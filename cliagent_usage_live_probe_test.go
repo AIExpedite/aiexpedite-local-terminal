@@ -1,0 +1,478 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestCLIUsageRefreshWantsLiveProbe(t *testing.T) {
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{}, false},
+		{[]string{"live-probe"}, true},
+		{[]string{"LIVE-PROBE"}, false},
+		{[]string{"other", "live-probe"}, false},
+	}
+	for _, c := range cases {
+		if got := cliUsageRefreshWantsLiveProbe(commandMsg{Command: "__cli_usage_refresh__", Args: c.args}); got != c.want {
+			t.Errorf("args=%v: got %v, want %v", c.args, got, c.want)
+		}
+	}
+}
+
+// fakeCodexAppServer answers the probe's initialize and rate-limit read the way
+// Codex 0.154 does — no `jsonrpc` member, an unsolicited notification in
+// between — and returns what it read from the probe.
+func fakeCodexAppServer(t *testing.T, readResponse string) (io.Writer, io.Reader, <-chan []string) {
+	t.Helper()
+	toServerR, toServerW := io.Pipe()
+	fromServerR, fromServerW := io.Pipe()
+	methods := make(chan []string, 1)
+	// io.Pipe has no buffer, unlike a real stdio pipe: the server's output goes
+	// through its own writer so a probe blocked writing a request can never
+	// deadlock against a server blocked writing a notification.
+	out := make(chan string, 16)
+	go func() {
+		defer fromServerW.Close()
+		for line := range out {
+			if _, err := io.WriteString(fromServerW, line); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer close(out)
+		var seen []string
+		scanner := bufio.NewScanner(toServerR)
+		for scanner.Scan() {
+			var frame struct {
+				ID     *int   `json:"id"`
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &frame) != nil {
+				continue
+			}
+			seen = append(seen, frame.Method)
+			switch {
+			case frame.Method == "initialize":
+				out <- `{"id":1,"result":{"userAgent":"codex"}}` + "\n"
+				out <- `{"method":"remoteControl/status/changed","params":{},"emittedAtMs":1}` + "\n"
+			case frame.Method == "account/rateLimits/read":
+				out <- readResponse + "\n"
+				methods <- seen
+				return
+			}
+		}
+		methods <- seen
+	}()
+	return toServerW, fromServerR, methods
+}
+
+// The shape Codex returned on 2026-09-11 for a Pro account: the main pool
+// meters weekly only, and a second, named pool meters both windows.
+const codexReadWeeklyMainPlusSpark = `{"id":2,"result":{` +
+	`"rateLimits":{"limitId":"codex","limitName":null,"primary":{"usedPercent":91,"windowDurationMins":10080,"resetsAt":%RESET_W%},"secondary":null,"planType":"pro"},` +
+	`"rateLimitsByLimitId":{` +
+	`"codex":{"limitId":"codex","limitName":null,"primary":{"usedPercent":91,"windowDurationMins":10080,"resetsAt":%RESET_W%},"secondary":null},` +
+	`"codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark","primary":{"usedPercent":4,"windowDurationMins":300,"resetsAt":%RESET_S%},"secondary":{"usedPercent":1,"windowDurationMins":10080,"resetsAt":%RESET_W%}}` +
+	`}}}`
+
+func codexReadFixture(now time.Time) string {
+	s := codexReadWeeklyMainPlusSpark
+	s = strings.ReplaceAll(s, "%RESET_W%", strconv.FormatInt(now.Add(72*time.Hour).Unix(), 10))
+	s = strings.ReplaceAll(s, "%RESET_S%", strconv.FormatInt(now.Add(3*time.Hour).Unix(), 10))
+	return s
+}
+
+func isolateCodexCache(t *testing.T) string {
+	t.Helper()
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	return cache
+}
+
+func TestCodexLiveProbeConverse_CapturesPoolsAndDropsMissingWindow(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	// A stale weekly reading from a days-old run, as AIE2's cache held.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":47,"window_minutes":10080,"resets_in_seconds":259200}}}}`,
+		now.Add(-24*time.Hour),
+	)
+
+	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
+	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	if seen := <-methods; len(seen) != 3 || seen[0] != "initialize" || seen[1] != "initialized" || seen[2] != "account/rateLimits/read" {
+		t.Fatalf("probe sent %v, want initialize → initialized → account/rateLimits/read", seen)
+	}
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	if snap.FullSnapshotAtMs == 0 {
+		t.Error("a live read is a full snapshot and must be recorded as one")
+	}
+	if snap.LimitNames["codex_bengalfox"] != "GPT-5.3-Codex-Spark" {
+		t.Errorf("limit names=%v, want the Spark pool named", snap.LimitNames)
+	}
+
+	metrics := codexMetricsFromCache(time.Now(), "")
+	if len(metrics) != 3 {
+		t.Fatalf("metrics=%+v, want main weekly + two Spark rows", metrics)
+	}
+	main := metrics[0]
+	if main.Kind != limitKindWeekly || main.Label != "Weekly quota" || main.Unknown || main.Consumed == nil || *main.Consumed != 91 {
+		t.Errorf("main row=%+v, want Weekly quota at 91%% (the stale 47%% is superseded)", main)
+	}
+	if main.Model != "" {
+		t.Errorf("main row model=%q, want none", main.Model)
+	}
+	spark5h, sparkWeekly := metrics[1], metrics[2]
+	if spark5h.Kind != limitKindSession || spark5h.Label != "GPT-5.3-Codex-Spark — 5-hour session window" ||
+		spark5h.Consumed == nil || *spark5h.Consumed != 4 || spark5h.Model != "gpt-5.3-codex-spark" {
+		t.Errorf("spark session row=%+v", spark5h)
+	}
+	if sparkWeekly.Kind != limitKindWeekly || sparkWeekly.Label != "GPT-5.3-Codex-Spark — Weekly quota" ||
+		sparkWeekly.Consumed == nil || *sparkWeekly.Consumed != 1 || sparkWeekly.Model != "gpt-5.3-codex-spark" {
+		t.Errorf("spark weekly row=%+v", sparkWeekly)
+	}
+	for _, m := range metrics {
+		if m.Kind == limitKindSession && m.Model == "" {
+			t.Errorf("the main pool has no 5-hour window, yet a main session row was emitted: %+v", m)
+		}
+	}
+}
+
+func TestCodexMetrics_PoolRowsDisappearWhenPoolIsGone(t *testing.T) {
+	isolateCodexCache(t)
+	now := time.Now()
+	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
+	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+		t.Fatalf("outcome=%q", got)
+	}
+	// A later read in which the account no longer has the Spark pool, and the
+	// main pool meters both windows again.
+	captureCodexRateLimitLine(`{"jsonrpc":"2.0","id":2,"result":{"rateLimitsByLimitId":{"codex":{"limitName":null,`+
+		`"primary":{"usedPercent":12,"windowDurationMins":300,"resetsInSeconds":3600},`+
+		`"secondary":{"usedPercent":50,"windowDurationMins":10080,"resetsInSeconds":86400}}}}}`, now.Add(time.Minute))
+
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if len(metrics) != 2 {
+		t.Fatalf("metrics=%+v, want the main pair only", metrics)
+	}
+	if metrics[0].Kind != limitKindSession || metrics[1].Kind != limitKindWeekly {
+		t.Errorf("rows=%+v, want session then weekly", metrics)
+	}
+	for _, m := range metrics {
+		if m.Model != "" {
+			t.Errorf("a retired pool still labels a row: %+v", m)
+		}
+	}
+}
+
+func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
+	isolateCodexCache(t)
+	now := time.Now()
+	// Only sparse evidence: nothing has shown which windows the account has.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	metrics := codexMetricsFromCache(now, "")
+	if len(metrics) != 2 || !metrics[0].Unknown || metrics[1].Unknown {
+		t.Fatalf("metrics=%+v, want an Unknown session placeholder and a known weekly", metrics)
+	}
+}
+
+func TestCodexLiveProbeConverse_RPCErrorLeavesCacheAlone(t *testing.T) {
+	cache := isolateCodexCache(t)
+	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to fetch codex rate limits"}}`)
+	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeRPCError {
+		t.Fatalf("outcome=%q, want rpc_error", got)
+	}
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Errorf("a failed read must not write the cache (stat err=%v)", err)
+	}
+}
+
+/* ---------------------------------- Grok ---------------------------------- */
+
+func writeGrokAuth(t *testing.T, home, key, email string, expires time.Time) {
+	t.Helper()
+	auth := map[string]any{
+		grokExactOIDCScope: map[string]any{
+			"key":           key,
+			"email":         email,
+			"user_id":       "user-" + email,
+			"refresh_token": "opaque-refresh",
+			"expires_at":    expires.UTC().Format(time.RFC3339Nano),
+		},
+	}
+	b, _ := json.Marshal(auth)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func isolateGrok(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("GROK_HOME", home)
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	origRenew := runGrokLoginRenewal
+	origURL := grokBillingLiveURL
+	t.Cleanup(func() {
+		runGrokLoginRenewal = origRenew
+		grokBillingLiveURL = origURL
+	})
+	runGrokLoginRenewal = func(context.Context, string, string) { t.Error("renewal must not run for a valid token") }
+	return home
+}
+
+const grokBillingFixture = `{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-09-07T22:28:32.746607+00:00","end":"%END%"},` +
+	`"creditUsagePercent":9,"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"productUsage":[{"product":"GrokBuild","usagePercent":9}],"isUnifiedBillingUser":true}}`
+
+func grokBillingServer(t *testing.T, handler func(auth string) (int, string)) *int32 {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		status, body := handler(r.Header.Get("Authorization"))
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	grokBillingLiveURL = srv.URL + "/v1/billing?format=credits"
+	return &calls
+}
+
+func grokFixtureBody(end time.Time) string {
+	return strings.ReplaceAll(grokBillingFixture, "%END%", end.UTC().Format(time.RFC3339Nano))
+}
+
+func TestProbeGrokBillingLive_CachesAndParserPrefersIt(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuth(t, home, "access-A", "dan@example.com", now.Add(5*time.Hour))
+	grokBillingServer(t, func(auth string) (int, string) {
+		if auth != "Bearer access-A" {
+			return http.StatusUnauthorized, `{}`
+		}
+		return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+	})
+
+	if got := probeGrokBillingLive(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	usage, ok := grokUsageParser{}.Parse(filepath.Dir(home), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	if len(usage.Metrics) == 0 || usage.Metrics[0].Unknown || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 9 {
+		t.Fatalf("metrics=%+v, want Weekly credits at 9%% from the live reading", usage.Metrics)
+	}
+	if usage.Metrics[0].Label != "Weekly credits" || usage.Metrics[0].ResetAt == "" {
+		t.Errorf("row=%+v, want labelled weekly credits with a reset", usage.Metrics[0])
+	}
+}
+
+func TestProbeGrokBillingLive_ExpiredTokenLetsGrokRenewThenRetries(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuth(t, home, "stale", "dan@example.com", now.Add(-time.Minute))
+	renewals := 0
+	runGrokLoginRenewal = func(_ context.Context, _ string, base string) {
+		renewals++
+		writeGrokAuth(t, base, "fresh", "dan@example.com", now.Add(6*time.Hour))
+	}
+	grokBillingServer(t, func(auth string) (int, string) {
+		if auth != "Bearer fresh" {
+			return http.StatusUnauthorized, `{}`
+		}
+		return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+	})
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	if renewals != 1 {
+		t.Errorf("renewals=%d, want exactly one", renewals)
+	}
+}
+
+func TestProbeGrokBillingLive_UnauthorizedRenewsOnceThenGivesUp(t *testing.T) {
+	home := isolateGrok(t)
+	writeGrokAuth(t, home, "revoked", "dan@example.com", time.Now().Add(time.Hour))
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+	calls := grokBillingServer(t, func(string) (int, string) { return http.StatusUnauthorized, `{}` })
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeUnauthorized {
+		t.Fatalf("outcome=%q, want unauthorized", got)
+	}
+	if renewals != 1 || atomic.LoadInt32(calls) != 2 {
+		t.Errorf("renewals=%d requests=%d, want one renewal and one retry", renewals, atomic.LoadInt32(calls))
+	}
+	if _, err := os.Stat(os.Getenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE")); !os.IsNotExist(err) {
+		t.Errorf("nothing may be cached after a refusal (stat err=%v)", err)
+	}
+}
+
+func TestLoadGrokBillingLiveSnapshot_OtherAccountNeverReplayed(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuth(t, home, "access-A", "a@example.com", now.Add(5*time.Hour))
+	grokBillingServer(t, func(string) (int, string) { return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour)) })
+	if got := probeGrokBillingLive(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q", got)
+	}
+	// The user signs into a different account; A's pool must not show under B.
+	writeGrokAuth(t, home, "access-B", "b@example.com", now.Add(5*time.Hour))
+	if _, ok := loadGrokBillingLiveSnapshot(grokAccountFingerprintFor(home)); ok {
+		t.Fatal("a live reading from another account was replayed")
+	}
+}
+
+/* ------------------------------- Antigravity ------------------------------ */
+
+func TestAntigravityHTTPPortForPID_OnlyTheRunWeStarted(t *testing.T) {
+	base := t.TempDir()
+	logDir := filepath.Join(base, "log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, pid, port int, mod time.Time) {
+		body := "I0911 server.go:1544] Starting language server process with pid " + strconv.Itoa(pid) + "\n" +
+			"I0911 server.go:612] Language server listening on random port at " + strconv.Itoa(port+1) + " for HTTPS (gRPC)\n" +
+			"I0911 server.go:620] Language server listening on random port at " + strconv.Itoa(port) + " for HTTP\n"
+		path := filepath.Join(logDir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Chtimes(path, mod, mod)
+	}
+	now := time.Now()
+	write("cli-ours.log", 1111, 50000, now.Add(-time.Second))
+	// A run the user started more recently must never be read.
+	write("cli-users-session.log", 2222, 60000, now)
+
+	if got := antigravityHTTPPortForPID(base, 1111); got != 50000 {
+		t.Errorf("port=%d, want 50000 from the run with our pid", got)
+	}
+	if got := antigravityHTTPPortForPID(base, 3333); got != 0 {
+		t.Errorf("port=%d, want 0 for a pid that has not logged yet", got)
+	}
+}
+
+/* ------------------------------ Orchestration ----------------------------- */
+
+func stubLiveProbes(t *testing.T) *int32 {
+	t.Helper()
+	var calls int32
+	origCodex, origAgy, origGrok, origWarm, origDetect := probeCodexRateLimitsLiveFn, probeAntigravityQuotaLiveFn, probeGrokBillingLiveFn, warmCLIAgentModelDiscoveryFn, liveProbeDetectedAgents
+	t.Cleanup(func() {
+		probeCodexRateLimitsLiveFn, probeAntigravityQuotaLiveFn, probeGrokBillingLiveFn = origCodex, origAgy, origGrok
+		warmCLIAgentModelDiscoveryFn, liveProbeDetectedAgents = origWarm, origDetect
+		cliUsageLiveProbeMu.Lock()
+		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
+		cliUsageLiveProbeMu.Unlock()
+	})
+	cliUsageLiveProbeMu.Lock()
+	cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
+	cliUsageLiveProbeMu.Unlock()
+	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
+		return map[string]detectedCLIAgent{
+			"codex":       {Detected: true, Path: "codex"},
+			"antigravity": {Detected: true, Path: "agy"},
+			"grok":        {Detected: true, Path: "grok"},
+			"claudeCode":  {Detected: true, Path: "claude"},
+		}
+	}
+	slow := func() { atomic.AddInt32(&calls, 1); time.Sleep(50 * time.Millisecond) }
+	probeCodexRateLimitsLiveFn = func(context.Context, string) string { slow(); return liveProbeOutcomeOK }
+	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeTimeout }
+	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string { slow(); panic("boom") }
+	warmCLIAgentModelDiscoveryFn = func(context.Context, string, detectedCLIAgent, string) {}
+	return &calls
+}
+
+func TestRunCLIUsageLiveProbes_ParallelOutcomesAndCooldown(t *testing.T) {
+	calls := stubLiveProbes(t)
+
+	outcomes := runCLIUsageLiveProbes(context.Background())
+	want := map[string]string{"codex": "ok", "antigravity": "timeout", "grok": "panic"}
+	for provider, outcome := range want {
+		if outcomes[provider] != outcome {
+			t.Errorf("%s=%q, want %q (all=%v)", provider, outcomes[provider], outcome, outcomes)
+		}
+	}
+	if _, ok := outcomes["claudeCode"]; ok {
+		t.Error("Claude is refreshed by the gather's forced probe, not here")
+	}
+	if atomic.LoadInt32(calls) != 3 {
+		t.Fatalf("probe calls=%d, want 3", atomic.LoadInt32(calls))
+	}
+
+	// A second click inside the cooldown asks nobody again.
+	again := runCLIUsageLiveProbes(context.Background())
+	if atomic.LoadInt32(calls) != 3 {
+		t.Errorf("a click within the cooldown re-probed (calls=%d)", atomic.LoadInt32(calls))
+	}
+	if again["codex"] != liveProbeOutcomeCooldown {
+		t.Errorf("cooldown outcome=%v", again)
+	}
+}
+
+func TestRunCLIUsageLiveProbes_ConcurrentClicksShareOneRun(t *testing.T) {
+	calls := stubLiveProbes(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runCLIUsageLiveProbes(context.Background())
+		}()
+	}
+	wg.Wait()
+	if got := atomic.LoadInt32(calls); got != 3 {
+		t.Errorf("probe calls=%d across five simultaneous clicks, want one run (3 probes)", got)
+	}
+}
+
+func TestRunCLIUsageLiveProbes_AntigravityModelListWaitsForQuotaProbe(t *testing.T) {
+	stubLiveProbes(t)
+	var probeDone atomic.Bool
+	var listedBeforeProbe atomic.Bool
+	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string {
+		time.Sleep(30 * time.Millisecond)
+		probeDone.Store(true)
+		return liveProbeOutcomeOK
+	}
+	warmCLIAgentModelDiscoveryFn = func(_ context.Context, id string, _ detectedCLIAgent, _ string) {
+		if id == "antigravity" && !probeDone.Load() {
+			listedBeforeProbe.Store(true)
+		}
+	}
+	runCLIUsageLiveProbes(context.Background())
+	if listedBeforeProbe.Load() {
+		t.Fatal("`agy models` ran alongside the quota probe; two agy runs started in the same second share one log file")
+	}
+}

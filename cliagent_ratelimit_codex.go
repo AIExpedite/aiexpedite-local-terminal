@@ -130,6 +130,16 @@ type codexRateLimitSnapshot struct {
 	AccountFingerprint string                                     `json:"accountFingerprint,omitempty"`
 	Buckets            map[string]codexRateLimitBucket            `json:"buckets"`
 	Contributors       map[string]map[string]codexRateLimitBucket `json:"contributors,omitempty"`
+	// LimitNames maps a metered limit id to the display name Codex gives it
+	// (`rateLimitsByLimitId.<id>.limitName`). A named limit is an independent
+	// model pool (e.g. `codex_bengalfox` → "GPT-5.3-Codex-Spark") and renders as
+	// its own rows; an unnamed limit is the account's main pool.
+	LimitNames map[string]string `json:"limitNames,omitempty"`
+	// FullSnapshotAtMs is when an authoritative `account/rateLimits/read` last
+	// restated every window that applies to the account. Only after one has been
+	// seen may a main-pool window the account does not report be left off the
+	// card rather than rendered as an unobserved placeholder.
+	FullSnapshotAtMs int64 `json:"fullSnapshotAtMs,omitempty"`
 	// RolloutHighWaterMtimeMs is filesystem scan progress, not provider
 	// observation time. It advances after every selected rollout file was either
 	// handled or recorded by redacted identity for retry, allowing completed
@@ -1049,8 +1059,56 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if len(updates) == 0 && len(clears) == 0 && !emptyAuthoritative {
 		return
 	}
-	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative, now, currentCodexAccountFingerprint())
+	mergeCodexRateLimitCachePerLimitProgressWithLock(
+		codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
+		now, currentCodexAccountFingerprint(), nil, "", true, extractCodexLimitNames(raw))
 }
+
+// extractCodexLimitNames returns the display name of every metered limit a
+// frame describes under `rateLimitsByLimitId`, keyed by limit id. A limit whose
+// name is null or absent maps to "" so a merge can forget a name the provider
+// stopped sending. Only JSON strings are accepted and each is bounded, so an
+// unexpected value can never reach a metric label.
+func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
+	names := map[string]string{}
+	containers := []map[string]interface{}{raw}
+	for _, key := range []string{"params", "result", "msg", "payload"} {
+		if m, ok := raw[key].(map[string]interface{}); ok {
+			containers = append(containers, m)
+			if msg, ok := m["msg"].(map[string]interface{}); ok {
+				containers = append(containers, msg)
+			}
+		}
+	}
+	for _, c := range containers {
+		v, ok := pickField(c, "rate_limits_by_limit_id", "rateLimitsByLimitId")
+		if !ok {
+			continue
+		}
+		limits, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		for limitID, entry := range limits {
+			info, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name := ""
+			if v, ok := pickField(info, "limit_name", "limitName"); ok {
+				if s, ok := v.(string); ok {
+					name = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
+				}
+			}
+			names[limitID] = name
+		}
+	}
+	return names
+}
+
+// codexLimitNameMaxBytes bounds a pool name before it is composed into a metric
+// label ("<name> — Weekly quota"), which the receipt caps at 256 bytes.
+const codexLimitNameMaxBytes = 96
 
 // isRecognizedCodexRateLimitEnvelope fails closed before typed extraction.
 // Rate-limit-looking fields inside arbitrary tool output, prompts, or response
@@ -1247,7 +1305,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 ) {
 	mergeCodexRateLimitCachePerLimitProgressWithLock(
 		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, rolloutHighWater, rolloutAccountBase, true,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, true, nil,
 	)
 }
 
@@ -1270,7 +1328,7 @@ func tryMergeCodexRateLimitCachePerLimitProgress(
 ) bool {
 	return mergeCodexRateLimitCachePerLimitProgressWithLock(
 		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, rolloutHighWater, rolloutAccountBase, false,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, false, nil,
 	)
 }
 
@@ -1286,6 +1344,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	rolloutHighWater *codexRolloutScanProgress,
 	rolloutAccountBase string,
 	waitForLocks bool,
+	limitNames map[string]string,
 ) bool {
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false
@@ -1343,6 +1402,8 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
 		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+		snap.LimitNames = nil
+		snap.FullSnapshotAtMs = 0
 		snap.RolloutHighWaterMtimeMs = 0
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
@@ -1492,7 +1553,9 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 				delete(snap.Contributors, slot)
 			}
 		}
+		snap.FullSnapshotAtMs = nowMs
 	}
+	snap.LimitNames = codexMergeLimitNames(snap.LimitNames, limitNames, snap.Contributors)
 	// Recompute the flat aggregate from contributors so callers reading the
 	// cache (codexMetricsFromCache, tests) see the most-constrained view.
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
@@ -1648,28 +1711,154 @@ func codexContributorsForAccount(currentFingerprint string) map[string]map[strin
 	return legacy
 }
 
-// codexMetricsFromCache builds the two Claude-aligned metric rows from the
-// rate-limit cache: the 5-hour session window first, the weekly quota second.
-// Rows are selected by metric IDENTITY (partitioning every contributor across
-// both storage slots) rather than by "slot == row", so duplicate weekly buckets
-// collapse to the newest, a migrated/swapped placement still renders in the
-// right row, and a weekly-band reading is never promoted into the session row
-// (AC4). Both rows are always emitted — Unknown when unobserved — so the layout
-// stays aligned with the Claude Code card even when a window is missing.
+// codexMergeLimitNames folds a frame's limit names into the cached ones and
+// forgets the name of every limit that no longer has a contributor, so a pool
+// the account lost cannot keep labelling rows. An empty incoming name removes
+// the entry (the provider now reports that limit unnamed).
+func codexMergeLimitNames(cached, incoming map[string]string, contributors map[string]map[string]codexRateLimitBucket) map[string]string {
+	merged := map[string]string{}
+	for id, name := range cached {
+		merged[id] = name
+	}
+	for id, name := range incoming {
+		if name == "" {
+			delete(merged, id)
+			continue
+		}
+		merged[id] = name
+	}
+	live := map[string]bool{}
+	for _, contribs := range contributors {
+		for id := range contribs {
+			live[id] = true
+		}
+	}
+	for id := range merged {
+		if !live[id] {
+			delete(merged, id)
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+// codexCacheView is the account-scoped slice of the cache the card renders.
+type codexCacheView struct {
+	contributors     map[string]map[string]codexRateLimitBucket
+	limitNames       map[string]string
+	fullSnapshotAtMs int64
+}
+
+// codexCacheViewForAccount is codexContributorsForAccount plus the pool names
+// and the time of the last authoritative full snapshot.
+func codexCacheViewForAccount(currentFingerprint string) codexCacheView {
+	view := codexCacheView{contributors: codexContributorsForAccount(currentFingerprint)}
+	if snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath()); ok && snap.AccountFingerprint == currentFingerprint {
+		view.limitNames = snap.LimitNames
+		view.fullSnapshotAtMs = snap.FullSnapshotAtMs
+	}
+	return view
+}
+
+// codexSplitContributorsByPool separates the account's main pool (every limit
+// Codex leaves unnamed, including the legacy aggregate) from each named model
+// pool. Named pools are returned keyed by display name.
+func codexSplitContributorsByPool(view codexCacheView) (map[string]map[string]codexRateLimitBucket, map[string]map[string]map[string]codexRateLimitBucket) {
+	main := map[string]map[string]codexRateLimitBucket{}
+	pools := map[string]map[string]map[string]codexRateLimitBucket{}
+	for slot, contribs := range view.contributors {
+		for limitID, b := range contribs {
+			target := main
+			if name := view.limitNames[limitID]; name != "" {
+				if pools[name] == nil {
+					pools[name] = map[string]map[string]codexRateLimitBucket{}
+				}
+				target = pools[name]
+			}
+			if target[slot] == nil {
+				target[slot] = map[string]codexRateLimitBucket{}
+			}
+			target[slot][limitID] = b
+		}
+	}
+	return main, pools
+}
+
+// codexPoolModelID turns a pool's display name into the model id it meters
+// ("GPT-5.3-Codex-Spark" → "gpt-5.3-codex-spark"), the same spelling Codex
+// lists the model under, so the row names the model it limits.
+func codexPoolModelID(name string) string {
+	return strings.ToLower(strings.Join(strings.Fields(name), "-"))
+}
+
+// codexMetricsFromCache builds the card rows from the rate-limit cache.
+//
+// The account's MAIN pool renders first as the Claude-aligned pair — the 5-hour
+// session window, then the weekly quota. Rows are selected by metric IDENTITY
+// (partitioning every contributor across both storage slots) rather than by
+// "slot == row", so duplicate weekly buckets collapse to the newest, a
+// migrated/swapped placement still renders in the right row, and a weekly-band
+// reading is never promoted into the session row (AC4). A missing window keeps
+// an Unknown placeholder until an authoritative full snapshot has shown the
+// account's actual windows; after that, a window the account does not have is
+// left off (a plan that meters weekly only shows one row), while an account
+// reporting no window at all still shows both placeholders — that is the
+// spent-quota shape codexUsageLimitNotice explains.
+//
+// Each NAMED model pool Codex reports (`limitName`, e.g. "GPT-5.3-Codex-Spark")
+// follows with its own rows for exactly the windows it has, labelled with the
+// pool name and carrying the model id. Folding a pool into the main rows would
+// let its 0% session window stand in for a main pool that has none.
 //
 // The cache is trusted only when its `accountFingerprint` exactly matches the
 // caller-supplied one — otherwise a previous account's windows could surface
 // under the current account after a credentials swap.
 func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	parts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
+	view := codexCacheViewForAccount(currentFingerprint)
+	mainContributors, pools := codexSplitContributorsByPool(view)
+	parts := codexPartitionByIdentity(mainContributors)
 
 	sessionBucket, sessionOK := codexIdentityDisplayBucket(parts, codexIdentitySession, codexWindowPrimary, now)
 	weeklyBucket, weeklyOK := codexIdentityDisplayBucket(parts, codexIdentityWeekly, codexWindowSecondary, now)
 
-	session := codexMetricFromBucket(sessionBucket, sessionOK, limitKindSession, "5-hour session window", now)
-	weekly := codexMetricFromBucket(weeklyBucket, weeklyOK, limitKindWeekly, "Weekly quota", now)
+	windowsKnown := view.fullSnapshotAtMs > 0 && (sessionOK || weeklyOK)
+	metrics := make([]cliAgentUsageMetric, 0, 2+2*len(pools))
+	if sessionOK || !windowsKnown {
+		metrics = append(metrics, codexMetricFromBucket(sessionBucket, sessionOK, limitKindSession, "5-hour session window", now))
+	}
+	if weeklyOK || !windowsKnown {
+		metrics = append(metrics, codexMetricFromBucket(weeklyBucket, weeklyOK, limitKindWeekly, "Weekly quota", now))
+	}
 
-	return []cliAgentUsageMetric{session, weekly}
+	names := make([]string, 0, len(pools))
+	for name := range pools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		poolParts := codexPartitionByIdentity(pools[name])
+		for _, row := range []struct {
+			identity, slot, kind, label string
+		}{
+			{codexIdentitySession, codexWindowPrimary, limitKindSession, "5-hour session window"},
+			{codexIdentityWeekly, codexWindowSecondary, limitKindWeekly, "Weekly quota"},
+		} {
+			bucket, ok := codexIdentityDisplayBucket(poolParts, row.identity, row.slot, now)
+			if !ok {
+				continue
+			}
+			metric := codexMetricFromBucket(bucket, true, row.kind, row.label, now)
+			metric.Label = name + " — " + metric.Label
+			metric.Model = codexPoolModelID(name)
+			metrics = append(metrics, metric)
+		}
+	}
+	if len(metrics) > cliUsageMaxMetricsPerProvider {
+		metrics = metrics[:cliUsageMaxMetricsPerProvider]
+	}
+	return metrics
 }
 
 // codexRolloutScanFileCap bounds how many of the most-recent rollout logs the

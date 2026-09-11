@@ -134,7 +134,14 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// it fetched for itself; when that log has a usable record we plot it and
 	// take the subscription tier from the same record (the auth file rarely
 	// carries a plan).
-	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	// A live reading (cliagent_usage_grok_live.go — the Refresh click asks xAI
+	// directly) replaces the log's record whenever it is the newer observation;
+	// the TUI writing a fresher line afterwards wins back the same way.
+	if live, liveOK := loadGrokBillingLiveSnapshot(usage.AccountFingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
+		snap, ok = live, true
+	}
+	if ok {
 		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
 			usage.Plan = firstNonEmpty(usage.Plan, snap.SubscriptionTier)

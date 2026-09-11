@@ -698,3 +698,57 @@ closes that gap by reading the server **while it exists**:
 - **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick (mirrors
   `AIEXPEDITE_AGY_QUOTA_CACHE`); a non-positive or unparseable value falls back
   to the shipped constant.
+
+# Live usage probe — the Refresh click on the CLI Agents card
+
+Passive capture only ever reports what the last run left behind, so a CLI that
+was not used for a day showed a day-old pool whose windows had since reset
+(every row striped). A **click** on the card's Refresh button now asks each
+provider for its current figures before the gather runs
+([`cliagent_usage_live_probe.go`](cliagent_usage_live_probe.go)).
+
+- **Only a click.** terminal-service adds the first arg `live-probe` to the
+  `__cli_usage_refresh__` it sends for `source: manual_refresh`. Args are inside
+  the command HMAC, so the flag cannot be added in transit. Tab-open wakes, the
+  active-refresh loop and heartbeats never carry it, and an older agent ignores
+  it. Automatic refreshes also stopped resetting the model-probe cache — that
+  reset relaunched `agy models` every five minutes while the tab was open.
+- **What each probe does** (all in parallel, one 30 s budget, then the normal
+  10 s gather):
+  - Claude Code — nothing extra; the gather's OAuth usage request is already
+    forced on every refresh.
+  - Codex — a private `codex app-server --listen stdio://` answers
+    `account/rateLimits/read`. It fetches from
+    `chatgpt.com/backend-api/wham/usage` (it fails when offline), so the reading
+    is live, and no turn is spent. Codex omits the `jsonrpc` member, so the
+    probe re-wraps its own response before `captureCodexRateLimitLine`.
+  - Grok — GET `cli-chat-proxy.grok.com/v1/billing?format=credits` with the
+    token Grok's resolver presents ([`cliagent_usage_grok_live.go`](cliagent_usage_grok_live.go)).
+    Headless Grok (`grok -p`, ACP) never fetches credits, so no run could
+    refresh this. The agent never renews the login itself; an expired token or
+    a 401 runs `grok models` once against the real home so Grok renews, then the
+    request is retried once.
+  - Antigravity — `agy -p` in an empty temp dir, only to start its language
+    server; the quota RPC forces a fresh fetch and the run is killed as soon as
+    the reading is persisted (~1.5 s, normally before any model output). The
+    server is found by the PID `agy` logs, so a run the user has open is never
+    read. `agy` names its log by the SECOND it started, so `agy models` waits
+    for the probe instead of sharing that log file.
+- **Model lists** are re-listed in the same window with the time the slowest
+  list needs; the bounded gather's 2 s discovery slot never fits `agy models`.
+- **Concurrency.** Clicks share one running probe (singleflight) and a click
+  within 15 s of a finished probe reuses it. Probes are not CLI sessions: they
+  take no reservation or session slot and never touch a running session.
+
+## Codex rows follow what Codex reports
+
+`account/rateLimits/read` is a full snapshot, so once one has been seen
+(`fullSnapshotAtMs` in the cache) the main pool renders only the windows the
+account has — a weekly-only plan shows one row, not a striped 5-hour
+placeholder. An account reporting no window at all keeps both placeholders
+(the spent-quota shape). Each named limit (`limitName`, e.g. `codex_bengalfox`
+→ "GPT-5.3-Codex-Spark") renders as its own rows labelled with the pool name
+and carrying the model id, instead of being folded into the main rows where
+its 0 % session window stood in for a main pool that had none. Routing still
+sees those rows in Codex's shared pool (no `metric.pool` on the wire yet —
+the B6 device half), exactly as the folded rows were before.

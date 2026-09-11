@@ -1951,9 +1951,11 @@ func TestCaptureCodexRateLimit_FullSnapshotOmissionDropsWindow(t *testing.T) {
 	if _, present := snap.Buckets[codexWindowSecondary]; present {
 		t.Errorf("weekly must be dropped when a full snapshot omits it: %+v", snap.Buckets)
 	}
+	// The full snapshot showed the account's actual windows, so the window it
+	// does not have is left off the card rather than drawn as a placeholder.
 	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
-	if !metrics[1].Unknown {
-		t.Errorf("weekly row=%+v, want Unknown after full-snapshot omission", metrics[1])
+	if len(metrics) != 1 {
+		t.Fatalf("metrics=%+v, want only the session row after full-snapshot omission", metrics)
 	}
 	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
 		t.Errorf("session row=%+v, want known session from the full snapshot", metrics[0])
@@ -2106,12 +2108,15 @@ func TestCaptureCodexRateLimit_FullSnapshotOmitsIdentityWithinSharedSlot(t *test
 		now.Add(time.Minute),
 	)
 
+	// The stale weekly identity sharing the primary slot is reconciled away, and
+	// because the full snapshot showed the account has no weekly window the row
+	// is left off entirely.
 	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if len(metrics) != 1 {
+		t.Fatalf("metrics=%+v, want only the session row retained by the full snapshot", metrics)
+	}
 	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
 		t.Errorf("session row=%+v, want known session retained by the full snapshot", metrics[0])
-	}
-	if !metrics[1].Unknown {
-		t.Errorf("weekly row=%+v, want Unknown — the stale weekly identity sharing the primary slot must be reconciled away", metrics[1])
 	}
 }
 
@@ -2291,12 +2296,14 @@ func TestCaptureCodexRateLimit_FullSnapshotOmitsConcurrentLimitOfSurvivingIdenti
 	if b, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
 		t.Errorf("restated limit B must survive at 30%%: %+v", snap.Contributors[codexWindowSecondary])
 	}
+	// The full snapshot reported a weekly window only, so the session row is
+	// left off and weekly is the single row.
 	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
-	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
-		t.Fatalf("metrics[1]=%+v, want known weekly", metrics[1])
+	if len(metrics) != 1 || metrics[0].Kind != limitKindWeekly || metrics[0].Unknown {
+		t.Fatalf("metrics=%+v, want a single known weekly row", metrics)
 	}
-	if metrics[1].Consumed == nil || *metrics[1].Consumed != 30 {
-		t.Errorf("weekly Consumed=%v, want 30 (stale A dropped by authoritative full snapshot)", metrics[1].Consumed)
+	if metrics[0].Consumed == nil || *metrics[0].Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (stale A dropped by authoritative full snapshot)", metrics[0].Consumed)
 	}
 }
 
