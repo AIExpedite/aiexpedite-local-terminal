@@ -377,7 +377,11 @@ Three rules keep a probe from doing damage on the way:
   implements `ParseContext`, so `opencode models` and `opencode auth list`
   derive their 3s caps from the gather context (the earlier deadline wins) and
   an answer the deadline cut is returned uncached with the forced re-probe
-  intact, instead of pinning "unknown" to the card for the readiness TTL.
+  intact, instead of pinning "unknown" to the card for the readiness TTL. The
+  optional `auth list` gets only what the gather can spare beyond the same 3s
+  reserve (`optionalOpenCodeProbeContext`) and is skipped otherwise — the
+  provider names then derive from the listed model ids — so a stall there can
+  never have the conclusive `models` answer discarded as canceled.
 - **`grok models` describes the same service, config and login as an ACP
   session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
   sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the

@@ -249,8 +249,15 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 	// Per-provider detail for the card. Best-effort and never affects the
 	// auth state: `auth list` failing on a machine whose models list is
 	// non-empty must not downgrade a working install.
-	if authOut, ok := runOpenCodeProbe(ctx, executable, "auth", "list"); ok {
-		out.Providers = parseOpenCodeAuthProviders(authOut)
+	// It is also OPTIONAL, so it is only handed what the gather can spare: a
+	// stall here until the parent expired would have runProviderParseSafely
+	// discard the conclusive models answer above and report the providers
+	// behind OpenCode as canceled.
+	if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
+		if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
+			out.Providers = parseOpenCodeAuthProviders(authOut)
+		}
+		release()
 	}
 	if len(out.Providers) == 0 {
 		out.Providers = openCodeProvidersFromModelIDs(modelIDs)
@@ -258,6 +265,32 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 
 	out.Model = firstNonEmpty(readOpenCodeConfiguredModel(home), openCodeSingleModel(modelIDs))
 	return out
+}
+
+// openCodeOptionalProbeReserve is what the best-effort `auth list` probe leaves
+// a bounded gather for the providers still to be polled: one utilization
+// probe's worth, the same reserve model discovery keeps.
+const openCodeOptionalProbeReserve = machineInfoProbeTimeout
+
+// optionalOpenCodeProbeContext hands the best-effort `auth list` probe what the
+// gather can spare: at most openCodeProbeTimeout, and never the gather's last
+// openCodeOptionalProbeReserve. ok=false means the probe is skipped; the
+// provider names then derive from the model ids the conclusive probe listed.
+// An unbounded caller (the periodic gather) passes through unchanged.
+func optionalOpenCodeProbeContext(ctx context.Context) (probeCtx context.Context, release func(), ok bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return ctx, func() {}, true
+	}
+	allowance := min(openCodeProbeTimeout, time.Until(deadline)-openCodeOptionalProbeReserve)
+	if allowance <= 0 {
+		return ctx, func() {}, false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, allowance)
+	return probeCtx, cancel, true
 }
 
 // runOpenCodeProbe runs `opencode <args…>` with a short timeout and returns its
