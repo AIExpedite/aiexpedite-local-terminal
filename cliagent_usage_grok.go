@@ -725,15 +725,24 @@ func grokIdentityCandidates(base string) []string {
 	claims := grokIDTokenClaims{}
 	parseJWTClaims(firstNonEmpty(auth.CachedToken.IDToken, auth.CachedToken.AccessToken), &claims)
 	scoped, _ := readGrokScopedAuthClaims(authPath)
-	presented := auth.presentedClaims()
 
 	candidates := []string{
-		presented.Email, presented.Account, presented.UserName, presented.UserID, presented.Subject,
 		auth.Email, auth.Account, auth.UserName, auth.UserID,
 		auth.CachedToken.Email, auth.CachedToken.Account, auth.CachedToken.Subject,
 		claims.Email, claims.Account, claims.UserName, claims.UserID, claims.Subject,
-		scoped.Email, scoped.Account, scoped.UserName, scoped.UserID, scoped.Subject,
 	}
+	// The presented credential's claims are an identity only when they are
+	// what named the account — exactly when readGrokAccountAndPlan falls back
+	// to them. Beside identity fields that name someone else (stale metadata
+	// after an account switch) they would let that other login's billing
+	// records pass as this account's.
+	if firstNonEmpty(candidates...) == "" {
+		presented := auth.presentedClaims()
+		candidates = append(candidates,
+			presented.Email, presented.Account, presented.UserName, presented.UserID, presented.Subject)
+	}
+	candidates = append(candidates,
+		scoped.Email, scoped.Account, scoped.UserName, scoped.UserID, scoped.Subject)
 	out := make([]string, 0, len(candidates))
 	seen := map[string]bool{}
 	for _, candidate := range candidates {

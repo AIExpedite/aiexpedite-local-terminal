@@ -930,3 +930,34 @@ func TestProbeGrokBillingLive_FlatCredentialNamesItsAccount(t *testing.T) {
 		})
 	}
 }
+
+// TestGrokIdentityCandidates_PresentedClaimsOnlyWhenTheyNameTheAccount: stale
+// identity fields for A beside a credential that claims B keep A as the account,
+// so B must not become an accepted identity for matching billing records.
+func TestGrokIdentityCandidates_PresentedClaimsOnlyWhenTheyNameTheAccount(t *testing.T) {
+	jwtB := unsignedJWT(t, map[string]any{"email": "b@example.com"})
+	cases := []struct {
+		name string
+		auth map[string]any
+		want []string
+		deny string
+	}{
+		{"identity fields win, B excluded", map[string]any{"email": "a@example.com", "access_token": jwtB}, []string{"a@example.com"}, "b@example.com"},
+		{"only the credential names the account", map[string]any{"access_token": jwtB}, []string{"b@example.com"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), tc.auth)
+			got := grokIdentityCandidates(base)
+			for _, w := range tc.want {
+				if !containsString(got, w) {
+					t.Errorf("candidates=%v, want %q", got, w)
+				}
+			}
+			if tc.deny != "" && containsString(got, tc.deny) {
+				t.Errorf("candidates=%v, must not accept %q", got, tc.deny)
+			}
+		})
+	}
+}
