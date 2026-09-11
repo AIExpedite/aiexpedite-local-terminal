@@ -370,8 +370,10 @@ Three rules keep a probe from doing damage on the way:
   `cliAgentDiscoveryBudget` shared across every provider (4s of time actually
   spent per gather, at most 2s per probe), and a probe never takes what the
   providers still to be polled need — 3s (one utilization probe) for each
-  later parser that performs bounded I/O (Claude, Codex, OpenCode; Antigravity
-  and Grok read local state), summed by `cliAgentUsageGatherReservesAfter`
+  later parser that performs bounded I/O (Claude — one window per serial child
+  it declares — Codex, OpenCode and Antigravity, whose loopback quota request
+  also derives from the gather; only Grok reads purely local state), summed by
+  `cliAgentUsageGatherReservesAfter`
   over the ordered run, so the first provider on a fully loaded box gets a
   short probe and the last gets the full cap. A probe the gather cannot afford is skipped
   and the cache answers; a cold cache reports nothing and the next gather asks.

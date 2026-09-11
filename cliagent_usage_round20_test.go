@@ -12,8 +12,8 @@ import (
 // only the ones that perform bounded I/O count.
 
 func TestGatherReservesSumOverTheParsersStillToRun(t *testing.T) {
-	// The default catalog order with every CLI installed: antigravity and grok
-	// read local state; claude, codex and opencode perform bounded I/O.
+	// The default catalog order with every CLI installed: only grok reads purely
+	// local state; claude, codex, opencode and antigravity perform bounded I/O.
 	parsers := cliAgentUsageParserIndex()
 	run := []cliAgentUsageParser{
 		parsers["antigravity"], parsers["claudeCode"], parsers["codex"], parsers["opencode"], parsers["grok"],

@@ -376,7 +376,8 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 // need of a bounded gather: one probe's worth for a parser that performs
 // bounded I/O during refresh (it implements cliAgentUsageContextParser —
 // Claude's usage request and auth status, Codex's app-server state, OpenCode's
-// readiness probes), nothing for one that only reads local files.
+// readiness probes, Antigravity's loopback quota request), nothing for one that
+// only reads local files.
 func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 	if parser == nil {
 		return 0
