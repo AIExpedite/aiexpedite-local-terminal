@@ -372,8 +372,12 @@ Three rules keep a probe from doing damage on the way:
   gather's last 3s — one utilization probe's worth, reserved for the
   providers still to be polled. A probe the gather cannot afford is skipped
   and the cache answers; a cold cache reports nothing and the next gather asks.
-  Discovery as a whole is therefore bounded under the refresh deadline; the
-  utilization probes' own worst case is unchanged by it.
+  Discovery as a whole is therefore bounded under the refresh deadline. The
+  same rule reaches OpenCode's readiness probes: `openCodeUsageParser`
+  implements `ParseContext`, so `opencode models` and `opencode auth list`
+  derive their 3s caps from the gather context (the earlier deadline wins) and
+  an answer the deadline cut is returned uncached with the forced re-probe
+  intact, instead of pinning "unknown" to the card for the readiness TTL.
 - **`grok models` describes the same service, config and login as an ACP
   session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
   sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the
