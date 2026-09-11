@@ -154,8 +154,8 @@ func grokPresentedToken(base string) (token string, expiresAt time.Time, hasExpi
 			entry := scoped[k]
 			// Same rule as grokHasUsableToken: a scope without a token is
 			// skipped, and the first token-bearing scope is the one Grok
-			// presents — its access credential, else its id_token.
-			token = firstNonEmpty(entry.Key, entry.AccessToken, entry.Token, entry.IDToken)
+			// presents, picked in grokScopedCredential's order.
+			token = grokScopedCredential(entry.Key, entry.Token, entry.AccessToken, entry.IDToken)
 			if token == "" {
 				continue
 			}

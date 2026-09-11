@@ -1100,11 +1100,16 @@ func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
 			if !ok {
 				continue
 			}
-			name := ""
-			if s, ok := v.(string); ok {
-				name = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
+			// Only an explicit null or empty string clears a cached name. A value
+			// of any other type (a future schema change) is not evidence the pool
+			// lost its name, so skip it rather than folding a live named pool back
+			// into the main one.
+			switch s := v.(type) {
+			case nil:
+				names[limitID] = ""
+			case string:
+				names[limitID] = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
 			}
-			names[limitID] = name
 		}
 	}
 	return names

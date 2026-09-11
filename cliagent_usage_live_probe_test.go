@@ -223,6 +223,33 @@ func TestCodexMergeLimitNames_OnlyAuthoritativeNullClears(t *testing.T) {
 	}
 }
 
+// TestExtractCodexLimitNames_OnlyNullOrEmptyClears: a limitName of a type this
+// build does not understand (a forward-compatible schema change) is skipped,
+// never recorded as the empty name codexMergeLimitNames treats as a clear.
+func TestExtractCodexLimitNames_OnlyNullOrEmptyClears(t *testing.T) {
+	var raw map[string]interface{}
+	body := `{"method":"account/rateLimits/read","result":{"rateLimitsByLimitId":{` +
+		`"named":{"limitName":" Spark "},` +
+		`"nulled":{"limitName":null},` +
+		`"emptied":{"limitName":""},` +
+		`"object":{"limitName":{"display":"Spark"}},` +
+		`"number":{"limitName":7},` +
+		`"absent":{}}}}`
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatal(err)
+	}
+	names := extractCodexLimitNames(raw)
+	want := map[string]string{"named": "Spark", "nulled": "", "emptied": ""}
+	if len(names) != len(want) {
+		t.Fatalf("names=%v, want exactly %v", names, want)
+	}
+	for id, name := range want {
+		if got, ok := names[id]; !ok || got != name {
+			t.Errorf("names[%q]=%q (present=%v), want %q", id, got, ok, name)
+		}
+	}
+}
+
 func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
 	isolateCodexCache(t)
 	now := time.Now()
@@ -378,6 +405,10 @@ func TestGrokPresentedToken_MatchesTheUsableTokenResolver(t *testing.T) {
 			`{"` + grokExactOIDCScope + `":{"id_token":"id-only","expires_at":"2099-01-01T00:00:00Z"}}`, "id-only"},
 		{"access token before id_token", "auth.json",
 			`{"` + grokExactOIDCScope + `":{"access_token":"access","id_token":"id"}}`, "access"},
+		{"token before access_token, as grokAuthExpiry reads it", "auth.json",
+			`{"` + grokExactOIDCScope + `":{"access_token":"access","token":"tok"}}`, "tok"},
+		{"key before every other credential", "auth.json",
+			`{"` + grokExactOIDCScope + `":{"key":"k","token":"tok","access_token":"access"}}`, "k"},
 		{"legacy cached_token.json", "cached_token.json",
 			`{"cached_token":{"access_token":"legacy-access","id_token":"legacy-id"}}`, "legacy-access"},
 	}
@@ -657,6 +688,13 @@ func TestGrokScopedAuthClaims_IdentityFromThePresentedCredentialOnly(t *testing.
 		{
 			"opaque key without identity fields",
 			`{"` + grokExactOIDCScope + `":{"key":"opaque-key","id_token":"` + other + `"}}`,
+			"",
+		},
+		{
+			// The OIDC scope is what Grok presents; the legacy scope's login is
+			// never used, so it must not name the account either.
+			"opaque OIDC scope never falls through to the legacy scope",
+			`{"` + grokExactOIDCScope + `":{"token":"opaque-oidc"},"` + grokExactLegacyScope + `":{"key":"` + other + `"}}`,
 			"",
 		},
 		{

@@ -354,7 +354,7 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 			// A refresh token is renewal metadata, not the credential Grok
 			// presents. Skip refresh-only preferred scopes just as Grok's
 			// resolver does, allowing it to fall back to a token-bearing scope.
-			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
+			token := grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken)
 			if token == "" {
 				continue
 			}
@@ -435,6 +435,15 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// grokScopedCredential is the credential Grok's resolver presents from one
+// scoped auth entry: key, then token, then access_token, then id_token. Every
+// reader of a scoped entry — expiry, usability, identity and the live billing
+// probe — picks through this one function, so the probe can never send a
+// different credential from the one the expiry and identity describe.
+func grokScopedCredential(key, token, accessToken, idToken string) string {
+	return firstNonEmpty(key, token, accessToken, idToken)
+}
+
 // grokHasUsableToken reports whether Grok's auth file carries a non-empty
 // credential Grok's resolver would present — regardless of whether that token's
 // expiry or identity is parseable. grokAuthNotice uses it to avoid a false "not
@@ -467,7 +476,7 @@ func grokHasUsableToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[key]
-			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
+			if grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
 				return true
 			}
 		}
@@ -523,7 +532,7 @@ func grokHasRefreshToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			entry := scoped[key]
-			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
+			if grokScopedCredential(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
 				return entry.RefreshToken != ""
 			}
 		}
@@ -760,15 +769,15 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	}
 	for _, k := range grokScopeKeysByPrecedence(keys) {
 		v := scoped[k]
-		// Identity comes from the ONE credential grokPresentedToken sends — the
-		// first of key, access_token, token, id_token — so a scope whose only
+		// Identity comes from the ONE credential grokPresentedToken sends —
+		// grokScopedCredential's pick — so a scope whose only
 		// credential is an `access_token` or `id_token` still fingerprints. A
 		// sibling credential is never consulted: with an opaque `key` beside a
 		// stale `access_token` JWT from another login, the billing reading taken
 		// with `key` would otherwise be cached under that other account. When
 		// the presented credential is opaque, only the entry's explicit identity
 		// fields below name the account.
-		presented := firstNonEmpty(v.Key, v.AccessToken, v.Token, v.IDToken)
+		presented := grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken)
 		if presented == "" {
 			continue
 		}
@@ -792,9 +801,16 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		hasIdentity := firstNonEmpty(
 			entry.Email, entry.Account, entry.UserName, entry.UserID, entry.Subject,
 		) != ""
+		// This is the scope Grok presents, so it is the ONLY scope that may name
+		// the account — stop here even when it names nothing. Walking on would
+		// fingerprint a lower-precedence sibling's login, and the billing reading
+		// taken with THIS credential would be cached under that other account
+		// (the post-request fingerprint check repeats this same resolution, so it
+		// could not catch the mismatch). Unknown is the honest answer.
 		if parsed || hasIdentity {
 			return entry, true
 		}
+		return claims, false
 	}
 	return claims, false
 }
