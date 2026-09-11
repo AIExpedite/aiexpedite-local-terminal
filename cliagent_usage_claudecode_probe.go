@@ -1022,7 +1022,7 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	if base == "" {
 		return claudeUsageProbeIdentity{}
 	}
-	raw, ok := readClaudeCredentialsRaw(base)
+	raw, ok := readClaudeCredentialsRaw(context.Background(), base)
 	if !ok {
 		return claudeUsageProbeIdentity{}
 	}

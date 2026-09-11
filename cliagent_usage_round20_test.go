@@ -24,7 +24,10 @@ func TestGatherReservesSumOverTheParsersStillToRun(t *testing.T) {
 		}
 	}
 	probe := cliAgentModelDiscoveryGatherReserve
-	want := []time.Duration{3 * probe, 2 * probe, probe, 0, 0}
+	// Claude reserves one window per bounded child it runs serially (round 22);
+	// codex and opencode take the one-window default.
+	claude := time.Duration(claudeCodeUsageParser{}.SerialProbeCount()) * probe
+	want := []time.Duration{claude + 2*probe, 2 * probe, probe, 0, 0}
 	got := cliAgentUsageGatherReservesAfter(run)
 	for i := range want {
 		if got[i] != want[i] {

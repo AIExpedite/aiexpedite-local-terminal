@@ -381,10 +381,27 @@ func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 	if parser == nil {
 		return 0
 	}
-	if _, bounded := parser.(cliAgentUsageContextParser); bounded {
-		return cliAgentModelDiscoveryGatherReserve
+	if _, bounded := parser.(cliAgentUsageContextParser); !bounded {
+		return 0
 	}
-	return 0
+	// A parser that runs SEVERAL bounded children one after another needs all of
+	// their windows held back, not one (Claude: Keychain read, usage request,
+	// auth status). One window is the default for a bounded parser that does not
+	// declare a count.
+	probes := 1
+	if counter, declares := parser.(cliAgentUsageSerialProbeCounter); declares {
+		if n := counter.SerialProbeCount(); n > probes {
+			probes = n
+		}
+	}
+	return time.Duration(probes) * cliAgentModelDiscoveryGatherReserve
+}
+
+// cliAgentUsageSerialProbeCounter is implemented by a bounded parser that runs
+// MORE than one bounded child serially in a single refresh, so the reserve held
+// back for it covers the whole sequence.
+type cliAgentUsageSerialProbeCounter interface {
+	SerialProbeCount() int
 }
 
 // cliAgentUsageGatherReservesAfter returns, for each position in the ordered

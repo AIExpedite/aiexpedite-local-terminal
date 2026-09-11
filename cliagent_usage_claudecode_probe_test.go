@@ -2052,7 +2052,7 @@ func TestClaudeUsageProbe_ReadsTheCredentialStoreOnce(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q}}`, probeTestToken)), true
 	}
@@ -2081,7 +2081,7 @@ func TestRefreshClaudeUsageIfStale_MakesNoCredentialRead(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return nil, false
 	}
@@ -2259,7 +2259,7 @@ func countClaudeCredentialReads(t *testing.T) *int64 {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q}}`, probeTestToken)), true
 	}

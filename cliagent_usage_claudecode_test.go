@@ -19,7 +19,7 @@ func stubClaudeProbes(t *testing.T, loggedIn, known bool) {
 		claudeKeychainReader = originalKeychain
 		claudeAuthStatusProbe = originalProbe
 	})
-	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+	claudeKeychainReader = func(context.Context) ([]byte, bool) { return nil, false }
 	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return loggedIn, known }
 }
 
