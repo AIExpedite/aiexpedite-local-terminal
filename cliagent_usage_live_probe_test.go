@@ -961,3 +961,29 @@ func TestGrokIdentityCandidates_PresentedClaimsOnlyWhenTheyNameTheAccount(t *tes
 		})
 	}
 }
+
+// TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount: identity fields
+// for A beside a credential claiming B's plan keep A's account and never label
+// it with B's plan; when the credential alone names the account, its plan does
+// come with it.
+func TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount(t *testing.T) {
+	jwtB := unsignedJWT(t, map[string]any{"email": "b@example.com", "plan": "SuperGrok Heavy"})
+	cases := []struct {
+		name              string
+		auth              map[string]any
+		wantAcct, wantPln string
+	}{
+		{"A's fields win, B's plan not borrowed", map[string]any{"email": "a@example.com", "access_token": jwtB}, "a@example.com", ""},
+		{"credential names the account and its plan", map[string]any{"access_token": jwtB}, "b@example.com", "SuperGrok Heavy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), tc.auth)
+			account, plan := readGrokAccountAndPlan(base)
+			if account != tc.wantAcct || plan != tc.wantPln {
+				t.Errorf("account/plan=%q/%q, want %q/%q", account, plan, tc.wantAcct, tc.wantPln)
+			}
+		})
+	}
+}

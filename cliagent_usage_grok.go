@@ -664,15 +664,6 @@ func readGrokAccountAndPlan(base string) (string, string) {
 			auth.CachedToken.Subject,
 			claims.Subject,
 		)
-		presented := auth.presentedClaims()
-		account = firstNonEmpty(
-			account,
-			presented.Email,
-			presented.Account,
-			presented.UserName,
-			presented.UserID,
-			presented.Subject,
-		)
 		plan = firstNonEmpty(
 			auth.Plan,
 			auth.PlanType,
@@ -680,9 +671,23 @@ func readGrokAccountAndPlan(base string) (string, string) {
 			auth.Subscription,
 			claims.Plan,
 			claims.PlanType,
-			presented.Plan,
-			presented.PlanType,
 		)
+		// The presented credential speaks for the login only when nothing else
+		// named the account. Beside identity fields that name someone else, its
+		// account AND its plan belong to that other login.
+		if account == "" {
+			presented := auth.presentedClaims()
+			account = firstNonEmpty(
+				presented.Email,
+				presented.Account,
+				presented.UserName,
+				presented.UserID,
+				presented.Subject,
+			)
+			if account != "" {
+				plan = firstNonEmpty(plan, presented.Plan, presented.PlanType)
+			}
+		}
 	}
 	// Scoped fallback: the installer-produced `auth.json` does not match the
 	// flat shape above — every top-level key is an auth scope whose value is a
