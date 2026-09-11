@@ -90,9 +90,10 @@ func TestAttachCLIAgentModelDiscoveryOpenCodeCollapsesRepeatedIDs(t *testing.T) 
 	if len(usage.Models) != 2 || len(usage.ModelDetails) != 2 {
 		t.Fatalf("repeats must collapse in both lists: %v / %#v", usage.Models, usage.ModelDetails)
 	}
-	// A repeat is not a lost model: the catalog is still the whole list.
-	if usage.ModelsExhaustive == nil || !*usage.ModelsExhaustive {
-		t.Fatal("deduplication alone must not make the catalog non-exhaustive")
+	// OpenCode discovery is always a floor (a session's project config can add
+	// models), so the flag is reported and false.
+	if usage.ModelsExhaustive == nil || *usage.ModelsExhaustive {
+		t.Fatal("OpenCode discovery must report a non-exhaustive catalog")
 	}
 	if _, _, _, err := canonicalCLIUsageRefreshReceipt("r", 1, true, []cliAgentUsage{*usage}, nil); err != nil {
 		t.Fatalf("must canonicalize: %v", err)

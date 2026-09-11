@@ -513,11 +513,12 @@ func TestModelDiscoveryDropsAModelIDTheReceiptWouldReject(t *testing.T) {
 	}
 }
 
-// OpenCode's list is truncated at the receipt cap by its readiness parser, and
-// an id the detail row cannot carry is listed but not reported. Either way the
-// reported set is not everything OpenCode accepts, so claiming it is exhaustive
-// would let routing veto a pin to a model OpenCode really runs.
-func TestOpenCodeModelsAreNonExhaustiveWhenTheListWasCutDown(t *testing.T) {
+// OpenCode's device-level probe runs without a session cwd, so a project-level
+// opencode.json can add models it never lists; its list may also be truncated
+// at the receipt cap or lose an id the detail row cannot carry. The reported
+// set is never provably everything a session accepts, so claiming it is
+// exhaustive would let routing veto a pin to a model OpenCode really runs.
+func TestOpenCodeModelsAreNeverExhaustive(t *testing.T) {
 	exhaustiveFor := func(ids []string) bool {
 		usage := &cliAgentUsage{Models: ids}
 		attachCLIAgentModelDiscovery(context.Background(), "opencode", detectedCLIAgent{Detected: true}, usage, "", time.Now())
@@ -527,8 +528,8 @@ func TestOpenCodeModelsAreNonExhaustiveWhenTheListWasCutDown(t *testing.T) {
 		return *usage.ModelsExhaustive
 	}
 
-	if !exhaustiveFor([]string{"anthropic/claude-opus-5", "openai/gpt-5.4"}) {
-		t.Fatal("a short, fully-reportable list IS the whole catalog")
+	if exhaustiveFor([]string{"anthropic/claude-opus-5", "openai/gpt-5.4"}) {
+		t.Fatal("a short list from the daemon's cwd is not a session's whole catalog")
 	}
 
 	atCap := make([]string, cliUsageMaxModelsPerProvider)

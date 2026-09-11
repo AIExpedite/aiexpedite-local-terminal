@@ -245,13 +245,8 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 		// duplicate model identity.
 		legacy := make([]string, 0, len(usage.Models))
 		seen := map[string]bool{}
-		dropped := false
 		for _, id := range usage.Models {
-			if seen[id] {
-				continue // a repeat is not a lost model
-			}
-			if id == "" || !bounded(id, cliUsageMaxLegacyModelIDLength) {
-				dropped = true // a listed model the receipt cannot carry IS
+			if seen[id] || id == "" || !bounded(id, cliUsageMaxLegacyModelIDLength) {
 				continue
 			}
 			seen[id] = true
@@ -263,14 +258,13 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 			details = append(details, cliAgentModelDetail{ID: id})
 		}
 		usage.ModelDetails = boundedModelDetails(details)
-		// The readiness probe stops reading at the receipt cap, so a list AT
-		// the cap may be a truncated catalog; and a provider id the detail row
-		// cannot carry (over its id bound) was listed but is not reported.
-		// Either way the details are not everything OpenCode accepts, and an
-		// exhaustive flag there would let routing veto a model OpenCode runs.
-		capped := len(usage.Models) >= cliUsageMaxModelsPerProvider
-		dropped = dropped || len(usage.ModelDetails) < len(usage.Models)
-		usage.ModelsExhaustive = authBoolPtr(!capped && !dropped)
+		// OpenCode discovery is ALWAYS a floor, as Grok's is: `opencode models`
+		// runs with the daemon's cwd, but a session runs in its repo, where a
+		// project-level opencode.json can add providers and models this
+		// device-level probe never sees. (The list may also be cut at the
+		// receipt cap, or lose an id no detail row can carry.) An exhaustive
+		// claim would let routing veto a model the session runs.
+		usage.ModelsExhaustive = authBoolPtr(false)
 		return
 	}
 	var discovery cliAgentModelDiscovery

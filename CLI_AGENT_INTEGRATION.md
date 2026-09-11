@@ -351,7 +351,7 @@ Grok from `grok models` (order and default) enriched from `~/.grok/models_cache.
 which listing refreshes when signed in and which carries the per-model
 `reasoning_efforts` menu the TUI's `/model` picker shows; Claude
 Code as its alias set with the scale from `claude --help`, non-exhaustive;
-OpenCode re-shaped from its readiness probe. A user-initiated usage refresh
+OpenCode re-shaped from its readiness probe, non-exhaustive. A user-initiated usage refresh
 resets the cache. The signed refresh receipt canonicalises both fields
 (`testdata/cli_usage_refresh_receipt_vectors.json`, vector 4, mirrored in
 terminal-service), so **terminal-service must deploy first**.
@@ -425,8 +425,11 @@ Three rules keep a probe from doing damage on the way:
   `capabilities.utilization.parserKey`, as the usage parser does; OpenCode's
   legacy `models` list drops an id past its own 2048-byte receipt bound (as
   the detail rows drop one past 256) and collapses repeated ids, which the
-  receipt rejects as duplicate identities — a repeat is not a lost model, so
-  it does not lower exhaustiveness.
+  receipt rejects as duplicate identities. **OpenCode discovery is ALWAYS a
+  floor too**, for the same reason as Grok's: `opencode models` runs with the
+  daemon's cwd, while a session runs in its repo, where a project-level
+  `opencode.json` can add providers and models the device-level probe never
+  lists.
 - **Codex without a models cache still reports its configured model.** A fresh
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
@@ -457,7 +460,8 @@ whole. Three more bounds follow from the same rule (Codex round 2 on #147):
   turn the whole refresh into `usage result rejected`.
 - **A capped or filtered list is not exhaustive — for any CLI.** OpenCode's
   readiness probe stops reading AT the cap, so a list of exactly that length
-  may be truncated, and an id dropped from the details was still listed; for
+  may be truncated, and an id dropped from the details was still listed
+  (OpenCode is never exhaustive anyway — see the floor rule above); for
   Codex / Antigravity / Grok the generic branch compares the bounded details
   against what the probe returned. In every such case `modelsExhaustive` is
   false, or routing would veto a model the CLI runs. The same bound guards

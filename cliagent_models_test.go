@@ -278,7 +278,7 @@ func TestAttachCLIAgentModelDiscoveryReshapesOpenCode(t *testing.T) {
 	usage := &cliAgentUsage{Provider: "opencode", Models: []string{"ollama/qwen3-coder:30b", "opencode/big-pickle"}}
 	attachCLIAgentModelDiscovery(context.Background(), "opencode", detectedCLIAgent{Detected: true}, usage, "", time.Now())
 	want := []cliAgentModelDetail{{ID: "ollama/qwen3-coder:30b"}, {ID: "opencode/big-pickle"}}
-	if !reflect.DeepEqual(usage.ModelDetails, want) || usage.ModelsExhaustive == nil || !*usage.ModelsExhaustive {
+	if !reflect.DeepEqual(usage.ModelDetails, want) || usage.ModelsExhaustive == nil || *usage.ModelsExhaustive {
 		t.Fatalf("got %#v", usage)
 	}
 }
