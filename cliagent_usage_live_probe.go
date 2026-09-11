@@ -85,6 +85,9 @@ const (
 	liveProbeOutcomeNoReading   = "no_reading"
 	liveProbeOutcomeNotSigned   = "not_attributable"
 	liveProbeOutcomeCooldown    = "cooldown"
+	// The signed-in account changed while the probe ran, so the reading can
+	// not be attributed to the account that is signed in now.
+	liveProbeOutcomeAccountChanged = "account_changed"
 )
 
 // cliUsageRefreshWantsLiveProbe reports whether a refresh carries the signed
@@ -267,6 +270,10 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
 	ctx, cancel := context.WithTimeout(parent, codexLiveProbeTimeout)
 	defer cancel()
 
+	// The account whose credential the child is about to load. The reading it
+	// returns belongs to THAT account, whatever auth.json says by the time it
+	// arrives.
+	spawnedFingerprint := currentCodexAccountFingerprint()
 	cmd := exec.Command(codexPath, buildCodexAppServerArgs(nil)...)
 	cmd.Dir = os.TempDir()
 	cmd.Env = absoluteCodexHomeEnv(sanitizeCodexAppServerEnv(os.Environ()))
@@ -302,7 +309,7 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
 	}()
 
 	result := make(chan string, 1)
-	go func() { result <- codexLiveProbeConverse(stdin, stdout) }()
+	go func() { result <- codexLiveProbeConverse(stdin, stdout, spawnedFingerprint) }()
 	select {
 	case outcome := <-result:
 		return outcome
@@ -340,7 +347,10 @@ func absoluteCodexHomeEnv(env []string) []string {
 
 // codexLiveProbeConverse runs the initialize → read exchange over the child's
 // stdio. Split out so tests can drive it with pipes instead of a real Codex.
-func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader) string {
+// spawnedFingerprint is the account the child was started under; the reading
+// is cached under it, and dropped when a `codex login` or account switch
+// changed the signed-in account while the request was in flight.
+func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprint string) string {
 	send := func(frame map[string]any) bool {
 		b, err := json.Marshal(frame)
 		if err != nil {
@@ -392,7 +402,10 @@ func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader) string {
 			if err != nil {
 				return liveProbeOutcomeRPCError
 			}
-			captureCodexRateLimitLine(string(envelope), time.Now())
+			if currentCodexAccountFingerprint() != spawnedFingerprint {
+				return liveProbeOutcomeAccountChanged
+			}
+			captureCodexRateLimitLineForAccount(string(envelope), time.Now(), spawnedFingerprint)
 			return liveProbeOutcomeOK
 		}
 	}

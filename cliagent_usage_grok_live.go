@@ -291,7 +291,10 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 
 	observedAt := now().UTC()
 	var rec grokBillingRecord
-	rec.TS = observedAt.Format(time.RFC3339)
+	// Nanosecond precision: Grok's own log stamps carry milliseconds, and the
+	// parser's newest-wins comparison must not see a same-second log record as
+	// newer than this reading because the fraction was truncated.
+	rec.TS = observedAt.Format(time.RFC3339Nano)
 	rec.Ctx.Config = config
 	snap, ok := grokBillingSnapshotFromRecord(rec)
 	if !ok || (!snap.HasUsedPercent && snap.PeriodType == "") {
@@ -311,7 +314,7 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 func grokBillingLiveFromSnapshot(snap grokBillingSnapshot, fingerprint string) grokBillingLiveCache {
 	out := grokBillingLiveCache{
 		SchemaVersion:      grokBillingLiveSchemaVersion,
-		ObservedAt:         snap.ObservedAt.UTC().Format(time.RFC3339),
+		ObservedAt:         snap.ObservedAt.UTC().Format(time.RFC3339Nano),
 		AccountFingerprint: fingerprint,
 		PeriodType:         clampAntigravityQuotaField(snap.PeriodType, antigravityQuotaMaxBucketFieldBytes),
 	}
@@ -366,7 +369,7 @@ func loadGrokBillingLiveSnapshot(fingerprint string) (grokBillingSnapshot, bool)
 	if !readJSONFile(grokBillingLiveCachePath(), &entry) || entry.AccountFingerprint != fingerprint {
 		return grokBillingSnapshot{}, false
 	}
-	observed, err := time.Parse(time.RFC3339, entry.ObservedAt)
+	observed, err := time.Parse(time.RFC3339Nano, entry.ObservedAt)
 	if err != nil {
 		return grokBillingSnapshot{}, false
 	}

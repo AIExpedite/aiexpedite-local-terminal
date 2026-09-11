@@ -117,7 +117,7 @@ func TestCodexLiveProbeConverse_CapturesPoolsAndDropsMissingWindow(t *testing.T)
 	)
 
 	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q, want ok", got)
 	}
 	if seen := <-methods; len(seen) != 3 || seen[0] != "initialize" || seen[1] != "initialized" || seen[2] != "account/rateLimits/read" {
@@ -166,7 +166,7 @@ func TestCodexMetrics_PoolRowsDisappearWhenPoolIsGone(t *testing.T) {
 	isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// A later read in which the account no longer has the Spark pool, and the
@@ -193,7 +193,7 @@ func TestCodexLimitNames_SparseUpdateKeepsPoolName(t *testing.T) {
 	cache := isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// Sparse updates restate the Spark pool's numbers: one omits limitName, the
@@ -267,7 +267,7 @@ func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
 func TestCodexLiveProbeConverse_RPCErrorLeavesCacheAlone(t *testing.T) {
 	cache := isolateCodexCache(t)
 	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to fetch codex rate limits"}}`)
-	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeRPCError {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeRPCError {
 		t.Fatalf("outcome=%q, want rpc_error", got)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
@@ -776,5 +776,52 @@ func TestProbeGrokBillingLive_KeepsTheTierTheLogStated(t *testing.T) {
 	}
 	if len(usage.Metrics) == 0 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 9 {
 		t.Errorf("metrics=%+v, want the live 9%% reading to still win", usage.Metrics)
+	}
+}
+
+// TestProbeGrokBillingLive_SubsecondNewerThanASameSecondLogRecord: Grok's log
+// stamps carry milliseconds, so a live reading taken later in the same second
+// must still win newest-first — its fraction may not be truncated away.
+func TestProbeGrokBillingLive_SubsecondNewerThanASameSecondLogRecord(t *testing.T) {
+	home := isolateGrok(t)
+	second := time.Now().UTC().Truncate(time.Second)
+	writeGrokAuth(t, home, "access-A", "dan@example.com", second.Add(5*time.Hour))
+	helperWriteGrokLog(t, home,
+		`{"ts":"`+second.Add(-time.Hour).Format(time.RFC3339)+`","msg":"session start","ctx":{"user_id":"user-dan@example.com"}}`,
+		grokBillingLine(
+			second.Add(511*time.Millisecond).Format(time.RFC3339Nano), 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			second.Add(-96*time.Hour).Format(time.RFC3339), second.Add(24*time.Hour).Format(time.RFC3339)))
+	grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, grokFixtureBody(second.Add(72 * time.Hour))
+	})
+	liveAt := second.Add(900 * time.Millisecond)
+	if got := probeGrokBillingLive(context.Background(), "", func() time.Time { return liveAt }); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	usage, ok := grokUsageParser{}.Parse(filepath.Dir(home), detectedCLIAgent{Detected: true}, liveAt)
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	if len(usage.Metrics) == 0 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 9 {
+		t.Errorf("metrics=%+v, want the live 9%% reading, not the same-second 33%% log record", usage.Metrics)
+	}
+}
+
+// TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped: the reading
+// belongs to the credential the child was spawned with. When auth.json names a
+// different account by the time it arrives, nothing may be cached — otherwise
+// account A's limits would be published under account B.
+func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
+	cache := isolateCodexCache(t)
+	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(time.Now()))
+	spawnedUnder := fingerprintAccount("codex", "account-A")
+	if spawnedUnder == currentCodexAccountFingerprint() {
+		t.Fatal("fixture must sign a different account in than the one spawned")
+	}
+	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder); got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChanged)
+	}
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Errorf("a reading from another account must not be cached (stat err=%v)", err)
 	}
 }

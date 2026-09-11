@@ -1023,6 +1023,14 @@ func codexReconcileIdentitySupersession(contributors map[string]map[string]codex
 // into the on-disk cache. Best-effort: every failure is silent (this runs in
 // the hot streaming path and must never break a session).
 func captureCodexRateLimitLine(line string, now time.Time) {
+	captureCodexRateLimitLineForAccount(line, now, currentCodexAccountFingerprint())
+}
+
+// captureCodexRateLimitLineForAccount is captureCodexRateLimitLine with the
+// account named by the caller rather than re-read from disk at receipt. The
+// live probe uses it to pin a reading to the account its child was spawned
+// under.
+func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint string) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
 		return
@@ -1061,7 +1069,7 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	}
 	mergeCodexRateLimitCachePerLimitProgressWithLock(
 		codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
-		now, currentCodexAccountFingerprint(), nil, "", true, extractCodexLimitNames(raw))
+		now, fingerprint, nil, "", true, extractCodexLimitNames(raw))
 }
 
 // extractCodexLimitNames returns the display name of every metered limit a
