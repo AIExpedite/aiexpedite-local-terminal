@@ -220,6 +220,52 @@ func RefreshMachineInfoNow() {
 	machineInfoMu.Unlock()
 }
 
+// machineInfoGathersInFlight counts full machine gathers running on a
+// background goroutine. A gather is not cancellable once started —
+// GatherReadinessOnly returns on its context while the gather it launched runs
+// on — and its last act is every CLI's usage parser, which reads process-global
+// state (PATH, the Claude cache path and probe endpoint). The counter lets a
+// test drain such a gather before it switches those fixtures, so a gather from
+// one test can never probe against the next test's.
+var (
+	machineInfoGathersMu       sync.Mutex
+	machineInfoGathersInFlight int
+)
+
+// gatherMachineInfoTracked is gatherMachineInfo counted in
+// machineInfoGathersInFlight for its whole duration.
+func gatherMachineInfoTracked() *MachineInfo {
+	machineInfoGathersMu.Lock()
+	machineInfoGathersInFlight++
+	machineInfoGathersMu.Unlock()
+	defer func() {
+		machineInfoGathersMu.Lock()
+		machineInfoGathersInFlight--
+		machineInfoGathersMu.Unlock()
+	}()
+	return gatherMachineInfo()
+}
+
+// drainMachineInfoGathers waits until no background gather is running, or
+// until timeout passes, and reports whether it drained. Test seam: a fixture
+// that switches process-global state a gather's parsers read must call it
+// first.
+func drainMachineInfoGathers(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		machineInfoGathersMu.Lock()
+		inFlight := machineInfoGathersInFlight
+		machineInfoGathersMu.Unlock()
+		if inFlight == 0 {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // StartMachineInfoGathering launches the background goroutine that
 // populates the cache. Safe to call once at startup; the loop runs for the
 // process lifetime, refreshing every machineInfoRefreshInterval.

@@ -336,6 +336,143 @@ Agents tab reads from `cliAgents[]` (see
 `grok login`, the entry still appears with empty account + dashed capacity
 gauges so the user sees they need to authenticate.
 
+## Model and effort discovery (Ship B5)
+
+Every provider snapshot in `cliAgents[]` also carries what the CLI itself says
+about its models — `modelDetails[{id, label, efforts, defaultEffort, noEffort}]`
+and `modelsExhaustive` — probed once per binary and cached for 30 minutes
+([cliagent_models.go](cliagent_models.go)): Codex from `~/.codex/models_cache.json`
+plus the top-level `model` in `config.toml` (a cache written by a different
+Codex build, or one missing the configured model, is reported non-exhaustive —
+two Codex clients share that file); Antigravity from `agy models`, folding the
+effort-suffixed slugs (`gemini-3.8-flash-high`) into one family with a scale
+and marking unsuffixed slugs `noEffort` (`agy` refuses `--effort` for them);
+Grok from `grok models` (order and default) enriched from `~/.grok/models_cache.json`,
+which listing refreshes when signed in and which carries the per-model
+`reasoning_efforts` menu the TUI's `/model` picker shows; Claude
+Code as its alias set with the scale from `claude --help`, non-exhaustive;
+OpenCode re-shaped from its readiness probe, non-exhaustive. A user-initiated usage refresh
+resets the cache. The signed refresh receipt canonicalises both fields
+(`testdata/cli_usage_refresh_receipt_vectors.json`, vector 4, mirrored in
+terminal-service), so **terminal-service must deploy first**.
+`AIX_B5_HARNESS_OUT=<file> go test -run TestB5ModelDiscoveryHarness -v` runs the
+real probes on this machine and writes the snapshot.
+
+Three rules keep a probe from doing damage on the way:
+
+- **A probe's deadline is derived, never fresh.** `runCLIAgentModelProbe` takes
+  the caller's gather context and layers its own 20s cap on top, so
+  `GatherCLIAgentUsageOnly` — which runs every provider serially under one 10s
+  deadline — can never be held past that by a slow `agy models`. An
+  inconclusive probe whose context expired is NOT cached, or one refresh that
+  ran out of time would hide the agent's models for the whole 30-minute TTL.
+  Under a bounded gather the probes are rationed by ONE
+  `cliAgentDiscoveryBudget` shared across every provider (4s of time actually
+  spent per gather, at most 2s per probe), and a probe never takes what the
+  providers still to be polled need — 3s (one utilization probe) for each
+  later parser that performs bounded I/O (Claude, Codex, OpenCode; Antigravity
+  and Grok read local state), summed by `cliAgentUsageGatherReservesAfter`
+  over the ordered run, so the first provider on a fully loaded box gets a
+  short probe and the last gets the full cap. A probe the gather cannot afford is skipped
+  and the cache answers; a cold cache reports nothing and the next gather asks.
+  Discovery as a whole is therefore bounded under the refresh deadline. The
+  same rule reaches OpenCode's readiness probes: `openCodeUsageParser`
+  implements `ParseContext`, so `opencode models` and `opencode auth list`
+  derive their 3s caps from the gather context (the earlier deadline wins) and
+  an answer the deadline cut is returned uncached with the forced re-probe
+  intact, instead of pinning "unknown" to the card for the readiness TTL. The
+  optional `auth list` gets only what the gather can spare beyond the same 3s
+  reserve (`optionalOpenCodeProbeContext`) and is skipped otherwise — the
+  provider names then derive from the listed model ids — so a stall there can
+  never have the conclusive `models` answer discarded as canceled. Claude's
+  `claude auth status --json` (`claudeAuthStatusProbe`) takes the gather
+  context the same way, so both of Claude's probes end with the gather.
+- **`grok models` describes the same service, config and login as an ACP
+  session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
+  sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the
+  `grokNeutralisedIntegrationSwitches` pinned to 0) and restores an explicit
+  allowlist — `grokModelListRoutingEnv`: `GROK_HOME` (the login and cache
+  directory the merged cache is read from), `GROK_CONFIG_PATH`, the endpoint
+  overrides (`GROK_API_BASE_URL`, `GROK_MODELS_BASE_URL`,
+  `GROK_MODELS_LIST_URL`, `XAI_API_BASE_URL`) — plus `XAI_API_KEY` ONLY when
+  `Config.EnableGrokAPIKeyFallback` is on, the same opt-in the ACP launch
+  honours. Not the whole `GROK_*` family: `GROK_LOG_FILE` and
+  `GROK_FUTURE_EXECUTION_OVERRIDE` change what a headless child DOES (a raw
+  diagnostics sink outside the isolated home, a swapped execution path) and
+  the smoke suite pins that no such sink is ever written. Listing with the
+  routing vars stripped would ask the default service for a catalog the
+  configured sessions never use, or list logged-out on a key-authenticated
+  host, and publish that as exhaustive. And the list runs against an
+  ISOLATED home built by `setupIsolatedGrokHomeFrom` exactly as a managed
+  session's is — cached login copied in, the persisted `[model] api_key` only
+  under the same opt-in — so a key the user never opted into cannot
+  authenticate the list and publish another account's catalog; the cache the
+  list just refreshed there is read first, the real home's cache is the
+  fallback. If the isolated home cannot be built the list is NOT run against
+  the real home — it fails closed like a managed session, and the cache alone
+  answers. The isolated home is seeded with the ACP default runtime model
+  (`grokACPDefaultModel`) so a key kept in the per-model
+  `[model.<runtime>] api_key` form rides along under the opt-in as it does for
+  a session. **Grok discovery is ALWAYS a floor** (`mergeGrokDiscovery` never
+  raises `Exhaustive`): which account a session runs as is decided per
+  session — the opt-in key, a per-model persisted key, an external
+  `GROK_CONFIG_PATH` (possibly relative to the session's cwd), and the
+  project's own `.grok/config.toml` found upward from that cwd — and a
+  device-level probe has no session cwd, so it cannot prove it listed the
+  catalog a given session will see; an exhaustive claim would let routing
+  veto a model that session accepts. A backend catalog entry
+  with its own id reaches discovery through its
+  `capabilities.utilization.parserKey`, as the usage parser does; OpenCode's
+  legacy `models` list drops an id past its own 2048-byte receipt bound (as
+  the detail rows drop one past 256) and collapses repeated ids, which the
+  receipt rejects as duplicate identities. **OpenCode discovery is ALWAYS a
+  floor too**, for the same reason as Grok's: `opencode models` runs with the
+  daemon's cwd, while a session runs in its repo, where a project-level
+  `opencode.json` can add providers and models the device-level probe never
+  lists.
+- **Codex without a models cache still reports its configured model.** A fresh
+  install or a cleared cache reports the top-level `model` from `config.toml`
+  (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
+  not nothing.
+- **A Codex cache is ALWAYS a floor.** `models_cache.json` is server-fetched
+  and only a `codex` run refreshes it, so the catalog can gain a model with no
+  binary upgrade and a same-`client_version` cache would not know; Codex
+  discovery is therefore never exhaustive (the writer-version comparison still
+  drives Grok, whose list probe refreshes its cache live). And a model whose
+  listed levels are all outside the shared union has an UNKNOWN scale —
+  `noEffort` is reported only when Codex listed no levels at all, because
+  `noEffort` tells the resolver to drop the flag.
+- **Cache-only Grok discovery is a floor.** When the list command fails but the
+  cache reads, `modelsExhaustive` is false regardless of the build-version
+  match — Grok fetches this catalog from its backend, so it can gain a model
+  with no binary upgrade and an exhaustive claim would let routing veto a model
+  the CLI accepts.
+
+Both `modelDetails` and the legacy `models` list are truncated to
+`cliUsageMaxModelsPerProvider`; the receipt rejects a provider that exceeds it
+on either field, so an over-cap vendor answer must never reach `canonicalProvider`
+whole. Three more bounds follow from the same rule (Codex round 2 on #147):
+
+- **A detail row the receipt would reject is dropped, not carried.** A model id
+  over 256 bytes (the `modelDetails[].id` bound — the legacy `models` list
+  allows 2048) or an empty id is filtered by `boundedModelDetails` before the
+  cap, so a user-configured OpenCode provider id or a long vendor slug cannot
+  turn the whole refresh into `usage result rejected`.
+- **A capped or filtered list is not exhaustive — for any CLI.** OpenCode's
+  readiness probe stops reading AT the cap, so a list of exactly that length
+  may be truncated, and an id dropped from the details was still listed
+  (OpenCode is never exhaustive anyway — see the floor rule above); for
+  Codex / Antigravity / Grok the generic branch compares the bounded details
+  against what the probe returned. In every such case `modelsExhaustive` is
+  false, or routing would veto a model the CLI runs. The same bound guards
+  `model`: a configured or reported default past 256 bytes is left unset
+  rather than copied into a field `canonicalProvider` would reject.
+- **A reset invalidates probes already in flight.** The cache carries a
+  generation that every reset advances; a probe stores its answer only under
+  the generation it started in. Otherwise the six-hour gather mid-probe when a
+  user forces a refresh would repopulate the cache with its pre-reset list and
+  the refresh would read that for the whole TTL.
+
 ## Why ACP, not TUI scraping
 
 `grok` (no subcommand) launches an interactive TUI built around terminal

@@ -88,7 +88,13 @@ type cliAgentUsage struct {
 	// providers the user configured and exposes no quota of its own, so the list
 	// of reachable models IS the useful content of its card. Additive, like
 	// Model — parsers that cannot enumerate simply leave it nil.
-	Models             []string              `json:"models,omitempty"`
+	Models []string `json:"models,omitempty"`
+	// ModelDetails is what the CLI itself says about each model — label, the
+	// effort scale it accepts, its default level — and ModelsExhaustive says
+	// whether that list is everything the CLI will run (Ship B5,
+	// cliagent_models.go). Additive like Models: an older backend ignores both.
+	ModelDetails       []cliAgentModelDetail `json:"modelDetails,omitempty"`
+	ModelsExhaustive   *bool                 `json:"modelsExhaustive,omitempty"`
 	AccountFingerprint string                `json:"accountFingerprint,omitempty"`
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`
@@ -210,6 +216,11 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
+		// The PARSER key, as for the usage parser above: a backend catalog
+		// entry may carry its own id while naming a built-in parser through
+		// capabilities.utilization.parserKey, and discovery recognises the
+		// built-in keys only.
+		attachCLIAgentModelDiscovery(context.Background(), cliAgentCatalogParserKey(agent), entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
@@ -290,7 +301,18 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 	parsers := cliAgentUsageParserIndex()
 	out := make([]cliAgentUsage, 0, len(detected))
 	var errs []cliAgentUsageError
-
+	// ONE discovery budget for the whole gather: every provider's model probe
+	// draws on it, so discovery as a whole — not just one probe — is bounded
+	// under the refresh deadline shared with the utilization probes. The
+	// providers that will run are listed FIRST so each discovery call knows
+	// how much of the parent the parsers still behind it need.
+	discoveryBudget := newCLIAgentDiscoveryBudget(gatherCtx)
+	type gatherStep struct {
+		agent  cliAgentCatalogEntry
+		entry  detectedCLIAgent
+		parser cliAgentUsageParser
+	}
+	steps := make([]gatherStep, 0, len(detected))
 	for _, agent := range activeCLIAgentCatalog() {
 		if !cliAgentCatalogSupportsUtilization(agent) {
 			continue
@@ -299,7 +321,16 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if !ok || !entry.Detected {
 			continue
 		}
-		parser := parsers[cliAgentCatalogParserKey(agent)]
+		steps = append(steps, gatherStep{agent: agent, entry: entry, parser: parsers[cliAgentCatalogParserKey(agent)]})
+	}
+	stepParsers := make([]cliAgentUsageParser, 0, len(steps))
+	for _, step := range steps {
+		stepParsers = append(stepParsers, step.parser)
+	}
+	reservesAfter := cliAgentUsageGatherReservesAfter(stepParsers)
+
+	for i, step := range steps {
+		agent, entry, parser := step.agent, step.entry, step.parser
 		provider := agent.ID
 		// Each provider parser runs under defer-recover so a panic in one
 		// parser cannot orphan the in-flight marker on the server side.
@@ -328,6 +359,7 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
+		attachCLIAgentModelDiscoveryBudgeted(gatherCtx, discoveryBudget, reservesAfter[i], cliAgentCatalogParserKey(agent), entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
@@ -338,6 +370,50 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
 	return out, errs
+}
+
+// cliAgentUsageGatherReserve is what one provider's utilization parse may
+// need of a bounded gather: one probe's worth for a parser that performs
+// bounded I/O during refresh (it implements cliAgentUsageContextParser —
+// Claude's usage request and auth status, Codex's app-server state, OpenCode's
+// readiness probes), nothing for one that only reads local files.
+func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
+	if parser == nil {
+		return 0
+	}
+	if _, bounded := parser.(cliAgentUsageContextParser); !bounded {
+		return 0
+	}
+	// A parser that runs SEVERAL bounded children one after another needs all of
+	// their windows held back, not one (Claude: Keychain read, usage request,
+	// auth status). One window is the default for a bounded parser that does not
+	// declare a count.
+	probes := 1
+	if counter, declares := parser.(cliAgentUsageSerialProbeCounter); declares {
+		if n := counter.SerialProbeCount(); n > probes {
+			probes = n
+		}
+	}
+	return time.Duration(probes) * cliAgentModelDiscoveryGatherReserve
+}
+
+// cliAgentUsageSerialProbeCounter is implemented by a bounded parser that runs
+// MORE than one bounded child serially in a single refresh, so the reserve held
+// back for it covers the whole sequence.
+type cliAgentUsageSerialProbeCounter interface {
+	SerialProbeCount() int
+}
+
+// cliAgentUsageGatherReservesAfter returns, for each position in the ordered
+// run, the reserve the providers AFTER it need in total — what a discovery
+// probe at that position must leave the parent gather (Codex round 20 on
+// #147: a one-probe holdback covered one later parser, not the sequence).
+func cliAgentUsageGatherReservesAfter(parsers []cliAgentUsageParser) []time.Duration {
+	reserves := make([]time.Duration, len(parsers))
+	for i := len(parsers) - 2; i >= 0; i-- {
+		reserves[i] = reserves[i+1] + cliAgentUsageGatherReserve(parsers[i+1])
+	}
+	return reserves
 }
 
 // runProviderParseSafely invokes a parser under defer-recover and the

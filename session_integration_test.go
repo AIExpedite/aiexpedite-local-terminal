@@ -75,7 +75,7 @@ func TestMain(m *testing.M) {
 	// "Claude Code-credentials" item would otherwise leak that real login into
 	// file-based tests. Default the reader to "no keychain credential"; tests that
 	// exercise the Keychain path override claudeKeychainReader explicitly.
-	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+	claudeKeychainReader = func(context.Context) ([]byte, bool) { return nil, false }
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through

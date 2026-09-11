@@ -73,8 +73,8 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 3 {
-		t.Fatal("expected three shared vectors")
+	if len(vectors.Vectors) != 4 {
+		t.Fatal("expected four shared vectors")
 	}
 	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
@@ -181,8 +181,8 @@ func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 3 {
-		t.Fatal("expected three shared vectors")
+	if len(vectors.Vectors) != 4 {
+		t.Fatal("expected four shared vectors")
 	}
 	if text != vectors.Vectors[2].Canonical {
 		t.Fatalf("unexpected protocol canonical bytes: %s", text)

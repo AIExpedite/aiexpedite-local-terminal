@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"testing"
@@ -18,8 +19,8 @@ func stubClaudeProbes(t *testing.T, loggedIn, known bool) {
 		claudeKeychainReader = originalKeychain
 		claudeAuthStatusProbe = originalProbe
 	})
-	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
-	claudeAuthStatusProbe = func(string) (bool, bool) { return loggedIn, known }
+	claudeKeychainReader = func(context.Context) ([]byte, bool) { return nil, false }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return loggedIn, known }
 }
 
 // seedClaudeRateLimitCache points the parser at an isolated cache holding the

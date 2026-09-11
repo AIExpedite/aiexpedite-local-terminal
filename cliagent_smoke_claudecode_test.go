@@ -100,7 +100,7 @@ func stubSmokeExec(t *testing.T, fn func(ctx context.Context, args []string, pro
 func stubAuthProbe(t *testing.T, loggedIn, known bool) {
 	t.Helper()
 	original := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(path string) (bool, bool) { return loggedIn, known }
+	claudeAuthStatusProbe = func(_ context.Context, path string) (bool, bool) { return loggedIn, known }
 	t.Cleanup(func() { claudeAuthStatusProbe = original })
 }
 
@@ -849,7 +849,7 @@ func TestRunCLISmoke_FreePrecheckVerdictsAreNotPinnedByTheCooldown(t *testing.T)
 
 	authLoggedIn := false
 	original := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(string) (bool, bool) { return authLoggedIn, true }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return authLoggedIn, true }
 	t.Cleanup(func() { claudeAuthStatusProbe = original })
 
 	calls := stubSmokeExec(t, func(ctx context.Context, args []string, prompt string) ([]byte, []byte, error) {
@@ -885,7 +885,7 @@ func TestRunCLISmoke_CachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
 
 	authLoggedIn := true
 	original := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(string) (bool, bool) { return authLoggedIn, true }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return authLoggedIn, true }
 	t.Cleanup(func() { claudeAuthStatusProbe = original })
 
 	calls := stubSmokeExec(t, func(ctx context.Context, args []string, prompt string) ([]byte, []byte, error) {
@@ -915,7 +915,7 @@ func TestRunCLISmoke_CachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
 	// An inconclusive probe (a working env-credential login looks exactly like
 	// this) must still replay, mirroring the "inconclusive proceeds" rule in
 	// the probe itself: refusing there would re-spend a turn on every poll.
-	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, false }
 	if result, replayed := runCLISmoke(context.Background(), "claudeCode"); replayed || result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("inconclusive auth = %+v (replayed=%v), want a fresh success to seed the cooldown", result, replayed)
 	}

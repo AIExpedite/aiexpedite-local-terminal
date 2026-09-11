@@ -47,11 +47,41 @@ var _ cliAgentUsageContextParser = (*claudeCodeUsageParser)(nil)
 
 func (claudeCodeUsageParser) Provider() string { return "claudeCode" }
 
-var claudeAuthStatusProbe = func(path string) (bool, bool) {
+// SerialProbeCount is how many bounded children ParseContext may run one after
+// another during a gather, so cliAgentUsageGatherReserve can hold back Claude's
+// WHOLE serial budget rather than one probe's worth (Codex round 22 on #147: a
+// single-window reserve let an earlier model-discovery probe spend time Claude
+// still needed, expiring the gather mid-parser — its result discarded and every
+// provider behind it reported canceled).
+//
+// The children, in order: the macOS Keychain `security` read (Darwin only), the
+// OAuth usage request when the reading is stale or forced, and `claude auth
+// status`. Each is capped at one probe window, so the count IS the reserve in
+// probe windows. This is a worst-case holdback — the Keychain item may be absent
+// and the usage reading fresh — which is the point: a reserve that assumed the
+// cheap path would under-reserve exactly when the expensive one happens.
+func (claudeCodeUsageParser) SerialProbeCount() int {
+	if runtime.GOOS == "darwin" {
+		return 3
+	}
+	return 2
+}
+
+// claudeAuthStatusProbe runs `claude auth status --json`. Its timeout DERIVES
+// from the caller's context (the earlier deadline wins): under the gather's
+// shared budget the probe ends with the gather instead of holding it past the
+// deadline on its own 3s clock — the second Claude probe after the usage
+// request, which the discovery reserve alone could not cover (Codex round 19
+// on #147). Callers without a gather pass context.Background() and keep the
+// full cap.
+var claudeAuthStatusProbe = func(ctx context.Context, path string) (bool, bool) {
 	if path == "" {
 		return false, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, machineInfoProbeTimeout)
 	defer cancel()
 	probeEnv, _ := prepareClaudeChildEnv(path, os.Environ())
 	out, err := runClaudeAuthStatusCommand(ctx, path, probeEnv)
@@ -172,11 +202,20 @@ var claudeKeychainReader = readClaudeKeychainCredential
 // an access prompt can't hang the 10s/20s usage/inspect gather contexts (it would
 // otherwise leave stuck processes on __env_inspect__ timeouts); on timeout we
 // return "no credential" and fall through to the on-disk file.
-func readClaudeKeychainCredential() ([]byte, bool) {
+//
+// Its deadline DERIVES from the caller's context (the earlier one wins), like
+// claudeAuthStatusProbe: this is the FIRST of Claude's serial bounded children in
+// a gather, so an independent 3s clock here could run on past a gather deadline
+// that expired during an earlier provider (Codex round 22 on #147). Callers
+// without a gather pass context.Background() and keep the full cap.
+func readClaudeKeychainCredential(ctx context.Context) ([]byte, bool) {
 	if runtime.GOOS != "darwin" {
 		return nil, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, machineInfoProbeTimeout)
 	defer cancel()
 	keychainCmd := exec.CommandContext(
 		ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
@@ -212,9 +251,9 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 // that profile's quota and auth-expiry notice to the default account. For a
 // non-default profile we read only its on-disk file, and report "no credential"
 // when it is absent instead of guessing.
-func readClaudeCredentialsRaw(base string) ([]byte, bool) {
+func readClaudeCredentialsRaw(ctx context.Context, base string) ([]byte, bool) {
 	if usingDefaultClaudeConfigDir() {
-		if raw, ok := claudeKeychainReader(); ok {
+		if raw, ok := claudeKeychainReader(ctx); ok {
 			return raw, true
 		}
 	}
@@ -356,7 +395,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// a second spawn here could push this parser past the whole budget and drop
 	// every provider ordered after it from the signed refresh.
 	oauthAccessToken := ""
-	if raw, ok := readClaudeCredentialsRaw(base); ok {
+	if raw, ok := readClaudeCredentialsRaw(ctx, base); ok {
 		credentialFound = true
 		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
@@ -441,7 +480,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// state a stale-but-valid credential produces — a definite loggedIn:true was
 	// discarded, the card read "Login expired", and the error notice blanked
 	// every usage bar below it.
-	if loggedIn, known := claudeAuthStatusProbe(detected.Path); known {
+	if loggedIn, known := claudeAuthStatusProbe(ctx, detected.Path); known {
 		if !loggedIn {
 			usage.Authenticated = authBoolPtr(false)
 			usage.AuthState = "missing"
@@ -632,7 +671,7 @@ func currentClaudeAccountFingerprint() string {
 		return ""
 	}
 	account := ""
-	if raw, ok := readClaudeCredentialsRaw(base); ok {
+	if raw, ok := readClaudeCredentialsRaw(context.Background(), base); ok {
 		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
 			account = creds.claudeCredentialAccount()

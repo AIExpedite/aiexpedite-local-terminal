@@ -274,9 +274,21 @@ func deriveReadinessState(findings []ReadinessFinding) string {
 // readiness report. Read-only; safe to run without user consent. Runs under a
 // bounded context so a hung probe can't stall the inspection round trip.
 func GatherReadinessOnly(ctx context.Context) ReadinessReport {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A gather is heavyweight and, once started, runs to completion on its own
+	// goroutine whatever happens to ctx below. An inspection that is already
+	// over must not spend one: the gather would outlive the request, detect
+	// whatever is on PATH by the time it finishes, and run every CLI's usage
+	// parser — the Claude probe included — against the process-global state of
+	// that later moment (the Windows CI flake in the settled-turn session tests).
+	if ctx.Err() != nil {
+		return evaluateReadiness(nil)
+	}
 	done := make(chan *MachineInfo, 1)
 	go func() {
-		done <- gatherMachineInfo()
+		done <- gatherMachineInfoTracked()
 	}()
 
 	select {

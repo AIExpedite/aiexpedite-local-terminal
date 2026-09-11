@@ -77,6 +77,13 @@ const (
 
 type openCodeUsageParser struct{}
 
+// Compile-time proof that the parser still satisfies the context parser
+// interface: runProviderParseSafely selects ParseContext through a TYPE
+// ASSERTION that fails silently, and Parse's context.Background() would let the
+// two readiness probes run their full 3s each after the gather's shared 10s
+// budget is already gone (Codex round 17 on #147).
+var _ cliAgentUsageContextParser = openCodeUsageParser{}
+
 func (openCodeUsageParser) Provider() string { return "opencode" }
 
 // openCodeReadiness is one probe cycle's answer.
@@ -132,6 +139,16 @@ func resetOpenCodeReadinessCache() {
 }
 
 func (p openCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	return p.ParseContext(context.Background(), home, detected, now)
+}
+
+// ParseContext is the gather's entry point: both readiness probes derive their
+// deadline from ctx, so under GatherCLIAgentUsageOnly's shared budget they end
+// with the gather instead of overrunning it on their own clocks.
+func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	usage := &cliAgentUsage{
 		CliAgentID:  "opencode",
 		Provider:    p.Provider(),
@@ -142,7 +159,7 @@ func (p openCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	readiness := probeOpenCodeReadiness(detected.Path, home)
+	readiness := probeOpenCodeReadiness(ctx, detected.Path, home)
 	usage.AuthState = readiness.AuthState
 	usage.Model = readiness.Model
 	// Authenticated is deliberately left NIL for "unknown": the frontend treats
@@ -173,7 +190,7 @@ func (p openCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 
 // probeOpenCodeReadiness returns the cached readiness for this binary, or runs
 // the probes when the cache is cold, expired, or a refresh forced it.
-func probeOpenCodeReadiness(executable, home string) openCodeReadiness {
+func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCodeReadiness {
 	if strings.TrimSpace(executable) == "" {
 		executable = resolveOpenCodeExecutable()
 	}
@@ -187,7 +204,14 @@ func probeOpenCodeReadiness(executable, home string) openCodeReadiness {
 		return entry.Result
 	}
 
-	result := probeOpenCodeReadinessUncached(executable, home)
+	result := probeOpenCodeReadinessUncached(ctx, executable, home)
+	if ctx != nil && ctx.Err() != nil {
+		// The probes lost the gather's deadline rather than answering. Caching
+		// that "unknown" would pin the card to it for the whole TTL (and clear
+		// the user's forced re-probe) because one refresh ran out of time, so
+		// return it uncached and let the next gather ask again.
+		return result
+	}
 
 	openCodeReadinessMu.Lock()
 	openCodeReadinessCache[executable] = openCodeReadinessEntry{At: time.Now(), Result: result}
@@ -198,10 +222,10 @@ func probeOpenCodeReadiness(executable, home string) openCodeReadiness {
 	return result
 }
 
-func probeOpenCodeReadinessUncached(executable, home string) openCodeReadiness {
+func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string) openCodeReadiness {
 	out := openCodeReadiness{AuthState: openCodeAuthUnknown}
 
-	models, modelsOK := runOpenCodeProbe(executable, "models")
+	models, modelsOK := runOpenCodeProbe(ctx, executable, "models")
 	if !modelsOK {
 		// Timeout, non-zero exit, or the binary vanished between detection and
 		// probe. We could not ask, so we do not answer — fail open.
@@ -225,8 +249,15 @@ func probeOpenCodeReadinessUncached(executable, home string) openCodeReadiness {
 	// Per-provider detail for the card. Best-effort and never affects the
 	// auth state: `auth list` failing on a machine whose models list is
 	// non-empty must not downgrade a working install.
-	if authOut, ok := runOpenCodeProbe(executable, "auth", "list"); ok {
-		out.Providers = parseOpenCodeAuthProviders(authOut)
+	// It is also OPTIONAL, so it is only handed what the gather can spare: a
+	// stall here until the parent expired would have runProviderParseSafely
+	// discard the conclusive models answer above and report the providers
+	// behind OpenCode as canceled.
+	if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
+		if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
+			out.Providers = parseOpenCodeAuthProviders(authOut)
+		}
+		release()
 	}
 	if len(out.Providers) == 0 {
 		out.Providers = openCodeProvidersFromModelIDs(modelIDs)
@@ -236,11 +267,46 @@ func probeOpenCodeReadinessUncached(executable, home string) openCodeReadiness {
 	return out
 }
 
+// openCodeOptionalProbeReserve is what the best-effort `auth list` probe leaves
+// a bounded gather for the providers still to be polled: one utilization
+// probe's worth, the same reserve model discovery keeps.
+const openCodeOptionalProbeReserve = machineInfoProbeTimeout
+
+// optionalOpenCodeProbeContext hands the best-effort `auth list` probe what the
+// gather can spare: at most openCodeProbeTimeout, and never the gather's last
+// openCodeOptionalProbeReserve. ok=false means the probe is skipped; the
+// provider names then derive from the model ids the conclusive probe listed.
+// An unbounded caller (the periodic gather) passes through unchanged.
+func optionalOpenCodeProbeContext(ctx context.Context) (probeCtx context.Context, release func(), ok bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		return ctx, func() {}, true
+	}
+	allowance := min(openCodeProbeTimeout, time.Until(deadline)-openCodeOptionalProbeReserve)
+	if allowance <= 0 {
+		return ctx, func() {}, false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, allowance)
+	return probeCtx, cancel, true
+}
+
 // runOpenCodeProbe runs `opencode <args…>` with a short timeout and returns its
 // combined output. ok=false means the probe was INCONCLUSIVE (timeout, non-zero
 // exit, spawn failure) — the caller must not read a verdict into that.
-func runOpenCodeProbe(executable string, args ...string) (string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), openCodeProbeTimeout)
+//
+// The timeout DERIVES from the caller's context rather than starting a fresh
+// one: context.WithTimeout takes the EARLIER of the two, so a probe is capped at
+// openCodeProbeTimeout on the unbounded path and at whatever the gather has
+// left on the demand-driven one — it can never hold the refresh past the
+// deadline the handler documents.
+func runOpenCodeProbe(ctx context.Context, executable string, args ...string) (string, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, openCodeProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, args...)
 	hideWindow(cmd)
@@ -294,11 +360,24 @@ func parseOpenCodeModelList(out string) []string {
 	return ids
 }
 
+// capOpenCodeModelIDs deduplicates (first occurrence wins, order kept — the
+// plain-text path already does this while scanning) BEFORE applying the
+// receipt cap, so a repeat among the first entries can never push a distinct
+// later model past the cut and leave a shortened list that reads as complete.
 func capOpenCodeModelIDs(ids []string) []string {
-	if len(ids) > cliUsageMaxModelsPerProvider {
-		return ids[:cliUsageMaxModelsPerProvider]
+	seen := make(map[string]bool, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+		if len(unique) == cliUsageMaxModelsPerProvider {
+			break
+		}
 	}
-	return ids
+	return unique
 }
 
 func parseOpenCodeModelJSON(trimmed string) []string {

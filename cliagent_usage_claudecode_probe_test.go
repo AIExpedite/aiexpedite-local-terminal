@@ -32,6 +32,14 @@ const probeTestToken = "sk-ant-oat-test-token"
 func armClaudeUsageProbe(t *testing.T, handler http.HandlerFunc) (string, *int64) {
 	t.Helper()
 
+	// Everything below is process-global (env, PATH-detected mock) and a full
+	// machine-info gather left running by an earlier test reads it at the END
+	// of its run, through the Claude usage parser — writing a probe reading into
+	// THIS test's cache before this test's run has produced one. Drain first.
+	if !drainMachineInfoGathers(2 * time.Minute) {
+		t.Fatal("a machine-info gather from an earlier test is still running; it would probe against this test's fixtures")
+	}
+
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 
@@ -2052,7 +2060,7 @@ func TestClaudeUsageProbe_ReadsTheCredentialStoreOnce(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q}}`, probeTestToken)), true
 	}
@@ -2081,7 +2089,7 @@ func TestRefreshClaudeUsageIfStale_MakesNoCredentialRead(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return nil, false
 	}
@@ -2259,7 +2267,7 @@ func countClaudeCredentialReads(t *testing.T) *int64 {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	var reads int64
 	original := claudeKeychainReader
-	claudeKeychainReader = func() ([]byte, bool) {
+	claudeKeychainReader = func(context.Context) ([]byte, bool) {
 		atomic.AddInt64(&reads, 1)
 		return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q}}`, probeTestToken)), true
 	}
