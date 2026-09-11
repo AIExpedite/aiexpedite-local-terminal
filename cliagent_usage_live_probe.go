@@ -250,7 +250,7 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
 
 	cmd := exec.Command(codexPath, buildCodexAppServerArgs(nil)...)
 	cmd.Dir = os.TempDir()
-	cmd.Env = sanitizeCodexAppServerEnv(os.Environ())
+	cmd.Env = absoluteCodexHomeEnv(sanitizeCodexAppServerEnv(os.Environ()))
 	cmd.Stderr = io.Discard
 	hideWindow(cmd)
 	// Unix: own process group, so the tree kill below reaches every child.
@@ -290,6 +290,33 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
 	case <-ctx.Done():
 		return liveProbeOutcomeTimeout
 	}
+}
+
+// absoluteCodexHomeEnv rewrites a RELATIVE CODEX_HOME into an absolute path
+// before the child inherits it. The probe runs the app-server from the system
+// temp directory (so a repo checkout is never its cwd), and a relative
+// CODEX_HOME would resolve against THAT directory instead of the daemon's —
+// pointing the child at a different or nonexistent auth/config tree than the
+// parser and the account fingerprint read. An unset or already-absolute value
+// is returned untouched.
+func absoluteCodexHomeEnv(env []string) []string {
+	out := make([]string, len(env))
+	copy(out, env)
+	for i, e := range out {
+		name, value, found := strings.Cut(e, "=")
+		if !found || !strings.EqualFold(name, "CODEX_HOME") {
+			continue
+		}
+		if strings.TrimSpace(value) == "" || filepath.IsAbs(value) {
+			continue
+		}
+		abs, err := filepath.Abs(value)
+		if err != nil {
+			continue
+		}
+		out[i] = name + "=" + abs
+	}
+	return out
 }
 
 // codexLiveProbeConverse runs the initialize → read exchange over the child's

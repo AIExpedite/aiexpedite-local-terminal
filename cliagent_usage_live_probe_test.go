@@ -567,3 +567,109 @@ func TestRunCLIUsageLiveProbes_AntigravityModelListWaitsForQuotaProbe(t *testing
 		t.Fatal("`agy models` ran alongside the quota probe; two agy runs started in the same second share one log file")
 	}
 }
+
+// TestGrokAccountFingerprint_AccessAndIDTokenScopes: the identity preflight must
+// recognize the same credential fields grokPresentedToken accepts, or a login
+// whose only credential is an access/id token is refused as no_account before
+// the token is ever used.
+func TestGrokAccountFingerprint_AccessAndIDTokenScopes(t *testing.T) {
+	claims := unsignedJWT(t, map[string]any{"email": "scoped@example.com"})
+	cases := []struct{ name, body string }{
+		{"id_token-only scope", `{"` + grokExactOIDCScope + `":{"id_token":"` + claims + `"}}`},
+		{"access_token-only scope", `{"` + grokExactOIDCScope + `":{"access_token":"` + claims + `"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			if err := os.WriteFile(filepath.Join(base, "auth.json"), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if got, _, _ := grokPresentedToken(base); got == "" {
+				t.Fatal("fixture must be a token-bearing login")
+			}
+			account, _ := readGrokAccountAndPlan(base)
+			if account != "scoped@example.com" {
+				t.Errorf("account=%q, want scoped@example.com", account)
+			}
+			if grokAccountFingerprintFor(base) == "" {
+				t.Error("fingerprint is empty, so the live probe would report no_account")
+			}
+		})
+	}
+}
+
+// TestGrokScopedAuthClaims_SiblingFieldsWithoutAJWT: a non-JWT access token must
+// not stop the plain sibling fields from naming the account.
+func TestGrokScopedAuthClaims_SiblingFieldsWithoutAJWT(t *testing.T) {
+	base := t.TempDir()
+	body := `{"` + grokExactOIDCScope + `":{"access_token":"opaque","email":"sibling@example.com"}}`
+	if err := os.WriteFile(filepath.Join(base, "auth.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if account, _ := readGrokAccountAndPlan(base); account != "sibling@example.com" {
+		t.Errorf("account=%q, want sibling@example.com", account)
+	}
+}
+
+// TestAbsoluteCodexHomeEnv: the app-server child runs from the system temp dir,
+// so a relative CODEX_HOME must be resolved against the daemon's cwd first.
+func TestAbsoluteCodexHomeEnv(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(wd, "relative-codex-home")
+	cases := []struct{ name, in, want string }{
+		{"relative is resolved", "CODEX_HOME=relative-codex-home", "CODEX_HOME=" + abs},
+		{"absolute is untouched", "CODEX_HOME=" + abs, "CODEX_HOME=" + abs},
+		{"empty is untouched", "CODEX_HOME=", "CODEX_HOME="},
+		{"other vars are untouched", "CODEX_HOME_OTHER=rel", "CODEX_HOME_OTHER=rel"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := absoluteCodexHomeEnv([]string{"PATH=/usr/bin", tc.in})
+			if len(out) != 2 || out[0] != "PATH=/usr/bin" {
+				t.Fatalf("env=%v, other entries must survive unchanged", out)
+			}
+			if out[1] != tc.want {
+				t.Errorf("env=%q, want %q", out[1], tc.want)
+			}
+		})
+	}
+}
+
+// TestProbeGrokBillingLive_KeepsTheTierTheLogStated: the billing response states
+// the credit pool, never the plan name — only the TUI's log line carries the
+// tier. A live refresh that wins on recency must not blank the displayed plan.
+func TestProbeGrokBillingLive_KeepsTheTierTheLogStated(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuth(t, home, "access-A", "dan@example.com", now.Add(5*time.Hour))
+	// An older log line — the only statement of the subscription tier. The
+	// session line attributes it to the account that is signed in.
+	helperWriteGrokLog(t, home,
+		`{"ts":"`+now.Add(-72*time.Hour).UTC().Format(time.RFC3339)+`","msg":"session start","ctx":{"user_id":"user-dan@example.com"}}`,
+		grokBillingLine(
+			now.Add(-48*time.Hour).UTC().Format(time.RFC3339), 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			now.Add(-96*time.Hour).UTC().Format(time.RFC3339), now.Add(24*time.Hour).UTC().Format(time.RFC3339)))
+	if snap, ok := readGrokBillingSnapshot(home, grokIdentityCandidates(home)); !ok || snap.SubscriptionTier != "SuperGrok" {
+		t.Fatalf("fixture must give the log a tier (ok=%v tier=%q)", ok, snap.SubscriptionTier)
+	}
+	grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+	})
+
+	if got := probeGrokBillingLive(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	usage, ok := grokUsageParser{}.Parse(filepath.Dir(home), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	if usage.Plan != "SuperGrok" {
+		t.Errorf("plan=%q, want the tier the log stated to survive the live refresh", usage.Plan)
+	}
+	if len(usage.Metrics) == 0 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 9 {
+		t.Errorf("metrics=%+v, want the live 9%% reading to still win", usage.Metrics)
+	}
+}

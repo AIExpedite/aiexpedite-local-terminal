@@ -139,6 +139,13 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// directly) replaces the log's record whenever it is the newer observation;
 	// the TUI writing a fresher line afterwards wins back the same way.
 	if live, liveOK := loadGrokBillingLiveSnapshot(usage.AccountFingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
+		// The billing response carries the credit pool, not the plan name —
+		// only the TUI's log line states the tier. Carry the log's tier across
+		// so a live refresh doesn't blank the displayed plan; a later log line
+		// that states a tier still overrides it the next time the log wins.
+		if live.SubscriptionTier == "" && ok {
+			live.SubscriptionTier = snap.SubscriptionTier
+		}
 		snap, ok = live, true
 	}
 	if ok {
@@ -733,14 +740,16 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		return claims, false
 	}
 	var scoped map[string]struct {
-		Key      string `json:"key"`
-		Token    string `json:"token"`
-		Email    string `json:"email"`
-		UserID   string `json:"user_id"`
-		UserName string `json:"username"`
-		Account  string `json:"account"`
-		Plan     string `json:"plan"`
-		PlanType string `json:"plan_type"`
+		Key         string `json:"key"`
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		IDToken     string `json:"id_token"`
+		Email       string `json:"email"`
+		UserID      string `json:"user_id"`
+		UserName    string `json:"username"`
+		Account     string `json:"account"`
+		Plan        string `json:"plan"`
+		PlanType    string `json:"plan_type"`
 	}
 	if err := json.Unmarshal(raw, &scoped); err != nil {
 		return claims, false
@@ -751,14 +760,32 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	}
 	for _, k := range grokScopeKeysByPrecedence(keys) {
 		v := scoped[k]
-		token := firstNonEmpty(v.Key, v.Token)
-		if token == "" {
+		// The same credential fields grokPresentedToken accepts, in its order:
+		// a scope whose only credential is an `access_token` or `id_token` is
+		// the one Grok presents, so it must also be the one identity is read
+		// from — otherwise the live probe refuses a login the CLI can use.
+		candidates := make([]string, 0, 4)
+		for _, candidate := range []string{v.Key, v.AccessToken, v.Token, v.IDToken} {
+			if strings.TrimSpace(candidate) != "" {
+				candidates = append(candidates, candidate)
+			}
+		}
+		if len(candidates) == 0 {
 			continue
 		}
 		// A fresh value per iteration: a partial decode must not leak fields
-		// from an entry we then walk past.
+		// from an entry we then walk past, nor from a sibling credential of
+		// this entry that turned out not to be a JWT.
 		var entry grokIDTokenClaims
-		parsed := parseJWTClaims(token, &entry)
+		parsed := false
+		for _, candidate := range candidates {
+			var decoded grokIDTokenClaims
+			if parseJWTClaims(candidate, &decoded) {
+				entry = decoded
+				parsed = true
+				break
+			}
+		}
 		entry.Email = firstNonEmpty(entry.Email, v.Email)
 		entry.UserID = firstNonEmpty(entry.UserID, v.UserID)
 		entry.UserName = firstNonEmpty(entry.UserName, v.UserName)
