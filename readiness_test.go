@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func boolPtr(b bool) *bool { return &b }
@@ -353,6 +354,13 @@ func TestCliAgentDetected_MatchesEitherShape(t *testing.T) {
 }
 
 func TestGatherReadinessOnly_CanceledContextIsBlocked(t *testing.T) {
+	// Whatever this test leaves running must not reach the next test: a full
+	// gather ends in every CLI's usage parser reading process-global fixtures.
+	t.Cleanup(func() {
+		if !drainMachineInfoGathers(2 * time.Minute) {
+			t.Errorf("a machine-info gather started here is still running — it will probe against a later test's fixtures")
+		}
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	report := GatherReadinessOnly(ctx)
@@ -360,5 +368,13 @@ func TestGatherReadinessOnly_CanceledContextIsBlocked(t *testing.T) {
 	// hanging on the gather.
 	if report.State != ReadinessBlocked {
 		t.Fatalf("expected blocked on canceled context, got %s", report.State)
+	}
+	// And it starts no gather at all: one launched here would run on unbounded
+	// (WMI, GPU, every CLI) and, tens of seconds later on a loaded Windows
+	// runner, detect a later test's mock `claude` on PATH and probe that
+	// test's cache and endpoint — the source of the intermittent settled-turn
+	// failures in the session tests.
+	if !drainMachineInfoGathers(200 * time.Millisecond) {
+		t.Fatal("an inspection that was already over must not start a machine-info gather")
 	}
 }
