@@ -901,3 +901,89 @@ func TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings(t *testin
 		t.Errorf("stale probe: account=%q metrics=%+v, want settings.json to stand again", usage.Account, usage.Metrics)
 	}
 }
+
+// TestProbeGrokBillingLive_FlatCredentialNamesItsAccount: in the flat layout the
+// only statement of identity can be the claims of the credential Grok presents.
+// The probe must fingerprint from that same credential instead of giving up
+// with no_account before asking for the reading.
+func TestProbeGrokBillingLive_FlatCredentialNamesItsAccount(t *testing.T) {
+	for _, field := range []string{"access_token", "token", "key", "id_token"} {
+		t.Run(field, func(t *testing.T) {
+			home := isolateGrok(t)
+			now := time.Now()
+			jwt := unsignedJWT(t, map[string]any{"email": "flat@example.com", "exp": now.Add(5 * time.Hour).Unix()})
+			helperWriteJSON(t, filepath.Join(home, "auth.json"), map[string]any{field: jwt})
+			if got := grokAccountFingerprintFor(home); got != fingerprintAccount("grok", "flat@example.com") {
+				t.Fatalf("fingerprint=%q, want the presented credential's account", got)
+			}
+			var sent string
+			grokBillingServer(t, func(auth string) (int, string) {
+				sent = auth
+				return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+			})
+			if got := probeGrokBillingLive(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+				t.Fatalf("outcome=%q, want ok", got)
+			}
+			if sent != "Bearer "+jwt {
+				t.Errorf("Authorization=%q, want the credential the fingerprint came from", sent)
+			}
+		})
+	}
+}
+
+// TestGrokIdentityCandidates_PresentedClaimsOnlyWhenTheyNameTheAccount: stale
+// identity fields for A beside a credential that claims B keep A as the account,
+// so B must not become an accepted identity for matching billing records.
+func TestGrokIdentityCandidates_PresentedClaimsOnlyWhenTheyNameTheAccount(t *testing.T) {
+	jwtB := unsignedJWT(t, map[string]any{"email": "b@example.com"})
+	cases := []struct {
+		name string
+		auth map[string]any
+		want []string
+		deny string
+	}{
+		{"identity fields win, B excluded", map[string]any{"email": "a@example.com", "access_token": jwtB}, []string{"a@example.com"}, "b@example.com"},
+		{"only the credential names the account", map[string]any{"access_token": jwtB}, []string{"b@example.com"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), tc.auth)
+			got := grokIdentityCandidates(base)
+			for _, w := range tc.want {
+				if !containsString(got, w) {
+					t.Errorf("candidates=%v, want %q", got, w)
+				}
+			}
+			if tc.deny != "" && containsString(got, tc.deny) {
+				t.Errorf("candidates=%v, must not accept %q", got, tc.deny)
+			}
+		})
+	}
+}
+
+// TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount: identity fields
+// for A beside a credential claiming B's plan keep A's account and never label
+// it with B's plan; when the credential alone names the account, its plan does
+// come with it.
+func TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount(t *testing.T) {
+	jwtB := unsignedJWT(t, map[string]any{"email": "b@example.com", "plan": "SuperGrok Heavy"})
+	cases := []struct {
+		name              string
+		auth              map[string]any
+		wantAcct, wantPln string
+	}{
+		{"A's fields win, B's plan not borrowed", map[string]any{"email": "a@example.com", "access_token": jwtB}, "a@example.com", ""},
+		{"credential names the account and its plan", map[string]any{"access_token": jwtB}, "b@example.com", "SuperGrok Heavy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), tc.auth)
+			account, plan := readGrokAccountAndPlan(base)
+			if account != tc.wantAcct || plan != tc.wantPln {
+				t.Errorf("account/plan=%q/%q, want %q/%q", account, plan, tc.wantAcct, tc.wantPln)
+			}
+		})
+	}
+}

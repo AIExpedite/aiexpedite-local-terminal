@@ -84,13 +84,39 @@ type grokAuthFile struct {
 	Tier         string `json:"tier"`
 	Subscription string `json:"subscription"`
 	OrgID        string `json:"org_id"`
-	CachedToken  struct {
+	// The flat layout's own credentials: the one grokFlatCredential picks is
+	// the one the live probe sends, so its claims can name the account when no
+	// identity field does.
+	Key         string `json:"key"`
+	Token       string `json:"token"`
+	AccessToken string `json:"access_token"`
+	IDToken     string `json:"id_token"`
+	CachedToken struct {
 		IDToken     string `json:"id_token"`
 		AccessToken string `json:"access_token"`
 		Account     string `json:"account"`
 		Email       string `json:"email"`
 		Subject     string `json:"sub"`
 	} `json:"cached_token"`
+}
+
+// presentedClaims decodes the flat-layout credential Grok presents. Only a
+// fallback: the identity fields and the cached_token claims keep precedence, so
+// a fingerprint that already resolved does not move.
+func (a grokAuthFile) presentedClaims() grokIDTokenClaims {
+	var claims grokIDTokenClaims
+	parseJWTClaims(grokFlatCredential(
+		a.AccessToken, a.Token, a.Key, a.CachedToken.AccessToken, a.IDToken, a.CachedToken.IDToken,
+	), &claims)
+	return claims
+}
+
+// grokFlatCredential is the credential Grok presents from the flat / legacy
+// auth layout — one account, access credential before id_token. Shared by the
+// expiry check, the live probe and identity so all three describe the same
+// token.
+func grokFlatCredential(accessToken, token, key, cachedAccessToken, idToken, cachedIDToken string) string {
+	return firstNonEmpty(accessToken, token, key, cachedAccessToken, idToken, cachedIDToken)
 }
 
 type grokIDTokenClaims struct {
@@ -423,7 +449,7 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 		// token is present. Otherwise a stale `access_token` paired with a
 		// later-expiring `id_token` would report the login as healthy and hide
 		// the impending stall.
-		if t, ok := fromJWT(firstNonEmpty(
+		if t, ok := fromJWT(grokFlatCredential(
 			flat.AccessToken, flat.Token, flat.Key,
 			flat.CachedToken.AccessToken,
 			flat.IDToken, flat.CachedToken.IDToken,
@@ -646,6 +672,22 @@ func readGrokAccountAndPlan(base string) (string, string) {
 			claims.Plan,
 			claims.PlanType,
 		)
+		// The presented credential speaks for the login only when nothing else
+		// named the account. Beside identity fields that name someone else, its
+		// account AND its plan belong to that other login.
+		if account == "" {
+			presented := auth.presentedClaims()
+			account = firstNonEmpty(
+				presented.Email,
+				presented.Account,
+				presented.UserName,
+				presented.UserID,
+				presented.Subject,
+			)
+			if account != "" {
+				plan = firstNonEmpty(plan, presented.Plan, presented.PlanType)
+			}
+		}
 	}
 	// Scoped fallback: the installer-produced `auth.json` does not match the
 	// flat shape above — every top-level key is an auth scope whose value is a
@@ -693,8 +735,19 @@ func grokIdentityCandidates(base string) []string {
 		auth.Email, auth.Account, auth.UserName, auth.UserID,
 		auth.CachedToken.Email, auth.CachedToken.Account, auth.CachedToken.Subject,
 		claims.Email, claims.Account, claims.UserName, claims.UserID, claims.Subject,
-		scoped.Email, scoped.Account, scoped.UserName, scoped.UserID, scoped.Subject,
 	}
+	// The presented credential's claims are an identity only when they are
+	// what named the account — exactly when readGrokAccountAndPlan falls back
+	// to them. Beside identity fields that name someone else (stale metadata
+	// after an account switch) they would let that other login's billing
+	// records pass as this account's.
+	if firstNonEmpty(candidates...) == "" {
+		presented := auth.presentedClaims()
+		candidates = append(candidates,
+			presented.Email, presented.Account, presented.UserName, presented.UserID, presented.Subject)
+	}
+	candidates = append(candidates,
+		scoped.Email, scoped.Account, scoped.UserName, scoped.UserID, scoped.Subject)
 	out := make([]string, 0, len(candidates))
 	seen := map[string]bool{}
 	for _, candidate := range candidates {

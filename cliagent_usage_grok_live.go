@@ -180,7 +180,7 @@ func grokPresentedToken(base string) (token string, expiresAt time.Time, hasExpi
 	if json.Unmarshal(raw, &flat) != nil {
 		return "", time.Time{}, false
 	}
-	token = firstNonEmpty(
+	token = grokFlatCredential(
 		flat.AccessToken, flat.Token, flat.Key,
 		flat.CachedToken.AccessToken,
 		flat.IDToken, flat.CachedToken.IDToken,
