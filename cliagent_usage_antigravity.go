@@ -24,7 +24,25 @@ type antigravityConfig struct {
 	Tier    string `json:"tier"`
 }
 
+// antigravityUsageParser performs bounded network I/O during a refresh (the
+// loopback quota request below), so it MUST satisfy cliAgentUsageContextParser:
+// the assertion selects ParseContext through a silent type assertion in
+// runProviderParseSafely, and implementing it is also what earns Antigravity a
+// reserve in cliAgentUsageGatherReserve. Drop it and the quota request goes back
+// to its own 2s clock, free to run past the gather deadline an earlier model
+// probe left near expiry — Antigravity's result then discarded and every
+// provider behind it reported canceled (Codex round 23 on #147).
+var _ cliAgentUsageContextParser = antigravityUsageParser{}
+
+// Parse keeps the small contract for callers without a gather; they keep the
+// full quota timeout.
 func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	return p.ParseContext(context.Background(), home, detected, now)
+}
+
+// ParseContext is the gather's entry point: the quota request derives its
+// deadline from the caller's context (the earlier one wins).
+func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	base := expandHome(home, filepath.Join(".gemini", "antigravity-cli"))
 	if base == "" {
 		return nil, false
@@ -61,12 +79,15 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 	// A live language server knows the account it is signed in as; settings.json
 	// usually does not. Prefer the server's identity so the fingerprint that
 	// scopes the cache is the same one the quota was captured under.
-	ctx, cancel := context.WithTimeout(context.Background(), antigravityQuotaTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	quotaCtx, cancel := context.WithTimeout(ctx, antigravityQuotaTimeout)
 	defer cancel()
 	var fresh antigravityQuotaSnapshot
 	var gotFresh bool
 	for _, quotaBase := range quotaBases {
-		if fresh, gotFresh = fetchAntigravityQuota(ctx, quotaBase, now); gotFresh {
+		if fresh, gotFresh = fetchAntigravityQuota(quotaCtx, quotaBase, now); gotFresh {
 			break
 		}
 	}
