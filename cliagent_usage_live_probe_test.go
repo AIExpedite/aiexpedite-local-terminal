@@ -901,3 +901,32 @@ func TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings(t *testin
 		t.Errorf("stale probe: account=%q metrics=%+v, want settings.json to stand again", usage.Account, usage.Metrics)
 	}
 }
+
+// TestProbeGrokBillingLive_FlatCredentialNamesItsAccount: in the flat layout the
+// only statement of identity can be the claims of the credential Grok presents.
+// The probe must fingerprint from that same credential instead of giving up
+// with no_account before asking for the reading.
+func TestProbeGrokBillingLive_FlatCredentialNamesItsAccount(t *testing.T) {
+	for _, field := range []string{"access_token", "token", "key", "id_token"} {
+		t.Run(field, func(t *testing.T) {
+			home := isolateGrok(t)
+			now := time.Now()
+			jwt := unsignedJWT(t, map[string]any{"email": "flat@example.com", "exp": now.Add(5 * time.Hour).Unix()})
+			helperWriteJSON(t, filepath.Join(home, "auth.json"), map[string]any{field: jwt})
+			if got := grokAccountFingerprintFor(home); got != fingerprintAccount("grok", "flat@example.com") {
+				t.Fatalf("fingerprint=%q, want the presented credential's account", got)
+			}
+			var sent string
+			grokBillingServer(t, func(auth string) (int, string) {
+				sent = auth
+				return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+			})
+			if got := probeGrokBillingLive(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+				t.Fatalf("outcome=%q, want ok", got)
+			}
+			if sent != "Bearer "+jwt {
+				t.Errorf("Authorization=%q, want the credential the fingerprint came from", sent)
+			}
+		})
+	}
+}

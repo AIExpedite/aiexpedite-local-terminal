@@ -84,13 +84,39 @@ type grokAuthFile struct {
 	Tier         string `json:"tier"`
 	Subscription string `json:"subscription"`
 	OrgID        string `json:"org_id"`
-	CachedToken  struct {
+	// The flat layout's own credentials: the one grokFlatCredential picks is
+	// the one the live probe sends, so its claims can name the account when no
+	// identity field does.
+	Key         string `json:"key"`
+	Token       string `json:"token"`
+	AccessToken string `json:"access_token"`
+	IDToken     string `json:"id_token"`
+	CachedToken struct {
 		IDToken     string `json:"id_token"`
 		AccessToken string `json:"access_token"`
 		Account     string `json:"account"`
 		Email       string `json:"email"`
 		Subject     string `json:"sub"`
 	} `json:"cached_token"`
+}
+
+// presentedClaims decodes the flat-layout credential Grok presents. Only a
+// fallback: the identity fields and the cached_token claims keep precedence, so
+// a fingerprint that already resolved does not move.
+func (a grokAuthFile) presentedClaims() grokIDTokenClaims {
+	var claims grokIDTokenClaims
+	parseJWTClaims(grokFlatCredential(
+		a.AccessToken, a.Token, a.Key, a.CachedToken.AccessToken, a.IDToken, a.CachedToken.IDToken,
+	), &claims)
+	return claims
+}
+
+// grokFlatCredential is the credential Grok presents from the flat / legacy
+// auth layout — one account, access credential before id_token. Shared by the
+// expiry check, the live probe and identity so all three describe the same
+// token.
+func grokFlatCredential(accessToken, token, key, cachedAccessToken, idToken, cachedIDToken string) string {
+	return firstNonEmpty(accessToken, token, key, cachedAccessToken, idToken, cachedIDToken)
 }
 
 type grokIDTokenClaims struct {
@@ -423,7 +449,7 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 		// token is present. Otherwise a stale `access_token` paired with a
 		// later-expiring `id_token` would report the login as healthy and hide
 		// the impending stall.
-		if t, ok := fromJWT(firstNonEmpty(
+		if t, ok := fromJWT(grokFlatCredential(
 			flat.AccessToken, flat.Token, flat.Key,
 			flat.CachedToken.AccessToken,
 			flat.IDToken, flat.CachedToken.IDToken,
@@ -638,6 +664,15 @@ func readGrokAccountAndPlan(base string) (string, string) {
 			auth.CachedToken.Subject,
 			claims.Subject,
 		)
+		presented := auth.presentedClaims()
+		account = firstNonEmpty(
+			account,
+			presented.Email,
+			presented.Account,
+			presented.UserName,
+			presented.UserID,
+			presented.Subject,
+		)
 		plan = firstNonEmpty(
 			auth.Plan,
 			auth.PlanType,
@@ -645,6 +680,8 @@ func readGrokAccountAndPlan(base string) (string, string) {
 			auth.Subscription,
 			claims.Plan,
 			claims.PlanType,
+			presented.Plan,
+			presented.PlanType,
 		)
 	}
 	// Scoped fallback: the installer-produced `auth.json` does not match the
@@ -688,8 +725,10 @@ func grokIdentityCandidates(base string) []string {
 	claims := grokIDTokenClaims{}
 	parseJWTClaims(firstNonEmpty(auth.CachedToken.IDToken, auth.CachedToken.AccessToken), &claims)
 	scoped, _ := readGrokScopedAuthClaims(authPath)
+	presented := auth.presentedClaims()
 
 	candidates := []string{
+		presented.Email, presented.Account, presented.UserName, presented.UserID, presented.Subject,
 		auth.Email, auth.Account, auth.UserName, auth.UserID,
 		auth.CachedToken.Email, auth.CachedToken.Account, auth.CachedToken.Subject,
 		claims.Email, claims.Account, claims.UserName, claims.UserID, claims.Subject,
