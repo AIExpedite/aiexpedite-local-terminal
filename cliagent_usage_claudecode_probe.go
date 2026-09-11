@@ -1544,7 +1544,8 @@ func triggerClaudeUsageProbeAfterRun() {
 	claudeUsageProbe.recordOwed(completedAt)
 	go func() {
 		defer func() { _ = recover() }()
-		claudeUsageProbeAfterRun(completedAt)
+		// Settle only: the debt above is the one record for this run.
+		claudeUsageProbePayRecordedRun(completedAt)
 	}()
 }
 
@@ -1568,7 +1569,17 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 	// — may not happen, and a run whose debt was never recorded is a run whose
 	// refresh is silently lost.
 	claudeUsageProbe.recordOwed(completedAt)
+	claudeUsageProbePayRecordedRun(completedAt)
+}
 
+// claudeUsageProbePayRecordedRun is the settlement half of
+// claudeUsageProbeAfterRun for a debt the caller ALREADY recorded — the
+// session trigger records synchronously before spawning this on a goroutine.
+// It must not record again: a gather or another cache writer may have observed
+// and settled that very baseline in the gap before the goroutine ran, and
+// recordOwed has no settled watermark, so a repeat would resurrect a paid debt
+// and schedule a trailing OAuth request for nothing.
+func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 	for attempt := 0; attempt < claudeUsageProbeAfterRunMaxAttempts; attempt++ {
 		// No credential or cache read in this preflight. Resolving the identity
 		// here would cost a `security` spawn PER RUN on macOS even when the burst
