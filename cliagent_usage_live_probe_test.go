@@ -640,6 +640,44 @@ func TestGrokScopedAuthClaims_SiblingFieldsWithoutAJWT(t *testing.T) {
 	}
 }
 
+// TestGrokScopedAuthClaims_IdentityFromThePresentedCredentialOnly: an opaque
+// `key` is what Grok presents, so a JWT in the fallback `access_token` (stale,
+// or another login's) must not name the account the billing reading is cached
+// under. The entry's explicit fields do; with none, there is no identity.
+func TestGrokScopedAuthClaims_IdentityFromThePresentedCredentialOnly(t *testing.T) {
+	other := unsignedJWT(t, map[string]any{"email": "other-login@example.com"})
+	cases := []struct {
+		name, body, want string
+	}{
+		{
+			"opaque key with sibling email",
+			`{"` + grokExactOIDCScope + `":{"key":"opaque-key","access_token":"` + other + `","email":"presented@example.com"}}`,
+			"presented@example.com",
+		},
+		{
+			"opaque key without identity fields",
+			`{"` + grokExactOIDCScope + `":{"key":"opaque-key","id_token":"` + other + `"}}`,
+			"",
+		},
+		{
+			"JWT key wins over a sibling JWT",
+			`{"` + grokExactOIDCScope + `":{"key":"` + unsignedJWT(t, map[string]any{"email": "key@example.com"}) + `","access_token":"` + other + `"}}`,
+			"key@example.com",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			if err := os.WriteFile(filepath.Join(base, "auth.json"), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if account, _ := readGrokAccountAndPlan(base); account != tc.want {
+				t.Errorf("account=%q, want %q", account, tc.want)
+			}
+		})
+	}
+}
+
 // TestAbsoluteCodexHomeEnv: the app-server child runs from the system temp dir,
 // so a relative CODEX_HOME must be resolved against the daemon's cwd first.
 func TestAbsoluteCodexHomeEnv(t *testing.T) {

@@ -760,31 +760,25 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	}
 	for _, k := range grokScopeKeysByPrecedence(keys) {
 		v := scoped[k]
-		// The same credential fields grokPresentedToken accepts, in its order:
-		// a scope whose only credential is an `access_token` or `id_token` is
-		// the one Grok presents, so it must also be the one identity is read
-		// from — otherwise the live probe refuses a login the CLI can use.
-		candidates := make([]string, 0, 4)
-		for _, candidate := range []string{v.Key, v.AccessToken, v.Token, v.IDToken} {
-			if strings.TrimSpace(candidate) != "" {
-				candidates = append(candidates, candidate)
-			}
-		}
-		if len(candidates) == 0 {
+		// Identity comes from the ONE credential grokPresentedToken sends — the
+		// first of key, access_token, token, id_token — so a scope whose only
+		// credential is an `access_token` or `id_token` still fingerprints. A
+		// sibling credential is never consulted: with an opaque `key` beside a
+		// stale `access_token` JWT from another login, the billing reading taken
+		// with `key` would otherwise be cached under that other account. When
+		// the presented credential is opaque, only the entry's explicit identity
+		// fields below name the account.
+		presented := firstNonEmpty(v.Key, v.AccessToken, v.Token, v.IDToken)
+		if presented == "" {
 			continue
 		}
-		// A fresh value per iteration: a partial decode must not leak fields
-		// from an entry we then walk past, nor from a sibling credential of
-		// this entry that turned out not to be a JWT.
+		// A fresh value, kept only on a successful decode: a partial decode must
+		// not leak fields from an entry we then walk past.
 		var entry grokIDTokenClaims
-		parsed := false
-		for _, candidate := range candidates {
-			var decoded grokIDTokenClaims
-			if parseJWTClaims(candidate, &decoded) {
-				entry = decoded
-				parsed = true
-				break
-			}
+		var decoded grokIDTokenClaims
+		parsed := parseJWTClaims(presented, &decoded)
+		if parsed {
+			entry = decoded
 		}
 		entry.Email = firstNonEmpty(entry.Email, v.Email)
 		entry.UserID = firstNonEmpty(entry.UserID, v.UserID)
