@@ -159,20 +159,39 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 		}()
 	}
 
+	// warmedWithProbe: agents whose model list is warmed by their own probe
+	// goroutine rather than the parallel loop below, because two children of the
+	// same CLI must not run at once.
+	warmedWithProbe := map[string]bool{}
+
 	if agent, ok := detected["codex"]; ok && agent.Detected {
 		run("codex", func() string { return probeCodexRateLimitsLiveFn(ctx, agent.Path) })
-	}
-	if agent, ok := detected["grok"]; ok && agent.Detected {
-		run("grok", func() string { return probeGrokBillingLiveFn(ctx, agent.Path, time.Now) })
 	}
 	// Model lists are part of the same click: the bounded gather gives a list
 	// probe two seconds, which `agy models` (a network fetch) never finishes in.
 	resetCLIAgentModelProbeCache()
+	if agent, ok := detected["grok"]; ok && agent.Detected {
+		// Both children can renew the SAME rotating login: the billing probe
+		// runs `grok models` against the real home on an expired token or a
+		// 401, and the model list runs `grok models` against an isolated home
+		// holding a COPY of that login. Concurrently, the isolated child can
+		// rotate the credential last and have its result deleted with the
+		// temporary home, leaving the real home holding an invalidated token —
+		// i.e. signing the user's CLI out. The list therefore waits for the
+		// probe, as Antigravity's does.
+		warmedWithProbe["grok"] = true
+		run("grok", func() string {
+			outcome := probeGrokBillingLiveFn(ctx, agent.Path, time.Now)
+			warmCLIAgentModelDiscoveryFn(ctx, "grok", agent, home)
+			return outcome
+		})
+	}
 	if agent, ok := detected["antigravity"]; ok && agent.Detected {
 		// `agy` names its log after the SECOND it started (cli-YYYYMMDD_HHMMSS.log),
 		// so a quota probe and `agy models` launched together share one log file
 		// and the PID line the probe matches on is overwritten. The list waits
 		// for the probe.
+		warmedWithProbe["antigravity"] = true
 		run("antigravity", func() string {
 			outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
 			warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
@@ -180,7 +199,7 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 		})
 	}
 	for id, agent := range detected {
-		if !agent.Detected || id == "antigravity" {
+		if !agent.Detected || warmedWithProbe[id] {
 			continue
 		}
 		id, agent := id, agent

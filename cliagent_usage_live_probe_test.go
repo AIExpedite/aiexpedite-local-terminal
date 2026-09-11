@@ -568,6 +568,35 @@ func TestRunCLIUsageLiveProbes_AntigravityModelListWaitsForQuotaProbe(t *testing
 	}
 }
 
+// TestRunCLIUsageLiveProbes_GrokModelListWaitsForBillingProbe: the billing probe
+// renews the cached login by running `grok models` against the REAL home, while
+// model discovery runs `grok models` against an isolated COPY of it. Run at the
+// same time, the isolated child can rotate the login last and take the renewed
+// credential with the temporary home it is deleted with, leaving the real home
+// holding an invalidated token.
+func TestRunCLIUsageLiveProbes_GrokModelListWaitsForBillingProbe(t *testing.T) {
+	stubLiveProbes(t)
+	var probeDone atomic.Bool
+	var listedBeforeProbe atomic.Bool
+	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string {
+		time.Sleep(30 * time.Millisecond)
+		probeDone.Store(true)
+		return liveProbeOutcomeOK
+	}
+	warmCLIAgentModelDiscoveryFn = func(_ context.Context, id string, _ detectedCLIAgent, _ string) {
+		if id == "grok" && !probeDone.Load() {
+			listedBeforeProbe.Store(true)
+		}
+	}
+	outcomes := runCLIUsageLiveProbes(context.Background())
+	if listedBeforeProbe.Load() {
+		t.Fatal("`grok models` ran alongside the billing probe; both children can renew the same rotating login")
+	}
+	if outcomes["grok"] != liveProbeOutcomeOK {
+		t.Errorf("grok=%q, want the billing probe's own outcome, not the list's", outcomes["grok"])
+	}
+}
+
 // TestGrokAccountFingerprint_AccessAndIDTokenScopes: the identity preflight must
 // recognize the same credential fields grokPresentedToken accepts, or a login
 // whose only credential is an access/id token is refused as no_account before
