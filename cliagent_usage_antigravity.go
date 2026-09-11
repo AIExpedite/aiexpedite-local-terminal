@@ -123,13 +123,19 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// observation time so the card ages it honestly instead of presenting a
 		// day-old pool as current.
 		snap = cached
-	} else if usage.AccountFingerprint == "" {
+	} else if liveProducer := recentAntigravityLiveProducer(time.Now()); usage.AccountFingerprint == "" || liveProducer != "" {
 		// settings.json names nobody — the usual case, since the account lives in
 		// the OS keyring. Replay under the identity that PRODUCED the reading
 		// rather than dropping it: there is no current identity for it to
 		// conflict with, and the card then names the account the quota belongs
 		// to instead of implying it is whoever is signed in now.
-		if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok {
+		//
+		// A live probe that just ran (a Refresh click) outranks settings.json:
+		// its server named the account it is signed into, which may be a newer
+		// login than the one settings.json still records. Only the reading that
+		// probe's own account produced is replayed.
+		if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok &&
+			(usage.AccountFingerprint == "" || cached.AccountFingerprint == liveProducer) {
 			snap = cached
 			usage.Account = cached.Account
 			usage.Plan = firstNonEmpty(cached.Plan, usage.Plan)

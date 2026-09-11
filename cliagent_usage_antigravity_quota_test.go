@@ -463,6 +463,7 @@ func TestAntigravityUsageParser_ReplaysCacheUnderItsProducerWhenSettingsHasNoIde
 // A settings file that names a DIFFERENT account still blocks the replay: the
 // scoped load fails and the producer fallback is only for an unknown identity.
 func TestAntigravityUsageParser_DoesNotReplayProducerCacheUnderAConflictingAccount(t *testing.T) {
+	resetAntigravityLiveProducer(t)
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
 	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)

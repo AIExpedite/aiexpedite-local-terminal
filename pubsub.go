@@ -1026,17 +1026,24 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return nil
 	}
 
-	// A __cli_usage_refresh__ is USER-INITIATED (the Refresh button on the
-	// Computers page), so any readiness answer cached for latency must be
-	// bypassed for this gather. Otherwise a user who just ran `opencode
-	// /connect` and pressed Refresh would keep seeing the pre-auth chip until
-	// the TTL lapsed — the exact "must not require deleting and re-adding the
-	// computer" failure. Version probes stay cached: they are keyed on the
-	// binary, which a login does not change.
+	// A __cli_usage_refresh__ is sent for the Refresh button, for opening the
+	// CLI Agents tab, and by terminal-service's own active-refresh loop, so any
+	// readiness answer cached for latency must be bypassed for this gather.
+	// Otherwise a user who just ran `opencode /connect` and pressed Refresh
+	// would keep seeing the pre-auth chip until the TTL lapsed — the exact
+	// "must not require deleting and re-adding the computer" failure. Version
+	// probes stay cached: they are keyed on the binary, which a login does not
+	// change.
 	SetOpenCodeReadinessForceProbe(true)
-	// And for the model/effort discovery probes (Ship B5): a user who just
-	// logged a CLI in, or updated it, wants its current model list now.
-	resetCLIAgentModelProbeCache()
+	// A CLICK (the signed live-probe arg) asks every provider for its current
+	// usage before gathering, and re-lists models with the time the slowest
+	// list needs (cliagent_usage_live_probe.go). Automatic refreshes keep the
+	// model cache: resetting it on each of them relaunched `agy models` every
+	// five minutes while the tab was open, and that list never fits the bounded
+	// gather's two-second probe anyway.
+	if cliUsageRefreshWantsLiveProbe(cmd) {
+		runCLIUsageLiveProbes(ctx)
+	}
 	// Same reasoning for Claude's utilization probe: its minimum interval exists
 	// to bound background traffic, not to hold back a reading the user just
 	// asked for. Without this the receipt can be signed from a cache whose

@@ -134,7 +134,21 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// it fetched for itself; when that log has a usable record we plot it and
 	// take the subscription tier from the same record (the auth file rarely
 	// carries a plan).
-	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	// A live reading (cliagent_usage_grok_live.go — the Refresh click asks xAI
+	// directly) replaces the log's record whenever it is the newer observation;
+	// the TUI writing a fresher line afterwards wins back the same way.
+	if live, liveOK := loadGrokBillingLiveSnapshot(usage.AccountFingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
+		// The billing response carries the credit pool, not the plan name —
+		// only the TUI's log line states the tier. Carry the log's tier across
+		// so a live refresh doesn't blank the displayed plan; a later log line
+		// that states a tier still overrides it the next time the log wins.
+		if live.SubscriptionTier == "" && ok {
+			live.SubscriptionTier = snap.SubscriptionTier
+		}
+		snap, ok = live, true
+	}
+	if ok {
 		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
 			usage.Plan = firstNonEmpty(usage.Plan, snap.SubscriptionTier)
@@ -340,7 +354,7 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 			// A refresh token is renewal metadata, not the credential Grok
 			// presents. Skip refresh-only preferred scopes just as Grok's
 			// resolver does, allowing it to fall back to a token-bearing scope.
-			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
+			token := grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken)
 			if token == "" {
 				continue
 			}
@@ -421,6 +435,15 @@ func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// grokScopedCredential is the credential Grok's resolver presents from one
+// scoped auth entry: key, then token, then access_token, then id_token. Every
+// reader of a scoped entry — expiry, usability, identity and the live billing
+// probe — picks through this one function, so the probe can never send a
+// different credential from the one the expiry and identity describe.
+func grokScopedCredential(key, token, accessToken, idToken string) string {
+	return firstNonEmpty(key, token, accessToken, idToken)
+}
+
 // grokHasUsableToken reports whether Grok's auth file carries a non-empty
 // credential Grok's resolver would present — regardless of whether that token's
 // expiry or identity is parseable. grokAuthNotice uses it to avoid a false "not
@@ -453,7 +476,7 @@ func grokHasUsableToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[key]
-			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
+			if grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
 				return true
 			}
 		}
@@ -509,7 +532,7 @@ func grokHasRefreshToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			entry := scoped[key]
-			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
+			if grokScopedCredential(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
 				return entry.RefreshToken != ""
 			}
 		}
@@ -726,14 +749,16 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		return claims, false
 	}
 	var scoped map[string]struct {
-		Key      string `json:"key"`
-		Token    string `json:"token"`
-		Email    string `json:"email"`
-		UserID   string `json:"user_id"`
-		UserName string `json:"username"`
-		Account  string `json:"account"`
-		Plan     string `json:"plan"`
-		PlanType string `json:"plan_type"`
+		Key         string `json:"key"`
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		IDToken     string `json:"id_token"`
+		Email       string `json:"email"`
+		UserID      string `json:"user_id"`
+		UserName    string `json:"username"`
+		Account     string `json:"account"`
+		Plan        string `json:"plan"`
+		PlanType    string `json:"plan_type"`
 	}
 	if err := json.Unmarshal(raw, &scoped); err != nil {
 		return claims, false
@@ -744,14 +769,26 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	}
 	for _, k := range grokScopeKeysByPrecedence(keys) {
 		v := scoped[k]
-		token := firstNonEmpty(v.Key, v.Token)
-		if token == "" {
+		// Identity comes from the ONE credential grokPresentedToken sends —
+		// grokScopedCredential's pick — so a scope whose only
+		// credential is an `access_token` or `id_token` still fingerprints. A
+		// sibling credential is never consulted: with an opaque `key` beside a
+		// stale `access_token` JWT from another login, the billing reading taken
+		// with `key` would otherwise be cached under that other account. When
+		// the presented credential is opaque, only the entry's explicit identity
+		// fields below name the account.
+		presented := grokScopedCredential(v.Key, v.Token, v.AccessToken, v.IDToken)
+		if presented == "" {
 			continue
 		}
-		// A fresh value per iteration: a partial decode must not leak fields
-		// from an entry we then walk past.
+		// A fresh value, kept only on a successful decode: a partial decode must
+		// not leak fields from an entry we then walk past.
 		var entry grokIDTokenClaims
-		parsed := parseJWTClaims(token, &entry)
+		var decoded grokIDTokenClaims
+		parsed := parseJWTClaims(presented, &decoded)
+		if parsed {
+			entry = decoded
+		}
 		entry.Email = firstNonEmpty(entry.Email, v.Email)
 		entry.UserID = firstNonEmpty(entry.UserID, v.UserID)
 		entry.UserName = firstNonEmpty(entry.UserName, v.UserName)
@@ -764,9 +801,16 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		hasIdentity := firstNonEmpty(
 			entry.Email, entry.Account, entry.UserName, entry.UserID, entry.Subject,
 		) != ""
+		// This is the scope Grok presents, so it is the ONLY scope that may name
+		// the account — stop here even when it names nothing. Walking on would
+		// fingerprint a lower-precedence sibling's login, and the billing reading
+		// taken with THIS credential would be cached under that other account
+		// (the post-request fingerprint check repeats this same resolution, so it
+		// could not catch the mismatch). Unknown is the honest answer.
 		if parsed || hasIdentity {
 			return entry, true
 		}
+		return claims, false
 	}
 	return claims, false
 }
