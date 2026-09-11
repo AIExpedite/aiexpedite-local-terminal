@@ -366,6 +366,14 @@ Three rules keep a probe from doing damage on the way:
   deadline — can never be held past that by a slow `agy models`. An
   inconclusive probe whose context expired is NOT cached, or one refresh that
   ran out of time would hide the agent's models for the whole 30-minute TTL.
+  Under a bounded gather the probes are rationed by ONE
+  `cliAgentDiscoveryBudget` shared across every provider (4s of time actually
+  spent per gather, at most 2s per probe), and a probe never takes the
+  gather's last 3s — one utilization probe's worth, reserved for the
+  providers still to be polled. A probe the gather cannot afford is skipped
+  and the cache answers; a cold cache reports nothing and the next gather asks.
+  Discovery as a whole is therefore bounded under the refresh deadline; the
+  utilization probes' own worst case is unchanged by it.
 - **`grok models` describes the same service, config and login as an ACP
   session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
   sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the

@@ -84,6 +84,19 @@ const (
 	// never starve the providers behind it; a probe that runs out is
 	// inconclusive and uncached, so the next periodic gather asks again.
 	cliAgentModelProbeGatherBudget = 2 * time.Second
+	// cliAgentModelDiscoveryGatherBudget is what ONE bounded gather may spend
+	// on model probes across every provider it polls. The per-probe cap alone
+	// still let each provider take its own two seconds, and with every CLI
+	// installed those slices plus the utilization probes between them exceed
+	// the refresh's deadline; the sum is bounded here instead. Cache hits are
+	// free, so after the first refresh a run rarely spends any of it.
+	cliAgentModelDiscoveryGatherBudget = 4 * time.Second
+	// cliAgentModelDiscoveryGatherReserve is what a probe leaves the parent
+	// gather for the providers still to be polled: one utilization probe's
+	// worth. Discovery is optional and theirs is not, so a probe that would
+	// eat into the reserve is skipped (the cache still answers) rather than
+	// handing the next provider an already-expired context.
+	cliAgentModelDiscoveryGatherReserve = machineInfoProbeTimeout
 	// cliUsageMaxEffortsPerModel is the receipt bound on one model's scale.
 	cliUsageMaxEffortsPerModel = 16
 	// cliUsageMaxEffortLength bounds one effort token in the receipt.
@@ -143,23 +156,74 @@ func resetCLIAgentModelProbeCache() {
 // parser ran, so it enriches whatever the parser produced (including the
 // baseline entry for a parser-less agent) and never replaces a list the parser
 // already established.
+// cliAgentDiscoveryBudget is what one bounded gather may spend on model probes
+// across every provider it polls. Discovery is optional; the gather it rides
+// on is not. The demand-driven refresh runs every provider serially under ONE
+// deadline, so a probe is handed the smallest of three slices: the per-probe
+// cap, what this gather-wide budget has left, and what the parent keeps beyond
+// the reserve for the providers still to be polled. A probe that cannot be
+// afforded is skipped — the cache still answers — instead of leaving the next
+// provider an expired context. A nil budget is an unbounded gather (the
+// periodic machine-info path), where a probe keeps its own full timeout.
+type cliAgentDiscoveryBudget struct {
+	mu        sync.Mutex
+	remaining time.Duration
+}
+
+// newCLIAgentDiscoveryBudget returns the budget for a gather under ctx, or nil
+// when ctx carries no deadline and nothing needs rationing.
+func newCLIAgentDiscoveryBudget(ctx context.Context) *cliAgentDiscoveryBudget {
+	if ctx == nil {
+		return nil
+	}
+	if _, bounded := ctx.Deadline(); !bounded {
+		return nil
+	}
+	return &cliAgentDiscoveryBudget{remaining: cliAgentModelDiscoveryGatherBudget}
+}
+
+// probeContext hands one probe its slice of the gather. ok=false means the
+// gather cannot afford a probe now (the budget is spent, or the parent has
+// no more than the reserve left) and the caller must answer from cache only.
+// The release function must be called when the probe is done; it charges the
+// time actually spent, not the slice allotted, so a fast answer costs little.
+func (b *cliAgentDiscoveryBudget) probeContext(ctx context.Context) (probeCtx context.Context, release func(), ok bool) {
+	if b == nil {
+		return ctx, func() {}, true
+	}
+	b.mu.Lock()
+	allowance := min(cliAgentModelProbeGatherBudget, b.remaining)
+	b.mu.Unlock()
+	if deadline, bounded := ctx.Deadline(); bounded {
+		allowance = min(allowance, time.Until(deadline)-cliAgentModelDiscoveryGatherReserve)
+	}
+	if allowance <= 0 {
+		return ctx, func() {}, false
+	}
+	start := time.Now()
+	probeCtx, cancel := context.WithTimeout(ctx, allowance)
+	return probeCtx, func() {
+		cancel()
+		b.mu.Lock()
+		b.remaining -= time.Since(start)
+		b.mu.Unlock()
+	}, true
+}
+
+// attachCLIAgentModelDiscovery is the single-provider entry point: it budgets
+// this one call as a bounded gather would (a fresh budget when ctx carries a
+// deadline, none otherwise). GatherCLIAgentUsageOnly shares ONE budget across
+// its providers through attachCLIAgentModelDiscoveryBudgeted instead.
 func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
+	attachCLIAgentModelDiscoveryBudgeted(ctx, newCLIAgentDiscoveryBudget(ctx), agentID, detected, usage, home, now)
+}
+
+func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentDiscoveryBudget, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
 	if usage == nil {
 		return
 	}
 	if ctx == nil {
 		ctx = context.Background()
-	}
-	// Discovery is optional; the gather it rides on is not. Under a bounded
-	// gather (the demand-driven refresh runs every provider serially under
-	// ONE deadline) a slow network-backed list such as `agy models` must not
-	// spend the whole budget and leave every later provider to fail on an
-	// already-expired context, so each probe gets its own slice of it. The
-	// periodic gather passes no deadline and keeps the probe's full timeout.
-	if _, bounded := ctx.Deadline(); bounded {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, cliAgentModelProbeGatherBudget)
-		defer cancel()
 	}
 	if strings.EqualFold(agentID, "opencode") {
 		// OpenCode enumerated through its readiness probe; re-shape only.
@@ -202,7 +266,16 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		usage.ModelsExhaustive = authBoolPtr(!capped && !dropped)
 		return
 	}
-	discovery, ok := cachedCLIAgentModelDiscovery(ctx, agentID, detected, home, now)
+	var discovery cliAgentModelDiscovery
+	var ok bool
+	if probeCtx, release, affordable := budget.probeContext(ctx); affordable {
+		discovery, ok = cachedCLIAgentModelDiscovery(probeCtx, agentID, detected, home, now)
+		release()
+	} else {
+		// The gather cannot afford a probe: a cached answer still serves; a
+		// cold cache reports nothing and the next gather asks again.
+		discovery, ok = lookupCLIAgentModelDiscoveryCache(agentID, detected, now)
+	}
 	if !ok || len(discovery.Models) == 0 {
 		return
 	}
@@ -231,8 +304,25 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 	}
 }
 
+func cliAgentModelProbeCacheKey(agentID string, detected detectedCLIAgent) string {
+	return strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
+}
+
+// lookupCLIAgentModelDiscoveryCache answers from the probe cache alone. The
+// second result is false when there is no live entry — the caller decides
+// whether it may probe.
+func lookupCLIAgentModelDiscoveryCache(agentID string, detected detectedCLIAgent, now time.Time) (cliAgentModelDiscovery, bool) {
+	cliAgentModelProbeMu.Lock()
+	entry, cached := cliAgentModelProbeCache[cliAgentModelProbeCacheKey(agentID, detected)]
+	cliAgentModelProbeMu.Unlock()
+	if cached && now.Sub(entry.At) < cliAgentModelProbeTTL {
+		return entry.Result, entry.OK
+	}
+	return cliAgentModelDiscovery{}, false
+}
+
 func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
-	key := strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
+	key := cliAgentModelProbeCacheKey(agentID, detected)
 	cliAgentModelProbeMu.Lock()
 	entry, cached := cliAgentModelProbeCache[key]
 	generation := cliAgentModelProbeGeneration

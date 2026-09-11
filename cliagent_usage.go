@@ -301,6 +301,10 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 	parsers := cliAgentUsageParserIndex()
 	out := make([]cliAgentUsage, 0, len(detected))
 	var errs []cliAgentUsageError
+	// ONE discovery budget for the whole gather: every provider's model probe
+	// draws on it, so discovery as a whole — not just one probe — is bounded
+	// under the refresh deadline shared with the utilization probes.
+	discoveryBudget := newCLIAgentDiscoveryBudget(gatherCtx)
 
 	for _, agent := range activeCLIAgentCatalog() {
 		if !cliAgentCatalogSupportsUtilization(agent) {
@@ -339,7 +343,7 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
-		attachCLIAgentModelDiscovery(gatherCtx, cliAgentCatalogParserKey(agent), entry, usage, home, now)
+		attachCLIAgentModelDiscoveryBudgeted(gatherCtx, discoveryBudget, cliAgentCatalogParserKey(agent), entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}

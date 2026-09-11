@@ -89,14 +89,23 @@ func TestAttachCLIAgentModelDiscoveryBudgetsAProbeInsideABoundedGather(t *testin
 		t.Fatal("an unbounded gather must not impose the refresh budget on the probe")
 	}
 
-	// A gather that is ALREADY nearly out of time hands the probe what is
-	// left, never more: the budget is a cap, not an extension.
+	// A gather that is ALREADY nearly out of time does not probe at all: what
+	// is left is the reserve for the providers still to be polled (round 16),
+	// and the budget is a cap, never an extension.
 	resetCLIAgentModelProbeCache()
+	probed := false
+	cliAgentModelProbeRunner = func(ctx context.Context, _ string, _ []string, _ ...string) (string, bool) {
+		probed = true
+		return realAntigravityModels, true
+	}
 	shortCtx, cancelShort := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancelShort()
-	before = time.Now()
-	attachCLIAgentModelDiscovery(shortCtx, "antigravity", detected, &cliAgentUsage{Provider: "antigravity"}, "", time.Now())
-	if remaining := seenDeadline.Sub(before); remaining > 400*time.Millisecond {
-		t.Fatalf("probe deadline %v after start, must not outlive the gather's %v", remaining, 300*time.Millisecond)
+	usage := &cliAgentUsage{Provider: "antigravity"}
+	attachCLIAgentModelDiscovery(shortCtx, "antigravity", detected, usage, "", time.Now())
+	if probed {
+		t.Fatalf("a gather with only %v left must not spend it on a model probe", 300*time.Millisecond)
+	}
+	if len(usage.ModelDetails) != 0 {
+		t.Fatalf("no probe and a cold cache must report nothing, got %#v", usage.ModelDetails)
 	}
 }
