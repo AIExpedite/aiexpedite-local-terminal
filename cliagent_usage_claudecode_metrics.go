@@ -174,6 +174,13 @@ func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now 
 	// that would read as "plenty of Fable quota left".
 	fable := observedMetricOrUnknown(
 		buckets, claudeFableWindowIDs(buckets), limitKindWeekly, "Weekly Fable", now)
+	// Naming the model makes this row a NESTED sub-limit rather than another
+	// window of the shared weekly budget (shared-constants
+	// `codingAgentPoolFor`): spending it blocks Fable and leaves the account
+	// PARTIAL — still routable on opus/sonnet/haiku — where an unnamed window
+	// marked the whole account "Limit reached". Codex already reports its
+	// per-model pools this way.
+	fable.Model = claudeModelFable
 
 	return []cliAgentUsageMetric{session, weekly, fable}
 }
