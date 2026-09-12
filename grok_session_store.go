@@ -209,6 +209,10 @@ func grokWindowsCommand(script string) *exec.Cmd {
 	}
 	cmd := exec.Command(executable, "/d", "/v:off", "/c", script)
 	configureGrokWindowsCommandLine(cmd, script)
+	// The isolated GROK_HOME is linked from background work (usage refresh,
+	// model discovery) on a tray agent with no console of its own, so this
+	// child must never show one.
+	hideWindow(cmd)
 	return cmd
 }
 

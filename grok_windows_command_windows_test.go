@@ -5,10 +5,30 @@ package main
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// A junction is linked from background work — the usage refresh on the
+// Computers tab warms Grok model discovery, which sets up the isolated
+// GROK_HOME — so cmd.exe must start hidden. configureGrokWindowsCommandLine
+// used to assign a fresh SysProcAttr, dropping HideWindow and flashing a
+// console window on the user's desktop mid-refresh.
+func TestGrokWindowsCommands_HideConsoleWindow(t *testing.T) {
+	for name, cmd := range map[string]*exec.Cmd{
+		"junction": grokWindowsJunctionCommand(`C:\link`, `C:	arget`),
+		"remove":   grokWindowsRemoveJunctionCommand(`C:\link`),
+	} {
+		if cmd.SysProcAttr == nil || !cmd.SysProcAttr.HideWindow {
+			t.Errorf("%s command does not hide its console window", name)
+		}
+		if cmd.SysProcAttr.CmdLine == "" {
+			t.Errorf("%s command lost its explicit CmdLine", name)
+		}
+	}
+}
 
 func TestGrokWindowsJunctionCommands_HandleMetacharacterPaths(t *testing.T) {
 	t.Setenv("AIEXPEDITE_GROK_UNSET_SENTINEL", "")
