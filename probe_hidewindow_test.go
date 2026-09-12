@@ -15,6 +15,8 @@ import (
 var probeSourceGlobs = []string{
 	"cliagent_usage*.go",
 	"cliagent_ratelimit*.go",
+	"cliagent_models*.go",
+	"grok_session_store*.go",
 	"systemInfo*.go",
 }
 
