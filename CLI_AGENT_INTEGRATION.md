@@ -355,6 +355,27 @@ OpenCode re-shaped from its readiness probe, non-exhaustive. A user-initiated us
 resets the cache. The signed refresh receipt canonicalises both fields
 (`testdata/cli_usage_refresh_receipt_vectors.json`, vector 4, mirrored in
 terminal-service), so **terminal-service must deploy first**.
+
+**Quota pool per model (Ship B6, v1.0.21).** A detail row also carries `pool`
+when the device can SAY which quota pool the model spends: a model the
+provider meters under its own window — the usage snapshot has a metric naming
+that model (Claude Code's weekly Fable window, a Codex per-model pool such as
+`GPT-5.3-Codex-Spark`) — reports the window's key, the model id lower-cased,
+which is exactly how shared-constants keys a nested sub-limit
+(`nestedPoolNameFor`). The annotation is re-derived on every gather from THAT
+gather's snapshot (`annotateModelPoolsFromUsage`), so the 30-minute probe cache
+holds the raw discovery only. Every other model is reported WITHOUT a pool and
+the backend falls through to the catalog rule (`cliAgents/<id>.modelPools`):
+Antigravity in particular stays there — `agy models` prints no group, and the
+quota RPC meters groups ("Gemini Models", "Claude and GPT models") without
+saying which model belongs to which, so the device does not guess a mapping
+that would outrank the authored rule. Bounded to 64 bytes
+(`cliUsageMaxModelPoolLength` = shared `MODEL_POOL_NAME_MAX`); an over-long
+name is dropped rather than truncated, since a name truncated on one side only
+matches no verdict and routes the model fail-open. Vector 5 of the shared
+receipt file pins the `pool` byte layout; terminal-service's receipt allowlist
+must carry `pool` before a device running this build reports it (a receipt
+field the verifier does not know rejects the whole refresh).
 `AIX_B5_HARNESS_OUT=<file> go test -run TestB5ModelDiscoveryHarness -v` runs the
 real probes on this machine and writes the snapshot.
 

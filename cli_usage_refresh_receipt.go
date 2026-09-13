@@ -61,6 +61,7 @@ type canonicalCLIUsageModelDetail struct {
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"defaultEffort,omitempty"`
 	NoEffort      bool     `json:"noEffort,omitempty"`
+	Pool          string   `json:"pool,omitempty"`
 }
 
 type canonicalCLIUsageProvider struct {
@@ -164,7 +165,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 	var modelDetails []canonicalCLIUsageModelDetail
 	modelIDs := map[string]struct{}{}
 	for _, detail := range agent.ModelDetails {
-		if detail.ID == "" || !bounded(detail.ID, cliUsageMaxModelDetailIDLength) || !bounded(detail.Label, 256) || !bounded(detail.DefaultEffort, cliUsageMaxEffortLength) {
+		if detail.ID == "" || !bounded(detail.ID, cliUsageMaxModelDetailIDLength) || !bounded(detail.Label, 256) || !bounded(detail.DefaultEffort, cliUsageMaxEffortLength) || !bounded(detail.Pool, cliUsageMaxModelPoolLength) {
 			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 		}
 		if _, duplicate := modelIDs[detail.ID]; duplicate {
@@ -181,7 +182,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 		}
 		modelDetails = append(modelDetails, canonicalCLIUsageModelDetail{
 			ID: detail.ID, Label: detail.Label, Efforts: detail.Efforts,
-			DefaultEffort: detail.DefaultEffort, NoEffort: detail.NoEffort,
+			DefaultEffort: detail.DefaultEffort, NoEffort: detail.NoEffort, Pool: detail.Pool,
 		})
 	}
 	metrics := make([]canonicalCLIUsageMetric, 0, len(agent.Metrics))
