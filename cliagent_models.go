@@ -52,12 +52,22 @@ import (
 // this model takes no effort flag; absent otherwise means the CLI did not say.
 // The three states are deliberately distinct: the backend clamps to a named
 // scale, and a later phase drops the flag for a model that refuses one.
+//
+// `Pool` is the quota pool this model spends when the device can SAY so (Ship
+// B6): today that is a model the provider meters under its own window — the
+// usage snapshot carries a metric naming the model (Claude Code's weekly Fable
+// window, Codex's per-model pools), and the pool is that window's key. Absent
+// means the device does not know; the backend falls through to the catalog's
+// `cliAgents/<id>.modelPools` rule (Antigravity's Gemini / "Claude and GPT"
+// groups live there — its quota payload meters groups but never says which
+// model belongs to which, so the device does not guess).
 type cliAgentModelDetail struct {
 	ID            string   `json:"id"`
 	Label         string   `json:"label,omitempty"`
 	Efforts       []string `json:"efforts,omitempty"`
 	DefaultEffort string   `json:"defaultEffort,omitempty"`
 	NoEffort      bool     `json:"noEffort,omitempty"`
+	Pool          string   `json:"pool,omitempty"`
 }
 
 // cliAgentModelDiscovery is what one probe learned about one CLI.
@@ -104,6 +114,11 @@ const (
 	cliUsageMaxEffortsPerModel = 16
 	// cliUsageMaxEffortLength bounds one effort token in the receipt.
 	cliUsageMaxEffortLength = 32
+	// cliUsageMaxModelPoolLength mirrors shared-constants MODEL_POOL_NAME_MAX:
+	// the device's `modelDetails[].pool`, the catalog's `modelPools[].pool` and
+	// a usage window's pool key are all bounded to the same length, so a
+	// reported name always matches the verdict the summary keys by it.
+	cliUsageMaxModelPoolLength = 64
 )
 
 // cliAgentEffortRank orders the levels every coding CLI draws from — the same
@@ -286,7 +301,7 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 	if !ok || len(discovery.Models) == 0 {
 		return
 	}
-	details := boundedModelDetails(discovery.Models)
+	details := boundedModelDetails(annotateModelPoolsFromUsage(discovery.Models, usage.Metrics))
 	usage.ModelDetails = details
 	// Bounding that changed the catalog — a row past the cap or an id the
 	// detail row cannot carry — means the published list is not everything
@@ -309,6 +324,46 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 	if usage.Model == "" && discovery.DefaultModel != "" && bounded(discovery.DefaultModel, cliUsageMaxModelDetailIDLength) {
 		usage.Model = discovery.DefaultModel
 	}
+}
+
+// annotateModelPoolsFromUsage sets `Pool` on every discovered model the usage
+// snapshot meters under its own window (Ship B6). A metric naming a model is a
+// NESTED sub-limit — Claude Code's weekly Fable window, a Codex per-model pool
+// — and shared-constants keys that pool by the model id, lower-cased
+// (`nestedPoolNameFor`), so the pool reported here is exactly that key: a
+// device-reported pool the summary cannot find would read as routable while
+// the window is spent. A model no window names is left without a pool for the
+// catalog rule to place; a pool a probe already set is kept.
+//
+// Metrics are matched to models case-insensitively (Codex's pool name is the
+// model id in the vendor's display case, `GPT-5.3-Codex-Spark`, lower-cased on
+// the wire; the models cache spells it lower-case already).
+func annotateModelPoolsFromUsage(models []cliAgentModelDetail, metrics []cliAgentUsageMetric) []cliAgentModelDetail {
+	if len(models) == 0 || len(metrics) == 0 {
+		return models
+	}
+	metered := map[string]string{}
+	for _, metric := range metrics {
+		model := strings.ToLower(strings.TrimSpace(metric.Model))
+		if model == "" {
+			continue
+		}
+		metered[model] = model
+	}
+	if len(metered) == 0 {
+		return models
+	}
+	out := make([]cliAgentModelDetail, len(models))
+	copy(out, models)
+	for i := range out {
+		if out[i].Pool != "" {
+			continue
+		}
+		if pool, ok := metered[strings.ToLower(strings.TrimSpace(out[i].ID))]; ok {
+			out[i].Pool = pool
+		}
+	}
+	return out
 }
 
 func cliAgentModelProbeCacheKey(agentID string, detected detectedCLIAgent) string {
@@ -1042,6 +1097,12 @@ func containsString(values []string, want string) bool {
 func boundedModelDetail(detail cliAgentModelDetail) cliAgentModelDetail {
 	if !bounded(detail.Label, 256) {
 		detail.Label = ""
+	}
+	// An over-long pool name is dropped, not truncated: truncated on this side
+	// only it would name a pool no usage window keys, and the model would route
+	// fail-open while its real pool is spent.
+	if !bounded(detail.Pool, cliUsageMaxModelPoolLength) {
+		detail.Pool = ""
 	}
 	if len(detail.Efforts) > cliUsageMaxEffortsPerModel {
 		detail.Efforts = detail.Efforts[:cliUsageMaxEffortsPerModel]
