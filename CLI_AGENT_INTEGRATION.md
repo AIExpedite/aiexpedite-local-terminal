@@ -356,7 +356,7 @@ resets the cache. The signed refresh receipt canonicalises both fields
 (`testdata/cli_usage_refresh_receipt_vectors.json`, vector 4, mirrored in
 terminal-service), so **terminal-service must deploy first**.
 
-**Quota pool per model (Ship B6, v1.0.20).** A detail row also carries `pool`
+**Quota pool per model (Ship B6, v1.0.21).** A detail row also carries `pool`
 when the device can SAY which quota pool the model spends: a model the
 provider meters under its own window — the usage snapshot has a metric naming
 that model (Claude Code's weekly Fable window, a Codex per-model pool such as
