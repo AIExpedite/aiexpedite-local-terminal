@@ -345,7 +345,13 @@ func annotateModelPoolsFromUsage(models []cliAgentModelDetail, metrics []cliAgen
 	metered := map[string]string{}
 	for _, metric := range metrics {
 		model := strings.ToLower(strings.TrimSpace(metric.Model))
-		if model == "" {
+		// The pool bound is enforced HERE, not left to boundedModelDetail: the
+		// parsers ran that pass before caching, and this annotation comes
+		// after it, so a metered id of 65–256 bytes would otherwise reach
+		// canonicalProvider as an over-long pool and fail the whole refresh.
+		// Such a model is left unpooled (the shared summary still keys its
+		// nested window by the model id) rather than reported truncated.
+		if model == "" || !bounded(model, cliUsageMaxModelPoolLength) {
 			continue
 		}
 		metered[model] = model

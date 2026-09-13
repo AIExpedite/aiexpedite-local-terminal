@@ -106,6 +106,31 @@ func TestAttachCLIAgentModelDiscovery_ReportsPoolOnTheSnapshot(t *testing.T) {
 	}
 }
 
+func TestAnnotateModelPoolsFromUsage_LeavesAnOverLongMeteredIDUnpooled(t *testing.T) {
+	// A metered id past the pool bound (65–256 bytes is a valid detail id)
+	// must not become a pool: the annotation runs AFTER the parsers' bounding
+	// pass, and an over-long pool would fail the whole refresh in
+	// canonicalProvider instead of being dropped.
+	long := strings.Repeat("m", cliUsageMaxModelPoolLength+1)
+	atBound := strings.Repeat("n", cliUsageMaxModelPoolLength)
+	models := []cliAgentModelDetail{{ID: long}, {ID: atBound}}
+	metrics := []cliAgentUsageMetric{
+		{Kind: limitKindWeekly, Model: long},
+		{Kind: limitKindWeekly, Model: atBound},
+	}
+	got := annotateModelPoolsFromUsage(models, metrics)
+	if got[0].Pool != "" {
+		t.Fatalf("over-long metered id became pool %q", got[0].Pool)
+	}
+	if got[1].Pool != atBound {
+		t.Fatalf("at-bound pool = %q, want kept", got[1].Pool)
+	}
+	usage := cliAgentUsage{Provider: "codex", CollectedAt: "now", ModelDetails: boundedModelDetails(got)}
+	if _, _, _, err := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{usage}, nil); err != nil {
+		t.Fatalf("the annotated snapshot must pass the receipt bounds: %v", err)
+	}
+}
+
 func TestBoundedModelDetail_DropsAnOverLongPool(t *testing.T) {
 	long := strings.Repeat("p", cliUsageMaxModelPoolLength+1)
 	got := boundedModelDetail(cliAgentModelDetail{ID: "m", Pool: long})
