@@ -168,6 +168,23 @@ func seedIsolatedGrokLogin(dir, srcBase string) error {
 	return nil
 }
 
+// grokCopyCredentialPreserved reports whether deleting copyHome loses nothing:
+// the copy holds no credential, its credential is another account's (the
+// real home was re-logged-in underneath it; not ours to carry), the real
+// home is signed out (a logout is not undone by a copy), or the real home
+// already holds a credential at least as new as the copy's.
+func grokCopyCredentialPreserved(base, copyHome string) bool {
+	copyStamp, ok := readGrokCredentialStamp(copyHome)
+	if !ok {
+		return true
+	}
+	real, ok := readGrokCredentialStamp(base)
+	if !ok || real.Fingerprint != copyStamp.Fingerprint {
+		return true
+	}
+	return !real.MintedAt.Before(copyStamp.MintedAt)
+}
+
 // removeIsolatedGrokHome unlinks the persistent sessions store before
 // recursively removing the ephemeral home. If unlinking cannot be verified,
 // it leaves the home and sessions entry in place and removes only siblings;
@@ -201,8 +218,18 @@ func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attem
 	// outlasts a whole CLI renewal; when even that is not enough, the copy is
 	// kept — files and registration — and the removal retries later, rather
 	// than deleting a credential nothing else holds.
-	if _, ok := reconcileGrokLoginWithin(grokPersistentHome(), grokLoginRemovalReconcileWait); !ok {
-		fmt.Printf("%s[grok-acp] isolated home kept for now (attempt %d): its login copy could not be reconciled while a renewal ran%s\n",
+	// Getting the lock is not the same as getting the credential across: the
+	// write into the real home can still fail (the CLI holding auth.json.lock
+	// past our wait, a sharing violation on Windows). So the test is on the
+	// outcome — the real home must hold a credential at least as new as this
+	// copy's — and not on whether the pass ran.
+	base := grokPersistentHome()
+	_, ok := reconcileGrokLoginWithin(base, grokLoginRemovalReconcileWait)
+	if ok && !grokCopyCredentialPreserved(base, home) {
+		ok = false
+	}
+	if !ok {
+		fmt.Printf("%s[grok-acp] isolated home kept for now (attempt %d): its login copy could not be handed to the real home yet%s\n",
 			colorYellow, attempt+1, colorReset)
 		if attempt < grokLoginRemovalRetries {
 			time.AfterFunc(grokLoginRemovalReconcileWait, func() {

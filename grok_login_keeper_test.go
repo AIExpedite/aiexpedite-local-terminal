@@ -807,3 +807,56 @@ func TestReconcileGrokLogin_DoesNotRecreateARealHomeSignedOutUnderTheSnapshot(t 
 		t.Error("staging file left behind")
 	}
 }
+
+// TestRemoveIsolatedGrokHome_KeepsTheCopyWhenTheWriteBackItselfFails: the
+// login lock was free, so the reconciliation pass ran — but the write into
+// the real home failed (here: the CLI holding the real home's auth.json.lock
+// past the wait). The copy holds the only live credential and must be kept,
+// then handed over on the retry once the write can land.
+func TestRemoveIsolatedGrokHome_KeepsTheCopyWhenTheWriteBackItselfFails(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, home, "copy-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+
+	prevWait := grokLoginRemovalReconcileWait
+	grokLoginRemovalReconcileWait = 300 * time.Millisecond
+	t.Cleanup(func() { grokLoginRemovalReconcileWait = prevWait })
+
+	held, err := os.OpenFile(filepath.Join(real, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeIsolatedGrokHome(home); err == nil || !strings.Contains(err.Error(), "renewal in flight") {
+		t.Fatalf("removal err=%v, want the deferral: the credential was not handed over", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "auth.json")); err != nil {
+		t.Fatal("the copy was deleted although its credential never reached the real home")
+	}
+	if got := grokKeyIn(t, real); got != "real-old" {
+		t.Fatalf("real home holds %q while the CLI held its lock", got)
+	}
+	_ = unlockFile(held)
+	_ = held.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(home); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatal("the retry never removed the copy once the write could land")
+	}
+	if got := grokKeyIn(t, real); got != "copy-renewed" {
+		t.Errorf("real home holds %q, want the copy's credential handed over by the retry", got)
+	}
+}
