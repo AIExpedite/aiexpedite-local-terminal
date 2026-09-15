@@ -1318,3 +1318,33 @@ func TestGrokLoginKeeperOnce_AdoptsAnotherAgentProcessesRenewalInsteadOfRenewing
 		t.Error("the other process's copy was registered here")
 	}
 }
+
+// TestGrokLoginKeeperOnce_AdoptsAnOrphanedCopysRenewalInsteadOfRenewing: the
+// agent died right after a child refreshed and before the write-back; the
+// orphan is unowned (its lock died with the process) and younger than the
+// sweep's 24 h. The restarted keeper must still find its newer credential
+// before renewing the real home's superseded token.
+func TestGrokLoginKeeperOnce_AdoptsAnOrphanedCopysRenewalInsteadOfRenewing(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	tmp := grokTempDirForSweep(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-superseded", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	orphan := filepath.Join(tmp, grokIsolatedHomePrefix+"orphan")
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, orphan, "orphan-renewed", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("renewed the real home's superseded token")
+	}
+	if renewals != 0 {
+		t.Fatalf("renewals=%d, want none", renewals)
+	}
+	if got := grokKeyIn(t, real); got != "orphan-renewed" {
+		t.Errorf("real home holds %q, want the orphan's renewal written back", got)
+	}
+}

@@ -713,11 +713,12 @@ account wins everywhere.**
   the cross-process `aix-renew.lock` beside the real home's `auth.json`, so
   their keepers never rotate one refresh token twice; the loser skips its
   tick (the probe reports `login_busy`). Before renewing, a keeper also
-  looks at the OTHER process's live copies (the owned `grok-acp-home-*`
-  homes in the temp dir): a newer same-account credential one of them holds
-  is written back to the real home instead of the superseded token being
-  renewed. Those copies are read, never written — they are the other
-  process's to fan out to.
+  looks at every `grok-acp-home-*` home in the temp dir it did not create —
+  another process's live copies and the orphans of a process that died
+  right after a child refreshed: a newer same-account credential one of them
+  holds is written back to the real home instead of the superseded token
+  being renewed. Those copies are read, never written. The keeper finds the
+  CLI the way the launchers do (PATH, then the installer's `~/.grok/bin`).
 - Every `auth.json` replacement stages its bytes in a uniquely named file
   beside the target (`os.CreateTemp`), never a fixed name: two agent
   processes reconciling one home must not rename each other's half-written

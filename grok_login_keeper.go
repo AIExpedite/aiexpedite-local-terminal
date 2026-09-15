@@ -483,16 +483,16 @@ func reconcileGrokLoginLocked(base string) int {
 // be written back (a signed-out real home is never recreated). So no renewal
 // runs until the write-back has landed.
 //
-// Copies owned by OTHER agent processes on this computer count too: their
-// registries are not visible here, but their homes are (every one holds its
-// owner lock, grokForeignOwnedGrokCopies), and a renewal one of them made is
-// as much a superseding of the real home's token as one of ours.
+// Copies of OTHER agent processes on this computer count too — live ones and
+// the orphans of a process that died — their registries are not visible
+// here, but their homes are (grokOtherGrokCopies), and a renewal one of them
+// made is as much a superseding of the real home's token as one of ours.
 func grokRealHomeHoldsNewest(base string) bool {
 	real, ok := readGrokCredentialStamp(base)
 	if !ok {
 		return false
 	}
-	for _, home := range append(grokLogin.liveCopies(), grokForeignOwnedGrokCopies()...) {
+	for _, home := range append(grokLogin.liveCopies(), grokOtherGrokCopies()...) {
 		if s, ok := readGrokCredentialStamp(home); ok && s.Fingerprint == real.Fingerprint && s.MintedAt.After(real.MintedAt) {
 			return false
 		}
@@ -526,7 +526,7 @@ func adoptForeignGrokRenewals(base string) bool {
 		return false
 	}
 	newest := real
-	for _, home := range grokForeignOwnedGrokCopies() {
+	for _, home := range grokOtherGrokCopies() {
 		if s, ok := readGrokCredentialStamp(home); ok && s.Fingerprint == real.Fingerprint && s.MintedAt.After(newest.MintedAt) {
 			newest = s
 		}
@@ -544,11 +544,14 @@ func adoptForeignGrokRenewals(base string) bool {
 	return true
 }
 
-// grokForeignOwnedGrokCopies lists the isolated homes in the temp dir that
-// another live agent process owns: not registered here, owner lock held.
-// Consulted only on the renewal path, so the temp dir is not scanned every
-// tick.
-func grokForeignOwnedGrokCopies() []string {
+// grokOtherGrokCopies lists every isolated home in the temp dir that is not
+// registered here: the live copies of another agent process, and the
+// orphans an agent process left when it died — including one whose child
+// had just refreshed, which then holds the account's newest credential and
+// must be found BEFORE the real home's superseded token is renewed, not
+// after the 24 h sweep. Consulted only on the renewal path, so the temp dir
+// is not scanned every tick.
+func grokOtherGrokCopies() []string {
 	entries, err := os.ReadDir(os.TempDir())
 	if err != nil {
 		return nil
@@ -566,9 +569,7 @@ func grokForeignOwnedGrokCopies() []string {
 		if _, ok := ours[filepath.Clean(home)]; ok {
 			continue
 		}
-		if grokIsolatedHomeOwned(home) {
-			out = append(out, home)
-		}
+		out = append(out, home)
 	}
 	return out
 }
@@ -647,13 +648,15 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 	return renewed
 }
 
-// grokLoginKeeperBinary resolves the CLI the keeper renews with. "" when it
-// is not installed; the keeper then only reconciles.
+// grokLoginKeeperBinary resolves the CLI the keeper renews with, the way the
+// session and ACP launchers do: PATH first, then the official installer's
+// ~/.grok/bin, which a macOS launchd/GUI agent's sparse PATH never has. ""
+// when it is not installed; the keeper then only reconciles.
 func grokLoginKeeperBinary() string {
 	if path, err := exec.LookPath("grok"); err == nil {
 		return path
 	}
-	return ""
+	return resolveGrokInstallerBinary()
 }
 
 // runGrokLoginKeeper is the background loop, started once at agent startup.
