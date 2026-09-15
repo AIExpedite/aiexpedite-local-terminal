@@ -43,6 +43,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -168,6 +169,24 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 	return nil
 }
 
+// errGrokCopyMovedOn: the destination changed under the snapshot — its own
+// child refreshed it — and now holds a credential at least as new as the one
+// about to be written. Nothing is written; the next pass re-reads it.
+var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the snapshot")
+
+// replaceGrokAuthFileIfOlder re-reads the destination immediately before
+// replacing it and writes only while it is still OLDER than newest. The
+// isolated Grok children never take the in-process login lock, so a child
+// may refresh its own auth.json between the snapshot and the write; writing
+// the snapshot's choice over that would put every home on the chain the
+// child's refresh just superseded.
+func replaceGrokAuthFileIfOlder(dstHome string, newest grokCredentialStamp) error {
+	if current, ok := readGrokCredentialStamp(dstHome); ok && !current.MintedAt.Before(newest.MintedAt) {
+		return errGrokCopyMovedOn
+	}
+	return replaceGrokAuthFile(dstHome, newest.Home)
+}
+
 // reconcileGrokLogin applies the newest-wins rule across the real home and
 // every live copy of the real home's account. Returns how many homes were
 // rewritten. Safe to call at any time: reading rotates nothing, and a rewrite
@@ -241,7 +260,7 @@ func reconcileGrokLoginLocked(base string) int {
 	}
 	rewritten := 0
 	if newest.Home != base {
-		if err := replaceGrokAuthFile(base, newest.Home); err != nil {
+		if err := replaceGrokAuthFileIfOlder(base, newest); err != nil {
 			fmt.Printf("%s[grok-login] could not write the renewed login back to the real home: %v%s\n",
 				colorYellow, err, colorReset)
 		} else {
@@ -254,7 +273,7 @@ func reconcileGrokLoginLocked(base string) int {
 		if s.Home == base || s.Home == newest.Home || s.Fingerprint != account || !s.MintedAt.Before(newest.MintedAt) {
 			continue
 		}
-		if err := replaceGrokAuthFile(s.Home, newest.Home); err != nil {
+		if err := replaceGrokAuthFileIfOlder(s.Home, newest); err != nil {
 			fmt.Printf("%s[grok-login] could not fan the renewed login out to a session copy: %v%s\n",
 				colorYellow, err, colorReset)
 			continue

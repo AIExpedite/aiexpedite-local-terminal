@@ -626,3 +626,37 @@ func TestRemoveIsolatedGrokHome_NeverDeletesWhileTheLoginLockStaysHeld(t *testin
 		t.Fatal("the copy was unregistered while still the only live credential")
 	}
 }
+
+// TestReconcileGrokLogin_DoesNotOverwriteACopyThatRefreshedUnderTheSnapshot:
+// isolated Grok children never take the login lock, so a copy can refresh
+// itself between the snapshot and the write. A destination that now holds a
+// credential at least as new as the chosen one must be left alone — writing
+// the snapshot over it would put the account on the chain that refresh just
+// superseded.
+func TestReconcileGrokLogin_DoesNotOverwriteACopyThatRefreshedUnderTheSnapshot(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-newest", "dan@example.com", now.Add(-time.Minute), now.Add(6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-old", "dan@example.com", now.Add(-3*time.Hour), now.Add(3*time.Hour))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	// The snapshot reconcileGrokLogin would take, then the child refreshes.
+	newest, ok := readGrokCredentialStamp(real)
+	if !ok {
+		t.Fatal("real stamp unreadable")
+	}
+	writeGrokAuthMinted(t, copyHome, "copy-refreshed-under-us", "dan@example.com", now, now.Add(6*time.Hour))
+	if err := replaceGrokAuthFileIfOlder(copyHome, newest); err == nil {
+		t.Fatal("a copy that refreshed itself since the snapshot was overwritten")
+	}
+	if got := grokKeyIn(t, copyHome); got != "copy-refreshed-under-us" {
+		t.Errorf("copy holds %q, want its own newer refresh kept", got)
+	}
+	// And the next pass carries that newer credential the other way.
+	reconcileGrokLogin(real)
+	if got := grokKeyIn(t, real); got != "copy-refreshed-under-us" {
+		t.Errorf("real home holds %q, want the copy's newer refresh on the next pass", got)
+	}
+}
