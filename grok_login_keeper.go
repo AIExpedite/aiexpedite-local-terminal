@@ -176,11 +176,6 @@ var errGrokDestinationGone = errors.New("grok login destination signed out since
 // about to be written. Nothing is written; the next pass re-reads it.
 var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the snapshot")
 
-// errGrokDestGone: the destination had a credential when the snapshot was
-// taken and no longer does. For the real home that is `grok logout` (or the
-// CLI signing the home out) and must not be undone by writing a copy back.
-var errGrokDestGone = errors.New("grok login destination disappeared since the snapshot")
-
 // acquireGrokAuthLock takes the CLI's exclusive lock beside dstHome's
 // auth.json, waiting at most grokAuthLockWait. The lock is released when the
 // returned file is closed.
