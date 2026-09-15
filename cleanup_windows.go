@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 	"time"
 )
 
@@ -22,7 +21,7 @@ func aggressiveCleanup() {
 	// Use taskkill /T to kill our entire process tree (all children)
 	// This includes any PowerShell, claude, ttyd processes we spawned
 	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", myPID))
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	hideWindow(cmd)
 	// Note: This will fail to kill ourselves (which is fine - we're exiting anyway)
 	// but it WILL kill all our child processes
 	_ = cmd.Run()
@@ -32,7 +31,7 @@ func aggressiveCleanup() {
 		pid := ttydCmd.Process.Pid
 		fmt.Printf("[cleanup] Killing ttyd process tree (PID %d)...\n", pid)
 		cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		hideWindow(cmd)
 		_ = cmd.Run()
 	}
 

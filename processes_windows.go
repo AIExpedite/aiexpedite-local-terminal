@@ -29,7 +29,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -111,7 +110,7 @@ func scanViaPowerShell() []ProcessInfo {
 		` @{Name='CreationDate';Expression={if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss') } else { '' }}}` +
 		` | ConvertTo-Csv -NoTypeInformation`
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	hideWindow(cmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -134,7 +133,7 @@ func scanViaWMIC() []ProcessInfo {
 		"/format:csv",
 	}
 	cmd := exec.Command("wmic", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	hideWindow(cmd)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	// wmic exits non-zero when the WHERE clause matches nothing — that's a
@@ -227,7 +226,7 @@ func KillProcessTree(pid int) error {
 		return fmt.Errorf("invalid pid %d", pid)
 	}
 	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	hideWindow(cmd)
 	return cmd.Run()
 }
 

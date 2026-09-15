@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -96,6 +97,25 @@ func (g *grokLoginGuard) beginRenewal(ctx context.Context) (func(), bool) {
 		g.broadcastLocked()
 		g.mu.Unlock()
 	}, true
+}
+
+// liveCopies returns the isolated homes currently holding a copy of the login,
+// after forgetting any whose directory is already gone. A copy's auth file is
+// as readable as the real home's — an ACP session that renewed ITS token holds a
+// fresher credential than a real home nothing has touched for hours — so a
+// read-only consumer (the billing probe) may present the freshest of them.
+// Reading never rotates anything; only renewal does, and renewal still waits
+// for every copy to be gone.
+func (g *grokLoginGuard) liveCopies() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pruneRemovedLocked()
+	out := make([]string, 0, len(g.copies))
+	for key := range g.copies {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // pruneRemovedLocked forgets copies whose home no longer exists. Every removal

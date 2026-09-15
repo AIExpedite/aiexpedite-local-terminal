@@ -24,7 +24,10 @@
 //	    up its language server, whose quota RPC forces a fresh fetch; the process
 //	    is killed as soon as the reading lands, normally before any model output.
 //	    The server is identified by the PID `agy` logs, so a run the user already
-//	    has open is never read or touched.
+//	    has open is never read or touched. Builds from 1.2.2 refuse that RPC
+//	    without a per-run CSRF token nothing headless can obtain
+//	    (cliagent_usage_antigravity_gate.go): the probe then stops at the first
+//	    refusal, records the build, and later clicks skip the spawn entirely.
 //
 //	Model discovery is warmed in the same window, with the time `agy models`
 //	actually needs, so the bounded gather that follows answers from the cache.
@@ -93,6 +96,10 @@ const (
 	// The signed-in account changed while the probe ran, so the reading can
 	// not be attributed to the account that is signed in now.
 	liveProbeOutcomeAccountChanged = "account_changed"
+	// The installed build refuses loopback quota reads (Antigravity ≥ 1.2.2,
+	// cliagent_usage_antigravity_gate.go). Reported both when a probe met the
+	// refusal and when the click skipped the spawn because a recent probe did.
+	liveProbeOutcomeGated = "gated"
 )
 
 // cliUsageRefreshWantsLiveProbe reports whether a refresh carries the signed
@@ -201,7 +208,7 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 		// for the probe.
 		warmedWithProbe["antigravity"] = true
 		run("antigravity", func() string {
-			outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
+			outcome := probeAntigravityQuotaLiveUnlessGated(ctx, agent, home)
 			warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
 			return outcome
 		})
@@ -493,6 +500,28 @@ func antigravityHTTPPortInPIDBlock(body []byte, pid string) (port int, found boo
 	return 0, false
 }
 
+// probeAntigravityQuotaLiveUnlessGated runs the Antigravity probe, unless a
+// recent probe of this same build already met the CSRF refusal
+// (cliagent_usage_antigravity_gate.go): a click then costs no model turn and
+// no 20 s wait for a reading the build will not give. A refusal met now is
+// recorded under the build that gave it; a reading clears the record.
+func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLIAgent, home string) string {
+	now := time.Now()
+	if gate, ok := antigravityQuotaGateFor(agent.Version, now); ok {
+		fmt.Printf("%s[cli-usage] Antigravity quota probe skipped: build %s refused loopback quota reads at %s (retried after %s)%s\n",
+			colorYellow, firstNonEmpty(agent.Version, gate.Version, "unknown"), gate.ObservedAt, antigravityQuotaGateRecheck, colorReset)
+		return liveProbeOutcomeGated
+	}
+	outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
+	switch outcome {
+	case liveProbeOutcomeGated:
+		noteAntigravityQuotaGate(agent.Version, now)
+	case liveProbeOutcomeOK:
+		clearAntigravityQuotaGate()
+	}
+	return outcome
+}
+
 // probeAntigravityQuotaLive starts `agy` only to bring up its language server,
 // reads the quota the server fetches for its signed-in account, and kills the
 // run as soon as the reading is persisted.
@@ -550,9 +579,15 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 		}
 		if port != 0 {
 			attemptCtx, attemptCancel := context.WithTimeout(ctx, antigravityQuotaTimeout)
-			snap, ok := fetchAntigravityQuotaOnPort(attemptCtx, client, port, time.Now())
+			snap, outcome := fetchAntigravityQuotaOnPortOutcome(attemptCtx, client, port, time.Now())
 			attemptCancel()
-			if ok {
+			if outcome == antigravityFetchGated {
+				// A property of the build, not of this tick: no later poll
+				// answers differently. The deferred kill ends the run before
+				// the model turn it was only started to host.
+				return liveProbeOutcomeGated
+			}
+			if outcome == antigravityFetchOK {
 				sawReading = true
 				// Persisted only under the account the server itself named —
 				// the same attribution rule the run-scoped poller follows.

@@ -336,28 +336,39 @@ func antigravityLoopbackClient() *http.Client {
 
 // antigravityPostJSON performs one loopback RPC and decodes into out.
 func antigravityPostJSON(ctx context.Context, client *http.Client, port int, path string, out any) bool {
+	return antigravityPostJSONOutcome(ctx, client, port, path, out) == antigravityRPCOK
+}
+
+// antigravityPostJSONOutcome is antigravityPostJSON with the CSRF refusal kept
+// apart from every other failure (cliagent_usage_antigravity_gate.go): a
+// caller that sees antigravityRPCGated is talking to a live server of a build
+// that will never answer it, and should stop asking.
+func antigravityPostJSONOutcome(ctx context.Context, client *http.Client, port int, path string, out any) antigravityRPCOutcome {
 	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return false
+		return antigravityRPCFailed
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return antigravityRPCFailed
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, antigravityQuotaMaxBody))
 		_ = resp.Body.Close()
 	}()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, antigravityQuotaMaxBody))
 	if err != nil {
-		return false
+		return antigravityRPCFailed
 	}
-	return json.Unmarshal(body, out) == nil
+	if resp.StatusCode == http.StatusUnauthorized && antigravityRefusalIsCSRF(body) {
+		return antigravityRPCGated
+	}
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, out) != nil {
+		return antigravityRPCFailed
+	}
+	return antigravityRPCOK
 }
 
 // fetchAntigravityQuota queries the first candidate port that answers. Returns
@@ -369,18 +380,29 @@ func antigravityPostJSON(ctx context.Context, client *http.Client, port int, pat
 // that snapshot was taken (antigravityMissedRun) without a second directory
 // walk.
 func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (antigravityQuotaSnapshot, time.Time, bool) {
+	snap, newestLog, ok, _ := fetchAntigravityQuotaDetailed(ctx, base, now)
+	return snap, newestLog, ok
+}
+
+// fetchAntigravityQuotaDetailed is fetchAntigravityQuota plus whether a live
+// server REFUSED the read (gated). A gated port is still a live server, so it
+// ends the walk: no other port from the same logs will answer differently.
+func fetchAntigravityQuotaDetailed(ctx context.Context, base string, now time.Time) (snap antigravityQuotaSnapshot, newestLog time.Time, ok, gated bool) {
 	ports, newestLog := discoverAntigravityHTTPPorts(base)
 	if len(ports) == 0 {
-		return antigravityQuotaSnapshot{}, newestLog, false
+		return antigravityQuotaSnapshot{}, newestLog, false, false
 	}
 	client := antigravityLoopbackClient()
 	defer client.CloseIdleConnections()
 	for _, port := range ports {
-		if snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now); ok {
-			return snap, newestLog, true
+		switch snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, port, now); outcome {
+		case antigravityFetchOK:
+			return snap, newestLog, true, false
+		case antigravityFetchGated:
+			return antigravityQuotaSnapshot{}, newestLog, false, true
 		}
 	}
-	return antigravityQuotaSnapshot{}, newestLog, false
+	return antigravityQuotaSnapshot{}, newestLog, false, false
 }
 
 // antigravityMissedRunSlack is how far a log may postdate the observation it
@@ -427,6 +449,14 @@ func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) 
 // CLI's logs — log scanning, not the RPC, is what makes a probe expensive
 // (antigravityQuotaMaxLogs files × 2×antigravityLogScanBytes per attempt).
 func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port int, now time.Time) (antigravityQuotaSnapshot, bool) {
+	snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, port, now)
+	return snap, outcome == antigravityFetchOK
+}
+
+// fetchAntigravityQuotaOnPortOutcome is fetchAntigravityQuotaOnPort for callers
+// that must tell a build that REFUSES (antigravityFetchGated — stop polling,
+// note the gate) from a port that simply did not answer usably.
+func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client, port int, now time.Time) (antigravityQuotaSnapshot, antigravityFetchOutcome) {
 	var quota struct {
 		Response struct {
 			Groups []struct {
@@ -444,8 +474,11 @@ func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port 
 			} `json:"groups"`
 		} `json:"response"`
 	}
-	if !antigravityPostJSON(ctx, client, port, antigravityQuotaRPC, &quota) {
-		return antigravityQuotaSnapshot{}, false
+	switch antigravityPostJSONOutcome(ctx, client, port, antigravityQuotaRPC, &quota) {
+	case antigravityRPCGated:
+		return antigravityQuotaSnapshot{}, antigravityFetchGated
+	case antigravityRPCFailed:
+		return antigravityQuotaSnapshot{}, antigravityFetchFailed
 	}
 	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
 	plottable := 0
@@ -477,7 +510,7 @@ func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port 
 	// success and overwrite the last usable cached reading with rows that
 	// all render Unknown.
 	if plottable == 0 {
-		return antigravityQuotaSnapshot{}, false
+		return antigravityQuotaSnapshot{}, antigravityFetchFailed
 	}
 	// Identity comes from the same server, on the same port, in the same
 	// probe — so the quota and the account it belongs to can never be
@@ -497,7 +530,7 @@ func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port 
 		snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
 		snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
 	}
-	return snap, true
+	return snap, antigravityFetchOK
 }
 
 // loadAntigravityQuotaSnapshot reads the cached snapshot, scoped to the current

@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -112,7 +111,7 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		"-OutputFormat", "Text",
 		"-Command", "-", // Read commands from stdin
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	hideWindow(cmd)
 	// Headless hardening: the persistent shell is the default fast path for
 	// non-agent Windows commands, so inject the authoritative non-interactive
 	// git/editor/credential overlay at spawn time — every command it later runs
