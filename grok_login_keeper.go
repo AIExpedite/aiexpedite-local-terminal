@@ -147,9 +147,70 @@ func readGrokCredentialStamp(home string) (grokCredentialStamp, bool) {
 	return grokCredentialStamp{}, false
 }
 
+// grokAuthLockName is the CLI's own lock file beside auth.json. The CLI
+// takes it around its writes to the credential; taking the same lock around
+// the keeper's re-check-and-replace makes the two writers serialize on the
+// file system rather than merely on this process's lock. When the CLI is not
+// holding it, the lock costs nothing; when it is, the keeper waits it out
+// (bounded) instead of racing it.
+const grokAuthLockName = "auth.json.lock"
+
+// grokAuthLockWait bounds how long a replacement waits for the CLI's lock
+// file before skipping this pass (the next tick retries).
+const grokAuthLockWait = 2 * time.Second
+
+// grokAuthLockPoll is the retry interval while the CLI holds the lock.
+const grokAuthLockPoll = 25 * time.Millisecond
+
+// errGrokAuthLocked: the CLI held auth.json.lock for the whole wait; nothing
+// was written. A running child writing its credential is the one case a
+// replacement must not race, so skipping is the point.
+var errGrokAuthLocked = errors.New("grok auth.json.lock held by the CLI")
+
+// errGrokCopyMovedOn: the destination changed under the snapshot — its own
+// child refreshed it — and now holds a credential at least as new as the one
+// about to be written. Nothing is written; the next pass re-reads it.
+var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the snapshot")
+
+// acquireGrokAuthLock takes the CLI's exclusive lock beside dstHome's
+// auth.json, waiting at most grokAuthLockWait. The lock is released when the
+// returned file is closed.
+func acquireGrokAuthLock(dstHome string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dstHome, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(grokAuthLockWait)
+	for {
+		locked, err := tryLockFileExclusive(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+		if locked {
+			return f, nil
+		}
+		if !time.Now().Before(deadline) {
+			_ = f.Close()
+			return nil, errGrokAuthLocked
+		}
+		time.Sleep(grokAuthLockPoll)
+	}
+}
+
 // replaceGrokAuthFile installs src's auth.json into dstHome atomically (write
 // beside, rename over), so Grok's hot reload never sees a half-written file.
+// The staging copy is prepared BEFORE the lock is taken and the destination
+// re-checked, so the window between check and rename holds nothing but the
+// rename itself.
 func replaceGrokAuthFile(dstHome, srcHome string) error {
+	return replaceGrokAuthFileWhen(dstHome, srcHome, func() error { return nil })
+}
+
+// replaceGrokAuthFileWhen is replaceGrokAuthFile with a check run under the
+// CLI's auth lock immediately before the rename; a non-nil error from the
+// check aborts the replacement and nothing is written.
+func replaceGrokAuthFileWhen(dstHome, srcHome string, check func() error) error {
 	data, err := os.ReadFile(filepath.Join(srcHome, "auth.json"))
 	if err != nil {
 		return err
@@ -157,6 +218,19 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 	dst := filepath.Join(dstHome, "auth.json")
 	tmp := dst + ".aix-tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	lock, err := acquireGrokAuthLock(dstHome)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	defer func() {
+		_ = unlockFile(lock)
+		_ = lock.Close()
+	}()
+	if err := check(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	// atomicReplaceConfigFile is MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH) on
@@ -169,22 +243,20 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 	return nil
 }
 
-// errGrokCopyMovedOn: the destination changed under the snapshot — its own
-// child refreshed it — and now holds a credential at least as new as the one
-// about to be written. Nothing is written; the next pass re-reads it.
-var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the snapshot")
-
-// replaceGrokAuthFileIfOlder re-reads the destination immediately before
-// replacing it and writes only while it is still OLDER than newest. The
-// isolated Grok children never take the in-process login lock, so a child
-// may refresh its own auth.json between the snapshot and the write; writing
-// the snapshot's choice over that would put every home on the chain the
-// child's refresh just superseded.
+// replaceGrokAuthFileIfOlder re-reads the destination under the CLI's auth
+// lock, immediately before the rename, and writes only while it is still
+// OLDER than newest. The isolated Grok children never take the in-process
+// login lock, so a child may refresh its own auth.json at any moment; the
+// re-read under the CLI's own lock, with nothing but the rename after it, is
+// what keeps the snapshot's choice from landing on top of that refresh — and
+// a child mid-write holds the lock, so the keeper waits for it or skips.
 func replaceGrokAuthFileIfOlder(dstHome string, newest grokCredentialStamp) error {
-	if current, ok := readGrokCredentialStamp(dstHome); ok && !current.MintedAt.Before(newest.MintedAt) {
-		return errGrokCopyMovedOn
-	}
-	return replaceGrokAuthFile(dstHome, newest.Home)
+	return replaceGrokAuthFileWhen(dstHome, newest.Home, func() error {
+		if current, ok := readGrokCredentialStamp(dstHome); ok && !current.MintedAt.Before(newest.MintedAt) {
+			return errGrokCopyMovedOn
+		}
+		return nil
+	})
 }
 
 // reconcileGrokLogin applies the newest-wins rule across the real home and

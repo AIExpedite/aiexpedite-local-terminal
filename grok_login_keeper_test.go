@@ -660,3 +660,51 @@ func TestReconcileGrokLogin_DoesNotOverwriteACopyThatRefreshedUnderTheSnapshot(t
 		t.Errorf("real home holds %q, want the copy's newer refresh on the next pass", got)
 	}
 }
+
+// TestReplaceGrokAuthFile_WaitsOutTheCLIsOwnLock: the CLI takes
+// auth.json.lock around its credential writes; a replacement must take the
+// same lock, so it never lands between a child's re-check and its write. With
+// the lock held elsewhere for the whole wait, nothing is written and no
+// staging file is left; once it is free, the same replacement lands.
+func TestReplaceGrokAuthFile_WaitsOutTheCLIsOwnLock(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-new", "dan@example.com", now, now.Add(6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-old", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	newest, ok := readGrokCredentialStamp(real)
+	if !ok {
+		t.Fatal("real stamp unreadable")
+	}
+
+	held, err := os.OpenFile(filepath.Join(copyHome, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = replaceGrokAuthFileIfOlder(copyHome, newest)
+	if err == nil || !strings.Contains(err.Error(), "held by the CLI") {
+		t.Fatalf("replacement err=%v, want the CLI-lock refusal", err)
+	}
+	if waited := time.Since(started); waited < grokAuthLockWait || waited > grokAuthLockWait+2*time.Second {
+		t.Errorf("waited %s, want about %s", waited, grokAuthLockWait)
+	}
+	if got := grokKeyIn(t, copyHome); got != "copy-old" {
+		t.Errorf("copy rewritten to %q while the CLI held its lock", got)
+	}
+	if _, err := os.Stat(filepath.Join(copyHome, "auth.json.aix-tmp")); !os.IsNotExist(err) {
+		t.Error("staging file left behind")
+	}
+	_ = unlockFile(held)
+	_ = held.Close()
+
+	if err := replaceGrokAuthFileIfOlder(copyHome, newest); err != nil {
+		t.Fatalf("replacement after the lock was freed: %v", err)
+	}
+	if got := grokKeyIn(t, copyHome); got != "real-new" {
+		t.Errorf("copy holds %q, want the replacement once the lock was free", got)
+	}
+}
