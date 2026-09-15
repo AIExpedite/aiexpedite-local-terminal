@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 )
@@ -94,15 +95,52 @@ var probeAntigravityQuotaCodeAssistFn = probeAntigravityQuotaCodeAssist
 // antigravityStoredToken returns the access token `agy` keeps in the keyring,
 // with its expiry when stated, and the account the token itself names when an
 // id_token is stored beside it.
+//
+// Two shapes are accepted. What `agy` 1.2.x actually writes (read off a real
+// entry's key names on 2026-09-15) wraps the OAuth2 token:
+//
+//	{"auth_method": "...", "id_token": "...", "token": {"access_token", "token_type", "refresh_token", "expiry"}}
+//
+// and a bare OAuth2 token JSON is taken as well, in case a build stores it
+// unwrapped. A present entry in neither shape is logged by its key names —
+// never its values — so the next shape change is diagnosable from agent.log.
 func antigravityStoredToken(ctx context.Context) (tok antigravityKeyringToken, ok bool) {
 	raw, ok := antigravityKeyringReader(ctx)
 	if !ok || len(bytes.TrimSpace(raw)) == 0 {
 		return antigravityKeyringToken{}, false
 	}
-	if json.Unmarshal(raw, &tok) != nil || strings.TrimSpace(tok.AccessToken) == "" {
-		return antigravityKeyringToken{}, false
+	var wrapped struct {
+		IDToken string                   `json:"id_token"`
+		Token   *antigravityKeyringToken `json:"token"`
 	}
-	return tok, true
+	if json.Unmarshal(raw, &wrapped) == nil && wrapped.Token != nil && strings.TrimSpace(wrapped.Token.AccessToken) != "" {
+		tok = *wrapped.Token
+		if tok.IDToken == "" {
+			tok.IDToken = wrapped.IDToken
+		}
+		return tok, true
+	}
+	if json.Unmarshal(raw, &tok) == nil && strings.TrimSpace(tok.AccessToken) != "" {
+		return tok, true
+	}
+	fmt.Printf("%s[cli-usage] Antigravity keyring entry present but in an unrecognised shape (top-level keys: %s)%s\n",
+		colorYellow, antigravityJSONKeyNames(raw), colorReset)
+	return antigravityKeyringToken{}, false
+}
+
+// antigravityJSONKeyNames lists a JSON object's top-level key names — the one
+// thing about an unrecognised credential that is safe to log.
+func antigravityJSONKeyNames(raw []byte) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return "not a JSON object"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, clampASCII(k, 40))
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 // antigravityPinnedURL resolves an endpoint, honouring an override ONLY when

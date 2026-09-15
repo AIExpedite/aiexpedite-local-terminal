@@ -113,11 +113,16 @@ func TestProbeAntigravityQuotaCodeAssist_ReadsAndCachesUnderTheTokensAccount(t *
 	}
 }
 
+// The shape agy 1.2.x really writes: the OAuth2 token wrapped under "token",
+// with auth_method and id_token beside it.
 func TestProbeAntigravityQuotaCodeAssist_IdentityFromTheStoredIDToken(t *testing.T) {
 	helperStubAntigravityKeyring(t, map[string]any{
-		"access_token": "access-B", "token_type": "Bearer",
-		"expiry":   time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
-		"id_token": helperIDToken(t, "bob@example.com"),
+		"auth_method": "consumer",
+		"id_token":    helperIDToken(t, "bob@example.com"),
+		"token": map[string]any{
+			"access_token": "access-B", "token_type": "Bearer", "refresh_token": "never-read",
+			"expiry": time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
+		},
 	})
 	_, userinfoCalls := helperCodeAssistServers(t,
 		func(string) (int, string) { return http.StatusOK, `{"response":` + antigravityCodeAssistFixture + `}` },
@@ -182,6 +187,15 @@ func TestProbeAntigravityQuotaCodeAssist_NoLoginWithoutAKeyringEntry(t *testing.
 	helperStubAntigravityKeyring(t, nil)
 	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
 		t.Fatalf("outcome=%q, want no_login", got)
+	}
+	// An entry in an unknown shape is no login either — and only its key
+	// names may be logged.
+	helperStubAntigravityKeyring(t, map[string]any{"credential": "opaque-secret-value"})
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
+		t.Fatalf("outcome=%q, want no_login for an unrecognised shape", got)
+	}
+	if names := antigravityJSONKeyNames([]byte(`{"token":{"access_token":"x"},"id_token":"y"}`)); names != "id_token,token" {
+		t.Errorf("key names=%q", names)
 	}
 }
 
