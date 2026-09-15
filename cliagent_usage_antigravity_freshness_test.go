@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -372,6 +376,32 @@ func TestAntigravityFreshness_AdvancedObservedAtSurvivesTheSignedRefresh(t *test
 // commandRunsAntigravity is the gate every terminal-managed spawn path shares.
 // It must see through the `bash -c "agy …"` wrapper terminal-service ships, and
 // must never fire for a command that merely mentions agy in its arguments.
+// helperFileModeLauncher reproduces terminal-service's PowerShell
+// `scriptMode: "file"` launcher (commandNormalize.util.js →
+// buildFileModeInvocation): the REAL script is a second base64 layer inside the
+// launcher, executed from a temp file with -File. A classifier that stops at the
+// outer layer sees only the launcher and never the agy inside it.
+func helperFileModeLauncher(script string) string {
+	launcher := strings.Join([]string{
+		`$ErrorActionPreference='Stop';`,
+		`$b=[Convert]::FromBase64String('` + encodeForPowerShell(script) + `');`,
+		`$s=[Text.Encoding]::Unicode.GetString($b);`,
+		`$f=Join-Path $env:TEMP ("aix-"+[Guid]::NewGuid().ToString()+".ps1");`,
+		`Set-Content -LiteralPath $f -Value $s -Encoding UTF8;`,
+		`try{& 'powershell' -NoProfile -ExecutionPolicy Bypass -File $f;exit $LASTEXITCODE}`,
+		`finally{Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue}`,
+	}, "")
+	return encodeForPowerShell(launcher)
+}
+
+// helperPosixFileModeLauncher is the same launcher's POSIX half — the identical
+// defect on macOS/Linux, emitted by the same terminal-service function.
+func helperPosixFileModeLauncher(script string) string {
+	return `f=$(mktemp -t aix-script.XXXXXX) && ` +
+		`printf '%s' '` + base64.StdEncoding.EncodeToString([]byte(script)) + `' | base64 -d > "$f" && ` +
+		`trap 'rm -f "$f"' EXIT INT TERM && bash "$f"`
+}
+
 func TestCommandRunsAntigravity(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -389,6 +419,42 @@ func TestCommandRunsAntigravity(t *testing.T) {
 		{"argument mentions agy", "git", []string{"log", "--grep", "agy"}, false},
 		{"empty shell payload", "bash", []string{"-c", ""}, false},
 		{"unrelated", "claude", []string{"-p", "hi"}, false},
+
+		// Every wrapper transport terminal-service actually emits on Windows.
+		// Before these were unwrapped, a green CLI-maintenance smoke on Windows
+		// armed no capture at all and freshness never moved.
+		{"ksh -lc", "ksh", []string{"-lc", "agy --print hi"}, true},
+		{"powershell -Command", "powershell", []string{"-Command", "agy -p hi"}, true},
+		{"pwsh.exe -c", "pwsh.exe", []string{"-c", "agy -p hi"}, true},
+		{"cmd /c", "cmd", []string{"/c", "agy --version"}, true},
+		{"cmd.exe /k", "cmd.exe", []string{"/k", "agy --version"}, true},
+		{"powershell -Command with a call operator and a quoted path", "powershell",
+			[]string{"-Command", `Set-Location C:\tmp; & 'C:\Program Files\agy.cmd' -p "do it"`}, true},
+		{"powershell -EncodedCommand", "powershell",
+			[]string{"-EncodedCommand", encodeForPowerShell(`Set-Location C:\t; & 'C:\t\agy.cmd' -p "hi"`)}, true},
+		// terminal-service prepends its own flags ahead of the script flag, so
+		// matching only args[0] would miss every real dispatch.
+		{"encoded behind leading flags", "powershell.exe",
+			[]string{"-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand",
+				encodeForPowerShell("agy --print hi")}, true},
+		{"file-mode launcher", "powershell.exe",
+			[]string{"-NoProfile", "-EncodedCommand", helperFileModeLauncher(`agy --print "a long prompt"`)}, true},
+		{"posix file-mode launcher", "bash",
+			[]string{"-c", helperPosixFileModeLauncher("agy --print hi")}, true},
+		{"start-process", "powershell", []string{"-Command", "Start-Process agy -ArgumentList '-p','hi'"}, true},
+		{"env prefix", "bash", []string{"-c", "AGY_HOME=/tmp agy --print hi"}, true},
+
+		// Negatives: a mention is not a spawn, and an unreadable payload must
+		// answer "no" rather than error or guess.
+		{"powershell mentions agy in an argument", "powershell",
+			[]string{"-Command", "git log --grep agy"}, false},
+		{"file-mode launcher wrapping another program", "powershell.exe",
+			[]string{"-EncodedCommand", helperFileModeLauncher("npm run build")}, false},
+		{"undecodable base64", "powershell", []string{"-EncodedCommand", "!!!not base64!!!"}, false},
+		{"payload over the classify cap", "powershell",
+			[]string{"-Command", strings.Repeat("x", antigravityClassifyMaxPayloadBytes+1) + "; agy -p hi"}, false},
+		{"empty powershell payload", "powershell", []string{"-Command"}, false},
+		{"cmd with a quoted agy mention", "cmd", []string{"/c", `echo "run agy later"`}, false},
 	}
 	for _, tc := range cases {
 		if got := commandRunsAntigravity(tc.command, tc.args); got != tc.want {
@@ -447,5 +513,165 @@ func TestAntigravityFreshness_ConcurrentRunsShareOnePoller(t *testing.T) {
 	}
 	if strings.TrimSpace(snap.Account) != "ada@example.com" {
 		t.Errorf("account=%q, want the server-named identity", snap.Account)
+	}
+}
+
+// The reported defect, end to end: a Windows CLI-maintenance smoke reaches the
+// device as `powershell -EncodedCommand <base64 of an agy invocation>`, and
+// every one of those runs used to arm nothing, so a PASSED smoke was still
+// followed by a day-old observedAt.
+//
+// Runs on every OS: runLocalCommandWindows carries no build tag and the
+// transport itself is stubbed through runEncodedPowerShellViaArgFn, so what is
+// under test here is the classify-and-arm decision rather than powershell.exe.
+func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "")
+	helperSeedStaleAntigravityCache(t, cache)
+	t.Setenv(mockAgyQuotaBaseEnv, filepath.Join(home, ".gemini", "antigravity-cli"))
+	_, executable := helperMockAgyOnPath(t, "antigravity-quota-server")
+
+	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
+	if err != nil {
+		t.Fatalf("parse seed: %v", err)
+	}
+
+	// The stub stands in for powershell.exe: it decodes the script the real
+	// transport would have run and executes the agy invocation inside it, so the
+	// child owns its quota server exactly as on Windows.
+	restore := runEncodedPowerShellViaArgFn
+	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
+	var ran atomic.Int64
+	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration) (string, error) {
+		ran.Add(1)
+		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
+		if decodeErr != nil {
+			return "", decodeErr
+		}
+		if !strings.Contains(script, "agy") {
+			return "", fmt.Errorf("stub received an unexpected script")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		out, runErr := exec.CommandContext(ctx, executable, "--print", "hello").CombinedOutput()
+		return string(out), runErr
+	}
+
+	// The bare `powershell -EncodedCommand <b64>` shape, which is the one
+	// runLocalCommandWindows routes straight to the encoded transport. The
+	// flag-prefixed spelling terminal-service also emits lands on the persistent
+	// PowerShell path instead — both sit UNDER the single arm at the top of the
+	// function, which is why one arm site covers the whole chain.
+	script := fmt.Sprintf(`Set-Location %q; & %q --print "hello"`, t.TempDir(), executable)
+	out, execErr := runLocalCommandWindows("powershell",
+		[]string{"-EncodedCommand", encodeForPowerShell(script)},
+		t.TempDir(), 30*time.Second)
+	if execErr != nil {
+		t.Fatalf("windows execute failed: %v (output=%q)", execErr, out)
+	}
+	if ran.Load() != 1 {
+		t.Fatalf("the encoded-PowerShell transport ran %d times, want exactly once", ran.Load())
+	}
+
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+		case <-time.After(30 * time.Second):
+			t.Fatal("capture poller did not stop after the execute returned")
+		}
+	} else {
+		t.Fatal("the Windows execute never armed a quota capture")
+	}
+	// Exactly one arm for the whole transport chain, and exactly one release:
+	// the fallbacks below the arm are sequential, so a failover must not
+	// double-arm and a poller must never outlive the execute.
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Errorf("arms=%d, want exactly one per execute", got)
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want exactly one per execute", got)
+	}
+
+	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s — the smoke passed and freshness did not move",
+			observed, stale)
+	}
+}
+
+// A non-agy Windows execute must arm nothing at all. The cost of a false
+// positive is only a poller that finds no server, but a capture attached to
+// every `npm test` on the device is noise in the logs and work on the user's
+// machine for nothing.
+func TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	before := antigravityCaptureStopped()
+
+	restore := runEncodedPowerShellViaArgFn
+	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
+	runEncodedPowerShellViaArgFn = func(string, string, time.Duration) (string, error) {
+		return "ok", nil
+	}
+
+	if _, err := runLocalCommandWindows("powershell",
+		[]string{"-EncodedCommand", encodeForPowerShell("git log --grep agy")},
+		t.TempDir(), 30*time.Second); err != nil {
+		t.Fatalf("windows execute failed: %v", err)
+	}
+	if got := antigravityCaptureArms.Load(); got != 0 {
+		t.Errorf("arms=%d, want 0 for a command that never spawns agy", got)
+	}
+	if antigravityCaptureStopped() != before {
+		t.Error("a poller was started for a non-agy execute")
+	}
+}
+
+// The acceptance's second half: freshness must survive an `agy` self-update.
+// Distinct from …SurvivesAnInstallTreeMigrationMidCapture, which moves the tree
+// under a single live poller. This is the maintenance flow's real shape — two
+// separate runs with the update between them — where the risk is not the poller
+// losing track mid-flight but the SECOND run reading a tree the first one never
+// knew about, and the replay then serving the pre-update observation forever.
+func TestAntigravityFreshness_SurvivesACLIUpdateBetweenSmokes(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "20ms")
+	helperSeedStaleAntigravityCache(t, cache)
+	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
+	if err != nil {
+		t.Fatalf("parse seed: %v", err)
+	}
+
+	// Smoke one, on the legacy install tree.
+	legacy := filepath.Join(home, ".agy")
+	helperWriteJSON(t, filepath.Join(legacy, "config.json"), map[string]any{})
+	first := helperStartCaptureServer(t, legacy, helperQuotaJSON, helperStatusJSON)
+	firstRun := startAntigravityQuotaCapture("smoke one")
+	preUpdate := helperAwaitSnapshot(t, cache, stale, "the pre-update observation")
+	helperStopCapture(t, firstRun)
+	first.srv.Close()
+	preUpdateObserved, err := time.Parse(time.RFC3339, preUpdate.ObservedAt)
+	if err != nil {
+		t.Fatalf("pre-update observedAt=%q is not RFC3339: %v", preUpdate.ObservedAt, err)
+	}
+
+	// The CLI updates between the two smokes: the install moves to the modern
+	// tree and the legacy config goes with it.
+	helperRemoveFile(t, filepath.Join(legacy, "config.json"))
+	modern := filepath.Join(home, ".gemini", "antigravity-cli")
+	helperWriteJSON(t, filepath.Join(modern, "settings.json"), map[string]any{})
+
+	// observedAt has one-second resolution; the post-update reading has to land
+	// in a strictly later second to be provably a new observation.
+	time.Sleep(1100 * time.Millisecond)
+
+	// Smoke two, on the updated install.
+	helperStartCaptureServer(t, modern, helperQuotaJSON, helperStatusJSON)
+	secondRun := startAntigravityQuotaCapture("smoke two")
+	helperAwaitSnapshot(t, cache, preUpdateObserved, "the post-update observation")
+	helperStopCapture(t, secondRun)
+
+	// And the card — which reads through the parser, with no server up — must
+	// show the post-update reading rather than replaying the pre-update one.
+	_, observed := helperParsedObservedAt(t, home, time.Now())
+	if !observed.After(preUpdateObserved) {
+		t.Fatalf("observedAt=%s did not advance past the pre-update %s — the update lost the capture",
+			observed, preUpdateObserved)
 	}
 }

@@ -189,14 +189,21 @@ func antigravityLogDir(base string) string {
 // discoverAntigravityHTTPPorts returns candidate loopback ports, newest run
 // first. Ports are read from the CLI's own logs — the server picks a random one
 // per run, so there is nothing to hard-code and nothing to scan for.
-func discoverAntigravityHTTPPorts(base string) []int {
+//
+// The second return is the newest log mtime seen in this base, which is the
+// closest thing the device has to "when did an agy run last happen here". It is
+// returned rather than re-derived so the missed-run backstop
+// (antigravityMissedRun) reuses the ReadDir this function already paid for
+// instead of walking the same directory a second time on every refresh.
+func discoverAntigravityHTTPPorts(base string) ([]int, time.Time) {
+	var newestLog time.Time
 	dir := antigravityLogDir(base)
 	if dir == "" {
-		return nil
+		return nil, newestLog
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil
+		return nil, newestLog
 	}
 	type logFile struct {
 		path    string
@@ -210,6 +217,9 @@ func discoverAntigravityHTTPPorts(base string) []int {
 		info, err := entry.Info()
 		if err != nil {
 			continue
+		}
+		if info.ModTime().After(newestLog) {
+			newestLog = info.ModTime()
 		}
 		files = append(files, logFile{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
 	}
@@ -232,11 +242,11 @@ func discoverAntigravityHTTPPorts(base string) []int {
 			seen[port] = true
 			ports = append(ports, port)
 			if len(ports) >= antigravityQuotaMaxPorts {
-				return ports
+				return ports, newestLog
 			}
 		}
 	}
-	return ports
+	return ports, newestLog
 }
 
 // antigravityPortsInLog extracts every plain-HTTP listener port from one log
@@ -354,19 +364,61 @@ func antigravityPostJSON(ctx context.Context, client *http.Client, port int, pat
 // (snapshot, true) only when at least one usable bucket came back — a server
 // that answers with an empty quota (signed out, or a plan with no metered pool)
 // must not overwrite a good cached reading with nothing.
-func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (antigravityQuotaSnapshot, bool) {
-	ports := discoverAntigravityHTTPPorts(base)
+// The newest log mtime under this base is returned alongside, so a caller that
+// ends up replaying a cached snapshot can tell whether a run has happened since
+// that snapshot was taken (antigravityMissedRun) without a second directory
+// walk.
+func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (antigravityQuotaSnapshot, time.Time, bool) {
+	ports, newestLog := discoverAntigravityHTTPPorts(base)
 	if len(ports) == 0 {
-		return antigravityQuotaSnapshot{}, false
+		return antigravityQuotaSnapshot{}, newestLog, false
 	}
 	client := antigravityLoopbackClient()
 	defer client.CloseIdleConnections()
 	for _, port := range ports {
 		if snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now); ok {
-			return snap, true
+			return snap, newestLog, true
 		}
 	}
-	return antigravityQuotaSnapshot{}, false
+	return antigravityQuotaSnapshot{}, newestLog, false
+}
+
+// antigravityMissedRunSlack is how far a log may postdate the observation it
+// belongs to before that counts as a SEPARATE, unobserved run.
+//
+// Load-bearing, not a fudge factor: the Refresh-click live probe
+// (probeAntigravityQuotaLive) starts its own `agy`, and that process keeps
+// writing its log for seconds after the reading the probe already persisted. A
+// bare `newestLog > observedAt` comparison would therefore warn on every
+// successful refresh, which is the opposite of the signal this exists to give.
+const antigravityMissedRunSlack = 60 * time.Second
+
+// antigravityMissedRun reports one closed-set line when the device is replaying
+// a cached snapshot and the CLI's own logs show a run finished AFTER that
+// snapshot was taken.
+//
+// This is the evidence that separates the two ways Antigravity freshness can
+// fail on the next maintenance pass: "capture was never armed for that run"
+// (this line present — a transport the classifier does not recognise) from
+// "capture was armed but the server would not attribute the reading" (this line
+// absent, and the capture's own close-out line showing attempts with no
+// snapshot). Without it both look identical from the outside: observed_stale.
+//
+// Timestamps and counts only — no paths, no log text, no account.
+func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) {
+	if newestLog.IsZero() || observedAt == "" {
+		return
+	}
+	observed, err := time.Parse(time.RFC3339, observedAt)
+	if err != nil {
+		return
+	}
+	if !newestLog.After(observed.Add(antigravityMissedRunSlack)) {
+		return
+	}
+	fmt.Printf("%s[antigravity-quota] a run completed after the last observation (observedAt=%s newestRunLog=%s behindBy=%s basesWalked=%d) — that run's quota was never captured%s\n",
+		colorYellow, observed.UTC().Format(time.RFC3339), newestLog.UTC().Format(time.RFC3339),
+		newestLog.Sub(observed).Round(time.Second), logBases, colorReset)
 }
 
 // fetchAntigravityQuotaOnPort runs the quota + identity RPC pair against ONE

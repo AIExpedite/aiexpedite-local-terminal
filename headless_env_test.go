@@ -247,3 +247,83 @@ func TestEffectiveCommandLine_UnwrapsBashDashC(t *testing.T) {
 		t.Errorf("direct join: got %q", got)
 	}
 }
+
+// shellDashCPayloadRaw's answers are pinned because wrapperScriptPayload must
+// NOT be implemented by widening it: it is also what decides which commands get
+// headless-hardened (via effectiveCommandLine) and which get their payload
+// rewritten (replaceDashCPayload), so teaching it about PowerShell, `-lc` or
+// ksh would silently change both of those, far from anything this feature is
+// about.
+func TestShellDashCPayloadRaw_StaysPOSIXDashCOnly(t *testing.T) {
+	cases := []struct {
+		name    string
+		cmd     string
+		args    []string
+		want    string
+		wantOK  bool
+		comment string
+	}{
+		{name: "bash -c", cmd: "bash", args: []string{"-c", "echo hi"}, want: "echo hi", wantOK: true},
+		{name: "zsh -c", cmd: "zsh", args: []string{"-c", "echo hi"}, want: "echo hi", wantOK: true},
+		// The no-trim rule the rewriter depends on: trimming a trailing
+		// backslash-newline leaves a dangling `\` that bash passes on as an
+		// extra argument.
+		{name: "no trim", cmd: "bash", args: []string{"-c", " echo hi \\\n"}, want: " echo hi \\\n", wantOK: true},
+		{name: "ksh stays out", cmd: "ksh", args: []string{"-c", "echo hi"}, wantOK: false},
+		{name: "-lc stays out", cmd: "bash", args: []string{"-lc", "echo hi"}, wantOK: false},
+		{name: "powershell stays out", cmd: "powershell", args: []string{"-Command", "echo hi"}, wantOK: false},
+		{name: "cmd stays out", cmd: "cmd", args: []string{"/c", "echo hi"}, wantOK: false},
+	}
+	for _, tc := range cases {
+		got, ok := shellDashCPayloadRaw(tc.cmd, tc.args)
+		if ok != tc.wantOK || (tc.wantOK && got != tc.want) {
+			t.Errorf("%s: shellDashCPayloadRaw(%q, %v) = (%q, %v), want (%q, %v)",
+				tc.name, tc.cmd, tc.args, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+// wrapperScriptPayload is the superset: every wrapper transport
+// terminal-service emits, with the flag at any argument index.
+func TestWrapperScriptPayload_CoversEveryEmittedWrapper(t *testing.T) {
+	cases := []struct {
+		name   string
+		cmd    string
+		args   []string
+		want   string
+		wantOK bool
+	}{
+		{"bash -c delegates", "bash", []string{"-c", "echo hi"}, "echo hi", true},
+		{"bash -lc", "bash", []string{"-lc", "echo hi"}, "echo hi", true},
+		{"ksh -c", "ksh", []string{"-c", "echo hi"}, "echo hi", true},
+		// Only the script argument, never the positional parameters after it.
+		{"posix positional params are not script", "bash",
+			[]string{"-c", "echo hi", "argv0", "extra"}, "echo hi", true},
+		{"powershell -Command", "powershell", []string{"-Command", "echo hi"}, "echo hi", true},
+		// PowerShell joins a multi-token -Command tail into one script.
+		{"powershell -Command tail", "pwsh.exe",
+			[]string{"-Command", "Set-Location", "C:\\t"}, "Set-Location C:\\t", true},
+		{"flag at a non-zero index", "powershell.exe",
+			[]string{"-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", "echo hi"},
+			"echo hi", true},
+		{"cmd /c", "cmd", []string{"/c", "echo hi"}, "echo hi", true},
+		{"cmd.exe /K is case-insensitive", "cmd.exe", []string{"/K", "echo hi"}, "echo hi", true},
+		{"encoded", "powershell",
+			[]string{"-EncodedCommand", encodeForPowerShell("echo hi")}, "echo hi", true},
+		// A wrapper with nothing after its flag is still a wrapper: the caller
+		// must be able to tell "wraps nothing" from "not a wrapper".
+		{"flag in final position", "powershell", []string{"-Command"}, "", true},
+		// An unreadable payload answers "empty", never an error and never the
+		// raw base64 (which a classifier could then pattern-match by accident).
+		{"undecodable encoded", "powershell", []string{"-EncodedCommand", "!!!"}, "", true},
+		{"not a wrapper", "git", []string{"status"}, "", false},
+		{"agy itself is not a wrapper", "agy", []string{"-p", "hi"}, "", false},
+	}
+	for _, tc := range cases {
+		got, ok := wrapperScriptPayload(tc.cmd, tc.args)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("%s: wrapperScriptPayload(%q, %v) = (%q, %v), want (%q, %v)",
+				tc.name, tc.cmd, tc.args, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}

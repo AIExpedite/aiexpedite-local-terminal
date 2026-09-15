@@ -106,10 +106,11 @@ type CLISession struct {
 	antigravityManagedStream bool
 
 	// finishQuotaCapture releases the run-scoped Antigravity quota poller armed
-	// at spawn (cliagent_usage_antigravity_capture.go). Set only when
-	// commandRunsAntigravity matched this invocation; nil for every other
-	// command. waitForExit calls it exactly once, immediately after the process
-	// is reaped, so the poller's final read still happens while the language
+	// at spawn (cliagent_usage_antigravity_capture.go). For a command that is
+	// not agy it is armAntigravityCaptureForCommand's no-op release, so this
+	// path holds no per-command condition of its own. waitForExit calls it
+	// exactly once, immediately after the process is reaped, so the poller's
+	// final read — and its tail window — still happen while the language
 	// server's loopback socket may answer.
 	finishQuotaCapture func()
 
@@ -639,10 +640,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// poller now that the process exists; waitForExit releases it as soon as the
 	// process ends. Nil for every other command. See
 	// cliagent_usage_antigravity_capture.go.
-	var finishQuotaCapture func()
-	if commandRunsAntigravity(command, cliArgs) {
-		finishQuotaCapture = startAntigravityQuotaCapture("pipe session")
-	}
+	finishQuotaCapture := armAntigravityCaptureForCommand("pipe session", command, cliArgs)
 
 	session := &CLISession{
 		ID:                           id,
@@ -2185,26 +2183,6 @@ func isGrokCommand(command string) bool {
 func isAntigravityCommand(command string) bool {
 	base := commandBaseName(command)
 	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
-}
-
-// commandRunsAntigravity reports whether SPAWNING command+args starts the
-// Antigravity CLI — i.e. whether an `agy` language server will exist for the
-// life of that child, and therefore whether the run-scoped quota capture should
-// be armed (cliagent_usage_antigravity_capture.go).
-//
-// Distinct from isAntigravityCommand, which asks whether the CLI ROUTER should
-// treat the command as Antigravity and shape its argv. terminal-service ships
-// operator-joined commands as `bash -c "agy …"`, where the base command is the
-// shell: the router deliberately leaves those to shapeShellWrappedPTYArgs, but
-// the process they spawn is still agy and still holds the only readable copy of
-// the quota. Unwrapping via shellDashCPayload is what keeps the execute path and
-// the shell-wrapped session path from silently losing their capture.
-func commandRunsAntigravity(command string, args []string) bool {
-	if payload, ok := shellDashCPayload(command, args); ok {
-		fields := strings.Fields(payload)
-		return len(fields) > 0 && isAntigravityCommand(fields[0])
-	}
-	return isAntigravityCommand(command)
 }
 
 // isOpenCodeCommand reports whether command routes to the OpenCode CLI.

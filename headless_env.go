@@ -313,3 +313,82 @@ func effectiveCommandLine(cmd string, args []string) string {
 	}
 	return cmd + " " + strings.Join(args, " ")
 }
+
+// wrapperScriptPayload returns the interpreter SCRIPT a wrapped invocation
+// carries, for every wrapper transport terminal-service actually emits
+// (commandNormalize.util.js → SCRIPT_BEARING_PATTERNS): the POSIX `-c` / `-lc`
+// shells, PowerShell's `-Command` / `-c` / `-EncodedCommand`, and `cmd /c`,
+// `cmd /k`. The bool reports whether the command was a wrapper at all — a
+// wrapper carrying an empty script still returns true, so a caller can tell
+// "not a wrapper" from "wraps nothing".
+//
+// Deliberately NOT implemented by widening shellDashCPayloadRaw: that function
+// also decides which commands get headless hardening (hardenNonAgentCommand via
+// effectiveCommandLine) and which get their payload rewritten
+// (replaceDashCPayload), so teaching it about PowerShell would silently change
+// both. The POSIX `-c` case delegates to it instead, so the two can never
+// disagree about a `bash -c`.
+//
+// The wrapper flag is matched at ANY argument index, not just args[0]:
+// terminal-service prepends -NoProfile / -NonInteractive / -OutputFormat Text
+// ahead of -EncodedCommand.
+//
+// Redaction: the returned script is a classification input only. Callers must
+// never log, persist or forward it — see cliagent_usage_antigravity_command.go.
+func wrapperScriptPayload(cmd string, args []string) (string, bool) {
+	if payload, ok := shellDashCPayloadRaw(cmd, args); ok {
+		return payload, true
+	}
+	switch commandBaseName(cmd) {
+	case "bash", "sh", "zsh", "dash", "ksh":
+		// The spellings shellDashCPayloadRaw does not know: `-lc` (a login
+		// shell) and ksh, both of which terminal-service emits. Only the single
+		// argument after the flag is script — anything after it is $0 and the
+		// positional parameters, not more script.
+		return wrapperFlagArg(args, false, "-lc", "-c")
+	case "powershell", "pwsh":
+		if encoded, ok := wrapperFlagArg(args, false, "-encodedcommand"); ok {
+			decoded, err := decodeBase64PowerShellStrict(encoded)
+			if err != nil {
+				// An undecodable payload is a wrapper we cannot read. Report the
+				// wrapper with nothing in it rather than erroring: a caller's
+				// answer about an unreadable script must be "no".
+				return "", true
+			}
+			return decoded, true
+		}
+		// PowerShell joins a multi-token -Command tail into one script.
+		return wrapperFlagArg(args, true, "-command", "-c")
+	case "cmd":
+		// cmd.exe likewise treats everything after /c as the command line.
+		return wrapperFlagArg(args, true, "/c", "/k")
+	}
+	return "", false
+}
+
+// wrapperFlagArg returns the script following the first occurrence of any of
+// flags, compared case-insensitively as both PowerShell and cmd.exe do. When
+// tail is true the remaining arguments are joined (the -Command / /c shape);
+// otherwise only the single argument after the flag is returned (the `-c`
+// shape, where later arguments are positional parameters rather than script).
+//
+// A flag in the final position returns ("", true): the wrapper is still a
+// wrapper, it just carries no script.
+func wrapperFlagArg(args []string, tail bool, flags ...string) (string, bool) {
+	for i, a := range args {
+		lower := strings.ToLower(a)
+		for _, flag := range flags {
+			if lower != flag {
+				continue
+			}
+			if i+1 >= len(args) {
+				return "", true
+			}
+			if tail {
+				return strings.Join(args[i+1:], " "), true
+			}
+			return args[i+1], true
+		}
+	}
+	return "", false
+}

@@ -63,10 +63,22 @@ const (
 	// long-running child before its only quota source disappears.
 	antigravityCaptureMaxDuration = 15 * time.Minute
 	antigravityCaptureMaxAttempts = 200
+	// antigravityCaptureTailGrace is how long the poller keeps reading an
+	// already-memoized port AFTER the last armed run has released it. A turn's
+	// quota is debited at the END of the turn, so the last in-run sample can
+	// under-report the run that just finished — and on the execute path the
+	// release happens the instant Wait returns, while the language server is
+	// still shutting down and still answering. No discovery and no log scanning
+	// happen in this window: it is bounded loopback reads of a port that already
+	// answered, or nothing at all.
+	antigravityCaptureTailGrace = 2 * time.Second
 	// antigravityCaptureIntervalEnv shortens the tick for tests, mirroring the
 	// AIEXPEDITE_AGY_QUOTA_CACHE seam. Not an operator knob: an unparseable or
 	// non-positive value falls back to the constant.
 	antigravityCaptureIntervalEnv = "AIEXPEDITE_AGY_CAPTURE_INTERVAL"
+	// antigravityCaptureTailEnv is the same seam for the tail window, so a test
+	// does not pay the shipped grace on every capture it stops.
+	antigravityCaptureTailEnv = "AIEXPEDITE_AGY_CAPTURE_TAIL"
 )
 
 var (
@@ -94,7 +106,27 @@ var (
 	antigravityCaptureArms      atomic.Int64
 	antigravityCaptureFinishes  atomic.Int64
 	antigravityCaptureSnapshots atomic.Int64
+	// antigravityCaptureTailProbes counts probes taken in the post-release tail
+	// window, so a test can prove the tail never rediscovers.
+	antigravityCaptureTailProbes atomic.Int64
 )
+
+// armAntigravityCaptureForCommand arms the quota poller when spawning cmd+args
+// would start `agy`, and returns the release function. When it would not, the
+// returned release is a no-op and nothing is armed.
+//
+// Every spawn site goes through this rather than pairing its own
+// commandRunsAntigravity check with startAntigravityQuotaCapture: a site that
+// re-implements the pair is a site that can drift out of step with the
+// classifier, which is exactly how the Windows execute path ended up arming
+// nothing at all. label is a fixed internal string ("windows execute", "local
+// execute", …) and must never carry a command line, path or prompt.
+func armAntigravityCaptureForCommand(label, cmd string, args []string) func() {
+	if !commandRunsAntigravity(cmd, args) {
+		return func() {}
+	}
+	return startAntigravityQuotaCapture(label)
+}
 
 // startAntigravityQuotaCapture arms the shared quota poller for one `agy` run
 // and returns the release function.
@@ -150,12 +182,23 @@ func antigravityCaptureStopped() <-chan struct{} {
 
 // antigravityCapturePollIntervalValue resolves the tick, honoring the test seam.
 func antigravityCapturePollIntervalValue() time.Duration {
-	if raw := os.Getenv(antigravityCaptureIntervalEnv); raw != "" {
+	return antigravityDurationEnv(antigravityCaptureIntervalEnv, antigravityCapturePollInterval)
+}
+
+// antigravityCaptureTailGraceValue resolves the tail window, honoring its seam.
+func antigravityCaptureTailGraceValue() time.Duration {
+	return antigravityDurationEnv(antigravityCaptureTailEnv, antigravityCaptureTailGrace)
+}
+
+// antigravityDurationEnv reads a test-seam duration. Not an operator knob: an
+// unparseable or non-positive value falls back to the shipped constant.
+func antigravityDurationEnv(name string, fallback time.Duration) time.Duration {
+	if raw := os.Getenv(name); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			return d
 		}
 	}
-	return antigravityCapturePollInterval
+	return fallback
 }
 
 // runAntigravityQuotaCapture is the single shared poller goroutine. It probes
@@ -197,6 +240,42 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 		}
 	}
 
+	// tailAndReport drains the post-release window and writes the single
+	// close-out line. Called on every exit from the loop below, so the tail can
+	// never be skipped by the path a particular run happens to take.
+	tailAndReport := func() {
+		tailProbes, tailCaptured := 0, 0
+		// No memoized port means no cheap probe exists: discovery is the
+		// expensive half, and a run that never found a server must not start
+		// scanning logs at the very moment it is being torn down.
+		if memoPort > 0 {
+			grace := antigravityCaptureTailGraceValue()
+			tailInterval := initial
+			if tailInterval > grace {
+				tailInterval = grace
+			}
+			for deadline := time.Now().Add(grace); ; {
+				tailProbes++
+				antigravityCaptureTailProbes.Add(1)
+				before := captured
+				probe(false)
+				if captured > before {
+					tailCaptured++
+				}
+				if remaining := time.Until(deadline); remaining <= 0 {
+					break
+				} else if remaining < tailInterval {
+					time.Sleep(remaining)
+				} else {
+					time.Sleep(tailInterval)
+				}
+			}
+		}
+		fmt.Printf("%s[antigravity-quota] Capture finished for %s (discoveryAttempts=%d captured=%d tailProbes=%d tailCaptured=%d lastObservedAt=%s)%s\n",
+			colorCyan, label, discoveryAttempts, captured, tailProbes, tailCaptured,
+			firstNonEmpty(lastObserved, "none"), colorReset)
+	}
+
 	// Probe before waiting on anything. A turn that finishes inside one tick
 	// would otherwise never be sampled at all: the server dies with the child,
 	// so there is no second chance once the run is over.
@@ -210,8 +289,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 	for {
 		select {
 		case <-stop:
-			fmt.Printf("%s[antigravity-quota] Capture finished for %s (discoveryAttempts=%d captured=%d lastObservedAt=%s)%s\n",
-				colorCyan, label, discoveryAttempts, captured, firstNonEmpty(lastObserved, "none"), colorReset)
+			tailAndReport()
 			return
 		case <-timer.C:
 			probe(discoveryEnabled)
@@ -221,8 +299,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 					fmt.Printf("%s[antigravity-quota] Capture discovery bound reached for %s after %d attempts — no live port to keep polling%s\n",
 						colorYellow, label, discoveryAttempts, colorReset)
 					<-stop
-					fmt.Printf("%s[antigravity-quota] Capture finished for %s (discoveryAttempts=%d captured=%d lastObservedAt=%s)%s\n",
-						colorCyan, label, discoveryAttempts, captured, firstNonEmpty(lastObserved, "none"), colorReset)
+					tailAndReport()
 					return
 				}
 				fmt.Printf("%s[antigravity-quota] Capture discovery bound reached for %s after %d attempts — continuing bounded-cost reads on the live port%s\n",
@@ -270,7 +347,8 @@ func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscover
 	// self-update that migrates ~/.agy → ~/.gemini/antigravity-cli mid-flight is
 	// picked up without restarting the agent.
 	for _, base := range antigravityQuotaBases(home) {
-		for _, port := range discoverAntigravityHTTPPorts(base) {
+		ports, _ := discoverAntigravityHTTPPorts(base)
+		for _, port := range ports {
 			snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now)
 			if !ok {
 				continue
