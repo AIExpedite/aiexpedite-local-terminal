@@ -352,7 +352,13 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		// renewing a refresh token a live copy has superseded can sign the
 		// real home out for good (grokRealHomeHoldsNewest). Until it lands,
 		// this login is busy, not broken.
-		if !grokRealHomeReadyToRenew(base) {
+		// A copy of ANOTHER agent process, or an orphan one left, may hold it
+		// instead; adopt it the same way. Unlike the keeper, the probe does
+		// not stop at an adoption: it is here because the presented token was
+		// expired or rejected, and an adopted chain that is too gets its
+		// rotate NOW, in this probe — not on a later click.
+		adoptForeignGrokRenewals(base)
+		if !grokRealHomeHoldsNewest(base) {
 			renewalBlocked = true
 			return
 		}

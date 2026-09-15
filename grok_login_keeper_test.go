@@ -1348,3 +1348,40 @@ func TestGrokLoginKeeperOnce_AdoptsAnOrphanedCopysRenewalInsteadOfRenewing(t *te
 		t.Errorf("real home holds %q, want the orphan's renewal written back", got)
 	}
 }
+
+// TestProbeGrokBillingLive_RenewsAnAdoptedOrphanChainInTheSameProbe: the
+// real home's credential is superseded by an orphaned copy's, and that one
+// is expired too. The probe adopts it and then renews it, in this probe —
+// the outcome is xAI's answer on the fresh chain, not login_busy.
+func TestProbeGrokBillingLive_RenewsAnAdoptedOrphanChainInTheSameProbe(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, home, "real-superseded", "a@example.com", now.Add(-12*time.Hour), now.Add(-6*time.Hour))
+	orphan := filepath.Join(os.TempDir(), grokIsolatedHomePrefix+"orphan")
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, orphan, "orphan-newer-expired", "a@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	renewals, heldAtRenewal := 0, ""
+	runGrokLoginRenewal = func(_ context.Context, _, base string) {
+		renewals++
+		heldAtRenewal = grokKeyIn(t, base)
+		writeGrokAuthMinted(t, base, "renewed", "a@example.com", now, now.Add(6*time.Hour))
+	}
+	grokBillingServer(t, func(token string) (int, string) {
+		if strings.HasSuffix(token, " renewed") {
+			return http.StatusOK, strings.ReplaceAll(grokBillingFixture, "%END%", now.Add(24*time.Hour).UTC().Format(time.RFC3339))
+		}
+		return http.StatusUnauthorized, `{}`
+	})
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok on the renewed chain", got)
+	}
+	if renewals != 1 {
+		t.Fatalf("renewals=%d, want exactly one", renewals)
+	}
+	if heldAtRenewal != "orphan-newer-expired" {
+		t.Errorf("real home held %q at renewal, want the orphan's adopted credential", heldAtRenewal)
+	}
+}
