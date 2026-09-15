@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1207,5 +1208,113 @@ func TestSetupIsolatedGrokHome_HoldsTheOwnerLockUntilRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(home); !os.IsNotExist(err) {
 		t.Fatal("the home was not removed")
+	}
+}
+
+// holdGrokLockAsAnotherProcess takes an exclusive lock on name inside home
+// through a handle of its own — what another agent process holding it looks
+// like to this one — and releases it on cleanup or when the returned func runs.
+func holdGrokLockAsAnotherProcess(t *testing.T, home, name string) func() {
+	t.Helper()
+	f, err := os.OpenFile(filepath.Join(home, name), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(f); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = unlockFile(f); _ = f.Close() }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestGrokLoginKeeperOnce_SkipsWhileAnotherAgentProcessRenews: the dev and the
+// release channel agents share one Grok home; with both keepers inside the
+// keep-ahead window at the same tick, only one may rotate the refresh token.
+// The other skips its tick while the cross-process renewal lock is held, and
+// renews (if still needed) once it is free.
+func TestGrokLoginKeeperOnce_SkipsWhileAnotherAgentProcessRenews(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-expiring", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	renewals := 0
+	runGrokLoginRenewal = func(_ context.Context, _, base string) {
+		renewals++
+		writeGrokAuthMinted(t, base, "renewed", "dan@example.com", now, now.Add(6*time.Hour))
+	}
+	release := holdGrokLockAsAnotherProcess(t, real, grokRenewLockName)
+
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("renewed while another agent process held the renewal lock")
+	}
+	if renewals != 0 {
+		t.Fatalf("renewals=%d, want none", renewals)
+	}
+	release()
+	if !grokLoginKeeperOnce(context.Background(), "grok", now.Add(grokLoginKeeperTick)) {
+		t.Fatal("did not renew once the other process was done")
+	}
+	if got := grokKeyIn(t, real); got != "renewed" {
+		t.Errorf("real home holds %q, want the renewal", got)
+	}
+}
+
+// TestProbeGrokBillingLive_ReportsBusyWhileAnotherAgentProcessRenews: the
+// live probe's own renewal takes the same cross-process lock; while another
+// agent process holds it, this login is busy, not broken.
+func TestProbeGrokBillingLive_ReportsBusyWhileAnotherAgentProcessRenews(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, home, "real-expired", "a@example.com", now.Add(-12*time.Hour), now.Add(-6*time.Hour))
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+	grokBillingServer(t, func(string) (int, string) { return http.StatusUnauthorized, `{}` })
+	holdGrokLockAsAnotherProcess(t, home, grokRenewLockName)
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeLoginBusy {
+		t.Fatalf("outcome=%q, want login_busy", got)
+	}
+	if renewals != 0 {
+		t.Errorf("renewals=%d, want none while another process renews", renewals)
+	}
+}
+
+// TestGrokLoginKeeperOnce_AdoptsAnotherAgentProcessesRenewalInsteadOfRenewing:
+// a copy owned by ANOTHER agent process (its owner lock held; not in this
+// process's registry) refreshed on its own and holds the account's newest
+// credential. This keeper must not rotate the real home's superseded token
+// — past the grace window that signs the real home out — but write that
+// credential back and leave the renewal to the fresh chain.
+func TestGrokLoginKeeperOnce_AdoptsAnotherAgentProcessesRenewalInsteadOfRenewing(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	tmp := grokTempDirForSweep(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-superseded", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	theirs := filepath.Join(tmp, grokIsolatedHomePrefix+"theirs")
+	if err := os.Mkdir(theirs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, theirs, "their-copy-renewed", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	holdGrokLockAsAnotherProcess(t, theirs, grokOwnerLockName)
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("renewed the real home's superseded token")
+	}
+	if renewals != 0 {
+		t.Fatalf("renewals=%d, want none", renewals)
+	}
+	if got := grokKeyIn(t, real); got != "their-copy-renewed" {
+		t.Errorf("real home holds %q, want the other process's renewal written back", got)
+	}
+	if got := grokKeyIn(t, theirs); got != "their-copy-renewed" {
+		t.Errorf("the other process's copy holds %q, want it untouched", got)
+	}
+	if grokLogin.holds(theirs) {
+		t.Error("the other process's copy was registered here")
 	}
 }

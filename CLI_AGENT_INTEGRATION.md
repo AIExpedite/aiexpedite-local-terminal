@@ -708,6 +708,16 @@ account wins everywhere.**
   earlier process left in it is written back to the real home first; the
   removal goes through `removeIsolatedGrokHome` so a linked conversation
   store is unlinked, never deleted.
+- Two agent processes can share one Grok home (the dev and the release
+  channel on one computer). A renewal pass — write-back, CLI, fan-out — holds
+  the cross-process `aix-renew.lock` beside the real home's `auth.json`, so
+  their keepers never rotate one refresh token twice; the loser skips its
+  tick (the probe reports `login_busy`). Before renewing, a keeper also
+  looks at the OTHER process's live copies (the owned `grok-acp-home-*`
+  homes in the temp dir): a newer same-account credential one of them holds
+  is written back to the real home instead of the superseded token being
+  renewed. Those copies are read, never written — they are the other
+  process's to fan out to.
 - Every `auth.json` replacement stages its bytes in a uniquely named file
   beside the target (`os.CreateTemp`), never a fixed name: two agent
   processes reconciling one home must not rename each other's half-written

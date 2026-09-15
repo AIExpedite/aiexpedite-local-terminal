@@ -332,6 +332,14 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			return
 		}
 		defer release()
+		// And across agent processes sharing this home (grokRenewLockName):
+		// another agent's renewal in flight is this login being busy.
+		renewLock, err := acquireGrokRenewLock(base)
+		if err != nil {
+			renewalBlocked = true
+			return
+		}
+		defer releaseGrokLockFile(renewLock)
 		// A live copy may already hold the account's newer credential; write it
 		// back first, so the renewal below never redeems a refresh token that
 		// copy superseded (past the grace window that signs the real home out).
@@ -344,7 +352,7 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		// renewing a refresh token a live copy has superseded can sign the
 		// real home out for good (grokRealHomeHoldsNewest). Until it lands,
 		// this login is busy, not broken.
-		if !grokRealHomeHoldsNewest(base) {
+		if !grokRealHomeReadyToRenew(base) {
 			renewalBlocked = true
 			return
 		}

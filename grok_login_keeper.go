@@ -180,7 +180,33 @@ var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the 
 // auth.json, waiting at most grokAuthLockWait. The lock is released when the
 // returned file is closed.
 func acquireGrokAuthLock(dstHome string) (*os.File, error) {
-	f, err := os.OpenFile(filepath.Join(dstHome, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	return acquireGrokLockFile(filepath.Join(dstHome, grokAuthLockName), errGrokAuthLocked)
+}
+
+// grokRenewLockName is the agent's own cross-process renewal lock beside the
+// real home's auth.json. The in-process login lock (grokLoginGuard) serializes
+// renewals within one agent; this one serializes them ACROSS agent processes
+// sharing the home (the dev and the release channel on one computer), so two
+// keepers whose ticks coincide inside the keep-ahead window cannot both
+// rotate the same refresh token. Held for the whole renewal pass: the
+// write-back before, the CLI, and the fan-out after.
+const grokRenewLockName = "aix-renew.lock"
+
+// errGrokRenewLocked: another agent process is renewing this login right now;
+// its result reaches the real home, which the next tick reads.
+var errGrokRenewLocked = errors.New("grok login is being renewed by another agent process")
+
+// acquireGrokRenewLock takes the cross-process renewal lock for base, waiting
+// at most grokAuthLockWait.
+func acquireGrokRenewLock(base string) (*os.File, error) {
+	return acquireGrokLockFile(filepath.Join(base, grokRenewLockName), errGrokRenewLocked)
+}
+
+// acquireGrokLockFile takes an exclusive lock on path, waiting at most
+// grokAuthLockWait and returning busy when it never came free. The lock is
+// released when the returned file is closed.
+func acquireGrokLockFile(path string, busy error) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -196,10 +222,16 @@ func acquireGrokAuthLock(dstHome string) (*os.File, error) {
 		}
 		if !time.Now().Before(deadline) {
 			_ = f.Close()
-			return nil, errGrokAuthLocked
+			return nil, busy
 		}
 		time.Sleep(grokAuthLockPoll)
 	}
+}
+
+// releaseGrokLockFile releases and closes a lock taken by acquireGrokLockFile.
+func releaseGrokLockFile(f *os.File) {
+	_ = unlockFile(f)
+	_ = f.Close()
 }
 
 // readGrokAuthFileVerified reads srcHome's auth.json under the CLI's lock
@@ -450,17 +482,95 @@ func reconcileGrokLoginLocked(base string) int {
 // sign the real home out, after which the copy's live credential can never
 // be written back (a signed-out real home is never recreated). So no renewal
 // runs until the write-back has landed.
+//
+// Copies owned by OTHER agent processes on this computer count too: their
+// registries are not visible here, but their homes are (every one holds its
+// owner lock, grokForeignOwnedGrokCopies), and a renewal one of them made is
+// as much a superseding of the real home's token as one of ours.
 func grokRealHomeHoldsNewest(base string) bool {
 	real, ok := readGrokCredentialStamp(base)
 	if !ok {
 		return false
 	}
-	for _, home := range grokLogin.liveCopies() {
+	for _, home := range append(grokLogin.liveCopies(), grokForeignOwnedGrokCopies()...) {
 		if s, ok := readGrokCredentialStamp(home); ok && s.Fingerprint == real.Fingerprint && s.MintedAt.After(real.MintedAt) {
 			return false
 		}
 	}
 	return true
+}
+
+// grokRealHomeReadyToRenew is the check before a renewal of the real home:
+// first any newer same-account credential held by another agent process's
+// copy is written back (that process's keeper will do the same, but this one
+// must not renew a superseded token while waiting for it), then the real
+// home must hold the account's newest credential across every live copy on
+// this computer, this process's and the others'.
+//
+// An adoption ends the pass without a renewal: the real home now holds a
+// credential judged by nobody yet — the next tick reads it fresh and decides.
+func grokRealHomeReadyToRenew(base string) bool {
+	if adoptForeignGrokRenewals(base) {
+		return false
+	}
+	return grokRealHomeHoldsNewest(base)
+}
+
+// adoptForeignGrokRenewals writes the newest same-account credential held by
+// another agent process's copy into the real home, when it is newer than the
+// real home's. Read-only towards those copies: they are the other process's
+// to fan out to. Returns whether the real home was rewritten.
+func adoptForeignGrokRenewals(base string) bool {
+	real, ok := readGrokCredentialStamp(base)
+	if !ok {
+		return false
+	}
+	newest := real
+	for _, home := range grokForeignOwnedGrokCopies() {
+		if s, ok := readGrokCredentialStamp(home); ok && s.Fingerprint == real.Fingerprint && s.MintedAt.After(newest.MintedAt) {
+			newest = s
+		}
+	}
+	if newest.Home == base {
+		return false
+	}
+	if err := replaceGrokAuthFileIfOlder(base, newest); err != nil {
+		fmt.Printf("%s[grok-login] could not write another agent process's renewed login back to the real home: %v%s\n",
+			colorYellow, err, colorReset)
+		return false
+	}
+	fmt.Printf("%s[grok-login] wrote another agent process's renewed login back to the real home%s\n",
+		colorGreen, colorReset)
+	return true
+}
+
+// grokForeignOwnedGrokCopies lists the isolated homes in the temp dir that
+// another live agent process owns: not registered here, owner lock held.
+// Consulted only on the renewal path, so the temp dir is not scanned every
+// tick.
+func grokForeignOwnedGrokCopies() []string {
+	entries, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		return nil
+	}
+	ours := map[string]struct{}{}
+	for _, home := range grokLogin.liveCopies() {
+		ours[filepath.Clean(home)] = struct{}{}
+	}
+	var out []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), grokIsolatedHomePrefix) {
+			continue
+		}
+		home := filepath.Join(os.TempDir(), entry.Name())
+		if _, ok := ours[filepath.Clean(home)]; ok {
+			continue
+		}
+		if grokIsolatedHomeOwned(home) {
+			out = append(out, home)
+		}
+	}
+	return out
 }
 
 // grokLoginKeeperState is the keeper's memory between ticks.
@@ -492,6 +602,14 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 		return false
 	}
 	defer release()
+	// And across agent processes sharing this home: another agent's keeper
+	// mid-renewal means this tick has nothing to do — its result lands in
+	// the real home, which the next tick reads.
+	renewLock, err := acquireGrokRenewLock(base)
+	if err != nil {
+		return false
+	}
+	defer releaseGrokLockFile(renewLock)
 
 	// Reconcile BEFORE judging the real home: a live copy may already hold
 	// the account's newer credential (it refreshed on its own), and renewing
@@ -503,7 +621,7 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 
 	renewed := false
 	if stamp, ok := readGrokCredentialStamp(base); ok && stamp.Refreshable && !stamp.ExpiresAt.IsZero() &&
-		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) && grokRealHomeHoldsNewest(base) {
+		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) && grokRealHomeReadyToRenew(base) {
 		grokKeeper.mu.Lock()
 		// One attempt per credential per retry window: a renewal that left
 		// the same token in place is not retried every tick.
