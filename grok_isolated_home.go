@@ -168,6 +168,19 @@ func seedIsolatedGrokLogin(dir, srcBase string) error {
 	return nil
 }
 
+// retryDeferredGrokHomeRemovals runs one removal attempt for every home whose
+// removal was deferred past its quick retries. Called by the keeper loop
+// outside the login lock (removal takes it itself). A home still not
+// removable defers itself again.
+func retryDeferredGrokHomeRemovals() {
+	for _, home := range grokLogin.takeDeferredRemovals() {
+		if !grokLogin.holds(home) {
+			continue
+		}
+		_ = removeIsolatedGrokHomeAttempt(home, grokPersistentHome(), unlinkGrokDirectory, grokLoginRemovalRetries)
+	}
+}
+
 // grokCopyCredentialPreserved reports whether deleting copyHome loses nothing:
 // the copy holds no credential, its credential is another account's (the
 // real home was re-logged-in underneath it; not ours to carry), the real
@@ -242,6 +255,13 @@ func removeIsolatedGrokHomeAttempt(home, base string, unlink func(string) error,
 			time.AfterFunc(grokLoginRemovalReconcileWait, func() {
 				_ = removeIsolatedGrokHomeAttempt(home, base, unlink, attempt+1)
 			})
+		} else {
+			// The quick retries are spent (a lock held for minutes). The home
+			// stays registered — so the keeper keeps reconciling it and the
+			// stale-home sweep leaves it alone — and the keeper retries the
+			// removal every tick until the credential has reached the real
+			// home; it is never leaked for the life of the process.
+			grokLogin.deferRemoval(home)
 		}
 		return errGrokLoginBusy
 	}

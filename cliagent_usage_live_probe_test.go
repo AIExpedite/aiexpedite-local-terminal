@@ -300,6 +300,7 @@ func isolateGrok(t *testing.T) string {
 	// deferred removal, a missed release) must not take part in this one.
 	grokLogin.mu.Lock()
 	grokLogin.copies = map[string]struct{}{}
+	grokLogin.deferredRemoval = nil
 	grokLogin.renewing = false
 	grokLogin.broadcastLocked()
 	grokLogin.mu.Unlock()

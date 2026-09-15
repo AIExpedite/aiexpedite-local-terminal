@@ -307,6 +307,12 @@ func replaceGrokAuthFileIfOlder(dstHome string, newest grokCredentialStamp) erro
 			// would recreate a login the user just removed.
 			return errGrokDestinationGone
 		}
+		if current.Fingerprint != newest.Fingerprint {
+			// The destination was signed into another account under the
+			// snapshot; the same-account rule must not depend on the two
+			// credentials' wall-clock order.
+			return errGrokCopyMovedOn
+		}
 		if !current.MintedAt.Before(newest.MintedAt) {
 			return errGrokCopyMovedOn
 		}
@@ -517,6 +523,7 @@ func runGrokLoginKeeper(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			grokLoginKeeperOnce(ctx, grokLoginKeeperBinary(), now)
+			retryDeferredGrokHomeRemovals()
 			grokKeeper.mu.Lock()
 			sweepDue := now.Sub(grokKeeper.lastSweep) >= grokStaleIsolatedHomeSweep
 			grokKeeper.mu.Unlock()

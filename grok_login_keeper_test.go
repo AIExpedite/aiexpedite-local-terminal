@@ -975,3 +975,82 @@ func TestReplaceGrokAuthFile_AbortsWhenTheSourceChangedAccountSinceTheSnapshot(t
 		t.Error("staging file left behind")
 	}
 }
+
+// TestRemoveIsolatedGrokHome_DeferredRemovalIsFinishedByTheKeeper: a removal
+// blocked past its quick retries is not abandoned — the keeper retries it
+// each tick, and once the credential has reached the real home the copy is
+// removed, not leaked for the life of the process.
+func TestRemoveIsolatedGrokHome_DeferredRemovalIsFinishedByTheKeeper(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, home, "copy-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+	prevWait := grokLoginRemovalReconcileWait
+	grokLoginRemovalReconcileWait = 20 * time.Millisecond
+	t.Cleanup(func() { grokLoginRemovalReconcileWait = prevWait })
+
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	if err := removeIsolatedGrokHome(home); !errors.Is(err, errGrokLoginBusy) {
+		t.Fatalf("removal err=%v, want errGrokLoginBusy", err)
+	}
+	time.Sleep(grokLoginRemovalReconcileWait*time.Duration(grokLoginRemovalRetries+2) + 200*time.Millisecond)
+	if _, err := os.Stat(filepath.Join(home, "auth.json")); err != nil {
+		t.Fatal("the copy was deleted while the lock was still held")
+	}
+	if !grokLogin.holds(home) {
+		t.Fatal("the deferred copy was unregistered")
+	}
+	release()
+
+	// The keeper's tick, with the lock free: the credential is handed over
+	// and the home is removed.
+	retryDeferredGrokHomeRemovals()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(home); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatal("the keeper never removed the deferred home once the lock was free")
+	}
+	if grokLogin.holds(home) {
+		t.Error("the removed home is still registered")
+	}
+	if got := grokKeyIn(t, real); got != "copy-renewed" {
+		t.Errorf("real home holds %q, want the copy's credential handed over first", got)
+	}
+}
+
+// TestReplaceGrokAuthFile_AbortsWhenTheDestinationChangedAccountSinceTheSnapshot:
+// the destination was signed into another account under the snapshot; the
+// same-account rule must hold under the destination lock regardless of the
+// two credentials' wall-clock order.
+func TestReplaceGrokAuthFile_AbortsWhenTheDestinationChangedAccountSinceTheSnapshot(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "dan-new", "dan@example.com", now, now.Add(6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "dan-old", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	newest, ok := readGrokCredentialStamp(real)
+	if !ok {
+		t.Fatal("real stamp unreadable")
+	}
+	// The destination switches account, with an OLDER create_time than newest.
+	writeGrokAuthMinted(t, copyHome, "someone-else", "someone@example.com", now.Add(-2*time.Hour), now.Add(4*time.Hour))
+
+	if err := replaceGrokAuthFileIfOlder(copyHome, newest); err == nil {
+		t.Fatal("another account's destination was overwritten")
+	}
+	if got := grokKeyIn(t, copyHome); got != "someone-else" {
+		t.Errorf("destination holds %q, want it untouched", got)
+	}
+}

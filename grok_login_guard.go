@@ -31,6 +31,10 @@ type grokLoginGuard struct {
 	mu       sync.Mutex
 	copies   map[string]struct{}
 	renewing bool
+	// deferredRemoval holds registered copies whose removal could not yet
+	// hand their credential to the real home after the quick retries; the
+	// keeper retries them every tick (retryDeferredGrokHomeRemovals).
+	deferredRemoval map[string]struct{}
 	// changed is closed (and replaced) on every state change, waking waiters.
 	changed chan struct{}
 }
@@ -70,6 +74,32 @@ func (g *grokLoginGuard) registerCopyHeld(home string) {
 	g.mu.Lock()
 	g.copies[key] = struct{}{}
 	g.mu.Unlock()
+}
+
+// deferRemoval marks a registered home for removal by the keeper's next
+// ticks, once its credential has reached the real home.
+func (g *grokLoginGuard) deferRemoval(home string) {
+	key := filepath.Clean(home)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.deferredRemoval == nil {
+		g.deferredRemoval = map[string]struct{}{}
+	}
+	g.deferredRemoval[key] = struct{}{}
+}
+
+// takeDeferredRemovals returns and clears the homes marked for removal; a
+// removal that still cannot complete marks itself again.
+func (g *grokLoginGuard) takeDeferredRemovals() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]string, 0, len(g.deferredRemoval))
+	for key := range g.deferredRemoval {
+		out = append(out, key)
+	}
+	g.deferredRemoval = nil
+	sort.Strings(out)
+	return out
 }
 
 // holds reports whether home is currently registered as a copy of the login.
