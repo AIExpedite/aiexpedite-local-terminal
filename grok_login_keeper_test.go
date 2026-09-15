@@ -1,0 +1,319 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// The computer that needed `grok login` every six hours: every Grok run there
+// used a copy of the login, the first copy to hit the six-hour mark rotated
+// the refresh token and was deleted, and the real home was left holding a
+// token xAI revoked two minutes later. These pin the newest-wins rule that
+// keeps one credential alive across the real home and every live copy.
+
+// writeGrokAuthMinted writes a scoped auth file that carries the CLI's
+// `create_time` stamp, which is what orders credentials of one account.
+func writeGrokAuthMinted(t *testing.T, home, key, email string, minted, expires time.Time) {
+	t.Helper()
+	auth := map[string]any{
+		grokExactOIDCScope: map[string]any{
+			"key":           key,
+			"email":         email,
+			"user_id":       "user-" + email,
+			"refresh_token": "refresh-for-" + key,
+			"create_time":   minted.UTC().Format(time.RFC3339Nano),
+			"expires_at":    expires.UTC().Format(time.RFC3339Nano),
+		},
+	}
+	b, _ := json.Marshal(auth)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func grokKeyIn(t *testing.T, home string) string {
+	t.Helper()
+	token, _, _ := grokPresentedToken(home)
+	return token
+}
+
+func resetGrokKeeper(t *testing.T) {
+	t.Helper()
+	grokKeeper.mu.Lock()
+	grokKeeper.lastRenewTry, grokKeeper.lastRenewFrom, grokKeeper.lastSweep = time.Time{}, time.Time{}, time.Time{}
+	grokKeeper.mu.Unlock()
+}
+
+// TestReconcileGrokLogin_WritesASessionsRenewalBackToTheRealHome: a live copy
+// that refreshed on its own holds the only live credential; the real home
+// must receive it, and a copy of ANOTHER account must never be mixed in even
+// when it is newer.
+func TestReconcileGrokLogin_WritesASessionsRenewalBackToTheRealHome(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+
+	renewedCopy := t.TempDir()
+	writeGrokAuthMinted(t, renewedCopy, "copy-new", "dan@example.com", now.Add(-time.Minute), now.Add(6*time.Hour))
+	otherAccount := t.TempDir()
+	writeGrokAuthMinted(t, otherAccount, "other-newest", "someone@example.com", now, now.Add(6*time.Hour))
+	for _, dir := range []string{renewedCopy, otherAccount} {
+		grokLogin.acquireCopy(dir)
+		t.Cleanup(func() { grokLogin.releaseCopy(dir) })
+	}
+
+	if n := reconcileGrokLogin(real); n != 1 {
+		t.Fatalf("rewrote %d homes, want exactly the real home", n)
+	}
+	if got := grokKeyIn(t, real); got != "copy-new" {
+		t.Errorf("real home holds %q, want the session's renewed credential", got)
+	}
+	if got := grokKeyIn(t, otherAccount); got != "other-newest" {
+		t.Errorf("another account's copy was rewritten to %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(real, "auth.json.aix-tmp")); !os.IsNotExist(err) {
+		t.Error("the staging file must not be left behind")
+	}
+	// A second pass changes nothing: everything already holds the newest.
+	if n := reconcileGrokLogin(real); n != 0 {
+		t.Errorf("second reconcile rewrote %d homes, want none", n)
+	}
+}
+
+// TestReconcileGrokLogin_FansARenewedRealHomeOutToEveryLiveCopy: after the
+// real home renews, every same-account copy holds a refresh token xAI is
+// about to revoke; each must receive the renewed file.
+func TestReconcileGrokLogin_FansARenewedRealHomeOutToEveryLiveCopy(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-new", "dan@example.com", now, now.Add(6*time.Hour))
+
+	copies := []string{t.TempDir(), t.TempDir()}
+	for i, dir := range copies {
+		writeGrokAuthMinted(t, dir, "copy-old", "dan@example.com", now.Add(-time.Duration(i+1)*time.Hour), now.Add(time.Hour))
+		grokLogin.acquireCopy(dir)
+		t.Cleanup(func() { grokLogin.releaseCopy(dir) })
+	}
+
+	if n := reconcileGrokLogin(real); n != 2 {
+		t.Fatalf("rewrote %d homes, want both copies", n)
+	}
+	for _, dir := range copies {
+		if got := grokKeyIn(t, dir); got != "real-new" {
+			t.Errorf("copy %s holds %q, want the renewed credential", dir, got)
+		}
+	}
+	if got := grokKeyIn(t, real); got != "real-new" {
+		t.Errorf("real home changed to %q", got)
+	}
+}
+
+// TestReconcileGrokLogin_OrdersByCreateTimeNotByWhoIsReal: the real home is
+// not privileged — an older real credential loses to a newer copy, and vice
+// versa, purely on the CLI's create_time.
+func TestReconcileGrokLogin_OrdersByCreateTimeNotByWhoIsReal(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real", "dan@example.com", now.Add(-2*time.Hour), now.Add(4*time.Hour))
+	copyHome := t.TempDir()
+	// Newer expiry but OLDER mint: a clock skew must not make it win.
+	writeGrokAuthMinted(t, copyHome, "copy", "dan@example.com", now.Add(-3*time.Hour), now.Add(5*time.Hour))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	reconcileGrokLogin(real)
+	if got := grokKeyIn(t, real); got != "real" {
+		t.Errorf("real home lost to an older credential: %q", got)
+	}
+	if got := grokKeyIn(t, copyHome); got != "real" {
+		t.Errorf("copy holds %q, want the newer real credential", got)
+	}
+}
+
+// TestGrokLoginKeeperOnce_RenewsAheadOfExpiryWhileCopiesAreLive: a real home
+// inside the keep-ahead window renews even though a session copy is live,
+// and the copy receives the renewed file in the same tick.
+func TestGrokLoginKeeperOnce_RenewsAheadOfExpiryWhileCopiesAreLive(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-5*time.Hour), now.Add(grokLoginKeepAhead-time.Minute))
+
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "real-old", "dan@example.com", now.Add(-5*time.Hour), now.Add(grokLoginKeepAhead-time.Minute))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	renewals := 0
+	runGrokLoginRenewal = func(_ context.Context, grokPath, base string) {
+		renewals++
+		if grokPath != "grok" || base != real {
+			t.Errorf("renewal ran as %q on %q, want the real home", grokPath, base)
+		}
+		// What `grok models` does: rotates the credential in the real home.
+		writeGrokAuthMinted(t, real, "real-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+	}
+
+	if !grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("keeper did not renew a login inside the keep-ahead window")
+	}
+	if renewals != 1 {
+		t.Fatalf("renewals=%d, want one", renewals)
+	}
+	if got := grokKeyIn(t, copyHome); got != "real-renewed" {
+		t.Errorf("live copy holds %q after the tick, want the renewed credential", got)
+	}
+
+	// Renewed: the next tick has nothing to do.
+	if grokLoginKeeperOnce(context.Background(), "grok", now.Add(grokLoginKeeperTick)) {
+		t.Error("keeper renewed again with five hours left")
+	}
+	if renewals != 1 {
+		t.Errorf("renewals=%d after a quiet tick, want still one", renewals)
+	}
+}
+
+// TestGrokLoginKeeperOnce_LeavesAFreshLoginAndANonRefreshableOneAlone: nothing
+// to do with hours left; and a login without a refresh token (an API-key or
+// legacy file) is not Grok's to renew, so no `grok models` is spawned for it.
+func TestGrokLoginKeeperOnce_LeavesAFreshLoginAndANonRefreshableOneAlone(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	runGrokLoginRenewal = func(context.Context, string, string) { t.Error("renewal must not run") }
+
+	writeGrokAuthMinted(t, real, "fresh", "dan@example.com", now, now.Add(6*time.Hour))
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Error("renewed a login with six hours left")
+	}
+
+	auth := map[string]any{grokExactOIDCScope: map[string]any{
+		"key": "no-refresh", "email": "dan@example.com", "user_id": "u",
+		"expires_at": now.Add(time.Minute).UTC().Format(time.RFC3339Nano),
+	}}
+	b, _ := json.Marshal(auth)
+	if err := os.WriteFile(filepath.Join(real, "auth.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Error("tried to renew a credential that has no refresh token")
+	}
+}
+
+// TestGrokLoginKeeperOnce_ARenewalThatChangedNothingIsNotRetriedEveryTick: a
+// missing CLI or an unreachable xAI must not spawn `grok models` twenty
+// times a minute for the rest of the token's life.
+func TestGrokLoginKeeperOnce_ARenewalThatChangedNothingIsNotRetriedEveryTick(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "stuck", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+
+	for i := 0; i < 5; i++ {
+		grokLoginKeeperOnce(context.Background(), "grok", now.Add(time.Duration(i)*grokLoginKeeperTick))
+	}
+	if renewals != 1 {
+		t.Fatalf("renewals=%d over five ticks, want one", renewals)
+	}
+	grokLoginKeeperOnce(context.Background(), "grok", now.Add(grokLoginRenewRetry))
+	if renewals != 2 {
+		t.Errorf("renewals=%d after the retry window, want two", renewals)
+	}
+}
+
+// TestRunGrokLoginRenewal_RaisesTheCLIsEarlyInvalidationHorizon: `grok models`
+// only refreshes within five minutes of expiry on its own; the renewal must
+// tell the CLI to refresh now, on the real home, with no other GROK_* sink.
+func TestRunGrokLoginRenewal_RaisesTheCLIsEarlyInvalidationHorizon(t *testing.T) {
+	real := isolateGrok(t)
+	t.Setenv("GROK_HOME", real)
+	t.Setenv("XAI_API_KEY", "must-not-leak")
+	prevRunner := cliAgentModelProbeRunner
+	t.Cleanup(func() { cliAgentModelProbeRunner = prevRunner })
+	var gotEnv []string
+	var gotArgs []string
+	cliAgentModelProbeRunner = func(_ context.Context, executable string, env []string, args ...string) (string, bool) {
+		gotEnv, gotArgs = env, args
+		return "", true
+	}
+	// isolateGrok replaced the renewal seam with a failing stub; run the real one.
+	renewGrokLoginWithCLI(context.Background(), "grok", real)
+
+	if strings.Join(gotArgs, " ") != "models" {
+		t.Errorf("args=%q, want the models list", gotArgs)
+	}
+	want := map[string]string{
+		"GROK_HOME":                  real,
+		grokAuthEarlyInvalidationEnv: "1800",
+	}
+	for name, value := range want {
+		if got := envValue(gotEnv, name); got != value {
+			t.Errorf("%s=%q, want %q", name, got, value)
+		}
+	}
+	if got := envValue(gotEnv, "XAI_API_KEY"); got != "" {
+		t.Errorf("XAI_API_KEY leaked into the renewal child")
+	}
+}
+
+func envValue(env []string, name string) string {
+	for _, entry := range env {
+		if k, v, ok := strings.Cut(entry, "="); ok && k == name {
+			return v
+		}
+	}
+	return ""
+}
+
+// TestSweepStaleIsolatedGrokHomes_RemovesOnlyOldUnownedHomes: a home a live
+// copy owns and a home younger than the age floor stay; an old orphan goes;
+// unrelated temp entries are untouched.
+func TestSweepStaleIsolatedGrokHomes_RemovesOnlyOldUnownedHomes(t *testing.T) {
+	tmp := t.TempDir()
+	for _, name := range []string{"TMP", "TEMP", "TMPDIR"} {
+		t.Setenv(name, tmp)
+	}
+	if got := filepath.Clean(os.TempDir()); got != filepath.Clean(tmp) {
+		t.Skipf("os.TempDir()=%s does not follow the env on this platform", got)
+	}
+	now := time.Now()
+	mk := func(name string, age time.Duration) string {
+		dir := filepath.Join(tmp, name)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stamp := now.Add(-age)
+		if err := os.Chtimes(dir, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	old := mk(grokIsolatedHomePrefix+"old", 48*time.Hour)
+	young := mk(grokIsolatedHomePrefix+"young", time.Hour)
+	owned := mk(grokIsolatedHomePrefix+"owned", 48*time.Hour)
+	unrelated := mk("something-else-", 48*time.Hour)
+	grokLogin.acquireCopy(owned)
+	t.Cleanup(func() { grokLogin.releaseCopy(owned) })
+
+	if n := sweepStaleIsolatedGrokHomes(now); n != 1 {
+		t.Fatalf("removed %d, want exactly the old orphan", n)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Error("old orphan still present")
+	}
+	for _, keep := range []string{young, owned, unrelated} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Errorf("%s was removed: %v", keep, err)
+		}
+	}
+}

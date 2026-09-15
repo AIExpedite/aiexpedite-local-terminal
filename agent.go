@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.24"
+var Version = "v1.0.25"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -413,6 +413,13 @@ func StartAgent(cfg *Config) {
 	/* 4b. Start orphan-process scanner (kills detached CLI agents) -------- */
 
 	StartOrphanScanner(cfg)
+
+	/* 4c. Keep the Grok login alive (grok_login_keeper.go) ---------------- */
+	// Every Grok run here uses a copy of the login whose refresh token rotates;
+	// the keeper renews the real home ahead of expiry and reconciles the newest
+	// credential across the copies, so `grok login` is a one-time step again.
+
+	go runGrokLoginKeeper(context.Background())
 
 	/* 5. Display connection instructions ---------------------------------- */
 

@@ -654,6 +654,56 @@ Summary:
   normal pipe-based session path use stream-json stdin; only the Unix PTY
   compatibility path retains `--print <prompt>` argv delivery.
 
+## Grok login keeper (why `grok login` was needed every 6 hours)
+
+Grok Build's login is a 6-hour access token plus a refresh token that
+**rotates on every use**: a refresh answers with a new pair, and the old
+refresh token stays redeemable only for a short grace window (measured on
+2026-09-15 with `grok` 1.0.30: accepted 44 s after rotation, rejected 2.5 min
+after). When a refresh is rejected the CLI signs that home out — it deletes
+`auth.json` — and the user is back at `grok login`. The CLI itself refreshes
+silently, inside `grok agent stdio` too, 5 min before expiry
+(`GROK_AUTH_EARLY_INVALIDATION_SECS`), and hot-reloads `auth.json`.
+
+Every Grok run this agent starts uses an isolated temp **copy** of the login
+(`grok_isolated_home.go`) that is deleted when the run ends. The first copy to
+reach the 6-hour mark refreshed, took the only live token with it, and left
+the real home holding a refresh token xAI revoked two minutes later. The next
+thing to touch the real home — the user's own `grok`, or a new copy taken
+after the 6-hour mark — was signed out. Every computer running the agent
+needed `grok login` every 6 hours, and the frontend had learnt to call a
+Grok "refreshable" deadline a hard one.
+
+`grok_login_keeper.go` applies one rule: **the newest credential of the
+account wins everywhere.**
+
+- Every 20 s the keeper reads the real home. Inside 30 min of expiry
+  (`grokLoginKeepAhead`) it runs `grok models` against the real home with
+  `GROK_AUTH_EARLY_INVALIDATION_SECS=1800`, so the CLI refreshes now. A copy
+  therefore never reaches its own 5-minute refresh point while the keeper runs.
+  A renewal that changes nothing (CLI missing, xAI unreachable) is retried
+  every 5 min, not every tick.
+- After every renewal — the keeper's or the live probe's — and on every tick,
+  `reconcileGrokLogin` writes the newest same-account credential (ordered by
+  the CLI's `create_time`) into the real home and every live copy, atomically
+  (write beside, rename over). A copy that refreshed on its own is written
+  BACK to the real home within one tick, inside the grace window; a renewed
+  real home is fanned OUT to the copies, which hot-reload it. Copies of another
+  account are never mixed in.
+- `grokLoginGuard` still serializes renewals (two rotations minutes apart sign
+  the loser out) and still keeps a copy from being taken mid-renewal, but a
+  live copy no longer blocks a renewal: it receives the result instead.
+- The keeper also sweeps `grok-acp-home-*` directories older than 24 h that no
+  live copy owns (178 had accumulated on one computer since July), through
+  `removeIsolatedGrokHome` so a linked conversation store is unlinked first.
+
+Frontend: `UNTRUSTED_AUTO_RENEWAL_PROVIDERS` (cliAgentAvailability.js) is empty
+again from the same day; a genuine sign-out still reaches it as authState
+`missing`, because the CLI deletes the file.
+
+Never test rotation by reusing a real home's refresh token from a copy: the
+real one is revoked two minutes later.
+
 ## Antigravity quota capture (why `agy` needs an active poller)
 
 Claude and Codex leak their usage numbers passively — Claude prints a rate-limit
@@ -830,13 +880,11 @@ provider for its current figures before the gather runs
     the RPC (≥ 1.2.2, see the CSRF gate above) the probe stops at the first
     refusal and later clicks skip the spawn.
   - Grok's token is the freshest one for the account across the real home AND
-    every live isolated copy (`grokFreshestPresentedToken`): headless sessions
-    run on copies for hours and renew only their own copy, so the real home's
-    token is the stale one on exactly the device that runs Grok through AI
-    Expedite. A renewal waits at most `grokLoginRenewGap` (2 s) for every copy
-    to be released — never the whole probe budget, which turned "the login is
-    busy" into a transport error — and reports `login_busy` when no token
-    worked and it could not renew.
+    every live isolated copy (`grokFreshestPresentedToken`). A renewal takes
+    its turn for at most `grokLoginRenewGap` (2 s) when the login keeper is
+    mid-renewal — never the whole probe budget, which turned "the login is
+    busy" into a transport error — reports `login_busy` when it could not,
+    and fans the renewed file out to every live copy (see "Grok login keeper").
 - **Model lists** are re-listed in the same window with the time the slowest
   list needs; the bounded gather's 2 s discovery slot never fits `agy models`.
 - **Concurrency.** Clicks share one running probe (singleflight) and a click

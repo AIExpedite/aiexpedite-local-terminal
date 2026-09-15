@@ -8,21 +8,24 @@ import (
 	"sync"
 )
 
-// grokLoginGuard serializes renewing the real Grok login against every child
-// that runs on a COPY of it.
+// grokLoginGuard tracks every child that runs on a COPY of the real Grok
+// login, and serializes renewals of that login.
 //
 // Grok's login carries a rotating refresh token. An isolated home (ACP
 // sessions, maintenance smokes, `grok models` discovery) holds a copy of
-// auth.json for as long as the home exists, and its child may redeem that
-// copy's refresh token at any time. Renewing the real home while a copy is live
-// lets the two redeem the SAME token: whichever rotates second either fails or
-// invalidates the other, and when the loser is the real home the user's CLI is
-// signed out. So a renewal only runs when no copy exists, and no copy is taken
-// while a renewal runs.
+// auth.json for as long as the home exists. A renewal rotates the token for
+// EVERY holder: after it, the copies hold a refresh token xAI revokes within
+// minutes. So one renewal runs at a time, no copy is taken while one runs
+// (a copy taken after it holds the renewed credential), and every renewal is
+// followed by reconcileGrokLogin (grok_login_keeper.go), which writes the
+// renewed file into each live copy inside the grace window — and writes a
+// copy's own renewal back to the real home. Renewal therefore no longer
+// waits for the copies to go away: an ACP session holds its copy for hours,
+// and a real home that could not renew for hours was exactly the login that
+// died.
 //
 // Copies are registered when an isolated home is created — before the auth file
-// is read, so a copy taken after a renewal holds the renewed credential — and
-// released when it is removed.
+// is read — and released when it is removed.
 type grokLoginGuard struct {
 	mu       sync.Mutex
 	copies   map[string]struct{}
@@ -69,15 +72,15 @@ func (g *grokLoginGuard) releaseCopy(home string) {
 	g.broadcastLocked()
 }
 
-// beginRenewal waits until no copy of the login is live and no other renewal
-// runs, then holds the login exclusively until the returned release is called.
-// It gives up when ctx ends first: a renewal that cannot run safely is skipped,
-// never forced — a failed usage refresh is recoverable, a signed-out CLI is not.
+// beginRenewal waits until no other renewal runs, then holds the login
+// exclusively until the returned release is called. It gives up when ctx ends
+// first: two renewals of one refresh token minutes apart sign the loser out,
+// so a renewal that cannot take the turn is skipped, never forced.
 func (g *grokLoginGuard) beginRenewal(ctx context.Context) (func(), bool) {
 	g.mu.Lock()
 	for {
 		g.pruneRemovedLocked()
-		if !g.renewing && len(g.copies) == 0 {
+		if !g.renewing {
 			break
 		}
 		wait := g.changed
@@ -103,9 +106,8 @@ func (g *grokLoginGuard) beginRenewal(ctx context.Context) (func(), bool) {
 // after forgetting any whose directory is already gone. A copy's auth file is
 // as readable as the real home's — an ACP session that renewed ITS token holds a
 // fresher credential than a real home nothing has touched for hours — so a
-// read-only consumer (the billing probe) may present the freshest of them.
-// Reading never rotates anything; only renewal does, and renewal still waits
-// for every copy to be gone.
+// read-only consumer (the billing probe) may present the freshest of them, and
+// the keeper reconciles the newest across all of them.
 func (g *grokLoginGuard) liveCopies() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
