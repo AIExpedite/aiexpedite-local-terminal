@@ -332,6 +332,16 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			return
 		}
 		defer release()
+		// A live copy may already hold the account's newer credential; write it
+		// back first, so the renewal below never redeems a refresh token that
+		// copy superseded (past the grace window that signs the real home out).
+		// If that reconciliation produced a token the request can use, the
+		// renewal is not needed at all.
+		if reconcileGrokLoginLocked(base) > 0 {
+			if _, expiresAt, hasExpiry := grokFreshestPresentedToken(base, fingerprint, now()); hasExpiry && now().Add(grokTokenExpirySkew).Before(expiresAt) {
+				return
+			}
+		}
 		runGrokLoginRenewal(ctx, grokPath, base)
 		// Every live copy of the login now holds a superseded refresh token;
 		// hand them the renewed file before xAI's grace window closes — still

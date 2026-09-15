@@ -444,3 +444,102 @@ func TestGrokLoginKeeperOnce_ReconcilesACopysRenewalBeforeRenewingTheRealHome(t 
 		t.Errorf("real home holds %q, want the copy's fresher credential", got)
 	}
 }
+
+// TestProbeGrokBillingLive_RenewsTheCopysNewerChainNotTheSupersededRealOne:
+// every token is stale, but a live copy holds the NEWER credential (it
+// refreshed on its own; that access token has since expired too). The real
+// home's refresh token was superseded by that copy's, so renewing the real
+// home as it stands would redeem a revoked token and sign the home out. The
+// probe writes the copy back under the lock FIRST, then renews the real home
+// — which now carries the copy's chain.
+func TestProbeGrokBillingLive_RenewsTheCopysNewerChainNotTheSupersededRealOne(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, home, "real-superseded", "a@example.com", now.Add(-12*time.Hour), now.Add(-6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-newer", "a@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	heldAtRenewal := ""
+	runGrokLoginRenewal = func(_ context.Context, _, base string) {
+		heldAtRenewal = grokKeyIn(t, base)
+		writeGrokAuthMinted(t, base, "renewed", "a@example.com", now, now.Add(6*time.Hour))
+	}
+	calls := grokBillingServer(t, func(auth string) (int, string) {
+		if auth != "Bearer renewed" {
+			return 401, `{}`
+		}
+		return 200, grokFixtureBody(now.Add(72 * time.Hour))
+	})
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok after renewing the copy's chain", got)
+	}
+	if heldAtRenewal != "copy-newer" {
+		t.Errorf("real home held %q when the renewal ran, want the copy's newer credential written back first", heldAtRenewal)
+	}
+	if *calls != 1 {
+		t.Errorf("requests=%d, want one (the renewed token)", *calls)
+	}
+	if got := grokKeyIn(t, copyHome); got != "renewed" {
+		t.Errorf("live copy holds %q, want the renewed credential fanned out", got)
+	}
+}
+
+// TestRemoveIsolatedGrokHome_KeepsTheCopyUntilItsCredentialIsWrittenBack: a
+// removal that cannot reconcile because a renewal holds the login for longer
+// than it waits must NOT delete the copy — files or registration — and must
+// retry once the lock is free, writing the copy's credential back then.
+func TestRemoveIsolatedGrokHome_KeepsTheCopyUntilItsCredentialIsWrittenBack(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, home, "copy-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+
+	prevWait := grokLoginRemovalReconcileWait
+	grokLoginRemovalReconcileWait = 100 * time.Millisecond
+	t.Cleanup(func() { grokLoginRemovalReconcileWait = prevWait })
+
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	if err := removeIsolatedGrokHome(home); err == nil || !strings.Contains(err.Error(), "renewal in flight") {
+		t.Fatalf("removal err=%v, want the login-busy deferral", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "auth.json")); err != nil {
+		t.Fatal("the copy was deleted while its credential was still the only live one")
+	}
+	if got := grokKeyIn(t, real); got != "real-old" {
+		t.Fatalf("real home rewritten to %q while the lock was held elsewhere", got)
+	}
+	registered := false
+	for _, live := range grokLogin.liveCopies() {
+		if live == filepath.Clean(home) {
+			registered = true
+		}
+	}
+	if !registered {
+		t.Fatal("the deferred copy was unregistered")
+	}
+	release()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(home); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatal("the retry never removed the copy once the lock was free")
+	}
+	if got := grokKeyIn(t, real); got != "copy-renewed" {
+		t.Errorf("real home holds %q, want the copy's credential written back by the retry", got)
+	}
+}

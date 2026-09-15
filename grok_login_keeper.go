@@ -188,18 +188,33 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 // grokLoginReconcileWait for its turn and skips the pass when it cannot get
 // it — the next tick, or the renewal's own reconciliation, covers it.
 func reconcileGrokLogin(base string) int {
+	n, _ := reconcileGrokLoginWithin(base, grokLoginReconcileWait)
+	return n
+}
+
+// reconcileGrokLoginWithin is reconcileGrokLogin with a caller-chosen wait
+// for the login lock. ok is false when the lock was not obtained in time —
+// the caller then knows the pass did NOT run.
+func reconcileGrokLoginWithin(base string, wait time.Duration) (int, bool) {
 	if base == "" {
-		return 0
+		return 0, true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), grokLoginReconcileWait)
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	release, ok := grokLogin.beginRenewal(ctx)
 	if !ok {
-		return 0
+		return 0, false
 	}
 	defer release()
-	return reconcileGrokLoginLocked(base)
+	return reconcileGrokLoginLocked(base), true
 }
+
+// grokLoginRemovalReconcileWait is how long removing an isolated home waits
+// for the login lock before giving up on writing the copy's credential back.
+// Longer than a whole CLI renewal (grokLoginRenewTimeout), because the copy
+// being removed may hold the only live credential and a renewal in flight is
+// exactly when that matters. A var so tests can shorten it.
+var grokLoginRemovalReconcileWait = grokLoginRenewTimeout + 5*time.Second
 
 // reconcileGrokLoginLocked is reconcileGrokLogin for a caller that already
 // holds the login lock.

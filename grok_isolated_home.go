@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
@@ -151,15 +152,39 @@ func removeIsolatedGrokHome(home string) error {
 }
 
 func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) error {
+	return removeIsolatedGrokHomeAttempt(home, unlink, 0)
+}
+
+// errGrokLoginBusy: the home was NOT removed this time because its login copy
+// could not be reconciled while a renewal held the login; a retry is
+// scheduled and the copy stays registered until then.
+var errGrokLoginBusy = errors.New("grok login copy not reconciled yet: renewal in flight")
+
+// grokLoginRemovalRetries bounds how many times a removal defers to a renewal
+// in flight before it proceeds regardless (a lock held that long is a stuck
+// renewal, and a leaked credential copy is then the lesser problem).
+const grokLoginRemovalRetries = 3
+
+func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attempt int) error {
 	if home == "" {
 		return nil
 	}
-	defer grokLogin.releaseCopy(home)
 	// The copy may hold the account's newest credential — a `grok models`
 	// discovery that refreshed and is being removed seconds later never lives
 	// to see a keeper tick. Reconcile while it is still registered, so its
-	// renewal reaches the real home before the file is deleted.
-	reconcileGrokLogin(grokPersistentHome())
+	// renewal reaches the real home before the file is deleted. The wait
+	// outlasts a whole CLI renewal; when even that is not enough, the copy is
+	// kept — files and registration — and the removal retries later, rather
+	// than deleting a credential nothing else holds.
+	if _, ok := reconcileGrokLoginWithin(grokPersistentHome(), grokLoginRemovalReconcileWait); !ok && attempt < grokLoginRemovalRetries {
+		fmt.Printf("%s[grok-acp] isolated home kept for now (attempt %d): its login copy could not be reconciled while a renewal ran%s\n",
+			colorYellow, attempt+1, colorReset)
+		time.AfterFunc(grokLoginRemovalReconcileWait, func() {
+			_ = removeIsolatedGrokHomeAttempt(home, unlink, attempt+1)
+		})
+		return errGrokLoginBusy
+	}
+	defer grokLogin.releaseCopy(home)
 
 	link := filepath.Join(home, grokSessionsDirName)
 	if err := unlink(link); err != nil {
@@ -180,7 +205,7 @@ func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) er
 // caller already has a primary result to return or publish. It keeps cleanup
 // failures observable without changing session/auth error semantics.
 func cleanupIsolatedGrokHome(home, sessionID string) {
-	if err := removeIsolatedGrokHome(home); err != nil {
+	if err := removeIsolatedGrokHome(home); err != nil && !errors.Is(err, errGrokLoginBusy) {
 		fmt.Printf("%s[grok-acp] isolated home cleanup failed for %s: %v%s\n",
 			colorYellow, sessionID, err, colorReset)
 	}
