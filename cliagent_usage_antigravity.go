@@ -86,8 +86,17 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	defer cancel()
 	var fresh antigravityQuotaSnapshot
 	var gotFresh bool
+	// The newest run log across EVERY base walked, not just the winning one: a
+	// legacy ~/.agy run must not look invisible because the modern tree happens
+	// to hold older logs.
+	var newestLog time.Time
 	for _, quotaBase := range quotaBases {
-		if fresh, gotFresh = fetchAntigravityQuota(quotaCtx, quotaBase, now); gotFresh {
+		var baseNewestLog time.Time
+		fresh, baseNewestLog, gotFresh = fetchAntigravityQuota(quotaCtx, quotaBase, now)
+		if baseNewestLog.After(newestLog) {
+			newestLog = baseNewestLog
+		}
+		if gotFresh {
 			break
 		}
 	}
@@ -141,6 +150,14 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 			usage.Plan = firstNonEmpty(cached.Plan, usage.Plan)
 			usage.AccountFingerprint = cached.AccountFingerprint
 		}
+	}
+
+	if !gotFresh {
+		// Replaying. If the CLI's own logs show a run finished after this
+		// reading was taken, that run's quota was never captured — say so, once,
+		// so the next maintenance pass can tell an unrecognised transport from a
+		// server that refused to attribute its reading.
+		antigravityMissedRun(snap.ObservedAt, newestLog, len(quotaBases))
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

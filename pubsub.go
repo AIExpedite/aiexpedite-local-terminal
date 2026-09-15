@@ -2488,10 +2488,7 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	// Do not arm until Start succeeds. Arming in runLocalCommand made the
 	// immediate probe race ahead of the child and also created a capture for a
 	// command that never spawned at all.
-	if commandRunsAntigravity(cmd, args) {
-		finishQuotaCapture := startAntigravityQuotaCapture("local execute")
-		defer finishQuotaCapture()
-	}
+	defer armAntigravityCaptureForCommand("local execute", cmd, args)()
 	err := c.Wait()
 	return combined.String(), err
 }
@@ -5132,7 +5129,6 @@ func replaceDashCPayload(args []string, payload string) []string {
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
 	timeout := resolveExecTimeout(timeoutMs)
 	workDir := resolveWorkDir(cfg, cwd)
-	runsAntigravity := commandRunsAntigravity(cmd, args)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
@@ -5140,9 +5136,42 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	// no PowerShell/cmd.exe involvement. Without this branch, Unix agents
 	// fall through to the Windows fallback path and try to exec
 	// powershell.exe, which doesn't exist on macOS/Linux.
-	if runtime.GOOS != "windows" || runsAntigravity {
+	//
+	// A DIRECT `agy …` takes that bare-exec route on Windows too: the CLI is a
+	// console app that streams, and wrapping it in PowerShell breaks the stream.
+	// The predicate here is deliberately isAntigravityCommand and NOT the
+	// wrapper superset commandRunsAntigravity — a `powershell -EncodedCommand
+	// <agy …>` sent down this route would be exec'd as a literal program on the
+	// bare path, losing CLIXML filtering, the temp-file fallback for oversized
+	// scripts and hardenNonAgentCommand. Wrapped payloads keep their PowerShell
+	// transport and get their quota capture armed inside
+	// runLocalCommandWindows instead.
+	if runtime.GOOS != "windows" || isAntigravityCommand(cmd) {
 		return runLocalCommandUnix(cmd, args, workDir, timeout)
 	}
+	return runLocalCommandWindows(cmd, args, workDir, timeout)
+}
+
+// runLocalCommandWindows runs one execute through the Windows transport chain:
+// encoded PowerShell (argument or temp .ps1), a dedicated process for the
+// streaming CLI agents, a one-shot hardened process for test runners,
+// `runViaShell`, or the persistent PowerShell instance with its restart and
+// one-shot fallbacks.
+//
+// Split out of runLocalCommand — which now holds only the route decision — for
+// one reason: every one of those transports can spawn `agy` (terminal-service
+// ships a Windows execute as `powershell -EncodedCommand <base64>`, whatever the
+// payload), and there was no single place to arm the quota capture around them.
+// It carries no build tag, so a test can drive the whole chain on any OS through
+// the runEncodedPowerShellViaArgFn / runPowerShellCommandViaTempFileFn seams.
+func runLocalCommandWindows(cmd string, args []string, workDir string, timeout time.Duration) (string, error) {
+	// One arm covers the whole chain below: every transport runs synchronously
+	// inside this window, and the fallbacks are sequential rather than
+	// concurrent, so a failover cannot double-arm. Unlike the Unix path there is
+	// no post-Start hook to hang this on — the transports own their own
+	// processes — so the window opens slightly before the child does, which
+	// costs at most one probe against a server that is not up yet.
+	defer armAntigravityCaptureForCommand("windows execute", cmd, args)()
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
 	isEncodedPowerShell := strings.ToLower(cmd) == "powershell" &&

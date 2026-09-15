@@ -70,6 +70,16 @@ const helperQuotaJSON = `{"response":{"groups":[
   {"displayName":"Claude and GPT models","buckets":[
     {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":1,"resetTime":"2126-08-19T01:11:09Z"}]}]}}`
 
+// helperQuotaJSONDebited is helperQuotaJSON after a turn has spent from the
+// pools — the reading a server only starts returning once the turn it belongs
+// to has ended.
+const helperQuotaJSONDebited = `{"response":{"groups":[
+  {"displayName":"Gemini Models","buckets":[
+    {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.5,"resetTime":"2126-08-14T14:17:13Z"},
+    {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":0.6,"resetTime":"2126-08-12T04:37:41Z"}]},
+  {"displayName":"Claude and GPT models","buckets":[
+    {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.8,"resetTime":"2126-08-19T01:11:09Z"}]}]}}`
+
 const helperStatusJSON = `{"userStatus":{"name":"Ada Lovelace","email":"ada@example.com",
   "planStatus":{"planInfo":{"planName":"Pro"}}}}`
 
@@ -78,7 +88,7 @@ func TestFetchAntigravityQuota_ReadsLoopbackServerDiscoveredFromLogs(t *testing.
 	helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
 
 	now := time.Date(2026, 8, 11, 12, 5, 0, 0, time.UTC)
-	snap, ok := fetchAntigravityQuota(context.Background(), base, now)
+	snap, _, ok := fetchAntigravityQuota(context.Background(), base, now)
 	if !ok {
 		t.Fatalf("expected a quota snapshot")
 	}
@@ -99,13 +109,13 @@ func TestFetchAntigravityQuota_NoServerRunning(t *testing.T) {
 	helperWriteAntigravityLog(t, base, "cli-old.log",
 		"server.go:584] Language server listening on random port at 1 for HTTP\n")
 
-	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("expected no snapshot when nothing answers")
 	}
 }
 
 func TestFetchAntigravityQuota_NoLogsIsNotAnError(t *testing.T) {
-	if _, ok := fetchAntigravityQuota(context.Background(), t.TempDir(), time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), t.TempDir(), time.Now()); ok {
 		t.Errorf("expected no snapshot without logs")
 	}
 }
@@ -116,7 +126,7 @@ func TestFetchAntigravityQuota_EmptyGroupsIsNotASnapshot(t *testing.T) {
 	base := t.TempDir()
 	helperAntigravityServer(t, base, `{"response":{"groups":[]}}`, helperStatusJSON)
 
-	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("an empty quota payload must not count as an observation")
 	}
 }
@@ -130,7 +140,7 @@ func TestFetchAntigravityQuota_UnrecognizedWindowsAreNotASnapshot(t *testing.T) 
 	  {"bucketId":"gemini-fortnightly","window":"fortnightly","remainingFraction":0.5,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("a response with no plottable bucket must not count as an observation")
 	}
 }
@@ -199,7 +209,7 @@ func TestDiscoverAntigravityHTTPPorts_PrefersNewestLogAndLastLine(t *testing.T) 
 			"server.go:584] Language server listening on random port at 22222 for HTTP\n"+
 			"server.go:584] Language server listening on random port at 33333 for HTTP\n")
 
-	ports := discoverAntigravityHTTPPorts(base)
+	ports, _ := discoverAntigravityHTTPPorts(base)
 	if len(ports) < 3 {
 		t.Fatalf("ports=%v, want at least 3 candidates", ports)
 	}
@@ -511,7 +521,7 @@ func TestDiscoverAntigravityHTTPPorts_ReadsBoundedHeadAndTail(t *testing.T) {
 		t.Fatalf("fixture must exceed the scan window, got %d bytes", info.Size())
 	}
 
-	ports := discoverAntigravityHTTPPorts(base)
+	ports, _ := discoverAntigravityHTTPPorts(base)
 	if len(ports) != 2 {
 		t.Fatalf("ports=%v, want both the startup and restart ports", ports)
 	}
@@ -531,7 +541,7 @@ func TestFetchAntigravityQuota_SkipsBucketsWithoutARemainingFraction(t *testing.
 	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":null,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("buckets with no usable fraction must not count as an observation")
 	}
 }
@@ -543,7 +553,7 @@ func TestFetchAntigravityQuota_SkipsOutOfRangeFraction(t *testing.T) {
 	  {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":42,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("a fraction outside 0..1 must not be plotted")
 	}
 }
@@ -557,7 +567,7 @@ func TestFetchAntigravityQuota_KeepsValidBucketsBesideMalformedOnes(t *testing.T
 	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
 		helperStatusJSON)
 
-	snap, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
+	snap, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
 	if !ok {
 		t.Fatalf("expected the usable bucket to yield a snapshot")
 	}
@@ -772,7 +782,7 @@ func TestDiscoverAntigravityHTTPPorts_AcceptsTheToleratedPortSpelling(t *testing
 		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
 			"server.go:584] Language server listening on port 55551 for HTTP\n")
 
-	ports := discoverAntigravityHTTPPorts(base)
+	ports, _ := discoverAntigravityHTTPPorts(base)
 	if len(ports) != 1 || ports[0] != 55551 {
 		t.Fatalf("ports=%v, want just the post-update HTTP port 55551", ports)
 	}
@@ -786,7 +796,7 @@ func TestDiscoverAntigravityHTTPPorts_IgnoresAnHTTPSOnlyLog(t *testing.T) {
 		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
 			"server.go:577] Language server listening on port 22222 for HTTPS (gRPC)\n")
 
-	if ports := discoverAntigravityHTTPPorts(base); len(ports) != 0 {
+	if ports, _ := discoverAntigravityHTTPPorts(base); len(ports) != 0 {
 		t.Errorf("ports=%v, want none — no plain-HTTP listener was advertised", ports)
 	}
 }
@@ -912,5 +922,107 @@ func TestAntigravityQuotaBases_OrdersByWhichInstallHoldsConfig(t *testing.T) {
 	// No home resolves to no bases at all, rather than a path rooted at "/".
 	if bases := antigravityQuotaBases(""); len(bases) != 0 {
 		t.Errorf("bases=%v, want none without a home", bases)
+	}
+}
+
+// The missed-run backstop. When a refresh replays a cached snapshot and the
+// CLI's own logs show a run finished after that snapshot was taken, that run's
+// quota was never captured — and saying so is what separates "the classifier
+// did not recognise the transport" from "capture ran but the server refused to
+// attribute the reading" on the next maintenance pass. From the outside both
+// look identical: observed_stale.
+func TestAntigravityMissedRun_WarnsWhenALogPostdatesTheObservation(t *testing.T) {
+	observed := time.Now().UTC().Add(-2 * time.Hour)
+	logAt := observed.Add(30 * time.Minute)
+
+	line := captureStdout(t, func() {
+		antigravityMissedRun(observed.Format(time.RFC3339), logAt, 2)
+	})
+	if !strings.Contains(line, "a run completed after the last observation") {
+		t.Fatalf("no backstop line: %q", line)
+	}
+	// Timestamps and counts only — never a path, log text or account.
+	for _, forbidden := range []string{"/", "\\", "@"} {
+		if strings.Contains(strings.ReplaceAll(line, "\\n", ""), forbidden) {
+			t.Errorf("backstop line leaks %q: %q", forbidden, line)
+		}
+	}
+}
+
+// The slack is load-bearing, not a fudge factor: the Refresh-click live probe
+// starts its own `agy`, whose log keeps being written for seconds after the
+// reading that probe already persisted. Without it the device would warn on
+// every successful refresh, which is the opposite of the signal.
+func TestAntigravityMissedRun_SilentForTheLiveProbeShape(t *testing.T) {
+	// Truncated: observedAt round-trips through RFC3339's one-second
+	// resolution, so the boundary case has to be expressed in whole seconds.
+	observed := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+
+	cases := []struct {
+		name   string
+		logAt  time.Time
+		reason string
+	}{
+		{"log seconds after its own observation", observed.Add(10 * time.Second),
+			"the live probe's own agy writes its log after the reading"},
+		{"log exactly at the slack boundary", observed.Add(antigravityMissedRunSlack),
+			"the boundary is not yet a separate run"},
+		{"snapshot newer than every log", observed.Add(-time.Hour),
+			"nothing ran after the observation"},
+		{"no logs at all", time.Time{}, "a zero mtime is not evidence of a run"},
+	}
+	for _, tc := range cases {
+		line := captureStdout(t, func() {
+			antigravityMissedRun(observed.Format(time.RFC3339), tc.logAt, 1)
+		})
+		if strings.Contains(line, "a run completed after") {
+			t.Errorf("%s: warned anyway (%s): %q", tc.name, tc.reason, line)
+		}
+	}
+}
+
+// An observation the device cannot parse is not evidence either way, so it must
+// not produce a warning about a run that may never have happened.
+func TestAntigravityMissedRun_SilentWithoutAParseableObservation(t *testing.T) {
+	for _, observedAt := range []string{"", "not-a-time"} {
+		line := captureStdout(t, func() {
+			antigravityMissedRun(observedAt, time.Now(), 1)
+		})
+		if strings.Contains(line, "a run completed after") {
+			t.Errorf("observedAt=%q warned anyway: %q", observedAt, line)
+		}
+	}
+}
+
+// The backstop reuses the stat discovery already paid for rather than walking
+// the log directory a second time on every refresh.
+func TestDiscoverAntigravityHTTPPorts_ReportsTheNewestLogMtime(t *testing.T) {
+	base := t.TempDir()
+	helperWriteAntigravityLog(t, base, "old.log",
+		"server.go:584] Language server listening on random port at 44441 for HTTP\n")
+	logDir := antigravityLogDir(base)
+	old := time.Now().Add(-3 * time.Hour)
+	if err := os.Chtimes(filepath.Join(logDir, "old.log"), old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	helperWriteAntigravityLog(t, base, "new.log",
+		"server.go:584] Language server listening on random port at 44442 for HTTP\n")
+	newest := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(filepath.Join(logDir, "new.log"), newest, newest); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	ports, newestLog := discoverAntigravityHTTPPorts(base)
+	if len(ports) != 2 {
+		t.Errorf("ports=%v, want both listeners", ports)
+	}
+	if !newestLog.Equal(newest.Truncate(time.Second)) && newestLog.Sub(newest).Abs() > time.Second {
+		t.Errorf("newestLog=%s, want the newer file's mtime %s", newestLog, newest)
+	}
+
+	// An unreadable (here: absent) log directory reports no run rather than a
+	// zero-value instant that could be mistaken for one.
+	if ports, newestLog := discoverAntigravityHTTPPorts(t.TempDir()); len(ports) != 0 || !newestLog.IsZero() {
+		t.Errorf("empty base gave ports=%v newestLog=%s, want none and the zero time", ports, newestLog)
 	}
 }

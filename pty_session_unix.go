@@ -72,10 +72,7 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 	// both direct `agy …` argv and shell-wrapped `bash -c "agy …"` payloads. The
 	// defer releases it on EVERY exit route — normal exit, overall timeout and
 	// prompt-abort. See cliagent_usage_antigravity_capture.go.
-	if commandRunsAntigravity(cmd, args) {
-		finishQuotaCapture := startAntigravityQuotaCapture("PTY session")
-		defer finishQuotaCapture()
-	}
+	defer armAntigravityCaptureForCommand("PTY session", cmd, args)()
 
 	norm := NewPTYNormalizer(DefaultRedrawInterval)
 	var sb strings.Builder

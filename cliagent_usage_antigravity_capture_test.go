@@ -29,12 +29,21 @@ type helperCaptureServer struct {
 
 func helperStartCaptureServer(t *testing.T, base, quotaJSON, statusJSON string) *helperCaptureServer {
 	t.Helper()
+	return helperStartCaptureServerFunc(t, base, func() string { return quotaJSON }, statusJSON)
+}
+
+// helperStartCaptureServerFunc is helperStartCaptureServer with the quota body
+// resolved per request, for the tail-window test: a turn's quota is debited when
+// the turn ENDS, so the reading has to be able to change after the run is
+// released.
+func helperStartCaptureServerFunc(t *testing.T, base string, quotaJSON func() string, statusJSON string) *helperCaptureServer {
+	t.Helper()
 	cs := &helperCaptureServer{}
 	mux := http.NewServeMux()
 	mux.HandleFunc(antigravityQuotaRPC, func(w http.ResponseWriter, r *http.Request) {
 		cs.quotaHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(quotaJSON))
+		_, _ = w.Write([]byte(quotaJSON()))
 	})
 	mux.HandleFunc(antigravityStatusRPC, func(w http.ResponseWriter, r *http.Request) {
 		cs.statusHits.Add(1)
@@ -64,8 +73,8 @@ func helperStartCaptureServer(t *testing.T, base, quotaJSON, statusJSON string) 
 	return cs
 }
 
-// helperIsolateAntigravityCapture points HOME, the quota cache and the capture
-// tick at test-owned locations, and asserts no previous poller is still alive.
+// helperIsolateAntigravityCapture points HOME, the quota cache, the capture
+// tick and the post-release tail window at test-owned locations, and asserts no previous poller is still alive.
 // Capture state is process-global by design (one poller for every concurrent
 // `agy` run), so these tests must not run in parallel with each other.
 func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache string) {
@@ -80,6 +89,7 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	antigravityCaptureArms.Store(0)
 	antigravityCaptureFinishes.Store(0)
 	antigravityCaptureSnapshots.Store(0)
+	antigravityCaptureTailProbes.Store(0)
 
 	home = t.TempDir()
 	t.Setenv("HOME", home)
@@ -87,6 +97,9 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	cache = filepath.Join(t.TempDir(), "agyq.json")
 	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
 	t.Setenv(antigravityCaptureIntervalEnv, interval)
+	// The shipped 2s tail grace would be paid by every helperStopCapture in the
+	// suite. The tail's own tests set this back to a value they can reason about.
+	t.Setenv(antigravityCaptureTailEnv, "1ms")
 	return home, cache
 }
 
@@ -429,5 +442,143 @@ func TestAntigravityCapturePollIntervalValue_RejectsUnusableOverrides(t *testing
 	t.Setenv(antigravityCaptureIntervalEnv, "25ms")
 	if got := antigravityCapturePollIntervalValue(); got != 25*time.Millisecond {
 		t.Errorf("override 25ms → %v", got)
+	}
+}
+
+// The quota a turn spends is debited at the END of the turn, and the execute
+// path releases the capture the instant Wait returns — while the language
+// server is still up and still answering. Without the post-release tail window,
+// the reading the card shows is the one taken BEFORE the turn's own debit
+// landed, so a successful run could still publish an under-reported pool.
+func TestAntigravityQuotaCapture_TailProbesAfterLastFinish(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "1h")
+	t.Setenv(antigravityCaptureTailEnv, "3s")
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+
+	var quotaJSON atomic.Value
+	quotaJSON.Store(helperQuotaJSON)
+	server := helperStartCaptureServerFunc(t, base, func() string {
+		return quotaJSON.Load().(string)
+	}, helperStatusJSON)
+
+	finish := startAntigravityQuotaCapture("tail run")
+	helperAwaitSnapshot(t, cache, time.Time{}, "the arm-time capture")
+
+	// observedAt has one-second resolution, so the release instant has to fall
+	// in a strictly later second than every in-run probe for the assertion below
+	// to be able to tell them apart.
+	time.Sleep(1100 * time.Millisecond)
+	// The turn's debit lands only now, as the run is released — the real-world
+	// ordering this window exists for.
+	quotaJSON.Store(helperQuotaJSONDebited)
+	releaseAt := time.Now().UTC().Truncate(time.Second)
+	hitsBeforeRelease := server.quotaHits.Load()
+
+	helperStopCapture(t, finish)
+	if elapsed := time.Since(releaseAt); elapsed > 3*time.Second+2*time.Second {
+		t.Errorf("poller took %s to exit after the last finish — the tail window is not bounded", elapsed)
+	}
+
+	var snap antigravityQuotaSnapshot
+	if !readJSONFile(cache, &snap) {
+		t.Fatal("no snapshot after the tail window")
+	}
+	observed, err := time.Parse(time.RFC3339, snap.ObservedAt)
+	if err != nil {
+		t.Fatalf("tail observedAt=%q is not RFC3339: %v", snap.ObservedAt, err)
+	}
+	// Every in-run probe happened strictly before releaseAt, so a reading at or
+	// after it can only have been taken by the tail.
+	if observed.Before(releaseAt) {
+		t.Errorf("observedAt=%s predates the release at %s — nothing probed after finish()", observed, releaseAt)
+	}
+	if got := helperBucketFraction(t, snap, "gemini-5h"); got != 0.6 {
+		t.Errorf("gemini-5h remainingFraction=%v, want the post-turn debited 0.6 — the tail reading was not the one persisted", got)
+	}
+	if got := antigravityCaptureTailProbes.Load(); got == 0 {
+		t.Error("tailProbes=0, want at least one probe after the last release")
+	}
+	if got := server.quotaHits.Load(); got <= hitsBeforeRelease {
+		t.Errorf("quotaHits=%d, unchanged from %d at release — the server saw no tail probe", got, hitsBeforeRelease)
+	}
+}
+
+// helperBucketFraction returns one bucket's remaining fraction, so a test can
+// assert WHICH reading was persisted rather than only that one was.
+func helperBucketFraction(t *testing.T, snap antigravityQuotaSnapshot, bucketID string) float64 {
+	t.Helper()
+	for _, b := range snap.Buckets {
+		if b.BucketID == bucketID {
+			return b.RemainingFraction
+		}
+	}
+	t.Fatalf("bucket %q missing from snapshot %+v", bucketID, snap)
+	return 0
+}
+
+// The tail window is cheap reads of an ALREADY-KNOWN port. A run that never
+// found a server must not start scanning logs at the very moment it is being
+// torn down — that is the expensive half of a probe, paid on the teardown path,
+// for a server that by construction is not there.
+func TestAntigravityQuotaCapture_TailProbeNeverRediscovers(t *testing.T) {
+	_, cache := helperIsolateAntigravityCapture(t, "1h")
+	t.Setenv(antigravityCaptureTailEnv, "3s")
+	// No server, and no log advertising one: the arm-time probe finds nothing
+	// and no port is ever memoized.
+
+	finish := startAntigravityQuotaCapture("no-server run")
+	released := time.Now()
+	helperStopCapture(t, finish)
+
+	if elapsed := time.Since(released); elapsed > 2*time.Second {
+		t.Errorf("release took %s — the tail ran despite there being no memoized port", elapsed)
+	}
+	if got := antigravityCaptureTailProbes.Load(); got != 0 {
+		t.Errorf("tailProbes=%d, want 0 with no memoized port", got)
+	}
+	if _, err := os.Stat(cache); err == nil {
+		t.Error("a snapshot was written with no server up")
+	}
+}
+
+// Every spawn site arms through armAntigravityCaptureForCommand rather than
+// pairing its own classifier check with startAntigravityQuotaCapture. A command
+// that never starts `agy` must arm nothing, and releasing that no-op must be
+// safe — a site that has to remember a nil check is a site that will forget one.
+func TestArmAntigravityCaptureForCommand_NoOpForOtherCommands(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+
+	// Capture state is process-global, so an earlier test's finished poller may
+	// still be the retained handle. Only a CHANGE means a poller was started.
+	before := antigravityCaptureStopped()
+	release := armAntigravityCaptureForCommand("test", "git", []string{"status"})
+	if got := antigravityCaptureArms.Load(); got != 0 {
+		t.Errorf("arms=%d, want 0 for a command that never spawns agy", got)
+	}
+	if antigravityCaptureStopped() != before {
+		t.Error("a poller was started for a non-agy command")
+	}
+	release()
+	release() // idempotent, like the real release
+	if got := antigravityCaptureFinishes.Load(); got != 0 {
+		t.Errorf("finishes=%d, want 0 — nothing was armed", got)
+	}
+}
+
+// The matching half of the same contract: a wrapped Windows payload arms
+// exactly once and releases exactly once.
+func TestArmAntigravityCaptureForCommand_ArmsWrappedAgyOnce(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+
+	release := armAntigravityCaptureForCommand("test", "powershell.exe", []string{
+		"-NoProfile", "-NonInteractive", "-EncodedCommand",
+		encodeForPowerShell(`Set-Location C:\tmp; & 'C:\t\agy.cmd' -p "hi"`),
+	})
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Fatalf("arms=%d, want exactly one for a wrapped agy payload", got)
+	}
+	helperStopCapture(t, release)
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want exactly one", got)
 	}
 }
