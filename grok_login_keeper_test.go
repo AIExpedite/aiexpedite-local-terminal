@@ -708,3 +708,102 @@ func TestReplaceGrokAuthFile_WaitsOutTheCLIsOwnLock(t *testing.T) {
 		t.Errorf("copy holds %q, want the replacement once the lock was free", got)
 	}
 }
+
+// TestSetupIsolatedGrokHome_SeedsTheCopyUnderTheLoginLock: creating a copy
+// waits for a renewal in flight — registration and the credential copy are
+// one step under the login lock — so the child never starts on a credential
+// the renewal is about to supersede, and no renewal can reconcile past a
+// registered-but-empty home.
+func TestSetupIsolatedGrokHome_SeedsTheCopyUnderTheLoginLock(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "before-renewal", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	type result struct {
+		home string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		home, err := setupIsolatedGrokSmokeHomeFrom(real)
+		done <- result{home, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("copy seeded while a renewal held the login (home=%q err=%v)", r.home, r.err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// What the renewal does before it releases: rotates the real credential.
+	writeGrokAuthMinted(t, real, "after-renewal", "dan@example.com", now, now.Add(6*time.Hour))
+	release()
+
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("copy never seeded after the renewal released the login")
+	}
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(r.home) })
+	if got := grokKeyIn(t, r.home); got != "after-renewal" {
+		t.Errorf("copy holds %q, want the credential as renewed", got)
+	}
+}
+
+// TestSetupIsolatedGrokHome_GivesUpOnAStuckRenewal: a lock held past the seed
+// wait is a stuck renewal; the home is not created beside it.
+func TestSetupIsolatedGrokHome_GivesUpOnAStuckRenewal(t *testing.T) {
+	real := isolateGrok(t)
+	writeGrokAuth(t, real, "k", "dan@example.com", time.Now().Add(time.Hour))
+	prev := grokLoginSeedWait
+	grokLoginSeedWait = 150 * time.Millisecond
+	t.Cleanup(func() { grokLoginSeedWait = prev })
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	defer release()
+	registeredBefore := len(grokLogin.liveCopies())
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err == nil {
+		_ = removeIsolatedGrokHome(home)
+		t.Fatal("isolated home created beside a renewal that never released")
+	}
+	if got := len(grokLogin.liveCopies()); got != registeredBefore {
+		t.Errorf("registered copies %d -> %d: a home that was never created stayed registered", registeredBefore, got)
+	}
+}
+
+// TestReconcileGrokLogin_DoesNotRecreateARealHomeSignedOutUnderTheSnapshot:
+// the snapshot chose a live copy as newest; then, before the write, the real
+// credential vanished (`grok logout`). The under-lock check must abort, not
+// treat the missing file as writable.
+func TestReconcileGrokLogin_DoesNotRecreateARealHomeSignedOutUnderTheSnapshot(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-new", "dan@example.com", now, now.Add(6*time.Hour))
+	newest, ok := readGrokCredentialStamp(copyHome)
+	if !ok {
+		t.Fatal("copy stamp unreadable")
+	}
+	if err := os.Remove(filepath.Join(real, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceGrokAuthFileIfOlder(real, newest); err == nil {
+		t.Fatal("a real home signed out under the snapshot was recreated")
+	}
+	if _, err := os.Stat(filepath.Join(real, "auth.json")); !os.IsNotExist(err) {
+		t.Error("auth.json recreated after logout")
+	}
+	if _, err := os.Stat(filepath.Join(real, "auth.json.aix-tmp")); !os.IsNotExist(err) {
+		t.Error("staging file left behind")
+	}
+}

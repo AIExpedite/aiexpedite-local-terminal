@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -70,26 +71,14 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
 	}
-	// Registered before the auth file is read, so this home never copies a
-	// login a renewal is mid-way through rotating (see grokLoginGuard). Every
-	// removal path releases it.
-	grokLogin.acquireCopy(dir)
-
-	// Copy the auth file under the first name that exists. Best-effort: a
-	// missing/unreadable source is tolerated (grok surfaces the auth error
-	// through the normal ACP flow).
-	if srcBase != "" {
-		for _, name := range []string{"auth.json", "cached_token.json"} {
-			src := filepath.Join(srcBase, name)
-			data, rerr := os.ReadFile(src)
-			if rerr != nil {
-				continue
-			}
-			if werr := os.WriteFile(filepath.Join(dir, name), data, 0o600); werr != nil {
-				cleanupErr := removeIsolatedGrokHome(dir)
-				return "", errors.Join(fmt.Errorf("copy grok auth file %s: %w", name, werr), cleanupErr)
-			}
-		}
+	// Registration and the credential copy happen under the login lock, as
+	// one step: a renewal (the keeper's or the live probe's) can then neither
+	// rotate the login between the source read and the destination write,
+	// nor reconcile past a home that is registered but not yet seeded — either
+	// would launch this child on a credential the rotation just superseded.
+	// Every removal path releases the registration.
+	if err := seedIsolatedGrokLogin(dir, srcBase); err != nil {
+		return "", err
 	}
 	if lerr := seedGrokManagedBillingIdentity(dir); lerr != nil {
 		fmt.Printf("%s[grok-acp] managed billing identity not seeded (usage freshness may be unavailable): %v%s\n",
@@ -141,6 +130,42 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 	}
 
 	return dir, nil
+}
+
+// grokLoginSeedWait bounds how long creating an isolated home waits for the
+// login lock. Longer than a whole CLI renewal, which is the longest anything
+// holds it; a lock held past that is a stuck renewal, and the home is then
+// not created rather than seeded beside it.
+var grokLoginSeedWait = grokLoginRenewTimeout + 5*time.Second
+
+// seedIsolatedGrokLogin registers dir as a copy of the login and copies the
+// credential into it, under the login lock. A missing/unreadable source is
+// tolerated (grok surfaces the auth error through the normal ACP flow); the
+// dir is removed on a write failure or when the lock never came free.
+func seedIsolatedGrokLogin(dir, srcBase string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), grokLoginSeedWait)
+	defer cancel()
+	release, ok := grokLogin.beginRenewal(ctx)
+	if !ok {
+		_ = os.RemoveAll(dir)
+		return fmt.Errorf("create isolated grok home: the login was busy renewing for %s", grokLoginSeedWait)
+	}
+	defer release()
+	grokLogin.registerCopyHeld(dir)
+	if srcBase == "" {
+		return nil
+	}
+	for _, name := range []string{"auth.json", "cached_token.json"} {
+		data, rerr := os.ReadFile(filepath.Join(srcBase, name))
+		if rerr != nil {
+			continue
+		}
+		if werr := os.WriteFile(filepath.Join(dir, name), data, 0o600); werr != nil {
+			grokLogin.releaseCopy(dir)
+			return errors.Join(fmt.Errorf("copy grok auth file %s: %w", name, werr), os.RemoveAll(dir))
+		}
+	}
+	return nil
 }
 
 // removeIsolatedGrokHome unlinks the persistent sessions store before

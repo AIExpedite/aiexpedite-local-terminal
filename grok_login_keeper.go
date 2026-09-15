@@ -167,10 +167,19 @@ const grokAuthLockPoll = 25 * time.Millisecond
 // replacement must not race, so skipping is the point.
 var errGrokAuthLocked = errors.New("grok auth.json.lock held by the CLI")
 
+// errGrokDestinationGone: the destination's credential disappeared between
+// the snapshot and the write (a logout, a teardown). Nothing is written.
+var errGrokDestinationGone = errors.New("grok login destination signed out since the snapshot")
+
 // errGrokCopyMovedOn: the destination changed under the snapshot — its own
 // child refreshed it — and now holds a credential at least as new as the one
 // about to be written. Nothing is written; the next pass re-reads it.
 var errGrokCopyMovedOn = errors.New("grok login copy refreshed itself since the snapshot")
+
+// errGrokDestGone: the destination had a credential when the snapshot was
+// taken and no longer does. For the real home that is `grok logout` (or the
+// CLI signing the home out) and must not be undone by writing a copy back.
+var errGrokDestGone = errors.New("grok login destination disappeared since the snapshot")
 
 // acquireGrokAuthLock takes the CLI's exclusive lock beside dstHome's
 // auth.json, waiting at most grokAuthLockWait. The lock is released when the
@@ -252,7 +261,15 @@ func replaceGrokAuthFileWhen(dstHome, srcHome string, check func() error) error 
 // a child mid-write holds the lock, so the keeper waits for it or skips.
 func replaceGrokAuthFileIfOlder(dstHome string, newest grokCredentialStamp) error {
 	return replaceGrokAuthFileWhen(dstHome, newest.Home, func() error {
-		if current, ok := readGrokCredentialStamp(dstHome); ok && !current.MintedAt.Before(newest.MintedAt) {
+		current, ok := readGrokCredentialStamp(dstHome)
+		if !ok {
+			// The snapshot saw a credential here and now there is none: the
+			// user ran `grok logout` on the real home, or a copy is being
+			// torn down. Neither is ours to reverse — a replacement here
+			// would recreate a login the user just removed.
+			return errGrokDestinationGone
+		}
+		if !current.MintedAt.Before(newest.MintedAt) {
 			return errGrokCopyMovedOn
 		}
 		return nil

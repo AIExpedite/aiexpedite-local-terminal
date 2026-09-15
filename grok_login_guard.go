@@ -25,11 +25,17 @@ import (
 // died.
 //
 // Copies are registered when an isolated home is created — before the auth file
-// is read — and released when it is removed.
+// is read — and released when it is removed. Registration holds a seed
+// exclusion until that snapshot is on disk, so a renewal cannot rotate the
+// real home under the copy and leave the new session on the superseded
+// credential.
 type grokLoginGuard struct {
 	mu       sync.Mutex
 	copies   map[string]struct{}
 	renewing bool
+	// seeding is how many copies are currently reading the real home and
+	// writing the snapshot. Renewals wait this out.
+	seeding int
 	// changed is closed (and replaced) on every state change, waking waiters.
 	changed chan struct{}
 }
@@ -42,16 +48,57 @@ func (g *grokLoginGuard) broadcastLocked() {
 }
 
 // acquireCopy registers an isolated home as holding a copy of the login,
-// waiting out a renewal in flight (bounded by grokLoginRenewTimeout).
+// waiting out a renewal in flight (bounded by grokLoginRenewTimeout). The
+// copy is assumed already seeded; setupIsolatedGrokHome uses beginCopy so
+// renewals also wait out the snapshot write.
 func (g *grokLoginGuard) acquireCopy(home string) {
-	key := filepath.Clean(home)
 	g.mu.Lock()
+	g.acquireCopyLocked(home)
+	g.mu.Unlock()
+}
+
+func (g *grokLoginGuard) acquireCopyLocked(home string) {
+	key := filepath.Clean(home)
 	for g.renewing {
 		wait := g.changed
 		g.mu.Unlock()
 		<-wait
 		g.mu.Lock()
 	}
+	g.copies[key] = struct{}{}
+}
+
+// beginCopy is acquireCopy plus a seed exclusion: the returned function
+// must be called once the snapshot is on disk (or the home is abandoned).
+// Renewals wait for that call, so they cannot rotate under a read that has
+// not yet been written.
+func (g *grokLoginGuard) beginCopy(home string) func() {
+	g.mu.Lock()
+	g.acquireCopyLocked(home)
+	g.seeding++
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			if g.seeding > 0 {
+				g.seeding--
+			}
+			g.broadcastLocked()
+			g.mu.Unlock()
+		})
+	}
+}
+
+// registerCopyHeld registers an isolated home from a caller that already holds
+// the login exclusively (beginRenewal): seeding a copy happens under that
+// lock, so a renewal can neither slip between the source read and the
+// destination write nor reconcile past a home that is registered but still
+// empty. acquireCopy would deadlock here — it waits for the very lock the
+// caller holds.
+func (g *grokLoginGuard) registerCopyHeld(home string) {
+	key := filepath.Clean(home)
+	g.mu.Lock()
 	g.copies[key] = struct{}{}
 	g.mu.Unlock()
 }
@@ -72,15 +119,16 @@ func (g *grokLoginGuard) releaseCopy(home string) {
 	g.broadcastLocked()
 }
 
-// beginRenewal waits until no other renewal runs, then holds the login
-// exclusively until the returned release is called. It gives up when ctx ends
-// first: two renewals of one refresh token minutes apart sign the loser out,
-// so a renewal that cannot take the turn is skipped, never forced.
+// beginRenewal waits until no other renewal runs and no copy is still being
+// seeded, then holds the login exclusively until the returned release is
+// called. It gives up when ctx ends first: two renewals of one refresh token
+// minutes apart sign the loser out, so a renewal that cannot take the turn
+// is skipped, never forced.
 func (g *grokLoginGuard) beginRenewal(ctx context.Context) (func(), bool) {
 	g.mu.Lock()
 	for {
 		g.pruneRemovedLocked()
-		if !g.renewing {
+		if !g.renewing && g.seeding == 0 {
 			break
 		}
 		wait := g.changed
