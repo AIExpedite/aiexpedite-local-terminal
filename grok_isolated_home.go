@@ -155,6 +155,11 @@ func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) er
 		return nil
 	}
 	defer grokLogin.releaseCopy(home)
+	// The copy may hold the account's newest credential — a `grok models`
+	// discovery that refreshed and is being removed seconds later never lives
+	// to see a keeper tick. Reconcile while it is still registered, so its
+	// renewal reaches the real home before the file is deleted.
+	reconcileGrokLogin(grokPersistentHome())
 
 	link := filepath.Join(home, grokSessionsDirName)
 	if err := unlink(link); err != nil {

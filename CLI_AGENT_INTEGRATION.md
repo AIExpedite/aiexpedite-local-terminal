@@ -690,6 +690,11 @@ account wins everywhere.**
   BACK to the real home within one tick, inside the grace window; a renewed
   real home is fanned OUT to the copies, which hot-reload it. Copies of another
   account are never mixed in.
+  Removing an isolated home reconciles first, so a short `grok models` run
+  that refreshed hands its credential back before the file dies; and the tick
+  reconciles BEFORE judging the real home, so a copy's newer credential is
+  written back rather than the superseded real one being renewed. Renewal and
+  reconciliation run under one login lock.
 - `grokLoginGuard` still serializes renewals (two rotations minutes apart sign
   the loser out) and still keeps a copy from being taken mid-renewal, but a
   live copy no longer blocks a renewal: it receives the result instead.

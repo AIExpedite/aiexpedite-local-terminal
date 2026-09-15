@@ -390,3 +390,57 @@ func TestGrokLoginKeeperOnce_WaitsOutAnotherRenewalRatherThanReconcilingBesideIt
 		t.Errorf("real home holds %q once the lock was free, want the copy's newer credential", got)
 	}
 }
+
+// TestRemoveIsolatedGrokHome_WritesItsRenewalBackBeforeTheFileDies: a short
+// isolated run (`grok models` discovery) that refreshed its copy is removed
+// seconds later, long before the next keeper tick. The removal itself must
+// hand the renewed credential to the real home, or it dies with the copy and
+// the real home is left with the superseded refresh token.
+func TestRemoveIsolatedGrokHome_WritesItsRenewalBackBeforeTheFileDies(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the CLI did inside the copy: rotated the credential.
+	writeGrokAuthMinted(t, home, "copy-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+
+	if err := removeIsolatedGrokHome(home); err != nil {
+		t.Fatal(err)
+	}
+	if got := grokKeyIn(t, real); got != "copy-renewed" {
+		t.Errorf("real home holds %q after the copy was removed, want the copy's renewed credential", got)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Error("isolated home not removed")
+	}
+}
+
+// TestGrokLoginKeeperOnce_ReconcilesACopysRenewalBeforeRenewingTheRealHome: the
+// real home is inside the keep-ahead window but a live copy already holds a
+// newer credential. Renewing the real home first would redeem a refresh token
+// the copy superseded — and past the grace window the CLI would sign the real
+// home out. The tick writes the copy back first and then has nothing to renew.
+func TestGrokLoginKeeperOnce_ReconcilesACopysRenewalBeforeRenewingTheRealHome(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-stale", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-fresh", "dan@example.com", now.Add(-time.Minute), now.Add(6*time.Hour))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+	runGrokLoginRenewal = func(context.Context, string, string) {
+		t.Error("renewed the stale real home instead of taking the copy's newer credential")
+	}
+
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("tick renewed")
+	}
+	if got := grokKeyIn(t, real); got != "copy-fresh" {
+		t.Errorf("real home holds %q, want the copy's fresher credential", got)
+	}
+}

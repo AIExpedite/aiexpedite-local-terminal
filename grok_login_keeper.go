@@ -279,6 +279,14 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 	}
 	defer release()
 
+	// Reconcile BEFORE judging the real home: a live copy may already hold
+	// the account's newer credential (it refreshed on its own), and renewing
+	// a real home whose refresh token that copy superseded — past the grace
+	// window, after a pause — would make the CLI sign the real home out and
+	// lose the copy's credential with it. Written back first, the real home
+	// is judged on the newest credential the account has.
+	reconcileGrokLoginLocked(base)
+
 	renewed := false
 	if stamp, ok := readGrokCredentialStamp(base); ok && stamp.Refreshable && !stamp.ExpiresAt.IsZero() &&
 		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) {
