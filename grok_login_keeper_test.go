@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -487,6 +488,43 @@ func TestProbeGrokBillingLive_RenewsTheCopysNewerChainNotTheSupersededRealOne(t 
 	}
 }
 
+// TestProbeGrokBillingLive_401OnAFreshCopyStillRenewsThatCopyChain: the copy's
+// access token is timestamp-fresh (so the first request uses it) but xAI
+// returns 401. Reconciling that copy back is not enough — its refresh chain
+// still has to be rotated — so the probe must run the CLI renewal against the
+// copy's credential, not skip it just because expires_at is in the future.
+func TestProbeGrokBillingLive_401OnAFreshCopyStillRenewsThatCopyChain(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, home, "real-superseded", "a@example.com", now.Add(-6*time.Hour), now.Add(5*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-newer", "a@example.com", now.Add(-time.Minute), now.Add(6*time.Hour))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	heldAtRenewal := ""
+	runGrokLoginRenewal = func(_ context.Context, _, base string) {
+		heldAtRenewal = grokKeyIn(t, base)
+		writeGrokAuthMinted(t, base, "renewed", "a@example.com", now, now.Add(6*time.Hour))
+	}
+	calls := grokBillingServer(t, func(auth string) (int, string) {
+		if auth != "Bearer renewed" {
+			return 401, `{}`
+		}
+		return 200, grokFixtureBody(now.Add(72 * time.Hour))
+	})
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome=%q, want ok after rotating the copy's 401'd chain", got)
+	}
+	if heldAtRenewal != "copy-newer" {
+		t.Errorf("real home held %q when the renewal ran, want the copy's newer credential", heldAtRenewal)
+	}
+	if *calls < 2 {
+		t.Errorf("requests=%d, want the 401 then the renewed token", *calls)
+	}
+}
+
 // TestRemoveIsolatedGrokHome_KeepsTheCopyUntilItsCredentialIsWrittenBack: a
 // removal that cannot reconcile because a renewal holds the login for longer
 // than it waits must NOT delete the copy — files or registration — and must
@@ -541,5 +579,50 @@ func TestRemoveIsolatedGrokHome_KeepsTheCopyUntilItsCredentialIsWrittenBack(t *t
 	}
 	if got := grokKeyIn(t, real); got != "copy-renewed" {
 		t.Errorf("real home holds %q, want the copy's credential written back by the retry", got)
+	}
+}
+
+// TestRemoveIsolatedGrokHome_NeverDeletesWhileTheLoginLockStaysHeld: even after
+// every retry has fired, a copy whose credential was never written back must
+// still be on disk and still registered — a stuck renewal is not a reason to
+// throw away the only live refresh token.
+func TestRemoveIsolatedGrokHome_NeverDeletesWhileTheLoginLockStaysHeld(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, home, "copy-renewed", "dan@example.com", now, now.Add(6*time.Hour))
+
+	prevWait := grokLoginRemovalReconcileWait
+	grokLoginRemovalReconcileWait = 20 * time.Millisecond
+	t.Cleanup(func() { grokLoginRemovalReconcileWait = prevWait })
+
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	t.Cleanup(release)
+
+	if err := removeIsolatedGrokHome(home); err == nil || !errors.Is(err, errGrokLoginBusy) {
+		t.Fatalf("removal err=%v, want errGrokLoginBusy", err)
+	}
+	time.Sleep(grokLoginRemovalReconcileWait*time.Duration(grokLoginRemovalRetries+2) + 200*time.Millisecond)
+	if _, err := os.Stat(filepath.Join(home, "auth.json")); err != nil {
+		t.Fatal("the copy was deleted after retries while the lock was still held")
+	}
+	if got := grokKeyIn(t, real); got != "real-old" {
+		t.Errorf("real home rewritten to %q while the lock was held elsewhere", got)
+	}
+	registered := false
+	for _, live := range grokLogin.liveCopies() {
+		if live == filepath.Clean(home) {
+			registered = true
+		}
+	}
+	if !registered {
+		t.Fatal("the copy was unregistered while still the only live credential")
 	}
 }

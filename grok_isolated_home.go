@@ -160,9 +160,9 @@ func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) er
 // scheduled and the copy stays registered until then.
 var errGrokLoginBusy = errors.New("grok login copy not reconciled yet: renewal in flight")
 
-// grokLoginRemovalRetries bounds how many times a removal defers to a renewal
-// in flight before it proceeds regardless (a lock held that long is a stuck
-// renewal, and a leaked credential copy is then the lesser problem).
+// grokLoginRemovalRetries bounds how many times a removal retries after a
+// renewal in flight; past that the copy is still kept (files and registration)
+// rather than deleted with a credential nothing else holds.
 const grokLoginRemovalRetries = 3
 
 func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attempt int) error {
@@ -176,12 +176,14 @@ func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attem
 	// outlasts a whole CLI renewal; when even that is not enough, the copy is
 	// kept — files and registration — and the removal retries later, rather
 	// than deleting a credential nothing else holds.
-	if _, ok := reconcileGrokLoginWithin(grokPersistentHome(), grokLoginRemovalReconcileWait); !ok && attempt < grokLoginRemovalRetries {
+	if _, ok := reconcileGrokLoginWithin(grokPersistentHome(), grokLoginRemovalReconcileWait); !ok {
 		fmt.Printf("%s[grok-acp] isolated home kept for now (attempt %d): its login copy could not be reconciled while a renewal ran%s\n",
 			colorYellow, attempt+1, colorReset)
-		time.AfterFunc(grokLoginRemovalReconcileWait, func() {
-			_ = removeIsolatedGrokHomeAttempt(home, unlink, attempt+1)
-		})
+		if attempt < grokLoginRemovalRetries {
+			time.AfterFunc(grokLoginRemovalReconcileWait, func() {
+				_ = removeIsolatedGrokHomeAttempt(home, unlink, attempt+1)
+			})
+		}
 		return errGrokLoginBusy
 	}
 	defer grokLogin.releaseCopy(home)
