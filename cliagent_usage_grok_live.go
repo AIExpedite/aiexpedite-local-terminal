@@ -28,6 +28,17 @@
 //     access token has expired (or xAI answers 401/403), `grok models` runs once
 //     against the real home so GROK renews its login, and the request is retried
 //     once with whatever Grok wrote.
+//   - A renewal can only run while no isolated copy of the login is live (an
+//     ACP session, a smoke, a model discovery). Headless sessions run on such
+//     copies for hours at a time, and each one refreshes ITS copy's access
+//     token while the real home's goes stale — which is exactly the device
+//     whose card showed a 10-hour-old reading. So the probe presents the
+//     freshest unexpired token across the real home AND every live copy
+//     (reading rotates nothing), and when a renewal is the only way forward it
+//     waits at most grokLoginRenewGap for a gap rather than the whole probe
+//     budget: a probe that spends its budget waiting returns a transport error
+//     for what is really "the login is busy", and the reading it could have
+//     taken with a copy's token is never attempted.
 //   - What persists is the normalized reading only (percent, period, on-demand
 //     pool), scoped to the account fingerprint, in grok_billing_live.json.
 package main
@@ -55,6 +66,11 @@ const (
 	// grokTokenExpirySkew treats a token this close to expiry as expired, so
 	// the request is not sent with a credential that dies in flight.
 	grokTokenExpirySkew = time.Minute
+	// grokLoginRenewGap bounds how long the probe waits for every isolated
+	// copy of the login to be released before it may renew. A copy is held for
+	// the life of a CLI session, so waiting the whole probe budget would only
+	// turn "busy" into a timeout.
+	grokLoginRenewGap = 2 * time.Second
 
 	grokBillingLiveSchemaVersion = 1
 )
@@ -69,6 +85,10 @@ const (
 	grokLiveOutcomeBadResponse  = "bad_response"
 	grokLiveOutcomeNoAccount    = "no_account"
 	grokLiveOutcomeWriteFailed  = "write_failed"
+	// The only usable token was refused or expired, and a renewal could not
+	// run because a copy of the login is live. Nothing is wrong with the
+	// login; the reading is simply not takeable until that session ends.
+	grokLiveOutcomeLoginBusy = "login_busy"
 )
 
 // grokBillingLiveCache is the persisted reading. Every field is normalized;
@@ -191,6 +211,44 @@ func grokPresentedToken(base string) (token string, expiresAt time.Time, hasExpi
 	return withExpiry(token, flat.ExpiresAt)
 }
 
+// grokFreshestPresentedToken returns the token to present for base's account:
+// the real home's, or a LIVE isolated copy's when that copy holds a later
+// expiry for the same account. A copy is a byte copy of the real home's login
+// taken at session start (setupIsolatedGrokHome), and only Grok's own renewal
+// inside that session moves its expiry forward — so a copy with a later expiry
+// is the same login, renewed. Copies are read only; nothing here rotates a
+// token. Only copies whose credential names the same account as base are
+// candidates, so a session that re-logged in as someone else never lends its
+// token to this account's reading.
+func grokFreshestPresentedToken(base, fingerprint string, now time.Time) (token string, expiresAt time.Time, hasExpiry bool) {
+	token, expiresAt, hasExpiry = grokPresentedToken(base)
+	unexpired := func(exp time.Time) bool { return now.Add(grokTokenExpirySkew).Before(exp) }
+	for _, copyHome := range grokLogin.liveCopies() {
+		if copyHome == base || grokAccountFingerprintFor(copyHome) != fingerprint {
+			continue
+		}
+		ct, cexp, chas := grokPresentedToken(copyHome)
+		if ct == "" || !chas {
+			// A copy that states no expiry cannot be shown to be fresher than
+			// what the real home holds; leave it.
+			continue
+		}
+		switch {
+		case token == "":
+			token, expiresAt, hasExpiry = ct, cexp, true
+		case !hasExpiry:
+			// The real home's token states no expiry; a copy that is
+			// demonstrably unexpired outranks a credential of unknown age.
+			if unexpired(cexp) {
+				token, expiresAt, hasExpiry = ct, cexp, true
+			}
+		case cexp.After(expiresAt):
+			token, expiresAt, hasExpiry = ct, cexp, true
+		}
+	}
+	return token, expiresAt, hasExpiry
+}
+
 // grokBillingLiveClient refuses redirects and proxies, mirroring the Claude
 // usage probe: the only host this request may reach is the pinned endpoint.
 func grokBillingLiveClient() *http.Client {
@@ -254,40 +312,50 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 	client := grokBillingLiveClient()
 	defer client.CloseIdleConnections()
 
-	renewed := false
+	// renewed: a renewal was attempted (it runs at most once per probe).
+	// renewalBlocked: the one renewal could not run because a copy of the
+	// login was live for the whole gap — the distinction between "xAI refused
+	// this login" and "this login is busy".
+	renewed, renewalBlocked := false, false
 	renew := func() {
 		renewed = true
 		// Never while an isolated home holds a copy of this login (a model
 		// discovery, an ACP session, a smoke): both could redeem the same
-		// rotating refresh token and sign the user's CLI out. When no gap opens
-		// within the probe's budget the renewal is skipped and the probe
-		// reports what the stale token gets.
-		release, ok := grokLogin.beginRenewal(ctx)
+		// rotating refresh token and sign the user's CLI out. The wait for a
+		// gap is bounded by grokLoginRenewGap (and by the probe's own budget),
+		// because a copy lives as long as its session: waiting longer only
+		// converts "busy" into a timeout.
+		gapCtx, cancel := context.WithTimeout(ctx, grokLoginRenewGap)
+		defer cancel()
+		release, ok := grokLogin.beginRenewal(gapCtx)
 		if !ok {
+			renewalBlocked = true
 			return
 		}
 		defer release()
 		runGrokLoginRenewal(ctx, grokPath, base)
 	}
-	token, expiresAt, hasExpiry := grokPresentedToken(base)
+	token, expiresAt, hasExpiry := grokFreshestPresentedToken(base, fingerprint, now())
 	if token == "" {
 		return grokLiveOutcomeNoLogin
 	}
 	if hasExpiry && !now().Add(grokTokenExpirySkew).Before(expiresAt) {
 		renew()
-		if token, _, _ = grokPresentedToken(base); token == "" {
+		if token, _, _ = grokFreshestPresentedToken(base, fingerprint, now()); token == "" {
 			return grokLiveOutcomeNoLogin
 		}
 	}
 	config, err := fetchGrokBillingLive(ctx, client, token)
 	if errors.Is(err, errGrokBillingUnauthorized) && !renewed {
 		renew()
-		if token, _, _ = grokPresentedToken(base); token == "" {
+		if token, _, _ = grokFreshestPresentedToken(base, fingerprint, now()); token == "" {
 			return grokLiveOutcomeNoLogin
 		}
 		config, err = fetchGrokBillingLive(ctx, client, token)
 	}
 	switch {
+	case errors.Is(err, errGrokBillingUnauthorized) && renewalBlocked:
+		return grokLiveOutcomeLoginBusy
 	case errors.Is(err, errGrokBillingUnauthorized):
 		return grokLiveOutcomeUnauthorized
 	case err != nil:

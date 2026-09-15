@@ -224,11 +224,27 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 	discoveryAttempts, captured := 0, 0
 	lastObserved := ""
 
+	// gated: the run's server refused the read. Set once; every later tick
+	// is skipped and the tail window is not paid, because the refusal is a
+	// property of the installed build (cliagent_usage_antigravity_gate.go).
+	gated := false
 	probe := func(allowDiscovery bool) {
+		if gated {
+			return
+		}
 		if allowDiscovery {
 			discoveryAttempts++
 		}
-		ok, observedAt := antigravityCaptureAttempt(client, &memoPort, allowDiscovery)
+		ok, observedAt, refused := antigravityCaptureAttempt(client, &memoPort, allowDiscovery)
+		if refused {
+			if !gated {
+				gated = true
+				noteAntigravityQuotaGate("", time.Now())
+				fmt.Printf("%s[antigravity-quota] the language server refuses loopback quota reads (CSRF-gated agy build) — capture for %s stops here; the card keeps the last reading with its true age%s\n",
+					colorYellow, label, colorReset)
+			}
+			return
+		}
 		if !ok {
 			return
 		}
@@ -248,7 +264,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 		// No memoized port means no cheap probe exists: discovery is the
 		// expensive half, and a run that never found a server must not start
 		// scanning logs at the very moment it is being torn down.
-		if memoPort > 0 {
+		if memoPort > 0 && !gated {
 			grace := antigravityCaptureTailGraceValue()
 			tailInterval := initial
 			if tailInterval > grace {
@@ -293,6 +309,12 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 			return
 		case <-timer.C:
 			probe(discoveryEnabled)
+			if gated {
+				// Nothing this run can answer differently; park until it ends.
+				<-stop
+				tailAndReport()
+				return
+			}
 			if discoveryEnabled && (discoveryAttempts >= antigravityCaptureMaxAttempts || !time.Now().Before(deadline)) {
 				discoveryEnabled = false
 				if memoPort == 0 {
@@ -317,10 +339,15 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 // antigravityCaptureAttempt performs one bounded probe and persists the reading
 // when it is attributable. Returns whether a snapshot was persisted and the
 // observation time that was written.
-func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscovery bool) (bool, string) {
+//
+// The third result reports a live server that REFUSED the read (the CSRF gate,
+// cliagent_usage_antigravity_gate.go). The port is still memoized — it IS the
+// run's server — but the caller must stop probing: no tick of this run will
+// answer differently, and each further attempt would only be another log scan.
+func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscovery bool) (persisted bool, observedAt string, gated bool) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return false, ""
+		return false, "", false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), antigravityQuotaTimeout)
@@ -328,19 +355,23 @@ func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscover
 	now := time.Now()
 
 	if *memoPort > 0 {
-		if snap, ok := fetchAntigravityQuotaOnPort(ctx, client, *memoPort, now); ok {
-			return antigravityCapturePersist(snap)
+		switch snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, *memoPort, now); outcome {
+		case antigravityFetchOK:
+			persisted, observedAt = antigravityCapturePersist(snap)
+			return persisted, observedAt, false
+		case antigravityFetchGated:
+			return false, "", true
 		}
 		if !allowDiscovery {
 			// Keep retrying the known port without scanning. A transient RPC
 			// failure after the discovery cap must not permanently stop tail
 			// capture, while a port change remains intentionally undiscovered.
-			return false, ""
+			return false, "", false
 		}
 		*memoPort = 0
 	}
 	if !allowDiscovery {
-		return false, ""
+		return false, "", false
 	}
 
 	// Bases are re-resolved on every attempt (not once at arm time) so an `agy`
@@ -349,15 +380,18 @@ func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscover
 	for _, base := range antigravityQuotaBases(home) {
 		ports, _ := discoverAntigravityHTTPPorts(base)
 		for _, port := range ports {
-			snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now)
-			if !ok {
-				continue
+			switch snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, port, now); outcome {
+			case antigravityFetchOK:
+				*memoPort = port
+				persisted, observedAt = antigravityCapturePersist(snap)
+				return persisted, observedAt, false
+			case antigravityFetchGated:
+				*memoPort = port
+				return false, "", true
 			}
-			*memoPort = port
-			return antigravityCapturePersist(snap)
 		}
 	}
-	return false, ""
+	return false, "", false
 }
 
 // antigravityCapturePersist scopes a live reading to the account the server

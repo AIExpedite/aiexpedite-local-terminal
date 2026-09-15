@@ -90,15 +90,24 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	// legacy ~/.agy run must not look invisible because the modern tree happens
 	// to hold older logs.
 	var newestLog time.Time
+	// gatedNow: a live server answered this gather with the CSRF refusal
+	// (cliagent_usage_antigravity_gate.go) — the one case where "no fresh
+	// reading" is a fact about the build rather than about timing.
+	gatedNow := false
 	for _, quotaBase := range quotaBases {
 		var baseNewestLog time.Time
-		fresh, baseNewestLog, gotFresh = fetchAntigravityQuota(quotaCtx, quotaBase, now)
+		var baseGated bool
+		fresh, baseNewestLog, gotFresh, baseGated = fetchAntigravityQuotaDetailed(quotaCtx, quotaBase, now)
+		gatedNow = gatedNow || baseGated
 		if baseNewestLog.After(newestLog) {
 			newestLog = baseNewestLog
 		}
 		if gotFresh {
 			break
 		}
+	}
+	if gatedNow {
+		noteAntigravityQuotaGate(detected.Version, now)
 	}
 	// A live reading may ONLY be published under an identity the server itself
 	// reported. settings.json can hold an account from a previous login, so
@@ -152,7 +161,26 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		}
 	}
 
-	if !gotFresh {
+	gate, gatedBuild := antigravityQuotaGateFor(detected.Version, now)
+	if gotFresh {
+		// A reading from a live server: whatever refused earlier no longer
+		// applies to this build.
+		clearAntigravityQuotaGate()
+		gatedBuild = false
+	}
+	switch {
+	case gatedBuild && antigravityGateOutranksReading(gate, snap.ObservedAt):
+		// The installed build refuses loopback reads and nothing newer has
+		// come from Google either. Say so on the card rather than striping
+		// the bars with no reason, and do not report the missed run as a
+		// capture defect — nothing could have captured it.
+		usage.Notice = antigravityGateNotice(firstNonEmpty(detected.Version, gate.Version), snap.ObservedAt)
+		usage.NoticeSeverity = "warning"
+	case gatedBuild:
+		// Gated locally, but the Code Assist route has supplied a reading
+		// since: the card shows that reading with its age, and a run not
+		// captured by the (refused) poller is not a defect to log.
+	case !gotFresh:
 		// Replaying. If the CLI's own logs show a run finished after this
 		// reading was taken, that run's quota was never captured — say so, once,
 		// so the next maintenance pass can tell an unrecognised transport from a
