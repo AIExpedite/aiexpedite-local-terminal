@@ -1119,9 +1119,13 @@ func TestMergeClaudeRateLimitCacheChecked_BoundedByQueuedInProcessWriters(t *tes
 	}
 
 	// Once the gate frees up the same merge lands, so the refusal above is a
-	// bounded wait and not a permanently closed door.
+	// bounded wait and not a permanently closed door. The follow-up runs under
+	// the real budget: the 100ms above pins the WAIT, and a loaded CI runner
+	// (windows-latest, 2026-09-15) needs longer than that for the lock file and
+	// the write themselves.
 	unlockClaudeRateLimitCache()
 	released = true
+	claudeRateLimitVerifiedPersistBudget = prevBudget
 	if _, err := mergeClaudeRateLimitCacheChecked(context.Background(), cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {
 			ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
