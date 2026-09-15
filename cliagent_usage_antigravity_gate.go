@@ -90,7 +90,7 @@ const (
 	antigravityQuotaGateEnv         = "AIEXPEDITE_AGY_QUOTA_GATE"
 	antigravityQuotaGateSchema      = 1
 	antigravityQuotaGateMaxVersion  = 64
-	antigravityQuotaGateNoticeLimit = 256
+	antigravityQuotaGateNoticeLimit = 320
 )
 
 // antigravityQuotaGate is the persisted marker. Version is the `agy` build that
@@ -113,19 +113,30 @@ func antigravityQuotaGatePath() string {
 
 // noteAntigravityQuotaGate records that the build refused. A known version
 // never gets overwritten by an unknown one: the poller's "" must not erase the
-// build the live probe identified.
+// build the live probe identified. A marker still inside its recheck window
+// keeps its ObservedAt: the refusal is one fact observed once, and readings
+// taken by another route since then (Code Assist) must stay newer than it —
+// see antigravityGateOutranksReading.
 func noteAntigravityQuotaGate(version string, now time.Time) {
 	version = clampASCII(version, antigravityQuotaGateMaxVersion)
 	antigravityQuotaGateMu.Lock()
 	defer antigravityQuotaGateMu.Unlock()
+	observedAt := now.UTC().Format(time.RFC3339)
 	var prev antigravityQuotaGate
-	if readJSONFile(antigravityQuotaGatePath(), &prev) && version == "" {
-		version = prev.Version
+	if readJSONFile(antigravityQuotaGatePath(), &prev) {
+		if version == "" {
+			version = prev.Version
+		}
+		if t, err := time.Parse(time.RFC3339, prev.ObservedAt); err == nil &&
+			now.Sub(t) <= antigravityQuotaGateRecheck && !now.Before(t) &&
+			(prev.Version == "" || prev.Version == version) {
+			observedAt = prev.ObservedAt
+		}
 	}
 	gate := antigravityQuotaGate{
 		SchemaVersion: antigravityQuotaGateSchema,
 		Version:       version,
-		ObservedAt:    now.UTC().Format(time.RFC3339),
+		ObservedAt:    observedAt,
 	}
 	body, err := json.Marshal(gate)
 	if err != nil {
@@ -165,6 +176,22 @@ func antigravityQuotaGateFor(version string, now time.Time) (antigravityQuotaGat
 	return gate, true
 }
 
+// antigravityGateOutranksReading reports whether the refusal is the newer
+// fact. A reading observed after the gate was recorded came by another route
+// (cliagent_usage_antigravity_codeassist.go), so the card shows it and not the
+// notice; with no reading, or an older one, the notice is what the user needs.
+func antigravityGateOutranksReading(gate antigravityQuotaGate, observedAt string) bool {
+	gateAt, err := time.Parse(time.RFC3339, gate.ObservedAt)
+	if err != nil {
+		return true
+	}
+	readAt, err := time.Parse(time.RFC3339, observedAt)
+	if err != nil {
+		return true
+	}
+	return !readAt.After(gateAt)
+}
+
 // antigravityGateNotice is the card banner for a gated build. lastObservedAt
 // is the cached reading's observation time ("" when there is none).
 func antigravityGateNotice(version, lastObservedAt string) string {
@@ -172,7 +199,7 @@ func antigravityGateNotice(version, lastObservedAt string) string {
 	if version != "" {
 		build += " " + version
 	}
-	notice := build + " no longer lets this computer read its quota: its language server now requires a per-run token it shares only with its own tools."
+	notice := build + " refuses local quota reads (its language server needs a per-run token it shares only with its own tools) and Google returned no reading for the stored login."
 	if t, err := time.Parse(time.RFC3339, lastObservedAt); err == nil {
 		notice += fmt.Sprintf(" Showing the last reading, taken %s.", t.UTC().Format("2006-01-02 15:04 UTC"))
 	} else {

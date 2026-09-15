@@ -742,10 +742,28 @@ receives no `ANTIGRAVITY_*` variable; an `ANTIGRAVITY_CSRF_TOKEN` set on the
 `agy` spawn is not adopted ("invalid CSRF token"); the value is composed per
 child spawn, not kept in the process environment block; and no Origin /
 Referer / Sec-Fetch variant is exempt. Workspace-level `.agents/hooks.json`
-and `.mcp.json` never load from an untrusted directory. The only remaining
-route is Google's own Code Assist quota endpoint with the OAuth token `agy`
-keeps in the OS keyring (`gemini:antigravity` in Credential Manager on
-Windows) — not implemented; see the PR that added this section.
+and `.mcp.json` never load from an untrusted directory.
+
+The server was only ever a proxy for Google's Code Assist API, and the OAuth
+token it uses is on the machine: `agy` keeps it in the OS keyring as a
+standard OAuth2 token JSON (Credential Manager `gemini:antigravity` on
+Windows, Keychain service `gemini` / account `antigravity` on macOS,
+secret-service on Linux). So a gated build is read the way the Grok and Claude
+probes read theirs — the CLI's own stored credential against the vendor's
+endpoint ([`cliagent_usage_antigravity_codeassist.go`](cliagent_usage_antigravity_codeassist.go),
+keyring readers in `antigravity_keyring_*.go`):
+`POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+with `Authorization: Bearer`, the account named by the stored `id_token` else
+Google's userinfo, persisted through the same allowlisted snapshot path under
+that account's fingerprint. Only the Refresh click runs it, only once the
+loopback route is known gated; the agent never renews the login (an expired
+token gets the click's `agy models` warm-up first — `agy` refreshes its
+keyring token on every run — then one retry; still expired is reported as
+`codeassist_token_expired`). Endpoint overrides are loopback-only, redirects
+are refused, no proxy is inherited, the refresh token is never decoded.
+Outcomes are the `codeassist_*` codes in the device log; a non-2xx status is
+logged by number so a moved request shape (400) is distinguishable from
+Google being down (5xx).
 
 What the agent does instead ([`cliagent_usage_antigravity_gate.go`](cliagent_usage_antigravity_gate.go)):
 
@@ -761,11 +779,15 @@ What the agent does instead ([`cliagent_usage_antigravity_gate.go`](cliagent_usa
   spawn no `agy` at all (outcome `gated`). The marker is per build — an
   `agy` update is tried the first time it is seen — and expires after
   `antigravityQuotaGateRecheck` (24 h); a successful reading clears it.
-- **The card says why.** The parser keeps the last snapshot with its original
-  `observedAt` and sets `notice` / `noticeSeverity: warning` naming the build
-  and that reading's date, instead of striped bars with no explanation. The
-  "a run completed after the last observation" log line is suppressed while
-  the build is gated — nothing could have captured it.
+- **The card says why, only while it has to.** The parser keeps the last
+  snapshot with its original `observedAt`; while no reading newer than the
+  gate marker exists it sets `notice` / `noticeSeverity: warning` naming the
+  build and that reading's date, instead of striped bars with no explanation.
+  A reading the Code Assist route took after the refusal outranks the marker
+  (`antigravityGateOutranksReading`; the poller re-noting the same refusal
+  keeps the marker's first `observedAt`). The "a run completed after the last
+  observation" log line is suppressed while the build is gated — nothing could
+  have captured it.
 
 # Live usage probe — the Refresh click on the CLI Agents card
 

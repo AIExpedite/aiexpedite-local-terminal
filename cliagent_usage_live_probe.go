@@ -505,19 +505,38 @@ func antigravityHTTPPortInPIDBlock(body []byte, pid string) (port int, found boo
 // (cliagent_usage_antigravity_gate.go): a click then costs no model turn and
 // no 20 s wait for a reading the build will not give. A refusal met now is
 // recorded under the build that gave it; a reading clears the record.
+//
+// A gated build is read from Google instead
+// (cliagent_usage_antigravity_codeassist.go), with the login `agy` keeps in the
+// OS keyring; the outcome reported for the click is then that route's.
 func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLIAgent, home string) string {
 	now := time.Now()
 	if gate, ok := antigravityQuotaGateFor(agent.Version, now); ok {
-		fmt.Printf("%s[cli-usage] Antigravity quota probe skipped: build %s refused loopback quota reads at %s (retried after %s)%s\n",
+		fmt.Printf("%s[cli-usage] Antigravity loopback quota probe skipped: build %s refused it at %s (retried after %s); reading from Google with the stored login%s\n",
 			colorYellow, firstNonEmpty(agent.Version, gate.Version, "unknown"), gate.ObservedAt, antigravityQuotaGateRecheck, colorReset)
-		return liveProbeOutcomeGated
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
 	}
 	outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
 	switch outcome {
 	case liveProbeOutcomeGated:
 		noteAntigravityQuotaGate(agent.Version, now)
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
 	case liveProbeOutcomeOK:
 		clearAntigravityQuotaGate()
+	}
+	return outcome
+}
+
+// probeAntigravityQuotaViaCodeAssist runs the Code Assist read. The agent
+// never renews the stored login itself; when the token has expired it runs the
+// click's `agy models` warm-up first — `agy` refreshes its keyring token on
+// every run — and tries once more. (The warm-up is cached for the click, so
+// the caller's later warm is a no-op.)
+func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
+	outcome := probeAntigravityQuotaCodeAssistFn(ctx, time.Now)
+	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
+		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
+		outcome = probeAntigravityQuotaCodeAssistFn(ctx, time.Now)
 	}
 	return outcome
 }

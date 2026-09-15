@@ -510,9 +510,11 @@ func stubLiveProbes(t *testing.T) *int32 {
 	t.Helper()
 	var calls int32
 	origCodex, origAgy, origGrok, origWarm, origDetect := probeCodexRateLimitsLiveFn, probeAntigravityQuotaLiveFn, probeGrokBillingLiveFn, warmCLIAgentModelDiscoveryFn, liveProbeDetectedAgents
+	origCodeAssist := probeAntigravityQuotaCodeAssistFn
 	t.Cleanup(func() {
 		probeCodexRateLimitsLiveFn, probeAntigravityQuotaLiveFn, probeGrokBillingLiveFn = origCodex, origAgy, origGrok
 		warmCLIAgentModelDiscoveryFn, liveProbeDetectedAgents = origWarm, origDetect
+		probeAntigravityQuotaCodeAssistFn = origCodeAssist
 		cliUsageLiveProbeMu.Lock()
 		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
 		cliUsageLiveProbeMu.Unlock()
@@ -533,6 +535,8 @@ func stubLiveProbes(t *testing.T) *int32 {
 	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeTimeout }
 	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string { slow(); panic("boom") }
 	warmCLIAgentModelDiscoveryFn = func(context.Context, string, detectedCLIAgent, string) {}
+	// The Code Assist route must never touch the machine's keyring from a test.
+	probeAntigravityQuotaCodeAssistFn = func(context.Context, func() time.Time) string { return liveProbeOutcomeCodeAssistNoLogin }
 	return &calls
 }
 

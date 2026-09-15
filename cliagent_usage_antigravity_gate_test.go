@@ -152,8 +152,9 @@ func TestRunCLIUsageLiveProbes_GatedBuildSkipsTheSpawn(t *testing.T) {
 		cliUsageLiveProbeMu.Unlock()
 	}
 
-	if out := runCLIUsageLiveProbes(context.Background()); out["antigravity"] != liveProbeOutcomeGated {
-		t.Fatalf("first click: antigravity=%q, want gated", out["antigravity"])
+	// A gated click reports the Code Assist route's outcome (stubbed here).
+	if out := runCLIUsageLiveProbes(context.Background()); out["antigravity"] != liveProbeOutcomeCodeAssistNoLogin {
+		t.Fatalf("first click: antigravity=%q, want the Code Assist outcome", out["antigravity"])
 	}
 	if atomic.LoadInt32(&agyCalls) != 1 {
 		t.Fatalf("first click must probe once, got %d", agyCalls)
@@ -163,8 +164,8 @@ func TestRunCLIUsageLiveProbes_GatedBuildSkipsTheSpawn(t *testing.T) {
 	}
 
 	resetCooldown()
-	if out := runCLIUsageLiveProbes(context.Background()); out["antigravity"] != liveProbeOutcomeGated {
-		t.Fatalf("second click: antigravity=%q, want gated", out["antigravity"])
+	if out := runCLIUsageLiveProbes(context.Background()); out["antigravity"] != liveProbeOutcomeCodeAssistNoLogin {
+		t.Fatalf("second click: antigravity=%q, want the Code Assist outcome", out["antigravity"])
 	}
 	if atomic.LoadInt32(&agyCalls) != 1 {
 		t.Errorf("second click on a gated build spawned agy again (calls=%d)", agyCalls)

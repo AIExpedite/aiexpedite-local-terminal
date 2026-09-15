@@ -459,19 +459,7 @@ func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port 
 func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client, port int, now time.Time) (antigravityQuotaSnapshot, antigravityFetchOutcome) {
 	var quota struct {
 		Response struct {
-			Groups []struct {
-				DisplayName string `json:"displayName"`
-				Buckets     []struct {
-					BucketID    string `json:"bucketId"`
-					DisplayName string `json:"displayName"`
-					Window      string `json:"window"`
-					// Pointer so an absent or null fraction is distinguishable
-					// from a real 0 — decoded into a plain float64 it would
-					// silently become "100% consumed".
-					RemainingFraction *float64 `json:"remainingFraction"`
-					ResetTime         string   `json:"resetTime"`
-				} `json:"buckets"`
-			} `json:"groups"`
+			Groups []antigravityQuotaGroupWire `json:"groups"`
 		} `json:"response"`
 	}
 	switch antigravityPostJSONOutcome(ctx, client, port, antigravityQuotaRPC, &quota) {
@@ -480,9 +468,56 @@ func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client
 	case antigravityRPCFailed:
 		return antigravityQuotaSnapshot{}, antigravityFetchFailed
 	}
+	snap, ok := antigravitySnapshotFromGroups(quota.Response.Groups, now)
+	if !ok {
+		return antigravityQuotaSnapshot{}, antigravityFetchFailed
+	}
+	// Identity comes from the same server, on the same port, in the same
+	// probe — so the quota and the account it belongs to can never be
+	// stitched together from two different signed-in sessions.
+	var status struct {
+		UserStatus struct {
+			Name       string `json:"name"`
+			Email      string `json:"email"`
+			PlanStatus struct {
+				PlanInfo struct {
+					PlanName string `json:"planName"`
+				} `json:"planInfo"`
+			} `json:"planStatus"`
+		} `json:"userStatus"`
+	}
+	if antigravityPostJSON(ctx, client, port, antigravityStatusRPC, &status) {
+		snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
+		snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
+	}
+	return snap, antigravityFetchOK
+}
+
+// antigravityQuotaGroupWire is one QuotaSummary group as both the loopback
+// server and Google's Code Assist API spell it.
+type antigravityQuotaGroupWire struct {
+	DisplayName string `json:"displayName"`
+	Buckets     []struct {
+		BucketID    string `json:"bucketId"`
+		DisplayName string `json:"displayName"`
+		Window      string `json:"window"`
+		// Pointer so an absent or null fraction is distinguishable from a
+		// real 0 — decoded into a plain float64 it would silently become
+		// "100% consumed".
+		RemainingFraction *float64 `json:"remainingFraction"`
+		ResetTime         string   `json:"resetTime"`
+	} `json:"buckets"`
+}
+
+// antigravitySnapshotFromGroups turns a QuotaSummary into the persisted
+// snapshot shape. ok is false when nothing in it can be plotted: a response we
+// cannot plot is not an observation, and counting raw buckets would let a
+// schema change pass as success and overwrite the last usable cached reading
+// with rows that all render Unknown.
+func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time) (antigravityQuotaSnapshot, bool) {
 	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
 	plottable := 0
-	for _, group := range quota.Response.Groups {
+	for _, group := range groups {
 		for _, bucket := range group.Buckets {
 			// A bucket with no usable fraction is not a reading. Keeping it
 			// would both render as 100% consumed and let a malformed payload
@@ -505,32 +540,10 @@ func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client
 			}
 		}
 	}
-	// A response we cannot plot is not an observation. Counting raw buckets
-	// here would let a schema addition — every window renamed, say — pass as
-	// success and overwrite the last usable cached reading with rows that
-	// all render Unknown.
 	if plottable == 0 {
-		return antigravityQuotaSnapshot{}, antigravityFetchFailed
+		return antigravityQuotaSnapshot{}, false
 	}
-	// Identity comes from the same server, on the same port, in the same
-	// probe — so the quota and the account it belongs to can never be
-	// stitched together from two different signed-in sessions.
-	var status struct {
-		UserStatus struct {
-			Name       string `json:"name"`
-			Email      string `json:"email"`
-			PlanStatus struct {
-				PlanInfo struct {
-					PlanName string `json:"planName"`
-				} `json:"planInfo"`
-			} `json:"planStatus"`
-		} `json:"userStatus"`
-	}
-	if antigravityPostJSON(ctx, client, port, antigravityStatusRPC, &status) {
-		snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
-		snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
-	}
-	return snap, antigravityFetchOK
+	return snap, true
 }
 
 // loadAntigravityQuotaSnapshot reads the cached snapshot, scoped to the current

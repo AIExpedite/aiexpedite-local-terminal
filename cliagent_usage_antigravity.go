@@ -169,12 +169,17 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		gatedBuild = false
 	}
 	switch {
-	case gatedBuild:
-		// The installed build refuses loopback reads. Say so on the card
-		// rather than striping the bars with no reason, and do not report the
-		// missed run as a capture defect — nothing could have captured it.
+	case gatedBuild && antigravityGateOutranksReading(gate, snap.ObservedAt):
+		// The installed build refuses loopback reads and nothing newer has
+		// come from Google either. Say so on the card rather than striping
+		// the bars with no reason, and do not report the missed run as a
+		// capture defect — nothing could have captured it.
 		usage.Notice = antigravityGateNotice(firstNonEmpty(detected.Version, gate.Version), snap.ObservedAt)
 		usage.NoticeSeverity = "warning"
+	case gatedBuild:
+		// Gated locally, but the Code Assist route has supplied a reading
+		// since: the card shows that reading with its age, and a run not
+		// captured by the (refused) poller is not a defect to log.
 	case !gotFresh:
 		// Replaying. If the CLI's own logs show a run finished after this
 		// reading was taken, that run's quota was never captured — say so, once,
