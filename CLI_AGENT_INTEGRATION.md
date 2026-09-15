@@ -699,8 +699,19 @@ account wins everywhere.**
   the loser out) and still keeps a copy from being taken mid-renewal, but a
   live copy no longer blocks a renewal: it receives the result instead.
 - The keeper also sweeps `grok-acp-home-*` directories older than 24 h that no
-  live copy owns (178 had accumulated on one computer since July), through
-  `removeIsolatedGrokHome` so a linked conversation store is unlinked first.
+  live process owns (178 had accumulated on one computer since July). Every
+  agent process holds an exclusive lock on `aix-owner.lock` inside each home
+  it created, released by the OS when it dies, so a second agent process on
+  the same computer (the dev and the release channel) never sweeps a home
+  whose session is still running, however old the directory looks. A
+  candidate is registered as a copy before removal, so a newer credential an
+  earlier process left in it is written back to the real home first; the
+  removal goes through `removeIsolatedGrokHome` so a linked conversation
+  store is unlinked, never deleted.
+- Every `auth.json` replacement stages its bytes in a uniquely named file
+  beside the target (`os.CreateTemp`), never a fixed name: two agent
+  processes reconciling one home must not rename each other's half-written
+  bytes into place.
 
 Frontend: `UNTRUSTED_AUTO_RENEWAL_PROVIDERS` (cliAgentAvailability.js) is empty
 again from the same day; a genuine sign-out still reaches it as authState

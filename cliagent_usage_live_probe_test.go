@@ -299,6 +299,11 @@ func isolateGrok(t *testing.T) string {
 	// Registrations are process-global; a copy a previous test kept (a
 	// deferred removal, a missed release) must not take part in this one.
 	grokLogin.mu.Lock()
+	for key, f := range grokLogin.owners {
+		_ = unlockFile(f)
+		_ = f.Close()
+		delete(grokLogin.owners, key)
+	}
 	grokLogin.copies = map[string]struct{}{}
 	grokLogin.deferredRemoval = nil
 	grokLogin.renewing = false

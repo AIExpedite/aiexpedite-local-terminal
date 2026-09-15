@@ -257,8 +257,13 @@ func replaceGrokAuthFileFrom(dstHome, srcHome string, verifySource func(grokCred
 		return err
 	}
 	dst := filepath.Join(dstHome, "auth.json")
-	tmp := dst + ".aix-tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// The staging file is created uniquely, not at a fixed name: two agent
+	// processes can reconcile one home at the same time (the dev and the
+	// release channel share ~/.grok; Linux has no instance lock at all), and
+	// a shared staging path would let one of them rename the other's
+	// half-written bytes over auth.json.
+	tmp, err := stageGrokAuthFile(dstHome, data)
+	if err != nil {
 		return err
 	}
 	lock, err := acquireGrokAuthLock(dstHome)
@@ -282,6 +287,27 @@ func replaceGrokAuthFileFrom(dstHome, srcHome string, verifySource func(grokCred
 		return err
 	}
 	return nil
+}
+
+// stageGrokAuthFile writes data to a uniquely named file beside dstHome's
+// auth.json and returns its path. The name is this process's alone, so a
+// concurrent replacement by another process can neither truncate it nor
+// rename it into place.
+func stageGrokAuthFile(dstHome string, data []byte) (string, error) {
+	f, err := os.CreateTemp(dstHome, ".auth.json.*.aix-tmp")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // replaceGrokAuthFileIfOlder re-reads the destination under the CLI's auth
@@ -534,6 +560,34 @@ func runGrokLoginKeeper(ctx context.Context) {
 	}
 }
 
+// grokOwnerLockName is the file inside an isolated home whose exclusive lock
+// the creating agent process holds for as long as the home is registered.
+// The OS releases it when that process dies, so the stale-home sweep can tell
+// a home another live agent process still runs from one nobody owns.
+const grokOwnerLockName = "aix-owner.lock"
+
+// grokIsolatedHomeOwned reports whether some live process holds home's owner
+// lock. A home without the lock file (created by an older agent, or one whose
+// lock could not be taken) is not owned; a lock that cannot be taken is.
+func grokIsolatedHomeOwned(home string) bool {
+	f, err := os.OpenFile(filepath.Join(home, grokOwnerLockName), os.O_RDWR, 0o600)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	locked, err := tryLockFileExclusive(f)
+	if err != nil {
+		// Cannot tell; treat as owned — leaking a directory for another day
+		// is cheaper than deleting a live session's home.
+		return true
+	}
+	if locked {
+		_ = unlockFile(f)
+		return false
+	}
+	return true
+}
+
 // grokLoginRenewEnv is the environment a renewal child runs with: the
 // sanitized maintenance environment (every GROK_* sink and XAI_API_KEY
 // stripped, so the cached login is the only credential it can use), the home
@@ -546,8 +600,23 @@ func grokLoginRenewEnv(base string) []string {
 
 // sweepStaleIsolatedGrokHomes removes grok-acp-home-* directories that no
 // live copy owns and that have not been touched for grokStaleIsolatedHomeAge.
-// Each is removed through removeIsolatedGrokHome, so a linked conversation
-// store is unlinked first and never deleted. Returns how many were removed.
+//
+// "Owned" is decided by the owner lock every agent process holds inside the
+// homes it created (grokIsolatedHomeOwned), not by this process's registry
+// alone: another agent process on the same computer (the dev and the release
+// channel each run one) holds its homes' locks for as long as they live, and
+// its still-running session must not lose its home because a directory
+// timestamp looks old. The age is kept as a second guard for homes created
+// by agent versions that wrote no owner lock.
+//
+// A candidate is registered as a copy before it is removed: removal
+// reconciles registered copies into the real home first, so a home whose
+// credential is NEWER than the real home's — left by an agent process that
+// died before writing it back — hands that credential over instead of being
+// deleted with it, and a removal the login lock defers is finished by the
+// keeper like any other. Each is removed through removeIsolatedGrokHome, so a
+// linked conversation store is unlinked first and never deleted. Returns how
+// many were removed.
 func sweepStaleIsolatedGrokHomes(now time.Time) int {
 	grokKeeper.mu.Lock()
 	grokKeeper.lastSweep = now
@@ -573,7 +642,15 @@ func sweepStaleIsolatedGrokHomes(now time.Time) int {
 		if err != nil || now.Sub(info.ModTime()) < grokStaleIsolatedHomeAge {
 			continue
 		}
+		if grokIsolatedHomeOwned(dir) {
+			continue
+		}
+		grokLogin.acquireCopy(dir)
 		if err := removeIsolatedGrokHome(dir); err != nil {
+			// errGrokLoginBusy: kept and registered; the keeper finishes it.
+			if !errors.Is(err, errGrokLoginBusy) {
+				grokLogin.releaseCopy(dir)
+			}
 			failed++
 			continue
 		}

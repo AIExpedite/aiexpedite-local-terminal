@@ -1054,3 +1054,158 @@ func TestReplaceGrokAuthFile_AbortsWhenTheDestinationChangedAccountSinceTheSnaps
 		t.Errorf("destination holds %q, want it untouched", got)
 	}
 }
+
+// TestReplaceGrokAuthFile_StagesInAFileOfItsOwn: another process's staging
+// file beside auth.json (the same fixed name an earlier build used) is
+// neither overwritten nor renamed into place — each replacement stages under
+// a unique name, so two agent processes reconciling one home cannot install
+// each other's half-written bytes.
+func TestReplaceGrokAuthFile_StagesInAFileOfItsOwn(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	now := time.Now()
+	writeGrokAuthMinted(t, src, "src-new", "dan@example.com", now, now.Add(6*time.Hour))
+	writeGrokAuthMinted(t, dst, "dst-old", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	foreign := filepath.Join(dst, "auth.json.aix-tmp")
+	if err := os.WriteFile(foreign, []byte("another process is still writing this"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := replaceGrokAuthFile(dst, src); err != nil {
+		t.Fatal(err)
+	}
+	if got := grokKeyIn(t, dst); got != "src-new" {
+		t.Fatalf("destination holds %q, want the source's credential", got)
+	}
+	b, err := os.ReadFile(foreign)
+	if err != nil || string(b) != "another process is still writing this" {
+		t.Fatalf("the other process's staging file was touched: %q, %v", b, err)
+	}
+	entries, _ := os.ReadDir(dst)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".aix-tmp") && e.Name() != "auth.json.aix-tmp" {
+			t.Errorf("staging file %s left behind", e.Name())
+		}
+	}
+}
+
+// grokTempDirForSweep points os.TempDir at a fresh directory for the sweep
+// tests, or skips when the platform ignores the env.
+func grokTempDirForSweep(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	for _, name := range []string{"TMP", "TEMP", "TMPDIR"} {
+		t.Setenv(name, tmp)
+	}
+	if got := filepath.Clean(os.TempDir()); got != filepath.Clean(tmp) {
+		t.Skipf("os.TempDir()=%s does not follow the env on this platform", got)
+	}
+	return tmp
+}
+
+func ageGrokHome(t *testing.T, dir string, age time.Duration) {
+	t.Helper()
+	stamp := time.Now().Add(-age)
+	if err := os.Chtimes(dir, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSweepStaleIsolatedGrokHomes_SkipsAHomeAnotherLiveProcessOwns: a home
+// whose owner lock is held — by another agent process on this computer, whose
+// session may have run for days without touching the directory's timestamp —
+// is not stale, however old the directory looks. Once the owner is gone (the
+// lock released), it is.
+func TestSweepStaleIsolatedGrokHomes_SkipsAHomeAnotherLiveProcessOwns(t *testing.T) {
+	_ = isolateGrok(t)
+	tmp := grokTempDirForSweep(t)
+	home := filepath.Join(tmp, grokIsolatedHomePrefix+"theirs")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// "Another process": a separate handle holding the owner lock.
+	other, err := os.OpenFile(filepath.Join(home, grokOwnerLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(other); err != nil {
+		t.Fatal(err)
+	}
+	ageGrokHome(t, home, 48*time.Hour)
+
+	if n := sweepStaleIsolatedGrokHomes(time.Now()); n != 0 {
+		t.Fatalf("removed %d, want none while the owner is alive", n)
+	}
+	if _, err := os.Stat(home); err != nil {
+		t.Fatal("a live process's home was swept")
+	}
+	if grokLogin.holds(home) {
+		t.Fatal("a live process's home was registered as ours")
+	}
+
+	_ = unlockFile(other)
+	_ = other.Close()
+	resetGrokKeeper(t)
+	if n := sweepStaleIsolatedGrokHomes(time.Now()); n != 1 {
+		t.Fatalf("removed %d, want the now-orphaned home", n)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatal("the orphaned home is still present")
+	}
+}
+
+// TestSweepStaleIsolatedGrokHomes_HandsANewerCredentialToTheRealHomeFirst: a
+// stale home nobody owns can hold the account's newest credential (its agent
+// process died before writing the renewal back). The sweep registers it and
+// removes it through the same path as any copy, so the credential reaches
+// the real home before the directory goes.
+func TestSweepStaleIsolatedGrokHomes_HandsANewerCredentialToTheRealHomeFirst(t *testing.T) {
+	real := isolateGrok(t)
+	tmp := grokTempDirForSweep(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	orphan := filepath.Join(tmp, grokIsolatedHomePrefix+"orphan")
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeGrokAuthMinted(t, orphan, "orphan-renewed", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	ageGrokHome(t, orphan, 48*time.Hour)
+
+	if n := sweepStaleIsolatedGrokHomes(now); n != 1 {
+		t.Fatalf("removed %d, want the orphan", n)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatal("the orphan is still present")
+	}
+	if got := grokKeyIn(t, real); got != "orphan-renewed" {
+		t.Errorf("real home holds %q, want the orphan's newer credential handed over before removal", got)
+	}
+	if grokLogin.holds(orphan) {
+		t.Error("the removed orphan is still registered")
+	}
+}
+
+// TestSetupIsolatedGrokHome_HoldsTheOwnerLockUntilRemoved: a home this
+// process created is owned (another process's sweep would skip it) for as
+// long as it exists, and the lock is dropped so removal can delete the
+// directory on Windows.
+func TestSetupIsolatedGrokHome_HoldsTheOwnerLockUntilRemoved(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real", "dan@example.com", now, now.Add(6*time.Hour))
+	home, err := setupIsolatedGrokSmokeHomeFrom(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !grokIsolatedHomeOwned(home) {
+		t.Fatal("a freshly created home is not owned")
+	}
+	if err := removeIsolatedGrokHome(home); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatal("the home was not removed")
+	}
+}

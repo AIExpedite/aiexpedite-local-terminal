@@ -152,6 +152,10 @@ func seedIsolatedGrokLogin(dir, srcBase string) error {
 	}
 	defer release()
 	grokLogin.registerCopyHeld(dir)
+	if lerr := grokLogin.holdOwnerLock(dir); lerr != nil {
+		fmt.Printf("%s[grok-acp] isolated home owner lock not taken (another agent's sweep may treat it as stale after %s): %v%s\n",
+			colorYellow, grokStaleIsolatedHomeAge, lerr, colorReset)
+	}
 	if srcBase == "" {
 		return nil
 	}
@@ -266,6 +270,7 @@ func removeIsolatedGrokHomeAttempt(home, base string, unlink func(string) error,
 		return errGrokLoginBusy
 	}
 	defer grokLogin.releaseCopy(home)
+	grokLogin.dropOwnerLock(home)
 
 	link := filepath.Join(home, grokSessionsDirName)
 	if err := unlink(link); err != nil {

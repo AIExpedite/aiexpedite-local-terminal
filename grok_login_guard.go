@@ -35,6 +35,10 @@ type grokLoginGuard struct {
 	// hand their credential to the real home after the quick retries; the
 	// keeper retries them every tick (retryDeferredGrokHomeRemovals).
 	deferredRemoval map[string]struct{}
+	// owners holds the owner lock (grokOwnerLockName) of every home this
+	// process created, so another agent process's stale-home sweep can see
+	// the home is alive. Dropped before the home is removed.
+	owners map[string]*os.File
 	// changed is closed (and replaced) on every state change, waking waiters.
 	changed chan struct{}
 }
@@ -74,6 +78,47 @@ func (g *grokLoginGuard) registerCopyHeld(home string) {
 	g.mu.Lock()
 	g.copies[key] = struct{}{}
 	g.mu.Unlock()
+}
+
+// holdOwnerLock takes home's owner lock for this process and keeps it until
+// dropOwnerLock. Failing to take it is not fatal: the home then only has the
+// age guard against another process's sweep.
+func (g *grokLoginGuard) holdOwnerLock(home string) error {
+	key := filepath.Clean(home)
+	f, err := os.OpenFile(filepath.Join(key, grokOwnerLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := lockFileExclusive(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if prev, ok := g.owners[key]; ok {
+		_ = unlockFile(prev)
+		_ = prev.Close()
+	}
+	if g.owners == nil {
+		g.owners = map[string]*os.File{}
+	}
+	g.owners[key] = f
+	return nil
+}
+
+// dropOwnerLock releases and closes home's owner lock, if this process holds
+// it. Called before the home's files are removed — an open handle inside the
+// directory would keep Windows from removing it.
+func (g *grokLoginGuard) dropOwnerLock(home string) {
+	key := filepath.Clean(home)
+	g.mu.Lock()
+	f, ok := g.owners[key]
+	delete(g.owners, key)
+	g.mu.Unlock()
+	if ok {
+		_ = unlockFile(f)
+		_ = f.Close()
+	}
 }
 
 // deferRemoval marks a registered home for removal by the keeper's next
@@ -125,6 +170,11 @@ func (g *grokLoginGuard) releaseCopy(home string) {
 	}
 	delete(g.copies, key)
 	g.broadcastLocked()
+	if f, ok := g.owners[key]; ok {
+		delete(g.owners, key)
+		_ = unlockFile(f)
+		_ = f.Close()
+	}
 }
 
 // beginRenewal waits until no other renewal runs, then holds the login
@@ -185,6 +235,11 @@ func (g *grokLoginGuard) pruneRemovedLocked() {
 	for key := range g.copies {
 		if _, err := os.Stat(key); os.IsNotExist(err) {
 			delete(g.copies, key)
+			if f, ok := g.owners[key]; ok {
+				delete(g.owners, key)
+				_ = unlockFile(f)
+				_ = f.Close()
+			}
 		}
 	}
 }
