@@ -334,8 +334,9 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		defer release()
 		runGrokLoginRenewal(ctx, grokPath, base)
 		// Every live copy of the login now holds a superseded refresh token;
-		// hand them the renewed file before xAI's grace window closes.
-		reconcileGrokLogin(base)
+		// hand them the renewed file before xAI's grace window closes — still
+		// under the lock, so nothing renews between the rotation and the fan-out.
+		reconcileGrokLoginLocked(base)
 	}
 	token, expiresAt, hasExpiry := grokFreshestPresentedToken(base, fingerprint, now())
 	if token == "" {

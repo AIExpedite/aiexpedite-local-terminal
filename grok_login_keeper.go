@@ -65,6 +65,9 @@ const (
 	// grokLoginRenewRetry spaces renewal attempts that changed nothing (CLI
 	// missing, xAI unreachable) so a broken renewal is not spawned every tick.
 	grokLoginRenewRetry = 5 * time.Minute
+	// grokLoginReconcileWait bounds how long a tick waits for the login lock
+	// before skipping its reconciliation pass.
+	grokLoginReconcileWait = 5 * time.Second
 	// grokStaleIsolatedHomeAge is how old an unregistered grok-acp-home-*
 	// directory must be before the sweep removes it. Long enough that a home
 	// belonging to a session of a previous agent process that is still
@@ -176,10 +179,31 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 // fail, not the keeper's to resurrect; the copies are also not consulted for
 // what the account is, so two of them holding different accounts can never
 // sign the real home into one of them.
+//
+// The comparison and the writes happen under the login lock (grokLoginGuard):
+// a renewal that lands between the snapshot and the writes would otherwise be
+// overwritten by the older credential the snapshot chose, and the newest
+// rotating refresh token would exist nowhere. Callers already holding the lock
+// (a renewal) use reconcileGrokLoginLocked; this entry waits at most
+// grokLoginReconcileWait for its turn and skips the pass when it cannot get
+// it — the next tick, or the renewal's own reconciliation, covers it.
 func reconcileGrokLogin(base string) int {
 	if base == "" {
 		return 0
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), grokLoginReconcileWait)
+	defer cancel()
+	release, ok := grokLogin.beginRenewal(ctx)
+	if !ok {
+		return 0
+	}
+	defer release()
+	return reconcileGrokLoginLocked(base)
+}
+
+// reconcileGrokLoginLocked is reconcileGrokLogin for a caller that already
+// holds the login lock.
+func reconcileGrokLoginLocked(base string) int {
 	real, realOK := readGrokCredentialStamp(base)
 	if !realOK {
 		return 0
@@ -244,6 +268,17 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 	if base == "" {
 		return false
 	}
+	// The whole tick runs under the login lock: the renewal AND the
+	// reconciliation that follows it, so no other renewal (the live probe's)
+	// can land between the two and be overwritten by an older snapshot.
+	lockCtx, cancelLock := context.WithTimeout(ctx, grokLoginReconcileWait)
+	defer cancelLock()
+	release, ok := grokLogin.beginRenewal(lockCtx)
+	if !ok {
+		return false
+	}
+	defer release()
+
 	renewed := false
 	if stamp, ok := readGrokCredentialStamp(base); ok && stamp.Refreshable && !stamp.ExpiresAt.IsZero() &&
 		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) {
@@ -257,23 +292,18 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 		}
 		grokKeeper.mu.Unlock()
 		if due {
-			renewCtx, cancel := context.WithTimeout(ctx, grokLoginRenewTimeout)
-			if release, ok := grokLogin.beginRenewal(renewCtx); ok {
-				runGrokLoginRenewal(ctx, grokPath, base)
-				release()
-				renewed = true
-			}
-			cancel()
+			runGrokLoginRenewal(ctx, grokPath, base)
+			renewed = true
 			if after, ok := readGrokCredentialStamp(base); ok && after.MintedAt.After(stamp.MintedAt) {
 				fmt.Printf("%s[grok-login] renewed the Grok login ahead of expiry (next expiry %s)%s\n",
 					colorGreen, after.ExpiresAt.UTC().Format(time.RFC3339), colorReset)
-			} else if renewed {
+			} else {
 				fmt.Printf("%s[grok-login] renewal ran but the login did not change; retrying in %s%s\n",
 					colorYellow, grokLoginRenewRetry, colorReset)
 			}
 		}
 	}
-	reconcileGrokLogin(base)
+	reconcileGrokLoginLocked(base)
 	return renewed
 }
 

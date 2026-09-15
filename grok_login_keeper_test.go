@@ -346,3 +346,47 @@ func TestReconcileGrokLogin_NeverRecreatesASignedOutRealHome(t *testing.T) {
 		}
 	}
 }
+
+// TestGrokLoginKeeperOnce_WaitsOutAnotherRenewalRatherThanReconcilingBesideIt:
+// the tick's renewal and reconciliation run under the login lock. While the
+// live probe holds it, a tick neither renews nor reconciles — a snapshot taken
+// beside a renewal in flight could write the older credential over the newer
+// one — and it gives the lock up after a bounded wait rather than blocking.
+func TestGrokLoginKeeperOnce_WaitsOutAnotherRenewalRatherThanReconcilingBesideIt(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-old", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-new", "dan@example.com", now, now.Add(6*time.Hour))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+	runGrokLoginRenewal = func(context.Context, string, string) { t.Error("renewal must not run beside another") }
+
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the login lock")
+	}
+	started := time.Now()
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("tick renewed while another renewal held the login")
+	}
+	if waited := time.Since(started); waited < grokLoginReconcileWait || waited > grokLoginReconcileWait+3*time.Second {
+		t.Errorf("tick waited %s, want about %s", waited, grokLoginReconcileWait)
+	}
+	if got := grokKeyIn(t, real); got != "real-old" {
+		t.Errorf("real home rewritten to %q while the lock was held elsewhere", got)
+	}
+	release()
+
+	// With the lock free the same tick reconciles the copy's newer credential
+	// back (the stale real credential is not renewed: the renewal stub above
+	// would fail the test, so the retry window is spent first).
+	grokKeeper.mu.Lock()
+	grokKeeper.lastRenewTry, grokKeeper.lastRenewFrom = now, now.Add(-6*time.Hour)
+	grokKeeper.mu.Unlock()
+	grokLoginKeeperOnce(context.Background(), "grok", now)
+	if got := grokKeyIn(t, real); got != "copy-new" {
+		t.Errorf("real home holds %q once the lock was free, want the copy's newer credential", got)
+	}
+}
