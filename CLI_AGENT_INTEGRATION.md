@@ -745,10 +745,13 @@ Referer / Sec-Fetch variant is exempt. Workspace-level `.agents/hooks.json`
 and `.mcp.json` never load from an untrusted directory.
 
 The server was only ever a proxy for Google's Code Assist API, and the OAuth
-token it uses is on the machine: `agy` keeps it in the OS keyring as a
-standard OAuth2 token JSON (Credential Manager `gemini:antigravity` on
-Windows, Keychain service `gemini` / account `antigravity` on macOS,
-secret-service on Linux). So a gated build is read the way the Grok and Claude
+token it uses is on the machine: `agy` keeps it in the OS keyring (Credential
+Manager `gemini:antigravity` on Windows, Keychain service `gemini` / account
+`antigravity` on macOS, secret-service on Linux) as JSON of the shape
+`{"auth_method", "id_token", "token": {access_token, token_type, refresh_token,
+expiry}}` — read off a real entry's key names on 2026-09-15; a bare OAuth2
+token JSON is accepted too, and an entry in any other shape is logged by its
+key names only. So a gated build is read the way the Grok and Claude
 probes read theirs — the CLI's own stored credential against the vendor's
 endpoint ([`cliagent_usage_antigravity_codeassist.go`](cliagent_usage_antigravity_codeassist.go),
 keyring readers in `antigravity_keyring_*.go`):
