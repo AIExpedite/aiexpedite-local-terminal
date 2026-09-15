@@ -23,22 +23,18 @@
 //     refused, 64 KB body cap, decoded into an allow-listed struct.
 //   - The token is the one Grok's own resolver presents (same scope precedence
 //     as grokAuthExpiry) and is never logged, cached or published.
-//   - The agent never renews the login itself. Rotating Grok's refresh token
-//     from here could race Grok's own renewal and sign the CLI out. When the
-//     access token has expired (or xAI answers 401/403), `grok models` runs once
-//     against the real home so GROK renews its login, and the request is retried
-//     once with whatever Grok wrote.
-//   - A renewal can only run while no isolated copy of the login is live (an
-//     ACP session, a smoke, a model discovery). Headless sessions run on such
-//     copies for hours at a time, and each one refreshes ITS copy's access
-//     token while the real home's goes stale — which is exactly the device
-//     whose card showed a 10-hour-old reading. So the probe presents the
-//     freshest unexpired token across the real home AND every live copy
-//     (reading rotates nothing), and when a renewal is the only way forward it
-//     waits at most grokLoginRenewGap for a gap rather than the whole probe
-//     budget: a probe that spends its budget waiting returns a transport error
-//     for what is really "the login is busy", and the reading it could have
-//     taken with a copy's token is never attempted.
+//   - The agent never mints tokens itself. When the access token has expired
+//     (or xAI answers 401/403), `grok models` runs once against the real home
+//     so GROK renews its login, and the request is retried once with whatever
+//     Grok wrote. The renewed file is then reconciled into every live copy of
+//     the login (grok_login_keeper.go), which is also what keeps the login
+//     alive between clicks.
+//   - The probe presents the freshest unexpired token across the real home
+//     AND every live copy (an ACP session that renewed ITS copy holds a
+//     fresher credential; reading rotates nothing), and takes its renewal turn
+//     for at most grokLoginRenewGap when the keeper is mid-renewal: a probe
+//     that spends its budget waiting returns a transport error for what is
+//     really "the login is busy".
 //   - What persists is the normalized reading only (percent, period, on-demand
 //     pool), scoped to the account fingerprint, in grok_billing_live.json.
 package main
@@ -66,10 +62,9 @@ const (
 	// grokTokenExpirySkew treats a token this close to expiry as expired, so
 	// the request is not sent with a credential that dies in flight.
 	grokTokenExpirySkew = time.Minute
-	// grokLoginRenewGap bounds how long the probe waits for every isolated
-	// copy of the login to be released before it may renew. A copy is held for
-	// the life of a CLI session, so waiting the whole probe budget would only
-	// turn "busy" into a timeout.
+	// grokLoginRenewGap bounds how long the probe waits for its turn to renew
+	// when another renewal (the keeper's) is in flight: waiting the whole
+	// probe budget would only turn "busy" into a timeout.
 	grokLoginRenewGap = 2 * time.Second
 
 	grokBillingLiveSchemaVersion = 1
@@ -86,8 +81,8 @@ const (
 	grokLiveOutcomeNoAccount    = "no_account"
 	grokLiveOutcomeWriteFailed  = "write_failed"
 	// The only usable token was refused or expired, and a renewal could not
-	// run because a copy of the login is live. Nothing is wrong with the
-	// login; the reading is simply not takeable until that session ends.
+	// run because another renewal of the login was in flight for the whole
+	// gap. Nothing is wrong with the login; the next click reads it renewed.
 	grokLiveOutcomeLoginBusy = "login_busy"
 )
 
@@ -124,17 +119,23 @@ var grokBillingLiveURL = grokBillingLiveEndpoint
 // against the real home. The output is discarded: this run exists only for the
 // side effect Grok performs on its own credential. A var so tests never spawn
 // the real CLI.
-var runGrokLoginRenewal = func(ctx context.Context, grokPath, base string) {
+var runGrokLoginRenewal = renewGrokLoginWithCLI
+
+// renewGrokLoginWithCLI is the production renewal: one `grok models` run on
+// the given home, which makes the CLI redeem its refresh token and rewrite
+// auth.json.
+func renewGrokLoginWithCLI(ctx context.Context, grokPath, base string) {
 	if grokPath == "" {
 		return
 	}
 	renewCtx, cancel := context.WithTimeout(ctx, grokLoginRenewTimeout)
 	defer cancel()
-	// The maintenance-smoke sanitizer strips every GROK_* sink and XAI_API_KEY,
-	// so the only credential this child can use is the cached login it is here
-	// to renew; GROK_HOME is pinned to the home the probe reads.
-	env := setEnvVar(sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "GROK_HOME", base)
-	_, _ = runCLIAgentModelProbe(renewCtx, grokPath, env, "models")
+	// grokLoginRenewEnv: the maintenance-smoke sanitizer strips every GROK_*
+	// sink and XAI_API_KEY, so the only credential this child can use is the
+	// cached login it is here to renew; GROK_HOME is pinned to the home the
+	// probe reads; and the CLI's early-invalidation horizon is raised so it
+	// refreshes now, not only within five minutes of expiry.
+	_, _ = cliAgentModelProbeRunner(renewCtx, grokPath, grokLoginRenewEnv(base), "models")
 }
 
 // grokPresentedToken returns the access token Grok's own resolver would send,
@@ -319,12 +320,10 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 	renewed, renewalBlocked := false, false
 	renew := func() {
 		renewed = true
-		// Never while an isolated home holds a copy of this login (a model
-		// discovery, an ACP session, a smoke): both could redeem the same
-		// rotating refresh token and sign the user's CLI out. The wait for a
-		// gap is bounded by grokLoginRenewGap (and by the probe's own budget),
-		// because a copy lives as long as its session: waiting longer only
-		// converts "busy" into a timeout.
+		// One renewal of this login at a time: the keeper (grok_login_keeper.go)
+		// may be renewing it right now, and two rotations of one refresh token
+		// minutes apart sign the loser out. The wait for the turn is bounded by
+		// grokLoginRenewGap (and by the probe's own budget).
 		gapCtx, cancel := context.WithTimeout(ctx, grokLoginRenewGap)
 		defer cancel()
 		release, ok := grokLogin.beginRenewal(gapCtx)
@@ -333,7 +332,41 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			return
 		}
 		defer release()
+		// And across agent processes sharing this home (grokRenewLockName):
+		// another agent's renewal in flight is this login being busy.
+		renewLock, err := acquireGrokRenewLock(base)
+		if err != nil {
+			renewalBlocked = true
+			return
+		}
+		defer releaseGrokLockFile(renewLock)
+		// A live copy may already hold the account's newer credential; write it
+		// back first, so the renewal below never redeems a refresh token that
+		// copy superseded (past the grace window that signs the real home out).
+		// Always run the CLI renewal after that write-back: this path is only
+		// entered when the presented token is expired or just 401'd, so a
+		// timestamp-fresh copy that xAI already rejected still needs a rotate
+		// of its (newer) refresh chain, not a skip.
+		reconcileGrokLoginLocked(base)
+		// The write-back must have landed before the real home is renewed:
+		// renewing a refresh token a live copy has superseded can sign the
+		// real home out for good (grokRealHomeHoldsNewest). Until it lands,
+		// this login is busy, not broken.
+		// A copy of ANOTHER agent process, or an orphan one left, may hold it
+		// instead; adopt it the same way. Unlike the keeper, the probe does
+		// not stop at an adoption: it is here because the presented token was
+		// expired or rejected, and an adopted chain that is too gets its
+		// rotate NOW, in this probe — not on a later click.
+		adoptForeignGrokRenewals(base)
+		if !grokRealHomeHoldsNewest(base) {
+			renewalBlocked = true
+			return
+		}
 		runGrokLoginRenewal(ctx, grokPath, base)
+		// Every live copy of the login now holds a superseded refresh token;
+		// hand them the renewed file before xAI's grace window closes — still
+		// under the lock, so nothing renews between the rotation and the fan-out.
+		reconcileGrokLoginLocked(base)
 	}
 	token, expiresAt, hasExpiry := grokFreshestPresentedToken(base, fingerprint, now())
 	if token == "" {

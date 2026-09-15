@@ -317,8 +317,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// none of the caller's repository-scoped extensions can participate.
 		isolatedGrokCwd = filepath.Join(isolatedGrokHome, "workspace")
 		if mkdirErr := os.Mkdir(isolatedGrokCwd, 0o700); mkdirErr != nil {
-			_ = os.RemoveAll(isolatedGrokHome)
-			grokLogin.releaseCopy(isolatedGrokHome)
+			_ = removeIsolatedGrokHome(isolatedGrokHome)
 			isolatedGrokHome = ""
 			return fmt.Errorf("grok no-tools working-directory isolation failed; refusing to spawn in caller workspace")
 		}
@@ -326,8 +325,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	isolationOwnedBySession := false
 	defer func() {
 		if isolatedGrokHome != "" && !isolationOwnedBySession {
-			_ = os.RemoveAll(isolatedGrokHome)
-			grokLogin.releaseCopy(isolatedGrokHome)
+			_ = removeIsolatedGrokHome(isolatedGrokHome)
 		}
 	}()
 
@@ -1894,8 +1892,9 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 			fmt.Printf("%s[session] Grok no-tools billing snapshot: %s%s\n",
 				colorCyan, outcome, colorReset)
 		}
-		_ = os.RemoveAll(session.isolatedGrokHome)
-		grokLogin.releaseCopy(session.isolatedGrokHome)
+		// Through the reconciliation-aware helper: a smoke that refreshed its
+		// copy hands the credential to the real home before the copy dies.
+		cleanupIsolatedGrokHome(session.isolatedGrokHome, session.ID)
 	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish

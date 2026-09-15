@@ -296,9 +296,40 @@ func writeGrokAuth(t *testing.T, home, key, email string, expires time.Time) {
 
 func isolateGrok(t *testing.T) string {
 	t.Helper()
+	// Registrations are process-global; a copy a previous test kept (a
+	// deferred removal, a missed release) must not take part in this one.
+	grokLogin.mu.Lock()
+	for key, f := range grokLogin.owners {
+		_ = unlockFile(f)
+		_ = f.Close()
+		delete(grokLogin.owners, key)
+	}
+	grokLogin.copies = map[string]struct{}{}
+	grokLogin.deferredRemoval = nil
+	grokLogin.renewing = false
+	grokLogin.broadcastLocked()
+	grokLogin.mu.Unlock()
 	home := t.TempDir()
 	t.Setenv("GROK_HOME", home)
 	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	// A temp root of this test's own: the keeper reads every grok-acp-home-*
+	// under os.TempDir() on its renewal path, so a home another test left
+	// there (same fixture account, newer stamp) must not be adopted here.
+	// The owner locks are dropped before the root is removed — an open
+	// handle inside it would keep Windows from deleting it.
+	tmpRoot := t.TempDir()
+	for _, name := range []string{"TMP", "TEMP", "TMPDIR"} {
+		t.Setenv(name, tmpRoot)
+	}
+	t.Cleanup(func() {
+		grokLogin.mu.Lock()
+		for key, f := range grokLogin.owners {
+			_ = unlockFile(f)
+			_ = f.Close()
+			delete(grokLogin.owners, key)
+		}
+		grokLogin.mu.Unlock()
+	})
 	origRenew := runGrokLoginRenewal
 	origURL := grokBillingLiveURL
 	t.Cleanup(func() {

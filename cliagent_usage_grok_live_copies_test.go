@@ -51,9 +51,10 @@ func TestProbeGrokBillingLive_PresentsAFreshTokenHeldByALiveCopy(t *testing.T) {
 }
 
 // TestProbeGrokBillingLive_LoginBusyIsBoundedAndNamed: when every token is
-// stale and a copy is live, the probe must neither renew nor spend its whole
-// budget waiting — it gives up after grokLoginRenewGap and says the login is
-// busy, not that the network failed.
+// stale and another renewal of the login is in flight (the keeper's), the
+// probe must neither start a second rotation nor spend its whole budget
+// waiting — it gives up after grokLoginRenewGap and says the login is busy,
+// not that the network failed.
 func TestProbeGrokBillingLive_LoginBusyIsBoundedAndNamed(t *testing.T) {
 	home := isolateGrok(t)
 	now := time.Now()
@@ -61,10 +62,11 @@ func TestProbeGrokBillingLive_LoginBusyIsBoundedAndNamed(t *testing.T) {
 	renewals := 0
 	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
 
-	copyHome := t.TempDir()
-	writeGrokAuth(t, copyHome, "stale-copy", "dan@example.com", now.Add(-time.Minute))
-	grokLogin.acquireCopy(copyHome)
-	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+	release, ok := grokLogin.beginRenewal(context.Background())
+	if !ok {
+		t.Fatal("could not hold the renewal turn")
+	}
+	t.Cleanup(release)
 
 	grokBillingServer(t, func(string) (int, string) { return http.StatusUnauthorized, `{}` })
 
@@ -78,7 +80,7 @@ func TestProbeGrokBillingLive_LoginBusyIsBoundedAndNamed(t *testing.T) {
 		t.Fatalf("outcome=%q, want login_busy", got)
 	}
 	if renewals != 0 {
-		t.Errorf("renewals=%d, want none while a copy of the login is live", renewals)
+		t.Errorf("renewals=%d, want none while another renewal holds the login", renewals)
 	}
 	if elapsed < grokLoginRenewGap || elapsed > grokLoginRenewGap+3*time.Second {
 		t.Errorf("probe took %s, want about one gap (%s): the wait is bounded by the gap, not the budget", elapsed, grokLoginRenewGap)
