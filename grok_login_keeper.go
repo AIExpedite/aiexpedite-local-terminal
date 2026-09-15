@@ -155,7 +155,10 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
+	// atomicReplaceConfigFile is MoveFileEx(REPLACE_EXISTING|WRITE_THROUGH) on
+	// Windows and rename(2) elsewhere: the replacement is one step, over an
+	// existing file, on every platform the agent runs on.
+	if err := atomicReplaceConfigFile(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -163,18 +166,26 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 }
 
 // reconcileGrokLogin applies the newest-wins rule across the real home and
-// every live copy of the same account. Returns how many homes were rewritten.
-// Safe to call at any time: reading rotates nothing, and a rewrite only ever
-// replaces an older credential of the SAME account with a newer one.
+// every live copy of the real home's account. Returns how many homes were
+// rewritten. Safe to call at any time: reading rotates nothing, and a rewrite
+// only ever replaces an OLDER credential of the SAME account with a newer one.
+//
+// A real home with no credential is never recreated from a copy. That absence
+// is a decision or a fact — the user ran `grok logout`, or the CLI signed the
+// home out — and copies of a login that no longer exists are the CLI's to
+// fail, not the keeper's to resurrect; the copies are also not consulted for
+// what the account is, so two of them holding different accounts can never
+// sign the real home into one of them.
 func reconcileGrokLogin(base string) int {
 	if base == "" {
 		return 0
 	}
 	real, realOK := readGrokCredentialStamp(base)
-	stamps := make([]grokCredentialStamp, 0, 4)
-	if realOK {
-		stamps = append(stamps, real)
+	if !realOK {
+		return 0
 	}
+	account := real.Fingerprint
+	stamps := []grokCredentialStamp{real}
 	for _, home := range grokLogin.liveCopies() {
 		if s, ok := readGrokCredentialStamp(home); ok {
 			stamps = append(stamps, s)
@@ -183,25 +194,14 @@ func reconcileGrokLogin(base string) int {
 	if len(stamps) < 2 {
 		return 0
 	}
-	// The account is the real home's when it has one; otherwise (signed out,
-	// copies still live) the copies agree among themselves or nothing moves.
-	account := ""
-	if realOK {
-		account = real.Fingerprint
-	} else {
-		account = stamps[0].Fingerprint
-	}
-	newest := grokCredentialStamp{}
+	newest := real
 	for _, s := range stamps {
 		if s.Fingerprint == account && s.MintedAt.After(newest.MintedAt) {
 			newest = s
 		}
 	}
-	if newest.Home == "" {
-		return 0
-	}
 	rewritten := 0
-	if !realOK || (real.Fingerprint == account && real.MintedAt.Before(newest.MintedAt)) {
+	if newest.Home != base {
 		if err := replaceGrokAuthFile(base, newest.Home); err != nil {
 			fmt.Printf("%s[grok-login] could not write the renewed login back to the real home: %v%s\n",
 				colorYellow, err, colorReset)

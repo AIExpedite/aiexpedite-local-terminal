@@ -317,3 +317,32 @@ func TestSweepStaleIsolatedGrokHomes_RemovesOnlyOldUnownedHomes(t *testing.T) {
 		}
 	}
 }
+
+// TestReconcileGrokLogin_NeverRecreatesASignedOutRealHome: an absent real
+// credential is `grok logout` (or the CLI signing the home out) and must stay
+// absent — a live copy, even a fresh one of the same account, must not sign
+// the persistent home back in; and copies never decide what the account is.
+func TestReconcileGrokLogin_NeverRecreatesASignedOutRealHome(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	copies := []string{t.TempDir(), t.TempDir()}
+	writeGrokAuthMinted(t, copies[0], "copy-dan", "dan@example.com", now, now.Add(6*time.Hour))
+	writeGrokAuthMinted(t, copies[1], "copy-someone", "someone@example.com", now.Add(time.Minute), now.Add(6*time.Hour))
+	for _, dir := range copies {
+		grokLogin.acquireCopy(dir)
+		t.Cleanup(func() { grokLogin.releaseCopy(dir) })
+	}
+
+	if n := reconcileGrokLogin(real); n != 0 {
+		t.Fatalf("rewrote %d homes with no real credential, want none", n)
+	}
+	if _, err := os.Stat(filepath.Join(real, "auth.json")); !os.IsNotExist(err) {
+		t.Fatal("a signed-out real home was recreated from a live copy")
+	}
+	for i, dir := range copies {
+		want := []string{"copy-dan", "copy-someone"}[i]
+		if got := grokKeyIn(t, dir); got != want {
+			t.Errorf("copy %d changed to %q, want %q untouched", i, got, want)
+		}
+	}
+}
