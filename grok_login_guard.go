@@ -72,6 +72,15 @@ func (g *grokLoginGuard) registerCopyHeld(home string) {
 	g.mu.Unlock()
 }
 
+// holds reports whether home is currently registered as a copy of the login.
+func (g *grokLoginGuard) holds(home string) bool {
+	key := filepath.Clean(home)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.copies[key]
+	return ok
+}
+
 // releaseCopy forgets an isolated home. Idempotent, and a no-op for a home that
 // was never registered.
 func (g *grokLoginGuard) releaseCopy(home string) {

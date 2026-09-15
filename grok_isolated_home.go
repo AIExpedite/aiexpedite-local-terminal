@@ -194,7 +194,7 @@ func removeIsolatedGrokHome(home string) error {
 }
 
 func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) error {
-	return removeIsolatedGrokHomeAttempt(home, unlink, 0)
+	return removeIsolatedGrokHomeAttempt(home, grokPersistentHome(), unlink, 0)
 }
 
 // errGrokLoginBusy: the home was NOT removed this time because its login copy
@@ -207,8 +207,16 @@ var errGrokLoginBusy = errors.New("grok login copy not reconciled yet: renewal i
 // rather than deleted with a credential nothing else holds.
 const grokLoginRemovalRetries = 3
 
-func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attempt int) error {
+// removeIsolatedGrokHomeAttempt is one removal attempt. base is the real home
+// the copy belongs to, resolved once on the first attempt so a deferred retry
+// never reconciles against whatever GROK_HOME points at when it fires. A
+// retry for a home that has since been released (removed by another path)
+// is a no-op.
+func removeIsolatedGrokHomeAttempt(home, base string, unlink func(string) error, attempt int) error {
 	if home == "" {
+		return nil
+	}
+	if attempt > 0 && !grokLogin.holds(home) {
 		return nil
 	}
 	// The copy may hold the account's newest credential — a `grok models`
@@ -223,7 +231,6 @@ func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attem
 	// past our wait, a sharing violation on Windows). So the test is on the
 	// outcome — the real home must hold a credential at least as new as this
 	// copy's — and not on whether the pass ran.
-	base := grokPersistentHome()
 	_, ok := reconcileGrokLoginWithin(base, grokLoginRemovalReconcileWait)
 	if ok && !grokCopyCredentialPreserved(base, home) {
 		ok = false
@@ -233,7 +240,7 @@ func removeIsolatedGrokHomeAttempt(home string, unlink func(string) error, attem
 			colorYellow, attempt+1, colorReset)
 		if attempt < grokLoginRemovalRetries {
 			time.AfterFunc(grokLoginRemovalReconcileWait, func() {
-				_ = removeIsolatedGrokHomeAttempt(home, unlink, attempt+1)
+				_ = removeIsolatedGrokHomeAttempt(home, base, unlink, attempt+1)
 			})
 		}
 		return errGrokLoginBusy

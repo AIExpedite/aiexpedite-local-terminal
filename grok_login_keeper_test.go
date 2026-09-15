@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -605,6 +606,7 @@ func TestRemoveIsolatedGrokHome_NeverDeletesWhileTheLoginLockStaysHeld(t *testin
 		t.Fatal("could not hold the login lock")
 	}
 	t.Cleanup(release)
+	t.Cleanup(func() { grokLogin.releaseCopy(home) })
 
 	if err := removeIsolatedGrokHome(home); err == nil || !errors.Is(err, errGrokLoginBusy) {
 		t.Fatalf("removal err=%v, want errGrokLoginBusy", err)
@@ -858,5 +860,118 @@ func TestRemoveIsolatedGrokHome_KeepsTheCopyWhenTheWriteBackItselfFails(t *testi
 	}
 	if got := grokKeyIn(t, real); got != "copy-renewed" {
 		t.Errorf("real home holds %q, want the copy's credential handed over by the retry", got)
+	}
+}
+
+// TestGrokLoginKeeperOnce_DoesNotRenewWhileACopysWriteBackHasNotLanded: a live
+// copy holds the newer credential and the write into the real home fails
+// (the CLI holds the real home's auth.json.lock past the wait). The real
+// home's refresh token is one that copy SUPERSEDED, so renewing it could
+// sign the real home out for good; the tick must skip the renewal until the
+// write-back lands, then renew on the copy's chain.
+func TestGrokLoginKeeperOnce_DoesNotRenewWhileACopysWriteBackHasNotLanded(t *testing.T) {
+	real := isolateGrok(t)
+	resetGrokKeeper(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "real-superseded", "dan@example.com", now.Add(-6*time.Hour), now.Add(time.Minute))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-newer", "dan@example.com", now.Add(-3*time.Hour), now.Add(time.Minute))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+
+	renewals := 0
+	heldAtRenewal := ""
+	runGrokLoginRenewal = func(_ context.Context, _, base string) {
+		renewals++
+		heldAtRenewal = grokKeyIn(t, base)
+		writeGrokAuthMinted(t, base, "renewed", "dan@example.com", now, now.Add(6*time.Hour))
+	}
+
+	held, err := os.OpenFile(filepath.Join(real, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	if grokLoginKeeperOnce(context.Background(), "grok", now) {
+		t.Fatal("renewed the superseded real credential while the copy's write-back had not landed")
+	}
+	if renewals != 0 {
+		t.Fatalf("renewals=%d, want none", renewals)
+	}
+	_ = unlockFile(held)
+	_ = held.Close()
+
+	if !grokLoginKeeperOnce(context.Background(), "grok", now.Add(grokLoginKeeperTick)) {
+		t.Fatal("did not renew once the write-back could land")
+	}
+	if heldAtRenewal != "copy-newer" {
+		t.Errorf("real home held %q when the renewal ran, want the copy's newer credential", heldAtRenewal)
+	}
+	if got := grokKeyIn(t, copyHome); got != "renewed" {
+		t.Errorf("copy holds %q, want the renewed credential fanned out", got)
+	}
+}
+
+// TestProbeGrokBillingLive_ReportsBusyWhileACopysWriteBackHasNotLanded: the
+// same guard on the click path — the probe must not renew a superseded real
+// credential; it reports the login busy instead.
+func TestProbeGrokBillingLive_ReportsBusyWhileACopysWriteBackHasNotLanded(t *testing.T) {
+	home := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, home, "real-superseded", "a@example.com", now.Add(-12*time.Hour), now.Add(-6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "copy-newer", "a@example.com", now.Add(-6*time.Hour), now.Add(-time.Minute))
+	grokLogin.acquireCopy(copyHome)
+	t.Cleanup(func() { grokLogin.releaseCopy(copyHome) })
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+	grokBillingServer(t, func(string) (int, string) { return http.StatusUnauthorized, `{}` })
+
+	held, err := os.OpenFile(filepath.Join(home, grokAuthLockName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unlockFile(held); _ = held.Close() })
+
+	if got := probeGrokBillingLive(context.Background(), "grok", time.Now); got != grokLiveOutcomeLoginBusy {
+		t.Fatalf("outcome=%q, want login_busy", got)
+	}
+	if renewals != 0 {
+		t.Errorf("renewals=%d, want none on a superseded real credential", renewals)
+	}
+}
+
+// TestReplaceGrokAuthFile_AbortsWhenTheSourceChangedAccountSinceTheSnapshot:
+// the snapshot chose the real home's credential; before the bytes were
+// staged the user signed the real home into ANOTHER account. The staged
+// bytes would belong to that account while the stamp still describes the
+// old one; the replacement must abort rather than switch a running session's
+// account.
+func TestReplaceGrokAuthFile_AbortsWhenTheSourceChangedAccountSinceTheSnapshot(t *testing.T) {
+	real := isolateGrok(t)
+	now := time.Now()
+	writeGrokAuthMinted(t, real, "dan-new", "dan@example.com", now, now.Add(6*time.Hour))
+	copyHome := t.TempDir()
+	writeGrokAuthMinted(t, copyHome, "dan-old", "dan@example.com", now.Add(-time.Hour), now.Add(5*time.Hour))
+	newest, ok := readGrokCredentialStamp(real)
+	if !ok {
+		t.Fatal("real stamp unreadable")
+	}
+	// The account switch, between the snapshot and the staging read.
+	writeGrokAuthMinted(t, real, "someone-else", "someone@example.com", now.Add(time.Minute), now.Add(6*time.Hour))
+
+	if err := replaceGrokAuthFileIfOlder(copyHome, newest); err == nil {
+		t.Fatal("another account's credential was installed into the copy")
+	}
+	if got := grokKeyIn(t, copyHome); got != "dan-old" {
+		t.Errorf("copy holds %q, want it untouched", got)
+	}
+	if _, err := os.Stat(filepath.Join(copyHome, "auth.json.aix-tmp")); !os.IsNotExist(err) {
+		t.Error("staging file left behind")
 	}
 }

@@ -340,6 +340,14 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		// timestamp-fresh copy that xAI already rejected still needs a rotate
 		// of its (newer) refresh chain, not a skip.
 		reconcileGrokLoginLocked(base)
+		// The write-back must have landed before the real home is renewed:
+		// renewing a refresh token a live copy has superseded can sign the
+		// real home out for good (grokRealHomeHoldsNewest). Until it lands,
+		// this login is busy, not broken.
+		if !grokRealHomeHoldsNewest(base) {
+			renewalBlocked = true
+			return
+		}
 		runGrokLoginRenewal(ctx, grokPath, base)
 		// Every live copy of the login now holds a superseded refresh token;
 		// hand them the renewed file before xAI's grace window closes — still

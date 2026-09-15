@@ -202,6 +202,29 @@ func acquireGrokAuthLock(dstHome string) (*os.File, error) {
 	}
 }
 
+// readGrokAuthFileVerified reads srcHome's auth.json under the CLI's lock
+// beside it, after verify has approved the credential it currently holds.
+// Under that lock the CLI cannot rewrite the file between the stamp and the
+// bytes (it waits for the lock, or gives up), so the two describe one state.
+func readGrokAuthFileVerified(srcHome string, verify func(grokCredentialStamp) error) ([]byte, error) {
+	lock, err := acquireGrokAuthLock(srcHome)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = unlockFile(lock)
+		_ = lock.Close()
+	}()
+	current, ok := readGrokCredentialStamp(srcHome)
+	if !ok {
+		return nil, errGrokSourceMovedOn
+	}
+	if err := verify(current); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(srcHome, "auth.json"))
+}
+
 // replaceGrokAuthFile installs src's auth.json into dstHome atomically (write
 // beside, rename over), so Grok's hot reload never sees a half-written file.
 // The staging copy is prepared BEFORE the lock is taken and the destination
@@ -215,7 +238,21 @@ func replaceGrokAuthFile(dstHome, srcHome string) error {
 // CLI's auth lock immediately before the rename; a non-nil error from the
 // check aborts the replacement and nothing is written.
 func replaceGrokAuthFileWhen(dstHome, srcHome string, check func() error) error {
-	data, err := os.ReadFile(filepath.Join(srcHome, "auth.json"))
+	return replaceGrokAuthFileFrom(dstHome, srcHome, func(grokCredentialStamp) error { return nil }, check)
+}
+
+// errGrokSourceMovedOn: the source's credential is no longer the one the
+// snapshot chose (an account switch, a refresh) — the staged bytes would not
+// be what the caller decided to install. Nothing is written.
+var errGrokSourceMovedOn = errors.New("grok login source changed since the snapshot")
+
+// replaceGrokAuthFileFrom stages srcHome's credential and installs it into
+// dstHome. The source is read under ITS CLI lock, and its stamp is handed to
+// verifySource before the bytes are staged: the bytes and the stamp are the
+// same read, so what verifySource approves is what gets installed. check
+// then runs under the DESTINATION's CLI lock immediately before the rename.
+func replaceGrokAuthFileFrom(dstHome, srcHome string, verifySource func(grokCredentialStamp) error, check func() error) error {
+	data, err := readGrokAuthFileVerified(srcHome, verifySource)
 	if err != nil {
 		return err
 	}
@@ -255,7 +292,13 @@ func replaceGrokAuthFileWhen(dstHome, srcHome string, check func() error) error 
 // what keeps the snapshot's choice from landing on top of that refresh — and
 // a child mid-write holds the lock, so the keeper waits for it or skips.
 func replaceGrokAuthFileIfOlder(dstHome string, newest grokCredentialStamp) error {
-	return replaceGrokAuthFileWhen(dstHome, newest.Home, func() error {
+	sameAsChosen := func(current grokCredentialStamp) error {
+		if current.Fingerprint != newest.Fingerprint || !current.MintedAt.Equal(newest.MintedAt) {
+			return errGrokSourceMovedOn
+		}
+		return nil
+	}
+	return replaceGrokAuthFileFrom(dstHome, newest.Home, sameAsChosen, func() error {
 		current, ok := readGrokCredentialStamp(dstHome)
 		if !ok {
 			// The snapshot saw a credential here and now there is none: the
@@ -367,6 +410,27 @@ func reconcileGrokLoginLocked(base string) int {
 	return rewritten
 }
 
+// grokRealHomeHoldsNewest reports whether the real home's credential is at
+// least as new as every live same-account copy's. False means a copy's
+// write-back did not land (the CLI held the lock past our wait, a sharing
+// violation): the real home's refresh token is then one a copy has
+// SUPERSEDED, and renewing it — past the grace window — would make the CLI
+// sign the real home out, after which the copy's live credential can never
+// be written back (a signed-out real home is never recreated). So no renewal
+// runs until the write-back has landed.
+func grokRealHomeHoldsNewest(base string) bool {
+	real, ok := readGrokCredentialStamp(base)
+	if !ok {
+		return false
+	}
+	for _, home := range grokLogin.liveCopies() {
+		if s, ok := readGrokCredentialStamp(home); ok && s.Fingerprint == real.Fingerprint && s.MintedAt.After(real.MintedAt) {
+			return false
+		}
+	}
+	return true
+}
+
 // grokLoginKeeperState is the keeper's memory between ticks.
 type grokLoginKeeperState struct {
 	mu            sync.Mutex
@@ -407,7 +471,7 @@ func grokLoginKeeperOnce(ctx context.Context, grokPath string, now time.Time) bo
 
 	renewed := false
 	if stamp, ok := readGrokCredentialStamp(base); ok && stamp.Refreshable && !stamp.ExpiresAt.IsZero() &&
-		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) {
+		grokPath != "" && !now.Add(grokLoginKeepAhead).Before(stamp.ExpiresAt) && grokRealHomeHoldsNewest(base) {
 		grokKeeper.mu.Lock()
 		// One attempt per credential per retry window: a renewal that left
 		// the same token in place is not retried every tick.
