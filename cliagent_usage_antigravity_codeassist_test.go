@@ -207,6 +207,48 @@ func TestProbeAntigravityQuotaCodeAssist_NoLoginWithoutAKeyringEntry(t *testing.
 	}
 }
 
+// The macOS Keychain hands the login back inside go-keyring's base64
+// envelope ("go-keyring-base64:<base64 JSON>") — that is what
+// `security find-generic-password -s gemini -a antigravity -w` printed on
+// Daniel-Mac on 2026-09-15, and what v1.0.24-26 logged as "not a JSON object"
+// on every Refresh while the Windows machine (unencoded blob) worked.
+func TestAntigravityStoredToken_DecodesTheMacKeychainEnvelope(t *testing.T) {
+	inner, _ := json.Marshal(map[string]any{
+		"auth_method": "consumer",
+		"id_token":    helperIDToken(t, "mac@example.com"),
+		"token": map[string]any{
+			"access_token": "ya29.mac-token", "token_type": "Bearer", "refresh_token": "1//never-decoded",
+			"expiry": time.Now().Add(time.Hour).Format(time.RFC3339),
+		},
+	})
+	envelope := []byte(antigravityKeyringBase64Prefix + base64.StdEncoding.EncodeToString(inner) + "\n")
+	orig := antigravityKeyringReader
+	t.Cleanup(func() { antigravityKeyringReader = orig })
+	antigravityKeyringReader = func(context.Context) ([]byte, bool) { return envelope, true }
+
+	tok, ok := antigravityStoredToken(context.Background())
+	if !ok {
+		t.Fatal("the enveloped login must be read as a login")
+	}
+	if tok.AccessToken != "ya29.mac-token" {
+		t.Errorf("access_token=%q", tok.AccessToken)
+	}
+	if got := antigravityIDTokenEmail(tok.IDToken); got != "mac@example.com" {
+		t.Errorf("account from the enveloped id_token=%q", got)
+	}
+
+	// A prefix that does not decode is left as read, so the shape log still
+	// names what was there instead of an empty string.
+	bad := []byte(antigravityKeyringBase64Prefix + "%%%not-base64%%%")
+	if got := decodeAntigravityKeyringEnvelope(bad); string(got) != string(bad) {
+		t.Errorf("undecodable envelope changed to %q", got)
+	}
+	// An unenveloped value (Windows, Linux) passes through untouched.
+	if got := decodeAntigravityKeyringEnvelope(inner); string(got) != string(inner) {
+		t.Error("plain JSON must pass through the envelope decoder unchanged")
+	}
+}
+
 func TestAntigravityPinnedURL_OverrideMustBeLoopback(t *testing.T) {
 	t.Setenv(antigravityCodeAssistURLEnv, "https://evil.example.com/v1internal:retrieveUserQuotaSummary")
 	if got := antigravityPinnedURL(antigravityCodeAssistURLEnv, antigravityCodeAssistEndpoint); got != antigravityCodeAssistEndpoint {

@@ -828,7 +828,13 @@ Manager `gemini:antigravity` on Windows, Keychain service `gemini` / account
 `{"auth_method", "id_token", "token": {access_token, token_type, refresh_token,
 expiry}}` — read off a real entry's key names on 2026-09-15; a bare OAuth2
 token JSON is accepted too, and an entry in any other shape is logged by its
-key names only. So a gated build is read the way the Grok and Claude
+key names only. **On macOS the Keychain returns that JSON inside go-keyring's
+base64 envelope** (`go-keyring-base64:<base64>` — the Go library `agy` stores
+through encodes before `security add-generic-password`), which v1.0.24-26
+logged as "not a JSON object" and reported `codeassist_no_login` on every
+Refresh while Windows, whose Credential Manager blob is unencoded, worked;
+v1.0.27 strips the prefix and decodes (`decodeAntigravityKeyringEnvelope`,
+prefix-driven so the Windows / Linux paths are untouched). So a gated build is read the way the Grok and Claude
 probes read theirs — the CLI's own stored credential against the vendor's
 endpoint ([`cliagent_usage_antigravity_codeassist.go`](cliagent_usage_antigravity_codeassist.go),
 keyring readers in `antigravity_keyring_*.go`):
