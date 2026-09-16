@@ -106,6 +106,15 @@ type antigravityKeyringToken struct {
 	IDToken     string    `json:"id_token"`
 }
 
+// antigravityKeyringBase64Prefix marks a value the Go `go-keyring` library
+// (which `agy` stores its login through) base64-encoded before writing it to
+// the macOS Keychain. `security find-generic-password -w` hands that envelope
+// back verbatim — "go-keyring-base64:eyJ0b2tlbiI6…" — so the JSON is only
+// reachable after stripping the prefix and decoding. Windows Credential
+// Manager and Linux secret-service receive the JSON unencoded, so the decode
+// is prefix-driven and harmless where the prefix never appears.
+const antigravityKeyringBase64Prefix = "go-keyring-base64:"
+
 // antigravityKeyringReader is the platform keyring read
 // (antigravity_keyring_*.go); a var so tests supply a token without touching
 // the machine's keyring.
@@ -131,6 +140,7 @@ func antigravityStoredToken(ctx context.Context) (tok antigravityKeyringToken, o
 	if !ok || len(bytes.TrimSpace(raw)) == 0 {
 		return antigravityKeyringToken{}, false
 	}
+	raw = decodeAntigravityKeyringEnvelope(raw)
 	var wrapped struct {
 		IDToken string                   `json:"id_token"`
 		Token   *antigravityKeyringToken `json:"token"`
@@ -148,6 +158,22 @@ func antigravityStoredToken(ctx context.Context) (tok antigravityKeyringToken, o
 	fmt.Printf("%s[cli-usage] Antigravity keyring entry present but in an unrecognised shape (top-level keys: %s)%s\n",
 		colorYellow, antigravityJSONKeyNames(raw), colorReset)
 	return antigravityKeyringToken{}, false
+}
+
+// decodeAntigravityKeyringEnvelope unwraps the go-keyring base64 envelope the
+// macOS Keychain returns (see antigravityKeyringBase64Prefix). Any other value
+// is returned as read; an envelope that does not decode is returned as read
+// too, so the shape log names it rather than an empty string.
+func decodeAntigravityKeyringEnvelope(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if !bytes.HasPrefix(trimmed, []byte(antigravityKeyringBase64Prefix)) {
+		return raw
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(trimmed[len(antigravityKeyringBase64Prefix):]))
+	if err != nil {
+		return raw
+	}
+	return decoded
 }
 
 // antigravityJSONKeyNames lists a JSON object's top-level key names — the one
