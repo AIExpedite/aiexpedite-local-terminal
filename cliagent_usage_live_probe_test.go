@@ -567,7 +567,7 @@ func stubLiveProbes(t *testing.T) *int32 {
 	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string { slow(); panic("boom") }
 	warmCLIAgentModelDiscoveryFn = func(context.Context, string, detectedCLIAgent, string) {}
 	// The Code Assist route must never touch the machine's keyring from a test.
-	probeAntigravityQuotaCodeAssistFn = func(context.Context, func() time.Time) string { return liveProbeOutcomeCodeAssistNoLogin }
+	probeAntigravityQuotaCodeAssistFn = func(context.Context, string, func() time.Time) string { return liveProbeOutcomeCodeAssistNoLogin }
 	return &calls
 }
 

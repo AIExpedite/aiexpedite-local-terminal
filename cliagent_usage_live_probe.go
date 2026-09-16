@@ -533,10 +533,10 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 // every run — and tries once more. (The warm-up is cached for the click, so
 // the caller's later warm is a no-op.)
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
-	outcome := probeAntigravityQuotaCodeAssistFn(ctx, time.Now)
+	outcome := probeAntigravityQuotaCodeAssistFn(ctx, agent.Version, time.Now)
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
 		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
-		outcome = probeAntigravityQuotaCodeAssistFn(ctx, time.Now)
+		outcome = probeAntigravityQuotaCodeAssistFn(ctx, agent.Version, time.Now)
 	}
 	return outcome
 }
