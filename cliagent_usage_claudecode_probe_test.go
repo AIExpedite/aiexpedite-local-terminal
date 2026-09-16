@@ -3041,6 +3041,46 @@ func TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal(t *testing.T) 
 	}
 }
 
+// A post-run probe refused by the latch must know it was refused even when it
+// read the very instant the holder was admitted at. Go's clock on Windows
+// advances on the interrupt tick (0.5–15.6 ms), so a probe fired a few
+// milliseconds behind a routine gather routinely reads the gather's instant;
+// deciding "was that my attempt?" by comparing instants then answers yes, and
+// the retry the previous test relies on is dropped — the windows-latest-only
+// failure of that test and of the native-lifecycle freshness test. The answer
+// has to come from begin() itself.
+func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("a refused probe must not reach the endpoint")
+	})
+	holderAt := time.Now()
+	if !claudeUsageProbe.begin(holderAt, false) {
+		t.Fatal("the holder must take the slot")
+	}
+	t.Cleanup(func() { claudeUsageProbe.finish(nil, false, time.Time{}, "") })
+
+	// Same instant as the holder — what a coarse clock hands the loser.
+	admitted, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(
+		context.Background(), holderAt, claudeUsageProbeStoredIdentity, holderAt, false)
+	if admitted {
+		t.Error("a probe refused by the single-flight latch reported itself admitted")
+	}
+	if refreshed || !observedAt.IsZero() || probeErr != nil {
+		t.Errorf("refusal must be silent: refreshed=%v observedAt=%v err=%v", refreshed, observedAt, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0", got)
+	}
+
+	// Release the slot: the same call at the same instant is now admitted.
+	claudeUsageProbe.finish(nil, false, time.Time{}, "")
+	admitted, _, _, _ = probeClaudeUsageAdmitted(
+		context.Background(), holderAt, func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }, holderAt, false)
+	if !admitted {
+		t.Error("with the slot free, the attempt must report itself admitted")
+	}
+}
+
 // waitForClaudeProbeInFlight blocks until a probe holds the single-flight slot,
 // so a test can stage the refusal deterministically instead of sleeping.
 func waitForClaudeProbeInFlight(t *testing.T) {

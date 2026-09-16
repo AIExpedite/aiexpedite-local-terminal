@@ -772,22 +772,6 @@ func (g *claudeUsageProbeGate) awaitInFlight() bool {
 	}
 }
 
-// admittedAt reports whether the attempt this gate last admitted is the one that
-// began at `at` — i.e. whether the caller that passed `at` to probeClaudeUsage
-// got the single-flight slot.
-//
-// begin() records the admitted attempt's own `now`, so an exact match is the
-// only reading that identifies OUR attempt: a probe refused by the latch leaves
-// lastAttempt belonging to whoever holds it, whose instant may be either side of
-// ours. Ambiguity is impossible in practice (two goroutines do not read the same
-// wall instant) and resolves to "admitted" if it ever happened, which merely
-// declines a retry rather than issuing a spurious one.
-func (g *claudeUsageProbeGate) admittedAt(at time.Time) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.lastAttempt.Equal(at)
-}
-
 // recordOwed notes that a run completed at `baseline` and still needs an
 // observation newer than it.
 //
@@ -1136,15 +1120,42 @@ func probeClaudeUsage(
 	dedupeBaseline time.Time,
 	forced bool,
 ) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
+	_, refreshed, observedAt, probeErr = probeClaudeUsageAdmitted(ctx, now, resolveIdentity, dedupeBaseline, forced)
+	return refreshed, observedAt, probeErr
+}
+
+// probeClaudeUsageAdmitted is probeClaudeUsage reporting, in addition, whether
+// THIS call was the one begin() admitted to the single-flight slot. A caller
+// settling a post-run debt needs that fact directly: "admitted and it
+// skipped/failed" leaves the debt for the next gather, while "refused by the
+// latch" means the debt has not had its turn and must retry behind the holder.
+//
+// It is reported here, from begin()'s own answer, rather than reconstructed
+// afterwards by comparing the caller's instant with the gate's lastAttempt
+// (what admittedAt did until v1.0.27). That comparison assumed two goroutines
+// never read the same wall instant, which is false on Windows: Go's clock there
+// advances on the interrupt tick (0.5–15.6 ms), so a post-run probe refused a
+// few milliseconds behind a routine gather read the gather's instant, judged
+// itself admitted, and dropped the retry — the run's utilization never moved
+// (TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal and the
+// native-lifecycle freshness test failing only on the windows-latest runner).
+func probeClaudeUsageAdmitted(
+	ctx context.Context,
+	now time.Time,
+	resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time,
+	forced bool,
+) (admitted, refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
 	// An already-cancelled gather must not burn the throttle slot on a request
 	// that cannot complete: the next caller would then be refused for a minute
 	// because of a probe that never left the process.
 	if ctx.Err() != nil {
-		return false, time.Time{}, nil
+		return false, false, time.Time{}, nil
 	}
 	if !claudeUsageProbe.begin(now, forced) {
-		return false, time.Time{}, nil
+		return false, false, time.Time{}, nil
 	}
+	admitted = true
 	// Release the single-flight latch on EVERY path out of here. begin() has
 	// already set inFlight, so an early return that skipped this would leave the
 	// latch stuck and every future probe in this process rejected — a permanent
@@ -1165,7 +1176,7 @@ func probeClaudeUsage(
 	persistedFor = identity.fingerprint
 	if identity.token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.
-		return false, time.Time{}, nil
+		return admitted, false, time.Time{}, nil
 	}
 
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
@@ -1186,18 +1197,18 @@ func probeClaudeUsage(
 		// check, so without the instant it would shape metrics from the pre-write
 		// buckets while the debt (and the trailing retry that would have
 		// corrected it) is already settled. See refreshClaudeUsageIfStale.
-		return false, sharedAt, nil
+		return admitted, false, sharedAt, nil
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, claudeUsageProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorInternal)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorInternal)
 	}
 	req.Header.Set("Authorization", "Bearer "+identity.token)
 	req.Header.Set("Accept", "application/json")
@@ -1216,7 +1227,7 @@ func probeClaudeUsage(
 		if reqCtx.Err() != nil {
 			category = cliUsageErrorProviderTimeout
 		}
-		return false, time.Time{}, claudeUsageProbeFailure(category)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(category)
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, claudeUsageProbeMaxBody))
@@ -1224,7 +1235,7 @@ func probeClaudeUsage(
 	}()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		// Honor the service backpressure rather than only our own timer. This
@@ -1232,10 +1243,10 @@ func probeClaudeUsage(
 		// account — Claude own /usage panel included — so ignoring Retry-After
 		// would keep pressing exactly when we have been asked to stop.
 		claudeUsageProbe.holdUntil(retryAfterDeadline(resp.Header.Get("Retry-After"), time.Now()))
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	// Read at most the cap + 1 byte so an oversized body is DETECTED rather than
@@ -1243,12 +1254,12 @@ func probeClaudeUsage(
 	// be treated as a partial observation.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, claudeUsageProbeMaxBody+1))
 	if err != nil || len(body) > claudeUsageProbeMaxBody {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	var decoded claudeUsageProbeResponse
 	if json.Unmarshal(body, &decoded) != nil {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 
 	updates := claudeUsageProbeBuckets(decoded, now)
@@ -1256,7 +1267,7 @@ func probeClaudeUsage(
 		// A response we cannot plot is not an observation. Returning here leaves
 		// the cache byte-identical rather than stamping a fresh ObservedAt on
 		// nothing.
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 	// Report success only if the snapshot actually reached disk. The
 	// fire-and-forget merge swallows an unwritable data dir, a Windows sharing
@@ -1273,7 +1284,7 @@ func probeClaudeUsage(
 	persisted, err := mergeClaudeRateLimitCacheChecked(ctx, claudeRateLimitCachePath(), updates, now,
 		identity.fingerprint, claudeRateLimitSourceProbe)
 	if err != nil {
-		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
+		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
 	}
 	// `persisted`, not `now`: the merge refuses a bucket whose stamp is older
 	// than the reading already standing in that window, so a probe holding the
@@ -1281,7 +1292,7 @@ func probeClaudeUsage(
 	// cares about. Reporting what the cache HOLDS lets the caller decide whether
 	// this covers the run it owes, instead of inferring it from "the write
 	// succeeded".
-	return true, persisted, nil
+	return admitted, true, persisted, nil
 }
 
 // claudeUsageProbeBuckets converts the allow-listed response into cache buckets.
@@ -1678,11 +1689,10 @@ func claudeUsageProbeAttempt(baseline time.Time) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeWholeTimeout)
 	defer cancel()
 
-	attemptAt := time.Now()
 	// forced=false: this is the background trailing probe. It must never spend a
 	// bypass a concurrent refresh is holding — that theft is what leaves the
 	// refresh signing a pre-probe cache.
-	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, attemptAt, claudeUsageProbeStoredIdentity, baseline, false)
+	admitted, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
 	// Same rule as the gather path: a write that left the run's window owned by
 	// an older reading has not paid this debt, even though it succeeded.
@@ -1691,8 +1701,10 @@ func claudeUsageProbeAttempt(baseline time.Time) bool {
 		return true
 	}
 	// A refusal or failure deliberately leaves the debt standing: the next
-	// gather, reconnect, or run retries it under the same bounds.
-	return claudeUsageProbe.admittedAt(attemptAt)
+	// gather, reconnect, or run retries it under the same bounds. Whether this
+	// was OUR attempt comes from begin() itself — never from comparing instants,
+	// which collide on Windows' coarse clock (see probeClaudeUsageAdmitted).
+	return admitted
 }
 
 // retryAfterDeadline turns a Retry-After header into an absolute instant, or the
