@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -51,6 +52,13 @@ func helperCodeAssistServers(t *testing.T, quota func(auth string) (int, string)
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		// Google's rule: a client it does not know is answered 403
+		// SUBSCRIPTION_REQUIRED however valid the token (verified 2026-09-15).
+		if !strings.HasPrefix(r.UserAgent(), "antigravity/cli/") {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(antigravityCodeAssistLicenceRefusal))
+			return
+		}
 		status, body := quota(r.Header.Get("Authorization"))
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(body))
@@ -88,7 +96,7 @@ func TestProbeAntigravityQuotaCodeAssist_ReadsAndCachesUnderTheTokensAccount(t *
 			return http.StatusOK, `{"sub":"123","email":"ada@example.com"}`
 		})
 
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistOK {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
 		t.Fatalf("outcome=%q, want ok", got)
 	}
 	if *quotaCalls != 1 || *userinfoCalls != 1 {
@@ -128,7 +136,7 @@ func TestProbeAntigravityQuotaCodeAssist_IdentityFromTheStoredIDToken(t *testing
 		func(string) (int, string) { return http.StatusOK, `{"response":` + antigravityCodeAssistFixture + `}` },
 		func(string) (int, string) { return http.StatusInternalServerError, `{}` })
 
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistOK {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
 		t.Fatalf("outcome=%q, want ok (enveloped response accepted, identity from id_token)", got)
 	}
 	if *userinfoCalls != 0 {
@@ -149,7 +157,7 @@ func TestProbeAntigravityQuotaCodeAssist_ExpiredTokenIsNamedAndNeverSent(t *test
 	quotaCalls, _ := helperCodeAssistServers(t,
 		func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
 		func(string) (int, string) { return http.StatusOK, `{"email":"x@example.com"}` })
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistTokenExpired {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistTokenExpired {
 		t.Fatalf("outcome=%q, want token_expired", got)
 	}
 	if *quotaCalls != 0 {
@@ -162,7 +170,7 @@ func TestProbeAntigravityQuotaCodeAssist_RefusalsNeverPersist(t *testing.T) {
 	helperCodeAssistServers(t,
 		func(string) (int, string) { return http.StatusUnauthorized, `{"error":{"status":"UNAUTHENTICATED"}}` },
 		func(string) (int, string) { return http.StatusOK, `{"email":"x@example.com"}` })
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistUnauthorized {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistUnauthorized {
 		t.Fatalf("outcome=%q, want unauthorized", got)
 	}
 	if _, err := os.Stat(os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")); !os.IsNotExist(err) {
@@ -175,7 +183,7 @@ func TestProbeAntigravityQuotaCodeAssist_RefusalsNeverPersist(t *testing.T) {
 	helperCodeAssistServers(t,
 		func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
 		func(string) (int, string) { return http.StatusInternalServerError, `{}` })
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistNotSigned {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistNotSigned {
 		t.Fatalf("outcome=%q, want not_attributable", got)
 	}
 	if _, err := os.Stat(os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")); !os.IsNotExist(err) {
@@ -185,13 +193,13 @@ func TestProbeAntigravityQuotaCodeAssist_RefusalsNeverPersist(t *testing.T) {
 
 func TestProbeAntigravityQuotaCodeAssist_NoLoginWithoutAKeyringEntry(t *testing.T) {
 	helperStubAntigravityKeyring(t, nil)
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
 		t.Fatalf("outcome=%q, want no_login", got)
 	}
 	// An entry in an unknown shape is no login either — and only its key
 	// names may be logged.
 	helperStubAntigravityKeyring(t, map[string]any{"credential": "opaque-secret-value"})
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistNoLogin {
 		t.Fatalf("outcome=%q, want no_login for an unrecognised shape", got)
 	}
 	if names := antigravityJSONKeyNames([]byte(`{"token":{"access_token":"x"},"id_token":"y"}`)); names != "id_token,token" {
@@ -225,7 +233,7 @@ func TestProbeAntigravityQuotaLiveUnlessGated_GatedBuildReadsFromGoogle(t *testi
 			atomic.AddInt32(&warmed, 1)
 		}
 	}
-	probeAntigravityQuotaCodeAssistFn = func(context.Context, func() time.Time) string {
+	probeAntigravityQuotaCodeAssistFn = func(context.Context, string, func() time.Time) string {
 		if atomic.AddInt32(&reads, 1) == 1 {
 			return liveProbeOutcomeCodeAssistTokenExpired
 		}
@@ -283,5 +291,51 @@ func TestAntigravityUsageParser_ReadingNewerThanTheGateHidesTheNotice(t *testing
 	usage, _ = antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Version: "1.2.3"}, now)
 	if usage.Notice != "" {
 		t.Errorf("a re-noted refusal outranked the newer reading: %q", usage.Notice)
+	}
+}
+
+// antigravityCodeAssistLicenceRefusal is what Google answered the agent's
+// v1.0.24-25 request (Go's default User-Agent) with, a valid token and all.
+const antigravityCodeAssistLicenceRefusal = `{"error":{"code":403,"message":"You do not have a valid license of this product. Please contact your administrator to request a license. If you are not an enterprise user and believe you are receiving this message as an error, please try using the latest version and logging in again. (#3501)","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"SUBSCRIPTION_REQUIRED","domain":"cloudaicompanion.googleapis.com"}]}}`
+
+// TestProbeAntigravityQuotaCodeAssist_IdentifiesItselfAsTheAntigravityClient:
+// the request carries agy's own User-Agent, built from the detected version
+// — without it Google refuses the licence (403), which is exactly what AIE2
+// logged as codeassist_unauthorized after the v1.0.25 update.
+func TestProbeAntigravityQuotaCodeAssist_IdentifiesItselfAsTheAntigravityClient(t *testing.T) {
+	helperStubAntigravityKeyring(t, map[string]any{
+		"access_token": "access-A", "token_type": "Bearer",
+		"expiry": time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
+	})
+	var seenUA string
+	qs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenUA = r.UserAgent()
+		if !strings.HasPrefix(seenUA, "antigravity/cli/") {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(antigravityCodeAssistLicenceRefusal))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(antigravityCodeAssistFixture))
+	}))
+	us := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"email":"ada@example.com"}`))
+	}))
+	t.Cleanup(qs.Close)
+	t.Cleanup(us.Close)
+	t.Setenv(antigravityCodeAssistURLEnv, qs.URL+"/v1internal:retrieveUserQuotaSummary")
+	t.Setenv(antigravityUserinfoURLEnv, us.URL+"/oauth2/v3/userinfo")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	want := "antigravity/cli/1.2.3 (aidev_client; os_type=" + runtime.GOOS + "; arch=" + runtime.GOARCH + "; auth_method=consumer)"
+	if seenUA != want {
+		t.Errorf("User-Agent=%q, want %q", seenUA, want)
+	}
+	// An unknown detected version still names a build Google accepts.
+	if got := antigravityCodeAssistUserAgent(""); !strings.HasPrefix(got, "antigravity/cli/"+antigravityCodeAssistUserAgentFallbackVersion+" (") {
+		t.Errorf("fallback User-Agent=%q", got)
 	}
 }

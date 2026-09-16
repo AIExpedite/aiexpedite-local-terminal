@@ -833,7 +833,14 @@ probes read theirs — the CLI's own stored credential against the vendor's
 endpoint ([`cliagent_usage_antigravity_codeassist.go`](cliagent_usage_antigravity_codeassist.go),
 keyring readers in `antigravity_keyring_*.go`):
 `POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
-with `Authorization: Bearer`, the account named by the stored `id_token` else
+with `Authorization: Bearer` **and agy's own `User-Agent`**
+(`antigravity/cli/<version> (aidev_client; os_type=…; arch=…; auth_method=consumer)`,
+`antigravityCodeAssistUserAgent`): Google licenses the endpoint per client and
+identifies the client by that header — the same token with Go's default
+User-Agent is answered `403 PERMISSION_DENIED / SUBSCRIPTION_REQUIRED` ("You
+do not have a valid license of this product"), which is what v1.0.24-25 logged
+as `codeassist_unauthorized` on every Refresh (found and verified on AIE2,
+2026-09-15; v1.0.26 carries the header). The account is named by the stored `id_token` else
 Google's userinfo, persisted through the same allowlisted snapshot path under
 that account's fingerprint. Only the Refresh click runs it, only once the
 loopback route is known gated; the agent never renews the login (an expired

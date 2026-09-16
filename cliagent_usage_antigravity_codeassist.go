@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -62,7 +63,28 @@ const (
 	// "service:user" for the Windows credential name).
 	antigravityKeyringService = "gemini"
 	antigravityKeyringUser    = "antigravity"
+
+	// antigravityCodeAssistUserAgentFallbackVersion is the build named in the
+	// User-Agent when the detected agy version is unknown — the build the
+	// rule below was verified on.
+	antigravityCodeAssistUserAgentFallbackVersion = "1.2.3"
 )
+
+// antigravityCodeAssistUserAgent is the User-Agent the quota request MUST
+// carry. Google licenses this endpoint per client, and identifies the client
+// by this header: the same token with Go's default User-Agent is answered
+// 403 PERMISSION_DENIED / SUBSCRIPTION_REQUIRED ("You do not have a valid
+// license of this product"), which is what the agent recorded as
+// codeassist_unauthorized on v1.0.24-25; with agy's own format it is answered
+// 200 (verified 2026-09-15 against agy 1.2.3). The format mirrors agy's:
+// "antigravity/cli/<version> (aidev_client; os_type=<os>; arch=<arch>; auth_method=consumer)".
+func antigravityCodeAssistUserAgent(version string) string {
+	version = clampASCII(strings.TrimSpace(version), antigravityQuotaGateMaxVersion)
+	if version == "" {
+		version = antigravityCodeAssistUserAgentFallbackVersion
+	}
+	return fmt.Sprintf("antigravity/cli/%s (aidev_client; os_type=%s; arch=%s; auth_method=consumer)", version, runtime.GOOS, runtime.GOARCH)
+}
 
 // Code Assist probe outcome codes — a closed set, logged on the device only.
 const (
@@ -237,7 +259,7 @@ func antigravityCodeAssistIdentity(ctx context.Context, client *http.Client, tok
 // fetchAntigravityQuotaCodeAssist performs the one quota request. The
 // response is the same QuotaSummary shape the loopback server relays, either
 // bare or under a "response" envelope; both are accepted.
-func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, accessToken string, now time.Time) (antigravityQuotaSnapshot, string) {
+func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, accessToken, version string, now time.Time) (antigravityQuotaSnapshot, string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		antigravityPinnedURL(antigravityCodeAssistURLEnv, antigravityCodeAssistEndpoint), bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -246,6 +268,7 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", antigravityCodeAssistUserAgent(version))
 	resp, err := client.Do(req)
 	if err != nil {
 		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistHTTPError
@@ -256,6 +279,10 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 	}()
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		// 401 (the token) and 403 (the licence / client identity) are worth
+		// telling apart on the device: a 403 on a valid token is the client
+		// rule above, not the login.
+		fmt.Printf("%s[cli-usage] Antigravity Code Assist quota request refused with %d%s\n", colorYellow, resp.StatusCode, colorReset)
 		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistUnauthorized
 	case resp.StatusCode != http.StatusOK:
 		// The status class is the one diagnostic worth having on the device
@@ -291,7 +318,7 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 // probeAntigravityQuotaCodeAssist reads the quota from Google with the stored
 // login and caches it under the account that login names. Returns a closed
 // outcome code.
-func probeAntigravityQuotaCodeAssist(ctx context.Context, now func() time.Time) string {
+func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now func() time.Time) string {
 	tok, ok := antigravityStoredToken(ctx)
 	if !ok {
 		return liveProbeOutcomeCodeAssistNoLogin
@@ -302,7 +329,7 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, now func() time.Time) 
 	client := antigravityCodeAssistClient()
 	defer client.CloseIdleConnections()
 
-	snap, outcome := fetchAntigravityQuotaCodeAssist(ctx, client, tok.AccessToken, now())
+	snap, outcome := fetchAntigravityQuotaCodeAssist(ctx, client, tok.AccessToken, version, now())
 	if outcome != liveProbeOutcomeCodeAssistOK {
 		return outcome
 	}
