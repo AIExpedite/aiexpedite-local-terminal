@@ -6241,7 +6241,9 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		fmt.Printf("%s[session] Starting session %s for command: %s%s\n",
 			colorCyan, cmd.SessionID, cmd.Command, colorReset)
 
-		err := globalSessionManager.StartSession(
+		// cmd.ConversationID is the SIGNED exact-resume seed (empty on an
+		// ordinary start) — see cli_conversation_resume.go.
+		err := globalSessionManager.StartSessionResuming(
 			cmd.SessionID,
 			cmd.Command,
 			sessionStartArgsForCommand(cmd),
@@ -6250,6 +6252,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			cmd.UID,
 			cmd.TimeoutMs,
 			cmd.Tty,
+			cmd.ConversationID,
 			publishFn,
 		)
 		if err != nil {
