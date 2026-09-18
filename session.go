@@ -105,6 +105,14 @@ type CLISession struct {
 	// a terminal result event and must retain their process exit code.
 	antigravityManagedStream bool
 
+	// cliConversationID is the one-shot CLI's OWN conversation id (agy
+	// `conversation_id` / OpenCode `sessionID`), captured off its JSON stream so
+	// a follow-up can resume the exact conversation in a new process.
+	// cliConversationPublished records that a stream frame already carried it.
+	// Both guarded by mu. See cli_conversation_resume.go.
+	cliConversationID        string
+	cliConversationPublished bool
+
 	// finishQuotaCapture releases the run-scoped Antigravity quota poller armed
 	// at spawn (cliagent_usage_antigravity_capture.go). For a command that is
 	// not agy it is armAntigravityCaptureForCommand's no-op release, so this
@@ -226,6 +234,14 @@ type PublishFunc func(res resultMsg)
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
 func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, publishFn PublishFunc) error {
+	return sm.StartSessionResuming(id, command, args, cwd, workspaceID, uid, timeoutMs, tty, "", publishFn)
+}
+
+// StartSessionResuming is StartSession with an exact conversation-resume seed:
+// a non-empty resumeConversationID (the SIGNED `conversationId` wire field) makes
+// a one-shot CLI start reattach to that conversation instead of opening a new
+// one. Empty is an ordinary start. See cli_conversation_resume.go.
+func (sm *SessionManager) StartSessionResuming(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, resumeConversationID string, publishFn PublishFunc) error {
 	// Re-verify Claude's status-line hook before launching a claude session. A
 	// Claude Code update rewrites settings.json and can drop our `statusLine`,
 	// silently stopping the only writer that carries numeric utilization on
@@ -279,6 +295,16 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// injecting --always-approve before the strict child-argv validation below.
 	enableGrokAlwaysApprove := !grokMaintenanceSmoke && sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+
+	// Exact conversation resume (one-shot CLIs). Refused rather than ignored when
+	// it cannot be honoured: the caller sent only its follow-up text.
+	if resumeConversationID != "" {
+		seeded, seedErr := applyCliResumeSeed(command, args, cliArgs, resumeConversationID, tty)
+		if seedErr != nil {
+			return seedErr
+		}
+		cliArgs = seeded
+	}
 
 	// Grok's `--tools` selector filters built-in tools only. An explicitly
 	// identified maintenance smoke must also be isolated from user-installed
@@ -1388,6 +1414,8 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			Type:        "stream",
 			SessionID:   session.ID,
 			Seq:         int(seq),
+			// Once per session — see takeUnpublishedCliConversationID.
+			ConversationID: session.takeUnpublishedCliConversationID(),
 		})
 
 		batch = batch[:0]
@@ -1397,6 +1425,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var antigravityResultSeen bool
 
 	appendDisplayText := func(lineText string) {
+		// Before any display filtering: the events that carry a one-shot CLI's
+		// conversation id (agy `init`, OpenCode lifecycle frames) render as no
+		// text at all, so this is the only place the id can be seen.
+		session.noteCliConversationID(lineText)
 		if isAntigravityCommand(session.Command) {
 			if isAntigravityAgentResponseDelta(lineText) {
 				var raw map[string]interface{}
@@ -1979,6 +2011,9 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
+		// Repeated here so a session whose only stream frame was dropped — or
+		// which produced no display text at all — is still resumable.
+		ConversationID: session.capturedCliConversationID(),
 	}, func() { sm.removeSessionIfSame(session.ID, session) }) {
 		fmt.Printf("%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
