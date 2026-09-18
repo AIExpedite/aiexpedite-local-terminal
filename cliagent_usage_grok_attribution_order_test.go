@@ -25,16 +25,35 @@ func TestStartSession_AttributesGrokBillingBeforeSpawn(t *testing.T) {
 		t.Fatalf("parse session.go: %v", err)
 	}
 
+	// The spawn body lives in StartSessionResuming; StartSession is the
+	// seed-less entry point that delegates to it (cli_conversation_resume.go).
+	// The invariant follows the BODY — and the delegation is pinned too, so a
+	// future StartSession that grew its own spawn path would not slip past this
+	// positional check unexamined.
 	var body *ast.BlockStmt
+	delegates := false
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "StartSession" && fn.Recv != nil {
+		if !ok || fn.Recv == nil {
+			continue
+		}
+		switch fn.Name.Name {
+		case "StartSessionResuming":
 			body = fn.Body
-			break
+		case "StartSession":
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "StartSessionResuming" {
+					delegates = true
+				}
+				return true
+			})
 		}
 	}
 	if body == nil {
-		t.Fatal("StartSession not found in session.go")
+		t.Fatal("StartSessionResuming (the session spawn body) not found in session.go")
+	}
+	if !delegates {
+		t.Fatal("StartSession no longer delegates to StartSessionResuming — it has its own spawn path, which this ordering check does not cover")
 	}
 
 	attribution, start := token.NoPos, token.NoPos
