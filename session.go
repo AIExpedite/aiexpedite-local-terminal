@@ -105,6 +105,11 @@ type CLISession struct {
 	// a terminal result event and must retain their process exit code.
 	antigravityManagedStream bool
 
+	// antigravityQuotaHandled: this managed agy turn already published its
+	// quota notice and had its retry loop stopped (antigravity_quota_notice.go).
+	// Guarded by mu.
+	antigravityQuotaHandled bool
+
 	// cliConversationID is the one-shot CLI's OWN conversation id (agy
 	// `conversation_id` / OpenCode `sessionID`), captured off its JSON stream so
 	// a follow-up can resume the exact conversation in a new process.
@@ -1607,6 +1612,42 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					}
 					continue
 				}
+			}
+
+			// Antigravity quota exhaustion: agy reports it as text-less
+			// `error_message` steps while it retries silently, and names the
+			// reason only in its own log (antigravity_quota_notice.go). Publish
+			// that reason in the same wrapper as a result error so the cloud's
+			// limit matcher sees it, fail the turn, and stop the retry loop —
+			// it would otherwise hold the device for the whole turn budget.
+			if reason := session.quotaFailureFromErrorStep(line.text); reason != "" {
+				antigravityResultSeen = true
+				antigravityDeltas.Reset()
+				flushBatch()
+				session.mu.Lock()
+				session.ExitCode = 1
+				session.mu.Unlock()
+				seq := atomic.AddInt64(&session.Seq, 1)
+				asyncPublish(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      fmt.Sprintf("\n[Antigravity turn failed: %s]\n", reason),
+					Status:      "error",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "stream",
+					SessionID:   session.ID,
+					Seq:         int(seq),
+				})
+				fmt.Printf("%s[session] Antigravity quota exhausted — %s: %s%s\n",
+					colorYellow, session.ID, reason, colorReset)
+				stopAntigravityRetryLoop(session.Process, func() {
+					if session.Process != nil && session.Process.Process != nil {
+						_ = session.Process.Process.Kill()
+					}
+				})
+				continue
 			}
 
 			// Antigravity result error: agy can emit result.status: "ERROR" on a protocol/quota/tool
