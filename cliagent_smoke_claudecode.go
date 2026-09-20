@@ -41,6 +41,14 @@
 // What leaves this file is the closed cliSmokeDiagnostic set, the fixed argv
 // shape id, and counts. The marker nonce, the prompt, the resolved argv,
 // `~/.claude.json` and `settings.json` are never included at any severity.
+//
+// The ONE thing that outlives the stdout buffer is numeric: the rate-limit
+// windows claudeUsageHarvestPrintStdout lifts out of the run's own `result`
+// envelope (percentages and reset stamps) and hands to the merge every other
+// Claude writer already uses. No vendor text, no envelope field other than the
+// documented `rate_limits` numbers, and nothing new on the wire — the backend
+// learns the fresher utilization through the existing `__cli_usage_refresh__`
+// cycle, not through `__cli_smoke_result__`, whose shape is unchanged.
 
 package main
 
@@ -143,6 +151,19 @@ type cliSmokeResult struct {
 	// Diagnostic is one of the cliSmokeDiagnostic* constants — a locally
 	// authored code, never vendor text.
 	Diagnostic string `json:"diagnostic,omitempty"`
+
+	// usageHarvested records whether the attempt's own envelope carried
+	// rate-limit telemetry that reached the cache. Unexported for the same reason
+	// as spentTurnAt below; it is what lets runCLISmoke skip recording a debt for
+	// a turn that already reported its own utilization.
+	usageHarvested bool
+
+	// spentTurnAt is the instant the attempt that spent the turn completed.
+	// UNEXPORTED, so it is invisible to encoding/json and the published payload
+	// above stays byte-identical — it exists only so runCLISmoke can record the
+	// post-run utilization debt against the SAME instant the harvest used (see
+	// runClaudeCodeSmoke). Zero when no turn was spent.
+	spentTurnAt time.Time
 }
 
 /* --------------------------------------------------------------------------
@@ -398,7 +419,21 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 		return result, nil
 	})
 	result, _ := v.(cliSmokeResult)
-	return result, !executed
+	replayed := !executed
+	// A spent turn moved the account's real percentages, so the CLI Agents card
+	// owes a fresh reading — the same obligation claude_native.go and session.go
+	// record on their own terminal frames. Without it a passing smoke left the
+	// three Claude rows on their PRE-smoke observedAt, and the follow-up
+	// refreshes saw a cache the staleness TTL still called fresh.
+	//
+	// Not for a replay or a shared single-flight verdict: neither spent a turn,
+	// so neither has anything to refresh. The debt is recorded against the
+	// attempt's own completion instant, which the harvest inside
+	// runClaudeCodeSmoke already wrote its reading at.
+	if !replayed && cliSmokeVerdictSpentTurn(result) {
+		noteClaudeTurnSpent(result.spentTurnAt, result.usageHarvested)
+	}
+	return result, replayed
 }
 
 // replayableCLISmokeVerdict reports the cached verdict when it may still stand
@@ -531,7 +566,28 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 		timedOut := runCtx.Err() != nil || ctx.Err() != nil
 		cancel()
 
+		// ONE completion instant for this attempt, shared by the harvest below and
+		// by the post-run debt runCLISmoke records from it. Two calls to
+		// time.Now() would put the debt a few microseconds AFTER the reading that
+		// is meant to pay it, and claudeUsageObservationCovers would then refuse
+		// the very observation this turn just earned.
+		spentTurnAt := time.Now()
+		result.spentTurnAt = spentTurnAt
+
 		result.ArgvShapeID = shape.ID
+
+		// Harvest the attempt's OWN utilization telemetry before the bytes go out
+		// of scope. `--print --output-format json` result envelopes carry the
+		// account's `rate_limits` map, so this makes the turn the smoke just paid
+		// for refresh the CLI Agents card for free — and on a device where the
+		// OAuth probe cannot run at all it is the only freshness source there is.
+		// Guarded on a PARSED envelope so a garbage attempt is never scanned.
+		// Retention is unchanged: only numeric buckets reach disk (see the
+		// file header), and the stdout bytes still die with this loop iteration.
+		if _, parsed := parseClaudePrintResultEnvelope(stdout); parsed {
+			result.usageHarvested = claudeUsageHarvestPrintStdout(stdout, spentTurnAt) ||
+				result.usageHarvested
+		}
 
 		category, diagnostic, matched := classifyClaudeSmokeRun(timedOut, stdout, stderr, runErr, marker)
 		if category == "" {

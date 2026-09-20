@@ -74,6 +74,7 @@ func smokeEnv(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(dir, "rl.json"))
 	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(dir, "prev.json"))
+	t.Setenv(claudeUsagePendingRunEnv, filepath.Join(dir, "pending_run.json"))
 	resetClaudeSmokeState()
 	resetVersionProbeCache()
 	t.Cleanup(func() {

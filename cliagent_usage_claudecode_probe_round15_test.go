@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -12,6 +14,10 @@ import (
 // already covered).
 
 func TestClaudeUsageProbePayRecordedRunNeverResurrectsASettledDebt(t *testing.T) {
+	// The debt is durable now, so the same rule has to hold on disk: a settled
+	// record must not come back, or every process start pays it again.
+	record := filepath.Join(t.TempDir(), "pending_run.json")
+	t.Setenv(claudeUsagePendingRunEnv, record)
 	resetClaudeUsageProbeGate() // unarmed: eligibility refuses, nothing probes
 	t.Cleanup(resetClaudeUsageProbeGate)
 
@@ -31,6 +37,9 @@ func TestClaudeUsageProbePayRecordedRunNeverResurrectsASettledDebt(t *testing.T)
 	claudeUsageProbePayRecordedRun(completed)
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("the settlement half resurrected a paid debt: %s", owed.UTC().Format(time.RFC3339Nano))
+	}
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Fatalf("the settlement half wrote a durable record for a paid debt (err=%v)", err)
 	}
 
 	// The direct entry point still records first, for its own callers.

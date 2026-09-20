@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -474,6 +475,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
+	claudeUsageStaleAfterRun(view, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the
@@ -678,4 +680,32 @@ func currentClaudeAccountFingerprint() string {
 		}
 	}
 	return fingerprintAccount("claudeCode", account)
+}
+
+// claudeUsageStaleAfterRun reports the one case this feature exists for: a
+// Claude turn completed, the card is still being shaped, and the STALEST row it
+// will show was observed BEFORE that turn.
+//
+// Modelled on antigravityMissedRun, and for the same reason: when the original
+// report had to be reconstructed from three timestamps on a Windows device,
+// nothing on the machine said "a run finished and the rows never caught up".
+// That is the difference between "the debt was never recorded" (this line
+// absent) and "it was recorded and the probe could not settle it" (this line
+// present on successive gathers) — which are different defects with different
+// fixes, and identical from the outside.
+//
+// Ages and a count only — no paths, no account, no token, no reading values.
+// One line per gather at most, and none at all on the healthy path.
+func claudeUsageStaleAfterRun(view claudeRateLimitView, now time.Time) {
+	owed := claudeUsageProbe.owedObservation()
+	if owed.IsZero() {
+		return
+	}
+	stalest := stalestClaudeRowObservation(view, now)
+	if stalest.IsZero() || !stalest.Before(owed) {
+		return
+	}
+	fmt.Printf("%s[claude-usage] rows still predate the last completed run (owedAgeMs=%d stalestRowAgeMs=%d rows=%d)%s\n",
+		colorYellow, now.Sub(owed).Milliseconds(), now.Sub(stalest).Milliseconds(),
+		len(claudeRowObservationsMs(view.buckets, now)), colorReset)
 }

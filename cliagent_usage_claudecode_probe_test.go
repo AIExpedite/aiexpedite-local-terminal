@@ -42,6 +42,10 @@ func armClaudeUsageProbe(t *testing.T, handler http.HandlerFunc) (string, *int64
 
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	// The durable post-run debt lives beside the cache, so it needs the same
+	// isolation: without this a case would read (and delete) the real device's
+	// claude_usage_pending_run.json.
+	t.Setenv(claudeUsagePendingRunEnv, filepath.Join(filepath.Dir(cache), "pending_run.json"))
 
 	configDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
@@ -2194,9 +2198,14 @@ func TestRefreshClaudeUsageIfStale_PaysAnOutstandingPostRunDebt(t *testing.T) {
 			},
 		}, preRun, "", claudeRateLimitSourceProbe)
 
-	// Record a debt for a run that finished after that reading.
+	// Record a debt for a run that finished after that reading, and make it
+	// durable the way the post-run goroutine does.
 	runCompleted := now
 	claudeUsageProbe.recordOwed(runCompleted)
+	claudeUsageRecordPendingRun(runCompleted)
+	if _, err := os.Stat(os.Getenv(claudeUsagePendingRunEnv)); err != nil {
+		t.Fatalf("recording a debt left nothing durable behind: %v", err)
+	}
 
 	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second),
 		latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")), probeTestToken, "") {
@@ -2208,9 +2217,13 @@ func TestRefreshClaudeUsageIfStale_PaysAnOutstandingPostRunDebt(t *testing.T) {
 	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !latest.After(runCompleted) {
 		t.Errorf("observation %v did not advance past the run %v", latest, runCompleted)
 	}
-	// Debt paid: the next gather goes back to the ordinary TTL.
+	// Debt paid: the next gather goes back to the ordinary TTL, and the durable
+	// record is gone so a restart does not re-pay it.
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Errorf("debt still outstanding (%v) after a successful probe", owed)
+	}
+	if _, err := os.Stat(os.Getenv(claudeUsagePendingRunEnv)); !os.IsNotExist(err) {
+		t.Errorf("settling the debt left its durable record behind (err=%v)", err)
 	}
 }
 

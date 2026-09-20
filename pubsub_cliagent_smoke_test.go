@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -46,9 +47,11 @@ func TestHandleCLISmokeCommand_PublishesExactlyOneCorrelatedResult(t *testing.T)
 	seedProbeVersion(t, path, "2.1.251 (Claude Code)")
 	stubAuthProbe(t, true, true)
 	calls := stubSmokeExec(t, func(ctx context.Context, args []string, prompt string) ([]byte, []byte, error) {
-		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+		return smokeEnvelopeWithRateLimits(markerFromPrompt(prompt), 12, 13, 14), nil, nil
 	})
 	published := capturePublishes(t)
+
+	beforeSmoke := time.Now()
 
 	cfg := &Config{AgentID: "agent-9"}
 	if err := handleCLISmokeCommand(context.Background(), nil, smokeCommand("claudeCode"), cfg); err != nil {
@@ -76,6 +79,25 @@ func TestHandleCLISmokeCommand_PublishesExactlyOneCorrelatedResult(t *testing.T)
 	}
 	if *calls != 1 {
 		t.Errorf("handler spent %d turns, want 1", *calls)
+	}
+	// The turn it spent moved the account's percentages, and the envelope the CLI
+	// returned carried them — so the handler must leave the cache the CLI Agents
+	// card reads FRESHER than it found it. Before this feature the smoke dropped
+	// stdout unread, and the card kept its pre-smoke observedAt across the whole
+	// maintenance window.
+	//
+	// The published payload asserted above is unchanged by any of it: the backend
+	// learns the fresher utilization through __cli_usage_refresh__, not through
+	// this message.
+	//
+	// The probe is deliberately left UNARMED here (handleCLISmokeCommand is what
+	// is under test, not the probe), so the only thing that can have advanced the
+	// cache is the run's own telemetry.
+	// claudeUsageObservationCovers, the same predicate the probe paths use: the
+	// cache truncates to milliseconds, and a stubbed run completes inside one.
+	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !claudeUsageObservationCovers(latest, beforeSmoke) {
+		t.Errorf("the smoke left the utilization cache at %v, no fresher than the pre-smoke %v",
+			latest, beforeSmoke)
 	}
 }
 

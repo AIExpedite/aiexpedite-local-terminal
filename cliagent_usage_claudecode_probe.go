@@ -376,6 +376,10 @@ type claudeUsageProbeGate struct {
 	// observation, and trailingScheduled marks that a timer is already waiting to
 	// pay it. See oweObservation: the throttle must be able to DELAY a post-run
 	// probe, never to discard it.
+	//
+	// Mirrored on disk by cliagent_usage_claudecode_pending_run.go, because this
+	// field alone is lost on the agent restart an auto-update performs — which is
+	// precisely when the CLI-maintenance flow is watching for the refresh.
 	owedBaseline      time.Time
 	trailingScheduled bool
 	// doneCh is created by begin() and closed by finish(), so a caller that was
@@ -559,6 +563,9 @@ func resetClaudeUsageProbeGate() {
 	}
 	claudeUsageProbe.cancelTrailing = make(chan struct{})
 	claudeUsageProbe.mu.Unlock()
+	// The DURABLE half of the debt, including the hydrate-once latch: a test seam
+	// that left either behind would hand the next case a debt it never recorded.
+	resetClaudeUsagePendingRun()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
 	claudeUsageProbeLog.at = time.Time{}
@@ -828,10 +835,16 @@ func (g *claudeUsageProbeGate) trailingCancelCh() <-chan struct{} {
 // gather or run to retry under the existing bounds.
 func (g *claudeUsageProbeGate) settleOwed(baseline time.Time) {
 	g.mu.Lock()
+	cleared := time.Time{}
 	if !baseline.Before(g.owedBaseline) {
-		g.owedBaseline = time.Time{}
+		cleared, g.owedBaseline = g.owedBaseline, time.Time{}
 	}
 	g.mu.Unlock()
+	// Only a settlement that actually zeroed a standing debt touches the durable
+	// record — so the common "nothing was owed" call costs no file operation.
+	if !cleared.IsZero() {
+		clearClaudeUsagePendingRun(cleared)
+	}
 }
 
 // claudeUsageObservationCovers reports whether `observed` is new enough to pay a
@@ -862,10 +875,14 @@ func claudeUsageObservationCovers(observed, baseline time.Time) bool {
 // is what keeps a reading that predates the run from clearing it.
 func (g *claudeUsageProbeGate) settleOwedIfCovered(observed time.Time) {
 	g.mu.Lock()
+	cleared := time.Time{}
 	if !g.owedBaseline.IsZero() && claudeUsageObservationCovers(observed, g.owedBaseline) {
-		g.owedBaseline = time.Time{}
+		cleared, g.owedBaseline = g.owedBaseline, time.Time{}
 	}
 	g.mu.Unlock()
+	if !cleared.IsZero() {
+		clearClaudeUsagePendingRun(cleared)
+	}
 }
 
 // owedObservation returns the outstanding post-run baseline, if any.
@@ -962,6 +979,15 @@ func claudeUsageProbeObservedSince(fingerprint string, baseline, now time.Time) 
 	// and Fable rows depend on. A probe writes every window the endpoint supplies,
 	// so the cross-process dedupe this exists for still collapses cleanly.
 	latest := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now)
+	// STRICTLY newer, deliberately — this is not claudeUsageObservationCovers.
+	// Suppression is a decision to make NO request, so it must refuse a reading
+	// that merely shares the run's millisecond: a routine gather that probed a
+	// few hundred microseconds BEFORE the run would otherwise cancel the probe
+	// that run earned, which is the reported defect itself
+	// (TestClaudeUsageProbe_ThrottledPostRunProbeStillLands). A run whose OWN
+	// output supplied the reading does not come through here at all — see
+	// claudeUsageRunCoveredByOwnTelemetry, which knows that fact directly rather
+	// than inferring it from two timestamps.
 	return latest, !latest.IsZero() && latest.After(baseline)
 }
 
@@ -1420,6 +1446,12 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// leave it to sign the cache it loaded before the probe landed. The ticket is
 	// on the refresh's own context, so only the requested gather can take it.
 	forced := claimClaudeUsageForceProbe(ctx)
+	// Inherit any debt a PREVIOUS process recorded and never got to pay — the
+	// agent update in the middle of the CLI-maintenance flow is exactly that
+	// case. Once per process, scoped by the fingerprint this gather already
+	// decoded, and before owedObservation() is consulted so the first gather
+	// after a restart is the one that pays it.
+	claudeUsageHydratePendingRun(fingerprint, now)
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
 	// BEFORE the run is not "fresh enough" just because it is recent, and this is
 	// the backstop for a trailing probe that was too far out to schedule or that
@@ -1538,13 +1570,24 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 // and collapsed by its single-flight, so a burst of finishing sessions issues
 // one request.
 func triggerClaudeUsageProbeAfterRun() {
+	triggerClaudeUsageProbeForTurn(time.Now())
+}
+
+// triggerClaudeUsageProbeForTurn is triggerClaudeUsageProbeAfterRun for a caller
+// that already knows WHEN its turn completed — the smoke, which harvested the
+// run's own telemetry at that same instant and must not record a debt a
+// microsecond after the reading meant to pay it (claudeUsageObservationCovers
+// compares at millisecond resolution, but not at zero).
+func triggerClaudeUsageProbeForTurn(completedAt time.Time) {
 	// Cheap synchronous gate before spawning anything. This fires once per
 	// completed turn on every Claude session, and a process that can never probe
 	// (unarmed, or the user opted out) should not pay a goroutine for it.
 	if !claudeUsageProbe.armedForProbe() {
 		return
 	}
-	completedAt := time.Now()
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
 	// The debt is recorded HERE, synchronously, before the goroutine exists:
 	// the caller's exit path (and the test harness that waits for it to
 	// finish) must be able to rely on "the trigger has fired" meaning "the
@@ -1591,6 +1634,15 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 // recordOwed has no settled watermark, so a repeat would resurrect a paid debt
 // and schedule a trailing OAuth request for nothing.
 func claudeUsageProbePayRecordedRun(completedAt time.Time) {
+	// Make the debt durable before anything that can be refused or delayed. The
+	// whole point is the window this function is most likely to be interrupted
+	// in: the CLI-maintenance flow smokes, updates the CLI, and the agent may
+	// self-replace before the trailing probe ever fires. Written HERE rather than
+	// in recordOwed so the synchronous trigger — which runs on the stream
+	// scanner's goroutine — pays no filesystem cost; coalescing and the settled
+	// watermark live in claudeUsageRecordPendingRun.
+	claudeUsageRecordPendingRun(claudeUsageProbe.owedObservation())
+
 	for attempt := 0; attempt < claudeUsageProbeAfterRunMaxAttempts; attempt++ {
 		// No credential or cache read in this preflight. Resolving the identity
 		// here would cost a `security` spawn PER RUN on macOS even when the burst

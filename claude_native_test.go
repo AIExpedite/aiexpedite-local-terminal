@@ -519,6 +519,7 @@ func TestClaudeNativeLifecycle_TerminalResultAdvancesUtilization(t *testing.T) {
 	if metric.Consumed == nil || *metric.Consumed < 36.9 || *metric.Consumed > 37.1 {
 		t.Errorf("five-hour Consumed=%v, want ~37 from the probe reading", metric.Consumed)
 	}
+	assertNoDurableClaudeUsageDebt(t)
 }
 
 // A direct run that never reaches a terminal `result` frame — killed, timed out,
@@ -577,6 +578,21 @@ func TestClaudeNativeLifecycle_SettledTurnLeavesNoTrailingDebt(t *testing.T) {
 	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("probe request count=%d, want exactly 1 for a single settled turn", got)
+	}
+	assertNoDurableClaudeUsageDebt(t)
+}
+
+// assertNoDurableClaudeUsageDebt pins the durable half of the same guarantee: a
+// settled turn must leave nothing on disk for the NEXT process to inherit, or a
+// permanent debt would buy one OAuth request on every agent start.
+func assertNoDurableClaudeUsageDebt(t *testing.T) {
+	t.Helper()
+	record := os.Getenv(claudeUsagePendingRunEnv)
+	if record == "" {
+		t.Fatal("the pending-run record is not isolated; armClaudeUsageProbe must redirect it")
+	}
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("a settled turn left a durable post-run debt behind (err=%v)", err)
 	}
 }
 
