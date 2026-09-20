@@ -105,18 +105,31 @@ func (v claudeRateLimitView) probeObservedAtMs() int64 {
 	return v.probedAtMs
 }
 
-// loadMergedClaudeRateLimitView is loadMergedClaudeRateLimitBuckets plus the
-// snapshot-level probe evidence, read in the SAME pass so the two cannot
-// describe different reads of the cache.
-func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitView {
+// claudeRateLimitCachePaths returns every cache file on this machine that could
+// hold an observation for the displayed rows, OUR channel's first and the path
+// the installed status-line hook pins second (skipped when it is the same file,
+// or when Claude has no hook of ours).
+//
+// Shared with claudeUsagePendingRunFingerprint so "which caches does this device
+// read?" is answered in exactly one place: a durable post-run debt scoped to an
+// account the displayed rows do not come from would be discarded on hydration,
+// which is the dual-channel form of the stale card this feature exists to fix.
+// Order is significant — it is the tie-break both callers fall back on.
+func claudeRateLimitCachePaths() []string {
 	home, _ := os.UserHomeDir()
 	paths := []string{claudeRateLimitCachePath()}
 	if pinned := installedClaudeRateLimitCachePath(home); pinned != "" && pinned != paths[0] {
 		paths = append(paths, pinned)
 	}
+	return paths
+}
 
+// loadMergedClaudeRateLimitView is loadMergedClaudeRateLimitBuckets plus the
+// snapshot-level probe evidence, read in the SAME pass so the two cannot
+// describe different reads of the cache.
+func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitView {
 	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}
-	for _, path := range paths {
+	for _, path := range claudeRateLimitCachePaths() {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok || snap.AccountFingerprint != currentFingerprint {
 			continue

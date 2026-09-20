@@ -148,15 +148,37 @@ func claudeUsageRecordPendingRun(baseline time.Time) {
 // pins). The cache is the RIGHT source anyway: it is the identity the buckets a
 // hydrated debt would refresh are already scoped to, so the two cannot disagree.
 //
-// (false) when no cache exists yet — a device with no reading at all has no
-// stale row to rescue, and its next gather probes on the zero observation
+// Read from EVERY path the displayed rows are merged from
+// (claudeRateLimitCachePaths), not just this channel's own file. On a box with
+// two channels installed the one that lost Claude's statusLine hook has no local
+// cache at all and shows rows exclusively from the pinned one — and consulting
+// only the local path there returns (false), so the smoke's debt is never
+// persisted and the pre-smoke pinned rows go on suppressing the probe after the
+// update: the very failure this record exists to survive, in its dual-channel
+// form. Where several caches exist, the one carrying the NEWEST observation
+// wins, because that is the file whose freshness decides whether the next
+// process probes at all; ties keep the local path, so a single-cache device
+// behaves exactly as before.
+//
+// (false) when no cache exists on any path — a device with no reading at all has
+// no stale row to rescue, and its next gather probes on the zero observation
 // regardless, so there is nothing for a persisted debt to buy.
 func claudeUsagePendingRunFingerprint() (string, bool) {
-	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
-	if !ok {
-		return "", false
+	fingerprint, newest, found := "", int64(0), false
+	for _, path := range claudeRateLimitCachePaths() {
+		snap, ok := loadClaudeRateLimitSnapshot(path)
+		if !ok {
+			continue
+		}
+		observed := snap.LastProbeObservedAtMs
+		if seen := latestClaudeObservation(snap.Buckets); !seen.IsZero() && seen.UnixMilli() > observed {
+			observed = seen.UnixMilli()
+		}
+		if !found || observed > newest {
+			fingerprint, newest, found = snap.AccountFingerprint, observed, true
+		}
 	}
-	return snap.AccountFingerprint, true
+	return fingerprint, found
 }
 
 // persistClaudeUsagePendingRun writes the record, reporting whether it landed.

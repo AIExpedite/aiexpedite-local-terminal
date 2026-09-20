@@ -398,3 +398,100 @@ func TestClaudeUsageHydratePendingRun_AnExpiredRecordClosesTheLatch(t *testing.T
 		t.Error("the latch stayed open on a record that can never be payable")
 	}
 }
+
+// A box with two agent channels shares ONE ~/.claude/settings.json, so the
+// channel that lost the status-line hook can have NO cache of its own and show
+// rows exclusively from the pinned one. Reading the account from the local path
+// alone would skip the persist there, and the pre-smoke pinned rows would go on
+// suppressing the probe after the update — the dual-channel form of the exact
+// failure the record exists to survive.
+func TestClaudeUsagePendingRun_ScopedFromTheCachePinnedByTheInstalledHook(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "pending_run.json")
+	ownCache := filepath.Join(dir, "own", "rl.json") // never written: this channel lost the hook
+	pinnedCache := filepath.Join(dir, "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv(claudeUsagePendingRunEnv, record)
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	resetClaudeUsagePendingRun()
+	t.Cleanup(resetClaudeUsagePendingRun)
+
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), "acct-pinned", claudeRateLimitSourceStream)
+
+	baseline := now.Truncate(time.Millisecond)
+	claudeUsageRecordPendingRun(baseline)
+
+	got, ok := loadClaudeUsagePendingRun("acct-pinned", now)
+	if !ok {
+		t.Fatal("no payable debt: the persist read only this channel's own (absent) cache")
+	}
+	if !got.Equal(baseline) {
+		t.Errorf("baseline=%s, want %s", got, baseline)
+	}
+	if _, ok := loadClaudeUsagePendingRun("someone-else", now); ok {
+		t.Error("the record is not scoped to the pinned cache's account")
+	}
+}
+
+// With both caches present, the account comes from the one carrying the NEWEST
+// observation — that is the file whose freshness decides whether the next
+// process probes, so it is the identity a hydrated debt has to match.
+func TestClaudeUsagePendingRun_ScopedToTheFreshestCacheAcrossPaths(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(dir, "pending_run.json")
+	ownCache := filepath.Join(dir, "own", "rl.json")
+	pinnedCache := filepath.Join(dir, "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv(claudeUsagePendingRunEnv, record)
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	resetClaudeUsagePendingRun()
+	t.Cleanup(resetClaudeUsagePendingRun)
+
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	// Our own cache stopped being written when the other channel took the hook.
+	mergeClaudeRateLimitCacheFromSource(ownCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-72 * time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-72*time.Hour), "acct-stale", claudeRateLimitSourceStream)
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-5 * time.Minute).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-5*time.Minute), "acct-fresh", claudeRateLimitSourceStream)
+
+	claudeUsageRecordPendingRun(now.Truncate(time.Millisecond))
+
+	if _, ok := loadClaudeUsagePendingRun("acct-fresh", now); !ok {
+		t.Error("the record should be scoped to the freshest cache's account")
+	}
+	if _, ok := loadClaudeUsagePendingRun("acct-stale", now); ok {
+		t.Error("the record is scoped to the cache nothing writes to any more")
+	}
+}
