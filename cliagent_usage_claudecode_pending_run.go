@@ -99,10 +99,14 @@ func claudeUsagePendingRunPath() string {
 
 // claudeUsageRecordPendingRun persists the coalesced post-run debt.
 //
-// Called from the post-run goroutine, never from the synchronous trigger: the
-// stream scanner that decides "this turn is over" must stay free of filesystem
-// work. Coalesced (claudeUsagePendingRunCoalesce) so a chatty multi-turn session
-// costs roughly one write per settled turn rather than one per stream line.
+// Called from the post-run goroutine for the stream-driven paths, never from
+// their synchronous trigger: the scanner that decides "this turn is over" must
+// stay free of filesystem work. The smoke is the one caller that pays it
+// synchronously (noteClaudeTurnSpentDurably) because its process may be replaced
+// the moment it returns. Coalesced (claudeUsagePendingRunCoalesce) so a chatty
+// multi-turn session costs roughly one write per settled turn rather than one
+// per stream line — and so the trailing goroutine's repeat of a baseline the
+// smoke already wrote costs no second write.
 func claudeUsageRecordPendingRun(baseline time.Time) {
 	if baseline.IsZero() {
 		return

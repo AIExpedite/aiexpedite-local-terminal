@@ -442,3 +442,60 @@ func TestClaudeUsageHarvestWindow(t *testing.T) {
 		}
 	}
 }
+
+// noteClaudeTurnSpentDurably is what the smoke calls, and its guarantee is about
+// ORDERING, not eventual consistency: the record must be on disk by the time it
+// returns, because its caller publishes the verdict and then updates the CLI —
+// the agent can be replaced before any trailing goroutine runs.
+func TestNoteClaudeTurnSpentDurably_WritesTheRecordBeforeItReturns(t *testing.T) {
+	cache := harvestEnv(t)
+	record := t.TempDir() + "/pending_run.json"
+	t.Setenv(claudeUsagePendingRunEnv, record)
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	// A pre-run reading, so the cache (and its account scope) exists.
+	stale := time.Now().Add(-time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12, ResetsAtMs: time.Now().Add(time.Hour).UnixMilli(),
+			ObservedAtMs: stale.UnixMilli(), usageKnown: true,
+		},
+	}, stale, "", claudeRateLimitSourceStream)
+
+	SetClaudeUsageProbeDisabled(false)
+	// Offline: the trailing probe is refused, so the only thing that can have
+	// written the record is the synchronous call itself.
+	SetOffline(true)
+	t.Cleanup(func() { SetOffline(false) })
+
+	completed := time.Now()
+	if !noteClaudeTurnSpentDurably(completed, false) {
+		t.Fatal("an armed process recorded no obligation for a spent turn")
+	}
+	baseline, ok := loadClaudeUsagePendingRun("", time.Now())
+	if !ok {
+		t.Fatalf("no durable debt at %s when the call returned", record)
+	}
+	if baseline.UnixMilli() != completed.UnixMilli() {
+		t.Errorf("durable baseline %v is not the turn's completion instant %v", baseline, completed)
+	}
+
+	// A turn whose own envelope already covered every displayed row owes
+	// nothing, and must leave no record for a later process to pay.
+	// settleOwed removes the record itself, the way a real probe's settlement
+	// does — so what follows starts from a clean slate.
+	claudeUsageProbe.settleOwed(claudeUsageProbe.owedObservation())
+	later := time.Now()
+	if !claudeUsageHarvestPrintStdout([]byte(fmt.Sprintf(
+		`{"type":"result","rate_limits":{"five_hour":{"used_percentage":13,"resets_at":%d}}}`,
+		later.Add(time.Hour).Unix())), later) {
+		t.Fatal("precondition: the envelope was not harvested")
+	}
+	if noteClaudeTurnSpentDurably(later, true) {
+		t.Error("a run covered by its own telemetry still recorded an obligation")
+	}
+	if _, err := os.Stat(record); !os.IsNotExist(err) {
+		t.Errorf("a covered run left a durable debt behind (err=%v)", err)
+	}
+}

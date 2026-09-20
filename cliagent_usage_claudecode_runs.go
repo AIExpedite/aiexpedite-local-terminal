@@ -20,7 +20,9 @@
 //     unless step 1 already covered EVERY displayed row. Newest baseline wins, so
 //     a burst of runs leaves exactly one debt.
 //  3. PERSIST it, so the debt outlives an agent update — see
-//     cliagent_usage_claudecode_pending_run.go.
+//     cliagent_usage_claudecode_pending_run.go. A path whose process may be
+//     replaced the moment it returns (the smoke) pays that write synchronously;
+//     see noteClaudeTurnSpentDurably.
 //
 // Retention is unchanged by any of this: the run's stdout is still discarded by
 // its caller, and the only thing that reaches disk is the numeric bucket set
@@ -69,16 +71,49 @@ const (
 // harvested at. `harvested` says whether that harvest actually persisted
 // anything, which is how a run whose own output carried telemetry avoids an
 // OAuth request altogether. A zero `completedAt` falls back to now.
-func noteClaudeTurnSpent(completedAt time.Time, harvested bool) {
+//
+// Reports whether an obligation was recorded — false when the harvest already
+// covered every row, or when this process can never probe at all.
+func noteClaudeTurnSpent(completedAt time.Time, harvested bool) bool {
 	// A run whose own envelope supplied the reading owes nothing: the cache
 	// already shows every displayed row at an instant that can have seen this
 	// turn. Checked BEFORE the debt is recorded rather than settled afterwards,
 	// so there is no window in which the trailing goroutine reads a debt that is
 	// about to be discharged and buys an OAuth request for it.
 	if harvested && claudeUsageRunCoveredByOwnTelemetry(completedAt) {
-		return
+		return false
 	}
-	triggerClaudeUsageProbeForTurn(completedAt)
+	return triggerClaudeUsageProbeForTurn(completedAt)
+}
+
+// noteClaudeTurnSpentDurably is noteClaudeTurnSpent for a caller whose PROCESS
+// may not outlive the turn it just spent — the `__cli_smoke__` probe, whose one
+// caller is the CLI-maintenance flow: it smokes, updates the CLI, and the agent
+// self-replaces, all inside the same window.
+//
+// The difference is only WHEN the debt reaches disk. noteClaudeTurnSpent leaves
+// that to the trailing goroutine, which is right for the native and managed
+// paths: they are driven by the stream scanner, fire once per turn of a chatty
+// session, and their process is not about to be killed. But the smoke returns to
+// a caller that publishes its verdict and may be replaced before that goroutine
+// is ever scheduled — and losing the write in that interval loses the debt
+// entirely, recreating the exact stale-card regression the record exists to
+// prevent. So the smoke pays the write on its own goroutine, before it returns.
+//
+// Costs one ~200-byte tmp+rename (plus the cache read the account scope needs)
+// per spent smoke turn — trivial beside the CLI child the smoke just waited on,
+// and bounded by the 15-minute verdict cooldown. The trailing goroutine still
+// calls claudeUsageRecordPendingRun; the coalesce window makes that a no-op for
+// the baseline already written here, so this adds no second write.
+func noteClaudeTurnSpentDurably(completedAt time.Time, harvested bool) bool {
+	if !noteClaudeTurnSpent(completedAt, harvested) {
+		return false
+	}
+	// The gate's own coalesced baseline, not `completedAt`: a concurrent run may
+	// already have recorded a newer one, and the record must carry whatever
+	// settlement will actually be measured against.
+	claudeUsageRecordPendingRun(claudeUsageProbe.owedObservation())
+	return true
 }
 
 // claudeUsageRunCoveredByOwnTelemetry reports whether the shared cache already

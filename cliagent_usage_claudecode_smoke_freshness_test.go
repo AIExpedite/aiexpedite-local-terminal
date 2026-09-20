@@ -222,8 +222,13 @@ func TestCLISmoke_PostRunDebtSurvivesAnAgentUpdate(t *testing.T) {
 	if result, _ := runCLISmoke(context.Background(), "claudeCode"); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("smoke failed: %+v", result)
 	}
-	// The record is written by the post-run goroutine, off the smoke's path.
-	waitForPendingRunRecord(t, pendingRecord, 5*time.Second)
+	// Already on disk — no waiting. runCLISmoke returns to the CLI-maintenance
+	// flow, which updates the CLI and can replace this process immediately; a
+	// record that only a trailing goroutine writes would be lost in that
+	// interval, which is the regression this whole test exists for.
+	if _, err := os.Stat(pendingRecord); err != nil {
+		t.Fatalf("the debt was not durable when the smoke returned: %v", err)
+	}
 	if got := atomic.LoadInt64(requests); got != 0 {
 		t.Fatalf("the refused trailing probe still issued %d requests", got)
 	}
@@ -403,16 +408,4 @@ func freshClaudeUsageProcess(t *testing.T) context.Context {
 	}
 	SetClaudeUsageProbeDisabled(false)
 	return context.Background()
-}
-
-func waitForPendingRunRecord(t *testing.T, path string, within time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("no durable post-run record appeared at %s within %s", path, within)
 }

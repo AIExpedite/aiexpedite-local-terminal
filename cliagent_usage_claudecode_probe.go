@@ -1570,7 +1570,7 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 // and collapsed by its single-flight, so a burst of finishing sessions issues
 // one request.
 func triggerClaudeUsageProbeAfterRun() {
-	triggerClaudeUsageProbeForTurn(time.Now())
+	_ = triggerClaudeUsageProbeForTurn(time.Now())
 }
 
 // triggerClaudeUsageProbeForTurn is triggerClaudeUsageProbeAfterRun for a caller
@@ -1578,12 +1578,16 @@ func triggerClaudeUsageProbeAfterRun() {
 // run's own telemetry at that same instant and must not record a debt a
 // microsecond after the reading meant to pay it (claudeUsageObservationCovers
 // compares at millisecond resolution, but not at zero).
-func triggerClaudeUsageProbeForTurn(completedAt time.Time) {
+//
+// Reports whether a debt was recorded, so a caller whose process may be replaced
+// the moment it returns can make that debt durable before it does — see
+// noteClaudeTurnSpentDurably.
+func triggerClaudeUsageProbeForTurn(completedAt time.Time) bool {
 	// Cheap synchronous gate before spawning anything. This fires once per
 	// completed turn on every Claude session, and a process that can never probe
 	// (unarmed, or the user opted out) should not pay a goroutine for it.
 	if !claudeUsageProbe.armedForProbe() {
-		return
+		return false
 	}
 	if completedAt.IsZero() {
 		completedAt = time.Now()
@@ -1601,6 +1605,7 @@ func triggerClaudeUsageProbeForTurn(completedAt time.Time) {
 		// Settle only: the debt above is the one record for this run.
 		claudeUsageProbePayRecordedRun(completedAt)
 	}()
+	return true
 }
 
 // claudeUsageProbeAfterRun refreshes utilization for a run that finished at

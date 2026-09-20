@@ -430,8 +430,13 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 	// so neither has anything to refresh. The debt is recorded against the
 	// attempt's own completion instant, which the harvest inside
 	// runClaudeCodeSmoke already wrote its reading at.
+	//
+	// DURABLY, before returning: our one caller is the CLI-maintenance flow,
+	// which publishes this verdict and then updates the CLI — the agent can
+	// self-replace before a trailing goroutine's write is ever scheduled, and a
+	// debt that never reached disk is the stale card all over again.
 	if !replayed && cliSmokeVerdictSpentTurn(result) {
-		noteClaudeTurnSpent(result.spentTurnAt, result.usageHarvested)
+		noteClaudeTurnSpentDurably(result.spentTurnAt, result.usageHarvested)
 	}
 	return result, replayed
 }
