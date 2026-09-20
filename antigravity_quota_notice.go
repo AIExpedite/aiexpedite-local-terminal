@@ -61,6 +61,8 @@ const (
 	antigravityQuotaThrottleWindow = 2 * time.Minute
 	// How often a native turn polls the log while its process runs.
 	antigravityQuotaPollInterval = 15 * time.Second
+	// Floor for that cadence once a short turn budget shortens it.
+	antigravityQuotaMinPollInterval = 500 * time.Millisecond
 	// Grace between the interrupt and the kill that stops the retry loop.
 	antigravityQuotaKillGrace = 3 * time.Second
 )
@@ -196,6 +198,14 @@ func findAntigravityQuotaFailureInLog(path string, since, now time.Time) string 
 		if !ok || at.Before(cutoff) || !isAntigravityQuotaReason(reason) {
 			continue
 		}
+		// A record whose own `Resets in …` window has already elapsed is spent:
+		// that quota came back before now, so the line says nothing about the
+		// failure being looked up. Matters because `since` can be much older
+		// than the turn — a raw session is opened when the chat opens and may
+		// sit idle for hours before its first prompt.
+		if window, ok := antigravityResetWindow(reason); ok && !at.Add(window).After(now) {
+			continue
+		}
 		newest = reason
 	}
 	if newest == "" {
@@ -249,10 +259,28 @@ func (s *CLISession) quotaFailureFromErrorStep(line string) string {
 
 // watchAntigravityQuota is the NATIVE-turn hook (antigravity_native.go
 // runOneShot): a native turn buffers stdout until exit, so it cannot react to
-// the error steps; it polls the log instead. Returns the reason exactly once
+// the error steps; it polls the log every `poll` (antigravityQuotaPollCadence,
+// bounded by the turn's own budget) instead. Returns the reason exactly once
 // through onQuota, then stops. Cancel ctx when the process exits.
-func watchAntigravityQuota(ctx context.Context, spawnedAt time.Time, onQuota func(reason string)) {
-	ticker := time.NewTicker(antigravityQuotaPollInterval)
+// antigravityQuotaPollCadence keeps at least one lookup inside a turn whose
+// budget is shorter than the default cadence: such a turn would otherwise hit
+// its timeout before the first tick and report the generic timeout instead of
+// the limit notice. Zero/negative (no budget) polls at the default.
+func antigravityQuotaPollCadence(turnTimeout time.Duration) time.Duration {
+	if turnTimeout <= 0 || turnTimeout >= 2*antigravityQuotaPollInterval {
+		return antigravityQuotaPollInterval
+	}
+	if cadence := turnTimeout / 2; cadence > antigravityQuotaMinPollInterval {
+		return cadence
+	}
+	return antigravityQuotaMinPollInterval
+}
+
+func watchAntigravityQuota(ctx context.Context, spawnedAt time.Time, poll time.Duration, onQuota func(reason string)) {
+	if poll <= 0 {
+		poll = antigravityQuotaPollInterval
+	}
+	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
 		select {

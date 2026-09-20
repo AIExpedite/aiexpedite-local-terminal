@@ -754,12 +754,14 @@ func (m *AntigravityNativeManager) runOneShot(
 	// Quota exhaustion is invisible on this path until exit (stdout is
 	// buffered) and agy retries it silently for as long as the turn budget
 	// allows. Poll its log for the reason and cut the turn short with it
-	// (antigravity_quota_notice.go); the reason becomes the turn's error.
+	// (antigravity_quota_notice.go); the reason becomes the turn's error. The
+	// cadence is bounded by this turn's budget so a short turn still gets a
+	// lookup before its timeout fires.
 	spawnedAt := time.Now()
 	quotaCtx, stopQuotaWatch := context.WithCancel(context.Background())
 	defer stopQuotaWatch()
 	var quotaReason atomic.Value
-	go watchAntigravityQuota(quotaCtx, spawnedAt, func(reason string) {
+	go watchAntigravityQuota(quotaCtx, spawnedAt, antigravityQuotaPollCadence(turnTimeout), func(reason string) {
 		quotaReason.Store(reason)
 		fmt.Printf("%s[antigravity-native] quota exhausted — %s%s\n", colorYellow, reason, colorReset)
 		stopAntigravityRetryLoop(cmd, func() { killAntigravityProcessTree(cmd) })

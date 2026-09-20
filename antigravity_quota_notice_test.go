@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -135,6 +136,21 @@ func TestFindAntigravityQuotaFailureInLog(t *testing.T) {
 		}
 	})
 
+	t.Run("a record whose reset window already elapsed is spent", func(t *testing.T) {
+		// 10:00 + 15m is 10:15, before `now`: that quota came back ahead of this
+		// lookup, so the line must not cut a later turn short — the case a raw
+		// session idling between its open and its first prompt hits.
+		path := writeAgyLog(t, "I0918 10:00:00.000000     1 run.go:395] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 15m.), retrying in 4s")
+		if got := findAntigravityQuotaFailureInLog(path, spawnBefore, now); got != "" {
+			t.Fatalf("an expired quota record must not be adopted, got %q", got)
+		}
+		// Still inside its window (10:00 + 3h), so it is still the live quota.
+		live := writeAgyLog(t, "I0918 10:00:00.000000     1 run.go:395] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 3h.), retrying in 4s")
+		if got := findAntigravityQuotaFailureInLog(live, spawnBefore, now); got == "" {
+			t.Fatal("a record still inside its reset window must be reported")
+		}
+	})
+
 	t.Run("missing log", func(t *testing.T) {
 		if got := findAntigravityQuotaFailureInLog(filepath.Join(t.TempDir(), "nope.log"), spawnBefore, now); got != "" {
 			t.Fatalf("got %q", got)
@@ -185,5 +201,51 @@ func TestQuotaFailureFromErrorStepIsOncePerManagedSession(t *testing.T) {
 	raw := &CLISession{Command: "agy", StartedAt: now.Add(-40 * time.Minute)} // not a managed stream (e.g. `agy --version`)
 	if got := raw.quotaFailureFromErrorStep(agyErrorStep); got != "" {
 		t.Fatalf("an unmanaged invocation never publishes a notice, got %q", got)
+	}
+}
+
+func TestAntigravityQuotaPollCadence(t *testing.T) {
+	// A turn budget at or above two polls keeps the default cadence.
+	for _, timeout := range []time.Duration{0, -time.Second, 30 * time.Second, 10 * time.Minute} {
+		if got := antigravityQuotaPollCadence(timeout); got != antigravityQuotaPollInterval {
+			t.Fatalf("cadence(%v) = %v, want the default", timeout, got)
+		}
+	}
+	// A shorter budget gets a cadence that fits at least one lookup inside it,
+	// otherwise the turn times out before the log is ever read.
+	for _, timeout := range []time.Duration{10 * time.Second, 5 * time.Second, time.Second, 100 * time.Millisecond} {
+		got := antigravityQuotaPollCadence(timeout)
+		if got > timeout && got != antigravityQuotaMinPollInterval {
+			t.Fatalf("cadence(%v) = %v, no lookup would run", timeout, got)
+		}
+		if got < antigravityQuotaMinPollInterval {
+			t.Fatalf("cadence(%v) = %v, below the floor", timeout, got)
+		}
+	}
+}
+
+func TestWatchAntigravityQuotaPollsWithinAShortTurn(t *testing.T) {
+	path := writeAgyLog(t, agyQuotaLogLine)
+	orig := antigravityCliLogPathOverride
+	antigravityCliLogPathOverride = path
+	defer func() { antigravityCliLogPathOverride = orig }()
+	now := agyLogNow()
+	antigravityQuotaClock = func() time.Time { return now }
+	defer func() { antigravityQuotaClock = time.Now }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan string, 1)
+	// A 1s turn budget: the default 15s cadence would never fire.
+	go watchAntigravityQuota(ctx, now.Add(-40*time.Minute), antigravityQuotaPollCadence(time.Second), func(reason string) {
+		got <- reason
+	})
+	select {
+	case reason := <-got:
+		if reason != agyQuotaReason {
+			t.Fatalf("reason = %q", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the watcher never polled inside a short turn's budget")
 	}
 }
