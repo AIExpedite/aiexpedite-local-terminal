@@ -238,9 +238,11 @@ func TestClaudeUsagePendingRun_CoalescesABurst(t *testing.T) {
 	}
 }
 
-// Hydration is once per process and scoped to the account: a record for someone
-// else is not this gather's to pay.
-func TestClaudeUsageHydratePendingRun_OncePerProcessAndScopedToTheAccount(t *testing.T) {
+// Hydration is scoped to the account — a record for someone else is not this
+// gather's to pay — but a mismatch is not an ANSWER: the gather's identity comes
+// from a bounded credential read that can fail, so the next one gets to try
+// again. (What the latch does close on is covered by the two tests below.)
+func TestClaudeUsageHydratePendingRun_ScopedToTheAccountAndRetriedAfterAMismatch(t *testing.T) {
 	record := pendingRunEnv(t, "")
 	resetClaudeUsageProbeGate()
 	t.Cleanup(resetClaudeUsageProbeGate)
@@ -257,12 +259,14 @@ func TestClaudeUsageHydratePendingRun_OncePerProcessAndScopedToTheAccount(t *tes
 		t.Fatalf("another account's debt was inherited (%v)", owed)
 	}
 
-	// The latch has been spent by that refused attempt, which is the point: the
-	// read happens once, not on every gather.
+	// That refused attempt did NOT spend the latch: had it been a Keychain read
+	// that timed out rather than a genuinely different account, latching would
+	// have dropped a real debt for the life of the process.
 	claudeUsageHydratePendingRun("acct-a", now)
-	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
-		t.Fatalf("the hydrate-once latch let a second read through (%v)", owed)
+	if owed := claudeUsageProbe.owedObservation(); !owed.Equal(baseline) {
+		t.Fatalf("debt after the identity resolved = %v, want %v", owed, baseline)
 	}
+	claudeUsageProbe.settleOwed(baseline)
 
 	// After a restart (the reset seam clears the latch AND the record), a record
 	// for the right account is inherited.
@@ -336,5 +340,61 @@ func TestClaudeUsagePendingRun_LeavesNoTempFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(record); err != nil {
 		t.Fatalf("the record itself is missing: %v", err)
+	}
+}
+
+// Once the record HAS been answered, the latch closes: a debt this process
+// already settled must not be hydrated a second time from a record a concurrent
+// writer left behind, which would resurrect it and buy an OAuth request for a
+// reading already taken.
+func TestClaudeUsageHydratePendingRun_DoesNotRehydrateASettledDebt(t *testing.T) {
+	account := fingerprintAccount("claudeCode", "someone@example.com")
+	record := pendingRunEnv(t, account)
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	now := time.Now()
+	baseline := now.Add(-time.Minute).Truncate(time.Millisecond)
+	writeRecord := func() {
+		writePendingRunRecord(t, record, claudeUsagePendingRun{
+			SchemaVersion: claudeUsagePendingRunSchema, AccountFingerprint: account,
+			OwedObservedAtMs: baseline.UnixMilli(), RecordedAtMs: now.UnixMilli(),
+		})
+	}
+
+	writeRecord()
+	claudeUsageHydratePendingRun(account, now)
+	owed := claudeUsageProbe.owedObservation()
+	if owed.UnixMilli() != baseline.UnixMilli() {
+		t.Fatalf("inherited debt = %v, want the persisted baseline %v", owed, baseline)
+	}
+
+	claudeUsageProbe.settleOwed(owed)
+	writeRecord()
+	claudeUsageHydratePendingRun(account, now)
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("a settled debt was hydrated a second time (%v)", owed)
+	}
+}
+
+// A record that has aged out is a permanent answer no matter whose it is: the
+// age and shape guards run BEFORE the fingerprint, so an expired record left by
+// another account cannot hold the latch open and buy a file read per gather for
+// the rest of the process's life.
+func TestClaudeUsageHydratePendingRun_AnExpiredRecordClosesTheLatch(t *testing.T) {
+	record := pendingRunEnv(t, "us")
+	now := time.Now()
+	stale := now.Add(-claudeUsagePendingRunMaxAge - time.Minute)
+	writePendingRunRecord(t, record, claudeUsagePendingRun{
+		SchemaVersion: claudeUsagePendingRunSchema, AccountFingerprint: "someone-else",
+		OwedObservedAtMs: stale.UnixMilli(), RecordedAtMs: stale.UnixMilli(),
+	})
+
+	claudeUsageHydratePendingRun("us", now)
+	if _, _, settled := claudeUsagePendingRunLoad("us", now); !settled {
+		t.Fatal("an expired record was treated as a question still open")
+	}
+	if !claudeUsagePendingRunState.hydrated {
+		t.Error("the latch stayed open on a record that can never be payable")
 	}
 }

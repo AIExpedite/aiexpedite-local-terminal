@@ -218,28 +218,49 @@ func clearClaudeUsagePendingRun(settled time.Time) {
 // to the buckets themselves), a non-positive baseline, and a record older than
 // claudeUsagePendingRunMaxAge.
 func loadClaudeUsagePendingRun(fingerprint string, now time.Time) (time.Time, bool) {
+	baseline, ok, _ := claudeUsagePendingRunLoad(fingerprint, now)
+	return baseline, ok
+}
+
+// claudeUsagePendingRunLoad is loadClaudeUsagePendingRun plus the one thing the
+// hydrate latch needs: whether the answer is SETTLED for this process.
+//
+// It is settled for every discard whose verdict cannot change while the process
+// runs — no file, unreadable, corrupt, unknown schema, nonsense baseline, past
+// claudeUsagePendingRunMaxAge — and for a successful load. It is NOT settled for
+// the one discard that depends on something the caller may not have had yet: a
+// well-formed, unexpired record whose fingerprint disagrees with the identity we
+// were handed. The gather derives that identity from a credential read (bounded,
+// and on macOS a `security` spawn), so a timeout there hands us "" for an
+// account whose record is scoped — and latching on that would retire the debt
+// for the whole process even though the very next gather can read the account
+// fine. That is the failure this record exists to prevent, just moved.
+//
+// The order matters: age and shape are checked BEFORE the fingerprint, so a
+// record that has aged out is settled regardless of whose it is and cannot keep
+// the latch open forever.
+func claudeUsagePendingRunLoad(fingerprint string, now time.Time) (baseline time.Time, ok, settled bool) {
 	raw, err := os.ReadFile(claudeUsagePendingRunPath())
 	if err != nil {
-		return time.Time{}, false
+		return time.Time{}, false, true
 	}
 	var rec claudeUsagePendingRun
 	if json.Unmarshal(raw, &rec) != nil {
-		return time.Time{}, false
+		return time.Time{}, false, true
 	}
 	if rec.SchemaVersion != claudeUsagePendingRunSchema {
-		return time.Time{}, false
-	}
-	if rec.AccountFingerprint != fingerprint {
-		return time.Time{}, false
+		return time.Time{}, false, true
 	}
 	if rec.OwedObservedAtMs <= 0 || rec.RecordedAtMs <= 0 {
-		return time.Time{}, false
+		return time.Time{}, false, true
 	}
-	recordedAt := time.UnixMilli(rec.RecordedAtMs)
-	if now.Sub(recordedAt) > claudeUsagePendingRunMaxAge {
-		return time.Time{}, false
+	if now.Sub(time.UnixMilli(rec.RecordedAtMs)) > claudeUsagePendingRunMaxAge {
+		return time.Time{}, false, true
 	}
-	return time.UnixMilli(rec.OwedObservedAtMs), true
+	if rec.AccountFingerprint != fingerprint {
+		return time.Time{}, false, false // may be ours; the identity we were given cannot say
+	}
+	return time.UnixMilli(rec.OwedObservedAtMs), true, true
 }
 
 // claudeUsageHydratePendingRun loads the persisted debt ONCE per process and
@@ -248,17 +269,37 @@ func loadClaudeUsagePendingRun(fingerprint string, now time.Time) (time.Time, bo
 //
 // Scoped by the fingerprint the gather already decoded — a record written under
 // another account is not ours to pay.
+//
+// "Once" means once the record has actually been ANSWERED: the latch is set for
+// a load and for every permanent discard, but not for a fingerprint mismatch,
+// which the next gather may resolve differently (see claudeUsagePendingRunLoad).
+// A mismatch therefore costs one ~200-byte read per gather until the identity
+// settles or the record ages out — far cheaper than the missed refresh it buys.
 func claudeUsageHydratePendingRun(fingerprint string, now time.Time) {
 	st := &claudeUsagePendingRunState
 	st.mu.Lock()
-	if st.hydrated {
-		st.mu.Unlock()
+	hydrated := st.hydrated
+	st.mu.Unlock()
+	if hydrated {
 		return
 	}
-	st.hydrated = true
+
+	// Read OFF the lock, the way every other reader here does.
+	baseline, ok, settled := claudeUsagePendingRunLoad(fingerprint, now)
+
+	st.mu.Lock()
+	if settled {
+		st.hydrated = true
+	}
+	// Never below the watermark this process has already PAID. Without the
+	// latch being taken up front, two gathers can read the same record
+	// concurrently, and one of them may land after the other's probe settled it
+	// — recordOwed has no settled watermark of its own, so an unguarded repeat
+	// would resurrect a discharged debt and buy an OAuth request for nothing.
+	fresh := ok && baseline.After(st.settled)
 	st.mu.Unlock()
 
-	if baseline, ok := loadClaudeUsagePendingRun(fingerprint, now); ok {
+	if fresh {
 		// recordOwed keeps the newest baseline, so a turn this process already
 		// finished outranks the inherited one rather than being rolled back.
 		claudeUsageProbe.recordOwed(baseline)
