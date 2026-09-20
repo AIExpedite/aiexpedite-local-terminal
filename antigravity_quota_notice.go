@@ -65,6 +65,9 @@ const (
 	antigravityQuotaMinPollInterval = 500 * time.Millisecond
 	// Grace between the interrupt and the kill that stops the retry loop.
 	antigravityQuotaKillGrace = 3 * time.Second
+	// Tolerated drift between the log clock and ours — both when deciding a
+	// line predates this turn and when dating a year-less stamp.
+	antigravityLogClockSkew = 2 * time.Second
 )
 
 // glog line: level, mmdd, hh:mm:ss.micros, thread, file:line] message.
@@ -138,7 +141,10 @@ func antigravityResetWindow(reason string) (time.Duration, bool) {
 
 // parseAntigravityRunFailureLine reads one cli.log line. glog stamps no year:
 // the current one is assumed, stepping back a year when that lands in the
-// future (a lookup across New Year).
+// future (a lookup across New Year). ANY stamp ahead of now is last year’s —
+// on January 1 a line dated January 2 is a year old, not tomorrow’s — bar
+// antigravityLogClockSkew of drift, which keeps a line agy has only just
+// written eligible.
 func parseAntigravityRunFailureLine(line string, now time.Time) (at time.Time, reason string, ok bool) {
 	m := antigravityRunFailureLine.FindStringSubmatch(strings.TrimRight(line, "\r"))
 	if m == nil {
@@ -152,7 +158,7 @@ func parseAntigravityRunFailureLine(line string, now time.Time) (at time.Time, r
 	// Fraction digits are a decimal fraction: `.5` is 500000µs, not 5µs.
 	micro, _ := strconv.Atoi(m[6] + strings.Repeat("0", 6-len(m[6])))
 	at = time.Date(now.Year(), time.Month(month), day, hour, minute, second, micro*1000, now.Location())
-	if at.After(now.Add(24 * time.Hour)) {
+	if at.After(now.Add(antigravityLogClockSkew)) {
 		at = at.AddDate(-1, 0, 0)
 	}
 	return at, strings.TrimSpace(m[7]), true
@@ -191,7 +197,7 @@ func findAntigravityQuotaFailureInLog(path string, since, now time.Time) string 
 	}
 	// Tolerate a cut first line and any timestamp drift between the log's
 	// clock and ours by a couple of seconds.
-	cutoff := since.Add(-2 * time.Second)
+	cutoff := since.Add(-antigravityLogClockSkew)
 	newest := ""
 	for _, raw := range bytes.Split(data, []byte("\n")) {
 		at, reason, ok := parseAntigravityRunFailureLine(string(raw), now)

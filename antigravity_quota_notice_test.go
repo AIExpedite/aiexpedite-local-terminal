@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,6 +43,22 @@ func TestParseAntigravityRunFailureLine(t *testing.T) {
 	if at2.Year() != now.Year()-1 {
 		t.Fatalf("a future-dated stamp should step back a year, got %v", at2)
 	}
+	// A stamp only HOURS ahead of now is last year’s too: on January 1 a line
+	// dated January 2 was written 364 days ago, not tomorrow.
+	newYear := time.Date(now.Year(), time.January, 1, 12, 0, 0, 0, time.Local)
+	at3, _, _ := parseAntigravityRunFailureLine(
+		`I0102 10:02:56.745522     460 run.go:395] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resets in 1h27m57s.), retrying in 4s`,
+		newYear,
+	)
+	if !at3.Before(newYear) {
+		t.Fatalf("a stamp ahead of now must date to last year, got %v (now %v)", at3, newYear)
+	}
+	// … but a line agy wrote a moment ago, on a log clock a hair ahead of
+	// ours, stays in the current year.
+	skewed := parseSkewedNow(t, now)
+	if skewed.Year() != now.Year() {
+		t.Fatalf("a stamp inside the tolerated drift must stay in this year, got %v", skewed)
+	}
 	for _, line := range []string{
 		"",
 		"I0918 10:02:56.517054     312 quota_manager.go:45] doRefreshQuota: starting reload (force=true)",
@@ -51,6 +68,22 @@ func TestParseAntigravityRunFailureLine(t *testing.T) {
 			t.Fatalf("%q must not parse as a run failure", line)
 		}
 	}
+}
+
+// parseSkewedNow parses a line stamped one second ahead of `now` — the drift
+// antigravityLogClockSkew tolerates — and returns its parsed time.
+func parseSkewedNow(t *testing.T, now time.Time) time.Time {
+	t.Helper()
+	ahead := now.Add(time.Second)
+	line := fmt.Sprintf(
+		"I%02d%02d %02d:%02d:%02d.000000     460 run.go:395] Run: attempt 1 failed (RESOURCE_EXHAUSTED (code 429): Resets in 1h.), retrying in 4s",
+		int(ahead.Month()), ahead.Day(), ahead.Hour(), ahead.Minute(), ahead.Second(),
+	)
+	at, _, ok := parseAntigravityRunFailureLine(line, now)
+	if !ok {
+		t.Fatalf("%q did not parse", line)
+	}
+	return at
 }
 
 func TestIsAntigravityQuotaReason(t *testing.T) {
