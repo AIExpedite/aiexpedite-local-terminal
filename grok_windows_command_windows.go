@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"os/exec"
 	"syscall"
 )
@@ -19,4 +20,26 @@ func configureGrokWindowsCommandLine(cmd *exec.Cmd, script string) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.CmdLine = "/d /v:off /c " + script
+}
+
+// grokSmokeShimCommand routes a `.cmd` / `.bat` npm shim launch of the Grok
+// maintenance smoke through cmd.exe with an explicit command line, so the
+// shim's re-parse cannot re-split or drop a token. Both paths ride in the
+// child's environment (grokSmokeShimScript); the script itself carries only
+// the ladder's fixed flag tokens. Returns ok=false for a native binary or a
+// launch whose argv the script renderer refuses, and the caller spawns
+// directly instead.
+func grokSmokeShimCommand(ctx context.Context, launch grokSmokeLaunch) (*exec.Cmd, bool) {
+	if !isGrokWindowsShim(launch.Path) {
+		return nil, false
+	}
+	script, ok := grokSmokeShimScript(launch.Args)
+	if !ok {
+		return nil, false
+	}
+	cmd := grokWindowsCommandContext(ctx, script)
+	env := setEnvVar(launch.Env, grokSmokeShimPathEnv, launch.Path)
+	cmd.Env = setEnvVar(env, grokSmokeShimPromptEnv, launch.PromptFile)
+	cmd.Dir = launch.Dir
+	return cmd, true
 }

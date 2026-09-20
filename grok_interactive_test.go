@@ -132,86 +132,75 @@ func TestSessionStartArgsForCommand_PromotesSerializedMaintenanceSmoke(t *testin
 	if !promoted {
 		t.Fatalf("malformed reserved smoke was not promoted for fail-closed validation: %#v", conflicting.Args)
 	}
-	if err := validateGrokMaintenanceSmokeRequestArgs(cleanedConflicting); err == nil {
+	if _, err := validateGrokSmokeRequest(cleanedConflicting); err == nil {
 		t.Fatalf("conflicting serialized smoke contract was accepted: %#v", cleanedConflicting)
 	}
 }
 
-func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
-	tests := []struct {
-		args []string
-		want bool
-	}{
-		{buildGrokInteractiveArgs([]string{"--tools", "", "marker"}, false), true},
-		{buildGrokInteractiveArgs([]string{"--tools=", "marker"}, false), true},
-		{buildGrokInteractiveArgs([]string{"--tools", "Bash", "marker"}, false), false},
-		{buildGrokInteractiveArgs([]string{"--tools", "", "--tools", "Bash", "marker"}, false), false},
-		{buildGrokInteractiveArgs([]string{"--tools=", "--tools", "", "marker"}, false), false},
-		{buildGrokInteractiveArgs([]string{"--disable-web-search", "marker"}, false), false},
-		{[]string{"--tools", "", "models"}, false},
-	}
-	for _, tc := range tests {
-		if got := grokArgsRequestNoTools(tc.args); got != tc.want {
-			t.Errorf("grokArgsRequestNoTools(%#v) = %t, want %t", tc.args, got, tc.want)
+// The child argv is one ladder rung and nothing else. Every safety control the
+// rung carries is load-bearing: dropping one, duplicating one, appending an
+// approval/provider/filesystem/response-shaping option, or leaving an empty
+// argv element (the Windows regression) fails the single shape validator both
+// call sites use.
+func TestValidateGrokSmokeShape_RequiresAllSafetyControls(t *testing.T) {
+	promptFile := filepath.Join(t.TempDir(), "prompt.txt")
+	for _, shape := range grokSmokeArgvShapes {
+		valid := buildGrokNoToolsSmokeArgs(shape, promptFile)
+		if err := validateGrokSmokeShape(valid); err != nil {
+			t.Fatalf("rung %s rejected its own argv: %v", shape.ID, err)
 		}
-	}
-}
 
-func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testing.T) {
-	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
-	valid := buildGrokInteractiveArgs([]string{
-		"--tools", "", "--disable-web-search", "--no-subagents",
-		"--max-turns", "1", "--verbatim", prompt,
-	}, false)
-	if err := validateGrokMaintenanceSmokeContract(valid); err != nil {
-		t.Fatalf("valid maintenance contract rejected: %v", err)
-	}
-
-	for _, missing := range []string{"--disable-web-search", "--no-subagents", "--verbatim", "--max-turns"} {
-		trimmed := make([]string, 0, len(valid))
-		dropValue := false
-		for _, arg := range valid {
-			if dropValue {
-				dropValue = false
-				continue
+		for i := range valid[:len(valid)-2] {
+			trimmed := append(append([]string(nil), valid[:i]...), valid[i+1:]...)
+			if err := validateGrokSmokeShape(trimmed); err == nil {
+				t.Errorf("rung %s missing %s was accepted: %#v", shape.ID, valid[i], trimmed)
 			}
-			if arg == missing {
-				dropValue = missing == "--max-turns"
-				continue
-			}
-			trimmed = append(trimmed, arg)
 		}
-		if err := validateGrokMaintenanceSmokeContract(trimmed); err == nil {
-			t.Errorf("contract missing %s was accepted: %#v", missing, trimmed)
+
+		for _, extra := range [][]string{
+			{"--max-turns=5"},
+			{"--max-turns", "1"},
+			{"--disable-web-search"},
+			{"--no-subagents"},
+			{"--verbatim"},
+			{"--always-approve"},
+			{"--auto-approve"},
+			{"--permission-mode", "bypassPermissions"},
+			{"--allow", "MCPTool(*)"},
+			{"--model", "provider-sentinel"},
+			{"--json-schema", `{"type":"string"}`},
+			{"--tools", ""},
+			{""},
+		} {
+			conflicting := append(append([]string(nil), valid[:len(valid)-2]...), extra...)
+			conflicting = append(conflicting, grokSmokePromptFileFlag, promptFile)
+			if err := validateGrokSmokeShape(conflicting); err == nil {
+				t.Errorf("rung %s with injected %#v was accepted: %#v", shape.ID, extra, conflicting)
+			}
 		}
 	}
 
-	for _, duplicate := range [][]string{
-		{"--max-turns", "1"},
-		{"--max-turns=5"},
-		{"--disable-web-search"},
-		{"--no-subagents"},
-		{"--verbatim"},
+	for _, bad := range [][]string{
+		nil,
+		{"--output-format=streaming-json", "--tools=", "--max-turns=1", grokSmokePromptFileFlag, ""},
+		{"--output-format=streaming-json", "--tools=", "--max-turns=1", grokSmokePromptFileFlag},
+		{"--output-format=streaming-json", "--tools=", "--max-turns=1", "-p", "inline prompt"},
 	} {
-		conflicting := append(append([]string(nil), valid...), duplicate...)
-		if err := validateGrokMaintenanceSmokeContract(conflicting); err == nil {
-			t.Errorf("contract with duplicate/conflicting controls was accepted: %#v", conflicting)
+		if err := validateGrokSmokeShape(bad); err == nil {
+			t.Errorf("argv without a staged prompt file was accepted: %#v", bad)
 		}
-	}
-	dangling := append(append([]string(nil), valid...), "--max-turns")
-	if err := validateGrokMaintenanceSmokeContract(dangling); err == nil {
-		t.Errorf("contract with dangling --max-turns was accepted: %#v", dangling)
 	}
 }
 
-func TestValidateGrokMaintenanceSmokeRequestArgs_RejectsEveryExtraOption(t *testing.T) {
+// The signed session_start wire request is the legacy transport's contract and
+// stays byte-stable: exactly the canonical tokens plus a marker prompt. Every
+// extra option is refused with fixed text that never reflects its value.
+func TestValidateGrokSmokeRequest_RejectsEveryExtraOption(t *testing.T) {
 	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
-	valid := []string{
-		"--tools", "", "--disable-web-search", "--no-subagents",
-		"--max-turns", "1", "--verbatim", prompt,
-	}
-	if err := validateGrokMaintenanceSmokeRequestArgs(valid); err != nil {
-		t.Fatalf("canonical request rejected: %v", err)
+	valid := append(append([]string(nil), grokSmokeWireRequest...), prompt)
+	got, err := validateGrokSmokeRequest(valid)
+	if err != nil || got != prompt {
+		t.Fatalf("canonical request rejected: prompt=%q err=%v", got, err)
 	}
 
 	tests := [][]string{
@@ -230,7 +219,7 @@ func TestValidateGrokMaintenanceSmokeRequestArgs_RejectsEveryExtraOption(t *test
 		candidate := append([]string(nil), valid[:len(valid)-1]...)
 		candidate = append(candidate, extra...)
 		candidate = append(candidate, prompt)
-		err := validateGrokMaintenanceSmokeRequestArgs(candidate)
+		_, err := validateGrokSmokeRequest(candidate)
 		if err == nil {
 			t.Errorf("maintenance request with extra option was accepted: %#v", extra)
 			continue
@@ -242,6 +231,13 @@ func TestValidateGrokMaintenanceSmokeRequestArgs_RejectsEveryExtraOption(t *test
 			if strings.Contains(err.Error(), sentinel) {
 				t.Errorf("maintenance rejection leaked %q: %v", sentinel, err)
 			}
+		}
+	}
+
+	for _, badPrompt := range []string{"", "TEST_MARKER", grokMaintenanceSmokePromptPrefix, grokMaintenanceSmokePromptPrefix + "A\nB"} {
+		candidate := append(append([]string(nil), grokSmokeWireRequest...), badPrompt)
+		if _, err := validateGrokSmokeRequest(candidate); err == nil {
+			t.Errorf("malformed marker prompt %q was accepted", badPrompt)
 		}
 	}
 }

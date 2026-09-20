@@ -510,6 +510,18 @@ func runMockCLI(mode string) {
 	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
 		runMockGrokMaintenanceSmoke(mode)
 
+	case "grok-smoke-argv-echo":
+		// Echoes every argv element it received as one streaming-json text
+		// frame, then `end`. Used by the Windows shim round-trip test to prove
+		// that a `.cmd` shim launch hands the child exactly the ladder's
+		// tokens — no re-split, no dropped empty operand.
+		for _, arg := range os.Args[1:] {
+			encoded, _ := json.Marshal(map[string]string{"type": "text", "text": arg})
+			fmt.Println(string(encoded))
+		}
+		fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+		os.Exit(0)
+
 	case "grok-ordinary-no-tools":
 		args := os.Args[1:]
 		tools, hasTools := mockArgValue(args, "--tools")
@@ -687,7 +699,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
 		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
-		!mockHasArg(args, "--verbatim") || !hasPromptFile || promptErr != nil ||
+		mockHasArg(args, "") || mockHasArg(args, "-p") || !hasPromptFile || promptErr != nil ||
 		string(prompt) != "Return exactly this marker and nothing else: "+grokMaintenanceSmokeMarker {
 		fmt.Fprintln(os.Stderr, "protocol error")
 		os.Exit(1)
@@ -711,10 +723,16 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	os.Exit(0)
 }
 
+// mockArgValue reads a flag's value in either spelling — the separate-value
+// pair the ordinary session path emits, or the equals form the maintenance
+// smoke shape (grok_argv.go) emits so no argv element is ever empty.
 func mockArgValue(args []string, name string) (string, bool) {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == name {
+	for i, arg := range args {
+		if arg == name && i+1 < len(args) {
 			return args[i+1], true
+		}
+		if value, ok := strings.CutPrefix(arg, name+"="); ok {
+			return value, true
 		}
 	}
 	return "", false

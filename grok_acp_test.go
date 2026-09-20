@@ -44,7 +44,7 @@ func TestGrokACPManager_NoToolsSmokeRejectedBeforePrompt(t *testing.T) {
 		GrokStartOptions{},
 		func(msg resultMsg) { captured = append(captured, msg) },
 	)
-	if err == nil || !strings.Contains(err.Error(), "use session_start") {
+	if err == nil || !strings.Contains(err.Error(), cliSmokeCommand) {
 		t.Fatalf("Start no-tools ACP error = %v, want actionable root-protocol rejection", err)
 	}
 	if m.ActiveCount() != 0 || len(captured) != 0 {

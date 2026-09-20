@@ -751,14 +751,14 @@ type resultMsg struct {
 	// Type == cliSmokeResultType. Metric-only BY CONSTRUCTION: status, a
 	// closed-enum errorCategory, the marker verdict, a duration, the fixed argv
 	// SHAPE ID, and `diagnostic` — a value from the closed cliSmokeDiagnostic*
-	// set in cliagent_smoke_claudecode.go. Read that block for the members
-	// rather than trusting a list here: a transcribed copy is how a closed set
-	// and its documentation drift apart.
+	// set in cliagent_smoke.go. Read that block for the members rather than
+	// trusting a list here: a transcribed copy is how a closed set and its
+	// documentation drift apart.
 	//
 	// NO text the CLI authored is published — or retained anywhere. The child's
 	// stdout and stderr are read only to choose between those constants and are
 	// then discarded; they are not logged either (see the retention note in
-	// cliagent_smoke_claudecode.go: the agent log is uploadable, and a denylist
+	// cliagent_smoke.go: the agent log is uploadable, and a denylist
 	// redactor cannot see a raw config fragment, a private path, a short
 	// password, or an unfamiliar credential format). An early revision carried a
 	// capped + redacted `stderrTail` here; it was removed for exactly that
@@ -1109,8 +1109,9 @@ func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, s
 
 // handleCLISmokeCommand fulfils the signed `__cli_smoke__` operational command
 // the CLI-maintenance flow runs on both sides of a CLI upgrade. It runs the
-// no-tools, non-interactive probe (cliagent_smoke_claudecode.go) and publishes
-// exactly one correlated `__cli_smoke_result__`.
+// no-tools, non-interactive probe for the named CLI (cliSmokeProviders in
+// cliagent_smoke.go: claudeCode, grok) and publishes exactly one correlated
+// `__cli_smoke_result__`.
 //
 // Which CLI to smoke travels as the FIRST ARG rather than a new top-level
 // field: Args are already inside the HMAC payload, so the target cannot be

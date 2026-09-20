@@ -74,10 +74,10 @@ func smokeEnv(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(dir, "rl.json"))
 	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(dir, "prev.json"))
-	resetClaudeSmokeState()
+	resetCLISmokeState()
 	resetVersionProbeCache()
 	t.Cleanup(func() {
-		resetClaudeSmokeState()
+		resetCLISmokeState()
 		resetVersionProbeCache()
 	})
 }
@@ -1012,11 +1012,11 @@ func TestClaudeSmokeCapturedOutputIsBounded(t *testing.T) {
 	if ctx.Err() != nil {
 		t.Fatal("the probe hit its deadline — the child wedged on a full pipe instead of being drained")
 	}
-	if len(stdout) != claudeSmokeMaxStdout {
-		t.Fatalf("retained %d stdout bytes, want the %d-byte cap", len(stdout), claudeSmokeMaxStdout)
+	if len(stdout) != cliSmokeMaxStdout {
+		t.Fatalf("retained %d stdout bytes, want the %d-byte cap", len(stdout), cliSmokeMaxStdout)
 	}
-	if len(stderr) != claudeSmokeMaxStderr {
-		t.Fatalf("retained %d stderr bytes, want the %d-byte cap", len(stderr), claudeSmokeMaxStderr)
+	if len(stderr) != cliSmokeMaxStderr {
+		t.Fatalf("retained %d stderr bytes, want the %d-byte cap", len(stderr), cliSmokeMaxStderr)
 	}
 }
 

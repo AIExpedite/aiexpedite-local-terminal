@@ -2418,26 +2418,44 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 	return nil
 }
 
+// grokSmokePreflightError is the typed refusal detectGrokMaintenanceSmokeSystemConfig
+// returns. Diagnostic is a value from the closed cliSmokeDiagnostic* set
+// (cliagent_smoke.go) so the `__cli_smoke__` probe can publish WHY it refused
+// (`internal`: a config posture this probe will not run under) instead of an
+// opaque non-zero verdict, while Message stays fixed text that names no path,
+// key or value from the layer it inspected. The session_start smoke wraps the
+// same error into its start failure unchanged.
+type grokSmokePreflightError struct {
+	Diagnostic string
+	Message    string
+}
+
+func (e *grokSmokePreflightError) Error() string { return e.Message }
+
+func newGrokSmokePreflightError(message string) *grokSmokePreflightError {
+	return &grokSmokePreflightError{Diagnostic: cliSmokeDiagnosticInternal, Message: message}
+}
+
 // detectGrokMaintenanceSmokeSystemConfig applies the stricter system-layer
 // posture required by the subscription-only, no-tools maintenance smoke.
 // GROK_HOME isolation cannot hide xAI's system requirements/managed-config
 // layers, so decode their TOML semantics and refuse pinned credentials,
 // permissive approval, external-tool definitions, or settings that re-enable
-// vendor MCP discovery.
+// vendor MCP discovery. Every refusal is a *grokSmokePreflightError.
 func detectGrokMaintenanceSmokeSystemConfig(grokVersion string) error {
 	for _, path := range grokSystemConfigPathsFn() {
 		finding, ok, err := inspectGrokSystemConfigSemantic(path, grokVersion)
 		if err != nil {
-			return err
+			return newGrokSmokePreflightError(err.Error())
 		}
 		if !ok {
 			continue
 		}
 		if finding.credential || finding.externalProvider || finding.permissiveApproval {
-			return fmt.Errorf("grok system configuration pins credentials, external provider routing, or a permissive approval policy; refusing no-tools maintenance smoke")
+			return newGrokSmokePreflightError("grok system configuration pins credentials, external provider routing, or a permissive approval policy; refusing no-tools maintenance smoke")
 		}
 		if finding.toolCategory != "" {
-			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", finding.toolCategory)
+			return newGrokSmokePreflightError(fmt.Sprintf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", finding.toolCategory))
 		}
 	}
 	// Claude's managed-settings compatibility layer is JSON rather than TOML,
@@ -2445,10 +2463,10 @@ func detectGrokMaintenanceSmokeSystemConfig(grokVersion string) error {
 	for _, path := range claudeManagedSettingsPathsFn() {
 		ok, err := inspectClaudeManagedSettingsAllowRule(path)
 		if err != nil {
-			return fmt.Errorf("grok system configuration cannot be inspected safely; refusing no-tools maintenance smoke")
+			return newGrokSmokePreflightError("grok system configuration cannot be inspected safely; refusing no-tools maintenance smoke")
 		}
 		if ok {
-			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
+			return newGrokSmokePreflightError("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
 		}
 	}
 	return nil
@@ -3603,7 +3621,7 @@ func setEnvVar(env []string, key, value string) []string {
 func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string, error) {
 	if arg, ok := grokACPRootOnlyArg(extraArgs); ok {
 		return defaultModel, nil, fmt.Errorf(
-			"grok agent stdio does not support root-only option %q; use session_start for grok -p/no-tools smoke invocations",
+			"grok agent stdio does not support root-only option %q; use the signed __cli_smoke__ command (cliId grok) for the no-tools maintenance smoke",
 			arg,
 		)
 	}
