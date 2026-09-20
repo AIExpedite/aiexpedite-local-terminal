@@ -123,18 +123,30 @@ func noteClaudeTurnSpentDurably(completedAt time.Time, harvested bool) bool {
 // Row-aware (claudeSnapshotFreshness), not "the newest reading anywhere": an
 // envelope that carried only `five_hour` leaves the weekly and Fable rows exactly
 // as stale as they were, and calling that covered would reintroduce the reported
-// defect on two of the three rows. The account scope comes from the cache's own
-// snapshot for the same reason claudeUsagePendingRunFingerprint uses it — it is
+// defect on two of the three rows. The account scope comes from the caches' own
+// snapshots for the same reason claudeUsagePendingRunAccounts uses them — it is
 // the identity those buckets are already filed under, and it costs no credential
 // read.
+//
+// EVERY candidate account must be covered, not just the newest cache's. Which of
+// them the next gather displays is not knowable without the credential read this
+// path refuses to pay, and the two mistakes are not symmetric: calling an
+// uncovered run covered suppresses the debt and leaves the card stale (the
+// reported defect), while the reverse costs at most one probe under the existing
+// bounds. On the single-account device this is the same single check as before.
 func claudeUsageRunCoveredByOwnTelemetry(completedAt time.Time) bool {
-	fingerprint, scoped := claudeUsagePendingRunFingerprint()
-	if !scoped {
+	accounts := claudeUsagePendingRunAccounts()
+	if len(accounts) == 0 {
 		return false
 	}
 	now := time.Now()
-	return claudeUsageObservationCovers(
-		claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now), completedAt)
+	for _, fingerprint := range accounts {
+		if !claudeUsageObservationCovers(
+			claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now), completedAt) {
+			return false
+		}
+	}
+	return true
 }
 
 // claudeUsageHarvestPrintStdout scans a completed run's own stdout for rate-limit

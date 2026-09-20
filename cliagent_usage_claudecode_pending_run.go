@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -44,15 +45,6 @@ const (
 	// the same two reasons: tests must never touch the real device record, and a
 	// read-only data dir can be relocated.
 	claudeUsagePendingRunEnv = "AIEXPEDITE_CLAUDE_PENDING_RUN"
-
-	// claudeUsagePendingRunCoalesce is how far a new baseline must advance past
-	// the one already on disk before it is worth another write. A chatty session
-	// settles a turn every few seconds, and the record exists only to survive a
-	// restart — re-writing it for a baseline that moved 200ms buys nothing and
-	// costs a file write per turn. The cost of the skip is bounded by this same
-	// value: after a restart the hydrated debt can be up to one interval older
-	// than the newest turn, which only ever makes the debt EASIER to settle.
-	claudeUsagePendingRunCoalesce = time.Second
 )
 
 // claudeUsagePendingRunMaxAge is how long a persisted debt stays payable.
@@ -68,8 +60,25 @@ const claudeUsagePendingRunMaxAge = 12 * time.Hour
 type claudeUsagePendingRun struct {
 	SchemaVersion      int    `json:"schemaVersion"`
 	AccountFingerprint string `json:"accountFingerprint,omitempty"`
-	OwedObservedAtMs   int64  `json:"owedObservedAtMs"`
-	RecordedAtMs       int64  `json:"recordedAtMs"`
+	// AccountFingerprints carries the ADDITIONAL accounts this debt may belong
+	// to — the other cache paths' owners on a multi-channel device. Additive
+	// within schema 1: an older agent ignores it and keeps today's behaviour.
+	AccountFingerprints []string `json:"accountFingerprints,omitempty"`
+	OwedObservedAtMs    int64    `json:"owedObservedAtMs"`
+	RecordedAtMs        int64    `json:"recordedAtMs"`
+}
+
+// scopedTo reports whether this record may be paid under `fingerprint`.
+func (r claudeUsagePendingRun) scopedTo(fingerprint string) bool {
+	if r.AccountFingerprint == fingerprint {
+		return true
+	}
+	for _, alt := range r.AccountFingerprints {
+		if alt == fingerprint {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeUsagePendingRunState serialises the record's writers against its
@@ -103,25 +112,30 @@ func claudeUsagePendingRunPath() string {
 // their synchronous trigger: the scanner that decides "this turn is over" must
 // stay free of filesystem work. The smoke is the one caller that pays it
 // synchronously (noteClaudeTurnSpentDurably) because its process may be replaced
-// the moment it returns. Coalesced (claudeUsagePendingRunCoalesce) so a chatty
-// multi-turn session costs roughly one write per settled turn rather than one
-// per stream line — and so the trailing goroutine's repeat of a baseline the
-// smoke already wrote costs no second write.
+// the moment it returns.
+//
+// Coalescing is by BASELINE, not by elapsed time: a baseline at or before the
+// one already on disk writes nothing — which is exactly the repeat the trailing
+// goroutine makes of what the smoke already wrote, and the dominant duplicate —
+// while any ADVANCE is written immediately. A time window here would be a
+// correctness bug rather than a saving: two turns settling inside it leave the
+// OLDER baseline durable, and an observation landing between them then settles
+// the hydrated debt even though it predates the second turn. The bound that
+// matters is per settled turn, which this keeps.
 func claudeUsageRecordPendingRun(baseline time.Time) {
 	if baseline.IsZero() {
 		return
 	}
 	st := &claudeUsagePendingRunState
 	st.mu.Lock()
-	due := baseline.After(st.settled) &&
-		(st.persisted.IsZero() || baseline.Sub(st.persisted) >= claudeUsagePendingRunCoalesce)
+	due := baseline.After(st.settled) && baseline.After(st.persisted)
 	st.mu.Unlock()
 	if !due {
 		return
 	}
-	// Resolved OFF the lock — it reads the cache file.
-	fingerprint, scoped := claudeUsagePendingRunFingerprint()
-	if !scoped {
+	// Resolved OFF the lock — it reads the cache files.
+	accounts := claudeUsagePendingRunAccounts()
+	if len(accounts) == 0 {
 		return
 	}
 
@@ -132,66 +146,106 @@ func claudeUsageRecordPendingRun(baseline time.Time) {
 	if !baseline.After(st.settled) {
 		return
 	}
-	if persistClaudeUsagePendingRun(baseline, fingerprint) {
+	if persistClaudeUsagePendingRun(baseline, accounts) {
 		st.persisted = baseline
 	}
 }
 
-// claudeUsagePendingRunFingerprint returns the account the record must be
-// scoped to, read from the rate-limit cache's own `accountFingerprint`.
+// claudeUsagePendingRunAccounts returns the accounts the record must be scoped
+// to, read from the rate-limit caches' own `accountFingerprint`.
 //
 // Deliberately NOT currentClaudeAccountFingerprint: on a default macOS config
 // that shells out to `security` under a 3s timeout, and paying it per settled
 // turn would move the per-run cost this feature's coalescing exists to avoid
 // rather than remove it (the same rule claudeUsageProbeStoredIdentity's comment
 // states, and TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe
-// pins). The cache is the RIGHT source anyway: it is the identity the buckets a
-// hydrated debt would refresh are already scoped to, so the two cannot disagree.
+// pins). The caches are the RIGHT source anyway: they hold the identity the
+// buckets a hydrated debt would refresh are already scoped to.
 //
 // Read from EVERY path the displayed rows are merged from
 // (claudeRateLimitCachePaths), not just this channel's own file. On a box with
 // two channels installed the one that lost Claude's statusLine hook has no local
 // cache at all and shows rows exclusively from the pinned one — and consulting
-// only the local path there returns (false), so the smoke's debt is never
+// only the local path there returns nothing, so the smoke's debt is never
 // persisted and the pre-smoke pinned rows go on suppressing the probe after the
 // update: the very failure this record exists to survive, in its dual-channel
-// form. Where several caches exist, the one carrying the NEWEST observation
-// wins, because that is the file whose freshness decides whether the next
-// process probes at all; ties keep the local path, so a single-cache device
-// behaves exactly as before.
+// form.
 //
-// (false) when no cache exists on any path — a device with no reading at all has
+// EVERY distinct account found is kept, rather than just the newest cache's.
+// Picking one by timestamp guesses which account the next gather will display,
+// and after an account switch the guess is wrong in the direction that hurts:
+// a newer cache for the previous account A scopes the debt to A while
+// loadMergedClaudeRateLimitView renders the still-within-TTL cache for the
+// current account B, so hydration under B rejects the record and the fresh-
+// looking B rows suppress the probe — the stale card again. The turn was spent
+// by whichever of these accounts Claude was authenticated as, the set is bounded
+// by the number of cache paths (two), and the worst case of being generous is
+// one extra probe under the existing per-account bounds. Ordered newest
+// observation first so the primary field stays the best single guess for a
+// reader that only understands it.
+//
+// Empty when no cache exists on any path — a device with no reading at all has
 // no stale row to rescue, and its next gather probes on the zero observation
 // regardless, so there is nothing for a persisted debt to buy.
-func claudeUsagePendingRunFingerprint() (string, bool) {
-	fingerprint, newest, found := "", int64(0), false
+func claudeUsagePendingRunAccounts() []string {
+	type seen struct {
+		fingerprint string
+		observed    int64
+	}
+	found := make([]seen, 0, 2)
 	for _, path := range claudeRateLimitCachePaths() {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok {
 			continue
 		}
 		observed := snap.LastProbeObservedAtMs
-		if seen := latestClaudeObservation(snap.Buckets); !seen.IsZero() && seen.UnixMilli() > observed {
-			observed = seen.UnixMilli()
+		if latest := latestClaudeObservation(snap.Buckets); !latest.IsZero() && latest.UnixMilli() > observed {
+			observed = latest.UnixMilli()
 		}
-		if !found || observed > newest {
-			fingerprint, newest, found = snap.AccountFingerprint, observed, true
+		at := -1
+		for i, prev := range found {
+			if prev.fingerprint == snap.AccountFingerprint {
+				at = i
+				break
+			}
+		}
+		switch {
+		case at < 0:
+			found = append(found, seen{fingerprint: snap.AccountFingerprint, observed: observed})
+		case observed > found[at].observed:
+			found[at].observed = observed
 		}
 	}
-	return fingerprint, found
+	// Stable by construction: the path order is fixed (local, then pinned), so a
+	// tie keeps the local account first exactly as it did before.
+	sort.SliceStable(found, func(i, j int) bool { return found[i].observed > found[j].observed })
+	accounts := make([]string, 0, len(found))
+	for _, f := range found {
+		accounts = append(accounts, f.fingerprint)
+	}
+	return accounts
 }
 
 // persistClaudeUsagePendingRun writes the record, reporting whether it landed.
 // Callers hold claudeUsagePendingRunState.mu.
-func persistClaudeUsagePendingRun(baseline time.Time, fingerprint string) bool {
+func persistClaudeUsagePendingRun(baseline time.Time, accounts []string) bool {
 	path := claudeUsagePendingRunPath()
 	now := time.Now()
-	out, err := json.Marshal(claudeUsagePendingRun{
-		SchemaVersion:      claudeUsagePendingRunSchema,
-		AccountFingerprint: fingerprint,
-		OwedObservedAtMs:   baseline.UnixMilli(),
-		RecordedAtMs:       now.UnixMilli(),
-	})
+	rec := claudeUsagePendingRun{
+		SchemaVersion:    claudeUsagePendingRunSchema,
+		OwedObservedAtMs: baseline.UnixMilli(),
+		RecordedAtMs:     now.UnixMilli(),
+	}
+	if len(accounts) > 0 {
+		// The newest cache's account stays in the single-valued field, so a
+		// reader that predates the set still scopes the record the way it always
+		// did; the rest ride along in `accountFingerprints`.
+		rec.AccountFingerprint = accounts[0]
+	}
+	if len(accounts) > 1 {
+		rec.AccountFingerprints = accounts[1:]
+	}
+	out, err := json.Marshal(rec)
 	if err != nil {
 		return false
 	}
@@ -216,12 +270,28 @@ func persistClaudeUsagePendingRun(baseline time.Time, fingerprint string) bool {
 // The watermark is kept in memory as well as on disk: a persist that was already
 // resolving its account fingerprint when the settlement landed must not re-create
 // the file behind it.
+//
+// The removal is CONDITIONAL on what is actually on disk. A settlement reads the
+// debt under the gate lock and clears the file afterwards, so a smoke that
+// records and persists a NEWER baseline in that gap would otherwise have its
+// record deleted by a settlement covering only the older one — and then the
+// agent replacement the smoke triggers takes the in-memory debt with it, which
+// is precisely the restart window this file exists to close. A record newer than
+// `settled` is therefore left standing; its own settlement clears it.
 func clearClaudeUsagePendingRun(settled time.Time) {
 	st := &claudeUsagePendingRunState
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if settled.After(st.settled) {
 		st.settled = settled
+	}
+	// Read the record rather than st.persisted: the writer may be another
+	// process (or this one, before a restart), and only the file can say which
+	// baseline the deletion would actually be throwing away. An unreadable or
+	// corrupt record carries no baseline to protect, so it is removed.
+	if rec, ok := readClaudeUsagePendingRunRecord(); ok &&
+		time.UnixMilli(rec.OwedObservedAtMs).After(settled) {
+		return
 	}
 	st.persisted = time.Time{}
 	if err := os.Remove(claudeUsagePendingRunPath()); err != nil && !os.IsNotExist(err) {
@@ -230,6 +300,28 @@ func clearClaudeUsagePendingRun(settled time.Time) {
 		// process start — the same bound every other path here obeys.
 		return
 	}
+}
+
+// readClaudeUsagePendingRunRecord returns the raw on-disk record, without any of
+// the age/account judgement claudeUsagePendingRunLoad applies. (false) when the
+// file is absent, unreadable, corrupt, of an unknown schema, or carries no
+// usable baseline.
+func readClaudeUsagePendingRunRecord() (claudeUsagePendingRun, bool) {
+	raw, err := os.ReadFile(claudeUsagePendingRunPath())
+	if err != nil {
+		return claudeUsagePendingRun{}, false
+	}
+	var rec claudeUsagePendingRun
+	if json.Unmarshal(raw, &rec) != nil {
+		return claudeUsagePendingRun{}, false
+	}
+	if rec.SchemaVersion != claudeUsagePendingRunSchema {
+		return claudeUsagePendingRun{}, false
+	}
+	if rec.OwedObservedAtMs <= 0 || rec.RecordedAtMs <= 0 {
+		return claudeUsagePendingRun{}, false
+	}
+	return rec, true
 }
 
 // loadClaudeUsagePendingRun returns the persisted debt when it is still payable
@@ -262,24 +354,14 @@ func loadClaudeUsagePendingRun(fingerprint string, now time.Time) (time.Time, bo
 // record that has aged out is settled regardless of whose it is and cannot keep
 // the latch open forever.
 func claudeUsagePendingRunLoad(fingerprint string, now time.Time) (baseline time.Time, ok, settled bool) {
-	raw, err := os.ReadFile(claudeUsagePendingRunPath())
-	if err != nil {
-		return time.Time{}, false, true
-	}
-	var rec claudeUsagePendingRun
-	if json.Unmarshal(raw, &rec) != nil {
-		return time.Time{}, false, true
-	}
-	if rec.SchemaVersion != claudeUsagePendingRunSchema {
-		return time.Time{}, false, true
-	}
-	if rec.OwedObservedAtMs <= 0 || rec.RecordedAtMs <= 0 {
+	rec, readable := readClaudeUsagePendingRunRecord()
+	if !readable {
 		return time.Time{}, false, true
 	}
 	if now.Sub(time.UnixMilli(rec.RecordedAtMs)) > claudeUsagePendingRunMaxAge {
 		return time.Time{}, false, true
 	}
-	if rec.AccountFingerprint != fingerprint {
+	if !rec.scopedTo(fingerprint) {
 		return time.Time{}, false, false // may be ours; the identity we were given cannot say
 	}
 	return time.UnixMilli(rec.OwedObservedAtMs), true, true
@@ -310,18 +392,21 @@ func claudeUsageHydratePendingRun(fingerprint string, now time.Time) {
 	baseline, ok, settled := claudeUsagePendingRunLoad(fingerprint, now)
 
 	st.mu.Lock()
+	defer st.mu.Unlock()
 	if settled {
 		st.hydrated = true
 	}
-	// Never below the watermark this process has already PAID. Without the
-	// latch being taken up front, two gathers can read the same record
-	// concurrently, and one of them may land after the other's probe settled it
-	// — recordOwed has no settled watermark of its own, so an unguarded repeat
-	// would resurrect a discharged debt and buy an OAuth request for nothing.
-	fresh := ok && baseline.After(st.settled)
-	st.mu.Unlock()
-
-	if fresh {
+	// Never below the watermark this process has already PAID, and the test and
+	// the recordOwed are done WITHOUT releasing the lock in between. Two gathers
+	// can start concurrently after a restart and read the same record; if one of
+	// them dropped the lock here, the other's probe could settle that baseline in
+	// the gap and the late recordOwed would resurrect a discharged debt —
+	// recordOwed has no watermark of its own — buying an OAuth request for
+	// nothing. clearClaudeUsagePendingRun takes this same mutex to advance
+	// st.settled, so holding it is what makes the pair atomic. (Lock order is
+	// st.mu → gate.mu; every settlement releases the gate before it takes st.mu,
+	// so the reverse edge does not exist.)
+	if ok && baseline.After(st.settled) {
 		// recordOwed keeps the newest baseline, so a turn this process already
 		// finished outranks the inherited one rather than being rolled back.
 		claudeUsageProbe.recordOwed(baseline)

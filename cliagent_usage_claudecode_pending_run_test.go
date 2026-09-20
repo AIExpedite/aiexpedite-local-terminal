@@ -21,7 +21,7 @@ import (
 
 // pendingRunEnv isolates BOTH the record and the rate-limit cache the record's
 // account scope is read from, and seeds the cache so a persist has an account
-// to key on (see claudeUsagePendingRunFingerprint).
+// to key on (see claudeUsagePendingRunAccounts).
 func pendingRunEnv(t *testing.T, fingerprint string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -157,6 +157,15 @@ func TestClaudeUsagePendingRun_FileHoldsOnlyNumbersAndTheAccountHash(t *testing.
 		if key == "accountFingerprint" {
 			continue
 		}
+		if key == "accountFingerprints" {
+			// The alternate accounts are the same hashes, in a list.
+			for _, alt := range value.([]any) {
+				if _, isString := alt.(string); !isString {
+					t.Errorf("accountFingerprints holds a non-hash %v", alt)
+				}
+			}
+			continue
+		}
 		if _, numeric := value.(float64); !numeric {
 			t.Errorf("field %q = %v is not numeric; only the account hash may be a string", key, value)
 		}
@@ -200,41 +209,6 @@ func TestClaudeUsagePendingRun_SettlementIsNotResurrected(t *testing.T) {
 	claudeUsageRecordPendingRun(baseline.Add(time.Minute))
 	if _, err := os.Stat(record); err != nil {
 		t.Fatalf("a newer run could not record its own debt: %v", err)
-	}
-}
-
-// One write per settled turn, not one per stream line: a burst inside the
-// coalesce window leaves the first record standing rather than rewriting it.
-func TestClaudeUsagePendingRun_CoalescesABurst(t *testing.T) {
-	record := pendingRunEnv(t, "")
-	first := time.Now()
-
-	claudeUsageRecordPendingRun(first)
-	info, err := os.Stat(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	written := info.ModTime()
-
-	for i := 1; i <= 5; i++ {
-		claudeUsageRecordPendingRun(first.Add(time.Duration(i) * 50 * time.Millisecond))
-	}
-	got, ok := loadClaudeUsagePendingRun("", time.Now())
-	if !ok {
-		t.Fatal("the coalesced record disappeared")
-	}
-	if !got.Equal(first.Truncate(time.Millisecond)) {
-		t.Errorf("baseline = %v, want the first run's %v — the burst rewrote the record",
-			got, first.Truncate(time.Millisecond))
-	}
-	if after, err := os.Stat(record); err == nil && after.ModTime().After(written.Add(time.Second)) {
-		t.Error("the record was rewritten inside the coalesce window")
-	}
-
-	// Past the window, a newer baseline does land.
-	claudeUsageRecordPendingRun(first.Add(2 * claudeUsagePendingRunCoalesce))
-	if got, _ := loadClaudeUsagePendingRun("", time.Now()); got.Equal(first.Truncate(time.Millisecond)) {
-		t.Error("a baseline past the coalesce window was not persisted")
 	}
 }
 
@@ -306,7 +280,7 @@ func TestClaudeUsagePendingRun_UnwritablePathIsSilent(t *testing.T) {
 		t.Fatal("a record appeared on an unwritable path")
 	}
 	// And the next call is not wedged by the failed one.
-	claudeUsageRecordPendingRun(now.Add(2 * claudeUsagePendingRunCoalesce))
+	claudeUsageRecordPendingRun(now.Add(time.Second))
 }
 
 // A device that has never observed anything has no stale row to rescue, so the
@@ -448,10 +422,13 @@ func TestClaudeUsagePendingRun_ScopedFromTheCachePinnedByTheInstalledHook(t *tes
 	}
 }
 
-// With both caches present, the account comes from the one carrying the NEWEST
-// observation — that is the file whose freshness decides whether the next
-// process probes, so it is the identity a hydrated debt has to match.
-func TestClaudeUsagePendingRun_ScopedToTheFreshestCacheAcrossPaths(t *testing.T) {
+// With both caches present, EVERY account found is payable — including an older
+// cache's. Picking one by timestamp guesses which account the next gather will
+// display, and after an account switch the newest cache can belong to the
+// account the card is no longer showing; hydration would then reject the record
+// and the fresh-looking rows would suppress the probe. An unrelated account is
+// still refused.
+func TestClaudeUsagePendingRun_ScopedToEveryAccountAcrossPaths(t *testing.T) {
 	dir := t.TempDir()
 	record := filepath.Join(dir, "pending_run.json")
 	ownCache := filepath.Join(dir, "own", "rl.json")
@@ -472,26 +449,104 @@ func TestClaudeUsagePendingRun_ScopedToTheFreshestCacheAcrossPaths(t *testing.T)
 	})
 
 	now := time.Now()
-	// Our own cache stopped being written when the other channel took the hook.
+	// The account the card still displays (older cache, but inside the TTL)...
 	mergeClaudeRateLimitCacheFromSource(ownCache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {
 			UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
-			ObservedAtMs: now.Add(-72 * time.Hour).UnixMilli(), usageKnown: true,
+			ObservedAtMs: now.Add(-10 * time.Minute).UnixMilli(), usageKnown: true,
 		},
-	}, now.Add(-72*time.Hour), "acct-stale", claudeRateLimitSourceStream)
+	}, now.Add(-10*time.Minute), "acct-displayed", claudeRateLimitSourceStream)
+	// ...and the other channel's, which happens to carry a newer observation.
 	mergeClaudeRateLimitCacheFromSource(pinnedCache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {
 			UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
 			ObservedAtMs: now.Add(-5 * time.Minute).UnixMilli(), usageKnown: true,
 		},
-	}, now.Add(-5*time.Minute), "acct-fresh", claudeRateLimitSourceStream)
+	}, now.Add(-5*time.Minute), "acct-other", claudeRateLimitSourceStream)
 
-	claudeUsageRecordPendingRun(now.Truncate(time.Millisecond))
+	baseline := now.Truncate(time.Millisecond)
+	claudeUsageRecordPendingRun(baseline)
 
-	if _, ok := loadClaudeUsagePendingRun("acct-fresh", now); !ok {
-		t.Error("the record should be scoped to the freshest cache's account")
+	for _, account := range []string{"acct-other", "acct-displayed"} {
+		got, ok := loadClaudeUsagePendingRun(account, now)
+		if !ok {
+			t.Errorf("the debt is not payable under %q — a gather for it would leave the card stale", account)
+			continue
+		}
+		if !got.Equal(baseline) {
+			t.Errorf("baseline under %q = %s, want %s", account, got, baseline)
+		}
 	}
-	if _, ok := loadClaudeUsagePendingRun("acct-stale", now); ok {
-		t.Error("the record is scoped to the cache nothing writes to any more")
+	if _, ok := loadClaudeUsagePendingRun("acct-unrelated", now); ok {
+		t.Error("an account with no cache on this device may not pay the debt")
+	}
+}
+
+// Coalescing is by BASELINE: the trailing goroutine's repeat of what the smoke
+// already wrote costs no second write, but ANY advance lands immediately —
+// including one inside the same second. A time window here would leave the older
+// baseline durable, and an observation taken between the two turns would then
+// settle a hydrated debt that predates the second one.
+func TestClaudeUsagePendingRun_CoalescesRepeatsButNeverHoldsBackAnAdvance(t *testing.T) {
+	record := pendingRunEnv(t, "")
+	first := time.Now().Truncate(time.Millisecond)
+
+	claudeUsageRecordPendingRun(first)
+	info, err := os.Stat(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstWrite := info.ModTime()
+
+	// The repeat (and anything older) writes nothing at all.
+	claudeUsageRecordPendingRun(first)
+	claudeUsageRecordPendingRun(first.Add(-time.Minute))
+	if after, err := os.Stat(record); err != nil {
+		t.Fatal(err)
+	} else if !after.ModTime().Equal(firstWrite) {
+		t.Error("a repeated baseline rewrote the record")
+	}
+
+	// A second turn 50ms later is durable straight away.
+	second := first.Add(50 * time.Millisecond)
+	claudeUsageRecordPendingRun(second)
+	got, ok := loadClaudeUsagePendingRun("", time.Now())
+	if !ok {
+		t.Fatal("the record disappeared")
+	}
+	if !got.Equal(second) {
+		t.Errorf("durable baseline = %v, want the newest turn's %v — a coalesce window held it back", got, second)
+	}
+}
+
+// A settlement clears only what it actually covers. If a newer run persists its
+// own debt in the gap between a settlement reading the gate and clearing the
+// file, deleting that record would drop a real debt just as the smoke hands the
+// process over to an update.
+func TestClaudeUsagePendingRun_AnOlderSettlementKeepsANewerRecord(t *testing.T) {
+	record := pendingRunEnv(t, "")
+	now := time.Now()
+	older := now.Add(-time.Minute).Truncate(time.Millisecond)
+	newer := now.Truncate(time.Millisecond)
+
+	writePendingRunRecord(t, record, claudeUsagePendingRun{
+		SchemaVersion: claudeUsagePendingRunSchema, AccountFingerprint: "",
+		OwedObservedAtMs: newer.UnixMilli(), RecordedAtMs: now.UnixMilli(),
+	})
+
+	clearClaudeUsagePendingRun(older)
+
+	got, ok := loadClaudeUsagePendingRun("", now)
+	if !ok {
+		t.Fatal("a settlement for an older run deleted the newer run's debt")
+	}
+	if !got.Equal(newer) {
+		t.Errorf("surviving baseline = %v, want %v", got, newer)
+	}
+
+	// Its own settlement does clear it.
+	clearClaudeUsagePendingRun(newer)
+	if _, ok := loadClaudeUsagePendingRun("", now); ok {
+		t.Error("the covering settlement left the record behind")
 	}
 }
