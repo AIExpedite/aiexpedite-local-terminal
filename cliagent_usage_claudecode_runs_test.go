@@ -365,3 +365,80 @@ func TestTriggerClaudeUsageProbeAfterRun_LeavesADurableDebtForDirectAndTerminalR
 		t.Errorf("durable baseline %v does not match the in-memory debt %v", baseline, owed)
 	}
 }
+
+// The window NAME is vendor-authored too, and it reaches the cache as a JSON
+// object KEY — the one part of an update no per-field normalizer downstream can
+// clean up. A malformed or hostile CLI that files its reading under a path, a
+// config fragment or a token must have that key dropped, while the genuine
+// windows in the SAME envelope still land.
+func TestClaudeUsageHarvestPrintStdout_DropsWindowNamesThatAreNotWindowShaped(t *testing.T) {
+	cache := harvestEnv(t)
+	now := time.Now()
+	resets := now.Add(time.Hour).Unix()
+	bucket := func(pct int) string {
+		return fmt.Sprintf(`{"used_percentage":%d,"resets_at":%d,"status":"allowed"}`, pct, resets)
+	}
+	line := fmt.Sprintf(
+		`{"type":"result","rate_limits":{"five_hour":%s,"/Users/someone/.claude/settings.json":%s,"sk-ant-oat01-SECRET":%s,"seven_day_fable_v2":%s}}`,
+		bucket(7), bucket(1), bucket(2), bucket(3))
+
+	if !claudeUsageHarvestPrintStdout([]byte(line), now) {
+		t.Fatal("precondition: the envelope was not harvested")
+	}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"settings.json", "/Users/someone", "sk-ant-oat01", "SECRET"} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("vendor-authored window name %q reached the cache: %s", banned, raw)
+		}
+	}
+	buckets := loadMergedClaudeRateLimitBuckets("")
+	if _, ok := buckets[claudeWindowFiveHour]; !ok {
+		t.Error("the canonical window in the same envelope was dropped")
+	}
+	// The read side (claudeFableWindowIDs) deliberately tolerates a suffixed
+	// rename, so the filter must not be a closed allowlist of the constants.
+	if _, ok := buckets["seven_day_fable_v2"]; !ok {
+		t.Error("a window-shaped variant of a known window was dropped")
+	}
+}
+
+// An envelope whose ONLY windows are unshaped persists nothing and reports no
+// harvest — so noteClaudeTurnSpent still records the debt a real probe pays.
+func TestClaudeUsageHarvestPrintStdout_ReportsNoHarvestWhenEveryWindowIsDropped(t *testing.T) {
+	cache := harvestEnv(t)
+	now := time.Now()
+	line := fmt.Sprintf(
+		`{"type":"result","rate_limits":{"/etc/passwd":{"used_percentage":9,"resets_at":%d}}}`,
+		now.Add(time.Hour).Unix())
+
+	if claudeUsageHarvestPrintStdout([]byte(line), now) {
+		t.Fatal("an envelope with no window-shaped key must report no harvest")
+	}
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Errorf("nothing should have been written to the cache (stat err = %v)", err)
+	}
+}
+
+func TestClaudeUsageHarvestWindow(t *testing.T) {
+	for _, keep := range []string{
+		claudeWindowFiveHour, claudeWindowSevenDay, claudeWindowSevenDayOpus,
+		claudeWindowSevenDaySonnet, claudeWindowSevenDayFable,
+		claudeWindowSevenDayOverageIncluded, "seven_day_fable_v2", "fable_weekly",
+	} {
+		if !claudeUsageHarvestWindow(keep) {
+			t.Errorf("claudeUsageHarvestWindow(%q) = false, want true", keep)
+		}
+	}
+	for _, drop := range []string{
+		"", "usage", "/Users/someone/.claude.json", "C:\\Users\\x\\settings.json",
+		"sk-ant-oat01-AAAA", "five hour", "FIVE_HOUR", `{"five_hour":1}`,
+		"five_hour_" + strings.Repeat("x", claudeUsageHarvestMaxWindowBytes),
+	} {
+		if claudeUsageHarvestWindow(drop) {
+			t.Errorf("claudeUsageHarvestWindow(%q) = true, want false", drop)
+		}
+	}
+}

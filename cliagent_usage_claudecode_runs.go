@@ -48,6 +48,11 @@ const (
 	// to the JSON decoder — telemetry envelopes are well under a kilobyte, and
 	// a megabyte-long line is a spew, not a reading.
 	claudeUsageHarvestMaxLineBytes = 64 << 10 // 64 KiB
+	// claudeUsageHarvestMaxWindowBytes caps a persisted window identifier. The
+	// longest one Claude Code emits is `seven_day_overage_included` (26); 40
+	// leaves room for a suffixed variant and is far short of any path, config
+	// fragment or token a leak would carry.
+	claudeUsageHarvestMaxWindowBytes = 40
 )
 
 // noteClaudeTurnSpent is the path-agnostic "a Claude inference turn just
@@ -158,13 +163,60 @@ func claudeUsageHarvestPrintStdout(stdout []byte, now time.Time) bool {
 		//     drive a SESSION's auto-defer. A completed run has nothing to defer,
 		//     and the smoke reports a usage limit through its own
 		//     provider_error verdict.
+		//   - The window NAME is vendor-authored too, and it lands on disk as a
+		//     JSON object KEY, which no normalizer downstream ever touches. A
+		//     malformed or hostile CLI that answers with
+		//     `{"rate_limits":{"/Users/x/.claude.json":{...}}}` would otherwise
+		//     write that string into the cache verbatim. claudeUsageHarvestWindow
+		//     keeps the key set to window-shaped identifiers.
 		for window, bucket := range updates {
+			if !claudeUsageHarvestWindow(window) {
+				delete(updates, window)
+				continue
+			}
 			bucket.Status = claudeUsageProbeStatus(bucket.Status)
 			updates[window] = bucket
+		}
+		if len(updates) == 0 {
+			continue
 		}
 		mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
 			currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
 		captured = true
 	}
 	return captured
+}
+
+// claudeUsageHarvestWindow reports whether a harvested `rate_limits` key is
+// window-shaped enough to persist under the smoke's "no vendor-authored bytes"
+// contract. The key is the one field of an update that reaches disk UNCHANGED —
+// it is the cache's JSON object key, so no per-field normalizer downstream can
+// clean it up.
+//
+// Not a closed allowlist of the six claudeWindow* constants, because the read
+// side deliberately is not one either: claudeFableWindowIDs carries a tolerant
+// tail so an upstream rename or a suffixed variant still draws its row, and
+// hard-coding the canonical set here would silently drop exactly the rows a
+// probe-less device depends on this harvest for.
+//
+// Instead: the shape a window identifier has always had, plus a stem from the
+// closed set of things Claude actually meters. That admits `seven_day_opus`,
+// a renamed `seven_day_fable_v2` and a `fable_weekly`, and refuses everything a
+// leak would look like — a path (`/`, `.`, uppercase), a config fragment
+// (braces, quotes, whitespace), an OAuth token (`-`, uppercase, far over the
+// length cap) and a key-shaped string generally.
+func claudeUsageHarvestWindow(window string) bool {
+	if len(window) == 0 || len(window) > claudeUsageHarvestMaxWindowBytes {
+		return false
+	}
+	for i := 0; i < len(window); i++ {
+		c := window[i]
+		if c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return strings.Contains(window, claudeWindowFiveHour) ||
+		strings.Contains(window, claudeWindowSevenDay) ||
+		strings.Contains(window, "fable")
 }
