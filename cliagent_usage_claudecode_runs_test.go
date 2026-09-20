@@ -164,6 +164,65 @@ func TestClaudeUsageHarvestPrintStdout_IsBounded(t *testing.T) {
 	})
 }
 
+// Retention. The harvest is the ONLY thing that outlives the smoke's stdout
+// buffer, and cliagent_smoke_claudecode.go's contract is that nothing
+// vendor-authored survives it. bucketFromInfo copies `status` out of the
+// envelope verbatim, so the harvest normalizes it to the closed set before the
+// merge — otherwise a CLI could put a path, a config fragment or any other text
+// on this device's disk simply by naming it `status`.
+func TestClaudeUsageHarvestPrintStdout_NeverPersistsVendorAuthoredText(t *testing.T) {
+	cache := harvestEnv(t)
+	now := time.Now()
+	hostile := `/Users/someone/.claude/settings.json ANTHROPIC_API_KEY=sk-ant-secret`
+	line := fmt.Sprintf(
+		`{"type":"result","rate_limits":{"five_hour":{"used_percentage":5,"resets_at":%d,"status":%q}}}`,
+		now.Add(time.Hour).Unix(), hostile)
+
+	if !claudeUsageHarvestPrintStdout([]byte(line), now) {
+		t.Fatal("precondition: the envelope was not harvested")
+	}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"settings.json", "ANTHROPIC_API_KEY", "sk-ant-secret", "/Users/someone"} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("vendor-authored text %q reached the cache: %s", banned, raw)
+		}
+	}
+	bucket, ok := harvestedFiveHour(t)
+	if !ok {
+		t.Fatal("the numeric reading was dropped along with the text")
+	}
+	switch bucket.Status {
+	case "", "allowed", claudeRateLimitStatusRejected:
+	default:
+		t.Errorf("status = %q, want one of the closed set", bucket.Status)
+	}
+	if bucket.UsedPercentage != 5 {
+		t.Errorf("usedPercentage = %v, want the numeric reading 5", bucket.UsedPercentage)
+	}
+}
+
+// A genuine `rejected` status must still survive normalization — the closed set
+// includes it, and the rows that read it drive the "Limit reached" chip.
+func TestClaudeUsageHarvestPrintStdout_KeepsARejectedStatus(t *testing.T) {
+	harvestEnv(t)
+	now := time.Now()
+	if !claudeUsageHarvestPrintStdout([]byte(fmt.Sprintf(
+		`{"type":"result","rate_limits":{"five_hour":{"used_percentage":100,"resets_at":%d,"status":"rejected"}}}`,
+		now.Add(time.Hour).Unix())), now) {
+		t.Fatal("precondition: the envelope was not harvested")
+	}
+	bucket, ok := harvestedFiveHour(t)
+	if !ok {
+		t.Fatal("five_hour was not persisted")
+	}
+	if bucket.Status != claudeRateLimitStatusRejected {
+		t.Errorf("status = %q, want %q", bucket.Status, claudeRateLimitStatusRejected)
+	}
+}
+
 // noteClaudeTurnSpent is the single definition of "a turn completed" shared by
 // the native, managed and smoke paths. An UNARMED process (the statusline-hook
 // subcommand, a one-shot verb, an opted-out user) must record nothing at all.
@@ -255,5 +314,54 @@ func TestClaudeUsageHarvest_CoversADebtRecordedAtTheSameInstant(t *testing.T) {
 	observed := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(""))
 	if !claudeUsageObservationCovers(observed, now) {
 		t.Fatalf("observation %v does not cover a debt recorded at %v", observed, now)
+	}
+}
+
+// The DIRECT (claude_native.go) and TERMINAL (session.go) run paths reach the
+// utilization pipeline through triggerClaudeUsageProbeAfterRun, so the durable
+// half of the obligation has to be theirs too — not just the smoke's. Without
+// it, a run finishing shortly before the CLI-maintenance update loses its
+// refresh exactly the way the smoke's did.
+func TestTriggerClaudeUsageProbeAfterRun_LeavesADurableDebtForDirectAndTerminalRuns(t *testing.T) {
+	cache := harvestEnv(t)
+	record := t.TempDir() + "/pending_run.json"
+	t.Setenv(claudeUsagePendingRunEnv, record)
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	// A pre-run reading, so the cache exists and the debt has rows to correct.
+	stale := time.Now().Add(-time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 4, ResetsAtMs: time.Now().Add(time.Hour).UnixMilli(),
+			ObservedAtMs: stale.UnixMilli(), usageKnown: true,
+		},
+	}, stale, "", claudeRateLimitSourceStream)
+
+	SetClaudeUsageProbeDisabled(false)
+	// Offline: the trailing probe is refused, which is the state a run that is
+	// about to be interrupted by an agent update is in.
+	SetOffline(true)
+	t.Cleanup(func() { SetOffline(false) })
+
+	triggerClaudeUsageProbeAfterRun()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(record); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	baseline, ok := loadClaudeUsagePendingRun("", time.Now())
+	if !ok {
+		t.Fatalf("a direct/terminal run left no durable debt at %s", record)
+	}
+	// Compared at MILLISECOND resolution, which is the record's (and the cache's).
+	// A hydrated baseline is therefore at most a sub-millisecond fraction EARLIER
+	// than the in-memory one — never later, so it can only be easier to settle,
+	// which is the safe direction.
+	if owed := claudeUsageProbe.owedObservation(); baseline.UnixMilli() != owed.UnixMilli() {
+		t.Errorf("durable baseline %v does not match the in-memory debt %v", baseline, owed)
 	}
 }

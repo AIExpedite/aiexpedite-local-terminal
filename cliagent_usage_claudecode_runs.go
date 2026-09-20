@@ -101,11 +101,11 @@ func claudeUsageRunCoveredByOwnTelemetry(completedAt time.Time) bool {
 // telemetry and merges whatever it finds into the shared cache, reporting whether
 // anything was persisted.
 //
-// Free in the sense that matters: no OAuth request, no credential read beyond the
-// one captureClaudeRateLimitLine already performs for the cache's account scope.
-// Line-tolerant for the same reason parseClaudePrintResultEnvelope is — a build
-// that prefixes a banner, or emits NDJSON instead of one object, still yields its
-// reading.
+// Free in the sense that matters: no OAuth request, and no credential read beyond
+// the one the cache's account scope needs — the same one every other writer of
+// this cache performs. Line-tolerant for the same reason
+// parseClaudePrintResultEnvelope is — a build that prefixes a banner, or emits
+// NDJSON instead of one object, still yields its reading.
 //
 // Best-effort and silent throughout: this runs after a health check has already
 // reached its verdict and must never change it.
@@ -135,19 +135,35 @@ func claudeUsageHarvestPrintStdout(stdout []byte, now time.Time) bool {
 		if !strings.Contains(trimmed, "rate_limit") && !strings.Contains(trimmed, "rateLimit") {
 			continue
 		}
-		// Decode once here purely to answer "did this line hold any window?" —
-		// captureClaudeRateLimitLine reports only the REJECTED bucket, and an
-		// allowed reading (the normal case) is indistinguishable from "nothing
-		// found" in its return value. The merge itself stays in that one function
-		// so every writer of this cache goes through the same path.
 		var raw map[string]interface{}
 		if json.Unmarshal([]byte(trimmed), &raw) != nil {
 			continue
 		}
-		if len(extractClaudeRateLimitBuckets(raw, nowMs)) == 0 {
+		updates := extractClaudeRateLimitBuckets(raw, nowMs)
+		if len(updates) == 0 {
 			continue
 		}
-		captureClaudeRateLimitLine(trimmed, now)
+		// Merge DIRECTLY rather than through captureClaudeRateLimitLine, for two
+		// reasons that both matter on this path:
+		//
+		//   - Retention. bucketFromInfo copies `status` out of the envelope
+		//     VERBATIM, so a vendor string lands on disk. Every other writer of
+		//     this cache is a live session, where that is long-standing behaviour;
+		//     the smoke is the one caller whose contract is "keep no
+		//     vendor-authored bytes at all" (see cliagent_smoke_claudecode.go).
+		//     claudeUsageProbeStatus is the existing normalizer that collapses the
+		//     field to the closed {"", "allowed", "rejected"} set, which is all
+		//     any reader of this cache has ever branched on.
+		//   - The rejected bucket captureClaudeRateLimitLine returns exists to
+		//     drive a SESSION's auto-defer. A completed run has nothing to defer,
+		//     and the smoke reports a usage limit through its own
+		//     provider_error verdict.
+		for window, bucket := range updates {
+			bucket.Status = claudeUsageProbeStatus(bucket.Status)
+			updates[window] = bucket
+		}
+		mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
+			currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
 		captured = true
 	}
 	return captured

@@ -335,6 +335,54 @@ func TestCLISmoke_NotLoggedInSpendsNothingAndWritesNothing(t *testing.T) {
 	}
 }
 
+// The diagnostic line. When the original report had to be reconstructed from
+// three timestamps, nothing on the device said "a run finished and the rows
+// never caught up" — this is that signal, and it must carry ages and a count
+// only: no paths, no account, no token, no reading values.
+func TestClaudeUsageStaleAfterRun_SilentWhenHealthyAndNumericWhenNot(t *testing.T) {
+	cache := harvestEnv(t)
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)
+	reset := now.Add(time.Hour).UnixMilli()
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour:      {UsedPercentage: 21, ResetsAtMs: reset, ObservedAtMs: stale.UnixMilli(), usageKnown: true},
+		claudeWindowSevenDay:      {UsedPercentage: 33, ResetsAtMs: reset, ObservedAtMs: stale.UnixMilli(), usageKnown: true},
+		claudeWindowSevenDayFable: {UsedPercentage: 8, ResetsAtMs: reset, ObservedAtMs: stale.UnixMilli(), usageKnown: true},
+	}, stale, "", claudeRateLimitSourceStream)
+	if _, err := os.Stat(cache); err != nil {
+		t.Fatalf("precondition: the seeded cache is missing: %v", err)
+	}
+	view := loadMergedClaudeRateLimitView("")
+
+	// No debt: nothing to say, however old the rows are.
+	if out := captureStdout(t, func() { claudeUsageStaleAfterRun(view, now) }); out != "" {
+		t.Errorf("a gather with no outstanding debt logged %q", out)
+	}
+
+	// A debt the rows already cover: still nothing to say.
+	claudeUsageProbe.recordOwed(stale.Add(-time.Minute))
+	if out := captureStdout(t, func() { claudeUsageStaleAfterRun(view, now) }); out != "" {
+		t.Errorf("a gather whose rows already cover the run logged %q", out)
+	}
+
+	// The reported state: a run completed after every displayed reading. Asserted
+	// as the EXACT rendered line rather than by substring, so the test fails if a
+	// future edit adds a field — which is the only way anything identifying could
+	// get in. (Substring bans are useless here: a two-digit reading collides with
+	// the ANSI colour code and with the age digits.)
+	claudeUsageProbe.recordOwed(now.Add(-time.Minute))
+	out := captureStdout(t, func() { claudeUsageStaleAfterRun(view, now) })
+	want := fmt.Sprintf(
+		"%s[claude-usage] rows still predate the last completed run (owedAgeMs=%d stalestRowAgeMs=%d rows=3)%s\n",
+		colorYellow, int64(60000), int64(2*time.Hour/time.Millisecond), colorReset)
+	if out != want {
+		t.Fatalf("diagnostic line =\n%q\nwant\n%q", out, want)
+	}
+}
+
 /* ---------------------------------- helpers -------------------------------- */
 
 // freshClaudeUsageProcess models the agent restarting mid-maintenance: every
