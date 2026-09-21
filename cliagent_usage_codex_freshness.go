@@ -176,13 +176,16 @@ type codexUsageRefreshGate struct {
 	// attempt into it would push a brand-new debt towards the stale warning
 	// on reconciles that never targeted its floor.
 	pendingAttempts map[string]codexRetainedAttempts
-	// armed maps a run start (floor, ms) to the account fingerprint that was
-	// live when it was armed, so the run's settlement is attributed to the
-	// account that actually made it even if the Codex credentials change while
-	// it runs. Without it a swap mid-run records account A's debt against B,
-	// which can later show B a stale-run warning for a run B never made while
-	// A's promised refresh is lost for good.
-	armed map[int64]string
+	// armed maps a run start (floor, ms) to the account fingerprints that were
+	// live when runs were armed at it, so each run's settlement is attributed
+	// to the account that actually made it even if the Codex credentials
+	// change while it runs. Without it a swap mid-run records account A's debt
+	// against B, which can later show B a stale-run warning for a run B never
+	// made while A's promised refresh is lost for good. The value is a queue
+	// because every caller truncates its floor to a millisecond: overlapping
+	// turns armed inside the same millisecond share a key and must each keep
+	// their own binding, or the second settlement reads as unbound.
+	armed map[int64][]string
 	// disarmed holds run starts withdrawn (codexUsageRunDisarmed) that may not
 	// have reached disk yet: an arm is written by its own retried goroutine,
 	// so the withdrawal can land first, and the late arm must then be dropped
@@ -240,7 +243,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		workers:         map[string]bool{},
 		pending:         map[string]codexPendingRunDebt{},
 		pendingAttempts: map[string]codexRetainedAttempts{},
-		armed:           map[int64]string{},
+		armed:           map[int64][]string{},
 		disarmed:        map[string]map[int64]struct{}{},
 		cancel:          make(chan struct{}),
 	}
@@ -438,6 +441,8 @@ func (g *codexUsageRefreshGate) takeRetainedAttempts(fp string) (codexDebtID, in
 // withdrawal) and forgets it. A miss means the run predates this process — a
 // floor replayed from disk at startup — and the caller falls back to the
 // account that is live now, which is the only one it can reconcile anyway.
+// Runs sharing a floor queue their bindings and consume them one settlement at
+// a time, so overlapping turns armed in the same millisecond stay bound.
 func (g *codexUsageRefreshGate) rememberArmedAccount(floorMs int64, fp string) {
 	if floorMs <= 0 {
 		return
@@ -445,28 +450,51 @@ func (g *codexUsageRefreshGate) rememberArmedAccount(floorMs int64, fp string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.armed == nil {
-		g.armed = map[int64]string{}
+		g.armed = map[int64][]string{}
 	}
-	g.armed[floorMs] = fp
+	g.armed[floorMs] = append(g.armed[floorMs], fp)
 	// Evict oldest-first: the oldest floor is the one whose run is least
-	// likely to still be open and owed a settlement.
-	for len(g.armed) > codexArmedAccountCap {
+	// likely to still be open and owed a settlement. The cap counts bindings,
+	// not keys, so a floor holding several overlapping runs cannot grow the
+	// map past its bound.
+	for total := g.armedCountLocked(); total > codexArmedAccountCap; total-- {
 		oldest := int64(0)
 		for ms := range g.armed {
 			if oldest == 0 || ms < oldest {
 				oldest = ms
 			}
 		}
-		delete(g.armed, oldest)
+		if rest := g.armed[oldest][1:]; len(rest) > 0 {
+			g.armed[oldest] = rest
+		} else {
+			delete(g.armed, oldest)
+		}
 	}
+}
+
+// armedCountLocked totals the queued bindings; callers hold g.mu.
+func (g *codexUsageRefreshGate) armedCountLocked() int {
+	total := 0
+	for _, fps := range g.armed {
+		total += len(fps)
+	}
+	return total
 }
 
 func (g *codexUsageRefreshGate) takeArmedAccount(floorMs int64) (string, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	fp, ok := g.armed[floorMs]
-	delete(g.armed, floorMs)
-	return fp, ok
+	fps := g.armed[floorMs]
+	if len(fps) == 0 {
+		return "", false
+	}
+	fp := fps[0]
+	if rest := fps[1:]; len(rest) > 0 {
+		g.armed[floorMs] = rest
+	} else {
+		delete(g.armed, floorMs)
+	}
+	return fp, true
 }
 
 // markDisarmed records that the run armed at floorMs was withdrawn before its
@@ -538,7 +566,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.pendingAttempts = map[string]codexRetainedAttempts{}
-	codexUsageRefresh.armed = map[int64]string{}
+	codexUsageRefresh.armed = map[int64][]string{}
 	codexUsageRefresh.disarmed = map[string]map[int64]struct{}{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()

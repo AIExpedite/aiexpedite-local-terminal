@@ -1429,3 +1429,42 @@ func TestCodexRecordRefreshAttempt_CountsOnlyTheReconciledDebt(t *testing.T) {
 		t.Fatalf("stale notice reached on a single attempt: %q", notice)
 	}
 }
+
+// Every caller truncates its run start to a millisecond, so two overlapping
+// turns can be armed at the SAME floor. Each still needs its own account
+// binding: if the first settlement consumed a single shared entry, the second
+// would read as unbound and — after a mid-run credentials swap — book run A's
+// debt against whoever is signed in now.
+func TestCodexUsageRefreshGate_ArmedBindingsQueuePerFloor(t *testing.T) {
+	g := newCodexUsageRefreshGate()
+	floor := time.Now().UnixMilli()
+	g.rememberArmedAccount(floor, "acct-a")
+	g.rememberArmedAccount(floor, "acct-b")
+
+	first, ok := g.takeArmedAccount(floor)
+	if !ok || first != "acct-a" {
+		t.Fatalf("first settlement got %q/%v, want acct-a bound", first, ok)
+	}
+	second, ok := g.takeArmedAccount(floor)
+	if !ok || second != "acct-b" {
+		t.Fatalf("second settlement got %q/%v, want acct-b bound", second, ok)
+	}
+	if fp, ok := g.takeArmedAccount(floor); ok {
+		t.Fatalf("a third settlement got %q, want the floor forgotten", fp)
+	}
+
+	// The cap counts bindings, not keys, so several runs sharing one floor
+	// cannot grow the map past its bound; the oldest floor is evicted first.
+	for i := 0; i <= codexArmedAccountCap; i++ {
+		g.rememberArmedAccount(floor+int64(i%2), "acct-c")
+	}
+	g.mu.Lock()
+	total := g.armedCountLocked()
+	g.mu.Unlock()
+	if total > codexArmedAccountCap {
+		t.Fatalf("retained %d bindings, want at most %d", total, codexArmedAccountCap)
+	}
+	if _, ok := g.takeArmedAccount(floor + 1); !ok {
+		t.Fatal("the newest floor was evicted, want oldest-first eviction")
+	}
+}
