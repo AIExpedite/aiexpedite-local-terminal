@@ -217,6 +217,13 @@ type codexRateLimitSnapshot struct {
 	RunFloorMs          int64 `json:"runFloorMs,omitempty"`
 	RefreshOwedAtMs     int64 `json:"refreshOwedAtMs,omitempty"`
 	RefreshOwedAttempts int   `json:"refreshOwedAttempts,omitempty"`
+	// ActiveRunFloorMs parks the start of a run that began while an OLDER
+	// run's debt was still standing. RunFloorMs must keep the older floor
+	// (that is what the debt waits on), but settling that debt would
+	// otherwise erase every trace of the newer run and skip its crash
+	// recovery; the parked floor is promoted into RunFloorMs when the older
+	// debt clears.
+	ActiveRunFloorMs int64 `json:"activeRunFloorMs,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -1577,6 +1584,7 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	snap.RunFloorMs = 0
 	snap.RefreshOwedAtMs = 0
 	snap.RefreshOwedAttempts = 0
+	snap.ActiveRunFloorMs = 0
 	snap.AccountFingerprint = fingerprint
 }
 

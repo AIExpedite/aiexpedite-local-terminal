@@ -387,13 +387,28 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 	if snap.RefreshOwedAtMs <= 0 {
 		return
 	}
-	if snap.RunFloorMs <= 0 || codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.RunFloorMs {
-		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	paid := snap.RunFloorMs <= 0 || codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.RunFloorMs
+	expired := now.Sub(time.UnixMilli(snap.RefreshOwedAtMs)) > codexRefreshOwedMaxAge
+	if !paid && !expired {
 		return
 	}
-	if now.Sub(time.UnixMilli(snap.RefreshOwedAtMs)) > codexRefreshOwedMaxAge {
-		snap.RunFloorMs, snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0, 0
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	if !paid {
+		snap.RunFloorMs = 0
 	}
+	codexPromoteActiveRunFloor(snap)
+}
+
+// codexPromoteActiveRunFloor moves a floor parked by codexArmRunFloor into
+// RunFloorMs once the older debt that forced it aside is gone. Without it,
+// evidence taken before a still-running run started would settle the previous
+// run's debt AND drop that run's floor, so a crash before it settles would
+// leave startup unable to classify it as interrupted.
+func codexPromoteActiveRunFloor(snap *codexRateLimitSnapshot) {
+	if snap.ActiveRunFloorMs > snap.RunFloorMs {
+		snap.RunFloorMs = snap.ActiveRunFloorMs
+	}
+	snap.ActiveRunFloorMs = 0
 }
 
 // codexRecordRunFreshness applies mutate to the account's snapshot through the
@@ -409,10 +424,19 @@ func codexRecordRunFreshness(fingerprint string, now time.Time, mutate func(snap
 // codexArmRunFloor records a run start. An unpaid debt keeps its (older)
 // floor: evidence covering the earlier run's start is what that debt waits on,
 // and moving the floor later would make it stricter than the run it describes.
+// The newer start is parked in ActiveRunFloorMs instead, so settling the older
+// debt promotes it rather than forgetting this run ever began.
 func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 	startMs := startedAt.UnixMilli()
 	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs == 0 || startMs < snap.RunFloorMs {
 		snap.RunFloorMs = startMs
+		if snap.RefreshOwedAtMs == 0 {
+			snap.ActiveRunFloorMs = 0
+		}
+		return
+	}
+	if startMs > snap.ActiveRunFloorMs {
+		snap.ActiveRunFloorMs = startMs
 	}
 }
 
@@ -428,6 +452,9 @@ func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Ti
 	}
 	snap.RefreshOwedAtMs = completedAt.UnixMilli()
 	snap.RefreshOwedAttempts = 0
+	if snap.ActiveRunFloorMs <= snap.RunFloorMs {
+		snap.ActiveRunFloorMs = 0
+	}
 }
 
 func codexCountRefreshAttempt(snap *codexRateLimitSnapshot) {
@@ -709,10 +736,31 @@ func codexRunCompletionFrame(line string) bool {
 // codexCompletionEventName matches a turn-completion event name, tolerating the
 // `codex/event/<name>` prefix app-server notifications may carry.
 func codexCompletionEventName(name string) bool {
-	if idx := strings.LastIndex(name, "/"); idx >= 0 {
-		name = name[idx+1:]
+	switch codexNormalizeCompletionName(name) {
+	case "turn.completed", "thread.completed":
+		return true
 	}
-	return name == "turn.completed" || name == "thread.completed"
+	return false
+}
+
+// codexNormalizeCompletionName reduces a method or event name to its bare
+// `<subject>.<verb>` form. App-server builds spell the same notification three
+// ways — `turn.completed`, `codex/event/turn.completed`, and (Codex 0.144's
+// generated JSON-RPC schema) the all-slash `turn/completed` — so the last
+// separator is only stripped when what follows already carries the subject.
+func codexNormalizeCompletionName(name string) string {
+	idx := strings.LastIndex(name, "/")
+	if idx < 0 {
+		return name
+	}
+	head, tail := name[:idx], name[idx+1:]
+	if strings.Contains(tail, ".") {
+		return tail
+	}
+	if hidx := strings.LastIndex(head, "/"); hidx >= 0 {
+		head = head[hidx+1:]
+	}
+	return head + "." + tail
 }
 
 /* ───────────────────────────── rollout side ──────────────────────────── */

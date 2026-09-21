@@ -706,3 +706,97 @@ func TestCodexRateLimitCacheTransaction_BoundedWaitOnWedgedLocks(t *testing.T) {
 		}
 	})
 }
+
+// The app-server spells its turn-completion notification differently across
+// builds: bare event, the `codex/event/` prefix, and — in Codex 0.144's
+// generated JSON-RPC schema — the all-slash `turn/completed` with no nested
+// event type at all. All three must settle the turn.
+func TestCodexRunCompletionFrame_AcceptsSlashFormMethod(t *testing.T) {
+	completing := []string{
+		`{"type":"turn.completed"}`,
+		`{"type":"thread.completed"}`,
+		`{"jsonrpc":"2.0","method":"codex/event/turn.completed","params":{"msg":{"type":"turn.completed"}}}`,
+		// Codex 0.144.0-alpha.4 `app-server generate-json-schema`.
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"turn_1"}}`,
+		`{"jsonrpc":"2.0","method":"thread/completed","params":{"threadId":"th_1"}}`,
+		`{"jsonrpc":"2.0","method":"codex/event/turn/completed","params":{}}`,
+	}
+	for _, line := range completing {
+		if !codexRunCompletionFrame(line) {
+			t.Errorf("want a completion frame: %s", line)
+		}
+	}
+	notCompleting := []string{
+		`{"jsonrpc":"2.0","method":"turn/started","params":{}}`,
+		`{"type":"item.completed"}`,
+		`{"jsonrpc":"2.0","method":"item/completed","params":{}}`,
+		`{"jsonrpc":"2.0","method":"turn/failed","params":{}}`,
+		`not json, completed`,
+	}
+	for _, line := range notCompleting {
+		if codexRunCompletionFrame(line) {
+			t.Errorf("must not settle a turn: %s", line)
+		}
+	}
+}
+
+// A run that starts while an OLDER run's debt is still standing parks its own
+// floor. Settling that older debt with evidence taken before this run began
+// must promote the parked floor rather than drop it — otherwise a crash before
+// the newer run settles leaves startup unable to see it was interrupted.
+func TestCodexArmRunFloor_ParkedFloorSurvivesAnOlderDebtSettling(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, runA)
+	codexOweRunRefresh(&snap, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&snap, runB)
+	if snap.RunFloorMs != runA.UnixMilli() || snap.ActiveRunFloorMs != runB.UnixMilli() {
+		t.Fatalf("the debt keeps runA's floor and runB parks its own: %+v", snap)
+	}
+	// Evidence from between the two starts pays runA's debt but says nothing
+	// about runB.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.Add(2 * time.Minute).UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(6*time.Minute))
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("runA's debt is covered and must clear: %+v", snap)
+	}
+	if snap.RunFloorMs != runB.UnixMilli() || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("runB's floor must be promoted, not forgotten: %+v", snap)
+	}
+	// A crash here: startup must still classify runB as interrupted.
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors: snap.Contributors,
+		runFloorMs:   snap.RunFloorMs,
+	}, t0.Add(7*time.Minute))
+	if !state.interrupted || state.owed {
+		t.Fatalf("runB must read as interrupted after a restart: %+v", state)
+	}
+}
+
+// Settling the parked floor must not resurrect a run the caller already
+// settled, and an expired debt still hands the active run its floor.
+func TestCodexActiveRunFloor_ClearedWhenItsOwnRunSettles(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+
+	settled := codexRateLimitSnapshot{}
+	codexArmRunFloor(&settled, runA)
+	codexOweRunRefresh(&settled, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&settled, runB)
+	codexOweRunRefresh(&settled, runB, t0.Add(6*time.Minute))
+	if settled.RunFloorMs != runB.UnixMilli() || settled.ActiveRunFloorMs != 0 {
+		t.Fatalf("runB settling coalesces onto its own floor: %+v", settled)
+	}
+
+	expired := codexRateLimitSnapshot{}
+	codexArmRunFloor(&expired, runA)
+	codexOweRunRefresh(&expired, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&expired, runB)
+	codexSettleRunFreshness(&expired, t0.Add(4*time.Minute).Add(codexRefreshOwedMaxAge+time.Minute))
+	if expired.RefreshOwedAtMs != 0 || expired.RunFloorMs != runB.UnixMilli() || expired.ActiveRunFloorMs != 0 {
+		t.Fatalf("an expired debt drops its own floor but hands over runB's: %+v", expired)
+	}
+}

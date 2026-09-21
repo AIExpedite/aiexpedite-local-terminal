@@ -543,11 +543,13 @@ func runMockCodexAppServer() {
 				})
 				// Real app-servers announce the end of the turn and stay up for
 				// the next one. Emitted last so the manager's per-turn settle
-				// sees the turn's frames first.
+				// sees the turn's frames first. This is the shape Codex
+				// 0.144's generated JSON-RPC schema defines: a slash-form
+				// method with no nested event type.
 				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 					"jsonrpc": "2.0",
-					"method":  "codex/event/turn.completed",
-					"params":  map[string]any{"msg": map[string]any{"type": "turn.completed"}},
+					"method":  "turn/completed",
+					"params":  map[string]any{"turnId": "turn_mock"},
 				})
 			}
 		}
