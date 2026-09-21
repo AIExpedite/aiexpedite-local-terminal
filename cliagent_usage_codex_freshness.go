@@ -645,7 +645,9 @@ func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFresh
 	}
 	state.floor = time.UnixMilli(view.runFloorMs)
 	state.latest = codexLatestContributorObservation(view.contributors)
-	unobserved := state.latest.Before(state.floor)
+	// A floor the paid watermark already covers stays covered even if the
+	// contributor that paid it is later dropped by an authoritative snapshot.
+	unobserved := state.latest.Before(state.floor) && view.runFloorPaidMs < view.runFloorMs
 	if view.refreshOwedAtMs > 0 {
 		state.owedAt = time.UnixMilli(view.refreshOwedAtMs)
 		state.owed = unobserved && now.Sub(state.owedAt) <= codexRefreshOwedMaxAge
@@ -664,10 +666,11 @@ func codexRunFreshnessForAccount(fingerprint string, now time.Time) codexRunFres
 // so whichever writer lands the covering observation — live capture, a routine
 // gather, the post-run worker — settles it in the same atomic write.
 func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
+	codexRecordPaidRunFloor(snap)
 	if snap.RefreshOwedAtMs <= 0 {
 		return
 	}
-	paid := snap.RunFloorMs <= 0 || codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.RunFloorMs
+	paid := snap.RunFloorMs <= 0 || snap.RunFloorPaidMs >= snap.RunFloorMs
 	expired := now.Sub(time.UnixMilli(snap.RefreshOwedAtMs)) > codexRefreshOwedMaxAge
 	if !paid && !expired {
 		return
@@ -677,6 +680,22 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 		snap.RunFloorMs = 0
 	}
 	codexPromoteActiveRunFloor(snap)
+}
+
+// codexRecordPaidRunFloor watermarks the newest run floor a contributor
+// observation covers. The watermark — not the live contributors — is what
+// says a run was observed, because contributors are not permanent: an empty
+// authoritative full snapshot legitimately drops them, and recomputing
+// "latest < floor" afterwards would resurrect an already-settled run as
+// interrupted and, after a restart inside codexRefreshOwedMaxAge, as a fresh
+// debt with a false stale-run warning behind it.
+func codexRecordPaidRunFloor(snap *codexRateLimitSnapshot) {
+	if snap.RunFloorMs <= 0 || snap.RunFloorPaidMs >= snap.RunFloorMs {
+		return
+	}
+	if codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.RunFloorMs {
+		snap.RunFloorPaidMs = snap.RunFloorMs
+	}
 }
 
 // codexPromoteActiveRunFloor moves a floor parked by codexArmRunFloor into

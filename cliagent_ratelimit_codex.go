@@ -224,6 +224,13 @@ type codexRateLimitSnapshot struct {
 	// recovery; the parked floor is promoted into RunFloorMs when the older
 	// debt clears.
 	ActiveRunFloorMs int64 `json:"activeRunFloorMs,omitempty"`
+	// RunFloorPaidMs is the newest floor already covered by a contributor
+	// observation. Contributors can legitimately disappear later (an empty
+	// authoritative full snapshot after a quota reset drops them), and without
+	// this watermark the surviving RunFloorMs would read as unobserved again
+	// and resurrect a settled run as "interrupted". A floor at or below it is
+	// paid for good.
+	RunFloorPaidMs int64 `json:"runFloorPaidMs,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -1585,6 +1592,7 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	snap.RefreshOwedAtMs = 0
 	snap.RefreshOwedAttempts = 0
 	snap.ActiveRunFloorMs = 0
+	snap.RunFloorPaidMs = 0
 	snap.AccountFingerprint = fingerprint
 }
 
@@ -1938,6 +1946,7 @@ type codexCacheView struct {
 	fullSnapshotAtMs int64
 	// Run freshness (codexRunFreshnessFromView).
 	runFloorMs          int64
+	runFloorPaidMs      int64
 	refreshOwedAtMs     int64
 	refreshOwedAttempts int
 }
@@ -1955,6 +1964,7 @@ func codexCacheViewForAccount(currentFingerprint string) codexCacheView {
 		limitNames:          snap.LimitNames,
 		fullSnapshotAtMs:    snap.FullSnapshotAtMs,
 		runFloorMs:          snap.RunFloorMs,
+		runFloorPaidMs:      snap.RunFloorPaidMs,
 		refreshOwedAtMs:     snap.RefreshOwedAtMs,
 		refreshOwedAttempts: snap.RefreshOwedAttempts,
 	}

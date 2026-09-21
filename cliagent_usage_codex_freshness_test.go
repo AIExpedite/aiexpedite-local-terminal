@@ -947,6 +947,47 @@ func TestCodexActiveRunFloor_ClearedWhenItsOwnRunSettles(t *testing.T) {
 	}
 }
 
+// A paid run stays paid. Contributors are not permanent — an authoritative
+// empty full snapshot drops them — and the retained floor must not then read as
+// unobserved, resurrecting the run as interrupted and, after a restart, as a
+// fresh debt with a false stale-run warning behind it.
+func TestCodexSettleRunFreshness_PaidFloorSurvivesDroppedContributors(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, t0)
+	codexOweRunRefresh(&snap, t0, t0.Add(time.Minute))
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.Add(90 * time.Second).UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(2*time.Minute))
+	if snap.RefreshOwedAtMs != 0 || snap.RunFloorPaidMs != t0.UnixMilli() {
+		t.Fatalf("a covering observation pays the debt and watermarks the floor: %+v", snap)
+	}
+
+	// A later authoritative snapshot legitimately removes every contributor.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+	codexSettleRunFreshness(&snap, t0.Add(3*time.Minute))
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors:   snap.Contributors,
+		runFloorMs:     snap.RunFloorMs,
+		runFloorPaidMs: snap.RunFloorPaidMs,
+	}, t0.Add(4*time.Minute))
+	if state.owed || state.interrupted {
+		t.Fatalf("a paid run must not be resurrected when its contributor is dropped: %+v", state)
+	}
+
+	// A NEWER run's floor is not covered by the old watermark.
+	codexArmRunFloor(&snap, t0.Add(10*time.Minute))
+	fresh := codexRunFreshnessFromView(codexCacheView{
+		contributors:   snap.Contributors,
+		runFloorMs:     snap.RunFloorMs,
+		runFloorPaidMs: snap.RunFloorPaidMs,
+	}, t0.Add(11*time.Minute))
+	if !fresh.interrupted {
+		t.Fatalf("the watermark must only cover floors at or below it: %+v", fresh)
+	}
+}
+
 // Every arm is written by its own spawned goroutine, so two starts can reach the
 // snapshot out of order. The late, OLDER write must not lower the floor: a crash
 // before the newer run settled would otherwise be covered by evidence that
