@@ -3376,11 +3376,13 @@ func writeGrokPromptFile(prompt string) (string, error) {
 }
 
 // grokMaintenanceSmokeVersionProbeFn probes the exact binary the session-path
-// maintenance smoke will spawn, under the same maintenance-only env policy
-// (sanitizeGrokMaintenanceSmokeEnv, grok_argv.go). A var so tests can pin the
-// reported version without executing a stub.
+// maintenance smoke will spawn, through the one shim-aware Grok version probe
+// (grokProbeVersion, cliagent_smoke_grok.go) — same maintenance-only env
+// policy, and on Windows an npm `grok.cmd` shim answers through cmd.exe
+// instead of failing CreateProcess and failing this smoke closed. A var so
+// tests can pin the reported version without executing a stub.
 var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
-	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
+	return grokProbeVersion(executable)
 }
 
 // resolveGrokMaintenanceSmokeExecutable returns the binary the maintenance

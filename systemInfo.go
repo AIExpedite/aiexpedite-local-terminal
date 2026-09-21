@@ -566,11 +566,15 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		// runs `exec.LookPath` internally and that accepts absolute paths.
 		var version string
 		if a.ID == "grok" {
-			// A maintenance cycle refreshes usage immediately after its smoke.
-			// Keep that Grok --version child on the same deny-by-default env policy
-			// so inherited RUST_LOG/GROK_LOG_FILE cannot add raw diagnostics or
-			// persist them while the signed usage result is being assembled.
-			version = cachedProbeVersionWithEnv(path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()))
+			// The one shim-aware Grok probe (cliagent_smoke_grok.go). A
+			// maintenance cycle refreshes usage immediately after its smoke, so
+			// this --version child stays on the same deny-by-default env policy
+			// — inherited RUST_LOG/GROK_LOG_FILE cannot add raw diagnostics or
+			// persist them while the signed usage result is being assembled —
+			// and on Windows an npm `grok.cmd` shim goes through cmd.exe rather
+			// than caching a failed direct launch's "" under the shared
+			// (path, mtime, size) key the smoke's own precheck reads.
+			version = grokProbeVersion(path)
 		} else {
 			version = cachedProbeVersion(path)
 		}

@@ -146,7 +146,7 @@ var resolveGrokSmokePath = func() string {
 	return resolveGrokInstallerBinary()
 }
 
-// grokSmokeProbeVersion answers `--version` for the resolved binary under the
+// grokProbeVersion answers `--version` for a Grok binary under the
 // maintenance-only env policy, cached per (path, mtime, size) exactly as the
 // CLI detection does — so an upgrade re-probes and a steady-state smoke does
 // not spawn a version child.
@@ -155,22 +155,29 @@ var resolveGrokSmokePath = func() string {
 // CreateProcess cannot start a batch file directly, so probing `grok.cmd`
 // with a plain exec.Command answers "" and the smoke reports binary_missing
 // without ever exercising the shim-safe route this probe exists to provide.
-func grokSmokeProbeVersion(path string) string {
+//
+// This is the ONLY Grok version probe: gatherCLIAgents (systemInfo.go) and the
+// session_start smoke (session.go) route here too. They must, because the
+// version cache is keyed on (path, mtime, size) alone — a probe that launched
+// `grok.cmd` directly would cache its own "" under the same key and every
+// later shim-aware probe would read that negative back and report
+// binary_missing without ever spawning cmd.exe. One route, one answer.
+func grokProbeVersion(path string) string {
 	env := sanitizeGrokMaintenanceSmokeEnv(os.Environ())
 	if isGrokWindowsShim(path) {
 		return cachedProbeVersionFunc(path, func() string {
-			return grokSmokeShimProbeVersion(path, env)
+			return grokShimProbeVersion(path, env)
 		})
 	}
 	return cachedProbeVersionWithEnv(path, env)
 }
 
-// grokSmokeShimProbeVersion runs `<shim> --version` through grokSmokeShimCommand
+// grokShimProbeVersion runs `<shim> --version` through grokSmokeShimCommand
 // — cmd.exe, explicit command line, shim path carried in the environment —
 // under the same short probe deadline the machine-info probes use. Returns ""
 // on any failure, exactly like probeVersionArgsWithEnv, so the caller's
 // binary_missing pre-check is unchanged for a genuinely dead shim.
-func grokSmokeShimProbeVersion(path string, env []string) string {
+func grokShimProbeVersion(path string, env []string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
 	cmd, ok := grokSmokeShimCommand(ctx, grokSmokeLaunch{

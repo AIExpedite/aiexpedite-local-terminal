@@ -367,7 +367,7 @@ var cliSmokeProviders = map[string]cliSmokeProvider{
 	},
 	"grok": {
 		resolvePath:  func() string { return resolveGrokSmokePath() },
-		probeVersion: grokSmokeProbeVersion,
+		probeVersion: grokProbeVersion,
 		loggedIn:     grokSmokeLoggedIn,
 		run:          runGrokSmoke,
 	},

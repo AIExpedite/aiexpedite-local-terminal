@@ -986,3 +986,37 @@ func TestGrokSmokeShimScript_RendersFixedTokensAndKeepsPathsOutOfTheScript(t *te
 		}
 	}
 }
+
+// Every Grok --version probe must funnel through grokProbeVersion. The version
+// cache is keyed on (path, mtime, size) alone, so a second Grok probe that
+// launched the binary directly would, on a Windows `grok.cmd` npm shim, cache
+// its own failed "" under the very key the shim-aware probe reads back — and
+// the smoke would report binary_missing without ever spawning cmd.exe. Source
+// scan because the poisoning caller (gatherCLIAgents) cannot be exercised for
+// a shim on a Linux CI runner; the behaviour half is windows-tagged.
+func TestGrokVersionProbes_AllRouteThroughTheShimAwareProbe(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file, "_test.go") || file == "cliagent_smoke_grok.go" {
+			continue
+		}
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, line := range strings.Split(string(raw), "\n") {
+			if !strings.Contains(line, "sanitizeGrokMaintenanceSmokeEnv") {
+				continue
+			}
+			for _, direct := range []string{"probeVersionArgsWithEnv(", "cachedProbeVersionWithEnv("} {
+				if strings.Contains(line, direct) {
+					t.Errorf("%s:%d probes a Grok version via %s; call grokProbeVersion so a Windows .cmd shim cannot cache a direct-launch failure: %s",
+						file, i+1, direct, strings.TrimSpace(line))
+				}
+			}
+		}
+	}
+}

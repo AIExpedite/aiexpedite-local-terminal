@@ -152,8 +152,8 @@ func TestGrokSmokeProbeVersion_AnswersThroughACmdShim(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := grokSmokeProbeVersion(shim); got != "grok 1.0.13" {
-		t.Fatalf("grokSmokeProbeVersion(%q) = %q, want the shim's version", shim, got)
+	if got := grokProbeVersion(shim); got != "grok 1.0.13" {
+		t.Fatalf("grokProbeVersion(%q) = %q, want the shim's version", shim, got)
 	}
 	// The answer is remembered on the binary stamp like every other version
 	// probe: a second call spawns no child, which a now-broken shim proves.
@@ -167,7 +167,35 @@ func TestGrokSmokeProbeVersion_AnswersThroughACmdShim(t *testing.T) {
 	if err := os.Chtimes(shim, time.Time{}, stamp.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	if got := grokSmokeProbeVersion(shim); got != "grok 1.0.13" {
+	if got := grokProbeVersion(shim); got != "grok 1.0.13" {
 		t.Fatalf("cached shim version = %q, want the remembered answer", got)
+	}
+}
+
+// The poisoning interaction the single route exists to prevent: gatherCLIAgents
+// runs first, PATH resolves the npm `grok.cmd` shim, and its --version answer is
+// cached under (path, mtime, size). If that probe launched the batch file
+// directly it cached "", and the smoke's own precheck read the negative back and
+// reported binary_missing without ever spawning cmd.exe. Both callers — and the
+// session_start smoke's probe — must answer the shim's real version.
+func TestGrokVersionProbes_ShimAnswerSurvivesAGatherFirstOrdering(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "grok.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif \"%1\"==\"--version\" echo grok 1.0.13\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	agents := gatherCLIAgents()
+	if got := agents["grok"].Version; got != "grok 1.0.13" {
+		t.Fatalf("gatherCLIAgents reported grok version %q, want the shim's version", got)
+	}
+	if got := grokProbeVersion(shim); got != "grok 1.0.13" {
+		t.Fatalf("smoke precheck after gather = %q, want the shim's version (a cached direct-launch negative)", got)
+	}
+	if got := grokMaintenanceSmokeVersionProbeFn(shim); got != "grok 1.0.13" {
+		t.Fatalf("session_start smoke precheck = %q, want the shim's version", got)
 	}
 }
