@@ -178,7 +178,7 @@ type CodexAppServerSession struct {
 	// telemetry (cliagent_usage_codex_freshness.go). Guarded by usageMu.
 	usageMu         sync.Mutex
 	usageTurnFloors []int64
-	// usageCreditShape / usageCreditAtMs pair the two shapes one finished turn
+	// usageCreditShape / usageCreditFrame pair the two shapes one finished turn
 	// may announce itself in (codexRunCompletionShape). Settling on the first
 	// leaves a credit labelled with its shape; the partner shape arriving
 	// later spends that credit instead of settling ANOTHER open turn — with
@@ -192,13 +192,20 @@ type CodexAppServerSession struct {
 	// names a turn, `thread.completed` a thread), so there is nothing to
 	// correlate them by. It is therefore bounded twice: it expires when the
 	// next turn opens, and — because a turn ALREADY open when the credit was
-	// created can announce itself in the partner shape much later — it also
-	// expires codexAppServerCompletionPairWindow after it was created. The two
-	// announcements of one turn arrive back to back, so the window keeps them
-	// paired while letting a later turn's lone completion settle its own floor
-	// instead of being swallowed.
+	// created can announce itself in the partner shape much later — it lapses
+	// once more than codexAppServerCompletionPairFrameSpan frames have been
+	// read past it.
+	//
+	// That bound is measured in STREAM POSITION (the frame's seq), not elapsed
+	// wall time: the scanner settles a frame and then blocks in publishOrFail,
+	// which can park for as long as the publish queue is stalled, so two
+	// frames adjacent on the wire can reach this layer seconds apart. A
+	// position span describes what the pairing actually means — the partner
+	// announcement follows immediately, a different turn's completion is
+	// separated by that turn's own output — and is immune to how long
+	// publishing took in between.
 	usageCreditShape string
-	usageCreditAtMs  int64
+	usageCreditFrame int64
 	// usageOverflowTurns / usageOverflowFloor stand in for turns dropped from
 	// usageTurnFloors at the cap. Completions are matched to floors by
 	// position, so simply forgetting a floor would shift every later
@@ -210,11 +217,13 @@ type CodexAppServerSession struct {
 	usageOverflowFloor int64
 }
 
-// codexAppServerCompletionPairWindow bounds how long a completion credit may
-// stand. A turn that announces itself in both shapes emits them back to back;
-// anything arriving later is a different turn's completion and must settle its
-// own floor. See usageCreditShape.
-const codexAppServerCompletionPairWindow = 2 * time.Second
+// codexAppServerCompletionPairFrameSpan bounds how far past a completion
+// credit — in frames read off the stream — its partner shape may arrive. A
+// turn that announces itself in both shapes emits them back to back, within a
+// handful of frames; a completion further downstream belongs to a different
+// turn and must settle its own floor. See usageCreditShape for why this is
+// counted in frames rather than elapsed time.
+const codexAppServerCompletionPairFrameSpan = 8
 
 // codexAppServerMaxOpenUsageTurns bounds usageTurnFloors. A turn whose
 // completion never arrives (a `turn/start` the child rejected, say) would
@@ -351,25 +360,20 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 // does not exist, and a debt for it would surface as a spurious "reading
 // predates the last run" notice.
 //
-// `shape` is the completion's label (codexRunCompletionShape). A turn may
+// `shape` is the completion's label (codexRunCompletionShape) and `frame` its
+// position in the stream (the scanner's seq for that line). A turn may
 // announce its end in two shapes back to back; the second is the SAME turn
 // finishing, not the next one, so it spends the credit the first left instead
 // of popping another floor. A credit only stands for the turn that left it
 // (see usageCreditShape): opening the NEXT turn discards it, and it lapses
-// after codexAppServerCompletionPairWindow, so neither a one-shape dialect nor
-// a turn that was ALREADY open when the credit was created can have its own
-// lone completion swallowed as someone else's partner shape.
-func (s *CodexAppServerSession) settleUsageRun(shape string) {
-	s.settleUsageRunAt(shape, time.Now())
-}
-
-// settleUsageRunAt is settleUsageRun with the arrival instant supplied, so the
-// credit window (codexAppServerCompletionPairWindow) is testable.
-func (s *CodexAppServerSession) settleUsageRunAt(shape string, now time.Time) {
-	nowMs := now.UnixMilli()
+// more than codexAppServerCompletionPairFrameSpan frames downstream, so
+// neither a one-shape dialect nor a turn that was ALREADY open when the credit
+// was created can have its own lone completion swallowed as someone else's
+// partner shape.
+func (s *CodexAppServerSession) settleUsageRun(shape string, frame int64) {
 	s.usageMu.Lock()
 	if s.usageCreditShape != "" && s.usageCreditShape != shape &&
-		nowMs-s.usageCreditAtMs <= codexAppServerCompletionPairWindow.Milliseconds() {
+		frame > s.usageCreditFrame && frame-s.usageCreditFrame <= codexAppServerCompletionPairFrameSpan {
 		// The partner shape of the turn that left the credit: the same turn
 		// finishing, not another one.
 		s.clearUsageCreditLocked()
@@ -377,7 +381,7 @@ func (s *CodexAppServerSession) settleUsageRunAt(shape string, now time.Time) {
 		return
 	}
 	s.usageCreditShape = shape
-	s.usageCreditAtMs = nowMs
+	s.usageCreditFrame = frame
 	var floor int64
 	switch {
 	case s.usageOverflowTurns > 0:
@@ -402,7 +406,7 @@ func (s *CodexAppServerSession) settleUsageRunAt(shape string, now time.Time) {
 // usageMu.
 func (s *CodexAppServerSession) clearUsageCreditLocked() {
 	s.usageCreditShape = ""
-	s.usageCreditAtMs = 0
+	s.usageCreditFrame = 0
 }
 
 // overflowOldestUsageTurnLocked collapses the oldest listed floor into the
@@ -627,6 +631,12 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 // and rejects, and the orphaned write (if it ever wakes up) lands on a closed
 // pipe. Without that guarantee, two timed-out Sends could interleave their
 // JSON-RPC frames on the wire and break request/response correlation.
+// codexAppServerStdinWriteBudget is the write budget Send enforces — an
+// indirection point for tests (pubsub.go keeps the same kind of seam): the
+// stall path tears a session down, and a test cannot afford to wait out the
+// real codexAppServerStdinWriteTimeout to reach it.
+var codexAppServerStdinWriteBudget = codexAppServerStdinWriteTimeout
+
 func (m *CodexAppServerManager) Send(id string, payload string) error {
 	session := m.Get(id)
 	if session == nil {
@@ -684,13 +694,27 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 			}
 			return fmt.Errorf("failed to write to codex app-server session %s stdin: %w", id, err)
 		}
-	case <-time.After(codexAppServerStdinWriteTimeout):
+	case <-time.After(codexAppServerStdinWriteBudget):
 		// Fatal: a stalled write is a signal that codex isn't draining stdin.
 		// Continuing would let the next Send acquire stdinMu and interleave
 		// its frame with the abandoned write's eventual completion. Close
 		// stdin to unblock the abandoned goroutine immediately, transition
 		// to "ended" so concurrent/subsequent Sends short-circuit, and kill
 		// the child so waitForExit publishes codex_appserver_ended.
+		//
+		// Roll the arm back FIRST, exactly as the write-error branch does: a
+		// request that stalled mid-frame never delivered a complete JSONL
+		// line, so the child never read a turn — and the session is being
+		// torn down, so no completion will ever settle this floor. Left
+		// armed, waitForExit would fold it into a debt no telemetry can pay,
+		// which ages into a false "reading predates the last run" warning.
+		// Disarming before closeStdin/Kill keeps it ahead of the exit path
+		// that would otherwise settle it.
+		if armedFloor > 0 {
+			session.disarmUsageRun(armedFloor, func() int64 {
+				return m.newestOpenUsageFloor(session)
+			})
+		}
 		session.closeStdin()
 		session.mu.Lock()
 		session.status = "ended"
@@ -1124,7 +1148,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// event. The frame shapes live in the usage layer, so this file
 			// still knows no JSON-RPC semantics.
 			if shape := codexRunCompletionShape(trimmed); shape != "" {
-				session.settleUsageRun(shape)
+				session.settleUsageRun(shape, seq)
 			} else if codexRunProgressFrame(trimmed) {
 				session.openUsageRun(time.Now())
 			}

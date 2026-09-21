@@ -1300,6 +1300,7 @@ func TestCodexAppServerLifecycle_BetweenTurnReadingDoesNotOpenARun(t *testing.T)
 // second completion settles the second. Exercised on the session directly:
 // the echo mock completes every turn immediately, so it cannot overlap them.
 func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	first := time.UnixMilli(1_700_000_000_000)
@@ -1310,7 +1311,7 @@ func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T)
 		t.Fatalf("started=%d settled=%d after two turn requests, want 2/0", started, settled)
 	}
 
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	if _, settled := rec.counts(); settled != 1 {
 		t.Fatalf("settled %d after the first completion, want 1", settled)
 	}
@@ -1324,13 +1325,13 @@ func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T)
 		t.Fatalf("started=%d after a progress frame with a turn open, want no new run", started)
 	}
 
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	settled := rec.settled
 	if len(settled) != 2 || !settled[1].Equal(second) {
 		t.Fatalf("settled=%v after the second completion, want [%s %s]", settled, first, second)
 	}
 	// Nothing open: a stray completion settles nothing.
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	session.settleOpenUsageRuns()
 	if _, n := rec.counts(); n != 2 {
 		t.Fatalf("settled %d after stray completions with nothing open, want 2", n)
@@ -1344,6 +1345,7 @@ func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T)
 // debt is created early, its in-flight telemetry pays it, and its real
 // completion is a no-op that leaves the final reading stale.
 func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	first := time.UnixMilli(1_700_000_000_000)
@@ -1351,8 +1353,8 @@ func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T)
 	session.armUsageRun(first)
 	session.armUsageRun(second)
 
-	session.settleUsageRun("turn.completed")
-	session.settleUsageRun("thread.completed")
+	session.settleUsageRun("turn.completed", frames.next())
+	session.settleUsageRun("thread.completed", frames.next())
 	if _, settled := rec.counts(); settled != 1 {
 		t.Fatalf("settled %d after one turn's paired completions, want 1 (the second turn is still running)", settled)
 	}
@@ -1360,8 +1362,8 @@ func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T)
 		t.Fatalf("paired completions settled floor %s, want the first turn's %s", got, first)
 	}
 
-	session.settleUsageRun("turn.completed")
-	session.settleUsageRun("thread.completed")
+	session.settleUsageRun("turn.completed", frames.apart())
+	session.settleUsageRun("thread.completed", frames.next())
 	settled := rec.settled
 	if len(settled) != 2 || !settled[1].Equal(second) {
 		t.Fatalf("settled=%v after the second turn's paired completions, want [%s %s]", settled, first, second)
@@ -1369,11 +1371,11 @@ func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T)
 	// Both pairs consumed: a third turn settles on its first shape again.
 	third := second.Add(time.Second)
 	session.armUsageRun(third)
-	session.settleUsageRun("thread.completed")
+	session.settleUsageRun("thread.completed", frames.apart())
 	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
 		t.Fatalf("settled=%v after the third turn's completion, want it settled at %s", got, third)
 	}
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	if _, n := rec.counts(); n != 3 {
 		t.Fatalf("settled %d after the third turn's partner shape, want 3", n)
 	}
@@ -1383,13 +1385,14 @@ func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T)
 // consecutive same-shape completions each settle a turn, and the credits they
 // leave stay bounded.
 func TestCodexAppServerSession_SingleShapeCompletionsSettleEveryTurn(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	base := time.UnixMilli(1_700_000_000_000)
 	const turns = codexAppServerMaxOpenUsageTurns + 8
 	for i := 0; i < turns; i++ {
 		session.armUsageRun(base.Add(time.Duration(i) * time.Second))
-		session.settleUsageRun("turn.completed")
+		session.settleUsageRun("turn.completed", frames.next())
 	}
 	if _, settled := rec.counts(); settled != turns {
 		t.Fatalf("settled %d of %d single-shape turns", settled, turns)
@@ -1410,6 +1413,7 @@ func TestCodexAppServerSession_SingleShapeCompletionsSettleEveryTurn(t *testing.
 // process exits — no post-run reconcile, card pinned to a pre-run reading for
 // the life of the app-server.
 func TestCodexAppServerSession_LateCompletionDoesNotSpendStaleCredit(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	first := time.UnixMilli(1_700_000_000_000)
@@ -1418,25 +1422,23 @@ func TestCodexAppServerSession_LateCompletionDoesNotSpendStaleCredit(t *testing.
 	session.armUsageRun(second)
 
 	// Turn A finishes in ONE shape while turn B is still running.
-	at := second.Add(time.Second)
-	session.settleUsageRunAt("turn.completed", at)
+	session.settleUsageRun("turn.completed", frames.next())
 	if _, settled := rec.counts(); settled != 1 {
 		t.Fatalf("settled %d after the first turn's only completion, want 1", settled)
 	}
 
-	// Turn B finishes in the OTHER shape, well past the pairing window.
-	session.settleUsageRunAt("thread.completed", at.Add(codexAppServerCompletionPairWindow+time.Second))
+	// Turn B finishes in the OTHER shape, well downstream of that credit.
+	session.settleUsageRun("thread.completed", frames.apart())
 	settled := rec.settled
 	if len(settled) != 2 || !settled[1].Equal(second) {
 		t.Fatalf("settled=%v after the second turn's completion, want it settled at %s", settled, second)
 	}
 
-	// Back-to-back shapes still pair: the partner arrives inside the window.
+	// Back-to-back shapes still pair: the partner is the very next frame.
 	third := second.Add(time.Minute)
 	session.armUsageRun(third)
-	paired := third.Add(time.Second)
-	session.settleUsageRunAt("turn.completed", paired)
-	session.settleUsageRunAt("thread.completed", paired.Add(5*time.Millisecond))
+	session.settleUsageRun("turn.completed", frames.apart())
+	session.settleUsageRun("thread.completed", frames.next())
 	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
 		t.Fatalf("settled=%v after the third turn's paired completions, want exactly one more settle at %s", got, third)
 	}
@@ -1448,6 +1450,7 @@ func TestCodexAppServerSession_LateCompletionDoesNotSpendStaleCredit(t *testing.
 // leave the LAST turn's completion with no floor at all — its debt created
 // early (and payable by mid-run telemetry) and its real completion a no-op.
 func TestCodexAppServerSession_OverflowKeepsCompletionAlignment(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	base := time.UnixMilli(1_700_000_000_000)
@@ -1463,10 +1466,9 @@ func TestCodexAppServerSession_OverflowKeepsCompletionAlignment(t *testing.T) {
 			overflow, listed, turns, turns-codexAppServerMaxOpenUsageTurns, codexAppServerMaxOpenUsageTurns)
 	}
 
-	// Every turn completes, one shape each, spaced past the pairing window.
-	at := base.Add(time.Hour)
+	// Every turn completes, one shape each — pairing never applies.
 	for i := 0; i < turns; i++ {
-		session.settleUsageRunAt("turn.completed", at.Add(time.Duration(i)*time.Minute))
+		session.settleUsageRun("turn.completed", frames.next())
 	}
 	if _, settled := rec.counts(); settled != turns {
 		t.Fatalf("settled %d of %d turns, want every completion to settle a floor", settled, turns)
@@ -1490,6 +1492,7 @@ func TestCodexAppServerSession_OverflowKeepsCompletionAlignment(t *testing.T) {
 // process start and converted into a debt no telemetry can pay. The rollback
 // names the newest turn still open so a concurrent run's floor is kept.
 func TestCodexAppServerSession_DisarmRollsBackPersistedFloor(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	first := time.UnixMilli(1_700_000_000_000)
@@ -1509,7 +1512,7 @@ func TestCodexAppServerSession_DisarmRollsBackPersistedFloor(t *testing.T) {
 			disarmed[0].floor, disarmed[0].fallback, second, first)
 	}
 	// Alone, the rollback names no fallback.
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	alone := session.armUsageRun(second.Add(time.Second))
 	session.disarmUsageRun(alone, nil)
 	rec.mu.Lock()
@@ -1583,12 +1586,64 @@ func TestCodexAppServerLifecycle_FailedTurnWriteDisarmsUsageRun(t *testing.T) {
 	}
 }
 
+// A turn request whose stdin write STALLS never delivered a complete JSONL
+// line either, so the child never read a turn. The timeout path tears the
+// session down, and without the same rollback the failed-write path performs,
+// waitForExit would fold that still-open floor into a refresh debt no
+// telemetry can pay — surfacing later as a false "reading predates the last
+// run" warning.
+func TestCodexAppServerLifecycle_TimedOutTurnWriteDisarmsUsageRun(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	restore := codexAppServerStdinWriteBudget
+	codexAppServerStdinWriteBudget = 100 * time.Millisecond
+	t.Cleanup(func() { codexAppServerStdinWriteBudget = restore })
+
+	m, id, ended := startCodexAppServerEchoMock(t)
+	session := m.Get(id)
+	if session == nil {
+		t.Fatal("session not registered")
+	}
+	// Swap the child's stdin for a pipe nobody drains: the write blocks once
+	// the pipe buffer fills, which is exactly the stall the timeout guards.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	session.stdinMu.Lock()
+	session.Stdin = w
+	session.stdinMu.Unlock()
+
+	stall := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":%q}]}}`,
+		strings.Repeat("x", 4*1024*1024))
+	if err := m.Send(id, stall); err == nil {
+		t.Fatal("Send on a stalled stdin succeeded, want a timeout error")
+	}
+
+	if started, settled := rec.counts(); started != 1 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after the stalled write, want the arm (1) and no settle", started, settled)
+	}
+	rec.mu.Lock()
+	disarmed := len(rec.disarmed)
+	rec.mu.Unlock()
+	if disarmed != 1 {
+		t.Fatalf("disarmed %d floors after the stalled write, want the arm rolled back", disarmed)
+	}
+
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if _, settled := rec.counts(); settled != 0 {
+		t.Fatalf("settled %d at exit after a turn request that never reached the child, want 0", settled)
+	}
+}
+
 // The persisted floor is account-wide while one manager runs many concurrent
 // sessions, so rolling back a failed turn write must preserve the newest turn
 // still open in ANY of them. Resetting the shared floor to this session's own
 // remainder would erase a sibling session's crash-recovery marker, and a crash
 // before that sibling settles would lose the refresh it was promised.
 func TestCodexAppServerSession_DisarmPreservesSiblingSessionFloor(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	mgr := NewCodexAppServerManager(nil)
 	sibling := &CodexAppServerSession{}
@@ -1614,7 +1669,7 @@ func TestCodexAppServerSession_DisarmPreservesSiblingSessionFloor(t *testing.T) 
 	}
 
 	// With every sibling turn settled there is nothing left to preserve.
-	sibling.settleUsageRun("turn.completed")
+	sibling.settleUsageRun("turn.completed", frames.next())
 	alone := session.armUsageRun(failed.Add(time.Second))
 	session.disarmUsageRun(alone, func() int64 { return mgr.newestOpenUsageFloor(session) })
 	rec.mu.Lock()
@@ -1630,19 +1685,20 @@ func TestCodexAppServerSession_DisarmPreservesSiblingSessionFloor(t *testing.T) 
 // a LATER turn's partner-shape completion spends: that turn's floor would stay
 // open until the process exited, so its post-run reconcile never runs.
 func TestCodexAppServerSession_CreditExpiresWhenNextTurnOpens(t *testing.T) {
+	frames := &frameCursor{}
 	rec := recordCodexRunHooks(t)
 	session := &CodexAppServerSession{}
 	first := time.UnixMilli(1_700_000_000_000)
 	second := first.Add(time.Second)
 	session.armUsageRun(first)
-	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("turn.completed", frames.next())
 	if _, settled := rec.counts(); settled != 1 {
 		t.Fatalf("settled %d after the first turn's only completion, want 1", settled)
 	}
 
 	// A different turn, announced in the shape the first turn never used.
 	session.armUsageRun(second)
-	session.settleUsageRun("thread.completed")
+	session.settleUsageRun("thread.completed", frames.next())
 	settled := rec.settled
 	if len(settled) != 2 || !settled[1].Equal(second) {
 		t.Fatalf("settled=%v after the second turn's completion, want it settled at %s", settled, second)
@@ -1650,10 +1706,27 @@ func TestCodexAppServerSession_CreditExpiresWhenNextTurnOpens(t *testing.T) {
 
 	// A progress frame that opens a run clears a stale credit too.
 	third := second.Add(time.Second)
-	session.settleUsageRun("turn.completed") // leaves a credit, nothing open
+	session.settleUsageRun("turn.completed", frames.next()) // leaves a credit, nothing open
 	session.openUsageRun(third)
-	session.settleUsageRun("thread.completed")
+	session.settleUsageRun("thread.completed", frames.next())
 	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
 		t.Fatalf("settled=%v after the opened run's completion, want it settled at %s", got, third)
 	}
+}
+
+// frameCursor hands out stream positions for settleUsageRun. next() is the
+// frame immediately after the last one — what a turn's partner announcement
+// looks like on the wire — while apart() leaves a full pairing span in
+// between, standing in for the output another turn emitted before its own
+// completion.
+type frameCursor struct{ pos int64 }
+
+func (c *frameCursor) next() int64 {
+	c.pos++
+	return c.pos
+}
+
+func (c *frameCursor) apart() int64 {
+	c.pos += codexAppServerCompletionPairFrameSpan + 1
+	return c.pos
 }
