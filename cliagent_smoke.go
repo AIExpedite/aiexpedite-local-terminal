@@ -371,7 +371,14 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 		}
 		executed = true
 		result := provider.run(ctx, path, version)
-		rememberCLISmokeVerdict(cliID, stamp, result)
+		// A verdict reached because the CALLER went away (delivery cancelled,
+		// agent shutting down) says nothing about the binary: the providers
+		// classify that kill as `timeout` like an attempt-deadline expiry, and
+		// caching it would hand the redelivered post-upgrade smoke a stale
+		// failure for 15 minutes instead of testing the CLI.
+		if ctx.Err() == nil {
+			rememberCLISmokeVerdict(cliID, stamp, result)
+		}
 		return result, nil
 	})
 	result, _ := v.(cliSmokeResult)

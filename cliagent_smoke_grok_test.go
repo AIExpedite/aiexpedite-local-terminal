@@ -618,6 +618,39 @@ func TestRunCLISmoke_GrokCooldownReplaysButNotAcrossAnUpgrade(t *testing.T) {
 	}
 }
 
+// A run killed because the CALLER's context was cancelled (delivery cancelled,
+// agent shutdown) is not a verdict on the binary: it must not be pinned by the
+// cooldown, so the redelivered smoke actually tests the CLI.
+func TestRunCLISmoke_GrokCallerCancellationIsNotCached(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.13")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelled := false
+	calls, _ := stubGrokSmokeExec(t, func(runCtx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		if !cancelled {
+			cancelled = true
+			cancel()
+			<-runCtx.Done()
+			return nil, nil, grokExitError(t)
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	first, replayed := runCLISmoke(ctx, "grok")
+	if replayed || first.Diagnostic != cliSmokeDiagnosticTimeout {
+		t.Fatalf("cancelled smoke = %+v replayed=%t, want an executed timeout", first, replayed)
+	}
+	second, replayed := runCLISmoke(context.Background(), "grok")
+	if replayed || second.Status != cliSmokeStatusSuccess {
+		t.Fatalf("redelivered smoke replayed the cancellation: %+v replayed=%t", second, replayed)
+	}
+	if *calls != 2 {
+		t.Fatalf("redelivered smoke did not execute: calls=%d", *calls)
+	}
+}
+
 func TestRunCLISmoke_GrokCachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
 	persistent := grokSmokeEnv(t)
 	path := stubGrokBinary(t)
