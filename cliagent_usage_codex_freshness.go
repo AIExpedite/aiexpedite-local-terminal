@@ -57,6 +57,10 @@ const (
 	// codexRefreshOwedMaxAge retires a debt nothing could pay, so it can never
 	// pin work (or a stale notice) forever.
 	codexRefreshOwedMaxAge = 30 * time.Minute
+	// codexArmedAccountCap bounds the armed-run → account map. A floor that is
+	// never settled individually (an app-server exit settles only the newest
+	// open turn) would otherwise retain its entry for the life of the process.
+	codexArmedAccountCap = 64
 	// codexRunFloorGrace widens the forced scan below the floor to absorb
 	// coarse filesystem mtimes and a rollout created just before the run start
 	// was recorded.
@@ -168,6 +172,13 @@ type codexUsageRefreshGate struct {
 	// RefreshOwedAttempts write the bounded cache locks refused, so the stale
 	// notice is not withheld forever by an uncounted attempt.
 	pendingAttempts map[string]int
+	// armed maps a run start (floor, ms) to the account fingerprint that was
+	// live when it was armed, so the run's settlement is attributed to the
+	// account that actually made it even if the Codex credentials change while
+	// it runs. Without it a swap mid-run records account A's debt against B,
+	// which can later show B a stale-run warning for a run B never made while
+	// A's promised refresh is lost for good.
+	armed map[int64]string
 	// disarmed holds run starts withdrawn (codexUsageRunDisarmed) that may not
 	// have reached disk yet: an arm is written by its own retried goroutine,
 	// so the withdrawal can land first, and the late arm must then be dropped
@@ -199,6 +210,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		workers:         map[string]bool{},
 		pending:         map[string]codexPendingRunDebt{},
 		pendingAttempts: map[string]int{},
+		armed:           map[int64]string{},
 		disarmed:        map[string]map[int64]struct{}{},
 		cancel:          make(chan struct{}),
 	}
@@ -364,6 +376,42 @@ func (g *codexUsageRefreshGate) takeAttempts(fp string) int {
 	return n
 }
 
+// rememberArmedAccount pins the account that was live when the run starting at
+// floorMs was armed; takeArmedAccount hands it to that run's settlement (or
+// withdrawal) and forgets it. A miss means the run predates this process — a
+// floor replayed from disk at startup — and the caller falls back to the
+// account that is live now, which is the only one it can reconcile anyway.
+func (g *codexUsageRefreshGate) rememberArmedAccount(floorMs int64, fp string) {
+	if floorMs <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.armed == nil {
+		g.armed = map[int64]string{}
+	}
+	g.armed[floorMs] = fp
+	// Evict oldest-first: the oldest floor is the one whose run is least
+	// likely to still be open and owed a settlement.
+	for len(g.armed) > codexArmedAccountCap {
+		oldest := int64(0)
+		for ms := range g.armed {
+			if oldest == 0 || ms < oldest {
+				oldest = ms
+			}
+		}
+		delete(g.armed, oldest)
+	}
+}
+
+func (g *codexUsageRefreshGate) takeArmedAccount(floorMs int64) (string, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	fp, ok := g.armed[floorMs]
+	delete(g.armed, floorMs)
+	return fp, ok
+}
+
 // markDisarmed records that the run armed at floorMs was withdrawn before its
 // arm was known to be on disk; takeDisarmed consumes that record. Both sides
 // run inside the cache transaction, so an arm and its withdrawal are ordered
@@ -433,6 +481,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.pendingAttempts = map[string]int{}
+	codexUsageRefresh.armed = map[int64]string{}
 	codexUsageRefresh.disarmed = map[string]map[int64]struct{}{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
@@ -652,8 +701,12 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 	if !codexUsageRefresh.isEnabled() {
 		return
 	}
+	// Resolved HERE, not on the spawned goroutine: this is the account that
+	// made the run, and it is what settlement (or withdrawal) must be booked
+	// against even if the credentials change before either lands.
+	fp := codexAccountFingerprintAtBase(codexHomeBase())
+	codexUsageRefresh.rememberArmedAccount(startedAt.UnixMilli(), fp)
 	codexUsageRefresh.spawn(func() {
-		fp := codexAccountFingerprintAtBase(codexHomeBase())
 		// A refused write is RETRIED: bounded locking deliberately lets this
 		// lose the race for the cache lock, and a start that never reached disk
 		// is a run startup cannot classify as interrupted if the process dies
@@ -696,8 +749,11 @@ func disarmCodexUsageRunFloor(floor, fallback time.Time) {
 	if !fallback.IsZero() {
 		fallbackMs = fallback.UnixMilli()
 	}
+	fp, _ := codexUsageRefresh.takeArmedAccount(floorMs)
+	if fp == "" {
+		fp = codexAccountFingerprintAtBase(codexHomeBase())
+	}
 	codexUsageRefresh.spawn(func() {
-		fp := codexAccountFingerprintAtBase(codexHomeBase())
 		codexUsageRefresh.markDisarmed(fp, floorMs)
 		for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
 			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
@@ -727,14 +783,29 @@ func triggerCodexUsageRefreshAfterRun(floor time.Time) {
 		return
 	}
 	completedAt := codexUsageFreshnessNow()
+	armed, _ := codexUsageRefresh.takeArmedAccount(floor.UnixMilli())
 	codexUsageRefresh.spawn(func() {
-		codexRefreshAfterRun(floor, completedAt)
+		codexRefreshAfterRun(armed, floor, completedAt)
 	})
 }
 
-func codexRefreshAfterRun(floor, completedAt time.Time) {
+// codexRefreshAfterRun settles the run that started at `floor`. `armed` is the
+// account that was live when the run was armed, or "" when this process never
+// armed it (a floor replayed from disk at startup).
+func codexRefreshAfterRun(armed string, floor, completedAt time.Time) {
 	base := codexHomeBase()
 	fp := codexAccountFingerprintAtBase(base)
+	if armed != "" && armed != fp {
+		// The Codex credentials changed while the run was in flight. Its
+		// telemetry is unreachable — the rollout scan only reads the account
+		// that is live now — and booking the debt either way is wrong: under
+		// the live account it would show a stale-run warning for a run that
+		// account never made, and under the armed one it would rescope the
+		// cache and discard the live account's readings. Drop it; the armed
+		// account's floor is cleared by the next write that rescopes the
+		// snapshot (codexScopeSnapshotToAccount).
+		return
+	}
 	// Record the debt FIRST: every later step may be refused or fail, and a
 	// debt that was never recorded is a run whose refresh is silently lost —
 	// including across a restart, which is what the persisted marker is for.

@@ -1244,3 +1244,76 @@ func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *tes
 		t.Fatalf("a withdrawn run must owe nothing after a restart: %+v", state)
 	}
 }
+
+// A run armed under one account must never be settled as the NEXT account's
+// debt: the cache holds a single account's readings, so booking account A's
+// finished run against B gives B a run floor for a run it never made — which
+// ages into a false stale-utilization warning on B's card — while A's promised
+// refresh is dropped. The run's account is captured when the floor is armed
+// and carried into settlement.
+func TestCodexRefreshAfterRun_CredentialsSwapDoesNotBookTheDebtOnTheNextAccount(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	codexUsageRunStarted(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("armed floor %d, want run start %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+
+	// Sign in as a different account mid-run, and let that account take over the
+	// cache the way any of its own telemetry would (the rescope drops account
+	// A's floor with the rest of A's state).
+	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+	next := currentCodexAccountFingerprint()
+	if next == f.fp {
+		t.Fatal("credentials swap did not change the account fingerprint")
+	}
+	mergeCodexRateLimitCache(f.cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(), ObservedAtMs: now.Add(-30 * time.Second).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, next)
+
+	codexUsageRunSettled(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != next {
+		t.Fatalf("cache rescoped to %q, want the account that is signed in now", snap.AccountFingerprint)
+	}
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("debt %d booked on the next account, want none", snap.RefreshOwedAtMs)
+	}
+	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("run floor %d/%d inherited by the next account, want none", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+}
+
+// The same binding applies to a withdrawal: the rollback must target the
+// account whose floor was armed, not whoever is signed in when the turn write
+// turns out to have failed.
+func TestDisarmCodexUsageRunFloor_RollsBackTheArmingAccount(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	codexUsageRunStarted(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+	codexUsageRunDisarmed(runStart, time.Time{})
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != f.fp {
+		t.Fatalf("rollback rescoped the cache to %q, want the arming account", snap.AccountFingerprint)
+	}
+	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("floor %d/%d survived the rollback, want it withdrawn", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+}
