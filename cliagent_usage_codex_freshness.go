@@ -737,9 +737,11 @@ func codexRunDebtWorker(base, fp string) {
 	for {
 		codexPayRunRefresh(base, fp)
 		if codexUsageRefresh.releaseWorker(fp) {
-			// Last chance to land attempts the cache lock refused: nothing else
-			// runs for this account until another run finishes or a gather
-			// forces a reconcile.
+			// Last chance to land a debt or attempts the cache lock refused:
+			// nothing else runs for this account until another run finishes
+			// or a gather reconciles — and the gather side flushes whatever is
+			// still retained here (codexReconcileForGather).
+			codexFlushPendingRunDebt(fp)
 			codexRecordRefreshAttempt(fp, 0)
 			return
 		}
@@ -748,7 +750,11 @@ func codexRunDebtWorker(base, fp string) {
 
 // codexPayRunRefresh spends up to codexRefreshAfterRunMaxAttempts forced
 // reconciles on fp's outstanding debt, restarting the count when another run
-// finishes meanwhile.
+// finishes meanwhile. A debt still RETAINED in the gate is landed first under
+// its own write budget (codexLandPendingRunDebt): a refused write is a lock
+// race, not a reconcile, and must not consume the reconcile attempts — those
+// gate the stale notice — or the worker would retire with the debt still
+// unrecorded and nothing left scheduled to record it.
 func codexPayRunRefresh(base, fp string) {
 	for attempt := 0; attempt < codexRefreshAfterRunMaxAttempts; attempt++ {
 		if attempt > 0 && !codexUsageRefresh.sleep(codexRefreshAfterRunRetryDelay) {
@@ -757,8 +763,13 @@ func codexPayRunRefresh(base, fp string) {
 		if codexUsageRefresh.takeRearm(fp) {
 			attempt = 0
 		}
-		if !codexFlushPendingRunDebt(fp) {
-			continue // still unrecorded; retry the write on the next attempt
+		if !codexLandPendingRunDebt(fp) {
+			// Still unrecorded after the write budget: the process is
+			// shutting down, or the lock is wedged past every bound. The
+			// debt stays retained for the worker's last-chance flush and the
+			// next gather; a reconcile now would read `owed == false` off
+			// disk and retire a run that was never recorded.
+			return
 		}
 		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
 		if !state.owed {
@@ -791,6 +802,21 @@ func codexRecordRefreshAttempt(fp string, spent int) {
 		return
 	}
 	codexUsageRefresh.rememberAttempts(fp, spent)
+}
+
+// codexLandPendingRunDebt retries codexFlushPendingRunDebt under the same
+// bounded write budget an arm or a rollback gets (codexRunFloorWriteAttempts ×
+// codexRunFloorWriteRetryDelay). Reports whether fp's debt is on disk.
+func codexLandPendingRunDebt(fp string) bool {
+	for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
+		if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
+			return false
+		}
+		if codexFlushPendingRunDebt(fp) {
+			return true
+		}
+	}
+	return false
 }
 
 // codexFlushPendingRunDebt retries a settle whose write was refused by the
@@ -877,10 +903,20 @@ func payOwedCodexUsageRefresh() {
 		if !state.owed && !state.interrupted {
 			return
 		}
+		// Either conversion below may be REFUSED by the bounded cache locks
+		// and retained in the gate instead. Such a debt is handed to the
+		// account's worker whatever happens to it here: the reconcile this
+		// replay runs happens BEFORE the retained debt is on disk, so its
+		// attempt cannot be counted against a debt that does not exist yet,
+		// and the conversion that finally lands resets the count to zero.
+		// Without the worker, every later gather would force a scan on the
+		// owed debt but never count an attempt, so a run whose telemetry
+		// never appears would never reach the stale-warning threshold.
+		retained := false
 		if state.interrupted {
 			// The run is over — its process is gone — so it is owed from now on:
 			// the stale notice and the age-out both need a completion time.
-			codexOweInterruptedRun(fp, state.floor, now)
+			retained = !codexOweInterruptedRun(fp, state.floor, now)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
 		defer cancel()
@@ -896,15 +932,17 @@ func payOwedCodexUsageRefresh() {
 		// never be refreshed and would simply age out.
 		now = codexUsageFreshnessNow()
 		if promoted := codexRunFreshnessForAccount(fp, now); promoted.interrupted {
-			codexOweInterruptedRun(fp, promoted.floor, now)
+			if !codexOweInterruptedRun(fp, promoted.floor, now) {
+				retained = true
+			}
 		}
-		// Either conversion may have been REFUSED by the bounded cache locks.
-		// A run left merely `interrupted` is never refreshed — routine gathers
-		// force only on `owed` — and never warns, so the retained debt is
-		// handed to the account's worker, the same retry a settle whose write
-		// was refused gets (codexFlushPendingRunDebt). Nothing to do when the
-		// flush lands here, or when nothing was retained.
-		if !codexFlushPendingRunDebt(fp) {
+		// A retained conversion gets the same bounded worker a refused
+		// post-run settle gets: it lands the debt (codexLandPendingRunDebt)
+		// and then spends the reconcile attempts the debt is owed, so the
+		// stale notice can still be reached. A run left merely `interrupted`
+		// would otherwise never be refreshed — routine gathers force only on
+		// `owed` — and never warn.
+		if retained {
 			codexRunDebtWorker(base, fp)
 		}
 	})
@@ -932,6 +970,11 @@ func codexOweInterruptedRun(fp string, floor, now time.Time) bool {
 // the routine cursor-based reconcile — after waiting out an in-flight one for a
 // forced refresh, so the reading it returns includes that reconcile's result.
 func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time, forced bool) codexReconcileResult {
+	// A settle the bounded cache locks refused past the worker's write budget
+	// is still retained in the gate; nothing else runs for this account until
+	// another run finishes, so land it here — the write is skipped when
+	// nothing is retained — or the debt would read as paid off disk.
+	codexFlushPendingRunDebt(fp)
 	state := codexRunFreshnessForAccount(fp, now)
 	if forced || state.owed {
 		var floor time.Time

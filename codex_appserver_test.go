@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -563,11 +564,42 @@ func runMockCodexAppServer() {
 					"method":  "turn/completed",
 					"params":  map[string]any{"turnId": "turn_mock"},
 				})
+				// Optional two-shape dialect with a chatty stderr: the
+				// partner `thread/completed` follows the turn completion
+				// after a burst of diagnostics. The pauses order the two
+				// streams as the parent sees them — the turn completion is
+				// consumed before the burst, the burst before the partner —
+				// and leave the test a window to observe the manager's state
+				// before the next turn's frames.
+				if n := mockCodexStderrBurst(); n > 0 {
+					time.Sleep(mockCodexStderrBurstPause)
+					for i := 0; i < n; i++ {
+						fmt.Fprintf(os.Stderr, "[mock-codex] diagnostic %d\n", i)
+					}
+					time.Sleep(mockCodexStderrBurstPause)
+					_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+						"jsonrpc": "2.0",
+						"method":  "thread/completed",
+						"params":  map[string]any{"threadId": "thr_mock"},
+					})
+					time.Sleep(mockCodexStderrBurstPause)
+				}
 			}
 		}
 	}
 	// Stdin closed → exit cleanly. Codex's stdio app-server contract.
 	os.Exit(0)
+}
+
+// mockCodexStderrBurstEnv asks the echo mock to announce every turn's end in
+// BOTH completion shapes, separated by that many stderr diagnostic lines.
+const mockCodexStderrBurstEnv = "TEST_MOCK_CODEX_STDERR_BURST"
+
+const mockCodexStderrBurstPause = 300 * time.Millisecond
+
+func mockCodexStderrBurst() int {
+	n, _ := strconv.Atoi(os.Getenv(mockCodexStderrBurstEnv))
+	return n
 }
 
 func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
@@ -1180,6 +1212,47 @@ func TestCodexAppServerLifecycle_SettlesUsageFreshnessPerTurn(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if _, n := rec.counts(); n != 2 {
 		t.Fatalf("settled %d times, want one settle per completed turn", n)
+	}
+}
+
+// A turn's two completion shapes are paired by their position on STDOUT, not
+// by the publication seq the stderr scanner also advances: a burst of
+// diagnostics between `turn/completed` and its partner `thread/completed` must
+// not lapse the credit, or the partner would settle the NEXT overlapping turn
+// while it is still running.
+func TestCodexAppServerLifecycle_StderrBurstDoesNotSplitPairedCompletions(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	t.Setenv(mockCodexStderrBurstEnv, strconv.Itoa(codexAppServerCompletionPairFrameSpan*4))
+	m, id, ended := startCodexAppServerEchoMock(t)
+	if m.Get(id) == nil {
+		t.Fatal("session not registered")
+	}
+	turn := func(n int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`, n)
+	}
+	// Two turns open before either completes: the mock answers stdin in
+	// order, so turn 2's frames follow turn 1's partner shape.
+	if err := m.Send(id, turn(1)); err != nil {
+		t.Fatalf("Send turn 1: %v", err)
+	}
+	if err := m.Send(id, turn(2)); err != nil {
+		t.Fatalf("Send turn 2: %v", err)
+	}
+	rec.waitSettled(t, 1)
+	// The partner shape lands two pauses after the first settle; the next
+	// turn's completion only after a third. Sample inside that window.
+	time.Sleep(2*mockCodexStderrBurstPause + mockCodexStderrBurstPause/2)
+	if _, n := rec.counts(); n != 1 {
+		t.Fatalf("settled %d turns after turn 1's paired completions, want 1 — the stderr burst split the pair and settled turn 2 early", n)
+	}
+	rec.waitSettled(t, 2)
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if _, n := rec.counts(); n != 2 {
+		t.Fatalf("settled %d times, want exactly one settle per turn", n)
 	}
 }
 

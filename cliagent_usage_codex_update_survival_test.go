@@ -198,3 +198,46 @@ func TestCodexOwedRefresh_RefusedInterruptedConversionIsRetried(t *testing.T) {
 		t.Fatalf("interrupted run must read as owed after the retry: %+v", state)
 	}
 }
+
+// The startup replay reconciles BEFORE a refused interrupted-to-owed conversion
+// is on disk, so that attempt is never counted against the debt, and the
+// conversion that finally lands resets the count to zero. The worker must run
+// whenever a conversion was retained — even when the replay's own final flush
+// lands it — or routine gathers force scan after scan without ever counting an
+// attempt, and a run whose telemetry never appears never reaches the warning.
+func TestCodexOwedRefresh_RefusedConversionStillSpendsTheWorkerAttempts(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-5 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexRecordRunFreshness(f.fp, runStart, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, runStart)
+	})
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	simulateCodexAgentRestart(t)
+	// Wedge the in-process gate across the conversion (refused after the 50ms
+	// wait) but not the replay's trailing flush, which lands the debt.
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("refused startup conversion left the interrupted run un-owed: %+v", snap)
+	}
+	// No rollout evidence exists, so the worker's attempts all come up empty
+	// and must be COUNTED: that count is what lets the card explain itself.
+	if snap.RefreshOwedAttempts < codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("RefreshOwedAttempts=%d, want the worker's %d attempts spent on the retained debt", snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, time.Now())); notice == "" {
+		t.Fatal("want the stale-run notice once the retained debt's attempts are spent")
+	}
+}

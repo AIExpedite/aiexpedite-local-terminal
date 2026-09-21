@@ -196,14 +196,17 @@ type CodexAppServerSession struct {
 	// once more than codexAppServerCompletionPairFrameSpan frames have been
 	// read past it.
 	//
-	// That bound is measured in STREAM POSITION (the frame's seq), not elapsed
-	// wall time: the scanner settles a frame and then blocks in publishOrFail,
-	// which can park for as long as the publish queue is stalled, so two
-	// frames adjacent on the wire can reach this layer seconds apart. A
-	// position span describes what the pairing actually means — the partner
-	// announcement follows immediately, a different turn's completion is
-	// separated by that turn's own output — and is immune to how long
-	// publishing took in between.
+	// That bound is measured in STREAM POSITION (the frame's ordinal on
+	// STDOUT), not elapsed wall time: the scanner settles a frame and then
+	// blocks in publishOrFail, which can park for as long as the publish queue
+	// is stalled, so two frames adjacent on the wire can reach this layer
+	// seconds apart. A position span describes what the pairing actually means
+	// — the partner announcement follows immediately, a different turn's
+	// completion is separated by that turn's own output — and is immune to how
+	// long publishing took in between. It is NOT the publication seq: that
+	// counter is shared with the stderr scanner, so a burst of diagnostics
+	// between two adjacent stdout frames would lapse a credit whose partner is
+	// the very next protocol frame.
 	usageCreditShape string
 	usageCreditFrame int64
 	// usageOverflowTurns / usageOverflowFloor stand in for turns dropped from
@@ -361,7 +364,8 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 // predates the last run" notice.
 //
 // `shape` is the completion's label (codexRunCompletionShape) and `frame` its
-// position in the stream (the scanner's seq for that line). A turn may
+// position on the stdout stream (the scanner's stdout-only line ordinal, never
+// the publication seq the stderr scanner also advances). A turn may
 // announce its end in two shapes back to back; the second is the SAME turn
 // finishing, not the next one, so it spends the credit the first left instead
 // of popping another floor. A credit only stands for the turn that left it
@@ -1147,8 +1151,11 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// started, exactly like a terminal `codex` session's terminal
 			// event. The frame shapes live in the usage layer, so this file
 			// still knows no JSON-RPC semantics.
+			// Pairing is measured against the stdout-only line ordinal:
+			// `seq` is shared with the stderr scanner, and diagnostics
+			// must not push a turn's two completion shapes apart.
 			if shape := codexRunCompletionShape(trimmed); shape != "" {
-				session.settleUsageRun(shape, seq)
+				session.settleUsageRun(shape, int64(lineCount))
 			} else if codexRunProgressFrame(trimmed) {
 				session.openUsageRun(time.Now())
 			}

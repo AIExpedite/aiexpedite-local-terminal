@@ -687,6 +687,67 @@ func TestCodexRefreshAfterRun_RetainsDebtWhenTheCacheWriteIsRefused(t *testing.T
 	}
 }
 
+// A refused settle write is a lock race, not a reconcile: landing the retained
+// debt gets its own write budget and must not spend the two reconcile attempts,
+// or the worker retires with the debt still only in memory — never retried
+// without another Codex run, and dropped outright by a restart.
+func TestCodexRefreshAfterRun_RetainedDebtOutlivesTheReconcileAttempts(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	prevAttempts, prevDelay := codexRunFloorWriteAttempts, codexRunFloorWriteRetryDelay
+	codexRunFloorWriteAttempts, codexRunFloorWriteRetryDelay = 3, 100*time.Millisecond
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
+	t.Cleanup(func() {
+		codexRunFloorWriteAttempts, codexRunFloorWriteRetryDelay = prevAttempts, prevDelay
+		codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll
+	})
+
+	// Wedge the in-process gate past both reconcile attempts (the fixture's
+	// 10ms retry) but inside the write budget's third try.
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+
+	triggerCodexUsageRefreshAfterRun(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("retained debt never landed once the reconcile attempts were spent: %+v", snap)
+	}
+	if _, still := codexUsageRefresh.takeDebt(f.fp); still {
+		t.Fatal("debt landed on disk but is still retained in the gate")
+	}
+}
+
+// A debt the worker could not land at all is flushed by the next gather: the
+// parser reads the debt off disk, so a debt retained only in memory would read
+// as paid and the gather would neither force a scan nor warn.
+func TestCodexReconcileForGather_LandsARetainedDebt(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexUsageRefresh.rememberDebt(f.fp, codexPendingRunDebt{floor: runStart, completedAt: now})
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
+	defer cancel()
+	codexReconcileForGather(ctx, codexHomeBase(), f.fp, now, false)
+
+	state := codexRunFreshnessForAccount(f.fp, now)
+	if !state.owed || state.floor.UnixMilli() != runStart.UnixMilli() {
+		t.Fatalf("gather left the retained debt off disk: %+v", state)
+	}
+	if !codexGateHasRun(f.fp) {
+		t.Fatal("gather did not force a reconcile on the debt it had just landed")
+	}
+}
+
 func TestCodexRateLimitCacheTransaction_BoundedWaitOnWedgedLocks(t *testing.T) {
 	now := time.Now()
 	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
