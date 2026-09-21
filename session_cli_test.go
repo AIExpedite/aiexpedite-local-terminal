@@ -29,6 +29,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -3945,5 +3946,62 @@ func TestSessionLifecycle_CodexInitialPromptArmsOnlyAfterDelivery(t *testing.T) 
 	delivered.settleCodexUsageRun()
 	if settled := rec.waitSettled(t, 1); !settled[0].Equal(startedAt) {
 		t.Fatalf("settled with floor %s, want %s", settled[0], startedAt)
+	}
+}
+
+// SendInput gives up on a stdin write after ten seconds, but it neither closes
+// the pipe nor kills the child: the abandoned writer can still deliver the
+// prompt. That turn reaches codex, so it must arm a run — an unarmed one makes
+// both terminal-event and exit settlement no-ops and skips the post-run
+// utilization refresh entirely.
+func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CLISession{Command: "codex", done: make(chan struct{})}
+
+	writeDone := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		session.armCodexUsageRunOnLateWrite(writeDone)
+		close(done)
+	}()
+	writeDone <- nil
+	<-done
+
+	started, settled := rec.counts()
+	if started != 1 {
+		t.Fatalf("started=%d, want the late write to arm exactly one run", started)
+	}
+	if settled != 0 {
+		t.Fatalf("settled=%d, want the live session's own settle path to close the run", settled)
+	}
+
+	// The same write landing after the session ended is armed AND settled
+	// here: the exit path already ran its settle and found nothing armed.
+	close(session.done)
+	session.codexUsageFloorMs.Store(0)
+	late := make(chan error, 1)
+	late <- nil
+	session.armCodexUsageRunOnLateWrite(late)
+	if started, settled = rec.counts(); started != 2 || settled != 1 {
+		t.Fatalf("started=%d settled=%d, want the post-exit write armed and settled once", started, settled)
+	}
+}
+
+// A write that fails, or one still blocked when the session ends, delivered
+// nothing: no run may be armed for it.
+func TestSendInputLateStdinWrite_IgnoresAFailedOrAbandonedWrite(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+
+	failed := &CLISession{Command: "codex", done: make(chan struct{})}
+	writeDone := make(chan error, 1)
+	writeDone <- errors.New("broken pipe")
+	failed.armCodexUsageRunOnLateWrite(writeDone)
+
+	abandoned := &CLISession{Command: "codex", done: make(chan struct{})}
+	close(abandoned.done)
+	abandoned.armCodexUsageRunOnLateWrite(make(chan error, 1))
+
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want no run for an undelivered prompt", started, settled)
 	}
 }

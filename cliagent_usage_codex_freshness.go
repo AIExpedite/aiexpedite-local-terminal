@@ -918,8 +918,31 @@ func codexRebaseFutureRunFreshnessForAccount(fp string, view codexCacheView, now
 		return false
 	}
 	return codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
-		codexRebaseFutureRunFreshness(snap, now, now)
+		// A run that still owes a refresh is the whole reason this path runs
+		// at startup, and its markers are exactly the state the rebase drops.
+		// The write side can afford that — the run arming right then owes its
+		// own debt immediately after — but here nothing re-owes it, and the
+		// restart would forget the post-run refresh in precisely the
+		// self-update case the replay exists to recover. So the debt is
+		// carried over rather than deleted: re-owed against `now`, the only
+		// trustworthy reading, with the rebased observations left behind it so
+		// the forced reconcile still has to find real telemetry to pay it.
+		owing := codexRunFreshnessOwing(snap, now)
+		if !codexRebaseFutureRunFreshness(snap, now, now) {
+			return
+		}
+		if owing && !codexRunFreshnessOwing(snap, now) {
+			codexOweRunRefresh(snap, now, now)
+		}
 	})
+}
+
+// codexRunFreshnessOwing reports whether the snapshot still has a run whose
+// utilization is unobserved — owed, or interrupted — classified exactly as the
+// read side classifies it, from inside the transaction that is mutating it.
+func codexRunFreshnessOwing(snap *codexRateLimitSnapshot, now time.Time) bool {
+	state := codexRunFreshnessFromView(codexCacheViewFromSnapshot(*snap), now)
+	return state.owed || state.interrupted
 }
 
 // codexDisarmRunFloor rolls back a start codexArmRunFloor recorded for a run

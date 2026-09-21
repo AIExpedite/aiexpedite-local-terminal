@@ -913,6 +913,42 @@ func (s *CLISession) armCodexUsageRun(at time.Time) {
 	codexUsageRunStarted(time.UnixMilli(floor))
 }
 
+// armCodexUsageRunOnLateWrite arms the run for a stdin write SendInput stopped
+// waiting on. The timeout branch neither closes stdin nor kills the child, so
+// the abandoned writer can still deliver the prompt — and a turn that reached
+// codex with nothing armed makes both terminal-event and exit settlement
+// no-ops, skipping the post-run refresh it owes. The wait is bounded by the
+// session itself: once it is gone, a write still blocked on its stdin can
+// never reach the child.
+func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return
+		}
+	case <-s.done:
+		// The write may have landed in the same moment the session ended;
+		// only a still-blocked one is abandoned here.
+		select {
+		case err := <-writeDone:
+			if err != nil {
+				return
+			}
+		default:
+			return
+		}
+	}
+	s.armCodexUsageRun(time.Now())
+	// The prompt can arrive after the exit path has already run its settle,
+	// which found nothing armed. Settle here so the refresh is owed now,
+	// rather than left for the next process to recover as an interrupted run.
+	select {
+	case <-s.done:
+		s.settleCodexUsageRun()
+	default:
+	}
+}
+
 // settleCodexUsageRun hands the session's armed codex run to the freshness
 // path exactly once. No-op for a non-codex command, for a session whose prompt
 // never arrived (nothing armed), and for a run already settled by the earlier
@@ -1005,6 +1041,12 @@ func (sm *SessionManager) SendInput(id, text string) error {
 			return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
 		}
 	case <-time.After(10 * time.Second):
+		// The child is neither killed nor its stdin closed here, so the
+		// abandoned writer can still deliver this prompt. Keep watching it, so
+		// a codex turn that does reach the child still arms its run.
+		if isCodexCommand(session.Command) {
+			go session.armCodexUsageRunOnLateWrite(writeDone)
+		}
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}
 
