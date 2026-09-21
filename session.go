@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -187,7 +188,15 @@ type CLISession struct {
 	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
-	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
+	// shimmedChildTree marks a session whose Process is an INTERMEDIATE cmd.exe
+	// wrapper rather than the CLI itself — the Windows npm `grok.cmd` shim route
+	// the retained session_start maintenance smoke takes (newGrokSmokeCmd).
+	// Killing only that wrapper reparents the shim's Node/Grok child out of
+	// reach, leaking a provider process that still holds this session's
+	// stdout/stderr handles. killSessionProcess takes the whole tree down for
+	// these; every other session keeps the plain Process.Kill it always had.
+	shimmedChildTree bool
+	streamDone       chan struct{} // closed when stdout/stderr and stream publishes finish
 	// terminalPublishState reserves this session's ID while its session_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
@@ -275,6 +284,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// own remains an ordinary caller request; it must not silently opt into the
 	// smoke's auth/config isolation policy.
 	grokMaintenanceSmoke := false
+	var grokSmokePrompt string
 	if isGrokCommand(command) {
 		args, grokMaintenanceSmoke = extractGrokMaintenanceSmokeControl(args)
 	}
@@ -286,9 +296,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		if arg, ok := grokNoToolsExternalLoaderArg(args); ok {
 			return fmt.Errorf("grok maintenance smoke cannot use external-loader or workspace/session option %q", arg)
 		}
-		if contractErr := validateGrokMaintenanceSmokeRequestArgs(args); contractErr != nil {
+		prompt, contractErr := validateGrokSmokeRequest(args)
+		if contractErr != nil {
 			return contractErr
 		}
+		grokSmokePrompt = prompt
 	}
 
 	// Build the CLI command with appropriate flags for structured streaming.
@@ -311,6 +323,21 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		cliArgs = seeded
 	}
 
+	// The maintenance smoke (here) and rewriteGrokPromptToFile (below) may
+	// create an on-disk prompt temp file. waitForExit owns the eventual
+	// removal, but it only runs once proc.Start() has succeeded AND a
+	// CLISession has been registered — every pipe/Start error path below this
+	// point returns early and would otherwise leak the file. Disarm this defer
+	// once the session has taken ownership.
+	var promptFile string
+	grokSmokeShimmed := false
+	sessionOwnsPromptFile := false
+	defer func() {
+		if promptFile != "" && !sessionOwnsPromptFile {
+			_ = os.Remove(promptFile)
+		}
+	}()
+
 	// Grok's `--tools` selector filters built-in tools only. An explicitly
 	// identified maintenance smoke must also be isolated from user-installed
 	// plugins and MCP discovery. Reuse the ACP auth-only home, but omit its
@@ -318,9 +345,6 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// gain access to unrelated transcripts.
 	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome, executable string
 	if grokMaintenanceSmoke {
-		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
-			return contractErr
-		}
 		// Version overrides are part of every managed Grok config layer. Probe the
 		// exact binary that will be spawned, under the same maintenance-only env
 		// policy, so pre/post-update smokes evaluate only the patch applicable to
@@ -351,6 +375,30 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			_ = removeIsolatedGrokHome(isolatedGrokHome)
 			isolatedGrokHome = ""
 			return fmt.Errorf("grok no-tools working-directory isolation failed; refusing to spawn in caller workspace")
+		}
+		// The child argv comes from the smoke ladder (grok_argv.go), NOT from the
+		// general builder's output above: the signed wire request carries an
+		// empty `--tools` operand that a Windows `.cmd` shim re-parse can drop,
+		// and the canonical shape has no empty element. The prompt — and the
+		// marker it carries — is staged in a 0600 file so it never sits on
+		// argv. The rung is the one the `__cli_smoke__` probe already resolved
+		// for this exact binary when it has; otherwise this streaming path —
+		// which spawns ONE child and cannot walk the ladder — takes the rung
+		// the probed version documents, so an older publisher's pre-update
+		// smoke against a build that predates the isolation switches is not
+		// rejected during option parsing before it can bless the upgrade.
+		stagedPrompt, promptErr := writeGrokPromptFile(grokSmokePrompt)
+		if promptErr != nil {
+			_ = removeIsolatedGrokHome(isolatedGrokHome)
+			isolatedGrokHome = ""
+			return fmt.Errorf("grok maintenance smoke could not stage its prompt file; refusing to place the prompt on argv")
+		}
+		promptFile = stagedPrompt
+		cliArgs = buildGrokNoToolsSmokeArgs(grokSmokeShapeLadder(executable, grokVersion)[0], promptFile)
+		if contractErr := validateGrokSmokeShape(cliArgs); contractErr != nil {
+			_ = removeIsolatedGrokHome(isolatedGrokHome)
+			isolatedGrokHome = ""
+			return contractErr
 		}
 	}
 	isolationOwnedBySession := false
@@ -429,22 +477,10 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// Windows command-line-length cap ("command line too long"). grok accepts
 	// `--prompt-file <path>` as a drop-in for `-p <prompt>`, so relocate the
 	// prompt into a temp file. promptFile is removed after the process exits.
-	var promptFile string
-	if isGrokCommand(command) {
+	// A maintenance smoke already staged its prompt file above.
+	if isGrokCommand(command) && !grokMaintenanceSmoke {
 		cliArgs, promptFile = rewriteGrokPromptToFile(cliArgs)
 	}
-
-	// rewriteGrokPromptToFile may have created an on-disk temp file. waitForExit
-	// owns the eventual removal, but it only runs once proc.Start() has
-	// succeeded AND a CLISession has been registered — every pipe/Start error
-	// path below this point returns early and would otherwise leak the file.
-	// Disarm this defer once the session has taken ownership.
-	sessionOwnsPromptFile := false
-	defer func() {
-		if promptFile != "" && !sessionOwnsPromptFile {
-			_ = os.Remove(promptFile)
-		}
-	}()
 
 	// Resolve executable path
 	if executable == "" {
@@ -481,6 +517,28 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		}
 	}
 	proc.Env = filtered
+	if grokMaintenanceSmoke {
+		// Same launcher the `__cli_smoke__` probe uses (newGrokSmokeCmd): on
+		// Windows the npm `grok.cmd` shim cannot be started by CreateProcess
+		// directly, so the child is routed through cmd.exe with an explicit
+		// command line that carries the two paths in the environment — the
+		// version probe above already took that route, and a direct spawn here
+		// would fail before the marker exactly as the un-shimmed probe did. A
+		// native binary spawns directly, with the env and cwd resolved above.
+		// The shim route hands us an intermediate cmd.exe, not grok itself, and
+		// this launch supplies a background context — so exec's own Cancel (the
+		// tree kill bindGrokShimProcessTree installs) can never fire here.
+		// Record the wrapper so every session kill path takes the tree down
+		// instead of orphaning the shim's Node child on the output handles.
+		grokSmokeShimmed = isGrokWindowsShim(executable)
+		proc = newGrokSmokeCmd(context.Background(), grokSmokeLaunch{
+			Path:       executable,
+			Args:       cliArgs,
+			Env:        proc.Env,
+			Dir:        proc.Dir,
+			PromptFile: promptFile,
+		})
+	}
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)
@@ -700,6 +758,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
+		shimmedChildTree:   grokSmokeShimmed,
 	}
 
 	sm.sessions[id] = session
@@ -912,7 +971,7 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 		fmt.Printf("%s[session] Interrupt sent to %s%s\n", colorYellow, id, colorReset)
 	case "kill":
 		// Force kill
-		if err := session.Process.Process.Kill(); err != nil {
+		if err := killSessionProcess(session); err != nil {
 			return fmt.Errorf("failed to kill session %s: %w", id, err)
 		}
 		fmt.Printf("%s[session] Kill sent to %s%s\n", colorRed, id, colorReset)
@@ -921,6 +980,35 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 	}
 
 	return nil
+}
+
+// killSessionProcess force-kills a session's child.
+//
+// For an ordinary session this is exactly the Process.Kill it has always been.
+// For a session whose child is a cmd.exe wrapper (shimmedChildTree — the
+// Windows `grok.cmd` smoke route) the whole tree goes down FIRST, because
+// killing cmd.exe on its own reparents the shim's real Grok/Node child out of
+// `taskkill /T`'s reach. Reuses KillProcessTree (processes_windows.go), the
+// same teardown cleanup_windows.go and bindGrokShimProcessTree use; it is a
+// no-op error on non-Windows, which is swallowed.
+//
+// A successful tree kill IS the kill: `taskkill /F /T` reaps the cmd.exe root
+// along with its descendants, so the follow-up Process.Kill lands on an
+// already-terminated handle and Windows reports it as TerminateProcess
+// "Access is denied". That is not a failed kill and must not be surfaced as
+// one to the shutdown paths; the follow-up stays as best-effort insurance for
+// a root taskkill enumerated but had not yet torn down.
+func killSessionProcess(session *CLISession) error {
+	if session == nil || session.Process == nil || session.Process.Process == nil {
+		return os.ErrProcessDone
+	}
+	if session.shimmedChildTree {
+		if err := KillProcessTree(session.Process.Process.Pid); err == nil {
+			_ = session.Process.Process.Kill()
+			return nil
+		}
+	}
+	return session.Process.Process.Kill()
 }
 
 /* --------------------------------------------------------------------------
@@ -972,7 +1060,7 @@ func (sm *SessionManager) EndSession(id string) error {
 			return fmt.Errorf("session %s not found", id)
 		}
 		if session.Process.Process != nil {
-			if killErr := session.Process.Process.Kill(); killErr != nil {
+			if killErr := killSessionProcess(session); killErr != nil {
 				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 			}
 		}
@@ -995,7 +1083,7 @@ func (sm *SessionManager) EndSession(id string) error {
 		// Force kill after timeout
 		fmt.Printf("%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
 			colorRed, id, colorReset)
-		if killErr := session.Process.Process.Kill(); killErr != nil {
+		if killErr := killSessionProcess(session); killErr != nil {
 			fmt.Printf("%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 		}
 		// BOUNDED wait for exit after kill — see end_confirm.go for why
@@ -1890,7 +1978,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 			fmt.Printf("%s[session] Session %s timed out after %dms — killing%s\n",
 				colorYellow, session.ID, session.TimeoutMs, colorReset)
 			if session.Process.Process != nil {
-				session.Process.Process.Kill()
+				_ = killSessionProcess(session)
 			}
 		})
 	}
@@ -3305,14 +3393,33 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	}
 	prompt := cliArgs[n-1]
 
-	// Write under the AI Expedite scratch root (`~/.ai-expedite/grok-prompts/`)
-	// — the same parent the documentRequirements / documentDesign agents use for
-	// their feature scratch files — rather than the OS temp dir. grokPromptTempDir
-	// returns "" on any failure, in which case CreateTemp falls back to the OS
-	// temp dir (still works; just not co-located with the other scratch files).
-	f, err := os.CreateTemp(grokPromptTempDir(), "grok-prompt-*.txt")
+	tempPath, err := writeGrokPromptFile(prompt)
 	if err != nil {
 		return cliArgs, ""
+	}
+
+	// Replace the trailing `-p <value>` pair with `--prompt-file <tempPath>`.
+	rewritten := make([]string, 0, n)
+	rewritten = append(rewritten, cliArgs[:n-2]...)
+	rewritten = append(rewritten, "--prompt-file", tempPath)
+	return rewritten, tempPath
+}
+
+// writeGrokPromptFile stages one prompt in a private temp file and returns its
+// path. The caller owns removal once the child has been reaped. Shared by the
+// session-path rewrite above and the maintenance smoke (cliagent_smoke_grok.go),
+// so a prompt — and the marker nonce a smoke prompt carries — reaches Grok
+// through exactly one mechanism that never touches argv.
+//
+// Written under the AI Expedite scratch root (`~/.ai-expedite/grok-prompts/`)
+// — the same parent the documentRequirements / documentDesign agents use for
+// their feature scratch files — rather than the OS temp dir. grokPromptTempDir
+// returns "" on any failure, in which case CreateTemp falls back to the OS
+// temp dir (still works; just not co-located with the other scratch files).
+func writeGrokPromptFile(prompt string) (string, error) {
+	f, err := os.CreateTemp(grokPromptTempDir(), "grok-prompt-*.txt")
+	if err != nil {
+		return "", err
 	}
 	tempPath := f.Name()
 	// The file holds only the prompt; lock it down to the owner (0600). On
@@ -3325,178 +3432,23 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	if _, writeErr := f.WriteString(prompt); writeErr != nil {
 		f.Close()
 		_ = os.Remove(tempPath)
-		return cliArgs, ""
+		return "", writeErr
 	}
 	if closeErr := f.Close(); closeErr != nil {
 		_ = os.Remove(tempPath)
-		return cliArgs, ""
+		return "", closeErr
 	}
-
-	// Replace the trailing `-p <value>` pair with `--prompt-file <tempPath>`.
-	rewritten := make([]string, 0, n)
-	rewritten = append(rewritten, cliArgs[:n-2]...)
-	rewritten = append(rewritten, "--prompt-file", tempPath)
-	return rewritten, tempPath
+	return tempPath, nil
 }
 
-// grokMaintenanceSmokeControlArg is an AI Expedite-only in-process control
-// derived from the signed session_start contract. It is consumed before Grok
-// argv shaping and must never be forwarded to the CLI.
-const grokMaintenanceSmokeControlArg = "--aiexpedite-maintenance-smoke"
-
-const grokMaintenanceSmokePromptPrefix = "Return exactly this marker and nothing else: "
-
-// extractGrokMaintenanceSmokeControl removes the internal maintenance-smoke
-// token and reports whether it was present. Keeping the signal separate from
-// --tools preserves ordinary no-tools invocations and their normal auth/config
-// behavior.
-func extractGrokMaintenanceSmokeControl(args []string) ([]string, bool) {
-	requested := false
-	cleaned := make([]string, 0, len(args))
-	for _, arg := range args {
-		if arg == grokMaintenanceSmokeControlArg {
-			requested = true
-			continue
-		}
-		cleaned = append(cleaned, arg)
-	}
-	return cleaned, requested
-}
-
-// grokMaintenanceSmokeRequest recognises the updater's reserved marker prompt
-// envelope. Args are part of commandMsg's HMAC payload, so deriving the private
-// control bit here keeps it authenticated without adding a new wire field that
-// older publishers cannot sign. StartSession then validates the exact canonical
-// request before spawning; malformed marker requests are promoted specifically
-// so they fail closed instead of falling through as ordinary Grok sessions.
-func grokMaintenanceSmokeRequest(args []string) bool {
-	cleaned, _ := extractGrokMaintenanceSmokeControl(args)
-	shaped := buildGrokInteractiveArgs(cleaned, false)
-	for i, arg := range shaped {
-		if arg != "-p" || i+1 >= len(shaped) {
-			continue
-		}
-		return validGrokMaintenanceSmokePrompt(shaped[i+1])
-	}
-	return false
-}
-
-func validGrokMaintenanceSmokePrompt(prompt string) bool {
-	marker := strings.TrimPrefix(prompt, grokMaintenanceSmokePromptPrefix)
-	return marker != prompt && strings.TrimSpace(marker) != "" && !strings.ContainsAny(marker, "\r\n")
-}
-
-// validateGrokMaintenanceSmokeRequestArgs accepts only the updater's canonical
-// signed wire argv. In particular, permission, model/provider, system-prompt,
-// schema, sandbox, rules, and debug-output options are rejected before the
-// general builder can strip or normalize them. The error is deliberately fixed
-// text so an option value containing credentials or a private path is never
-// reflected into a published session error.
-func validateGrokMaintenanceSmokeRequestArgs(args []string) error {
-	if len(args) != 8 ||
-		args[0] != "--tools" || args[1] != "" ||
-		args[2] != "--disable-web-search" ||
-		args[3] != "--no-subagents" ||
-		args[4] != "--max-turns" || args[5] != "1" ||
-		args[6] != "--verbatim" ||
-		!validGrokMaintenanceSmokePrompt(args[7]) {
-		return fmt.Errorf("grok maintenance smoke must use the exact no-tools single-turn contract")
-	}
-	return nil
-}
-
-// grokArgsRequestNoTools validates the smoke's explicit empty built-in-tool
-// filter. It is not itself a maintenance-smoke classifier; the separate signed
-// control token above selects that behavior.
-func grokArgsRequestNoTools(args []string) bool {
-	if len(args) < 5 || args[0] != "--output-format" || args[1] != "streaming-json" || args[2] != "--no-auto-update" {
-		return false
-	}
-	hasManagedPrompt := false
-	for i := 3; i < len(args); i++ {
-		if args[i] == "-p" && i+1 < len(args) {
-			hasManagedPrompt = true
-			break
-		}
-	}
-	if !hasManagedPrompt {
-		return false
-	}
-	count := 0
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case strings.HasPrefix(arg, "--tools="):
-			count++
-			if arg != "--tools=" {
-				return false
-			}
-		case arg == "--tools":
-			count++
-			if i+1 >= len(args) || args[i+1] != "" {
-				return false
-			}
-			i++
-		}
-	}
-	return count == 1
-}
-
-// validateGrokMaintenanceSmokeContract verifies the final child argv after the
-// general Grok builder has injected its protocol controls. Keeping this exact
-// prevents future builder changes from silently adding an approval, provider,
-// filesystem, or response-shaping option to the maintenance child.
-func validateGrokMaintenanceSmokeContract(args []string) error {
-	if len(args) != 12 ||
-		args[0] != "--output-format" || args[1] != "streaming-json" ||
-		args[2] != "--no-auto-update" ||
-		args[3] != "--tools" || args[4] != "" ||
-		args[5] != "--disable-web-search" ||
-		args[6] != "--no-subagents" ||
-		args[7] != "--max-turns" || args[8] != "1" ||
-		args[9] != "--verbatim" || args[10] != "-p" ||
-		!validGrokMaintenanceSmokePrompt(args[11]) {
-		return fmt.Errorf("grok maintenance smoke child argv violates the exact no-tools single-turn contract")
-	}
-	return nil
-}
-
-// grokNoToolsExternalLoaderArg rejects caller-controlled loader surfaces that
-// would defeat the isolated no-tools home. It returns only the canonical flag
-// name, never an equals-form value: those values can contain credentials, raw
-// agent JSON, or private file paths and are interpolated into a published start
-// error by StartSession.
-func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
-	for _, arg := range args {
-		lower := strings.ToLower(arg)
-		for _, name := range []string{
-			"--plugin-dir", "--config", "--agent", "--agents",
-			"--cwd", "-w", "--worktree", "--worktree-ref", "--ref",
-			"-r", "--resume", "-c", "--continue", "-s", "--session-id",
-			"--fork-session", "--restore-code", "--leader-socket",
-		} {
-			if lower == name || strings.HasPrefix(lower, name+"=") {
-				return name, true
-			}
-		}
-	}
-	return "", false
-}
-
-// sanitizeGrokMaintenanceSmokeEnv is stricter than the reusable ACP sanitizer:
-// maintenance smokes must not inherit any Grok execution, routing, logging, or
-// extension-discovery override. Grok's environment surface grows independently
-// of this agent, so a denylist is unsafe here: strip every inherited GROK_* and
-// OTEL_* variable, plus related xAI endpoint and Rust diagnostic controls, then
-// add back only fixed-off compatibility/tool-scanner controls. OTEL_* must be
-// removed even though GROK_EXTERNAL_OTEL is also stripped: a system managed
-// `[telemetry] otel_enabled = true` survives GROK_HOME isolation and otherwise
-// turns inherited exporter/content controls back on. This also prevents
-// GROK_LOG_FILE from persisting raw diagnostics outside the isolated home and
-// RUST_LOG/RUST_BACKTRACE or an OTEL console exporter from adding non-protocol
-// output to the exact marker.
+// grokMaintenanceSmokeVersionProbeFn probes the exact binary the session-path
+// maintenance smoke will spawn, through the one shim-aware Grok version probe
+// (grokProbeVersion, cliagent_smoke_grok.go) — same maintenance-only env
+// policy, and on Windows an npm `grok.cmd` shim answers through cmd.exe
+// instead of failing CreateProcess and failing this smoke closed. A var so
+// tests can pin the reported version without executing a stub.
 var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
-	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
+	return grokProbeVersion(executable)
 }
 
 // resolveGrokMaintenanceSmokeExecutable returns the binary the maintenance
@@ -3522,39 +3474,6 @@ func resolveGrokMaintenanceSmokeExecutable(command, cwd string) string {
 		return filepath.Clean(filepath.Join(base, executable))
 	}
 	return filepath.Clean(filepath.Join(absBase, executable))
-}
-
-func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
-	base := sanitizeGrokACPEnv(env, false)
-	filtered := make([]string, 0, len(base)+2)
-	for _, entry := range base {
-		name, _, _ := strings.Cut(entry, "=")
-		upper := strings.ToUpper(name)
-		if strings.HasPrefix(upper, "GROK_") || strings.HasPrefix(upper, "OTEL_") || upper == "XAI_API_BASE_URL" ||
-			upper == "RUST_LOG" || upper == "RUST_BACKTRACE" || upper == "RUST_LIB_BACKTRACE" {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	for _, name := range grokNeutralisedIntegrationSwitches {
-		filtered = setEnvVar(filtered, name, "0")
-	}
-	return filtered
-}
-
-// grokNeutralisedIntegrationSwitches are the workspace-integration switches a
-// non-interactive Grok child runs with forced OFF — the maintenance smoke and
-// the model-list probe (cliagent_models.go) both pin them so the child neither
-// loads editor skills/rules/MCPs nor writes session state.
-var grokNeutralisedIntegrationSwitches = []string{
-	"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
-	"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
-	"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
-	"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
-	"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
-	"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
-	"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
-	"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
 }
 
 // buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot

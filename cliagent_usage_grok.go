@@ -160,20 +160,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// it fetched for itself; when that log has a usable record we plot it and
 	// take the subscription tier from the same record (the auth file rarely
 	// carries a plan).
-	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
-	// A live reading (cliagent_usage_grok_live.go — the Refresh click asks xAI
-	// directly) replaces the log's record whenever it is the newer observation;
-	// the TUI writing a fresher line afterwards wins back the same way.
-	if live, liveOK := loadGrokBillingLiveSnapshot(usage.AccountFingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
-		// The billing response carries the credit pool, not the plan name —
-		// only the TUI's log line states the tier. Carry the log's tier across
-		// so a live refresh doesn't blank the displayed plan; a later log line
-		// that states a tier still overrides it the next time the log wins.
-		if live.SubscriptionTier == "" && ok {
-			live.SubscriptionTier = snap.SubscriptionTier
-		}
-		snap, ok = live, true
-	}
+	snap, ok := grokNewestBillingObservation(base, usage.AccountFingerprint)
 	if ok {
 		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
@@ -268,6 +255,45 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	}
 
 	return usage, true
+}
+
+// grokNewestBillingObservation resolves the ONE billing observation the card
+// publishes for the account signed in now: the NEWEST of every local source,
+// so no older source can pin a stale `observedAt`.
+//
+// The sources, and who writes them:
+//   - the persistent log tail (readGrokBillingSnapshot) — a direct (PTY) run's
+//     own `billing: fetched credits config` record, attributed by the identity
+//     line the session start appends; AND every managed run's record (an ACP
+//     session, a session_start smoke, a `__cli_smoke__` probe), which
+//     persistGrokManagedBillingSnapshot merges here from the isolated home;
+//   - the live billing cache (loadGrokBillingLiveSnapshot) — the Refresh
+//     click asking xAI directly.
+//
+// Whichever carries the later ObservedAt wins; the TUI writing a fresher line
+// afterwards wins back the same way. This is what makes "usage freshens after
+// an upgrade" hold for a direct run, a terminal (session) run and a smoke
+// alike: each advances one of these sources, and the newest is what refresh
+// reports.
+//
+// The account gate is upstream of this choice and is never widened by it: a
+// log record whose producer identity does not name the current account is
+// refused by readGrokBillingSnapshot, and a live entry cached under another
+// fingerprint is refused by loadGrokBillingLiveSnapshot — an older reading is
+// never "aged forward" by a foreign newer one.
+func grokNewestBillingObservation(base, fingerprint string) (grokBillingSnapshot, bool) {
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	if live, liveOK := loadGrokBillingLiveSnapshot(fingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
+		// The billing response carries the credit pool, not the plan name —
+		// only the TUI's log line states the tier. Carry the log's tier across
+		// so a live refresh doesn't blank the displayed plan; a later log line
+		// that states a tier still overrides it the next time the log wins.
+		if live.SubscriptionTier == "" && ok {
+			live.SubscriptionTier = snap.SubscriptionTier
+		}
+		return live, true
+	}
+	return snap, ok
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,

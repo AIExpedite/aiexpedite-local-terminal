@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -199,6 +200,12 @@ func grokWindowsRemoveJunctionCommand(link string) *exec.Cmd {
 }
 
 func grokWindowsCommand(script string) *exec.Cmd {
+	return grokWindowsCommandContext(context.Background(), script)
+}
+
+// grokWindowsCommandContext is grokWindowsCommand bound to a context, for
+// callers with a per-attempt deadline (the maintenance smoke's shim route).
+func grokWindowsCommandContext(ctx context.Context, script string) *exec.Cmd {
 	executable := os.Getenv("ComSpec")
 	if executable == "" {
 		if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
@@ -207,7 +214,7 @@ func grokWindowsCommand(script string) *exec.Cmd {
 			executable = "cmd"
 		}
 	}
-	cmd := exec.Command(executable, "/d", "/v:off", "/c", script)
+	cmd := exec.CommandContext(ctx, executable, "/d", "/v:off", "/c", script)
 	configureGrokWindowsCommandLine(cmd, script)
 	// The isolated GROK_HOME is linked from background work (usage refresh,
 	// model discovery) on a tray agent with no console of its own, so this

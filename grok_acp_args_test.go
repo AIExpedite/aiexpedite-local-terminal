@@ -165,9 +165,39 @@ func TestBuildGrokACPArgs_RejectsRootOnlyNoToolsSmoke(t *testing.T) {
 			t.Fatalf("buildGrokACPArgs(%#v) = %#v, %v; want explicit rejection", args, got, err)
 		}
 		if !strings.Contains(err.Error(), "does not support root-only option") ||
-			!strings.Contains(err.Error(), "session_start") {
+			!strings.Contains(err.Error(), cliSmokeCommand) {
 			t.Fatalf("rejection is not actionable: %v", err)
 		}
+	}
+}
+
+// Every root-only one-shot flag stays REJECTED, never stripped: silently
+// dropping `--tools ""` would turn a requested no-tools smoke into a fully
+// tooled ACP session. The rejection points callers at the signed __cli_smoke__
+// command, which is where the Grok maintenance smoke now lives.
+func TestGrokACPRootOnlyArg_RejectsEveryOneShotFlagAndNamesCliSmoke(t *testing.T) {
+	for _, flag := range []string{
+		"--tools", "--tools=", "--disallowed-tools", "--max-turns", "--max-turns=1",
+		"--output-format", "--output-format=streaming-json", "--prompt-file", "--prompt-json",
+		"--json-schema", "--rules", "--system-prompt-override", "--sandbox",
+		"-p", "--single", "--disable-web-search", "--no-subagents", "--no-plan",
+		"--verbatim", "--include-partial-messages", "--fork-session", "--restore-code",
+	} {
+		args := []string{"--model", "grok-4", flag}
+		if _, ok := grokACPRootOnlyArg(args); !ok {
+			t.Errorf("root-only flag %q was not detected", flag)
+		}
+		got, err := buildGrokACPArgs(args, false)
+		if err == nil || got != nil {
+			t.Errorf("buildGrokACPArgs with %q = %#v, %v; want rejection, never a stripped argv", flag, got, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "session_start") || !strings.Contains(err.Error(), cliSmokeCommand) {
+			t.Errorf("rejection for %q must name %s, not session_start: %v", flag, cliSmokeCommand, err)
+		}
+	}
+	if _, ok := grokACPRootOnlyArg([]string{"--model", "grok-4", "--reasoning-effort", "high"}); ok {
+		t.Error("an ordinary ACP argv was flagged as root-only")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -120,7 +121,18 @@ func TestHandleCLISmokeCommand_UnknownCliIDNeverExecutes(t *testing.T) {
 		t.Fatal("unknown cliId must never spawn a child")
 		return nil, nil, nil
 	})
+	grokCalls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		t.Fatal("unknown cliId must never spawn a grok child")
+		return nil, nil, nil
+	})
 	published := capturePublishes(t)
+
+	// grok is a KNOWN provider now — it must not be in this list.
+	for _, known := range []string{"claudeCode", "grok"} {
+		if _, ok := cliSmokeProviders[known]; !ok {
+			t.Fatalf("%s is missing from cliSmokeProviders", known)
+		}
+	}
 
 	for _, cmd := range []commandMsg{smokeCommand("notACLI"), {ID: "cmd-2", Command: cliSmokeCommand}} {
 		if err := handleCLISmokeCommand(context.Background(), nil, cmd, &Config{AgentID: "a"}); err != nil {
@@ -139,40 +151,106 @@ func TestHandleCLISmokeCommand_UnknownCliIDNeverExecutes(t *testing.T) {
 			t.Errorf("result %d status = %q, want error", i, res.Status)
 		}
 	}
-	if *calls != 0 {
-		t.Fatalf("exec seam ran %d times for unknown cliIds", *calls)
+	if *calls != 0 || *grokCalls != 0 {
+		t.Fatalf("exec seams ran %d/%d times for unknown cliIds", *calls, *grokCalls)
+	}
+}
+
+// grok on the same signed channel: one correlated result, a marker verdict,
+// and — because the probe merges the child's billing record into the
+// persistent home — a newer Grok observation for the next signed refresh.
+func TestHandleCLISmokeCommand_GrokPublishesMarkerVerdictAndMergesBilling(t *testing.T) {
+	persistent := grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.13")
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		writeGrokSmokeBillingRecord(t, launch, time.Now())
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+	published := capturePublishes(t)
+
+	cfg := &Config{AgentID: "agent-9"}
+	if err := handleCLISmokeCommand(context.Background(), nil, smokeCommand("grok"), cfg); err != nil {
+		t.Fatalf("handler returned %v, want nil", err)
+	}
+
+	if len(*published) != 1 {
+		t.Fatalf("published %d messages, want exactly 1", len(*published))
+	}
+	res := (*published)[0]
+	if res.Type != cliSmokeResultType || res.RefreshID != "refresh-7" || res.ID != "cmd-1" {
+		t.Fatalf("result is not correlated to its command: %+v", res)
+	}
+	if res.Status != "success" || res.Smoke == nil || !res.Smoke.MarkerMatched || res.Smoke.CliID != "grok" {
+		t.Fatalf("healthy grok should publish a success verdict: %+v", res.Smoke)
+	}
+	if res.Smoke.ArgvShapeID != grokSmokeArgvShapes[0].ID {
+		t.Errorf("argvShapeId = %q, want the canonical rung", res.Smoke.ArgvShapeID)
+	}
+	if res.Output != "" {
+		t.Errorf("smoke result must carry no CLI output, got %q", res.Output)
+	}
+	if *calls != 1 {
+		t.Errorf("handler spent %d turns, want 1", *calls)
+	}
+	if snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent)); !ok || snap.SubscriptionTier != "SuperGrok" {
+		t.Fatalf("the smoke's billing record was not merged into the persistent home: ok=%t snap=%+v", ok, snap)
 	}
 }
 
 func TestMakeCLISmokeResult_PublishesMetricsOnly(t *testing.T) {
-	res := makeCLISmokeResult(smokeCommand("claudeCode"), &Config{AgentID: "agent-9"}, cliSmokeResult{
-		CliID:         "claudeCode",
-		Version:       "2.1.251 (Claude Code)",
-		Status:        cliSmokeStatusFailed,
-		ErrorCategory: cliUsageErrorProtocol,
-		DurationMs:    1234,
-		ArgvShapeID:   claudeArgvShapes[0].ID,
-		Diagnostic:    cliSmokeDiagnosticFramingRejected,
-	})
-
-	payload, err := json.Marshal(res)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(payload)
-	for _, want := range []string{
-		`"type":"__cli_smoke_result__"`, `"refreshId":"refresh-7"`,
-		`"status":"error"`, `"errorCategory":"protocol"`, `"argvShapeId":`,
+	for _, tc := range []struct {
+		name  string
+		smoke cliSmokeResult
+	}{
+		{"claudeCode", cliSmokeResult{
+			CliID:         "claudeCode",
+			Version:       "2.1.251 (Claude Code)",
+			Status:        cliSmokeStatusFailed,
+			ErrorCategory: cliUsageErrorProtocol,
+			DurationMs:    1234,
+			ArgvShapeID:   claudeArgvShapes[0].ID,
+			Diagnostic:    cliSmokeDiagnosticFramingRejected,
+		}},
+		{"grok", cliSmokeResult{
+			CliID:         "grok",
+			Version:       "grok 1.0.13",
+			Status:        cliSmokeStatusFailed,
+			ErrorCategory: cliUsageErrorProtocol,
+			DurationMs:    321,
+			ArgvShapeID:   grokSmokeArgvShapes[0].ID,
+			Diagnostic:    cliSmokeDiagnosticFlagRejected,
+		}},
 	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("published payload missing %s: %s", want, text)
-		}
-	}
-	// The published shape must have no room for prompt/marker/argv material.
-	for _, banned := range []string{"AIEXPEDITE_CLI_SMOKE_OK_", "Reply with exactly", "mcpServers"} {
-		if strings.Contains(text, banned) {
-			t.Errorf("published payload leaked %q: %s", banned, text)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			res := makeCLISmokeResult(smokeCommand(tc.name), &Config{AgentID: "agent-9"}, tc.smoke)
+
+			payload, err := json.Marshal(res)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(payload)
+			for _, want := range []string{
+				`"type":"__cli_smoke_result__"`, `"refreshId":"refresh-7"`, `"cliId":"` + tc.name + `"`,
+				`"status":"error"`, `"errorCategory":"protocol"`, `"argvShapeId":`, `"diagnostic":"` + tc.smoke.Diagnostic + `"`,
+			} {
+				if !strings.Contains(text, want) {
+					t.Errorf("published payload missing %s: %s", want, text)
+				}
+			}
+			// The published shape must have no room for prompt/marker/argv/config
+			// material — for either provider.
+			for _, banned := range []string{
+				claudeSmokeMarkerPrefix, grokSmokeMarkerPrefix, "Reply with exactly",
+				grokMaintenanceSmokePromptPrefix, "mcpServers", "--tools", "--print",
+				"--prompt-file", "auth.json", "config.toml", "GROK_HOME",
+			} {
+				if strings.Contains(text, banned) {
+					t.Errorf("published payload leaked %q: %s", banned, text)
+				}
+			}
+		})
 	}
 }
 

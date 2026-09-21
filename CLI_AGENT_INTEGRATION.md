@@ -78,7 +78,14 @@ The paragraph above says "use a non-session execute path that builds its own
 argv" — that path now **exists, is tested, and is the only sanctioned one**:
 `buildClaudeNonInteractivePrintArgs` in [claude_argv.go](claude_argv.go),
 driven by `runClaudeCodeSmoke` in
-[cliagent_smoke_claudecode.go](cliagent_smoke_claudecode.go).
+[cliagent_smoke_claudecode.go](cliagent_smoke_claudecode.go). The
+provider-agnostic half of the probe — the closed `cliSmokeDiagnostic*` set,
+the metric-only `cliSmokeResult`, the cooldown, the singleflight collapse and
+the per-binary resolved-shape cache — lives in
+[cliagent_smoke.go](cliagent_smoke.go) and is shared with the Grok smoke
+(see the Grok section below). `runCLISmoke` routes a `cliId` through the
+`cliSmokeProviders` table (`claudeCode`, `grok`); anything else is
+`provider_unavailable` / `unknown_cli` without spawning.
 
 Why it had to exist: while `buildClaudeInteractiveArgs` was the only Claude
 argv builder, a print-mode probe pushed through it **lost its `--print`**,
@@ -195,8 +202,8 @@ A Claude upgrade rewrites `~/.claude/settings.json` and can drop our
 re-verifies the hook at every run start (throttled, opt-out aware), and the
 bounded utilization probe ([cliagent_usage_claudecode_probe.go](cliagent_usage_claudecode_probe.go))
 refreshes a reading that has aged past the staleness TTL. The smoke only
-contributes `claudeBinaryStamp` (path, mtime, size, version), which keys its own
-cooldown so a verdict cached before an upgrade is never served for the
+contributes `cliSmokeBinaryStamp` (path, mtime, size, version), which keys its
+own cooldown so a verdict cached before an upgrade is never served for the
 post-upgrade binary.
 
 ## Environment policy
@@ -496,6 +503,160 @@ whole. Three more bounds follow from the same rule (Codex round 2 on #147):
   user forces a refresh would repopulate the cache with its pre-reset list and
   the refresh would read that for the whole TTL.
 
+## The no-tools maintenance smoke (`__cli_smoke__`, cliId `grok`)
+
+Grok runs on the **same signed `__cli_smoke__` channel as Claude**:
+`runGrokSmoke` in [cliagent_smoke_grok.go](cliagent_smoke_grok.go), argv from
+[grok_argv.go](grok_argv.go), shared core in
+[cliagent_smoke.go](cliagent_smoke.go). The harness dispatches
+`__cli_smoke__` with `["grok"]` as the (HMAC-signed) first arg and receives one
+correlated `__cli_smoke_result__`.
+
+**Do not use `session_start` for a Grok `-p` / no-tools smoke.** The signed
+`session_start` maintenance transport (`--tools "" --disable-web-search
+--no-subagents --max-turns 1 --verbatim <marker prompt>`, promoted by
+`sessionStartArgsForCommand`) is kept working for older publishers, but it is
+a thin caller of the same builder: `StartSession` validates the wire request
+with `validateGrokSmokeRequest`, stages the prompt in a file, and spawns the
+**same canonical argv** below (`validateGrokSmokeShape` at both call sites).
+It returns streamed frames, not a structured verdict. `grok agent stdio`
+(the ACP path) refuses every root-only one-shot flag outright — silently
+dropping `--tools ""` would turn a no-tools smoke into a fully tooled session —
+and its error names `__cli_smoke__`.
+
+Why this exists: the previous contract was a hand-frozen **12-token** child
+argv re-asserted in two places, and it carried an **empty argv element**
+(`--tools ""`). On Windows the `grok` on PATH is frequently an npm `.cmd` shim,
+and a `cmd.exe` re-parse of the shim's `%*` can drop an empty operand, leaving
+`--tools` to swallow `--disable-web-search` as its value. The child then exits
+non-zero **during option parsing, before inference**, so no marker is ever
+echoed and the pre- and post-update smokes fail identically — while `grok
+models` (no empty operand, none of the contested flags) stays healthy, and the
+post-update usage refresh replays the pre-update observation because the
+smoke never fetched credits.
+
+Canonical shape (rung 0, `streaming-notools-prompt-file`):
+
+```
+--output-format=streaming-json   # per-event NDJSON frames; `end` is the terminal envelope
+--tools=                         # THE FIX: equals-form empty value, no separate empty argv element
+--disable-web-search
+--no-subagents
+--max-turns=1
+--prompt-file <0600 temp file>   # the marker prompt; never inline -p
+```
+
+- **No argv element is ever the empty string**, `--tools` is **always the
+  equals form**, and the **marker nonce never appears in argv** — Grok's
+  headless mode does not read a piped stdin, and `-p <nonce>` would sit in a
+  process listing any local user can read, so the prompt is staged by
+  `writeGrokPromptFile` (owner-only, under `~/.ai-expedite/grok-prompts/`) and
+  removed exactly once after the child is reaped. All three are pinned by
+  [grok_argv_test.go](grok_argv_test.go).
+- `--no-auto-update` is **dropped from rung 0** (current builds reject it at
+  the root command — exactly the pre-inference exit being reported — and the
+  isolated home already pins `auto_update = false`) and `--verbatim` is gone
+  (not a documented root flag; the prompt asks for a verbatim echo). Rung 1
+  (`streaming-notools-prompt-file-legacy`) drops the two isolation switches
+  and carries `--no-auto-update`, the flag set an older build documented.
+- **Walk order follows the installed version** (`grokSmokeArgvShapesForVersion`):
+  a build reporting a version below `grokSmokeHardenedFlagsMinVersion`
+  (1.0.13, the first release documenting the isolation switches) tries the
+  legacy rung first; everything else — including an unparseable version —
+  keeps the canonical order. Every rung is always present, so a wrong guess
+  costs one free pre-inference spawn, not the verdict. The legacy
+  `session_start` smoke streams ONE child and cannot walk, so the
+  version-ordered first entry **is** its resolution of a compatible rung: an
+  older publisher's pre-update smoke against a pre-1.0.13 build is no longer
+  rejected during option parsing before it can bless the upgrade.
+- The ladder retries **only** on `flag_rejected` naming a flag another rung
+  drops (`grokSmokeRetryableFlags`, derived from the shapes in both
+  directions, never hand-listed): option parsing precedes inference, so a
+  rejected rung costs no quota. A rejection of a flag every rung carries is
+  reported as `flag_rejected` without a second child. The winning rung is
+  cached per `(path, mtime, size)`; the session_start smoke takes its rung
+  from the same cache.
+- **Windows `.cmd` / `.bat` shim:** the smoke routes the launch through
+  `cmd.exe` with an explicit command line (`grokSmokeShimCommand` →
+  `configureGrokWindowsCommandLine`): `call "%AIEXPEDITE_GROK_SMOKE_SHIM%"
+  <fixed flags> --prompt-file "%AIEXPEDITE_GROK_SMOKE_PROMPT_FILE%"`. Both
+  paths ride in the environment, the script carries only the ladder's fixed
+  flag tokens, and `HideWindow` survives. A native `grok.exe` is spawned
+  directly. [cliagent_smoke_grok_windows_test.go](cliagent_smoke_grok_windows_test.go)
+  (`//go:build windows`) round-trips every token through a real batch shim.
+
+Pre-inference checks, all free (no turn spent, never pinned by the cooldown):
+the binary must answer `--version` (`binary_missing`); the version must be
+parseable and `detectGrokMaintenanceSmokeSystemConfig` must accept the system
+config posture (`internal`, via the typed `grokSmokePreflightError` — the layer's
+contents are never published); the auth-only, MCP-disabled isolated home from
+`setupIsolatedGrokSmokeHomeFrom` must build (`internal`); and
+`assessIsolatedGrokLaunch` must find a usable login (`not_logged_in`). The child
+runs with `sanitizeGrokMaintenanceSmokeEnv` (every `GROK_*` / `OTEL_*` / Rust
+diagnostic stripped, the integration switches pinned off), `GROK_HOME` /
+`HOME` / `USERPROFILE` / `PWD` redirected into the isolated tree, and an empty
+workspace as cwd.
+
+Classification, onto the same closed sets as Claude:
+
+| Observation | `errorCategory` | `diagnostic` |
+| --- | --- | --- |
+| Binary absent, `--version` non-zero | `provider_unavailable` | `binary_missing` |
+| Unparseable version, refused system config, isolation setup failed | `internal_error` | `internal` |
+| Isolated login unusable (`assessIsolatedGrokLaunch`) | `not_authenticated` | `not_logged_in` |
+| `error` frame reporting auth | `not_authenticated` | `auth_error` |
+| `error` frame reporting a limit / credit / outage | `provider_unavailable` | `provider_error` |
+| The attempt's deadline killed the child | `provider_timeout` | `timeout` |
+| Option-parse rejection of one of our flags | `protocol` | `flag_rejected` |
+| Rejection of `--output-format` / `streaming-json` / `--prompt-file` | `protocol` | `framing_rejected` |
+| Exit with no terminal `end` frame (non-zero, or clean with no frames) | `protocol` | `no_envelope` |
+| `end` frame whose concatenated `text` deltas are not exactly the marker | `parse_failed` | `marker_mismatch` |
+
+`text` frames are incremental deltas (`text`, or `data` from 1.0.13) and are
+concatenated with **no separator** — the same rule `readOutputStream` applies
+for the session smoke — because a separator at a frame boundary corrupts the
+exact marker.
+
+Cost and privacy posture match Claude's: one real inference turn per smoke
+against the user's own Grok window, the 15-minute per-CLI cooldown keyed on
+the binary stamp (`cliSmokeBinaryStamp`), `singleflight` collapse of concurrent
+callers, at most one retry child per smoke and only on a pre-inference
+rejection. Worst case per upgrade: 2 spent turns + 2 free rejected spawns. The
+published result carries `{cliId, version, status, errorCategory,
+markerMatched, durationMs, argvShapeId, diagnostic}` and nothing else; the
+child's stdout/stderr, the prompt, the nonce, the resolved argv and the
+isolated home's contents (`auth.json`, `config.toml`, the private log) are
+never published or logged (`grokSmokeFailureLogLine` takes the stderr
+**length**, not the bytes).
+
+### Post-update freshness
+
+"Usage freshens after upgrade" holds because three things hold together:
+
+1. The cooldown is keyed on the binary stamp, so an upgrade **invalidates** the
+   pre-update verdict and the post-update smoke actually executes.
+2. The smoke child writes its `billing: fetched credits config` record into
+   the isolated home; `runGrokSmoke` calls the existing
+   `persistGrokManagedBillingSnapshot(isolatedHome, persistentHome,
+   producerContested)` after the last child exits — whatever the verdict — and
+   before the isolated home is removed. Same merge `waitForExit` performs for
+   the session path; a contested producer still refuses the merge.
+3. `grokNewestBillingObservation` ([cliagent_usage_grok.go](cliagent_usage_grok.go))
+   resolves the card's observation as the **newest** of the persistent log tail
+   (a direct run's own record, or a merged smoke / ACP record) and the live
+   billing cache, so a direct (ACP) run, a terminal (session) run and a smoke
+   all advance `latestObservedAt`. The account gate is upstream of that choice:
+   a foreign record or a foreign live entry never ages the observation forward.
+
+Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
+(classification, budget, cooldown, redaction, prompt file),
+[cliagent_usage_grok_freshness_test.go](cliagent_usage_grok_freshness_test.go)
+(newest-source selection) and
+[cliagent_usage_grok_post_update_freshness_test.go](cliagent_usage_grok_post_update_freshness_test.go)
+(the upgrade end to end across the smoke and usage layers). The end-to-end
+"real grok binary echoes the marker" case stays a manual pre-release check on
+a Windows device.
+
 ## Why ACP, not TUI scraping
 
 `grok` (no subcommand) launches an interactive TUI built around terminal
@@ -615,6 +776,17 @@ seeing every frame in `Seq` order; a silent drop would deadlock.
   env markers; strips `XAI_API_KEY` unless `Config.EnableGrokAPIKeyFallback`
   is set; preserves `GROK_*` so the local cached-token path stays
   discoverable.
+- [`grok_acp.go` — `grokACPRootOnlyArg`](grok_acp.go) — rejects (never
+  strips) every root-only one-shot flag (`--tools`, `--max-turns`,
+  `--prompt-file`, `-p`, …) and points the caller at `__cli_smoke__`.
+- [`grok_argv.go`](grok_argv.go) — `grokSmokeArgvShapes` /
+  `buildGrokNoToolsSmokeArgs` / `validateGrokSmokeShape` /
+  `validateGrokSmokeRequest` / `sanitizeGrokMaintenanceSmokeEnv`: the ONLY
+  source of the maintenance-smoke argv, for both `__cli_smoke__` and the
+  `session_start` transport.
+- [`cliagent_smoke_grok.go` — `runGrokSmoke`](cliagent_smoke_grok.go) — the
+  probe: preflight → isolated home → prompt file → ladder → classify → billing
+  merge → cleanup; `grokSmokeShimCommand` for Windows `.cmd` shims.
 - [`grok_acp.go` — `pathInsideRoot`](grok_acp.go) — workspace containment
   helper (symlink-resolved, `filepath.Rel`-based, no `HasPrefix` shortcut).
 - [`grok_acp.go` — `Start` deadline timer](grok_acp.go) — per-session

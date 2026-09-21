@@ -44,6 +44,11 @@ import (
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
 const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
+
+// mockGrokSmokeHangPidEnv names a file the `grok-smoke-hang` mode writes its
+// own pid into before blocking, so a test can assert the deadline kill reached
+// the shim's grandchild and not just the intermediate cmd.exe.
+const mockGrokSmokeHangPidEnv = "TEST_MOCK_GROK_SMOKE_HANG_PID_FILE"
 const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
 const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
 
@@ -510,6 +515,36 @@ func runMockCLI(mode string) {
 	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
 		runMockGrokMaintenanceSmoke(mode)
 
+	case "grok-smoke-hang":
+		// Records its pid, then blocks while holding stdout/stderr. Used by
+		// the Windows shim deadline test: killing the intermediate cmd.exe
+		// alone leaves this process alive and the captured pipe open, so Run
+		// would never return.
+		if marker := os.Getenv(mockGrokSmokeHangPidEnv); marker != "" {
+			_ = os.WriteFile(marker, []byte(fmt.Sprintf("%d", os.Getpid())), 0o600)
+		}
+		time.Sleep(10 * time.Minute)
+		os.Exit(0)
+
+	case "grok-smoke-argv-echo":
+		// Echoes every argv element it received as one streaming-json text
+		// frame, then `end`. Used by the Windows shim round-trip test to prove
+		// that a `.cmd` shim launch hands the child exactly the ladder's
+		// tokens — no re-split, no dropped empty operand.
+		for _, arg := range os.Args[1:] {
+			encoded, _ := json.Marshal(map[string]string{"type": "text", "text": arg})
+			fmt.Println(string(encoded))
+		}
+		// Also reports the shim path the cmd.exe route carries in the
+		// environment (empty on a direct launch), so a caller can tell which
+		// route spawned it.
+		if shim := os.Getenv(grokSmokeShimPathEnv); shim != "" {
+			encoded, _ := json.Marshal(map[string]string{"type": "text", "text": "shim=" + shim})
+			fmt.Println(string(encoded))
+		}
+		fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+		os.Exit(0)
+
 	case "grok-ordinary-no-tools":
 		args := os.Args[1:]
 		tools, hasTools := mockArgValue(args, "--tools")
@@ -583,12 +618,17 @@ func runMockCLI(mode string) {
 	}
 }
 
-// runMockGrokMaintenanceSmoke enforces the Grok 1.0.13 no-tools, one-shot
-// argv contract at the process boundary. It deliberately emits the legacy
-// `text` payload before the simulated update and 1.0.13's `data` payload after
-// it so the same SessionManager lifecycle proves protocol compatibility across
-// replacement. Failures expose only a generic protocol error, never argv,
-// prompt-file contents, or billing-log data.
+// runMockGrokMaintenanceSmoke enforces the Grok no-tools, one-shot argv
+// contract at the process boundary, for the build each mode impersonates:
+// the pre-update 1.0.5 build predates the headless isolation switches and
+// rejects them during option parsing (the pre-inference failure an older
+// publisher's session_start smoke must not hit), while the post-update 1.0.13
+// build documents them and rejects the retired `--no-auto-update` root flag.
+// It deliberately emits the legacy `text` payload before the simulated update
+// and 1.0.13's `data` payload after it so the same SessionManager lifecycle
+// proves protocol compatibility across replacement. Failures expose only a
+// generic protocol error, never argv, prompt-file contents, or billing-log
+// data.
 func runMockGrokMaintenanceSmoke(mode string) {
 	// Model Grok's documented diagnostics for both `--version` and the smoke:
 	// if the parent leaks either override, the probe/output is contaminated and
@@ -608,8 +648,9 @@ func runMockGrokMaintenanceSmoke(mode string) {
 			break
 		}
 	}
+	preHardenedBuild := mode == "grok-maintenance-smoke-v1"
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		if mode == "grok-maintenance-smoke-v1" {
+		if preHardenedBuild {
 			fmt.Println("grok 1.0.5")
 		} else {
 			fmt.Println("grok 1.0.13")
@@ -618,6 +659,17 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	}
 
 	args := os.Args[1:]
+	// Option parsing precedes everything else, as in the real CLI: a flag this
+	// build does not know is rejected before any isolation or auth check.
+	if preHardenedBuild {
+		if mockHasArg(args, "--disable-web-search") || mockHasArg(args, "--no-subagents") || !mockHasArg(args, "--no-auto-update") {
+			fmt.Fprintln(os.Stderr, "error: unexpected argument found")
+			os.Exit(2)
+		}
+	} else if mockHasArg(args, "--no-auto-update") || !mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") {
+		fmt.Fprintln(os.Stderr, "error: unexpected argument found")
+		os.Exit(2)
+	}
 	isolatedHome := os.Getenv("GROK_HOME")
 	persistentHome := os.Getenv(mockGrokPersistentHomeEnv)
 	vendorHome := os.Getenv(mockGrokVendorHomeEnv)
@@ -686,8 +738,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
-		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
-		!mockHasArg(args, "--verbatim") || !hasPromptFile || promptErr != nil ||
+		mockHasArg(args, "") || mockHasArg(args, "-p") || !hasPromptFile || promptErr != nil ||
 		string(prompt) != "Return exactly this marker and nothing else: "+grokMaintenanceSmokeMarker {
 		fmt.Fprintln(os.Stderr, "protocol error")
 		os.Exit(1)
@@ -697,7 +748,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		os.Exit(1)
 	}
 	field := "text"
-	if mode != "grok-maintenance-smoke-v1" {
+	if !preHardenedBuild {
 		field = "data"
 	}
 	// Real streaming-json output may split one assistant message across
@@ -711,10 +762,16 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	os.Exit(0)
 }
 
+// mockArgValue reads a flag's value in either spelling — the separate-value
+// pair the ordinary session path emits, or the equals form the maintenance
+// smoke shape (grok_argv.go) emits so no argv element is ever empty.
 func mockArgValue(args []string, name string) (string, bool) {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == name {
+	for i, arg := range args {
+		if arg == name && i+1 < len(args) {
 			return args[i+1], true
+		}
+		if value, ok := strings.CutPrefix(arg, name+"="); ok {
+			return value, true
 		}
 	}
 	return "", false
