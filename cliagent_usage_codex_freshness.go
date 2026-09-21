@@ -71,6 +71,16 @@ const (
 	// read as a backwards clock step rather than skew. Mirrors
 	// grokBillingMaxClockSkew.
 	codexRunFloorClockSkew = 5 * time.Minute
+	// codexRunFloorLocalSkew is the same allowance for the freshness floors and
+	// the debt marker, which — unlike a contributor observation — are stamped
+	// ONLY from this machine's clock and so can never legitimately sit minutes
+	// ahead of it. The one benign way a floor outruns a caller's `now` is that
+	// `now` was read before a concurrent run armed (a gather's `now` is taken
+	// before its budgets and the cache lock wait), so the tolerance covers that
+	// in-flight window and nothing more: a smaller backwards correction is a
+	// rollback, not skew, and must not leave a paid floor parked ahead of every
+	// new run until wall time catches back up.
+	codexRunFloorLocalSkew = 30 * time.Second
 )
 
 // Vars rather than consts so tests can pin them small.
@@ -763,14 +773,27 @@ func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 // codexRecordPaidRunFloor retires the debt before the post-run worker can
 // spend an attempt on it — utilization would stay stale until wall time caught
 // back up to the old floor. `now` is the only reading still trustworthy, so
-// state beyond it by more than codexRunFloorClockSkew is pulled back: floors
-// and the paid watermark are dropped outright, and an observation is re-dated
-// to just before this run's start, which is the one thing we do know about it.
-// The skew tolerance keeps ordinary forward-stamped telemetry — which would
-// otherwise be back-dated on every arm — out of this path. Reports whether
-// anything was rebased.
+// state beyond it is pulled back: floors and the paid watermark are dropped
+// outright, and an observation is re-dated to just before this run's start,
+// which is the one thing we do know about it.
+//
+// The two kinds of state get their own ceilings. Floors and the debt marker
+// are stamped only from the local clock, so codexRunFloorLocalSkew is all the
+// headroom they ever need. A contributor observation can carry a Codex-stamped
+// envelope time, so it keeps the wider codexRunFloorClockSkew — UNLESS a floor
+// is itself dated ahead, which proves the local clock moved back: provider skew
+// can no longer explain a future observation either, and leaving one behind
+// would let it cover (and instantly retire the debt of) every run armed until
+// wall time caught back up. Reports whether anything was rebased.
 func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now time.Time) bool {
+	localCeilingMs := now.Add(codexRunFloorLocalSkew).UnixMilli()
 	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
+	for _, floor := range []int64{snap.RunFloorMs, snap.ActiveRunFloorMs, snap.RunFloorPaidMs, snap.RefreshOwedAtMs} {
+		if floor > localCeilingMs {
+			ceilingMs = localCeilingMs
+			break
+		}
+	}
 	// Before the run started AND not after `now`: an observation this rebase
 	// touches was taken before the run it is being re-dated behind, so it must
 	// not be able to stand in for that run's telemetry.
@@ -793,7 +816,7 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 	// retires whatever debt stood on it; this run arms its own floor and owes
 	// its own debt immediately after.
 	for _, floor := range []*int64{&snap.RunFloorMs, &snap.ActiveRunFloorMs, &snap.RunFloorPaidMs, &snap.RefreshOwedAtMs} {
-		if *floor > ceilingMs {
+		if *floor > localCeilingMs {
 			*floor, rebased = 0, true
 		}
 	}
@@ -804,17 +827,20 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 }
 
 // codexRunFreshnessInFuture reports whether the account's persisted freshness
-// state is dated past `now` by more than codexRunFloorClockSkew — the read-side
-// test for the rollback codexRebaseFutureRunFreshness repairs. Cheap (one cache
-// read, already taken by every caller) so it can gate the repair write.
+// state is dated past `now` — the read-side test for the rollback
+// codexRebaseFutureRunFreshness repairs, and it applies that function's two
+// ceilings: codexRunFloorLocalSkew for the locally stamped floors and debt
+// marker, the wider codexRunFloorClockSkew for a possibly provider-stamped
+// observation. Cheap (one cache read, already taken by every caller) so it can
+// gate the repair write.
 func codexRunFreshnessInFuture(view codexCacheView, now time.Time) bool {
-	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
+	localCeilingMs := now.Add(codexRunFloorLocalSkew).UnixMilli()
 	for _, ms := range []int64{view.runFloorMs, view.activeRunFloorMs, view.runFloorPaidMs, view.refreshOwedAtMs} {
-		if ms > ceilingMs {
+		if ms > localCeilingMs {
 			return true
 		}
 	}
-	return codexLatestContributorObservation(view.contributors).UnixMilli() > ceilingMs
+	return codexLatestContributorObservation(view.contributors).UnixMilli() > now.Add(codexRunFloorClockSkew).UnixMilli()
 }
 
 // codexRebaseFutureRunFreshnessForAccount applies codexRebaseFutureRunFreshness

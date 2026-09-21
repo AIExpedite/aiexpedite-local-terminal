@@ -1605,6 +1605,64 @@ func TestCodexArmRunFloor_RebasesStateLeftAfterAClockRollback(t *testing.T) {
 	}
 }
 
+// A backwards correction SMALLER than the provider skew tolerance is still a
+// rollback: floors and the debt marker are stamped only from the local clock,
+// so one dated ahead of `now` can never be explained by a Codex-stamped
+// envelope. Applying the wide tolerance to them left a paid floor parked ahead
+// of every new run — and the observation that paid it able to cover them — for
+// the whole rollback.
+func TestCodexArmRunFloor_RebasesAfterASubSkewClockRollback(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	rolledBack := t0.Add(-2 * time.Minute) // inside codexRunFloorClockSkew.
+
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, t0)
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(time.Second))
+	if snap.RunFloorPaidMs != t0.UnixMilli() {
+		t.Fatalf("the pre-rollback run must be paid before the clock moves: %+v", snap)
+	}
+
+	if !codexRebaseFutureRunFreshness(&snap, rolledBack, rolledBack) {
+		t.Fatal("a floor ahead of the local clock is a rollback whatever the provider skew tolerance allows")
+	}
+	codexArmRunFloor(&snap, rolledBack)
+	if snap.RunFloorMs != rolledBack.UnixMilli() || snap.RunFloorPaidMs != 0 {
+		t.Fatalf("the new start must own the floor with nothing paid against it: %+v", snap)
+	}
+	// The proven rollback tightens the observation ceiling too: left at t0 it
+	// would cover — and instantly retire the debt of — the run armed below.
+	if observed := snap.Contributors["5h"]["primary"].ObservedAtMs; observed >= rolledBack.UnixMilli() {
+		t.Fatalf("a future-dated observation must be re-dated before the run it predates: %d", observed)
+	}
+	codexOweRunRefresh(&snap, rolledBack, rolledBack.Add(time.Second))
+	codexSettleRunFreshness(&snap, rolledBack.Add(time.Second))
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors:    snap.Contributors,
+		runFloorMs:      snap.RunFloorMs,
+		runFloorPaidMs:  snap.RunFloorPaidMs,
+		refreshOwedAtMs: snap.RefreshOwedAtMs,
+	}, rolledBack.Add(time.Minute))
+	if !state.owed {
+		t.Fatalf("a run started after the rollback still owes a refresh: %+v %+v", state, snap)
+	}
+
+	// A floor a hair ahead of a caller's `now` is the benign in-flight case —
+	// `now` was read before a concurrent run armed — and must NOT be rebased.
+	inFlight := codexRateLimitSnapshot{RunFloorMs: t0.Add(codexRunFloorLocalSkew - time.Second).UnixMilli()}
+	if codexRebaseFutureRunFreshness(&inFlight, t0, t0) {
+		t.Fatalf("a floor inside the in-flight tolerance must be left alone: %+v", inFlight)
+	}
+	if codexRunFreshnessInFuture(codexCacheView{runFloorMs: inFlight.RunFloorMs}, t0) {
+		t.Fatal("the read-side test must agree with the rebase it gates")
+	}
+	if !codexRunFreshnessInFuture(codexCacheView{runFloorMs: t0.Add(codexRunFloorLocalSkew + time.Second).UnixMilli()}, t0) {
+		t.Fatal("a floor past the in-flight tolerance must be read as a rollback")
+	}
+}
+
 // A clock rollback while a debt is outstanding, with no run start since to
 // rebase it, would otherwise keep every gather forcing a reconcile against a
 // future floor for the debt's whole age-out window — and the stale notice
