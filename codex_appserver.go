@@ -159,6 +159,29 @@ type CodexAppServerSession struct {
 	// terminalPublishState reserves this session's ID while its codex_appserver_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
+
+	// usageRunFloorMs / usageRunOpen track the utilization run this session is
+	// currently accumulating. The app-server is long-lived and serves MANY
+	// turns, so settling only at process exit would leave the CLI Agents card
+	// pinned to a pre-turn reading for as long as an IDE session stays open.
+	// usageRunOpen is set by any stdout frame and cleared by the turn's
+	// completion event, so waitForExit settles only a turn the stream did not
+	// already settle. The floor is swapped forward at each settle, giving the
+	// next turn a floor of its own (cliagent_usage_codex_freshness.go).
+	usageRunFloorMs atomic.Int64
+	usageRunOpen    atomic.Bool
+}
+
+// settleUsageRun hands a finished utilization run to the freshness path and
+// opens the next one at `at`. No-op when the stream produced nothing since the
+// last settle — the run it would describe does not exist, and a debt for it
+// would surface as a spurious "reading predates the last run" notice.
+func (s *CodexAppServerSession) settleUsageRun(at time.Time) {
+	if !s.usageRunOpen.CompareAndSwap(true, false) {
+		return
+	}
+	floor := s.usageRunFloorMs.Swap(at.UnixMilli())
+	codexUsageRunSettled(time.UnixMilli(floor))
 }
 
 // Status returns the current lifecycle status under the session mutex so
@@ -320,8 +343,11 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "codex-appserver:"+id)
 	}
-	// Utilization observed from here on covers this run; waitForExit settles
-	// it. Asynchronous — never holds m.mu across the cache lock.
+	// Utilization observed from here on covers this run; each completed turn
+	// (readStream) and finally waitForExit settle it. Asynchronous — never
+	// holds m.mu across the cache lock.
+	session.usageRunFloorMs.Store(session.StartedAt.UnixMilli())
+	session.usageRunOpen.Store(true)
 	codexUsageRunStarted(session.StartedAt)
 
 	go m.readStream(session, publishFn)
@@ -818,6 +844,15 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// into the per-account cache cliagent_usage_codex.go reads from.
 			// Side-effect only — does not alter framing or block publish.
 			captureCodexRateLimitLine(trimmed, time.Now())
+			// A completed turn owes the card a reading taken after that turn
+			// started, exactly like a terminal `codex` session's terminal
+			// event. The frame shapes live in the usage layer, so this file
+			// still knows no JSON-RPC semantics.
+			if codexRunCompletionFrame(trimmed) {
+				session.settleUsageRun(time.Now())
+			} else {
+				session.usageRunOpen.Store(true)
+			}
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
@@ -981,10 +1016,11 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// reclaim the session slot in parallel with the Pub/Sub round-trip.
 	close(session.done)
 
-	// The run is over, so the account's utilization has just moved. Keyed off
-	// the session lifecycle — never a JSON-RPC method name — and launched after
-	// the ended publication so it cannot delay or break it.
-	codexUsageRunSettled(session.StartedAt)
+	// The process is gone, so any turn still open — one that never announced
+	// its completion, or a session that produced nothing at all — settles here.
+	// Keyed off the session lifecycle and launched after the ended publication
+	// so it cannot delay or break it.
+	session.settleUsageRun(time.Now())
 
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)

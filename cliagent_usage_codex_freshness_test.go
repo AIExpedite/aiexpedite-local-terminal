@@ -631,6 +631,41 @@ func TestCodexBucketsFromRolloutFile_InferredAnchorScope(t *testing.T) {
 // of either cache lock must cost that gather the bounded wait and no more —
 // the transaction gives up (leaving the cursor unadvanced and the debt owed)
 // rather than blocking the refresh receipt and every later provider.
+// Bounded cache locking deliberately lets a settle's write be REFUSED. The debt
+// must then be RETAINED and written by a later attempt: dropping it retires a
+// finished run with neither a refresh nor the persisted marker a restart pays.
+func TestCodexRefreshAfterRun_RetainsDebtWhenTheCacheWriteIsRefused(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	// No rollout evidence exists, so nothing but the retry can record the debt.
+	codexRefreshAfterRunRetryDelay = 300 * time.Millisecond
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	// Wedge the in-process gate across the settle's write, then free it well
+	// inside the worker's retry window.
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+
+	triggerCodexUsageRefreshAfterRun(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("refused settle lost the debt: %+v", snap)
+	}
+	if snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("retained debt recorded floor %d, want the run start %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+}
+
 func TestCodexRateLimitCacheTransaction_BoundedWaitOnWedgedLocks(t *testing.T) {
 	now := time.Now()
 	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")

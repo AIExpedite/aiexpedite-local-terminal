@@ -541,6 +541,14 @@ func runMockCodexAppServer() {
 					"id":      id,
 					"result":  map[string]any{"turnId": "turn_mock"},
 				})
+				// Real app-servers announce the end of the turn and stay up for
+				// the next one. Emitted last so the manager's per-turn settle
+				// sees the turn's frames first.
+				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "codex/event/turn.completed",
+					"params":  map[string]any{"msg": map[string]any{"type": "turn.completed"}},
+				})
 			}
 		}
 	}
@@ -1077,7 +1085,7 @@ func TestCodexAppServerLifecycle_ArmsAndSettlesUsageFreshnessOnce(t *testing.T) 
 	rec.mu.Lock()
 	floor := rec.started[0]
 	rec.mu.Unlock()
-	if !floor.Equal(session.StartedAt) {
+	if floor.UnixMilli() != session.StartedAt.UnixMilli() {
 		t.Fatalf("armed floor %s, want the session start %s", floor, session.StartedAt)
 	}
 
@@ -1090,8 +1098,49 @@ func TestCodexAppServerLifecycle_ArmsAndSettlesUsageFreshnessOnce(t *testing.T) 
 	if _, n := rec.counts(); n != 1 {
 		t.Fatalf("settled %d times, want exactly once", n)
 	}
-	if !settled[0].Equal(floor) {
+	if settled[0].UnixMilli() != floor.UnixMilli() {
 		t.Fatalf("settled with floor %s, want %s", settled[0], floor)
+	}
+}
+
+// The app-server is long-lived and serves MANY turns per process, so every
+// completed turn settles its own utilization run. Waiting for process exit —
+// as the first cut did — leaves the card pinned to a pre-turn reading for as
+// long as an IDE session stays open.
+func TestCodexAppServerLifecycle_SettlesUsageFreshnessPerTurn(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	session := m.Get(id)
+	if session == nil {
+		t.Fatal("session not registered")
+	}
+	turn := func(n int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`, n)
+	}
+	if err := m.Send(id, turn(1)); err != nil {
+		t.Fatalf("Send turn 1: %v", err)
+	}
+	first := rec.waitSettled(t, 1)
+	if first[0].UnixMilli() != session.StartedAt.UnixMilli() {
+		t.Fatalf("first turn settled with floor %s, want the session start %s", first[0], session.StartedAt)
+	}
+
+	if err := m.Send(id, turn(2)); err != nil {
+		t.Fatalf("Send turn 2: %v", err)
+	}
+	second := rec.waitSettled(t, 2)
+	if second[1].UnixMilli() <= first[0].UnixMilli() {
+		t.Fatalf("second turn settled with floor %s, want one after the first turn's settle", second[1])
+	}
+
+	// The last turn already settled, so process exit must not settle again.
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if _, n := rec.counts(); n != 2 {
+		t.Fatalf("settled %d times, want one settle per completed turn", n)
 	}
 }
 

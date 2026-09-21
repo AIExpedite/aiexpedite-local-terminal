@@ -6061,8 +6061,37 @@ func TestCodexArmRunFloor_KeepsUnpaidFloor(t *testing.T) {
 		t.Fatalf("an unpaid debt keeps its floor: %d", snap.RunFloorMs)
 	}
 	codexOweRunRefresh(&snap, t0, t0.Add(4*time.Minute))
-	if snap.RunFloorMs != t0.UnixMilli() {
-		t.Fatalf("concurrent runs coalesce onto the oldest floor: %d", snap.RunFloorMs)
+	if snap.RunFloorMs != t0.Add(time.Minute).UnixMilli() {
+		t.Fatalf("an older run settling must not lower the coalesced floor: %d", snap.RunFloorMs)
+	}
+}
+
+// Two overlapping runs share one debt, so that debt has to require the LATER
+// run's floor: evidence taken while only the first run was going does not
+// describe the second one and must not clear it.
+func TestCodexOweRunRefresh_CoalescesOntoNewestFloor(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, runA)
+	codexArmRunFloor(&snap, runB)
+	codexOweRunRefresh(&snap, runA, t0.Add(8*time.Minute))
+	codexOweRunRefresh(&snap, runB, t0.Add(9*time.Minute))
+	if snap.RunFloorMs != runB.UnixMilli() {
+		t.Fatalf("coalesced floor %d, want the later run %d", snap.RunFloorMs, runB.UnixMilli())
+	}
+	// An observation from inside run A (10:02) predates run B entirely.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.Add(2 * time.Minute).UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(10*time.Minute))
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatal("an observation predating the later run must not clear the shared debt")
+	}
+	snap.Contributors["5h"]["primary"] = codexRateLimitBucket{ObservedAtMs: runB.Add(time.Minute).UnixMilli(), UsedPercentage: 41}
+	codexSettleRunFreshness(&snap, t0.Add(11*time.Minute))
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("an observation covering the later run must clear the debt: %+v", snap)
 	}
 }
 

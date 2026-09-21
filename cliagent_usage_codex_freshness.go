@@ -37,8 +37,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,9 +114,20 @@ type codexUsageRefreshGate struct {
 	// "re-arm" flag, set when another run finished while it was working so that
 	// run gets its own attempts instead of being folded into a nearly spent loop.
 	workers map[string]bool
+	// pending holds a settle whose cache write lost the bounded race for the
+	// cache lock. Bounded locking deliberately lets that write be REFUSED, and
+	// an unrecorded debt is a run whose refresh — and whose restart marker — is
+	// silently lost, so it is retried by the account's worker instead.
+	pending map[string]codexPendingRunDebt
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
 	wg     sync.WaitGroup
+}
+
+// codexPendingRunDebt is one finished run whose debt is not on disk yet.
+type codexPendingRunDebt struct {
+	floor       time.Time
+	completedAt time.Time
 }
 
 var codexUsageRefresh = newCodexUsageRefreshGate()
@@ -124,6 +137,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		inFlight: map[string]chan struct{}{},
 		lastRun:  map[string]time.Time{},
 		workers:  map[string]bool{},
+		pending:  map[string]codexPendingRunDebt{},
 		cancel:   make(chan struct{}),
 	}
 }
@@ -217,6 +231,32 @@ func (g *codexUsageRefreshGate) releaseWorker(fp string) bool {
 	return true
 }
 
+// rememberDebt retains a settle whose cache write was refused. Concurrent
+// unrecorded runs coalesce the same way the snapshot does: the NEWEST floor,
+// so one observation has to cover every run the retained debt represents.
+func (g *codexUsageRefreshGate) rememberDebt(fp string, debt codexPendingRunDebt) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if cur, ok := g.pending[fp]; ok {
+		if cur.floor.After(debt.floor) {
+			debt.floor = cur.floor
+		}
+		if cur.completedAt.After(debt.completedAt) {
+			debt.completedAt = cur.completedAt
+		}
+	}
+	g.pending[fp] = debt
+}
+
+// takeDebt removes and returns fp's retained debt, if any.
+func (g *codexUsageRefreshGate) takeDebt(fp string) (codexPendingRunDebt, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	debt, ok := g.pending[fp]
+	delete(g.pending, fp)
+	return debt, ok
+}
+
 func (g *codexUsageRefreshGate) cancelCh() <-chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -255,6 +295,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.inFlight = map[string]chan struct{}{}
 	codexUsageRefresh.lastRun = map[string]time.Time{}
 	codexUsageRefresh.workers = map[string]bool{}
+	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
 }
@@ -376,10 +417,13 @@ func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 }
 
 // codexOweRunRefresh records that a run which started at `floor` has finished.
-// Concurrent runs coalesce onto the oldest outstanding floor.
+// Concurrent runs coalesce onto the NEWEST floor: one debt stands for every run
+// it absorbed, so it must only be cleared by an observation that covers the
+// latest of them. Keeping the oldest would let evidence taken while the first
+// run was still going satisfy a second run that had not even started.
 func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Time) {
 	floorMs := floor.UnixMilli()
-	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs == 0 || floorMs < snap.RunFloorMs {
+	if snap.RunFloorMs == 0 || floorMs > snap.RunFloorMs {
 		snap.RunFloorMs = floorMs
 	}
 	snap.RefreshOwedAtMs = completedAt.UnixMilli()
@@ -432,9 +476,14 @@ func codexRefreshAfterRun(floor, completedAt time.Time) {
 	// including across a restart, which is what the persisted marker is for.
 	// When live capture already observed the run, the settle inside this very
 	// transaction clears it and the loop below exits without scanning.
-	codexRecordRunFreshness(fp, completedAt, func(snap *codexRateLimitSnapshot) {
+	if !codexRecordRunFreshness(fp, completedAt, func(snap *codexRateLimitSnapshot) {
 		codexOweRunRefresh(snap, floor, completedAt)
-	})
+	}) {
+		// The bounded cache locks refused the write. Retain the debt rather
+		// than walking into a worker that would read `owed == false` off disk
+		// and retire a run that was never actually recorded.
+		codexUsageRefresh.rememberDebt(fp, codexPendingRunDebt{floor: floor, completedAt: completedAt})
+	}
 	if !codexUsageRefresh.claimWorker(fp) {
 		return // the running worker was re-armed and will pay the newest debt
 	}
@@ -457,6 +506,9 @@ func codexPayRunRefresh(base, fp string) {
 		if codexUsageRefresh.takeRearm(fp) {
 			attempt = 0
 		}
+		if !codexFlushPendingRunDebt(fp) {
+			continue // still unrecorded; retry the write on the next attempt
+		}
 		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
 		if !state.owed {
 			return // paid by capture, a gather, or an earlier attempt
@@ -466,6 +518,23 @@ func codexPayRunRefresh(base, fp string) {
 		}
 		codexRecordRunFreshness(fp, codexUsageFreshnessNow(), codexCountRefreshAttempt)
 	}
+}
+
+// codexFlushPendingRunDebt retries a settle whose write was refused by the
+// bounded cache locks. Reports whether fp's debt is on disk: false means it is
+// still retained and the caller must not treat the account as debt-free.
+func codexFlushPendingRunDebt(fp string) bool {
+	debt, ok := codexUsageRefresh.takeDebt(fp)
+	if !ok {
+		return true
+	}
+	if codexRecordRunFreshness(fp, debt.completedAt, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, debt.floor, debt.completedAt)
+	}) {
+		return true
+	}
+	codexUsageRefresh.rememberDebt(fp, debt)
+	return false
 }
 
 // codexAwaitGatedReconcile runs one background forced reconcile, waiting (at
@@ -594,6 +663,56 @@ func codexStaleRunNotice(state codexRunFreshnessState) string {
 	}
 	return fmt.Sprintf("%s, before the most recent Codex run started (%s); it will update once that run's telemetry is found.",
 		last, state.floor.UTC().Format(layout))
+}
+
+// codexRunCompletionFrame reports whether a Codex stdout line announces the end
+// of a TURN (`turn.completed`, or the `thread.completed` that follows it). It
+// exists so the long-lived app-server — which serves many turns per process and
+// must stay free of JSON-RPC semantics — can settle each finished turn instead
+// of only the process exit. The envelope shapes mirror
+// isRecognizedCodexRateLimitEnvelope: a bare event, one nested under
+// `msg`/`payload`/`params`, or a JSON-RPC notification whose method carries the
+// event name. detectCLITerminalEvent covers the same two names for terminal
+// `codex` sessions, which speak the bare-event dialect only.
+func codexRunCompletionFrame(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "completed") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	if method, _ := raw["method"].(string); codexCompletionEventName(method) {
+		return true
+	}
+	if eventType, _ := raw["type"].(string); codexCompletionEventName(eventType) {
+		return true
+	}
+	for _, key := range []string{"msg", "payload", "params", "result"} {
+		nested, ok := raw[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if eventType, _ := nested["type"].(string); codexCompletionEventName(eventType) {
+			return true
+		}
+		if msg, ok := nested["msg"].(map[string]interface{}); ok {
+			if eventType, _ := msg["type"].(string); codexCompletionEventName(eventType) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// codexCompletionEventName matches a turn-completion event name, tolerating the
+// `codex/event/<name>` prefix app-server notifications may carry.
+func codexCompletionEventName(name string) bool {
+	if idx := strings.LastIndex(name, "/"); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return name == "turn.completed" || name == "thread.completed"
 }
 
 /* ───────────────────────────── rollout side ──────────────────────────── */
