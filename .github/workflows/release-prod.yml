@@ -103,6 +103,10 @@ jobs:
           # which carries the fix for GHSA-hfvc-g4fc-pqhx / GHSA-9h8m-3fm2-qjrq
           # (PATH hijacking); downgrading would reintroduce those CVEs.
           go-version: "1.26"
+          # Self-hosted runner keeps GOMODCACHE + GOCACHE on disk between runs;
+          # the GHA cache save took 60 min on a key miss (2026-09-21). Same
+          # reasoning as the beta leg in release-nonprod.yml.
+          cache: false
 
       - name: Download Go modules
         run: go mod download
