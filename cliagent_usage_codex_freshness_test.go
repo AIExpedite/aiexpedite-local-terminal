@@ -922,6 +922,50 @@ func TestCodexArmRunFloor_ParkedFloorSurvivesAnOlderDebtSettling(t *testing.T) {
 	}
 }
 
+// An observation that covers BOTH the owed run and the parked run behind it
+// must watermark the promoted floor too. The contributor carrying that
+// observation can be dropped by an authoritative empty snapshot before the
+// newer run settles; without the watermark a restart in that window would
+// read the already-observed run as interrupted and owe a false debt.
+func TestCodexSettleRunFreshness_WatermarksPromotedFloor(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, runA)
+	codexOweRunRefresh(&snap, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&snap, runB)
+	// One observation from inside runB covers runA's debt and runB's start.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: runB.Add(time.Minute).UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(7*time.Minute))
+	if snap.RefreshOwedAtMs != 0 || snap.RunFloorMs != runB.UnixMilli() || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("runA's debt clears and runB's floor is promoted: %+v", snap)
+	}
+	if snap.RunFloorPaidMs != runB.UnixMilli() {
+		t.Fatalf("the promoted floor is covered by the same observation and must be watermarked: %+v", snap)
+	}
+
+	// The contributor is dropped while runB is still open, then the agent
+	// restarts: runB was observed and must not read as interrupted.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+	codexSettleRunFreshness(&snap, t0.Add(8*time.Minute))
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors:   snap.Contributors,
+		runFloorMs:     snap.RunFloorMs,
+		runFloorPaidMs: snap.RunFloorPaidMs,
+	}, t0.Add(9*time.Minute))
+	if state.owed || state.interrupted {
+		t.Fatalf("an observed promoted run must not resurrect: %+v", state)
+	}
+	// And when runB settles, its debt is paid on the spot.
+	codexOweRunRefresh(&snap, runB, t0.Add(10*time.Minute))
+	codexSettleRunFreshness(&snap, t0.Add(10*time.Minute))
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("runB's debt is already covered by the watermark: %+v", snap)
+	}
+}
+
 // Settling the parked floor must not resurrect a run the caller already
 // settled, and an expired debt still hands the active run its floor.
 func TestCodexActiveRunFloor_ClearedWhenItsOwnRunSettles(t *testing.T) {

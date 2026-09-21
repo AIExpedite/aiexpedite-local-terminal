@@ -709,6 +709,12 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 		snap.RunFloorMs = 0
 	}
 	codexPromoteActiveRunFloor(snap)
+	// The watermark above was taken against the OLD floor. If the observation
+	// that paid it also reaches the floor just promoted, watermark that one
+	// now: the contributor carrying it can be dropped by an authoritative
+	// snapshot before the promoted run settles, and a restart would then read
+	// an already-observed run as interrupted.
+	codexRecordPaidRunFloor(snap)
 }
 
 // codexRecordPaidRunFloor watermarks the newest run floor a contributor
