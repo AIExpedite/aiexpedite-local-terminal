@@ -151,19 +151,32 @@ func claudeUsageRunCoveredByOwnTelemetry(completedAt time.Time) bool {
 
 // claudeUsageHarvestPrintStdout scans a completed run's own stdout for rate-limit
 // telemetry and merges whatever it finds into the shared cache, reporting whether
-// anything was persisted.
+// anything was found to persist.
 //
-// Free in the sense that matters: no OAuth request, and no credential read beyond
-// the one the cache's account scope needs — the same one every other writer of
-// this cache performs. Line-tolerant for the same reason
-// parseClaudePrintResultEnvelope is — a build that prefixes a banner, or emits
-// NDJSON instead of one object, still yields its reading.
+// Free in the sense that matters: no OAuth request, and ONE credential read — the
+// same one every other writer of this cache performs, for the account the buckets
+// are filed under. Line-tolerant for the same reason parseClaudePrintResultEnvelope
+// is — a build that prefixes a banner, or emits NDJSON instead of one object, still
+// yields its reading.
+//
+// The scan ACCUMULATES and merges exactly once, rather than merging per line.
+// Both of this function's real costs sit in that merge — the cache's gate and
+// file lock (claudeRateLimitBestEffortGateWait plus claudeRateLimitCacheLockWait,
+// seconds apiece whenever a live session's stream writer holds them) and
+// currentClaudeAccountFingerprint's credential read (a `security` spawn under a
+// 3s timeout on a default macOS config) — and a per-line merge multiplies both by
+// claudeUsageHarvestMaxLines, so a CLI spewing telemetry could stall a health
+// check for minutes after its child had already answered. Nothing about the
+// freshness this exists to deliver depends on the split: every bucket carries the
+// same `nowMs` either way. A later line simply supersedes an earlier one for the
+// same window, which is the right answer for an NDJSON build whose last `result`
+// event is its most current reading.
 //
 // Best-effort and silent throughout: this runs after a health check has already
 // reached its verdict and must never change it.
 func claudeUsageHarvestPrintStdout(stdout []byte, now time.Time) bool {
-	captured := false
 	nowMs := now.UnixMilli()
+	harvested := map[string]claudeRateLimitBucket{}
 	scanned, lines := 0, 0
 	rest := stdout
 	for len(rest) > 0 && lines < claudeUsageHarvestMaxLines && scanned < claudeUsageHarvestMaxBytes {
@@ -218,20 +231,27 @@ func claudeUsageHarvestPrintStdout(stdout []byte, now time.Time) bool {
 		//     keeps the key set to window-shaped identifiers.
 		for window, bucket := range updates {
 			if !claudeUsageHarvestWindow(window) {
-				delete(updates, window)
 				continue
 			}
 			bucket.Status = claudeUsageProbeStatus(bucket.Status)
-			updates[window] = bucket
+			harvested[window] = bucket
 		}
-		if len(updates) == 0 {
-			continue
-		}
-		mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
-			currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
-		captured = true
 	}
-	return captured
+	if len(harvested) == 0 {
+		return false
+	}
+	claudeUsageHarvestMerge(harvested, now)
+	return true
+}
+
+// claudeUsageHarvestMerge is the harvest's ONE write. A var so a test can count
+// the calls — "exactly one merge per harvest, however many telemetry lines the
+// scan saw" is the claim that keeps the cache's lock waits and the account's
+// credential read out of the scan loop, and it is not observable from the
+// merged cache (both shapes leave the same buckets behind).
+var claudeUsageHarvestMerge = func(updates map[string]claudeRateLimitBucket, now time.Time) {
+	mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
+		currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
 }
 
 // claudeUsageHarvestWindow reports whether a harvested `rate_limits` key is

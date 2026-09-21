@@ -92,9 +92,9 @@ func TestHandleCLISmokeCommand_PublishesExactlyOneCorrelatedResult(t *testing.T)
 	//
 	// The probe is deliberately left UNARMED here (handleCLISmokeCommand is what
 	// is under test, not the probe), so the only thing that can have advanced the
-	// cache is the run's own telemetry.
-	// claudeUsageObservationCovers, the same predicate the probe paths use: the
-	// cache truncates to milliseconds, and a stubbed run completes inside one.
+	// cache is the run's own telemetry. Compared with claudeUsageObservationCovers
+	// rather than After, for the same reason the probe paths use it: the cache
+	// truncates to milliseconds and a stubbed run completes inside one.
 	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !claudeUsageObservationCovers(latest, beforeSmoke) {
 		t.Errorf("the smoke left the utilization cache at %v, no fresher than the pre-smoke %v",
 			latest, beforeSmoke)

@@ -499,3 +499,59 @@ func TestNoteClaudeTurnSpentDurably_WritesTheRecordBeforeItReturns(t *testing.T)
 		t.Errorf("a covered run left a durable debt behind (err=%v)", err)
 	}
 }
+
+// One scan, one merge. Both of the harvest's real costs live in the merge — the
+// cache's gate and file lock (seconds apiece while a live session's stream
+// writer holds them) and the credential read the account scope needs (a
+// `security` spawn under a 3s timeout on a default macOS config) — so a per-line
+// merge would multiply them by claudeUsageHarvestMaxLines and let a spewing CLI
+// stall a health check long after its child had answered.
+//
+// Counted at the seam, because the merged cache cannot tell the two shapes
+// apart: per-line and accumulated leave the same buckets behind. The union and
+// the last-writer-wins value are asserted here too, so consolidating cannot
+// quietly drop what an earlier line contributed.
+func TestClaudeUsageHarvestPrintStdout_AccumulatesAcrossLinesAndMergesOnce(t *testing.T) {
+	harvestEnv(t)
+	now := time.Now()
+	reset := now.Add(time.Hour).Unix()
+
+	merges := 0
+	var merged map[string]claudeRateLimitBucket
+	real := claudeUsageHarvestMerge
+	claudeUsageHarvestMerge = func(updates map[string]claudeRateLimitBucket, at time.Time) {
+		merges++
+		merged = updates
+		real(updates, at)
+	}
+	t.Cleanup(func() { claudeUsageHarvestMerge = real })
+
+	line := func(fiveHour float64) string {
+		return fmt.Sprintf(
+			`{"type":"result","rate_limits":{"five_hour":{"used_percentage":%v,"resets_at":%d}}}`,
+			fiveHour, reset)
+	}
+	// seven_day appears only on the first line, so the test pins that
+	// accumulating carries an earlier line's window through to the single merge.
+	first := fmt.Sprintf(
+		`{"type":"result","rate_limits":{"five_hour":{"used_percentage":11,"resets_at":%d},"seven_day":{"used_percentage":22,"resets_at":%d}}}`,
+		reset, now.Add(72*time.Hour).Unix())
+
+	if !claudeUsageHarvestPrintStdout([]byte(first+"\n"+line(33)+"\n"+line(44)+"\n"), now) {
+		t.Fatal("an NDJSON stream carrying rate_limits must be harvested")
+	}
+
+	if merges != 1 {
+		t.Fatalf("the scan merged %d times for 3 telemetry lines, want exactly 1", merges)
+	}
+	if got := merged[claudeWindowFiveHour].UsedPercentage; got != 44 {
+		t.Errorf("five_hour = %v, want the last line's 44", got)
+	}
+	if got := merged[claudeWindowSevenDay].UsedPercentage; got != 22 {
+		t.Errorf("seven_day = %v, want the first line's 22 carried through", got)
+	}
+	// And it actually landed, through the real merge the seam wraps.
+	if b, ok := harvestedFiveHour(t); !ok || b.UsedPercentage != 44 {
+		t.Errorf("cache holds five_hour %+v (present=%v), want 44", b, ok)
+	}
+}
