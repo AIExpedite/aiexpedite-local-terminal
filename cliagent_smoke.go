@@ -20,7 +20,7 @@
 //     spent.
 //   - A per-CLI cooldown serves the previous verdict to any caller that asks
 //     again too soon, so a sequential retry storm cannot drain the user's quota.
-//   - A per-CLI singleflight collapses CONCURRENT callers onto one run. The
+//   - A per-(CLI, binary) singleflight collapses CONCURRENT callers onto one run. The
 //     cooldown cannot do that on its own: Pub/Sub delivers several outstanding
 //     messages at a time, so a burst would otherwise have every callback miss
 //     the same empty cache and spend its own turn.
@@ -288,7 +288,17 @@ var (
 // N inference turns against the user's own subscription window despite a
 // cooldown that promises one. Followers block on the leader and are handed its
 // verdict. Same singleflight the token refresh in auth.go uses.
+//
+// The key is (cliId, binary stamp), not the cliId alone: a caller arriving
+// after an upgrade replaced the binary mid-flight must test the NEW binary, not
+// join the pre-upgrade leader and be handed its verdict — that would bypass the
+// cooldown's binary-change invalidation exactly when the smoke matters.
 var cliSmokeGroup singleflight.Group
+
+// cliSmokeFlightKey scopes a singleflight to callers probing the same binary.
+func cliSmokeFlightKey(cliID, stamp string) string {
+	return cliID + "\x00" + stamp
+}
 
 /* --------------------------------------------------------------------------
    Provider table
@@ -365,7 +375,7 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 	executed := false
 	// The cooldown lookup lives INSIDE the group so a burst collapses onto one
 	// lookup — including its auth re-check, which may spawn a child of its own.
-	v, _, _ := cliSmokeGroup.Do(cliID, func() (any, error) {
+	v, _, _ := cliSmokeGroup.Do(cliSmokeFlightKey(cliID, stamp), func() (any, error) {
 		if replay, ok := replayableCLISmokeVerdict(cliID, stamp, path, provider.loggedIn); ok {
 			return replay, nil
 		}
@@ -376,7 +386,11 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 		// classify that kill as `timeout` like an attempt-deadline expiry, and
 		// caching it would hand the redelivered post-upgrade smoke a stale
 		// failure for 15 minutes instead of testing the CLI.
-		if ctx.Err() == nil {
+		//
+		// Nor is a verdict on a binary replaced while it ran: the post-upgrade
+		// flight (keyed on the new stamp) may already have cached the new
+		// binary's verdict, and this late write would evict it.
+		if ctx.Err() == nil && cliSmokeBinaryStamp(path, version) == stamp {
 			rememberCLISmokeVerdict(cliID, stamp, result)
 		}
 		return result, nil

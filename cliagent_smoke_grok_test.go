@@ -751,6 +751,79 @@ func TestRunCLISmoke_GrokConcurrentCallersShareOneTurn(t *testing.T) {
 	}
 }
 
+// A caller arriving after an upgrade replaced the binary while a pre-upgrade
+// smoke is still in flight must test the NEW binary rather than join the old
+// leader — and the old leader's late verdict must not evict the new one.
+func TestRunCLISmoke_GrokUpgradeMidFlightDoesNotJoinTheOldLeader(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.5")
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var mu sync.Mutex
+	first := true
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		mu.Lock()
+		isOld := first
+		first = false
+		mu.Unlock()
+		if isOld {
+			close(oldStarted)
+			<-releaseOld
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	var old cliSmokeResult
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		old, _ = runCLISmoke(context.Background(), "grok")
+	}()
+	<-oldStarted
+
+	// The upgrade lands while the pre-upgrade smoke is still running.
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(path, []byte("stub-upgraded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedProbeVersion(t, path, "grok 1.0.13")
+	var upgraded cliSmokeResult
+	var replayed bool
+	upgradedDone := make(chan struct{})
+	go func() {
+		defer close(upgradedDone)
+		upgraded, replayed = runCLISmoke(context.Background(), "grok")
+	}()
+	select {
+	case <-upgradedDone:
+	case <-time.After(5 * time.Second):
+		// Joined the blocked pre-upgrade leader instead of running its own probe.
+		close(releaseOld)
+		<-done
+		t.Fatal("post-upgrade caller blocked on the pre-upgrade flight")
+	}
+	if replayed || upgraded.Version != "grok 1.0.13" || upgraded.Status != cliSmokeStatusSuccess {
+		t.Fatalf("post-upgrade caller joined the pre-upgrade flight: %+v replayed=%t", upgraded, replayed)
+	}
+
+	close(releaseOld)
+	<-done
+	if old.Version != "grok 1.0.5" {
+		t.Fatalf("pre-upgrade leader = %+v", old)
+	}
+	if *calls != 2 {
+		t.Fatalf("spawned %d children, want one per binary (2)", *calls)
+	}
+	// The stale leader finished last; the cooldown must still hold the NEW
+	// binary's verdict.
+	again, replayed := runCLISmoke(context.Background(), "grok")
+	if !replayed || again.Version != "grok 1.0.13" {
+		t.Fatalf("late pre-upgrade verdict evicted the post-upgrade one: %+v replayed=%t", again, replayed)
+	}
+}
+
 // Neither the published result nor the device log carries any text the CLI
 // authored — or anything from the isolated home. A stderr fixture holding a
 // credential-shaped string and an auth.json path leaks neither.
