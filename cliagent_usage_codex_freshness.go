@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,13 +70,33 @@ var (
 	codexUsageFreshnessNow          = time.Now
 )
 
-// codexUsageRunStarted / codexUsageRunSettled are the two lifecycle hooks the
-// session managers call. Vars so the manager tests can observe them without
-// running a reconcile.
-var (
-	codexUsageRunStarted = armCodexUsageRunFloor
-	codexUsageRunSettled = triggerCodexUsageRefreshAfterRun
-)
+// codexRunHooks lets the manager tests observe the two lifecycle calls without
+// running a reconcile. Atomic because a previous test's exit watcher can still
+// be reaching codexUsageRunSettled while the next test installs its recorder.
+type codexRunHooks struct {
+	started func(time.Time)
+	settled func(time.Time)
+}
+
+var codexRunHookOverride atomic.Pointer[codexRunHooks]
+
+// codexUsageRunStarted is what the session managers call when a Codex run
+// starts; codexUsageRunSettled when it finishes.
+func codexUsageRunStarted(startedAt time.Time) {
+	if hooks := codexRunHookOverride.Load(); hooks != nil {
+		hooks.started(startedAt)
+		return
+	}
+	armCodexUsageRunFloor(startedAt)
+}
+
+func codexUsageRunSettled(floor time.Time) {
+	if hooks := codexRunHookOverride.Load(); hooks != nil {
+		hooks.settled(floor)
+		return
+	}
+	triggerCodexUsageRefreshAfterRun(floor)
+}
 
 // codexUsageRefreshGate holds the process-local bounds. Keyed by account
 // fingerprint so a credentials swap never inherits another account's throttle.

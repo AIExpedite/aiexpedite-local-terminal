@@ -27,10 +27,11 @@ func newCodexFreshnessFixture(t *testing.T, loginAt time.Time) codexFreshnessFix
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	helperCodexAuthAt(t, home, "dev@example.com", loginAt)
 
+	// Drain any worker first: the bounds below are plain vars its goroutine reads.
+	resetCodexUsageRefreshGate()
 	prevRetry, prevInterval := codexRefreshAfterRunRetryDelay, codexForcedReconcileMinInterval
 	codexRefreshAfterRunRetryDelay = 10 * time.Millisecond
 	codexForcedReconcileMinInterval = 20 * time.Millisecond
-	resetCodexUsageRefreshGate()
 	SetCodexUsageRefreshEnabled(true)
 	// Registered after the t.Setenv calls, so it runs BEFORE they are undone:
 	// no worker can outlive this test's CODEX_HOME / cache path.
@@ -522,18 +523,19 @@ type codexRunHookRecorder struct {
 func recordCodexRunHooks(t *testing.T) *codexRunHookRecorder {
 	t.Helper()
 	rec := &codexRunHookRecorder{}
-	prevStarted, prevSettled := codexUsageRunStarted, codexUsageRunSettled
-	codexUsageRunStarted = func(at time.Time) {
-		rec.mu.Lock()
-		rec.started = append(rec.started, at)
-		rec.mu.Unlock()
-	}
-	codexUsageRunSettled = func(at time.Time) {
-		rec.mu.Lock()
-		rec.settled = append(rec.settled, at)
-		rec.mu.Unlock()
-	}
-	t.Cleanup(func() { codexUsageRunStarted, codexUsageRunSettled = prevStarted, prevSettled })
+	prev := codexRunHookOverride.Swap(&codexRunHooks{
+		started: func(at time.Time) {
+			rec.mu.Lock()
+			rec.started = append(rec.started, at)
+			rec.mu.Unlock()
+		},
+		settled: func(at time.Time) {
+			rec.mu.Lock()
+			rec.settled = append(rec.settled, at)
+			rec.mu.Unlock()
+		},
+	})
+	t.Cleanup(func() { codexRunHookOverride.Store(prev) })
 	return rec
 }
 
