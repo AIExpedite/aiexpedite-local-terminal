@@ -976,3 +976,79 @@ func TestCodexRunProgressFrame(t *testing.T) {
 		}
 	}
 }
+
+// A run start whose cache write the bounded locks refuse must be RETRIED, not
+// dropped: an unpersisted floor is a run startup cannot classify as
+// interrupted, so a crash or self-update before it settles loses its refresh
+// for good.
+func TestArmCodexUsageRunFloor_RetriesARefusedWrite(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	prevDelay := codexRunFloorWriteRetryDelay
+	codexRunFloorWriteRetryDelay = 50 * time.Millisecond
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 30*time.Millisecond, time.Millisecond
+	t.Cleanup(func() {
+		codexRunFloorWriteRetryDelay = prevDelay
+		codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll
+	})
+
+	// Wedge the in-process gate across the first write, then free it inside the
+	// retry window.
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("armed floor %d, want the retried run start %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+}
+
+// A forced reconcile whose attempt-counter write is refused must keep the
+// attempt: codexStaleRunNotice only warns once RefreshOwedAttempts reaches
+// codexRefreshAfterRunMaxAttempts, so an uncounted attempt leaves a run whose
+// telemetry never appears reconciling on every gather while the card never
+// explains why it looks old.
+func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now)
+	}) {
+		t.Fatal("seeding the debt failed")
+	}
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 30*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	func() {
+		codexRateLimitMu.Lock()
+		defer codexRateLimitMu.Unlock()
+		codexRecordRefreshAttempt(f.fp, 1)
+	}()
+	if snap := f.snapshot(t); snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("refused write recorded %d attempts, want none on disk", snap.RefreshOwedAttempts)
+	}
+
+	// The next write folds the retained attempt in, so the run reaches the
+	// notice threshold on the attempts it actually spent.
+	codexRecordRefreshAttempt(f.fp, 1)
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAttempts != 2 {
+		t.Fatalf("RefreshOwedAttempts=%d, want the refused attempt folded in (2)", snap.RefreshOwedAttempts)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice == "" {
+		t.Fatal("want the stale-run notice once every attempt is counted")
+	}
+}

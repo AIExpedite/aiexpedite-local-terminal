@@ -168,10 +168,12 @@ type CodexAppServerSession struct {
 	// in progress and cleared by the turn's completion event, so waitForExit
 	// settles only a turn the stream did not already settle. Between-turn
 	// traffic (an `account/rateLimits/read` reply, initialization) never opens
-	// a run: a floor anchored on it would owe a refresh no run produced. The floor is ANCHORED when a turn is requested (Send) and
-	// cleared at each settle, so a reading that arrives during initialization or
-	// between turns is never mistaken for the next turn's telemetry
-	// (cliagent_usage_codex_freshness.go).
+	// a run: a floor anchored on it would owe a refresh no run produced —
+	// neither does Start itself, so an app-server launched and closed without a
+	// turn owes nothing. The floor is ANCHORED when a turn is requested (Send)
+	// and cleared at each settle, so a reading that arrives during
+	// initialization or between turns is never mistaken for the next turn's
+	// telemetry (cliagent_usage_codex_freshness.go).
 	usageRunFloorMs atomic.Int64
 	usageRunOpen    atomic.Bool
 }
@@ -372,11 +374,13 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "codex-appserver:"+id)
 	}
-	// Utilization observed from here on covers this run; each requested turn
-	// re-anchors the floor (Send), each completed turn (readStream) and finally
-	// waitForExit settle it. Asynchronous — never holds m.mu across the cache
-	// lock.
-	session.armUsageRun(session.StartedAt)
+	// No utilization run is armed here: starting an app-server is not running a
+	// turn. An IDE that launches one and closes it after initialization would
+	// otherwise settle a floor at exit and owe a refresh no telemetry can pay,
+	// surfacing as a stale-utilization warning for a run that never happened.
+	// The floor is anchored when a turn is REQUESTED (Send) or, for a client
+	// dialect that request predicate does not recognize, by the first frame
+	// demonstrating a turn in progress (readStream).
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)

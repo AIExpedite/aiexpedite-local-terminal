@@ -1084,36 +1084,57 @@ func waitCodexAppServerEnded(t *testing.T, ended func() bool) {
 	}
 }
 
-// A direct run arms the utilization floor at Start (the session's own start
-// time) and settles it exactly once when the process ends.
+// Starting an app-server is not running a turn: Start arms NO utilization run,
+// and an IDE that launches one and closes it after initialization settles
+// nothing. Arming at Start — as the first cut did — owed a refresh no telemetry
+// could pay, which aged out into a stale-utilization warning for a run that
+// never happened. A turn that IS requested arms and settles exactly once.
 func TestCodexAppServerLifecycle_ArmsAndSettlesUsageFreshnessOnce(t *testing.T) {
 	rec := recordCodexRunHooks(t)
 	m, id, ended := startCodexAppServerEchoMock(t)
-	session := m.Get(id)
-	if session == nil {
+	if m.Get(id) == nil {
 		t.Fatal("session not registered")
 	}
-	if started, settled := rec.counts(); started != 1 || settled != 0 {
-		t.Fatalf("after Start: started=%d settled=%d, want 1/0", started, settled)
-	}
-	rec.mu.Lock()
-	floor := rec.started[0]
-	rec.mu.Unlock()
-	if floor.UnixMilli() != session.StartedAt.UnixMilli() {
-		t.Fatalf("armed floor %s, want the session start %s", floor, session.StartedAt)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("after Start: started=%d settled=%d, want no run armed (0/0)", started, settled)
 	}
 
+	requested := time.Now()
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`); err != nil {
+		t.Fatalf("Send turn: %v", err)
+	}
+	settled := rec.waitSettled(t, 1)
+	if settled[0].UnixMilli() < requested.UnixMilli() {
+		t.Fatalf("settled with floor %s, want one at/after the turn request %s", settled[0], requested)
+	}
+
+	// The turn already settled, so process exit must not settle again.
 	if err := m.End(id); err != nil {
 		t.Fatalf("End: %v", err)
 	}
 	waitCodexAppServerEnded(t, ended)
-	settled := rec.waitSettled(t, 1)
 	time.Sleep(50 * time.Millisecond)
-	if _, n := rec.counts(); n != 1 {
-		t.Fatalf("settled %d times, want exactly once", n)
+	if started, n := rec.counts(); started != 1 || n != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one run for the one turn", started, n)
 	}
-	if settled[0].UnixMilli() != floor.UnixMilli() {
-		t.Fatalf("settled with floor %s, want %s", settled[0], floor)
+}
+
+// An app-server launched and closed without ever running a turn owes nothing:
+// no floor is armed, so waitForExit has no phantom run to settle.
+func TestCodexAppServerLifecycle_NoTurnNoUsageRun(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`); err != nil {
+		t.Fatalf("Send initialize: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after initialize-only session, want none", started, settled)
 	}
 }
 
@@ -1266,7 +1287,7 @@ func TestCodexAppServerLifecycle_BetweenTurnReadingDoesNotOpenARun(t *testing.T)
 	}
 	waitCodexAppServerEnded(t, ended)
 	time.Sleep(200 * time.Millisecond)
-	if started, settled := rec.counts(); settled != 1 || started != 2 {
-		t.Fatalf("started=%d settled=%d after a between-turn reading and exit, want the session arm + one turn (2/1)", started, settled)
+	if started, settled := rec.counts(); settled != 1 || started != 1 {
+		t.Fatalf("started=%d settled=%d after a between-turn reading and exit, want exactly the one turn (1/1)", started, settled)
 	}
 }

@@ -66,6 +66,11 @@ const (
 // Vars rather than consts so tests can pin them small.
 var (
 	codexRefreshAfterRunRetryDelay = 5 * time.Second
+	// codexRunFloorWriteAttempts / codexRunFloorWriteRetryDelay bound the
+	// retries armCodexUsageRunFloor spends getting a run start onto disk when
+	// the bounded cache locks refuse the write.
+	codexRunFloorWriteAttempts   = 3
+	codexRunFloorWriteRetryDelay = time.Second
 	// codexForcedReconcileMinInterval spaces forced reconciles per account. A
 	// user-initiated refresh bypasses it; nothing bypasses the single flight.
 	codexForcedReconcileMinInterval = 20 * time.Second
@@ -119,6 +124,10 @@ type codexUsageRefreshGate struct {
 	// an unrecorded debt is a run whose refresh — and whose restart marker — is
 	// silently lost, so it is retried by the account's worker instead.
 	pending map[string]codexPendingRunDebt
+	// pendingAttempts holds forced reconciles that were spent but whose
+	// RefreshOwedAttempts write the bounded cache locks refused, so the stale
+	// notice is not withheld forever by an uncounted attempt.
+	pendingAttempts map[string]int
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
 	// active counts the tracked goroutines spawn started; idle broadcasts when
@@ -140,11 +149,12 @@ var codexUsageRefresh = newCodexUsageRefreshGate()
 
 func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 	return &codexUsageRefreshGate{
-		inFlight: map[string]chan struct{}{},
-		lastRun:  map[string]time.Time{},
-		workers:  map[string]bool{},
-		pending:  map[string]codexPendingRunDebt{},
-		cancel:   make(chan struct{}),
+		inFlight:        map[string]chan struct{}{},
+		lastRun:         map[string]time.Time{},
+		workers:         map[string]bool{},
+		pending:         map[string]codexPendingRunDebt{},
+		pendingAttempts: map[string]int{},
+		cancel:          make(chan struct{}),
 	}
 }
 
@@ -292,6 +302,22 @@ func (g *codexUsageRefreshGate) takeDebt(fp string) (codexPendingRunDebt, bool) 
 	return debt, ok
 }
 
+// rememberAttempts retains attempts whose counter write was refused, and
+// takeAttempts hands them to the next write for fp.
+func (g *codexUsageRefreshGate) rememberAttempts(fp string, n int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pendingAttempts[fp] += n
+}
+
+func (g *codexUsageRefreshGate) takeAttempts(fp string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := g.pendingAttempts[fp]
+	delete(g.pendingAttempts, fp)
+	return n
+}
+
 func (g *codexUsageRefreshGate) cancelCh() <-chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -331,6 +357,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.lastRun = map[string]time.Time{}
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
+	codexUsageRefresh.pendingAttempts = map[string]int{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
 }
@@ -518,9 +545,24 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 	}
 	codexUsageRefresh.spawn(func() {
 		fp := codexAccountFingerprintAtBase(codexHomeBase())
-		codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
-			codexArmRunFloor(snap, startedAt)
-		})
+		// A refused write is RETRIED: bounded locking deliberately lets this
+		// lose the race for the cache lock, and a start that never reached disk
+		// is a run startup cannot classify as interrupted if the process dies
+		// or is replaced before it settles — its promised refresh is then lost
+		// for good. Re-applying the arm is safe at any later moment:
+		// codexArmRunFloor coalesces onto the newest floor and never moves one
+		// backwards, so a late write can neither lower a floor nor re-open a
+		// run that has already settled.
+		for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
+			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
+				return
+			}
+			if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+				codexArmRunFloor(snap, startedAt)
+			}) {
+				return
+			}
+		}
 	})
 }
 
@@ -569,6 +611,10 @@ func codexRunDebtWorker(base, fp string) {
 	for {
 		codexPayRunRefresh(base, fp)
 		if codexUsageRefresh.releaseWorker(fp) {
+			// Last chance to land attempts the cache lock refused: nothing else
+			// runs for this account until another run finishes or a gather
+			// forces a reconcile.
+			codexRecordRefreshAttempt(fp, 0)
 			return
 		}
 	}
@@ -595,8 +641,30 @@ func codexPayRunRefresh(base, fp string) {
 		if !codexAwaitGatedReconcile(base, fp, state.floor) {
 			return
 		}
-		codexRecordRunFreshness(fp, codexUsageFreshnessNow(), codexCountRefreshAttempt)
+		codexRecordRefreshAttempt(fp, 1)
 	}
+}
+
+// codexRecordRefreshAttempt counts `spent` attempts against fp's debt, folding
+// in any whose write the bounded cache locks previously refused. The count is
+// what codexStaleRunNotice gates the warning on (attempts >=
+// codexRefreshAfterRunMaxAttempts), so an attempt that was spent but never
+// recorded leaves a run whose telemetry never appears reconciling on every
+// later gather while the card never says why it looks old. A refused write is
+// retained for the next transaction instead; spent=0 only flushes.
+func codexRecordRefreshAttempt(fp string, spent int) {
+	spent += codexUsageRefresh.takeAttempts(fp)
+	if spent <= 0 {
+		return
+	}
+	if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+		for i := 0; i < spent; i++ {
+			codexCountRefreshAttempt(snap)
+		}
+	}) {
+		return
+	}
+	codexUsageRefresh.rememberAttempts(fp, spent)
 }
 
 // codexFlushPendingRunDebt retries a settle whose write was refused by the
@@ -692,7 +760,7 @@ func payOwedCodexUsageRefresh() {
 		defer cancel()
 		// Bypass the interval: nothing in this fresh process has reconciled yet.
 		if _, ran, _, _ := codexRunGatedReconcile(ctx, base, fp, state.floor, true, now); ran {
-			codexRecordRunFreshness(fp, codexUsageFreshnessNow(), codexCountRefreshAttempt)
+			codexRecordRefreshAttempt(fp, 1)
 		}
 		// The reconcile may have PAID the debt it was sent to pay and, in the
 		// same transaction, promoted a floor that was parked behind it — a
