@@ -1946,6 +1946,7 @@ type codexCacheView struct {
 	fullSnapshotAtMs int64
 	// Run freshness (codexRunFreshnessFromView).
 	runFloorMs          int64
+	activeRunFloorMs    int64
 	runFloorPaidMs      int64
 	refreshOwedAtMs     int64
 	refreshOwedAttempts int
@@ -1964,6 +1965,7 @@ func codexCacheViewForAccount(currentFingerprint string) codexCacheView {
 		limitNames:          snap.LimitNames,
 		fullSnapshotAtMs:    snap.FullSnapshotAtMs,
 		runFloorMs:          snap.RunFloorMs,
+		activeRunFloorMs:    snap.ActiveRunFloorMs,
 		runFloorPaidMs:      snap.RunFloorPaidMs,
 		refreshOwedAtMs:     snap.RefreshOwedAtMs,
 		refreshOwedAttempts: snap.RefreshOwedAttempts,

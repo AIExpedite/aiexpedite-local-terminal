@@ -803,6 +803,43 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 	return rebased
 }
 
+// codexRunFreshnessInFuture reports whether the account's persisted freshness
+// state is dated past `now` by more than codexRunFloorClockSkew — the read-side
+// test for the rollback codexRebaseFutureRunFreshness repairs. Cheap (one cache
+// read, already taken by every caller) so it can gate the repair write.
+func codexRunFreshnessInFuture(view codexCacheView, now time.Time) bool {
+	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
+	for _, ms := range []int64{view.runFloorMs, view.activeRunFloorMs, view.runFloorPaidMs, view.refreshOwedAtMs} {
+		if ms > ceilingMs {
+			return true
+		}
+	}
+	return codexLatestContributorObservation(view.contributors).UnixMilli() > ceilingMs
+}
+
+// codexRebaseFutureRunFreshnessForAccount applies codexRebaseFutureRunFreshness
+// from the READ side — startup replay and the gather path — where no run start
+// is at hand to prove the clock moved. A future floor is proof enough on its
+// own: `now` is the only trustworthy reading, and a floor no wall clock has
+// reached yet cannot describe a run that already happened. Without this, a
+// rollback while a run is unpaid or interrupted, followed by a restart before
+// any new run arms, leaves codexRunFreshnessFromView reading the negative age
+// as current: startup and every later gather force a reconcile against a floor
+// that even timestamp-less rollout evidence (clamped to `now`) can never
+// cover, and the stale notice names a run time still in the future until wall
+// time catches up. The write is skipped when nothing is dated ahead, so the
+// routine path costs only the cache read it already took. The observation
+// anchor is `now`: nothing of this process has run yet, so a re-dated
+// observation predates any run armed after it and cannot stand in for it.
+func codexRebaseFutureRunFreshnessForAccount(fp string, view codexCacheView, now time.Time) bool {
+	if !codexRunFreshnessInFuture(view, now) {
+		return false
+	}
+	return codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+		codexRebaseFutureRunFreshness(snap, now, now)
+	})
+}
+
 // codexDisarmRunFloor rolls back a start codexArmRunFloor recorded for a run
 // that never happened, to fallbackMs — the newest run its manager still has
 // open, or zero. Only the exact floor is touched, wherever the arm left it: a
@@ -1182,7 +1219,16 @@ func payOwedCodexUsageRefresh() {
 		base := codexHomeBase()
 		fp := codexAccountFingerprintAtBase(base)
 		now := codexUsageFreshnessNow()
-		state := codexRunFreshnessForAccount(fp, now)
+		view := codexCacheViewForAccount(fp)
+		// A clock rollback while the previous process had a run unpaid or in
+		// flight leaves its floor ahead of `now`; no run start of this process
+		// has rebased it yet, so do it here before classifying the state, or
+		// the replay (and every gather after it) reconciles against a floor
+		// nothing can cover.
+		if codexRebaseFutureRunFreshnessForAccount(fp, view, now) {
+			view = codexCacheViewForAccount(fp)
+		}
+		state := codexRunFreshnessFromView(view, now)
 		if !state.owed && !state.interrupted {
 			return
 		}
@@ -1264,7 +1310,14 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 	// another run finishes, so land it here — the write is skipped when
 	// nothing is retained — or the debt would read as paid off disk.
 	codexFlushPendingRunDebt(fp)
-	state := codexRunFreshnessForAccount(fp, now)
+	view := codexCacheViewForAccount(fp)
+	// Same repair as startup replay: a rollback while a debt is outstanding,
+	// with no run start since, would otherwise keep forcing this gather onto a
+	// future floor for the debt's whole age-out window.
+	if codexRebaseFutureRunFreshnessForAccount(fp, view, now) {
+		view = codexCacheViewForAccount(fp)
+	}
+	state := codexRunFreshnessFromView(view, now)
 	if forced || state.owed {
 		var floor time.Time
 		if state.owed {

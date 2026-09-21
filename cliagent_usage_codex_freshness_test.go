@@ -1604,3 +1604,35 @@ func TestCodexArmRunFloor_RebasesStateLeftAfterAClockRollback(t *testing.T) {
 		t.Fatalf("state within the skew tolerance must be left alone: %+v", skewed)
 	}
 }
+
+// A clock rollback while a debt is outstanding, with no run start since to
+// rebase it, would otherwise keep every gather forcing a reconcile against a
+// future floor for the debt's whole age-out window — and the stale notice
+// would name a run time that has not happened yet. The gather rebases first.
+func TestCodexReconcileForGather_RebasesDebtLeftInTheFutureByAClockRollback(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	future := now.Add(time.Hour)
+	if !codexRecordRunFreshness(f.fp, future, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, future)
+		codexOweRunRefresh(snap, future, future.Add(time.Minute))
+	}) {
+		t.Fatal("seeding the debt failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
+	defer cancel()
+	codexReconcileForGather(ctx, codexHomeBase(), f.fp, now, false)
+
+	if codexGateHasRun(f.fp) {
+		t.Fatal("a routine gather must not force a reconcile onto a future floor")
+	}
+	snap := f.snapshot(t)
+	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("future-dated debt must be dropped by the gather: %+v", snap)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice != "" {
+		t.Fatalf("no stale notice may name a run that has not happened: %q", notice)
+	}
+}
