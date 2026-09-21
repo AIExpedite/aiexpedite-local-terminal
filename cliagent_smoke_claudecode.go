@@ -168,6 +168,10 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	prompt := claudeSmokePrompt(marker)
 	env, _ := prepareClaudeChildEnv(path, os.Environ())
 
+	// Bound BEFORE the first spawn: the shape this walk resolves is a fact
+	// about THESE bytes, not about whatever is at `path` when it finishes.
+	shapeBinding := bindCLISmokeShape(path)
+
 	var lastCategory, lastDiagnostic string
 	for _, shape := range claudeSmokeShapeLadder(path) {
 		runCtx, cancel := context.WithTimeout(ctx, claudeSmokeTimeout)
@@ -190,7 +194,7 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 			result.MarkerMatched = matched
 			result.Diagnostic = diagnostic
 			result.DurationMs = time.Since(started).Milliseconds()
-			rememberCLISmokeShape(path, shape.ID)
+			shapeBinding.remember(shape.ID)
 			return result
 		}
 		lastCategory, lastDiagnostic = category, diagnostic

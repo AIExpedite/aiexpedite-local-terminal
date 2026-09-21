@@ -503,6 +503,47 @@ func TestRunGrokSmoke_FlagRejectionRetriesOnceAndCachesTheRung(t *testing.T) {
 	}
 }
 
+// A walk that outlives the binary it probed must not file its winning rung
+// under the replacement's key: the shape is a fact about the bytes that
+// accepted it, and a post-upgrade flight may already have resolved a different
+// one. Every later smoke — including the legacy session_start path, which
+// reads the same cache — would otherwise collapse its ladder onto a rung the
+// installed build can reject.
+func TestRunGrokSmoke_ShapeIsNotBoundToABinaryReplacedMidRun(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		frames := grokSuccessFrames(grokMarkerFromLaunch(t, launch))
+		// The upgrade lands while this child is still running.
+		if err := os.WriteFile(path, []byte("stub-upgraded-longer"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return frames, nil, nil
+	})
+
+	result := runGrokSmoke(context.Background(), path, "grok 1.0.5")
+	if result.Status != cliSmokeStatusSuccess || *calls != 1 {
+		t.Fatalf("pre-upgrade walk should have passed in one child: %+v calls=%d", result, *calls)
+	}
+	if shape, cached := cliSmokeRememberedShape(path); cached {
+		t.Fatalf("late walk bound %q to the replacement binary", shape)
+	}
+
+	// Nor can a late walk overwrite the shape a post-upgrade flight already
+	// resolved: the stale binding is taken first, the upgrade lands, the
+	// post-upgrade flight stores its rung, and the stale write is refused.
+	stale := bindCLISmokeShape(path)
+	if err := os.WriteFile(path, []byte("stub-upgraded-longer-still"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bindCLISmokeShape(path).remember(grokSmokeArgvShapes[1].ID)
+	stale.remember(grokSmokeArgvShapes[0].ID)
+	shape, cached := cliSmokeRememberedShape(path)
+	if !cached || shape != grokSmokeArgvShapes[1].ID {
+		t.Fatalf("stale walk clobbered the post-upgrade rung: shape=%q cached=%t", shape, cached)
+	}
+}
+
 func TestRunGrokSmoke_RejectionOfASharedFlagSpendsNoSecondChild(t *testing.T) {
 	grokSmokeEnv(t)
 	path := stubGrokBinary(t)

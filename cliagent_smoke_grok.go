@@ -323,6 +323,9 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	// Frozen BEFORE the spawn, from the credential surface the child is
 	// spawned with: the same verdict gates the billing merge on exit, resolved
 	// once rather than re-derived after the run (see the session path).
+	// Bound BEFORE the first spawn: the shape this walk resolves is a fact
+	// about THESE bytes, not about whatever is at `path` when it finishes.
+	shapeBinding := bindCLISmokeShape(path)
 	ladder := grokSmokeShapeLadder(path)
 	producerContested := grokManagedRunProducerContested(grokDirectRunLaunch{
 		Env: env, Cwd: isolatedCwd, Args: buildGrokNoToolsSmokeArgs(ladder[0], promptFile),
@@ -374,7 +377,7 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 			result.MarkerMatched = matched
 			result.Diagnostic = diagnostic
 			result.DurationMs = time.Since(started).Milliseconds()
-			rememberCLISmokeShape(path, shape.ID)
+			shapeBinding.remember(shape.ID)
 			return result
 		}
 		lastCategory, lastDiagnostic = category, diagnostic

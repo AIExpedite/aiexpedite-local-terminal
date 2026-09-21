@@ -238,11 +238,43 @@ func cliSmokeRememberedShape(path string) (string, bool) {
 	return resolved, cached
 }
 
-func rememberCLISmokeShape(path, shapeID string) {
+// cliSmokeShapeBinding pins a ladder walk to the binary it started against.
+// A smoke can outlive the binary it probed (an upgrade lands mid-run), and a
+// shape is only a fact about the bytes that accepted it. Re-stating the path
+// on the way out would file the OLD binary's winning shape under the NEW
+// binary's key — and, because a post-upgrade flight writes the same key, the
+// late walk would clobber the shape that flight had already resolved. Every
+// later smoke (including the legacy session_start one, which reads the same
+// cache) would then collapse its ladder onto a rung the installed build may
+// reject. Same discipline runCLISmoke applies to the cooldown verdict.
+type cliSmokeShapeBinding struct {
+	path  string
+	key   cliSmokeShapeKey
+	known bool
+}
+
+// bindCLISmokeShape captures the binary identity BEFORE the first child is
+// launched. An unstattable path yields an unknown binding, which never writes.
+func bindCLISmokeShape(path string) cliSmokeShapeBinding {
 	key, ok := cliSmokeShapeKeyFor(path)
-	if !ok {
+	return cliSmokeShapeBinding{path: path, key: key, known: ok}
+}
+
+// remember stores the winning shape only while the binary on disk is still the
+// one this walk probed.
+func (b cliSmokeShapeBinding) remember(shapeID string) {
+	if !b.known {
 		return
 	}
+	current, ok := cliSmokeShapeKeyFor(b.path)
+	if !ok || current != b.key {
+		return
+	}
+	rememberCLISmokeShape(b.key, shapeID)
+}
+
+func rememberCLISmokeShape(key cliSmokeShapeKey, shapeID string) {
+	path := key.Path
 	cliSmokeShapeMu.Lock()
 	// Drop stale entries for the same path first: an upgrade leaves the old
 	// (mtime,size) key behind and nothing else prunes this map.
