@@ -329,13 +329,20 @@ func TestCodexAppServerManager_StartRequiresValidCwd(t *testing.T) {
 // publish a codex_appserver_error surface and force-kill the child so the
 // orchestrator sees a clear failure instead of a silently-truncated stream.
 //
-// Pretty heavy test (drives a real mock CLI and relies on the
-// codexAppServerEnqueueTimeout cap), so we shrink the cap via a build-tag-
-// free swap pattern: we override the constants through the public package
-// vars used in production. Because the constants ARE constants here, we
-// instead point the mock at a tight "echo many frames" mode and assert the
-// fatal error surface is published.
+// Pretty heavy test (drives a real mock CLI and has to wait out the
+// codexAppServerEnqueueTimeout cap), so we shrink the cap for the duration of
+// the test. Waiting out the production 30s is dead wall-clock that crowds the
+// whole package against CI's `go test -timeout 5m`; the escalation path under
+// test is identical at either value.
 func TestCodexAppServerLifecycle_StallingPublisherTerminatesSession(t *testing.T) {
+	origEnqueueTimeout := codexAppServerEnqueueTimeout
+	codexAppServerEnqueueTimeout = 500 * time.Millisecond
+	// readStream reads the cap on every enqueue, so the restore has to wait
+	// for that goroutine to return (`streamDone`) or it races the read under
+	// `-race`. Registered before Start so it runs last.
+	restoreEnqueueTimeout := func() { codexAppServerEnqueueTimeout = origEnqueueTimeout }
+	defer func() { restoreEnqueueTimeout() }()
+
 	// Build a publishFn that blocks forever after a handful of messages so
 	// the queue fills, then assert we see codex_appserver_error indicating
 	// the queue stalled.
@@ -397,6 +404,15 @@ func TestCodexAppServerLifecycle_StallingPublisherTerminatesSession(t *testing.T
 
 	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+	if session := m.Get(id); session != nil {
+		restoreEnqueueTimeout = func() {
+			select {
+			case <-session.streamDone:
+			case <-time.After(30 * time.Second):
+			}
+			codexAppServerEnqueueTimeout = origEnqueueTimeout
+		}
 	}
 
 	// Wait up to enqueue timeout + a margin for the fatal escalation to fire.

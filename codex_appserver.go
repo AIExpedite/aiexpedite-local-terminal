@@ -115,15 +115,19 @@ const (
 	// fatal error and kill the child rather than silently dropping (see
 	// codexAppServerEnqueueTimeout below).
 	codexAppServerPublishQueueSize = 256
-
-	// codexAppServerEnqueueTimeout is the upper bound for the stream readers
-	// to wait when the publish queue is full. Hitting this means Pub/Sub has
-	// stalled for a sustained period; the session cannot continue safely
-	// (silently dropped frames would break the JSON-RPC state machine on the
-	// orchestrator), so the manager publishes a `codex_appserver_error`
-	// surface and force-kills the child to fail-fast.
-	codexAppServerEnqueueTimeout = 30 * time.Second
 )
+
+// codexAppServerEnqueueTimeout is the upper bound for the stream readers
+// to wait when the publish queue is full. Hitting this means Pub/Sub has
+// stalled for a sustained period; the session cannot continue safely
+// (silently dropped frames would break the JSON-RPC state machine on the
+// orchestrator), so the manager publishes a `codex_appserver_error`
+// surface and force-kills the child to fail-fast.
+//
+// A var rather than a const purely so the stall test can shrink it: waiting
+// out the real 30s is dead wall-clock that crowds the package against CI's
+// `go test -timeout 5m`. Production never reassigns it.
+var codexAppServerEnqueueTimeout = 30 * time.Second
 
 /* --------------------------------------------------------------------------
    CodexAppServerSession — one running `codex app-server` process
