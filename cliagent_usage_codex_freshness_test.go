@@ -1831,3 +1831,60 @@ func TestCodexOweInterruptedRun_SkipsAFloorAnotherRunReplaced(t *testing.T) {
 		t.Fatalf("the interrupted run must be owed from now: %+v", view)
 	}
 }
+
+// A backwards clock step landing between a run start being captured and the
+// arm transaction running persists that start as a future floor. Settling the
+// run used to owe its debt against that unreachable timestamp: both forced
+// reconciles were spent on a floor no observation taken now can cover, and the
+// read-side rebase that eventually dropped it retired the run without ever
+// running the post-run scan it had promised.
+func TestCodexOweRunRefresh_ClampsAStartLeftAheadByAClockRollback(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	rolledBack := t0.Add(-time.Hour) // the clock moves back after t0 is captured.
+
+	// The arm ran against the pre-rollback reading, so the floor on disk — and
+	// the start the manager still holds — are both an hour ahead of `now`.
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, t0)
+
+	completedAt := rolledBack.Add(time.Minute)
+	codexRebaseFutureRunFreshness(&snap, completedAt, completedAt)
+	codexOweRunRefresh(&snap, t0, completedAt)
+
+	if snap.RunFloorMs <= 0 || snap.RunFloorMs > completedAt.UnixMilli() {
+		t.Fatalf("the debt must stand on a floor an observation taken now can reach: %+v", snap)
+	}
+	view := codexCacheView{
+		contributors:    snap.Contributors,
+		runFloorMs:      snap.RunFloorMs,
+		runFloorPaidMs:  snap.RunFloorPaidMs,
+		refreshOwedAtMs: snap.RefreshOwedAtMs,
+	}
+	if state := codexRunFreshnessFromView(view, completedAt); !state.owed {
+		t.Fatalf("the finished run still owes a refresh: %+v %+v", state, snap)
+	}
+
+	// Telemetry observed after the run now pays the debt, which is the whole
+	// point of clamping: against the future floor it never could.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: completedAt.UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, completedAt)
+	if snap.RefreshOwedAtMs != 0 || snap.RunFloorPaidMs < snap.RunFloorMs {
+		t.Fatalf("an observation taken after the run must pay its debt: %+v", snap)
+	}
+}
+
+// The clamp is a rollback repair only: an ordinary run keeps its own start as
+// the floor, so the debt stays exactly as strict as the run it describes.
+func TestCodexOweRunRefresh_KeepsAnOrdinaryRunStartAsItsFloor(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, t0)
+	codexOweRunRefresh(&snap, t0, t0.Add(time.Minute))
+
+	if snap.RunFloorMs != t0.UnixMilli() {
+		t.Fatalf("a forward-running clock must leave the run start alone: %+v", snap)
+	}
+}

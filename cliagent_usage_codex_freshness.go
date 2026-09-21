@@ -929,7 +929,17 @@ func codexDisarmRunFloor(snap *codexRateLimitSnapshot, floorMs, fallbackMs int64
 // latest of them. Keeping the oldest would let evidence taken while the first
 // run was still going satisfy a second run that had not even started.
 func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Time) {
+	// A start captured before a backwards clock step arrives here dated ahead
+	// of the run's own completion. Owed against that timestamp, the debt asks
+	// for telemetry no observation taken now can reach: both forced reconciles
+	// are spent on a floor nothing covers, and the read-side rebase that
+	// eventually drops it retires the run without ever running the post-run
+	// scan it promised. `completedAt` is the trustworthy reading — the run had
+	// certainly started by then — so the floor is clamped to it.
 	floorMs := floor.UnixMilli()
+	if completedMs := completedAt.UnixMilli(); floorMs > completedMs {
+		floorMs = completedMs
+	}
 	if snap.RunFloorMs == 0 || floorMs > snap.RunFloorMs {
 		snap.RunFloorMs = floorMs
 	}
@@ -1077,6 +1087,14 @@ func codexRefreshAfterRun(armed string, floor, completedAt time.Time) {
 	// When live capture already observed the run, the settle inside this very
 	// transaction clears it and the loop below exits without scanning.
 	if !codexRecordRunFreshness(fp, completedAt, func(snap *codexRateLimitSnapshot) {
+		// Clamping the incoming floor above is not enough on its own: this
+		// run's own arm may already have persisted the same pre-rollback start
+		// as a future floor, and codexOweRunRefresh only ever raises the floor,
+		// so the debt would still stand on it. `completedAt` is the anchor for
+		// the same reason it is the clamp — this run has finished, so an
+		// observation pulled back to just before it cannot stand in for the
+		// debt being recorded right here.
+		codexRebaseFutureRunFreshness(snap, completedAt, completedAt)
 		codexOweRunRefresh(snap, floor, completedAt)
 	}) {
 		// The bounded cache locks refused the write. Retain the debt rather
