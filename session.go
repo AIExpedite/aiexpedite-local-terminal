@@ -188,7 +188,15 @@ type CLISession struct {
 	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
-	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
+	// shimmedChildTree marks a session whose Process is an INTERMEDIATE cmd.exe
+	// wrapper rather than the CLI itself — the Windows npm `grok.cmd` shim route
+	// the retained session_start maintenance smoke takes (newGrokSmokeCmd).
+	// Killing only that wrapper reparents the shim's Node/Grok child out of
+	// reach, leaking a provider process that still holds this session's
+	// stdout/stderr handles. killSessionProcess takes the whole tree down for
+	// these; every other session keeps the plain Process.Kill it always had.
+	shimmedChildTree bool
+	streamDone       chan struct{} // closed when stdout/stderr and stream publishes finish
 	// terminalPublishState reserves this session's ID while its session_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
@@ -322,6 +330,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// point returns early and would otherwise leak the file. Disarm this defer
 	// once the session has taken ownership.
 	var promptFile string
+	grokSmokeShimmed := false
 	sessionOwnsPromptFile := false
 	defer func() {
 		if promptFile != "" && !sessionOwnsPromptFile {
@@ -516,6 +525,12 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// version probe above already took that route, and a direct spawn here
 		// would fail before the marker exactly as the un-shimmed probe did. A
 		// native binary spawns directly, with the env and cwd resolved above.
+		// The shim route hands us an intermediate cmd.exe, not grok itself, and
+		// this launch supplies a background context — so exec's own Cancel (the
+		// tree kill bindGrokShimProcessTree installs) can never fire here.
+		// Record the wrapper so every session kill path takes the tree down
+		// instead of orphaning the shim's Node child on the output handles.
+		grokSmokeShimmed = isGrokWindowsShim(executable)
 		proc = newGrokSmokeCmd(context.Background(), grokSmokeLaunch{
 			Path:       executable,
 			Args:       cliArgs,
@@ -743,6 +758,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
+		shimmedChildTree:   grokSmokeShimmed,
 	}
 
 	sm.sessions[id] = session
@@ -955,7 +971,7 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 		fmt.Printf("%s[session] Interrupt sent to %s%s\n", colorYellow, id, colorReset)
 	case "kill":
 		// Force kill
-		if err := session.Process.Process.Kill(); err != nil {
+		if err := killSessionProcess(session); err != nil {
 			return fmt.Errorf("failed to kill session %s: %w", id, err)
 		}
 		fmt.Printf("%s[session] Kill sent to %s%s\n", colorRed, id, colorReset)
@@ -964,6 +980,25 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 	}
 
 	return nil
+}
+
+// killSessionProcess force-kills a session's child.
+//
+// For an ordinary session this is exactly the Process.Kill it has always been.
+// For a session whose child is a cmd.exe wrapper (shimmedChildTree — the
+// Windows `grok.cmd` smoke route) the whole tree goes down FIRST, because
+// killing cmd.exe on its own reparents the shim's real Grok/Node child out of
+// `taskkill /T`'s reach. Reuses KillProcessTree (processes_windows.go), the
+// same teardown cleanup_windows.go and bindGrokShimProcessTree use; it is a
+// no-op error on non-Windows, which is swallowed.
+func killSessionProcess(session *CLISession) error {
+	if session == nil || session.Process == nil || session.Process.Process == nil {
+		return os.ErrProcessDone
+	}
+	if session.shimmedChildTree {
+		_ = KillProcessTree(session.Process.Process.Pid)
+	}
+	return session.Process.Process.Kill()
 }
 
 /* --------------------------------------------------------------------------
@@ -1015,7 +1050,7 @@ func (sm *SessionManager) EndSession(id string) error {
 			return fmt.Errorf("session %s not found", id)
 		}
 		if session.Process.Process != nil {
-			if killErr := session.Process.Process.Kill(); killErr != nil {
+			if killErr := killSessionProcess(session); killErr != nil {
 				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 			}
 		}
@@ -1038,7 +1073,7 @@ func (sm *SessionManager) EndSession(id string) error {
 		// Force kill after timeout
 		fmt.Printf("%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
 			colorRed, id, colorReset)
-		if killErr := session.Process.Process.Kill(); killErr != nil {
+		if killErr := killSessionProcess(session); killErr != nil {
 			fmt.Printf("%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 		}
 		// BOUNDED wait for exit after kill — see end_confirm.go for why
@@ -1933,7 +1968,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 			fmt.Printf("%s[session] Session %s timed out after %dms — killing%s\n",
 				colorYellow, session.ID, session.TimeoutMs, colorReset)
 			if session.Process.Process != nil {
-				session.Process.Process.Kill()
+				_ = killSessionProcess(session)
 			}
 		})
 	}

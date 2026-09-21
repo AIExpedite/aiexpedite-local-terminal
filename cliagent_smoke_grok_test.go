@@ -1071,7 +1071,7 @@ func TestGrokSmokeShimScript_RendersTheVersionPrecheck(t *testing.T) {
 	if !ok {
 		t.Fatal("the version precheck must be renderable through the shim route")
 	}
-	if script != `call "%`+grokSmokeShimPathEnv+`%" --version` {
+	if script != `"%`+grokSmokeShimPathEnv+`%" --version` {
 		t.Fatalf("version script = %q", script)
 	}
 }
@@ -1087,8 +1087,13 @@ func TestGrokSmokeShimScript_RendersFixedTokensAndKeepsPathsOutOfTheScript(t *te
 		if !ok {
 			t.Fatalf("rung %s refused by the shim renderer", shape.ID)
 		}
-		if !strings.HasPrefix(script, `call "%`+grokSmokeShimPathEnv+`%"`) {
-			t.Errorf("rung %s script does not begin with the env-indirected call: %q", shape.ID, script)
+		if !strings.HasPrefix(script, `"%`+grokSmokeShimPathEnv+`%"`) {
+			t.Errorf("rung %s script does not begin with the env-indirected shim path: %q", shape.ID, script)
+		}
+		// `call` would re-expand a percent sequence the shim or prompt path
+		// legitimately contains, mangling it before the shim ever runs.
+		if strings.Contains(script, "call ") {
+			t.Errorf("rung %s script reintroduced CALL's second percent expansion: %q", shape.ID, script)
 		}
 		if strings.Contains(script, promptFile) || strings.Contains(script, "Some One") {
 			t.Errorf("rung %s script interpolated the prompt path: %q", shape.ID, script)

@@ -46,8 +46,14 @@ func TestGrokSmokeShimCommand_RoutesCmdShimThroughCmdExeAndHidesTheWindow(t *tes
 		t.Error("shim route lost HideWindow — cmd.exe would flash a console on the user's desktop")
 	}
 	line := cmd.SysProcAttr.CmdLine
-	if !strings.HasPrefix(line, "/d /v:off /c call \"%"+grokSmokeShimPathEnv+"%\"") {
-		t.Errorf("CmdLine = %q, want the /d /v:off /c call prefix with an env-indirected shim path", line)
+	if !strings.HasPrefix(line, "/d /s /v:off /c \"\"%"+grokSmokeShimPathEnv+"%\"") {
+		t.Errorf("CmdLine = %q, want the /d /s /v:off /c prefix with an env-indirected, outer-quoted shim path", line)
+	}
+	// /s strips exactly the outer quote pair, so the shim path keeps its own
+	// quoting without a leading `call` — whose second percent expansion would
+	// mangle a path containing a paired percent sequence.
+	if !strings.HasSuffix(line, "\"") || strings.Contains(line, " call ") {
+		t.Errorf("CmdLine = %q, want an outer-quoted line with no CALL", line)
 	}
 	if strings.Contains(line, launch.Path) || strings.Contains(line, promptFile) {
 		t.Errorf("a path leaked into the raw cmd.exe command line: %q", line)

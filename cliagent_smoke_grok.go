@@ -623,19 +623,27 @@ const (
 // grokSmokeShimScript renders the explicit cmd.exe command line for a `.cmd` /
 // `.bat` shim launch:
 //
-//	call "%AIEXPEDITE_GROK_SMOKE_SHIM%" <fixed flags…> --prompt-file "%AIEXPEDITE_GROK_SMOKE_PROMPT_FILE%"
+//	"%AIEXPEDITE_GROK_SMOKE_SHIM%" <fixed flags…> --prompt-file "%AIEXPEDITE_GROK_SMOKE_PROMPT_FILE%"
 //
-// `call` puts a keyword — not a quote — first on the line, which keeps cmd.exe
-// from applying its leading/trailing quote-stripping rule to a line that
-// carries two quoted operands, and it returns the batch file's exit code. The
-// only non-fixed tokens are the two paths, and both travel through the
+// The shim is invoked DIRECTLY, with no leading `call`. `call` performs a
+// SECOND round of percent expansion over the already-expanded line, so a shim
+// or prompt path that legitimately contains a paired percent sequence
+// (`C:\Users\dev\%DEV%\grok.cmd` — a valid Windows directory name) would have
+// that sequence re-read as an environment reference and mangled or dropped
+// before the shim ever ran. One expansion pass keeps both paths literal, and a
+// `.cmd` run directly under `cmd /c` still returns the batch file's exit code.
+// The line that carries two quoted operands is kept intact by the caller's
+// `/s` + outer-quote rendering (configureGrokWindowsShimCommandLine) rather
+// than by a leading keyword.
+//
+// The only non-fixed tokens are the two paths, and both travel through the
 // environment. Every other token must be one of the shape's own fixed flags —
 // a token outside that charset (a space, a quote, a metacharacter) refuses the
 // route (ok=false) so the caller falls back to a direct spawn rather than
 // interpolating unexpected text into a script line.
 func grokSmokeShimScript(args []string) (script string, ok bool) {
 	var b strings.Builder
-	b.WriteString(`call "%` + grokSmokeShimPathEnv + `%"`)
+	b.WriteString(`"%` + grokSmokeShimPathEnv + `%"`)
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == grokSmokePromptFileFlag && i+1 < len(args) {

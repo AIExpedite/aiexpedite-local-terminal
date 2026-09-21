@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -1812,5 +1813,36 @@ func TestWriteGrokUsageLimitState_ReachedWinsUntilTTL(t *testing.T) {
 	}
 	if string(after) != string(before) {
 		t.Fatal("severity-empty notice write must be rejected")
+	}
+}
+
+// The retained session_start maintenance smoke launches its child with a
+// BACKGROUND context (newGrokSmokeCmd), so exec's own Cancel — the tree kill
+// bindGrokShimProcessTree installs — can never fire for it. On Windows that
+// child is an intermediate cmd.exe: killing it alone reparents the npm
+// `grok.cmd` shim's Node/Grok process out of taskkill /T's reach, leaking a
+// provider process that still holds the session's output handles. Every
+// session kill route therefore goes through killSessionProcess, which takes
+// the whole tree down first for a shim-wrapped session and is the plain
+// Process.Kill for every other one.
+func TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions(t *testing.T) {
+	for _, shimmed := range []bool{false, true} {
+		proc := exec.Command("sleep", "60")
+		if err := proc.Start(); err != nil {
+			t.Fatalf("start child: %v", err)
+		}
+		session := &CLISession{ID: "kill-test", Process: proc, shimmedChildTree: shimmed}
+		if err := killSessionProcess(session); err != nil {
+			t.Fatalf("killSessionProcess(shimmed=%v): %v", shimmed, err)
+		}
+		if err := proc.Wait(); err == nil {
+			t.Fatalf("child with shimmed=%v exited cleanly, want killed", shimmed)
+		}
+	}
+	if err := killSessionProcess(&CLISession{ID: "no-process"}); err == nil {
+		t.Fatal("killSessionProcess must report a session with no process rather than panic")
+	}
+	if err := killSessionProcess(nil); err == nil {
+		t.Fatal("killSessionProcess must be nil-safe")
 	}
 }

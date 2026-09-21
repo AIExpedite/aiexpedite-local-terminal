@@ -24,6 +24,23 @@ func configureGrokWindowsCommandLine(cmd *exec.Cmd, script string) {
 	cmd.SysProcAttr.CmdLine = "/d /v:off /c " + script
 }
 
+// configureGrokWindowsShimCommandLine renders the `.cmd` shim launch, whose
+// script begins with a quoted operand and carries a second one.
+//
+// Without /s, cmd.exe applies its "strip the first and last quote character"
+// rule to such a line and the shim path loses its quoting. The line used to
+// lead with `call` to dodge that rule, but `call` performs a SECOND percent
+// expansion over the already-expanded text, so a path holding a paired percent
+// sequence (`C:\Users\dev\%DEV%\grok.cmd`) was re-read as an environment
+// reference and mangled. /s strips exactly the outer quote pair and leaves
+// everything between untouched — one expansion pass, both paths literal.
+func configureGrokWindowsShimCommandLine(cmd *exec.Cmd, script string) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CmdLine = `/d /s /v:off /c "` + script + `"`
+}
+
 // grokSmokeShimCommand routes a `.cmd` / `.bat` npm shim launch of the Grok
 // maintenance smoke through cmd.exe with an explicit command line, so the
 // shim's re-parse cannot re-split or drop a token. Both paths ride in the
@@ -40,6 +57,7 @@ func grokSmokeShimCommand(ctx context.Context, launch grokSmokeLaunch) (*exec.Cm
 		return nil, false
 	}
 	cmd := grokWindowsCommandContext(ctx, script)
+	configureGrokWindowsShimCommandLine(cmd, script)
 	bindGrokShimProcessTree(cmd)
 	env := setEnvVar(launch.Env, grokSmokeShimPathEnv, launch.Path)
 	cmd.Env = setEnvVar(env, grokSmokeShimPromptEnv, launch.PromptFile)
