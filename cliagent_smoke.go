@@ -397,8 +397,8 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 // themselves, since that is what a working env-credential login looks like.
 //
 // The opposite direction — a user who logs IN after a failure — needs no check
-// here: a not_authenticated verdict is never cached at all (see
-// cliSmokeVerdictSpentTurn).
+// here: neither a not_logged_in nor a provider-side auth_error verdict is
+// cached at all (see cliSmokeVerdictSpentTurn).
 func replayableCLISmokeVerdict(cliID, stamp, path string, loggedInCheck func(context.Context, string) (bool, bool)) (cliSmokeResult, bool) {
 	cliSmokeCooldownMu.Lock()
 	entry, seen := cliSmokeCooldownCache[cliID]
@@ -438,10 +438,19 @@ func rememberCLISmokeVerdict(cliID, stamp string, result cliSmokeResult) {
 // minutes keeps reporting a broken CLI for a user who signed in ten seconds
 // after the probe, and a transient `internal` (marker RNG, isolation setup)
 // failure would stick just as long.
+//
+// `auth_error` belongs with them even though the child did launch: the provider
+// rejected the credential BEFORE any assistant turn, so nothing was spent. It
+// is also the one failure the replay's login re-check cannot clear — that check
+// only drops a cached verdict when the local login is known-bad, and an expired
+// or revoked credential that the local precheck still reads as valid looks
+// healthy again the moment the user signs in. Pinning it would keep reporting
+// a broken CLI across exactly the recovery it is meant to notice.
 func cliSmokeVerdictSpentTurn(result cliSmokeResult) bool {
 	switch result.Diagnostic {
 	case cliSmokeDiagnosticBinaryMissing,
 		cliSmokeDiagnosticNotLoggedIn,
+		cliSmokeDiagnosticAuthError,
 		cliSmokeDiagnosticInternal:
 		return false
 	}

@@ -150,8 +150,42 @@ var resolveGrokSmokePath = func() string {
 // maintenance-only env policy, cached per (path, mtime, size) exactly as the
 // CLI detection does — so an upgrade re-probes and a steady-state smoke does
 // not spawn a version child.
+//
+// A Windows npm shim takes the SAME cmd.exe route the inference launch takes:
+// CreateProcess cannot start a batch file directly, so probing `grok.cmd`
+// with a plain exec.Command answers "" and the smoke reports binary_missing
+// without ever exercising the shim-safe route this probe exists to provide.
 func grokSmokeProbeVersion(path string) string {
-	return cachedProbeVersionWithEnv(path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()))
+	env := sanitizeGrokMaintenanceSmokeEnv(os.Environ())
+	if isGrokWindowsShim(path) {
+		return cachedProbeVersionFunc(path, func() string {
+			return grokSmokeShimProbeVersion(path, env)
+		})
+	}
+	return cachedProbeVersionWithEnv(path, env)
+}
+
+// grokSmokeShimProbeVersion runs `<shim> --version` through grokSmokeShimCommand
+// — cmd.exe, explicit command line, shim path carried in the environment —
+// under the same short probe deadline the machine-info probes use. Returns ""
+// on any failure, exactly like probeVersionArgsWithEnv, so the caller's
+// binary_missing pre-check is unchanged for a genuinely dead shim.
+func grokSmokeShimProbeVersion(path string, env []string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	defer cancel()
+	cmd, ok := grokSmokeShimCommand(ctx, grokSmokeLaunch{
+		Path: path,
+		Args: []string{"--version"},
+		Env:  env,
+	})
+	if !ok {
+		return ""
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return firstNonEmptyLine(out)
 }
 
 // grokSmokeLoggedIn is the free login re-check the cooldown replay runs. Same

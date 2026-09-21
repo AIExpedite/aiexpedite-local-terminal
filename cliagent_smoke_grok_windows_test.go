@@ -135,3 +135,39 @@ func TestGrokSmokeShimCommand_RoundTripsEveryTokenThroughARealShim(t *testing.T)
 		}
 	}
 }
+
+// The version precheck must survive the shim too: CreateProcess cannot start a
+// batch file, so probing `grok.cmd` directly answers "" and runGrokSmoke would
+// report binary_missing without ever exercising the shim-safe route.
+func TestGrokSmokeProbeVersion_AnswersThroughACmdShim(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "grok.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif \"%1\"==\"--version\" echo grok 1.0.13\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	stamp, err := os.Stat(shim)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := grokSmokeProbeVersion(shim); got != "grok 1.0.13" {
+		t.Fatalf("grokSmokeProbeVersion(%q) = %q, want the shim's version", shim, got)
+	}
+	// The answer is remembered on the binary stamp like every other version
+	// probe: a second call spawns no child, which a now-broken shim proves.
+	broken := []byte("@echo off\r\nexit /b 1\r\n")
+	for len(broken) < int(stamp.Size()) { // same (size, mtime) => same cache key
+		broken = append(broken, ' ')
+	}
+	if err := os.WriteFile(shim, broken, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(shim, time.Time{}, stamp.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if got := grokSmokeProbeVersion(shim); got != "grok 1.0.13" {
+		t.Fatalf("cached shim version = %q, want the remembered answer", got)
+	}
+}

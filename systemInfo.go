@@ -487,6 +487,12 @@ func probeVersionArgsWithEnv(cmd string, env []string, args ...string) string {
 	// Some tools print version on stderr (java) and others print multiple
 	// lines (`go version go1.x` is one line; `bash --version` is many).
 	// First non-empty line is what we want.
+	return firstNonEmptyLine(out)
+}
+
+// firstNonEmptyLine returns the first non-blank, trimmed line of a probe's
+// combined output, or "" when there is none.
+func firstNonEmptyLine(out []byte) string {
 	for _, line := range strings.Split(string(out), "\n") {
 		s := strings.TrimSpace(line)
 		if s != "" {
@@ -693,9 +699,20 @@ func cachedProbeVersion(path string) string {
 }
 
 func cachedProbeVersionWithEnv(path string, env []string) string {
+	return cachedProbeVersionFunc(path, func() string {
+		return probeVersionArgsWithEnv(path, env, "--version")
+	})
+}
+
+// cachedProbeVersionFunc is the caching half on its own, for a caller whose
+// binary cannot be spawned by a plain exec.Command -- notably the Grok
+// maintenance smoke on Windows, where an npm `grok.cmd` shim has to go through
+// cmd.exe. The cache key and pruning rule are identical; only how the version
+// is obtained differs.
+func cachedProbeVersionFunc(path string, probe func() string) string {
 	info, err := os.Stat(path)
 	if err != nil {
-		return probeVersionArgsWithEnv(path, env, "--version")
+		return probe()
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
 
@@ -706,7 +723,7 @@ func cachedProbeVersionWithEnv(path string, env []string) string {
 		return cached
 	}
 
-	v := probeVersionArgsWithEnv(path, env, "--version")
+	v := probe()
 	versionProbeMu.Lock()
 	// Cache negatives too: a binary that reliably fails --version would
 	// otherwise re-spawn a doomed child on every single gather, which is the

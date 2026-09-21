@@ -651,6 +651,41 @@ func TestRunCLISmoke_GrokCallerCancellationIsNotCached(t *testing.T) {
 	}
 }
 
+// A provider-side auth rejection (the local credential still parses, xAI
+// refuses it) spends no turn and is the one failure the replay's login
+// re-check cannot clear — so it must never be pinned. The user who signs in
+// again gets a real probe on the next wake, not the cached failure.
+func TestRunCLISmoke_GrokAuthErrorIsNotCached(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.13")
+	rejected := false
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		if !rejected {
+			rejected = true
+			return []byte(`{"type":"error","message":"Not logged in. Run grok login."}` + "\n" + `{"type":"end"}`), nil, grokExitError(t)
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	first, replayed := runCLISmoke(context.Background(), "grok")
+	if replayed || first.Diagnostic != cliSmokeDiagnosticAuthError {
+		t.Fatalf("first smoke = %+v replayed=%t, want an executed auth_error", first, replayed)
+	}
+	if cliSmokeVerdictSpentTurn(first) {
+		t.Fatal("a pre-inference auth rejection must not be pinned by the cooldown")
+	}
+	// Same binary, same cooldown window, credential healthy again.
+	second, replayed := runCLISmoke(context.Background(), "grok")
+	if replayed || second.Status != cliSmokeStatusSuccess {
+		t.Fatalf("post-login smoke replayed the cached auth failure: %+v replayed=%t", second, replayed)
+	}
+	if *calls != 2 {
+		t.Fatalf("post-login smoke did not execute: calls=%d", *calls)
+	}
+}
+
 func TestRunCLISmoke_GrokCachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
 	persistent := grokSmokeEnv(t)
 	path := stubGrokBinary(t)
@@ -780,6 +815,19 @@ func TestGrokSmokeFailureLogLine_CarriesOnlyClosedValues(t *testing.T) {
 	want := fmt.Sprintf("[cli-smoke] grok shape=%s category=protocol diagnostic=flag_rejected stderrBytes=512", grokSmokeArgvShapes[0].ID)
 	if !strings.Contains(line, want) {
 		t.Fatalf("log line = %q, want it to contain %q", line, want)
+	}
+}
+
+// The version precheck takes the SAME cmd.exe route as the inference launch,
+// so a `grok.cmd` npm shim answers --version instead of failing CreateProcess
+// and reporting binary_missing. Pure-string half, runs everywhere.
+func TestGrokSmokeShimScript_RendersTheVersionPrecheck(t *testing.T) {
+	script, ok := grokSmokeShimScript([]string{"--version"})
+	if !ok {
+		t.Fatal("the version precheck must be renderable through the shim route")
+	}
+	if script != `call "%`+grokSmokeShimPathEnv+`%" --version` {
+		t.Fatalf("version script = %q", script)
 	}
 }
 
