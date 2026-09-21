@@ -1079,6 +1079,19 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 		}
 		res, ran, busy, _ := codexRunGatedReconcile(ctx, base, fp, floor, forced, now)
 		if ran {
+			// A reconcile spent ON a debt counts as one of its bounded
+			// attempts, exactly like the post-run worker's. Uncounted, a debt
+			// carried over from a previous process — whose startup replay
+			// spends one attempt and then retires — would be rescanned by
+			// every later gather while never reaching the stale-notice
+			// threshold (codexStaleRunNotice gates on attempts >=
+			// codexRefreshAfterRunMaxAttempts), so the card would keep looking
+			// current and age the debt out without ever saying why it is old.
+			// A no-op once this reconcile PAID the debt: the same transaction
+			// cleared the count (codexCountRefreshAttempt).
+			if state.owed {
+				codexRecordRefreshAttempt(fp, 1)
+			}
 			return res
 		}
 		if forced && busy != nil {

@@ -165,6 +165,43 @@ func TestBuildCodexInteractiveArgs_PreservesResumeSubcommand(t *testing.T) {
 	}
 }
 
+// `codex exec resume|review "<prompt>"` runs its turn the moment the process
+// starts — its prompt travels in argv — while a session opened with no prompt
+// at all sits idle until SendInput delivers one. Both reach StartSession with
+// a nil stdinPrompt, so the utilization floor is armed off this predicate: a
+// false negative leaves the run's utilization stale (the bug), a false
+// positive books a debt for a run that never happened.
+func TestCodexPromptTravelsOnArgv(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"top-level prompt goes to stdin", []string{"implement the login page"}, false},
+		{"no args at all", nil, false},
+		{"resume --last with prompt", []string{"resume", "--last", "follow-up"}, true},
+		{"resume session id with prompt", []string{"resume", "abc-123", "follow-up"}, true},
+		{"resume session id only", []string{"resume", "abc-123"}, false},
+		{"resume --last only", []string{"resume", "--last"}, false},
+		{"resume prompt behind a valued flag", []string{"--model", "o3", "resume", "--last", "follow-up"}, true},
+		{"resume flag value is not the prompt", []string{"resume", "--last", "--model", "o3"}, false},
+		{"review with prompt", []string{"review", "--base", "main", "check the diff"}, true},
+		{"review with no prompt", []string{"review", "--base", "main"}, false},
+		{"prompt placed on stdin explicitly", []string{"resume", "--last", "-"}, false},
+		{"help is not a run", []string{"help"}, false},
+		// The automation flags sanitizeCodexExecArgs strips must not shift the
+		// subcommand out of view.
+		{"sanitized flags before the subcommand", []string{"exec", "--json", "resume", "--last", "follow-up"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexPromptTravelsOnArgv(tc.args); got != tc.want {
+				t.Errorf("codexPromptTravelsOnArgv(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildCodexInteractiveArgs_PreservesResumeSessionAndPrompt(t *testing.T) {
 	args, prompt := buildCodexInteractiveArgs([]string{"resume", "abc-123", "follow-up text"})
 	if prompt != "" {
@@ -3778,6 +3815,33 @@ func TestSessionLifecycle_CodexDeferredPromptArmsOnDelivery(t *testing.T) {
 	}
 	if !settled[0].Equal(floor) {
 		t.Fatalf("settled with floor %s, want the delivered prompt's floor %s", settled[0], floor)
+	}
+}
+
+// `codex exec resume|review "<prompt>"` carries its prompt in argv, so the
+// child is running the turn from the moment it starts even though
+// buildCodexInteractiveArgs hands StartSession a nil stdinPrompt (the same
+// signal the idle chat-direct session gives). Its floor is armed at start —
+// otherwise these supported runs settle nothing and leave utilization stale.
+func TestSessionLifecycle_CodexArgvSubcommandArmsAtStart(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "codex", []string{"resume", "--last", "follow-up"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the run start %s", settled[0], floor)
 	}
 }
 

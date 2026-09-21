@@ -733,8 +733,13 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// prompt, and its exit must not settle a run that never happened into a
 	// debt no telemetry can pay. A session started WITHOUT a prompt is not
 	// running yet — its run is armed by the SendInput that delivers one.
+	// `codex exec resume|review "<prompt>"` is the third shape: a nil
+	// stdinPrompt because its prompt stayed in argv (buildCodexInteractiveArgs
+	// forwards those subcommands verbatim), so it IS already running and is
+	// told apart from the idle session by codexPromptTravelsOnArgv.
 	// Asynchronous — never holds sm.mu across the cache lock.
-	if isCodexCommand(session.Command) && !session.deferredStdinClose && stdinPrompt == nil {
+	if isCodexCommand(session.Command) && stdinPrompt == nil &&
+		(!session.deferredStdinClose || codexPromptTravelsOnArgv(args)) {
 		session.armCodexUsageRun(session.StartedAt)
 	}
 
@@ -2529,55 +2534,13 @@ func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	// this, e.g. `--model o3` would treat "o3" as a prompt word. Keep this
 	// in sync with `codex exec --help` (and the resume/review subcommands).
 	// The `--flag=value` form is one token and doesn't need entries here.
-	valuedFlags := map[string]bool{
-		// Top-level `codex exec` options
-		"-c": true, "--config": true,
-		"-m": true, "--model": true,
-		"-i": true, "--image": true,
-		"-p": true, "--profile": true,
-		"-C": true, "--cd": true,
-		"-o": true, "--output-last-message": true,
-		"--enable": true, "--disable": true,
-		"--local-provider": true,
-		"--add-dir":        true,
-		"--output-schema":  true,
-		"--color":          true,
-		// `codex exec review` adds these (harmless when passed through in the
-		// subcommand path; listed for completeness so the value isn't
-		// misclassified if a future change brings reviews into the parser).
-		"--base":   true,
-		"--commit": true,
-		"--title":  true,
-	}
+	valuedFlags := codexExecValuedFlags
 
-	// Detect whether the user invoked an `exec` subcommand (resume/review/help)
-	// by scanning until the first non-flag positional token. Anything past that
-	// token belongs to the subcommand and must be forwarded verbatim.
-	knownSubcommands := map[string]bool{
-		"resume": true,
-		"review": true,
-		"help":   true,
-	}
-	hasSubcommand := false
-	{
-		skipNext := false
-		for i, a := range cleanedArgs {
-			if skipNext {
-				skipNext = false
-				continue
-			}
-			if strings.HasPrefix(a, "-") {
-				if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(cleanedArgs) {
-					skipNext = true
-				}
-				continue
-			}
-			if knownSubcommands[strings.ToLower(a)] {
-				hasSubcommand = true
-			}
-			break // first non-flag positional decides
-		}
-	}
+	// Detect whether the user invoked an `exec` subcommand (resume/review/help).
+	// Anything past that token belongs to the subcommand and must be forwarded
+	// verbatim.
+	subcommand, _ := codexExecSubcommand(cleanedArgs)
+	hasSubcommand := subcommand != ""
 
 	if hasSubcommand {
 		// Subcommand path: keep argv shape intact, no stdin routing.
@@ -2625,6 +2588,116 @@ func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	result = append(result, "-")
 
 	return result, strings.Join(promptParts, " ")
+}
+
+// codexExecValuedFlags lists the codex options that consume the NEXT argv
+// token as their value — without it, e.g. `--model o3` would read "o3" as a
+// prompt word. Keep in sync with `codex exec --help` (and the resume/review
+// subcommands). The `--flag=value` form is one token and needs no entry.
+var codexExecValuedFlags = map[string]bool{
+	// Top-level `codex exec` options
+	"-c": true, "--config": true,
+	"-m": true, "--model": true,
+	"-i": true, "--image": true,
+	"-p": true, "--profile": true,
+	"-C": true, "--cd": true,
+	"-o": true, "--output-last-message": true,
+	"--enable": true, "--disable": true,
+	"--local-provider": true,
+	"--add-dir":        true,
+	"--output-schema":  true,
+	"--color":          true,
+	// `codex exec review` adds these (harmless when passed through in the
+	// subcommand path; listed for completeness so the value isn't
+	// misclassified if a future change brings reviews into the parser).
+	"--base":   true,
+	"--commit": true,
+	"--title":  true,
+}
+
+// codexExecSubcommand reports which `codex exec` subcommand (resume/review/
+// help) a sanitized argv invokes, plus the tokens that follow it. The first
+// non-flag positional decides; flags that consume a value are skipped so the
+// value is never mistaken for the subcommand. Empty name means the ordinary
+// top-level `codex exec` form, whose prompt buildCodexInteractiveArgs routes
+// through stdin.
+func codexExecSubcommand(cleanedArgs []string) (string, []string) {
+	known := map[string]bool{"resume": true, "review": true, "help": true}
+	skipNext := false
+	for i, a := range cleanedArgs {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			if !strings.Contains(a, "=") && codexExecValuedFlags[a] && i+1 < len(cleanedArgs) {
+				skipNext = true
+			}
+			continue
+		}
+		if name := strings.ToLower(a); known[name] {
+			return name, cleanedArgs[i+1:]
+		}
+		return "", nil // first non-flag positional decides
+	}
+	return "", nil
+}
+
+// codexExecPositionals returns the non-flag tokens of an argv tail, skipping
+// the values of flags that consume one.
+func codexExecPositionals(args []string) []string {
+	var positionals []string
+	skipNext := false
+	for i, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			if !strings.Contains(a, "=") && codexExecValuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		positionals = append(positionals, a)
+	}
+	return positionals
+}
+
+// codexPromptTravelsOnArgv reports whether a codex invocation already carries
+// its prompt in argv, so the child is running the turn the moment it starts.
+//
+// buildCodexInteractiveArgs passes `codex exec resume|review` through verbatim
+// and returns NO stdinPrompt for them, which is the same signal a chat-direct
+// session — opened empty and fed its prompt by the first SendInput — gives.
+// StartSession needs to tell the two apart: the argv-bearing subcommand runs
+// immediately and must arm its utilization floor at start, while the empty
+// session must not (nothing is running yet; SendInput arms it on delivery).
+//
+// Conservative by design: a subcommand whose prompt is absent or routed to
+// stdin (the `-` placeholder) reports false and is armed by SendInput instead.
+// `resume` puts SESSION_ID before PROMPT unless --last names the session.
+func codexPromptTravelsOnArgv(args []string) bool {
+	subcommand, rest := codexExecSubcommand(sanitizeCodexExecArgs(args))
+	promptIndex := 0
+	switch subcommand {
+	case "review":
+	case "resume":
+		promptIndex = 1 // SESSION_ID PROMPT
+		for _, a := range rest {
+			if a == "--last" {
+				promptIndex = 0 // --last names the session; PROMPT is first
+				break
+			}
+		}
+	default:
+		return false // `help`, or the top-level stdin-routed form
+	}
+	positionals := codexExecPositionals(rest)
+	if len(positionals) <= promptIndex {
+		return false
+	}
+	return positionals[promptIndex] != "-"
 }
 
 func sanitizeCodexExecArgs(args []string) []string {

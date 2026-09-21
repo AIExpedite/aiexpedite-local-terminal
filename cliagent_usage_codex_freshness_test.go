@@ -725,6 +725,70 @@ func TestCodexRefreshAfterRun_RetainedDebtOutlivesTheReconcileAttempts(t *testin
 	}
 }
 
+// A gather that spends a forced reconcile ON a debt counts it as one of that
+// debt's bounded attempts. Without the count, a debt carried over from a
+// previous process — whose startup replay spends one attempt and then retires
+// — would be rescanned by every later gather while never reaching the
+// stale-notice threshold, so the card would age it out without ever saying why
+// the reading looks old.
+func TestCodexReconcileForGather_CountsAnAttemptOnTheDebt(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	// The state a startup replay leaves behind: still owed, one attempt spent.
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now)
+		codexCountRefreshAttempt(snap)
+	}) {
+		t.Fatal("seeding the debt failed")
+	}
+
+	// No rollout telemetry exists for this run, so the reconcile comes up empty
+	// and the debt stays owed — the case the notice exists for.
+	ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
+	defer cancel()
+	codexReconcileForGather(ctx, codexHomeBase(), f.fp, now, false)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("debt was cleared without any covering observation: %+v", snap)
+	}
+	if snap.RefreshOwedAttempts != codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("RefreshOwedAttempts=%d, want the gather's reconcile counted (%d)",
+			snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice == "" {
+		t.Fatal("want the stale-run notice once every bounded attempt is spent")
+	}
+}
+
+// A reconcile that PAYS the debt must not leave an attempt behind it: the
+// clearing transaction zeroes the count, and counting it afterwards would
+// re-create a debt-less count the next run's notice could trip over.
+func TestCodexReconcileForGather_PaidDebtKeepsNoAttempt(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	writeCodexRunRollout(t, f.home, "run", runStart, runStart.Add(30*time.Second), runStart.Add(40*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(61, 64, now)})
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now)
+	}) {
+		t.Fatal("seeding the debt failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
+	defer cancel()
+	codexReconcileForGather(ctx, codexHomeBase(), f.fp, now, false)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("paid debt left bookkeeping behind: %+v", snap)
+	}
+}
+
 // A debt the worker could not land at all is flushed by the next gather: the
 // parser reads the debt off disk, so a debt retained only in memory would read
 // as paid and the gather would neither force a scan nor warn.
