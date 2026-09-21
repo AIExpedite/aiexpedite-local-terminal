@@ -800,19 +800,17 @@ func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 // are stamped only from the local clock, so codexRunFloorLocalSkew is all the
 // headroom they ever need. A contributor observation can carry a Codex-stamped
 // envelope time, so it keeps the wider codexRunFloorClockSkew — UNLESS a floor
-// is itself dated ahead, which proves the local clock moved back: provider skew
-// can no longer explain a future observation either, and leaving one behind
-// would let it cover (and instantly retire the debt of) every run armed until
-// wall time caught back up. Reports whether anything was rebased.
+// is itself dated ahead, which proves the local clock moved back. Provider skew
+// can no longer explain a future observation either, and the allowance has to
+// go entirely, not just narrow to the local one: a rollback of two minutes
+// leaves a pre-run observation anywhere inside the surviving allowance intact,
+// and the run armed at `now` is then read as covered by it and marked paid
+// before the post-run reconcile ever runs. So once rollback is proven, every
+// observation at or after this run's start is re-dated behind it — it was
+// taken before the run, whatever clock stamped it. Reports whether anything
+// was rebased.
 func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now time.Time) bool {
 	localCeilingMs := now.Add(codexRunFloorLocalSkew).UnixMilli()
-	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
-	for _, floor := range []int64{snap.RunFloorMs, snap.ActiveRunFloorMs, snap.RunFloorPaidMs, snap.RefreshOwedAtMs} {
-		if floor > localCeilingMs {
-			ceilingMs = localCeilingMs
-			break
-		}
-	}
 	// Before the run started AND not after `now`: an observation this rebase
 	// touches was taken before the run it is being re-dated behind, so it must
 	// not be able to stand in for that run's telemetry.
@@ -821,6 +819,13 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 		beforeMs = nowMs
 	}
 	beforeMs--
+	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
+	for _, floor := range []int64{snap.RunFloorMs, snap.ActiveRunFloorMs, snap.RunFloorPaidMs, snap.RefreshOwedAtMs} {
+		if floor > localCeilingMs {
+			ceilingMs = beforeMs
+			break
+		}
+	}
 	rebased := false
 	for _, limits := range snap.Contributors {
 		for limit, bucket := range limits {
@@ -1349,8 +1354,22 @@ func payOwedCodexUsageRefresh() {
 // middle of into a debt completed at `now`. When the bounded cache locks
 // refuse the write, the debt is RETAINED in the gate rather than dropped, so
 // payOwedCodexUsageRefresh can retry it through the worker.
+//
+// The classification that picked `floor` was made off an earlier cache read,
+// so the decision is re-taken HERE, inside the transaction, against the
+// snapshot actually being written: a run of this process that armed in the
+// meantime has already replaced the floor, and codexOweRunRefresh would then
+// book a completion time for a run that is still going — mid-run telemetry
+// would retire that debt, and a crash before the real completion would leave
+// no interrupted marker at all. A floor that has moved on, or one this process
+// armed itself, is left to its own settle path; that is not a refused write,
+// so it is reported as handled rather than retained.
 func codexOweInterruptedRun(fp string, floor, now time.Time) bool {
+	floorMs := floor.UnixMilli()
 	if codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+		if snap.RunFloorMs != floorMs || codexUsageRefresh.armedLocally(floorMs) {
+			return
+		}
 		codexOweRunRefresh(snap, floor, now)
 	}) {
 		return true

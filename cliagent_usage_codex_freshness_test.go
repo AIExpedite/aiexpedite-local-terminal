@@ -1738,3 +1738,96 @@ func TestCodexReconcileForGather_RebasesDebtLeftInTheFutureByAClockRollback(t *t
 		t.Fatalf("no stale notice may name a run that has not happened: %q", notice)
 	}
 }
+
+// A proven rollback has to drop the observation allowance ENTIRELY, not just
+// narrow it to the local one. After a two-minute backwards step, a floor left
+// two minutes ahead proves the clock moved, but a pre-run observation inside
+// the surviving allowance used to survive — and then covered the run armed at
+// `now`, retiring its debt before the post-run reconcile ever ran.
+func TestCodexArmRunFloor_RebasesObservationsInsideTheLocalAllowance(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	rolledBack := t0.Add(-2 * time.Minute)
+
+	// Observed a third of a minute after the rolled-back clock: ahead of the
+	// new run's start, but well inside codexRunFloorLocalSkew.
+	preRun := rolledBack.Add(20 * time.Second)
+	snap := codexRateLimitSnapshot{
+		RunFloorMs:     t0.UnixMilli(),
+		RunFloorPaidMs: t0.UnixMilli(),
+		Contributors: map[string]map[string]codexRateLimitBucket{
+			"5h": {"primary": {ObservedAtMs: preRun.UnixMilli(), UsedPercentage: 40}},
+		},
+	}
+	if !codexRebaseFutureRunFreshness(&snap, rolledBack, rolledBack) {
+		t.Fatal("a floor two minutes ahead of the clock must be rebased")
+	}
+	if observed := snap.Contributors["5h"]["primary"].ObservedAtMs; observed >= rolledBack.UnixMilli() {
+		t.Fatalf("an observation taken before the run must not survive at/after its start: %d", observed)
+	}
+
+	codexArmRunFloor(&snap, rolledBack)
+	codexOweRunRefresh(&snap, rolledBack, rolledBack.Add(time.Second))
+	codexSettleRunFreshness(&snap, rolledBack.Add(time.Second))
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors:    snap.Contributors,
+		runFloorMs:      snap.RunFloorMs,
+		runFloorPaidMs:  snap.RunFloorPaidMs,
+		refreshOwedAtMs: snap.RefreshOwedAtMs,
+	}, rolledBack.Add(time.Minute))
+	if !state.owed {
+		t.Fatalf("the pre-run observation must not pay the new run's debt: %+v %+v", state, snap)
+	}
+}
+
+// Startup classifies an interrupted floor off an earlier cache read, so a run
+// of THIS process can arm and persist a newer floor before the conversion
+// writes. Converting then would book a completion time for a run that is still
+// going: mid-run telemetry retires the debt, and a crash before the real
+// completion leaves no interrupted marker at all. The decision is re-taken
+// inside the transaction, so the live run is left to its own settle path.
+func TestCodexOweInterruptedRun_SkipsAFloorAnotherRunReplaced(t *testing.T) {
+	now := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+
+	interrupted := now.Add(-10 * time.Minute)
+	if !codexRecordRunFreshness(f.fp, interrupted, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, interrupted)
+	}) {
+		t.Fatal("seeding the interrupted floor must land")
+	}
+
+	// The live run of this process wins the race to disk.
+	live := now.Add(-time.Second)
+	if !codexRecordRunFreshness(f.fp, live, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, live)
+	}) {
+		t.Fatal("seeding the live floor must land")
+	}
+
+	// Reported handled — the write was not refused, the conversion is simply
+	// no longer the right thing to do — so no debt is retained for a retry.
+	if !codexOweInterruptedRun(f.fp, interrupted, now) {
+		t.Fatal("a superseded conversion is handled, not retained")
+	}
+	view := codexCacheViewForAccount(f.fp)
+	if view.refreshOwedAtMs != 0 {
+		t.Fatalf("the live run must not be recorded as completed: %+v", view)
+	}
+	if view.runFloorMs != live.UnixMilli() {
+		t.Fatalf("the live run keeps the floor: %+v", view)
+	}
+
+	// The floor that IS still the persisted one converts as before.
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.RunFloorMs = interrupted.UnixMilli()
+		snap.ActiveRunFloorMs = 0
+	}) {
+		t.Fatal("restoring the interrupted floor must land")
+	}
+	if !codexOweInterruptedRun(f.fp, interrupted, now) {
+		t.Fatal("converting the persisted interrupted floor must land")
+	}
+	if view := codexCacheViewForAccount(f.fp); view.refreshOwedAtMs != now.UnixMilli() {
+		t.Fatalf("the interrupted run must be owed from now: %+v", view)
+	}
+}
