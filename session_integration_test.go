@@ -595,12 +595,17 @@ func runMockCLI(mode string) {
 	}
 }
 
-// runMockGrokMaintenanceSmoke enforces the Grok 1.0.13 no-tools, one-shot
-// argv contract at the process boundary. It deliberately emits the legacy
-// `text` payload before the simulated update and 1.0.13's `data` payload after
-// it so the same SessionManager lifecycle proves protocol compatibility across
-// replacement. Failures expose only a generic protocol error, never argv,
-// prompt-file contents, or billing-log data.
+// runMockGrokMaintenanceSmoke enforces the Grok no-tools, one-shot argv
+// contract at the process boundary, for the build each mode impersonates:
+// the pre-update 1.0.5 build predates the headless isolation switches and
+// rejects them during option parsing (the pre-inference failure an older
+// publisher's session_start smoke must not hit), while the post-update 1.0.13
+// build documents them and rejects the retired `--no-auto-update` root flag.
+// It deliberately emits the legacy `text` payload before the simulated update
+// and 1.0.13's `data` payload after it so the same SessionManager lifecycle
+// proves protocol compatibility across replacement. Failures expose only a
+// generic protocol error, never argv, prompt-file contents, or billing-log
+// data.
 func runMockGrokMaintenanceSmoke(mode string) {
 	// Model Grok's documented diagnostics for both `--version` and the smoke:
 	// if the parent leaks either override, the probe/output is contaminated and
@@ -620,8 +625,9 @@ func runMockGrokMaintenanceSmoke(mode string) {
 			break
 		}
 	}
+	preHardenedBuild := mode == "grok-maintenance-smoke-v1"
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		if mode == "grok-maintenance-smoke-v1" {
+		if preHardenedBuild {
 			fmt.Println("grok 1.0.5")
 		} else {
 			fmt.Println("grok 1.0.13")
@@ -630,6 +636,17 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	}
 
 	args := os.Args[1:]
+	// Option parsing precedes everything else, as in the real CLI: a flag this
+	// build does not know is rejected before any isolation or auth check.
+	if preHardenedBuild {
+		if mockHasArg(args, "--disable-web-search") || mockHasArg(args, "--no-subagents") || !mockHasArg(args, "--no-auto-update") {
+			fmt.Fprintln(os.Stderr, "error: unexpected argument found")
+			os.Exit(2)
+		}
+	} else if mockHasArg(args, "--no-auto-update") || !mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") {
+		fmt.Fprintln(os.Stderr, "error: unexpected argument found")
+		os.Exit(2)
+	}
 	isolatedHome := os.Getenv("GROK_HOME")
 	persistentHome := os.Getenv(mockGrokPersistentHomeEnv)
 	vendorHome := os.Getenv(mockGrokVendorHomeEnv)
@@ -698,7 +715,6 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
-		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
 		mockHasArg(args, "") || mockHasArg(args, "-p") || !hasPromptFile || promptErr != nil ||
 		string(prompt) != "Return exactly this marker and nothing else: "+grokMaintenanceSmokeMarker {
 		fmt.Fprintln(os.Stderr, "protocol error")
@@ -709,7 +725,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		os.Exit(1)
 	}
 	field := "text"
-	if mode != "grok-maintenance-smoke-v1" {
+	if !preHardenedBuild {
 		field = "data"
 	}
 	// Real streaming-json output may split one assistant message across

@@ -559,13 +559,23 @@ Canonical shape (rung 0, `streaming-notools-prompt-file`):
   (not a documented root flag; the prompt asks for a verbatim echo). Rung 1
   (`streaming-notools-prompt-file-legacy`) drops the two isolation switches
   and carries `--no-auto-update`, the flag set an older build documented.
-- The ladder retries **only** on `flag_rejected` naming a flag a later rung
-  drops (`grokSmokeRetryableFlags`, derived from the shapes, never
-  hand-listed): option parsing precedes inference, so a rejected rung costs
-  no quota. A rejection of a flag every rung carries is reported as
-  `flag_rejected` without a second child. The winning rung is cached per
-  `(path, mtime, size)`; the session_start smoke takes its rung from the same
-  cache.
+- **Walk order follows the installed version** (`grokSmokeArgvShapesForVersion`):
+  a build reporting a version below `grokSmokeHardenedFlagsMinVersion`
+  (1.0.13, the first release documenting the isolation switches) tries the
+  legacy rung first; everything else — including an unparseable version —
+  keeps the canonical order. Every rung is always present, so a wrong guess
+  costs one free pre-inference spawn, not the verdict. The legacy
+  `session_start` smoke streams ONE child and cannot walk, so the
+  version-ordered first entry **is** its resolution of a compatible rung: an
+  older publisher's pre-update smoke against a pre-1.0.13 build is no longer
+  rejected during option parsing before it can bless the upgrade.
+- The ladder retries **only** on `flag_rejected` naming a flag another rung
+  drops (`grokSmokeRetryableFlags`, derived from the shapes in both
+  directions, never hand-listed): option parsing precedes inference, so a
+  rejected rung costs no quota. A rejection of a flag every rung carries is
+  reported as `flag_rejected` without a second child. The winning rung is
+  cached per `(path, mtime, size)`; the session_start smoke takes its rung
+  from the same cache.
 - **Windows `.cmd` / `.bat` shim:** the smoke routes the launch through
   `cmd.exe` with an explicit command line (`grokSmokeShimCommand` →
   `configureGrokWindowsCommandLine`): `call "%AIEXPEDITE_GROK_SMOKE_SHIM%"

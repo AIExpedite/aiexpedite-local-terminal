@@ -480,7 +480,10 @@ func TestRunGrokSmoke_FlagRejectionRetriesOnceAndCachesTheRung(t *testing.T) {
 		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
 	})
 
-	result := runGrokSmoke(context.Background(), path, "grok 1.0.5")
+	// A build that documents the hardened rung yet rejects one of its
+	// switches: the canonical rung goes first and the walk heals on the legacy
+	// rung.
+	result := runGrokSmoke(context.Background(), path, "grok 1.0.13")
 
 	if result.Status != cliSmokeStatusSuccess || !result.MarkerMatched {
 		t.Fatalf("legacy rung should have passed: %+v", result)
@@ -497,9 +500,75 @@ func TestRunGrokSmoke_FlagRejectionRetriesOnceAndCachesTheRung(t *testing.T) {
 
 	// Steady state: the resolved rung is the only one tried.
 	*calls = 0
-	result = runGrokSmoke(context.Background(), path, "grok 1.0.5")
+	result = runGrokSmoke(context.Background(), path, "grok 1.0.13")
 	if *calls != 1 || result.ArgvShapeID != grokSmokeArgvShapes[1].ID {
 		t.Fatalf("cached rung not honoured: calls=%d shape=%q", *calls, result.ArgvShapeID)
+	}
+}
+
+// A build that predates the isolation switches starts on the legacy rung, so
+// the probe spends no rejected spawn on it — and the legacy session_start
+// smoke, which takes the ladder's first entry as its ONLY child, resolves the
+// compatible rung without being able to walk at all.
+func TestRunGrokSmoke_PreHardenedBuildStartsOnTheLegacyRung(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	calls, launches := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		for _, arg := range launch.Args {
+			if arg == "--disable-web-search" || arg == "--no-subagents" {
+				return nil, []byte("error: unexpected argument '" + arg + "' found\n"), grokExitError(t)
+			}
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	if first := grokSmokeShapeLadder(path, "grok 1.0.5")[0]; first.ID != grokSmokeArgvShapes[1].ID {
+		t.Fatalf("session-path rung for a pre-1.0.13 build = %q, want the legacy rung", first.ID)
+	}
+
+	result := runGrokSmoke(context.Background(), path, "grok 1.0.5")
+	if result.Status != cliSmokeStatusSuccess || !result.MarkerMatched || result.ArgvShapeID != grokSmokeArgvShapes[1].ID {
+		t.Fatalf("pre-hardened build should pass on the legacy rung first: %+v", result)
+	}
+	if *calls != 1 {
+		t.Fatalf("spent %d children, want 1 (no rejected rung)", *calls)
+	}
+	if err := validateGrokSmokeShape((*launches)[0].Args); err != nil {
+		t.Fatalf("legacy rung failed the shape contract: %v", err)
+	}
+	for _, arg := range (*launches)[0].Args {
+		if arg == "" {
+			t.Fatal("legacy rung emitted an empty argv element")
+		}
+	}
+
+	// Once resolved, both transports collapse onto that rung for this binary.
+	if ladder := grokSmokeShapeLadder(path, "grok 1.0.5"); len(ladder) != 1 || ladder[0].ID != grokSmokeArgvShapes[1].ID {
+		t.Fatalf("resolved rung not cached for the binary: %+v", ladder)
+	}
+}
+
+// The reverse walk: a build whose version says "legacy" but that has dropped
+// `--no-auto-update` is healed by advancing to the hardened rung — the
+// retryable set is symmetric, so a legacy-first walk can move on too.
+func TestRunGrokSmoke_LegacyFirstWalkAdvancesOnARejectedAutoUpdateFlag(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		for _, arg := range launch.Args {
+			if arg == "--no-auto-update" {
+				return nil, []byte("error: unexpected argument '--no-auto-update' found\n"), grokExitError(t)
+			}
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	result := runGrokSmoke(context.Background(), path, "grok 1.0.5")
+	if result.Status != cliSmokeStatusSuccess || !result.MarkerMatched || result.ArgvShapeID != grokSmokeArgvShapes[0].ID {
+		t.Fatalf("walk should have advanced to the canonical rung: %+v", result)
+	}
+	if *calls != 2 {
+		t.Fatalf("spent %d children, want 2 (one rejected rung + one turn)", *calls)
 	}
 }
 

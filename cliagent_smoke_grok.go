@@ -213,14 +213,16 @@ func grokSmokeLoggedIn(_ context.Context, _ string) (loggedIn, known bool) {
 	return false, true
 }
 
-// grokSmokeShapeLadder returns the shapes to try, newest-known-good first.
-// When a shape has already been resolved for this exact binary it is the ONLY
-// entry, so a steady-state smoke — and the session_start smoke, which takes
-// its rung from here too — spawns one child rather than walking the ladder.
-func grokSmokeShapeLadder(path string) []grokSmokeArgvShape {
+// grokSmokeShapeLadder returns the shapes to try, in the order the installed
+// build makes most likely to pass (grokSmokeArgvShapesForVersion). When a
+// shape has already been resolved for this exact binary it is the ONLY entry,
+// so a steady-state smoke spawns one child rather than walking the ladder.
+// The session_start smoke takes its single rung from here too: it cannot walk,
+// so the version-ordered first entry IS its resolution of a compatible rung.
+func grokSmokeShapeLadder(path, version string) []grokSmokeArgvShape {
 	resolved, cached := cliSmokeRememberedShape(path)
 	if !cached {
-		return grokSmokeArgvShapes
+		return grokSmokeArgvShapesForVersion(version)
 	}
 	for _, shape := range grokSmokeArgvShapes {
 		if shape.ID == resolved {
@@ -333,7 +335,7 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	// Bound BEFORE the first spawn: the shape this walk resolves is a fact
 	// about THESE bytes, not about whatever is at `path` when it finishes.
 	shapeBinding := bindCLISmokeShape(path)
-	ladder := grokSmokeShapeLadder(path)
+	ladder := grokSmokeShapeLadder(path, version)
 	producerContested := grokManagedRunProducerContested(grokDirectRunLaunch{
 		Env: env, Cwd: isolatedCwd, Args: buildGrokNoToolsSmokeArgs(ladder[0], promptFile),
 	}, isolatedHome)

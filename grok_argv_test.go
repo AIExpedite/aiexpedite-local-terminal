@@ -171,10 +171,11 @@ func TestValidateGrokSmokeShape_AcceptsEveryRungAndRejectsInjectedFlags(t *testi
 	}
 }
 
-// The retryable set is DERIVED from the ladder: exactly the flags the first
-// rung carries and the last rung drops, and never one every rung shares.
+// The retryable set is DERIVED from the ladder: exactly the flags some rung
+// carries and another drops — in BOTH directions, since the walk order
+// follows the installed version — and never one every rung shares.
 func TestGrokSmokeRetryableFlags_DerivedFromTheLadder(t *testing.T) {
-	want := map[string]bool{"--disable-web-search": true, "--no-subagents": true}
+	want := map[string]bool{"--disable-web-search": true, "--no-subagents": true, "--no-auto-update": true}
 	got := map[string]bool{}
 	for _, flag := range grokSmokeRetryableFlags {
 		got[flag] = true
@@ -186,6 +187,48 @@ func TestGrokSmokeRetryableFlags_DerivedFromTheLadder(t *testing.T) {
 		if got[shared] {
 			t.Errorf("%s is carried by every rung and must not be retryable", shared)
 		}
+	}
+}
+
+// The ladder is ordered for the installed build: a release that predates the
+// hardened rung's isolation switches tries the legacy rung first, everything
+// else (including an unparseable version) keeps the canonical order. Every
+// rung is always present, so a wrong guess costs one free spawn, not the run.
+func TestGrokSmokeArgvShapesForVersion_OrdersTheRungTheBuildDocumentsFirst(t *testing.T) {
+	canonical := grokSmokeArgvShapes[0].ID
+	legacy := grokSmokeArgvShapes[1].ID
+	for _, tc := range []struct {
+		version string
+		first   string
+	}{
+		{"grok 1.0.13", canonical},
+		{"grok 1.0.14 (5e9a1c2) [stable]", canonical},
+		{"grok 1.1.0", canonical},
+		{"grok 2.0.0", canonical},
+		{"grok 1.0.12", legacy},
+		{"grok 1.0.5", legacy},
+		{"grok 0.9.0", legacy},
+		{"", canonical},
+		{"not a version", canonical},
+	} {
+		ladder := grokSmokeArgvShapesForVersion(tc.version)
+		if len(ladder) != len(grokSmokeArgvShapes) {
+			t.Fatalf("%q: ladder has %d rungs, want every rung (%d)", tc.version, len(ladder), len(grokSmokeArgvShapes))
+		}
+		if ladder[0].ID != tc.first {
+			t.Errorf("%q: first rung = %q, want %q", tc.version, ladder[0].ID, tc.first)
+		}
+		seen := map[string]bool{}
+		for _, shape := range ladder {
+			if seen[shape.ID] {
+				t.Errorf("%q: rung %q appears twice", tc.version, shape.ID)
+			}
+			seen[shape.ID] = true
+		}
+	}
+	// Reordering must never mutate the canonical ladder itself.
+	if grokSmokeArgvShapes[0].ID != canonical || grokSmokeArgvShapes[1].ID != legacy {
+		t.Fatal("grokSmokeArgvShapesForVersion mutated grokSmokeArgvShapes")
 	}
 }
 

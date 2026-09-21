@@ -28,6 +28,8 @@ package main
 import (
 	"fmt"
 	"strings"
+
+	"golang.org/x/mod/semver"
 )
 
 // grokMaintenanceSmokeControlArg is an AI Expedite-only in-process control
@@ -180,6 +182,47 @@ var grokSmokeArgvShapes = []grokSmokeArgvShape{
 	{ID: "streaming-notools-prompt-file-legacy", NoAutoUpdate: true},
 }
 
+// grokSmokeHardenedFlagsMinVersion is the first Grok release whose headless
+// mode documents the hardened rung's isolation switches. Normalized the same
+// way `grok --version` output is (normalizeGrokConfigVersion), so it compares
+// with golang.org/x/mod/semver.
+const grokSmokeHardenedFlagsMinVersion = "v1.0.13"
+
+// grokSmokeArgvShapesForVersion orders the ladder for the installed build:
+// the rung that build documents first, every other rung after it. Both smoke
+// transports take their first attempt from here — the `__cli_smoke__` probe
+// walks on from it on a flag rejection, and the legacy `session_start` smoke,
+// which streams ONE child and cannot walk at all, spawns exactly it. Without
+// this, a pre-update session smoke against a build that predates the
+// isolation switches would always spawn the hardened rung, be rejected during
+// option parsing, and fail before inference — blocking the very upgrade that
+// would fix it.
+//
+// The version is a hint, not a verdict: a build that reports a pre-1.0.13
+// version but accepts the hardened switches simply passes on the legacy rung
+// (`--tools=` already disables every built-in tool), and one whose version
+// cannot be parsed keeps the canonical order. The full ladder is always
+// returned so a wrong guess costs the probe one free pre-inference spawn, not
+// the verdict.
+func grokSmokeArgvShapesForVersion(version string) []grokSmokeArgvShape {
+	normalized := normalizeGrokConfigVersion(version)
+	if normalized == "" || semver.Compare(normalized, grokSmokeHardenedFlagsMinVersion) >= 0 {
+		return grokSmokeArgvShapes
+	}
+	ordered := make([]grokSmokeArgvShape, 0, len(grokSmokeArgvShapes))
+	for _, shape := range grokSmokeArgvShapes {
+		if !shape.Hardened {
+			ordered = append(ordered, shape)
+		}
+	}
+	for _, shape := range grokSmokeArgvShapes {
+		if shape.Hardened {
+			ordered = append(ordered, shape)
+		}
+	}
+	return ordered
+}
+
 // grokSmokePromptFileFlag is the only separate-value flag in the shape; its
 // value is a path this process created, never caller text.
 const grokSmokePromptFileFlag = "--prompt-file"
@@ -253,13 +296,17 @@ func argvEqual(a, b []string) bool {
 	return true
 }
 
-// grokSmokeRetryableFlags are the flags that some LATER rung of the ladder
-// omits — derived from the shapes themselves rather than re-listed, so a third
-// rung (or a change to what the fallback drops) cannot leave a stale copy
-// behind. Lowercased for case-insensitive matching against a CLI's error text.
+// grokSmokeRetryableFlags are the flags that SOME rung of the ladder omits —
+// derived from the shapes themselves rather than re-listed, so a third rung
+// (or a change to what a rung drops) cannot leave a stale copy behind. The set
+// is symmetric because the walk order depends on the installed version
+// (grokSmokeArgvShapesForVersion): a legacy-first walk must be able to advance
+// on a rejected `--no-auto-update` just as a canonical-first walk advances on
+// a rejected isolation switch. Lowercased for case-insensitive matching
+// against a CLI's error text.
 //
 // Used by the smoke's retry gate: a rejection naming one of these can be fixed
-// by the next rung and is safe to retry (option parsing precedes inference),
+// by another rung and is safe to retry (option parsing precedes inference),
 // while a rejection of any flag EVERY rung carries would spend a second child
 // to fail identically.
 var grokSmokeRetryableFlags = computeGrokSmokeRetryableFlags()
@@ -269,14 +316,23 @@ func computeGrokSmokeRetryableFlags() []string {
 		return nil
 	}
 	const placeholder = "prompt-file-placeholder"
-	kept := map[string]bool{}
-	for _, arg := range buildGrokNoToolsSmokeArgs(grokSmokeArgvShapes[len(grokSmokeArgvShapes)-1], placeholder) {
-		kept[grokSmokeFlagName(arg)] = true
+	carriedBy := map[string]int{}
+	var order []string
+	for _, shape := range grokSmokeArgvShapes {
+		for _, arg := range buildGrokNoToolsSmokeArgs(shape, placeholder) {
+			name := grokSmokeFlagName(arg)
+			if !strings.HasPrefix(name, "--") {
+				continue
+			}
+			if carriedBy[name] == 0 {
+				order = append(order, name)
+			}
+			carriedBy[name]++
+		}
 	}
 	var optional []string
-	for _, arg := range buildGrokNoToolsSmokeArgs(grokSmokeArgvShapes[0], placeholder) {
-		name := grokSmokeFlagName(arg)
-		if strings.HasPrefix(name, "--") && !kept[name] {
+	for _, name := range order {
+		if carriedBy[name] < len(grokSmokeArgvShapes) {
 			optional = append(optional, strings.ToLower(name))
 		}
 	}

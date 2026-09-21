@@ -372,7 +372,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// and the canonical shape has no empty element. The prompt — and the
 		// marker it carries — is staged in a 0600 file so it never sits on
 		// argv. The rung is the one the `__cli_smoke__` probe already resolved
-		// for this exact binary when it has, and the canonical rung otherwise.
+		// for this exact binary when it has; otherwise this streaming path —
+		// which spawns ONE child and cannot walk the ladder — takes the rung
+		// the probed version documents, so an older publisher's pre-update
+		// smoke against a build that predates the isolation switches is not
+		// rejected during option parsing before it can bless the upgrade.
 		stagedPrompt, promptErr := writeGrokPromptFile(grokSmokePrompt)
 		if promptErr != nil {
 			_ = removeIsolatedGrokHome(isolatedGrokHome)
@@ -380,7 +384,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			return fmt.Errorf("grok maintenance smoke could not stage its prompt file; refusing to place the prompt on argv")
 		}
 		promptFile = stagedPrompt
-		cliArgs = buildGrokNoToolsSmokeArgs(grokSmokeShapeLadder(executable)[0], promptFile)
+		cliArgs = buildGrokNoToolsSmokeArgs(grokSmokeShapeLadder(executable, grokVersion)[0], promptFile)
 		if contractErr := validateGrokSmokeShape(cliArgs); contractErr != nil {
 			_ = removeIsolatedGrokHome(isolatedGrokHome)
 			isolatedGrokHome = ""
