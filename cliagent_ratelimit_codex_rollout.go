@@ -88,8 +88,10 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
 	}
 	if ok || highWater != nil {
+		// The forced path passes ctx so its bounded lock wait is clamped to the
+		// gather deadline it is running inside.
 		mergeCodexRateLimitCachePerLimitProgressWithLock(
-			codexRateLimitCachePath(), contribs, nil, false, nil, false,
+			ctx, codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base, forced, nil,
 		)
 	}
@@ -2287,6 +2289,24 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	inferredAt := codexRolloutInferredObservation(ctx, f, now)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
+	// An inferred anchor is built from the file's mtime, which describes the
+	// NEWEST append and nothing else. Stamping every timestamp-less frame with
+	// it would republish an old percentage from an earlier turn as a post-run
+	// observation — wrongly settling the freshness debt — so inference is
+	// narrowed to the one frame that can honestly claim the mtime: the LAST
+	// timestamp-less frame in a file where NO frame stated a time at all.
+	//
+	// That second condition is what keeps an ordinary multi-turn rollout out of
+	// this path. A build that stamps its envelopes produces stated frames, so a
+	// lone timestamp-less frame among them is an anomaly from an earlier turn,
+	// not the finished run's evidence, and stays dropped exactly as on a routine
+	// scan. Only a file that is timestamp-less throughout — the renamed-key
+	// build this fallback exists for — has no stated time to prefer, and there
+	// the mtime is the sole anchor available. It stays clamped to
+	// [runFloor, now] and flagged Inferred, so it can never outrank or back-date
+	// a stated observation.
+	var pendingInferred map[string]interface{}
+	statedFrameSeen := false
 	consumeLine := func(line string) {
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
@@ -2319,20 +2339,21 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// Absolute `resets_at` fields ignore this anchor, so the fallback is
 		// when the line carries no parseable timestamp.
 		eventTime, observedAt := codexObservationTimes(raw, now, false)
-		inferred := false
 		if eventTime.IsZero() {
 			// Numeric rollout telemetry without an enclosing event time cannot
 			// advance freshness on a routine scan. Drop this object only and
 			// continue later lines — unless a forced post-run reconcile vouched
 			// for this file (written at/after the run floor), in which case the
-			// file's own mtime stands in, flagged Inferred so it never outranks
-			// a stated observation. A Codex build that renames its envelope
-			// timestamp key would otherwise leave the card stale after every run.
-			if inferredAt.IsZero() {
-				return
+			// file's own mtime may stand in for the LAST such frame, flagged
+			// Inferred so it never outranks a stated observation. A Codex build
+			// that renames its envelope timestamp key would otherwise leave the
+			// card stale after every run.
+			if !inferredAt.IsZero() {
+				pendingInferred = raw
 			}
-			eventTime, observedAt, inferred = inferredAt, inferredAt, true
+			return
 		}
+		statedFrameSeen = true
 		// The rollout shape nests telemetry under `payload`
 		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
 		// which extractCodexRateLimitBuckets already unwraps. fullSnapshot is
@@ -2340,9 +2361,6 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
 			codexStampContributorObservations(updates, observedAt)
-			if inferred {
-				codexMarkContributorsInferred(updates)
-			}
 			updates = codexCanonicalizeContributors(updates)
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
@@ -2436,6 +2454,19 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	// forward pass was interrupted; their newer timestamps supersede any prefix
 	// evidence without treating an incomplete fragment as provider telemetry.
 	consumeTail()
+	// Fold the anchored frame last: it is the newest record in a file that
+	// stated no times at all, so the sparse-merge rules in mergeCodexRolloutFrame
+	// treat it exactly as they would a stated frame at that time, and
+	// codexRolloutReadingBeats still lets any stated observation covering the run
+	// floor outrank it.
+	if pendingInferred != nil && !statedFrameSeen {
+		if updates, _ := extractCodexRateLimitBuckets(pendingInferred, inferredAt); len(updates) > 0 {
+			codexStampContributorObservations(updates, inferredAt)
+			codexMarkContributorsInferred(updates)
+			updates = codexCanonicalizeContributors(updates)
+			mergeCodexRolloutFrame(acc, updates, inferredAt)
+		}
+	}
 	if !handled {
 		return acc, sessionStart, limit, false, len(acc) > 0
 	}

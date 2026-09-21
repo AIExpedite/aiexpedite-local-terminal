@@ -62,7 +62,7 @@ func (f codexFreshnessFixture) seedPreRunReading(t *testing.T, observedAt, now t
 // state in which a routine scan no longer reopens a rollout written earlier.
 func (f codexFreshnessFixture) advanceCursorPast(t *testing.T, cursorAt, now time.Time) {
 	t.Helper()
-	ok := codexRateLimitCacheTransaction(f.cache, now, true, func(snap *codexRateLimitSnapshot) bool {
+	ok := codexRateLimitCacheTransaction(context.Background(), f.cache, now, true, func(snap *codexRateLimitSnapshot) bool {
 		snap.RolloutHighWaterMtimeNs = cursorAt.UnixNano()
 		snap.RolloutHighWaterMtimeMs = cursorAt.UnixMilli()
 		snap.RolloutRootFingerprint = codexRolloutRootFingerprint(f.home)
@@ -562,4 +562,112 @@ func (r *codexRunHookRecorder) waitSettled(t *testing.T, n int) []time.Time {
 	}
 	t.Fatalf("settle hook fired fewer than %d times", n)
 	return nil
+}
+
+// The mtime anchor describes the file's newest append, so it may only stand in
+// for a frame that can honestly claim it. A multi-turn rollout whose other
+// frames state their times keeps a stale timestamp-less frame dropped — even
+// under a forced reconcile whose floor the mtime clears — instead of
+// republishing that old percentage as post-run evidence.
+func TestCodexBucketsFromRolloutFile_InferredAnchorScope(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	floor := now.Add(-time.Minute)
+	stale := `{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":91,"window_minutes":300}}}}`
+	statedAt := now.Add(-2 * time.Hour)
+	stated := `{"timestamp":"` + statedAt.UTC().Format(time.RFC3339Nano) +
+		`","type":"event_msg","payload":{"type":"token_count","rate_limits":{"secondary":{"used_percent":40,"window_minutes":10080}}}}`
+	fresher := `{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12,"window_minutes":300}}}}`
+
+	for _, tc := range []struct {
+		name         string
+		lines        []string
+		wantInferred bool
+		wantPercent  float64
+	}{
+		// The renamed-envelope-key build this fallback exists for: nothing in
+		// the file states a time, so the mtime is the only anchor there is.
+		{"timestamp-less file anchors its last frame", []string{stale, fresher}, true, 12},
+		// A build that does stamp its envelopes: the timestamp-less frame is an
+		// anomaly from an earlier turn, not the finished run's evidence.
+		{"a stated frame anywhere disables inference", []string{stale, stated}, false, 0},
+		{"a stated frame before the candidate disables it too", []string{stated, stale}, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rollout.jsonl")
+			if err := os.WriteFile(path, []byte(strings.Join(tc.lines, "\n")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mtime := now.Add(-10 * time.Second)
+			if err := os.Chtimes(path, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+
+			buckets, _, _, _, _ := codexBucketsFromRolloutFile(
+				withCodexForcedReconcile(context.Background(), floor), path, now)
+			b, found := buckets[codexWindowPrimary][codexLegacyLimitID]
+			if !tc.wantInferred {
+				if found {
+					t.Fatalf("primary=%+v, want the timestamp-less frame dropped", b)
+				}
+				return
+			}
+			if !found {
+				t.Fatalf("primary missing, want the last frame anchored at the mtime")
+			}
+			if b.UsedPercentage != tc.wantPercent {
+				t.Fatalf("used=%v, want %v — only the final frame may claim the mtime", b.UsedPercentage, tc.wantPercent)
+			}
+			if !b.Inferred {
+				t.Fatalf("bucket=%+v, want Inferred so it cannot outrank a stated observation", b)
+			}
+			if b.ObservedAtMs != mtime.UnixMilli() {
+				t.Fatalf("observedAt=%d, want the file mtime %d", b.ObservedAtMs, mtime.UnixMilli())
+			}
+		})
+	}
+}
+
+// A forced reconcile runs inside a gather that owns a deadline. A wedged holder
+// of either cache lock must cost that gather the bounded wait and no more —
+// the transaction gives up (leaving the cursor unadvanced and the debt owed)
+// rather than blocking the refresh receipt and every later provider.
+func TestCodexRateLimitCacheTransaction_BoundedWaitOnWedgedLocks(t *testing.T) {
+	now := time.Now()
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 80*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	t.Run("in-process gate", func(t *testing.T) {
+		codexRateLimitMu.Lock()
+		defer codexRateLimitMu.Unlock()
+		start := time.Now()
+		ran := false
+		ok := codexRateLimitCacheTransaction(context.Background(), cache, now, true, func(*codexRateLimitSnapshot) bool {
+			ran = true
+			return true
+		})
+		if ok || ran {
+			t.Fatalf("ok=%v ran=%v, want the wedged gate to be given up on", ok, ran)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("waited %s, want the bounded %s", elapsed, codexRateLimitCacheLockWait)
+		}
+	})
+
+	t.Run("caller deadline clamps the wait", func(t *testing.T) {
+		codexRateLimitCacheLockWait = 30 * time.Second
+		codexRateLimitMu.Lock()
+		defer codexRateLimitMu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if codexRateLimitCacheTransaction(ctx, cache, now, true, func(*codexRateLimitSnapshot) bool { return true }) {
+			t.Fatal("want the transaction to give up rather than write")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("waited %s, want the wait clamped to the caller's deadline", elapsed)
+		}
+	})
 }

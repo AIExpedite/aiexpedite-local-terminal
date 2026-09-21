@@ -25,6 +25,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -223,6 +224,59 @@ type codexRateLimitSnapshot struct {
 // advisory file lock (the cache may be touched by a future Codex statusline
 // hook running in a different process, same as Claude's).
 var codexRateLimitMu sync.Mutex
+
+// codexRateLimitCacheLockWait bounds how long a WAITING Codex cache writer
+// blocks on each of the two locks the transaction takes — the in-process gate
+// and the cross-process advisory file lock — and codexRateLimitCacheLockPoll is
+// the retry cadence inside that wait. Vars so a contention test can pin them
+// small instead of spending seconds of wall clock.
+//
+// Bounded rather than blocking, because both waiters sit on deadlines they do
+// not own. captureCodexRateLimitLine merges SYNCHRONOUSLY inside the Codex
+// stdout scanners, so an unbounded wait there stops output publication and
+// hangs the session; a FORCED post-run reconcile runs inside
+// handleCLIUsageRefreshCommand's gather, whose 10s budget a wedged holder would
+// otherwise consume whole, starving the refresh receipt and every later
+// provider. Go cannot cancel a filesystem syscall, so bounding the waiters is
+// the only lever available — the stalled holder itself cannot be interrupted.
+//
+// Two seconds is generous for a read-merge-rename of a few KB of JSON: an
+// ordinary contending writer is gone in milliseconds, so the wait only expires
+// when the holder is genuinely wedged, which is exactly when giving up is
+// right. Giving up costs at most one reading: the cursor is left unadvanced, so
+// the same evidence is offered again on the next refresh, and an unsettled
+// freshness debt simply stays owed.
+var (
+	codexRateLimitCacheLockWait = 2 * time.Second
+	codexRateLimitCacheLockPoll = 10 * time.Millisecond
+)
+
+// codexAcquireCacheGate takes the in-process gate, waiting no later than
+// deadline. Reports whether it was acquired; the caller MUST unlock when true.
+func codexAcquireCacheGate(deadline time.Time) bool {
+	for {
+		if codexRateLimitMu.TryLock() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(codexRateLimitCacheLockPoll)
+	}
+}
+
+// codexCacheLockDeadline is how long this transaction may spend waiting on
+// locks: codexRateLimitCacheLockWait, clamped to the caller's own deadline so a
+// forced reconcile can never outlive the gather that is waiting on it.
+func codexCacheLockDeadline(ctx context.Context) time.Time {
+	deadline := time.Now().Add(codexRateLimitCacheLockWait)
+	if ctx != nil {
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			return d
+		}
+	}
+	return deadline
+}
 
 // codexRateLimitCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_CODEX_RL_CACHE overrides it (tests isolate from the real machine
@@ -1083,7 +1137,7 @@ func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint
 		return
 	}
 	mergeCodexRateLimitCachePerLimitProgressWithLock(
-		codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
+		context.Background(), codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
 		now, fingerprint, nil, "", true, extractCodexLimitNames(raw))
 }
 
@@ -1336,7 +1390,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	rolloutAccountBase string,
 ) {
 	mergeCodexRateLimitCachePerLimitProgressWithLock(
-		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		context.Background(), path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
 		now, fingerprint, rolloutHighWater, rolloutAccountBase, true, nil,
 	)
 }
@@ -1359,12 +1413,13 @@ func tryMergeCodexRateLimitCachePerLimitProgress(
 	rolloutAccountBase string,
 ) bool {
 	return mergeCodexRateLimitCachePerLimitProgressWithLock(
-		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		context.Background(), path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
 		now, fingerprint, rolloutHighWater, rolloutAccountBase, false, nil,
 	)
 }
 
 func mergeCodexRateLimitCachePerLimitProgressWithLock(
+	ctx context.Context,
 	path string,
 	perLimit map[string]map[string]codexRateLimitBucket,
 	clears map[string]bool,
@@ -1381,7 +1436,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false
 	}
-	return codexRateLimitCacheTransaction(path, now, waitForLocks, func(snap *codexRateLimitSnapshot) bool {
+	return codexRateLimitCacheTransaction(ctx, path, now, waitForLocks, func(snap *codexRateLimitSnapshot) bool {
 		// A rollout scan validates the active account before it starts, but auth
 		// can change while filesystem I/O is in progress. Revalidate inside the
 		// cache transaction locks so a newly signed-in account's live capture
@@ -1407,12 +1462,15 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 //
 // waitForLocks=false is the optional-work mode: when either lock is held the
 // transaction is skipped rather than waited for.
-func codexRateLimitCacheTransaction(path string, now time.Time, waitForLocks bool, mutate func(snap *codexRateLimitSnapshot) bool) bool {
+func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.Time, waitForLocks bool, mutate func(snap *codexRateLimitSnapshot) bool) bool {
 	if path == "" {
 		return false
 	}
+	lockDeadline := codexCacheLockDeadline(ctx)
 	if waitForLocks {
-		codexRateLimitMu.Lock()
+		if !codexAcquireCacheGate(lockDeadline) {
+			return false
+		}
 	} else if !codexRateLimitMu.TryLock() {
 		return false
 	}
@@ -1424,7 +1482,20 @@ func codexRateLimitCacheTransaction(path string, now time.Time, waitForLocks boo
 	var lockFile *os.File
 	var locked bool
 	if waitForLocks {
-		lockFile, locked = acquireCrossProcessCacheLock(path)
+		// Reuses the shared bounded acquirer (it is generic over the cache path;
+		// only its name is Claude's). Confirmed contention REFUSES rather than
+		// proceeding unlocked: renaming a snapshot read while another writer was
+		// mid-write would clobber whatever that writer went on to commit. Only
+		// Unavailable — which carries no evidence of a competitor — takes the
+		// degraded unlocked path, matching the previous behaviour on lock error.
+		var outcome claudeRateLimitLockOutcome
+		lockFile, outcome = acquireClaudeRateLimitCacheLock(path, lockDeadline)
+		switch outcome {
+		case claudeRateLimitLockAcquired:
+			locked = true
+		case claudeRateLimitLockContended:
+			return false
+		}
 	} else {
 		lockFile, locked = tryAcquireCrossProcessCacheLock(path)
 		if !locked {

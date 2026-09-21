@@ -358,7 +358,7 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 // codexRecordRunFreshness applies mutate to the account's snapshot through the
 // blocking cache transaction.
 func codexRecordRunFreshness(fingerprint string, now time.Time, mutate func(snap *codexRateLimitSnapshot)) bool {
-	return codexRateLimitCacheTransaction(codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+	return codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
 		codexScopeSnapshotToAccount(snap, fingerprint)
 		mutate(snap)
 		return true
