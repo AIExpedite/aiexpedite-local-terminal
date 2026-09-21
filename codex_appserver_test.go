@@ -1006,3 +1006,128 @@ func TestCodexAppServerLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 		t.Errorf("manager should have 0 sessions after failed start; got %d", m.ActiveCount())
 	}
 }
+
+// startCodexAppServerEchoMock starts a session against the echo mock and
+// returns the manager, the session id, and a func reporting whether the
+// codex_appserver_ended frame has been published.
+func startCodexAppServerEchoMock(t *testing.T) (*CodexAppServerManager, string, func() bool) {
+	t.Helper()
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("integration test only runs on win/linux/darwin")
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(tmpDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-appserver-echo")
+
+	m := NewCodexAppServerManager(nil)
+	id := fmt.Sprintf("appsrv-freshness-%d", time.Now().UnixNano())
+	var mu sync.Mutex
+	ended := false
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		if res.Type == "codex_appserver_ended" {
+			ended = true
+		}
+	}
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	return m, id, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return ended
+	}
+}
+
+func waitCodexAppServerEnded(t *testing.T, ended func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !ended() {
+		if time.Now().After(deadline) {
+			t.Fatal("codex_appserver_ended was never published")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// A direct run arms the utilization floor at Start (the session's own start
+// time) and settles it exactly once when the process ends.
+func TestCodexAppServerLifecycle_ArmsAndSettlesUsageFreshnessOnce(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	session := m.Get(id)
+	if session == nil {
+		t.Fatal("session not registered")
+	}
+	if started, settled := rec.counts(); started != 1 || settled != 0 {
+		t.Fatalf("after Start: started=%d settled=%d, want 1/0", started, settled)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !floor.Equal(session.StartedAt) {
+		t.Fatalf("armed floor %s, want the session start %s", floor, session.StartedAt)
+	}
+
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	if _, n := rec.counts(); n != 1 {
+		t.Fatalf("settled %d times, want exactly once", n)
+	}
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want %s", settled[0], floor)
+	}
+}
+
+// A failed Start never arms a floor for a run that did not happen.
+func TestCodexAppServerLifecycle_FailedStartDoesNotArmUsageFreshness(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	tmpDir := t.TempDir()
+	t.Setenv("PATH", tmpDir)
+	if err := NewCodexAppServerManager(nil).Start("missing-bin", tmpDir, nil, "ws", "uid", func(resultMsg) {}); err == nil {
+		t.Fatal("expected start error")
+	}
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want none", started, settled)
+	}
+}
+
+// The real freshness path failing — here the cache cannot even be created —
+// must neither panic nor delay the ended publication.
+func TestCodexAppServerLifecycle_UsageFreshnessFailureNeverBlocksEnded(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", t.TempDir())
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(blocker, "codex_rate_limits.json"))
+	resetCodexUsageRefreshGate()
+	SetCodexUsageRefreshEnabled(true)
+	t.Cleanup(resetCodexUsageRefreshGate)
+
+	m, id, ended := startCodexAppServerEchoMock(t)
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	waitCodexUsageRefreshIdle(t)
+	if _, err := os.Stat(filepath.Join(blocker, "codex_rate_limits.json")); err == nil {
+		t.Fatal("cache unexpectedly written under a file")
+	}
+}

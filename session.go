@@ -153,6 +153,14 @@ type CLISession struct {
 	// stream reader writes it and waitForExit reads it.
 	turnSettled atomic.Bool
 
+	// codexUsageSettled is set once a codex session's run has been handed to
+	// codexUsageRunSettled — on its first terminal event (turn.completed /
+	// thread.completed) or, failing that, on exit — so a run is settled exactly
+	// once. Unlike turnSettled it is not cleared per line: codex emits BOTH
+	// terminal events for one turn. Only an accepted follow-up turn (SendInput)
+	// reopens it.
+	codexUsageSettled atomic.Bool
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -709,6 +717,12 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
 	}
+	// A codex run's utilization is owed from its start; the terminal event or
+	// waitForExit settles it. Asynchronous — never holds sm.mu across the
+	// cache lock.
+	if isCodexCommand(session.Command) {
+		codexUsageRunStarted(session.StartedAt)
+	}
 
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
@@ -833,6 +847,7 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	// at worst schedule one extra throttled probe for a write that then failed;
 	// the opposite error silently drops a turn's usage.
 	session.turnSettled.Store(false)
+	session.codexUsageSettled.Store(false)
 
 	// Write input with timeout to prevent deadlock if the CLI process's
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).
@@ -1692,6 +1707,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// sequence precedes the turn_complete prompt sequence.
 				appendDisplayText(line.text)
 				flushBatch()
+				// A finished codex turn owes the CLI Agents card a reading taken
+				// after it started (cliagent_usage_codex_freshness.go). Once per
+				// run: thread.completed follows turn.completed.
+				if isCodexCommand(session.Command) && session.codexUsageSettled.CompareAndSwap(false, true) {
+					codexUsageRunSettled(session.StartedAt)
+				}
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
@@ -2005,6 +2026,10 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// request gets scheduled for a turn that was already reported.
 	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
+	}
+	// Same for a codex run that never reached a terminal event.
+	if isCodexCommand(session.Command) && session.codexUsageSettled.CompareAndSwap(false, true) {
+		codexUsageRunSettled(session.StartedAt)
 	}
 
 	seq := atomic.AddInt64(&session.Seq, 1)

@@ -96,6 +96,13 @@ type codexRateLimitBucket struct {
 	ResetsAtMs     int64   `json:"resetsAtMs"`
 	ObservedAtMs   int64   `json:"observedAtMs"`
 	WindowMinutes  float64 `json:"windowMinutes,omitempty"`
+	// Inferred marks an observation whose time Codex did NOT state: a rollout
+	// frame with no parseable envelope `timestamp`, accepted only by a forced
+	// post-run reconcile and anchored at the rollout file's mtime clamped to
+	// [run floor, now] (codexRolloutInferredObservation). It loses every tie
+	// against a stated observation and never displaces one that already covers
+	// the run floor.
+	Inferred bool `json:"inferred,omitempty"`
 	// usageKnown/resetKnown mark which fields were freshly observed in this
 	// update. Codex's account/rateLimits/updated is sparse — a notification
 	// may carry only the new reset time, or only a new used_percent, and the
@@ -198,6 +205,17 @@ type codexRateLimitSnapshot struct {
 	// RolloutRootFingerprint scopes filesystem progress to the CODEX_HOME tree
 	// that produced it. It is a hash of the normalized root, never the raw path.
 	RolloutRootFingerprint string `json:"rolloutRootFingerprint,omitempty"`
+	// Run freshness (cliagent_usage_codex_freshness.go). RunFloorMs is when the
+	// oldest Codex run whose utilization is still unobserved started;
+	// RefreshOwedAtMs is when a run finished without that observation, i.e. a
+	// post-run refresh is owed; RefreshOwedAttempts counts the bounded post-run
+	// reconciles spent on it. Persisted beside the evidence that settles them so
+	// a run that finished just before an agent restart or self-update is still
+	// paid. Numeric only; zero on snapshots written before these fields existed,
+	// which reads as "nothing owed".
+	RunFloorMs          int64 `json:"runFloorMs,omitempty"`
+	RefreshOwedAtMs     int64 `json:"refreshOwedAtMs,omitempty"`
+	RefreshOwedAttempts int   `json:"refreshOwedAttempts,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -820,14 +838,17 @@ func codexPartitionByIdentity(contributors map[string]map[string]codexRateLimitB
 
 // codexPlacementBeats gives a total order for two placements of the SAME
 // (identity, limit id) sitting under different storage slots: the freshest
-// observation wins; on an equal timestamp the higher usage wins; then a fixed
-// primary-over-secondary slot precedence; finally a known-usage reading beats an
-// unknown one. Freshness dominates so an older duplicate is discarded even when
-// its used % is higher (AC1 / stale-observation), and no branch depends on Go
-// map iteration order.
+// observation wins; on an equal timestamp a stated observation beats an inferred
+// one, then the higher usage wins; then a fixed primary-over-secondary slot
+// precedence; finally a known-usage reading beats an unknown one. Freshness
+// dominates so an older duplicate is discarded even when its used % is higher
+// (AC1 / stale-observation), and no branch depends on Go map iteration order.
 func codexPlacementBeats(aBucket codexRateLimitBucket, aSlot string, bBucket codexRateLimitBucket, bSlot string) bool {
 	if aBucket.ObservedAtMs != bBucket.ObservedAtMs {
 		return aBucket.ObservedAtMs > bBucket.ObservedAtMs
+	}
+	if aBucket.Inferred != bBucket.Inferred {
+		return !aBucket.Inferred
 	}
 	if aBucket.UsedPercentage != bBucket.UsedPercentage {
 		return aBucket.UsedPercentage > bBucket.UsedPercentage
@@ -1360,6 +1381,36 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false
 	}
+	return codexRateLimitCacheTransaction(path, now, waitForLocks, func(snap *codexRateLimitSnapshot) bool {
+		// A rollout scan validates the active account before it starts, but auth
+		// can change while filesystem I/O is in progress. Revalidate inside the
+		// cache transaction locks so a newly signed-in account's live capture
+		// cannot be cleared and replaced by the earlier account's rollout
+		// contributors. Live capture passes an empty base because its evidence is
+		// scoped at receive time and must remain able to initialize or replace the
+		// cache.
+		if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
+			return false
+		}
+		codexScopeSnapshotToAccount(snap, fingerprint)
+		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
+		return true
+	})
+}
+
+// codexRateLimitCacheTransaction runs mutate as one read-modify-write of the
+// cache file under the in-process mutex and the cross-process advisory lock,
+// then writes the result atomically (temp file + rename). mutate returning
+// false aborts without writing. Every writer of codex_rate_limits.json goes
+// through here — the contributor merge and the run-freshness bookkeeping alike
+// — so codexSettleRunFreshness sees, and settles against, every mutation.
+//
+// waitForLocks=false is the optional-work mode: when either lock is held the
+// transaction is skipped rather than waited for.
+func codexRateLimitCacheTransaction(path string, now time.Time, waitForLocks bool, mutate func(snap *codexRateLimitSnapshot) bool) bool {
+	if path == "" {
+		return false
+	}
 	if waitForLocks {
 		codexRateLimitMu.Lock()
 	} else if !codexRateLimitMu.TryLock() {
@@ -1386,15 +1437,6 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 			_ = lockFile.Close()
 		}()
 	}
-	// A rollout scan validates the active account before it starts, but auth can
-	// change while filesystem I/O is in progress. Revalidate after acquiring the
-	// cache transaction locks so a newly signed-in account's live capture cannot
-	// be cleared and replaced by the earlier account's rollout contributors.
-	// Live capture passes an empty base because its evidence is scoped at receive
-	// time and must remain able to initialize or replace the cache.
-	if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
-		return false
-	}
 
 	snap := codexRateLimitSnapshot{
 		Buckets:      map[string]codexRateLimitBucket{},
@@ -1410,31 +1452,79 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		}
 		snap.RolloutRetryEntries = codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries))
 	}
-	if snap.AccountFingerprint != fingerprint {
-		snap.Buckets = map[string]codexRateLimitBucket{}
-		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
-		snap.LimitNames = nil
-		snap.FullSnapshotAtMs = 0
-		snap.RolloutHighWaterMtimeMs = 0
-		snap.RolloutHighWaterMtimeNs = 0
-		snap.RolloutHighWaterBoundaryFingerprint = ""
-		snap.RolloutHighWaterBoundaryCursor = ""
-		snap.RolloutBacklogFingerprint = ""
-		snap.RolloutBacklogCursor = ""
-		snap.RolloutBacklogMtimeNs = 0
-		snap.RolloutBacklogCohortSize = 0
-		snap.RolloutRetryEntries = nil
-		snap.RolloutRetryCursor = ""
-		snap.RolloutRetryFingerprint = ""
-		snap.RolloutFutureMtimeAnchorNs = 0
-		snap.RolloutFutureMtimeFloorNs = 0
-		snap.RolloutFutureMtimeCeilingNs = 0
-		snap.RolloutFutureMtimeFingerprint = ""
-		snap.RolloutFutureMtimeCursor = ""
-		snap.RolloutFutureMtimeCohortSize = 0
-		snap.RolloutFutureMtimeComplete = false
-		snap.RolloutRootFingerprint = ""
+	if !mutate(&snap) {
+		return false
 	}
+	codexSettleRunFreshness(&snap, now)
+
+	out, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return false
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return false
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return false
+	}
+	return true
+}
+
+// codexScopeSnapshotToAccount discards everything a snapshot holds for another
+// account: its telemetry, its rollout scan progress and its run-freshness
+// bookkeeping. A credentials swap must never surface — or owe a refresh for —
+// the previous account's quota.
+func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint string) {
+	if snap.AccountFingerprint == fingerprint {
+		return
+	}
+	snap.Buckets = map[string]codexRateLimitBucket{}
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+	snap.LimitNames = nil
+	snap.FullSnapshotAtMs = 0
+	snap.RolloutHighWaterMtimeMs = 0
+	snap.RolloutHighWaterMtimeNs = 0
+	snap.RolloutHighWaterBoundaryFingerprint = ""
+	snap.RolloutHighWaterBoundaryCursor = ""
+	snap.RolloutBacklogFingerprint = ""
+	snap.RolloutBacklogCursor = ""
+	snap.RolloutBacklogMtimeNs = 0
+	snap.RolloutBacklogCohortSize = 0
+	snap.RolloutRetryEntries = nil
+	snap.RolloutRetryCursor = ""
+	snap.RolloutRetryFingerprint = ""
+	snap.RolloutFutureMtimeAnchorNs = 0
+	snap.RolloutFutureMtimeFloorNs = 0
+	snap.RolloutFutureMtimeCeilingNs = 0
+	snap.RolloutFutureMtimeFingerprint = ""
+	snap.RolloutFutureMtimeCursor = ""
+	snap.RolloutFutureMtimeCohortSize = 0
+	snap.RolloutFutureMtimeComplete = false
+	snap.RolloutRootFingerprint = ""
+	snap.RunFloorMs = 0
+	snap.RefreshOwedAtMs = 0
+	snap.RefreshOwedAttempts = 0
+	snap.AccountFingerprint = fingerprint
+}
+
+// codexMergeContributorsIntoSnapshot is the body of the contributor merge,
+// applied to a snapshot already loaded and scoped to `fingerprint` inside
+// codexRateLimitCacheTransaction.
+func codexMergeContributorsIntoSnapshot(
+	snap *codexRateLimitSnapshot,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+	limitNames map[string]string,
+) {
 	// Migrate legacy cache files written before Contributors existed: each
 	// pre-existing aggregated bucket becomes a single __legacy__ contributor
 	// so subsequent sparse updates can merge against it instead of starting
@@ -1495,6 +1585,13 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 			if hadPrev && bucket.ObservedAtMs < prev.ObservedAtMs {
 				continue
 			}
+			// An inferred observation time is a stand-in for one Codex did not
+			// state, so it never displaces a stated reading it ties with, nor one
+			// that already covers the current run floor.
+			if hadPrev && bucket.Inferred && !prev.Inferred &&
+				(bucket.ObservedAtMs == prev.ObservedAtMs || (snap.RunFloorMs > 0 && prev.ObservedAtMs >= snap.RunFloorMs)) {
+				continue
+			}
 			priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
 			sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
 			if !bucket.usageKnown && sameLiveWindow {
@@ -1503,6 +1600,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 				// usage timestamp with the carried percentage instead of stamping it
 				// with this sparse frame's receive time.
 				bucket.ObservedAtMs = prev.ObservedAtMs
+				bucket.Inferred = prev.Inferred
 			}
 			if !bucket.resetKnown && priorStillLive {
 				bucket.ResetsAtMs = prev.ResetsAtMs
@@ -1620,20 +1718,6 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutFutureMtimeComplete = rolloutHighWater.futureComplete
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
-
-	out, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return false
-	}
-	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return false
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	return true
 }
 
 // reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance
@@ -1674,9 +1758,14 @@ func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
 // the active account. Returns "" when no auth is readable, in which case the
 // cache is unscoped (best-effort, matches the Claude analog).
 func currentCodexAccountFingerprint() string {
+	return codexAccountFingerprintAtBase(codexHomeBase())
+}
+
+// codexHomeBase is the active CODEX_HOME (or ~/.codex), resolved the same way
+// codexUsageParser.ParseContext resolves it for the default home.
+func codexHomeBase() string {
 	home, _ := os.UserHomeDir()
-	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
-	return codexAccountFingerprintAtBase(base)
+	return firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
 }
 
 func codexAccountFingerprintAtBase(base string) string {
@@ -1704,6 +1793,10 @@ func codexContributorsForAccount(currentFingerprint string) map[string]map[strin
 	if !ok || snap.AccountFingerprint != currentFingerprint {
 		return map[string]map[string]codexRateLimitBucket{}
 	}
+	return codexContributorsFromSnapshot(snap)
+}
+
+func codexContributorsFromSnapshot(snap codexRateLimitSnapshot) map[string]map[string]codexRateLimitBucket {
 	if len(snap.Contributors) > 0 {
 		reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
 		for w, contribs := range snap.Contributors {
@@ -1764,17 +1857,28 @@ type codexCacheView struct {
 	contributors     map[string]map[string]codexRateLimitBucket
 	limitNames       map[string]string
 	fullSnapshotAtMs int64
+	// Run freshness (codexRunFreshnessFromView).
+	runFloorMs          int64
+	refreshOwedAtMs     int64
+	refreshOwedAttempts int
 }
 
-// codexCacheViewForAccount is codexContributorsForAccount plus the pool names
-// and the time of the last authoritative full snapshot.
+// codexCacheViewForAccount is codexContributorsForAccount plus the pool names,
+// the time of the last authoritative full snapshot and the run-freshness
+// bookkeeping — all from one read of the cache file.
 func codexCacheViewForAccount(currentFingerprint string) codexCacheView {
-	view := codexCacheView{contributors: codexContributorsForAccount(currentFingerprint)}
-	if snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath()); ok && snap.AccountFingerprint == currentFingerprint {
-		view.limitNames = snap.LimitNames
-		view.fullSnapshotAtMs = snap.FullSnapshotAtMs
+	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return codexCacheView{contributors: map[string]map[string]codexRateLimitBucket{}}
 	}
-	return view
+	return codexCacheView{
+		contributors:        codexContributorsFromSnapshot(snap),
+		limitNames:          snap.LimitNames,
+		fullSnapshotAtMs:    snap.FullSnapshotAtMs,
+		runFloorMs:          snap.RunFloorMs,
+		refreshOwedAtMs:     snap.RefreshOwedAtMs,
+		refreshOwedAttempts: snap.RefreshOwedAttempts,
+	}
 }
 
 // codexSplitContributorsByPool separates the account's main pool (every limit

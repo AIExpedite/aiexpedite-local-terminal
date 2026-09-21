@@ -320,6 +320,9 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "codex-appserver:"+id)
 	}
+	// Utilization observed from here on covers this run; waitForExit settles
+	// it. Asynchronous — never holds m.mu across the cache lock.
+	codexUsageRunStarted(session.StartedAt)
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
@@ -977,6 +980,11 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// without waiting on it) means End() can unblock and the manager can
 	// reclaim the session slot in parallel with the Pub/Sub round-trip.
 	close(session.done)
+
+	// The run is over, so the account's utilization has just moved. Keyed off
+	// the session lifecycle — never a JSON-RPC method name — and launched after
+	// the ended publication so it cannot delay or break it.
+	codexUsageRunSettled(session.StartedAt)
 
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)

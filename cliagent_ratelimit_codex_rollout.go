@@ -67,8 +67,18 @@ const codexRolloutReadDirChunkSize = 128
 // than a successful direct run. Newest evidence wins per metric identity and
 // limit id, then the existing most-constrained aggregate determines the row and
 // its observation timestamp.
+//
+// A FORCED reconcile (ctx from withCodexForcedReconcile) is one a run or the
+// user is waiting on: it scans from below the run floor rather than trusting a
+// cursor that may already have advanced past the run's rollout, and it commits
+// through the blocking merge because dropping its evidence on lock contention
+// is exactly how a finished run's utilization went missing.
 func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
 	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
+	floor, forced := codexForcedReconcileFrom(ctx)
+	if forced {
+		cursor = codexRolloutCursorBelowFloor(cursor, floor)
+	}
 	latestCachedObservation := codexLatestContributorObservation(codexContributorsForAccount(currentFingerprint))
 	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor, latestCachedObservation)
 	// Authentication can change while filesystem I/O is in progress. Never let
@@ -78,12 +88,34 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
 	}
 	if ok || highWater != nil {
-		tryMergeCodexRateLimitCachePerLimitProgress(
+		mergeCodexRateLimitCachePerLimitProgressWithLock(
 			codexRateLimitCachePath(), contribs, nil, false, nil, false,
-			now, currentFingerprint, highWater, base,
+			now, currentFingerprint, highWater, base, forced, nil,
 		)
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
+}
+
+// codexRolloutCursorBelowFloor restarts a forced scan just below the run
+// floor when the persisted cursor already sits above it. The contributor-derived
+// watermark can advance past a run's rollout — a heartbeat captured live, a
+// sibling file with a later mtime — and the run's own numeric frames would then
+// never be read again. Retry identities are kept (they bypass the watermark
+// anyway); the rest of the capped-scan state belongs to the higher cursor and is
+// rebuilt by this pass. The merge only commits the resulting progress when it is
+// not behind the stored cursor, so a forced pass can never rewind it.
+func codexRolloutCursorBelowFloor(cursor codexRolloutScanCursor, floor time.Time) codexRolloutScanCursor {
+	if floor.IsZero() {
+		return cursor
+	}
+	floorNs := floor.Add(-codexRunFloorGrace).UnixNano()
+	if floorNs < 0 {
+		floorNs = 0
+	}
+	if cursor.mtimeNs <= floorNs {
+		return cursor
+	}
+	return codexRolloutScanCursor{mtimeNs: floorNs, retryEntries: cursor.retryEntries}
 }
 
 func codexLatestContributorObservation(contribs map[string]map[string]codexRateLimitBucket) time.Time {
@@ -1791,6 +1823,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		bucket  codexRateLimitBucket
 	}
 	winners := map[string]rolloutContribution{}
+	runFloor, _ := codexForcedReconcileFrom(ctx)
 	var limit codexUsageLimitEvidence
 	// Identity of the rollout that supplied `limit`, so a still-live refusal can
 	// be held eligible on its own rather than by voiding the whole pass.
@@ -1894,7 +1927,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 					latestObservation = observed
 				}
 				key := codexWindowIdentity(b.WindowMinutes, w) + "\x00" + limitID
-				if prev, exists := winners[key]; !exists || b.ObservedAtMs > prev.bucket.ObservedAtMs {
+				if prev, exists := winners[key]; !exists || codexRolloutReadingBeats(b, prev.bucket, runFloor) {
 					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b}
 				}
 			}
@@ -2066,6 +2099,25 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	return acc, limit, latestObservation, highWater, true
 }
 
+// codexRolloutReadingBeats orders two readings of the same (identity, limit)
+// found in one scan: newest wins, except that an inferred reading never beats a
+// stated one that already covers the run floor, and loses every tie.
+func codexRolloutReadingBeats(b, prev codexRateLimitBucket, runFloor time.Time) bool {
+	if b.Inferred != prev.Inferred && !runFloor.IsZero() {
+		stated := prev
+		if !b.Inferred {
+			stated = b
+		}
+		if stated.ObservedAtMs >= runFloor.UnixMilli() {
+			return !b.Inferred
+		}
+	}
+	if b.ObservedAtMs != prev.ObservedAtMs {
+		return b.ObservedAtMs > prev.ObservedAtMs
+	}
+	return prev.Inferred && !b.Inferred
+}
+
 func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, handled bool) (accept, retry bool) {
 	if sessionStart.IsZero() {
 		// An authenticated scan must prove which account produced the rollout.
@@ -2232,6 +2284,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	defer f.Close()
 
 	sessionStart := codexRolloutSessionStartPrefix(f)
+	inferredAt := codexRolloutInferredObservation(ctx, f, now)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
 	consumeLine := func(line string) {
@@ -2266,10 +2319,19 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// Absolute `resets_at` fields ignore this anchor, so the fallback is
 		// when the line carries no parseable timestamp.
 		eventTime, observedAt := codexObservationTimes(raw, now, false)
+		inferred := false
 		if eventTime.IsZero() {
 			// Numeric rollout telemetry without an enclosing event time cannot
-			// advance freshness. Drop this object only and continue later lines.
-			return
+			// advance freshness on a routine scan. Drop this object only and
+			// continue later lines — unless a forced post-run reconcile vouched
+			// for this file (written at/after the run floor), in which case the
+			// file's own mtime stands in, flagged Inferred so it never outranks
+			// a stated observation. A Codex build that renames its envelope
+			// timestamp key would otherwise leave the card stale after every run.
+			if inferredAt.IsZero() {
+				return
+			}
+			eventTime, observedAt, inferred = inferredAt, inferredAt, true
 		}
 		// The rollout shape nests telemetry under `payload`
 		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
@@ -2278,6 +2340,9 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
 			codexStampContributorObservations(updates, observedAt)
+			if inferred {
+				codexMarkContributorsInferred(updates)
+			}
 			updates = codexCanonicalizeContributors(updates)
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
@@ -2524,6 +2589,7 @@ func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBuc
 				// carried percentage paired with its original observation time so
 				// repeated rollout heartbeats cannot make stale usage appear fresh.
 				b.ObservedAtMs = prev.ObservedAtMs
+				b.Inferred = prev.Inferred
 				b.usageKnown = true
 			}
 			if !b.resetKnown && priorStillLive {

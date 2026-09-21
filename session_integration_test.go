@@ -144,6 +144,13 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"thread.completed"}`)
 		os.Exit(0)
 
+	case "codex-no-terminal-event":
+		// A codex run that dies mid-turn: it streams, then exits without ever
+		// emitting turn.completed / thread.completed.
+		fmt.Println(`{"type":"thread.started","thread_id":"t-1"}`)
+		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}`)
+		os.Exit(1)
+
 	case "codex-reads-stdin":
 		// Mimic `codex exec -` on codex CLI v0.140+: read the prompt from stdin
 		// to EOF, then run. With NO prompt (immediate EOF), exit 1 like the real

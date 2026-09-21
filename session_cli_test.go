@@ -3690,3 +3690,60 @@ func mustContain(t *testing.T, args []string, expected ...string) {
 func strPtr(s string) *string {
 	return &s
 }
+
+// A terminal codex run arms its utilization floor at start and settles exactly
+// once, although the mock emits BOTH turn.completed and thread.completed
+// before exiting.
+func TestSessionLifecycle_CodexSettlesUsageFreshnessOnce(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "codex", []string{"implement the login page"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond) // a double-fire would land by now
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the run start %s", settled[0], floor)
+	}
+}
+
+// A codex run that exits without any terminal event is still settled, once,
+// from the exit path.
+func TestSessionLifecycle_CodexExitWithoutTerminalEventSettlesOnce(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex-no-terminal-event", "codex", []string{"implement the login page"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 1 || settled != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settled)
+	}
+}
+
+// A non-codex command streaming the very same codex frames never touches the
+// Codex utilization bookkeeping.
+func TestSessionLifecycle_NonCodexCommandSkipsUsageFreshness(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "shim", []string{}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want none for a non-codex command", started, settled)
+	}
+}
