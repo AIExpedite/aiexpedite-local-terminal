@@ -65,6 +65,12 @@ const (
 	// coarse filesystem mtimes and a rollout created just before the run start
 	// was recorded.
 	codexRunFloorGrace = 5 * time.Second
+	// codexRunFloorClockSkew is how far ahead of the local clock persisted
+	// freshness state may legitimately sit — Codex stamps its own envelopes,
+	// and a rate-limit window can carry a server-side reading — before it is
+	// read as a backwards clock step rather than skew. Mirrors
+	// grokBillingMaxClockSkew.
+	codexRunFloorClockSkew = 5 * time.Minute
 )
 
 // Vars rather than consts so tests can pin them small.
@@ -748,6 +754,55 @@ func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 	}
 }
 
+// codexRebaseFutureRunFreshness repairs freshness bookkeeping left dated in
+// the future by a backwards clock step (an NTP correction, a VM resume, a
+// manual set). Every floor comparison here is wall-clock, so a future-dated
+// floor and the future-dated observation that paid it make every genuine run
+// starting behind them look already covered: codexArmRunFloor discards the new
+// start as older, codexOweRunRefresh keeps the stale floor, and
+// codexRecordPaidRunFloor retires the debt before the post-run worker can
+// spend an attempt on it — utilization would stay stale until wall time caught
+// back up to the old floor. `now` is the only reading still trustworthy, so
+// state beyond it by more than codexRunFloorClockSkew is pulled back: floors
+// and the paid watermark are dropped outright, and an observation is re-dated
+// to just before this run's start, which is the one thing we do know about it.
+// The skew tolerance keeps ordinary forward-stamped telemetry — which would
+// otherwise be back-dated on every arm — out of this path. Reports whether
+// anything was rebased.
+func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now time.Time) bool {
+	ceilingMs := now.Add(codexRunFloorClockSkew).UnixMilli()
+	// Before the run started AND not after `now`: an observation this rebase
+	// touches was taken before the run it is being re-dated behind, so it must
+	// not be able to stand in for that run's telemetry.
+	beforeMs := startedAt.UnixMilli()
+	if nowMs := now.UnixMilli(); nowMs < beforeMs {
+		beforeMs = nowMs
+	}
+	beforeMs--
+	rebased := false
+	for _, limits := range snap.Contributors {
+		for limit, bucket := range limits {
+			if bucket.ObservedAtMs > ceilingMs {
+				bucket.ObservedAtMs = beforeMs
+				limits[limit] = bucket
+				rebased = true
+			}
+		}
+	}
+	// A dropped floor cannot describe a run any more, so codexSettleRunFreshness
+	// retires whatever debt stood on it; this run arms its own floor and owes
+	// its own debt immediately after.
+	for _, floor := range []*int64{&snap.RunFloorMs, &snap.ActiveRunFloorMs, &snap.RunFloorPaidMs, &snap.RefreshOwedAtMs} {
+		if *floor > ceilingMs {
+			*floor, rebased = 0, true
+		}
+	}
+	if rebased {
+		snap.RefreshOwedAttempts = 0
+	}
+	return rebased
+}
+
 // codexDisarmRunFloor rolls back a start codexArmRunFloor recorded for a run
 // that never happened, to fallbackMs — the newest run its manager still has
 // open, or zero. Only the exact floor is touched, wherever the arm left it: a
@@ -837,12 +892,17 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
 				return
 			}
-			if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+			now := codexUsageFreshnessNow()
+			if codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
 				// Withdrawn (codexUsageRunDisarmed) before this write landed: the
 				// run never happened, so its floor must not reach disk at all.
 				if codexUsageRefresh.takeDisarmed(fp, startedAt.UnixMilli()) {
 					return
 				}
+				// A run start is the one moment that proves the clock a floor
+				// was written against is gone, so state left ahead of `now` is
+				// rebased here rather than left to block this arm.
+				codexRebaseFutureRunFreshness(snap, startedAt, now)
 				codexArmRunFloor(snap, startedAt)
 			}) {
 				return

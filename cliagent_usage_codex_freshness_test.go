@@ -1546,3 +1546,61 @@ func TestCodexUsageRefreshGate_ArmedBindingsQueuePerFloor(t *testing.T) {
 		t.Fatal("the newest floor was evicted, want oldest-first eviction")
 	}
 }
+
+// A backwards clock step (NTP correction, VM resume, manual set) leaves the
+// floor, its paid watermark and the observation that paid it dated in the
+// future. Every later run then starts BEHIND them, so its start is discarded as
+// older, its debt is retired as already paid, and utilization stays stale until
+// wall time catches back up. A run start rebases that state onto `now` instead.
+func TestCodexArmRunFloor_RebasesStateLeftAfterAClockRollback(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	rolledBack := t0.Add(-time.Hour)
+
+	future := codexRateLimitSnapshot{}
+	codexArmRunFloor(&future, t0)
+	future.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&future, t0.Add(time.Minute))
+	if future.RunFloorPaidMs != t0.UnixMilli() {
+		t.Fatalf("the pre-rollback run must be paid before the clock moves: %+v", future)
+	}
+
+	// Without the rebase this arm is a no-op and the debt below is born paid.
+	if !codexRebaseFutureRunFreshness(&future, rolledBack, rolledBack) {
+		t.Fatal("state an hour ahead of the clock must be rebased")
+	}
+	codexArmRunFloor(&future, rolledBack)
+	if future.RunFloorMs != rolledBack.UnixMilli() || future.RunFloorPaidMs != 0 {
+		t.Fatalf("the new start must own the floor with nothing paid against it: %+v", future)
+	}
+	if observed := future.Contributors["5h"]["primary"].ObservedAtMs; observed >= rolledBack.UnixMilli() {
+		t.Fatalf("a future-dated observation must be re-dated before the run it predates: %d", observed)
+	}
+
+	// The run finishes: its debt now stands, so the post-run worker can pay it.
+	codexOweRunRefresh(&future, rolledBack, rolledBack.Add(time.Minute))
+	codexSettleRunFreshness(&future, rolledBack.Add(time.Minute))
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors:    future.Contributors,
+		runFloorMs:      future.RunFloorMs,
+		runFloorPaidMs:  future.RunFloorPaidMs,
+		refreshOwedAtMs: future.RefreshOwedAtMs,
+	}, rolledBack.Add(2*time.Minute))
+	if !state.owed {
+		t.Fatalf("a run started after the rollback still owes a refresh: %+v %+v", state, future)
+	}
+
+	// Ordinary forward-stamped telemetry sits inside the skew tolerance and must
+	// NOT be back-dated: that would manufacture a debt on every single run.
+	skewed := codexRateLimitSnapshot{
+		RunFloorMs:     t0.UnixMilli(),
+		RunFloorPaidMs: t0.UnixMilli(),
+		Contributors: map[string]map[string]codexRateLimitBucket{
+			"5h": {"primary": {ObservedAtMs: t0.Add(codexRunFloorClockSkew - time.Minute).UnixMilli(), UsedPercentage: 40}},
+		},
+	}
+	if codexRebaseFutureRunFreshness(&skewed, t0, t0) {
+		t.Fatalf("state within the skew tolerance must be left alone: %+v", skewed)
+	}
+}
