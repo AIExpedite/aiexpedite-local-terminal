@@ -1240,3 +1240,33 @@ func TestCodexAppServerLifecycle_AnchorsUsageFloorAtEachTurnRequest(t *testing.T
 		t.Fatalf("second turn settled with floor %s, want one at/after the between-turn reading (before %s)", settled[1], between)
 	}
 }
+
+// Between-turn traffic — the supported `account/rateLimits/read` reply above
+// all — must not open a utilization run. Its reading is captured a moment
+// before the run check, so a run opened on it would anchor a floor LATER than
+// that reading; a client that then closes the app-server without another turn
+// would settle that phantom run into a debt no rollout can pay, and the card
+// would warn that utilization is stale after a run that never happened.
+func TestCodexAppServerLifecycle_BetweenTurnReadingDoesNotOpenARun(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`); err != nil {
+		t.Fatalf("Send turn: %v", err)
+	}
+	rec.waitSettled(t, 1)
+
+	// No turn is running: the reply must leave the session with nothing open.
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":99,"method":"account/rateLimits/read","params":{}}`); err != nil {
+		t.Fatalf("Send between-turn request: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if started, settled := rec.counts(); settled != 1 || started != 2 {
+		t.Fatalf("started=%d settled=%d after a between-turn reading and exit, want the session arm + one turn (2/1)", started, settled)
+	}
+}

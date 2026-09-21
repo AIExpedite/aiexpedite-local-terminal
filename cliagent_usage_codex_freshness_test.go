@@ -931,3 +931,48 @@ func TestCodexRunStartFrame(t *testing.T) {
 		}
 	}
 }
+
+// Only a frame that DEMONSTRATES a turn may open a utilization run the
+// transport never saw requested. Responses and notifications that arrive while
+// no turn is running — above all the between-turn `account/rateLimits/read`
+// reply, whose numeric reading is captured a moment before this check — must
+// not: a run opened on one anchors its floor after that reading and, when the
+// client then closes the app-server, settles into a debt no rollout can pay.
+func TestCodexRunProgressFrame(t *testing.T) {
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"type":"agent_message"}}}`,
+		`{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hi"}}`,
+		`{"jsonrpc":"2.0","method":"turn/started","params":{"turnId":"turn_1"}}`,
+		`{"jsonrpc":"2.0","id":7,"method":"item/commandExecution/requestApproval","params":{}}`,
+		`{"jsonrpc":"2.0","method":"codex/event/agent_message","params":{"msg":{"type":"agent_message"}}}`,
+		`{"jsonrpc":"2.0","method":"codex/event/task_started","params":{"msg":{"type":"task_started"}}}`,
+		`{"type":"item.completed","item":{"type":"agent_message"}}`,
+	} {
+		if !codexRunProgressFrame(line) {
+			t.Errorf("codexRunProgressFrame(%s) = false, want true", line)
+		}
+	}
+	for _, line := range []string{
+		// The between-turn reading the fallback must never open a run on.
+		`{"jsonrpc":"2.0","id":99,"result":{"rateLimits":{"primary":{"used_percent":7,"window_minutes":300}}}}`,
+		`{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{}}}`,
+		`{"jsonrpc":"2.0","method":"codex/event/token_count","params":{"msg":{"type":"token_count"}}}`,
+		// Initialization and thread traffic.
+		`{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex","version":"0.144.0"}}}`,
+		`{"jsonrpc":"2.0","method":"initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thr_1"}}}`,
+		`{"jsonrpc":"2.0","method":"thread/started","params":{}}`,
+		// Plain responses carry no method; a turn/start ack is not the turn.
+		`{"jsonrpc":"2.0","id":3,"result":{"turnId":"turn_1"}}`,
+		`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}`,
+		// Completions settle a run; they never open one.
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{}}`,
+		`{"type":"thread.completed"}`,
+		`not json`,
+		``,
+	} {
+		if codexRunProgressFrame(line) {
+			t.Errorf("codexRunProgressFrame(%s) = true, want false", line)
+		}
+	}
+}

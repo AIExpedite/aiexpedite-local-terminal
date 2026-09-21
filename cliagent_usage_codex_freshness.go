@@ -555,8 +555,16 @@ func codexRefreshAfterRun(floor, completedAt time.Time) {
 		// and retire a run that was never actually recorded.
 		codexUsageRefresh.rememberDebt(fp, codexPendingRunDebt{floor: floor, completedAt: completedAt})
 	}
+	codexRunDebtWorker(base, fp)
+}
+
+// codexRunDebtWorker makes the caller fp's post-run worker and pays whatever
+// debt is outstanding — on disk or retained in the gate — until no run has
+// finished since its last check. Returns at once when a worker is already
+// running: that worker was re-armed and re-reads the newest debt itself.
+func codexRunDebtWorker(base, fp string) {
 	if !codexUsageRefresh.claimWorker(fp) {
-		return // the running worker was re-armed and will pay the newest debt
+		return
 	}
 	for {
 		codexPayRunRefresh(base, fp)
@@ -678,9 +686,7 @@ func payOwedCodexUsageRefresh() {
 		if state.interrupted {
 			// The run is over — its process is gone — so it is owed from now on:
 			// the stale notice and the age-out both need a completion time.
-			codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
-				codexOweRunRefresh(snap, state.floor, now)
-			})
+			codexOweInterruptedRun(fp, state.floor, now)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
 		defer cancel()
@@ -696,11 +702,32 @@ func payOwedCodexUsageRefresh() {
 		// never be refreshed and would simply age out.
 		now = codexUsageFreshnessNow()
 		if promoted := codexRunFreshnessForAccount(fp, now); promoted.interrupted {
-			codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
-				codexOweRunRefresh(snap, promoted.floor, now)
-			})
+			codexOweInterruptedRun(fp, promoted.floor, now)
+		}
+		// Either conversion may have been REFUSED by the bounded cache locks.
+		// A run left merely `interrupted` is never refreshed — routine gathers
+		// force only on `owed` — and never warns, so the retained debt is
+		// handed to the account's worker, the same retry a settle whose write
+		// was refused gets (codexFlushPendingRunDebt). Nothing to do when the
+		// flush lands here, or when nothing was retained.
+		if !codexFlushPendingRunDebt(fp) {
+			codexRunDebtWorker(base, fp)
 		}
 	})
+}
+
+// codexOweInterruptedRun converts a run the previous process died in the
+// middle of into a debt completed at `now`. When the bounded cache locks
+// refuse the write, the debt is RETAINED in the gate rather than dropped, so
+// payOwedCodexUsageRefresh can retry it through the worker.
+func codexOweInterruptedRun(fp string, floor, now time.Time) bool {
+	if codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, floor, now)
+	}) {
+		return true
+	}
+	codexUsageRefresh.rememberDebt(fp, codexPendingRunDebt{floor: floor, completedAt: now})
+	return false
 }
 
 /* ───────────────────────────── gather side ───────────────────────────── */
@@ -811,6 +838,101 @@ func codexRunStartFrame(line string) bool {
 	// Codex 0.144's generated schema spells it `turn/start`; older app-server
 	// builds send the turn as `sendUserTurn` / `sendUserMessage`.
 	case "turn.start", "sendUserTurn", "sendUserMessage":
+		return true
+	}
+	return false
+}
+
+// codexRunProgressFrame reports whether a Codex stdout line DEMONSTRATES a turn
+// in progress: a `turn.*`/`item.*` event or request (any spelling
+// codexNormalizeCompletionName accepts, including server-initiated approval
+// requests such as `item/commandExecution/requestApproval`), or one of the
+// legacy `codex/event/<name>` task events. It is the only frame that may open a
+// utilization run the transport did not see requested — the fallback for a
+// client dialect codexRunStartFrame does not recognize.
+//
+// Everything else is deliberately excluded: responses (`id` + `result`, no
+// method) such as the between-turn `account/rateLimits/read` reply,
+// `account/rateLimits/*` notifications, `initialize`/`thread/*` traffic and
+// the initialization heartbeat. Opening a run on those anchors a floor LATER
+// than the reading captured a moment earlier from the very same frame, and a
+// client that then closes the app-server without another turn settles that
+// phantom run into a debt no rollout can pay — a false stale-utilization
+// notice.
+func codexRunProgressFrame(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	if isRecognizedCodexRateLimitEnvelope(raw) {
+		return false
+	}
+	for _, name := range codexFrameEventNames(raw) {
+		if codexCompletionEventName(name) {
+			return false
+		}
+		if codexTurnScopedEventName(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// codexFrameEventNames collects the method or event names a frame carries in
+// the shapes codexRunCompletionFrame reads: the JSON-RPC method, a bare event
+// `type`, and one nested under `msg`/`payload`/`params`/`result`.
+func codexFrameEventNames(raw map[string]interface{}) []string {
+	var names []string
+	add := func(v interface{}) {
+		if name, _ := v.(string); name != "" {
+			names = append(names, name)
+		}
+	}
+	add(raw["method"])
+	add(raw["type"])
+	for _, key := range []string{"msg", "payload", "params", "result"} {
+		nested, ok := raw[key].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		add(nested["type"])
+		if msg, ok := nested["msg"].(map[string]interface{}); ok {
+			add(msg["type"])
+		}
+	}
+	return names
+}
+
+// codexTurnScopedEventName reports whether an event or method name belongs to
+// a turn: the `turn`/`item` subjects of the current app-server schema, or a
+// legacy task event name.
+func codexTurnScopedEventName(name string) bool {
+	// The subject is the FIRST segment once the `codex/event/` prefix is gone:
+	// `item/agentMessage/delta` and `item/commandExecution/requestApproval`
+	// nest deeper than the two-part names codexNormalizeCompletionName reduces.
+	trimmed := strings.TrimPrefix(name, "codex/event/")
+	subject := trimmed
+	if idx := strings.IndexAny(trimmed, "/."); idx >= 0 {
+		subject = trimmed[:idx]
+	}
+	switch subject {
+	case "turn", "item":
+		return true
+	}
+	// Legacy `codex/event/<name>` builds nest the bare name under params.msg.
+	bare := trimmed
+	if idx := strings.LastIndexAny(bare, "/."); idx >= 0 {
+		bare = bare[idx+1:]
+	}
+	switch bare {
+	case "task_started", "task_complete", "agent_message", "agent_message_delta",
+		"agent_reasoning", "agent_reasoning_delta", "exec_command_begin", "exec_command_end",
+		"patch_apply_begin", "patch_apply_end", "mcp_tool_call_begin", "mcp_tool_call_end",
+		"exec_approval_request", "apply_patch_approval_request":
 		return true
 	}
 	return false

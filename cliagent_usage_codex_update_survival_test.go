@@ -156,3 +156,45 @@ func TestCodexOwedRefresh_UnarmedProcessDoesNothing(t *testing.T) {
 		t.Fatal("an unarmed process must not reconcile")
 	}
 }
+
+// Bounded cache locking may REFUSE the write that converts an interrupted run
+// into an owed debt at startup. The run must not be left merely `interrupted`:
+// routine gathers force a reconcile only on `owed`, so it would never be
+// refreshed and never warn. The debt is retained and retried through the same
+// worker a refused post-run settle uses.
+func TestCodexOwedRefresh_RefusedInterruptedConversionIsRetried(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-5 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexRecordRunFreshness(f.fp, runStart, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, runStart)
+	})
+	// Leave the worker's retry inside the wedge below, but the flush after it.
+	codexRefreshAfterRunRetryDelay = 300 * time.Millisecond
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	simulateCodexAgentRestart(t)
+	// Wedge the in-process gate across the whole startup replay — conversion,
+	// reconcile, attempt count and the promoted-run check — then free it.
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("refused startup conversion left the interrupted run un-owed: %+v", snap)
+	}
+	if snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("retried debt recorded floor %d, want the interrupted run's %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+	if state := codexRunFreshnessForAccount(f.fp, time.Now()); !state.owed || state.interrupted {
+		t.Fatalf("interrupted run must read as owed after the retry: %+v", state)
+	}
+}

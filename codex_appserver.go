@@ -164,9 +164,11 @@ type CodexAppServerSession struct {
 	// currently accumulating. The app-server is long-lived and serves MANY
 	// turns, so settling only at process exit would leave the CLI Agents card
 	// pinned to a pre-turn reading for as long as an IDE session stays open.
-	// usageRunOpen is set by any stdout frame and cleared by the turn's
-	// completion event, so waitForExit settles only a turn the stream did not
-	// already settle. The floor is ANCHORED when a turn is requested (Send) and
+	// usageRunOpen is set by a turn request or a frame that demonstrates a turn
+	// in progress and cleared by the turn's completion event, so waitForExit
+	// settles only a turn the stream did not already settle. Between-turn
+	// traffic (an `account/rateLimits/read` reply, initialization) never opens
+	// a run: a floor anchored on it would owe a refresh no run produced. The floor is ANCHORED when a turn is requested (Send) and
 	// cleared at each settle, so a reading that arrives during initialization or
 	// between turns is never mistaken for the next turn's telemetry
 	// (cliagent_usage_codex_freshness.go).
@@ -183,11 +185,13 @@ func (s *CodexAppServerSession) armUsageRun(at time.Time) {
 	codexUsageRunStarted(at)
 }
 
-// openUsageRun marks that the stream produced a frame belonging to the current
-// run, anchoring one at `at` only when nothing else has (settleUsageRun leaves
-// the floor cleared). That fallback covers a client dialect whose turn request
-// armUsageRun does not recognize; a recognized turn/start always wins, since it
-// is written before any of the turn's frames come back.
+// openUsageRun marks that the stream produced a frame DEMONSTRATING a turn in
+// progress (codexRunProgressFrame), anchoring a run at `at` only when nothing
+// else has (settleUsageRun leaves the floor cleared). That fallback covers a
+// client dialect whose turn request armUsageRun does not recognize; a
+// recognized turn/start always wins, since it is written before any of the
+// turn's frames come back. Callers must not pass unrelated responses or
+// notifications — see codexRunProgressFrame for why.
 func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 	if s.usageRunFloorMs.CompareAndSwap(0, at.UnixMilli()) {
 		codexUsageRunStarted(at)
@@ -884,7 +888,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// still knows no JSON-RPC semantics.
 			if codexRunCompletionFrame(trimmed) {
 				session.settleUsageRun()
-			} else {
+			} else if codexRunProgressFrame(trimmed) {
 				session.openUsageRun(time.Now())
 			}
 			if !publishOrFail(resultMsg{
