@@ -405,31 +405,63 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 	// `shared` flag cannot do (it reports true for the leader too whenever
 	// anyone waited on it).
 	executed := false
-	// The cooldown lookup lives INSIDE the group so a burst collapses onto one
-	// lookup — including its auth re-check, which may spawn a child of its own.
-	v, _, _ := cliSmokeGroup.Do(cliSmokeFlightKey(cliID, stamp), func() (any, error) {
-		if replay, ok := replayableCLISmokeVerdict(cliID, stamp, path, provider.loggedIn); ok {
-			return replay, nil
+	// The shared probe runs under the LEADER's ctx. When that delivery is
+	// cancelled mid-run, the leader's verdict is a synthetic `timeout` that
+	// says nothing about the binary — and every follower parked on the flight
+	// is handed the same one. A follower whose OWN delivery is still live
+	// therefore re-enters the group (singleflight has already released the
+	// key by the time waiters wake), becoming the leader of a fresh run or
+	// joining one another healthy caller has just started. Bounded, so a
+	// pathological chain of cancelled leaders cannot spin.
+	var flight cliSmokeFlight
+	for attempt := 0; ; attempt++ {
+		executed = false
+		// The cooldown lookup lives INSIDE the group so a burst collapses onto one
+		// lookup — including its auth re-check, which may spawn a child of its own.
+		v, _, _ := cliSmokeGroup.Do(cliSmokeFlightKey(cliID, stamp), func() (any, error) {
+			if replay, ok := replayableCLISmokeVerdict(cliID, stamp, path, provider.loggedIn); ok {
+				return cliSmokeFlight{result: replay}, nil
+			}
+			executed = true
+			result := provider.run(ctx, path, version)
+			// A verdict reached because the CALLER went away (delivery cancelled,
+			// agent shutting down) says nothing about the binary: the providers
+			// classify that kill as `timeout` like an attempt-deadline expiry, and
+			// caching it would hand the redelivered post-upgrade smoke a stale
+			// failure for 15 minutes instead of testing the CLI.
+			//
+			// Nor is a verdict on a binary replaced while it ran: the post-upgrade
+			// flight (keyed on the new stamp) may already have cached the new
+			// binary's verdict, and this late write would evict it.
+			leaderCancelled := ctx.Err() != nil
+			if !leaderCancelled && cliSmokeBinaryStamp(path, version) == stamp {
+				rememberCLISmokeVerdict(cliID, stamp, result)
+			}
+			return cliSmokeFlight{result: result, leaderCancelled: leaderCancelled}, nil
+		})
+		flight, _ = v.(cliSmokeFlight)
+		if executed || !flight.leaderCancelled || ctx.Err() != nil || attempt >= cliSmokeMaxFollowerRetries {
+			break
 		}
-		executed = true
-		result := provider.run(ctx, path, version)
-		// A verdict reached because the CALLER went away (delivery cancelled,
-		// agent shutting down) says nothing about the binary: the providers
-		// classify that kill as `timeout` like an attempt-deadline expiry, and
-		// caching it would hand the redelivered post-upgrade smoke a stale
-		// failure for 15 minutes instead of testing the CLI.
-		//
-		// Nor is a verdict on a binary replaced while it ran: the post-upgrade
-		// flight (keyed on the new stamp) may already have cached the new
-		// binary's verdict, and this late write would evict it.
-		if ctx.Err() == nil && cliSmokeBinaryStamp(path, version) == stamp {
-			rememberCLISmokeVerdict(cliID, stamp, result)
-		}
-		return result, nil
-	})
-	result, _ := v.(cliSmokeResult)
-	return result, !executed
+	}
+	return flight.result, !executed
 }
+
+// cliSmokeFlight is what one singleflight execution hands to every caller
+// parked on it: the verdict, and whether it was reached under a leader whose
+// own context had been cancelled — the one shared outcome a still-live
+// follower must not accept as an answer about the binary.
+type cliSmokeFlight struct {
+	result          cliSmokeResult
+	leaderCancelled bool
+}
+
+// cliSmokeMaxFollowerRetries bounds how many times a live follower re-enters
+// the group after being handed a cancelled leader's verdict. Each retry either
+// makes it the leader (its own ctx, its own turn) or joins a healthy one, so
+// one is normally enough; the bound only stops a chain of cancellations from
+// spinning.
+const cliSmokeMaxFollowerRetries = 2
 
 // replayableCLISmokeVerdict reports the cached verdict when it may still stand
 // in for a fresh probe.

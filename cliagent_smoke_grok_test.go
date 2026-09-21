@@ -761,6 +761,68 @@ func TestRunCLISmoke_GrokCallerCancellationIsNotCached(t *testing.T) {
 	}
 }
 
+// A follower that joined the singleflight with a LIVE delivery must not be
+// handed the leader's cancellation as its answer: the shared probe ran under
+// the leader's ctx, so its `timeout` says nothing about the binary. The
+// follower re-enters the group and runs (or joins) a fresh probe of its own.
+func TestRunCLISmoke_GrokLiveFollowerRetriesAfterACancelledLeader(t *testing.T) {
+	grokSmokeEnv(t)
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.13")
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	followerJoined := make(chan struct{})
+	leaderTurn := make(chan struct{}, 1)
+	leaderTurn <- struct{}{}
+	calls, _ := stubGrokSmokeExec(t, func(runCtx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		select {
+		case <-leaderTurn:
+			// The first run is the leader's: park until the follower is
+			// queued behind this flight, then lose the delivery mid-run.
+			<-followerJoined
+			cancelLeader()
+			<-runCtx.Done()
+			return nil, nil, grokExitError(t)
+		default:
+		}
+		if runCtx.Err() != nil {
+			t.Errorf("the follower's own run inherited a cancelled context")
+		}
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	var wg sync.WaitGroup
+	var leader, follower cliSmokeResult
+	var followerReplayed bool
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		leader, _ = runCLISmoke(leaderCtx, "grok")
+	}()
+	// Give the leader time to enter the exec seam before the follower joins.
+	time.Sleep(50 * time.Millisecond)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		follower, followerReplayed = runCLISmoke(context.Background(), "grok")
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(followerJoined)
+	wg.Wait()
+
+	if leader.Diagnostic != cliSmokeDiagnosticTimeout {
+		t.Fatalf("cancelled leader = %+v, want its own timeout verdict", leader)
+	}
+	if follower.Status != cliSmokeStatusSuccess || followerReplayed {
+		t.Fatalf("live follower = %+v replayed=%t, want a fresh executed success — it was handed the leader's cancellation", follower, followerReplayed)
+	}
+	if *calls != 2 {
+		t.Fatalf("calls = %d, want the leader's cancelled run plus the follower's own", *calls)
+	}
+}
+
 // A provider-side auth rejection (the local credential still parses, xAI
 // refuses it) spends no turn and is the one failure the replay's login
 // re-check cannot clear — so it must never be pinned. The user who signs in

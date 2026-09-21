@@ -519,6 +519,13 @@ func runMockCLI(mode string) {
 			encoded, _ := json.Marshal(map[string]string{"type": "text", "text": arg})
 			fmt.Println(string(encoded))
 		}
+		// Also reports the shim path the cmd.exe route carries in the
+		// environment (empty on a direct launch), so a caller can tell which
+		// route spawned it.
+		if shim := os.Getenv(grokSmokeShimPathEnv); shim != "" {
+			encoded, _ := json.Marshal(map[string]string{"type": "text", "text": "shim=" + shim})
+			fmt.Println(string(encoded))
+		}
 		fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
 		os.Exit(0)
 

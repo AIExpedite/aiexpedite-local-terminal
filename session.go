@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -507,6 +508,22 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		}
 	}
 	proc.Env = filtered
+	if grokMaintenanceSmoke {
+		// Same launcher the `__cli_smoke__` probe uses (newGrokSmokeCmd): on
+		// Windows the npm `grok.cmd` shim cannot be started by CreateProcess
+		// directly, so the child is routed through cmd.exe with an explicit
+		// command line that carries the two paths in the environment — the
+		// version probe above already took that route, and a direct spawn here
+		// would fail before the marker exactly as the un-shimmed probe did. A
+		// native binary spawns directly, with the env and cwd resolved above.
+		proc = newGrokSmokeCmd(context.Background(), grokSmokeLaunch{
+			Path:       executable,
+			Args:       cliArgs,
+			Env:        proc.Env,
+			Dir:        proc.Dir,
+			PromptFile: promptFile,
+		})
+	}
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)

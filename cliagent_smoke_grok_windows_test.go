@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -123,6 +124,12 @@ func TestGrokSmokeShimCommand_RoundTripsEveryTokenThroughARealShim(t *testing.T)
 				Text string `json:"text"`
 			}
 			if json.Unmarshal(bytes.TrimSpace(line), &frame) == nil && frame.Type == "text" {
+				if strings.HasPrefix(frame.Text, "shim=") {
+					if got := strings.TrimPrefix(frame.Text, "shim="); got != shim {
+						t.Fatalf("rung %s: child saw shim %q via the env route, want %q", shape.ID, got, shim)
+					}
+					continue
+				}
 				received = append(received, frame.Text)
 			}
 		}
@@ -197,5 +204,111 @@ func TestGrokVersionProbes_ShimAnswerSurvivesAGatherFirstOrdering(t *testing.T) 
 	}
 	if got := grokMaintenanceSmokeVersionProbeFn(shim); got != "grok 1.0.13" {
 		t.Fatalf("session_start smoke precheck = %q, want the shim's version", got)
+	}
+}
+
+// The retained session_start smoke takes the SAME cmd.exe route as the
+// first-class probe. Before this, StartSession built the shim-safe argv and
+// then handed `grok.cmd` straight to CreateProcess, which cannot start a batch
+// file — so an older publisher's maintenance smoke on an npm install failed
+// before the marker exactly as the un-shimmed probe did. Drive the real
+// StartSession through a real batch shim and check the child received every
+// ladder token and the session exited clean.
+func TestStartSession_GrokMaintenanceSmokeLaunchesThroughACmdShim(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	enableTestGrokLogin(t)
+	resetCLISmokeState()
+	t.Cleanup(resetCLISmokeState)
+
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := copyTestBinary(testExe, filepath.Join(dir, "grok-mock.exe")); err != nil {
+		t.Fatal(err)
+	}
+	// Only the shim carries the `grok` name, so PATH resolution lands on it.
+	shim := filepath.Join(dir, "grok.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\n\"%~dp0grok-mock.exe\" %*\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-smoke-argv-echo")
+	// The staged prompt file lives under the user's home; give it the
+	// metacharacters the shim round-trip test uses so the path must travel
+	// as environment data rather than script text.
+	home := filepath.Join(t.TempDir(), "home & (co)")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("USERPROFILE", home)
+	if got := resolveExecutable("grok"); !strings.EqualFold(got, shim) {
+		t.Fatalf("resolveExecutable(grok) = %q, want the shim %q", got, shim)
+	}
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	sm := NewSessionManager(nil)
+	const id = "grok-smoke-cmd-shim"
+	err = sm.StartSession(id, "grok", grokMaintenanceSmokeStartArgs(), dir, "ws", "uid", 30000, false, func(res resultMsg) {
+		mu.Lock()
+		captured = append(captured, res)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("StartSession through the shim: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		mu.Lock()
+		ended := false
+		for _, m := range captured {
+			if m.Type == "session_ended" {
+				ended = true
+			}
+		}
+		mu.Unlock()
+		if ended || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	messages := append([]resultMsg(nil), captured...)
+	mu.Unlock()
+	ended := false
+	for _, m := range messages {
+		if m.Type == "session_ended" {
+			ended = true
+			if m.ExitCode != 0 {
+				t.Fatalf("shim-launched smoke exited %d — the batch shim was not started through cmd.exe", m.ExitCode)
+			}
+		}
+	}
+	if !ended {
+		t.Fatal("shim-launched smoke never ended")
+	}
+	// The argv-echo child streams every token it received; the ladder's fixed
+	// flags must all be there, and the prompt must have arrived by file.
+	received := concatStreamOutput(messages)
+	if promptDir := filepath.Join(home, ".ai-expedite", "grok-prompts"); !strings.Contains(received, promptDir) {
+		t.Errorf("child did not receive the staged prompt path under %q verbatim; streamed %q", promptDir, received)
+	}
+	// Only the cmd.exe route hands the shim path to the child through the
+	// environment; the echo mock reports it, so its presence proves the
+	// session took that route rather than a direct CreateProcess launch.
+	if !strings.Contains(received, "shim="+shim) {
+		t.Errorf("session_start smoke did not launch the shim through grokSmokeShimCommand; streamed %q", received)
+	}
+	want := buildGrokNoToolsSmokeArgs(grokSmokeShapeLadder(shim, "grok 1.0.13")[0], "unused")
+	for _, token := range want[:len(want)-1] {
+		if !strings.Contains(received, token) {
+			t.Errorf("child did not receive %q through the shim; streamed %q", token, received)
+		}
+	}
+	if strings.Contains(received, grokMaintenanceSmokePromptPrefix) {
+		t.Errorf("prompt text reached argv through the shim: %q", received)
 	}
 }
