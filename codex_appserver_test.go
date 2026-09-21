@@ -1753,6 +1753,51 @@ func TestCodexAppServerSession_DisarmPreservesSiblingSessionFloor(t *testing.T) 
 	}
 }
 
+// The same account-wide floor is armed by ordinary terminal `codex` sessions
+// (SessionManager), not only by this manager's turns. Rolling back a failed
+// app-server turn write while a terminal run is the only thing still open must
+// fall back to THAT run's floor: a zero fallback would erase its
+// crash-recovery marker along with the withdrawn arm.
+func TestCodexAppServerSession_DisarmPreservesTerminalSessionFloor(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	prevTerminal := globalSessionManager
+	globalSessionManager = NewSessionManager(nil)
+	t.Cleanup(func() { globalSessionManager = prevTerminal })
+	terminal := &CLISession{ID: "terminal", Command: "codex"}
+	globalSessionManager.sessions[terminal.ID] = terminal
+	mgr := NewCodexAppServerManager(nil)
+	session := &CodexAppServerSession{}
+	mgr.sessions["self"] = session
+
+	terminalRun := time.UnixMilli(1_700_000_000_000)
+	failed := terminalRun.Add(250 * time.Millisecond)
+	terminal.armCodexUsageRun(terminalRun)
+	armed := session.armUsageRun(failed)
+	session.disarmUsageRun(armed, func() int64 { return mgr.newestOpenUsageFloor(session) })
+
+	rec.mu.Lock()
+	disarmed := append([]codexRunDisarm(nil), rec.disarmed...)
+	rec.mu.Unlock()
+	if len(disarmed) != 1 {
+		t.Fatalf("disarmed %d floors, want 1", len(disarmed))
+	}
+	if !disarmed[0].floor.Equal(failed) || !disarmed[0].fallback.Equal(terminalRun) {
+		t.Fatalf("disarmed floor=%s fallback=%s, want floor=%s fallback=%s (the terminal session's open run)",
+			disarmed[0].floor, disarmed[0].fallback, failed, terminalRun)
+	}
+
+	// A terminal run that already settled is not open: nothing left to preserve.
+	terminal.settleCodexUsageRun()
+	alone := session.armUsageRun(failed.Add(time.Second))
+	session.disarmUsageRun(alone, func() int64 { return mgr.newestOpenUsageFloor(session) })
+	rec.mu.Lock()
+	last := rec.disarmed[len(rec.disarmed)-1]
+	rec.mu.Unlock()
+	if !last.fallback.IsZero() {
+		t.Fatalf("disarmed fallback=%s with no run open in any manager, want zero", last.fallback)
+	}
+}
+
 // A completion credit stands for the turn that left it and nothing else. A
 // server that announced one turn in a single shape must not bank a credit that
 // a LATER turn's partner-shape completion spends: that turn's floor would stay

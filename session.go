@@ -864,6 +864,30 @@ func (s *CLISession) settleCodexUsageRun() {
 	codexUsageRunSettled(time.UnixMilli(floor))
 }
 
+// newestOpenCodexUsageFloor reports the newest codex utilization floor still
+// open across every terminal session this manager holds — armed by a delivered
+// prompt and not yet settled. The persisted floor is ACCOUNT-WIDE and shared
+// with the app-server manager, whose rollback of a failed turn write must fall
+// back to the newest run open ANYWHERE, so that rollback consults this next to
+// its own sessions (codexNewestOpenRunFloor).
+func (sm *SessionManager) newestOpenCodexUsageFloor() int64 {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	var newest int64
+	for _, session := range sm.sessions {
+		if !isCodexCommand(session.Command) || session.codexUsageSettled.Load() {
+			continue
+		}
+		if floor := session.codexUsageFloorMs.Load(); floor > newest {
+			newest = floor
+		}
+	}
+	return newest
+}
+
 // SendInput writes text to the stdin of the specified session.
 // For Claude and Antigravity stream-json sessions, the text is wrapped in the
 // CLI's NDJSON user-message envelope. For other CLIs it is sent as raw text.

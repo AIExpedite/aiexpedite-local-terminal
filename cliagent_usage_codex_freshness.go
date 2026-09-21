@@ -110,7 +110,18 @@ func codexUsageRunSettled(floor time.Time) {
 // `floor` never started — its request never reached the child. `fallback` is
 // the newest run that manager still has open, or zero: the arm coalesced onto
 // this floor, so that is what the persisted floor rolls back to.
+//
+// The persisted floor is ACCOUNT-WIDE while several managers arm it — the
+// app-server manager and the terminal `codex` sessions of SessionManager — so
+// the rollback falls back to the newest run open in ANY of them
+// (codexNewestOpenRunFloor), never just the caller's own. Otherwise an
+// app-server turn write failing while a terminal run is the only other thing
+// open would reset the shared floor to zero and erase that run's
+// crash-recovery marker.
 func codexUsageRunDisarmed(floor, fallback time.Time) {
+	if open := codexNewestOpenRunFloor(); open > 0 && (fallback.IsZero() || open > fallback.UnixMilli()) {
+		fallback = time.UnixMilli(open)
+	}
 	if hooks := codexRunHookOverride.Load(); hooks != nil {
 		if hooks.disarmed != nil {
 			hooks.disarmed(floor, fallback)
@@ -118,6 +129,20 @@ func codexUsageRunDisarmed(floor, fallback time.Time) {
 		return
 	}
 	disarmCodexUsageRunFloor(floor, fallback)
+}
+
+// codexNewestOpenRunFloor reports the newest Codex run floor still open across
+// every run source of this process: the terminal sessions of the global
+// SessionManager and the turns of the global app-server manager. Both are nil
+// outside StartAgent (tests), where each manager accounts for itself. The
+// caller has already withdrawn the floor being rolled back from its own
+// manager, so whatever remains is honestly still open.
+func codexNewestOpenRunFloor() int64 {
+	newest := globalSessionManager.newestOpenCodexUsageFloor()
+	if floor := globalCodexAppServerManager.newestOpenUsageFloor(nil); floor > newest {
+		newest = floor
+	}
+	return newest
 }
 
 // codexUsageRefreshGate holds the process-local bounds. Keyed by account

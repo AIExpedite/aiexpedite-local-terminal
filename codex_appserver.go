@@ -272,7 +272,9 @@ func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 // shared floor to zero and erase a sibling's crash-recovery marker. It is
 // consulted AFTER this floor is popped so a sibling arming concurrently is
 // either already counted or still to write its own (newer) floor, which
-// codexArmRunFloor never lets a later write lower.
+// codexArmRunFloor never lets a later write lower. Runs armed by OTHER
+// managers — terminal `codex` sessions — share the same floor; the freshness
+// layer raises the fallback to cover those (codexNewestOpenRunFloor).
 func (s *CodexAppServerSession) disarmUsageRun(floor int64, siblings func() int64) {
 	s.usageMu.Lock()
 	n := len(s.usageTurnFloors)
@@ -298,7 +300,12 @@ func (s *CodexAppServerSession) disarmUsageRun(floor int64, siblings func() int6
 // newestOpenUsageFloor reports the newest utilization floor still open across
 // every session this manager holds, skipping `except` — the session doing the
 // rollback, which accounts for its own remaining turns under its own lock.
+// Nil-safe: the freshness layer consults the global manager, which is unset
+// outside StartAgent.
 func (m *CodexAppServerManager) newestOpenUsageFloor(except *CodexAppServerSession) int64 {
+	if m == nil {
+		return 0
+	}
 	m.mu.RLock()
 	open := make([]*CodexAppServerSession, 0, len(m.sessions))
 	for _, session := range m.sessions {
