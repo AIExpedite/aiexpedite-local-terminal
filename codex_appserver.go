@@ -183,7 +183,12 @@ type CodexAppServerSession struct {
 	// leaves a credit under its shape; the partner shape arriving later spends
 	// that credit instead of settling ANOTHER open turn — with overlapping
 	// turns, the second announcement would otherwise retire a turn still
-	// running. Keyed by the opaque shape label; capped per shape.
+	// running. Keyed by the opaque shape label; capped per shape. A credit is
+	// only meaningful for the turn that left it, and completions carry no
+	// identity this file may read, so it EXPIRES when the next turn opens: a
+	// server speaking one shape only would otherwise bank a credit that the
+	// partner shape spends against some unrelated LATER turn, retiring nothing
+	// and leaving that turn's floor open until the process exits.
 	usageCompletionCredits map[string]int
 }
 
@@ -201,6 +206,7 @@ const codexAppServerMaxOpenUsageTurns = 64
 func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 	floor := at.UnixMilli()
 	s.usageMu.Lock()
+	s.usageCompletionCredits = nil
 	if len(s.usageTurnFloors) >= codexAppServerMaxOpenUsageTurns {
 		s.usageTurnFloors = s.usageTurnFloors[1:]
 	}
@@ -220,7 +226,16 @@ func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 // it. The floor persisted by codexUsageRunStarted is left alone — without a
 // debt it is only ever read as an interrupted run at the NEXT process start,
 // where one bounded reconcile retires it.
-func (s *CodexAppServerSession) disarmUsageRun(floor int64) {
+//
+// The persisted floor is ACCOUNT-WIDE while this manager runs many concurrent
+// sessions, so the rollback target is the newest turn still open anywhere, not
+// just here: `siblings` reports the newest floor the manager's OTHER sessions
+// hold open. Without it, disarming this session's newer arm would reset the
+// shared floor to zero and erase a sibling's crash-recovery marker. It is
+// consulted AFTER this floor is popped so a sibling arming concurrently is
+// either already counted or still to write its own (newer) floor, which
+// codexArmRunFloor never lets a later write lower.
+func (s *CodexAppServerSession) disarmUsageRun(floor int64, siblings func() int64) {
 	s.usageMu.Lock()
 	n := len(s.usageTurnFloors)
 	if n == 0 || s.usageTurnFloors[n-1] != floor {
@@ -228,20 +243,52 @@ func (s *CodexAppServerSession) disarmUsageRun(floor int64) {
 		return
 	}
 	s.usageTurnFloors = s.usageTurnFloors[:n-1]
-	// The persisted floor coalesced onto this arm; it rolls back to the newest
-	// turn still open (none: zero), which is what it stood in for.
-	var fallback int64
-	for _, open := range s.usageTurnFloors {
-		if open > fallback {
-			fallback = open
+	fallback := newestFloor(s.usageTurnFloors)
+	s.usageMu.Unlock()
+	if siblings != nil {
+		if other := siblings(); other > fallback {
+			fallback = other
 		}
 	}
-	s.usageMu.Unlock()
 	var fallbackAt time.Time
 	if fallback > 0 {
 		fallbackAt = time.UnixMilli(fallback)
 	}
 	codexUsageRunDisarmed(time.UnixMilli(floor), fallbackAt)
+}
+
+// newestOpenUsageFloor reports the newest utilization floor still open across
+// every session this manager holds, skipping `except` — the session doing the
+// rollback, which accounts for its own remaining turns under its own lock.
+func (m *CodexAppServerManager) newestOpenUsageFloor(except *CodexAppServerSession) int64 {
+	m.mu.RLock()
+	open := make([]*CodexAppServerSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session != except {
+			open = append(open, session)
+		}
+	}
+	m.mu.RUnlock()
+	var newest int64
+	for _, session := range open {
+		session.usageMu.Lock()
+		floor := newestFloor(session.usageTurnFloors)
+		session.usageMu.Unlock()
+		if floor > newest {
+			newest = floor
+		}
+	}
+	return newest
+}
+
+func newestFloor(floors []int64) int64 {
+	var newest int64
+	for _, floor := range floors {
+		if floor > newest {
+			newest = floor
+		}
+	}
+	return newest
 }
 
 // openUsageRun marks that the stream produced a frame DEMONSTRATING a turn in
@@ -256,6 +303,7 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 	s.usageMu.Lock()
 	opened := len(s.usageTurnFloors) == 0
 	if opened {
+		s.usageCompletionCredits = nil
 		s.usageTurnFloors = append(s.usageTurnFloors, floor)
 	}
 	s.usageMu.Unlock()
@@ -277,8 +325,11 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 // `shape` is the completion's label (codexRunCompletionShape). A turn may
 // announce its end in two shapes back to back; the second is the SAME turn
 // finishing, not the next one, so it spends the credit the first left instead
-// of popping another floor. Credits are never reset: a dialect that speaks one
-// shape only accumulates credits its partner shape never comes to spend.
+// of popping another floor. A credit only stands for the turn that left it:
+// opening the NEXT turn discards it (see usageCompletionCredits), so a
+// dialect that speaks one shape only can never bank a credit that a later,
+// unrelated partner-shape completion spends in place of settling the turn it
+// announces.
 func (s *CodexAppServerSession) settleUsageRun(shape string) {
 	s.usageMu.Lock()
 	for other, credits := range s.usageCompletionCredits {
@@ -312,12 +363,7 @@ func (s *CodexAppServerSession) settleUsageRun(shape string) {
 // would, without spawning a refresh per abandoned turn.
 func (s *CodexAppServerSession) settleOpenUsageRuns() {
 	s.usageMu.Lock()
-	var newest int64
-	for _, floor := range s.usageTurnFloors {
-		if floor > newest {
-			newest = floor
-		}
-	}
+	newest := newestFloor(s.usageTurnFloors)
 	s.usageTurnFloors = nil
 	s.usageMu.Unlock()
 	if newest > 0 {
@@ -564,7 +610,9 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 			// no turn ran, so the floor armed above must not be settled into a
 			// debt at exit.
 			if armedFloor > 0 {
-				session.disarmUsageRun(armedFloor)
+				session.disarmUsageRun(armedFloor, func() int64 {
+					return m.newestOpenUsageFloor(session)
+				})
 			}
 			return fmt.Errorf("failed to write to codex app-server session %s stdin: %w", id, err)
 		}

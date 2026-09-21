@@ -1413,7 +1413,7 @@ func TestCodexAppServerSession_DisarmRollsBackPersistedFloor(t *testing.T) {
 	second := first.Add(250 * time.Millisecond)
 	session.armUsageRun(first)
 	failed := session.armUsageRun(second)
-	session.disarmUsageRun(failed)
+	session.disarmUsageRun(failed, nil)
 
 	rec.mu.Lock()
 	disarmed := append([]codexRunDisarm(nil), rec.disarmed...)
@@ -1428,7 +1428,7 @@ func TestCodexAppServerSession_DisarmRollsBackPersistedFloor(t *testing.T) {
 	// Alone, the rollback names no fallback.
 	session.settleUsageRun("turn.completed")
 	alone := session.armUsageRun(second.Add(time.Second))
-	session.disarmUsageRun(alone)
+	session.disarmUsageRun(alone, nil)
 	rec.mu.Lock()
 	last := rec.disarmed[len(rec.disarmed)-1]
 	rec.mu.Unlock()
@@ -1497,5 +1497,80 @@ func TestCodexAppServerLifecycle_FailedTurnWriteDisarmsUsageRun(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if _, settled := rec.counts(); settled != 0 {
 		t.Fatalf("settled %d at exit after a turn request that never reached the child, want 0", settled)
+	}
+}
+
+// The persisted floor is account-wide while one manager runs many concurrent
+// sessions, so rolling back a failed turn write must preserve the newest turn
+// still open in ANY of them. Resetting the shared floor to this session's own
+// remainder would erase a sibling session's crash-recovery marker, and a crash
+// before that sibling settles would lose the refresh it was promised.
+func TestCodexAppServerSession_DisarmPreservesSiblingSessionFloor(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	mgr := NewCodexAppServerManager(nil)
+	sibling := &CodexAppServerSession{}
+	session := &CodexAppServerSession{}
+	mgr.sessions["sibling"] = sibling
+	mgr.sessions["self"] = session
+
+	siblingTurn := time.UnixMilli(1_700_000_000_000)
+	failed := siblingTurn.Add(250 * time.Millisecond)
+	sibling.armUsageRun(siblingTurn)
+	armed := session.armUsageRun(failed)
+	session.disarmUsageRun(armed, func() int64 { return mgr.newestOpenUsageFloor(session) })
+
+	rec.mu.Lock()
+	disarmed := append([]codexRunDisarm(nil), rec.disarmed...)
+	rec.mu.Unlock()
+	if len(disarmed) != 1 {
+		t.Fatalf("disarmed %d floors, want 1", len(disarmed))
+	}
+	if !disarmed[0].floor.Equal(failed) || !disarmed[0].fallback.Equal(siblingTurn) {
+		t.Fatalf("disarmed floor=%s fallback=%s, want floor=%s fallback=%s (the sibling session's open turn)",
+			disarmed[0].floor, disarmed[0].fallback, failed, siblingTurn)
+	}
+
+	// With every sibling turn settled there is nothing left to preserve.
+	sibling.settleUsageRun("turn.completed")
+	alone := session.armUsageRun(failed.Add(time.Second))
+	session.disarmUsageRun(alone, func() int64 { return mgr.newestOpenUsageFloor(session) })
+	rec.mu.Lock()
+	last := rec.disarmed[len(rec.disarmed)-1]
+	rec.mu.Unlock()
+	if !last.fallback.IsZero() {
+		t.Fatalf("disarmed fallback=%s with no turn open anywhere, want zero", last.fallback)
+	}
+}
+
+// A completion credit stands for the turn that left it and nothing else. A
+// server that announced one turn in a single shape must not bank a credit that
+// a LATER turn's partner-shape completion spends: that turn's floor would stay
+// open until the process exited, so its post-run reconcile never runs.
+func TestCodexAppServerSession_CreditExpiresWhenNextTurnOpens(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(time.Second)
+	session.armUsageRun(first)
+	session.settleUsageRun("turn.completed")
+	if _, settled := rec.counts(); settled != 1 {
+		t.Fatalf("settled %d after the first turn's only completion, want 1", settled)
+	}
+
+	// A different turn, announced in the shape the first turn never used.
+	session.armUsageRun(second)
+	session.settleUsageRun("thread.completed")
+	settled := rec.settled
+	if len(settled) != 2 || !settled[1].Equal(second) {
+		t.Fatalf("settled=%v after the second turn's completion, want it settled at %s", settled, second)
+	}
+
+	// A progress frame that opens a run clears a stale credit too.
+	third := second.Add(time.Second)
+	session.settleUsageRun("turn.completed") // leaves a credit, nothing open
+	session.openUsageRun(third)
+	session.settleUsageRun("thread.completed")
+	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
+		t.Fatalf("settled=%v after the opened run's completion, want it settled at %s", got, third)
 	}
 }
