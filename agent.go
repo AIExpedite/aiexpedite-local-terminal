@@ -153,6 +153,11 @@ func StartAgent(cfg *Config) {
 	// Code update, and the bounded utilization probe.
 	SetClaudeStatusLineHookDisabled(cfg.DisableClaudeStatusLineHook)
 	SetClaudeUsageProbeDisabled(cfg.DisableClaudeUsageProbe)
+	// Arm Codex's post-run freshness path, then pay — once, bounded, off this
+	// goroutine — any refresh the previous process owed: a Codex run that
+	// finished (or was cut off) just before a restart or self-update.
+	SetCodexUsageRefreshEnabled(true)
+	payOwedCodexUsageRefresh()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

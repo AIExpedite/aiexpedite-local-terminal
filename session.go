@@ -154,6 +154,22 @@ type CLISession struct {
 	// stream reader writes it and waitForExit reads it.
 	turnSettled atomic.Bool
 
+	// codexUsageFloorMs is the floor a codex session's utilization run is
+	// measured against — the moment its prompt was DELIVERED to the child
+	// (armCodexUsageRun). Zero until then: a stdin-fed session started without
+	// a prompt (deferredStdinClose) only waits for its first SendInput, so a
+	// floor armed at start would let telemetry from some other run during that
+	// wait pass as this session's reading, and closing the session before any
+	// prompt arrived would settle a run that never happened into a debt no
+	// telemetry can pay. codexUsageSettled is set once the armed run has been
+	// handed to codexUsageRunSettled — on its first terminal event
+	// (turn.completed / thread.completed) or, failing that, on exit — so a run
+	// is settled exactly once. Unlike turnSettled it is not cleared per line:
+	// codex emits BOTH terminal events for one turn. Only a delivered
+	// follow-up turn (SendInput) re-arms it.
+	codexUsageFloorMs atomic.Int64
+	codexUsageSettled atomic.Bool
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -768,6 +784,23 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
 	}
+	// A codex run's utilization is owed from its start; the terminal event or
+	// waitForExit settles it. Armed here only when the prompt travelled on
+	// argv, so the child is already running it. A prompt still to be written
+	// to stdin arms once that write SUCCEEDS (below, anchored at the same
+	// start): a child that exits or closes stdin first never received a
+	// prompt, and its exit must not settle a run that never happened into a
+	// debt no telemetry can pay. A session started WITHOUT a prompt is not
+	// running yet — its run is armed by the SendInput that delivers one.
+	// `codex exec resume|review "<prompt>"` is the third shape: a nil
+	// stdinPrompt because its prompt stayed in argv (buildCodexInteractiveArgs
+	// forwards those subcommands verbatim), so it IS already running and is
+	// told apart from the idle session by codexPromptTravelsOnArgv.
+	// Asynchronous — never holds sm.mu across the cache lock.
+	if isCodexCommand(session.Command) && stdinPrompt == nil &&
+		(!session.deferredStdinClose || codexPromptTravelsOnArgv(args)) {
+		session.armCodexUsageRun(session.StartedAt)
+	}
 
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
@@ -822,15 +855,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			// than dropping the prompt silently.
 			line = *stdinPrompt
 		}
-		if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
-			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
-				colorRed, id, err, colorReset)
-		} else {
-			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
-				colorGreen, id, len(*stdinPrompt), stdinPromptFormat(command), colorReset)
-			// Prompt delivered — arm the claude no-output watchdog now.
-			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
-		}
+		sm.deliverInitialPrompt(session, line, len(*stdinPrompt), stdinPromptFormat(command))
 	}
 
 	// Close stdin for one-shot sessions. Codex exec appends piped stdin to the
@@ -851,9 +876,81 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	return nil
 }
 
+// deliverInitialPrompt writes the framed initial prompt to the child's stdin.
+// Only a write that SUCCEEDED starts anything: the claude no-output watchdog
+// arms, and a codex run is armed at the session start — the prompt was the
+// first thing the child read, so its run began there. A failed write is
+// logged and starts nothing, exactly as a failed deferred SendInput does.
+func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string, promptLen int, format string) {
+	if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
+		fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
+			colorRed, session.ID, err, colorReset)
+		return
+	}
+	fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
+		colorGreen, session.ID, promptLen, format, colorReset)
+	if isCodexCommand(session.Command) {
+		session.armCodexUsageRun(session.StartedAt)
+	}
+	// Prompt delivered — arm the claude no-output watchdog now.
+	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
+}
+
 /* --------------------------------------------------------------------------
    SendInput — write to a session's stdin
    -------------------------------------------------------------------------- */
+
+// armCodexUsageRun anchors the session's codex utilization run at `at`, the
+// moment its prompt reached the child, and hands the start to the freshness
+// path. Re-arming for a delivered follow-up turn moves the floor forward and
+// reopens the settle.
+func (s *CLISession) armCodexUsageRun(at time.Time) {
+	// Floors are persisted in milliseconds; arm at that precision so the
+	// start and settle describe the same instant.
+	floor := at.UnixMilli()
+	s.codexUsageFloorMs.Store(floor)
+	s.codexUsageSettled.Store(false)
+	codexUsageRunStarted(time.UnixMilli(floor))
+}
+
+// settleCodexUsageRun hands the session's armed codex run to the freshness
+// path exactly once. No-op for a non-codex command, for a session whose prompt
+// never arrived (nothing armed), and for a run already settled by the earlier
+// of its terminal event and its exit.
+func (s *CLISession) settleCodexUsageRun() {
+	if !isCodexCommand(s.Command) {
+		return
+	}
+	floor := s.codexUsageFloorMs.Load()
+	if floor <= 0 || !s.codexUsageSettled.CompareAndSwap(false, true) {
+		return
+	}
+	codexUsageRunSettled(time.UnixMilli(floor))
+}
+
+// newestOpenCodexUsageFloor reports the newest codex utilization floor still
+// open across every terminal session this manager holds — armed by a delivered
+// prompt and not yet settled. The persisted floor is ACCOUNT-WIDE and shared
+// with the app-server manager, whose rollback of a failed turn write must fall
+// back to the newest run open ANYWHERE, so that rollback consults this next to
+// its own sessions (codexNewestOpenRunFloor).
+func (sm *SessionManager) newestOpenCodexUsageFloor() int64 {
+	if sm == nil {
+		return 0
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	var newest int64
+	for _, session := range sm.sessions {
+		if !isCodexCommand(session.Command) || session.codexUsageSettled.Load() {
+			continue
+		}
+		if floor := session.codexUsageFloorMs.Load(); floor > newest {
+			newest = floor
+		}
+	}
+	return newest
+}
 
 // SendInput writes text to the stdin of the specified session.
 // For Claude and Antigravity stream-json sessions, the text is wrapped in the
@@ -890,7 +987,9 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	// is accepted and before it produces its next line would otherwise still look
 	// settled to waitForExit and skip the abnormal-exit probe. Clearing early can
 	// at worst schedule one extra throttled probe for a write that then failed;
-	// the opposite error silently drops a turn's usage.
+	// the opposite error silently drops a turn's usage. A codex run, by
+	// contrast, is armed only once the write below has SUCCEEDED (see
+	// codexUsageFloorMs): its floor is the moment the prompt reached the child.
 	session.turnSettled.Store(false)
 
 	// Write input with timeout to prevent deadlock if the CLI process's
@@ -907,6 +1006,12 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		}
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
+	}
+
+	// The prompt reached codex: this is where its run starts — for the
+	// deferred flow above all, whose session has been idle since StartSession.
+	if isCodexCommand(session.Command) {
+		session.armCodexUsageRun(time.Now())
 	}
 
 	// One-shot, stdin-fed CLIs (codex) started without a prompt held
@@ -1780,6 +1885,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// sequence precedes the turn_complete prompt sequence.
 				appendDisplayText(line.text)
 				flushBatch()
+				// A finished codex turn owes the CLI Agents card a reading taken
+				// after it started (cliagent_usage_codex_freshness.go). Once per
+				// run: thread.completed follows turn.completed.
+				session.settleCodexUsageRun()
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
@@ -2094,6 +2203,9 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
 	}
+	// Same for a codex run that never reached a terminal event. A session that
+	// never received its prompt has no run to settle.
+	session.settleCodexUsageRun()
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 
@@ -2510,55 +2622,13 @@ func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	// this, e.g. `--model o3` would treat "o3" as a prompt word. Keep this
 	// in sync with `codex exec --help` (and the resume/review subcommands).
 	// The `--flag=value` form is one token and doesn't need entries here.
-	valuedFlags := map[string]bool{
-		// Top-level `codex exec` options
-		"-c": true, "--config": true,
-		"-m": true, "--model": true,
-		"-i": true, "--image": true,
-		"-p": true, "--profile": true,
-		"-C": true, "--cd": true,
-		"-o": true, "--output-last-message": true,
-		"--enable": true, "--disable": true,
-		"--local-provider": true,
-		"--add-dir":        true,
-		"--output-schema":  true,
-		"--color":          true,
-		// `codex exec review` adds these (harmless when passed through in the
-		// subcommand path; listed for completeness so the value isn't
-		// misclassified if a future change brings reviews into the parser).
-		"--base":   true,
-		"--commit": true,
-		"--title":  true,
-	}
+	valuedFlags := codexExecValuedFlags
 
-	// Detect whether the user invoked an `exec` subcommand (resume/review/help)
-	// by scanning until the first non-flag positional token. Anything past that
-	// token belongs to the subcommand and must be forwarded verbatim.
-	knownSubcommands := map[string]bool{
-		"resume": true,
-		"review": true,
-		"help":   true,
-	}
-	hasSubcommand := false
-	{
-		skipNext := false
-		for i, a := range cleanedArgs {
-			if skipNext {
-				skipNext = false
-				continue
-			}
-			if strings.HasPrefix(a, "-") {
-				if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(cleanedArgs) {
-					skipNext = true
-				}
-				continue
-			}
-			if knownSubcommands[strings.ToLower(a)] {
-				hasSubcommand = true
-			}
-			break // first non-flag positional decides
-		}
-	}
+	// Detect whether the user invoked an `exec` subcommand (resume/review/help).
+	// Anything past that token belongs to the subcommand and must be forwarded
+	// verbatim.
+	subcommand, _ := codexExecSubcommand(cleanedArgs)
+	hasSubcommand := subcommand != ""
 
 	if hasSubcommand {
 		// Subcommand path: keep argv shape intact, no stdin routing.
@@ -2606,6 +2676,146 @@ func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	result = append(result, "-")
 
 	return result, strings.Join(promptParts, " ")
+}
+
+// codexExecValuedFlags lists the codex options that consume the NEXT argv
+// token as their value — without it, e.g. `--model o3` would read "o3" as a
+// prompt word. Keep in sync with `codex exec --help` (and the resume/review
+// subcommands). The `--flag=value` form is one token and needs no entry.
+var codexExecValuedFlags = map[string]bool{
+	// Top-level `codex exec` options
+	"-c": true, "--config": true,
+	"-m": true, "--model": true,
+	"-i": true, "--image": true,
+	"-p": true, "--profile": true,
+	"-C": true, "--cd": true,
+	"-o": true, "--output-last-message": true,
+	"--enable": true, "--disable": true,
+	"--local-provider": true,
+	"--add-dir":        true,
+	"--output-schema":  true,
+	"--color":          true,
+	// `codex exec review` adds these (harmless when passed through in the
+	// subcommand path; listed for completeness so the value isn't
+	// misclassified if a future change brings reviews into the parser).
+	"--base":   true,
+	"--commit": true,
+	"--title":  true,
+}
+
+// codexExecSubcommand reports which `codex exec` subcommand (resume/review/
+// help) a sanitized argv invokes, plus the tokens that follow it. The first
+// non-flag positional decides; flags that consume a value are skipped so the
+// value is never mistaken for the subcommand. Empty name means the ordinary
+// top-level `codex exec` form, whose prompt buildCodexInteractiveArgs routes
+// through stdin.
+func codexExecSubcommand(cleanedArgs []string) (string, []string) {
+	known := map[string]bool{"resume": true, "review": true, "help": true}
+	skipNext := false
+	for i, a := range cleanedArgs {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			if !strings.Contains(a, "=") && codexExecValuedFlags[a] && i+1 < len(cleanedArgs) {
+				skipNext = true
+			}
+			continue
+		}
+		if name := strings.ToLower(a); known[name] {
+			return name, cleanedArgs[i+1:]
+		}
+		return "", nil // first non-flag positional decides
+	}
+	return "", nil
+}
+
+// codexExecPositionals returns the non-flag tokens of an argv tail, skipping
+// the values of flags that consume one.
+func codexExecPositionals(args []string) []string {
+	var positionals []string
+	skipNext := false
+	for i, a := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			if !strings.Contains(a, "=") && codexExecValuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		positionals = append(positionals, a)
+	}
+	return positionals
+}
+
+// codexPromptTravelsOnArgv reports whether a codex invocation already carries
+// its prompt in argv, so the child is running the turn the moment it starts.
+//
+// buildCodexInteractiveArgs passes `codex exec resume|review` through verbatim
+// and returns NO stdinPrompt for them, which is the same signal a chat-direct
+// session — opened empty and fed its prompt by the first SendInput — gives.
+// StartSession needs to tell the two apart: the argv-bearing subcommand runs
+// immediately and must arm its utilization floor at start, while the empty
+// session must not (nothing is running yet; SendInput arms it on delivery).
+//
+// Conservative by design: a subcommand whose prompt is absent or routed to
+// stdin (the `-` placeholder) reports false and is armed by SendInput instead.
+// `resume` puts SESSION_ID before PROMPT unless --last names the session.
+//
+// `review` is the exception to "no prompt, no run": its custom prompt is
+// OPTIONAL, and a review that names its target on argv (`review --uncommitted`
+// / `--base` / `--commit`) starts on that diff the moment the child does. No
+// SendInput ever follows one, so reporting false there would leave its
+// utilization floor unarmed and the card stale after the review finishes.
+func codexPromptTravelsOnArgv(args []string) bool {
+	subcommand, rest := codexExecSubcommand(sanitizeCodexExecArgs(args))
+	promptIndex := 0
+	switch subcommand {
+	case "review":
+		if codexReviewTargetsArgv(rest) {
+			return true
+		}
+	case "resume":
+		promptIndex = 1 // SESSION_ID PROMPT
+		for _, a := range rest {
+			if a == "--last" {
+				promptIndex = 0 // --last names the session; PROMPT is first
+				break
+			}
+		}
+	default:
+		return false // `help`, or the top-level stdin-routed form
+	}
+	positionals := codexExecPositionals(rest)
+	if len(positionals) <= promptIndex {
+		return false
+	}
+	return positionals[promptIndex] != "-"
+}
+
+// codexReviewTargetsArgv reports whether a `codex exec review` tail already
+// names the diff to review, so the review runs without any further input. The
+// valued forms (`--base main`, `--commit <sha>`) count in either spelling; the
+// flag alone with its value missing does not, since codex rejects it.
+func codexReviewTargetsArgv(rest []string) bool {
+	for i, a := range rest {
+		lower := strings.ToLower(a)
+		if lower == "--uncommitted" {
+			return true
+		}
+		name, value, inline := strings.Cut(lower, "=")
+		if name != "--base" && name != "--commit" {
+			continue
+		}
+		if inline && value != "" || !inline && i+1 < len(rest) {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeCodexExecArgs(args []string) []string {

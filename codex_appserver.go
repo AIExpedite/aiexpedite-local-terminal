@@ -115,15 +115,19 @@ const (
 	// fatal error and kill the child rather than silently dropping (see
 	// codexAppServerEnqueueTimeout below).
 	codexAppServerPublishQueueSize = 256
-
-	// codexAppServerEnqueueTimeout is the upper bound for the stream readers
-	// to wait when the publish queue is full. Hitting this means Pub/Sub has
-	// stalled for a sustained period; the session cannot continue safely
-	// (silently dropped frames would break the JSON-RPC state machine on the
-	// orchestrator), so the manager publishes a `codex_appserver_error`
-	// surface and force-kills the child to fail-fast.
-	codexAppServerEnqueueTimeout = 30 * time.Second
 )
+
+// codexAppServerEnqueueTimeout is the upper bound for the stream readers
+// to wait when the publish queue is full. Hitting this means Pub/Sub has
+// stalled for a sustained period; the session cannot continue safely
+// (silently dropped frames would break the JSON-RPC state machine on the
+// orchestrator), so the manager publishes a `codex_appserver_error`
+// surface and force-kills the child to fail-fast.
+//
+// A var rather than a const purely so the stall test can shrink it: waiting
+// out the real 30s is dead wall-clock that crowds the package against CI's
+// `go test -timeout 5m`. Production never reassigns it.
+var codexAppServerEnqueueTimeout = 30 * time.Second
 
 /* --------------------------------------------------------------------------
    CodexAppServerSession — one running `codex app-server` process
@@ -159,6 +163,299 @@ type CodexAppServerSession struct {
 	// terminalPublishState reserves this session's ID while its codex_appserver_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
+
+	// usageTurnFloors holds the floor of every utilization run this session
+	// has open — one per turn requested (or demonstrated by the stream) and not
+	// yet settled, oldest first. The app-server is long-lived and serves MANY
+	// turns, so settling only at process exit would leave the CLI Agents card
+	// pinned to a pre-turn reading for as long as an IDE session stays open;
+	// and because Send serialises concurrent callers rather than rejecting an
+	// overlapping turn, turns on different threads CAN overlap, so each keeps
+	// its own floor: a completion settles one turn, never the whole set, and
+	// the last completion (or waitForExit) is what leaves the session with
+	// nothing open. Between-turn traffic (an `account/rateLimits/read` reply,
+	// initialization) never opens a run: a floor anchored on it would owe a
+	// refresh no run produced — neither does Start itself, so an app-server
+	// launched and closed without a turn owes nothing. A floor is ANCHORED when
+	// a turn is requested (Send), so a reading that arrives during
+	// initialization or between turns is never mistaken for the next turn's
+	// telemetry (cliagent_usage_codex_freshness.go). Guarded by usageMu.
+	usageMu         sync.Mutex
+	usageTurnFloors []int64
+	// usageCreditShape / usageCreditFrame pair the two shapes one finished turn
+	// may announce itself in (codexRunCompletionShape). Settling on the first
+	// leaves a credit labelled with its shape; the partner shape arriving
+	// later spends that credit instead of settling ANOTHER open turn — with
+	// overlapping turns, the second announcement would otherwise retire a turn
+	// still running. Only ONE credit is ever live: a turn's two announcements
+	// are consecutive, so a newer completion replaces any credit still
+	// standing.
+	//
+	// A credit is only meaningful for the turn that left it, and the two
+	// shapes carry DIFFERENT identities for the same turn (`turn.completed`
+	// names a turn, `thread.completed` a thread), so there is nothing to
+	// correlate them by. It is therefore bounded twice: it expires when the
+	// next turn opens, and — because a turn ALREADY open when the credit was
+	// created can announce itself in the partner shape much later — it lapses
+	// once more than codexAppServerCompletionPairFrameSpan frames have been
+	// read past it.
+	//
+	// That bound is measured in STREAM POSITION (the frame's ordinal on
+	// STDOUT), not elapsed wall time: the scanner settles a frame and then
+	// blocks in publishOrFail, which can park for as long as the publish queue
+	// is stalled, so two frames adjacent on the wire can reach this layer
+	// seconds apart. A position span describes what the pairing actually means
+	// — the partner announcement follows immediately, a different turn's
+	// completion is separated by that turn's own output — and is immune to how
+	// long publishing took in between. It is NOT the publication seq: that
+	// counter is shared with the stderr scanner, so a burst of diagnostics
+	// between two adjacent stdout frames would lapse a credit whose partner is
+	// the very next protocol frame.
+	usageCreditShape string
+	usageCreditFrame int64
+	// usageOverflowTurns / usageOverflowFloor stand in for turns dropped from
+	// usageTurnFloors at the cap. Completions are matched to floors by
+	// position, so simply forgetting a floor would shift every later
+	// completion onto the wrong turn — and leave the final turn's completion
+	// with no floor at all. The dropped turns keep a COUNT (memory stays
+	// bounded) plus the newest floor among them, and a completion drains that
+	// count before touching usageTurnFloors, so the alignment survives.
+	usageOverflowTurns int
+	usageOverflowFloor int64
+}
+
+// codexAppServerCompletionPairFrameSpan bounds how far past a completion
+// credit — in frames read off the stream — its partner shape may arrive. A
+// turn that announces itself in both shapes emits them back to back, within a
+// handful of frames; a completion further downstream belongs to a different
+// turn and must settle its own floor. See usageCreditShape for why this is
+// counted in frames rather than elapsed time.
+const codexAppServerCompletionPairFrameSpan = 8
+
+// codexAppServerMaxOpenUsageTurns bounds usageTurnFloors. A turn whose
+// completion never arrives (a `turn/start` the child rejected, say) would
+// otherwise leave its floor behind for the life of the session; past the cap
+// the OLDEST floors collapse into usageOverflowTurns — their exact instants
+// are lost, but the freshness layer coalesces concurrent runs onto the newest
+// floor anyway, and the entry itself is kept so completion-to-floor alignment
+// does not shift.
+const codexAppServerMaxOpenUsageTurns = 64
+
+// armUsageRun anchors a new utilization run at `at` — a turn the client just
+// requested — alongside any turn still open. Telemetry observed before this
+// turn was asked for cannot stand in for the reading this turn owes. Returns
+// the floor so a request that never reached the child can be disarmed.
+func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
+	floor := at.UnixMilli()
+	s.usageMu.Lock()
+	s.clearUsageCreditLocked()
+	if len(s.usageTurnFloors) >= codexAppServerMaxOpenUsageTurns {
+		s.overflowOldestUsageTurnLocked()
+	}
+	s.usageTurnFloors = append(s.usageTurnFloors, floor)
+	s.usageMu.Unlock()
+	// Floors are persisted in milliseconds; arm at that precision so the
+	// start and settle describe the same instant.
+	codexUsageRunStarted(time.UnixMilli(floor))
+	return floor
+}
+
+// disarmUsageRun undoes armUsageRun for a turn request whose stdin write
+// FAILED: the request never reached the child, so no run started and
+// waitForExit must not settle it into a debt no telemetry can pay — one that
+// would age into a false stale-utilization warning. Only the newest open turn
+// is a candidate: Send holds stdinMu from arm to write, so nothing armed after
+// it. The floor persisted by codexUsageRunStarted is left alone — without a
+// debt it is only ever read as an interrupted run at the NEXT process start,
+// where one bounded reconcile retires it.
+//
+// The persisted floor is ACCOUNT-WIDE while this manager runs many concurrent
+// sessions, so the rollback target is the newest turn still open anywhere, not
+// just here: `siblings` reports the newest floor the manager's OTHER sessions
+// hold open. Without it, disarming this session's newer arm would reset the
+// shared floor to zero and erase a sibling's crash-recovery marker. It is
+// consulted AFTER this floor is popped so a sibling arming concurrently is
+// either already counted or still to write its own (newer) floor, which
+// codexArmRunFloor never lets a later write lower. Runs armed by OTHER
+// managers — terminal `codex` sessions — share the same floor; the freshness
+// layer raises the fallback to cover those (codexNewestOpenRunFloor).
+func (s *CodexAppServerSession) disarmUsageRun(floor int64, siblings func() int64) {
+	s.usageMu.Lock()
+	n := len(s.usageTurnFloors)
+	if n == 0 || s.usageTurnFloors[n-1] != floor {
+		s.usageMu.Unlock()
+		return
+	}
+	s.usageTurnFloors = s.usageTurnFloors[:n-1]
+	fallback := newestFloor(s.usageTurnFloors)
+	s.usageMu.Unlock()
+	if siblings != nil {
+		if other := siblings(); other > fallback {
+			fallback = other
+		}
+	}
+	var fallbackAt time.Time
+	if fallback > 0 {
+		fallbackAt = time.UnixMilli(fallback)
+	}
+	codexUsageRunDisarmed(time.UnixMilli(floor), fallbackAt)
+}
+
+// newestOpenUsageFloor reports the newest utilization floor still open across
+// every session this manager holds, skipping `except` — the session doing the
+// rollback, which accounts for its own remaining turns under its own lock.
+// Nil-safe: the freshness layer consults the global manager, which is unset
+// outside StartAgent.
+func (m *CodexAppServerManager) newestOpenUsageFloor(except *CodexAppServerSession) int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	open := make([]*CodexAppServerSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session != except {
+			open = append(open, session)
+		}
+	}
+	m.mu.RUnlock()
+	var newest int64
+	for _, session := range open {
+		session.usageMu.Lock()
+		floor := newestFloor(session.usageTurnFloors)
+		if session.usageOverflowFloor > floor {
+			floor = session.usageOverflowFloor
+		}
+		session.usageMu.Unlock()
+		if floor > newest {
+			newest = floor
+		}
+	}
+	return newest
+}
+
+func newestFloor(floors []int64) int64 {
+	var newest int64
+	for _, floor := range floors {
+		if floor > newest {
+			newest = floor
+		}
+	}
+	return newest
+}
+
+// openUsageRun marks that the stream produced a frame DEMONSTRATING a turn in
+// progress (codexRunProgressFrame), anchoring a run at `at` only when nothing
+// else has (no turn is open). That fallback covers a client dialect whose turn
+// request armUsageRun does not recognize; a recognized turn/start always wins,
+// since it is written before any of the turn's frames come back. Callers must
+// not pass unrelated responses or notifications — see codexRunProgressFrame
+// for why.
+func (s *CodexAppServerSession) openUsageRun(at time.Time) {
+	floor := at.UnixMilli()
+	s.usageMu.Lock()
+	opened := len(s.usageTurnFloors) == 0 && s.usageOverflowTurns == 0
+	if opened {
+		s.clearUsageCreditLocked()
+		s.usageTurnFloors = append(s.usageTurnFloors, floor)
+	}
+	s.usageMu.Unlock()
+	if opened {
+		codexUsageRunStarted(time.UnixMilli(floor))
+	}
+}
+
+// settleUsageRun hands ONE finished utilization run — the oldest still open —
+// to the freshness path. Completions carry no identity this file may read, so
+// overlapping turns settle in request order; the freshness layer coalesces
+// concurrent runs onto the newest floor, so which of them a given completion
+// retires does not change what the debt waits on — only that every completion
+// settles something, and the last one leaves nothing open. No-op when the
+// stream produced nothing since the last settle — the run it would describe
+// does not exist, and a debt for it would surface as a spurious "reading
+// predates the last run" notice.
+//
+// `shape` is the completion's label (codexRunCompletionShape) and `frame` its
+// position on the stdout stream (the scanner's stdout-only line ordinal, never
+// the publication seq the stderr scanner also advances). A turn may
+// announce its end in two shapes back to back; the second is the SAME turn
+// finishing, not the next one, so it spends the credit the first left instead
+// of popping another floor. A credit only stands for the turn that left it
+// (see usageCreditShape): opening the NEXT turn discards it, and it lapses
+// more than codexAppServerCompletionPairFrameSpan frames downstream, so
+// neither a one-shape dialect nor a turn that was ALREADY open when the credit
+// was created can have its own lone completion swallowed as someone else's
+// partner shape.
+func (s *CodexAppServerSession) settleUsageRun(shape string, frame int64) {
+	s.usageMu.Lock()
+	if s.usageCreditShape != "" && s.usageCreditShape != shape &&
+		frame > s.usageCreditFrame && frame-s.usageCreditFrame <= codexAppServerCompletionPairFrameSpan {
+		// The partner shape of the turn that left the credit: the same turn
+		// finishing, not another one.
+		s.clearUsageCreditLocked()
+		s.usageMu.Unlock()
+		return
+	}
+	s.usageCreditShape = shape
+	s.usageCreditFrame = frame
+	var floor int64
+	switch {
+	case s.usageOverflowTurns > 0:
+		// Oldest first: the collapsed turns were requested before every floor
+		// still listed, so they own the earliest completions.
+		floor = s.usageOverflowFloor
+		s.usageOverflowTurns--
+		if s.usageOverflowTurns == 0 {
+			s.usageOverflowFloor = 0
+		}
+	case len(s.usageTurnFloors) > 0:
+		floor = s.usageTurnFloors[0]
+		s.usageTurnFloors = s.usageTurnFloors[1:]
+	}
+	s.usageMu.Unlock()
+	if floor > 0 {
+		codexUsageRunSettled(time.UnixMilli(floor))
+	}
+}
+
+// clearUsageCreditLocked drops any standing completion credit. Callers hold
+// usageMu.
+func (s *CodexAppServerSession) clearUsageCreditLocked() {
+	s.usageCreditShape = ""
+	s.usageCreditFrame = 0
+}
+
+// overflowOldestUsageTurnLocked collapses the oldest listed floor into the
+// overflow counter, keeping its slot so completions stay aligned with turns.
+// Callers hold usageMu.
+func (s *CodexAppServerSession) overflowOldestUsageTurnLocked() {
+	if len(s.usageTurnFloors) == 0 {
+		return
+	}
+	dropped := s.usageTurnFloors[0]
+	s.usageTurnFloors = s.usageTurnFloors[1:]
+	if dropped > s.usageOverflowFloor {
+		s.usageOverflowFloor = dropped
+	}
+	s.usageOverflowTurns++
+}
+
+// settleOpenUsageRuns settles every turn still open at process exit as one
+// run anchored at the NEWEST floor — the freshness layer coalesces concurrent
+// runs onto the newest floor, so one settle records the same debt several
+// would, without spawning a refresh per abandoned turn.
+func (s *CodexAppServerSession) settleOpenUsageRuns() {
+	s.usageMu.Lock()
+	newest := newestFloor(s.usageTurnFloors)
+	if s.usageOverflowFloor > newest {
+		newest = s.usageOverflowFloor
+	}
+	s.usageTurnFloors = nil
+	s.usageOverflowTurns = 0
+	s.usageOverflowFloor = 0
+	s.usageMu.Unlock()
+	if newest > 0 {
+		codexUsageRunSettled(time.UnixMilli(newest))
+	}
 }
 
 // Status returns the current lifecycle status under the session mutex so
@@ -320,6 +617,13 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "codex-appserver:"+id)
 	}
+	// No utilization run is armed here: starting an app-server is not running a
+	// turn. An IDE that launches one and closes it after initialization would
+	// otherwise settle a floor at exit and owe a refresh no telemetry can pay,
+	// surfacing as a stale-utilization warning for a run that never happened.
+	// The floor is anchored when a turn is REQUESTED (Send) or, for a client
+	// dialect that request predicate does not recognize, by the first frame
+	// demonstrating a turn in progress (readStream).
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
@@ -342,6 +646,12 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 // and rejects, and the orphaned write (if it ever wakes up) lands on a closed
 // pipe. Without that guarantee, two timed-out Sends could interleave their
 // JSON-RPC frames on the wire and break request/response correlation.
+// codexAppServerStdinWriteBudget is the write budget Send enforces — an
+// indirection point for tests (pubsub.go keeps the same kind of seam): the
+// stall path tears a session down, and a test cannot afford to wait out the
+// real codexAppServerStdinWriteTimeout to reach it.
+var codexAppServerStdinWriteBudget = codexAppServerStdinWriteTimeout
+
 func (m *CodexAppServerManager) Send(id string, payload string) error {
 	session := m.Get(id)
 	if session == nil {
@@ -370,6 +680,17 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 		return fmt.Errorf("codex app-server session %s has ended", id)
 	}
 
+	// Anchor the turn's utilization floor BEFORE the request reaches the child:
+	// the reading this turn owes must be taken from here on, not from the
+	// previous turn's completion, which would let a rate-limit frame delivered
+	// between turns pass as payment. Arming after the write would race the
+	// turn's own completion frame. The request shapes live in the usage layer,
+	// so this file still knows no JSON-RPC semantics.
+	var armedFloor int64
+	if codexRunStartFrame(trimmed) {
+		armedFloor = session.armUsageRun(time.Now())
+	}
+
 	writeDone := make(chan error, 1)
 	go func() {
 		_, err := fmt.Fprintln(session.Stdin, trimmed)
@@ -378,15 +699,37 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 	select {
 	case err := <-writeDone:
 		if err != nil {
+			// The request never reached the child (stdin already closed, say):
+			// no turn ran, so the floor armed above must not be settled into a
+			// debt at exit.
+			if armedFloor > 0 {
+				session.disarmUsageRun(armedFloor, func() int64 {
+					return m.newestOpenUsageFloor(session)
+				})
+			}
 			return fmt.Errorf("failed to write to codex app-server session %s stdin: %w", id, err)
 		}
-	case <-time.After(codexAppServerStdinWriteTimeout):
+	case <-time.After(codexAppServerStdinWriteBudget):
 		// Fatal: a stalled write is a signal that codex isn't draining stdin.
 		// Continuing would let the next Send acquire stdinMu and interleave
 		// its frame with the abandoned write's eventual completion. Close
 		// stdin to unblock the abandoned goroutine immediately, transition
 		// to "ended" so concurrent/subsequent Sends short-circuit, and kill
 		// the child so waitForExit publishes codex_appserver_ended.
+		//
+		// Roll the arm back FIRST, exactly as the write-error branch does: a
+		// request that stalled mid-frame never delivered a complete JSONL
+		// line, so the child never read a turn — and the session is being
+		// torn down, so no completion will ever settle this floor. Left
+		// armed, waitForExit would fold it into a debt no telemetry can pay,
+		// which ages into a false "reading predates the last run" warning.
+		// Disarming before closeStdin/Kill keeps it ahead of the exit path
+		// that would otherwise settle it.
+		if armedFloor > 0 {
+			session.disarmUsageRun(armedFloor, func() int64 {
+				return m.newestOpenUsageFloor(session)
+			})
+		}
 		session.closeStdin()
 		session.mu.Lock()
 		session.status = "ended"
@@ -815,6 +1158,18 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// into the per-account cache cliagent_usage_codex.go reads from.
 			// Side-effect only — does not alter framing or block publish.
 			captureCodexRateLimitLine(trimmed, time.Now())
+			// A completed turn owes the card a reading taken after that turn
+			// started, exactly like a terminal `codex` session's terminal
+			// event. The frame shapes live in the usage layer, so this file
+			// still knows no JSON-RPC semantics.
+			// Pairing is measured against the stdout-only line ordinal:
+			// `seq` is shared with the stderr scanner, and diagnostics
+			// must not push a turn's two completion shapes apart.
+			if shape := codexRunCompletionShape(trimmed); shape != "" {
+				session.settleUsageRun(shape, int64(lineCount))
+			} else if codexRunProgressFrame(trimmed) {
+				session.openUsageRun(time.Now())
+			}
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
@@ -977,6 +1332,11 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// without waiting on it) means End() can unblock and the manager can
 	// reclaim the session slot in parallel with the Pub/Sub round-trip.
 	close(session.done)
+
+	// The process is gone, so any turns still open — ones that never announced
+	// their completion — settle here. Keyed off the session lifecycle and
+	// launched after the ended publication so it cannot delay or break it.
+	session.settleOpenUsageRuns()
 
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)

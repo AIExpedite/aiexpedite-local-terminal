@@ -1054,7 +1054,11 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// machine-info gather, and a package-level flag lets that gather claim the
 	// bypass we just armed — leaving this refresh unforced, skipping the join
 	// that covers an in-flight probe, and signing the pre-refresh snapshot.
-	usageCtx := WithClaudeUsageForceProbe(ctx)
+	//
+	// Codex gets the equivalent: its parser runs a forced rollout reconcile that
+	// bypasses the per-account interval (never the single flight), so a run that
+	// just finished is reflected in the reading this receipt signs.
+	usageCtx := WithCodexUsageForceRefresh(WithClaudeUsageForceProbe(ctx))
 	usage, errs := GatherCLIAgentUsageOnly(usageCtx)
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that

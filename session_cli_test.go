@@ -29,10 +29,12 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +162,50 @@ func TestBuildCodexInteractiveArgs_PreservesResumeSubcommand(t *testing.T) {
 	lastIdx := argIndex(args, "--last")
 	if resumeIdx < 0 || lastIdx < 0 || resumeIdx > lastIdx {
 		t.Errorf("expected `resume` before `--last`, got %v", args)
+	}
+}
+
+// `codex exec resume|review "<prompt>"` runs its turn the moment the process
+// starts — its prompt travels in argv — while a session opened with no prompt
+// at all sits idle until SendInput delivers one. Both reach StartSession with
+// a nil stdinPrompt, so the utilization floor is armed off this predicate: a
+// false negative leaves the run's utilization stale (the bug), a false
+// positive books a debt for a run that never happened.
+func TestCodexPromptTravelsOnArgv(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"top-level prompt goes to stdin", []string{"implement the login page"}, false},
+		{"no args at all", nil, false},
+		{"resume --last with prompt", []string{"resume", "--last", "follow-up"}, true},
+		{"resume session id with prompt", []string{"resume", "abc-123", "follow-up"}, true},
+		{"resume session id only", []string{"resume", "abc-123"}, false},
+		{"resume --last only", []string{"resume", "--last"}, false},
+		{"resume prompt behind a valued flag", []string{"--model", "o3", "resume", "--last", "follow-up"}, true},
+		{"resume flag value is not the prompt", []string{"resume", "--last", "--model", "o3"}, false},
+		{"review with prompt", []string{"review", "--base", "main", "check the diff"}, true},
+		// `review` needs no prompt: naming the diff is enough to start it, and
+		// no SendInput ever follows, so the floor must be armed at start.
+		{"review targets the uncommitted diff", []string{"review", "--uncommitted"}, true},
+		{"review targets a base ref", []string{"review", "--base", "main"}, true},
+		{"review targets a base ref inline", []string{"review", "--base=main"}, true},
+		{"review targets a commit", []string{"review", "--commit", "abc123"}, true},
+		{"review with no target and no prompt", []string{"review"}, false},
+		{"review target flag missing its value", []string{"review", "--base"}, false},
+		{"prompt placed on stdin explicitly", []string{"resume", "--last", "-"}, false},
+		{"help is not a run", []string{"help"}, false},
+		// The automation flags sanitizeCodexExecArgs strips must not shift the
+		// subcommand out of view.
+		{"sanitized flags before the subcommand", []string{"exec", "--json", "resume", "--last", "follow-up"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexPromptTravelsOnArgv(tc.args); got != tc.want {
+				t.Errorf("codexPromptTravelsOnArgv(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -3689,4 +3735,215 @@ func mustContain(t *testing.T, args []string, expected ...string) {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+// A terminal codex run arms its utilization floor at start and settles exactly
+// once, although the mock emits BOTH turn.completed and thread.completed
+// before exiting.
+func TestSessionLifecycle_CodexSettlesUsageFreshnessOnce(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "codex", []string{"implement the login page"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond) // a double-fire would land by now
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the run start %s", settled[0], floor)
+	}
+}
+
+// A codex run that exits without any terminal event is still settled, once,
+// from the exit path.
+func TestSessionLifecycle_CodexExitWithoutTerminalEventSettlesOnce(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex-no-terminal-event", "codex", []string{"implement the login page"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 1 || settled != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settled)
+	}
+}
+
+// A non-codex command streaming the very same codex frames never touches the
+// Codex utilization bookkeeping.
+func TestSessionLifecycle_NonCodexCommandSkipsUsageFreshness(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "shim", []string{}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want none for a non-codex command", started, settled)
+	}
+}
+
+// A stdin-fed codex session started WITHOUT a prompt (the chat-direct flow)
+// is only waiting for its first SendInput: its run is armed when that prompt
+// is delivered, not at process start, so the floor sits at/after delivery and
+// telemetry from another run during the wait cannot pass as this session's
+// reading. It still settles exactly once.
+func TestSessionLifecycle_CodexDeferredPromptArmsOnDelivery(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	beforeStart := time.Now()
+	_, messages, err := captureSession(t, "codex-reads-stdin", "codex", []string{}, "Hi there")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if floor.Before(beforeStart) {
+		t.Fatalf("armed at %s, before the session started %s", floor, beforeStart)
+	}
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the delivered prompt's floor %s", settled[0], floor)
+	}
+}
+
+// `codex exec resume|review "<prompt>"` carries its prompt in argv, so the
+// child is running the turn from the moment it starts even though
+// buildCodexInteractiveArgs hands StartSession a nil stdinPrompt (the same
+// signal the idle chat-direct session gives). Its floor is armed at start —
+// otherwise these supported runs settle nothing and leave utilization stale.
+func TestSessionLifecycle_CodexArgvSubcommandArmsAtStart(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	_, messages, err := captureSession(t, "codex", "codex", []string{"resume", "--last", "follow-up"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the run start %s", settled[0], floor)
+	}
+}
+
+// A deferred codex session closed before any prompt was delivered never ran:
+// nothing is armed, so the exit path has no run to settle into a debt that
+// would age into a stale-utilization warning.
+func TestSessionLifecycle_CodexDeferredPromptNeverDeliveredSettlesNothing(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(tmpDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-reads-stdin")
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("codex-deferred-%d", time.Now().UnixNano())
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, "codex", []string{}, tmpDir, "ws", "uid", 30000, false, func(resultMsg) {})
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if startErr != nil {
+		t.Fatalf("StartSession: %v", startErr)
+	}
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("after start without a prompt: started=%d settled=%d, want nothing armed", started, settled)
+	}
+
+	// Close it while the child is still waiting on stdin: no prompt ever went in.
+	if err := sm.EndSession(id); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	waitForManagedSessionDrained(t, sm, id)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after closing a never-prompted session, want none", started, settled)
+	}
+}
+
+// A stdin-fed codex session arms its run only once the initial prompt write
+// SUCCEEDS — anchored at the session start, where the child began reading it.
+// A child that exits or closes stdin before the write never received a
+// prompt: nothing is armed, so waitForExit has no run to settle into a debt no
+// telemetry can pay.
+func TestSessionLifecycle_CodexInitialPromptArmsOnlyAfterDelivery(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	sm := NewSessionManager(nil)
+	startedAt := time.UnixMilli(1_700_000_000_000)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	_ = w.Close()
+	failed := &CLISession{ID: "codex-closed-stdin", Command: "codex", Stdin: w, StartedAt: startedAt}
+	sm.deliverInitialPrompt(failed, "implement the login page", 24, "plain")
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after a failed initial prompt write, want nothing armed", started, settled)
+	}
+	failed.settleCodexUsageRun()
+	if _, settled := rec.counts(); settled != 0 {
+		t.Fatalf("settled %d with nothing armed, want 0", settled)
+	}
+
+	r, w, err = os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	delivered := &CLISession{ID: "codex-open-stdin", Command: "codex", Stdin: w, StartedAt: startedAt}
+	sm.deliverInitialPrompt(delivered, "implement the login page", 24, "plain")
+	if started, _ := rec.counts(); started != 1 {
+		t.Fatalf("started=%d after a delivered initial prompt, want 1", started)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !floor.Equal(startedAt) {
+		t.Fatalf("armed at %s, want the session start %s", floor, startedAt)
+	}
+	delivered.settleCodexUsageRun()
+	if settled := rec.waitSettled(t, 1); !settled[0].Equal(startedAt) {
+		t.Fatalf("settled with floor %s, want %s", settled[0], startedAt)
+	}
 }

@@ -15,6 +15,11 @@
 // (CODEX_HOME/sessions/.../rollout-*.jsonl), which persist the identical
 // `token_count.rate_limits` telemetry. Only windows still Unknown after the
 // live cache are filled in this way.
+//
+// A finished Codex run is owed a fresh reading: cliagent_usage_codex_freshness.go
+// arms a run floor at start and, at completion, forces a bounded reconcile from
+// that floor; this parser honors both the debt and a forced refresh, and says so
+// when the reading still predates the most recent run.
 package main
 
 import (
@@ -224,14 +229,26 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	// bounded children below cannot sum past it. Child expiry is best-effort: any
 	// complete numeric objects already consumed are persisted and the valid cache
 	// remains publishable.
+	//
+	// A forced refresh (WithCodexUsageForceRefresh — the Refresh button and
+	// terminal-service's active loop) is the reading someone is waiting on, so
+	// its scan may also spend the login probe's holdback; the probe then gets
+	// what is left, and an inconclusive probe never un-authenticates a
+	// credential auth.json already proved.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time
-	scanBudget := codexSubBudget(ctx, codexRolloutScanBudget, codexGatherSiblingReserve+machineInfoProbeTimeout)
+	forced := codexUsageForceRefresh(ctx)
+	scanHoldBack := codexGatherSiblingReserve + machineInfoProbeTimeout
+	if forced {
+		scanHoldBack = codexGatherSiblingReserve
+	}
+	scanBudget := codexSubBudget(ctx, codexRolloutScanBudget, scanHoldBack)
 	if scanBudget > 0 && ctx.Err() == nil {
 		scanCtx, cancel := context.WithTimeout(ctx, scanBudget)
-		usage.Metrics, usageLimit, latestRolloutObservation = codexReconcileFromRollout(scanCtx, base, usage.AccountFingerprint, now)
+		reconciled := codexReconcileForGather(scanCtx, base, usage.AccountFingerprint, now, forced)
 		cancel()
+		usage.Metrics, usageLimit, latestRolloutObservation = reconciled.metrics, reconciled.limit, reconciled.latestObservation
 	}
 	// An account that is OUT of quota reports no window at all — Codex nulls both
 	// `primary` and `secondary` on a refused turn — so the card fell back to
@@ -243,6 +260,11 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	if notice := codexUsageLimitNotice(usage.Metrics, usageLimit, latestRolloutObservation, now); notice != "" {
 		usage.Notice = notice
 		usage.NoticeSeverity = "error"
+	} else if notice := codexStaleRunNotice(codexRunFreshnessForAccount(usage.AccountFingerprint, now)); notice != "" {
+		// The reading is published unchanged; the notice only stops it from
+		// passing for one taken after the run that just finished.
+		usage.Notice = notice
+		usage.NoticeSeverity = "warning"
 	}
 	// No time left to answer is inconclusive — the same verdict a timed-out
 	// probe already produced — so a squeezed gather degrades rather than

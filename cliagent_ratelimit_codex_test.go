@@ -5926,3 +5926,256 @@ func TestCodexUnconsumedRolloutCandidates_FutureCursorSurvivesPartialCatchUp(t *
 			nextComplete, nextCursor, all[4].path)
 	}
 }
+
+// A forced post-run reconcile restarts below the run floor whenever the
+// persisted cursor already sits above it, so the run's rollout can never be
+// hidden behind progress a heartbeat or a sibling file advanced. It keeps the
+// retry identities and never touches a cursor that is already low enough.
+func TestCodexRolloutCursorBelowFloor(t *testing.T) {
+	floor := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	floorNs := floor.Add(-codexRunFloorGrace).UnixNano()
+	high := codexRolloutScanCursor{
+		mtimeNs:            floor.Add(time.Minute).UnixNano(),
+		boundaryCursor:     "abc",
+		backlogFingerprint: "def",
+		retryEntries:       []string{"0123"},
+	}
+
+	got := codexRolloutCursorBelowFloor(high, floor)
+	if got.mtimeNs != floorNs {
+		t.Fatalf("mtimeNs = %d, want floor - grace %d", got.mtimeNs, floorNs)
+	}
+	if got.boundaryCursor != "" || got.backlogFingerprint != "" {
+		t.Fatalf("capped-scan state of the higher cursor must not carry over: %+v", got)
+	}
+	if len(got.retryEntries) != 1 || got.retryEntries[0] != "0123" {
+		t.Fatalf("retry identities must be kept: %+v", got.retryEntries)
+	}
+
+	low := codexRolloutScanCursor{mtimeNs: floor.Add(-time.Hour).UnixNano(), boundaryCursor: "abc"}
+	if got := codexRolloutCursorBelowFloor(low, floor); got.mtimeNs != low.mtimeNs || got.boundaryCursor != "abc" {
+		t.Fatalf("a cursor already below the floor must be untouched: %+v", got)
+	}
+	if got := codexRolloutCursorBelowFloor(high, time.Time{}); got.mtimeNs != high.mtimeNs {
+		t.Fatalf("a forced refresh with no run floor keeps the cursor: %+v", got)
+	}
+}
+
+// A forced scan's progress is committed only when it is not behind the stored
+// cursor: restarting below the floor must never rewind completed progress.
+func TestCodexForcedReconcile_NeverRewindsStoredCursor(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	writeCodexRunRollout(t, f.home, "old", runStart.Add(-time.Hour), runStart.Add(-time.Hour), runStart.Add(-time.Hour), true,
+		[]map[string]any{codexRateLimitFrame(5, 6, now)})
+	cursorAt := now.Add(-10 * time.Second)
+	f.advanceCursorPast(t, cursorAt, now)
+
+	codexReconcileFromRollout(withCodexForcedReconcile(context.Background(), runStart), f.home, f.fp, time.Now())
+
+	if got := f.snapshot(t).RolloutHighWaterMtimeNs; got != cursorAt.UnixNano() {
+		t.Fatalf("forced scan rewound the cursor: %d, want %d", got, cursorAt.UnixNano())
+	}
+}
+
+// The owed marker is written and read inside the cache transaction, survives a
+// merge that does not cover the run, and clears on the first contributor
+// observation at/after the floor, whichever writer lands it.
+func TestCodexRunFreshness_OwedMarkerRoundTripsAndClearsOnCoveringObservation(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	floor := now.Add(-time.Minute)
+	bucket := func(observed time.Time) map[string]codexRateLimitBucket {
+		return map[string]codexRateLimitBucket{codexWindowPrimary: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		}}
+	}
+	mergeCodexRateLimitCache(cache, bucket(now.Add(-time.Hour)), nil, now, "fp")
+	codexRecordRunFreshness("fp", now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, floor, now)
+	})
+
+	snap, _ := loadCodexRateLimitSnapshot(cache)
+	if snap.RunFloorMs != floor.UnixMilli() || snap.RefreshOwedAtMs != now.UnixMilli() {
+		t.Fatalf("owed marker did not round-trip: %+v", snap)
+	}
+
+	// A reading still before the floor does not pay the debt.
+	mergeCodexRateLimitCache(cache, bucket(floor.Add(-time.Second)), nil, now, "fp")
+	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.RefreshOwedAtMs == 0 {
+		t.Fatal("an observation before the floor must not clear the debt")
+	}
+
+	mergeCodexRateLimitCache(cache, bucket(floor), nil, now, "fp")
+	snap, _ = loadCodexRateLimitSnapshot(cache)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("an observation at the floor must clear the debt: %+v", snap)
+	}
+	if snap.RunFloorMs != floor.UnixMilli() {
+		t.Fatalf("a paid debt keeps its floor: %d", snap.RunFloorMs)
+	}
+}
+
+// A debt nothing could pay ages out on the next write, floor included, and a
+// credentials swap drops the previous account's debt with its telemetry.
+func TestCodexRunFreshness_DebtAgesOutAndIsAccountScoped(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	old := now.Add(-codexRefreshOwedMaxAge - time.Minute)
+	codexRecordRunFreshness("fp-a", old, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, old.Add(-time.Minute), old)
+	})
+	codexRecordRunFreshness("fp-a", now, func(*codexRateLimitSnapshot) {})
+	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.RefreshOwedAtMs != 0 || snap.RunFloorMs != 0 {
+		t.Fatalf("expired debt must age out: %+v", snap)
+	}
+
+	codexRecordRunFreshness("fp-a", now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, now.Add(-time.Minute), now)
+	})
+	codexRecordRunFreshness("fp-b", now, func(*codexRateLimitSnapshot) {})
+	snap, _ := loadCodexRateLimitSnapshot(cache)
+	if snap.AccountFingerprint != "fp-b" || snap.RefreshOwedAtMs != 0 || snap.RunFloorMs != 0 {
+		t.Fatalf("another account must not inherit the debt: %+v", snap)
+	}
+}
+
+// Arming a new run keeps an unpaid debt's older floor; with nothing owed it
+// moves the floor to the new run.
+func TestCodexArmRunFloor_KeepsUnpaidFloor(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, t0)
+	codexArmRunFloor(&snap, t0.Add(time.Minute))
+	if snap.RunFloorMs != t0.Add(time.Minute).UnixMilli() {
+		t.Fatalf("with nothing owed the floor follows the newest run: %d", snap.RunFloorMs)
+	}
+	codexOweRunRefresh(&snap, t0.Add(time.Minute), t0.Add(2*time.Minute))
+	codexArmRunFloor(&snap, t0.Add(3*time.Minute))
+	if snap.RunFloorMs != t0.Add(time.Minute).UnixMilli() {
+		t.Fatalf("an unpaid debt keeps its floor: %d", snap.RunFloorMs)
+	}
+	codexOweRunRefresh(&snap, t0, t0.Add(4*time.Minute))
+	if snap.RunFloorMs != t0.Add(time.Minute).UnixMilli() {
+		t.Fatalf("an older run settling must not lower the coalesced floor: %d", snap.RunFloorMs)
+	}
+}
+
+// Two overlapping runs share one debt, so that debt has to require the LATER
+// run's floor: evidence taken while only the first run was going does not
+// describe the second one and must not clear it.
+func TestCodexOweRunRefresh_CoalescesOntoNewestFloor(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+	snap := codexRateLimitSnapshot{}
+	codexArmRunFloor(&snap, runA)
+	codexArmRunFloor(&snap, runB)
+	codexOweRunRefresh(&snap, runA, t0.Add(8*time.Minute))
+	codexOweRunRefresh(&snap, runB, t0.Add(9*time.Minute))
+	if snap.RunFloorMs != runB.UnixMilli() {
+		t.Fatalf("coalesced floor %d, want the later run %d", snap.RunFloorMs, runB.UnixMilli())
+	}
+	// An observation from inside run A (10:02) predates run B entirely.
+	snap.Contributors = map[string]map[string]codexRateLimitBucket{
+		"5h": {"primary": {ObservedAtMs: t0.Add(2 * time.Minute).UnixMilli(), UsedPercentage: 40}},
+	}
+	codexSettleRunFreshness(&snap, t0.Add(10*time.Minute))
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatal("an observation predating the later run must not clear the shared debt")
+	}
+	snap.Contributors["5h"]["primary"] = codexRateLimitBucket{ObservedAtMs: runB.Add(time.Minute).UnixMilli(), UsedPercentage: 41}
+	codexSettleRunFreshness(&snap, t0.Add(11*time.Minute))
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("an observation covering the later run must clear the debt: %+v", snap)
+	}
+}
+
+// An inferred observation time loses every tie against a stated one, never
+// displaces a stated reading that already covers the run floor, and never
+// back-dates anything.
+func TestCodexInferredObservation_NeverOutranksStated(t *testing.T) {
+	stated := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 10, usageKnown: true}
+	inferred := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 90, usageKnown: true, Inferred: true}
+	if codexPlacementBeats(inferred, codexWindowPrimary, stated, codexWindowSecondary) {
+		t.Fatal("placement: inferred must lose a tie despite higher usage and slot precedence")
+	}
+	if !codexPlacementBeats(stated, codexWindowSecondary, inferred, codexWindowPrimary) {
+		t.Fatal("placement: stated must win a tie")
+	}
+
+	floor := time.UnixMilli(900)
+	later := inferred
+	later.ObservedAtMs = 2000
+	if codexRolloutReadingBeats(later, stated, floor) {
+		t.Fatal("scan: a later inferred reading must not beat a stated one covering the floor")
+	}
+	if !codexRolloutReadingBeats(stated, later, floor) {
+		t.Fatal("scan: a stated reading covering the floor beats an inferred one")
+	}
+	preRun := stated
+	preRun.ObservedAtMs = 500
+	if !codexRolloutReadingBeats(later, preRun, floor) {
+		t.Fatal("scan: an inferred post-run reading beats a stated pre-run one")
+	}
+	if codexRolloutReadingBeats(inferred, stated, time.Time{}) {
+		t.Fatal("scan: inferred loses a tie even without a floor")
+	}
+
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	floorAt := now.Add(-time.Minute)
+	merge := func(b codexRateLimitBucket) {
+		b.ResetsAtMs, b.WindowMinutes, b.usageKnown, b.resetKnown = now.Add(time.Hour).UnixMilli(), 300, true, true
+		mergeCodexRateLimitCachePerLimit(cache, map[string]map[string]codexRateLimitBucket{
+			codexWindowPrimary: {"codex": b},
+		}, nil, false, nil, false, now, "fp")
+	}
+	current := func() codexRateLimitBucket {
+		snap, _ := loadCodexRateLimitSnapshot(cache)
+		return snap.Contributors[codexWindowPrimary]["codex"]
+	}
+	codexRecordRunFreshness("fp", now, func(snap *codexRateLimitSnapshot) { codexArmRunFloor(snap, floorAt) })
+
+	merge(codexRateLimitBucket{UsedPercentage: 30, ObservedAtMs: floorAt.Add(10 * time.Second).UnixMilli()})
+	merge(codexRateLimitBucket{UsedPercentage: 80, ObservedAtMs: floorAt.Add(10 * time.Second).UnixMilli(), Inferred: true})
+	if got := current(); got.UsedPercentage != 30 || got.Inferred {
+		t.Fatalf("merge: an inferred tie displaced the stated reading: %+v", got)
+	}
+	merge(codexRateLimitBucket{UsedPercentage: 80, ObservedAtMs: floorAt.Add(20 * time.Second).UnixMilli(), Inferred: true})
+	if got := current(); got.UsedPercentage != 30 || got.Inferred {
+		t.Fatalf("merge: an inferred reading displaced a stated one covering the floor: %+v", got)
+	}
+	merge(codexRateLimitBucket{UsedPercentage: 80, ObservedAtMs: floorAt.Add(-time.Hour).UnixMilli(), Inferred: true})
+	if got := current(); got.ObservedAtMs != floorAt.Add(10*time.Second).UnixMilli() {
+		t.Fatalf("merge: an inferred reading back-dated the observation: %+v", got)
+	}
+}
+
+// Snapshots written before the run-freshness fields existed decode with zero
+// values and read as "nothing owed, nothing interrupted".
+func TestCodexRunFreshness_LegacySnapshotReadsAsNothingOwed(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	legacy := fmt.Sprintf(`{"updatedAt":%q,"accountFingerprint":"fp","buckets":{"primary":{"usedPercentage":20,"resetsAtMs":%d,"observedAtMs":%d}}}`,
+		now.UTC().Format(time.RFC3339), now.Add(time.Hour).UnixMilli(), now.Add(-time.Hour).UnixMilli())
+	if err := os.WriteFile(cache, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("legacy snapshot decode: ok=%v %+v", ok, snap)
+	}
+	if state := codexRunFreshnessForAccount("fp", now); state.owed || state.interrupted {
+		t.Fatalf("legacy snapshot must read as nothing owed: %+v", state)
+	}
+	if metrics := codexMetricsFromCache(now, "fp"); metrics[0].Consumed == nil || *metrics[0].Consumed != 20 {
+		t.Fatalf("legacy reading must still render: %+v", metrics[0])
+	}
+}
