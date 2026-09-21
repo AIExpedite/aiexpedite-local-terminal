@@ -500,6 +500,19 @@ func (g *codexUsageRefreshGate) armedCountLocked() int {
 	return total
 }
 
+// armedLocally reports whether the run starting at floorMs was armed by THIS
+// process and has neither settled nor been withdrawn yet — i.e. it is still
+// running. Non-destructive: the binding is left for the settlement that will
+// consume it.
+func (g *codexUsageRefreshGate) armedLocally(floorMs int64) bool {
+	if floorMs <= 0 {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.armed[floorMs]) > 0
+}
+
 func (g *codexUsageRefreshGate) takeArmedAccount(floorMs int64) (string, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1258,6 +1271,20 @@ func payOwedCodexUsageRefresh() {
 		if !state.owed && !state.interrupted {
 			return
 		}
+		// "Interrupted" means the floor's run belongs to a process that is
+		// gone — but this replay is spawned, so a session of THIS process can
+		// arm and persist its start before the goroutine gets here, and
+		// codexArmRunFloor coalesces that start onto RunFloorMs whenever
+		// nothing is owed. Converting a floor that is still running would book
+		// a completion time for a live run: mid-run telemetry would then retire
+		// the debt and leave a crash before the real completion with no
+		// interrupted marker at all, and the attempts spent here could raise a
+		// stale-utilization warning while the run is still going. The live
+		// run's own settle path owes it a refresh when it finishes, so leave
+		// the floor to it.
+		if state.interrupted && codexUsageRefresh.armedLocally(state.floor.UnixMilli()) {
+			return
+		}
 		// Either conversion below may be REFUSED by the bounded cache locks
 		// and retained in the gate instead. Such a debt is handed to the
 		// account's worker whatever happens to it here: the reconcile this
@@ -1292,7 +1319,10 @@ func payOwedCodexUsageRefresh() {
 		// force only on `owed`, so an interrupted floor left un-owed would
 		// never be refreshed and would simply age out.
 		now = codexUsageFreshnessNow()
-		if promoted := codexRunFreshnessForAccount(fp, now); promoted.interrupted {
+		// Same guard as above: the floor promoted into place may be a run of
+		// this process that is still open, not one the dead process left.
+		if promoted := codexRunFreshnessForAccount(fp, now); promoted.interrupted &&
+			!codexUsageRefresh.armedLocally(promoted.floor.UnixMilli()) {
 			if !codexOweInterruptedRun(fp, promoted.floor, now) {
 				retained = true
 			}

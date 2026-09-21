@@ -137,6 +137,39 @@ func TestCodexOwedRefresh_InterruptedRunIsOwedAtStartup(t *testing.T) {
 	}
 }
 
+// Startup replay is spawned, so a session of the NEW process can arm its floor
+// before the replay reads the cache. That floor's run is still going: it must
+// not be converted into a completed debt (nor spend the replay's reconcile),
+// because its own settle path owes it a refresh when it finishes.
+func TestCodexOwedRefresh_StartupReplaySkipsARunThisProcessStarted(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	simulateCodexAgentRestart(t)
+	// This process's own run start, landed on disk before the replay runs.
+	runStart := time.Now()
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if state := codexRunFreshnessForAccount(f.fp, time.Now()); !state.interrupted {
+		t.Fatalf("a live armed floor is what startup would read as interrupted: %+v", state)
+	}
+
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("a run this process started must not be settled as debt at startup: %+v", snap)
+	}
+	if snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("RunFloorMs = %d, want the live run's floor %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+	if codexGateHasRun(f.fp) {
+		t.Fatal("the replay must not spend a reconcile on a still-running run")
+	}
+}
+
 // With the freshness path unarmed (every test binary that has not called
 // SetCodexUsageRefreshEnabled) nothing is replayed or scanned.
 func TestCodexOwedRefresh_UnarmedProcessDoesNothing(t *testing.T) {
