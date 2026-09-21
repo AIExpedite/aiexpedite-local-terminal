@@ -1454,6 +1454,117 @@ func TestResetClaudeUsageProbeGate_DrainsInFlightProbe(t *testing.T) {
 	}
 }
 
+// A settlement still running must not outlive the reset. The slot
+// reserveTrailing guards is process-wide and carries no gate generation, so a
+// straggler that reaches it after the reset makes the NEXT caller's debt look
+// already-owned — and awaitEligible answers a refused reservation by dropping
+// the debt, which silently disables the trailing probe from then on.
+//
+// The window is the stretch between entering the settlement and reserving:
+// cancelling the sleep is not enough, because a straggler that has not reached
+// the reserve yet has no sleep to cancel. Simulating that straggler with the
+// gate's own bracket is what makes the assertion deterministic — parking a real
+// settlement on a trailing wait cannot pin it to a chosen instruction.
+func TestResetClaudeUsageProbeGate_DrainsRunningSettlement(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseStraggler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseStraggler)
+
+	go func() {
+		claudeUsageProbe.beginSettling()
+		defer claudeUsageProbe.endSettling()
+		close(entered)
+		<-release
+	}()
+	<-entered
+
+	resetReturned := make(chan struct{})
+	go func() {
+		resetClaudeUsageProbeGate()
+		close(resetReturned)
+	}()
+
+	select {
+	case <-resetReturned:
+		t.Fatal("resetClaudeUsageProbeGate returned while a settlement was still running — " +
+			"the straggler can still reserve the trailing slot and starve every later run")
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked, as required.
+	}
+
+	releaseStraggler()
+	select {
+	case <-resetReturned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("resetClaudeUsageProbeGate did not return after the settlement finished")
+	}
+
+	claudeUsageProbe.mu.Lock()
+	settling := claudeUsageProbe.settling
+	claudeUsageProbe.mu.Unlock()
+	if settling != 0 {
+		t.Errorf("settling=%d after the reset, want 0", settling)
+	}
+	// The slot is genuinely reusable: a later caller must be able to claim it.
+	if !claudeUsageProbe.reserveTrailing() {
+		t.Fatal("the trailing slot leaked across the reset — later runs can never schedule a trailing probe")
+	}
+	claudeUsageProbe.releaseTrailing()
+}
+
+// A settlement asleep on a trailing wait is CANCELLED by the reset, not waited
+// out. Its wait can be minutes (claudeUsageProbeMaxTrailingWait is 5m) and the
+// drain budget is seconds, so without the cancel the drain would time out and
+// return with the straggler still live — the very leak above.
+func TestResetClaudeUsageProbeGate_CancelsParkedSettlement(t *testing.T) {
+	base := time.Now()
+	armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":52,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+
+	// A wait far longer than the drain budget, but well inside the trailing cap
+	// so the settlement really does reserve the slot and sleep.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000") // 1m
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("precondition: the first probe should run")
+	}
+	claudeUsageProbeAfterRunAsyncForTest(time.Now())
+
+	// Wait for the straggler to actually take the slot and park on it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		claudeUsageProbe.mu.Lock()
+		reserved := claudeUsageProbe.trailingScheduled
+		claudeUsageProbe.mu.Unlock()
+		if reserved {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the settlement never reserved the trailing slot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	start := time.Now()
+	resetClaudeUsageProbeGate()
+	if elapsed := time.Since(start); elapsed >= claudeUsageProbeDrainTimeout {
+		t.Errorf("reset took %v — it waited out the trailing sleep instead of cancelling it", elapsed)
+	}
+
+	claudeUsageProbe.mu.Lock()
+	settling, reserved := claudeUsageProbe.settling, claudeUsageProbe.trailingScheduled
+	claudeUsageProbe.mu.Unlock()
+	if settling != 0 {
+		t.Errorf("settling=%d after the reset, want 0", settling)
+	}
+	if reserved {
+		t.Error("the trailing slot is still held after the reset")
+	}
+}
+
 // The drain must be bounded: a probe that never releases the latch cannot be
 // allowed to hang the whole suite in a cleanup.
 //

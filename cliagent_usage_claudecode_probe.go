@@ -378,6 +378,16 @@ type claudeUsageProbeGate struct {
 	// probe, never to discard it.
 	owedBaseline      time.Time
 	trailingScheduled bool
+	// settling counts the post-run settlement calls currently running —
+	// claudeUsageProbePayRecordedRun, whether reached synchronously or on the
+	// goroutine triggerClaudeUsageProbeAfterRun spawns. The slot
+	// trailingScheduled guards is process-wide and NOT keyed to a gate
+	// generation, so a settlement that outlives the state it was scheduled
+	// against can reserve that slot and make the next caller's debt look
+	// already-owned — the refusal path drops the debt outright. Draining this
+	// counter in resetClaudeUsageProbeGate is what stops a settlement from one
+	// test from silently disabling the trailing probe in the next.
+	settling int
 	// doneCh is created by begin() and closed by finish(), so a caller that was
 	// refused the single-flight slot can WAIT for the probe already holding it
 	// instead of reporting a stale reading. Nil whenever inFlight is false.
@@ -524,12 +534,25 @@ var claudeUsageProbeDrainTimeout = 5 * time.Second
 // Bounded by claudeUsageProbeDrainTimeout so a wedged probe cannot hang the
 // suite; the probe's own 3s timeout means a live one drains far inside it.
 func resetClaudeUsageProbeGate() {
+	// Unarm and cancel FIRST, before waiting for anything. A settlement sleeping
+	// out a trailing wait — up to claudeUsageProbeMaxTrailingWait — would
+	// otherwise sit through the entire drain budget; unarmed eligibility and a
+	// closed cancel channel turn that sleep into a prompt return, so the drain
+	// below measures work that is genuinely still running.
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.armed = false
+	if claudeUsageProbe.cancelTrailing != nil {
+		close(claudeUsageProbe.cancelTrailing)
+	}
+	claudeUsageProbe.cancelTrailing = make(chan struct{})
+	claudeUsageProbe.mu.Unlock()
+
 	deadline := time.Now().Add(claudeUsageProbeDrainTimeout)
 	for time.Now().Before(deadline) {
 		claudeUsageProbe.mu.Lock()
-		inFlight := claudeUsageProbe.inFlight
+		inFlight, settling := claudeUsageProbe.inFlight, claudeUsageProbe.settling
 		claudeUsageProbe.mu.Unlock()
-		if !inFlight {
+		if !inFlight && settling == 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -551,13 +574,13 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
 	claudeUsageProbe.owedBaseline = time.Time{}
-	claudeUsageProbe.trailingScheduled = false // release any reservation outright
-	// Abandon any sleeping trailing timer before the caller restores the
-	// environment it would otherwise wake into.
-	if claudeUsageProbe.cancelTrailing != nil {
-		close(claudeUsageProbe.cancelTrailing)
-	}
-	claudeUsageProbe.cancelTrailing = make(chan struct{})
+	// Release any reservation outright. The sleeping trailing timer was already
+	// abandoned by the cancel at the top of this function, and the drain has
+	// since waited for the settlement holding it to return — so this clears a
+	// slot nobody is still sitting in rather than yanking one out from under a
+	// live sleeper.
+	claudeUsageProbe.trailingScheduled = false
+	claudeUsageProbe.settling = 0
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
@@ -808,6 +831,23 @@ func (g *claudeUsageProbeGate) reserveTrailing() bool {
 func (g *claudeUsageProbeGate) releaseTrailing() {
 	g.mu.Lock()
 	g.trailingScheduled = false
+	g.mu.Unlock()
+}
+
+// beginSettling / endSettling bracket one post-run settlement so a reset can
+// wait for it. Every successful beginSettling MUST be paired with endSettling on
+// every exit path, or resetClaudeUsageProbeGate burns its whole drain budget.
+func (g *claudeUsageProbeGate) beginSettling() {
+	g.mu.Lock()
+	g.settling++
+	g.mu.Unlock()
+}
+
+func (g *claudeUsageProbeGate) endSettling() {
+	g.mu.Lock()
+	if g.settling > 0 {
+		g.settling--
+	}
 	g.mu.Unlock()
 }
 
@@ -1591,6 +1631,13 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 // recordOwed has no settled watermark, so a repeat would resurrect a paid debt
 // and schedule a trailing OAuth request for nothing.
 func claudeUsageProbePayRecordedRun(completedAt time.Time) {
+	// Counted for the whole settlement, not just the sleep: an attempt already on
+	// the wire holds no trailing reservation but still writes the cache, and a
+	// reset that returned ahead of it would hand the next caller a gate a
+	// departing settlement is about to mutate.
+	claudeUsageProbe.beginSettling()
+	defer claudeUsageProbe.endSettling()
+
 	for attempt := 0; attempt < claudeUsageProbeAfterRunMaxAttempts; attempt++ {
 		// No credential or cache read in this preflight. Resolving the identity
 		// here would cost a `security` spawn PER RUN on macOS even when the burst
