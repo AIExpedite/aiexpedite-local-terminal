@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -311,4 +314,85 @@ func TestStartSession_GrokMaintenanceSmokeLaunchesThroughACmdShim(t *testing.T) 
 	if strings.Contains(received, grokMaintenanceSmokePromptPrefix) {
 		t.Errorf("prompt text reached argv through the shim: %q", received)
 	}
+}
+
+// The per-attempt deadline must reach the process that actually runs Grok.
+// exec.CommandContext kills only the intermediate cmd.exe; the npm `grok.cmd`
+// shim starts the real binary as a separate child, which survives that kill,
+// keeps the smoke's stdout/stderr handles open (so Run never returns) and
+// leaks a provider process on every timed out attempt.
+func TestGrokSmokeShimCommand_KillsTheShimsChildOnDeadline(t *testing.T) {
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	mockExe := filepath.Join(dir, "grok-mock.exe")
+	if err := copyTestBinary(testExe, mockExe); err != nil {
+		t.Fatal(err)
+	}
+	shim := filepath.Join(dir, "grok.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\n\"%~dp0grok-mock.exe\" %*\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pidFile := filepath.Join(dir, "child.pid")
+
+	cmd, ok := grokSmokeShimCommand(context.Background(), grokSmokeLaunch{Path: shim, Args: []string{"--version"}})
+	if !ok {
+		t.Fatal("a .cmd shim launch must take the cmd.exe route")
+	}
+	if cmd.Cancel == nil || cmd.WaitDelay <= 0 {
+		t.Fatalf("shim route left the deadline unbounded: cancel=%v waitDelay=%v", cmd.Cancel != nil, cmd.WaitDelay)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		env := setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang")
+		_, _, runErr := runGrokSmokeCommand(ctx, grokSmokeLaunch{
+			Path: shim,
+			Args: buildGrokNoToolsSmokeArgs(grokSmokeArgvShapes[0], filepath.Join(dir, "prompt.txt")),
+			Dir:  dir,
+			Env:  setEnvVar(env, mockGrokSmokeHangPidEnv, pidFile),
+		})
+		done <- runErr
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a killed attempt must report an error")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("run never returned after the deadline — the shim's child still holds the captured pipes")
+	}
+
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Skipf("the shim's child never recorded its pid (%v); nothing to assert about the tree kill", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("unreadable child pid %q: %v", raw, err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !grokTestProcessAlive(pid) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	_ = KillProcessTree(pid)
+	t.Fatalf("the shim's child (pid %d) survived the deadline kill", pid)
+}
+
+// grokTestProcessAlive reports whether pid is still running, via the same
+// snapshot the agent's own process inventory uses.
+func grokTestProcessAlive(pid int) bool {
+	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/NH", "/FO", "CSV").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), fmt.Sprintf("\"%d\"", pid))
 }

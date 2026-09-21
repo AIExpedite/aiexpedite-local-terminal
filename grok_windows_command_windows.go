@@ -4,8 +4,10 @@ package main
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // cmd.exe does not use CommandLineToArgvW quoting rules. Supplying the fixed
@@ -38,8 +40,39 @@ func grokSmokeShimCommand(ctx context.Context, launch grokSmokeLaunch) (*exec.Cm
 		return nil, false
 	}
 	cmd := grokWindowsCommandContext(ctx, script)
+	bindGrokShimProcessTree(cmd)
 	env := setEnvVar(launch.Env, grokSmokeShimPathEnv, launch.Path)
 	cmd.Env = setEnvVar(env, grokSmokeShimPromptEnv, launch.PromptFile)
 	cmd.Dir = launch.Dir
 	return cmd, true
+}
+
+// grokShimWaitDelay bounds how long Run / CombinedOutput may stay blocked on
+// the captured stdout/stderr handles once the deadline has fired and the tree
+// has been killed. A descendant that outlives the kill (or a grandchild the
+// snapshot taskkill enumerates missed) still holds the write end of the pipe,
+// and without a delay Wait blocks on that handle forever — the per-attempt
+// deadline would bound nothing. Short, because by this point the whole tree
+// has already been force-killed; this only covers the reap race.
+const grokShimWaitDelay = 2 * time.Second
+
+// bindGrokShimProcessTree makes the per-attempt deadline reach the process the
+// smoke actually cares about. exec.CommandContext kills only the intermediate
+// cmd.exe, but the npm `grok.cmd` shim starts Node as a separate child, so the
+// default cancel would leave the real Grok process running — holding the
+// smoke's stdout/stderr handles and leaking a provider process on every timed
+// out attempt. Reuses KillProcessTree (processes_windows.go), the same
+// `taskkill /F /T /PID` teardown cleanup and the session signal path use, so
+// the whole tree goes down with the context.
+func bindGrokShimProcessTree(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		// Tree first: killing cmd.exe on its own reparents the shim's Node
+		// child out of taskkill /T's reach.
+		_ = KillProcessTree(cmd.Process.Pid)
+		return cmd.Process.Kill()
+	}
+	cmd.WaitDelay = grokShimWaitDelay
 }

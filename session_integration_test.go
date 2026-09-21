@@ -44,6 +44,11 @@ import (
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
 const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
+
+// mockGrokSmokeHangPidEnv names a file the `grok-smoke-hang` mode writes its
+// own pid into before blocking, so a test can assert the deadline kill reached
+// the shim's grandchild and not just the intermediate cmd.exe.
+const mockGrokSmokeHangPidEnv = "TEST_MOCK_GROK_SMOKE_HANG_PID_FILE"
 const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
 const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
 
@@ -509,6 +514,17 @@ func runMockCLI(mode string) {
 
 	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
 		runMockGrokMaintenanceSmoke(mode)
+
+	case "grok-smoke-hang":
+		// Records its pid, then blocks while holding stdout/stderr. Used by
+		// the Windows shim deadline test: killing the intermediate cmd.exe
+		// alone leaves this process alive and the captured pipe open, so Run
+		// would never return.
+		if marker := os.Getenv(mockGrokSmokeHangPidEnv); marker != "" {
+			_ = os.WriteFile(marker, []byte(fmt.Sprintf("%d", os.Getpid())), 0o600)
+		}
+		time.Sleep(10 * time.Minute)
+		os.Exit(0)
 
 	case "grok-smoke-argv-echo":
 		// Echoes every argv element it received as one streaming-json text
