@@ -991,12 +991,22 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 // `taskkill /T`'s reach. Reuses KillProcessTree (processes_windows.go), the
 // same teardown cleanup_windows.go and bindGrokShimProcessTree use; it is a
 // no-op error on non-Windows, which is swallowed.
+//
+// A successful tree kill IS the kill: `taskkill /F /T` reaps the cmd.exe root
+// along with its descendants, so the follow-up Process.Kill lands on an
+// already-terminated handle and Windows reports it as TerminateProcess
+// "Access is denied". That is not a failed kill and must not be surfaced as
+// one to the shutdown paths; the follow-up stays as best-effort insurance for
+// a root taskkill enumerated but had not yet torn down.
 func killSessionProcess(session *CLISession) error {
 	if session == nil || session.Process == nil || session.Process.Process == nil {
 		return os.ErrProcessDone
 	}
 	if session.shimmedChildTree {
-		_ = KillProcessTree(session.Process.Process.Pid)
+		if err := KillProcessTree(session.Process.Process.Pid); err == nil {
+			_ = session.Process.Process.Kill()
+			return nil
+		}
 	}
 	return session.Process.Process.Kill()
 }
