@@ -81,8 +81,9 @@ var (
 // running a reconcile. Atomic because a previous test's exit watcher can still
 // be reaching codexUsageRunSettled while the next test installs its recorder.
 type codexRunHooks struct {
-	started func(time.Time)
-	settled func(time.Time)
+	started  func(time.Time)
+	settled  func(time.Time)
+	disarmed func(floor, fallback time.Time)
 }
 
 var codexRunHookOverride atomic.Pointer[codexRunHooks]
@@ -103,6 +104,20 @@ func codexUsageRunSettled(floor time.Time) {
 		return
 	}
 	triggerCodexUsageRefreshAfterRun(floor)
+}
+
+// codexUsageRunDisarmed is what a session manager calls when a run it armed at
+// `floor` never started — its request never reached the child. `fallback` is
+// the newest run that manager still has open, or zero: the arm coalesced onto
+// this floor, so that is what the persisted floor rolls back to.
+func codexUsageRunDisarmed(floor, fallback time.Time) {
+	if hooks := codexRunHookOverride.Load(); hooks != nil {
+		if hooks.disarmed != nil {
+			hooks.disarmed(floor, fallback)
+		}
+		return
+	}
+	disarmCodexUsageRunFloor(floor, fallback)
 }
 
 // codexUsageRefreshGate holds the process-local bounds. Keyed by account
@@ -128,6 +143,11 @@ type codexUsageRefreshGate struct {
 	// RefreshOwedAttempts write the bounded cache locks refused, so the stale
 	// notice is not withheld forever by an uncounted attempt.
 	pendingAttempts map[string]int
+	// disarmed holds run starts withdrawn (codexUsageRunDisarmed) that may not
+	// have reached disk yet: an arm is written by its own retried goroutine,
+	// so the withdrawal can land first, and the late arm must then be dropped
+	// rather than persist a floor for a run that never happened.
+	disarmed map[string]map[int64]struct{}
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
 	// active counts the tracked goroutines spawn started; idle broadcasts when
@@ -154,6 +174,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		workers:         map[string]bool{},
 		pending:         map[string]codexPendingRunDebt{},
 		pendingAttempts: map[string]int{},
+		disarmed:        map[string]map[int64]struct{}{},
 		cancel:          make(chan struct{}),
 	}
 }
@@ -318,6 +339,35 @@ func (g *codexUsageRefreshGate) takeAttempts(fp string) int {
 	return n
 }
 
+// markDisarmed records that the run armed at floorMs was withdrawn before its
+// arm was known to be on disk; takeDisarmed consumes that record. Both sides
+// run inside the cache transaction, so an arm and its withdrawal are ordered
+// by the cache lock: whichever lands second sees the other's work.
+func (g *codexUsageRefreshGate) markDisarmed(fp string, floorMs int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	floors := g.disarmed[fp]
+	if floors == nil {
+		floors = map[int64]struct{}{}
+		g.disarmed[fp] = floors
+	}
+	floors[floorMs] = struct{}{}
+}
+
+func (g *codexUsageRefreshGate) takeDisarmed(fp string, floorMs int64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	floors := g.disarmed[fp]
+	if _, ok := floors[floorMs]; !ok {
+		return false
+	}
+	delete(floors, floorMs)
+	if len(floors) == 0 {
+		delete(g.disarmed, fp)
+	}
+	return true
+}
+
 func (g *codexUsageRefreshGate) cancelCh() <-chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -358,6 +408,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.pendingAttempts = map[string]int{}
+	codexUsageRefresh.disarmed = map[string]map[int64]struct{}{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
 }
@@ -511,6 +562,39 @@ func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 	}
 }
 
+// codexDisarmRunFloor rolls back a start codexArmRunFloor recorded for a run
+// that never happened, to fallbackMs — the newest run its manager still has
+// open, or zero. Only the exact floor is touched, wherever the arm left it: a
+// newer floor belongs to another run and stays; an older one was never
+// displaced by this arm. Reports whether anything changed.
+func codexDisarmRunFloor(snap *codexRateLimitSnapshot, floorMs, fallbackMs int64) bool {
+	switch {
+	case floorMs <= 0:
+		return false
+	case snap.ActiveRunFloorMs == floorMs:
+		// Parked behind a debt: the debt keeps its floor, the parked start
+		// falls back to the manager's remaining open run when that is newer
+		// than the debt, else there is nothing left to promote.
+		if fallbackMs > snap.RunFloorMs {
+			snap.ActiveRunFloorMs = fallbackMs
+		} else {
+			snap.ActiveRunFloorMs = 0
+		}
+		return true
+	case snap.RunFloorMs == floorMs:
+		// The arm coalesced onto this floor, so an older open run's start (or a
+		// debt that later coalesced onto it) is what it stood in for. A zero
+		// fallback with a debt outstanding lets codexSettleRunFreshness retire
+		// that debt: no run is left for it to describe.
+		snap.RunFloorMs = fallbackMs
+		if snap.ActiveRunFloorMs <= snap.RunFloorMs {
+			snap.ActiveRunFloorMs = 0
+		}
+		return true
+	}
+	return false
+}
+
 // codexOweRunRefresh records that a run which started at `floor` has finished.
 // Concurrent runs coalesce onto the NEWEST floor: one debt stands for every run
 // it absorbed, so it must only be cleared by an observation that covers the
@@ -558,8 +642,50 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 				return
 			}
 			if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+				// Withdrawn (codexUsageRunDisarmed) before this write landed: the
+				// run never happened, so its floor must not reach disk at all.
+				if codexUsageRefresh.takeDisarmed(fp, startedAt.UnixMilli()) {
+					return
+				}
 				codexArmRunFloor(snap, startedAt)
 			}) {
+				return
+			}
+		}
+	})
+}
+
+// disarmCodexUsageRunFloor withdraws a run start armCodexUsageRunFloor recorded
+// (or is still retrying) for a run that never started — its turn request never
+// reached the child. Left on disk, that floor would be read as an interrupted
+// run at the next process start and converted into a debt no telemetry can
+// pay, which ages into a false stale-utilization warning. The withdrawal is
+// marked in the gate BEFORE the rollback so a late arm write is dropped, and
+// a rollback the bounded cache locks refuse is retried like the arm itself.
+func disarmCodexUsageRunFloor(floor, fallback time.Time) {
+	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
+		return
+	}
+	floorMs := floor.UnixMilli()
+	var fallbackMs int64
+	if !fallback.IsZero() {
+		fallbackMs = fallback.UnixMilli()
+	}
+	codexUsageRefresh.spawn(func() {
+		fp := codexAccountFingerprintAtBase(codexHomeBase())
+		codexUsageRefresh.markDisarmed(fp, floorMs)
+		for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
+			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
+				return
+			}
+			var reached bool
+			if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+				reached = true
+				if codexDisarmRunFloor(snap, floorMs, fallbackMs) {
+					// The arm had landed; the mark has nothing left to stop.
+					codexUsageRefresh.takeDisarmed(fp, floorMs)
+				}
+			}) || reached {
 				return
 			}
 		}
@@ -853,35 +979,30 @@ func codexStaleRunNotice(state codexRunFreshnessState) string {
 // event name. detectCLITerminalEvent covers the same two names for terminal
 // `codex` sessions, which speak the bare-event dialect only.
 func codexRunCompletionFrame(line string) bool {
+	return codexRunCompletionShape(line) != ""
+}
+
+// codexRunCompletionShape is codexRunCompletionFrame's classifying form: the
+// completion's normalized event name (`turn.completed` or `thread.completed`),
+// or "" for any other line. A finished turn may announce itself in BOTH shapes,
+// one after the other; the app-server treats the name as an opaque label so it
+// can pair the second announcement with the first instead of settling another
+// turn on it — without learning what either name means.
+func codexRunCompletionShape(line string) string {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "completed") {
-		return false
+		return ""
 	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		return false
+		return ""
 	}
-	if method, _ := raw["method"].(string); codexCompletionEventName(method) {
-		return true
-	}
-	if eventType, _ := raw["type"].(string); codexCompletionEventName(eventType) {
-		return true
-	}
-	for _, key := range []string{"msg", "payload", "params", "result"} {
-		nested, ok := raw[key].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if eventType, _ := nested["type"].(string); codexCompletionEventName(eventType) {
-			return true
-		}
-		if msg, ok := nested["msg"].(map[string]interface{}); ok {
-			if eventType, _ := msg["type"].(string); codexCompletionEventName(eventType) {
-				return true
-			}
+	for _, name := range codexFrameEventNames(raw) {
+		if codexCompletionEventName(name) {
+			return codexNormalizeCompletionName(name)
 		}
 	}
-	return false
+	return ""
 }
 
 // codexRunStartFrame reports whether a line the CLIENT wrote to a long-lived

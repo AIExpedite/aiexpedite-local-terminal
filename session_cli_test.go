@@ -3828,3 +3828,51 @@ func TestSessionLifecycle_CodexDeferredPromptNeverDeliveredSettlesNothing(t *tes
 		t.Fatalf("started=%d settled=%d after closing a never-prompted session, want none", started, settled)
 	}
 }
+
+// A stdin-fed codex session arms its run only once the initial prompt write
+// SUCCEEDS — anchored at the session start, where the child began reading it.
+// A child that exits or closes stdin before the write never received a
+// prompt: nothing is armed, so waitForExit has no run to settle into a debt no
+// telemetry can pay.
+func TestSessionLifecycle_CodexInitialPromptArmsOnlyAfterDelivery(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	sm := NewSessionManager(nil)
+	startedAt := time.UnixMilli(1_700_000_000_000)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	_ = w.Close()
+	failed := &CLISession{ID: "codex-closed-stdin", Command: "codex", Stdin: w, StartedAt: startedAt}
+	sm.deliverInitialPrompt(failed, "implement the login page", 24, "plain")
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after a failed initial prompt write, want nothing armed", started, settled)
+	}
+	failed.settleCodexUsageRun()
+	if _, settled := rec.counts(); settled != 0 {
+		t.Fatalf("settled %d with nothing armed, want 0", settled)
+	}
+
+	r, w, err = os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	delivered := &CLISession{ID: "codex-open-stdin", Command: "codex", Stdin: w, StartedAt: startedAt}
+	sm.deliverInitialPrompt(delivered, "implement the login page", 24, "plain")
+	if started, _ := rec.counts(); started != 1 {
+		t.Fatalf("started=%d after a delivered initial prompt, want 1", started)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if !floor.Equal(startedAt) {
+		t.Fatalf("armed at %s, want the session start %s", floor, startedAt)
+	}
+	delivered.settleCodexUsageRun()
+	if settled := rec.waitSettled(t, 1); !settled[0].Equal(startedAt) {
+		t.Fatalf("settled with floor %s, want %s", settled[0], startedAt)
+	}
+}

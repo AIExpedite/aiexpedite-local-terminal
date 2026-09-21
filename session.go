@@ -726,10 +726,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
 	}
 	// A codex run's utilization is owed from its start; the terminal event or
-	// waitForExit settles it. A session started WITHOUT a prompt is not running
-	// yet — its run is armed by the SendInput that delivers one. Asynchronous —
-	// never holds sm.mu across the cache lock.
-	if isCodexCommand(session.Command) && !session.deferredStdinClose {
+	// waitForExit settles it. Armed here only when the prompt travelled on
+	// argv, so the child is already running it. A prompt still to be written
+	// to stdin arms once that write SUCCEEDS (below, anchored at the same
+	// start): a child that exits or closes stdin first never received a
+	// prompt, and its exit must not settle a run that never happened into a
+	// debt no telemetry can pay. A session started WITHOUT a prompt is not
+	// running yet — its run is armed by the SendInput that delivers one.
+	// Asynchronous — never holds sm.mu across the cache lock.
+	if isCodexCommand(session.Command) && !session.deferredStdinClose && stdinPrompt == nil {
 		session.armCodexUsageRun(session.StartedAt)
 	}
 
@@ -786,15 +791,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			// than dropping the prompt silently.
 			line = *stdinPrompt
 		}
-		if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
-			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
-				colorRed, id, err, colorReset)
-		} else {
-			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
-				colorGreen, id, len(*stdinPrompt), stdinPromptFormat(command), colorReset)
-			// Prompt delivered — arm the claude no-output watchdog now.
-			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
-		}
+		sm.deliverInitialPrompt(session, line, len(*stdinPrompt), stdinPromptFormat(command))
 	}
 
 	// Close stdin for one-shot sessions. Codex exec appends piped stdin to the
@@ -813,6 +810,26 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	}
 
 	return nil
+}
+
+// deliverInitialPrompt writes the framed initial prompt to the child's stdin.
+// Only a write that SUCCEEDED starts anything: the claude no-output watchdog
+// arms, and a codex run is armed at the session start — the prompt was the
+// first thing the child read, so its run began there. A failed write is
+// logged and starts nothing, exactly as a failed deferred SendInput does.
+func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string, promptLen int, format string) {
+	if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
+		fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
+			colorRed, session.ID, err, colorReset)
+		return
+	}
+	fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
+		colorGreen, session.ID, promptLen, format, colorReset)
+	if isCodexCommand(session.Command) {
+		session.armCodexUsageRun(session.StartedAt)
+	}
+	// Prompt delivered — arm the claude no-output watchdog now.
+	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 }
 
 /* --------------------------------------------------------------------------

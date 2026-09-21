@@ -515,9 +515,15 @@ func TestCodexParse_ForcedRefreshBypassesIntervalRoutineDoesNot(t *testing.T) {
 // codexRunHookRecorder replaces the two session-manager lifecycle hooks so the
 // manager tests can assert when, and how often, they fire.
 type codexRunHookRecorder struct {
-	mu      sync.Mutex
-	started []time.Time
-	settled []time.Time
+	mu       sync.Mutex
+	started  []time.Time
+	settled  []time.Time
+	disarmed []codexRunDisarm
+}
+
+// codexRunDisarm is one recorded codexUsageRunDisarmed call.
+type codexRunDisarm struct {
+	floor, fallback time.Time
 }
 
 func recordCodexRunHooks(t *testing.T) *codexRunHookRecorder {
@@ -532,6 +538,11 @@ func recordCodexRunHooks(t *testing.T) *codexRunHookRecorder {
 		settled: func(at time.Time) {
 			rec.mu.Lock()
 			rec.settled = append(rec.settled, at)
+			rec.mu.Unlock()
+		},
+		disarmed: func(floor, fallback time.Time) {
+			rec.mu.Lock()
+			rec.disarmed = append(rec.disarmed, codexRunDisarm{floor: floor, fallback: fallback})
 			rec.mu.Unlock()
 		},
 	})
@@ -1050,5 +1061,125 @@ func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
 	}
 	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice == "" {
 		t.Fatal("want the stale-run notice once every attempt is counted")
+	}
+}
+
+// A turn request whose write never reached the child is withdrawn from the
+// PERSISTED floor too — left there, the next process start would read it as an
+// interrupted run and owe a refresh no telemetry can pay. Only the exact floor
+// rolls back: it returns to the newest turn its manager still has open, a
+// newer floor belongs to another run and stays, and a start parked behind a
+// debt is unparked without touching the debt.
+func TestCodexDisarmRunFloor_RollsBackOnlyTheFailedArm(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB, runC := t0, t0.Add(5*time.Minute), t0.Add(10*time.Minute)
+
+	// The failed arm coalesced onto runB with runA still open: back to runA.
+	open := codexRateLimitSnapshot{}
+	codexArmRunFloor(&open, runA)
+	codexArmRunFloor(&open, runB)
+	if !codexDisarmRunFloor(&open, runB.UnixMilli(), runA.UnixMilli()) || open.RunFloorMs != runA.UnixMilli() {
+		t.Fatalf("the failed arm must fall back to the turn still open: %+v", open)
+	}
+
+	// Nothing else open: nothing is left to classify as interrupted.
+	alone := codexRateLimitSnapshot{}
+	codexArmRunFloor(&alone, runB)
+	if !codexDisarmRunFloor(&alone, runB.UnixMilli(), 0) || alone.RunFloorMs != 0 {
+		t.Fatalf("a lone failed arm must leave no floor: %+v", alone)
+	}
+	if state := codexRunFreshnessFromView(codexCacheView{runFloorMs: alone.RunFloorMs}, runB.Add(time.Minute)); state.interrupted {
+		t.Fatalf("a withdrawn run must not read as interrupted: %+v", state)
+	}
+
+	// A newer run armed since: its floor is not this arm's to roll back.
+	newer := codexRateLimitSnapshot{}
+	codexArmRunFloor(&newer, runB)
+	codexArmRunFloor(&newer, runC)
+	if codexDisarmRunFloor(&newer, runB.UnixMilli(), 0) || newer.RunFloorMs != runC.UnixMilli() {
+		t.Fatalf("a newer run's floor must survive an older arm's withdrawal: %+v", newer)
+	}
+
+	// Parked behind runA's debt: the debt keeps its floor, the park is undone.
+	parked := codexRateLimitSnapshot{}
+	codexArmRunFloor(&parked, runA)
+	codexOweRunRefresh(&parked, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&parked, runB)
+	if !codexDisarmRunFloor(&parked, runB.UnixMilli(), 0) || parked.ActiveRunFloorMs != 0 || parked.RunFloorMs != runA.UnixMilli() || parked.RefreshOwedAtMs == 0 {
+		t.Fatalf("withdrawing a parked start must leave the debt alone: %+v", parked)
+	}
+	// Parked with an older turn of its own still open: that turn takes the park.
+	parkedOpen := codexRateLimitSnapshot{}
+	codexArmRunFloor(&parkedOpen, runA)
+	codexOweRunRefresh(&parkedOpen, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&parkedOpen, runB)
+	codexArmRunFloor(&parkedOpen, runC)
+	if !codexDisarmRunFloor(&parkedOpen, runC.UnixMilli(), runB.UnixMilli()) || parkedOpen.ActiveRunFloorMs != runB.UnixMilli() {
+		t.Fatalf("the open turn must take over the park: %+v", parkedOpen)
+	}
+	// A debt that coalesced onto the failed arm (its turn settled after the
+	// failed request) falls back to that settled turn's floor, so the debt
+	// waits on evidence covering the run that actually happened.
+	coalesced := codexRateLimitSnapshot{}
+	codexArmRunFloor(&coalesced, runA)
+	codexArmRunFloor(&coalesced, runB)
+	codexOweRunRefresh(&coalesced, runA, t0.Add(6*time.Minute))
+	if !codexDisarmRunFloor(&coalesced, runB.UnixMilli(), runA.UnixMilli()) || coalesced.RunFloorMs != runA.UnixMilli() || coalesced.RefreshOwedAtMs == 0 {
+		t.Fatalf("the debt must fall back to the turn that ran: %+v", coalesced)
+	}
+}
+
+// Arms are written by their own retried goroutines, so a withdrawal can reach
+// the cache BEFORE the arm it withdraws. The late arm must then be dropped:
+// the run never happened, and a floor for it would be read as an interrupted
+// run at the next start. And a withdrawal the bounded locks refuse is retried,
+// like the arm itself, so the floor does not linger on disk.
+func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	// Withdrawal first, then the arm it withdraws: nothing may reach disk.
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	waitCodexUsageRefreshIdle(t)
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 {
+		t.Fatalf("a withdrawn arm reached disk: RunFloorMs=%d", snap.RunFloorMs)
+	}
+	if codexUsageRefresh.takeDisarmed(f.fp, runStart.UnixMilli()) {
+		t.Fatal("the late arm must consume its withdrawal mark")
+	}
+
+	// Arm first, then a withdrawal whose first write is refused.
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("armed floor %d, want %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+	prevDelay := codexRunFloorWriteRetryDelay
+	codexRunFloorWriteRetryDelay = 50 * time.Millisecond
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 30*time.Millisecond, time.Millisecond
+	t.Cleanup(func() {
+		codexRunFloorWriteRetryDelay = prevDelay
+		codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll
+	})
+	codexRateLimitMu.Lock()
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		codexRateLimitMu.Unlock()
+	}()
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 {
+		t.Fatalf("the retried withdrawal left RunFloorMs=%d on disk", snap.RunFloorMs)
+	}
+	if codexUsageRefresh.takeDisarmed(f.fp, runStart.UnixMilli()) {
+		t.Fatal("a withdrawal that rolled back the landed arm must clear its mark")
+	}
+	if state := codexRunFreshnessForAccount(f.fp, now); state.interrupted || state.owed {
+		t.Fatalf("a withdrawn run must owe nothing after a restart: %+v", state)
 	}
 }

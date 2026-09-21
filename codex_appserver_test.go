@@ -1310,7 +1310,7 @@ func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T)
 		t.Fatalf("started=%d settled=%d after two turn requests, want 2/0", started, settled)
 	}
 
-	session.settleUsageRun()
+	session.settleUsageRun("turn.completed")
 	if _, settled := rec.counts(); settled != 1 {
 		t.Fatalf("settled %d after the first completion, want 1", settled)
 	}
@@ -1324,16 +1324,116 @@ func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T)
 		t.Fatalf("started=%d after a progress frame with a turn open, want no new run", started)
 	}
 
-	session.settleUsageRun()
+	session.settleUsageRun("turn.completed")
 	settled := rec.settled
 	if len(settled) != 2 || !settled[1].Equal(second) {
 		t.Fatalf("settled=%v after the second completion, want [%s %s]", settled, first, second)
 	}
 	// Nothing open: a stray completion settles nothing.
-	session.settleUsageRun()
+	session.settleUsageRun("turn.completed")
 	session.settleOpenUsageRuns()
 	if _, n := rec.counts(); n != 2 {
 		t.Fatalf("settled %d after stray completions with nothing open, want 2", n)
+	}
+}
+
+// A finished turn may announce itself in BOTH completion shapes back to back
+// (`turn.completed`, then `thread.completed`). With two turns open, the second
+// announcement is the SAME turn finishing: it must pair with the first instead
+// of retiring the other turn, which is still running — otherwise that turn's
+// debt is created early, its in-flight telemetry pays it, and its real
+// completion is a no-op that leaves the final reading stale.
+func TestCodexAppServerSession_PairedCompletionShapesSettleOneTurn(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(250 * time.Millisecond)
+	session.armUsageRun(first)
+	session.armUsageRun(second)
+
+	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("thread.completed")
+	if _, settled := rec.counts(); settled != 1 {
+		t.Fatalf("settled %d after one turn's paired completions, want 1 (the second turn is still running)", settled)
+	}
+	if got := rec.settled[0]; !got.Equal(first) {
+		t.Fatalf("paired completions settled floor %s, want the first turn's %s", got, first)
+	}
+
+	session.settleUsageRun("turn.completed")
+	session.settleUsageRun("thread.completed")
+	settled := rec.settled
+	if len(settled) != 2 || !settled[1].Equal(second) {
+		t.Fatalf("settled=%v after the second turn's paired completions, want [%s %s]", settled, first, second)
+	}
+	// Both pairs consumed: a third turn settles on its first shape again.
+	third := second.Add(time.Second)
+	session.armUsageRun(third)
+	session.settleUsageRun("thread.completed")
+	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
+		t.Fatalf("settled=%v after the third turn's completion, want it settled at %s", got, third)
+	}
+	session.settleUsageRun("turn.completed")
+	if _, n := rec.counts(); n != 3 {
+		t.Fatalf("settled %d after the third turn's partner shape, want 3", n)
+	}
+}
+
+// Pairing must not swallow completions from a dialect that speaks ONE shape:
+// consecutive same-shape completions each settle a turn, and the credits they
+// leave stay bounded.
+func TestCodexAppServerSession_SingleShapeCompletionsSettleEveryTurn(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	base := time.UnixMilli(1_700_000_000_000)
+	const turns = codexAppServerMaxOpenUsageTurns + 8
+	for i := 0; i < turns; i++ {
+		session.armUsageRun(base.Add(time.Duration(i) * time.Second))
+		session.settleUsageRun("turn.completed")
+	}
+	if _, settled := rec.counts(); settled != turns {
+		t.Fatalf("settled %d of %d single-shape turns", settled, turns)
+	}
+	session.usageMu.Lock()
+	credits := session.usageCompletionCredits["turn.completed"]
+	session.usageMu.Unlock()
+	if credits > codexAppServerMaxOpenUsageTurns {
+		t.Fatalf("credits grew to %d, want capped at %d", credits, codexAppServerMaxOpenUsageTurns)
+	}
+}
+
+// A failed turn write disarms the PERSISTED floor too, not only the queue
+// entry: left on disk, the arm would be read as an interrupted run at the next
+// process start and converted into a debt no telemetry can pay. The rollback
+// names the newest turn still open so a concurrent run's floor is kept.
+func TestCodexAppServerSession_DisarmRollsBackPersistedFloor(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(250 * time.Millisecond)
+	session.armUsageRun(first)
+	failed := session.armUsageRun(second)
+	session.disarmUsageRun(failed)
+
+	rec.mu.Lock()
+	disarmed := append([]codexRunDisarm(nil), rec.disarmed...)
+	rec.mu.Unlock()
+	if len(disarmed) != 1 {
+		t.Fatalf("disarmed %d floors, want 1", len(disarmed))
+	}
+	if !disarmed[0].floor.Equal(second) || !disarmed[0].fallback.Equal(first) {
+		t.Fatalf("disarmed floor=%s fallback=%s, want floor=%s fallback=%s (the turn still open)",
+			disarmed[0].floor, disarmed[0].fallback, second, first)
+	}
+	// Alone, the rollback names no fallback.
+	session.settleUsageRun("turn.completed")
+	alone := session.armUsageRun(second.Add(time.Second))
+	session.disarmUsageRun(alone)
+	rec.mu.Lock()
+	last := rec.disarmed[len(rec.disarmed)-1]
+	rec.mu.Unlock()
+	if !last.floor.Equal(time.UnixMilli(alone)) || !last.fallback.IsZero() {
+		t.Fatalf("disarmed floor=%s fallback=%s with nothing else open, want fallback zero", last.floor, last.fallback)
 	}
 }
 

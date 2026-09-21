@@ -178,6 +178,13 @@ type CodexAppServerSession struct {
 	// telemetry (cliagent_usage_codex_freshness.go). Guarded by usageMu.
 	usageMu         sync.Mutex
 	usageTurnFloors []int64
+	// usageCompletionCredits pairs the two shapes one finished turn may
+	// announce itself in (codexRunCompletionShape). Settling on the first
+	// leaves a credit under its shape; the partner shape arriving later spends
+	// that credit instead of settling ANOTHER open turn — with overlapping
+	// turns, the second announcement would otherwise retire a turn still
+	// running. Keyed by the opaque shape label; capped per shape.
+	usageCompletionCredits map[string]int
 }
 
 // codexAppServerMaxOpenUsageTurns bounds usageTurnFloors. A turn whose
@@ -215,10 +222,26 @@ func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 // where one bounded reconcile retires it.
 func (s *CodexAppServerSession) disarmUsageRun(floor int64) {
 	s.usageMu.Lock()
-	defer s.usageMu.Unlock()
-	if n := len(s.usageTurnFloors); n > 0 && s.usageTurnFloors[n-1] == floor {
-		s.usageTurnFloors = s.usageTurnFloors[:n-1]
+	n := len(s.usageTurnFloors)
+	if n == 0 || s.usageTurnFloors[n-1] != floor {
+		s.usageMu.Unlock()
+		return
 	}
+	s.usageTurnFloors = s.usageTurnFloors[:n-1]
+	// The persisted floor coalesced onto this arm; it rolls back to the newest
+	// turn still open (none: zero), which is what it stood in for.
+	var fallback int64
+	for _, open := range s.usageTurnFloors {
+		if open > fallback {
+			fallback = open
+		}
+	}
+	s.usageMu.Unlock()
+	var fallbackAt time.Time
+	if fallback > 0 {
+		fallbackAt = time.UnixMilli(fallback)
+	}
+	codexUsageRunDisarmed(time.UnixMilli(floor), fallbackAt)
 }
 
 // openUsageRun marks that the stream produced a frame DEMONSTRATING a turn in
@@ -250,8 +273,28 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 // stream produced nothing since the last settle — the run it would describe
 // does not exist, and a debt for it would surface as a spurious "reading
 // predates the last run" notice.
-func (s *CodexAppServerSession) settleUsageRun() {
+//
+// `shape` is the completion's label (codexRunCompletionShape). A turn may
+// announce its end in two shapes back to back; the second is the SAME turn
+// finishing, not the next one, so it spends the credit the first left instead
+// of popping another floor. Credits are never reset: a dialect that speaks one
+// shape only accumulates credits its partner shape never comes to spend.
+func (s *CodexAppServerSession) settleUsageRun(shape string) {
 	s.usageMu.Lock()
+	for other, credits := range s.usageCompletionCredits {
+		if other == shape || credits <= 0 {
+			continue
+		}
+		s.usageCompletionCredits[other] = credits - 1
+		s.usageMu.Unlock()
+		return
+	}
+	if s.usageCompletionCredits == nil {
+		s.usageCompletionCredits = map[string]int{}
+	}
+	if s.usageCompletionCredits[shape] < codexAppServerMaxOpenUsageTurns {
+		s.usageCompletionCredits[shape]++
+	}
 	var floor int64
 	if len(s.usageTurnFloors) > 0 {
 		floor = s.usageTurnFloors[0]
@@ -964,8 +1007,8 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// started, exactly like a terminal `codex` session's terminal
 			// event. The frame shapes live in the usage layer, so this file
 			// still knows no JSON-RPC semantics.
-			if codexRunCompletionFrame(trimmed) {
-				session.settleUsageRun()
+			if shape := codexRunCompletionShape(trimmed); shape != "" {
+				session.settleUsageRun(shape)
 			} else if codexRunProgressFrame(trimmed) {
 				session.openUsageRun(time.Now())
 			}
