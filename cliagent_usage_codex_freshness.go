@@ -170,8 +170,12 @@ type codexUsageRefreshGate struct {
 	pending map[string]codexPendingRunDebt
 	// pendingAttempts holds forced reconciles that were spent but whose
 	// RefreshOwedAttempts write the bounded cache locks refused, so the stale
-	// notice is not withheld forever by an uncounted attempt.
-	pendingAttempts map[string]int
+	// notice is not withheld forever by an uncounted attempt. Each retained
+	// count carries the debt GENERATION it was spent on: a run that settles
+	// meanwhile resets the counter on disk, and folding an older generation's
+	// attempt into it would push a brand-new debt towards the stale warning
+	// on reconciles that never targeted its floor.
+	pendingAttempts map[string]codexRetainedAttempts
 	// armed maps a run start (floor, ms) to the account fingerprint that was
 	// live when it was armed, so the run's settlement is attributed to the
 	// account that actually made it even if the Codex credentials change while
@@ -195,6 +199,32 @@ type codexUsageRefreshGate struct {
 	idle   *sync.Cond
 }
 
+// codexDebtID identifies ONE generation of run debt — the floor it waits on
+// and the completion that created it. Every codexOweRunRefresh starts a new
+// generation (and resets RefreshOwedAttempts), so an attempt spent on an
+// earlier one must never land on a later one.
+type codexDebtID struct {
+	floorMs  int64
+	owedAtMs int64
+}
+
+func (id codexDebtID) valid() bool { return id.owedAtMs > 0 && id.floorMs > 0 }
+
+// debtID names the generation this state describes, or the zero id when
+// nothing is owed.
+func (s codexRunFreshnessState) debtID() codexDebtID {
+	if !s.owed {
+		return codexDebtID{}
+	}
+	return codexDebtID{floorMs: s.floor.UnixMilli(), owedAtMs: s.owedAt.UnixMilli()}
+}
+
+// codexRetainedAttempts is a refused attempt count plus the debt it belongs to.
+type codexRetainedAttempts struct {
+	id codexDebtID
+	n  int
+}
+
 // codexPendingRunDebt is one finished run whose debt is not on disk yet.
 type codexPendingRunDebt struct {
 	floor       time.Time
@@ -209,7 +239,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		lastRun:         map[string]time.Time{},
 		workers:         map[string]bool{},
 		pending:         map[string]codexPendingRunDebt{},
-		pendingAttempts: map[string]int{},
+		pendingAttempts: map[string]codexRetainedAttempts{},
 		armed:           map[int64]string{},
 		disarmed:        map[string]map[int64]struct{}{},
 		cancel:          make(chan struct{}),
@@ -360,20 +390,47 @@ func (g *codexUsageRefreshGate) takeDebt(fp string) (codexPendingRunDebt, bool) 
 	return debt, ok
 }
 
-// rememberAttempts retains attempts whose counter write was refused, and
-// takeAttempts hands them to the next write for fp.
-func (g *codexUsageRefreshGate) rememberAttempts(fp string, n int) {
+// rememberAttempts retains attempts whose counter write was refused, under the
+// debt generation they were spent on. A count retained for an OLDER generation
+// is dropped rather than carried over: the newer debt reset the counter on
+// purpose, and those attempts did not target its floor.
+func (g *codexUsageRefreshGate) rememberAttempts(fp string, id codexDebtID, n int) {
+	if !id.valid() || n <= 0 {
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.pendingAttempts[fp] += n
+	if cur, ok := g.pendingAttempts[fp]; ok && cur.id == id {
+		n += cur.n
+	}
+	g.pendingAttempts[fp] = codexRetainedAttempts{id: id, n: n}
 }
 
-func (g *codexUsageRefreshGate) takeAttempts(fp string) int {
+// takeAttempts hands the next write the attempts retained for THIS debt; a
+// count held for another generation is discarded, since it can never be
+// counted anywhere.
+func (g *codexUsageRefreshGate) takeAttempts(fp string, id codexDebtID) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	n := g.pendingAttempts[fp]
+	cur, ok := g.pendingAttempts[fp]
+	if !ok {
+		return 0
+	}
 	delete(g.pendingAttempts, fp)
-	return n
+	if cur.id != id {
+		return 0
+	}
+	return cur.n
+}
+
+// takeRetainedAttempts drains whatever generation is retained for fp, for the
+// flush-only path that has no debt of its own to count.
+func (g *codexUsageRefreshGate) takeRetainedAttempts(fp string) (codexDebtID, int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur := g.pendingAttempts[fp]
+	delete(g.pendingAttempts, fp)
+	return cur.id, cur.n
 }
 
 // rememberArmedAccount pins the account that was live when the run starting at
@@ -480,7 +537,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.lastRun = map[string]time.Time{}
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
-	codexUsageRefresh.pendingAttempts = map[string]int{}
+	codexUsageRefresh.pendingAttempts = map[string]codexRetainedAttempts{}
 	codexUsageRefresh.armed = map[int64]string{}
 	codexUsageRefresh.disarmed = map[string]map[int64]struct{}{}
 	codexUsageRefresh.cancel = make(chan struct{})
@@ -686,10 +743,16 @@ func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Ti
 	}
 }
 
-func codexCountRefreshAttempt(snap *codexRateLimitSnapshot) {
-	if snap.RefreshOwedAtMs > 0 {
-		snap.RefreshOwedAttempts++
+// codexCountRefreshAttempt counts one bounded attempt against the debt `id`
+// names, and only that one. The snapshot is re-read inside the transaction, so
+// a run that settled between the reconcile and this write has already replaced
+// the debt (and reset the count); counting there would spend a new run's
+// budget on a reconcile that never looked at its floor.
+func codexCountRefreshAttempt(snap *codexRateLimitSnapshot, id codexDebtID) {
+	if snap.RefreshOwedAtMs <= 0 || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs {
+		return
 	}
+	snap.RefreshOwedAttempts++
 }
 
 /* ─────────────────────────── lifecycle hooks ─────────────────────────── */
@@ -838,7 +901,7 @@ func codexRunDebtWorker(base, fp string) {
 			// or a gather reconciles — and the gather side flushes whatever is
 			// still retained here (codexReconcileForGather).
 			codexFlushPendingRunDebt(fp)
-			codexRecordRefreshAttempt(fp, 0)
+			codexRecordRefreshAttempt(fp, codexDebtID{}, 0)
 			return
 		}
 	}
@@ -874,7 +937,7 @@ func codexPayRunRefresh(base, fp string) {
 		if !codexAwaitGatedReconcile(base, fp, state.floor) {
 			return
 		}
-		codexRecordRefreshAttempt(fp, 1)
+		codexRecordRefreshAttempt(fp, state.debtID(), 1)
 	}
 }
 
@@ -884,20 +947,29 @@ func codexPayRunRefresh(base, fp string) {
 // codexRefreshAfterRunMaxAttempts), so an attempt that was spent but never
 // recorded leaves a run whose telemetry never appears reconciling on every
 // later gather while the card never says why it looks old. A refused write is
-// retained for the next transaction instead; spent=0 only flushes.
-func codexRecordRefreshAttempt(fp string, spent int) {
-	spent += codexUsageRefresh.takeAttempts(fp)
+// retained for the next transaction instead; spent=0 only flushes whatever
+// generation is still retained.
+//
+// `id` binds the count to the debt the attempt was actually spent on, so a run
+// that settles between the reconcile and this write keeps the full attempt
+// budget its own floor is owed.
+func codexRecordRefreshAttempt(fp string, id codexDebtID, spent int) {
 	if spent <= 0 {
+		id, spent = codexUsageRefresh.takeRetainedAttempts(fp)
+	} else {
+		spent += codexUsageRefresh.takeAttempts(fp, id)
+	}
+	if spent <= 0 || !id.valid() {
 		return
 	}
 	if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
 		for i := 0; i < spent; i++ {
-			codexCountRefreshAttempt(snap)
+			codexCountRefreshAttempt(snap, id)
 		}
 	}) {
 		return
 	}
-	codexUsageRefresh.rememberAttempts(fp, spent)
+	codexUsageRefresh.rememberAttempts(fp, id, spent)
 }
 
 // codexLandPendingRunDebt retries codexFlushPendingRunDebt under the same
@@ -1009,16 +1081,22 @@ func payOwedCodexUsageRefresh() {
 		// owed debt but never count an attempt, so a run whose telemetry
 		// never appears would never reach the stale-warning threshold.
 		retained := false
+		// The generation this replay's one reconcile is spent on: the debt
+		// already on disk, or the one the conversion below creates (floor
+		// unchanged, completed now). Naming it here keeps a run that settles
+		// mid-replay from inheriting this attempt.
+		debt := state.debtID()
 		if state.interrupted {
 			// The run is over — its process is gone — so it is owed from now on:
 			// the stale notice and the age-out both need a completion time.
 			retained = !codexOweInterruptedRun(fp, state.floor, now)
+			debt = codexDebtID{floorMs: state.floor.UnixMilli(), owedAtMs: now.UnixMilli()}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
 		defer cancel()
 		// Bypass the interval: nothing in this fresh process has reconciled yet.
 		if _, ran, _, _ := codexRunGatedReconcile(ctx, base, fp, state.floor, true, now); ran {
-			codexRecordRefreshAttempt(fp, 1)
+			codexRecordRefreshAttempt(fp, debt, 1)
 		}
 		// The reconcile may have PAID the debt it was sent to pay and, in the
 		// same transaction, promoted a floor that was parked behind it — a
@@ -1090,7 +1168,7 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 			// A no-op once this reconcile PAID the debt: the same transaction
 			// cleared the count (codexCountRefreshAttempt).
 			if state.owed {
-				codexRecordRefreshAttempt(fp, 1)
+				codexRecordRefreshAttempt(fp, state.debtID(), 1)
 			}
 			return res
 		}

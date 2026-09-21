@@ -2677,11 +2677,20 @@ func codexExecPositionals(args []string) []string {
 // Conservative by design: a subcommand whose prompt is absent or routed to
 // stdin (the `-` placeholder) reports false and is armed by SendInput instead.
 // `resume` puts SESSION_ID before PROMPT unless --last names the session.
+//
+// `review` is the exception to "no prompt, no run": its custom prompt is
+// OPTIONAL, and a review that names its target on argv (`review --uncommitted`
+// / `--base` / `--commit`) starts on that diff the moment the child does. No
+// SendInput ever follows one, so reporting false there would leave its
+// utilization floor unarmed and the card stale after the review finishes.
 func codexPromptTravelsOnArgv(args []string) bool {
 	subcommand, rest := codexExecSubcommand(sanitizeCodexExecArgs(args))
 	promptIndex := 0
 	switch subcommand {
 	case "review":
+		if codexReviewTargetsArgv(rest) {
+			return true
+		}
 	case "resume":
 		promptIndex = 1 // SESSION_ID PROMPT
 		for _, a := range rest {
@@ -2698,6 +2707,27 @@ func codexPromptTravelsOnArgv(args []string) bool {
 		return false
 	}
 	return positionals[promptIndex] != "-"
+}
+
+// codexReviewTargetsArgv reports whether a `codex exec review` tail already
+// names the diff to review, so the review runs without any further input. The
+// valued forms (`--base main`, `--commit <sha>`) count in either spelling; the
+// flag alone with its value missing does not, since codex rejects it.
+func codexReviewTargetsArgv(rest []string) bool {
+	for i, a := range rest {
+		lower := strings.ToLower(a)
+		if lower == "--uncommitted" {
+			return true
+		}
+		name, value, inline := strings.Cut(lower, "=")
+		if name != "--base" && name != "--commit" {
+			continue
+		}
+		if inline && value != "" || !inline && i+1 < len(rest) {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeCodexExecArgs(args []string) []string {

@@ -739,7 +739,7 @@ func TestCodexReconcileForGather_CountsAnAttemptOnTheDebt(t *testing.T) {
 	// The state a startup replay leaves behind: still owed, one attempt spent.
 	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 		codexOweRunRefresh(snap, runStart, now)
-		codexCountRefreshAttempt(snap)
+		codexCountRefreshAttempt(snap, codexDebtID{floorMs: runStart.UnixMilli(), owedAtMs: now.UnixMilli()})
 	}) {
 		t.Fatal("seeding the debt failed")
 	}
@@ -1164,6 +1164,7 @@ func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
 		t.Fatal("seeding the debt failed")
 	}
 
+	debt := codexDebtID{floorMs: runStart.UnixMilli(), owedAtMs: now.UnixMilli()}
 	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
 	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 30*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
@@ -1171,7 +1172,7 @@ func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
 	func() {
 		codexRateLimitMu.Lock()
 		defer codexRateLimitMu.Unlock()
-		codexRecordRefreshAttempt(f.fp, 1)
+		codexRecordRefreshAttempt(f.fp, debt, 1)
 	}()
 	if snap := f.snapshot(t); snap.RefreshOwedAttempts != 0 {
 		t.Fatalf("refused write recorded %d attempts, want none on disk", snap.RefreshOwedAttempts)
@@ -1179,7 +1180,7 @@ func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
 
 	// The next write folds the retained attempt in, so the run reaches the
 	// notice threshold on the attempts it actually spent.
-	codexRecordRefreshAttempt(f.fp, 1)
+	codexRecordRefreshAttempt(f.fp, debt, 1)
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAttempts != 2 {
 		t.Fatalf("RefreshOwedAttempts=%d, want the refused attempt folded in (2)", snap.RefreshOwedAttempts)
@@ -1379,5 +1380,52 @@ func TestDisarmCodexUsageRunFloor_RollsBackTheArmingAccount(t *testing.T) {
 	}
 	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
 		t.Fatalf("floor %d/%d survived the rollback, want it withdrawn", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+}
+
+// An attempt belongs to the debt it was spent on. A gather reads the debt,
+// reconciles it, and only then writes the count; a run settling in that window
+// installs a NEW debt whose counter was deliberately reset. Counting the older
+// reconcile there would march a brand-new run towards the stale warning on
+// scans that never looked at its floor — and the retained-count path must not
+// carry an increment across generations either.
+func TestCodexRecordRefreshAttempt_CountsOnlyTheReconciledDebt(t *testing.T) {
+	now := time.Now()
+	runA, runB := now.Add(-5*time.Minute), now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runA, now)
+	}) {
+		t.Fatal("seeding debt A failed")
+	}
+	debtA := codexRunFreshnessForAccount(f.fp, now).debtID()
+
+	// Run B settles before the attempt spent on A is recorded.
+	settledB := now.Add(time.Second)
+	if !codexRecordRunFreshness(f.fp, settledB, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runB, settledB)
+	}) {
+		t.Fatal("settling run B failed")
+	}
+	codexRecordRefreshAttempt(f.fp, debtA, 1)
+	if snap := f.snapshot(t); snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("RefreshOwedAttempts=%d after an attempt spent on the previous debt, want 0", snap.RefreshOwedAttempts)
+	}
+
+	// The same holds for a count retained by a refused write: it may only land
+	// on its own generation, so B's first real attempt counts once.
+	codexUsageRefresh.rememberAttempts(f.fp, debtA, 1)
+	debtB := codexRunFreshnessForAccount(f.fp, settledB).debtID()
+	if debtB == debtA || !debtB.valid() {
+		t.Fatalf("debtB=%+v must be a new generation (debtA=%+v)", debtB, debtA)
+	}
+	codexRecordRefreshAttempt(f.fp, debtB, 1)
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAttempts != 1 {
+		t.Fatalf("RefreshOwedAttempts=%d, want only B's own attempt (1)", snap.RefreshOwedAttempts)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, settledB)); notice != "" {
+		t.Fatalf("stale notice reached on a single attempt: %q", notice)
 	}
 }

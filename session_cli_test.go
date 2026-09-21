@@ -186,7 +186,14 @@ func TestCodexPromptTravelsOnArgv(t *testing.T) {
 		{"resume prompt behind a valued flag", []string{"--model", "o3", "resume", "--last", "follow-up"}, true},
 		{"resume flag value is not the prompt", []string{"resume", "--last", "--model", "o3"}, false},
 		{"review with prompt", []string{"review", "--base", "main", "check the diff"}, true},
-		{"review with no prompt", []string{"review", "--base", "main"}, false},
+		// `review` needs no prompt: naming the diff is enough to start it, and
+		// no SendInput ever follows, so the floor must be armed at start.
+		{"review targets the uncommitted diff", []string{"review", "--uncommitted"}, true},
+		{"review targets a base ref", []string{"review", "--base", "main"}, true},
+		{"review targets a base ref inline", []string{"review", "--base=main"}, true},
+		{"review targets a commit", []string{"review", "--commit", "abc123"}, true},
+		{"review with no target and no prompt", []string{"review"}, false},
+		{"review target flag missing its value", []string{"review", "--base"}, false},
 		{"prompt placed on stdin explicitly", []string{"resume", "--last", "-"}, false},
 		{"help is not a run", []string{"help"}, false},
 		// The automation flags sanitizeCodexExecArgs strips must not shift the
