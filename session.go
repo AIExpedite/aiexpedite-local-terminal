@@ -938,6 +938,14 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 			return
 		}
 	}
+	// The prompt only reached the child: a deferred one-shot session still
+	// holds its stdin open, and codex exec waits for EOF before running the
+	// turn. SendInput's own close was skipped when it gave up on this write, so
+	// close here — otherwise the run armed below never executes, and the child
+	// sits until it is killed, leaving refresh debt for a turn that never ran.
+	s.mu.Lock()
+	s.closeDeferredStdinLocked()
+	s.mu.Unlock()
 	s.armCodexUsageRun(time.Now())
 	// The prompt can arrive after the exit path has already run its settle,
 	// which found nothing armed. Settle here so the refresh is owed now,
@@ -947,6 +955,24 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 		s.settleCodexUsageRun()
 	default:
 	}
+}
+
+// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex)
+// started WITHOUT a prompt held open for its first message. codex exec reads
+// stdin to EOF before running the turn, so the pipe must close once that
+// prompt is written — otherwise the child waits forever for EOF. Called by
+// SendInput for a write that completed in time, and by
+// armCodexUsageRunOnLateWrite for one SendInput abandoned and the writer then
+// delivered. deferredStdinClose is cleared here, so those two never
+// double-close and a second SendInput is a no-op. Caller holds s.mu.
+func (s *CLISession) closeDeferredStdinLocked() {
+	if !s.deferredStdinClose {
+		return
+	}
+	s.deferredStdinClose = false
+	s.Stdin.Close()
+	fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
+		colorYellow, s.ID, s.Command, colorReset)
 }
 
 // settleCodexUsageRun hands the session's armed codex run to the freshness
@@ -1056,17 +1082,10 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		session.armCodexUsageRun(time.Now())
 	}
 
-	// One-shot, stdin-fed CLIs (codex) started without a prompt held
-	// their stdin open waiting for this first message. codex exec reads stdin
-	// to EOF before running, so close the pipe now that the prompt is written —
-	// otherwise the child waits forever for EOF. Done once: a subsequent
-	// SendInput hits an already-ended one-shot session.
-	if session.deferredStdinClose {
-		session.deferredStdinClose = false
-		session.Stdin.Close()
-		fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
-			colorYellow, id, session.Command, colorReset)
-	}
+	// One-shot, stdin-fed CLIs (codex) started without a prompt held their
+	// stdin open waiting for this first message; close it now that the prompt
+	// is written.
+	session.closeDeferredStdinLocked()
 
 	// Reset status from waiting_input back to running
 	if session.Status == "waiting_input" {

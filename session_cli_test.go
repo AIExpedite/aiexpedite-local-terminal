@@ -37,6 +37,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -3985,6 +3986,86 @@ func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
 	if started, settled = rec.counts(); started != 2 || settled != 1 {
 		t.Fatalf("started=%d settled=%d, want the post-exit write armed and settled once", started, settled)
 	}
+}
+
+// A deferred one-shot codex session holds its stdin open for its first
+// prompt, and codex exec waits for EOF before running the turn. SendInput's
+// timeout branch returns before its own close, so the late writer owns it:
+// without this the prompt lands, the run arms, and the child sits waiting for
+// an EOF that never comes until it is killed.
+func TestSendInputLateStdinWrite_ClosesDeferredStdin(t *testing.T) {
+	recordCodexRunHooks(t)
+	stdin := &countingWriteCloser{}
+	session := &CLISession{
+		Command:            "codex",
+		done:               make(chan struct{}),
+		Stdin:              stdin,
+		deferredStdinClose: true,
+	}
+
+	writeDone := make(chan error, 1)
+	writeDone <- nil
+	session.armCodexUsageRunOnLateWrite(writeDone)
+
+	if got := stdin.closes(); got != 1 {
+		t.Fatalf("stdin closed %d times, want the late write to close it once", got)
+	}
+	if session.deferredStdinClose {
+		t.Fatal("deferredStdinClose still set; a later SendInput would double-close")
+	}
+
+	// The flag is cleared, so the SendInput path cannot close it a second time.
+	session.mu.Lock()
+	session.closeDeferredStdinLocked()
+	session.mu.Unlock()
+	if got := stdin.closes(); got != 1 {
+		t.Fatalf("stdin closed %d times, want the deferred close to happen exactly once", got)
+	}
+}
+
+// A failed late write delivered nothing, so the deferred stdin must stay open:
+// the session is still waiting for a first prompt that can arrive later.
+func TestSendInputLateStdinWrite_KeepsDeferredStdinOpenOnFailure(t *testing.T) {
+	recordCodexRunHooks(t)
+	stdin := &countingWriteCloser{}
+	session := &CLISession{
+		Command:            "codex",
+		done:               make(chan struct{}),
+		Stdin:              stdin,
+		deferredStdinClose: true,
+	}
+
+	writeDone := make(chan error, 1)
+	writeDone <- errors.New("broken pipe")
+	session.armCodexUsageRunOnLateWrite(writeDone)
+
+	if got := stdin.closes(); got != 0 {
+		t.Fatalf("stdin closed %d times, want an undelivered prompt to leave it open", got)
+	}
+	if !session.deferredStdinClose {
+		t.Fatal("deferredStdinClose cleared for a write that never landed")
+	}
+}
+
+// countingWriteCloser is a session stdin pipe that counts its closes.
+type countingWriteCloser struct {
+	mu     sync.Mutex
+	closed int
+}
+
+func (c *countingWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+
+func (c *countingWriteCloser) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed++
+	return nil
+}
+
+func (c *countingWriteCloser) closes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // A write that fails, or one still blocked when the session ends, delivered
