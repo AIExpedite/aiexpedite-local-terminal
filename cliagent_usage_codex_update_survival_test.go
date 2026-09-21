@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,11 +278,12 @@ func TestCodexOwedRefresh_RefusedConversionStillSpendsTheWorkerAttempts(t *testi
 
 // The clock rolled back while the previous process still had a run unpaid, and
 // no run of THIS process has started yet to rebase it. Startup must not read
-// the future floor as a live debt: nothing — not even timestamp-less rollout
-// evidence, clamped to `now` — can cover a floor the wall clock has not
-// reached, so the replay would spend its reconcile on it, and every gather
-// after it would force a scan behind a stale notice naming a run time in the
-// future. The replay rebases the state instead and pays nothing.
+// the future floor as-is: nothing — not even timestamp-less rollout evidence,
+// clamped to `now` — can cover a floor the wall clock has not reached, and a
+// stale notice would name a run time in the future. The replay re-dates the
+// state onto `now`, the only trustworthy reading, and CARRIES THE DEBT OVER:
+// dropping it would forget the promised post-run refresh in exactly the
+// self-update case this path exists to recover.
 func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
@@ -292,37 +294,41 @@ func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *
 		codexArmRunFloor(snap, future)
 		codexOweRunRefresh(snap, future, future.Add(time.Minute))
 	})
-	if state := codexRunFreshnessForAccount(f.fp, now); !state.owed {
-		t.Fatalf("a future-dated debt reads as current until rebased: %+v", state)
-	}
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
 	waitCodexUsageRefreshIdle(t)
 
-	if codexGateHasRun(f.fp) {
-		t.Fatal("a floor no wall clock has reached must not be reconciled against")
+	if !codexGateHasRun(f.fp) {
+		t.Fatal("the carried-over debt must still be reconciled for")
 	}
 	snap := f.snapshot(t)
-	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
-		t.Fatalf("future-dated run state must be dropped at startup: %+v", snap)
+	if snap.RunFloorMs == 0 || snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("future-dated run state must be re-dated, not dropped: %+v", snap)
 	}
-	if state := codexRunFreshnessForAccount(f.fp, time.Now()); state.owed || state.interrupted {
-		t.Fatalf("rebased state still reads as outstanding: %+v", state)
+	if snap.RunFloorMs > time.Now().Add(codexRunFloorLocalSkew).UnixMilli() {
+		t.Fatalf("no floor may stay ahead of the wall clock: %+v", snap)
+	}
+	if snap.RefreshOwedAttempts != 1 {
+		t.Fatalf("replay spent %d reconciles, want exactly 1", snap.RefreshOwedAttempts)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, time.Now())); strings.Contains(notice, future.UTC().Format("2006-01-02 15:04")) {
+		t.Fatalf("no notice may name a run that has not happened: %q", notice)
 	}
 
 	// The same rollback with the run merely interrupted (armed, never settled)
-	// must not be converted into a debt at a future floor either.
+	// is carried over the same way: re-dated onto `now` and owed from there.
+	resetCodexUsageRefreshGate()
+	SetCodexUsageRefreshEnabled(true)
 	codexRecordRunFreshness(f.fp, future, func(snap *codexRateLimitSnapshot) {
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.RunFloorPaidMs = 0, 0, 0
 		codexArmRunFloor(snap, future)
 	})
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
 	waitCodexUsageRefreshIdle(t)
-	if codexGateHasRun(f.fp) {
-		t.Fatal("an interrupted run at a future floor must not be reconciled against")
-	}
-	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 {
-		t.Fatalf("future-dated interrupted run must be dropped, not owed: %+v", snap)
+	snap = f.snapshot(t)
+	if snap.RunFloorMs == 0 || snap.RunFloorMs > time.Now().Add(codexRunFloorLocalSkew).UnixMilli() {
+		t.Fatalf("an interrupted future-dated run must be re-dated onto now: %+v", snap)
 	}
 }

@@ -1727,15 +1727,44 @@ func TestCodexReconcileForGather_RebasesDebtLeftInTheFutureByAClockRollback(t *t
 	defer cancel()
 	codexReconcileForGather(ctx, codexHomeBase(), f.fp, now, false)
 
-	if codexGateHasRun(f.fp) {
-		t.Fatal("a routine gather must not force a reconcile onto a future floor")
+	snap := f.snapshot(t)
+	// The future timestamps go, but the DEBT they carried does not: it is
+	// re-dated onto `now`, the only trustworthy reading, so the refresh the
+	// run was promised is still owed and still coverable.
+	if snap.RunFloorMs != now.UnixMilli() || snap.RefreshOwedAtMs != now.UnixMilli() {
+		t.Fatalf("a rollback must carry the debt onto `now`, not drop it: %+v", snap)
+	}
+	if !codexGateHasRun(f.fp) {
+		t.Fatal("the carried-over debt must still be reconciled for")
+	}
+	state := codexRunFreshnessForAccount(f.fp, now)
+	if !state.owed {
+		t.Fatalf("the debt must survive the rebase: %+v", state)
+	}
+	if state.floor.After(now) {
+		t.Fatalf("no run time may stay ahead of the clock: %s", state.floor)
+	}
+}
+
+// The read-side rebase must not turn an ALREADY PAID run into a fresh debt:
+// nothing is outstanding, so there is nothing to carry over.
+func TestCodexRebaseFutureRunFreshness_LeavesAPaidRunRetired(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	future := now.Add(time.Hour)
+	if !codexRecordRunFreshness(f.fp, future, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, future)
+		snap.RunFloorPaidMs = future.UnixMilli()
+	}) {
+		t.Fatal("seeding the paid floor failed")
+	}
+
+	if !codexRebaseFutureRunFreshnessForAccount(f.fp, codexCacheViewForAccount(f.fp), now) {
+		t.Fatal("future-dated state must be rebased")
 	}
 	snap := f.snapshot(t)
-	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
-		t.Fatalf("future-dated debt must be dropped by the gather: %+v", snap)
-	}
-	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice != "" {
-		t.Fatalf("no stale notice may name a run that has not happened: %q", notice)
+	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("a run already paid for must not be re-owed by the rebase: %+v", snap)
 	}
 }
 

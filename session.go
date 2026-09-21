@@ -913,6 +913,68 @@ func (s *CLISession) armCodexUsageRun(at time.Time) {
 	codexUsageRunStarted(time.UnixMilli(floor))
 }
 
+// armCodexUsageRunOnLateWrite arms the run for a stdin write SendInput stopped
+// waiting on. The timeout branch neither closes stdin nor kills the child, so
+// the abandoned writer can still deliver the prompt — and a turn that reached
+// codex with nothing armed makes both terminal-event and exit settlement
+// no-ops, skipping the post-run refresh it owes. The wait is bounded by the
+// session itself: once it is gone, a write still blocked on its stdin can
+// never reach the child.
+func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return
+		}
+	case <-s.done:
+		// The write may have landed in the same moment the session ended;
+		// only a still-blocked one is abandoned here.
+		select {
+		case err := <-writeDone:
+			if err != nil {
+				return
+			}
+		default:
+			return
+		}
+	}
+	// The prompt only reached the child: a deferred one-shot session still
+	// holds its stdin open, and codex exec waits for EOF before running the
+	// turn. SendInput's own close was skipped when it gave up on this write, so
+	// close here — otherwise the run armed below never executes, and the child
+	// sits until it is killed, leaving refresh debt for a turn that never ran.
+	s.mu.Lock()
+	s.closeDeferredStdinLocked()
+	s.mu.Unlock()
+	s.armCodexUsageRun(time.Now())
+	// The prompt can arrive after the exit path has already run its settle,
+	// which found nothing armed. Settle here so the refresh is owed now,
+	// rather than left for the next process to recover as an interrupted run.
+	select {
+	case <-s.done:
+		s.settleCodexUsageRun()
+	default:
+	}
+}
+
+// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex)
+// started WITHOUT a prompt held open for its first message. codex exec reads
+// stdin to EOF before running the turn, so the pipe must close once that
+// prompt is written — otherwise the child waits forever for EOF. Called by
+// SendInput for a write that completed in time, and by
+// armCodexUsageRunOnLateWrite for one SendInput abandoned and the writer then
+// delivered. deferredStdinClose is cleared here, so those two never
+// double-close and a second SendInput is a no-op. Caller holds s.mu.
+func (s *CLISession) closeDeferredStdinLocked() {
+	if !s.deferredStdinClose {
+		return
+	}
+	s.deferredStdinClose = false
+	s.Stdin.Close()
+	fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
+		colorYellow, s.ID, s.Command, colorReset)
+}
+
 // settleCodexUsageRun hands the session's armed codex run to the freshness
 // path exactly once. No-op for a non-codex command, for a session whose prompt
 // never arrived (nothing armed), and for a run already settled by the earlier
@@ -1005,6 +1067,12 @@ func (sm *SessionManager) SendInput(id, text string) error {
 			return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
 		}
 	case <-time.After(10 * time.Second):
+		// The child is neither killed nor its stdin closed here, so the
+		// abandoned writer can still deliver this prompt. Keep watching it, so
+		// a codex turn that does reach the child still arms its run.
+		if isCodexCommand(session.Command) {
+			go session.armCodexUsageRunOnLateWrite(writeDone)
+		}
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}
 
@@ -1014,17 +1082,10 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		session.armCodexUsageRun(time.Now())
 	}
 
-	// One-shot, stdin-fed CLIs (codex) started without a prompt held
-	// their stdin open waiting for this first message. codex exec reads stdin
-	// to EOF before running, so close the pipe now that the prompt is written —
-	// otherwise the child waits forever for EOF. Done once: a subsequent
-	// SendInput hits an already-ended one-shot session.
-	if session.deferredStdinClose {
-		session.deferredStdinClose = false
-		session.Stdin.Close()
-		fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
-			colorYellow, id, session.Command, colorReset)
-	}
+	// One-shot, stdin-fed CLIs (codex) started without a prompt held their
+	// stdin open waiting for this first message; close it now that the prompt
+	// is written.
+	session.closeDeferredStdinLocked()
 
 	// Reset status from waiting_input back to running
 	if session.Status == "waiting_input" {

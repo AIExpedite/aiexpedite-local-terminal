@@ -1960,6 +1960,13 @@ func codexCacheViewForAccount(currentFingerprint string) codexCacheView {
 	if !ok || snap.AccountFingerprint != currentFingerprint {
 		return codexCacheView{contributors: map[string]map[string]codexRateLimitBucket{}}
 	}
+	return codexCacheViewFromSnapshot(snap)
+}
+
+// codexCacheViewFromSnapshot is codexCacheViewForAccount's projection without
+// the read, so a writer already inside a cache transaction can classify the
+// snapshot it is about to persist with the same helpers the read side uses.
+func codexCacheViewFromSnapshot(snap codexRateLimitSnapshot) codexCacheView {
 	return codexCacheView{
 		contributors:        codexContributorsFromSnapshot(snap),
 		limitNames:          snap.LimitNames,
