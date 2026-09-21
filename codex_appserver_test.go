@@ -1395,10 +1395,93 @@ func TestCodexAppServerSession_SingleShapeCompletionsSettleEveryTurn(t *testing.
 		t.Fatalf("settled %d of %d single-shape turns", settled, turns)
 	}
 	session.usageMu.Lock()
-	credits := session.usageCompletionCredits["turn.completed"]
+	shape, floors, overflow := session.usageCreditShape, len(session.usageTurnFloors), session.usageOverflowTurns
 	session.usageMu.Unlock()
-	if credits > codexAppServerMaxOpenUsageTurns {
-		t.Fatalf("credits grew to %d, want capped at %d", credits, codexAppServerMaxOpenUsageTurns)
+	if shape != "turn.completed" || floors != 0 || overflow != 0 {
+		t.Fatalf("credit=%q floors=%d overflow=%d after %d settled turns, want a single standing credit and nothing open",
+			shape, floors, overflow, turns)
+	}
+}
+
+// A turn that was ALREADY open when a credit was created announces itself much
+// later, so its lone completion must settle its own floor rather than be
+// mistaken for the credit-holder's partner shape. Without the credit window,
+// that completion is swallowed and the turn's floor stays open until the
+// process exits — no post-run reconcile, card pinned to a pre-run reading for
+// the life of the app-server.
+func TestCodexAppServerSession_LateCompletionDoesNotSpendStaleCredit(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(250 * time.Millisecond)
+	session.armUsageRun(first)
+	session.armUsageRun(second)
+
+	// Turn A finishes in ONE shape while turn B is still running.
+	at := second.Add(time.Second)
+	session.settleUsageRunAt("turn.completed", at)
+	if _, settled := rec.counts(); settled != 1 {
+		t.Fatalf("settled %d after the first turn's only completion, want 1", settled)
+	}
+
+	// Turn B finishes in the OTHER shape, well past the pairing window.
+	session.settleUsageRunAt("thread.completed", at.Add(codexAppServerCompletionPairWindow+time.Second))
+	settled := rec.settled
+	if len(settled) != 2 || !settled[1].Equal(second) {
+		t.Fatalf("settled=%v after the second turn's completion, want it settled at %s", settled, second)
+	}
+
+	// Back-to-back shapes still pair: the partner arrives inside the window.
+	third := second.Add(time.Minute)
+	session.armUsageRun(third)
+	paired := third.Add(time.Second)
+	session.settleUsageRunAt("turn.completed", paired)
+	session.settleUsageRunAt("thread.completed", paired.Add(5*time.Millisecond))
+	if got := rec.settled; len(got) != 3 || !got[2].Equal(third) {
+		t.Fatalf("settled=%v after the third turn's paired completions, want exactly one more settle at %s", got, third)
+	}
+}
+
+// Past the open-turn cap the oldest floor is collapsed into an overflow
+// counter rather than forgotten: completions are matched to turns by position,
+// so dropping the entry outright would settle turn N+1 on completion N and
+// leave the LAST turn's completion with no floor at all — its debt created
+// early (and payable by mid-run telemetry) and its real completion a no-op.
+func TestCodexAppServerSession_OverflowKeepsCompletionAlignment(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	base := time.UnixMilli(1_700_000_000_000)
+	const turns = codexAppServerMaxOpenUsageTurns + 2
+	for i := 0; i < turns; i++ {
+		session.armUsageRun(base.Add(time.Duration(i) * time.Second))
+	}
+	session.usageMu.Lock()
+	overflow, listed := session.usageOverflowTurns, len(session.usageTurnFloors)
+	session.usageMu.Unlock()
+	if overflow != turns-codexAppServerMaxOpenUsageTurns || listed != codexAppServerMaxOpenUsageTurns {
+		t.Fatalf("overflow=%d listed=%d after %d overlapping turns, want %d/%d",
+			overflow, listed, turns, turns-codexAppServerMaxOpenUsageTurns, codexAppServerMaxOpenUsageTurns)
+	}
+
+	// Every turn completes, one shape each, spaced past the pairing window.
+	at := base.Add(time.Hour)
+	for i := 0; i < turns; i++ {
+		session.settleUsageRunAt("turn.completed", at.Add(time.Duration(i)*time.Minute))
+	}
+	if _, settled := rec.counts(); settled != turns {
+		t.Fatalf("settled %d of %d turns, want every completion to settle a floor", settled, turns)
+	}
+	// The newest turn is settled by the LAST completion, not by an earlier one
+	// while it was still running.
+	newest := base.Add(time.Duration(turns-1) * time.Second)
+	if got := rec.settled[turns-1]; !got.Equal(newest) {
+		t.Fatalf("final completion settled floor %s, want the newest turn's %s", got, newest)
+	}
+	session.usageMu.Lock()
+	overflow, listed = session.usageOverflowTurns, len(session.usageTurnFloors)
+	session.usageMu.Unlock()
+	if overflow != 0 || listed != 0 {
+		t.Fatalf("overflow=%d listed=%d once every turn completed, want nothing open", overflow, listed)
 	}
 }
 

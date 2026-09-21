@@ -178,25 +178,51 @@ type CodexAppServerSession struct {
 	// telemetry (cliagent_usage_codex_freshness.go). Guarded by usageMu.
 	usageMu         sync.Mutex
 	usageTurnFloors []int64
-	// usageCompletionCredits pairs the two shapes one finished turn may
-	// announce itself in (codexRunCompletionShape). Settling on the first
-	// leaves a credit under its shape; the partner shape arriving later spends
-	// that credit instead of settling ANOTHER open turn — with overlapping
-	// turns, the second announcement would otherwise retire a turn still
-	// running. Keyed by the opaque shape label; capped per shape. A credit is
-	// only meaningful for the turn that left it, and completions carry no
-	// identity this file may read, so it EXPIRES when the next turn opens: a
-	// server speaking one shape only would otherwise bank a credit that the
-	// partner shape spends against some unrelated LATER turn, retiring nothing
-	// and leaving that turn's floor open until the process exits.
-	usageCompletionCredits map[string]int
+	// usageCreditShape / usageCreditAtMs pair the two shapes one finished turn
+	// may announce itself in (codexRunCompletionShape). Settling on the first
+	// leaves a credit labelled with its shape; the partner shape arriving
+	// later spends that credit instead of settling ANOTHER open turn — with
+	// overlapping turns, the second announcement would otherwise retire a turn
+	// still running. Only ONE credit is ever live: a turn's two announcements
+	// are consecutive, so a newer completion replaces any credit still
+	// standing.
+	//
+	// A credit is only meaningful for the turn that left it, and the two
+	// shapes carry DIFFERENT identities for the same turn (`turn.completed`
+	// names a turn, `thread.completed` a thread), so there is nothing to
+	// correlate them by. It is therefore bounded twice: it expires when the
+	// next turn opens, and — because a turn ALREADY open when the credit was
+	// created can announce itself in the partner shape much later — it also
+	// expires codexAppServerCompletionPairWindow after it was created. The two
+	// announcements of one turn arrive back to back, so the window keeps them
+	// paired while letting a later turn's lone completion settle its own floor
+	// instead of being swallowed.
+	usageCreditShape string
+	usageCreditAtMs  int64
+	// usageOverflowTurns / usageOverflowFloor stand in for turns dropped from
+	// usageTurnFloors at the cap. Completions are matched to floors by
+	// position, so simply forgetting a floor would shift every later
+	// completion onto the wrong turn — and leave the final turn's completion
+	// with no floor at all. The dropped turns keep a COUNT (memory stays
+	// bounded) plus the newest floor among them, and a completion drains that
+	// count before touching usageTurnFloors, so the alignment survives.
+	usageOverflowTurns int
+	usageOverflowFloor int64
 }
+
+// codexAppServerCompletionPairWindow bounds how long a completion credit may
+// stand. A turn that announces itself in both shapes emits them back to back;
+// anything arriving later is a different turn's completion and must settle its
+// own floor. See usageCreditShape.
+const codexAppServerCompletionPairWindow = 2 * time.Second
 
 // codexAppServerMaxOpenUsageTurns bounds usageTurnFloors. A turn whose
 // completion never arrives (a `turn/start` the child rejected, say) would
 // otherwise leave its floor behind for the life of the session; past the cap
-// the OLDEST floor is dropped, which loses nothing — the freshness layer
-// coalesces concurrent runs onto the newest floor anyway.
+// the OLDEST floors collapse into usageOverflowTurns — their exact instants
+// are lost, but the freshness layer coalesces concurrent runs onto the newest
+// floor anyway, and the entry itself is kept so completion-to-floor alignment
+// does not shift.
 const codexAppServerMaxOpenUsageTurns = 64
 
 // armUsageRun anchors a new utilization run at `at` — a turn the client just
@@ -206,9 +232,9 @@ const codexAppServerMaxOpenUsageTurns = 64
 func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 	floor := at.UnixMilli()
 	s.usageMu.Lock()
-	s.usageCompletionCredits = nil
+	s.clearUsageCreditLocked()
 	if len(s.usageTurnFloors) >= codexAppServerMaxOpenUsageTurns {
-		s.usageTurnFloors = s.usageTurnFloors[1:]
+		s.overflowOldestUsageTurnLocked()
 	}
 	s.usageTurnFloors = append(s.usageTurnFloors, floor)
 	s.usageMu.Unlock()
@@ -273,6 +299,9 @@ func (m *CodexAppServerManager) newestOpenUsageFloor(except *CodexAppServerSessi
 	for _, session := range open {
 		session.usageMu.Lock()
 		floor := newestFloor(session.usageTurnFloors)
+		if session.usageOverflowFloor > floor {
+			floor = session.usageOverflowFloor
+		}
 		session.usageMu.Unlock()
 		if floor > newest {
 			newest = floor
@@ -301,9 +330,9 @@ func newestFloor(floors []int64) int64 {
 func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 	floor := at.UnixMilli()
 	s.usageMu.Lock()
-	opened := len(s.usageTurnFloors) == 0
+	opened := len(s.usageTurnFloors) == 0 && s.usageOverflowTurns == 0
 	if opened {
-		s.usageCompletionCredits = nil
+		s.clearUsageCreditLocked()
 		s.usageTurnFloors = append(s.usageTurnFloors, floor)
 	}
 	s.usageMu.Unlock()
@@ -325,29 +354,41 @@ func (s *CodexAppServerSession) openUsageRun(at time.Time) {
 // `shape` is the completion's label (codexRunCompletionShape). A turn may
 // announce its end in two shapes back to back; the second is the SAME turn
 // finishing, not the next one, so it spends the credit the first left instead
-// of popping another floor. A credit only stands for the turn that left it:
-// opening the NEXT turn discards it (see usageCompletionCredits), so a
-// dialect that speaks one shape only can never bank a credit that a later,
-// unrelated partner-shape completion spends in place of settling the turn it
-// announces.
+// of popping another floor. A credit only stands for the turn that left it
+// (see usageCreditShape): opening the NEXT turn discards it, and it lapses
+// after codexAppServerCompletionPairWindow, so neither a one-shape dialect nor
+// a turn that was ALREADY open when the credit was created can have its own
+// lone completion swallowed as someone else's partner shape.
 func (s *CodexAppServerSession) settleUsageRun(shape string) {
+	s.settleUsageRunAt(shape, time.Now())
+}
+
+// settleUsageRunAt is settleUsageRun with the arrival instant supplied, so the
+// credit window (codexAppServerCompletionPairWindow) is testable.
+func (s *CodexAppServerSession) settleUsageRunAt(shape string, now time.Time) {
+	nowMs := now.UnixMilli()
 	s.usageMu.Lock()
-	for other, credits := range s.usageCompletionCredits {
-		if other == shape || credits <= 0 {
-			continue
-		}
-		s.usageCompletionCredits[other] = credits - 1
+	if s.usageCreditShape != "" && s.usageCreditShape != shape &&
+		nowMs-s.usageCreditAtMs <= codexAppServerCompletionPairWindow.Milliseconds() {
+		// The partner shape of the turn that left the credit: the same turn
+		// finishing, not another one.
+		s.clearUsageCreditLocked()
 		s.usageMu.Unlock()
 		return
 	}
-	if s.usageCompletionCredits == nil {
-		s.usageCompletionCredits = map[string]int{}
-	}
-	if s.usageCompletionCredits[shape] < codexAppServerMaxOpenUsageTurns {
-		s.usageCompletionCredits[shape]++
-	}
+	s.usageCreditShape = shape
+	s.usageCreditAtMs = nowMs
 	var floor int64
-	if len(s.usageTurnFloors) > 0 {
+	switch {
+	case s.usageOverflowTurns > 0:
+		// Oldest first: the collapsed turns were requested before every floor
+		// still listed, so they own the earliest completions.
+		floor = s.usageOverflowFloor
+		s.usageOverflowTurns--
+		if s.usageOverflowTurns == 0 {
+			s.usageOverflowFloor = 0
+		}
+	case len(s.usageTurnFloors) > 0:
 		floor = s.usageTurnFloors[0]
 		s.usageTurnFloors = s.usageTurnFloors[1:]
 	}
@@ -357,6 +398,28 @@ func (s *CodexAppServerSession) settleUsageRun(shape string) {
 	}
 }
 
+// clearUsageCreditLocked drops any standing completion credit. Callers hold
+// usageMu.
+func (s *CodexAppServerSession) clearUsageCreditLocked() {
+	s.usageCreditShape = ""
+	s.usageCreditAtMs = 0
+}
+
+// overflowOldestUsageTurnLocked collapses the oldest listed floor into the
+// overflow counter, keeping its slot so completions stay aligned with turns.
+// Callers hold usageMu.
+func (s *CodexAppServerSession) overflowOldestUsageTurnLocked() {
+	if len(s.usageTurnFloors) == 0 {
+		return
+	}
+	dropped := s.usageTurnFloors[0]
+	s.usageTurnFloors = s.usageTurnFloors[1:]
+	if dropped > s.usageOverflowFloor {
+		s.usageOverflowFloor = dropped
+	}
+	s.usageOverflowTurns++
+}
+
 // settleOpenUsageRuns settles every turn still open at process exit as one
 // run anchored at the NEWEST floor — the freshness layer coalesces concurrent
 // runs onto the newest floor, so one settle records the same debt several
@@ -364,7 +427,12 @@ func (s *CodexAppServerSession) settleUsageRun(shape string) {
 func (s *CodexAppServerSession) settleOpenUsageRuns() {
 	s.usageMu.Lock()
 	newest := newestFloor(s.usageTurnFloors)
+	if s.usageOverflowFloor > newest {
+		newest = s.usageOverflowFloor
+	}
 	s.usageTurnFloors = nil
+	s.usageOverflowTurns = 0
+	s.usageOverflowFloor = 0
 	s.usageMu.Unlock()
 	if newest > 0 {
 		codexUsageRunSettled(time.UnixMilli(newest))
