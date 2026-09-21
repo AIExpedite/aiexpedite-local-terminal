@@ -755,6 +755,38 @@ func codexRecordRunFreshness(fingerprint string, now time.Time, mutate func(snap
 	})
 }
 
+// codexRecordRunFloorWrite applies a run-floor mutation for `fingerprint`
+// through the blocking transaction, but ABANDONS it when the write would
+// rescope the snapshot away from an account that is live now. Arms and
+// withdrawals are written by their own retried goroutines against the account
+// captured when the run started, and codexScopeSnapshotToAccount discards
+// everything the snapshot holds for any other account. A write delayed past a
+// credentials swap — long enough for the new account to have written its own
+// telemetry — would therefore delete the live account's metrics and rollout
+// progress to book a run whose telemetry is already unreachable
+// (codexRefreshAfterRun drops such a run for the same reason). Dropping the
+// delayed write instead costs nothing: the swap's own rescope already cleared
+// the previous account's floor and debt. The snapshot still being the arming
+// account's is NOT such a case — that is the ordinary "swap seen before any
+// write from the new account" ordering, where the floor and its rollback must
+// still be booked against the account that made the run.
+//
+// Reports whether the write is finished with, so a refused lock is retried but
+// an abandoned write is not.
+func codexRecordRunFloorWrite(fingerprint string, now time.Time, mutate func(snap *codexRateLimitSnapshot)) bool {
+	var abandoned bool
+	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fingerprint && codexAccountFingerprintAtBase(codexHomeBase()) != fingerprint {
+			abandoned = true
+			return false
+		}
+		codexScopeSnapshotToAccount(snap, fingerprint)
+		mutate(snap)
+		return true
+	})
+	return committed || abandoned
+}
+
 // codexArmRunFloor records a run start. An unpaid debt keeps its (older)
 // floor: evidence covering the earlier run's start is what that debt waits on,
 // and moving the floor later would make it stricter than the run it describes.
@@ -990,7 +1022,7 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 				return
 			}
 			now := codexUsageFreshnessNow()
-			if codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+			if codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
 				// Withdrawn (codexUsageRunDisarmed) before this write landed: the
 				// run never happened, so its floor must not reach disk at all.
 				if codexUsageRefresh.takeDisarmed(fp, startedAt.UnixMilli()) {
@@ -1035,7 +1067,7 @@ func disarmCodexUsageRunFloor(floor, fallback time.Time) {
 				return
 			}
 			var reached bool
-			if codexRecordRunFreshness(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+			if codexRecordRunFloorWrite(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
 				reached = true
 				if codexDisarmRunFloor(snap, floorMs, fallbackMs) {
 					// The arm had landed; the mark has nothing left to stop.
@@ -1487,7 +1519,9 @@ func codexRunCompletionFrame(line string) bool {
 // turn on it — without learning what either name means.
 func codexRunCompletionShape(line string) string {
 	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "completed") {
+	// "complete", not "completed": legacy builds spell their terminal event
+	// `task_complete`.
+	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "complete") {
 		return ""
 	}
 	var raw map[string]interface{}
@@ -1495,8 +1529,8 @@ func codexRunCompletionShape(line string) string {
 		return ""
 	}
 	for _, name := range codexFrameEventNames(raw) {
-		if codexCompletionEventName(name) {
-			return codexNormalizeCompletionName(name)
+		if label := codexCompletionEventLabel(name); label != "" {
+			return label
 		}
 	}
 	return ""
@@ -1610,11 +1644,7 @@ func codexTurnScopedEventName(name string) bool {
 		return true
 	}
 	// Legacy `codex/event/<name>` builds nest the bare name under params.msg.
-	bare := trimmed
-	if idx := strings.LastIndexAny(bare, "/."); idx >= 0 {
-		bare = bare[idx+1:]
-	}
-	switch bare {
+	switch codexBareEventName(trimmed) {
 	case "task_started", "task_complete", "agent_message", "agent_message_delta",
 		"agent_reasoning", "agent_reasoning_delta", "exec_command_begin", "exec_command_end",
 		"patch_apply_begin", "patch_apply_end", "mcp_tool_call_begin", "mcp_tool_call_end",
@@ -1627,11 +1657,34 @@ func codexTurnScopedEventName(name string) bool {
 // codexCompletionEventName matches a turn-completion event name, tolerating the
 // `codex/event/<name>` prefix app-server notifications may carry.
 func codexCompletionEventName(name string) bool {
-	switch codexNormalizeCompletionName(name) {
-	case "turn.completed", "thread.completed":
-		return true
+	return codexCompletionEventLabel(name) != ""
+}
+
+// codexCompletionEventLabel is codexCompletionEventName's classifying form: the
+// opaque label a completion is paired by, or "" when the name announces no
+// completion. Legacy `codex/event/task_complete` builds — which never send a
+// `turn.completed`/`thread.completed` notification — end a turn with that event
+// alone, so it has to settle the run rather than fall through to the
+// turn-scoped progress fallback, which would re-open the very turn that just
+// finished and defer every per-turn reconcile to process exit.
+func codexCompletionEventLabel(name string) string {
+	if normalized := codexNormalizeCompletionName(name); normalized == "turn.completed" || normalized == "thread.completed" {
+		return normalized
 	}
-	return false
+	if codexBareEventName(name) == "task_complete" {
+		return "task_complete"
+	}
+	return ""
+}
+
+// codexBareEventName reduces a legacy `codex/event/<name>` notification method
+// (or an already-bare event `type`) to `<name>`.
+func codexBareEventName(name string) string {
+	bare := strings.TrimPrefix(name, "codex/event/")
+	if idx := strings.LastIndexAny(bare, "/."); idx >= 0 {
+		bare = bare[idx+1:]
+	}
+	return bare
 }
 
 // codexNormalizeCompletionName reduces a method or event name to its bare

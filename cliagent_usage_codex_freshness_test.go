@@ -1888,3 +1888,89 @@ func TestCodexOweRunRefresh_KeepsAnOrdinaryRunStartAsItsFloor(t *testing.T) {
 		t.Fatalf("a forward-running clock must leave the run start alone: %+v", snap)
 	}
 }
+
+// Legacy app-server builds end a turn with `codex/event/task_complete` and
+// never send a `turn.completed`/`thread.completed` notification. Classifying
+// it as mere progress would re-open the very turn that just finished, deferring
+// every per-turn reconcile to process exit and mis-aligning later completions
+// with their floors.
+func TestCodexRunCompletionShape_SettlesLegacyTaskComplete(t *testing.T) {
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","method":"codex/event/task_complete","params":{"msg":{"type":"task_complete"}}}`,
+		`{"type":"task_complete"}`,
+	} {
+		if shape := codexRunCompletionShape(line); shape != "task_complete" {
+			t.Errorf("codexRunCompletionShape(%s) = %q, want %q", line, shape, "task_complete")
+		}
+		if codexRunProgressFrame(line) {
+			t.Errorf("codexRunProgressFrame(%s) = true; a completion never opens a run", line)
+		}
+	}
+	// The modern spellings keep their own labels, so a turn announced in both
+	// shapes still pairs onto one run.
+	for line, want := range map[string]string{
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{}}`:                                        "turn.completed",
+		`{"type":"thread.completed"}`:                                                                    "thread.completed",
+		`{"jsonrpc":"2.0","method":"codex/event/task_started","params":{"msg":{"type":"task_started"}}}`: "",
+		`{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agent_message"}}}`:         "",
+	} {
+		if shape := codexRunCompletionShape(line); shape != want {
+			t.Errorf("codexRunCompletionShape(%s) = %q, want %q", line, shape, want)
+		}
+	}
+}
+
+// An arm or withdrawal delayed past a credentials swap must not rescope the
+// cache back to the account that made the run: the account signed in now has
+// already written its own telemetry there, and reinstating the old account
+// would delete it (leaving the card on unknown usage) to book a run whose
+// telemetry is unreachable anyway. A snapshot still held by the arming account
+// is the ordinary ordering and must still be written.
+func TestCodexRecordRunFloorWrite_DropsADelayedWriteForASwappedAccount(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+	next := currentCodexAccountFingerprint()
+	if next == f.fp {
+		t.Fatal("the swapped account must have its own fingerprint")
+	}
+
+	// The swap has happened, but the new account has written nothing yet: the
+	// snapshot is still the arming account's, so its floor must still land.
+	if !codexRecordRunFloorWrite(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, runStart)
+	}) {
+		t.Fatal("the first write for a swapped-away account must still be committed")
+	}
+	if snap := f.snapshot(t); snap.AccountFingerprint != f.fp || snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("arming account write did not land: %+v", snap)
+	}
+
+	// The new account now writes its own telemetry, rescoping the cache.
+	mergeCodexRateLimitCache(f.cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 33, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, next)
+
+	// A write for the previous account delayed past that point is abandoned.
+	if !codexRecordRunFloorWrite(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, runStart)
+	}) {
+		t.Fatal("an abandoned write must report itself finished, not be retried forever")
+	}
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != next {
+		t.Fatalf("cache rescoped to %q, want the account signed in now (%q)", snap.AccountFingerprint, next)
+	}
+	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 33 {
+		t.Fatalf("the live account's reading was discarded: used=%v, want 33", got)
+	}
+	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("floor %d/%d booked on the live account, want none", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+}
