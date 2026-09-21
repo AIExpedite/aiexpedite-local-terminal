@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0 // direct
-	cloud.google.com/go/storage v1.67.1 // direct
+	cloud.google.com/go/storage v1.68.0 // direct
 	github.com/BurntSushi/toml v1.6.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
 	golang.org/x/mod v0.41.0 // semver‑compare helper
@@ -17,7 +17,7 @@ require (
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.23.0
 	golang.org/x/time v0.16.0
-	google.golang.org/api v0.297.0
+	google.golang.org/api v0.298.0
 )
 
 require (
