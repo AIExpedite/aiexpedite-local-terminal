@@ -29,10 +29,12 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -3745,5 +3747,84 @@ func TestSessionLifecycle_NonCodexCommandSkipsUsageFreshness(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if started, settled := rec.counts(); started != 0 || settled != 0 {
 		t.Fatalf("started=%d settled=%d, want none for a non-codex command", started, settled)
+	}
+}
+
+// A stdin-fed codex session started WITHOUT a prompt (the chat-direct flow)
+// is only waiting for its first SendInput: its run is armed when that prompt
+// is delivered, not at process start, so the floor sits at/after delivery and
+// telemetry from another run during the wait cannot pass as this session's
+// reading. It still settles exactly once.
+func TestSessionLifecycle_CodexDeferredPromptArmsOnDelivery(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	beforeStart := time.Now()
+	_, messages, err := captureSession(t, "codex-reads-stdin", "codex", []string{}, "Hi there")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+
+	settled := rec.waitSettled(t, 1)
+	time.Sleep(50 * time.Millisecond)
+	started, settledCount := rec.counts()
+	if started != 1 || settledCount != 1 {
+		t.Fatalf("started=%d settled=%d, want exactly one of each", started, settledCount)
+	}
+	rec.mu.Lock()
+	floor := rec.started[0]
+	rec.mu.Unlock()
+	if floor.Before(beforeStart) {
+		t.Fatalf("armed at %s, before the session started %s", floor, beforeStart)
+	}
+	if !settled[0].Equal(floor) {
+		t.Fatalf("settled with floor %s, want the delivered prompt's floor %s", settled[0], floor)
+	}
+}
+
+// A deferred codex session closed before any prompt was delivered never ran:
+// nothing is armed, so the exit path has no run to settle into a debt that
+// would age into a stale-utilization warning.
+func TestSessionLifecycle_CodexDeferredPromptNeverDeliveredSettlesNothing(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(tmpDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-reads-stdin")
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("codex-deferred-%d", time.Now().UnixNano())
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, "codex", []string{}, tmpDir, "ws", "uid", 30000, false, func(resultMsg) {})
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if startErr != nil {
+		t.Fatalf("StartSession: %v", startErr)
+	}
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("after start without a prompt: started=%d settled=%d, want nothing armed", started, settled)
+	}
+
+	// Close it while the child is still waiting on stdin: no prompt ever went in.
+	if err := sm.EndSession(id); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+	waitForManagedSessionDrained(t, sm, id)
+	time.Sleep(50 * time.Millisecond)
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after closing a never-prompted session, want none", started, settled)
 	}
 }

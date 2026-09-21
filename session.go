@@ -153,12 +153,20 @@ type CLISession struct {
 	// stream reader writes it and waitForExit reads it.
 	turnSettled atomic.Bool
 
-	// codexUsageSettled is set once a codex session's run has been handed to
-	// codexUsageRunSettled — on its first terminal event (turn.completed /
-	// thread.completed) or, failing that, on exit — so a run is settled exactly
-	// once. Unlike turnSettled it is not cleared per line: codex emits BOTH
-	// terminal events for one turn. Only an accepted follow-up turn (SendInput)
-	// reopens it.
+	// codexUsageFloorMs is the floor a codex session's utilization run is
+	// measured against — the moment its prompt was DELIVERED to the child
+	// (armCodexUsageRun). Zero until then: a stdin-fed session started without
+	// a prompt (deferredStdinClose) only waits for its first SendInput, so a
+	// floor armed at start would let telemetry from some other run during that
+	// wait pass as this session's reading, and closing the session before any
+	// prompt arrived would settle a run that never happened into a debt no
+	// telemetry can pay. codexUsageSettled is set once the armed run has been
+	// handed to codexUsageRunSettled — on its first terminal event
+	// (turn.completed / thread.completed) or, failing that, on exit — so a run
+	// is settled exactly once. Unlike turnSettled it is not cleared per line:
+	// codex emits BOTH terminal events for one turn. Only a delivered
+	// follow-up turn (SendInput) re-arms it.
+	codexUsageFloorMs atomic.Int64
 	codexUsageSettled atomic.Bool
 
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
@@ -718,10 +726,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
 	}
 	// A codex run's utilization is owed from its start; the terminal event or
-	// waitForExit settles it. Asynchronous — never holds sm.mu across the
-	// cache lock.
-	if isCodexCommand(session.Command) {
-		codexUsageRunStarted(session.StartedAt)
+	// waitForExit settles it. A session started WITHOUT a prompt is not running
+	// yet — its run is armed by the SendInput that delivers one. Asynchronous —
+	// never holds sm.mu across the cache lock.
+	if isCodexCommand(session.Command) && !session.deferredStdinClose {
+		session.armCodexUsageRun(session.StartedAt)
 	}
 
 	// Start output reader goroutines
@@ -810,6 +819,34 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
    SendInput — write to a session's stdin
    -------------------------------------------------------------------------- */
 
+// armCodexUsageRun anchors the session's codex utilization run at `at`, the
+// moment its prompt reached the child, and hands the start to the freshness
+// path. Re-arming for a delivered follow-up turn moves the floor forward and
+// reopens the settle.
+func (s *CLISession) armCodexUsageRun(at time.Time) {
+	// Floors are persisted in milliseconds; arm at that precision so the
+	// start and settle describe the same instant.
+	floor := at.UnixMilli()
+	s.codexUsageFloorMs.Store(floor)
+	s.codexUsageSettled.Store(false)
+	codexUsageRunStarted(time.UnixMilli(floor))
+}
+
+// settleCodexUsageRun hands the session's armed codex run to the freshness
+// path exactly once. No-op for a non-codex command, for a session whose prompt
+// never arrived (nothing armed), and for a run already settled by the earlier
+// of its terminal event and its exit.
+func (s *CLISession) settleCodexUsageRun() {
+	if !isCodexCommand(s.Command) {
+		return
+	}
+	floor := s.codexUsageFloorMs.Load()
+	if floor <= 0 || !s.codexUsageSettled.CompareAndSwap(false, true) {
+		return
+	}
+	codexUsageRunSettled(time.UnixMilli(floor))
+}
+
 // SendInput writes text to the stdin of the specified session.
 // For Claude and Antigravity stream-json sessions, the text is wrapped in the
 // CLI's NDJSON user-message envelope. For other CLIs it is sent as raw text.
@@ -845,9 +882,10 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	// is accepted and before it produces its next line would otherwise still look
 	// settled to waitForExit and skip the abnormal-exit probe. Clearing early can
 	// at worst schedule one extra throttled probe for a write that then failed;
-	// the opposite error silently drops a turn's usage.
+	// the opposite error silently drops a turn's usage. A codex run, by
+	// contrast, is armed only once the write below has SUCCEEDED (see
+	// codexUsageFloorMs): its floor is the moment the prompt reached the child.
 	session.turnSettled.Store(false)
-	session.codexUsageSettled.Store(false)
 
 	// Write input with timeout to prevent deadlock if the CLI process's
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).
@@ -863,6 +901,12 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		}
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
+	}
+
+	// The prompt reached codex: this is where its run starts — for the
+	// deferred flow above all, whose session has been idle since StartSession.
+	if isCodexCommand(session.Command) {
+		session.armCodexUsageRun(time.Now())
 	}
 
 	// One-shot, stdin-fed CLIs (codex) started without a prompt held
@@ -1710,9 +1754,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// A finished codex turn owes the CLI Agents card a reading taken
 				// after it started (cliagent_usage_codex_freshness.go). Once per
 				// run: thread.completed follows turn.completed.
-				if isCodexCommand(session.Command) && session.codexUsageSettled.CompareAndSwap(false, true) {
-					codexUsageRunSettled(session.StartedAt)
-				}
+				session.settleCodexUsageRun()
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
@@ -2027,10 +2069,9 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
 	}
-	// Same for a codex run that never reached a terminal event.
-	if isCodexCommand(session.Command) && session.codexUsageSettled.CompareAndSwap(false, true) {
-		codexUsageRunSettled(session.StartedAt)
-	}
+	// Same for a codex run that never reached a terminal event. A session that
+	// never received its prompt has no run to settle.
+	session.settleCodexUsageRun()
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 

@@ -1291,3 +1291,111 @@ func TestCodexAppServerLifecycle_BetweenTurnReadingDoesNotOpenARun(t *testing.T)
 		t.Fatalf("started=%d settled=%d after a between-turn reading and exit, want exactly the one turn (1/1)", started, settled)
 	}
 }
+
+// Send serialises concurrent callers rather than rejecting an overlapping
+// turn, so two turns (on different threads) can be open at once. Each keeps
+// its own floor: the first completion settles the first turn only — it must
+// not retire the second turn, whose own completion would then be a no-op and
+// whose telemetry could be pre-empted by the first turn's tail — and the
+// second completion settles the second. Exercised on the session directly:
+// the echo mock completes every turn immediately, so it cannot overlap them.
+func TestCodexAppServerSession_OverlappingTurnsSettleIndependently(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(250 * time.Millisecond)
+	session.armUsageRun(first)
+	session.armUsageRun(second)
+	if started, settled := rec.counts(); started != 2 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after two turn requests, want 2/0", started, settled)
+	}
+
+	session.settleUsageRun()
+	if _, settled := rec.counts(); settled != 1 {
+		t.Fatalf("settled %d after the first completion, want 1", settled)
+	}
+	if got := rec.settled[0]; !got.Equal(first) {
+		t.Fatalf("first completion settled floor %s, want the first turn's %s", got, first)
+	}
+	// The second turn is still open: a between-turn progress frame must not
+	// re-anchor it, and process exit would still settle it.
+	session.openUsageRun(second.Add(time.Second))
+	if started, _ := rec.counts(); started != 2 {
+		t.Fatalf("started=%d after a progress frame with a turn open, want no new run", started)
+	}
+
+	session.settleUsageRun()
+	settled := rec.settled
+	if len(settled) != 2 || !settled[1].Equal(second) {
+		t.Fatalf("settled=%v after the second completion, want [%s %s]", settled, first, second)
+	}
+	// Nothing open: a stray completion settles nothing.
+	session.settleUsageRun()
+	session.settleOpenUsageRuns()
+	if _, n := rec.counts(); n != 2 {
+		t.Fatalf("settled %d after stray completions with nothing open, want 2", n)
+	}
+}
+
+// Turns still open at process exit settle as ONE run at the newest floor —
+// the freshness layer coalesces concurrent runs onto the newest floor, so one
+// settle records the same debt several would.
+func TestCodexAppServerSession_ExitSettlesOpenTurnsAtNewestFloor(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	session := &CodexAppServerSession{}
+	first := time.UnixMilli(1_700_000_000_000)
+	second := first.Add(250 * time.Millisecond)
+	session.armUsageRun(first)
+	session.armUsageRun(second)
+	session.settleOpenUsageRuns()
+	if _, n := rec.counts(); n != 1 {
+		t.Fatalf("settled %d at exit with two turns open, want one coalesced settle", n)
+	}
+	if got := rec.settled[0]; !got.Equal(second) {
+		t.Fatalf("exit settled floor %s, want the newest turn's %s", got, second)
+	}
+}
+
+// A turn request whose stdin write fails never reached the child: the floor
+// armed before the write is disarmed, so process exit does not settle a run
+// that never happened into a debt no telemetry can pay.
+func TestCodexAppServerLifecycle_FailedTurnWriteDisarmsUsageRun(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	session := m.Get(id)
+	if session == nil {
+		t.Fatal("session not registered")
+	}
+	// Swap the child's stdin for an already-closed pipe so the write fails
+	// immediately while the child itself stays alive (it still holds the real
+	// pipe, so Status stays "running" and Send reaches the write).
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.Close()
+	_ = w.Close()
+	realStdin := session.Stdin
+	session.stdinMu.Lock()
+	session.Stdin = w
+	session.stdinMu.Unlock()
+
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`); err == nil {
+		t.Fatal("Send on a closed stdin succeeded, want a write error")
+	}
+	if started, settled := rec.counts(); started != 1 || settled != 0 {
+		t.Fatalf("started=%d settled=%d after the failed write, want the arm (1) and no settle", started, settled)
+	}
+
+	session.stdinMu.Lock()
+	session.Stdin = realStdin
+	session.stdinMu.Unlock()
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, ended)
+	time.Sleep(200 * time.Millisecond)
+	if _, settled := rec.counts(); settled != 0 {
+		t.Fatalf("settled %d at exit after a turn request that never reached the child, want 0", settled)
+	}
+}
