@@ -189,8 +189,11 @@ type codexUsageRefreshGate struct {
 	// disarmed holds run starts withdrawn (codexUsageRunDisarmed) that may not
 	// have reached disk yet: an arm is written by its own retried goroutine,
 	// so the withdrawal can land first, and the late arm must then be dropped
-	// rather than persist a floor for a run that never happened.
-	disarmed map[string]map[int64]struct{}
+	// rather than persist a floor for a run that never happened. The value is
+	// a COUNT per (account, floor): floors are millisecond-truncated, so two
+	// turns armed inside the same millisecond whose writes both fail produce
+	// two withdrawals at one key, and each late arm must consume its own.
+	disarmed map[string]map[int64]int
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
 	// active counts the tracked goroutines spawn started; idle broadcasts when
@@ -244,7 +247,7 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		pending:         map[string]codexPendingRunDebt{},
 		pendingAttempts: map[string]codexRetainedAttempts{},
 		armed:           map[int64][]string{},
-		disarmed:        map[string]map[int64]struct{}{},
+		disarmed:        map[string]map[int64]int{},
 		cancel:          make(chan struct{}),
 	}
 }
@@ -506,20 +509,25 @@ func (g *codexUsageRefreshGate) markDisarmed(fp string, floorMs int64) {
 	defer g.mu.Unlock()
 	floors := g.disarmed[fp]
 	if floors == nil {
-		floors = map[int64]struct{}{}
+		floors = map[int64]int{}
 		g.disarmed[fp] = floors
 	}
-	floors[floorMs] = struct{}{}
+	floors[floorMs]++
 }
 
+// takeDisarmed consumes ONE withdrawal recorded at (fp, floorMs); it reports
+// false once every withdrawal at that key has been consumed.
 func (g *codexUsageRefreshGate) takeDisarmed(fp string, floorMs int64) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	floors := g.disarmed[fp]
-	if _, ok := floors[floorMs]; !ok {
+	if floors[floorMs] <= 0 {
 		return false
 	}
-	delete(floors, floorMs)
+	floors[floorMs]--
+	if floors[floorMs] == 0 {
+		delete(floors, floorMs)
+	}
 	if len(floors) == 0 {
 		delete(g.disarmed, fp)
 	}
@@ -567,7 +575,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.pendingAttempts = map[string]codexRetainedAttempts{}
 	codexUsageRefresh.armed = map[int64][]string{}
-	codexUsageRefresh.disarmed = map[string]map[int64]struct{}{}
+	codexUsageRefresh.disarmed = map[string]map[int64]int{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
 }

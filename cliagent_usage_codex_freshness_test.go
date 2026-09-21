@@ -1310,6 +1310,43 @@ func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *tes
 	}
 }
 
+// Floors are millisecond-truncated, so two turns armed in the same millisecond
+// share a key. When both writes fail before their arm transactions land, the
+// two withdrawals must be counted separately: a single mark would be consumed
+// by the first late arm, and the second would persist a floor for a turn that
+// never reached Codex — read back as an interrupted run at the next start.
+func TestDisarmCodexUsageRunFloor_CountsWithdrawalsThatShareAFloor(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	// Two withdrawals at one floor, then the two late arms they withdraw.
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	waitCodexUsageRefreshIdle(t)
+	armCodexUsageRunFloor(runStart)
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("a withdrawn arm reached disk: RunFloorMs=%d ActiveRunFloorMs=%d", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+	if codexUsageRefresh.takeDisarmed(f.fp, runStart.UnixMilli()) {
+		t.Fatal("each late arm must consume exactly one withdrawal, leaving none")
+	}
+	if state := codexRunFreshnessForAccount(f.fp, now); state.interrupted || state.owed {
+		t.Fatalf("withdrawn runs must owe nothing after a restart: %+v", state)
+	}
+
+	// The count is exact: a third arm at the same floor is a real run and
+	// must land.
+	armCodexUsageRunFloor(runStart)
+	waitCodexUsageRefreshIdle(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatalf("an arm with no withdrawal left must land: RunFloorMs=%d, want %d", snap.RunFloorMs, runStart.UnixMilli())
+	}
+}
+
 // A run armed under one account must never be settled as the NEXT account's
 // debt: the cache holds a single account's readings, so booking account A's
 // finished run against B gives B a run floor for a run it never made — which
