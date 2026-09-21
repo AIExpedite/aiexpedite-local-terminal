@@ -133,7 +133,7 @@ func waitCodexUsageRefreshIdle(t *testing.T) {
 	t.Helper()
 	done := make(chan struct{})
 	go func() {
-		codexUsageRefresh.wg.Wait()
+		codexUsageRefresh.waitIdle()
 		close(done)
 	}()
 	select {
@@ -577,6 +577,10 @@ func TestCodexBucketsFromRolloutFile_InferredAnchorScope(t *testing.T) {
 	stated := `{"timestamp":"` + statedAt.UTC().Format(time.RFC3339Nano) +
 		`","type":"event_msg","payload":{"type":"token_count","rate_limits":{"secondary":{"used_percent":40,"window_minutes":10080}}}}`
 	fresher := `{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12,"window_minutes":300}}}}`
+	completion := `{"type":"event_msg","payload":{"type":"turn.completed","turn_id":"t-1"}}`
+	// Mentions rate_limits (so it passes the prefilter) but carries no usable
+	// telemetry — still a later physical record.
+	unparseable := `{"type":"event_msg","payload":{"type":"agent_reasoning","text":"checking rate_limits"}}`
 
 	for _, tc := range []struct {
 		name         string
@@ -591,6 +595,12 @@ func TestCodexBucketsFromRolloutFile_InferredAnchorScope(t *testing.T) {
 		// anomaly from an earlier turn, not the finished run's evidence.
 		{"a stated frame anywhere disables inference", []string{stale, stated}, false, 0},
 		{"a stated frame before the candidate disables it too", []string{stated, stale}, false, 0},
+		// The mtime belongs to the file's newest append. When that append is a
+		// non-metric record — a turn completion, a reasoning item — the numeric
+		// frame before it is NOT what the mtime describes, so nothing may be
+		// inferred and the run's debt stays owed.
+		{"a non-metric last record invalidates the candidate", []string{stale, fresher, completion}, false, 0},
+		{"a non-telemetry rate-limit line invalidates it too", []string{stale, fresher, unparseable}, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "rollout.jsonl")
@@ -798,5 +808,126 @@ func TestCodexActiveRunFloor_ClearedWhenItsOwnRunSettles(t *testing.T) {
 	codexSettleRunFreshness(&expired, t0.Add(4*time.Minute).Add(codexRefreshOwedMaxAge+time.Minute))
 	if expired.RefreshOwedAtMs != 0 || expired.RunFloorMs != runB.UnixMilli() || expired.ActiveRunFloorMs != 0 {
 		t.Fatalf("an expired debt drops its own floor but hands over runB's: %+v", expired)
+	}
+}
+
+// Every arm is written by its own spawned goroutine, so two starts can reach the
+// snapshot out of order. The late, OLDER write must not lower the floor: a crash
+// before the newer run settled would otherwise be covered by evidence that
+// predates it, and that run would never be classified as interrupted.
+func TestCodexArmRunFloor_NeverMovesTheFloorBackwards(t *testing.T) {
+	t0 := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	runA, runB := t0, t0.Add(5*time.Minute)
+
+	// No debt outstanding: B lands first, A's delayed write must be a no-op.
+	reordered := codexRateLimitSnapshot{}
+	codexArmRunFloor(&reordered, runB)
+	codexArmRunFloor(&reordered, runA)
+	if reordered.RunFloorMs != runB.UnixMilli() || reordered.ActiveRunFloorMs != 0 {
+		t.Fatalf("the newest start must hold the floor: %+v", reordered)
+	}
+	state := codexRunFreshnessFromView(codexCacheView{
+		contributors: map[string]map[string]codexRateLimitBucket{
+			"5h": {"primary": {ObservedAtMs: t0.Add(2 * time.Minute).UnixMilli(), UsedPercentage: 40}},
+		},
+		runFloorMs: reordered.RunFloorMs,
+	}, t0.Add(6*time.Minute))
+	if !state.interrupted {
+		t.Fatalf("evidence taken before runB started cannot cover it: %+v", state)
+	}
+
+	// A debt outstanding: the same reordering must not lower the owed floor
+	// either, and the older start is already covered by it, so nothing parks.
+	owed := codexRateLimitSnapshot{}
+	codexArmRunFloor(&owed, runB)
+	codexOweRunRefresh(&owed, runB, t0.Add(6*time.Minute))
+	codexArmRunFloor(&owed, runA)
+	if owed.RunFloorMs != runB.UnixMilli() || owed.ActiveRunFloorMs != 0 {
+		t.Fatalf("a late older start must not lower an owed floor: %+v", owed)
+	}
+
+	// A floor parked behind a debt that has since cleared is folded in, not lost,
+	// when the next run arms.
+	parked := codexRateLimitSnapshot{}
+	codexArmRunFloor(&parked, runA)
+	codexOweRunRefresh(&parked, runA, t0.Add(4*time.Minute))
+	codexArmRunFloor(&parked, runB)
+	parked.RefreshOwedAtMs, parked.RefreshOwedAttempts = 0, 0
+	codexArmRunFloor(&parked, runB.Add(time.Minute))
+	if parked.RunFloorMs != runB.Add(time.Minute).UnixMilli() || parked.ActiveRunFloorMs != 0 {
+		t.Fatalf("a parked floor is folded in once nothing is owed: %+v", parked)
+	}
+}
+
+// Startup pays one owed debt. If that reconcile finds evidence covering the
+// older run and PROMOTES a newer floor parked behind it, that newer run — whose
+// process is equally gone — must become debt of its own: routine gathers force
+// only on `owed`, so an interrupted floor left un-owed is never refreshed.
+func TestPayOwedCodexUsageRefresh_OwesAPromotedInterruptedRun(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	runA, runB := now.Add(-10*time.Minute), now.Add(-2*time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	// The reading on disk predates runA, so the seeded debt is genuinely unpaid.
+	f.seedPreRunReading(t, now.Add(-15*time.Minute), now)
+	// The only evidence the startup reconcile can find sits BETWEEN the two
+	// starts: it covers runA and says nothing about runB.
+	writeCodexRunRollout(t, f.home, "between", runA, now.Add(-6*time.Minute), now.Add(-6*time.Minute), true,
+		[]map[string]any{{"primary": map[string]any{"used_percent": 55, "window_minutes": 300, "resets_in_seconds": 3600}}})
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.RunFloorMs = runA.UnixMilli()
+		snap.RefreshOwedAtMs = now.Add(-9 * time.Minute).UnixMilli()
+		snap.ActiveRunFloorMs = runB.UnixMilli()
+	}) {
+		t.Fatal("seeding the owed + parked state was refused")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.ActiveRunFloorMs != runB.UnixMilli() {
+		t.Fatalf("fixture must start with runA owed and runB parked: %+v", snap)
+	}
+
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RunFloorMs != runB.UnixMilli() {
+		t.Fatalf("runB's parked floor must be promoted by the reconcile: %+v", snap)
+	}
+	if snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("the promoted interrupted run must be owed a refresh of its own: %+v", snap)
+	}
+	if snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("nothing is parked behind runB's own debt: %+v", snap)
+	}
+	// Sanity: the reconcile really did land runA's evidence.
+	if got := codexLatestContributorObservation(snap.Contributors); got.Before(now.Add(-7 * time.Minute)) {
+		t.Fatalf("latest observation %s, want the rollout frame at %s", got, now.Add(-6*time.Minute))
+	}
+}
+
+// The floor a turn is measured against is the moment the turn was REQUESTED.
+// Recognizing the request shapes keeps codex_appserver.go free of JSON-RPC
+// semantics, exactly like codexRunCompletionFrame.
+func TestCodexRunStartFrame(t *testing.T) {
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{"threadId":"thr","input":[]}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"turn.start","params":{}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"codex/turn/start","params":{}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"sendUserTurn","params":{}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"sendUserMessage","params":{}}`,
+	} {
+		if !codexRunStartFrame(line) {
+			t.Errorf("codexRunStartFrame(%s) = false, want true", line)
+		}
+	}
+	for _, line := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}`,
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"account/rateLimits/read","params":{}}`,
+		`not json`,
+		``,
+	} {
+		if codexRunStartFrame(line) {
+			t.Errorf("codexRunStartFrame(%s) = true, want false", line)
+		}
 	}
 }

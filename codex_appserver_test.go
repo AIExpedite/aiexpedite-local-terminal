@@ -529,6 +529,18 @@ func runMockCodexAppServer() {
 				}
 				_ = json.NewEncoder(os.Stdout).Encode(resp)
 			}
+		case "account/rateLimits/read":
+			// A between-turn reading: real app-servers answer this while no turn
+			// is running, and the reply carries numeric utilization.
+			if hasID {
+				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      id,
+					"result": map[string]any{"rateLimits": map[string]any{
+						"primary": map[string]any{"used_percent": 7, "window_minutes": 300},
+					}},
+				})
+			}
 		case "turn/start":
 			if hasID {
 				_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
@@ -1119,12 +1131,16 @@ func TestCodexAppServerLifecycle_SettlesUsageFreshnessPerTurn(t *testing.T) {
 	turn := func(n int) string {
 		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`, n)
 	}
+	requested := time.Now()
 	if err := m.Send(id, turn(1)); err != nil {
 		t.Fatalf("Send turn 1: %v", err)
 	}
 	first := rec.waitSettled(t, 1)
-	if first[0].UnixMilli() != session.StartedAt.UnixMilli() {
-		t.Fatalf("first turn settled with floor %s, want the session start %s", first[0], session.StartedAt)
+	// The floor is the moment the TURN was requested, not the session start: a
+	// rate-limit frame delivered during initialization must not pass as this
+	// turn's reading. Floors are persisted in milliseconds, so compare there.
+	if first[0].UnixMilli() < requested.UnixMilli() {
+		t.Fatalf("first turn settled with floor %s, want one at/after the turn request %s", first[0], requested)
 	}
 
 	if err := m.Send(id, turn(2)); err != nil {
@@ -1180,5 +1196,47 @@ func TestCodexAppServerLifecycle_UsageFreshnessFailureNeverBlocksEnded(t *testin
 	waitCodexUsageRefreshIdle(t)
 	if _, err := os.Stat(filepath.Join(blocker, "codex_rate_limits.json")); err == nil {
 		t.Fatal("cache unexpectedly written under a file")
+	}
+}
+
+// The floor a turn is measured against must be anchored when the turn is
+// REQUESTED. Deriving it from the previous turn's completion — as the first
+// per-turn cut did — lets a rate-limit frame delivered between turns (an
+// `account/rateLimits/read` reply, or a notification during initialization)
+// count as the next turn's reading, so that turn skips its post-run refresh.
+func TestCodexAppServerLifecycle_AnchorsUsageFloorAtEachTurnRequest(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	m, id, ended := startCodexAppServerEchoMock(t)
+	t.Cleanup(func() {
+		_ = m.End(id)
+		waitCodexAppServerEnded(t, ended)
+	})
+	session := m.Get(id)
+	if session == nil {
+		t.Fatal("session not registered")
+	}
+	turn := func(n int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`, n)
+	}
+
+	if err := m.Send(id, turn(1)); err != nil {
+		t.Fatalf("Send turn 1: %v", err)
+	}
+	rec.waitSettled(t, 1)
+	// Between the turns: a numeric reading arrives while no turn is running. It
+	// must not become the floor the NEXT turn is measured against, or that turn
+	// would read as already paid and skip its post-run refresh.
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":99,"method":"account/rateLimits/read","params":{}}`); err != nil {
+		t.Fatalf("Send between-turn request: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	between := time.Now()
+
+	if err := m.Send(id, turn(2)); err != nil {
+		t.Fatalf("Send turn 2: %v", err)
+	}
+	settled := rec.waitSettled(t, 2)
+	if settled[1].UnixMilli() < between.UnixMilli() {
+		t.Fatalf("second turn settled with floor %s, want one at/after the between-turn reading (before %s)", settled[1], between)
 	}
 }

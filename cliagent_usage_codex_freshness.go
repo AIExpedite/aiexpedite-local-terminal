@@ -121,7 +121,13 @@ type codexUsageRefreshGate struct {
 	pending map[string]codexPendingRunDebt
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
-	wg     sync.WaitGroup
+	// active counts the tracked goroutines spawn started; idle broadcasts when
+	// it reaches zero. A sync.WaitGroup cannot serve here: a run settling at
+	// process/session teardown legitimately spawns while a waiter is already
+	// blocked, and Add racing a Wait that has just seen zero is exactly the
+	// reuse the race detector reports. Both sides live under mu instead.
+	active int
+	idle   *sync.Cond
 }
 
 // codexPendingRunDebt is one finished run whose debt is not on disk yet.
@@ -158,12 +164,41 @@ func (g *codexUsageRefreshGate) isEnabled() bool {
 
 // spawn runs fn on a tracked goroutine that can never take the process down.
 func (g *codexUsageRefreshGate) spawn(fn func()) {
-	g.wg.Add(1)
+	g.mu.Lock()
+	g.active++
+	g.mu.Unlock()
 	go func() {
-		defer g.wg.Done()
+		defer g.spawnDone()
 		defer func() { _ = recover() }()
 		fn()
 	}()
+}
+
+func (g *codexUsageRefreshGate) spawnDone() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.active--
+	if g.active <= 0 {
+		g.idleCond().Broadcast()
+	}
+}
+
+// waitIdle blocks until no tracked goroutine is running. Callers that need a
+// deadline run it on a goroutine of their own.
+func (g *codexUsageRefreshGate) waitIdle() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.active > 0 {
+		g.idleCond().Wait()
+	}
+}
+
+// idleCond must be called with mu held: the cond it returns is bound to mu.
+func (g *codexUsageRefreshGate) idleCond() *sync.Cond {
+	if g.idle == nil {
+		g.idle = sync.NewCond(&g.mu)
+	}
+	return g.idle
 }
 
 // begin claims the single flight for fp. It returns the flight's done channel
@@ -289,7 +324,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.mu.Lock()
 	close(codexUsageRefresh.cancel)
 	codexUsageRefresh.mu.Unlock()
-	codexUsageRefresh.wg.Wait()
+	codexUsageRefresh.waitIdle()
 	codexUsageRefresh.mu.Lock()
 	codexUsageRefresh.enabled = false
 	codexUsageRefresh.inFlight = map[string]chan struct{}{}
@@ -426,16 +461,25 @@ func codexRecordRunFreshness(fingerprint string, now time.Time, mutate func(snap
 // and moving the floor later would make it stricter than the run it describes.
 // The newer start is parked in ActiveRunFloorMs instead, so settling the older
 // debt promotes it rather than forgetting this run ever began.
+//
+// A start NEVER moves a floor backwards. Every arm is written by its own
+// spawned goroutine, so two runs starting at A then B can reach this mutation
+// in B-then-A order; letting the late A write lower the floor would let
+// evidence that predates B be read as covering it, and a crash before B
+// settled would then not classify B as interrupted. An older start is already
+// covered by the newer floor, so dropping it loses nothing.
 func codexArmRunFloor(snap *codexRateLimitSnapshot, startedAt time.Time) {
 	startMs := startedAt.UnixMilli()
-	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs == 0 || startMs < snap.RunFloorMs {
-		snap.RunFloorMs = startMs
-		if snap.RefreshOwedAtMs == 0 {
-			snap.ActiveRunFloorMs = 0
+	if snap.RefreshOwedAtMs == 0 {
+		// Nothing owed, so nothing can still be parked behind a debt: fold any
+		// leftover parked floor in before coalescing this start onto the newest.
+		codexPromoteActiveRunFloor(snap)
+		if startMs > snap.RunFloorMs {
+			snap.RunFloorMs = startMs
 		}
 		return
 	}
-	if startMs > snap.ActiveRunFloorMs {
+	if startMs > snap.RunFloorMs && startMs > snap.ActiveRunFloorMs {
 		snap.ActiveRunFloorMs = startMs
 	}
 }
@@ -644,6 +688,18 @@ func payOwedCodexUsageRefresh() {
 		if _, ran, _, _ := codexRunGatedReconcile(ctx, base, fp, state.floor, true, now); ran {
 			codexRecordRunFreshness(fp, codexUsageFreshnessNow(), codexCountRefreshAttempt)
 		}
+		// The reconcile may have PAID the debt it was sent to pay and, in the
+		// same transaction, promoted a floor that was parked behind it — a
+		// second, newer run this dead process never settled. That run is over
+		// too, so turn the promoted floor into debt of its own: routine gathers
+		// force only on `owed`, so an interrupted floor left un-owed would
+		// never be refreshed and would simply age out.
+		now = codexUsageFreshnessNow()
+		if promoted := codexRunFreshnessForAccount(fp, now); promoted.interrupted {
+			codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+				codexOweRunRefresh(snap, promoted.floor, now)
+			})
+		}
 	})
 }
 
@@ -729,6 +785,33 @@ func codexRunCompletionFrame(line string) bool {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+// codexRunStartFrame reports whether a line the CLIENT wrote to a long-lived
+// app-server REQUESTS a turn. It is the mirror of codexRunCompletionFrame and
+// exists for the same reason: the transport file must stay free of JSON-RPC
+// semantics, and the floor a turn is measured against has to be the moment that
+// turn was asked for. Anchoring it at the previous turn's completion instead
+// would let a rate-limit frame delivered between turns (an
+// `account/rateLimits/read` reply, or a notification during initialization)
+// count as the new turn's reading.
+func codexRunStartFrame(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	method, _ := raw["method"].(string)
+	switch codexNormalizeCompletionName(method) {
+	// Codex 0.144's generated schema spells it `turn/start`; older app-server
+	// builds send the turn as `sendUserTurn` / `sendUserMessage`.
+	case "turn.start", "sendUserTurn", "sendUserMessage":
+		return true
 	}
 	return false
 }

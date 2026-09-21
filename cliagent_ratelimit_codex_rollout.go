@@ -2293,8 +2293,9 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	// NEWEST append and nothing else. Stamping every timestamp-less frame with
 	// it would republish an old percentage from an earlier turn as a post-run
 	// observation — wrongly settling the freshness debt — so inference is
-	// narrowed to the one frame that can honestly claim the mtime: the LAST
-	// timestamp-less frame in a file where NO frame stated a time at all.
+	// narrowed to the one frame that can honestly claim the mtime: a
+	// timestamp-less frame that is the file's FINAL record, in a file where NO
+	// frame stated a time at all.
 	//
 	// That second condition is what keeps an ordinary multi-turn rollout out of
 	// this path. A build that stamps its envelopes produces stated frames, so a
@@ -2307,7 +2308,16 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	// a stated observation.
 	var pendingInferred map[string]interface{}
 	statedFrameSeen := false
+	finalRecordSeen := false
 	consumeLine := func(line string) {
+		// Any later record — telemetry or not — invalidates a pending candidate.
+		// The mtime describes the file's newest append and nothing else, so only
+		// the file's FINAL record can honestly claim it. Appending a completion
+		// event or a reasoning item for the latest run advances the mtime while
+		// leaving an older numeric frame behind it; stamping that old percentage
+		// with the new mtime would settle the run's debt with evidence that
+		// predates it.
+		pendingInferred = nil
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
@@ -2376,6 +2386,11 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	}
 	tailLines := codexRecentRolloutLines(ctx, f, size, now)
 	consumeTail := func() {
+		// The tail lines ARE the file's trailing records, so whatever survives
+		// this pass is anchored at the end of the file.
+		if len(tailLines) > 0 {
+			finalRecordSeen = true
+		}
 		for _, line := range tailLines {
 			consumeLine(line)
 		}
@@ -2444,6 +2459,9 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		lineBytes = lineBytes[:0]
 		oversized = false
 		if readErr == io.EOF {
+			// The forward pass reached the end of the file, so the last record
+			// it consumed is the file's final one.
+			finalRecordSeen = true
 			break
 		}
 	}
@@ -2454,12 +2472,12 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	// forward pass was interrupted; their newer timestamps supersede any prefix
 	// evidence without treating an incomplete fragment as provider telemetry.
 	consumeTail()
-	// Fold the anchored frame last: it is the newest record in a file that
+	// Fold the anchored frame last: it is the file's final record, in a file that
 	// stated no times at all, so the sparse-merge rules in mergeCodexRolloutFrame
 	// treat it exactly as they would a stated frame at that time, and
 	// codexRolloutReadingBeats still lets any stated observation covering the run
 	// floor outrank it.
-	if pendingInferred != nil && !statedFrameSeen {
+	if pendingInferred != nil && !statedFrameSeen && finalRecordSeen {
 		if updates, _ := extractCodexRateLimitBuckets(pendingInferred, inferredAt); len(updates) > 0 {
 			codexStampContributorObservations(updates, inferredAt)
 			codexMarkContributorsInferred(updates)
