@@ -271,7 +271,10 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		result.ArgvShapeID = shape.ID
 		stream := parseCodexSmokeStream(stdout)
 		category, diagnostic, matched := classifyCodexSmokeRun(timedOut, stream, stderr, lastMessage, runErr, marker)
-		evidence = codexSmokeEvidence{matched: matched, completed: stream.Completed}
+		// Utilization evidence is what the TURN produced, not what the verdict
+		// was: a run that emitted the exact marker and THEN reported an error
+		// still spent a payable turn, so it settles even though it fails.
+		evidence = codexSmokeEvidence{markerSeen: codexSmokeMarkerSeen(stream, lastMessage, marker), completed: stream.Completed}
 		if category == "" {
 			result.Status = cliSmokeStatusSuccess
 			result.MarkerMatched = matched
@@ -321,8 +324,8 @@ func codexSmokeFailureLogLine(shapeID, category, diagnostic string, stderrBytes 
 
 // codexSmokeEvidence is what the final attempt proved about the turn.
 type codexSmokeEvidence struct {
-	matched   bool // trimmed exact marker from the last-message file or the stream
-	completed bool // a recognised turn-completion frame (codexRunCompletionShape)
+	markerSeen bool // trimmed exact marker from the last-message file or the stream
+	completed  bool // a recognised turn-completion frame (codexRunCompletionShape)
 }
 
 // settleOrDisarmCodexSmokeRun decides the probe's armed utilization run, once.
@@ -337,7 +340,7 @@ type codexSmokeEvidence struct {
 // floor as an interrupted run at the next start — and the post-update restart
 // is exactly when this smoke runs.
 func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
-	if evidence.matched || evidence.completed || codexSmokeRolloutSignal(floor) {
+	if evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
 		return
 	}
@@ -470,29 +473,27 @@ func codexErrorFrameMessage(raw map[string]interface{}) (string, bool) {
 // `item.completed` and no turn-level completion frame has still returned the
 // marker. The completion frame only EXPLAINS a mismatch — framing (no text,
 // no completion: no_envelope) versus a chatty model (marker_mismatch).
+//
+// An EXPLICIT error frame is the one thing that outranks the match: a turn
+// that printed the marker and then reported `turn.failed` / `error` did not
+// end well, and caching it as a success for the cooldown would hide the auth
+// or quota failure the card exists to show. A non-zero exit on its own does
+// NOT outrank it — the marker is random per run, so an exact match proves
+// this turn answered, and failing it would turn a shim's or a teardown's exit
+// code into a red card for a Codex that works.
 func classifyCodexSmokeRun(timedOut bool, stream codexSmokeStream, stderr, lastMessage []byte, runErr error, marker string) (category, diagnostic string, matched bool) {
 	// The kill IS the reason the output is incomplete.
 	if timedOut || errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, context.Canceled) {
 		return cliUsageErrorProviderTimeout, cliSmokeDiagnosticTimeout, false
 	}
-	if strings.TrimSpace(string(lastMessage)) == marker || strings.TrimSpace(stream.Text) == marker {
-		return "", cliSmokeDiagnosticNone, true
-	}
+	markerSeen := codexSmokeMarkerSeen(stream, lastMessage, marker)
 
 	if stream.SawError {
-		lower := strings.ToLower(stream.ErrorMessage)
-		switch {
-		case cliSmokeTextMentionsAuth(lower), strings.Contains(lower, "401"):
-			return cliUsageErrorNotAuthenticated, cliSmokeDiagnosticAuthError, false
-		case strings.Contains(lower, "limit"), strings.Contains(lower, "quota"),
-			strings.Contains(lower, "overloaded"), strings.Contains(lower, "unavailable"),
-			strings.Contains(lower, "rate"), strings.Contains(lower, "status 5"),
-			strings.Contains(lower, "429"):
-			// The CLI and our invocation are both fine; the provider refused.
-			return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError, false
-		default:
-			return cliUsageErrorProtocol, cliSmokeDiagnosticNoEnvelope, false
-		}
+		category, diagnostic := classifyCodexSmokeErrorFrame(stream.ErrorMessage, markerSeen)
+		return category, diagnostic, false
+	}
+	if markerSeen {
+		return "", cliSmokeDiagnosticNone, true
 	}
 
 	answered := stream.Text != "" || len(bytes.TrimSpace(lastMessage)) > 0
@@ -510,6 +511,36 @@ func classifyCodexSmokeRun(timedOut bool, stream codexSmokeStream, stderr, lastM
 	// The turn answered (or completed) with something other than the marker:
 	// the model was chatty, NOT a broken CLI contract.
 	return cliUsageErrorParseFailed, cliSmokeDiagnosticMarkerMismatch, false
+}
+
+// codexSmokeMarkerSeen reports whether the turn produced the exact marker on
+// either channel. It is the verdict's success test AND the utilization run's
+// payable-turn evidence, which is why it is one predicate: those two answers
+// diverge (an errored turn fails but still settles) and must not drift.
+func codexSmokeMarkerSeen(stream codexSmokeStream, lastMessage []byte, marker string) bool {
+	return strings.TrimSpace(string(lastMessage)) == marker || strings.TrimSpace(stream.Text) == marker
+}
+
+// classifyCodexSmokeErrorFrame maps an explicit error frame onto the closed
+// enum. `answered` says the turn still produced the marker: the envelope
+// contract held, so the failure is the provider's rather than a missing
+// envelope, and no_envelope would be a false report.
+func classifyCodexSmokeErrorFrame(message string, answered bool) (category, diagnostic string) {
+	lower := strings.ToLower(message)
+	switch {
+	case cliSmokeTextMentionsAuth(lower), strings.Contains(lower, "401"):
+		return cliUsageErrorNotAuthenticated, cliSmokeDiagnosticAuthError
+	case strings.Contains(lower, "limit"), strings.Contains(lower, "quota"),
+		strings.Contains(lower, "overloaded"), strings.Contains(lower, "unavailable"),
+		strings.Contains(lower, "rate"), strings.Contains(lower, "status 5"),
+		strings.Contains(lower, "429"):
+		// The CLI and our invocation are both fine; the provider refused.
+		return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError
+	case answered:
+		return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError
+	default:
+		return cliUsageErrorProtocol, cliSmokeDiagnosticNoEnvelope
+	}
 }
 
 // codexSmokeNoEnvelopeDiagnostic separates the pre-inference rejections once a

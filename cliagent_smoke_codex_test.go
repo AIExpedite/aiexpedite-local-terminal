@@ -258,6 +258,11 @@ func TestClassifyCodexSmokeRun_MapsEveryOutcomeOntoTheClosedSet(t *testing.T) {
 			category: cliUsageErrorProviderUnavailable, diagnostic: cliSmokeDiagnosticProviderError},
 		{name: "nested provider error", stdout: `{"method":"codex/event/error","params":{"msg":{"type":"error","message":"stream disconnected: status 503 overloaded"}}}`,
 			category: cliUsageErrorProviderUnavailable, diagnostic: cliSmokeDiagnosticProviderError},
+		{name: "error frame outranks a match", stdout: string(codexPreUpdateFrames(marker)) + "\n" + `{"type":"turn.failed","error":{"message":"the model stopped responding"}}`,
+			category: cliUsageErrorProviderUnavailable, diagnostic: cliSmokeDiagnosticProviderError},
+		{name: "auth error frame outranks a match", lastMessage: marker, stdout: `{"type":"error","message":"401 Unauthorized: token expired"}`,
+			category: cliUsageErrorNotAuthenticated, diagnostic: cliSmokeDiagnosticAuthError},
+		{name: "non-zero exit alone does not outrank a match", lastMessage: marker, runErr: exitErr},
 		{name: "chatty model", stdout: string(codexPreUpdateFrames("Sure! " + marker)),
 			category: cliUsageErrorParseFailed, diagnostic: cliSmokeDiagnosticMarkerMismatch},
 		{name: "completed with no text", stdout: `{"type":"turn.completed"}`,
@@ -431,6 +436,33 @@ func TestRunCodexSmoke_RealDeadlineKillIsTimeoutAndDisarms(t *testing.T) {
 	}
 	if _, settled, disarmed := rec.lifecycle(); settled != 0 || disarmed != 1 {
 		t.Fatalf("settled=%d disarmed=%d, want the killed run disarmed", settled, disarmed)
+	}
+}
+
+// An answered-then-failed turn is the one place the verdict and the
+// utilization evidence disagree on purpose: the smoke FAILS (the error frame
+// outranks the marker, so a broken Codex is never cached as healthy for the
+// cooldown), yet the run SETTLES, because the turn was spent and a forced
+// reconcile can pay it.
+func TestRunCodexSmoke_ErrorAfterTheMarkerFailsButStillSettles(t *testing.T) {
+	_, rec := codexSmokeEnv(t)
+	path := stubCodexBinary(t)
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		stdout := append(codexPreUpdateFrames(codexMarkerFromLaunch(t, launch)),
+			[]byte(`{"type":"turn.failed","error":{"message":"the model stopped responding"}}`+"\n")...)
+		return stdout, nil, nil
+	})
+
+	result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion)
+
+	if result.ErrorCategory != cliUsageErrorProviderUnavailable || result.Diagnostic != cliSmokeDiagnosticProviderError {
+		t.Fatalf("result = %+v, want provider_unavailable/provider_error", result)
+	}
+	if result.MarkerMatched {
+		t.Fatalf("result.MarkerMatched = true; an error frame outranks the match")
+	}
+	if _, settled, disarmed := rec.lifecycle(); settled != 1 || disarmed != 0 {
+		t.Fatalf("settled=%d disarmed=%d, want the spent turn settled", settled, disarmed)
 	}
 }
 
