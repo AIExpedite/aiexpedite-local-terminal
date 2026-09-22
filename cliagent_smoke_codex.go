@@ -489,7 +489,7 @@ func classifyCodexSmokeRun(timedOut bool, stream codexSmokeStream, stderr, lastM
 	markerSeen := codexSmokeMarkerSeen(stream, lastMessage, marker)
 
 	if stream.SawError {
-		category, diagnostic := classifyCodexSmokeErrorFrame(stream.ErrorMessage, markerSeen)
+		category, diagnostic := classifyCodexSmokeErrorFrame(stream.ErrorMessage)
 		return category, diagnostic, false
 	}
 	if markerSeen {
@@ -522,25 +522,19 @@ func codexSmokeMarkerSeen(stream codexSmokeStream, lastMessage []byte, marker st
 }
 
 // classifyCodexSmokeErrorFrame maps an explicit error frame onto the closed
-// enum. `answered` says the turn still produced the marker: the envelope
-// contract held, so the failure is the provider's rather than a missing
-// envelope, and no_envelope would be a false report.
-func classifyCodexSmokeErrorFrame(message string, answered bool) (category, diagnostic string) {
+// enum. Reaching here means a recognised `error` / `stream_error` /
+// `turn.failed` envelope arrived, so the CLI contract plainly held: the
+// message only picks between auth and the provider, and wording we do not
+// recognise stays a provider failure. no_envelope would be a false report —
+// it is reserved for a stream that produced no terminal envelope at all.
+func classifyCodexSmokeErrorFrame(message string) (category, diagnostic string) {
 	lower := strings.ToLower(message)
-	switch {
-	case cliSmokeTextMentionsAuth(lower), strings.Contains(lower, "401"):
+	if cliSmokeTextMentionsAuth(lower) || strings.Contains(lower, "401") {
 		return cliUsageErrorNotAuthenticated, cliSmokeDiagnosticAuthError
-	case strings.Contains(lower, "limit"), strings.Contains(lower, "quota"),
-		strings.Contains(lower, "overloaded"), strings.Contains(lower, "unavailable"),
-		strings.Contains(lower, "rate"), strings.Contains(lower, "status 5"),
-		strings.Contains(lower, "429"):
-		// The CLI and our invocation are both fine; the provider refused.
-		return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError
-	case answered:
-		return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError
-	default:
-		return cliUsageErrorProtocol, cliSmokeDiagnosticNoEnvelope
 	}
+	// Everything else — a quota refusal, a 5xx, or wording we have never
+	// seen: the CLI and our invocation are both fine, the turn is not.
+	return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticProviderError
 }
 
 // codexSmokeNoEnvelopeDiagnostic separates the pre-inference rejections once a
