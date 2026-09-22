@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -2001,5 +2003,135 @@ func TestCodexRecordRunFloorWrite_DropsADelayedWriteForASwappedAccount(t *testin
 	}
 	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
 		t.Fatalf("floor %d/%d booked on the live account, want none", snap.RunFloorMs, snap.ActiveRunFloorMs)
+	}
+}
+
+/* ───────────────────── __cli_smoke__: settle on evidence ───────────────────── */
+
+// codexSmokeFreshnessFixture wires a Codex smoke to the REAL freshness path —
+// no lifecycle hooks — against an isolated CODEX_HOME and cache.
+func codexSmokeFreshnessFixture(t *testing.T) (codexFreshnessFixture, string) {
+	t.Helper()
+	smokeEnv(t)
+	t.Setenv("OPENAI_API_KEY", "")
+	f := newCodexFreshnessFixture(t, time.Now().Add(-3*time.Hour))
+	stubCodexLogin(t, true, true)
+	return f, stubCodexBinary(t)
+}
+
+// withOpenCodexTerminalRun registers a terminal `codex` session of this
+// process whose run is armed at floor and not yet settled.
+func withOpenCodexTerminalRun(t *testing.T, floor time.Time) {
+	t.Helper()
+	sm := NewSessionManager(nil)
+	session := &CLISession{ID: "open-codex-run", Command: "codex"}
+	session.codexUsageFloorMs.Store(floor.UnixMilli())
+	sm.sessions[session.ID] = session
+	previous := globalSessionManager
+	globalSessionManager = sm
+	t.Cleanup(func() { globalSessionManager = previous })
+}
+
+// A smoke whose run produced evidence settles exactly as a session run does:
+// the debt is recorded against the smoke's own floor.
+func TestCodexSmoke_SettleRecordsTheDebt(t *testing.T) {
+	f, path := codexSmokeFreshnessFixture(t)
+	before := time.Now()
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		return codexPreUpdateFrames(codexMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RunFloorMs < before.UnixMilli() || snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("a settled smoke must owe a refresh against its own floor: %+v", snap)
+	}
+}
+
+// Every no-evidence outcome disarms, and the disarm rolls RunFloorMs back to
+// the newest floor another run of this process still holds — never to zero
+// under it, never leaving the smoke's floor behind.
+func TestCodexSmoke_DisarmRollsBackToTheNewestOpenFloor(t *testing.T) {
+	exitErr := errors.New("exit status 1")
+	for name, run := range map[string]func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error){
+		"never spawned": func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+			return nil, nil, &exec.Error{Name: launch.Path, Err: exec.ErrNotFound}
+		},
+		"deadline kill": func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+			<-ctx.Done()
+			return nil, nil, exitErr
+		},
+		"spawned, no signal": func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+			return []byte(`{"type":"thread.started"}` + "\n"), nil, nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, path := codexSmokeFreshnessFixture(t)
+			original := codexSmokeTimeout
+			codexSmokeTimeout = 50 * time.Millisecond
+			t.Cleanup(func() { codexSmokeTimeout = original })
+
+			sibling := time.UnixMilli(time.Now().Add(-time.Minute).UnixMilli())
+			armCodexUsageRunFloor(sibling)
+			waitCodexUsageRefreshIdle(t)
+			withOpenCodexTerminalRun(t, sibling)
+			stubCodexSmokeExec(t, run)
+
+			if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status == cliSmokeStatusSuccess {
+				t.Fatalf("result = %+v, want a failure", result)
+			}
+			waitCodexUsageRefreshIdle(t)
+
+			snap := f.snapshot(t)
+			if snap.RunFloorMs != sibling.UnixMilli() || snap.RefreshOwedAtMs != 0 {
+				t.Fatalf("after the disarm RunFloorMs=%d RefreshOwedAtMs=%d, want the open sibling floor %d and no debt",
+					snap.RunFloorMs, snap.RefreshOwedAtMs, sibling.UnixMilli())
+			}
+		})
+	}
+}
+
+// The row that matters: the smoke runs across a Codex update, so the agent
+// restart that follows is exactly when an armed-but-unsettled floor would be
+// adopted as an interrupted run and written into RefreshOwed for a turn that
+// can never pay it. After a killed smoke, the restart finds nothing to adopt,
+// owes nothing, and the card carries no stale-utilization notice.
+func TestCodexSmoke_KilledRunOwesNothingAfterARestart(t *testing.T) {
+	f, path := codexSmokeFreshnessFixture(t)
+	f.seedPreRunReading(t, time.Now().Add(-time.Hour), time.Now())
+	original := codexSmokeTimeout
+	codexSmokeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { codexSmokeTimeout = original })
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		<-ctx.Done()
+		return nil, nil, errors.New("signal: killed")
+	})
+
+	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Diagnostic != cliSmokeDiagnosticTimeout {
+		t.Fatalf("result = %+v, want timeout", result)
+	}
+	waitCodexUsageRefreshIdle(t)
+
+	// Simulate the post-update restart: a fresh process's gate, then the
+	// startup replay.
+	resetCodexUsageRefreshGate()
+	SetCodexUsageRefreshEnabled(true)
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("restart adopted the killed smoke: RunFloorMs=%d RefreshOwedAtMs=%d", snap.RunFloorMs, snap.RefreshOwedAtMs)
+	}
+	state := codexRunFreshnessForAccount(f.fp, time.Now().Add(codexRefreshOwedMaxAge/2))
+	if state.owed || state.interrupted {
+		t.Fatalf("freshness after restart = %+v, want nothing owed or interrupted", state)
+	}
+	if notice := codexStaleRunNotice(state); notice != "" {
+		t.Fatalf("the card carries a stale-utilization notice: %q", notice)
 	}
 }

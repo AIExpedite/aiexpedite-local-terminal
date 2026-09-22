@@ -1,14 +1,35 @@
 //go:build windows
 
+// cli_smoke_shim_windows.go — the cmd.exe route the maintenance smokes use to
+// launch a `.cmd` / `.bat` npm shim (Grok and Codex), plus the explicit
+// command-line helpers the Grok junction commands share. CreateProcess cannot
+// start a batch file directly, and letting os/exec quote one re-splits or drops
+// tokens in the shim's own re-parse, so every shim launch goes through
+// cliSmokeShimCommand with its paths carried in the child environment.
+
 package main
 
 import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
+
+// isWindowsShimPath reports whether a resolved CLI path is a cmd.exe batch
+// shim (what `npm install -g` puts on PATH on Windows) rather than a native
+// binary. Defined per platform because its callers — version probes, login
+// probes, the smoke providers — are all-platform code.
+func isWindowsShimPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".cmd", ".bat":
+		return true
+	}
+	return false
+}
 
 // cmd.exe does not use CommandLineToArgvW quoting rules. Supplying the fixed
 // script through CmdLine prevents os/exec from backslash-escaping its quotes,
@@ -56,13 +77,23 @@ func grokSmokeShimCommand(ctx context.Context, launch grokSmokeLaunch) (*exec.Cm
 	if !ok {
 		return nil, false
 	}
+	env := setEnvVar(launch.Env, grokSmokeShimPathEnv, launch.Path)
+	env = setEnvVar(env, grokSmokeShimPromptEnv, launch.PromptFile)
+	return cliSmokeShimCommand(ctx, script, env, launch.Dir), true
+}
+
+// cliSmokeShimCommand builds the cmd.exe child for an already-rendered shim
+// script (grokSmokeShimScript / codexSmokeShimScript). The script carries only
+// fixed tokens and `%VAR%` references; `env` must already hold every path those
+// references name. The per-attempt deadline takes the whole process tree down
+// (bindGrokShimProcessTree), and the child starts hidden.
+func cliSmokeShimCommand(ctx context.Context, script string, env []string, dir string) *exec.Cmd {
 	cmd := grokWindowsCommandContext(ctx, script)
 	configureGrokWindowsShimCommandLine(cmd, script)
 	bindGrokShimProcessTree(cmd)
-	env := setEnvVar(launch.Env, grokSmokeShimPathEnv, launch.Path)
-	cmd.Env = setEnvVar(env, grokSmokeShimPromptEnv, launch.PromptFile)
-	cmd.Dir = launch.Dir
-	return cmd, true
+	cmd.Env = env
+	cmd.Dir = dir
+	return cmd
 }
 
 // grokShimWaitDelay bounds how long Run / CombinedOutput may stay blocked on

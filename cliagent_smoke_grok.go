@@ -45,7 +45,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -117,14 +116,7 @@ func newGrokSmokeCmd(ctx context.Context, launch grokSmokeLaunch) *exec.Cmd {
 // isGrokWindowsShim reports whether the resolved `grok` is a cmd.exe batch shim
 // (what `npm install -g` puts on PATH on Windows) rather than a native binary.
 func isGrokWindowsShim(path string) bool {
-	if runtime.GOOS != "windows" {
-		return false
-	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".cmd", ".bat":
-		return true
-	}
-	return false
+	return isWindowsShimPath(path)
 }
 
 /* --------------------------------------------------------------------------
@@ -499,7 +491,7 @@ func classifyGrokSmokeRun(timedOut bool, stdout, stderr []byte, runErr error, ma
 	if stream.SawError {
 		lower := strings.ToLower(stream.ErrorMessage)
 		switch {
-		case grokSmokeTextMentionsAuth(lower):
+		case cliSmokeTextMentionsAuth(lower):
 			return cliUsageErrorNotAuthenticated, cliSmokeDiagnosticAuthError, false
 		case strings.Contains(lower, "limit"), strings.Contains(lower, "credit"),
 			strings.Contains(lower, "quota"), strings.Contains(lower, "overloaded"),
@@ -532,13 +524,6 @@ func classifyGrokSmokeRun(timedOut bool, stdout, stderr []byte, runErr error, ma
 		return cliUsageErrorParseFailed, cliSmokeDiagnosticMarkerMismatch, false
 	}
 	return "", cliSmokeDiagnosticNone, true
-}
-
-func grokSmokeTextMentionsAuth(lower string) bool {
-	return strings.Contains(lower, "authenticat") || strings.Contains(lower, "login") ||
-		strings.Contains(lower, "logged out") || strings.Contains(lower, "credential") ||
-		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "sign in") ||
-		strings.Contains(lower, "token expired")
 }
 
 // grokSmokeNoEnvelopeDiagnostic separates the pre-inference failures that

@@ -417,3 +417,30 @@ func TestCapabilitiesDerivation_RespectsRAMConstraint(t *testing.T) {
 			mi.Capabilities.RecommendedConcurrentBuilds)
 	}
 }
+
+// gatherCLIAgents asks the ONE shim-aware Codex probe. A plain spawn of an npm
+// `codex.cmd` fails to start, and the "" it produced was cached under the same
+// (path, mtime, size) key the maintenance smoke's precheck reads — pinning
+// binary_missing on exactly the platform the post-update smoke failed on.
+// Whoever asks first, both must read the shim's real answer.
+func TestGatherCLIAgents_CodexShimAnswersThroughTheSmokesProbe(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("a .cmd batch shim only exists on Windows")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "codex.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif \"%1\"==\"--version\" echo codex-cli 9.9.9\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	agents := gatherCLIAgents()
+	if got := agents["codex"]; !strings.EqualFold(got.Path, shim) || got.Version != "codex-cli 9.9.9" {
+		t.Fatalf("gatherCLIAgents codex = %+v, want the shim's path and version", got)
+	}
+	if got := codexProbeVersion(agents["codex"].Path); got != "codex-cli 9.9.9" {
+		t.Fatalf("smoke precheck after gather = %q, want the cached shim version", got)
+	}
+}

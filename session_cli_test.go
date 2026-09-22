@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -3406,6 +3407,156 @@ func TestExtractDisplayText_Codex_SkipsLifecycleEvents(t *testing.T) {
 		got := extractDisplayText("codex", line)
 		if got != "" {
 			t.Errorf("lifecycle event should be skipped, got %q for %q", got, line)
+		}
+	}
+}
+
+// Post-update Codex builds emit the same assistant message in shapes with no
+// top-level `type` (JSON-RPC) or with the event nested one level down. Each
+// must render exactly the text; a delta renders nothing here because
+// readOutputStream buffers it on the side.
+func TestExtractDisplayText_Codex_PostUpdateShapes(t *testing.T) {
+	const want = "Here is your answer."
+	for name, line := range map[string]string{
+		"msg nested":                 `{"id":"0","msg":{"type":"agent_message","message":"Here is your answer."}}`,
+		"params.msg nested":          `{"params":{"msg":{"type":"agent_message","message":"Here is your answer."}}}`,
+		"method codex/event":         `{"jsonrpc":"2.0","method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"Here is your answer."}}}`,
+		"method item/agentMessage/*": `{"jsonrpc":"2.0","method":"item/agentMessage/completed","params":{"text":"Here is your answer."}}`,
+		"method item/completed":      `{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","text":"Here is your answer."}}}`,
+	} {
+		if got := extractDisplayText("codex", line); got != want {
+			t.Errorf("%s: got %q, want %q", name, got, want)
+		}
+	}
+	for _, delta := range []string{
+		`{"msg":{"type":"agent_message_delta","delta":"Here"}}`,
+		`{"method":"item/agentMessage/delta","params":{"delta":"Here"}}`,
+	} {
+		if got := extractDisplayText("codex", delta); got != "" {
+			t.Errorf("a delta must not render as its own line, got %q for %s", got, delta)
+		}
+	}
+}
+
+// codexSessionAccumulatedText runs a codex transcript through readOutputStream
+// — the code a terminal session runs — and returns the text the published
+// stream frames accumulate to, in Seq order.
+func codexSessionAccumulatedText(t *testing.T, lines []string) string {
+	t.Helper()
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "codex-rate-limits.json"))
+	session := &CLISession{
+		ID:             "codex-exact-marker",
+		Command:        "codex",
+		Stdout:         io.NopCloser(strings.NewReader(strings.Join(lines, "\n") + "\n")),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	var mu sync.Mutex
+	var streams []resultMsg
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		if msg.Type == "stream" {
+			mu.Lock()
+			streams = append(streams, msg)
+			mu.Unlock()
+		}
+	})
+	sort.Slice(streams, func(i, j int) bool { return streams[i].Seq < streams[j].Seq })
+	var b strings.Builder
+	for _, msg := range streams {
+		b.WriteString(msg.Output)
+	}
+	return b.String()
+}
+
+// Acceptance, terminal path: the exact marker survives a pre-update and every
+// post-update transcript through the same code a `codex exec --json` session
+// runs. Before this change the post-update rows accumulated to "" (exit 0,
+// empty answer) and the delta row to a newline-split marker.
+func TestReadOutputStream_CodexExactMarkerPreAndPostUpdate(t *testing.T) {
+	const marker = "AIEXPEDITE_CODEX_SMOKE_OK_0badc0de"
+	start := []string{`{"type":"thread.started","thread_id":"t-1"}`, `{"type":"turn.started"}`}
+	deltas := []string{
+		`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_"}}`,
+		`{"method":"item/agentMessage/delta","params":{"delta":"SMOKE_OK_"}}`,
+		`{"method":"item/agentMessage/delta","params":{"delta":"0badc0de"}}`,
+	}
+	for _, tc := range []struct {
+		name  string
+		lines []string
+	}{
+		{"pre-update", append(append([]string{}, start...),
+			`{"type":"item.completed","item":{"type":"agent_message","text":"`+marker+`"}}`,
+			`{"type":"turn.completed"}`, `{"type":"thread.completed"}`)},
+		{"post-update nested", []string{
+			`{"id":"0","msg":{"type":"task_started"}}`,
+			`{"id":"0","msg":{"type":"agent_message","message":"` + marker + `"}}`,
+			`{"id":"0","msg":{"type":"task_complete"}}`,
+		}},
+		{"post-update JSON-RPC", []string{
+			`{"jsonrpc":"2.0","method":"codex/event/task_started","params":{"msg":{"type":"task_started"}}}`,
+			`{"jsonrpc":"2.0","method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"` + marker + `"}}}`,
+			`{"jsonrpc":"2.0","method":"turn/completed","params":{"turnId":"r-1"}}`,
+		}},
+		// Side buffer appended at stream end, no separator between chunks.
+		{"delta only", append(append([]string{}, start...), append(deltas, `{"type":"turn.completed"}`)...)},
+		{"delta only, no terminal event", append(append([]string{}, start...), deltas...)},
+		// The app-server protocol announces every chunk and message in BOTH
+		// dialects; the twin must neither double a delta nor batch the marker
+		// a second time.
+		{"dual dialect, deltas then complete", append(append([]string{}, start...),
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"AIEXPEDITE_CODEX_"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_"}}`,
+			`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"`+marker+`"}}}`,
+			`{"method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"`+marker+`"}}}`,
+			`{"type":"turn.completed"}`)},
+		{"dual dialect, delta only", append(append([]string{}, start...),
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}`,
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"0badc0de"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"0badc0de"}}`)},
+		// The complete message discards the buffered deltas: marker once.
+		{"delta then complete", append(append(append([]string{}, start...), deltas...),
+			`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"`+marker+`"}}}`,
+			`{"type":"turn.completed"}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexSessionAccumulatedText(t, tc.lines); got != marker {
+				t.Fatalf("accumulated text = %q, want exactly %q", got, marker)
+			}
+		})
+	}
+}
+
+// The boundary of the exact-match guarantee: every rendered line is part of
+// the accumulated text, so a turn that also runs a command accumulates that
+// line too. The guarantee covers an answer-only turn — which is what the smoke
+// prompt (echo, no tool use) produces.
+func TestReadOutputStream_CodexRenderedCommandIsPartOfTheAccumulatedText(t *testing.T) {
+	const marker = "AIEXPEDITE_CODEX_SMOKE_OK_0badc0de"
+	got := codexSessionAccumulatedText(t, []string{
+		`{"type":"item.completed","item":{"type":"command_execution","command":"echo hi"}}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"` + marker + `"}}`,
+		`{"type":"turn.completed"}`,
+	})
+	if got == marker || !strings.Contains(got, marker) || !strings.Contains(got, "[Executing: echo hi]") {
+		t.Fatalf("accumulated text = %q, want the command row AND the marker (not an exact match)", got)
+	}
+}
+
+// Recognising post-update assistant frames does not widen the terminal-event
+// classifier: an item completion — in either dialect — still does not end the
+// turn.
+func TestDetectCLITerminalEvent_CodexItemCompletedStaysNonTerminal(t *testing.T) {
+	for _, line := range []string{
+		`{"type":"item.completed","item":{"type":"agent_message","text":"x"}}`,
+		`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"x"}}}`,
+	} {
+		if detectCLITerminalEvent("codex", line) {
+			t.Errorf("item completion must not be a terminal event: %s", line)
+		}
+		if codexRunCompletionFrame(line) {
+			t.Errorf("item completion must not settle a utilization run: %s", line)
 		}
 	}
 }

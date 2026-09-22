@@ -7,11 +7,13 @@
 // upgrade to prove the binary can still complete a round trip. The probes live
 // HERE, in this process, because it is the only component that knows the
 // resolved binary path, the sanitized child env, and the flag shape that
-// actually works for each CLI (claude_argv.go, grok_argv.go).
+// actually works for each CLI (claude_argv.go, grok_argv.go,
+// cliagent_smoke_codex.go).
 //
 // Per-provider probes:
 //   - claudeCode → cliagent_smoke_claudecode.go (runClaudeCodeSmoke)
 //   - grok       → cliagent_smoke_grok.go       (runGrokSmoke)
+//   - codex      → cliagent_smoke_codex.go      (runCodexSmoke)
 //
 // Cost discipline — a smoke spends ONE real inference turn against the user's
 // own subscription window, the same quota the CLI Agents tab reports:
@@ -53,6 +55,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -79,8 +82,8 @@ const (
 //
 // Every value here is a compile-time constant chosen by our own classifiers;
 // nothing derived from the child's bytes ever reaches the wire — or the log
-// (see claudeSmokeFailureLogLine / grokSmokeFailureLogLine, which cannot even
-// accept text).
+// (see claudeSmokeFailureLogLine / grokSmokeFailureLogLine /
+// codexSmokeFailureLogLine, which cannot even accept text).
 const (
 	cliSmokeDiagnosticNone = "" // success, or nothing further to say
 	// The CLI rejected one of OUR flags — the one failure that is safe to
@@ -92,7 +95,8 @@ const (
 	// or a Grok build refusing `--output-format=streaming-json`).
 	cliSmokeDiagnosticFramingRejected = "framing_rejected"
 	// Exited without emitting the documented terminal envelope (Claude's
-	// `result` object, Grok's `end` frame).
+	// `result` object, Grok's `end` frame; for Codex, neither assistant text
+	// nor a turn-completion frame).
 	cliSmokeDiagnosticNoEnvelope = "no_envelope"
 	// A well-formed envelope reporting an auth failure.
 	cliSmokeDiagnosticAuthError = "auth_error"
@@ -124,7 +128,7 @@ type cliSmokeResult struct {
 	MarkerMatched bool   `json:"markerMatched"`
 	DurationMs    int64  `json:"durationMs"`
 	// ArgvShapeID names the ladder entry that ran (claudeArgvShapes /
-	// grokSmokeArgvShapes), never the argv itself.
+	// grokSmokeArgvShapes / codexSmokeArgvShapes), never the argv itself.
 	ArgvShapeID string `json:"argvShapeId,omitempty"`
 	// Diagnostic is one of the cliSmokeDiagnostic* constants — a locally
 	// authored code, never vendor text.
@@ -371,6 +375,12 @@ var cliSmokeProviders = map[string]cliSmokeProvider{
 		loggedIn:     grokSmokeLoggedIn,
 		run:          runGrokSmoke,
 	},
+	"codex": {
+		resolvePath:  func() string { return resolveCodexSmokePath() },
+		probeVersion: codexProbeVersion,
+		loggedIn:     codexSmokeLoginCheck,
+		run:          runCodexSmoke,
+	},
 }
 
 // runCLISmoke is the entry point the `__cli_smoke__` handler calls. It resolves
@@ -533,4 +543,14 @@ func cliSmokeVerdictSpentTurn(result cliSmokeResult) bool {
 		return false
 	}
 	return true
+}
+
+// cliSmokeTextMentionsAuth reports whether lowercased CLI text describes an
+// authentication failure. Read only to pick auth_error over the other closed
+// diagnostics; the text itself goes no further.
+func cliSmokeTextMentionsAuth(lower string) bool {
+	return strings.Contains(lower, "authenticat") || strings.Contains(lower, "login") ||
+		strings.Contains(lower, "logged out") || strings.Contains(lower, "credential") ||
+		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "sign in") ||
+		strings.Contains(lower, "token expired")
 }

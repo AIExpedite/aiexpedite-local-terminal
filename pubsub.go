@@ -763,7 +763,9 @@ type resultMsg struct {
 	// password, or an unfamiliar credential format). An early revision carried a
 	// capped + redacted `stderrTail` here; it was removed for exactly that
 	// reason and must not come back. The prompt, the marker nonce, the resolved
-	// argv values and any config content are likewise never present.
+	// argv values and any config content are likewise never present — nor is
+	// the Codex `--output-last-message` file, which is read for the marker
+	// verdict and deleted with the probe's temp dir.
 	//
 	// Echoes RefreshID so the maintenance flow can correlate the response with
 	// its pending request.
@@ -1114,7 +1116,7 @@ func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, s
 // handleCLISmokeCommand fulfils the signed `__cli_smoke__` operational command
 // the CLI-maintenance flow runs on both sides of a CLI upgrade. It runs the
 // no-tools, non-interactive probe for the named CLI (cliSmokeProviders in
-// cliagent_smoke.go: claudeCode, grok) and publishes exactly one correlated
+// cliagent_smoke.go: claudeCode, grok, codex) and publishes exactly one correlated
 // `__cli_smoke_result__`.
 //
 // Which CLI to smoke travels as the FIRST ARG rather than a new top-level

@@ -575,6 +575,11 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 			// than caching a failed direct launch's "" under the shared
 			// (path, mtime, size) key the smoke's own precheck reads.
 			version = grokProbeVersion(path)
+		} else if a.ID == "codex" {
+			// The one shim-aware Codex probe (cliagent_smoke_codex.go), for the
+			// same reason: a plain spawn of an npm `codex.cmd` would cache ""
+			// under the shared key and pin the smoke's binary_missing.
+			version = codexProbeVersion(path)
 		} else {
 			version = cachedProbeVersion(path)
 		}
