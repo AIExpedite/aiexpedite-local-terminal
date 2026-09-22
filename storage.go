@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"golang.org/x/oauth2"
@@ -167,8 +168,13 @@ func UploadFile(
 	obj := bucket.Object(gcsPath)
 	writer := obj.NewWriter(ctx)
 
-	// Set metadata
+	// Set metadata. Custom-Time marks the object as TRANSIENT: the bucket's
+	// lifecycle rule sweeps media by `daysSinceCustomTime`, which GCS never
+	// satisfies for an object without it, so permanent workspace media under
+	// the same `private/workspace/` root (scene clips, uploads, renders) is
+	// left alone and only these session uploads age out.
 	writer.ContentType = detectContentType(filename)
+	writer.CustomTime = time.Now().UTC()
 	writer.Metadata = map[string]string{
 		"uploaded-by":   "aiexpedite-local-terminal",
 		"workspace-id":  workspaceID,
