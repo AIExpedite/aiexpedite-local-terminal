@@ -570,6 +570,13 @@ func runMockCodexAppServer() {
 					"id":      id,
 					"result":  map[string]any{"turnId": "turn_mock"},
 				})
+				// Optional marker transcript: the pre- and post-update frames
+				// the direct-path parity test expects forwarded byte-for-byte.
+				if os.Getenv(mockCodexMarkerFramesEnv) != "" {
+					for _, frame := range codexAppServerMarkerFrames {
+						fmt.Println(frame)
+					}
+				}
 				// Real app-servers announce the end of the turn and stay up for
 				// the next one. Emitted last so the manager's per-turn settle
 				// sees the turn's frames first. This is the shape Codex
@@ -605,6 +612,25 @@ func runMockCodexAppServer() {
 	}
 	// Stdin closed → exit cleanly. Codex's stdio app-server contract.
 	os.Exit(0)
+}
+
+// mockCodexMarkerFramesEnv asks the echo mock to emit codexAppServerMarkerFrames
+// inside every turn.
+const mockCodexMarkerFramesEnv = "TEST_MOCK_CODEX_MARKER_FRAMES"
+
+// codexAppServerMarkerTest is the nonce the marker transcript carries.
+const codexAppServerMarkerTest = "AIEXPEDITE_CODEX_SMOKE_OK_feedf00d"
+
+// codexAppServerMarkerFrames is one pre-update and one post-update rendering of
+// the same answer. The irregular spacing and key order are deliberate: a
+// transport that re-encoded a frame would normalise them.
+var codexAppServerMarkerFrames = []string{
+	// Pre-update, bare JSONL.
+	`{"type": "item.completed",  "item":{"text":"` + codexAppServerMarkerTest + `","type":"agent_message","id":"item_0"}}`,
+	// Post-update, JSON-RPC deltas then the complete legacy event.
+	`{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}`,
+	`{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"feedf00d"}}`,
+	`{"jsonrpc":"2.0", "method":"codex/event/agent_message","params":{"msg":{"message":"` + codexAppServerMarkerTest + `","type":"agent_message"},"id":"1"}}`,
 }
 
 // mockCodexStderrBurstEnv asks the echo mock to announce every turn's end in
@@ -1863,4 +1889,110 @@ func (c *frameCursor) next() int64 {
 func (c *frameCursor) apart() int64 {
 	c.pos += codexAppServerCompletionPairFrameSpan + 1
 	return c.pos
+}
+
+// Acceptance, direct path: the app-server transport is byte-preserving by
+// contract, so the marker is whatever Codex wrote. A pre-update and a
+// post-update frame carrying it are forwarded unmodified — no re-framing, no
+// re-encode, no drop — so the shared reader recovers the marker from what was
+// published on both, and the turn still arms and settles once.
+func TestCodexAppServerLifecycle_ForwardsMarkerFramesVerbatim(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("integration test only runs on win/linux/darwin")
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(tmpDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-appserver-echo")
+	t.Setenv(mockCodexMarkerFramesEnv, "1")
+
+	m := NewCodexAppServerManager(nil)
+	id := fmt.Sprintf("appsrv-marker-%d", time.Now().UnixNano())
+	var mu sync.Mutex
+	var messages []string
+	ended := false
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch res.Type {
+		case "codex_appserver_message":
+			messages = append(messages, res.Output)
+		case "codex_appserver_ended":
+			ended = true
+		}
+	}
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"turn/start","params":{"threadId":"thr_mock","input":[{"type":"text","text":"hi"}]}}`); err != nil {
+		t.Fatalf("Send turn: %v", err)
+	}
+	rec.waitSettled(t, 1)
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	waitCodexAppServerEnded(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return ended
+	})
+
+	mu.Lock()
+	forwarded := append([]string(nil), messages...)
+	mu.Unlock()
+	published := map[string]bool{}
+	for _, out := range forwarded {
+		published[out] = true
+	}
+	for _, frame := range codexAppServerMarkerFrames {
+		if !published[frame] {
+			t.Fatalf("frame was not forwarded byte-for-byte: %s; forwarded: %q", frame, forwarded)
+		}
+	}
+	pre := codexFoldAssistantText([]byte(codexAppServerMarkerFrames[0]))
+	post := codexFoldAssistantText([]byte(strings.Join(codexAppServerMarkerFrames[1:], "\n")))
+	if pre != codexAppServerMarkerTest || post != codexAppServerMarkerTest {
+		t.Fatalf("marker recovered from forwarded frames: pre=%q post=%q, want %q", pre, post, codexAppServerMarkerTest)
+	}
+	if started, settled := rec.counts(); started != 1 || settled != 1 {
+		t.Fatalf("started=%d settled=%d, want the one turn armed and settled once", started, settled)
+	}
+}
+
+// Both dialects still drive the usage classifiers the transport arms and
+// settles by, so utilization freshness does not change with the dialect.
+func TestCodexUsageClassifiers_RecognisePreAndPostUpdateShapes(t *testing.T) {
+	for _, line := range []string{
+		`{"type":"item.completed","item":{"type":"agent_message","text":"x"}}`,
+		`{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"x"}}`,
+		`{"jsonrpc":"2.0","method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"x"}}}`,
+	} {
+		if !codexRunProgressFrame(line) {
+			t.Errorf("assistant frame must still read as turn progress: %s", line)
+		}
+		if codexRunCompletionFrame(line) {
+			t.Errorf("assistant frame must not settle the turn: %s", line)
+		}
+	}
+	for line, want := range map[string]string{
+		`{"type":"turn.completed"}`:                                                        "turn.completed",
+		`{"jsonrpc":"2.0","method":"turn/completed","params":{}}`:                          "turn.completed",
+		`{"msg":{"type":"task_complete"}}`:                                                 "task_complete",
+		`{"method":"codex/event/task_complete","params":{"msg":{"type":"task_complete"}}}`: "task_complete",
+	} {
+		if got := codexRunCompletionShape(line); got != want {
+			t.Errorf("codexRunCompletionShape(%s) = %q, want %q", line, got, want)
+		}
+	}
 }

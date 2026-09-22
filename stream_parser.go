@@ -396,7 +396,21 @@ func extractContentFromMessage(msg map[string]interface{}) string {
    -------------------------------------------------------------------------- */
 
 // extractCodexDisplayText extracts display text from a Codex JSONL event.
+//
+// Assistant text is read FIRST, through the shared dialect reader
+// (codex_frames.go), because a post-update frame — a JSON-RPC `method`, an
+// event nested under `msg` / `params.msg` — has no top-level `type` for the
+// switch below to see. A delta renders nothing here: readOutputStream buffers
+// deltas on the side (isCodexAssistantDelta) so a delta and the complete
+// message that repeats it can never both reach the batch.
 func extractCodexDisplayText(raw map[string]interface{}) string {
+	switch kind, text := codexAssistantMessageFrame(raw); kind {
+	case codexAssistantComplete:
+		return text
+	case codexAssistantDelta:
+		return ""
+	}
+
 	eventType, _ := raw["type"].(string)
 
 	switch eventType {
@@ -431,10 +445,9 @@ func extractCodexItemCompleted(raw map[string]interface{}) string {
 	}
 	itemType, _ := item["type"].(string)
 
+	// agent_message items are assistant text, read by codexAssistantMessageFrame
+	// before this is reached.
 	switch itemType {
-	case "agent_message":
-		text, _ := item["text"].(string)
-		return text
 	case "command_execution":
 		command, _ := item["command"].(string)
 		if command != "" {

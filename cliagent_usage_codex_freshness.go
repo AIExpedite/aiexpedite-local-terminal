@@ -127,7 +127,9 @@ func codexUsageRunSettled(floor time.Time) {
 }
 
 // codexUsageRunDisarmed is what a session manager calls when a run it armed at
-// `floor` never started — its request never reached the child. `fallback` is
+// `floor` never started — its request never reached the child — and what the
+// `__cli_smoke__` probe calls when its run left no evidence a reconcile could
+// pay (settleOrDisarmCodexSmokeRun). `fallback` is
 // the newest run that manager still has open, or zero: the arm coalesced onto
 // this floor, so that is what the persisted floor rolls back to.
 //

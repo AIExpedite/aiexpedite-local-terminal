@@ -71,10 +71,7 @@ var codexAuthStatusProbe = func(ctx context.Context, path string) (bool, bool) {
 	if strings.TrimSpace(path) == "" {
 		return false, false
 	}
-	cmd := exec.CommandContext(ctx, path, "login", "status")
-	// Background probe: hide the console the child would otherwise pop up on
-	// Windows, where the agent itself runs windowless in the tray.
-	hideWindow(cmd)
+	cmd := newCodexLoginStatusCmd(ctx, path)
 	out, err := cmd.CombinedOutput()
 	status := strings.ToLower(string(out))
 	if strings.Contains(status, "not logged in") || strings.Contains(status, "login required") {
@@ -84,6 +81,52 @@ var codexAuthStatusProbe = func(ctx context.Context, path string) (bool, bool) {
 		return true, true
 	}
 	return false, false
+}
+
+// newCodexLoginStatusCmd builds the `codex login status` child. A Windows
+// `.cmd` / `.bat` npm shim takes the same cmd.exe route the smoke's inference
+// launch takes (codexSmokeShimCommand): CreateProcess cannot start a batch file
+// directly, so a plain spawn would never produce a definite logout and a
+// logged-out shim would spend a turn on every smoke. Background probe: hidden
+// on every route, since the agent itself runs windowless in the tray.
+func newCodexLoginStatusCmd(ctx context.Context, path string) *exec.Cmd {
+	if cmd, ok := codexSmokeShimCommand(ctx, codexSmokeLaunch{
+		Path: path, Args: []string{"login", "status"}, Env: os.Environ(),
+	}); ok {
+		return cmd
+	}
+	cmd := exec.CommandContext(ctx, path, "login", "status")
+	hideWindow(cmd)
+	return cmd
+}
+
+// codexAuthenticatedByAPIKey reports whether Codex will authenticate with an
+// API key — the inherited OPENAI_API_KEY, or the key `codex login --api-key`
+// persists in auth.json — which `codex login status` does not describe.
+func codexAuthenticatedByAPIKey(base string) bool {
+	if strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != "" {
+		return true
+	}
+	auth := codexAuth{}
+	return base != "" && readJSONFile(expandHome(base, "auth.json"), &auth) &&
+		strings.TrimSpace(auth.APIKey) != ""
+}
+
+// codexSmokeLoginCheck is the login pre-check the `__cli_smoke__` provider row
+// registers — the probe's own pre-check and the cooldown replay both call it.
+// It reads the RAW `codex login status` answer, but reports a definite logout
+// as INCONCLUSIVE when an API key will authenticate the turn anyway: otherwise
+// an API-key user's cached verdict is dropped on every replay and each call
+// re-spends a turn despite the cooldown. codexProbeLoginStatus itself keeps
+// the raw pair, because ParseContext acts on a definite logout.
+func codexSmokeLoginCheck(ctx context.Context, path string) (loggedIn, known bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, machineInfoProbeTimeout)
+	defer cancel()
+	loggedIn, known = codexProbeLoginStatus(probeCtx, path)
+	if known && !loggedIn && codexAuthenticatedByAPIKey(codexHomeBase()) {
+		return false, false
+	}
+	return loggedIn, known
 }
 
 // codexProbeLoginStatus skips the probe outright when its budget is gone; an
@@ -187,7 +230,7 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		DataSource:  "token_count",
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
-	hasAPIKeyAuth := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
+	hasAPIKeyAuth := codexAuthenticatedByAPIKey(base)
 	if hasAPIKeyAuth {
 		usage.Authenticated = authBoolPtr(true)
 		usage.AuthState = "authenticated"
@@ -203,7 +246,6 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		usage.Plan = firstNonEmpty(
 			auth.Plan, auth.PlanType, claims.Plan, claims.PlanType, claims.OpenAIAuth.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
-			hasAPIKeyAuth = hasAPIKeyAuth || strings.TrimSpace(auth.APIKey) != ""
 			usage.Authenticated = authBoolPtr(true)
 			usage.AuthState = "authenticated"
 			if auth.Tokens.RefreshToken != "" {

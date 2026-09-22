@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -127,8 +129,12 @@ func TestHandleCLISmokeCommand_UnknownCliIDNeverExecutes(t *testing.T) {
 	})
 	published := capturePublishes(t)
 
-	// grok is a KNOWN provider now — it must not be in this list.
-	for _, known := range []string{"claudeCode", "grok"} {
+	codexCalls, _ := stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		t.Fatal("unknown cliId must never spawn a codex child")
+		return nil, nil, nil
+	})
+	// grok and codex are KNOWN providers now — they must not be in this list.
+	for _, known := range []string{"claudeCode", "grok", "codex"} {
 		if _, ok := cliSmokeProviders[known]; !ok {
 			t.Fatalf("%s is missing from cliSmokeProviders", known)
 		}
@@ -151,8 +157,8 @@ func TestHandleCLISmokeCommand_UnknownCliIDNeverExecutes(t *testing.T) {
 			t.Errorf("result %d status = %q, want error", i, res.Status)
 		}
 	}
-	if *calls != 0 || *grokCalls != 0 {
-		t.Fatalf("exec seams ran %d/%d times for unknown cliIds", *calls, *grokCalls)
+	if *calls != 0 || *grokCalls != 0 || *codexCalls != 0 {
+		t.Fatalf("exec seams ran %d/%d/%d times for unknown cliIds", *calls, *grokCalls, *codexCalls)
 	}
 }
 
@@ -213,6 +219,15 @@ func TestMakeCLISmokeResult_PublishesMetricsOnly(t *testing.T) {
 			ArgvShapeID:   claudeArgvShapes[0].ID,
 			Diagnostic:    cliSmokeDiagnosticFramingRejected,
 		}},
+		{"codex", cliSmokeResult{
+			CliID:         "codex",
+			Version:       codexSmokeTestVersion,
+			Status:        cliSmokeStatusFailed,
+			ErrorCategory: cliUsageErrorProtocol,
+			DurationMs:    99,
+			ArgvShapeID:   codexSmokeArgvShapes[0].ID,
+			Diagnostic:    cliSmokeDiagnosticNoEnvelope,
+		}},
 		{"grok", cliSmokeResult{
 			CliID:         "grok",
 			Version:       "grok 1.0.13",
@@ -242,7 +257,8 @@ func TestMakeCLISmokeResult_PublishesMetricsOnly(t *testing.T) {
 			// The published shape must have no room for prompt/marker/argv/config
 			// material — for either provider.
 			for _, banned := range []string{
-				claudeSmokeMarkerPrefix, grokSmokeMarkerPrefix, "Reply with exactly",
+				claudeSmokeMarkerPrefix, grokSmokeMarkerPrefix, codexSmokeMarkerPrefix, "Reply with exactly",
+				"--output-last-message", codexSmokeLastMessageName, "read-only",
 				grokMaintenanceSmokePromptPrefix, "mcpServers", "--tools", "--print",
 				"--prompt-file", "auth.json", "config.toml", "GROK_HOME",
 			} {
@@ -259,5 +275,102 @@ func TestCLISmokeCommandIsAllowlistedInternalCommand(t *testing.T) {
 	// the approval dialog if it ever reaches the execute path.
 	if !strings.Contains(defaultAllowListContent, cliSmokeCommand) {
 		t.Fatalf("%s missing from the internal-commands allowlist", cliSmokeCommand)
+	}
+}
+
+// codex on the same signed channel: `Args: ["codex"]` reaches the Codex
+// provider and publishes exactly one correlated result with Output empty.
+func TestHandleCLISmokeCommand_CodexPublishesOneCorrelatedResult(t *testing.T) {
+	codexSmokeEnv(t)
+	path := stubCodexBinary(t)
+	stubCodexSmokePath(t, path)
+	calls, _ := stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		return []byte(`{"jsonrpc":"2.0","method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"` +
+			codexMarkerFromLaunch(t, launch) + `"}}}` + "\n"), nil, nil
+	})
+	published := capturePublishes(t)
+
+	if err := handleCLISmokeCommand(context.Background(), nil, smokeCommand("codex"), &Config{AgentID: "agent-9"}); err != nil {
+		t.Fatalf("handler returned %v", err)
+	}
+
+	if len(*published) != 1 {
+		t.Fatalf("published %d messages, want exactly 1", len(*published))
+	}
+	res := (*published)[0]
+	if res.Type != cliSmokeResultType || res.RefreshID != "refresh-7" || res.ID != "cmd-1" {
+		t.Fatalf("result is not a correlated smoke result: %+v", res)
+	}
+	if res.Status != "success" || res.Smoke == nil || res.Smoke.CliID != "codex" || !res.Smoke.MarkerMatched {
+		t.Fatalf("post-update codex answer should publish a success verdict: %+v", res.Smoke)
+	}
+	if res.Output != "" {
+		t.Errorf("smoke result must carry no CLI output, got %q", res.Output)
+	}
+	if *calls != 1 {
+		t.Errorf("handler spent %d turns, want 1", *calls)
+	}
+}
+
+// Redaction: credential, prompt and raw-config sentinels planted in the
+// child's stdout/stderr, the env and CODEX_HOME's config must appear in
+// neither the published result, the published usage payload, nor the device
+// log line.
+func TestHandleCLISmokeCommand_CodexLeaksNoCredentialPromptOrConfig(t *testing.T) {
+	const (
+		credSentinel   = "sk-CODEX-CREDENTIAL-SENTINEL-7f3a"
+		promptSentinel = "PROMPT-SENTINEL-EXACTLY-THIS"
+		configSentinel = "CONFIG-SENTINEL-model_provider"
+	)
+	home, _ := codexSmokeEnv(t)
+	t.Setenv("OPENAI_API_KEY", credSentinel)
+	helperWriteJSON(t, filepath.Join(home, "auth.json"), map[string]any{
+		"email": "dev@example.com", "OPENAI_API_KEY": credSentinel,
+	})
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(`model_provider = "`+configSentinel+`"`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := stubCodexBinary(t)
+	stubCodexSmokePath(t, path)
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		// A chatty answer echoing everything it can see, so the verdict is a
+		// failure and the device log line is written.
+		stdout := `{"type":"item.completed","item":{"type":"agent_message","text":"` + promptSentinel + " " + credSentinel + " " + configSentinel + `"}}` + "\n" +
+			`{"type":"turn.completed"}` + "\n"
+		stderr := "warning: " + credSentinel + " " + configSentinel + " " + launch.Prompt + " " + launch.LastMessageFile
+		return []byte(stdout), []byte(stderr), nil
+	})
+	published := capturePublishes(t)
+
+	logged := captureStdout(t, func() {
+		if err := handleCLISmokeCommand(context.Background(), nil, smokeCommand("codex"), &Config{AgentID: "agent-9"}); err != nil {
+			t.Fatalf("handler returned %v", err)
+		}
+	})
+	if len(*published) != 1 || (*published)[0].Smoke == nil || (*published)[0].Smoke.Diagnostic != cliSmokeDiagnosticMarkerMismatch {
+		t.Fatalf("published = %+v, want one marker_mismatch verdict", *published)
+	}
+	payload, err := json.Marshal((*published)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true, Path: path, Version: codexSmokeTestVersion}, time.Now())
+	usagePayload, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for surface, text := range map[string]string{
+		"published result": string(payload),
+		"usage payload":    string(usagePayload),
+		"device log":       logged,
+	} {
+		for _, banned := range []string{credSentinel, promptSentinel, configSentinel, codexSmokeMarkerPrefix, "Reply with exactly", codexSmokeLastMessageName} {
+			if strings.Contains(text, banned) {
+				t.Errorf("%s leaked %q: %s", surface, banned, text)
+			}
+		}
+	}
+	if !strings.Contains(logged, "diagnostic=marker_mismatch") {
+		t.Errorf("the failure should still reach the device log as closed values: %q", logged)
 	}
 }

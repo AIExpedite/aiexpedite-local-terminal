@@ -1683,11 +1683,33 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
 
+	// Codex assistant deltas accumulate here with NO separator — flushBatch
+	// joins batch entries with a newline, and a newline at a frame boundary breaks
+	// an exact marker. A complete assistant message supersedes (discards) the
+	// deltas that streamed it, so the text reaches the batch once; deltas no
+	// complete message followed are appended when the turn or stream ends.
+	var codexDeltas strings.Builder
+	flushCodexDeltas := func() {
+		if codexDeltas.Len() > 0 {
+			batch = append(batch, codexDeltas.String())
+			codexDeltas.Reset()
+		}
+	}
+
 	appendDisplayText := func(lineText string) {
 		// Before any display filtering: the events that carry a one-shot CLI's
 		// conversation id (agy `init`, OpenCode lifecycle frames) render as no
 		// text at all, so this is the only place the id can be seen.
 		session.noteCliConversationID(lineText)
+		if isCodexCommand(session.Command) {
+			switch kind, text := codexAssistantLine(lineText); kind {
+			case codexAssistantDelta:
+				codexDeltas.WriteString(text)
+				return
+			case codexAssistantComplete:
+				codexDeltas.Reset()
+			}
+		}
 		if isAntigravityCommand(session.Command) {
 			if isAntigravityAgentResponseDelta(lineText) {
 				var raw map[string]interface{}
@@ -1743,6 +1765,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					session.ExitCode = 1
 					session.mu.Unlock()
 				}
+				flushCodexDeltas()
 				// All readers done — flush remaining
 				flushBatch()
 				return
@@ -1945,6 +1968,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// the terminal event itself. Add it before flushing so its stream
 				// sequence precedes the turn_complete prompt sequence.
 				appendDisplayText(line.text)
+				flushCodexDeltas()
 				flushBatch()
 				// A finished codex turn owes the CLI Agents card a reading taken
 				// after it started (cliagent_usage_codex_freshness.go). Once per
