@@ -52,7 +52,7 @@ func TestCodexAssistantMessageFrame_ReadsEveryDialect(t *testing.T) {
 		{"non-JSON banner", `Codex v9.9.9 — update available`, codexAssistantNone, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			kind, text := codexAssistantLine(tc.line)
+			kind, text, _ := codexAssistantLine(tc.line)
 			if kind != tc.kind || text != tc.text {
 				t.Fatalf("codexAssistantLine = (%d, %q), want (%d, %q)", kind, text, tc.kind, tc.text)
 			}
@@ -96,6 +96,14 @@ func TestCodexFoldAssistantText(t *testing.T) {
 			`{"type":"item.completed","item":{"type":"agent_message","text":"` + m + `"}}`,
 		}, m},
 		{"no assistant text", noise, ""},
+		// The app-server protocol announces every chunk in BOTH dialects: the
+		// twin must not double the answer.
+		{"dual-dialect deltas", []string{
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}`,
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"0badc0de"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"0badc0de"}}`,
+		}, m},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			stdout := []byte(strings.Join(tc.lines, "\n") + "\n")

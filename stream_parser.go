@@ -404,7 +404,7 @@ func extractContentFromMessage(msg map[string]interface{}) string {
 // deltas on the side (isCodexAssistantDelta) so a delta and the complete
 // message that repeats it can never both reach the batch.
 func extractCodexDisplayText(raw map[string]interface{}) string {
-	switch kind, text := codexAssistantMessageFrame(raw); kind {
+	switch kind, text, _ := codexAssistantMessageFrame(raw); kind {
 	case codexAssistantComplete:
 		return text
 	case codexAssistantDelta:

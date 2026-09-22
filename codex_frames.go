@@ -19,6 +19,12 @@
 // codexNormalizeCompletionName in cliagent_usage_codex_freshness.go); this
 // file adds only which names carry assistant text and under which key.
 //
+// A stream may announce the SAME message in two dialects at once — the
+// app-server protocol sends every event both as a legacy `codex/event/*`
+// notification and as its `item/*` successor — so each frame also reports its
+// dialect family, and consumers accept assistant text from the first family a
+// stream uses and ignore its twin.
+//
 // The text keys are `text` then `message` (and `delta` for a delta frame) at
 // the location the event name was found. Only `item.text` is evidenced by a
 // captured transcript in this repo; if a captured post-update transcript
@@ -42,30 +48,38 @@ const (
 	codexAssistantDelta
 )
 
+// Dialect families of an assistant frame: the legacy event names
+// (`agent_message`, `agent_message_delta`) and the item-based ones
+// (`item.completed` with an agent-message item, `item/agentMessage/*`).
+const (
+	codexAssistantFamilyEvent = "event"
+	codexAssistantFamilyItem  = "item"
+)
+
 // codexAssistantMessageFrame reports whether a parsed Codex frame carries
-// assistant text, and that text. It must run BEFORE any top-level `type`
-// switch: a JSON-RPC frame has no top-level `type` at all. A frame whose text
+// assistant text, that text, and its dialect family. It must run BEFORE any
+// top-level `type` switch: a JSON-RPC frame has no top-level `type` at all. A frame whose text
 // is empty reports codexAssistantNone — an empty message says nothing and
 // must not replace a real one.
-func codexAssistantMessageFrame(raw map[string]interface{}) (codexAssistantFrameKind, string) {
+func codexAssistantMessageFrame(raw map[string]interface{}) (kind codexAssistantFrameKind, text, family string) {
 	for _, node := range codexAssistantEventNodes(raw) {
-		kind, text := codexAssistantNodeText(node)
+		kind, text, family := codexAssistantNodeText(node)
 		if kind != codexAssistantNone && text != "" {
-			return kind, text
+			return kind, text, family
 		}
 	}
-	return codexAssistantNone, ""
+	return codexAssistantNone, "", ""
 }
 
 // codexAssistantLine is codexAssistantMessageFrame for a raw stdout line.
-func codexAssistantLine(line string) (codexAssistantFrameKind, string) {
+func codexAssistantLine(line string) (kind codexAssistantFrameKind, text, family string) {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
-		return codexAssistantNone, ""
+		return codexAssistantNone, "", ""
 	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		return codexAssistantNone, ""
+		return codexAssistantNone, "", ""
 	}
 	return codexAssistantMessageFrame(raw)
 }
@@ -75,7 +89,7 @@ func codexAssistantLine(line string) (codexAssistantFrameKind, string) {
 // chunks) instead of batching them, the same discipline
 // isAntigravityAgentResponseDelta gives Antigravity.
 func isCodexAssistantDelta(line string) bool {
-	kind, _ := codexAssistantLine(line)
+	kind, _, _ := codexAssistantLine(line)
 	return kind == codexAssistantDelta
 }
 
@@ -83,17 +97,24 @@ func isCodexAssistantDelta(line string) bool {
 // answer: the LAST complete message wins; deltas are concatenated with NO
 // separator (a newline at a frame boundary is itself an exact-marker failure)
 // and used only when no complete message arrived, so a stream that deltas and
-// then repeats itself yields the text once. Non-JSON lines (a banner, an
-// updater notice) and unparseable lines are skipped.
+// then repeats itself yields the text once. Deltas are taken from ONE dialect
+// family — the first the stream uses — so a stream announcing every chunk in
+// both dialects does not double them. Non-JSON lines (a banner, an updater
+// notice) and unparseable lines are skipped.
 func codexFoldAssistantText(stdout []byte) string {
-	var complete string
+	var complete, deltaFamily string
 	var deltas strings.Builder
 	for _, line := range bytes.Split(stdout, []byte("\n")) {
-		switch kind, text := codexAssistantLine(string(line)); kind {
+		switch kind, text, family := codexAssistantLine(string(line)); kind {
 		case codexAssistantComplete:
 			complete = text
 		case codexAssistantDelta:
-			deltas.WriteString(text)
+			if deltaFamily == "" {
+				deltaFamily = family
+			}
+			if family == deltaFamily {
+				deltas.WriteString(text)
+			}
 		}
 	}
 	if complete != "" {
@@ -142,13 +163,13 @@ func codexAssistantEventNodes(raw map[string]interface{}) []codexEventNode {
 
 // codexAssistantNodeText classifies one node by its event name and reads the
 // text at that node.
-func codexAssistantNodeText(node codexEventNode) (codexAssistantFrameKind, string) {
+func codexAssistantNodeText(node codexEventNode) (codexAssistantFrameKind, string, string) {
 	name := strings.TrimPrefix(node.name, "codex/event/")
 	switch codexBareEventName(name) {
 	case "agent_message":
-		return codexAssistantComplete, codexFirstString(node.body, "text", "message")
+		return codexAssistantComplete, codexFirstString(node.body, "text", "message"), codexAssistantFamilyEvent
 	case "agent_message_delta":
-		return codexAssistantDelta, codexFirstString(node.body, "delta", "text", "message")
+		return codexAssistantDelta, codexFirstString(node.body, "delta", "text", "message"), codexAssistantFamilyEvent
 	}
 	switch codexNormalizeCompletionName(name) {
 	case "item.completed":
@@ -156,14 +177,14 @@ func codexAssistantNodeText(node codexEventNode) (codexAssistantFrameKind, strin
 		// file_change items are rendered by extractCodexItemCompleted.
 		item, _ := node.body["item"].(map[string]interface{})
 		if itemType, _ := item["type"].(string); itemType == "agent_message" || itemType == "agentMessage" {
-			return codexAssistantComplete, codexFirstString(item, "text", "message")
+			return codexAssistantComplete, codexFirstString(item, "text", "message"), codexAssistantFamilyItem
 		}
 	case "agentMessage.completed":
-		return codexAssistantComplete, codexFirstString(node.body, "text", "message")
+		return codexAssistantComplete, codexFirstString(node.body, "text", "message"), codexAssistantFamilyItem
 	case "agentMessage.delta":
-		return codexAssistantDelta, codexFirstString(node.body, "delta", "text", "message")
+		return codexAssistantDelta, codexFirstString(node.body, "delta", "text", "message"), codexAssistantFamilyItem
 	}
-	return codexAssistantNone, ""
+	return codexAssistantNone, "", ""
 }
 
 // codexFirstString returns the first non-empty string value among keys.

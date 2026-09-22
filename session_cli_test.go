@@ -3501,6 +3501,20 @@ func TestReadOutputStream_CodexExactMarkerPreAndPostUpdate(t *testing.T) {
 		// Side buffer appended at stream end, no separator between chunks.
 		{"delta only", append(append([]string{}, start...), append(deltas, `{"type":"turn.completed"}`)...)},
 		{"delta only, no terminal event", append(append([]string{}, start...), deltas...)},
+		// The app-server protocol announces every chunk and message in BOTH
+		// dialects; the twin must neither double a delta nor batch the marker
+		// a second time.
+		{"dual dialect, deltas then complete", append(append([]string{}, start...),
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"AIEXPEDITE_CODEX_"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_"}}`,
+			`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"`+marker+`"}}}`,
+			`{"method":"codex/event/agent_message","params":{"msg":{"type":"agent_message","message":"`+marker+`"}}}`,
+			`{"type":"turn.completed"}`)},
+		{"dual dialect, delta only", append(append([]string{}, start...),
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"AIEXPEDITE_CODEX_SMOKE_OK_"}}`,
+			`{"method":"codex/event/agent_message_delta","params":{"msg":{"type":"agent_message_delta","delta":"0badc0de"}}}`,
+			`{"method":"item/agentMessage/delta","params":{"delta":"0badc0de"}}`)},
 		// The complete message discards the buffered deltas: marker once.
 		{"delta then complete", append(append(append([]string{}, start...), deltas...),
 			`{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"`+marker+`"}}}`,

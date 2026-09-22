@@ -1688,7 +1688,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	// an exact marker. A complete assistant message supersedes (discards) the
 	// deltas that streamed it, so the text reaches the batch once; deltas no
 	// complete message followed are appended when the turn or stream ends.
+	// Text is accepted from ONE dialect family per kind — the first the stream
+	// uses — because the app-server protocol announces every message and chunk
+	// twice (legacy `codex/event/*` and `item/*`); the twin would otherwise
+	// double each delta and batch the marker twice.
 	var codexDeltas strings.Builder
+	var codexDeltaFamily, codexCompleteFamily string
 	flushCodexDeltas := func() {
 		if codexDeltas.Len() > 0 {
 			batch = append(batch, codexDeltas.String())
@@ -1702,12 +1707,23 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		// text at all, so this is the only place the id can be seen.
 		session.noteCliConversationID(lineText)
 		if isCodexCommand(session.Command) {
-			switch kind, text := codexAssistantLine(lineText); kind {
+			switch kind, text, family := codexAssistantLine(lineText); kind {
 			case codexAssistantDelta:
-				codexDeltas.WriteString(text)
+				if codexDeltaFamily == "" {
+					codexDeltaFamily = family
+				}
+				if family == codexDeltaFamily {
+					codexDeltas.WriteString(text)
+				}
 				return
 			case codexAssistantComplete:
 				codexDeltas.Reset()
+				if codexCompleteFamily == "" {
+					codexCompleteFamily = family
+				}
+				if family != codexCompleteFamily {
+					return // the same message in the stream's other dialect
+				}
 			}
 		}
 		if isAntigravityCommand(session.Command) {
