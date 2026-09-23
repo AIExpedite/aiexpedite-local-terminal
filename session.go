@@ -1255,15 +1255,58 @@ func taskkillRootNotFound(err error) bool {
 // at the ANSI escape that starts colorReset, so the terminal color still resets.
 var sessionConfigPathPattern = regexp.MustCompile(`(?i)(?:(?:[a-z]:|~)?[\\/](?:[^\\/\r\n\x1b"':*?<>|]*[\\/])*|[^\s\x1b"']*)(?:\.grok[\\/]|[^\\/\s\x1b"']*config\.(?:toml|json|ya?ml)\b)[^\s\x1b"']*`)
 
+// sessionIDWordByte reports whether b can sit inside a session id, and so
+// whether a neighbouring byte means a match is only part of a longer token.
+// Ids reach this file straight from the cloud (handleSessionCommand enforces
+// no shape), so they can be any non-empty string — including a single letter.
+func sessionIDWordByte(b byte) bool {
+	return b == '-' || b == '_' ||
+		(b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z')
+}
+
+// redactSessionIDOccurrences replaces whole-token occurrences of sessionID
+// only. A short id like `s` is a valid session id, and a plain ReplaceAll
+// would then rewrite the `[session]` prefix and every other `s` in the line;
+// requiring a non-word byte (or the line edge) on both sides keeps the
+// diagnostic text readable while still masking the id wherever it stands
+// alone. An id whose own edge is a non-word byte still matches, because the
+// boundary test looks at what surrounds the match, not at the id.
+func redactSessionIDOccurrences(msg, sessionID string) string {
+	var b strings.Builder
+	for rest := msg; ; {
+		i := strings.Index(rest, sessionID)
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		end := i + len(sessionID)
+		beforeIsWord := i > 0 && sessionIDWordByte(rest[i-1])
+		afterIsWord := end < len(rest) && sessionIDWordByte(rest[end])
+		if beforeIsWord || afterIsWord {
+			// Part of a longer token: emit through this match and keep
+			// scanning from just after its first byte, so an overlapping
+			// standalone occurrence is still found.
+			b.WriteString(rest[:i+1])
+			rest = rest[i+1:]
+			continue
+		}
+		b.WriteString(rest[:i])
+		b.WriteString("[session_id:REDACTED]")
+		rest = rest[end:]
+	}
+}
+
 // redactSessionLog strips credentials, config paths and the session id from a
 // [session] log line. The id goes first, so the long-blob mask in
 // redactAgentSecrets cannot mangle an unusually long id past recognition. An
-// empty sessionID leaves ids alone: strings.ReplaceAll with an empty old
-// string would insert the mask between every byte. Log-only — published
+// empty sessionID leaves ids alone: replacing an empty old string would
+// insert the mask between every byte. Log-only — published
 // resultMsg.SessionID values stay intact, the cloud keys frames by them.
 func redactSessionLog(sessionID, msg string) string {
 	if sessionID != "" {
-		msg = strings.ReplaceAll(msg, sessionID, "[session_id:REDACTED]")
+		msg = redactSessionIDOccurrences(msg, sessionID)
 	}
 	msg = redactAgentSecrets(redactSensitiveData(msg))
 	return sessionConfigPathPattern.ReplaceAllString(msg, "[config_path:REDACTED]")

@@ -2244,6 +2244,22 @@ func TestRedactSessionLog(t *testing.T) {
 			present: []string{"--api-key [REDACTED]", "--model grok-4"},
 		},
 		{
+			name:      "short id masks only whole tokens",
+			sessionID: "s",
+			msg:       "[session] stderr[1] s: session stream stalled\n",
+			absent:    []string{" s:"},
+			present: []string{
+				"[session] stderr[1] [session_id:REDACTED]: session stream stalled",
+			},
+		},
+		{
+			name:      "id inside a longer token is left alone",
+			sessionID: "abc",
+			msg:       "[session] abcdef and xyabc and abc-1 done: abc\n",
+			absent:    []string{" abc\n"},
+			present:   []string{"abcdef", "xyabc", "abc-1", "done: [session_id:REDACTED]"},
+		},
+		{
 			name:    "color reset survives a trailing path",
 			msg:     colorYellow + "[session] loading ~/.codex/config.yaml" + colorReset + "\n",
 			absent:  []string{"config.yaml"},
