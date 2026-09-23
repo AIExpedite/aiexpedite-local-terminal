@@ -12,15 +12,19 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -204,15 +208,7 @@ type CLISession struct {
 	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
-	// shimmedChildTree marks a session whose Process is an INTERMEDIATE cmd.exe
-	// wrapper rather than the CLI itself — the Windows npm `grok.cmd` shim route
-	// the retained session_start maintenance smoke takes (newGrokSmokeCmd).
-	// Killing only that wrapper reparents the shim's Node/Grok child out of
-	// reach, leaking a provider process that still holds this session's
-	// stdout/stderr handles. killSessionProcess takes the whole tree down for
-	// these; every other session keeps the plain Process.Kill it always had.
-	shimmedChildTree bool
-	streamDone       chan struct{} // closed when stdout/stderr and stream publishes finish
+	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
 	// terminalPublishState reserves this session's ID while its session_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
@@ -346,7 +342,6 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// point returns early and would otherwise leak the file. Disarm this defer
 	// once the session has taken ownership.
 	var promptFile string
-	grokSmokeShimmed := false
 	sessionOwnsPromptFile := false
 	defer func() {
 		if promptFile != "" && !sessionOwnsPromptFile {
@@ -436,7 +431,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			if reason == "" {
 				reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
 			}
-			fmt.Printf("%s[session] Refusing grok maintenance smoke %s: %s (source=%s state=%s)%s\n",
+			logSession(id, "%s[session] Refusing grok maintenance smoke %s: %s (source=%s state=%s)%s\n",
 				colorYellow, id, reason, authAssessment.Source, authAssessment.AuthState, colorReset)
 			return newGrokAuthError(reason)
 		}
@@ -503,7 +498,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		executable = resolveExecutable(command)
 	}
 
-	fmt.Printf("%s[session] Starting %s session %s: %s %s%s\n",
+	logSession(id, "%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, strings.Join(cliArgs, " "), colorReset)
 
 	proc := exec.Command(executable, cliArgs...)
@@ -544,9 +539,8 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// The shim route hands us an intermediate cmd.exe, not grok itself, and
 		// this launch supplies a background context — so exec's own Cancel (the
 		// tree kill bindGrokShimProcessTree installs) can never fire here.
-		// Record the wrapper so every session kill path takes the tree down
-		// instead of orphaning the shim's Node child on the output handles.
-		grokSmokeShimmed = isGrokWindowsShim(executable)
+		// killSessionProcess tree-kills every Windows session, so the shim's
+		// Node child goes down with the wrapper.
 		proc = newGrokSmokeCmd(context.Background(), grokSmokeLaunch{
 			Path:       executable,
 			Args:       cliArgs,
@@ -556,7 +550,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		})
 	}
 	if len(strippedVars) > 0 {
-		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
+		logSession(id, "%s[session] Stripped env vars from session %s: %s%s\n",
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)
 	}
 
@@ -774,7 +768,6 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
-		shimmedChildTree:   grokSmokeShimmed,
 	}
 
 	sm.sessions[id] = session
@@ -820,7 +813,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	sessionOwnsPromptFile = true
 	isolationOwnedBySession = true
 
-	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
+	logSession(id, "%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
 
 	// Deliver the initial prompt on stdin, framed per the target CLI's protocol.
@@ -862,7 +855,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// prompt, so leaving the pipe open makes it wait indefinitely for EOF.
 	if shouldCloseStdinAfterStart(command, stdinPrompt) {
 		session.Stdin.Close()
-		fmt.Printf("%s[session] Closed stdin for one-shot session %s (%s)%s\n",
+		logSession(id, "%s[session] Closed stdin for one-shot session %s (%s)%s\n",
 			colorYellow, id, command, colorReset)
 	} else if utilitySession {
 		// A utility never reads interactive stdin; close it so a child that does
@@ -883,11 +876,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 // logged and starts nothing, exactly as a failed deferred SendInput does.
 func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string, promptLen int, format string) {
 	if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
-		fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
+		logSession(session.ID, "%s[session] Failed to send initial prompt to %s: %v%s\n",
 			colorRed, session.ID, err, colorReset)
 		return
 	}
-	fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
+	logSession(session.ID, "%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
 		colorGreen, session.ID, promptLen, format, colorReset)
 	if isCodexCommand(session.Command) {
 		session.armCodexUsageRun(session.StartedAt)
@@ -971,7 +964,7 @@ func (s *CLISession) closeDeferredStdinLocked() {
 	}
 	s.deferredStdinClose = false
 	s.Stdin.Close()
-	fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
+	logSession(s.ID, "%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
 		colorYellow, s.ID, s.Command, colorReset)
 }
 
@@ -1101,7 +1094,7 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	// caught.
 	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 
-	fmt.Printf("%s[session] Input sent to %s: %s%s\n",
+	logSession(id, "%s[session] Input sent to %s: %s%s\n",
 		colorBlue, id, truncateString(text, 80), colorReset)
 
 	return nil
@@ -1134,13 +1127,13 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 		if err := interruptProcess(session.Process); err != nil {
 			return fmt.Errorf("failed to interrupt session %s: %w", id, err)
 		}
-		fmt.Printf("%s[session] Interrupt sent to %s%s\n", colorYellow, id, colorReset)
+		logSession(id, "%s[session] Interrupt sent to %s%s\n", colorYellow, id, colorReset)
 	case "kill":
 		// Force kill
 		if err := killSessionProcess(session); err != nil {
 			return fmt.Errorf("failed to kill session %s: %w", id, err)
 		}
-		fmt.Printf("%s[session] Kill sent to %s%s\n", colorRed, id, colorReset)
+		logSession(id, "%s[session] Kill sent to %s%s\n", colorRed, id, colorReset)
 	default:
 		return fmt.Errorf("unknown signal: %s (expected 'interrupt' or 'kill')", signal)
 	}
@@ -1148,33 +1141,86 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 	return nil
 }
 
-// killSessionProcess force-kills a session's child.
+// killSessionProcess force-kills a session's child AND its descendants.
 //
-// For an ordinary session this is exactly the Process.Kill it has always been.
-// For a session whose child is a cmd.exe wrapper (shimmedChildTree — the
-// Windows `grok.cmd` smoke route) the whole tree goes down FIRST, because
-// killing cmd.exe on its own reparents the shim's real Grok/Node child out of
-// `taskkill /T`'s reach. Reuses KillProcessTree (processes_windows.go), the
-// same teardown cleanup_windows.go and bindGrokShimProcessTree use; it is a
-// no-op error on non-Windows, which is swallowed.
+// The tree goes down FIRST, while the root still anchors it: killing the root
+// alone (cmd.exe for the Windows `grok.cmd` smoke, or any CLI that spawned a
+// shim/tool child) reparents the descendants out of `taskkill /T`'s reach, and
+// they keep this session's stdout/stderr write handles open until waitForExit
+// hits sessionStreamDrainTimeout. Same order as killAntigravityProcessTree.
+// KillProcessTree (processes_windows.go) is the only Windows tree primitive;
+// on unix it is an error without spawning and Process.Kill is the kill.
 //
-// A successful tree kill IS the kill: `taskkill /F /T` reaps the cmd.exe root
-// along with its descendants, so the follow-up Process.Kill lands on an
-// already-terminated handle and Windows reports it as TerminateProcess
-// "Access is denied". That is not a failed kill and must not be surfaced as
-// one to the shutdown paths; the follow-up stays as best-effort insurance for
-// a root taskkill enumerated but had not yet torn down.
+// Result contract:
+//   - no process                          → os.ErrProcessDone
+//   - already reaped by waitForExit       → nil, without touching the PID
+//   - already gone before the tree kill   → nil
+//   - Windows tree kill failed but Kill
+//     terminated a still-live root        → the tree error (descendants may
+//     have been orphaned)
+//   - Kill returned ErrProcessDone, the
+//     process reads gone, or Kill nil
+//     after a working tree kill           → nil (taskkill "not found" races an
+//     exit; a unix zombie awaits waitForExit's reap)
+//   - otherwise one more gone probe, else the Kill error (a concurrent kill
+//     can land the exit code between Kill and the first probe).
+//
+// Neither Wait nor Release is called here: waitForExit owns the reap, and the
+// open os.Process handle is what keeps the PID from being recycled.
 func killSessionProcess(session *CLISession) error {
 	if session == nil || session.Process == nil || session.Process.Process == nil {
 		return os.ErrProcessDone
 	}
-	if session.shimmedChildTree {
-		if err := KillProcessTree(session.Process.Process.Pid); err == nil {
-			_ = session.Process.Process.Kill()
-			return nil
-		}
+	proc := session.Process.Process
+	// Already reaped (waitForExit's Wait returned, e.g. a delayed quota kill
+	// firing after exit): the handle that pinned the PID is closed, so a
+	// PID-based taskkill could reach a recycled stranger. Signal 0 reads
+	// ErrProcessDone from Go's own state on every platform without the OS.
+	if errors.Is(proc.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+		return nil
 	}
-	return session.Process.Process.Kill()
+	goneBefore := processHandleGone(proc)
+	treeErr := KillProcessTree(proc.Pid)
+	killErr := proc.Kill()
+	switch {
+	case goneBefore:
+		return nil
+	case runtime.GOOS == "windows" && treeErr != nil && killErr == nil:
+		return fmt.Errorf("process tree kill failed, root killed alone: %w", treeErr)
+	case killErr == nil, errors.Is(killErr, os.ErrProcessDone), processHandleGone(proc):
+		return nil
+	case processHandleGone(proc):
+		// Re-probe once: a concurrent kill (the session timeout) can land the
+		// exit code between Kill and the probe above.
+		return nil
+	}
+	return killErr
+}
+
+// sessionConfigPathPattern matches config-file paths (config.toml / .json /
+// .yaml / .yml) and anything under a `.grok/` directory — a CLI that fails
+// while loading one quotes the path, and the user's home/profile layout is not
+// something a [session] log line needs. Stops at whitespace, quotes, and the
+// ANSI escape that starts colorReset so the terminal color still resets.
+var sessionConfigPathPattern = regexp.MustCompile(`(?i)[^\s\x1b"']*(?:config\.(?:toml|json|ya?ml)\b|\.grok[\\/])[^\s\x1b"']*`)
+
+// redactSessionLog strips credentials, config paths and the session id from a
+// [session] log line. The id goes first, so the long-blob mask in
+// redactAgentSecrets cannot mangle an unusually long id past recognition. An
+// empty sessionID leaves ids alone: strings.ReplaceAll with an empty old
+// string would insert the mask between every byte. Log-only — published
+// resultMsg.SessionID values stay intact, the cloud keys frames by them.
+func redactSessionLog(sessionID, msg string) string {
+	if sessionID != "" {
+		msg = strings.ReplaceAll(msg, sessionID, "[session_id:REDACTED]")
+	}
+	msg = redactAgentSecrets(redactSensitiveData(msg))
+	return sessionConfigPathPattern.ReplaceAllString(msg, "[config_path:REDACTED]")
+}
+
+// logSession prints a [session] log line through redactSessionLog.
+func logSession(sessionID, format string, args ...any) {
+	fmt.Print(redactSessionLog(sessionID, fmt.Sprintf(format, args...)))
 }
 
 /* --------------------------------------------------------------------------
@@ -1227,7 +1273,7 @@ func (sm *SessionManager) EndSession(id string) error {
 		}
 		if session.Process.Process != nil {
 			if killErr := killSessionProcess(session); killErr != nil {
-				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+				logSession(id, "%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 			}
 		}
 		if waitDoneConfirm(processExited, killConfirmTimeout) {
@@ -1236,7 +1282,7 @@ func (sm *SessionManager) EndSession(id string) error {
 		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
-	fmt.Printf("%s[session] Ending session %s gracefully...%s\n", colorYellow, id, colorReset)
+	logSession(id, "%s[session] Ending session %s gracefully...%s\n", colorYellow, id, colorReset)
 
 	// Try graceful interrupt first
 	_ = interruptProcess(session.Process)
@@ -1247,15 +1293,15 @@ func (sm *SessionManager) EndSession(id string) error {
 		// Process exited gracefully
 	case <-time.After(gracefulShutdownTimeout):
 		// Force kill after timeout
-		fmt.Printf("%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
+		logSession(id, "%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
 			colorRed, id, colorReset)
 		if killErr := killSessionProcess(session); killErr != nil {
-			fmt.Printf("%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+			logSession(id, "%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 		}
 		// BOUNDED wait for exit after kill — see end_confirm.go for why
 		// blocking here indefinitely wedged an entire device (2026-08-27).
 		if !waitDoneConfirm(processExited, killConfirmTimeout) {
-			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+			logSession(id, "%s[session] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 				colorRed, id, killConfirmTimeout, colorReset)
 			session.mu.Lock()
 			session.killUnconfirmed = true
@@ -1307,7 +1353,7 @@ func (sm *SessionManager) CleanupStale(maxAge time.Duration) {
 			sm.mu.RUnlock()
 
 			for _, id := range staleIDs {
-				fmt.Printf("%s[session] Cleaning up stale session %s (exceeded %v)%s\n",
+				logSession(id, "%s[session] Cleaning up stale session %s (exceeded %v)%s\n",
 					colorYellow, id, maxAge, colorReset)
 				_ = sm.EndSession(id)
 			}
@@ -1461,7 +1507,7 @@ func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
 	select {
 	case <-session.streamDone:
 	case <-time.After(timeout):
-		fmt.Printf("%s[session] Timed out waiting for stream publish completion for %s%s\n",
+		logSession(session.ID, "%s[session] Timed out waiting for stream publish completion for %s%s\n",
 			colorYellow, session.ID, colorReset)
 	}
 }
@@ -1566,7 +1612,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stdout)
 		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (large CLI agent output, encoded content)
-		fmt.Printf("%s[session] stdout scanner started for %s%s\n", colorCyan, session.ID, colorReset)
+		logSession(session.ID, "%s[session] stdout scanner started for %s%s\n", colorCyan, session.ID, colorReset)
 		lineCount := 0
 		for scanner.Scan() {
 			lineCount++
@@ -1575,21 +1621,21 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				continue
 			}
 			if lineCount <= 3 {
-				fmt.Printf("%s[session] stdout[%d] %s: %s%s\n",
+				logSession(session.ID, "%s[session] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(text, 120), colorReset)
 			}
 			lines <- streamLine{text: text, source: "stdout"}
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Printf("%s[session] stdout scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
+			logSession(session.ID, "%s[session] stdout scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
 		}
-		fmt.Printf("%s[session] stdout scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
+		logSession(session.ID, "%s[session] stdout scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
 	}()
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stderr)
 		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (large CLI agent output, encoded content)
-		fmt.Printf("%s[session] stderr scanner started for %s%s\n", colorCyan, session.ID, colorReset)
+		logSession(session.ID, "%s[session] stderr scanner started for %s%s\n", colorCyan, session.ID, colorReset)
 		lineCount := 0
 		for scanner.Scan() {
 			lineCount++
@@ -1598,15 +1644,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				continue
 			}
 			if lineCount <= 3 {
-				fmt.Printf("%s[session] stderr[%d] %s: %s%s\n",
+				logSession(session.ID, "%s[session] stderr[%d] %s: %s%s\n",
 					colorYellow, lineCount, session.ID, truncateString(text, 120), colorReset)
 			}
 			lines <- streamLine{text: text, source: "stderr"}
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Printf("%s[session] stderr scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
+			logSession(session.ID, "%s[session] stderr scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
 		}
-		fmt.Printf("%s[session] stderr scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
+		logSession(session.ID, "%s[session] stderr scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
 	}()
 
 	// Close lines channel when both readers are done
@@ -1639,7 +1685,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		case <-time.After(5 * time.Second):
 			publishWg.Done()
 			// All publish slots busy for 5s — drop to prevent goroutine buildup
-			fmt.Printf("%s[session] Publish timeout, dropping batch for %s%s\n",
+			logSession(session.ID, "%s[session] Publish timeout, dropping batch for %s%s\n",
 				colorYellow, session.ID, colorReset)
 		}
 	}
@@ -1850,7 +1896,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 						SessionID:   session.ID,
 						Seq:         int(seq),
 					})
-					fmt.Printf("%s[session] Claude rate limit rejected — %s resets %s%s\n",
+					logSession(session.ID, "%s[session] Claude rate limit rejected — %s resets %s%s\n",
 						colorYellow, session.ID,
 						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
 				}
@@ -1898,11 +1944,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 						SessionID: session.ID,
 						Seq:       int(seq),
 					})
-					fmt.Printf("%s[session] Claude auth failure (%s) — %s terminated%s\n",
+					logSession(session.ID, "%s[session] Claude auth failure (%s) — %s terminated%s\n",
 						colorRed, authFail.Category, session.ID, colorReset)
-					if session.Process != nil && session.Process.Process != nil {
-						_ = session.Process.Process.Kill()
-					}
+					_ = killSessionProcess(session)
 					continue
 				}
 			}
@@ -1933,12 +1977,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					SessionID:   session.ID,
 					Seq:         int(seq),
 				})
-				fmt.Printf("%s[session] Antigravity quota exhausted — %s: %s%s\n",
+				logSession(session.ID, "%s[session] Antigravity quota exhausted — %s: %s%s\n",
 					colorYellow, session.ID, reason, colorReset)
 				stopAntigravityRetryLoop(session.Process, func() {
-					if session.Process != nil && session.Process.Process != nil {
-						_ = session.Process.Process.Kill()
-					}
+					_ = killSessionProcess(session)
 				})
 				continue
 			}
@@ -2024,7 +2066,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					PromptType:  "turn_complete",
 					Seq:         int(seq),
 				})
-				fmt.Printf("%s[session] Result event — turn complete, %s waiting_input%s\n",
+				logSession(session.ID, "%s[session] Result event — turn complete, %s waiting_input%s\n",
 					colorGreen, session.ID, colorReset)
 
 				// A Claude result event means the turn reached terminal state —
@@ -2075,7 +2117,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					Seq:         int(seq),
 				})
 
-				fmt.Printf("%s[session] Prompt detected in %s: %s%s\n",
+				logSession(session.ID, "%s[session] Prompt detected in %s: %s%s\n",
 					colorMagenta, session.ID, truncateString(promptInfo.Text, 80), colorReset)
 
 				// A claude permission/input prompt means the session is healthy
@@ -2154,7 +2196,7 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 	}
 
 	seq := atomic.AddInt64(&session.Seq, 1)
-	fmt.Printf("%s[session] Claude produced no output within %v — assuming not signed in / startup stall, killing %s%s\n",
+	logSession(session.ID, "%s[session] Claude produced no output within %v — assuming not signed in / startup stall, killing %s%s\n",
 		colorYellow, timeout, session.ID, colorReset)
 	publishFn(resultMsg{
 		ID:          session.ID,
@@ -2173,9 +2215,7 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 		SessionID: session.ID,
 		Seq:       int(seq),
 	})
-	if session.Process != nil && session.Process.Process != nil {
-		_ = session.Process.Process.Kill()
-	}
+	_ = killSessionProcess(session)
 }
 
 // waitForExit waits for the session's process to exit and publishes a
@@ -2185,7 +2225,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	var timeoutTimer *time.Timer
 	if session.TimeoutMs > 0 {
 		timeoutTimer = time.AfterFunc(time.Duration(session.TimeoutMs)*time.Millisecond, func() {
-			fmt.Printf("%s[session] Session %s timed out after %dms — killing%s\n",
+			logSession(session.ID, "%s[session] Session %s timed out after %dms — killing%s\n",
 				colorYellow, session.ID, session.TimeoutMs, colorReset)
 			if session.Process.Process != nil {
 				_ = killSessionProcess(session)
@@ -2229,7 +2269,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	select {
 	case <-session.streamDone:
 	case <-time.After(sessionStreamDrainTimeout):
-		fmt.Printf("%s[session] Stream drain timed out for %s — forcing pipe close%s\n",
+		logSession(session.ID, "%s[session] Stream drain timed out for %s — forcing pipe close%s\n",
 			colorYellow, session.ID, colorReset)
 		session.Stdout.Close()
 		session.Stderr.Close()
@@ -2255,12 +2295,12 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	if session.isolatedGrokHome != "" {
 		outcome, persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome, session.grokProducerContested)
 		if persistErr != nil {
-			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted (%s): %v%s\n",
+			logSession("", "%s[session] Grok no-tools billing snapshot not persisted (%s): %v%s\n",
 				colorYellow, outcome, persistErr, colorReset)
 		} else {
 			// A smoke that never fetched credits is a real outcome, not success:
 			// logging only errors made it indistinguishable from a merged record.
-			fmt.Printf("%s[session] Grok no-tools billing snapshot: %s%s\n",
+			logSession("", "%s[session] Grok no-tools billing snapshot: %s%s\n",
 				colorCyan, outcome, colorReset)
 		}
 		// Through the reconciliation-aware helper: a smoke that refreshed its
@@ -2357,11 +2397,11 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		// which produced no display text at all — is still resumable.
 		ConversationID: session.capturedCliConversationID(),
 	}, func() { sm.removeSessionIfSame(session.ID, session) }) {
-		fmt.Printf("%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
+		logSession(session.ID, "%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
 	}
 
-	fmt.Printf("%s[session] Session %s ended (exit code: %d)%s\n",
+	logSession(session.ID, "%s[session] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, session.ExitCode, colorReset)
 
 	// Remove from session map. No-op while the ended frame is still in flight —
@@ -4416,7 +4456,7 @@ func (sm *SessionManager) ShutdownAllSessions() {
 	sm.mu.RUnlock()
 
 	if len(ids) > 0 {
-		fmt.Printf("%s[session] Shutting down %d active session(s)...%s\n",
+		logSession("", "%s[session] Shutting down %d active session(s)...%s\n",
 			colorYellow, len(ids), colorReset)
 	}
 

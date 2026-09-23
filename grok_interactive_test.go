@@ -2,11 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1816,33 +1821,279 @@ func TestWriteGrokUsageLimitState_ReachedWinsUntilTTL(t *testing.T) {
 	}
 }
 
-// The retained session_start maintenance smoke launches its child with a
-// BACKGROUND context (newGrokSmokeCmd), so exec's own Cancel — the tree kill
-// bindGrokShimProcessTree installs — can never fire for it. On Windows that
-// child is an intermediate cmd.exe: killing it alone reparents the npm
-// `grok.cmd` shim's Node/Grok process out of taskkill /T's reach, leaking a
-// provider process that still holds the session's output handles. Every
-// session kill route therefore goes through killSessionProcess, which takes
-// the whole tree down first for a shim-wrapped session and is the plain
-// Process.Kill for every other one.
+// Every Windows session kill goes through KillProcessTree before Process.Kill:
+// killing a root on its own (the grok.cmd smoke's cmd.exe, or any CLI that
+// spawned a tool/shim child) reparents the descendants out of taskkill /T's
+// reach, and they keep the session's stdout/stderr write handles open until
+// waitForExit's drain timeout. Death is judged by process absence and pipe
+// EOF, never by a clean exit: TerminateProcess and `taskkill /F` both exit
+// with code 1, so a nil Wait on a 10-minute hang means the kill missed.
 func TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions(t *testing.T) {
-	for _, shimmed := range []bool{false, true} {
-		proc := exec.Command("sleep", "60")
-		if err := proc.Start(); err != nil {
-			t.Fatalf("start child: %v", err)
-		}
-		session := &CLISession{ID: "kill-test", Process: proc, shimmedChildTree: shimmed}
-		if err := killSessionProcess(session); err != nil {
-			t.Fatalf("killSessionProcess(shimmed=%v): %v", shimmed, err)
-		}
-		if err := proc.Wait(); err == nil {
-			t.Fatalf("child with shimmed=%v exited cleanly, want killed", shimmed)
-		}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
 	}
-	if err := killSessionProcess(&CLISession{ID: "no-process"}); err == nil {
-		t.Fatal("killSessionProcess must report a session with no process rather than panic")
+
+	t.Run("direct child", func(t *testing.T) {
+		pidFile := filepath.Join(t.TempDir(), "hang.pid")
+		proc := exec.Command(exe)
+		proc.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang"), mockGrokSmokeHangPidEnv, pidFile)
+		startKillTestRoot(t, proc)
+		waitForKillTestPid(t, pidFile, proc.Process)
+
+		if err := killSessionProcess(&CLISession{ID: "kill-test", Process: proc}); err != nil {
+			t.Fatalf("killSessionProcess: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			// Checked BEFORE Wait, while this test's os.Process handle still
+			// pins the pid against recycling.
+			requireKillTestGone(t, "root", proc.Process)
+		}
+		if err := waitKillTestRoot(t, proc); err == nil {
+			t.Fatal("hang exited cleanly — the kill did not stop it")
+		}
+		if !processHandleGone(proc.Process) {
+			t.Fatal("root still reads alive after Wait")
+		}
+	})
+
+	t.Run("windows trees", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("cmd.exe shims and taskkill /T are Windows-only")
+		}
+		t.Run("shim wrapped", func(t *testing.T) {
+			// grok.cmd shape: a .cmd beside the binary it runs, launched
+			// through cmd.exe. Quoted %~dp0 because t.TempDir can hold spaces.
+			dir := t.TempDir()
+			if err := copyTestBinary(exe, filepath.Join(dir, "hang-mock.exe")); err != nil {
+				t.Fatalf("copy test binary: %v", err)
+			}
+			shim := filepath.Join(dir, "hang.cmd")
+			if err := os.WriteFile(shim, []byte("@echo off\r\n\"%~dp0hang-mock.exe\" %*\r\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pidFile := filepath.Join(dir, "child.pid")
+			root := exec.Command("cmd.exe", "/d", "/c", shim)
+			root.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang"), mockGrokSmokeHangPidEnv, pidFile)
+			assertKillSessionTakesTree(t, root, pidFile)
+		})
+		t.Run("ordinary", func(t *testing.T) {
+			pidFile := filepath.Join(t.TempDir(), "child.pid")
+			root := exec.Command(exe)
+			root.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "session-kill-tree"), mockSessionKillChildPidEnv, pidFile)
+			assertKillSessionTakesTree(t, root, pidFile)
+		})
+	})
+
+	if err := killSessionProcess(&CLISession{ID: "no-process"}); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("session with no process: got %v, want os.ErrProcessDone", err)
 	}
-	if err := killSessionProcess(nil); err == nil {
-		t.Fatal("killSessionProcess must be nil-safe")
+	if err := killSessionProcess(nil); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("nil session: got %v, want os.ErrProcessDone", err)
+	}
+}
+
+// A process waitForExit already reaped must not be touched by PID again —
+// the handle that pinned it is closed, so taskkill could hit a recycled pid.
+func TestKillSessionProcess_ReapedProcessIsNotKilledAgain(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	proc := exec.Command(exe, "-test.run=^$")
+	if err := proc.Run(); err != nil {
+		t.Fatalf("run short-lived child: %v", err)
+	}
+	if err := killSessionProcess(&CLISession{ID: "reaped", Process: proc}); err != nil {
+		t.Fatalf("killSessionProcess on a reaped child: %v", err)
+	}
+}
+
+// assertKillSessionTakesTree starts root with its stdout/stderr on a pipe the
+// descendant inherits, then proves killSessionProcess took root AND
+// descendant down: both read gone while their handles still pin the pids, the
+// root's Wait reports the force kill, and the pipe reaches EOF (no survivor
+// holds the write end).
+func assertKillSessionTakesTree(t *testing.T, root *exec.Cmd, pidFile string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	root.Stdout = w
+	root.Stderr = w
+	startKillTestRoot(t, root)
+	// Drop our copy of the write end, as StartSession does, or the read below
+	// could never EOF.
+	_ = w.Close()
+
+	pid := waitForKillTestPid(t, pidFile, root.Process)
+	descendant, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("open descendant %d: %v", pid, err)
+	}
+	t.Cleanup(func() {
+		if !processHandleGone(descendant) {
+			_ = descendant.Kill()
+		}
+		_ = descendant.Release()
+	})
+	if processHandleGone(descendant) {
+		t.Fatalf("descendant %d exited before the kill", pid)
+	}
+
+	eof := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, r)
+		eof <- err
+	}()
+
+	if err := killSessionProcess(&CLISession{ID: "kill-tree-test", Process: root}); err != nil {
+		t.Fatalf("killSessionProcess: %v", err)
+	}
+	requireKillTestGone(t, "root", root.Process)
+	requireKillTestGone(t, "descendant", descendant)
+	if err := waitKillTestRoot(t, root); err == nil {
+		t.Fatal("root exited cleanly — want the force-kill exit status")
+	}
+	select {
+	case err := <-eof:
+		if err != nil {
+			t.Fatalf("read session pipe: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session pipe never reached EOF — a surviving descendant still holds the write end")
+	}
+}
+
+// startKillTestRoot starts proc and registers a cleanup that cannot leave the
+// 10-minute hang running: tree first (while proc still anchors it), then the
+// root — unless Wait already reaped it, when its pid may be recycled.
+func startKillTestRoot(t *testing.T, proc *exec.Cmd) {
+	t.Helper()
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	t.Cleanup(func() {
+		if errors.Is(proc.Process.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+			return
+		}
+		if runtime.GOOS == "windows" {
+			_ = KillProcessTree(proc.Process.Pid)
+		}
+		_ = proc.Process.Kill()
+		_ = proc.Wait()
+	})
+}
+
+// waitForKillTestPid waits for the hang child to record its pid — it writes
+// the file just before it sleeps — while root is still alive. An early exit
+// or a missing file is a failure, not a killed hang.
+func waitForKillTestPid(t *testing.T, pidFile string, root *os.Process) int {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err != nil {
+				t.Fatalf("unreadable hang pid %q: %v", raw, err)
+			}
+			if processHandleGone(root) {
+				t.Fatal("root exited before the kill")
+			}
+			return pid
+		}
+		if processHandleGone(root) {
+			t.Fatal("root exited before the hang recorded its pid")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("hang never recorded its pid in %s", pidFile)
+	return 0
+}
+
+// requireKillTestGone polls processHandleGone briefly: taskkill returns once
+// termination is requested, the exit code can land a moment later.
+func requireKillTestGone(t *testing.T, what string, p *os.Process) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !processHandleGone(p) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (pid %d) still running after killSessionProcess", what, p.Pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func waitKillTestRoot(t *testing.T, proc *exec.Cmd) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- proc.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		t.Fatal("root never exited after killSessionProcess")
+		return nil
+	}
+}
+
+func TestRedactSessionLog(t *testing.T) {
+	const id = "sess-7f3c2a91-4b1e-4d2a-9c0e-1a2b3c4d5e6f"
+	cases := []struct {
+		name      string
+		sessionID string
+		msg       string
+		absent    []string
+		present   []string
+	}{
+		{
+			name:      "id, credential and config path",
+			sessionID: id,
+			msg:       "[session] Starting grok session " + id + ": grok --config C:\\Users\\dev\\.config\\grok\\config.toml api_key=secret\n",
+			absent:    []string{id, "secret", "config.toml", `C:\Users\dev`},
+			present:   []string{"[session_id:REDACTED]", "[session] Starting grok session"},
+		},
+		{
+			name:      "grok home path",
+			sessionID: id,
+			msg:       "[session] stderr[1] " + id + ": failed reading /home/dev/.grok/auth.json\n",
+			absent:    []string{id, "/home/dev/.grok/auth.json"},
+			present:   []string{"[session_id:REDACTED]", "failed reading"},
+		},
+		{
+			name:      "windows grok home path",
+			sessionID: id,
+			msg:       "[session] stderr[2] " + id + `: open C:\Users\dev\.grok\settings.json: denied` + "\n",
+			absent:    []string{id, `C:\Users\dev`, "settings.json"},
+			present:   []string{"[session_id:REDACTED]", "denied"},
+		},
+		{
+			name:    "color reset survives a trailing path",
+			msg:     colorYellow + "[session] loading ~/.codex/config.yaml" + colorReset + "\n",
+			absent:  []string{"config.yaml"},
+			present: []string{colorReset},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactSessionLog(tc.sessionID, tc.msg)
+			for _, s := range tc.absent {
+				if strings.Contains(got, s) {
+					t.Errorf("redacted line still contains %q: %q", s, got)
+				}
+			}
+			for _, s := range tc.present {
+				if !strings.Contains(got, s) {
+					t.Errorf("redacted line lost %q: %q", s, got)
+				}
+			}
+		})
+	}
+
+	plain := "[session] Shutting down 2 active session(s)...\n"
+	if got := redactSessionLog("", plain); got != plain {
+		t.Fatalf("empty session id must leave the message unchanged: got %q", got)
 	}
 }

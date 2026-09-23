@@ -49,6 +49,10 @@ const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
 // own pid into before blocking, so a test can assert the deadline kill reached
 // the shim's grandchild and not just the intermediate cmd.exe.
 const mockGrokSmokeHangPidEnv = "TEST_MOCK_GROK_SMOKE_HANG_PID_FILE"
+
+// mockSessionKillChildPidEnv names the file the `session-kill-tree` mode's
+// grok-smoke-hang descendant writes its pid into once it is in the hang.
+const mockSessionKillChildPidEnv = "TEST_MOCK_SESSION_KILL_CHILD_PID_FILE"
 const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
 const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
 
@@ -531,6 +535,31 @@ func runMockCLI(mode string) {
 			_ = os.WriteFile(marker, []byte(fmt.Sprintf("%d", os.Getpid())), 0o600)
 		}
 		time.Sleep(10 * time.Minute)
+		os.Exit(0)
+
+	case "session-kill-tree":
+		// An ordinary (non-shim) session root that spawns one grok-smoke-hang
+		// descendant and waits on it. The descendant INHERITS this process's
+		// stdout/stderr — the session pipe — so a kill that takes only this
+		// root leaves the pipe open behind a reparented child. Used by
+		// TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions.
+		self, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "session-kill-tree: %v\n", err)
+			os.Exit(1)
+		}
+		child := exec.Command(self)
+		// Replace, never append: the child reads the first TEST_MOCK_CLI_MODE,
+		// and inheriting session-kill-tree would fork copies without bound.
+		env := setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang")
+		child.Env = setEnvVar(env, mockGrokSmokeHangPidEnv, os.Getenv(mockSessionKillChildPidEnv))
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "session-kill-tree: start child: %v\n", err)
+			os.Exit(1)
+		}
+		_ = child.Wait()
 		os.Exit(0)
 
 	case "grok-smoke-argv-echo":

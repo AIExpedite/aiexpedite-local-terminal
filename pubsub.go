@@ -6245,7 +6245,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			return
 		}
 
-		fmt.Printf("%s[session] Starting session %s for command: %s%s\n",
+		logSession(cmd.SessionID, "%s[session] Starting session %s for command: %s%s\n",
 			colorCyan, cmd.SessionID, cmd.Command, colorReset)
 
 		// cmd.ConversationID is the SIGNED exact-resume seed (empty on an
@@ -6291,7 +6291,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			return
 		}
 
-		fmt.Printf("%s[session] Sending input to session %s%s\n",
+		logSession(cmd.SessionID, "%s[session] Sending input to session %s%s\n",
 			colorBlue, cmd.SessionID, colorReset)
 
 		if err := globalSessionManager.SendInput(cmd.SessionID, cmd.Input); err != nil {
@@ -6305,7 +6305,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			return
 		}
 
-		fmt.Printf("%s[session] Sending signal '%s' to session %s%s\n",
+		logSession(cmd.SessionID, "%s[session] Sending signal '%s' to session %s%s\n",
 			colorYellow, cmd.Signal, cmd.SessionID, colorReset)
 
 		if err := globalSessionManager.SignalSession(cmd.SessionID, cmd.Signal); err != nil {
@@ -6319,7 +6319,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			return
 		}
 
-		fmt.Printf("%s[session] Ending session %s%s\n",
+		logSession(cmd.SessionID, "%s[session] Ending session %s%s\n",
 			colorYellow, cmd.SessionID, colorReset)
 
 		if err := globalSessionManager.EndSession(cmd.SessionID); err != nil {
@@ -6362,7 +6362,7 @@ func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 // publishGrokACPError: keep GROK_NOT_AUTHENTICATED on errorCode so consumers
 // never have to infer it from free-form Output text.
 func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg, errorCode string) {
-	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
+	logSession(cmd.SessionID, "%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
 
 	res := resultMsg{
 		ID:          cmd.ID,
@@ -6379,7 +6379,7 @@ func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, c
 		res.ErrorCode = errorCode
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
-		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+		logSession(cmd.SessionID, "%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }
 
