@@ -5176,8 +5176,15 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// inside this window, and the fallbacks are sequential rather than
 	// concurrent, so a failover cannot double-arm. Unlike the Unix path there is
 	// no post-Start hook to hang this on — the transports own their own
-	// processes — so the window opens slightly before the child does, which
-	// costs at most one probe against a server that is not up yet.
+	// processes — so the window opens before the child does. That is not one
+	// wasted probe: PowerShell startup alone is 300-800ms, and until a port is
+	// memoized every tick is a full discovery attempt over both install trees,
+	// so the pre-server window is several log scans (the immediate probe plus
+	// the 250ms ramp, then one per steady interval), bounded by the poller's own
+	// attempt/duration caps. It also buys no guarantee: a server that binds and
+	// exits between two ticks is never sampled, and with no memoized port the
+	// tail window is skipped too. What it does buy is that a sequential failover
+	// through the chain below cannot double-arm.
 	defer armAntigravityCaptureForCommand("windows execute", cmd, args)()
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)

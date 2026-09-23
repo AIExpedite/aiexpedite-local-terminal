@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"strings"
@@ -316,6 +317,10 @@ func TestWrapperScriptPayload_CoversEveryEmittedWrapper(t *testing.T) {
 		// An unreadable payload answers "empty", never an error and never the
 		// raw base64 (which a classifier could then pattern-match by accident).
 		{"undecodable encoded", "powershell", []string{"-EncodedCommand", "!!!"}, "", true},
+		// Oversized payloads are refused on the ENCODED length, before any
+		// decode allocates. Same shape as an undecodable payload.
+		{"oversized encoded payload", "powershell",
+			[]string{"-EncodedCommand", oversizedEncodedCommandArg()}, "", true},
 		{"not a wrapper", "git", []string{"status"}, "", false},
 		{"agy itself is not a wrapper", "agy", []string{"-p", "hi"}, "", false},
 	}
@@ -325,5 +330,69 @@ func TestWrapperScriptPayload_CoversEveryEmittedWrapper(t *testing.T) {
 			t.Errorf("%s: wrapperScriptPayload(%q, %v) = (%q, %v), want (%q, %v)",
 				tc.name, tc.cmd, tc.args, got, ok, tc.want, tc.wantOK)
 		}
+	}
+}
+
+// oversizedEncodedCommandArg builds a -EncodedCommand argument whose base64
+// alone exceeds what antigravityClassifyMaxPayloadBytes of UTF-16LE script can
+// encode to, so wrapperScriptPayload must refuse it without decoding.
+func oversizedEncodedCommandArg() string {
+	return strings.Repeat("A", base64.StdEncoding.EncodedLen(2*antigravityClassifyMaxPayloadBytes)+4)
+}
+
+// TestWrapperScriptPayload_RefusesOversizedEncodedBeforeDecoding pins the
+// budget the classifier documents: an oversized wrapper must not be decoded,
+// and commandRunsAntigravity must answer false for it even when the payload
+// would have named agy.
+func TestWrapperScriptPayload_RefusesOversizedEncodedBeforeDecoding(t *testing.T) {
+	// A payload that WOULD classify as agy, padded past the budget. Padding is
+	// appended to the encoded form so the decode, if it ran, still succeeds.
+	realScript := encodeForPowerShell("agy -p hi")
+	oversized := realScript + strings.Repeat("A", base64.StdEncoding.EncodedLen(2*antigravityClassifyMaxPayloadBytes))
+	args := []string{"-NoProfile", "-EncodedCommand", oversized}
+
+	got, ok := wrapperScriptPayload("powershell.exe", args)
+	if !ok {
+		t.Fatal("an oversized -EncodedCommand is still a wrapper; want ok=true")
+	}
+	if got != "" {
+		t.Errorf("oversized payload was decoded: got %d chars of script, want none", len(got))
+	}
+	if commandRunsAntigravity("powershell.exe", args) {
+		t.Error("commandRunsAntigravity = true for an over-budget payload, want false")
+	}
+
+	// The same script within budget still classifies, so the cap is what
+	// rejected it above rather than the padding breaking the scan.
+	if !commandRunsAntigravity("powershell.exe", []string{"-NoProfile", "-EncodedCommand", realScript}) {
+		t.Error("commandRunsAntigravity = false for an in-budget agy payload, want true")
+	}
+}
+
+// TestWrapperScriptPayload_DecodesAPayloadExactlyOnTheBudget guards the
+// padding edge of encodedCommandFitsClassifyBudget: a script whose UTF-16LE
+// form is exactly 2*antigravityClassifyMaxPayloadBytes encodes with a `=`, so
+// DecodedLen reports one byte more than the payload really carries. That
+// payload is inside the classifier's contract and must still be decoded.
+func TestWrapperScriptPayload_DecodesAPayloadExactlyOnTheBudget(t *testing.T) {
+	// "agy -p hi" plus filler, so the script is exactly on the cap and would
+	// classify if it is decoded at all.
+	script := "agy -p hi" + strings.Repeat("x", antigravityClassifyMaxPayloadBytes-len("agy -p hi"))
+	encoded := encodeForPowerShell(script)
+	if !strings.HasSuffix(encoded, "=") {
+		t.Fatalf("the edge this test pins needs a padded payload; got a suffix of %q", encoded[len(encoded)-4:])
+	}
+	args := []string{"-NoProfile", "-EncodedCommand", encoded}
+
+	got, ok := wrapperScriptPayload("powershell.exe", args)
+	if !ok {
+		t.Fatal("an -EncodedCommand wrapper is a wrapper; want ok=true")
+	}
+	if len(got) != antigravityClassifyMaxPayloadBytes {
+		t.Fatalf("payload on the cap was not decoded: got %d chars, want %d",
+			len(got), antigravityClassifyMaxPayloadBytes)
+	}
+	if !commandRunsAntigravity("powershell.exe", args) {
+		t.Error("commandRunsAntigravity = false for an agy payload exactly on the cap, want true")
 	}
 }

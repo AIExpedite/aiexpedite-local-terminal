@@ -917,22 +917,72 @@ executing, so it never finds a port, replays the cached snapshot with its
 how many runs succeed. That is the `observed_stale` /
 `latestObservedAt = 2026-08-28T05:13:22Z` symptom.
 
+With the poller armed, that same replay carries the **in-run** `observedAt`: the
+gather still finds no port, but the snapshot it loads was written while the run's
+own server was alive. The gather adds no post-smoke probe of its own; the only
+read that happens after the run releases is the capture's own 2s tail (below),
+which is still an in-run read and can itself write a newer `observedAt` while the
+server shuts down.
+
+`ParseContext` replays that cache under three predicates, not one. Current
+identity comes from `~/.gemini/antigravity-cli/settings.json`, or from legacy
+`~/.agy/config.json` when the modern file is absent:
+
+1. **Scoped load.** The cached `accountFingerprint` equals the fingerprint of the
+   account that identity file names — replayed as stored.
+2. **No identity on disk.** That is the usual case, since the account lives in
+   the OS keyring, so the fingerprint is empty and `loadAntigravityQuotaSnapshot`
+   refuses by construction. The cache is then replayed under the account that
+   PRODUCED it (`loadAntigravityQuotaSnapshotByProducer`) and the card names that
+   account. **No live probe is required for this.**
+3. **A recent live probe outranks the file.** When the identity file names
+   someone the cache does not match, a live probe from the last
+   `antigravityLiveProducerTTL = 2m` (a Refresh click) whose own server named the
+   cache's producer wins: the cache is replayed and the card takes the *probe's*
+   account and plan, because that server's login is newer than the one the file
+   still records. The probe is matched against the CACHE, never against
+   `settings.json`.
+
+A file-named account with no such probe and no matching cache leaves the reading
+unreplayed.
+
 [`cliagent_usage_antigravity_capture.go`](cliagent_usage_antigravity_capture.go)
 closes that gap by reading the server **while it exists**:
 
-- **Armed at every spawn.** `startAntigravityQuotaCapture(label)` is called from
-  [`runOneShot`](antigravity_native.go) (native chat),
-  [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`),
-  [`StartSession`](session.go) (pipe session path, released in `waitForExit`) and
-  [`runLocalCommand`](pubsub.go) (tty=false `execute` — direct spawn on Unix and
-  a dedicated one-shot process on Windows). All but
-  native chat gate on `commandRunsAntigravity`, which also sees through the
-  `bash -c "agy …"` wrapper terminal-service ships. Windows has no PTY path, so
-  capture there comes from native chat, the pipe path and `execute`.
-  **Known gap:** a command that arrives already wrapped as
-  `powershell -EncodedCommand <base64>` is opaque at this layer and is not
-  classified; decoding caller-supplied base64 to sniff for a program name is a
-  worse trade than losing freshness on that one route.
+- **Armed at every spawn.** The arm sites are
+  [`runOneShot`](antigravity_native.go) (native chat, `"native turn"`),
+  [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`,
+  `"PTY session"`), [`StartSession`](session.go) (pipe session path,
+  `"pipe session"`, released in `waitForExit`),
+  [`runLocalCommandUnix`](pubsub.go) (tty=false `execute` — the bare-exec route,
+  which a DIRECT `agy …` takes on Windows too, `"local execute"`) and
+  [`runLocalCommandWindows`](pubsub.go) (the WRAPPED Windows transport chain,
+  `"windows execute"`). Native chat calls
+  `startAntigravityQuotaCapture` directly — it already knows it is spawning
+  `agy`; every other site goes through `armAntigravityCaptureForCommand`, which
+  pairs `commandRunsAntigravity` with the arm in one place so a site cannot drift
+  out of step with the classifier. Windows has no PTY path, so capture there
+  comes from native chat, the pipe path and `execute`.
+  `commandRunsAntigravity`
+  ([`cliagent_usage_antigravity_command.go`](cliagent_usage_antigravity_command.go))
+  sees through every wrapper transport terminal-service emits
+  (`wrapperScriptPayload` in [`headless_env.go`](headless_env.go)): the POSIX
+  shells' `-c` / `-lc`, `cmd /c` and `/k`, PowerShell's `-Command` / `-c`, and
+  `powershell`/`pwsh` `-EncodedCommand <base64>` — the wrapper flag is matched at
+  ANY argument index, so `-NoProfile` / `-NonInteractive` / `-OutputFormat Text`
+  ahead of it change nothing. That includes the `scriptMode: "file"` launcher whose
+  outer payload carries the real script as a nested base64 literal. The decoded
+  script is a classification input and nothing else — it is never logged,
+  persisted or returned, and the only value that leaves that file is a bool. A
+  payload over `antigravityClassifyMaxPayloadBytes` (256 KB) classifies as *not*
+  Antigravity rather than growing the decode budget, and that cap is applied to
+  an `-EncodedCommand` argument BEFORE it is decoded
+  (`encodedCommandFitsClassifyBudget`): the payload is base64 of UTF-16LE, so an
+  argument whose base64 already exceeds the bound cannot decode under it, and
+  refusing on the encoded length keeps an oversized argument from allocating the
+  base64 buffer, the UTF-16 slice and the decoded string on the way to being
+  rejected. The nested file-mode literal needs no separate check — it is only
+  reached from a script that already passed the cap.
 - **One shared, refcounted poller.** Concurrent `agy` runs join the same
   goroutine; it stops when the last one releases it.
 - **Timing is everything.** The server dies *with* the child, so a post-exit
@@ -940,15 +990,50 @@ closes that gap by reading the server **while it exists**:
   **immediately at arm**, then ramps
   (`antigravityCaptureInitialPollInterval = 250ms` ×
   `antigravityCaptureInitialPolls = 12`, covering server bind time and short
-  turns) down to `antigravityCapturePollInterval = 3s`. Capture is armed only
-  after the child successfully starts, so the immediate probe cannot run before
-  the process exists.
+  turns) down to `antigravityCapturePollInterval = 3s`. Arm timing is per path:
+  native chat, PTY, the pipe session and the Unix `execute` arm **after a
+  successful `Start`**, so the immediate probe cannot run before the process
+  exists, and a failed spawn arms nothing at all.
+  `runLocalCommandWindows` is the exception. It has no single post-`Start` hook —
+  each transport in the chain (encoded-argument PowerShell, temp `.ps1`, a
+  dedicated one-shot process, `runViaShell`, the persistent instance and its
+  fallbacks) owns its own process — so it takes one `defer` arm at **function
+  entry**, before any child exists. What that costs is not one wasted probe:
+  PowerShell startup alone is 300–800ms, and until a port is memoized every tick
+  is a full discovery attempt that walks both install trees. So the pre-server
+  window is several log scans — the immediate probe plus a 250ms tick for as long
+  as the ramp lasts (`antigravityCaptureInitialPolls = 12` discovery attempts,
+  ≈3s), then one every 3s. Those attempts are bounded by the same
+  `antigravityCaptureMaxAttempts = 200` / `antigravityCaptureMaxDuration = 15m`
+  caps, after which the poller parks (or, with no port memoized, returns and
+  waits for release). **An early arm is not a guarantee of capture:** a server
+  that binds and exits entirely inside a gap between ticks is never sampled, and
+  with `memoPort == 0` there is no tail to catch it either, so that smoke still
+  finishes stale. What the entry-time arm does buy is that a sequential failover
+  through the chain cannot double-arm.
+  Arming is still gated on the classifier: a **classified** Windows execute arms
+  once at entry and releases on return even when no transport ever starts a
+  child; an **unclassified** one gets `armAntigravityCaptureForCommand`'s no-op
+  release and arms nothing at all (`antigravityCaptureArms` stays 0 —
+  `TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing`).
+  Note the route split: a DIRECT `agy …` on Windows never reaches that defer.
+  `runLocalCommand` sends it to `runLocalCommandUnix` on the `isAntigravityCommand`
+  predicate (the CLI streams, and wrapping it in PowerShell breaks the stream), so
+  it arms `"local execute"` after a successful `Start` like the Unix path.
+  `runLocalCommandWindows` owns only the WRAPPED transports.
 - **Bounded discovery, continuous live-port reads.**
   `antigravityCaptureMaxAttempts = 200` and
   `antigravityCaptureMaxDuration = 15m` bound attempts that may scan logs. Once
   either cap is reached, a memoized live port continues receiving cheap 3s
   loopback reads until the run ends; no further log scans occur. If no port was
   found, the poller parks until release.
+- **A short tail after the last release.** A turn's quota is debited at the END
+  of the turn, and the execute path releases the instant `Wait` returns while the
+  server is still shutting down and still answering. So after the last armed run
+  releases, the poller keeps reading for `antigravityCaptureTailGrace = 2s` —
+  memoized port only, no discovery and no log scanning. A run that exits with no
+  memoized port, or one stopped by the CSRF gate, skips the tail entirely. That
+  tail is the last in-run read, not a second gather.
 - **Cheap.** The expensive part of a probe is log scanning (4 files ×
   2×128 KB), not the RPC, so the winning port is memoized for the life of the run
   and rediscovered only after an RPC failure. One HTTP client/transport is reused
@@ -965,7 +1050,8 @@ closes that gap by reading the server **while it exists**:
   `settings.json` contents are never written to the cache and never logged. A
   reading the server could not attribute (`GetUserStatus` failed) is retried on
   the next tick rather than cached under a settings-file account.
-- **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick (mirrors
+- **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick and
+  `AIEXPEDITE_AGY_CAPTURE_TAIL` the tail window (both mirror
   `AIEXPEDITE_AGY_QUOTA_CACHE`); a non-positive or unparseable value falls back
   to the shipped constant.
 
