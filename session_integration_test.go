@@ -559,8 +559,11 @@ func runMockCLI(mode string) {
 			fmt.Fprintf(os.Stderr, "session-kill-tree: start child: %v\n", err)
 			os.Exit(1)
 		}
+		// Block even after the child dies: taskkill /T takes descendants
+		// before the root, and a root that exited 0 here would leave the
+		// tree on its own instead of by the kill under test.
 		_ = child.Wait()
-		os.Exit(0)
+		select {}
 
 	case "grok-smoke-argv-echo":
 		// Echoes every argv element it received as one streaming-json text

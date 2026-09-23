@@ -499,7 +499,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	}
 
 	logSession(id, "%s[session] Starting %s session %s: %s %s%s\n",
-		colorCyan, command, id, executable, strings.Join(cliArgs, " "), colorReset)
+		colorCyan, command, id, executable, sessionArgsForLog(cliArgs), colorReset)
 
 	proc := exec.Command(executable, cliArgs...)
 	hideWindow(proc)
@@ -1152,18 +1152,18 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 // on unix it is an error without spawning and Process.Kill is the kill.
 //
 // Result contract:
-//   - no process                          → os.ErrProcessDone
-//   - already reaped by waitForExit       → nil, without touching the PID
-//   - already gone before the tree kill   → nil
-//   - Windows tree kill failed but Kill
-//     terminated a still-live root        → the tree error (descendants may
-//     have been orphaned)
-//   - Kill returned ErrProcessDone, the
-//     process reads gone, or Kill nil
-//     after a working tree kill           → nil (taskkill "not found" races an
-//     exit; a unix zombie awaits waitForExit's reap)
-//   - otherwise one more gone probe, else the Kill error (a concurrent kill
-//     can land the exit code between Kill and the first probe).
+//   - no process                        → os.ErrProcessDone
+//   - already reaped, or already gone
+//     before the kill                   → nil, and the PID is never touched
+//   - Windows tree kill failed          → the tree error, whatever Kill says:
+//     Kill's TerminateProcess "Access is denied" only means taskkill already
+//     took the root, not that it took the descendants. The one exception is
+//     taskkill "not found" (exit 128) with the root now gone — the root
+//     exited on its own between the probe and taskkill, so there was no tree
+//     left for this call to orphan.
+//   - Kill nil, ErrProcessDone, or the root reads gone → nil (a unix zombie
+//     awaits waitForExit's reap; Kill nil is the kill there)
+//   - otherwise the Kill error
 //
 // Neither Wait nor Release is called here: waitForExit owns the reap, and the
 // open os.Process handle is what keeps the PID from being recycled.
@@ -1172,37 +1172,59 @@ func killSessionProcess(session *CLISession) error {
 		return os.ErrProcessDone
 	}
 	proc := session.Process.Process
-	// Already reaped (waitForExit's Wait returned, e.g. a delayed quota kill
-	// firing after exit): the handle that pinned the PID is closed, so a
-	// PID-based taskkill could reach a recycled stranger. Signal 0 reads
-	// ErrProcessDone from Go's own state on every platform without the OS.
-	if errors.Is(proc.Signal(syscall.Signal(0)), os.ErrProcessDone) {
+	// A reaped process's handle is closed, so its PID may already belong to a
+	// stranger; an exited-but-unreaped one has no tree left to take (its
+	// descendants were reparented when it died). Neither gets a PID kill.
+	if processReaped(proc) || processHandleGone(proc) {
 		return nil
 	}
-	goneBefore := processHandleGone(proc)
-	treeErr := KillProcessTree(proc.Pid)
+	// Re-check right before the PID-based kill: waitForExit's Wait runs
+	// concurrently and may have reaped the child during the probe above.
+	if processReaped(proc) {
+		return nil
+	}
+	treeErr := killProcessTree(proc.Pid)
 	killErr := proc.Kill()
-	switch {
-	case goneBefore:
-		return nil
-	case runtime.GOOS == "windows" && treeErr != nil && killErr == nil:
-		return fmt.Errorf("process tree kill failed, root killed alone: %w", treeErr)
-	case killErr == nil, errors.Is(killErr, os.ErrProcessDone), processHandleGone(proc):
-		return nil
-	case processHandleGone(proc):
-		// Re-probe once: a concurrent kill (the session timeout) can land the
-		// exit code between Kill and the probe above.
+	if runtime.GOOS == "windows" && treeErr != nil &&
+		!(taskkillRootNotFound(treeErr) && processHandleGone(proc)) {
+		return fmt.Errorf("process tree kill failed: %w", treeErr)
+	}
+	if killErr == nil || errors.Is(killErr, os.ErrProcessDone) || processHandleGone(proc) {
 		return nil
 	}
 	return killErr
 }
 
+// killProcessTree is KillProcessTree behind a seam so tests can make the tree
+// kill fail without a process taskkill cannot reach.
+var killProcessTree = KillProcessTree
+
+// processReaped reports whether Wait has already reaped p. Signal 0 reads Go's
+// own process state on every platform, never the OS, so it cannot reach a
+// recycled PID.
+func processReaped(p *os.Process) bool {
+	return errors.Is(p.Signal(syscall.Signal(0)), os.ErrProcessDone)
+}
+
+// taskkillRootNotFound reports taskkill's exit 128: the PID it was given no
+// longer names a process.
+func taskkillRootNotFound(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 128
+}
+
 // sessionConfigPathPattern matches config-file paths (config.toml / .json /
 // .yaml / .yml) and anything under a `.grok/` directory — a CLI that fails
 // while loading one quotes the path, and the user's home/profile layout is not
-// something a [session] log line needs. Stops at whitespace, quotes, and the
-// ANSI escape that starts colorReset so the terminal color still resets.
-var sessionConfigPathPattern = regexp.MustCompile(`(?i)[^\s\x1b"']*(?:config\.(?:toml|json|ya?ml)\b|\.grok[\\/])[^\s\x1b"']*`)
+// something a [session] log line needs.
+//
+// An absolute path (drive, `~`, or leading separator) is matched segment by
+// segment, and a segment may contain spaces, so `C:\Users\First Last\.grok\…`
+// loses its profile prefix too. A segment cannot contain `:` or another
+// path-illegal character, which keeps one match from running across two
+// paths. A relative path stops at whitespace. Every match stops at quotes and
+// at the ANSI escape that starts colorReset, so the terminal color still resets.
+var sessionConfigPathPattern = regexp.MustCompile(`(?i)(?:(?:[a-z]:|~)?[\\/](?:[^\\/\r\n\x1b"':*?<>|]*[\\/])*|[^\s\x1b"']*)(?:\.grok[\\/]|[^\\/\s\x1b"']*config\.(?:toml|json|ya?ml)\b)[^\s\x1b"']*`)
 
 // redactSessionLog strips credentials, config paths and the session id from a
 // [session] log line. The id goes first, so the long-blob mask in
@@ -1218,7 +1240,20 @@ func redactSessionLog(sessionID, msg string) string {
 	return sessionConfigPathPattern.ReplaceAllString(msg, "[config_path:REDACTED]")
 }
 
+// sessionArgsForLog joins argv for a log line after masking a secret that sits
+// in the token AFTER its flag (`--api-key xai-…`): redactSessionLog's patterns
+// need `key=value` / `key: value` and cannot see across two argv tokens. Same
+// split-token pass the Grok ACP approval dialog and rejection record use.
+func sessionArgsForLog(args []string) string {
+	return strings.Join(redactGrokACPArgsForLog(args), " ")
+}
+
 // logSession prints a [session] log line through redactSessionLog.
+//
+// Only the [session] family is routed here. The other session-family logs
+// ([codex-appserver], [claude-native], [antigravity-native],
+// [opencode-native], [grok-acp]) still print raw session ids: ~130 call sites
+// across their own files, left for a dedicated pass rather than this change.
 func logSession(sessionID, format string, args ...any) {
 	fmt.Print(redactSessionLog(sessionID, fmt.Sprintf(format, args...)))
 }

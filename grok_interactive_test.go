@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -1826,8 +1827,10 @@ func TestWriteGrokUsageLimitState_ReachedWinsUntilTTL(t *testing.T) {
 // spawned a tool/shim child) reparents the descendants out of taskkill /T's
 // reach, and they keep the session's stdout/stderr write handles open until
 // waitForExit's drain timeout. Death is judged by process absence and pipe
-// EOF, never by a clean exit: TerminateProcess and `taskkill /F` both exit
-// with code 1, so a nil Wait on a 10-minute hang means the kill missed.
+// EOF. Only the direct 10-minute hang also requires a non-nil Wait
+// (TerminateProcess and `taskkill /F` exit with code 1, so a clean exit means
+// the kill missed); a tree root is a waiter, and its exit status says nothing
+// about who killed its child.
 func TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -1835,12 +1838,7 @@ func TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions(t *testing.
 	}
 
 	t.Run("direct child", func(t *testing.T) {
-		pidFile := filepath.Join(t.TempDir(), "hang.pid")
-		proc := exec.Command(exe)
-		proc.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang"), mockGrokSmokeHangPidEnv, pidFile)
-		startKillTestRoot(t, proc)
-		waitForKillTestPid(t, pidFile, proc.Process)
-
+		proc := startKillTestHang(t, exe)
 		if err := killSessionProcess(&CLISession{ID: "kill-test", Process: proc}); err != nil {
 			t.Fatalf("killSessionProcess: %v", err)
 		}
@@ -1864,17 +1862,26 @@ func TestKillSessionProcess_TerminatesShimWrappedAndOrdinarySessions(t *testing.
 		t.Run("shim wrapped", func(t *testing.T) {
 			// grok.cmd shape: a .cmd beside the binary it runs, launched
 			// through cmd.exe. Quoted %~dp0 because t.TempDir can hold spaces.
+			// After the hang ends the shim blocks in `set /p` on a stdin pipe
+			// this test never writes to — a builtin, so no new process — and
+			// cmd.exe cannot leave the tree on its own.
 			dir := t.TempDir()
 			if err := copyTestBinary(exe, filepath.Join(dir, "hang-mock.exe")); err != nil {
 				t.Fatalf("copy test binary: %v", err)
 			}
 			shim := filepath.Join(dir, "hang.cmd")
-			if err := os.WriteFile(shim, []byte("@echo off\r\n\"%~dp0hang-mock.exe\" %*\r\n"), 0o600); err != nil {
+			if err := os.WriteFile(shim, []byte("@echo off\r\n\"%~dp0hang-mock.exe\" %*\r\nset /p AIEXPEDITE_KILL_TEST_BLOCK=\r\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			pidFile := filepath.Join(dir, "child.pid")
 			root := exec.Command("cmd.exe", "/d", "/c", shim)
 			root.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang"), mockGrokSmokeHangPidEnv, pidFile)
+			stdin, stdinWriter, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stdinWriter.Close(); _ = stdin.Close() })
+			root.Stdin = stdin
 			assertKillSessionTakesTree(t, root, pidFile)
 		})
 		t.Run("ordinary", func(t *testing.T) {
@@ -1900,6 +1907,7 @@ func TestKillSessionProcess_ReapedProcessIsNotKilledAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("locate test binary: %v", err)
 	}
+	calls := stubKillProcessTree(t, func(int) error { return nil })
 	proc := exec.Command(exe, "-test.run=^$")
 	if err := proc.Run(); err != nil {
 		t.Fatalf("run short-lived child: %v", err)
@@ -1907,13 +1915,130 @@ func TestKillSessionProcess_ReapedProcessIsNotKilledAgain(t *testing.T) {
 	if err := killSessionProcess(&CLISession{ID: "reaped", Process: proc}); err != nil {
 		t.Fatalf("killSessionProcess on a reaped child: %v", err)
 	}
+	if *calls != 0 {
+		t.Fatalf("reaped child's pid was tree-killed %d time(s), want 0", *calls)
+	}
+}
+
+// A root that already exited (but is not yet reaped) has no tree left to take
+// — its descendants were reparented when it died — so it gets no PID kill.
+// Windows only: an exited unix child is a zombie that still reads alive.
+func TestKillSessionProcess_GoneBeforeKillSkipsTreeKill(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("an exited unix child reads alive until reaped")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	calls := stubKillProcessTree(t, func(int) error { return nil })
+	proc := exec.Command(exe, "-test.run=^$")
+	startKillTestRoot(t, proc)
+	requireKillTestGone(t, "short-lived child", proc.Process)
+	if err := killSessionProcess(&CLISession{ID: "gone", Process: proc}); err != nil {
+		t.Fatalf("killSessionProcess on an exited child: %v", err)
+	}
+	if *calls != 0 {
+		t.Fatalf("exited child's pid was tree-killed %d time(s), want 0", *calls)
+	}
+	_ = waitKillTestRoot(t, proc)
+}
+
+// A failed Windows tree kill is a failed kill even when the root died: the
+// follow-up Process.Kill then reads TerminateProcess "Access is denied", which
+// only says the root is gone, not its descendants. The one success is taskkill
+// "not found" (exit 128) for a root that had already exited on its own.
+func TestKillSessionProcess_TreeKillFailureIsReported(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	treeErr := errors.New("taskkill: child access denied")
+
+	if runtime.GOOS != "windows" {
+		// unix has no tree primitive; KillProcessTree always errors there and
+		// Process.Kill is the kill.
+		proc := startKillTestHang(t, exe)
+		stubKillProcessTree(t, func(int) error { return treeErr })
+		if err := killSessionProcess(&CLISession{ID: "unix", Process: proc}); err != nil {
+			t.Fatalf("unix kill must ignore the tree error: %v", err)
+		}
+		_ = waitKillTestRoot(t, proc)
+		return
+	}
+
+	exitErr := func(code int) error {
+		err := exec.Command("cmd.exe", "/d", "/c", fmt.Sprintf("exit %d", code)).Run()
+		if !taskkillRootNotFound(err) && code == 128 {
+			t.Fatalf("cmd exit 128 not recognized as taskkill not-found: %v", err)
+		}
+		return err
+	}
+	partialFailure, notFound := exitErr(1), exitErr(128)
+
+	cases := []struct {
+		name      string
+		killsRoot bool
+		err       error
+		wantErr   bool
+	}{
+		{name: "tree kill failed, root still alive", err: treeErr, wantErr: true},
+		{name: "tree kill took the root, then failed", killsRoot: true, err: partialFailure, wantErr: true},
+		{name: "root exited before taskkill ran", killsRoot: true, err: notFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proc := startKillTestHang(t, exe)
+			stubKillProcessTree(t, func(int) error {
+				if tc.killsRoot {
+					_ = proc.Process.Kill()
+					requireKillTestGone(t, "root", proc.Process)
+				}
+				return tc.err
+			})
+			err := killSessionProcess(&CLISession{ID: "tree-fail", Process: proc})
+			if tc.wantErr && err == nil {
+				t.Fatal("a failed tree kill was reported as a clean kill")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("root exited before taskkill: got %v, want nil", err)
+			}
+			_ = waitKillTestRoot(t, proc)
+		})
+	}
+}
+
+// stubKillProcessTree swaps the tree-kill seam for fn for the rest of the
+// test and returns the number of calls it received.
+func stubKillProcessTree(t *testing.T, fn func(pid int) error) *int {
+	t.Helper()
+	calls := new(int)
+	prev := killProcessTree
+	killProcessTree = func(pid int) error {
+		*calls++
+		return fn(pid)
+	}
+	t.Cleanup(func() { killProcessTree = prev })
+	return calls
+}
+
+// startKillTestHang starts the direct grok-smoke-hang child and returns once
+// it is in its 10-minute hang.
+func startKillTestHang(t *testing.T, exe string) *exec.Cmd {
+	t.Helper()
+	pidFile := filepath.Join(t.TempDir(), "hang.pid")
+	proc := exec.Command(exe)
+	proc.Env = setEnvVar(setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang"), mockGrokSmokeHangPidEnv, pidFile)
+	startKillTestRoot(t, proc)
+	waitForKillTestPid(t, pidFile, proc.Process)
+	return proc
 }
 
 // assertKillSessionTakesTree starts root with its stdout/stderr on a pipe the
 // descendant inherits, then proves killSessionProcess took root AND
 // descendant down: both read gone while their handles still pin the pids, the
-// root's Wait reports the force kill, and the pipe reaches EOF (no survivor
-// holds the write end).
+// pipe reaches EOF (no survivor holds the write end). The root's Wait status
+// is not judged: roots are waiters, so a clean exit proves nothing either way.
 func assertKillSessionTakesTree(t *testing.T, root *exec.Cmd, pidFile string) {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -1954,9 +2079,7 @@ func assertKillSessionTakesTree(t *testing.T, root *exec.Cmd, pidFile string) {
 	}
 	requireKillTestGone(t, "root", root.Process)
 	requireKillTestGone(t, "descendant", descendant)
-	if err := waitKillTestRoot(t, root); err == nil {
-		t.Fatal("root exited cleanly — want the force-kill exit status")
-	}
+	_ = waitKillTestRoot(t, root)
 	select {
 	case err := <-eof:
 		if err != nil {
@@ -2068,6 +2191,27 @@ func TestRedactSessionLog(t *testing.T) {
 			msg:       "[session] stderr[2] " + id + `: open C:\Users\dev\.grok\settings.json: denied` + "\n",
 			absent:    []string{id, `C:\Users\dev`, "settings.json"},
 			present:   []string{"[session_id:REDACTED]", "denied"},
+		},
+		{
+			name:      "spaced windows profile before .grok",
+			sessionID: id,
+			msg:       "[session] stderr[3] " + id + `: open C:\Users\First Last\.grok\auth.json failed` + "\n",
+			absent:    []string{id, "First", "Last", "auth.json"},
+			present:   []string{"[session_id:REDACTED]", "failed"},
+		},
+		{
+			name:    "spaced unix home before config.toml",
+			msg:     "[session] loading /Users/First Last/.codex/config.toml now\n",
+			absent:  []string{"First", "Last", "config.toml"},
+			present: []string{"loading", "now"},
+		},
+		{
+			name:      "split --api-key argv in the start line",
+			sessionID: id,
+			msg: "[session] Starting grok session " + id + ": grok " +
+				sessionArgsForLog([]string{"--api-key", "xai-splitsecret123", "--model", "grok-4"}) + "\n",
+			absent:  []string{id, "xai-splitsecret123"},
+			present: []string{"--api-key [REDACTED]", "--model grok-4"},
 		},
 		{
 			name:    "color reset survives a trailing path",
