@@ -919,8 +919,9 @@ how many runs succeed. That is the `observed_stale` /
 
 With the poller armed, that same replay carries the **in-run** `observedAt`: the
 gather still finds no port, but the snapshot it loads was written while the run's
-own server was alive. Nothing probes after the smoke returns — there is no server
-left to probe — so freshness comes from the capture, not from a second gather.
+own server was alive. No new probe is added after the smoke returns — by then the
+server is gone — so freshness comes from the capture (whose own 2s tail below is
+the last in-run read), not from a second gather.
 The replay conditions are unchanged: the cached account matches `settings.json`,
 settings names nobody, or a live probe from the last two minutes named that same
 account.
@@ -943,9 +944,12 @@ closes that gap by reading the server **while it exists**:
   comes from native chat, the pipe path and `execute`.
   `commandRunsAntigravity`
   ([`cliagent_usage_antigravity_command.go`](cliagent_usage_antigravity_command.go))
-  sees through every wrapper terminal-service ships: `bash -c` / `-lc`,
-  `cmd /c`, and `powershell`/`pwsh` `-EncodedCommand <base64>` with flags such as
-  `-NoProfile` ahead of it, including the `scriptMode: "file"` launcher whose
+  sees through every wrapper transport terminal-service emits
+  (`wrapperScriptPayload` in [`headless_env.go`](headless_env.go)): the POSIX
+  shells' `-c` / `-lc`, `cmd /c` and `/k`, PowerShell's `-Command` / `-c`, and
+  `powershell`/`pwsh` `-EncodedCommand <base64>` — the wrapper flag is matched at
+  ANY argument index, so `-NoProfile` / `-NonInteractive` / `-OutputFormat Text`
+  ahead of it change nothing. That includes the `scriptMode: "file"` launcher whose
   outer payload carries the real script as a nested base64 literal. The decoded
   script is a classification input and nothing else — it is never logged,
   persisted or returned, and the only value that leaves that file is a bool. A
