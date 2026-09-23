@@ -1644,7 +1644,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		}
 	}
 
-	var batch []string
+	var batch []streamBatchEntry
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
@@ -1652,14 +1652,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if len(batch) == 0 {
 			return
 		}
-		separator := "\n"
-		if isGrokCommand(session.Command) && session.isolatedGrokHome != "" {
-			// Grok's streaming-json text/data frames are incremental deltas. A
-			// newline inserted at an internal frame boundary corrupts the exact
-			// maintenance marker; any intended whitespace is already in the delta.
-			separator = ""
-		}
-		output := strings.Join(batch, separator)
+		output := joinStreamBatch(batch)
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -1696,7 +1689,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var codexDeltaFamily, codexCompleteFamily string
 	flushCodexDeltas := func() {
 		if codexDeltas.Len() > 0 {
-			batch = append(batch, codexDeltas.String())
+			batch = append(batch, streamBatchEntry{text: codexDeltas.String()})
 			codexDeltas.Reset()
 		}
 	}
@@ -1746,7 +1739,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if displayText == "" {
 			return
 		}
-		batch = append(batch, displayText)
+		// A structured-stream frame renders as a FRAGMENT of the turn's text —
+		// a Claude text/thinking delta, or a tool marker that carries its own
+		// newlines — so it joins neighbouring fragments with no separator.
+		// Isolated Grok streaming-json frames are deltas for the same reason.
+		// A plain line (stderr, a login banner, an unknown CLI) keeps its newline.
+		fragment := (isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(lineText)) ||
+			(isGrokCommand(session.Command) && session.isolatedGrokHome != "")
+		batch = append(batch, streamBatchEntry{text: displayText, fragment: fragment})
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
 		// no-output watchdog. No-op for non-claude sessions (they
@@ -1775,7 +1775,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete stream for a successful turn.
 				if session.antigravityManagedStream && !antigravityResultSeen {
 					if antigravityDeltas.Len() > 0 {
-						batch = append(batch, antigravityDeltas.String())
+						batch = append(batch, streamBatchEntry{text: antigravityDeltas.String()})
 					}
 					session.mu.Lock()
 					session.ExitCode = 1

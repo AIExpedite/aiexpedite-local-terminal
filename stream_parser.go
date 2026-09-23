@@ -553,3 +553,28 @@ func extractContentArray(raw map[string]interface{}) string {
 	}
 	return strings.Join(parts, "")
 }
+
+// streamBatchEntry is one rendered frame waiting in a session's publish batch.
+// fragment marks text that is a piece of a larger stream (a structured delta):
+// it already carries whatever whitespace the CLI meant, so a newline at its
+// frame boundary would split a word. A newline inside a Claude
+// `IMPLEMENTATION COMPLETE` marker made it unparseable for the orchestrator
+// (`IMPLEMENT` / `ATION COMPLETE`, `Counts: New 0,` / ` Updated 2`).
+type streamBatchEntry struct {
+	text     string
+	fragment bool
+}
+
+// joinStreamBatch concatenates a publish batch. Two adjacent fragments join
+// with nothing between them; any boundary that touches a whole line keeps the
+// newline the line reader stripped.
+func joinStreamBatch(entries []streamBatchEntry) string {
+	var b strings.Builder
+	for i, entry := range entries {
+		if i > 0 && !(entries[i-1].fragment && entry.fragment) {
+			b.WriteByte('\n')
+		}
+		b.WriteString(entry.text)
+	}
+	return b.String()
+}
