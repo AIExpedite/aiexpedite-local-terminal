@@ -10,12 +10,20 @@
 // observedAt. That is why the CLI Agents card kept ageing a day-old pool even
 // after a successful run.
 //
-// The fix is to read the server WHILE it exists. Every path that spawns `agy` —
-// native chat (antigravity_native.go), the PTY session/execute path
-// (pty_session_unix.go) and the pipe session path (session.go) — arms this
-// bounded poller for the life of the child: it probes immediately and ramps
-// down to a steady interval. The next signed refresh then replays a snapshot
-// whose observedAt falls inside the run.
+// The fix is to read the server WHILE it exists. Every path that spawns `agy`
+// arms this bounded poller for the life of the child: it probes immediately and
+// ramps down to a steady interval. The next signed refresh then replays a
+// snapshot whose observedAt falls inside the run. The five arm sites, and the
+// per-path timing that goes with them, are documented in CLI_AGENT_INTEGRATION.md
+// ("Antigravity quota capture"):
+//
+//   - runOneShot            (antigravity_native.go) — native chat, after Start
+//   - runPTYCommand         (pty_session_unix.go)   — PTY session + execute, after Start
+//   - StartSession          (session.go)            — pipe session, after Start, released in waitForExit
+//   - runLocalCommandUnix   (pubsub.go)             — tty=false execute, incl. a DIRECT
+//     `agy` on Windows, after Start
+//   - runLocalCommandWindows (pubsub.go)            — the wrapped Windows transport
+//     chain, armed at function ENTRY because no single post-Start hook exists there
 //
 // Cost discipline matters because this runs on the user's machine while they are
 // working, and the expensive part of a probe is log scanning

@@ -919,12 +919,32 @@ how many runs succeed. That is the `observed_stale` /
 
 With the poller armed, that same replay carries the **in-run** `observedAt`: the
 gather still finds no port, but the snapshot it loads was written while the run's
-own server was alive. No new probe is added after the smoke returns — by then the
-server is gone — so freshness comes from the capture (whose own 2s tail below is
-the last in-run read), not from a second gather.
-The replay conditions are unchanged: the cached account matches `settings.json`,
-settings names nobody, or a live probe from the last two minutes named that same
-account.
+own server was alive. The gather adds no post-smoke probe of its own; the only
+read that happens after the run releases is the capture's own 2s tail (below),
+which is still an in-run read and can itself write a newer `observedAt` while the
+server shuts down.
+
+`ParseContext` replays that cache under three predicates, not one. Current
+identity comes from `~/.gemini/antigravity-cli/settings.json`, or from legacy
+`~/.agy/config.json` when the modern file is absent:
+
+1. **Scoped load.** The cached `accountFingerprint` equals the fingerprint of the
+   account that identity file names — replayed as stored.
+2. **No identity on disk.** That is the usual case, since the account lives in
+   the OS keyring, so the fingerprint is empty and `loadAntigravityQuotaSnapshot`
+   refuses by construction. The cache is then replayed under the account that
+   PRODUCED it (`loadAntigravityQuotaSnapshotByProducer`) and the card names that
+   account. **No live probe is required for this.**
+3. **A recent live probe outranks the file.** When the identity file names
+   someone the cache does not match, a live probe from the last
+   `antigravityLiveProducerTTL = 2m` (a Refresh click) whose own server named the
+   cache's producer wins: the cache is replayed and the card takes the *probe's*
+   account and plan, because that server's login is newer than the one the file
+   still records. The probe is matched against the CACHE, never against
+   `settings.json`.
+
+A file-named account with no such probe and no matching cache leaves the reading
+unreplayed.
 
 [`cliagent_usage_antigravity_capture.go`](cliagent_usage_antigravity_capture.go)
 closes that gap by reading the server **while it exists**:
@@ -934,9 +954,10 @@ closes that gap by reading the server **while it exists**:
   [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`,
   `"PTY session"`), [`StartSession`](session.go) (pipe session path,
   `"pipe session"`, released in `waitForExit`),
-  [`runLocalCommandUnix`](pubsub.go) (tty=false `execute` on Unix,
-  `"local execute"`) and [`runLocalCommandWindows`](pubsub.go) (the whole Windows
-  transport chain, `"windows execute"`). Native chat calls
+  [`runLocalCommandUnix`](pubsub.go) (tty=false `execute` — the bare-exec route,
+  which a DIRECT `agy …` takes on Windows too, `"local execute"`) and
+  [`runLocalCommandWindows`](pubsub.go) (the WRAPPED Windows transport chain,
+  `"windows execute"`). Native chat calls
   `startAntigravityQuotaCapture` directly — it already knows it is spawning
   `agy`; every other site goes through `armAntigravityCaptureForCommand`, which
   pairs `commandRunsAntigravity` with the arm in one place so a site cannot drift
@@ -965,15 +986,34 @@ closes that gap by reading the server **while it exists**:
   turns) down to `antigravityCapturePollInterval = 3s`. Arm timing is per path:
   native chat, PTY, the pipe session and the Unix `execute` arm **after a
   successful `Start`**, so the immediate probe cannot run before the process
-  exists, and a failed spawn arms nothing at all. `runLocalCommandWindows` has no
-  single post-`Start` hook — each transport in the chain (encoded-argument
-  PowerShell, temp `.ps1`, dedicated process, `runViaShell`, the persistent
-  instance and its fallbacks) owns its own process — so it takes one `defer` arm
-  at function entry covering the whole chain. That window opens slightly before
-  the child does, costing at most one probe against a server that is not up yet;
-  in exchange a sequential failover cannot double-arm, and the opening 250ms ramp
-  still samples any smoke that outlives the first miss. A Windows run that never
-  spawns a child opens and closes that single arm.
+  exists, and a failed spawn arms nothing at all.
+  `runLocalCommandWindows` is the exception. It has no single post-`Start` hook —
+  each transport in the chain (encoded-argument PowerShell, temp `.ps1`, a
+  dedicated one-shot process, `runViaShell`, the persistent instance and its
+  fallbacks) owns its own process — so it takes one `defer` arm at **function
+  entry**, before any child exists. What that costs is not one wasted probe:
+  PowerShell startup alone is 300–800ms, and until a port is memoized every tick
+  is a full discovery attempt that walks both install trees. So the pre-server
+  window is several log scans — the immediate probe plus a 250ms tick for as long
+  as the ramp lasts (`antigravityCaptureInitialPolls = 12` discovery attempts,
+  ≈3s), then one every 3s. Those attempts are bounded by the same
+  `antigravityCaptureMaxAttempts = 200` / `antigravityCaptureMaxDuration = 15m`
+  caps, after which the poller parks (or, with no port memoized, returns and
+  waits for release). **An early arm is not a guarantee of capture:** a server
+  that binds and exits entirely inside a gap between ticks is never sampled, and
+  with `memoPort == 0` there is no tail to catch it either, so that smoke still
+  finishes stale. What the entry-time arm does buy is that a sequential failover
+  through the chain cannot double-arm.
+  Arming is still gated on the classifier: a **classified** Windows execute arms
+  once at entry and releases on return even when no transport ever starts a
+  child; an **unclassified** one gets `armAntigravityCaptureForCommand`'s no-op
+  release and arms nothing at all (`antigravityCaptureArms` stays 0 —
+  `TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing`).
+  Note the route split: a DIRECT `agy …` on Windows never reaches that defer.
+  `runLocalCommand` sends it to `runLocalCommandUnix` on the `isAntigravityCommand`
+  predicate (the CLI streams, and wrapping it in PowerShell breaks the stream), so
+  it arms `"local execute"` after a successful `Start` like the Unix path.
+  `runLocalCommandWindows` owns only the WRAPPED transports.
 - **Bounded discovery, continuous live-port reads.**
   `antigravityCaptureMaxAttempts = 200` and
   `antigravityCaptureMaxDuration = 15m` bound attempts that may scan logs. Once
