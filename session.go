@@ -1166,7 +1166,9 @@ func (sm *SessionManager) SignalSession(id, signal string) error {
 //   - otherwise the Kill error
 //
 // Neither Wait nor Release is called here: waitForExit owns the reap, and the
-// open os.Process handle is what keeps the PID from being recycled.
+// open os.Process handle is what keeps the PID from being recycled — the tree
+// kill pins that handle for its own duration (killProcessTreePinned) so a
+// concurrent reap cannot free the PID under taskkill.
 func killSessionProcess(session *CLISession) error {
 	if session == nil || session.Process == nil || session.Process.Process == nil {
 		return os.ErrProcessDone
@@ -1178,12 +1180,14 @@ func killSessionProcess(session *CLISession) error {
 	if processReaped(proc) || processHandleGone(proc) {
 		return nil
 	}
-	// Re-check right before the PID-based kill: waitForExit's Wait runs
-	// concurrently and may have reaped the child during the probe above.
-	if processReaped(proc) {
+	// The tree kill is PID-based and waitForExit's Wait runs concurrently with
+	// every kill path, so a second probe here would still be a TOCTOU: Wait
+	// can reap between the probe and taskkill, close the handle, and let the
+	// PID be reused. Pin the handle across the tree kill instead.
+	treeErr, pinned := killProcessTreePinned(proc)
+	if !pinned {
 		return nil
 	}
-	treeErr := killProcessTree(proc.Pid)
 	killErr := proc.Kill()
 	if runtime.GOOS == "windows" && treeErr != nil &&
 		!(taskkillRootNotFound(treeErr) && processHandleGone(proc)) {
@@ -1198,6 +1202,31 @@ func killSessionProcess(session *CLISession) error {
 // killProcessTree is KillProcessTree behind a seam so tests can make the tree
 // kill fail without a process taskkill cannot reach.
 var killProcessTree = KillProcessTree
+
+// killProcessTreePinned runs the PID-based tree kill with proc's process
+// handle pinned open, and reports whether the process was still unreaped.
+//
+// KillProcessTree names its target by PID, and waitForExit's Wait races every
+// kill path: the moment Wait reaps, the os.Process handle closes and Windows
+// is free to hand that PID to a stranger whose whole tree `taskkill /F /T`
+// would then take. WithHandle (Go 1.26) is the only TOCTOU-free sequencing —
+// it keeps the handle valid for the duration of f even if the process exits,
+// which is what holds the PID reserved, and it refuses outright once Wait has
+// reaped (there is nothing left to kill and no PID we may touch).
+//
+// ErrNoHandle means the platform has no handle to pin (macOS, pre-5.4 Linux,
+// plan9). There KillProcessTree is an error that never spawns anything, so no
+// PID is touched and Process.Kill — which reads Go's own process state, not
+// the PID — is the kill.
+func killProcessTreePinned(proc *os.Process) (treeErr error, unreaped bool) {
+	if err := proc.WithHandle(func(uintptr) { treeErr = killProcessTree(proc.Pid) }); err != nil {
+		if !errors.Is(err, os.ErrNoHandle) {
+			return nil, false
+		}
+		treeErr = killProcessTree(proc.Pid)
+	}
+	return treeErr, true
+}
 
 // processReaped reports whether Wait has already reaped p. Signal 0 reads Go's
 // own process state on every platform, never the OS, so it cannot reach a

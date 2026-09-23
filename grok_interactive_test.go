@@ -1920,6 +1920,36 @@ func TestKillSessionProcess_ReapedProcessIsNotKilledAgain(t *testing.T) {
 	}
 }
 
+// The probe in killSessionProcess cannot close the Wait race on its own, so
+// the tree kill itself has to refuse a reaped process: WithHandle is the only
+// reader of that state that cannot go stale under the caller.
+func TestKillProcessTreePinned_RefusesAReapedProcess(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	calls := stubKillProcessTree(t, func(int) error { return nil })
+	proc := exec.Command(exe, "-test.run=^$")
+	if err := proc.Run(); err != nil {
+		t.Fatalf("run short-lived child: %v", err)
+	}
+	treeErr, unreaped := killProcessTreePinned(proc.Process)
+	if unreaped {
+		if runtime.GOOS == "windows" {
+			t.Fatal("a reaped process was reported unreaped — its pid may already belong to a stranger")
+		}
+		// No handle to pin (macOS, pre-5.4 Linux): KillProcessTree is an
+		// unimplemented error there and spawns nothing, so no pid is touched.
+		t.Skipf("%s has no process handle to pin", runtime.GOOS)
+	}
+	if treeErr != nil {
+		t.Fatalf("refused tree kill reported an error: %v", treeErr)
+	}
+	if *calls != 0 {
+		t.Fatalf("reaped process's pid was tree-killed %d time(s), want 0", *calls)
+	}
+}
+
 // A root that already exited (but is not yet reaped) has no tree left to take
 // — its descendants were reparented when it died — so it gets no PID kill.
 // Windows only: an exited unix child is a zombie that still reads alive.
