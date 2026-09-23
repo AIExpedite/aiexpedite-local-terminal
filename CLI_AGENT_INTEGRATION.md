@@ -917,22 +917,40 @@ executing, so it never finds a port, replays the cached snapshot with its
 how many runs succeed. That is the `observed_stale` /
 `latestObservedAt = 2026-08-28T05:13:22Z` symptom.
 
+With the poller armed, that same replay carries the **in-run** `observedAt`: the
+gather still finds no port, but the snapshot it loads was written while the run's
+own server was alive. Nothing probes after the smoke returns — there is no server
+left to probe — so freshness comes from the capture, not from a second gather.
+The replay conditions are unchanged: the cached account matches `settings.json`,
+settings names nobody, or a live probe from the last two minutes named that same
+account.
+
 [`cliagent_usage_antigravity_capture.go`](cliagent_usage_antigravity_capture.go)
 closes that gap by reading the server **while it exists**:
 
-- **Armed at every spawn.** `startAntigravityQuotaCapture(label)` is called from
-  [`runOneShot`](antigravity_native.go) (native chat),
-  [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`),
-  [`StartSession`](session.go) (pipe session path, released in `waitForExit`) and
-  [`runLocalCommand`](pubsub.go) (tty=false `execute` — direct spawn on Unix and
-  a dedicated one-shot process on Windows). All but
-  native chat gate on `commandRunsAntigravity`, which also sees through the
-  `bash -c "agy …"` wrapper terminal-service ships. Windows has no PTY path, so
-  capture there comes from native chat, the pipe path and `execute`.
-  **Known gap:** a command that arrives already wrapped as
-  `powershell -EncodedCommand <base64>` is opaque at this layer and is not
-  classified; decoding caller-supplied base64 to sniff for a program name is a
-  worse trade than losing freshness on that one route.
+- **Armed at every spawn.** The arm sites are
+  [`runOneShot`](antigravity_native.go) (native chat, `"native turn"`),
+  [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`,
+  `"PTY session"`), [`StartSession`](session.go) (pipe session path,
+  `"pipe session"`, released in `waitForExit`),
+  [`runLocalCommandUnix`](pubsub.go) (tty=false `execute` on Unix,
+  `"local execute"`) and [`runLocalCommandWindows`](pubsub.go) (the whole Windows
+  transport chain, `"windows execute"`). Native chat calls
+  `startAntigravityQuotaCapture` directly — it already knows it is spawning
+  `agy`; every other site goes through `armAntigravityCaptureForCommand`, which
+  pairs `commandRunsAntigravity` with the arm in one place so a site cannot drift
+  out of step with the classifier. Windows has no PTY path, so capture there
+  comes from native chat, the pipe path and `execute`.
+  `commandRunsAntigravity`
+  ([`cliagent_usage_antigravity_command.go`](cliagent_usage_antigravity_command.go))
+  sees through every wrapper terminal-service ships: `bash -c` / `-lc`,
+  `cmd /c`, and `powershell`/`pwsh` `-EncodedCommand <base64>` with flags such as
+  `-NoProfile` ahead of it, including the `scriptMode: "file"` launcher whose
+  outer payload carries the real script as a nested base64 literal. The decoded
+  script is a classification input and nothing else — it is never logged,
+  persisted or returned, and the only value that leaves that file is a bool. A
+  payload over `antigravityClassifyMaxPayloadBytes` (256 KB) classifies as *not*
+  Antigravity rather than growing the decode budget.
 - **One shared, refcounted poller.** Concurrent `agy` runs join the same
   goroutine; it stops when the last one releases it.
 - **Timing is everything.** The server dies *with* the child, so a post-exit
@@ -940,15 +958,31 @@ closes that gap by reading the server **while it exists**:
   **immediately at arm**, then ramps
   (`antigravityCaptureInitialPollInterval = 250ms` ×
   `antigravityCaptureInitialPolls = 12`, covering server bind time and short
-  turns) down to `antigravityCapturePollInterval = 3s`. Capture is armed only
-  after the child successfully starts, so the immediate probe cannot run before
-  the process exists.
+  turns) down to `antigravityCapturePollInterval = 3s`. Arm timing is per path:
+  native chat, PTY, the pipe session and the Unix `execute` arm **after a
+  successful `Start`**, so the immediate probe cannot run before the process
+  exists, and a failed spawn arms nothing at all. `runLocalCommandWindows` has no
+  single post-`Start` hook — each transport in the chain (encoded-argument
+  PowerShell, temp `.ps1`, dedicated process, `runViaShell`, the persistent
+  instance and its fallbacks) owns its own process — so it takes one `defer` arm
+  at function entry covering the whole chain. That window opens slightly before
+  the child does, costing at most one probe against a server that is not up yet;
+  in exchange a sequential failover cannot double-arm, and the opening 250ms ramp
+  still samples any smoke that outlives the first miss. A Windows run that never
+  spawns a child opens and closes that single arm.
 - **Bounded discovery, continuous live-port reads.**
   `antigravityCaptureMaxAttempts = 200` and
   `antigravityCaptureMaxDuration = 15m` bound attempts that may scan logs. Once
   either cap is reached, a memoized live port continues receiving cheap 3s
   loopback reads until the run ends; no further log scans occur. If no port was
   found, the poller parks until release.
+- **A short tail after the last release.** A turn's quota is debited at the END
+  of the turn, and the execute path releases the instant `Wait` returns while the
+  server is still shutting down and still answering. So after the last armed run
+  releases, the poller keeps reading for `antigravityCaptureTailGrace = 2s` —
+  memoized port only, no discovery and no log scanning. A run that exits with no
+  memoized port, or one stopped by the CSRF gate, skips the tail entirely. That
+  tail is the last in-run read, not a second gather.
 - **Cheap.** The expensive part of a probe is log scanning (4 files ×
   2×128 KB), not the RPC, so the winning port is memoized for the life of the run
   and rediscovered only after an RPC failure. One HTTP client/transport is reused
@@ -965,7 +999,8 @@ closes that gap by reading the server **while it exists**:
   `settings.json` contents are never written to the cache and never logged. A
   reading the server could not attribute (`GetUserStatus` failed) is retried on
   the next tick rather than cached under a settings-file account.
-- **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick (mirrors
+- **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick and
+  `AIEXPEDITE_AGY_CAPTURE_TAIL` the tail window (both mirror
   `AIEXPEDITE_AGY_QUOTA_CACHE`); a non-positive or unparseable value falls back
   to the shipped constant.
 
