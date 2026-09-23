@@ -1797,7 +1797,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		}
 	}
 
-	var batch []string
+	var batch []streamBatchEntry
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
@@ -1805,14 +1805,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if len(batch) == 0 {
 			return
 		}
-		separator := "\n"
-		if isGrokCommand(session.Command) && session.isolatedGrokHome != "" {
-			// Grok's streaming-json text/data frames are incremental deltas. A
-			// newline inserted at an internal frame boundary corrupts the exact
-			// maintenance marker; any intended whitespace is already in the delta.
-			separator = ""
-		}
-		output := strings.Join(batch, separator)
+		output := joinStreamBatch(batch)
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -1836,6 +1829,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
 
+	// Claude streams one content block at a time. Deltas inside a block join
+	// with nothing between them (see joinStreamBatch), but the boundary BETWEEN
+	// two blocks must keep a newline: a thinking block's last delta does not
+	// necessarily end in whitespace and the intervening `content_block_stop` /
+	// text `content_block_start` render no text, so joining them would run the
+	// last thought into the answer ("considering...Final answer").
+	var claudeBlocks claudeBlockTracker
+
 	// Codex assistant deltas accumulate here with NO separator — flushBatch
 	// joins batch entries with a newline, and a newline at a frame boundary breaks
 	// an exact marker. A complete assistant message supersedes (discards) the
@@ -1849,7 +1850,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var codexDeltaFamily, codexCompleteFamily string
 	flushCodexDeltas := func() {
 		if codexDeltas.Len() > 0 {
-			batch = append(batch, codexDeltas.String())
+			batch = append(batch, streamBatchEntry{text: codexDeltas.String()})
 			codexDeltas.Reset()
 		}
 	}
@@ -1899,7 +1900,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if displayText == "" {
 			return
 		}
-		batch = append(batch, displayText)
+		// A structured-stream frame renders as a FRAGMENT of the turn's text —
+		// a Claude text/thinking delta, or a tool marker that carries its own
+		// newlines — so it joins neighbouring fragments with no separator.
+		// Isolated Grok streaming-json frames are deltas for the same reason.
+		// A plain line (stderr, a login banner, an unknown CLI) keeps its newline.
+		fragment := (isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(lineText)) ||
+			(isGrokCommand(session.Command) && session.isolatedGrokHome != "")
+		if fragment && isClaudeCommand(session.Command) {
+			displayText = claudeBlocks.separate(lineText, displayText, batch)
+		}
+		batch = append(batch, streamBatchEntry{text: displayText, fragment: fragment})
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
 		// no-output watchdog. No-op for non-claude sessions (they
@@ -1928,7 +1939,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete stream for a successful turn.
 				if session.antigravityManagedStream && !antigravityResultSeen {
 					if antigravityDeltas.Len() > 0 {
-						batch = append(batch, antigravityDeltas.String())
+						batch = append(batch, streamBatchEntry{text: antigravityDeltas.String()})
 					}
 					session.mu.Lock()
 					session.ExitCode = 1
@@ -2135,6 +2146,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				appendDisplayText(line.text)
 				flushCodexDeltas()
 				flushBatch()
+				if isClaudeCommand(session.Command) {
+					claudeBlocks.recordTurnBoundary()
+				}
 				// A finished codex turn owes the CLI Agents card a reading taken
 				// after it started (cliagent_usage_codex_freshness.go). Once per
 				// run: thread.completed follows turn.completed.
@@ -2155,6 +2169,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// "session already ended") broke the kickoff-then-sendInput pattern
 			// that codeImplementation relies on across steps 11→14→15.
 			if detectResultEvent(session.Command, line.text) {
+				if isClaudeCommand(session.Command) {
+					claudeBlocks.recordTurnBoundary()
+				}
 				session.mu.Lock()
 				session.Status = "waiting_input"
 				session.mu.Unlock()

@@ -553,3 +553,106 @@ func extractContentArray(raw map[string]interface{}) string {
 	}
 	return strings.Join(parts, "")
 }
+
+// streamBatchEntry is one rendered frame waiting in a session's publish batch.
+// fragment marks text that is a piece of a larger stream (a structured delta):
+// it already carries whatever whitespace the CLI meant, so a newline at its
+// frame boundary would split a word. A newline inside a Claude
+// `IMPLEMENTATION COMPLETE` marker made it unparseable for the orchestrator
+// (`IMPLEMENT` / `ATION COMPLETE`, `Counts: New 0,` / ` Updated 2`).
+type streamBatchEntry struct {
+	text     string
+	fragment bool
+}
+
+// joinStreamBatch concatenates a publish batch. Two adjacent fragments join
+// with nothing between them; any boundary that touches a whole line keeps the
+// newline the line reader stripped.
+func joinStreamBatch(entries []streamBatchEntry) string {
+	var b strings.Builder
+	for i, entry := range entries {
+		if i > 0 && !(entries[i-1].fragment && entry.fragment) {
+			b.WriteByte('\n')
+		}
+		b.WriteString(entry.text)
+	}
+	return b.String()
+}
+
+// claudeStreamBlockIndex returns the content-block index a Claude stream_event
+// frame belongs to (`content_block_start` / `_delta` / `_stop` all carry one),
+// and whether the frame carries an index at all. The session batcher uses it to
+// tell a delta that continues the current block from the first delta of the
+// next one: deltas inside a block join with nothing between them, but a
+// thinking block's last delta does not necessarily end in whitespace and the
+// intervening `content_block_stop` plus the text `content_block_start` render
+// no text — so without the boundary the last thought would run straight into
+// the answer ("considering...Final answer").
+func claudeStreamBlockIndex(line string) (int, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return 0, false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return 0, false
+	}
+	event, ok := raw["event"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	index, ok := event["index"].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(index), true
+}
+
+// claudeBlockTracker remembers which Claude content block the batch is
+// currently inside so the first frame of the NEXT block can carry the
+// separator the lifecycle frames don't render. It also tracks turn boundaries
+// so successive turns whose block indices repeat (e.g. both starting at index 0)
+// do not run together across a flushed batch.
+type claudeBlockTracker struct {
+	index               int
+	seen                bool
+	turnBoundary        bool
+	lastEndsWithNewline bool
+}
+
+// recordTurnBoundary notes that a Claude turn has completed (a terminal
+// result event was received). The next displayed fragment must start on a
+// new line even if its content-block index matches the previous turn's
+// last block.
+func (t *claudeBlockTracker) recordTurnBoundary() {
+	if t.seen {
+		t.turnBoundary = true
+	}
+}
+
+// separate returns displayText with a leading newline when lineText opens a
+// different content block than the previous frame or starts a new turn — unless
+// the boundary is already separated, i.e. the text opens with a newline (the
+// `--- Thinking ---` / `[Using tool: …]` markers do) or the frame before it
+// closed with one, so a boundary adds at most one blank line.
+func (t *claudeBlockTracker) separate(lineText, displayText string, batch []streamBatchEntry) string {
+	index, ok := claudeStreamBlockIndex(lineText)
+	boundary := t.turnBoundary || (ok && t.seen && index != t.index)
+	if ok {
+		t.index = index
+	}
+	t.seen = true
+	t.turnBoundary = false
+
+	if !boundary || strings.HasPrefix(displayText, "\n") {
+		t.lastEndsWithNewline = strings.HasSuffix(displayText, "\n")
+		return displayText
+	}
+	if (len(batch) > 0 && strings.HasSuffix(batch[len(batch)-1].text, "\n")) || (len(batch) == 0 && t.lastEndsWithNewline) {
+		t.lastEndsWithNewline = strings.HasSuffix(displayText, "\n")
+		return displayText
+	}
+	res := "\n" + displayText
+	t.lastEndsWithNewline = strings.HasSuffix(res, "\n")
+	return res
+}
