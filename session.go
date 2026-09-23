@@ -1997,6 +1997,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				appendDisplayText(line.text)
 				flushCodexDeltas()
 				flushBatch()
+				if isClaudeCommand(session.Command) {
+					claudeBlocks.recordTurnBoundary()
+				}
 				// A finished codex turn owes the CLI Agents card a reading taken
 				// after it started (cliagent_usage_codex_freshness.go). Once per
 				// run: thread.completed follows turn.completed.
@@ -2017,6 +2020,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// "session already ended") broke the kickoff-then-sendInput pattern
 			// that codeImplementation relies on across steps 11→14→15.
 			if detectResultEvent(session.Command, line.text) {
+				if isClaudeCommand(session.Command) {
+					claudeBlocks.recordTurnBoundary()
+				}
 				session.mu.Lock()
 				session.Status = "waiting_input"
 				session.mu.Unlock()

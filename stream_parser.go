@@ -610,29 +610,49 @@ func claudeStreamBlockIndex(line string) (int, bool) {
 
 // claudeBlockTracker remembers which Claude content block the batch is
 // currently inside so the first frame of the NEXT block can carry the
-// separator the lifecycle frames don't render.
+// separator the lifecycle frames don't render. It also tracks turn boundaries
+// so successive turns whose block indices repeat (e.g. both starting at index 0)
+// do not run together across a flushed batch.
 type claudeBlockTracker struct {
-	index int
-	seen  bool
+	index               int
+	seen                bool
+	turnBoundary        bool
+	lastEndsWithNewline bool
+}
+
+// recordTurnBoundary notes that a Claude turn has completed (a terminal
+// result event was received). The next displayed fragment must start on a
+// new line even if its content-block index matches the previous turn's
+// last block.
+func (t *claudeBlockTracker) recordTurnBoundary() {
+	if t.seen {
+		t.turnBoundary = true
+	}
 }
 
 // separate returns displayText with a leading newline when lineText opens a
-// different content block than the previous frame — unless the boundary is
-// already separated, i.e. the text opens with a newline (the
+// different content block than the previous frame or starts a new turn — unless
+// the boundary is already separated, i.e. the text opens with a newline (the
 // `--- Thinking ---` / `[Using tool: …]` markers do) or the frame before it
 // closed with one, so a boundary adds at most one blank line.
 func (t *claudeBlockTracker) separate(lineText, displayText string, batch []streamBatchEntry) string {
 	index, ok := claudeStreamBlockIndex(lineText)
-	if !ok {
-		return displayText
+	boundary := t.turnBoundary || (ok && t.seen && index != t.index)
+	if ok {
+		t.index = index
 	}
-	boundary := t.seen && index != t.index
-	t.index, t.seen = index, true
+	t.seen = true
+	t.turnBoundary = false
+
 	if !boundary || strings.HasPrefix(displayText, "\n") {
+		t.lastEndsWithNewline = strings.HasSuffix(displayText, "\n")
 		return displayText
 	}
-	if len(batch) > 0 && strings.HasSuffix(batch[len(batch)-1].text, "\n") {
+	if (len(batch) > 0 && strings.HasSuffix(batch[len(batch)-1].text, "\n")) || (len(batch) == 0 && t.lastEndsWithNewline) {
+		t.lastEndsWithNewline = strings.HasSuffix(displayText, "\n")
 		return displayText
 	}
-	return "\n" + displayText
+	res := "\n" + displayText
+	t.lastEndsWithNewline = strings.HasSuffix(res, "\n")
+	return res
 }

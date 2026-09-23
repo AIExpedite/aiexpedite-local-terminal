@@ -139,3 +139,121 @@ func TestClaudeBlockBoundaryDoesNotDoubleExistingNewline(t *testing.T) {
 		t.Fatalf("joined = %q, want %q", got, want)
 	}
 }
+
+// In a multi-turn Claude session, content-block indices restart for each turn.
+// When two turns both start with block 0, the first delta of the second turn
+// must be separated from the previous turn by a newline instead of running together.
+func TestClaudeSuccessiveTurnsStaySeparatedWhenBlockIndicesRepeat(t *testing.T) {
+	turn1Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first reply"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+	turn2Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second reply"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}`,
+	}
+
+	var tracker claudeBlockTracker
+	runTurn := func(frames []string) string {
+		var batch []streamBatchEntry
+		for _, frame := range frames {
+			displayText := extractDisplayText("claude", frame)
+			if displayText == "" {
+				continue
+			}
+			displayText = tracker.separate(frame, displayText, batch)
+			batch = append(batch, streamBatchEntry{text: displayText, fragment: isClaudeStructuredStreamLine(frame)})
+		}
+		tracker.recordTurnBoundary()
+		return joinStreamBatch(batch)
+	}
+
+	out1 := runTurn(turn1Frames)
+	if out1 != "first reply" {
+		t.Fatalf("turn 1 = %q, want %q", out1, "first reply")
+	}
+
+	out2 := runTurn(turn2Frames)
+	if out2 != "\nsecond reply" {
+		t.Fatalf("turn 2 = %q, want %q", out2, "\nsecond reply")
+	}
+
+	// Consumers concatenating outputs receive clean lines rather than "first replysecond reply".
+	combined := out1 + out2
+	want := "first reply\nsecond reply"
+	if combined != want {
+		t.Fatalf("combined = %q, want %q", combined, want)
+	}
+}
+
+// If a prior turn already ended with a newline, the turn boundary must not insert an extra blank line.
+func TestClaudeSuccessiveTurnsDoNotDoubleExistingNewline(t *testing.T) {
+	turn1Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first reply.\n"}}}`,
+	}
+	turn2Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second reply"}}}`,
+	}
+
+	var tracker claudeBlockTracker
+	runTurn := func(frames []string) string {
+		var batch []streamBatchEntry
+		for _, frame := range frames {
+			displayText := extractDisplayText("claude", frame)
+			if displayText == "" {
+				continue
+			}
+			displayText = tracker.separate(frame, displayText, batch)
+			batch = append(batch, streamBatchEntry{text: displayText, fragment: isClaudeStructuredStreamLine(frame)})
+		}
+		tracker.recordTurnBoundary()
+		return joinStreamBatch(batch)
+	}
+
+	out1 := runTurn(turn1Frames)
+	out2 := runTurn(turn2Frames)
+	combined := out1 + out2
+	want := "first reply.\nsecond reply"
+	if combined != want {
+		t.Fatalf("combined = %q, want %q", combined, want)
+	}
+}
+
+// When a new turn starts with a thinking block or tool use marker that already has a leading newline,
+// no extra newline is added before it.
+func TestClaudeSuccessiveTurnStartingWithThinkingBlock(t *testing.T) {
+	turn1Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first reply"}}}`,
+	}
+	turn2Frames := []string{
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinking"}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}`,
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"second reply"}}}`,
+	}
+
+	var tracker claudeBlockTracker
+	runTurn := func(frames []string) string {
+		var batch []streamBatchEntry
+		for _, frame := range frames {
+			displayText := extractDisplayText("claude", frame)
+			if displayText == "" {
+				continue
+			}
+			displayText = tracker.separate(frame, displayText, batch)
+			batch = append(batch, streamBatchEntry{text: displayText, fragment: isClaudeStructuredStreamLine(frame)})
+		}
+		tracker.recordTurnBoundary()
+		return joinStreamBatch(batch)
+	}
+
+	out1 := runTurn(turn1Frames)
+	out2 := runTurn(turn2Frames)
+	combined := out1 + out2
+	want := "first reply\n--- Thinking ---\nthinking\nsecond reply"
+	if combined != want {
+		t.Fatalf("combined = %q, want %q", combined, want)
+	}
+}
