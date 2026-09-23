@@ -578,3 +578,61 @@ func joinStreamBatch(entries []streamBatchEntry) string {
 	}
 	return b.String()
 }
+
+// claudeStreamBlockIndex returns the content-block index a Claude stream_event
+// frame belongs to (`content_block_start` / `_delta` / `_stop` all carry one),
+// and whether the frame carries an index at all. The session batcher uses it to
+// tell a delta that continues the current block from the first delta of the
+// next one: deltas inside a block join with nothing between them, but a
+// thinking block's last delta does not necessarily end in whitespace and the
+// intervening `content_block_stop` plus the text `content_block_start` render
+// no text — so without the boundary the last thought would run straight into
+// the answer ("considering...Final answer").
+func claudeStreamBlockIndex(line string) (int, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return 0, false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return 0, false
+	}
+	event, ok := raw["event"].(map[string]interface{})
+	if !ok {
+		return 0, false
+	}
+	index, ok := event["index"].(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(index), true
+}
+
+// claudeBlockTracker remembers which Claude content block the batch is
+// currently inside so the first frame of the NEXT block can carry the
+// separator the lifecycle frames don't render.
+type claudeBlockTracker struct {
+	index int
+	seen  bool
+}
+
+// separate returns displayText with a leading newline when lineText opens a
+// different content block than the previous frame — unless the boundary is
+// already separated, i.e. the text opens with a newline (the
+// `--- Thinking ---` / `[Using tool: …]` markers do) or the frame before it
+// closed with one, so a boundary adds at most one blank line.
+func (t *claudeBlockTracker) separate(lineText, displayText string, batch []streamBatchEntry) string {
+	index, ok := claudeStreamBlockIndex(lineText)
+	if !ok {
+		return displayText
+	}
+	boundary := t.seen && index != t.index
+	t.index, t.seen = index, true
+	if !boundary || strings.HasPrefix(displayText, "\n") {
+		return displayText
+	}
+	if len(batch) > 0 && strings.HasSuffix(batch[len(batch)-1].text, "\n") {
+		return displayText
+	}
+	return "\n" + displayText
+}

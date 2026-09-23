@@ -1676,6 +1676,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
 
+	// Claude streams one content block at a time. Deltas inside a block join
+	// with nothing between them (see joinStreamBatch), but the boundary BETWEEN
+	// two blocks must keep a newline: a thinking block's last delta does not
+	// necessarily end in whitespace and the intervening `content_block_stop` /
+	// text `content_block_start` render no text, so joining them would run the
+	// last thought into the answer ("considering...Final answer").
+	var claudeBlocks claudeBlockTracker
+
 	// Codex assistant deltas accumulate here with NO separator — flushBatch
 	// joins batch entries with a newline, and a newline at a frame boundary breaks
 	// an exact marker. A complete assistant message supersedes (discards) the
@@ -1746,6 +1754,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		// A plain line (stderr, a login banner, an unknown CLI) keeps its newline.
 		fragment := (isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(lineText)) ||
 			(isGrokCommand(session.Command) && session.isolatedGrokHome != "")
+		if fragment && isClaudeCommand(session.Command) {
+			displayText = claudeBlocks.separate(lineText, displayText, batch)
+		}
 		batch = append(batch, streamBatchEntry{text: displayText, fragment: fragment})
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
