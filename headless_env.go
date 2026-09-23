@@ -18,6 +18,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"strings"
@@ -348,6 +349,14 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 		return wrapperFlagArg(args, false, "-lc", "-c")
 	case "powershell", "pwsh":
 		if encoded, ok := wrapperFlagArg(args, false, "-encodedcommand"); ok {
+			if !encodedCommandFitsClassifyBudget(encoded) {
+				// Oversized: refuse BEFORE decoding. Rejecting after the fact
+				// would already have allocated the base64 buffer, the UTF-16
+				// slice and the resulting string — i.e. the decode budget the
+				// cap exists to bound. Same answer as an undecodable payload:
+				// a wrapper we will not read.
+				return "", true
+			}
 			decoded, err := decodeBase64PowerShellStrict(encoded)
 			if err != nil {
 				// An undecodable payload is a wrapper we cannot read. Report the
@@ -364,6 +373,22 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 		return wrapperFlagArg(args, true, "/c", "/k")
 	}
 	return "", false
+}
+
+// encodedCommandFitsClassifyBudget reports whether a -EncodedCommand argument
+// can possibly decode to a script within antigravityClassifyMaxPayloadBytes,
+// the budget the sole production caller (commandRunsAntigravity in
+// cliagent_usage_antigravity_command.go) applies to the DECODED script. The
+// payload is base64 of UTF-16LE, so the decoded script is at most half the
+// decoded byte count; an argument whose base64 already exceeds that bound
+// cannot come in under the cap, and checking the ENCODED length costs one
+// integer compare against an argv string the caller is already holding.
+//
+// Cross-file on purpose: one number, one name. The nested file-mode literal
+// needs no such check — fileModeLauncherScript only runs on a script that has
+// already passed the cap, so its inner base64 is bounded by the outer payload.
+func encodedCommandFitsClassifyBudget(encoded string) bool {
+	return base64.StdEncoding.DecodedLen(len(encoded)) <= 2*antigravityClassifyMaxPayloadBytes
 }
 
 // wrapperFlagArg returns the script following the first occurrence of any of

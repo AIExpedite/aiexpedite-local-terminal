@@ -975,7 +975,14 @@ closes that gap by reading the server **while it exists**:
   script is a classification input and nothing else — it is never logged,
   persisted or returned, and the only value that leaves that file is a bool. A
   payload over `antigravityClassifyMaxPayloadBytes` (256 KB) classifies as *not*
-  Antigravity rather than growing the decode budget.
+  Antigravity rather than growing the decode budget, and that cap is applied to
+  an `-EncodedCommand` argument BEFORE it is decoded
+  (`encodedCommandFitsClassifyBudget`): the payload is base64 of UTF-16LE, so an
+  argument whose base64 already exceeds the bound cannot decode under it, and
+  refusing on the encoded length keeps an oversized argument from allocating the
+  base64 buffer, the UTF-16 slice and the decoded string on the way to being
+  rejected. The nested file-mode literal needs no separate check — it is only
+  reached from a script that already passed the cap.
 - **One shared, refcounted poller.** Concurrent `agy` runs join the same
   goroutine; it stops when the last one releases it.
 - **Timing is everything.** The server dies *with* the child, so a post-exit
