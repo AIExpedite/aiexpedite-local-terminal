@@ -384,12 +384,24 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 // cannot come in under the cap, and checking the ENCODED length costs one
 // integer compare against an argv string the caller is already holding.
 //
+// DecodedLen counts base64 padding, overshooting the real byte count by up to
+// encodedCommandPaddingSlack, so that slack is added back: a script sitting
+// exactly ON the cap encodes with a `=` and must not be refused here. The
+// decoded script is still measured against the cap itself in
+// scriptSpawnsAntigravity, so the slack widens what is decoded, not what
+// classifies.
+//
 // Cross-file on purpose: one number, one name. The nested file-mode literal
 // needs no such check — fileModeLauncherScript only runs on a script that has
 // already passed the cap, so its inner base64 is bounded by the outer payload.
 func encodedCommandFitsClassifyBudget(encoded string) bool {
-	return base64.StdEncoding.DecodedLen(len(encoded)) <= 2*antigravityClassifyMaxPayloadBytes
+	return base64.StdEncoding.DecodedLen(len(encoded)) <=
+		2*antigravityClassifyMaxPayloadBytes+encodedCommandPaddingSlack
 }
+
+// encodedCommandPaddingSlack is how far base64.StdEncoding.DecodedLen can
+// exceed the true decoded length: one or two `=` bytes of padding.
+const encodedCommandPaddingSlack = 2
 
 // wrapperFlagArg returns the script following the first occurrence of any of
 // flags, compared case-insensitively as both PowerShell and cmd.exe do. When
