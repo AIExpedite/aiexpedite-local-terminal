@@ -3333,6 +3333,38 @@ func TestExtractDisplayText_Claude_FailedResultWithoutTextStillReportsFailure(t 
 	}
 }
 
+func TestExtractDisplayText_Claude_FailedResultNamesItsSubtypeOrErrors(t *testing.T) {
+	// Prod 2026-09-24: an interrupted turn surfaced only as "no error detail".
+	// The result's own `errors` / `subtype` name the failure; the session id
+	// on the same event must never reach the output.
+	cases := []struct {
+		line string
+		want string
+	}{
+		{`{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-uuid-1"}`, "error_during_execution"},
+		{`{"type":"result","subtype":"error_max_turns","is_error":true}`, "error_max_turns"},
+		{`{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Request was aborted."]}`, "Request was aborted."},
+		{`{"type":"result","is_error":true,"errors":[{"message":"stream closed"}]}`, "stream closed"},
+	}
+	for _, tc := range cases {
+		got := extractDisplayText("claude", tc.line)
+		if !strings.Contains(got, "Claude turn failed: "+tc.want) {
+			t.Errorf("extractDisplayText(%q) = %q, want it to contain %q", tc.line, got, tc.want)
+		}
+		if strings.Contains(got, "sess-uuid-1") {
+			t.Errorf("extractDisplayText(%q) = %q leaked the session id", tc.line, got)
+		}
+	}
+}
+
+func TestExtractDisplayText_Claude_FailedResultDetailIsBounded(t *testing.T) {
+	long := strings.Repeat("x", 2000)
+	got := extractDisplayText("claude", `{"type":"result","is_error":true,"errors":["`+long+`"]}`)
+	if len(got) > claudeResultFailureDetailMaxLen+64 {
+		t.Errorf("detail not bounded: %d bytes", len(got))
+	}
+}
+
 func TestExtractDisplayText_Claude_NonJsonPassthrough(t *testing.T) {
 	// Plain-text errors / stderr go straight through.
 	got := extractDisplayText("claude", "fatal: not a git repository")

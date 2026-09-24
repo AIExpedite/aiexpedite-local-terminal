@@ -346,6 +346,13 @@ func extractClaudeFlatEvent(raw map[string]interface{}, eventType string) string
 			if text := claudeResultErrorText(raw); text != "" {
 				return fmt.Sprintf("\n[Claude turn failed: %s]\n", text)
 			}
+			// No text: the result's own `errors` / `subtype` still say what
+			// kind of failure it was. Prod 2026-09-24: a turn the platform
+			// interrupted surfaced only as "no error detail", and the
+			// orchestrator read an interrupted turn as a broken CLI.
+			if detail := claudeResultFailureDetail(raw); detail != "" {
+				return fmt.Sprintf("\n[Claude turn failed: %s]\n", detail)
+			}
 			// is_error with no text still beats silence: the orchestrator
 			// learns the turn FAILED rather than inferring an empty answer.
 			return "\n[Claude turn failed with no error detail]\n"

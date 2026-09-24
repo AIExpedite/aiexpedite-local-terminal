@@ -24,6 +24,7 @@ package main
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 // claudeAuthFailure describes an authentication/login failure Claude Code
@@ -96,6 +97,47 @@ func detectClaudeAuthFailure(line string) *claudeAuthFailure {
 		}
 	}
 	return nil
+}
+
+// claudeResultFailureDetailMaxLen bounds what a failed result's detail adds to
+// the chunk stream.
+const claudeResultFailureDetailMaxLen = 500
+
+// claudeResultFailureDetail describes a failed `result` event that carries no
+// error text: its `errors` entries (strings, or objects with a `message`),
+// else its `subtype` (`error_during_execution`, `error_max_turns`, …). Only
+// those two fields are read, so nothing else in the event — the session id
+// in particular — can reach the output. Empty when neither says anything.
+func claudeResultFailureDetail(event map[string]interface{}) string {
+	var parts []string
+	if errs, ok := event["errors"].([]interface{}); ok {
+		for _, e := range errs {
+			switch v := e.(type) {
+			case string:
+				if s := strings.TrimSpace(v); s != "" {
+					parts = append(parts, s)
+				}
+			case map[string]interface{}:
+				if s, _ := v["message"].(string); strings.TrimSpace(s) != "" {
+					parts = append(parts, strings.TrimSpace(s))
+				}
+			}
+		}
+	}
+	detail := strings.Join(parts, "; ")
+	if detail == "" {
+		if subtype, _ := event["subtype"].(string); subtype != "" && subtype != "success" {
+			detail = subtype
+		}
+	}
+	if len(detail) > claudeResultFailureDetailMaxLen {
+		detail = detail[:claudeResultFailureDetailMaxLen]
+		for !utf8.ValidString(detail) {
+			detail = detail[:len(detail)-1]
+		}
+		detail += "…"
+	}
+	return detail
 }
 
 // claudeResultErrorText pulls the human-readable error text out of a terminal
