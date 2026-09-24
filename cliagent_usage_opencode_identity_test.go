@@ -13,8 +13,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,5 +109,40 @@ func TestOpenCodeKeepsItsNameWhenAProbeFails(t *testing.T) {
 	}
 	if len(after.Models) != 0 {
 		t.Fatalf("a failed probe must not republish the old models: %#v", after.Models)
+	}
+}
+
+// A conclusive "no usable provider" forgets the old name, so a later probe
+// that cannot ask does not bring a disconnected install's account back.
+func TestOpenCodeForgetsItsNameAfterAConclusiveEmptyProbe(t *testing.T) {
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+
+	if named := parseOpenCodeUnder(t, "opencode"); named.Account == "" {
+		t.Fatal("expected a named install to start from")
+	}
+	if empty := parseOpenCodeUnder(t, "opencode-no-providers"); empty.Account != "" {
+		t.Fatalf("account after a conclusive empty probe = %q, want none", empty.Account)
+	}
+	if after := parseOpenCodeUnder(t, "opencode-unreachable"); after.Account != "" {
+		t.Fatalf("a failed probe revived the forgotten name %q", after.Account)
+	}
+}
+
+// The name covers every provider in the catalog, including those listed after
+// the cap on the published models.
+func TestOpenCodeNamesProvidersBeyondTheModelCap(t *testing.T) {
+	var out strings.Builder
+	for i := 0; i < cliUsageMaxModelsPerProvider+5; i++ {
+		fmt.Fprintf(&out, "opencode/model-%d\n", i)
+	}
+	out.WriteString("ollama/qwen3-coder:30b\n")
+
+	all := parseOpenCodeModelIDs(out.String())
+	if got, want := openCodeProvidersFromModelIDs(all), []string{"ollama", "opencode"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("providers = %#v, want %#v", got, want)
+	}
+	if got := len(parseOpenCodeModelList(out.String())); got != cliUsageMaxModelsPerProvider {
+		t.Fatalf("published models = %d, want the cap %d", got, cliUsageMaxModelsPerProvider)
 	}
 }

@@ -216,11 +216,15 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 
 	result := probeOpenCodeReadinessUncached(ctx, executable, home)
 	openCodeReadinessMu.Lock()
-	if len(result.Providers) > 0 {
+	switch {
+	case len(result.Providers) > 0:
 		openCodeLastProviders[executable] = result.Providers
-	} else if !result.Conclusive {
-		// Only when we could not ask. A conclusive "no usable provider" is a real
-		// change and must not be papered over with the old names.
+	case result.Conclusive:
+		// A conclusive "no usable provider" is a real change: forget the old
+		// names, or a later probe that cannot ask would bring them back.
+		delete(openCodeLastProviders, executable)
+	default:
+		// We could not ask: keep the name the install last had.
 		result.Providers = openCodeLastProviders[executable]
 	}
 	openCodeReadinessMu.Unlock()
@@ -252,7 +256,12 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 		return out
 	}
 
-	modelIDs := parseOpenCodeModelList(models)
+	// The provider names come from the WHOLE catalog; only the published
+	// Models list is capped. Derived from the capped list, a catalog longer
+	// than the cap would drop the providers listed after the cut, and the
+	// name would change whenever OpenCode reordered its catalog.
+	allModelIDs := parseOpenCodeModelIDs(models)
+	modelIDs := capOpenCodeModelIDs(allModelIDs)
 	if len(modelIDs) > 0 {
 		out.AuthState = openCodeAuthReady
 		out.Conclusive = true
@@ -281,7 +290,7 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 	// handed what the gather can spare: a stall here until the parent expired
 	// would have runProviderParseSafely discard the conclusive models answer
 	// above and report the providers behind OpenCode as canceled.
-	out.Providers = openCodeProvidersFromModelIDs(modelIDs)
+	out.Providers = openCodeProvidersFromModelIDs(allModelIDs)
 	if len(out.Providers) == 0 {
 		if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
 			if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
@@ -356,6 +365,12 @@ func runOpenCodeProbe(ctx context.Context, executable string, args ...string) (s
 // rejected, because counting one of those as a model would report an
 // unauthenticated machine as ready.
 func parseOpenCodeModelList(out string) []string {
+	return capOpenCodeModelIDs(parseOpenCodeModelIDs(out))
+}
+
+// parseOpenCodeModelIDs is parseOpenCodeModelList without the receipt cap:
+// every distinct model id, in the CLI's order.
+func parseOpenCodeModelIDs(out string) []string {
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
 		return nil
@@ -363,7 +378,7 @@ func parseOpenCodeModelList(out string) []string {
 
 	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
 		if ids := parseOpenCodeModelJSON(trimmed); len(ids) > 0 {
-			return capOpenCodeModelIDs(ids)
+			return ids
 		}
 	}
 
@@ -381,9 +396,6 @@ func parseOpenCodeModelList(out string) []string {
 		}
 		seen[id] = true
 		ids = append(ids, id)
-		if len(ids) == cliUsageMaxModelsPerProvider {
-			break
-		}
 	}
 	return ids
 }

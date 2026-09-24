@@ -131,6 +131,9 @@ func runMockCLI(mode string) {
 		}
 		fmt.Print(realOpenCodeModels)
 		return
+	case "opencode-no-providers":
+		// `opencode models` answering, conclusively, with nothing.
+		return
 	case "opencode-unreachable":
 		// Every probe fails: a timeout or a crashed binary looks the same.
 		os.Exit(1)
