@@ -16,8 +16,10 @@
 //
 // Readiness therefore comes from asking OpenCode itself: `opencode models`
 // listing at least one model means the CLI can reach a provider, however the
-// credential arrived. `opencode auth list` supplies per-provider NAMES for the
-// card detail. The parser FAILS OPEN: anything inconclusive (timeout,
+// credential arrived. The provider names on the card — which double as the
+// snapshot's Account, the identity the capacity view keys the install by —
+// come from those model ids; `opencode auth list` is asked only when the ids
+// name no provider. The parser FAILS OPEN: anything inconclusive (timeout,
 // unrecognized output, non-zero exit) reports authState "unknown", which
 // matches none of getCodingAgentStatus's failure branches and falls through to
 // available. The red chip requires positive evidence of *no usable provider*.
@@ -109,6 +111,13 @@ type openCodeReadiness struct {
 var (
 	openCodeReadinessMu    sync.Mutex
 	openCodeReadinessCache = map[string]openCodeReadinessEntry{}
+	// openCodeLastProviders is the last provider list a probe of this binary
+	// could name. OpenCode has no login, so the joined list IS the snapshot's
+	// Account, and the backend and frontend key an account by that string. A
+	// probe that could not ask (timeout, non-zero exit) must not rename the
+	// install for a cycle: every rename minted a second "account" for the same
+	// computer in the capacity view.
+	openCodeLastProviders = map[string][]string{}
 )
 
 type openCodeReadinessEntry struct {
@@ -134,6 +143,7 @@ func SetOpenCodeReadinessForceProbe(force bool) {
 func resetOpenCodeReadinessCache() {
 	openCodeReadinessMu.Lock()
 	openCodeReadinessCache = map[string]openCodeReadinessEntry{}
+	openCodeLastProviders = map[string][]string{}
 	openCodeForceProbe = false
 	openCodeReadinessMu.Unlock()
 }
@@ -205,6 +215,19 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 	}
 
 	result := probeOpenCodeReadinessUncached(ctx, executable, home)
+	openCodeReadinessMu.Lock()
+	switch {
+	case len(result.Providers) > 0:
+		openCodeLastProviders[executable] = result.Providers
+	case result.Conclusive:
+		// A conclusive "no usable provider" is a real change: forget the old
+		// names, or a later probe that cannot ask would bring them back.
+		delete(openCodeLastProviders, executable)
+	default:
+		// We could not ask: keep the name the install last had.
+		result.Providers = openCodeLastProviders[executable]
+	}
+	openCodeReadinessMu.Unlock()
 	if ctx != nil && ctx.Err() != nil {
 		// The probes lost the gather's deadline rather than answering. Caching
 		// that "unknown" would pin the card to it for the whole TTL (and clear
@@ -233,7 +256,12 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 		return out
 	}
 
-	modelIDs := parseOpenCodeModelList(models)
+	// The provider names come from the WHOLE catalog; only the published
+	// Models list is capped. Derived from the capped list, a catalog longer
+	// than the cap would drop the providers listed after the cut, and the
+	// name would change whenever OpenCode reordered its catalog.
+	allModelIDs := parseOpenCodeModelIDs(models)
+	modelIDs := capOpenCodeModelIDs(allModelIDs)
 	if len(modelIDs) > 0 {
 		out.AuthState = openCodeAuthReady
 		out.Conclusive = true
@@ -246,21 +274,30 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 	}
 	// Anything else (unrecognized output shape) stays "unknown".
 
-	// Per-provider detail for the card. Best-effort and never affects the
-	// auth state: `auth list` failing on a machine whose models list is
-	// non-empty must not downgrade a working install.
-	// It is also OPTIONAL, so it is only handed what the gather can spare: a
-	// stall here until the parent expired would have runProviderParseSafely
-	// discard the conclusive models answer above and report the providers
-	// behind OpenCode as canceled.
-	if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
-		if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
-			out.Providers = parseOpenCodeAuthProviders(authOut)
-		}
-		release()
-	}
+	// Provider names for the card. The joined list is also the snapshot's
+	// Account — the identity the capacity view keys this install by — so it
+	// must not depend on which probe happened to answer. It used to prefer
+	// `auth list` and fall back to the model ids when that optional probe was
+	// skipped for time, which renamed the same install whenever the budget
+	// tipped ("google" one refresh, "google, opencode" the next), each name a
+	// separate account. The model ids are the stable source: every provider
+	// that can run lists its models, and they carry the provider ID where
+	// `auth list` prints a display name ("GitHub Copilot", not
+	// "github-copilot"). `auth list` is asked only when the ids name nothing.
+	//
+	// It is best-effort and never affects the auth state: `auth list` failing
+	// must not downgrade a working install. It is also OPTIONAL, so it is only
+	// handed what the gather can spare: a stall here until the parent expired
+	// would have runProviderParseSafely discard the conclusive models answer
+	// above and report the providers behind OpenCode as canceled.
+	out.Providers = openCodeProvidersFromModelIDs(allModelIDs)
 	if len(out.Providers) == 0 {
-		out.Providers = openCodeProvidersFromModelIDs(modelIDs)
+		if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
+			if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
+				out.Providers = parseOpenCodeAuthProviders(authOut)
+			}
+			release()
+		}
 	}
 
 	out.Model = firstNonEmpty(readOpenCodeConfiguredModel(home), openCodeSingleModel(modelIDs))
@@ -328,6 +365,12 @@ func runOpenCodeProbe(ctx context.Context, executable string, args ...string) (s
 // rejected, because counting one of those as a model would report an
 // unauthenticated machine as ready.
 func parseOpenCodeModelList(out string) []string {
+	return capOpenCodeModelIDs(parseOpenCodeModelIDs(out))
+}
+
+// parseOpenCodeModelIDs is parseOpenCodeModelList without the receipt cap:
+// every distinct model id, in the CLI's order.
+func parseOpenCodeModelIDs(out string) []string {
 	trimmed := strings.TrimSpace(out)
 	if trimmed == "" {
 		return nil
@@ -335,7 +378,7 @@ func parseOpenCodeModelList(out string) []string {
 
 	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
 		if ids := parseOpenCodeModelJSON(trimmed); len(ids) > 0 {
-			return capOpenCodeModelIDs(ids)
+			return ids
 		}
 	}
 
@@ -353,9 +396,6 @@ func parseOpenCodeModelList(out string) []string {
 		}
 		seen[id] = true
 		ids = append(ids, id)
-		if len(ids) == cliUsageMaxModelsPerProvider {
-			break
-		}
 	}
 	return ids
 }
@@ -551,14 +591,23 @@ func parseOpenCodeAuthProviders(out string) []string {
 			continue
 		}
 		fields := strings.Fields(line)
+		// Without a Unicode-capable terminal — the tray agent has none — the
+		// frame is drawn in ASCII: "T" opens a section, "|" continues it, "—"
+		// closes it, "•" marks a row. The punctuation is stripped above, but "T"
+		// is a letter and was published as a provider named "t".
+		if len(fields) > 1 && openCodeASCIIFrameGlyphs[fields[0]] {
+			fields = fields[1:]
+			line = strings.Join(fields, " ")
+		}
 		if len(fields) == 0 {
 			continue
 		}
 		lowered := strings.ToLower(line)
-		// Frame chrome: the "Credentials <path>" header, and the "N credentials"
-		// summary footer — which is the row that reports ZERO providers and must
-		// never be mistaken for one.
+		// Frame chrome: the "Credentials <path>" and "Environment" section
+		// headers, and their "N credentials" / "N environment variables" footers
+		// — the rows that COUNT providers and must never be mistaken for one.
 		if strings.HasPrefix(lowered, "credentials") ||
+			lowered == "environment" ||
 			strings.HasPrefix(lowered, "no ") ||
 			openCodeCredentialCountRe.MatchString(lowered) {
 			continue
@@ -578,14 +627,23 @@ func parseOpenCodeAuthProviders(out string) []string {
 	return providers
 }
 
-// openCodeCredentialCountRe matches the "0 credentials" / "3 credentials"
-// summary row. Matched on the whole (stripped) line so a provider literally
-// named e.g. "2credentials" could not be swallowed by it.
-var openCodeCredentialCountRe = regexp.MustCompile(`^\d+\s+credentials?\b`)
+// openCodeCredentialCountRe matches the "0 credentials" / "1 environment
+// variable" section footers. Matched on the whole (stripped) line so a provider
+// literally named e.g. "2credentials" could not be swallowed by it.
+var openCodeCredentialCountRe = regexp.MustCompile(`^\d+\s+(credentials?|environment\s+variables?)\b`)
+
+// openCodeASCIIFrameGlyphs are the letters and symbols OpenCode's prompt
+// library draws its frame with when the terminal cannot render Unicode, and
+// that stripTerminalDecoration cannot strip because they are ordinary
+// characters. Dropped only as a row's FIRST field with text after it.
+var openCodeASCIIFrameGlyphs = map[string]bool{
+	"T": true, ">": true, "x": true, "o": true, "!": true,
+}
 
 // openCodeProvidersFromModelIDs derives provider names from `provider/model`
-// ids, used when `auth list` is unavailable. A local-model install typically
-// reports no auth entries at all, so this keeps the card informative there.
+// ids, sorted. It is the primary source of the card's provider names (and so
+// of the Account): the ids are provider IDs, present on every install that can
+// run, including a local-model one with no auth entries at all.
 func openCodeProvidersFromModelIDs(ids []string) []string {
 	seen := map[string]bool{}
 	var out []string

@@ -121,6 +121,22 @@ func runMockCLI(mode string) {
 		}
 		fmt.Print(realOpenCodeModels)
 		return
+	case "opencode-ascii-env":
+		// The same install seen from the tray agent: no Unicode-capable
+		// terminal, so `auth list` draws its frame in ASCII, and a provider
+		// configured by an environment variable rather than a credential.
+		if len(os.Args) > 2 && os.Args[1] == "auth" && os.Args[2] == "list" {
+			fmt.Print(realOpenCodeAuthListASCIIEnv)
+			return
+		}
+		fmt.Print(realOpenCodeModels)
+		return
+	case "opencode-no-providers":
+		// `opencode models` answering, conclusively, with nothing.
+		return
+	case "opencode-unreachable":
+		// Every probe fails: a timeout or a crashed binary looks the same.
+		os.Exit(1)
 	case "claude":
 		// Real claude waits for NDJSON on stdin before emitting anything. We
 		// mimic that — read one line, then start streaming.
