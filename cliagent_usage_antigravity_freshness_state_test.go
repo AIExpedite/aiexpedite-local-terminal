@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -232,6 +234,117 @@ func TestAntigravityFreshness_LocalRefusalsDecideWhetherToKeepSpending(t *testin
 				t.Error("a local refusal sent no request and must not space the next one")
 			}
 		})
+	}
+}
+
+// helperBlockingCodeAssistStub answers `outcome`, holding the FIRST call until
+// the returned channel is closed, so a test can settle another run while a
+// payment is genuinely in flight.
+func helperBlockingCodeAssistStub(t *testing.T, outcome string) (calls *atomic.Int64, entered <-chan struct{}, release func()) {
+	t.Helper()
+	gate := make(chan struct{})
+	first := make(chan struct{}, 1)
+	var once sync.Once
+	stub := helperStubAntigravityCodeAssistOutcome(t, func() string {
+		select {
+		case first <- struct{}{}:
+			<-gate
+		default:
+		}
+		return outcome
+	})
+	t.Cleanup(func() { once.Do(func() { close(gate) }) })
+	return stub, first, func() { once.Do(func() { close(gate) }) }
+}
+
+// A run that finishes while a payment is in flight must still get worked. The
+// single flight is held, so its request cannot start a worker of its own — and
+// the worker holding it may be one read from returning (its read succeeded,
+// the login is gone, the interval blocked it, or it is the startup replay's
+// single attempt). Without a re-arm the run that just finished waits for the
+// NEXT run, or the next agent start, to be refreshed at all — which is the
+// staleness this whole path exists to remove.
+func TestAntigravityFreshness_ARunSettlingDuringTheStartupReplayIsStillPaid(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	now := time.Now()
+	helperWriteAntigravityCache(t, cache, now.Add(-time.Hour))
+	antigravityRefreshMinInterval = time.Nanosecond
+	// A debt the previous process left behind: the startup replay adopts it and
+	// spends exactly ONE attempt on it.
+	helperWriteJSON(t, antigravityFreshnessPath(), antigravityUsageFreshness{
+		SchemaVersion: antigravityFreshnessSchema,
+		RunFloorMs:    now.Add(-10 * time.Minute).UnixMilli(),
+	})
+	reads, entered, release := helperBlockingCodeAssistStub(t, liveProbeOutcomeCodeAssistHTTPError)
+
+	payOwedAntigravityUsageRefresh()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the startup replay never reached its read")
+	}
+
+	// A real run finishes while that single attempt is still in flight.
+	runFloor := time.Now()
+	antigravityUsageRunSettled(runFloor, false, true)
+	release()
+	antigravityUsageRefreshWaitIdle()
+
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != runFloor.UnixMilli() {
+		t.Fatalf("owed floor=%d, want the finished run's %d", state.RefreshOwedFloorMs, runFloor.UnixMilli())
+	}
+	// One read for the adopted debt, then the finished run's OWN budget — not
+	// one read total with the run left stranded until the age-out.
+	if got := reads.Load(); got != int64(1+antigravityRefreshAfterRunMaxAttempts) {
+		t.Errorf("reads=%d, want 1 for the adopted debt plus %d for the run that settled during it",
+			got, antigravityRefreshAfterRunMaxAttempts)
+	}
+	if state.Attempts != antigravityRefreshAfterRunMaxAttempts {
+		t.Errorf("attempts=%d, want the finished run charged its own budget only", state.Attempts)
+	}
+}
+
+// The other half: an attempt spent on one generation of the debt must not be
+// charged to the run that replaced it mid-read, or that run reaches the
+// attempt cap having been tried fewer times than the cap says.
+func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	now := time.Now()
+	helperWriteAntigravityCache(t, cache, now.Add(-time.Hour))
+	antigravityRefreshMinInterval = time.Nanosecond
+	reads, entered, release := helperBlockingCodeAssistStub(t, liveProbeOutcomeCodeAssistHTTPError)
+
+	antigravityUsageRunSettled(now.Add(-time.Minute), false, true)
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the first run's payment never reached its read")
+	}
+	before := helperFreshnessState(t).debtID()
+
+	// The second run finishes while that read is in flight, replacing the
+	// pending generation with its own newer floor.
+	second := time.Now()
+	antigravityUsageRunSettled(second, false, true)
+	if helperFreshnessState(t).debtID() == before {
+		t.Fatal("the second run did not replace the pending debt")
+	}
+	release()
+	antigravityUsageRefreshWaitIdle()
+
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != second.UnixMilli() {
+		t.Fatalf("owed floor=%d, want the newer run's %d", state.RefreshOwedFloorMs, second.UnixMilli())
+	}
+	// The in-flight read belonged to the first generation, so the second run
+	// still owes — and gets — a full budget of its own.
+	if got := reads.Load(); got != int64(1+antigravityRefreshAfterRunMaxAttempts) {
+		t.Errorf("reads=%d, want the first generation's one plus the second's own %d",
+			got, antigravityRefreshAfterRunMaxAttempts)
+	}
+	if state.Attempts != antigravityRefreshAfterRunMaxAttempts {
+		t.Errorf("attempts=%d, want exactly the second run's own budget", state.Attempts)
 	}
 }
 

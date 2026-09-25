@@ -1176,7 +1176,17 @@ size: no rollout scanning, no cursor, one outbound read.
   `antigravityRefreshAfterRunRetryDelay` (5 s) — `antigravityRefreshAfterRunMaxAttempts
   = 2`, each under `antigravityCodeAssistTimeout` (8 s), under a process-wide
   single flight, with one debt at a time (a later run's floor REPLACES the
-  pending one rather than queueing). A new debt's first read is spaced by
+  pending one rather than queueing). A settle that finds the flight held
+  records a **re-arm** rather than dropping its request, and the running worker
+  takes another pass — without it, a run that finished while the worker was one
+  read from returning (its read succeeded, the login is gone, the interval
+  blocked it, or it was the startup replay's single attempt) would have nobody
+  working its debt and would wait for the NEXT run, or the next agent start, to
+  be refreshed at all. Attempts are booked against the debt GENERATION they
+  were spent on (`antigravityDebtID`), so a run that settles between a read and
+  its write keeps the full budget its own floor is owed. Both mirror
+  `codexRunDebtWorker`'s `claimWorker` / `takeRearm` / `releaseWorker` and
+  `codexDebtID`. A new debt's first read is spaced by
   `antigravityRefreshMinInterval` (60 s); a retry within one debt is the same
   unpaid run and bypasses it, as does the startup adoption. A debt the interval
   blocks is KEPT, not dropped — there is deliberately no timer to come back for

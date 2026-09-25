@@ -134,13 +134,32 @@ type antigravityUsageFreshness struct {
 
 var (
 	antigravityFreshnessMu sync.Mutex
-	// antigravityRefreshWorkerBusy is the process-wide single flight: one debt
-	// worker at a time, however many runs settle at once.
-	antigravityRefreshWorkerBusy atomic.Bool
+	// antigravityRefreshWorkerMu guards the process-wide single flight: one
+	// debt worker at a time, however many runs settle at once.
+	antigravityRefreshWorkerMu sync.Mutex
+	// antigravityRefreshWorkerRunning is that claim; antigravityRefreshWorkerRearm
+	// records that a run settled while it was held, so the debt it created is
+	// worked by the running worker instead of being dropped.
+	antigravityRefreshWorkerRunning bool
+	antigravityRefreshWorkerRearm   bool
 	// antigravityFreshnessInFlight counts the background writes this file owns
 	// (the arm persist and the debt worker), so a test can wait them out.
 	antigravityFreshnessInFlight atomic.Int64
 )
+
+// antigravityDebtID names one generation of the debt: the run floor it must
+// cover and the completion that created it. An attempt is booked against the
+// generation it was actually spent on, so a run that settles between the read
+// and the write keeps the full attempt budget its own floor is owed (the same
+// reason codexDebtID exists).
+type antigravityDebtID struct {
+	floorMs  int64
+	owedAtMs int64
+}
+
+func (state antigravityUsageFreshness) debtID() antigravityDebtID {
+	return antigravityDebtID{floorMs: state.RefreshOwedFloorMs, owedAtMs: state.RefreshOwedAtMs}
+}
 
 func antigravityFreshnessPath() string {
 	if p := os.Getenv(antigravityFreshnessEnv); p != "" {
@@ -339,23 +358,69 @@ func settleAntigravityRunFreshness(observedAt string) {
 
 /* ────────────────────────────────── pay ──────────────────────────────── */
 
-// antigravityStartRunDebtWorker runs the bounded payment on its own goroutine,
-// once: a second settle while one is in flight is a no-op, because the debt it
-// would pay is the one already being paid.
+// antigravityStartRunDebtWorker runs the bounded payment on its own goroutine
+// under a process-wide single flight.
+//
+// A settle that finds the flight held does NOT simply drop its request: the
+// worker may be about to return (its read succeeded, the login is gone, the
+// interval blocked it, it was the startup replay's single attempt), and the
+// debt this settle just created would then have no one working it — the run
+// that finished would wait for the NEXT run, or the next agent start, to be
+// refreshed at all. Recording a re-arm instead makes the running worker take
+// another pass, which is the same shape as codexRunDebtWorker's
+// claimWorker / releaseWorker.
 func antigravityStartRunDebtWorker(maxAttempts int, bypassInterval bool) {
 	// Counted BEFORE the claim: a waiter that sampled the counter between a
 	// successful claim and the increment would read "idle" while a worker is
 	// about to run.
 	antigravityFreshnessInFlight.Add(1)
-	if !antigravityRefreshWorkerBusy.CompareAndSwap(false, true) {
+	if !antigravityClaimRunDebtWorker() {
 		antigravityFreshnessInFlight.Add(-1)
 		return
 	}
 	go func() {
 		defer antigravityFreshnessInFlight.Add(-1)
-		defer antigravityRefreshWorkerBusy.Store(false)
-		antigravityPayRunDebt(maxAttempts, bypassInterval)
+		for {
+			antigravityPayRunDebt(maxAttempts, bypassInterval)
+			// Any pass after the first is an ordinary post-run debt, whatever
+			// this worker was started as: the startup replay's one bypassing
+			// attempt is spent on the debt it adopted, not on a run that
+			// finished afterwards.
+			maxAttempts, bypassInterval = antigravityRefreshAfterRunMaxAttempts, false
+			if antigravityReleaseRunDebtWorker() {
+				return
+			}
+		}
 	}()
+}
+
+// antigravityClaimRunDebtWorker takes the single flight, or records a re-arm
+// for the worker that holds it.
+func antigravityClaimRunDebtWorker() bool {
+	antigravityRefreshWorkerMu.Lock()
+	defer antigravityRefreshWorkerMu.Unlock()
+	if antigravityRefreshWorkerRunning {
+		antigravityRefreshWorkerRearm = true
+		return false
+	}
+	antigravityRefreshWorkerRunning, antigravityRefreshWorkerRearm = true, false
+	return true
+}
+
+// antigravityReleaseRunDebtWorker retires the worker unless a run settled
+// since its last pass, in which case the claim is KEPT and the worker takes
+// another one. Passes are driven by real settles, and each one is bounded by
+// the debt's own attempt cap, the minimum interval and the age-out, so a burst
+// of runs cannot spin it.
+func antigravityReleaseRunDebtWorker() bool {
+	antigravityRefreshWorkerMu.Lock()
+	defer antigravityRefreshWorkerMu.Unlock()
+	if antigravityRefreshWorkerRearm {
+		antigravityRefreshWorkerRearm = false
+		return false
+	}
+	antigravityRefreshWorkerRunning = false
+	return true
 }
 
 // antigravityUsageRefreshWaitIdle blocks until no debt worker is in flight,
@@ -456,7 +521,7 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
 		outcome := probeAntigravityQuotaCodeAssistFn(ctx, antigravityCodeAssistBuildVersion(""), antigravityUsageFreshnessNow)
 		cancel()
-		antigravityRecordRefreshAttempt(outcome, antigravityUsageFreshnessNow())
+		antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
 		fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
 			colorCyan, attempt+1, maxAttempts, outcome, colorReset)
 
@@ -478,7 +543,7 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 // the reading was taken under; the two local refusals spend no request, so they
 // space nothing. Attempts are only counted while a debt is actually pending: a
 // successful read has already retired it through the settle hook.
-func antigravityRecordRefreshAttempt(outcome string, now time.Time) {
+func antigravityRecordRefreshAttempt(id antigravityDebtID, outcome string, now time.Time) {
 	fingerprint := ""
 	if outcome == liveProbeOutcomeCodeAssistOK {
 		if snap, ok := cachedAntigravityQuotaSnapshot(); ok {
@@ -486,6 +551,22 @@ func antigravityRecordRefreshAttempt(outcome string, now time.Time) {
 		}
 	}
 	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+		if outcome != liveProbeOutcomeCodeAssistTokenExpired &&
+			outcome != liveProbeOutcomeCodeAssistNoLogin {
+			// The machine's last OUTBOUND read, whatever it was spent on: it is
+			// what the minimum interval spaces and the account it landed under.
+			state.LastPaidAtMs = now.UnixMilli()
+			if fingerprint != "" {
+				state.AccountFingerprint = fingerprint
+			}
+		}
+		if state.debtID() != id {
+			// A run settled between the read and this write, so the debt on
+			// disk is a newer generation than the one this attempt was spent
+			// on. Charging it here would short-change a run that has not been
+			// tried even once; the worker's next pass gives it its own budget.
+			return
+		}
 		state.Outcome = outcome
 		switch outcome {
 		case liveProbeOutcomeCodeAssistNoLogin:
@@ -498,10 +579,6 @@ func antigravityRecordRefreshAttempt(outcome string, now time.Time) {
 			// Keep the debt and its budget: the next real `agy` run refreshes
 			// the keyring token for free, and this cost no request.
 		default:
-			state.LastPaidAtMs = now.UnixMilli()
-			if fingerprint != "" {
-				state.AccountFingerprint = fingerprint
-			}
 			if state.RefreshOwedAtMs != 0 {
 				state.Attempts++
 			}
