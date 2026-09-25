@@ -1175,11 +1175,15 @@ size: no rollout scanning, no cursor, one outbound read.
   therefore asks for, and clears on, a reading
   (`cachedAntigravityObservedAt`) at or after that completion, within
   `antigravityObservedAtGrace = 1s` for the one-second resolution of RFC3339.
-  `captured` is a hint (`antigravityCaptureLastPersistedMs`) that makes the
-  ungated case cheap and appears in the log line; it is honest there because
-  the poller's tail grace deliberately outlives the run and lands the
-  post-completion reading itself. On a gated build there is no such tail, so
-  the comparison above is what covers the run.
+  `captured` (`antigravityCaptureLastPersistedMs`) is a hint that the poller
+  reached a server while the run was going, and appears in the log line. It is
+  never coverage by itself — that snapshot predates the turn's debit — but it
+  does mean the post-release tail is being paid, so an UNGATED run waits for it
+  (`antigravityAwaitPostRunReading`, bounded by `antigravityCaptureTailGrace +
+  antigravityPostRunReadingGrace`, polling the cache and never the ref-counted
+  poller). That wait is what keeps an ungated build spending no outbound read
+  per run. On a gated build no tail is paid and nothing waits, so every current
+  build decides immediately on the comparison above.
 - **Pay.** One `probeAntigravityQuotaCodeAssist` per debt, then one retry after
   `antigravityRefreshAfterRunRetryDelay` (5 s) — `antigravityRefreshAfterRunMaxAttempts
   = 2`, each under `antigravityCodeAssistTimeout` (8 s), under a process-wide
@@ -1218,11 +1222,22 @@ size: no rollout scanning, no cursor, one outbound read.
   outbound request, and the debt waits for the next run rather than retiring,
   because offline is temporary. An **uninstalled** `agy` retires it without an
   attempt — no retry and no notice for a provider the card no longer shows.
+  "Uninstalled" resolves the ACTIVE catalog's command for the provider
+  (`antigravityCatalogCommand`, falling back to `agy`) through PATH and the
+  installer bin dir, exactly as `gatherCLIAgents` does, so a catalog that points
+  Antigravity at another spelling cannot have the card detect the CLI while the
+  worker retires its debt as missing.
 - **Clear.** `settleAntigravityRunFreshness` is called from inside
   `writeAntigravityQuotaSnapshotLocked`, so EVERY route that lands a reading is
   a settler: the in-run loopback, the Code Assist read, a Refresh click, a
-  concurrent run's poller. The lock order is cache → freshness; nothing under
-  the freshness lock may read the cache.
+  concurrent run's poller. The lock order is cache → freshness → live runs;
+  nothing under the freshness lock may read the cache. A covering reading also
+  retires the run FLOOR — but only down to the oldest run still armed
+  (`antigravityOldestLiveRunFloorMs`, the process-local registry
+  `armAntigravityUsageRunFloor` writes and the settle releases). A reading taken
+  while a run is going does not hold the usage that run is still spending, so
+  dropping the marker outright would leave a crash or self-update before that
+  run's settle with neither a floor nor a debt, and no recovery refresh.
 - **Survive.** The debt is a file (`antigravity_quota_freshness.json` in the
   agent's data dir; `AIEXPEDITE_AGY_FRESHNESS` relocates it, and every rewrite
   is temp-file + rename like the quota snapshot's, because a truncate-in-place

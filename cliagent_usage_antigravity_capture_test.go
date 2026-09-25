@@ -93,6 +93,7 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	antigravityCaptureSnapshots.Store(0)
 	antigravityCaptureTailProbes.Store(0)
 	antigravityCaptureLastPersistedMs.Store(0)
+	helperResetAntigravityLiveRuns()
 	// The run-completion debt is process-global too, and a run that captures
 	// nothing now owes an OUTBOUND Google read. Point the state file at the
 	// test's own dir and stub that read, so no test reaches the network or the
@@ -666,4 +667,13 @@ func TestArmAntigravityCaptureForCommand_ArmsWrappedAgyOnce(t *testing.T) {
 	if got := antigravityCaptureFinishes.Load(); got != 1 {
 		t.Errorf("finishes=%d, want exactly one", got)
 	}
+}
+
+// helperResetAntigravityLiveRuns drops the armed-run registry. It is
+// process-global, and a test that arms a floor without settling it would
+// otherwise pin the next test's crash marker.
+func helperResetAntigravityLiveRuns() {
+	antigravityLiveRunsMu.Lock()
+	antigravityLiveRuns = map[int64]int{}
+	antigravityLiveRunsMu.Unlock()
 }

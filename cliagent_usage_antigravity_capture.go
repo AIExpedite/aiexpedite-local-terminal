@@ -118,10 +118,11 @@ var (
 	// window, so a test can prove the tail never rediscovers.
 	antigravityCaptureTailProbes atomic.Int64
 	// antigravityCaptureLastPersistedMs is the observation time of the newest
-	// reading any capture persisted in this process. It is the cheap HINT a
-	// finishing run uses to answer "did anything land for me?" without reading
-	// the cache; the authoritative answer is still the time comparison in
-	// antigravityUsageRunSettled.
+	// reading any capture persisted in this process. A finishing run uses it to
+	// answer "did the poller reach a server while I was going?" without reading
+	// the cache — which is a reason to WAIT for the post-release tail, never
+	// coverage in itself: the authoritative answer is the comparison against
+	// the run's completion in antigravityUsageRunSettled.
 	antigravityCaptureLastPersistedMs atomic.Int64
 )
 
@@ -197,6 +198,8 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 				// the single source for "could the poller have captured this
 				// run at all?".
 				_, gated := antigravityQuotaGateFor("", now)
+				// A reading persisted at or after this run armed means the
+				// poller found a server for it, so the tail is being paid.
 				antigravityUsageRunSettled(floor,
 					antigravityCaptureLastPersistedMs.Load() >= floor.UnixMilli(), gated)
 			}()

@@ -25,6 +25,7 @@ func helperIsolateAntigravityFreshness(t *testing.T) (state, cache string) {
 	cache = filepath.Join(t.TempDir(), "agyq.json")
 	t.Setenv(antigravityFreshnessEnv, state)
 	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperResetAntigravityLiveRuns()
 	helperIsolateAntigravityGate(t)
 
 	origRetry, origInterval, origNow := antigravityRefreshAfterRunRetryDelay, antigravityRefreshMinInterval, antigravityUsageFreshnessNow
@@ -798,5 +799,156 @@ func TestAntigravityFreshness_StateFileIsReplacedAtomically(t *testing.T) {
 		if strings.Contains(entry.Name(), ".tmp.") {
 			t.Errorf("intermediate file left behind: %s", entry.Name())
 		}
+	}
+}
+
+// The capture hint says the poller reached a server, never that the run was
+// covered: a snapshot persisted WHILE the run was going predates the turn's own
+// debit, so the run still owes a refresh once the post-release tail has had its
+// bounded chance to land the reading that covers it.
+func TestAntigravityFreshness_ACaptureDuringTheRunIsNotCoverage(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	// The tail this run is waiting for never lands a reading; keep the wait
+	// short so the case costs milliseconds rather than the shipped window.
+	t.Setenv(antigravityCaptureTailEnv, "10ms")
+	origGrace := antigravityPostRunReadingGrace
+	t.Cleanup(func() { antigravityPostRunReadingGrace = origGrace })
+	antigravityPostRunReadingGrace = 10 * time.Millisecond
+
+	floor := time.Now().Truncate(time.Second)
+	completed := floor.Add(time.Minute)
+	antigravityUsageFreshnessNow = func() time.Time { return completed }
+	// The newest reading is from the middle of the run, which is exactly what
+	// the hint reports on an ungated build.
+	helperWriteAntigravityCache(t, cache, floor.Add(30*time.Second))
+	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	antigravityUsageRunSettled(floor, true, false)
+	antigravityUsageRefreshWaitIdle()
+
+	state := helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 {
+		t.Fatalf("state=%+v, want a mid-run reading to leave the run owing a refresh", state)
+	}
+	if state.RefreshOwedFloorMs != completed.UnixMilli() {
+		t.Errorf("owed floor=%d, want the completion %d", state.RefreshOwedFloorMs, completed.UnixMilli())
+	}
+	if calls.Load() == 0 {
+		t.Error("the unpaid run spent no Code Assist read")
+	}
+}
+
+// The same hint, with the tail actually landing its reading: the run waits the
+// bounded window, sees the post-completion snapshot, and owes nothing — so an
+// ungated build still spends no outbound read per run.
+func TestAntigravityFreshness_ThePostRunTailReadingCoversTheRun(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	t.Setenv(antigravityCaptureTailEnv, "2s")
+	floor := time.Now().Truncate(time.Second)
+	completed := floor.Add(time.Minute)
+	antigravityUsageFreshnessNow = func() time.Time { return completed }
+	helperWriteAntigravityCache(t, cache, floor.Add(30*time.Second))
+	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	// The tail's write, a moment after the run released.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		helperWriteAntigravityCache(t, cache, completed)
+	}()
+	antigravityUsageRunSettled(floor, true, false)
+	antigravityUsageRefreshWaitIdle()
+
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want the tail reading to leave nothing owed", state)
+	}
+	if calls.Load() != 0 {
+		t.Errorf("a covered run spent %d Code Assist reads", calls.Load())
+	}
+}
+
+// A reading that lands while a run is still going covers the persisted floor,
+// but must not drop it: the floor is the only record a crash or self-update
+// before that run's settle can recover from.
+func TestAntigravityFreshness_ALiveRunKeepsItsCrashMarker(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	started := time.Now().Truncate(time.Second)
+	antigravityUsageFreshnessNow = func() time.Time { return started }
+
+	floor := armAntigravityUsageRunFloor(started)
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
+		t.Fatalf("state=%+v, want the armed run's floor %d", state, floor.UnixMilli())
+	}
+
+	// A Refresh click mid-run: newer than the floor, but taken before the run
+	// spent the usage it is still spending.
+	settleAntigravityRunFreshness(started.Add(10 * time.Second).UTC().Format(time.RFC3339))
+	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
+		t.Fatalf("state=%+v, want a live run to keep its floor for crash recovery", state)
+	}
+
+	// Once that run settles as covered, nothing is left for a restart to adopt.
+	completed := started.Add(time.Minute)
+	antigravityUsageFreshnessNow = func() time.Time { return completed }
+	helperWriteAntigravityCache(t, cache, completed)
+	antigravityUsageRunSettled(floor, false, true)
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RunFloorMs != 0 || state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want a settled and covered run to leave nothing behind", state)
+	}
+}
+
+// Two overlapping runs: a reading that covers the newer one rolls the marker
+// back to the older run still in flight rather than dropping it.
+func TestAntigravityFreshness_ACoveringReadingRollsTheMarkerBackToTheOldestLiveRun(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	started := time.Now().Truncate(time.Second)
+	antigravityUsageFreshnessNow = func() time.Time { return started }
+
+	older := armAntigravityUsageRunFloor(started)
+	newer := armAntigravityUsageRunFloor(started.Add(30 * time.Second))
+	antigravityUsageRefreshWaitIdle()
+	t.Cleanup(func() {
+		antigravityReleaseLiveRun(older.UnixMilli())
+		antigravityReleaseLiveRun(newer.UnixMilli())
+	})
+	if state := helperFreshnessState(t); state.RunFloorMs != newer.UnixMilli() {
+		t.Fatalf("state=%+v, want the newest arm's floor %d", state, newer.UnixMilli())
+	}
+
+	settleAntigravityRunFreshness(started.Add(time.Minute).UTC().Format(time.RFC3339))
+	if state := helperFreshnessState(t); state.RunFloorMs != older.UnixMilli() {
+		t.Errorf("floor=%d, want it rolled back to the oldest live run %d",
+			helperFreshnessState(t).RunFloorMs, older.UnixMilli())
+	}
+}
+
+// The uninstall check follows the ACTIVE catalog, so a deployment that points
+// the provider at another command cannot have the card detect the CLI while the
+// debt worker retires the debt as "no longer installed".
+func TestAntigravityExecutablePath_FollowsTheActiveCatalogCommand(t *testing.T) {
+	dir := t.TempDir()
+	name := "agy-custom"
+	if runtime.GOOS == "windows" {
+		name += ".cmd"
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write custom agy: %v", err)
+	}
+	// Only the custom command exists: a check still resolving the literal `agy`
+	// would report the CLI uninstalled.
+	t.Setenv("PATH", dir)
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	if got := antigravityExecutablePath(); got != "" {
+		t.Fatalf("antigravityExecutablePath()=%q with the default catalog, want it not found", got)
+	}
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{ID: "antigravity", DisplayName: "Antigravity", Command: "agy-custom", DetectionKeys: []string{"antigravity"}},
+	})
+	if got := antigravityExecutablePath(); got == "" {
+		t.Error("antigravityExecutablePath()=\"\", want the catalog's command resolved")
 	}
 }

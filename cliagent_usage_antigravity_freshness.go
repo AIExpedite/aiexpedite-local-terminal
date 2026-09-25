@@ -100,7 +100,58 @@ var (
 	// this worker at all, so a user-initiated refresh is never throttled by it.
 	antigravityRefreshMinInterval = 60 * time.Second
 	antigravityUsageFreshnessNow  = time.Now
+	// antigravityPostRunReadingGrace is how long past the poller's own tail
+	// window a settling run waits for the reading that tail is taking, and
+	// antigravityPostRunReadingPoll how often it looks. Only an UNGATED run
+	// that actually reached a server waits at all: a gated build pays no tail,
+	// so on every current build the settle decides immediately.
+	antigravityPostRunReadingGrace = time.Second
+	antigravityPostRunReadingPoll  = 25 * time.Millisecond
 )
+
+// antigravityLiveRuns counts, by floor, the runs this process has armed and not
+// yet settled. It is what keeps a crash marker on disk for a run that is still
+// accruing usage: a reading landed mid-run (a Refresh click, a concurrent run's
+// poller) covers the persisted floor, but the run it belongs to is not over, so
+// the floor is rolled back to the oldest run still live rather than dropped.
+// Without that, a crash or self-update before the run's own settle would leave
+// startup with neither a floor nor a debt, and the run would never be refreshed.
+var (
+	antigravityLiveRunsMu sync.Mutex
+	antigravityLiveRuns   = map[int64]int{}
+)
+
+func antigravityRegisterLiveRun(floorMs int64) {
+	antigravityLiveRunsMu.Lock()
+	antigravityLiveRuns[floorMs]++
+	antigravityLiveRunsMu.Unlock()
+}
+
+func antigravityReleaseLiveRun(floorMs int64) {
+	antigravityLiveRunsMu.Lock()
+	if n := antigravityLiveRuns[floorMs]; n > 1 {
+		antigravityLiveRuns[floorMs] = n - 1
+	} else {
+		delete(antigravityLiveRuns, floorMs)
+	}
+	antigravityLiveRunsMu.Unlock()
+}
+
+// antigravityOldestLiveRunFloorMs is the floor of the earliest run still armed,
+// or 0 when none is. Called from inside updateAntigravityUsageFreshness's
+// mutate, so the lock order is cache -> freshness -> live runs; nothing may take
+// these in the other direction.
+func antigravityOldestLiveRunFloorMs() int64 {
+	antigravityLiveRunsMu.Lock()
+	defer antigravityLiveRunsMu.Unlock()
+	oldest := int64(0)
+	for floorMs := range antigravityLiveRuns {
+		if oldest == 0 || floorMs < oldest {
+			oldest = floorMs
+		}
+	}
+	return oldest
+}
 
 // antigravityUsageFreshness is the persisted debt. Deliberately its own file
 // rather than a field of the quota snapshot: that cache is a single sanitized
@@ -280,6 +331,10 @@ func antigravityObservedAtCovers(observedAt string, floorMs int64) bool {
 // payment's own cached-reading check before any request is sent.
 func armAntigravityUsageRunFloor(now time.Time) time.Time {
 	floorMs := now.UnixMilli()
+	// Registered on the CALLER's goroutine, so the run counts as live from the
+	// instant it is armed: a reading that lands before the background persist
+	// below must not be able to drop a floor for a run that is starting.
+	antigravityRegisterLiveRun(floorMs)
 	antigravityFreshnessInFlight.Add(1)
 	go func() {
 		defer antigravityFreshnessInFlight.Add(-1)
@@ -306,12 +361,13 @@ func armAntigravityUsageRunFloor(now time.Time) time.Time {
 // treating it as coverage would leave that usage unobserved until some later
 // run happened to owe a debt.
 //
-// capturedSinceFloor is a HINT (the last snapshot the capture path persisted
-// for this run): it makes the ungated case cheap and keeps it debt-free, which
-// is honest there because the poller's own tail grace deliberately outlives the
-// run and lands the post-completion reading in the cache. On a gated build the
-// poller captures nothing, so there is no such tail and the decision below is
-// what covers the run.
+// capturedDuringRun says the capture path persisted a reading WHILE this run
+// was going. It is never coverage by itself — a snapshot taken mid-run predates
+// the turn's own debit — but it does mean the poller reached a server, so the
+// post-release tail grace is being paid and the reading that covers this run is
+// moments away. That is the only case that waits for it, bounded by
+// antigravityPostRunReadingGrace. On a gated build the poller captures nothing
+// and pays no tail, so every current build decides immediately.
 //
 // gated says the run's build refused loopback reads, so the debt goes straight
 // to the Code Assist route instead of a retry the build will refuse, and the
@@ -320,7 +376,7 @@ func armAntigravityUsageRunFloor(now time.Time) time.Time {
 // Called from the capture's finish() on its own goroutine: it must NOT wait for
 // the poller, which is ref-counted and outlives a short run whenever a longer
 // one is still armed.
-func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool) {
+func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) {
 	if floor.IsZero() {
 		return
 	}
@@ -336,17 +392,30 @@ func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool)
 		completionMs = floor.UnixMilli()
 	}
 
-	if !capturedSinceFloor {
-		// The authoritative check: any route may have landed a reading for this
-		// run, including a concurrent run's poller.
-		capturedSinceFloor = antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs)
+	// The authoritative check, and the ONLY one: any route may have landed a
+	// reading for this run — a concurrent run's poller, a Refresh click, this
+	// poller's own tail — but only one taken at or after the completion holds
+	// the usage this run just spent.
+	covered := antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs)
+	if !covered && capturedDuringRun && !gated {
+		covered = antigravityAwaitPostRunReading(completionMs)
 	}
-	if capturedSinceFloor {
+	// The run is over either way: stop protecting its floor from the GC below
+	// before deciding what to persist for it.
+	antigravityReleaseLiveRun(floor.UnixMilli())
+	if covered {
 		// A reading covers this run, and the write that landed it already
-		// cleared any debt through settleAntigravityRunFreshness. Silent on
-		// purpose: the poller's own close-out line already reports `captured`
-		// for this run, and a second line per run is noise in a log that is
-		// uploaded with diagnostics.
+		// cleared any debt through settleAntigravityRunFreshness. All that is
+		// left is the run's own floor, which that write had to keep while the
+		// run was live. Silent on purpose: the poller's own close-out line
+		// already reports `captured` for this run, and a second line per run is
+		// noise in a log that is uploaded with diagnostics.
+		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+			if state.RunFloorMs != 0 && state.RunFloorMs <= completionMs &&
+				state.RefreshOwedAtMs == 0 {
+				state.RunFloorMs = antigravityOldestLiveRunFloorMs()
+			}
+		})
 		return
 	}
 
@@ -374,6 +443,39 @@ func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool)
 	antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, false)
 }
 
+// antigravityAwaitPostRunReading waits, bounded, for a reading taken at or
+// after completionMs to reach the quota cache.
+//
+// It exists for exactly one case: an ungated run whose poller reached a server
+// is followed by antigravityCaptureTailGrace of post-release probing, and the
+// reading that holds the run's end-of-turn usage lands in that window. Owing a
+// debt without waiting for it would spend an outbound Google read on every
+// ungated run for a number that was already on its way.
+//
+// It waits on the CACHE, never on the poller: the poller is ref-counted and a
+// short run sharing it with a long interactive session would otherwise park its
+// settle for the length of that session. Runs on the settle goroutine, so it
+// delays nothing but the debt decision it is making.
+func antigravityAwaitPostRunReading(completionMs int64) bool {
+	// Wall clock, not antigravityUsageFreshnessNow: this is a real wait for a
+	// real write, and a test that pins the logical clock must not turn it into
+	// a spin. antigravityCaptureTailEnv shrinks it where a test needs it short.
+	deadline := time.Now().Add(antigravityCaptureTailGraceValue() + antigravityPostRunReadingGrace)
+	for {
+		if antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs) {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		if remaining > antigravityPostRunReadingPoll {
+			remaining = antigravityPostRunReadingPoll
+		}
+		time.Sleep(remaining)
+	}
+}
+
 // settleAntigravityRunFreshness retires whatever a landed reading covers. It is
 // called from inside writeAntigravityQuotaSnapshotLocked — while the quota
 // cache lock is held — so it must never read the cache back.
@@ -389,8 +491,13 @@ func settleAntigravityRunFreshness(observedAt string) {
 			state.Attempts, state.Outcome, state.Gated = 0, "", false
 		}
 		if state.RunFloorMs != 0 && observedMs >= state.RunFloorMs {
-			// Nothing left for a restart to adopt for that run.
-			state.RunFloorMs = 0
+			// Nothing left for a restart to adopt for the run that floor named
+			// — UNLESS a run is still armed. A reading taken while a run is
+			// going does not hold the usage that run is still spending, so
+			// dropping the marker outright would leave a crash or self-update
+			// before its settle with neither a floor nor a debt, and no
+			// recovery refresh. Roll back to the oldest live run instead.
+			state.RunFloorMs = antigravityOldestLiveRunFloorMs()
 		}
 	})
 }
@@ -732,16 +839,39 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	return clampASCII(notice, antigravityFreshnessNoticeLimit), true
 }
 
-// antigravityExecutablePath resolves the installed `agy`, or "" when it is not
-// on this machine at all. Same resolution as gatherCLIAgents — PATH, then the
-// installer's own bin dir, which a macOS GUI/launchd agent's sparse PATH misses
-// — so the worker and the card can never disagree about whether the CLI exists.
-// resolveExecutable is deliberately NOT used: it echoes the command back on a
-// miss, which would read as "installed" forever.
+// antigravityExecutablePath resolves the installed Antigravity CLI, or "" when
+// it is not on this machine at all.
+//
+// The command comes from the ACTIVE catalog entry rather than the literal
+// "agy": the catalog is server-configurable, so a deployment that points the
+// provider at a different spelling or an absolute path would otherwise have the
+// card detect it while this check declared it uninstalled — and a real run's
+// debt would be retired instead of refreshed. Resolution then matches
+// gatherCLIAgents exactly — PATH, then the installer's own bin dir, which a
+// macOS GUI/launchd agent's sparse PATH misses — so the worker and the card can
+// never disagree about whether the CLI exists. resolveExecutable is
+// deliberately NOT used: it echoes the command back on a miss, which would read
+// as "installed" forever.
 func antigravityExecutablePath() string {
-	const command = "agy"
+	command := antigravityCatalogCommand()
 	if path, err := exec.LookPath(command); err == nil {
 		return path
 	}
 	return resolveInstallerBinary(command, installerBinDirFor(command))
+}
+
+// antigravityCatalogCommand is the command the active catalog runs Antigravity
+// with, falling back to the shipped default when the provider is absent from a
+// configured catalog (the card shows nothing for it either, and the fallback
+// keeps the uninstall check from turning a missing entry into a retired debt).
+func antigravityCatalogCommand() string {
+	for _, entry := range activeCLIAgentCatalog() {
+		if entry.ID == "antigravity" {
+			if command := firstCommandToken(entry.Command); command != "" {
+				return command
+			}
+			break
+		}
+	}
+	return "agy"
 }
