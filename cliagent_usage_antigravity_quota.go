@@ -119,8 +119,15 @@ type antigravityQuotaBucket struct {
 type antigravityQuotaSnapshot struct {
 	// SchemaVersion is written but never enforced on read — see
 	// antigravityQuotaSchemaVersion.
-	SchemaVersion      int                      `json:"schemaVersion,omitempty"`
-	ObservedAt         string                   `json:"observedAt"`
+	SchemaVersion int    `json:"schemaVersion,omitempty"`
+	ObservedAt    string `json:"observedAt"`
+	// ObservedAtMs is the same instant to the millisecond. ObservedAt is RFC3339
+	// seconds because that is the card's wire format, and a whole second is too
+	// coarse to say whether a reading was taken before or after a run completed
+	// (cliagent_usage_antigravity_freshness.go). Local cache only: every metric
+	// is built from ObservedAt, so this never leaves the machine. Absent on a
+	// reading cached by an older agent — see antigravitySnapshotObservedMs.
+	ObservedAtMs       int64                    `json:"observedAtMs,omitempty"`
 	AccountFingerprint string                   `json:"accountFingerprint"`
 	Account            string                   `json:"account"`
 	Plan               string                   `json:"plan"`
@@ -515,7 +522,7 @@ type antigravityQuotaGroupWire struct {
 // schema change pass as success and overwrite the last usable cached reading
 // with rows that all render Unknown.
 func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time) (antigravityQuotaSnapshot, bool) {
-	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
+	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339), ObservedAtMs: now.UnixMilli()}
 	plottable := 0
 	for _, group := range groups {
 		for _, bucket := range group.Buckets {
@@ -584,6 +591,53 @@ func loadAntigravityQuotaSnapshotByProducer() (antigravityQuotaSnapshot, bool) {
 	return snap, true
 }
 
+// cachedAntigravityObservedMs returns the cached reading's observation instant
+// (antigravitySnapshotObservedMs; 0 when nothing is cached) regardless of which
+// account produced it, for callers that hold no snapshot and only need to know
+// how fresh the card's figure is (the run-completion freshness path,
+// cliagent_usage_antigravity_freshness.go). Freshness is a question about TIME,
+// not identity: a login switched between a run's floor and its reading still
+// satisfies that run.
+func cachedAntigravityObservedMs() int64 {
+	snap, ok := cachedAntigravityQuotaSnapshot()
+	if !ok {
+		return 0
+	}
+	return antigravitySnapshotObservedMs(snap)
+}
+
+// antigravitySnapshotObservedMs is the epoch-millisecond instant a reading was
+// taken, or 0 when its observation time is unparseable.
+//
+// ObservedAtMs is trusted only when it falls inside the second ObservedAt
+// names, so a hand-edited or mismatched pair cannot move a reading. A reading
+// without it (cached by an older agent) resolves to the START of its second:
+// the earliest instant it can have been taken. That is the conservative
+// direction for every caller — it can only make a reading look older than it
+// was, which costs at most one refresh, whereas rounding up would let a reading
+// taken just before a run completed pass as one taken after it.
+func antigravitySnapshotObservedMs(snap antigravityQuotaSnapshot) int64 {
+	at, err := time.Parse(time.RFC3339, snap.ObservedAt)
+	if err != nil {
+		return 0
+	}
+	secondMs := at.Truncate(time.Second).UnixMilli()
+	if snap.ObservedAtMs >= secondMs && snap.ObservedAtMs < secondMs+time.Second.Milliseconds() {
+		return snap.ObservedAtMs
+	}
+	return secondMs
+}
+
+// cachedAntigravityQuotaSnapshot is the same read for a caller that needs more
+// than the observation time. readAntigravityQuotaCache itself is lock-free by
+// contract (its callers hold antigravityQuotaCacheMu), so this is the entry
+// point for anyone outside this file.
+func cachedAntigravityQuotaSnapshot() (antigravityQuotaSnapshot, bool) {
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+	return readAntigravityQuotaCache()
+}
+
 func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(antigravityQuotaCachePath(), &snap) {
@@ -618,7 +672,7 @@ func saveAntigravityQuotaSnapshotIfNewer(snap antigravityQuotaSnapshot) bool {
 
 	if existing, ok := readAntigravityQuotaCache(); ok &&
 		existing.AccountFingerprint == snap.AccountFingerprint &&
-		!antigravityQuotaObservedAfter(snap.ObservedAt, existing.ObservedAt) {
+		!antigravitySnapshotObservedAfter(snap, existing) {
 		return false
 	}
 	return writeAntigravityQuotaSnapshotLocked(snap)
@@ -637,6 +691,21 @@ func antigravityQuotaObservedAfter(a, b string) bool {
 		return true
 	}
 	return at.After(bt)
+}
+
+// antigravitySnapshotObservedAfter is antigravityQuotaObservedAfter with the
+// millisecond tiebreak: two readings inside the same second are ordered by the
+// ObservedAtMs both carry. Without it a post-completion reading landing in the
+// same second as a mid-run one would be refused as "not newer", and the run it
+// covers would owe an outbound refresh for a number already in hand.
+func antigravitySnapshotObservedAfter(a, b antigravityQuotaSnapshot) bool {
+	if antigravityQuotaObservedAfter(a.ObservedAt, b.ObservedAt) {
+		return true
+	}
+	if a.ObservedAtMs == 0 || b.ObservedAtMs == 0 || a.ObservedAt != b.ObservedAt {
+		return false
+	}
+	return antigravitySnapshotObservedMs(a) > antigravitySnapshotObservedMs(b)
 }
 
 // writeAntigravityQuotaSnapshotLocked sanitizes and atomically replaces the
@@ -682,6 +751,12 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 		_ = os.Remove(tmp)
 		return false
 	}
+	// Every route that lands a reading is a settler: the in-run poller, the
+	// Code Assist read, a Refresh click and a concurrent run's poller all reach
+	// here, so a run's refresh debt is retired exactly once by whichever of
+	// them covers its floor. Takes only the freshness lock — the cache lock is
+	// held here, and the package's lock order is cache -> freshness.
+	settleAntigravityRunFreshness(antigravitySnapshotObservedMs(snap))
 	return true
 }
 
@@ -696,6 +771,7 @@ func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravity
 	out := antigravityQuotaSnapshot{
 		SchemaVersion:      antigravityQuotaSchemaVersion,
 		ObservedAt:         clampAntigravityQuotaField(snap.ObservedAt, antigravityQuotaMaxFieldBytes),
+		ObservedAtMs:       snap.ObservedAtMs,
 		AccountFingerprint: clampAntigravityQuotaField(snap.AccountFingerprint, antigravityQuotaMaxFieldBytes),
 		Account:            clampAntigravityQuotaField(snap.Account, antigravityQuotaMaxFieldBytes),
 		Plan:               clampAntigravityQuotaField(snap.Plan, antigravityQuotaMaxFieldBytes),

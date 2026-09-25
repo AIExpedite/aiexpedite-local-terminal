@@ -117,6 +117,13 @@ var (
 	// antigravityCaptureTailProbes counts probes taken in the post-release tail
 	// window, so a test can prove the tail never rediscovers.
 	antigravityCaptureTailProbes atomic.Int64
+	// antigravityCaptureLastPersistedMs is the observation time of the newest
+	// reading any capture persisted in this process. A finishing run uses it to
+	// answer "did the poller reach a server while I was going?" without reading
+	// the cache — which is a reason to WAIT for the post-release tail, never
+	// coverage in itself: the authoritative answer is the comparison against
+	// the run's completion in antigravityUsageRunSettled.
+	antigravityCaptureLastPersistedMs atomic.Int64
 )
 
 // armAntigravityCaptureForCommand arms the quota poller when spawning cmd+args
@@ -146,6 +153,11 @@ func armAntigravityCaptureForCommand(label, cmd string, args []string) func() {
 // line, path or prompt.
 func startAntigravityQuotaCapture(label string) (finish func()) {
 	antigravityCaptureArms.Add(1)
+	// Arm this run's freshness floor. Every spawn site reaches here — directly
+	// on the native path, through armAntigravityCaptureForCommand everywhere
+	// else — so all five inherit the run-completion refresh with no new call
+	// sites (cliagent_usage_antigravity_freshness.go).
+	floor := armAntigravityUsageRunFloor(antigravityUsageFreshnessNow())
 
 	antigravityCaptureMu.Lock()
 	antigravityCaptureRefs++
@@ -175,6 +187,29 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 			if stop != nil {
 				close(stop)
 			}
+
+			// Settle THIS run, off the caller's goroutine and without waiting
+			// for the poller: the poller is ref-counted and exits only when the
+			// last armed run releases, so settling there would park a finished
+			// run's refresh behind a long interactive session sharing it.
+			// Counted in antigravityFreshnessInFlight like every other
+			// background write this feature owns: the settle can wait out the
+			// post-release tail, and a goroutine nobody can wait for would
+			// write the state file after its owner (a test's temp dir, or an
+			// agent shutting down) has already gone.
+			antigravityFreshnessInFlight.Add(1)
+			go func() {
+				defer antigravityFreshnessInFlight.Add(-1)
+				now := antigravityUsageFreshnessNow()
+				// The build's refusal is remembered per build, so the marker is
+				// the single source for "could the poller have captured this
+				// run at all?".
+				_, gated := antigravityQuotaGateFor("", now)
+				// A reading persisted at or after this run armed means the
+				// poller found a server for it, so the tail is being paid.
+				antigravityUsageRunSettled(floor,
+					antigravityCaptureLastPersistedMs.Load() >= floor.UnixMilli(), gated)
+			}()
 		})
 	}
 }
@@ -420,5 +455,14 @@ func antigravityCapturePersist(snap antigravityQuotaSnapshot) (bool, string) {
 		return false, ""
 	}
 	antigravityCaptureSnapshots.Add(1)
+	if observedMs := antigravitySnapshotObservedMs(snap); observedMs > 0 {
+		for {
+			prev := antigravityCaptureLastPersistedMs.Load()
+			if observedMs <= prev ||
+				antigravityCaptureLastPersistedMs.CompareAndSwap(prev, observedMs) {
+				break
+			}
+		}
+	}
 	return true, snap.ObservedAt
 }

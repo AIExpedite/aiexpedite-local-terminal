@@ -883,7 +883,7 @@ func noteAntigravityLiveProducerForTest(fingerprint string, at time.Time) {
 func TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings(t *testing.T) {
 	resetAntigravityLiveProducer(t)
 	home := t.TempDir()
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperIsolateAntigravityQuotaState(t, filepath.Join(t.TempDir(), "agyq.json"))
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"),
 		map[string]any{"email": "a@example.com"})
 	now := time.Now().UTC()

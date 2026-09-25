@@ -193,7 +193,7 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 	helperIsolateAntigravityGate(t)
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	observed := "2026-09-12T03:04:14Z"
 	snap := antigravityQuotaSnapshot{
@@ -212,6 +212,20 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 		map[string]any{"email": "ada@example.com"})
 	now := time.Date(2026, 9, 15, 13, 30, 0, 0, time.UTC)
 	noteAntigravityQuotaGate("1.2.3", now.Add(-time.Hour))
+
+	// A finished run on this build owes a refresh
+	// (cliagent_usage_antigravity_freshness.go). Its arm sits BELOW the gate's,
+	// and a gated debt carries no wording of its own, so the banner must still
+	// be the gate's — two sources for one banner would drift.
+	t.Setenv(antigravityFreshnessEnv, filepath.Join(t.TempDir(), "agy_freshness.json"))
+	helperWriteJSON(t, antigravityFreshnessPath(), antigravityUsageFreshness{
+		SchemaVersion:      antigravityFreshnessSchema,
+		RefreshOwedFloorMs: now.Add(-time.Minute).UnixMilli(),
+		RefreshOwedAtMs:    now.Add(-time.Minute).UnixMilli(),
+		Attempts:           antigravityRefreshAfterRunMaxAttempts,
+		Gated:              true,
+		Outcome:            liveProbeOutcomeCodeAssistHTTPError,
+	})
 
 	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Version: "1.2.3"}, now)
 	if !ok {

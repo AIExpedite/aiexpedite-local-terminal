@@ -1140,6 +1140,153 @@ What the agent does instead ([`cliagent_usage_antigravity_gate.go`](cliagent_usa
   observation" log line is suppressed while the build is gated — nothing could
   have captured it.
 
+### Run-completion freshness: the debt a finished `agy` run owes
+
+The gate above leaves a hole the poller cannot fill. On **every current build**
+the in-run capture reads nothing, so a finished direct or terminal `agy` run
+left `observedAt` exactly where it was — and the one route that still returns
+numbers, the Code Assist read, was wired to the Refresh click only. A passing
+CLI-maintenance smoke was therefore still followed by a days-old reading.
+[`cliagent_usage_antigravity_freshness.go`](cliagent_usage_antigravity_freshness.go)
+gives Antigravity the run-completion path Codex
+([`cliagent_usage_codex_freshness.go`](cliagent_usage_codex_freshness.go)) and
+Claude (`triggerClaudeUsageProbeAfterRun`) already have, at a fraction of the
+size: no rollout scanning, no cursor, one outbound read.
+
+- **Arm.** `startAntigravityQuotaCapture` calls `armAntigravityUsageRunFloor(now)`
+  and keeps the returned floor in the `finish` closure. All five spawn sites
+  inherit it, because they all reach that function — no new call sites. The
+  floor is returned immediately and PERSISTED on a goroutine, like
+  `armCodexUsageRunFloor`: this is the spawn path (the Windows chain arms at
+  function entry), and arming must never block the run. A write that loses the
+  race with its own settle costs nothing — the arm only raises the floor, and a
+  floor left behind for a run that did get its reading is dropped by the
+  payment's cached-reading check before any request is sent.
+- **Settle.** That `finish` runs `antigravityUsageRunSettled(floor, captured,
+  gated)` on its own goroutine, inside the existing `sync.Once`. It must **not**
+  wait for the poller: the poller is refcounted and exits only when the LAST
+  armed run releases, so settling there would park a finished run's refresh
+  behind a long interactive session sharing it. The decision is a time
+  comparison, never a flag — and the instant compared against is the run's
+  **completion**, not its start: a turn's quota is debited at the END of the
+  turn (`antigravityCaptureTailGrace`), so a snapshot taken while the run was
+  still going (a Refresh click mid-run, an overlapping run's Code Assist read)
+  does not contain this run's usage and must not count as coverage. The debt
+  therefore asks for, and clears on, a reading
+  (`cachedAntigravityObservedMs`) taken at or after that completion, compared
+  EXACTLY. `observedAt` is RFC3339 seconds (the card's wire format), so the
+  cached snapshot also carries `observedAtMs` — local only, never on a metric —
+  and `antigravitySnapshotObservedMs` resolves a reading without it (cached by
+  an older agent) to the START of its second. No grace is added: rounding a
+  reading up to the next second is exactly how a Refresh click a few hundred
+  milliseconds before completion used to pass as the run's own reading. The
+  cache's newer-than guard orders two readings in the same second by the same
+  instant, so a post-completion reading is not refused as "not newer".
+  `captured` (`antigravityCaptureLastPersistedMs`) is a hint that the poller
+  reached a server while the run was going, and appears in the log line. It is
+  never coverage by itself — that snapshot predates the turn's debit — but it
+  does mean the post-release tail is being paid, so an UNGATED run waits for it
+  (`antigravityAwaitPostRunReading`, bounded by `antigravityCaptureTailGrace +
+  antigravityPostRunReadingGrace`, polling the cache and never the ref-counted
+  poller). That wait is what keeps an ungated build spending no outbound read
+  per run. On a gated build no tail is paid and nothing waits, so every current
+  build decides immediately on the comparison above.
+- **Pay.** One `probeAntigravityQuotaCodeAssist` per debt, then one retry after
+  `antigravityRefreshAfterRunRetryDelay` (5 s) — `antigravityRefreshAfterRunMaxAttempts
+  = 2`, each under `antigravityCodeAssistTimeout` (8 s), under a process-wide
+  single flight, with one debt at a time (a later run's floor REPLACES the
+  pending one rather than queueing). A settle that finds the flight held
+  records a **re-arm** rather than dropping its request, and the running worker
+  takes another pass — without it, a run that finished while the worker was one
+  read from returning (its read succeeded, the login is gone, the interval
+  blocked it, or it was the startup replay's single attempt) would have nobody
+  working its debt and would wait for the NEXT run, or the next agent start, to
+  be refreshed at all. Attempts are booked against the debt GENERATION they
+  were spent on (`antigravityDebtID`), so a run that settles between a read and
+  its write keeps the full budget its own floor is owed. Both mirror
+  `codexRunDebtWorker`'s `claimWorker` / `takeRearm` / `releaseWorker` and
+  `codexDebtID`. A new debt's first read is spaced by
+  `antigravityRefreshMinInterval` (60 s); a retry within one debt is the same
+  unpaid run and bypasses it, as does the startup adoption. A debt the interval
+  blocks is KEPT, not dropped — there is deliberately no timer to come back for
+  it, because the next run's settle (or the next agent start) pays it, and a
+  background timer per debt is work the user never asked for. The Refresh click
+  does not go through this worker, so a user-initiated refresh is never
+  throttled by it. **Ceiling: one outbound call per minute, whatever the run
+  volume** — 200 short runs in an hour still spend at most 60.
+- **It never runs a model turn.** The click may run the `agy models` warm-up to
+  make the CLI refresh its own keyring token; doing that behind the user's back
+  on run teardown is a different class of side effect. So `codeassist_token_expired`
+  KEEPS the debt and its budget (the next real run refreshes the keyring for
+  free) and only `codeassist_no_login` stops attempting. The build the request
+  identifies itself as comes from `antigravityCodeAssistBuildVersion` — the same
+  cached `--version` detection already ran, shared with the click; on a cold
+  cache that is one short `<agy> --version` child (bounded by
+  `machineInfoProbeTimeout`), which warms the cache the next gather needs. An
+  unresolvable build is fine: `antigravityCodeAssistUserAgent` falls back to the
+  pinned build the licence rule was verified on.
+- **Skipped entirely while offline** (`IsOffline`): an offline agent makes no
+  outbound request, and the debt waits for the next run rather than retiring,
+  because offline is temporary. An **uninstalled** `agy` retires it without an
+  attempt — no retry and no notice for a provider the card no longer shows.
+  "Uninstalled" resolves the ACTIVE catalog's command for the provider
+  (`antigravityCatalogCommand`, falling back to `agy`) through PATH and the
+  installer bin dir, exactly as `gatherCLIAgents` does, so a catalog that points
+  Antigravity at another spelling cannot have the card detect the CLI while the
+  worker retires its debt as missing.
+- **Clear.** `settleAntigravityRunFreshness` is called from inside
+  `writeAntigravityQuotaSnapshotLocked`, so EVERY route that lands a reading is
+  a settler: the in-run loopback, the Code Assist read, a Refresh click, a
+  concurrent run's poller. The lock order is cache → freshness → live runs;
+  nothing under the freshness lock may read the cache. A covering reading also
+  retires the run FLOOR — but only down to the oldest run still armed
+  (`antigravityOldestLiveRunFloorMs`, the process-local registry
+  `armAntigravityUsageRunFloor` writes and the settle releases). A reading taken
+  while a run is going does not hold the usage that run is still spending, so
+  dropping the marker outright would leave a crash or self-update before that
+  run's settle with neither a floor nor a debt, and no recovery refresh.
+- **Survive.** The debt is a file (`antigravity_quota_freshness.json` in the
+  agent's data dir; `AIEXPEDITE_AGY_FRESHNESS` relocates it, and every rewrite
+  is temp-file + rename like the quota snapshot's, because a truncate-in-place
+  interrupted by exactly the kill or self-replace this record exists for would
+  read back as invalid JSON, i.e. no debt at all), so `StartAgent`'s
+  `payOwedAntigravityUsageRefresh` pays ONE bounded read for a run the previous
+  process never settled (crash, restart, self-update) — placed after `isOffline`
+  is published so the first attempt honours offline mode, and run entirely off
+  the boot goroutine. It adopts only a floor stamped BEFORE that call's own
+  instant: the replay is spawned, so a session of this process can arm first,
+  and converting a live run's floor would book a completion time for a run
+  still going — the reading it triggered, taken at the run's start, would then
+  satisfy that run's own settle and leave it with no refresh at all.
+  (`codexOweInterruptedRun` guards the same race with `armedLocally`.) A floor further than
+  `antigravityRunFloorLocalSkew` (30 s) ahead of `now` is a clock rollback and is
+  discarded rather than parked in the future; a debt older than
+  `antigravityRefreshOwedMaxAge` (30 min) retires, so an unpayable one can never
+  pin a worker or a warning forever.
+- **Report.** `antigravityFreshnessNotice(lastObservedAt, now) (notice, pending)`
+  is the single accessor — no caller reads the state file. `notice` is empty on
+  a gated build (the gate banner above already names the build and the reading's
+  age; two sources for one banner would drift) and until the bounded attempts
+  are spent. `pending` doubles as the "is a debt owed" query, and suppresses
+  `antigravityMissedRun` for the same run so the pair cannot double-report it.
+- **Redaction.** The state file holds `schemaVersion`, four epoch-millisecond
+  fields, an attempt count, the `gated` bool, the hashed `accountFingerprint`
+  (written by the PAYMENT — at arm time no server has named an account; it is
+  diagnostic only, since clearing is decided by time alone) and a closed-set
+  `codeassist_*` outcome. Never a token, a keyring payload, `settings.json`
+  contents, an account email, a command line, a prompt, a port or log text.
+- **Not covered, deliberately:** `commandRunsAntigravity` still does not peel an
+  interpreter nested inside a composite statement (`cd repo && powershell
+  -EncodedCommand <b64>`), so such a run arms nothing. Widening the classifier
+  now costs an outbound Google call per false positive, so it belongs in its own
+  change with its own false-positive review.
+- **Test seams.** `AIEXPEDITE_AGY_FRESHNESS` relocates the state file;
+  `antigravityRefreshAfterRunRetryDelay` and `antigravityRefreshMinInterval` are
+  vars so a test pins them small; `antigravityUsageRefreshWaitIdle` waits the
+  single-flight worker out. The mock CLI mode `antigravity-quota-gated`
+  (`session_integration_test.go`) is a child-owned language server that refuses
+  every RPC — the shape every current build has.
+
 # Live usage probe — the Refresh click on the CLI Agents card
 
 Passive capture only ever reports what the last run left behind, so a CLI that

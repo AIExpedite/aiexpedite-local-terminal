@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -223,6 +224,167 @@ func TestAntigravityFreshness_NonTTYExecuteAdvancesObservedAt(t *testing.T) {
 
 	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
 		t.Fatalf("observedAt=%s did not advance past the stale %s", observed, stale)
+	}
+}
+
+// ───────────────────── the gated build: every current one ─────────────────────
+//
+// Since `agy` 1.2.2 the loopback language server refuses every quota RPC, so
+// the three paths above capture NOTHING on a real machine however healthy the
+// run. The reading then has to come from the Code Assist route, driven by the
+// run's own completion rather than by a human clicking Refresh — which is the
+// gap this feature exists to close, and the reason a passing CLI-maintenance
+// smoke was still followed by a days-old observedAt.
+
+// helperGatedRunFreshnessFixture stands up the machine those runs really see: a
+// CSRF-refusing language server owned by the spawned child, a stored keyring
+// login, a Code Assist endpoint that answers, and a stale cached reading. It
+// returns the home dir, the cache path, the seeded stale instant and the
+// binary to spawn.
+func helperGatedRunFreshnessFixture(t *testing.T) (home, cache string, stale time.Time, executable string) {
+	t.Helper()
+	helperStubAntigravityKeyring(t, map[string]any{
+		"access_token": "access-A", "token_type": "Bearer", "refresh_token": "never-read",
+		"expiry": time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
+	})
+	helperCodeAssistServers(t,
+		func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
+		func(string) (int, string) { return http.StatusOK, `{"sub":"123","email":"ada@example.com"}` })
+
+	// After helperCodeAssistServers, which points the cache at its own temp dir.
+	home, cache = helperIsolateAntigravityCapture(t, "20ms")
+	helperIsolateAntigravityGate(t)
+	helperSeedStaleAntigravityCache(t, cache)
+	t.Setenv(mockAgyQuotaBaseEnv, filepath.Join(home, ".gemini", "antigravity-cli"))
+	_, executable = helperMockAgyOnPath(t, "antigravity-quota-gated")
+	// The real Code Assist read, against the loopback stand-ins above: this is
+	// the route under test, not a stub of it.
+	probeAntigravityQuotaCodeAssistFn = probeAntigravityQuotaCodeAssist
+	// The debt worker's first attempt must not be spaced out of this test.
+	orig := antigravityRefreshMinInterval
+	antigravityRefreshMinInterval = time.Nanosecond
+	// Wait the worker out BEFORE restoring: it reads this var, and cleanups run
+	// last-registered-first, so the suite's own idle wait has not run yet.
+	t.Cleanup(func() { antigravityUsageRefreshWaitIdle(); antigravityRefreshMinInterval = orig })
+
+	var err error
+	if stale, err = time.Parse(time.RFC3339, helperStaleObservedAt); err != nil {
+		t.Fatalf("parse seed: %v", err)
+	}
+	return home, cache, stale, executable
+}
+
+// helperAwaitDebt waits for a finished run's refresh debt to be persisted. The
+// settle runs off the caller's goroutine by design, so the debt lands shortly
+// after finish() returns.
+func helperAwaitDebt(t *testing.T, why string) antigravityUsageFreshness {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+			return state
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", why)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// helperAwaitPaidRefresh waits for the run-completion debt to be paid and
+// returns the reading that paid it.
+func helperAwaitPaidRefresh(t *testing.T, cache string, after time.Time) antigravityQuotaSnapshot {
+	t.Helper()
+	antigravityUsageRefreshWaitIdle()
+	snap := helperAwaitSnapshot(t, cache, after, "the Code Assist reading the finished run owed")
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("the debt survived the reading that covers it: %+v", state)
+	}
+	return snap
+}
+
+// Direct path on a gated build: the native turn's poller captures nothing, and
+// the run's completion must still advance observedAt.
+func TestAntigravityFreshness_GatedNativeTurnAdvancesObservedAt(t *testing.T) {
+	home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
+
+	session := &AntigravityNativeSession{ID: "freshness-native-gated", status: "idle"}
+	out, _, exitCode, timedOut, _, runErr := NewAntigravityNativeManager(nil).runOneShot(
+		session, t.TempDir(), executable, "hello", "", 30*time.Second, "test:antigravity-freshness-gated")
+	if runErr != nil || exitCode != 0 || timedOut {
+		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
+	}
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+		case <-time.After(30 * time.Second):
+			t.Fatal("capture poller did not stop after the turn")
+		}
+	} else {
+		t.Fatal("the native turn never armed a quota capture")
+	}
+	if got := antigravityCaptureSnapshots.Load(); got != 0 {
+		t.Fatalf("snapshots=%d during a gated run, want 0 — the poller cannot read a gated build", got)
+	}
+
+	helperAwaitPaidRefresh(t, cache, stale)
+	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s on a gated build", observed, stale)
+	}
+}
+
+// Terminal-managed session on a gated build: same guarantee through
+// SessionManager, whose capture is armed at spawn and released in waitForExit.
+func TestAntigravityFreshness_GatedTerminalManagedSessionAdvancesObservedAt(t *testing.T) {
+	home, cache, stale, _ := helperGatedRunFreshnessFixture(t)
+
+	if _, _, err := captureSession(t, "antigravity-quota-gated", "agy", []string{"do the thing"}, ""); err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+		case <-time.After(30 * time.Second):
+			t.Fatal("capture poller did not stop after the session ended")
+		}
+	} else {
+		t.Fatal("the terminal-managed session never armed a quota capture")
+	}
+
+	helperAwaitPaidRefresh(t, cache, stale)
+	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s on a gated build", observed, stale)
+	}
+}
+
+// Non-PTY execute on a gated build — the shape the Windows CLI-maintenance
+// smoke actually reaches the device as.
+func TestAntigravityFreshness_GatedNonTTYExecuteAdvancesObservedAt(t *testing.T) {
+	home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
+
+	out, execErr := executeTerminalCommand(nil, commandMsg{
+		Command:   executable,
+		Args:      []string{"--print", "hello"},
+		Cwd:       t.TempDir(),
+		TimeoutMs: 30000,
+		Tty:       false,
+	})
+	if execErr != nil {
+		t.Fatalf("execute failed: %v (output=%q)", execErr, out)
+	}
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+		case <-time.After(30 * time.Second):
+			t.Fatal("capture poller did not stop after the execute returned")
+		}
+	} else {
+		t.Fatal("a tty=false execute of agy never armed a quota capture")
+	}
+
+	helperAwaitPaidRefresh(t, cache, stale)
+	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s on a gated build", observed, stale)
 	}
 }
 
@@ -499,6 +661,10 @@ func TestAntigravityFreshness_ConcurrentRunsShareOnePoller(t *testing.T) {
 	if got := antigravityCaptureFinishes.Load(); got != 4 {
 		t.Errorf("finishes=%d, want one per run", got)
 	}
+	// Every run's reading landed, so the four settles left no debt between them.
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want no debt when each run has a reading of its own", state)
+	}
 
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(cache, &snap) {
@@ -673,5 +839,123 @@ func TestAntigravityFreshness_SurvivesACLIUpdateBetweenSmokes(t *testing.T) {
 	if !observed.After(preUpdateObserved) {
 		t.Fatalf("observedAt=%s did not advance past the pre-update %s — the update lost the capture",
 			observed, preUpdateObserved)
+	}
+}
+
+// Concurrent runs on a GATED build are where the debt bookkeeping has to hold:
+// four overlapping runs capture nothing, share one poller, and must leave ONE
+// debt carrying the NEWEST floor — a reading that covers the newest covers
+// every earlier one — paid by exactly one outbound read.
+func TestAntigravityFreshness_ConcurrentGatedRunsOweOneDebtAndPayItOnce(t *testing.T) {
+	_, cache := helperIsolateAntigravityCapture(t, "20ms")
+	helperIsolateAntigravityGate(t)
+	helperSeedStaleAntigravityCache(t, cache)
+	// No server at all: nothing can capture, which is what a gated build looks
+	// like to the poller once it has parked.
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	origInterval := antigravityRefreshMinInterval
+	antigravityRefreshMinInterval = time.Hour
+	t.Cleanup(func() { antigravityUsageRefreshWaitIdle(); antigravityRefreshMinInterval = origInterval })
+
+	first := startAntigravityQuotaCapture("short run")
+	// The long run holds the poller open. The short run's settle must not wait
+	// on it: the debt is decided off the poller precisely so a finished run's
+	// refresh is never parked behind a live interactive session.
+	long := startAntigravityQuotaCapture("long run")
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			helperStopCapture(t, long)
+		}
+	})
+	first()
+
+	state := helperAwaitDebt(t, "the short run's debt while the long run still holds the poller")
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+			t.Fatal("the poller stopped while a run was still armed")
+		default:
+		}
+	}
+	antigravityUsageRefreshWaitIdle()
+	shortFloor := state.RefreshOwedFloorMs
+	if reads.Load() == 0 {
+		t.Fatal("the short run's debt spent no read")
+	}
+	paid := reads.Load()
+
+	helperStopCapture(t, long)
+	released = true
+	state = helperFreshnessState(t)
+	if state.RefreshOwedFloorMs < shortFloor {
+		t.Errorf("owed floor moved backwards: %d then %d", shortFloor, state.RefreshOwedFloorMs)
+	}
+	// One pending debt at a time, and the minimum interval keeps the second
+	// run from spending another outbound call.
+	if got := reads.Load(); got != paid {
+		t.Errorf("reads=%d, want the interval to hold the second run's payment at %d", got, paid)
+	}
+	// A reading taken BEFORE the second run armed must not clear its debt.
+	settleAntigravityRunFreshness(shortFloor - time.Minute.Milliseconds())
+	if helperFreshnessState(t).RefreshOwedAtMs == 0 {
+		t.Error("a reading older than the run's floor retired its debt")
+	}
+}
+
+// The acceptance's hard half: a run armed under the old build, the process cut
+// off before it could settle (a self-update restarts the agent), and the debt
+// paid on the NEXT start. Nothing in the dead process's memory survives — only
+// the state file does — so this is what proves observedAt survives an update.
+func TestAntigravityFreshness_SurvivesARestartBeforeTheRunSettles(t *testing.T) {
+	home, cache, stale, _ := helperGatedRunFreshnessFixture(t)
+
+	// The previous process armed a run and died: a floor on disk, no debt, no
+	// reading of its own.
+	armAntigravityUsageRunFloor(time.Now().Add(-time.Minute))
+	// The arm persists in the background so it never blocks a spawn.
+	antigravityUsageRefreshWaitIdle()
+	if helperFreshnessState(t).RunFloorMs == 0 {
+		t.Fatal("the interrupted run left no floor behind")
+	}
+
+	// The next StartAgent adopts it.
+	payOwedAntigravityUsageRefresh()
+	helperAwaitPaidRefresh(t, cache, stale)
+
+	usage, observed := helperParsedObservedAt(t, home, time.Now())
+	if !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s across the restart", observed, stale)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none once the debt is paid", usage.Notice)
+	}
+}
+
+// A debt that outlives its bounded attempts on a NON-gated build is what the
+// card has to explain, and the explanation replaces the log-only missed-run
+// report for the same run rather than doubling it.
+func TestAntigravityFreshness_UnpayableDebtWarnsOnTheCard(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "1h")
+	helperIsolateAntigravityGate(t)
+	helperSeedStaleAntigravityCache(t, cache)
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"),
+		map[string]any{"email": "ada@example.com"})
+
+	now := time.Now()
+	helperWriteJSON(t, antigravityFreshnessPath(), antigravityUsageFreshness{
+		SchemaVersion:      antigravityFreshnessSchema,
+		RefreshOwedFloorMs: now.Add(-time.Minute).UnixMilli(),
+		RefreshOwedAtMs:    now.Add(-time.Minute).UnixMilli(),
+		Attempts:           antigravityRefreshAfterRunMaxAttempts,
+		Outcome:            liveProbeOutcomeCodeAssistNoLogin,
+	})
+
+	usage, _ := helperParsedObservedAt(t, home, now)
+	if usage.NoticeSeverity != "warning" || !strings.Contains(usage.Notice, "No Antigravity login is stored") {
+		t.Errorf("notice=%q severity=%q, want the unpaid-debt warning", usage.Notice, usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "last observed") {
+		t.Errorf("notice=%q, want it to name the reading the card is showing", usage.Notice)
 	}
 }

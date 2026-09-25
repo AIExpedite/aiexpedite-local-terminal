@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.33"
+var Version = "v1.0.34"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -158,6 +158,11 @@ func StartAgent(cfg *Config) {
 	// finished (or was cut off) just before a restart or self-update.
 	SetCodexUsageRefreshEnabled(true)
 	payOwedCodexUsageRefresh()
+	// The same debt for Antigravity: on a CSRF-gated build (every current one)
+	// the in-run poller captures nothing, so a run cut off by a crash, restart
+	// or self-update is paid here with one bounded Code Assist read. Placed
+	// after isOffline is published above, so the attempt honours offline mode.
+	payOwedAntigravityUsageRefresh()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",
