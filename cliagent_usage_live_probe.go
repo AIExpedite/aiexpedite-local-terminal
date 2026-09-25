@@ -533,12 +533,31 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 // every run — and tries once more. (The warm-up is cached for the click, so
 // the caller's later warm is a no-op.)
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
-	outcome := probeAntigravityQuotaCodeAssistFn(ctx, agent.Version, time.Now)
+	version := antigravityCodeAssistBuildVersion(agent.Version)
+	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
 		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
-		outcome = probeAntigravityQuotaCodeAssistFn(ctx, agent.Version, time.Now)
+		outcome = probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
 	}
 	return outcome
+}
+
+// antigravityCodeAssistBuildVersion resolves the `agy` build the Code Assist
+// request identifies itself as. Google licenses that endpoint per client and
+// reads the client off the User-Agent (antigravityCodeAssistUserAgent), so the
+// run-completion refresh — which has no detectedCLIAgent to hand — must derive
+// the build the same way the click does: the detected version when there is
+// one, otherwise the same cached `--version` probe detection itself ran, which
+// is a cache hit on any machine that has gathered usage since the CLI was
+// installed. Never a spawn of `agy` itself.
+func antigravityCodeAssistBuildVersion(version string) string {
+	if v := strings.TrimSpace(version); v != "" {
+		return v
+	}
+	if path := antigravityExecutablePath(); path != "" {
+		return cachedProbeVersion(path)
+	}
+	return ""
 }
 
 // probeAntigravityQuotaLive starts `agy` only to bring up its language server,

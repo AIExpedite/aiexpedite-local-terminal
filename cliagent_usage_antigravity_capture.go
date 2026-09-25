@@ -117,6 +117,12 @@ var (
 	// antigravityCaptureTailProbes counts probes taken in the post-release tail
 	// window, so a test can prove the tail never rediscovers.
 	antigravityCaptureTailProbes atomic.Int64
+	// antigravityCaptureLastPersistedMs is the observation time of the newest
+	// reading any capture persisted in this process. It is the cheap HINT a
+	// finishing run uses to answer "did anything land for me?" without reading
+	// the cache; the authoritative answer is still the time comparison in
+	// antigravityUsageRunSettled.
+	antigravityCaptureLastPersistedMs atomic.Int64
 )
 
 // armAntigravityCaptureForCommand arms the quota poller when spawning cmd+args
@@ -146,6 +152,11 @@ func armAntigravityCaptureForCommand(label, cmd string, args []string) func() {
 // line, path or prompt.
 func startAntigravityQuotaCapture(label string) (finish func()) {
 	antigravityCaptureArms.Add(1)
+	// Arm this run's freshness floor. Every spawn site reaches here — directly
+	// on the native path, through armAntigravityCaptureForCommand everywhere
+	// else — so all five inherit the run-completion refresh with no new call
+	// sites (cliagent_usage_antigravity_freshness.go).
+	floor := armAntigravityUsageRunFloor(time.Now())
 
 	antigravityCaptureMu.Lock()
 	antigravityCaptureRefs++
@@ -175,6 +186,20 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 			if stop != nil {
 				close(stop)
 			}
+
+			// Settle THIS run, off the caller's goroutine and without waiting
+			// for the poller: the poller is ref-counted and exits only when the
+			// last armed run releases, so settling there would park a finished
+			// run's refresh behind a long interactive session sharing it.
+			go func() {
+				now := time.Now()
+				// The build's refusal is remembered per build, so the marker is
+				// the single source for "could the poller have captured this
+				// run at all?".
+				_, gated := antigravityQuotaGateFor("", now)
+				antigravityUsageRunSettled(floor,
+					antigravityCaptureLastPersistedMs.Load() >= floor.UnixMilli(), gated)
+			}()
 		})
 	}
 }
@@ -420,5 +445,14 @@ func antigravityCapturePersist(snap antigravityQuotaSnapshot) (bool, string) {
 		return false, ""
 	}
 	antigravityCaptureSnapshots.Add(1)
+	if at, err := time.Parse(time.RFC3339, snap.ObservedAt); err == nil {
+		for {
+			prev := antigravityCaptureLastPersistedMs.Load()
+			if at.UnixMilli() <= prev ||
+				antigravityCaptureLastPersistedMs.CompareAndSwap(prev, at.UnixMilli()) {
+				break
+			}
+		}
+	}
 	return true, snap.ObservedAt
 }

@@ -161,6 +161,11 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		}
 	}
 
+	// The run-completion refresh debt (cliagent_usage_antigravity_freshness.go):
+	// pending says a finished `agy` run is still waiting for a reading, notice
+	// is the wording for the cases the gate banner below does not already own.
+	freshnessNotice, freshnessPending := antigravityFreshnessNotice(snap.ObservedAt, now)
+
 	gate, gatedBuild := antigravityQuotaGateFor(detected.Version, now)
 	if gotFresh {
 		// A reading from a live server: whatever refused earlier no longer
@@ -180,11 +185,20 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// Gated locally, but the Code Assist route has supplied a reading
 		// since: the card shows that reading with its age, and a run not
 		// captured by the (refused) poller is not a defect to log.
-	case !gotFresh:
+	case !gotFresh && freshnessNotice != "":
+		// A finished run owes a refresh that every bounded attempt failed to
+		// pay on a build that is NOT gated (no login stored, or the Code Assist
+		// route kept failing). The gate arms above keep precedence, so one
+		// banner is only ever worded by one source.
+		usage.Notice = freshnessNotice
+		usage.NoticeSeverity = "warning"
+	case !gotFresh && !freshnessPending:
 		// Replaying. If the CLI's own logs show a run finished after this
 		// reading was taken, that run's quota was never captured — say so, once,
 		// so the next maintenance pass can tell an unrecognised transport from a
-		// server that refused to attribute its reading.
+		// server that refused to attribute its reading. Skipped while a debt is
+		// pending: the debt is the better signal for the same run, and the pair
+		// would double-report it.
 		antigravityMissedRun(snap.ObservedAt, newestLog, len(quotaBases))
 	}
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -86,10 +87,19 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 			t.Fatal("a capture poller from an earlier test is still running")
 		}
 	}
+	antigravityUsageRefreshWaitIdle()
 	antigravityCaptureArms.Store(0)
 	antigravityCaptureFinishes.Store(0)
 	antigravityCaptureSnapshots.Store(0)
 	antigravityCaptureTailProbes.Store(0)
+	antigravityCaptureLastPersistedMs.Store(0)
+	// The run-completion debt is process-global too, and a run that captures
+	// nothing now owes an OUTBOUND Google read. Point the state file at the
+	// test's own dir and stub that read, so no test reaches the network or the
+	// developer's real agent state, and wait out any worker a test left behind.
+	t.Setenv(antigravityFreshnessEnv, filepath.Join(t.TempDir(), "agy_freshness.json"))
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	t.Cleanup(antigravityUsageRefreshWaitIdle)
 
 	home = t.TempDir()
 	t.Setenv("HOME", home)
@@ -103,6 +113,28 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	return home, cache
 }
 
+// helperStubAntigravityCodeAssistOutcome replaces the Code Assist read the
+// run-completion debt worker spends, and reports how many times it ran.
+func helperStubAntigravityCodeAssistOutcome(t *testing.T, outcome func() string) *atomic.Int64 {
+	t.Helper()
+	orig := probeAntigravityQuotaCodeAssistFn
+	t.Cleanup(func() { probeAntigravityQuotaCodeAssistFn = orig })
+	var calls atomic.Int64
+	probeAntigravityQuotaCodeAssistFn = func(context.Context, string, func() time.Time) string {
+		calls.Add(1)
+		return outcome()
+	}
+	return &calls
+}
+
+// helperFreshnessState reads the persisted run-completion debt.
+func helperFreshnessState(t *testing.T) antigravityUsageFreshness {
+	t.Helper()
+	var state antigravityUsageFreshness
+	readJSONFile(antigravityFreshnessPath(), &state)
+	return state
+}
+
 // helperStopCapture releases a capture and waits for the poller to finish, so
 // no goroutine outlives the test.
 func helperStopCapture(t *testing.T, finish func()) {
@@ -110,6 +142,7 @@ func helperStopCapture(t *testing.T, finish func()) {
 	stopped := antigravityCaptureStopped()
 	finish()
 	if stopped == nil {
+		antigravityUsageRefreshWaitIdle()
 		return
 	}
 	select {
@@ -117,6 +150,9 @@ func helperStopCapture(t *testing.T, finish func()) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("capture poller did not stop after the last finish()")
 	}
+	// The settle runs off the poller (a short run must not wait on a longer
+	// one holding it), so the debt it decides lands slightly after shutdown.
+	antigravityUsageRefreshWaitIdle()
 }
 
 // helperAwaitSnapshot polls the cache until a snapshot is present whose
@@ -206,6 +242,49 @@ func TestAntigravityQuotaCapture_SingleFlightUntilLastFinish(t *testing.T) {
 	if got := antigravityCaptureFinishes.Load(); got != 2 {
 		t.Errorf("finishes=%d, want 2 (one per armed run, double release ignored)", got)
 	}
+	// Both runs had a reading of their own, so neither settle left a debt.
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want no refresh debt when both runs captured", state)
+	}
+}
+
+// Settling is PER RUN, not per poller exit. A short run that captured nothing
+// must owe its refresh the moment it finishes — even while a second, still
+// armed run holds the shared poller open — and the doubled release must not
+// settle it twice.
+func TestAntigravityQuotaCapture_SettlesOncePerRunNotPerPollerExit(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperIsolateAntigravityGate(t)
+	// No server: nothing can capture, so every run finishes owing a refresh.
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+
+	short := startAntigravityQuotaCapture("short run")
+	long := startAntigravityQuotaCapture("long run")
+	stopped := antigravityCaptureStopped()
+	short()
+	short() // idempotent: the second release must not settle a second time
+
+	deadline := time.Now().Add(30 * time.Second)
+	for helperFreshnessState(t).RefreshOwedAtMs == 0 {
+		if time.Now().After(deadline) {
+			helperStopCapture(t, long)
+			t.Fatal("the short run's debt waited for the poller to exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("the poller stopped while a run was still armed")
+	default:
+	}
+	antigravityUsageRefreshWaitIdle()
+	// no_login stops attempting after one read, so a double settle would show
+	// up as a second read of the same debt.
+	if got := reads.Load(); got != 1 {
+		t.Errorf("reads=%d, want exactly one per settled run", got)
+	}
+	helperStopCapture(t, long)
 }
 
 // The first probe must happen at ARM time, not one interval later. The quota

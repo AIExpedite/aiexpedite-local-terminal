@@ -68,6 +68,11 @@ const mockAgyQuotaBaseEnv = "TEST_MOCK_AGY_QUOTA_BASE"
 // samples a fast turn, rather than relying on a shrunken test interval.
 const mockAgyQuotaLifetime = 1500 * time.Millisecond
 
+// mockAgyGatedQuotaLifetime is the same for the CSRF-gated mode. A gated server
+// can never be captured from, so the turn only has to outlive the poller's
+// first probe.
+const mockAgyGatedQuotaLifetime = 300 * time.Millisecond
+
 const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
 // TestMain dispatches into the mock CLI when the env var is set; otherwise
@@ -85,6 +90,14 @@ func TestMain(m *testing.M) {
 	// file-based tests. Default the reader to "no keychain credential"; tests that
 	// exercise the Keychain path override claudeKeychainReader explicitly.
 	claudeKeychainReader = func(context.Context) ([]byte, bool) { return nil, false }
+	// Same rule for Antigravity's keyring login. A finished `agy` run now owes a
+	// Code Assist read when it captured nothing
+	// (cliagent_usage_antigravity_freshness.go), so a suite that spawns a fake
+	// `agy` would otherwise reach Google with the developer's real stored
+	// credential. Default to "no login" — the probe then stops locally, before
+	// any request — and let the tests that exercise the route stub it
+	// explicitly (helperStubAntigravityKeyring).
+	antigravityKeyringReader = func(context.Context) ([]byte, bool) { return nil, false }
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through
@@ -273,6 +286,54 @@ func runMockCLI(mode string) {
 		// prompt at all, and a blocking read there would hang the turn.
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin) }()
 		time.Sleep(mockAgyQuotaLifetime)
+		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"quota-server turn done"}}`)
+		os.Exit(0)
+
+	case "antigravity-quota-gated":
+		// The same run on a CSRF-gated build (`agy` >= 1.2.2): the language
+		// server is up and advertises its port exactly as above, but answers
+		// every RPC 401 {"code":"unauthenticated"}. This is what EVERY current
+		// build does, so it is the shape the run-completion refresh has to
+		// cover: the in-run poller captures nothing and freshness can only come
+		// from the Code Assist route.
+		if len(os.Args) > 1 && os.Args[1] == "--version" {
+			// Keep the version probe off the server path: the freshness worker
+			// resolves the build through the same cached `--version` the
+			// machine-info gather uses, and a probe that took the turn's
+			// lifetime would charge every test 1.5 s.
+			fmt.Println("agy version 1.2.3")
+			os.Exit(0)
+		}
+		base := os.Getenv(mockAgyQuotaBaseEnv)
+		ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+		if lnErr != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"listen failed"}}`)
+			os.Exit(1)
+		}
+		go func() {
+			_ = (&http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(antigravityCSRFRefusal))
+			})}).Serve(ln)
+		}()
+		logDir := antigravityLogDir(base)
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"mkdir failed"}}`)
+			os.Exit(1)
+		}
+		line := fmt.Sprintf(
+			"I0811 12:00:00.000000 42 server.go:584] Language server listening on random port at %d for HTTP\n",
+			ln.Addr().(*net.TCPAddr).Port)
+		if err := os.WriteFile(filepath.Join(logDir, "cli-child.log"), []byte(line), 0o600); err != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"log write failed"}}`)
+			os.Exit(1)
+		}
+		go func() { _, _ = io.Copy(io.Discard, os.Stdin) }()
+		// Shorter than mockAgyQuotaLifetime: nothing can be captured from a
+		// gated server, so the turn only has to be long enough for the poller
+		// to meet the refusal once.
+		time.Sleep(mockAgyGatedQuotaLifetime)
 		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"quota-server turn done"}}`)
 		os.Exit(0)
 

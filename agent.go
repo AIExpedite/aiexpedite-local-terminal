@@ -158,6 +158,11 @@ func StartAgent(cfg *Config) {
 	// finished (or was cut off) just before a restart or self-update.
 	SetCodexUsageRefreshEnabled(true)
 	payOwedCodexUsageRefresh()
+	// The same debt for Antigravity: on a CSRF-gated build (every current one)
+	// the in-run poller captures nothing, so a run cut off by a crash, restart
+	// or self-update is paid here with one bounded Code Assist read. Placed
+	// after isOffline is published above, so the attempt honours offline mode.
+	payOwedAntigravityUsageRefresh()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

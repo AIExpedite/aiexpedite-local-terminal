@@ -584,6 +584,34 @@ func loadAntigravityQuotaSnapshotByProducer() (antigravityQuotaSnapshot, bool) {
 	return snap, true
 }
 
+// cachedAntigravityObservedAt returns the cached reading's observation time
+// regardless of which account produced it, for callers that hold no snapshot
+// and only need to know how fresh the card's figure is (the run-completion
+// freshness path, cliagent_usage_antigravity_freshness.go). Freshness is a
+// question about TIME, not identity: a login switched between a run's floor and
+// its reading still satisfies that run.
+func cachedAntigravityObservedAt() string {
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+	snap, ok := readAntigravityQuotaCache()
+	if !ok {
+		return ""
+	}
+	return snap.ObservedAt
+}
+
+// cachedAntigravityFingerprint is the same read for the identity a payment
+// landed under, recorded on the debt for diagnostics only.
+func cachedAntigravityFingerprint() string {
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+	snap, ok := readAntigravityQuotaCache()
+	if !ok {
+		return ""
+	}
+	return snap.AccountFingerprint
+}
+
 func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(antigravityQuotaCachePath(), &snap) {
@@ -682,6 +710,12 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 		_ = os.Remove(tmp)
 		return false
 	}
+	// Every route that lands a reading is a settler: the in-run poller, the
+	// Code Assist read, a Refresh click and a concurrent run's poller all reach
+	// here, so a run's refresh debt is retired exactly once by whichever of
+	// them covers its floor. Takes only the freshness lock — the cache lock is
+	// held here, and the package's lock order is cache -> freshness.
+	settleAntigravityRunFreshness(snap.ObservedAt)
 	return true
 }
 

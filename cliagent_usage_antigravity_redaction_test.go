@@ -57,6 +57,28 @@ func TestAntigravityClassify_MatchingPayloadNeverEscapes(t *testing.T) {
 	}
 	helperAssertNoSecrets(t, "the quota cache", string(raw))
 
+	// The run-completion freshness state is written by the same armed run and
+	// is uploaded with diagnostics just like the cache, so it carries the same
+	// allowlist: timestamps, counters and a hashed fingerprint only. Asserted
+	// on the SERIALIZED bytes, not the struct.
+	if freshness, readErr := os.ReadFile(antigravityFreshnessPath()); readErr == nil {
+		helperAssertNoSecrets(t, "the freshness state", string(freshness))
+		var decodedState map[string]json.RawMessage
+		if err := json.Unmarshal(freshness, &decodedState); err != nil {
+			t.Fatalf("freshness state is not a JSON object: %v", err)
+		}
+		allowedState := map[string]bool{
+			"schemaVersion": true, "runFloorMs": true, "refreshOwedFloorMs": true,
+			"refreshOwedAtMs": true, "lastPaidAtMs": true, "attempts": true,
+			"gated": true, "accountFingerprint": true, "outcome": true,
+		}
+		for key := range decodedState {
+			if !allowedState[key] {
+				t.Errorf("unexpected persisted freshness field %q", key)
+			}
+		}
+	}
+
 	// The persisted snapshot is still exactly the allowlist after a
 	// Windows-wrapped capture — the transport must not widen what is cached.
 	var decoded map[string]json.RawMessage
