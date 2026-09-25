@@ -591,25 +591,21 @@ func loadAntigravityQuotaSnapshotByProducer() (antigravityQuotaSnapshot, bool) {
 // question about TIME, not identity: a login switched between a run's floor and
 // its reading still satisfies that run.
 func cachedAntigravityObservedAt() string {
-	antigravityQuotaCacheMu.Lock()
-	defer antigravityQuotaCacheMu.Unlock()
-	snap, ok := readAntigravityQuotaCache()
+	snap, ok := cachedAntigravityQuotaSnapshot()
 	if !ok {
 		return ""
 	}
 	return snap.ObservedAt
 }
 
-// cachedAntigravityFingerprint is the same read for the identity a payment
-// landed under, recorded on the debt for diagnostics only.
-func cachedAntigravityFingerprint() string {
+// cachedAntigravityQuotaSnapshot is the same read for a caller that needs more
+// than the observation time. readAntigravityQuotaCache itself is lock-free by
+// contract (its callers hold antigravityQuotaCacheMu), so this is the entry
+// point for anyone outside this file.
+func cachedAntigravityQuotaSnapshot() (antigravityQuotaSnapshot, bool) {
 	antigravityQuotaCacheMu.Lock()
 	defer antigravityQuotaCacheMu.Unlock()
-	snap, ok := readAntigravityQuotaCache()
-	if !ok {
-		return ""
-	}
-	return snap.AccountFingerprint
+	return readAntigravityQuotaCache()
 }
 
 func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {

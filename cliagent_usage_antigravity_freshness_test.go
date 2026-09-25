@@ -913,6 +913,8 @@ func TestAntigravityFreshness_SurvivesARestartBeforeTheRunSettles(t *testing.T) 
 	// The previous process armed a run and died: a floor on disk, no debt, no
 	// reading of its own.
 	armAntigravityUsageRunFloor(time.Now().Add(-time.Minute))
+	// The arm persists in the background so it never blocks a spawn.
+	antigravityUsageRefreshWaitIdle()
 	if helperFreshnessState(t).RunFloorMs == 0 {
 		t.Fatal("the interrupted run left no floor behind")
 	}

@@ -1155,7 +1155,13 @@ size: no rollout scanning, no cursor, one outbound read.
 
 - **Arm.** `startAntigravityQuotaCapture` calls `armAntigravityUsageRunFloor(now)`
   and keeps the returned floor in the `finish` closure. All five spawn sites
-  inherit it, because they all reach that function — no new call sites.
+  inherit it, because they all reach that function — no new call sites. The
+  floor is returned immediately and PERSISTED on a goroutine, like
+  `armCodexUsageRunFloor`: this is the spawn path (the Windows chain arms at
+  function entry), and arming must never block the run. A write that loses the
+  race with its own settle costs nothing — the arm only raises the floor, and a
+  floor left behind for a run that did get its reading is dropped by the
+  payment's cached-reading check before any request is sent.
 - **Settle.** That `finish` runs `antigravityUsageRunSettled(floor, captured,
   gated)` on its own goroutine, inside the existing `sync.Once`. It must **not**
   wait for the poller: the poller is refcounted and exits only when the LAST
@@ -1172,7 +1178,10 @@ size: no rollout scanning, no cursor, one outbound read.
   single flight, with one debt at a time (a later run's floor REPLACES the
   pending one rather than queueing). A new debt's first read is spaced by
   `antigravityRefreshMinInterval` (60 s); a retry within one debt is the same
-  unpaid run and bypasses it, as does the startup adoption. The Refresh click
+  unpaid run and bypasses it, as does the startup adoption. A debt the interval
+  blocks is KEPT, not dropped — there is deliberately no timer to come back for
+  it, because the next run's settle (or the next agent start) pays it, and a
+  background timer per debt is work the user never asked for. The Refresh click
   does not go through this worker, so a user-initiated refresh is never
   throttled by it. **Ceiling: one outbound call per minute, whatever the run
   volume** — 200 short runs in an hour still spend at most 60.

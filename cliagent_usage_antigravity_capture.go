@@ -156,7 +156,7 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 	// on the native path, through armAntigravityCaptureForCommand everywhere
 	// else — so all five inherit the run-completion refresh with no new call
 	// sites (cliagent_usage_antigravity_freshness.go).
-	floor := armAntigravityUsageRunFloor(time.Now())
+	floor := armAntigravityUsageRunFloor(antigravityUsageFreshnessNow())
 
 	antigravityCaptureMu.Lock()
 	antigravityCaptureRefs++
@@ -192,7 +192,7 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 			// last armed run releases, so settling there would park a finished
 			// run's refresh behind a long interactive session sharing it.
 			go func() {
-				now := time.Now()
+				now := antigravityUsageFreshnessNow()
 				// The build's refusal is remembered per build, so the marker is
 				// the single source for "could the poller have captured this
 				// run at all?".

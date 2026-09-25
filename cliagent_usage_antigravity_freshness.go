@@ -137,6 +137,9 @@ var (
 	// antigravityRefreshWorkerBusy is the process-wide single flight: one debt
 	// worker at a time, however many runs settle at once.
 	antigravityRefreshWorkerBusy atomic.Bool
+	// antigravityFreshnessInFlight counts the background writes this file owns
+	// (the arm persist and the debt worker), so a test can wait them out.
+	antigravityFreshnessInFlight atomic.Int64
 )
 
 func antigravityFreshnessPath() string {
@@ -225,18 +228,30 @@ func antigravityObservedAtCovers(observedAt string, floorMs int64) bool {
 
 /* ───────────────────────────────── arm ───────────────────────────────── */
 
-// armAntigravityUsageRunFloor persists the floor of a starting `agy` run and
-// returns it. The persisted RunFloorMs keeps the NEWEST arm's — that is the one
-// a restart adopts for a run nobody settled — while each run settles against
-// the floor returned here.
+// armAntigravityUsageRunFloor returns the floor of a starting `agy` run and
+// persists it in the background. The persisted RunFloorMs keeps the NEWEST
+// arm's — that is the one a restart adopts for a run nobody settled — while
+// each run settles against the floor returned here.
+//
+// The write is off the caller's goroutine for the same reason
+// armCodexUsageRunFloor's is: this runs on the spawn path (the Windows execute
+// chain arms at function entry), and startAntigravityQuotaCapture's contract is
+// that arming never blocks the run it is attached to. A write that loses the
+// race with its own settle costs nothing — the arm only ever RAISES the floor,
+// and a floor left behind for a run that did get its reading is dropped by the
+// payment's own cached-reading check before any request is sent.
 func armAntigravityUsageRunFloor(now time.Time) time.Time {
 	floorMs := now.UnixMilli()
-	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
-		antigravityRebaseFutureFreshness(state, now)
-		if floorMs > state.RunFloorMs {
-			state.RunFloorMs = floorMs
-		}
-	})
+	antigravityFreshnessInFlight.Add(1)
+	go func() {
+		defer antigravityFreshnessInFlight.Add(-1)
+		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+			antigravityRebaseFutureFreshness(state, now)
+			if floorMs > state.RunFloorMs {
+				state.RunFloorMs = floorMs
+			}
+		})
+	}()
 	return now
 }
 
@@ -269,10 +284,11 @@ func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool)
 		capturedSinceFloor = antigravityObservedAtCovers(cachedAntigravityObservedAt(), floorMs)
 	}
 	if capturedSinceFloor {
-		// A reading covers this run. The write that landed it already cleared
-		// any debt through settleAntigravityRunFreshness.
-		fmt.Printf("%s[antigravity-freshness] Run settled with a reading of its own (owed=false gated=%v)%s\n",
-			colorCyan, gated, colorReset)
+		// A reading covers this run, and the write that landed it already
+		// cleared any debt through settleAntigravityRunFreshness. Silent on
+		// purpose: the poller's own close-out line already reports `captured`
+		// for this run, and a second line per run is noise in a log that is
+		// uploaded with diagnostics.
 		return
 	}
 
@@ -330,7 +346,9 @@ func antigravityStartRunDebtWorker(maxAttempts int, bypassInterval bool) {
 	if !antigravityRefreshWorkerBusy.CompareAndSwap(false, true) {
 		return
 	}
+	antigravityFreshnessInFlight.Add(1)
 	go func() {
+		defer antigravityFreshnessInFlight.Add(-1)
 		defer antigravityRefreshWorkerBusy.Store(false)
 		antigravityPayRunDebt(maxAttempts, bypassInterval)
 	}()
@@ -342,7 +360,7 @@ func antigravityStartRunDebtWorker(maxAttempts int, bypassInterval bool) {
 // goroutine would have to touch on every run.
 func antigravityUsageRefreshWaitIdle() {
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
-		if !antigravityRefreshWorkerBusy.Load() {
+		if antigravityFreshnessInFlight.Load() == 0 {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -457,7 +475,9 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 func antigravityRecordRefreshAttempt(outcome string, now time.Time) {
 	fingerprint := ""
 	if outcome == liveProbeOutcomeCodeAssistOK {
-		fingerprint = cachedAntigravityFingerprint()
+		if snap, ok := cachedAntigravityQuotaSnapshot(); ok {
+			fingerprint = snap.AccountFingerprint
+		}
 	}
 	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		state.Outcome = outcome
@@ -552,11 +572,13 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	if at, err := time.Parse(time.RFC3339, lastObservedAt); err == nil {
 		last = "Antigravity utilization was last observed " + at.UTC().Format(layout)
 	}
-	cause := "Google returned no reading for the stored login."
+	// One sentence per case, because the remedy differs: a missing login is
+	// something the user fixes, a failing read is something that heals itself.
+	cause := "Google returned no reading for the stored login; it will update on the next run that reports one."
 	if state.Outcome == liveProbeOutcomeCodeAssistNoLogin {
-		cause = "No Antigravity login is stored on this device."
+		cause = "No Antigravity login is stored on this device, so no reading can be taken; sign in with the CLI to restore it."
 	}
-	notice := fmt.Sprintf("%s, before the most recent Antigravity run started (%s). %s It will update on the next run that reports one.",
+	notice := fmt.Sprintf("%s, before the most recent Antigravity run started (%s). %s",
 		last, time.UnixMilli(state.RefreshOwedFloorMs).UTC().Format(layout), cause)
 	return clampASCII(notice, antigravityFreshnessNoticeLimit), true
 }

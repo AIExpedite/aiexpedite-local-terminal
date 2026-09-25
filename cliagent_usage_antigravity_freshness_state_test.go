@@ -284,6 +284,7 @@ func TestAntigravityFreshness_FutureFloorIsDiscardedAsAClockRollback(t *testing.
 	// Arming rewrites the floor at the current clock rather than keeping the
 	// future one.
 	floor := armAntigravityUsageRunFloor(now)
+	antigravityUsageRefreshWaitIdle()
 	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
 		t.Errorf("runFloorMs=%d, want the rearmed %d", state.RunFloorMs, floor.UnixMilli())
 	}
@@ -300,6 +301,7 @@ func TestAntigravityFreshness_CorruptStateFileReadsAsNoDebt(t *testing.T) {
 		t.Errorf("notice=%q pending=%v, want a corrupt file to read as no debt", notice, pending)
 	}
 	floor := armAntigravityUsageRunFloor(time.Now())
+	antigravityUsageRefreshWaitIdle()
 	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
 		t.Errorf("runFloorMs=%d, want the corrupt file replaced by a real floor", state.RunFloorMs)
 	}
