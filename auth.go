@@ -85,6 +85,11 @@ type WIFTokenSource struct {
 // up to an hour later (prod AIX3, 2026-09-25).
 var tokenSourceAwaitingMachineInfo atomic.Pointer[WIFTokenSource]
 
+// testHookAfterMachineInfoRead runs in getOIDCToken right after the cache read,
+// where a gather landing after a nil read used to be lost. Test seam only;
+// always nil in production.
+var testHookAfterMachineInfoRead func()
+
 // resendTokenRequestWithMachineInfo repeats the /auth/token request of a token
 // source that sent one without machine info, now that the cache is populated.
 // Only the request's side effect matters (the backend records the machine and
@@ -229,13 +234,21 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	// goroutine returns). In that case we send the request without these
 	// fields and terminal-service falls back to the legacy workspace
 	// systemInfo path.
+	// Arm the re-send BEFORE reading the cache. Arming after a nil read left a
+	// lost-wakeup window: a gather landing between the read and the arm found
+	// nothing pending, this request still went out bare, and nothing re-sent it
+	// until the next gather hours later. Armed first, a gather that lands at
+	// any point after this line either shows up in the read below (and the arm
+	// is withdrawn) or finds the arm and re-sends (see
+	// resendTokenRequestWithMachineInfo); at worst both, which is one spare
+	// request.
+	tokenSourceAwaitingMachineInfo.Store(ts)
 	mi := GetMachineInfo()
-	if mi == nil {
-		// Remembered so the first completed gather re-sends this request with
-		// the machine info (see resendTokenRequestWithMachineInfo).
-		tokenSourceAwaitingMachineInfo.Store(ts)
-	} else {
-		// This request carries it, so an earlier bare one needs no re-send.
+	if testHookAfterMachineInfoRead != nil {
+		testHookAfterMachineInfoRead()
+	}
+	if mi != nil {
+		// This request carries it, so no re-send is needed.
 		tokenSourceAwaitingMachineInfo.CompareAndSwap(ts, nil)
 	}
 	if mi != nil {

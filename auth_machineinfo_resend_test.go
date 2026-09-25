@@ -141,3 +141,32 @@ func TestTokenRequestCarryingMachineInfo_LeavesNothingToResend(t *testing.T) {
 		t.Fatalf("token requests=%d, want 2 (no re-send)", got)
 	}
 }
+
+// Codex P2 on #178: a gather that lands after getOIDCToken reads a nil cache
+// but before the re-send is armed found nothing pending, and the bare request
+// was never repeated. The re-send is armed before the read now.
+func TestGatherLandingRightAfterBareRead_StillResends(t *testing.T) {
+	isolateMachineInfo(t)
+	rec, srv := newTokenRequestRecorder(t)
+	ts := NewWIFTokenSource(&Config{AgentID: "agent-1", CommandSecret: "secret", TokenEndpoint: srv.URL})
+
+	testHookAfterMachineInfoRead = func() {
+		testHookAfterMachineInfoRead = nil
+		storeMachineInfo(baselineMachineInfo())
+	}
+	t.Cleanup(func() { testHookAfterMachineInfoRead = nil })
+
+	if _, err := ts.getOIDCToken(); err != nil {
+		t.Fatalf("getOIDCToken failed: %v", err)
+	}
+	rec.waitFor(t, 2)
+	var carried bool
+	for _, p := range rec.snapshot() {
+		if p["cpu"] != nil && p["collectedAt"] != nil {
+			carried = true
+		}
+	}
+	if !carried {
+		t.Fatalf("no token request carried machine info after the gather landed: %v", rec.snapshot())
+	}
+}
