@@ -67,8 +67,17 @@ func helperFakeAgyOnPath(t *testing.T) string {
 // helperWriteAntigravityCache seeds a cached reading observed at `at`.
 func helperWriteAntigravityCache(t *testing.T, cache string, at time.Time) {
 	t.Helper()
+	helperWriteAntigravityCacheAt(t, cache, at, at.UnixMilli())
+}
+
+// helperWriteAntigravityCacheAt seeds a cached reading with an explicit
+// millisecond instant; 0 is a reading cached by an agent that predates the
+// field, which carries only the RFC3339 second.
+func helperWriteAntigravityCacheAt(t *testing.T, cache string, at time.Time, observedAtMs int64) {
+	t.Helper()
 	snap := antigravityQuotaSnapshot{
 		ObservedAt:         at.UTC().Format(time.RFC3339),
+		ObservedAtMs:       observedAtMs,
 		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
 		Account:            "ada@example.com",
 		Buckets: []antigravityQuotaBucket{
@@ -121,6 +130,99 @@ func TestAntigravityFreshness_ReadingClearsOnlyAtOrAfterTheRunCompleted(t *testi
 				t.Errorf("a covered run spent %d Code Assist reads", calls.Load())
 			}
 		})
+	}
+}
+
+// The completion boundary holds below one second. observedAt is RFC3339
+// seconds, and the run-completion comparison used to round every reading up by
+// a whole second to absorb that — which let a Refresh click, or an overlapping
+// run's read, taken a few hundred milliseconds BEFORE a run completed pass as
+// that run's own reading. The exact instant decides now, and a reading known
+// only to the second (cached by an older agent) is taken as the START of that
+// second: it can cost a refresh, never lose one.
+func TestAntigravityFreshness_SubSecondBoundaryIsExact(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	floor := time.Now().Truncate(time.Second)
+	completed := floor.Add(time.Minute + 600*time.Millisecond)
+	antigravityUsageFreshnessNow = func() time.Time { return completed }
+
+	for _, tc := range []struct {
+		name       string
+		observedMs int64
+		wantOwing  bool
+	}{
+		{"400 ms before the completion, same second", completed.Add(-400 * time.Millisecond).UnixMilli(), true},
+		{"1 ms before the completion", completed.Add(-time.Millisecond).UnixMilli(), true},
+		{"exactly the completion", completed.UnixMilli(), false},
+		{"100 ms after the completion, same second", completed.Add(100 * time.Millisecond).UnixMilli(), false},
+		{"same second, no millisecond instant", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(antigravityFreshnessPath())
+			helperWriteAntigravityCacheAt(t, cache, completed, tc.observedMs)
+			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+			antigravityUsageRunSettled(floor, false, true)
+			antigravityUsageRefreshWaitIdle()
+
+			if owing := helperFreshnessState(t).RefreshOwedAtMs != 0; owing != tc.wantOwing {
+				t.Errorf("owing=%v, want %v", owing, tc.wantOwing)
+			}
+			if !tc.wantOwing && calls.Load() != 0 {
+				t.Errorf("a covered run spent %d Code Assist reads", calls.Load())
+			}
+		})
+	}
+}
+
+// A millisecond instant is trusted only inside the second observedAt names;
+// anything else falls back to the start of that second.
+func TestAntigravitySnapshotObservedMs(t *testing.T) {
+	second := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
+	at := second.Format(time.RFC3339)
+	for _, tc := range []struct {
+		name string
+		snap antigravityQuotaSnapshot
+		want int64
+	}{
+		{"exact instant", antigravityQuotaSnapshot{ObservedAt: at, ObservedAtMs: second.UnixMilli() + 750}, second.UnixMilli() + 750},
+		{"no instant", antigravityQuotaSnapshot{ObservedAt: at}, second.UnixMilli()},
+		{"instant in a later second", antigravityQuotaSnapshot{ObservedAt: at, ObservedAtMs: second.UnixMilli() + 1000}, second.UnixMilli()},
+		{"instant in an earlier second", antigravityQuotaSnapshot{ObservedAt: at, ObservedAtMs: second.UnixMilli() - 1}, second.UnixMilli()},
+		{"unparseable", antigravityQuotaSnapshot{ObservedAt: "yesterday", ObservedAtMs: second.UnixMilli()}, 0},
+	} {
+		if got := antigravitySnapshotObservedMs(tc.snap); got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Two readings inside the same second are ordered by their millisecond
+// instants, so a post-completion reading is not refused as "not newer" than a
+// mid-run one stamped with the same RFC3339 second.
+func TestSaveAntigravityQuotaSnapshotIfNewer_OrdersWithinOneSecond(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	second := time.Now().Truncate(time.Second)
+	helperWriteAntigravityCacheAt(t, cache, second, second.UnixMilli()+200)
+
+	fp := fingerprintAccount("antigravity", "ada@example.com")
+	reading := func(ms int64) antigravityQuotaSnapshot {
+		return antigravityQuotaSnapshot{
+			ObservedAt: second.UTC().Format(time.RFC3339), ObservedAtMs: ms,
+			AccountFingerprint: fp, Account: "ada@example.com",
+			Buckets: []antigravityQuotaBucket{
+				{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.3, ResetTime: "2126-08-14T00:00:00Z"},
+			},
+		}
+	}
+	if saveAntigravityQuotaSnapshotIfNewer(reading(second.UnixMilli() + 100)) {
+		t.Error("an earlier reading in the same second replaced a later one")
+	}
+	if !saveAntigravityQuotaSnapshotIfNewer(reading(second.UnixMilli() + 800)) {
+		t.Error("a later reading in the same second was refused as not newer")
+	}
+	if got := cachedAntigravityObservedMs(); got != second.UnixMilli()+800 {
+		t.Errorf("cached instant=%d, want %d", got, second.UnixMilli()+800)
 	}
 }
 
@@ -326,6 +428,15 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 	helperWriteAntigravityCache(t, cache, now.Add(-time.Hour))
 	antigravityRefreshMinInterval = time.Nanosecond
 	reads, entered, release := helperBlockingCodeAssistStub(t, liveProbeOutcomeCodeAssistHTTPError)
+	// A clock that ticks one millisecond per read: the two settles below run
+	// back to back, and on a fast machine the real clock hands both the same
+	// millisecond — the same debt generation — which is not the case this test
+	// is about. It must still move, or the minimum interval would read every
+	// later payment as "0 s since the last read". Atomic because the worker
+	// reads it while the test advances it.
+	var clockMs atomic.Int64
+	clockMs.Store(now.UnixMilli())
+	antigravityUsageFreshnessNow = func() time.Time { return time.UnixMilli(clockMs.Add(1)) }
 
 	antigravityUsageRunSettled(now.Add(-time.Minute), false, true)
 	select {
@@ -337,7 +448,8 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 
 	// The second run finishes while that read is in flight, replacing the
 	// pending generation with its own newer floor.
-	second := time.Now()
+	second := now.Add(time.Second)
+	clockMs.Store(second.UnixMilli())
 	antigravityUsageRunSettled(second, false, true)
 	if helperFreshnessState(t).debtID() == before {
 		t.Fatal("the second run did not replace the pending debt")
@@ -883,7 +995,7 @@ func TestAntigravityFreshness_ALiveRunKeepsItsCrashMarker(t *testing.T) {
 
 	// A Refresh click mid-run: newer than the floor, but taken before the run
 	// spent the usage it is still spending.
-	settleAntigravityRunFreshness(started.Add(10 * time.Second).UTC().Format(time.RFC3339))
+	settleAntigravityRunFreshness(started.Add(10 * time.Second).UnixMilli())
 	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
 		t.Fatalf("state=%+v, want a live run to keep its floor for crash recovery", state)
 	}
@@ -917,7 +1029,7 @@ func TestAntigravityFreshness_ACoveringReadingRollsTheMarkerBackToTheOldestLiveR
 		t.Fatalf("state=%+v, want the newest arm's floor %d", state, newer.UnixMilli())
 	}
 
-	settleAntigravityRunFreshness(started.Add(time.Minute).UTC().Format(time.RFC3339))
+	settleAntigravityRunFreshness(started.Add(time.Minute).UnixMilli())
 	if state := helperFreshnessState(t); state.RunFloorMs != older.UnixMilli() {
 		t.Errorf("floor=%d, want it rolled back to the oldest live run %d",
 			helperFreshnessState(t).RunFloorMs, older.UnixMilli())

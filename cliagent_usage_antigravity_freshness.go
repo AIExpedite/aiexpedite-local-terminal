@@ -76,12 +76,6 @@ const (
 	// make every later run owe a debt nothing can cover. Mirrors
 	// codexRunFloorLocalSkew.
 	antigravityRunFloorLocalSkew = 30 * time.Second
-	// antigravityObservedAtGrace absorbs the one-second resolution of the
-	// RFC3339 observation times: a reading taken 400 ms after the floor is
-	// stamped with the floor's own second and would otherwise read as older
-	// than the run it was taken during. It is also what makes a reading taken
-	// AT the floor cover it.
-	antigravityObservedAtGrace = time.Second
 
 	antigravityFreshnessSchema = 1
 	// antigravityFreshnessEnv relocates the state file (tests isolate from the
@@ -301,18 +295,20 @@ func antigravityRebaseFutureFreshness(state *antigravityUsageFreshness, now time
 	}
 }
 
-// antigravityObservedAtCovers reports whether an RFC3339 observation time is at
-// or after a floor, within the one-second resolution of those timestamps. An
-// unparseable reading never covers anything.
-func antigravityObservedAtCovers(observedAt string, floorMs int64) bool {
+// antigravityObservedCovers reports whether a reading taken at observedMs
+// (antigravitySnapshotObservedMs) is at or after a floor. Exact, with no grace:
+// the floor a settle compares against is a run's COMPLETION, and a reading from
+// even a few milliseconds before it cannot hold the usage debited at the end of
+// that turn. Rounding a whole-second timestamp up to meet the floor is exactly
+// how a Refresh click just before completion used to pass as the run's own
+// reading; a reading only known to the second resolves to the start of it
+// instead, which can cost a refresh but never loses one. No reading (0) never
+// covers anything.
+func antigravityObservedCovers(observedMs, floorMs int64) bool {
 	if floorMs == 0 {
 		return true
 	}
-	at, err := time.Parse(time.RFC3339, observedAt)
-	if err != nil {
-		return false
-	}
-	return at.UnixMilli()+antigravityObservedAtGrace.Milliseconds() >= floorMs
+	return observedMs > 0 && observedMs >= floorMs
 }
 
 /* ───────────────────────────────── arm ───────────────────────────────── */
@@ -396,7 +392,7 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 	// reading for this run — a concurrent run's poller, a Refresh click, this
 	// poller's own tail — but only one taken at or after the completion holds
 	// the usage this run just spent.
-	covered := antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs)
+	covered := antigravityObservedCovers(cachedAntigravityObservedMs(), completionMs)
 	if !covered && capturedDuringRun && !gated {
 		covered = antigravityAwaitPostRunReading(completionMs)
 	}
@@ -462,7 +458,7 @@ func antigravityAwaitPostRunReading(completionMs int64) bool {
 	// a spin. antigravityCaptureTailEnv shrinks it where a test needs it short.
 	deadline := time.Now().Add(antigravityCaptureTailGraceValue() + antigravityPostRunReadingGrace)
 	for {
-		if antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs) {
+		if antigravityObservedCovers(cachedAntigravityObservedMs(), completionMs) {
 			return true
 		}
 		remaining := time.Until(deadline)
@@ -478,13 +474,12 @@ func antigravityAwaitPostRunReading(completionMs int64) bool {
 
 // settleAntigravityRunFreshness retires whatever a landed reading covers. It is
 // called from inside writeAntigravityQuotaSnapshotLocked — while the quota
-// cache lock is held — so it must never read the cache back.
-func settleAntigravityRunFreshness(observedAt string) {
-	at, err := time.Parse(time.RFC3339, observedAt)
-	if err != nil {
+// cache lock is held — so it must never read the cache back. observedMs is the
+// landed reading's instant (antigravitySnapshotObservedMs); 0 retires nothing.
+func settleAntigravityRunFreshness(observedMs int64) {
+	if observedMs <= 0 {
 		return
 	}
-	observedMs := at.UnixMilli() + antigravityObservedAtGrace.Milliseconds()
 	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		if state.RefreshOwedAtMs != 0 && observedMs >= state.RefreshOwedFloorMs {
 			state.RefreshOwedFloorMs, state.RefreshOwedAtMs = 0, 0
@@ -621,7 +616,8 @@ func antigravityRetireRunDebt(reason string) {
 // token_expired debt is KEPT (the next real run refreshes the keyring for free)
 // and only a no_login debt stops attempting, since nothing here can pay it.
 // The one child this can start is the bounded `<agy> --version` behind
-// antigravityCodeAssistBuildVersion's cache, and only on a cold cache.
+// antigravityCodeAssistBuildVersion's cache, only on a cold cache, and only
+// once the probe has found a usable stored login.
 func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -635,7 +631,7 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 		// Any route may have landed a reading since the settle: a concurrent
 		// run's poller, a Refresh click, or the poller's own 2 s tail on an
 		// ungated build.
-		if cached := cachedAntigravityObservedAt(); antigravityObservedAtCovers(cached, state.RefreshOwedFloorMs) {
+		if cached := cachedAntigravityObservedMs(); antigravityObservedCovers(cached, state.RefreshOwedFloorMs) {
 			settleAntigravityRunFreshness(cached)
 			return
 		}
@@ -665,7 +661,9 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
-		outcome := probeAntigravityQuotaCodeAssistFn(ctx, antigravityCodeAssistBuildVersion(""), antigravityUsageFreshnessNow)
+		// No version: the probe resolves it itself, and only once it knows a
+		// login exists, so a no_login debt never spawns `<agy> --version`.
+		outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
 		cancel()
 		antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
 		fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
@@ -817,7 +815,11 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	if state.Gated || state.Attempts < antigravityRefreshAfterRunMaxAttempts {
 		return "", true
 	}
-	if antigravityObservedAtCovers(lastObservedAt, state.RefreshOwedFloorMs) {
+	// Only the card's RFC3339 string is at hand here, so it resolves to the start
+	// of its second (antigravitySnapshotObservedMs): at worst a warning stays up
+	// for a reading taken within a second of the floor, never the reverse. The
+	// settle hook has the exact instant and retires such a debt anyway.
+	if antigravityObservedCovers(antigravitySnapshotObservedMs(antigravityQuotaSnapshot{ObservedAt: lastObservedAt}), state.RefreshOwedFloorMs) {
 		// The card is already showing a reading that covers the run; the debt
 		// is a bookkeeping leftover, not something to warn about.
 		return "", true

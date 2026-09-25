@@ -100,7 +100,15 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	// developer's real agent state, and wait out any worker a test left behind.
 	t.Setenv(antigravityFreshnessEnv, filepath.Join(t.TempDir(), "agy_freshness.json"))
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
-	t.Cleanup(antigravityUsageRefreshWaitIdle)
+	// The shipped 5 s retry delay would be paid by every case whose stub keeps
+	// the debt unpaid past its first read; the worker reads it, so it is
+	// restored only once the worker is out of flight.
+	origRetry := antigravityRefreshAfterRunRetryDelay
+	antigravityRefreshAfterRunRetryDelay = time.Millisecond
+	t.Cleanup(func() {
+		antigravityUsageRefreshWaitIdle()
+		antigravityRefreshAfterRunRetryDelay = origRetry
+	})
 	// A debt is retired WITHOUT an attempt when `agy` is not on the machine, so
 	// whether a capture test exercises the worker at all would otherwise depend
 	// on the developer happening to have the CLI installed — green on a dev box,
@@ -491,7 +499,7 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 		t.Fatalf("cache is not a JSON object: %v", err)
 	}
 	allowedTop := map[string]bool{
-		"schemaVersion": true, "observedAt": true, "accountFingerprint": true,
+		"schemaVersion": true, "observedAt": true, "observedAtMs": true, "accountFingerprint": true,
 		"account": true, "plan": true, "buckets": true,
 	}
 	for key := range decoded {

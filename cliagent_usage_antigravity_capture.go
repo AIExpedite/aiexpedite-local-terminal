@@ -192,7 +192,14 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 			// for the poller: the poller is ref-counted and exits only when the
 			// last armed run releases, so settling there would park a finished
 			// run's refresh behind a long interactive session sharing it.
+			// Counted in antigravityFreshnessInFlight like every other
+			// background write this feature owns: the settle can wait out the
+			// post-release tail, and a goroutine nobody can wait for would
+			// write the state file after its owner (a test's temp dir, or an
+			// agent shutting down) has already gone.
+			antigravityFreshnessInFlight.Add(1)
 			go func() {
+				defer antigravityFreshnessInFlight.Add(-1)
 				now := antigravityUsageFreshnessNow()
 				// The build's refusal is remembered per build, so the marker is
 				// the single source for "could the poller have captured this
@@ -448,11 +455,11 @@ func antigravityCapturePersist(snap antigravityQuotaSnapshot) (bool, string) {
 		return false, ""
 	}
 	antigravityCaptureSnapshots.Add(1)
-	if at, err := time.Parse(time.RFC3339, snap.ObservedAt); err == nil {
+	if observedMs := antigravitySnapshotObservedMs(snap); observedMs > 0 {
 		for {
 			prev := antigravityCaptureLastPersistedMs.Load()
-			if at.UnixMilli() <= prev ||
-				antigravityCaptureLastPersistedMs.CompareAndSwap(prev, at.UnixMilli()) {
+			if observedMs <= prev ||
+				antigravityCaptureLastPersistedMs.CompareAndSwap(prev, observedMs) {
 				break
 			}
 		}

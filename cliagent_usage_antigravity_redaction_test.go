@@ -86,7 +86,7 @@ func TestAntigravityClassify_MatchingPayloadNeverEscapes(t *testing.T) {
 		t.Fatalf("cache is not a JSON object: %v", err)
 	}
 	allowedTop := map[string]bool{
-		"schemaVersion": true, "observedAt": true, "accountFingerprint": true,
+		"schemaVersion": true, "observedAt": true, "observedAtMs": true, "accountFingerprint": true,
 		"account": true, "plan": true, "buckets": true,
 	}
 	for key := range decoded {

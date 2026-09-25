@@ -344,6 +344,12 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 // probeAntigravityQuotaCodeAssist reads the quota from Google with the stored
 // login and caches it under the account that login names. Returns a closed
 // outcome code.
+//
+// An empty version is resolved here (antigravityCodeAssistBuildVersion), and
+// only once a usable login is known to exist: that resolution can spawn
+// `<agy> --version` on a cold cache, and the two local refusals above it must
+// stay free — a debt nothing on this machine can pay (no login, an expired
+// token) never starts a child.
 func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now func() time.Time) string {
 	tok, ok := antigravityStoredToken(ctx)
 	if !ok {
@@ -352,6 +358,7 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	if !tok.Expiry.IsZero() && !now().Add(antigravityTokenExpirySkew).Before(tok.Expiry) {
 		return liveProbeOutcomeCodeAssistTokenExpired
 	}
+	version = antigravityCodeAssistBuildVersion(version)
 	client := antigravityCodeAssistClient()
 	defer client.CloseIdleConnections()
 

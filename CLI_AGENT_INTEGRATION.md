@@ -1173,8 +1173,15 @@ size: no rollout scanning, no cursor, one outbound read.
   still going (a Refresh click mid-run, an overlapping run's Code Assist read)
   does not contain this run's usage and must not count as coverage. The debt
   therefore asks for, and clears on, a reading
-  (`cachedAntigravityObservedAt`) at or after that completion, within
-  `antigravityObservedAtGrace = 1s` for the one-second resolution of RFC3339.
+  (`cachedAntigravityObservedMs`) taken at or after that completion, compared
+  EXACTLY. `observedAt` is RFC3339 seconds (the card's wire format), so the
+  cached snapshot also carries `observedAtMs` — local only, never on a metric —
+  and `antigravitySnapshotObservedMs` resolves a reading without it (cached by
+  an older agent) to the START of its second. No grace is added: rounding a
+  reading up to the next second is exactly how a Refresh click a few hundred
+  milliseconds before completion used to pass as the run's own reading. The
+  cache's newer-than guard orders two readings in the same second by the same
+  instant, so a post-completion reading is not refused as "not newer".
   `captured` (`antigravityCaptureLastPersistedMs`) is a hint that the poller
   reached a server while the run was going, and appears in the log line. It is
   never coverage by itself — that snapshot predates the turn's debit — but it
