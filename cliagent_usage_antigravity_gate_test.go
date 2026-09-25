@@ -193,7 +193,7 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 	helperIsolateAntigravityGate(t)
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	observed := "2026-09-12T03:04:14Z"
 	snap := antigravityQuotaSnapshot{

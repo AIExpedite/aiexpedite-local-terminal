@@ -73,7 +73,7 @@ func helperCodeAssistServers(t *testing.T, quota func(auth string) (int, string)
 	t.Cleanup(us.Close)
 	t.Setenv(antigravityCodeAssistURLEnv, qs.URL+"/v1internal:retrieveUserQuotaSummary")
 	t.Setenv(antigravityUserinfoURLEnv, us.URL+"/oauth2/v3/userinfo")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperIsolateAntigravityQuotaState(t, filepath.Join(t.TempDir(), "agyq.json"))
 	return &q, &u
 }
 
@@ -300,7 +300,7 @@ func TestAntigravityUsageParser_ReadingNewerThanTheGateHidesTheNotice(t *testing
 	helperIsolateAntigravityGate(t)
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 	now := time.Date(2026, 9, 15, 15, 0, 0, 0, time.UTC)
 	noteAntigravityQuotaGate("1.2.3", now.Add(-2*time.Hour))
 
@@ -367,7 +367,7 @@ func TestProbeAntigravityQuotaCodeAssist_IdentifiesItselfAsTheAntigravityClient(
 	t.Cleanup(us.Close)
 	t.Setenv(antigravityCodeAssistURLEnv, qs.URL+"/v1internal:retrieveUserQuotaSummary")
 	t.Setenv(antigravityUserinfoURLEnv, us.URL+"/oauth2/v3/userinfo")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperIsolateAntigravityQuotaState(t, filepath.Join(t.TempDir(), "agyq.json"))
 
 	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
 		t.Fatalf("outcome=%q, want ok", got)

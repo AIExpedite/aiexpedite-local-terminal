@@ -52,6 +52,23 @@ func helperAntigravityServer(t *testing.T, base, quotaJSON, statusJSON string) *
 	return srv
 }
 
+// helperIsolateAntigravityQuotaState points BOTH persisted antigravity quota
+// files — the reading cache and the run-completion freshness debt — at
+// test-owned paths.
+//
+// They travel together because the parser reads both: a debt left in the
+// suite-wide sandbox by ANY earlier test that spawned a classified `agy`
+// (antigravity_native_test.go's stub turns, the session and execute cases)
+// would otherwise reach a later parser test as a card notice, and as the
+// suppression of the missed-run report. That is an order-dependent input to a
+// test that never asked for one, which is exactly the flake this helper exists
+// to prevent.
+func helperIsolateAntigravityQuotaState(t *testing.T, cache string) {
+	t.Helper()
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	t.Setenv(antigravityFreshnessEnv, filepath.Join(t.TempDir(), "agy_freshness.json"))
+}
+
 func helperWriteAntigravityLog(t *testing.T, base, name, body string) {
 	t.Helper()
 	dir := antigravityLogDir(base)
@@ -153,7 +170,7 @@ func TestAntigravityUsageParser_DoesNotCacheQuotaWithoutServerIdentity(t *testin
 	home := t.TempDir()
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 	helperAntigravityServer(t, base, helperQuotaJSON, "") // GetUserStatus 500s
 	// A stale identity from a previous login, exactly what must NOT be adopted.
 	helperWriteJSON(t, filepath.Join(base, "settings.json"), map[string]any{
@@ -183,7 +200,7 @@ func TestAntigravityUsageParser_DoesNotCacheQuotaWithoutServerIdentity(t *testin
 // Even a cache left by an older build must not be replayed unscoped.
 func TestLoadAntigravityQuotaSnapshot_RefusesUnscopedCache(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 	body, _ := json.Marshal(antigravityQuotaSnapshot{
 		ObservedAt: "2026-08-11T09:00:00Z",
 		Buckets: []antigravityQuotaBucket{
@@ -326,7 +343,7 @@ func TestAntigravityQuotaMetrics_CapsSignedRefreshMetrics(t *testing.T) {
 func TestAntigravityUsageParser_ReplaysCachedSnapshotWhenServerIsDown(t *testing.T) {
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	observed := "2026-08-11T09:00:00Z"
 	snap := antigravityQuotaSnapshot{
@@ -365,7 +382,7 @@ func TestAntigravityUsageParser_ReplaysCachedSnapshotWhenServerIsDown(t *testing
 func TestAntigravityUsageParser_IgnoresCacheFromAnotherAccount(t *testing.T) {
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	snap := antigravityQuotaSnapshot{
 		ObservedAt:         "2026-08-11T09:00:00Z",
@@ -395,7 +412,7 @@ func TestAntigravityUsageParser_FreshReadOverwritesCache(t *testing.T) {
 	home := t.TempDir()
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 	helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
 
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
@@ -430,7 +447,7 @@ func TestAntigravityUsageParser_FreshReadOverwritesCache(t *testing.T) {
 func TestAntigravityUsageParser_ReplaysCacheUnderItsProducerWhenSettingsHasNoIdentity(t *testing.T) {
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	fingerprint := fingerprintAccount("antigravity", "ada@example.com")
 	body, _ := json.Marshal(antigravityQuotaSnapshot{
@@ -476,7 +493,7 @@ func TestAntigravityUsageParser_DoesNotReplayProducerCacheUnderAConflictingAccou
 	resetAntigravityLiveProducer(t)
 	home := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	body, _ := json.Marshal(antigravityQuotaSnapshot{
 		ObservedAt:         "2026-08-11T09:00:00Z",
@@ -580,7 +597,7 @@ func TestFetchAntigravityQuota_KeepsValidBucketsBesideMalformedOnes(t *testing.T
 // one writer truncate bytes another is about to rename into place.
 func TestSaveAntigravityQuotaSnapshot_ConcurrentWritesStayIntact(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
@@ -619,7 +636,7 @@ func TestSaveAntigravityQuotaSnapshot_ConcurrentWritesStayIntact(t *testing.T) {
 func TestAntigravityUsageParser_DiscoversQuotaFromLegacyInstall(t *testing.T) {
 	home := t.TempDir()
 	legacyBase := filepath.Join(home, ".agy")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperIsolateAntigravityQuotaState(t, filepath.Join(t.TempDir(), "agyq.json"))
 	// Legacy config selects the ~/.agy tree; its log names the live server.
 	helperWriteJSON(t, filepath.Join(legacyBase, "config.json"), map[string]any{})
 	helperAntigravityServer(t, legacyBase, helperQuotaJSON, helperStatusJSON)
@@ -645,7 +662,7 @@ func TestAntigravityUsageParser_DiscoversQuotaFromLegacyInstall(t *testing.T) {
 func TestAntigravityUsageParser_DiscoversQuotaWithoutASettingsFile(t *testing.T) {
 	home := t.TempDir()
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperIsolateAntigravityQuotaState(t, filepath.Join(t.TempDir(), "agyq.json"))
 	helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
 
 	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
@@ -662,7 +679,7 @@ func TestAntigravityUsageParser_DiscoversQuotaWithoutASettingsFile(t *testing.T)
 // started first must not be able to age the card backwards by finishing last.
 func TestSaveAntigravityQuotaSnapshotIfNewer_RefusesAnOlderReadingForTheSameAccount(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	fingerprint := fingerprintAccount("antigravity", "ada@example.com")
 	newer := antigravityQuotaSnapshot{
@@ -707,7 +724,7 @@ func TestSaveAntigravityQuotaSnapshotIfNewer_RefusesAnOlderReadingForTheSameAcco
 // newly signed-in account's figure must land regardless of timestamps.
 func TestSaveAntigravityQuotaSnapshotIfNewer_AlwaysAcceptsADifferentAccount(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	saveAntigravityQuotaSnapshot(antigravityQuotaSnapshot{
 		ObservedAt:         "2026-08-28T06:00:00Z",
@@ -816,7 +833,7 @@ func TestAntigravityPortsInLog_OrdersByPositionNotPattern(t *testing.T) {
 // the version is diagnostic metadata, never a gate.
 func TestReadAntigravityQuotaCache_AcceptsAnUnknownSchemaVersion(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 	body := `{"schemaVersion":99,"observedAt":"2026-08-28T06:00:00Z",
 	  "accountFingerprint":"` + fingerprintAccount("antigravity", "ada@example.com") + `",
 	  "account":"ada@example.com","plan":"Pro","somethingNewer":{"x":1},
@@ -884,7 +901,7 @@ func TestSanitizeAntigravityQuotaSnapshot_DropsUnplottableRowsAndClampsStrings(t
 // would destroy a good previous reading for no gain.
 func TestSaveAntigravityQuotaSnapshot_RefusesASnapshotWithNoPlottableBucket(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "agyq.json")
-	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperIsolateAntigravityQuotaState(t, cache)
 
 	saveAntigravityQuotaSnapshot(antigravityQuotaSnapshot{
 		ObservedAt:         "2026-08-28T06:00:00Z",
