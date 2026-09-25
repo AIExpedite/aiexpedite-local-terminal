@@ -39,10 +39,13 @@ func helperIsolateAntigravityFreshness(t *testing.T) (state, cache string) {
 	return state, cache
 }
 
-// helperFakeAgyOnPath puts a trivial `agy` that answers `--version` first on
-// PATH. Deliberately not helperMockAgyOnPath: that copies the whole test binary
-// (tens of MB) per call, which these cases pay for nothing — none of them needs
-// the mock CLI's behaviour, only for the CLI to exist and name a build.
+// helperFakeAgyOnPath puts a trivial `agy` first on PATH so the CLI looks
+// installed and a debt is not retired before it can be paid. Deliberately not
+// helperMockAgyOnPath: that copies the whole test binary (tens of MB) per call,
+// which these cases pay for nothing — none of them spawns `agy`, and the debt
+// worker only asks whether it EXISTS. A case that needs the version probe to
+// answer must use the real mock binary instead: Windows cannot CreateProcess
+// the `.cmd` written here.
 func helperFakeAgyOnPath(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -605,6 +608,12 @@ func TestAntigravityFreshness_StateFileCarriesNothingIdentifying(t *testing.T) {
 // identifies itself as comes from the same cached probe detection uses.
 func TestAntigravityCodeAssistBuildVersion_FallsBackToTheInstalledBinary(t *testing.T) {
 	helperIsolateAntigravityFreshness(t)
+	// The one case that needs a REAL executable: helperFakeAgyOnPath's shell
+	// script is enough for "is agy installed", but Windows cannot CreateProcess
+	// a .cmd directly (the same reason grokProbeVersion exists), so the probe
+	// would answer "" there and this assertion would pass only on Unix. The
+	// mock binary is a genuine .exe on every platform.
+	helperMockAgyOnPath(t, "antigravity-diagnostic")
 	if got := antigravityCodeAssistBuildVersion("1.2.4"); got != "1.2.4" {
 		t.Errorf("version=%q, want the detected one kept", got)
 	}

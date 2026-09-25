@@ -549,7 +549,14 @@ func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAg
 // the build the same way the click does: the detected version when there is
 // one, otherwise the same cached `--version` probe detection itself ran, which
 // is a cache hit on any machine that has gathered usage since the CLI was
-// installed. Never a spawn of `agy` itself.
+// installed.
+//
+// On a COLD cache (a fresh process paying a debt before the first gather, or an
+// `agy` update that changed the binary) that probe does start one short-lived
+// `<agy> --version` child, bounded by machineInfoProbeTimeout — and it warms the
+// cache the gather would have filled seconds later anyway. That is the only
+// child any of this starts: never a model turn, and never the `agy models`
+// warm-up the Refresh click may run.
 func antigravityCodeAssistBuildVersion(version string) string {
 	if v := strings.TrimSpace(version); v != "" {
 		return v

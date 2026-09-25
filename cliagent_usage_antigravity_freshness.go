@@ -404,11 +404,13 @@ func antigravityRetireRunDebt(reason string) {
 // previous outbound read by antigravityRefreshMinInterval; a retry within one
 // debt bypasses that interval, because it is the same unpaid run.
 //
-// It never spawns `agy`. The Refresh click may run the `agy models` warm-up to
-// make the CLI refresh its own keyring token; doing that behind the user's back
-// on run teardown is a different class of side effect, so a token_expired debt
-// is KEPT (the next real run refreshes the keyring for free) and only a
-// no_login debt stops attempting, since nothing here can pay it.
+// It never runs a model turn. The Refresh click may run the `agy models`
+// warm-up to make the CLI refresh its own keyring token; doing that behind the
+// user's back on run teardown is a different class of side effect, so a
+// token_expired debt is KEPT (the next real run refreshes the keyring for free)
+// and only a no_login debt stops attempting, since nothing here can pay it.
+// The one child this can start is the bounded `<agy> --version` behind
+// antigravityCodeAssistBuildVersion's cache, and only on a cold cache.
 func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {

@@ -1185,13 +1185,17 @@ size: no rollout scanning, no cursor, one outbound read.
   does not go through this worker, so a user-initiated refresh is never
   throttled by it. **Ceiling: one outbound call per minute, whatever the run
   volume** — 200 short runs in an hour still spend at most 60.
-- **It never spawns `agy`.** The click may run the `agy models` warm-up to make
-  the CLI refresh its own keyring token; doing that behind the user's back on
-  run teardown is a different class of side effect. So `codeassist_token_expired`
+- **It never runs a model turn.** The click may run the `agy models` warm-up to
+  make the CLI refresh its own keyring token; doing that behind the user's back
+  on run teardown is a different class of side effect. So `codeassist_token_expired`
   KEEPS the debt and its budget (the next real run refreshes the keyring for
   free) and only `codeassist_no_login` stops attempting. The build the request
   identifies itself as comes from `antigravityCodeAssistBuildVersion` — the same
-  cached `--version` detection already ran, shared with the click.
+  cached `--version` detection already ran, shared with the click; on a cold
+  cache that is one short `<agy> --version` child (bounded by
+  `machineInfoProbeTimeout`), which warms the cache the next gather needs. An
+  unresolvable build is fine: `antigravityCodeAssistUserAgent` falls back to the
+  pinned build the licence rule was verified on.
 - **Skipped entirely while offline** (`IsOffline`): an offline agent makes no
   outbound request, and the debt waits for the next run rather than retiring,
   because offline is temporary. An **uninstalled** `agy` retires it without an
