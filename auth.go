@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -70,6 +71,39 @@ type WIFTokenSource struct {
 	// singleflight collapses them into a single HTTP round-trip and shares
 	// the result, preventing a thundering herd of WIF refresh calls.
 	sfg singleflight.Group
+}
+
+// tokenSourceAwaitingMachineInfo is the token source whose last /auth/token
+// request went out before the first machine-info gather finished, or nil.
+//
+// terminal-service starts a newly paired computer's automatic onboarding
+// (readiness inspection -> repository discovery -> enablement) only from a
+// token request that carries a machine-info baseline. The first request after
+// pairing races the startup gather, and on Windows the gather (dozens of
+// version probes plus every CLI's usage parser) routinely loses -- so the
+// computer sat at "new" with nothing started until the next token refresh,
+// up to an hour later (prod AIX3, 2026-09-25).
+var tokenSourceAwaitingMachineInfo atomic.Pointer[WIFTokenSource]
+
+// resendTokenRequestWithMachineInfo repeats the /auth/token request of a token
+// source that sent one without machine info, now that the cache is populated.
+// Only the request's side effect matters (the backend records the machine and
+// may start onboarding); the returned ID token is discarded, and the cached
+// access token is left alone. At most one re-send per bare request.
+func resendTokenRequestWithMachineInfo() {
+	ts := tokenSourceAwaitingMachineInfo.Swap(nil)
+	if ts == nil {
+		return
+	}
+	go func() {
+		if _, err := ts.getOIDCToken(); err != nil {
+			fmt.Printf("[auth] Re-sending the token request with machine info failed: %v\n", err)
+		}
+	}()
+}
+
+func init() {
+	onMachineInfoStored = resendTokenRequestWithMachineInfo
 }
 
 // NewWIFTokenSource creates a new token source for Workload Identity Federation.
@@ -195,7 +229,16 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	// goroutine returns). In that case we send the request without these
 	// fields and terminal-service falls back to the legacy workspace
 	// systemInfo path.
-	if mi := GetMachineInfo(); mi != nil {
+	mi := GetMachineInfo()
+	if mi == nil {
+		// Remembered so the first completed gather re-sends this request with
+		// the machine info (see resendTokenRequestWithMachineInfo).
+		tokenSourceAwaitingMachineInfo.Store(ts)
+	} else {
+		// This request carries it, so an earlier bare one needs no re-send.
+		tokenSourceAwaitingMachineInfo.CompareAndSwap(ts, nil)
+	}
+	if mi != nil {
 		payload["architecture"] = mi.Architecture
 		if mi.CPU != nil {
 			payload["cpu"] = mi.CPU

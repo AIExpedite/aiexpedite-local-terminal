@@ -295,9 +295,7 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	case info := <-done:
 		// Keep the shared cache fresh so the next /auth/token POST reflects
 		// what the user just saw in the readiness card.
-		machineInfoMu.Lock()
-		machineInfoCache = info
-		machineInfoMu.Unlock()
+		storeMachineInfo(info)
 		return evaluateReadiness(info)
 	case <-ctx.Done():
 		return evaluateReadiness(nil)
