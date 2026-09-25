@@ -100,6 +100,12 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	t.Setenv(antigravityFreshnessEnv, filepath.Join(t.TempDir(), "agy_freshness.json"))
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
 	t.Cleanup(antigravityUsageRefreshWaitIdle)
+	// A debt is retired WITHOUT an attempt when `agy` is not on the machine, so
+	// whether a capture test exercises the worker at all would otherwise depend
+	// on the developer happening to have the CLI installed — green on a dev box,
+	// red on every CI runner. Same seam as helperIsolateAntigravityFreshness; a
+	// case that needs `agy` to look GONE overrides PATH itself.
+	helperFakeAgyOnPath(t)
 
 	home = t.TempDir()
 	t.Setenv("HOME", home)
