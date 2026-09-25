@@ -1205,7 +1205,13 @@ size: no rollout scanning, no cursor, one outbound read.
   agent's data dir; `AIEXPEDITE_AGY_FRESHNESS` relocates it), so `StartAgent`'s
   `payOwedAntigravityUsageRefresh` pays ONE bounded read for a run the previous
   process never settled (crash, restart, self-update) — placed after `isOffline`
-  is published so the first attempt honours offline mode. A floor further than
+  is published so the first attempt honours offline mode, and run entirely off
+  the boot goroutine. It adopts only a floor stamped BEFORE that call's own
+  instant: the replay is spawned, so a session of this process can arm first,
+  and converting a live run's floor would book a completion time for a run
+  still going — the reading it triggered, taken at the run's start, would then
+  satisfy that run's own settle and leave it with no refresh at all.
+  (`codexOweInterruptedRun` guards the same race with `armedLocally`.) A floor further than
   `antigravityRunFloorLocalSkew` (30 s) ahead of `now` is a clock rollback and is
   discarded rather than parked in the future; a debt older than
   `antigravityRefreshOwedMaxAge` (30 min) retires, so an unpayable one can never

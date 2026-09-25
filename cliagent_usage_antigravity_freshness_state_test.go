@@ -475,6 +475,38 @@ func TestPayOwedAntigravityUsageRefresh_SkipsWhatItCannotOrNeedNotPay(t *testing
 		}
 	})
 
+	t.Run("a floor a run of THIS process armed", func(t *testing.T) {
+		_, cache := helperIsolateAntigravityFreshness(t)
+		now := time.Now()
+		helperWriteAntigravityCache(t, cache, now.Add(-time.Hour))
+		calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistOK })
+
+		// The replay is spawned, so a session can arm between StartAgent asking
+		// and the goroutine reading its state. Pin that ordering rather than
+		// racing it: a floor stamped after this call's own instant is a run
+		// this process armed. Converting it would book a completion time for a
+		// run that is still going, and the reading it triggered — taken at the
+		// run's START — would then satisfy the run's own settle, leaving the
+		// finished run with no refresh at all.
+		helperWriteJSON(t, antigravityFreshnessPath(), antigravityUsageFreshness{
+			SchemaVersion: antigravityFreshnessSchema,
+			RunFloorMs:    now.Add(500 * time.Millisecond).UnixMilli(),
+		})
+		payOwedAntigravityUsageRefresh()
+		antigravityUsageRefreshWaitIdle()
+
+		if calls.Load() != 0 {
+			t.Errorf("reads=%d, want none for a run that is still running", calls.Load())
+		}
+		state := helperFreshnessState(t)
+		if state.RefreshOwedAtMs != 0 {
+			t.Errorf("state=%+v, want a live run's floor left to its own settle", state)
+		}
+		if state.RunFloorMs == 0 {
+			t.Error("the live run's floor was dropped")
+		}
+	})
+
 	t.Run("a floor a reading already covers", func(t *testing.T) {
 		_, cache := helperIsolateAntigravityFreshness(t)
 		now := time.Now()

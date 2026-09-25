@@ -343,10 +343,14 @@ func settleAntigravityRunFreshness(observedAt string) {
 // once: a second settle while one is in flight is a no-op, because the debt it
 // would pay is the one already being paid.
 func antigravityStartRunDebtWorker(maxAttempts int, bypassInterval bool) {
+	// Counted BEFORE the claim: a waiter that sampled the counter between a
+	// successful claim and the increment would read "idle" while a worker is
+	// about to run.
+	antigravityFreshnessInFlight.Add(1)
 	if !antigravityRefreshWorkerBusy.CompareAndSwap(false, true) {
+		antigravityFreshnessInFlight.Add(-1)
 		return
 	}
-	antigravityFreshnessInFlight.Add(1)
 	go func() {
 		defer antigravityFreshnessInFlight.Add(-1)
 		defer antigravityRefreshWorkerBusy.Store(false)
@@ -510,16 +514,43 @@ func antigravityRecordRefreshAttempt(outcome string, now time.Time) {
 //
 // Asynchronous and best-effort — StartAgent must never wait on it.
 func payOwedAntigravityUsageRefresh() {
+	// Sampled on the CALLER's goroutine, before anything of this process can
+	// have armed: every floor below it belongs to the process that is gone.
+	startedAt := antigravityUsageFreshnessNow()
+	antigravityFreshnessInFlight.Add(1)
+	go func() {
+		defer antigravityFreshnessInFlight.Add(-1)
+		adoptAndPayOwedAntigravityRunDebt(startedAt)
+	}()
+}
+
+// adoptAndPayOwedAntigravityRunDebt is payOwedAntigravityUsageRefresh's body,
+// off the boot goroutine: it reads the state file, the gate marker and — through
+// the worker — the quota cache, and StartAgent must wait on none of them.
+//
+// startedAt is the instant the boot goroutine asked, and it is what makes a
+// bare floor safe to convert: this replay is spawned, so a session of THIS
+// process can arm and persist its own floor before it gets here. Converting
+// that floor would book a completion time for a run that is still going — the
+// reading it triggers would be taken at the run's START and would then satisfy
+// the run's own settle, so the run would end with no refresh at all. The live
+// run's settle path owes it a refresh when it finishes; leave the floor to it.
+// (codexOweInterruptedRun guards the same race with codexUsageRefresh.armedLocally.)
+func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
 	now := antigravityUsageFreshnessNow()
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
 		if state.RefreshOwedAtMs != 0 || state.RunFloorMs == 0 {
 			return
 		}
+		if state.RunFloorMs >= startedAt.UnixMilli() {
+			// A run this process armed: not interrupted, still going.
+			return
+		}
 		// A floor with no debt beside it is a run THIS process cannot be
-		// running (nothing has armed yet at startup), so its owner was cut off.
-		// Convert it into a debt completed now: the age-out and the notice both
-		// need a completion time, and a merely-armed floor is never refreshed.
+		// running, so its owner was cut off. Convert it into a debt completed
+		// now: the age-out and the notice both need a completion time, and a
+		// merely-armed floor is never refreshed.
 		if now.Sub(time.UnixMilli(state.RunFloorMs)) > antigravityRefreshOwedMaxAge {
 			state.RunFloorMs = 0
 			return
