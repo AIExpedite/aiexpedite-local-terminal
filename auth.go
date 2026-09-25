@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -70,6 +71,44 @@ type WIFTokenSource struct {
 	// singleflight collapses them into a single HTTP round-trip and shares
 	// the result, preventing a thundering herd of WIF refresh calls.
 	sfg singleflight.Group
+}
+
+// tokenSourceAwaitingMachineInfo is the token source whose last /auth/token
+// request went out before the first machine-info gather finished, or nil.
+//
+// terminal-service starts a newly paired computer's automatic onboarding
+// (readiness inspection -> repository discovery -> enablement) only from a
+// token request that carries a machine-info baseline. The first request after
+// pairing races the startup gather, and on Windows the gather (dozens of
+// version probes plus every CLI's usage parser) routinely loses -- so the
+// computer sat at "new" with nothing started until the next token refresh,
+// up to an hour later (prod AIX3, 2026-09-25).
+var tokenSourceAwaitingMachineInfo atomic.Pointer[WIFTokenSource]
+
+// testHookAfterMachineInfoRead runs in getOIDCToken right after the cache read,
+// where a gather landing after a nil read used to be lost. Test seam only;
+// always nil in production.
+var testHookAfterMachineInfoRead func()
+
+// resendTokenRequestWithMachineInfo repeats the /auth/token request of a token
+// source that sent one without machine info, now that the cache is populated.
+// Only the request's side effect matters (the backend records the machine and
+// may start onboarding); the returned ID token is discarded, and the cached
+// access token is left alone. At most one re-send per bare request.
+func resendTokenRequestWithMachineInfo() {
+	ts := tokenSourceAwaitingMachineInfo.Swap(nil)
+	if ts == nil {
+		return
+	}
+	go func() {
+		if _, err := ts.getOIDCToken(); err != nil {
+			fmt.Printf("[auth] Re-sending the token request with machine info failed: %v\n", err)
+		}
+	}()
+}
+
+func init() {
+	onMachineInfoStored = resendTokenRequestWithMachineInfo
 }
 
 // NewWIFTokenSource creates a new token source for Workload Identity Federation.
@@ -195,7 +234,24 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	// goroutine returns). In that case we send the request without these
 	// fields and terminal-service falls back to the legacy workspace
 	// systemInfo path.
-	if mi := GetMachineInfo(); mi != nil {
+	// Arm the re-send BEFORE reading the cache. Arming after a nil read left a
+	// lost-wakeup window: a gather landing between the read and the arm found
+	// nothing pending, this request still went out bare, and nothing re-sent it
+	// until the next gather hours later. Armed first, a gather that lands at
+	// any point after this line either shows up in the read below (and the arm
+	// is withdrawn) or finds the arm and re-sends (see
+	// resendTokenRequestWithMachineInfo); at worst both, which is one spare
+	// request.
+	tokenSourceAwaitingMachineInfo.Store(ts)
+	mi := GetMachineInfo()
+	if testHookAfterMachineInfoRead != nil {
+		testHookAfterMachineInfoRead()
+	}
+	if mi != nil {
+		// This request carries it, so no re-send is needed.
+		tokenSourceAwaitingMachineInfo.CompareAndSwap(ts, nil)
+	}
+	if mi != nil {
 		payload["architecture"] = mi.Architecture
 		if mi.CPU != nil {
 			payload["cpu"] = mi.CPU

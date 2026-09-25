@@ -214,11 +214,25 @@ func SetCachedCLIAgents(usage []cliAgentUsage) {
 // The 6h periodic gather started by StartMachineInfoGathering remains
 // the source of truth for the full MachineInfo cache.
 func RefreshMachineInfoNow() {
-	info := gatherMachineInfo()
+	storeMachineInfo(gatherMachineInfo())
+}
+
+// storeMachineInfo replaces the cached MachineInfo. Every writer goes through
+// it so a token request that went out before the first gather finished is
+// re-sent with the data as soon as ANY gather lands.
+func storeMachineInfo(info *MachineInfo) {
 	machineInfoMu.Lock()
 	machineInfoCache = info
 	machineInfoMu.Unlock()
+	if info != nil && onMachineInfoStored != nil {
+		onMachineInfoStored()
+	}
 }
+
+// onMachineInfoStored runs after a gather lands in the cache. It is wired in
+// auth.go's init() rather than called directly: a direct call would close a
+// package-initialization cycle through refreshMachineInfoAfterCatalogUpdate.
+var onMachineInfoStored func()
 
 // machineInfoGathersInFlight counts full machine gathers running on a
 // background goroutine. A gather is not cancellable once started —
@@ -270,15 +284,13 @@ func drainMachineInfoGathers(timeout time.Duration) bool {
 // populates the cache. Safe to call once at startup; the loop runs for the
 // process lifetime, refreshing every machineInfoRefreshInterval.
 //
-// First gather runs immediately (not after the first sleep), so within a
-// few seconds of agent start the first /auth/token refresh has full data.
+// First gather runs immediately (not after the first sleep). It usually beats
+// the first /auth/token request; when it does not, storeMachineInfo re-sends
+// that request once the data exists.
 func StartMachineInfoGathering() {
 	go func() {
 		for {
-			info := gatherMachineInfo()
-			machineInfoMu.Lock()
-			machineInfoCache = info
-			machineInfoMu.Unlock()
+			storeMachineInfo(gatherMachineInfo())
 			time.Sleep(machineInfoRefreshInterval)
 		}
 	}()
