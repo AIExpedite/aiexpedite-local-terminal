@@ -77,12 +77,19 @@ func helperWriteAntigravityCache(t *testing.T, cache string, at time.Time) {
 	helperWriteJSON(t, cache, snap)
 }
 
-// A reading older than the run's floor leaves the debt standing; one at the
-// floor retires it. The boundary is the whole settle decision — a flag would
-// have made a pre-run reading look like the run's own.
-func TestAntigravityFreshness_ReadingClearsOnlyAtOrAfterTheFloor(t *testing.T) {
+// Only a reading taken at or after the run COMPLETED retires the debt. A
+// turn's quota is debited at the end of the turn, so a snapshot taken while the
+// run was still going — a Refresh click mid-run, or an overlapping run's Code
+// Assist read — does not contain this run's usage and must not be mistaken for
+// coverage. The boundary is the whole settle decision; a flag would have made
+// any newer reading look like the run's own.
+func TestAntigravityFreshness_ReadingClearsOnlyAtOrAfterTheRunCompleted(t *testing.T) {
 	_, cache := helperIsolateAntigravityFreshness(t)
 	floor := time.Now().Truncate(time.Second)
+	// A run that took a minute, so "during the run" and "after the run" are
+	// distinguishable instants rather than the same millisecond.
+	completed := floor.Add(time.Minute)
+	antigravityUsageFreshnessNow = func() time.Time { return completed }
 
 	for _, tc := range []struct {
 		name      string
@@ -90,8 +97,10 @@ func TestAntigravityFreshness_ReadingClearsOnlyAtOrAfterTheFloor(t *testing.T) {
 		wantOwing bool
 	}{
 		{"a reading from before the run", floor.Add(-time.Minute), true},
-		{"a reading at exactly the floor", floor, false},
-		{"a reading from during the run", floor.Add(30 * time.Second), false},
+		{"a reading at exactly the run's start", floor, true},
+		{"a reading from during the run", floor.Add(30 * time.Second), true},
+		{"a reading at exactly the completion", completed, false},
+		{"a reading from after the run", completed.Add(30 * time.Second), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_ = os.Remove(antigravityFreshnessPath())
@@ -291,8 +300,10 @@ func TestAntigravityFreshness_ARunSettlingDuringTheStartupReplayIsStillPaid(t *t
 	antigravityUsageRefreshWaitIdle()
 
 	state := helperFreshnessState(t)
-	if state.RefreshOwedFloorMs != runFloor.UnixMilli() {
-		t.Fatalf("owed floor=%d, want the finished run's %d", state.RefreshOwedFloorMs, runFloor.UnixMilli())
+	// The debt asks for a reading covering the run's COMPLETION, which is at or
+	// after the floor it armed — never the older, adopted floor.
+	if state.RefreshOwedFloorMs < runFloor.UnixMilli() {
+		t.Fatalf("owed floor=%d, want the finished run's completion (>= %d)", state.RefreshOwedFloorMs, runFloor.UnixMilli())
 	}
 	// One read for the adopted debt, then the finished run's OWN budget — not
 	// one read total with the run left stranded until the age-out.
@@ -334,8 +345,8 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 	antigravityUsageRefreshWaitIdle()
 
 	state := helperFreshnessState(t)
-	if state.RefreshOwedFloorMs != second.UnixMilli() {
-		t.Fatalf("owed floor=%d, want the newer run's %d", state.RefreshOwedFloorMs, second.UnixMilli())
+	if state.RefreshOwedFloorMs < second.UnixMilli() {
+		t.Fatalf("owed floor=%d, want the newer run's completion (>= %d)", state.RefreshOwedFloorMs, second.UnixMilli())
 	}
 	// The in-flight read belonged to the first generation, so the second run
 	// still owes — and gets — a full budget of its own.
@@ -742,5 +753,50 @@ func TestAntigravityCodeAssistBuildVersion_FallsBackToTheInstalledBinary(t *test
 	// sent with Go's default header.
 	if ua := antigravityCodeAssistUserAgent(""); !strings.HasPrefix(ua, "antigravity/cli/") {
 		t.Errorf("user agent=%q", ua)
+	}
+}
+
+// The state file is the SOLE crash-recovery record, so it is replaced
+// atomically: a truncate-in-place the agent is killed or self-replaced in the
+// middle of would leave invalid JSON, which reads back as "no debt" and loses
+// the very floor this file exists to carry across an interruption. Asserts the
+// bytes on disk after every rewrite — the observable the reader depends on —
+// and that no intermediate file is left behind for the next start to trip over.
+func TestAntigravityFreshness_StateFileIsReplacedAtomically(t *testing.T) {
+	state, _ := helperIsolateAntigravityFreshness(t)
+	now := time.Now()
+
+	for i, owed := range []int64{
+		now.Add(-5 * time.Minute).UnixMilli(),
+		now.Add(-4 * time.Minute).UnixMilli(),
+		now.Add(-3 * time.Minute).UnixMilli(),
+	} {
+		updateAntigravityUsageFreshness(func(s *antigravityUsageFreshness) {
+			s.RefreshOwedFloorMs, s.RefreshOwedAtMs = owed, owed
+			s.Attempts = i
+		})
+		// Every rewrite leaves a COMPLETE document behind, never a truncated
+		// one: the reader treats a partial file as no debt at all.
+		body, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatalf("read state: %v", err)
+		}
+		var decoded antigravityUsageFreshness
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatalf("state file is not valid JSON after rewrite %d: %v (%q)", i, err, body)
+		}
+		if decoded.RefreshOwedFloorMs != owed {
+			t.Fatalf("owed floor=%d, want %d", decoded.RefreshOwedFloorMs, owed)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(state))
+	if err != nil {
+		t.Fatalf("read state dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp.") {
+			t.Errorf("intermediate file left behind: %s", entry.Name())
+		}
 	}
 }

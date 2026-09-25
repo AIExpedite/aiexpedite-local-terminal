@@ -22,8 +22,10 @@
 //   - Arm: a run start persists RunFloorMs (armAntigravityUsageRunFloor) and
 //     hands that run its own floor.
 //   - Settle: run completion (antigravityUsageRunSettled) compares the CACHED
-//     reading against that floor — never a flag — and, when nothing covers it,
-//     persists the debt and hands it to a bounded single-flight worker.
+//     reading against the run's COMPLETION — never a flag, and never merely the
+//     run's start, since a turn's quota is debited at its end — and, when
+//     nothing covers it, persists the debt and hands it to a bounded
+//     single-flight worker.
 //   - Clear: settleAntigravityRunFreshness runs inside
 //     writeAntigravityQuotaSnapshotLocked, so ANY route that lands a reading at
 //     or after the floor (in-run loopback, Code Assist, a Refresh click, a
@@ -107,8 +109,10 @@ var (
 // monotonic guard. antigravity_quota_gate.json is the precedent.
 type antigravityUsageFreshness struct {
 	SchemaVersion int `json:"schemaVersion,omitempty"`
-	// RunFloorMs is the newest armed run's start. A restart adopts it for a run
-	// nobody settled; each run's own settle uses the floor its arm returned.
+	// RunFloorMs is the newest floor anything owes a reading for: an armed run's
+	// start, or a settled run's completion once that is later. A restart adopts
+	// it for a run nobody settled; each run's own settle uses the floor its arm
+	// returned.
 	RunFloorMs int64 `json:"runFloorMs,omitempty"`
 	// RefreshOwedFloorMs is the observation time an unpaid run needs covered,
 	// and RefreshOwedAtMs when that run finished (0 = nothing owed).
@@ -182,6 +186,15 @@ func readAntigravityUsageFreshnessLocked() antigravityUsageFreshness {
 // writeAntigravityUsageFreshnessLocked persists the state, removing the file
 // once nothing is left to remember. Best-effort: a read-only data dir costs a
 // refresh, never a run.
+//
+// The replacement is temp-file + rename, exactly as
+// writeAntigravityQuotaSnapshotLocked does it, because this is the SOLE
+// crash-recovery record: a truncate-in-place the agent is killed or
+// self-replaced in the middle of would leave invalid JSON, which
+// readAntigravityUsageFreshnessLocked reads as "no debt" — losing the run floor
+// this file exists to carry across exactly that kind of interruption. The
+// pid+nanosecond suffix keeps two writers (or a stale temp from a crashed run)
+// off the same intermediate file.
 func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 	path := antigravityFreshnessPath()
 	if path == "" {
@@ -197,7 +210,13 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	_ = os.WriteFile(path, body, 0o600)
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+	}
 }
 
 // updateAntigravityUsageFreshness applies mutate to the persisted state under
@@ -279,9 +298,20 @@ func armAntigravityUsageRunFloor(now time.Time) time.Time {
 // antigravityUsageRunSettled decides, when one `agy` run ends, whether the
 // agent owes a refresh for it.
 //
-// capturedSinceFloor is a HINT (the last snapshot the capture path persisted):
-// it makes the common ungated case cheap. The decision itself is always a time
-// comparison against this run's own floor.
+// The requirement is a reading taken at or after this run COMPLETED, not one
+// merely newer than its start: a turn's quota is debited at the END of the turn
+// (antigravityCaptureTailGrace in cliagent_usage_antigravity_capture.go), so a
+// snapshot taken while the run was still going — a Refresh click mid-run, or an
+// overlapping run's Code Assist read — does not contain this run's usage, and
+// treating it as coverage would leave that usage unobserved until some later
+// run happened to owe a debt.
+//
+// capturedSinceFloor is a HINT (the last snapshot the capture path persisted
+// for this run): it makes the ungated case cheap and keeps it debt-free, which
+// is honest there because the poller's own tail grace deliberately outlives the
+// run and lands the post-completion reading in the cache. On a gated build the
+// poller captures nothing, so there is no such tail and the decision below is
+// what covers the run.
 //
 // gated says the run's build refused loopback reads, so the debt goes straight
 // to the Code Assist route instead of a retry the build will refuse, and the
@@ -295,12 +325,21 @@ func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool)
 		return
 	}
 	now := antigravityUsageFreshnessNow()
-	floorMs := floor.UnixMilli()
+	// The run is over, so the reading that covers it is one taken at or after
+	// this instant — never one taken while the run was still accruing usage.
+	// The completion is also what the debt asks for, so the payment's own
+	// cached-reading check and settleAntigravityRunFreshness agree with it.
+	completionMs := now.UnixMilli()
+	if completionMs < floor.UnixMilli() {
+		// A clock stepped backwards between arm and settle: the run's own start
+		// is the most honest floor left.
+		completionMs = floor.UnixMilli()
+	}
 
 	if !capturedSinceFloor {
 		// The authoritative check: any route may have landed a reading for this
 		// run, including a concurrent run's poller.
-		capturedSinceFloor = antigravityObservedAtCovers(cachedAntigravityObservedAt(), floorMs)
+		capturedSinceFloor = antigravityObservedAtCovers(cachedAntigravityObservedAt(), completionMs)
 	}
 	if capturedSinceFloor {
 		// A reading covers this run, and the write that landed it already
@@ -313,7 +352,7 @@ func antigravityUsageRunSettled(floor time.Time, capturedSinceFloor, gated bool)
 
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
-		owedFloorMs := floorMs
+		owedFloorMs := completionMs
 		if state.RefreshOwedFloorMs > owedFloorMs {
 			// One pending debt at a time: a reading that covers the newest
 			// floor covers every earlier one.
@@ -688,7 +727,7 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	if state.Outcome == liveProbeOutcomeCodeAssistNoLogin {
 		cause = "No Antigravity login is stored on this device, so no reading can be taken; sign in with the CLI to restore it."
 	}
-	notice := fmt.Sprintf("%s, before the most recent Antigravity run started (%s). %s",
+	notice := fmt.Sprintf("%s, before the most recent Antigravity run finished (%s). %s",
 		last, time.UnixMilli(state.RefreshOwedFloorMs).UTC().Format(layout), cause)
 	return clampASCII(notice, antigravityFreshnessNoticeLimit), true
 }

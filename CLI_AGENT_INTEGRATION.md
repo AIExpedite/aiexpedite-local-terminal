@@ -1167,11 +1167,19 @@ size: no rollout scanning, no cursor, one outbound read.
   wait for the poller: the poller is refcounted and exits only when the LAST
   armed run releases, so settling there would park a finished run's refresh
   behind a long interactive session sharing it. The decision is a time
-  comparison against that run's own floor, never a flag — the debt clears only
-  when the cached reading (`cachedAntigravityObservedAt`) covers it, within
+  comparison, never a flag — and the instant compared against is the run's
+  **completion**, not its start: a turn's quota is debited at the END of the
+  turn (`antigravityCaptureTailGrace`), so a snapshot taken while the run was
+  still going (a Refresh click mid-run, an overlapping run's Code Assist read)
+  does not contain this run's usage and must not count as coverage. The debt
+  therefore asks for, and clears on, a reading
+  (`cachedAntigravityObservedAt`) at or after that completion, within
   `antigravityObservedAtGrace = 1s` for the one-second resolution of RFC3339.
   `captured` is a hint (`antigravityCaptureLastPersistedMs`) that makes the
-  ungated case cheap and appears in the log line.
+  ungated case cheap and appears in the log line; it is honest there because
+  the poller's tail grace deliberately outlives the run and lands the
+  post-completion reading itself. On a gated build there is no such tail, so
+  the comparison above is what covers the run.
 - **Pay.** One `probeAntigravityQuotaCodeAssist` per debt, then one retry after
   `antigravityRefreshAfterRunRetryDelay` (5 s) — `antigravityRefreshAfterRunMaxAttempts
   = 2`, each under `antigravityCodeAssistTimeout` (8 s), under a process-wide
@@ -1216,7 +1224,10 @@ size: no rollout scanning, no cursor, one outbound read.
   concurrent run's poller. The lock order is cache → freshness; nothing under
   the freshness lock may read the cache.
 - **Survive.** The debt is a file (`antigravity_quota_freshness.json` in the
-  agent's data dir; `AIEXPEDITE_AGY_FRESHNESS` relocates it), so `StartAgent`'s
+  agent's data dir; `AIEXPEDITE_AGY_FRESHNESS` relocates it, and every rewrite
+  is temp-file + rename like the quota snapshot's, because a truncate-in-place
+  interrupted by exactly the kill or self-replace this record exists for would
+  read back as invalid JSON, i.e. no debt at all), so `StartAgent`'s
   `payOwedAntigravityUsageRefresh` pays ONE bounded read for a run the previous
   process never settled (crash, restart, self-update) — placed after `isOffline`
   is published so the first attempt honours offline mode, and run entirely off
