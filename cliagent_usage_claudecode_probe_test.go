@@ -3392,13 +3392,13 @@ func TestClaudeUsageProbeGate_CacheSeedIsOneShot(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	owed := claudeUsageProbe.owedObservation()
 	if owed.UnixMilli() != runEnded.UnixMilli() {
 		t.Fatalf("owedObservation()=%v, want the persisted debt %v", owed, runEnded)
 	}
 	claudeUsageProbe.settleOwed(owed)
-	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if again := claudeUsageProbe.owedObservation(); !again.IsZero() {
 		t.Fatalf("the cache seed must be one-shot; a settled debt came back as %v", again)
 	}
@@ -3415,7 +3415,7 @@ func TestClaudeUsageProbeGate_CacheSeedIsAccountScoped(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache(context.Background(), "someone-else", claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache(context.Background(), "someone-else", probeTestToken, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("another account's debt was seeded onto this gather: %v", owed)
 	}

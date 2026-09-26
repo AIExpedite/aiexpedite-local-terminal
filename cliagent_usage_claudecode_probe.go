@@ -1051,10 +1051,12 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // window, be ADMITTED and put another request to an endpoint that just refused
 // this device.
 //
-// It takes the fingerprint the gather already decoded from its one credential
-// read rather than resolving its own. refreshClaudeUsageIfStale makes no
-// credential read by contract (a `security` spawn per gather on macOS), and the
-// seed must not be the thing that breaks it.
+// It takes the fingerprint AND the bearer token the gather already decoded from
+// its one credential read rather than resolving its own. refreshClaudeUsageIfStale
+// makes no credential read by contract (a `security` spawn per gather on macOS),
+// and the seed must not be the thing that breaks it. The token is read only for
+// its EMPTINESS — never stored, logged or compared — because a gather holding no
+// token is one whose probe exits before the wire (see the pre-check below).
 //
 // The cache read happens OFF g.mu: that mutex is taken on the session stdout
 // path, so nothing touching the filesystem may be held under it.
@@ -1103,7 +1105,7 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // generation counter exists to catch, and leave the gather to publish the
 // pre-replay view for the whole TTL. A needless re-read costs one cache load, and
 // the latch makes it at most one per account per process.
-func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint string, generation uint64, now, latest time.Time) time.Time {
+func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) time.Time {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
 	// One-shot, for the post-latch stamp recheck below.
@@ -1282,7 +1284,17 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// the hold expires or the agent reconnects — neither of which touches the
 	// snapshot the latch is keyed to. Latching a refusal would strand the debt
 	// for the rest of this process's life.
-	if uncovered && (ctx.Err() != nil || g.blockedFromIssuing(now)) {
+	//
+	// An EMPTY token is the same kind of refusal, and it is decided here rather
+	// than inside blockedFromIssuing because it is a fact about this gather's
+	// credential read, not about the gate: the gather hands probeClaudeUsageAdmitted
+	// a fixed identity, so a token that is empty now is still empty when that
+	// admitted probe reaches its empty-token exit — which refunds the throttle slot
+	// and returns issued=false without asking the endpoint anything. On the common
+	// claude.ai login the fingerprint is "" and matches the unscoped snapshot, so a
+	// transient Keychain failure would otherwise charge a full attempt against a
+	// debt no request was made for, and two such gathers would retire it.
+	if uncovered && (ctx.Err() != nil || token == "" || g.blockedFromIssuing(now)) {
 		claudeUsageProbeSeedBlocked()
 		persisted, uncovered, latch = time.Time{}, false, false
 	}
@@ -2174,7 +2186,7 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	// not that reading. The verdict is carried instead, and answers the forced
 	// gather only if its own attempts produce nothing — re-reading a cache that
 	// advanced still beats publishing the view it loaded before.
-	seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, generation, now, latest)
+	seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
 	if !seeded.IsZero() && !forced {
 		return true
 	}
