@@ -22,14 +22,23 @@
 //     each scans the rollout tree from just below the floor instead of the
 //     persisted cursor, accepts file-anchored observation times for frames with
 //     no envelope timestamp, and commits through the blocking merge.
+//   - Fall back: a debt that survives every forced reconcile gets ONE live
+//     `account/rateLimits/read` (codexLiveUsageFallback) — the path the
+//     Refresh button uses, immune to rollout layout drift after a Codex
+//     upgrade. Once per debt generation, never offline, behind the shared
+//     live-read cooldown.
 //   - Clear: codexSettleRunFreshness, run inside EVERY cache transaction,
 //     clears the debt the moment any contributor observation lands at/after the
 //     floor, or once it is older than codexRefreshOwedMaxAge.
 //   - Survive: the debt lives in codex_rate_limits.json, so StartAgent's
 //     payOwedCodexUsageRefresh pays one bounded reconcile for a run that ended —
-//     or was cut off by — the previous process (crash, restart, self-update).
-//   - Report: a debt that outlived every attempt surfaces as a timestamps-only
-//     warning notice (codexStaleRunNotice) instead of a card that looks fresh.
+//     or was cut off by — the previous process (crash, restart, self-update),
+//     and hands whatever it leaves owed to the worker and its fallback.
+//   - Report: a debt that outlived every attempt and its fallback surfaces as
+//     a timestamps-only warning notice (codexStaleRunNotice), or — when the
+//     reading predates the installed Codex build — as capture drift
+//     (cliagent_usage_codex_capture_stamp.go), instead of a card that looks
+//     fresh.
 //
 // Every path here is silent and bounded: it runs off session teardown and must
 // never delay, block or break a session.
@@ -212,6 +221,12 @@ type codexUsageRefreshGate struct {
 	// turns armed inside the same millisecond whose writes both fail produce
 	// two withdrawals at one key, and each late arm must consume its own.
 	disarmed map[string]map[int64]int
+	// fallbacks marks the accounts whose live fallback is running, so two
+	// callers settling onto the same debt spend one probe, not two.
+	fallbacks map[string]bool
+	// driftBypass records, per account, the Codex version whose capture drift
+	// already bought one reconcile past codexForcedReconcileMinInterval.
+	driftBypass map[string]string
 	// cancel wakes every sleeping worker when the gate is reset (tests).
 	cancel chan struct{}
 	// active counts the tracked goroutines spawn started; idle broadcasts when
@@ -266,6 +281,8 @@ func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 		pendingAttempts: map[string]codexRetainedAttempts{},
 		armed:           map[int64][]string{},
 		disarmed:        map[string]map[int64]int{},
+		fallbacks:       map[string]bool{},
+		driftBypass:     map[string]string{},
 		cancel:          make(chan struct{}),
 	}
 }
@@ -565,6 +582,43 @@ func (g *codexUsageRefreshGate) takeDisarmed(fp string, floorMs int64) bool {
 	return true
 }
 
+// claimFallback makes the caller fp's one running live fallback; false when
+// another is already running for fp.
+func (g *codexUsageRefreshGate) claimFallback(fp string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.fallbacks == nil {
+		g.fallbacks = map[string]bool{}
+	}
+	if g.fallbacks[fp] {
+		return false
+	}
+	g.fallbacks[fp] = true
+	return true
+}
+
+func (g *codexUsageRefreshGate) releaseFallback(fp string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.fallbacks, fp)
+}
+
+// takeDriftBypass reports true the first time fp's reading is seen drifted
+// against `version`, so capture drift bypasses the reconcile interval once per
+// binary change rather than on every gather.
+func (g *codexUsageRefreshGate) takeDriftBypass(fp, version string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.driftBypass == nil {
+		g.driftBypass = map[string]string{}
+	}
+	if g.driftBypass[fp] == version {
+		return false
+	}
+	g.driftBypass[fp] = version
+	return true
+}
+
 func (g *codexUsageRefreshGate) cancelCh() <-chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -607,8 +661,24 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.pendingAttempts = map[string]codexRetainedAttempts{}
 	codexUsageRefresh.armed = map[int64][]string{}
 	codexUsageRefresh.disarmed = map[string]map[int64]int{}
+	codexUsageRefresh.fallbacks = map[string]bool{}
+	codexUsageRefresh.driftBypass = map[string]string{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
+	// The binary a previous test (or process) named must not stamp this one.
+	codexUsageCaptureVersion.Store("")
+	resetCodexLiveRateLimitRead()
+}
+
+// codexStaleRunNoticeDue is the gate both run-freshness notices share: a debt
+// still owed after every bounded attempt, and no live fallback in flight. The
+// fallback is only owed once the attempts are spent, so the counter alone has
+// already crossed the threshold while it runs; without the second half a
+// gather landing mid-probe would show the warning and the next one would take
+// it away.
+func codexStaleRunNoticeDue(state codexRunFreshnessState) bool {
+	return state.owed && state.attempts >= codexRefreshAfterRunMaxAttempts &&
+		state.fallback != codexFallbackOutstanding
 }
 
 /* ─────────────────────────── context markers ─────────────────────────── */
@@ -667,10 +737,15 @@ type codexRunFreshnessState struct {
 	// Only meaningful at process start, where no run of this process can be in
 	// flight — the previous process died (or was replaced) mid-run.
 	interrupted bool
+	// fallback is the debt's RefreshFallbackState (codexLiveUsageFallback).
+	fallback string
+	// codexVersion is the binary that produced the newest observation
+	// (codexCaptureDriftNotice).
+	codexVersion string
 }
 
 func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFreshnessState {
-	state := codexRunFreshnessState{attempts: view.refreshOwedAttempts}
+	state := codexRunFreshnessState{attempts: view.refreshOwedAttempts, fallback: view.refreshFallback, codexVersion: view.codexVersion}
 	if view.runFloorMs <= 0 {
 		return state
 	}
@@ -707,6 +782,8 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 		return
 	}
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	// A settled debt raises no notice and owes no live fallback.
+	snap.RefreshFallbackState = codexFallbackUnset
 	if !paid {
 		snap.RunFloorMs = 0
 	}
@@ -880,6 +957,7 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 	}
 	if rebased {
 		snap.RefreshOwedAttempts = 0
+		snap.RefreshFallbackState = codexFallbackUnset
 	}
 	return rebased
 }
@@ -1001,7 +1079,9 @@ func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Ti
 		snap.RunFloorMs = floorMs
 	}
 	snap.RefreshOwedAtMs = completedAt.UnixMilli()
+	// A new generation: its own attempt budget and its own live fallback.
 	snap.RefreshOwedAttempts = 0
+	snap.RefreshFallbackState = codexFallbackUnset
 	if snap.ActiveRunFloorMs <= snap.RunFloorMs {
 		snap.ActiveRunFloorMs = 0
 	}
@@ -1179,6 +1259,10 @@ func codexRunDebtWorker(base, fp string) {
 			// still retained here (codexReconcileForGather).
 			codexFlushPendingRunDebt(fp)
 			codexRecordRefreshAttempt(fp, codexDebtID{}, 0)
+			// Nothing reschedules this worker, so a fallback it leaves
+			// outstanding would hold the stale notice back for the debt's
+			// whole age-out window. Resolve it: the notice surfaces now.
+			codexSkipOutstandingFallback(fp)
 			return
 		}
 	}
@@ -1191,10 +1275,28 @@ func codexRunDebtWorker(base, fp string) {
 // race, not a reconcile, and must not consume the reconcile attempts — those
 // gate the stale notice — or the worker would retire with the debt still
 // unrecorded and nothing left scheduled to record it.
+//
+// A debt that survives every reconcile gets one live read
+// (codexLiveUsageFallback): the rollout scan is the one step a Codex upgrade
+// can break — a new layout, a cursor written by the old binary — and the live
+// read does not depend on either.
 func codexPayRunRefresh(base, fp string) {
+	if !codexPayRunRefreshAttempts(base, fp) {
+		return
+	}
+	state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+	if !state.owed {
+		return
+	}
+	codexLiveUsageFallback(fp, state)
+}
+
+// codexPayRunRefreshAttempts is codexPayRunRefresh's reconcile loop. Reports
+// true only when it spent every attempt and the debt may still be owed.
+func codexPayRunRefreshAttempts(base, fp string) bool {
 	for attempt := 0; attempt < codexRefreshAfterRunMaxAttempts; attempt++ {
 		if attempt > 0 && !codexUsageRefresh.sleep(codexRefreshAfterRunRetryDelay) {
-			return
+			return false
 		}
 		if codexUsageRefresh.takeRearm(fp) {
 			attempt = 0
@@ -1205,17 +1307,24 @@ func codexPayRunRefresh(base, fp string) {
 			// debt stays retained for the worker's last-chance flush and the
 			// next gather; a reconcile now would read `owed == false` off
 			// disk and retire a run that was never recorded.
-			return
+			return false
 		}
 		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
 		if !state.owed {
-			return // paid by capture, a gather, or an earlier attempt
+			return false // paid by capture, a gather, or an earlier attempt
+		}
+		if state.attempts >= codexRefreshAfterRunMaxAttempts {
+			// Already spent elsewhere — the startup replay's reconcile, or a
+			// gather's — so the debt goes straight to its live fallback
+			// instead of paying for more scans than its bound allows.
+			return true
 		}
 		if !codexAwaitGatedReconcile(base, fp, state.floor) {
-			return
+			return false
 		}
 		codexRecordRefreshAttempt(fp, state.debtID(), 1)
 	}
+	return true
 }
 
 // codexRecordRefreshAttempt counts `spent` attempts against fp's debt, folding
@@ -1310,6 +1419,131 @@ func codexAwaitGatedReconcile(base, fp string, floor time.Time) bool {
 	return true // counted as an attempt; the debt stays for the next one
 }
 
+// codexLiveUsageFallbackTries bounds how often one fallback asks the shared
+// Codex read: once, then once more after waiting out a cooldown refusal.
+const codexLiveUsageFallbackTries = 2
+
+// codexLiveUsageFallbackRead is the live read the fallback spends. A var so
+// tests never start a real `codex app-server`.
+var codexLiveUsageFallbackRead = func(ctx context.Context, fp string) string {
+	return codexLiveRateLimitRead(ctx, "", fp)
+}
+
+// codexLiveUsageFallback spends at most one live `account/rateLimits/read` on
+// a debt its rollout attempts could not pay. The reading lands through the
+// ordinary capture path, so a debt it covers settles in that same write.
+//
+// Bounds: once per debt generation (RefreshFallbackState), never while
+// offline or with the gate disabled (both resolve it to skipped), behind the
+// shared Codex read cooldown, one fallback per account at a time, and each
+// read inside codexLiveProbeTimeout — cancelled by shutdown or a gate reset
+// like every other wait of the worker. Only a read that actually ran —
+// whatever it returned — spends the bound; a cooldown refusal leaves the
+// state outstanding for the worker's next pass (or its retirement, which
+// resolves it to skipped).
+//
+// The read is pinned to the debt's own account: a credentials swap since the
+// run returns account_changed and the reading is dropped rather than booked
+// against the account that made the run.
+func codexLiveUsageFallback(fp string, state codexRunFreshnessState) {
+	id := state.debtID()
+	if !id.valid() || state.fallback == codexFallbackSpent || state.fallback == codexFallbackSkipped {
+		return
+	}
+	if !codexUsageRefresh.claimFallback(fp) {
+		return
+	}
+	defer codexUsageRefresh.releaseFallback(fp)
+	if !codexUsageRefresh.isEnabled() || IsOffline() {
+		codexSetRefreshFallback(fp, id, codexFallbackSkipped)
+		return
+	}
+	// Outstanding BEFORE the read: a gather landing mid-probe must see the
+	// notice held back, not show it and have the next gather take it away.
+	if !codexSetRefreshFallback(fp, id, codexFallbackOutstanding) {
+		return // the debt moved on (paid, re-owed, or another account's now)
+	}
+	codexResolveCaptureVersion()
+	for try := 0; try < codexLiveUsageFallbackTries; try++ {
+		outcome, cancelled := codexRunLiveUsageFallbackRead(fp)
+		if cancelled {
+			return // shutting down or reset: the cache may belong to someone else now
+		}
+		if outcome != liveProbeOutcomeCooldown {
+			codexSetRefreshFallback(fp, id, codexFallbackSpent)
+			fmt.Printf("%s[cli-usage] codex post-run live read: %s%s\n", colorCyan, outcome, colorReset)
+			return
+		}
+		if try+1 < codexLiveUsageFallbackTries &&
+			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(time.Now())) {
+			return
+		}
+	}
+}
+
+// codexRunLiveUsageFallbackRead runs one read under codexLiveProbeTimeout,
+// cancelled by process shutdown or a gate reset. cancelled reports the latter
+// two, after which the caller must write nothing.
+func codexRunLiveUsageFallbackRead(fp string) (outcome string, cancelled bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), codexLiveProbeTimeout)
+	defer cancel()
+	stop := make(chan struct{})
+	var aborted atomic.Bool
+	go func() {
+		select {
+		case <-shutdownChan:
+		case <-codexUsageRefresh.cancelCh():
+		case <-stop:
+			return
+		}
+		aborted.Store(true)
+		cancel()
+	}()
+	outcome = codexLiveUsageFallbackRead(ctx, fp)
+	close(stop)
+	return outcome, aborted.Load()
+}
+
+// codexSetRefreshFallback moves the fallback state of the debt `id` names to
+// `to`. It refuses — reporting false — when the debt is no longer that
+// generation, when the snapshot belongs to another account (writing would
+// rescope it and discard the live account's readings), or when the state has
+// already resolved: spent and skipped are final for their generation.
+func codexSetRefreshFallback(fp string, id codexDebtID, to string) bool {
+	var applied bool
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs {
+			return false
+		}
+		switch snap.RefreshFallbackState {
+		case codexFallbackSpent, codexFallbackSkipped:
+			return false
+		case to:
+			applied = true
+			return false
+		}
+		snap.RefreshFallbackState = to
+		applied = true
+		return true
+	})
+	return applied
+}
+
+// codexSkipOutstandingFallback resolves a fallback the retiring worker leaves
+// outstanding. The read comes first so the routine retirement writes nothing.
+func codexSkipOutstandingFallback(fp string) {
+	if codexCacheViewForAccount(fp).refreshFallback != codexFallbackOutstanding {
+		return
+	}
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshFallbackState != codexFallbackOutstanding {
+			return false
+		}
+		snap.RefreshFallbackState = codexFallbackSkipped
+		return true
+	})
+}
+
 // codexReconcileResult is what one rollout reconcile hands the parser.
 type codexReconcileResult struct {
 	metrics           []cliAgentUsageMetric
@@ -1345,6 +1579,10 @@ func payOwedCodexUsageRefresh() {
 		fp := codexAccountFingerprintAtBase(base)
 		now := codexUsageFreshnessNow()
 		view := codexCacheViewForAccount(fp)
+		// No gather or smoke has named the binary yet in this fresh process;
+		// without it the reconcile and the live fallback below would stamp
+		// nothing and leave the pre-update stamp to raise capture drift.
+		codexResolveCaptureVersion()
 		// A clock rollback while the previous process had a run unpaid or in
 		// flight leaves its floor ahead of `now`; no run start of this process
 		// has rebased it yet, so do it here before classifying the state, or
@@ -1419,7 +1657,13 @@ func payOwedCodexUsageRefresh() {
 		// stale notice can still be reached. A run left merely `interrupted`
 		// would otherwise never be refreshed — routine gathers force only on
 		// `owed` — and never warn.
-		if retained {
+		//
+		// So does a debt this one reconcile left owed. It was carried across a
+		// restart — typically the agent's own self-update, or the one after a
+		// Codex upgrade — which is exactly when the rollout scan is the step
+		// most likely to find nothing, and the worker is the one place the
+		// live fallback runs, once per debt.
+		if retained || codexRunFreshnessForAccount(fp, codexUsageFreshnessNow()).owed {
 			codexRunDebtWorker(base, fp)
 		}
 	})
@@ -1476,10 +1720,16 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 	state := codexRunFreshnessFromView(view, now)
 	if forced || state.owed {
 		var floor time.Time
+		bypass := forced
 		if state.owed {
 			floor = state.floor
+			// The reading predates the installed binary: the first owed
+			// reconcile after the change is not held back by the interval.
+			if version := currentCodexUsageCaptureVersion(); codexCaptureDriftFromView(view, version) {
+				bypass = codexUsageRefresh.takeDriftBypass(fp, version) || bypass
+			}
 		}
-		res, ran, busy, _ := codexRunGatedReconcile(ctx, base, fp, floor, forced, now)
+		res, ran, busy, _ := codexRunGatedReconcile(ctx, base, fp, floor, bypass, now)
 		if ran {
 			// A reconcile spent ON a debt counts as one of its bounded
 			// attempts, exactly like the post-run worker's. Uncounted, a debt
@@ -1509,9 +1759,10 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 
 // codexStaleRunNotice explains a card whose newest observation predates the
 // most recent Codex run, once the bounded post-run attempts have all come up
-// empty. Timestamps only — never a path, an account or log text.
+// empty. Timestamps only — never a path, an account or log text. The card
+// reaches it through codexRunFreshnessNotice, which prefers capture drift.
 func codexStaleRunNotice(state codexRunFreshnessState) string {
-	if !state.owed || state.attempts < codexRefreshAfterRunMaxAttempts {
+	if !codexStaleRunNoticeDue(state) {
 		return ""
 	}
 	const layout = "2006-01-02 15:04 UTC"

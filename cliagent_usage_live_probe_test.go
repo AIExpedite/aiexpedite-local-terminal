@@ -549,10 +549,12 @@ func stubLiveProbes(t *testing.T) *int32 {
 		cliUsageLiveProbeMu.Lock()
 		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
 		cliUsageLiveProbeMu.Unlock()
+		resetCodexLiveRateLimitRead()
 	})
 	cliUsageLiveProbeMu.Lock()
 	cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
 	cliUsageLiveProbeMu.Unlock()
+	resetCodexLiveRateLimitRead()
 	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
 		return map[string]detectedCLIAgent{
 			"codex":       {Detected: true, Path: "codex"},
@@ -562,7 +564,7 @@ func stubLiveProbes(t *testing.T) *int32 {
 		}
 	}
 	slow := func() { atomic.AddInt32(&calls, 1); time.Sleep(50 * time.Millisecond) }
-	probeCodexRateLimitsLiveFn = func(context.Context, string) string { slow(); return liveProbeOutcomeOK }
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeOK }
 	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeTimeout }
 	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string { slow(); panic("boom") }
 	warmCLIAgentModelDiscoveryFn = func(context.Context, string, detectedCLIAgent, string) {}
@@ -1020,5 +1022,60 @@ func TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount(t *testing.T) {
 				t.Errorf("account/plan=%q/%q, want %q/%q", account, plan, tc.wantAcct, tc.wantPln)
 			}
 		})
+	}
+}
+
+// After the split, the Codex read keeps ONE cooldown and ONE single flight,
+// shared by the Refresh click and the post-run freshness fallback: concurrent
+// callers share one probe, and a fallback right after a click spawns nothing.
+func TestCodexLiveRateLimitRead_SharesCooldownAndFlightWithTheFallback(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	var codexCalls int32
+	calls := &codexCalls
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		atomic.AddInt32(calls, 1)
+		once.Do(func() { close(entered) })
+		<-release
+		return liveProbeOutcomeOK
+	}
+
+	var wg sync.WaitGroup
+	outcomes := make([]string, 3)
+	for i := range outcomes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i] = codexLiveRateLimitRead(context.Background(), "codex", "")
+		}(i)
+		if i == 0 {
+			<-entered
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("probes = %d across concurrent callers, want one shared flight", got)
+	}
+	for i, outcome := range outcomes {
+		if outcome != liveProbeOutcomeOK {
+			t.Errorf("caller %d got %q, want the shared flight's outcome", i, outcome)
+		}
+	}
+
+	// The freshness fallback's read inside the cooldown spawns nothing.
+	fp := currentCodexAccountFingerprint()
+	if got := codexLiveRateLimitRead(context.Background(), "", fp); got != liveProbeOutcomeCooldown {
+		t.Fatalf("fallback inside the click's cooldown = %q, want cooldown", got)
+	}
+	// So does a click's Codex probe after a fallback.
+	if got := runCLIUsageLiveProbes(context.Background()); got["codex"] != liveProbeOutcomeCooldown {
+		t.Fatalf("click inside the shared cooldown = %v, want codex cooldown", got)
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("probes = %d, want none spent inside the cooldown", got)
 	}
 }

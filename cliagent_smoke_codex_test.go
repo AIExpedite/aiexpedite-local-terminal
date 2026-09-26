@@ -551,6 +551,83 @@ func TestRunCodexSmoke_RolloutSignalSettlesOnlyAWriteThisRunMade(t *testing.T) {
 	})
 }
 
+// The case captured usage earns its keep on: a MISMATCH whose turn printed its
+// rate-limit windows settles on that evidence, without the rollout tree walk,
+// and without a completion frame to lean on. (A marker match already skips
+// the walk, so it proves nothing new.)
+func TestRunCodexSmoke_MismatchWithCapturedWindowsSettlesWithoutAWalk(t *testing.T) {
+	_, rec := codexSmokeEnv(t)
+	walks := countCodexRolloutWalks(t)
+	path := stubCodexBinary(t)
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		return []byte(strings.Join([]string{
+			`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Sure thing!"}}`,
+			codexSmokeTokenCountLine(t, 30, 40, time.Now()),
+		}, "\n") + "\n"), nil, nil
+	})
+
+	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Diagnostic != cliSmokeDiagnosticMarkerMismatch {
+		t.Fatalf("result = %+v, want marker_mismatch", result)
+	}
+	if _, settled, disarmed := rec.lifecycle(); settled != 1 || disarmed != 0 || *walks != 0 {
+		t.Fatalf("settled=%d disarmed=%d walks=%d, want a walk-free settle on the captured windows", settled, disarmed, *walks)
+	}
+}
+
+// Credentials that change while the turn runs make its reading
+// unattributable: nothing reaches the cache, and the run is judged on its
+// other evidence alone (here none, so it disarms).
+func TestRunCodexSmoke_AccountChangeMidProbeSuppressesCapture(t *testing.T) {
+	home, rec := codexSmokeEnv(t)
+	helperCodexAuthAt(t, home, "before@example.com", time.Now().Add(-time.Hour))
+	path := stubCodexBinary(t)
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		helperCodexAuthAt(t, home, "after@example.com", time.Now())
+		return []byte(codexSmokeTokenCountLine(t, 30, 40, time.Now()) + "\n"), nil, nil
+	})
+
+	runCodexSmoke(context.Background(), path, codexSmokeTestVersion)
+
+	if _, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath()); ok {
+		t.Fatal("a reading taken across an account change must never reach the cache")
+	}
+	if _, settled, disarmed := rec.lifecycle(); settled != 0 || disarmed != 1 {
+		t.Fatalf("settled=%d disarmed=%d, want a disarm: the only evidence was unattributable", settled, disarmed)
+	}
+}
+
+// A turn that leaves no evidence at all — no numeric frame, no marker, no
+// completion, no newer rollout — still disarms exactly as before; a
+// reset-only frame is not a numeric window and does not count.
+func TestRunCodexSmoke_EvidenceFreeTurnStillDisarms(t *testing.T) {
+	_, rec := codexSmokeEnv(t)
+	path := stubCodexBinary(t)
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		return []byte(`{"type":"thread.started"}` + "\n" +
+			`{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"window_minutes":300,"resets_in_seconds":3600}}}}` + "\n"), nil, nil
+	})
+
+	runCodexSmoke(context.Background(), path, codexSmokeTestVersion)
+
+	if _, settled, disarmed := rec.lifecycle(); settled != 0 || disarmed != 1 {
+		t.Fatalf("settled=%d disarmed=%d, want the evidence-free turn disarmed", settled, disarmed)
+	}
+}
+
+// parseCodexSmokeStream stays pure: it collects the candidate lines and
+// touches no cache.
+func TestParseCodexSmokeStream_CollectsRateLimitLinesWithoutCaching(t *testing.T) {
+	cache := isolateCodexCache(t)
+	line := codexSmokeTokenCountLine(t, 1, 2, time.Now())
+	stream := parseCodexSmokeStream([]byte(`{"type":"thread.started"}` + "\n" + line + "\nnot json rate_limits\n"))
+	if len(stream.RateLimitLines) != 1 || stream.RateLimitLines[0] != line {
+		t.Fatalf("RateLimitLines = %q, want only the token_count line", stream.RateLimitLines)
+	}
+	if _, ok := loadCodexRateLimitSnapshot(cache); ok {
+		t.Fatal("parsing must not write the cache")
+	}
+}
+
 /* --------------------------------------------------------------------------
    Cooldown
    -------------------------------------------------------------------------- */

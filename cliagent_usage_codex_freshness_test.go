@@ -2135,3 +2135,157 @@ func TestCodexSmoke_KilledRunOwesNothingAfterARestart(t *testing.T) {
 		t.Fatalf("the card carries a stale-utilization notice: %q", notice)
 	}
 }
+
+/* ─────────────────────── live fallback accounting ─────────────────────── */
+
+// A run whose rollout attempts all come up empty gets exactly ONE live read,
+// after them and never before; a later pass of the worker over the same debt
+// spends none.
+func TestCodexRefreshAfterRun_LiveFallbackRunsOncePerDebt(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	var attemptsAtRead int
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string {
+		attemptsAtRead = codexRunFreshnessForAccount(f.fp, time.Now()).attempts
+		return liveProbeOutcomeNoReading
+	})
+
+	triggerCodexUsageRefreshAfterRun(runStart)
+	waitCodexUsageRefreshIdle(t)
+	codexRunDebtWorker(f.home, f.fp)
+
+	if got := *calls; got != 1 {
+		t.Fatalf("live reads = %d, want exactly one for the debt", got)
+	}
+	if attemptsAtRead < codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("the live read ran after %d rollout attempts, want it only once all %d were spent", attemptsAtRead, codexRefreshAfterRunMaxAttempts)
+	}
+}
+
+// Offline, the fallback never runs; it resolves to skipped so the card is not
+// left waiting on a read that cannot happen.
+func TestCodexRefreshAfterRun_LiveFallbackSkippedWhileOffline(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	setCodexTestOffline(t, true)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	codexPayRunRefresh(f.home, f.fp)
+
+	if *calls != 0 {
+		t.Fatalf("an offline agent spent %d live reads", *calls)
+	}
+	state := codexRunFreshnessForAccount(f.fp, time.Now())
+	if state.fallback != codexFallbackSkipped || codexStaleRunNotice(state) == "" {
+		t.Fatalf("offline fallback must resolve to skipped and let the notice through: %+v", state)
+	}
+}
+
+// A debt the live read pays clears in the capture's own write: observedAt
+// advances past the floor and the card carries no stale notice.
+func TestCodexRefreshAfterRun_DebtPaidByFallbackClearsWithoutNotice(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	stubCodexFallbackRead(t, capturingFallbackRead)
+
+	triggerCodexUsageRefreshAfterRun(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshFallbackState != codexFallbackUnset {
+		t.Fatalf("a debt the fallback paid must clear with its fallback state: %+v", snap)
+	}
+	if got := metricObservedAt(t, codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))); got.Before(runStart.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the run %s", got, runStart)
+	}
+	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.Notice != "" {
+		t.Fatalf("a paid debt raised a notice: %q", usage.Notice)
+	}
+}
+
+// A read the shared cooldown refuses spawned nothing, so it does not spend the
+// once-per-debt bound: the fallback stays OUTSTANDING (the notice held back)
+// for as long as the worker is still there to reach it.
+func TestCodexRefreshAfterRun_CooldownRefusalLeavesFallbackOutstanding(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeCooldown })
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	codexLiveUsageFallback(f.fp, state)
+
+	if *calls != codexLiveUsageFallbackTries {
+		t.Fatalf("reads = %d, want one retry after waiting out the cooldown (%d)", *calls, codexLiveUsageFallbackTries)
+	}
+	after := codexRunFreshnessForAccount(f.fp, time.Now())
+	if after.fallback != codexFallbackOutstanding {
+		t.Fatalf("a cooldown refusal must leave the fallback outstanding, got %q", after.fallback)
+	}
+	if notice := codexStaleRunNotice(after); notice != "" {
+		t.Fatalf("an outstanding fallback must hold the notice back, got %q", notice)
+	}
+	// Still owed: a later pass reaches the read.
+	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
+	codexLiveUsageFallback(f.fp, after)
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()).fallback; got != codexFallbackSpent {
+		t.Fatalf("the later pass must spend the owed read, state=%q", got)
+	}
+}
+
+// A worker that retires with the fallback still outstanding resolves it to
+// skipped: nothing reschedules the worker, and the notice must surface now
+// rather than after codexRefreshOwedMaxAge.
+func TestCodexRunDebtWorker_RetiringResolvesOutstandingFallback(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeCooldown })
+	f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	codexRunDebtWorker(f.home, f.fp)
+
+	state := codexRunFreshnessForAccount(f.fp, time.Now())
+	if state.fallback != codexFallbackSkipped {
+		t.Fatalf("retiring worker left the fallback %q, want skipped", state.fallback)
+	}
+	if codexStaleRunNotice(state) == "" {
+		t.Fatal("the stale notice must surface once the worker retires")
+	}
+}
+
+// No flicker: a gather landing while the live read is in flight shows no stale
+// notice, and the notice appears only once the read resolved without paying.
+func TestCodexParse_NoStaleNoticeWhileLiveFallbackInFlight(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	entered, release := make(chan struct{}), make(chan struct{})
+	stubCodexFallbackRead(t, func(context.Context, string) string {
+		close(entered)
+		<-release
+		return liveProbeOutcomeNoReading
+	})
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+	codexUsageRefresh.spawn(func() { codexLiveUsageFallback(f.fp, state) })
+	<-entered
+
+	during, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	close(release)
+	waitCodexUsageRefreshIdle(t)
+	after, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+
+	if during.Notice != "" {
+		t.Fatalf("gather mid-read showed %q", during.Notice)
+	}
+	if after.Notice == "" || after.NoticeSeverity != "warning" {
+		t.Fatalf("after an unpaid read the stale warning must show, got %q (%s)", after.Notice, after.NoticeSeverity)
+	}
+}

@@ -98,6 +98,14 @@ func TestMain(m *testing.M) {
 	// any request — and let the tests that exercise the route stub it
 	// explicitly (helperStubAntigravityKeyring).
 	antigravityKeyringReader = func(context.Context) ([]byte, bool) { return nil, false }
+	// Same rule for Codex: a debt its rollout attempts cannot pay now owes a
+	// live `account/rateLimits/read` (codexLiveUsageFallback), which would
+	// start the developer's real `codex app-server` and reach OpenAI. Default
+	// to a read that ran and found nothing; the tests that exercise the route
+	// stub it explicitly. The capture version would likewise `--version` a
+	// real install, so it reads as unknown unless a test names one.
+	codexLiveUsageFallbackRead = func(context.Context, string) string { return liveProbeOutcomeSpawnFailed }
+	codexInstalledVersion = func() string { return "" }
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through

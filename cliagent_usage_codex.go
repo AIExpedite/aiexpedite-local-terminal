@@ -277,6 +277,9 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	// its scan may also spend the login probe's holdback; the probe then gets
 	// what is left, and an inconclusive probe never un-authenticates a
 	// credential auth.json already proved.
+	// Every writer in this pass — the reconcile below, and any live capture
+	// racing it — stamps the binary detected here.
+	publishCodexUsageCaptureVersion(detected.Version)
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time
@@ -302,9 +305,11 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	if notice := codexUsageLimitNotice(usage.Metrics, usageLimit, latestRolloutObservation, now); notice != "" {
 		usage.Notice = notice
 		usage.NoticeSeverity = "error"
-	} else if notice := codexStaleRunNotice(codexRunFreshnessForAccount(usage.AccountFingerprint, now)); notice != "" {
+	} else if notice := codexRunFreshnessNotice(codexRunFreshnessForAccount(usage.AccountFingerprint, now), detected.Version); notice != "" {
 		// The reading is published unchanged; the notice only stops it from
-		// passing for one taken after the run that just finished.
+		// passing for one taken after the run that just finished — and, when
+		// it was produced by the Codex build this one replaced, says so
+		// (capture drift) instead of promising a telemetry find.
 		usage.Notice = notice
 		usage.NoticeSeverity = "warning"
 	}

@@ -74,6 +74,7 @@ const codexRolloutReadDirChunkSize = 128
 // through the blocking merge because dropping its evidence on lock contention
 // is exactly how a finished run's utilization went missing.
 func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
+	codexResetRolloutCursorForVersion(ctx, currentFingerprint, now)
 	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
 	floor, forced := codexForcedReconcileFrom(ctx)
 	if forced {
@@ -118,6 +119,62 @@ func codexRolloutCursorBelowFloor(cursor codexRolloutScanCursor, floor time.Time
 		return cursor
 	}
 	return codexRolloutScanCursor{mtimeNs: floorNs, retryEntries: cursor.retryEntries}
+}
+
+// codexResetRolloutCursorForVersion resets the persisted scan cursor the first
+// time a Codex binary other than the one that wrote it is in use, and stamps
+// that binary in the SAME write (RolloutCursorVersion). A cursor written
+// against the previous binary's layout may sit past files the new one writes
+// differently, and trusting it is how a post-upgrade run's telemetry stayed
+// unfound.
+//
+// The stamp lands at the reset, not when a pass completes: a post-upgrade
+// rescan re-reads up to codexRolloutScanFileCap files under a bounded budget
+// and often will not finish, and stamping on completion would reset the
+// cursor again on every later refresh, starving the backlog march it is
+// making. Mirrors the RolloutRootFingerprint reset in the contributor merge.
+// A snapshot of another account, or an unknown current version, is left
+// alone.
+func codexResetRolloutCursorForVersion(ctx context.Context, currentFingerprint string, now time.Time) {
+	version := currentCodexUsageCaptureVersion()
+	if version == "" {
+		return
+	}
+	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentFingerprint || snap.RolloutCursorVersion == version {
+		return
+	}
+	codexRateLimitCacheTransaction(ctx, codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != currentFingerprint || snap.RolloutCursorVersion == version {
+			return false
+		}
+		codexClearRolloutProgress(snap)
+		snap.RolloutCursorVersion = version
+		return true
+	})
+}
+
+// codexClearRolloutProgress drops every field of the persisted scan cursor,
+// leaving the telemetry and run bookkeeping untouched.
+func codexClearRolloutProgress(snap *codexRateLimitSnapshot) {
+	snap.RolloutHighWaterMtimeMs = 0
+	snap.RolloutHighWaterMtimeNs = 0
+	snap.RolloutHighWaterBoundaryFingerprint = ""
+	snap.RolloutHighWaterBoundaryCursor = ""
+	snap.RolloutBacklogFingerprint = ""
+	snap.RolloutBacklogCursor = ""
+	snap.RolloutBacklogMtimeNs = 0
+	snap.RolloutBacklogCohortSize = 0
+	snap.RolloutRetryEntries = nil
+	snap.RolloutRetryCursor = ""
+	snap.RolloutRetryFingerprint = ""
+	snap.RolloutFutureMtimeAnchorNs = 0
+	snap.RolloutFutureMtimeFloorNs = 0
+	snap.RolloutFutureMtimeCeilingNs = 0
+	snap.RolloutFutureMtimeFingerprint = ""
+	snap.RolloutFutureMtimeCursor = ""
+	snap.RolloutFutureMtimeCohortSize = 0
+	snap.RolloutFutureMtimeComplete = false
 }
 
 func codexLatestContributorObservation(contribs map[string]map[string]codexRateLimitBucket) time.Time {
@@ -195,14 +252,19 @@ func codexRolloutRootFingerprint(base string) string {
 }
 
 // codexRolloutScanCursorForAccount separates filesystem progress from provider
-// event time. Completed progress is reusable only for the same account and
-// CODEX_HOME. Legacy/unscoped cursors reset once, then the completed scan writes
-// the root fingerprint. Otherwise legacy caches fall back to the oldest
+// event time. Completed progress is reusable only for the same account,
+// CODEX_HOME and Codex binary. Legacy/unscoped cursors reset once, then the
+// completed scan writes the root fingerprint; a cursor another binary wrote
+// reads as empty until codexResetRolloutCursorForVersion has stamped the
+// current one. Read-only: it selects a cursor and writes nothing. Otherwise legacy caches fall back to the oldest
 // observable aggregate so a newer weekly-bearing file is not hidden by a
 // fresher session row; empty/all-Unknown caches scan from zero.
 func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.Time) codexRolloutScanCursor {
 	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
 	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return codexRolloutScanCursor{}
+	}
+	if version := currentCodexUsageCaptureVersion(); version != "" && snap.RolloutCursorVersion != version {
 		return codexRolloutScanCursor{}
 	}
 	hasStoredProgress := snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutHighWaterMtimeMs > 0 ||

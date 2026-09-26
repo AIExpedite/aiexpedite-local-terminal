@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -6177,5 +6178,91 @@ func TestCodexRunFreshness_LegacySnapshotReadsAsNothingOwed(t *testing.T) {
 	}
 	if metrics := codexMetricsFromCache(now, "fp"); metrics[0].Consumed == nil || *metrics[0].Consumed != 20 {
 		t.Fatalf("legacy reading must still render: %+v", metrics[0])
+	}
+}
+
+// captureCodexRateLimitLine reports whether a capture LANDED: true for a
+// merged numeric window or an authoritative clear, false for a dropped,
+// unrecognised, stale or reset-only frame. The smoke settles its run on it.
+func TestCaptureCodexRateLimitLine_ReportsWhetherACaptureLanded(t *testing.T) {
+	now := time.Now()
+	isolateCodexCache(t)
+	cases := []struct {
+		name, line string
+		want       bool
+	}{
+		{"not json", "rate_limits token_count", false},
+		{"unrecognised envelope", `{"type":"response_item","payload":{"content":"rate_limits token_count"}}`, false},
+		{"numeric window", `{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":12,"window_minutes":300,"resets_in_seconds":3600}}}}`, true},
+		{"reset-only heartbeat", `{"method":"token_count","params":{"rate_limits":{"primary":{"window_minutes":300,"resets_in_seconds":3600}}}}`, false},
+		{"older than the cache", `{"method":"token_count","timestamp":"` + now.Add(-time.Hour).UTC().Format(time.RFC3339Nano) +
+			`","params":{"rate_limits":{"primary":{"used_percent":9,"window_minutes":300,"resets_in_seconds":3600}}}}`, false},
+		{"authoritative clear", `{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{"primary":{"usedPercent":14,"windowDurationMins":300,"resetsAt":` +
+			strconv.FormatInt(now.Add(time.Hour).Unix(), 10) + `},"secondary":null}}}`, true},
+	}
+	for _, tc := range cases {
+		if got := captureCodexRateLimitLine(tc.line, now); got != tc.want {
+			t.Errorf("%s: captured = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The three new snapshot fields round-trip through the cache file, and a cache
+// written before they existed loads with their zero values rather than
+// failing.
+func TestCodexRateLimitSnapshot_CaptureStampsRoundTripAndLegacyLoads(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	codexRateLimitCacheTransaction(context.Background(), cache, now, true, func(snap *codexRateLimitSnapshot) bool {
+		snap.CodexVersion, snap.RolloutCursorVersion = "codex-cli 0.150.0", "codex-cli 0.149.0"
+		snap.RefreshFallbackState = codexFallbackSkipped
+		return true
+	})
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.CodexVersion != "codex-cli 0.150.0" || snap.RolloutCursorVersion != "codex-cli 0.149.0" || snap.RefreshFallbackState != codexFallbackSkipped {
+		t.Fatalf("round trip lost a field: ok=%v %+v", ok, snap)
+	}
+
+	legacy := `{"updatedAt":"2026-09-01T00:00:00Z","buckets":{"primary":{"usedPercentage":10}},"runFloorMs":1,"refreshOwedAtMs":2,"refreshOwedAttempts":2}`
+	if err := os.WriteFile(cache, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snap, ok = loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.CodexVersion != "" || snap.RolloutCursorVersion != "" || snap.RefreshFallbackState != codexFallbackUnset {
+		t.Fatalf("a pre-stamp cache must load with zero stamps: ok=%v %+v", ok, snap)
+	}
+	if view := codexCacheViewFromSnapshot(snap); codexCaptureDriftFromView(view, "codex-cli 0.150.0") {
+		t.Fatal("an unstamped reading is not drift")
+	}
+}
+
+// The cursor selector is read-only and version-scoped: the stored cursor when
+// the binary matches (or is unknown), the empty cursor when another binary
+// wrote it.
+func TestCodexRolloutScanCursorForAccount_VersionScoped(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	cursorAt := now.Add(-time.Minute)
+	f.advanceCursorPast(t, cursorAt, now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) { snap.RolloutCursorVersion = "codex-cli 0.149.0" })
+	before, _ := os.ReadFile(f.cache)
+
+	for _, tc := range []struct {
+		version string
+		want    int64
+	}{
+		{"", cursorAt.UnixNano()},
+		{"codex-cli 0.149.0", cursorAt.UnixNano()},
+		{"codex-cli 0.150.0", 0},
+	} {
+		codexUsageCaptureVersion.Store(tc.version)
+		if got := codexRolloutScanCursorForAccount(f.home, f.fp, now).mtimeNs; got != tc.want {
+			t.Errorf("version %q: cursor mtime = %d, want %d", tc.version, got, tc.want)
+		}
+	}
+	codexUsageCaptureVersion.Store("")
+	if after, _ := os.ReadFile(f.cache); string(after) != string(before) {
+		t.Fatal("selecting a cursor must write nothing")
 	}
 }

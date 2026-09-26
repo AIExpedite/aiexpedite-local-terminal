@@ -33,7 +33,10 @@
 //	actually needs, so the bounded gather that follows answers from the cache.
 //
 // Boundaries: only the signed `live-probe` refresh (sent for a real click) runs
-// this; the periodic and tab-open refreshes never do. Probes run in parallel
+// this; the periodic and tab-open refreshes never do. The one exception is the
+// Codex read (codexLiveRateLimitRead), which the post-run freshness worker
+// also spends — once per debt its rollout scans could not pay — under the same
+// single flight and cooldown as the click. Probes run in parallel
 // under one budget; a concurrent click shares the running probe and a click
 // within the cooldown reuses its result. Nothing a CLI prints is kept.
 package main
@@ -180,7 +183,7 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 	warmedWithProbe := map[string]bool{}
 
 	if agent, ok := detected["codex"]; ok && agent.Detected {
-		run("codex", func() string { return probeCodexRateLimitsLiveFn(ctx, agent.Path) })
+		run("codex", func() string { return codexLiveRateLimitRead(ctx, agent.Path, "") })
 	}
 	// Model lists are part of the same click: the bounded gather gives a list
 	// probe two seconds, which `agy models` (a network fetch) never finishes in.
@@ -271,11 +274,77 @@ func warmCLIAgentModelDiscovery(ctx context.Context, agentID string, agent detec
 // codexLiveProbeReadID is the JSON-RPC id of the one rate-limit read.
 const codexLiveProbeReadID = 2
 
+// The Codex read's own single flight and cooldown. Shared by the Refresh click
+// and the post-run freshness fallback (codexLiveUsageFallback), so the two
+// together never start more than one `codex app-server` per
+// cliUsageLiveProbeCooldown.
+var (
+	codexLiveReadGroup    singleflight.Group
+	codexLiveReadMu       sync.Mutex
+	codexLiveReadLastDone time.Time
+)
+
+// codexLiveRateLimitRead runs one bounded `account/rateLimits/read` for the
+// signed-in Codex account. A caller that arrives while a read is running
+// waits for it and takes its outcome; one that arrives within
+// cliUsageLiveProbeCooldown of a finished read gets liveProbeOutcomeCooldown
+// and spawns nothing.
+//
+// wantFingerprint "" (the click) accepts whichever account is signed in. A
+// non-empty one (the fallback, paying a specific account's debt) refuses with
+// liveProbeOutcomeAccountChanged when another account is signed in now, so
+// its figures are never booked against the old account's run.
+func codexLiveRateLimitRead(ctx context.Context, codexPath, wantFingerprint string) string {
+	if wantFingerprint != "" && currentCodexAccountFingerprint() != wantFingerprint {
+		return liveProbeOutcomeAccountChanged
+	}
+	ch := codexLiveReadGroup.DoChan("codex", func() (any, error) {
+		if codexLiveRateLimitCooldownRemaining(time.Now()) > 0 {
+			return liveProbeOutcomeCooldown, nil
+		}
+		outcome := safeLiveProbe(func() string { return probeCodexRateLimitsLiveFn(ctx, codexPath, wantFingerprint) })
+		codexLiveReadMu.Lock()
+		codexLiveReadLastDone = time.Now()
+		codexLiveReadMu.Unlock()
+		return outcome, nil
+	})
+	select {
+	case res := <-ch:
+		outcome, _ := res.Val.(string)
+		return outcome
+	case <-ctx.Done():
+		return liveProbeOutcomeTimeout
+	}
+}
+
+// codexLiveRateLimitCooldownRemaining is how long the shared cooldown still
+// refuses a new Codex read, or zero.
+func codexLiveRateLimitCooldownRemaining(now time.Time) time.Duration {
+	codexLiveReadMu.Lock()
+	defer codexLiveReadMu.Unlock()
+	if codexLiveReadLastDone.IsZero() {
+		return 0
+	}
+	if since := now.Sub(codexLiveReadLastDone); since >= 0 && since < cliUsageLiveProbeCooldown {
+		return cliUsageLiveProbeCooldown - since
+	}
+	return 0
+}
+
+// resetCodexLiveRateLimitRead clears the shared cooldown. Test-only seam.
+func resetCodexLiveRateLimitRead() {
+	codexLiveReadMu.Lock()
+	codexLiveReadLastDone = time.Time{}
+	codexLiveReadMu.Unlock()
+}
+
 // probeCodexRateLimitsLive starts a private `codex app-server`, asks it for the
 // account's rate limits and hands the answer to captureCodexRateLimitLine.
 // The app-server fetches the figures from OpenAI (it fails when offline), so
-// the reading is current, not a replay of local state.
-func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
+// the reading is current, not a replay of local state. A non-empty
+// wantFingerprint refuses before spawning when another account is signed in
+// (codexLiveRateLimitRead).
+func probeCodexRateLimitsLive(parent context.Context, codexPath, wantFingerprint string) string {
 	if codexPath == "" {
 		codexPath = resolveExecutable("codex")
 	}
@@ -286,6 +355,9 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath string) string {
 	// returns belongs to THAT account, whatever auth.json says by the time it
 	// arrives.
 	spawnedFingerprint := currentCodexAccountFingerprint()
+	if wantFingerprint != "" && spawnedFingerprint != wantFingerprint {
+		return liveProbeOutcomeAccountChanged
+	}
 	cmd := exec.Command(codexPath, buildCodexAppServerArgs(nil)...)
 	cmd.Dir = os.TempDir()
 	cmd.Env = absoluteCodexHomeEnv(sanitizeCodexAppServerEnv(os.Environ()))
