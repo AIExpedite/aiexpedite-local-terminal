@@ -337,7 +337,9 @@ func readCodexSmokeLastMessage(path string) []byte {
 // under — and only while that account is still the signed-in one, checked
 // BEFORE EVERY write: a reading that cannot be attributed must never reach the
 // cache, and a swap part-way through stops the remaining frames rather than
-// letting them rescope the new account's cache back to the old one. Stamped
+// letting them rescope the new account's cache back to the old one. The merge
+// transaction re-checks the active account again under the cache locks, so a
+// swap during a lock wait is caught too. Stamped
 // with the smoke's own binary version. Reports whether any frame landed a
 // numeric window (or an authoritative clear).
 func captureCodexSmokeRateLimits(lines []string, fingerprint, version string) bool {

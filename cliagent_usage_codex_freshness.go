@@ -674,7 +674,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
 	// The binary a previous test (or process) named must not stamp this one.
-	codexUsageCaptureVersion.Store("")
+	codexResetUsageCaptureVersion()
 	resetCodexLiveRateLimitRead()
 }
 

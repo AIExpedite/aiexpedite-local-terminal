@@ -1133,7 +1133,9 @@ func captureCodexRateLimitLine(line string, now time.Time) bool {
 // captureCodexRateLimitLineForAccount is captureCodexRateLimitLine with the
 // account named by the caller rather than re-read from disk at receipt. The
 // live probe uses it to pin a reading to the account its child was spawned
-// under, and the smoke to the account its turn ran under.
+// under, and the smoke to the account its turn ran under. The merge re-reads
+// the active account inside the cache transaction, so a swap during the lock
+// wait drops the frame instead of rescoping the new account's snapshot.
 //
 // Reports true when the merge committed a numeric window that advanced an
 // observation, or an authoritative clear; false for a dropped, unrecognised,
@@ -1180,7 +1182,7 @@ func captureCodexRateLimitLineFromProducer(line string, now time.Time, fingerpri
 	}
 	committed, advanced := mergeCodexRateLimitCacheObserved(
 		context.Background(), codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, nil, "", true, extractCodexLimitNames(raw), producerVersion)
+		now, fingerprint, nil, "", true, extractCodexLimitNames(raw), producerVersion, true)
 	return advanced || (committed && (len(clears) > 0 || emptyAuthoritative))
 }
 
@@ -1490,7 +1492,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	limitNames map[string]string,
 ) bool {
 	committed, _ := mergeCodexRateLimitCacheObserved(ctx, path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, rolloutHighWater, rolloutAccountBase, waitForLocks, limitNames, currentCodexUsageCaptureVersion())
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, waitForLocks, limitNames, currentCodexUsageCaptureVersion(), false)
 	return committed
 }
 
@@ -1514,6 +1516,7 @@ func mergeCodexRateLimitCacheObserved(
 	waitForLocks bool,
 	limitNames map[string]string,
 	producerVersion string,
+	requireActiveAccount bool,
 ) (committed, advanced bool) {
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false, false
@@ -1524,10 +1527,23 @@ func mergeCodexRateLimitCacheObserved(
 		// can change while filesystem I/O is in progress. Revalidate inside the
 		// cache transaction locks so a newly signed-in account's live capture
 		// cannot be cleared and replaced by the earlier account's rollout
-		// contributors. Live capture passes an empty base because its evidence is
-		// scoped at receive time and must remain able to initialize or replace the
-		// cache.
-		if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
+		// contributors.
+		//
+		// Live capture needs the same revalidation for the same reason, and asks
+		// for it with requireActiveAccount: its fingerprint is read when the frame
+		// arrives (or, for the smoke and the live probe, when the child was
+		// spawned), and acquiring these locks can wait seconds behind another
+		// writer. A sign-out/sign-in inside that wait would otherwise let the old
+		// account's reading rescope a snapshot already written for the new one. It
+		// has no rollout base to re-read, so it re-reads the ACTIVE account
+		// instead; a mismatch drops the frame, which is what an unattributable
+		// reading is supposed to do. Callers that name an account the process is
+		// not signed in to (a migration, a test) leave it false.
+		if rolloutAccountBase != "" {
+			if codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
+				return false
+			}
+		} else if requireActiveAccount && currentCodexAccountFingerprint() != fingerprint {
 			return false
 		}
 		codexScopeSnapshotToAccount(snap, fingerprint)

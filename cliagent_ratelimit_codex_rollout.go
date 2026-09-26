@@ -96,7 +96,7 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		mergeCodexRateLimitCacheObserved(
 			ctx, codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base, forced, nil,
-			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()),
+			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()), false,
 		)
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation

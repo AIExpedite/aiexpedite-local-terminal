@@ -16,8 +16,8 @@ import (
 // setCodexCaptureVersion publishes the producing binary for one test.
 func setCodexCaptureVersion(t *testing.T, version string) {
 	t.Helper()
-	codexUsageCaptureVersion.Store(version)
-	t.Cleanup(func() { codexUsageCaptureVersion.Store("") })
+	publishCodexUsageCaptureVersion(version)
+	t.Cleanup(func() { codexResetUsageCaptureVersion() })
 }
 
 // Drift is about DIFFERENCE: a reading stamped by one binary while another is
@@ -64,7 +64,7 @@ func TestCodexCaptureStamp_OnlyAKnownAdvancingMergeRestamps(t *testing.T) {
 		t.Fatalf("stamp = %q, want the producing binary", snap.CodexVersion)
 	}
 
-	codexUsageCaptureVersion.Store("")
+	codexResetUsageCaptureVersion()
 	if !captureCodexRateLimitLineForAccount(codexLiveReadEnvelope(11, 21, now), now, fp) {
 		t.Fatal("the newer reading must land")
 	}
@@ -338,6 +338,47 @@ func TestCodexCaptureVersionForLaunch(t *testing.T) {
 	}
 }
 
+// The installer takes none of our locks, so a binary can be replaced between a
+// publish and the launch that pins it: the published version would then be a
+// build that is gone, and the child about to start runs the new one. A launch
+// pin re-checks the identity the publish validated and pins nothing rather than
+// stamping new-build telemetry with the old version. Already-received
+// telemetry still stamps the published version — it really was produced by the
+// binary that was installed at the time.
+func TestCodexCaptureVersionForLaunch_RefusesAReplacedInstall(t *testing.T) {
+	t.Cleanup(resetVersionProbeCache)
+	setCodexCaptureVersion(t, "")
+
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.149.0" })
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
+	if got := codexCaptureVersionForLaunch("codex", path); got != "codex-cli 0.149.0" {
+		t.Fatalf("launch pin = %q while the published binary is on disk, want it", got)
+	}
+
+	// The upgrade lands with no publisher having run yet.
+	if err := os.WriteFile(path, []byte("binary-v2-longer"), 0o700); err != nil {
+		t.Fatalf("rewrite binary: %v", err)
+	}
+	if got := codexCaptureVersionForLaunch("codex", path); got != "" {
+		t.Fatalf("launch pin = %q after the binary was replaced, want unknown", got)
+	}
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.149.0" {
+		t.Fatalf("stamp for already-received telemetry = %q, want the build that produced it", got)
+	}
+
+	// The next publisher names the build that is really there, and launches pin
+	// it again.
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.150.0" })
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.150.0")
+	if got := codexCaptureVersionForLaunch("codex", path); got != "codex-cli 0.150.0" {
+		t.Fatalf("launch pin = %q after the new build published, want it", got)
+	}
+}
+
 // A gather that detected the PRE-upgrade build and was overtaken by one that
 // published the new build must not roll the process-global stamp back: later
 // captures made by the new binary would be stamped old, and the rollout cursor
@@ -474,7 +515,7 @@ func TestCodexLiveProbeConverse_StampsTheLaunchedBuild(t *testing.T) {
 
 	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
 	// The upgrade lands while the child is mid-request.
-	codexUsageCaptureVersion.Store("codex-cli 0.150.0")
+	publishCodexUsageCaptureVersion("codex-cli 0.150.0")
 	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), pinned); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q, want ok", got)
 	}

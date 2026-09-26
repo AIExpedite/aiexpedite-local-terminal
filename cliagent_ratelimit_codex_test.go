@@ -6256,13 +6256,56 @@ func TestCodexRolloutScanCursorForAccount_VersionScoped(t *testing.T) {
 		{"codex-cli 0.149.0", cursorAt.UnixNano()},
 		{"codex-cli 0.150.0", 0},
 	} {
-		codexUsageCaptureVersion.Store(tc.version)
+		publishCodexUsageCaptureVersion(tc.version)
 		if got := codexRolloutScanCursorForAccount(f.home, f.fp, now).mtimeNs; got != tc.want {
 			t.Errorf("version %q: cursor mtime = %d, want %d", tc.version, got, tc.want)
 		}
 	}
-	codexUsageCaptureVersion.Store("")
+	codexResetUsageCaptureVersion()
 	if after, _ := os.ReadFile(f.cache); string(after) != string(before) {
 		t.Fatal("selecting a cursor must write nothing")
+	}
+}
+
+// Live capture pins its account before the merge — at receipt for a managed
+// session, at spawn for the smoke and the live probe — and acquiring the cache
+// locks can then wait behind another writer. A sign-out/sign-in inside that
+// wait must not let the old account's reading rescope a snapshot already
+// written for the newly signed-in one, so the transaction re-reads the active
+// account and drops a frame it can no longer attribute.
+func TestCaptureCodexRateLimit_DropsAFrameWhoseAccountIsNoLongerActive(t *testing.T) {
+	cache := isolateCodexCache(t)
+	home := os.Getenv("CODEX_HOME")
+	now := time.Now()
+
+	helperCodexAuthAt(t, home, "first@example.com", now.Add(-time.Hour))
+	first := currentCodexAccountFingerprint()
+	if !captureCodexRateLimitLineForAccount(codexLiveReadEnvelope(10, 20, now), now, first) {
+		t.Fatal("precondition: the signed-in account's reading must land")
+	}
+
+	// The swap happens after the frame was scoped to `first` and before its
+	// merge — here, before the capture call that stands in for it.
+	helperCodexAuthAt(t, home, "second@example.com", now)
+	second := currentCodexAccountFingerprint()
+	if second == first {
+		t.Fatal("precondition: the fixture must change the active account")
+	}
+	if !captureCodexRateLimitLineForAccount(codexLiveReadEnvelope(33, 44, now), now, second) {
+		t.Fatal("the new account's reading must land")
+	}
+	if captureCodexRateLimitLineForAccount(codexLiveReadEnvelope(55, 66, now.Add(time.Second)), now.Add(time.Second), first) {
+		t.Fatal("a frame pinned to the previous account must not be merged")
+	}
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	if snap.AccountFingerprint != second {
+		t.Fatalf("fingerprint = %q, want the newly signed-in account", snap.AccountFingerprint)
+	}
+	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 33 {
+		t.Fatalf("primary = %v, want the new account's 33 (the dropped frame carried 55)", got)
 	}
 }

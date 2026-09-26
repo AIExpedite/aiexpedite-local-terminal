@@ -729,15 +729,36 @@ func cachedProbeVersionWithEnv(path string, env []string) string {
 // for the binary as it is now (same path, mtime, size), without spawning
 // anything. ok is false when no probe of this exact binary is cached.
 func peekCachedProbeVersion(path string) (string, bool) {
+	v, _, ok := peekCachedProbeVersionIdentity(path)
+	return v, ok
+}
+
+// peekCachedProbeVersionIdentity is peekCachedProbeVersion plus the identity
+// the reading was validated against, so a caller that KEEPS the version past
+// the peek can re-check later whether that exact binary is still on disk. An
+// installer never participates in any of our locks, so identity is the only
+// thing that survives the interval.
+func peekCachedProbeVersionIdentity(path string) (string, versionProbeKey, bool) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", false
+		return "", versionProbeKey{}, false
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
 	versionProbeMu.Lock()
 	defer versionProbeMu.Unlock()
 	v, ok := versionProbeCache[key]
-	return v, ok
+	return v, key, ok
+}
+
+// versionProbeIdentityCurrent reports whether the binary key was recorded for
+// is still the file on disk. A zero key (no identity was ever validated) is
+// not current: there is nothing to confirm.
+func versionProbeIdentityCurrent(key versionProbeKey) bool {
+	if key.Path == "" {
+		return false
+	}
+	info, err := os.Stat(key.Path)
+	return err == nil && info.ModTime().UnixNano() == key.ModUnix && info.Size() == key.Size
 }
 
 // cachedProbeVersionFunc is the caching half on its own, for a caller whose

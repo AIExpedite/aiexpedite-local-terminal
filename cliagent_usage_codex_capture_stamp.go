@@ -42,13 +42,29 @@ import (
 // A long-lived child snapshots it at spawn and stamps with that pinned value
 // (captureCodexRateLimitLineFromProducer), so an upgrade published while it
 // runs is not credited to its pre-upgrade telemetry.
-var codexUsageCaptureVersion atomic.Value // string
+var codexUsageCaptureVersion atomic.Value // codexCaptureVersionStamp
 
-// publishCodexUsageCaptureVersion records the producing binary's version. An
-// empty version (a failed `--version` probe) never overwrites a known one.
+// codexCaptureVersionStamp is a published version together with the identity
+// of the binary it was validated against. The identity is what lets a LATER
+// reader (a child about to be spawned) tell that the published build is no
+// longer the one installed: the installer takes none of our locks, so the file
+// can be replaced between a publish and the launch that pins it. A zero
+// identity means the publisher could not name a binary for the reading.
+type codexCaptureVersionStamp struct {
+	version  string
+	identity versionProbeKey
+}
+
+// publishCodexUsageCaptureVersion records the producing binary's version with
+// no identity attached. An empty version (a failed `--version` probe) never
+// overwrites a known one.
 func publishCodexUsageCaptureVersion(version string) {
+	publishCodexUsageCaptureVersionWithIdentity(version, versionProbeKey{})
+}
+
+func publishCodexUsageCaptureVersionWithIdentity(version string, identity versionProbeKey) {
 	if version = codexNormalizeVersion(version); version != "" {
-		codexUsageCaptureVersion.Store(version)
+		codexUsageCaptureVersion.Store(codexCaptureVersionStamp{version: version, identity: identity})
 	}
 }
 
@@ -82,6 +98,14 @@ func publishCodexUsageCaptureVersion(version string) {
 // version anyway. Under the lock a publisher either stores before the newer
 // one (which then overwrites it) or checks after it, when the cache already
 // names the replacement and the stale version is refused.
+//
+// The validated identity is KEPT with the published version. The mutex orders
+// publishers against each other but not against the installer, so a binary
+// replaced between the peek and the store is published as installed with no
+// newer publisher around to correct it — and a child spawned in that window
+// would pin the gone build and stamp its new-build telemetry old for its whole
+// life. Carrying the identity lets a launch re-check it with a single stat and
+// pin nothing (unknown producer) rather than the wrong version.
 func publishCodexUsageCaptureVersionFrom(path, version string) {
 	codexCaptureVersionPublishMu.Lock()
 	defer codexCaptureVersionPublishMu.Unlock()
@@ -89,16 +113,16 @@ func publishCodexUsageCaptureVersionFrom(path, version string) {
 		publishCodexUsageCaptureVersion(version)
 		return
 	}
-	installed, ok := peekCachedProbeVersion(path)
+	installed, identity, ok := peekCachedProbeVersionIdentity(path)
 	if !ok || codexNormalizeVersion(installed) != codexNormalizeVersion(version) {
 		return
 	}
-	publishCodexUsageCaptureVersion(version)
+	publishCodexUsageCaptureVersionWithIdentity(version, identity)
 }
 
 // codexCaptureVersionPublishMu makes publishCodexUsageCaptureVersionFrom's
 // identity check and store one step. Taken before versionProbeMu (inside
-// peekCachedProbeVersion), never the other way round.
+// peekCachedProbeVersionIdentity), never the other way round.
 var codexCaptureVersionPublishMu sync.Mutex
 
 // codexVersionMaxBytes bounds a `--version` first line before it is persisted,
@@ -116,8 +140,30 @@ func codexNormalizeVersion(version string) string {
 // currentCodexUsageCaptureVersion is the version captures are stamped with, or
 // "" while no publisher has named the binary yet.
 func currentCodexUsageCaptureVersion() string {
-	v, _ := codexUsageCaptureVersion.Load().(string)
-	return v
+	return currentCodexUsageCaptureStamp().version
+}
+
+func currentCodexUsageCaptureStamp() codexCaptureVersionStamp {
+	stamp, _ := codexUsageCaptureVersion.Load().(codexCaptureVersionStamp)
+	return stamp
+}
+
+// codexInstalledCaptureVersion is the published version, but only while the
+// binary it was read from is still the file on disk — the check a launch needs
+// and a stamp of already-received telemetry does not. A replacement that
+// landed after the publish yields "" (unknown producer), which leaves the
+// cache's existing stamp untouched instead of crediting the removed build with
+// the new one's telemetry. A version published without an identity (a test, or
+// a caller that had no path) is returned as-is: there is nothing to invalidate.
+func codexInstalledCaptureVersion() string {
+	stamp := currentCodexUsageCaptureStamp()
+	if stamp.version == "" || stamp.identity.Path == "" {
+		return stamp.version
+	}
+	if !versionProbeIdentityCurrent(stamp.identity) {
+		return ""
+	}
+	return stamp.version
 }
 
 // codexInstalledVersion reads the installed Codex binary's version through the
@@ -155,7 +201,7 @@ func codexResolveCaptureVersion() {
 // than crediting the installed build with another binary's telemetry.
 func codexCaptureVersionForLaunch(command, executable string) string {
 	if !isExplicitPath(command) {
-		return currentCodexUsageCaptureVersion()
+		return codexInstalledCaptureVersion()
 	}
 	if v, ok := peekCachedProbeVersion(executable); ok {
 		return codexNormalizeVersion(v)
@@ -275,4 +321,11 @@ func codexContributorObservationAdvanced(before map[string]int64, after map[stri
 		}
 	}
 	return false
+}
+
+// codexResetUsageCaptureVersion clears the published stamp. Test seam: a
+// publish never clears (an empty version must not overwrite a known one), and
+// a case that asserts the unknown-producer behaviour needs to start there.
+func codexResetUsageCaptureVersion() {
+	codexUsageCaptureVersion.Store(codexCaptureVersionStamp{})
 }

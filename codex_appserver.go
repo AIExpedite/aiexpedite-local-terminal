@@ -596,7 +596,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	// Pinned before the spawn for the same reason as the pipe-session path: a
 	// version published between Start() and the struct literal below describes a
 	// build this long-lived child is not running.
-	codexCaptureVersion := currentCodexUsageCaptureVersion()
+	codexCaptureVersion := codexCaptureVersionForLaunch("codex", executable)
 
 	if err := proc.Start(); err != nil {
 		stdin.Close()
