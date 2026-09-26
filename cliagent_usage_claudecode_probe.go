@@ -445,9 +445,17 @@ type claudeUsageProbeGate struct {
 	// the gather that inherited it would re-read the cache, find nothing for its
 	// own account, and sign a receipt with no fresh utilization — having already
 	// spent the join that would have probed for it.
+	//
+	// lastRefreshShared marks an advance that came from the cross-process dedupe:
+	// the probe issued nothing because another writer had already persisted a
+	// covering reading. That reading is on disk, so a gather that loaded its view
+	// earlier must still re-read (refreshLandedSince, seedOwedFromCache) — but it
+	// is not this process's answer, so joinInFlight does not hand it to a forced
+	// refresh, which is never deduped against the shared cache.
 	refreshes              uint64
 	lastRefreshAt          time.Time
 	lastRefreshFingerprint string
+	lastRefreshShared      bool
 	// cancelTrailing is closed by resetClaudeUsageProbeGate to abandon any timer
 	// that is currently sleeping. A trailing probe resolves the endpoint and the
 	// cache path when it WAKES, so one that outlives its test would read whatever
@@ -762,9 +770,9 @@ func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context, fingerprint str
 		return false, time.Time{}
 	}
 	g.mu.Lock()
-	after, at, forAccount := g.refreshes, g.lastRefreshAt, g.lastRefreshFingerprint
+	after, at, forAccount, shared := g.refreshes, g.lastRefreshAt, g.lastRefreshFingerprint, g.lastRefreshShared
 	g.mu.Unlock()
-	if after == before || forAccount != fingerprint {
+	if after == before || forAccount != fingerprint || shared {
 		return true, time.Time{}
 	}
 	return true, at
@@ -985,7 +993,8 @@ func (g *claudeUsageProbeGate) refreshGeneration() uint64 {
 	return g.refreshes
 }
 
-// refreshLandedSince reports whether a probe of THIS process persisted, for
+// refreshLandedSince reports whether a probe of THIS process persisted — or
+// deduped against another writer that persisted — for
 // `fingerprint`, a reading newer than `latest` since `generation` was sampled.
 //
 // seedOwedFromCache asks the same question, but only as of the moment it runs.
@@ -1233,13 +1242,19 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 // wrote and `fingerprint` the account it wrote them under, both recorded only
 // alongside a refresh so a joiner can tell WHEN the reading it is inheriting
 // was taken and WHOSE it is, not merely that there was one.
+//
+// An unrefreshed probe that still reports an observation took the dedupe path:
+// another writer's covering reading is on disk and the debt it covers is
+// already settled. It advances the generation too — flagged shared — so a gather
+// that loaded its view before it cannot publish the pre-write metrics.
 func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time, fingerprint string) {
 	g.mu.Lock()
 	g.inFlight = false
-	if refreshed {
+	if refreshed || (probeErr == nil && !observedAt.IsZero()) {
 		g.refreshes++
 		g.lastRefreshAt = observedAt
 		g.lastRefreshFingerprint = fingerprint
+		g.lastRefreshShared = !refreshed
 	}
 	switch {
 	case probeErr == nil:
@@ -1542,8 +1557,9 @@ func probeClaudeUsageAdmitted(
 		// gate lock, so a run that finished after this reading keeps its debt.
 		claudeUsageProbe.settleOwedIfCovered(sharedAt)
 		// Report the shared reading even though this process issued no request.
-		// `refreshed` stays false — nothing here wrote, and finish() must not
-		// record a refresh a joiner could inherit as ours — but the caller still
+		// `refreshed` stays false — nothing here wrote, so finish() records it as
+		// SHARED: visible to refreshLandedSince, never inherited by a forced
+		// joiner as ours — but the caller still
 		// has to know the SHARED cache moved: it loaded its view before this
 		// check, so without the instant it would shape metrics from the pre-write
 		// buckets while the debt (and the trailing retry that would have

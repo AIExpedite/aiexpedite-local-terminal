@@ -1645,3 +1645,62 @@ func TestRefreshClaudeUsageIfStale_OwingGatherJoinsTheInFlightPayer(t *testing.T
 		t.Errorf("issued %d requests, want 0 — the joined probe answered", n)
 	}
 }
+
+// The post-seed replay can also land WITHOUT persisting anything itself: another
+// process wrote a covering reading first, so the replay takes the cross-process
+// dedupe path and settles the debt with it. That shared reading is on disk, so an
+// overlapping gather that loaded its view earlier must still re-read — while a
+// forced refresh joining that probe must not inherit it as an answer.
+func TestRefreshClaudeUsageIfStale_ReportsADedupedReplayThatLandedAfterTheSeed(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	latest := time.Now().Add(-2 * time.Minute) // fresh by the TTL
+	seedClaudeProbeReading(t, cache, latest)
+
+	generation := claudeUsageProbe.refreshGeneration()
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, time.Now(), latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero before the replay lands", got)
+	}
+	// The replay is admitted, finds another writer's covering reading, and
+	// finishes on the dedupe path: nothing written by us, an observation reported.
+	if !claudeUsageProbe.begin(time.Now(), false) {
+		t.Fatal("the simulated replay was not admitted")
+	}
+	before := claudeUsageProbe.refreshGeneration()
+	joined := make(chan time.Time, 1)
+	go func() {
+		ok, at := claudeUsageProbe.joinInFlight(context.Background(), fp)
+		if !ok {
+			at = time.Unix(1, 0) // sentinel: the join did not happen
+		}
+		joined <- at
+	}()
+	for {
+		claudeUsageProbe.mu.Lock()
+		waiting := claudeUsageProbe.doneCh != nil
+		claudeUsageProbe.mu.Unlock()
+		if waiting {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // let the joiner park on doneCh
+	claudeUsageProbe.finish(nil, false, latest.Add(time.Minute), fp)
+
+	if at := <-joined; !at.IsZero() {
+		t.Fatalf("joinInFlight()=%v, want a joined-but-unusable answer — a forced refresh never inherits a dedupe", at)
+	}
+	if claudeUsageProbe.refreshGeneration() == before {
+		t.Fatal("a deduped replay did not advance the refresh generation")
+	}
+	if !refreshClaudeUsageIfStaleFrom(context.Background(), generation, time.Now(), latest, "token", fp) {
+		t.Fatal("a deduped replay that landed after the seed was not reported, so the gather would publish the pre-replay view")
+	}
+	// Another account's shared reading says nothing about this one.
+	if refreshClaudeUsageIfStaleFrom(context.Background(), generation, time.Now(), latest, "token", "someone-else") {
+		t.Fatal("a shared reading for another account must not ask this one to re-read")
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0 — the view was fresh", n)
+	}
+}
