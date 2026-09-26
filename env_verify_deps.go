@@ -18,6 +18,11 @@
 //	    (and `resolved` when neither side has an integrity — a git or file
 //	    dependency, whose version alone does not move with its commit).
 //
+//	link targets
+//	  - every `link: true` folder must actually point (realpath) at its
+//	    `resolved`, taken relative to the project root — lockfiles that agree
+//	    prove nothing about links swapped or repointed on disk.
+//
 //	representativeness (npm's own rule for trusting a hidden lockfile,
 //	arborist shrinkwrap.js assertNoNewer)
 //	  - every package folder it lists exists;
@@ -313,10 +318,13 @@ func verifyDependencies(ctx context.Context, req envVerifyDepsRequest, platform 
 		return res, nil
 	}
 
-	if diffs := compareLockEntries(
-		normalizeLockPackages(lock.Packages, platform),
-		normalizeLockPackages(hidden.Packages, platform),
-	); len(diffs) > 0 {
+	want := normalizeLockPackages(lock.Packages, platform)
+	if diffs := compareLockEntries(want, normalizeLockPackages(hidden.Packages, platform)); len(diffs) > 0 {
+		res.Reason = verifyReasonEntriesDiffer
+		res.Mismatches = capMismatches(diffs)
+		return res, nil
+	}
+	if diffs := checkLinkTargets(root, want); len(diffs) > 0 {
 		res.Reason = verifyReasonEntriesDiffer
 		res.Mismatches = capMismatches(diffs)
 		return res, nil
@@ -489,6 +497,33 @@ func checkHiddenLockfileRepresentative(ctx context.Context, root string, package
 	return representativeness{}, nil
 }
 
+// linkRealPath follows a link (symlink or Windows junction) to the directory it
+// finally names. filepath.EvalSymlinks alone is not enough: since Go 1.23 it
+// does not traverse Windows junctions, which is how npm links workspaces there.
+func linkRealPath(p string) (string, error) {
+	for i := 0; i < 16; i++ {
+		t, err := os.Readlink(p)
+		if err != nil {
+			break // not a link (any more)
+		}
+		if !filepath.IsAbs(t) {
+			t = filepath.Join(filepath.Dir(p), t)
+		}
+		p = filepath.Clean(t)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", p)
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r, nil
+	}
+	return p, nil
+}
+
 // resolveDirLink returns a link's target the way npm does
 // (path.resolve(dirname(link), readlink(link))), falling back to full
 // resolution when the link cannot be read directly.
@@ -515,4 +550,53 @@ func isLinkEntry(e os.DirEntry, full string) bool {
 		}
 	}
 	return false
+}
+
+// checkLinkTargets compares where every `link: true` entry's folder actually
+// points (its realpath) with the entry's `resolved` (relative to the project
+// root). Two lockfiles can agree perfectly while the links on disk were swapped
+// or repointed by hand, so the entries alone never prove a link. A link folder
+// that does not exist or dangles is left to the representativeness check
+// (folder_missing).
+func checkLinkTargets(root string, want map[string]lockEntry) []string {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = root
+	}
+	canonical := func(p string) string {
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			p = r
+		}
+		p = filepath.Clean(p)
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			p = strings.ToLower(p)
+		}
+		return p
+	}
+	relToRoot := func(p string) string {
+		if r, err := filepath.Rel(realRoot, p); err == nil {
+			return filepath.ToSlash(r)
+		}
+		return filepath.ToSlash(p)
+	}
+	var diffs []string
+	for k, e := range want {
+		if !e.Link {
+			continue
+		}
+		linkPath := filepath.Join(root, filepath.FromSlash(k))
+		if _, err := os.Lstat(linkPath); err != nil {
+			continue
+		}
+		actual, err := linkRealPath(linkPath)
+		if err != nil {
+			continue // dangling: reported folder_missing
+		}
+		expected := filepath.Join(root, filepath.FromSlash(e.Resolved))
+		if canonical(actual) != canonical(expected) {
+			diffs = append(diffs, fmt.Sprintf("%s: links to %s, lockfile says %s", k, relToRoot(actual), e.Resolved))
+		}
+	}
+	sort.Strings(diffs)
+	return diffs
 }

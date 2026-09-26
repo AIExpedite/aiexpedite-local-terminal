@@ -294,10 +294,11 @@ func TestRunProbesParallel_BoundedAndComplete(t *testing.T) {
    -------------------------------------------------------------------------- */
 
 func TestNormalizeSetupToolCatalog(t *testing.T) {
-	got := normalizeSetupToolCatalog([]setupToolCatalogEntry{
+	got, skipped := normalizeSetupToolCatalogReport([]setupToolCatalogEntry{
 		{ID: "git", Command: "git"},
 		{ID: "GIT", Command: "git"}, // duplicate id
 		{ID: "java", Command: "java", VersionArgs: []string{"-version"}, VersionPattern: `version "([^"]+)"`},
+		{ID: "kubectl", Command: "kubectl", VersionArgs: []string{"version", "--short"}},
 		{ID: "gpu", Command: "nvidia-smi", VersionArgs: []string{"--query-gpu=driver_version", "--format=csv,noheader"}},
 		{ID: "evil1", Command: "powershell", VersionArgs: []string{"--version"}},
 		{ID: "evil2", Command: "node", VersionArgs: []string{"-e", "process.exit"}},
@@ -310,11 +311,86 @@ func TestNormalizeSetupToolCatalog(t *testing.T) {
 	want := []setupToolCatalogEntry{
 		{ID: "git", Command: "git", VersionArgs: []string{"--version"}},
 		{ID: "java", Command: "java", VersionArgs: []string{"-version"}, VersionPattern: `version "([^"]+)"`},
-		{ID: "gpu", Command: "nvidia-smi", VersionArgs: []string{"--query-gpu=driver_version", "--format=csv,noheader"}},
+		{ID: "kubectl", Command: "kubectl", VersionArgs: []string{"version", "--short"}},
 		{ID: "long", Command: "go", VersionArgs: []string{"version"}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got  %+v\nwant %+v", got, want)
+	}
+	if len(skipped) != 8 {
+		t.Fatalf("expected 8 skipped entries with reasons, got %q", skipped)
+	}
+}
+
+// A catalog probe can only ever be a version query: anything that would run a
+// different operation, however plausible its flags, is refused.
+func TestNormalizeSetupToolCatalog_RefusesNonVersionCommands(t *testing.T) {
+	refused := []setupToolCatalogEntry{
+		{ID: "codex", Command: "npm", VersionArgs: []string{"uninstall", "-g", "codex"}},
+		{ID: "codex2", Command: "npm uninstall -g codex"},
+		{ID: "a", Command: "npm", VersionArgs: []string{"install", "-g", "x"}},
+		{ID: "b", Command: "git", VersionArgs: []string{"--version", "--exec-path=/tmp"}},
+		{ID: "c", Command: "gh", VersionArgs: []string{"auth", "logout"}},
+		{ID: "d", Command: "docker", VersionArgs: []string{"system", "prune", "-f"}},
+		{ID: "e", Command: "winget", VersionArgs: []string{"uninstall", "Git.Git"}},
+		{ID: "f", Command: "node", VersionArgs: []string{"--version", "-e"}},
+		{ID: "g", Command: "git", VersionArgs: []string{"--VERSION"}},
+		{ID: "h", Command: "git", VersionArgs: []string{"-version", "--json"}},
+		{ID: "i", Command: `C:\Windows\System32\cmd`, VersionArgs: []string{"--version"}},
+		{ID: "j", Command: "/usr/bin/git"},
+		{ID: "k", Command: "sh", VersionArgs: []string{"--version"}},
+	}
+	for _, e := range refused {
+		got, skipped := normalizeSetupToolCatalogReport([]setupToolCatalogEntry{e})
+		if len(got) != 0 || len(skipped) != 1 {
+			t.Errorf("%+v was accepted (got %+v)", e, got)
+		}
+	}
+	// A refused entry is never spawned by a pass.
+	f := &fakeProbeRunner{answers: map[string]string{"npm": "removed 1 package"}}
+	if res := probeSetupToolCatalog(context.Background(), normalizeSetupToolCatalog(refused), nil, f.run); len(res) != 0 || len(f.calls) != 0 {
+		t.Fatalf("refused entries ran: %v %v", res, f.calls)
+	}
+}
+
+// Every detect entry the db-content catalog ships today (dev/setupTools/*.json
+// `detect`, plus the cliAgents' commands with the default --version, as
+// terminal-service sends them) is accepted unchanged. Transcribed from
+// db-content origin/main on 2026-09-26; a new versionArgs form there needs an
+// agent release adding it to setupToolVersionArgForms first.
+func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
+	real := []setupToolCatalogEntry{
+		{ID: "cuda-toolkit", Command: "nvcc", VersionArgs: []string{"--version"}, VersionPattern: `release (\d+\.\d+)`},
+		{ID: "docker-desktop", Command: "docker", VersionArgs: []string{"--version"}, VersionPattern: `version (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "firebase-tools", Command: "firebase", VersionArgs: []string{"--version"}, VersionPattern: `(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "flutter", Command: "flutter", VersionArgs: []string{"--version"}, VersionPattern: `Flutter (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "gh", Command: "gh", VersionArgs: []string{"--version"}, VersionPattern: `gh version (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "git", Command: "git", VersionArgs: []string{"--version"}, VersionPattern: `git version (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "go", Command: "go", VersionArgs: []string{"version"}, VersionPattern: `go(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "godot", Command: "godot", VersionArgs: []string{"--version"}, VersionPattern: `(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "java", Command: "java", VersionArgs: []string{"--version"}, VersionPattern: `(?:openjdk|java) (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "node", Command: "node", VersionArgs: []string{"--version"}, VersionPattern: `v?(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "playwright", Command: "playwright", VersionArgs: []string{"--version"}, VersionPattern: `(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "python", Command: "python3", VersionArgs: []string{"--version"}, VersionPattern: `Python (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "python-windows", Command: "python", VersionArgs: []string{"--version"}, VersionPattern: `Python (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "terraform", Command: "terraform", VersionArgs: []string{"--version"}, VersionPattern: `Terraform v(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "uv", Command: "uv", VersionArgs: []string{"--version"}, VersionPattern: `uv (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "vscode", Command: "code", VersionArgs: []string{"--version"}, VersionPattern: `(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "xcode", Command: "xcodebuild", VersionArgs: []string{"-version"}, VersionPattern: `Xcode (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "antigravity", Command: "agy", VersionArgs: []string{"--version"}},
+		{ID: "claudeCode", Command: "claude", VersionArgs: []string{"--version"}},
+		{ID: "codex", Command: "codex", VersionArgs: []string{"--version"}},
+		{ID: "grok", Command: "grok", VersionArgs: []string{"--version"}},
+		{ID: "opencode", Command: "opencode"}, // no versionArgs: defaults to --version
+	}
+	got, skipped := normalizeSetupToolCatalogReport(real)
+	if len(skipped) != 0 || len(got) != len(real) {
+		t.Fatalf("real catalog entries refused: %q", skipped)
+	}
+	for i := range real {
+		if got[i].Command != real[i].Command || got[i].VersionPattern != real[i].VersionPattern {
+			t.Fatalf("entry %d changed: %+v -> %+v", i, real[i], got[i])
+		}
 	}
 }
 

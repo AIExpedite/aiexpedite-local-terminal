@@ -403,6 +403,45 @@ func TestVerifyDependencies_DanglingLinkIsMissing(t *testing.T) {
 	}
 }
 
+// Two workspace links swapped on disk: both lockfiles still agree entry for
+// entry, so only the link targets can catch it.
+func TestVerifyDependencies_SwappedWorkspaceLinks(t *testing.T) {
+	lock := baseLock()
+	lock["node_modules/ws-a"] = map[string]any{"resolved": "packages/ws-a", "link": true}
+	lock["node_modules/ws-b"] = map[string]any{"resolved": "packages/ws-b", "link": true}
+	lock["packages/ws-a"] = map[string]any{"name": "ws-a", "version": "0.1.0"}
+	lock["packages/ws-b"] = map[string]any{"name": "ws-b", "version": "0.2.0"}
+	folders := append(baseFolders(), "packages/ws-a", "packages/ws-b")
+
+	fx := depsFixture{lock: lock, hidden: hiddenOf(lock), folders: folders, links: map[string]string{
+		"node_modules/ws-a": "../packages/ws-a",
+		"node_modules/ws-b": "../packages/ws-b",
+	}}
+	res, err := verifyDependencies(context.Background(), envVerifyDepsRequest{Path: fx.build(t), Manager: "npm"}, fixturePlatform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Match {
+		t.Fatalf("correct links should verify: %q %q", res.Reason, res.Mismatches)
+	}
+
+	fx.links = map[string]string{
+		"node_modules/ws-a": "../packages/ws-b",
+		"node_modules/ws-b": "../packages/ws-a",
+	}
+	res, err = verifyDependencies(context.Background(), envVerifyDepsRequest{Path: fx.build(t), Manager: "npm"}, fixturePlatform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"node_modules/ws-a: links to packages/ws-b, lockfile says packages/ws-a",
+		"node_modules/ws-b: links to packages/ws-a, lockfile says packages/ws-b",
+	}
+	if res.Match || res.Reason != verifyReasonEntriesDiffer || !reflect.DeepEqual(res.Mismatches, want) {
+		t.Fatalf("swapped links: match=%v reason=%q mismatches=%q", res.Match, res.Reason, res.Mismatches)
+	}
+}
+
 func TestVerifyDependencies_Inputs(t *testing.T) {
 	res, err := verifyDependencies(context.Background(), envVerifyDepsRequest{Path: t.TempDir(), Manager: "pnpm"}, fixturePlatform)
 	if err != nil || res.Match || res.Reason != verifyReasonUnsupportedManager {

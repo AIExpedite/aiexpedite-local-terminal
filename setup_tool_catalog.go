@@ -52,8 +52,6 @@ type setupToolCatalogEntry struct {
 
 const (
 	maxSetupToolCatalogEntries = 64
-	maxSetupToolVersionArgs    = 6
-	maxSetupToolArgLength      = 64
 	maxSetupToolPatternLength  = 256
 	// setupToolPassBudget bounds a whole catalog pass. An __env_inspect__ allows
 	// 20 s in total; the pass runs beside the gather, so it must finish inside.
@@ -63,67 +61,100 @@ const (
 var (
 	setupToolIDPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	setupToolCommandPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
-	setupToolArgPattern     = regexp.MustCompile(`^-{0,2}[A-Za-z0-9][A-Za-z0-9._=,-]*$`)
 )
 
-// Defense in depth: the catalog comes from our own authenticated backend, but a
-// version probe never needs an interpreter or an evaluate flag, so an entry
-// that asks for one is dropped rather than run.
-var (
-	setupToolDeniedCommands = map[string]bool{
-		"cmd": true, "powershell": true, "pwsh": true, "bash": true, "sh": true,
-		"zsh": true, "fish": true, "dash": true, "ksh": true, "csh": true, "tcsh": true,
-		"wsl": true, "env": true, "sudo": true, "doas": true, "osascript": true,
-		"rundll32": true, "mshta": true, "wscript": true, "cscript": true, "start": true,
-		"xargs": true, "nohup": true, "open": true,
+// setupToolVersionArgForms is the COMPLETE set of argument lists a catalog probe
+// may run. The catalog comes from our own authenticated backend, but its only
+// job is detection: a probe must never be able to run anything but a version
+// query (`npm uninstall -g codex` is a perfectly valid bare command plus flags).
+// An entry asking for any other form is skipped and logged, never executed.
+// Covers every form the db-content setupTools / cliAgents catalog uses today
+// (`--version`, `version`, `-version`) plus the other common spellings; a new
+// form means an agent release, on purpose.
+var setupToolVersionArgForms = [][]string{
+	{"--version"},
+	{"-v"},
+	{"-V"},
+	{"version"},
+	{"-version"},
+	{"--version", "--json"},
+	{"version", "--short"},
+}
+
+func isAllowedVersionArgs(args []string) bool {
+	for _, form := range setupToolVersionArgForms {
+		if len(form) != len(args) {
+			continue
+		}
+		match := true
+		for i := range form {
+			if form[i] != args[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
 	}
-	setupToolDeniedArgs = map[string]bool{
-		"-c": true, "-e": true, "-p": true, "--eval": true, "--print": true,
-		"-command": true, "-encodedcommand": true, "-enc": true, "-ec": true,
-		"-file": true, "--exec": true, "-exec": true, "--require": true, "-r": true,
-		"-m": true, "--import": true, "--loader": true,
-	}
-)
+	return false
+}
+
+// Defense in depth on top of the version-args allowlist: a shell or launcher is
+// never a detected tool, so it is never probed.
+var setupToolDeniedCommands = map[string]bool{
+	"cmd": true, "powershell": true, "pwsh": true, "bash": true, "sh": true,
+	"zsh": true, "fish": true, "dash": true, "ksh": true, "csh": true, "tcsh": true,
+	"wsl": true, "env": true, "sudo": true, "doas": true, "osascript": true,
+	"rundll32": true, "mshta": true, "wscript": true, "cscript": true, "start": true,
+	"xargs": true, "nohup": true, "open": true,
+}
 
 // normalizeSetupToolCatalog validates and canonicalizes entries: ids unique
-// (case-insensitive, first wins), command a bare program name, versionArgs
-// flag-like tokens (default ["--version"]), an over-long pattern dropped.
-// Invalid entries are skipped, never an error.
+// (case-insensitive, first wins), command a bare program name (no path
+// separators), versionArgs exactly one of setupToolVersionArgForms (default
+// ["--version"]), an over-long pattern dropped. Invalid entries are skipped,
+// never an error.
 func normalizeSetupToolCatalog(entries []setupToolCatalogEntry) []setupToolCatalogEntry {
-	out := make([]setupToolCatalogEntry, 0, len(entries))
+	out, _ := normalizeSetupToolCatalogReport(entries)
+	return out
+}
+
+// normalizeSetupToolCatalogReport is normalizeSetupToolCatalog that also says
+// why each skipped entry was skipped.
+func normalizeSetupToolCatalogReport(entries []setupToolCatalogEntry) (out []setupToolCatalogEntry, skipped []string) {
+	out = make([]setupToolCatalogEntry, 0, len(entries))
 	seen := map[string]bool{}
 	for _, raw := range entries {
 		if len(out) >= maxSetupToolCatalogEntries {
-			break
+			skipped = append(skipped, fmt.Sprintf("%q: catalog exceeds %d entries", raw.ID, maxSetupToolCatalogEntries))
+			continue
 		}
 		id := strings.TrimSpace(raw.ID)
 		command := strings.TrimSpace(raw.Command)
-		if !setupToolIDPattern.MatchString(id) || !setupToolCommandPattern.MatchString(command) {
+		if !setupToolIDPattern.MatchString(id) {
+			skipped = append(skipped, fmt.Sprintf("%q: invalid id", raw.ID))
+			continue
+		}
+		if !setupToolCommandPattern.MatchString(command) {
+			skipped = append(skipped, fmt.Sprintf("%q: command %q is not a bare program name", id, command))
 			continue
 		}
 		if setupToolDeniedCommands[strings.ToLower(commandBaseName(command))] {
+			skipped = append(skipped, fmt.Sprintf("%q: command %q is never a detected tool", id, command))
 			continue
 		}
 		key := strings.ToLower(id)
 		if seen[key] {
+			skipped = append(skipped, fmt.Sprintf("%q: duplicate id", id))
 			continue
 		}
 		args := raw.VersionArgs
 		if len(args) == 0 {
 			args = []string{"--version"}
 		}
-		if len(args) > maxSetupToolVersionArgs {
-			continue
-		}
-		validArgs := true
-		for _, a := range args {
-			if len(a) > maxSetupToolArgLength || !setupToolArgPattern.MatchString(a) ||
-				setupToolDeniedArgs[strings.ToLower(a)] {
-				validArgs = false
-				break
-			}
-		}
-		if !validArgs {
+		if !isAllowedVersionArgs(args) {
+			skipped = append(skipped, fmt.Sprintf("%q: versionArgs %q is not a version query", id, args))
 			continue
 		}
 		pattern := raw.VersionPattern
@@ -138,7 +169,7 @@ func normalizeSetupToolCatalog(entries []setupToolCatalogEntry) []setupToolCatal
 			VersionPattern: pattern,
 		})
 	}
-	return out
+	return out, skipped
 }
 
 func cloneSetupToolCatalog(entries []setupToolCatalogEntry) []setupToolCatalogEntry {
@@ -198,6 +229,11 @@ var refreshSetupToolsAfterCatalogUpdate = func() {
 func persistSetupToolCatalogUpdate(cfg *Config, entries []setupToolCatalogEntry, logScope, source string) bool {
 	if cfg == nil || entries == nil {
 		return false
+	}
+	if _, skipped := normalizeSetupToolCatalogReport(entries); len(skipped) > 0 {
+		for _, reason := range skipped {
+			fmt.Printf("%s[%s] setup-tool catalog entry skipped (never probed): %s%s\n", colorYellow, logScope, reason, colorReset)
+		}
 	}
 	changed := false
 	if err := cfg.MutateAndSave(ConfigPath(), func() {
