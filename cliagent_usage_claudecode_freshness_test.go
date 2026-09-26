@@ -240,7 +240,7 @@ func TestMutateClaudeRateLimitSnapshot_ResetsAForeignFingerprintFirst(t *testing
 		snap.RefreshOwedAtMs = now.UnixMilli()
 		return true
 	})
-	if owed, _ := claudeRunRefreshOwed(); !owed.IsZero() {
+	if owed, _ := claudeRunRefreshOwedFor(currentClaudeAccountFingerprint()); !owed.IsZero() {
 		t.Errorf("another account's debt is visible to this one: %v", owed)
 	}
 }
@@ -419,5 +419,72 @@ func TestClaudeUsageProbe_RetryAfterHoldIsPersisted(t *testing.T) {
 	}
 	if got := time.UnixMilli(snap.HeldUntilMs); got.Before(now.Add(25*time.Minute)) || got.After(now.Add(35*time.Minute)) {
 		t.Errorf("HeldUntilMs=%v, want ~30 minutes out", got)
+	}
+}
+
+// An attempt the single-flight gate never admitted issued no request, so the
+// charge is REFUNDED. Without it two unlucky starts would retire a debt that
+// was never once put to the endpoint — exactly the stale card this path clears.
+func TestPayOwedClaudeUsageRefresh_UnadmittedAttemptIsRefunded(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+
+	// Pin the single-flight slot, as a concurrent gather's probe would.
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.inFlight = true
+	claudeUsageProbe.doneCh = make(chan struct{})
+	claudeUsageProbe.mu.Unlock()
+
+	payOwedClaudeUsageRefreshAt(now)
+
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.inFlight = false
+	close(claudeUsageProbe.doneCh)
+	claudeUsageProbe.doneCh = nil
+	claudeUsageProbe.mu.Unlock()
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the gate refused the attempt", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != owed.UnixMilli() {
+		t.Fatalf("the debt must stand: %+v", snap)
+	}
+	if snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("RefreshOwedAttempts=%d, want 0 — an unadmitted attempt spends nothing", snap.RefreshOwedAttempts)
+	}
+	if snap.AccountFingerprint != fp {
+		t.Errorf("cache scoped to %q, want %q", snap.AccountFingerprint, fp)
+	}
+}
+
+// A debt-only cache the mutator had to CREATE still carries a real updatedAt,
+// so a diagnostics upload never shows an empty timestamp.
+func TestMutateClaudeRateLimitSnapshot_StampsACreatedSnapshot(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	if _, err := os.Stat(cache); err == nil {
+		t.Fatal("this case needs a cache that does not exist yet")
+	}
+
+	claudeOweRunRefresh(time.Now())
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.UpdatedAt == "" {
+		t.Fatalf("a created snapshot must be stamped: %+v", snap)
+	}
+	if _, err := time.Parse(time.RFC3339, snap.UpdatedAt); err != nil {
+		t.Fatalf("updatedAt %q is not RFC3339: %v", snap.UpdatedAt, err)
+	}
+
+	// An EXISTING cache keeps its merge stamp: a debt marker is not an
+	// observation and must not pass for one.
+	stamped := claudeCacheSnapshot(t, cache).UpdatedAt
+	claudeOweRunRefresh(time.Now().Add(time.Minute))
+	if got := claudeCacheSnapshot(t, cache).UpdatedAt; got != stamped {
+		t.Errorf("updatedAt moved on a debt-only write: %q -> %q", stamped, got)
 	}
 }

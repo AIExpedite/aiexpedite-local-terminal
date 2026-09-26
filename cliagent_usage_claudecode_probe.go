@@ -915,32 +915,45 @@ func (g *claudeUsageProbeGate) settleOwedIfCovered(observed time.Time) {
 	g.mu.Unlock()
 }
 
-// owedObservation returns the outstanding post-run baseline, if any.
-//
-// It seeds itself ONCE from the debt the previous process persisted
-// (claudeRunRefreshOwed). payOwedClaudeUsageRefresh is spawned, so the first
-// gather of a fresh process can reach here before that replay has read the
-// cache; without the seed the `owing` branch of refreshClaudeUsageIfStale would
-// see no debt, defer to the claudeUsageProbeStaleAfter TTL, and publish the
-// pre-update reading — the stale card this whole path exists to prevent.
-//
-// The read happens OFF g.mu: this mutex is taken on the session stdout path, and
-// nothing that touches the filesystem may be held under it.
+// owedObservation returns the outstanding post-run baseline, if any. A pure
+// in-memory read: its callers include claudeUsageProbePayRecordedRun's
+// preflight loop, which must stay free of cache and credential reads (see the
+// note there). The DURABLE debt reaches the gate through seedOwedFromCache.
 func (g *claudeUsageProbeGate) owedObservation() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.owedBaseline
+}
+
+// seedOwedFromCache adopts, ONCE per process, the debt a previous process
+// persisted, so the `owing` branch below sees a run this process never saw.
+//
+// payOwedClaudeUsageRefresh seeds the same value, but it is SPAWNED: the first
+// gather of a fresh agent can reach the staleness check before that goroutine
+// has read the cache, find a reading younger than claudeUsageProbeStaleAfter,
+// and publish the PRE-update utilization — the stale card this whole path
+// exists to prevent.
+//
+// It takes the fingerprint the gather already decoded from its one credential
+// read rather than resolving its own. refreshClaudeUsageIfStale makes no
+// credential read by contract (a `security` spawn per gather on macOS), and the
+// seed must not be the thing that breaks it.
+//
+// The cache read happens OFF g.mu: that mutex is taken on the session stdout
+// path, so nothing touching the filesystem may be held under it.
+func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string) {
 	g.mu.Lock()
 	seed := !g.owedSeeded
 	g.owedSeeded = true
 	g.mu.Unlock()
-	if seed {
-		if persisted, _ := claudeRunRefreshOwed(); !persisted.IsZero() {
-			// recordOwed only ever RAISES the baseline, so a persisted debt can
-			// never walk back one this process recorded in the meantime.
-			g.recordOwed(persisted)
-		}
+	if !seed {
+		return
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.owedBaseline
+	if persisted, _ := claudeRunRefreshOwedFor(fingerprint); !persisted.IsZero() {
+		// recordOwed only ever RAISES the baseline, so a persisted debt can
+		// never walk back one this process recorded in the meantime.
+		g.recordOwed(persisted)
+	}
 }
 
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
@@ -1493,6 +1506,11 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// leave it to sign the cache it loaded before the probe landed. The ticket is
 	// on the refresh's own context, so only the requested gather can take it.
 	forced := claimClaudeUsageForceProbe(ctx)
+	// Adopt the previous process's debt before reading ours, so a run that
+	// finished just before a restart or self-update is not mistaken for "no
+	// debt" on this process's very first gather. Latched, and it reuses the
+	// fingerprint the caller already decoded — no extra credential read.
+	claudeUsageProbe.seedOwedFromCache(fingerprint)
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
 	// BEFORE the run is not "fresh enough" just because it is recent, and this is
 	// the backstop for a trailing probe that was too far out to schedule or that

@@ -93,8 +93,10 @@ const (
 // behaviour this file replaces (the in-memory debt still stands for this
 // process) — never to something worse.
 //
-// UpdatedAt is deliberately left alone. It records when BUCKETS were merged, and
-// a debt marker is not an observation.
+// UpdatedAt is deliberately left alone on an existing cache: it records when
+// BUCKETS were merged, and a debt marker is not an observation. A snapshot this
+// helper CREATES is stamped, so a debt-only file never reaches an operator (or
+// a diagnostics upload) carrying an empty timestamp.
 func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRateLimitSnapshot) bool) bool {
 	if path == "" || fn == nil {
 		return false
@@ -118,6 +120,9 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 		}
 		if !fn(&snap) {
 			return time.Time{}, nil
+		}
+		if snap.UpdatedAt == "" {
+			snap.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 		out, err := json.MarshalIndent(snap, "", "  ")
 		if err != nil {
@@ -179,20 +184,23 @@ func claudeOweRunRefresh(baseline time.Time) {
 		})
 }
 
-// claudeRunRefreshOwed reports the debt the previous process left, and how many
-// replay attempts it has already cost. Zero when there is none, when the cache
-// belongs to another account, or when the file is missing or corrupt — this is a
-// freshness optimisation, and the next run rewrites it.
+// claudeRunRefreshOwedFor reports the debt the previous process left for
+// `fingerprint`, and how many replay attempts it has already cost. Zero when
+// there is none, when the cache belongs to another account, or when the file is
+// missing or corrupt — this is a freshness optimisation, and the next run
+// rewrites it.
+//
+// The account is a PARAMETER, never resolved here: the one caller
+// (claudeUsageProbeGate.seedOwedFromCache, on the gather path) already holds the
+// fingerprint its gather decoded, and resolving a second one would cost a macOS
+// `security` spawn on a path that is contractually free of credential reads.
 //
 // Read WITHOUT the cache lock: the snapshot is only ever replaced by rename, so
 // a reader sees a whole file or the previous whole file, and taking the gate for
 // a read would queue this behind writers on the gather path.
-func claudeRunRefreshOwed() (time.Time, int) {
+func claudeRunRefreshOwedFor(fingerprint string) (time.Time, int) {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
-	if !ok || snap.RefreshOwedAtMs == 0 {
-		return time.Time{}, 0
-	}
-	if snap.AccountFingerprint != currentClaudeAccountFingerprint() {
+	if !ok || snap.RefreshOwedAtMs == 0 || snap.AccountFingerprint != fingerprint {
 		return time.Time{}, 0
 	}
 	return time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
@@ -359,5 +367,21 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// ONE bounded attempt, through the ordinary single-flight probe. Whatever it
 	// finds (or fails to find) is left to the ordinary gather/refresh bounds; the
 	// merge that carries a covering reading settles the debt in its own write.
-	claudeUsageProbeAttempt(owed)
+	if claudeUsageProbeAttempt(owed) {
+		return
+	}
+	// The gate never admitted it — a concurrent gather held the single-flight
+	// slot — so no request left this process and the charge above bought
+	// nothing. Refund it, or two unlucky starts would retire a debt that was
+	// never once put to the endpoint, leaving exactly the stale card this path
+	// exists to clear. Safe in the crash direction: a crash between the charge
+	// and the refund keeps the charge, which only ever spends the budget
+	// faster.
+	mutateClaudeRateLimitSnapshot(path, fingerprint, func(s *claudeRateLimitSnapshot) bool {
+		if s.RefreshOwedAtMs != owed.UnixMilli() || s.RefreshOwedAttempts == 0 {
+			return false
+		}
+		s.RefreshOwedAttempts--
+		return true
+	})
 }
