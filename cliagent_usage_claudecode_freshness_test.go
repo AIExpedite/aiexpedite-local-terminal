@@ -318,8 +318,20 @@ func TestPayOwedClaudeUsageRefresh_OfflineSpendsNothing(t *testing.T) {
 		return true
 	})
 
-	SetOffline(true)
-	t.Cleanup(func() { SetOffline(false) })
+	// Pin the flag directly, as the sibling Antigravity freshness test does,
+	// rather than calling SetOffline: this case is about the replay's gate
+	// decision, and SetOffline additionally releases the reconnect drain,
+	// signals offlineChan and logs a transition — process-global side effects
+	// a freshness assertion has no business emitting into a shared suite.
+	offlineMutex.Lock()
+	wasOffline := isOffline
+	isOffline = true
+	offlineMutex.Unlock()
+	t.Cleanup(func() {
+		offlineMutex.Lock()
+		isOffline = wasOffline
+		offlineMutex.Unlock()
+	})
 
 	payOwedClaudeUsageRefreshAt(now)
 

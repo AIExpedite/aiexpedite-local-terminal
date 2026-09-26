@@ -182,8 +182,8 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	// The outcome is recorded ONCE, after the ladder stops, from the FINAL
 	// attempt's evidence; a rejected rung that continues the walk is not an
 	// outcome. See settleOrDisarmClaudeSmokeRun.
-	var evidence claudeSmokeUsageEvidence
-	defer func() { settleOrDisarmClaudeSmokeRun(evidence) }()
+	spentTurn := false
+	defer func() { settleOrDisarmClaudeSmokeRun(spentTurn) }()
 
 	var lastCategory, lastDiagnostic string
 	for _, shape := range claudeSmokeShapeLadder(path) {
@@ -205,12 +205,10 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 		// Utilization evidence is what the TURN produced, not what the verdict
 		// was: a run whose model answered and was then judged chatty
 		// (marker_mismatch) still spent a payable turn. Reassigned rather than
-		// accumulated so the FINAL rung's evidence is the one that decides.
-		evidence = claudeSmokeUsageEvidence{}
-		if !timedOut {
-			evidence.markerSeen = matched
-			evidence.reachedInference = claudeSmokeReachedInference(stdout)
-		}
+		// accumulated so the FINAL rung's evidence is the one that decides, and
+		// a timeout is never evidence — the kill is why the output is
+		// incomplete, so nothing it left behind can be trusted.
+		spentTurn = !timedOut && claudeSmokeReachedInference(stdout)
 		if category == "" {
 			result.Status = cliSmokeStatusSuccess
 			result.MarkerMatched = matched
@@ -248,21 +246,8 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	return finish(lastCategory)
 }
 
-// claudeSmokeUsageEvidence is what one smoke attempt proves about the account's
-// utilization: that a turn reached inference and a fresh reading therefore
-// EXISTS for a probe to fetch. Derived entirely from the closed classification
-// already computed plus the terminal envelope; no new bytes are retained, and
-// nothing here reaches the published cliSmokeResult or the log line.
-type claudeSmokeUsageEvidence struct {
-	// markerSeen is the strongest form: the model echoed our nonce.
-	markerSeen bool
-	// reachedInference is a well-formed, non-error `subtype: "success"`
-	// envelope — the CLI's own statement that the turn completed.
-	reachedInference bool
-}
-
 // settleOrDisarmClaudeSmokeRun owes a utilization refresh for a smoke that
-// reached inference, and writes NOTHING for one that did not. Mirrors
+// spent a turn, and writes NOTHING for one that did not. Mirrors
 // settleOrDisarmCodexSmokeRun; "settle" is reserved in this feature for
 // CLEARING a debt, so the recording half is called owe.
 //
@@ -270,6 +255,16 @@ type claudeSmokeUsageEvidence struct {
 // killed turn may genuinely have consumed quota, so this can under-report —
 // but the alternative writes a debt the bounded replays cannot pay, which
 // surfaces as a permanent stale-utilization state.
+//
+// ONE predicate, unlike codexSmokeEvidence's marker-or-completion pair, because
+// here a marker match is not independent evidence: classifyClaudeSmokeRun can
+// only report `matched` after it has already accepted a non-error
+// `subtype: "success"` envelope, so every marker match is a
+// claudeSmokeReachedInference. A second field would have been an unreachable
+// branch pretending to be a safety net —
+// TestClassifyClaudeSmokeRun_MarkerMatchImpliesASpentTurn pins the implication
+// so a future classifier change fails CI here rather than silently dropping a
+// debt.
 //
 // Deliberately NOT keyed off cliSmokeVerdictSpentTurn. That answers "may this
 // verdict be cached?", which is true for a timeout or a protocol failure
@@ -284,21 +279,23 @@ type claudeSmokeUsageEvidence struct {
 // smoke mid-session fetches fresh numbers inside the probe's own window instead
 // of sitting on a disk marker until the gather TTL, while a smoke just before a
 // self-update still leaves the durable debt for the startup replay.
-func settleOrDisarmClaudeSmokeRun(evidence claudeSmokeUsageEvidence) {
-	if !evidence.markerSeen && !evidence.reachedInference {
+func settleOrDisarmClaudeSmokeRun(spentTurn bool) {
+	if !spentTurn {
 		return
 	}
 	triggerClaudeUsageProbeAfterRun()
 }
 
 // claudeSmokeReachedInference reports whether the child returned the CLI's
-// documented terminal envelope for a COMPLETED turn. An error envelope (auth,
-// provider refusal, an undocumented subtype) is not one: those are the cases
-// where the CLI answered without the model doing so.
+// documented terminal envelope for a COMPLETED turn — the single "a turn was
+// spent" rule. An error envelope (auth, provider refusal, an undocumented
+// subtype) is not one: those are the cases where the CLI answered without the
+// model doing so.
 //
 // Re-parses the envelope the classifier already read rather than threading it
-// out: the classifier stays pure and single-purpose, and this is a few hundred
-// bytes of JSON on a path that just spent a 60-second budget.
+// out: the classifier stays pure and single-purpose, this keeps the rule
+// testable on its own, and it is a few hundred bytes of JSON on a path that
+// just spent a 60-second budget.
 func claudeSmokeReachedInference(stdout []byte) bool {
 	envelope, ok := parseClaudePrintResultEnvelope(stdout)
 	return ok && !envelope.IsError && envelope.Subtype == "success"

@@ -90,7 +90,7 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 	preSmoke := now.Add(-time.Second)
 	seedClaudeProbeReading(t, cache, preSmoke)
 
-	settleOrDisarmClaudeSmokeRun(claudeSmokeUsageEvidence{markerSeen: true})
+	settleOrDisarmClaudeSmokeRun(true)
 	waitForClaudeDebt(t, cache, 5*time.Second)
 	claudeFreshnessWaitIdle(t)
 	smokeDebt := claudeCacheSnapshot(t, cache).RefreshOwedAtMs

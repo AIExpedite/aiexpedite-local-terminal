@@ -1198,3 +1198,38 @@ func TestRunClaudeCodeSmoke_UsageDebtDoesNotChangeThePublishedResult(t *testing.
 		t.Errorf("device log changed with the probe armed:\n bare %q\n with %q", bareLog, withProbeLog)
 	}
 }
+
+// settleOrDisarmClaudeSmokeRun rests on ONE predicate, and that is only safe
+// while a marker match implies a spent turn. classifyClaudeSmokeRun can reach
+// `matched` only after accepting a non-error `subtype: "success"` envelope, so
+// the implication holds today — pin it, and a future classifier that reports a
+// match some other way fails here instead of silently dropping the debt for a
+// turn the user paid for.
+func TestClassifyClaudeSmokeRun_MarkerMatchImpliesASpentTurn(t *testing.T) {
+	const marker = claudeSmokeMarkerPrefix + "deadbeef"
+	errorEnvelope, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "success", "is_error": true, "result": marker,
+	})
+	odd, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "error_during_execution", "is_error": false, "result": marker,
+	})
+
+	for _, stdout := range [][]byte{
+		successEnvelope(marker),        // the healthy match
+		successEnvelope("Sure! Here."), // chatty, still a spent turn
+		errorEnvelope,                  // marker text inside an error envelope
+		odd,                            // marker text under an unknown subtype
+		[]byte("not json at all"),      // framing failure
+		nil,                            // no output
+	} {
+		_, _, matched := classifyClaudeSmokeRun(false, stdout, nil, nil, marker)
+		if matched && !claudeSmokeReachedInference(stdout) {
+			t.Fatalf("marker match without a spent turn for %q — settleOrDisarmClaudeSmokeRun would drop the debt", stdout)
+		}
+	}
+
+	// And the timeout arm never reports a match, whatever the child left behind.
+	if _, _, matched := classifyClaudeSmokeRun(true, successEnvelope(marker), nil, nil, marker); matched {
+		t.Fatal("a killed attempt must never report a marker match")
+	}
+}
