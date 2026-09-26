@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -53,9 +54,12 @@ func TestCodexOwedRefresh_SurvivesAgentRestart(t *testing.T) {
 	}
 }
 
-// The replay is exactly ONE bounded reconcile, even when it finds nothing: the
-// remainder is left to the next run or refresh under the ordinary bounds.
-func TestCodexOwedRefresh_RestartReplayIsExactlyOneReconcile(t *testing.T) {
+// The replay spends ONE bounded reconcile itself and, when that finds nothing,
+// hands the debt to the account's worker — the one place the live fallback
+// runs. The worker spends only what is left of the debt's attempt budget, then
+// the fallback, once: a debt carried across a (self-)update is exactly the one
+// the rollout scan is most likely to miss.
+func TestCodexOwedRefresh_RestartReplaySpendsTheDebtBudgetOnce(t *testing.T) {
 	now := time.Now()
 	runStart := now.Add(-3 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
@@ -72,8 +76,11 @@ func TestCodexOwedRefresh_RestartReplayIsExactlyOneReconcile(t *testing.T) {
 	if snap.RefreshOwedAtMs == 0 {
 		t.Fatal("an unpaid debt must survive the replay")
 	}
-	if snap.RefreshOwedAttempts != 1 {
-		t.Fatalf("replay spent %d reconciles, want exactly 1", snap.RefreshOwedAttempts)
+	if snap.RefreshOwedAttempts != codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("replay + worker spent %d reconciles, want exactly the debt's %d", snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
+	}
+	if snap.RefreshFallbackState != codexFallbackSpent {
+		t.Fatalf("the unpaid replayed debt must reach its live fallback once: state=%q", snap.RefreshFallbackState)
 	}
 }
 
@@ -133,8 +140,8 @@ func TestCodexOwedRefresh_InterruptedRunIsOwedAtStartup(t *testing.T) {
 	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != runStart.UnixMilli() {
 		t.Fatalf("interrupted run must become an owed debt at its floor: %+v", snap)
 	}
-	if snap.RefreshOwedAttempts != 1 {
-		t.Fatalf("attempts = %d, want the replay's 1", snap.RefreshOwedAttempts)
+	if snap.RefreshOwedAttempts != codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("attempts = %d, want the replay's 1 plus the worker's remainder (%d)", snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
 	}
 }
 
@@ -309,8 +316,8 @@ func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *
 	if snap.RunFloorMs > time.Now().Add(codexRunFloorLocalSkew).UnixMilli() {
 		t.Fatalf("no floor may stay ahead of the wall clock: %+v", snap)
 	}
-	if snap.RefreshOwedAttempts != 1 {
-		t.Fatalf("replay spent %d reconciles, want exactly 1", snap.RefreshOwedAttempts)
+	if snap.RefreshOwedAttempts != codexRefreshAfterRunMaxAttempts {
+		t.Fatalf("replay + worker spent %d reconciles, want exactly %d", snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
 	}
 	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, time.Now())); strings.Contains(notice, future.UTC().Format("2006-01-02 15:04")) {
 		t.Fatalf("no notice may name a run that has not happened: %q", notice)
@@ -330,5 +337,229 @@ func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *
 	snap = f.snapshot(t)
 	if snap.RunFloorMs == 0 || snap.RunFloorMs > time.Now().Add(codexRunFloorLocalSkew).UnixMilli() {
 		t.Fatalf("an interrupted future-dated run must be re-dated onto now: %+v", snap)
+	}
+}
+
+/* ───────────────────────── Codex binary upgrades ───────────────────────── */
+
+const (
+	codexPreUpdateVersion  = "codex-cli 0.149.0"
+	codexPostUpdateVersion = "codex-cli 0.150.0"
+)
+
+// stampPreUpdateCache marks the cache as written by the previous Codex binary:
+// both the reading and the scan cursor.
+func (f codexFreshnessFixture) stampPreUpdateCache(t *testing.T, now time.Time) {
+	t.Helper()
+	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.CodexVersion, snap.RolloutCursorVersion = codexPreUpdateVersion, codexPreUpdateVersion
+	}) {
+		t.Fatal("stamping the pre-update cache failed")
+	}
+}
+
+// The headline regression. The cache was written by the previous Codex, the
+// new build's rollout carries its telemetry in a shape the scan cannot read,
+// and a run settles: both rollout attempts come up empty, the live fallback
+// pays the debt, observedAt advances — and all of it survives an agent
+// restart with no stale or drift notice left behind.
+func TestCodexUpgrade_ObservedAtAdvancesViaLiveFallbackAndSurvivesRestart(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
+	f.stampPreUpdateCache(t, now)
+	// The post-update rollout: numbers under a key the scan does not know.
+	writeCodexRunRollout(t, f.home, "post-update", runStart, runStart.Add(30*time.Second), runStart.Add(40*time.Second), true, nil,
+		map[string]any{"timestamp": runStart.Add(30 * time.Second).UTC().Format(time.RFC3339Nano), "type": "event_msg",
+			"payload": map[string]any{"type": "usage_snapshot", "windows": map[string]any{"five_hour": 55}}})
+	setCodexCaptureVersion(t, codexPostUpdateVersion)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+
+	triggerCodexUsageRefreshAfterRun(runStart)
+	waitCodexUsageRefreshIdle(t)
+
+	if *calls != 1 {
+		t.Fatalf("live reads = %d, want the one fallback", *calls)
+	}
+	observed := metricObservedAt(t, codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp)))
+	if observed.Before(runStart.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the post-update run %s", observed, runStart)
+	}
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.CodexVersion != codexPostUpdateVersion || snap.RolloutCursorVersion != codexPostUpdateVersion {
+		t.Fatalf("want the debt paid and both stamps on the new binary: %+v", snap)
+	}
+
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	if got := metricObservedAt(t, codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))); !got.Equal(observed) {
+		t.Fatalf("observedAt %s did not survive the restart (was %s)", got, observed)
+	}
+	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Version: codexPostUpdateVersion}, time.Now())
+	if usage.Notice != "" {
+		t.Fatalf("a refreshed post-update card carries a notice: %q", usage.Notice)
+	}
+}
+
+// Startup ordering: the replay runs before any gather or smoke has named the
+// binary. It resolves the installed version itself, so a debt its live
+// fallback pays is stamped with the NEW build — and the first gather after
+// the restart shows no capture drift against a reading just refreshed.
+func TestCodexUpgrade_StartupReplayStampsTheInstalledBuild(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-3 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.stampPreUpdateCache(t, now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now.Add(-time.Minute))
+	})
+	original := codexInstalledVersion
+	codexInstalledVersion = func() (string, string) { return "", codexPostUpdateVersion }
+	t.Cleanup(func() { codexInstalledVersion = original })
+	stubCodexFallbackRead(t, capturingFallbackRead)
+
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.CodexVersion != codexPostUpdateVersion {
+		t.Fatalf("the replayed debt must be paid and stamped with the installed build: %+v", snap)
+	}
+	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Version: codexPostUpdateVersion}, time.Now())
+	if usage.Notice != "" {
+		t.Fatalf("first gather after the restart shows %q", usage.Notice)
+	}
+}
+
+// A binary change resets the rollout scan cursor ONCE, in a write taken before
+// the scan, and stamps the new binary in that same write.
+func TestCodexUpgrade_CursorResetsOnceOnVersionChange(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	cursorAt := now.Add(-10 * time.Second)
+	f.advanceCursorPast(t, cursorAt, now)
+	f.stampPreUpdateCache(t, now)
+
+	setCodexCaptureVersion(t, codexPreUpdateVersion)
+	if cursor := codexRolloutScanCursorForAccount(f.home, f.fp, now); cursor.mtimeNs != cursorAt.UnixNano() {
+		t.Fatalf("same binary must keep its cursor, got %+v", cursor)
+	}
+
+	setCodexCaptureVersion(t, codexPostUpdateVersion)
+	if cursor := codexRolloutScanCursorForAccount(f.home, f.fp, now); cursor.mtimeNs != 0 {
+		t.Fatalf("a cursor the previous binary wrote must read as empty, got %+v", cursor)
+	}
+	codexResetRolloutCursorForVersion(context.Background(), f.fp, now)
+	snap := f.snapshot(t)
+	if snap.RolloutHighWaterMtimeNs != 0 || snap.RolloutCursorVersion != codexPostUpdateVersion {
+		t.Fatalf("reset must clear progress and stamp the new binary together: %+v", snap)
+	}
+	if snap.CodexVersion != codexPreUpdateVersion {
+		t.Fatalf("the cursor reset must not touch the reading's stamp, got %q", snap.CodexVersion)
+	}
+}
+
+// A routine (unforced) scan treats the reset as optional work, like its own
+// commit: under lock contention it neither blocks nor writes, and the stale
+// cursor still reads as empty so nothing is scanned against the old layout.
+// A forced scan waits and lands it.
+func TestCodexUpgrade_RoutineResetSkipsUnderContention(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
+	f.stampPreUpdateCache(t, now)
+	setCodexCaptureVersion(t, codexPostUpdateVersion)
+
+	codexRateLimitMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		codexResetRolloutCursorForVersion(context.Background(), f.fp, now)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		codexRateLimitMu.Unlock()
+		<-done
+		t.Fatal("a routine reset blocked on the cache lock")
+	}
+	codexRateLimitMu.Unlock()
+	if snap := f.snapshot(t); snap.RolloutCursorVersion != codexPreUpdateVersion {
+		t.Fatalf("a contended routine reset wrote: %+v", snap)
+	}
+	if cursor := codexRolloutScanCursorForAccount(f.home, f.fp, now); cursor.mtimeNs != 0 {
+		t.Fatalf("the old cursor must still read as empty, got %+v", cursor)
+	}
+
+	codexResetRolloutCursorForVersion(withCodexForcedReconcile(context.Background(), now), f.fp, now)
+	if snap := f.snapshot(t); snap.RolloutCursorVersion != codexPostUpdateVersion {
+		t.Fatalf("a forced reset must land: %+v", snap)
+	}
+}
+
+// No reset loop: a post-upgrade rescan that runs out of budget leaves partial
+// progress, and the NEXT refresh resumes it instead of resetting again —
+// the stamp landed at the reset, not at a completed pass.
+func TestCodexUpgrade_PartialRescanIsNotResetAgain(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
+	f.stampPreUpdateCache(t, now)
+	setCodexCaptureVersion(t, codexPostUpdateVersion)
+
+	codexResetRolloutCursorForVersion(context.Background(), f.fp, now)
+	// The budget-bound first pass got part way through the backlog.
+	partialAt := now.Add(-time.Hour)
+	codexRateLimitCacheTransaction(context.Background(), f.cache, now, true, func(snap *codexRateLimitSnapshot) bool {
+		snap.RolloutHighWaterMtimeNs, snap.RolloutHighWaterMtimeMs = partialAt.UnixNano(), partialAt.UnixMilli()
+		snap.RolloutBacklogCursor = strings.Repeat("a", 64)
+		snap.RolloutRootFingerprint = codexRolloutRootFingerprint(f.home)
+		return true
+	})
+
+	codexResetRolloutCursorForVersion(context.Background(), f.fp, now.Add(time.Minute))
+	cursor := codexRolloutScanCursorForAccount(f.home, f.fp, now.Add(time.Minute))
+	if cursor.mtimeNs != partialAt.UnixNano() || cursor.backlogCursor != strings.Repeat("a", 64) {
+		t.Fatalf("the second refresh must resume the partial rescan, got %+v", cursor)
+	}
+}
+
+// The drift notice surfaces on the card only once the debt's attempts are
+// spent AND its fallback resolved, and only when the reading was produced by
+// another binary than the one detected.
+func TestCodexUpgrade_DriftNoticeOnlyOnceTheFallbackResolved(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.stampPreUpdateCache(t, now)
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+	detected := detectedCLIAgent{Version: codexPostUpdateVersion}
+	parse := func() *cliAgentUsage {
+		// A routine gather inside the interval: no forced reconcile to count.
+		codexUsageRefresh.mu.Lock()
+		codexUsageRefresh.lastRun[f.fp] = time.Now()
+		codexUsageRefresh.driftBypass[f.fp] = codexPostUpdateVersion
+		codexUsageRefresh.mu.Unlock()
+		usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detected, time.Now())
+		return usage
+	}
+
+	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackOutstanding)
+	if usage := parse(); usage.Notice != "" {
+		t.Fatalf("no notice while the fallback is outstanding, got %q", usage.Notice)
+	}
+	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackSkipped)
+	usage := parse()
+	if usage.NoticeSeverity != "warning" || !strings.Contains(usage.Notice, codexPreUpdateVersion) || !strings.Contains(usage.Notice, codexPostUpdateVersion) {
+		t.Fatalf("resolved fallback must show the capture-drift warning, got %q (%s)", usage.Notice, usage.NoticeSeverity)
 	}
 }

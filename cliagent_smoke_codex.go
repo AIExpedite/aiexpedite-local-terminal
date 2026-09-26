@@ -20,15 +20,20 @@
 //   - walks its two-rung ladder only on an option-parsing rejection of the
 //     one droppable flag, so the walk costs children, never turns;
 //   - arms the Codex utilization run floor before the first spawn and, once
-//     the ladder stops, SETTLES it exactly when the run produced evidence a
-//     reconcile can pay (marker match, completion frame, or a new rollout
-//     write) and DISARMS it otherwise — see settleOrDisarmCodexSmokeRun.
+//     the ladder stops, SETTLES it exactly when the run produced evidence
+//     that pays it (its own captured rate-limit windows, marker match,
+//     completion frame, or a new rollout write) and DISARMS it otherwise —
+//     see settleOrDisarmCodexSmokeRun;
+//   - feeds the rate-limit frames its own turn printed through the ordinary
+//     capture path, so the turn it spent produces its own reading instead of
+//     leaving it to a rollout scan a Codex upgrade may have broken.
 //
 // Retention discipline applies here exactly as in cliagent_smoke.go: the
 // child's stdout, stderr and last-message file are read to derive a verdict
-// and then DISCARDED. The marker nonce, the prompt, the resolved argv, the
-// last-message path and `auth.json` / `config.toml` are never published or
-// logged at any severity.
+// and then DISCARDED. The only thing kept is what the capture path keeps from
+// a recognised rate-limit envelope — numeric windows. The marker nonce, the
+// prompt, the resolved argv, the last-message path and `auth.json` /
+// `config.toml` are never published or logged at any severity.
 
 package main
 
@@ -243,12 +248,22 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	env, _ := prepareClaudeChildEnv(path, os.Environ())
 
 	shapeBinding := bindCLISmokeShape(path)
+	// A capture made outside a gather still stamps the binary that produced
+	// it — the one this smoke was sent to validate.
+	publishCodexUsageCaptureVersionFrom(path, version)
+	// The account the turn runs under. A reading taken after the credentials
+	// changed cannot be attributed to it and never reaches the cache.
+	smokeFingerprint := currentCodexAccountFingerprint()
 	// The run floor is armed before the first spawn and settled or disarmed
 	// exactly once, after the ladder stops, from the FINAL attempt's evidence.
 	// A rejected rung that continues the walk is not an outcome.
 	floor := time.UnixMilli(time.Now().UnixMilli())
 	codexUsageRunStarted(floor)
 	var evidence codexSmokeEvidence
+	// usageCaptured is sticky across rungs: a window an earlier rung merged is
+	// already in the cache, so a later rung that captures nothing must not
+	// disarm a run whose telemetry did land.
+	usageCaptured := false
 	defer func() { settleOrDisarmCodexSmokeRun(floor, evidence) }()
 
 	var lastCategory, lastDiagnostic string
@@ -270,11 +285,18 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 
 		result.ArgvShapeID = shape.ID
 		stream := parseCodexSmokeStream(stdout)
+		if captureCodexSmokeRateLimits(stream.RateLimitLines, smokeFingerprint, version) {
+			usageCaptured = true
+		}
 		category, diagnostic, matched := classifyCodexSmokeRun(timedOut, stream, stderr, lastMessage, runErr, marker)
 		// Utilization evidence is what the TURN produced, not what the verdict
 		// was: a run that emitted the exact marker and THEN reported an error
 		// still spent a payable turn, so it settles even though it fails.
-		evidence = codexSmokeEvidence{markerSeen: codexSmokeMarkerSeen(stream, lastMessage, marker), completed: stream.Completed}
+		evidence = codexSmokeEvidence{
+			markerSeen:    codexSmokeMarkerSeen(stream, lastMessage, marker),
+			completed:     stream.Completed,
+			usageCaptured: usageCaptured,
+		}
 		if category == "" {
 			result.Status = cliSmokeStatusSuccess
 			result.MarkerMatched = matched
@@ -310,6 +332,30 @@ func readCodexSmokeLastMessage(path string) []byte {
 	return body
 }
 
+// captureCodexSmokeRateLimits hands the rate-limit frames one attempt printed
+// to the ordinary capture path, pinned to the account the smoke started
+// under — and only while that account is still the signed-in one, checked
+// BEFORE EVERY write: a reading that cannot be attributed must never reach the
+// cache, and a swap part-way through stops the remaining frames rather than
+// letting them rescope the new account's cache back to the old one. The merge
+// transaction re-checks the active account again under the cache locks, so a
+// swap during a lock wait is caught too. Stamped
+// with the smoke's own binary version. Reports whether any frame landed a
+// numeric window (or an authoritative clear).
+func captureCodexSmokeRateLimits(lines []string, fingerprint, version string) bool {
+	captured := false
+	now := time.Now()
+	for _, line := range lines {
+		if currentCodexAccountFingerprint() != fingerprint {
+			break
+		}
+		if captureCodexRateLimitLineFromProducer(line, now, fingerprint, version) {
+			captured = true
+		}
+	}
+	return captured
+}
+
 // codexSmokeFailureLogLine renders the device-local diagnostic line. It takes
 // the stderr LENGTH rather than the bytes: a function that cannot receive
 // vendor text cannot leak it.
@@ -322,17 +368,23 @@ func codexSmokeFailureLogLine(shapeID, category, diagnostic string, stderrBytes 
    Utilization: settle on evidence, disarm otherwise
    -------------------------------------------------------------------------- */
 
-// codexSmokeEvidence is what the final attempt proved about the turn.
+// codexSmokeEvidence is what the final attempt proved about the turn, plus
+// whether ANY attempt's own rate-limit frames reached the cache.
 type codexSmokeEvidence struct {
 	markerSeen bool // trimmed exact marker from the last-message file or the stream
 	completed  bool // a recognised turn-completion frame (codexRunCompletionShape)
+	// usageCaptured: a numeric window from the probe's own stdout merged into
+	// the cache (sticky across rungs). The merge has already paid the debt the
+	// settle is about to record.
+	usageCaptured bool
 }
 
 // settleOrDisarmCodexSmokeRun decides the probe's armed utilization run, once.
 //
-// It SETTLES exactly when the run left something a forced reconcile can pay:
-// a marker match, a completion frame, or — checked last, and only then — a
-// rollout written after the floor. Every other outcome DISARMS: a timeout, a
+// It SETTLES exactly when the run left something that pays it: its own
+// rate-limit windows already captured (checked first — the settle's own write
+// then finds the floor covered), a marker match, a completion frame, or —
+// checked last, and only then — a rollout written after the floor. Every other outcome DISARMS: a timeout, a
 // flag/framing/auth failure, a mismatch that wrote nothing. Both halves
 // matter. Settling with no evidence writes RefreshOwed the bounded reconciles
 // cannot pay, which IS the stale-utilization warning; leaving the floor armed
@@ -340,7 +392,7 @@ type codexSmokeEvidence struct {
 // floor as an interrupted run at the next start — and the post-update restart
 // is exactly when this smoke runs.
 func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
-	if evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
+	if evidence.usageCaptured || evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
 		return
 	}
@@ -410,16 +462,25 @@ type codexSmokeStream struct {
 	// constant and never retained past the classifier.
 	ErrorMessage string
 	SawError     bool
+	// RateLimitLines are the lines that could carry rate-limit telemetry,
+	// collected for runCodexSmoke to capture. Whether each is a recognised
+	// envelope is the capture path's decision, not the parser's.
+	RateLimitLines []string
 }
 
 // parseCodexSmokeStream reads the whole stdout once for the three facts the
-// verdict rests on. Non-JSON lines are skipped rather than failing the parse.
+// verdict rests on, and collects the candidate rate-limit lines on the same
+// pass. Non-JSON lines are skipped rather than failing the parse. Pure: no
+// cache I/O happens here.
 func parseCodexSmokeStream(stdout []byte) codexSmokeStream {
 	stream := codexSmokeStream{Text: codexFoldAssistantText(stdout)}
 	for _, line := range bytes.Split(stdout, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 || line[0] != '{' {
 			continue
+		}
+		if text := string(line); codexRateLimitLineCandidate(text) {
+			stream.RateLimitLines = append(stream.RateLimitLines, text)
 		}
 		if codexRunCompletionShape(string(line)) != "" {
 			stream.Completed = true

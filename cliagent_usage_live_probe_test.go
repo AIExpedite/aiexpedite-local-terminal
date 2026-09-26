@@ -117,7 +117,7 @@ func TestCodexLiveProbeConverse_CapturesPoolsAndDropsMissingWindow(t *testing.T)
 	)
 
 	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q, want ok", got)
 	}
 	if seen := <-methods; len(seen) != 3 || seen[0] != "initialize" || seen[1] != "initialized" || seen[2] != "account/rateLimits/read" {
@@ -166,7 +166,7 @@ func TestCodexMetrics_PoolRowsDisappearWhenPoolIsGone(t *testing.T) {
 	isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// A later read in which the account no longer has the Spark pool, and the
@@ -193,7 +193,7 @@ func TestCodexLimitNames_SparseUpdateKeepsPoolName(t *testing.T) {
 	cache := isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// Sparse updates restate the Spark pool's numbers: one omits limitName, the
@@ -267,7 +267,7 @@ func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
 func TestCodexLiveProbeConverse_RPCErrorLeavesCacheAlone(t *testing.T) {
 	cache := isolateCodexCache(t)
 	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to fetch codex rate limits"}}`)
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeRPCError {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeRPCError {
 		t.Fatalf("outcome=%q, want rpc_error", got)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
@@ -549,10 +549,12 @@ func stubLiveProbes(t *testing.T) *int32 {
 		cliUsageLiveProbeMu.Lock()
 		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
 		cliUsageLiveProbeMu.Unlock()
+		resetCodexLiveRateLimitRead()
 	})
 	cliUsageLiveProbeMu.Lock()
 	cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
 	cliUsageLiveProbeMu.Unlock()
+	resetCodexLiveRateLimitRead()
 	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
 		return map[string]detectedCLIAgent{
 			"codex":       {Detected: true, Path: "codex"},
@@ -562,7 +564,7 @@ func stubLiveProbes(t *testing.T) *int32 {
 		}
 	}
 	slow := func() { atomic.AddInt32(&calls, 1); time.Sleep(50 * time.Millisecond) }
-	probeCodexRateLimitsLiveFn = func(context.Context, string) string { slow(); return liveProbeOutcomeOK }
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeOK }
 	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string { slow(); return liveProbeOutcomeTimeout }
 	probeGrokBillingLiveFn = func(context.Context, string, func() time.Time) string { slow(); panic("boom") }
 	warmCLIAgentModelDiscoveryFn = func(context.Context, string, detectedCLIAgent, string) {}
@@ -853,7 +855,7 @@ func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
 	if spawnedUnder == currentCodexAccountFingerprint() {
 		t.Fatal("fixture must sign a different account in than the one spawned")
 	}
-	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder); got != liveProbeOutcomeAccountChanged {
+	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChanged {
 		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChanged)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
@@ -1020,6 +1022,161 @@ func TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount(t *testing.T) {
 				t.Errorf("account/plan=%q/%q, want %q/%q", account, plan, tc.wantAcct, tc.wantPln)
 			}
 		})
+	}
+}
+
+// After the split, the Codex read keeps ONE cooldown and ONE single flight,
+// shared by the Refresh click and the post-run freshness fallback: concurrent
+// callers share one probe, and a fallback right after a click spawns nothing.
+func TestCodexLiveRateLimitRead_SharesCooldownAndFlightWithTheFallback(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	var codexCalls int32
+	calls := &codexCalls
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		atomic.AddInt32(calls, 1)
+		once.Do(func() { close(entered) })
+		<-release
+		return liveProbeOutcomeOK
+	}
+
+	var wg sync.WaitGroup
+	outcomes := make([]string, 3)
+	for i := range outcomes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			outcomes[i] = codexLiveRateLimitRead(context.Background(), "codex", "")
+		}(i)
+		if i == 0 {
+			<-entered
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("probes = %d across concurrent callers, want one shared flight", got)
+	}
+	for i, outcome := range outcomes {
+		if outcome != liveProbeOutcomeOK {
+			t.Errorf("caller %d got %q, want the shared flight's outcome", i, outcome)
+		}
+	}
+
+	// The freshness fallback's read inside the cooldown spawns nothing.
+	fp := currentCodexAccountFingerprint()
+	if got := codexLiveRateLimitRead(context.Background(), "", fp); got != liveProbeOutcomeCooldown {
+		t.Fatalf("fallback inside the click's cooldown = %q, want cooldown", got)
+	}
+	// So does a click's Codex probe after a fallback.
+	if got := runCLIUsageLiveProbes(context.Background()); got["codex"] != liveProbeOutcomeCooldown {
+		t.Fatalf("click inside the shared cooldown = %v, want codex cooldown", got)
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("probes = %d, want none spent inside the cooldown", got)
+	}
+}
+
+// The single flight is per account: a read for a newly signed-in account never
+// joins a flight still probing the previous one and inheriting its outcome.
+func TestCodexLiveRateLimitRead_FlightIsScopedToTheAccount(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	home := os.Getenv("CODEX_HOME")
+	helperCodexAuthAt(t, home, "before@example.com", time.Now().Add(-time.Hour))
+	var calls int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			once.Do(func() { close(entered) })
+			<-release
+			return liveProbeOutcomeAccountChanged
+		}
+		return liveProbeOutcomeOK
+	}
+
+	oldDone := make(chan string, 1)
+	go func() { oldDone <- codexLiveRateLimitRead(context.Background(), "codex", "") }()
+	<-entered
+	helperCodexAuthAt(t, home, "after@example.com", time.Now())
+	if got := codexLiveRateLimitRead(context.Background(), "codex", currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+		t.Fatalf("new account's read = %q, want its own probe's outcome", got)
+	}
+	close(release)
+	if got := <-oldDone; got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("old flight = %q", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("probes = %d, want one per account", got)
+	}
+}
+
+// The completed-read cooldown is per account too. A process-global one refused
+// the first read for an account the user had just switched to because the
+// PREVIOUS account's read had finished seconds earlier — and a Refresh click
+// does not retry, so that account's card simply stayed stale.
+func TestCodexLiveRateLimitRead_CooldownIsScopedToTheAccount(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	home := os.Getenv("CODEX_HOME")
+	helperCodexAuthAt(t, home, "before@example.com", time.Now().Add(-time.Hour))
+	var calls int32
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		atomic.AddInt32(&calls, 1)
+		return liveProbeOutcomeOK
+	}
+
+	first := currentCodexAccountFingerprint()
+	if got := codexLiveRateLimitRead(context.Background(), "codex", ""); got != liveProbeOutcomeOK {
+		t.Fatalf("first account's read = %q, want its probe's outcome", got)
+	}
+	// Same account, still inside the cooldown: nothing spawns.
+	if got := codexLiveRateLimitRead(context.Background(), "codex", first); got != liveProbeOutcomeCooldown {
+		t.Fatalf("same account inside its cooldown = %q, want cooldown", got)
+	}
+
+	helperCodexAuthAt(t, home, "after@example.com", time.Now())
+	second := currentCodexAccountFingerprint()
+	if second == first {
+		t.Fatal("credentials swap did not change the account fingerprint")
+	}
+	if got := codexLiveRateLimitRead(context.Background(), "codex", second); got != liveProbeOutcomeOK {
+		t.Fatalf("new account's read = %q, want its own probe rather than the other account's cooldown", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("probes = %d, want one per account", got)
+	}
+	// The account that just read is the one on cooldown.
+	if remaining := codexLiveRateLimitCooldownRemaining(second, time.Now()); remaining <= 0 {
+		t.Fatalf("cooldown for the account that just read = %v, want it held", remaining)
+	}
+}
+
+// The cooldown map holds only accounts still on cooldown, whatever the signing
+// in and out does — a lapsed entry is dropped the next time a read is recorded.
+func TestCodexRecordLiveRateLimitRead_DropsLapsedAccounts(t *testing.T) {
+	resetCodexLiveRateLimitRead()
+	t.Cleanup(resetCodexLiveRateLimitRead)
+
+	now := time.Now()
+	codexRecordLiveRateLimitRead("lapsed", now.Add(-2*cliUsageLiveProbeCooldown))
+	codexRecordLiveRateLimitRead("fresh", now)
+	if got := codexLiveRateLimitCooldownRemaining("lapsed", now); got != 0 {
+		t.Fatalf("lapsed account cooldown = %v, want zero", got)
+	}
+	if got := codexLiveRateLimitCooldownRemaining("fresh", now); got <= 0 {
+		t.Fatalf("fresh account cooldown = %v, want it held", got)
+	}
+	codexLiveReadMu.Lock()
+	_, stillThere := codexLiveReadLastDone["lapsed"]
+	size := len(codexLiveReadLastDone)
+	codexLiveReadMu.Unlock()
+	if stillThere || size != 1 {
+		t.Fatalf("map holds %d entries (lapsed present=%v), want only the account on cooldown", size, stillThere)
 	}
 }
 

@@ -172,7 +172,12 @@ type CLISession struct {
 	// codex emits BOTH terminal events for one turn. Only a delivered
 	// follow-up turn (SendInput) re-arms it.
 	codexUsageFloorMs atomic.Int64
-	codexUsageSettled atomic.Bool
+	// codexCaptureVersion is the Codex build this child was launched from
+	// (codexCaptureVersionForLaunch), pinned at spawn. Its telemetry is stamped
+	// with it, not with whatever build a gather publishes after an upgrade the
+	// running child never picked up.
+	codexCaptureVersion string
+	codexUsageSettled   atomic.Bool
 
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
@@ -710,6 +715,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
 	}
 
+	// Pinned BEFORE the spawn, never read from the struct literal below. A
+	// gather that publishes a newer build in the window between Start() and that
+	// literal would credit this child's whole lifetime of telemetry to a binary
+	// it is not running, which also clears the capture-drift signal the new
+	// build should still be raising. Confirmed again once the child exists: an
+	// installer holds none of our locks, so the file can also be replaced
+	// between this pin and Start().
+	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
+
 	// Start the process
 	if err := proc.Start(); err != nil {
 		if finishGrokAttribution != nil {
@@ -759,6 +773,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		antigravityManagedStream:     antigravityManagedStream,
 		finishQuotaCapture:           finishQuotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
+		// The child is running now, so the pin can be confirmed against the
+		// binary still on disk: a replacement that landed in the pin→Start
+		// window leaves this child an unnameable producer rather than one
+		// stamping the removed build's version onto the replacement's frames.
+		codexCaptureVersion: codexCaptureVersionPin.confirmed(),
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
@@ -1983,7 +2002,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// sessions never populate codex_rate_limits.json and the CLI Agents
 			// card stays Unknown for users who don't go through app-server.
 			if isCodexCommand(session.Command) {
-				captureCodexRateLimitLine(line.text, time.Now())
+				captureCodexRateLimitLineFromProducer(line.text, time.Now(), currentCodexAccountFingerprint(), session.codexCaptureVersion)
 			}
 
 			// Grok notice telemetry: live stdout is deliberately notice-only.
