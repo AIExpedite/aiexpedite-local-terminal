@@ -390,6 +390,17 @@ type claudeUsageProbeGate struct {
 	// drain and cancelTrailing prevent.
 	owedSeeded    bool
 	owedSeededFor string
+	// owedSeededObservation is the freshest observation that seed MEASURED for
+	// owedSeededFor — the shared cache as it stood after the adoption, including
+	// a replay or another process's probe that landed while it read. Retained
+	// because the latch above is process-wide while `latest` is per-CALLER: a
+	// gather that loaded the pre-replay view and then waited on seedingCh (or one
+	// that arrives later in the same process) would otherwise pass the latch,
+	// receive "nothing to re-read", and publish the pre-replay utilization the
+	// claimant was told to re-read. Every latched caller re-applies the same
+	// supersession rules against its OWN view instead, from this one reading —
+	// no second cache load.
+	owedSeededObservation time.Time
 	// seedingCh is non-nil while a seed is between claiming the latch and
 	// finishing its adoption, and is closed when it does. A concurrent gather
 	// WAITS on it rather than treating "a seed has started" as "the debt and hold
@@ -595,6 +606,7 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
+	claudeUsageProbe.owedSeededObservation = time.Time{}
 	// A seed still in flight closes its own channel when it returns; dropping the
 	// reference here only stops it from marking the NEXT generation as seeded.
 	claudeUsageProbe.seedingCh = nil
@@ -1020,8 +1032,15 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	for seeding == nil {
 		g.mu.Lock()
 		if g.owedSeeded && g.owedSeededFor == fingerprint {
+			// The adoption already happened — for this account, in this process.
+			// Its debt and hold are on the gate, but its re-read verdict was
+			// about the CLAIMANT's view. Re-derive one for this caller's `latest`
+			// from the reading that seed measured, so a peer that waited here (or
+			// arrived later) cannot publish a view the shared cache has moved
+			// past.
+			superseded := g.supersedingObservationLocked(g.owedSeededObservation, latest, now)
 			g.mu.Unlock()
-			return time.Time{}
+			return superseded
 		}
 		if pending := g.seedingCh; pending != nil {
 			g.mu.Unlock()
@@ -1044,12 +1063,18 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// latch before the debt and hold are on the gate. A reset in the meantime
 	// swaps seedingCh out, and this seed then leaves the latch for the next
 	// generation to claim.
+	// measured is the reading the adoption below settled on, handed to the latch
+	// so every later caller derives its own verdict from it. Registered BEFORE
+	// the tail's `defer g.mu.Unlock()`, so it runs after it — this relock is not
+	// a recursive one.
+	measured := time.Time{}
 	defer func() {
 		g.mu.Lock()
 		if g.seedingCh == seeding {
 			g.seedingCh = nil
 			g.owedSeeded = true
 			g.owedSeededFor = fingerprint
+			g.owedSeededObservation = measured
 		}
 		g.mu.Unlock()
 		close(seeding)
@@ -1084,12 +1109,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	if onDisk.After(landed) {
 		landed = onDisk
 	}
-	// It supersedes the caller's own view, so the gather must re-read whatever we
-	// decide about the debt below.
-	superseded := time.Time{}
-	if landed.After(latest) {
-		superseded = landed
-	}
+	measured = landed
 	// A debt neither the caller's view nor the landed reading covers is adopted.
 	// (Covered by `landed` means it was settled while we were reading.)
 	if !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
@@ -1106,10 +1126,30 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		// re-read even if the cache moved, or it would return before reaching it.
 		return time.Time{}
 	}
+	return g.supersedingObservationLocked(landed, latest, now)
+}
+
+// supersedingObservationLocked decides whether `observation` — the freshest
+// reading the shared cache holds — supersedes the view a gather already loaded,
+// and must therefore send it back to re-read the cache instead of shaping
+// metrics from `latest`.
+//
+// Shared by seedOwedFromCache's two exits (the claimant that measured the
+// reading, and every caller the latch turns away afterwards) so the two cannot
+// drift: a peer answered by a different rule than the claimant is precisely the
+// split that let a waiter publish a pre-replay view.
+//
+// Called with g.mu held, and it may PAY an in-memory debt, so it is not a pure
+// predicate.
+func (g *claudeUsageProbeGate) supersedingObservationLocked(observation, latest, now time.Time) time.Time {
+	// Nothing newer than what the caller is already holding.
+	if observation.IsZero() || !observation.After(latest) {
+		return time.Time{}
+	}
 	// A superseding reading that has itself aged past the staleness TTL answers
 	// nothing: the caller still has a probe to issue, and the ordinary path
 	// already asks for a re-read when the shared cache moved under it.
-	if superseded.IsZero() || now.Sub(superseded) >= claudeUsageProbeStaleAfter {
+	if now.Sub(observation) >= claudeUsageProbeStaleAfter {
 		return time.Time{}
 	}
 	// Nor does one that predates a debt this process recorded itself — the
@@ -1118,12 +1158,12 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// leaving it standing would bring a trailing probe back for a reading
 	// already on disk.
 	if !g.owedBaseline.IsZero() {
-		if !claudeUsageObservationCovers(superseded, g.owedBaseline) {
+		if !claudeUsageObservationCovers(observation, g.owedBaseline) {
 			return time.Time{}
 		}
 		g.owedBaseline = time.Time{}
 	}
-	return superseded
+	return observation
 }
 
 // claudeUsageProbeAfterSeedRead is an observation point for the deterministic
@@ -1719,7 +1759,14 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	// probe for, but the caller must re-read the cache rather than publish the
 	// view it holds — the same "the shared cache moved" contract as the final
 	// return.
-	if seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, generation, now, latest); !seeded.IsZero() {
+	//
+	// A FORCED refresh is not short-circuited by it: somebody is looking at the
+	// card and asked for a reading now, and a cache that moved while we adopted is
+	// not that reading. The verdict is carried instead, and answers the forced
+	// gather only if its own attempts produce nothing — re-reading a cache that
+	// advanced still beats publishing the view it loaded before.
+	seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, generation, now, latest)
+	if !seeded.IsZero() && !forced {
 		return true
 	}
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
@@ -1804,7 +1851,10 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 			// that second join is unusable, pass two makes one final request after
 			// the joined holder has released the slot.
 		}
-		return false
+		// Nothing of ours landed. The seed's verdict is the last thing left: when
+		// the shared cache moved past `latest` while we adopted, the caller must
+		// still re-read rather than publish the view it holds.
+		return !seeded.IsZero()
 	}
 	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)

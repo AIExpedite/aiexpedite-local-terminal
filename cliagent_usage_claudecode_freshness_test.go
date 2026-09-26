@@ -1381,3 +1381,120 @@ func TestClaudeOweRunRefresh_UnscopedCacheStillTakesTheDebt(t *testing.T) {
 		t.Fatalf("RefreshOwedAtMs=%d, want the debt at %d on an unscoped cache", snap.RefreshOwedAtMs, runEnded.UnixMilli())
 	}
 }
+
+// A gather that waited on someone else's seed — or simply arrived after it —
+// must inherit the re-read verdict, not just the adopted debt. The claimant's
+// answer was about the claimant's `latest`; a peer that loaded the pre-replay
+// view and is told "nothing to re-read" publishes exactly the stale utilization
+// this whole path exists to prevent.
+func TestClaudeUsageProbeGate_CacheSeedLatchedPeerInheritsTheReReadVerdict(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-time.Minute)
+	stale := runEnded.Add(-time.Minute) // the PRE-replay view both gathers loaded
+	seedClaudeProbeReading(t, cache, stale)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	generation := claudeUsageProbe.refreshGeneration()
+	// The replay (or another agent channel) persists a covering reading, clearing
+	// the debt in the same locked write.
+	settled := runEnded.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: settled.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: settled.UnixMilli(), usageKnown: true,
+		},
+	}, settled, fp, claudeRateLimitSourceProbe)
+
+	now := time.Now()
+	// The claimant takes the latch and is told to re-read.
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, now, stale); got.UnixMilli() != settled.UnixMilli() {
+		t.Fatalf("precondition: the claimant got %v, want the covering reading %v", got, settled)
+	}
+	// The peer holds the same pre-replay view and is turned away by the latch.
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, now, stale); got.UnixMilli() != settled.UnixMilli() {
+		t.Fatalf("a latched peer got %v, want the same re-read verdict %v", got, settled)
+	}
+	// A caller already holding the covering reading has nothing to re-read.
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, now, settled); !got.IsZero() {
+		t.Errorf("a latched caller already holding the reading got %v, want zero", got)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("the seed issued %d requests, want 0 — the latched path re-reads nothing", n)
+	}
+}
+
+// Opting out of the probe must not erase utilization the status-line path
+// supplies independently of it. A transiently empty fingerprint over a scoped
+// cache is an unresolved identity, not a logout, so the opt-out clear is skipped
+// rather than allowed to take the buckets down with the debt.
+func TestPayOwedClaudeUsageRefresh_OptOutLeavesAScopedCacheAloneWhenTheIdentityIsUnresolved(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	if fp := currentClaudeAccountFingerprint(); fp != "" {
+		t.Fatalf("the fixture credential resolved to %q, want the unscoped fixture this case needs", fp)
+	}
+	runEnded := time.Now().Add(-time.Minute)
+	observed := runEnded.Add(-time.Minute)
+	if !mutateClaudeRateLimitSnapshot(cache, "scoped-account", func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs = runEnded.UnixMilli()
+		snap.Buckets[claudeWindowFiveHour] = claudeRateLimitBucket{
+			UsedPercentage: 55, ResetsAtMs: observed.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}
+		return true
+	}) {
+		t.Fatal("seeding a scoped snapshot wrote nothing")
+	}
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	SetClaudeUsageProbeDisabled(true)
+	t.Cleanup(func() { SetClaudeUsageProbeDisabled(false) })
+	payOwedClaudeUsageRefreshAt(time.Now())
+
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the opt-out clear rewrote a scoped cache under an unresolved identity:\nbefore %s\nafter  %s", before, after)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("an opted-out replay issued %d requests, want 0", n)
+	}
+}
+
+// The opt-out clear still runs when the identity IS resolved — the guard above
+// must refuse the scoped -> "" downgrade only, or a debt nothing can pay is
+// stranded forever.
+func TestPayOwedClaudeUsageRefresh_OptOutClearsADebtUnderAMatchingScope(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	observed := time.Now().Add(-2 * time.Minute)
+	seedClaudeProbeReading(t, cache, observed)
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs = time.Now().Add(-time.Minute).UnixMilli()
+		return true
+	}) {
+		t.Fatal("seeding the debt wrote nothing")
+	}
+
+	SetClaudeUsageProbeDisabled(true)
+	t.Cleanup(func() { SetClaudeUsageProbeDisabled(false) })
+	payOwedClaudeUsageRefreshAt(time.Now())
+
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("RefreshOwedAtMs=%d, want an opted-out debt retired", snap.RefreshOwedAtMs)
+	}
+	if snap := claudeCacheSnapshot(t, cache); len(snap.Buckets) != 1 {
+		t.Errorf("Buckets=%v, want the existing reading preserved by the clear", snap.Buckets)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("an opted-out replay issued %d requests, want 0", n)
+	}
+}

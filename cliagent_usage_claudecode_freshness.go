@@ -149,6 +149,30 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 	return wrote
 }
 
+// claudeUnresolvedIdentityWouldResetScope reports whether writing under
+// `fingerprint` would make mutateClaudeRateLimitSnapshot read an account
+// BOUNDARY that did not happen, and so drop the cached buckets and probe state
+// of a login this device is still signed in to.
+//
+// A credential read that transiently fails (a macOS Keychain timeout, a config
+// dir not yet readable) resolves to exactly the same "" a genuine accountless
+// claude.ai login does, and the mutation cannot tell the two apart. Every caller
+// that may hold a *stale* "" — the per-turn owe, and the opt-out clear at
+// startup — asks this first and skips the durable write instead, because the
+// cache it would wipe carries utilization the status-line path supplies
+// independently of this probe.
+//
+// Read unlocked, like claudePersistedProbeStateFor: the snapshot is only ever
+// replaced by rename. A concurrent genuine flip can overtake it, costing at most
+// one skipped write — not worth queueing these writers behind the cache gate.
+func claudeUnresolvedIdentityWouldResetScope(path, fingerprint string) bool {
+	if fingerprint != "" {
+		return false
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(path)
+	return ok && snap.AccountFingerprint != ""
+}
+
 /* ────────────────────────────────── owe ──────────────────────────────────── */
 
 // claudeOweRunRefresh mirrors an in-memory post-run debt to disk.
@@ -203,13 +227,11 @@ func claudeOweRunRefresh(baseline time.Time) {
 	// live writers (stream capture, status-line hook, probe) reset the scope on
 	// their next reading, after which an owe under "" proceeds normally.
 	//
-	// Read unlocked, like claudePersistedProbeStateFor: the snapshot is only ever
-	// replaced by rename. A concurrent genuine flip can overtake it, costing at
-	// most one skipped debt — not worth queueing a per-turn writer behind the gate.
-	if fingerprint == "" {
-		if snap, ok := loadClaudeRateLimitSnapshot(path); ok && snap.AccountFingerprint != "" {
-			return
-		}
+	// The same guard covers payOwedClaudeUsageRefreshAt's opt-out clear, for the
+	// same reason — see claudeUnresolvedIdentityWouldResetScope.
+	//
+	if claudeUnresolvedIdentityWouldResetScope(path, fingerprint) {
+		return
 	}
 	baselineMs := baseline.UnixMilli()
 	mutateClaudeRateLimitSnapshot(path, fingerprint,
@@ -391,8 +413,18 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// before the user opted out is therefore CLEARED rather than left standing —
 	// toggling the setting must not strand a marker nothing will ever retire.
 	// This is the one early return that still writes.
+	//
+	// Not, however, when the identity behind that write is unresolved: a
+	// transiently empty fingerprint over a scoped cache would be read as an
+	// account transition and take the cached BUCKETS — utilization the
+	// status-line path supplies whether or not this probe is enabled — down with
+	// the debt. Opting out of the probe must not erase someone else's readings.
+	// The debt simply stays until a start that can name the account retires it,
+	// which is the same degradation every other best-effort write here takes.
 	if !claudeUsageProbe.armedForProbe() {
-		mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
+		if !claudeUnresolvedIdentityWouldResetScope(path, fingerprint) {
+			mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
+		}
 		return
 	}
 
