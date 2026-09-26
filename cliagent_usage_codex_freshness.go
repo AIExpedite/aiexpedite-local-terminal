@@ -1503,7 +1503,7 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) {
 			return
 		}
 		if try+1 < codexLiveUsageFallbackTries &&
-			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(time.Now())) {
+			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(fp, time.Now())) {
 			return
 		}
 	}

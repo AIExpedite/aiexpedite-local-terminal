@@ -529,3 +529,60 @@ func TestCodexLiveProbeConverse_StampsTheLaunchedBuild(t *testing.T) {
 		t.Fatalf("stamp = %q, want the build the probe launched", snap.CodexVersion)
 	}
 }
+
+// Validating the pin before the exec only narrows the window. An installer that
+// replaces the binary between the check and Start() leaves the child running the
+// replacement while holding the previous build's version for its whole life, so
+// every frame it emits is mislabeled. Confirming the pin once the child exists
+// turns that into an unnameable producer, which leaves the cache's stamp alone.
+func TestCodexCaptureVersionPin_ConfirmedAfterTheSpawn(t *testing.T) {
+	t.Cleanup(resetVersionProbeCache)
+	setCodexCaptureVersion(t, "")
+
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.149.0" })
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
+
+	pin := codexCaptureVersionPinForLaunch("codex", path)
+	if pin.version != "codex-cli 0.149.0" {
+		t.Fatalf("pin = %q, want the published install", pin.version)
+	}
+	if got := pin.confirmed(); got != "codex-cli 0.149.0" {
+		t.Fatalf("confirmed = %q with the pinned binary still on disk, want it", got)
+	}
+
+	// The replacement lands in the pin → Start() window.
+	if err := os.WriteFile(path, []byte("binary-v2-longer"), 0o700); err != nil {
+		t.Fatalf("rewrite binary: %v", err)
+	}
+	if got := pin.confirmed(); got != "" {
+		t.Fatalf("confirmed = %q after the binary was replaced, want unknown", got)
+	}
+
+	// An explicit side-by-side launch confirms against its own binary.
+	side := filepath.Join(t.TempDir(), "codex-side")
+	if err := os.WriteFile(side, []byte("binary"), 0o700); err != nil {
+		t.Fatalf("write side binary: %v", err)
+	}
+	cachedProbeVersionFunc(side, func() string { return "codex-cli 0.151.0" })
+	sidePin := codexCaptureVersionPinForLaunch(side, side)
+	if got := sidePin.confirmed(); got != "codex-cli 0.151.0" {
+		t.Fatalf("side-by-side confirmed = %q, want that binary's own version", got)
+	}
+	if err := os.WriteFile(side, []byte("binary-v2-longer"), 0o700); err != nil {
+		t.Fatalf("rewrite side binary: %v", err)
+	}
+	if got := sidePin.confirmed(); got != "" {
+		t.Fatalf("side-by-side confirmed = %q after replacement, want unknown", got)
+	}
+
+	// A version published with no path has no identity to invalidate, so it
+	// survives confirmation (tests, and any caller that had no path).
+	setCodexCaptureVersion(t, "codex-cli 0.152.0")
+	if got := codexCaptureVersionPinForLaunch("codex", path).confirmed(); got != "codex-cli 0.152.0" {
+		t.Fatalf("identity-less pin confirmed = %q, want the published version", got)
+	}
+}

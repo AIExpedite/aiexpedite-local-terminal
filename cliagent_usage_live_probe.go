@@ -277,11 +277,18 @@ const codexLiveProbeReadID = 2
 // The Codex read's own single flight and cooldown. Shared by the Refresh click
 // and the post-run freshness fallback (codexLiveUsageFallback), so the two
 // together never start more than one `codex app-server` per
-// cliUsageLiveProbeCooldown.
+// cliUsageLiveProbeCooldown PER ACCOUNT.
+//
+// Both are keyed by the signed-in account's fingerprint. A process-global
+// cooldown would refuse the first read for an account the user just switched
+// to because the PREVIOUS account's read had finished seconds earlier — and a
+// Refresh click does not retry, so that account's card would simply stay stale.
+// The rate this bounds is spawns against one account's quota endpoint, which is
+// what a per-account key already bounds.
 var (
 	codexLiveReadGroup    singleflight.Group
 	codexLiveReadMu       sync.Mutex
-	codexLiveReadLastDone time.Time
+	codexLiveReadLastDone = map[string]time.Time{}
 )
 
 // codexLiveRateLimitRead runs one bounded `account/rateLimits/read` for the
@@ -299,15 +306,15 @@ func codexLiveRateLimitRead(ctx context.Context, codexPath, wantFingerprint stri
 		return liveProbeOutcomeAccountChanged
 	}
 	// Keyed by the signed-in account: a caller for a newly signed-in account
-	// must not join (and inherit the outcome of) a flight probing the old one.
-	ch := codexLiveReadGroup.DoChan("codex:"+currentCodexAccountFingerprint(), func() (any, error) {
-		if codexLiveRateLimitCooldownRemaining(time.Now()) > 0 {
+	// must not join (and inherit the outcome of) a flight probing the old one,
+	// nor be refused by a cooldown that account never spent.
+	fingerprint := currentCodexAccountFingerprint()
+	ch := codexLiveReadGroup.DoChan("codex:"+fingerprint, func() (any, error) {
+		if codexLiveRateLimitCooldownRemaining(fingerprint, time.Now()) > 0 {
 			return liveProbeOutcomeCooldown, nil
 		}
 		outcome := safeLiveProbe(func() string { return probeCodexRateLimitsLiveFn(ctx, codexPath, wantFingerprint) })
-		codexLiveReadMu.Lock()
-		codexLiveReadLastDone = time.Now()
-		codexLiveReadMu.Unlock()
+		codexRecordLiveRateLimitRead(fingerprint, time.Now())
 		return outcome, nil
 	})
 	select {
@@ -319,24 +326,40 @@ func codexLiveRateLimitRead(ctx context.Context, codexPath, wantFingerprint stri
 	}
 }
 
-// codexLiveRateLimitCooldownRemaining is how long the shared cooldown still
-// refuses a new Codex read, or zero.
-func codexLiveRateLimitCooldownRemaining(now time.Time) time.Duration {
+// codexLiveRateLimitCooldownRemaining is how long the cooldown still refuses a
+// new Codex read for that account, or zero.
+func codexLiveRateLimitCooldownRemaining(fingerprint string, now time.Time) time.Duration {
 	codexLiveReadMu.Lock()
 	defer codexLiveReadMu.Unlock()
-	if codexLiveReadLastDone.IsZero() {
+	last, ok := codexLiveReadLastDone[fingerprint]
+	if !ok {
 		return 0
 	}
-	if since := now.Sub(codexLiveReadLastDone); since >= 0 && since < cliUsageLiveProbeCooldown {
+	if since := now.Sub(last); since >= 0 && since < cliUsageLiveProbeCooldown {
 		return cliUsageLiveProbeCooldown - since
 	}
 	return 0
 }
 
-// resetCodexLiveRateLimitRead clears the shared cooldown. Test-only seam.
+// codexRecordLiveRateLimitRead starts that account's cooldown. Entries whose
+// cooldown has already lapsed are dropped in the same step, so the map holds
+// only accounts currently on cooldown however often the signed-in account
+// changes.
+func codexRecordLiveRateLimitRead(fingerprint string, now time.Time) {
+	codexLiveReadMu.Lock()
+	defer codexLiveReadMu.Unlock()
+	for key, last := range codexLiveReadLastDone {
+		if since := now.Sub(last); since < 0 || since >= cliUsageLiveProbeCooldown {
+			delete(codexLiveReadLastDone, key)
+		}
+	}
+	codexLiveReadLastDone[fingerprint] = now
+}
+
+// resetCodexLiveRateLimitRead clears every account's cooldown. Test-only seam.
 func resetCodexLiveRateLimitRead() {
 	codexLiveReadMu.Lock()
-	codexLiveReadLastDone = time.Time{}
+	codexLiveReadLastDone = map[string]time.Time{}
 	codexLiveReadMu.Unlock()
 }
 
@@ -357,7 +380,11 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath, wantFingerprint
 	if codexPath == "" {
 		command, codexPath = "codex", resolveExecutable("codex")
 	}
-	producerVersion := codexCaptureVersionForLaunch(command, codexPath)
+	// Confirmed after Start() below, for the same reason a managed session
+	// confirms its pin: a replacement landing between the pin and the exec would
+	// have this child stamp the removed build's version onto the replacement's
+	// reading.
+	producerVersionPin := codexCaptureVersionPinForLaunch(command, codexPath)
 	ctx, cancel := context.WithTimeout(parent, codexLiveProbeTimeout)
 	defer cancel()
 
@@ -386,6 +413,10 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath, wantFingerprint
 	if err := cmd.Start(); err != nil {
 		return liveProbeOutcomeSpawnFailed
 	}
+	// The child exists, so the pin can be checked against the binary still on
+	// disk; a replacement in the pin→Start window makes this an unnameable
+	// producer, which leaves the cache's existing stamp alone.
+	producerVersion := producerVersionPin.confirmed()
 	// Whatever happens below, the whole tree goes: on Windows the npm shim is
 	// cmd.exe → node → codex.exe.
 	defer func() {

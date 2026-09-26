@@ -715,12 +715,14 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
 	}
 
-	// Read BEFORE the spawn, never from the struct literal below. A gather that
-	// publishes a newer build in the window between Start() and that literal
-	// would credit this child's whole lifetime of telemetry to a binary it is
-	// not running, which also clears the capture-drift signal the new build
-	// should still be raising.
-	codexCaptureVersion := codexCaptureVersionForLaunch(command, executable)
+	// Pinned BEFORE the spawn, never read from the struct literal below. A
+	// gather that publishes a newer build in the window between Start() and that
+	// literal would credit this child's whole lifetime of telemetry to a binary
+	// it is not running, which also clears the capture-drift signal the new
+	// build should still be raising. Confirmed again once the child exists: an
+	// installer holds none of our locks, so the file can also be replaced
+	// between this pin and Start().
+	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
 
 	// Start the process
 	if err := proc.Start(); err != nil {
@@ -771,7 +773,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		antigravityManagedStream:     antigravityManagedStream,
 		finishQuotaCapture:           finishQuotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
-		codexCaptureVersion:          codexCaptureVersion,
+		// The child is running now, so the pin can be confirmed against the
+		// binary still on disk: a replacement that landed in the pin→Start
+		// window leaves this child an unnameable producer rather than one
+		// stamping the removed build's version onto the replacement's frames.
+		codexCaptureVersion: codexCaptureVersionPin.confirmed(),
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.

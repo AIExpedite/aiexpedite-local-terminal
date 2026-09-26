@@ -148,22 +148,21 @@ func currentCodexUsageCaptureStamp() codexCaptureVersionStamp {
 	return stamp
 }
 
-// codexInstalledCaptureVersion is the published version, but only while the
-// binary it was read from is still the file on disk — the check a launch needs
-// and a stamp of already-received telemetry does not. A replacement that
-// landed after the publish yields "" (unknown producer), which leaves the
-// cache's existing stamp untouched instead of crediting the removed build with
-// the new one's telemetry. A version published without an identity (a test, or
-// a caller that had no path) is returned as-is: there is nothing to invalidate.
-func codexInstalledCaptureVersion() string {
+// codexInstalledCaptureVersionPin is the published version as a launch pin, but
+// only while the binary it was read from is still the file on disk — the check a
+// launch needs and a stamp of already-received telemetry does not. A replacement
+// that landed after the publish pins nothing (unknown producer), which leaves
+// the cache's existing stamp untouched instead of crediting the removed build
+// with the new one's telemetry. A version published without an identity (a
+// test, or a caller that had no path) is kept as-is: there is nothing to
+// invalidate.
+func codexInstalledCaptureVersionPin() codexCaptureVersionPin {
 	stamp := currentCodexUsageCaptureStamp()
-	if stamp.version == "" || stamp.identity.Path == "" {
-		return stamp.version
+	pin := codexCaptureVersionPin{version: stamp.version, identity: stamp.identity}
+	if pin.confirmed() == "" {
+		return codexCaptureVersionPin{}
 	}
-	if !versionProbeIdentityCurrent(stamp.identity) {
-		return ""
-	}
-	return stamp.version
+	return pin
 }
 
 // codexInstalledVersion reads the installed Codex binary's version through the
@@ -199,14 +198,58 @@ func codexResolveCaptureVersion() {
 // it stamps only a version already probed for that exact binary, and
 // otherwise stays unknown — which leaves the existing stamp untouched rather
 // than crediting the installed build with another binary's telemetry.
+//
+// Callers that SPAWN keep the pin (codexCaptureVersionPinForLaunch) so they can
+// confirm it once the child is running; this form is for a caller that only
+// needs the version it would have pinned.
 func codexCaptureVersionForLaunch(command, executable string) string {
+	return codexCaptureVersionPinForLaunch(command, executable).version
+}
+
+// codexCaptureVersionPin is a version pinned for a child about to be spawned,
+// together with the identity of the binary it was read from. The identity is
+// what lets the caller confirm the pin AFTER the spawn: the installer takes
+// none of our locks, so the file can be replaced between naming the version and
+// the exec that runs it. A zero identity means there is nothing to confirm —
+// either no version was pinned, or it was published without a path (a test, or
+// a publisher that had none).
+type codexCaptureVersionPin struct {
+	version  string
+	identity versionProbeKey
+}
+
+// codexCaptureVersionPinForLaunch is codexCaptureVersionForLaunch keeping the
+// identity it validated the version against.
+func codexCaptureVersionPinForLaunch(command, executable string) codexCaptureVersionPin {
 	if !isExplicitPath(command) {
-		return codexInstalledCaptureVersion()
+		return codexInstalledCaptureVersionPin()
 	}
-	if v, ok := peekCachedProbeVersion(executable); ok {
-		return codexNormalizeVersion(v)
+	if v, identity, ok := peekCachedProbeVersionIdentity(executable); ok {
+		return codexCaptureVersionPin{version: codexNormalizeVersion(v), identity: identity}
 	}
-	return ""
+	return codexCaptureVersionPin{}
+}
+
+// confirmed is the version the child that just started may stamp its telemetry
+// with — "" (unknown producer) when the binary it was pinned from is no longer
+// the file on disk.
+//
+// Validating before the exec only narrows the window; it cannot close it. An
+// installer that replaces the executable between the check and Start() leaves
+// the child RUNNING the replacement while holding the previous build's version
+// for its whole lifetime, which mislabels every frame it emits: false capture
+// drift after an upgrade, suppressed drift after a downgrade. One stat after
+// Start() turns that into an unnameable producer, which leaves the cache's
+// existing stamp untouched — the same thing every other unnameable capture
+// does.
+func (pin codexCaptureVersionPin) confirmed() string {
+	if pin.version == "" || pin.identity.Path == "" {
+		return pin.version
+	}
+	if !versionProbeIdentityCurrent(pin.identity) {
+		return ""
+	}
+	return pin.version
 }
 
 // codexRolloutProducerVersion maps a rollout header's `cli_version` onto the

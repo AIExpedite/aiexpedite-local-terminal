@@ -1114,3 +1114,68 @@ func TestCodexLiveRateLimitRead_FlightIsScopedToTheAccount(t *testing.T) {
 		t.Fatalf("probes = %d, want one per account", got)
 	}
 }
+
+// The completed-read cooldown is per account too. A process-global one refused
+// the first read for an account the user had just switched to because the
+// PREVIOUS account's read had finished seconds earlier — and a Refresh click
+// does not retry, so that account's card simply stayed stale.
+func TestCodexLiveRateLimitRead_CooldownIsScopedToTheAccount(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	home := os.Getenv("CODEX_HOME")
+	helperCodexAuthAt(t, home, "before@example.com", time.Now().Add(-time.Hour))
+	var calls int32
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		atomic.AddInt32(&calls, 1)
+		return liveProbeOutcomeOK
+	}
+
+	first := currentCodexAccountFingerprint()
+	if got := codexLiveRateLimitRead(context.Background(), "codex", ""); got != liveProbeOutcomeOK {
+		t.Fatalf("first account's read = %q, want its probe's outcome", got)
+	}
+	// Same account, still inside the cooldown: nothing spawns.
+	if got := codexLiveRateLimitRead(context.Background(), "codex", first); got != liveProbeOutcomeCooldown {
+		t.Fatalf("same account inside its cooldown = %q, want cooldown", got)
+	}
+
+	helperCodexAuthAt(t, home, "after@example.com", time.Now())
+	second := currentCodexAccountFingerprint()
+	if second == first {
+		t.Fatal("credentials swap did not change the account fingerprint")
+	}
+	if got := codexLiveRateLimitRead(context.Background(), "codex", second); got != liveProbeOutcomeOK {
+		t.Fatalf("new account's read = %q, want its own probe rather than the other account's cooldown", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("probes = %d, want one per account", got)
+	}
+	// The account that just read is the one on cooldown.
+	if remaining := codexLiveRateLimitCooldownRemaining(second, time.Now()); remaining <= 0 {
+		t.Fatalf("cooldown for the account that just read = %v, want it held", remaining)
+	}
+}
+
+// The cooldown map holds only accounts still on cooldown, whatever the signing
+// in and out does — a lapsed entry is dropped the next time a read is recorded.
+func TestCodexRecordLiveRateLimitRead_DropsLapsedAccounts(t *testing.T) {
+	resetCodexLiveRateLimitRead()
+	t.Cleanup(resetCodexLiveRateLimitRead)
+
+	now := time.Now()
+	codexRecordLiveRateLimitRead("lapsed", now.Add(-2*cliUsageLiveProbeCooldown))
+	codexRecordLiveRateLimitRead("fresh", now)
+	if got := codexLiveRateLimitCooldownRemaining("lapsed", now); got != 0 {
+		t.Fatalf("lapsed account cooldown = %v, want zero", got)
+	}
+	if got := codexLiveRateLimitCooldownRemaining("fresh", now); got <= 0 {
+		t.Fatalf("fresh account cooldown = %v, want it held", got)
+	}
+	codexLiveReadMu.Lock()
+	_, stillThere := codexLiveReadLastDone["lapsed"]
+	size := len(codexLiveReadLastDone)
+	codexLiveReadMu.Unlock()
+	if stillThere || size != 1 {
+		t.Fatalf("map holds %d entries (lapsed present=%v), want only the account on cooldown", size, stillThere)
+	}
+}

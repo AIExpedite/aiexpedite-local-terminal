@@ -595,8 +595,9 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 
 	// Pinned before the spawn for the same reason as the pipe-session path: a
 	// version published between Start() and the struct literal below describes a
-	// build this long-lived child is not running.
-	codexCaptureVersion := codexCaptureVersionForLaunch("codex", executable)
+	// build this long-lived child is not running. Confirmed after Start() too,
+	// since an installer can replace the binary in the pin→exec window.
+	codexCaptureVersionPin := codexCaptureVersionPinForLaunch("codex", executable)
 
 	if err := proc.Start(); err != nil {
 		stdin.Close()
@@ -616,7 +617,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		UID:                 uid,
 		status:              "running",
 		done:                make(chan struct{}),
-		codexCaptureVersion: codexCaptureVersion,
+		codexCaptureVersion: codexCaptureVersionPin.confirmed(),
 		processExited:       make(chan struct{}),
 		streamDone:          make(chan struct{}),
 	}
