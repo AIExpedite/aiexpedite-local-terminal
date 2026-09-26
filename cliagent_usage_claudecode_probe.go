@@ -379,11 +379,24 @@ type claudeUsageProbeGate struct {
 	owedBaseline      time.Time
 	trailingScheduled bool
 	// owedSeeded latches the ONE read of the persisted debt this process makes
-	// (see owedObservation). Cleared by resetClaudeUsageProbeGate alongside the
-	// fields it already zeroes: a latch that survived the reset would let one
-	// test's persisted debt decide whether the next test reads its own cache —
-	// the same cross-test leak class the drain and cancelTrailing prevent.
-	owedSeeded bool
+	// for the account named by owedSeededFor (see seedOwedFromCache). Scoped to
+	// the fingerprint rather than the process, so a first gather that could not
+	// identify the account — a transient Keychain timeout hands it an empty
+	// fingerprint, which no scoped snapshot matches — does not consume the only
+	// chance the real account's debt and hold have of being adopted. Cleared by
+	// resetClaudeUsageProbeGate alongside the fields it already zeroes: a latch
+	// that survived the reset would let one test's persisted debt decide whether
+	// the next test reads its own cache — the same cross-test leak class the
+	// drain and cancelTrailing prevent.
+	owedSeeded    bool
+	owedSeededFor string
+	// seedingCh is non-nil while a seed is between claiming the latch and
+	// finishing its adoption, and is closed when it does. A concurrent gather
+	// WAITS on it rather than treating "a seed has started" as "the debt and hold
+	// are adopted": the claimant does its cache read unlocked, and a peer that
+	// ran on in that window could publish the pre-run reading or be admitted
+	// inside a persisted Retry-After.
+	seedingCh chan struct{}
 	// settling counts the post-run settlement calls currently running —
 	// claudeUsageProbePayRecordedRun, whether reached synchronously or on the
 	// goroutine triggerClaudeUsageProbeAfterRun spawns. The slot
@@ -581,6 +594,10 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.heldUntil = time.Time{}
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
+	claudeUsageProbe.owedSeededFor = ""
+	// A seed still in flight closes its own channel when it returns; dropping the
+	// reference here only stops it from marking the NEXT generation as seeded.
+	claudeUsageProbe.seedingCh = nil
 	// Release any reservation outright. The sleeping trailing timer was already
 	// abandoned by the cancel at the top of this function, and the drain has
 	// since waited for the settlement holding it to return — so this clears a
@@ -933,7 +950,7 @@ func (g *claudeUsageProbeGate) refreshGeneration() uint64 {
 	return g.refreshes
 }
 
-// seedOwedFromCache adopts, ONCE per process, the state a previous process
+// seedOwedFromCache adopts, ONCE per account per process, the state a previous process
 // persisted — the post-run debt and any 429 hold — so the `owing` branch below
 // sees a run this process never saw, and begin() honours backpressure this
 // process never took.
@@ -997,15 +1014,46 @@ func (g *claudeUsageProbeGate) refreshGeneration() uint64 {
 // answer off the debt would report "nothing happened" for precisely the case the
 // generation counter exists to catch, and leave the gather to publish the
 // pre-replay view for the whole TTL. A needless re-read costs one cache load, and
-// the latch makes it at most one per process.
-func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, generation uint64, now, latest time.Time) time.Time {
-	g.mu.Lock()
-	seed := !g.owedSeeded
-	g.owedSeeded = true
-	g.mu.Unlock()
-	if !seed {
-		return time.Time{}
+// the latch makes it at most one per account per process.
+func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint string, generation uint64, now, latest time.Time) time.Time {
+	var seeding chan struct{}
+	for seeding == nil {
+		g.mu.Lock()
+		if g.owedSeeded && g.owedSeededFor == fingerprint {
+			g.mu.Unlock()
+			return time.Time{}
+		}
+		if pending := g.seedingCh; pending != nil {
+			g.mu.Unlock()
+			// Another gather is mid-adoption. Wait for it, then look again: it may
+			// have been seeding a DIFFERENT account, in which case this one still
+			// has its own to adopt. Bounded by the gather's context — a gather that
+			// gives up here degrades to the unseeded path, never to a hang.
+			select {
+			case <-pending:
+			case <-ctx.Done():
+				return time.Time{}
+			}
+			continue
+		}
+		seeding = make(chan struct{})
+		g.seedingCh = seeding
+		g.mu.Unlock()
 	}
+	// Marked seeded only once the adoption below is done, so no peer can pass the
+	// latch before the debt and hold are on the gate. A reset in the meantime
+	// swaps seedingCh out, and this seed then leaves the latch for the next
+	// generation to claim.
+	defer func() {
+		g.mu.Lock()
+		if g.seedingCh == seeding {
+			g.seedingCh = nil
+			g.owedSeeded = true
+			g.owedSeededFor = fingerprint
+		}
+		g.mu.Unlock()
+		close(seeding)
+	}()
 	persisted, _, held := claudePersistedProbeStateFor(fingerprint)
 	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
 	// process already took outranks a shorter persisted one.
@@ -1013,6 +1061,16 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, generation 
 		g.holdUntil(held)
 	}
 	claudeUsageProbeAfterSeedRead()
+	// The shared cache as it stands NOW, measured by the same row-aware rule as
+	// `latest`. The generation counter below only sees probes of THIS process; an
+	// overlapping old agent or a second agent channel writes the same file and
+	// settles the same durable debt in that write, so without this a reading it
+	// persisted after the caller's load would leave the seed finding no debt and
+	// nothing to report, and the gather would publish the pre-refresh view. Loaded
+	// AFTER the debt read, so any write that cleared the debt is visible here, and
+	// before g.mu is taken, since nothing touching the filesystem may be held
+	// under it.
+	onDisk := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	// What a probe of THIS process persisted while we were reading, for THIS
@@ -1023,30 +1081,49 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, generation 
 	if g.refreshes != generation && g.lastRefreshFingerprint == fingerprint {
 		landed = g.lastRefreshAt
 	}
+	if onDisk.After(landed) {
+		landed = onDisk
+	}
 	// It supersedes the caller's own view, so the gather must re-read whatever we
 	// decide about the debt below.
 	superseded := time.Time{}
 	if landed.After(latest) {
 		superseded = landed
 	}
-	if persisted.IsZero() || claudeUsageObservationCovers(latest, persisted) {
-		return superseded
+	// A debt neither the caller's view nor the landed reading covers is adopted.
+	// (Covered by `landed` means it was settled while we were reading.)
+	if !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
+		!claudeUsageObservationCovers(landed, persisted) {
+		// Inlined rather than calling recordOwed so the decision and the record
+		// are one critical section: releasing the lock between them would reopen
+		// exactly the window above. Same rule as recordOwed — only ever RAISE the
+		// baseline, so a persisted debt can never walk back one this process
+		// recorded in the meantime.
+		if persisted.After(g.owedBaseline) {
+			g.owedBaseline = persisted
+		}
+		// A debt was adopted, so the caller has a probe to issue: report no
+		// re-read even if the cache moved, or it would return before reaching it.
+		return time.Time{}
 	}
-	if claudeUsageObservationCovers(landed, persisted) {
-		// Settled while we were reading. Nothing to adopt.
-		return superseded
+	// A superseding reading that has itself aged past the staleness TTL answers
+	// nothing: the caller still has a probe to issue, and the ordinary path
+	// already asks for a re-read when the shared cache moved under it.
+	if superseded.IsZero() || now.Sub(superseded) >= claudeUsageProbeStaleAfter {
+		return time.Time{}
 	}
-	// Inlined rather than calling recordOwed so the decision and the record are
-	// one critical section: releasing the lock between them would reopen exactly
-	// the window above. Same rule as recordOwed — only ever RAISE the baseline,
-	// so a persisted debt can never walk back one this process recorded in the
-	// meantime.
-	if persisted.After(g.owedBaseline) {
-		g.owedBaseline = persisted
+	// Nor does one that predates a debt this process recorded itself — the
+	// caller must reach the `owing` branch. One that covers it pays it, exactly
+	// as settleOwedIfCovered would on the dedupe path this early return skips;
+	// leaving it standing would bring a trailing probe back for a reading
+	// already on disk.
+	if !g.owedBaseline.IsZero() {
+		if !claudeUsageObservationCovers(superseded, g.owedBaseline) {
+			return time.Time{}
+		}
+		g.owedBaseline = time.Time{}
 	}
-	// A debt was adopted, so the caller has a probe to issue: report no re-read
-	// even if the cache moved, or it would return before reaching it.
-	return time.Time{}
+	return superseded
 }
 
 // claudeUsageProbeAfterSeedRead is an observation point for the deterministic
@@ -1642,7 +1719,7 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	// probe for, but the caller must re-read the cache rather than publish the
 	// view it holds — the same "the shared cache moved" contract as the final
 	// return.
-	if seeded := claudeUsageProbe.seedOwedFromCache(fingerprint, generation, now, latest); !seeded.IsZero() {
+	if seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, generation, now, latest); !seeded.IsZero() {
 		return true
 	}
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken

@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"os"
 	"sync"
@@ -883,7 +884,7 @@ func TestClaudeUsageProbeGate_CacheSeedDoesNotResurrectASettledDebt(t *testing.T
 		mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
 	}
 
-	got := claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest)
+	got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest)
 
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("a settled debt was resurrected on the gate as %v", owed)
@@ -908,7 +909,7 @@ func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheCallerAlreadyCovers(t *testi
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	if got := claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), runEnded.Add(time.Second)); !got.IsZero() {
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), runEnded.Add(time.Second)); !got.IsZero() {
 		t.Fatalf("seedOwedFromCache()=%v, want zero — the caller's own reading needs no re-read", got)
 	}
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
@@ -954,7 +955,7 @@ func TestClaudeUsageProbeGate_CacheSeedReportsARefreshThatAlreadyClearedTheDebt(
 	// Cleared before the seed's own read, so it loads no debt at all.
 	mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
 
-	got := claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest)
+	got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest)
 
 	if got.UnixMilli() != settled.UnixMilli() {
 		t.Fatalf("seedOwedFromCache()=%v, want the landed reading %v so the gather re-reads the cache", got, settled)
@@ -1006,7 +1007,7 @@ func TestClaudeUsageProbeGate_CacheSeedReportsNoReReadWithoutAFreshRefresh(t *te
 			} else {
 				record()
 			}
-			if got := claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest); !got.IsZero() {
+			if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), latest); !got.IsZero() {
 				t.Fatalf("seedOwedFromCache()=%v, want zero — no fresh reading supersedes the caller's", got)
 			}
 		})
@@ -1033,7 +1034,7 @@ func TestClaudeUsageProbeGate_CacheSeedRestoresAPersistedHold(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
 
 	claudeUsageProbe.mu.Lock()
 	gateHold := claudeUsageProbe.heldUntil
@@ -1069,7 +1070,7 @@ func TestClaudeUsageProbeGate_CacheSeedIgnoresASkewedHold(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
 
 	claudeUsageProbe.mu.Lock()
 	gateHold := claudeUsageProbe.heldUntil
@@ -1113,7 +1114,7 @@ func TestClaudeUsageProbeGate_CacheSeedReportsARefreshThatLandedBeforeItWasEnter
 	claudeUsageProbe.mu.Unlock()
 	mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
 
-	got := claudeUsageProbe.seedOwedFromCache(fp, generation, time.Now(), latest)
+	got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, time.Now(), latest)
 
 	if got.UnixMilli() != settled.UnixMilli() {
 		t.Fatalf("seedOwedFromCache()=%v, want the landed reading %v so the gather re-reads the cache", got, settled)
@@ -1123,6 +1124,159 @@ func TestClaudeUsageProbeGate_CacheSeedReportsARefreshThatLandedBeforeItWasEnter
 	}
 	if n := atomic.LoadInt64(calls); n != 0 {
 		t.Errorf("the seed issued %d requests, want 0 — it is a pure cache read", n)
+	}
+}
+
+// The generation counter only sees probes of THIS process, but the cache and the
+// durable debt are shared: an overlapping old agent or a second agent channel can
+// persist a covering reading — settling the debt in the same write — after the
+// gather loaded its view. The seed must compare what is on disk now against the
+// caller's view, or it finds no debt, reports nothing, and the gather publishes
+// the pre-refresh reading.
+func TestClaudeUsageProbeGate_CacheSeedReportsARefreshByAnotherProcess(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-time.Minute)
+	latest := runEnded.Add(-time.Minute) // the PRE-refresh reading this gather loaded
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	generation := claudeUsageProbe.refreshGeneration()
+	// Another process's probe writes a covering reading, which clears the debt in
+	// the same write; this process's refresh counter never moves.
+	settled := runEnded.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: settled.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: settled.UnixMilli(), usageKnown: true,
+		},
+	}, settled, fp, claudeRateLimitSourceProbe)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("precondition: the covering write left the debt at %d", snap.RefreshOwedAtMs)
+	}
+
+	got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, time.Now(), latest)
+
+	if got.UnixMilli() != settled.UnixMilli() {
+		t.Fatalf("seedOwedFromCache()=%v, want the other process's reading %v so the gather re-reads the cache", got, settled)
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("a settled debt was adopted on the gate as %v", owed)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("the seed issued %d requests, want 0 — it is a pure cache read", n)
+	}
+}
+
+// Two gathers entering a fresh process together: the second must not pass the
+// latch while the first is still reading the cache, or it runs on with neither
+// the persisted debt nor the hold adopted.
+func TestClaudeUsageProbeGate_CacheSeedPeersWaitForTheAdoption(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	reading := make(chan struct{})
+	release := make(chan struct{})
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+	claudeUsageProbeAfterSeedRead = func() {
+		close(reading)
+		<-release
+	}
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+	}()
+	<-reading
+
+	peer := make(chan time.Time, 1)
+	go func() {
+		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+		peer <- claudeUsageProbe.owedObservation()
+	}()
+	select {
+	case owed := <-peer:
+		t.Fatalf("a peer returned while the first seed was mid-read (owed=%v)", owed)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-first
+	select {
+	case owed := <-peer:
+		if owed.UnixMilli() != runEnded.UnixMilli() {
+			t.Fatalf("the peer saw owed=%v, want the adopted debt %v", owed, runEnded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the peer never returned after the first seed finished")
+	}
+}
+
+// A peer waiting on someone else's seed is still bounded by its own gather.
+func TestClaudeUsageProbeGate_CacheSeedPeerWaitHonoursItsContext(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	reading := make(chan struct{})
+	release := make(chan struct{})
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+	claudeUsageProbeAfterSeedRead = func() {
+		close(reading)
+		<-release
+	}
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	}()
+	<-reading
+	defer func() { close(release); <-first }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := claudeUsageProbe.seedOwedFromCache(ctx, fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{}); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero from a gather whose context ended", got)
+	}
+}
+
+// The latch is scoped to the account. A first gather that could not identify it —
+// a transient Keychain timeout hands it an empty fingerprint, which no scoped
+// snapshot matches — must not consume the real account's only chance to adopt
+// its debt.
+func TestClaudeUsageProbeGate_CacheSeedRetriesAfterAnUnknownAccount(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	const fp = "scoped-account"
+	runEnded := time.Now().Add(-time.Minute)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs = runEnded.UnixMilli()
+		return true
+	})
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), "", claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("an unidentified gather adopted a scoped debt: %v", owed)
+	}
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
+	if owed := claudeUsageProbe.owedObservation(); owed.UnixMilli() != runEnded.UnixMilli() {
+		t.Fatalf("owedObservation()=%v, want the persisted debt %v once the account is known", owed, runEnded)
 	}
 }
 
