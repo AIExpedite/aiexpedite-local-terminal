@@ -104,10 +104,30 @@ const (
 // helper CREATES is stamped, so a debt-only file never reaches an operator (or
 // a diagnostics upload) carrying an empty timestamp.
 func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRateLimitSnapshot) bool) bool {
+	wrote, _, _ := mutateClaudeRateLimitSnapshotStamped(path, fingerprint, fn)
+	return wrote
+}
+
+// mutateClaudeRateLimitSnapshotStamped is mutateClaudeRateLimitSnapshot plus the
+// cache stamp (claudeRateLimitCacheStamp's pair) of the file the mutation leaves
+// behind, stat'd under the SAME lock as the write.
+//
+// Under the lock because a caller that latches a decision to a stamp must latch
+// it to the snapshot it actually read and wrote. Sampling the stamp after the
+// lock is released lets another process's rename land in between: the stamp then
+// describes THAT snapshot while the state the caller adopted describes the
+// previous one, so the latch matches a file whose debt and Retry-After were
+// never read — and keeps matching until some later write moves the file again.
+//
+// Zero mod/size means the stat failed (or nothing was written). A caller keeps
+// whatever older stamp it already holds in that case, which errs toward
+// re-opening the decision rather than latching one away.
+func mutateClaudeRateLimitSnapshotStamped(path, fingerprint string, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
 	if path == "" || fn == nil {
-		return false
+		return false, 0, 0
 	}
 	wrote := false
+	var modUnixNano, size int64
 	_, _ = withClaudeRateLimitCacheLocked(path, time.Time{}, func() (time.Time, error) {
 		snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 		if b, err := os.ReadFile(path); err == nil {
@@ -158,9 +178,12 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 			return time.Time{}, err
 		}
 		wrote = true
+		if info, err := os.Stat(path); err == nil {
+			modUnixNano, size = info.ModTime().UnixNano(), info.Size()
+		}
 		return time.Time{}, nil
 	})
-	return wrote
+	return wrote, modUnixNano, size
 }
 
 /* ────────────────────────────────── owe ──────────────────────────────────── */

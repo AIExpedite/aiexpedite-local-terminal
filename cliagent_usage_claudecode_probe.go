@@ -1252,8 +1252,9 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		!claudeUsageObservationCovers(onDisk, persisted)
 	// A debt no probe of this gather could pay is not adopted, and — crucially —
 	// not CHARGED. begin() refuses on an unarmed gate, a live 429 hold (possibly
-	// the one this seed adopted two statements up), offline mode, or a context
-	// that has already ended, so a charge here would buy a request that is never
+	// the one this seed adopted two statements up), offline mode, an unelapsed
+	// throttle interval with nothing on the wire to inherit, or a context that
+	// has already ended, so a charge here would buy a request that is never
 	// issued: two such starts reach the attempt cap and the startup replay then
 	// retires a debt nothing ever asked the endpoint about, leaving the pre-run
 	// utilization stale for the whole TTL — the exact failure this path exists to
@@ -1273,43 +1274,66 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		claudeUsageProbeSeedBlocked()
 		persisted, uncovered, latch = time.Time{}, false, false
 	}
+	claudeUsageProbeBeforeSeedCharge()
 	if uncovered {
 		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
 		lockedHeldMs := int64(0)
-		if mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
+		lockedObserved := time.Time{}
+		// Both values are sampled on EVERY path, under the SAME lock the charge
+		// takes and BEFORE the charge decides anything, because the unlocked read
+		// above is necessarily older than this write:
+		//
+		//   - the hold, so a 429 another channel recorded in that gap is not
+		//     latched away unseen for this account;
+		//   - the observation, so a covering reading another writer persisted in
+		//     that same gap reaches `landed` below. That reading is exactly what
+		//     makes the charge refuse (the debt it settled is gone), and a refusal
+		//     that dropped it would leave a gather holding a pre-run `latest` with
+		//     no debt to probe for and no re-read to report — publishing the stale
+		//     view this whole path exists to prevent.
+		charged, wroteMod, wroteSize := mutateClaudeRateLimitSnapshotStamped(claudeRateLimitCachePath(), fingerprint,
 			func(snap *claudeRateLimitSnapshot) bool {
-				if !charge(snap) {
-					return false
-				}
-				// The hold as it stands under the SAME lock the charge took. The
-				// unlocked read above is older than this write, and the latch stamp
-				// below is re-sampled to match the file we leave behind, so a 429
-				// another channel recorded in that gap would otherwise be latched
-				// away unseen for this account.
 				lockedHeldMs = snap.HeldUntilMs
-				return true
-			}) {
-			if lockedHeldMs > 0 {
-				if locked := time.UnixMilli(lockedHeldMs); !locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
-					// Monotonic, like the adoption above: this only ever raises the hold.
-					g.holdUntil(locked)
-				}
+				lockedObserved = claudeSnapshotFreshness(claudeRateLimitView{
+					buckets:    snap.Buckets,
+					probedAtMs: snap.LastProbeObservedAtMs,
+				}, now)
+				return charge(snap)
+			})
+		claudeUsageProbeAfterSeedCharge()
+		if lockedHeldMs > 0 {
+			if locked := time.UnixMilli(lockedHeldMs); !locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+				// Monotonic, like the adoption above: this only ever raises the hold.
+				g.holdUntil(locked)
 			}
+		}
+		// Measured by the same rule as `onDisk` and only ever raises it: this is
+		// the primary cache alone, whereas onDisk also folds the pinned hook cache.
+		if lockedObserved.After(onDisk) {
+			onDisk = lockedObserved
+		}
+		if charged {
 			// The charge rewrote the snapshot, so the stamp sampled before the
-			// reads no longer describes the file. Re-sample it, or the latch this
-			// seed is about to record is stale on arrival and EVERY later gather
-			// re-adopts — resurrecting a debt this process has since settled in
-			// memory, since only the covering merge clears it on disk. Sound
-			// because the write above carries the locked view the re-sampled stamp
-			// belongs to; a cross-process rename landing between that write and
-			// this stat degrades exactly as claudeRateLimitCacheStamp documents,
-			// and the post-latch recheck above still shortens the exposure.
-			stampMod, stampSize = claudeRateLimitCacheStamp()
+			// reads no longer describes the file. Take the one the mutation stat'd
+			// under its own lock, or the latch this seed is about to record is
+			// stale on arrival and EVERY later gather re-adopts — resurrecting a
+			// debt this process has since settled in memory, since only the
+			// covering merge clears it on disk. Stamping under that lock is also
+			// what keeps the stamp describing the snapshot whose hold we just
+			// adopted: an off-lock stat could describe another process's newer
+			// file and latch its Retry-After away unread. A failed stat reports
+			// zeroes, and the older stamp we already hold is kept — it re-opens
+			// the adoption rather than latching one away.
+			if wroteMod != 0 || wroteSize != 0 {
+				stampMod, stampSize = wroteMod, wroteSize
+			}
 		} else {
 			// Refused: contended cache, a debt another writer settled or replaced
 			// while we read, or a count two overlapping processes both passed the
 			// unlocked retirement test on. Nothing was written, so the stamp still
-			// describes the file — and an uncharged debt is not adopted.
+			// describes the file — and an uncharged debt is not adopted. The
+			// reading sampled above still travels, so a settlement that landed in
+			// the gap is reported to the caller as a re-read.
 			persisted = time.Time{}
 		}
 	}
@@ -1419,21 +1443,52 @@ var claudeUsageProbeAfterSeedStamp = func() {}
 // no-op.
 var claudeUsageProbeSeedBlocked = func() {}
 
+// claudeUsageProbeBeforeSeedCharge is an observation point for the "a refused
+// charge still carries the reading that refused it" test: it sits between
+// seedOwedFromCache's unlocked cache load and the locked charge, the window in
+// which another process's covering write both settles the debt and invalidates
+// the view this gather measured. Production leaves it as a no-op.
+var claudeUsageProbeBeforeSeedCharge = func() {}
+
+// claudeUsageProbeAfterSeedCharge is an observation point for the "the latch
+// carries the stamp of the snapshot the charge wrote" test: it runs after the
+// charge has released the cache lock and before its stamp is used, which is
+// exactly where an off-lock stat would pick up another process's newer file.
+// Production leaves it as a no-op.
+var claudeUsageProbeAfterSeedCharge = func() {}
+
 // blockedFromIssuing reports whether begin() would refuse every probe this
 // gather could still make, for a reason that is not transient contention: an
-// unarmed (opted-out) gate, a live server-imposed hold, or offline mode. Used by
-// seedOwedFromCache to decline — uncharged — a debt it cannot hand a payable
-// request to. inFlight and the interval are deliberately NOT consulted: a probe
-// already on the wire settles the debt, and the interval is what the `owing`
-// branch exists to beat.
+// unarmed (opted-out) gate, a live server-imposed hold, offline mode, or an
+// in-memory throttle interval that has not elapsed with no probe on the wire to
+// inherit. Used by seedOwedFromCache to decline — uncharged — a debt it cannot
+// hand a payable request to.
+//
+// The interval IS consulted, because begin() checks it too: the `owing` branch
+// beats the staleness TTL and the cross-process dedupe baseline, not the
+// throttle. Without it, a gather arriving right behind a failed startup replay
+// (which has already charged one attempt and moved lastAttempt) charges the
+// second and last attempt, is then refused by begin() without a request going
+// out, and the next start retires a debt the endpoint was asked about exactly
+// once. A forced refresh does bypass the interval, but it probes unconditionally
+// anyway and the merge that carries its reading settles the durable debt, so
+// declining the adoption costs it nothing.
+//
+// inFlight is still NOT consulted, and is what makes the throttle test safe: a
+// probe already on the wire is the one paying this debt, so the adoption is kept
+// (the `owing` branch joins it) even though begin() would refuse the slot.
 func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 	g.mu.Lock()
 	armed, held := g.armed, g.heldUntil
+	throttled := !g.inFlight && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval()
 	g.mu.Unlock()
 	if !armed {
 		return true
 	}
 	if !held.IsZero() && now.Before(held) {
+		return true
+	}
+	if throttled {
 		return true
 	}
 	return IsOffline()

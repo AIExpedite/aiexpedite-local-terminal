@@ -2210,3 +2210,175 @@ func adoptedDebtOnceTheHoldExpires(t *testing.T, fp string, held, latest time.Ti
 	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), held.Add(time.Second), latest)
 	return claudeUsageProbe.owedObservation()
 }
+
+// A gather arriving right behind a FAILED startup replay is still inside the
+// in-memory throttle interval, which begin() enforces for every non-forced probe
+// — the `owing` branch beats the staleness TTL and the dedupe baseline, not the
+// throttle. Charging the adoption there would spend the second and last attempt
+// on a request nobody issues, and the next start would retire a debt the
+// endpoint was asked about exactly once. Declined uncharged and unlatched, so the
+// gather after the interval adopts the same unchanged snapshot.
+func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhileThrottled(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	// armClaudeUsageProbe pins the interval to 0; this test is about the throttle.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	blocked := 0
+	originalBlocked := claudeUsageProbeSeedBlocked
+	t.Cleanup(func() { claudeUsageProbeSeedBlocked = originalBlocked })
+	claudeUsageProbeSeedBlocked = func() { blocked++ }
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	// The startup replay charged its durable attempt and failed a second ago,
+	// leaving lastAttempt behind — the state begin() refuses on.
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.lastAttempt = now.Add(-time.Second)
+	claudeUsageProbe.mu.Unlock()
+
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero while throttled", got)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked adoptions=%d, want 1", blocked)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("adopted owed=%v inside a throttle interval begin() will refuse", got)
+	}
+	if owed, attempts, _ := claudePersistedProbeStateFor(fp); owed.UnixMilli() != runEnded.UnixMilli() || attempts != 0 {
+		t.Errorf("persisted debt=%v attempts=%d, want the debt left payable at 0 attempts", owed, attempts)
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Errorf("request count=%d, want 0 — the seed issues nothing itself", atomic.LoadInt64(calls))
+	}
+
+	// The interval elapses. The snapshot has not changed, so only an UNCLAIMED
+	// latch lets this gather reach the adoption at all.
+	after := now.Add(2 * time.Minute)
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), after, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the gather has a probe to issue", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
+		t.Errorf("adopted owed=%v once the interval elapsed, want the persisted debt %v", got, runEnded)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
+		t.Errorf("RefreshOwedAttempts=%d, want 1 — charged by the adoption that can actually issue", attempts)
+	}
+}
+
+// A probe already on the wire is the one paying the debt, so the throttle test
+// above must not decline an adoption the `owing` branch would JOIN.
+func TestClaudeUsageProbeGate_CacheSeedAdoptsWhileAProbeIsInFlight(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	if !claudeUsageProbe.begin(now, false) {
+		t.Fatal("begin() refused the single-flight slot on a fresh gate")
+	}
+	t.Cleanup(func() { claudeUsageProbe.finish(nil, false, time.Time{}, fp) })
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
+		t.Errorf("adopted owed=%v, want the persisted debt %v — the in-flight probe is the one that pays it", got, runEnded)
+	}
+}
+
+// The charge is refused precisely BECAUSE another writer settled the debt with a
+// covering reading, so the reading that refused it must travel: dropping it
+// leaves a gather holding a pre-run `latest` with no debt to probe for and no
+// re-read to report, which publishes the stale view.
+func TestClaudeUsageProbeGate_CacheSeedReportsTheReadingThatRefusedItsCharge(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	// An overlapping old agent persists a covering PROBE reading — which settles
+	// the debt in that same locked write — after this seed measured the shared
+	// cache and before its charge takes the lock.
+	covering := now.Add(-time.Second)
+	originalHook := claudeUsageProbeBeforeSeedCharge
+	t.Cleanup(func() { claudeUsageProbeBeforeSeedCharge = originalHook })
+	var once sync.Once
+	claudeUsageProbeBeforeSeedCharge = func() {
+		once.Do(func() {
+			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {
+					UsedPercentage: 41, ResetsAtMs: covering.Add(time.Hour).UnixMilli(),
+					ObservedAtMs: covering.UnixMilli(), usageKnown: true,
+				},
+			}, covering, fp, claudeRateLimitSourceProbe)
+		})
+	}
+
+	got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got.UnixMilli() != covering.UnixMilli() {
+		t.Errorf("seedOwedFromCache()=%v, want the covering reading %v that refused the charge reported for a re-read", got, covering)
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("adopted owed=%v, want nothing — the debt was settled on disk", owed)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 0 {
+		t.Errorf("RefreshOwedAttempts=%d, want 0 — a refused charge spends nothing", attempts)
+	}
+}
+
+// The latch must be keyed to the snapshot the charge WROTE, stat'd under the
+// charge's own lock. An off-lock stat can describe another process's newer file
+// while the adopted state describes the previous one: the latch then matches a
+// snapshot whose Retry-After was never read, and keeps matching until some later
+// write moves the file again.
+func TestClaudeUsageProbeGate_CacheSeedLatchesTheStampTheChargeWrote(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	// Another agent channel takes a 429 and records the hold after the charge
+	// released the cache lock — the exact window an off-lock stat would latch away.
+	held := now.Add(15 * time.Minute)
+	originalHook := claudeUsageProbeAfterSeedCharge
+	t.Cleanup(func() { claudeUsageProbeAfterSeedCharge = originalHook })
+	var once sync.Once
+	claudeUsageProbeAfterSeedCharge = func() {
+		once.Do(func() { claudeHoldUsageProbe(fp, held) })
+	}
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+
+	// The latch is keyed to the pre-hold file, so the next gather re-adopts and
+	// finds the hold rather than being answered from the latch.
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now.Add(time.Second), latest)
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != held.UnixMilli() {
+		t.Errorf("in-memory hold=%v, want the hold %v written after the charge released the lock", gateHold, held)
+	}
+}
