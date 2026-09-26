@@ -323,12 +323,16 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 			// the newest log as if no debt were pending.
 			state.clearDebt()
 		}
-		if state.RefreshOwedAtMs != 0 && state.Attempts >= antigravityRefreshDebtMaxAttempts &&
+		if state.RefreshOwedAtMs != 0 &&
+			(state.Attempts >= antigravityRefreshDebtMaxAttempts || state.Outcome == liveProbeOutcomeCodeAssistTokenExpired) &&
 			settled && !liveRun && newestLog.UnixMilli() > state.RefreshOwedFloorMs {
 			// A terminal debt (no_login, an exhausted ladder) and a settled run
 			// newer than its floor: that run — perhaps after the user signed
 			// in — owes its own refresh, exactly as a settle whose floor moved
-			// gets a fresh budget, instead of waiting out the age-out.
+			// gets a fresh budget, instead of waiting out the age-out. An
+			// expired-login debt is replaced the same way: the newer run
+			// renewed the keyring token, so the read is payable now rather than
+			// at a free rung booked up to half an hour out.
 			state.clearDebt()
 		}
 		if state.RefreshOwedAtMs != 0 {

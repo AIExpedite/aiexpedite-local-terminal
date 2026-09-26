@@ -306,7 +306,14 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 		if refused {
 			if !gated {
 				gated = true
-				noteAntigravityQuotaGate(antigravityInstalledBuildVersion(), time.Now())
+				// Only a refusal stamped with the installed build is persisted.
+				// With the build unprobed or changed since its probe, an
+				// unversioned marker would cover every later build for the
+				// recheck window; this run still parks, and the card's gather
+				// — which knows the version — records the build's own marker.
+				if version := antigravityInstalledBuildVersion(); version != "" {
+					noteAntigravityQuotaGate(version, time.Now())
+				}
 				fmt.Printf("%s[antigravity-quota] the language server refuses loopback quota reads (CSRF-gated agy build) — capture for %s stops here; the card keeps the last reading with its true age%s\n",
 					colorYellow, label, colorReset)
 			}

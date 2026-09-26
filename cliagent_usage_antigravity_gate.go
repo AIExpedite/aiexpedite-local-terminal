@@ -94,8 +94,8 @@ const (
 )
 
 // antigravityQuotaGate is the persisted marker. Version is the `agy` build that
-// refused ("" when the refusal was seen where the build is not known — the
-// run-scoped poller); ObservedAt is when.
+// refused ("" when the refusal was seen where the build is not known; the
+// run-scoped poller never persists one of those); ObservedAt is when.
 type antigravityQuotaGate struct {
 	SchemaVersion int    `json:"schemaVersion,omitempty"`
 	Version       string `json:"version,omitempty"`

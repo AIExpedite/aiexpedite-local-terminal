@@ -255,6 +255,7 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 func TestAntigravityQuotaCapture_StopsAtTheFirstRefusal(t *testing.T) {
 	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "1.2.2")
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	_, hits := helperGatedAntigravityServer(t, base)
 

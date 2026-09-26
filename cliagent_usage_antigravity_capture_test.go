@@ -834,3 +834,39 @@ func TestAntigravityQuotaCapture_PollerStampsTheInstalledBuild(t *testing.T) {
 		t.Errorf("marker version=%q, want the installed build 1.2.2", gate.Version)
 	}
 }
+
+// A refusal on a build the card has not probed (cold cache, or a binary changed
+// since its probe) persists nothing: an unversioned marker would cover every
+// later build for the recheck window. The poller still parks for this run.
+func TestAntigravityQuotaCapture_UnprobedBuildPersistsNoMarker(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "")
+	_, hits := helperGatedAntigravityServer(t, filepath.Join(home, ".gemini", "antigravity-cli"))
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	var atRefusal int64
+	logged := captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("unprobed run")
+		deadline := time.Now().Add(10 * time.Second)
+		for hits.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		atRefusal = hits.Load()
+		time.Sleep(300 * time.Millisecond) // ~15 ticks at 20ms
+		if extra := hits.Load() - atRefusal; extra > 1 {
+			t.Errorf("%d further RPCs after the refusal, want the poller parked", extra)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	if atRefusal == 0 {
+		t.Fatal("the poller never reached the gated server")
+	}
+	if !strings.Contains(logged, "refuses loopback quota reads") {
+		t.Errorf("the refusal was not logged: %q", logged)
+	}
+	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+		t.Errorf("an unprobed build's refusal wrote a marker (stat err=%v)", err)
+	}
+}

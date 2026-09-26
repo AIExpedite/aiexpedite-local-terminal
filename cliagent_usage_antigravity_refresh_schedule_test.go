@@ -534,3 +534,68 @@ func TestNudgeAntigravityUsageRefresh_KeepsATerminalDebtForItsOwnRun(t *testing.
 		t.Errorf("reads=%d, want no attempt", reads.Load())
 	}
 }
+
+// An expired-login debt waiting on a free rung up to half an hour out is
+// replaced by a newer settled run: that run renewed the keyring token, so the
+// read is payable now rather than at the old debt's booked attempt.
+func TestNudgeAntigravityUsageRefresh_ReplacesAnExpiredLoginDebtForANewerRun(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-8 * time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	owed := now.Add(-time.Hour)
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: owed.UnixMilli(), RefreshOwedAtMs: owed.UnixMilli(),
+		Attempts: 1, Outcome: liveProbeOutcomeCodeAssistTokenExpired,
+		NextAttemptAtMs: now.Add(20 * time.Minute).UnixMilli(),
+	})
+	helperWriteRunLogAt(t, home, now.Add(-5*time.Minute))
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
+	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+		t.Fatal("an expired-login debt blocked the nudge from owing a newer run")
+	}
+	antigravityUsageRefreshWaitIdle()
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != newest.UnixMilli() || state.RefreshOwedAtMs < now.UnixMilli() {
+		t.Errorf("state=%+v, want a fresh debt floored at the newer run log", state)
+	}
+	if state.Outcome == liveProbeOutcomeCodeAssistTokenExpired || state.Attempts != 1 {
+		t.Errorf("state=%+v, want the expired-login debt replaced and the new one charged once", state)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the new debt attempted once", reads.Load())
+	}
+}
+
+// The expired-login debt's own run is not a newer run: it keeps waiting on its
+// booked free rung and nothing is spent.
+func TestNudgeAntigravityUsageRefresh_KeepsAnExpiredLoginDebtForItsOwnRun(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-8 * time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	helperWriteRunLogAt(t, home, now.Add(-time.Hour))
+	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
+	next := now.Add(20 * time.Minute).UnixMilli()
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: newest.UnixMilli(), RefreshOwedAtMs: newest.UnixMilli(),
+		Attempts: 1, Outcome: liveProbeOutcomeCodeAssistTokenExpired, NextAttemptAtMs: next,
+	})
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	if nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+		t.Fatal("the nudge replaced an expired-login debt for the run it was booked for")
+	}
+	antigravityUsageRefreshWaitIdle()
+	state := helperFreshnessState(t)
+	if state.Outcome != liveProbeOutcomeCodeAssistTokenExpired || state.NextAttemptAtMs != next {
+		t.Errorf("state=%+v, want the expired-login debt left on its booked rung", state)
+	}
+	if reads.Load() != 0 {
+		t.Errorf("reads=%d, want no attempt", reads.Load())
+	}
+}
