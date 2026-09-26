@@ -1525,7 +1525,7 @@ func mergeCodexRateLimitCacheObserved(
 		// mistaken for a fresh observation and restamped.
 		before := codexContributorObservationTimes(codexContributorsFromSnapshot(*snap))
 		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
-		advanced = codexStampCaptureVersion(snap, before)
+		advanced = codexStampCaptureVersion(snap, before, fullSnapshot && (len(clears) > 0 || emptyAuthoritative))
 		return true
 	})
 	return committed, committed && advanced

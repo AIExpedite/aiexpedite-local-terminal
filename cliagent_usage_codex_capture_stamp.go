@@ -29,7 +29,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"sync/atomic"
 )
 
@@ -43,9 +42,21 @@ var codexUsageCaptureVersion atomic.Value // string
 // publishCodexUsageCaptureVersion records the producing binary's version. An
 // empty version (a failed `--version` probe) never overwrites a known one.
 func publishCodexUsageCaptureVersion(version string) {
-	if version = strings.TrimSpace(version); version != "" {
+	if version = codexNormalizeVersion(version); version != "" {
 		codexUsageCaptureVersion.Store(version)
 	}
+}
+
+// codexVersionMaxBytes bounds a `--version` first line before it is persisted,
+// compared or shown. Only a build printing something unexpectedly long is
+// affected.
+const codexVersionMaxBytes = 64
+
+// codexNormalizeVersion is the one form a version takes everywhere here —
+// trimmed and rune-safely bounded — so a stamp and a detected version of the
+// same build always compare equal.
+func codexNormalizeVersion(version string) string {
+	return clampAntigravityQuotaField(version, codexVersionMaxBytes)
 }
 
 // currentCodexUsageCaptureVersion is the version captures are stamped with, or
@@ -83,7 +94,7 @@ func codexResolveCaptureVersion() string {
 // detected version is a failed `--version` probe. A downgrade IS drift — the
 // predicate is about difference, not ordering.
 func codexCaptureDrift(stamped, detected string) bool {
-	stamped, detected = strings.TrimSpace(stamped), strings.TrimSpace(detected)
+	stamped, detected = codexNormalizeVersion(stamped), codexNormalizeVersion(detected)
 	return stamped != "" && detected != "" && stamped != detected
 }
 
@@ -101,25 +112,13 @@ func codexCaptureDriftNotice(state codexRunFreshnessState, detectedVersion strin
 		return ""
 	}
 	const layout = "2006-01-02 15:04 UTC"
-	stamped, installed := codexNoticeVersion(state.codexVersion), codexNoticeVersion(detectedVersion)
+	stamped, installed := codexNormalizeVersion(state.codexVersion), codexNormalizeVersion(detectedVersion)
 	last := fmt.Sprintf("No Codex utilization reading has been observed since Codex build %q", stamped)
 	if !state.latest.IsZero() {
 		last = fmt.Sprintf("Codex utilization was last observed %s by Codex build %q", state.latest.UTC().Format(layout), stamped)
 	}
 	return fmt.Sprintf("%s; the installed build %q has not reported utilization since the most recent Codex run started (%s). It will update once that build's telemetry is captured.",
 		last, installed, state.floor.UTC().Format(layout))
-}
-
-// codexNoticeVersion bounds a version string before it reaches a notice. The
-// value is a `--version` first line, so this only guards against a build that
-// prints something unexpectedly long.
-func codexNoticeVersion(version string) string {
-	const maxBytes = 64
-	version = strings.TrimSpace(version)
-	if len(version) > maxBytes {
-		version = version[:maxBytes]
-	}
-	return version
 }
 
 // codexRunFreshnessNotice is the run-freshness notice the card shows: capture
@@ -133,17 +132,21 @@ func codexRunFreshnessNotice(state codexRunFreshnessState, detectedVersion strin
 }
 
 // codexStampCaptureVersion stamps the snapshot with the producing binary when
-// a merge advanced a contributor observation. An unknown producer leaves the
-// existing stamp untouched: a capture we cannot name must not erase the
-// evidence that the previous one came from the previous binary.
-func codexStampCaptureVersion(snap *codexRateLimitSnapshot, before map[string]int64) bool {
-	if !codexContributorObservationAdvanced(before, snap.Contributors) {
+// a merge advanced a contributor observation, or applied an authoritative
+// clear — a full snapshot saying a window no longer applies is still a
+// reading this binary produced, and leaving the old stamp would report drift
+// against a build that did answer. An unknown producer leaves the existing
+// stamp untouched: a capture we cannot name must not erase the evidence that
+// the previous one came from the previous binary. Reports only the advance.
+func codexStampCaptureVersion(snap *codexRateLimitSnapshot, before map[string]int64, authoritativeClear bool) bool {
+	advanced := codexContributorObservationAdvanced(before, snap.Contributors)
+	if !advanced && !authoritativeClear {
 		return false
 	}
 	if version := currentCodexUsageCaptureVersion(); version != "" {
 		snap.CodexVersion = version
 	}
-	return true
+	return advanced
 }
 
 // codexContributorObservationTimes indexes every contributor's observation

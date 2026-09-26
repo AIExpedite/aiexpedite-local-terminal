@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // setCodexCaptureVersion publishes the producing binary for one test.
@@ -99,6 +101,40 @@ func TestCodexCaptureStamp_LegacyMigrationIsNotAnObservation(t *testing.T) {
 	}
 	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.149.0" {
 		t.Fatalf("legacy migration restamped the reading: %q", snap.CodexVersion)
+	}
+}
+
+// An authoritative full snapshot that only clears windows is still an answer
+// from the installed build: it restamps, so drift is not reported against the
+// build that just reported.
+func TestCodexCaptureStamp_AuthoritativeClearRestamps(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	fp := currentCodexAccountFingerprint()
+	setCodexCaptureVersion(t, "codex-cli 0.149.0")
+	captureCodexRateLimitLineForAccount(codexLiveReadEnvelope(10, 20, now), now.Add(-time.Minute), fp)
+
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+	if !captureCodexRateLimitLineForAccount(`{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{}}}`, now, fp) {
+		t.Fatal("an authoritative empty snapshot must report a capture")
+	}
+	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.150.0" {
+		t.Fatalf("stamp = %q, want the build that answered", snap.CodexVersion)
+	}
+}
+
+// Versions are bounded rune-safely and in ONE form, so an over-long build
+// string never splits a rune and never reads as drift against itself.
+func TestCodexNormalizeVersion_BoundedAndStable(t *testing.T) {
+	long := "codex-cli 0.150.0 " + strings.Repeat("é", 60)
+	got := codexNormalizeVersion(long)
+	if len(got) > codexVersionMaxBytes || !utf8.ValidString(got) {
+		t.Fatalf("normalized = %q (%d bytes), want valid UTF-8 within %d", got, len(got), codexVersionMaxBytes)
+	}
+	setCodexCaptureVersion(t, "")
+	publishCodexUsageCaptureVersion(long)
+	if codexCaptureDrift(currentCodexUsageCaptureVersion(), long) {
+		t.Fatal("a bounded stamp must not read as drift against its own build")
 	}
 }
 
