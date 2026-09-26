@@ -1233,3 +1233,84 @@ func TestClassifyClaudeSmokeRun_MarkerMatchImpliesASpentTurn(t *testing.T) {
 		t.Fatal("a killed attempt must never report a marker match")
 	}
 }
+
+// A cooldown REPLAY and a singleflight FOLLOWER both return a verdict without
+// spawning a child, so neither may owe a utilization refresh: the debt would
+// be for a turn nobody spent, and paying it costs a real OAuth request against
+// an account-scoped limit.
+//
+// This is why the arming lives in runClaudeCodeSmoke and not in the runCLISmoke
+// handler above it. Reasoning alone is not enough — move the arm one level up
+// and every case in this file still passes, so the rule is pinned here, at the
+// entry point the agent actually calls.
+func TestRunCLISmoke_ReplaysAndFollowersOweNoRefresh(t *testing.T) {
+	t.Run("cooldown replay", func(t *testing.T) {
+		smokeEnv(t)
+		cache := armSmokeUsageDebt(t)
+		path := stubClaudeBinary(t)
+		stubAuthProbe(t, true, true)
+		stubSmokePath(t, path)
+		seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+		calls := stubSmokeExec(t, func(_ context.Context, _ []string, prompt string) ([]byte, []byte, error) {
+			return successEnvelope(markerFromPrompt(prompt)), nil, nil
+		})
+
+		if _, cached := runCLISmoke(context.Background(), "claudeCode"); cached {
+			t.Fatal("the first smoke must actually run")
+		}
+		waitForClaudeDebt(t, cache, 5*time.Second)
+		claudeFreshnessWaitIdle(t)
+		spent := claudeCacheSnapshot(t, cache).RefreshOwedAtMs
+
+		// Far enough apart that an owe from the replay would be a strictly
+		// newer instant, and so visible.
+		time.Sleep(5 * time.Millisecond)
+		if _, cached := runCLISmoke(context.Background(), "claudeCode"); !cached {
+			t.Fatal("the second smoke must be answered from the cooldown")
+		}
+		claudeFreshnessWaitIdle(t)
+
+		if *calls != 1 {
+			t.Fatalf("the cooldown spent %d turns, want 1", *calls)
+		}
+		if got := claudeCacheSnapshot(t, cache).RefreshOwedAtMs; got != spent {
+			t.Fatalf("a replayed verdict owed a refresh: debt moved %d -> %d", spent, got)
+		}
+	})
+
+	t.Run("singleflight follower", func(t *testing.T) {
+		smokeEnv(t)
+		cache := armSmokeUsageDebt(t)
+		path := stubClaudeBinary(t)
+		stubAuthProbe(t, true, true)
+		stubSmokePath(t, path)
+		seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+		gate := make(chan struct{})
+		execCalls := stubConcurrentSmokeExec(t, gate)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runCLISmoke(context.Background(), "claudeCode")
+			}()
+		}
+		// Let the followers park on the leader before it answers.
+		time.Sleep(20 * time.Millisecond)
+		close(gate)
+		wg.Wait()
+		waitForClaudeDebt(t, cache, 5*time.Second)
+		claudeFreshnessWaitIdle(t)
+
+		if got := execCalls(); got != 1 {
+			t.Fatalf("%d turns spent, want 1 — the followers shared the leader's", got)
+		}
+		// One turn, one debt: the followers must not have raised it past the
+		// leader's completion.
+		debt := time.UnixMilli(claudeCacheSnapshot(t, cache).RefreshOwedAtMs)
+		if time.Since(debt) > 3*time.Second {
+			t.Fatalf("debt %v is not from this run", debt)
+		}
+	})
+}
