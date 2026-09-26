@@ -8,9 +8,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1463,6 +1465,124 @@ func TestClaudeOweRunRefresh_UnresolvedFingerprintLeavesAScopedCacheAlone(t *tes
 	}
 	if snap.RefreshOwedAtMs != 0 {
 		t.Fatalf("RefreshOwedAtMs=%d, want no debt written under an unknown scope", snap.RefreshOwedAtMs)
+	}
+}
+
+// writeClaudeAccountCredential writes a credential carrying an account identity,
+// so currentClaudeAccountFingerprint resolves to a SCOPED fingerprint — the
+// fixture in armClaudeUsageProbe deliberately models the accountless claude.ai
+// login, which fingerprints to "".
+func writeClaudeAccountCredential(t *testing.T, configDir, email string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"email":%q,"claudeAiOauth":{"accessToken":%q,"refreshToken":"rt","subscriptionType":"max"}}`,
+		email, probeTestToken)
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The other half of the guard: a `/login` that already re-scoped the cache
+// BEFORE the debt sampled the scope is an ordinary account boundary, and the
+// debt still resets the cache onto its own account. Only a flip that overtook
+// the sample is refused.
+func TestClaudeOweRunRefresh_TakesACacheLeftByAPreviousLogin(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	writeClaudeAccountCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "ada@example.com")
+	fp := currentClaudeAccountFingerprint()
+	if fp == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	observedAt := time.Now().Add(-time.Hour)
+	if !mutateClaudeRateLimitSnapshot(cache, "previous-account", func(snap *claudeRateLimitSnapshot) bool {
+		snap.Buckets[claudeWindowFiveHour] = claudeRateLimitBucket{
+			UsedPercentage: 41, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observedAt.UnixMilli(), usageKnown: true,
+		}
+		return true
+	}) {
+		t.Fatal("seeding the previous account's snapshot wrote nothing")
+	}
+
+	runEnded := time.Now()
+	claudeOweRunRefresh(runEnded)
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != fp {
+		t.Fatalf("AccountFingerprint=%q, want the debt's own account %q", snap.AccountFingerprint, fp)
+	}
+	if snap.RefreshOwedAtMs != runEnded.UnixMilli() {
+		t.Fatalf("RefreshOwedAtMs=%d, want the debt at %d", snap.RefreshOwedAtMs, runEnded.UnixMilli())
+	}
+	if len(snap.Buckets) != 0 {
+		t.Errorf("the previous account's buckets survived the account boundary: %+v", snap.Buckets)
+	}
+}
+
+// A `/login` to another account that re-scopes the cache AFTER this debt sampled
+// the scope must not be read as an account transition the debt is entitled to
+// make: resetting it would clear the newly signed-in account's fresh buckets and
+// its hold, and then stamp the previous account's run onto the replacement
+// state. The durable write is refused; the in-memory debt still stands.
+func TestClaudeOweRunRefresh_RefusesACacheANewerLoginRescoped(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	writeClaudeAccountCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "ada@example.com")
+	fp := currentClaudeAccountFingerprint()
+	if fp == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	prev := claudeRateLimitBestEffortGateWait
+	claudeRateLimitBestEffortGateWait = 5 * time.Second
+	t.Cleanup(func() { claudeRateLimitBestEffortGateWait = prev })
+
+	// Hold the gate so the debt write blocks AFTER it has sampled the scope and
+	// resolved its identity — the exact window a concurrent `/login` lands in.
+	lockClaudeRateLimitCache()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		claudeOweRunRefresh(time.Now())
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// The other account's writer, standing in for the post-`/login` merge. Written
+	// straight to the file because this test is holding the gate that writer would
+	// otherwise take.
+	const other = "account-b"
+	observedAt := time.Now()
+	rescoped, err := json.MarshalIndent(claudeRateLimitSnapshot{
+		AccountFingerprint: other,
+		UpdatedAt:          observedAt.UTC().Format(time.RFC3339),
+		HeldUntilMs:        observedAt.Add(time.Hour).UnixMilli(),
+		Buckets: map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				UsedPercentage: 7, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: observedAt.UnixMilli(),
+			},
+		},
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, rescoped, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unlockClaudeRateLimitCache()
+	<-done
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != other {
+		t.Fatalf("AccountFingerprint=%q, want the newly signed-in account %q left alone", snap.AccountFingerprint, other)
+	}
+	if len(snap.Buckets) != 1 {
+		t.Fatalf("Buckets=%v, want the new account's reading preserved", snap.Buckets)
+	}
+	if snap.HeldUntilMs == 0 {
+		t.Fatal("the new account's hold was cleared by the previous account's debt write")
+	}
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("RefreshOwedAtMs=%d, want no debt stamped onto another account's cache", snap.RefreshOwedAtMs)
 	}
 }
 

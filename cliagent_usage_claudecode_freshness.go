@@ -250,6 +250,16 @@ func claudeOweRunRefresh(baseline time.Time) {
 		return
 	}
 	path := claudeRateLimitCachePath()
+	// Sampled BEFORE the credential read, not after: it names the scope this debt
+	// is entitled to write over. A `/login` to B landing between this sample and
+	// the locked write leaves onDisk == B, which is not in the allow-list, so the
+	// mutation is refused instead of treating B -> A as an account transition —
+	// which would clear the newly signed-in account's fresh buckets and hold and
+	// then stamp A's debt onto its replacement state. Sampling AFTER the resolve
+	// would defeat that: a login already landed would be sampled as B and then
+	// allowed. See mutateClaudeRateLimitSnapshotScoped, which judges it under the
+	// same lock the write takes.
+	scopeBefore := claudeRateLimitCacheScope()
 	fingerprint := currentClaudeAccountFingerprint()
 	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
 	// dir not yet readable) resolves to exactly the same "" a genuine accountless
@@ -265,12 +275,14 @@ func claudeOweRunRefresh(baseline time.Time) {
 	// to something worse, which is the rule every other best-effort path here
 	// follows.
 	//
-	// Only scoped -> unscoped is refused; a scoped -> other-scoped flip is a real
-	// `/login` and proceeds. A genuine logout also resolves to "", and there the
-	// live writers (stream capture, status-line hook, probe) reset the scope on
-	// their next reading, after which an owe under "" proceeds normally.
+	// A genuine logout also resolves to "", and there the live writers (stream
+	// capture, status-line hook, probe) reset the scope on their next reading,
+	// after which an owe under "" proceeds normally. A scoped -> other-scoped flip
+	// still proceeds when the cache is where this debt left it (onDisk is the
+	// sampled scope or the resolved fingerprint); a flip that overtook the sample
+	// is refused by the allow-list above.
 	baselineMs := baseline.UnixMilli()
-	mutateClaudeRateLimitSnapshot(path, fingerprint,
+	mutateClaudeRateLimitSnapshotScoped(path, fingerprint, []string{scopeBefore},
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
 				return false
