@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1046,4 +1047,270 @@ func TestBoundedBufferRetainsPrefixAndDrainsExcess(t *testing.T) {
 	if got := string(b.Bytes()); got != "abcd" {
 		t.Fatalf("retained %q, want %q", got, "abcd")
 	}
+}
+
+/* --------------------------------------------------------------------------
+   Utilization debt per verdict (settleOrDisarmClaudeSmokeRun)
+   --------------------------------------------------------------------------
+   The smoke spends a REAL inference turn, which moves the account's
+   utilization. A verdict that reached inference must OWE a refresh so the card
+   catches up (and so a self-update right after it still has something to
+   replay); every other verdict must write nothing, because a debt no reading
+   can pay surfaces as permanent staleness.
+   ------------------------------------------------------------------------ */
+
+// armSmokeUsageDebt arms the utilization probe against an endpoint that always
+// refuses, so a debt the smoke records is still standing when the case asserts
+// it. Returns the cache path, pre-seeded with one reading so "the cache was not
+// touched" is a meaningful claim.
+func armSmokeUsageDebt(t *testing.T) string {
+	t.Helper()
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	return cache
+}
+
+func TestRunClaudeCodeSmoke_OwesARefreshOnlyForASpentTurn(t *testing.T) {
+	providerError, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "error_during_execution", "is_error": true,
+		"result": "Overloaded", "api_error_status": 529,
+	})
+	authError, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "error_during_execution", "is_error": true,
+		"result": "Invalid credentials — please run /login",
+	})
+
+	cases := []struct {
+		name string
+		// stdout/stderr/err describe the child; nil stdout with wantTimeout
+		// selects the deadline-kill path instead.
+		stdout      func(prompt string) []byte
+		stderr      string
+		wantTimeout bool
+		// preArm short-circuits before the floor is armed at all.
+		missingBinary bool
+		loggedOut     bool
+		wantOwed      bool
+	}{
+		{name: "marker match", stdout: func(p string) []byte { return successEnvelope(markerFromPrompt(p)) }, wantOwed: true},
+		{name: "chatty success envelope", stdout: func(string) []byte { return successEnvelope("Sure! Here you go.") }, wantOwed: true},
+		{name: "timeout", wantTimeout: true},
+		{name: "framing rejection", stdout: func(string) []byte { return nil }, stderr: "error: unknown option '--input-format'"},
+		{name: "provider error envelope", stdout: func(string) []byte { return providerError }},
+		{name: "auth error envelope", stdout: func(string) []byte { return authError }},
+		{name: "binary missing", missingBinary: true},
+		{name: "not logged in", loggedOut: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			smokeEnv(t)
+			cache := armSmokeUsageDebt(t)
+			before, err := os.ReadFile(cache)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			path := stubClaudeBinary(t)
+			stubAuthProbe(t, !tc.loggedOut, true)
+			if tc.wantTimeout {
+				original := claudeSmokeTimeout
+				claudeSmokeTimeout = 100 * time.Millisecond
+				t.Cleanup(func() { claudeSmokeTimeout = original })
+			}
+			stubSmokeExec(t, func(ctx context.Context, _ []string, prompt string) ([]byte, []byte, error) {
+				if tc.wantTimeout {
+					<-ctx.Done()
+					return nil, []byte("signal: killed\n"), killedChildError(t)
+				}
+				var out []byte
+				if tc.stdout != nil {
+					out = tc.stdout(prompt)
+				}
+				var runErr error
+				if len(out) == 0 {
+					runErr = errors.New("exit status 1")
+				}
+				return out, []byte(tc.stderr), runErr
+			})
+
+			version := "2.1.251"
+			if tc.missingBinary {
+				version = ""
+			}
+			runClaudeCodeSmoke(context.Background(), path, version)
+
+			if tc.wantOwed {
+				waitForClaudeDebt(t, cache, 5*time.Second)
+			}
+			claudeFreshnessWaitIdle(t)
+
+			snap := claudeCacheSnapshot(t, cache)
+			if owed := snap.RefreshOwedAtMs != 0; owed != tc.wantOwed {
+				t.Fatalf("owed=%v, want %v (snapshot %+v)", owed, tc.wantOwed, snap)
+			}
+			if !tc.wantOwed {
+				after, err := os.ReadFile(cache)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatalf("a disarmed smoke must leave the cache byte-identical:\nbefore %s\nafter  %s", before, after)
+				}
+			}
+		})
+	}
+}
+
+// The owed-refresh work is invisible on the wire and in the log: the published
+// receipt and the device-local line are identical whether or not the
+// utilization probe is armed to receive a debt.
+func TestRunClaudeCodeSmoke_UsageDebtDoesNotChangeThePublishedResult(t *testing.T) {
+	run := func(t *testing.T, armed bool) (cliSmokeResult, string) {
+		t.Helper()
+		smokeEnv(t)
+		if armed {
+			armSmokeUsageDebt(t)
+		}
+		path := stubClaudeBinary(t)
+		stubAuthProbe(t, true, true)
+		stubSmokeExec(t, func(_ context.Context, _ []string, _ string) ([]byte, []byte, error) {
+			return nil, []byte("error: unrecognized option '--output-format'"), errors.New("exit status 1")
+		})
+		var result cliSmokeResult
+		log := captureStdout(t, func() {
+			result = runClaudeCodeSmoke(context.Background(), path, "2.1.251")
+		})
+		claudeFreshnessWaitIdle(t)
+		result.DurationMs = 0 // wall clock, not a contract
+		return result, log
+	}
+
+	bare, bareLog := run(t, false)
+	withProbe, withProbeLog := run(t, true)
+
+	if bare != withProbe {
+		t.Errorf("published result changed with the probe armed:\n bare %+v\n with %+v", bare, withProbe)
+	}
+	if bare != (cliSmokeResult{}) && bareLog != withProbeLog {
+		t.Errorf("device log changed with the probe armed:\n bare %q\n with %q", bareLog, withProbeLog)
+	}
+}
+
+// settleOrDisarmClaudeSmokeRun rests on ONE predicate, and that is only safe
+// while a marker match implies a spent turn. classifyClaudeSmokeRun can reach
+// `matched` only after accepting a non-error `subtype: "success"` envelope, so
+// the implication holds today — pin it, and a future classifier that reports a
+// match some other way fails here instead of silently dropping the debt for a
+// turn the user paid for.
+func TestClassifyClaudeSmokeRun_MarkerMatchImpliesASpentTurn(t *testing.T) {
+	const marker = claudeSmokeMarkerPrefix + "deadbeef"
+	errorEnvelope, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "success", "is_error": true, "result": marker,
+	})
+	odd, _ := json.Marshal(map[string]any{
+		"type": "result", "subtype": "error_during_execution", "is_error": false, "result": marker,
+	})
+
+	for _, stdout := range [][]byte{
+		successEnvelope(marker),        // the healthy match
+		successEnvelope("Sure! Here."), // chatty, still a spent turn
+		errorEnvelope,                  // marker text inside an error envelope
+		odd,                            // marker text under an unknown subtype
+		[]byte("not json at all"),      // framing failure
+		nil,                            // no output
+	} {
+		_, _, matched := classifyClaudeSmokeRun(false, stdout, nil, nil, marker)
+		if matched && !claudeSmokeReachedInference(stdout) {
+			t.Fatalf("marker match without a spent turn for %q — settleOrDisarmClaudeSmokeRun would drop the debt", stdout)
+		}
+	}
+
+	// And the timeout arm never reports a match, whatever the child left behind.
+	if _, _, matched := classifyClaudeSmokeRun(true, successEnvelope(marker), nil, nil, marker); matched {
+		t.Fatal("a killed attempt must never report a marker match")
+	}
+}
+
+// A cooldown REPLAY and a singleflight FOLLOWER both return a verdict without
+// spawning a child, so neither may owe a utilization refresh: the debt would
+// be for a turn nobody spent, and paying it costs a real OAuth request against
+// an account-scoped limit.
+//
+// This is why the arming lives in runClaudeCodeSmoke and not in the runCLISmoke
+// handler above it. Reasoning alone is not enough — move the arm one level up
+// and every case in this file still passes, so the rule is pinned here, at the
+// entry point the agent actually calls.
+func TestRunCLISmoke_ReplaysAndFollowersOweNoRefresh(t *testing.T) {
+	t.Run("cooldown replay", func(t *testing.T) {
+		smokeEnv(t)
+		cache := armSmokeUsageDebt(t)
+		path := stubClaudeBinary(t)
+		stubAuthProbe(t, true, true)
+		stubSmokePath(t, path)
+		seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+		calls := stubSmokeExec(t, func(_ context.Context, _ []string, prompt string) ([]byte, []byte, error) {
+			return successEnvelope(markerFromPrompt(prompt)), nil, nil
+		})
+
+		if _, cached := runCLISmoke(context.Background(), "claudeCode"); cached {
+			t.Fatal("the first smoke must actually run")
+		}
+		waitForClaudeDebt(t, cache, 5*time.Second)
+		claudeFreshnessWaitIdle(t)
+		spent := claudeCacheSnapshot(t, cache).RefreshOwedAtMs
+
+		// Far enough apart that an owe from the replay would be a strictly
+		// newer instant, and so visible.
+		time.Sleep(5 * time.Millisecond)
+		if _, cached := runCLISmoke(context.Background(), "claudeCode"); !cached {
+			t.Fatal("the second smoke must be answered from the cooldown")
+		}
+		claudeFreshnessWaitIdle(t)
+
+		if *calls != 1 {
+			t.Fatalf("the cooldown spent %d turns, want 1", *calls)
+		}
+		if got := claudeCacheSnapshot(t, cache).RefreshOwedAtMs; got != spent {
+			t.Fatalf("a replayed verdict owed a refresh: debt moved %d -> %d", spent, got)
+		}
+	})
+
+	t.Run("singleflight follower", func(t *testing.T) {
+		smokeEnv(t)
+		cache := armSmokeUsageDebt(t)
+		path := stubClaudeBinary(t)
+		stubAuthProbe(t, true, true)
+		stubSmokePath(t, path)
+		seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+		gate := make(chan struct{})
+		execCalls := stubConcurrentSmokeExec(t, gate)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 3; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runCLISmoke(context.Background(), "claudeCode")
+			}()
+		}
+		// Let the followers park on the leader before it answers.
+		time.Sleep(20 * time.Millisecond)
+		close(gate)
+		wg.Wait()
+		waitForClaudeDebt(t, cache, 5*time.Second)
+		claudeFreshnessWaitIdle(t)
+
+		if got := execCalls(); got != 1 {
+			t.Fatalf("%d turns spent, want 1 — the followers shared the leader's", got)
+		}
+		// One turn, one debt: the followers must not have raised it past the
+		// leader's completion.
+		debt := time.UnixMilli(claudeCacheSnapshot(t, cache).RefreshOwedAtMs)
+		if time.Since(debt) > 3*time.Second {
+			t.Fatalf("debt %v is not from this run", debt)
+		}
+	})
 }

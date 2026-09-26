@@ -172,6 +172,19 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	// about THESE bytes, not about whatever is at `path` when it finishes.
 	shapeBinding := bindCLISmokeShape(path)
 
+	// ARMED here, immediately before the first spawn, for the same reason: from
+	// this line on a real inference turn may be spent, and a spent turn moves
+	// the account's utilization. The three pre-arm refusals above
+	// (binary_missing, not_logged_in, and the marker-generation internal
+	// failure) return before it, so they never arm and there is nothing for them
+	// to disarm — none of them spawned a child, let alone spent a turn.
+	//
+	// The outcome is recorded ONCE, after the ladder stops, from the FINAL
+	// attempt's evidence; a rejected rung that continues the walk is not an
+	// outcome. See settleOrDisarmClaudeSmokeRun.
+	spentTurn := false
+	defer func() { settleOrDisarmClaudeSmokeRun(spentTurn) }()
+
 	var lastCategory, lastDiagnostic string
 	for _, shape := range claudeSmokeShapeLadder(path) {
 		runCtx, cancel := context.WithTimeout(ctx, claudeSmokeTimeout)
@@ -189,6 +202,13 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 		result.ArgvShapeID = shape.ID
 
 		category, diagnostic, matched := classifyClaudeSmokeRun(timedOut, stdout, stderr, runErr, marker)
+		// Utilization evidence is what the TURN produced, not what the verdict
+		// was: a run whose model answered and was then judged chatty
+		// (marker_mismatch) still spent a payable turn. Reassigned rather than
+		// accumulated so the FINAL rung's evidence is the one that decides, and
+		// a timeout is never evidence — the kill is why the output is
+		// incomplete, so nothing it left behind can be trusted.
+		spentTurn = !timedOut && claudeSmokeReachedInference(stdout)
 		if category == "" {
 			result.Status = cliSmokeStatusSuccess
 			result.MarkerMatched = matched
@@ -224,6 +244,61 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	result.MarkerMatched = false
 	result.Diagnostic = lastDiagnostic
 	return finish(lastCategory)
+}
+
+// settleOrDisarmClaudeSmokeRun owes a utilization refresh for a smoke that
+// spent a turn, and writes NOTHING for one that did not. Mirrors
+// settleOrDisarmCodexSmokeRun; "settle" is reserved in this feature for
+// CLEARING a debt, so the recording half is called owe.
+//
+// A timeout, a flag/framing rejection and a provider/auth error all DISARM. A
+// killed turn may genuinely have consumed quota, so this can under-report —
+// but the alternative writes a debt the bounded replays cannot pay, which
+// surfaces as a permanent stale-utilization state.
+//
+// ONE predicate, unlike codexSmokeEvidence's marker-or-completion pair, because
+// here a marker match is not independent evidence: classifyClaudeSmokeRun can
+// only report `matched` after it has already accepted a non-error
+// `subtype: "success"` envelope, so every marker match is a
+// claudeSmokeReachedInference. A second field would have been an unreachable
+// branch pretending to be a safety net —
+// TestClassifyClaudeSmokeRun_MarkerMatchImpliesASpentTurn pins the implication
+// so a future classifier change fails CI here rather than silently dropping a
+// debt.
+//
+// Deliberately NOT keyed off cliSmokeVerdictSpentTurn. That answers "may this
+// verdict be cached?", which is true for a timeout or a protocol failure
+// precisely because quota may well have gone. Owing asks the different
+// question "is there evidence a reading has MOVED that a probe can fetch?",
+// which those verdicts cannot supply; collapsing the two would owe on every
+// timeout and reintroduce the unpayable debt the disarm rule exists to avoid.
+//
+// Owing goes through triggerClaudeUsageProbeAfterRun rather than writing
+// RefreshOwedAtMs directly: that call already records the debt on the gate,
+// persists it off the hot path, and schedules the bounded trailing probe — so a
+// smoke mid-session fetches fresh numbers inside the probe's own window instead
+// of sitting on a disk marker until the gather TTL, while a smoke just before a
+// self-update still leaves the durable debt for the startup replay.
+func settleOrDisarmClaudeSmokeRun(spentTurn bool) {
+	if !spentTurn {
+		return
+	}
+	triggerClaudeUsageProbeAfterRun()
+}
+
+// claudeSmokeReachedInference reports whether the child returned the CLI's
+// documented terminal envelope for a COMPLETED turn — the single "a turn was
+// spent" rule. An error envelope (auth, provider refusal, an undocumented
+// subtype) is not one: those are the cases where the CLI answered without the
+// model doing so.
+//
+// Re-parses the envelope the classifier already read rather than threading it
+// out: the classifier stays pure and single-purpose, this keeps the rule
+// testable on its own, and it is a few hundred bytes of JSON on a path that
+// just spent a 60-second budget.
+func claudeSmokeReachedInference(stdout []byte) bool {
+	envelope, ok := parseClaudePrintResultEnvelope(stdout)
+	return ok && !envelope.IsError && envelope.Subtype == "success"
 }
 
 // claudeSmokeFailureLogLine renders the device-local diagnostic line.

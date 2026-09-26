@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -150,6 +151,48 @@ type claudeRateLimitSnapshot struct {
 	// Omitted when zero so a cache written before this field existed round-trips
 	// byte-identically; readers fall back to the per-bucket provenance for those.
 	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
+
+	// RefreshOwedAtMs is the newest run (or `__cli_smoke__` turn) completion for
+	// which no observation has landed yet — the DURABLE half of
+	// claudeUsageProbeGate.owedBaseline, which dies with the process. Without it
+	// a run that finished moments before an agent self-update left nothing
+	// behind, and the next gather treated the pre-run reading as fresh for the
+	// whole claudeUsageProbeStaleAfter window: a passing post-update smoke beside
+	// a stale utilization card. StartAgent's payOwedClaudeUsageRefresh replays it
+	// once. Codex (RefreshOwedAtMs in codexRateLimitSnapshot) and Antigravity
+	// carry the same field for the same reason.
+	//
+	// It lives HERE rather than in a state file of its own because this snapshot
+	// is already scoped by AccountFingerprint and already dropped on a
+	// fingerprint flip, which is exactly the scoping a debt needs: a /login to
+	// another account must not pay one account's debt against another's quota.
+	RefreshOwedAtMs int64 `json:"refreshOwedAtMs,omitempty"`
+	// RefreshOwedAttempts bounds one debt. Each agent start spends at most one
+	// replay, so the age limit alone would let a crash-looping agent issue a
+	// request per restart for the whole of claudeRefreshOwedMaxAge; this counter
+	// is what actually caps it. It resets ONLY when RefreshOwedAtMs advances —
+	// see claudeOweRunRefresh.
+	RefreshOwedAttempts int `json:"refreshOwedAttempts,omitempty"`
+	// HeldUntilMs mirrors claudeUsageProbeGate.heldUntil, the floor a 429
+	// Retry-After imposes. In memory only, a restart inside the hold window
+	// forgets it and the startup replay fires straight at an endpoint that just
+	// told us to stop — on an ACCOUNT-scoped limit shared by every device on the
+	// account. Bounded on the way in by claudeUsageProbeMaxRetryAfter and again
+	// on the way out by payOwedClaudeUsageRefresh, so a hostile or skewed value
+	// cannot disable utilization for days.
+	HeldUntilMs int64 `json:"heldUntilMs,omitempty"`
+}
+
+// clearClaudeRefreshDebt drops the owed-refresh marker and its attempt counter,
+// reporting whether anything changed. The HOLD is deliberately not touched: a
+// paid, retired or account-scoped-away debt says nothing about whether the
+// service has asked us to slow down.
+func clearClaudeRefreshDebt(snap *claudeRateLimitSnapshot) bool {
+	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 {
+		return false
+	}
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	return true
 }
 
 // claudeRateLimitGate serialises the read-modify-write of the cache file
@@ -451,7 +494,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false)
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false, nil)
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -495,7 +538,58 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // it — and that treats an unserialized write as a failure. See
 // mergeClaudeRateLimitCacheInto.
 func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true)
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, nil)
+}
+
+// errClaudeRateLimitCacheRescoped is returned when the snapshot found UNDER THE
+// LOCK belongs to an account this write may not describe. It is a fact about
+// the cache, not about the endpoint, so a caller must not fold it into its
+// provider failure backoff — see the scope note in probeClaudeUsageAdmitted.
+var errClaudeRateLimitCacheRescoped = errors.New("claude rate-limit cache: re-scoped to another account")
+
+// mergeClaudeRateLimitCacheCheckedScoped is mergeClaudeRateLimitCacheChecked
+// with a scope guard applied INSIDE the locked read-modify-rename.
+//
+// A writer that resolved its identity long before it writes — the utilization
+// probe, which pins an account, spends a network round trip, and only then
+// merges — can be overtaken by a `/login` that re-scopes the snapshot to a
+// different account. The merge reads that mismatch as an ordinary account
+// transition and clears the buckets it finds, so the late reading would erase
+// the account the device is now signed in to and republish the previous one's
+// numbers under it.
+//
+// `allowedScopes` names the scopes this reading may still be applied over,
+// besides its own `fingerprint`: normally the single scope the caller sampled
+// before it started. A snapshot carrying anything else is a THIRD account that
+// arrived while the caller was out, and the merge is refused with
+// errClaudeRateLimitCacheRescoped without touching the file.
+//
+// Checked under the lock rather than before it, because an unlocked pre-check
+// answers a question about the past: another process can rename its snapshot in
+// between, and the merge would then clear the very buckets the pre-check was
+// added to protect. An empty `allowedScopes` disables the guard, which is what
+// every writer that resolves its identity immediately before writing wants.
+func mergeClaudeRateLimitCacheCheckedScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, allowedScopes)
+}
+
+// claudeCacheScopeRejects reports whether a snapshot found on disk under
+// `onDisk` is out of scope for a writer whose evidence belongs to `fingerprint`
+// and which sampled `allowed` before it started.
+//
+// Shared by the merge and mutateClaudeRateLimitSnapshot so the two cannot drift:
+// both reset a snapshot they find under another fingerprint, so both need the
+// same answer to "is this a transition I am entitled to make?".
+func claudeCacheScopeRejects(onDisk, fingerprint string, allowed []string) bool {
+	if len(allowed) == 0 || onDisk == fingerprint {
+		return false
+	}
+	for _, scope := range allowed {
+		if onDisk == scope {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
@@ -533,12 +627,12 @@ func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates 
 // in both modes: there is no evidence of a competing holder, only of a
 // filesystem that will not give us the lock file (a read-only data dir fails the
 // write below anyway, which the verified caller does see).
-func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool, allowedScopes []string) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	if !verified {
-		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{})
+		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes)
 	}
 	// A verified merge is bounded END TO END, not merely across its two lock
 	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
@@ -575,7 +669,7 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	}
 	done := make(chan persistResult, 1)
 	go func() {
-		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline)
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline, allowedScopes)
 		done <- persistResult{observed: observed, err: err}
 	}()
 	timer := time.NewTimer(time.Until(deadline))
@@ -605,7 +699,25 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // then drop the merge); a non-zero one selects the verified contract, clamping
 // both waits to what is left of the caller's budget and reporting the failure
 // rather than dropping it. Neither contract writes behind a confirmed holder.
-func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string) (time.Time, error) {
+	return withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
+		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes)
+	})
+}
+
+// withClaudeRateLimitCacheLocked runs fn holding BOTH serialization layers this
+// cache needs — the in-process gate and the cross-process advisory file lock —
+// and is the only place either is taken for a write. Extracted from the merge so
+// mutateClaudeRateLimitSnapshot (which records the owed-refresh debt without
+// supplying any buckets) takes the identical ladder in the identical order,
+// rather than a second hand-written copy that could deadlock against it.
+//
+// A zero budgetDeadline selects the best-effort contract (wait
+// claudeRateLimitBestEffortGateWait for the gate, then drop the write); a
+// non-zero one selects the verified contract, clamping both waits to what is
+// left of the caller's budget and reporting the failure rather than dropping it.
+// Neither contract writes behind a confirmed holder.
+func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn func() (time.Time, error)) (time.Time, error) {
 	verified := !budgetDeadline.IsZero()
 	if verified {
 		if !lockClaudeRateLimitCacheUntil(budgetDeadline) {
@@ -654,7 +766,12 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 		// verified writer's committed result.
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
 	}
+	return fn()
+}
 
+// mergeClaudeRateLimitCacheLocked is the read-merge-rename itself. Callers MUST
+// already hold the ladder withClaudeRateLimitCacheLocked takes.
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -667,11 +784,24 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 	// transitions, buckets cached while creds were unreadable get stamped under
 	// the next signed-in account's fingerprint and surface as that account's
 	// reset windows on the CLI Agents tab.
+	// The scope guard, judged against the snapshot THIS locked read found rather
+	// than one sampled before the lock was granted. See
+	// mergeClaudeRateLimitCacheCheckedScoped: a reading that belongs to an
+	// account the cache has since moved off must refuse rather than take the new
+	// login's fresh buckets down as a transition.
+	if claudeCacheScopeRejects(snap.AccountFingerprint, fingerprint, allowedScopes) {
+		return time.Time{}, errClaudeRateLimitCacheRescoped
+	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 		// Probe evidence is an observation about ONE account's quota, so it
 		// crosses an account boundary no more than a bucket does.
 		snap.LastProbeObservedAtMs = 0
+		// Neither does a post-run debt or a 429 hold. Paying the previous
+		// account's debt against this one's quota would spend a request for a
+		// reading that can never cover it, and inheriting its hold would park
+		// the new account's probe behind backpressure it never earned.
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -790,6 +920,32 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 		if observed.IsZero() || b.ObservedAtMs < observed.UnixMilli() {
 			observed = time.UnixMilli(b.ObservedAtMs)
 		}
+	}
+
+	// Settle a standing post-run debt in the SAME locked write that carries the
+	// reading which pays it. A second best-effort mutation afterwards could be
+	// dropped on contention (or lost to a crash) while the observation it
+	// settled is already on disk, and the two would then disagree — a debt
+	// replayed at the next start for a reading the cache already holds.
+	//
+	// ONLY the probe may settle, and that restriction is load-bearing. `observed`
+	// is the constraining window of THIS WRITE — not of the card — so it is a
+	// claim about every displayed row only for a writer that samples them all.
+	// The probe does; a status-line render answers five_hour/seven_day and a
+	// stream capture often one window. Letting a partial write settle cleared
+	// the durable debt while the weekly / Fable row still displayed a PRE-run
+	// reading, so a self-update moments later found nothing to replay and that
+	// row stayed stale — a diluted form of the very defect this field exists to
+	// fix. The in-memory settle is unaffected: it goes through
+	// claudeSnapshotFreshness, which is row-aware and can afford to be, and a
+	// debt a partial write did cover is cleared without a request by
+	// payOwedClaudeUsageRefreshAt's coverage pre-check at the next start.
+	//
+	// A merge that covers nothing leaves all three fields exactly as it found
+	// them. A bucket write must never silently pay a debt.
+	if source == claudeRateLimitSourceProbe && snap.RefreshOwedAtMs != 0 &&
+		claudeUsageObservationCovers(observed, time.UnixMilli(snap.RefreshOwedAtMs)) {
+		clearClaudeRefreshDebt(&snap)
 	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
@@ -966,6 +1122,23 @@ func loadClaudeRateLimitSnapshot(path string) (claudeRateLimitSnapshot, bool) {
 		return claudeRateLimitSnapshot{}, false
 	}
 	return snap, true
+}
+
+// claudeRateLimitCacheScope reports the account fingerprint the cache on disk is
+// currently scoped to, or "" when there is no readable snapshot — which is the
+// same value an unscoped one carries, and deliberately so: a writer comparing
+// two samples of this wants "did the scope move", and a cache that was deleted
+// and rewritten unscoped moved no further than one that was only rewritten.
+//
+// Unlocked, like every other freshness pre-check here: it answers a question
+// about a snapshot another process may rename a moment later, so its callers
+// must treat it as evidence about the past, never as a claim they hold.
+func claudeRateLimitCacheScope() string {
+	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
+	if !ok {
+		return ""
+	}
+	return snap.AccountFingerprint
 }
 
 // formatClaudeLimitLine renders a rejected window as a one-line notice whose

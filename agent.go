@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.34"
+var Version = "v1.0.35"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -153,6 +153,13 @@ func StartAgent(cfg *Config) {
 	// Code update, and the bounded utilization probe.
 	SetClaudeStatusLineHookDisabled(cfg.DisableClaudeStatusLineHook)
 	SetClaudeUsageProbeDisabled(cfg.DisableClaudeUsageProbe)
+	// Same debt for Claude Code, replayed once and bounded: a run — or the
+	// post-update `__cli_smoke__` turn — that finished just before the binary
+	// swap left its owed refresh only in claude_rate_limits.json, and without
+	// this the next gather would treat the PRE-update reading as fresh for the
+	// whole staleness TTL. Placed after isOffline is published above, and after
+	// the opt-out, so the attempt honours both.
+	payOwedClaudeUsageRefresh()
 	// Arm Codex's post-run freshness path, then pay — once, bounded, off this
 	// goroutine — any refresh the previous process owed: a Codex run that
 	// finished (or was cut off) just before a restart or self-update.
