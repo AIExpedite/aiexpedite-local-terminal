@@ -665,31 +665,16 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 // previous login; for the gather this click runs next, the server's own answer
 // is the better statement of who is signed in.
 //
-// codeAssist marks a reading taken with the stored keyring login itself — the
-// login `agy` runs as. That attestation does not age out with
-// antigravityLiveProducerTTL: the run-completion refresh lands such a reading
-// minutes before the periodic gather that replays it, and a settings.json
-// naming another account would otherwise turn it into Unknown placeholder rows.
-// It stays scoped to the cache's own fingerprint, so it attests nothing once a
-// different account's reading replaces it.
+// A reading taken with the stored keyring login itself — the login `agy` runs
+// as — is attested by the cached reading instead (StoredLoginRead): that
+// attestation must outlive both this TTL and this process.
 var antigravityLiveProducer struct {
 	mu          sync.Mutex
 	fingerprint string
 	at          time.Time
-	codeAssist  bool
 }
 
 func noteAntigravityLiveProducer(fingerprint string, at time.Time) {
-	noteAntigravityProducer(fingerprint, at, false)
-}
-
-// noteAntigravityCodeAssistProducer records the account a Code Assist read of
-// the stored login named.
-func noteAntigravityCodeAssistProducer(fingerprint string, at time.Time) {
-	noteAntigravityProducer(fingerprint, at, true)
-}
-
-func noteAntigravityProducer(fingerprint string, at time.Time, codeAssist bool) {
 	if fingerprint == "" {
 		return
 	}
@@ -697,20 +682,29 @@ func noteAntigravityProducer(fingerprint string, at time.Time, codeAssist bool) 
 	defer antigravityLiveProducer.mu.Unlock()
 	antigravityLiveProducer.fingerprint = fingerprint
 	antigravityLiveProducer.at = at
-	antigravityLiveProducer.codeAssist = codeAssist
 }
 
-// antigravityProducerAttests reports whether the most recent probe named the
-// account that produced a cached reading with this fingerprint: within
-// antigravityLiveProducerTTL for a loopback probe, and for as long as the cache
-// still holds that account's reading for a Code Assist read.
-func antigravityProducerAttests(cachedFingerprint string, now time.Time) bool {
-	antigravityLiveProducer.mu.Lock()
-	defer antigravityLiveProducer.mu.Unlock()
-	if cachedFingerprint == "" || antigravityLiveProducer.fingerprint != cachedFingerprint {
+// antigravityProducerAttests reports whether the account that produced a cached
+// reading is attested: within antigravityLiveProducerTTL for a loopback probe,
+// and for as long as the cache still holds that reading for a Code Assist read.
+//
+// The Code Assist half is answered by the cached reading itself
+// (StoredLoginRead), so it survives the restart or self-update that discards
+// the in-process note — the reading was taken with the stored keyring login,
+// which is a fact about the file, not about this process.
+func antigravityProducerAttests(cached antigravityQuotaSnapshot, now time.Time) bool {
+	if cached.AccountFingerprint == "" {
 		return false
 	}
-	return antigravityLiveProducer.codeAssist || now.Sub(antigravityLiveProducer.at) <= antigravityLiveProducerTTL
+	if cached.StoredLoginRead {
+		return true
+	}
+	antigravityLiveProducer.mu.Lock()
+	defer antigravityLiveProducer.mu.Unlock()
+	if antigravityLiveProducer.fingerprint != cached.AccountFingerprint {
+		return false
+	}
+	return now.Sub(antigravityLiveProducer.at) <= antigravityLiveProducerTTL
 }
 
 // removeDirEventually deletes a probe's temp directory. Windows keeps a killed

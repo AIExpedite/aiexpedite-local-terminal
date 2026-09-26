@@ -88,7 +88,7 @@ func TestAntigravityClassify_MatchingPayloadNeverEscapes(t *testing.T) {
 	}
 	allowedTop := map[string]bool{
 		"schemaVersion": true, "observedAt": true, "observedAtMs": true, "accountFingerprint": true,
-		"account": true, "plan": true, "buckets": true,
+		"account": true, "plan": true, "buckets": true, "storedLoginRead": true,
 	}
 	for key := range decoded {
 		if !allowedTop[key] {

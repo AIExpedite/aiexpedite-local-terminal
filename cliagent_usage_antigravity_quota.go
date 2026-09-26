@@ -132,6 +132,14 @@ type antigravityQuotaSnapshot struct {
 	Account            string                   `json:"account"`
 	Plan               string                   `json:"plan"`
 	Buckets            []antigravityQuotaBucket `json:"buckets"`
+	// StoredLoginRead marks a reading taken through Code Assist with the stored
+	// keyring login itself — the login `agy` runs as. It is the persisted half
+	// of the producer attestation (cliagent_usage_live_probe.go): the in-memory
+	// note is lost to a restart or a self-update, and without it a settings.json
+	// naming a different account turns a freshly captured reading into Unknown
+	// placeholder rows. A boolean about the ROUTE, not about the account, so it
+	// stays inside the cache's allowlist.
+	StoredLoginRead bool `json:"storedLoginRead,omitempty"`
 }
 
 // antigravityQuotaCacheMu serializes cache writers within this process — see
@@ -814,6 +822,7 @@ func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravity
 		AccountFingerprint: clampAntigravityQuotaField(snap.AccountFingerprint, antigravityQuotaMaxFieldBytes),
 		Account:            clampAntigravityQuotaField(snap.Account, antigravityQuotaMaxFieldBytes),
 		Plan:               clampAntigravityQuotaField(snap.Plan, antigravityQuotaMaxFieldBytes),
+		StoredLoginRead:    snap.StoredLoginRead,
 	}
 	for _, bucket := range snap.Buckets {
 		if _, _, ok := antigravityWindowKind(bucket.Window); !ok {

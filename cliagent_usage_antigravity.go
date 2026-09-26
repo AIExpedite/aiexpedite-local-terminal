@@ -152,7 +152,7 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// day-old pool as current.
 		snap = cached
 	} else if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok &&
-		(usage.AccountFingerprint == "" || antigravityProducerAttests(cached.AccountFingerprint, time.Now())) {
+		(usage.AccountFingerprint == "" || antigravityProducerAttests(cached, time.Now())) {
 		// settings.json names nobody — the usual case, since the account lives in
 		// the OS keyring. Replay under the identity that PRODUCED the reading
 		// rather than dropping it: there is no current identity for it to

@@ -943,11 +943,12 @@ identity comes from `~/.gemini/antigravity-cli/settings.json`, or from legacy
    still records. The probe is matched against the CACHE, never against
    `settings.json`. A **Code Assist** read (the click on a gated build, or the
    run-completion refresh below) was taken with the stored keyring login
-   itself, so its attestation does not age out with that TTL: it holds for as
-   long as the cache still carries that account's reading
-   (`antigravityProducerAttests`). Without that, a reading the refresh landed
-   minutes before the next periodic gather fell back to `Unknown` rows whenever
-   `settings.json` named a different account.
+   itself, so its attestation does not age out with that TTL: the reading carries
+   it on disk (`storedLoginRead`) and it holds for as long as the cache still
+   carries that reading (`antigravityProducerAttests`), across a restart or a
+   self-update. Without that, a reading the refresh landed minutes before the
+   next periodic gather fell back to `Unknown` rows whenever `settings.json`
+   named a different account — or whenever the agent was replaced in between.
 
 A file-named account with no such probe and no matching cache leaves the reading
 unreplayed.

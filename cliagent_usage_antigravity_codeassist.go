@@ -369,10 +369,15 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	// Identity from the same credential, in the same probe: the quota and the
 	// account it is cached under can never come from two different logins.
 	snap.Account = antigravityCodeAssistIdentity(ctx, client, tok)
+	// Attest the route on the cached reading itself, not only in memory: the
+	// gather that replays it may belong to a later process (a restart or a
+	// self-update), and a settings.json naming another account needs the
+	// attestation to replay this reading at all.
+	snap.StoredLoginRead = true
 	persisted, _ := antigravityCapturePersist(snap)
 	if !persisted {
 		return liveProbeOutcomeCodeAssistNotSigned
 	}
-	noteAntigravityCodeAssistProducer(fingerprintAccount("antigravity", snap.Account), now())
+	noteAntigravityLiveProducer(fingerprintAccount("antigravity", snap.Account), now())
 	return liveProbeOutcomeCodeAssistOK
 }

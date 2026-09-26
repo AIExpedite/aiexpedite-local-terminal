@@ -116,12 +116,15 @@ func TestProbeAntigravityQuotaCodeAssist_ReadsAndCachesUnderTheTokensAccount(t *
 	if strings.Contains(string(raw), "access-A") || strings.Contains(string(raw), "never-read") {
 		t.Error("a token leaked into the cache")
 	}
-	if !antigravityProducerAttests(snap.AccountFingerprint, time.Now()) {
+	if !snap.StoredLoginRead {
+		t.Error("the cached reading did not record that the stored login produced it")
+	}
+	if !antigravityProducerAttests(snap, time.Now()) {
 		t.Error("the live producer was not noted for the gather that follows")
 	}
 	// A Code Assist reading was taken with the stored login itself, so its
 	// attestation outlives the click's TTL for as long as the cache holds it.
-	if !antigravityProducerAttests(snap.AccountFingerprint, time.Now().Add(antigravityLiveProducerTTL+time.Hour)) {
+	if !antigravityProducerAttests(snap, time.Now().Add(antigravityLiveProducerTTL+time.Hour)) {
 		t.Error("the Code Assist producer aged out with the loopback probe's TTL")
 	}
 }

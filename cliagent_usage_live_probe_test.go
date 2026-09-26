@@ -873,7 +873,6 @@ func noteAntigravityLiveProducerForTest(fingerprint string, at time.Time) {
 	defer antigravityLiveProducer.mu.Unlock()
 	antigravityLiveProducer.fingerprint = fingerprint
 	antigravityLiveProducer.at = at
-	antigravityLiveProducer.codeAssist = false
 }
 
 // TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings: the account

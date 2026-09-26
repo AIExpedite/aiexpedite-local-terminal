@@ -282,14 +282,47 @@ func TestAntigravityStaleRegression_ReadingOutlivesAStaleSettingsAccount(t *test
 		}
 	}
 
-	// The contrast: the same aged attestation from a loopback probe (a Refresh
-	// click) does not outrank settings.json, exactly as before.
+	// A restart or self-update discards the in-process note entirely. The
+	// reading itself records that the stored login produced it, so the card
+	// still replays it instead of falling back to Unknown rows.
+	resetAntigravityLiveProducer(t)
+	usage, observed = helperParsedObservedAt(t, f.home, time.Now())
+	if !observed.After(f.stale) || usage.Account != "ada@example.com" {
+		t.Fatalf("after a restart account=%q observedAt=%s, want the stored login's fresh reading",
+			usage.Account, observed)
+	}
+	for _, m := range usage.Metrics {
+		if m.Unknown {
+			t.Errorf("after a restart metric %+v fell back to Unknown", m)
+		}
+	}
+
+	// The contrast: an aged attestation from a loopback probe (a Refresh click)
+	// does not outrank settings.json, exactly as before. Such a reading carries
+	// no StoredLoginRead — only the Code Assist route writes it — so the cached
+	// one is rewritten here as the click would have left it.
+	helperClearStoredLoginAttestation(t, f.cache)
 	noteAntigravityLiveProducerForTest(fingerprintAccount("antigravity", "ada@example.com"),
 		time.Now().Add(-antigravityLiveProducerTTL-5*time.Minute))
 	usage, _ = antigravityUsageParser{}.Parse(f.home, detectedCLIAgent{Detected: true}, time.Now())
 	if len(usage.Metrics) == 0 || !usage.Metrics[0].Unknown {
 		t.Errorf("an aged loopback attestation replayed %q's reading under settings.json's account", usage.Account)
 	}
+}
+
+// helperClearStoredLoginAttestation rewrites the cached reading as a loopback
+// probe would have left it: same numbers and account, no route attestation.
+func helperClearStoredLoginAttestation(t *testing.T, cache string) {
+	t.Helper()
+	var snap antigravityQuotaSnapshot
+	if !readJSONFile(cache, &snap) {
+		t.Fatal("no snapshot cached")
+	}
+	if !snap.StoredLoginRead {
+		t.Fatal("the Code Assist reading did not record the stored login as its producer")
+	}
+	snap.StoredLoginRead = false
+	helperWriteJSON(t, cache, snap)
 }
 
 // A burst of runs costs at most one outbound read per interval: every later
