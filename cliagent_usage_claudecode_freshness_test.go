@@ -744,3 +744,76 @@ func TestAdjustClaudeRefreshAttemptsAt_IsSymmetricAndScopedToTheJudgedDebt(t *te
 		t.Fatalf("the newer debt was disturbed: %+v", snap)
 	}
 }
+
+// payOwedClaudeUsageRefresh is the function StartAgent actually calls, and the
+// only one of this file's entry points that every other test bypasses in
+// favour of the clock-injected body. Four properties live in that six-line
+// wrapper, all of them reliability-critical at agent boot:
+//
+//   - the settlement counter is raised on the CALLER's goroutine, so a reset
+//     cannot drain past a replay that has not started yet (the same defect
+//     already fixed once in triggerClaudeUsageProbeAfterRun);
+//   - endSettling runs on every exit, or every later reset burns its whole
+//     drain budget against a counter that never returns to zero;
+//   - a panic is recovered — this runs on a goroutine, where an unrecovered
+//     panic takes the whole tray app down at startup;
+//   - it SPAWNS, so StartAgent is never blocked behind the cache.
+func TestPayOwedClaudeUsageRefresh_SpawnsBoundedAndContainsAPanic(t *testing.T) {
+	t.Run("a panic cannot escape or leak the gate", func(t *testing.T) {
+		cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+		fp := currentClaudeAccountFingerprint()
+		seedClaudeRefreshDebt(t, cache, fp, time.Now().Add(-time.Minute), 0, time.Time{})
+
+		// Opted out, so the replay's first act is the debt-clearing write — and
+		// that write blows up. Installed AFTER the seed, which uses the same
+		// seam.
+		SetClaudeUsageProbeDisabled(true)
+		original := claudeRateLimitCacheWriteFile
+		claudeRateLimitCacheWriteFile = func(string, []byte, os.FileMode) error {
+			panic("cache write blew up")
+		}
+		t.Cleanup(func() { claudeRateLimitCacheWriteFile = original })
+
+		payOwedClaudeUsageRefresh()
+
+		// Raised synchronously: no sleep, so this cannot be a timing-dependent
+		// read.
+		claudeUsageProbe.mu.Lock()
+		settling := claudeUsageProbe.settling
+		claudeUsageProbe.mu.Unlock()
+		if settling == 0 {
+			t.Fatal("the replay returned with settling=0; a reset could drain past it before it starts")
+		}
+
+		// The process is still here, and the counter came back down — so the
+		// panic was recovered and endSettling ran on the unwind.
+		claudeFreshnessWaitIdle(t)
+
+		// The unwind must also have released the cache gate, or every later
+		// writer on this device is wedged for good.
+		if !lockClaudeRateLimitCacheUntil(time.Now().Add(2 * time.Second)) {
+			t.Fatal("the panicking replay leaked the cache gate")
+		}
+		unlockClaudeRateLimitCache()
+	})
+
+	t.Run("it spawns rather than blocking the boot goroutine", func(t *testing.T) {
+		cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+		fp := currentClaudeAccountFingerprint()
+		seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+		seedClaudeRefreshDebt(t, cache, fp, time.Now().Add(-time.Minute), 0, time.Time{})
+
+		// Pin the gate so the replay's first write would block for the whole
+		// best-effort wait if it ran inline.
+		lockClaudeRateLimitCache()
+		started := time.Now()
+		payOwedClaudeUsageRefresh()
+		elapsed := time.Since(started)
+		unlockClaudeRateLimitCache()
+		claudeFreshnessWaitIdle(t)
+
+		if elapsed > claudeRateLimitBestEffortGateWait/2 {
+			t.Fatalf("payOwedClaudeUsageRefresh blocked its caller for %v; StartAgent must never wait on the cache", elapsed)
+		}
+	})
+}
