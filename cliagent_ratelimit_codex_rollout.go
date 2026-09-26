@@ -134,7 +134,9 @@ func codexRolloutCursorBelowFloor(cursor codexRolloutScanCursor, floor time.Time
 // cursor again on every later refresh, starving the backlog march it is
 // making. Mirrors the RolloutRootFingerprint reset in the contributor merge.
 // A snapshot of another account, or an unknown current version, is left
-// alone.
+// alone. Like the scan's own commit, only a FORCED reconcile waits for the
+// cache locks; a routine one skips the reset under contention — the selector
+// still reads the mismatched cursor as empty, and the next refresh retries.
 func codexResetRolloutCursorForVersion(ctx context.Context, currentFingerprint string, now time.Time) {
 	version := currentCodexUsageCaptureVersion()
 	if version == "" {
@@ -144,7 +146,8 @@ func codexResetRolloutCursorForVersion(ctx context.Context, currentFingerprint s
 	if !ok || snap.AccountFingerprint != currentFingerprint || snap.RolloutCursorVersion == version {
 		return
 	}
-	codexRateLimitCacheTransaction(ctx, codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+	_, forced := codexForcedReconcileFrom(ctx)
+	codexRateLimitCacheTransaction(ctx, codexRateLimitCachePath(), now, forced, func(snap *codexRateLimitSnapshot) bool {
 		if snap.AccountFingerprint != currentFingerprint || snap.RolloutCursorVersion == version {
 			return false
 		}

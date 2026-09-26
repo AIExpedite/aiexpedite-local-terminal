@@ -434,6 +434,45 @@ func TestCodexUpgrade_CursorResetsOnceOnVersionChange(t *testing.T) {
 	}
 }
 
+// A routine (unforced) scan treats the reset as optional work, like its own
+// commit: under lock contention it neither blocks nor writes, and the stale
+// cursor still reads as empty so nothing is scanned against the old layout.
+// A forced scan waits and lands it.
+func TestCodexUpgrade_RoutineResetSkipsUnderContention(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
+	f.stampPreUpdateCache(t, now)
+	setCodexCaptureVersion(t, codexPostUpdateVersion)
+
+	codexRateLimitMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		codexResetRolloutCursorForVersion(context.Background(), f.fp, now)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		codexRateLimitMu.Unlock()
+		<-done
+		t.Fatal("a routine reset blocked on the cache lock")
+	}
+	codexRateLimitMu.Unlock()
+	if snap := f.snapshot(t); snap.RolloutCursorVersion != codexPreUpdateVersion {
+		t.Fatalf("a contended routine reset wrote: %+v", snap)
+	}
+	if cursor := codexRolloutScanCursorForAccount(f.home, f.fp, now); cursor.mtimeNs != 0 {
+		t.Fatalf("the old cursor must still read as empty, got %+v", cursor)
+	}
+
+	codexResetRolloutCursorForVersion(withCodexForcedReconcile(context.Background(), now), f.fp, now)
+	if snap := f.snapshot(t); snap.RolloutCursorVersion != codexPostUpdateVersion {
+		t.Fatalf("a forced reset must land: %+v", snap)
+	}
+}
+
 // No reset loop: a post-upgrade rescan that runs out of budget leaves partial
 // progress, and the NEXT refresh resumes it instead of resetting again —
 // the stamp landed at the reset, not at a completed pass.
