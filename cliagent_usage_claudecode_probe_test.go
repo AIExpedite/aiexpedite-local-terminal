@@ -3171,10 +3171,10 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 	t.Cleanup(func() { claudeUsageProbe.finish(nil, false, time.Time{}, "") })
 
 	// Same instant as the holder — what a coarse clock hands the loser.
-	admitted, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(
+	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(
 		context.Background(), holderAt, claudeUsageProbeStoredIdentity, holderAt, false)
-	if admitted {
-		t.Error("a probe refused by the single-flight latch reported itself admitted")
+	if admitted || issued {
+		t.Errorf("a probe refused by the single-flight latch reported admitted=%v issued=%v", admitted, issued)
 	}
 	if refreshed || !observedAt.IsZero() || probeErr != nil {
 		t.Errorf("refusal must be silent: refreshed=%v observedAt=%v err=%v", refreshed, observedAt, probeErr)
@@ -3185,10 +3185,17 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 
 	// Release the slot: the same call at the same instant is now admitted.
 	claudeUsageProbe.finish(nil, false, time.Time{}, "")
-	admitted, _, _, _ = probeClaudeUsageAdmitted(
+	admitted, issued, _, _, _ = probeClaudeUsageAdmitted(
 		context.Background(), holderAt, func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }, holderAt, false)
 	if !admitted {
 		t.Error("with the slot free, the attempt must report itself admitted")
+	}
+	// Admitted, but the credential store handed back nothing, so no request went
+	// out and nothing was learned: the turn was NOT spent, which is what lets the
+	// startup replay refund its attempt charge instead of retiring a debt it never
+	// put to the endpoint.
+	if issued {
+		t.Error("an attempt that returned on an empty token reported its turn as spent")
 	}
 }
 
@@ -3382,13 +3389,13 @@ func TestClaudeUsageProbeGate_CacheSeedIsOneShot(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache(fp, time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	owed := claudeUsageProbe.owedObservation()
 	if owed.UnixMilli() != runEnded.UnixMilli() {
 		t.Fatalf("owedObservation()=%v, want the persisted debt %v", owed, runEnded)
 	}
 	claudeUsageProbe.settleOwed(owed)
-	claudeUsageProbe.seedOwedFromCache(fp, time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache(fp, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if again := claudeUsageProbe.owedObservation(); !again.IsZero() {
 		t.Fatalf("the cache seed must be one-shot; a settled debt came back as %v", again)
 	}
@@ -3405,7 +3412,7 @@ func TestClaudeUsageProbeGate_CacheSeedIsAccountScoped(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	claudeUsageProbe.seedOwedFromCache("someone-else", time.Now(), time.Time{})
+	claudeUsageProbe.seedOwedFromCache("someone-else", claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("another account's debt was seeded onto this gather: %v", owed)
 	}

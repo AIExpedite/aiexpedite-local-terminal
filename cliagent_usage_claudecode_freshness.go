@@ -462,15 +462,16 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// ONE bounded attempt, through the ordinary single-flight probe. Whatever it
 	// finds (or fails to find) is left to the ordinary gather/refresh bounds; the
 	// merge that carries a covering reading settles the debt in its own write.
-	if claudeUsageProbeAttempt(owed) {
+	if done, issued := claudeUsageProbeAttemptIssued(owed); done && issued {
 		return
 	}
-	// The gate never admitted it — a concurrent gather held the single-flight
-	// slot — so no request left this process and the charge above bought
-	// nothing. Refund it, or two unlucky starts would retire a debt that was
-	// never once put to the endpoint, leaving exactly the stale card this path
-	// exists to clear. Safe in the crash direction: a crash between the charge
-	// and the refund keeps the charge, which only ever spends the budget
-	// faster.
+	// Nothing left this process, so the charge above bought nothing: either the
+	// gate never admitted the attempt — a concurrent gather held the single-flight
+	// slot — or it was admitted and returned before asking anything, which is the
+	// credential store failing to hand back a token (a Keychain timeout on macOS).
+	// Refund it, or two unlucky starts would retire a debt that was never once put
+	// to the endpoint, leaving exactly the stale card this path exists to clear.
+	// Safe in the crash direction: a crash between the charge and the refund keeps
+	// the charge, which only ever spends the budget faster.
 	mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
 }

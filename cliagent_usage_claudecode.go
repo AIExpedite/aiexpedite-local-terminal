@@ -469,8 +469,15 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// an hours-old reading. Rows that were never observed, and rows our own probe
 	// has already shown it cannot supply, are excluded there so this can never
 	// become a per-gather probe loop.
+	// Sampled BEFORE the load, and handed down: the startup replay runs on its own
+	// goroutine and can persist a covering reading — clearing the debt in the same
+	// write — between this load and the seed inside refreshClaudeUsageIfStaleFrom. A
+	// generation sampled inside the seed already includes such a refresh, so nothing
+	// would report that the view below is superseded, and this gather would publish
+	// the pre-replay reading for the whole staleness TTL.
+	generation := claudeUsageProbe.refreshGeneration()
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(view, now), oauthAccessToken, usage.AccountFingerprint) {
+	if refreshClaudeUsageIfStaleFrom(ctx, generation, now, claudeSnapshotFreshness(view, now), oauthAccessToken, usage.AccountFingerprint) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
