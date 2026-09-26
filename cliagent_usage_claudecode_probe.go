@@ -1178,10 +1178,18 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// the tail's `defer g.mu.Unlock()`, so it runs after it — this relock is not
 	// a recursive one.
 	measured := time.Time{}
+	// Claimed unless the adoption below declines a debt for a reason that can
+	// change without the snapshot changing — see the blockedFromIssuing check.
+	latch := true
 	defer func() {
 		g.mu.Lock()
 		if g.seedingCh == seeding {
 			g.seedingCh = nil
+			if !latch {
+				g.mu.Unlock()
+				close(seeding)
+				return
+			}
 			g.owedSeeded = true
 			g.owedSeededFor = fingerprint
 			g.owedSeededObservation = measured
@@ -1240,8 +1248,32 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// read keeps the charge. Same direction as the replay's crash-between-charge-
 	// and-refund window: it only ever spends the budget faster, and the reading
 	// that declined it is the one the debt wanted.
-	if !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
-		!claudeUsageObservationCovers(onDisk, persisted) {
+	uncovered := !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
+		!claudeUsageObservationCovers(onDisk, persisted)
+	// A debt no probe of this gather could pay is not adopted, and — crucially —
+	// not CHARGED. begin() refuses on an unarmed gate, a live 429 hold (possibly
+	// the one this seed adopted two statements up), offline mode, or a context
+	// that has already ended, so a charge here would buy a request that is never
+	// issued: two such starts reach the attempt cap and the startup replay then
+	// retires a debt nothing ever asked the endpoint about, leaving the pre-run
+	// utilization stale for the whole TTL — the exact failure this path exists to
+	// prevent. Same rule as payOwedClaudeUsageRefreshAt, which returns ahead of
+	// its charge for the same two refusals and leaves the debt and its counter
+	// exactly as found.
+	//
+	// Checked rather than refunded because the gather never reports back whether
+	// it issued anything: the adoption hands the debt to a later `owing` branch,
+	// and a refund keyed to this call would have to outlive it.
+	//
+	// The latch is left UNCLAIMED, so the next gather re-runs the adoption once
+	// the hold expires or the agent reconnects — neither of which touches the
+	// snapshot the latch is keyed to. Latching a refusal would strand the debt
+	// for the rest of this process's life.
+	if uncovered && (ctx.Err() != nil || g.blockedFromIssuing(now)) {
+		claudeUsageProbeSeedBlocked()
+		persisted, uncovered, latch = time.Time{}, false, false
+	}
+	if uncovered {
 		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
 		lockedHeldMs := int64(0)
 		if mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
@@ -1381,6 +1413,31 @@ var claudeUsageProbeSeedWaiting = func() {}
 // sample and the locked latch test, the exact window a cross-process rename has
 // to slip through. Production leaves it as a no-op.
 var claudeUsageProbeAfterSeedStamp = func() {}
+
+// claudeUsageProbeSeedBlocked is an observation point for the "adoption is not
+// charged when nothing could issue a request" test. Production leaves it as a
+// no-op.
+var claudeUsageProbeSeedBlocked = func() {}
+
+// blockedFromIssuing reports whether begin() would refuse every probe this
+// gather could still make, for a reason that is not transient contention: an
+// unarmed (opted-out) gate, a live server-imposed hold, or offline mode. Used by
+// seedOwedFromCache to decline — uncharged — a debt it cannot hand a payable
+// request to. inFlight and the interval are deliberately NOT consulted: a probe
+// already on the wire settles the debt, and the interval is what the `owing`
+// branch exists to beat.
+func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
+	g.mu.Lock()
+	armed, held := g.armed, g.heldUntil
+	g.mu.Unlock()
+	if !armed {
+		return true
+	}
+	if !held.IsZero() && now.Before(held) {
+		return true
+	}
+	return IsOffline()
+}
 
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
 // deadline is zero (no usable Retry-After).
