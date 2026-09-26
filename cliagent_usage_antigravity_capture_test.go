@@ -87,7 +87,7 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 			t.Fatal("a capture poller from an earlier test is still running")
 		}
 	}
-	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
 	antigravityCaptureArms.Store(0)
 	antigravityCaptureFinishes.Store(0)
 	antigravityCaptureSnapshots.Store(0)
@@ -106,7 +106,7 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	origRetry := antigravityRefreshAfterRunRetryDelay
 	antigravityRefreshAfterRunRetryDelay = time.Millisecond
 	t.Cleanup(func() {
-		antigravityUsageRefreshWaitIdle()
+		helperStopAntigravityRefreshSchedule()
 		antigravityRefreshAfterRunRetryDelay = origRetry
 	})
 	// A debt is retired WITHOUT an attempt when `agy` is not on the machine, so
@@ -684,4 +684,56 @@ func helperResetAntigravityLiveRuns() {
 	antigravityLiveRunsMu.Lock()
 	antigravityLiveRuns = map[int64]int{}
 	antigravityLiveRunsMu.Unlock()
+}
+
+// A build the gate marker already knows refuses loopback reads gets NO poller:
+// every probe would be a log scan for a read guaranteed to be refused. The run
+// still arms its floor and still settles gated, so the Code Assist route that
+// does answer on such a build pays it.
+func TestAntigravityQuotaCapture_GatedBuildStartsNoPoller(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	helperIsolateAntigravityGate(t)
+	noteAntigravityQuotaGate("", time.Now().Add(-time.Minute))
+	// A live-looking server whose port the log names: a poller would find it.
+	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"), helperQuotaJSON, helperStatusJSON)
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	logged := captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("gated run")
+		antigravityCaptureMu.Lock()
+		refs := antigravityCaptureRefs
+		antigravityCaptureMu.Unlock()
+		if refs != 0 {
+			t.Errorf("refs=%d, want no poller joined for a gated build", refs)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Errorf("arms=%d, want the run armed once", got)
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want the run released once", got)
+	}
+	if got := server.quotaHits.Load() + server.statusHits.Load(); got != 0 {
+		t.Errorf("loopback RPCs=%d, want none on a gated build", got)
+	}
+	if got := antigravityCaptureTailProbes.Load(); got != 0 {
+		t.Errorf("tailProbes=%d, want none", got)
+	}
+	// The poller's close-out line reports its discovery attempts; no poller,
+	// no line — and so no discovery at all.
+	if strings.Contains(logged, "Capture finished for gated run") {
+		t.Errorf("a poller ran for a gated build: %q", logged)
+	}
+	state := helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 || !state.Gated {
+		t.Errorf("state=%+v, want the run's debt owed and marked gated", state)
+	}
+	// antigravityCaptureStopped stays answerable with no poller armed.
+	select {
+	case <-antigravityCaptureStopped():
+	case <-time.After(5 * time.Second):
+		t.Error("antigravityCaptureStopped hung with no poller armed")
+	}
 }

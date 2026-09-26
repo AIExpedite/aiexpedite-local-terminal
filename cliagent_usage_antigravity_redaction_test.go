@@ -71,6 +71,7 @@ func TestAntigravityClassify_MatchingPayloadNeverEscapes(t *testing.T) {
 			"schemaVersion": true, "runFloorMs": true, "refreshOwedFloorMs": true,
 			"refreshOwedAtMs": true, "lastPaidAtMs": true, "attempts": true,
 			"gated": true, "accountFingerprint": true, "outcome": true,
+			"nextAttemptAtMs": true,
 		}
 		for key := range decodedState {
 			if !allowedState[key] {
@@ -140,5 +141,78 @@ func helperAssertNoSecrets(t *testing.T, surface, body string) {
 		if strings.Contains(body, secret) {
 			t.Errorf("%s leaked %q from the classified payload:\n%s", surface, secret, body)
 		}
+	}
+}
+
+// The retry schedule and the gather's nudge add one persisted field and a few
+// log lines. The field is a single epoch-millisecond int, and neither surface
+// may carry a path, an account, a port or log text — the state file and the
+// agent log are both uploaded with diagnostics.
+func TestAntigravityRefreshSchedule_PersistsAndLogsMetricsOnly(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	const port = "54452"
+	helperWriteAntigravityLog(t, base, "secret-run.log",
+		"server.go:584] Language server listening on random port at "+port+" for HTTP\n"+helperSecretScript("agy")+"\n")
+	logAt := now.Add(-5 * time.Minute)
+	if err := os.Chtimes(filepath.Join(antigravityLogDir(base), "secret-run.log"), logAt, logAt); err != nil {
+		t.Fatal(err)
+	}
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	antigravityRefreshMinInterval = time.Nanosecond
+
+	logged := captureStdout(t, func() {
+		nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), antigravityNewestRunLog(base))
+		antigravityUsageRefreshWaitIdle()
+		// And the restart path's own line, for a booked rung in the future.
+		stopAntigravityRunDebtRetry()
+		payOwedAntigravityUsageRefresh()
+		antigravityUsageRefreshWaitIdle()
+	})
+	for _, line := range []string{"refresh owed", "retry scheduled", "schedule resumed after restart"} {
+		if !strings.Contains(logged, line) {
+			t.Fatalf("the %q line was not logged: %q", line, logged)
+		}
+	}
+
+	raw, err := os.ReadFile(antigravityFreshnessPath())
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	// The port is checked on the log only: five digits can occur inside any
+	// epoch-millisecond value, and the state file's keys are pinned below.
+	for surface, body := range map[string]string{"the agent log": logged, "the freshness state": string(raw)} {
+		helperAssertNoSecrets(t, surface, body)
+		for _, forbidden := range []string{home, base, "secret-run", "ada@example.com", "Language server"} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("%s leaked %q:\n%s", surface, forbidden, body)
+			}
+		}
+	}
+	if strings.Contains(logged, port) {
+		t.Errorf("the agent log leaked the port:\n%s", logged)
+	}
+	allowed := map[string]bool{
+		"schemaVersion": true, "runFloorMs": true, "refreshOwedFloorMs": true,
+		"refreshOwedAtMs": true, "lastPaidAtMs": true, "attempts": true,
+		"gated": true, "accountFingerprint": true, "outcome": true,
+		"nextAttemptAtMs": true,
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("state is not a JSON object: %v", err)
+	}
+	for key := range decoded {
+		if !allowed[key] {
+			t.Errorf("unexpected persisted freshness field %q", key)
+		}
+	}
+	var next int64
+	if err := json.Unmarshal(decoded["nextAttemptAtMs"], &next); err != nil || next <= now.UnixMilli() {
+		t.Errorf("nextAttemptAtMs=%s, want one future epoch-millisecond int", decoded["nextAttemptAtMs"])
 	}
 }

@@ -373,6 +373,6 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	if !persisted {
 		return liveProbeOutcomeCodeAssistNotSigned
 	}
-	noteAntigravityLiveProducer(fingerprintAccount("antigravity", snap.Account), now())
+	noteAntigravityCodeAssistProducer(fingerprintAccount("antigravity", snap.Account), now())
 	return liveProbeOutcomeCodeAssistOK
 }

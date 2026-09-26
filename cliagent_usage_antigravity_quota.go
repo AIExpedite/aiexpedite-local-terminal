@@ -200,37 +200,15 @@ func antigravityLogDir(base string) string {
 // The second return is the newest log mtime seen in this base, which is the
 // closest thing the device has to "when did an agy run last happen here". It is
 // returned rather than re-derived so the missed-run backstop
-// (antigravityMissedRun) reuses the ReadDir this function already paid for
-// instead of walking the same directory a second time on every refresh.
+// (antigravityMissedRun) and the gather's refresh nudge reuse the ReadDir this
+// function already paid for instead of walking the same directory a second time
+// on every refresh.
 func discoverAntigravityHTTPPorts(base string) ([]int, time.Time) {
-	var newestLog time.Time
-	dir := antigravityLogDir(base)
-	if dir == "" {
-		return nil, newestLog
+	files := antigravityRunLogs(base)
+	if len(files) == 0 {
+		return nil, time.Time{}
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, newestLog
-	}
-	type logFile struct {
-		path    string
-		modTime time.Time
-	}
-	files := make([]logFile, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(newestLog) {
-			newestLog = info.ModTime()
-		}
-		files = append(files, logFile{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
+	newestLog := files[0].modTime
 	if len(files) > antigravityQuotaMaxLogs {
 		files = files[:antigravityQuotaMaxLogs]
 	}
@@ -254,6 +232,49 @@ func discoverAntigravityHTTPPorts(base string) ([]int, time.Time) {
 		}
 	}
 	return ports, newestLog
+}
+
+// antigravityNewestRunLog is the newest run-log mtime under base, or the zero
+// time when there is none — the ReadDir-only half of
+// discoverAntigravityHTTPPorts, for a gather on a CSRF-gated build that has no
+// server to discover and so must not pay for reading log bodies.
+func antigravityNewestRunLog(base string) time.Time {
+	if files := antigravityRunLogs(base); len(files) > 0 {
+		return files[0].modTime
+	}
+	return time.Time{}
+}
+
+// antigravityRunLog is one CLI run log: where it is and when it last changed.
+type antigravityRunLog struct {
+	path    string
+	modTime time.Time
+}
+
+// antigravityRunLogs lists base's run logs, newest first, from directory
+// metadata alone. A missing or unreadable log directory is no logs.
+func antigravityRunLogs(base string) []antigravityRunLog {
+	dir := antigravityLogDir(base)
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	files := make([]antigravityRunLog, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, antigravityRunLog{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
+	return files
 }
 
 // antigravityPortsInLog extracts every plain-HTTP listener port from one log
@@ -435,19 +456,37 @@ const antigravityMissedRunSlack = 60 * time.Second
 //
 // Timestamps and counts only — no paths, no log text, no account.
 func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) {
-	if newestLog.IsZero() || observedAt == "" {
-		return
-	}
-	observed, err := time.Parse(time.RFC3339, observedAt)
-	if err != nil {
-		return
-	}
-	if !newestLog.After(observed.Add(antigravityMissedRunSlack)) {
+	observed, behind := antigravityRunBehindObservation(observedAt, newestLog, antigravityMissedRunSlack)
+	if !behind {
 		return
 	}
 	fmt.Printf("%s[antigravity-quota] a run completed after the last observation (observedAt=%s newestRunLog=%s behindBy=%s basesWalked=%d) — that run's quota was never captured%s\n",
 		colorYellow, observed.UTC().Format(time.RFC3339), newestLog.UTC().Format(time.RFC3339),
 		newestLog.Sub(observed).Round(time.Second), logBases, colorReset)
+}
+
+// antigravityRunBehindObservation reports whether the newest run log postdates
+// the reading observed at observedAt by more than slack, and returns the parsed
+// observation. No log, or an observation that cannot be parsed, is not evidence
+// of anything.
+//
+// The single predicate behind both the missed-run diagnostic (which keeps
+// antigravityMissedRunSlack so a Refresh click's own `agy` does not warn about
+// itself) and the gather's refresh nudge (nudgeAntigravityUsageRefresh), which
+// passes 0: newestLog and observedAt are both fixed once a run ends, so a run
+// that finished within the slack of the last observation would fail the
+// comparison on that gather and on every gather after it — exactly the short
+// runs a maintenance smoke produces. The nudge applies its own settle guard
+// instead.
+func antigravityRunBehindObservation(observedAt string, newestLog time.Time, slack time.Duration) (time.Time, bool) {
+	if newestLog.IsZero() || observedAt == "" {
+		return time.Time{}, false
+	}
+	observed, err := time.Parse(time.RFC3339, observedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return observed, newestLog.After(observed.Add(slack))
 }
 
 // fetchAntigravityQuotaOnPort runs the quota + identity RPC pair against ONE

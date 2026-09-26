@@ -20,7 +20,7 @@ import (
 // the Code Assist read at test-owned locations and shrinks the timing seams.
 func helperIsolateAntigravityFreshness(t *testing.T) (state, cache string) {
 	t.Helper()
-	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
 	state = filepath.Join(t.TempDir(), "agy_freshness.json")
 	cache = filepath.Join(t.TempDir(), "agyq.json")
 	t.Setenv(antigravityFreshnessEnv, state)
@@ -30,8 +30,9 @@ func helperIsolateAntigravityFreshness(t *testing.T) (state, cache string) {
 
 	origRetry, origInterval, origNow := antigravityRefreshAfterRunRetryDelay, antigravityRefreshMinInterval, antigravityUsageFreshnessNow
 	t.Cleanup(func() {
-		// The worker reads all three, so it has to be out of flight first.
-		antigravityUsageRefreshWaitIdle()
+		// The worker reads all three, so it has to be out of flight first —
+		// and no retry rung may fire into the next test's state file.
+		helperStopAntigravityRefreshSchedule()
 		antigravityRefreshAfterRunRetryDelay = origRetry
 		antigravityRefreshMinInterval = origInterval
 		antigravityUsageFreshnessNow = origNow
@@ -40,6 +41,22 @@ func helperIsolateAntigravityFreshness(t *testing.T) (state, cache string) {
 	// `agy` has to look installed, or every debt retires before it is paid.
 	helperFakeAgyOnPath(t)
 	return state, cache
+}
+
+// helperStopAntigravityRefreshSchedule cancels a pending retry rung and waits
+// out every worker, so nothing a test booked outlives it. The ladder's shipped
+// rungs are a minute and longer, so a test that does not drain the schedule
+// itself leaves a timer that would otherwise fire into a later test.
+func helperStopAntigravityRefreshSchedule() {
+	stopAntigravityRunDebtRetry()
+	antigravityUsageRefreshWaitIdle()
+	// A worker that was still in flight may have booked a rung on its way out.
+	stopAntigravityRunDebtRetry()
+	// The nudge cooldown is per process, so one test's gather must not hold
+	// back the next test's.
+	antigravityRefreshNudge.mu.Lock()
+	antigravityRefreshNudge.lastAt = time.Time{}
+	antigravityRefreshNudge.mu.Unlock()
 }
 
 // helperFakeAgyOnPath puts a trivial `agy` first on PATH so the CLI looks
@@ -226,8 +243,9 @@ func TestSaveAntigravityQuotaSnapshotIfNewer_OrdersWithinOneSecond(t *testing.T)
 	}
 }
 
-// The attempt cap: one immediate read and one retry, then the debt stops
-// spending however long it stays unpaid.
+// The attempt caps: the settle pass spends one immediate read and one retry,
+// later passes spend what is left of the debt's lifetime budget, and then the
+// debt stops spending however long it stays unpaid.
 func TestAntigravityFreshness_AttemptCapIsHonoured(t *testing.T) {
 	_, cache := helperIsolateAntigravityFreshness(t)
 	floor := time.Now()
@@ -238,18 +256,27 @@ func TestAntigravityFreshness_AttemptCapIsHonoured(t *testing.T) {
 	antigravityUsageRunSettled(floor, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if got := calls.Load(); got != int64(antigravityRefreshAfterRunMaxAttempts) {
-		t.Fatalf("reads=%d, want %d", got, antigravityRefreshAfterRunMaxAttempts)
+		t.Fatalf("reads=%d, want the settle pass's %d", got, antigravityRefreshAfterRunMaxAttempts)
 	}
 	state := helperFreshnessState(t)
 	if state.RefreshOwedAtMs == 0 || state.Attempts != antigravityRefreshAfterRunMaxAttempts {
-		t.Fatalf("state=%+v, want the debt kept with its budget spent", state)
+		t.Fatalf("state=%+v, want the debt kept with the settle pass's attempts booked", state)
+	}
+	if state.NextAttemptAtMs == 0 || !antigravityRunDebtRetryPending() {
+		t.Fatalf("state=%+v pending=%v, want the kept debt scheduled", state, antigravityRunDebtRetryPending())
 	}
 
-	// A second worker on the same debt must spend nothing further.
-	antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, true)
-	antigravityUsageRefreshWaitIdle()
-	if got := calls.Load(); got != int64(antigravityRefreshAfterRunMaxAttempts) {
-		t.Errorf("reads=%d after a second worker, want the cap to hold", got)
+	// Later passes may spend the rest of the lifetime budget and no more.
+	for i := 0; i < antigravityRefreshDebtMaxAttempts; i++ {
+		antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, true)
+		antigravityUsageRefreshWaitIdle()
+	}
+	if got := calls.Load(); got != int64(antigravityRefreshDebtMaxAttempts) {
+		t.Errorf("reads=%d after repeated workers, want the lifetime cap %d", got, antigravityRefreshDebtMaxAttempts)
+	}
+	state = helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 || state.Attempts != antigravityRefreshDebtMaxAttempts || state.NextAttemptAtMs != 0 {
+		t.Errorf("state=%+v, want the spent debt kept (for the notice) with nothing scheduled", state)
 	}
 }
 
@@ -274,9 +301,49 @@ func TestAntigravityFreshness_MinimumIntervalBlocksTheNextRunsPayment(t *testing
 	if got := calls.Load(); got != first {
 		t.Errorf("reads=%d, want the interval to block the second run's payment (was %d)", got, first)
 	}
-	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 {
-		t.Error("the blocked debt was dropped instead of kept for the next run")
+	state := helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 {
+		t.Fatal("the blocked debt was dropped instead of kept")
 	}
+	// Kept is not enough: something has to come back for it. The deferral
+	// books a rung no earlier than the interval allows.
+	if state.NextAttemptAtMs < state.LastPaidAtMs+antigravityRefreshMinInterval.Milliseconds() || !antigravityRunDebtRetryPending() {
+		t.Fatalf("state=%+v pending=%v, want a retry booked once the interval lapses", state, antigravityRunDebtRetryPending())
+	}
+	// The interval lapses and the rung fires: the deferred run is paid.
+	antigravityRefreshMinInterval = time.Nanosecond
+	antigravityArmRunDebtRetry(state.debtID(), 0)
+	helperDrainAntigravityRefreshScheduleOnce(t)
+	if got := calls.Load(); got != first+1 {
+		t.Errorf("reads=%d, want the rung to pay the deferred run once (was %d)", got, first)
+	}
+}
+
+// helperDrainAntigravityRefreshScheduleOnce waits for the rung that was just
+// armed to fire and its worker to finish, then stops whatever that worker
+// booked next — shipped rungs are a minute and longer.
+func helperDrainAntigravityRefreshScheduleOnce(t *testing.T) {
+	t.Helper()
+	timer := &antigravityRunDebtRetryTimer
+	timer.mu.Lock()
+	armed := timer.gen
+	timer.mu.Unlock()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		// Fired: the callback cleared the timer, or the worker it started has
+		// already booked the next rung (a new generation).
+		timer.mu.Lock()
+		fired := timer.timer == nil || timer.gen != armed
+		timer.mu.Unlock()
+		if fired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the armed rung never fired")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	antigravityUsageRefreshWaitIdle()
 }
 
 // A debt whose worker is already in flight must not start a second one: the
@@ -321,7 +388,7 @@ func TestAntigravityFreshness_LocalRefusalsDecideWhetherToKeepSpending(t *testin
 		wantAttempts int
 		wantReads    int64
 	}{
-		{liveProbeOutcomeCodeAssistNoLogin, antigravityRefreshAfterRunMaxAttempts, 1},
+		{liveProbeOutcomeCodeAssistNoLogin, antigravityRefreshDebtMaxAttempts, 1},
 		{liveProbeOutcomeCodeAssistTokenExpired, 0, 1},
 	} {
 		t.Run(tc.outcome, func(t *testing.T) {
@@ -344,6 +411,24 @@ func TestAntigravityFreshness_LocalRefusalsDecideWhetherToKeepSpending(t *testin
 			}
 			if state.LastPaidAtMs != 0 {
 				t.Error("a local refusal sent no request and must not space the next one")
+			}
+			// no_login is terminal; an expired login comes back on the free
+			// rung instead of waiting for a run that may never settle here.
+			wantScheduled := tc.outcome == liveProbeOutcomeCodeAssistTokenExpired
+			if scheduled := state.NextAttemptAtMs != 0; scheduled != wantScheduled {
+				t.Errorf("nextAttemptAtMs=%d, want scheduled=%v", state.NextAttemptAtMs, wantScheduled)
+			}
+			if !wantScheduled {
+				return
+			}
+			// The rung fires: one more local check, still free of budget.
+			antigravityArmRunDebtRetry(state.debtID(), 0)
+			helperDrainAntigravityRefreshScheduleOnce(t)
+			if got := calls.Load(); got != tc.wantReads+1 {
+				t.Errorf("reads=%d after the rung, want %d", got, tc.wantReads+1)
+			}
+			if again := helperFreshnessState(t); again.Attempts != 0 || again.NextAttemptAtMs == 0 {
+				t.Errorf("state=%+v, want the budget intact and the next free rung booked", again)
 			}
 		})
 	}
@@ -461,14 +546,16 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 	if state.RefreshOwedFloorMs < second.UnixMilli() {
 		t.Fatalf("owed floor=%d, want the newer run's completion (>= %d)", state.RefreshOwedFloorMs, second.UnixMilli())
 	}
-	// The in-flight read belonged to the first generation, so the second run
-	// still owes — and gets — a full budget of its own.
-	if got := reads.Load(); got != int64(1+antigravityRefreshAfterRunMaxAttempts) {
-		t.Errorf("reads=%d, want the first generation's one plus the second's own %d",
+	// The in-flight read belonged to the first generation, so every read after
+	// it — and only those — is charged to the second run, which is tried at
+	// least a full settle pass of its own.
+	got := reads.Load()
+	if got < int64(1+antigravityRefreshAfterRunMaxAttempts) {
+		t.Errorf("reads=%d, want the first generation's one plus at least the second's own %d",
 			got, antigravityRefreshAfterRunMaxAttempts)
 	}
-	if state.Attempts != antigravityRefreshAfterRunMaxAttempts {
-		t.Errorf("attempts=%d, want exactly the second run's own budget", state.Attempts)
+	if int64(state.Attempts) != got-1 {
+		t.Errorf("attempts=%d after %d reads, want exactly the second run's own reads charged", state.Attempts, got)
 	}
 }
 
@@ -573,6 +660,20 @@ func TestAntigravityFreshness_OfflineKeepsTheDebtAndSpendsNothing(t *testing.T) 
 	if state.RefreshOwedAtMs == 0 || state.Attempts != 0 {
 		t.Errorf("state=%+v, want the debt kept with no attempt consumed", state)
 	}
+	// Offline spends nothing, so it comes back on the free rung rather than
+	// waiting for a run that may never settle.
+	if until := time.Until(time.UnixMilli(state.NextAttemptAtMs)); until <= 0 || until > antigravityRunDebtFreeRetryDelay+time.Second {
+		t.Fatalf("next attempt is %s away, want the free rung %s", until, antigravityRunDebtFreeRetryDelay)
+	}
+	// Back online; the rung fires and pays.
+	offlineMutex.Lock()
+	isOffline = false
+	offlineMutex.Unlock()
+	antigravityArmRunDebtRetry(state.debtID(), 0)
+	helperDrainAntigravityRefreshScheduleOnce(t)
+	if calls.Load() != 1 {
+		t.Errorf("reads=%d once back online, want the kept debt paid", calls.Load())
+	}
 }
 
 // An uninstall between the run and the payment retires the debt without an
@@ -599,9 +700,11 @@ func TestAntigravityFreshness_UninstalledAgyRetiresTheDebt(t *testing.T) {
 }
 
 // The notice accessor is the single source for both questions the parser asks.
-// A gated debt reports pending with NO wording — antigravityGateNotice already
-// names the build and the reading's age, and two sources for one banner drift.
-func TestAntigravityFreshnessNotice_WordsOnlyTheNonGatedCase(t *testing.T) {
+// Nothing is worded while attempts remain; once the budget is spent every
+// cause is worded, gated or not — ParseContext decides whether the gate banner
+// outranks it, and a gated debt that could never speak would leave the card
+// silently stale once a Code Assist reading made the gate the older fact.
+func TestAntigravityFreshnessNotice_WordsEachCauseOnceSpent(t *testing.T) {
 	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 	floor := now.Add(-5 * time.Minute)
 	lastObserved := now.Add(-48 * time.Hour).Format(time.RFC3339)
@@ -613,9 +716,21 @@ func TestAntigravityFreshnessNotice_WordsOnlyTheNonGatedCase(t *testing.T) {
 		wantNotice  []string
 	}{
 		{
-			name:        "a gated debt leaves the wording to the gate banner",
-			state:       antigravityUsageFreshness{Gated: true, Attempts: antigravityRefreshAfterRunMaxAttempts, Outcome: liveProbeOutcomeCodeAssistHTTPError},
+			name:        "a gated debt with attempts left says nothing yet",
+			state:       antigravityUsageFreshness{Gated: true, Attempts: antigravityRefreshDebtMaxAttempts - 1, Outcome: liveProbeOutcomeCodeAssistHTTPError},
 			wantPending: true,
+		},
+		{
+			name:        "a spent gated debt is worded too",
+			state:       antigravityUsageFreshness{Gated: true, Attempts: antigravityRefreshDebtMaxAttempts, Outcome: liveProbeOutcomeCodeAssistHTTPError},
+			wantPending: true,
+			wantNotice:  []string{"Google returned no reading"},
+		},
+		{
+			name:        "an expired login is worded before the budget is spent",
+			state:       antigravityUsageFreshness{Attempts: 1, Outcome: liveProbeOutcomeCodeAssistTokenExpired},
+			wantPending: true,
+			wantNotice:  []string{"has expired", "next Antigravity run renews it", "2026-09-20 11:55 UTC"},
 		},
 		{
 			name:        "a debt with attempts left says nothing yet",
@@ -624,13 +739,13 @@ func TestAntigravityFreshnessNotice_WordsOnlyTheNonGatedCase(t *testing.T) {
 		},
 		{
 			name:        "a spent no_login debt names the missing login",
-			state:       antigravityUsageFreshness{Attempts: antigravityRefreshAfterRunMaxAttempts, Outcome: liveProbeOutcomeCodeAssistNoLogin},
+			state:       antigravityUsageFreshness{Attempts: antigravityRefreshDebtMaxAttempts, Outcome: liveProbeOutcomeCodeAssistNoLogin},
 			wantPending: true,
 			wantNotice:  []string{"No Antigravity login is stored", "2026-09-18 12:00 UTC", "2026-09-20 11:55 UTC"},
 		},
 		{
 			name:        "a spent failing debt names the stored login",
-			state:       antigravityUsageFreshness{Attempts: antigravityRefreshAfterRunMaxAttempts, Outcome: liveProbeOutcomeCodeAssistHTTPError},
+			state:       antigravityUsageFreshness{Attempts: antigravityRefreshDebtMaxAttempts, Outcome: liveProbeOutcomeCodeAssistHTTPError},
 			wantPending: true,
 			wantNotice:  []string{"Google returned no reading", "2026-09-20 11:55 UTC"},
 		},
@@ -824,6 +939,7 @@ func TestAntigravityFreshness_StateFileCarriesNothingIdentifying(t *testing.T) {
 		"schemaVersion": true, "runFloorMs": true, "refreshOwedFloorMs": true,
 		"refreshOwedAtMs": true, "lastPaidAtMs": true, "attempts": true,
 		"gated": true, "accountFingerprint": true, "outcome": true,
+		"nextAttemptAtMs": true,
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -1062,5 +1178,84 @@ func TestAntigravityExecutablePath_FollowsTheActiveCatalogCommand(t *testing.T) 
 	})
 	if got := antigravityExecutablePath(); got == "" {
 		t.Error("antigravityExecutablePath()=\"\", want the catalog's command resolved")
+	}
+}
+
+// NextAttemptAtMs round-trips through the state file and has its own rebase
+// rule: the floors' 30 s skew ceiling would discard every rung past the first,
+// so a 30-minute rung must survive it, while a value past any rung the ladder
+// can book is a backwards clock step and resolves to "due now".
+func TestAntigravityFreshness_NextAttemptRoundTripsAndRebases(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		next time.Time
+		keep bool
+	}{
+		{"the first rung", now.Add(time.Minute), true},
+		{"the longest rung", now.Add(30 * time.Minute), true},
+		{"past the longest rung", now.Add(30*time.Minute + antigravityRunFloorLocalSkew + time.Minute), false},
+		{"a clock stepped back hours", now.Add(5 * time.Hour), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityFreshness(t)
+			helperOwedDebt(t, antigravityUsageFreshness{Attempts: 4, NextAttemptAtMs: tc.next.UnixMilli()})
+
+			raw, err := os.ReadFile(antigravityFreshnessPath())
+			if err != nil || !strings.Contains(string(raw), `"nextAttemptAtMs":`) {
+				t.Fatalf("state file %q (err=%v), want nextAttemptAtMs persisted", raw, err)
+			}
+			state, owed := antigravityPendingDebt(now)
+			if !owed || state.Attempts != 4 {
+				t.Fatalf("state=%+v owed=%v, want the debt itself untouched", state, owed)
+			}
+			want := int64(0)
+			if tc.keep {
+				want = tc.next.UnixMilli()
+			}
+			if state.NextAttemptAtMs != want {
+				t.Errorf("nextAttemptAtMs=%d, want %d", state.NextAttemptAtMs, want)
+			}
+		})
+	}
+}
+
+// The age-out moved from 30 minutes to 6 hours: a debt just inside it is still
+// owed — and still worth a read — while one just past it is retired.
+func TestAntigravityFreshness_DebtAtTheSixHourEdge(t *testing.T) {
+	now := time.Now()
+	if antigravityRefreshOwedMaxAge != 6*time.Hour {
+		t.Fatalf("age-out=%s, want 6h", antigravityRefreshOwedMaxAge)
+	}
+	for _, tc := range []struct {
+		name  string
+		owed  time.Time
+		keeps bool
+	}{
+		{"inside", now.Add(-antigravityRefreshOwedMaxAge + time.Minute), true},
+		{"past", now.Add(-antigravityRefreshOwedMaxAge - time.Minute), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cache := helperIsolateAntigravityFreshness(t)
+			helperWriteAntigravityCache(t, cache, now.Add(-24*time.Hour))
+			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+			antigravityRefreshMinInterval = time.Nanosecond
+			helperOwedDebt(t, antigravityUsageFreshness{
+				RefreshOwedFloorMs: tc.owed.UnixMilli(), RefreshOwedAtMs: tc.owed.UnixMilli(), Attempts: 1,
+			})
+
+			antigravityStartRunDebtWorker(1, false)
+			antigravityUsageRefreshWaitIdle()
+			state := helperFreshnessState(t)
+			if tc.keeps {
+				if state.RefreshOwedAtMs == 0 || calls.Load() != 1 {
+					t.Errorf("state=%+v reads=%d, want a debt inside the window still paid", state, calls.Load())
+				}
+				return
+			}
+			if state.RefreshOwedAtMs != 0 || calls.Load() != 0 {
+				t.Errorf("state=%+v reads=%d, want a debt past the window retired unpaid", state, calls.Load())
+			}
+		})
 	}
 }

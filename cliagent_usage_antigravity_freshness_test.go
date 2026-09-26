@@ -947,7 +947,7 @@ func TestAntigravityFreshness_UnpayableDebtWarnsOnTheCard(t *testing.T) {
 		SchemaVersion:      antigravityFreshnessSchema,
 		RefreshOwedFloorMs: now.Add(-time.Minute).UnixMilli(),
 		RefreshOwedAtMs:    now.Add(-time.Minute).UnixMilli(),
-		Attempts:           antigravityRefreshAfterRunMaxAttempts,
+		Attempts:           antigravityRefreshDebtMaxAttempts,
 		Outcome:            liveProbeOutcomeCodeAssistNoLogin,
 	})
 
