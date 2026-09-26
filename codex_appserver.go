@@ -145,6 +145,9 @@ type CodexAppServerSession struct {
 	StartedAt   time.Time
 	WorkspaceID string
 	UID         string
+	// codexCaptureVersion is the Codex build published when this app-server
+	// was spawned; its telemetry is stamped with it (see CLISession).
+	codexCaptureVersion string
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -598,18 +601,19 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	}
 
 	session := &CodexAppServerSession{
-		ID:            id,
-		Process:       proc,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		StartedAt:     time.Now(),
-		WorkspaceID:   workspaceID,
-		UID:           uid,
-		status:        "running",
-		done:          make(chan struct{}),
-		processExited: make(chan struct{}),
-		streamDone:    make(chan struct{}),
+		ID:                  id,
+		Process:             proc,
+		Stdin:               stdin,
+		Stdout:              stdout,
+		Stderr:              stderr,
+		StartedAt:           time.Now(),
+		WorkspaceID:         workspaceID,
+		UID:                 uid,
+		status:              "running",
+		done:                make(chan struct{}),
+		codexCaptureVersion: currentCodexUsageCaptureVersion(),
+		processExited:       make(chan struct{}),
+		streamDone:          make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -1157,7 +1161,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			// Passive utilization capture: extract token_count rate_limits
 			// into the per-account cache cliagent_usage_codex.go reads from.
 			// Side-effect only — does not alter framing or block publish.
-			captureCodexRateLimitLine(trimmed, time.Now())
+			captureCodexRateLimitLineFromProducer(trimmed, time.Now(), currentCodexAccountFingerprint(), session.codexCaptureVersion)
 			// A completed turn owes the card a reading taken after that turn
 			// started, exactly like a terminal `codex` session's terminal
 			// event. The frame shapes live in the usage layer, so this file

@@ -37,6 +37,9 @@ import (
 // (its own version argument) and codexResolveCaptureVersion (startup replay,
 // live fallback). Every publisher reads the same installed binary, so racing
 // writes are benign; the atomic only guarantees a stamp is never a torn string.
+// A long-lived child snapshots it at spawn and stamps with that pinned value
+// (captureCodexRateLimitLineFromProducer), so an upgrade published while it
+// runs is not credited to its pre-upgrade telemetry.
 var codexUsageCaptureVersion atomic.Value // string
 
 // publishCodexUsageCaptureVersion records the producing binary's version. An
@@ -137,12 +140,14 @@ func codexRunFreshnessNotice(state codexRunFreshnessState, detectedVersion strin
 // against a build that did answer. An unknown producer leaves the existing
 // stamp untouched: a capture we cannot name must not erase the evidence that
 // the previous one came from the previous binary. Reports only the advance.
-func codexStampCaptureVersion(snap *codexRateLimitSnapshot, before map[string]int64, authoritativeClear bool) bool {
+// producerVersion is the binary that produced THIS evidence — pinned by the
+// caller, since a child spawned before an upgrade still runs the old build.
+func codexStampCaptureVersion(snap *codexRateLimitSnapshot, before map[string]int64, authoritativeClear bool, producerVersion string) bool {
 	advanced := codexContributorObservationAdvanced(before, snap.Contributors)
 	if !advanced && !authoritativeClear {
 		return false
 	}
-	if version := currentCodexUsageCaptureVersion(); version != "" {
+	if version := codexNormalizeVersion(producerVersion); version != "" {
 		snap.CodexVersion = version
 	}
 	return advanced

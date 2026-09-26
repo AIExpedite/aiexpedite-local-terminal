@@ -206,3 +206,19 @@ func TestCodexCaptureDriftNotice_InheritsTheStaleGate(t *testing.T) {
 		t.Fatalf("without drift the stale-run notice stands, got %q", notice)
 	}
 }
+
+// A child spawned before an upgrade keeps running the old build: its frames
+// are stamped with the version pinned at spawn, not the newer one a gather
+// published since, so pre-upgrade telemetry can never clear capture drift.
+func TestCodexCaptureStamp_PinnedProducerOutranksThePublishedVersion(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+
+	if !captureCodexRateLimitLineFromProducer(codexLiveReadEnvelope(10, 20, now), now, currentCodexAccountFingerprint(), "codex-cli 0.149.0") {
+		t.Fatal("the reading must land")
+	}
+	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.149.0" {
+		t.Fatalf("stamp = %q, want the build pinned when the child was spawned", snap.CodexVersion)
+	}
+}

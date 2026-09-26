@@ -285,7 +285,7 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 
 		result.ArgvShapeID = shape.ID
 		stream := parseCodexSmokeStream(stdout)
-		if captureCodexSmokeRateLimits(stream.RateLimitLines, smokeFingerprint) {
+		if captureCodexSmokeRateLimits(stream.RateLimitLines, smokeFingerprint, version) {
 			usageCaptured = true
 		}
 		category, diagnostic, matched := classifyCodexSmokeRun(timedOut, stream, stderr, lastMessage, runErr, marker)
@@ -335,17 +335,19 @@ func readCodexSmokeLastMessage(path string) []byte {
 // captureCodexSmokeRateLimits hands the rate-limit frames one attempt printed
 // to the ordinary capture path, pinned to the account the smoke started
 // under — and only while that account is still the signed-in one, checked
-// BEFORE any write: a reading that cannot be attributed must never reach the
-// cache. Reports whether any frame landed a numeric window (or an
-// authoritative clear).
-func captureCodexSmokeRateLimits(lines []string, fingerprint string) bool {
-	if len(lines) == 0 || currentCodexAccountFingerprint() != fingerprint {
-		return false
-	}
+// BEFORE EVERY write: a reading that cannot be attributed must never reach the
+// cache, and a swap part-way through stops the remaining frames rather than
+// letting them rescope the new account's cache back to the old one. Stamped
+// with the smoke's own binary version. Reports whether any frame landed a
+// numeric window (or an authoritative clear).
+func captureCodexSmokeRateLimits(lines []string, fingerprint, version string) bool {
 	captured := false
 	now := time.Now()
 	for _, line := range lines {
-		if captureCodexRateLimitLineForAccount(line, now, fingerprint) {
+		if currentCodexAccountFingerprint() != fingerprint {
+			break
+		}
+		if captureCodexRateLimitLineFromProducer(line, now, fingerprint, version) {
 			captured = true
 		}
 	}

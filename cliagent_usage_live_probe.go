@@ -298,7 +298,9 @@ func codexLiveRateLimitRead(ctx context.Context, codexPath, wantFingerprint stri
 	if wantFingerprint != "" && currentCodexAccountFingerprint() != wantFingerprint {
 		return liveProbeOutcomeAccountChanged
 	}
-	ch := codexLiveReadGroup.DoChan("codex", func() (any, error) {
+	// Keyed by the signed-in account: a caller for a newly signed-in account
+	// must not join (and inherit the outcome of) a flight probing the old one.
+	ch := codexLiveReadGroup.DoChan("codex:"+currentCodexAccountFingerprint(), func() (any, error) {
 		if codexLiveRateLimitCooldownRemaining(time.Now()) > 0 {
 			return liveProbeOutcomeCooldown, nil
 		}

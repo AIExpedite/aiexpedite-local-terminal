@@ -1079,3 +1079,38 @@ func TestCodexLiveRateLimitRead_SharesCooldownAndFlightWithTheFallback(t *testin
 		t.Fatalf("probes = %d, want none spent inside the cooldown", got)
 	}
 }
+
+// The single flight is per account: a read for a newly signed-in account never
+// joins a flight still probing the previous one and inheriting its outcome.
+func TestCodexLiveRateLimitRead_FlightIsScopedToTheAccount(t *testing.T) {
+	stubLiveProbes(t)
+	isolateCodexCache(t)
+	home := os.Getenv("CODEX_HOME")
+	helperCodexAuthAt(t, home, "before@example.com", time.Now().Add(-time.Hour))
+	var calls int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	probeCodexRateLimitsLiveFn = func(context.Context, string, string) string {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			once.Do(func() { close(entered) })
+			<-release
+			return liveProbeOutcomeAccountChanged
+		}
+		return liveProbeOutcomeOK
+	}
+
+	oldDone := make(chan string, 1)
+	go func() { oldDone <- codexLiveRateLimitRead(context.Background(), "codex", "") }()
+	<-entered
+	helperCodexAuthAt(t, home, "after@example.com", time.Now())
+	if got := codexLiveRateLimitRead(context.Background(), "codex", currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+		t.Fatalf("new account's read = %q, want its own probe's outcome", got)
+	}
+	close(release)
+	if got := <-oldDone; got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("old flight = %q", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("probes = %d, want one per account", got)
+	}
+}

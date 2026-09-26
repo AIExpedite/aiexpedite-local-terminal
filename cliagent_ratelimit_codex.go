@@ -1140,6 +1140,15 @@ func captureCodexRateLimitLine(line string, now time.Time) bool {
 // stale or reset-only frame. The session paths ignore it; the smoke settles
 // its run on it.
 func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint string) bool {
+	return captureCodexRateLimitLineFromProducer(line, now, fingerprint, currentCodexUsageCaptureVersion())
+}
+
+// captureCodexRateLimitLineFromProducer is captureCodexRateLimitLineForAccount
+// with the producing binary's version named by the caller. A long-lived child
+// (a managed session or app-server) outlives a Codex upgrade, so its frames
+// must carry the version pinned when it was spawned, not whatever build a
+// later gather published; "" (unknown producer) leaves the stamp untouched.
+func captureCodexRateLimitLineFromProducer(line string, now time.Time, fingerprint, producerVersion string) bool {
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
 		return false
@@ -1171,7 +1180,7 @@ func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint
 	}
 	committed, advanced := mergeCodexRateLimitCacheObserved(
 		context.Background(), codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, nil, "", true, extractCodexLimitNames(raw))
+		now, fingerprint, nil, "", true, extractCodexLimitNames(raw), producerVersion)
 	return advanced || (committed && (len(clears) > 0 || emptyAuthoritative))
 }
 
@@ -1481,14 +1490,15 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 	limitNames map[string]string,
 ) bool {
 	committed, _ := mergeCodexRateLimitCacheObserved(ctx, path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
-		now, fingerprint, rolloutHighWater, rolloutAccountBase, waitForLocks, limitNames)
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, waitForLocks, limitNames, currentCodexUsageCaptureVersion())
 	return committed
 }
 
 // mergeCodexRateLimitCacheObserved is the merge transaction itself. advanced
 // reports whether the committed write moved a contributor observation forward
 // — the one moment the snapshot's CodexVersion stamp is (re)written, so live
-// capture, the rollout scan and the live probe all stamp identically.
+// capture, the rollout scan and the live probe all stamp identically, each
+// with the producerVersion of the binary that produced the evidence.
 func mergeCodexRateLimitCacheObserved(
 	ctx context.Context,
 	path string,
@@ -1503,6 +1513,7 @@ func mergeCodexRateLimitCacheObserved(
 	rolloutAccountBase string,
 	waitForLocks bool,
 	limitNames map[string]string,
+	producerVersion string,
 ) (committed, advanced bool) {
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false, false
@@ -1525,7 +1536,7 @@ func mergeCodexRateLimitCacheObserved(
 		// mistaken for a fresh observation and restamped.
 		before := codexContributorObservationTimes(codexContributorsFromSnapshot(*snap))
 		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
-		advanced = codexStampCaptureVersion(snap, before, fullSnapshot && (len(clears) > 0 || emptyAuthoritative))
+		advanced = codexStampCaptureVersion(snap, before, fullSnapshot && (len(clears) > 0 || emptyAuthoritative), producerVersion)
 		return true
 	})
 	return committed, committed && advanced
