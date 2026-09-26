@@ -1279,6 +1279,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
 		lockedHeldMs := int64(0)
 		lockedObserved := time.Time{}
+		lockedHeld := false
 		// Both values are sampled on EVERY path, under the SAME lock the charge
 		// takes and BEFORE the charge decides anything, because the unlocked read
 		// above is necessarily older than this write:
@@ -1298,9 +1299,35 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					buckets:    snap.Buckets,
 					probedAtMs: snap.LastProbeObservedAtMs,
 				}, now)
+				// The hold the unlocked blockedFromIssuing pre-check could not see.
+				// Another channel may have recorded a 429 for this account between
+				// that check and this lock, and a charge on top of it buys a request
+				// begin() is bound to refuse once the hold is adopted five lines
+				// below — the same uncharged-refusal rule the pre-check applies,
+				// decided on the freshest evidence rather than the stale read.
+				//
+				// A hold stamped implausibly far ahead is NOT a reason to refuse:
+				// the skew ceiling discards it, so it never reaches the gate and
+				// never blocks anything. Same bound as the adoption below.
+				if snap.HeldUntilMs > 0 {
+					if locked := time.UnixMilli(snap.HeldUntilMs); locked.After(now) &&
+						!locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+						lockedHeld = true
+						return false
+					}
+				}
 				return charge(snap)
 			})
 		claudeUsageProbeAfterSeedCharge()
+		if lockedHeld {
+			// Declined for a reason that can change without the snapshot changing,
+			// so the latch is left unclaimed exactly as the pre-check leaves it:
+			// the gather after the hold expires must reach the adoption again.
+			// `charged` is false, so the debt is un-adopted by the branch below and
+			// its counter stays where the next start can still spend it.
+			claudeUsageProbeSeedBlocked()
+			latch = false
+		}
 		if lockedHeldMs > 0 {
 			if locked := time.UnixMilli(lockedHeldMs); !locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
 				// Monotonic, like the adoption above: this only ever raises the hold.

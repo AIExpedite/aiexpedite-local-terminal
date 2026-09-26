@@ -2343,6 +2343,69 @@ func TestClaudeUsageProbeGate_CacheSeedReportsTheReadingThatRefusedItsCharge(t *
 	}
 }
 
+// A 429 another channel persists between the unlocked blockedFromIssuing
+// pre-check and the locked charge is evidence the charge must obey: without it
+// the attempt is spent, the hold is then adopted, and begin() refuses the owing
+// probe — so two such gathers reach the cap and the next start retires a debt
+// the endpoint was never asked about. Declined uncharged and unlatched, exactly
+// as a hold the pre-check could see.
+func TestClaudeUsageProbeGate_CacheSeedSkipsTheChargeWhenALockedHoldBlocksIt(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	blocked := 0
+	originalBlocked := claudeUsageProbeSeedBlocked
+	t.Cleanup(func() { claudeUsageProbeSeedBlocked = originalBlocked })
+	claudeUsageProbeSeedBlocked = func() { blocked++ }
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	held := now.Add(2 * time.Minute)
+	originalHook := claudeUsageProbeBeforeSeedCharge
+	t.Cleanup(func() { claudeUsageProbeBeforeSeedCharge = originalHook })
+	var once sync.Once
+	claudeUsageProbeBeforeSeedCharge = func() {
+		once.Do(func() { claudeHoldUsageProbe(fp, held) })
+	}
+
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero inside the hold that landed in the gap", got)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked adoptions=%d, want 1", blocked)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("adopted owed=%v inside a hold begin() is bound to refuse", got)
+	}
+	owed, attempts, gotHeld := claudePersistedProbeStateFor(fp)
+	if owed.UnixMilli() != runEnded.UnixMilli() || attempts != 0 || gotHeld.UnixMilli() != held.UnixMilli() {
+		t.Errorf("persisted state owed=%v attempts=%d held=%v, want the debt left payable at 0 attempts", owed, attempts, gotHeld)
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Errorf("request count=%d, want 0 — the seed issues nothing itself", atomic.LoadInt64(calls))
+	}
+	// The hold reached the gate even though the charge refused, so the `owing`
+	// branch of this very gather cannot spend an uncharged request either.
+	if !claudeUsageProbe.blockedFromIssuing(now) {
+		t.Error("the hold observed under the charge's lock was not adopted onto the gate")
+	}
+
+	// Unlatched: the snapshot's hold is the only thing that changed, so the
+	// gather after it expires must still reach the adoption.
+	if got := adoptedDebtOnceTheHoldExpires(t, fp, held, latest); got.UnixMilli() != runEnded.UnixMilli() {
+		t.Errorf("adopted owed=%v once the hold expired, want the persisted debt %v", got, runEnded)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
+		t.Errorf("RefreshOwedAttempts=%d, want 1 — charged by the adoption that can actually issue", attempts)
+	}
+}
+
 // The latch must be keyed to the snapshot the charge WROTE, stat'd under the
 // charge's own lock. An off-lock stat can describe another process's newer file
 // while the adopted state describes the previous one: the latch then matches a
