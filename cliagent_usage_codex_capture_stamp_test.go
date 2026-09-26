@@ -430,6 +430,39 @@ func TestProbeRacingABinaryReplacement_LeavesNoStaleStamp(t *testing.T) {
 	}
 }
 
+// The startup replay and the live fallback resolve the version outside a
+// gather, so they must pass the same identity check: a probe that raced a
+// binary replacement hands its stale reading back uncached, and publishing it
+// unchecked would roll the stamp back to a build that is gone.
+func TestCodexResolveCaptureVersion_RefusesAStaleReading(t *testing.T) {
+	t.Cleanup(resetVersionProbeCache)
+	resetVersionProbeCache()
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("binary-v2"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.150.0" })
+
+	original := codexInstalledVersion
+	t.Cleanup(func() { codexInstalledVersion = original })
+
+	codexInstalledVersion = func() (string, string) { return path, "codex-cli 0.149.0" }
+	codexResolveCaptureVersion()
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.150.0" {
+		t.Fatalf("stale resolved version rolled the stamp back to %q", got)
+	}
+
+	// A reading the cache holds for the binary as it is now still publishes.
+	setCodexCaptureVersion(t, "")
+	codexInstalledVersion = func() (string, string) { return path, "codex-cli 0.150.0" }
+	codexResolveCaptureVersion()
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.150.0" {
+		t.Fatalf("resolved installed version = %q, want it published", got)
+	}
+}
+
 // The live probe's child is a long-lived process like a managed session: its
 // reading is stamped with the build launched, not with whatever a concurrent
 // gather published while the request was in flight.

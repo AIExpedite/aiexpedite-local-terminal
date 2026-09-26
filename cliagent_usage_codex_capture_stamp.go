@@ -30,6 +30,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -74,7 +75,16 @@ func publishCodexUsageCaptureVersion(version string) {
 // unchallenged and roll the process-global stamp back. Refusing leaves the
 // existing stamp in place, which is what an unnameable capture is supposed to
 // do, and the next pass re-probes and publishes the build that is really there.
+//
+// The identity check and the store happen under one lock. Checked and stored
+// separately, a caller could pass the check, stall while an upgrade lands and
+// a newer pass publishes the replacement build, then store its now-stale
+// version anyway. Under the lock a publisher either stores before the newer
+// one (which then overwrites it) or checks after it, when the cache already
+// names the replacement and the stale version is refused.
 func publishCodexUsageCaptureVersionFrom(path, version string) {
+	codexCaptureVersionPublishMu.Lock()
+	defer codexCaptureVersionPublishMu.Unlock()
 	if path == "" {
 		publishCodexUsageCaptureVersion(version)
 		return
@@ -85,6 +95,11 @@ func publishCodexUsageCaptureVersionFrom(path, version string) {
 	}
 	publishCodexUsageCaptureVersion(version)
 }
+
+// codexCaptureVersionPublishMu makes publishCodexUsageCaptureVersionFrom's
+// identity check and store one step. Taken before versionProbeMu (inside
+// peekCachedProbeVersion), never the other way round.
+var codexCaptureVersionPublishMu sync.Mutex
 
 // codexVersionMaxBytes bounds a `--version` first line before it is persisted,
 // compared or shown. Only a build printing something unexpectedly long is
@@ -107,14 +122,15 @@ func currentCodexUsageCaptureVersion() string {
 
 // codexInstalledVersion reads the installed Codex binary's version through the
 // same (path, mtime, size)-keyed cache the gather and the smoke use, so on any
-// process that has gathered since the binary changed it spawns nothing. A var
-// so tests never reach a real install.
-var codexInstalledVersion = func() string {
-	path := resolveCodexSmokePath()
+// process that has gathered since the binary changed it spawns nothing. It
+// returns the path it probed so the caller can validate the reading against
+// that binary's identity. A var so tests never reach a real install.
+var codexInstalledVersion = func() (path, version string) {
+	path = resolveCodexSmokePath()
 	if path == "" {
-		return ""
+		return "", ""
 	}
-	return codexProbeVersion(path)
+	return path, codexProbeVersion(path)
 }
 
 // codexResolveCaptureVersion publishes the installed binary's version for a
@@ -122,8 +138,12 @@ var codexInstalledVersion = func() string {
 // runs at startup before either, so without this its reconcile and live
 // fallback would stamp nothing, leave the pre-upgrade stamp in place, and have
 // the first gather raise capture drift against a reading just refreshed.
+//
+// It publishes through the same identity check as a gather: a probe that
+// raced a binary replacement hands its stale reading back uncached, and
+// publishing it unchecked would roll the stamp back to a build that is gone.
 func codexResolveCaptureVersion() {
-	publishCodexUsageCaptureVersion(codexInstalledVersion())
+	publishCodexUsageCaptureVersionFrom(codexInstalledVersion())
 }
 
 // codexCaptureVersionForLaunch is the version a managed child launched from

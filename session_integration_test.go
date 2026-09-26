@@ -105,7 +105,7 @@ func TestMain(m *testing.M) {
 	// stub it explicitly. The capture version would likewise `--version` a
 	// real install, so it reads as unknown unless a test names one.
 	codexLiveUsageFallbackRead = func(context.Context, string) string { return liveProbeOutcomeSpawnFailed }
-	codexInstalledVersion = func() string { return "" }
+	codexInstalledVersion = func() (string, string) { return "", "" }
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through

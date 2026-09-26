@@ -419,7 +419,7 @@ func TestCodexUpgrade_StartupReplayStampsTheInstalledBuild(t *testing.T) {
 		codexOweRunRefresh(snap, runStart, now.Add(-time.Minute))
 	})
 	original := codexInstalledVersion
-	codexInstalledVersion = func() string { return codexPostUpdateVersion }
+	codexInstalledVersion = func() (string, string) { return "", codexPostUpdateVersion }
 	t.Cleanup(func() { codexInstalledVersion = original })
 	stubCodexFallbackRead(t, capturingFallbackRead)
 
