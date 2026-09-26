@@ -131,17 +131,3 @@ func assertClaudeSnapshotStringsRedacted(t *testing.T, path string, v any) {
 		}
 	}
 }
-
-// waitForClaudeProbeReading polls until the probe has persisted a reading. The
-// trailing probe is asynchronous by design, so polling is the only honest way
-// to observe it.
-func waitForClaudeProbeReading(t *testing.T, cache string, within time.Duration) {
-	t.Helper()
-	for deadline := time.Now().Add(within); time.Now().Before(deadline); {
-		if snap, ok := loadClaudeRateLimitSnapshot(cache); ok && snap.LastProbeObservedAtMs != 0 {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("the smoke's trailing probe never persisted a reading")
-}
