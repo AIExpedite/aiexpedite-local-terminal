@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"sync"
@@ -1341,12 +1342,13 @@ func TestClaudeUsageProbeGate_CacheSeedRetriesAfterAnUnknownAccount(t *testing.T
 	}
 }
 
-// The attempt charge pays for a turn at the endpoint. An admitted attempt that
-// returns because the credential store handed back no token — a transient
-// Keychain timeout on macOS — asked nothing and learned nothing, so the charge
-// bought nothing: two such starts would otherwise exhaust the cap and retire a
-// debt that was never once put to the endpoint, leaving the pre-run card stale.
-func TestPayOwedClaudeUsageRefresh_RefundsAChargeWhenTheCredentialStoreYieldsNoToken(t *testing.T) {
+// The attempt charge pays for a turn at the endpoint. A credential store that
+// hands back no token — a transient Keychain timeout on macOS — means no request
+// can be made, so the charge is DECLINED outright: the identity is resolved once
+// at the top of the replay, so an empty token is known before anything is spent.
+// Two such starts would otherwise exhaust the cap and retire a debt that was
+// never once put to the endpoint, leaving the pre-run card stale.
+func TestPayOwedClaudeUsageRefresh_DeclinesTheChargeWhenTheCredentialStoreYieldsNoToken(t *testing.T) {
 	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
 	now := time.Now()
 	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
@@ -1369,7 +1371,51 @@ func TestPayOwedClaudeUsageRefresh_RefundsAChargeWhenTheCredentialStoreYieldsNoT
 		t.Fatalf("the debt must stand for the next start: %+v", snap)
 	}
 	if snap.RefreshOwedAttempts != 0 {
-		t.Fatalf("RefreshOwedAttempts=%d, want 0 — a charge that bought no request is refunded", snap.RefreshOwedAttempts)
+		t.Fatalf("RefreshOwedAttempts=%d, want 0 — a turn that cannot be asked for is never charged", snap.RefreshOwedAttempts)
+	}
+}
+
+// The replay resolves token and fingerprint TOGETHER, once, and issues with that
+// same identity. A `/login` landing between the fingerprint read and the request
+// must not let a debt loaded and charged under account A go out carrying account
+// B's token: the merge that carried B's reading would drop A's buckets as an
+// account transition — B's quota spent on A's run, and A's readings erased.
+//
+// Driven through claudeUsageProbeAttemptIssuedAs, which is the binding itself:
+// the on-disk credential is swapped to another token before the attempt, and the
+// request must still carry the pinned one and persist under the pinned scope.
+func TestClaudeUsageProbeAttemptIssuedAs_IssuesWithThePinnedIdentity(t *testing.T) {
+	const pinnedToken = "sk-ant-oat-pinned"
+	const pinnedFingerprint = "account-a"
+
+	now := time.Now()
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+pinnedToken {
+			t.Errorf("Authorization=%q, want the identity the caller pinned", got)
+		}
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":51,"resets_at":%q,"status":"allowed"}`,
+				now.Add(time.Hour).Format(time.RFC3339)),
+		}))
+	})
+
+	// What a `/login` to another account leaves behind after the caller has
+	// already resolved its identity.
+	writeClaudeProbeCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "sk-ant-oat-other-account")
+
+	identity := claudeUsageProbeIdentity{token: pinnedToken, fingerprint: pinnedFingerprint}
+	done, issued := claudeUsageProbeAttemptIssuedAs(now.Add(-time.Minute), func() claudeUsageProbeIdentity {
+		return identity
+	})
+	if !done || !issued {
+		t.Fatalf("done=%v issued=%v, want the pinned attempt to spend its turn", done, issued)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.AccountFingerprint != pinnedFingerprint {
+		t.Fatalf("AccountFingerprint=%q, want the reading scoped to the pinned identity %q",
+			snap.AccountFingerprint, pinnedFingerprint)
 	}
 }
 

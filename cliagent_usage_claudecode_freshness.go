@@ -458,7 +458,27 @@ func payOwedClaudeUsageRefresh() {
 // time.
 func payOwedClaudeUsageRefreshAt(now time.Time) {
 	path := claudeRateLimitCachePath()
-	fingerprint := currentClaudeAccountFingerprint()
+
+	// ONE credential read, resolved ONCE, for both halves of this replay: the
+	// fingerprint every read and write below is scoped by, and the bearer token
+	// the request will carry. They must name the SAME identity.
+	//
+	// Deriving the fingerprint separately (currentClaudeAccountFingerprint) and
+	// letting the attempt re-resolve the credential at issue time leaves a window
+	// — this runs on a goroutine that reads the credential store, the cache, and
+	// then the network — in which a `/login` to another account lands between the
+	// two reads. The debt would be loaded and CHARGED under account A while the
+	// request went out with account B's token, and the merge carrying B's reading
+	// would drop A's buckets as an account transition: B's quota spent on A's
+	// run, and A's readings erased. Pinning the identity also spares the
+	// duplicate credential read, which on a default macOS config shells out to
+	// `security` under a timeout — see claudeUsageProbeIdentity.
+	//
+	// An account that flips AFTER this point is refused where it already was: the
+	// snapshot comparison below, and mutateClaudeRateLimitSnapshot's own
+	// fingerprint check under the cache lock.
+	identity := claudeUsageProbeStoredIdentity()
+	fingerprint := identity.fingerprint
 
 	// Opted out (`disable_claude_usage_probe`): the gate is never armed, so
 	// nothing in this process or any later one can pay a debt. A debt written
@@ -541,11 +561,19 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// RefreshOwedAttempts and undo the cap.
 	claudeUsageProbe.recordOwed(owed)
 
-	// Offline, or a live hold: return AHEAD of the charge and leave the debt and
-	// its counter exactly as found, so a device coming back online inside the age
+	// Offline, a live hold, or no readable token: return AHEAD of the charge and
+	// leave the debt and its counter exactly as found, so a device coming back
+	// online — or one whose Keychain answers on the next start — inside the age
 	// window can still pay. Charging here would spend the cap on restarts that
 	// never asked the endpoint anything.
-	if IsOffline() || (!held.IsZero() && now.Before(held)) {
+	//
+	// The empty token is decided HERE, from the identity pinned at the top,
+	// rather than only refunded afterwards: the attempt would reach
+	// probeClaudeUsageAdmitted's empty-token exit and return issued=false without
+	// asking anything, and a charge-then-refund pair is two best-effort cache
+	// writes where a transiently unreadable credential store needs none. Same
+	// rule the gather's seed charge already applies before it charges.
+	if IsOffline() || (!held.IsZero() && now.Before(held)) || identity.token == "" {
 		return
 	}
 
@@ -567,16 +595,18 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 		return
 	}
 
-	// ONE bounded attempt, through the ordinary single-flight probe. Whatever it
-	// finds (or fails to find) is left to the ordinary gather/refresh bounds; the
-	// merge that carries a covering reading settles the debt in its own write.
-	if done, issued := claudeUsageProbeAttemptIssued(owed); done && issued {
+	// ONE bounded attempt, through the ordinary single-flight probe, issued with
+	// the identity this replay charged under — never a freshly resolved one.
+	// Whatever it finds (or fails to find) is left to the ordinary gather/refresh
+	// bounds; the merge that carries a covering reading settles the debt in its
+	// own write.
+	if done, issued := claudeUsageProbeAttemptIssuedAs(owed, func() claudeUsageProbeIdentity { return identity }); done && issued {
 		return
 	}
 	// Nothing left this process, so the charge above bought nothing: either the
 	// gate never admitted the attempt — a concurrent gather held the single-flight
-	// slot — or it was admitted and returned before asking anything, which is the
-	// credential store failing to hand back a token (a Keychain timeout on macOS).
+	// slot — or it was admitted and returned before asking anything, which with a
+	// pinned non-empty token means a rejected endpoint override.
 	// Refund it, or two unlucky starts would retire a debt that was never once put
 	// to the endpoint, leaving exactly the stale card this path exists to clear.
 	// Safe in the crash direction: a crash between the charge and the refund keeps

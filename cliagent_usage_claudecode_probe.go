@@ -2556,6 +2556,23 @@ func claudeUsageProbeAttempt(baseline time.Time) bool {
 // admitted but returned before doing either (an unreadable credential store), so
 // a caller that charged for the turn bought nothing and must refund it.
 func claudeUsageProbeAttemptIssued(baseline time.Time) (done, issued bool) {
+	// The trailing probe has no credential in hand, so it reads the stored one.
+	return claudeUsageProbeAttemptIssuedAs(baseline, claudeUsageProbeStoredIdentity)
+}
+
+// claudeUsageProbeAttemptIssuedAs is claudeUsageProbeAttemptIssued with the
+// identity supplied by the caller.
+//
+// It exists for the startup replay (payOwedClaudeUsageRefreshAt), which has
+// already resolved the credential in order to scope the debt it loaded and
+// charged. Re-resolving it here would let a `/login` landing in that gap issue
+// the request under a DIFFERENT account than the one charged — whose merge then
+// drops the charged account's buckets as an account transition. Pinning it also
+// avoids a second credential read; see claudeUsageProbeIdentity.
+func claudeUsageProbeAttemptIssuedAs(
+	baseline time.Time,
+	resolveIdentity func() claudeUsageProbeIdentity,
+) (done, issued bool) {
 	// The WHOLE-probe bound, not the request bound. This context is a root the
 	// trailing probe fabricates for itself — there is no gather deadline above it
 	// to respect — and probeClaudeUsage derives BOTH its request timeout and its
@@ -2572,7 +2589,7 @@ func claudeUsageProbeAttemptIssued(baseline time.Time) (done, issued bool) {
 	// forced=false: this is the background trailing probe. It must never spend a
 	// bypass a concurrent refresh is holding — that theft is what leaves the
 	// refresh signing a pre-probe cache.
-	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline, false)
+	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, time.Now(), resolveIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
 	// Same rule as the gather path: a write that left the run's window owned by
 	// an older reading has not paid this debt, even though it succeeded.
