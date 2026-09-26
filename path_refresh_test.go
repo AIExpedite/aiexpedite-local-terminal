@@ -116,13 +116,23 @@ func TestUnixRefreshedPath(t *testing.T) {
 }
 
 func TestUnixPathCandidates(t *testing.T) {
-	got := unixPathCandidates("/home/me", "/home/me/.npm-global")
+	got := unixPathCandidates("darwin", "/home/me", "/home/me/.npm-global")
 	want := []string{"/opt/homebrew/bin", "/usr/local/bin",
 		filepath.Join("/home/me", ".local", "bin"), filepath.Join("/home/me/.npm-global", "bin")}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %q want %q", got, want)
+		t.Fatalf("darwin: got %q want %q", got, want)
 	}
-	if got := unixPathCandidates("", ""); !reflect.DeepEqual(got, []string{"/opt/homebrew/bin", "/usr/local/bin"}) {
+	// Linux adds Homebrew-on-Linux's system and per-user prefixes.
+	got = unixPathCandidates("linux", "/home/me", "")
+	want = []string{"/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin",
+		filepath.Join("/home/me", ".linuxbrew", "bin"), filepath.Join("/home/me", ".local", "bin")}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("linux: got %q want %q", got, want)
+	}
+	if got := unixPathCandidates("linux", "", ""); !reflect.DeepEqual(got, []string{"/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin"}) {
+		t.Fatalf("linux no home: got %q", got)
+	}
+	if got := unixPathCandidates("darwin", "", ""); !reflect.DeepEqual(got, []string{"/opt/homebrew/bin", "/usr/local/bin"}) {
 		t.Fatalf("no home: got %q", got)
 	}
 }

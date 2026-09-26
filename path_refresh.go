@@ -144,10 +144,19 @@ func unixRefreshedPath(current string, candidates []string, dirExists func(strin
 
 // unixPathCandidates lists the common per-machine and per-user bin directories
 // macOS / Linux installers write to, most specific install location first.
+// On Linux that includes Homebrew-on-Linux's default prefix
+// (/home/linuxbrew/.linuxbrew) and its per-user alternative (~/.linuxbrew),
+// which `brew install` writes to but a service-started agent never has on PATH.
 // npmPrefix is the npm global prefix ("" when unknown); its bin directory is
 // where `npm install -g` puts CLIs such as codex and firebase.
-func unixPathCandidates(home, npmPrefix string) []string {
+func unixPathCandidates(goos, home, npmPrefix string) []string {
 	out := []string{"/opt/homebrew/bin", "/usr/local/bin"}
+	if goos == "linux" {
+		out = append(out, "/home/linuxbrew/.linuxbrew/bin")
+		if home != "" {
+			out = append(out, filepath.Join(home, ".linuxbrew", "bin"))
+		}
+	}
 	if home != "" {
 		out = append(out, filepath.Join(home, ".local", "bin"))
 	}
@@ -233,7 +242,7 @@ func refreshCommandPath() {
 	} else {
 		home, _ := os.UserHomeDir()
 		prefix := npmGlobalPrefix(os.Getenv, home, os.ReadFile)
-		next = unixRefreshedPath(current, unixPathCandidates(home, prefix), isExistingDir)
+		next = unixRefreshedPath(current, unixPathCandidates(runtime.GOOS, home, prefix), isExistingDir)
 	}
 	if next != "" && next != current {
 		_ = os.Setenv("PATH", next)

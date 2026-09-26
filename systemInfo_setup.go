@@ -301,38 +301,49 @@ func applySetupExtras(info *MachineInfo, x setupExtras) {
 
 // applyNvidiaVRAM corrects NVIDIA adapters' VRAM with nvidia-smi's readings.
 // WMI's AdapterRAM is a uint32, so every card with more than 4 GB reads ~4 GB;
-// nvidia-smi reports the real total. Each NVIDIA WMI entry takes the nvidia-smi
-// entry with the same name, else the next unused one in order. nvidia-smi
-// entries no WMI entry claimed are appended (WMI failed or missed the card).
+// nvidia-smi reports the real total. Matching is two passes, so an earlier
+// adapter can never take a later adapter's exact row: first every NVIDIA WMI
+// entry takes the nvidia-smi row with the same name, then the adapters still
+// unmatched take the remaining rows in order. nvidia-smi rows no WMI entry
+// claimed are appended (WMI failed or missed the card).
 func applyNvidiaVRAM(wmi, nvidia []gpuInfo) []gpuInfo {
 	if len(nvidia) == 0 {
 		return wmi
 	}
 	used := make([]bool, len(nvidia))
+	match := make([]int, len(wmi)) // WMI index -> nvidia-smi index, -1 = none
 	out := make([]gpuInfo, len(wmi))
 	copy(out, wmi)
-	claim := func(i int) (gpuInfo, bool) {
-		name := strings.ToLower(strings.TrimSpace(out[i].Name))
-		for j, n := range nvidia {
-			if !used[j] && strings.ToLower(strings.TrimSpace(n.Name)) == name {
-				used[j] = true
-				return n, true
-			}
-		}
-		for j, n := range nvidia {
-			if !used[j] {
-				used[j] = true
-				return n, true
-			}
-		}
-		return gpuInfo{}, false
-	}
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+	// Pass 1: exact names, across all adapters.
 	for i := range out {
+		match[i] = -1
 		if out[i].Vendor != "nvidia" {
 			continue
 		}
-		if n, ok := claim(i); ok && n.MemoryGB > 0 {
-			out[i].MemoryGB = n.MemoryGB
+		for j, n := range nvidia {
+			if !used[j] && norm(n.Name) == norm(out[i].Name) {
+				used[j], match[i] = true, j
+				break
+			}
+		}
+	}
+	// Pass 2: the rest, in order.
+	for i := range out {
+		if out[i].Vendor != "nvidia" || match[i] >= 0 {
+			continue
+		}
+		for j := range nvidia {
+			if !used[j] {
+				used[j], match[i] = true, j
+				break
+			}
+		}
+	}
+	for i, j := range match {
+		if j >= 0 && nvidia[j].MemoryGB > 0 {
+			out[i].MemoryGB = nvidia[j].MemoryGB
 		}
 	}
 	for j, n := range nvidia {

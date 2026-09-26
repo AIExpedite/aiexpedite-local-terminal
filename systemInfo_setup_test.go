@@ -171,6 +171,21 @@ func TestApplyNvidiaVRAM(t *testing.T) {
 	if len(got) != 2 || got[0].MemoryGB != 4 || got[1].Name != "Tesla T4" {
 		t.Fatalf("%+v", got)
 	}
+	// Exact names are matched across ALL adapters before any order fallback:
+	// the first adapter (no exact row) must not consume the second adapter's
+	// exact row just because it comes first.
+	got = applyNvidiaVRAM(
+		[]gpuInfo{
+			{Name: "NVIDIA GeForce RTX 3060 Laptop GPU", Vendor: "nvidia", MemoryGB: 4},
+			{Name: "NVIDIA RTX A6000", Vendor: "nvidia", MemoryGB: 4},
+		},
+		[]gpuInfo{
+			{Name: "NVIDIA RTX A6000", Vendor: "nvidia", MemoryGB: 48},
+			{Name: "NVIDIA GeForce RTX 3060", Vendor: "nvidia", MemoryGB: 6},
+		})
+	if len(got) != 2 || got[0].MemoryGB != 6 || got[1].MemoryGB != 48 {
+		t.Fatalf("exact-first matching: %+v", got)
+	}
 	if got := applyNvidiaVRAM(wmi, nil); !reflect.DeepEqual(got, wmi) {
 		t.Fatal("no nvidia-smi rows leaves WMI untouched")
 	}
