@@ -81,7 +81,7 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		cursor = codexRolloutCursorBelowFloor(cursor, floor)
 	}
 	latestCachedObservation := codexLatestContributorObservation(codexContributorsForAccount(currentFingerprint))
-	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor, latestCachedObservation)
+	contribs, limit, latestObservation, highWater, ok, producer := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, latestCachedObservation)
 	// Authentication can change while filesystem I/O is in progress. Never let
 	// an old-account scan clear or overwrite a live capture already scoped to the
 	// newly active account; the next refresh will reconcile under that account.
@@ -90,10 +90,13 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 	}
 	if ok || highWater != nil {
 		// The forced path passes ctx so its bounded lock wait is clamped to the
-		// gather deadline it is running inside.
-		mergeCodexRateLimitCachePerLimitProgressWithLock(
+		// gather deadline it is running inside. The stamp names the installed
+		// build only when every merged rollout says that build wrote it; any
+		// other provenance merges unstamped and leaves the existing stamp alone.
+		mergeCodexRateLimitCacheObserved(
 			ctx, codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base, forced, nil,
+			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()),
 		)
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
@@ -1798,8 +1801,21 @@ func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now ti
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
 func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool) {
+	contribs, limit, latest, highWater, ok, _ := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, priorObservations...)
+	return contribs, limit, latest, highWater, ok
+}
+
+// codexRolloutFallbackBucketsWithProducer is codexRolloutFallbackBuckets plus
+// the build that produced the returned contributors: the header `cli_version`
+// shared by every winning contributor's rollout, or "" when any winner's file
+// named no build or the winners came from different builds. Provenance is per
+// FILE, not the installed binary's: after an upgrade resets the cursor, older
+// rollouts — and ones a pre-upgrade process is still appending to — are
+// rescanned, and crediting their telemetry to the new build would clear
+// capture drift that is still real.
+func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool, string) {
 	if base == "" {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
 	}
 	// auth.json mtime is the account-login watermark (zero = missing → guard
 	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
@@ -1823,14 +1839,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// it; once the clock or file timestamp is corrected, the unchanged rollout
 	// remains eligible for a retry.
 	if authMod.After(now) {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
 	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
 	cancelDiscovery()
 	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
 	}
 	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
 	if len(eligibleCandidates) == 0 {
@@ -1852,9 +1868,9 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 					codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now),
 				)
 			}
-			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false
+			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false, ""
 		}
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -1885,9 +1901,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// distinct reading. Newest-first iteration means the first-seen reading of a
 	// given (identity, limit) wins.
 	type rolloutContribution struct {
-		slot    string
-		limitID string
-		bucket  codexRateLimitBucket
+		slot     string
+		limitID  string
+		bucket   codexRateLimitBucket
+		producer string
 	}
 	winners := map[string]rolloutContribution{}
 	runFloor, _ := codexForcedReconcileFrom(ctx)
@@ -1947,7 +1964,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 		attempted = append(attempted, c)
 		fileCtx, cancelFile := codexRolloutFileContext(ctx, len(selected)-i-1)
-		buckets, sessionStart, fileLimit, handled, ok := codexBucketsFromRolloutFile(fileCtx, c.path, now)
+		buckets, sessionStart, fileLimit, handled, ok, producer := codexBucketsFromRolloutFileWithProducer(fileCtx, c.path, now)
 		cancelFile()
 		retryEntry := codexRolloutBacklogEntryDigest(c)
 		retry := !handled
@@ -1995,7 +2012,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 				}
 				key := codexWindowIdentity(b.WindowMinutes, w) + "\x00" + limitID
 				if prev, exists := winners[key]; !exists || codexRolloutReadingBeats(b, prev.bucket, runFloor) {
-					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b}
+					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b, producer: producer}
 				}
 			}
 		}
@@ -2130,7 +2147,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, latestObservation, highWater, false
+		return nil, limit, latestObservation, highWater, false, ""
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
 	// displayed identities onto their canonical cache slots while preserving the
@@ -2140,7 +2157,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// behind. Non-canonical durations retain their source slot so the display path
 	// can apply its slot-scoped fallback.
 	acc := map[string]map[string]codexRateLimitBucket{}
+	producer, producerKnown := "", true
 	for _, c := range winners {
+		if c.producer == "" || (producer != "" && c.producer != producer) {
+			producerKnown = false
+		}
+		producer = c.producer
 		slot := c.slot
 		switch codexWindowIdentity(c.bucket.WindowMinutes, c.slot) {
 		case codexIdentitySession:
@@ -2163,7 +2185,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 		slotMap[limitKey] = c.bucket
 	}
-	return acc, limit, latestObservation, highWater, true
+	if !producerKnown {
+		producer = ""
+	}
+	return acc, limit, latestObservation, highWater, true, producer
 }
 
 // codexRolloutReadingBeats orders two readings of the same (identity, limit)
@@ -2322,35 +2347,75 @@ func codexRolloutSessionStartFromLine(line string) (time.Time, bool) {
 	return codexRolloutLineTimestamp(line)
 }
 
-func codexRolloutSessionStartPrefix(f *os.File) time.Time {
+// codexRolloutSessionVersionFromLine reads the `cli_version` Codex records in
+// a rollout's session header — the build that wrote the file. Like the start
+// time it is trusted only from the header record itself (typed session_meta,
+// or the legacy bare header); any other record yields "".
+func codexRolloutSessionVersionFromLine(line string) string {
+	var header struct {
+		Type       *string          `json:"type"`
+		ID         *json.RawMessage `json:"id"`
+		CLIVersion string           `json:"cli_version"`
+		Payload    struct {
+			CLIVersion string `json:"cli_version"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal([]byte(line), &header) != nil {
+		return ""
+	}
+	if header.Type != nil {
+		if *header.Type != codexRolloutSessionMetaType {
+			return ""
+		}
+		return codexNormalizeVersion(strings.TrimSpace(header.Payload.CLIVersion))
+	}
+	if header.ID == nil {
+		return ""
+	}
+	return codexNormalizeVersion(strings.TrimSpace(header.CLIVersion))
+}
+
+// codexRolloutSessionStartPrefix reads the session start and the producing
+// build's version from a rollout's first record.
+func codexRolloutSessionStartPrefix(f *os.File) (time.Time, string) {
 	buf := make([]byte, codexRolloutTailReadChunkSize)
 	n, err := f.ReadAt(buf, 0)
 	if err != nil && err != io.EOF {
-		return time.Time{}
+		return time.Time{}, ""
 	}
 	line := buf[:n]
 	if newline := bytes.IndexByte(line, '\n'); newline >= 0 {
 		line = line[:newline]
 	}
-	if ts, ok := codexRolloutSessionStartFromLine(string(bytes.TrimSuffix(line, []byte{'\r'}))); ok {
-		return ts
+	header := string(bytes.TrimSuffix(line, []byte{'\r'}))
+	version := codexRolloutSessionVersionFromLine(header)
+	if ts, ok := codexRolloutSessionStartFromLine(header); ok {
+		return ts, version
 	}
-	return time.Time{}
+	return time.Time{}, version
 }
 
 var codexOpenRolloutFile = os.Open
 
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
+	buckets, sessionStart, limit, handled, ok, _ := codexBucketsFromRolloutFileWithProducer(ctx, path, now)
+	return buckets, sessionStart, limit, handled, ok
+}
+
+// codexBucketsFromRolloutFileWithProducer is codexBucketsFromRolloutFile plus
+// the header's `cli_version` — the build that wrote this file ("" when the
+// header records none or could not be read).
+func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool, string) {
 	f, err := codexOpenRolloutFile(path)
 	if err != nil {
 		// Only a file that definitively vanished is handled progress. Permission
 		// failures, descriptor exhaustion, and other open errors can be transient;
 		// advancing the watermark past them would suppress a later successful read.
-		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false
+		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false, ""
 	}
 	defer f.Close()
 
-	sessionStart := codexRolloutSessionStartPrefix(f)
+	sessionStart, producer := codexRolloutSessionStartPrefix(f)
 	inferredAt := codexRolloutInferredObservation(ctx, f, now)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
@@ -2517,6 +2582,9 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 					if ts, ok := codexRolloutSessionStartFromLine(line); ok {
 						sessionStart = ts
 					}
+					if producer == "" {
+						producer = codexRolloutSessionVersionFromLine(line)
+					}
 				}
 				consumeLine(line)
 			}
@@ -2551,21 +2619,21 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		}
 	}
 	if !handled {
-		return acc, sessionStart, limit, false, len(acc) > 0
+		return acc, sessionStart, limit, false, len(acc) > 0, producer
 	}
 	if len(acc) == 0 {
 		// ok=false means "no usable window here", NOT "nothing here": a log whose
 		// every turn was refused for quota is precisely the case that produces no
 		// buckets AND the evidence the card needs, so the evidence is returned
 		// alongside the miss.
-		return nil, sessionStart, limit, true, false
+		return nil, sessionStart, limit, true, false, producer
 	}
 	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
 	// whose reset already passed as of `now` is applied by the display path
 	// (codexAggregateIdentity), so a stale relative reset anchored above still
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
-	return acc, sessionStart, limit, true, true
+	return acc, sessionStart, limit, true, true, producer
 }
 
 func codexRolloutOpenFailureHandled(err error) bool {

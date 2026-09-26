@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +223,117 @@ func TestCodexCaptureStamp_PinnedProducerOutranksThePublishedVersion(t *testing.
 	}
 	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.149.0" {
 		t.Fatalf("stamp = %q, want the build pinned when the child was spawned", snap.CodexVersion)
+	}
+}
+
+// writeCodexRolloutFromBuild writes a run rollout whose session header records
+// the Codex build that wrote it, as `cli_version` does on a real rollout.
+func writeCodexRolloutFromBuild(t *testing.T, base, name, build string, sessionStart, frameAt, mtime time.Time, frames []map[string]any) {
+	t.Helper()
+	path := writeCodexRunRollout(t, base, name, sessionStart, frameAt, mtime, true, frames)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rollout: %v", err)
+	}
+	header, err := json.Marshal(map[string]any{
+		"timestamp": sessionStart.UTC().Format(time.RFC3339Nano),
+		"type":      codexRolloutSessionMetaType,
+		"payload":   map[string]any{"id": "sess-" + name, "cli_version": build},
+	})
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	body := raw[bytes.IndexByte(raw, '\n')+1:]
+	if err := os.WriteFile(path, append(append(header, '\n'), body...), 0o600); err != nil {
+		t.Fatalf("rewrite rollout: %v", err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes rollout: %v", err)
+	}
+}
+
+// A rollout names its producer in its header; only one written by the
+// installed build may carry the installed build's stamp.
+func TestCodexRolloutProducerVersion(t *testing.T) {
+	const installed = "codex-cli 0.150.0"
+	for _, tc := range []struct{ header, installed, want string }{
+		{"0.150.0", installed, installed},
+		{"v0.150.0", installed, installed},
+		{"0.150.0", "0.150.0", "0.150.0"},
+		{"0.149.0", installed, ""},
+		{"0.15", installed, ""},
+		{"", installed, ""},
+		{"0.150.0", "", ""},
+	} {
+		if got := codexRolloutProducerVersion(tc.header, tc.installed); got != tc.want {
+			t.Errorf("codexRolloutProducerVersion(%q, %q) = %q, want %q", tc.header, tc.installed, got, tc.want)
+		}
+	}
+	for line, want := range map[string]string{
+		`{"type":"session_meta","payload":{"id":"s","cli_version":"0.150.0"}}`:  "0.150.0",
+		`{"id":"s","timestamp":"2026-09-26T10:00:00Z","cli_version":"0.149.0"}`: "0.149.0",
+		`{"type":"event_msg","payload":{"cli_version":"0.150.0"}}`:              "",
+		`{"type":"session_meta","payload":{"id":"s"}}`:                          "",
+		`{"cli_version":"0.150.0"}`:                                             "",
+	} {
+		if got := codexRolloutSessionVersionFromLine(line); got != want {
+			t.Errorf("codexRolloutSessionVersionFromLine(%s) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// After an upgrade resets the cursor, the scan re-reads rollouts the previous
+// build wrote. Their telemetry advances the reading but must not be credited
+// to the installed build, or capture drift would clear on old-build evidence;
+// a rollout the installed build wrote does restamp.
+func TestCodexCaptureStamp_RolloutMergeKeepsItsProducer(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.CodexVersion, snap.RolloutCursorVersion = "codex-cli 0.149.0", "codex-cli 0.150.0"
+	})
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+
+	oldStart := now.Add(-10 * time.Minute)
+	writeCodexRolloutFromBuild(t, f.home, "old", "0.149.0", oldStart, oldStart.Add(time.Minute), oldStart.Add(2*time.Minute),
+		[]map[string]any{codexRateLimitFrame(21, 41, now)})
+	codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
+	snap := f.snapshot(t)
+	if got := codexLatestContributorObservation(snap.Contributors); got.Before(oldStart) {
+		t.Fatalf("precondition: the old-build rollout must advance the reading, latest = %s", got)
+	}
+	if snap.CodexVersion != "codex-cli 0.149.0" {
+		t.Fatalf("stamp = %q after an old-build rollout, want the pre-upgrade stamp kept", snap.CodexVersion)
+	}
+
+	newStart := now.Add(-3 * time.Minute)
+	writeCodexRolloutFromBuild(t, f.home, "new", "0.150.0", newStart, newStart.Add(time.Minute), newStart.Add(2*time.Minute),
+		[]map[string]any{codexRateLimitFrame(22, 42, now)})
+	codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
+	if snap := f.snapshot(t); snap.CodexVersion != "codex-cli 0.150.0" {
+		t.Fatalf("stamp = %q after an installed-build rollout, want the installed build", snap.CodexVersion)
+	}
+}
+
+// A session launched from an explicit side-by-side path may run a different
+// build than the detected install: it stamps only a version probed for that
+// exact binary, never the published install's.
+func TestCodexCaptureVersionForLaunch(t *testing.T) {
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+	if got := codexCaptureVersionForLaunch("codex", "/usr/local/bin/codex"); got != "codex-cli 0.150.0" {
+		t.Fatalf("PATH launch = %q, want the published install", got)
+	}
+
+	side := filepath.Join(t.TempDir(), "codex-side")
+	if err := os.WriteFile(side, []byte("binary"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	if got := codexCaptureVersionForLaunch(side, side); got != "" {
+		t.Fatalf("unprobed explicit path = %q, want unknown", got)
+	}
+	cachedProbeVersionFunc(side, func() string { return "codex-cli 0.151.0" })
+	if got := codexCaptureVersionForLaunch(side, side); got != "codex-cli 0.151.0" {
+		t.Fatalf("probed explicit path = %q, want that binary's own version", got)
 	}
 }

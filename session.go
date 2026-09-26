@@ -172,9 +172,10 @@ type CLISession struct {
 	// codex emits BOTH terminal events for one turn. Only a delivered
 	// follow-up turn (SendInput) re-arms it.
 	codexUsageFloorMs atomic.Int64
-	// codexCaptureVersion is the Codex build published when this child was
-	// spawned. Its telemetry is stamped with it, not with whatever build a
-	// gather publishes after an upgrade the running child never picked up.
+	// codexCaptureVersion is the Codex build this child was launched from
+	// (codexCaptureVersionForLaunch), pinned at spawn. Its telemetry is stamped
+	// with it, not with whatever build a gather publishes after an upgrade the
+	// running child never picked up.
 	codexCaptureVersion string
 	codexUsageSettled   atomic.Bool
 
@@ -763,7 +764,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		antigravityManagedStream:     antigravityManagedStream,
 		finishQuotaCapture:           finishQuotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
-		codexCaptureVersion:          currentCodexUsageCaptureVersion(),
+		codexCaptureVersion:          codexCaptureVersionForLaunch(command, executable),
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.

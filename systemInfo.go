@@ -725,6 +725,21 @@ func cachedProbeVersionWithEnv(path string, env []string) string {
 	})
 }
 
+// peekCachedProbeVersion returns a version cachedProbeVersion already recorded
+// for the binary as it is now (same path, mtime, size), without spawning
+// anything. ok is false when no probe of this exact binary is cached.
+func peekCachedProbeVersion(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
+	versionProbeMu.Lock()
+	defer versionProbeMu.Unlock()
+	v, ok := versionProbeCache[key]
+	return v, ok
+}
+
 // cachedProbeVersionFunc is the caching half on its own, for a caller whose
 // binary cannot be spawned by a plain exec.Command -- notably the Grok
 // maintenance smoke on Windows, where an npm `grok.cmd` shim has to go through

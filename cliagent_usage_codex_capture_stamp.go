@@ -29,6 +29,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"sync/atomic"
 )
 
@@ -88,6 +89,44 @@ var codexInstalledVersion = func() string {
 // the first gather raise capture drift against a reading just refreshed.
 func codexResolveCaptureVersion() {
 	publishCodexUsageCaptureVersion(codexInstalledVersion())
+}
+
+// codexCaptureVersionForLaunch is the version a managed child launched from
+// command (resolved to executable) stamps its telemetry with. A bare `codex`
+// resolves through PATH exactly as detection does, so it is the published
+// installed build. An explicit side-by-side path may be a different build:
+// it stamps only a version already probed for that exact binary, and
+// otherwise stays unknown — which leaves the existing stamp untouched rather
+// than crediting the installed build with another binary's telemetry.
+func codexCaptureVersionForLaunch(command, executable string) string {
+	if !isExplicitPath(command) {
+		return currentCodexUsageCaptureVersion()
+	}
+	if v, ok := peekCachedProbeVersion(executable); ok {
+		return codexNormalizeVersion(v)
+	}
+	return ""
+}
+
+// codexRolloutProducerVersion maps a rollout header's `cli_version` onto the
+// installed build's version string, which is what the stamp and the drift
+// predicate compare. It returns the installed version only when the header
+// names that same build; a rollout written by any other build — including a
+// pre-upgrade process still appending after the cursor reset — or one with no
+// recorded version returns "", so its evidence never claims the installed
+// build produced it.
+func codexRolloutProducerVersion(headerVersion, installed string) string {
+	header := strings.TrimPrefix(strings.TrimSpace(headerVersion), "v")
+	installed = codexNormalizeVersion(installed)
+	if header == "" || installed == "" {
+		return ""
+	}
+	for _, field := range strings.Fields(installed) {
+		if strings.TrimPrefix(field, "v") == header {
+			return installed
+		}
+	}
+	return ""
 }
 
 // codexCaptureDrift reports whether the reading the cache holds was produced
