@@ -268,6 +268,27 @@ func retireClaudeRefreshDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bo
 // may already have replaced the value, and clearing on the stale read would
 // throw away live backpressure and send the next probe straight back at an
 // endpoint that just refused us.
+// adjustClaudeRefreshAttemptsAt moves the attempt counter by delta, ONLY while
+// the debt is still the instant the caller judged — the same guard
+// retireClaudeRefreshDebtAt applies, for the same reason: every decision in
+// payOwedClaudeUsageRefreshAt is made from an unlocked read, and a run of this
+// process can record a newer debt before the lock is granted. Charging or
+// refunding that one would move a budget this replay never spent.
+//
+// The charge and the refund share it so the two cannot drift apart: a refund
+// guarded differently from its charge would leak or invent attempts, and that
+// counter is the only thing bounding a crash-looping agent.
+func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLimitSnapshot) bool {
+	owedMs := owed.UnixMilli()
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts+delta < 0 {
+			return false
+		}
+		snap.RefreshOwedAttempts += delta
+		return true
+	}
+}
+
 func dropClaudeSkewedHold(ceilingMs int64) func(*claudeRateLimitSnapshot) bool {
 	return func(snap *claudeRateLimitSnapshot) bool {
 		if snap.HeldUntilMs == 0 || snap.HeldUntilMs <= ceilingMs {
@@ -339,16 +360,13 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// a clock step, not backpressure — the same ceiling retryAfterDeadline puts
 	// on the live value. Left in place it would disable utilization for days.
 	held := time.Time{}
+	// One ceiling, named once: the `case` that spots the skew and the helper
+	// that re-checks it under the lock must not be able to drift apart.
+	holdCeilingMs := now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
 	switch {
 	case snap.HeldUntilMs <= 0:
-	case snap.HeldUntilMs > now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli():
-		// Re-apply the ceiling INSIDE the lock. The read above is unlocked, so a
-		// probe that took a legitimate 429 in the meantime may already have
-		// replaced the skewed value — clearing on the stale read would throw
-		// away live backpressure and send the next probe straight back at an
-		// endpoint that just refused us.
-		mutateClaudeRateLimitSnapshot(path, fingerprint,
-			dropClaudeSkewedHold(now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()))
+	case snap.HeldUntilMs > holdCeilingMs:
+		mutateClaudeRateLimitSnapshot(path, fingerprint, dropClaudeSkewedHold(holdCeilingMs))
 	default:
 		held = time.UnixMilli(snap.HeldUntilMs)
 		// Carry the surviving hold into this process's gate too, so the ordinary
@@ -407,15 +425,7 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// Charged at exactly one point: after every refusal has been cleared and
 	// immediately before the request goes out. A crash mid-request still costs
 	// the attempt, so a restart loop cannot replay the same debt forever.
-	mutateClaudeRateLimitSnapshot(path, fingerprint, func(s *claudeRateLimitSnapshot) bool {
-		if s.RefreshOwedAtMs != owed.UnixMilli() {
-			// A newer run was owed between the read and here; that debt has its
-			// own budget and its own replay.
-			return false
-		}
-		s.RefreshOwedAttempts++
-		return true
-	})
+	mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1))
 
 	// ONE bounded attempt, through the ordinary single-flight probe. Whatever it
 	// finds (or fails to find) is left to the ordinary gather/refresh bounds; the
@@ -430,11 +440,5 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// exists to clear. Safe in the crash direction: a crash between the charge
 	// and the refund keeps the charge, which only ever spends the budget
 	// faster.
-	mutateClaudeRateLimitSnapshot(path, fingerprint, func(s *claudeRateLimitSnapshot) bool {
-		if s.RefreshOwedAtMs != owed.UnixMilli() || s.RefreshOwedAttempts == 0 {
-			return false
-		}
-		s.RefreshOwedAttempts--
-		return true
-	})
+	mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
 }

@@ -700,3 +700,47 @@ func TestPayOwedClaudeUsageRefresh_ClearsADebtAPartialWriteCovered(t *testing.T)
 		t.Errorf("the replay must retire a debt the card already covers: %+v", snap)
 	}
 }
+
+// The charge and the refund share one guard, so they cannot drift apart — a
+// refund guarded differently from its charge would leak or invent attempts,
+// and that counter is the only thing bounding a crash-looping agent.
+func TestAdjustClaudeRefreshAttemptsAt_IsSymmetricAndScopedToTheJudgedDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	judged := time.Now().Add(-time.Minute)
+
+	seedClaudeRefreshDebt(t, cache, fp, judged, 0, time.Time{})
+	if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
+		t.Fatal("the charge must land on the judged debt")
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
+		t.Fatalf("attempts=%d after one charge, want 1", got)
+	}
+	if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, -1)) {
+		t.Fatal("the refund must land on the judged debt")
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 0 {
+		t.Fatalf("attempts=%d after charge+refund, want 0", got)
+	}
+
+	// It can never drive the counter negative, so a stray refund cannot hand a
+	// debt budget it was never granted.
+	if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, -1)) {
+		t.Fatal("a refund below zero must be refused, not wrap the budget")
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 0 {
+		t.Fatalf("attempts=%d after an over-refund, want 0", got)
+	}
+
+	// And neither half touches a debt recorded since the verdict.
+	newer := time.Now()
+	seedClaudeRefreshDebt(t, cache, fp, newer, 0, time.Time{})
+	for _, delta := range []int{+1, -1} {
+		if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, delta)) {
+			t.Fatalf("delta %+d moved the budget of a debt it did not judge", delta)
+		}
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != newer.UnixMilli() || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("the newer debt was disturbed: %+v", snap)
+	}
+}
