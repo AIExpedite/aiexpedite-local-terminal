@@ -249,20 +249,19 @@ func TestMutateClaudeRateLimitSnapshot_ResetsAForeignFingerprintFirst(t *testing
 		},
 	}, now, "someone-else", claudeRateLimitSourceProbe)
 
-	// Driven through the helper directly rather than through claudeOweRunRefresh:
-	// the fixture account is unscoped, and the owe path deliberately REFUSES a
-	// scoped -> "" downgrade (it cannot tell one from a failed credential read).
-	// That refusal has its own case,
-	// TestClaudeOweRunRefresh_UnresolvedFingerprintLeavesAScopedCacheAlone; this
-	// one is about the helper's reset.
-	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(),
+	// A scoped -> other-scoped flip — a real `/login`. The helper deliberately
+	// REFUSES a scoped -> "" downgrade (it cannot tell one from a failed
+	// credential read); that refusal has its own case,
+	// TestMutateClaudeRateLimitSnapshot_RefusesAnUnresolvedIdentityOverAScopedCache.
+	const current = "current-account"
+	mutateClaudeRateLimitSnapshot(cache, current,
 		func(snap *claudeRateLimitSnapshot) bool {
 			snap.RefreshOwedAtMs = now.UnixMilli()
 			return true
 		})
 
 	snap := claudeCacheSnapshot(t, cache)
-	if snap.AccountFingerprint != currentClaudeAccountFingerprint() {
+	if snap.AccountFingerprint != current {
 		t.Fatalf("debt recorded under %q, want the current account", snap.AccountFingerprint)
 	}
 	if len(snap.Buckets) != 0 {
@@ -279,7 +278,7 @@ func TestMutateClaudeRateLimitSnapshot_ResetsAForeignFingerprintFirst(t *testing
 		snap.RefreshOwedAtMs = now.UnixMilli()
 		return true
 	})
-	if owed, _, _ := claudePersistedProbeStateFor(currentClaudeAccountFingerprint()); !owed.IsZero() {
+	if owed, _, _ := claudePersistedProbeStateFor(current); !owed.IsZero() {
 		t.Errorf("another account's debt is visible to this one: %v", owed)
 	}
 }
@@ -570,35 +569,43 @@ func TestRetireClaudeRefreshDebtAt_OnlyClearsTheJudgedDebt(t *testing.T) {
 	}
 }
 
-// The skewed-hold clear is bounded the same way: only a hold still beyond the
-// ceiling is dropped, so a real 429 recorded between the unlocked read and the
-// lock keeps its backpressure.
-func TestDropClaudeSkewedHold_KeepsAHoldInsideTheCeiling(t *testing.T) {
+// The skewed-hold clear is bounded the same way: only the exact value the
+// replay judged is dropped, so a real 429 recorded between the unlocked read and
+// the lock keeps its backpressure — including a maximum-length one another
+// process stamped from a slightly later clock, which lands just past the
+// ceiling the replay computed from its own `now`.
+func TestDropClaudeSkewedHold_KeepsAHoldRenewedSinceTheRead(t *testing.T) {
 	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
 	fp := currentClaudeAccountFingerprint()
 	now := time.Now()
 	ceilingMs := now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
+	skewedMs := now.Add(48 * time.Hour).UnixMilli()
 
 	// A legitimate hold replaced the skewed one before the lock was granted.
 	legit := now.Add(30 * time.Minute)
 	seedClaudeRefreshDebt(t, cache, fp, now, 0, legit)
-	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
-		t.Fatal("a hold inside the ceiling must not be rewritten")
+	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(skewedMs)) {
+		t.Fatal("a hold renewed since the read must not be rewritten")
 	}
 	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != legit.UnixMilli() {
 		t.Fatalf("live backpressure was discarded: %+v", snap)
 	}
 
-	// A hold exactly AT the ceiling is the longest one the bound allows.
-	seedClaudeRefreshDebt(t, cache, fp, now, 0, time.UnixMilli(ceilingMs))
-	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
-		t.Fatal("a hold exactly at the ceiling is legal and must be kept")
+	// A maximum-length Retry-After taken a moment later by another process sits
+	// just past the replay's stale ceiling. It is still live and must survive.
+	renewed := time.UnixMilli(ceilingMs + 250)
+	seedClaudeRefreshDebt(t, cache, fp, now, 0, renewed)
+	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(skewedMs)) {
+		t.Fatal("a renewed maximum-length hold must not be dropped as the skewed one")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != renewed.UnixMilli() {
+		t.Fatalf("renewed hold was discarded: %+v", snap)
 	}
 
-	// One beyond it is a clock step.
-	seedClaudeRefreshDebt(t, cache, fp, now, 0, time.UnixMilli(ceilingMs+1))
-	if !mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
-		t.Fatal("a hold beyond the ceiling must be dropped")
+	// The value actually judged is dropped.
+	seedClaudeRefreshDebt(t, cache, fp, now, 0, time.UnixMilli(skewedMs))
+	if !mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(skewedMs)) {
+		t.Fatal("the judged skewed hold must be dropped")
 	}
 	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != 0 {
 		t.Fatalf("skewed hold survived: %+v", snap)
@@ -1496,5 +1503,145 @@ func TestPayOwedClaudeUsageRefresh_OptOutClearsADebtUnderAMatchingScope(t *testi
 	}
 	if n := atomic.LoadInt64(calls); n != 0 {
 		t.Errorf("an opted-out replay issued %d requests, want 0", n)
+	}
+}
+
+// The scoped -> unscoped refusal lives INSIDE the locked mutation, so it holds
+// even when another writer scoped the snapshot after an unlocked check would
+// have passed: an empty fingerprint is never read as an account boundary by a
+// debt or hold marker, and fn never sees the snapshot.
+func TestMutateClaudeRateLimitSnapshot_RefusesAnUnresolvedIdentityOverAScopedCache(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	observedAt := time.Now().Add(-time.Hour)
+	if !mutateClaudeRateLimitSnapshot(cache, "scoped-account", func(snap *claudeRateLimitSnapshot) bool {
+		snap.Buckets[claudeWindowFiveHour] = claudeRateLimitBucket{
+			UsedPercentage: 41, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observedAt.UnixMilli(), usageKnown: true,
+		}
+		return true
+	}) {
+		t.Fatal("seeding a scoped snapshot wrote nothing")
+	}
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ran := false
+	if mutateClaudeRateLimitSnapshot(cache, "", func(snap *claudeRateLimitSnapshot) bool {
+		ran = true
+		snap.RefreshOwedAtMs = time.Now().UnixMilli()
+		return true
+	}) {
+		t.Fatal("an unresolved fingerprint was allowed to rewrite a scoped cache")
+	}
+	if ran {
+		t.Fatal("fn ran against a scoped snapshot under an unresolved fingerprint")
+	}
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("the scoped cache changed:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// An admitted attempt that returns before asking anything — the credential
+// store handing back no token — gives back the in-memory throttle slot as well
+// as the durable attempt charge, so the next caller (the startup gather that
+// adopted the debt) is not refused for a whole interval by a probe that never
+// left the process.
+func TestClaudeUsageProbe_UnissuedAdmissionRefundsTheThrottleSlot(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	earlier := time.Now().Add(-time.Hour)
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.lastAttempt = earlier
+	claudeUsageProbe.mu.Unlock()
+
+	noToken := func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }
+	admitted, issued, _, _, _ := probeClaudeUsageAdmitted(context.Background(), time.Now(), noToken, time.Time{}, false)
+	if !admitted || issued {
+		t.Fatalf("admitted=%v issued=%v, want an admitted attempt that issued nothing", admitted, issued)
+	}
+	claudeUsageProbe.mu.Lock()
+	got := claudeUsageProbe.lastAttempt
+	claudeUsageProbe.mu.Unlock()
+	if !got.Equal(earlier) {
+		t.Fatalf("lastAttempt=%v, want the pre-admission %v restored", got, earlier)
+	}
+	if !claudeUsageProbe.begin(time.Now(), false) {
+		t.Fatal("the next attempt was throttled by an admission that issued nothing")
+	}
+	claudeUsageProbe.finish(nil, false, time.Time{}, "")
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0", n)
+	}
+}
+
+// The startup replay can land AFTER the seed has returned — settling the debt
+// the seed adopted — so the gather then finds nothing owed and a view that looks
+// fresh. It must still report the landed reading so the caller re-reads the
+// cache, rather than publishing the pre-replay view for the whole TTL.
+func TestRefreshClaudeUsageIfStale_ReportsAReplayThatLandedAfterTheSeed(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	latest := time.Now().Add(-2 * time.Minute) // fresh by the TTL
+	seedClaudeProbeReading(t, cache, latest)
+
+	generation := claudeUsageProbe.refreshGeneration()
+	// The seed has already run for this account and found nothing to re-read.
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, generation, time.Now(), latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero before the replay lands", got)
+	}
+	// The replay lands now, after the seed.
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.refreshes++
+	claudeUsageProbe.lastRefreshAt = latest.Add(time.Minute)
+	claudeUsageProbe.lastRefreshFingerprint = fp
+	claudeUsageProbe.mu.Unlock()
+
+	if !refreshClaudeUsageIfStaleFrom(context.Background(), generation, time.Now(), latest, "token", fp) {
+		t.Fatal("a replay that landed after the seed was not reported, so the gather would publish the pre-replay view")
+	}
+	// A gather that sampled its generation AFTER the replay holds nothing stale.
+	if refreshClaudeUsageIfStaleFrom(context.Background(), claudeUsageProbe.refreshGeneration(), time.Now(), latest, "token", fp) {
+		t.Fatal("an unchanged generation must not ask for a re-read")
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0 — the view was fresh", n)
+	}
+}
+
+// A routine gather that owes a debt and finds the slot held by the probe paying
+// it — the startup replay, or this process's trailing probe — joins that probe
+// instead of being refused and publishing the pre-run view.
+func TestRefreshClaudeUsageIfStale_OwingGatherJoinsTheInFlightPayer(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-30 * time.Second)
+	latest := runEnded.Add(-time.Minute) // the PRE-run reading
+	seedClaudeProbeReading(t, cache, latest)
+	claudeUsageProbe.recordOwed(runEnded)
+
+	// The payer holds the slot and lands a covering reading shortly.
+	if !claudeUsageProbe.begin(time.Now(), false) {
+		t.Fatal("the simulated payer was not admitted")
+	}
+	covering := runEnded.Add(time.Second)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		claudeUsageProbe.finish(nil, true, covering, fp)
+	}()
+
+	generation := claudeUsageProbe.refreshGeneration()
+	if !refreshClaudeUsageIfStaleFrom(context.Background(), generation, time.Now(), latest, "token", fp) {
+		t.Fatal("an owing gather refused by the payer's slot did not report the covering reading it landed")
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("owedObservation()=%v, want the debt settled by the joined reading", owed)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0 — the joined probe answered", n)
 	}
 }

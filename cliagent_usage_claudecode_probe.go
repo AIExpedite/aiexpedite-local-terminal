@@ -361,6 +361,9 @@ type claudeUsageProbeGate struct {
 	mu          sync.Mutex
 	inFlight    bool
 	lastAttempt time.Time
+	// admittedOver is the lastAttempt the current admission replaced, kept only
+	// so refundAdmission can restore it — see there.
+	admittedOver time.Time
 	// NOTE: the refresh bypass is deliberately NOT a field here. It belongs to
 	// one gather, and a package-level gate cannot express that — see
 	// claudeUsageForceProbeTicket, which carries it on the refresh's context.
@@ -600,6 +603,7 @@ func resetClaudeUsageProbeGate() {
 	// is a monotonic counter compared only against a value the joiner sampled
 	// itself, so zeroing it here would make a stale sample look like an advance.
 	claudeUsageProbe.lastAttempt = time.Time{}
+	claudeUsageProbe.admittedOver = time.Time{}
 	claudeUsageProbe.armed = false
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
@@ -663,9 +667,28 @@ func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 		return false
 	}
 	g.inFlight = true
+	g.admittedOver = g.lastAttempt
 	g.lastAttempt = now
 	g.doneCh = make(chan struct{})
 	return true
+}
+
+// refundAdmission gives back the throttle slot an admission charged, for an
+// attempt that returned before asking anything (no credential to ask with).
+// Called by the admitted holder while it still holds the single-flight slot, so
+// no other begin() can have moved lastAttempt in between.
+//
+// Without it the startup replay, whose credential read can fail transiently (a
+// macOS Keychain timeout), refunds its DURABLE attempt charge yet leaves this
+// in-memory one standing: the immediate startup gather then adopts the
+// still-outstanding debt, is throttled for a full interval without issuing a
+// request, and publishes the pre-update reading.
+func (g *claudeUsageProbeGate) refundAdmission() {
+	g.mu.Lock()
+	if g.inFlight {
+		g.lastAttempt = g.admittedOver
+	}
+	g.mu.Unlock()
 }
 
 // claudeUsageProbeWholeTimeout bounds ONE complete post-run probe: credential
@@ -960,6 +983,23 @@ func (g *claudeUsageProbeGate) refreshGeneration() uint64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.refreshes
+}
+
+// refreshLandedSince reports whether a probe of THIS process persisted, for
+// `fingerprint`, a reading newer than `latest` since `generation` was sampled.
+//
+// seedOwedFromCache asks the same question, but only as of the moment it runs.
+// The startup replay is asynchronous and can land AFTER the seed has returned —
+// settling the very debt the seed adopted — so a gather that then finds nothing
+// owed and a fresh-looking `latest` would publish the pre-replay view. Asking
+// again at each "not refreshed" exit, against the generation the caller sampled
+// before its load, closes that window without a second cache read. Sampled
+// relatively, never as an absolute claim, for the reason
+// resetClaudeUsageProbeGate documents.
+func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint string, latest time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.refreshes != generation && g.lastRefreshFingerprint == fingerprint && g.lastRefreshAt.After(latest)
 }
 
 // seedOwedFromCache adopts, ONCE per account per process, the state a previous process
@@ -1481,7 +1521,9 @@ func probeClaudeUsageAdmitted(
 		// attempt charge) must be able to tell it apart from a probe that actually
 		// asked. The credential store can fail TRANSIENTLY here — a Keychain timeout
 		// on macOS — and charging those would retire a debt no request was ever made
-		// for, leaving exactly the stale card the replay exists to clear.
+		// for, leaving exactly the stale card the replay exists to clear. The same
+		// goes for the in-memory throttle slot begin() just charged.
+		claudeUsageProbe.refundAdmission()
 		return admitted, false, false, time.Time{}, nil
 	}
 	// Past the credential: from here every exit either asked the endpoint or
@@ -1776,7 +1818,10 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	owed := claudeUsageProbe.owedObservation()
 	owing := !owed.IsZero() && (latest.IsZero() || !latest.After(owed))
 	if !forced && !owing && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
-		return false
+		// Fresh by the caller's view — unless the startup replay landed after
+		// the seed returned and settled the debt this gather would otherwise
+		// have probed for. See refreshLandedSince.
+		return claudeUsageProbe.refreshLandedSince(generation, fingerprint, latest)
 	}
 	// A user-initiated refresh is never deduped against the shared cache —
 	// somebody is looking at the card and asked for a reading now. A routine
@@ -1856,8 +1901,21 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 		// still re-read rather than publish the view it holds.
 		return !seeded.IsZero()
 	}
-	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, false)
+	admitted, _, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, now, resolveIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
+	// Refused while OWING: the slot is most likely held by the probe paying that
+	// very debt — the startup replay seeded it, or this process's trailing probe
+	// after a run. A routine gather ordinarily gains nothing by blocking, but
+	// here it would otherwise publish the pre-run view for the whole TTL while
+	// the covering answer lands a moment later. Join it, bounded by the gather's
+	// context and claudeUsageProbeJoinTimeout, and accept only a reading for
+	// this account that covers the debt — the forced path's rule.
+	if !admitted && !refreshed && owing {
+		if joined, joinedAt := claudeUsageProbe.joinInFlight(ctx, fingerprint); joined && claudeUsageObservationCovers(joinedAt, owed) {
+			claudeUsageProbe.settleOwed(owed)
+			return true
+		}
+	}
 	// Settle only on an observation that actually covers the run — the same test
 	// the join above applies, for the same reason. `now` is ParseContext's gather
 	// instant, so it can PREDATE the debt (a turn that finished while the gather
@@ -1881,7 +1939,11 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	// poll. Both instants come from claudeSnapshotFreshness, so a strictly newer
 	// one means the DISPLAYED snapshot advanced and re-reading is worth a load;
 	// an equal one is the same reading the caller already holds.
-	return !observedAt.IsZero() && observedAt.After(latest)
+	//
+	// And a refusal or skip may have raced the startup replay landing after the
+	// seed returned; that reading is on disk too — see refreshLandedSince.
+	return (!observedAt.IsZero() && observedAt.After(latest)) ||
+		claudeUsageProbe.refreshLandedSince(generation, fingerprint, latest)
 }
 
 // triggerClaudeUsageProbeAfterRun fires the probe off the hot path once a Claude

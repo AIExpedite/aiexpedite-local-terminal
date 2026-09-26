@@ -90,7 +90,9 @@ const (
 //
 // It takes the fingerprint for the same reason the merge does: a snapshot
 // belonging to a DIFFERENT account is reset before fn runs, so a debt can never
-// be recorded onto, or read back off, an obsolete login's cache.
+// be recorded onto, or read back off, an obsolete login's cache. The one
+// transition it will NOT make is scoped -> unscoped, which it refuses (returning
+// false) — see the note in the body.
 //
 // Best-effort, like every other non-verified writer: on gate or lock contention
 // the mutation is DROPPED rather than retried. A dropped debt degrades to the
@@ -114,9 +116,21 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 				snap.Buckets = map[string]claudeRateLimitBucket{}
 			}
 		}
+		// A scoped cache written under an EMPTY fingerprint is refused, and
+		// refused HERE, under the lock: an unlocked check could be overtaken by
+		// another writer creating or re-scoping the snapshot before the lock is
+		// granted. A credential read that transiently fails (a macOS Keychain
+		// timeout) resolves to the same "" a genuine logout does, and treating it
+		// as an account boundary would wipe the buckets of a login this device is
+		// still signed in to. Only the live writers (stream capture, status-line hook, probe
+		// merge) may reset a scope to unscoped — they carry a reading, and a debt
+		// or hold marker does not.
+		if fingerprint == "" && snap.AccountFingerprint != "" {
+			return time.Time{}, nil
+		}
 		if snap.AccountFingerprint != fingerprint {
-			// Any fingerprint transition is an account boundary, unscoped <->
-			// scoped flips included — the same rule the merge applies.
+			// Any other fingerprint transition is an account boundary, including
+			// an unscoped -> scoped flip — the same rule the merge applies.
 			snap.Buckets = map[string]claudeRateLimitBucket{}
 			snap.LastProbeObservedAtMs = 0
 			snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
@@ -147,30 +161,6 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 		return time.Time{}, nil
 	})
 	return wrote
-}
-
-// claudeUnresolvedIdentityWouldResetScope reports whether writing under
-// `fingerprint` would make mutateClaudeRateLimitSnapshot read an account
-// BOUNDARY that did not happen, and so drop the cached buckets and probe state
-// of a login this device is still signed in to.
-//
-// A credential read that transiently fails (a macOS Keychain timeout, a config
-// dir not yet readable) resolves to exactly the same "" a genuine accountless
-// claude.ai login does, and the mutation cannot tell the two apart. Every caller
-// that may hold a *stale* "" — the per-turn owe, and the opt-out clear at
-// startup — asks this first and skips the durable write instead, because the
-// cache it would wipe carries utilization the status-line path supplies
-// independently of this probe.
-//
-// Read unlocked, like claudePersistedProbeStateFor: the snapshot is only ever
-// replaced by rename. A concurrent genuine flip can overtake it, costing at most
-// one skipped write — not worth queueing these writers behind the cache gate.
-func claudeUnresolvedIdentityWouldResetScope(path, fingerprint string) bool {
-	if fingerprint != "" {
-		return false
-	}
-	snap, ok := loadClaudeRateLimitSnapshot(path)
-	return ok && snap.AccountFingerprint != ""
 }
 
 /* ────────────────────────────────── owe ──────────────────────────────────── */
@@ -217,22 +207,16 @@ func claudeOweRunRefresh(baseline time.Time) {
 	// recovered fingerprint, ignores it. So the completed turn would cost a wiped
 	// cache AND an unpayable marker.
 	//
-	// Refuse the durable write on that downgrade instead. The in-memory debt still
-	// stands for this process, so this degrades to the behaviour this file
-	// replaces — never to something worse, which is the rule every other
-	// best-effort path here follows.
+	// mutateClaudeRateLimitSnapshot refuses that downgrade under the cache lock,
+	// so the durable write is simply skipped. The in-memory debt still stands for
+	// this process, so this degrades to the behaviour this file replaces — never
+	// to something worse, which is the rule every other best-effort path here
+	// follows.
 	//
 	// Only scoped -> unscoped is refused; a scoped -> other-scoped flip is a real
 	// `/login` and proceeds. A genuine logout also resolves to "", and there the
 	// live writers (stream capture, status-line hook, probe) reset the scope on
 	// their next reading, after which an owe under "" proceeds normally.
-	//
-	// The same guard covers payOwedClaudeUsageRefreshAt's opt-out clear, for the
-	// same reason — see claudeUnresolvedIdentityWouldResetScope.
-	//
-	if claudeUnresolvedIdentityWouldResetScope(path, fingerprint) {
-		return
-	}
 	baselineMs := baseline.UnixMilli()
 	mutateClaudeRateLimitSnapshot(path, fingerprint,
 		func(snap *claudeRateLimitSnapshot) bool {
@@ -351,16 +335,20 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	}
 }
 
-// dropClaudeSkewedHold clears a 429 hold ONLY while it is still parked beyond
-// the ceiling a Retry-After could legitimately reach. Sibling of
-// retireClaudeRefreshDebtAt and there for the same reason: the read that
-// spotted the skew is unlocked, so a probe that took a real 429 in the meantime
-// may already have replaced the value, and clearing on the stale read would
-// throw away live backpressure and send the next probe straight back at an
-// endpoint that just refused us.
-func dropClaudeSkewedHold(ceilingMs int64) func(*claudeRateLimitSnapshot) bool {
+// dropClaudeSkewedHold clears a 429 hold ONLY while it is still the exact value
+// the caller judged skewed. Sibling of retireClaudeRefreshDebtAt and there for
+// the same reason: the read that spotted the skew is unlocked, so a probe that
+// took a real 429 in the meantime may already have replaced the value, and
+// clearing on the stale read would throw away live backpressure and send the
+// next probe straight back at an endpoint that just refused us.
+//
+// Keyed to the observed value rather than re-tested against the ceiling: that
+// ceiling was computed from the replay's `now`, and a legitimate maximum-length
+// Retry-After recorded by another process a moment later lands just past it —
+// a ceiling test would clear that live hold as if it were the skewed one.
+func dropClaudeSkewedHold(judgedMs int64) func(*claudeRateLimitSnapshot) bool {
 	return func(snap *claudeRateLimitSnapshot) bool {
-		if snap.HeldUntilMs == 0 || snap.HeldUntilMs <= ceilingMs {
+		if snap.HeldUntilMs == 0 || snap.HeldUntilMs != judgedMs {
 			return false
 		}
 		snap.HeldUntilMs = 0
@@ -421,10 +409,9 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// the debt. Opting out of the probe must not erase someone else's readings.
 	// The debt simply stays until a start that can name the account retires it,
 	// which is the same degradation every other best-effort write here takes.
+	// mutateClaudeRateLimitSnapshot refuses that write under the cache lock.
 	if !claudeUsageProbe.armedForProbe() {
-		if !claudeUnresolvedIdentityWouldResetScope(path, fingerprint) {
-			mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
-		}
+		mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
 		return
 	}
 
@@ -439,13 +426,12 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// a clock step, not backpressure — the same ceiling retryAfterDeadline puts
 	// on the live value. Left in place it would disable utilization for days.
 	held := time.Time{}
-	// One ceiling, named once: the `case` that spots the skew and the helper
-	// that re-checks it under the lock must not be able to drift apart.
-	holdCeilingMs := now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
 	switch {
 	case snap.HeldUntilMs <= 0:
-	case snap.HeldUntilMs > holdCeilingMs:
-		mutateClaudeRateLimitSnapshot(path, fingerprint, dropClaudeSkewedHold(holdCeilingMs))
+	case snap.HeldUntilMs > now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli():
+		// Drop the value JUDGED, never whatever is on disk by the time the lock
+		// is granted — see dropClaudeSkewedHold.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, dropClaudeSkewedHold(snap.HeldUntilMs))
 	default:
 		held = time.UnixMilli(snap.HeldUntilMs)
 		// Carry the surviving hold into this process's gate too, so the ordinary
