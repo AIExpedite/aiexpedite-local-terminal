@@ -297,8 +297,9 @@ func TestNormalizeSetupToolCatalog(t *testing.T) {
 	got, skipped := normalizeSetupToolCatalogReport([]setupToolCatalogEntry{
 		{ID: "git", Command: "git"},
 		{ID: "GIT", Command: "git"}, // duplicate id
-		{ID: "java", Command: "java", VersionArgs: []string{"-version"}, VersionPattern: `version "([^"]+)"`},
-		{ID: "kubectl", Command: "kubectl", VersionArgs: []string{"version", "--short"}},
+		{ID: "java", Command: "java", VersionArgs: []string{"--version"}, VersionPattern: `version "([^"]+)"`},
+		{ID: "kubectl", Command: "kubectl", VersionArgs: []string{"version", "--short"}}, // not an allowlisted tool
+		{ID: "java8", Command: "java", VersionArgs: []string{"-version"}},                // not java's allowlisted form
 		{ID: "gpu", Command: "nvidia-smi", VersionArgs: []string{"--query-gpu=driver_version", "--format=csv,noheader"}},
 		{ID: "evil1", Command: "powershell", VersionArgs: []string{"--version"}},
 		{ID: "evil2", Command: "node", VersionArgs: []string{"-e", "process.exit"}},
@@ -310,15 +311,14 @@ func TestNormalizeSetupToolCatalog(t *testing.T) {
 	})
 	want := []setupToolCatalogEntry{
 		{ID: "git", Command: "git", VersionArgs: []string{"--version"}},
-		{ID: "java", Command: "java", VersionArgs: []string{"-version"}, VersionPattern: `version "([^"]+)"`},
-		{ID: "kubectl", Command: "kubectl", VersionArgs: []string{"version", "--short"}},
+		{ID: "java", Command: "java", VersionArgs: []string{"--version"}, VersionPattern: `version "([^"]+)"`},
 		{ID: "long", Command: "go", VersionArgs: []string{"version"}},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got  %+v\nwant %+v", got, want)
 	}
-	if len(skipped) != 8 {
-		t.Fatalf("expected 8 skipped entries with reasons, got %q", skipped)
+	if len(skipped) != 10 {
+		t.Fatalf("expected 10 skipped entries with reasons, got %q", skipped)
 	}
 }
 
@@ -328,6 +328,12 @@ func TestNormalizeSetupToolCatalog_RefusesNonVersionCommands(t *testing.T) {
 	refused := []setupToolCatalogEntry{
 		{ID: "codex", Command: "npm", VersionArgs: []string{"uninstall", "-g", "codex"}},
 		{ID: "codex2", Command: "npm uninstall -g codex"},
+		{ID: "rm", Command: "rm", VersionArgs: []string{"version"}},
+		{ID: "mkdir", Command: "mkdir", VersionArgs: []string{"--version"}},
+		{ID: "npm", Command: "npm", VersionArgs: []string{"--version"}}, // not in the catalog, so not allowlisted
+		{ID: "go-wrong-form", Command: "go", VersionArgs: []string{"--version"}},
+		{ID: "git-v", Command: "git", VersionArgs: []string{"-v"}},
+		{ID: "case", Command: "Git", VersionArgs: []string{"--version"}},
 		{ID: "a", Command: "npm", VersionArgs: []string{"install", "-g", "x"}},
 		{ID: "b", Command: "git", VersionArgs: []string{"--version", "--exec-path=/tmp"}},
 		{ID: "c", Command: "gh", VersionArgs: []string{"auth", "logout"}},
@@ -357,7 +363,8 @@ func TestNormalizeSetupToolCatalog_RefusesNonVersionCommands(t *testing.T) {
 // `detect`, plus the cliAgents' commands with the default --version, as
 // terminal-service sends them) is accepted unchanged. Transcribed from
 // db-content origin/main on 2026-09-26; a new versionArgs form there needs an
-// agent release adding it to setupToolVersionArgForms first.
+// agent release adding it to setupToolProbeAllowlist first. Every allowlisted
+// command is exercised, so the allowlist cannot hold a pair nothing uses.
 func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
 	real := []setupToolCatalogEntry{
 		{ID: "cuda-toolkit", Command: "nvcc", VersionArgs: []string{"--version"}, VersionPattern: `release (\d+\.\d+)`},
@@ -387,6 +394,15 @@ func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
 	if len(skipped) != 0 || len(got) != len(real) {
 		t.Fatalf("real catalog entries refused: %q", skipped)
 	}
+	used := map[string]bool{}
+	for _, e := range real {
+		used[e.Command] = true
+	}
+	for cmd := range setupToolProbeAllowlist {
+		if !used[cmd] {
+			t.Errorf("allowlisted command %q is not used by the catalog", cmd)
+		}
+	}
 	for i := range real {
 		if got[i].Command != real[i].Command || got[i].VersionPattern != real[i].VersionPattern {
 			t.Fatalf("entry %d changed: %+v -> %+v", i, real[i], got[i])
@@ -402,7 +418,7 @@ func TestProbeSetupToolCatalog(t *testing.T) {
 	}}
 	entries := normalizeSetupToolCatalog([]setupToolCatalogEntry{
 		{ID: "git", Command: "git"},
-		{ID: "java", Command: "java", VersionArgs: []string{"-version"}, VersionPattern: `version "([^"]+)"`},
+		{ID: "java", Command: "java", VersionArgs: []string{"--version"}, VersionPattern: `version "([^"]+)"`},
 		{ID: "terraform", Command: "terraform"},
 		{ID: "firebase-tools", Command: "firebase"}, // not installed
 		{ID: "codex", Command: "codex"},             // a CLI agent: skipped
@@ -483,7 +499,7 @@ func TestGetOIDCToken_PersistsSetupToolCatalog(t *testing.T) {
 	}
 	catalog := []map[string]any{
 		{"id": "gh", "command": "gh", "versionArgs": []string{"--version"}},
-		{"id": "java", "command": "java", "versionArgs": []string{"-version"}, "versionPattern": `version "([^"]+)"`},
+		{"id": "java", "command": "java", "versionArgs": []string{"--version"}, "versionPattern": `version "([^"]+)"`},
 	}
 	srv := respond(catalog)
 	t.Cleanup(srv.Close)

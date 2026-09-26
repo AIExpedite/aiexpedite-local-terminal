@@ -63,26 +63,50 @@ var (
 	setupToolCommandPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
 )
 
-// setupToolVersionArgForms is the COMPLETE set of argument lists a catalog probe
-// may run. The catalog comes from our own authenticated backend, but its only
-// job is detection: a probe must never be able to run anything but a version
-// query (`npm uninstall -g codex` is a perfectly valid bare command plus flags).
-// An entry asking for any other form is skipped and logged, never executed.
-// Covers every form the db-content setupTools / cliAgents catalog uses today
-// (`--version`, `version`, `-version`) plus the other common spellings; a new
-// form means an agent release, on purpose.
-var setupToolVersionArgForms = [][]string{
-	{"--version"},
-	{"-v"},
-	{"-V"},
-	{"version"},
-	{"-version"},
-	{"--version", "--json"},
-	{"version", "--short"},
+// setupToolProbeAllowlist is the COMPLETE set of (command, versionArgs) pairs a
+// catalog probe may run, compiled into the agent. The catalog comes from our
+// own authenticated backend, but its only job is detection, so a probe must
+// never be able to run anything but a known tool's version query: `rm version`
+// and `npm uninstall -g codex` are perfectly valid bare commands plus flags.
+// An entry whose pair is not listed here is skipped and logged, never executed.
+//
+// It lists exactly what the db-content catalog uses today (dev/setupTools/*.json
+// `detect`, including `commandByOs` variants, and dev/cliAgents/*.json
+// `command`, which terminal-service probes with the default `--version`). A new
+// tool, or a new argument form for an existing one, therefore needs an agent
+// release before this agent probes it — deliberate: until then it is reported
+// "unknown" and the server plans the install anyway (plan §10 Phase 0).
+var setupToolProbeAllowlist = map[string][][]string{
+	// setupTools
+	"code":       {{"--version"}}, // vscode
+	"docker":     {{"--version"}}, // docker-desktop
+	"firebase":   {{"--version"}}, // firebase-tools
+	"flutter":    {{"--version"}},
+	"gh":         {{"--version"}},
+	"git":        {{"--version"}},
+	"go":         {{"version"}},
+	"godot":      {{"--version"}},
+	"java":       {{"--version"}},
+	"node":       {{"--version"}},
+	"nvcc":       {{"--version"}}, // cuda-toolkit
+	"playwright": {{"--version"}},
+	"python":     {{"--version"}}, // python, commandByOs.windows
+	"python3":    {{"--version"}}, // python
+	"terraform":  {{"--version"}},
+	"uv":         {{"--version"}},
+	"xcodebuild": {{"-version"}}, // xcode
+	// cliAgents
+	"agy":      {{"--version"}}, // antigravity
+	"claude":   {{"--version"}}, // claudeCode
+	"codex":    {{"--version"}},
+	"grok":     {{"--version"}},
+	"opencode": {{"--version"}},
 }
 
-func isAllowedVersionArgs(args []string) bool {
-	for _, form := range setupToolVersionArgForms {
+// isAllowedSetupToolProbe reports whether `command args…` is an allowlisted
+// version query. Exact, case-sensitive match on both.
+func isAllowedSetupToolProbe(command string, args []string) bool {
+	for _, form := range setupToolProbeAllowlist[command] {
 		if len(form) != len(args) {
 			continue
 		}
@@ -100,20 +124,10 @@ func isAllowedVersionArgs(args []string) bool {
 	return false
 }
 
-// Defense in depth on top of the version-args allowlist: a shell or launcher is
-// never a detected tool, so it is never probed.
-var setupToolDeniedCommands = map[string]bool{
-	"cmd": true, "powershell": true, "pwsh": true, "bash": true, "sh": true,
-	"zsh": true, "fish": true, "dash": true, "ksh": true, "csh": true, "tcsh": true,
-	"wsl": true, "env": true, "sudo": true, "doas": true, "osascript": true,
-	"rundll32": true, "mshta": true, "wscript": true, "cscript": true, "start": true,
-	"xargs": true, "nohup": true, "open": true,
-}
-
 // normalizeSetupToolCatalog validates and canonicalizes entries: ids unique
 // (case-insensitive, first wins), command a bare program name (no path
-// separators), versionArgs exactly one of setupToolVersionArgForms (default
-// ["--version"]), an over-long pattern dropped. Invalid entries are skipped,
+// separators), (command, versionArgs) exactly a pair of setupToolProbeAllowlist
+// (versionArgs default ["--version"]), an over-long pattern dropped. Invalid entries are skipped,
 // never an error.
 func normalizeSetupToolCatalog(entries []setupToolCatalogEntry) []setupToolCatalogEntry {
 	out, _ := normalizeSetupToolCatalogReport(entries)
@@ -140,10 +154,6 @@ func normalizeSetupToolCatalogReport(entries []setupToolCatalogEntry) (out []set
 			skipped = append(skipped, fmt.Sprintf("%q: command %q is not a bare program name", id, command))
 			continue
 		}
-		if setupToolDeniedCommands[strings.ToLower(commandBaseName(command))] {
-			skipped = append(skipped, fmt.Sprintf("%q: command %q is never a detected tool", id, command))
-			continue
-		}
 		key := strings.ToLower(id)
 		if seen[key] {
 			skipped = append(skipped, fmt.Sprintf("%q: duplicate id", id))
@@ -153,8 +163,8 @@ func normalizeSetupToolCatalogReport(entries []setupToolCatalogEntry) (out []set
 		if len(args) == 0 {
 			args = []string{"--version"}
 		}
-		if !isAllowedVersionArgs(args) {
-			skipped = append(skipped, fmt.Sprintf("%q: versionArgs %q is not a version query", id, args))
+		if !isAllowedSetupToolProbe(command, args) {
+			skipped = append(skipped, fmt.Sprintf("%q: %q %q is not an allowlisted version query", id, command, args))
 			continue
 		}
 		pattern := raw.VersionPattern
