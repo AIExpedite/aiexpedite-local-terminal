@@ -154,6 +154,15 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 // a pure in-memory update under that mutex: a cache flock wait taken while
 // holding it would stall frame handling and every other gate caller.
 //
+// Cost, stated plainly: this runs once per COMPLETED TURN, so a chatty session
+// pays one fingerprint resolve plus one read-modify-rename of a few KB per
+// turn, where the probe itself stays throttled to one request a minute. That is
+// deliberate — the debt's whole value is being on disk before the process can
+// die, so it cannot be debounced without reopening the window this file
+// closes — and it is within the budget the same path already spends:
+// captureClaudeRateLimitLine resolves the fingerprint and merges the cache on
+// every rate_limit_event line of the same turn.
+//
 // An unchanged (or older) instant is a no-op: it neither rewrites the cache nor
 // touches RefreshOwedAttempts. Resetting the counter on an unchanged instant
 // would hand the same debt a fresh pair of attempts on every restart and
@@ -233,6 +242,38 @@ func claudeHoldUsageProbe(fingerprint string, deadline time.Time) {
 		})
 }
 
+// retireClaudeRefreshDebtAt clears the debt ONLY while it is still the instant
+// the caller judged. Every retire decision in payOwedClaudeUsageRefreshAt is
+// made from an unlocked read, and that read can be overtaken by a run of this
+// process finishing; scoping the clear to the judged instant is what stops a
+// verdict about an old debt from being applied to a new one.
+func retireClaudeRefreshDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bool {
+	owedMs := owed.UnixMilli()
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs != owedMs {
+			return false
+		}
+		return clearClaudeRefreshDebt(snap)
+	}
+}
+
+// dropClaudeSkewedHold clears a 429 hold ONLY while it is still parked beyond
+// the ceiling a Retry-After could legitimately reach. Sibling of
+// retireClaudeRefreshDebtAt and there for the same reason: the read that
+// spotted the skew is unlocked, so a probe that took a real 429 in the meantime
+// may already have replaced the value, and clearing on the stale read would
+// throw away live backpressure and send the next probe straight back at an
+// endpoint that just refused us.
+func dropClaudeSkewedHold(ceilingMs int64) func(*claudeRateLimitSnapshot) bool {
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.HeldUntilMs == 0 || snap.HeldUntilMs <= ceilingMs {
+			return false
+		}
+		snap.HeldUntilMs = 0
+		return true
+	}
+}
+
 /* ────────────────────────────────── pay ──────────────────────────────────── */
 
 // payOwedClaudeUsageRefresh replays, at most once per agent start, the refresh a
@@ -297,13 +338,13 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	switch {
 	case snap.HeldUntilMs <= 0:
 	case snap.HeldUntilMs > now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli():
-		mutateClaudeRateLimitSnapshot(path, fingerprint, func(s *claudeRateLimitSnapshot) bool {
-			if s.HeldUntilMs == 0 {
-				return false
-			}
-			s.HeldUntilMs = 0
-			return true
-		})
+		// Re-apply the ceiling INSIDE the lock. The read above is unlocked, so a
+		// probe that took a legitimate 429 in the meantime may already have
+		// replaced the skewed value — clearing on the stale read would throw
+		// away live backpressure and send the next probe straight back at an
+		// endpoint that just refused us.
+		mutateClaudeRateLimitSnapshot(path, fingerprint,
+			dropClaudeSkewedHold(now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()))
 	default:
 		held = time.UnixMilli(snap.HeldUntilMs)
 		// Carry the surviving hold into this process's gate too, so the ordinary
@@ -323,7 +364,13 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	if snap.RefreshOwedAtMs > now.Add(claudeRefreshOwedLocalSkew).UnixMilli() ||
 		now.Sub(owed) > claudeRefreshOwedMaxAge ||
 		snap.RefreshOwedAttempts >= claudeUsageProbeAfterRunMaxAttempts {
-		mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
+		// Retire the debt this replay JUDGED, never whatever is on disk by the
+		// time the lock is granted. This runs on a spawned goroutine, so a
+		// session of this process can finish and record a newer, perfectly
+		// payable debt between the unlocked read above and here; a blanket
+		// clear would silently discard it and leave that run's card stale —
+		// the very failure this file exists to fix.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
 		return
 	}
 
@@ -333,7 +380,9 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// on the debt alone would spend one OAuth request per restart for an answer
 	// we are holding.
 	if observed := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now); claudeUsageObservationCovers(observed, owed) {
-		mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
+		// Same rule: the reading covers the debt we read, and says nothing about
+		// a newer one recorded since.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
 		return
 	}
 

@@ -1644,7 +1644,18 @@ func triggerClaudeUsageProbeAfterRun() {
 	// CI runners. claudeUsageProbeAfterRun records it again for its own
 	// callers; recordOwed keeps the newest baseline, so the repeat is a no-op.
 	claudeUsageProbe.recordOwed(completedAt)
+	// Counted on the CALLER's goroutine, before the spawn — not left to
+	// claudeUsageProbePayRecordedRun's own beginSettling below. The durable
+	// mirror runs FIRST inside that goroutine, so a reset that sampled
+	// `settling` in the gap between the spawn and that call would see zero,
+	// declare the drain complete, and return while a cache write is still on
+	// its way to disk: in a test that is the next case's cache being written by
+	// the previous case's run, which is exactly the cross-test escape the drain
+	// exists to close. settling is a counter, so the nested beginSettling
+	// inside the settlement is harmless.
+	claudeUsageProbe.beginSettling()
 	go func() {
+		defer claudeUsageProbe.endSettling()
 		defer func() { _ = recover() }()
 		// Mirror the debt to disk BEFORE settling it, from this goroutine: the
 		// write takes the cache gate and flock, which must never be waited on

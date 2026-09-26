@@ -488,3 +488,88 @@ func TestMutateClaudeRateLimitSnapshot_StampsACreatedSnapshot(t *testing.T) {
 		t.Errorf("updatedAt moved on a debt-only write: %q -> %q", stamped, got)
 	}
 }
+
+// Every retire decision in payOwedClaudeUsageRefreshAt is made from an UNLOCKED
+// read, and that read can be overtaken by a run of this process finishing. The
+// clear must therefore be scoped to the debt it judged: a blanket clear would
+// discard a newer, perfectly payable debt and leave that run's card stale.
+func TestRetireClaudeRefreshDebtAt_OnlyClearsTheJudgedDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	judged := time.Now().Add(-time.Hour)
+	newer := time.Now()
+
+	// A newer run landed between the verdict and the lock.
+	seedClaudeRefreshDebt(t, cache, fp, newer, 0, time.Time{})
+	if mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(judged)) {
+		t.Fatal("a verdict about an older debt must not rewrite the cache")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != newer.UnixMilli() {
+		t.Fatalf("a newer debt was discarded by a stale verdict: %+v", snap)
+	}
+
+	// The debt it actually judged is cleared, counter and all.
+	seedClaudeRefreshDebt(t, cache, fp, judged, 1, time.Time{})
+	if !mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(judged)) {
+		t.Fatal("the judged debt must be retired")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("retire left the debt behind: %+v", snap)
+	}
+}
+
+// The skewed-hold clear is bounded the same way: only a hold still beyond the
+// ceiling is dropped, so a real 429 recorded between the unlocked read and the
+// lock keeps its backpressure.
+func TestDropClaudeSkewedHold_KeepsAHoldInsideTheCeiling(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	ceilingMs := now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
+
+	// A legitimate hold replaced the skewed one before the lock was granted.
+	legit := now.Add(30 * time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, now, 0, legit)
+	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
+		t.Fatal("a hold inside the ceiling must not be rewritten")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != legit.UnixMilli() {
+		t.Fatalf("live backpressure was discarded: %+v", snap)
+	}
+
+	// A hold exactly AT the ceiling is the longest one the bound allows.
+	seedClaudeRefreshDebt(t, cache, fp, now, 0, time.UnixMilli(ceilingMs))
+	if mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
+		t.Fatal("a hold exactly at the ceiling is legal and must be kept")
+	}
+
+	// One beyond it is a clock step.
+	seedClaudeRefreshDebt(t, cache, fp, now, 0, time.UnixMilli(ceilingMs+1))
+	if !mutateClaudeRateLimitSnapshot(cache, fp, dropClaudeSkewedHold(ceilingMs)) {
+		t.Fatal("a hold beyond the ceiling must be dropped")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != 0 {
+		t.Fatalf("skewed hold survived: %+v", snap)
+	}
+}
+
+// resetClaudeUsageProbeGate's drain must cover the DURABLE debt write, not just
+// the probe. The settlement counter is therefore raised on the caller's
+// goroutine, before the spawn: a reset that sampled it in the gap would declare
+// the drain complete while a cache write was still on its way to disk — in a
+// test, the next case's cache written by the previous case's run.
+func TestTriggerClaudeUsageProbeAfterRun_CountsTheDebtWriteInTheDrain(t *testing.T) {
+	armClaudeUsageProbe(t, unreachableProbeHandler)
+
+	triggerClaudeUsageProbeAfterRun()
+	// Sampled with no sleep: beginSettling is synchronous with the trigger, so
+	// this cannot be a timing-dependent read.
+	claudeUsageProbe.mu.Lock()
+	settling := claudeUsageProbe.settling
+	claudeUsageProbe.mu.Unlock()
+	if settling == 0 {
+		t.Fatal("the trigger returned with settling=0; a reset could drain past the pending debt write")
+	}
+	claudeFreshnessWaitIdle(t)
+}
