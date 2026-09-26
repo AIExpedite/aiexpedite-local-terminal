@@ -1253,7 +1253,8 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// A debt no probe of this gather could pay is not adopted, and — crucially —
 	// not CHARGED. begin() refuses on an unarmed gate, a live 429 hold (possibly
 	// the one this seed adopted two statements up), offline mode, an unelapsed
-	// throttle interval with nothing on the wire to inherit, or a context that
+	// throttle interval with nothing on the wire to inherit, a rejected endpoint
+	// override, or a context that
 	// has already ended, so a charge here would buy a request that is never
 	// issued: two such starts reach the attempt cap and the startup replay then
 	// retires a debt nothing ever asked the endpoint about, leaving the pre-run
@@ -1486,10 +1487,10 @@ var claudeUsageProbeAfterSeedCharge = func() {}
 
 // blockedFromIssuing reports whether begin() would refuse every probe this
 // gather could still make, for a reason that is not transient contention: an
-// unarmed (opted-out) gate, a live server-imposed hold, offline mode, or an
+// unarmed (opted-out) gate, a live server-imposed hold, offline mode, an
 // in-memory throttle interval that has not elapsed with no probe on the wire to
-// inherit. Used by seedOwedFromCache to decline — uncharged — a debt it cannot
-// hand a payable request to.
+// inherit, or a rejected endpoint override. Used by seedOwedFromCache to
+// decline — uncharged — a debt it cannot hand a payable request to.
 //
 // The interval IS consulted, because begin() checks it too: the `owing` branch
 // beats the staleness TTL and the cross-process dedupe baseline, not the
@@ -1516,6 +1517,19 @@ func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 		return true
 	}
 	if throttled {
+		return true
+	}
+	// A rejected endpoint override (malformed or non-loopback) is the one
+	// refusal that lives PAST admission: begin() lets the probe through, it
+	// resolves the credential, and probeClaudeUsage then returns issued=false
+	// without putting anything on the wire. The gather never reports that flag
+	// back here — the adoption hands the debt to a later `owing` branch — so
+	// unlike the startup replay, which refunds its charge on that same exit,
+	// the seed has no way to give the attempt back. Two such starts would reach
+	// the cap and retire a debt no request was ever made for. Checked ahead of
+	// the charge instead, which is the same uncharged-refusal rule the rest of
+	// this function applies; it is an env read and a url.Parse, no I/O.
+	if claudeUsageProbeURL() == "" {
 		return true
 	}
 	return IsOffline()

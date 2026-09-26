@@ -2445,3 +2445,62 @@ func TestClaudeUsageProbeGate_CacheSeedLatchesTheStampTheChargeWrote(t *testing.
 		t.Errorf("in-memory hold=%v, want the hold %v written after the charge released the lock", gateHold, held)
 	}
 }
+
+// A rejected endpoint override (malformed or non-loopback) is refused PAST
+// admission: begin() lets the probe through and probeClaudeUsage returns
+// issued=false without sending anything. The startup replay refunds its charge
+// on that exit; the seed cannot, because the gather never reports the flag back
+// to it. So two such gathers would reach the attempt cap and the next start
+// would retire a debt no request was ever made for — leaving the pre-run
+// utilization stale for the whole TTL. Declined uncharged and unlatched ahead of
+// the charge instead.
+func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhenTheEndpointIsRejected(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	loopback := os.Getenv(claudeUsageProbeEndpointEnv)
+	// Set and then ignored: claudeUsageProbeURL() refuses a non-loopback
+	// override rather than falling back to the real endpoint.
+	t.Setenv(claudeUsageProbeEndpointEnv, "https://example.invalid/api/oauth/usage")
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	blocked := 0
+	originalBlocked := claudeUsageProbeSeedBlocked
+	t.Cleanup(func() { claudeUsageProbeSeedBlocked = originalBlocked })
+	claudeUsageProbeSeedBlocked = func() { blocked++ }
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero while the endpoint override is rejected", got)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked adoptions=%d, want 1", blocked)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("adopted owed=%v for a debt no request can be issued for", got)
+	}
+	if owed, attempts, _ := claudePersistedProbeStateFor(fp); owed.UnixMilli() != runEnded.UnixMilli() || attempts != 0 {
+		t.Errorf("persisted debt=%v attempts=%d, want the debt left payable at 0 attempts", owed, attempts)
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Errorf("request count=%d, want 0 — nothing reaches the wire", atomic.LoadInt64(calls))
+	}
+
+	// The operator fixes the override. The snapshot has not changed, so only an
+	// UNCLAIMED latch lets this gather reach the adoption at all.
+	t.Setenv(claudeUsageProbeEndpointEnv, loopback)
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the gather has a probe to issue", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
+		t.Errorf("adopted owed=%v once the endpoint resolved, want the persisted debt %v", got, runEnded)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
+		t.Errorf("RefreshOwedAttempts=%d, want 1 — charged by the adoption that can actually issue", attempts)
+	}
+}
