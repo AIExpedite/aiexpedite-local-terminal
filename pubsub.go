@@ -1836,8 +1836,14 @@ func runPubSubConnection(cfg *Config) error {
 		// confirmation the backend already enforced — even if the raw command
 		// would otherwise be allowlisted. The riskLevel is HMAC-signed so it
 		// can't be stripped to skip this gate. See requiresNativeApprovalForStep.
-		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) ||
-			requiresNativeApprovalForStep(cmd) {
+		//
+		// The setup checklist's built-in device commands (env_setup_commands.go)
+		// are not raw command lines, so the allow list does not apply to them;
+		// they take the native dialog exactly when their effective risk demands
+		// it — always for a sign-in (external_write).
+		gate := executeApprovalGate(cfg, defaultAllowList, cmd)
+		setupDeviceCmd := gate.DeviceCommand
+		if gate.Needed {
 			// Command not in allow list (or high-risk step) - show approval dialog
 
 			// Get timeout settings from config
@@ -1850,12 +1856,12 @@ func runPubSubConnection(cfg *Config) error {
 			// update never restarts the process while the user is still
 			// reading the dialog (drain.go).
 			trackApprovalStart()
-			result := commandApprovalDialogFn(cmd.Command, cmd.Args, timeoutSec)
+			result := commandApprovalDialogFn(gate.DialogCommand, gate.DialogArgs, timeoutSec)
 			trackApprovalEnd()
 
 			// Resolve the allow-on-timeout policy — deliberately NOT honored for
 			// destructive Environment Setup steps (see applyTimeoutPolicy).
-			result = applyTimeoutPolicy(result, cfg, cmd)
+			result = applyTimeoutPolicy(result, cfg, gate.PolicyCommand)
 
 			switch result {
 			case ApprovalDeny:
@@ -1883,7 +1889,9 @@ func runPubSubConnection(cfg *Config) error {
 				// InitAllowList is skipped in that config. Guard persistence
 				// like the session path does rather than panic (which would
 				// nack/redeliver the setup step forever).
-				if defaultAllowList != nil {
+				// A device command is not a command line, so there is no pattern
+				// to remember (and a sign-in prompts every time regardless).
+				if defaultAllowList != nil && !setupDeviceCmd {
 					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
 					if err := defaultAllowList.AddPattern(pattern); err != nil {
 						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
@@ -1930,8 +1938,17 @@ func runPubSubConnection(cfg *Config) error {
 		cmdStartedAt := time.Now()
 
 		// Execute command (silently - no internal logs). Routes tty=true to the
-		// PTY path; all other commands take the hardened pipe path.
-		out, execErr := executeTerminalCommand(cfg, cmd)
+		// PTY path; all other commands take the hardened pipe path. The setup
+		// checklist's device commands are intercepted here and never exec'd.
+		var out string
+		var execErr error
+		if setupDeviceCmd {
+			devCtx, devCancel := context.WithTimeout(context.Background(), resolveExecTimeout(cmd.TimeoutMs))
+			out, execErr = runEnvSetupDeviceCommand(devCtx, cfg, cmd)
+			devCancel()
+		} else {
+			out, execErr = executeTerminalCommand(cfg, cmd)
+		}
 
 		// Debug mode: show raw output details (redacted)
 		if cfg.DebugMode {
@@ -1953,8 +1970,14 @@ func runPubSubConnection(cfg *Config) error {
 			fmt.Println(redactSensitiveData(out))
 		}
 
-		// Redact sensitive data from output before publishing to Pub/Sub
+		// Redact sensitive data from output before publishing to Pub/Sub. A
+		// device command's JSON was redacted value by value before encoding
+		// (runEnvSetupDeviceCommand); a whole-output pass would let a `\S+`
+		// pattern run across JSON punctuation and corrupt the document.
 		redactedOut := redactSensitiveData(out)
+		if setupDeviceCmd {
+			redactedOut = out
+		}
 
 		res := resultMsg{
 			ID:          cmd.ID,
@@ -1977,7 +2000,7 @@ func runPubSubConnection(cfg *Config) error {
 		// MOST want the image to reach the orchestrator — gating on a
 		// successful exit code was the previous behavior, and it dropped
 		// screenshots from the crashes we most needed to debug.
-		if cfg.EnableFileUpload {
+		if cfg.EnableFileUpload && !setupDeviceCmd {
 			// Resolve a single, correctly-scoped scan dir (unchanged
 			// precedence): the post-`cd` tracked cwd, else the command's
 			// own cwd, else the home WorkingDirectory as last resort. These
@@ -2546,6 +2569,11 @@ func resolveWorkDir(cfg *Config, cwd string) string {
 // agent commands only) and everything else to the hardened pipe path. Git and
 // test runners are forced onto pipes even when tty=true (design guardrail).
 func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
+	// Re-read PATH first so a tool the previous setup step installed resolves
+	// here without an agent restart (path_refresh.go). Every transport below —
+	// PTY, one-shot shells, the persistent PowerShell (re-synced in Execute) —
+	// spawns from this process's PATH.
+	refreshCommandPath()
 	// PTY is an allowlist: only a recognized resident TUI agent may run under a
 	// PTY. Everything else (git, test runners, bash/sh/PowerShell, ssh, …) stays
 	// on the hardened pipe path even with tty=true, so unsigned tty can't flip a
@@ -5903,6 +5931,34 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 		return false
 	}
 	return !al.IsAllowed(cmd, args)
+}
+
+// approvalGate is the approval decision for one inbound `execute` command.
+type approvalGate struct {
+	Needed        bool       // show the native approval dialog
+	DeviceCommand bool       // a setup checklist device command (env_setup_commands.go)
+	DialogCommand string     // what the dialog shows
+	DialogArgs    []string   //
+	PolicyCommand commandMsg // what applyTimeoutPolicy judges (effective risk)
+}
+
+// executeApprovalGate decides whether an execute command needs the native
+// approval dialog. Ordinary commands: when the allow list does not permit them
+// or their signed riskLevel forces native approval. The setup checklist's device
+// commands are not raw command lines, so the allow list does not apply; they are
+// gated by their EFFECTIVE risk alone (a sign-in is always external_write), and
+// a sign-in's dialog shows the argv it will run.
+func executeApprovalGate(cfg *Config, al *AllowList, cmd commandMsg) approvalGate {
+	g := approvalGate{DialogCommand: cmd.Command, DialogArgs: cmd.Args, PolicyCommand: cmd}
+	if isEnvSetupDeviceCommand(cmd.Command) {
+		g.DeviceCommand = true
+		g.Needed = envSetupCommandNeedsApproval(cmd)
+		g.DialogCommand, g.DialogArgs = envSetupApprovalDisplay(cmd)
+		g.PolicyCommand.RiskLevel = effectiveEnvSetupRisk(cmd)
+		return g
+	}
+	g.Needed = shouldGateExecuteCommand(cfg, al, cmd.Command, cmd.Args) || requiresNativeApprovalForStep(cmd)
+	return g
 }
 
 // commandApprovalDialogFn is an indirection over ShowCommandApprovalDialog so

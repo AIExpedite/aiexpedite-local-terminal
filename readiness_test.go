@@ -76,6 +76,8 @@ func TestEvaluateReadiness_NilMachineIsBlocked(t *testing.T) {
 }
 
 func TestEvaluateReadiness_MissingToolsNeedsSetup(t *testing.T) {
+	// needs_setup here comes from missing Git alone; Node and Codex ride along
+	// as informational findings with their actions.
 	m := healthyMachine()
 	delete(m.Tools, "git")
 	delete(m.Runtimes, "node")
@@ -109,14 +111,15 @@ func TestEvaluateReadiness_MissingToolsNeedsSetup(t *testing.T) {
 }
 
 func TestEvaluateReadiness_NodeWithoutNpmWarns(t *testing.T) {
-	// Split-package distros can have node present but npm absent; the
-	// npm-based setup steps would then fail on a machine reported "ready".
+	// Split-package distros can have node present but npm absent. The finding
+	// and its install action stay, but it is informational: the server decides
+	// whether this computer's work needs npm, so it no longer forces needs_setup.
 	m := healthyMachine()
 	delete(m.PackageManagers, "npm")
 
 	report := evaluateReadiness(m)
-	if report.State != ReadinessNeedsSetup {
-		t.Fatalf("expected needs_setup when npm is missing, got %s (findings: %+v)", report.State, report.Findings)
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("expected ready_with_warnings when only npm is missing, got %s (findings: %+v)", report.State, report.Findings)
 	}
 	f := findFinding(report.Findings, "missing_npm")
 	if f == nil {
@@ -131,6 +134,66 @@ func TestEvaluateReadiness_NodeWithoutNpmWarns(t *testing.T) {
 	// When node itself is missing we warn on node, not npm (npm-comes-with-node).
 	if findFinding(report.Findings, "missing_node") != nil {
 		t.Fatalf("did not expect missing_node when node is installed")
+	}
+}
+
+// Node, npm and Codex are informational since the setup checklist: the server
+// computes work readiness from the workspace's repositories and the signed-in
+// coding agents (COMPUTER_SETUP_CHECKLIST_PLAN.md §6). A computer with Git and
+// sound hardware but no Node / Codex is ready_with_warnings, never needs_setup,
+// and still carries the findings and install actions.
+func TestEvaluateReadiness_MissingNodeAndCodexAreInformational(t *testing.T) {
+	m := healthyMachine()
+	delete(m.Runtimes, "node")
+	delete(m.PackageManagers, "npm")
+	m.DetectedCliAgents = map[string]detectedCLIAgent{}
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("expected ready_with_warnings, got %s (findings: %+v)", report.State, report.Findings)
+	}
+	for _, code := range []string{"missing_node", "missing_codex"} {
+		f := findFinding(report.Findings, code)
+		if f == nil || f.Severity != FindingWarning {
+			t.Fatalf("expected %s as a warning finding, got %+v", code, f)
+		}
+		if findAction(report.Actions, code) == nil {
+			t.Fatalf("expected the %s install action to stay", code)
+		}
+	}
+}
+
+func TestEvaluateReadiness_InformationalNeverOverridesHardware(t *testing.T) {
+	m := healthyMachine()
+	delete(m.Runtimes, "node")
+	m.Memory = &memoryInfo{TotalGB: 4}
+	if got := evaluateReadiness(m).State; got != ReadinessUnderpower {
+		t.Fatalf("expected underpowered to win over informational findings, got %s", got)
+	}
+	m = healthyMachine()
+	m.DetectedCliAgents = map[string]detectedCLIAgent{}
+	m.Disk = []diskEntry{{Drive: "/", SizeGB: 500, FreeGB: 1}}
+	if got := evaluateReadiness(m).State; got != ReadinessBlocked {
+		t.Fatalf("expected blocked to win over informational findings, got %s", got)
+	}
+}
+
+func TestDeriveReadinessState_InformationalCodes(t *testing.T) {
+	for code := range informationalSoftwareCodes {
+		got := deriveReadinessState([]ReadinessFinding{{Code: code, Severity: FindingWarning}})
+		if got != ReadinessReadyWithWarnings {
+			t.Errorf("%s alone: expected ready_with_warnings, got %s", code, got)
+		}
+		got = deriveReadinessState([]ReadinessFinding{
+			{Code: code, Severity: FindingWarning},
+			{Code: "missing_git", Severity: FindingWarning},
+		})
+		if got != ReadinessNeedsSetup {
+			t.Errorf("%s + missing_git: expected needs_setup (Git still gates), got %s", code, got)
+		}
+	}
+	if _, ok := informationalSoftwareCodes["missing_git"]; ok {
+		t.Fatal("missing_git must keep gating readiness")
 	}
 }
 

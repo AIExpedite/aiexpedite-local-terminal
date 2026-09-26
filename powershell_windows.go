@@ -63,6 +63,13 @@ type PersistentPowerShell struct {
 	lastUsed   time.Time
 	isPwsh     bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
 	lastCwd    string // last known working directory of this PS process
+	// lastPath is the PATH this PS process was last given: the agent's PATH at
+	// spawn, then whatever Execute re-synced. refreshCommandPath (path_refresh.go)
+	// rewrites the AGENT's PATH after an install, but this long-lived child fixed
+	// its own copy at spawn — so Execute re-sends $env:Path whenever the agent's
+	// PATH moved on, or a tool installed by the previous step would stay
+	// "not recognized" here until the agent restarted.
+	lastPath string
 }
 
 var (
@@ -149,6 +156,7 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		stderr:     stderr,
 		lastUsed:   time.Now(),
 		isPwsh:     psExe == "pwsh.exe",
+		lastPath:   os.Getenv("PATH"),
 	}
 	ps.healthy.Store(true)
 
@@ -215,6 +223,14 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		fullCmd.WriteString(fmt.Sprintf("Set-Location -LiteralPath '%s'; ", escapedCwd))
 	}
 
+	// Re-sync PATH when the agent's own PATH changed since this process last saw
+	// it (see lastPath).
+	syncedPath := ""
+	if cur := os.Getenv("PATH"); cur != "" && cur != ps.lastPath {
+		fullCmd.WriteString(persistentPSPathAssignment(cur))
+		syncedPath = cur
+	}
+
 	// Reset $LASTEXITCODE to 0 before running the user command.
 	// PowerShell only updates $LASTEXITCODE when a native executable is invoked;
 	// pure-cmdlet commands (Write-Host, Get-ChildItem, etc.) leave it unchanged.
@@ -242,6 +258,9 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	if err != nil {
 		ps.healthy.Store(false)
 		return "", fmt.Errorf("failed to send command: %w", err)
+	}
+	if syncedPath != "" {
+		ps.lastPath = syncedPath
 	}
 
 	// Read output until delimiter with timeout, capturing exit code and cwd markers

@@ -189,6 +189,9 @@ type oidcTokenResponse struct {
 	Error           string                 `json:"error,omitempty"`
 	ErrorDesc       string                 `json:"error_description,omitempty"`
 	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
+	// SetupToolCatalog: the tool detect probes for the computer setup
+	// checklist. nil = absent (an older backend); stored like cliAgentCatalog.
+	SetupToolCatalog []setupToolCatalogEntry `json:"setupToolCatalog,omitempty"`
 }
 
 // getOIDCToken requests an OIDC ID token from our backend.
@@ -304,6 +307,9 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		if mi.DockerRunning != nil {
 			payload["dockerRunning"] = *mi.DockerRunning
 		}
+		if mi.Virtualization != nil {
+			payload["virtualization"] = mi.Virtualization
+		}
 	}
 
 	body, err := json.Marshal(payload)
@@ -342,6 +348,7 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	}
 
 	persistCLIAgentCatalogUpdate(ts.cfg, tokenResp.CliAgentCatalog, "auth", "token response")
+	persistSetupToolCatalogUpdate(ts.cfg, tokenResp.SetupToolCatalog, "auth", "token response")
 
 	if tokenResp.IDToken == "" {
 		return "", fmt.Errorf("empty id_token in response")
