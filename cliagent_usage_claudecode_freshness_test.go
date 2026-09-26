@@ -817,3 +817,102 @@ func TestPayOwedClaudeUsageRefresh_SpawnsBoundedAndContainsAPanic(t *testing.T) 
 		}
 	})
 }
+
+// The attempt charge must reach DISK before the request does. With another
+// writer holding the cache gate past the best-effort wait the charge is
+// dropped, and probing anyway would leave RefreshOwedAttempts untouched — one
+// startup request per restart, forever, on a persistently contended cache. The
+// debt is left uncharged and payable instead.
+func TestPayOwedClaudeUsageRefresh_UnpersistedChargeIssuesNoRequest(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+
+	original := claudeRateLimitBestEffortGateWait
+	claudeRateLimitBestEffortGateWait = 20 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitBestEffortGateWait = original })
+
+	lockClaudeRateLimitCache()
+	payOwedClaudeUsageRefreshAt(now)
+	unlockClaudeRateLimitCache()
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — an uncharged attempt must not go out", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != owed.UnixMilli() {
+		t.Fatalf("the debt must stand for the next start: %+v", snap)
+	}
+	if snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("RefreshOwedAttempts=%d, want 0 — the charge never reached disk", snap.RefreshOwedAttempts)
+	}
+}
+
+// The startup replay races the first gather's seed: it can persist a covering
+// reading and clear the debt on disk AND on the gate while the seed's unlocked
+// cache read is in flight. Adopting the value read before that would resurrect
+// a PAID debt, and the gather's own probe would then be refused by the throttle
+// the replay just spent — publishing the pre-replay view. The seed must detect
+// the settlement and hand the covering reading back instead.
+func TestClaudeUsageProbeGate_CacheSeedDoesNotResurrectASettledDebt(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-time.Minute)
+	latest := runEnded.Add(-time.Minute) // the PRE-update reading this gather loaded
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	settled := runEnded.Add(time.Second)
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+	// Stand in for the startup replay landing inside the race window: a probe of
+	// this process persisted a covering reading, settled the debt on the gate,
+	// and cleared it on disk.
+	claudeUsageProbeAfterSeedRead = func() {
+		claudeUsageProbe.mu.Lock()
+		claudeUsageProbe.refreshes++
+		claudeUsageProbe.lastRefreshAt = settled
+		claudeUsageProbe.lastRefreshFingerprint = fp
+		claudeUsageProbe.owedBaseline = time.Time{}
+		claudeUsageProbe.mu.Unlock()
+		mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
+	}
+
+	got := claudeUsageProbe.seedOwedFromCache(fp, latest)
+
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("a settled debt was resurrected on the gate as %v", owed)
+	}
+	if got.UnixMilli() != settled.UnixMilli() {
+		t.Fatalf("seedOwedFromCache()=%v, want the covering reading %v so the gather re-reads the cache", got, settled)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("the seed issued %d requests, want 0 — it is a pure cache read", n)
+	}
+}
+
+// A debt the gather's OWN reading already covers is not adopted: probing for an
+// observation the caller is holding spends a request for nothing.
+func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheCallerAlreadyCovers(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-time.Minute)
+	seedClaudeProbeReading(t, cache, runEnded.Add(time.Second))
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	if got := claudeUsageProbe.seedOwedFromCache(fp, runEnded.Add(time.Second)); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the caller's own reading needs no re-read", got)
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("a debt the caller's reading already covers was adopted as %v", owed)
+	}
+	_ = cache
+}

@@ -425,7 +425,20 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// Charged at exactly one point: after every refusal has been cleared and
 	// immediately before the request goes out. A crash mid-request still costs
 	// the attempt, so a restart loop cannot replay the same debt forever.
-	mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1))
+	//
+	// The charge must reach DISK before the request does. The write is
+	// best-effort like every other non-verified one here, so another cache
+	// writer holding the gate or the flock past claudeRateLimitBestEffortGateWait
+	// drops it — and probing anyway would leave the counter untouched, so a
+	// device whose cache is persistently contended would issue one startup
+	// request per restart forever. That counter is the only thing bounding a
+	// crash-looping agent against an account-scoped endpoint, so an uncharged
+	// attempt does not go out. The debt and its counter are left exactly as
+	// found, so the next start still pays it — and this process's own trailing
+	// probe or gather can still pay it now, from the gate seeded just above.
+	if !mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+		return
+	}
 
 	// ONE bounded attempt, through the ordinary single-flight probe. Whatever it
 	// finds (or fails to find) is left to the ordinary gather/refresh bounds; the
