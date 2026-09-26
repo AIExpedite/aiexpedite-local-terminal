@@ -1953,3 +1953,50 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 		})
 	}
 }
+
+// A snapshot another process renames in AFTER the seed samples the cache stamp
+// but BEFORE the locked latch test still matches the recorded stamp, so the
+// latch would hand back the previous snapshot's verdict and never read the debt
+// or Retry-After that write carried. The post-latch recheck re-stats and, on a
+// moved file, falls back through the loop into a full adoption.
+func TestClaudeUsageProbeGate_CacheSeedRechecksTheStampAfterTheLatch(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	// First gather: claims the latch and adopts the (debt-free) snapshot.
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+
+	originalStamp := claudeUsageProbeAfterSeedStamp
+	t.Cleanup(func() { claudeUsageProbeAfterSeedStamp = originalStamp })
+	ranAt, held := now.Add(-time.Minute), now.Add(15*time.Minute)
+	var stampOnce sync.Once
+	claudeUsageProbeAfterSeedStamp = func() {
+		stampOnce.Do(func() {
+			// Another agent channel writes a debt and a 429 in the window between
+			// this gather's stat and its latch test.
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAtMs, snap.HeldUntilMs = ranAt.UnixMilli(), held.UnixMilli()
+				return true
+			})
+		})
+	}
+
+	// Second gather: samples the pre-write stamp, which still matches the latch.
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != ranAt.UnixMilli() {
+		t.Errorf("owedBaseline=%v, want the debt written inside the stat-to-latch window %v", got, ranAt)
+	}
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != held.UnixMilli() {
+		t.Errorf("in-memory hold=%v, want the hold written inside that same window %v", gateHold, held)
+	}
+}

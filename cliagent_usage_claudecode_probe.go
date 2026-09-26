@@ -1096,6 +1096,8 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint string, generation uint64, now, latest time.Time) time.Time {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
+	// One-shot, for the post-latch stamp recheck below.
+	revalidated := false
 	for seeding == nil {
 		// Sampled BEFORE any read and off g.mu — a write landing between this stat
 		// and the reads below leaves the recorded stamp OLDER than the content
@@ -1112,6 +1114,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		// is the same as landing after this gather returned: the next gather's stamp
 		// differs and re-opens the adoption.
 		stampMod, stampSize = claudeRateLimitCacheStamp()
+		claudeUsageProbeAfterSeedStamp()
 		g.mu.Lock()
 		if g.owedSeeded && g.owedSeededFor == fingerprint &&
 			g.owedSeededStampMod == stampMod && g.owedSeededStampSize == stampSize {
@@ -1124,6 +1127,28 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			// past.
 			superseded := g.supersedingObservationLocked(g.owedSeededObservation, latest, now)
 			g.mu.Unlock()
+			// The stamp above was sampled off g.mu, so a snapshot another process
+			// renamed in between that stat and the latch test still matches the
+			// recorded one: the latch would hand back a verdict about the PREVIOUS
+			// snapshot and never read the debt or Retry-After that write carried.
+			// Re-stat after the decision and, when the file moved, fall back
+			// through the loop — the next pass samples the new stamp, misses the
+			// latch and performs a full adoption.
+			//
+			// ONE recheck, not a retry loop: the window cannot be closed by
+			// stat-based detection (a write can always land after the last stat),
+			// and spinning against a hot writer would block the gather. What makes
+			// a still-missed write harmless is that a latch HIT records nothing —
+			// the stamp on the gate stays the claimant's, older than what is now on
+			// disk — so the next gather's sample differs and re-opens the adoption
+			// regardless. This only shortens the exposure from "until the next
+			// gather" to the width of the recheck.
+			if !revalidated {
+				if mod, size := claudeRateLimitCacheStamp(); mod != stampMod || size != stampSize {
+					revalidated = true
+					continue
+				}
+			}
 			return superseded
 		}
 		if pending := g.seedingCh; pending != nil {
@@ -1281,6 +1306,12 @@ var claudeUsageProbeAfterSeedRead = func() {}
 // test: it runs when a gather is about to block on another gather's adoption.
 // Production leaves it as a no-op.
 var claudeUsageProbeSeedWaiting = func() {}
+
+// claudeUsageProbeAfterSeedStamp is an observation point for the post-latch
+// stamp recheck test: it sits in seedOwedFromCache between the off-lock stamp
+// sample and the locked latch test, the exact window a cross-process rename has
+// to slip through. Production leaves it as a no-op.
+var claudeUsageProbeAfterSeedStamp = func() {}
 
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
 // deadline is zero (no usable Retry-After).
