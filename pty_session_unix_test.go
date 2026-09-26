@@ -142,15 +142,7 @@ func TestRunPTYCommand_ArmsQuotaCaptureForShellWrappedAntigravity(t *testing.T) 
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Fatalf("arms=%d, want exactly one for a shell-wrapped agy PTY run", got)
 	}
-	stopped := antigravityCaptureStopped()
-	if stopped == nil {
-		t.Fatal("no capture poller was started")
-	}
-	select {
-	case <-stopped:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the PTY run leaked its quota capture")
-	}
+	helperAwaitCaptureStopped(t, "the PTY run leaked its quota capture", "no capture poller was started")
 	if got := antigravityCaptureFinishes.Load(); got != 1 {
 		t.Errorf("finishes=%d, want exactly one", got)
 	}

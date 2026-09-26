@@ -941,7 +941,14 @@ identity comes from `~/.gemini/antigravity-cli/settings.json`, or from legacy
    cache's producer wins: the cache is replayed and the card takes the *probe's*
    account and plan, because that server's login is newer than the one the file
    still records. The probe is matched against the CACHE, never against
-   `settings.json`.
+   `settings.json`. A **Code Assist** read (the click on a gated build, or the
+   run-completion refresh below) was taken with the stored keyring login
+   itself, so its attestation does not age out with that TTL: the reading carries
+   it on disk (`storedLoginRead`) and it holds for as long as the cache still
+   carries that reading (`antigravityProducerAttests`), across a restart or a
+   self-update. Without that, a reading the refresh landed minutes before the
+   next periodic gather fell back to `Unknown` rows whenever `settings.json`
+   named a different account — or whenever the agent was replaced in between.
 
 A file-named account with no such probe and no matching cache leaves the reading
 unreplayed.
@@ -1206,19 +1213,22 @@ size: no rollout scanning, no cursor, one outbound read.
   its write keeps the full budget its own floor is owed. Both mirror
   `codexRunDebtWorker`'s `claimWorker` / `takeRearm` / `releaseWorker` and
   `codexDebtID`. A new debt's first read is spaced by
-  `antigravityRefreshMinInterval` (60 s); a retry within one debt is the same
+  `antigravityRefreshMinInterval` (60 s); a retry within one pass is the same
   unpaid run and bypasses it, as does the startup adoption. A debt the interval
-  blocks is KEPT, not dropped — there is deliberately no timer to come back for
-  it, because the next run's settle (or the next agent start) pays it, and a
-  background timer per debt is work the user never asked for. The Refresh click
-  does not go through this worker, so a user-initiated refresh is never
-  throttled by it. **Ceiling: one outbound call per minute, whatever the run
-  volume** — 200 short runs in an hour still spend at most 60.
+  blocks is KEPT and handed to the refresh schedule below, which comes back for
+  it once the interval lapses. The Refresh click does not go through this
+  worker, so a user-initiated refresh is never throttled by it — but its Code
+  Assist read does record `lastPaidAtMs` (`antigravityRecordClickRead`, and
+  nothing else: no attempt, no clear, no floor), so a nudge in the click's own
+  follow-up gather cannot send a second read seconds later. **Ceiling: one
+  outbound call per minute, whatever the run volume** — 200 short runs in an
+  hour still spend at most 60.
 - **It never runs a model turn.** The click may run the `agy models` warm-up to
   make the CLI refresh its own keyring token; doing that behind the user's back
   on run teardown is a different class of side effect. So `codeassist_token_expired`
   KEEPS the debt and its budget (the next real run refreshes the keyring for
-  free) and only `codeassist_no_login` stops attempting. The build the request
+  free, and the schedule re-checks on its free rung) and only
+  `codeassist_no_login` stops attempting. The build the request
   identifies itself as comes from `antigravityCodeAssistBuildVersion` — the same
   cached `--version` detection already ran, shared with the click; on a cold
   cache that is one short `<agy> --version` child (bounded by
@@ -1226,8 +1236,8 @@ size: no rollout scanning, no cursor, one outbound read.
   unresolvable build is fine: `antigravityCodeAssistUserAgent` falls back to the
   pinned build the licence rule was verified on.
 - **Skipped entirely while offline** (`IsOffline`): an offline agent makes no
-  outbound request, and the debt waits for the next run rather than retiring,
-  because offline is temporary. An **uninstalled** `agy` retires it without an
+  outbound request, and the debt is kept — with its budget — on the schedule's
+  free rung rather than retiring, because offline is temporary. An **uninstalled** `agy` retires it without an
   attempt — no retry and no notice for a provider the card no longer shows.
   "Uninstalled" resolves the ACTIVE catalog's command for the provider
   (`antigravityCatalogCommand`, falling back to `agy`) through PATH and the
@@ -1250,8 +1260,11 @@ size: no rollout scanning, no cursor, one outbound read.
   is temp-file + rename like the quota snapshot's, because a truncate-in-place
   interrupted by exactly the kill or self-replace this record exists for would
   read back as invalid JSON, i.e. no debt at all), so `StartAgent`'s
-  `payOwedAntigravityUsageRefresh` pays ONE bounded read for a run the previous
-  process never settled (crash, restart, self-update) — placed after `isOffline`
+  `payOwedAntigravityUsageRefresh` re-arms a retry the previous process booked
+  and that is not yet due (for its remainder, paying nothing — a restart loop
+  must not burn the budget in seconds), or else pays ONE bounded read for a run
+  the previous process never settled (crash, restart, self-update) and puts any
+  remainder back on the ladder — placed after `isOffline`
   is published so the first attempt honours offline mode, and run entirely off
   the boot goroutine. It adopts only a floor stamped BEFORE that call's own
   instant: the replay is spawned, so a session of this process can arm first,
@@ -1261,16 +1274,22 @@ size: no rollout scanning, no cursor, one outbound read.
   (`codexOweInterruptedRun` guards the same race with `armedLocally`.) A floor further than
   `antigravityRunFloorLocalSkew` (30 s) ahead of `now` is a clock rollback and is
   discarded rather than parked in the future; a debt older than
-  `antigravityRefreshOwedMaxAge` (30 min) retires, so an unpayable one can never
-  pin a worker or a warning forever.
+  `antigravityRefreshOwedMaxAge` (6 h) retires, so an unpayable one can never
+  pin a worker or a warning forever. Until then a spent debt keeps its
+  `outcome`, so the notice can say why the figure is behind.
 - **Report.** `antigravityFreshnessNotice(lastObservedAt, now) (notice, pending)`
-  is the single accessor — no caller reads the state file. `notice` is empty on
-  a gated build (the gate banner above already names the build and the reading's
-  age; two sources for one banner would drift) and until the bounded attempts
-  are spent. `pending` doubles as the "is a debt owed" query, and suppresses
-  `antigravityMissedRun` for the same run so the pair cannot double-report it.
-- **Redaction.** The state file holds `schemaVersion`, four epoch-millisecond
-  fields, an attempt count, the `gated` bool, the hashed `accountFingerprint`
+  is the single accessor — no caller reads the state file. `notice` is empty
+  until the debt's budget (`antigravityRefreshDebtMaxAttempts`) is spent, except
+  for an expired stored login, which no attempt of ours can pay and is worded
+  at once ("the next Antigravity run renews it"). The three causes are a missing
+  login, an expired one, and a read that kept failing. It is worded on a gated
+  build too: `ParseContext` lets the gate banner own the card while the gate is
+  the newer fact, and renders this notice in the gated arm otherwise — before,
+  every current (gated) build's spent debt could never say anything. `pending`
+  doubles as the "is a debt owed" query, and suppresses `antigravityMissedRun`
+  for the same run so the pair cannot double-report it.
+- **Redaction.** The state file holds `schemaVersion`, five epoch-millisecond
+  fields (the fifth is the schedule's `nextAttemptAtMs`), an attempt count, the `gated` bool, the hashed `accountFingerprint`
   (written by the PAYMENT — at arm time no server has named an account; it is
   diagnostic only, since clearing is decided by time alone) and a closed-set
   `codeassist_*` outcome. Never a token, a keyring payload, `settings.json`
@@ -1281,11 +1300,87 @@ size: no rollout scanning, no cursor, one outbound read.
   now costs an outbound Google call per false positive, so it belongs in its own
   change with its own false-positive review.
 - **Test seams.** `AIEXPEDITE_AGY_FRESHNESS` relocates the state file;
-  `antigravityRefreshAfterRunRetryDelay` and `antigravityRefreshMinInterval` are
-  vars so a test pins them small; `antigravityUsageRefreshWaitIdle` waits the
-  single-flight worker out. The mock CLI mode `antigravity-quota-gated`
+  `antigravityRefreshAfterRunRetryDelay`, `antigravityRefreshMinInterval`,
+  `antigravityRunDebtRetryLadder`, `antigravityRunDebtFreeRetryDelay` and
+  `antigravityRefreshNudgeCooldown` are vars so a test pins them small;
+  `antigravityUsageRefreshWaitIdle` waits the single-flight worker (and a firing
+  rung) out, and `stopAntigravityRunDebtRetry` cancels a pending rung. The mock CLI mode `antigravity-quota-gated`
   (`session_integration_test.go`) is a child-owned language server that refuses
   every RPC — the shape every current build has.
+
+### Refresh schedule: a kept debt always comes back
+
+The worker above used to have no clock of its own. The minimum-interval defer,
+`IsOffline()`, `codeassist_token_expired` and a transient miss that spent the
+pass's attempts all left the debt on disk with nothing scheduled to return to
+it, and the (then 30-minute) age-out discarded it unpaid and unmentioned — so a
+maintenance pass that ran `agy` twice inside a minute ended green with a day-old
+reading. [`cliagent_usage_antigravity_refresh_schedule.go`](cliagent_usage_antigravity_refresh_schedule.go)
+gives the debt a bounded schedule and a second, state-independent trigger.
+
+- **One process-wide timer.** Every pass that keeps the debt hands it to
+  `antigravityScheduleRunDebtRetry`, which persists `nextAttemptAtMs` beside the
+  debt and REPLACES the single `time.AfterFunc`, so concurrent settles cannot
+  multiply attempts. Each firing re-reads the debt first (a rung for a debt
+  another route paid, or a generation a newer run replaced, does nothing) and
+  runs the worker with ONE attempt; the 2-attempt / 5 s same-pass retry stays
+  on the settle-driven pass only.
+- **The ladder.** By attempts already booked: 60 s, 2 m, 8 m, 30 m, clamped at
+  the last rung, at most `antigravityRefreshDebtMaxAttempts = 5` outbound Code
+  Assist reads over the debt's life (the per-pass cap stays
+  `antigravityRefreshAfterRunMaxAttempts = 2`). The first rung equals the
+  minimum interval on purpose, and every rung is pushed out to
+  `lastPaidAtMs + antigravityRefreshMinInterval` so an attempt never fires only
+  to defer. A refusal that spent no outbound read spends no budget. A deferral
+  on the minimum interval alone cannot recur, so it waits the 30 s rung or the
+  interval's remainder, whichever is later. Offline and an expired login CAN
+  recur, and the budget cannot bound them, so their free rung grows with the
+  debt's age (30 s, then as long as the debt has been owed, capped at the 30 m
+  rung): a device that stays offline or keeps an expired login costs a couple
+  of dozen local checks over the 6 h age-out rather than one every 30 s (each of
+  which is a `security` / `secret-tool` child on macOS / Linux).
+  `codeassist_no_login` is terminal and books nothing. A spent budget books
+  nothing and clears `nextAttemptAtMs`.
+- **Survives restart and self-update.** `nextAttemptAtMs` has its own rebase
+  rule — it is legitimately up to 30 minutes ahead, which the floors' 30 s skew
+  ceiling would discard — and a value past any rung the ladder can book is a
+  backwards clock step that resolves to "due now". `gracefulShutdown` stops the
+  timer (before the update-handoff return, so a rung cannot fire into an exiting
+  process); the next process re-arms it from the file.
+- **The gather's nudge.** After the notice/gate switch, `ParseContext` calls
+  `nudgeAntigravityUsageRefresh(now, observedAt, newestLog)`. It arms the worker
+  when a pending debt's booked rung is due (a timer lost to sleep), or — with no
+  debt pending — creates one floored at the newest run log when that log
+  postdates the replayed reading. That second trigger is what makes a run
+  converge when no spawn path classified it, including an `agy` the user ran in
+  their own shell: it reads the user's own quota with the login `agy` already
+  stored, exactly as the Refresh click does. Both the nudge and the
+  `antigravityMissedRun` diagnostic use one predicate,
+  `antigravityRunBehindObservation(observedAt, newestLog, slack)`: the
+  diagnostic keeps `antigravityMissedRunSlack` (60 s), while the nudge passes 0
+  — both instants are fixed once a run ends, so a run that finished inside the
+  slack would be invisible to it forever — and instead requires the log to be at
+  least `antigravityRefreshMinInterval` old (the settle guard), compares at the
+  card's one-second resolution, and skips while a run of this process is still
+  live. Bounded by the minimum interval (which a click's read now feeds) and
+  `antigravityRefreshNudgeCooldown` (60 s); it never touches an existing debt,
+  never lowers `runFloorMs`, and a device with nothing owed makes no request.
+  The backstop depends on `agy` writing run logs under `antigravityQuotaBases`,
+  re-resolved per gather so the `~/.agy` → `~/.gemini/antigravity-cli`
+  migration keeps working; the spawn-site arm stays the primary trigger.
+- **Gated builds stop paying for refused reads.** `startAntigravityQuotaCapture`
+  reads `antigravityQuotaGateFor("", now)` once at arm time. A matching marker
+  still arms the run floor and still settles with `gated: true` (reusing that
+  one read), but starts no poller goroutine and scans no logs; the gather on
+  such a build resolves `newestLog` through `antigravityNewestRunLog` (a
+  `ReadDir`, no log bodies) and skips port discovery and the loopback fetch. A
+  same-version server-side fix is then picked up at the marker's 24 h recheck
+  rather than on the next run — the gate's existing contract for the click,
+  extended to the run path. `antigravityCaptureStopped` returns an
+  already-closed channel when no poller has ever been armed.
+- **Cost.** Nothing grows with workspace size. At most five reads per unpaid
+  run, and at most one read per `antigravityRefreshMinInterval` per device
+  whichever trigger fires; the retry lines log counters and durations only.
 
 # Live usage probe — the Refresh click on the CLI Agents card
 

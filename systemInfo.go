@@ -762,6 +762,22 @@ func cachedProbeVersionFunc(path string, probe func() string) string {
 	return v
 }
 
+// lookupCachedProbeVersion returns the version a prior cachedProbeVersion
+// recorded for the binary as it is on disk now, without spawning anything. ok
+// is false when the binary cannot be stat'ed or has changed (an upgrade leaves
+// a new mtime/size) since it was last probed.
+func lookupCachedProbeVersion(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
+	versionProbeMu.Lock()
+	defer versionProbeMu.Unlock()
+	v, ok := versionProbeCache[key]
+	return v, ok
+}
+
 // resetVersionProbeCache clears the cache. Test-only seam so a case that
 // rewrites a stub binary in place can assert re-probe behaviour deterministically.
 func resetVersionProbeCache() {

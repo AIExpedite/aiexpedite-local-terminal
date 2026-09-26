@@ -1043,3 +1043,103 @@ func TestDiscoverAntigravityHTTPPorts_ReportsTheNewestLogMtime(t *testing.T) {
 		t.Errorf("empty base gave ports=%v newestLog=%s, want none and the zero time", ports, newestLog)
 	}
 }
+
+// The one predicate behind the missed-run diagnostic (60 s slack) and the
+// refresh nudge (no slack plus its own settle guard).
+func TestAntigravityRunBehindObservation(t *testing.T) {
+	observed := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	at := observed.Format(time.RFC3339)
+	for _, tc := range []struct {
+		name   string
+		logAt  time.Time
+		slack  time.Duration
+		behind bool
+	}{
+		{"inside the diagnostic's slack", observed.Add(30 * time.Second), antigravityMissedRunSlack, false},
+		{"at the diagnostic's slack", observed.Add(antigravityMissedRunSlack), antigravityMissedRunSlack, false},
+		{"past the diagnostic's slack", observed.Add(antigravityMissedRunSlack + time.Second), antigravityMissedRunSlack, true},
+		{"no slack, log after the reading", observed.Add(time.Second), 0, true},
+		{"no slack, log at the reading", observed, 0, false},
+		{"no slack, log before the reading", observed.Add(-time.Second), 0, false},
+		{"no log", time.Time{}, 0, false},
+	} {
+		got, behind := antigravityRunBehindObservation(at, tc.logAt, tc.slack)
+		if behind != tc.behind {
+			t.Errorf("%s: behind=%v, want %v", tc.name, behind, tc.behind)
+		}
+		if !tc.logAt.IsZero() && !got.Equal(observed) {
+			t.Errorf("%s: observed=%s, want %s", tc.name, got, observed)
+		}
+	}
+	for _, bad := range []string{"", "not-a-time"} {
+		if _, behind := antigravityRunBehindObservation(bad, time.Now(), 0); behind {
+			t.Errorf("observedAt=%q counted as behind", bad)
+		}
+	}
+}
+
+// The regression the slack caused: a run that finished 20 s after the last
+// observation is inside the diagnostic's 60 s forever — both instants are
+// fixed once the run ends — so a nudge that reused the slack would never see
+// the short runs a maintenance smoke produces. The nudge sees it on a later
+// gather, once its log has settled.
+func TestNudgeAntigravityUsageRefresh_SeesARunTwentySecondsAfterTheReading(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	observed := time.Now().Add(-5 * time.Minute).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	runEnded := observed.Add(20 * time.Second)
+
+	if _, behind := antigravityRunBehindObservation(observed.Format(time.RFC3339), runEnded, antigravityMissedRunSlack); behind {
+		t.Fatal("the diagnostic's slack now sees the run; this case no longer pins the regression")
+	}
+	// The gather right after the run: the settle guard holds the nudge.
+	if nudgeAntigravityUsageRefresh(runEnded.Add(5*time.Second), observed.Format(time.RFC3339), runEnded) {
+		t.Error("the nudge fired for a log that has not settled")
+	}
+	// A later gather: seen.
+	if !nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), runEnded) {
+		t.Fatal("the nudge never saw a run that finished 20 s after the reading")
+	}
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the run paid once", reads.Load())
+	}
+}
+
+// The gated gather's mtime-only helper agrees with the discovery walk it
+// replaces, including for logs that name no port at all — it never needs to
+// read a body to answer.
+func TestAntigravityNewestRunLog_AgreesWithDiscovery(t *testing.T) {
+	base := t.TempDir()
+	logDir := antigravityLogDir(base)
+	helperWriteAntigravityLog(t, base, "a.log", "server.go:584] Language server listening on random port at 44441 for HTTP\n")
+	helperWriteAntigravityLog(t, base, "b.log", "no port here\n")
+	helperWriteAntigravityLog(t, base, "ignored.txt", "not a run log\n")
+	if err := os.MkdirAll(filepath.Join(logDir, "dir.log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	older, newer := time.Now().Add(-2*time.Hour), time.Now().Add(-10*time.Minute)
+	if err := os.Chtimes(filepath.Join(logDir, "a.log"), older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(logDir, "b.log"), newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(filepath.Join(logDir, "ignored.txt"), later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	_, discovered := discoverAntigravityHTTPPorts(base)
+	got := antigravityNewestRunLog(base)
+	if !got.Equal(discovered) {
+		t.Errorf("newest=%s, discovery=%s, want them to agree", got, discovered)
+	}
+	if got.Sub(newer).Abs() > time.Second {
+		t.Errorf("newest=%s, want the newest .log file's mtime %s", got, newer)
+	}
+	if empty := antigravityNewestRunLog(t.TempDir()); !empty.IsZero() {
+		t.Errorf("no log dir gave %s, want the zero time", empty)
+	}
+}

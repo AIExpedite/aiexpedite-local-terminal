@@ -138,11 +138,5 @@ func TestWindowsRoute_FailoverDoesNotDoubleArm(t *testing.T) {
 	if arms, finishes := antigravityCaptureArms.Load(), antigravityCaptureFinishes.Load(); arms != 2 || finishes != 2 {
 		t.Errorf("arms=%d finishes=%d, want 2 and 2 — every armed run must be released", arms, finishes)
 	}
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("a poller is still running after both executes returned")
-		}
-	}
+	helperAwaitCaptureStopped(t, "a poller is still running after both executes returned", "neither execute armed a quota capture")
 }

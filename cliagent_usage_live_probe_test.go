@@ -1022,3 +1022,59 @@ func TestReadGrokAccountAndPlan_PresentedPlanOnlyWithItsAccount(t *testing.T) {
 		})
 	}
 }
+
+// A Refresh click's Code Assist read lands on the spacing clock — so a nudge
+// in the click's own follow-up gather cannot send a second outbound read
+// seconds later — and touches nothing else: it books no attempt against a debt
+// it does not own, clears none, and creates no floor.
+func TestProbeAntigravityQuotaViaCodeAssist_RecordsOnlyTheSpacingClock(t *testing.T) {
+	now := time.Now()
+	pending := antigravityUsageFreshness{
+		SchemaVersion:      antigravityFreshnessSchema,
+		RunFloorMs:         now.Add(-3 * time.Minute).UnixMilli(),
+		RefreshOwedFloorMs: now.Add(-2 * time.Minute).UnixMilli(),
+		RefreshOwedAtMs:    now.Add(-2 * time.Minute).UnixMilli(),
+		Attempts:           2,
+		Outcome:            liveProbeOutcomeCodeAssistHTTPError,
+		NextAttemptAtMs:    now.Add(2 * time.Minute).UnixMilli(),
+		LastPaidAtMs:       now.Add(-time.Hour).UnixMilli(),
+	}
+	for _, tc := range []struct {
+		name     string
+		before   *antigravityUsageFreshness
+		outcome  string
+		wantPaid bool
+	}{
+		{name: "no debt pending", outcome: liveProbeOutcomeCodeAssistHTTPError, wantPaid: true},
+		{name: "a debt pending", before: &pending, outcome: liveProbeOutcomeCodeAssistNotSigned, wantPaid: true},
+		{name: "a local refusal spends no read", before: &pending, outcome: liveProbeOutcomeCodeAssistNoLogin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityFreshness(t)
+			helperStubAntigravityCodeAssistOutcome(t, func() string { return tc.outcome })
+			var before antigravityUsageFreshness
+			if tc.before != nil {
+				before = *tc.before
+				helperWriteJSON(t, antigravityFreshnessPath(), before)
+			}
+
+			clickAt := time.Now()
+			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}, t.TempDir()); got != tc.outcome {
+				t.Fatalf("outcome=%q, want %q", got, tc.outcome)
+			}
+
+			after := helperFreshnessState(t)
+			if tc.wantPaid && after.LastPaidAtMs < clickAt.UnixMilli() {
+				t.Errorf("lastPaidAtMs=%d, want the click's read (>= %d)", after.LastPaidAtMs, clickAt.UnixMilli())
+			}
+			if !tc.wantPaid && after.LastPaidAtMs != before.LastPaidAtMs {
+				t.Errorf("lastPaidAtMs=%d, want a refusal that sent nothing to leave it at %d", after.LastPaidAtMs, before.LastPaidAtMs)
+			}
+			after.LastPaidAtMs, before.LastPaidAtMs = 0, 0
+			after.SchemaVersion, before.SchemaVersion = 0, 0
+			if after != before {
+				t.Errorf("state=%+v, want every field but the spacing clock untouched (%+v)", after, before)
+			}
+		})
+	}
+}

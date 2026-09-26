@@ -153,39 +153,55 @@ func armAntigravityCaptureForCommand(label, cmd string, args []string) func() {
 // line, path or prompt.
 func startAntigravityQuotaCapture(label string) (finish func()) {
 	antigravityCaptureArms.Add(1)
+	now := antigravityUsageFreshnessNow()
 	// Arm this run's freshness floor. Every spawn site reaches here — directly
 	// on the native path, through armAntigravityCaptureForCommand everywhere
 	// else — so all five inherit the run-completion refresh with no new call
 	// sites (cliagent_usage_antigravity_freshness.go).
-	floor := armAntigravityUsageRunFloor(antigravityUsageFreshnessNow())
+	floor := armAntigravityUsageRunFloor(now)
+	// The build's refusal is remembered per build, so the marker is the single
+	// source for "could the poller capture this run at all?" — read once, here,
+	// and reused by the settle. A build known to refuse loopback reads starts
+	// no poller: every probe would be a log scan (up to antigravityQuotaMaxLogs
+	// files × 2×antigravityLogScanBytes) for a read guaranteed to be refused.
+	// The run still has its floor, and its settle still owes the Code Assist
+	// read that is the only route answering on such a build. A same-version
+	// server-side fix is then picked up at the marker's recheck, exactly as the
+	// Refresh click already does; a different installed build is re-probed.
+	gated := antigravityCaptureGateFor(now)
 
-	antigravityCaptureMu.Lock()
-	antigravityCaptureRefs++
-	if antigravityCaptureRefs == 1 {
-		antigravityCaptureStop = make(chan struct{})
-		antigravityCaptureDone = make(chan struct{})
-		go runAntigravityQuotaCapture(label, antigravityCaptureStop, antigravityCaptureDone)
+	polled := !gated
+	if polled {
+		antigravityCaptureMu.Lock()
+		antigravityCaptureRefs++
+		if antigravityCaptureRefs == 1 {
+			antigravityCaptureStop = make(chan struct{})
+			antigravityCaptureDone = make(chan struct{})
+			go runAntigravityQuotaCapture(label, antigravityCaptureStop, antigravityCaptureDone)
+		}
+		antigravityCaptureMu.Unlock()
 	}
-	antigravityCaptureMu.Unlock()
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			antigravityCaptureFinishes.Add(1)
 
-			antigravityCaptureMu.Lock()
-			antigravityCaptureRefs--
-			var stop chan struct{}
-			if antigravityCaptureRefs <= 0 {
-				antigravityCaptureRefs = 0
-				// Leave antigravityCaptureDone in place: it is the only handle on
-				// the in-flight shutdown, and the next arm replaces it.
-				stop, antigravityCaptureStop = antigravityCaptureStop, nil
-			}
-			antigravityCaptureMu.Unlock()
+			if polled {
+				antigravityCaptureMu.Lock()
+				antigravityCaptureRefs--
+				var stop chan struct{}
+				if antigravityCaptureRefs <= 0 {
+					antigravityCaptureRefs = 0
+					// Leave antigravityCaptureDone in place: it is the only handle
+					// on the in-flight shutdown, and the next arm replaces it.
+					stop, antigravityCaptureStop = antigravityCaptureStop, nil
+				}
+				antigravityCaptureMu.Unlock()
 
-			if stop != nil {
-				close(stop)
+				if stop != nil {
+					close(stop)
+				}
 			}
 
 			// Settle THIS run, off the caller's goroutine and without waiting
@@ -200,11 +216,6 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 			antigravityFreshnessInFlight.Add(1)
 			go func() {
 				defer antigravityFreshnessInFlight.Add(-1)
-				now := antigravityUsageFreshnessNow()
-				// The build's refusal is remembered per build, so the marker is
-				// the single source for "could the poller have captured this
-				// run at all?".
-				_, gated := antigravityQuotaGateFor("", now)
 				// A reading persisted at or after this run armed means the
 				// poller found a server for it, so the tail is being paid.
 				antigravityUsageRunSettled(floor,
@@ -214,14 +225,27 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 	}
 }
 
-// antigravityCaptureStopped returns the current poller's completion channel, or
-// nil when none has ever been armed in this process. It is closed once the
-// poller has finished.
+// antigravityCaptureStopped returns the current poller's completion channel,
+// closed once the poller has finished. When no poller has ever been armed in
+// this process — every run so far was on a gated build — it is an
+// already-closed channel, so a caller waiting out a capture never hangs on one
+// that was never started.
 func antigravityCaptureStopped() <-chan struct{} {
 	antigravityCaptureMu.Lock()
 	defer antigravityCaptureMu.Unlock()
+	if antigravityCaptureDone == nil {
+		return antigravityCaptureNeverArmed
+	}
 	return antigravityCaptureDone
 }
+
+// antigravityCaptureNeverArmed is antigravityCaptureStopped's answer before any
+// poller exists.
+var antigravityCaptureNeverArmed = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
 
 // antigravityCapturePollIntervalValue resolves the tick, honoring the test seam.
 func antigravityCapturePollIntervalValue() time.Duration {
@@ -282,7 +306,14 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 		if refused {
 			if !gated {
 				gated = true
-				noteAntigravityQuotaGate("", time.Now())
+				// Only a refusal stamped with the installed build is persisted.
+				// With the build unprobed or changed since its probe, an
+				// unversioned marker would cover every later build for the
+				// recheck window; this run still parks, and the card's gather
+				// — which knows the version — records the build's own marker.
+				if version := antigravityInstalledBuildVersion(); version != "" {
+					noteAntigravityQuotaGate(version, time.Now())
+				}
 				fmt.Printf("%s[antigravity-quota] the language server refuses loopback quota reads (CSRF-gated agy build) — capture for %s stops here; the card keeps the last reading with its true age%s\n",
 					colorYellow, label, colorReset)
 			}

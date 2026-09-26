@@ -90,15 +90,24 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	// legacy ~/.agy run must not look invisible because the modern tree happens
 	// to hold older logs.
 	var newestLog time.Time
-	// gatedNow: a live server answered this gather with the CSRF refusal
-	// (cliagent_usage_antigravity_gate.go) — the one case where "no fresh
-	// reading" is a fact about the build rather than about timing.
+	// A build known to refuse loopback reads (cliagent_usage_antigravity_gate.go)
+	// gets no port discovery and no loopback fetch: only the log mtimes the
+	// missed-run diagnostic and the refresh nudge need, which cost a ReadDir
+	// rather than up to antigravityQuotaMaxLogs log-body reads.
+	gate, gatedBuild := antigravityQuotaGateFor(detected.Version, now)
+	// gatedNow: a live server answered this gather with the CSRF refusal — the
+	// one case where "no fresh reading" is a fact about the build rather than
+	// about timing.
 	gatedNow := false
 	for _, quotaBase := range quotaBases {
 		var baseNewestLog time.Time
-		var baseGated bool
-		fresh, baseNewestLog, gotFresh, baseGated = fetchAntigravityQuotaDetailed(quotaCtx, quotaBase, now)
-		gatedNow = gatedNow || baseGated
+		if gatedBuild {
+			baseNewestLog = antigravityNewestRunLog(quotaBase)
+		} else {
+			var baseGated bool
+			fresh, baseNewestLog, gotFresh, baseGated = fetchAntigravityQuotaDetailed(quotaCtx, quotaBase, now)
+			gatedNow = gatedNow || baseGated
+		}
 		if baseNewestLog.After(newestLog) {
 			newestLog = baseNewestLog
 		}
@@ -108,6 +117,7 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	}
 	if gatedNow {
 		noteAntigravityQuotaGate(detected.Version, now)
+		gate, gatedBuild = antigravityQuotaGateFor(detected.Version, now)
 	}
 	// A live reading may ONLY be published under an identity the server itself
 	// reported. settings.json can hold an account from a previous login, so
@@ -141,24 +151,23 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// observation time so the card ages it honestly instead of presenting a
 		// day-old pool as current.
 		snap = cached
-	} else if liveProducer := recentAntigravityLiveProducer(time.Now()); usage.AccountFingerprint == "" || liveProducer != "" {
+	} else if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok &&
+		(usage.AccountFingerprint == "" || antigravityProducerAttests(cached, time.Now())) {
 		// settings.json names nobody — the usual case, since the account lives in
 		// the OS keyring. Replay under the identity that PRODUCED the reading
 		// rather than dropping it: there is no current identity for it to
 		// conflict with, and the card then names the account the quota belongs
 		// to instead of implying it is whoever is signed in now.
 		//
-		// A live probe that just ran (a Refresh click) outranks settings.json:
-		// its server named the account it is signed into, which may be a newer
-		// login than the one settings.json still records. Only the reading that
-		// probe's own account produced is replayed.
-		if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok &&
-			(usage.AccountFingerprint == "" || cached.AccountFingerprint == liveProducer) {
-			snap = cached
-			usage.Account = cached.Account
-			usage.Plan = firstNonEmpty(cached.Plan, usage.Plan)
-			usage.AccountFingerprint = cached.AccountFingerprint
-		}
+		// A probe that read the cached reading itself outranks settings.json:
+		// its server (or the stored login, for a Code Assist read) named the
+		// account it is signed into, which may be a newer login than the one
+		// settings.json still records. Only the reading that probe's own
+		// account produced is replayed.
+		snap = cached
+		usage.Account = cached.Account
+		usage.Plan = firstNonEmpty(cached.Plan, usage.Plan)
+		usage.AccountFingerprint = cached.AccountFingerprint
 	}
 
 	// The run-completion refresh debt (cliagent_usage_antigravity_freshness.go):
@@ -166,7 +175,6 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	// is the wording for the cases the gate banner below does not already own.
 	freshnessNotice, freshnessPending := antigravityFreshnessNotice(snap.ObservedAt, now)
 
-	gate, gatedBuild := antigravityQuotaGateFor(detected.Version, now)
 	if gotFresh {
 		// A reading from a live server: whatever refused earlier no longer
 		// applies to this build.
@@ -184,12 +192,18 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	case gatedBuild:
 		// Gated locally, but the Code Assist route has supplied a reading
 		// since: the card shows that reading with its age, and a run not
-		// captured by the (refused) poller is not a defect to log.
+		// captured by the (refused) poller is not a defect to log. A debt that
+		// has since run out of ways to be paid still says why — this is the
+		// only arm a gated build with a since-landed reading ever reaches.
+		if freshnessNotice != "" {
+			usage.Notice = freshnessNotice
+			usage.NoticeSeverity = "warning"
+		}
 	case !gotFresh && freshnessNotice != "":
 		// A finished run owes a refresh that every bounded attempt failed to
-		// pay on a build that is NOT gated (no login stored, or the Code Assist
-		// route kept failing). The gate arms above keep precedence, so one
-		// banner is only ever worded by one source.
+		// pay (no login stored, an expired one, or the Code Assist route kept
+		// failing). The gate arms above keep precedence, so one banner is only
+		// ever worded by one source.
 		usage.Notice = freshnessNotice
 		usage.NoticeSeverity = "warning"
 	case !gotFresh && !freshnessPending:
@@ -200,6 +214,12 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// pending: the debt is the better signal for the same run, and the pair
 		// would double-report it.
 		antigravityMissedRun(snap.ObservedAt, newestLog, len(quotaBases))
+	}
+	if !gotFresh {
+		// The same evidence, acted on: a due retry, or a run log newer than the
+		// replayed reading, arms the bounded refresh so the next gather replays
+		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
+		nudgeAntigravityUsageRefresh(now, snap.ObservedAt, newestLog)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

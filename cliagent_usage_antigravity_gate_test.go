@@ -222,7 +222,7 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 		SchemaVersion:      antigravityFreshnessSchema,
 		RefreshOwedFloorMs: now.Add(-time.Minute).UnixMilli(),
 		RefreshOwedAtMs:    now.Add(-time.Minute).UnixMilli(),
-		Attempts:           antigravityRefreshAfterRunMaxAttempts,
+		Attempts:           antigravityRefreshDebtMaxAttempts,
 		Gated:              true,
 		Outcome:            liveProbeOutcomeCodeAssistHTTPError,
 	})
@@ -239,8 +239,13 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 	}
 
 	usage, _ = antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Version: "1.2.4"}, now)
-	if usage.Notice != "" {
+	if strings.Contains(usage.Notice, "refuses local quota reads") || strings.Contains(usage.Notice, "1.2.3") {
 		t.Errorf("a newer build carried the old build's notice: %q", usage.Notice)
+	}
+	// The spent debt is still a fact about this device once the gate no longer
+	// applies, so it is the one worded now.
+	if !strings.Contains(usage.Notice, "before the most recent Antigravity run finished") {
+		t.Errorf("notice=%q, want the spent run debt worded once the gate is gone", usage.Notice)
 	}
 }
 
@@ -250,6 +255,7 @@ func TestAntigravityUsageParser_GatedBuildCarriesANoticeAndKeepsTheReading(t *te
 func TestAntigravityQuotaCapture_StopsAtTheFirstRefusal(t *testing.T) {
 	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "1.2.2")
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	_, hits := helperGatedAntigravityServer(t, base)
 
