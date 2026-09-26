@@ -336,10 +336,18 @@ func retireClaudeRefreshDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bo
 // The charge and the refund share it so the two cannot drift apart: a refund
 // guarded differently from its charge would leak or invent attempts, and that
 // counter is the only thing bounding a crash-looping agent.
+//
+// A charge is also refused once it would take the counter past the cap. The
+// retirement check that admitted it ran on an unlocked read, so two overlapping
+// agent processes can both pass it on the same count and then serialize here;
+// without the locked bound each would charge and issue, exceeding the cap the
+// counter exists to enforce. A refused charge means "do not probe".
 func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLimitSnapshot) bool {
 	owedMs := owed.UnixMilli()
 	return func(snap *claudeRateLimitSnapshot) bool {
-		if snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts+delta < 0 {
+		next := snap.RefreshOwedAttempts + delta
+		if snap.RefreshOwedAtMs != owedMs || next < 0 ||
+			(delta > 0 && next > claudeUsageProbeAfterRunMaxAttempts) {
 			return false
 		}
 		snap.RefreshOwedAttempts += delta

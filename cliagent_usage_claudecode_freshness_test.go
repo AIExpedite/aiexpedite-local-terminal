@@ -1623,6 +1623,48 @@ func TestClaudeUsageProbe_UnissuedAdmissionRefundsTheThrottleSlot(t *testing.T) 
 	}
 }
 
+// Two overlapping agent processes can both pass the unlocked retirement check
+// on the same count; the LOCKED charge is what must stop the second one from
+// taking the counter past the cap and issuing a request the cap refuses.
+func TestAdjustClaudeRefreshAttemptsAt_RefusesAChargePastTheCap(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	judged := time.Now().Add(-time.Minute)
+
+	seedClaudeRefreshDebt(t, cache, fp, judged, claudeUsageProbeAfterRunMaxAttempts-1, time.Time{})
+	if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
+		t.Fatal("the first charge up to the cap must land")
+	}
+	if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
+		t.Fatal("a second charge that read the same pre-cap count was allowed past the cap")
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeUsageProbeAfterRunMaxAttempts {
+		t.Fatalf("attempts=%d, want the cap %d", got, claudeUsageProbeAfterRunMaxAttempts)
+	}
+}
+
+// A rejected endpoint override sends nothing, so the attempt must report
+// itself as NOT issued — otherwise the startup replay keeps its durable charge
+// and two such starts retire a debt no request was ever made for.
+func TestClaudeUsageProbe_RejectedEndpointIsNotIssued(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	t.Setenv(claudeUsageProbeEndpointEnv, "https://example.invalid/api/oauth/usage")
+
+	identity := func() claudeUsageProbeIdentity {
+		return claudeUsageProbeIdentity{token: "token", fingerprint: currentClaudeAccountFingerprint()}
+	}
+	admitted, issued, refreshed, _, probeErr := probeClaudeUsageAdmitted(context.Background(), time.Now(), identity, time.Time{}, false)
+	if !admitted || issued || refreshed {
+		t.Fatalf("admitted=%v issued=%v refreshed=%v, want an admitted attempt that issued nothing", admitted, issued, refreshed)
+	}
+	if probeErr == nil {
+		t.Fatal("a rejected endpoint must still be reported as a failure")
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0", n)
+	}
+}
+
 // The startup replay can land AFTER the seed has returned — settling the debt
 // the seed adopted — so the gather then finds nothing owed and a view that looks
 // fresh. It must still report the landed reading so the caller re-reads the

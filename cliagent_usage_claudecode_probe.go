@@ -1549,7 +1549,8 @@ func probeClaudeUsageAdmitted(
 		return admitted, false, false, time.Time{}, nil
 	}
 	// Past the credential: from here every exit either asked the endpoint or
-	// inherited another writer's covering reading, so the turn was spent.
+	// inherited another writer's covering reading, so the turn was spent — bar
+	// a rejected endpoint override, which un-issues itself below.
 	issued = true
 
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
@@ -1575,7 +1576,13 @@ func probeClaudeUsageAdmitted(
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
-		return admitted, issued, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		// A rejected endpoint override (malformed or non-loopback) sends nothing,
+		// so this attempt is NOT issued: reporting it as one would let the startup
+		// replay keep its durable charge, and two such starts would retire a debt
+		// no request was ever made for. The in-memory throttle and failure backoff
+		// are kept — the misconfiguration is persistent, and they are what stop
+		// every gather from re-walking this path.
+		return admitted, false, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, claudeUsageProbeTimeout)
