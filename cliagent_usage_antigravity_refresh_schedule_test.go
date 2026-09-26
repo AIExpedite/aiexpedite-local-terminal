@@ -136,11 +136,26 @@ func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
 		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
 	})
 	now := time.Now()
-	if !antigravityScheduleRunDebtRetry(state, now, true) {
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetryFree) {
 		t.Fatal("the free rung was not booked")
 	}
 	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < 29*time.Minute {
 		t.Errorf("an hour-old debt's free rung is %s away, want it backed off to the longest rung", until)
+	}
+
+	// A deferral on the minimum interval alone cannot recur, so the same
+	// hour-old debt waits only for the interval to lapse — a click's read
+	// seconds ago must not park it for half an hour.
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
+		LastPaidAtMs: now.Add(-10 * time.Second).UnixMilli(),
+	})
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetrySpacing) {
+		t.Fatal("the spacing rung was not booked")
+	}
+	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < antigravityRefreshMinInterval-15*time.Second ||
+		until > antigravityRefreshMinInterval {
+		t.Errorf("a spacing deferral is %s away, want the interval's remainder (~%s)", until, antigravityRefreshMinInterval-10*time.Second)
 	}
 }
 
@@ -160,7 +175,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			antigravityScheduleRunDebtRetry(state, time.Now(), false)
+			antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
 		}()
 	}
 	wg.Wait()
@@ -178,7 +193,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 	// Now let the schedule run on a short ladder: a single timer means one
 	// attempt per firing, and the budget caps the total.
 	helperPinAntigravityRefreshSchedule(t, 10*time.Millisecond, 10*time.Millisecond)
-	antigravityScheduleRunDebtRetry(state, time.Now(), false)
+	antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
 	helperDrainAntigravityRefreshSchedule(t)
 	if got := reads.Load(); got != antigravityRefreshDebtMaxAttempts {
 		t.Errorf("reads=%d, want exactly the lifetime budget %d", got, antigravityRefreshDebtMaxAttempts)

@@ -43,11 +43,12 @@ var (
 	antigravityRunDebtRetryLadder = []time.Duration{
 		time.Minute, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute,
 	}
-	// antigravityRunDebtFreeRetryDelay is the SHORTEST rung after a refusal that
-	// spent no outbound read (offline, an expired stored login, the minimum
-	// interval itself), where there is no read to space from; it stretches with
-	// the debt's age (antigravityFreeRetryDelay). The minimum interval still
-	// applies to the attempt it leads to.
+	// antigravityRunDebtFreeRetryDelay is the short rung after a refusal that
+	// spent no outbound read, where there is no read to space from: as-is for a
+	// minimum-interval deferral (antigravityRetrySpacing), and as the floor of
+	// the age backoff for offline or an expired stored login
+	// (antigravityFreeRetryDelay). The minimum interval still applies to the
+	// attempt it leads to.
 	antigravityRunDebtFreeRetryDelay = 30 * time.Second
 	// antigravityRefreshNudgeCooldown bounds how often a gather may arm the
 	// worker, on top of the minimum interval the worker itself honours.
@@ -68,6 +69,28 @@ var antigravityRefreshNudge struct {
 	mu     sync.Mutex
 	lastAt time.Time
 }
+
+// antigravityRunDebtRetryKind says what a payment pass left behind for the
+// schedule, and so which rung the next attempt waits for.
+type antigravityRunDebtRetryKind int
+
+const (
+	// antigravityRetryNone: nothing to book — paid, retired, terminal
+	// (no_login) or out of budget.
+	antigravityRetryNone antigravityRunDebtRetryKind = iota
+	// antigravityRetryAfterRead: a read reached Google and failed; the ladder
+	// rung for the attempts booked so far.
+	antigravityRetryAfterRead
+	// antigravityRetryFree: a refusal that sent nothing and may keep
+	// recurring (offline, an expired stored login). Spends no budget, so its
+	// rung backs off with the debt's age (antigravityFreeRetryDelay).
+	antigravityRetryFree
+	// antigravityRetrySpacing: deferred only because the minimum interval
+	// since the last outbound read has not lapsed. One-off by construction —
+	// once it lapses the next attempt cannot defer on it again — so it waits
+	// just the short rung and the interval's remainder, never an age backoff.
+	antigravityRetrySpacing
+)
 
 // antigravityRetryDelayForAttempt is the ladder: the delay before the next
 // attempt of a debt that has already booked `attempts`, or false once the
@@ -125,12 +148,12 @@ func antigravityRunDebtRetryHorizon() time.Duration {
 // antigravityScheduleRunDebtRetry books the next attempt for the debt state
 // names, persists it as NextAttemptAtMs and arms the process-wide timer —
 // replacing any pending one, so concurrent settles cannot multiply attempts.
-// free selects the short rung for a refusal that spent no outbound read.
+// kind picks the rung (antigravityRunDebtRetryKind).
 // Returns false when nothing was booked: the debt is gone or was replaced by a
 // newer generation (whose own pass books it), its budget is spent (it keeps its
 // Outcome until the age-out so the notice can explain it), or the process is
 // shutting down.
-func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.Time, free bool) bool {
+func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.Time, kind antigravityRunDebtRetryKind) bool {
 	if IsShutdownInProgress() {
 		return false
 	}
@@ -145,8 +168,11 @@ func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.T
 			state.NextAttemptAtMs = 0
 			return
 		}
-		if free {
+		switch kind {
+		case antigravityRetryFree:
 			delay = antigravityFreeRetryDelay(now.Sub(time.UnixMilli(state.RefreshOwedAtMs)))
+		case antigravityRetrySpacing:
+			delay = antigravityRunDebtFreeRetryDelay
 		}
 		next = now.Add(delay)
 		// Never earlier than the minimum interval allows, or the attempt would

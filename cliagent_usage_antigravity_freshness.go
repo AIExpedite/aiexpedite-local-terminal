@@ -660,21 +660,9 @@ func antigravityRetireRunDebt(reason string) {
 func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 	state, retry := antigravityPayRunDebtPass(maxAttempts, bypassInterval)
 	if retry != antigravityRetryNone {
-		antigravityScheduleRunDebtRetry(state, antigravityUsageFreshnessNow(), retry == antigravityRetryFree)
+		antigravityScheduleRunDebtRetry(state, antigravityUsageFreshnessNow(), retry)
 	}
 }
-
-// antigravityRunDebtRetryKind says what a payment pass left behind for the
-// schedule: nothing (paid, retired, terminal or out of budget), a rung that
-// follows a read that reached Google, or a free rung after a refusal that spent
-// no outbound read.
-type antigravityRunDebtRetryKind int
-
-const (
-	antigravityRetryNone antigravityRunDebtRetryKind = iota
-	antigravityRetryAfterRead
-	antigravityRetryFree
-)
 
 // antigravityPayRunDebtPass is antigravityPayRunDebt's body. It returns the
 // debt it last looked at, so the schedule is booked against that generation.
@@ -722,7 +710,7 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 			if since := now.Sub(time.UnixMilli(state.LastPaidAtMs)); since >= 0 && since < antigravityRefreshMinInterval {
 				fmt.Printf("%s[antigravity-freshness] Run refresh deferred: last read %ds ago (minimum %ds, debt kept)%s\n",
 					colorCyan, int(since.Seconds()), int(antigravityRefreshMinInterval.Seconds()), colorReset)
-				return state, antigravityRetryFree
+				return state, antigravityRetrySpacing
 			}
 		}
 

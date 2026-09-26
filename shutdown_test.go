@@ -65,7 +65,7 @@ func TestGracefulShutdownStopsTheAntigravityRefreshSchedule(t *testing.T) {
 		t.Error("gracefulShutdown left the refresh rung armed")
 	}
 	// And nothing can book a new one while the process is going down.
-	if antigravityScheduleRunDebtRetry(antigravityUsageFreshness{}, time.Now(), false) {
+	if antigravityScheduleRunDebtRetry(antigravityUsageFreshness{}, time.Now(), antigravityRetryAfterRead) {
 		t.Error("a retry was booked during shutdown")
 	}
 }
