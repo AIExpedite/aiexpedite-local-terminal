@@ -80,12 +80,10 @@ func helperStartCaptureServerFunc(t *testing.T, base string, quotaJSON func() st
 // `agy` run), so these tests must not run in parallel with each other.
 func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache string) {
 	t.Helper()
-	if ch := antigravityCaptureStopped(); ch != nil {
-		select {
-		case <-ch:
-		default:
-			t.Fatal("a capture poller from an earlier test is still running")
-		}
+	select {
+	case <-antigravityCaptureStopped():
+	default:
+		t.Fatal("a capture poller from an earlier test is still running")
 	}
 	helperStopAntigravityRefreshSchedule()
 	antigravityCaptureArms.Store(0)
@@ -156,10 +154,6 @@ func helperStopCapture(t *testing.T, finish func()) {
 	t.Helper()
 	stopped := antigravityCaptureStopped()
 	finish()
-	if stopped == nil {
-		antigravityUsageRefreshWaitIdle()
-		return
-	}
 	select {
 	case <-stopped:
 	case <-time.After(30 * time.Second):
@@ -168,6 +162,22 @@ func helperStopCapture(t *testing.T, finish func()) {
 	// The settle runs off the poller (a short run must not wait on a longer
 	// one holding it), so the debt it decides lands slightly after shutdown.
 	antigravityUsageRefreshWaitIdle()
+}
+
+// helperAwaitCaptureStopped asserts a run armed a capture and waits for the
+// poller to finish. antigravityCaptureStopped is never nil (an already-closed
+// channel stands in before any poller exists), so "was anything armed" is
+// asked of the arm counter rather than of the channel.
+func helperAwaitCaptureStopped(t *testing.T, stuck, neverArmed string) {
+	t.Helper()
+	if antigravityCaptureArms.Load() == 0 {
+		t.Fatal(neverArmed)
+	}
+	select {
+	case <-antigravityCaptureStopped():
+	case <-time.After(30 * time.Second):
+		t.Fatal(stuck)
+	}
 }
 
 // helperAwaitSnapshot polls the cache until a snapshot is present whose

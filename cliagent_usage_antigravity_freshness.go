@@ -99,11 +99,14 @@ const (
 // Vars rather than consts so tests can pin them small.
 var (
 	antigravityRefreshAfterRunRetryDelay = 5 * time.Second
-	// antigravityRefreshMinInterval spaces the outbound Google reads a NEW
-	// debt may trigger. A debt's own retry is the same unpaid run and bypasses
-	// it, exactly as a forced Codex reconcile bypasses
-	// codexForcedReconcileMinInterval; the Refresh click does not go through
-	// this worker at all, so a user-initiated refresh is never throttled by it.
+	// antigravityRefreshMinInterval spaces the outbound Google reads the debt
+	// worker sends: a new debt's first read, every scheduled rung and every
+	// gather nudge. Only the same-pass retry (the same unpaid run, seconds
+	// later) and the startup replay bypass it, exactly as a forced Codex
+	// reconcile bypasses codexForcedReconcileMinInterval. The Refresh click does
+	// not go through this worker, so a user-initiated refresh is never
+	// throttled by it — though its read does feed this clock
+	// (antigravityRecordClickRead).
 	antigravityRefreshMinInterval = 60 * time.Second
 	antigravityUsageFreshnessNow  = time.Now
 	// antigravityPostRunReadingGrace is how long past the poller's own tail
@@ -638,8 +641,8 @@ func antigravityRetireRunDebt(reason string) {
 // antigravityPayRunDebt spends at most maxAttempts Code Assist reads on the
 // pending debt — the route that still answers on a CSRF-gated build. Each read
 // is bounded by antigravityCodeAssistTimeout and the first is spaced from the
-// previous outbound read by antigravityRefreshMinInterval; a retry within one
-// debt bypasses that interval, because it is the same unpaid run.
+// previous outbound read by antigravityRefreshMinInterval; a retry within the
+// same pass bypasses that interval, because it is the same unpaid run.
 //
 // It never runs a model turn. The Refresh click may run the `agy models`
 // warm-up to make the CLI refresh its own keyring token; doing that behind the
@@ -661,21 +664,21 @@ func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
 	}
 }
 
-// antigravityRunDebtRetry says what a payment pass left behind for the
+// antigravityRunDebtRetryKind says what a payment pass left behind for the
 // schedule: nothing (paid, retired, terminal or out of budget), a rung that
 // follows a read that reached Google, or a free rung after a refusal that spent
 // no outbound read.
-type antigravityRunDebtRetry int
+type antigravityRunDebtRetryKind int
 
 const (
-	antigravityRetryNone antigravityRunDebtRetry = iota
+	antigravityRetryNone antigravityRunDebtRetryKind = iota
 	antigravityRetryAfterRead
 	antigravityRetryFree
 )
 
 // antigravityPayRunDebtPass is antigravityPayRunDebt's body. It returns the
 // debt it last looked at, so the schedule is booked against that generation.
-func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravityUsageFreshness, antigravityRunDebtRetry) {
+func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravityUsageFreshness, antigravityRunDebtRetryKind) {
 	var state antigravityUsageFreshness
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {

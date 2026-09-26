@@ -27,6 +27,14 @@ import (
 // shared atomic flag would otherwise leak from one case to the next.
 func resetShutdownState(t *testing.T) {
 	t.Helper()
+	clearShutdownState()
+	// Restored afterwards too: a shutdown flag left set makes every later
+	// test's background work (the Antigravity refresh schedule, for one)
+	// refuse to run, so a test's outcome would depend on file order.
+	t.Cleanup(clearShutdownState)
+}
+
+func clearShutdownState() {
 	shutdownInProgress.Store(false)
 	offlineMutex.Lock()
 	isOffline = false
@@ -36,6 +44,29 @@ func resetShutdownState(t *testing.T) {
 	select {
 	case <-offlineChan:
 	default:
+	}
+}
+
+// A pending Antigravity refresh rung must not fire into a process that is
+// exiting; the schedule is on disk for the next process to re-arm.
+func TestGracefulShutdownStopsTheAntigravityRefreshSchedule(t *testing.T) {
+	resetShutdownState(t)
+	helperIsolateAntigravityFreshness(t)
+	antigravityArmRunDebtRetry(antigravityDebtID{floorMs: 1, owedAtMs: 1}, time.Hour)
+	if !antigravityRunDebtRetryPending() {
+		t.Fatal("precondition: a rung should be armed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	gracefulShutdown(ctx, &Config{})
+
+	if antigravityRunDebtRetryPending() {
+		t.Error("gracefulShutdown left the refresh rung armed")
+	}
+	// And nothing can book a new one while the process is going down.
+	if antigravityScheduleRunDebtRetry(antigravityUsageFreshness{}, time.Now(), false) {
+		t.Error("a retry was booked during shutdown")
 	}
 }
 

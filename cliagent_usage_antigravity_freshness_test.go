@@ -114,15 +114,7 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 	}
 
 	// runOneShot released the capture on return; wait for poller shutdown.
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the turn")
-		}
-	} else {
-		t.Fatal("the native turn never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the turn", "the native turn never armed a quota capture")
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Errorf("arms=%d, want exactly one per turn", got)
 	}
@@ -158,15 +150,7 @@ func TestAntigravityFreshness_TerminalManagedSessionAdvancesObservedAt(t *testin
 	if _, _, err := captureSession(t, "antigravity-quota-server", "agy", []string{"do the thing"}, ""); err != nil {
 		t.Fatalf("captureSession: %v", err)
 	}
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the session ended")
-		}
-	} else {
-		t.Fatal("the terminal-managed session never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the session ended", "the terminal-managed session never armed a quota capture")
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Errorf("arms=%d, want exactly one per session", got)
 	}
@@ -206,15 +190,7 @@ func TestAntigravityFreshness_NonTTYExecuteAdvancesObservedAt(t *testing.T) {
 		t.Fatalf("mock agy did not run to completion: %q", out)
 	}
 
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the execute returned")
-		}
-	} else {
-		t.Fatal("a tty=false execute of agy never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the execute returned", "a tty=false execute of agy never armed a quota capture")
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Errorf("arms=%d, want exactly one per execute", got)
 	}
@@ -314,15 +290,7 @@ func TestAntigravityFreshness_GatedNativeTurnAdvancesObservedAt(t *testing.T) {
 	if runErr != nil || exitCode != 0 || timedOut {
 		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
 	}
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the turn")
-		}
-	} else {
-		t.Fatal("the native turn never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the turn", "the native turn never armed a quota capture")
 	if got := antigravityCaptureSnapshots.Load(); got != 0 {
 		t.Fatalf("snapshots=%d during a gated run, want 0 — the poller cannot read a gated build", got)
 	}
@@ -341,15 +309,7 @@ func TestAntigravityFreshness_GatedTerminalManagedSessionAdvancesObservedAt(t *t
 	if _, _, err := captureSession(t, "antigravity-quota-gated", "agy", []string{"do the thing"}, ""); err != nil {
 		t.Fatalf("captureSession: %v", err)
 	}
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the session ended")
-		}
-	} else {
-		t.Fatal("the terminal-managed session never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the session ended", "the terminal-managed session never armed a quota capture")
 
 	helperAwaitPaidRefresh(t, cache, stale)
 	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
@@ -372,15 +332,7 @@ func TestAntigravityFreshness_GatedNonTTYExecuteAdvancesObservedAt(t *testing.T)
 	if execErr != nil {
 		t.Fatalf("execute failed: %v (output=%q)", execErr, out)
 	}
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the execute returned")
-		}
-	} else {
-		t.Fatal("a tty=false execute of agy never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the execute returned", "a tty=false execute of agy never armed a quota capture")
 
 	helperAwaitPaidRefresh(t, cache, stale)
 	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
@@ -651,13 +603,7 @@ func TestAntigravityFreshness_ConcurrentRunsShareOnePoller(t *testing.T) {
 	}
 	wg.Wait()
 
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("the shared poller did not stop after the last run")
-		}
-	}
+	helperAwaitCaptureStopped(t, "the shared poller did not stop after the last run", "no run armed a quota capture")
 	if got := antigravityCaptureFinishes.Load(); got != 4 {
 		t.Errorf("finishes=%d, want one per run", got)
 	}
@@ -738,15 +684,7 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 		t.Fatalf("the encoded-PowerShell transport ran %d times, want exactly once", ran.Load())
 	}
 
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-		case <-time.After(30 * time.Second):
-			t.Fatal("capture poller did not stop after the execute returned")
-		}
-	} else {
-		t.Fatal("the Windows execute never armed a quota capture")
-	}
+	helperAwaitCaptureStopped(t, "capture poller did not stop after the execute returned", "the Windows execute never armed a quota capture")
 	// Exactly one arm for the whole transport chain, and exactly one release:
 	// the fallbacks below the arm are sequential, so a failover must not
 	// double-arm and a poller must never outlive the execute.
@@ -871,12 +809,10 @@ func TestAntigravityFreshness_ConcurrentGatedRunsOweOneDebtAndPayItOnce(t *testi
 	first()
 
 	state := helperAwaitDebt(t, "the short run's debt while the long run still holds the poller")
-	if stopped := antigravityCaptureStopped(); stopped != nil {
-		select {
-		case <-stopped:
-			t.Fatal("the poller stopped while a run was still armed")
-		default:
-		}
+	select {
+	case <-antigravityCaptureStopped():
+		t.Fatal("the poller stopped while a run was still armed")
+	default:
 	}
 	antigravityUsageRefreshWaitIdle()
 	shortFloor := state.RefreshOwedFloorMs
