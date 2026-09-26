@@ -272,6 +272,18 @@ func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts 
 	return owed, attempts, held
 }
 
+// claudeRefreshDebtRetired reports whether a persisted debt is past paying:
+// stamped in the future beyond the skew ceiling, older than the age limit, or
+// already at the attempt cap. The ONE rule for both readers of the durable debt
+// — the startup replay, which retires it, and the gather's seed, which must then
+// refuse to adopt it — so a gather that reaches the seed before the replay
+// cannot issue an uncharged request for a debt the cap has already retired.
+func claudeRefreshDebtRetired(owed time.Time, attempts int, now time.Time) bool {
+	return owed.After(now.Add(claudeRefreshOwedLocalSkew)) ||
+		now.Sub(owed) > claudeRefreshOwedMaxAge ||
+		attempts >= claudeUsageProbeAfterRunMaxAttempts
+}
+
 /* ────────────────────────────────── hold ─────────────────────────────────── */
 
 // claudeHoldUsageProbe mirrors a 429 Retry-After to disk beside the gate's own
@@ -448,9 +460,7 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// ceiling, older than the age limit, or already at the attempt cap. The debt
 	// is retired at the cap whether or not it was ever actually paid — that is
 	// what stops a crash-looping agent from issuing a request per restart.
-	if snap.RefreshOwedAtMs > now.Add(claudeRefreshOwedLocalSkew).UnixMilli() ||
-		now.Sub(owed) > claudeRefreshOwedMaxAge ||
-		snap.RefreshOwedAttempts >= claudeUsageProbeAfterRunMaxAttempts {
+	if claudeRefreshDebtRetired(owed, snap.RefreshOwedAttempts, now) {
 		// Retire the debt this replay JUDGED, never whatever is on disk by the
 		// time the lock is granted. This runs on a spawned goroutine, so a
 		// session of this process can finish and record a newer, perfectly

@@ -1128,7 +1128,14 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		g.mu.Unlock()
 		close(seeding)
 	}()
-	persisted, _, held := claudePersistedProbeStateFor(fingerprint)
+	persisted, attempts, held := claudePersistedProbeStateFor(fingerprint)
+	// A debt the replay would retire without a request is not adopted either:
+	// this read races the replay, and adopting a capped, aged-out or skewed debt
+	// would let the gather spend the uncharged request the cap exists to refuse.
+	// Only the replay CLEARS it — this is a read on the gather path.
+	if !persisted.IsZero() && claudeRefreshDebtRetired(persisted, attempts, now) {
+		persisted = time.Time{}
+	}
 	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
 	// process already took outranks a shorter persisted one.
 	if !held.IsZero() && !held.After(now.Add(claudeUsageProbeMaxRetryAfter)) {

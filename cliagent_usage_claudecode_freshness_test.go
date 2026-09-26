@@ -935,6 +935,50 @@ func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheCallerAlreadyCovers(t *testi
 	_ = cache
 }
 
+// A debt the startup replay would retire without a request — at the attempt cap,
+// past the age limit, or stamped beyond the skew ceiling — is not adopted by a
+// gather that reaches the seed first. Adopting it would let the gather spend an
+// uncharged request, bypassing the cap that bounds a crash-looping agent. The
+// seed is a read: the debt stays on disk for the replay to retire.
+func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheReplayWouldRetire(t *testing.T) {
+	cases := []struct {
+		name     string
+		owedAgo  time.Duration
+		attempts int
+	}{
+		{"at the attempt cap", time.Minute, claudeUsageProbeAfterRunMaxAttempts},
+		{"past the age limit", claudeRefreshOwedMaxAge + time.Minute, 0},
+		{"stamped beyond the skew ceiling", -2 * claudeRefreshOwedLocalSkew, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+			fp := currentClaudeAccountFingerprint()
+			now := time.Now()
+			seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+			owed := now.Add(-tc.owedAgo)
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAtMs = owed.UnixMilli()
+				snap.RefreshOwedAttempts = tc.attempts
+				return true
+			})
+
+			resetClaudeUsageProbeGate()
+			SetClaudeUsageProbeDisabled(false)
+
+			claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+
+			if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+				t.Fatalf("a retirable debt was adopted as %v", got)
+			}
+			if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != owed.UnixMilli() || snap.RefreshOwedAttempts != tc.attempts {
+				t.Errorf("debt=(%d,%d), want the untouched (%d,%d) — only the replay retires it",
+					snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, owed.UnixMilli(), tc.attempts)
+			}
+		})
+	}
+}
+
 // The replay settles the debt in the SAME locked write that carries the reading,
 // so a replay landing during the seed's unlocked cache read has already cleared
 // the debt from disk by the time the seed loads it. Keying the "must the gather
