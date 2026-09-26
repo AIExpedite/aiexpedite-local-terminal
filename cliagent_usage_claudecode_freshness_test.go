@@ -2000,3 +2000,90 @@ func TestClaudeUsageProbeGate_CacheSeedRechecksTheStampAfterTheLatch(t *testing.
 		t.Errorf("in-memory hold=%v, want the hold written inside that same window %v", gateHold, held)
 	}
 }
+
+// Adopting a persisted debt CHARGES the durable attempt counter. The gather's
+// `owing` branch issues its request off the in-memory baseline without
+// consulting the counter again, so an uncharged adoption would spend a request
+// the two-attempt cap never sees — and, since the startup replay refunds its own
+// charge whenever the in-memory throttle refuses it, the counter would come back
+// to where it started and every restart would repeat the request.
+func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	// Each pass is a fresh process inheriting the same cache: only the gate is
+	// reset, exactly as a self-update restart leaves things.
+	for attempt := 1; attempt <= claudeUsageProbeAfterRunMaxAttempts; attempt++ {
+		resetClaudeUsageProbeGate()
+		SetClaudeUsageProbeDisabled(false)
+		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+		if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
+			t.Fatalf("pass %d adopted owed=%v, want the persisted debt %v", attempt, got, runEnded)
+		}
+		owed, attempts, _ := claudePersistedProbeStateFor(fp)
+		if owed.UnixMilli() != runEnded.UnixMilli() {
+			t.Fatalf("pass %d moved the persisted debt to %v", attempt, owed)
+		}
+		if attempts != attempt {
+			t.Fatalf("pass %d left RefreshOwedAttempts=%d, want %d — the adoption must charge the request it enables", attempt, attempts, attempt)
+		}
+	}
+
+	// The cap is reached, so the next start can neither adopt the debt nor spend
+	// another uncharged request for it.
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("a capped debt was adopted as %v; the gather would issue an uncharged request for it", got)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != claudeUsageProbeAfterRunMaxAttempts {
+		t.Errorf("RefreshOwedAttempts=%d, want it held at the cap %d", attempts, claudeUsageProbeAfterRunMaxAttempts)
+	}
+}
+
+// A refused charge means "do not adopt": a gather that cannot reach the counter
+// degrades to its own staleness TTL rather than spending an unbounded request,
+// and leaves the debt exactly as it found it for the next start.
+func TestClaudeUsageProbeGate_CacheSeedDropsAnUnchargeableDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	// Another writer replaces the debt with a newer one in the window between the
+	// seed's unlocked read and its charge, so the charge — keyed to the instant
+	// the seed judged — is refused rather than moving a budget it never spent.
+	replaced := now.Add(-30 * time.Second)
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+	var once sync.Once
+	claudeUsageProbeAfterSeedRead = func() {
+		once.Do(func() {
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAtMs = replaced.UnixMilli()
+				return true
+			})
+		})
+	}
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("an uncharged debt was adopted as %v", got)
+	}
+	owed, attempts, _ := claudePersistedProbeStateFor(fp)
+	if owed.UnixMilli() != replaced.UnixMilli() || attempts != 0 {
+		t.Errorf("persisted debt=%v attempts=%d, want the other writer's %v left untouched at 0", owed, attempts, replaced)
+	}
+}

@@ -1215,6 +1215,72 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// before g.mu is taken, since nothing touching the filesystem may be held
 	// under it.
 	onDisk := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now)
+	// CHARGE before the gate can be handed a debt to probe for. Adoption is what
+	// turns a persisted debt into this gather's `owing` branch, and that branch
+	// issues its request off the in-memory baseline without consulting the durable
+	// counter again — so an uncharged adoption spends a request the two-attempt cap
+	// never sees. Left uncharged, a gather that beats the startup replay to the
+	// seed issues one request, and the replay's own charge is then refunded when
+	// the in-memory throttle refuses it: the counter comes back to where it
+	// started, and every restart repeats it. The cap is the only thing bounding a
+	// crash-looping agent against an account-scoped endpoint, so the counter moves
+	// on the same side of the request here as it does in payOwedClaudeUsageRefreshAt.
+	//
+	// Keyed to the instant read above and bounded at the cap inside
+	// adjustClaudeRefreshAttemptsAt, so a refused charge — contended cache, a debt
+	// another writer settled or replaced while we read, or a count two overlapping
+	// processes both passed the unlocked retirement test on — means "do not adopt".
+	// That degrades to the pre-seed behaviour: the gather still probes on its own
+	// staleness TTL, and the debt is left exactly as found for the next start.
+	//
+	// Charged off g.mu (it takes the cache gate and flock) and only for a debt the
+	// readings already in hand do not answer, so the ordinary no-debt gather still
+	// writes nothing. `landed` is not yet known here; an adoption the locked read
+	// below then declines because a probe of this process settled the debt while we
+	// read keeps the charge. Same direction as the replay's crash-between-charge-
+	// and-refund window: it only ever spends the budget faster, and the reading
+	// that declined it is the one the debt wanted.
+	if !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
+		!claudeUsageObservationCovers(onDisk, persisted) {
+		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
+		lockedHeldMs := int64(0)
+		if mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
+			func(snap *claudeRateLimitSnapshot) bool {
+				if !charge(snap) {
+					return false
+				}
+				// The hold as it stands under the SAME lock the charge took. The
+				// unlocked read above is older than this write, and the latch stamp
+				// below is re-sampled to match the file we leave behind, so a 429
+				// another channel recorded in that gap would otherwise be latched
+				// away unseen for this account.
+				lockedHeldMs = snap.HeldUntilMs
+				return true
+			}) {
+			if lockedHeldMs > 0 {
+				if locked := time.UnixMilli(lockedHeldMs); !locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+					// Monotonic, like the adoption above: this only ever raises the hold.
+					g.holdUntil(locked)
+				}
+			}
+			// The charge rewrote the snapshot, so the stamp sampled before the
+			// reads no longer describes the file. Re-sample it, or the latch this
+			// seed is about to record is stale on arrival and EVERY later gather
+			// re-adopts — resurrecting a debt this process has since settled in
+			// memory, since only the covering merge clears it on disk. Sound
+			// because the write above carries the locked view the re-sampled stamp
+			// belongs to; a cross-process rename landing between that write and
+			// this stat degrades exactly as claudeRateLimitCacheStamp documents,
+			// and the post-latch recheck above still shortens the exposure.
+			stampMod, stampSize = claudeRateLimitCacheStamp()
+		} else {
+			// Refused: contended cache, a debt another writer settled or replaced
+			// while we read, or a count two overlapping processes both passed the
+			// unlocked retirement test on. Nothing was written, so the stamp still
+			// describes the file — and an uncharged debt is not adopted.
+			persisted = time.Time{}
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	// A retired debt an EARLIER seed already adopted is dropped from the gate
@@ -1240,7 +1306,10 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		landed = onDisk
 	}
 	measured = landed
-	// A debt neither the caller's view nor the landed reading covers is adopted.
+	// A debt neither the caller's view nor the landed reading covers is adopted —
+	// and only one whose durable attempt was charged above ever reaches here, so
+	// the request this adoption hands the caller is inside the same cap the
+	// startup replay spends from.
 	// (Covered by `landed` means it was settled while we were reading.)
 	if !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
 		!claudeUsageObservationCovers(landed, persisted) {
