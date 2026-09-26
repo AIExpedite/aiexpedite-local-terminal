@@ -1105,7 +1105,18 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // generation counter exists to catch, and leave the gather to publish the
 // pre-replay view for the whole TTL. A needless re-read costs one cache load, and
 // the latch makes it at most one per account per process.
-func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) time.Time {
+//
+// The SECOND return is the debt instant whose durable attempt this call charged,
+// or zero when it charged nothing. The charge is spent on the request the caller
+// is expected to issue off the adopted debt, and the pre-checks below can only
+// establish that begin() would admit that request AS OF this call: the
+// probeInFlight test and the counter increment are not atomic with the caller's
+// later begin(), so the startup replay sitting between its own durable charge and
+// begin() is invisible here and then wins the slot. The caller therefore reports
+// back whether a request of its own actually went out and refunds this charge
+// when none did — the mirror of payOwedClaudeUsageRefreshAt's own refund, and
+// what keeps one HTTP request from costing the two attempts the cap allows.
+func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time) {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
 	// One-shot, for the post-latch stamp recheck below.
@@ -1161,7 +1172,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					continue
 				}
 			}
-			return superseded
+			return superseded, time.Time{}
 		}
 		if pending := g.seedingCh; pending != nil {
 			g.mu.Unlock()
@@ -1173,7 +1184,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			select {
 			case <-pending:
 			case <-ctx.Done():
-				return time.Time{}
+				return time.Time{}, time.Time{}
 			}
 			continue
 		}
@@ -1378,6 +1389,13 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			onDisk = lockedObserved
 		}
 		if charged {
+			// Reported to the caller so a charge the caller then spends no request
+			// on is refunded — see this function's doc comment. Recorded even when
+			// the adoption below declines the debt because a reading landed while
+			// we read: that caller issues nothing either, and the refund is keyed
+			// to this instant, so a debt another writer has since settled or
+			// replaced refuses it rather than inventing an attempt.
+			chargedDebt = persisted
 			// The charge rewrote the snapshot, so the stamp sampled before the
 			// reads no longer describes the file. Take the one the mutation stat'd
 			// under its own lock, or the latch this seed is about to record is
@@ -1444,9 +1462,9 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		}
 		// A debt was adopted, so the caller has a probe to issue: report no
 		// re-read even if the cache moved, or it would return before reaching it.
-		return time.Time{}
+		return time.Time{}, chargedDebt
 	}
-	return g.supersedingObservationLocked(landed, latest, now)
+	return g.supersedingObservationLocked(landed, latest, now), chargedDebt
 }
 
 // supersedingObservationLocked decides whether `observation` — the freshest
@@ -2186,7 +2204,34 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 	// not that reading. The verdict is carried instead, and answers the forced
 	// gather only if its own attempts produce nothing — re-reading a cache that
 	// advanced still beats publishing the view it loaded before.
-	seeded := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
+	seeded, seedCharged := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
+	// The seed charges the adopted debt's durable attempt against the request this
+	// gather is about to issue, but it can only establish that begin() would admit
+	// one as of the moment it charged: the startup replay sitting between its own
+	// charge and begin() is invisible to the seed's in-flight test and then takes
+	// the slot, leaving this gather to JOIN a request it never paid for. Two
+	// charges for one request reach the cap, and the next start retires a debt the
+	// endpoint was asked about once.
+	//
+	// So the charge is refunded whenever no request of this gather's own went out,
+	// exactly as payOwedClaudeUsageRefreshAt refunds its own. Deferred because
+	// every path out of here below — the early re-read, a join that answered, a
+	// refusal — is one that issued nothing.
+	//
+	// Keyed to the instant charged, so a debt settled (the joined probe covering
+	// it) or replaced while we probed refuses the refund rather than inventing an
+	// attempt. Best-effort like the charge itself: a contended cache drops it,
+	// which only ever spends the budget faster, never wrongly.
+	issuedOwn := false
+	if !seedCharged.IsZero() {
+		defer func() {
+			if issuedOwn {
+				return
+			}
+			mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
+				adjustClaudeRefreshAttemptsAt(seedCharged, -1))
+		}()
+	}
 	if !seeded.IsZero() && !forced {
 		return true
 	}
@@ -2261,8 +2306,11 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 				break
 			}
 			claudeUsageProbeBeforeForcedAttempt(pass)
-			refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, true)
+			_, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, now, resolveIdentity, baseline, true)
 			logClaudeUsageProbeFailure(probeErr)
+			// A request of ours went out (or inherited another writer's covering
+			// reading), so the seed's charge bought what it paid for.
+			issuedOwn = issuedOwn || issued
 			if refreshed {
 				// Same settle rule as the routine path below.
 				if owing && claudeUsageObservationCovers(observedAt, owed) {
@@ -2280,8 +2328,11 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 		// still re-read rather than publish the view it holds.
 		return !seeded.IsZero()
 	}
-	admitted, _, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, now, resolveIdentity, baseline, false)
+	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(ctx, now, resolveIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
+	// See the refund above: only an attempt that actually asked (or inherited a
+	// covering reading) keeps the seed's charge.
+	issuedOwn = issued
 	// Refused while OWING: the slot is most likely held by the probe paying that
 	// very debt — the startup replay seeded it, or this process's trailing probe
 	// after a run. A routine gather ordinarily gains nothing by blocking, but
