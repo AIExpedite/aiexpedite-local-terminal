@@ -176,6 +176,31 @@ func antigravityQuotaGateFor(version string, now time.Time) (antigravityQuotaGat
 	return gate, true
 }
 
+// antigravityInstalledBuildVersion is the installed `agy` build's version as
+// the card's own detection last probed it, read without spawning a child: the
+// capture runs on every spawn path and must not block on `agy --version`. ""
+// when the binary is missing, unprobed, or changed on disk since its probe —
+// the last being exactly the self-update the marker must not outlive.
+func antigravityInstalledBuildVersion() string {
+	path := antigravityExecutablePath()
+	if path == "" {
+		return ""
+	}
+	v, _ := lookupCachedProbeVersion(path)
+	return v
+}
+
+// antigravityCaptureGateFor is the run path's reading of the marker. Unlike
+// antigravityQuotaGateFor, an unknown installed version does not match a
+// versioned marker: the run path cannot tell a new build from an unprobed one,
+// and skipping the poller on a build that may answer costs a whole run's
+// reading, where polling a still-gated one costs one refused scan.
+func antigravityCaptureGateFor(now time.Time) bool {
+	version := antigravityInstalledBuildVersion()
+	gate, ok := antigravityQuotaGateFor(version, now)
+	return ok && (gate.Version == "" || gate.Version == version)
+}
+
 // antigravityGateOutranksReading reports whether the refusal is the newer
 // fact. A reading observed after the gate was recorded came by another route
 // (cliagent_usage_antigravity_codeassist.go), so the card shows it and not the

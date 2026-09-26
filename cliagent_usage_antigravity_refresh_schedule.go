@@ -316,11 +316,17 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 				return
 			}
 		}
+		if state.RefreshOwedAtMs != 0 && now.Sub(time.UnixMilli(state.RefreshOwedAtMs)) > antigravityRefreshOwedMaxAge {
+			// Aged out. A terminal debt (no_login, an exhausted ladder) has no
+			// timer to retire it, and left in place it would block every later
+			// run log from ever owing a refresh — so retire it here and judge
+			// the newest log as if no debt were pending.
+			state.clearDebt()
+		}
 		if state.RefreshOwedAtMs != 0 {
 			// Only a debt whose booked attempt is due; its own timer (or the
 			// settle's pass) owns every other one.
-			if now.Sub(time.UnixMilli(state.RefreshOwedAtMs)) > antigravityRefreshOwedMaxAge ||
-				state.Attempts >= antigravityRefreshDebtMaxAttempts ||
+			if state.Attempts >= antigravityRefreshDebtMaxAttempts ||
 				state.NextAttemptAtMs == 0 || state.NextAttemptAtMs > now.UnixMilli() {
 				return
 			}

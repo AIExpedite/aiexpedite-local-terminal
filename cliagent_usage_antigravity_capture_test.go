@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -745,5 +746,91 @@ func TestAntigravityQuotaCapture_GatedBuildStartsNoPoller(t *testing.T) {
 	case <-antigravityCaptureStopped():
 	case <-time.After(5 * time.Second):
 		t.Error("antigravityCaptureStopped hung with no poller armed")
+	}
+}
+
+// helperInstalledAgy puts an `agy` binary on PATH and, when version is
+// non-empty, records it in the version-probe cache as the card's detection
+// would have — the run path reads that cache and never spawns --version.
+func helperInstalledAgy(t *testing.T, version string) {
+	t.Helper()
+	dir := t.TempDir()
+	name := "agy"
+	if runtime.GOOS == "windows" {
+		name = "agy.exe"
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	if version != "" {
+		cachedProbeVersionFunc(antigravityExecutablePath(), func() string { return version })
+	}
+}
+
+// The run path compares the marker with the installed build: a versioned
+// marker skips the poller only for that same build. A self-update (a new
+// version, or a binary changed since its last probe) gets its first re-probe
+// instead of riding the old build's refusal for up to the recheck window.
+func TestAntigravityQuotaCapture_GateMarkerIsPerInstalledBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		marker     string
+		installed  string
+		wantPolled bool
+	}{
+		{name: "same build stays gated", marker: "1.2.2", installed: "1.2.2", wantPolled: false},
+		{name: "an upgraded build is re-probed", marker: "1.2.2", installed: "1.3.0", wantPolled: true},
+		{name: "an unprobed build is re-probed", marker: "1.2.2", installed: "", wantPolled: true},
+		{name: "an unversioned marker covers whatever is installed", marker: "", installed: "1.3.0", wantPolled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityCapture(t, "20ms")
+			helperIsolateAntigravityGate(t)
+			helperInstalledAgy(t, tc.installed)
+			noteAntigravityQuotaGate(tc.marker, time.Now().Add(-time.Minute))
+			helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+			captureStdout(t, func() {
+				finish := startAntigravityQuotaCapture("build check")
+				antigravityCaptureMu.Lock()
+				polled := antigravityCaptureRefs == 1
+				antigravityCaptureMu.Unlock()
+				if polled != tc.wantPolled {
+					t.Errorf("poller started=%v, want %v", polled, tc.wantPolled)
+				}
+				helperStopCapture(t, finish)
+			})
+		})
+	}
+}
+
+// A refusal the poller records is stamped with the installed build when the
+// card has probed it, so a later upgrade is not covered by it.
+func TestAntigravityQuotaCapture_PollerStampsTheInstalledBuild(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "1.2.2")
+	_, hits := helperGatedAntigravityServer(t, filepath.Join(home, ".gemini", "antigravity-cli"))
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("stamp run")
+		deadline := time.Now().Add(10 * time.Second)
+		for hits.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	var gate antigravityQuotaGate
+	if !readJSONFile(gatePath, &gate) {
+		t.Fatal("the poller recorded no refusal")
+	}
+	if gate.Version != "1.2.2" {
+		t.Errorf("marker version=%q, want the installed build 1.2.2", gate.Version)
 	}
 }

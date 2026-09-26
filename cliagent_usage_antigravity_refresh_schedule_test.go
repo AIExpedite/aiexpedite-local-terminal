@@ -432,3 +432,38 @@ func TestNudgeAntigravityUsageRefresh_NeverObservedIsBehindAnyRun(t *testing.T) 
 		t.Errorf("state=%+v, want a no_login debt left unscheduled", state)
 	}
 }
+
+// A terminal debt (no_login has no timer) that outlived the age-out must not
+// block every later run from owing a refresh: the nudge retires it and judges
+// the newer run log in the same pass.
+func TestNudgeAntigravityUsageRefresh_RetiresAnAgedOutDebt(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-8 * time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	stale := now.Add(-antigravityRefreshOwedMaxAge - time.Hour)
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: stale.UnixMilli(), RefreshOwedAtMs: stale.UnixMilli(),
+		Attempts: 1, Outcome: liveProbeOutcomeCodeAssistNoLogin,
+	})
+	logAt := now.Add(-5 * time.Minute)
+	helperWriteRunLogAt(t, home, logAt)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
+	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+		t.Fatal("an aged-out debt blocked the nudge from owing the newer run")
+	}
+	antigravityUsageRefreshWaitIdle()
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != newest.UnixMilli() || state.RefreshOwedAtMs < now.UnixMilli() {
+		t.Errorf("state=%+v, want a fresh debt floored at the newer run log", state)
+	}
+	if state.Outcome == liveProbeOutcomeCodeAssistNoLogin {
+		t.Errorf("state=%+v, want the aged-out no_login outcome retired", state)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the new debt attempted once", reads.Load())
+	}
+}
