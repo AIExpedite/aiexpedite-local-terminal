@@ -32,9 +32,13 @@
 //   - Pay — the in-process trailing probe pays it first (unchanged).
 //     payOwedClaudeUsageRefresh is the backstop for when the process died.
 //   - Settle — cleared inside mergeClaudeRateLimitCacheSerialized, in the same
-//     locked write that carries the covering reading. There is deliberately no
-//     claudeSettleOwedRefresh here: a second clear path could disagree with the
-//     merge.
+//     locked write that carries the covering reading, and only for a PROBE
+//     write: that is the one writer which samples every window, so it is the
+//     one whose observation is a claim about every row the card shows. A debt a
+//     partial write happens to cover is cleared, without a request, by
+//     payOwedClaudeUsageRefreshAt's row-aware pre-check. There is deliberately
+//     no claudeSettleOwedRefresh here: a second clear path could disagree with
+//     the merge.
 //   - Hold — a 429 Retry-After is mirrored to HeldUntilMs so a restart inside
 //     the window does not re-storm an account-scoped endpoint.
 //   - Retire — aged out, at the attempt cap, stamped implausibly far ahead, or

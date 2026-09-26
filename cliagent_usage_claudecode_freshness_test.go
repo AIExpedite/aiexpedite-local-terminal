@@ -613,3 +613,90 @@ func TestTriggerClaudeUsageProbeAfterRun_CountsTheDebtWriteInTheDrain(t *testing
 	}
 	claudeFreshnessWaitIdle(t)
 }
+
+// Only a PROBE write may durably settle a debt. `observed` is the constraining
+// window of the WRITE, not of the card, so it is a claim about every displayed
+// row only for the writer that samples them all. A status-line render answers
+// five_hour/seven_day and a stream capture often one window: letting either
+// settle cleared the durable debt while the weekly / Fable row still showed a
+// PRE-run reading, so a self-update moments later found nothing to replay —
+// a diluted form of the defect this whole path exists to fix.
+func TestMergeClaudeRateLimitCache_PartialWriteCannotSettleTheDurableDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	preRun := now.Add(-time.Hour)
+
+	for _, source := range []string{claudeRateLimitSourceStatusLine, claudeRateLimitSourceStream} {
+		t.Run(source, func(t *testing.T) {
+			// Two displayed rows, both observed BEFORE the run.
+			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+					ObservedAtMs: preRun.UnixMilli(), usageKnown: true},
+				claudeWindowSevenDayOverageIncluded: {UsedPercentage: 20, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(),
+					ObservedAtMs: preRun.UnixMilli(), usageKnown: true},
+			}, preRun, fp, claudeRateLimitSourceStatusLine)
+
+			runEnded := time.Now()
+			seedClaudeRefreshDebt(t, cache, fp, runEnded, 0, time.Time{})
+
+			// A post-run write that only knows five_hour.
+			after := runEnded.Add(time.Second)
+			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {UsedPercentage: 11, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+					ObservedAtMs: after.UnixMilli(), usageKnown: true},
+			}, after, fp, source)
+
+			// The card is still stale, so the debt must still be owed.
+			displayed := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fp), time.Now())
+			if claudeUsageObservationCovers(displayed, runEnded) {
+				t.Fatalf("fixture is wrong: the displayed card (%v) already covers the run %v", displayed, runEnded)
+			}
+			if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != runEnded.UnixMilli() {
+				t.Fatalf("a %s write settled a debt the card still owes: %+v", source, snap)
+			}
+		})
+	}
+
+	// The same write from the PROBE does settle it: the probe stamps every
+	// window the endpoint supplies, so its observation speaks for the card.
+	runEnded := time.Now()
+	seedClaudeRefreshDebt(t, cache, fp, runEnded, 0, time.Time{})
+	after := runEnded.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: after.UnixMilli(), usageKnown: true},
+		claudeWindowSevenDayOverageIncluded: {UsedPercentage: 21, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(),
+			ObservedAtMs: after.UnixMilli(), usageKnown: true},
+	}, after, fp, claudeRateLimitSourceProbe)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("a covering probe write must settle the debt: %+v", snap)
+	}
+}
+
+// A debt a partial write DID cover costs no request: the startup replay's
+// row-aware pre-check clears it. That is what makes the probe-only settlement
+// rule free rather than a source of extra OAuth calls.
+func TestPayOwedClaudeUsageRefresh_ClearsADebtAPartialWriteCovered(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	runEnded := now.Add(-time.Minute)
+
+	// One displayed row, refreshed by a status-line render after the run — so
+	// the CARD is genuinely current even though no probe wrote.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 13, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: runEnded.Add(time.Second).UnixMilli(), usageKnown: true},
+	}, runEnded.Add(time.Second), fp, claudeRateLimitSourceStatusLine)
+	seedClaudeRefreshDebt(t, cache, fp, runEnded, 0, time.Time{})
+
+	payOwedClaudeUsageRefreshAt(now)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0 — the card is already current", got)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Errorf("the replay must retire a debt the card already covers: %+v", snap)
+	}
+}

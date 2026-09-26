@@ -868,11 +868,22 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// settled is already on disk, and the two would then disagree — a debt
 	// replayed at the next start for a reading the cache already holds.
 	//
-	// `observed` is the constraining window of THIS write, so a reading that
-	// predates the run cannot clear the debt, and a merge that covers nothing
-	// leaves all three fields exactly as it found them. A bucket write must
-	// never silently pay a debt.
-	if snap.RefreshOwedAtMs != 0 &&
+	// ONLY the probe may settle, and that restriction is load-bearing. `observed`
+	// is the constraining window of THIS WRITE — not of the card — so it is a
+	// claim about every displayed row only for a writer that samples them all.
+	// The probe does; a status-line render answers five_hour/seven_day and a
+	// stream capture often one window. Letting a partial write settle cleared
+	// the durable debt while the weekly / Fable row still displayed a PRE-run
+	// reading, so a self-update moments later found nothing to replay and that
+	// row stayed stale — a diluted form of the very defect this field exists to
+	// fix. The in-memory settle is unaffected: it goes through
+	// claudeSnapshotFreshness, which is row-aware and can afford to be, and a
+	// debt a partial write did cover is cleared without a request by
+	// payOwedClaudeUsageRefreshAt's coverage pre-check at the next start.
+	//
+	// A merge that covers nothing leaves all three fields exactly as it found
+	// them. A bucket write must never silently pay a debt.
+	if source == claudeRateLimitSourceProbe && snap.RefreshOwedAtMs != 0 &&
 		claudeUsageObservationCovers(observed, time.UnixMilli(snap.RefreshOwedAtMs)) {
 		clearClaudeRefreshDebt(&snap)
 	}
