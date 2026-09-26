@@ -337,3 +337,69 @@ func TestCodexCaptureVersionForLaunch(t *testing.T) {
 		t.Fatalf("probed explicit path = %q, want that binary's own version", got)
 	}
 }
+
+// A gather that detected the PRE-upgrade build and was overtaken by one that
+// published the new build must not roll the process-global stamp back: later
+// captures made by the new binary would be stamped old, and the rollout cursor
+// reset against the wrong version. The version-probe cache's binary identity
+// is what settles it — no spawn.
+func TestPublishCodexUsageCaptureVersionFrom_StaleDetectionCannotRollBack(t *testing.T) {
+	t.Cleanup(resetVersionProbeCache)
+	setCodexCaptureVersion(t, "")
+
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("binary"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+
+	// Nothing has probed this exact binary: an offered version cannot be shown
+	// stale, so it publishes.
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.149.0" {
+		t.Fatalf("unprobed binary published %q, want the offered version", got)
+	}
+
+	// The upgrade: the binary as it is now reports the new build, and the
+	// gather that detected it published first.
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.150.0" })
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.150.0")
+
+	// The slow pre-upgrade gather finally reaches its publish.
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.150.0" {
+		t.Fatalf("stale detection rolled the stamp back to %q, want the installed build", got)
+	}
+
+	// An absent path (detection reported no path) keeps the old unconditional
+	// behaviour rather than dropping every stamp.
+	publishCodexUsageCaptureVersionFrom("", "codex-cli 0.151.0")
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.151.0" {
+		t.Fatalf("pathless publish = %q, want it to publish", got)
+	}
+}
+
+// The live probe's child is a long-lived process like a managed session: its
+// reading is stamped with the build launched, not with whatever a concurrent
+// gather published while the request was in flight.
+func TestCodexLiveProbeConverse_StampsTheLaunchedBuild(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	setCodexCaptureVersion(t, "codex-cli 0.149.0")
+	pinned := currentCodexUsageCaptureVersion()
+
+	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
+	// The upgrade lands while the child is mid-request.
+	codexUsageCaptureVersion.Store("codex-cli 0.150.0")
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), pinned); got != liveProbeOutcomeOK {
+		t.Fatalf("outcome=%q, want ok", got)
+	}
+	<-methods
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	if snap.CodexVersion != "codex-cli 0.149.0" {
+		t.Fatalf("stamp = %q, want the build the probe launched", snap.CodexVersion)
+	}
+}

@@ -117,7 +117,7 @@ func TestCodexLiveProbeConverse_CapturesPoolsAndDropsMissingWindow(t *testing.T)
 	)
 
 	stdin, stdout, methods := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q, want ok", got)
 	}
 	if seen := <-methods; len(seen) != 3 || seen[0] != "initialize" || seen[1] != "initialized" || seen[2] != "account/rateLimits/read" {
@@ -166,7 +166,7 @@ func TestCodexMetrics_PoolRowsDisappearWhenPoolIsGone(t *testing.T) {
 	isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// A later read in which the account no longer has the Spark pool, and the
@@ -193,7 +193,7 @@ func TestCodexLimitNames_SparseUpdateKeepsPoolName(t *testing.T) {
 	cache := isolateCodexCache(t)
 	now := time.Now()
 	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeOK {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q", got)
 	}
 	// Sparse updates restate the Spark pool's numbers: one omits limitName, the
@@ -267,7 +267,7 @@ func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
 func TestCodexLiveProbeConverse_RPCErrorLeavesCacheAlone(t *testing.T) {
 	cache := isolateCodexCache(t)
 	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"error":{"code":-32000,"message":"failed to fetch codex rate limits"}}`)
-	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint()); got != liveProbeOutcomeRPCError {
+	if got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion()); got != liveProbeOutcomeRPCError {
 		t.Fatalf("outcome=%q, want rpc_error", got)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
@@ -855,7 +855,7 @@ func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
 	if spawnedUnder == currentCodexAccountFingerprint() {
 		t.Fatal("fixture must sign a different account in than the one spawned")
 	}
-	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder); got != liveProbeOutcomeAccountChanged {
+	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChanged {
 		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChanged)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {

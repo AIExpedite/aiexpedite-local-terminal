@@ -51,6 +51,32 @@ func publishCodexUsageCaptureVersion(version string) {
 	}
 }
 
+// publishCodexUsageCaptureVersionFrom publishes a version that was read from a
+// SPECIFIC binary, and refuses when that reading is already stale.
+//
+// The periodic gather and a demand-driven refresh are independent callers, so
+// one pass can detect the pre-upgrade build, be overtaken by an upgrade and a
+// second pass publishing the new build, and only then reach its own publish —
+// rolling the process-global stamp back to the old version. Captures made by
+// the NEW binary would then be stamped old, and the rollout cursor reset
+// against the wrong version, until another pass corrected it.
+//
+// The version-probe cache already keys on binary identity (path, mtime, size),
+// so this check is a stat plus a map read and never spawns: when that cache
+// holds a version for the binary AS IT IS NOW and it differs from the one
+// offered, the offered reading describes a binary that is no longer installed
+// and is dropped. No cached entry — nothing has probed this exact binary yet —
+// cannot be shown stale, so it publishes as before.
+func publishCodexUsageCaptureVersionFrom(path, version string) {
+	if path != "" {
+		if installed, ok := peekCachedProbeVersion(path); ok &&
+			codexNormalizeVersion(installed) != codexNormalizeVersion(version) {
+			return
+		}
+	}
+	publishCodexUsageCaptureVersion(version)
+}
+
 // codexVersionMaxBytes bounds a `--version` first line before it is persisted,
 // compared or shown. Only a build printing something unexpectedly long is
 // affected.

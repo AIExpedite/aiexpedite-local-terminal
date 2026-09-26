@@ -347,9 +347,17 @@ func resetCodexLiveRateLimitRead() {
 // wantFingerprint refuses before spawning when another account is signed in
 // (codexLiveRateLimitRead).
 func probeCodexRateLimitsLive(parent context.Context, codexPath, wantFingerprint string) string {
+	// The binary this probe is about to launch, and the version it reports —
+	// pinned here rather than read when the answer arrives. An upgrade (or a
+	// gather publishing one) while the child is mid-request must not credit the
+	// already-running old build's telemetry to the new one, which would settle
+	// the debt and suppress capture drift. Same rule, and the same helper, as a
+	// managed Codex session (codexCaptureVersionForLaunch).
+	command := codexPath
 	if codexPath == "" {
-		codexPath = resolveExecutable("codex")
+		command, codexPath = "codex", resolveExecutable("codex")
 	}
+	producerVersion := codexCaptureVersionForLaunch(command, codexPath)
 	ctx, cancel := context.WithTimeout(parent, codexLiveProbeTimeout)
 	defer cancel()
 
@@ -395,7 +403,7 @@ func probeCodexRateLimitsLive(parent context.Context, codexPath, wantFingerprint
 	}()
 
 	result := make(chan string, 1)
-	go func() { result <- codexLiveProbeConverse(stdin, stdout, spawnedFingerprint) }()
+	go func() { result <- codexLiveProbeConverse(stdin, stdout, spawnedFingerprint, producerVersion) }()
 	select {
 	case outcome := <-result:
 		return outcome
@@ -436,7 +444,9 @@ func absoluteCodexHomeEnv(env []string) []string {
 // spawnedFingerprint is the account the child was started under; the reading
 // is cached under it, and dropped when a `codex login` or account switch
 // changed the signed-in account while the request was in flight.
-func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprint string) string {
+// producerVersion is the version of the binary that was launched, pinned at
+// spawn, so an upgrade published mid-request never claims this reading.
+func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprint, producerVersion string) string {
 	send := func(frame map[string]any) bool {
 		b, err := json.Marshal(frame)
 		if err != nil {
@@ -491,7 +501,7 @@ func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprin
 			if currentCodexAccountFingerprint() != spawnedFingerprint {
 				return liveProbeOutcomeAccountChanged
 			}
-			captureCodexRateLimitLineForAccount(string(envelope), time.Now(), spawnedFingerprint)
+			captureCodexRateLimitLineFromProducer(string(envelope), time.Now(), spawnedFingerprint, producerVersion)
 			return liveProbeOutcomeOK
 		}
 	}

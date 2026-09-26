@@ -278,8 +278,9 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	// what is left, and an inconclusive probe never un-authenticates a
 	// credential auth.json already proved.
 	// Every writer in this pass — the reconcile below, and any live capture
-	// racing it — stamps the binary detected here.
-	publishCodexUsageCaptureVersion(detected.Version)
+	// racing it — stamps the binary detected here, unless an upgrade has already
+	// overtaken this pass and published the newer build.
+	publishCodexUsageCaptureVersionFrom(detected.Path, detected.Version)
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time

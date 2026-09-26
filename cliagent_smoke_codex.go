@@ -250,7 +250,7 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	shapeBinding := bindCLISmokeShape(path)
 	// A capture made outside a gather still stamps the binary that produced
 	// it — the one this smoke was sent to validate.
-	publishCodexUsageCaptureVersion(version)
+	publishCodexUsageCaptureVersionFrom(path, version)
 	// The account the turn runs under. A reading taken after the credentials
 	// changed cannot be attributed to it and never reaches the cache.
 	smokeFingerprint := currentCodexAccountFingerprint()
