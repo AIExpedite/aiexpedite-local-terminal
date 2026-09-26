@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1631,5 +1633,92 @@ func TestMergeClaudeRateLimitCache_PreRunReadingLeavesTheDebtStanding(t *testing
 	}
 	if snap.RefreshOwedAtMs != runEnded.UnixMilli() || snap.RefreshOwedAttempts != 1 || snap.HeldUntilMs != held.UnixMilli() {
 		t.Errorf("a pre-run reading must leave debt, counter and hold untouched: %+v", snap)
+	}
+}
+
+// A reading that belongs to account A must NOT be merged over a snapshot a
+// `/login` re-scoped to a third account while the request was in flight: the
+// merge reads the mismatch as an account transition and would clear B's fresh
+// buckets before writing A's numbers under them. The guard is judged inside the
+// locked read, so another process renaming its snapshot after the caller
+// sampled the scope cannot slip past it.
+func TestMergeClaudeRateLimitCacheCheckedScoped_RefusesAThirdAccount(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "claude_rate_limits.json")
+	now := time.Now()
+
+	// Account B's writer owns the cache by the time A's late reading arrives.
+	if _, err := mergeClaudeRateLimitCacheChecked(context.Background(), cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			UsedPercentage: 12, Status: "allowed", usageKnown: true,
+		},
+	}, now, "account-b", claudeRateLimitSourceStatusLine); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	later := now.Add(time.Minute)
+	// A started when the cache was still unscoped, so "" is all it may write over.
+	observed, err := mergeClaudeRateLimitCacheCheckedScoped(context.Background(), cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: later.UnixMilli(), ResetsAtMs: later.Add(time.Hour).UnixMilli(),
+			UsedPercentage: 91, Status: "allowed", usageKnown: true,
+		},
+	}, later, "account-a", claudeRateLimitSourceProbe, []string{""})
+	if !errors.Is(err, errClaudeRateLimitCacheRescoped) {
+		t.Fatalf("err=%v, want errClaudeRateLimitCacheRescoped", err)
+	}
+	if !observed.IsZero() {
+		t.Errorf("observed=%s, want zero — nothing was persisted", observed)
+	}
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("a refused merge rewrote the cache:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// The guard refuses only a THIRD scope. An unchanged scope, and one that moved
+// to the reading's OWN account, are the ordinary transitions this merge exists
+// to perform.
+func TestMergeClaudeRateLimitCacheCheckedScoped_AdmitsTheSampledAndOwnScopes(t *testing.T) {
+	now := time.Now()
+	write := func(t *testing.T, onDisk, fingerprint string, allowed []string) error {
+		t.Helper()
+		cache := filepath.Join(t.TempDir(), "claude_rate_limits.json")
+		if _, err := mergeClaudeRateLimitCacheChecked(context.Background(), cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				UsedPercentage: 12, Status: "allowed", usageKnown: true,
+			},
+		}, now, onDisk, claudeRateLimitSourceStatusLine); err != nil {
+			t.Fatal(err)
+		}
+		later := now.Add(time.Minute)
+		_, err := mergeClaudeRateLimitCacheCheckedScoped(context.Background(), cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: later.UnixMilli(), ResetsAtMs: later.Add(time.Hour).UnixMilli(),
+				UsedPercentage: 91, Status: "allowed", usageKnown: true,
+			},
+		}, later, fingerprint, claudeRateLimitSourceProbe, allowed)
+		return err
+	}
+
+	if err := write(t, "account-a", "account-a", []string{"account-a"}); err != nil {
+		t.Errorf("an unchanged scope was refused: %v", err)
+	}
+	// B signed in while the request was out, and the reading belongs to B.
+	if err := write(t, "account-b", "account-b", []string{"account-a"}); err != nil {
+		t.Errorf("a move to the reading's own account was refused: %v", err)
+	}
+	// No sample supplied: the guard is off, as it is for every writer that
+	// resolves its identity immediately before writing.
+	if err := write(t, "account-b", "account-a", nil); err != nil {
+		t.Errorf("an unguarded merge was refused: %v", err)
 	}
 }

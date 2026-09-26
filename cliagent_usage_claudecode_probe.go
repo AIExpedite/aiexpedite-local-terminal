@@ -62,6 +62,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2009,7 +2010,14 @@ func probeClaudeUsageAdmitted(
 		// Durable too: an in-memory hold is forgotten by a restart, and the
 		// startup replay would then fire straight at an endpoint that just told
 		// us to stop — on a limit scoped to an account every device shares.
-		claudeHoldUsageProbe(identity.fingerprint, hold)
+		//
+		// Scoped like the merge below, and for the same reason: this hold belongs
+		// to the account the request was issued under, so a `/login` that landed
+		// while it was in flight must refuse it rather than let a marker write
+		// clear the new account's fresh buckets as a transition. The guard runs
+		// under the cache lock, so it cannot be overtaken the way an unlocked
+		// pre-check can.
+		claudeHoldUsageProbe(identity.fingerprint, hold, scopeBefore)
 		return admitted, issued, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -2048,25 +2056,32 @@ func probeClaudeUsageAdmitted(
 	// that budget must be clamped by whatever is left of it rather than added to
 	// it. An abandoned merge still finishes on its own goroutine — the reading
 	// lands for the next gather; this probe just does not claim it.
-	// Refuse the merge if the cache moved to a THIRD scope while the request was
-	// out: one that is neither what it held when we started nor the account this
-	// reading belongs to. That is another writer re-scoping the snapshot to a
-	// login this reading cannot describe, and merging over it would take the new
-	// account's fresh buckets down as a transition. An unchanged scope, or one
-	// that moved to OUR account, is the ordinary transition this merge exists to
-	// perform and still goes through.
+	// The merge refuses itself if the cache moved to a THIRD scope while the
+	// request was out: one that is neither what it held when we started nor the
+	// account this reading belongs to. That is another writer re-scoping the
+	// snapshot to a login this reading cannot describe, and merging over it would
+	// take the new account's fresh buckets down as a transition. An unchanged
+	// scope, or one that moved to OUR account, is the ordinary transition this
+	// merge exists to perform and still goes through.
+	//
+	// The check is passed INTO the merge rather than made here, because a scope
+	// sampled outside the cache lock is evidence about the past: account B's
+	// writer can rename its snapshot between this goroutine reading the scope and
+	// the merge acquiring the lock, and the merge would then clear the very
+	// buckets the check was added to protect. mergeClaudeRateLimitCacheCheckedScoped
+	// judges it against the snapshot its own locked read found.
 	//
 	// `issued` stays true: the turn was spent and the endpoint answered. There is
 	// nothing here for the startup replay to retry against the account it charged
 	// under, and the new login's own gather will probe for itself. probeErr stays
 	// nil for the same reason — the endpoint did nothing wrong, so this must not
 	// extend the failure backoff for the account that just signed in.
-	if after := claudeRateLimitCacheScope(); after != scopeBefore && after != identity.fingerprint {
-		return admitted, issued, false, time.Time{}, nil
-	}
-	persisted, err := mergeClaudeRateLimitCacheChecked(ctx, claudeRateLimitCachePath(), updates, now,
-		identity.fingerprint, claudeRateLimitSourceProbe)
+	persisted, err := mergeClaudeRateLimitCacheCheckedScoped(ctx, claudeRateLimitCachePath(), updates, now,
+		identity.fingerprint, claudeRateLimitSourceProbe, []string{scopeBefore})
 	if err != nil {
+		if errors.Is(err, errClaudeRateLimitCacheRescoped) {
+			return admitted, issued, false, time.Time{}, nil
+		}
 		return admitted, issued, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
 	}
 	// `persisted`, not `now`: the merge refuses a bucket whose stamp is older

@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -493,7 +494,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false)
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false, nil)
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -537,7 +538,58 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // it — and that treats an unserialized write as a failure. See
 // mergeClaudeRateLimitCacheInto.
 func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true)
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, nil)
+}
+
+// errClaudeRateLimitCacheRescoped is returned when the snapshot found UNDER THE
+// LOCK belongs to an account this write may not describe. It is a fact about
+// the cache, not about the endpoint, so a caller must not fold it into its
+// provider failure backoff — see the scope note in probeClaudeUsageAdmitted.
+var errClaudeRateLimitCacheRescoped = errors.New("claude rate-limit cache: re-scoped to another account")
+
+// mergeClaudeRateLimitCacheCheckedScoped is mergeClaudeRateLimitCacheChecked
+// with a scope guard applied INSIDE the locked read-modify-rename.
+//
+// A writer that resolved its identity long before it writes — the utilization
+// probe, which pins an account, spends a network round trip, and only then
+// merges — can be overtaken by a `/login` that re-scopes the snapshot to a
+// different account. The merge reads that mismatch as an ordinary account
+// transition and clears the buckets it finds, so the late reading would erase
+// the account the device is now signed in to and republish the previous one's
+// numbers under it.
+//
+// `allowedScopes` names the scopes this reading may still be applied over,
+// besides its own `fingerprint`: normally the single scope the caller sampled
+// before it started. A snapshot carrying anything else is a THIRD account that
+// arrived while the caller was out, and the merge is refused with
+// errClaudeRateLimitCacheRescoped without touching the file.
+//
+// Checked under the lock rather than before it, because an unlocked pre-check
+// answers a question about the past: another process can rename its snapshot in
+// between, and the merge would then clear the very buckets the pre-check was
+// added to protect. An empty `allowedScopes` disables the guard, which is what
+// every writer that resolves its identity immediately before writing wants.
+func mergeClaudeRateLimitCacheCheckedScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, allowedScopes)
+}
+
+// claudeCacheScopeRejects reports whether a snapshot found on disk under
+// `onDisk` is out of scope for a writer whose evidence belongs to `fingerprint`
+// and which sampled `allowed` before it started.
+//
+// Shared by the merge and mutateClaudeRateLimitSnapshot so the two cannot drift:
+// both reset a snapshot they find under another fingerprint, so both need the
+// same answer to "is this a transition I am entitled to make?".
+func claudeCacheScopeRejects(onDisk, fingerprint string, allowed []string) bool {
+	if len(allowed) == 0 || onDisk == fingerprint {
+		return false
+	}
+	for _, scope := range allowed {
+		if onDisk == scope {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
@@ -575,12 +627,12 @@ func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates 
 // in both modes: there is no evidence of a competing holder, only of a
 // filesystem that will not give us the lock file (a read-only data dir fails the
 // write below anyway, which the verified caller does see).
-func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool, allowedScopes []string) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	if !verified {
-		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{})
+		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes)
 	}
 	// A verified merge is bounded END TO END, not merely across its two lock
 	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
@@ -617,7 +669,7 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	}
 	done := make(chan persistResult, 1)
 	go func() {
-		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline)
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline, allowedScopes)
 		done <- persistResult{observed: observed, err: err}
 	}()
 	timer := time.NewTimer(time.Until(deadline))
@@ -647,9 +699,9 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // then drop the merge); a non-zero one selects the verified contract, clamping
 // both waits to what is left of the caller's budget and reporting the failure
 // rather than dropping it. Neither contract writes behind a confirmed holder.
-func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string) (time.Time, error) {
 	return withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
-		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source)
+		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes)
 	})
 }
 
@@ -719,7 +771,7 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 
 // mergeClaudeRateLimitCacheLocked is the read-merge-rename itself. Callers MUST
 // already hold the ladder withClaudeRateLimitCacheLocked takes.
-func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -732,6 +784,14 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// transitions, buckets cached while creds were unreadable get stamped under
 	// the next signed-in account's fingerprint and surface as that account's
 	// reset windows on the CLI Agents tab.
+	// The scope guard, judged against the snapshot THIS locked read found rather
+	// than one sampled before the lock was granted. See
+	// mergeClaudeRateLimitCacheCheckedScoped: a reading that belongs to an
+	// account the cache has since moved off must refuse rather than take the new
+	// login's fresh buckets down as a transition.
+	if claudeCacheScopeRejects(snap.AccountFingerprint, fingerprint, allowedScopes) {
+		return time.Time{}, errClaudeRateLimitCacheRescoped
+	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 		// Probe evidence is an observation about ONE account's quota, so it

@@ -108,6 +108,22 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 	return wrote
 }
 
+// mutateClaudeRateLimitSnapshotScoped is mutateClaudeRateLimitSnapshot with the
+// merge's scope guard (claudeCacheScopeRejects) applied under the SAME lock,
+// for the one caller whose marker was earned long before it is written: the 429
+// hold, which belongs to the account the in-flight request was issued under. A
+// `/login` landing while that request is out re-scopes the cache, and writing
+// the old account's hold over it would take the new login's fresh buckets down
+// as a transition — for backpressure that account never earned.
+//
+// `allowedScopes` names the scopes the marker may still be written over besides
+// its own fingerprint; empty disables the guard, which is what every caller
+// that resolves its identity immediately before writing wants.
+func mutateClaudeRateLimitSnapshotScoped(path, fingerprint string, allowedScopes []string, fn func(*claudeRateLimitSnapshot) bool) bool {
+	wrote, _, _ := mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint, allowedScopes, fn)
+	return wrote
+}
+
 // mutateClaudeRateLimitSnapshotStamped is mutateClaudeRateLimitSnapshot plus the
 // cache stamp (claudeRateLimitCacheStamp's pair) of the file the mutation leaves
 // behind, stat'd under the SAME lock as the write.
@@ -123,6 +139,13 @@ func mutateClaudeRateLimitSnapshot(path, fingerprint string, fn func(*claudeRate
 // whatever older stamp it already holds in that case, which errs toward
 // re-opening the decision rather than latching one away.
 func mutateClaudeRateLimitSnapshotStamped(path, fingerprint string, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
+	return mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint, nil, fn)
+}
+
+// mutateClaudeRateLimitSnapshotStampedScoped is the implementation of both, with
+// the optional under-lock scope guard mutateClaudeRateLimitSnapshotScoped
+// documents.
+func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowedScopes []string, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
 	if path == "" || fn == nil {
 		return false, 0, 0
 	}
@@ -146,6 +169,12 @@ func mutateClaudeRateLimitSnapshotStamped(path, fingerprint string, fn func(*cla
 		// merge) may reset a scope to unscoped — they carry a reading, and a debt
 		// or hold marker does not.
 		if fingerprint == "" && snap.AccountFingerprint != "" {
+			return time.Time{}, nil
+		}
+		// A marker earned under an account the cache has since moved off is
+		// refused outright — here, under the lock, for the same reason the
+		// empty-fingerprint check is. See mutateClaudeRateLimitSnapshotScoped.
+		if claudeCacheScopeRejects(snap.AccountFingerprint, fingerprint, allowedScopes) {
 			return time.Time{}, nil
 		}
 		if snap.AccountFingerprint != fingerprint {
@@ -340,12 +369,18 @@ func claudeRateLimitCacheStamp() (modUnixNano, size int64) {
 // Monotonic — a shorter hold never shortens a longer one already on record —
 // and never clears or charges a debt: backpressure suppresses the replay, it
 // does not retire what the replay was going to pay.
-func claudeHoldUsageProbe(fingerprint string, deadline time.Time) {
+//
+// `allowedScopes` carries the scope the caller sampled before its request went
+// out: a hold earned by account A must not be written over a cache a `/login`
+// re-scoped to B while the request was in flight, since that write would clear
+// B's fresh buckets as an account transition. Judged under the lock — see
+// mutateClaudeRateLimitSnapshotScoped.
+func claudeHoldUsageProbe(fingerprint string, deadline time.Time, allowedScopes ...string) {
 	if deadline.IsZero() {
 		return
 	}
 	deadlineMs := deadline.UnixMilli()
-	mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
+	mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), fingerprint, allowedScopes,
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.HeldUntilMs >= deadlineMs {
 				return false

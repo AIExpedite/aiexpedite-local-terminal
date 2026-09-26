@@ -2930,3 +2930,62 @@ func TestClaudeUsageProbe_MergesOverACacheScopeItAlreadySawOnEntry(t *testing.T)
 		t.Errorf("five-hour utilization=%v, want the probe's 61", got)
 	}
 }
+
+// A 429 hold belongs to the account the request went out under. When a
+// `/login` re-scopes the cache while that request is in flight, persisting the
+// hold would clear the NEW account's fresh buckets as an account transition —
+// for backpressure that account never earned. The guard runs under the cache
+// lock, so a writer that renamed its snapshot after the probe sampled the scope
+// cannot slip past it either.
+func TestClaudeHoldUsageProbe_RefusesAStaleAccountHold(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+
+	observedAt := time.Now().Add(-time.Minute)
+	if !mutateClaudeRateLimitSnapshot(cache, "account-b", func(snap *claudeRateLimitSnapshot) bool {
+		snap.Buckets[claudeWindowFiveHour] = claudeRateLimitBucket{
+			UsedPercentage: 41, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observedAt.UnixMilli(), usageKnown: true,
+		}
+		return true
+	}) {
+		t.Fatal("seeding account B's snapshot wrote nothing")
+	}
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Account A's request started while the cache was still unscoped.
+	claudeHoldUsageProbe("account-a", time.Now().Add(30*time.Minute), "")
+
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("a stale-account hold rewrote the cache:\nbefore %s\nafter  %s", before, after)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.HeldUntilMs != 0 {
+		t.Errorf("HeldUntilMs=%d, want no hold written under another account", snap.HeldUntilMs)
+	}
+	if len(snap.Buckets) != 1 || snap.AccountFingerprint != "account-b" {
+		t.Errorf("account B's reading was disturbed: %+v", snap)
+	}
+}
+
+// The guard refuses only a THIRD scope: a hold whose account still owns the
+// cache is exactly what the durable hold exists to record.
+func TestClaudeHoldUsageProbe_StillRecordsTheOwningAccountsHold(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Minute))
+
+	hold := time.Now().Add(30 * time.Minute)
+	claudeHoldUsageProbe(fp, hold, fp)
+
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != hold.UnixMilli() {
+		t.Fatalf("HeldUntilMs=%d, want %d — the owning account's hold must persist",
+			snap.HeldUntilMs, hold.UnixMilli())
+	}
+}
