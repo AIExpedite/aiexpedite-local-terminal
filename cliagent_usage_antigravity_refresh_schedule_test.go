@@ -336,9 +336,11 @@ func TestNudgeAntigravityUsageRefresh_Refusals(t *testing.T) {
 			},
 		},
 		{
+			// For its own run: a newer run replaces a spent debt (see
+			// ReplacesATerminalDebtForANewerRun).
 			name: "a pending debt with its budget spent", logAt: now.Add(-5 * time.Minute), observed: observed,
 			state: &antigravityUsageFreshness{
-				RefreshOwedFloorMs: now.Add(-10 * time.Minute).UnixMilli(), RefreshOwedAtMs: now.Add(-10 * time.Minute).UnixMilli(),
+				RefreshOwedFloorMs: now.Add(-5 * time.Minute).UnixMilli(), RefreshOwedAtMs: now.Add(-4 * time.Minute).UnixMilli(),
 				Attempts: antigravityRefreshDebtMaxAttempts,
 			},
 		},
@@ -465,5 +467,70 @@ func TestNudgeAntigravityUsageRefresh_RetiresAnAgedOutDebt(t *testing.T) {
 	}
 	if reads.Load() != 1 {
 		t.Errorf("reads=%d, want the new debt attempted once", reads.Load())
+	}
+}
+
+// A terminal debt still inside the age-out must not block a newer run either:
+// a settled run log past the debt's floor (the user signed in and ran `agy`
+// from their own shell) owes its own refresh with a fresh budget.
+func TestNudgeAntigravityUsageRefresh_ReplacesATerminalDebtForANewerRun(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-8 * time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	owed := now.Add(-time.Hour)
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: owed.UnixMilli(), RefreshOwedAtMs: owed.UnixMilli(),
+		Attempts: antigravityRefreshDebtMaxAttempts, Outcome: liveProbeOutcomeCodeAssistNoLogin,
+	})
+	logAt := now.Add(-5 * time.Minute)
+	helperWriteRunLogAt(t, home, logAt)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
+	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+		t.Fatal("a terminal debt blocked the nudge from owing a newer run")
+	}
+	antigravityUsageRefreshWaitIdle()
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != newest.UnixMilli() || state.RefreshOwedAtMs < now.UnixMilli() {
+		t.Errorf("state=%+v, want a fresh debt floored at the newer run log", state)
+	}
+	if state.Outcome == liveProbeOutcomeCodeAssistNoLogin || state.Attempts != 1 {
+		t.Errorf("state=%+v, want the no_login debt replaced and the new one charged once", state)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the new debt attempted once", reads.Load())
+	}
+}
+
+// The run a terminal debt was booked for is not a newer run: a log no later
+// than the debt's floor leaves the debt terminal and spends nothing.
+func TestNudgeAntigravityUsageRefresh_KeepsATerminalDebtForItsOwnRun(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	home := t.TempDir()
+	now := time.Now()
+	observed := now.Add(-8 * time.Hour).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	logAt := now.Add(-time.Hour)
+	helperWriteRunLogAt(t, home, logAt)
+	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
+	helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: newest.UnixMilli(), RefreshOwedAtMs: newest.UnixMilli(),
+		Attempts: antigravityRefreshDebtMaxAttempts, Outcome: liveProbeOutcomeCodeAssistNoLogin,
+	})
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	if nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+		t.Fatal("the nudge replaced a terminal debt for the run it was booked for")
+	}
+	antigravityUsageRefreshWaitIdle()
+	state := helperFreshnessState(t)
+	if state.Outcome != liveProbeOutcomeCodeAssistNoLogin || state.Attempts != antigravityRefreshDebtMaxAttempts {
+		t.Errorf("state=%+v, want the terminal debt left alone", state)
+	}
+	if reads.Load() != 0 {
+		t.Errorf("reads=%d, want no attempt", reads.Load())
 	}
 }
