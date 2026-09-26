@@ -249,7 +249,17 @@ func TestMutateClaudeRateLimitSnapshot_ResetsAForeignFingerprintFirst(t *testing
 		},
 	}, now, "someone-else", claudeRateLimitSourceProbe)
 
-	claudeOweRunRefresh(now)
+	// Driven through the helper directly rather than through claudeOweRunRefresh:
+	// the fixture account is unscoped, and the owe path deliberately REFUSES a
+	// scoped -> "" downgrade (it cannot tell one from a failed credential read).
+	// That refusal has its own case,
+	// TestClaudeOweRunRefresh_UnresolvedFingerprintLeavesAScopedCacheAlone; this
+	// one is about the helper's reset.
+	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(),
+		func(snap *claudeRateLimitSnapshot) bool {
+			snap.RefreshOwedAtMs = now.UnixMilli()
+			return true
+		})
 
 	snap := claudeCacheSnapshot(t, cache)
 	if snap.AccountFingerprint != currentClaudeAccountFingerprint() {
@@ -1309,5 +1319,65 @@ func TestPayOwedClaudeUsageRefresh_RefundsAChargeWhenTheCredentialStoreYieldsNoT
 	}
 	if snap.RefreshOwedAttempts != 0 {
 		t.Fatalf("RefreshOwedAttempts=%d, want 0 — a charge that bought no request is refunded", snap.RefreshOwedAttempts)
+	}
+}
+
+// A transiently unreadable credential resolves to exactly the "" an accountless
+// claude.ai login does. Owing a debt through it must NOT be taken for an account
+// boundary: that would drop the scoped buckets and stamp the debt under "",
+// where the next start — resolving the recovered fingerprint — never looks for
+// it. The durable write is skipped instead; the in-memory debt still stands.
+func TestClaudeOweRunRefresh_UnresolvedFingerprintLeavesAScopedCacheAlone(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	if fp := currentClaudeAccountFingerprint(); fp != "" {
+		t.Fatalf("the fixture credential resolved to %q, want the unscoped fixture this case needs", fp)
+	}
+
+	observedAt := time.Now().Add(-time.Hour)
+	if !mutateClaudeRateLimitSnapshot(cache, "scoped-account", func(snap *claudeRateLimitSnapshot) bool {
+		snap.Buckets[claudeWindowFiveHour] = claudeRateLimitBucket{
+			UsedPercentage: 41, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observedAt.UnixMilli(), usageKnown: true,
+		}
+		return true
+	}) {
+		t.Fatal("seeding a scoped snapshot wrote nothing")
+	}
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claudeOweRunRefresh(time.Now())
+
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("an unresolved fingerprint rewrote a scoped cache:\nbefore %s\nafter  %s", before, after)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != "scoped-account" {
+		t.Fatalf("AccountFingerprint=%q, want the scoped account preserved", snap.AccountFingerprint)
+	}
+	if len(snap.Buckets) != 1 {
+		t.Fatalf("Buckets=%v, want the scoped reading preserved", snap.Buckets)
+	}
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("RefreshOwedAtMs=%d, want no debt written under an unknown scope", snap.RefreshOwedAtMs)
+	}
+}
+
+// An UNSCOPED cache is the ordinary claude.ai case, not a failure: a debt still
+// persists there. The guard above must refuse the scoped -> "" downgrade only.
+func TestClaudeOweRunRefresh_UnscopedCacheStillTakesTheDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+
+	runEnded := time.Now()
+	claudeOweRunRefresh(runEnded)
+
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != runEnded.UnixMilli() {
+		t.Fatalf("RefreshOwedAtMs=%d, want the debt at %d on an unscoped cache", snap.RefreshOwedAtMs, runEnded.UnixMilli())
 	}
 }

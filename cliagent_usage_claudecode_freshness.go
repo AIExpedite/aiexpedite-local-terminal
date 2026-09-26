@@ -183,8 +183,36 @@ func claudeOweRunRefresh(baseline time.Time) {
 	if !claudeUsageProbe.armedForProbe() {
 		return
 	}
+	path := claudeRateLimitCachePath()
+	fingerprint := currentClaudeAccountFingerprint()
+	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
+	// dir not yet readable) resolves to exactly the same "" a genuine accountless
+	// claude.ai login does, and mutateClaudeRateLimitSnapshot cannot tell the two
+	// apart: it would read the downgrade as an account boundary, drop the scoped
+	// buckets, and write this debt under "" — where the next start, resolving the
+	// recovered fingerprint, ignores it. So the completed turn would cost a wiped
+	// cache AND an unpayable marker.
+	//
+	// Refuse the durable write on that downgrade instead. The in-memory debt still
+	// stands for this process, so this degrades to the behaviour this file
+	// replaces — never to something worse, which is the rule every other
+	// best-effort path here follows.
+	//
+	// Only scoped -> unscoped is refused; a scoped -> other-scoped flip is a real
+	// `/login` and proceeds. A genuine logout also resolves to "", and there the
+	// live writers (stream capture, status-line hook, probe) reset the scope on
+	// their next reading, after which an owe under "" proceeds normally.
+	//
+	// Read unlocked, like claudePersistedProbeStateFor: the snapshot is only ever
+	// replaced by rename. A concurrent genuine flip can overtake it, costing at
+	// most one skipped debt — not worth queueing a per-turn writer behind the gate.
+	if fingerprint == "" {
+		if snap, ok := loadClaudeRateLimitSnapshot(path); ok && snap.AccountFingerprint != "" {
+			return
+		}
+	}
 	baselineMs := baseline.UnixMilli()
-	mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), currentClaudeAccountFingerprint(),
+	mutateClaudeRateLimitSnapshot(path, fingerprint,
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
 				return false
