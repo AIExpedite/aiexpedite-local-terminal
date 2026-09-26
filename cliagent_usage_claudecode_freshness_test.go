@@ -2272,11 +2272,15 @@ func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhileThrottled(t *tes
 	}
 }
 
-// A probe already on the wire is the one paying the debt, so the throttle test
-// above must not decline an adoption the `owing` branch would JOIN.
-func TestClaudeUsageProbeGate_CacheSeedAdoptsWhileAProbeIsInFlight(t *testing.T) {
-	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
-	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+// A probe already on the wire holds the single-flight slot and was charged by
+// whoever admitted it, so the gather behind it issues nothing of its own:
+// begin() refuses the slot and the `owing` branch would merely JOIN. Charging
+// the adoption there bills two attempts for one request — if that probe fails,
+// the cap is reached having asked the endpoint exactly once and the next start
+// retires the debt. The seed cannot refund (the gather never reports `issued`
+// back to it), so the adoption is declined uncharged and unlatched instead.
+func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhileAProbeIsInFlight(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
 	fp := currentClaudeAccountFingerprint()
 	now := time.Now()
 	latest := now.Add(-time.Hour)
@@ -2284,16 +2288,54 @@ func TestClaudeUsageProbeGate_CacheSeedAdoptsWhileAProbeIsInFlight(t *testing.T)
 	runEnded := now.Add(-time.Minute)
 	claudeOweRunRefresh(runEnded)
 
+	blocked := 0
+	originalBlocked := claudeUsageProbeSeedBlocked
+	t.Cleanup(func() { claudeUsageProbeSeedBlocked = originalBlocked })
+	claudeUsageProbeSeedBlocked = func() { blocked++ }
+
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 	if !claudeUsageProbe.begin(now, false) {
 		t.Fatal("begin() refused the single-flight slot on a fresh gate")
 	}
-	t.Cleanup(func() { claudeUsageProbe.finish(nil, false, time.Time{}, fp) })
+	finished := false
+	finish := func() {
+		if !finished {
+			finished = true
+			claudeUsageProbe.finish(nil, false, time.Time{}, fp)
+		}
+	}
+	t.Cleanup(finish)
 
-	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero while another probe owns the slot", got)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked adoptions=%d, want 1", blocked)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("adopted owed=%v for a debt the in-flight probe is already paying", got)
+	}
+	if owed, attempts, _ := claudePersistedProbeStateFor(fp); owed.UnixMilli() != runEnded.UnixMilli() || attempts != 0 {
+		t.Errorf("persisted debt=%v attempts=%d, want the debt left payable at 0 attempts", owed, attempts)
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Errorf("request count=%d, want 0 — the seed issues nothing itself", atomic.LoadInt64(calls))
+	}
+
+	// That probe lands without covering the debt. The snapshot never changed, so
+	// only an UNCLAIMED latch lets the gather after it reach the adoption at all
+	// — and that one charges exactly once, for the request it can now issue.
+	finish()
+	after := now.Add(2 * time.Minute)
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), after, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the gather has a probe to issue", got)
+	}
 	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
-		t.Errorf("adopted owed=%v, want the persisted debt %v — the in-flight probe is the one that pays it", got, runEnded)
+		t.Errorf("adopted owed=%v once the slot freed, want the persisted debt %v", got, runEnded)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
+		t.Errorf("RefreshOwedAttempts=%d, want 1 — one charge for the one request this gather can issue", attempts)
 	}
 }
 
@@ -2499,6 +2541,92 @@ func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhenTheEndpointIsReje
 	}
 	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
 		t.Errorf("adopted owed=%v once the endpoint resolved, want the persisted debt %v", got, runEnded)
+	}
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
+		t.Errorf("RefreshOwedAttempts=%d, want 1 — charged by the adoption that can actually issue", attempts)
+	}
+}
+
+// pinClaudeProbeSlot occupies the single-flight slot the way an asynchronous
+// startup replay does, and returns the release. The slot must be given back
+// before the test ends or claudeFreshnessWaitIdle never settles.
+func pinClaudeProbeSlot(t *testing.T) func() {
+	t.Helper()
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.inFlight = true
+	claudeUsageProbe.doneCh = make(chan struct{})
+	claudeUsageProbe.mu.Unlock()
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			claudeUsageProbe.mu.Lock()
+			claudeUsageProbe.inFlight = false
+			if claudeUsageProbe.doneCh != nil {
+				close(claudeUsageProbe.doneCh)
+				claudeUsageProbe.doneCh = nil
+			}
+			claudeUsageProbe.mu.Unlock()
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// The same rule decided on the freshest evidence: a probe admitted between the
+// unlocked blockedFromIssuing pre-check and the locked charge is still the payer
+// this gather would only join, so the charge refuses under its own lock rather
+// than spending an attempt the pre-check would have refused a moment earlier.
+func TestClaudeUsageProbeGate_CacheSeedSkipsTheChargeWhenAProbeTakesTheSlotUnderTheLock(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	runEnded := now.Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	blocked := 0
+	originalBlocked := claudeUsageProbeSeedBlocked
+	t.Cleanup(func() { claudeUsageProbeSeedBlocked = originalBlocked })
+	claudeUsageProbeSeedBlocked = func() { blocked++ }
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	var release func()
+	originalHook := claudeUsageProbeBeforeSeedCharge
+	t.Cleanup(func() { claudeUsageProbeBeforeSeedCharge = originalHook })
+	var once sync.Once
+	claudeUsageProbeBeforeSeedCharge = func() {
+		once.Do(func() { release = pinClaudeProbeSlot(t) })
+	}
+
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the probe that took the slot in the gap is the payer", got)
+	}
+	if blocked != 1 {
+		t.Fatalf("blocked adoptions=%d, want 1", blocked)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("adopted owed=%v behind a probe that already holds the slot", got)
+	}
+	if owed, attempts, _ := claudePersistedProbeStateFor(fp); owed.UnixMilli() != runEnded.UnixMilli() || attempts != 0 {
+		t.Errorf("persisted debt=%v attempts=%d, want the debt left payable at 0 attempts", owed, attempts)
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Errorf("request count=%d, want 0 — nothing reaches the wire", atomic.LoadInt64(calls))
+	}
+
+	// Unlatched: once the slot frees, the same unchanged snapshot is adopted and
+	// charged once.
+	if release != nil {
+		release()
+	}
+	if got := claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest); !got.IsZero() {
+		t.Fatalf("seedOwedFromCache()=%v, want zero — the gather has a probe to issue", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
+		t.Errorf("adopted owed=%v once the slot freed, want the persisted debt %v", got, runEnded)
 	}
 	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != 1 {
 		t.Errorf("RefreshOwedAttempts=%d, want 1 — charged by the adoption that can actually issue", attempts)

@@ -703,6 +703,16 @@ func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 // in-memory one standing: the immediate startup gather then adopts the
 // still-outstanding debt, is throttled for a full interval without issuing a
 // request, and publishes the pre-update reading.
+// probeInFlight reports whether this process already has a probe on the wire.
+// Such a probe was charged by whoever admitted it and holds the single-flight
+// slot, so a gather arriving behind it issues nothing of its own: seedOwedFromCache
+// uses this to decline an adoption rather than bill a second attempt for it.
+func (g *claudeUsageProbeGate) probeInFlight() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inFlight
+}
+
 func (g *claudeUsageProbeGate) refundAdmission() {
 	g.mu.Lock()
 	if g.inFlight {
@@ -1253,8 +1263,9 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// A debt no probe of this gather could pay is not adopted, and — crucially —
 	// not CHARGED. begin() refuses on an unarmed gate, a live 429 hold (possibly
 	// the one this seed adopted two statements up), offline mode, an unelapsed
-	// throttle interval with nothing on the wire to inherit, a rejected endpoint
-	// override, or a context that
+	// throttle interval, a probe of this process already on the wire (whoever
+	// put it there charged for it; this gather would only join it), a rejected
+	// endpoint override, or a context that
 	// has already ended, so a charge here would buy a request that is never
 	// issued: two such starts reach the attempt cap and the startup replay then
 	// retires a debt nothing ever asked the endpoint about, leaving the pre-run
@@ -1281,6 +1292,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		lockedHeldMs := int64(0)
 		lockedObserved := time.Time{}
 		lockedHeld := false
+		lockedInFlight := false
 		// Both values are sampled on EVERY path, under the SAME lock the charge
 		// takes and BEFORE the charge decides anything, because the unlocked read
 		// above is necessarily older than this write:
@@ -1317,13 +1329,26 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 						return false
 					}
 				}
+				// The probe the unlocked blockedFromIssuing pre-check could not
+				// see. A probe of this process admitted between that check and
+				// this lock already carries a charge of its own, and begin()
+				// will refuse this gather the slot — so charging on top bills a
+				// second attempt for the one request on the wire. Read under
+				// g.mu INSIDE the cache lock: the ladder only ever runs this
+				// way round, since nothing in this file touches the filesystem
+				// while holding g.mu.
+				if g.probeInFlight() {
+					lockedInFlight = true
+					return false
+				}
 				return charge(snap)
 			})
 		claudeUsageProbeAfterSeedCharge()
-		if lockedHeld {
+		if lockedHeld || lockedInFlight {
 			// Declined for a reason that can change without the snapshot changing,
 			// so the latch is left unclaimed exactly as the pre-check leaves it:
-			// the gather after the hold expires must reach the adoption again.
+			// the gather after the hold expires — or after the in-flight probe
+			// lands without settling this debt — must reach the adoption again.
 			// `charged` is false, so the debt is un-adopted by the branch below and
 			// its counter stays where the next start can still spend it.
 			claudeUsageProbeSeedBlocked()
@@ -1485,12 +1510,12 @@ var claudeUsageProbeBeforeSeedCharge = func() {}
 // Production leaves it as a no-op.
 var claudeUsageProbeAfterSeedCharge = func() {}
 
-// blockedFromIssuing reports whether begin() would refuse every probe this
-// gather could still make, for a reason that is not transient contention: an
-// unarmed (opted-out) gate, a live server-imposed hold, offline mode, an
-// in-memory throttle interval that has not elapsed with no probe on the wire to
-// inherit, or a rejected endpoint override. Used by seedOwedFromCache to
-// decline — uncharged — a debt it cannot hand a payable request to.
+// blockedFromIssuing reports whether the gather that is adopting a debt would
+// put no NEW request on the wire for it: an unarmed (opted-out) gate, a live
+// server-imposed hold, offline mode, an in-memory throttle interval that has
+// not elapsed, a probe of this process already in flight, or a rejected
+// endpoint override. Used by seedOwedFromCache to decline — uncharged — a debt
+// it cannot hand a request of its own to.
 //
 // The interval IS consulted, because begin() checks it too: the `owing` branch
 // beats the staleness TTL and the cross-process dedupe baseline, not the
@@ -1502,13 +1527,18 @@ var claudeUsageProbeAfterSeedCharge = func() {}
 // anyway and the merge that carries its reading settles the durable debt, so
 // declining the adoption costs it nothing.
 //
-// inFlight is still NOT consulted, and is what makes the throttle test safe: a
-// probe already on the wire is the one paying this debt, so the adoption is kept
-// (the `owing` branch joins it) even though begin() would refuse the slot.
+// inFlight IS consulted, and is a refusal rather than an inheritance: the probe
+// already on the wire was charged by whoever put it there, and begin() refuses
+// the slot, so this gather only JOINS it. Charging here would bill two attempts
+// for one request — and the seed, unlike payOwedClaudeUsageRefreshAt, has no
+// refund path, because the gather never reports `issued` back to it. If that
+// in-flight probe settles the debt the adoption is moot; if it fails, the latch
+// is unclaimed, so the gather after the throttle interval adopts and charges
+// once, keeping the cap counting requests rather than gathers.
 func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 	g.mu.Lock()
-	armed, held := g.armed, g.heldUntil
-	throttled := !g.inFlight && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval()
+	armed, held, inFlight := g.armed, g.heldUntil, g.inFlight
+	throttled := !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval()
 	g.mu.Unlock()
 	if !armed {
 		return true
@@ -1516,7 +1546,7 @@ func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 	if !held.IsZero() && now.Before(held) {
 		return true
 	}
-	if throttled {
+	if inFlight || throttled {
 		return true
 	}
 	// A rejected endpoint override (malformed or non-loopback) is the one
