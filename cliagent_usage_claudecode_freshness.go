@@ -261,13 +261,6 @@ func retireClaudeRefreshDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bo
 	}
 }
 
-// dropClaudeSkewedHold clears a 429 hold ONLY while it is still parked beyond
-// the ceiling a Retry-After could legitimately reach. Sibling of
-// retireClaudeRefreshDebtAt and there for the same reason: the read that
-// spotted the skew is unlocked, so a probe that took a real 429 in the meantime
-// may already have replaced the value, and clearing on the stale read would
-// throw away live backpressure and send the next probe straight back at an
-// endpoint that just refused us.
 // adjustClaudeRefreshAttemptsAt moves the attempt counter by delta, ONLY while
 // the debt is still the instant the caller judged — the same guard
 // retireClaudeRefreshDebtAt applies, for the same reason: every decision in
@@ -289,6 +282,13 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	}
 }
 
+// dropClaudeSkewedHold clears a 429 hold ONLY while it is still parked beyond
+// the ceiling a Retry-After could legitimately reach. Sibling of
+// retireClaudeRefreshDebtAt and there for the same reason: the read that
+// spotted the skew is unlocked, so a probe that took a real 429 in the meantime
+// may already have replaced the value, and clearing on the stale read would
+// throw away live backpressure and send the next probe straight back at an
+// endpoint that just refused us.
 func dropClaudeSkewedHold(ceilingMs int64) func(*claudeRateLimitSnapshot) bool {
 	return func(snap *claudeRateLimitSnapshot) bool {
 		if snap.HeldUntilMs == 0 || snap.HeldUntilMs <= ceilingMs {

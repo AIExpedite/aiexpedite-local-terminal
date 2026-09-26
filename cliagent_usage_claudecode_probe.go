@@ -749,9 +749,6 @@ func (g *claudeUsageProbeGate) interval() time.Duration {
 	return backoff
 }
 
-// finish releases the single-flight slot and records the outcome. A probe that
-// refreshed the cache — or that skipped before issuing a request — clears the
-// failure streak; only a real failure extends the backoff.
 // nextEligible reports when begin() would next admit a probe, and whether it
 // ever will. Caller must NOT hold g.mu.
 func (g *claudeUsageProbeGate) nextEligible(now time.Time) (time.Time, bool) {
@@ -969,11 +966,14 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 	g.mu.Unlock()
 }
 
-// finish releases the single-flight slot. `observedAt` is the observation the
-// cache holds for the windows the probe wrote and `fingerprint` the account it
-// wrote them under, both recorded only alongside a refresh so a joiner can tell
-// WHEN the reading it is inheriting was taken and WHOSE it is, not merely that
-// there was one.
+// finish releases the single-flight slot and records the outcome. A probe that
+// refreshed the cache — or that skipped before issuing a request — clears the
+// failure streak; only a real failure extends the backoff.
+//
+// `observedAt` is the observation the cache holds for the windows the probe
+// wrote and `fingerprint` the account it wrote them under, both recorded only
+// alongside a refresh so a joiner can tell WHEN the reading it is inheriting
+// was taken and WHOSE it is, not merely that there was one.
 func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time, fingerprint string) {
 	g.mu.Lock()
 	g.inFlight = false
