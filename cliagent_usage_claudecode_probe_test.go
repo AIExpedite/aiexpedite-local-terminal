@@ -588,12 +588,15 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 			t.Fatal("the first stale gather should probe")
 		}
 		for i := 0; i < 3; i++ {
-			if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Duration(i+1)*time.Second), stale, probeTestToken, "") {
-				t.Errorf("gather %d inside the minimum interval must not probe", i)
+			// The verdict may well be "re-read": these gathers keep passing the
+			// same stale `latest` while the first probe has moved the shared cache
+			// past it, which is exactly the second case this function's contract
+			// covers. What the minimum interval owes is that no further REQUEST
+			// goes out.
+			refreshClaudeUsageIfStale(context.Background(), now.Add(time.Duration(i+1)*time.Second), stale, probeTestToken, "")
+			if got := atomic.LoadInt64(calls); got != 1 {
+				t.Fatalf("gather %d inside the minimum interval probed: request count=%d, want 1", i, got)
 			}
-		}
-		if got := atomic.LoadInt64(calls); got != 1 {
-			t.Errorf("request count=%d, want 1", got)
 		}
 	})
 

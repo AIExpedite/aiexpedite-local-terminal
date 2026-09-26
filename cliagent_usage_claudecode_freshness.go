@@ -284,6 +284,27 @@ func claudeRefreshDebtRetired(owed time.Time, attempts int, now time.Time) bool 
 		attempts >= claudeUsageProbeAfterRunMaxAttempts
 }
 
+// claudeRateLimitCacheStamp identifies the CONTENTS of the snapshot file without
+// parsing it: modification time and size, both zero when there is no readable
+// file. Two different contents sharing a stamp would need the same size and the
+// same nanosecond mtime; when that happens the caller degrades to treating the
+// file as unchanged, which is exactly today's behaviour.
+//
+// It exists so claudeUsageProbeGate.seedOwedFromCache's per-account latch can be
+// REVALIDATED rather than believed for the process lifetime: another agent
+// channel writes this same file, and a debt or a 429 hold it records after the
+// latch was set would otherwise stay invisible to this process — leaving the card
+// stale for the whole staleness TTL, or admitting a probe inside a window the
+// endpoint already imposed on this device. A stat is cheap enough to do per
+// gather on a path that already reads the same file whole.
+func claudeRateLimitCacheStamp() (modUnixNano, size int64) {
+	info, err := os.Stat(claudeRateLimitCachePath())
+	if err != nil {
+		return 0, 0
+	}
+	return info.ModTime().UnixNano(), info.Size()
+}
+
 /* ────────────────────────────────── hold ─────────────────────────────────── */
 
 // claudeHoldUsageProbe mirrors a 429 Retry-After to disk beside the gate's own

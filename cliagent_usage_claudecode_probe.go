@@ -393,6 +393,16 @@ type claudeUsageProbeGate struct {
 	// drain and cancelTrailing prevent.
 	owedSeeded    bool
 	owedSeededFor string
+	// owedSeededStampMod / owedSeededStampSize are the claudeRateLimitCacheStamp
+	// the latch above was set against, and the latch is believed only while the
+	// snapshot file still carries them. Another agent channel writes the same
+	// file, so a latch trusted for the whole process lifetime would hide a debt or
+	// a 429 hold that channel recorded afterwards — the card left stale for the
+	// whole TTL, or a probe admitted inside a window the endpoint already imposed
+	// on this device. An unchanged stamp cannot hide a write, so the ordinary case
+	// still reads the persisted state exactly once per account.
+	owedSeededStampMod  int64
+	owedSeededStampSize int64
 	// owedSeededObservation is the freshest observation that seed MEASURED for
 	// owedSeededFor — the shared cache as it stood after the adoption, including
 	// a replay or another process's probe that landed while it read. Retained
@@ -618,6 +628,8 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
+	claudeUsageProbe.owedSeededStampMod = 0
+	claudeUsageProbe.owedSeededStampSize = 0
 	claudeUsageProbe.owedSeededObservation = time.Time{}
 	// A seed still in flight closes its own channel when it returns; dropping the
 	// reference here only stops it from marking the NEXT generation as seeded.
@@ -1011,10 +1023,15 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 	return g.refreshes != generation && g.lastRefreshFingerprint == fingerprint && g.lastRefreshAt.After(latest)
 }
 
-// seedOwedFromCache adopts, ONCE per account per process, the state a previous process
-// persisted — the post-run debt and any 429 hold — so the `owing` branch below
-// sees a run this process never saw, and begin() honours backpressure this
-// process never took.
+// seedOwedFromCache adopts the state another process persisted — the post-run
+// debt and any 429 hold — so the `owing` branch below sees a run this process
+// never saw, and begin() honours backpressure this process never took.
+//
+// Adopted once per account per SNAPSHOT, not once per account per process: the
+// latch is keyed to claudeRateLimitCacheStamp, so the persisted state is read
+// once while the file is unchanged and re-read when it is not. A second agent
+// channel writes the same file, and a latch believed for the process lifetime
+// would hide a debt or a hold it recorded afterwards — see owedSeededStampMod.
 //
 // payOwedClaudeUsageRefresh restores both, but it is SPAWNED: the first gather of
 // a fresh agent can reach the staleness check before that goroutine has read the
@@ -1077,11 +1094,18 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // pre-replay view for the whole TTL. A needless re-read costs one cache load, and
 // the latch makes it at most one per account per process.
 func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint string, generation uint64, now, latest time.Time) time.Time {
+	// Sampled BEFORE any read and off g.mu — a write landing between this stat and
+	// the reads below leaves the recorded stamp OLDER than the content adopted, so
+	// the next gather re-opens the adoption; sampling it afterwards could record a
+	// stamp newer than what was read and hide that write for the process lifetime.
+	stampMod, stampSize := claudeRateLimitCacheStamp()
 	var seeding chan struct{}
 	for seeding == nil {
 		g.mu.Lock()
-		if g.owedSeeded && g.owedSeededFor == fingerprint {
-			// The adoption already happened — for this account, in this process.
+		if g.owedSeeded && g.owedSeededFor == fingerprint &&
+			g.owedSeededStampMod == stampMod && g.owedSeededStampSize == stampSize {
+			// The adoption already happened — for this account, in this process,
+			// against the snapshot still on disk unchanged.
 			// Its debt and hold are on the gate, but its re-read verdict was
 			// about the CLAIMANT's view. Re-derive one for this caller's `latest`
 			// from the reading that seed measured, so a peer that waited here (or
@@ -1124,6 +1148,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			g.owedSeeded = true
 			g.owedSeededFor = fingerprint
 			g.owedSeededObservation = measured
+			g.owedSeededStampMod, g.owedSeededStampSize = stampMod, stampSize
 		}
 		g.mu.Unlock()
 		close(seeding)

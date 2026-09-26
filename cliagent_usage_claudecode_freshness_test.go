@@ -1790,3 +1790,45 @@ func TestRefreshClaudeUsageIfStale_ReportsADedupedReplayThatLandedAfterTheSeed(t
 		t.Errorf("issued %d requests, want 0 — the view was fresh", n)
 	}
 }
+
+// The adoption latch is keyed to the SNAPSHOT's stamp, not to the process. A
+// second agent channel that records a run debt and takes a 429 AFTER this process
+// has already seeded must still be seen: a latch believed for the process
+// lifetime would leave the card stale for the whole TTL and admit a probe inside
+// a window the endpoint already imposed on this device.
+func TestClaudeUsageProbeGate_CacheSeedReReadsAfterAnotherProcessWrites(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	// First gather: nothing persisted, so the latch is set on an empty adoption.
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Fatalf("owedBaseline=%v before the other process wrote, want none", got)
+	}
+
+	// Another agent channel finishes a run and takes a 429, then exits without
+	// paying either.
+	ranAt, held := now.Add(-time.Minute), now.Add(15*time.Minute)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs, snap.HeldUntilMs = ranAt.UnixMilli(), held.UnixMilli()
+		return true
+	})
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != ranAt.UnixMilli() {
+		t.Errorf("owedBaseline=%v, want the other process's debt %v", got, ranAt)
+	}
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != held.UnixMilli() {
+		t.Errorf("in-memory hold=%v, want the other process's %v", gateHold, held)
+	}
+}
