@@ -1268,9 +1268,8 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// readings already in hand do not answer, so the ordinary no-debt gather still
 	// writes nothing. `landed` is not yet known here; an adoption the locked read
 	// below then declines because a probe of this process settled the debt while we
-	// read keeps the charge. Same direction as the replay's crash-between-charge-
-	// and-refund window: it only ever spends the budget faster, and the reading
-	// that declined it is the one the debt wanted.
+	// read is still REPORTED as charged, so the caller refunds it along with every
+	// other charge no request of its own was spent on.
 	uncovered := !persisted.IsZero() && !claudeUsageObservationCovers(latest, persisted) &&
 		!claudeUsageObservationCovers(onDisk, persisted)
 	// A debt no probe of this gather could pay is not adopted, and — crucially —
@@ -1287,9 +1286,12 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// its charge for the same two refusals and leaves the debt and its counter
 	// exactly as found.
 	//
-	// Checked rather than refunded because the gather never reports back whether
-	// it issued anything: the adoption hands the debt to a later `owing` branch,
-	// and a refund keyed to this call would have to outlive it.
+	// Checked HERE as well as refunded afterwards. The refund the caller makes
+	// when it issues nothing is what covers the window this check cannot — the
+	// slot taken between this test and the caller's begin() — but a refusal
+	// already visible here also means the debt must not be ADOPTED, and that
+	// decision cannot wait for the caller: adoption is what hands the debt to a
+	// later `owing` branch.
 	//
 	// The latch is left UNCLAIMED, so the next gather re-runs the adoption once
 	// the hold expires or the agent reconnects — neither of which touches the
