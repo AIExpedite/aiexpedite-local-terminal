@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,24 +299,100 @@ func indexUnquotedComment(v string) int {
 	return -1
 }
 
-// sanitizeRemoteURL drops userinfo from an http(s) remote (a token in
-// `https://x-access-token:TOKEN@github.com/…` must never leave the device). The
-// server matches remotes by host and path, so nothing it needs is lost. SSH
-// forms (`git@host:owner/repo`) keep their user, which is not a secret.
+// redactedRemote replaces a remote whose credentials cannot be stripped safely.
+const redactedRemote = "<redacted>"
+
+// sanitizeRemoteURL removes credentials from a remote URL before it leaves the
+// device (a token in `https://x-access-token:TOKEN@github.com/…` must never be
+// published). It is purely textual — never url.Parse, which rejects exactly the
+// malformed userinfo (`%` not followed by hex, a raw `/` or `@` in a password)
+// that must still be stripped. The server matches remotes by host and path, so
+// nothing it needs is lost. When the userinfo cannot be delimited with
+// certainty the whole remote becomes "<redacted>": a lost mapping only means
+// that repository is cloned instead of found.
+//
+//   - `scheme://userinfo@host/path`: the authority runs to the first `/`, `?`
+//     or `#`; everything up to its LAST `@` is userinfo. http(s) remotes drop it
+//     entirely (the "user" is often the token itself); other schemes (ssh://,
+//     git://) keep a password-free username. An `@` after the authority with
+//     none inside it may be a password containing `/` — redacted.
+//   - scp-like `[user@]host:path`: git allows no password here, but one written
+//     as `user:pass@host:path` is reduced to `user@host:path`.
+//   - local paths (`/srv/r.git`, `C:\repos\r`, `./r`) pass through.
 func sanitizeRemoteURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.User == nil {
-		return raw
+	if i := strings.Index(raw, "://"); i > 0 && isURLScheme(raw[:i]) {
+		return sanitizeSchemeRemote(raw[:i], raw[i+3:])
 	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		u.User = nil
-	default:
-		if _, hasPassword := u.User.Password(); hasPassword {
-			u.User = url.User(u.User.Username())
+	return sanitizeScpRemote(raw)
+}
+
+func isURLScheme(s string) bool {
+	for i, r := range s {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.')
+		if !ok {
+			return false
 		}
 	}
-	return u.String()
+	return s != ""
+}
+
+func sanitizeSchemeRemote(scheme, rest string) string {
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority, tail := rest[:end], rest[end:]
+	at := strings.LastIndex(authority, "@")
+	if at < 0 {
+		if strings.Contains(tail, "@") {
+			return redactedRemote // maybe `user:pa/ss@host` — can't tell where the password ends
+		}
+		return scheme + "://" + rest
+	}
+	userinfo, host := authority[:at], authority[at+1:]
+	if host == "" {
+		return redactedRemote
+	}
+	if strings.Contains(strings.ToLower(scheme), "http") {
+		return scheme + "://" + host + tail
+	}
+	user, _, _ := strings.Cut(userinfo, ":")
+	if user == "" {
+		return scheme + "://" + host + tail
+	}
+	return scheme + "://" + user + "@" + host + tail
+}
+
+func sanitizeScpRemote(raw string) string {
+	colon := strings.Index(raw, ":")
+	if colon < 0 {
+		return raw // a path: no password without a colon
+	}
+	if colon == 1 || strings.ContainsAny(raw[:colon], `/\`) {
+		return raw // a drive letter or a path with a colon in it
+	}
+	first := strings.Index(raw, "@")
+	if first < 0 || !strings.Contains(raw[:first], ":") {
+		return raw // `host:path` or `user@host:path`
+	}
+	// `user:pass@host:path`: the host follows the LAST `@` that is followed by
+	// a well-formed `host:` (the password may itself contain `@`).
+	best := -1
+	for i := first; i < len(raw); i++ {
+		if raw[i] != '@' {
+			continue
+		}
+		host, _, ok := strings.Cut(raw[i+1:], ":")
+		if ok && host != "" && !strings.ContainsAny(host, `@/\`) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return redactedRemote
+	}
+	user, _, _ := strings.Cut(raw[:best], ":")
+	return user + raw[best:]
 }
 
 // readGitHead resolves HEAD: a symbolic ref reports its branch and the sha it

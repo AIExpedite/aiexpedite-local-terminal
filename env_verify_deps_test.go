@@ -354,6 +354,55 @@ func makeDirLink(t *testing.T, target, link string) {
 	t.Cleanup(func() { _ = os.Remove(link) })
 }
 
+// A dangling link (a symlink, or a junction on Windows) for a linked
+// dependency must count as missing, not present — otherwise a deleted link
+// target would verify as a match.
+func TestVerifyDependencies_DanglingLinkIsMissing(t *testing.T) {
+	lock := baseLock()
+	lock["node_modules/linked"] = map[string]any{"resolved": "linked-target", "link": true}
+	lock["linked-target"] = map[string]any{"name": "linked", "version": "0.0.1"}
+	root := depsFixture{lock: lock, hidden: hiddenOf(lock), folders: append(baseFolders(), "linked-target")}.build(t)
+
+	target := filepath.Join(root, "linked-target")
+	link := filepath.Join(root, "node_modules", "linked")
+	makeDirLink(t, filepath.Join("..", "linked-target"), link)
+	// Adding the link touched node_modules: put its mtime back before the
+	// hidden lockfile's, so only the link itself can decide the result.
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(filepath.Join(root, "node_modules"), old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := verifyDependencies(context.Background(), envVerifyDepsRequest{Path: root, Manager: "npm"}, fixturePlatform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Match {
+		t.Fatalf("a live link should verify: reason=%q mismatches=%q", res.Reason, res.Mismatches)
+	}
+
+	// Remove the target: the link now dangles. Drop the target's own entry so
+	// the ONLY evidence left is the link entry itself.
+	if err := os.RemoveAll(target); err != nil {
+		t.Fatal(err)
+	}
+	delete(lock, "linked-target")
+	writeJSONFile(t, filepath.Join(root, "package-lock.json"), map[string]any{"lockfileVersion": 3, "packages": lock})
+	hiddenPath := filepath.Join(root, "node_modules", ".package-lock.json")
+	writeJSONFile(t, hiddenPath, map[string]any{"lockfileVersion": 3, "packages": hiddenOf(lock)})
+	_ = os.Chtimes(filepath.Join(root, "node_modules"), old, old)
+	_ = os.Chtimes(hiddenPath, old.Add(10*time.Second), old.Add(10*time.Second))
+
+	res, err = verifyDependencies(context.Background(), envVerifyDepsRequest{Path: root, Manager: "npm"}, fixturePlatform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Match || res.Reason != verifyReasonFolderMissing ||
+		len(res.Mismatches) != 1 || res.Mismatches[0] != "node_modules/linked: listed but not on disk" {
+		t.Fatalf("dangling link: match=%v reason=%q mismatches=%q", res.Match, res.Reason, res.Mismatches)
+	}
+}
+
 func TestVerifyDependencies_Inputs(t *testing.T) {
 	res, err := verifyDependencies(context.Background(), envVerifyDepsRequest{Path: t.TempDir(), Manager: "pnpm"}, fixturePlatform)
 	if err != nil || res.Match || res.Reason != verifyReasonUnsupportedManager {

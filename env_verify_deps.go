@@ -429,12 +429,23 @@ func checkHiddenLockfileRepresentative(ctx context.Context, root string, package
 			}
 			child := filepath.Join(listDir, name)
 			if isLinkEntry(e, child) {
-				seen[rel(child)] = true
+				// A link counts as present only once its target is confirmed to
+				// be an accessible directory. A dangling link / junction is left
+				// unseen, so its listed entry is reported folder_missing — npm
+				// would not trust it either.
 				target, err := resolveDirLink(child)
 				if err != nil {
-					continue // dangling: a listed target shows up as missing below
+					continue
 				}
-				if tinfo, err := os.Stat(target); err != nil || !tinfo.IsDir() || seen[rel(target)] {
+				tinfo, err := os.Stat(target)
+				if err != nil || !tinfo.IsDir() {
+					continue
+				}
+				if _, err := os.ReadDir(target); err != nil {
+					continue
+				}
+				seen[rel(child)] = true
+				if seen[rel(target)] {
 					continue
 				}
 				if err := walk(target, kindPackage); err != nil {

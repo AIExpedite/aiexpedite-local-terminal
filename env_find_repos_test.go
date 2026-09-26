@@ -210,15 +210,64 @@ func TestParseGitRemotesAndSanitize(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v want %v", got, want)
 	}
-	for in, want := range map[string]string{
-		"https://ghp_abc@github.com/o/r.git":   "https://github.com/o/r.git",
-		"git@github.com:o/r.git":               "git@github.com:o/r.git",
-		"ssh://git@github.com/o/r.git":         "ssh://git@github.com/o/r.git",
-		"/srv/git/r.git":                       "/srv/git/r.git",
-		"http://u:p@h.example/x?token=keep-me": "http://h.example/x?token=keep-me",
-	} {
-		if got := sanitizeRemoteURL(in); got != want {
-			t.Errorf("sanitizeRemoteURL(%q) = %q, want %q", in, got, want)
+}
+
+func TestSanitizeRemoteURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// http(s): userinfo dropped entirely.
+		{"https://ghp_abc@github.com/o/r.git", "https://github.com/o/r.git"},
+		{"http://u:p@h.example/x?token=keep-me", "http://h.example/x?token=keep-me"},
+		{"https://x-access-token:ghs_SECRET@github.com/o/r", "https://github.com/o/r"},
+		// Malformed userinfo that url.Parse rejects: still stripped.
+		{"https://user:secret%oops@example.com/repo.git", "https://example.com/repo.git"},
+		{"https://user:%zz%@example.com", "https://example.com"},
+		// Several `@` in the userinfo: everything up to the last one in the authority goes.
+		{"https://user:p@ss@w@rd@example.com/r.git", "https://example.com/r.git"},
+		{"https://tok@en@example.com:8443/r.git?x=1#f", "https://example.com:8443/r.git?x=1#f"},
+		{"git+https://u:p@example.com/r.git", "git+https://example.com/r.git"},
+		// A password containing `/` can't be delimited: redacted.
+		{"https://user:pa/ss@example.com/r.git", redactedRemote},
+		// Nothing but userinfo: redacted.
+		{"https://user:pw@", redactedRemote},
+		// No credentials: unchanged.
+		{"https://github.com/o/r.git", "https://github.com/o/r.git"},
+		{"https://example.com:8443/group/r.git", "https://example.com:8443/group/r.git"},
+		// ssh:// keeps a password-free username.
+		{"ssh://git@github.com/o/r.git", "ssh://git@github.com/o/r.git"},
+		{"ssh://git:pw@example.com:2222/r.git", "ssh://git@example.com:2222/r.git"},
+		{"ssh://git:p%w@d@example.com/r.git", "ssh://git@example.com/r.git"},
+		{"ssh://:pw@example.com/r.git", "ssh://example.com/r.git"},
+		// scp-like forms.
+		{"git@github.com:o/r.git", "git@github.com:o/r.git"},
+		{"github.com:o/r.git", "github.com:o/r.git"},
+		{"user:pass@host.example:o/r.git", "user@host.example:o/r.git"},
+		{"user:p@ss@host.example:o/r.git", "user@host.example:o/r.git"},
+		{"user:pass@host.example:a/@b.git", "user@host.example:a/@b.git"},
+		{"user:pass@nohostpath", redactedRemote},
+		// Local paths pass through, `@` and all.
+		{"/srv/git/r.git", "/srv/git/r.git"},
+		{`C:\Users\a@b\repo`, `C:\Users\a@b\repo`},
+		{"./r@x", "./r@x"},
+		{"../a:b@c", "../a:b@c"},
+	}
+	secrets := []string{"secret", "pass", "SECRET", "ghp_abc", "p@ss", ":pw", "%zz%", "tok@en"}
+	for _, c := range cases {
+		got := sanitizeRemoteURL(c.in)
+		if got != c.want {
+			t.Errorf("sanitizeRemoteURL(%q) = %q, want %q", c.in, got, c.want)
 		}
+		if got == c.in {
+			continue
+		}
+		for _, s := range secrets {
+			if strings.Contains(got, s) {
+				t.Errorf("sanitizeRemoteURL(%q) = %q still carries %q", c.in, got, s)
+			}
+		}
+	}
+	// Through the config parser too, a malformed credential never survives.
+	got := parseGitRemotes([]byte("[remote \"origin\"]\n\turl = https://user:secret%oops@example.com/repo.git\n"))
+	if got["origin"] != "https://example.com/repo.git" {
+		t.Fatalf("parsed %v", got)
 	}
 }
