@@ -1169,9 +1169,10 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// A debt the replay would retire without a request is not adopted either:
 	// this read races the replay, and adopting a capped, aged-out or skewed debt
 	// would let the gather spend the uncharged request the cap exists to refuse.
-	// Only the replay CLEARS it — this is a read on the gather path.
+	// Only the replay CLEARS it on disk — this is a read on the gather path.
+	retired := time.Time{}
 	if !persisted.IsZero() && claudeRefreshDebtRetired(persisted, attempts, now) {
-		persisted = time.Time{}
+		retired, persisted = persisted, time.Time{}
 	}
 	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
 	// process already took outranks a shorter persisted one.
@@ -1191,6 +1192,17 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	onDisk := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// A retired debt an EARLIER seed already adopted is dropped from the gate
+	// too — refusing to re-adopt it is not enough, since the gate still carries
+	// it and the next gather's `owing` branch would spend the uncharged request
+	// the cap just refused (e.g. the replay charged the final attempt and
+	// failed). Compared at the cache's millisecond resolution, so the same debt
+	// recorded locally at sub-millisecond precision is recognised as the one
+	// retired, while a strictly newer run this process owes survives.
+	if !retired.IsZero() && !g.owedBaseline.IsZero() &&
+		g.owedBaseline.UnixMilli() <= retired.UnixMilli() {
+		g.owedBaseline = time.Time{}
+	}
 	// What a probe of THIS process persisted while we were reading, for THIS
 	// account. Read only when the generation advanced: lastRefreshAt is sampled
 	// RELATIVELY, never as an absolute claim, for the reason

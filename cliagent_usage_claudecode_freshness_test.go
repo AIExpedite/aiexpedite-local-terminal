@@ -1893,3 +1893,63 @@ func TestClaudeUsageProbeGate_CacheSeedWaiterResamplesTheStampAfterTheWait(t *te
 		t.Errorf("in-memory hold=%v, want the hold written during the wait %v", gateHold, held)
 	}
 }
+
+// A debt an EARLIER seed already adopted onto the gate is dropped from it when a
+// later re-seed finds that same debt retired — e.g. the replay charged the final
+// allowed attempt and failed. Refusing to re-adopt it is not enough: the gate
+// would still carry it and the next gather's `owing` branch would spend the
+// uncharged request the cap just refused. A strictly newer debt this process
+// recorded itself survives.
+func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		localRun  time.Duration // offset of a local recordOwed from the persisted debt; 0 = none
+		wantOwing bool
+	}{
+		{"same debt is dropped", 0, false},
+		{"newer local debt survives", time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+			fp := currentClaudeAccountFingerprint()
+			now := time.Now()
+			latest := now.Add(-time.Hour)
+			seedClaudeProbeReading(t, cache, latest)
+			owed := now.Add(-time.Minute)
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed.UnixMilli(), claudeUsageProbeAfterRunMaxAttempts-1
+				return true
+			})
+
+			resetClaudeUsageProbeGate()
+			SetClaudeUsageProbeDisabled(false)
+
+			claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+			if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != owed.UnixMilli() {
+				t.Fatalf("owedBaseline=%v after the first seed, want the persisted debt %v", got, owed)
+			}
+			var local time.Time
+			if tc.localRun != 0 {
+				local = owed.Add(tc.localRun)
+				claudeUsageProbe.recordOwed(local)
+			}
+
+			// The replay charges the final attempt and fails, rewriting the snapshot.
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
+				return true
+			})
+
+			claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+
+			got := claudeUsageProbe.owedObservation()
+			if tc.wantOwing {
+				if !got.Equal(local) {
+					t.Errorf("owedBaseline=%v, want the newer local debt %v preserved", got, local)
+				}
+			} else if !got.IsZero() {
+				t.Errorf("owedBaseline=%v, want the retired debt dropped from the gate", got)
+			}
+		})
+	}
+}
