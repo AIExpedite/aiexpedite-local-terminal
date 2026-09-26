@@ -30,7 +30,7 @@
 //     and the status-line hook all consume the same limit while sharing nothing
 //     but the on-disk cache. Before spending a request the probe therefore asks
 //     that shared cache whether someone already observed inside the current
-//     interval (claudeUsageProbeRecentlyObserved), and it honors Retry-After on
+//     interval (claudeUsageProbeObservedSince), and it honors Retry-After on
 //     a 429. Neither is exact — two processes can still race between the check
 //     and the write — but together they collapse the steady-state duplication,
 //     which is what matters for a limit shared with Claude own pollers.
@@ -102,7 +102,7 @@ const (
 	// claudeUsageProbeMinInterval is the floor between two attempts while the
 	// probe is HEALTHY, giving ~60 requests/hour as an upper bound. That bound is
 	// enforced per PROCESS by the gate and approximately per DEVICE by the shared
-	// cache check in claudeUsageProbeRecentlyObserved — a second agent channel on
+	// cache check in claudeUsageProbeObservedSince — a second agent channel on
 	// the same machine reads the same cache and stands down rather than doubling
 	// the rate. It is a per-account call, not a fan-out, so it scales with active
 	// accounts rather than with runs. A repeatedly failing probe settles far
@@ -378,6 +378,12 @@ type claudeUsageProbeGate struct {
 	// probe, never to discard it.
 	owedBaseline      time.Time
 	trailingScheduled bool
+	// owedSeeded latches the ONE read of the persisted debt this process makes
+	// (see owedObservation). Cleared by resetClaudeUsageProbeGate alongside the
+	// fields it already zeroes: a latch that survived the reset would let one
+	// test's persisted debt decide whether the next test reads its own cache —
+	// the same cross-test leak class the drain and cancelTrailing prevent.
+	owedSeeded bool
 	// settling counts the post-run settlement calls currently running —
 	// claudeUsageProbePayRecordedRun, whether reached synchronously or on the
 	// goroutine triggerClaudeUsageProbeAfterRun spawns. The slot
@@ -574,6 +580,7 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
 	claudeUsageProbe.owedBaseline = time.Time{}
+	claudeUsageProbe.owedSeeded = false
 	// Release any reservation outright. The sleeping trailing timer was already
 	// abandoned by the cancel at the top of this function, and the drain has
 	// since waited for the settlement holding it to return — so this clears a
@@ -909,7 +916,28 @@ func (g *claudeUsageProbeGate) settleOwedIfCovered(observed time.Time) {
 }
 
 // owedObservation returns the outstanding post-run baseline, if any.
+//
+// It seeds itself ONCE from the debt the previous process persisted
+// (claudeRunRefreshOwed). payOwedClaudeUsageRefresh is spawned, so the first
+// gather of a fresh process can reach here before that replay has read the
+// cache; without the seed the `owing` branch of refreshClaudeUsageIfStale would
+// see no debt, defer to the claudeUsageProbeStaleAfter TTL, and publish the
+// pre-update reading — the stale card this whole path exists to prevent.
+//
+// The read happens OFF g.mu: this mutex is taken on the session stdout path, and
+// nothing that touches the filesystem may be held under it.
 func (g *claudeUsageProbeGate) owedObservation() time.Time {
+	g.mu.Lock()
+	seed := !g.owedSeeded
+	g.owedSeeded = true
+	g.mu.Unlock()
+	if seed {
+		if persisted, _ := claudeRunRefreshOwed(); !persisted.IsZero() {
+			// recordOwed only ever RAISES the baseline, so a persisted debt can
+			// never walk back one this process recorded in the meantime.
+			g.recordOwed(persisted)
+		}
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.owedBaseline
@@ -1282,7 +1310,12 @@ func probeClaudeUsageAdmitted(
 		// endpoint is account-scoped and shared with every other poller on the
 		// account — Claude own /usage panel included — so ignoring Retry-After
 		// would keep pressing exactly when we have been asked to stop.
-		claudeUsageProbe.holdUntil(retryAfterDeadline(resp.Header.Get("Retry-After"), time.Now()))
+		hold := retryAfterDeadline(resp.Header.Get("Retry-After"), time.Now())
+		claudeUsageProbe.holdUntil(hold)
+		// Durable too: an in-memory hold is forgotten by a restart, and the
+		// startup replay would then fire straight at an endpoint that just told
+		// us to stop — on a limit scoped to an account every device shares.
+		claudeHoldUsageProbe(identity.fingerprint, hold)
 		return admitted, false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -1595,6 +1628,12 @@ func triggerClaudeUsageProbeAfterRun() {
 	claudeUsageProbe.recordOwed(completedAt)
 	go func() {
 		defer func() { _ = recover() }()
+		// Mirror the debt to disk BEFORE settling it, from this goroutine: the
+		// write takes the cache gate and flock, which must never be waited on
+		// from the stdout path or under the gate mutex. Persisting it is what
+		// lets a self-update, crash or restart between here and the trailing
+		// probe still be paid — see cliagent_usage_claudecode_freshness.go.
+		claudeOweRunRefresh(completedAt)
 		// Settle only: the debt above is the one record for this run.
 		claudeUsageProbePayRecordedRun(completedAt)
 	}()

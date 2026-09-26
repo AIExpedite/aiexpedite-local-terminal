@@ -1510,3 +1510,126 @@ func TestMergeClaudeRateLimitCacheChecked_BoundedByTheCallerContext(t *testing.T
 	}
 	t.Error("the abandoned merge should still have persisted its reading once the gate cleared")
 }
+
+/* --------------------------------------------------------------------------
+   Owed-refresh fields on the snapshot (cliagent_usage_claudecode_freshness.go)
+   -------------------------------------------------------------------------- */
+
+// seedClaudeRefreshDebt writes a debt (and optionally a hold) onto the cache
+// through the production mutator, so these cases exercise the same
+// read-modify-write the agent uses rather than a hand-rolled JSON fixture.
+func seedClaudeRefreshDebt(t *testing.T, cache, fingerprint string, owedAt time.Time, attempts int, heldUntil time.Time) {
+	t.Helper()
+	if !mutateClaudeRateLimitSnapshot(cache, fingerprint, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs = owedAt.UnixMilli()
+		snap.RefreshOwedAttempts = attempts
+		if !heldUntil.IsZero() {
+			snap.HeldUntilMs = heldUntil.UnixMilli()
+		}
+		return true
+	}) {
+		t.Fatal("seeding the owed-refresh debt did not write the cache")
+	}
+}
+
+// A cache written before the owed-refresh fields existed must round-trip
+// unchanged: all three are omitempty, so terminal-service's payload-hash
+// delta-skip still sees an identical snapshot.
+func TestClaudeRateLimitSnapshot_LegacyCacheRoundTripsWithoutOwedFields(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, "fp-A")
+
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"refreshOwedAtMs", "refreshOwedAttempts", "heldUntilMs"} {
+		if strings.Contains(string(raw), field) {
+			t.Errorf("a cache with no debt must not carry %q", field)
+		}
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 || snap.HeldUntilMs != 0 {
+		t.Errorf("legacy cache decoded with a debt: %+v", snap)
+	}
+}
+
+// The debt, its attempt counter and the 429 hold are all account-scoped facts:
+// a /login to another account drops them with the buckets rather than paying
+// one account's debt against another's quota.
+func TestMergeClaudeRateLimitCache_AccountChangeClearsDebtCounterAndHold(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, "fp-A")
+	seedClaudeRefreshDebt(t, cache, "fp-A", now, 1, now.Add(time.Hour))
+
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, "fp-B")
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 || snap.HeldUntilMs != 0 {
+		t.Errorf("account change left debt/counter/hold behind: %+v", snap)
+	}
+}
+
+// The settlement is the SAME locked write that carries the covering reading —
+// never a second best-effort mutation that contention could drop.
+func TestMergeClaudeRateLimitCache_CoveringReadingSettlesTheDebtInOneWrite(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	runEnded := now
+	seedClaudeRefreshDebt(t, cache, "fp-A", runEnded, 1, now.Add(time.Hour))
+
+	after := runEnded.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 41, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: after.UnixMilli(), usageKnown: true},
+	}, after, "fp-A", claudeRateLimitSourceProbe)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Errorf("a covering reading must settle the debt in its own write: %+v", snap)
+	}
+	// The hold is a different fact: paying a debt says nothing about whether
+	// the service asked us to slow down.
+	if snap.HeldUntilMs != now.Add(time.Hour).UnixMilli() {
+		t.Errorf("settlement must not clear the 429 hold: %+v", snap)
+	}
+}
+
+// A bucket write must never SILENTLY pay a debt: a reading taken before the run
+// cannot hold the usage that run spent, so all three fields stand.
+func TestMergeClaudeRateLimitCache_PreRunReadingLeavesTheDebtStanding(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	runEnded := now
+	held := now.Add(30 * time.Minute)
+	seedClaudeRefreshDebt(t, cache, "fp-A", runEnded, 1, held)
+
+	before := runEnded.Add(-time.Minute)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 41, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: before.UnixMilli(), usageKnown: true},
+	}, before, "fp-A", claudeRateLimitSourceStatusLine)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected snapshot")
+	}
+	if snap.RefreshOwedAtMs != runEnded.UnixMilli() || snap.RefreshOwedAttempts != 1 || snap.HeldUntilMs != held.UnixMilli() {
+		t.Errorf("a pre-run reading must leave debt, counter and hold untouched: %+v", snap)
+	}
+}

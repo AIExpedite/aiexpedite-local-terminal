@@ -3271,3 +3271,80 @@ func TestClaudeUsageProbeWholeTimeoutIncludesCredentialLookup(t *testing.T) {
 			claudeUsageProbeJoinTimeout, claudeUsageProbeWholeTimeout)
 	}
 }
+
+// The post-run trigger mirrors its debt to DISK, not just to the gate — that
+// mirror is what survives a self-update.
+func TestTriggerClaudeUsageProbeAfterRun_PersistsTheDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError) // never settles the debt
+	})
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	before := time.Now()
+	triggerClaudeUsageProbeAfterRun()
+	waitForClaudeDebt(t, cache, 5*time.Second)
+	claudeFreshnessWaitIdle(t)
+
+	snap := claudeCacheSnapshot(t, cache)
+	if got := time.UnixMilli(snap.RefreshOwedAtMs); got.Before(before.Truncate(time.Millisecond)) {
+		t.Fatalf("persisted debt %v predates the run %v", got, before)
+	}
+}
+
+// A merge carrying a covering observation clears the persisted debt in the
+// SAME write; one carrying a pre-run observation does not.
+func TestClaudePersistedDebt_SettledOnlyByACoveringMerge(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	runEnded := now
+	claudeOweRunRefresh(runEnded)
+
+	// A reading from BEFORE the run cannot hold the usage that run spent.
+	preRun := runEnded.Add(-time.Minute)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 20, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: preRun.UnixMilli(), usageKnown: true},
+	}, preRun, fp, claudeRateLimitSourceStatusLine)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != runEnded.UnixMilli() {
+		t.Fatalf("a pre-run observation must not settle the debt: %+v", snap)
+	}
+
+	// A reading from after it does, in its own write.
+	postRun := runEnded.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 21, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: postRun.UnixMilli(), usageKnown: true},
+	}, postRun, fp, claudeRateLimitSourceProbe)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("a covering observation must settle the debt: %+v", snap)
+	}
+}
+
+// A gather in a FRESH process must see the debt the previous one persisted:
+// owedObservation seeds itself once from the cache, so the `owing` branch
+// overrides the staleness TTL instead of publishing the pre-update reading.
+func TestClaudeUsageProbeGate_OwedObservationSeedsFromTheCacheOnce(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	runEnded := time.Now().Add(-time.Minute)
+	claudeOweRunRefresh(runEnded)
+
+	// The self-update: every in-memory trace is gone, the cache is not.
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	owed := claudeUsageProbe.owedObservation()
+	if owed.UnixMilli() != runEnded.UnixMilli() {
+		t.Fatalf("owedObservation()=%v, want the persisted debt %v", owed, runEnded)
+	}
+	// Once seeded, a settlement in this process is not undone by a re-read.
+	claudeUsageProbe.settleOwed(owed)
+	if again := claudeUsageProbe.owedObservation(); !again.IsZero() {
+		t.Fatalf("the cache seed must be one-shot; a settled debt came back as %v", again)
+	}
+}

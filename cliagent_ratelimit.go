@@ -150,6 +150,48 @@ type claudeRateLimitSnapshot struct {
 	// Omitted when zero so a cache written before this field existed round-trips
 	// byte-identically; readers fall back to the per-bucket provenance for those.
 	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
+
+	// RefreshOwedAtMs is the newest run (or `__cli_smoke__` turn) completion for
+	// which no observation has landed yet — the DURABLE half of
+	// claudeUsageProbeGate.owedBaseline, which dies with the process. Without it
+	// a run that finished moments before an agent self-update left nothing
+	// behind, and the next gather treated the pre-run reading as fresh for the
+	// whole claudeUsageProbeStaleAfter window: a passing post-update smoke beside
+	// a stale utilization card. StartAgent's payOwedClaudeUsageRefresh replays it
+	// once. Codex (RefreshOwedAtMs in codexRateLimitSnapshot) and Antigravity
+	// carry the same field for the same reason.
+	//
+	// It lives HERE rather than in a state file of its own because this snapshot
+	// is already scoped by AccountFingerprint and already dropped on a
+	// fingerprint flip, which is exactly the scoping a debt needs: a /login to
+	// another account must not pay one account's debt against another's quota.
+	RefreshOwedAtMs int64 `json:"refreshOwedAtMs,omitempty"`
+	// RefreshOwedAttempts bounds one debt. Each agent start spends at most one
+	// replay, so the age limit alone would let a crash-looping agent issue a
+	// request per restart for the whole of claudeRefreshOwedMaxAge; this counter
+	// is what actually caps it. It resets ONLY when RefreshOwedAtMs advances —
+	// see claudeOweRunRefresh.
+	RefreshOwedAttempts int `json:"refreshOwedAttempts,omitempty"`
+	// HeldUntilMs mirrors claudeUsageProbeGate.heldUntil, the floor a 429
+	// Retry-After imposes. In memory only, a restart inside the hold window
+	// forgets it and the startup replay fires straight at an endpoint that just
+	// told us to stop — on an ACCOUNT-scoped limit shared by every device on the
+	// account. Bounded on the way in by claudeUsageProbeMaxRetryAfter and again
+	// on the way out by payOwedClaudeUsageRefresh, so a hostile or skewed value
+	// cannot disable utilization for days.
+	HeldUntilMs int64 `json:"heldUntilMs,omitempty"`
+}
+
+// clearClaudeRefreshDebt drops the owed-refresh marker and its attempt counter,
+// reporting whether anything changed. The HOLD is deliberately not touched: a
+// paid, retired or account-scoped-away debt says nothing about whether the
+// service has asked us to slow down.
+func clearClaudeRefreshDebt(snap *claudeRateLimitSnapshot) bool {
+	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 {
+		return false
+	}
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	return true
 }
 
 // claudeRateLimitGate serialises the read-modify-write of the cache file
@@ -606,6 +648,24 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // both waits to what is left of the caller's budget and reporting the failure
 // rather than dropping it. Neither contract writes behind a confirmed holder.
 func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
+	return withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
+		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source)
+	})
+}
+
+// withClaudeRateLimitCacheLocked runs fn holding BOTH serialization layers this
+// cache needs — the in-process gate and the cross-process advisory file lock —
+// and is the only place either is taken for a write. Extracted from the merge so
+// mutateClaudeRateLimitSnapshot (which records the owed-refresh debt without
+// supplying any buckets) takes the identical ladder in the identical order,
+// rather than a second hand-written copy that could deadlock against it.
+//
+// A zero budgetDeadline selects the best-effort contract (wait
+// claudeRateLimitBestEffortGateWait for the gate, then drop the write); a
+// non-zero one selects the verified contract, clamping both waits to what is
+// left of the caller's budget and reporting the failure rather than dropping it.
+// Neither contract writes behind a confirmed holder.
+func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn func() (time.Time, error)) (time.Time, error) {
 	verified := !budgetDeadline.IsZero()
 	if verified {
 		if !lockClaudeRateLimitCacheUntil(budgetDeadline) {
@@ -654,7 +714,12 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 		// verified writer's committed result.
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
 	}
+	return fn()
+}
 
+// mergeClaudeRateLimitCacheLocked is the read-merge-rename itself. Callers MUST
+// already hold the ladder withClaudeRateLimitCacheLocked takes.
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -672,6 +737,11 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 		// Probe evidence is an observation about ONE account's quota, so it
 		// crosses an account boundary no more than a bucket does.
 		snap.LastProbeObservedAtMs = 0
+		// Neither does a post-run debt or a 429 hold. Paying the previous
+		// account's debt against this one's quota would spend a request for a
+		// reading that can never cover it, and inheriting its hold would park
+		// the new account's probe behind backpressure it never earned.
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -790,6 +860,21 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 		if observed.IsZero() || b.ObservedAtMs < observed.UnixMilli() {
 			observed = time.UnixMilli(b.ObservedAtMs)
 		}
+	}
+
+	// Settle a standing post-run debt in the SAME locked write that carries the
+	// reading which pays it. A second best-effort mutation afterwards could be
+	// dropped on contention (or lost to a crash) while the observation it
+	// settled is already on disk, and the two would then disagree — a debt
+	// replayed at the next start for a reading the cache already holds.
+	//
+	// `observed` is the constraining window of THIS write, so a reading that
+	// predates the run cannot clear the debt, and a merge that covers nothing
+	// leaves all three fields exactly as it found them. A bucket write must
+	// never silently pay a debt.
+	if snap.RefreshOwedAtMs != 0 &&
+		claudeUsageObservationCovers(observed, time.UnixMilli(snap.RefreshOwedAtMs)) {
+		clearClaudeRefreshDebt(&snap)
 	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
