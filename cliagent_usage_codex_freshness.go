@@ -392,6 +392,14 @@ func (g *codexUsageRefreshGate) takeRearm(fp string) bool {
 	return rearm
 }
 
+// workerRunning reports whether fp has a post-run worker that has not retired.
+func (g *codexUsageRefreshGate) workerRunning(fp string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, running := g.workers[fp]
+	return running
+}
+
 // releaseWorker retires fp's worker unless a run finished since its last
 // check, in which case it reports false and the worker keeps going.
 func (g *codexUsageRefreshGate) releaseWorker(fp string) bool {
@@ -1099,6 +1107,25 @@ func codexCountRefreshAttempt(snap *codexRateLimitSnapshot, id codexDebtID) {
 	snap.RefreshOwedAttempts++
 }
 
+// codexOweFallbackWhileWorkerRuns marks the live fallback outstanding the
+// moment a counted attempt exhausts the debt's budget — whoever spent it — as
+// long as fp's worker is still running and so will reach the fallback. A
+// gather can spend the last attempt while the worker sleeps between its own;
+// left unset, the card would show the stale warning, hide it while the
+// worker's fallback runs, and maybe show it again.
+//
+// The worker check runs INSIDE the cache transaction: a retiring worker
+// releases itself before its skip write (codexSkipOutstandingFallback), and
+// both writes serialize on the cache lock, so an outstanding written here is
+// either seen and resolved by that skip, or never written at all.
+func codexOweFallbackWhileWorkerRuns(snap *codexRateLimitSnapshot, fp string) {
+	if snap.RefreshOwedAtMs <= 0 || snap.RefreshOwedAttempts < codexRefreshAfterRunMaxAttempts ||
+		snap.RefreshFallbackState != codexFallbackUnset || !codexUsageRefresh.workerRunning(fp) {
+		return
+	}
+	snap.RefreshFallbackState = codexFallbackOutstanding
+}
+
 /* ─────────────────────────── lifecycle hooks ─────────────────────────── */
 
 // armCodexUsageRunFloor records that a Codex run started at startedAt. The
@@ -1352,6 +1379,7 @@ func codexRecordRefreshAttempt(fp string, id codexDebtID, spent int) {
 		for i := 0; i < spent; i++ {
 			codexCountRefreshAttempt(snap, id)
 		}
+		codexOweFallbackWhileWorkerRuns(snap, fp)
 	}) {
 		return
 	}

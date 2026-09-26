@@ -2261,6 +2261,44 @@ func TestCodexRunDebtWorker_RetiringResolvesOutstandingFallback(t *testing.T) {
 	}
 }
 
+// No flicker when a GATHER spends the debt's last attempt while the worker is
+// still between its own: the fallback is marked outstanding in that same
+// write, so the warning is held back until the worker's read resolves. With no
+// worker left to run it, nothing is held back.
+func TestCodexRecordRefreshAttempt_LastAttemptOwesFallbackOnlyWhileWorkerRuns(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	oweOneAttemptLeft := func() codexRunFreshnessState {
+		codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+			codexOweRunRefresh(snap, now.Add(-2*time.Minute), time.Now())
+			snap.RefreshOwedAttempts = codexRefreshAfterRunMaxAttempts - 1
+		})
+		return codexRunFreshnessForAccount(f.fp, time.Now())
+	}
+
+	if !codexUsageRefresh.claimWorker(f.fp) {
+		t.Fatal("claim worker")
+	}
+	state := oweOneAttemptLeft()
+	codexRecordRefreshAttempt(f.fp, state.debtID(), 1)
+	held := codexRunFreshnessForAccount(f.fp, time.Now())
+	if held.fallback != codexFallbackOutstanding || codexStaleRunNotice(held) != "" {
+		t.Fatalf("with a worker running the last attempt must owe the fallback and hold the notice: %+v", held)
+	}
+	codexUsageRefresh.releaseWorker(f.fp)
+	codexSkipOutstandingFallback(f.fp)
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackSkipped || codexStaleRunNotice(got) == "" {
+		t.Fatalf("the retiring worker must release the notice: %+v", got)
+	}
+
+	state = oweOneAttemptLeft()
+	codexRecordRefreshAttempt(f.fp, state.debtID(), 1)
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackUnset || codexStaleRunNotice(got) == "" {
+		t.Fatalf("with no worker nothing may hold the notice back: %+v", got)
+	}
+}
+
 // No flicker: a gather landing while the live read is in flight shows no stale
 // notice, and the notice appears only once the read resolved without paying.
 func TestCodexParse_NoStaleNoticeWhileLiveFallbackInFlight(t *testing.T) {
