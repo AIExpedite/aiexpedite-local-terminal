@@ -175,6 +175,14 @@ type Config struct {
 	// a local terminal code change.
 	CliAgentCatalog   []cliAgentCatalogEntry `json:"-"`
 	cliAgentCatalogMu sync.RWMutex
+
+	/* ─── Setup-tool catalog ──────────────────────────── */
+	// SetupToolCatalog is the backend-provided list of tool detect probes
+	// (`setupToolCatalog` in the /auth/token response) the machine-info gather
+	// reports under tools[id] (setup_tool_catalog.go). Persisted so the probes
+	// run from the first gather after a restart. Written only under the config
+	// persistence lock (MutateAndSave); readers use activeSetupToolCatalog.
+	SetupToolCatalog []setupToolCatalogEntry `json:"setupToolCatalog,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */
@@ -233,6 +241,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.SkippedVersion = ""
 	}
 	SetCLIAgentCatalog(cfg.cliAgentCatalogSnapshot())
+	SetSetupToolCatalog(cfg.SetupToolCatalog)
 	// Mirror the persisted AllowAllCommands bool into the atomic so the
 	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
 	// sees the same value the user toggled in a previous session.

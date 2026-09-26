@@ -267,6 +267,13 @@ Some commands always prompt even if a pattern would allow them — installs and
 other destructive steps are marked as risky by AI Expedite before they're sent,
 and that marking can't be stripped in transit, so you get the final say.
 
+When AI Expedite sets up a new computer it also uses three built-in steps that
+aren't command lines and so aren't on the list: finding the git checkouts
+already in your code folder and home folder, and checking whether a checkout's
+`node_modules` still matches its `package-lock.json` (both only read files), and
+opening a sign-in window (for example `gh auth login`) that you complete
+yourself. The sign-in always asks you first, showing the exact command.
+
 ---
 
 ## Security

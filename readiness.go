@@ -67,6 +67,21 @@ var capacityAdvisoryCodes = map[string]struct{}{
 	"low_disk":   {},
 }
 
+// informationalSoftwareCodes are software findings the agent still reports —
+// with their install action — but that no longer decide readiness. Whether a
+// computer can do the workspace's work is the server's call now: it knows which
+// repositories need Node and which coding agents are signed in
+// (COMPUTER_SETUP_CHECKLIST_PLAN.md §6 "Enablement"). A hard-coded Node / npm /
+// Codex gate made a computer needs_setup — unable to be enabled — for a
+// workspace with no Node repository and a signed-in Claude Code. The agent's
+// own verdict keeps only hardware and Git. Like the capacity advisories they
+// cap the state at ready_with_warnings.
+var informationalSoftwareCodes = map[string]struct{}{
+	"missing_node":  {},
+	"missing_npm":   {},
+	"missing_codex": {},
+}
+
 // marketedComparableRAM returns reported usable RAM plus slack so thresholds
 // express marketed stick sizes. 15.7 GB usable → 16.7 comparable ≥ 16 (no warn).
 func marketedComparableRAM(reportedGB float64) float64 {
@@ -191,7 +206,8 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		add("missing_git", FindingWarning, "Git isn't installed yet. It's needed to clone and work with repositories.", softwareAction("missing_git", "Install Git", "Create a setup plan to install Git.", "Install Git using the recommended package for this operating system."))
 	}
 
-	// Node/npm runtime (needed for most AIExpedite dev workflows).
+	// Node/npm runtime. Informational (informationalSoftwareCodes): the server
+	// decides whether this workspace needs it.
 	_, hasNode := info.Runtimes["node"]
 	if !hasNode {
 		add("missing_node", FindingWarning, "Node.js isn't installed yet. Many development workflows need it.", softwareAction("missing_node", "Install Node.js", "Create a setup plan to install Node.js and npm.", "Install the current Node.js LTS release, including npm."))
@@ -203,7 +219,8 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		add("missing_npm", FindingWarning, "npm isn't installed yet. It comes with Node.js on most systems and is needed to install CLI tools like Codex.", softwareAction("missing_npm", "Install npm", "Create a setup plan to install npm.", "Install npm for the detected Node.js runtime."))
 	}
 
-	// Codex CLI — the launch install workflow.
+	// Codex CLI. Informational too: work readiness needs a signed-in coding
+	// agent, which the server checks.
 	if !cliAgentDetected(info, "codex") {
 		add("missing_codex", FindingWarning, "Codex CLI isn't set up yet. AIExpedite can install and sign you in with your permission.", softwareAction("missing_codex", "Install Codex", "Create a setup plan to install Codex CLI.", "Install Codex CLI, then follow its sign-in prompt."))
 	}
@@ -233,9 +250,11 @@ func cliAgentDetected(info *MachineInfo, id string) bool {
 //
 //	blocked > underpowered > needs_setup > ready_with_warnings > ready
 //
-// Capacity/utilization warnings (low_memory, low_disk) are advisories only —
-// they become ready_with_warnings so terminal-service keeps the device
-// routable for work. Missing-but-installable tooling becomes needs_setup.
+// Capacity/utilization warnings (low_memory, low_disk) and the informational
+// software findings (missing_node / missing_npm / missing_codex) are advisories
+// only — they become ready_with_warnings so terminal-service keeps the device
+// routable for work. Any other missing-but-installable tooling (Git) becomes
+// needs_setup.
 // Collapsing every warning into needs_setup previously blocked assignment for
 // nominal 16 GB laptops that only carried a RAM advisory.
 func deriveReadinessState(findings []ReadinessFinding) string {
@@ -251,7 +270,9 @@ func deriveReadinessState(findings []ReadinessFinding) string {
 		case f.Severity == FindingBlocker:
 			state = ReadinessBlocked
 		case f.Severity == FindingWarning:
-			if _, capacity := capacityAdvisoryCodes[f.Code]; capacity {
+			_, capacity := capacityAdvisoryCodes[f.Code]
+			_, informational := informationalSoftwareCodes[f.Code]
+			if capacity || informational {
 				// Advisory only — do not demote past ready_with_warnings, and
 				// never override needs_setup / underpowered / blocked.
 				if state == ReadinessReady {
@@ -290,14 +311,30 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	go func() {
 		done <- gatherMachineInfoTracked()
 	}()
+	// A fresh setupToolCatalog pass runs beside the gather: the setup flow
+	// re-inspects right after installing, and the cached pass may predate the
+	// install. The pass is bounded by setupToolPassBudget (inside the 20 s
+	// inspection budget), so waiting for it after the gather costs at most the
+	// difference.
+	toolsDone := make(chan map[string]string, 1)
+	go func() {
+		toolsDone <- runSetupToolProbePass(ctx)
+	}()
 
+	var info *MachineInfo
 	select {
-	case info := <-done:
-		// Keep the shared cache fresh so the next /auth/token POST reflects
-		// what the user just saw in the readiness card.
-		storeMachineInfo(info)
-		return evaluateReadiness(info)
+	case info = <-done:
 	case <-ctx.Done():
 		return evaluateReadiness(nil)
 	}
+	select {
+	case results := <-toolsDone:
+		withSetupToolResults(info, activeSetupToolCatalog(), results)
+	case <-ctx.Done():
+		// Keep the gather's merge of the previous pass.
+	}
+	// Keep the shared cache fresh so the next /auth/token POST reflects
+	// what the user just saw in the readiness card.
+	storeMachineInfo(info)
+	return evaluateReadiness(info)
 }

@@ -162,6 +162,16 @@ type MachineInfo struct {
 	CliAgents    []cliAgentUsage   `json:"cliAgents,omitempty"`
 	Capabilities *capabilitiesInfo `json:"capabilities,omitempty"`
 	CollectedAt  string            `json:"collectedAt,omitempty"`
+	// Virtualization is Windows-only (nil elsewhere, and when neither signal
+	// could be read): whether hardware virtualization is usable and whether
+	// WSL2 is set up — Docker Desktop needs both (systemInfo_setup.go).
+	Virtualization *virtualizationInfo `json:"virtualization,omitempty"`
+
+	// baseTools is Tools as the gather's own probes left it, before the
+	// setupToolCatalog results were merged in, so a later catalog pass can
+	// recompute Tools without keeping a stale or removed catalog id
+	// (setup_tool_catalog.go withSetupToolResults). Not serialized.
+	baseTools map[string]string
 }
 
 /* --------------------------------------------------------------------------
@@ -291,6 +301,10 @@ func StartMachineInfoGathering() {
 	go func() {
 		for {
 			storeMachineInfo(gatherMachineInfo())
+			// The setupToolCatalog pass runs AFTER the gather is stored, never
+			// inside it, so it cannot delay the data the first /auth/token
+			// request is waiting for (setup_tool_catalog.go).
+			refreshSetupToolProbesInCache()
 			time.Sleep(machineInfoRefreshInterval)
 		}
 	}()
@@ -301,6 +315,10 @@ func StartMachineInfoGathering() {
    -------------------------------------------------------------------------- */
 
 func gatherMachineInfo() *MachineInfo {
+	// A tool installed since the last gather (a setup step, or the user) must be
+	// visible to the probes below without an agent restart (path_refresh.go).
+	refreshCommandPath()
+
 	info := &MachineInfo{
 		Architecture:    runtime.GOARCH,
 		Runtimes:        map[string]string{},
@@ -308,6 +326,17 @@ func gatherMachineInfo() *MachineInfo {
 		Tools:           map[string]string{},
 		CollectedAt:     time.Now().UTC().Format(time.RFC3339),
 	}
+
+	// The setup-checklist probes (gh / firebase / terraform, the OS package
+	// managers, Windows virtualization + nvidia-smi VRAM) run on their own
+	// goroutines while the serial gather below proceeds, and are joined at the
+	// end, so they add no wall time to the gather (systemInfo_setup.go).
+	extrasCh := make(chan setupExtras, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*setupProbeTimeout)
+		defer cancel()
+		extrasCh <- gatherSetupExtras(ctx, currentGOOS(), runSetupProbe)
+	}()
 
 	// CPU — gopsutil reads /proc/cpuinfo, sysctl, or WMI as appropriate.
 	if cpus, err := cpu.Info(); err == nil && len(cpus) > 0 {
@@ -445,6 +474,13 @@ func gatherMachineInfo() *MachineInfo {
 	// and subsequent calls average over 6 hours, which smooths out any
 	// signal we'd actually act on).
 	info.Live = gatherLiveLoad()
+
+	// Join the parallel setup probes (normally long finished by now), then
+	// record the gather's own tools before folding in the last setupToolCatalog
+	// pass (no spawn here — see setup_tool_catalog.go).
+	applySetupExtras(info, <-extrasCh)
+	info.baseTools = copyStringMap(info.Tools)
+	withSetupToolResults(info, activeSetupToolCatalog(), cachedSetupToolResults())
 
 	// Capability hints — cheap derivation from the gathered numbers; the
 	// LLM uses these to decide whether to run tests/builds in parallel.
