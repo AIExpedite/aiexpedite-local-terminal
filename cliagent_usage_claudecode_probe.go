@@ -1718,6 +1718,24 @@ func claudeSnapshotFreshness(view claudeRateLimitView, now time.Time) time.Time 
 type claudeUsageProbeIdentity struct {
 	token       string
 	fingerprint string
+
+	// scope is the account the rate-limit cache was scoped to when THIS
+	// identity's credential was read, and scopePinned says it was captured at
+	// all (an empty scope is a real value — an unscoped cache — so it cannot
+	// double as "absent").
+	//
+	// It exists because probeClaudeUsageAdmitted's sample of the live scope is
+	// only an at-or-older-than-the-token value when the credential is resolved
+	// there and then. A pre-resolved identity breaks that: the startup replay
+	// reads the credential, judges the hold, charges the attempt and only then
+	// calls the probe, so a `/login` to B plus a B writer re-scoping the
+	// snapshot inside that gap would make the probe's own sample name B while
+	// the request still carries A's token — and the locked 429/merge guards
+	// would then admit B as a write target and clear B's fresh buckets as an A
+	// transition. Captured with the credential, the scope can only be at-or-older
+	// than the token it belongs to, which is the whole guard.
+	scope       string
+	scopePinned bool
 }
 
 // claudeUsageProbeStoredIdentity reads the stored subscription credential ONCE
@@ -1738,6 +1756,12 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	if base == "" {
 		return claudeUsageProbeIdentity{}
 	}
+	// Sampled BEFORE the credential read, and carried on the identity so that
+	// ordering survives however long the caller holds this value before issuing
+	// its request — see claudeUsageProbeIdentity.scope. The read below is a
+	// Keychain round-trip on a default macOS config, not an instant, so a
+	// `/login` landing inside it is exactly the case this ordering refuses.
+	scope := claudeRateLimitCacheScope()
 	raw, ok := readClaudeCredentialsRaw(context.Background(), base)
 	if !ok {
 		return claudeUsageProbeIdentity{}
@@ -1749,6 +1773,8 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	return claudeUsageProbeIdentity{
 		token:       creds.ClaudeAiOauth.AccessToken,
 		fingerprint: fingerprintAccount(claudeCodeUsageParser{}.Provider(), creds.claudeCredentialAccount()),
+		scope:       scope,
+		scopePinned: true,
 	}
 }
 
@@ -1930,6 +1956,17 @@ func probeClaudeUsageAdmitted(
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
 	identity := resolveIdentity()
+	// A PRE-resolved identity makes the sample above worthless: the resolver is a
+	// closure over a credential read that already happened, so the sample sits
+	// AFTER that read rather than before it, and a `/login` plus a re-scoping
+	// writer in the gap would let it name a login newer than the token this
+	// request carries — the one thing this value must never do. Such an identity
+	// therefore carries the scope captured alongside its own credential read, and
+	// that value wins: it is at-or-older than the token by construction, so it can
+	// only ever narrow the write targets the locked guards below admit.
+	if identity.scopePinned {
+		scopeBefore = identity.scope
+	}
 	persistedFor = identity.fingerprint
 	if identity.token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.

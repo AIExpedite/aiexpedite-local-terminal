@@ -3050,3 +3050,102 @@ func TestClaudeHoldUsageProbe_StillRecordsTheOwningAccountsHold(t *testing.T) {
 			snap.HeldUntilMs, hold.UnixMilli())
 	}
 }
+
+// A PRE-resolved identity — the startup replay's — carries the scope captured
+// alongside its own credential read, and that is the value the locked guards must
+// judge. The probe's own sample is taken after that read by construction: the
+// replay resolves the credential, judges the hold, charges its attempt and only
+// then calls the probe, so a `/login` to B plus B's own writer re-scoping the
+// cache inside that gap would make the sample name B while the request still
+// speaks for A — and the guard would admit exactly the write it exists to refuse.
+func TestClaudeUsageProbe_JudgesThePinnedScopeNotTheLiveOne(t *testing.T) {
+	now := time.Date(2026, 9, 26, 13, 0, 0, 0, time.UTC)
+	const (
+		accountA = "fingerprint-of-the-account-the-replay-pinned"
+		accountB = "fingerprint-of-the-account-logged-into-after-the-pin"
+	)
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":77,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+
+	// The cache as the replay's credential read saw it: account A's snapshot.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), accountA, claudeRateLimitSourceStatusLine)
+	identity := claudeUsageProbeIdentity{
+		token: probeTestToken, fingerprint: accountA,
+		scope: claudeRateLimitCacheScope(), scopePinned: true,
+	}
+
+	// The login, and B's re-scoping write, land BEFORE the probe is called — the
+	// window the pin exists to cover, which no sample inside the probe can see.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 9, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, accountB, claudeRateLimitSourceStatusLine)
+
+	refreshed, _, probeErr := probeClaudeUsage(context.Background(), now,
+		func() claudeUsageProbeIdentity { return identity }, now, false)
+	if refreshed {
+		t.Error("the probe reported a refresh it must have refused to persist")
+	}
+	if probeErr != nil {
+		t.Errorf("probeErr=%+v, want none — the endpoint answered correctly", probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != accountB {
+		t.Fatalf("AccountFingerprint=%q, want the new login %q left intact", snap.AccountFingerprint, accountB)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
+		t.Errorf("five-hour utilization=%v, want the new account's own 9 — account A's reading overwrote it", got)
+	}
+}
+
+// The pin is not a blanket refusal: when the account that owns the pin still owns
+// the cache, the reading it carries must land exactly as it does today.
+func TestClaudeUsageProbe_MergesUnderThePinnedScope(t *testing.T) {
+	now := time.Date(2026, 9, 26, 13, 30, 0, 0, time.UTC)
+	const account = "fingerprint-of-the-only-account-here"
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":54,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), account, claudeRateLimitSourceStatusLine)
+
+	identity := claudeUsageProbeIdentity{
+		token: probeTestToken, fingerprint: account,
+		scope: claudeRateLimitCacheScope(), scopePinned: true,
+	}
+	refreshed, _, probeErr := probeClaudeUsage(context.Background(), now,
+		func() claudeUsageProbeIdentity { return identity }, now, false)
+	if !refreshed || probeErr != nil {
+		t.Fatalf("probeClaudeUsage: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+	if got := claudeCacheSnapshot(t, cache).Buckets[claudeWindowFiveHour].UsedPercentage; got != 54 {
+		t.Errorf("five-hour utilization=%v, want the probe's 54", got)
+	}
+}
