@@ -395,6 +395,17 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// a second spawn here could push this parser past the whole budget and drop
 	// every provider ordered after it from the signed refresh.
 	oauthAccessToken := ""
+	// The account the rate-limit cache is scoped to as of THIS credential read,
+	// carried to the probe below so its locked 429/merge guards judge an allowed
+	// write target that is at-or-older than the token they are judging. Sampled
+	// here and not at the probe because the whole remaining scan runs in between:
+	// a `/login` to another account plus a writer re-scoping the snapshot in that
+	// gap would otherwise let the probe name the NEW account as an allowed target
+	// while still speaking for this one, and the merge would clear the new
+	// account's fresh buckets as a transition away from it. See
+	// claudeUsageProbeIdentity.scope. One small local JSON read, of the same file
+	// this parser loads a few lines further down.
+	cacheScopeAtCredentialRead := claudeRateLimitCacheScope()
 	if raw, ok := readClaudeCredentialsRaw(ctx, base); ok {
 		credentialFound = true
 		creds := claudeOAuthCredentials{}
@@ -477,7 +488,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// the pre-replay reading for the whole staleness TTL.
 	generation := claudeUsageProbe.refreshGeneration()
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStaleFrom(ctx, generation, now, claudeSnapshotFreshness(view, now), oauthAccessToken, usage.AccountFingerprint) {
+	if refreshClaudeUsageIfStaleAs(ctx, generation, now, claudeSnapshotFreshness(view, now), claudeUsageProbeIdentity{
+		token:       oauthAccessToken,
+		fingerprint: usage.AccountFingerprint,
+		scope:       cacheScopeAtCredentialRead,
+		scopePinned: true,
+	}) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)

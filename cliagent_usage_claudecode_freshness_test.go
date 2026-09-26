@@ -3149,3 +3149,59 @@ func TestClaudeUsageProbe_MergesUnderThePinnedScope(t *testing.T) {
 		t.Errorf("five-hour utilization=%v, want the probe's 54", got)
 	}
 }
+
+// The gather's identity is pre-resolved too: claudeCodeUsageParser.ParseContext
+// decodes the credential near the top of the scan and only reaches the probe at
+// the end of it, so the probe's own sample of the cache scope sits well after
+// that read. This drives the binding itself — refreshClaudeUsageIfStaleAs — with
+// account A pinned and account B installed in the gap, and requires B's fresh
+// buckets to survive A's reading.
+func TestRefreshClaudeUsageIfStaleAs_JudgesTheGathersPinnedScope(t *testing.T) {
+	now := time.Date(2026, 9, 26, 14, 0, 0, 0, time.UTC)
+	const (
+		accountA = "fingerprint-of-the-account-the-gather-decoded"
+		accountB = "fingerprint-of-the-account-logged-into-mid-gather"
+	)
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":77,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+
+	// The cache as the gather's credential read saw it: account A's snapshot.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), accountA, claudeRateLimitSourceStatusLine)
+	identity := claudeUsageProbeIdentity{
+		token: probeTestToken, fingerprint: accountA,
+		scope: claudeRateLimitCacheScope(), scopePinned: true,
+	}
+
+	// The `/login` to B, and B's own re-scoping write, land while the rest of the
+	// scan runs — before the probe, and invisible to any sample inside it.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 9, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, accountB, claudeRateLimitSourceStatusLine)
+
+	generation := claudeUsageProbe.refreshGeneration()
+	refreshClaudeUsageIfStaleAs(context.Background(), generation, now, time.Time{}, identity)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != accountB {
+		t.Fatalf("AccountFingerprint=%q, want the new login %q left intact", snap.AccountFingerprint, accountB)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
+		t.Errorf("five-hour utilization=%v, want the new account's own 9 — account A's reading overwrote it", got)
+	}
+}

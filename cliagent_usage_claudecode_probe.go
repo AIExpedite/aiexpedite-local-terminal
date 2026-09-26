@@ -2274,7 +2274,33 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 // generation the caller sampled BEFORE it loaded `latest`, so the seed can tell
 // that the startup replay moved the shared cache in the gap between that load and
 // this call. Identical in every other respect.
+//
+// The identity carries NO pinned cache scope: a caller handing in only a token
+// and a fingerprint has not told us when it read them, so the only sound sample
+// is the live one probeClaudeUsageAdmitted takes for itself. A caller that did
+// sample the scope before its own credential read passes the identity directly
+// through refreshClaudeUsageIfStaleAs instead.
 func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, latest time.Time, accessToken, fingerprint string) bool {
+	return refreshClaudeUsageIfStaleAs(ctx, generation, now, latest,
+		claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint})
+}
+
+// refreshClaudeUsageIfStaleAs is refreshClaudeUsageIfStaleFrom taking the whole
+// pre-resolved identity, so a caller that sampled claudeRateLimitCacheScope()
+// BEFORE its own credential read can carry that ordering all the way to the
+// locked 429/merge guards.
+//
+// The gather path needs it. It decodes the credential near the top of
+// claudeCodeUsageParser.ParseContext and only reaches the probe after the rest of
+// the scan, so probeClaudeUsageAdmitted's own sample sits well AFTER that read:
+// a `/login` to B plus a B writer re-scoping the snapshot in that gap would make
+// the sample name B while this request still carries A's token, and the locked
+// guards would then admit B as a write target and clear B's fresh buckets as an
+// A transition. A scope pinned beside the credential can only be at-or-older
+// than the token, which is the property those guards rest on — see
+// claudeUsageProbeIdentity.scope.
+func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, latest time.Time, identity claudeUsageProbeIdentity) bool {
+	accessToken, fingerprint := identity.token, identity.fingerprint
 	// CLAIM the bypass off THIS gather's context rather than a process-global
 	// flag: this function is in the common parser path, so a routine machine-info
 	// gather overlapping a refresh would otherwise spend the refresh's bypass and
@@ -2360,7 +2386,6 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 			baseline = now.Add(-window)
 		}
 	}
-	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
 	resolveIdentity := func() claudeUsageProbeIdentity { return identity }
 	// A forced refresh joins a probe that already holds the single-flight slot
 	// rather than being turned away by it — see joinInFlight. Done BEFORE our own
