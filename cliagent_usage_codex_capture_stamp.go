@@ -62,17 +62,26 @@ func publishCodexUsageCaptureVersion(version string) {
 // against the wrong version, until another pass corrected it.
 //
 // The version-probe cache already keys on binary identity (path, mtime, size),
-// so this check is a stat plus a map read and never spawns: when that cache
-// holds a version for the binary AS IT IS NOW and it differs from the one
-// offered, the offered reading describes a binary that is no longer installed
-// and is dropped. No cached entry — nothing has probed this exact binary yet —
-// cannot be shown stale, so it publishes as before.
+// so this check is a stat plus a map read and never spawns: a version publishes
+// only when that cache holds it for the binary AS IT IS NOW.
+//
+// A cache MISS is a refusal, not a pass. Every caller here reads its version
+// through codexProbeVersion, which records it under the identity it probed, so
+// a hit is the ordinary case and a miss means the file moved underneath the
+// reading — the binary was replaced mid-probe, or it cannot be stat'ed at all.
+// Accepting a miss was the hole: a probe that raced a replacement leaves no
+// entry for the installed binary, and the stale version would then publish
+// unchallenged and roll the process-global stamp back. Refusing leaves the
+// existing stamp in place, which is what an unnameable capture is supposed to
+// do, and the next pass re-probes and publishes the build that is really there.
 func publishCodexUsageCaptureVersionFrom(path, version string) {
-	if path != "" {
-		if installed, ok := peekCachedProbeVersion(path); ok &&
-			codexNormalizeVersion(installed) != codexNormalizeVersion(version) {
-			return
-		}
+	if path == "" {
+		publishCodexUsageCaptureVersion(version)
+		return
+	}
+	installed, ok := peekCachedProbeVersion(path)
+	if !ok || codexNormalizeVersion(installed) != codexNormalizeVersion(version) {
+		return
 	}
 	publishCodexUsageCaptureVersion(version)
 }

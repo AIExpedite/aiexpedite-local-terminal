@@ -593,6 +593,11 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	// Pinned before the spawn for the same reason as the pipe-session path: a
+	// version published between Start() and the struct literal below describes a
+	// build this long-lived child is not running.
+	codexCaptureVersion := currentCodexUsageCaptureVersion()
+
 	if err := proc.Start(); err != nil {
 		stdin.Close()
 		stdout.Close()
@@ -611,7 +616,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		UID:                 uid,
 		status:              "running",
 		done:                make(chan struct{}),
-		codexCaptureVersion: currentCodexUsageCaptureVersion(),
+		codexCaptureVersion: codexCaptureVersion,
 		processExited:       make(chan struct{}),
 		streamDone:          make(chan struct{}),
 	}

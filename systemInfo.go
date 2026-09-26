@@ -760,6 +760,16 @@ func cachedProbeVersionFunc(path string, probe func() string) string {
 	}
 
 	v := probe()
+	// Re-stat before touching the map. A probe that raced a binary replacement
+	// answers for a file that is no longer there, so neither its value nor its
+	// pruning may land: storing it would key an installed-binary lookup to a
+	// version that is gone, and the prune below would DELETE the entry a
+	// concurrent probe of the new build had already recorded. Return the reading
+	// to this caller uncached and leave the map describing only what is on disk.
+	if after, err := os.Stat(path); err != nil ||
+		after.ModTime().UnixNano() != key.ModUnix || after.Size() != key.Size {
+		return v
+	}
 	versionProbeMu.Lock()
 	// Cache negatives too: a binary that reliably fails --version would
 	// otherwise re-spawn a doomed child on every single gather, which is the

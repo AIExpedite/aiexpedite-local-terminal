@@ -352,17 +352,30 @@ func TestPublishCodexUsageCaptureVersionFrom_StaleDetectionCannotRollBack(t *tes
 		t.Fatalf("write binary: %v", err)
 	}
 
-	// Nothing has probed this exact binary: an offered version cannot be shown
-	// stale, so it publishes.
+	// Nothing has probed this exact binary, so the offered version cannot be
+	// tied to the file on disk and is refused rather than published on trust.
+	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
+	if got := currentCodexUsageCaptureVersion(); got != "" {
+		t.Fatalf("unprobed binary published %q, want no stamp", got)
+	}
+
+	// A version probed for the binary AS IT IS publishes.
+	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.149.0" })
 	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
 	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.149.0" {
-		t.Fatalf("unprobed binary published %q, want the offered version", got)
+		t.Fatalf("probed binary published %q, want the offered version", got)
 	}
 
 	// The upgrade: the binary as it is now reports the new build, and the
 	// gather that detected it published first.
+	if err := os.WriteFile(path, []byte("binary-v2"), 0o700); err != nil {
+		t.Fatalf("rewrite binary: %v", err)
+	}
 	cachedProbeVersionFunc(path, func() string { return "codex-cli 0.150.0" })
 	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.150.0")
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.150.0" {
+		t.Fatalf("installed build published %q, want it to publish", got)
+	}
 
 	// The slow pre-upgrade gather finally reaches its publish.
 	publishCodexUsageCaptureVersionFrom(path, "codex-cli 0.149.0")
@@ -375,6 +388,45 @@ func TestPublishCodexUsageCaptureVersionFrom_StaleDetectionCannotRollBack(t *tes
 	publishCodexUsageCaptureVersionFrom("", "codex-cli 0.151.0")
 	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.151.0" {
 		t.Fatalf("pathless publish = %q, want it to publish", got)
+	}
+}
+
+// The narrow race the identity check exists for: a probe whose binary is
+// REPLACED while it runs answers for a file that is gone, so it records nothing
+// and cannot delete what a probe of the new build already recorded. Its own
+// stale reading then finds no entry for the installed binary and is refused,
+// rather than rolling the stamp back to a build that is no longer there.
+func TestProbeRacingABinaryReplacement_LeavesNoStaleStamp(t *testing.T) {
+	t.Cleanup(resetVersionProbeCache)
+	resetVersionProbeCache()
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+
+	path := filepath.Join(t.TempDir(), "codex")
+	if err := os.WriteFile(path, []byte("binary-v1"), 0o700); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+
+	// The slow pre-upgrade probe: the upgrade lands mid-probe, and a probe of
+	// the NEW build completes first and records its answer.
+	stale := cachedProbeVersionFunc(path, func() string {
+		if err := os.WriteFile(path, []byte("binary-v2-longer"), 0o700); err != nil {
+			t.Fatalf("rewrite binary: %v", err)
+		}
+		cachedProbeVersionFunc(path, func() string { return "codex-cli 0.150.0" })
+		return "codex-cli 0.149.0"
+	})
+	if stale != "codex-cli 0.149.0" {
+		t.Fatalf("racing probe returned %q, want its own reading handed back uncached", stale)
+	}
+
+	// The new build's entry survived: the racing probe must not prune it.
+	if got, ok := peekCachedProbeVersion(path); !ok || got != "codex-cli 0.150.0" {
+		t.Fatalf("installed binary caches (%q, %v), want the new build's own probe", got, ok)
+	}
+
+	publishCodexUsageCaptureVersionFrom(path, stale)
+	if got := currentCodexUsageCaptureVersion(); got != "codex-cli 0.150.0" {
+		t.Fatalf("stale racing probe rolled the stamp back to %q", got)
 	}
 }
 
