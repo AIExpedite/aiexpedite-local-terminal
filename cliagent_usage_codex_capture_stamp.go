@@ -83,9 +83,8 @@ var codexInstalledVersion = func() string {
 // runs at startup before either, so without this its reconcile and live
 // fallback would stamp nothing, leave the pre-upgrade stamp in place, and have
 // the first gather raise capture drift against a reading just refreshed.
-func codexResolveCaptureVersion() string {
+func codexResolveCaptureVersion() {
 	publishCodexUsageCaptureVersion(codexInstalledVersion())
-	return currentCodexUsageCaptureVersion()
 }
 
 // codexCaptureDrift reports whether the reading the cache holds was produced

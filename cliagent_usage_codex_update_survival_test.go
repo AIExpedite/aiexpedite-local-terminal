@@ -405,6 +405,38 @@ func TestCodexUpgrade_ObservedAtAdvancesViaLiveFallbackAndSurvivesRestart(t *tes
 	}
 }
 
+// Startup ordering: the replay runs before any gather or smoke has named the
+// binary. It resolves the installed version itself, so a debt its live
+// fallback pays is stamped with the NEW build — and the first gather after
+// the restart shows no capture drift against a reading just refreshed.
+func TestCodexUpgrade_StartupReplayStampsTheInstalledBuild(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-3 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.stampPreUpdateCache(t, now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now.Add(-time.Minute))
+	})
+	original := codexInstalledVersion
+	codexInstalledVersion = func() string { return codexPostUpdateVersion }
+	t.Cleanup(func() { codexInstalledVersion = original })
+	stubCodexFallbackRead(t, capturingFallbackRead)
+
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	waitCodexUsageRefreshIdle(t)
+
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.CodexVersion != codexPostUpdateVersion {
+		t.Fatalf("the replayed debt must be paid and stamped with the installed build: %+v", snap)
+	}
+	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Version: codexPostUpdateVersion}, time.Now())
+	if usage.Notice != "" {
+		t.Fatalf("first gather after the restart shows %q", usage.Notice)
+	}
+}
+
 // A binary change resets the rollout scan cursor ONCE, in a write taken before
 // the scan, and stamps the new binary in that same write.
 func TestCodexUpgrade_CursorResetsOnceOnVersionChange(t *testing.T) {
