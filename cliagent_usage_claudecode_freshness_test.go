@@ -2931,6 +2931,67 @@ func TestClaudeUsageProbe_MergesOverACacheScopeItAlreadySawOnEntry(t *testing.T)
 	}
 }
 
+// The allowed-scope sample must be pinned no later than the identity it travels
+// with. A `/login` to B can land WHILE this probe is reading A's credential (a
+// Keychain round-trip, not an instant) and B's own writer can re-scope the cache
+// before the probe reaches the sample — so a sample taken after the credential
+// would name B as a scope A's reading may be written over, and the locked guard
+// would admit precisely the write it exists to refuse.
+func TestClaudeUsageProbe_RefusesAScopeInstalledDuringTheCredentialRead(t *testing.T) {
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	const (
+		accountA = "fingerprint-of-the-account-this-request-speaks-for"
+		accountB = "fingerprint-of-the-account-just-logged-into"
+	)
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":88,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+	// The cache as it stands when the probe starts: account A's own snapshot.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), accountA, claudeRateLimitSourceStatusLine)
+
+	// The login lands inside the credential read, and B's writer re-scopes the
+	// snapshot before this probe gets any further.
+	resolveIdentity := func() claudeUsageProbeIdentity {
+		mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				UsedPercentage: 9, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: now.UnixMilli(), usageKnown: true,
+			},
+		}, now, accountB, claudeRateLimitSourceStatusLine)
+		return claudeUsageProbeIdentity{token: probeTestToken, fingerprint: accountA}
+	}
+
+	refreshed, _, probeErr := probeClaudeUsage(context.Background(), now, resolveIdentity, now, false)
+	if refreshed {
+		t.Error("the probe reported a refresh it must have refused to persist")
+	}
+	// The endpoint answered correctly; the race is not its fault, so the failure
+	// backoff must stay clear for the account that just signed in.
+	if probeErr != nil {
+		t.Errorf("probeErr=%+v, want none", probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != accountB {
+		t.Fatalf("AccountFingerprint=%q, want the new login %q left intact", snap.AccountFingerprint, accountB)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
+		t.Errorf("five-hour utilization=%v, want the new account's own 9 — account A's reading overwrote it", got)
+	}
+}
+
 // A 429 hold belongs to the account the request went out under. When a
 // `/login` re-scopes the cache while that request is in flight, persisting the
 // hold would clear the NEW account's fresh buckets as an account transition —

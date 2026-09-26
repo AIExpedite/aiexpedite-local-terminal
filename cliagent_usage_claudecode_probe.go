@@ -1902,6 +1902,31 @@ func probeClaudeUsageAdmitted(
 	persistedFor := ""
 	defer func() { claudeUsageProbe.finish(probeErr, refreshed, observedAt, persistedFor) }()
 
+	// The account the CACHE is scoped to as this request goes out, re-checked
+	// against disk before the merge below. Every other writer here resolves its
+	// identity moments before it writes, but this one may not: the startup replay
+	// pins an identity, charges its attempt, and only then makes a network call,
+	// so a `/login` can land — and a gather or status-line write can re-scope the
+	// snapshot to the NEW account — while this request is still in flight. The
+	// merge reads any fingerprint mismatch as an account transition and CLEARS
+	// the buckets it finds, so applying this reading afterwards would erase the
+	// account the device is now signed in to and republish the previous one's
+	// numbers under it. See claudeRateLimitCacheScope.
+	//
+	// Sampled BEFORE the credential below, not after, and that order is the whole
+	// guard: this value is an ALLOWED write target, so it must never be able to
+	// name a login NEWER than the token this request carries. Read after the
+	// credential, a `/login` to B landing during the credential read (a Keychain
+	// round-trip, not an instant) plus B's own writer re-scoping the snapshot
+	// would make this sample B while the request still speaks for A — and the
+	// locked guard would then admit exactly the write it exists to refuse,
+	// clearing B's fresh buckets as an A transition. Sampled first, the scope can
+	// only be at-or-older than the pinned identity: an unchanged scope, or the
+	// previous account's, is the ordinary transition the merge performs, and any
+	// scope a later login installs is refused because it matches neither this
+	// sample nor this reading's own fingerprint.
+	scopeBefore := claudeRateLimitCacheScope()
+
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
 	identity := resolveIdentity()
@@ -1922,18 +1947,6 @@ func probeClaudeUsageAdmitted(
 	// inherited another writer's covering reading, so the turn was spent — bar
 	// a rejected endpoint override, which un-issues itself below.
 	issued = true
-
-	// The account the CACHE is scoped to as this request goes out, re-checked
-	// against disk before the merge below. Every other writer here resolves its
-	// identity moments before it writes, but this one may not: the startup replay
-	// pins an identity, charges its attempt, and only then makes a network call,
-	// so a `/login` can land — and a gather or status-line write can re-scope the
-	// snapshot to the NEW account — while this request is still in flight. The
-	// merge reads any fingerprint mismatch as an account transition and CLEARS
-	// the buckets it finds, so applying this reading afterwards would erase the
-	// account the device is now signed in to and republish the previous one's
-	// numbers under it. See claudeRateLimitCacheScope.
-	scopeBefore := claudeRateLimitCacheScope()
 
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
 	// writer on this machine already answered what this probe would ask?
