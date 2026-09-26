@@ -1331,7 +1331,12 @@ gives the debt a bounded schedule and a second, state-independent trigger.
   minimum interval on purpose, and every rung is pushed out to
   `lastPaidAtMs + antigravityRefreshMinInterval` so an attempt never fires only
   to defer. A refusal that spent no outbound read — offline, an expired login,
-  the interval itself — uses the 30 s free rung and spends no budget.
+  the interval itself — uses the free rung and spends no budget. Because the
+  budget cannot bound those, the free rung grows with the debt's age (30 s,
+  then as long as the debt has been owed, capped at the 30 m rung), so a device
+  that stays offline or keeps an expired login costs a couple of dozen local
+  checks over the 6 h age-out rather than one every 30 s (each of which is a
+  `security` / `secret-tool` child on macOS / Linux).
   `codeassist_no_login` is terminal and books nothing. A spent budget books
   nothing and clears `nextAttemptAtMs`.
 - **Survives restart and self-update.** `nextAttemptAtMs` has its own rebase

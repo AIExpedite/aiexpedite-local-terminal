@@ -102,6 +102,48 @@ func TestAntigravityRetryDelayForAttempt_Ladder(t *testing.T) {
 	}
 }
 
+// Refusals that spend no outbound read also spend no budget, so their rung has
+// to stretch with the debt's age or an offline / expired-login device would
+// re-check every 30 s for six hours.
+func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
+	for _, tc := range []struct {
+		owedFor, want time.Duration
+	}{
+		{0, antigravityRunDebtFreeRetryDelay},
+		{10 * time.Second, antigravityRunDebtFreeRetryDelay},
+		{5 * time.Minute, 5 * time.Minute},
+		{2 * time.Hour, 30 * time.Minute},
+	} {
+		if got := antigravityFreeRetryDelay(tc.owedFor); got != tc.want {
+			t.Errorf("owedFor=%s: delay=%s, want %s", tc.owedFor, got, tc.want)
+		}
+	}
+
+	// Across the whole age-out that is a couple of dozen checks, not hundreds.
+	checks := 0
+	for owed := time.Duration(0); owed < antigravityRefreshOwedMaxAge; owed += antigravityFreeRetryDelay(owed) {
+		checks++
+	}
+	if checks > 30 {
+		t.Errorf("checks=%d over %s, want the free rung to back off", checks, antigravityRefreshOwedMaxAge)
+	}
+
+	// And the schedule uses it: a debt owed for an hour is not re-checked in 30 s.
+	_, cache := helperIsolateAntigravityFreshness(t)
+	helperWriteAntigravityCache(t, cache, time.Now().Add(-2*time.Hour))
+	owedAt := time.Now().Add(-time.Hour)
+	state := helperOwedDebt(t, antigravityUsageFreshness{
+		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
+	})
+	now := time.Now()
+	if !antigravityScheduleRunDebtRetry(state, now, true) {
+		t.Fatal("the free rung was not booked")
+	}
+	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < 29*time.Minute {
+		t.Errorf("an hour-old debt's free rung is %s away, want it backed off to the longest rung", until)
+	}
+}
+
 // A kept debt books its rung on disk and exactly one timer however many
 // settles ask at once, and the whole schedule then spends the debt's lifetime
 // budget and no more.

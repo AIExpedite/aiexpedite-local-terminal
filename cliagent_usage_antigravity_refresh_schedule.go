@@ -43,10 +43,11 @@ var (
 	antigravityRunDebtRetryLadder = []time.Duration{
 		time.Minute, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute,
 	}
-	// antigravityRunDebtFreeRetryDelay is the rung after a refusal that spent
-	// no outbound read (offline, an expired stored login, the minimum interval
-	// itself), where there is no read to space from. The minimum interval
-	// still applies to the attempt it leads to.
+	// antigravityRunDebtFreeRetryDelay is the SHORTEST rung after a refusal that
+	// spent no outbound read (offline, an expired stored login, the minimum
+	// interval itself), where there is no read to space from; it stretches with
+	// the debt's age (antigravityFreeRetryDelay). The minimum interval still
+	// applies to the attempt it leads to.
 	antigravityRunDebtFreeRetryDelay = 30 * time.Second
 	// antigravityRefreshNudgeCooldown bounds how often a gather may arm the
 	// worker, on top of the minimum interval the worker itself honours.
@@ -83,6 +84,25 @@ func antigravityRetryDelayForAttempt(attempts int) (time.Duration, bool) {
 		rung = len(antigravityRunDebtRetryLadder) - 1
 	}
 	return antigravityRunDebtRetryLadder[rung], true
+}
+
+// antigravityFreeRetryDelay is the rung after a refusal that spent no outbound
+// read, for a debt owed for `owedFor`. Such refusals spend no budget, so the
+// budget cannot bound them; the delay grows with the debt's age instead (at
+// least the free rung, at most the longest rung). Without that, a device that
+// stays offline, or whose stored login stays expired, would re-check every 30 s
+// for the whole age-out — hundreds of log lines, and on macOS/Linux hundreds of
+// `security` / `secret-tool` keyring children — where this costs a couple of
+// dozen checks across six hours.
+func antigravityFreeRetryDelay(owedFor time.Duration) time.Duration {
+	delay := antigravityRunDebtFreeRetryDelay
+	if owedFor > delay {
+		delay = owedFor
+	}
+	if n := len(antigravityRunDebtRetryLadder); n > 0 && delay > antigravityRunDebtRetryLadder[n-1] {
+		delay = antigravityRunDebtRetryLadder[n-1]
+	}
+	return delay
 }
 
 // antigravityRunDebtRetryHorizon is the furthest ahead a legitimately booked
@@ -126,7 +146,7 @@ func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.T
 			return
 		}
 		if free {
-			delay = antigravityRunDebtFreeRetryDelay
+			delay = antigravityFreeRetryDelay(now.Sub(time.UnixMilli(state.RefreshOwedAtMs)))
 		}
 		next = now.Add(delay)
 		// Never earlier than the minimum interval allows, or the attempt would
