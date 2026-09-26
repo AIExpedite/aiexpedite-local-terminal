@@ -420,6 +420,21 @@ func dropClaudeSkewedHold(judgedMs int64) func(*claudeRateLimitSnapshot) bool {
 	}
 }
 
+// claudeHoldSkewCeiling is the furthest ahead a persisted HeldUntilMs may be
+// stamped and still be read as backpressure rather than a clock step: the same
+// claudeUsageProbeMaxRetryAfter bound retryAfterDeadline puts on the live value.
+//
+// credentialLookupTook widens it by however long the caller spent resolving its
+// credential AFTER sampling `now`. That read can block for a whole Keychain
+// timeout, and another process recording a maximum-length Retry-After off its
+// own, later clock inside that window writes a perfectly legitimate hold that a
+// ceiling measured from the pre-read instant would delete as skew — freeing the
+// replay to call an endpoint still inside its backoff. Callers with no such gap
+// pass 0.
+func claudeHoldSkewCeiling(now time.Time, credentialLookupTook time.Duration) int64 {
+	return now.Add(credentialLookupTook).Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
+}
+
 /* ────────────────────────────────── pay ──────────────────────────────────── */
 
 // payOwedClaudeUsageRefresh replays, at most once per agent start, the refresh a
@@ -477,8 +492,21 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// An account that flips AFTER this point is refused where it already was: the
 	// snapshot comparison below, and mutateClaudeRateLimitSnapshot's own
 	// fingerprint check under the cache lock.
+	identityAt := time.Now()
 	identity := claudeUsageProbeStoredIdentity()
 	fingerprint := identity.fingerprint
+	// How long that credential read actually took. On a default macOS config it
+	// shells out to `security` under a timeout, so this is not a rounding error:
+	// it is the window in which ANOTHER process can record a legitimate
+	// maximum-length Retry-After off its own, later clock. Judging that hold
+	// against the `now` sampled before the read would put it above
+	// now+claudeUsageProbeMaxRetryAfter and delete it as clock skew, freeing this
+	// replay to call an endpoint still inside its backoff — on a limit every
+	// device on the account shares. The skew ceiling is therefore raised by the
+	// time the lookup spent, which is ~0 in tests, so the injected clock stays
+	// deterministic. Only the CEILING moves: the debt's age and retirement bounds
+	// stay on the caller's instant, where a test can pin them.
+	identityTook := time.Since(identityAt)
 
 	// Opted out (`disable_claude_usage_probe`): the gate is never armed, so
 	// nothing in this process or any later one can pay a debt. A debt written
@@ -509,10 +537,15 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// A hold stamped further ahead than a Retry-After could legitimately reach is
 	// a clock step, not backpressure — the same ceiling retryAfterDeadline puts
 	// on the live value. Left in place it would disable utilization for days.
+	//
+	// The ceiling is measured from the clock AFTER the credential read (see
+	// identityTook): a hold written during that read is legitimate and must not
+	// be misread as skew just because this goroutine was blocked while it landed.
 	held := time.Time{}
+	holdCeilingMs := claudeHoldSkewCeiling(now, identityTook)
 	switch {
 	case snap.HeldUntilMs <= 0:
-	case snap.HeldUntilMs > now.Add(claudeUsageProbeMaxRetryAfter).UnixMilli():
+	case snap.HeldUntilMs > holdCeilingMs:
 		// Drop the value JUDGED, never whatever is on disk by the time the lock
 		// is granted — see dropClaudeSkewedHold.
 		mutateClaudeRateLimitSnapshot(path, fingerprint, dropClaudeSkewedHold(snap.HeldUntilMs))

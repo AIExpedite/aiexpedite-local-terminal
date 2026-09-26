@@ -2815,3 +2815,118 @@ func TestRefreshClaudeUsageIfStale_KeepsTheSeedChargeWhenTheRequestWentOut(t *te
 		t.Errorf("RefreshOwedAttempts=%d, want 1 — a request that asked keeps its charge", attempts)
 	}
 }
+
+// The skew ceiling a persisted hold is judged against must cover the credential
+// read the replay performs AFTER sampling its clock. A maximum-length
+// Retry-After another process records inside that window is legitimate
+// backpressure stamped off its own, later clock; measured from the pre-read
+// instant it lands just past the ceiling and would be deleted as a clock step,
+// freeing the replay to call an endpoint still inside its backoff.
+func TestClaudeHoldSkewCeiling_CoversTheCredentialLookup(t *testing.T) {
+	now := time.Date(2026, 9, 26, 9, 0, 0, 0, time.UTC)
+	const lookup = 30 * time.Second
+
+	// The worst case another process can legitimately write while this one is
+	// still inside its credential read.
+	live := now.Add(lookup).Add(claudeUsageProbeMaxRetryAfter)
+	if live.UnixMilli() > claudeHoldSkewCeiling(now, lookup) {
+		t.Errorf("a max-length hold recorded during the credential read is judged as skew")
+	}
+	if live.UnixMilli() <= claudeHoldSkewCeiling(now, 0) {
+		t.Fatal("test is vacuous: the pre-read ceiling already covers this hold")
+	}
+	// The widening is bounded by the lookup, not open-ended: anything past it is
+	// still a clock step.
+	if skewed := live.Add(time.Millisecond); skewed.UnixMilli() <= claudeHoldSkewCeiling(now, lookup) {
+		t.Errorf("a hold beyond the widened ceiling is still accepted as backpressure")
+	}
+}
+
+// A probe pins its identity before it asks the endpoint, and the startup replay
+// pins it a whole request earlier still. If a `/login` lands in that gap and the
+// new account's gather (or status line) re-scopes the cache first, merging this
+// reading would read the mismatch as an account transition and CLEAR the buckets
+// the device is actually signed in to — republishing the previous account's
+// numbers under the new one. The reading is dropped instead.
+func TestClaudeUsageProbe_RefusesToMergeOverACacheRescopedToAnotherAccount(t *testing.T) {
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	const otherAccount = "fingerprint-of-the-account-just-logged-into"
+
+	var cache string
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		// The login lands while this request is in flight: the new account's
+		// writer re-scopes the snapshot and leaves its own fresh reading.
+		mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				UsedPercentage: 9, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: now.UnixMilli(), usageKnown: true,
+			},
+		}, now, otherAccount, claudeRateLimitSourceStatusLine)
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":88,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+	// The cache this probe started against: the account it resolved its identity
+	// under.
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
+	if refreshed {
+		t.Error("the probe reported a refresh it refused to persist")
+	}
+	// Not a failure of the endpoint: extending the backoff would punish the
+	// account that just signed in for a race it did not cause.
+	if probeErr != nil {
+		t.Errorf("probeErr=%+v, want none — the endpoint answered correctly", probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != otherAccount {
+		t.Fatalf("AccountFingerprint=%q, want the new login %q left intact", snap.AccountFingerprint, otherAccount)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
+		t.Errorf("five-hour utilization=%v, want the new account's own 9 — the stale probe overwrote it", got)
+	}
+}
+
+// The same guard must not refuse the ordinary transition it lives beside: a
+// cache still scoped to the account it held when the request went out is merged
+// normally, even though that scope differs from this probe's identity. That IS
+// the account flip the merge exists to perform.
+func TestClaudeUsageProbe_MergesOverACacheScopeItAlreadySawOnEntry(t *testing.T) {
+	now := time.Date(2026, 9, 26, 11, 0, 0, 0, time.UTC)
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":61,"resets_at":%q,"status":"allowed"}`,
+				now.Add(3*time.Hour).Format(time.RFC3339)),
+		}))
+	})
+	// A cache left behind by a PREVIOUS login, unchanged for the whole request.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-time.Hour), "fingerprint-of-the-account-signed-out-of", claudeRateLimitSourceStatusLine)
+
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
+	if !refreshed || probeErr != nil {
+		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want exactly 1", got)
+	}
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != currentClaudeAccountFingerprint() {
+		t.Fatalf("AccountFingerprint=%q, want this probe's account", snap.AccountFingerprint)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 61 {
+		t.Errorf("five-hour utilization=%v, want the probe's 61", got)
+	}
+}

@@ -1922,6 +1922,18 @@ func probeClaudeUsageAdmitted(
 	// a rejected endpoint override, which un-issues itself below.
 	issued = true
 
+	// The account the CACHE is scoped to as this request goes out, re-checked
+	// against disk before the merge below. Every other writer here resolves its
+	// identity moments before it writes, but this one may not: the startup replay
+	// pins an identity, charges its attempt, and only then makes a network call,
+	// so a `/login` can land — and a gather or status-line write can re-scope the
+	// snapshot to the NEW account — while this request is still in flight. The
+	// merge reads any fingerprint mismatch as an account transition and CLEARS
+	// the buckets it finds, so applying this reading afterwards would erase the
+	// account the device is now signed in to and republish the previous one's
+	// numbers under it. See claudeRateLimitCacheScope.
+	scopeBefore := claudeRateLimitCacheScope()
+
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
 	// writer on this machine already answered what this probe would ask?
 	if sharedAt, answered := claudeUsageProbeObservedSince(identity.fingerprint, dedupeBaseline, now); answered {
@@ -2036,6 +2048,22 @@ func probeClaudeUsageAdmitted(
 	// that budget must be clamped by whatever is left of it rather than added to
 	// it. An abandoned merge still finishes on its own goroutine — the reading
 	// lands for the next gather; this probe just does not claim it.
+	// Refuse the merge if the cache moved to a THIRD scope while the request was
+	// out: one that is neither what it held when we started nor the account this
+	// reading belongs to. That is another writer re-scoping the snapshot to a
+	// login this reading cannot describe, and merging over it would take the new
+	// account's fresh buckets down as a transition. An unchanged scope, or one
+	// that moved to OUR account, is the ordinary transition this merge exists to
+	// perform and still goes through.
+	//
+	// `issued` stays true: the turn was spent and the endpoint answered. There is
+	// nothing here for the startup replay to retry against the account it charged
+	// under, and the new login's own gather will probe for itself. probeErr stays
+	// nil for the same reason — the endpoint did nothing wrong, so this must not
+	// extend the failure backoff for the account that just signed in.
+	if after := claudeRateLimitCacheScope(); after != scopeBefore && after != identity.fingerprint {
+		return admitted, issued, false, time.Time{}, nil
+	}
 	persisted, err := mergeClaudeRateLimitCacheChecked(ctx, claudeRateLimitCachePath(), updates, now,
 		identity.fingerprint, claudeRateLimitSourceProbe)
 	if err != nil {

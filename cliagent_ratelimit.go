@@ -1064,6 +1064,23 @@ func loadClaudeRateLimitSnapshot(path string) (claudeRateLimitSnapshot, bool) {
 	return snap, true
 }
 
+// claudeRateLimitCacheScope reports the account fingerprint the cache on disk is
+// currently scoped to, or "" when there is no readable snapshot — which is the
+// same value an unscoped one carries, and deliberately so: a writer comparing
+// two samples of this wants "did the scope move", and a cache that was deleted
+// and rewritten unscoped moved no further than one that was only rewritten.
+//
+// Unlocked, like every other freshness pre-check here: it answers a question
+// about a snapshot another process may rename a moment later, so its callers
+// must treat it as evidence about the past, never as a claim they hold.
+func claudeRateLimitCacheScope() string {
+	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
+	if !ok {
+		return ""
+	}
+	return snap.AccountFingerprint
+}
+
 // formatClaudeLimitLine renders a rejected window as a one-line notice whose
 // shape agent-orchestrator-service's detectRateLimit already recognises (the
 // "iso-timestamp" matcher: a usage-limit cue + "resets at <ISO-8601>"). Emitting
