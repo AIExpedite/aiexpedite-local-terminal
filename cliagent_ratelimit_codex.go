@@ -1144,14 +1144,7 @@ func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint
 	if !strings.HasPrefix(trimmed, "{") {
 		return false
 	}
-	// Cheap prefilter: only attempt the JSON decode when the line could
-	// plausibly carry rate-limit telemetry. `token_count` wraps the legacy
-	// notification; `account/rateLimits/{read,updated}` is the newer
-	// JSON-RPC surface; `rate_limits`/`rateLimits` cover both payload key
-	// spellings. Anything else can't carry a window update for us.
-	if !strings.Contains(trimmed, "token_count") &&
-		!strings.Contains(trimmed, "rateLimits") &&
-		!strings.Contains(trimmed, "rate_limit") {
+	if !codexRateLimitLineCandidate(trimmed) {
 		return false
 	}
 	var raw map[string]interface{}
@@ -1180,6 +1173,19 @@ func captureCodexRateLimitLineForAccount(line string, now time.Time, fingerprint
 		context.Background(), codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative,
 		now, fingerprint, nil, "", true, extractCodexLimitNames(raw))
 	return advanced || (committed && (len(clears) > 0 || emptyAuthoritative))
+}
+
+// codexRateLimitLineCandidate is the cheap prefilter in front of the JSON
+// decode: only a line that could plausibly carry rate-limit telemetry is worth
+// parsing. `token_count` wraps the legacy notification;
+// `account/rateLimits/{read,updated}` is the newer JSON-RPC surface;
+// `rate_limits`/`rateLimits` cover both payload key spellings. Anything else
+// can't carry a window update for us. Shared with the smoke, which applies it
+// before retaining a stdout line at all.
+func codexRateLimitLineCandidate(line string) bool {
+	return strings.Contains(line, "token_count") ||
+		strings.Contains(line, "rateLimits") ||
+		strings.Contains(line, "rate_limit")
 }
 
 // extractCodexLimitNames returns the display name of every metered limit a
@@ -1514,7 +1520,10 @@ func mergeCodexRateLimitCacheObserved(
 			return false
 		}
 		codexScopeSnapshotToAccount(snap, fingerprint)
-		before := codexContributorObservationTimes(snap.Contributors)
+		// Taken from the same projection the merge migrates a pre-Contributors
+		// cache into, so a legacy bucket that is merely migrated is not
+		// mistaken for a fresh observation and restamped.
+		before := codexContributorObservationTimes(codexContributorsFromSnapshot(*snap))
 		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
 		advanced = codexStampCaptureVersion(snap, before)
 		return true

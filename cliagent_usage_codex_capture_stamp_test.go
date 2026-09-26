@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -73,6 +75,30 @@ func TestCodexCaptureStamp_OnlyAKnownAdvancingMergeRestamps(t *testing.T) {
 	}
 	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.149.0" {
 		t.Fatalf("a merge that advanced nothing restamped: %q", snap.CodexVersion)
+	}
+}
+
+// A pre-Contributors cache (flat Buckets only) is migrated by the merge; that
+// migration is not an observation, so a merge that brings nothing newer does
+// not claim the reading for the current binary.
+func TestCodexCaptureStamp_LegacyMigrationIsNotAnObservation(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	fp := currentCodexAccountFingerprint()
+	legacy := fmt.Sprintf(`{"updatedAt":"x","accountFingerprint":%q,"codexVersion":"codex-cli 0.149.0","buckets":{"primary":{"usedPercentage":10,"resetsAtMs":%d,"observedAtMs":%d,"windowMinutes":300}}}`,
+		fp, now.Add(time.Hour).UnixMilli(), now.UnixMilli())
+	if err := os.WriteFile(cache, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setCodexCaptureVersion(t, "codex-cli 0.150.0")
+	// Older than the migrated bucket, for the same slot: nothing advances.
+	stale := `{"method":"token_count","timestamp":"` + now.Add(-time.Hour).UTC().Format(time.RFC3339Nano) +
+		`","params":{"rate_limits":{"primary":{"used_percent":5,"window_minutes":300,"resets_in_seconds":3600}}}}`
+	if captureCodexRateLimitLineForAccount(stale, now, fp) {
+		t.Fatal("a merge that only migrated the legacy bucket must not report a capture")
+	}
+	if snap, _ := loadCodexRateLimitSnapshot(cache); snap.CodexVersion != "codex-cli 0.149.0" {
+		t.Fatalf("legacy migration restamped the reading: %q", snap.CodexVersion)
 	}
 }
 

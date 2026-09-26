@@ -475,8 +475,8 @@ func parseCodexSmokeStream(stdout []byte) codexSmokeStream {
 		if len(line) == 0 || line[0] != '{' {
 			continue
 		}
-		if codexSmokeRateLimitCandidate(line) {
-			stream.RateLimitLines = append(stream.RateLimitLines, string(line))
+		if text := string(line); codexRateLimitLineCandidate(text) {
+			stream.RateLimitLines = append(stream.RateLimitLines, text)
 		}
 		if codexRunCompletionShape(string(line)) != "" {
 			stream.Completed = true
@@ -495,14 +495,6 @@ func parseCodexSmokeStream(stdout []byte) codexSmokeStream {
 		}
 	}
 	return stream
-}
-
-// codexSmokeRateLimitCandidate is captureCodexRateLimitLineForAccount's cheap
-// prefilter, applied before a line is retained at all.
-func codexSmokeRateLimitCandidate(line []byte) bool {
-	return bytes.Contains(line, []byte("token_count")) ||
-		bytes.Contains(line, []byte("rateLimits")) ||
-		bytes.Contains(line, []byte("rate_limit"))
 }
 
 // codexErrorFrameMessage recognises a Codex error frame in any envelope shape
