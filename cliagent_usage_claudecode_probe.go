@@ -1233,7 +1233,15 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	}
 	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
 	// process already took outranks a shorter persisted one.
-	if !held.IsZero() && !held.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+	//
+	// The ceiling is REBASED on the live clock rather than measured from the
+	// caller's `now`: that instant was sampled at the top of the gather, before a
+	// credential read that can block for a whole Keychain timeout, so a legitimate
+	// maximum-length Retry-After another process recorded off its own later clock
+	// inside that gap lands just past now+claudeUsageProbeMaxRetryAfter and would
+	// be ignored as skew — admitting this gather into a live backoff window. Same
+	// correction payOwedClaudeUsageRefreshAt makes with identityTook.
+	if !held.IsZero() && held.UnixMilli() <= claudeHoldSkewCeilingRebased(now) {
 		g.holdUntil(held)
 	}
 	claudeUsageProbeAfterSeedRead()
@@ -1347,10 +1355,13 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 				//
 				// A hold stamped implausibly far ahead is NOT a reason to refuse:
 				// the skew ceiling discards it, so it never reaches the gate and
-				// never blocks anything. Same bound as the adoption below.
+				// never blocks anything. Same bound as the adoption below, and
+				// rebased on the live clock for the same reason — the wait for this
+				// lock is one more gap in which another process can record a
+				// legitimate maximum-length hold off a later clock.
 				if snap.HeldUntilMs > 0 {
 					if locked := time.UnixMilli(snap.HeldUntilMs); locked.After(now) &&
-						!locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+						snap.HeldUntilMs <= claudeHoldSkewCeilingRebased(now) {
 						lockedHeld = true
 						return false
 					}
@@ -1381,7 +1392,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			latch = false
 		}
 		if lockedHeldMs > 0 {
-			if locked := time.UnixMilli(lockedHeldMs); !locked.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+			if locked := time.UnixMilli(lockedHeldMs); lockedHeldMs <= claudeHoldSkewCeilingRebased(now) {
 				// Monotonic, like the adoption above: this only ever raises the hold.
 				g.holdUntil(locked)
 			}

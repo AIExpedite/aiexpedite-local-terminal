@@ -482,6 +482,29 @@ func claudeHoldSkewCeiling(now time.Time, credentialLookupTook time.Duration) in
 	return now.Add(credentialLookupTook).Add(claudeUsageProbeMaxRetryAfter).UnixMilli()
 }
 
+// claudeHoldSkewCeilingRebased is claudeHoldSkewCeiling for a caller that did
+// not time the work between sampling `now` and judging the hold, but knows that
+// work happened — the gather samples `now` at the top of ParseContext and only
+// reaches the seed after a credential read (a `security` spawn under a 3s
+// timeout on macOS) and the rest of the scan.
+//
+// Another process recording a maximum-length Retry-After off its own, later
+// clock anywhere inside that gap writes a perfectly legitimate hold that sits
+// just past now+claudeUsageProbeMaxRetryAfter, and a ceiling measured from the
+// pre-read instant would read it as a clock step and ignore it — admitting a
+// request into a backoff window on a limit every device on the account shares.
+// Rebasing on the live clock widens the ceiling by exactly the elapsed time, the
+// same correction identityTook makes for the replay, and by ~0 when the caller's
+// instant is already current — so an injected clock stays deterministic and a
+// `now` sampled AHEAD of the wall clock is never narrowed.
+func claudeHoldSkewCeilingRebased(now time.Time) int64 {
+	took := time.Since(now)
+	if took < 0 {
+		took = 0
+	}
+	return claudeHoldSkewCeiling(now, took)
+}
+
 /* ────────────────────────────────── pay ──────────────────────────────────── */
 
 // payOwedClaudeUsageRefresh replays, at most once per agent start, the refresh a

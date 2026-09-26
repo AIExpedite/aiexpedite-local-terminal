@@ -1147,6 +1147,45 @@ func TestClaudeUsageProbeGate_CacheSeedIgnoresASkewedHold(t *testing.T) {
 	}
 }
 
+// The gather samples `now` at the top of ParseContext and only reaches the seed
+// after a credential read that can block for a whole Keychain timeout. A
+// maximum-length Retry-After another process records off its own, later clock
+// inside that gap is legitimate backpressure even though it sits past
+// now+claudeUsageProbeMaxRetryAfter — the seed's ceiling is rebased on the live
+// clock so it is adopted rather than ignored as a clock step, the same
+// correction identityTook makes for the startup replay.
+func TestClaudeUsageProbeGate_CacheSeedKeepsAHoldRecordedDuringTheCredentialRead(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	// `now` as the gather sampled it, before a credential read that took a while.
+	lookup := 2 * time.Second
+	now := time.Now().Add(-lookup)
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	live := now.Add(lookup + claudeUsageProbeMaxRetryAfter)
+	if !live.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+		t.Fatal("the fixture must sit past a ceiling measured from the pre-read instant")
+	}
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.HeldUntilMs = live.UnixMilli()
+		return true
+	})
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, now.Add(-time.Hour))
+
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != live.UnixMilli() {
+		t.Fatalf("in-memory hold=%v, want the hold %v recorded during the credential read", gateHold, live)
+	}
+	if claudeUsageProbe.begin(time.Now(), true) {
+		t.Fatal("a gather was admitted inside a live backoff window")
+	}
+}
+
 // The seed compares the refresh generation against the moment the CALLER read the
 // cache, not the moment the seed runs. A replay landing in that gap — after
 // ParseContext loaded its view, before the seed is entered — is already counted in
