@@ -197,26 +197,45 @@ func claudeOweRunRefresh(baseline time.Time) {
 		})
 }
 
-// claudeRunRefreshOwedFor reports the debt the previous process left for
-// `fingerprint`, and how many replay attempts it has already cost. Zero when
-// there is none, when the cache belongs to another account, or when the file is
-// missing or corrupt — this is a freshness optimisation, and the next run
-// rewrites it.
+// claudePersistedProbeStateFor reports what a previous process left on the
+// snapshot for `fingerprint`: the outstanding debt, how many replay attempts it
+// has already cost, and any 429 hold still on record. All zero when there is
+// none, when the cache belongs to another account, or when the file is missing
+// or corrupt — this is a freshness optimisation, and the next run rewrites it.
 //
-// The account is a PARAMETER, never resolved here: the one caller
-// (claudeUsageProbeGate.seedOwedFromCache, on the gather path) already holds the
+// The debt and the hold are read TOGETHER because the one caller
+// (claudeUsageProbeGate.seedOwedFromCache, on the gather path) needs both from
+// one unlocked read: the debt so a run that finished before a restart is not
+// mistaken for "nothing owed", and the hold so no gather can be ADMITTED inside
+// a window the endpoint already imposed. payOwedClaudeUsageRefresh restores that
+// hold too, but from a SPAWNED goroutine — the first gather of a fresh agent can
+// reach begin() while that goroutine is still reading the credential store, and
+// would then put a request to an endpoint that just told this device to stop.
+//
+// The hold is returned exactly as recorded, ceiling unchecked: the caller
+// applies the same claudeUsageProbeMaxRetryAfter bound payOwedClaudeUsageRefreshAt
+// does, and only the replay may CLEAR a skewed one — this is a read on the
+// gather path and writes nothing.
+//
+// The account is a PARAMETER, never resolved here: the caller already holds the
 // fingerprint its gather decoded, and resolving a second one would cost a macOS
 // `security` spawn on a path that is contractually free of credential reads.
 //
 // Read WITHOUT the cache lock: the snapshot is only ever replaced by rename, so
 // a reader sees a whole file or the previous whole file, and taking the gate for
 // a read would queue this behind writers on the gather path.
-func claudeRunRefreshOwedFor(fingerprint string) (time.Time, int) {
+func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts int, held time.Time) {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
-	if !ok || snap.RefreshOwedAtMs == 0 || snap.AccountFingerprint != fingerprint {
-		return time.Time{}, 0
+	if !ok || snap.AccountFingerprint != fingerprint {
+		return time.Time{}, 0, time.Time{}
 	}
-	return time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
+	if snap.RefreshOwedAtMs != 0 {
+		owed, attempts = time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
+	}
+	if snap.HeldUntilMs > 0 {
+		held = time.UnixMilli(snap.HeldUntilMs)
+	}
+	return owed, attempts, held
 }
 
 /* ────────────────────────────────── hold ─────────────────────────────────── */

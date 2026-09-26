@@ -268,7 +268,7 @@ func TestMutateClaudeRateLimitSnapshot_ResetsAForeignFingerprintFirst(t *testing
 		snap.RefreshOwedAtMs = now.UnixMilli()
 		return true
 	})
-	if owed, _ := claudeRunRefreshOwedFor(currentClaudeAccountFingerprint()); !owed.IsZero() {
+	if owed, _, _ := claudePersistedProbeStateFor(currentClaudeAccountFingerprint()); !owed.IsZero() {
 		t.Errorf("another account's debt is visible to this one: %v", owed)
 	}
 }
@@ -883,7 +883,7 @@ func TestClaudeUsageProbeGate_CacheSeedDoesNotResurrectASettledDebt(t *testing.T
 		mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
 	}
 
-	got := claudeUsageProbe.seedOwedFromCache(fp, latest)
+	got := claudeUsageProbe.seedOwedFromCache(fp, time.Now(), latest)
 
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("a settled debt was resurrected on the gate as %v", owed)
@@ -908,11 +908,176 @@ func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheCallerAlreadyCovers(t *testi
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
 
-	if got := claudeUsageProbe.seedOwedFromCache(fp, runEnded.Add(time.Second)); !got.IsZero() {
+	if got := claudeUsageProbe.seedOwedFromCache(fp, time.Now(), runEnded.Add(time.Second)); !got.IsZero() {
 		t.Fatalf("seedOwedFromCache()=%v, want zero — the caller's own reading needs no re-read", got)
 	}
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("a debt the caller's reading already covers was adopted as %v", owed)
 	}
 	_ = cache
+}
+
+// The replay settles the debt in the SAME locked write that carries the reading,
+// so a replay landing during the seed's unlocked cache read has already cleared
+// the debt from disk by the time the seed loads it. Keying the "must the gather
+// re-read?" answer off a surviving debt therefore reports "nothing happened" for
+// precisely the case the generation counter exists to catch, and the gather
+// publishes its pre-replay view for the whole TTL — the stale card this file
+// exists to clear.
+func TestClaudeUsageProbeGate_CacheSeedReportsARefreshThatAlreadyClearedTheDebt(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now().Add(-time.Minute)
+	latest := runEnded.Add(-time.Minute) // the PRE-replay reading this gather loaded
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(runEnded)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	settled := runEnded.Add(time.Second)
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+	// The replay lands mid-read and CLEARS the debt first, which is the ordering
+	// the single settling write produces — unlike the sibling test above, the seed
+	// finds nothing owed on disk.
+	claudeUsageProbeAfterSeedRead = func() {
+		mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
+		claudeUsageProbe.mu.Lock()
+		claudeUsageProbe.refreshes++
+		claudeUsageProbe.lastRefreshAt = settled
+		claudeUsageProbe.lastRefreshFingerprint = fp
+		claudeUsageProbe.owedBaseline = time.Time{}
+		claudeUsageProbe.mu.Unlock()
+	}
+
+	// Cleared before the seed's own read, so it loads no debt at all.
+	mutateClaudeRateLimitSnapshot(cache, fp, retireClaudeRefreshDebtAt(runEnded))
+
+	got := claudeUsageProbe.seedOwedFromCache(fp, time.Now(), latest)
+
+	if got.UnixMilli() != settled.UnixMilli() {
+		t.Fatalf("seedOwedFromCache()=%v, want the landed reading %v so the gather re-reads the cache", got, settled)
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("a settled debt was resurrected on the gate as %v", owed)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("the seed issued %d requests, want 0 — it is a pure cache read", n)
+	}
+}
+
+// The re-read answer stays a RELATIVE reading of the generation counter, never an
+// absolute claim about lastRefreshAt: resetClaudeUsageProbeGate deliberately
+// leaves that pair standing, so a refresh recorded before this gather started —
+// or one belonging to another account, or no newer than the caller's own view —
+// is no reason to re-read.
+func TestClaudeUsageProbeGate_CacheSeedReportsNoReReadWithoutAFreshRefresh(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	latest := time.Now().Add(-time.Minute)
+	seedClaudeProbeReading(t, cache, latest)
+	originalHook := claudeUsageProbeAfterSeedRead
+	t.Cleanup(func() { claudeUsageProbeAfterSeedRead = originalHook })
+
+	for _, tc := range []struct {
+		name        string
+		landsDuring bool
+		fingerprint string
+		at          time.Time
+	}{
+		{"a refresh recorded before this gather started", false, fp, latest.Add(time.Minute)},
+		{"another account's refresh", true, "someone-else", latest.Add(time.Minute)},
+		{"a reading the caller already holds", true, fp, latest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetClaudeUsageProbeGate()
+			SetClaudeUsageProbeDisabled(false)
+			record := func() {
+				claudeUsageProbe.mu.Lock()
+				claudeUsageProbe.refreshes++
+				claudeUsageProbe.lastRefreshAt = tc.at
+				claudeUsageProbe.lastRefreshFingerprint = tc.fingerprint
+				claudeUsageProbe.mu.Unlock()
+			}
+			claudeUsageProbeAfterSeedRead = func() {}
+			if tc.landsDuring {
+				claudeUsageProbeAfterSeedRead = record
+			} else {
+				record()
+			}
+			if got := claudeUsageProbe.seedOwedFromCache(fp, time.Now(), latest); !got.IsZero() {
+				t.Fatalf("seedOwedFromCache()=%v, want zero — no fresh reading supersedes the caller's", got)
+			}
+		})
+	}
+	_ = cache
+}
+
+// The startup replay restores a persisted hold from a SPAWNED goroutine, so the
+// first gather of a fresh agent can reach begin() while that goroutine is still
+// reading the credential store. The gather-side seed adopts the hold from the
+// same unlocked read it takes the debt from, so no request can go out inside a
+// window the endpoint already imposed.
+func TestClaudeUsageProbeGate_CacheSeedRestoresAPersistedHold(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	held := now.Add(20 * time.Minute)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.HeldUntilMs = held.UnixMilli()
+		return true
+	})
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	claudeUsageProbe.seedOwedFromCache(fp, now, now.Add(-time.Hour))
+
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != held.UnixMilli() {
+		t.Fatalf("in-memory hold=%v, want the persisted %v", gateHold, held)
+	}
+	// And the hold outranks force, exactly as begin() documents.
+	if claudeUsageProbe.begin(now, true) {
+		t.Fatal("a gather was admitted inside the persisted hold window")
+	}
+	// The seed is a READ: it neither clears nor rewrites what it adopted.
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != held.UnixMilli() {
+		t.Errorf("HeldUntilMs=%d, want the untouched %d", snap.HeldUntilMs, held.UnixMilli())
+	}
+}
+
+// A hold stamped beyond the ceiling a Retry-After could legitimately reach is a
+// clock step, not backpressure. The seed IGNORES it rather than parking
+// utilization for days — and leaves it on disk, because the durable drop belongs
+// to payOwedClaudeUsageRefreshAt and this path writes nothing.
+func TestClaudeUsageProbeGate_CacheSeedIgnoresASkewedHold(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	skewed := now.Add(2 * claudeUsageProbeMaxRetryAfter)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.HeldUntilMs = skewed.UnixMilli()
+		return true
+	})
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	claudeUsageProbe.seedOwedFromCache(fp, now, now.Add(-time.Hour))
+
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if !gateHold.IsZero() {
+		t.Fatalf("in-memory hold=%v, want none — a skewed hold is not backpressure", gateHold)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.HeldUntilMs != skewed.UnixMilli() {
+		t.Errorf("HeldUntilMs=%d, want the untouched %d — only the replay clears a skewed hold", snap.HeldUntilMs, skewed.UnixMilli())
+	}
 }

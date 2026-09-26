@@ -922,14 +922,18 @@ func (g *claudeUsageProbeGate) owedObservation() time.Time {
 	return g.owedBaseline
 }
 
-// seedOwedFromCache adopts, ONCE per process, the debt a previous process
-// persisted, so the `owing` branch below sees a run this process never saw.
+// seedOwedFromCache adopts, ONCE per process, the state a previous process
+// persisted — the post-run debt and any 429 hold — so the `owing` branch below
+// sees a run this process never saw, and begin() honours backpressure this
+// process never took.
 //
-// payOwedClaudeUsageRefresh seeds the same value, but it is SPAWNED: the first
-// gather of a fresh agent can reach the staleness check before that goroutine
-// has read the cache, find a reading younger than claudeUsageProbeStaleAfter,
-// and publish the PRE-update utilization — the stale card this whole path
-// exists to prevent.
+// payOwedClaudeUsageRefresh restores both, but it is SPAWNED: the first gather of
+// a fresh agent can reach the staleness check before that goroutine has read the
+// credential store and the cache, find a reading younger than
+// claudeUsageProbeStaleAfter, and publish the PRE-update utilization — the stale
+// card this whole path exists to prevent — or, inside a persisted Retry-After
+// window, be ADMITTED and put another request to an endpoint that just refused
+// this device.
 //
 // It takes the fingerprint the gather already decoded from its one credential
 // read rather than resolving its own. refreshClaudeUsageIfStale makes no
@@ -938,6 +942,11 @@ func (g *claudeUsageProbeGate) owedObservation() time.Time {
 //
 // The cache read happens OFF g.mu: that mutex is taken on the session stdout
 // path, so nothing touching the filesystem may be held under it.
+//
+// The hold is adopted under the same claudeUsageProbeMaxRetryAfter ceiling
+// payOwedClaudeUsageRefreshAt applies, so a value left by a stepped clock cannot
+// park utilization for days. A skewed one is only IGNORED here, never cleared:
+// the replay owns the durable drop, and this path writes nothing.
 //
 // `latest` is the freshest observation the caller already read out of the cache,
 // and it is the first coverage test: a debt a reading THIS gather is holding
@@ -956,10 +965,20 @@ func (g *claudeUsageProbeGate) owedObservation() time.Time {
 // lastRefreshFingerprint say what it observed and for whom — sampled relatively,
 // never as an absolute claim, for the reason resetClaudeUsageProbeGate documents.
 //
-// Returns that covering observation when it is NEWER than `latest`, so the
-// caller re-reads the cache instead of shaping metrics from the view it loaded
-// before the replay landed. Zero means "nothing to re-read" — the ordinary case.
-func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, latest time.Time) time.Time {
+// Returns a covering observation whenever a refresh that landed while we read
+// has moved the shared cache PAST `latest`, so the caller re-reads the cache
+// instead of shaping metrics from the view it loaded before the replay landed.
+// Zero means "nothing to re-read" — the ordinary case.
+//
+// That answer is given even when NO persisted debt remains, which is the usual
+// ordering rather than an edge: the replay's settlement is the same locked write
+// that carries the reading, so a replay landing during the unlocked read above
+// has already cleared the debt from disk by the time we load it. Keying the
+// answer off the debt would report "nothing happened" for precisely the case the
+// generation counter exists to catch, and leave the gather to publish the
+// pre-replay view for the whole TTL. A needless re-read costs one cache load, and
+// the latch makes it at most one per process.
+func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, now, latest time.Time) time.Time {
 	g.mu.Lock()
 	seed := !g.owedSeeded
 	g.owedSeeded = true
@@ -968,21 +987,35 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, latest time
 	if !seed {
 		return time.Time{}
 	}
-	persisted, _ := claudeRunRefreshOwedFor(fingerprint)
-	if persisted.IsZero() || claudeUsageObservationCovers(latest, persisted) {
-		return time.Time{}
+	persisted, _, held := claudePersistedProbeStateFor(fingerprint)
+	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
+	// process already took outranks a shorter persisted one.
+	if !held.IsZero() && !held.After(now.Add(claudeUsageProbeMaxRetryAfter)) {
+		g.holdUntil(held)
 	}
 	claudeUsageProbeAfterSeedRead()
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.refreshes != generation && g.lastRefreshFingerprint == fingerprint &&
-		claudeUsageObservationCovers(g.lastRefreshAt, persisted) {
-		// Settled while we were reading. Nothing to adopt; hand the reading back
-		// when it supersedes the caller's own.
-		if g.lastRefreshAt.After(latest) {
-			return g.lastRefreshAt
-		}
-		return time.Time{}
+	// What a probe of THIS process persisted while we were reading, for THIS
+	// account. Read only when the generation advanced: lastRefreshAt is sampled
+	// RELATIVELY, never as an absolute claim, for the reason
+	// resetClaudeUsageProbeGate documents.
+	landed := time.Time{}
+	if g.refreshes != generation && g.lastRefreshFingerprint == fingerprint {
+		landed = g.lastRefreshAt
+	}
+	// It supersedes the caller's own view, so the gather must re-read whatever we
+	// decide about the debt below.
+	superseded := time.Time{}
+	if landed.After(latest) {
+		superseded = landed
+	}
+	if persisted.IsZero() || claudeUsageObservationCovers(latest, persisted) {
+		return superseded
+	}
+	if claudeUsageObservationCovers(landed, persisted) {
+		// Settled while we were reading. Nothing to adopt.
+		return superseded
 	}
 	// Inlined rather than calling recordOwed so the decision and the record are
 	// one critical section: releasing the lock between them would reopen exactly
@@ -992,6 +1025,8 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(fingerprint string, latest time
 	if persisted.After(g.owedBaseline) {
 		g.owedBaseline = persisted
 	}
+	// A debt was adopted, so the caller has a probe to issue: report no re-read
+	// even if the cache moved, or it would return before reaching it.
 	return time.Time{}
 }
 
@@ -1554,16 +1589,19 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// leave it to sign the cache it loaded before the probe landed. The ticket is
 	// on the refresh's own context, so only the requested gather can take it.
 	forced := claimClaudeUsageForceProbe(ctx)
-	// Adopt the previous process's debt before reading ours, so a run that
-	// finished just before a restart or self-update is not mistaken for "no
-	// debt" on this process's very first gather. Latched, and it reuses the
-	// fingerprint the caller already decoded — no extra credential read.
+	// Adopt the previous process's debt — and any 429 hold it left — before
+	// reading ours, so a run that finished just before a restart or self-update is
+	// not mistaken for "no debt" on this process's very first gather, and so this
+	// gather cannot be admitted inside a hold the startup replay has not yet got
+	// round to restoring. Latched, and it reuses the fingerprint the caller
+	// already decoded — no extra credential read.
 	//
-	// A non-zero answer means the startup replay settled that debt with a reading
-	// newer than the `latest` this gather loaded: there is nothing left to probe
-	// for, but the caller must re-read the cache rather than publish the view it
-	// holds — the same "the shared cache moved" contract as the final return.
-	if seeded := claudeUsageProbe.seedOwedFromCache(fingerprint, latest); !seeded.IsZero() {
+	// A non-zero answer means the shared cache moved past the `latest` this gather
+	// loaded (the startup replay landing mid-gather): there is nothing left to
+	// probe for, but the caller must re-read the cache rather than publish the
+	// view it holds — the same "the shared cache moved" contract as the final
+	// return.
+	if seeded := claudeUsageProbe.seedOwedFromCache(fingerprint, now, latest); !seeded.IsZero() {
 		return true
 	}
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
