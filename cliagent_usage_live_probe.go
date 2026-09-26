@@ -650,9 +650,11 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
 	version := antigravityCodeAssistBuildVersion(agent.Version)
 	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
+	antigravityRecordClickRead(outcome, time.Now())
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
 		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
 		outcome = probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
+		antigravityRecordClickRead(outcome, time.Now())
 	}
 	return outcome
 }
@@ -777,6 +779,10 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 // named. The account lives in the OS keyring, so settings.json can still name a
 // previous login; for the gather this click runs next, the server's own answer
 // is the better statement of who is signed in.
+//
+// A reading taken with the stored keyring login itself — the login `agy` runs
+// as — is attested by the cached reading instead (StoredLoginRead): that
+// attestation must outlive both this TTL and this process.
 var antigravityLiveProducer struct {
 	mu          sync.Mutex
 	fingerprint string
@@ -793,15 +799,27 @@ func noteAntigravityLiveProducer(fingerprint string, at time.Time) {
 	antigravityLiveProducer.at = at
 }
 
-// recentAntigravityLiveProducer returns the fingerprint a live probe attested
-// within antigravityLiveProducerTTL, else "".
-func recentAntigravityLiveProducer(now time.Time) string {
+// antigravityProducerAttests reports whether the account that produced a cached
+// reading is attested: within antigravityLiveProducerTTL for a loopback probe,
+// and for as long as the cache still holds that reading for a Code Assist read.
+//
+// The Code Assist half is answered by the cached reading itself
+// (StoredLoginRead), so it survives the restart or self-update that discards
+// the in-process note — the reading was taken with the stored keyring login,
+// which is a fact about the file, not about this process.
+func antigravityProducerAttests(cached antigravityQuotaSnapshot, now time.Time) bool {
+	if cached.AccountFingerprint == "" {
+		return false
+	}
+	if cached.StoredLoginRead {
+		return true
+	}
 	antigravityLiveProducer.mu.Lock()
 	defer antigravityLiveProducer.mu.Unlock()
-	if antigravityLiveProducer.fingerprint == "" || now.Sub(antigravityLiveProducer.at) > antigravityLiveProducerTTL {
-		return ""
+	if antigravityLiveProducer.fingerprint != cached.AccountFingerprint {
+		return false
 	}
-	return antigravityLiveProducer.fingerprint
+	return now.Sub(antigravityLiveProducer.at) <= antigravityLiveProducerTTL
 }
 
 // removeDirEventually deletes a probe's temp directory. Windows keeps a killed

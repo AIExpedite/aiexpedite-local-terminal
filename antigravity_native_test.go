@@ -1608,15 +1608,7 @@ func TestAntigravityNativeRunOneShot_ReleasesQuotaCaptureOnTimeout(t *testing.T)
 		t.Fatalf("expected the turn to time out")
 	}
 
-	stopped := antigravityCaptureStopped()
-	if stopped == nil {
-		t.Fatal("the turn never armed a quota capture")
-	}
-	select {
-	case <-stopped:
-	case <-time.After(30 * time.Second):
-		t.Fatal("a timed-out turn leaked its quota capture")
-	}
+	helperAwaitCaptureStopped(t, "a timed-out turn leaked its quota capture", "the turn never armed a quota capture")
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Errorf("arms=%d, want exactly one per turn", got)
 	}

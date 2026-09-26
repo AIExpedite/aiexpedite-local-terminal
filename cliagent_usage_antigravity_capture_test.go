@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -80,14 +81,12 @@ func helperStartCaptureServerFunc(t *testing.T, base string, quotaJSON func() st
 // `agy` run), so these tests must not run in parallel with each other.
 func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache string) {
 	t.Helper()
-	if ch := antigravityCaptureStopped(); ch != nil {
-		select {
-		case <-ch:
-		default:
-			t.Fatal("a capture poller from an earlier test is still running")
-		}
+	select {
+	case <-antigravityCaptureStopped():
+	default:
+		t.Fatal("a capture poller from an earlier test is still running")
 	}
-	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
 	antigravityCaptureArms.Store(0)
 	antigravityCaptureFinishes.Store(0)
 	antigravityCaptureSnapshots.Store(0)
@@ -106,7 +105,7 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	origRetry := antigravityRefreshAfterRunRetryDelay
 	antigravityRefreshAfterRunRetryDelay = time.Millisecond
 	t.Cleanup(func() {
-		antigravityUsageRefreshWaitIdle()
+		helperStopAntigravityRefreshSchedule()
 		antigravityRefreshAfterRunRetryDelay = origRetry
 	})
 	// A debt is retired WITHOUT an attempt when `agy` is not on the machine, so
@@ -156,10 +155,6 @@ func helperStopCapture(t *testing.T, finish func()) {
 	t.Helper()
 	stopped := antigravityCaptureStopped()
 	finish()
-	if stopped == nil {
-		antigravityUsageRefreshWaitIdle()
-		return
-	}
 	select {
 	case <-stopped:
 	case <-time.After(30 * time.Second):
@@ -168,6 +163,22 @@ func helperStopCapture(t *testing.T, finish func()) {
 	// The settle runs off the poller (a short run must not wait on a longer
 	// one holding it), so the debt it decides lands slightly after shutdown.
 	antigravityUsageRefreshWaitIdle()
+}
+
+// helperAwaitCaptureStopped asserts a run armed a capture and waits for the
+// poller to finish. antigravityCaptureStopped is never nil (an already-closed
+// channel stands in before any poller exists), so "was anything armed" is
+// asked of the arm counter rather than of the channel.
+func helperAwaitCaptureStopped(t *testing.T, stuck, neverArmed string) {
+	t.Helper()
+	if antigravityCaptureArms.Load() == 0 {
+		t.Fatal(neverArmed)
+	}
+	select {
+	case <-antigravityCaptureStopped():
+	case <-time.After(30 * time.Second):
+		t.Fatal(stuck)
+	}
 }
 
 // helperAwaitSnapshot polls the cache until a snapshot is present whose
@@ -684,4 +695,178 @@ func helperResetAntigravityLiveRuns() {
 	antigravityLiveRunsMu.Lock()
 	antigravityLiveRuns = map[int64]int{}
 	antigravityLiveRunsMu.Unlock()
+}
+
+// A build the gate marker already knows refuses loopback reads gets NO poller:
+// every probe would be a log scan for a read guaranteed to be refused. The run
+// still arms its floor and still settles gated, so the Code Assist route that
+// does answer on such a build pays it.
+func TestAntigravityQuotaCapture_GatedBuildStartsNoPoller(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	helperIsolateAntigravityGate(t)
+	noteAntigravityQuotaGate("", time.Now().Add(-time.Minute))
+	// A live-looking server whose port the log names: a poller would find it.
+	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"), helperQuotaJSON, helperStatusJSON)
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	logged := captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("gated run")
+		antigravityCaptureMu.Lock()
+		refs := antigravityCaptureRefs
+		antigravityCaptureMu.Unlock()
+		if refs != 0 {
+			t.Errorf("refs=%d, want no poller joined for a gated build", refs)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Errorf("arms=%d, want the run armed once", got)
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want the run released once", got)
+	}
+	if got := server.quotaHits.Load() + server.statusHits.Load(); got != 0 {
+		t.Errorf("loopback RPCs=%d, want none on a gated build", got)
+	}
+	if got := antigravityCaptureTailProbes.Load(); got != 0 {
+		t.Errorf("tailProbes=%d, want none", got)
+	}
+	// The poller's close-out line reports its discovery attempts; no poller,
+	// no line — and so no discovery at all.
+	if strings.Contains(logged, "Capture finished for gated run") {
+		t.Errorf("a poller ran for a gated build: %q", logged)
+	}
+	state := helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 || !state.Gated {
+		t.Errorf("state=%+v, want the run's debt owed and marked gated", state)
+	}
+	// antigravityCaptureStopped stays answerable with no poller armed.
+	select {
+	case <-antigravityCaptureStopped():
+	case <-time.After(5 * time.Second):
+		t.Error("antigravityCaptureStopped hung with no poller armed")
+	}
+}
+
+// helperInstalledAgy puts an `agy` binary on PATH and, when version is
+// non-empty, records it in the version-probe cache as the card's detection
+// would have — the run path reads that cache and never spawns --version.
+func helperInstalledAgy(t *testing.T, version string) {
+	t.Helper()
+	dir := t.TempDir()
+	name := "agy"
+	if runtime.GOOS == "windows" {
+		name = "agy.exe"
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	if version != "" {
+		cachedProbeVersionFunc(antigravityExecutablePath(), func() string { return version })
+	}
+}
+
+// The run path compares the marker with the installed build: a versioned
+// marker skips the poller only for that same build. A self-update (a new
+// version, or a binary changed since its last probe) gets its first re-probe
+// instead of riding the old build's refusal for up to the recheck window.
+func TestAntigravityQuotaCapture_GateMarkerIsPerInstalledBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		marker     string
+		installed  string
+		wantPolled bool
+	}{
+		{name: "same build stays gated", marker: "1.2.2", installed: "1.2.2", wantPolled: false},
+		{name: "an upgraded build is re-probed", marker: "1.2.2", installed: "1.3.0", wantPolled: true},
+		{name: "an unprobed build is re-probed", marker: "1.2.2", installed: "", wantPolled: true},
+		{name: "an unversioned marker covers whatever is installed", marker: "", installed: "1.3.0", wantPolled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityCapture(t, "20ms")
+			helperIsolateAntigravityGate(t)
+			helperInstalledAgy(t, tc.installed)
+			noteAntigravityQuotaGate(tc.marker, time.Now().Add(-time.Minute))
+			helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+			captureStdout(t, func() {
+				finish := startAntigravityQuotaCapture("build check")
+				antigravityCaptureMu.Lock()
+				polled := antigravityCaptureRefs == 1
+				antigravityCaptureMu.Unlock()
+				if polled != tc.wantPolled {
+					t.Errorf("poller started=%v, want %v", polled, tc.wantPolled)
+				}
+				helperStopCapture(t, finish)
+			})
+		})
+	}
+}
+
+// A refusal the poller records is stamped with the installed build when the
+// card has probed it, so a later upgrade is not covered by it.
+func TestAntigravityQuotaCapture_PollerStampsTheInstalledBuild(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "1.2.2")
+	_, hits := helperGatedAntigravityServer(t, filepath.Join(home, ".gemini", "antigravity-cli"))
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("stamp run")
+		deadline := time.Now().Add(10 * time.Second)
+		for hits.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	var gate antigravityQuotaGate
+	if !readJSONFile(gatePath, &gate) {
+		t.Fatal("the poller recorded no refusal")
+	}
+	if gate.Version != "1.2.2" {
+		t.Errorf("marker version=%q, want the installed build 1.2.2", gate.Version)
+	}
+}
+
+// A refusal on a build the card has not probed (cold cache, or a binary changed
+// since its probe) persists nothing: an unversioned marker would cover every
+// later build for the recheck window. The poller still parks for this run.
+func TestAntigravityQuotaCapture_UnprobedBuildPersistsNoMarker(t *testing.T) {
+	home, _ := helperIsolateAntigravityCapture(t, "20ms")
+	gatePath := helperIsolateAntigravityGate(t)
+	helperInstalledAgy(t, "")
+	_, hits := helperGatedAntigravityServer(t, filepath.Join(home, ".gemini", "antigravity-cli"))
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	var atRefusal int64
+	logged := captureStdout(t, func() {
+		finish := startAntigravityQuotaCapture("unprobed run")
+		deadline := time.Now().Add(10 * time.Second)
+		for hits.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		atRefusal = hits.Load()
+		time.Sleep(300 * time.Millisecond) // ~15 ticks at 20ms
+		if extra := hits.Load() - atRefusal; extra > 1 {
+			t.Errorf("%d further RPCs after the refusal, want the poller parked", extra)
+		}
+		helperStopCapture(t, finish)
+	})
+
+	if atRefusal == 0 {
+		t.Fatal("the poller never reached the gated server")
+	}
+	if !strings.Contains(logged, "refuses loopback quota reads") {
+		t.Errorf("the refusal was not logged: %q", logged)
+	}
+	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
+		t.Errorf("an unprobed build's refusal wrote a marker (stat err=%v)", err)
+	}
 }
