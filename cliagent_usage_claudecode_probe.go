@@ -1094,13 +1094,24 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // pre-replay view for the whole TTL. A needless re-read costs one cache load, and
 // the latch makes it at most one per account per process.
 func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint string, generation uint64, now, latest time.Time) time.Time {
-	// Sampled BEFORE any read and off g.mu — a write landing between this stat and
-	// the reads below leaves the recorded stamp OLDER than the content adopted, so
-	// the next gather re-opens the adoption; sampling it afterwards could record a
-	// stamp newer than what was read and hide that write for the process lifetime.
-	stampMod, stampSize := claudeRateLimitCacheStamp()
+	var stampMod, stampSize int64
 	var seeding chan struct{}
 	for seeding == nil {
+		// Sampled BEFORE any read and off g.mu — a write landing between this stat
+		// and the reads below leaves the recorded stamp OLDER than the content
+		// adopted, so the next gather re-opens the adoption; sampling it afterwards
+		// could record a stamp newer than what was read and hide that write for the
+		// process lifetime.
+		//
+		// Re-sampled on EVERY pass rather than once at entry: a pass that follows a
+		// wait on seedingCh would otherwise test the latch against a stamp taken
+		// before the wait, and a snapshot another process renamed in during it would
+		// still match the claimant's older stamp — returning the latched verdict
+		// without ever reading the debt or hold that write carried. Sampled
+		// immediately before the latch test, a write can only land after it, which
+		// is the same as landing after this gather returned: the next gather's stamp
+		// differs and re-opens the adoption.
+		stampMod, stampSize = claudeRateLimitCacheStamp()
 		g.mu.Lock()
 		if g.owedSeeded && g.owedSeededFor == fingerprint &&
 			g.owedSeededStampMod == stampMod && g.owedSeededStampSize == stampSize {
@@ -1121,6 +1132,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			// have been seeding a DIFFERENT account, in which case this one still
 			// has its own to adopt. Bounded by the gather's context — a gather that
 			// gives up here degrades to the unseeded path, never to a hang.
+			claudeUsageProbeSeedWaiting()
 			select {
 			case <-pending:
 			case <-ctx.Done():
@@ -1252,6 +1264,11 @@ func (g *claudeUsageProbeGate) supersedingObservationLocked(observation, latest,
 // and the locked adoption it guards. Production leaves it as a no-op, like
 // claudeUsageProbeBeforeForcedAttempt.
 var claudeUsageProbeAfterSeedRead = func() {}
+
+// claudeUsageProbeSeedWaiting is an observation point for the latch re-sample
+// test: it runs when a gather is about to block on another gather's adoption.
+// Production leaves it as a no-op.
+var claudeUsageProbeSeedWaiting = func() {}
 
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
 // deadline is zero (no usable Retry-After).

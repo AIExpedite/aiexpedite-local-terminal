@@ -1832,3 +1832,64 @@ func TestClaudeUsageProbeGate_CacheSeedReReadsAfterAnotherProcessWrites(t *testi
 		t.Errorf("in-memory hold=%v, want the other process's %v", gateHold, held)
 	}
 }
+
+// A gather that WAITED on another gather's adoption re-samples the snapshot stamp
+// before trusting the latch that adoption set. The claimant stamped the file
+// before another agent channel renamed in a debt and a 429 hold; a waiter still
+// holding the stamp it sampled before the wait would match that older stamp and
+// return the latched verdict without ever reading what the write carried.
+func TestClaudeUsageProbeGate_CacheSeedWaiterResamplesTheStampAfterTheWait(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	originalRead, originalWait := claudeUsageProbeAfterSeedRead, claudeUsageProbeSeedWaiting
+	t.Cleanup(func() {
+		claudeUsageProbeAfterSeedRead, claudeUsageProbeSeedWaiting = originalRead, originalWait
+	})
+	waiting := make(chan struct{})
+	var waitOnce sync.Once
+	claudeUsageProbeSeedWaiting = func() { waitOnce.Do(func() { close(waiting) }) }
+
+	ranAt, held := now.Add(-time.Minute), now.Add(15*time.Minute)
+	waiterDone := make(chan struct{})
+	var readOnce sync.Once
+	claudeUsageProbeAfterSeedRead = func() {
+		readOnce.Do(func() {
+			// The claimant has already stamped and read the empty snapshot. A
+			// second gather arrives, samples the same stamp, and blocks on it.
+			go func() {
+				defer close(waiterDone)
+				claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+			}()
+			<-waiting
+			// Another agent channel records a run debt and a 429 while it waits.
+			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.RefreshOwedAtMs, snap.HeldUntilMs = ranAt.UnixMilli(), held.UnixMilli()
+				return true
+			})
+		})
+	}
+
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, claudeUsageProbe.refreshGeneration(), now, latest)
+	select {
+	case <-waiterDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting gather never returned")
+	}
+
+	if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != ranAt.UnixMilli() {
+		t.Errorf("owedBaseline=%v, want the debt written during the wait %v", got, ranAt)
+	}
+	claudeUsageProbe.mu.Lock()
+	gateHold := claudeUsageProbe.heldUntil
+	claudeUsageProbe.mu.Unlock()
+	if gateHold.UnixMilli() != held.UnixMilli() {
+		t.Errorf("in-memory hold=%v, want the hold written during the wait %v", gateHold, held)
+	}
+}
