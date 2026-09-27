@@ -360,6 +360,22 @@ func resetCodexRefreshNudge() {
 
 // codexNudgeRollout merges a freshly reported rollout mtime with whatever a
 // previous, declined nudge retained for this account, and reports the newest.
+// codexPendingRolloutCeiling is the newest instant deferred rollout evidence may
+// legitimately carry: `now` less the settle guard's own window.
+//
+// A filesystem mtime ahead of the clock (a correction, or restored metadata) is
+// untrustworthy about WHEN, but the file's existence still proves the run
+// happened — and the scan has already read it, so it is not mid-write in any way
+// we could detect. Correcting it to `now` would be safe but unhelpful: the
+// corrected value would then be too young for `settled`, so it would shadow older
+// valid reports for a further codexForcedReconcileMinInterval on top of whatever
+// the rollback already cost. Dating it just past that window lets recovery happen
+// on the very next nudge, and codexOweRunRefresh clamps the floor it derives
+// anyway.
+func codexPendingRolloutCeiling(now time.Time) time.Time {
+	return now.Add(-codexForcedReconcileMinInterval)
+}
+
 // codexNudgeRolloutEvidence merges a freshly reported rollout mtime with the
 // evidence already held for this account (PendingRolloutMtimeMs) and reports the
 // newest usable one, plus whether the fresh report is something not yet on disk.
@@ -381,14 +397,24 @@ func resetCodexRefreshNudge() {
 // every re-report of the SAME unchanged file look fresh — and each of those would
 // take the blocking cache lock on a path that runs every ~30 s.
 func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (evidence time.Time, fresh bool) {
-	if reported.After(now) {
-		reported = now
+	ceiling := codexPendingRolloutCeiling(now)
+	if reported.After(ceiling) && reported.After(now) {
+		reported = ceiling
 	}
 	if !reported.IsZero() {
 		reported = time.UnixMilli(reported.UnixMilli())
 	}
 	if view.pendingRolloutMs > 0 {
 		evidence = time.UnixMilli(view.pendingRolloutMs)
+		// The STORED value is clamped too, not just the incoming report. Evidence
+		// recorded before a backwards clock step sits ahead of `now` through no
+		// fault of its own, and because the held value is the newest of the two it
+		// would then win against every later valid report while `settled` could
+		// never become true for it. codexRebaseFutureRunFreshness persists the
+		// correction; this makes the decision right even before that runs.
+		if evidence.After(now) {
+			evidence = ceiling
+		}
 	}
 	if reported.After(evidence) {
 		return reported, true

@@ -273,6 +273,17 @@ type codexRolloutScanProgress struct {
 	futureFloorNs       int64
 	futureCeilingNs     int64
 	futureCohortSize    int
+	// pendingRolloutMtimeMs is the newest ACCOUNT-ELIGIBLE rollout mtime this pass
+	// stat-ed, carried here so it lands in the SAME write that advances the cursor
+	// over those files (nudgeCodexUsageRefresh reads it back).
+	//
+	// It has to be atomic with the cursor, not a follow-up write: the cursor is what
+	// makes a rollout stop being reported, so a gap between the two — a refused
+	// write, a failed commit, or the process exiting between transactions — leaves a
+	// consumed file with no record that anything still owes attention to it, and an
+	// unmanaged run whose telemetry is unreadable then has no trigger at all. Zero
+	// when the pass did not complete or found nothing eligible.
+	pendingRolloutMtimeMs int64
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -2203,6 +2214,11 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		progress.futureCursor = futureCursor
 		progress.futureCohortSize = futureCohortSize
 		progress.futureComplete = futureComplete
+		// The evidence rides with the progress so the write that CONSUMES these
+		// files also records that one of them may still owe a refresh.
+		if eligible := codexEligibleMtimeFor(newestEligibleMtime, progressComplete); !eligible.IsZero() {
+			progress.pendingRolloutMtimeMs = eligible.UnixMilli()
+		}
 		highWater = &progress
 	}
 	if len(winners) == 0 {

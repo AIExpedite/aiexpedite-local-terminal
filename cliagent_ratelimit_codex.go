@@ -1979,6 +1979,38 @@ func codexMergeContributorsIntoSnapshot(
 		snap.RolloutFutureMtimeComplete = rolloutHighWater.futureComplete
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
+	// Record the deferred-refresh evidence in the SAME write that advanced the
+	// cursor past the files it names, so a consumed rollout can never be left with
+	// nothing owing it attention (see codexRolloutScanProgress.pendingRolloutMtimeMs).
+	// Applied even when the cursor above did not move: the file was still read.
+	if rolloutHighWater != nil {
+		codexRecordPendingRollout(snap, rolloutHighWater.pendingRolloutMtimeMs)
+	}
+}
+
+// codexRecordPendingRollout notes a rollout whose refresh may still be owed,
+// unless this very write already observed it. The observation check is what keeps
+// the field quiet on a healthy device: a rollout the merge could mine needs no
+// deferred evidence, so the overwhelmingly common pass records nothing.
+//
+// It never lowers the held value — a newer rollout supersedes an older one — and
+// it ignores a future-dated mtime, which cannot describe a settled run and would
+// otherwise shadow every later report (nudgeCodexUsageRefresh clamps the same way).
+func codexRecordPendingRollout(snap *codexRateLimitSnapshot, mtimeMs int64) {
+	if mtimeMs <= 0 || mtimeMs <= snap.PendingRolloutMtimeMs {
+		return
+	}
+	if codexLatestContributorObservation(snap.Contributors).UnixMilli() >= mtimeMs {
+		return // this pass mined it; there is nothing deferred
+	}
+	// A debt whose floor already reaches this rollout IS the record — it is being
+	// chased on the ladder, and every forced reconcile that chases it comes back
+	// through here. Recording evidence beside it would be a redundant write on
+	// each of those passes, and would outlive the debt it duplicates.
+	if snap.RefreshOwedAtMs != 0 && snap.RunFloorMs >= mtimeMs {
+		return
+	}
+	snap.PendingRolloutMtimeMs = mtimeMs
 }
 
 // reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance

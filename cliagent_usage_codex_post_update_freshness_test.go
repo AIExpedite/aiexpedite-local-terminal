@@ -709,41 +709,168 @@ func TestCodexPostUpdate_AFailedNudgeWriteKeepsTheRolloutEvidence(t *testing.T) 
 }
 
 // A rollout mtime dated in the FUTURE (a clock correction, or restored file
-// metadata) must not shadow later valid evidence. Held raw it would be the newest
-// value for as long as the clock took to catch up, and `settled` can never become
-// true for it — so every eligible run behind it would be blocked from the
-// fallback. It is clamped to `now` instead, which keeps the trigger.
-func TestCodexPostUpdate_AFutureDatedRolloutCannotBlockLaterEvidence(t *testing.T) {
+// metadata) must not be held raw. Held raw it is the newest value for as long as
+// the clock takes to catch up, and `settled` can never become true for it — so
+// every eligible run behind it is blocked from the fallback. It is CORRECTED
+// instead, which both keeps the trigger and lets it act.
+func TestCodexPostUpdate_AFutureDatedRolloutIsCorrectedNotHeldRaw(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	observed := now.Add(-time.Hour)
 	f.seedPreRunReading(t, observed, now)
 
-	// A report dated hours ahead. It must not be stored as-is.
+	// A report dated hours ahead.
 	future := now.Add(3 * time.Hour)
-	if nudgeCodexUsageRefresh(f.home, f.fp, now, future, observed) {
-		t.Fatal("a rollout that cannot be settled yet must not arm anything")
+	nudgeCodexUsageRefresh(f.home, f.fp, now, future, observed)
+
+	snap := f.snapshot(t)
+	// Nothing future-dated may reach disk, in either field: a held mtime ahead of
+	// the clock shadows every later report, and a floor ahead of it asks for
+	// telemetry no observation can reach.
+	if snap.PendingRolloutMtimeMs > now.UnixMilli() {
+		t.Fatalf("a future-dated mtime was stored raw (%d > %d)", snap.PendingRolloutMtimeMs, now.UnixMilli())
 	}
-	held := f.snapshot(t).PendingRolloutMtimeMs
-	if held > now.UnixMilli() {
-		t.Fatalf("a future-dated mtime was stored raw (%d > %d); it would shadow every later report",
-			held, now.UnixMilli())
+	if snap.RunFloorMs > now.UnixMilli() {
+		t.Fatalf("debt floored ahead of the clock: %d > %d", snap.RunFloorMs, now.UnixMilli())
+	}
+	// And the trigger must not be LOST: the correction makes the report actionable,
+	// so either a debt already carries it or the evidence is still held for one.
+	if snap.RefreshOwedAtMs == 0 && snap.PendingRolloutMtimeMs == 0 {
+		t.Fatalf("the trigger was dropped; the file was still written: %+v", snap)
+	}
+	drainCodexRunDebtLadder(t)
+}
+
+// Prior finding 3's remaining gap: evidence recorded BEFORE a backwards clock
+// step is itself future-dated afterwards. It must be detected by the rollback
+// repair, corrected rather than dropped, and must not shadow a later valid report.
+//
+// The whole scenario is built in the ROLLED-BACK timeframe so the cache stays
+// self-consistent — a reading dated after the corrected clock would be pulled back
+// by the repair and would then legitimately cover the rollout, which is a
+// different behaviour from shadowing.
+func TestCodexPostUpdate_EvidenceLeftAheadByAClockRollbackRecovers(t *testing.T) {
+	real := time.Now()
+	rolledBack := real.Add(-4 * time.Hour)
+	f := newCodexFreshnessFixture(t, rolledBack.Add(-5*time.Hour))
+	observed := rolledBack.Add(-2 * time.Hour)
+	f.seedPreRunReading(t, observed, rolledBack)
+
+	// Evidence recorded while the clock still read `real` — ahead of the corrected
+	// clock by hours.
+	codexRecordRunFreshness(f.fp, rolledBack, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs = real.UnixMilli()
+	})
+
+	view := codexCacheViewForAccount(f.fp)
+	if !codexRunFreshnessInFuture(view, rolledBack) {
+		t.Fatal("evidence left ahead of the clock must be detected as a rollback to repair")
+	}
+	if !codexRebaseFutureRunFreshnessForAccount(f.fp, view, rolledBack) {
+		t.Fatal("the repair must run")
+	}
+	repaired := f.snapshot(t).PendingRolloutMtimeMs
+	if repaired == 0 {
+		t.Fatal("the evidence was dropped; the rollout was still written, so the trigger is worth keeping")
+	}
+	if repaired > rolledBack.UnixMilli() {
+		t.Fatalf("repaired evidence %d is still ahead of the corrected clock %d",
+			repaired, rolledBack.UnixMilli())
 	}
 
-	// A normally dated, settled rollout now reports. It must be able to create the
-	// debt rather than being shadowed.
+	// It must now be able to act, on the very next nudge, rather than shadowing
+	// itself for another settle window.
 	resetCodexRefreshNudge()
-	later := now.Add(2 * codexForcedReconcileMinInterval)
-	settled := now.Truncate(time.Millisecond)
-	if !nudgeCodexUsageRefresh(f.home, f.fp, later, settled, observed) {
-		t.Fatal("a valid settled rollout was shadowed by the future-dated one")
+	if !nudgeCodexUsageRefresh(f.home, f.fp, rolledBack, time.Time{}, observed) {
+		t.Fatal("the repaired evidence could not act; recovery is still shadowed")
 	}
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
-		t.Fatalf("the settled rollout must own a debt: %+v", snap)
+		t.Fatalf("the repaired evidence must own a debt: %+v", snap)
 	}
-	if snap.RunFloorMs > later.UnixMilli() {
-		t.Fatalf("the debt floor %d is in the future of the gather %d", snap.RunFloorMs, later.UnixMilli())
+	if snap.RunFloorMs > rolledBack.UnixMilli() {
+		t.Fatalf("the debt floor %d is ahead of the corrected clock %d", snap.RunFloorMs, rolledBack.UnixMilli())
+	}
+	if snap.PendingRolloutMtimeMs != 0 {
+		t.Fatalf("evidence handed to a debt must be released: %+v", snap)
 	}
 	drainCodexRunDebtLadder(t)
+}
+
+// And a later, NEWER report is still taken as fresh rather than being shadowed by
+// evidence a rollback left ahead — the shadowing mechanism itself, asserted
+// directly.
+func TestCodexNudgeRolloutEvidence_FutureHeldValueCannotShadowANewerReport(t *testing.T) {
+	now := time.Now()
+	ahead := codexCacheView{pendingRolloutMs: now.Add(2 * time.Hour).UnixMilli()}
+	// Newer than the corrected held value (now - the settle window) and not itself
+	// in the future. Held RAW, the +2h value would make this — and every other
+	// non-future report — non-fresh for two hours.
+	reported := now.Add(-time.Second).Truncate(time.Millisecond)
+
+	evidence, fresh := codexNudgeRolloutEvidence(ahead, reported, now)
+
+	if !fresh {
+		t.Fatalf("a report newer than the CORRECTED held value must read as fresh; evidence=%s", evidence)
+	}
+	if !evidence.Equal(reported) {
+		t.Fatalf("evidence = %s, want the report %s", evidence, reported)
+	}
+	// With nothing reported, the corrected held value stands and is usable.
+	held, fresh := codexNudgeRolloutEvidence(ahead, time.Time{}, now)
+	if fresh {
+		t.Fatal("a held value is not a fresh report")
+	}
+	if held.After(now) {
+		t.Fatalf("held evidence %s is still ahead of now %s", held, now)
+	}
+}
+
+// Prior finding 1's remaining gap: the evidence must be written by the SAME
+// transaction that advances the cursor over the rollout. Here the reconcile
+// commits and then EVERY later write fails — a refused nudge write, or the process
+// exiting between the two transactions — and the run must still converge, because
+// the reconcile itself already recorded that something owes attention.
+func TestCodexPostUpdate_EvidenceIsAtomicWithTheCursorThatConsumesIt(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	rollout := now.Truncate(time.Millisecond)
+	writeCodexRunRollout(t, f.home, "own-shell-unreadable", now.Add(-5*time.Minute), time.Time{}, rollout, false, nil)
+
+	// The reconcile runs and commits. Its own write must carry the evidence.
+	first := codexReconcileForGather(context.Background(), f.home, f.fp, now, false)
+	if got := f.snapshot(t).PendingRolloutMtimeMs; got != rollout.UnixMilli() {
+		t.Fatalf("the reconcile must record the evidence in its OWN write, got %d want %d",
+			got, rollout.UnixMilli())
+	}
+
+	// Everything after it fails, which stands in for the process exiting between
+	// the two transactions.
+	original := codexCommitRateLimitSnapshot
+	codexCommitRateLimitSnapshot = func(string, []byte, time.Time) bool { return false }
+	nudgeCodexUsageRefresh(f.home, f.fp, now, first.newestRollout, first.latestObservation)
+	codexCommitRateLimitSnapshot = original
+	if got := f.snapshot(t).PendingRolloutMtimeMs; got != rollout.UnixMilli() {
+		t.Fatalf("the evidence must survive a nudge whose writes all failed, got %d", got)
+	}
+
+	// Restart, then a later gather: the file is unchanged and consumed, so the
+	// reconcile reports nothing. Only the persisted evidence remains.
+	simulateCodexAgentRestart(t)
+	later := now.Add(2 * codexForcedReconcileMinInterval)
+	second := codexReconcileForGather(context.Background(), f.home, f.fp, later, false)
+	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.newestRollout, second.latestObservation) {
+		t.Fatal("the run lost its trigger: the later gather nudged nothing")
+	}
+	drainCodexRunDebtLadder(t)
+
+	if *calls == 0 {
+		t.Fatal("the fallback never ran, so the card would stay stale in silence")
+	}
+	if got := codexObservedAt(t, f); !got.After(observed) {
+		t.Fatalf("observedAt %s did not advance past the pre-run reading %s", got, observed)
+	}
 }

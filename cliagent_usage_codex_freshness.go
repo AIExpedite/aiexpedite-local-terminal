@@ -1251,6 +1251,14 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 			break
 		}
 	}
+	// Deferred rollout evidence is CLAMPED rather than dropped: unlike the marker,
+	// the file it names really was written, so the trigger is still worth keeping —
+	// only its timestamp is untrustworthy. Left ahead of the clock it would shadow
+	// every later report and never settle. `now` is the one reading we trust, and
+	// codexOweRunRefresh clamps the floor it derives the same way.
+	if snap.PendingRolloutMtimeMs > localCeilingMs {
+		snap.PendingRolloutMtimeMs, rebased = codexPendingRolloutCeiling(now).UnixMilli(), true
+	}
 	return rebased
 }
 
@@ -1269,6 +1277,10 @@ func codexRunFreshnessInFuture(view codexCacheView, now time.Time) bool {
 	for _, ms := range []int64{
 		view.runFloorMs, view.activeRunFloorMs, view.runFloorPaidMs, view.refreshOwedAtMs,
 		view.staleNoticeFloorMs, view.staleNoticeAtMs,
+		// Deferred rollout evidence is a filesystem mtime, but once it is ahead of
+		// the clock it behaves exactly like a future-dated floor: it shadows every
+		// later report and can never settle. It needs the same repair.
+		view.pendingRolloutMs,
 	} {
 		if ms > localCeilingMs {
 			return true
