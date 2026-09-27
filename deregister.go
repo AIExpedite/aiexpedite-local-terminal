@@ -315,6 +315,10 @@ type onlineResponse struct {
 	FencedSessionIDs []string `json:"fencedSessionIds"`
 
 	sentReaped []string
+	// readable: the 200's body was read and parsed completely. Only then is
+	// its fence list known to be complete; an unreadable answer (truncated,
+	// timed out, malformed) still counts as "online" but applies nothing.
+	readable bool
 }
 
 // onOnlineAccepted applies an accepted (2xx) /online: the reaped sessions it
@@ -324,6 +328,14 @@ var onOnlineAccepted = func(resp *onlineResponse) { applyOnlineAccepted(globalSp
 
 func applyOnlineAccepted(l *spawnLedger, resp *onlineResponse) {
 	if resp == nil {
+		return
+	}
+	if !resp.readable {
+		// The fence list may be incomplete: never let session commands run
+		// on it, and keep the reaped report for the next /online (the server
+		// treats a repeat as idempotent). ensureFenceReport retries.
+		fmt.Printf("%s[online] /online answered 200 with an unreadable body — fence report not applied; will retry%s\n",
+			colorYellow, colorReset)
 		return
 	}
 	l.AckReaped(resp.sentReaped)
@@ -440,12 +452,16 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, path 
 		return nil, nil
 	}
 	out := &onlineResponse{sentReaped: sentReaped}
-	// The answer is advisory beyond the 200 itself: an unreadable body still
-	// means the report was accepted, it just names no fenced session.
-	if raw, err := io.ReadAll(io.LimitReader(resp.Body, maxOnlineResponseBody)); err == nil && len(raw) > 0 {
+	// The 200 itself means "online". The fence list counts only when the
+	// whole body was read and parsed: a truncated, timed-out, oversized or
+	// malformed answer may be missing a fenced session, so it applies
+	// nothing (applyOnlineAccepted) and the fence report is retried.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxOnlineResponseBody+1))
+	if err == nil && len(raw) > 0 && len(raw) <= maxOnlineResponseBody {
 		var parsed onlineResponse
 		if json.Unmarshal(raw, &parsed) == nil {
 			out.FencedSessionIDs = parsed.FencedSessionIDs
+			out.readable = true
 		}
 	}
 	return out, nil

@@ -548,10 +548,10 @@ func TestEnsureFenceReportRetriesUntilAccepted(t *testing.T) {
 		t.Fatalf("fence report never retried to acceptance (calls = %d)", calls.Load())
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for fenceReportRetrying.Load() && time.Now().Before(deadline) {
+	for fenceWorkerRunning() && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if fenceReportRetrying.Load() {
+	if fenceWorkerRunning() {
 		t.Fatalf("retry loop did not stop once applied")
 	}
 	if n := calls.Load(); n != 3 {
@@ -588,5 +588,73 @@ func TestReconnectResetsTheFenceReport(t *testing.T) {
 	}
 	if holdForFenceReport(context.Background(), nil, commandMsg{Type: "session_signal", SessionID: "s"}, 10*time.Millisecond) {
 		t.Fatalf("a signal (cancel) must never wait")
+	}
+}
+
+// TestUnreadableOnlineAnswerAppliesNoFences: a 200 whose body cannot be read
+// or parsed completely may be missing a fenced session, so it neither applies
+// the fence report nor acks the reaped sessions it carried.
+func TestUnreadableOnlineAnswerAppliesNoFences(t *testing.T) {
+	for _, body := range []string{"", `{"fencedSessionIds":["s-1"`, "<html>proxy</html>"} {
+		resetConnectivityState(t)
+		resetFencedSessions(t)
+		resetFenceReportForTest(t)
+		dir := t.TempDir()
+		writeLedgerFixture(t, dir, ledgerFileData{BootID: "boot-u", Entries: []*ledgerEntry{
+			{SessionID: "s-gone", BootID: "boot-u", State: ledgerStateReaped, PIDs: []ledgerProcess{}},
+		}})
+		l := newTestLedger(t, dir, "boot-v")
+		l.RunBootReap()
+		prevReport, prevAccepted := bootReportForOnline, onOnlineAccepted
+		bootReportForOnline = func(ctx context.Context) bootReport { return l.Report(ctx) }
+		onOnlineAccepted = func(resp *onlineResponse) { applyOnlineAccepted(l, resp) }
+
+		c := &onlineCapture{}
+		srv := c.server(t, func(int) int { return http.StatusOK }, body)
+		t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+		err := notifyOnline(context.Background(), &Config{AgentID: "agent-u", CommandSecret: "secret-u"})
+		srv.Close()
+		bootReportForOnline, onOnlineAccepted = prevReport, prevAccepted
+		if err != nil {
+			t.Fatalf("body %q: a 200 is still online: %v", body, err)
+		}
+		if fenceReportApplied() {
+			t.Fatalf("body %q: an unreadable answer applied the fence report", body)
+		}
+		if got := l.Report(context.Background()).SessionsReaped; !reflect.DeepEqual(got, []string{"s-gone"}) {
+			t.Fatalf("body %q: an unreadable answer acked the reaped sessions: %v", body, got)
+		}
+	}
+}
+
+// TestFenceWorkerHandsOffAcrossReconnects: a reset racing a worker that is
+// just stopping never leaves the new connection without a worker.
+func TestFenceWorkerHandsOffAcrossReconnects(t *testing.T) {
+	resetConnectivityState(t)
+	resetFenceReportForTest(t)
+	prevDelays, prevSend := fenceReportRetryDelays, sendOnlineForFenceReport
+	fenceReportRetryDelays = []time.Duration{time.Millisecond}
+	sendOnlineForFenceReport = func(context.Context, *Config) error {
+		markFenceReportApplied()
+		return nil
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for fenceWorkerRunning() && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		fenceReportRetryDelays, sendOnlineForFenceReport = prevDelays, prevSend
+	})
+	cfg := &Config{AgentID: "a", CommandSecret: "s"}
+	for i := 0; i < 200; i++ {
+		resetFenceReport()
+		ensureFenceReport(cfg)
+		deadline := time.Now().Add(2 * time.Second)
+		for !fenceReportApplied() {
+			if time.Now().After(deadline) {
+				t.Fatalf("iteration %d: the new connection was left without a fence worker", i)
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
 	}
 }

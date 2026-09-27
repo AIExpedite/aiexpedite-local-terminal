@@ -231,8 +231,22 @@ func holdForFenceReport(ctx context.Context, m *pubsub.Message, cmd commandMsg, 
 	return true
 }
 
-// fenceReportRetrying is the single-flight guard of ensureFenceReport.
-var fenceReportRetrying atomic.Bool
+// fenceWorker is the single-flight state of ensureFenceReport. A worker
+// decides to stop and clears running in ONE critical section, so a
+// resetFenceReport + ensureFenceReport racing a stopping worker either finds
+// it still running (it then sees the reset and keeps going) or finds it gone
+// and starts a new one — a new connection is never left without a worker.
+var fenceWorker struct {
+	sync.Mutex
+	running bool
+}
+
+// fenceWorkerRunning reports whether an ensureFenceReport worker is active.
+func fenceWorkerRunning() bool {
+	fenceWorker.Lock()
+	defer fenceWorker.Unlock()
+	return fenceWorker.running
+}
 
 // sendOnlineForFenceReport is the /online behind a seam for tests.
 var sendOnlineForFenceReport = func(ctx context.Context, cfg *Config) error { return notifyOnline(ctx, cfg) }
@@ -248,14 +262,37 @@ var fenceReportRetryDelays = []time.Duration{5 * time.Second, 15 * time.Second, 
 // reconciliation while an update attempt is pending (that path reports the
 // version-aware /online, which applies the fences too).
 func ensureFenceReport(cfg *Config) {
-	if cfg == nil || !fenceReportRetrying.CompareAndSwap(false, true) {
+	if cfg == nil {
 		return
 	}
+	registered := false
+	cfg.WithPersistenceLock(func() { registered = cfg.IsRegistered() && !cfg.OfflineMode })
+	if !registered {
+		return // nothing to report as; a registration starts a new connection
+	}
+	fenceWorker.Lock()
+	if fenceWorker.running {
+		fenceWorker.Unlock()
+		return
+	}
+	fenceWorker.running = true
+	fenceWorker.Unlock()
+
 	// Read the seams once, here, so the loop never races a test restoring them.
 	delays := append([]time.Duration(nil), fenceReportRetryDelays...)
 	send := sendOnlineForFenceReport
+	// stopIf ends the worker when stop() holds, deciding and releasing the
+	// single-flight slot atomically.
+	stopIf := func(stop func() bool) bool {
+		fenceWorker.Lock()
+		defer fenceWorker.Unlock()
+		if stop() {
+			fenceWorker.running = false
+			return true
+		}
+		return false
+	}
 	go func() {
-		defer fenceReportRetrying.Store(false)
 		for attempt := 0; ; attempt++ {
 			delay := delays[len(delays)-1]
 			if attempt < len(delays) {
@@ -263,27 +300,24 @@ func ensureFenceReport(cfg *Config) {
 			}
 			select {
 			case <-shutdownChan:
+				stopIf(func() bool { return true })
 				return
 			case <-time.After(delay):
-			}
-			if fenceReportApplied() || IsShutdownInProgress() || IsOffline() {
-				return
 			}
 			registered, pendingUpdate := false, false
 			cfg.WithPersistenceLock(func() {
 				registered = cfg.IsRegistered() && !cfg.OfflineMode
 				pendingUpdate = cfg.PendingUpdateAttemptID != ""
 			})
-			if !registered {
+			if stopIf(func() bool {
+				return fenceReportApplied() || IsShutdownInProgress() || IsOffline() || !registered
+			}) {
 				return
 			}
 			if !pendingUpdate {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_ = send(ctx, cfg)
 				cancel()
-				if fenceReportApplied() {
-					return
-				}
 			}
 		}
 	}()
