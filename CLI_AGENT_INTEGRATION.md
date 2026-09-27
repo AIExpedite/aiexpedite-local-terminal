@@ -1518,7 +1518,12 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   closes after the write (`shouldCloseStdinAfterStart` → `hasPrompt`,
   `deferredStdinClose`). A **promptless** chat-direct start keeps that pipe open
   for the first `SendInput`, so the two mechanisms stay distinct and are tested
-  separately. This deleted the old 24 KiB pre-spawn argv-ceiling refusal
+  separately. Moving the prompt off argv put OpenCode into the deferred-stdin flow
+  codex already used, and membership there is **derived** from the CLI's stdin
+  envelope (`isOneShotStdinPromptFormat` over `stdinPromptFormat`), never from a
+  per-command test: `closeDeferredStdinLocked` is deliberately NOT gated on the
+  command, because gating it on codex would hang every promptless OpenCode session
+  on a pipe nothing closes — and that hang reads as a slow model, not a bug. This deleted the old 24 KiB pre-spawn argv-ceiling refusal
   (`openCodeInteractiveMaxPromptBytes`) — dead once the prompt left argv.
 - **Diagnostic invocations** (`--version`, `--help`, `models`, `auth …`) pass
   through **verbatim**. Reshaping one into a `run` would spend a turn nobody

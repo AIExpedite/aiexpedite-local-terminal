@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -65,6 +66,20 @@ type openCodeSessionRun struct {
 	err     error
 }
 
+// openCodeSessionEndedSignal returns a channel closed on the session's
+// `session_ended` frame, and the publishFn that closes it. A one-shot close
+// guarded by a flag, because SessionManager may publish more than one terminal
+// frame and closing a closed channel panics.
+func openCodeSessionEndedSignal() (<-chan struct{}, PublishFunc) {
+	ended := make(chan struct{})
+	var once sync.Once
+	return ended, func(res resultMsg) {
+		if res.Type == "session_ended" {
+			once.Do(func() { close(ended) })
+		}
+	}
+}
+
 func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
 	t.Helper()
 	installOpenCodeStub(t)
@@ -80,14 +95,7 @@ func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
 
 	sm := NewSessionManager(nil)
 	id := fmt.Sprintf("opencode-legacy-smoke-%d", time.Now().UnixNano())
-	ended := make(chan struct{})
-	var once bool
-	publishFn := func(res resultMsg) {
-		if res.Type == "session_ended" && !once {
-			once = true
-			close(ended)
-		}
-	}
+	ended, publishFn := openCodeSessionEndedSignal()
 
 	run := openCodeSessionRun{}
 	run.err = sm.StartSession(id, cmd.Command, sessionStartArgsForCommand(cmd),
@@ -278,5 +286,82 @@ func TestOpenCodeLegacySmoke_PromptPastTheOldArgvCeilingIsAccepted(t *testing.T)
 	}
 	if run.stdin != strings.TrimSpace(long) {
 		t.Fatalf("the long prompt did not arrive intact on stdin (%d bytes delivered)", len(run.stdin))
+	}
+}
+
+/* --------------------------------------------------------------------------
+   The promptless start on the same transport
+   --------------------------------------------------------------------------
+   Moving the prompt off argv put OpenCode into codex's deferred-stdin flow: a
+   session opened with NO prompt keeps its pipe open for the first SendInput,
+   which then closes it. `opencode run` reads stdin to EOF before running the
+   turn, so if that close is ever gated on codex — the command the mechanism's
+   comments used to name exclusively — every promptless OpenCode session hangs on
+   a pipe nothing closes, and the hang looks like a slow model rather than a bug.
+   The stub reads stdin to EOF too, so its EXIT is the proof.
+   ------------------------------------------------------------------------ */
+
+func TestOpenCodeSession_PromptlessStartClosesStdinOnTheFirstSendInput(t *testing.T) {
+	installOpenCodeStub(t)
+
+	dir := t.TempDir()
+	stdinLog := filepath.Join(dir, "stdin.log")
+	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
+	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"session.completed"}`)
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("opencode-promptless-%d", time.Now().UnixNano())
+	ended, publishFn := openCodeSessionEndedSignal()
+
+	// No prompt: only a flag. This is the shape the chat-direct flow opens on
+	// model selection, before the user has said anything.
+	if err := sm.StartSession(id, "opencode", []string{"--model", openCodeTestModel},
+		t.TempDir(), "ws", "uid", 30000, false, publishFn); err != nil {
+		t.Fatalf("promptless start failed: %v", err)
+	}
+
+	session := sm.sessions[id]
+	if session == nil {
+		t.Fatal("session was not registered")
+	}
+	session.mu.Lock()
+	deferred := session.deferredStdinClose
+	session.mu.Unlock()
+	if !deferred {
+		t.Fatal("a promptless opencode start must defer its stdin close, not close at start")
+	}
+
+	// The child must still be waiting: nothing has been delivered yet.
+	select {
+	case <-ended:
+		t.Fatal("the session ended before any prompt was sent — stdin was closed at start")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := sm.SendInput(id, "implement the feature"); err != nil {
+		t.Fatalf("SendInput failed: %v", err)
+	}
+
+	// Only reachable if SendInput closed the pipe: the stub reads stdin to EOF.
+	select {
+	case <-ended:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the session never ended — the first SendInput did not close stdin")
+	}
+
+	delivered, err := os.ReadFile(stdinLog)
+	if err != nil {
+		t.Fatalf("the prompt never reached the child: %v", err)
+	}
+	if got := strings.TrimSpace(string(delivered)); got != "implement the feature" {
+		t.Fatalf("child stdin = %q, want the SendInput prompt", got)
+	}
+
+	// A second SendInput must not double-close the already-closed pipe.
+	session.mu.Lock()
+	stillDeferred := session.deferredStdinClose
+	session.mu.Unlock()
+	if stillDeferred {
+		t.Error("deferredStdinClose was not cleared, so a second SendInput would double-close")
 	}
 }

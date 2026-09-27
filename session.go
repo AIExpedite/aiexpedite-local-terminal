@@ -140,13 +140,20 @@ type CLISession struct {
 	// there is nothing left to keep attributed.
 	finishGrokBillingAttribution func()
 
-	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
+	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex, opencode) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
 	// open at start (see shouldCloseStdinAfterStart) and closed by SendInput
 	// immediately after the first prompt is written, giving the child its
-	// prompt + EOF in the order codex exec requires. Reset to false once the
-	// pipe is closed so a second SendInput doesn't double-close.
+	// prompt + EOF in the order `codex exec` and `opencode run` both require.
+	// Reset to false once the pipe is closed so a second SendInput doesn't
+	// double-close.
+	//
+	// Membership is DERIVED from the CLI's stdin envelope
+	// (isOneShotStdinPromptFormat over stdinPromptFormat), never from a
+	// per-command test: OpenCode joined this flow the moment its prompt left
+	// argv, and a hand-listed set would have left its promptless sessions
+	// hanging on a pipe nothing ever closes.
 	deferredStdinClose bool
 
 	// turnSettled is true only while the LAST stream line this session produced
@@ -1003,10 +1010,12 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 	}
 }
 
-// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex)
-// started WITHOUT a prompt held open for its first message. codex exec reads
-// stdin to EOF before running the turn, so the pipe must close once that
-// prompt is written — otherwise the child waits forever for EOF. Called by
+// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex or
+// opencode) started WITHOUT a prompt held open for its first message. Both
+// `codex exec` and `opencode run` read stdin to EOF before running the turn, so
+// the pipe must close once that prompt is written — otherwise the child waits
+// forever for EOF. Deliberately NOT gated on the command: gating it on codex
+// would hang every promptless OpenCode session. Called by
 // SendInput for a write that completed in time, and by
 // armCodexUsageRunOnLateWrite for one SendInput abandoned and the writer then
 // delivered. deferredStdinClose is cleared here, so those two never
@@ -1128,9 +1137,10 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		session.armCodexUsageRun(time.Now())
 	}
 
-	// One-shot, stdin-fed CLIs (codex) started without a prompt held their
-	// stdin open waiting for this first message; close it now that the prompt
-	// is written.
+	// One-shot, stdin-fed CLIs (codex, opencode) started without a prompt held
+	// their stdin open waiting for this first message; close it now that the
+	// prompt is written. Unconditional by design — see
+	// closeDeferredStdinLocked.
 	session.closeDeferredStdinLocked()
 
 	// Reset status from waiting_input back to running
