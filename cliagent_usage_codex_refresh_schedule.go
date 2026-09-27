@@ -405,15 +405,31 @@ func codexPendingRolloutCeiling(now time.Time) time.Time {
 // A zero report is the ordinary case once the scan cursor has consumed the file,
 // so it must not erase what is held: that held value IS the evidence.
 //
-// A report dated in the FUTURE is CLAMPED to `now` rather than held as-is. A
-// filesystem timestamp ahead of the clock (a correction, or restored file
-// metadata) is untrustworthy about when, but the file's existence still proves a
-// run happened — and holding the raw future value would be worse than useless:
-// `settled` can never become true for it, and because the held value is the
-// newest of the two it would shadow every later valid report for as long as the
-// clock took to catch up. Clamping keeps the trigger and cannot shadow anything,
-// since every held value is then at or before `now`. codexOweRunRefresh clamps
-// the floor it derives the same way.
+// A report dated past `now` is CLAMPED rather than held as-is, but the clamp is
+// TWO-TIER, because sitting ahead of `now` is not on its own evidence of a bad
+// clock. A gather captures `now` before its budgets and the cache lock wait
+// (cliagent_usage.go), so an external run that appends its rollout while the pass
+// is still running legitimately stat-s a few seconds ahead of it — the same
+// in-flight window codexRunFloorLocalSkew exists for, and the same tolerance
+// codexRebaseFutureRunFreshness already applies to the STORED value.
+//
+//   - Within codexRunFloorLocalSkew of `now`: a CONTEMPORARY write. It is ordered
+//     to `now`, never backdated. Backdating it by codexForcedReconcileMinInterval
+//     could place it before an OLDER cached observation; `behind` would then read
+//     false and the nudge would release the persisted evidence for a
+//     telemetry-free turn the raw mtime proves is newer, so that run would create
+//     no debt and never reach the live fallback. Ordering at `now` shadows
+//     nothing; it is merely not `settled` for one
+//     codexForcedReconcileMinInterval, which is true of any just-written rollout.
+//   - Beyond it: a clock anomaly (a correction, or restored file metadata). The
+//     timestamp is untrustworthy about WHEN, but the file's existence still proves
+//     a run happened, and holding the raw value would be worse than useless:
+//     `settled` can never become true for it, and because the held value is the
+//     newest of the two it would shadow every later valid report for as long as
+//     the clock took to catch up. It takes the ceiling instead, so recovery can
+//     happen on the very next nudge. codexOweRunRefresh clamps the floor it
+//     derives the same way.
+//
 // Both sides are compared at MILLISECOND resolution, the resolution the field is
 // stored at. A filesystem mtime carries nanoseconds, so comparing raw values made
 // every re-report of the SAME unchanged file look fresh — and each of those would
@@ -424,21 +440,31 @@ func codexPendingRolloutCeiling(now time.Time) time.Time {
 // shadow a report that does.
 func codexNudgeRolloutEvidence(view codexCacheView, reported time.Time, reportedEntry string, heldCovered bool, now time.Time) (evidence time.Time, entry string, fresh bool) {
 	ceiling := codexPendingRolloutCeiling(now)
-	if reported.After(ceiling) && reported.After(now) {
+	switch {
+	case reported.After(now.Add(codexRunFloorLocalSkew)):
 		reported = ceiling
+	case reported.After(now):
+		// Contemporary: written after the gather read `now`, before the scan
+		// stat-ed it. Ordered, never backdated.
+		reported = now
 	}
 	if !reported.IsZero() {
 		reported = time.UnixMilli(reported.UnixMilli())
 	}
 	if view.pendingRolloutMs > 0 && !heldCovered {
 		evidence, entry = time.UnixMilli(view.pendingRolloutMs), view.pendingRolloutEntry
-		// The STORED value is clamped too, not just the incoming report. Evidence
-		// recorded before a backwards clock step sits ahead of `now` through no
-		// fault of its own, and because the held value is the newest of the two it
-		// would then win against every later valid report while `settled` could
-		// never become true for it. codexRebaseFutureRunFreshness persists the
-		// correction; this makes the decision right even before that runs.
-		if evidence.After(now) {
+		// The STORED value gets the same two-tier treatment, not just the incoming
+		// report. Evidence recorded before a backwards clock step sits ahead of
+		// `now` through no fault of its own, and because the held value is the
+		// newest of the two it would then win against every later valid report
+		// while `settled` could never become true for it. Only a value past
+		// codexRunFloorLocalSkew is judged that way — the very ceiling
+		// codexRebaseFutureRunFreshness persists the correction against — so this
+		// makes the decision right even before that runs, and agrees with it. A
+		// stored value inside the skew was recorded as a contemporary write and
+		// stays put: re-dating it backwards is the shadowing this guards against,
+		// in reverse.
+		if evidence.After(now.Add(codexRunFloorLocalSkew)) {
 			evidence = ceiling
 		}
 	}

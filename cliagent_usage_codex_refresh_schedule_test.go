@@ -1571,3 +1571,82 @@ func TestNudgeCodexUsageRefresh_KeepsEvidenceReplacedAfterTheRead(t *testing.T) 
 			got.PendingRolloutMtimeMs, got.PendingRolloutEntry)
 	}
 }
+
+// Prior finding: being dated past `now` is not on its own evidence of a bad
+// clock. A gather reads `now` before its budgets and the cache lock wait, so an
+// external run that appends its rollout while the pass is still running stat-s a
+// few seconds ahead of it. Backdating that by codexForcedReconcileMinInterval
+// could order it BEFORE an older cached observation, at which point the nudge
+// reads `behind == false`, releases the persisted evidence, and the
+// telemetry-free turn never owes a debt or reaches the live fallback. A
+// contemporary write is therefore ordered to `now`; only a report past
+// codexRunFloorLocalSkew — the tolerance codexRebaseFutureRunFreshness already
+// applies to the stored value — is judged a clock anomaly and takes the ceiling.
+func TestCodexNudgeRolloutEvidence_ContemporaryWriteIsOrderedNotBackdated(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	// Older than the ceiling, so a backdated report would fall BEHIND it and the
+	// nudge would read the evidence as caught up.
+	observed := now.Add(-codexForcedReconcileMinInterval / 2)
+
+	for _, tc := range []struct {
+		name     string
+		reported time.Time
+		want     time.Time
+	}{
+		{"just ahead of the gather's now", now.Add(time.Second), now},
+		{"at the edge of the in-flight window", now.Add(codexRunFloorLocalSkew), now},
+		{"beyond it is a clock anomaly", now.Add(codexRunFloorLocalSkew + time.Second),
+			codexPendingRolloutCeiling(now)},
+		{"behind now is untouched", now.Add(-time.Minute), now.Add(-time.Minute)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence, _, fresh := codexNudgeRolloutEvidence(
+				codexCacheView{}, tc.reported, "rollout-a", false, now)
+			if !fresh {
+				t.Fatal("a non-zero report with nothing held is fresh evidence")
+			}
+			if !evidence.Equal(tc.want) {
+				t.Fatalf("evidence = %s, want %s (reported %s, now %s)",
+					evidence, tc.want, tc.reported, now)
+			}
+			// The whole point: a contemporary write must still read as behind the
+			// older cached observation, the way nudgeCodexUsageRefresh judges it.
+			behind := evidence.After(observed)
+			wantBehind := tc.reported.After(observed) && !tc.reported.After(now.Add(codexRunFloorLocalSkew))
+			if wantBehind && !behind {
+				t.Fatalf("evidence %s was backdated behind the cached observation %s; the run owes no debt",
+					evidence, observed)
+			}
+			if evidence.After(now) {
+				t.Fatalf("evidence %s is ahead of now %s and can never settle", evidence, now)
+			}
+		})
+	}
+}
+
+// The STORED value takes the same two ceilings, so evidence recorded as a
+// contemporary write by an earlier pass is not re-dated backwards on every later
+// read — the same shadowing, in reverse.
+func TestCodexNudgeRolloutEvidence_HeldContemporaryValueIsNotBackdated(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	held := now.Add(time.Second)
+
+	evidence, _, fresh := codexNudgeRolloutEvidence(
+		codexCacheView{pendingRolloutMs: held.UnixMilli(), pendingRolloutEntry: "rollout-a"},
+		time.Time{}, "", false, now)
+
+	if fresh {
+		t.Fatal("a held value is not a fresh report")
+	}
+	if !evidence.Equal(held) {
+		t.Fatalf("held evidence = %s, want it left at %s", evidence, held)
+	}
+	// Past the skew it is a rollback again, and takes the ceiling.
+	rolled := now.Add(codexRunFloorLocalSkew + time.Minute)
+	evidence, _, _ = codexNudgeRolloutEvidence(
+		codexCacheView{pendingRolloutMs: rolled.UnixMilli(), pendingRolloutEntry: "rollout-a"},
+		time.Time{}, "", false, now)
+	if !evidence.Equal(codexPendingRolloutCeiling(now)) {
+		t.Fatalf("a future held value = %s, want the ceiling %s", evidence, codexPendingRolloutCeiling(now))
+	}
+}
