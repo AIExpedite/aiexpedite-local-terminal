@@ -124,7 +124,7 @@ func TestParseEnvSignInRequest(t *testing.T) {
 
 func TestSignInWindowCommandShapes(t *testing.T) {
 	cl := windowsSignInCommandLine(`C:\Windows\System32\cmd.exe`, `C:\Program Files\GitHub CLI\gh.exe`, []string{"auth", "login", "--web"}, "Sign in to GitHub")
-	want := `"C:\Windows\System32\cmd.exe" /d /c title Sign in to GitHub & "C:\Program Files\GitHub CLI\gh.exe" auth login --web & echo. & pause`
+	want := `"C:\Windows\System32\cmd.exe" /d /c title Sign in to GitHub & echo Sign in to GitHub & echo. & "C:\Program Files\GitHub CLI\gh.exe" auth login --web & echo. & pause`
 	if cl != want {
 		t.Fatalf("windows command line\n got %s\nwant %s", cl, want)
 	}
@@ -241,5 +241,79 @@ func TestEncodeRedactedJSON_StaysValid(t *testing.T) {
 	}
 	if strings.Contains(out, "hunter2") || strings.Contains(out, "token=abc") {
 		t.Fatalf("secret survived: %s", out)
+	}
+}
+
+// The catalog's own sign-in commands (db-content dev/cliAgents/*.json and
+// dev/setupTools/gh.json `signIn.argv`, 2026-09-26) open without the native
+// dialog; anything else — however close — still takes it every time.
+func TestBuiltinSignInAllowlist(t *testing.T) {
+	catalog := [][]string{
+		{"gh", "auth", "login", "--web", "--git-protocol", "https"},
+		{"claude", "auth", "login"},
+		{"codex", "login"},
+		{"grok", "login", "--oauth"},
+		{"opencode", "auth", "login"},
+		{"agy"},
+	}
+	cfg := &Config{EnableAllowList: true}
+	for _, argv := range catalog {
+		if !isBuiltinSignInArgv(argv) {
+			t.Errorf("%q should be a built-in sign-in", argv)
+		}
+		for _, risk := range []string{riskExternalWrite, riskReadOnly, ""} {
+			cmd := commandMsg{Command: envSignInCommand, Args: signInArgs(t, argv, "Sign in"), RiskLevel: risk}
+			if g := executeApprovalGate(cfg, &AllowList{}, cmd); g.Needed {
+				t.Errorf("%q (risk %q) must open without the dialog", argv, risk)
+			}
+		}
+		// A signed destructive risk is always honoured.
+		cmd := commandMsg{Command: envSignInCommand, Args: signInArgs(t, argv, "Sign in"), RiskLevel: riskDestructive}
+		if g := executeApprovalGate(cfg, &AllowList{}, cmd); !g.Needed {
+			t.Errorf("%q at destructive must still prompt", argv)
+		}
+	}
+	if len(builtinSignInArgvs) != len(catalog) {
+		t.Fatalf("builtinSignInArgvs has %d entries, the catalog %d", len(builtinSignInArgvs), len(catalog))
+	}
+
+	nearMisses := [][]string{
+		{"gh", "auth", "login"},
+		{"gh", "auth", "login", "--web"},
+		{"gh", "auth", "login", "--web", "--git-protocol", "ssh"},
+		{"gh", "auth", "login", "--web", "--git-protocol", "https", "--with-token"},
+		{"gh", "auth", "login", "--git-protocol", "https", "--web"},
+		{"GH", "auth", "login", "--web", "--git-protocol", "https"},
+		{"gh.exe", "auth", "login", "--web", "--git-protocol", "https"},
+		{`C:\Program Files\GitHub CLI\gh.exe`, "auth", "login", "--web", "--git-protocol", "https"},
+		{"/usr/bin/gh", "auth", "login", "--web", "--git-protocol", "https"},
+		{"claude", "auth", "Login"},
+		{"claude", "auth", "logout"},
+		{"claude", "auth", "login", "--dangerously-skip-permissions"},
+		{"claude"},
+		{"codex", "login", "--api-key", "sk-x"},
+		{"codex", "logout"},
+		{"grok", "login"},
+		{"grok", "login", "--OAUTH"},
+		{"opencode", "auth", "login", "extra"},
+		{"agy", "--version"},
+		{"npm", "uninstall", "-g", "codex"},
+	}
+	for _, argv := range nearMisses {
+		if isBuiltinSignInArgv(argv) {
+			t.Errorf("%q must not be a built-in sign-in", argv)
+		}
+		cmd := commandMsg{Command: envSignInCommand, Args: signInArgs(t, argv, "t"), RiskLevel: riskExternalWrite}
+		g := executeApprovalGate(cfg, &AllowList{}, cmd)
+		if _, err := parseEnvSignInRequest(cmd.Args); err == nil && !g.Needed {
+			t.Errorf("%q must take the dialog", argv)
+		}
+	}
+	// Allow All Commands changes nothing for a non-built-in sign-in.
+	allowAll := &Config{}
+	allowAll.SetAllowAllCommands(true)
+	cmd := commandMsg{Command: envSignInCommand, Args: signInArgs(t, []string{"gh", "auth", "login"}, "t")}
+	if g := executeApprovalGate(allowAll, nil, cmd); !g.Needed {
+		t.Error("a non-built-in sign-in must prompt even with Allow All Commands")
 	}
 }
