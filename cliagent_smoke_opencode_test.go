@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -120,19 +119,13 @@ func openCodeSuccessFrames(marker string) []byte {
 	return []byte(b.String())
 }
 
+// openCodeExitError is the shared killedChildError (cliagent_smoke_claudecode_test.go)
+// under a provider-local name, exactly as codexExitError is. It spawns no shell
+// of its own: a third hand-rolled copy of "manufacture an *exec.ExitError" is a
+// third thing to fix when the trick stops working on a platform.
 func openCodeExitError(t *testing.T) error {
 	t.Helper()
-	var err error
-	if runtime.GOOS == "windows" {
-		err = exec.Command("cmd", "/c", "exit 2").Run()
-	} else {
-		err = exec.Command("sh", "-c", "exit 2").Run()
-	}
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("could not manufacture an *exec.ExitError: %v", err)
-	}
-	return err
+	return killedChildError(t)
 }
 
 // stubOpenCodeReadiness pins the readiness pre-check so a case never spawns the
@@ -316,6 +309,74 @@ func TestOpenCodeSmokeNoEnvelopeDiagnostic_UsageBlockDoesNotForgeFramingRejected
 	// And a non-rejection stays no_envelope.
 	if got := openCodeSmokeNoEnvelopeDiagnostic([]byte("panic: nil map")); got != cliSmokeDiagnosticNoEnvelope {
 		t.Fatalf("a non-rejection = %q, want no_envelope", got)
+	}
+}
+
+// exec.ErrWaitDelay means "the child RAN and we stopped waiting for its I/O",
+// not "we could not start it". A lingering OpenCode TOOL GRANDCHILD holding the
+// captured pipe past WaitDelay is the realistic cause, and judging it a launch
+// failure would report a healthy install as provider_unavailable, throw away
+// stdout that holds the marker, and — because launch_error is never cached —
+// re-spend a turn on every smoke. That is the fused bucket this probe exists to
+// separate, reintroduced by the WaitDelay the deadline path needs.
+func TestClassifyOpenCodeSmokeRun_WaitDelayExpiryStillClassifiesTheOutput(t *testing.T) {
+	const marker = "AIEXPEDITE_OPENCODE_SMOKE_OK_0a1b2c3d"
+	for _, tc := range []struct {
+		name           string
+		stdout, stderr string
+		wantCategory   string
+		wantDiagnostic string
+		wantMatched    bool
+	}{
+		{
+			name:           "a complete marker echo is a success",
+			stdout:         string(openCodeSuccessFrames(marker)),
+			wantDiagnostic: cliSmokeDiagnosticNone,
+			wantMatched:    true,
+		},
+		{
+			name:           "a chatty reply is still a mismatch",
+			stdout:         `{"type":"text","text":"Sure!"}` + "\n" + `{"type":"session.completed"}`,
+			wantCategory:   cliUsageErrorParseFailed,
+			wantDiagnostic: cliSmokeDiagnosticMarkerMismatch,
+		},
+		{
+			// No terminal frame: the child ran and produced no envelope. It must
+			// NOT be read as a pre-inference flag rejection, because there was no
+			// non-zero exit reporting one — the stderr text is incidental.
+			name:           "no terminal frame is no_envelope, never a flag rejection",
+			stdout:         `{"type":"text","text":"partial"}`,
+			stderr:         "error: unknown option '--format'",
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoEnvelope,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			category, diagnostic, matched := classifyOpenCodeSmokeRun(
+				false, []byte(tc.stdout), []byte(tc.stderr), exec.ErrWaitDelay, marker)
+			if diagnostic == cliSmokeDiagnosticLaunchError {
+				t.Fatalf("a WaitDelay expiry was judged a launch failure (%q)", category)
+			}
+			if category != tc.wantCategory || diagnostic != tc.wantDiagnostic || matched != tc.wantMatched {
+				t.Fatalf("got (%q, %q, %v), want (%q, %q, %v)", category, diagnostic, matched,
+					tc.wantCategory, tc.wantDiagnostic, tc.wantMatched)
+			}
+		})
+	}
+
+	// A WRAPPED ErrWaitDelay (os/exec may return it joined with other context)
+	// must be recognised too, so the check cannot be defeated by wrapping.
+	category, diagnostic, matched := classifyOpenCodeSmokeRun(false,
+		openCodeSuccessFrames(marker), nil, fmt.Errorf("waiting on opencode: %w", exec.ErrWaitDelay), marker)
+	if category != "" || diagnostic != cliSmokeDiagnosticNone || !matched {
+		t.Fatalf("a wrapped ErrWaitDelay: got (%q, %q, %v), want a clean success",
+			category, diagnostic, matched)
+	}
+
+	// And the deadline still outranks it: a killed run says nothing about output.
+	if _, diagnostic, _ := classifyOpenCodeSmokeRun(true,
+		openCodeSuccessFrames(marker), nil, exec.ErrWaitDelay, marker); diagnostic != cliSmokeDiagnosticTimeout {
+		t.Fatalf("a timed-out run reporting ErrWaitDelay = %q, want timeout", diagnostic)
 	}
 }
 
@@ -668,37 +729,50 @@ func TestPruneOpenCodeSmokeScratch_IsBounded(t *testing.T) {
 	}
 }
 
-func TestRunOpenCodeSmoke_SweepsOrphansAndLeavesNoScratchBehind(t *testing.T) {
+func TestRunOpenCodeSmoke_LeavesNoScratchBehind(t *testing.T) {
+	// Every run removes its own per-run cwd and staged prompt on every path, so
+	// the scratch tree does not grow with use. (Reclaiming an ORPHAN left by a
+	// KILLED agent is the background sweep's job and is covered directly against
+	// pruneOpenCodeSmokeScratch — asserting it through here would race the
+	// goroutine and the once-per-process gate.)
 	openCodeSmokeEnv(t)
 	path := stubOpenCodeBinary(t)
 	stubOpenCodeReadiness(t, "", false)
-
-	// An orphan from a previous, killed run.
-	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
-	if scratch == "" {
-		t.Skip("no resolvable home directory for the scratch root")
-	}
-	orphan := filepath.Join(scratch, "cwd-from-a-killed-run")
-	if err := os.MkdirAll(orphan, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	stamp := time.Now().Add(-openCodeSmokeScratchMaxAge - time.Hour)
-	if err := os.Chtimes(orphan, stamp, stamp); err != nil {
-		t.Fatal(err)
-	}
-
 	stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
 		return openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)), nil, nil
 	})
 	if result := runOpenCodeSmoke(context.Background(), path, "0.9.1"); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("expected success, got %+v", result)
 	}
+	assertNoOpenCodeSmokeScratchLeaks(t)
+}
 
-	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
-		t.Errorf("the orphan from a killed run was not reclaimed (err=%v)", err)
+// A symlink (or Windows junction) named like a run directory must be LEFT ALONE,
+// never descended into: this repo has lost entire sibling checkouts to a
+// recursive delete that followed a junction.
+func TestPruneOpenCodeSmokeScratch_NeverFollowsASymlink(t *testing.T) {
+	scratch := t.TempDir()
+	// The target holds a sentinel whose survival is the actual assertion.
+	target := t.TempDir()
+	sentinel := filepath.Join(target, "precious.txt")
+	if err := os.WriteFile(sentinel, []byte("do not delete"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	// And this run cleaned up after itself, so the count does not grow.
-	if entries, err := os.ReadDir(scratch); err == nil && len(entries) != 0 {
-		t.Errorf("the smoke left %d scratch entries behind", len(entries))
+	link := filepath.Join(scratch, "cwd-looks-like-a-run-dir")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create a symlink on this platform/filesystem: %v", err)
+	}
+	old := time.Now().Add(-openCodeSmokeScratchMaxAge - time.Hour)
+	// Backdate the LINK itself (lchown-style times); best-effort, since the point
+	// is that age never even gets consulted for a reparse point.
+	_ = os.Chtimes(link, old, old)
+
+	pruneOpenCodeSmokeScratch(scratch, time.Now())
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("the sweep followed the symlink and touched its target: %v", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("the link itself was removed; a reparse point must be left alone: %v", err)
 	}
 }

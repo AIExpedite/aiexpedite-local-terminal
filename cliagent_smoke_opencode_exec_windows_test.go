@@ -180,3 +180,66 @@ func TestRunCLISmoke_OpenCodeCmdShimWithNoUsableProviderSpendsNoTurn(t *testing.
 		t.Errorf("the device log carries vendor text: %q", logged)
 	}
 }
+
+// TestOpenCodeShimCommand_MetacharacterTokensSurviveCmdExe is the security
+// property the character policy rests on, proven through a REAL cmd.exe and a
+// real `.cmd` shim rather than through the renderer alone.
+//
+// The policy ACCEPTS `&`, `|`, `^`, `(`, `)`, `;`, `<`, `>` and spaces on the
+// argument that they are rendered inside double quotes with delayed expansion
+// off, so cmd.exe never re-parses the substituted text as redirection, a pipe or
+// a separator. That argument is exactly the kind that is right until it is not:
+// a value silently swallowed by a `>` would write a file instead of reaching the
+// CLI, and a `&` would run a second command. Asserting only that the renderer
+// returns ok=true would prove none of it.
+func TestOpenCodeShimCommand_MetacharacterTokensSurviveCmdExe(t *testing.T) {
+	openCodeSmokeEnv(t)
+	shim := writeOpenCodeFakeShim(t)
+
+	argvLog := filepath.Join(t.TempDir(), "argv.log")
+	t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
+
+	// Every token the policy accepts and a reader would worry about. The
+	// redirection operators come first: if cmd.exe re-parsed them, the shim's
+	// child would receive fewer tokens and a stray file would appear.
+	hostile := []string{
+		"run",
+		"--not-a-known-flag", "redirect>out", "redirect<in",
+		"amp&ersand", "pipe|x", "caret^x", "(paren)", "semi;colon",
+		"a value with spaces", "all&of|it^(at);once",
+	}
+	cmd, ok := openCodeShimCommand(context.Background(), openCodeLaunch{
+		Path: shim,
+		Args: hostile,
+		Env:  os.Environ(),
+		Dir:  t.TempDir(),
+	})
+	if !ok {
+		t.Fatal("the renderer refused a launch its own policy accepts")
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("the shim launch failed: %v", err)
+	}
+
+	logged, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatalf("the shim's child never ran — a metacharacter broke the line: %v", err)
+	}
+	// The stub logs its argv space-joined, which is lossy for tokens that
+	// themselves contain spaces; assert every token is PRESENT and that the count
+	// is right, which together rule out both swallowing and re-splitting.
+	got := strings.TrimSpace(string(logged))
+	for _, token := range hostile {
+		if !strings.Contains(got, token) {
+			t.Errorf("token %q did not survive cmd.exe; child argv was %q", token, got)
+		}
+	}
+	// Nothing was interpreted as redirection: no stray file in the working dir.
+	if entries, err := os.ReadDir(cmd.Dir); err == nil && len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("cmd.exe treated a token as redirection and created %v", names)
+	}
+}

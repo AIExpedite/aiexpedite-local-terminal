@@ -22,16 +22,22 @@ import (
 
 const openCodeTestShimPath = `C:\Users\some one\AppData\Roaming\npm & co\opencode.cmd`
 
-// openCodeShimArgEnv reads back the environment slot a token was carried in.
-func openCodeShimArgEnv(t *testing.T, env []string, i int) (string, bool) {
-	t.Helper()
-	prefix := fmt.Sprintf(openCodeShimArgEnvFmt, i) + "="
+// openCodeShimEnvValue reads back the value a launch carried in one environment
+// slot — the shim path or an indexed argv token.
+func openCodeShimEnvValue(env []string, key string) (string, bool) {
+	prefix := key + "="
 	for _, e := range env {
 		if strings.HasPrefix(e, prefix) {
 			return strings.TrimPrefix(e, prefix), true
 		}
 	}
 	return "", false
+}
+
+// openCodeShimArgEnv reads back the environment slot token i was carried in.
+func openCodeShimArgEnv(t *testing.T, env []string, i int) (string, bool) {
+	t.Helper()
+	return openCodeShimEnvValue(env, fmt.Sprintf(openCodeShimArgEnvFmt, i))
 }
 
 func TestOpenCodeShimCommand_CarriesEveryTokenInTheEnvironmentAndHidesTheWindow(t *testing.T) {
@@ -94,7 +100,7 @@ func TestOpenCodeShimCommand_CarriesEveryTokenInTheEnvironmentAndHidesTheWindow(
 				}
 			}
 			// A binary path with spaces AND `&` survives as data.
-			if got, _ := openCodeShimPathEnvValue(cmd.Env); got != openCodeTestShimPath {
+			if got, _ := openCodeShimEnvValue(cmd.Env, openCodeShimPathEnv); got != openCodeTestShimPath {
 				t.Fatalf("shim path round-tripped as %q", got)
 			}
 			// A background probe on a windowless tray app must not flash a
@@ -115,23 +121,24 @@ func TestOpenCodeShimCommand_CarriesEveryTokenInTheEnvironmentAndHidesTheWindow(
 	}
 }
 
-func openCodeShimPathEnvValue(env []string) (string, bool) {
-	for _, e := range env {
-		if strings.HasPrefix(e, openCodeShimPathEnv+"=") {
-			return strings.TrimPrefix(e, openCodeShimPathEnv+"="), true
-		}
-	}
-	return "", false
-}
-
 func TestOpenCodeShimScript_RefusalsAreExactlyTheDocumentedSet(t *testing.T) {
 	// ONE character policy: a token is REFUSED rather than escaped when it
 	// contains something that breaks the quoting or gets re-read by cmd's single
 	// expansion pass. Everything else must be SUPPORTED, not refused.
+	// Accepted, and each asserted as a successful round-trip rather than a
+	// refusal. The REDIRECTION operators are the ones a reader will question:
+	// they are safe for the same reason `&` and `|` are — the reference is
+	// rendered inside double quotes and delayed expansion is off, so cmd.exe
+	// never re-parses the substituted text for redirection, pipes or separators.
+	// What would break that is a double quote (closes the quoting) or a `%`
+	// (re-read by the single expansion pass), and both are refused below.
+	// TestOpenCodeShimCommand_MetacharacterTokensSurviveCmdExe proves the
+	// round-trip through a real cmd.exe rather than through the renderer alone.
 	supported := []string{
 		"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5",
 		"a value with spaces", "amp&ersand", "caret^x", "(paren)", "pipe|x",
-		"semi;colon", "less<greater>", "back\\slash", "single'quote",
+		"semi;colon", "redirect<in", "redirect>out", "back\\slash", "single'quote",
+		"at@sign", "bang!bang", "comma,sep", "equals=sign", "star*glob", "quest?ion",
 	}
 	for _, token := range supported {
 		if _, ok := openCodeShimScript([]string{token}); !ok {

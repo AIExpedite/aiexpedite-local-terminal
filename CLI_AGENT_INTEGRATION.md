@@ -1582,6 +1582,7 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | Observation | `errorCategory` | `diagnostic` |
 | --- | --- | --- |
 | Spawn failed (CreateProcess refused, shim unrenderable, prompt/cwd staging failed) | `provider_unavailable` | `launch_error` |
+| `exec.ErrWaitDelay` — the child RAN, a tool grandchild held the pipe | *classified from the captured output* | *(never `launch_error`)* |
 | Binary absent or `--version` unanswerable | `provider_unavailable` | `binary_missing` |
 | Conclusive "no usable provider" from the readiness probe | `not_authenticated` | `not_logged_in` |
 | Non-zero exit, no terminal frame, stderr shows an option-parsing rejection | `protocol` | `flag_rejected` |
@@ -1595,6 +1596,15 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | Per-attempt deadline, or the delivery context cancelled | `provider_timeout` | `timeout` |
 | Marker RNG failure | `internal_error` | `internal` |
 
+- **`exec.ErrWaitDelay` means "the child ran", not "we could not start it".** The
+  process exited — often 0, having said everything it had to say — and a lingering
+  OpenCode tool GRANDCHILD held the captured pipe past `WaitDelay`, so os/exec
+  stopped waiting on the copy. It is the one non-`*exec.ExitError` that must NOT
+  reach the `launch_error` gate: doing so reports a healthy install as
+  `provider_unavailable`, discards stdout that may hold the marker, and (because
+  `launch_error` is never cached) re-spends a turn on every smoke — re-fusing the
+  buckets this probe exists to separate. It also does not make a missing terminal
+  frame read as a pre-inference rejection, since no non-zero exit reported one.
 - `framing_rejected` is **never inferred from silence** — only a positive
   rejection names it, and only in the **error region** of stderr
   (`openCodeStderrErrorRegion`, the text before any `usage:` block). OpenCode
@@ -1638,9 +1648,16 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   short-circuits an unusable install before anything is spent. The probe runs in a
   **fresh empty cwd** so a repository's `opencode.json` cannot decide what it
   measures, and that directory is swept on the way in
-  (`pruneOpenCodeSmokeScratch`, bounded and best-effort) because an agent killed
-  mid-smoke would otherwise leave one entry behind forever — nothing else prunes
-  the scratch tree.
+  (`pruneOpenCodeSmokeScratchOnce`: once per process, in the BACKGROUND so a slow
+  or AV-scanned filesystem cannot spend a deadline-bounded health check's budget
+  on housekeeping — the same shape as `pruneGrokSessionStoreOnce`) because an
+  agent killed mid-smoke would otherwise leave one entry behind forever and
+  nothing else prunes the scratch tree. The sweep is bounded (64 entries), floored
+  at 6h so a live run is never reclaimed under itself, name-scoped, silent, and
+  **skips any reparse point**: `IsDir()` comes from the directory entry's own
+  lstat, so a symlink or Windows junction named like a run directory is left
+  strictly alone rather than descended into — this repo has lost entire sibling
+  checkouts to a recursive delete that followed a junction.
 - `probeOpenCodeNativeCapability`'s positive cache is keyed by **(path, mtime,
   size)** instead of a bare 5-minute TTL, so a binary replaced mid-window cannot
   keep the previous build's resume capability and be handed an unsupported
@@ -1666,9 +1683,15 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   **`%`**, **CR**, **LF** or another **control character**, when a token is
   **empty**, or when the token count exceeds `openCodeShimMaxArgs`. Those are what
   break the quoting or get re-read by cmd's single expansion pass. **Spaces and
-  `&` / `^` / `(` / `)` / `|` are supported** — the reference is quoted and delayed
-  expansion is off (`/v:off`) — and are asserted as successful round-trips, not
-  refusals. The cost: a value containing a literal `%` or a double quote cannot
+  `&` / `^` / `(` / `)` / `|` / `;` and even the redirection operators `<` / `>`
+  are supported** — the reference is rendered inside double quotes and delayed
+  expansion is off (`/v:off`), so cmd.exe never re-parses the substituted text as
+  redirection, a pipe or a separator — and are asserted as successful
+  round-trips, not refusals, **through a real cmd.exe** rather than through the
+  renderer alone (`TestOpenCodeShimCommand_MetacharacterTokensSurviveCmdExe`,
+  which also asserts no token was swallowed into a stray file). What breaks that
+  quoting is precisely what is refused: a double quote closes it, and a `%` is
+  re-read by the single expansion pass. The cost: a value containing a literal `%` or a double quote cannot
   run on a Windows shim install.
 - The shim is invoked **directly**, with no leading `call`: `call` performs a
   second percent-expansion pass over the already-expanded line and would mangle a

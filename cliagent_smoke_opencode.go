@@ -47,6 +47,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -242,8 +243,9 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
 	// The defer below removes this run's directory, but only if the process lives
 	// to run it: an agent killed mid-smoke leaves the entry behind forever, and
-	// nothing else prunes this tree. Sweep first, bounded, best-effort.
-	pruneOpenCodeSmokeScratch(scratch, time.Now())
+	// nothing else prunes this tree. Reclaim in the BACKGROUND so a slow
+	// filesystem cannot add latency to a deadline-bounded health check.
+	pruneOpenCodeSmokeScratchOnce(scratch)
 	runDir, err := os.MkdirTemp(scratch, "cwd-*")
 	if err != nil {
 		return finish(cliUsageErrorProviderUnavailable, cliSmokeDiagnosticLaunchError)
@@ -340,6 +342,27 @@ const (
 	openCodeSmokeScratchMaxSweep = 64
 )
 
+var openCodeSmokeScratchPruneOnce sync.Once
+
+// pruneOpenCodeSmokeScratchOnce reclaims orphaned per-run directories at most
+// once per agent process, in the background. Called from the smoke path rather
+// than agent startup so a device that never smokes OpenCode never touches the
+// directory, and backgrounded so a slow or AV-scanned filesystem cannot spend
+// the probe's deadline on housekeeping. Same shape as
+// pruneGrokSessionStoreOnce.
+//
+// `scratch` is resolved by the CALLER, on its goroutine: cliPromptTempDir reads
+// the process environment, which tests swap and restore via t.Cleanup, and a
+// background read of it would race that restore under -race.
+func pruneOpenCodeSmokeScratchOnce(scratch string) {
+	if scratch == "" {
+		return
+	}
+	openCodeSmokeScratchPruneOnce.Do(func() {
+		go pruneOpenCodeSmokeScratch(scratch, time.Now())
+	})
+}
+
 // pruneOpenCodeSmokeScratch removes orphaned per-run cwd directories.
 //
 // Best-effort and silent by design: this is housekeeping on the way to a health
@@ -358,9 +381,16 @@ func pruneOpenCodeSmokeScratch(scratch string, now time.Time) {
 	swept := 0
 	for _, entry := range entries {
 		if swept >= openCodeSmokeScratchMaxSweep {
-			return
+			break
 		}
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "cwd-") {
+		// IsDir() comes from the directory entry itself (an lstat), so a SYMLINK
+		// or Windows junction named like a run directory reports false here and is
+		// skipped rather than descended into. That is deliberate and load-bearing:
+		// this repo has lost entire sibling checkouts to a recursive delete that
+		// followed a junction, so a reparse point in this tree is left strictly
+		// alone rather than reclaimed.
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 ||
+			!strings.HasPrefix(entry.Name(), "cwd-") {
 			continue
 		}
 		info, statErr := entry.Info()
@@ -541,8 +571,16 @@ func classifyOpenCodeSmokeRun(timedOut bool, stdout, stderr []byte, runErr error
 	// we never got a turn out of the CLI at all. That is launch_error, and
 	// keeping it out of no_envelope is the whole point: the deployed symptom was
 	// those two sharing one bucket.
+	//
+	// exec.ErrWaitDelay is the one non-ExitError that still means "the child
+	// RAN": the process exited (often 0, having said everything it had to say)
+	// and a lingering tool GRANDCHILD held the captured pipe past our WaitDelay,
+	// so os/exec stopped waiting on the copy. Judging that as a launch failure
+	// would report a healthy install as provider_unavailable and throw away
+	// stdout that may hold the marker — re-fusing the very buckets this probe
+	// exists to separate. Fall through and classify the output we did capture.
 	var exitErr *exec.ExitError
-	if runErr != nil && !errors.As(runErr, &exitErr) {
+	if runErr != nil && !errors.As(runErr, &exitErr) && !errors.Is(runErr, exec.ErrWaitDelay) {
 		return cliUsageErrorProviderUnavailable, cliSmokeDiagnosticLaunchError, false
 	}
 
@@ -567,7 +605,7 @@ func classifyOpenCodeSmokeRun(timedOut bool, stdout, stderr []byte, runErr error
 	}
 
 	if !stream.Ended {
-		if runErr != nil {
+		if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
 			// Exit non-zero with no terminal frame: the CLI rejected our
 			// invocation shape before producing its documented output — the
 			// pre-inference exit this probe exists to name precisely.
