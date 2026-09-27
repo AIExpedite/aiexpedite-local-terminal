@@ -372,13 +372,16 @@ func TestPersistCodexSmokeRunDebt_StandsDownForAStubbedLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	codexRunHookOverride.Store(&codexRunHooks{
-		started: func(time.Time) {}, settled: func(time.Time) {},
-		disarmed: func(floor, fallback time.Time) {},
-	})
-	t.Cleanup(func() { codexRunHookOverride.Store(nil) })
+	// The package's own recorder, which restores whatever override was in place
+	// rather than clobbering it with nil.
+	rec := recordCodexRunHooks(t)
 
+	codexUsageRunSettled(now.Add(-time.Minute))
 	persistCodexSmokeRunDebt(now.Add(-time.Minute), f.fp)
+
+	if _, settled, _ := rec.lifecycle(); settled != 1 {
+		t.Fatalf("the recorder must still observe the settle: settled=%d", settled)
+	}
 
 	after, err := os.ReadFile(f.cache)
 	if err != nil {
