@@ -765,8 +765,12 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// between this pin and Start().
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
 
-	// Start the process
+	// Start the process. It leads its own process group (Unix) and is recorded
+	// in the spawn ledger so a later boot can prove it gone (session_ledger.go).
+	ownProcessGroup(proc)
+	beginSessionSpawn(id)
 	if err := proc.Start(); err != nil {
+		abortSessionSpawn(id)
 		if finishGrokAttribution != nil {
 			// No child will ever write a record for this arm; release now so a
 			// failed spawn cannot leave the shared keeper running forever.
@@ -779,6 +783,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		stderrW.Close()
 		return fmt.Errorf("failed to start %s: %w", command, err)
 	}
+	trackSessionProcess(id, proc)
 
 	// The child now holds its own dup of the write ends; close the parent's
 	// copies so the read ends see EOF when (and only when) the child exits.
@@ -1575,6 +1580,7 @@ func (sm *SessionManager) removeSession(id string) {
 	}
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
@@ -1603,6 +1609,7 @@ func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(sm.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 

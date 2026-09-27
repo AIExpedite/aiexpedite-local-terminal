@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.37"
+var Version = "v1.0.38"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -134,6 +134,15 @@ func IsOffline() bool {
 func StartAgent(cfg *Config) {
 	/* 0. Initialize storage config for WIF authentication ----------------- */
 	SetStorageConfig(cfg)
+
+	/* 0a. End what an earlier boot of this agent left running ------------- */
+	// Before anything can report this boot (/online, including the update
+	// reconciliation below) and before any session can start: look up ONLY
+	// the processes the spawn ledger recorded for earlier boots, end the ones
+	// that are provably still ours (same PID AND start time), and classify
+	// each session reaped / surviving for the signed /online boot report.
+	// See session_ledger.go.
+	globalSpawnLedger.RunBootReap()
 
 	// Restore persisted offline state so the cloud connection respects the
 	// user's last "Disconnect from cloud" toggle across restarts.

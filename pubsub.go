@@ -173,6 +173,7 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		Command:         redactSensitiveData(cmd.Command),
 		Args:            redactRejectionArgs(cmd),
 		RejectionReason: reason,
+		BootID:          agentBootID,
 	}
 	// Session-routed commands need Type/SessionID set so the backend can
 	// correlate the rejection with the session document. The rejection Type
@@ -775,6 +776,12 @@ type resultMsg struct {
 	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
 	ErrorCode string `json:"errorCode,omitempty"`
 
+	// BootID names the agent process that produced this frame (a random id
+	// per process start, session_ledger.go). Set on pongs, session error
+	// frames and rejections, so terminal-service can tell a same-boot
+	// "session not found" (session-level) from one after a restart.
+	BootID string `json:"bootId,omitempty"`
+
 	// Durable CLI conversation id for a resident kind whose conversation lives
 	// on THIS device's filesystem and whose id the cloud cannot otherwise learn.
 	//
@@ -1291,6 +1298,23 @@ func canPublishSignedCLIUsageFailure(cmd commandMsg, cfg *Config) bool {
 	return cfg != nil && cfg.CommandSecret != "" && verifySignature(cmd, cfg.CommandSecret)
 }
 
+// pongResult is the answer to a __ping__. Every pong names this agent
+// process's boot, so terminal-service can tell a transient drop (same boot)
+// from a restart (new boot); see session_ledger.go.
+func pongResult(cmd commandMsg) resultMsg {
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     cmd.AgentID,
+		Output:      "pong",
+		Status:      "success",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		BootID:      agentBootID,
+	}
+}
+
 // publishMsg marshals res and publishes it on topic using ctx.
 // Logs and returns any error so callers can decide whether to ack or nack.
 // publishMsg is a var, not a plain func, so tests can observe what a handler
@@ -1559,16 +1583,7 @@ func runPubSubConnection(cfg *Config) error {
 				m.Ack()
 				return
 			}
-			res := resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				AgentID:     cmd.AgentID,
-				Output:      "pong",
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-			}
+			res := pongResult(cmd)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
 			}
@@ -1821,6 +1836,12 @@ func runPubSubConnection(cfg *Config) error {
 		// session_end / codex_appserver_send / codex_appserver_end) flow
 		// through directly because they target an already-allowed session.
 		if cmd.Type != "" && cmd.Type != "execute" {
+			// A session fenced by a Move / max-park end (reported on /online,
+			// fenced_sessions.go) accepts nothing but its END: its run has
+			// moved on, so a late input must not drive the old CLI.
+			if refuseFencedSessionCommand(ctx, topic, m, cmd, cfg) {
+				return
+			}
 			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
 				return
 			}
@@ -6470,6 +6491,7 @@ func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, c
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6597,6 +6619,7 @@ func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cm
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "codex_appserver_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6722,6 +6745,7 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "claude_native_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6937,6 +6961,7 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "antigravity_native_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -7160,6 +7185,7 @@ func publishOpenCodeNativeError(ctx context.Context, topic *pubsub.Publisher, cm
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "opencode_native_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -7309,6 +7335,7 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "grok_acp_error",
 		SessionID:   cmd.SessionID,
 	}

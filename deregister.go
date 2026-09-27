@@ -9,10 +9,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -133,6 +137,13 @@ func notifyOnline(ctx context.Context, cfg *Config) error {
 // "agentId:timestamp", matching the server's verifier, so extra fields ride
 // alongside without changing the auth scheme. The value is package-private and
 // only set by the wrapper functions above.
+//
+// Every "online" call — boot, tray Reconnect, update reconciliation — also
+// carries the boot report (bootId, previousBootId, sessionsReaped,
+// sessionsSurviving; session_ledger.go), with sessionsReaped certified by a
+// second HMAC, bootReportSignature (buildBootReportSignedMessage). An accepted
+// answer drops the reaped sessions it carried from the ledger and fences the
+// sessions it names in fencedSessionIds (onOnlineAccepted).
 func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map[string]any) error {
 	if cfg == nil || cfg.AgentID == "" || cfg.CommandSecret == "" {
 		return fmt.Errorf("notify%s: missing agent credentials", capitalize(path))
@@ -224,8 +235,11 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 		default:
 		}
 
-		err := sendConnectivityRequest(ctx, url, cfg, extra)
+		resp, err := sendConnectivityRequest(ctx, url, cfg, path, extra)
 		if err == nil {
+			if path == "online" {
+				onOnlineAccepted(resp)
+			}
 			// Pick a user-facing verb per route for the success log.
 			verb := "shutdown"
 			switch {
@@ -293,11 +307,80 @@ func capitalize(s string) string {
 	return s
 }
 
+// onlineResponse is what an accepted /online answered, plus the boot report
+// the request carried (so only the reaped sessions it certified are acked).
+type onlineResponse struct {
+	// FencedSessionIDs are sessions a Move or a max-park end fenced on this
+	// device; the agent ends them before anything else runs for them.
+	FencedSessionIDs []string `json:"fencedSessionIds"`
+
+	sentReaped []string
+}
+
+// onOnlineAccepted applies an accepted (2xx) /online: the reaped sessions it
+// carried are proven delivered (dropped from the ledger), and the sessions it
+// reports fenced are refused and ended. A var so tests can observe it.
+var onOnlineAccepted = func(resp *onlineResponse) { applyOnlineAccepted(globalSpawnLedger, resp) }
+
+func applyOnlineAccepted(l *spawnLedger, resp *onlineResponse) {
+	if resp == nil {
+		return
+	}
+	l.AckReaped(resp.sentReaped)
+	handleFencedSessions(resp.FencedSessionIDs)
+}
+
+// bootReportForOnline is the ledger's report, behind a seam for tests.
+var bootReportForOnline = func(ctx context.Context) bootReport { return globalSpawnLedger.Report(ctx) }
+
+// buildBootReportSignedMessage is the string bootReportSignature covers —
+// byte for byte the terminal-service helper of the same name
+// (src/utils/hmac.util.js):
+//
+//	${agentId}:${timestamp}:${bootId}:${sha256hex(sortedSessionsReaped.join(","))}
+//
+// The list is sorted in byte order (session ids are ASCII, so this equals the
+// server's default JavaScript sort) and comma-joined; an empty list hashes
+// the empty string; the digest is lowercase hex. The timestamp is the same one
+// the request's own `signature` covers.
+func buildBootReportSignedMessage(agentID string, timestamp int64, bootID string, sessionsReaped []string) string {
+	sorted := append([]string(nil), sessionsReaped...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, ",")))
+	return fmt.Sprintf("%s:%d:%s:%s", agentID, timestamp, bootID, hex.EncodeToString(sum[:]))
+}
+
+// addBootReport adds the boot report to an /online payload: the unsigned
+// extras (bootId, previousBootId, sessionsSurviving) and sessionsReaped with
+// the bootReportSignature that certifies it. Returns the reaped list sent.
+func addBootReport(payload map[string]interface{}, cfg *Config, timestamp int64, report bootReport) []string {
+	if report.BootID == "" {
+		return nil
+	}
+	reaped := append([]string{}, report.SessionsReaped...)
+	surviving := append([]string{}, report.SessionsSurviving...)
+	payload["bootId"] = report.BootID
+	if report.PreviousBootID != "" {
+		payload["previousBootId"] = report.PreviousBootID
+	}
+	payload["sessionsReaped"] = reaped
+	payload["sessionsSurviving"] = surviving
+	payload["bootReportSignature"] = generateHMAC(
+		buildBootReportSignedMessage(cfg.AgentID, timestamp, report.BootID, reaped),
+		cfg.CommandSecret,
+	)
+	return reaped
+}
+
+// maxOnlineResponseBody bounds how much of an /online answer is read.
+const maxOnlineResponseBody = 256 << 10
+
 // sendConnectivityRequest performs a single HTTP POST attempt of an
 // offline-or-online signal. It is intentionally side-effect-free apart
 // from the network call so the retry loop in notifyConnectivity can
-// call it repeatedly within one mutex hold and ctx budget.
-func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, extra map[string]any) error {
+// call it repeatedly within one mutex hold and ctx budget. For "online" it
+// returns the parsed answer; the caller applies it (onOnlineAccepted).
+func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, path string, extra map[string]any) (*onlineResponse, error) {
 	// Build HMAC-signed payload (same auth scheme as /auth/token and
 	// /device/:id/offline). The signature covers only "agentId:timestamp";
 	// any `extra` fields (drain attemptId/targetVersion/reason, online
@@ -311,21 +394,27 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, extra
 		"signature": signature,
 	}
 	for k, v := range extra {
-		// Never let an extra field clobber the signed timestamp/signature.
-		if k == "timestamp" || k == "signature" {
+		// Never let an extra field clobber the signed fields.
+		if k == "timestamp" || k == "signature" || isBootReportField(k) {
 			continue
 		}
 		payload[k] = v
 	}
+	// Every /online caller (boot, tray Reconnect, update reconciliation)
+	// reports the boot here, signed with this request's timestamp.
+	var sentReaped []string
+	if path == "online" {
+		sentReaped = addBootReport(payload, cfg, timestamp, bootReportForOnline(ctx))
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("new request: %w", err)
+		return nil, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
@@ -333,19 +422,40 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, extra
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return fmt.Errorf("cancelled: %w", ctx.Err())
+			return nil, fmt.Errorf("cancelled: %w", ctx.Err())
 		}
-		return fmt.Errorf("http: %w", err)
+		return nil, fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return &connectivityHTTPError{
+		return nil, &connectivityHTTPError{
 			StatusCode: resp.StatusCode,
 			Code:       readServiceErrorCode(resp.Body),
 		}
 	}
-	return nil
+	if path != "online" {
+		return nil, nil
+	}
+	out := &onlineResponse{sentReaped: sentReaped}
+	// The answer is advisory beyond the 200 itself: an unreadable body still
+	// means the report was accepted, it just names no fenced session.
+	if raw, err := io.ReadAll(io.LimitReader(resp.Body, maxOnlineResponseBody)); err == nil && len(raw) > 0 {
+		var parsed onlineResponse
+		if json.Unmarshal(raw, &parsed) == nil {
+			out.FencedSessionIDs = parsed.FencedSessionIDs
+		}
+	}
+	return out, nil
+}
+
+// isBootReportField names the /online body fields only addBootReport sets.
+func isBootReportField(k string) bool {
+	switch k {
+	case "bootId", "previousBootId", "sessionsReaped", "sessionsSurviving", "bootReportSignature":
+		return true
+	}
+	return false
 }
 
 // connectivityHTTPError is a non-2xx answer from a connectivity RPC, carrying

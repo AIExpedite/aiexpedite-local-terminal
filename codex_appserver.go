@@ -599,12 +599,16 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	// since an installer can replace the binary in the pin→exec window.
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch("codex", executable)
 
+	ownProcessGroup(proc)
+	beginSessionSpawn(id)
 	if err := proc.Start(); err != nil {
+		abortSessionSpawn(id)
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
 		return fmt.Errorf("failed to start codex app-server (is `codex` on PATH?): %w", err)
 	}
+	trackSessionProcess(id, proc)
 
 	session := &CodexAppServerSession{
 		ID:                  id,
@@ -929,6 +933,7 @@ func (m *CodexAppServerManager) removeSession(id string) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session.
@@ -960,6 +965,7 @@ func (m *CodexAppServerManager) removeSessionIfSame(id string, s *CodexAppServer
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(m.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
