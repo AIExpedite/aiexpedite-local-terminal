@@ -548,7 +548,6 @@ const (
 	reapClassReaped bootReapClass = iota
 	reapClassSurviving
 	reapClassUnknown
-	reapClassDrop // permanently unknowable: never listed, not retried
 )
 
 // classifyEarlierEntry looks up ONLY the entry's recorded PIDs, ends any
@@ -557,8 +556,12 @@ func (l *spawnLedger) classifyEarlierEntry(e ledgerEntry) bootReapClass {
 	if e.State == ledgerStateReaped {
 		return reapClassReaped
 	}
+	// A pending spawn or an incomplete record may hide a process the ledger
+	// never saw: never certifiable. Kept as an unknown tombstone (not
+	// dropped) so it also blocks a reaped entry of the same session id in
+	// another generation; the age limit removes it eventually.
 	if e.PendingSpawns > 0 || e.Incomplete {
-		return reapClassDrop
+		return reapClassUnknown
 	}
 	surviving, unknown := false, false
 	for _, p := range e.PIDs {
@@ -661,8 +664,6 @@ func (l *spawnLedger) RunBootReap() {
 			surviving++
 		case reapClassUnknown:
 			e.State = ledgerStateUnknown
-		case reapClassDrop:
-			continue
 		}
 		// An unresolved entry is retried every boot, but not forever.
 		if class != reapClassReaped && e.UpdatedAt > 0 && e.UpdatedAt < cutoff {

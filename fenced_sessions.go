@@ -124,14 +124,46 @@ func endSessionOnDevice(sessionID string) {
 // holds the connectivity mutex, is not held for a session's graceful stop.
 func handleFencedSessions(ids []string) {
 	added := markSessionsFenced(ids)
-	if len(added) == 0 {
-		return
+	if len(added) > 0 {
+		fmt.Printf("%s[fence] terminal-service fenced %d session(s) on this device: %v%s\n",
+			colorYellow, len(added), added, colorReset)
 	}
-	fmt.Printf("%s[fence] terminal-service fenced %d session(s) on this device: %v%s\n",
-		colorYellow, len(added), added, colorReset)
-	for _, id := range added {
-		go endFencedSession(id)
+	// Every report re-attempts the teardown of every fenced session it
+	// names, not only new ones: a first End can fail (a kill-unconfirmed
+	// tombstone is deliberately retained) and must be retried. Ending a
+	// session this process no longer holds is a no-op; one teardown per
+	// session runs at a time.
+	for _, id := range ids {
+		if id == "" || !beginFencedTeardown(id) {
+			continue
+		}
+		go func(id string) {
+			defer endFencedTeardown(id)
+			endFencedSession(id)
+		}(id)
 	}
+}
+
+// fencedTeardowns holds the sessions whose teardown is running.
+var fencedTeardowns = struct {
+	sync.Mutex
+	running map[string]bool
+}{running: make(map[string]bool)}
+
+func beginFencedTeardown(id string) bool {
+	fencedTeardowns.Lock()
+	defer fencedTeardowns.Unlock()
+	if fencedTeardowns.running[id] {
+		return false
+	}
+	fencedTeardowns.running[id] = true
+	return true
+}
+
+func endFencedTeardown(id string) {
+	fencedTeardowns.Lock()
+	defer fencedTeardowns.Unlock()
+	delete(fencedTeardowns.running, id)
 }
 
 // ── The fence report gate ────────────────────────────────────────────────

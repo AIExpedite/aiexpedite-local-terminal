@@ -286,7 +286,7 @@ func TestBootReapClassification(t *testing.T) {
 	}
 
 	// Surviving and unknown are kept for a retry; the permanently
-	// unknowable (pending / incomplete) are dropped.
+	// unknowable (pending / incomplete) are kept as unknown tombstones.
 	states := map[string]string{}
 	for _, e := range readLedgerFile(t, dir).Entries {
 		states[e.SessionID] = e.State
@@ -295,6 +295,7 @@ func TestBootReapClassification(t *testing.T) {
 		"gone": ledgerStateReaped, "ended": ledgerStateReaped, "idle-agy": ledgerStateReaped,
 		"stuck": ledgerStateSurviving, "denied": ledgerStateUnknown, "mixed": ledgerStateUnknown,
 		"left-a-tool": ledgerStateUnknown, "ended-uncontained": ledgerStateUnknown,
+		"pending": ledgerStateUnknown, "incomplete": ledgerStateUnknown,
 	}
 	if !reflect.DeepEqual(states, want) {
 		t.Fatalf("persisted states = %v, want %v", states, want)
@@ -514,5 +515,26 @@ func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
 	l2.RunBootReap()
 	if r := l2.Report(context.Background()); len(r.SessionsReaped) != 0 {
 		t.Fatalf("a session with a live descendant was certified: %+v", r)
+	}
+}
+
+// TestIncompleteGenerationBlocksAReapedOne: a pending / incomplete record is
+// kept as an unknown tombstone, so a reaped entry of the same session id in
+// another generation is never certified.
+func TestIncompleteGenerationBlocksAReapedOne(t *testing.T) {
+	dir := t.TempDir()
+	writeLedgerFixture(t, dir, ledgerFileData{
+		BootID: "boot-2",
+		Entries: []*ledgerEntry{
+			{SessionID: "s", BootID: "boot-1", Incomplete: true, PIDs: []ledgerProcess{}},
+			{SessionID: "s", BootID: "boot-2", PIDs: []ledgerProcess{}, Logical: true},
+			{SessionID: "p", BootID: "boot-1", PendingSpawns: 1, PIDs: []ledgerProcess{}},
+			{SessionID: "p", BootID: "boot-2", PIDs: []ledgerProcess{}, Logical: true},
+		},
+	})
+	l := newTestLedger(t, dir, "boot-3")
+	l.RunBootReap()
+	if r := l.Report(context.Background()); len(r.SessionsReaped) != 0 {
+		t.Fatalf("certified despite an unrecorded generation: %+v", r)
 	}
 }

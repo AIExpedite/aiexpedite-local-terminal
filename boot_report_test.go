@@ -374,14 +374,22 @@ func TestFencedSessionsAreRefusedAndEndedFirst(t *testing.T) {
 		t.Fatalf("ended = %v", got)
 	}
 
-	// A repeated /online does not end them again.
+	// A repeated /online re-attempts the teardown (a first End can fail and
+	// leave the session in place; ending an absent session is a no-op).
 	if err := notifyOnline(context.Background(), &Config{AgentID: "agent-f", CommandSecret: "secret-f"}); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case id := <-endedCh:
-		t.Fatalf("session %s ended twice", id)
-	case <-time.After(200 * time.Millisecond):
+	again := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-endedCh:
+			again[id] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("fenced sessions not re-ended: %v", again)
+		}
+	}
+	if !again["s-moved"] || !again["s-parked"] {
+		t.Fatalf("re-ended = %v", again)
 	}
 
 	// The entry gate: input refused, END let through, other sessions untouched.
@@ -692,4 +700,30 @@ func TestOnlineAnswerFromAnEarlierConnectionDoesNotOpenTheGate(t *testing.T) {
 	if err := notifyOnline(context.Background(), cfg); err != nil || !fenceReportApplied() {
 		t.Fatalf("a current-generation answer must apply (err %v)", err)
 	}
+}
+
+// TestFencedTeardownNeverRunsTwiceAtOnce: repeated reports retry a fenced
+// session's teardown, but never concurrently with one still running.
+func TestFencedTeardownNeverRunsTwiceAtOnce(t *testing.T) {
+	resetFencedSessions(t)
+	block := make(chan struct{})
+	var calls atomic.Int32
+	prev := endFencedSession
+	endFencedSession = func(string) { calls.Add(1); <-block }
+	t.Cleanup(func() { endFencedSession = prev })
+	handleFencedSessions([]string{"s-slow"})
+	handleFencedSessions([]string{"s-slow"})
+	time.Sleep(100 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("concurrent teardowns = %d", n)
+	}
+	close(block)
+	deadline := time.Now().Add(2 * time.Second)
+	for !beginFencedTeardown("s-slow") {
+		if time.Now().After(deadline) {
+			t.Fatalf("teardown slot never released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	endFencedTeardown("s-slow")
 }
