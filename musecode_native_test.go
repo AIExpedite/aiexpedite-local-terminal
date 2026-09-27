@@ -224,7 +224,12 @@ func TestSplitRedactionCarry(t *testing.T) {
 		{"a long opaque tail could still grow into a blob", "token is " + strings.Repeat("a", 20), "token is ", strings.Repeat("a", 20)},
 		{"ordinary prose streams straight through", "the plan is ready now", "the plan is ready now", ""},
 		{"a short trailing word is not held back", "thinking", "thinking", ""},
-		{"a whole-buffer tail publishes rather than stalling", strings.Repeat("x", 4*1024), strings.Repeat("x", 4*1024), ""},
+		// A window that holds nothing BUT the ambiguous tail is exactly what the
+		// carry exists for: publishing the label alone strands its value in a
+		// frame the per-frame pass can no longer match.
+		{"a whole-buffer dangling key is carried, not published", "api_key=", "", "api_key="},
+		{"a whole-buffer opaque run is carried", strings.Repeat("a", 20), "", strings.Repeat("a", 20)},
+		{"a whole-buffer tail at the bound publishes rather than stalling", strings.Repeat("x", agentSecretCarryMaxBytes), strings.Repeat("x", agentSecretCarryMaxBytes), ""},
 		{"an oversize run is not buffered", "x " + strings.Repeat("y", agentSecretCarryMaxBytes+1), "x " + strings.Repeat("y", agentSecretCarryMaxBytes+1), ""},
 		{"empty text", "", "", ""},
 	}
@@ -276,6 +281,42 @@ func TestDeltaCoalescer_CredentialSplitAcrossFlushesIsNotPublishedRaw(t *testing
 	}
 	if !strings.Contains(joined, "running tool: ") {
 		t.Fatalf("the safe prefix must still stream: %q", joined)
+	}
+}
+
+// A timer window that holds NOTHING but the credential label must not publish
+// it: the value arrives in a later frame that, on its own, matches no
+// per-frame pattern, so the pair would reach the cloud complete across two
+// frames that the masked completion frame cannot retract.
+func TestDeltaCoalescer_WholeBufferCredentialLabelIsCarried(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	c := newDeltaCoalescer(
+		func(text string) string { return text },
+		func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+	)
+	c.add("api_key=")
+	// Give the 250ms timer time to fire on a buffer that is only the label.
+	time.Sleep(750 * time.Millisecond)
+	mu.Lock()
+	flushed := len(out)
+	mu.Unlock()
+	if flushed != 0 {
+		t.Fatalf("the label must stay buffered, got %d frame(s): %v", flushed, out)
+	}
+	c.add("mk-live-0123456789abcdef\n")
+	c.close()
+
+	mu.Lock()
+	joined := strings.Join(out, "")
+	mu.Unlock()
+	if strings.Contains(joined, "0123456789abcdef") {
+		t.Fatalf("the split credential value leaked: %q", joined)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("the rejoined pair must be masked: %q", joined)
 	}
 }
 

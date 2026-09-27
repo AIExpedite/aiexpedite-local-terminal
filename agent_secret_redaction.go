@@ -83,11 +83,15 @@ func splitRedactionCarry(text string) (emit string, carry string) {
 	} else if loc := agentOpaqueBlobCarryTailPattern.FindStringIndex(text); loc != nil {
 		idx = loc[0]
 	}
-	// idx <= 0 means the ambiguous tail IS the whole buffer. Carrying it would
-	// make no forward progress — the size-bound flush would re-buffer the same
-	// bytes and the stream would stall — so it is published now and the
-	// per-frame pass masks whatever it can already classify.
-	if idx <= 0 || len(text)-idx > agentSecretCarryMaxBytes {
+	// idx == 0 means the ambiguous tail IS the whole buffer — a timer window
+	// that held nothing but `META_API_KEY=`, or nothing but the opaque run that
+	// follows one. That is exactly the case the carry exists for, so it is
+	// carried too: publishing it would stream the label without its value (or
+	// the value without its label), and neither frame can then be matched by
+	// the per-frame pass. Progress is still guaranteed because the carry is
+	// released unconditionally once it reaches the bound below — which equals
+	// the coalescer's own flush threshold — or when the stream ends.
+	if idx < 0 || len(text)-idx >= agentSecretCarryMaxBytes {
 		return text, ""
 	}
 	return text[:idx], text[idx:]
