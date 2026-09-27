@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 /* --------------------------------------------------------------------------
@@ -572,5 +574,131 @@ func TestOpenCodeStderrErrorRegion_IsLineAnchored(t *testing.T) {
 	// No usage block at all: the whole text is the error region.
 	if got := openCodeStderrErrorRegion("error: unknown option '--format'"); !strings.Contains(got, "--format") {
 		t.Errorf("stderr without a usage block was truncated: %q", got)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Per-run scratch directory
+   -------------------------------------------------------------------------- */
+
+func TestPruneOpenCodeSmokeScratch_ReclaimsOnlyOrphanedRunDirs(t *testing.T) {
+	// Nothing else prunes this tree, so an agent killed mid-smoke would otherwise
+	// leave one directory entry behind forever.
+	scratch := t.TempDir()
+	now := time.Now()
+
+	mk := func(name string, age time.Duration) string {
+		path := filepath.Join(scratch, name)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		stamp := now.Add(-age)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	orphan := mk("cwd-orphaned", openCodeSmokeScratchMaxAge+time.Hour)
+	live := mk("cwd-live", time.Minute)
+	// A neighbour's directory and a file must be untouched whatever their age:
+	// the sweep only ever reclaims the names THIS file creates.
+	foreign := mk("someone-elses-dir", openCodeSmokeScratchMaxAge+time.Hour)
+	stray := filepath.Join(scratch, "cwd-not-a-dir")
+	if err := os.WriteFile(stray, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-openCodeSmokeScratchMaxAge - time.Hour)
+	if err := os.Chtimes(stray, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneOpenCodeSmokeScratch(scratch, now)
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("the orphaned run dir survived (err=%v)", err)
+	}
+	for name, path := range map[string]string{
+		"a live run's dir":     live,
+		"a neighbour's dir":    foreign,
+		"a same-prefixed file": stray,
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was reclaimed: %v", name, err)
+		}
+	}
+
+	// A missing or unreadable scratch root is not an error — the sweep is
+	// housekeeping on the way to a health check, never a reason to fail one.
+	pruneOpenCodeSmokeScratch("", now)
+	pruneOpenCodeSmokeScratch(filepath.Join(scratch, "does-not-exist"), now)
+}
+
+func TestPruneOpenCodeSmokeScratch_IsBounded(t *testing.T) {
+	// One sweep must not turn a health check into a long blocking scan; the
+	// remainder is reclaimed by later smokes.
+	scratch := t.TempDir()
+	now := time.Now()
+	stamp := now.Add(-openCodeSmokeScratchMaxAge - time.Hour)
+	total := openCodeSmokeScratchMaxSweep + 10
+	for i := 0; i < total; i++ {
+		path := filepath.Join(scratch, fmt.Sprintf("cwd-%03d", i))
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pruneOpenCodeSmokeScratch(scratch, now)
+
+	entries, err := os.ReadDir(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left := len(entries); left != total-openCodeSmokeScratchMaxSweep {
+		t.Fatalf("one sweep left %d entries, want %d (cap %d)",
+			left, total-openCodeSmokeScratchMaxSweep, openCodeSmokeScratchMaxSweep)
+	}
+	// And a second sweep makes progress rather than stalling.
+	pruneOpenCodeSmokeScratch(scratch, now)
+	if entries, _ := os.ReadDir(scratch); len(entries) != 0 {
+		t.Errorf("a second sweep left %d entries", len(entries))
+	}
+}
+
+func TestRunOpenCodeSmoke_SweepsOrphansAndLeavesNoScratchBehind(t *testing.T) {
+	openCodeSmokeEnv(t)
+	path := stubOpenCodeBinary(t)
+	stubOpenCodeReadiness(t, "", false)
+
+	// An orphan from a previous, killed run.
+	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
+	if scratch == "" {
+		t.Skip("no resolvable home directory for the scratch root")
+	}
+	orphan := filepath.Join(scratch, "cwd-from-a-killed-run")
+	if err := os.MkdirAll(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().Add(-openCodeSmokeScratchMaxAge - time.Hour)
+	if err := os.Chtimes(orphan, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+
+	stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+		return openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)), nil, nil
+	})
+	if result := runOpenCodeSmoke(context.Background(), path, "0.9.1"); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("expected success, got %+v", result)
+	}
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("the orphan from a killed run was not reclaimed (err=%v)", err)
+	}
+	// And this run cleaned up after itself, so the count does not grow.
+	if entries, err := os.ReadDir(scratch); err == nil && len(entries) != 0 {
+		t.Errorf("the smoke left %d scratch entries behind", len(entries))
 	}
 }

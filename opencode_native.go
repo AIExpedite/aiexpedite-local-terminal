@@ -457,7 +457,7 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 	// false-positive replay. At most ONE replay per turn.
 	if useNativeResume && result.exitCode != 0 &&
 		(looksLikeMissingOpenCodeSession(result.rawStdout, result.stderr) ||
-			openCodeRejectedSessionFlag(result.stderr)) {
+			openCodeRejectedSessionFlag(result.rawStdout, result.stderr)) {
 		fmt.Printf("%s[opencode-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeSessionID = ""
@@ -1720,11 +1720,17 @@ func isOpenCodeNativeCommand(t string) bool {
 // without this an unsupported `--session` surfaced as an opaque non-zero exit
 // and the turn's context was lost instead of replayed.
 //
+// BOTH streams are read, exactly as looksLikeMissingOpenCodeSession does and for
+// the same reason: `opencode` reports a bad `--session` as a plain line on
+// STDOUT rather than as a JSON event, so a build that puts session errors there
+// will put its option-parse errors there too. Reading stderr alone left the
+// repair silently inert on the very case it exists for.
+//
 // The rejection needles are shared with the maintenance smoke's classifier
 // (openCodeOptionRejectionText), and the text is read only to pick between our
 // own constants.
-func openCodeRejectedSessionFlag(stderr string) bool {
-	lower := strings.ToLower(stderr)
+func openCodeRejectedSessionFlag(stdout, stderr string) bool {
+	lower := strings.ToLower(stdout + "\n" + stderr)
 	if !strings.Contains(lower, "--session") {
 		return false
 	}

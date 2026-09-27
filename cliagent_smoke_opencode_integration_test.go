@@ -13,6 +13,8 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -178,5 +180,96 @@ func TestRunCLISmoke_OpenCodeLaunchErrorIsNotCached(t *testing.T) {
 	}
 	if *calls != 2 {
 		t.Fatalf("expected a second real run, got calls=%d", *calls)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   The real deadline path, on every platform
+   --------------------------------------------------------------------------
+   openCodeSmokeTimeout is a var precisely so a test can shrink it and exercise
+   the REAL kill, but the only case doing so was Windows-gated — so the seam's
+   cmd.Cancel hook, its WaitDelay and the process-tree reap had no executed
+   coverage on the platform CI actually runs. Driving the compiled stub proves
+   all three without a vendor binary.
+   ------------------------------------------------------------------------ */
+
+func TestRunCLISmoke_OpenCodeRealDeadlineKillsTheChildAndReportsTimeout(t *testing.T) {
+	openCodeSmokeEnv(t)
+	binDir := installOpenCodeStub(t)
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	stubOpenCodeSmokePath(t, filepath.Join(binDir, name))
+	t.Setenv("OPENCODE_STUB_VERSION", "opencode 0.9.1")
+
+	// The child outlives the deadline by a wide margin, and records reaching the
+	// end of its sleep. That marker is the cross-platform proof of the reap: it
+	// appears iff the child was NOT killed.
+	doneLog := filepath.Join(t.TempDir(), "done.log")
+	t.Setenv("OPENCODE_STUB_SLEEP_MS", "60000")
+	t.Setenv("OPENCODE_STUB_DONE_LOG", doneLog)
+
+	original := openCodeSmokeTimeout
+	openCodeSmokeTimeout = 800 * time.Millisecond
+	t.Cleanup(func() { openCodeSmokeTimeout = original })
+
+	started := time.Now()
+	result, replayed := runCLISmoke(context.Background(), "opencode")
+	elapsed := time.Since(started)
+
+	if replayed {
+		t.Fatal("the first smoke must actually run")
+	}
+	if result.Diagnostic != cliSmokeDiagnosticTimeout ||
+		result.ErrorCategory != cliUsageErrorProviderTimeout {
+		t.Fatalf("got (%q, %q), want timeout/provider_timeout", result.ErrorCategory, result.Diagnostic)
+	}
+	if result.MarkerMatched {
+		t.Error("a killed run must not report markerMatched")
+	}
+	// Bounded by the deadline plus the reap race (WaitDelay), nowhere near the
+	// child's own 60s sleep. Without the tree kill, Wait would sit on the pipes
+	// the child still holds.
+	if elapsed > 30*time.Second {
+		t.Fatalf("the deadline did not bound the run: %v", elapsed)
+	}
+	if _, err := os.Stat(doneLog); err == nil {
+		t.Error("the child reached the end of its sleep — the deadline did not kill it")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error stat-ing the done marker: %v", err)
+	}
+
+	// A verdict reached by a kill says nothing about the binary, so it must not
+	// be pinned: the redelivered post-upgrade smoke has to test the CLI.
+	if cliSmokeVerdictSpentTurn(result) {
+		// timeout IS a spent-turn verdict by design (inference may have started),
+		// so this only documents which side of the line it falls on.
+		t.Log("timeout is cached as a spent turn, as designed")
+	}
+	// The scratch cwd and the prompt file are gone even on the kill path.
+	assertNoOpenCodeSmokeScratchLeaks(t)
+}
+
+// assertNoOpenCodeSmokeScratchLeaks fails when a run left a per-run cwd or a
+// staged prompt behind. The prompt file carries the marker nonce, and the cwd
+// accumulates one directory entry per run, so neither may survive.
+func assertNoOpenCodeSmokeScratchLeaks(t *testing.T) {
+	t.Helper()
+	for _, dir := range []string{cliPromptTempDir("opencode-smoke"), cliPromptTempDir("opencode-prompts")} {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue // never created — nothing to leak
+		}
+		if len(entries) != 0 {
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Errorf("scratch dir %s still holds %v", dir, names)
+		}
 	}
 }

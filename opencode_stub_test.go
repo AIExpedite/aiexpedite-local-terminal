@@ -37,6 +37,9 @@ import (
 //	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT
 //	OPENCODE_STUB_MODELS     stdout for `models` (a diagnostic, not a run)
 //	OPENCODE_STUB_AUTH       stdout for `auth …` (a diagnostic, not a run)
+//	OPENCODE_STUB_DONE_LOG   written AFTER the sleep, just before exit — absent
+//	                         iff the child was killed mid-run, which is how a
+//	                         deadline test proves the tree was actually reaped
 //	OPENCODE_STUB_ECHO_STDIN when set, emit a text frame echoing the LAST
 //	                         whitespace-delimited token of stdin plus a
 //	                         completion frame — a real marker echo, which is
@@ -63,12 +66,10 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "models":
-			fmt.Print(env("OPENCODE_STUB_MODELS", "anthropic/claude-sonnet-4-5
-"))
+			fmt.Print(env("OPENCODE_STUB_MODELS", "anthropic/claude-sonnet-4-5" + newline))
 			return
 		case "auth":
-			fmt.Print(env("OPENCODE_STUB_AUTH", "anthropic
-"))
+			fmt.Print(env("OPENCODE_STUB_AUTH", "anthropic" + newline))
 			return
 		}
 	}
@@ -104,6 +105,13 @@ func main() {
 		if n, err := strconv.Atoi(ms); err == nil {
 			time.Sleep(time.Duration(n) * time.Millisecond)
 		}
+	}
+
+	// Survived the sleep: record it. A deadline test asserts this file does NOT
+	// exist, which is the only cross-platform proof that the kill reached the
+	// child rather than the parent merely giving up on it.
+	if p := os.Getenv("OPENCODE_STUB_DONE_LOG"); p != "" {
+		os.WriteFile(p, []byte("done\n"), 0o600)
 	}
 
 	if os.Getenv("OPENCODE_STUB_ECHO_STDIN") != "" {
@@ -144,6 +152,13 @@ func main() {
 	}
 	os.Exit(exitCode)
 }
+
+// newline is spelled once, as a value. This whole program lives inside a Go RAW
+// string in the parent test file, so it may contain no backtick, and a scripted
+// edit that mangles a line-feed escape here breaks the generated program's
+// LITERALS rather than its behaviour -- which is exactly how this stub once
+// stopped compiling and took every stub-backed test with it, silently.
+const newline = "\n"
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -202,7 +217,16 @@ func buildOpenCodeStub(t *testing.T) string {
 		openCodeStubPath = out
 	})
 	if openCodeStubErr != nil {
-		t.Skipf("could not build the opencode stub (%v): %s", openCodeStubErr, openCodeStubPath)
+		// A build failure here is OUR bug, not an unavailable environment, and
+		// skipping on it is how a broken stub hid: a `\n` escape mangled inside
+		// the raw string above made the program uncompilable, every stub-backed
+		// test skipped, and the suite still reported ok. Only a MISSING toolchain
+		// is a legitimate skip.
+		if _, lookErr := exec.LookPath("go"); lookErr != nil {
+			t.Skipf("no Go toolchain to build the opencode stub (%v)", lookErr)
+		}
+		t.Fatalf("the opencode stub does not compile — every stub-backed test "+
+			"would otherwise skip silently (%v):\n%s", openCodeStubErr, openCodeStubPath)
 	}
 	return openCodeStubPath
 }

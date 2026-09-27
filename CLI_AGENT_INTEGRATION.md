@@ -1621,7 +1621,10 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   `no_envelope`.
 - **The probe never retries** (nothing droppable in its argv). The direct path
   retries once for a rejected `--session` via the **existing replay recovery**
-  (`openCodeRejectedSessionFlag` → clear `NativeSessionID`, rebuild with
+  (`openCodeRejectedSessionFlag`, which reads **both** streams because `opencode`
+  reports a bad `--session` as a plain line on stdout rather than as a JSON event
+  — the same reason `looksLikeMissingOpenCodeSession` does — then clear
+  `NativeSessionID`, rebuild with
   `buildOpenCodeReplayPrompt`, run the no-session rung), not a bare retry — a bare
   retry would silently start a fresh conversation, the trap
   `looksLikeMissingOpenCodeSession` was written to avoid.
@@ -1634,7 +1637,10 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   binary per window, and the free `opencode models` readiness pre-check
   short-circuits an unusable install before anything is spent. The probe runs in a
   **fresh empty cwd** so a repository's `opencode.json` cannot decide what it
-  measures.
+  measures, and that directory is swept on the way in
+  (`pruneOpenCodeSmokeScratch`, bounded and best-effort) because an agent killed
+  mid-smoke would otherwise leave one entry behind forever — nothing else prunes
+  the scratch tree.
 - `probeOpenCodeNativeCapability`'s positive cache is keyed by **(path, mtime,
   size)** instead of a bare 5-minute TTL, so a binary replaced mid-window cannot
   keep the previous build's resume capability and be handed an unsupported

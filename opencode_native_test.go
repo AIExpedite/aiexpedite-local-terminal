@@ -1455,9 +1455,22 @@ func TestOpenCodeRejectedSessionFlag_OnlyAnOptionRejectionNamingSession(t *testi
 		"unexpected argument '--session' found",
 		"Error: unrecognized flag --session",
 	} {
-		if !openCodeRejectedSessionFlag(yes) {
-			t.Errorf("%q must read as a rejected --session", yes)
+		// Either stream: `opencode` reports a bad `--session` as a plain line on
+		// STDOUT rather than as a JSON event (the reason
+		// looksLikeMissingOpenCodeSession reads both), so a build that does that
+		// will put its option-parse errors there too. Reading stderr alone left
+		// the repair inert on exactly the case it exists for.
+		if !openCodeRejectedSessionFlag("", yes) {
+			t.Errorf("%q on stderr must read as a rejected --session", yes)
 		}
+		if !openCodeRejectedSessionFlag(yes, "") {
+			t.Errorf("%q on stdout must read as a rejected --session", yes)
+		}
+	}
+	// The needle and the rejection may even arrive on DIFFERENT streams, which
+	// is why the two are joined before matching rather than checked per stream.
+	if !openCodeRejectedSessionFlag("unknown option", "--session") {
+		t.Error("a rejection split across the two streams must still be recognised")
 	}
 	for _, no := range []string{
 		"",
@@ -1469,7 +1482,7 @@ func TestOpenCodeRejectedSessionFlag_OnlyAnOptionRejectionNamingSession(t *testi
 		// Assistant prose mentioning the flag is not a rejection.
 		"you could pass --session to resume",
 	} {
-		if openCodeRejectedSessionFlag(no) {
+		if openCodeRejectedSessionFlag(no, "") || openCodeRejectedSessionFlag("", no) {
 			t.Errorf("%q must not read as a rejected --session", no)
 		}
 	}

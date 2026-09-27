@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -238,7 +239,12 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	// the caller's workspace would let a repository's configuration decide what
 	// the smoke measures. A directory this process cannot create is a LAUNCH
 	// failure, not a missing envelope.
-	runDir, err := os.MkdirTemp(cliPromptTempDir("opencode-smoke"), "cwd-*")
+	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
+	// The defer below removes this run's directory, but only if the process lives
+	// to run it: an agent killed mid-smoke leaves the entry behind forever, and
+	// nothing else prunes this tree. Sweep first, bounded, best-effort.
+	pruneOpenCodeSmokeScratch(scratch, time.Now())
+	runDir, err := os.MkdirTemp(scratch, "cwd-*")
 	if err != nil {
 		return finish(cliUsageErrorProviderUnavailable, cliSmokeDiagnosticLaunchError)
 	}
@@ -313,6 +319,57 @@ func newOpenCodeSmokeMarker() (string, error) {
 		return "", err
 	}
 	return openCodeSmokeMarkerPrefix + hex.EncodeToString(buf), nil
+}
+
+/* --------------------------------------------------------------------------
+   Per-run scratch directory
+   -------------------------------------------------------------------------- */
+
+const (
+	// openCodeSmokeScratchDirName is the scratch root the per-run empty cwd is
+	// created under, beside the prompt scratch dir the direct path uses.
+	openCodeSmokeScratchDirName = "opencode-smoke"
+	// openCodeSmokeScratchMaxAge is how long an ORPHANED per-run cwd may sit
+	// before the next smoke reclaims it. Comfortably longer than the per-attempt
+	// deadline, so a live run's directory is never swept out from under it — even
+	// one whose clock differs from ours after a suspend.
+	openCodeSmokeScratchMaxAge = 6 * time.Hour
+	// openCodeSmokeScratchMaxSweep bounds one sweep. A directory that somehow
+	// accumulated thousands of entries must not turn a health check into a long
+	// blocking scan; the remainder is reclaimed by later smokes.
+	openCodeSmokeScratchMaxSweep = 64
+)
+
+// pruneOpenCodeSmokeScratch removes orphaned per-run cwd directories.
+//
+// Best-effort and silent by design: this is housekeeping on the way to a health
+// check, so every error is ignored rather than turned into a smoke failure. It
+// only ever removes entries matching the name this file creates and older than
+// openCodeSmokeScratchMaxAge, so it cannot touch a live run or anything a
+// neighbouring feature put there.
+func pruneOpenCodeSmokeScratch(scratch string, now time.Time) {
+	if scratch == "" {
+		return
+	}
+	entries, err := os.ReadDir(scratch)
+	if err != nil {
+		return
+	}
+	swept := 0
+	for _, entry := range entries {
+		if swept >= openCodeSmokeScratchMaxSweep {
+			return
+		}
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "cwd-") {
+			continue
+		}
+		info, statErr := entry.Info()
+		if statErr != nil || now.Sub(info.ModTime()) < openCodeSmokeScratchMaxAge {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(scratch, entry.Name()))
+		swept++
+	}
 }
 
 /* --------------------------------------------------------------------------
