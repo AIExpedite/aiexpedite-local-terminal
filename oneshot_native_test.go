@@ -78,7 +78,7 @@ func TestOneShotNative_SendStreamsFramesAndPublishesIDAfterSuccess(t *testing.T)
 	stdinLog := filepath.Join(t.TempDir(), "stdin.log")
 	t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
 	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
-	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameDeltaHello, museFrameDeltaWorld, museFrameTool, museFrameCompleted))
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameUserInput, museFrameDeltaHello, museFrameDeltaWorld, museFrameTool, museFrameScheduled, museFrameCompleted))
 	startMuse(t, m, "s", "")
 	minted := m.Get("s").NativeSessionID
 
@@ -87,9 +87,16 @@ func TestOneShotNative_SendStreamsFramesAndPublishesIDAfterSuccess(t *testing.T)
 		t.Fatalf("send: %v", err)
 	}
 
-	// One MESSAGE per event line, then the completion.
-	if got := len(sink.ofType("musecode_native_message")); got != 5 {
-		t.Fatalf("want 4 event frames + 1 completion, got %d", got)
+	// One MESSAGE per rendered event line, then the completion. The echoed
+	// prompt (turn.input.user) and task scheduling chatter are not published.
+	msgs := sink.ofType("musecode_native_message")
+	if len(msgs) != 5 {
+		t.Fatalf("want 4 event frames + 1 completion, got %d", len(msgs))
+	}
+	for _, f := range msgs {
+		if strings.Contains(f.Output, "turn.input.user") || strings.Contains(f.Output, "task.lifecycle.scheduled") {
+			t.Fatalf("bookkeeping record was published: %s", f.Output)
+		}
 	}
 	done, ok := sink.completion()
 	if !ok {
@@ -118,7 +125,7 @@ func TestOneShotNative_SendStreamsFramesAndPublishesIDAfterSuccess(t *testing.T)
 	}
 	entries, _ := os.ReadDir(cliPromptTempDir("musecode-prompts"))
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "musecode-prompts-") {
+		if strings.HasPrefix(e.Name(), "musecode-prompt-") {
 			t.Fatalf("prompt file %s was not removed after the turn", e.Name())
 		}
 	}

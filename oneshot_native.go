@@ -84,19 +84,35 @@ type oneShotEvent struct {
 	// Failure is non-empty when the CLI reported the turn failed; it is the
 	// device-wrapped failure text published as the turn error.
 	Failure string
+	// Internal marks CLI bookkeeping no consumer renders. It still feeds the
+	// turn result and the diagnostic raw buffer but is not published: every
+	// published line costs a Pub/Sub message and a Firestore chunk write.
+	Internal bool
 }
 
-// oneShotNativeSpec is everything that differs between one-shot CLIs.
-type oneShotNativeSpec struct {
+// nativeFrameKind names a native chat kind on the wire: the part the Pub/Sub
+// handler (handleOneShotNativeCommand) needs, shared by every one-shot kind.
+type nativeFrameKind struct {
 	// DisplayName is used in user-facing error text ("Muse Code").
 	DisplayName string
 	// LogTag prefixes console logs ("[musecode-native]").
 	LogTag string
-	// FramePrefix is the result-type stem ("musecode_native" →
-	// musecode_native_{started,message,stderr,error,ended}).
+	// FramePrefix is the command/result-type stem ("musecode_native" →
+	// musecode_native_{start,send,end} / _{started,message,stderr,error,ended}).
 	FramePrefix string
-	// PromptDirName is the scratch dir under ~/.ai-expedite for prompt files.
-	PromptDirName string
+}
+
+func (k nativeFrameKind) frameType(suffix string) string {
+	return k.FramePrefix + "_" + suffix
+}
+
+// oneShotNativeSpec is everything that differs between one-shot CLIs.
+type oneShotNativeSpec struct {
+	nativeFrameKind
+	// PromptDirName is the scratch dir under ~/.ai-expedite for prompt files;
+	// PromptFilePrefix names the files in it.
+	PromptDirName    string
+	PromptFilePrefix string
 	// MinResumeVersion is the CLI version floor for native resume; below it
 	// every follow-up uses the bounded transcript replay.
 	MinResumeVersion string
@@ -122,10 +138,6 @@ type oneShotNativeSpec struct {
 	StripEnvPrefixes []string
 	// ReplayPreamble opens a transcript-replay prompt.
 	ReplayPreamble string
-}
-
-func (s *oneShotNativeSpec) frameType(suffix string) string {
-	return s.FramePrefix + "_" + suffix
 }
 
 /* --------------------------------------------------------------------------
@@ -601,7 +613,7 @@ func (m *oneShotNativeManager) runOneShot(
 	registryLabel string,
 	publishFn PublishFunc,
 ) oneShotRunResult {
-	promptPath, promptFile, promptErr := writeOneShotPromptFile(m.spec.PromptDirName, prompt)
+	promptPath, promptFile, promptErr := writeOneShotPromptFile(m.spec.PromptDirName, m.spec.PromptFilePrefix, prompt)
 	if promptErr != nil {
 		return oneShotRunResult{err: fmt.Errorf("could not stage the %s prompt: %w", m.spec.DisplayName, promptErr)}
 	}
@@ -752,6 +764,9 @@ func (m *oneShotNativeManager) streamEvents(
 			}
 			if ev.Failure != "" && state.failure == "" {
 				state.failure = ev.Failure
+			}
+			if ev.Internal {
+				continue
 			}
 		}
 		m.publishEventFrame(session, publishFn, line)
@@ -909,6 +924,10 @@ func (m *oneShotNativeManager) Get(id string) *oneShotNativeSession {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.sessions[id]
+}
+
+func (m *oneShotNativeManager) HasSession(id string) bool {
+	return m.Get(id) != nil
 }
 
 func (m *oneShotNativeManager) ActiveCount() int {
@@ -1109,8 +1128,8 @@ func stripEnvPrefixes(env []string, prefixes []string) []string {
 
 // writeOneShotPromptFile stages the prompt in an owner-only temp file, open and
 // rewound for the child's stdin. The caller closes and removes it on every path.
-func writeOneShotPromptFile(dirName, prompt string) (path string, handle *os.File, err error) {
-	f, err := os.CreateTemp(cliPromptTempDir(dirName), dirName+"-*.txt")
+func writeOneShotPromptFile(dirName, filePrefix, prompt string) (path string, handle *os.File, err error) {
+	f, err := os.CreateTemp(cliPromptTempDir(dirName), filePrefix+"-*.txt")
 	if err != nil {
 		return "", nil, err
 	}

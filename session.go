@@ -2629,8 +2629,14 @@ var openCodeUnrelatedStripped = []string{
 // credentials via openCodeUnrelatedStripped.
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	stripClaudeBilling := isClaudeCommand(command)
-	stripOpenCodeUnrelated := isOpenCodeCommand(command)
-	stripMuseCodeUnrelated := isMuseCodeCommand(command)
+	// One-shot agents that must not see other agents' provider credentials.
+	var unrelatedStripped []string
+	switch {
+	case isOpenCodeCommand(command):
+		unrelatedStripped = openCodeUnrelatedStripped
+	case isMuseCodeCommand(command):
+		unrelatedStripped = museCodeUnrelatedStripped
+	}
 
 	filtered := make([]string, 0, len(env))
 	var stripped []string
@@ -2652,16 +2658,8 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 				}
 			}
 		}
-		if !drop && stripOpenCodeUnrelated {
-			for _, p := range openCodeUnrelatedStripped {
-				if strings.HasPrefix(upper, p) {
-					drop = true
-					break
-				}
-			}
-		}
-		if !drop && stripMuseCodeUnrelated {
-			for _, p := range museCodeUnrelatedStripped {
+		if !drop {
+			for _, p := range unrelatedStripped {
 				if strings.HasPrefix(upper, p) {
 					drop = true
 					break

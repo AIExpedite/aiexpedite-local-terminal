@@ -63,10 +63,13 @@ var museCodeUnrelatedStripped = append(append([]string{}, openCodeUnrelatedStrip
 )
 
 var museCodeNativeSpec = &oneShotNativeSpec{
-	DisplayName:        "Muse Code",
-	LogTag:             "[musecode-native]",
-	FramePrefix:        "musecode_native",
+	nativeFrameKind: nativeFrameKind{
+		DisplayName: "Muse Code",
+		LogTag:      "[musecode-native]",
+		FramePrefix: "musecode_native",
+	},
 	PromptDirName:      "musecode-prompts",
+	PromptFilePrefix:   "musecode-prompt",
 	MinResumeVersion:   museCodeNativeMinVersion,
 	DefaultTurnTimeout: museCodeNativeDefaultTurnTimeout,
 	ResolveExecutable:  resolveMuseCodeExecutable,
@@ -151,6 +154,23 @@ type museCodePayload struct {
 	SessionID  string `json:"session_id"`
 }
 
+// museCodeInternalEvents are `exec --json` bookkeeping records: command
+// acceptance, stream linking, the echoed user prompt, and task scheduling
+// chatter. A trivial turn emits ~28 records and these are ~60% of them; none
+// is rendered anywhere, so they are not published. Kept: text deltas, the
+// run.terminal.* outcome, and task proposed/started/completed/failed (the
+// records that name a task and report how it ended).
+var museCodeInternalEvents = map[string]bool{
+	"runtime.command.accepted":          true,
+	"session.run.linked":                true,
+	"turn.input.user":                   true,
+	"run.lifecycle.started":             true,
+	"task.stream.linked":                true,
+	"task.lifecycle.accepted":           true,
+	"task.lifecycle.scheduled":          true,
+	"task.lifecycle.side_effect_intent": true,
+}
+
 // parseMuseCodeEventLine maps one stdout line onto the core's event. ok=false
 // for anything that is not a JSON object, so a banner is forwarded to the UI
 // but never treated as model output.
@@ -162,7 +182,10 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 	if err := json.Unmarshal([]byte(line), &env); err != nil {
 		return oneShotEvent{}, false
 	}
-	ev := oneShotEvent{SessionID: firstNonEmpty(env.Payload.SessionID, env.SessionID)}
+	ev := oneShotEvent{
+		SessionID: firstNonEmpty(env.Payload.SessionID, env.SessionID),
+		Internal:  museCodeInternalEvents[env.PayloadType],
+	}
 	if ev.SessionID == "" && env.Stream.Kind == "session" {
 		ev.SessionID = env.Stream.ID
 	}

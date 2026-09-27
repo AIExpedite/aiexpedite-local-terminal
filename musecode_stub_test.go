@@ -60,6 +60,8 @@ const (
 	museFrameDeltaWorld = `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"sequence":18,"record_type":"status","payload_type":"run.output.delta","payload":{"kind":"run_output_delta","text":" world"}}`
 	museFrameTool       = `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"sequence":19,"record_type":"event","payload_type":"task.lifecycle.started","payload":{"kind":"task_lifecycle","task_id":"01a0e091-4b4c-73f3-919b-83ffbfda4355"}}`
 	museFrameCompleted  = `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"sequence":27,"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"Hello world","reason":null}}`
+	museFrameUserInput  = `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"sequence":3,"record_type":"status","payload_type":"turn.input.user","payload":{"kind":"turn_input_user","prompt":"say hello"}}`
+	museFrameScheduled  = `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"sequence":8,"record_type":"event","payload_type":"task.lifecycle.scheduled","payload":{"kind":"task_lifecycle","task_id":"01a0e091-4b4c-73f3-919b-83ffbfda4355"}}`
 	museFrameFailed402  = `{"schema_version":1,"sequence":9,"record_type":"event","payload_type":"run.terminal.failed","payload":{"kind":"run_terminal","terminal":"failed","error_kind":"billing_not_configured","status":402,"reason":"Billing is not configured for this account."}}`
 )
 

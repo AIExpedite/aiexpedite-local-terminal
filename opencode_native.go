@@ -566,21 +566,7 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 // completion envelope the frontend normalizer recognizes. The replay marker is
 // a structured token stripped before rendering (same contract as Antigravity's).
 func openCodeCompletionFrame(text string, usedReplay bool) string {
-	payload := map[string]any{
-		"type":  "aiexpedite.turn_complete",
-		"text":  text,
-		"final": true,
-	}
-	if usedReplay {
-		payload["replayRecovery"] = true
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		// Marshaling a map of plain strings cannot realistically fail; fall back
-		// to the raw text rather than dropping the completion.
-		return text
-	}
-	return string(encoded)
+	return oneShotCompletionFrame(text, usedReplay)
 }
 
 /* --------------------------------------------------------------------------
@@ -1125,6 +1111,11 @@ func (m *OpenCodeNativeManager) retainOrResolveDrainTombstone(id string, session
 	return fmt.Errorf("opencode native session %s not found", id)
 }
 
+// HasSession reports whether id is registered (handleOneShotNativeCommand).
+func (m *OpenCodeNativeManager) HasSession(id string) bool {
+	return m.Get(id) != nil
+}
+
 func (m *OpenCodeNativeManager) Get(id string) *OpenCodeNativeSession {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1264,6 +1255,13 @@ func openCodeNativeEnvelopePublishable(msg resultMsg) error {
 	return nil
 }
 
+// openCodeNativeKind is OpenCode's wire identity for the shared Pub/Sub handler.
+var openCodeNativeKind = nativeFrameKind{
+	DisplayName: "OpenCode",
+	LogTag:      "[opencode-native]",
+	FramePrefix: "opencode_native",
+}
+
 /* --------------------------------------------------------------------------
    Arg / env builders
    -------------------------------------------------------------------------- */
@@ -1359,29 +1357,7 @@ func normalizeOpenCodeCallerArgs(args []string) []string {
 // so OAuth/session tokens are covered too, and the comparison is
 // case-insensitive because Windows and some shells export mixed-case names.
 func sanitizeOpenCodeEnv(env []string) []string {
-	denyPrefixes := []string{
-		"CLAUDECODE=",
-		"CLAUDE_",    // CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_API_KEY, …
-		"ANTHROPIC_", // ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
-		"CODEX_",     // CODEX_API_KEY, CODEX_IDE_*
-		"XAI_",       // XAI_API_KEY
-		"GROK_",      // GROK_API_KEY
-	}
-	out := make([]string, 0, len(env))
-	for _, e := range env {
-		upper := strings.ToUpper(e)
-		deny := false
-		for _, p := range denyPrefixes {
-			if strings.HasPrefix(upper, p) {
-				deny = true
-				break
-			}
-		}
-		if !deny {
-			out = append(out, e)
-		}
-	}
-	return out
+	return stripEnvPrefixes(env, openCodeUnrelatedStripped)
 }
 
 /* --------------------------------------------------------------------------
@@ -1410,31 +1386,7 @@ func cliPromptTempDir(name string) string {
 // path — runOneShot does so in a defer that covers success, error, timeout and
 // kill.
 func writeOpenCodePromptFile(prompt string) (path string, handle *os.File, err error) {
-	f, err := os.CreateTemp(cliPromptTempDir("opencode-prompts"), "opencode-prompt-*.txt")
-	if err != nil {
-		return "", nil, err
-	}
-	path = f.Name()
-	// The file holds only the prompt; lock it down to the owner. On Windows the
-	// perm bits are advisory, but keeping them consistent with the Unix builds
-	// matches the other per-session temp resources.
-	if chmodErr := f.Chmod(0o600); chmodErr != nil {
-		// Non-fatal — proceed with the default perms.
-		_ = chmodErr
-	}
-	if _, writeErr := f.WriteString(prompt); writeErr != nil {
-		f.Close()
-		_ = os.Remove(path)
-		return "", nil, writeErr
-	}
-	// Rewind rather than reopen: the handle is already the one the child will
-	// read, and reopening by path would race a concurrent unlink.
-	if _, seekErr := f.Seek(0, 0); seekErr != nil {
-		f.Close()
-		_ = os.Remove(path)
-		return "", nil, seekErr
-	}
-	return path, f, nil
+	return writeOneShotPromptFile("opencode-prompts", "opencode-prompt", prompt)
 }
 
 /* --------------------------------------------------------------------------
@@ -1515,16 +1467,7 @@ func probeOpenCodeVersionUncached() (string, error) {
 // "" when nothing parses — callers treat that as "usable but no resume" rather
 // than inventing a version.
 func parseOpenCodeVersion(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if m := semverRe.FindString(line); m != "" {
-			return m
-		}
-	}
-	return ""
+	return parseCLIVersionTriple(out)
 }
 
 // openCodeSupportsNativeResume reports whether the installed binary is at or
