@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -43,7 +41,7 @@ func TestCodexOwedRefresh_SurvivesAgentRestart(t *testing.T) {
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	session := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))
 	if got := metricObservedAt(t, session); got.UnixMilli() < runStart.UnixMilli() {
@@ -70,7 +68,7 @@ func TestCodexOwedRefresh_RestartReplaySpendsTheDebtBudgetOnce(t *testing.T) {
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
@@ -79,42 +77,48 @@ func TestCodexOwedRefresh_RestartReplaySpendsTheDebtBudgetOnce(t *testing.T) {
 	if snap.RefreshOwedAttempts != codexRefreshAfterRunMaxAttempts {
 		t.Fatalf("replay + worker spent %d reconciles, want exactly the debt's %d", snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
 	}
-	if snap.RefreshFallbackState != codexFallbackSpent {
+	if snap.RefreshFallbackState != codexFallbackDeferred {
 		t.Fatalf("the unpaid replayed debt must reach its live fallback once: state=%q", snap.RefreshFallbackState)
 	}
 }
 
-// A debt older than codexRefreshOwedMaxAge is not replayed: no reconcile, no
-// write — the cache is byte-for-byte what the previous process left.
-func TestCodexOwedRefresh_ExpiredMarkerIsNotReplayed(t *testing.T) {
+// A debt older than codexRefreshOwedMaxAge is not replayed — no reconcile is
+// spent on it — but it is RETIRED rather than merely ignored: the replay leaves
+// the bounded expiry marker behind, so the card says the figure is behind instead
+// of going quiet. Left unretired the debt would sit on disk with no marker and no
+// warning until some unrelated write happened to settle it.
+func TestCodexOwedRefresh_ExpiredDebtIsRetiredNotReplayed(t *testing.T) {
 	now := time.Now()
-	runStart := now.Add(-40 * time.Minute)
+	owedAt := now.Add(-codexRefreshOwedMaxAge - time.Hour)
+	runStart := owedAt.Add(-10 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
-	f.seedPreRunReading(t, now.Add(-time.Hour), now)
-	codexRecordRunFreshness(f.fp, now.Add(-35*time.Minute), func(snap *codexRateLimitSnapshot) {
-		codexOweRunRefresh(snap, runStart, now.Add(-35*time.Minute))
+	// Observed BEFORE the run, so the debt is genuinely unpaid rather than
+	// covered by a later reading.
+	f.seedPreRunReading(t, runStart.Add(-time.Hour), now)
+	codexRecordRunFreshness(f.fp, owedAt, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, owedAt)
 	})
-	before, err := os.ReadFile(f.cache)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if codexGateHasRun(f.fp) {
 		t.Fatal("an expired debt must not spend a reconcile")
 	}
-	after, err := os.ReadFile(f.cache)
-	if err != nil {
-		t.Fatal(err)
+	snap := f.snapshot(t)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("an expired debt must be retired outright: %+v", snap)
 	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("an expired debt must not rewrite the cache")
+	if snap.StaleRunNoticeFloorMs != runStart.UnixMilli() || snap.StaleRunNoticeAtMs == 0 {
+		t.Fatalf("retirement must leave the expiry marker at the unobserved floor: %+v", snap)
 	}
-	if state := codexRunFreshnessForAccount(f.fp, time.Now()); state.owed || state.interrupted {
+	state := codexRunFreshnessForAccount(f.fp, time.Now())
+	if state.owed || state.interrupted {
 		t.Fatalf("expired debt still reads as outstanding: %+v", state)
+	}
+	if codexStaleRunNotice(state) == "" {
+		t.Fatal("the marker must carry the stale-utilization warning")
 	}
 }
 
@@ -134,7 +138,7 @@ func TestCodexOwedRefresh_InterruptedRunIsOwedAtStartup(t *testing.T) {
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != runStart.UnixMilli() {
@@ -158,13 +162,13 @@ func TestCodexOwedRefresh_StartupReplaySkipsARunThisProcessStarted(t *testing.T)
 	// This process's own run start, landed on disk before the replay runs.
 	runStart := time.Now()
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if state := codexRunFreshnessForAccount(f.fp, time.Now()); !state.interrupted {
 		t.Fatalf("a live armed floor is what startup would read as interrupted: %+v", state)
 	}
 
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 {
@@ -191,7 +195,7 @@ func TestCodexOwedRefresh_UnarmedProcessDoesNothing(t *testing.T) {
 	payOwedCodexUsageRefresh()
 	triggerCodexUsageRefreshAfterRun(now.Add(-time.Minute))
 	armCodexUsageRunFloor(now)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if codexGateHasRun(f.fp) {
 		t.Fatal("an unarmed process must not reconcile")
@@ -211,8 +215,6 @@ func TestCodexOwedRefresh_RefusedInterruptedConversionIsRetried(t *testing.T) {
 	codexRecordRunFreshness(f.fp, runStart, func(snap *codexRateLimitSnapshot) {
 		codexArmRunFloor(snap, runStart)
 	})
-	// Leave the worker's retry inside the wedge below, but the flush after it.
-	codexRefreshAfterRunRetryDelay = 300 * time.Millisecond
 	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
 	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
@@ -226,7 +228,7 @@ func TestCodexOwedRefresh_RefusedInterruptedConversionIsRetried(t *testing.T) {
 		codexRateLimitMu.Unlock()
 	}()
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
@@ -254,6 +256,9 @@ func TestCodexOwedRefresh_RefusedConversionStillSpendsTheWorkerAttempts(t *testi
 	codexRecordRunFreshness(f.fp, runStart, func(snap *codexRateLimitSnapshot) {
 		codexArmRunFloor(snap, runStart)
 	})
+	// The live reads reach OpenAI and find nothing, so both budgets drain and the
+	// warning is due rather than the debt staying on the ladder.
+	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
 	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
 	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
@@ -267,7 +272,7 @@ func TestCodexOwedRefresh_RefusedConversionStillSpendsTheWorkerAttempts(t *testi
 		codexRateLimitMu.Unlock()
 	}()
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
@@ -304,7 +309,7 @@ func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if !codexGateHasRun(f.fp) {
 		t.Fatal("the carried-over debt must still be reconciled for")
@@ -333,7 +338,7 @@ func TestCodexOwedRefresh_StartupRebasesFloorLeftInTheFutureByAClockRollback(t *
 	})
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	snap = f.snapshot(t)
 	if snap.RunFloorMs == 0 || snap.RunFloorMs > time.Now().Add(codexRunFloorLocalSkew).UnixMilli() {
 		t.Fatalf("an interrupted future-dated run must be re-dated onto now: %+v", snap)
@@ -378,7 +383,7 @@ func TestCodexUpgrade_ObservedAtAdvancesViaLiveFallbackAndSurvivesRestart(t *tes
 	calls := stubCodexFallbackRead(t, capturingFallbackRead)
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if *calls != 1 {
 		t.Fatalf("live reads = %d, want the one fallback", *calls)
@@ -394,7 +399,7 @@ func TestCodexUpgrade_ObservedAtAdvancesViaLiveFallbackAndSurvivesRestart(t *tes
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if got := metricObservedAt(t, codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))); !got.Equal(observed) {
 		t.Fatalf("observedAt %s did not survive the restart (was %s)", got, observed)
@@ -425,7 +430,7 @@ func TestCodexUpgrade_StartupReplayStampsTheInstalledBuild(t *testing.T) {
 
 	simulateCodexAgentRestart(t)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs != 0 || snap.CodexVersion != codexPostUpdateVersion {
@@ -557,7 +562,7 @@ func TestCodexUpgrade_DriftNoticeOnlyOnceTheFallbackResolved(t *testing.T) {
 	if usage := parse(); usage.Notice != "" {
 		t.Fatalf("no notice while the fallback is outstanding, got %q", usage.Notice)
 	}
-	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackSkipped)
+	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackExhausted)
 	usage := parse()
 	if usage.NoticeSeverity != "warning" || !strings.Contains(usage.Notice, codexPreUpdateVersion) || !strings.Contains(usage.Notice, codexPostUpdateVersion) {
 		t.Fatalf("resolved fallback must show the capture-drift warning, got %q (%s)", usage.Notice, usage.NoticeSeverity)

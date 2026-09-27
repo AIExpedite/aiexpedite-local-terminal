@@ -94,19 +94,11 @@ const (
 
 // antigravityRetryDelayForAttempt is the ladder: the delay before the next
 // attempt of a debt that has already booked `attempts`, or false once the
-// debt's budget is spent.
+// debt's budget is spent. The arithmetic itself lives in
+// cliagent_usage_refresh_ladder.go, shared with Codex so the two providers
+// cannot drift on the same rung math; only the VALUES above are Antigravity's.
 func antigravityRetryDelayForAttempt(attempts int) (time.Duration, bool) {
-	if attempts >= antigravityRefreshDebtMaxAttempts || len(antigravityRunDebtRetryLadder) == 0 {
-		return 0, false
-	}
-	rung := attempts - 1
-	if rung < 0 {
-		rung = 0
-	}
-	if rung >= len(antigravityRunDebtRetryLadder) {
-		rung = len(antigravityRunDebtRetryLadder) - 1
-	}
-	return antigravityRunDebtRetryLadder[rung], true
+	return refreshRetryDelayForAttempt(attempts, antigravityRefreshDebtMaxAttempts, antigravityRunDebtRetryLadder)
 }
 
 // antigravityFreeRetryDelay is the rung after a refusal that spent no outbound
@@ -116,16 +108,10 @@ func antigravityRetryDelayForAttempt(attempts int) (time.Duration, bool) {
 // stays offline, or whose stored login stays expired, would re-check every 30 s
 // for the whole age-out — hundreds of log lines, and on macOS/Linux hundreds of
 // `security` / `secret-tool` keyring children — where this costs a couple of
-// dozen checks across six hours.
+// dozen checks across six hours. Shared arithmetic:
+// cliagent_usage_refresh_ladder.go.
 func antigravityFreeRetryDelay(owedFor time.Duration) time.Duration {
-	delay := antigravityRunDebtFreeRetryDelay
-	if owedFor > delay {
-		delay = owedFor
-	}
-	if n := len(antigravityRunDebtRetryLadder); n > 0 && delay > antigravityRunDebtRetryLadder[n-1] {
-		delay = antigravityRunDebtRetryLadder[n-1]
-	}
-	return delay
+	return refreshFreeRetryDelay(owedFor, antigravityRunDebtFreeRetryDelay, antigravityRunDebtRetryLadder)
 }
 
 // antigravityRunDebtRetryHorizon is the furthest ahead a legitimately booked

@@ -31,15 +31,23 @@ func newCodexFreshnessFixture(t *testing.T, loginAt time.Time) codexFreshnessFix
 
 	// Drain any worker first: the bounds below are plain vars its goroutine reads.
 	resetCodexUsageRefreshGate()
-	prevRetry, prevInterval := codexRefreshAfterRunRetryDelay, codexForcedReconcileMinInterval
-	codexRefreshAfterRunRetryDelay = 10 * time.Millisecond
+	prevLadder, prevFree, prevInterval := codexRunDebtRetryLadder, codexRunDebtFreeRetryDelay, codexForcedReconcileMinInterval
+	prevNudge := codexRefreshNudgeCooldown
+	// The rungs are what pace the worker now, so they have to be small enough
+	// that a test driving the real timer finishes.
+	codexRunDebtRetryLadder = []time.Duration{
+		10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond,
+	}
+	codexRunDebtFreeRetryDelay = 10 * time.Millisecond
 	codexForcedReconcileMinInterval = 20 * time.Millisecond
+	codexRefreshNudgeCooldown = 10 * time.Millisecond
 	SetCodexUsageRefreshEnabled(true)
 	// Registered after the t.Setenv calls, so it runs BEFORE they are undone:
 	// no worker can outlive this test's CODEX_HOME / cache path.
 	t.Cleanup(func() {
 		resetCodexUsageRefreshGate()
-		codexRefreshAfterRunRetryDelay, codexForcedReconcileMinInterval = prevRetry, prevInterval
+		codexRunDebtRetryLadder, codexRunDebtFreeRetryDelay = prevLadder, prevFree
+		codexForcedReconcileMinInterval, codexRefreshNudgeCooldown = prevInterval, prevNudge
 	})
 	return codexFreshnessFixture{home: home, cache: cache, fp: currentCodexAccountFingerprint()}
 }
@@ -131,6 +139,69 @@ func writeCodexRunRollout(t *testing.T, base, name string, sessionStart, frameAt
 	return path
 }
 
+// drainCodexRunDebtLadder walks the rungs the debt books the way wall time
+// would: the worker spends ONE attempt per firing and books the next rung, so a
+// test that wants the whole budget has to let the timer run. The fixture pins the
+// ladder to tens of milliseconds, so the entire budget goes in well under a
+// second.
+//
+// It stops on lack of PROGRESS, not on an empty timer: a debt nothing on this
+// machine can pay keeps booking free rungs until codexRefreshOwedMaxAge (6 h by
+// design), so "no rung armed" would never arrive. Once the counters, the debt and
+// the newest observation have all stopped moving it cancels the pending rung, so
+// no stray callback writes into the test's cache afterwards. The booked
+// NextAttemptAtMs stays on disk for a test to assert.
+func drainCodexRunDebtLadder(t *testing.T) {
+	t.Helper()
+	defer stopCodexRunDebtRetry()
+	type progress struct {
+		owedAtMs, floorMs, paidMs int64
+		attempts, reads           int
+		fallback                  string
+		latestMs                  int64
+	}
+	sample := func() progress {
+		view := codexCacheViewForAccount(currentCodexAccountFingerprint())
+		return progress{
+			owedAtMs: view.refreshOwedAtMs, floorMs: view.runFloorMs, paidMs: view.runFloorPaidMs,
+			attempts: view.refreshOwedAttempts, reads: view.refreshLiveReads,
+			fallback: view.refreshFallback,
+			latestMs: codexLatestContributorObservation(view.contributors).UnixMilli(),
+		}
+	}
+	// The quiet window has to outlast the LONGEST rung the ladder can book, or
+	// the drain gives up while a legitimate retry is still waiting.
+	const poll = 10 * time.Millisecond
+	longest := codexRunDebtFreeRetryDelay + codexForcedReconcileMinInterval
+	for _, rung := range codexRunDebtRetryLadder {
+		if rung > longest {
+			longest = rung
+		}
+	}
+	quietFor := int(longest/poll) + 8
+	deadline := time.Now().Add(30 * time.Second)
+	last, still := sample(), 0
+	for still < quietFor {
+		waitCodexUsageRefreshIdle(t)
+		now := sample()
+		switch {
+		case now != last:
+			last, still = now, 0
+		case now.owedAtMs == 0 && !codexRunDebtRetryPending():
+			// No debt and nothing armed: the ladder is genuinely done. Any other
+			// state has to wait out the quiet window — a timer that has fired but
+			// whose worker has not started yet reads as neither armed nor active.
+			return
+		default:
+			still++
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the codex run debt ladder never stopped making progress")
+		}
+		time.Sleep(poll)
+	}
+}
+
 func waitCodexUsageRefreshIdle(t *testing.T) {
 	t.Helper()
 	done := make(chan struct{})
@@ -180,13 +251,13 @@ func TestCodexRefreshAfterRun_ObservedAtAdvancesAtOrAfterRunStart(t *testing.T) 
 	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
 
 	// Precondition: the routine, cursor-gated scan cannot see the run.
-	routine, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
+	routine, _, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
 	if got := metricObservedAt(t, codexSessionMetric(t, routine)); got.After(runStart) {
 		t.Fatalf("precondition: routine scan already advanced observedAt to %s", got)
 	}
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	session := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))
 	if got := metricObservedAt(t, session); got.UnixMilli() < runStart.UnixMilli() {
@@ -213,7 +284,7 @@ func TestCodexRefreshAfterRun_LiveCaptureAlreadyCoveringRunSettlesWithoutScan(t 
 	f.seedPreRunReading(t, now.Add(-10*time.Second), now)
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
 		t.Fatalf("covered run left a debt: %+v", snap)
@@ -240,13 +311,13 @@ func TestCodexRefreshAfterRun_InfersObservationForTimestamplessFrames(t *testing
 	writeCodexRunRollout(t, f.home, "unstamped", runStart, time.Time{}, mtime, false,
 		[]map[string]any{codexRateLimitFrame(72, 64, now)})
 
-	routine, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
+	routine, _, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
 	if got := metricObservedAt(t, codexSessionMetric(t, routine)); got.UnixMilli() != preRun.UnixMilli() {
 		t.Fatalf("routine scan must still drop timestamp-less frames; observedAt=%s want %s", got, preRun)
 	}
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	session := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))
 	if got := metricObservedAt(t, session); got.UnixMilli() < runStart.UnixMilli() || got.After(time.Now()) {
@@ -284,7 +355,7 @@ func TestCodexRefreshAfterRun_StatedReadingBeatsLaterInferredOne(t *testing.T) {
 		[]map[string]any{codexRateLimitFrame(99, 99, now)})
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	session := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))
 	if session.Consumed == nil || *session.Consumed != 21 {
@@ -347,9 +418,14 @@ func TestCodexRefreshAfterRun_NoEvidenceKeepsReadingAndWarns(t *testing.T) {
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	preRun := now.Add(-time.Hour)
 	f.seedPreRunReading(t, preRun, now)
+	// The live reads reach OpenAI and come back with nothing, so the debt runs out
+	// of both budgets and the warning is due. (A read that never LEFT the device
+	// would keep the debt retryable and the card deliberately quiet — see
+	// TestCodexLiveFallback_RefusalsThatSentNothingCostNoRead.)
+	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
@@ -388,7 +464,13 @@ func TestCodexStaleRunNotice_OnlyAfterAttemptsAreSpent(t *testing.T) {
 	if n := codexStaleRunNotice(state); n != "" {
 		t.Fatalf("notice before attempts were spent: %q", n)
 	}
+	// Spending the scans is no longer enough on its own: the live fallback still
+	// has to have run out (`exhausted`), or the debt is still being paid.
 	state.attempts = codexRefreshAfterRunMaxAttempts
+	if n := codexStaleRunNotice(state); n != "" {
+		t.Fatalf("notice while the live fallback can still run: %q", n)
+	}
+	state.fallback = codexFallbackExhausted
 	if n := codexStaleRunNotice(state); !strings.Contains(n, "09:00 UTC") || !strings.Contains(n, "10:00 UTC") {
 		t.Fatalf("notice %q must name both timestamps", n)
 	}
@@ -413,7 +495,7 @@ func TestCodexForcedReconcile_WaitsForContendedCacheLock(t *testing.T) {
 		[]map[string]any{codexRateLimitFrame(33, 44, now)})
 
 	codexRateLimitMu.Lock()
-	routine, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
+	routine, _, _, _ := codexReconcileFromRollout(context.Background(), f.home, f.fp, time.Now())
 	if got := metricObservedAt(t, codexSessionMetric(t, routine)); !got.Before(runStart) {
 		codexRateLimitMu.Unlock()
 		t.Fatalf("precondition: routine scan committed under a held lock (observedAt %s)", got)
@@ -662,9 +744,8 @@ func TestCodexRefreshAfterRun_RetainsDebtWhenTheCacheWriteIsRefused(t *testing.T
 	runStart := now.Add(-2 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
-	// No rollout evidence exists, so nothing but the retry can record the debt.
-	codexRefreshAfterRunRetryDelay = 300 * time.Millisecond
-
+	// No rollout evidence exists, so nothing but the write-budget retry
+	// (codexLandPendingRunDebt) can record the debt.
 	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
 	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 50*time.Millisecond, time.Millisecond
 	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
@@ -678,7 +759,7 @@ func TestCodexRefreshAfterRun_RetainsDebtWhenTheCacheWriteIsRefused(t *testing.T
 	}()
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 {
@@ -716,7 +797,7 @@ func TestCodexRefreshAfterRun_RetainedDebtOutlivesTheReconcileAttempts(t *testin
 	}()
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != runStart.UnixMilli() {
@@ -738,10 +819,14 @@ func TestCodexReconcileForGather_CountsAnAttemptOnTheDebt(t *testing.T) {
 	runStart := now.Add(-2 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
-	// The state a startup replay leaves behind: still owed, one attempt spent.
+	// The state a startup replay leaves behind: still owed, every scan but the
+	// last already spent, so this gather's reconcile is the one that exhausts it.
 	if !codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 		codexOweRunRefresh(snap, runStart, now)
-		codexCountRefreshAttempt(snap, codexDebtID{floorMs: runStart.UnixMilli(), owedAtMs: now.UnixMilli()})
+		id := codexDebtID{floorMs: runStart.UnixMilli(), owedAtMs: now.UnixMilli()}
+		for i := 0; i < codexRefreshAfterRunMaxAttempts-1; i++ {
+			codexCountRefreshAttempt(snap, id)
+		}
 	}) {
 		t.Fatal("seeding the debt failed")
 	}
@@ -760,8 +845,15 @@ func TestCodexReconcileForGather_CountsAnAttemptOnTheDebt(t *testing.T) {
 		t.Fatalf("RefreshOwedAttempts=%d, want the gather's reconcile counted (%d)",
 			snap.RefreshOwedAttempts, codexRefreshAfterRunMaxAttempts)
 	}
+	// The gather counts the scan but never runs the live fallback, so the notice
+	// is still held back until that fallback has run out too.
+	state := codexRunFreshnessForAccount(f.fp, now)
+	if notice := codexStaleRunNotice(state); notice != "" {
+		t.Fatalf("the notice must wait for the live fallback, got %q", notice)
+	}
+	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackExhausted)
 	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice == "" {
-		t.Fatal("want the stale-run notice once every bounded attempt is spent")
+		t.Fatal("want the stale-run notice once every bounded attempt and the fallback are spent")
 	}
 }
 
@@ -1108,7 +1200,7 @@ func TestPayOwedCodexUsageRefresh_OwesAPromotedInterruptedRun(t *testing.T) {
 	}
 
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RunFloorMs != runB.UnixMilli() {
@@ -1228,7 +1320,7 @@ func TestArmCodexUsageRunFloor_RetriesARefusedWrite(t *testing.T) {
 	}()
 
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
 		t.Fatalf("armed floor %d, want the retried run start %d", snap.RunFloorMs, runStart.UnixMilli())
@@ -1265,13 +1357,17 @@ func TestCodexRecordRefreshAttempt_RetainsARefusedCount(t *testing.T) {
 		t.Fatalf("refused write recorded %d attempts, want none on disk", snap.RefreshOwedAttempts)
 	}
 
-	// The next write folds the retained attempt in, so the run reaches the
-	// notice threshold on the attempts it actually spent.
+	// The next write folds the retained attempt in, so the run is charged the
+	// attempts it actually spent and can still reach the notice threshold.
 	codexRecordRefreshAttempt(f.fp, debt, 1)
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAttempts != 2 {
 		t.Fatalf("RefreshOwedAttempts=%d, want the refused attempt folded in (2)", snap.RefreshOwedAttempts)
 	}
+	// Spend the rest of the budget and the fallback: the folded attempt counted,
+	// so the threshold is reached on the attempts actually spent.
+	codexRecordRefreshAttempt(f.fp, debt, codexRefreshAfterRunMaxAttempts-2)
+	codexSetRefreshFallback(f.fp, debt, codexFallbackExhausted)
 	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, now)); notice == "" {
 		t.Fatal("want the stale-run notice once every attempt is counted")
 	}
@@ -1355,9 +1451,9 @@ func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *tes
 
 	// Withdrawal first, then the arm it withdraws: nothing may reach disk.
 	disarmCodexUsageRunFloor(runStart, time.Time{})
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != 0 {
 		t.Fatalf("a withdrawn arm reached disk: RunFloorMs=%d", snap.RunFloorMs)
 	}
@@ -1367,7 +1463,7 @@ func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *tes
 
 	// Arm first, then a withdrawal whose first write is refused.
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
 		t.Fatalf("armed floor %d, want %d", snap.RunFloorMs, runStart.UnixMilli())
 	}
@@ -1385,7 +1481,7 @@ func TestDisarmCodexUsageRunFloor_DropsALateArmAndRetriesARefusedRollback(t *tes
 		codexRateLimitMu.Unlock()
 	}()
 	disarmCodexUsageRunFloor(runStart, time.Time{})
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != 0 {
 		t.Fatalf("the retried withdrawal left RunFloorMs=%d on disk", snap.RunFloorMs)
 	}
@@ -1411,10 +1507,10 @@ func TestDisarmCodexUsageRunFloor_CountsWithdrawalsThatShareAFloor(t *testing.T)
 	// Two withdrawals at one floor, then the two late arms they withdraw.
 	disarmCodexUsageRunFloor(runStart, time.Time{})
 	disarmCodexUsageRunFloor(runStart, time.Time{})
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	armCodexUsageRunFloor(runStart)
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
 		t.Fatalf("a withdrawn arm reached disk: RunFloorMs=%d ActiveRunFloorMs=%d", snap.RunFloorMs, snap.ActiveRunFloorMs)
 	}
@@ -1428,7 +1524,7 @@ func TestDisarmCodexUsageRunFloor_CountsWithdrawalsThatShareAFloor(t *testing.T)
 	// The count is exact: a third arm at the same floor is a real run and
 	// must land.
 	armCodexUsageRunFloor(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
 		t.Fatalf("an arm with no withdrawal left must land: RunFloorMs=%d, want %d", snap.RunFloorMs, runStart.UnixMilli())
 	}
@@ -1447,7 +1543,7 @@ func TestCodexRefreshAfterRun_CredentialsSwapDoesNotBookTheDebtOnTheNextAccount(
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 
 	codexUsageRunStarted(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
 		t.Fatalf("armed floor %d, want run start %d", snap.RunFloorMs, runStart.UnixMilli())
 	}
@@ -1468,7 +1564,7 @@ func TestCodexRefreshAfterRun_CredentialsSwapDoesNotBookTheDebtOnTheNextAccount(
 	}, nil, now, next)
 
 	codexUsageRunSettled(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.AccountFingerprint != next {
@@ -1492,11 +1588,11 @@ func TestDisarmCodexUsageRunFloor_RollsBackTheArmingAccount(t *testing.T) {
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 
 	codexUsageRunStarted(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
 	codexUsageRunDisarmed(runStart, time.Time{})
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.AccountFingerprint != f.fp {
@@ -2044,7 +2140,7 @@ func TestCodexSmoke_SettleRecordsTheDebt(t *testing.T) {
 	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("result = %+v, want success", result)
 	}
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RunFloorMs < before.UnixMilli() || snap.RefreshOwedAtMs == 0 {
@@ -2077,14 +2173,14 @@ func TestCodexSmoke_DisarmRollsBackToTheNewestOpenFloor(t *testing.T) {
 
 			sibling := time.UnixMilli(time.Now().Add(-time.Minute).UnixMilli())
 			armCodexUsageRunFloor(sibling)
-			waitCodexUsageRefreshIdle(t)
+			drainCodexRunDebtLadder(t)
 			withOpenCodexTerminalRun(t, sibling)
 			stubCodexSmokeExec(t, run)
 
 			if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status == cliSmokeStatusSuccess {
 				t.Fatalf("result = %+v, want a failure", result)
 			}
-			waitCodexUsageRefreshIdle(t)
+			drainCodexRunDebtLadder(t)
 
 			snap := f.snapshot(t)
 			if snap.RunFloorMs != sibling.UnixMilli() || snap.RefreshOwedAtMs != 0 {
@@ -2114,14 +2210,14 @@ func TestCodexSmoke_KilledRunOwesNothingAfterARestart(t *testing.T) {
 	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Diagnostic != cliSmokeDiagnosticTimeout {
 		t.Fatalf("result = %+v, want timeout", result)
 	}
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	// Simulate the post-update restart: a fresh process's gate, then the
 	// startup replay.
 	resetCodexUsageRefreshGate()
 	SetCodexUsageRefreshEnabled(true)
 	payOwedCodexUsageRefresh()
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RunFloorMs != 0 || snap.RefreshOwedAtMs != 0 {
@@ -2138,10 +2234,10 @@ func TestCodexSmoke_KilledRunOwesNothingAfterARestart(t *testing.T) {
 
 /* ─────────────────────── live fallback accounting ─────────────────────── */
 
-// A run whose rollout attempts all come up empty gets exactly ONE live read,
-// after them and never before; a later pass of the worker over the same debt
-// spends none.
-func TestCodexRefreshAfterRun_LiveFallbackRunsOncePerDebt(t *testing.T) {
+// A run whose rollout attempts all come up empty reaches the live read only AFTER
+// every scan is spent, spends at most codexRefreshLiveReadMaxAttempts of them,
+// and a later pass over the same, now exhausted, debt spends none.
+func TestCodexRefreshAfterRun_LiveFallbackBoundedPerDebt(t *testing.T) {
 	now := time.Now()
 	runStart := now.Add(-2 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
@@ -2153,20 +2249,23 @@ func TestCodexRefreshAfterRun_LiveFallbackRunsOncePerDebt(t *testing.T) {
 	})
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 	codexRunDebtWorker(f.home, f.fp)
 
-	if got := *calls; got != 1 {
-		t.Fatalf("live reads = %d, want exactly one for the debt", got)
+	if got := *calls; got != int32(codexRefreshLiveReadMaxAttempts) {
+		t.Fatalf("live reads = %d, want the debt's whole budget of %d and no more", got, codexRefreshLiveReadMaxAttempts)
 	}
 	if attemptsAtRead < codexRefreshAfterRunMaxAttempts {
 		t.Fatalf("the live read ran after %d rollout attempts, want it only once all %d were spent", attemptsAtRead, codexRefreshAfterRunMaxAttempts)
 	}
 }
 
-// Offline, the fallback never runs; it resolves to skipped so the card is not
-// left waiting on a read that cannot happen.
-func TestCodexRefreshAfterRun_LiveFallbackSkippedWhileOffline(t *testing.T) {
+// Offline, the fallback never runs — and because nothing left the device it
+// spends no read and stays RETRYABLE (`deferred`), so the ladder comes back to
+// it once the device is online. This is the reported case: `skipped` used to be
+// final, so a brief IsOffline() right after a self-update ended the debt's only
+// network recovery for good.
+func TestCodexRefreshAfterRun_LiveFallbackDeferredWhileOffline(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
@@ -2180,8 +2279,11 @@ func TestCodexRefreshAfterRun_LiveFallbackSkippedWhileOffline(t *testing.T) {
 		t.Fatalf("an offline agent spent %d live reads", *calls)
 	}
 	state := codexRunFreshnessForAccount(f.fp, time.Now())
-	if state.fallback != codexFallbackSkipped || codexStaleRunNotice(state) == "" {
-		t.Fatalf("offline fallback must resolve to skipped and let the notice through: %+v", state)
+	if state.fallback != codexFallbackDeferred || state.liveReads != 0 {
+		t.Fatalf("offline fallback must defer without spending a read: %+v", state)
+	}
+	if notice := codexStaleRunNotice(state); notice != "" {
+		t.Fatalf("a deferred debt is still trying and must not warn yet, got %q", notice)
 	}
 }
 
@@ -2195,7 +2297,7 @@ func TestCodexRefreshAfterRun_DebtPaidByFallbackClearsWithoutNotice(t *testing.T
 	stubCodexFallbackRead(t, capturingFallbackRead)
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
 	if snap.RefreshOwedAtMs != 0 || snap.RefreshFallbackState != codexFallbackUnset {
@@ -2211,9 +2313,9 @@ func TestCodexRefreshAfterRun_DebtPaidByFallbackClearsWithoutNotice(t *testing.T
 }
 
 // A read the shared cooldown refuses spawned nothing, so it does not spend the
-// once-per-debt bound: the fallback stays OUTSTANDING (the notice held back)
-// for as long as the worker is still there to reach it.
-func TestCodexRefreshAfterRun_CooldownRefusalLeavesFallbackOutstanding(t *testing.T) {
+// read budget: the fallback resolves to `deferred` (the notice held back) and the
+// ladder's spacing rung brings it back.
+func TestCodexRefreshAfterRun_CooldownRefusalDefersTheFallback(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
@@ -2226,24 +2328,25 @@ func TestCodexRefreshAfterRun_CooldownRefusalLeavesFallbackOutstanding(t *testin
 		t.Fatalf("reads = %d, want one retry after waiting out the cooldown (%d)", *calls, codexLiveUsageFallbackTries)
 	}
 	after := codexRunFreshnessForAccount(f.fp, time.Now())
-	if after.fallback != codexFallbackOutstanding {
-		t.Fatalf("a cooldown refusal must leave the fallback outstanding, got %q", after.fallback)
+	if after.fallback != codexFallbackDeferred || after.liveReads != 0 {
+		t.Fatalf("a cooldown refusal must defer without spending a read: %+v", after)
 	}
 	if notice := codexStaleRunNotice(after); notice != "" {
-		t.Fatalf("an outstanding fallback must hold the notice back, got %q", notice)
+		t.Fatalf("a deferred fallback must hold the notice back, got %q", notice)
 	}
-	// Still owed: a later pass reaches the read.
+	// Still owed, and the read budget is untouched: a later pass reaches the read.
 	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
 	codexLiveUsageFallback(f.fp, after)
-	if got := codexRunFreshnessForAccount(f.fp, time.Now()).fallback; got != codexFallbackSpent {
-		t.Fatalf("the later pass must spend the owed read, state=%q", got)
+	got := codexRunFreshnessForAccount(f.fp, time.Now())
+	if got.liveReads != 1 || got.fallback != codexFallbackDeferred {
+		t.Fatalf("the later pass must spend one of the %d reads and stay retryable: %+v", codexRefreshLiveReadMaxAttempts, got)
 	}
 }
 
-// A worker that retires with the fallback still outstanding resolves it to
-// skipped: nothing reschedules the worker, and the notice must surface now
-// rather than after codexRefreshOwedMaxAge.
-func TestCodexRunDebtWorker_RetiringResolvesOutstandingFallback(t *testing.T) {
+// A worker that retires having BOOKED a rung leaves the debt `deferred` and the
+// notice hidden: the ladder is still going to come back to it, and a warning
+// that appeared now would disappear again on the next rung.
+func TestCodexRunDebtWorker_RetiringWithARungBookedKeepsTheNoticeHidden(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
@@ -2253,11 +2356,41 @@ func TestCodexRunDebtWorker_RetiringResolvesOutstandingFallback(t *testing.T) {
 	codexRunDebtWorker(f.home, f.fp)
 
 	state := codexRunFreshnessForAccount(f.fp, time.Now())
-	if state.fallback != codexFallbackSkipped {
-		t.Fatalf("retiring worker left the fallback %q, want skipped", state.fallback)
+	if state.fallback == codexFallbackExhausted {
+		t.Fatalf("a cooldown refusal spent nothing and must stay retryable: %+v", state)
+	}
+	if state.nextAttemptAt.IsZero() {
+		t.Fatalf("the retiring worker must book a rung: %+v", state)
+	}
+	if notice := codexStaleRunNotice(state); notice != "" {
+		t.Fatalf("a booked rung means still trying, got %q", notice)
+	}
+}
+
+// A worker that retires with BOTH budgets spent books nothing, resolves the
+// fallback to `exhausted` and lets the notice surface now — nothing else will
+// look at this debt before its age-out.
+func TestCodexRunDebtWorker_RetiringWithNoBudgetLeftSurfacesTheNotice(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeRPCError })
+	f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	// Each pass reaches OpenAI and fails, so the read budget drains.
+	for i := 0; i < codexRefreshLiveReadMaxAttempts; i++ {
+		codexRunDebtWorker(f.home, f.fp)
+	}
+
+	if int(*calls) != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("live reads = %d, want the debt's whole budget of %d", *calls, codexRefreshLiveReadMaxAttempts)
+	}
+	state := codexRunFreshnessForAccount(f.fp, time.Now())
+	if state.fallback != codexFallbackExhausted || !state.nextAttemptAt.IsZero() {
+		t.Fatalf("a spent budget must book nothing and read exhausted: %+v", state)
 	}
 	if codexStaleRunNotice(state) == "" {
-		t.Fatal("the stale notice must surface once the worker retires")
+		t.Fatal("the stale notice must surface once both budgets are spent")
 	}
 }
 
@@ -2287,15 +2420,15 @@ func TestCodexRecordRefreshAttempt_LastAttemptOwesFallbackOnlyWhileWorkerRuns(t 
 		t.Fatalf("with a worker running the last attempt must owe the fallback and hold the notice: %+v", held)
 	}
 	codexUsageRefresh.releaseWorker(f.fp)
-	codexSkipOutstandingFallback(f.fp)
-	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackSkipped || codexStaleRunNotice(got) == "" {
+	codexResolveOutstandingFallback(f.fp, false)
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackExhausted || codexStaleRunNotice(got) == "" {
 		t.Fatalf("the retiring worker must release the notice: %+v", got)
 	}
 
 	state = oweOneAttemptLeft()
 	codexRecordRefreshAttempt(f.fp, state.debtID(), 1)
-	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackUnset || codexStaleRunNotice(got) == "" {
-		t.Fatalf("with no worker nothing may hold the notice back: %+v", got)
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()); got.fallback != codexFallbackUnset {
+		t.Fatalf("with no worker nothing may claim the fallback: %+v", got)
 	}
 }
 
@@ -2317,7 +2450,13 @@ func TestCodexParse_NoStaleNoticeWhileLiveFallbackInFlight(t *testing.T) {
 
 	during, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
 	close(release)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
+	// Drain the rest of the read budget: one unpaid read leaves the debt
+	// `deferred` (still trying), and the notice is only due once nothing is left.
+	stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
+	for i := 0; i < codexRefreshLiveReadMaxAttempts; i++ {
+		codexLiveUsageFallback(f.fp, codexRunFreshnessForAccount(f.fp, time.Now()))
+	}
 	after, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
 
 	if during.Notice != "" {

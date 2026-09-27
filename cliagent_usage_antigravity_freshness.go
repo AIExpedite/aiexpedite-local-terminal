@@ -68,8 +68,9 @@ import (
 const (
 	// antigravityRefreshAfterRunMaxAttempts bounds the Code Assist reads the
 	// settle-driven pass may spend (immediate, then one retry after
-	// antigravityRefreshAfterRunRetryDelay). Mirrors
-	// codexRefreshAfterRunMaxAttempts. Scheduled passes spend one each.
+	// antigravityRefreshAfterRunRetryDelay). Scheduled passes spend one each.
+	// Antigravity's own bound — the Codex equivalent deliberately diverges, since
+	// its attempts are local file scans rather than outbound reads.
 	antigravityRefreshAfterRunMaxAttempts = 2
 	// antigravityRefreshDebtMaxAttempts is the debt's LIFETIME budget of
 	// outbound Code Assist reads, across the settle pass and every scheduled

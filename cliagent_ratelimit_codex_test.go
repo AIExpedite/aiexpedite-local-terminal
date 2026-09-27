@@ -3922,7 +3922,7 @@ func TestCodexReconcileFromRollout_ResetsCursorForDifferentCodexHome(t *testing.
 	if err := os.Chtimes(firstPath, firstMtime, firstMtime); err != nil {
 		t.Fatal(err)
 	}
-	metrics, _, _ := codexReconcileFromRollout(context.Background(), firstBase, "", now)
+	metrics, _, _, _ := codexReconcileFromRollout(context.Background(), firstBase, "", now)
 	if got := metrics[0].Consumed; got == nil || *got != 31 {
 		t.Fatalf("first CODEX_HOME session usage=%v, want 31", got)
 	}
@@ -3947,7 +3947,7 @@ func TestCodexReconcileFromRollout_ResetsCursorForDifferentCodexHome(t *testing.
 		t.Fatalf("different CODEX_HOME cursor=%+v, want reset before discovery", cursor)
 	}
 
-	metrics, _, _ = codexReconcileFromRollout(context.Background(), secondBase, "", now)
+	metrics, _, _, _ = codexReconcileFromRollout(context.Background(), secondBase, "", now)
 	if got := metrics[0].Consumed; got == nil || *got != 64 {
 		t.Fatalf("second CODEX_HOME session usage=%v, want older-mtime rollout reconciled at 64", got)
 	}
@@ -6215,11 +6215,11 @@ func TestCodexRateLimitSnapshot_CaptureStampsRoundTripAndLegacyLoads(t *testing.
 	now := time.Now()
 	codexRateLimitCacheTransaction(context.Background(), cache, now, true, func(snap *codexRateLimitSnapshot) bool {
 		snap.CodexVersion, snap.RolloutCursorVersion = "codex-cli 0.150.0", "codex-cli 0.149.0"
-		snap.RefreshFallbackState = codexFallbackSkipped
+		snap.RefreshFallbackState = codexFallbackDeferred
 		return true
 	})
 	snap, ok := loadCodexRateLimitSnapshot(cache)
-	if !ok || snap.CodexVersion != "codex-cli 0.150.0" || snap.RolloutCursorVersion != "codex-cli 0.149.0" || snap.RefreshFallbackState != codexFallbackSkipped {
+	if !ok || snap.CodexVersion != "codex-cli 0.150.0" || snap.RolloutCursorVersion != "codex-cli 0.149.0" || snap.RefreshFallbackState != codexFallbackDeferred {
 		t.Fatalf("round trip lost a field: ok=%v %+v", ok, snap)
 	}
 
@@ -6233,6 +6233,94 @@ func TestCodexRateLimitSnapshot_CaptureStampsRoundTripAndLegacyLoads(t *testing.
 	}
 	if view := codexCacheViewFromSnapshot(snap); codexCaptureDriftFromView(view, "codex-cli 0.150.0") {
 		t.Fatal("an unstamped reading is not drift")
+	}
+}
+
+// The schedule's persisted fields round-trip, are surfaced on the cache view, and
+// are cleared with the debt they belong to — except the expiry marker, which
+// outlives the debt on purpose so the card can still explain itself.
+func TestCodexRateLimitSnapshot_ScheduleFieldsRoundTripAndScope(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, now.Add(-time.Minute), now)
+		snap.NextAttemptAtMs, snap.RefreshLiveReads = now.Add(time.Minute).UnixMilli(), 1
+		// A marker floor NEWER than the seeded reading, or the covering-observation
+		// clear would (correctly) retract it in this same write.
+		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = now.Add(time.Hour).UnixMilli(), now.UnixMilli()
+	})
+
+	snap := f.snapshot(t)
+	if snap.NextAttemptAtMs == 0 || snap.RefreshLiveReads != 1 ||
+		snap.StaleRunNoticeFloorMs == 0 || snap.StaleRunNoticeAtMs == 0 {
+		t.Fatalf("round trip lost a schedule field: %+v", snap)
+	}
+	view := codexCacheViewFromSnapshot(snap)
+	if view.nextAttemptAtMs != snap.NextAttemptAtMs || view.refreshLiveReads != snap.RefreshLiveReads ||
+		view.staleNoticeFloorMs != snap.StaleRunNoticeFloorMs || view.staleNoticeAtMs != snap.StaleRunNoticeAtMs {
+		t.Fatalf("the cache view drops a schedule field: %+v", view)
+	}
+
+	// Clearing the debt drops the rung and the read counter; the marker stays.
+	codexRecordRunFreshness(f.fp, now, codexClearRunFreshnessDebt)
+	cleared := f.snapshot(t)
+	if cleared.NextAttemptAtMs != 0 || cleared.RefreshLiveReads != 0 || cleared.RefreshOwedAtMs != 0 {
+		t.Fatalf("clearing the debt must drop its rung and counters: %+v", cleared)
+	}
+	if cleared.StaleRunNoticeFloorMs == 0 {
+		t.Fatalf("the expiry marker must outlive the debt it describes: %+v", cleared)
+	}
+
+	// A rescope to another account drops everything, marker included: the new
+	// account must not be warned about a run it never made.
+	codexRecordRunFreshness("another-account", now, func(snap *codexRateLimitSnapshot) {})
+	rescoped := f.snapshot(t)
+	if rescoped.NextAttemptAtMs != 0 || rescoped.RefreshLiveReads != 0 ||
+		rescoped.StaleRunNoticeFloorMs != 0 || rescoped.StaleRunNoticeAtMs != 0 {
+		t.Fatalf("a rescope must drop every run-freshness field: %+v", rescoped)
+	}
+}
+
+// A cache written before the deferred/exhausted split is migrated by what each
+// legacy value MEANT, not by the fact that both were final. Mapping either to
+// `exhausted` would carry the reported bug across the upgrade that ships the fix.
+func TestCodexRateLimitSnapshot_LegacyFallbackStateMigration(t *testing.T) {
+	for _, tc := range []struct {
+		legacy    string
+		wantReads int
+	}{
+		// "skipped" was offline / a disabled gate / worker retirement: no request
+		// ever left the device, so the whole read budget is still available.
+		{codexLegacyFallbackSkipped, 0},
+		// "spent" proves exactly one outbound read, so one remains.
+		{codexLegacyFallbackSpent, 1},
+	} {
+		t.Run(tc.legacy, func(t *testing.T) {
+			cache := isolateCodexCache(t)
+			legacy := `{"updatedAt":"2026-09-01T00:00:00Z","buckets":{"primary":{"usedPercentage":10}},` +
+				`"runFloorMs":1,"refreshOwedAtMs":2,"refreshOwedAttempts":2,` +
+				`"refreshFallbackState":"` + tc.legacy + `"}`
+			if err := os.WriteFile(cache, []byte(legacy), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			snap, ok := loadCodexRateLimitSnapshot(cache)
+			if !ok {
+				t.Fatal("legacy cache failed to load")
+			}
+			if snap.RefreshFallbackState != codexFallbackDeferred {
+				t.Fatalf("legacy %q loaded as %q, want deferred — an exhausted debt is unpayable forever",
+					tc.legacy, snap.RefreshFallbackState)
+			}
+			if snap.RefreshLiveReads != tc.wantReads {
+				t.Fatalf("legacy %q charged %d reads, want %d", tc.legacy, snap.RefreshLiveReads, tc.wantReads)
+			}
+			if snap.RefreshLiveReads >= codexRefreshLiveReadMaxAttempts {
+				t.Fatalf("legacy %q must leave at least one of the %d reads available",
+					tc.legacy, codexRefreshLiveReadMaxAttempts)
+			}
+		})
 	}
 }
 

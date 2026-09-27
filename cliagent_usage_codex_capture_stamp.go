@@ -303,7 +303,7 @@ func codexCaptureDriftNotice(state codexRunFreshnessState, detectedVersion strin
 		last = fmt.Sprintf("Codex utilization was last observed %s by Codex build %q", state.latest.UTC().Format(layout), stamped)
 	}
 	return fmt.Sprintf("%s; the installed build %q has not reported utilization since the most recent Codex run started (%s). It will update once that build's telemetry is captured.",
-		last, installed, state.floor.UTC().Format(layout))
+		last, installed, state.noticeFloor().UTC().Format(layout))
 }
 
 // codexRunFreshnessNotice is the run-freshness notice the card shows: capture

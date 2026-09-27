@@ -252,3 +252,42 @@ func TestNotifyOfflineHonorsContextCancel(t *testing.T) {
 		t.Fatalf("expected notifyOffline to surface ctx.Err() when cancelled")
 	}
 }
+
+// The Codex equivalent: a pending rung must not fire into a process that is
+// exiting — including one handing off to an update, where it would write into a
+// cache the replacement process is about to read. The schedule is on disk, so the
+// next process re-arms it (payOwedCodexUsageRefresh).
+func TestGracefulShutdownStopsTheCodexRefreshSchedule(t *testing.T) {
+	resetShutdownState(t)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+	// A rung long enough to still be armed when shutdown runs, booked through the
+	// real schedule so it is PERSISTED as well as armed.
+	prevLadder := codexRunDebtRetryLadder
+	codexRunDebtRetryLadder = []time.Duration{time.Hour, time.Hour, time.Hour, time.Hour}
+	t.Cleanup(func() { codexRunDebtRetryLadder = prevLadder })
+	if !codexScheduleRunDebtRetry(f.fp, state, time.Now(), codexRetryAfterScan) {
+		t.Fatal("precondition: the rung should have been booked")
+	}
+	if !codexRunDebtRetryPending() || f.snapshot(t).NextAttemptAtMs == 0 {
+		t.Fatal("precondition: a rung should be armed and on disk")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	gracefulShutdown(ctx, &Config{})
+
+	if codexRunDebtRetryPending() {
+		t.Error("gracefulShutdown left the refresh rung armed")
+	}
+	// And nothing can book a new one while the process is going down — the rung
+	// already on disk is left alone for the next process rather than cleared.
+	if codexScheduleRunDebtRetry(f.fp, state, time.Now(), codexRetryAfterScan) {
+		t.Error("a retry was booked during shutdown")
+	}
+	if f.snapshot(t).NextAttemptAtMs == 0 {
+		t.Error("shutdown cleared the persisted rung instead of leaving it for the next process")
+	}
+}
