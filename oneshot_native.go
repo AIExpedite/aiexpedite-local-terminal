@@ -1179,7 +1179,10 @@ func (m *oneShotNativeManager) probeVersionUncached() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), oneShotVersionProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, "--version")
-	hideWindow(cmd)
+	// Hides the console on Windows; on Unix makes the child a process-group
+	// leader so the tree kill below reaches its descendants (and it cannot
+	// prompt on a controlling terminal).
+	detachControllingTTY(cmd)
 	// CommandContext alone kills only the direct child. A Windows `.cmd`
 	// launcher (Muse Code's runs PowerShell) leaves its descendants holding
 	// the output pipe, and CombinedOutput would then block past the deadline.
