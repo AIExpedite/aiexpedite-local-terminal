@@ -4451,6 +4451,14 @@ func resolveExecutable(command string) string {
 			return p
 		}
 	}
+	// Same fallback for Muse Code's installer dir (MUSE_INSTALL_DIR, else
+	// ~/.local/bin or %LOCALAPPDATA%\Programs\muse), so the generic
+	// session_start / takeover path runs the install detection reported.
+	if isMuseCodeCommand(command) {
+		if p := resolveInstallerBinary("muse", installerBinDirFor("muse")); p != "" {
+			return p
+		}
+	}
 
 	return command
 }

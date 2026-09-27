@@ -634,6 +634,73 @@ func killOneShotProcessTree(cmd *exec.Cmd) {
 	_ = killProcessGroup(pid)
 }
 
+// oneShotShimPathEnv and oneShotShimArgEnvPrefix name the child environment
+// variables a Windows `.cmd` launch carries its shim path and variable
+// operands in (see oneShotShimScript).
+const (
+	oneShotShimPathEnv      = "AIX_ONESHOT_SHIM_PATH"
+	oneShotShimArgEnvPrefix = "AIX_ONESHOT_SHIM_ARG_"
+)
+
+// newOneShotCommand builds the child for one turn or version probe. A Windows
+// `.cmd` / `.bat` launcher (Muse Code's `muse.cmd`, an npm shim) cannot be
+// started by CreateProcess directly, so it goes through cmd.exe via the same
+// cliSmokeShimCommand route the maintenance smokes use; a native binary, or an
+// argv the shim renderer refuses, spawns directly.
+func newOneShotCommand(ctx context.Context, executable string, args, env []string, dir string) *exec.Cmd {
+	if isWindowsShimPath(executable) {
+		if script, shimEnv, ok := oneShotShimScript(executable, args, env); ok {
+			return cliSmokeShimCommand(ctx, script, shimEnv, dir)
+		}
+	}
+	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd.Env = env
+	cmd.Dir = dir
+	return cmd
+}
+
+// oneShotShimScript renders a cmd.exe script for a `.cmd` launch. Fixed tokens
+// (subcommands, `--flags`) stay literal; every other operand — the session id,
+// the prompt file path — rides in the returned environment and is referenced
+// as a quoted `%VAR%`, so cmd.exe's single expansion pass can neither re-split
+// nor re-expand it. ok=false for an operand that cannot survive that quoting
+// (empty — cmd.exe leaves an empty `%VAR%` literal — or holding a quote or a
+// line break).
+func oneShotShimScript(executable string, args, env []string) (script string, shimEnv []string, ok bool) {
+	var b strings.Builder
+	b.WriteString(`"%` + oneShotShimPathEnv + `%"`)
+	shimEnv = setEnvVar(env, oneShotShimPathEnv, executable)
+	for i, arg := range args {
+		if grokSmokeFixedFlagToken(arg) || isOneShotShimWord(arg) {
+			b.WriteString(" " + arg)
+			continue
+		}
+		if arg == "" || strings.ContainsAny(arg, "\"\r\n") {
+			return "", nil, false
+		}
+		name := fmt.Sprintf("%s%d", oneShotShimArgEnvPrefix, i)
+		shimEnv = setEnvVar(shimEnv, name, arg)
+		b.WriteString(` "%` + name + `%"`)
+	}
+	return b.String(), shimEnv, true
+}
+
+// isOneShotShimWord reports whether arg is a bare word (`exec`, `run`) that
+// cmd.exe passes through unchanged.
+func isOneShotShimWord(arg string) bool {
+	if arg == "" {
+		return false
+	}
+	for _, r := range arg {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (m *oneShotNativeManager) runOneShot(
 	session *oneShotNativeSession,
 	runDir, executable, prompt, nativeID string,
@@ -650,11 +717,10 @@ func (m *oneShotNativeManager) runOneShot(
 		_ = os.Remove(promptPath)
 	}()
 
-	cmd := exec.Command(executable, m.spec.BuildArgs(nativeID, promptPath)...)
+	cmd := newOneShotCommand(context.Background(), executable, m.spec.BuildArgs(nativeID, promptPath),
+		stripEnvPrefixes(os.Environ(), m.spec.StripEnvPrefixes), runDir)
 	// Own process group so cancel/timeout can reap tools that inherited pipes.
 	detachControllingTTY(cmd)
-	cmd.Dir = runDir
-	cmd.Env = stripEnvPrefixes(os.Environ(), m.spec.StripEnvPrefixes)
 	cmd.Stdin = promptFile
 
 	stdout, err := cmd.StdoutPipe()
@@ -962,7 +1028,21 @@ func (m *oneShotNativeManager) End(id string) error {
 	if session == nil {
 		return fmt.Errorf("%s session %s not found", kind, id)
 	}
+	return m.endSession(id, session)
+}
 
+// endIfSame ends id only while it still maps to the sampled session. The stale
+// reaper samples under m.mu and ends after releasing it; resolving the id again
+// there would tear down a replacement Start that reused it.
+func (m *oneShotNativeManager) endIfSame(id string, sampled *oneShotNativeSession) error {
+	if m.Get(id) != sampled {
+		return staleEndError(m.spec.DisplayName+" native", id)
+	}
+	return m.endSession(id, sampled)
+}
+
+func (m *oneShotNativeManager) endSession(id string, session *oneShotNativeSession) error {
+	kind := m.spec.DisplayName + " native"
 	session.mu.Lock()
 	if session.status == "ended" {
 		session.mu.Unlock()
@@ -1053,6 +1133,7 @@ func (m *oneShotNativeManager) CleanupStale(maxAge time.Duration) {
 func (m *oneShotNativeManager) endStaleSessions(maxAge time.Duration) {
 	type staleInfo struct {
 		id          string
+		session     *oneShotNativeSession
 		workspaceID string
 		uid         string
 		publishFn   PublishFunc
@@ -1063,7 +1144,7 @@ func (m *oneShotNativeManager) endStaleSessions(maxAge time.Duration) {
 	for id, s := range m.sessions {
 		if now.Sub(s.StartedAt) > maxAge {
 			s.mu.Lock()
-			stale = append(stale, staleInfo{id: id, workspaceID: s.WorkspaceID, uid: s.UID, publishFn: s.publishFn})
+			stale = append(stale, staleInfo{id: id, session: s, workspaceID: s.WorkspaceID, uid: s.UID, publishFn: s.publishFn})
 			s.mu.Unlock()
 		}
 	}
@@ -1072,7 +1153,7 @@ func (m *oneShotNativeManager) endStaleSessions(maxAge time.Duration) {
 		m.logf(colorYellow, "Reaping stale session %s", ss.id)
 		trackTerminalPublishStart()
 		// Withheld for an unconfirmed or stale end — see the *_end handler.
-		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
+		if err := m.endIfSame(ss.id, ss.session); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
 			m.logf(colorRed, "Stale reap withheld ended frame for %s — %v", ss.id, err)
 			trackTerminalPublishEnd()
 			continue
@@ -1178,7 +1259,7 @@ func (m *oneShotNativeManager) probeVersionUncached() (string, error) {
 	// wrapper that hangs (an update check, a lock) must not wedge it.
 	ctx, cancel := context.WithTimeout(context.Background(), oneShotVersionProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, "--version")
+	cmd := newOneShotCommand(ctx, executable, []string{"--version"}, os.Environ(), "")
 	// Hides the console on Windows; on Unix makes the child a process-group
 	// leader so the tree kill below reaches its descendants (and it cannot
 	// prompt on a controlling terminal).

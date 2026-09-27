@@ -522,3 +522,63 @@ func TestOneShotNative_VersionProbeIsBoundedForLauncherTrees(t *testing.T) {
 		t.Fatalf("probe took %v; the deadline must bound the whole launcher tree", elapsed)
 	}
 }
+
+// The stale reaper samples under m.mu and ends after releasing it. If the
+// sampled session was ended and its id reused by a replacement Start in that
+// window, the reap must refuse (staleEndError) rather than end the replacement.
+func TestOneShotNative_StaleReapSparesAReplacementUnderTheSameID(t *testing.T) {
+	m := installMuseCodeStub(t)
+	cwd := startMuse(t, m, "s", "")
+	sampled := m.Get("s")
+	if err := m.End("s"); err != nil {
+		t.Fatalf("end: %v", err)
+	}
+	if err := m.Start("s", cwd, "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("replacement start: %v", err)
+	}
+	replacement := m.Get("s")
+
+	if err := m.endIfSame("s", sampled); !errors.Is(err, errEndStaleSession) {
+		t.Fatalf("a reap of a replaced session must be refused as stale, got %v", err)
+	}
+	if m.Get("s") != replacement || replacement.Status() == "ended" {
+		t.Fatal("the replacement session must survive the stale reap")
+	}
+	if err := m.endIfSame("s", replacement); err != nil {
+		t.Fatalf("ending the sampled session itself must still work: %v", err)
+	}
+}
+
+func TestOneShotShimScript_KeepsVariableOperandsInTheEnvironment(t *testing.T) {
+	prompt := `C:\Users\A B\%TEMP%\aix muse\prompt-1.txt`
+	args := buildMuseCodeNativeArgs("3f2b8c1e-6a4d-4e2f-9b7a-1c2d3e4f5a6b", prompt)
+	script, env, ok := oneShotShimScript(`C:\Users\A B\muse.cmd`, args, []string{"PATH=x"})
+	if !ok {
+		t.Fatal("the Muse Code turn argv must render as a shim script")
+	}
+	want := `"%AIX_ONESHOT_SHIM_PATH%" exec --json --disable-approval --session-id 3f2b8c1e-6a4d-4e2f-9b7a-1c2d3e4f5a6b --prompt-file "%AIX_ONESHOT_SHIM_ARG_6%"`
+	if script != want {
+		t.Fatalf("script:\n got %s\nwant %s", script, want)
+	}
+	if strings.Contains(script, prompt) || strings.Contains(script, "muse.cmd") {
+		t.Fatal("paths must ride in the environment, never in the script text")
+	}
+	envSet := map[string]bool{}
+	for _, kv := range env {
+		envSet[kv] = true
+	}
+	for _, kv := range []string{"PATH=x", `AIX_ONESHOT_SHIM_PATH=C:\Users\A B\muse.cmd`, "AIX_ONESHOT_SHIM_ARG_6=" + prompt} {
+		if !envSet[kv] {
+			t.Fatalf("env missing %q: %v", kv, env)
+		}
+	}
+
+	if script, _, ok := oneShotShimScript("muse.cmd", []string{"--version"}, nil); !ok || script != `"%AIX_ONESHOT_SHIM_PATH%" --version` {
+		t.Fatalf("version probe script = %q, ok=%v", script, ok)
+	}
+	for _, bad := range []string{"", `a"b`, "a\nb"} {
+		if _, _, ok := oneShotShimScript("muse.cmd", []string{"--prompt-file", bad}, nil); ok {
+			t.Fatalf("operand %q cannot survive cmd.exe quoting and must be refused", bad)
+		}
+	}
+}
