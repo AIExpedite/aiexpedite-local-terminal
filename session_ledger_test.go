@@ -598,3 +598,26 @@ func TestLedgerCapEvictsOnlyReapedEvidence(t *testing.T) {
 		}
 	}
 }
+
+// TestUntrackWithoutDescendantProofMakesTheSessionIncomplete: once a turn's
+// record is dropped, a session whose descendants cannot be proven gone
+// (Unix, uncontained Windows) can never be certified by that record's
+// absence — it is marked incomplete.
+func TestUntrackWithoutDescendantProofMakesTheSessionIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLedger(t, dir, "boot-1")
+	l.descendants = func(ledgerProcess) processProbeResult { return processUnknown }
+	l.OpenLogicalSession("agy")
+	l.BeginSpawn("agy")
+	l.TrackProcess("agy", proc(31), false)
+	l.UntrackProcess("agy", 31)
+	e := readLedgerFile(t, dir).Entries
+	if len(e) != 1 || !e[0].Incomplete || len(e[0].PIDs) != 0 {
+		t.Fatalf("entry = %+v, want incomplete", e)
+	}
+	l2 := newTestLedger(t, dir, "boot-2")
+	l2.RunBootReap()
+	if r := l2.Report(context.Background()); len(r.SessionsReaped) != 0 {
+		t.Fatalf("certified without descendant proof: %+v", r)
+	}
+}

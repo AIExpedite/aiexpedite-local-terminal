@@ -121,3 +121,15 @@ func TestBootReap_LeaderGoneGroupAliveIsNotReaped(t *testing.T) {
 		t.Fatalf("the unrecorded group member was touched (probe = %v)", got)
 	}
 }
+
+// TestUnixNeverVouchesForDescendants: an empty process group does not prove
+// a setsid'd descendant gone, so Unix never vouches for descendants.
+func TestUnixNeverVouchesForDescendants(t *testing.T) {
+	cmd, _ := startLedgerChild(t, "grok-smoke-hang")
+	rec := recordedProcess(t, cmd.Process)
+	_ = cmd.Process.Kill()
+	waitForProbe(t, rec, processGone, 5*time.Second)
+	if got := probeRecordedDescendants(rec); got != processUnknown {
+		t.Fatalf("descendants = %v, want unknown", got)
+	}
+}

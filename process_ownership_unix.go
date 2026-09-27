@@ -78,25 +78,32 @@ var signalRecordedGroup = func(rec ledgerProcess) {
 	_ = syscall.Kill(rec.PID, syscall.SIGKILL)
 }
 
-// probeRecordedDescendants answers, once the recorded group leader is gone,
-// whether its process group is empty too. A tool the CLI started stays in
-// the group (unless it made its own session), so a group that still has
-// members means the session is not provably gone. Such members are never
-// signalled here: only a leader with a matching start time proves the group
-// is ours. A process that led no group of its own cannot be vouched for.
+// probeRecordedDescendants answers whether everything a gone process started
+// is provably gone too. On Unix it never is: an empty process group proves
+// nothing about a descendant that called setsid / setpgid and left it, and
+// the agent does not enumerate processes to look for one. There is no kernel
+// containment equivalent to a kill-on-close Job Object here, so a Unix
+// session is never certified reaped through a process it spawned (it stays
+// unproven; the run parks rather than failing over). Linux cgroups would be
+// the way to add this proof later.
 func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
-	if rec.PGID <= 0 || rec.PGID != rec.PID {
-		return processUnknown
-	}
-	if err := syscall.Kill(-rec.PGID, 0); errors.Is(err, syscall.ESRCH) {
-		return processGone
-	}
 	return processUnknown
+}
+
+// processGroupEmpty reports whether the group the recorded process led has
+// no member left. It decides only housekeeping (whether a record is still
+// worth keeping), never proof.
+func processGroupEmpty(rec ledgerProcess) bool {
+	if rec.PGID <= 0 || rec.PGID != rec.PID {
+		return true
+	}
+	err := syscall.Kill(-rec.PGID, 0)
+	return errors.Is(err, syscall.ESRCH)
 }
 
 // processTreeGone: an exited per-turn leader's process group is empty.
 func processTreeGone(p ledgerProcess, job uintptr) bool {
-	return probeRecordedDescendants(p) == processGone
+	return processGroupEmpty(p)
 }
 
 // endRecordedProcess ends the recorded process (its whole process group when
@@ -115,7 +122,7 @@ func endRecordedProcess(rec ledgerProcess, wait time.Duration) processProbeResul
 		}
 		// Killed members linger as zombies until init reaps them; wait for
 		// the group to empty, within the same bound.
-		if res == processGone && (rec.PGID != rec.PID || rec.PGID <= 0 || probeRecordedDescendants(rec) == processGone) {
+		if res == processGone && processGroupEmpty(rec) {
 			return processGone
 		}
 		if time.Now().After(deadline) {

@@ -24,7 +24,12 @@
 // Unix, its tree on Windows — normally the kill-on-close Job Object already
 // did that when the old agent died). Each session is then:
 //
-//   - reaped    — none of its recorded processes is still ours;
+//   - reaped    — none of its recorded processes is still ours AND everything
+//     they started is provably gone: only a process that ran from its first
+//     instruction inside a kill-on-close Job Object (Windows, `contained`)
+//     proves that. On Unix nothing does (a setsid'd descendant leaves the
+//     group unseen), so a Unix session with a recorded process is never
+//     certified; it stays unproven and its run parks;
 //   - surviving — one could not be ended (kept, retried every boot);
 //   - unknown   — its state could not be determined (access denied, an
 //     incomplete record): never listed, kept for a retry.
@@ -516,6 +521,13 @@ func (l *spawnLedger) UntrackProcess(sessionID string, pid int) {
 				colorYellow, sessionID, pid, colorReset)
 			kept = append(kept, p)
 			continue
+		}
+		// The record goes, but whether everything it started is gone
+		// cannot always be proven (Unix; an uncontained Windows process).
+		// Then the still-open session can never be certified by the
+		// absence of this record: it becomes incomplete.
+		if l.descendants(p) != processGone {
+			e.Incomplete = true
 		}
 		l.releaseJobLocked(pid)
 	}

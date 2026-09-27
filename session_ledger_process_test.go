@@ -164,17 +164,12 @@ func TestBootReapEndsAnEarlierBootsProcess(t *testing.T) {
 	if r.PreviousBootID != "boot-old" {
 		t.Fatalf("report = %+v", r)
 	}
-	if runtime.GOOS == "windows" {
-		// Not started suspended in a job: its descendants are never vouched
-		// for, so ending it proves the session nothing (see the contained
-		// case in process_ownership_windows_test.go).
-		if len(r.SessionsReaped) != 0 {
-			t.Fatalf("an uncontained Windows session was reported reaped: %+v", r)
-		}
-		return
-	}
-	if len(r.SessionsReaped) != 1 || r.SessionsReaped[0] != "orphaned" {
-		t.Fatalf("report = %+v", r)
+	// The recorded process is ended, but nothing proves what it started is
+	// gone (uncontained on Windows — see the contained case in
+	// process_ownership_windows_test.go; never provable on Unix), so the
+	// session is not certified.
+	if len(r.SessionsReaped) != 0 {
+		t.Fatalf("a session without descendant proof was reported reaped: %+v", r)
 	}
 }
 
