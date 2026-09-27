@@ -30,6 +30,14 @@ func codexSmokeEnv(t *testing.T) (home string, rec *codexRunHookRecorder) {
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "codex_rate_limits.json"))
 	stubCodexLogin(t, true, true)
+	// runCodexSmoke publishes the binary it validated to the PROCESS-GLOBAL
+	// capture version, and nothing here was undoing it. A later test whose cache
+	// carries a different RolloutCursorVersion then has its persisted cursor read
+	// as empty by the version-scoped selector, so the rollout-cursor tests passed
+	// or failed on file order (visible under `go test -shuffle=on`). The other
+	// entry points already reset it — newCodexFreshnessFixture via
+	// resetCodexUsageRefreshGate, and setCodexCaptureVersion directly.
+	t.Cleanup(codexResetUsageCaptureVersion)
 	return home, recordCodexRunHooks(t)
 }
 
