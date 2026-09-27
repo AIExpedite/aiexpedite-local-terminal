@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -646,23 +647,54 @@ func TestCodexReconcileFromRollout_StaleFrameDoesNotCoverALaterAppend(t *testing
 	}
 }
 
-// The coverage window is codexRolloutCoverageLag exactly, on both sides.
+// Coverage takes TWO facts, and a turn that began after the telemetry overrides
+// the time window entirely: the lag only bounds a build whose turn-start record
+// this scan does not recognise.
 func TestCodexRolloutMinedCoversMtime_Boundary(t *testing.T) {
 	minedAt := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
-		name  string
-		mined time.Time
-		mtime time.Time
-		want  bool
+		name      string
+		mined     time.Time
+		laterTurn bool
+		mtime     time.Time
+		want      bool
 	}{
-		{"no telemetry mined", time.Time{}, minedAt, false},
-		{"stamp after the write", minedAt, minedAt.Add(-time.Second), true},
-		{"inside the lag", minedAt, minedAt.Add(codexRolloutCoverageLag - time.Millisecond), true},
-		{"on the lag", minedAt, minedAt.Add(codexRolloutCoverageLag), true},
-		{"past the lag", minedAt, minedAt.Add(codexRolloutCoverageLag + time.Millisecond), false},
+		{"no telemetry mined", time.Time{}, false, minedAt, false},
+		{"stamp after the write", minedAt, false, minedAt.Add(-time.Second), true},
+		{"inside the lag", minedAt, false, minedAt.Add(codexRolloutCoverageLag - time.Millisecond), true},
+		{"on the lag", minedAt, false, minedAt.Add(codexRolloutCoverageLag), true},
+		{"past the lag", minedAt, false, minedAt.Add(codexRolloutCoverageLag + time.Millisecond), false},
+		// A later turn that finished FAST sits well inside the lag, so the window
+		// alone would call it covered and the run's utilization would stay stale.
+		{"later turn inside the lag", minedAt, true, minedAt.Add(time.Second), false},
+		{"later turn on the lag", minedAt, true, minedAt.Add(codexRolloutCoverageLag), false},
+		{"later turn without telemetry", time.Time{}, true, minedAt, false},
 	} {
-		if got := codexRolloutMinedCoversMtime(tc.mined, tc.mtime); got != tc.want {
+		cov := codexRolloutCoverage{minedAt: tc.mined, laterTurn: tc.laterTurn}
+		if got := codexRolloutMinedCoversMtime(cov, tc.mtime); got != tc.want {
 			t.Errorf("%s: covers = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Every record Codex opens a turn with is recognised, and nothing else is. A
+// prompt that merely QUOTES one of those type names is not a turn boundary: it
+// would mark an ordinary covered rollout as owing telemetry for ever.
+func TestCodexRolloutLineStartsTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"turn_context envelope", `{"timestamp":"2026-09-20T10:00:00Z","type":"turn_context","payload":{"cwd":"/x"}}`, true},
+		{"user_message payload", `{"timestamp":"2026-09-20T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}`, true},
+		{"token_count telemetry", `{"timestamp":"2026-09-20T10:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{}}}`, false},
+		{"assistant message", `{"timestamp":"2026-09-20T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}`, false},
+		{"prompt quoting a type name", `{"timestamp":"2026-09-20T10:00:00Z","type":"response_item","payload":{"type":"message","content":"explain turn_context and user_message"}}`, false},
+		{"malformed", `{"type":"turn_context"`, false},
+	} {
+		if got := codexRolloutLineStartsTurn(tc.line); got != tc.want {
+			t.Errorf("%s: startsTurn = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -1224,5 +1256,103 @@ func TestCodexRunFreshnessFromView_RetiredDebtKeepsTheLastObservation(t *testing
 	}
 	if strings.Contains(notice, "No Codex utilization reading has been observed") {
 		t.Fatalf("notice denied a cached reading it still has: %q", notice)
+	}
+}
+
+// A later turn that finishes FAST does not inherit the previous turn's coverage.
+//
+// codexRolloutCoverageLag forgives the gap between a telemetry frame and the
+// same turn's trailing records, but a whole later turn can land inside that
+// window too. Judged on the time gap alone the file reads as covered, so the
+// nudge withholds its mtime, no debt is created for the later run, and its
+// utilization stays stale with the card showing nothing wrong — the reported
+// shape, one turn smaller. The turn-start record is what tells the two apart.
+func TestCodexReconcileFromRollout_FastLaterTurnIsNotCovered(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	observedAt := now.Add(-2 * time.Minute).Truncate(time.Second)
+	// Well inside codexRolloutCoverageLag: the whole point of the case.
+	mtime := observedAt.Add(2 * time.Second)
+	path := writeCodexRunRollout(t, f.home, "fastturn", now.Add(-30*time.Minute), observedAt, mtime, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, observedAt)})
+	// The later turn: its own turn_context and a completion record, no telemetry.
+	appendCodexRolloutLines(t, path, mtime,
+		map[string]any{"timestamp": mtime.UTC().Format(time.RFC3339Nano), "type": "turn_context", "payload": map[string]any{"cwd": "/w"}},
+		map[string]any{"timestamp": mtime.UTC().Format(time.RFC3339Nano), "type": "event_msg", "payload": map[string]any{"type": "task_complete"}},
+	)
+
+	_, _, latest, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+
+	if latest.Before(observedAt) {
+		t.Fatalf("the pass did not mine the earlier turn's telemetry (latest = %s)", latest)
+	}
+	if !rollouts.covered.IsZero() {
+		t.Fatalf("a turn that began AFTER the mined frame must leave the file uncovered (covered = %s)", rollouts.covered)
+	}
+	if rollouts.newest.Truncate(time.Second) != mtime.Truncate(time.Second) {
+		t.Fatalf("eligible mtime = %s, want the later turn %s still owing telemetry", rollouts.newest, mtime)
+	}
+	// End to end: the nudge owes a debt floored at that turn, so the ladder runs.
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollouts, latest) {
+		t.Fatal("a later turn with no telemetry of its own must owe a refresh")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != mtime.UnixMilli() {
+		t.Fatalf("debt not floored at the later turn: owed=%d floor=%d want floor=%d",
+			snap.RefreshOwedAtMs, snap.RunFloorMs, mtime.UnixMilli())
+	}
+}
+
+// The other half of the same predicate: an ordinary single-turn rollout whose
+// trailing records advanced the mtime STAYS covered, so the common case makes no
+// request and arms no ladder.
+func TestCodexReconcileFromRollout_TrailingRecordsOfTheSameTurnStayCovered(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	observedAt := now.Add(-2 * time.Minute).Truncate(time.Second)
+	mtime := observedAt.Add(2 * time.Second)
+	path := writeCodexRunRollout(t, f.home, "sameturn", now.Add(-30*time.Minute), observedAt, mtime, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, observedAt)})
+	appendCodexRolloutLines(t, path, mtime,
+		map[string]any{"timestamp": mtime.UTC().Format(time.RFC3339Nano), "type": "event_msg", "payload": map[string]any{"type": "task_complete"}},
+	)
+
+	_, _, _, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+	if rollouts.covered.Truncate(time.Second) != mtime.Truncate(time.Second) {
+		t.Fatalf("covered = %s, want the file's own mtime %s", rollouts.covered, mtime)
+	}
+	if !rollouts.newest.IsZero() {
+		t.Fatalf("a covered file must not be reported as owing telemetry (newest = %s)", rollouts.newest)
+	}
+}
+
+// appendCodexRolloutLines adds records to a rollout written by
+// writeCodexRunRollout (which emits its extras BEFORE the telemetry frames) and
+// restores the file mtime the test is pinning.
+func appendCodexRolloutLines(t *testing.T, path string, mtime time.Time, lines ...map[string]any) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open rollout: %v", err)
+	}
+	for _, line := range lines {
+		encoded, err := json.Marshal(line)
+		if err != nil {
+			f.Close()
+			t.Fatalf("marshal rollout line: %v", err)
+		}
+		if _, err := f.Write(append(encoded, '\n')); err != nil {
+			f.Close()
+			t.Fatalf("append rollout line: %v", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close rollout: %v", err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("chtimes rollout: %v", err)
 	}
 }

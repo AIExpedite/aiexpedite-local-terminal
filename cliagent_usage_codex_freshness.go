@@ -1540,19 +1540,28 @@ func triggerCodexUsageRefreshAfterRun(floor time.Time) {
 		return
 	}
 	completedAt := codexUsageFreshnessNow()
-	armed, _ := codexUsageRefresh.takeArmedAccount(floor.UnixMilli())
+	// armedKnown separates the two meanings an empty fingerprint would otherwise
+	// share: the unscoped account (API-key-only auth, which owes and pays debts
+	// like any other) and a floor this process never armed.
+	armed, armedKnown := codexUsageRefresh.takeArmedAccount(floor.UnixMilli())
 	codexUsageRefresh.spawn(func() {
-		codexRefreshAfterRun(armed, floor, completedAt)
+		codexRefreshAfterRun(armed, armedKnown, floor, completedAt)
 	})
 }
 
 // codexRefreshAfterRun settles the run that started at `floor`. `armed` is the
-// account that was live when the run was armed, or "" when this process never
-// armed it (a floor replayed from disk at startup).
-func codexRefreshAfterRun(armed string, floor, completedAt time.Time) {
+// account that was live when the run was armed, and `armedKnown` says whether
+// this process armed it at all — false for a floor replayed from disk at
+// startup, where the live account is the only one reconcilable anyway.
+//
+// The two are separate arguments because "" is a legitimate account (the
+// unscoped one), so it cannot double as the "never armed" sentinel: a run armed
+// under API-key-only auth that finishes after the user signs in would otherwise
+// have its debt booked against the new account.
+func codexRefreshAfterRun(armed string, armedKnown bool, floor, completedAt time.Time) {
 	base := codexHomeBase()
 	fp := codexAccountFingerprintAtBase(base)
-	if armed != "" && armed != fp {
+	if armedKnown && armed != fp {
 		// The Codex credentials changed while the run was in flight. Its
 		// telemetry is unreachable — the rollout scan only reads the account
 		// that is live now — and booking the debt either way is wrong: under
@@ -1839,14 +1848,28 @@ func codexLiveReadOutbound(outcome string) bool {
 	return true
 }
 
-// codexLiveReadRetryKind is the rung a finished live read asks for. `ok` pays the
-// debt (the merge clears it, so nothing is booked); a read that reached OpenAI
-// and failed books afterRead; a refusal that sent nothing books free; a cooldown
-// books spacing.
-func codexLiveReadRetryKind(outcome string) codexRunDebtRetryKind {
+// codexLiveReadRetryKind is the rung a finished live read asks for. An `ok` that
+// SETTLED the debt books nothing (the merge cleared it); a read that reached
+// OpenAI and left the debt standing books afterRead; a refusal that sent nothing
+// books free; a cooldown books spacing.
+//
+// `settled` is a fact separate from `ok` because the probe reports the RPC, not
+// the merge: codexLiveProbeConverse hands its frame to
+// captureCodexRateLimitLineFromProducer and returns liveProbeOutcomeOK without
+// consulting the boolean that says whether the reading landed. A window refused
+// as stale or reset-only, or a cache write refused under contention, therefore
+// answers `ok` with the debt still on disk. Booking nothing there ended the
+// ladder on a read that paid nothing, and the worker then resolved the
+// outstanding fallback to `exhausted`, so the second read the budget promises
+// was never run.
+func codexLiveReadRetryKind(outcome string, settled bool) codexRunDebtRetryKind {
 	switch outcome {
 	case liveProbeOutcomeOK:
-		return codexRetryNone
+		if settled {
+			return codexRetryNone
+		}
+		// It reached OpenAI, so it costs a read exactly like a failed one.
+		return codexRetryAfterRead
 	case liveProbeOutcomeCooldown:
 		return codexRetrySpacing
 	}
@@ -1854,6 +1877,28 @@ func codexLiveReadRetryKind(outcome string) codexRunDebtRetryKind {
 		return codexRetryAfterRead
 	}
 	return codexRetryFree
+}
+
+// codexRunDebtStillOwed reports whether the debt `id` names is still recorded
+// for `fp`. Read after a live read that reported success, it separates a
+// reading that settled the debt from one the capture path refused.
+//
+// A debt that moved on (paid by another writer, re-owed by a newer run, or
+// rescoped to another account) is NOT still owed: this read has nothing left to
+// pay, and every write it could make is generation-guarded anyway.
+func codexRunDebtStillOwed(fp string, id codexDebtID) bool {
+	state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+	return state.owed && state.debtID() == id
+}
+
+// codexLiveReadLandedSuffix annotates the one outcome whose name does not settle
+// the question on its own. Fixed labels only, like every other line this path
+// prints (cliagent_usage_codex_redaction_test.go).
+func codexLiveReadLandedSuffix(outcome string, settled bool) string {
+	if outcome != liveProbeOutcomeOK || settled {
+		return ""
+	}
+	return " (not merged)"
 }
 
 // codexLiveUsageFallbackRead is the live read the fallback spends. A var so
@@ -1928,9 +1973,13 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 			return codexRetryFree
 		}
 		if outcome != liveProbeOutcomeCooldown {
-			kind := codexLiveReadRetryKind(outcome)
-			codexRecordLiveReadOutcome(fp, id, outcome, kind)
-			fmt.Printf("%s[cli-usage] codex post-run live read: %s%s\n", colorCyan, outcome, colorReset)
+			// An `ok` only proves the RPC answered. Ask the cache whether the
+			// reading actually settled this debt before letting it end the ladder.
+			settled := outcome == liveProbeOutcomeOK && !codexRunDebtStillOwed(fp, id)
+			kind := codexLiveReadRetryKind(outcome, settled)
+			codexRecordLiveReadOutcome(fp, id, outcome, settled, kind)
+			fmt.Printf("%s[cli-usage] codex post-run live read: %s%s%s\n",
+				colorCyan, outcome, codexLiveReadLandedSuffix(outcome, settled), colorReset)
 			return kind
 		}
 		if try+1 < codexLiveUsageFallbackTries &&
@@ -1958,12 +2007,12 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 // disk to pick the next rung, so an uncounted read left the debt looking as
 // though it had budget left and the next rung spent a third read. Sustained
 // contention could do that repeatedly.
-func codexRecordLiveReadOutcome(fp string, id codexDebtID, outcome string, kind codexRunDebtRetryKind) {
+func codexRecordLiveReadOutcome(fp string, id codexDebtID, outcome string, settled bool, kind codexRunDebtRetryKind) {
 	spent := codexUsageRefresh.takeLiveReads(fp, id)
 	if codexLiveReadOutbound(outcome) {
 		spent++
 	}
-	if spent <= 0 && outcome != liveProbeOutcomeOK {
+	if spent <= 0 && !settled {
 		// Nothing left the device and nothing was retained: only the state below
 		// would change, which the caller's own kind already describes.
 		return
@@ -1974,8 +2023,8 @@ func codexRecordLiveReadOutcome(fp string, id codexDebtID, outcome string, kind 
 		}
 		snap.RefreshLiveReads += spent
 		switch {
-		case outcome == liveProbeOutcomeOK:
-			// The reading's own merge settles the debt; leave the state alone so
+		case settled:
+			// The reading's own merge settled the debt; leave the state alone so
 			// codexSettleRunFreshness clears it with everything else.
 			return spent > 0
 		case snap.RefreshLiveReads >= codexRefreshLiveReadMaxAttempts, kind == codexRetryNone:

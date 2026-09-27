@@ -442,9 +442,13 @@ func persistCodexSmokeRunDebt(floor time.Time, armedFP string) {
 	}
 	fp := currentCodexAccountFingerprint()
 	// An empty fp is the unscoped account (no derivable identity, e.g.
-	// API-key-only auth), which owes and pays debts like any other; the swap check
-	// below still drops a run armed under a DIFFERENT account.
-	if armedFP != "" && armedFP != fp {
+	// API-key-only auth), which owes and pays debts like any other. It is a real
+	// identity, not a missing one: this function is only ever handed the
+	// fingerprint the probe captured (settleOrDisarmCodexSmokeRun), so the
+	// comparison is unconditional. Exempting "" would let a smoke that ran under
+	// API-key auth book its debt — and its stale-run warning — against a
+	// fingerprinted account the user signed into while it was still running.
+	if armedFP != fp {
 		return
 	}
 	floorMs := floor.UnixMilli()

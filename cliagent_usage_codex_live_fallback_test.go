@@ -158,35 +158,88 @@ func TestCodexLiveFallback_SecondReadRunsOnTheNextRung(t *testing.T) {
 	}
 }
 
-// Every live-probe outcome is classified once, and both halves of that
-// classification are load-bearing: whether the read cost a budget slot, and which
-// rung the debt waits for next. A result that sent nothing must never cost a
-// read; an unrecognised one from a newer producer must never loop for free.
+// Every live-probe outcome is classified once, and all of that classification is
+// load-bearing: whether the read cost a budget slot, and which rung the debt
+// waits for next. A result that sent nothing must never cost a read; an
+// unrecognised one from a newer producer must never loop for free; and an `ok`
+// ends the ladder only when the reading it carried actually settled the debt.
 func TestCodexLiveFallback_OutcomeClassification(t *testing.T) {
 	for _, tc := range []struct {
+		name     string
 		outcome  string
+		settled  bool
 		outbound bool
 		kind     codexRunDebtRetryKind
 	}{
-		{liveProbeOutcomeOK, true, codexRetryNone},
-		{liveProbeOutcomeRPCError, true, codexRetryAfterRead},
-		{liveProbeOutcomeNoReading, true, codexRetryAfterRead},
-		{liveProbeOutcomeTimeout, true, codexRetryAfterRead},
-		{liveProbeOutcomeNotSigned, true, codexRetryAfterRead},
-		{liveProbeOutcomeSpawnFailed, false, codexRetryFree},
-		{liveProbeOutcomeAccountChanged, false, codexRetryFree},
-		{liveProbeOutcomeGated, false, codexRetryFree},
-		{liveProbeOutcomeCooldown, false, codexRetrySpacing},
-		{"some_future_outcome", true, codexRetryAfterRead},
+		{"ok_settled", liveProbeOutcomeOK, true, true, codexRetryNone},
+		// The probe reports the RPC, not the merge: a window refused as stale or
+		// reset-only answers `ok` with the debt still owed, and that read has to
+		// book the next rung rather than retire the ladder.
+		{"ok_not_merged", liveProbeOutcomeOK, false, true, codexRetryAfterRead},
+		{"rpc_error", liveProbeOutcomeRPCError, false, true, codexRetryAfterRead},
+		{"no_reading", liveProbeOutcomeNoReading, false, true, codexRetryAfterRead},
+		{"timeout", liveProbeOutcomeTimeout, false, true, codexRetryAfterRead},
+		{"not_attributable", liveProbeOutcomeNotSigned, false, true, codexRetryAfterRead},
+		{"spawn_failed", liveProbeOutcomeSpawnFailed, false, false, codexRetryFree},
+		{"account_changed", liveProbeOutcomeAccountChanged, false, false, codexRetryFree},
+		{"gated", liveProbeOutcomeGated, false, false, codexRetryFree},
+		{"cooldown", liveProbeOutcomeCooldown, false, false, codexRetrySpacing},
+		{"unknown", "some_future_outcome", false, true, codexRetryAfterRead},
 	} {
-		t.Run(tc.outcome, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			if got := codexLiveReadOutbound(tc.outcome); got != tc.outbound {
 				t.Fatalf("outbound = %v, want %v", got, tc.outbound)
 			}
-			if got := codexLiveReadRetryKind(tc.outcome); got != tc.kind {
+			if got := codexLiveReadRetryKind(tc.outcome, tc.settled); got != tc.kind {
 				t.Fatalf("retry kind = %v, want %v", got, tc.kind)
 			}
 		})
+	}
+}
+
+// An `ok` whose reading never landed keeps the ladder walking. codexLiveProbeConverse
+// hands its frame to captureCodexRateLimitLineFromProducer and returns
+// liveProbeOutcomeOK without consulting the boolean that says whether the reading
+// was merged, so a window refused as stale or reset-only used to end the debt's
+// only network recovery on its FIRST read: the worker booked nothing and resolved
+// the outstanding fallback to `exhausted`, and the second read the budget promises
+// was never run.
+func TestCodexLiveFallback_OKThatDidNotMergeKeepsTheLadderWalking(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	// The stub answers `ok` and merges NOTHING — the refused-capture case.
+	var calls int32
+	stubCodexFallbackRead(t, func(context.Context, string) string {
+		atomic.AddInt32(&calls, 1)
+		return liveProbeOutcomeOK
+	})
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	if kind := codexLiveUsageFallback(f.fp, state); kind != codexRetryAfterRead {
+		t.Fatalf("first read booked %v, want afterRead", kind)
+	}
+	state = codexRunFreshnessForAccount(f.fp, time.Now())
+	if !state.owed {
+		t.Fatal("the debt was cleared by a reading that never merged")
+	}
+	if state.liveReads != 1 {
+		t.Fatalf("liveReads = %d, want 1 (the read reached OpenAI)", state.liveReads)
+	}
+	if state.fallback != codexFallbackDeferred {
+		t.Fatalf("fallback = %q, want deferred", state.fallback)
+	}
+
+	// The promised second read runs, and only then is the budget spent.
+	if kind := codexLiveUsageFallback(f.fp, state); kind != codexRetryAfterRead {
+		t.Fatalf("second read booked %v, want afterRead", kind)
+	}
+	if got := atomic.LoadInt32(&calls); got != int32(codexRefreshLiveReadMaxAttempts) {
+		t.Fatalf("live reads = %d, want %d", got, codexRefreshLiveReadMaxAttempts)
+	}
+	state = codexRunFreshnessForAccount(f.fp, time.Now())
+	if state.fallback != codexFallbackExhausted {
+		t.Fatalf("fallback = %q, want exhausted once the budget is spent", state.fallback)
 	}
 }
 

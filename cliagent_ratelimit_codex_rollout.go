@@ -2043,7 +2043,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		}
 		attempted = append(attempted, c)
 		fileCtx, cancelFile := codexRolloutFileContext(ctx, len(selected)-i-1)
-		buckets, sessionStart, fileLimit, handled, ok, producer := codexBucketsFromRolloutFileWithProducer(fileCtx, c.path, now)
+		buckets, sessionStart, fileLimit, handled, ok, producer, coverage := codexBucketsFromRolloutFileWithProducer(fileCtx, c.path, now)
 		cancelFile()
 		retryEntry := codexRolloutBacklogEntryDigest(c)
 		retry := !handled
@@ -2086,7 +2086,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		// appends that followed it. Split here — before the no-buckets skip below
 		// — because a rollout Codex has written but whose telemetry frame has not
 		// landed yet is exactly the run the nudge exists to notice.
-		if codexRolloutMinedCoversMtime(codexRolloutMinedObservationAt(buckets, fileLimit), c.mtime) {
+		if codexRolloutMinedCoversMtime(coverage, c.mtime) {
 			if c.mtime.After(coveredMtime) {
 				coveredMtime = c.mtime
 			}
@@ -2348,10 +2348,78 @@ func codexRolloutMinedObservationAt(buckets map[string]map[string]codexRateLimit
 	return newest
 }
 
-// codexRolloutMinedCoversMtime answers whether telemetry mined at minedAt
-// accounts for a rollout whose newest write is mtime (codexRolloutCoverageLag).
-func codexRolloutMinedCoversMtime(minedAt, mtime time.Time) bool {
-	return !minedAt.IsZero() && !mtime.After(minedAt.Add(codexRolloutCoverageLag))
+// codexRolloutCoverage is what one file's scan knows about whether the telemetry
+// it mined accounts for that file's newest write.
+type codexRolloutCoverage struct {
+	// minedAt is the newest stamped observation (or quota refusal) this pass
+	// mined from the file; zero when it yielded neither.
+	minedAt time.Time
+	// laterTurn: a turn-start record follows that telemetry in the file, so a
+	// run the file has already recorded is still unaccounted for.
+	laterTurn bool
+}
+
+// codexRolloutMinedCoversMtime answers whether the telemetry this pass mined
+// accounts for a rollout whose newest write is mtime.
+//
+// Two independent conditions, and both are load-bearing:
+//
+//   - No turn began after that telemetry. Codex opens each turn with its own
+//     record (codexRolloutTurnStartTypes), so this asks the direct question —
+//     did a later run append without telemetry of its own? — rather than
+//     guessing it from timestamps. A later turn that FINISHES quickly leaves its
+//     trailing records within moments of the previous turn's frame, and no time
+//     tolerance can tell those from that frame's own trailing records.
+//   - The mtime is still within codexRolloutCoverageLag of the telemetry, which
+//     bounds a build whose turn-start record this scan does not recognise. A
+//     wider gap then reads as uncovered, the fail-safe direction: the file
+//     becomes nudge evidence and the debt reaches the live read.
+func codexRolloutMinedCoversMtime(cov codexRolloutCoverage, mtime time.Time) bool {
+	if cov.minedAt.IsZero() || cov.laterTurn {
+		return false
+	}
+	return !mtime.After(cov.minedAt.Add(codexRolloutCoverageLag))
+}
+
+// codexRolloutTurnStartTypes are the records Codex writes when a turn begins: a
+// `turn_context` carrying the turn's settings, and the `user_message` event that
+// opens it. Either one proves a NEW run started at that point in the file, which
+// is what separates an unaccounted-for turn from the trailing records of the
+// turn whose telemetry this pass already holds.
+var codexRolloutTurnStartTypes = []string{"turn_context", "user_message"}
+
+// codexRolloutLineStartsTurn reports whether a rollout record opens a turn. The
+// literal prefilter leaves the common record — which is neither — undecoded, the
+// same shape as the bucket and refusal gates above it.
+func codexRolloutLineStartsTurn(line string) bool {
+	matched := false
+	for _, t := range codexRolloutTurnStartTypes {
+		if strings.Contains(line, t) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	var envelope struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type string `json:"type"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal([]byte(line), &envelope) != nil {
+		return false
+	}
+	for _, t := range codexRolloutTurnStartTypes {
+		// The type sits on the envelope (`turn_context`) or on the payload of an
+		// `event_msg` (`user_message`); a record carrying the word anywhere else —
+		// a prompt quoting it, say — decodes to neither and is not a turn.
+		if envelope.Type == t || envelope.Payload.Type == t {
+			return true
+		}
+	}
+	return false
 }
 
 // codexRolloutNudgeEvidenceFor pairs the two mtimes, withholding only `newest`
@@ -2580,20 +2648,20 @@ func codexRolloutSessionStartPrefix(f *os.File) (time.Time, string) {
 var codexOpenRolloutFile = os.Open
 
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
-	buckets, sessionStart, limit, handled, ok, _ := codexBucketsFromRolloutFileWithProducer(ctx, path, now)
+	buckets, sessionStart, limit, handled, ok, _, _ := codexBucketsFromRolloutFileWithProducer(ctx, path, now)
 	return buckets, sessionStart, limit, handled, ok
 }
 
 // codexBucketsFromRolloutFileWithProducer is codexBucketsFromRolloutFile plus
 // the header's `cli_version` — the build that wrote this file ("" when the
 // header records none or could not be read).
-func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool, string) {
+func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool, string, codexRolloutCoverage) {
 	f, err := codexOpenRolloutFile(path)
 	if err != nil {
 		// Only a file that definitively vanished is handled progress. Permission
 		// failures, descriptor exhaustion, and other open errors can be transient;
 		// advancing the watermark past them would suppress a later successful read.
-		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false, ""
+		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false, "", codexRolloutCoverage{}
 	}
 	defer f.Close()
 
@@ -2621,7 +2689,17 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 	var pendingInferred map[string]interface{}
 	statedFrameSeen := false
 	finalRecordSeen := false
+	// turnAfterTelemetry: a turn began after the newest telemetry this pass has
+	// mined so far, so the reading in hand predates a run the file has already
+	// recorded. Set by a turn-start record, cleared by every reading (a merged
+	// window or a quota refusal) that follows one. Read by
+	// codexRolloutMinedCoversMtime — a time gap alone cannot tell a turn
+	// boundary from the same turn's trailing records.
+	turnAfterTelemetry := false
 	consumeLine := func(line string) {
+		if codexRolloutLineStartsTurn(line) {
+			turnAfterTelemetry = true
+		}
 		// Any later record — telemetry or not — invalidates a pending candidate.
 		// The mtime describes the file's newest append and nothing else, so only
 		// the file's FINAL record can honestly claim it. Appending a completion
@@ -2634,8 +2712,14 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
 		// these lines are exactly the ones the bucket scan discards.
-		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok && ev.At.After(limit.At) {
-			limit = ev
+		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok {
+			// A refusal IS this turn's telemetry: it is the reading that explains the
+			// absent window (codexRolloutMinedObservationAt folds it in), so the turn
+			// it belongs to is no longer unaccounted for.
+			turnAfterTelemetry = false
+			if ev.At.After(limit.At) {
+				limit = ev
+			}
 		}
 		// Cheap prefilter: only decode lines that could carry a window update.
 		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
@@ -2690,6 +2774,9 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 			// Liveness for sparse-merge is judged at the frame's own event
 			// time so an expired prior reset isn't carried onto fresh usage.
 			mergeCodexRolloutFrame(acc, updates, eventTime)
+			// This turn's window is now in hand, so nothing before the next
+			// turn-start record is unaccounted for.
+			turnAfterTelemetry = false
 		}
 	}
 	var size int64
@@ -2800,22 +2887,26 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 			mergeCodexRolloutFrame(acc, updates, inferredAt)
 		}
 	}
+	coverage := codexRolloutCoverage{
+		minedAt:   codexRolloutMinedObservationAt(acc, limit),
+		laterTurn: turnAfterTelemetry,
+	}
 	if !handled {
-		return acc, sessionStart, limit, false, len(acc) > 0, producer
+		return acc, sessionStart, limit, false, len(acc) > 0, producer, coverage
 	}
 	if len(acc) == 0 {
 		// ok=false means "no usable window here", NOT "nothing here": a log whose
 		// every turn was refused for quota is precisely the case that produces no
 		// buckets AND the evidence the card needs, so the evidence is returned
 		// alongside the miss.
-		return nil, sessionStart, limit, true, false, producer
+		return nil, sessionStart, limit, true, false, producer, coverage
 	}
 	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
 	// whose reset already passed as of `now` is applied by the display path
 	// (codexAggregateIdentity), so a stale relative reset anchored above still
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
-	return acc, sessionStart, limit, true, true, producer
+	return acc, sessionStart, limit, true, true, producer, coverage
 }
 
 func codexRolloutOpenFailureHandled(err error) bool {

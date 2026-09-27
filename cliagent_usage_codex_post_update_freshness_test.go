@@ -392,6 +392,67 @@ func TestPersistCodexSmokeRunDebt_StandsDownForAStubbedLifecycle(t *testing.T) {
 	}
 }
 
+// The unscoped account is an IDENTITY, so it participates in the account-change
+// comparison like any other. Exempting "" from the swap check let a smoke that
+// ran under API-key-only auth book its debt — and the stale-run warning that
+// debt eventually produces — against a fingerprinted account the user signed
+// into while the probe was still running, for a run that account never made.
+func TestPersistCodexSmokeRunDebt_DropsAnUnscopedRunAfterASignIn(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	if f.fp == "" {
+		t.Fatal("fixture must be signed in for this case")
+	}
+
+	// The probe armed under the unscoped account; a fingerprinted one is live now.
+	persistCodexSmokeRunDebt(now.Add(-time.Minute), "")
+
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("an unscoped run must not owe a debt under the account that replaced it: %+v", snap)
+	}
+}
+
+// And the mirror: on a device that is STILL unscoped, the same empty fingerprint
+// matches and the debt is recorded. The comparison drops a swap, never the
+// unscoped account itself.
+func TestPersistCodexSmokeRunDebt_RecordsAnUnscopedRunOnAnUnscopedDevice(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour)).unscopeAccount(t)
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	persistCodexSmokeRunDebt(now.Add(-time.Minute), f.fp)
+
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("the unscoped account's own run must still be recorded: %+v", snap)
+	}
+	drainCodexRunDebtLadder(t)
+}
+
+// codexRefreshAfterRun has the same two meanings to keep apart, and there the
+// empty string genuinely IS the "this process never armed it" sentinel for a
+// floor replayed from disk. Threading armedKnown separately keeps a replayed
+// floor reconcilable while still dropping an unscoped run whose account changed.
+func TestCodexRefreshAfterRun_UnscopedArmAndReplayedFloorDiffer(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	// Armed under the unscoped account, settled after a sign-in: dropped.
+	codexRefreshAfterRun("", true, now.Add(-time.Minute), now)
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("an unscoped arm must not book against the account that replaced it: %+v", snap)
+	}
+
+	// Never armed by this process (a floor replayed from disk): reconciled under
+	// the live account, which is the only one it could use anyway.
+	codexRefreshAfterRun("", false, now.Add(-time.Minute), now)
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("a replayed floor must still be settled under the live account: %+v", snap)
+	}
+	drainCodexRunDebtLadder(t)
+}
+
 /* ───────────── adversarial-review regressions (secondary pass) ───────────── */
 
 // A shutdown during an OUTSTANDING live read must not exhaust the debt. The read
@@ -536,7 +597,7 @@ func TestCodexRecordLiveReadOutcome_RetainsARefusedCount(t *testing.T) {
 	func() {
 		codexRateLimitMu.Lock()
 		defer codexRateLimitMu.Unlock()
-		codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, codexRetryAfterRead)
+		codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, false, codexRetryAfterRead)
 	}()
 	if got := f.snapshot(t).RefreshLiveReads; got != 0 {
 		t.Fatalf("precondition: the refused write must leave the counter at 0, got %d", got)
@@ -546,7 +607,7 @@ func TestCodexRecordLiveReadOutcome_RetainsARefusedCount(t *testing.T) {
 	}
 
 	// The next write folds it in, so the debt is charged what it actually spent.
-	codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, codexRetryAfterRead)
+	codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, false, codexRetryAfterRead)
 	snap := f.snapshot(t)
 	if snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
 		t.Fatalf("RefreshLiveReads = %d, want the refused read folded in (%d)",
