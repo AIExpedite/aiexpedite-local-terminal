@@ -1059,6 +1059,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "codex_appserver_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
 		})
@@ -1159,6 +1160,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 					Type:        "codex_appserver_error",
+					BootID:      agentBootID,
 					SessionID:   session.ID,
 					Seq:         int(seq),
 				}, "codex_appserver_error") {

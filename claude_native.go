@@ -342,6 +342,7 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
 				Type:        "claude_native_error",
+				BootID:      agentBootID,
 				SessionID:   session.ID,
 				Seq:         int(seq),
 			})
@@ -665,6 +666,7 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "claude_native_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
 		})

@@ -1149,6 +1149,7 @@ func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSe
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
 		Type:        "antigravity_native_error",
+		BootID:      agentBootID,
 		SessionID:   session.ID,
 		Seq:         seq,
 	})

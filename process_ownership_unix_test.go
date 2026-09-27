@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,4 +84,40 @@ func TestEndRecordedProcess_EndsTheWholeGroup(t *testing.T) {
 		t.Fatalf("end(root) = %v", got)
 	}
 	waitForProbe(t, child, processGone, 10*time.Second)
+}
+
+// TestBootReap_LeaderGoneGroupAliveIsNotReaped: the CLI leader died but a tool
+// it started still runs in its group. The session is not provably gone, so it
+// is never reported reaped, and the tool (not a recorded PID) is not touched.
+func TestBootReap_LeaderGoneGroupAliveIsNotReaped(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	cmd, stdin := startLedgerChild(t, "ledger-tree-on-stdin", mockSessionKillChildPidEnv, pidFile)
+	root := recordedProcess(t, cmd.Process)
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	childPID := readPIDFile(t, pidFile)
+	child := recordedProcess(t, proc(childPID))
+	t.Cleanup(func() { _ = syscall.Kill(childPID, syscall.SIGKILL) })
+
+	// Only the leader dies.
+	if err := syscall.Kill(root.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitForProbe(t, root, processGone, 5*time.Second)
+
+	dir := t.TempDir()
+	writeLedgerFixture(t, dir, ledgerFileData{
+		BootID:  "boot-old",
+		Entries: []*ledgerEntry{{SessionID: "leaky", BootID: "boot-old", PIDs: []ledgerProcess{root}}},
+	})
+	path := filepath.Join(dir, spawnLedgerFileName)
+	l := newSpawnLedger(func() string { return path }, "boot-new")
+	l.RunBootReap()
+	if r := l.Report(context.Background()); len(r.SessionsReaped) != 0 {
+		t.Fatalf("a session with a live group member was reported reaped: %+v", r)
+	}
+	if got := probeRecordedProcess(child); got != processOurs {
+		t.Fatalf("the unrecorded group member was touched (probe = %v)", got)
+	}
 }

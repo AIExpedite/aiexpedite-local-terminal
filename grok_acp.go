@@ -625,6 +625,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
 				Type:        "grok_acp_error",
+				BootID:      agentBootID,
 				SessionID:   session.ID,
 				Seq:         int(seq),
 			})
@@ -1017,6 +1018,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "grok_acp_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
 		})
@@ -1095,6 +1097,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 					Type:        "grok_acp_error",
+					BootID:      agentBootID,
 					SessionID:   session.ID,
 					Seq:         int(seq),
 				}, "grok_acp_error") {
@@ -1406,6 +1409,7 @@ func (m *GrokACPManager) watchFirstFrame(session *GrokACPSession, publishFn Publ
 		Ts:        time.Now().UnixMilli(),
 		Version:   Version,
 		Type:      "grok_acp_error",
+		BootID:    agentBootID,
 		SessionID: session.ID,
 		Seq:       int(seq),
 	})

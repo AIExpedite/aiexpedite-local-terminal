@@ -19,6 +19,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"syscall"
@@ -69,9 +70,25 @@ var signalRecordedGroup = func(rec ledgerProcess) {
 	_ = syscall.Kill(rec.PID, syscall.SIGKILL)
 }
 
+// probeRecordedDescendants answers, once the recorded group leader is gone,
+// whether its process group is empty too. A tool the CLI started stays in
+// the group (unless it made its own session), so a group that still has
+// members means the session is not provably gone. Such members are never
+// signalled here: only a leader with a matching start time proves the group
+// is ours. A process that led no group of its own cannot be vouched for.
+func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
+	if rec.PGID <= 0 || rec.PGID != rec.PID {
+		return processUnknown
+	}
+	if err := syscall.Kill(-rec.PGID, 0); errors.Is(err, syscall.ESRCH) {
+		return processGone
+	}
+	return processUnknown
+}
+
 // endRecordedProcess ends the recorded process (its whole process group when
 // it leads one), ONLY when it is still ours (alive, same start time), and
-// reports whether it is gone afterwards.
+// reports whether it and its group are gone afterwards.
 func endRecordedProcess(rec ledgerProcess, wait time.Duration) processProbeResult {
 	if res := probeRecordedProcess(rec); res != processOurs {
 		return res
@@ -80,8 +97,13 @@ func endRecordedProcess(rec ledgerProcess, wait time.Duration) processProbeResul
 	deadline := time.Now().Add(wait)
 	for {
 		res := probeRecordedProcess(rec)
-		if res != processOurs {
+		if res == processUnknown {
 			return res
+		}
+		// Killed members linger as zombies until init reaps them; wait for
+		// the group to empty, within the same bound.
+		if res == processGone && (rec.PGID != rec.PID || rec.PGID <= 0 || probeRecordedDescendants(rec) == processGone) {
+			return processGone
 		}
 		if time.Now().After(deadline) {
 			return processOurs

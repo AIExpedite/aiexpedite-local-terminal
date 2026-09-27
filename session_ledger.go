@@ -116,6 +116,9 @@ type ledgerProcess struct {
 	StartTime string `json:"startTime"`
 	// PGID is the process group the process leads (Unix), 0 otherwise.
 	PGID int `json:"pgid,omitempty"`
+	// Contained: the process was in a kill-on-close Job Object (Windows), so
+	// the agent's death ended every descendant it started.
+	Contained bool `json:"contained,omitempty"`
 }
 
 type ledgerEntry struct {
@@ -163,25 +166,30 @@ type spawnLedger struct {
 	startToken func(pid int) (string, error)
 	probe      func(ledgerProcess) processProbeResult
 	end        func(ledgerProcess, time.Duration) processProbeResult
-	attachJob  func(*os.Process) (uintptr, error)
-	releaseJob func(uintptr)
-	groupOf    func(*os.Process) int
+	// descendants answers, for a recorded process that is itself gone,
+	// whether what it started can be proven gone too (its process group on
+	// Unix, its kill-on-close job on Windows).
+	descendants func(ledgerProcess) processProbeResult
+	attachJob   func(*os.Process) (uintptr, error)
+	releaseJob  func(uintptr)
+	groupOf     func(*os.Process) int
 }
 
 func newSpawnLedger(path func() string, bootID string) *spawnLedger {
 	return &spawnLedger{
-		path:       path,
-		bootID:     bootID,
-		jobs:       make(map[int]uintptr),
-		reapDone:   make(chan struct{}),
-		now:        time.Now,
-		writeFile:  writeLedgerFileAtomic,
-		startToken: processStartToken,
-		probe:      probeRecordedProcess,
-		end:        endRecordedProcess,
-		attachJob:  attachSessionJob,
-		releaseJob: releaseSessionJob,
-		groupOf:    processGroupOf,
+		path:        path,
+		bootID:      bootID,
+		jobs:        make(map[int]uintptr),
+		reapDone:    make(chan struct{}),
+		now:         time.Now,
+		writeFile:   writeLedgerFileAtomic,
+		startToken:  processStartToken,
+		probe:       probeRecordedProcess,
+		end:         endRecordedProcess,
+		descendants: probeRecordedDescendants,
+		attachJob:   attachSessionJob,
+		releaseJob:  releaseSessionJob,
+		groupOf:     processGroupOf,
 	}
 }
 
@@ -402,7 +410,7 @@ func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process) {
 	case len(e.PIDs) >= spawnLedgerMaxPIDs:
 		e.Incomplete = true
 	default:
-		e.PIDs = append(e.PIDs, ledgerProcess{PID: proc.Pid, StartTime: token, PGID: pgid})
+		e.PIDs = append(e.PIDs, ledgerProcess{PID: proc.Pid, StartTime: token, PGID: pgid, Contained: job != 0})
 	}
 	l.touch(e)
 	l.persistLocked()
@@ -489,6 +497,12 @@ func (l *spawnLedger) classifyEarlierEntry(e ledgerEntry) bootReapClass {
 	for _, p := range e.PIDs {
 		switch l.probe(p) {
 		case processGone:
+			// The recorded process is gone, but a tool it started may not be:
+			// only a group / job that is provably empty counts. Anything else
+			// is not ours to kill (it is not a recorded PID) and not proof.
+			if l.descendants(p) != processGone {
+				unknown = true
+			}
 			continue
 		case processUnknown:
 			unknown = true

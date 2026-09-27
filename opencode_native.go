@@ -1031,6 +1031,7 @@ func (m *OpenCodeNativeManager) publishTurnError(session *OpenCodeNativeSession,
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "opencode_native_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         seq,
 		})

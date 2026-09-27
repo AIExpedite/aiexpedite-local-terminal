@@ -15,3 +15,7 @@ func processStartToken(pid int) (string, error) {
 func probeRecordedProcess(rec ledgerProcess) processProbeResult {
 	return processUnknown
 }
+
+func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
+	return processUnknown
+}

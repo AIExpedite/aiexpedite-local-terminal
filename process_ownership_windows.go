@@ -34,6 +34,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// probeRecordedDescendants answers, once the recorded process is gone,
+// whether what it started is provably gone too: only when it ran in a
+// kill-on-close job, which ended every descendant when the agent died.
+// Nothing else is looked up.
+func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
+	if rec.Contained {
+		return processGone
+	}
+	return processUnknown
+}
+
 // ownProcessGroup is Unix-only (process groups); Windows uses Job Objects.
 func ownProcessGroup(cmd *exec.Cmd) {}
 

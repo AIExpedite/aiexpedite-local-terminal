@@ -97,6 +97,9 @@ func TestTrackProcessPutsTheSessionInAJob(t *testing.T) {
 	if !processInJob(t, cmd.Process.Pid, windows.Handle(job)) {
 		t.Fatalf("session process not in its job")
 	}
+	if e := readLedgerFile(t, dir).Entries; len(e) != 1 || len(e[0].PIDs) != 1 || !e[0].PIDs[0].Contained {
+		t.Fatalf("a job-owned process must be recorded contained: %+v", e)
+	}
 	rec := recordedProcess(t, cmd.Process)
 	l.ReleaseSession("s-job")
 	l.mu.Lock()

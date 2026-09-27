@@ -24,6 +24,7 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	l.attachJob = func(*os.Process) (uintptr, error) { return 0, nil }
 	l.releaseJob = func(uintptr) {}
 	l.groupOf = func(*os.Process) int { return 0 }
+	l.descendants = func(ledgerProcess) processProbeResult { return processGone }
 	l.startToken = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	l.probe = func(ledgerProcess) processProbeResult {
 		t.Fatalf("unexpected probe")
@@ -204,6 +205,8 @@ func TestBootReapClassification(t *testing.T) {
 			{SessionID: "denied", BootID: "boot-1", PIDs: []ledgerProcess{{PID: 4, StartTime: "t4"}}},
 			{SessionID: "mixed", BootID: "boot-1", PIDs: []ledgerProcess{{PID: 1, StartTime: "t1"}, {PID: 4, StartTime: "t4"}}},
 			{SessionID: "idle-agy", BootID: "boot-1", Logical: true, PIDs: []ledgerProcess{}},
+			// Leader gone, but its group / job cannot be proven empty.
+			{SessionID: "left-a-tool", BootID: "boot-1", PIDs: []ledgerProcess{{PID: 5, StartTime: "t5", PGID: 5}}},
 			{SessionID: "pending", BootID: "boot-1", PendingSpawns: 1, PIDs: []ledgerProcess{}},
 			{SessionID: "incomplete", BootID: "boot-1", Incomplete: true, PIDs: []ledgerProcess{{PID: 1, StartTime: "t1"}}},
 		},
@@ -217,13 +220,19 @@ func TestBootReapClassification(t *testing.T) {
 		probed = append(probed, p.PID)
 		mu.Unlock()
 		switch p.PID {
-		case 1:
+		case 1, 5:
 			return processGone
 		case 2, 3:
 			return processOurs
 		default:
 			return processUnknown
 		}
+	}
+	l.descendants = func(p ledgerProcess) processProbeResult {
+		if p.PID == 5 {
+			return processUnknown
+		}
+		return processGone
 	}
 	l.end = func(p ledgerProcess, _ time.Duration) processProbeResult {
 		mu.Lock()
@@ -251,7 +260,7 @@ func TestBootReapClassification(t *testing.T) {
 		t.Fatalf("only processes still ours may be ended, ended = %v", ended)
 	}
 	for _, pid := range probed {
-		if pid < 1 || pid > 4 {
+		if pid < 1 || pid > 5 {
 			t.Fatalf("probed a PID the ledger never recorded: %d", pid)
 		}
 	}
@@ -265,6 +274,7 @@ func TestBootReapClassification(t *testing.T) {
 	want := map[string]string{
 		"gone": ledgerStateReaped, "ended": ledgerStateReaped, "idle-agy": ledgerStateReaped,
 		"stuck": ledgerStateSurviving, "denied": ledgerStateUnknown, "mixed": ledgerStateUnknown,
+		"left-a-tool": ledgerStateUnknown,
 	}
 	if !reflect.DeepEqual(states, want) {
 		t.Fatalf("persisted states = %v, want %v", states, want)
@@ -285,7 +295,7 @@ func TestBootReapClassification(t *testing.T) {
 	if r3.PreviousBootID != "boot-2" {
 		t.Fatalf("previousBootId = %q", r3.PreviousBootID)
 	}
-	if want := []string{"denied", "ended", "idle-agy", "mixed", "stuck"}; !reflect.DeepEqual(r3.SessionsReaped, want) {
+	if want := []string{"denied", "ended", "idle-agy", "left-a-tool", "mixed", "stuck"}; !reflect.DeepEqual(r3.SessionsReaped, want) {
 		t.Fatalf("boot-3 reaped = %v, want %v", r3.SessionsReaped, want)
 	}
 	if len(r3.SessionsSurviving) != 0 {
