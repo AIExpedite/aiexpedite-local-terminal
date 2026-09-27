@@ -753,3 +753,182 @@ func TestCodexScheduleRunDebtRetry_ARefusedWriteStillArmsARetry(t *testing.T) {
 	}
 	drainCodexRunDebtLadder(t)
 }
+
+// Contributors are not permanent — an empty authoritative full snapshot drops
+// them — so the marker must clear off the PAID WATERMARK too. Trusting the live
+// map alone would let such a clear resurrect a warning a reading had already
+// answered.
+func TestCodexClearCoveredStaleRunNotice_ClearsOffThePaidWatermark(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	markerFloor := now.Add(-2 * time.Hour)
+
+	// The watermark already covers the marker's floor, but no contributor does.
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+		snap.StaleRunNoticeFloorMs = markerFloor.UnixMilli()
+		snap.StaleRunNoticeAtMs = now.UnixMilli()
+		snap.RunFloorPaidMs = markerFloor.Add(time.Minute).UnixMilli()
+	})
+
+	if snap := f.snapshot(t); snap.StaleRunNoticeFloorMs != 0 {
+		t.Fatalf("a watermark past the marker's floor must clear it: %+v", snap)
+	}
+
+	// A watermark that has NOT reached the floor leaves the warning standing.
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+		snap.StaleRunNoticeFloorMs = markerFloor.UnixMilli()
+		snap.StaleRunNoticeAtMs = now.UnixMilli()
+		snap.RunFloorPaidMs = markerFloor.Add(-time.Minute).UnixMilli()
+	})
+	if snap := f.snapshot(t); snap.StaleRunNoticeFloorMs == 0 {
+		t.Fatal("a watermark short of the marker's floor must not clear it")
+	}
+}
+
+// The legacy fallback migration has TWO call sites — the loader and the cache
+// transaction's own read — because a mutation can branch on the fallback state
+// and must never see a value no current code path understands. Cover the
+// transaction site: a legacy cache mutated by any writer comes out migrated.
+func TestCodexMigrateLegacyFallbackState_AppliesInsideTheTransaction(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+
+	// Rewrite the persisted state to the pre-split value, behind the cache API,
+	// so only the transaction's own read can migrate it.
+	raw, err := os.ReadFile(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(raw), `"refreshOwedAttempts": 1`,
+		`"refreshOwedAttempts": 1,`+"\n"+`  "refreshFallbackState": "`+codexLegacyFallbackSpent+`"`, 1)
+	if legacy == string(raw) {
+		t.Fatalf("fixture shape changed; could not inject the legacy state:\n%s", raw)
+	}
+	if err := os.WriteFile(f.cache, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Any mutation at all: the migration runs on the transaction's read.
+	var seen string
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		seen = snap.RefreshFallbackState
+	})
+
+	if seen != codexFallbackDeferred {
+		t.Fatalf("the mutation saw %q, want the migrated %q", seen, codexFallbackDeferred)
+	}
+	snap := f.snapshot(t)
+	if snap.RefreshFallbackState != codexFallbackDeferred || snap.RefreshLiveReads != 1 {
+		t.Fatalf("the transaction must persist the migrated state: %+v", snap)
+	}
+}
+
+// The nudge runs on every gather (~30 s). In the steady state it must not take
+// the blocking cross-process cache lock at all — proven by wedging that lock and
+// asserting the nudge still returns promptly rather than spending the whole
+// bounded wait. The case that matters most is a debt PENDING with its next rung
+// still in the future: its own timer owns that rung, and without the cheap read
+// the nudge would pay for the lock on every gather for the debt's whole life.
+func TestNudgeCodexUsageRefresh_SteadyStateTakesNoCacheLock(t *testing.T) {
+	now := time.Now()
+	observed := now.Add(-time.Hour)
+	settledRollout := now.Add(-2 * codexForcedReconcileMinInterval)
+
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, f codexFreshnessFixture)
+		// rollout handed to the nudge; zero means "the reconcile reported nothing".
+		rollout time.Time
+	}{
+		{
+			name:    "nothing owed and no missed run",
+			setup:   func(*testing.T, codexFreshnessFixture) {},
+			rollout: time.Time{},
+		},
+		{
+			name: "debt pending with its rung still in the future",
+			setup: func(t *testing.T, f codexFreshnessFixture) {
+				f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+				codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+					snap.NextAttemptAtMs = now.Add(time.Hour).UnixMilli()
+				})
+			},
+			rollout: settledRollout,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+			f.seedPreRunReading(t, observed, now)
+			tc.setup(t, f)
+
+			// A wait long enough that paying it would be unmistakable.
+			prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+			codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 2*time.Second, 5*time.Millisecond
+			t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+			codexRateLimitMu.Lock()
+			defer codexRateLimitMu.Unlock()
+
+			start := time.Now()
+			if nudgeCodexUsageRefresh(f.home, f.fp, now, tc.rollout, observed) {
+				t.Fatal("the steady state must arm nothing")
+			}
+			if took := time.Since(start); took > 300*time.Millisecond {
+				t.Fatalf("the nudge waited %s on the wedged cache lock; it must decide off the cheap read", took)
+			}
+		})
+	}
+}
+
+// codexNudgeNeedsWrite must mirror exactly what the transaction would decide, or
+// the cheap guard would silently drop work.
+func TestCodexNudgeNeedsWrite_MirrorsTheTransactionsDecision(t *testing.T) {
+	now := time.Now()
+	nowMs := now.UnixMilli()
+	for _, tc := range []struct {
+		name          string
+		view          codexCacheView
+		settled, live bool
+		want          bool
+	}{
+		{name: "idle", want: false},
+		{name: "missed run to own", settled: true, want: true},
+		{name: "missed run but a local run is open", settled: true, live: true, want: false},
+		{
+			name: "debt with a future rung belongs to its timer",
+			view: codexCacheView{refreshOwedAtMs: nowMs - 1000, nextAttemptAtMs: nowMs + 60_000},
+			want: false,
+		},
+		{
+			name: "debt with a due rung arms the worker",
+			view: codexCacheView{refreshOwedAtMs: nowMs - 1000, nextAttemptAtMs: nowMs - 1},
+			want: true,
+		},
+		{
+			name: "debt mid-hand-off (no rung) belongs to its worker",
+			view: codexCacheView{refreshOwedAtMs: nowMs - 1000},
+			want: false,
+		},
+		{
+			name: "an over-age debt must be retired",
+			view: codexCacheView{refreshOwedAtMs: now.Add(-codexRefreshOwedMaxAge - time.Hour).UnixMilli()},
+			want: true,
+		},
+		{
+			name: "a future-dated floor must be rebased",
+			view: codexCacheView{runFloorMs: now.Add(codexRunFloorLocalSkew + time.Hour).UnixMilli()},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexNudgeNeedsWrite(tc.view, now, tc.settled, tc.live); got != tc.want {
+				t.Fatalf("needsWrite = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

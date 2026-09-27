@@ -393,11 +393,9 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := codexNewestOpenRunFloor() != 0
 
-	// The steady state — no debt on disk and no missed run to own — needs no
-	// write, so it must not pay for the blocking cache lock on every gather.
-	// A future-dated cache still does: the rebase below is the repair.
-	view := codexCacheViewForAccount(fp)
-	if view.refreshOwedAtMs == 0 && (!settled || liveRun) && !codexRunFreshnessInFuture(view, now) {
+	// Decided off the cheap cache READ: the transaction below takes the blocking
+	// cross-process cache lock, and this runs every ~30 s.
+	if !codexNudgeNeedsWrite(codexCacheViewForAccount(fp), now, settled, liveRun) {
 		return false
 	}
 
@@ -438,21 +436,55 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 		if latest := codexLatestContributorObservation(snap.Contributors); !latest.Before(newestRollout) {
 			return wrote
 		}
-		codexClearRunFreshnessDebt(snap)
+		// codexOweRunRefresh opens the new generation itself (it clears the debt's
+		// counters, fallback and rung first).
 		codexOweRunRefresh(snap, newestRollout, now)
 		start, created = true, true
 		return true
 	})
+	// The cooldown is consumed whenever the transaction RAN, not only when it
+	// armed the worker: a pass that took the lock and then declined — a local run
+	// still open, an observation that moved on — would otherwise re-take it on
+	// every gather for as long as that condition held.
+	n.lastAt = now
 	if !start {
 		return false
 	}
-	n.lastAt = now
 	if created {
 		fmt.Printf("%s[cli-usage] codex telemetry was written after the cached reading with no refresh owed (behindBy=%s); refresh owed%s\n",
 			colorYellow, codexBehindBy(observedAt, newestRollout), colorReset)
 	}
 	codexUsageRefresh.spawn(func() { codexRunDebtWorker(base, fp) })
 	return true
+}
+
+// codexNudgeNeedsWrite reports whether a nudge could do anything at all, from
+// the cheap cache read alone. It mirrors exactly what the transaction would
+// decide, so it changes no behaviour — it only keeps the blocking
+// cross-process cache lock off the steady-state gather.
+//
+// That matters most for the case the obvious guard misses: a debt PENDING on the
+// ladder with its next rung still in the future. Its own timer owns that rung, so
+// the nudge has nothing to do, yet without this it would take the lock on every
+// gather for as long as the debt lives — up to codexRefreshOwedMaxAge.
+func codexNudgeNeedsWrite(view codexCacheView, now time.Time, settled, liveRun bool) bool {
+	// A clock rollback left state dated ahead; the rebase inside is the repair.
+	if codexRunFreshnessInFuture(view, now) {
+		return true
+	}
+	if view.refreshOwedAtMs == 0 {
+		// Nothing owed: only a settled run of someone else's that nothing recorded.
+		return settled && !liveRun
+	}
+	// Over-age: retire it and leave the marker, so a newer rollout is not blocked
+	// behind it forever.
+	if codexRunDebtExpired(view.refreshOwedAtMs, now) {
+		return true
+	}
+	// Otherwise only a booked rung that is DUE arms the worker. A missing rung is
+	// the transient between a payment pass returning and the worker booking what
+	// it kept, and belongs to that worker.
+	return view.nextAttemptAtMs != 0 && view.nextAttemptAtMs <= now.UnixMilli()
 }
 
 // codexBehindBy renders how far a rollout write postdates the reading, for the

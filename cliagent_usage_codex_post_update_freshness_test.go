@@ -136,16 +136,18 @@ func TestCodexPostUpdate_GreenSmokeThenUpdateThenRolloutLands(t *testing.T) {
 	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("result = %+v, want the green smoke the bug report describes", result)
 	}
-	// Durability WITHOUT waiting for the workers: the debt and its first rung are
-	// on disk the instant runCodexSmoke returns, so an update handoff right here
-	// cannot take them with it. Read the cache directly — going through
-	// waitIdle() would pass even if persistence moved back onto the goroutine.
+	// Durability WITHOUT waiting for the workers: the DEBT is on disk the instant
+	// runCodexSmoke returns, so an update handoff right here cannot take it with
+	// it. Read the cache directly — going through waitIdle() would pass even if
+	// persistence moved back onto the goroutine.
+	//
+	// Only the debt is asserted here, not the rung: the asynchronous settle is
+	// racing the synchronous persist for the same run, and whichever lands second
+	// legitimately replaces the generation. The rung is asserted below, once the
+	// workers have drained.
 	settled := f.snapshot(t)
 	if settled.RefreshOwedAtMs == 0 || settled.RunFloorMs < before.UnixMilli() {
 		t.Fatalf("the smoke must persist its debt synchronously: %+v", settled)
-	}
-	if settled.NextAttemptAtMs == 0 {
-		t.Fatalf("the smoke must book its first rung synchronously: %+v", settled)
 	}
 
 	// The self-update replaces the process. Only the cache file carries over.

@@ -957,11 +957,23 @@ func codexRetireRunDebtInSnapshot(snap *codexRateLimitSnapshot, now time.Time) {
 // unconditionally on any paid debt: a newer debt can legitimately stand on an
 // OLDER floor (a withdrawal rolled the floor back to a run still open), and an
 // observation paying that one says nothing about the run the marker names.
+//
+// "Covered" reads the PAID WATERMARK as well as the live contributors, for the
+// reason codexRecordPaidRunFloor documents: contributors are not permanent — an
+// empty authoritative full snapshot legitimately drops them — so the watermark,
+// not the live map, is what says a run was observed. Trusting the map alone
+// would let an authoritative clear resurrect a warning that a reading had
+// already answered. The watermark can only reach the marker's floor via an
+// observation at or after it, so it can never clear the marker early: at the
+// moment the marker is written the debt is by definition unpaid, i.e.
+// RunFloorPaidMs is still below the floor being recorded.
 func codexClearCoveredStaleRunNotice(snap *codexRateLimitSnapshot) {
 	if snap.StaleRunNoticeFloorMs <= 0 {
 		return
 	}
-	if codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.StaleRunNoticeFloorMs {
+	covered := snap.RunFloorPaidMs >= snap.StaleRunNoticeFloorMs ||
+		codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.StaleRunNoticeFloorMs
+	if covered {
 		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
 	}
 }

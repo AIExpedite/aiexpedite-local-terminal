@@ -393,13 +393,13 @@ type codexSmokeEvidence struct {
 func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 	if evidence.usageCaptured || evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
-		// codexUsageRunSettled only SPAWNS a goroutine, so the debt and its first
-		// rung may not be on disk when runCodexSmoke returns. A smoke is usually
-		// the last thing that happens before an update handoff replaces the
-		// process, which would take the unwritten debt with it — the reported
-		// "green smoke, stale utilization" case. Land it here, synchronously,
-		// under the same bounded write budget an arm gets. The asynchronous worker
-		// still runs; it simply no longer owns durability.
+		// codexUsageRunSettled only SPAWNS a goroutine, so the debt may not be on
+		// disk when runCodexSmoke returns. A smoke is usually the last thing that
+		// happens before an update handoff replaces the process, which would take
+		// the unwritten debt with it — the reported "green smoke, stale
+		// utilization" case. Land it here, synchronously, under the same bounded
+		// write budget an arm gets. The asynchronous worker still runs; it simply
+		// no longer owns durability.
 		persistCodexSmokeRunDebt(floor)
 		return
 	}
@@ -408,12 +408,25 @@ func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 	codexUsageRunDisarmed(floor, time.Time{})
 }
 
-// persistCodexSmokeRunDebt records the smoke's run debt and books its first rung
-// before returning, on the shared bounded write budget every freshness write
-// that cannot be dropped uses (codexRetryBoundedWrite). A no-op when the
-// freshness path is disarmed (tests), and idempotent with the worker's own
-// settle: codexOweRunRefresh coalesces onto the newest floor and the worker
-// re-reads the debt from disk.
+// persistCodexSmokeRunDebt makes the smoke's run DEBT durable before
+// runCodexSmoke returns, on the shared bounded write budget every freshness
+// write that cannot be dropped uses (codexRetryBoundedWrite). A no-op when the
+// freshness path is disarmed (tests).
+//
+// It is idempotent with codexUsageRunSettled's own asynchronous settle, which is
+// racing it for the same run: a debt whose floor already covers this run is left
+// ALONE rather than re-owed. Re-owing would open a new generation
+// (codexOweRunRefresh resets the counters and the rung), so the two writers would
+// take turns discarding each other's bookkeeping for a run neither had spent an
+// attempt on yet.
+//
+// The debt is the guarantee; the first rung is BEST EFFORT. Whichever of the two
+// writers lands second may still replace the generation, and the worker the async
+// settle starts books the rung either way — within milliseconds, and a restart
+// that finds a debt with no rung reconciles immediately
+// (payOwedCodexUsageRefresh), which is the pre-existing behaviour. What must not
+// be lost is the debt itself: a smoke is usually the last thing that happens
+// before an update handoff replaces the process.
 func persistCodexSmokeRunDebt(floor time.Time) {
 	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
 		return
@@ -422,20 +435,25 @@ func persistCodexSmokeRunDebt(floor time.Time) {
 	if fp == "" {
 		return
 	}
+	floorMs := floor.UnixMilli()
 	landed := codexRetryBoundedWrite(func() bool {
 		now := codexUsageFreshnessNow()
 		return codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
 			codexRebaseFutureRunFreshness(snap, now, now)
+			if snap.RefreshOwedAtMs != 0 && snap.RunFloorMs >= floorMs {
+				// Already owed for this run, or for a newer one that absorbed it
+				// (the coalescing rule codexOweRunRefresh documents). Keep that
+				// generation and whatever it has already booked.
+				return
+			}
 			codexOweRunRefresh(snap, floor, now)
 		})
 	})
 	if !landed {
 		return
 	}
-	// The debt is on disk; book its first rung so a process replaced right now
-	// re-enters the ladder rather than waiting for the next run.
 	now := codexUsageFreshnessNow()
-	if state := codexRunFreshnessForAccount(fp, now); state.owed {
+	if state := codexRunFreshnessForAccount(fp, now); state.owed && state.nextAttemptAt.IsZero() {
 		codexScheduleRunDebtRetry(fp, state, now, codexRetryAfterScan)
 	}
 }
