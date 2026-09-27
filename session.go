@@ -1862,6 +1862,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
+	// Muse Code: whether this turn streamed any text, so its terminal
+	// record's full text is not rendered a second time.
+	var museCodeDeltaSeen bool
 
 	// Claude streams one content block at a time. Deltas inside a block join
 	// with nothing between them (see joinStreamBatch), but the boundary BETWEEN
@@ -1912,6 +1915,25 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				if family != codexCompleteFamily {
 					return // the same message in the stream's other dialect
 				}
+			}
+		}
+		if isMuseCodeCommand(session.Command) {
+			// `muse exec --json` records render as the assistant's text (deltas
+			// joined as fragments), the terminal text only when nothing
+			// streamed, and a failure in the shared turn-failed wrapper;
+			// bookkeeping and task records render nothing. A non-JSON line
+			// (banner, plain error) falls through and keeps its newline.
+			if ev, ok := parseMuseCodeEventLine(strings.TrimSpace(lineText)); ok {
+				switch {
+				case ev.TextDelta != "":
+					museCodeDeltaSeen = true
+					batch = append(batch, streamBatchEntry{text: ev.TextDelta, fragment: true})
+				case ev.FinalText != "" && !museCodeDeltaSeen:
+					batch = append(batch, streamBatchEntry{text: ev.FinalText, fragment: true})
+				case ev.Failure != "":
+					batch = append(batch, streamBatchEntry{text: "\n" + ev.Failure + "\n", fragment: true})
+				}
+				return
 			}
 		}
 		if isAntigravityCommand(session.Command) {

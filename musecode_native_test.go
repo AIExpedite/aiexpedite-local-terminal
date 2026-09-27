@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -251,5 +252,43 @@ func TestOneShotNative_CapabilityProbeUsesTheVersionFile(t *testing.T) {
 	}
 	if m.supportsNativeResume() {
 		t.Fatal("the launcher's recorded version (below the floor) must win over a spawned probe")
+	}
+}
+
+// The generic session_start path (what iOS drives, and the takeover route)
+// renders `muse exec --json` records as the assistant's text instead of raw
+// JSON: deltas join as one text, the terminal text is used only when nothing
+// streamed, failures use the turn-failed wrapper, and bookkeeping is silent.
+func TestReadOutputStream_MuseCodeRendersAssistantText(t *testing.T) {
+	render := func(lines ...string) string {
+		session := &CLISession{
+			ID:             "muse-legacy",
+			Command:        "muse",
+			Stdout:         io.NopCloser(strings.NewReader(strings.Join(lines, "\n") + "\n")),
+			Stderr:         io.NopCloser(strings.NewReader("")),
+			streamDone:     make(chan struct{}),
+			firstRealFrame: make(chan struct{}),
+		}
+		var out strings.Builder
+		NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+			if msg.Type == "stream" {
+				out.WriteString(msg.Output)
+			}
+		})
+		return out.String()
+	}
+
+	if got := render(museFrameUserInput, museFrameDeltaHello, museFrameDeltaWorld, museFrameTool, museFrameScheduled, museFrameCompleted); got != "Hello world" {
+		t.Fatalf("streamed turn rendered %q", got)
+	}
+	if got := render(museFrameCompleted); got != "Hello world" {
+		t.Fatalf("a turn with no deltas must render its terminal text, got %q", got)
+	}
+	got := render(museFrameDeltaHello, museFrameFailed402)
+	if !strings.Contains(got, "Hello") || !strings.Contains(got, "[Muse Code turn failed: billing_not_configured (status 402):") {
+		t.Fatalf("failed turn rendered %q", got)
+	}
+	if got := render("Muse Code: update available"); !strings.Contains(got, "update available") {
+		t.Fatalf("a plain line must pass through, got %q", got)
 	}
 }
