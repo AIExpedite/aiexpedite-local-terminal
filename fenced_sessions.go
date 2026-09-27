@@ -150,24 +150,53 @@ var fenceReport = struct {
 	sync.Mutex
 	applied bool
 	ready   chan struct{}
+	// gen is the connection generation: every reset starts a new one, and
+	// only an /online SENT under the current generation can apply it.
+	gen uint64
 }{ready: make(chan struct{})}
+
+// currentFenceGeneration is read when an /online is sent.
+func currentFenceGeneration() uint64 {
+	fenceReport.Lock()
+	defer fenceReport.Unlock()
+	return fenceReport.gen
+}
 
 // markFenceReportApplied records that an accepted /online's fence list is in
 // force (called after handleFencedSessions).
 func markFenceReportApplied() {
 	fenceReport.Lock()
 	defer fenceReport.Unlock()
+	markFenceReportAppliedLocked()
+}
+
+// markFenceReportAppliedFor applies an /online answer only when that request
+// was sent under the current connection generation: an answer to a request
+// sent before a reconnect may predate a Move made during the reconnect.
+func markFenceReportAppliedFor(gen uint64) bool {
+	fenceReport.Lock()
+	defer fenceReport.Unlock()
+	if gen != fenceReport.gen {
+		return false
+	}
+	markFenceReportAppliedLocked()
+	return true
+}
+
+func markFenceReportAppliedLocked() {
 	if !fenceReport.applied {
 		fenceReport.applied = true
 		close(fenceReport.ready)
 	}
 }
 
-// resetFenceReport forgets it: the agent went offline, and the next
-// connection must learn the fences again before running session commands.
+// resetFenceReport forgets it and starts a new generation: the agent went
+// offline or reconnected, and the connection must learn the fences again
+// before running session commands.
 func resetFenceReport() {
 	fenceReport.Lock()
 	defer fenceReport.Unlock()
+	fenceReport.gen++
 	if fenceReport.applied {
 		fenceReport.applied = false
 		fenceReport.ready = make(chan struct{})

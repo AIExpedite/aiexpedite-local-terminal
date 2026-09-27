@@ -484,3 +484,35 @@ func TestSecondAgentNeverReapsTheLiveOwnersLedger(t *testing.T) {
 		t.Fatalf("the second agent rewrote the owner's ledger")
 	}
 }
+
+// TestReleaseKeepsRecordsWhoseTreeIsNotEmpty: a session ending does not prove
+// its tree ended; a record whose group / job still holds a process stays
+// (with its job) so the next boot never certifies the session.
+func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLedger(t, dir, "boot-1")
+	var released []uintptr
+	l.attachJob = func(p *os.Process, _ bool) (uintptr, bool, error) { return uintptr(p.Pid), true, nil }
+	l.releaseJob = func(j uintptr) { released = append(released, j) }
+	l.treeGone = func(p ledgerProcess, _ uintptr) bool { return p.PID == 1 }
+	l.BeginSpawn("s")
+	l.TrackProcess("s", proc(1), true)
+	l.BeginSpawn("s")
+	l.TrackProcess("s", proc(2), true)
+	l.ReleaseSession("s")
+	got := readLedgerFile(t, dir).Entries
+	if len(got) != 1 || len(got[0].PIDs) != 1 || got[0].PIDs[0].PID != 2 || got[0].Logical {
+		t.Fatalf("kept = %+v", got)
+	}
+	if !reflect.DeepEqual(released, []uintptr{1}) {
+		t.Fatalf("released jobs = %v, want only the empty one", released)
+	}
+
+	l2 := newTestLedger(t, dir, "boot-2")
+	l2.probe = func(ledgerProcess) processProbeResult { return processGone }
+	l2.descendants = func(ledgerProcess) processProbeResult { return processUnknown }
+	l2.RunBootReap()
+	if r := l2.Report(context.Background()); len(r.SessionsReaped) != 0 {
+		t.Fatalf("a session with a live descendant was certified: %+v", r)
+	}
+}

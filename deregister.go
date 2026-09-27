@@ -319,6 +319,8 @@ type onlineResponse struct {
 	// its fence list known to be complete; an unreadable answer (truncated,
 	// timed out, malformed) still counts as "online" but applies nothing.
 	readable bool
+	// fenceGen is the connection generation the request was sent under.
+	fenceGen uint64
 }
 
 // onOnlineAccepted applies an accepted (2xx) /online: the reaped sessions it
@@ -340,8 +342,14 @@ func applyOnlineAccepted(l *spawnLedger, resp *onlineResponse) {
 	}
 	l.AckReaped(resp.sentReaped)
 	handleFencedSessions(resp.FencedSessionIDs)
-	// The fences are in force: session commands may run (holdForFenceReport).
-	markFenceReportApplied()
+	// The fences are in force: session commands may run (holdForFenceReport)
+	// — unless a reconnect started a new generation while this request was
+	// in flight; its answer may predate a Move, so the gate stays closed and
+	// ensureFenceReport sends a fresh /online.
+	if !markFenceReportAppliedFor(resp.fenceGen) {
+		fmt.Printf("%s[online] /online answer belongs to an earlier connection — fence report not applied%s\n",
+			colorYellow, colorReset)
+	}
 }
 
 // bootReportForOnline is the ledger's report, behind a seam for tests.
@@ -417,6 +425,9 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, path 
 	// Every /online caller (boot, tray Reconnect, update reconciliation)
 	// reports the boot here, signed with this request's timestamp.
 	var sentReaped []string
+	// Read before the request is sent: the answer can only be as fresh as
+	// the moment the server received it.
+	fenceGen := currentFenceGeneration()
 	if path == "online" {
 		sentReaped = addBootReport(payload, cfg, timestamp, bootReportForOnline(ctx))
 	}
@@ -451,7 +462,7 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, path 
 	if path != "online" {
 		return nil, nil
 	}
-	out := &onlineResponse{sentReaped: sentReaped}
+	out := &onlineResponse{sentReaped: sentReaped, fenceGen: fenceGen}
 	// The 200 itself means "online". The fence list counts only when the
 	// whole body was read and parsed: a truncated, timed-out, oversized or
 	// malformed answer may be missing a fenced session, so it applies

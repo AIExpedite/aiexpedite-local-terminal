@@ -658,3 +658,38 @@ func TestFenceWorkerHandsOffAcrossReconnects(t *testing.T) {
 		}
 	}
 }
+
+// TestOnlineAnswerFromAnEarlierConnectionDoesNotOpenTheGate: an /online sent
+// before a reconnect may answer with fences that predate a Move made during
+// the reconnect, so it never applies the new connection's fence report.
+func TestOnlineAnswerFromAnEarlierConnectionDoesNotOpenTheGate(t *testing.T) {
+	resetConnectivityState(t)
+	resetFencedSessions(t)
+	resetFenceReportForTest(t)
+	withBootReport(t, bootReport{BootID: "boot-gen", SessionsReaped: []string{}, SessionsSurviving: []string{}})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		<-release
+		_, _ = w.Write([]byte(`{"fencedSessionIds":[]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+	cfg := &Config{AgentID: "agent-gen", CommandSecret: "secret-gen"}
+
+	done := make(chan error, 1)
+	go func() { done <- notifyOnline(context.Background(), cfg) }()
+	time.Sleep(200 * time.Millisecond) // the request is in flight
+	resetFenceReport()                 // a reconnect starts a new generation
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if fenceReportApplied() {
+		t.Fatalf("an answer to a request sent before the reconnect opened the gate")
+	}
+	// A request sent under the new generation does.
+	if err := notifyOnline(context.Background(), cfg); err != nil || !fenceReportApplied() {
+		t.Fatalf("a current-generation answer must apply (err %v)", err)
+	}
+}

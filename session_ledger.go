@@ -508,10 +508,29 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 	if e == nil {
 		return
 	}
+	// A session ending does not prove its tree ended: a CLI may have left a
+	// daemonized child, or a turn a tool. Keep every record whose group
+	// (Unix) / job (Windows) is not proven empty — with its kill-on-close job
+	// — so the next boot never certifies the session on the record's absence
+	// and an agent death still ends what the job holds.
+	kept := e.PIDs[:0]
 	for _, p := range e.PIDs {
-		l.releaseJobLocked(p.PID)
+		if l.treeGone(p, l.jobs[p.PID]) {
+			l.releaseJobLocked(p.PID)
+			continue
+		}
+		fmt.Printf("%s[ledger] Session %s ended but PID %d's group/job still holds processes; kept for the boot reap%s\n",
+			colorYellow, sessionID, p.PID, colorReset)
+		kept = append(kept, p)
 	}
-	l.removeAtLocked(i)
+	if len(kept) == 0 {
+		l.removeAtLocked(i)
+	} else {
+		e.PIDs = kept
+		e.Logical = false
+		e.PendingSpawns = 0
+		l.touch(e)
+	}
 	l.persistLocked()
 }
 

@@ -198,16 +198,40 @@ func TestTrackProcessPutsTheSessionInAJob(t *testing.T) {
 		t.Fatalf("a job-owned process must be recorded contained: %+v", e)
 	}
 	rec := recordedProcess(t, cmd.Process)
+
+	// Released while its job still holds a live process: the record and the
+	// kill-on-close job stay, and nothing is killed.
 	l.ReleaseSession("s-job")
 	l.mu.Lock()
 	_, still := l.jobs[cmd.Process.Pid]
 	l.mu.Unlock()
-	if still {
-		t.Fatalf("ReleaseSession kept the job handle")
+	if !still || len(readLedgerFile(t, dir).Entries) != 1 {
+		t.Fatalf("a session whose job is not empty lost its record or job")
 	}
 	time.Sleep(200 * time.Millisecond)
 	if got := probeRecordedProcess(rec); got != processOurs {
-		t.Fatalf("a clean release must not kill (probe = %v)", got)
+		t.Fatalf("a release must not kill (probe = %v)", got)
+	}
+
+	// Once the job is empty, releasing drops both.
+	_ = cmd.Process.Kill()
+	waitForProbe(t, rec, processGone, 10*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l.mu.Lock()
+		n, _ := jobActiveProcesses(l.jobs[cmd.Process.Pid])
+		l.mu.Unlock()
+		if n == 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	l.ReleaseSession("s-job")
+	l.mu.Lock()
+	_, still = l.jobs[cmd.Process.Pid]
+	l.mu.Unlock()
+	if still || len(readLedgerFile(t, dir).Entries) != 0 {
+		t.Fatalf("an empty job's session was not released")
 	}
 }
 
