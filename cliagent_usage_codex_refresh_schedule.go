@@ -179,17 +179,24 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 	}
 	var next time.Time
 	var scans, reads int
+	// rejected marks a transaction that DID read the snapshot and declined on
+	// its merits, as opposed to one the cache locks refused before mutate ran
+	// (or whose write failed after it). Only the latter may arm the in-process
+	// fallback below.
+	rejected := false
 	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
 		// Generation safety, the rule codexSetRefreshFallback and
 		// codexRecordRefreshAttempt already follow: a credentials swap mid-wait,
 		// a newer run's debt, or a floor withdrawn by codexUsageRunDisarmed all
 		// mean this pass has nothing to book.
 		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs {
+			rejected = true
 			return false
 		}
 		owedAt := time.UnixMilli(snap.RefreshOwedAtMs)
 		if codexRunDebtExpired(snap.RefreshOwedAtMs, now) {
 			// Over-age: the expiry path owns this debt, not the ladder.
+			rejected = true
 			return false
 		}
 		delay, ok := time.Duration(0), false
@@ -231,9 +238,17 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 		scans, reads = snap.RefreshOwedAttempts, snap.RefreshLiveReads
 		return true
 	})
+	if rejected {
+		// The debt this pass describes is gone, superseded, or over-age. Arming a
+		// timer for it would REPLACE the process-wide timer — possibly the one the
+		// current generation's own pass just armed — with one whose callback
+		// discards itself, stranding the live debt's rung until a gather or a
+		// restart. Whoever owns the current debt books it.
+		return false
+	}
 	if !committed {
-		// The bounded cache locks REFUSED the write, so mutate never ran and there
-		// is no rung on disk. Dropping it here is the exact failure this file
+		// The bounded cache locks REFUSED the write (or it failed to commit), so
+		// there is no rung on disk. Dropping it here is the exact failure this file
 		// exists to fix, so arm one in this process anyway: its callback re-reads
 		// the debt and books it properly. Nothing is persisted, so a restart
 		// before then falls back to the startup replay.
@@ -546,6 +561,12 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 		if snap.AccountFingerprint != fp {
 			return false
 		}
+		// Whether the held evidence is still the one the read above judged. A
+		// concurrent reconcile may have replaced it since — atomically with
+		// advancing its scan cursor, so that newer file will not be reported
+		// again — and `stale` says nothing about evidence it never saw.
+		heldUnchanged := snap.PendingRolloutMtimeMs == view.pendingRolloutMs &&
+			snap.PendingRolloutEntry == view.pendingRolloutEntry
 		wrote := codexRebaseFutureRunFreshness(snap, now, now)
 		// Record the evidence FIRST, in the same write as anything else this
 		// transaction does. It is the only durable trace of a rollout the scan
@@ -561,7 +582,9 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 		}
 		// A reading has caught up with what we were holding, or has been mined from
 		// the file it names; it can no longer tell us anything.
-		if stale && snap.PendingRolloutMtimeMs != 0 {
+		// Only the evidence that was actually judged (plus a fresh report this
+		// pass wrote over it, which `behind` covered too).
+		if stale && heldUnchanged && snap.PendingRolloutMtimeMs != 0 {
 			snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry, wrote = 0, "", true
 		}
 		if snap.RefreshOwedAtMs != 0 && codexRunDebtExpired(snap.RefreshOwedAtMs, now) {

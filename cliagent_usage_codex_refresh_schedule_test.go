@@ -1493,3 +1493,81 @@ func TestNudgeCodexUsageRefresh_CaughtUpReadingReleasesHeldEvidence(t *testing.T
 		t.Fatalf("the nudge waited %s on the wedged cache lock; the release must be once, not every gather", took)
 	}
 }
+
+// A pass describing a generation that has since been replaced is REJECTED by the
+// transaction, not refused by the locks, and must not arm the in-process
+// fallback: that would replace the timer the current generation already armed
+// with one whose callback discards itself, stranding the live debt's rung.
+func TestCodexScheduleRunDebtRetry_AStaleGenerationKeepsTheLiveTimer(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	stale := f.oweUnpaidDebt(t, now.Add(-4*time.Minute), now.Add(-3*time.Minute), 1, 0)
+	live := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+	if stale.debtID() == live.debtID() {
+		t.Fatal("fixture must produce two distinct generations")
+	}
+	codexArmRunDebtRetry(live.debtID(), f.fp, time.Hour)
+	t.Cleanup(stopCodexRunDebtRetry)
+	gen := retryTimerGeneration()
+
+	if codexScheduleRunDebtRetry(f.fp, stale, now, codexRetryAfterScan) {
+		t.Fatal("a superseded generation must book nothing")
+	}
+	if got := retryTimerGeneration(); got != gen {
+		t.Fatalf("the live generation's timer was replaced (gen %d -> %d)", gen, got)
+	}
+	if !codexRunDebtRetryPending() {
+		t.Fatal("the live generation's timer is gone")
+	}
+}
+
+// A nudge that judged held evidence stale must not clear evidence a concurrent
+// reconcile recorded between the nudge's read and its transaction: that reconcile
+// advanced its cursor in the same write, so the newer rollout is never reported
+// again and its refresh debt would be lost for good.
+func TestNudgeCodexUsageRefresh_KeepsEvidenceReplacedAfterTheRead(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	held := now.Add(-4 * codexForcedReconcileMinInterval)
+	// A reading that has caught up with the held evidence, so the read judges it
+	// stale.
+	f.seedPreRunReading(t, held.Add(time.Minute), now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = held.UnixMilli(), "rollout-a"
+	})
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 5*time.Second, 5*time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	// Hold the in-process gate so the nudge reads its view and then waits for the
+	// transaction; replace the evidence underneath it before releasing.
+	codexRateLimitMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{}, time.Time{})
+	}()
+	time.Sleep(150 * time.Millisecond)
+	newer := now.Add(-2 * codexForcedReconcileMinInterval)
+	snap := f.snapshot(t)
+	snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = newer.UnixMilli(), "rollout-b"
+	out, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		codexRateLimitMu.Unlock()
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.cache, out, 0o600); err != nil {
+		codexRateLimitMu.Unlock()
+		t.Fatal(err)
+	}
+	codexRateLimitMu.Unlock()
+	<-done
+
+	got := f.snapshot(t)
+	if got.PendingRolloutEntry != "rollout-b" {
+		t.Fatalf("evidence recorded after the nudge's read was cleared: pending=%d entry=%q",
+			got.PendingRolloutMtimeMs, got.PendingRolloutEntry)
+	}
+}
