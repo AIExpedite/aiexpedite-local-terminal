@@ -618,7 +618,7 @@ func TestCodexReconcileFromRollout_ReportsTheNewestEligibleMtime(t *testing.T) {
 	if got := codexCoveredMtimes(rollouts); len(got) != 1 || got[0].Truncate(time.Second) != older {
 		t.Fatalf("covered mtimes = %v, want only the mined candidate %s", got, older)
 	}
-	if rollouts.newestEntry == "" || rollouts.covers(rollouts.newestEntry) {
+	if rollouts.newestEntry == "" || rollouts.covers(rollouts.newestEntry, 0) {
 		t.Fatalf("the uncovered rollout must be reported with its own identity, not a covered one (entry=%q)", rollouts.newestEntry)
 	}
 }
@@ -1462,6 +1462,37 @@ func TestNudgeCodexUsageRefresh_CoveredHeldEvidenceYieldsToAFreshReport(t *testi
 	if snap := f.snapshot(t); snap.RunFloorMs != older.UnixMilli() {
 		t.Fatalf("the uncovered report was shadowed by covered held evidence: floor=%d want %d",
 			snap.RunFloorMs, older.UnixMilli())
+	}
+}
+
+// Coverage of an OLDER generation of the same file does not release newer held
+// evidence: a concurrent pass recorded a telemetry-free append at T2 (advancing
+// its cursor, so it will not be reported again) while this pass only mined the
+// file as of T1. Releasing on identity alone would drop the only trigger that
+// run gets.
+func TestNudgeCodexUsageRefresh_OlderGenerationCoverageKeepsHeldEvidence(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	held := now.Add(-2 * time.Minute)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = held.UnixMilli(), "rollout-a"
+	})
+
+	olderGeneration := codexRolloutNudgeEvidence{covered: map[string]time.Time{"rollout-a": held.Add(-time.Minute)}}
+	if olderGeneration.covers("rollout-a", held.UnixMilli()) {
+		t.Fatal("coverage at T1 must not cover evidence held at T2")
+	}
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, olderGeneration, observed) {
+		t.Fatal("held evidence newer than the covered generation must still owe a refresh")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != held.UnixMilli() {
+		t.Fatalf("debt not floored at the held T2 evidence: owed=%d floor=%d", snap.RefreshOwedAtMs, snap.RunFloorMs)
+	}
+	sameGeneration := codexRolloutNudgeEvidence{covered: map[string]time.Time{"rollout-a": held}}
+	if !sameGeneration.covers("rollout-a", held.UnixMilli()) {
+		t.Fatal("coverage reaching the held mtime must cover it")
 	}
 }
 

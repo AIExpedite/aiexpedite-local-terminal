@@ -2330,13 +2330,21 @@ type codexRolloutNudgeEvidence struct {
 }
 
 // covers reports whether this pass mined telemetry covering the rollout
-// identified by entry. An empty entry names no file and is never covered.
-func (e codexRolloutNudgeEvidence) covers(entry string) bool {
+// identified by entry as of heldMs, the (millisecond) mtime the evidence was
+// recorded at. An empty entry names no file and is never covered.
+//
+// Identity alone is not enough: concurrent reconciles can inspect different
+// generations of the same file. A pass that mined it at T1 says nothing about
+// a telemetry-free append at T2 that another pass recorded (atomically with
+// advancing its cursor, so it will not be reported again) — releasing that on
+// T1's coverage would drop the only trigger that run ever gets. So the mtime
+// this pass covered must reach the held one.
+func (e codexRolloutNudgeEvidence) covers(entry string, heldMs int64) bool {
 	if entry == "" {
 		return false
 	}
-	_, ok := e.covered[entry]
-	return ok
+	mtime, ok := e.covered[entry]
+	return ok && mtime.UnixMilli() >= heldMs
 }
 
 // codexRolloutCoverageLag is how far a rollout's mtime may sit ahead of the

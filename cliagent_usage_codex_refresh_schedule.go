@@ -581,7 +581,7 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 	// reporting its mtime, and the reading it then merges is normally EARLIER
 	// than that mtime — so without this the held value would stay permanently
 	// "behind" and floor an unpayable debt.
-	heldCovered := view.pendingRolloutMs > 0 && rollouts.covers(view.pendingRolloutEntry)
+	heldCovered := view.pendingRolloutMs > 0 && rollouts.covers(view.pendingRolloutEntry, view.pendingRolloutMs)
 	newestRollout, newestEntry, freshEvidence := codexNudgeRolloutEvidence(view, rollouts.newest, rollouts.newestEntry, heldCovered, now)
 	// A rollout written since the newest observation, still owing telemetry,
 	// settled long enough ago that it is not still being appended to.
