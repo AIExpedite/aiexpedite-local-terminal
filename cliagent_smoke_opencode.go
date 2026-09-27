@@ -101,6 +101,12 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 	// the kill still holds the write end, and without a delay Wait would block on
 	// it forever — the per-attempt deadline would bound nothing.
 	cmd.WaitDelay = openCodeSmokeWaitDelay
+	// Setsid on unix (hides the console window on Windows) so the child leads its
+	// own process group, exactly as runOneShot does. Without it the child shares
+	// the terminal agent's group, killOpenCodeProcessTree's `-pid` group kill
+	// targets a group that does not exist, and a tool descendant survives the
+	// deadline on macOS/Linux.
+	detachControllingTTY(cmd)
 	// The deadline must reach the process the probe actually cares about.
 	// exec.CommandContext's own Cancel kills the single child, and the shim
 	// route's kills cmd.exe plus the tree — but an `opencode` TOOL child can
