@@ -466,15 +466,18 @@ func isMuseCodeSynthesizedRun(args []string) bool {
 // synthesized `muse exec` argv into an owner-only temp file referenced by
 // `--prompt-file`, and returns the rewritten argv plus the path to remove.
 //
-// Only the Windows `.cmd` shim launch needs this (StartSession): cmd.exe gets
-// one expansion pass, so oneShotShimScript refuses an operand holding a quote
-// or a line break — which a prompt routinely holds. Moving the prompt to a file
-// leaves argv with flags and a path, which the shim renderer can carry safely.
+// StartSession stages every synthesized run this way. A prompt can carry
+// source code or credentials, and argv is visible to any local user through
+// the process list — the native chat path already keeps it off argv. The
+// Windows `.cmd` shim launch additionally depends on it: cmd.exe gets one
+// expansion pass, so oneShotShimScript refuses an operand holding a quote or a
+// line break, which a prompt routinely holds.
 // A non-synthesized (diagnostic) argv, or a promptless one, is returned
-// unchanged with an empty path.
-func rewriteMuseCodePromptToFile(args []string) (rewritten []string, cleanupPath string) {
+// unchanged with an empty path. A staging failure is returned as an error so
+// the caller fails closed instead of falling back to a plaintext argv prompt.
+func rewriteMuseCodePromptToFile(args []string) (rewritten []string, cleanupPath string, err error) {
 	if !isMuseCodeSynthesizedRun(args) {
-		return args, ""
+		return args, "", nil
 	}
 	sep := -1
 	for i, a := range args {
@@ -484,23 +487,21 @@ func rewriteMuseCodePromptToFile(args []string) (rewritten []string, cleanupPath
 		}
 	}
 	if sep < 0 || sep+1 >= len(args) {
-		return args, ""
+		return args, "", nil
 	}
 	prompt := strings.Join(args[sep+1:], " ")
 	if strings.TrimSpace(prompt) == "" {
-		return args, ""
+		return args, "", nil
 	}
 	path, handle, err := writeOneShotPromptFile(
 		museCodeNativeSpec.PromptDirName, museCodeNativeSpec.PromptFilePrefix, prompt)
 	if err != nil {
-		// Fall back to the positional form; a launch failure is a clearer
-		// signal than silently dropping the user's prompt.
-		return args, ""
+		return args, "", err
 	}
 	_ = handle.Close() // the child reads the path, not stdin
 
 	out := make([]string, 0, sep+2)
 	out = append(out, args[:sep]...)
 	out = append(out, "--prompt-file", path)
-	return out, path
+	return out, path, nil
 }

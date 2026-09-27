@@ -513,12 +513,16 @@ func TestReadOutputStream_MuseCodeRendersAssistantText(t *testing.T) {
 	}
 }
 
-// The Windows `.cmd` shim launch (StartSession) routes argv through cmd.exe,
+// StartSession keeps every synthesized Muse prompt off argv (process listings
+// expose it), and the Windows `.cmd` shim launch routes argv through cmd.exe,
 // whose single expansion pass cannot carry an operand holding a quote or a line
 // break — so the legacy positional prompt moves into a --prompt-file first.
 func TestRewriteMuseCodePromptToFile(t *testing.T) {
 	shaped := buildMuseCodeInteractiveArgs([]string{"--model", "m", "review \"this\"\nplease"})
-	rewritten, path := rewriteMuseCodePromptToFile(shaped)
+	rewritten, path, err := rewriteMuseCodePromptToFile(shaped)
+	if err != nil {
+		t.Fatalf("staging failed: %v", err)
+	}
 	if path == "" {
 		t.Fatalf("expected the prompt to be staged; argv=%v", shaped)
 	}
@@ -557,11 +561,33 @@ func TestRewriteMuseCodePromptToFile(t *testing.T) {
 
 	// A diagnostic invocation and a promptless argv are returned untouched.
 	diag := []string{"--version"}
-	if got, p := rewriteMuseCodePromptToFile(diag); p != "" || strings.Join(got, " ") != "--version" {
+	if got, p, _ := rewriteMuseCodePromptToFile(diag); p != "" || strings.Join(got, " ") != "--version" {
 		t.Fatalf("diagnostic argv must pass through: %v %q", got, p)
 	}
 	bare := buildMuseCodeInteractiveArgs([]string{"--model", "m"})
-	if got, p := rewriteMuseCodePromptToFile(bare); p != "" || strings.Join(got, " ") != strings.Join(bare, " ") {
+	if got, p, _ := rewriteMuseCodePromptToFile(bare); p != "" || strings.Join(got, " ") != strings.Join(bare, " ") {
 		t.Fatalf("promptless argv must pass through: %v %q", got, p)
+	}
+}
+
+// A staging failure must surface as an error — StartSession then refuses the
+// launch — never as a silent fallback that leaves the prompt on argv.
+func TestRewriteMuseCodePromptToFileFailsClosed(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Both the per-user prompt dir and the OS temp fallback sit under a file.
+	for _, k := range []string{"HOME", "USERPROFILE", "TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(k, blocker)
+	}
+	shaped := buildMuseCodeInteractiveArgs([]string{"secret prompt"})
+	got, path, err := rewriteMuseCodePromptToFile(shaped)
+	if err == nil {
+		os.Remove(path)
+		t.Fatalf("expected a staging error, got argv=%v path=%q", got, path)
+	}
+	if path != "" {
+		t.Fatalf("no cleanup path on failure, got %q", path)
 	}
 }

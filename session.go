@@ -512,19 +512,28 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		executable = resolveExecutable(command)
 	}
 
-	// A Windows `.cmd` / `.bat` launcher (an npm-style `muse.cmd`) cannot be
-	// started by CreateProcess directly — the same failure newOneShotCommand
-	// fixes on the native chat path. The generic session_start / takeover route
-	// resolves that same installation, so shim-launch it the same way. The
-	// prompt moves to `--prompt-file` first: cmd.exe has a single expansion
-	// pass, so oneShotShimScript refuses an operand holding a quote or a line
-	// break, and a prompt routinely holds both.
-	museShimLaunch := isMuseCodeCommand(command) && isWindowsShimPath(executable)
-	if museShimLaunch {
-		if rewritten, staged := rewriteMuseCodePromptToFile(cliArgs); staged != "" {
+	// A synthesized Muse prompt moves to an owner-only `--prompt-file` on every
+	// platform: argv is readable through the process list, and a prompt can hold
+	// source code or credentials (the native chat path keeps it off argv too).
+	// Staging failure refuses the launch rather than falling back to plaintext
+	// argv. The Windows `.cmd` shim launch below depends on it as well — cmd.exe
+	// has a single expansion pass, so oneShotShimScript refuses an operand
+	// holding a quote or a line break, and a prompt routinely holds both.
+	if isMuseCodeCommand(command) {
+		rewritten, staged, stageErr := rewriteMuseCodePromptToFile(cliArgs)
+		if stageErr != nil {
+			return fmt.Errorf("muse could not stage its prompt file; refusing to place the prompt on argv: %w", stageErr)
+		}
+		if staged != "" {
 			cliArgs, promptFile = rewritten, staged
 		}
 	}
+
+	// A Windows `.cmd` / `.bat` launcher (an npm-style `muse.cmd`) cannot be
+	// started by CreateProcess directly — the same failure newOneShotCommand
+	// fixes on the native chat path. The generic session_start / takeover route
+	// resolves that same installation, so shim-launch it the same way.
+	museShimLaunch := isMuseCodeCommand(command) && isWindowsShimPath(executable)
 
 	logSession(id, "%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, sessionArgsForLog(cliArgs), colorReset)
