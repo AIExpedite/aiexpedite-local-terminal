@@ -613,3 +613,37 @@ func TestOneShotCompletionFrameRedactsCredentialShapedText(t *testing.T) {
 		t.Fatalf("plain completion frame altered: %q", plain)
 	}
 }
+
+// endIfSame frees the id before the reaper publishes its ended frame, and that
+// frame names the session only by the logical id. A replacement Start must not
+// be admitted into that window, or the stale frame would release the live
+// session's cloud reservation.
+func TestOneShotNative_StaleReapReservesTheIDThroughEndedPublication(t *testing.T) {
+	m := installMuseCodeStub(t)
+	cwd := startMuse(t, m, "s", "")
+	sampled := m.Get("s")
+
+	admitted := make(chan error, 1)
+	var published []resultMsg
+	publish := func(msg resultMsg) {
+		// Racing Start, as the cloud would once the id looked free.
+		admitted <- m.Start("s", cwd, "ws", "uid", "", nil, nil)
+		published = append(published, msg)
+	}
+
+	m.reapStaleSession("s", sampled, "ws", "uid", publish)
+
+	if err := <-admitted; err == nil {
+		t.Fatal("a Start racing the ended publication must be refused while the id is reserved")
+	}
+	if len(published) != 1 || published[0].Type != m.spec.frameType("ended") {
+		t.Fatalf("the reap must still publish exactly one ended frame, got %+v", published)
+	}
+	if m.Get("s") != nil {
+		t.Fatal("the reaped session must not be replaced inside the reserved window")
+	}
+	// The reservation is released once publication is done.
+	if err := m.Start("s", cwd, "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("a Start after the ended frame must be admitted: %v", err)
+	}
+}

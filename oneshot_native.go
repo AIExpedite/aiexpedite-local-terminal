@@ -250,7 +250,12 @@ func (s *oneShotNativeSession) clearActiveProcess() {
 type oneShotNativeManager struct {
 	spec     *oneShotNativeSpec
 	sessions map[string]*oneShotNativeSession
-	mu       sync.RWMutex
+	// reaping holds ids the stale reaper has taken out of sessions but whose
+	// ended frame is still unpublished. Start refuses a reserved id so that
+	// frame can never be attributed to a replacement session (and release its
+	// cloud reservation). Guarded by mu.
+	reaping map[string]struct{}
+	mu      sync.RWMutex
 
 	capMu       sync.Mutex
 	capOK       bool
@@ -265,6 +270,7 @@ func newOneShotNativeManager(spec *oneShotNativeSpec) *oneShotNativeManager {
 	m := &oneShotNativeManager{
 		spec:     spec,
 		sessions: make(map[string]*oneShotNativeSession),
+		reaping:  make(map[string]struct{}),
 	}
 	m.probeVersion = m.probeVersionUncached
 	return m
@@ -311,6 +317,10 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 		m.mu.Unlock()
 		return err
 	}
+	if err := m.reapReservedErr(id); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	m.mu.Unlock()
 
 	if err := m.probeCapability(); err != nil {
@@ -328,6 +338,9 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 	defer m.mu.Unlock()
 	if existing, exists := m.sessions[id]; exists {
 		return m.ackExisting(existing, id, publishFn, onStarted)
+	}
+	if err := m.reapReservedErr(id); err != nil {
+		return err
 	}
 
 	nativeID, confirmed := resumeSessionID, resumeSessionID != ""
@@ -1156,32 +1169,44 @@ func (m *oneShotNativeManager) endStaleSessions(maxAge time.Duration) {
 	}
 	m.mu.RUnlock()
 	for _, ss := range stale {
-		m.logf(colorYellow, "Reaping stale session %s", ss.id)
-		trackTerminalPublishStart()
-		// Withheld for an unconfirmed or stale end — see the *_end handler.
-		if err := m.endIfSame(ss.id, ss.session); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
-			m.logf(colorRed, "Stale reap withheld ended frame for %s — %v", ss.id, err)
-			trackTerminalPublishEnd()
-			continue
-		}
-		if ss.publishFn == nil {
-			trackTerminalPublishEnd()
-			continue
-		}
-		ss.publishFn(resultMsg{
-			ID:          ss.id,
-			WorkspaceID: ss.workspaceID,
-			UID:         ss.uid,
-			Output:      m.spec.DisplayName + " native session expired (stale)",
-			Status:      "success",
-			Ts:          time.Now().UnixMilli(),
-			Version:     Version,
-			Type:        m.spec.frameType("ended"),
-			SessionID:   ss.id,
-			ExitCode:    0,
-		})
-		trackTerminalPublishEnd()
+		m.reapStaleSession(ss.id, ss.session, ss.workspaceID, ss.uid, ss.publishFn)
 	}
+}
+
+// reapStaleSession ends one sampled session and publishes its ended frame with
+// the logical id reserved across BOTH steps: endIfSame frees the id before the
+// publish, and the frame identifies the session only by that id, so a
+// replacement Start landing in the gap would have its live reservation released
+// by this stale frame.
+func (m *oneShotNativeManager) reapStaleSession(id string, session *oneShotNativeSession, workspaceID, uid string, publishFn PublishFunc) {
+	if !m.reserveForReap(id) {
+		return
+	}
+	defer m.releaseReap(id)
+
+	m.logf(colorYellow, "Reaping stale session %s", id)
+	trackTerminalPublishStart()
+	defer trackTerminalPublishEnd()
+	// Withheld for an unconfirmed or stale end — see the *_end handler.
+	if err := m.endIfSame(id, session); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
+		m.logf(colorRed, "Stale reap withheld ended frame for %s — %v", id, err)
+		return
+	}
+	if publishFn == nil {
+		return
+	}
+	publishFn(resultMsg{
+		ID:          id,
+		WorkspaceID: workspaceID,
+		UID:         uid,
+		Output:      m.spec.DisplayName + " native session expired (stale)",
+		Status:      "success",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        m.spec.frameType("ended"),
+		SessionID:   id,
+		ExitCode:    0,
+	})
 }
 
 func (m *oneShotNativeManager) ShutdownAll() {
@@ -1194,6 +1219,37 @@ func (m *oneShotNativeManager) ShutdownAll() {
 	for _, id := range ids {
 		_ = m.End(id)
 	}
+}
+
+// reserveForReap claims id for the stale reaper before it ends the session, so
+// the id stays off-limits until the ended frame has been published. Returns
+// false when another reaper already holds it. Caller must releaseReap on
+// every path.
+func (m *oneShotNativeManager) reserveForReap(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, held := m.reaping[id]; held {
+		return false
+	}
+	m.reaping[id] = struct{}{}
+	return true
+}
+
+func (m *oneShotNativeManager) releaseReap(id string) {
+	m.mu.Lock()
+	delete(m.reaping, id)
+	m.mu.Unlock()
+}
+
+// reapReservedErr refuses a Start whose id a reaper is still publishing an
+// ended frame for. Caller holds m.mu. Fail closed and let the cloud retry:
+// registering here would hand that stale ended frame — which carries only the
+// logical id — to the new session and release its reservation.
+func (m *oneShotNativeManager) reapReservedErr(id string) error {
+	if _, held := m.reaping[id]; !held {
+		return nil
+	}
+	return fmt.Errorf("%s native session %s is being reaped; retry once its ended frame is published", m.spec.DisplayName, id)
 }
 
 // removeSessionIfSame removes id only while it still maps to s; false means a
