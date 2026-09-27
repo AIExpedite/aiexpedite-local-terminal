@@ -638,8 +638,10 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 		// branch below declines to act on it.
 		// Held evidence this pass covered yields to the fresh report even when it
 		// is the newer of the two — but only if it is still the evidence the read
-		// judged, not one a concurrent writer has replaced since.
-		replaceCovered := heldCovered && snap.PendingRolloutEntry == view.pendingRolloutEntry
+		// judged, not one a concurrent writer has replaced since. The entry alone
+		// is not enough: a concurrent reconcile may have advanced that same file to
+		// a newer, telemetry-free append this pass's coverage never reached.
+		replaceCovered := heldCovered && heldUnchanged
 		if freshEvidence && (replaceCovered || snap.PendingRolloutMtimeMs < newestRollout.UnixMilli()) {
 			snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = newestRollout.UnixMilli(), newestEntry
 			wrote = true

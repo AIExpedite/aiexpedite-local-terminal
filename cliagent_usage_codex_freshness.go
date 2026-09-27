@@ -2207,6 +2207,12 @@ func payOwedCodexUsageRefresh() {
 			} else if state.nextAttemptAt.After(now) {
 				codexArmRunDebtRetry(state.debtID(), fp, state.nextAttemptAt.UnixMilli(), state.nextAttemptAt.Sub(now))
 				return
+			} else if !codexClaimRunDebtRung(fp, state.debtID(), state.nextAttemptAt.UnixMilli(), now) {
+				// A due rung is claimed exactly as the timer and the gather nudge
+				// claim it, so a gather started beside this replay cannot pay the
+				// same rung a second time. Losing the claim means that trigger
+				// already owns it.
+				return
 			}
 		}
 		// "Interrupted" means the floor's run belongs to a process that is
