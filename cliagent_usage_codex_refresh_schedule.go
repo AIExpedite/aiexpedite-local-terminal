@@ -69,26 +69,14 @@ var codexRunDebtRetryTimer struct {
 	gen   uint64
 }
 
-// codexRefreshNudge is the per-process nudge cooldown, plus the rollout evidence
-// a declined nudge has to hold on to.
+// codexRefreshNudge is the per-process nudge cooldown.
 //
-// Retaining that evidence is not an optimisation. The reconcile ADVANCES its scan
-// cursor over a rollout it has read, so a file is usually reported exactly once:
-// the next pass sees it as consumed and unchanged and reports nothing. A nudge
-// that declines such a report — because the file was written less than
-// codexForcedReconcileMinInterval ago, or because its own cooldown is running —
-// therefore throws away the only trigger an unmanaged run will ever get, and a
-// rollout carrying no readable utilization (the post-upgrade case this whole
-// feature is about) leaves the card stale with no debt, no fallback and no
-// warning. Held per account, in memory only: a restart loses it, which is
-// acceptable because holding the SCAN CURSOR back instead would starve the
-// backlog march the scanner depends on.
+// The rollout evidence a declined nudge has to hold on to lives in the CACHE
+// (codexRateLimitSnapshot.PendingRolloutMtimeMs), not here — see
+// codexNudgeRolloutEvidence for why it has to be durable rather than remembered.
 var codexRefreshNudge struct {
 	mu     sync.Mutex
 	lastAt time.Time
-	// pending is the newest account-eligible rollout mtime a nudge has seen but
-	// not yet acted on, keyed by account fingerprint.
-	pending map[string]time.Time
 }
 
 // codexRunDebtRetryKind says what a payment pass left behind, and so which rung
@@ -361,41 +349,51 @@ func codexRunDebtRetryPending() bool {
 	return t.timer != nil
 }
 
-// resetCodexRefreshNudge clears the per-process nudge cooldown and its retained
-// rollout evidence. Test seam, called from resetCodexUsageRefreshGate.
+// resetCodexRefreshNudge clears the per-process nudge cooldown. Test seam, called
+// from resetCodexUsageRefreshGate. The retained rollout evidence is NOT reset
+// here: it lives in the cache, which is the state a restart is supposed to carry.
 func resetCodexRefreshNudge() {
 	codexRefreshNudge.mu.Lock()
 	codexRefreshNudge.lastAt = time.Time{}
-	codexRefreshNudge.pending = nil
 	codexRefreshNudge.mu.Unlock()
 }
 
 // codexNudgeRollout merges a freshly reported rollout mtime with whatever a
 // previous, declined nudge retained for this account, and reports the newest.
-// Callers hold codexRefreshNudge.mu.
+// codexNudgeRolloutEvidence merges a freshly reported rollout mtime with the
+// evidence already held for this account (PendingRolloutMtimeMs) and reports the
+// newest usable one, plus whether the fresh report is something not yet on disk.
 //
 // A zero report is the ordinary case once the scan cursor has consumed the file,
-// so it must not erase what is held: that retained value IS the evidence.
-func codexNudgeRollout(fp string, reported time.Time) time.Time {
-	held := codexRefreshNudge.pending[fp]
-	if reported.After(held) {
-		held = reported
+// so it must not erase what is held: that held value IS the evidence.
+//
+// A report dated in the FUTURE is CLAMPED to `now` rather than held as-is. A
+// filesystem timestamp ahead of the clock (a correction, or restored file
+// metadata) is untrustworthy about when, but the file's existence still proves a
+// run happened — and holding the raw future value would be worse than useless:
+// `settled` can never become true for it, and because the held value is the
+// newest of the two it would shadow every later valid report for as long as the
+// clock took to catch up. Clamping keeps the trigger and cannot shadow anything,
+// since every held value is then at or before `now`. codexOweRunRefresh clamps
+// the floor it derives the same way.
+// Both sides are compared at MILLISECOND resolution, the resolution the field is
+// stored at. A filesystem mtime carries nanoseconds, so comparing raw values made
+// every re-report of the SAME unchanged file look fresh — and each of those would
+// take the blocking cache lock on a path that runs every ~30 s.
+func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (evidence time.Time, fresh bool) {
+	if reported.After(now) {
+		reported = now
 	}
-	if held.IsZero() {
-		return time.Time{}
+	if !reported.IsZero() {
+		reported = time.UnixMilli(reported.UnixMilli())
 	}
-	if codexRefreshNudge.pending == nil {
-		codexRefreshNudge.pending = map[string]time.Time{}
+	if view.pendingRolloutMs > 0 {
+		evidence = time.UnixMilli(view.pendingRolloutMs)
 	}
-	codexRefreshNudge.pending[fp] = held
-	return held
-}
-
-// codexNudgeRolloutHandled drops the retained evidence for fp once it has been
-// acted on — a debt was created for it, or an observation covers it, so it can
-// no longer tell us anything. Callers hold codexRefreshNudge.mu.
-func codexNudgeRolloutHandled(fp string) {
-	delete(codexRefreshNudge.pending, fp)
+	if reported.After(evidence) {
+		return reported, true
+	}
+	return evidence, false
 }
 
 // nudgeCodexUsageRefresh is the gather's trigger, the mirror of
@@ -436,28 +434,33 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 	n := &codexRefreshNudge
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	// Capture the evidence BEFORE any decline can return, and merge it with what a
-	// previous decline retained. The reconcile reports a rollout about once (its
-	// cursor then treats the file as consumed), so a decline that dropped the
-	// report would lose the only trigger an unmanaged run ever gets.
-	newestRollout = codexNudgeRollout(fp, newestRollout)
-	// Evidence the reading has caught up with says nothing any more.
-	if !newestRollout.IsZero() && !observedAt.IsZero() && !newestRollout.After(observedAt) {
-		codexNudgeRolloutHandled(fp)
-	}
-	if !n.lastAt.IsZero() && !now.Before(n.lastAt) && now.Sub(n.lastAt) < codexRefreshNudgeCooldown {
-		return false
-	}
+	// One cheap cache READ decides everything below, including whether the
+	// blocking transaction is needed at all (this runs every ~30 s).
+	view := codexCacheViewForAccount(fp)
+	// Merge the fresh report with the evidence already on disk. The reconcile
+	// reports a rollout about once — its cursor then treats the file as consumed —
+	// so a decline that dropped the report would lose the only trigger an
+	// unmanaged run ever gets, and a restart in that window would lose it even if
+	// the decline had only remembered it.
+	newestRollout, freshEvidence := codexNudgeRolloutEvidence(view, newestRollout, now)
 	// A rollout written since the newest observation, settled long enough ago
 	// that it is not still being appended to.
 	behind := !newestRollout.IsZero() && (observedAt.IsZero() || newestRollout.After(observedAt))
 	settled := behind && now.Sub(newestRollout) >= codexForcedReconcileMinInterval
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := codexNewestOpenRunFloor() != 0
+	// Evidence the reading has caught up with says nothing any more, so it has to
+	// be released rather than held for ever.
+	stale := view.pendingRolloutMs > 0 && !behind
 
-	// Decided off the cheap cache READ: the transaction below takes the blocking
-	// cross-process cache lock, and this runs every ~30 s.
-	if !codexNudgeNeedsWrite(codexCacheViewForAccount(fp), now, settled, liveRun) {
+	if !codexNudgeNeedsWrite(view, now, settled, liveRun, freshEvidence, stale) {
+		return false
+	}
+	// The cooldown bounds how often a gather may arm the worker — but it must never
+	// discard a FRESH report, because the reconcile will not make that report
+	// again. Recording evidence always goes through; only acting on it waits.
+	if !freshEvidence && !n.lastAt.IsZero() && !now.Before(n.lastAt) &&
+		now.Sub(n.lastAt) < codexRefreshNudgeCooldown {
 		return false
 	}
 
@@ -467,6 +470,18 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 			return false
 		}
 		wrote := codexRebaseFutureRunFreshness(snap, now, now)
+		// Record the evidence FIRST, in the same write as anything else this
+		// transaction does. It is the only durable trace of a rollout the scan
+		// cursor has already consumed, so it must reach disk even when every
+		// branch below declines to act on it.
+		if freshEvidence && snap.PendingRolloutMtimeMs < newestRollout.UnixMilli() {
+			snap.PendingRolloutMtimeMs, wrote = newestRollout.UnixMilli(), true
+		}
+		// A reading has caught up with what we were holding; it can no longer tell
+		// us anything.
+		if stale && snap.PendingRolloutMtimeMs != 0 {
+			snap.PendingRolloutMtimeMs, wrote = 0, true
+		}
 		if snap.RefreshOwedAtMs != 0 && codexRunDebtExpired(snap.RefreshOwedAtMs, now) {
 			// Aged out. Left in place it would block every later rollout from
 			// ever owing a refresh, so retire it — with its marker, so the card
@@ -501,13 +516,16 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 		// codexOweRunRefresh opens the new generation itself (it clears the debt's
 		// counters, fallback and rung first).
 		codexOweRunRefresh(snap, newestRollout, now)
+		// The debt now carries this rollout, so the held evidence has done its job
+		// — released in the SAME atomic write that creates the debt. Releasing it
+		// from the caller instead was wrong twice over: the callback sets its flag
+		// before the snapshot is written, and the caller ignored the commit result,
+		// so a failed write dropped the evidence AND created no debt, losing the
+		// trigger for a rollout the scan cursor had already consumed.
+		snap.PendingRolloutMtimeMs = 0
 		start, created = true, true
 		return true
 	})
-	if created {
-		// The debt now carries this rollout; the retained copy has done its job.
-		codexNudgeRolloutHandled(fp)
-	}
 	// The cooldown is consumed whenever the transaction RAN, not only when it
 	// armed the worker: a pass that took the lock and then declined — a local run
 	// still open, an observation that moved on — would otherwise re-take it on
@@ -533,7 +551,13 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 // ladder with its next rung still in the future. Its own timer owns that rung, so
 // the nudge has nothing to do, yet without this it would take the lock on every
 // gather for as long as the debt lives — up to codexRefreshOwedMaxAge.
-func codexNudgeNeedsWrite(view codexCacheView, now time.Time, settled, liveRun bool) bool {
+func codexNudgeNeedsWrite(view codexCacheView, now time.Time, settled, liveRun, freshEvidence, stale bool) bool {
+	// Rollout evidence to record, or evidence to release. Recording is the one
+	// reason that does NOT wait for the nudge cooldown: the reconcile reports a
+	// rollout about once, so a report not written now is a report lost.
+	if freshEvidence || stale {
+		return true
+	}
 	// A clock rollback left state dated ahead; the rebase inside is the repair.
 	if codexRunFreshnessInFuture(view, now) {
 		return true

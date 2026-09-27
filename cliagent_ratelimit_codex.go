@@ -262,6 +262,18 @@ type codexRateLimitSnapshot struct {
 	// scheduling nothing. Numeric only.
 	StaleRunNoticeFloorMs int64 `json:"staleRunNoticeFloorMs,omitempty"`
 	StaleRunNoticeAtMs    int64 `json:"staleRunNoticeAtMs,omitempty"`
+	// PendingRolloutMtimeMs is rollout evidence the refresh nudge has SEEN but not
+	// yet turned into a debt (nudgeCodexUsageRefresh): the newest account-eligible
+	// rollout mtime, held while it is still too young to judge.
+	//
+	// It has to be persisted, not merely remembered, because the rollout scan
+	// ADVANCES its cursor over a file it has read — so that file is reported about
+	// once, and the next pass sees it consumed and unchanged and reports nothing.
+	// A restart between the report and the debt (an agent self-update is the
+	// likeliest one, and it happens right after a smoke) would otherwise leave the
+	// run with no trigger at all: no debt, no fallback, and a card that looks
+	// current. Numeric only; zero means no evidence is held.
+	PendingRolloutMtimeMs int64 `json:"pendingRolloutMtimeMs,omitempty"`
 	// CodexVersion is the `--version` of the Codex binary that produced the
 	// newest contributor observation; RolloutCursorVersion is the binary in
 	// use when the rollout scan cursor was last reset or first established.
@@ -1719,6 +1731,19 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 	if err != nil {
 		return false
 	}
+	// A var so a test can simulate the one failure mode no fixture can produce
+	// portably: a commit that fails AFTER the mutation already ran. Every caller
+	// that must not lose state on a refused write depends on that ordering, so it
+	// needs to be exercisable rather than only reasoned about.
+	if !codexCommitRateLimitSnapshot(path, out, now) {
+		return false
+	}
+	return true
+}
+
+// codexCommitRateLimitSnapshot writes the serialized snapshot atomically: a
+// temp file beside the cache, then a rename over it.
+var codexCommitRateLimitSnapshot = func(path string, out []byte, now time.Time) bool {
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return false
@@ -1752,6 +1777,9 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	// clears it too — the new account must not be warned about a run it never
 	// made.
 	snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
+	// Rollout evidence the nudge was holding describes the PREVIOUS account's
+	// session, so it cannot floor a debt for this one.
+	snap.PendingRolloutMtimeMs = 0
 	// The observations it stamped are gone. RolloutCursorVersion is kept: the
 	// progress it scoped was just cleared, so any cursor written from here on
 	// is written by the binary it already names.
@@ -2106,6 +2134,8 @@ type codexCacheView struct {
 	// Expiry marker (codexRetireExpiredRunDebt).
 	staleNoticeFloorMs int64
 	staleNoticeAtMs    int64
+	// Rollout evidence the nudge is holding (nudgeCodexUsageRefresh).
+	pendingRolloutMs int64
 	// Capture stamps (cliagent_usage_codex_capture_stamp.go).
 	codexVersion         string
 	rolloutCursorVersion string
@@ -2140,6 +2170,7 @@ func codexCacheViewFromSnapshot(snap codexRateLimitSnapshot) codexCacheView {
 		nextAttemptAtMs:      snap.NextAttemptAtMs,
 		staleNoticeFloorMs:   snap.StaleRunNoticeFloorMs,
 		staleNoticeAtMs:      snap.StaleRunNoticeAtMs,
+		pendingRolloutMs:     snap.PendingRolloutMtimeMs,
 		codexVersion:         snap.CodexVersion,
 		rolloutCursorVersion: snap.RolloutCursorVersion,
 	}

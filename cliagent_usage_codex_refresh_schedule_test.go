@@ -851,11 +851,26 @@ func TestNudgeCodexUsageRefresh_SteadyStateTakesNoCacheLock(t *testing.T) {
 			rollout: time.Time{},
 		},
 		{
+			// The realistic steady state: the rollout was consumed by the scan
+			// cursor long ago, so the reconcile reports nothing new.
 			name: "debt pending with its rung still in the future",
 			setup: func(t *testing.T, f codexFreshnessFixture) {
 				f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
 				codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 					snap.NextAttemptAtMs = now.Add(time.Hour).UnixMilli()
+				})
+			},
+			rollout: time.Time{},
+		},
+		{
+			// Evidence ALREADY on disk and re-reported unchanged is not fresh, so it
+			// needs no write either — a re-report must not re-take the lock.
+			name: "evidence already recorded, re-reported unchanged",
+			setup: func(t *testing.T, f codexFreshnessFixture) {
+				f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+				codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+					snap.NextAttemptAtMs = now.Add(time.Hour).UnixMilli()
+					snap.PendingRolloutMtimeMs = settledRollout.UnixMilli()
 				})
 			},
 			rollout: settledRollout,
@@ -891,12 +906,15 @@ func TestCodexNudgeNeedsWrite_MirrorsTheTransactionsDecision(t *testing.T) {
 	now := time.Now()
 	nowMs := now.UnixMilli()
 	for _, tc := range []struct {
-		name          string
-		view          codexCacheView
-		settled, live bool
-		want          bool
+		name                 string
+		view                 codexCacheView
+		settled, live        bool
+		freshEvidence, stale bool
+		want                 bool
 	}{
 		{name: "idle", want: false},
+		{name: "fresh rollout evidence to record", freshEvidence: true, want: true},
+		{name: "held evidence the reading caught up with", stale: true, want: true},
 		{name: "missed run to own", settled: true, want: true},
 		{name: "missed run but a local run is open", settled: true, live: true, want: false},
 		{
@@ -926,7 +944,7 @@ func TestCodexNudgeNeedsWrite_MirrorsTheTransactionsDecision(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := codexNudgeNeedsWrite(tc.view, now, tc.settled, tc.live); got != tc.want {
+			if got := codexNudgeNeedsWrite(tc.view, now, tc.settled, tc.live, tc.freshEvidence, tc.stale); got != tc.want {
 				t.Fatalf("needsWrite = %v, want %v", got, tc.want)
 			}
 		})
