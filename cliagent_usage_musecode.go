@@ -8,12 +8,15 @@
 //
 // # WHY AUTH FAILS OPEN
 //
-// Muse Code authenticates by `muse login` (browser / device code, stored in
-// its config dir) or META_API_KEY, and has no `muse account status` command.
-// The on-disk credential layout is not documented, so only POSITIVE evidence
-// is reported: an API key in the environment or a credential file in a known
-// config location reads "ready"; anything else reads "unknown", which matches
-// none of the frontend's Login-required branches. Reporting
+// Muse Code authenticates by `muse login` (browser / device code) or
+// `muse auth set` / META_API_KEY, and has no auth-status command. Muse Code
+// 1.4.0 stores the credential in the OS keychain and falls back to `auth.json`
+// under an XDG-style config home (named in its binary). That layout holds on
+// Windows too: the same install keeps its data in ~/.local/share/muse, and
+// %APPDATA%\muse does not exist. A keychain login leaves no file to find, so
+// only POSITIVE evidence is reported: an API key in the environment or the
+// fallback `auth.json` reads "ready"; anything else reads "unknown", which
+// matches none of the frontend's Login-required branches. Reporting
 // "unauthenticated" on a guessed path would paint a red chip on a working
 // install the user cannot act on — the worst failure this parser can have.
 //
@@ -36,10 +39,9 @@ type museCodeUsageParser struct{}
 
 func (museCodeUsageParser) Provider() string { return "museCode" }
 
-// museCodeCredentialFileNames are the candidate credential files inside the
-// Muse Code config dir. Unverified names, deliberately a short list: a miss
-// degrades to "unknown", never to a Login-required chip.
-var museCodeCredentialFileNames = []string{"credentials.json", "auth.json", "credentials"}
+// museCodeCredentialFileName is the keychain-fallback credential file in the
+// Muse Code config dir. A miss degrades to "unknown", never to Login-required.
+const museCodeCredentialFileName = "auth.json"
 
 func (p museCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	usage := &cliAgentUsage{
@@ -70,17 +72,15 @@ func museCodeHasCredential(home string, getenv func(string) string) bool {
 		return true
 	}
 	for _, dir := range museCodeConfigDirs(home, getenv) {
-		for _, name := range museCodeCredentialFileNames {
-			if info, err := os.Stat(filepath.Join(dir, name)); err == nil && !info.IsDir() && info.Size() > 0 {
-				return true
-			}
+		if info, err := os.Stat(filepath.Join(dir, museCodeCredentialFileName)); err == nil && !info.IsDir() && info.Size() > 0 {
+			return true
 		}
 	}
 	return false
 }
 
 // museCodeConfigDirs returns candidate config dirs: $XDG_CONFIG_HOME/muse,
-// then ~/.config/muse (Muse Code resolves user skills from the same roots).
+// then ~/.config/muse, on every OS (see the file comment).
 func museCodeConfigDirs(home string, getenv func(string) string) []string {
 	var dirs []string
 	if xdg := strings.TrimSpace(getenv("XDG_CONFIG_HOME")); xdg != "" {

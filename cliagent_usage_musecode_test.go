@@ -43,7 +43,7 @@ func TestMuseCodeUsageParser_ReadinessStates(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(`{"t":"x"}`), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"t":"x"}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		usage, _ := museCodeUsageParser{}.Parse(home, detected, now)
