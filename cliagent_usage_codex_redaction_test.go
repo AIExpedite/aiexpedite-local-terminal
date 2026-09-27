@@ -230,7 +230,7 @@ func TestCodexRefreshSchedule_LogsCarryCountersOnly(t *testing.T) {
 
 	logged := captureStdout(t, func() {
 		// The nudge's "refresh owed" line, then the schedule's rung line.
-		nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observed)
+		nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, observed)
 		drainCodexRunDebtLadder(t)
 	})
 

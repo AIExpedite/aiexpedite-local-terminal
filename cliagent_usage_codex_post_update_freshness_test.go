@@ -245,7 +245,7 @@ func TestCodexPostUpdate_UnmanagedRunConvergesThroughTheNudge(t *testing.T) {
 	}
 	// The gather: reconcile, then nudge with the mtime it saw.
 	res := codexReconcileForGather(context.Background(), f.home, f.fp, now, false)
-	nudgeCodexUsageRefresh(f.home, f.fp, now, res.newestRollout, res.latestObservation)
+	nudgeCodexUsageRefresh(f.home, f.fp, now, res.rollouts, res.latestObservation)
 	drainCodexRunDebtLadder(t)
 
 	if got := codexObservedAt(t, f); !got.After(observed) {
@@ -485,7 +485,7 @@ func TestCodexPostUpdate_UnmanagedRunSurvivesAnEarlyDeclinedNudge(t *testing.T) 
 	// Gather 1, immediately after the write: the reconcile reports the mtime, the
 	// nudge declines it as possibly still being appended to.
 	first := codexReconcileForGather(context.Background(), f.home, f.fp, now, false)
-	if nudgeCodexUsageRefresh(f.home, f.fp, now, first.newestRollout, first.latestObservation) {
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, first.rollouts, first.latestObservation) {
 		t.Fatal("a rollout younger than the minimum interval must be declined")
 	}
 	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
@@ -500,10 +500,10 @@ func TestCodexPostUpdate_UnmanagedRunSurvivesAnEarlyDeclinedNudge(t *testing.T) 
 	// transaction, so it consumed no cooldown either.
 	later := now.Add(2 * codexForcedReconcileMinInterval)
 	second := codexReconcileForGather(context.Background(), f.home, f.fp, later, false)
-	if !second.newestRollout.IsZero() {
-		t.Logf("note: the reconcile still reported %s; the retained path is exercised when it reports zero", second.newestRollout)
+	if !second.rollouts.newest.IsZero() {
+		t.Logf("note: the reconcile still reported %s; the retained path is exercised when it reports zero", second.rollouts.newest)
 	}
-	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.newestRollout, second.latestObservation) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.rollouts, second.latestObservation) {
 		t.Fatal("the run's evidence was lost: the second gather nudged nothing")
 	}
 	drainCodexRunDebtLadder(t)
@@ -619,7 +619,7 @@ func TestCodexPostUpdate_DeferredRolloutEvidenceSurvivesARestart(t *testing.T) {
 
 	// Gather 1: reported, then declined for being too young to judge.
 	first := codexReconcileForGather(context.Background(), f.home, f.fp, now, false)
-	if nudgeCodexUsageRefresh(f.home, f.fp, now, first.newestRollout, first.latestObservation) {
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, first.rollouts, first.latestObservation) {
 		t.Fatal("a rollout younger than the minimum interval must be declined")
 	}
 	if got := f.snapshot(t).PendingRolloutMtimeMs; got != rollout.UnixMilli() {
@@ -634,7 +634,7 @@ func TestCodexPostUpdate_DeferredRolloutEvidenceSurvivesARestart(t *testing.T) {
 	// reconcile reports nothing: the persisted evidence is all that is left.
 	later := now.Add(2 * codexForcedReconcileMinInterval)
 	second := codexReconcileForGather(context.Background(), f.home, f.fp, later, false)
-	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.newestRollout, second.latestObservation) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.rollouts, second.latestObservation) {
 		t.Fatal("the run's evidence did not survive the restart: the second gather nudged nothing")
 	}
 	drainCodexRunDebtLadder(t)
@@ -678,7 +678,7 @@ func TestCodexPostUpdate_AFailedNudgeWriteKeepsTheRolloutEvidence(t *testing.T) 
 		}
 		return original(p, out, at)
 	}
-	nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observed)
+	nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, observed)
 	drainCodexRunDebtLadder(t)
 	codexCommitRateLimitSnapshot = original
 	if !failedOnce {
@@ -695,7 +695,7 @@ func TestCodexPostUpdate_AFailedNudgeWriteKeepsTheRolloutEvidence(t *testing.T) 
 
 	// With the cache writable the same evidence still converges.
 	resetCodexRefreshNudge()
-	if !nudgeCodexUsageRefresh(f.home, f.fp, now, time.Time{}, observed) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{}, observed) {
 		t.Fatal("the retained evidence must still create the debt on a later gather")
 	}
 	after := f.snapshot(t)
@@ -721,7 +721,7 @@ func TestCodexPostUpdate_AFutureDatedRolloutIsCorrectedNotHeldRaw(t *testing.T) 
 
 	// A report dated hours ahead.
 	future := now.Add(3 * time.Hour)
-	nudgeCodexUsageRefresh(f.home, f.fp, now, future, observed)
+	nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: future}, observed)
 
 	snap := f.snapshot(t)
 	// Nothing future-dated may reach disk, in either field: a held mtime ahead of
@@ -781,7 +781,7 @@ func TestCodexPostUpdate_EvidenceLeftAheadByAClockRollbackRecovers(t *testing.T)
 	// It must now be able to act, on the very next nudge, rather than shadowing
 	// itself for another settle window.
 	resetCodexRefreshNudge()
-	if !nudgeCodexUsageRefresh(f.home, f.fp, rolledBack, time.Time{}, observed) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, rolledBack, codexRolloutNudgeEvidence{}, observed) {
 		t.Fatal("the repaired evidence could not act; recovery is still shadowed")
 	}
 	snap := f.snapshot(t)
@@ -851,7 +851,7 @@ func TestCodexPostUpdate_EvidenceIsAtomicWithTheCursorThatConsumesIt(t *testing.
 	// the two transactions.
 	original := codexCommitRateLimitSnapshot
 	codexCommitRateLimitSnapshot = func(string, []byte, time.Time) bool { return false }
-	nudgeCodexUsageRefresh(f.home, f.fp, now, first.newestRollout, first.latestObservation)
+	nudgeCodexUsageRefresh(f.home, f.fp, now, first.rollouts, first.latestObservation)
 	codexCommitRateLimitSnapshot = original
 	if got := f.snapshot(t).PendingRolloutMtimeMs; got != rollout.UnixMilli() {
 		t.Fatalf("the evidence must survive a nudge whose writes all failed, got %d", got)
@@ -862,7 +862,7 @@ func TestCodexPostUpdate_EvidenceIsAtomicWithTheCursorThatConsumesIt(t *testing.
 	simulateCodexAgentRestart(t)
 	later := now.Add(2 * codexForcedReconcileMinInterval)
 	second := codexReconcileForGather(context.Background(), f.home, f.fp, later, false)
-	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.newestRollout, second.latestObservation) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.rollouts, second.latestObservation) {
 		t.Fatal("the run lost its trigger: the later gather nudged nothing")
 	}
 	drainCodexRunDebtLadder(t)

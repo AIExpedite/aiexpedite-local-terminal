@@ -424,7 +424,7 @@ func TestNudgeCodexUsageRefresh_ArmsOnlyOnADueRung(t *testing.T) {
 	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 		snap.NextAttemptAtMs = now.Add(time.Hour).UnixMilli()
 	})
-	if nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, state.latest) {
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, state.latest) {
 		t.Fatal("a rung in the future must be left to its own timer")
 	}
 
@@ -433,7 +433,7 @@ func TestNudgeCodexUsageRefresh_ArmsOnlyOnADueRung(t *testing.T) {
 	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 		snap.NextAttemptAtMs = now.Add(-time.Second).UnixMilli()
 	})
-	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, state.latest) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, state.latest) {
 		t.Fatal("a due rung must arm the worker")
 	}
 	drainCodexRunDebtLadder(t)
@@ -450,7 +450,7 @@ func TestNudgeCodexUsageRefresh_CreatesADebtForAnUnmanagedRun(t *testing.T) {
 	f.seedPreRunReading(t, observed, now)
 	rollout := now.Add(-2 * codexForcedReconcileMinInterval).Truncate(time.Millisecond)
 
-	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observed) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, observed) {
 		t.Fatal("telemetry newer than the reading with no debt must create one")
 	}
 	drainCodexRunDebtLadder(t)
@@ -473,7 +473,7 @@ func TestNudgeCodexUsageRefresh_Refusals(t *testing.T) {
 	t.Run("zero mtime", func(t *testing.T) {
 		f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 		f.seedPreRunReading(t, observed, now)
-		if nudgeCodexUsageRefresh(f.home, f.fp, now, time.Time{}, observed) {
+		if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: time.Time{}}, observed) {
 			t.Fatal("a pass that reported no eligible mtime must nudge nothing")
 		}
 	})
@@ -481,7 +481,7 @@ func TestNudgeCodexUsageRefresh_Refusals(t *testing.T) {
 	t.Run("rollout older than the reading", func(t *testing.T) {
 		f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 		f.seedPreRunReading(t, observed, now)
-		if nudgeCodexUsageRefresh(f.home, f.fp, now, observed.Add(-time.Minute), observed) {
+		if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: observed.Add(-time.Minute)}, observed) {
 			t.Fatal("telemetry the reading already covers is not a missed run")
 		}
 	})
@@ -489,7 +489,7 @@ func TestNudgeCodexUsageRefresh_Refusals(t *testing.T) {
 	t.Run("rollout still being written", func(t *testing.T) {
 		f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 		f.seedPreRunReading(t, observed, now)
-		if nudgeCodexUsageRefresh(f.home, f.fp, now, now, observed) {
+		if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: now}, observed) {
 			t.Fatal("a rollout younger than the minimum interval may still be appending")
 		}
 	})
@@ -500,11 +500,11 @@ func TestNudgeCodexUsageRefresh_Refusals(t *testing.T) {
 		prev := codexRefreshNudgeCooldown
 		codexRefreshNudgeCooldown = time.Hour
 		t.Cleanup(func() { codexRefreshNudgeCooldown = prev })
-		if !nudgeCodexUsageRefresh(f.home, f.fp, now, settled, observed) {
+		if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: settled}, observed) {
 			t.Fatal("the first nudge must go through")
 		}
 		drainCodexRunDebtLadder(t)
-		if nudgeCodexUsageRefresh(f.home, f.fp, now, settled, observed) {
+		if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: settled}, observed) {
 			t.Fatal("a second nudge inside the cooldown must be refused")
 		}
 	})
@@ -515,7 +515,7 @@ func TestNudgeCodexUsageRefresh_Refusals(t *testing.T) {
 		// A run this process armed is still open: it settles itself.
 		armCodexUsageRunFloor(time.Now())
 		drainCodexRunDebtLadder(t)
-		if nudgeCodexUsageRefresh(f.home, f.fp, now, settled, observed) {
+		if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: settled}, observed) {
 			t.Fatal("a run of this process must settle itself, not be nudged")
 		}
 	})
@@ -534,30 +534,97 @@ func TestCodexReconcileFromRollout_OldAccountRolloutIsNotEligible(t *testing.T) 
 	writeCodexRunRollout(t, f.home, "old-account", loginAt.Add(-time.Hour), now.Add(-30*time.Second), now.Add(-time.Second), true,
 		[]map[string]any{codexRateLimitFrame(80, 90, now)})
 
-	_, _, _, newest := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+	_, _, _, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
 
-	if !newest.IsZero() {
-		t.Fatalf("an old-account rollout reported mtime %s; the nudge would floor a debt the new account cannot pay", newest)
+	if !rollouts.newest.IsZero() {
+		t.Fatalf("an old-account rollout reported mtime %s; the nudge would floor a debt the new account cannot pay", rollouts.newest)
 	}
 }
 
 // A completed pass reports the newest mtime among the candidates that cleared the
-// login guard, which is what the nudge floors a created debt at.
+// login guard AND still owe telemetry — that is what the nudge floors a created
+// debt at — while a candidate whose telemetry the pass mined is reported as
+// COVERED instead. A rollout stamps its own observation before the write that
+// advances its mtime (and trailing records widen the gap), so reporting a mined
+// file as owing a refresh would floor a debt no re-read could ever pay.
 func TestCodexReconcileFromRollout_ReportsTheNewestEligibleMtime(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	older := now.Add(-5 * time.Minute).Truncate(time.Second)
 	newer := now.Add(-2 * time.Minute).Truncate(time.Second)
-	writeCodexRunRollout(t, f.home, "older", now.Add(-10*time.Minute), older, older, true,
-		[]map[string]any{codexRateLimitFrame(20, 30, older)})
-	writeCodexRunRollout(t, f.home, "newer", now.Add(-8*time.Minute), newer, newer, true,
-		[]map[string]any{codexRateLimitFrame(21, 31, newer)})
+	// Telemetry landed in this one, stamped before its mtime.
+	writeCodexRunRollout(t, f.home, "mined", now.Add(-10*time.Minute), older.Add(-time.Second), older, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, older.Add(-time.Second))})
+	// Written but silent: the run the nudge exists to notice.
+	writeCodexRunRollout(t, f.home, "silent", now.Add(-8*time.Minute), newer, newer, true, nil)
 
-	_, _, _, newest := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+	_, _, _, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
 
-	if newest.Truncate(time.Second) != newer {
-		t.Fatalf("eligible mtime = %s, want the newest guard-passing candidate %s", newest, newer)
+	if rollouts.newest.Truncate(time.Second) != newer {
+		t.Fatalf("eligible mtime = %s, want the newest guard-passing candidate still owing telemetry %s", rollouts.newest, newer)
+	}
+	if rollouts.covered.Truncate(time.Second) != older {
+		t.Fatalf("covered mtime = %s, want the mined candidate %s", rollouts.covered, older)
+	}
+}
+
+// The reported case: a single rollout that DOES carry telemetry, whose embedded
+// observation necessarily predates the write that set its mtime. Judged on mtime
+// alone the freshly mined reading looks behind its own rollout, so the nudge would
+// create a debt floored at that mtime — one no re-read of the file could ever pay,
+// burning the whole scan ladder plus the live reads on an ordinary unmanaged run
+// and ending in a stale warning that is not true.
+func TestCodexReconcileFromRollout_MinedTelemetryCoversItsOwnRollout(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	mtime := now.Add(-2 * time.Minute).Truncate(time.Second)
+	observedAt := mtime.Add(-30 * time.Second)
+	writeCodexRunRollout(t, f.home, "mined", now.Add(-10*time.Minute), observedAt, mtime, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, observedAt)})
+
+	_, _, latest, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+
+	if !rollouts.newest.IsZero() {
+		t.Fatalf("a rollout whose telemetry was mined reported mtime %s as still owing a refresh", rollouts.newest)
+	}
+	if rollouts.covered.Truncate(time.Second) != mtime {
+		t.Fatalf("covered mtime = %s, want %s", rollouts.covered, mtime)
+	}
+	if latest.Before(observedAt) {
+		t.Fatalf("the pass did not mine the rollout's telemetry (latest = %s)", latest)
+	}
+	// End to end: the nudge is handed exactly this, and must not owe anything.
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, rollouts, latest) {
+		t.Fatal("the reading the pass just mined FROM the rollout covers it; no debt is owed")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 || snap.PendingRolloutMtimeMs != 0 {
+		t.Fatalf("a covered rollout left state behind: owed=%d pending=%d", snap.RefreshOwedAtMs, snap.PendingRolloutMtimeMs)
+	}
+}
+
+// Coverage has to release evidence already HELD, not just suppress a fresh
+// report: the reconcile may only reach a file's frames a pass or two after first
+// reporting its mtime, and the reading it then merges is EARLIER than that mtime.
+// Held evidence judged on mtime alone would stay "behind" for ever.
+func TestNudgeCodexUsageRefresh_CoverageReleasesHeldEvidence(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	rollout := now.Add(-2 * time.Minute)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs = rollout.UnixMilli()
+	})
+
+	// The pass that finally mines that rollout reports it as covered, and reports
+	// no newest (its cursor has consumed the file).
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{covered: rollout}, observed) {
+		t.Fatal("evidence the mined telemetry covers must not create a debt")
+	}
+	if snap := f.snapshot(t); snap.PendingRolloutMtimeMs != 0 || snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("covered evidence was neither released nor ignored: pending=%d owed=%d", snap.PendingRolloutMtimeMs, snap.RefreshOwedAtMs)
 	}
 }
 
@@ -891,7 +958,7 @@ func TestNudgeCodexUsageRefresh_SteadyStateTakesNoCacheLock(t *testing.T) {
 			defer codexRateLimitMu.Unlock()
 
 			start := time.Now()
-			if nudgeCodexUsageRefresh(f.home, f.fp, now, tc.rollout, observed) {
+			if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: tc.rollout}, observed) {
 				t.Fatal("the steady state must arm nothing")
 			}
 			if took := time.Since(start); took > 300*time.Millisecond {
@@ -1049,7 +1116,7 @@ func TestNudgeCodexUsageRefresh_AcceptsAnUnscopedAccount(t *testing.T) {
 	f.seedPreRunReading(t, observedAt, now)
 	rollout := now.Add(-codexForcedReconcileMinInterval - time.Second)
 
-	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observedAt) {
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: rollout}, observedAt) {
 		t.Fatal("the nudge refused the unscoped account")
 	}
 	if got := f.snapshot(t).RefreshOwedAtMs; got == 0 {

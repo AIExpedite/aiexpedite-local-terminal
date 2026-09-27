@@ -2083,10 +2083,11 @@ type codexReconcileResult struct {
 	metrics           []cliAgentUsageMetric
 	limit             codexUsageLimitEvidence
 	latestObservation time.Time
-	// newestRollout is the newest ACCOUNT-ELIGIBLE rollout mtime the pass
-	// stat-ed, or zero when it did not complete. The refresh nudge is handed this
-	// rather than walking the tree again (nudgeCodexUsageRefresh).
-	newestRollout time.Time
+	// rollouts is what the pass saw of the rollout tree: the newest
+	// account-eligible mtime that still owes telemetry, and the newest one whose
+	// telemetry the pass mined. The refresh nudge is handed this rather than
+	// walking the tree again (nudgeCodexUsageRefresh).
+	rollouts codexRolloutNudgeEvidence
 }
 
 // codexRunGatedReconcile runs one forced rollout reconcile for fp under the
@@ -2099,8 +2100,8 @@ func codexRunGatedReconcile(ctx context.Context, base, fp string, floor time.Tim
 		return codexReconcileResult{}, false, busy, wait
 	}
 	defer codexUsageRefresh.finish(fp, done)
-	metrics, limit, latest, newest := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, newestRollout: newest}, true, nil, 0
+	metrics, limit, latest, rollouts := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
+	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}, true, nil, 0
 }
 
 // payOwedCodexUsageRefresh pays, once, a debt the previous agent process left
@@ -2324,8 +2325,8 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 			}
 		}
 	}
-	metrics, limit, latest, newest := codexReconcileFromRollout(ctx, base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, newestRollout: newest}
+	metrics, limit, latest, rollouts := codexReconcileFromRollout(ctx, base, fp, now)
+	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}
 }
 
 // codexStaleRunNotice explains a card whose newest observation predates the

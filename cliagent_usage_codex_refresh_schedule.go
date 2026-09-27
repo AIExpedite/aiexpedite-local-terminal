@@ -435,19 +435,28 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 //   - With a debt pending it arms the worker only when the booked rung is DUE.
 //     That debt's own timer owns every other rung.
 //   - With no debt pending it CREATES one, inside a single cache transaction,
-//     floored at `newestRollout`. Arming the worker alone would be a no-op: the
-//     worker retires on owed == false.
+//     floored at `rollouts.newest`. Arming the worker alone would be a no-op:
+//     the worker retires on owed == false.
 //
-// `newestRollout` is the newest ACCOUNT-ELIGIBLE rollout mtime the reconcile
-// just stat-ed (codexReconcileFromRollout), never a walk of this function's own:
-// the nudge runs every ~30 s, and an unbounded filepath.WalkDir there would be
-// material past roughly 50 k files on a long-lived CODEX_HOME. Account
-// eligibility is load-bearing rather than tidiness — a previous account's
-// session keeps appending after a `codex login`, so its file's mtime advances
-// while its telemetry belongs to the old account, and binding that to the live
-// fingerprint would invent a debt the new account can never pay. When the
-// reconcile did not run, or was cut short, the mtime is zero and this does
-// nothing, which is correct: the reading did not change either.
+// `rollouts` is what the reconcile just stat-ed (codexReconcileFromRollout),
+// never a walk of this function's own: the nudge runs every ~30 s, and an
+// unbounded filepath.WalkDir there would be material past roughly 50 k files on a
+// long-lived CODEX_HOME. Account eligibility is load-bearing rather than
+// tidiness — a previous account's session keeps appending after a `codex login`,
+// so its file's mtime advances while its telemetry belongs to the old account,
+// and binding that to the live fingerprint would invent a debt the new account
+// can never pay. When the reconcile did not run, or was cut short,
+// `rollouts.newest` is zero and this does nothing, which is correct: the reading
+// did not change either.
+//
+// `rollouts.covered` is the newest rollout the reconcile MINED telemetry from,
+// and evidence at or below it is satisfied rather than behind. A rollout's own
+// observation timestamp is stamped before the write that advances its mtime, and
+// trailing completion records widen the gap, so a freshly mined reading normally
+// sits behind the file it came from: judged on mtime alone it would look like a
+// run owing a refresh for ever, and the debt it created could not be paid by
+// re-reading the file. That is a whole scan ladder plus the live reads spent on
+// an ordinary unmanaged run, ending in a stale warning that is not true.
 //
 // Bounds: nothing while shutting down or disarmed, nothing more than once per
 // codexRefreshNudgeCooldown, nothing for a rollout younger than
@@ -460,7 +469,7 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 // transaction below takes the blocking cross-process cache lock, and this runs
 // every ~30 s, so a nudge with provably nothing to do returns before reaching it.
 // The worker, when there is one, runs on its own goroutine.
-func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time.Time) bool {
+func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRolloutNudgeEvidence, observedAt time.Time) bool {
 	// An empty fp is the unscoped account, not a missing one — see
 	// codexScheduleRunDebtRetry. It nudges like any other.
 	if IsShutdownInProgress() || !codexUsageRefresh.isEnabled() {
@@ -477,10 +486,17 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 	// so a decline that dropped the report would lose the only trigger an
 	// unmanaged run ever gets, and a restart in that window would lose it even if
 	// the decline had only remembered it.
-	newestRollout, freshEvidence := codexNudgeRolloutEvidence(view, newestRollout, now)
-	// A rollout written since the newest observation, settled long enough ago
-	// that it is not still being appended to.
-	behind := !newestRollout.IsZero() && (observedAt.IsZero() || newestRollout.After(observedAt))
+	newestRollout, freshEvidence := codexNudgeRolloutEvidence(view, rollouts.newest, now)
+	// Telemetry mined FROM a rollout covers that rollout, whatever the ordering of
+	// its stamp and its mtime. This releases held evidence too, not just a fresh
+	// report: the reconcile may only reach a file's frames a pass or two after
+	// first reporting its mtime, and the reading it then merges is normally
+	// EARLIER than that mtime — so without this the held value would stay
+	// permanently "behind" and floor an unpayable debt.
+	covered := !rollouts.covered.IsZero() && !newestRollout.After(rollouts.covered)
+	// A rollout written since the newest observation, still owing telemetry,
+	// settled long enough ago that it is not still being appended to.
+	behind := !newestRollout.IsZero() && !covered && (observedAt.IsZero() || newestRollout.After(observedAt))
 	settled := behind && now.Sub(newestRollout) >= codexForcedReconcileMinInterval
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := codexNewestOpenRunFloor() != 0
