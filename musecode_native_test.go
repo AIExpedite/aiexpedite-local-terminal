@@ -591,3 +591,19 @@ func TestRewriteMuseCodePromptToFileFailsClosed(t *testing.T) {
 		t.Fatalf("no cleanup path on failure, got %q", path)
 	}
 }
+
+// The legacy-path prompt is staged off argv, so a prompt above the old 24 KiB
+// CreateProcess cap is admitted; only the native path's limit refuses it.
+func TestCheckMuseCodeLegacyPromptSize(t *testing.T) {
+	long := buildMuseCodeInteractiveArgs([]string{strings.Repeat("a", 64*1024)})
+	if err := checkMuseCodeLegacyPromptSize(long); err != nil {
+		t.Fatalf("a 64 KiB prompt must be admitted: %v", err)
+	}
+	huge := buildMuseCodeInteractiveArgs([]string{strings.Repeat("a", oneShotNativeMaxPromptBytes+1)})
+	if err := checkMuseCodeLegacyPromptSize(huge); err == nil {
+		t.Fatal("a prompt above the native limit must be refused")
+	}
+	if err := checkMuseCodeLegacyPromptSize([]string{"--version"}); err != nil {
+		t.Fatalf("diagnostic argv must pass: %v", err)
+	}
+}

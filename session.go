@@ -458,13 +458,12 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 				n, openCodeInteractiveMaxPromptBytes)
 		}
 	}
-	// Muse Code's legacy path carries its prompt positionally for the same
-	// reason (buildMuseCodeInteractiveArgs); its chat path uses --prompt-file.
+	// Muse Code's synthesized prompt is staged to --prompt-file below on every
+	// platform, so the CreateProcess cap above does not apply; bound it by the
+	// same limit the native chat path enforces instead.
 	if isMuseCodeCommand(command) {
-		if n := argvByteLen(cliArgs); n > openCodeInteractiveMaxPromptBytes {
-			return fmt.Errorf(
-				"muse arguments are %d bytes, exceeding the %d-byte limit for a one-shot session; use a Muse Code chat session for long prompts",
-				n, openCodeInteractiveMaxPromptBytes)
+		if err := checkMuseCodeLegacyPromptSize(cliArgs); err != nil {
+			return err
 		}
 	}
 

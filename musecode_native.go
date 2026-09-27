@@ -404,8 +404,8 @@ func isMuseCodeDiagnosticInvocation(args []string) bool {
 
 // buildMuseCodeInteractiveArgs shapes a one-shot `muse` invocation for the
 // legacy session_start / PTY path: `exec --json --disable-approval`, forwarded
-// caller flags, then `--` and the prompt as a trailing positional (subject to
-// the argv byte cap — see oneShotPositionalMaxPromptBytes). A bare `muse`
+// caller flags, then `--` and the prompt as a trailing positional, which
+// StartSession relocates to --prompt-file (rewriteMuseCodePromptToFile). A bare `muse`
 // would open the interactive TUI, which never exits on a headless session.
 func buildMuseCodeInteractiveArgs(args []string) []string {
 	if isMuseCodeDiagnosticInvocation(args) {
@@ -460,6 +460,26 @@ func buildMuseCodeInteractiveArgs(args []string) []string {
 // isMuseCodeSynthesizedRun reports the forced headless shape produced above.
 func isMuseCodeSynthesizedRun(args []string) bool {
 	return len(args) >= 3 && args[0] == "exec" && args[1] == "--json" && args[2] == "--disable-approval"
+}
+
+// checkMuseCodeLegacyPromptSize bounds a synthesized legacy-path prompt by the
+// native chat path's limit. The prompt never reaches argv (it is staged to
+// --prompt-file), so the Windows command-line cap is not the constraint here.
+func checkMuseCodeLegacyPromptSize(args []string) error {
+	if !isMuseCodeSynthesizedRun(args) {
+		return nil
+	}
+	n := 0
+	for i, a := range args {
+		if a == "--" {
+			n = argvByteLen(args[i+1:])
+			break
+		}
+	}
+	if n > oneShotNativeMaxPromptBytes {
+		return fmt.Errorf("muse prompt is %d bytes, exceeding the %d-byte limit", n, oneShotNativeMaxPromptBytes)
+	}
+	return nil
 }
 
 // rewriteMuseCodePromptToFile relocates the trailing positional prompt of a
