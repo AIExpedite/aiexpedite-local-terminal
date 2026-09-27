@@ -320,6 +320,58 @@ func TestDeltaCoalescer_WholeBufferCredentialLabelIsCarried(t *testing.T) {
 	}
 }
 
+// A publishable lifecycle/tool frame between the two halves of a credential
+// must not release the carry. If it did, the label would stream verbatim, the
+// event would follow, and the value's own short delta would match neither the
+// key/value nor the opaque-token pattern — so the pair would reach the cloud
+// complete across frames the masked completion frame cannot retract.
+func TestDeltaCoalescer_CarrySurvivesAnInterveningNonDeltaFrame(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	c := newDeltaCoalescer(
+		func(text string) string { return "text:" + text },
+		func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+	)
+	c.add("running tool: META_API_KEY=")
+	// The non-delta frame arrives between the label and its value.
+	c.publish(`{"type":"tool.start","name":"Bash"}`)
+	c.add("mk-live-0123456789abcdef\n")
+	c.close()
+
+	mu.Lock()
+	frames := append([]string(nil), out...)
+	mu.Unlock()
+	joined := strings.Join(frames, "")
+	if strings.Contains(joined, "0123456789abcdef") {
+		t.Fatalf("the credential value leaked across the intervening frame: %q", frames)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("the rejoined pair must be masked: %q", frames)
+	}
+	// The intervening frame is still emitted, and still ahead of the deferred
+	// tail — only the held fragment moves, never a lifecycle frame.
+	eventIdx, tailIdx := -1, -1
+	for i, f := range frames {
+		if strings.Contains(f, "tool.start") {
+			eventIdx = i
+		}
+		if strings.Contains(f, "[REDACTED]") {
+			tailIdx = i
+		}
+	}
+	if eventIdx < 0 {
+		t.Fatalf("the non-delta frame must still be published: %q", frames)
+	}
+	if tailIdx < eventIdx {
+		t.Fatalf("the carry must flush after the frame it was held across: %q", frames)
+	}
+	if !strings.Contains(joined, "running tool: ") {
+		t.Fatalf("the safe prefix must still stream: %q", frames)
+	}
+}
+
 func TestMuseCodeProbeVersion_PrefersTheLauncherVersionFile(t *testing.T) {
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "muse.cmd")

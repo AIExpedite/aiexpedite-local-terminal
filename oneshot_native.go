@@ -945,13 +945,17 @@ func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoal
 }
 
 // publish emits a non-delta line after whatever text is buffered ahead of it.
-// The buffered text flushes as FINAL (no redaction carry): the line that
-// follows it is already classified, and holding a tail back past it would
-// publish the turn's text out of order.
+// The buffered text flushes as NON-final, so an ambiguous credential tail
+// survives the intervening frame: releasing `META_API_KEY=` here would strand
+// its value in a later short delta that matches neither the key/value nor the
+// opaque-token pattern, and a masked completion frame cannot retract a stream
+// frame already published. Lifecycle and tool frames still go out in their own
+// order; only the held tail — bounded by agentSecretCarryMaxBytes — is
+// deferred to the next flush, and close() always releases it.
 func (c *deltaCoalescer) publish(line string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.flushLocked(true)
+	c.flushLocked(false)
 	c.emit(line)
 }
 
@@ -980,7 +984,8 @@ func (c *deltaCoalescer) add(text string) bool {
 // tail stays buffered (splitRedactionCarry) so the per-frame redaction in
 // publishEventFrame sees `api_key=<value>` whole even when the pair straddles
 // two flushes — the later masked completion frame cannot retract a leaked
-// stream frame. The carry is released by the next delta or by close().
+// stream frame. The carry is released by the next delta or by close() — never
+// by an intervening non-delta frame.
 func (c *deltaCoalescer) flushLocked(final bool) {
 	if c.timer != nil {
 		c.timer.Stop()
