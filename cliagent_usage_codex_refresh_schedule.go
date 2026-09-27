@@ -403,7 +403,11 @@ func codexPendingRolloutCeiling(now time.Time) time.Time {
 // stored at. A filesystem mtime carries nanoseconds, so comparing raw values made
 // every re-report of the SAME unchanged file look fresh — and each of those would
 // take the blocking cache lock on a path that runs every ~30 s.
-func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (evidence time.Time, fresh bool) {
+//
+// heldCovered drops the held value from the merge: this pass mined telemetry
+// from the very file it names, so it no longer owes anything and must not
+// shadow a report that does.
+func codexNudgeRolloutEvidence(view codexCacheView, reported time.Time, reportedEntry string, heldCovered bool, now time.Time) (evidence time.Time, entry string, fresh bool) {
 	ceiling := codexPendingRolloutCeiling(now)
 	if reported.After(ceiling) && reported.After(now) {
 		reported = ceiling
@@ -411,8 +415,8 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 	if !reported.IsZero() {
 		reported = time.UnixMilli(reported.UnixMilli())
 	}
-	if view.pendingRolloutMs > 0 {
-		evidence = time.UnixMilli(view.pendingRolloutMs)
+	if view.pendingRolloutMs > 0 && !heldCovered {
+		evidence, entry = time.UnixMilli(view.pendingRolloutMs), view.pendingRolloutEntry
 		// The STORED value is clamped too, not just the incoming report. Evidence
 		// recorded before a backwards clock step sits ahead of `now` through no
 		// fault of its own, and because the held value is the newest of the two it
@@ -424,9 +428,9 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 		}
 	}
 	if reported.After(evidence) {
-		return reported, true
+		return reported, reportedEntry, true
 	}
-	return evidence, false
+	return evidence, entry, false
 }
 
 // nudgeCodexUsageRefresh is the gather's trigger, the mirror of
@@ -449,14 +453,19 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 // `rollouts.newest` is zero and this does nothing, which is correct: the reading
 // did not change either.
 //
-// `rollouts.covered` is the newest rollout the reconcile MINED telemetry from,
-// and evidence at or below it is satisfied rather than behind. A rollout's own
+// `rollouts.covered` names, per file, the rollouts the reconcile MINED
+// telemetry from, and held evidence naming one of them is satisfied rather than
+// behind. A fresh report never needs the check: the scan only reports a file as
+// `newest` when it did not cover it. A rollout's own
 // observation timestamp is stamped before the write that advances its mtime, and
 // trailing completion records widen the gap, so a freshly mined reading normally
 // sits behind the file it came from: judged on mtime alone it would look like a
 // run owing a refresh for ever, and the debt it created could not be paid by
 // re-reading the file. That is a whole scan ladder plus the live reads spent on
 // an ordinary unmanaged run, ending in a stale warning that is not true.
+// Coverage is matched by file identity, never by ordering mtimes: with
+// overlapping sessions a covered file can carry a later mtime than an uncovered
+// one whose run its reading predates.
 //
 // Bounds: nothing while shutting down or disarmed, nothing more than once per
 // codexRefreshNudgeCooldown, nothing for a rollout younger than
@@ -486,17 +495,18 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 	// so a decline that dropped the report would lose the only trigger an
 	// unmanaged run ever gets, and a restart in that window would lose it even if
 	// the decline had only remembered it.
-	newestRollout, freshEvidence := codexNudgeRolloutEvidence(view, rollouts.newest, now)
+	//
 	// Telemetry mined FROM a rollout covers that rollout, whatever the ordering of
-	// its stamp and its mtime. This releases held evidence too, not just a fresh
-	// report: the reconcile may only reach a file's frames a pass or two after
-	// first reporting its mtime, and the reading it then merges is normally
-	// EARLIER than that mtime — so without this the held value would stay
-	// permanently "behind" and floor an unpayable debt.
-	covered := !rollouts.covered.IsZero() && !newestRollout.After(rollouts.covered)
+	// its stamp and its mtime, and that has to release HELD evidence: the
+	// reconcile may only reach a file's frames a pass or two after first
+	// reporting its mtime, and the reading it then merges is normally EARLIER
+	// than that mtime — so without this the held value would stay permanently
+	// "behind" and floor an unpayable debt.
+	heldCovered := view.pendingRolloutMs > 0 && rollouts.covers(view.pendingRolloutEntry)
+	newestRollout, newestEntry, freshEvidence := codexNudgeRolloutEvidence(view, rollouts.newest, rollouts.newestEntry, heldCovered, now)
 	// A rollout written since the newest observation, still owing telemetry,
 	// settled long enough ago that it is not still being appended to.
-	behind := !newestRollout.IsZero() && !covered && (observedAt.IsZero() || newestRollout.After(observedAt))
+	behind := !newestRollout.IsZero() && (observedAt.IsZero() || newestRollout.After(observedAt))
 	settled := behind && now.Sub(newestRollout) >= codexForcedReconcileMinInterval
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := codexNewestOpenRunFloor() != 0
@@ -525,13 +535,18 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 		// transaction does. It is the only durable trace of a rollout the scan
 		// cursor has already consumed, so it must reach disk even when every
 		// branch below declines to act on it.
-		if freshEvidence && snap.PendingRolloutMtimeMs < newestRollout.UnixMilli() {
-			snap.PendingRolloutMtimeMs, wrote = newestRollout.UnixMilli(), true
+		// Held evidence this pass covered yields to the fresh report even when it
+		// is the newer of the two — but only if it is still the evidence the read
+		// judged, not one a concurrent writer has replaced since.
+		replaceCovered := heldCovered && snap.PendingRolloutEntry == view.pendingRolloutEntry
+		if freshEvidence && (replaceCovered || snap.PendingRolloutMtimeMs < newestRollout.UnixMilli()) {
+			snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = newestRollout.UnixMilli(), newestEntry
+			wrote = true
 		}
-		// A reading has caught up with what we were holding; it can no longer tell
-		// us anything.
+		// A reading has caught up with what we were holding, or has been mined from
+		// the file it names; it can no longer tell us anything.
 		if stale && snap.PendingRolloutMtimeMs != 0 {
-			snap.PendingRolloutMtimeMs, wrote = 0, true
+			snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry, wrote = 0, "", true
 		}
 		if snap.RefreshOwedAtMs != 0 && codexRunDebtExpired(snap.RefreshOwedAtMs, now) {
 			// Aged out. Left in place it would block every later rollout from
@@ -573,7 +588,7 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 		// before the snapshot is written, and the caller ignored the commit result,
 		// so a failed write dropped the evidence AND created no debt, losing the
 		// trigger for a rollout the scan cursor had already consumed.
-		snap.PendingRolloutMtimeMs = 0
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = 0, ""
 		start, created = true, true
 		return true
 	})

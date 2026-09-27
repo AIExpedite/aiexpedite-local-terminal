@@ -285,6 +285,9 @@ type codexRolloutScanProgress struct {
 	// unmanaged run whose telemetry is unreadable then has no trigger at all. Zero
 	// when the pass did not complete or found nothing eligible.
 	pendingRolloutMtimeMs int64
+	// pendingRolloutEntry identifies the file pendingRolloutMtimeMs came from
+	// (codexRolloutBacklogEntryDigest), persisted with it for the same reason.
+	pendingRolloutEntry string
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -1975,7 +1978,10 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// nudge. Only files that cleared the login guard count, so a previous
 	// account's still-appending session cannot contribute one.
 	var newestUncoveredMtime time.Time
-	// The newest mtime among accepted candidates whose telemetry this pass mined
+	// Identity (codexRolloutBacklogEntryDigest) of that same file, so the nudge
+	// can later tell whether a pass that mines telemetry mined it from THIS file.
+	var newestUncoveredEntry string
+	// The accepted candidates whose telemetry this pass mined
 	// CONTEMPORANEOUSLY with their newest write. A rollout's embedded observation
 	// timestamp is stamped just before the write that advances its mtime, and the
 	// same turn's trailing records widen the gap by moments, so the reading this
@@ -1991,7 +1997,12 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// completion records advances its mtime well past the frame we hold, and that
 	// later turn — whose utilization really is missing — is exactly the run the
 	// nudge exists to notice.
-	var coveredMtime time.Time
+	//
+	// Kept per file identity, never as one newest mtime: with overlapping
+	// sessions a covered file B can carry a later mtime than an uncovered file A
+	// whose run B's reading predates, and ordering the two mtimes would call A
+	// covered on B's account.
+	coveredEntries := map[string]time.Time{}
 	for _, observed := range priorObservations {
 		if observed.After(latestObservation) {
 			latestObservation = observed
@@ -2087,11 +2098,9 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		// — because a rollout Codex has written but whose telemetry frame has not
 		// landed yet is exactly the run the nudge exists to notice.
 		if codexRolloutMinedCoversMtime(coverage, c.mtime) {
-			if c.mtime.After(coveredMtime) {
-				coveredMtime = c.mtime
-			}
+			coveredEntries[retryEntry] = c.mtime
 		} else if c.mtime.After(newestUncoveredMtime) {
-			newestUncoveredMtime = c.mtime
+			newestUncoveredMtime, newestUncoveredEntry = c.mtime, retryEntry
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
@@ -2240,6 +2249,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		// files also records that one of them may still owe a refresh.
 		if eligible := codexEligibleMtimeFor(newestUncoveredMtime, progressComplete); !eligible.IsZero() {
 			progress.pendingRolloutMtimeMs = eligible.UnixMilli()
+			progress.pendingRolloutEntry = newestUncoveredEntry
 		}
 		highWater = &progress
 	}
@@ -2247,7 +2257,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, latestObservation, highWater, false, "", codexRolloutNudgeEvidenceFor(newestUncoveredMtime, coveredMtime, progressComplete)
+		return nil, limit, latestObservation, highWater, false, "", codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
 	// displayed identities onto their canonical cache slots while preserving the
@@ -2288,7 +2298,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	if !producerKnown {
 		producer = ""
 	}
-	return acc, limit, latestObservation, highWater, true, producer, codexRolloutNudgeEvidenceFor(newestUncoveredMtime, coveredMtime, progressComplete)
+	return acc, limit, latestObservation, highWater, true, producer, codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
 }
 
 // codexRolloutNudgeEvidence is what a rollout scan tells the refresh nudge about
@@ -2304,13 +2314,29 @@ type codexRolloutNudgeEvidence struct {
 	// mine — the one that may still owe a refresh. Zero when the pass was cut
 	// short by its budget or found no such file.
 	newest time.Time
-	// covered is the newest eligible rollout this pass DID mine telemetry from.
-	// Evidence at or below it is satisfied: the reading carries that rollout's
-	// own frames, which are stamped before the write that set its mtime, so
-	// re-reading the file can never advance the reading to its mtime. Reported
-	// even when the pass was cut short — a file whose telemetry was merged stays
-	// covered however the rest of the walk ended.
-	covered time.Time
+	// newestEntry identifies the file `newest` came from
+	// (codexRolloutBacklogEntryDigest — a digest, never the path). It is held
+	// beside the mtime so a later pass can release exactly that evidence.
+	newestEntry string
+	// covered holds, per file identity, the eligible rollouts this pass DID mine
+	// telemetry from, with each one's mtime. Evidence naming one of them is
+	// satisfied: the reading carries that rollout's own frames, which are stamped
+	// before the write that set its mtime, so re-reading the file can never
+	// advance the reading to its mtime. Keyed by file rather than reduced to one
+	// newest mtime, because another session's covered file says nothing about
+	// this one. Reported even when the pass was cut short — a file whose
+	// telemetry was merged stays covered however the rest of the walk ended.
+	covered map[string]time.Time
+}
+
+// covers reports whether this pass mined telemetry covering the rollout
+// identified by entry. An empty entry names no file and is never covered.
+func (e codexRolloutNudgeEvidence) covers(entry string) bool {
+	if entry == "" {
+		return false
+	}
+	_, ok := e.covered[entry]
+	return ok
 }
 
 // codexRolloutCoverageLag is how far a rollout's mtime may sit ahead of the
@@ -2422,10 +2448,14 @@ func codexRolloutLineStartsTurn(line string) bool {
 	return false
 }
 
-// codexRolloutNudgeEvidenceFor pairs the two mtimes, withholding only `newest`
-// on an unfinished pass (codexEligibleMtimeFor).
-func codexRolloutNudgeEvidenceFor(newest, covered time.Time, complete bool) codexRolloutNudgeEvidence {
-	return codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered}
+// codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
+// withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
+func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
+	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered}
+	if !evidence.newest.IsZero() {
+		evidence.newestEntry = newestEntry
+	}
+	return evidence
 }
 
 // codexEligibleMtimeFor withholds the newest account-eligible rollout mtime

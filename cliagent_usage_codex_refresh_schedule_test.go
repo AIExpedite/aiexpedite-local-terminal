@@ -565,8 +565,11 @@ func TestCodexReconcileFromRollout_ReportsTheNewestEligibleMtime(t *testing.T) {
 	if rollouts.newest.Truncate(time.Second) != newer {
 		t.Fatalf("eligible mtime = %s, want the newest guard-passing candidate still owing telemetry %s", rollouts.newest, newer)
 	}
-	if rollouts.covered.Truncate(time.Second) != older {
-		t.Fatalf("covered mtime = %s, want the mined candidate %s", rollouts.covered, older)
+	if got := codexCoveredMtimes(rollouts); len(got) != 1 || got[0].Truncate(time.Second) != older {
+		t.Fatalf("covered mtimes = %v, want only the mined candidate %s", got, older)
+	}
+	if rollouts.newestEntry == "" || rollouts.covers(rollouts.newestEntry) {
+		t.Fatalf("the uncovered rollout must be reported with its own identity, not a covered one (entry=%q)", rollouts.newestEntry)
 	}
 }
 
@@ -592,8 +595,8 @@ func TestCodexReconcileFromRollout_MinedTelemetryCoversItsOwnRollout(t *testing.
 	if !rollouts.newest.IsZero() {
 		t.Fatalf("a rollout whose telemetry was mined reported mtime %s as still owing a refresh", rollouts.newest)
 	}
-	if rollouts.covered.Truncate(time.Second) != mtime {
-		t.Fatalf("covered mtime = %s, want %s", rollouts.covered, mtime)
+	if got := codexCoveredMtimes(rollouts); len(got) != 1 || got[0].Truncate(time.Second) != mtime {
+		t.Fatalf("covered mtimes = %v, want %s", got, mtime)
 	}
 	if latest.Before(observedAt) {
 		t.Fatalf("the pass did not mine the rollout's telemetry (latest = %s)", latest)
@@ -632,9 +635,9 @@ func TestCodexReconcileFromRollout_StaleFrameDoesNotCoverALaterAppend(t *testing
 	if rollouts.newest.Truncate(time.Second) != mtime {
 		t.Fatalf("eligible mtime = %s, want the later append %s still owing telemetry", rollouts.newest, mtime)
 	}
-	if !rollouts.covered.IsZero() {
-		t.Fatalf("a frame %s older than the file's newest write must not cover it (covered = %s)",
-			mtime.Sub(observedAt), rollouts.covered)
+	if len(rollouts.covered) != 0 {
+		t.Fatalf("a frame %s older than the file's newest write must not cover it (covered = %v)",
+			mtime.Sub(observedAt), codexCoveredMtimes(rollouts))
 	}
 	// End to end: the nudge owes a debt floored at the uncovered append, which the
 	// live-read fallback can pay.
@@ -709,13 +712,14 @@ func TestNudgeCodexUsageRefresh_CoverageReleasesHeldEvidence(t *testing.T) {
 	observed := now.Add(-time.Hour)
 	f.seedPreRunReading(t, observed, now)
 	rollout := now.Add(-2 * time.Minute)
+	const entry = "held-rollout"
 	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
-		snap.PendingRolloutMtimeMs = rollout.UnixMilli()
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = rollout.UnixMilli(), entry
 	})
 
 	// The pass that finally mines that rollout reports it as covered, and reports
 	// no newest (its cursor has consumed the file).
-	if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{covered: rollout}, observed) {
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{covered: map[string]time.Time{entry: rollout}}, observed) {
 		t.Fatal("evidence the mined telemetry covers must not create a debt")
 	}
 	if snap := f.snapshot(t); snap.PendingRolloutMtimeMs != 0 || snap.RefreshOwedAtMs != 0 {
@@ -1288,8 +1292,8 @@ func TestCodexReconcileFromRollout_FastLaterTurnIsNotCovered(t *testing.T) {
 	if latest.Before(observedAt) {
 		t.Fatalf("the pass did not mine the earlier turn's telemetry (latest = %s)", latest)
 	}
-	if !rollouts.covered.IsZero() {
-		t.Fatalf("a turn that began AFTER the mined frame must leave the file uncovered (covered = %s)", rollouts.covered)
+	if len(rollouts.covered) != 0 {
+		t.Fatalf("a turn that began AFTER the mined frame must leave the file uncovered (covered = %v)", codexCoveredMtimes(rollouts))
 	}
 	if rollouts.newest.Truncate(time.Second) != mtime.Truncate(time.Second) {
 		t.Fatalf("eligible mtime = %s, want the later turn %s still owing telemetry", rollouts.newest, mtime)
@@ -1321,12 +1325,103 @@ func TestCodexReconcileFromRollout_TrailingRecordsOfTheSameTurnStayCovered(t *te
 	)
 
 	_, _, _, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
-	if rollouts.covered.Truncate(time.Second) != mtime.Truncate(time.Second) {
-		t.Fatalf("covered = %s, want the file's own mtime %s", rollouts.covered, mtime)
+	if got := codexCoveredMtimes(rollouts); len(got) != 1 || got[0].Truncate(time.Second) != mtime.Truncate(time.Second) {
+		t.Fatalf("covered = %v, want the file's own mtime %s", got, mtime)
 	}
 	if !rollouts.newest.IsZero() {
 		t.Fatalf("a covered file must not be reported as owing telemetry (newest = %s)", rollouts.newest)
 	}
+}
+
+// Coverage belongs to the file that produced it. With overlapping sessions a
+// covered rollout B (telemetry, then trailing records) can carry a LATER mtime
+// than an uncovered rollout A whose telemetry-free run B's reading predates.
+// Ordering the two mtimes would call A covered on B's account, so A would never
+// owe a refresh and its utilization would stay stale with no fallback reached.
+func TestCodexReconcileFromRollout_AnotherSessionsCoverageDoesNotCoverIt(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	bFrame := now.Add(-3 * time.Minute).Truncate(time.Second)
+	bMtime := bFrame.Add(29 * time.Second)
+	aMtime := bFrame.Add(19 * time.Second)
+	writeCodexRunRollout(t, f.home, "covered-b", now.Add(-30*time.Minute), bFrame, bMtime, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, bFrame)})
+	writeCodexRunRollout(t, f.home, "silent-a", now.Add(-20*time.Minute), aMtime, aMtime, true, nil)
+
+	_, _, latest, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+
+	if rollouts.newest.Truncate(time.Second) != aMtime {
+		t.Fatalf("newest = %s, want the uncovered rollout %s", rollouts.newest, aMtime)
+	}
+	if got := codexCoveredMtimes(rollouts); len(got) != 1 || got[0].Truncate(time.Second) != bMtime {
+		t.Fatalf("covered = %v, want only B at %s", got, bMtime)
+	}
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollouts, latest) {
+		t.Fatal("A's run owes a refresh; B's newer covered mtime must not hide it")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != aMtime.UnixMilli() {
+		t.Fatalf("debt not floored at A: owed=%d floor=%d want floor=%d",
+			snap.RefreshOwedAtMs, snap.RunFloorMs, aMtime.UnixMilli())
+	}
+}
+
+// The held-evidence half of the same rule: evidence already on disk for file A
+// is released only when a pass mines A itself, never because some other file
+// with a newer mtime was covered.
+func TestNudgeCodexUsageRefresh_AnotherFilesCoverageKeepsHeldEvidence(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	held := now.Add(-3 * time.Minute)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = held.UnixMilli(), "rollout-a"
+	})
+
+	other := codexRolloutNudgeEvidence{covered: map[string]time.Time{"rollout-b": held.Add(time.Minute)}}
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, other, observed) {
+		t.Fatal("held evidence for A must still owe a refresh when only B was covered")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != held.UnixMilli() {
+		t.Fatalf("debt not floored at A's held evidence: owed=%d floor=%d", snap.RefreshOwedAtMs, snap.RunFloorMs)
+	}
+}
+
+// A held value the pass covered yields to a fresh report even when it is the
+// newer of the two, so an OLDER uncovered file reported in the same pass is not
+// shadowed by evidence that no longer owes anything.
+func TestNudgeCodexUsageRefresh_CoveredHeldEvidenceYieldsToAFreshReport(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	held := now.Add(-2 * time.Minute)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = held.UnixMilli(), "rollout-a"
+	})
+	older := now.Add(-4 * time.Minute).Truncate(time.Millisecond)
+
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{
+		newest: older, newestEntry: "rollout-c",
+		covered: map[string]time.Time{"rollout-a": held},
+	}, observed) {
+		t.Fatal("the uncovered report must owe a refresh once the covered held evidence yields")
+	}
+	if snap := f.snapshot(t); snap.RunFloorMs != older.UnixMilli() {
+		t.Fatalf("the uncovered report was shadowed by covered held evidence: floor=%d want %d",
+			snap.RunFloorMs, older.UnixMilli())
+	}
+}
+
+// codexCoveredMtimes lists the covered rollouts' mtimes, for assertions.
+func codexCoveredMtimes(e codexRolloutNudgeEvidence) []time.Time {
+	out := make([]time.Time, 0, len(e.covered))
+	for _, m := range e.covered {
+		out = append(out, m)
+	}
+	return out
 }
 
 // appendCodexRolloutLines adds records to a rollout written by

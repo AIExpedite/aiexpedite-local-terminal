@@ -274,6 +274,13 @@ type codexRateLimitSnapshot struct {
 	// run with no trigger at all: no debt, no fallback, and a card that looks
 	// current. Numeric only; zero means no evidence is held.
 	PendingRolloutMtimeMs int64 `json:"pendingRolloutMtimeMs,omitempty"`
+	// PendingRolloutEntry identifies the rollout PendingRolloutMtimeMs came from,
+	// as the same SHA-256 digest the scan cursor's retry entries already persist
+	// (codexRolloutBacklogEntryDigest) — never the path. It is what lets a later
+	// pass that mines THAT file release the evidence, rather than any file whose
+	// mtime happens to be newer. Empty when unknown; the evidence is then only
+	// released by a reading that catches up with it.
+	PendingRolloutEntry string `json:"pendingRolloutEntry,omitempty"`
 	// CodexVersion is the `--version` of the Codex binary that produced the
 	// newest contributor observation; RolloutCursorVersion is the binary in
 	// use when the rollout scan cursor was last reset or first established.
@@ -1779,7 +1786,7 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
 	// Rollout evidence the nudge was holding describes the PREVIOUS account's
 	// session, so it cannot floor a debt for this one.
-	snap.PendingRolloutMtimeMs = 0
+	snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = 0, ""
 	// The observations it stamped are gone. RolloutCursorVersion is kept: the
 	// progress it scoped was just cleared, so any cursor written from here on
 	// is written by the binary it already names.
@@ -1984,7 +1991,7 @@ func codexMergeContributorsIntoSnapshot(
 	// nothing owing it attention (see codexRolloutScanProgress.pendingRolloutMtimeMs).
 	// Applied even when the cursor above did not move: the file was still read.
 	if rolloutHighWater != nil {
-		codexRecordPendingRollout(snap, rolloutHighWater.pendingRolloutMtimeMs)
+		codexRecordPendingRollout(snap, rolloutHighWater.pendingRolloutMtimeMs, rolloutHighWater.pendingRolloutEntry)
 	}
 }
 
@@ -1996,7 +2003,7 @@ func codexMergeContributorsIntoSnapshot(
 // It never lowers the held value — a newer rollout supersedes an older one — and
 // it ignores a future-dated mtime, which cannot describe a settled run and would
 // otherwise shadow every later report (nudgeCodexUsageRefresh clamps the same way).
-func codexRecordPendingRollout(snap *codexRateLimitSnapshot, mtimeMs int64) {
+func codexRecordPendingRollout(snap *codexRateLimitSnapshot, mtimeMs int64, entry string) {
 	if mtimeMs <= 0 || mtimeMs <= snap.PendingRolloutMtimeMs {
 		return
 	}
@@ -2010,7 +2017,7 @@ func codexRecordPendingRollout(snap *codexRateLimitSnapshot, mtimeMs int64) {
 	if snap.RefreshOwedAtMs != 0 && snap.RunFloorMs >= mtimeMs {
 		return
 	}
-	snap.PendingRolloutMtimeMs = mtimeMs
+	snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = mtimeMs, entry
 }
 
 // reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance
@@ -2167,7 +2174,8 @@ type codexCacheView struct {
 	staleNoticeFloorMs int64
 	staleNoticeAtMs    int64
 	// Rollout evidence the nudge is holding (nudgeCodexUsageRefresh).
-	pendingRolloutMs int64
+	pendingRolloutMs    int64
+	pendingRolloutEntry string
 	// Capture stamps (cliagent_usage_codex_capture_stamp.go).
 	codexVersion         string
 	rolloutCursorVersion string
@@ -2203,6 +2211,7 @@ func codexCacheViewFromSnapshot(snap codexRateLimitSnapshot) codexCacheView {
 		staleNoticeFloorMs:   snap.StaleRunNoticeFloorMs,
 		staleNoticeAtMs:      snap.StaleRunNoticeAtMs,
 		pendingRolloutMs:     snap.PendingRolloutMtimeMs,
+		pendingRolloutEntry:  snap.PendingRolloutEntry,
 		codexVersion:         snap.CodexVersion,
 		rolloutCursorVersion: snap.RolloutCursorVersion,
 	}

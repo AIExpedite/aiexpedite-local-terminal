@@ -869,7 +869,7 @@ func TestCodexNudgeRolloutEvidence_FutureHeldValueCannotShadowANewerReport(t *te
 	// non-future report — non-fresh for two hours.
 	reported := now.Add(-time.Second).Truncate(time.Millisecond)
 
-	evidence, fresh := codexNudgeRolloutEvidence(ahead, reported, now)
+	evidence, _, fresh := codexNudgeRolloutEvidence(ahead, reported, "", false, now)
 
 	if !fresh {
 		t.Fatalf("a report newer than the CORRECTED held value must read as fresh; evidence=%s", evidence)
@@ -878,7 +878,7 @@ func TestCodexNudgeRolloutEvidence_FutureHeldValueCannotShadowANewerReport(t *te
 		t.Fatalf("evidence = %s, want the report %s", evidence, reported)
 	}
 	// With nothing reported, the corrected held value stands and is usable.
-	held, fresh := codexNudgeRolloutEvidence(ahead, time.Time{}, now)
+	held, _, fresh := codexNudgeRolloutEvidence(ahead, time.Time{}, "", false, now)
 	if fresh {
 		t.Fatal("a held value is not a fresh report")
 	}
