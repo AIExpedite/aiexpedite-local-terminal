@@ -727,15 +727,23 @@ func resetCodexUsageRefreshGate() {
 // codexStaleRunNoticeDue is the gate both run-freshness notices share. Two ways
 // in:
 //
-//   - A LIVE debt that has run out of everything: every rollout scan spent and
-//     the live fallback `exhausted`. A fallback that is outstanding (a read in
-//     flight) or `deferred` with a rung booked is still TRYING — showing the
-//     warning mid-ladder would make it flicker on and off across gathers.
+//   - A LIVE debt that has run out of everything: every rollout scan spent AND
+//     the live fallback `exhausted`. Any other fallback state is still TRYING —
+//     a read in flight, or a `deferred` debt whose rung will re-enter it — and
+//     showing the warning mid-ladder would make it flicker on and off across
+//     gathers.
 //   - The expiry MARKER a debt left when it aged out unpaid
 //     (codexRetireExpiredRunDebt). Without it, a continuously offline debt that
 //     kept booking free rungs would simply vanish at the age-out and the card
 //     would go quiet instead of warning — which the 6 h window makes worse, not
 //     better.
+//
+// The gate is `exhausted`, deliberately NOT "exhausted or no rung booked". Every
+// path that creates a debt ends in codexRunDebtWorker, which always either books
+// a rung or resolves the fallback to `exhausted`, so a debt with neither is only
+// ever a transient: the instants between a payment pass returning and the worker
+// booking what it kept. Reading that window as "given up" is precisely the
+// flicker this predicate exists to prevent.
 func codexStaleRunNoticeDue(state codexRunFreshnessState) bool {
 	if !state.expiredFloor.IsZero() && !state.owed {
 		return true
@@ -835,10 +843,11 @@ type codexRunFreshnessState struct {
 	liveReads int
 	// nextAttemptAt is the booked rung (NextAttemptAtMs), zero when none.
 	nextAttemptAt time.Time
-	// expiredFloor / expiredAt are the marker codexRetireExpiredRunDebt left for
-	// a debt that aged out unpaid: the floor never observed, and when it expired.
+	// expiredFloor is the floor from the marker codexRetireExpiredRunDebt left for
+	// a debt that aged out unpaid — the run whose telemetry was never found. The
+	// marker's own timestamp (StaleRunNoticeAtMs) stays on the cache view, which
+	// is where the rollback repair reads it; the notice needs only the floor.
 	expiredFloor time.Time
-	expiredAt    time.Time
 	// codexVersion is the binary that produced the newest observation
 	// (codexCaptureDriftNotice).
 	codexVersion string
@@ -856,9 +865,6 @@ func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFresh
 	}
 	if view.staleNoticeFloorMs > 0 {
 		state.expiredFloor = time.UnixMilli(view.staleNoticeFloorMs)
-	}
-	if view.staleNoticeAtMs > 0 {
-		state.expiredAt = time.UnixMilli(view.staleNoticeAtMs)
 	}
 	if view.runFloorMs <= 0 {
 		return state
@@ -887,6 +893,11 @@ func codexRunFreshnessForAccount(fingerprint string, now time.Time) codexRunFres
 // gather, the post-run worker — settles it in the same atomic write.
 func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 	codexRecordPaidRunFloor(snap)
+	// A covering observation answers whatever an earlier expiry warned about —
+	// and it has to be checked BEFORE the early return below, because the debt
+	// that left the marker is already gone. Otherwise the warning would outlive
+	// every later reading and only an account rescope could ever clear it.
+	codexClearCoveredStaleRunNotice(snap)
 	if snap.RefreshOwedAtMs <= 0 {
 		return
 	}
@@ -896,19 +907,12 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 		return
 	}
 	if paid {
-		// A covering observation also answers whatever an earlier debt's expiry
-		// warned about, so the marker goes with it.
-		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
+		// A settled debt raises no notice, owes no live fallback and books no rung.
+		codexClearRunFreshnessDebt(snap)
 	} else {
-		// Expired unpaid: leave the bounded marker so the card can still say the
-		// figure is behind, instead of going quiet. Written on THIS branch only —
-		// never the paid one.
-		codexMarkRunDebtExpired(snap, now)
-	}
-	// A settled debt raises no notice, owes no live fallback and books no rung.
-	codexClearRunFreshnessDebt(snap)
-	if !paid {
-		snap.RunFloorMs = 0
+		// Expired unpaid: retire it with the bounded marker so the card can still
+		// say the figure is behind instead of going quiet.
+		codexRetireRunDebtInSnapshot(snap, now)
 	}
 	codexPromoteActiveRunFloor(snap)
 	// The watermark above was taken against the OLD floor. If the observation
@@ -919,15 +923,19 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 	codexRecordPaidRunFloor(snap)
 }
 
-// codexMarkRunDebtExpired records the bounded terminal marker for a debt that
-// aged out unpaid — the floor that was never observed and the moment it expired
-// — and clears the debt. Must be called while snap.RunFloorMs still holds that
-// floor.
+// codexRetireRunDebtInSnapshot is the ONE in-transaction retirement: it records
+// the bounded expiry marker (the floor that was never observed, and when it
+// expired), clears the debt, drops the floor it stood on and PROMOTES whatever
+// newer run was parked behind it. Every path that gives up on an over-age debt
+// goes through it, so none can forget the promotion — a parked floor is the only
+// crash-recovery marker the newer run has, and dropping it silently would make a
+// restart unable to classify that run as interrupted.
 //
 // One marker per account, overwritten by a later expiry. It holds no attempt
 // budget and schedules nothing; codexStaleRunNoticeDue reads it as a due notice,
-// and the next covering observation or an account rescope clears it.
-func codexMarkRunDebtExpired(snap *codexRateLimitSnapshot, now time.Time) {
+// and codexClearCoveredStaleRunNotice clears it on the next covering observation
+// (an account rescope drops it outright).
+func codexRetireRunDebtInSnapshot(snap *codexRateLimitSnapshot, now time.Time) {
 	if snap.RefreshOwedAtMs <= 0 {
 		return
 	}
@@ -936,6 +944,26 @@ func codexMarkRunDebtExpired(snap *codexRateLimitSnapshot, now time.Time) {
 		snap.StaleRunNoticeAtMs = now.UnixMilli()
 	}
 	codexClearRunFreshnessDebt(snap)
+	snap.RunFloorMs = 0
+	codexPromoteActiveRunFloor(snap)
+}
+
+// codexClearCoveredStaleRunNotice drops the expiry marker once a contributor
+// observation reaches the floor it names. The marker outlives its debt on
+// purpose, so this — not the debt's own settle — is what finally clears it; a
+// reading that covers the run we gave up on has answered the warning.
+//
+// It compares against the marker's OWN floor rather than clearing
+// unconditionally on any paid debt: a newer debt can legitimately stand on an
+// OLDER floor (a withdrawal rolled the floor back to a run still open), and an
+// observation paying that one says nothing about the run the marker names.
+func codexClearCoveredStaleRunNotice(snap *codexRateLimitSnapshot) {
+	if snap.StaleRunNoticeFloorMs <= 0 {
+		return
+	}
+	if codexLatestContributorObservation(snap.Contributors).UnixMilli() >= snap.StaleRunNoticeFloorMs {
+		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
+	}
 }
 
 // codexRetireExpiredRunDebt is the atomic operation every path that could WALK
@@ -945,10 +973,15 @@ func codexMarkRunDebtExpired(snap *codexRateLimitSnapshot, now time.Time) {
 // nothing — the debt then sits unretired until some unrelated write settles it,
 // with no marker and no warning.
 //
+// The cheap cache READ comes first, like codexResolveOutstandingFallback's: this
+// is called on every "nothing owed" path, the overwhelmingly common reason being
+// that the debt was just PAID, and taking the blocking cross-process cache lock
+// only to write nothing would put that cost on the settle path.
+//
 // Reports whether it retired anything, so a caller can tell an expiry from an
 // ordinary "nothing owed".
 func codexRetireExpiredRunDebt(fp string, now time.Time) bool {
-	if fp == "" {
+	if fp == "" || !codexRunDebtExpired(codexCacheViewForAccount(fp).refreshOwedAtMs, now) {
 		return false
 	}
 	var retired bool
@@ -956,8 +989,7 @@ func codexRetireExpiredRunDebt(fp string, now time.Time) bool {
 		if snap.AccountFingerprint != fp || !codexRunDebtExpired(snap.RefreshOwedAtMs, now) {
 			return false
 		}
-		codexMarkRunDebtExpired(snap, now)
-		snap.RunFloorMs = 0
+		codexRetireRunDebtInSnapshot(snap, now)
 		retired = true
 		return true
 	})
@@ -1345,12 +1377,9 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 		// codexArmRunFloor coalesces onto the newest floor and never moves one
 		// backwards, so a late write can neither lower a floor nor re-open a
 		// run that has already settled.
-		for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
-			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
-				return
-			}
+		codexRetryBoundedWrite(func() bool {
 			now := codexUsageFreshnessNow()
-			if codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+			return codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
 				// Withdrawn (codexUsageRunDisarmed) before this write landed: the
 				// run never happened, so its floor must not reach disk at all.
 				if codexUsageRefresh.takeDisarmed(fp, startedAt.UnixMilli()) {
@@ -1361,10 +1390,8 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 				// rebased here rather than left to block this arm.
 				codexRebaseFutureRunFreshness(snap, startedAt, now)
 				codexArmRunFloor(snap, startedAt)
-			}) {
-				return
-			}
-		}
+			})
+		})
 	})
 }
 
@@ -1390,21 +1417,19 @@ func disarmCodexUsageRunFloor(floor, fallback time.Time) {
 	}
 	codexUsageRefresh.spawn(func() {
 		codexUsageRefresh.markDisarmed(fp, floorMs)
-		for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
-			if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
-				return
-			}
+		codexRetryBoundedWrite(func() bool {
+			// `reached` finishes the work even when the write was abandoned rather
+			// than committed: the mutation ran, so there is nothing left to retry.
 			var reached bool
-			if codexRecordRunFloorWrite(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
+			committed := codexRecordRunFloorWrite(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
 				reached = true
 				if codexDisarmRunFloor(snap, floorMs, fallbackMs) {
 					// The arm had landed; the mark has nothing left to stop.
 					codexUsageRefresh.takeDisarmed(fp, floorMs)
 				}
-			}) || reached {
-				return
-			}
-		}
+			})
+			return committed || reached
+		})
 	})
 }
 
@@ -1622,19 +1647,31 @@ func codexRecordRefreshAttempt(fp string, id codexDebtID, spent int) {
 	codexUsageRefresh.rememberAttempts(fp, id, spent)
 }
 
-// codexLandPendingRunDebt retries codexFlushPendingRunDebt under the same
-// bounded write budget an arm or a rollback gets (codexRunFloorWriteAttempts ×
-// codexRunFloorWriteRetryDelay). Reports whether fp's debt is on disk.
-func codexLandPendingRunDebt(fp string) bool {
+// codexRetryBoundedWrite is the write budget every freshness write that cannot
+// simply be DROPPED shares: at most codexRunFloorWriteAttempts tries, spaced by
+// codexRunFloorWriteRetryDelay, stopping early once `write` reports it is
+// finished with. Bounded cache locking deliberately lets such a write be
+// refused, and a run start, a withdrawal, a settle or a smoke's debt that never
+// reached disk is a refresh silently lost.
+//
+// Reports whether the work finished: false means the process is shutting down,
+// the gate was reset, or the locks stayed wedged past the whole budget.
+func codexRetryBoundedWrite(write func() bool) bool {
 	for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
 		if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
 			return false
 		}
-		if codexFlushPendingRunDebt(fp) {
+		if write() {
 			return true
 		}
 	}
 	return false
+}
+
+// codexLandPendingRunDebt retries codexFlushPendingRunDebt under that budget.
+// Reports whether fp's debt is on disk.
+func codexLandPendingRunDebt(fp string) bool {
+	return codexRetryBoundedWrite(func() bool { return codexFlushPendingRunDebt(fp) })
 }
 
 // codexFlushPendingRunDebt retries a settle whose write was refused by the

@@ -568,7 +568,6 @@ func TestCodexStaleRunNotice_RetiredDebtNamesTheMarkersFloor(t *testing.T) {
 	state := codexRunFreshnessState{
 		latest:       floor.Add(-time.Hour),
 		expiredFloor: floor,
-		expiredAt:    floor.Add(codexRefreshOwedMaxAge),
 		codexVersion: "codex-cli 0.149.0",
 	}
 
@@ -591,3 +590,166 @@ func TestCodexStaleRunNotice_RetiredDebtNamesTheMarkersFloor(t *testing.T) {
 	}
 }
 
+// The expiry marker outlives its debt on purpose, so nothing in the debt's own
+// settle path can clear it: a later COVERING observation must. Without that the
+// warning would survive every refresh and only an account rescope could ever
+// remove it — a permanent notice on a card that is now current.
+func TestCodexClearCoveredStaleRunNotice_ALaterObservationClearsTheMarker(t *testing.T) {
+	real := time.Now()
+	f := newCodexFreshnessFixture(t, real.Add(-9*time.Hour))
+	runStart := real.Add(-codexRefreshOwedMaxAge - time.Hour)
+	owedAt := runStart.Add(time.Minute)
+	f.seedPreRunReading(t, runStart.Add(-time.Hour), real)
+	f.oweUnpaidDebt(t, runStart, owedAt, 1, 0)
+
+	if !codexRetireExpiredRunDebt(f.fp, real) {
+		t.Fatal("the over-age debt was not retired")
+	}
+	if got := f.snapshot(t).StaleRunNoticeFloorMs; got != runStart.UnixMilli() {
+		t.Fatalf("marker floor = %d, want the unobserved run start %d", got, runStart.UnixMilli())
+	}
+	if codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, real)) == "" {
+		t.Fatal("the retired debt must warn")
+	}
+
+	// A fresh reading lands, covering the floor the marker names. No debt exists
+	// any more, so only codexClearCoveredStaleRunNotice can retract the warning.
+	f.seedPreRunReading(t, real, real)
+
+	snap := f.snapshot(t)
+	if snap.StaleRunNoticeFloorMs != 0 || snap.StaleRunNoticeAtMs != 0 {
+		t.Fatalf("a covering observation must clear the marker: %+v", snap)
+	}
+	if notice := codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, real)); notice != "" {
+		t.Fatalf("a refreshed card must carry no stale notice, got %q", notice)
+	}
+}
+
+// An observation that covers a NEWER debt's floor says nothing about the older
+// run the marker names, so it must not retract that warning. (A withdrawal can
+// legitimately roll RunFloorMs back below the marker's floor.)
+func TestCodexClearCoveredStaleRunNotice_KeepsAMarkerNoObservationCovers(t *testing.T) {
+	real := time.Now()
+	f := newCodexFreshnessFixture(t, real.Add(-9*time.Hour))
+	f.seedPreRunReading(t, real.Add(-8*time.Hour), real)
+	// A marker for a run that started AFTER any reading we will land below.
+	codexRecordRunFreshness(f.fp, real, func(snap *codexRateLimitSnapshot) {
+		snap.StaleRunNoticeFloorMs = real.Add(time.Hour).UnixMilli()
+		snap.StaleRunNoticeAtMs = real.UnixMilli()
+	})
+
+	// An observation older than the marker's floor.
+	f.seedPreRunReading(t, real.Add(-time.Minute), real)
+
+	if got := f.snapshot(t).StaleRunNoticeFloorMs; got == 0 {
+		t.Fatal("an observation that does not cover the marker's floor must not clear it")
+	}
+}
+
+// Retirement must PROMOTE a newer run parked behind the expired debt. That
+// parked floor is the newer run's only crash-recovery marker, and dropping it
+// would leave a restart unable to classify it as interrupted.
+func TestCodexRetireExpiredRunDebt_PromotesAParkedNewerRun(t *testing.T) {
+	real := time.Now()
+	f := newCodexFreshnessFixture(t, real.Add(-9*time.Hour))
+	runStart := real.Add(-codexRefreshOwedMaxAge - time.Hour)
+	owedAt := runStart.Add(time.Minute)
+	f.seedPreRunReading(t, runStart.Add(-time.Hour), real)
+	f.oweUnpaidDebt(t, runStart, owedAt, 1, 0)
+	// A second run started while the older debt stood, so it was parked.
+	parked := real.Add(-time.Minute).Truncate(time.Millisecond)
+	codexRecordRunFreshness(f.fp, owedAt, func(snap *codexRateLimitSnapshot) {
+		codexArmRunFloor(snap, parked)
+	})
+	if got := f.snapshot(t).ActiveRunFloorMs; got != parked.UnixMilli() {
+		t.Fatalf("fixture must park the newer run: ActiveRunFloorMs=%d want %d", got, parked.UnixMilli())
+	}
+
+	if !codexRetireExpiredRunDebt(f.fp, real) {
+		t.Fatal("the over-age debt was not retired")
+	}
+
+	snap := f.snapshot(t)
+	if snap.RunFloorMs != parked.UnixMilli() {
+		t.Fatalf("retirement dropped the parked run: RunFloorMs=%d want the promoted %d", snap.RunFloorMs, parked.UnixMilli())
+	}
+	if snap.ActiveRunFloorMs != 0 {
+		t.Fatalf("a promoted floor must leave the park empty: %+v", snap)
+	}
+	// And that promoted run is what a restart now classifies as interrupted.
+	if state := codexRunFreshnessForAccount(f.fp, real); !state.interrupted {
+		t.Fatalf("the promoted run must still be recoverable at startup: %+v", state)
+	}
+}
+
+// Only `exhausted` releases the warning for a live debt. Every other fallback
+// state is still trying, and the instants between a payment pass returning
+// `deferred` and the worker booking its rung must NOT read as "given up" — that
+// is the flicker (warn, then un-warn on the next gather) the gate exists to
+// prevent. The expiry marker is the other, independent way in.
+func TestCodexStaleRunNoticeDue_OnlyExhaustedOrTheExpiryMarker(t *testing.T) {
+	floor := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	base := codexRunFreshnessState{
+		floor: floor, owedAt: floor.Add(time.Minute), latest: floor.Add(-time.Hour),
+		owed: true, attempts: codexRefreshAfterRunMaxAttempts,
+	}
+	for _, tc := range []struct {
+		name     string
+		fallback string
+		rung     time.Time
+		want     bool
+	}{
+		{"fallback not reached yet", codexFallbackUnset, time.Time{}, false},
+		{"deferred with a rung booked is still trying", codexFallbackDeferred, floor.Add(time.Hour), false},
+		{"deferred mid-hand-off to the schedule is still trying", codexFallbackDeferred, time.Time{}, false},
+		{"a read in flight is still trying", codexFallbackOutstanding, time.Time{}, false},
+		{"exhausted has nothing left", codexFallbackExhausted, time.Time{}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := base
+			state.fallback, state.nextAttemptAt = tc.fallback, tc.rung
+			if got := codexStaleRunNoticeDue(state); got != tc.want {
+				t.Fatalf("due = %v, want %v (%+v)", got, tc.want, state)
+			}
+		})
+	}
+
+	// A retired debt's marker is due regardless of the counters it no longer has.
+	retired := codexRunFreshnessState{latest: floor.Add(-time.Hour), expiredFloor: floor}
+	if !codexStaleRunNoticeDue(retired) {
+		t.Fatalf("the expiry marker must be due on its own: %+v", retired)
+	}
+	// ...but not while a NEW debt is being chased.
+	retired.owed, retired.floor = true, floor.Add(time.Hour)
+	if codexStaleRunNoticeDue(retired) {
+		t.Fatal("a live debt still being paid must not surface an older expiry")
+	}
+}
+
+// A rung the bounded cache locks refuse to persist must not be DROPPED — that is
+// the exact failure this schedule exists to fix. It is armed in-process anyway,
+// so the ladder keeps walking even though nothing reached disk.
+func TestCodexScheduleRunDebtRetry_ARefusedWriteStillArmsARetry(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 20*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	booked := func() bool {
+		codexRateLimitMu.Lock()
+		defer codexRateLimitMu.Unlock()
+		return codexScheduleRunDebtRetry(f.fp, state, time.Now(), codexRetryAfterScan)
+	}()
+
+	if !booked {
+		t.Fatal("a refused write must still leave a retry armed, not drop the debt")
+	}
+	if !codexRunDebtRetryPending() {
+		t.Fatal("no timer armed after the refused write")
+	}
+	drainCodexRunDebtLadder(t)
+}

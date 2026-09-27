@@ -6246,7 +6246,9 @@ func TestCodexRateLimitSnapshot_ScheduleFieldsRoundTripAndScope(t *testing.T) {
 	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
 		codexOweRunRefresh(snap, now.Add(-time.Minute), now)
 		snap.NextAttemptAtMs, snap.RefreshLiveReads = now.Add(time.Minute).UnixMilli(), 1
-		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = now.Add(-time.Hour).UnixMilli(), now.UnixMilli()
+		// A marker floor NEWER than the seeded reading, or the covering-observation
+		// clear would (correctly) retract it in this same write.
+		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = now.Add(time.Hour).UnixMilli(), now.UnixMilli()
 	})
 
 	snap := f.snapshot(t)

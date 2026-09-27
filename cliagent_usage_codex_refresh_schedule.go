@@ -168,7 +168,7 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 	}
 	var next time.Time
 	var scans, reads int
-	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
 		// Generation safety, the rule codexSetRefreshFallback and
 		// codexRecordRefreshAttempt already follow: a credentials swap mid-wait,
 		// a newer run's debt, or a floor withdrawn by codexUsageRunDisarmed all
@@ -212,6 +212,22 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 		scans, reads = snap.RefreshOwedAttempts, snap.RefreshLiveReads
 		return true
 	})
+	if !committed {
+		// The bounded cache locks REFUSED the write, so mutate never ran and there
+		// is no rung on disk. Dropping it here is the exact failure this file
+		// exists to fix, so arm one in this process anyway: its callback re-reads
+		// the debt and books it properly. Nothing is persisted, so a restart
+		// before then falls back to the startup replay.
+		//
+		// The free rung's age backoff, not a flat delay: nothing was spent, so no
+		// budget bounds these retries, and a cache wedged for hours would
+		// otherwise re-check (and log) every 15 s for the whole age-out.
+		retry := codexFreeRetryDelay(now.Sub(state.owedAt))
+		codexArmRunDebtRetry(id, fp, retry)
+		fmt.Printf("%s[cli-usage] codex run refresh rung not persisted (cache busy); retrying in %ds%s\n",
+			colorYellow, int(retry.Round(time.Second).Seconds()), colorReset)
+		return true
+	}
 	if next.IsZero() {
 		return false
 	}
@@ -356,8 +372,10 @@ func resetCodexRefreshNudge() {
 // settles itself. It never lowers RunFloorMs; a mtime is only ever an owed
 // floor.
 //
-// Never blocks the gather: one small cache transaction, then the worker on its
-// own goroutine.
+// Cost on the steady-state gather is ONE cache read and nothing else: the
+// transaction below takes the blocking cross-process cache lock, and this runs
+// every ~30 s, so a nudge with provably nothing to do returns before reaching it.
+// The worker, when there is one, runs on its own goroutine.
 func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time.Time) bool {
 	if IsShutdownInProgress() || !codexUsageRefresh.isEnabled() || fp == "" {
 		return false
@@ -375,6 +393,14 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := codexNewestOpenRunFloor() != 0
 
+	// The steady state — no debt on disk and no missed run to own — needs no
+	// write, so it must not pay for the blocking cache lock on every gather.
+	// A future-dated cache still does: the rebase below is the repair.
+	view := codexCacheViewForAccount(fp)
+	if view.refreshOwedAtMs == 0 && (!settled || liveRun) && !codexRunFreshnessInFuture(view, now) {
+		return false
+	}
+
 	start, created := false, false
 	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
 		if snap.AccountFingerprint != fp {
@@ -386,7 +412,7 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 			// ever owing a refresh, so retire it — with its marker, so the card
 			// still says why the figure is behind — and judge the rollout as if
 			// no debt were pending.
-			codexMarkRunDebtExpired(snap, now)
+			codexRetireRunDebtInSnapshot(snap, now)
 			wrote = true
 		}
 		if snap.RefreshOwedAtMs != 0 {

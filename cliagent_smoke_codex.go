@@ -409,11 +409,11 @@ func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 }
 
 // persistCodexSmokeRunDebt records the smoke's run debt and books its first rung
-// before returning, retrying a refused cache lock under
-// codexRunFloorWriteAttempts × codexRunFloorWriteRetryDelay — the budget an arm
-// or a rollback gets. A no-op when the freshness path is disarmed (tests), and
-// idempotent with the worker's own settle: codexOweRunRefresh coalesces onto the
-// newest floor and the worker re-reads the debt from disk.
+// before returning, on the shared bounded write budget every freshness write
+// that cannot be dropped uses (codexRetryBoundedWrite). A no-op when the
+// freshness path is disarmed (tests), and idempotent with the worker's own
+// settle: codexOweRunRefresh coalesces onto the newest floor and the worker
+// re-reads the debt from disk.
 func persistCodexSmokeRunDebt(floor time.Time) {
 	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
 		return
@@ -422,24 +422,21 @@ func persistCodexSmokeRunDebt(floor time.Time) {
 	if fp == "" {
 		return
 	}
-	for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
-		if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
-			return
-		}
+	landed := codexRetryBoundedWrite(func() bool {
 		now := codexUsageFreshnessNow()
-		if !codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+		return codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
 			codexRebaseFutureRunFreshness(snap, now, now)
 			codexOweRunRefresh(snap, floor, now)
-		}) {
-			continue
-		}
-		// The debt is on disk; book its first rung so a process replaced right
-		// now re-enters the ladder rather than waiting for the next run.
-		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
-		if state.owed {
-			codexScheduleRunDebtRetry(fp, state, codexUsageFreshnessNow(), codexRetryAfterScan)
-		}
+		})
+	})
+	if !landed {
 		return
+	}
+	// The debt is on disk; book its first rung so a process replaced right now
+	// re-enters the ladder rather than waiting for the next run.
+	now := codexUsageFreshnessNow()
+	if state := codexRunFreshnessForAccount(fp, now); state.owed {
+		codexScheduleRunDebtRetry(fp, state, now, codexRetryAfterScan)
 	}
 }
 
