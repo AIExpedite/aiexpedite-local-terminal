@@ -92,15 +92,29 @@ func TestBuildOpenCodeInteractiveArgs_ForwardsModel(t *testing.T) {
 			wantPrompt: "implement the feature",
 		},
 		{
-			// Arity is never guessed: nothing tells us whether an unknown option
-			// is boolean or consumes the next token, so dropping it could eat the
-			// prompt and reordering it could turn a value into prompt text. It is
-			// forwarded as-is, and if OpenCode refuses it the smoke reports
-			// flag_rejected — a precise diagnostic instead of a fused failure.
-			name:       "an unknown caller flag and its value are forwarded unchanged",
+			// Arity is never guessed: nothing tells us whether an unlearned
+			// option is boolean or consumes the next token. The FLAG is
+			// forwarded; a SEPARATE operand stays with the prompt, because
+			// moving it onto argv when the option turns out to be boolean would
+			// split the prompt across argv and stdin and expose prompt text in a
+			// process listing. A bare option OpenCode needs an operand for is
+			// then refused and classifies as flag_rejected — a precise
+			// diagnostic instead of a fused failure.
+			name:       "an unlearned caller flag is forwarded and its separate operand stays with the prompt",
 			in:         []string{"--not-a-known-flag", "someValue", "implement the feature"},
 			want:       []string{"run", "--format", "json", "--not-a-known-flag"},
 			wantPrompt: "someValue implement the feature",
+		},
+		{
+			// The documented escape hatch for the case above: `--flag=value` is
+			// unambiguous, so an unlearned option's value IS forwarded intact
+			// and nothing leaks into the prompt. This is what a caller sends
+			// (and what a reviewer should reach for) before this repo has
+			// learned a newly shipped OpenCode option.
+			name:       "an unlearned caller flag keeps an inline value intact",
+			in:         []string{"--not-a-known-flag=someValue", "implement the feature"},
+			want:       []string{"run", "--format", "json", "--not-a-known-flag=someValue"},
+			wantPrompt: "implement the feature",
 		},
 		{
 			// Manager-owned positions are still taken away with their values.
@@ -138,8 +152,9 @@ func TestBuildOpenCodeInteractiveArgs_ForwardsModel(t *testing.T) {
 
 func TestBuildOpenCodeInteractiveArgs_ForwardsUnknownFlagsAndStripsOwnedOnes(t *testing.T) {
 	// One strip policy (openCodeStrippedCallerFlagAt): every manager-owned flag
-	// goes with its value, a caller's duplicate `run` is dropped, and an unknown
-	// flag and its value survive untouched.
+	// goes with its value, a caller's duplicate `run` is dropped, and an
+	// unlearned flag survives — its separate operand stays with the prompt,
+	// never dropped and never re-ordered onto argv.
 	got, prompt := buildOpenCodeInteractiveArgs([]string{
 		"run", "--format", "json", "--session", "ses_x", "--fork", "abc",
 		"--continue", "--print-logs", "--model", openCodeTestModel,

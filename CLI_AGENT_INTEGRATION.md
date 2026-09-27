@@ -1507,9 +1507,16 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   `normalizeOpenCodeArgs` answers on the other end of the wire. The direct and
   session paths used to carry a hand-copied loop each, and a flag stripped on one
   path but forwarded on the other re-points a conversation at a chat the caller
-  does not own. **Everything else a caller sends is forwarded as-is** — nothing
-  tells us whether an unknown option is boolean or consumes the next token, so
+  does not own. **Every other token a caller sends is forwarded as-is** — nothing
+  tells us whether an unlearned option is boolean or consumes the next token, so
   dropping can eat the prompt and keeping can turn a value into prompt text.
+  Concretely: the FLAG is forwarded, and an unlearned option's **separate**
+  operand stays with the prompt rather than being guessed onto argv, because
+  guessing wrong on a boolean option splits the prompt across argv and stdin and
+  puts prompt text (including a smoke marker nonce) into a process listing — the
+  exposure this transport exists to close. The unambiguous `--flag=value` form is
+  forwarded intact whether or not the flag is known, which is the escape hatch
+  before `openCodeForwardedValuedFlags` learns a newly shipped option.
   A forwarded flag OpenCode refuses yields `flag_rejected`, a precise diagnostic.
 - **Prompt never on argv, via two transports.** A one-shot (native turn or smoke)
   stages it with `writeOpenCodePromptFile` (0600) and hands the open file to the

@@ -18,10 +18,13 @@
 //   - `--session <id>` is added only on the direct path, only above
 //     openCodeNativeMinVersion, and is the one droppable token in the ladder.
 //   - Manager-owned flags a caller sent (openCodeStrippedFlags) are removed
-//     with their values; everything else a caller sent is forwarded AS-IS,
-//     because nothing tells us whether an unknown option is boolean or
+//     with their values; every other TOKEN a caller sent is forwarded AS-IS,
+//     because nothing tells us whether an unlearned option is boolean or
 //     consumes the next token — dropping can eat the prompt and keeping can
-//     turn a value into prompt text.
+//     turn a value into prompt text. An unlearned option's SEPARATE operand
+//     therefore stays with the prompt rather than being guessed onto argv; the
+//     unambiguous `--flag=value` form is forwarded intact. See
+//     openCodeForwardedValuedFlags for why that asymmetry is the safe one.
 //   - The prompt is NEVER on argv. Two transports: a one-shot stages it in a
 //     0600 file handed to the child as stdin (openCodeLaunch.Stdin); a legacy
 //     session returns it as stdinPrompt and the session manager writes it
@@ -135,8 +138,18 @@ var openCodeValuedStrippedFlags = map[string]bool{
 // mistaken for prompt text and reordered behind the flags.
 //
 // A flag NOT listed here is still forwarded — see buildOpenCodeInteractiveArgs
-// — it simply cannot have its value re-ordered ahead of the prompt, because
-// nothing tells us whether an unknown option consumes a token.
+// — it simply cannot have a SEPARATE operand re-ordered ahead of the prompt,
+// because nothing tells us whether an unlearned option is boolean or consumes
+// the next token. Both guesses are unsound, and they are not symmetric: moving
+// that token onto argv when the option turns out to be boolean splits the prompt
+// across argv and stdin AND puts prompt text — including the maintenance smoke's
+// marker nonce — into a process listing any local user can read, the exact
+// exposure this transport exists to close. Leaving it with the prompt instead
+// costs a bare option OpenCode answers with a missing-operand rejection, which
+// classifies as flag_rejected: a precise, actionable diagnostic. Two cheap
+// remedies, so nothing is stuck waiting on this file: send the unambiguous
+// `--flag=value` inline form, which is forwarded intact whether or not the flag
+// is known, or add a one-line entry here once OpenCode ships the option.
 var openCodeForwardedValuedFlags = map[string]bool{
 	"--model": true,
 	"-m":      true,
