@@ -164,7 +164,14 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 		return false
 	}
 	id := state.debtID()
-	if fp == "" || !id.valid() {
+	// Deliberately NOT rejecting an empty fp: that is the unscoped account
+	// (currentCodexAccountFingerprint returns "" when no identity is derivable,
+	// e.g. API-key-only auth), and every generation check below compares against
+	// snap.AccountFingerprint, which is "" for it too. Refusing it would leave
+	// such a device unable to book any rung — so an empty first scan could never
+	// reach the live-read fallback and the utilization would stay stale until the
+	// debt aged out, the exact regression the pre-ladder fallback did not have.
+	if !id.valid() {
 		return false
 	}
 	if !codexUsageRefresh.isEnabled() || IsShutdownInProgress() {
@@ -454,7 +461,9 @@ func codexNudgeRolloutEvidence(view codexCacheView, reported, now time.Time) (ev
 // every ~30 s, so a nudge with provably nothing to do returns before reaching it.
 // The worker, when there is one, runs on its own goroutine.
 func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time.Time) bool {
-	if IsShutdownInProgress() || !codexUsageRefresh.isEnabled() || fp == "" {
+	// An empty fp is the unscoped account, not a missing one — see
+	// codexScheduleRunDebtRetry. It nudges like any other.
+	if IsShutdownInProgress() || !codexUsageRefresh.isEnabled() {
 		return false
 	}
 	n := &codexRefreshNudge

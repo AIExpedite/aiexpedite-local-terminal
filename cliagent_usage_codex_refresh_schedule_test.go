@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -968,4 +969,130 @@ func restoreCodexRefreshCancel(t *testing.T) {
 	codexUsageRefresh.mu.Lock()
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
+}
+
+/* ─────────────────────── the unscoped (identity-less) account ─────────────────────── */
+
+// unscopeAccount rewrites auth.json with credentials carrying no derivable
+// identity (API-key-only auth), the state in which
+// currentCodexAccountFingerprint returns "" and the cache operates UNSCOPED.
+func (f codexFreshnessFixture) unscopeAccount(t *testing.T) codexFreshnessFixture {
+	t.Helper()
+	helperWriteJSON(t, filepath.Join(f.home, "auth.json"), map[string]any{"OPENAI_API_KEY": "sk-test"})
+	if fp := currentCodexAccountFingerprint(); fp != "" {
+		t.Fatalf("fixture must be unscoped, got fingerprint %q", fp)
+	}
+	f.fp = ""
+	return f
+}
+
+// An empty fingerprint is a real, ELIGIBLE account — not a missing one. Refusing
+// to book a rung for it left such a device unable to retry at all: an empty first
+// scan could never reach the live-read fallback, so the utilization stayed stale
+// until the debt aged out, which the pre-ladder fallback did not do.
+func TestCodexScheduleRunDebtRetry_BooksForAnUnscopedAccount(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour)).unscopeAccount(t)
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+
+	if !codexScheduleRunDebtRetry(f.fp, state, now, codexRetryAfterScan) {
+		t.Fatal("an unscoped account booked no rung")
+	}
+	rung := f.bookedRung(t)
+	if rung.IsZero() {
+		t.Fatal("no rung persisted for the unscoped account")
+	}
+	if want := now.Add(codexRunDebtRetryLadder[0]); rung.UnixMilli() != want.UnixMilli() {
+		t.Fatalf("rung %s, want %s", rung, want)
+	}
+	if !codexRunDebtRetryPending() {
+		t.Fatal("no timer armed for the unscoped account")
+	}
+	// The live-read phase is reachable too — the phase the old guard cut off.
+	spent := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute),
+		codexRefreshAfterRunMaxAttempts, 1)
+	if !codexScheduleRunDebtRetry(f.fp, spent, now, codexRetryAfterRead) {
+		t.Fatal("an unscoped account booked no rung after a failed live read")
+	}
+}
+
+// Retirement must reach the unscoped account too: it is the only path that leaves
+// the expiry marker, so refusing it would age a debt out with no marker and no
+// warning — a card that looks current for ever.
+func TestCodexRetireExpiredRunDebt_RetiresForAnUnscopedAccount(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-9*time.Hour)).unscopeAccount(t)
+	runStart := now.Add(-codexRefreshOwedMaxAge - time.Hour)
+	f.seedPreRunReading(t, runStart.Add(-time.Hour), now)
+	f.oweUnpaidDebt(t, runStart, runStart.Add(time.Minute), codexRefreshAfterRunMaxAttempts, 0)
+
+	if !codexRetireExpiredRunDebt(f.fp, now) {
+		t.Fatal("an over-age unscoped debt was not retired")
+	}
+	snap := f.snapshot(t)
+	if snap.StaleRunNoticeFloorMs != runStart.UnixMilli() || snap.StaleRunNoticeAtMs == 0 {
+		t.Fatalf("expiry marker not written: floor=%d at=%d", snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs)
+	}
+	if snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("retired debt left behind: owed=%d rung=%d", snap.RefreshOwedAtMs, snap.NextAttemptAtMs)
+	}
+}
+
+// The nudge is the only trigger an unmanaged run ever gets, so it has to accept
+// the unscoped account as well; rejecting it meant a `codex` the user ran in their
+// own shell could never converge on such a device.
+func TestNudgeCodexUsageRefresh_AcceptsAnUnscopedAccount(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour)).unscopeAccount(t)
+	observedAt := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observedAt, now)
+	rollout := now.Add(-codexForcedReconcileMinInterval - time.Second)
+
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observedAt) {
+		t.Fatal("the nudge refused the unscoped account")
+	}
+	if got := f.snapshot(t).RefreshOwedAtMs; got == 0 {
+		t.Fatal("the nudge created no debt for the unscoped account")
+	}
+	if got := f.snapshot(t).RunFloorMs; got != rollout.UnixMilli() {
+		t.Fatalf("debt floored at %d, want the rollout mtime %d", got, rollout.UnixMilli())
+	}
+}
+
+/* ────────────────── the retired-debt notice keeps its last reading ────────────────── */
+
+// codexRetireRunDebtInSnapshot clears RunFloorMs but KEEPS the expiry marker, so
+// the retired-debt notice is read out of a state with no floor. Returning from
+// codexRunFreshnessFromView before populating `latest` made that warning claim no
+// Codex reading had ever been observed even though a perfectly good pre-run one
+// was still cached — the one number the notice exists to report.
+func TestCodexRunFreshnessFromView_RetiredDebtKeepsTheLastObservation(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-9*time.Hour))
+	runStart := now.Add(-codexRefreshOwedMaxAge - time.Hour)
+	observedAt := runStart.Add(-time.Hour).Truncate(time.Millisecond)
+	f.seedPreRunReading(t, observedAt, now)
+	f.oweUnpaidDebt(t, runStart, runStart.Add(time.Minute), codexRefreshAfterRunMaxAttempts, 0)
+	if !codexRetireExpiredRunDebt(f.fp, now) {
+		t.Fatal("the over-age debt was not retired")
+	}
+
+	state := codexRunFreshnessForAccount(f.fp, now)
+	if state.owed {
+		t.Fatal("a retired debt must not read as owed")
+	}
+	if !state.floor.IsZero() {
+		t.Fatalf("retirement must clear the floor, got %s", state.floor)
+	}
+	if state.latest.UnixMilli() != observedAt.UnixMilli() {
+		t.Fatalf("latest observation = %s, want the cached pre-run reading %s", state.latest, observedAt)
+	}
+	notice := codexStaleRunNotice(state)
+	if !strings.Contains(notice, "last observed") {
+		t.Fatalf("notice must name the last observed reading, got %q", notice)
+	}
+	if strings.Contains(notice, "No Codex utilization reading has been observed") {
+		t.Fatalf("notice denied a cached reading it still has: %q", notice)
+	}
 }

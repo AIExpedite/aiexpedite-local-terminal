@@ -929,11 +929,16 @@ func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFresh
 	if view.staleNoticeFloorMs > 0 {
 		state.expiredFloor = time.UnixMilli(view.staleNoticeFloorMs)
 	}
+	// BEFORE the zero-floor return: codexRetireRunDebtInSnapshot clears
+	// RunFloorMs but keeps the expiry marker, so the retired-debt notice is read
+	// out of a state with no floor. Returning early here left `latest` zero and
+	// made that notice claim no Codex reading had ever been observed even when a
+	// perfectly good pre-run one was still cached.
+	state.latest = codexLatestContributorObservation(view.contributors)
 	if view.runFloorMs <= 0 {
 		return state
 	}
 	state.floor = time.UnixMilli(view.runFloorMs)
-	state.latest = codexLatestContributorObservation(view.contributors)
 	// A floor the paid watermark already covers stays covered even if the
 	// contributor that paid it is later dropped by an authoritative snapshot.
 	unobserved := state.latest.Before(state.floor) && view.runFloorPaidMs < view.runFloorMs
@@ -1056,7 +1061,12 @@ func codexClearCoveredStaleRunNotice(snap *codexRateLimitSnapshot) {
 // Reports whether it retired anything, so a caller can tell an expiry from an
 // ordinary "nothing owed".
 func codexRetireExpiredRunDebt(fp string, now time.Time) bool {
-	if fp == "" || !codexRunDebtExpired(codexCacheViewForAccount(fp).refreshOwedAtMs, now) {
+	// An EMPTY fp is a real, eligible account: currentCodexAccountFingerprint
+	// returns "" when no auth identity is derivable (API-key-only auth) and the
+	// cache then operates unscoped. Its debts are written, paid and aged out like
+	// any other, so refusing it here would leave an unscoped debt on disk with no
+	// marker and no warning.
+	if !codexRunDebtExpired(codexCacheViewForAccount(fp).refreshOwedAtMs, now) {
 		return false
 	}
 	var retired bool

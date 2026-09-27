@@ -441,7 +441,10 @@ func persistCodexSmokeRunDebt(floor time.Time, armedFP string) {
 		return
 	}
 	fp := currentCodexAccountFingerprint()
-	if fp == "" || (armedFP != "" && armedFP != fp) {
+	// An empty fp is the unscoped account (no derivable identity, e.g.
+	// API-key-only auth), which owes and pays debts like any other; the swap check
+	// below still drops a run armed under a DIFFERENT account.
+	if armedFP != "" && armedFP != fp {
 		return
 	}
 	floorMs := floor.UnixMilli()
