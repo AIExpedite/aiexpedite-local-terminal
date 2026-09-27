@@ -220,6 +220,15 @@ type codexUsageRefreshGate struct {
 	// attempt into it would push a brand-new debt towards the stale warning
 	// on reconciles that never targeted its floor.
 	pendingAttempts map[string]codexRetainedAttempts
+	// pendingLiveReads is the same retention for OUTBOUND live reads
+	// (RefreshLiveReads), and it is load-bearing for a stricter reason than the
+	// scan counter: a read that reached OpenAI but whose counter write the bounded
+	// cache locks refused would otherwise leave the debt looking as though it had
+	// budget left, and the next rung would spend a THIRD read against a promised
+	// bound of two. Retained by generation and consulted before any further read
+	// is authorized (codexLiveUsageFallback), so the bound holds even under
+	// sustained contention.
+	pendingLiveReads map[string]codexRetainedAttempts
 	// armed maps a run start (floor, ms) to the account fingerprints that were
 	// live when runs were armed at it, so each run's settlement is attributed
 	// to the account that actually made it even if the Codex credentials
@@ -291,16 +300,17 @@ var codexUsageRefresh = newCodexUsageRefreshGate()
 
 func newCodexUsageRefreshGate() *codexUsageRefreshGate {
 	return &codexUsageRefreshGate{
-		inFlight:        map[string]chan struct{}{},
-		lastRun:         map[string]time.Time{},
-		workers:         map[string]bool{},
-		pending:         map[string]codexPendingRunDebt{},
-		pendingAttempts: map[string]codexRetainedAttempts{},
-		armed:           map[int64][]string{},
-		disarmed:        map[string]map[int64]int{},
-		fallbacks:       map[string]bool{},
-		driftBypass:     map[string]string{},
-		cancel:          make(chan struct{}),
+		inFlight:         map[string]chan struct{}{},
+		lastRun:          map[string]time.Time{},
+		workers:          map[string]bool{},
+		pending:          map[string]codexPendingRunDebt{},
+		pendingAttempts:  map[string]codexRetainedAttempts{},
+		pendingLiveReads: map[string]codexRetainedAttempts{},
+		armed:            map[int64][]string{},
+		disarmed:         map[string]map[int64]int{},
+		fallbacks:        map[string]bool{},
+		driftBypass:      map[string]string{},
+		cancel:           make(chan struct{}),
 	}
 }
 
@@ -498,6 +508,51 @@ func (g *codexUsageRefreshGate) rememberAttempts(fp string, id codexDebtID, n in
 		n += cur.n
 	}
 	g.pendingAttempts[fp] = codexRetainedAttempts{id: id, n: n}
+}
+
+// rememberLiveReads retains outbound live reads whose counter write was refused,
+// under the debt generation they were spent on. Same rule as rememberAttempts: a
+// count held for an OLDER generation is dropped, since the newer debt reset the
+// counter on purpose and those reads did not target its floor.
+func (g *codexUsageRefreshGate) rememberLiveReads(fp string, id codexDebtID, n int) {
+	if !id.valid() || n <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if cur, ok := g.pendingLiveReads[fp]; ok && cur.id == id {
+		n += cur.n
+	}
+	g.pendingLiveReads[fp] = codexRetainedAttempts{id: id, n: n}
+}
+
+// takeLiveReads removes and returns the reads retained for THIS debt; a count
+// held for another generation is discarded, since it can never be counted.
+func (g *codexUsageRefreshGate) takeLiveReads(fp string, id codexDebtID) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	cur, ok := g.pendingLiveReads[fp]
+	if !ok {
+		return 0
+	}
+	delete(g.pendingLiveReads, fp)
+	if cur.id != id {
+		return 0
+	}
+	return cur.n
+}
+
+// peekLiveReads reports the reads retained for THIS debt WITHOUT consuming them,
+// so the decision to spend another read can account for a counter write that was
+// refused. Consuming here instead would lose the count if the authorizing read
+// then failed to write too.
+func (g *codexUsageRefreshGate) peekLiveReads(fp string, id codexDebtID) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if cur, ok := g.pendingLiveReads[fp]; ok && cur.id == id {
+		return cur.n
+	}
+	return 0
 }
 
 // takeAttempts hands the next write the attempts retained for THIS debt; a
@@ -719,6 +774,7 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.workers = map[string]bool{}
 	codexUsageRefresh.pending = map[string]codexPendingRunDebt{}
 	codexUsageRefresh.pendingAttempts = map[string]codexRetainedAttempts{}
+	codexUsageRefresh.pendingLiveReads = map[string]codexRetainedAttempts{}
 	codexUsageRefresh.armed = map[int64][]string{}
 	codexUsageRefresh.disarmed = map[string]map[int64]int{}
 	codexUsageRefresh.fallbacks = map[string]bool{}
@@ -1809,7 +1865,11 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 	if !id.valid() || state.fallback == codexFallbackExhausted {
 		return codexRetryNone
 	}
-	if state.liveReads >= codexRefreshLiveReadMaxAttempts {
+	// The budget counts reads on disk PLUS any whose counter write the bounded
+	// cache locks refused (peeked, not consumed: consuming here would lose the
+	// count if this read's own write failed too). Without the retained half, a
+	// refused write would re-authorize a read the debt had already spent.
+	if state.liveReads+codexUsageRefresh.peekLiveReads(fp, id) >= codexRefreshLiveReadMaxAttempts {
 		codexSetRefreshFallback(fp, id, codexFallbackExhausted)
 		return codexRetryNone
 	}
@@ -1833,9 +1893,17 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 	for try := 0; try < codexLiveUsageFallbackTries; try++ {
 		outcome, cancelled := codexRunLiveUsageFallbackRead(fp)
 		if cancelled {
-			// Shutting down or reset: the cache may belong to someone else now,
-			// so write nothing and leave the rung on disk alone.
-			return codexRetryNone
+			// Shutting down or reset: the cache may belong to someone else now, so
+			// write nothing and leave the rung on disk alone.
+			//
+			// The kind is FREE, not None: the read never completed, so nothing was
+			// charged and the debt has to stay retryable. Reporting None made the
+			// worker book nothing and then resolve the outstanding fallback to
+			// `exhausted` — persisting a terminal verdict for a read that was
+			// cancelled, so the next process refused the debt for good. During
+			// shutdown neither write happens at all now; a gate reset books a free
+			// rung it then cancels, which is harmless.
+			return codexRetryFree
 		}
 		if outcome != liveProbeOutcomeCooldown {
 			kind := codexLiveReadRetryKind(outcome)
@@ -1845,7 +1913,9 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 		}
 		if try+1 < codexLiveUsageFallbackTries &&
 			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(fp, time.Now())) {
-			return codexRetryNone
+			// Same as the cancellation above: the cooldown wait was interrupted, no
+			// read went out, so the debt stays retryable.
+			return codexRetryFree
 		}
 	}
 	// Every try was refused by the cooldown: no read went out, so nothing is
@@ -1859,26 +1929,47 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 // the state becomes `exhausted` only once that counter is at its cap — never on
 // the first failure, which would make the second scheduled read unrunnable and
 // the two-read budget a fiction.
+//
+// A refused write is RETAINED by generation and folded into the next one, the
+// same way codexRecordRefreshAttempt handles the scan counter. Dropping it was a
+// hole in a promise about OUTBOUND calls: the schedule reads RefreshLiveReads off
+// disk to pick the next rung, so an uncounted read left the debt looking as
+// though it had budget left and the next rung spent a third read. Sustained
+// contention could do that repeatedly.
 func codexRecordLiveReadOutcome(fp string, id codexDebtID, outcome string, kind codexRunDebtRetryKind) {
-	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+	spent := codexUsageRefresh.takeLiveReads(fp, id)
+	if codexLiveReadOutbound(outcome) {
+		spent++
+	}
+	if spent <= 0 && outcome != liveProbeOutcomeOK {
+		// Nothing left the device and nothing was retained: only the state below
+		// would change, which the caller's own kind already describes.
+		return
+	}
+	if codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
 		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs {
 			return false
 		}
-		if codexLiveReadOutbound(outcome) {
-			snap.RefreshLiveReads++
-		}
+		snap.RefreshLiveReads += spent
 		switch {
 		case outcome == liveProbeOutcomeOK:
 			// The reading's own merge settles the debt; leave the state alone so
 			// codexSettleRunFreshness clears it with everything else.
-			return snap.RefreshLiveReads > 0
+			return spent > 0
 		case snap.RefreshLiveReads >= codexRefreshLiveReadMaxAttempts, kind == codexRetryNone:
 			snap.RefreshFallbackState = codexFallbackExhausted
 		default:
 			snap.RefreshFallbackState = codexFallbackDeferred
 		}
 		return true
-	})
+	}) {
+		return
+	}
+	// Refused, or the debt moved on. Retaining a count for a generation that is
+	// gone is harmless — rememberLiveReads drops it on the next read of a
+	// different generation — and retaining one for a LIVE generation is what keeps
+	// the bound honest.
+	codexUsageRefresh.rememberLiveReads(fp, id, spent)
 }
 
 // codexRunLiveUsageFallbackRead runs one read under codexLiveProbeTimeout,
@@ -1935,7 +2026,20 @@ func codexSetRefreshFallback(fp string, id codexDebtID, to string) bool {
 // come back to it, so the notice must stay hidden — and to `exhausted` only when
 // none is, which is when the notice surfaces. The read comes first so the routine
 // retirement writes nothing.
+//
+// It writes NOTHING while the process is shutting down or the path is disarmed,
+// the same rule codexScheduleRunDebtRetry follows and for a sharper reason: a
+// shutdown cancels the in-flight read (codexRunLiveUsageFallbackRead reports
+// `cancelled`), so nothing was spent and no rung can be booked — and resolving
+// that to `exhausted` would persist a TERMINAL state for a read that never
+// completed. The next process would then refuse the debt outright, which defeats
+// the update survival this file exists for, on the one path (gracefulShutdown,
+// including an update handoff) where it matters most. `outstanding` left on disk
+// is retryable: the next process's fallback re-enters it.
 func codexResolveOutstandingFallback(fp string, booked bool) {
+	if !codexUsageRefresh.isEnabled() || IsShutdownInProgress() {
+		return
+	}
 	if codexCacheViewForAccount(fp).refreshFallback != codexFallbackOutstanding {
 		return
 	}

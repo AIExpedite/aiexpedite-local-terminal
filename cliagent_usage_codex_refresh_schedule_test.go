@@ -932,3 +932,22 @@ func TestCodexNudgeNeedsWrite_MirrorsTheTransactionsDecision(t *testing.T) {
 		})
 	}
 }
+
+// cancelCodexRefreshInFlight / restoreCodexRefreshCancel drive the gate's cancel
+// channel — what a shutdown or a gate reset does to an in-flight live read. The
+// field is guarded by the gate mutex (see cancelCh), so a test may close and
+// replace it; the process-wide shutdownChan may NOT be driven this way, because
+// production closes it exactly once and never reassigns it.
+func cancelCodexRefreshInFlight(t *testing.T) {
+	t.Helper()
+	codexUsageRefresh.mu.Lock()
+	close(codexUsageRefresh.cancel)
+	codexUsageRefresh.mu.Unlock()
+}
+
+func restoreCodexRefreshCancel(t *testing.T) {
+	t.Helper()
+	codexUsageRefresh.mu.Lock()
+	codexUsageRefresh.cancel = make(chan struct{})
+	codexUsageRefresh.mu.Unlock()
+}

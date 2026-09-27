@@ -69,10 +69,26 @@ var codexRunDebtRetryTimer struct {
 	gen   uint64
 }
 
-// codexRefreshNudge is the per-process nudge cooldown.
+// codexRefreshNudge is the per-process nudge cooldown, plus the rollout evidence
+// a declined nudge has to hold on to.
+//
+// Retaining that evidence is not an optimisation. The reconcile ADVANCES its scan
+// cursor over a rollout it has read, so a file is usually reported exactly once:
+// the next pass sees it as consumed and unchanged and reports nothing. A nudge
+// that declines such a report — because the file was written less than
+// codexForcedReconcileMinInterval ago, or because its own cooldown is running —
+// therefore throws away the only trigger an unmanaged run will ever get, and a
+// rollout carrying no readable utilization (the post-upgrade case this whole
+// feature is about) leaves the card stale with no debt, no fallback and no
+// warning. Held per account, in memory only: a restart loses it, which is
+// acceptable because holding the SCAN CURSOR back instead would starve the
+// backlog march the scanner depends on.
 var codexRefreshNudge struct {
 	mu     sync.Mutex
 	lastAt time.Time
+	// pending is the newest account-eligible rollout mtime a nudge has seen but
+	// not yet acted on, keyed by account fingerprint.
+	pending map[string]time.Time
 }
 
 // codexRunDebtRetryKind says what a payment pass left behind, and so which rung
@@ -345,12 +361,41 @@ func codexRunDebtRetryPending() bool {
 	return t.timer != nil
 }
 
-// resetCodexRefreshNudge clears the per-process nudge cooldown. Test seam,
-// called from resetCodexUsageRefreshGate.
+// resetCodexRefreshNudge clears the per-process nudge cooldown and its retained
+// rollout evidence. Test seam, called from resetCodexUsageRefreshGate.
 func resetCodexRefreshNudge() {
 	codexRefreshNudge.mu.Lock()
 	codexRefreshNudge.lastAt = time.Time{}
+	codexRefreshNudge.pending = nil
 	codexRefreshNudge.mu.Unlock()
+}
+
+// codexNudgeRollout merges a freshly reported rollout mtime with whatever a
+// previous, declined nudge retained for this account, and reports the newest.
+// Callers hold codexRefreshNudge.mu.
+//
+// A zero report is the ordinary case once the scan cursor has consumed the file,
+// so it must not erase what is held: that retained value IS the evidence.
+func codexNudgeRollout(fp string, reported time.Time) time.Time {
+	held := codexRefreshNudge.pending[fp]
+	if reported.After(held) {
+		held = reported
+	}
+	if held.IsZero() {
+		return time.Time{}
+	}
+	if codexRefreshNudge.pending == nil {
+		codexRefreshNudge.pending = map[string]time.Time{}
+	}
+	codexRefreshNudge.pending[fp] = held
+	return held
+}
+
+// codexNudgeRolloutHandled drops the retained evidence for fp once it has been
+// acted on — a debt was created for it, or an observation covers it, so it can
+// no longer tell us anything. Callers hold codexRefreshNudge.mu.
+func codexNudgeRolloutHandled(fp string) {
+	delete(codexRefreshNudge.pending, fp)
 }
 
 // nudgeCodexUsageRefresh is the gather's trigger, the mirror of
@@ -391,6 +436,15 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 	n := &codexRefreshNudge
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// Capture the evidence BEFORE any decline can return, and merge it with what a
+	// previous decline retained. The reconcile reports a rollout about once (its
+	// cursor then treats the file as consumed), so a decline that dropped the
+	// report would lose the only trigger an unmanaged run ever gets.
+	newestRollout = codexNudgeRollout(fp, newestRollout)
+	// Evidence the reading has caught up with says nothing any more.
+	if !newestRollout.IsZero() && !observedAt.IsZero() && !newestRollout.After(observedAt) {
+		codexNudgeRolloutHandled(fp)
+	}
 	if !n.lastAt.IsZero() && !now.Before(n.lastAt) && now.Sub(n.lastAt) < codexRefreshNudgeCooldown {
 		return false
 	}
@@ -450,6 +504,10 @@ func nudgeCodexUsageRefresh(base, fp string, now, newestRollout, observedAt time
 		start, created = true, true
 		return true
 	})
+	if created {
+		// The debt now carries this rollout; the retained copy has done its job.
+		codexNudgeRolloutHandled(fp)
+	}
 	// The cooldown is consumed whenever the transaction RAN, not only when it
 	// armed the worker: a pass that took the lock and then declined — a local run
 	// still open, an observation that moved on — would otherwise re-take it on

@@ -391,3 +391,214 @@ func TestPersistCodexSmokeRunDebt_StandsDownForAStubbedLifecycle(t *testing.T) {
 		t.Fatal("a stubbed lifecycle must not have the cache written behind it")
 	}
 }
+
+/* ───────────── adversarial-review regressions (secondary pass) ───────────── */
+
+// A shutdown during an OUTSTANDING live read must not exhaust the debt. The read
+// is cancelled, so nothing was spent; persisting `exhausted` there made the next
+// process refuse the debt outright, defeating update survival on the one path —
+// gracefulShutdown, which an update handoff goes through — where it matters most.
+func TestCodexPostUpdate_ShutdownDuringALiveReadKeepsTheDebtPayable(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	// The read blocks until the process starts shutting down, then reports the
+	// cancellation the real probe reports.
+	entered := make(chan struct{})
+	reads := stubCodexFallbackRead(t, func(ctx context.Context, fp string) string {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-ctx.Done()
+		return liveProbeOutcomeTimeout
+	})
+	state := f.oweExhaustedDebt(t, runStart, now.Add(-time.Minute))
+
+	done := make(chan codexRunDebtRetryKind, 1)
+	go func() { done <- codexLiveUsageFallback(f.fp, state) }()
+	<-entered
+	// Cancel the in-flight read the way a shutdown (or a gate reset) does. The
+	// gate's cancel channel is guarded by its mutex, so this is safe to drive
+	// from a test — unlike the process-wide shutdownChan, which production closes
+	// exactly once and never reassigns.
+	cancelCodexRefreshInFlight(t)
+	if kind := <-done; kind == codexRetryNone {
+		t.Fatal("a cancelled read spent nothing and must report a retryable kind")
+	}
+	restoreCodexRefreshCancel(t)
+
+	// The worker's retirement then runs the resolve. While the process is going
+	// down it must write nothing rather than persist a terminal verdict.
+	shutdownInProgress.Store(true)
+	t.Cleanup(func() { shutdownInProgress.Store(false) })
+	codexResolveOutstandingFallback(f.fp, false)
+
+	snap := f.snapshot(t)
+	if snap.RefreshFallbackState == codexFallbackExhausted {
+		t.Fatalf("a cancelled read must not exhaust the debt: %+v", snap)
+	}
+	if snap.RefreshLiveReads != 0 {
+		t.Fatalf("a cancelled read charged %d reads", snap.RefreshLiveReads)
+	}
+	if *reads != 1 {
+		t.Fatalf("reads = %d, want the one that was cancelled", *reads)
+	}
+
+	// The replacement process: the debt is still payable and a read advances it.
+	shutdownInProgress.Store(false)
+	simulateCodexAgentRestart(t)
+	stubCodexFallbackRead(t, capturingFallbackRead)
+	codexRunDebtWorker(f.home, f.fp)
+	drainCodexRunDebtLadder(t)
+
+	if got := codexObservedAt(t, f); got.Before(runStart.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the run %s after the restart", got, runStart)
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("the restarted process must be able to pay the debt: %+v", snap)
+	}
+}
+
+// An unmanaged run whose rollout carries NO readable utilization must still
+// converge. The reconcile reports that rollout about once — its cursor then treats
+// the file as consumed and unchanged — so a nudge that declined the report for
+// being too young used to throw away the run's only trigger, leaving the card
+// stale with no debt, no fallback and no warning.
+//
+// Two consecutive gathers over the SAME unchanged rollout: the first inside the
+// age threshold (declined), the second past it (must act).
+func TestCodexPostUpdate_UnmanagedRunSurvivesAnEarlyDeclinedNudge(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	// A rollout with a session header and NO usable rate-limit frame: exactly the
+	// post-upgrade shape the scan cannot mine.
+	rollout := now.Truncate(time.Millisecond)
+	writeCodexRunRollout(t, f.home, "own-shell-unreadable", now.Add(-5*time.Minute), time.Time{}, rollout, false, nil)
+
+	// Gather 1, immediately after the write: the reconcile reports the mtime, the
+	// nudge declines it as possibly still being appended to.
+	first := codexReconcileForGather(context.Background(), f.home, f.fp, now, false)
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, first.newestRollout, first.latestObservation) {
+		t.Fatal("a rollout younger than the minimum interval must be declined")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("nothing should be owed yet: %+v", snap)
+	}
+
+	// Gather 2, past the age threshold. The file is unchanged and the cursor has
+	// consumed it, so the reconcile reports nothing this time — the retained
+	// evidence is all that is left.
+	// No resetCodexRefreshNudge here: it would clear the retained evidence that is
+	// the whole point of this test. The first nudge declined before reaching its
+	// transaction, so it consumed no cooldown either.
+	later := now.Add(2 * codexForcedReconcileMinInterval)
+	second := codexReconcileForGather(context.Background(), f.home, f.fp, later, false)
+	if !second.newestRollout.IsZero() {
+		t.Logf("note: the reconcile still reported %s; the retained path is exercised when it reports zero", second.newestRollout)
+	}
+	if !nudgeCodexUsageRefresh(f.home, f.fp, later, second.newestRollout, second.latestObservation) {
+		t.Fatal("the run's evidence was lost: the second gather nudged nothing")
+	}
+	drainCodexRunDebtLadder(t)
+
+	if *calls == 0 {
+		t.Fatal("the debt's live fallback never ran, so the card would stay stale in silence")
+	}
+	if got := codexObservedAt(t, f); !got.After(observed) {
+		t.Fatalf("observedAt %s did not advance past the pre-run reading %s", got, observed)
+	}
+}
+
+// The live-read counter must survive a refused write. codexRecordLiveReadOutcome
+// used to ignore its transaction result, so a read that reached OpenAI but whose
+// counter write the bounded cache locks refused vanished — and the schedule picks
+// the next rung off RefreshLiveReads on DISK, so the debt looked as though it had
+// budget left. The count is retained by generation and folded into the next write.
+func TestCodexRecordLiveReadOutcome_RetainsARefusedCount(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+	id := state.debtID()
+
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 20*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+
+	// One outbound read whose counter write is refused.
+	func() {
+		codexRateLimitMu.Lock()
+		defer codexRateLimitMu.Unlock()
+		codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, codexRetryAfterRead)
+	}()
+	if got := f.snapshot(t).RefreshLiveReads; got != 0 {
+		t.Fatalf("precondition: the refused write must leave the counter at 0, got %d", got)
+	}
+	if got := codexUsageRefresh.peekLiveReads(f.fp, id); got != 1 {
+		t.Fatalf("retained reads = %d, want the refused one held for this generation", got)
+	}
+
+	// The next write folds it in, so the debt is charged what it actually spent.
+	codexRecordLiveReadOutcome(f.fp, id, liveProbeOutcomeRPCError, codexRetryAfterRead)
+	snap := f.snapshot(t)
+	if snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("RefreshLiveReads = %d, want the refused read folded in (%d)",
+			snap.RefreshLiveReads, codexRefreshLiveReadMaxAttempts)
+	}
+	if snap.RefreshFallbackState != codexFallbackExhausted {
+		t.Fatalf("fallback = %q, want exhausted once the folded budget is spent", snap.RefreshFallbackState)
+	}
+	if got := codexUsageRefresh.peekLiveReads(f.fp, id); got != 0 {
+		t.Fatalf("a folded count must be consumed, %d still retained", got)
+	}
+}
+
+// A count retained for a generation the debt has moved past is never charged to
+// the new one — the same rule the scan counter follows.
+func TestCodexRecordLiveReadOutcome_RetainedCountIsPerGeneration(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	stale := codexDebtID{floorMs: now.Add(-time.Hour).UnixMilli(), owedAtMs: now.Add(-time.Hour).UnixMilli()}
+	codexUsageRefresh.rememberLiveReads(f.fp, stale, codexRefreshLiveReadMaxAttempts)
+
+	fresh := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+	if got := codexUsageRefresh.peekLiveReads(f.fp, fresh.debtID()); got != 0 {
+		t.Fatalf("a newer debt inherited %d reads from a generation it replaced", got)
+	}
+}
+
+// The retained count must GATE the next read, not merely be recorded: that is what
+// keeps the promised two outbound reads per debt honest when the counter writes
+// are being refused. Seeded through the gate, which is exactly the state a refused
+// write leaves, so this needs no wedged cache of its own.
+func TestCodexLiveFallback_RetainedReadsBoundTheBudget(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	reads := stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeRPCError })
+	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
+
+	// The whole budget spent, but none of it on disk — every counter write was
+	// refused.
+	codexUsageRefresh.rememberLiveReads(f.fp, state.debtID(), codexRefreshLiveReadMaxAttempts)
+	if got := f.snapshot(t).RefreshLiveReads; got != 0 {
+		t.Fatalf("precondition: the counter on disk must still read 0, got %d", got)
+	}
+
+	codexLiveUsageFallback(f.fp, state)
+
+	if *reads != 0 {
+		t.Fatalf("reads = %d, want none: the retained count says the budget is spent", *reads)
+	}
+	if got := codexRunFreshnessForAccount(f.fp, time.Now()).fallback; got != codexFallbackExhausted {
+		t.Fatalf("fallback = %q, want exhausted", got)
+	}
+}
