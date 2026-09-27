@@ -263,7 +263,7 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	// already in the cache, so a later rung that captures nothing must not
 	// disarm a run whose telemetry did land.
 	usageCaptured := false
-	defer func() { settleOrDisarmCodexSmokeRun(floor, evidence) }()
+	defer func() { settleOrDisarmCodexSmokeRun(floor, smokeFingerprint, evidence) }()
 
 	var lastCategory, lastDiagnostic string
 	for _, shape := range codexSmokeShapeLadder(path) {
@@ -390,7 +390,9 @@ type codexSmokeEvidence struct {
 // only defers it, because payOwedCodexUsageRefresh adopts an armed, unsettled
 // floor as an interrupted run at the next start — and the post-update restart
 // is exactly when this smoke runs.
-func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
+// `armedFP` is the account that was live when the probe armed its floor, so the
+// debt this settles can be refused if the credentials changed underneath it.
+func settleOrDisarmCodexSmokeRun(floor time.Time, armedFP string, evidence codexSmokeEvidence) {
 	if evidence.usageCaptured || evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
 		// codexUsageRunSettled only SPAWNS a goroutine, so the debt may not be on
@@ -400,7 +402,7 @@ func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 		// utilization" case. Land it here, synchronously, under the same bounded
 		// write budget an arm gets. The asynchronous worker still runs; it simply
 		// no longer owns durability.
-		persistCodexSmokeRunDebt(floor)
+		persistCodexSmokeRunDebt(floor, armedFP)
 		return
 	}
 	// Unchanged: a run that spent nothing writes nothing and puts the device on
@@ -427,12 +429,19 @@ func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 // (payOwedCodexUsageRefresh), which is the pre-existing behaviour. What must not
 // be lost is the debt itself: a smoke is usually the last thing that happens
 // before an update handoff replaces the process.
-func persistCodexSmokeRunDebt(floor time.Time) {
-	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
+//
+// A credentials change since the probe armed DROPS the debt, exactly as
+// codexRefreshAfterRun does and for the same reason: the run's telemetry is
+// unreachable (the rollout scan only reads the account live now), and booking it
+// either way is wrong — under the live account it would show a stale-run warning
+// for a run that account never made, and under the armed one it would rescope the
+// cache and discard the live account's readings.
+func persistCodexSmokeRunDebt(floor time.Time, armedFP string) {
+	if !codexUsageRefresh.isEnabled() || floor.IsZero() || codexRunLifecycleStubbed() {
 		return
 	}
 	fp := currentCodexAccountFingerprint()
-	if fp == "" {
+	if fp == "" || (armedFP != "" && armedFP != fp) {
 		return
 	}
 	floorMs := floor.UnixMilli()

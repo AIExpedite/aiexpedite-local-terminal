@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -249,5 +250,141 @@ func TestCodexPostUpdate_UnmanagedRunConvergesThroughTheNudge(t *testing.T) {
 
 	if got := codexObservedAt(t, f); !got.After(observed) {
 		t.Fatalf("observedAt %s did not advance past the pre-run reading %s", got, observed)
+	}
+}
+
+// The migration's whole point, end to end: a cache written by the PREVIOUS agent
+// version, whose debt was retired offline (`skipped`, which used to be final),
+// must become payable again on the very upgrade that ships this fix. Mapping it
+// to `exhausted` would carry the reported bug across that upgrade — the debt
+// would be permanently unpayable on every cache written before it.
+func TestCodexPostUpdate_LegacyOfflineRetiredDebtIsPayableAfterTheUpgrade(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	// The state the old agent left: every rollout scan spent and the fallback
+	// resolved to the old, terminal "skipped" because the device was offline.
+	if !codexRecordRunFreshness(f.fp, now.Add(-time.Minute), func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now.Add(-time.Minute))
+		snap.RefreshOwedAttempts = codexRefreshAfterRunMaxAttempts
+		snap.RefreshFallbackState = codexLegacyFallbackSkipped
+	}) {
+		t.Fatal("seeding the legacy debt failed")
+	}
+
+	// The upgraded agent starts and replays the debt.
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	drainCodexRunDebtLadder(t)
+
+	if *calls == 0 {
+		t.Fatal("a legacy offline-retired debt must be payable again after the upgrade")
+	}
+	if got := codexObservedAt(t, f); got.Before(runStart.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the run %s", got, runStart)
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("the migrated debt must be paid, not stuck: %+v", snap)
+	}
+	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.Notice != "" {
+		t.Fatalf("a paid card must carry no notice: %q", usage.Notice)
+	}
+}
+
+// The other legacy value: "spent" proved exactly ONE outbound read, so the
+// upgrade must leave the second read of the new budget available rather than
+// treating the debt as finished.
+func TestCodexPostUpdate_LegacySpentDebtGetsItsRemainingRead(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string { return liveProbeOutcomeNoReading })
+	if !codexRecordRunFreshness(f.fp, now.Add(-time.Minute), func(snap *codexRateLimitSnapshot) {
+		codexOweRunRefresh(snap, runStart, now.Add(-time.Minute))
+		snap.RefreshOwedAttempts = codexRefreshAfterRunMaxAttempts
+		snap.RefreshFallbackState = codexLegacyFallbackSpent
+	}) {
+		t.Fatal("seeding the legacy debt failed")
+	}
+
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	drainCodexRunDebtLadder(t)
+
+	// Exactly the one read the new budget still had, then exhausted.
+	want := codexRefreshLiveReadMaxAttempts - 1
+	if int(*calls) != want {
+		t.Fatalf("live reads = %d, want the %d the legacy debt had left", *calls, want)
+	}
+	snap := f.snapshot(t)
+	if snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("read counter = %d, want the budget fully spent (%d)", snap.RefreshLiveReads, codexRefreshLiveReadMaxAttempts)
+	}
+	if snap.RefreshFallbackState != codexFallbackExhausted {
+		t.Fatalf("fallback = %q, want exhausted once the migrated budget is spent", snap.RefreshFallbackState)
+	}
+	// And the card now explains itself rather than looking current.
+	if codexStaleRunNotice(codexRunFreshnessForAccount(f.fp, time.Now())) == "" {
+		t.Fatal("a debt that ran out of everything must warn")
+	}
+}
+
+// A credentials change between the probe arming and its settle must DROP the
+// debt, not book it. Under the live account it would show a stale-run warning for
+// a run that account never made; under the armed one it would rescope the cache
+// and discard the live account's readings. The synchronous persist has to apply
+// the same rule codexRefreshAfterRun does, since it writes outside that path.
+func TestPersistCodexSmokeRunDebt_DropsTheDebtWhenTheAccountChanged(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	// The account live NOW is not the one the probe armed under.
+	armedByAnotherAccount := "codex-account-that-signed-out"
+
+	persistCodexSmokeRunDebt(now.Add(-time.Minute), armedByAnotherAccount)
+
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("a run made under another account must not owe a debt here: %+v", snap)
+	}
+
+	// The matching account still books it, so the guard is not simply refusing
+	// everything.
+	persistCodexSmokeRunDebt(now.Add(-time.Minute), f.fp)
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 {
+		t.Fatalf("the arming account's own run must still be recorded: %+v", snap)
+	}
+	drainCodexRunDebtLadder(t)
+}
+
+// The run-lifecycle seam exists so a test can observe arm/settle WITHOUT any
+// cache write. The synchronous persist runs beside codexUsageRunSettled, so it
+// has to honour that seam too or a recorder would see clean lifecycle counts
+// while the cache was written behind it.
+func TestPersistCodexSmokeRunDebt_StandsDownForAStubbedLifecycle(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	before, err := os.ReadFile(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexRunHookOverride.Store(&codexRunHooks{
+		started: func(time.Time) {}, settled: func(time.Time) {},
+		disarmed: func(floor, fallback time.Time) {},
+	})
+	t.Cleanup(func() { codexRunHookOverride.Store(nil) })
+
+	persistCodexSmokeRunDebt(now.Add(-time.Minute), f.fp)
+
+	after, err := os.ReadFile(f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("a stubbed lifecycle must not have the cache written behind it")
 	}
 }

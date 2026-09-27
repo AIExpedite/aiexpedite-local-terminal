@@ -187,6 +187,14 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 			delay, ok = codexRetryDelayForAttempt(snap.RefreshOwedAttempts)
 		case codexRetryAfterRead:
 			delay, ok = codexRetryDelayForLiveRead(snap.RefreshLiveReads)
+			// The rung has to CLEAR the shared live-read cooldown. The first one
+			// (15 s) is exactly that cooldown, and it is booked at the moment the
+			// read finished — i.e. the moment the cooldown started — so without
+			// this the next attempt is a coin flip to be refused on arrival,
+			// spending a wake-up and a log line only to book a spacing rung.
+			if cooldown := codexLiveRateLimitCooldownRemaining(fp, now); ok && cooldown > delay {
+				delay = cooldown
+			}
 		case codexRetryFree:
 			// Spends neither budget, so no budget can bound it; the age-out
 			// clamp below is what finally stops it.

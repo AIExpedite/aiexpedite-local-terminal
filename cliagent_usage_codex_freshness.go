@@ -127,6 +127,13 @@ type codexRunHooks struct {
 
 var codexRunHookOverride atomic.Pointer[codexRunHooks]
 
+// codexRunLifecycleStubbed reports whether a test has replaced the run lifecycle
+// with a recorder. A stubbed lifecycle deliberately writes NOTHING — that is what
+// the seam is for — so anything that runs beside codexUsageRunSettled to make its
+// work durable (persistCodexSmokeRunDebt) must stand down too, or the recorder
+// would observe lifecycle calls while the cache was written behind it.
+func codexRunLifecycleStubbed() bool { return codexRunHookOverride.Load() != nil }
+
 // codexUsageRunStarted is what the session managers call when a Codex run
 // starts; codexUsageRunSettled when it finishes.
 func codexUsageRunStarted(startedAt time.Time) {
