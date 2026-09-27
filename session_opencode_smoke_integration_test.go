@@ -320,7 +320,11 @@ func TestOpenCodeSession_PromptlessStartClosesStdinOnTheFirstSendInput(t *testin
 		t.Fatalf("promptless start failed: %v", err)
 	}
 
-	session := sm.sessions[id]
+	// Through the accessor, not the map: sm.sessions is guarded by sm.mu and the
+	// manager's readOutputStream / waitForExit goroutines are live by now, with
+	// removeSession writing that map on exit. An unguarded read here is a data
+	// race the detector would eventually surface as an intermittent CI failure.
+	session := sm.GetSession(id)
 	if session == nil {
 		t.Fatal("session was not registered")
 	}
