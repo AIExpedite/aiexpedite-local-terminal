@@ -44,7 +44,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -214,7 +213,10 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 		return entry.Result
 	}
 
-	result := probeOpenCodeReadinessUncached(ctx, executable, home)
+	// The card describes the install as the agent sees it, so its probes keep the
+	// process working directory. The maintenance smoke does NOT — see
+	// openCodeSmokeLoggedInDir.
+	result := probeOpenCodeReadinessUncached(ctx, executable, home, "")
 	openCodeReadinessMu.Lock()
 	switch {
 	case len(result.Providers) > 0:
@@ -245,10 +247,10 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 	return result
 }
 
-func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string) openCodeReadiness {
+func probeOpenCodeReadinessUncached(ctx context.Context, executable, home, dir string) openCodeReadiness {
 	out := openCodeReadiness{AuthState: openCodeAuthUnknown}
 
-	models, modelsOK := runOpenCodeProbe(ctx, executable, "models")
+	models, modelsOK := runOpenCodeProbe(ctx, executable, dir, "models")
 	if !modelsOK {
 		// Timeout, non-zero exit, or the binary vanished between detection and
 		// probe. We could not ask, so we do not answer — fail open.
@@ -293,7 +295,7 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 	out.Providers = openCodeProvidersFromModelIDs(allModelIDs)
 	if len(out.Providers) == 0 {
 		if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
-			if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
+			if authOut, ok := runOpenCodeProbe(authCtx, executable, dir, "auth", "list"); ok {
 				out.Providers = parseOpenCodeAuthProviders(authOut)
 			}
 			release()
@@ -339,22 +341,98 @@ func optionalOpenCodeProbeContext(ctx context.Context) (probeCtx context.Context
 // openCodeProbeTimeout on the unbounded path and at whatever the gather has
 // left on the demand-driven one — it can never hold the refresh past the
 // deadline the handler documents.
-func runOpenCodeProbe(ctx context.Context, executable string, args ...string) (string, bool) {
+// A package-level var so a test can drive readiness (and therefore the smoke's
+// free login pre-check) without spawning a real binary.
+// dir is the working directory the probe runs in, and it MATTERS: OpenCode
+// discovers a project `opencode.json` (and its provider/model entries) by walking
+// upward from cwd, so a probe that answers from the agent's own directory can
+// describe a different configuration than the turn it is a pre-check for. "" keeps
+// the process working directory, which is what the card wants.
+var runOpenCodeProbe = func(ctx context.Context, executable, dir string, args ...string) (string, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(ctx, openCodeProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, args...)
-	hideWindow(cmd)
+	// The shared shim-aware launcher, not a bare exec.CommandContext: on Windows
+	// the `opencode` on PATH is frequently an npm `.cmd` shim, which
+	// CreateProcess cannot start at all — so `models` and `auth list` answered
+	// nothing on exactly the installs the maintenance smoke targets, leaving the
+	// readiness pre-check inconclusive and an unusable install free to spend a
+	// turn before failing.
+	//
 	// The probes must not inherit another agent's credentials any more than a
 	// real turn does.
-	cmd.Env = sanitizeOpenCodeEnv(os.Environ())
+	cmd, launchErr := newOpenCodeCmd(ctx, openCodeLaunch{
+		Path: executable,
+		Args: args,
+		Env:  sanitizeOpenCodeEnv(os.Environ()),
+		Dir:  dir,
+	})
+	if launchErr != nil {
+		return "", false
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", false
 	}
 	return string(out), true
+}
+
+// openCodeSmokeLoggedIn is the FREE login pre-check the `__cli_smoke__` provider
+// row and the cooldown replay run (cliagent_smoke.go). It answers the same
+// question the card does, from the same probe — `opencode models` — and applies
+// the same fail-open rule: only a CONCLUSIVE "no usable provider" is a negative,
+// because OpenCode has no login of its own and a local-model install with no
+// credential anywhere is perfectly usable.
+//
+// It reads and writes NOTHING shared: not the readiness TTL cache, not
+// openCodeForceProbe, not openCodeLastProviders. A smoke must not mint a second
+// "account" for the install, consume a user's armed Refresh, or decide auth from
+// a pre-update answer.
+//
+// The provider row's seam passes only a path, so `home` is resolved here.
+func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bool) {
+	// The cooldown replay has no run directory of its own, so make one: the
+	// pre-check must answer for the same configuration the smoke it is replaying
+	// measured, not for whatever project the agent happens to be sitting in. A
+	// directory we cannot create degrades to the process cwd rather than failing
+	// the replay.
+	dir, err := newOpenCodeSmokeRunDir()
+	if err == nil {
+		defer func() { _ = os.RemoveAll(dir) }()
+	} else {
+		dir = ""
+	}
+	return openCodeSmokeLoggedInDir(ctx, path, dir)
+}
+
+// openCodeSmokeLoggedInDir is openCodeSmokeLoggedIn with the caller's isolated
+// working directory. runOpenCodeSmoke passes the per-run empty cwd it is about to
+// spend the turn in: OpenCode resolves a project `opencode.json` upward from cwd,
+// so probing elsewhere lets a provider that is configured only in the agent's own
+// project pass the pre-check and then fail the turn — and lets a project override
+// report a premature not_logged_in.
+func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool) {
+	if strings.TrimSpace(path) == "" {
+		return false, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	readiness := probeOpenCodeReadinessUncached(ctx, path, home, dir)
+	switch {
+	case readiness.AuthState == openCodeAuthUnauthenticated && readiness.Conclusive:
+		return false, true
+	case readiness.AuthState == openCodeAuthReady:
+		return true, true
+	}
+	// Inconclusive (timeout, unrecognized output, non-zero exit): proceed.
+	return false, false
 }
 
 // parseOpenCodeModelList extracts model identifiers from `opencode models`.

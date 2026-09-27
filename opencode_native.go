@@ -47,6 +47,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,9 +88,6 @@ const (
 	// CreateProcess argv ceiling does not apply. This cap exists only so a
 	// runaway caller cannot ask the device to buffer an unbounded prompt.
 	openCodeNativeMaxPromptBytes = 1024 * 1024
-	// Cache capability probes so Start does not spawn `opencode --version` on
-	// every chat open. Invalidated after this TTL or when a probe fails.
-	openCodeCapabilityCacheTTL = 5 * time.Minute
 	// GCP Pub/Sub documented per-message publish ceiling. Authoritative gate
 	// after marshaling the resultMsg envelope (JSON escaping can inflate a
 	// frame that already fits openCodeNativeMaxFrameBytes).
@@ -449,11 +447,17 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 		return m.publishTurnError(session, publishFn, "OpenCode turn timed out")
 	}
 
-	// Exact-id resume failed with a recognized missing/stale session. Require a
-	// non-zero exit so ordinary assistant text mentioning "session not found"
-	// cannot trigger a costly false-positive replay. At most ONE replay per turn.
+	// Exact-id resume failed: either the CLI reported a recognized missing/stale
+	// session, or it REFUSED `--session` during option parsing (a build that
+	// does not know the flag). Both are repaired the same way — clear the
+	// unusable native id, rebuild the prompt with buildOpenCodeReplayPrompt and
+	// run the no-session rung — rather than by a bare retry, which would
+	// silently start a fresh conversation. Require a non-zero exit so ordinary
+	// assistant text mentioning "session not found" cannot trigger a costly
+	// false-positive replay. At most ONE replay per turn.
 	if useNativeResume && result.exitCode != 0 &&
-		looksLikeMissingOpenCodeSession(result.rawStdout, result.stderr) {
+		(looksLikeMissingOpenCodeSession(result.rawStdout, result.stderr) ||
+			openCodeRejectedSessionFlag(result.rawStdout, result.stderr)) {
 		fmt.Printf("%s[opencode-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeSessionID = ""
@@ -642,16 +646,28 @@ func (m *OpenCodeNativeManager) runOneShot(
 		_ = os.Remove(promptPath)
 	}()
 
-	args := buildOpenCodeNativeArgs(nativeID)
-	cmd := exec.Command(executable, args...)
+	// One launcher for every OpenCode spawn (opencode_argv.go): a native binary
+	// directly, a Windows `.cmd` / `.bat` npm shim through cmd.exe. A direct
+	// spawn of a shim fails in CreateProcess, which is why an npm-installed
+	// OpenCode could not start a turn at all on Windows.
+	shape := openCodeShapeForResume(nativeID)
+	args := buildOpenCodeRunArgs(shape, nativeID)
+	cmd, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
+		Path:       executable,
+		Args:       args,
+		Env:        sanitizeOpenCodeEnv(os.Environ()),
+		Dir:        runDir,
+		PromptFile: promptPath,
+		Stdin:      promptFile,
+	})
+	if launchErr != nil {
+		return openCodeRunResult{err: fmt.Errorf("could not launch opencode: %w", launchErr)}
+	}
 	// Setsid on unix (hides the console window on Windows) so the child becomes
 	// its own process-group leader. A tool `opencode` spawns can outlive it and
 	// keep the stdout/stderr pipes open past the timeout; because the unix
 	// orphan scanner is a no-op, cancel/timeout must reap the whole group.
 	detachControllingTTY(cmd)
-	cmd.Dir = runDir
-	cmd.Env = sanitizeOpenCodeEnv(os.Environ())
-	cmd.Stdin = promptFile
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1265,87 +1281,8 @@ func openCodeNativeEnvelopePublishable(msg resultMsg) error {
 }
 
 /* --------------------------------------------------------------------------
-   Arg / env builders
+   Env builder — the argv contract lives in opencode_argv.go
    -------------------------------------------------------------------------- */
-
-// openCodeStrippedFlags are caller-supplied flags the manager always removes.
-//
-//   - --format / --print-logs would flip the child out of the JSON mode this
-//     driver's parser depends on, producing an unrenderable turn.
-//   - --session / --continue / --fork would re-point the conversation at
-//     something other than the session the cloud reserved, letting a caller
-//     read or extend a chat that is not theirs.
-//
-// The manager owns these positions; everything it does NOT own is forwarded.
-var openCodeStrippedFlags = map[string]bool{
-	"--format":     true,
-	"-f":           true,
-	"--session":    true,
-	"-s":           true,
-	"--continue":   true,
-	"-c":           true,
-	"--fork":       true,
-	"--print-logs": true,
-}
-
-// openCodeValuedStrippedFlags are the stripped flags that consume the NEXT argv
-// token as their value, so removing the flag must also remove its value (a
-// dangling `json` would otherwise land as a positional prompt token).
-var openCodeValuedStrippedFlags = map[string]bool{
-	"--format":  true,
-	"-f":        true,
-	"--session": true,
-	"-s":        true,
-	"--fork":    true,
-}
-
-// buildOpenCodeNativeArgs builds argv for one native-chat turn.
-//
-// `run` and `--format json` are ALWAYS forced. The prompt is never on argv — it
-// arrives on stdin from a temp file (see runOneShot) — so a bare `opencode`
-// cannot fall through to the interactive TUI, which on a headless remote
-// session emits escape-sequence noise and never exits.
-func buildOpenCodeNativeArgs(nativeSessionID string) []string {
-	args := []string{"run", "--format", "json"}
-	if nativeSessionID != "" {
-		// Exact-id resume only — never --continue, which resumes whatever the
-		// user last ran globally, including in their own local TUI.
-		args = append(args, "--session", nativeSessionID)
-	}
-	return args
-}
-
-// normalizeOpenCodeCallerArgs strips manager-owned flags from a caller-supplied
-// argv and returns what is safe to forward (e.g. `--model`, `--agent`).
-// Exported shape mirrors terminal-service's normalizeOpenCodeArgs so the two
-// ends of the wire agree on which flags a caller may set.
-func normalizeOpenCodeCallerArgs(args []string) []string {
-	out := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		name := a
-		hasInlineValue := false
-		if idx := strings.Index(a, "="); idx > 0 {
-			name = a[:idx]
-			hasInlineValue = true
-		}
-		if openCodeStrippedFlags[name] {
-			// `--flag=value` carries its value inline; the separate-value form
-			// consumes the next token as well.
-			if !hasInlineValue && openCodeValuedStrippedFlags[name] {
-				i++
-			}
-			continue
-		}
-		// A bare `run` from the caller is already forced by the manager; a
-		// second one would be parsed as prompt text.
-		if a == "run" && len(out) == 0 {
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
-}
 
 // sanitizeOpenCodeEnv strips unrelated provider credentials and nested-IDE
 // markers that might otherwise leak into the child or the tools it spawns.
@@ -1442,9 +1379,17 @@ func writeOpenCodePromptFile(prompt string) (path string, handle *os.File, err e
    -------------------------------------------------------------------------- */
 
 // Capability probe cache — avoids spawning `opencode --version` on every Start.
+//
+// The POSITIVE half is keyed on the binary itself (path, mtime, size), not on a
+// wall-clock TTL: a version is a pure function of the bytes, and a binary
+// replaced mid-window must never keep the previous build's resume capability and
+// be handed a `--session` it does not support. The NEGATIVE half keeps a short
+// time window so installing or fixing opencode recovers quickly.
 var (
 	openCodeCapabilityMu       sync.Mutex
 	openCodeCapabilityOK       bool
+	openCodeCapabilityKey      cliSmokeShapeKey
+	openCodeCapabilityKeyKnown bool
 	openCodeCapabilityChecked  time.Time
 	openCodeCapabilityErr      error
 	openCodeCapabilityResumeOK bool
@@ -1467,7 +1412,8 @@ func resolveOpenCodeExecutable() string {
 func probeOpenCodeNativeCapability() error {
 	openCodeCapabilityMu.Lock()
 	defer openCodeCapabilityMu.Unlock()
-	if openCodeCapabilityOK && time.Since(openCodeCapabilityChecked) < openCodeCapabilityCacheTTL {
+	key, keyKnown := cliSmokeShapeKeyFor(resolveOpenCodeExecutable())
+	if openCodeCapabilityOK && keyKnown && openCodeCapabilityKeyKnown && openCodeCapabilityKey == key {
 		return nil
 	}
 	// Negative cache is short-lived so installing/auth-fixing opencode recovers
@@ -1479,6 +1425,7 @@ func probeOpenCodeNativeCapability() error {
 
 	version, err := probeOpenCodeVersionUncached()
 	openCodeCapabilityChecked = time.Now()
+	openCodeCapabilityKey, openCodeCapabilityKeyKnown = key, keyKnown
 	if err != nil {
 		openCodeCapabilityOK = false
 		openCodeCapabilityErr = err
@@ -1499,14 +1446,18 @@ func probeOpenCodeNativeCapability() error {
 // error (native chat cannot run); a binary that succeeds but prints something
 // unparseable returns ("", nil) — usable, but resume stays disabled.
 func probeOpenCodeVersionUncached() (string, error) {
-	executable := resolveOpenCodeExecutable()
-	cmd := exec.Command(executable, "--version")
-	hideWindow(cmd)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	// openCodeProbeVersion is the ONE OpenCode version probe: shim-aware, and
+	// cached on (path, mtime, size) — the same key gatherCLIAgents and the
+	// maintenance smoke use. A plain exec.Command here answered "" for an npm
+	// `opencode.cmd` shim and cached that negative under the shared key, so
+	// every later probe read it back and reported the CLI as unrunnable.
+	raw := openCodeProbeVersion(resolveOpenCodeExecutable())
+	if raw == "" {
 		return "", fmt.Errorf("OpenCode CLI not found or not runnable: install opencode (>= %s for session resume)", openCodeNativeMinVersion)
 	}
-	return parseOpenCodeVersion(string(out)), nil
+	// A binary that answered but printed something unparseable is USABLE; only
+	// resume stays disabled (see probeOpenCodeNativeCapability).
+	return parseOpenCodeVersion(raw), nil
 }
 
 // parseOpenCodeVersion extracts a major.minor.patch triple from `opencode
@@ -1554,6 +1505,8 @@ func resetOpenCodeCapabilityCache() {
 	openCodeCapabilityErr = nil
 	openCodeCapabilityChecked = time.Time{}
 	openCodeCapabilityResumeOK = false
+	openCodeCapabilityKey = cliSmokeShapeKey{}
+	openCodeCapabilityKeyKnown = false
 	openCodeCapabilityMu.Unlock()
 }
 
@@ -1756,6 +1709,45 @@ func isOpenCodeNativeCommand(t string) bool {
 	switch t {
 	case "opencode_native_start", "opencode_native_send", "opencode_native_end":
 		return true
+	}
+	return false
+}
+
+// openCodeRejectedSessionFlag reports whether the child refused `--session`
+// during OPTION PARSING — a build that does not know the flag — as opposed to
+// accepting it and reporting the session gone. Both need the same repair, but
+// only the missing/stale case is visible to looksLikeMissingOpenCodeSession, so
+// without this an unsupported `--session` surfaced as an opaque non-zero exit
+// and the turn's context was lost instead of replayed.
+//
+// BOTH streams are read, exactly as looksLikeMissingOpenCodeSession does and for
+// the same reason: `opencode` reports a bad `--session` as a plain line on
+// STDOUT rather than as a JSON event, so a build that puts session errors there
+// will put its option-parse errors there too. Reading stderr alone left the
+// repair silently inert on the very case it exists for.
+//
+// Each stream is judged ON ITS OWN and only inside its parser-error region — the
+// same split openCodeSmokeNoEnvelopeDiagnostic already makes over the same text:
+//
+//   - JSON stdout frames are dropped (openCodeStdoutPlainLines). A documented
+//     event is never a parser error, and model text may quote `--session`.
+//   - the usage/help block a CLI appends after an option error is dropped
+//     (openCodeStderrErrorRegion). That block lists `--session` whatever was
+//     actually refused, so `unknown option '--format'` followed by usage read as
+//     a rejected `--session`: the recovery cleared a native id the CLI had
+//     ACCEPTED and replayed the bounded transcript, truncating older context.
+//   - needle and rejection must sit in the SAME region, so neither stream can
+//     borrow the other's evidence.
+//
+// The rejection needles are shared with the maintenance smoke's classifier
+// (openCodeOptionRejectionText), and the text is read only to pick between our
+// own constants.
+func openCodeRejectedSessionFlag(stdout, stderr string) bool {
+	for _, stream := range []string{openCodeStdoutPlainLines([]byte(stdout)), stderr} {
+		region := openCodeStderrErrorRegion(strings.ToLower(stream))
+		if strings.Contains(region, "--session") && openCodeOptionRejectionText(region) {
+			return true
+		}
 	}
 	return false
 }

@@ -444,3 +444,28 @@ func TestGatherCLIAgents_CodexShimAnswersThroughTheSmokesProbe(t *testing.T) {
 		t.Fatalf("smoke precheck after gather = %q, want the cached shim version", got)
 	}
 }
+
+// OpenCode goes through its shim-aware probe for the same reason Codex does:
+// the "" a plain spawn of an npm `opencode.cmd` produced landed under the
+// shared key the smoke precheck and native capability check read.
+func TestGatherCLIAgents_OpenCodeShimAnswersThroughTheSmokesProbe(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("a .cmd batch shim only exists on Windows")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "opencode.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\nif \"%~1\"==\"--version\" echo 9.9.9\r\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	agents := gatherCLIAgents()
+	if got := agents["opencode"]; !strings.EqualFold(got.Path, shim) || got.Version != "9.9.9" {
+		t.Fatalf("gatherCLIAgents opencode = %+v, want the shim's path and version", got)
+	}
+	if got := openCodeProbeVersion(agents["opencode"].Path); got != "9.9.9" {
+		t.Fatalf("smoke precheck after gather = %q, want the cached shim version", got)
+	}
+}

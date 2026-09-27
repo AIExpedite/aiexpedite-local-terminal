@@ -7,13 +7,14 @@
 // upgrade to prove the binary can still complete a round trip. The probes live
 // HERE, in this process, because it is the only component that knows the
 // resolved binary path, the sanitized child env, and the flag shape that
-// actually works for each CLI (claude_argv.go, grok_argv.go,
+// actually works for each CLI (claude_argv.go, grok_argv.go, opencode_argv.go,
 // cliagent_smoke_codex.go).
 //
 // Per-provider probes:
 //   - claudeCode → cliagent_smoke_claudecode.go (runClaudeCodeSmoke)
 //   - grok       → cliagent_smoke_grok.go       (runGrokSmoke)
 //   - codex      → cliagent_smoke_codex.go      (runCodexSmoke)
+//   - opencode   → cliagent_smoke_opencode.go   (runOpenCodeSmoke)
 //
 // Cost discipline — a smoke spends ONE real inference turn against the user's
 // own subscription window, the same quota the CLI Agents tab reports:
@@ -83,7 +84,8 @@ const (
 // Every value here is a compile-time constant chosen by our own classifiers;
 // nothing derived from the child's bytes ever reaches the wire — or the log
 // (see claudeSmokeFailureLogLine / grokSmokeFailureLogLine /
-// codexSmokeFailureLogLine, which cannot even accept text).
+// codexSmokeFailureLogLine / openCodeSmokeFailureLogLine, which cannot even
+// accept text).
 const (
 	cliSmokeDiagnosticNone = "" // success, or nothing further to say
 	// The CLI rejected one of OUR flags — the one failure that is safe to
@@ -107,6 +109,13 @@ const (
 	cliSmokeDiagnosticMarkerMismatch = "marker_mismatch"
 	// Our per-attempt deadline killed the child.
 	cliSmokeDiagnosticTimeout = "timeout"
+	// The child could not be STARTED: CreateProcess refused a `.cmd` / `.bat`
+	// npm shim, a shim command line could not be rendered, a prompt file or an
+	// isolated cwd could not be staged. Deliberately distinct from
+	// `no_envelope`, which now means exactly "the child ran and never produced
+	// its documented envelope" — folding a spawn failure into it is the fused
+	// bucket the OpenCode smoke regression was reported as. No turn was spent.
+	cliSmokeDiagnosticLaunchError = "launch_error"
 	// Pre-check failures — no turn was spent.
 	cliSmokeDiagnosticBinaryMissing = "binary_missing"
 	cliSmokeDiagnosticNotLoggedIn   = "not_logged_in"
@@ -381,6 +390,12 @@ var cliSmokeProviders = map[string]cliSmokeProvider{
 		loggedIn:     codexSmokeLoginCheck,
 		run:          runCodexSmoke,
 	},
+	"opencode": {
+		resolvePath:  func() string { return resolveOpenCodeSmokePath() },
+		probeVersion: openCodeProbeVersion,
+		loggedIn:     openCodeSmokeLoggedIn,
+		run:          runOpenCodeSmoke,
+	},
 }
 
 // runCLISmoke is the entry point the `__cli_smoke__` handler calls. It resolves
@@ -539,6 +554,10 @@ func cliSmokeVerdictSpentTurn(result cliSmokeResult) bool {
 	case cliSmokeDiagnosticBinaryMissing,
 		cliSmokeDiagnosticNotLoggedIn,
 		cliSmokeDiagnosticAuthError,
+		// The child never started, so nothing was inferred. Pinning it would
+		// keep reporting a broken CLI across exactly the repair (a reinstall
+		// that replaces a broken shim) it is meant to notice.
+		cliSmokeDiagnosticLaunchError,
 		cliSmokeDiagnosticInternal:
 		return false
 	}

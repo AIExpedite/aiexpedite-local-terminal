@@ -38,8 +38,8 @@ func TestIsOpenCodeNativeCommand(t *testing.T) {
    Argv builder
    -------------------------------------------------------------------------- */
 
-func TestBuildOpenCodeNativeArgs_AlwaysForcesJSONRun(t *testing.T) {
-	args := buildOpenCodeNativeArgs("")
+func TestBuildOpenCodeRunArgs_AlwaysForcesJSONRun(t *testing.T) {
+	args := buildOpenCodeRunArgs(openCodeShapeForResume(""), "")
 	want := []string{"run", "--format", "json"}
 	if len(args) != len(want) {
 		t.Fatalf("expected exactly %v, got %#v", want, args)
@@ -51,8 +51,8 @@ func TestBuildOpenCodeNativeArgs_AlwaysForcesJSONRun(t *testing.T) {
 	}
 }
 
-func TestBuildOpenCodeNativeArgs_ExactSessionResumeNeverContinue(t *testing.T) {
-	args := buildOpenCodeNativeArgs("ses_abc123")
+func TestBuildOpenCodeRunArgs_ExactSessionResumeNeverContinue(t *testing.T) {
+	args := buildOpenCodeRunArgs(openCodeShapeForResume("ses_abc123"), "ses_abc123")
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--session ses_abc123") {
 		t.Fatalf("expected adjacent --session <id>, got %q", joined)
@@ -66,10 +66,10 @@ func TestBuildOpenCodeNativeArgs_ExactSessionResumeNeverContinue(t *testing.T) {
 	}
 }
 
-func TestBuildOpenCodeNativeArgs_NeverCarriesThePrompt(t *testing.T) {
+func TestBuildOpenCodeRunArgs_NeverCarriesThePrompt(t *testing.T) {
 	// The prompt goes to a temp file consumed on stdin. A prompt on argv would
 	// be visible in a process listing and subject to the CreateProcess ceiling.
-	args := buildOpenCodeNativeArgs("ses_1")
+	args := buildOpenCodeRunArgs(openCodeShapeForResume("ses_1"), "ses_1")
 	for _, a := range args {
 		if len(a) > 64 {
 			t.Fatalf("suspiciously long argv token — is the prompt on argv? %#v", args)
@@ -77,7 +77,12 @@ func TestBuildOpenCodeNativeArgs_NeverCarriesThePrompt(t *testing.T) {
 	}
 }
 
-func TestNormalizeOpenCodeCallerArgs_StripsManagerOwnedFlags(t *testing.T) {
+// The strip policy, asserted against the REAL consumer. It used to be asserted
+// against normalizeOpenCodeCallerArgs, a mirror of terminal-service's own
+// normalizer that no production path called — so the table described a policy
+// nothing shipped. buildOpenCodeInteractiveArgs is what actually shapes a
+// caller's argv, and `want` is the FORWARDED tail after the forced prefix.
+func TestBuildOpenCodeInteractiveArgs_StripsManagerOwnedFlags(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []string
@@ -130,13 +135,18 @@ func TestNormalizeOpenCodeCallerArgs_StripsManagerOwnedFlags(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeOpenCodeCallerArgs(tc.in)
+			shaped, _ := buildOpenCodeInteractiveArgs(tc.in)
+			forced := buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+			if len(shaped) < len(forced) {
+				t.Fatalf("shaped argv %#v is shorter than the forced prefix %#v", shaped, forced)
+			}
+			got := shaped[len(forced):]
 			if len(got) != len(tc.want) {
-				t.Fatalf("want %#v, got %#v", tc.want, got)
+				t.Fatalf("want %#v, got %#v (full %#v)", tc.want, got, shaped)
 			}
 			for i := range tc.want {
 				if got[i] != tc.want[i] {
-					t.Fatalf("arg %d: want %q, got %q (full %#v)", i, tc.want[i], got[i], got)
+					t.Fatalf("arg %d: want %q, got %q (full %#v)", i, tc.want[i], got[i], shaped)
 				}
 			}
 		})
@@ -1269,19 +1279,27 @@ func TestOpenCodeNativeManager_PublishedFramesCarryNoSecrets(t *testing.T) {
 
 // primeOpenCodeCapability marks the `opencode --version` probe satisfied (with
 // native resume available) for one test, and restores the cache afterwards.
-// The surrounding Start tests skip when opencode is absent, which means CI —
-// the only machine that gates merges, and one where it is never installed —
-// exercises none of them. Start's seeding and the completion-frame id are pure
-// registration/publish logic with no dependency on the binary.
+// It serves the tests that inject a session directly and never re-probe — the
+// Send tests below, whose fake shell `opencode` answers a run but not
+// `--version`. A test that actually reaches probeOpenCodeNativeCapability must
+// use installOpenCodeStub instead: the positive cache is keyed on the BINARY
+// (path, mtime, size), so an absent binary — CI, always — yields no key, the
+// primed entry can never be read back, and the probe re-runs for real.
 func primeOpenCodeCapability(t *testing.T) {
 	t.Helper()
+	key, keyKnown := cliSmokeShapeKeyFor(resolveOpenCodeExecutable())
 	openCodeCapabilityMu.Lock()
 	prevOK, prevChecked, prevErr, prevResume := openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK
+	prevKey, prevKeyKnown := openCodeCapabilityKey, openCodeCapabilityKeyKnown
 	openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK = true, time.Now(), nil, true
+	// The positive cache is keyed on the BINARY now, not on a wall clock, so a
+	// primed capability must name the binary it was primed for.
+	openCodeCapabilityKey, openCodeCapabilityKeyKnown = key, keyKnown
 	openCodeCapabilityMu.Unlock()
 	t.Cleanup(func() {
 		openCodeCapabilityMu.Lock()
 		openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK = prevOK, prevChecked, prevErr, prevResume
+		openCodeCapabilityKey, openCodeCapabilityKeyKnown = prevKey, prevKeyKnown
 		openCodeCapabilityMu.Unlock()
 	})
 }
@@ -1363,7 +1381,10 @@ func TestOpenCodeNativeSend_NoConversationIDOnFailedTurn(t *testing.T) {
 }
 
 func TestOpenCodeNativeStart_SeedsResumeSessionID(t *testing.T) {
-	primeOpenCodeCapability(t)
+	// Start probes the binary, so it needs a real one on PATH rather than a
+	// primed cache entry keyed on a binary that does not exist. The stub answers
+	// `--version` above openCodeNativeMinVersion on every platform CI runs.
+	installOpenCodeStub(t)
 	m := NewOpenCodeNativeManager()
 	if err := m.Start("sess-oc-seeded", t.TempDir(), "ws", "uid", "ses-seed-1", nil, nil); err != nil {
 		t.Fatalf("start: %v", err)
@@ -1374,12 +1395,251 @@ func TestOpenCodeNativeStart_SeedsResumeSessionID(t *testing.T) {
 }
 
 func TestOpenCodeNativeStart_EmptySeedStartsFreshSession(t *testing.T) {
-	primeOpenCodeCapability(t)
+	installOpenCodeStub(t)
 	m := NewOpenCodeNativeManager()
 	if err := m.Start("sess-oc-fresh", t.TempDir(), "ws", "uid", "", nil, nil); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	if got := m.Get("sess-oc-fresh").NativeSessionID; got != "" {
 		t.Fatalf("empty seed must leave the session unset, got %q", got)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   The shared launcher, the --session repair, and the capability stamp
+   --------------------------------------------------------------------------
+   Three regressions this path used to carry, each invisible on the other:
+     - runOneShot spawned with a bare exec.Command, which CANNOT start the
+       `opencode.cmd` npm shim Windows installs put on PATH;
+     - a build that REJECTED `--session` during option parsing surfaced as an
+       opaque non-zero exit, so the turn's context was lost instead of replayed;
+     - the capability probe's positive cache was a bare 5-minute TTL, so a binary
+       replaced mid-window kept the previous build's resume capability and was
+       handed a `--session` it did not support.
+   ------------------------------------------------------------------------ */
+
+func TestNewOpenCodeCmd_RoutesAShimPathAndSpawnsANativeOneDirectly(t *testing.T) {
+	native, err := newOpenCodeCmd(nil, openCodeLaunch{
+		Path: filepath.Join(t.TempDir(), "opencode"),
+		Args: buildOpenCodeRunArgs(openCodeRunShapeNoSession, ""),
+		Env:  []string{"PATH=/usr/bin"},
+		Dir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("native launch refused: %v", err)
+	}
+	if strings.Join(native.Args[1:], " ") != "run --format json" {
+		t.Fatalf("native argv = %q", native.Args)
+	}
+	if len(native.Env) != 1 || native.Env[0] != "PATH=/usr/bin" {
+		t.Fatalf("the launch env was not applied: %q", native.Env)
+	}
+
+	// isWindowsShimPath is false off Windows, so a `.cmd` path there is just a
+	// file — the route only diverges where CreateProcess actually refuses.
+	shimPath := filepath.Join(t.TempDir(), "opencode.cmd")
+	cmd, err := newOpenCodeCmd(nil, openCodeLaunch{
+		Path: shimPath,
+		Args: buildOpenCodeRunArgs(openCodeRunShapeNoSession, ""),
+	})
+	if err != nil {
+		t.Fatalf("shim launch refused: %v", err)
+	}
+	// The Windows half of this — that a `.cmd` path takes the cmd.exe route with
+	// every token in the environment — is pinned in
+	// cliagent_smoke_opencode_windows_test.go, which is the only place
+	// SysProcAttr.CmdLine exists.
+	if !isWindowsShimPath(shimPath) && cmd.Path != shimPath {
+		t.Fatalf("off Windows a .cmd path must spawn directly, got %q", cmd.Path)
+	}
+}
+
+func TestOpenCodeRejectedSessionFlag_OnlyAnOptionRejectionNamingSession(t *testing.T) {
+	for _, yes := range []string{
+		"error: unknown option '--session'",
+		"unexpected argument '--session' found",
+		"Error: unrecognized flag --session",
+	} {
+		// Either stream: `opencode` reports a bad `--session` as a plain line on
+		// STDOUT rather than as a JSON event (the reason
+		// looksLikeMissingOpenCodeSession reads both), so a build that does that
+		// will put its option-parse errors there too. Reading stderr alone left
+		// the repair inert on exactly the case it exists for.
+		if !openCodeRejectedSessionFlag("", yes) {
+			t.Errorf("%q on stderr must read as a rejected --session", yes)
+		}
+		if !openCodeRejectedSessionFlag(yes, "") {
+			t.Errorf("%q on stdout must read as a rejected --session", yes)
+		}
+	}
+	for _, no := range []string{
+		"",
+		// The session was GONE, not the flag unknown — looksLikeMissingOpenCodeSession
+		// already covers this, and both repair the same way.
+		"Error: Session not found",
+		// A rejection of a DIFFERENT flag must not clear the native id.
+		"error: unknown option '--variant'",
+		// Assistant prose mentioning the flag is not a rejection.
+		"you could pass --session to resume",
+		// A DIFFERENT flag was refused and the usage block that follows documents
+		// `--session` regardless. Clearing the native id here would replay the
+		// bounded transcript over a resume the CLI had accepted.
+		"error: unknown option '--format'\nUsage: opencode run [--session <ID>] [--format <FORMAT>]\n",
+		// Same, with the usage block written lower-case and indented.
+		"error: unexpected argument '--nope' found\n  usage: opencode run --session <id>\n",
+	} {
+		if openCodeRejectedSessionFlag(no, "") || openCodeRejectedSessionFlag("", no) {
+			t.Errorf("%q must not read as a rejected --session", no)
+		}
+	}
+	// Each stream is judged on its own: evidence may not be borrowed across the
+	// two, because a real CLI writes one error message to one stream and a
+	// cross-stream match is how an unrelated usage block gets read as a rejection.
+	if openCodeRejectedSessionFlag("unknown option", "--session") {
+		t.Error("a needle on one stream and a rejection on the other must not match")
+	}
+	// A JSON stdout frame is the CLI's documented output, never a parser error,
+	// even when the model text inside it quotes both the flag and a rejection.
+	if openCodeRejectedSessionFlag(`{"type":"message","text":"unknown option '--session'"}`, "") {
+		t.Error("a JSON stdout frame quoting a rejection must not match")
+	}
+}
+
+func TestOpenCodeNativeManager_RejectedSessionFlagReplaysExactlyOnce(t *testing.T) {
+	// A build that does not know `--session` must reuse the EXISTING replay
+	// recovery — clear the unusable id, rebuild the prompt with the bounded
+	// transcript, run the no-session rung — not a bare retry, which would
+	// silently start a fresh conversation.
+	installOpenCodeStub(t)
+	runLog := filepath.Join(t.TempDir(), "runs.log")
+	stdinLog := filepath.Join(t.TempDir(), "stdin.txt")
+	t.Setenv("OPENCODE_STUB_RUN_LOG", runLog)
+	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
+	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
+	t.Setenv("OPENCODE_STUB_FIRST_STDERR", "")
+	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", "error: unknown option '--session'\n")
+	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "1")
+	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"text","text":"recovered"}`+"\n")
+
+	m := NewOpenCodeNativeManager()
+	id := "sess-session-flag-rejected"
+	sess := injectOpenCodeSession(t, m, id, t.TempDir())
+	sess.NativeSessionID = "ses_unsupported"
+	sess.Transcript = []openCodeTurn{
+		{Role: "user", Content: "earlier question"},
+		{Role: "assistant", Content: "earlier answer"},
+	}
+
+	var frames []resultMsg
+	if err := m.Send(id, "follow up", func(r resultMsg) { frames = append(frames, r) }, 60*time.Second); err != nil {
+		t.Fatalf("a rejected --session must be repaired by replay: %v", err)
+	}
+
+	logged, _ := os.ReadFile(runLog)
+	if runs := strings.Count(string(logged), "run"); runs != 2 {
+		t.Fatalf("expected exactly one replay retry (2 runs), got %d:\n%s", runs, logged)
+	}
+	if sess.NativeSessionID == "ses_unsupported" {
+		t.Fatal("the unusable native id must be cleared")
+	}
+	// The replay carried the PRIOR TURNS, which is what distinguishes it from a
+	// bare retry that would have started a stateless conversation.
+	replayed, err := os.ReadFile(stdinLog)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	for _, want := range []string{"earlier question", "earlier answer", "follow up"} {
+		if !strings.Contains(string(replayed), want) {
+			t.Fatalf("the replay prompt lost %q:\n%s", want, string(replayed))
+		}
+	}
+	final := frames[len(frames)-1]
+	if !strings.Contains(final.Output, `"replayRecovery":true`) {
+		t.Fatalf("the recovered turn must carry the replay marker: %s", final.Output)
+	}
+}
+
+func TestProbeOpenCodeNativeCapability_CacheIsInvalidatedByABinaryStampChange(t *testing.T) {
+	// Both directions: an upgrade AND a downgrade inside what used to be the
+	// 5-minute TTL. Failing to notice either is what handed a pre-resume build a
+	// `--session` it rejects.
+	binDir := installOpenCodeStub(t)
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	stubPath := filepath.Join(binDir, name)
+
+	t.Setenv("OPENCODE_STUB_VERSION", "0.9.1")
+	if err := probeOpenCodeNativeCapability(); err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if !openCodeSupportsNativeResume() {
+		t.Fatal("0.9.1 is above the resume floor")
+	}
+
+	// Replace the bytes with a build that reports a version BELOW the floor.
+	replaceOpenCodeStubBinary(t, stubPath)
+	t.Setenv("OPENCODE_STUB_VERSION", "0.3.0")
+	resetVersionProbeCache()
+	if err := probeOpenCodeNativeCapability(); err != nil {
+		t.Fatalf("re-probe failed: %v", err)
+	}
+	if openCodeSupportsNativeResume() {
+		t.Fatal("a downgrade inside the old TTL must drop resume capability")
+	}
+
+	// And back up again.
+	replaceOpenCodeStubBinary(t, stubPath)
+	t.Setenv("OPENCODE_STUB_VERSION", "0.9.1")
+	resetVersionProbeCache()
+	if err := probeOpenCodeNativeCapability(); err != nil {
+		t.Fatalf("re-probe failed: %v", err)
+	}
+	if !openCodeSupportsNativeResume() {
+		t.Fatal("an upgrade inside the old TTL must restore resume capability")
+	}
+}
+
+// replaceOpenCodeStubBinary rewrites the installed stub so its (mtime, size)
+// change — the identity the capability cache is keyed on — while keeping it
+// runnable.
+func replaceOpenCodeStubBinary(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read stub: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	// Appending to a Go binary leaves it executable and changes size + mtime.
+	if err := os.WriteFile(path, append(data, byte(len(data)%251)), 0o755); err != nil {
+		t.Fatalf("replace stub: %v", err)
+	}
+}
+
+func TestProbeOpenCodeVersionUncached_RoutesThroughTheSharedProbe(t *testing.T) {
+	// One route, one answer: a plain spawn of `opencode.cmd` would cache its own
+	// "" under the SHARED (path, mtime, size) key, and every later shim-aware
+	// probe — including the smoke's binary_missing pre-check — would read that
+	// negative back.
+	binDir := installOpenCodeStub(t)
+	name := "opencode"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	stubPath := filepath.Join(binDir, name)
+	t.Setenv("OPENCODE_STUB_VERSION", "opencode 0.9.1")
+
+	version, err := probeOpenCodeVersionUncached()
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if version != "0.9.1" {
+		t.Fatalf("parsed version = %q, want 0.9.1", version)
+	}
+	// The shared cache now holds the reading, so the smoke's probe answers from
+	// it without spawning.
+	if raw := openCodeProbeVersion(stubPath); raw != "opencode 0.9.1" {
+		t.Fatalf("openCodeProbeVersion = %q, want the cached raw line", raw)
 	}
 }

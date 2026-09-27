@@ -4145,7 +4145,7 @@ func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
 	writeDone := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
-		session.armCodexUsageRunOnLateWrite(writeDone)
+		session.finishLateStdinWrite(writeDone)
 		close(done)
 	}()
 	writeDone <- nil
@@ -4165,7 +4165,7 @@ func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
 	session.codexUsageFloorMs.Store(0)
 	late := make(chan error, 1)
 	late <- nil
-	session.armCodexUsageRunOnLateWrite(late)
+	session.finishLateStdinWrite(late)
 	if started, settled = rec.counts(); started != 2 || settled != 1 {
 		t.Fatalf("started=%d settled=%d, want the post-exit write armed and settled once", started, settled)
 	}
@@ -4188,7 +4188,7 @@ func TestSendInputLateStdinWrite_ClosesDeferredStdin(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	writeDone <- nil
-	session.armCodexUsageRunOnLateWrite(writeDone)
+	session.finishLateStdinWrite(writeDone)
 
 	if got := stdin.closes(); got != 1 {
 		t.Fatalf("stdin closed %d times, want the late write to close it once", got)
@@ -4220,13 +4220,44 @@ func TestSendInputLateStdinWrite_KeepsDeferredStdinOpenOnFailure(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	writeDone <- errors.New("broken pipe")
-	session.armCodexUsageRunOnLateWrite(writeDone)
+	session.finishLateStdinWrite(writeDone)
 
 	if got := stdin.closes(); got != 0 {
 		t.Fatalf("stdin closed %d times, want an undelivered prompt to leave it open", got)
 	}
 	if !session.deferredStdinClose {
 		t.Fatal("deferredStdinClose cleared for a write that never landed")
+	}
+}
+
+// A promptless OpenCode session holds its stdin open for its first SendInput,
+// and `opencode run` reads stdin to EOF before running the turn. When that first
+// write outlasts SendInput's ten-second wait and then lands, the late writer owes
+// the EOF — this used to run for codex only, so an OpenCode prompt could reach
+// the child while the pipe stayed open and the session hung until its overall
+// timeout. No codex usage accounting may follow for a non-codex command.
+func TestSendInputLateStdinWrite_ClosesDeferredOpenCodeStdin(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	stdin := &countingWriteCloser{}
+	session := &CLISession{
+		Command:            "opencode",
+		done:               make(chan struct{}),
+		Stdin:              stdin,
+		deferredStdinClose: true,
+	}
+
+	writeDone := make(chan error, 1)
+	writeDone <- nil
+	session.finishLateStdinWrite(writeDone)
+
+	if got := stdin.closes(); got != 1 {
+		t.Fatalf("stdin closed %d times, want the late OpenCode write to close it once", got)
+	}
+	if session.deferredStdinClose {
+		t.Fatal("deferredStdinClose still set; a later SendInput would double-close")
+	}
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want codex usage accounting untouched by an OpenCode session", started, settled)
 	}
 }
 
@@ -4259,13 +4290,123 @@ func TestSendInputLateStdinWrite_IgnoresAFailedOrAbandonedWrite(t *testing.T) {
 	failed := &CLISession{Command: "codex", done: make(chan struct{})}
 	writeDone := make(chan error, 1)
 	writeDone <- errors.New("broken pipe")
-	failed.armCodexUsageRunOnLateWrite(writeDone)
+	failed.finishLateStdinWrite(writeDone)
 
 	abandoned := &CLISession{Command: "codex", done: make(chan struct{})}
 	close(abandoned.done)
-	abandoned.armCodexUsageRunOnLateWrite(make(chan error, 1))
+	abandoned.finishLateStdinWrite(make(chan error, 1))
 
 	if started, settled := rec.counts(); started != 0 || settled != 0 {
 		t.Fatalf("started=%d settled=%d, want no run for an undelivered prompt", started, settled)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   OpenCode stdin contract
+   --------------------------------------------------------------------------
+   The legacy session_start / PTY path used to carry the OpenCode prompt as a
+   trailing POSITIONAL, which made it subject to the Windows CreateProcess ~32KB
+   command-line ceiling (guarded by a 24 KiB pre-spawn refusal) and put a
+   maintenance smoke's marker nonce in a process listing any local user can read.
+   It now travels on stdin like codex's, which means three things must line up —
+   and each fails silently on its own.
+   ------------------------------------------------------------------------ */
+
+func TestBuildInteractiveCLIArgs_OpenCodePromptTravelsOnStdin(t *testing.T) {
+	args, stdinPrompt := buildInteractiveCLIArgs("opencode",
+		[]string{"--model", "anthropic/claude-sonnet-4-5", "implement the feature"}, false)
+
+	want := []string{"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5"}
+	if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("argv = %q, want %q", args, want)
+	}
+	if stdinPrompt == nil {
+		t.Fatal("the prompt must be returned for the stdin transport, got nil")
+	}
+	if *stdinPrompt != "implement the feature" {
+		t.Fatalf("stdinPrompt = %q", *stdinPrompt)
+	}
+	for _, a := range args {
+		if a == *stdinPrompt {
+			t.Fatalf("the prompt reached argv: %q", args)
+		}
+	}
+	// An absolute path follows the same policy — commandBaseName resolution is
+	// what keeps the argv shaping and the stdin policy in lockstep.
+	if _, prompt := buildInteractiveCLIArgs("/opt/bin/opencode", []string{"do it"}, false); prompt == nil {
+		t.Error("an absolute opencode path must also route its prompt to stdin")
+	}
+	// A promptless start (the chat-direct flow opens the session on model
+	// selection and sends the first message later) yields no stdin prompt.
+	if _, prompt := buildInteractiveCLIArgs("opencode", []string{"--model", "m/x"}, false); prompt != nil {
+		t.Errorf("a promptless start must not manufacture a stdin prompt, got %q", *prompt)
+	}
+}
+
+func TestStdinPromptFormat_OpenCodeIsPlainText(t *testing.T) {
+	// `opencode run` parses no framing protocol of its own; a wrapper envelope
+	// would be read as the prompt text.
+	if got := stdinPromptFormat("opencode"); got != "plain" {
+		t.Fatalf("stdinPromptFormat(opencode) = %q, want \"plain\"", got)
+	}
+	if !isOneShotStdinPromptFormat(stdinPromptFormat("opencode")) {
+		t.Error("opencode must be classified as a one-shot stdin-fed CLI")
+	}
+}
+
+func TestShouldCloseStdinAfterStart_OpenCodeFollowsThePrompt(t *testing.T) {
+	prompt := "implement the feature"
+	// WITH a prompt: close right after the write, or `opencode run` waits on an
+	// input stream nothing will close.
+	if !shouldCloseStdinAfterStart("opencode", &prompt) {
+		t.Error("a prompted opencode start must close stdin after the write")
+	}
+	// WITHOUT one: keep the pipe open for the first SendInput. Closing here would
+	// hand the child an immediate EOF with no prompt — the codex v0.140+ failure.
+	if shouldCloseStdinAfterStart("opencode", nil) {
+		t.Error("a promptless opencode start must keep stdin open for SendInput")
+	}
+	if !shouldCloseStdinAfterStart("/opt/bin/opencode", &prompt) {
+		t.Error("an absolute opencode path must follow the same stdin policy")
+	}
+}
+
+func TestBuildInteractiveCLIArgs_OpenCodePromptPastTheOldArgvCeiling(t *testing.T) {
+	// The 24 KiB pre-spawn refusal (openCodeInteractiveMaxPromptBytes) existed
+	// only because the prompt sat on argv. It is deleted with the positional, so
+	// a long review brief must now simply be delivered.
+	long := strings.Repeat("a very long review brief. ", 2000)
+	if len(long) <= 24*1024 {
+		t.Fatalf("the fixture prompt (%d bytes) must exceed the old ceiling", len(long))
+	}
+	args, stdinPrompt := buildInteractiveCLIArgs("opencode", []string{long}, false)
+	if stdinPrompt == nil || *stdinPrompt != long {
+		t.Fatal("the long prompt must survive intact on the stdin transport")
+	}
+	for _, a := range args {
+		if len(a) > 64 {
+			t.Fatalf("a long token reached argv: %q", args)
+		}
+	}
+}
+
+func TestDetectCLITerminalEvent_OpenCodeSharesTheTurnCompletionPredicate(t *testing.T) {
+	// The session stream and the maintenance probe must agree on what "the turn
+	// finished" looks like, or one of them waits forever on a frame the other
+	// already accepted.
+	for _, eventType := range []string{"session.completed", "step.completed", "turn.done", "finish", "session.idle", "step_finish"} {
+		line := `{"type":"` + eventType + `"}`
+		if !detectCLITerminalEvent("opencode", line) {
+			t.Errorf("%q must close an opencode turn", eventType)
+		}
+		if !isOpenCodeTerminalEventType(eventType, "") {
+			t.Errorf("the shared predicate disagrees about %q", eventType)
+		}
+	}
+	for _, eventType := range []string{"text", "session.error", "tool.completed.error"} {
+		line := `{"type":"` + eventType + `"}`
+		if detectCLITerminalEvent("opencode", line) != isOpenCodeTerminalEventType(eventType, "") {
+			t.Errorf("session detection and the shared predicate disagree about %q", eventType)
+		}
 	}
 }
