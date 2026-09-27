@@ -269,6 +269,54 @@ func TestClassifyOpenCodeSmokeRun_MapsEveryOutcomeOntoTheClosedSet(t *testing.T)
 	}
 }
 
+// A completion event whose `message` is a plain STRING must not read as
+// malformed. openCodeEvent (the shared reader) types that field as an object,
+// and OpenCode spells it both ways across releases — so treating the shared
+// reader's decode failure as "broken contract" reported a HEALTHY turn as
+// no_envelope.
+func TestClassifyOpenCodeSmokeRun_AStringMessageFieldIsNotMalformed(t *testing.T) {
+	const marker = "AIEXPEDITE_OPENCODE_SMOKE_OK_0a1b2c3d"
+	const completion = `{"type":"session.completed","message":"done"}`
+	stdout := `{"type":"text","text":"` + marker + `"}` + "\n" + completion + "\n"
+
+	// Guard the premise: the shared reader really does refuse this line, so this
+	// case exercises the divergence rather than a shape both readers accept.
+	if _, _, parsed := parseOpenCodeEventLine(completion); parsed {
+		t.Skip("parseOpenCodeEventLine now tolerates a string `message`; the divergence is gone")
+	}
+
+	category, diagnostic, matched := classifyOpenCodeSmokeRun(false, []byte(stdout), nil, nil, marker)
+	if category != "" || diagnostic != cliSmokeDiagnosticNone || !matched {
+		t.Fatalf("got (%q, %q, %v), want a clean marker success", category, diagnostic, matched)
+	}
+}
+
+// framing_rejected must be named by the FLAG, not by a bare `json` substring:
+// OpenCode prints a usage block on an option error and that block lists
+// `--format json`, so a substring match reported every rejected caller flag as a
+// broken framing contract.
+func TestOpenCodeSmokeNoEnvelopeDiagnostic_UsageBlockDoesNotForgeFramingRejected(t *testing.T) {
+	usage := "error: unexpected argument '--not-a-known-flag' found\n\n" +
+		"Usage: opencode run [OPTIONS] [PROMPT]\n\nOptions:\n" +
+		"      --format <FORMAT>  Output format [possible values: text, json]\n"
+	if got := openCodeSmokeNoEnvelopeDiagnostic([]byte(usage)); got != cliSmokeDiagnosticFlagRejected {
+		t.Fatalf("a rejected caller flag whose usage block mentions json = %q, want flag_rejected", got)
+	}
+	// A genuine refusal of the output contract still reports framing_rejected.
+	for _, stderr := range []string{
+		"error: unknown option '--format'",
+		"error: unrecognized value 'json' for --format",
+	} {
+		if got := openCodeSmokeNoEnvelopeDiagnostic([]byte(stderr)); got != cliSmokeDiagnosticFramingRejected {
+			t.Fatalf("%q = %q, want framing_rejected", stderr, got)
+		}
+	}
+	// And a non-rejection stays no_envelope.
+	if got := openCodeSmokeNoEnvelopeDiagnostic([]byte("panic: nil map")); got != cliSmokeDiagnosticNoEnvelope {
+		t.Fatalf("a non-rejection = %q, want no_envelope", got)
+	}
+}
+
 func TestClassifyOpenCodeSmokeRun_OversizeOutputIsNeverMarkerMatched(t *testing.T) {
 	const marker = "AIEXPEDITE_OPENCODE_SMOKE_OK_0a1b2c3d"
 
@@ -281,17 +329,53 @@ func TestClassifyOpenCodeSmokeRun_OversizeOutputIsNeverMarkerMatched(t *testing.
 		t.Fatalf("oversize frame: got (%q, %q, %v), want no_envelope", category, diagnostic, matched)
 	}
 
-	// Stdout past the retention cap: bytes were dropped, so the accumulated text
-	// is partial and the marker at its end must not be believed.
-	var b strings.Builder
-	for b.Len() <= cliSmokeMaxStdout {
-		b.WriteString(`{"type":"text","text":"` + strings.Repeat("b", 4096) + `"}` + "\n")
+	// Stdout past the retention cap. Driven through the REAL capture buffer the
+	// exec seam uses, not a hand-built oversize slice: boundedBuffer stops AT its
+	// limit, so a detection that summed scanned LINE lengths could never fire on
+	// a genuine capture (newlines are dropped, putting that sum strictly below the
+	// byte total) and the blindness was invisible to a test that fed the
+	// classifier an over-limit slice directly.
+	captured := &boundedBuffer{limit: cliSmokeMaxStdout}
+	for len(captured.Bytes()) < cliSmokeMaxStdout {
+		captured.Write([]byte(`{"type":"text","text":"` + strings.Repeat("b", 4096) + `"}` + "\n"))
 	}
-	b.WriteString(`{"type":"text","text":"` + marker + `"}` + "\n")
-	b.WriteString(`{"type":"session.completed"}` + "\n")
-	category, diagnostic, matched = classifyOpenCodeSmokeRun(false, []byte(b.String()), nil, nil, marker)
+	// The dropped tail is what would otherwise be believed: a marker echo and a
+	// completion event the caller never actually received in full.
+	captured.Write([]byte(`{"type":"text","text":"` + marker + `"}` + "\n"))
+	captured.Write([]byte(`{"type":"session.completed"}` + "\n"))
+	if len(captured.Bytes()) != cliSmokeMaxStdout {
+		t.Fatalf("the capture buffer must stop at its limit, got %d bytes", len(captured.Bytes()))
+	}
+	category, diagnostic, matched = classifyOpenCodeSmokeRun(false, captured.Bytes(), nil, nil, marker)
 	if diagnostic != cliSmokeDiagnosticNoEnvelope || matched {
 		t.Fatalf("stdout cap overflow: got (%q, %q, %v), want no_envelope", category, diagnostic, matched)
+	}
+
+	// The genuinely dangerous shape: a truncated capture whose retained bytes end
+	// in an INTACT marker echo and completion event, so every content check would
+	// read a clean success. The reply was still incomplete, so the marker proves
+	// nothing about this turn and only the truncation signal can refuse it. The
+	// padding ends in a newline so the marker frame really is its own scanned
+	// line rather than being swallowed by a partial one.
+	tail := `{"type":"text","text":"` + marker + `"}` + "\n" + `{"type":"session.completed"}` + "\n"
+	padding := strings.Repeat("x", cliSmokeMaxStdout-len(tail)-1) + "\n"
+	forged := &boundedBuffer{limit: cliSmokeMaxStdout}
+	forged.Write([]byte(padding))
+	forged.Write([]byte(tail))
+	if len(forged.Bytes()) != cliSmokeMaxStdout {
+		t.Fatalf("the forged capture must fill the cap exactly, got %d", len(forged.Bytes()))
+	}
+	// Prove the premise: with the truncation signal ignored, this capture reads
+	// as a clean marker success — which is exactly what must not be published.
+	if stream := parseOpenCodeSmokeStream(forged.Bytes()); !stream.Ended ||
+		strings.TrimSpace(stream.Text) != marker {
+		t.Fatalf("the forged capture must look like a success on content alone "+
+			"(ended=%v text=%q)", stream.Ended, stream.Text)
+	}
+	category, diagnostic, matched = classifyOpenCodeSmokeRun(false, forged.Bytes(), nil, nil, marker)
+	if diagnostic != cliSmokeDiagnosticNoEnvelope || matched {
+		t.Fatalf("a truncated capture ending in the marker: got (%q, %q, %v), want no_envelope",
+			category, diagnostic, matched)
 	}
 }
 
@@ -467,5 +551,26 @@ func TestRunOpenCodeSmoke_ShapeIsRememberedOnlyForTheProbedBinary(t *testing.T) 
 	}
 	if _, cached := cliSmokeRememberedShape(path); cached {
 		t.Error("a shape was filed under the REPLACED binary's key")
+	}
+}
+
+func TestOpenCodeStderrErrorRegion_IsLineAnchored(t *testing.T) {
+	// A `Usage:` LINE opens the help block and everything from it is dropped.
+	got := openCodeStderrErrorRegion("error: unexpected argument '--x'\nusage: opencode run --format json\n")
+	if strings.Contains(got, "--format") {
+		t.Errorf("the usage block survived into the error region: %q", got)
+	}
+	if !strings.Contains(got, "--x") {
+		t.Errorf("the error line was dropped: %q", got)
+	}
+	// Prose mentioning "usage:" mid-line is part of the error, not the help
+	// block, so a genuine framing rejection behind it is still visible.
+	got = openCodeStderrErrorRegion("error: invalid usage: --format needs a value\n")
+	if !strings.Contains(got, "--format") {
+		t.Errorf("a mid-line 'usage:' truncated a real framing rejection: %q", got)
+	}
+	// No usage block at all: the whole text is the error region.
+	if got := openCodeStderrErrorRegion("error: unknown option '--format'"); !strings.Contains(got, "--format") {
+		t.Errorf("stderr without a usage block was truncated: %q", got)
 	}
 }

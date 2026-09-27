@@ -138,6 +138,43 @@ var openCodeMarkerGrammars = map[string]string{
 	"an opaque vendor token":    "zz-Marker.42/xyz",
 }
 
+// The reserved vocabulary is DERIVED from the frozen wire shapes, never
+// re-listed. A hand-maintained copy would go stale the moment a third shape is
+// frozen (or a token leaves one), and a stale vocabulary stops recognising the
+// deployed envelope — letting its tokens reach the ordinary session path, which
+// is the exact bug this feature fixes.
+func TestOpenCodeSmokeReservedTokens_AreDerivedFromTheFrozenWireShapes(t *testing.T) {
+	for _, wire := range openCodeSmokeWireRequests {
+		for _, token := range wire {
+			if !openCodeSmokeReservedTokens[token] {
+				t.Errorf("token %q of frozen wire %q is not in the reserved vocabulary", token, wire)
+			}
+		}
+	}
+	// And nothing beyond them: a wider vocabulary would start promoting ordinary
+	// caller traffic, where a malformed combination fails closed.
+	inWire := map[string]bool{}
+	for _, wire := range openCodeSmokeWireRequests {
+		for _, token := range wire {
+			inWire[token] = true
+		}
+	}
+	for token := range openCodeSmokeReservedTokens {
+		if !inWire[token] {
+			t.Errorf("reserved vocabulary carries %q, which no frozen wire shape contains", token)
+		}
+	}
+	// A shape added later is picked up with no second edit.
+	extended := append(append([][]string{}, openCodeSmokeWireRequests...),
+		[]string{"run", "--strict", "--format", "json"})
+	prev := openCodeSmokeWireRequests
+	openCodeSmokeWireRequests = extended
+	t.Cleanup(func() { openCodeSmokeWireRequests = prev })
+	if !computeOpenCodeSmokeReservedTokens()["--strict"] {
+		t.Error("a newly frozen shape's token was not derived into the vocabulary")
+	}
+}
+
 func TestOpenCodeMaintenanceSmokeRequest_RecognisesBothFrozenShapesAndMutations(t *testing.T) {
 	for grammar, marker := range openCodeMarkerGrammars {
 		prompt := openCodeSmokePromptFor(marker)

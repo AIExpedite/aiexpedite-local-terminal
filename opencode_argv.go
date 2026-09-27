@@ -150,6 +150,40 @@ var openCodeForwardedValuedFlags = map[string]bool{
 	"--host":    true,
 }
 
+// openCodeFlagNameAt splits a caller token into its flag NAME and whether it
+// carried an inline `=value`. One spelling rule, so the strip and forward
+// tables are always consulted with the same key.
+func openCodeFlagNameAt(arg string) (name string, inlineValue bool) {
+	if idx := strings.Index(arg, "="); idx > 0 {
+		return arg[:idx], true
+	}
+	return arg, false
+}
+
+// openCodeStrippedCallerFlagAt reports whether args[i] is a manager-owned flag
+// that must be removed, and the index the caller should resume from (skipping a
+// separate value when the flag consumes one).
+//
+// ONE strip policy, and the single answer to "which flags may a caller set?" —
+// the question terminal-service's own normalizeOpenCodeArgs answers on the other
+// end of the wire, so the two ends stay comparable. The direct and session paths
+// used to carry a hand-copied loop each, which is exactly how two answers to
+// that question drift apart, and a flag stripped on one path but forwarded on
+// the other re-points a conversation at a chat the caller does not own.
+func openCodeStrippedCallerFlagAt(args []string, i int) (resume int, stripped bool) {
+	name, inlineValue := openCodeFlagNameAt(args[i])
+	if !openCodeStrippedFlags[name] {
+		return i, false
+	}
+	// `--flag=value` carries its value inline; the separate-value form consumes
+	// the next token as well (a dangling `json` would otherwise land as a
+	// positional prompt token).
+	if !inlineValue && openCodeValuedStrippedFlags[name] {
+		return i + 1, true
+	}
+	return i, true
+}
+
 // openCodeDiagnosticTokens are invocations that ask OpenCode for information
 // instead of running a prompt. Reshaping any of these into `run` would burn a
 // model call the caller never asked for.
@@ -188,38 +222,6 @@ func isOpenCodeSynthesizedRun(args []string) bool {
 	return len(args) >= 3 && args[0] == "run" && args[1] == "--format" && args[2] == "json"
 }
 
-// normalizeOpenCodeCallerArgs strips manager-owned flags from a caller-supplied
-// argv and returns what is safe to forward (e.g. `--model`, `--agent`).
-// Exported shape mirrors terminal-service's normalizeOpenCodeArgs so the two
-// ends of the wire agree on which flags a caller may set.
-func normalizeOpenCodeCallerArgs(args []string) []string {
-	out := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		name := a
-		hasInlineValue := false
-		if idx := strings.Index(a, "="); idx > 0 {
-			name = a[:idx]
-			hasInlineValue = true
-		}
-		if openCodeStrippedFlags[name] {
-			// `--flag=value` carries its value inline; the separate-value form
-			// consumes the next token as well.
-			if !hasInlineValue && openCodeValuedStrippedFlags[name] {
-				i++
-			}
-			continue
-		}
-		// A bare `run` from the caller is already forced by the manager; a
-		// second one would be parsed as prompt text.
-		if a == "run" && len(out) == 0 {
-			continue
-		}
-		out = append(out, a)
-	}
-	return out
-}
-
 // buildOpenCodeInteractiveArgs shapes a one-shot `opencode` invocation for the
 // legacy session_start / PTY path and returns (argv, stdinPrompt).
 //
@@ -245,19 +247,12 @@ func buildOpenCodeInteractiveArgs(args []string) (cliArgs []string, stdinPrompt 
 	forwarded := make([]string, 0, len(args))
 	var prompt []string
 	for i := 0; i < len(args); i++ {
-		a := args[i]
-		name := a
-		inlineValue := false
-		if idx := strings.Index(a, "="); idx > 0 {
-			name = a[:idx]
-			inlineValue = true
-		}
-		if openCodeStrippedFlags[name] {
-			if !inlineValue && openCodeValuedStrippedFlags[name] {
-				i++
-			}
+		if resume, stripped := openCodeStrippedCallerFlagAt(args, i); stripped {
+			i = resume
 			continue
 		}
+		a := args[i]
+		name, inlineValue := openCodeFlagNameAt(a)
 		if a == "run" && len(forwarded) == 0 && len(prompt) == 0 {
 			// Already forced below; a second `run` parses as prompt text.
 			continue
@@ -383,8 +378,21 @@ var openCodeSmokeWireRequests = [][]string{
 // ordinary session) and BOUNDED by this set: an argv carrying anything outside
 // it — `--model x`, a different subcommand — is never maintenance traffic and
 // passes through untouched.
-var openCodeSmokeReservedTokens = map[string]bool{
-	"run": true, "--pure": true, "--format": true, "json": true,
+// It is DERIVED from openCodeSmokeWireRequests rather than re-listed, so a third
+// frozen shape (or a token leaving one) cannot leave a stale copy behind — a
+// stale vocabulary would stop recognising the deployed envelope and let its
+// tokens reach the ordinary session path, which is the bug this feature exists
+// to fix. Same discipline as computeGrokSmokeRetryableFlags.
+var openCodeSmokeReservedTokens = computeOpenCodeSmokeReservedTokens()
+
+func computeOpenCodeSmokeReservedTokens() map[string]bool {
+	reserved := map[string]bool{}
+	for _, wire := range openCodeSmokeWireRequests {
+		for _, token := range wire {
+			reserved[token] = true
+		}
+	}
+	return reserved
 }
 
 // extractOpenCodeMaintenanceSmokeControl removes the internal control token and

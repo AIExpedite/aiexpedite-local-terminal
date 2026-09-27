@@ -77,7 +77,12 @@ func TestBuildOpenCodeRunArgs_NeverCarriesThePrompt(t *testing.T) {
 	}
 }
 
-func TestNormalizeOpenCodeCallerArgs_StripsManagerOwnedFlags(t *testing.T) {
+// The strip policy, asserted against the REAL consumer. It used to be asserted
+// against normalizeOpenCodeCallerArgs, a mirror of terminal-service's own
+// normalizer that no production path called — so the table described a policy
+// nothing shipped. buildOpenCodeInteractiveArgs is what actually shapes a
+// caller's argv, and `want` is the FORWARDED tail after the forced prefix.
+func TestBuildOpenCodeInteractiveArgs_StripsManagerOwnedFlags(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []string
@@ -130,13 +135,18 @@ func TestNormalizeOpenCodeCallerArgs_StripsManagerOwnedFlags(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := normalizeOpenCodeCallerArgs(tc.in)
+			shaped, _ := buildOpenCodeInteractiveArgs(tc.in)
+			forced := buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+			if len(shaped) < len(forced) {
+				t.Fatalf("shaped argv %#v is shorter than the forced prefix %#v", shaped, forced)
+			}
+			got := shaped[len(forced):]
 			if len(got) != len(tc.want) {
-				t.Fatalf("want %#v, got %#v", tc.want, got)
+				t.Fatalf("want %#v, got %#v (full %#v)", tc.want, got, shaped)
 			}
 			for i := range tc.want {
 				if got[i] != tc.want[i] {
-					t.Fatalf("arg %d: want %q, got %q (full %#v)", i, tc.want[i], got[i], got)
+					t.Fatalf("arg %d: want %q, got %q (full %#v)", i, tc.want[i], got[i], shaped)
 				}
 			}
 		})

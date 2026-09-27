@@ -136,17 +136,23 @@ func TestBuildOpenCodeInteractiveArgs_ForwardsModel(t *testing.T) {
 	}
 }
 
-func TestNormalizeOpenCodeCallerArgs_ForwardsUnknownFlagsAndStripsOwnedOnes(t *testing.T) {
-	// The session path's normalizer answers the same question the interactive
-	// builder does, so the two cannot disagree about which flags a caller owns.
-	got := normalizeOpenCodeCallerArgs([]string{
+func TestBuildOpenCodeInteractiveArgs_ForwardsUnknownFlagsAndStripsOwnedOnes(t *testing.T) {
+	// One strip policy (openCodeStrippedCallerFlagAt): every manager-owned flag
+	// goes with its value, a caller's duplicate `run` is dropped, and an unknown
+	// flag and its value survive untouched.
+	got, prompt := buildOpenCodeInteractiveArgs([]string{
 		"run", "--format", "json", "--session", "ses_x", "--fork", "abc",
 		"--continue", "--print-logs", "--model", openCodeTestModel,
 		"--not-a-known-flag", "someValue",
 	})
-	want := []string{"--model", openCodeTestModel, "--not-a-known-flag", "someValue"}
+	want := []string{"run", "--format", "json", "--model", openCodeTestModel, "--not-a-known-flag"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("normalizeOpenCodeCallerArgs\n got %q\nwant %q", got, want)
+		t.Fatalf("buildOpenCodeInteractiveArgs\n got %q\nwant %q", got, want)
+	}
+	// `someValue` cannot be re-ordered ahead of the prompt (the flag's arity is
+	// unknown), so it lands in the prompt rather than being dropped.
+	if prompt != "someValue" {
+		t.Fatalf("stdin prompt = %q, want the unknown flag's trailing token", prompt)
 	}
 }
 

@@ -1502,7 +1502,12 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   (`openCodeRunShapeResume` → `openCodeRunShapeNoSession`).
 - **Stripped, always:** `--format` / `-f`, `--session` / `-s`, `--continue` /
   `-c`, `--fork`, `--print-logs` and their values (`openCodeStrippedFlags`,
-  unchanged). **Everything else a caller sends is forwarded as-is** — nothing
+  unchanged), decided in ONE place — `openCodeStrippedCallerFlagAt`, the single
+  answer to "which flags may a caller set?" that terminal-service's own
+  `normalizeOpenCodeArgs` answers on the other end of the wire. The direct and
+  session paths used to carry a hand-copied loop each, and a flag stripped on one
+  path but forwarded on the other re-points a conversation at a chat the caller
+  does not own. **Everything else a caller sends is forwarded as-is** — nothing
   tells us whether an unknown option is boolean or consumes the next token, so
   dropping can eat the prompt and keeping can turn a value into prompt text.
   A forwarded flag OpenCode refuses yields `flag_rejected`, a precise diagnostic.
@@ -1580,7 +1585,7 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | Binary absent or `--version` unanswerable | `provider_unavailable` | `binary_missing` |
 | Conclusive "no usable provider" from the readiness probe | `not_authenticated` | `not_logged_in` |
 | Non-zero exit, no terminal frame, stderr shows an option-parsing rejection | `protocol` | `flag_rejected` |
-| …and the rejection names `--format` / `json` | `protocol` | `framing_rejected` |
+| …and the rejection's ERROR REGION names `--format` | `protocol` | `framing_rejected` |
 | Non-zero exit, no terminal frame, no recognizable rejection | `protocol` | `no_envelope` |
 | Clean exit with no terminal frame | `protocol` | `no_envelope` |
 | Malformed/truncated JSON, a frame past `openCodeNativeMaxFrameBytes`, stdout past the 1 MiB retention cap | `protocol` | `no_envelope` |
@@ -1591,9 +1596,29 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | Marker RNG failure | `internal_error` | `internal` |
 
 - `framing_rejected` is **never inferred from silence** — only a positive
-  rejection names it.
-- **Partial text is never matched against the marker**: overflow is recorded as a
-  byte count in the local log line, and the run reports `no_envelope`.
+  rejection names it, and only in the **error region** of stderr
+  (`openCodeStderrErrorRegion`, the text before any `usage:` block). OpenCode
+  prints a usage block after an option error and that block documents
+  `--format <FORMAT> … [possible values: text, json]`, so searching the whole of
+  stderr for `--format` — or worse, a bare `json` — reports every rejected
+  *caller* flag as a broken framing contract, inverting the precise diagnostic
+  this probe exists to provide.
+- **Partial text is never matched against the marker.** The truncation signal is
+  that the capture buffer FILLED (`len(stdout) >= cliSmokeMaxStdout`):
+  `boundedBuffer` stops writing exactly AT its limit, so a filled buffer means
+  the child had more to say than we kept. Summing scanned LINE lengths cannot
+  work — newlines are dropped, putting that sum strictly below the byte total for
+  any multi-line reply — and a truncated capture whose retained bytes end in an
+  intact marker echo plus a completion event would otherwise be published as
+  `markerMatched: true`. Overflow is recorded as a byte count in the local log
+  line and the run reports `no_envelope`.
+- **A shared-reader decode failure is not a malformed frame.** `openCodeEvent`
+  (the reader the resident chat path uses) types `message` as an object, while
+  OpenCode spells it as a plain string in some releases; only the deliberately
+  permissive `openCodeSmokeFrame` decode failing means the line is genuinely
+  broken JSON. Treating the shared reader's refusal as a broken contract reported
+  a healthy turn — one whose completion event carried a string `message` — as
+  `no_envelope`.
 - **The probe never retries** (nothing droppable in its argv). The direct path
   retries once for a rejected `--session` via the **existing replay recovery**
   (`openCodeRejectedSessionFlag` → clear `NativeSessionID`, rebuild with

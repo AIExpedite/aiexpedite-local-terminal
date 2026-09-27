@@ -99,18 +99,24 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 	// the kill still holds the write end, and without a delay Wait would block on
 	// it forever — the per-attempt deadline would bound nothing.
 	cmd.WaitDelay = openCodeSmokeWaitDelay
+	// The deadline must reach the process the probe actually cares about.
+	// exec.CommandContext's own Cancel kills the single child, and the shim
+	// route's kills cmd.exe plus the tree — but an `opencode` TOOL child can
+	// outlive either and keep the captured pipes open past the deadline.
+	// killOpenCodeProcessTree is a superset of both (tree, then the process, then
+	// the unix process group), so overwriting Cancel with it is correct on every
+	// route and replaces a per-attempt watchdog goroutine that double-killed the
+	// shim route. Set before Start, as os/exec requires.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		killOpenCodeProcessTree(cmd)
+		return nil
+	}
 	if err = cmd.Start(); err != nil {
 		return nil, nil, err
 	}
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			killOpenCodeProcessTree(cmd)
-		case <-done:
-		}
-	}()
 	err = cmd.Wait()
 	return outBuf.Bytes(), errBuf.Bytes(), err
 }
@@ -341,26 +347,30 @@ type openCodeSmokeStream struct {
 func parseOpenCodeSmokeStream(stdout []byte) openCodeSmokeStream {
 	var stream openCodeSmokeStream
 	var text strings.Builder
+	// The RETENTION cap is what tells us bytes were dropped, and the only honest
+	// signal is that the capture buffer FILLED: boundedBuffer stops writing
+	// exactly AT its limit, so `len(stdout) >= cliSmokeMaxStdout` means the child
+	// had more to say than we kept. Summing the scanned LINE lengths instead
+	// could never fire — newlines are dropped, so that sum is strictly below the
+	// byte total for any multi-line reply — which left this detection dead on
+	// real captures while a test feeding the classifier directly still passed.
+	if len(stdout) >= cliSmokeMaxStdout {
+		stream.Overflow = true
+	}
 	scanner := bufio.NewScanner(bytes.NewReader(stdout))
 	scanner.Buffer(make([]byte, 0, 64*1024), openCodeNativeMaxFrameBytes)
-	consumed := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		consumed += len(line)
-		if consumed > cliSmokeMaxStdout {
-			// The retention cap dropped bytes, so nothing downstream can claim
-			// to have seen the whole reply.
-			stream.Overflow = true
-			break
-		}
-		if !strings.HasPrefix(line, "{") {
+		if line == "" || !strings.HasPrefix(line, "{") {
+			// A line that is not a JSON object (a banner, an updater notice) is
+			// skipped rather than treated as a protocol failure.
 			continue
 		}
 		frame, ok := parseOpenCodeSmokeFrame(line)
 		if !ok {
+			// This decode is DELIBERATELY permissive (see openCodeSmokeFrame), so
+			// failing it means the line is genuinely broken JSON — a broken
+			// contract rather than noise.
 			stream.Malformed = true
 			continue
 		}
@@ -374,12 +384,14 @@ func parseOpenCodeSmokeStream(stdout []byte) openCodeSmokeStream {
 		if isOpenCodeTerminalEventType(frame.Type) {
 			stream.Ended = true
 		}
-		delta, _, parsed := parseOpenCodeEventLine(line)
-		if !parsed {
-			stream.Malformed = true
-			continue
+		// A line the SHARED reader cannot decode simply carries no assistant
+		// text: openCodeEvent types `message` as an object, while OpenCode spells
+		// it as a plain string in some releases. Treating that as malformed would
+		// report a healthy turn — one whose completion event happened to carry a
+		// string `message` — as no_envelope.
+		if delta, _, parsed := parseOpenCodeEventLine(line); parsed {
+			text.WriteString(delta)
 		}
-		text.WriteString(delta)
 	}
 	if scanner.Err() != nil {
 		// bufio.ErrTooLong (a single event past openCodeNativeMaxFrameBytes) or
@@ -527,6 +539,28 @@ func classifyOpenCodeSmokeRun(timedOut bool, stdout, stderr []byte, runErr error
 	return "", cliSmokeDiagnosticNone, true
 }
 
+// openCodeStderrErrorRegion returns the part of already-lowercased stderr that
+// describes WHAT was refused, dropping the usage/help block a CLI appends after
+// it. Without this split every flag name the usage block happens to document
+// reads as the flag that was rejected.
+//
+// Bounded by construction: it only ever shortens its input, and the caller's
+// stderr is already capped at cliSmokeMaxStderr.
+func openCodeStderrErrorRegion(lower string) string {
+	// Line-anchored, not a substring search: prose such as "error: invalid usage:
+	// --format" is part of the ERROR, while a `Usage: opencode run …` line opens
+	// the help block. Matching "usage:" anywhere would cut the region short and
+	// hide a genuine framing rejection behind it.
+	offset := 0
+	for _, line := range strings.SplitAfter(lower, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "usage") {
+			return lower[:offset]
+		}
+		offset += len(line)
+	}
+	return lower
+}
+
 // openCodeSmokeNoEnvelopeDiagnostic separates the pre-inference failures once a
 // child exited non-zero with no terminal frame:
 //
@@ -542,8 +576,13 @@ func openCodeSmokeNoEnvelopeDiagnostic(stderr []byte) string {
 	if !openCodeOptionRejectionText(lower) {
 		return cliSmokeDiagnosticNoEnvelope
 	}
-	if strings.Contains(lower, "--format") || strings.Contains(lower, "-f ") ||
-		strings.Contains(lower, "json") {
+	// Read the ERROR region only, and match the flag NAME rather than a bare
+	// `json` substring. OpenCode prints a usage block after an option error and
+	// that block lists `--format <FORMAT> … [possible values: text, json]`, so
+	// searching the whole of stderr for either `json` or `--format` reported
+	// every rejected CALLER flag as a broken framing contract — the precise
+	// diagnostic this probe exists to provide, inverted.
+	if strings.Contains(openCodeStderrErrorRegion(lower), "--format") {
 		return cliSmokeDiagnosticFramingRejected
 	}
 	return cliSmokeDiagnosticFlagRejected
