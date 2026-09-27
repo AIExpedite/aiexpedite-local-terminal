@@ -1451,3 +1451,45 @@ func appendCodexRolloutLines(t *testing.T, path string, mtime time.Time, lines .
 		t.Fatalf("chtimes rollout: %v", err)
 	}
 }
+
+// The reconcile reports a ZERO observation from every path that returns before
+// folding the cached reading in — most commonly the steady state where its cursor
+// has consumed every candidate. Held evidence must not be judged "behind" on
+// that: the transaction's authoritative contributor check would decline to create
+// a debt while `stale` stayed false, so nothing released the evidence and every
+// later gather re-took the blocking cache lock for ever.
+func TestNudgeCodexUsageRefresh_CaughtUpReadingReleasesHeldEvidence(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	held := now.Add(-2 * codexForcedReconcileMinInterval)
+	// The live read that already caught up with the held evidence.
+	f.seedPreRunReading(t, held.Add(time.Minute), now)
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry = held.UnixMilli(), "rollout-a"
+	})
+
+	// The reconcile reported nothing at all: no newest, no coverage, and — from an
+	// early return — a zero observation.
+	if nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{}, time.Time{}) {
+		t.Fatal("evidence the cached reading has caught up with must not create a debt")
+	}
+	if snap := f.snapshot(t); snap.PendingRolloutMtimeMs != 0 || snap.PendingRolloutEntry != "" || snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("caught-up evidence was not released: pending=%d entry=%q owed=%d",
+			snap.PendingRolloutMtimeMs, snap.PendingRolloutEntry, snap.RefreshOwedAtMs)
+	}
+
+	// And with the evidence gone the next gather decides off the cheap read alone:
+	// it must never re-take the blocking cross-process lock.
+	prevWait, prevPoll := codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll
+	codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = 2*time.Second, 5*time.Millisecond
+	t.Cleanup(func() { codexRateLimitCacheLockWait, codexRateLimitCacheLockPoll = prevWait, prevPoll })
+	codexRateLimitMu.Lock()
+	defer codexRateLimitMu.Unlock()
+	start := time.Now()
+	if nudgeCodexUsageRefresh(f.home, f.fp, now.Add(codexRefreshNudgeCooldown), codexRolloutNudgeEvidence{}, time.Time{}) {
+		t.Fatal("a released-evidence steady state must arm nothing")
+	}
+	if took := time.Since(start); took > 300*time.Millisecond {
+		t.Fatalf("the nudge waited %s on the wedged cache lock; the release must be once, not every gather", took)
+	}
+}

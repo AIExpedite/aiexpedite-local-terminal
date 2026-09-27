@@ -506,6 +506,22 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 	newestRollout, newestEntry, freshEvidence := codexNudgeRolloutEvidence(view, rollouts.newest, rollouts.newestEntry, heldCovered, now)
 	// A rollout written since the newest observation, still owing telemetry,
 	// settled long enough ago that it is not still being appended to.
+	//
+	// The caller's `observedAt` is what the reconcile REPORTED, and the reconcile
+	// reports zero from every path that returns before folding the cached reading
+	// in — most commonly the steady-state one where the cursor has consumed every
+	// candidate (codexRolloutFallbackBucketsWithProducer's
+	// len(eligibleCandidates) == 0 branch). Judging held evidence on that alone
+	// would call it `behind` for ever even after a live read had caught up: the
+	// transaction's authoritative contributor check would then decline to create a
+	// debt while `stale` stayed false, so nothing released the evidence, and every
+	// later gather re-took the blocking cache lock once the cooldown lapsed —
+	// across restarts included. The cache view is already read here, so folding its
+	// newest contributor observation in costs nothing and makes this cheap read
+	// agree with the transaction it is standing in for.
+	if latest := codexLatestContributorObservation(view.contributors); latest.After(observedAt) {
+		observedAt = latest
+	}
 	behind := !newestRollout.IsZero() && (observedAt.IsZero() || newestRollout.After(observedAt))
 	settled := behind && now.Sub(newestRollout) >= codexForcedReconcileMinInterval
 	// A run of this process that is still going settles itself when it ends.
