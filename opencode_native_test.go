@@ -1279,10 +1279,12 @@ func TestOpenCodeNativeManager_PublishedFramesCarryNoSecrets(t *testing.T) {
 
 // primeOpenCodeCapability marks the `opencode --version` probe satisfied (with
 // native resume available) for one test, and restores the cache afterwards.
-// The surrounding Start tests skip when opencode is absent, which means CI —
-// the only machine that gates merges, and one where it is never installed —
-// exercises none of them. Start's seeding and the completion-frame id are pure
-// registration/publish logic with no dependency on the binary.
+// It serves the tests that inject a session directly and never re-probe — the
+// Send tests below, whose fake shell `opencode` answers a run but not
+// `--version`. A test that actually reaches probeOpenCodeNativeCapability must
+// use installOpenCodeStub instead: the positive cache is keyed on the BINARY
+// (path, mtime, size), so an absent binary — CI, always — yields no key, the
+// primed entry can never be read back, and the probe re-runs for real.
 func primeOpenCodeCapability(t *testing.T) {
 	t.Helper()
 	key, keyKnown := cliSmokeShapeKeyFor(resolveOpenCodeExecutable())
@@ -1379,7 +1381,10 @@ func TestOpenCodeNativeSend_NoConversationIDOnFailedTurn(t *testing.T) {
 }
 
 func TestOpenCodeNativeStart_SeedsResumeSessionID(t *testing.T) {
-	primeOpenCodeCapability(t)
+	// Start probes the binary, so it needs a real one on PATH rather than a
+	// primed cache entry keyed on a binary that does not exist. The stub answers
+	// `--version` above openCodeNativeMinVersion on every platform CI runs.
+	installOpenCodeStub(t)
 	m := NewOpenCodeNativeManager()
 	if err := m.Start("sess-oc-seeded", t.TempDir(), "ws", "uid", "ses-seed-1", nil, nil); err != nil {
 		t.Fatalf("start: %v", err)
@@ -1390,7 +1395,7 @@ func TestOpenCodeNativeStart_SeedsResumeSessionID(t *testing.T) {
 }
 
 func TestOpenCodeNativeStart_EmptySeedStartsFreshSession(t *testing.T) {
-	primeOpenCodeCapability(t)
+	installOpenCodeStub(t)
 	m := NewOpenCodeNativeManager()
 	if err := m.Start("sess-oc-fresh", t.TempDir(), "ws", "uid", "", nil, nil); err != nil {
 		t.Fatalf("start: %v", err)
