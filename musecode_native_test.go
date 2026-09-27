@@ -222,6 +222,13 @@ func TestSplitRedactionCarry(t *testing.T) {
 		{"a dangling credential key waits for its value", "tool output: META_API_KEY=", "tool output: META_", "API_KEY="},
 		{"a partial value is held with its key", "echo api_key: mk-live", "echo ", "api_key: mk-live"},
 		{"a long opaque tail could still grow into a blob", "token is " + strings.Repeat("a", 20), "token is ", strings.Repeat("a", 20)},
+		// A flush boundary inside the label itself: the next frame begins
+		// `KEY=…`, which no per-frame pattern matches on its own.
+		{"a partial credential label is held", "tool output: META_API_", "tool output: META_", "API_"},
+		{"a label cut before its separator is held", "export api_key", "export ", "api_key"},
+		{"a partial token label is held", "access_tok", "access_", "tok"},
+		{"a partial bearer header is held", "Authorization: bea", "", "Authorization: bea"},
+		{"a one-letter label start is held", "cat", "ca", "t"},
 		{"ordinary prose streams straight through", "the plan is ready now", "the plan is ready now", ""},
 		{"a short trailing word is not held back", "thinking", "thinking", ""},
 		// A window that holds nothing BUT the ambiguous tail is exactly what the
@@ -373,6 +380,44 @@ func TestDeltaCoalescer_WholeBufferCredentialLabelIsCarried(t *testing.T) {
 	}
 	if !strings.Contains(joined, "[REDACTED]") {
 		t.Fatalf("the rejoined pair must be masked: %q", joined)
+	}
+}
+
+// A flush boundary that splits the credential LABEL (`META_API_` | `KEY=…`)
+// must not publish either half raw: neither frame matches a per-frame pattern
+// on its own, so the value would reach the cloud complete across the two.
+func TestDeltaCoalescer_SplitCredentialLabelIsNotPublishedRaw(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	c := newDeltaCoalescer(
+		func(text string) string { return text },
+		func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+	)
+	c.add("running tool: META_API_")
+	// Let the 250ms timer fire with the label cut mid-way.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(out)
+		mu.Unlock()
+		if n > 0 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.add("KEY=mk-live-0123456789abcdef\n")
+	c.close()
+
+	mu.Lock()
+	joined := strings.Join(out, "")
+	mu.Unlock()
+	if strings.Contains(joined, "0123456789abcdef") {
+		t.Fatalf("the credential value behind a split label leaked: %q", joined)
+	}
+	if !strings.Contains(joined, "running tool: ") || !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("the safe prefix must stream and the rejoined pair must be masked: %q", joined)
 	}
 }
 

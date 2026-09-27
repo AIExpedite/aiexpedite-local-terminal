@@ -56,6 +56,36 @@ func redactAgentSecrets(s string) string {
 var agentSecretCarryTailPattern = regexp.MustCompile(
 	`(?i)(?:authorization:\s*bearer|api[_-]?key\s*[=:]|token\s*[=:])\s*[A-Za-z0-9._\-]*$`)
 
+// agentSecretLabelPrefixTailPattern matches a trailing PARTIAL credential
+// label — `META_API_`, `api_ke`, `tok`, `authorization: bea` — that a flush
+// boundary cut before its separator. agentSecretCarryTailPattern needs the
+// whole label, and the value's frame then begins `KEY=mk-live-…`, which no
+// per-frame pattern matches either, so the pair would stream out complete
+// across two frames. Unanchored on the left, like the per-frame patterns it
+// feeds (they match `api_key` inside `META_API_KEY`), so even a one-letter
+// `a`/`t` tail is held; the cost is that fragment reaching the cloud one flush
+// later, and it is bounded by the longest label prefix.
+var agentSecretLabelPrefixTailPattern = regexp.MustCompile(`(?i)(?:` +
+	labelPrefixAlternation("a", "p", "i", `[_-]?`, "k", "e", "y", `\s*`) + `|` +
+	labelPrefixAlternation("t", "o", "k", "e", "n", `\s*`) + `|` +
+	labelPrefixAlternation("a", "u", "t", "h", "o", "r", "i", "z", "a", "t", "i", "o", "n", ":", `\s*`, "b", "e", "a", "r", "e") +
+	`)$`)
+
+// labelPrefixAlternation builds a regexp matching any non-empty prefix of the
+// label spelled by atoms (one regexp atom per label character):
+// a(?:p(?:i)?)? for "a", "p", "i".
+func labelPrefixAlternation(atoms ...string) string {
+	out := ""
+	for i := len(atoms) - 1; i >= 0; i-- {
+		if out == "" {
+			out = atoms[i]
+		} else {
+			out = atoms[i] + "(?:" + out + ")?"
+		}
+	}
+	return out
+}
+
 // agentOpaqueBlobCarryTailPattern matches a trailing opaque run long enough to
 // grow into the 80-char blob shape. The 16-char floor is where an unbroken run
 // stops looking like ordinary streamed prose: lower would hold back the tail of
@@ -80,11 +110,17 @@ func splitRedactionCarry(text string) (emit string, carry string) {
 	if text == "" {
 		return "", ""
 	}
+	// The earliest ambiguous tail wins: holding more is always safe, and a
+	// label prefix can sit inside a longer opaque run (`x_META_API_`).
 	idx := -1
-	if loc := agentSecretCarryTailPattern.FindStringIndex(text); loc != nil {
-		idx = loc[0]
-	} else if loc := agentOpaqueBlobCarryTailPattern.FindStringIndex(text); loc != nil {
-		idx = loc[0]
+	for _, re := range []*regexp.Regexp{
+		agentSecretCarryTailPattern,
+		agentSecretLabelPrefixTailPattern,
+		agentOpaqueBlobCarryTailPattern,
+	} {
+		if loc := re.FindStringIndex(text); loc != nil && (idx < 0 || loc[0] < idx) {
+			idx = loc[0]
+		}
 	}
 	// idx == 0 means the ambiguous tail IS the whole buffer — a timer window
 	// that held nothing but `META_API_KEY=`, or nothing but the opaque run that
