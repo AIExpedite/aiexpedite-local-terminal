@@ -75,7 +75,7 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	MinResumeVersion:   museCodeNativeMinVersion,
 	DefaultTurnTimeout: museCodeNativeDefaultTurnTimeout,
 	ResolveExecutable:  resolveMuseCodeExecutable,
-	ProbeVersion:       museCodeProbeVersion,
+	ReadVersion:        readMuseCodeVersionFile,
 	BuildArgs:          buildMuseCodeNativeArgs,
 	ParseEventLine:     parseMuseCodeEventLine,
 	DeltaFrame:         museCodeDeltaFrame,
@@ -115,8 +115,9 @@ func resolveMuseCodeExecutable() string {
 // installed build ("1.4.0-R4302.1"), beside the `muse` shim.
 const museCodeVersionFile = ".muse-version"
 
-// museCodeProbeVersion reports the installed Muse Code version for detection
-// and the capability probe. On a launcher install the version file beside the
+// museCodeProbeVersion reports the installed Muse Code version for CLI
+// detection (the chat manager's capability probe reads the file directly and
+// otherwise spawns its own bounded, uncached probe). On a launcher install the version file beside the
 // shim is authoritative, instant, and changes on every upgrade — unlike the
 // shim itself, whose unchanged (path, mtime, size) would pin a stale or
 // failed `--version` in the shared probe cache. A cold `muse.cmd --version`

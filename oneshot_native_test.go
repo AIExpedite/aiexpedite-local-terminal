@@ -475,3 +475,16 @@ func TestDeltaCoalescer(t *testing.T) {
 		}
 	})
 }
+
+func TestOneShotNative_CachedDetectionFailureDoesNotDisableResume(t *testing.T) {
+	m := installMuseCodeStub(t) // stub `--version` prints 1.4.0; no .muse-version beside it
+	exe := resolveMuseCodeExecutable()
+	// A cold detection probe that timed out is cached as "" under the shared key.
+	cachedProbeVersionFunc(exe, func() string { return "" })
+	if err := m.probeCapability(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.supportsNativeResume() {
+		t.Fatal("the capability probe must run its own --version, not inherit a cached detection failure")
+	}
+}

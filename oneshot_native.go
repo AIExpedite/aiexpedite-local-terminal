@@ -130,9 +130,11 @@ type oneShotNativeSpec struct {
 	DefaultTurnTimeout time.Duration
 	// ResolveExecutable returns the binary to launch.
 	ResolveExecutable func() string
-	// ProbeVersion, when set, returns the installed version ("" = unknown)
-	// for the capability probe instead of spawning `<cli> --version`.
-	ProbeVersion func(executable string) string
+	// ReadVersion, when set, reads the installed version without spawning the
+	// CLI ("" = not available, fall back to a bounded `<cli> --version`).
+	// It must not consult the shared detection cache, which also stores
+	// failures and would pin a cold-start timeout as "no resume".
+	ReadVersion func(executable string) string
 	// BuildArgs returns argv for one turn. nativeID is "" when the turn must
 	// not resume; promptPath is the owner-only prompt file (also on stdin).
 	BuildArgs func(nativeID, promptPath string) []string
@@ -317,7 +319,7 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 	// it would silently start a stateless chat. Fail closed, as
 	// applyCliResumeSeed does on the raw session path.
 	if resumeSessionID != "" && !m.supportsNativeResume() {
-		return fmt.Errorf("conversation resume refused: the installed %s is below %s and cannot resume a session", m.spec.DisplayName, m.spec.MinResumeVersion)
+		return fmt.Errorf("conversation resume refused: the installed %s cannot resume a session; upgrade it to %s or later on this computer", m.spec.DisplayName, m.spec.MinResumeVersion)
 	}
 
 	m.mu.Lock()
@@ -894,7 +896,10 @@ func (c *deltaCoalescer) flushLocked() {
 	}
 	text := c.pending.String()
 	c.pending.Reset()
-	c.emit(c.render(text))
+	// The completion frame still carries the full text if a render fails.
+	if frame := c.render(text); frame != "" {
+		c.emit(frame)
+	}
 }
 
 // close flushes what is buffered and disables the timer path.
@@ -1162,11 +1167,10 @@ func (m *oneShotNativeManager) probeCapability() error {
 func (m *oneShotNativeManager) probeVersionUncached() (string, error) {
 	executable := m.spec.ResolveExecutable()
 	notRunnable := fmt.Errorf("%s CLI not found or not runnable: install it (>= %s for session resume)", m.spec.DisplayName, m.spec.MinResumeVersion)
-	if m.spec.ProbeVersion != nil {
-		if !filepath.IsAbs(executable) {
-			return "", notRunnable
+	if m.spec.ReadVersion != nil && filepath.IsAbs(executable) {
+		if v := m.spec.ReadVersion(executable); v != "" {
+			return parseCLIVersionTriple(v), nil
 		}
-		return parseCLIVersionTriple(m.spec.ProbeVersion(executable)), nil
 	}
 	// Bounded: Start runs this on the Pub/Sub handler goroutine, and a CLI
 	// wrapper that hangs (an update check, a lock) must not wedge it.
