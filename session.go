@@ -458,6 +458,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 				n, openCodeInteractiveMaxPromptBytes)
 		}
 	}
+	// Muse Code's legacy path carries its prompt positionally for the same
+	// reason (buildMuseCodeInteractiveArgs); its chat path uses --prompt-file.
+	if isMuseCodeCommand(command) {
+		if n := argvByteLen(cliArgs); n > openCodeInteractiveMaxPromptBytes {
+			return fmt.Errorf(
+				"muse arguments are %d bytes, exceeding the %d-byte limit for a one-shot session; use a Muse Code chat session for long prompts",
+				n, openCodeInteractiveMaxPromptBytes)
+		}
+	}
 
 	// Opt-in PTY path for recognized resident TUI agents (agy/antigravity) that
 	// require a real terminal. macOS/Linux only — startPTYSession rejects on
@@ -1601,12 +1610,12 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
-	case isOpenCodeCommand(command):
+	case isOpenCodeCommand(command), isMuseCodeCommand(command):
 		// One-shot with the prompt on argv and NO stdin protocol: leaving the
-		// pipe open would hand `opencode run` an input stream it waits on.
-		// Close unconditionally — unlike codex there is no "session opened with
-		// no prompt yet" case here, because this legacy path always carries its
-		// prompt positionally.
+		// pipe open would hand `opencode run` / `muse exec` an input stream it
+		// waits on. Close unconditionally — unlike codex there is no "session
+		// opened with no prompt yet" case here, because this legacy path always
+		// carries its prompt positionally.
 		return true
 	case strings.HasPrefix(base, "codex"):
 		// One-shot, stdin-fed CLIs: close stdin right after start ONLY when a
@@ -1662,6 +1671,12 @@ func detectCLITerminalEvent(command, line string) bool {
 	if isAntigravityCommand(command) {
 		eventType, _ := event["event"].(string)
 		return eventType == "result"
+	}
+	if isMuseCodeCommand(command) {
+		// `muse exec --json` ends every turn with run.terminal.{completed,
+		// failed,cancelled}, right before the one-shot process exits.
+		payloadType, _ := event["payload_type"].(string)
+		return strings.HasPrefix(payloadType, "run.terminal.")
 	}
 
 	eventType, _ := event["type"].(string)
@@ -2615,6 +2630,7 @@ var openCodeUnrelatedStripped = []string{
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	stripClaudeBilling := isClaudeCommand(command)
 	stripOpenCodeUnrelated := isOpenCodeCommand(command)
+	stripMuseCodeUnrelated := isMuseCodeCommand(command)
 
 	filtered := make([]string, 0, len(env))
 	var stripped []string
@@ -2638,6 +2654,14 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 		}
 		if !drop && stripOpenCodeUnrelated {
 			for _, p := range openCodeUnrelatedStripped {
+				if strings.HasPrefix(upper, p) {
+					drop = true
+					break
+				}
+			}
+		}
+		if !drop && stripMuseCodeUnrelated {
+			for _, p := range museCodeUnrelatedStripped {
 				if strings.HasPrefix(upper, p) {
 					drop = true
 					break
@@ -2787,8 +2811,9 @@ func isResidentAgentSessionCommand(command string) bool {
 	// launches the interactive TUI, which on a headless remote session produces
 	// escape-sequence noise and never exits. Classifying it as a resident agent
 	// is what routes it through buildOpenCodeInteractiveArgs, which forces
-	// `run --format json` and can never fall through to the TUI.
-	return isAntigravityCommand(command) || isOpenCodeCommand(command)
+	// `run --format json` and can never fall through to the TUI. Muse Code is
+	// here for the same reason (buildMuseCodeInteractiveArgs forces `exec`).
+	return isAntigravityCommand(command) || isOpenCodeCommand(command) || isMuseCodeCommand(command)
 }
 
 /* --------------------------------------------------------------------------
@@ -2839,6 +2864,8 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 		return buildAntigravityStreamingArgs(args)
 	case isOpenCodeCommand(command):
 		return buildOpenCodeInteractiveArgs(args), nil
+	case isMuseCodeCommand(command):
+		return buildMuseCodeInteractiveArgs(args), nil
 	case strings.HasPrefix(base, "grok"):
 		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), nil
 	default:

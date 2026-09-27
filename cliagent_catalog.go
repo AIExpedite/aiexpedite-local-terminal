@@ -57,6 +57,10 @@ func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
 		// a device that never receives a catalog still reports it.
 		{ID: "opencode", DisplayName: "OpenCode", DisplayOrder: 40, Command: "opencode", DetectionKeys: []string{"opencode", "openCode"}},
 		{ID: "grok", DisplayName: "Grok Build", DisplayOrder: 50, Command: "grok", DetectionKeys: []string{"grok", "grokBuild"}},
+		// Mirrors db-content/dev/cliAgents/museCode.json (id, command, order,
+		// detection keys; the utilization parser key defaults to the id) so
+		// the built-in and backend-projected catalogs cannot drift.
+		{ID: "museCode", DisplayName: "Muse Code", DisplayOrder: 70, Command: "muse", DetectionKeys: []string{"museCode", "muse", "musecode"}},
 	}
 }
 

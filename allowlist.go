@@ -659,6 +659,10 @@ agy *
 # the synthesised shape on session_start, so it does not need a default
 # allowlist match, and a raw execute of "opencode ..." stays gated by the
 # approval dialog so it cannot bypass the manager's env sanitisation.
+#
+# No "muse" / "muse *" entries, for the same reason: the Muse Code session
+# manager owns execution (and forces --disable-approval, stripping --yolo), so
+# a raw execute of "muse ..." stays gated by the approval dialog.
 
 # --- Remote/SSH ---
 ssh *

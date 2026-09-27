@@ -5,8 +5,9 @@
 // Provider-neutral by design: bearer headers, `api_key=` pairs, OAuth URLs,
 // credential-file paths and long opaque blobs are shapes, not vendors. It began
 // life as `redactAntigravitySecrets` in antigravity_native.go with OpenCode
-// calling through a pass-through alias; three providers now depend on it
-// (Antigravity, OpenCode, and the Claude Code smoke probe), and a provider name
+// calling through a pass-through alias; four providers now depend on it
+// (Antigravity, OpenCode, Muse Code via the one-shot core — whose META_API_KEY
+// is covered by the `api_key=` shape — and the Claude Code smoke probe), and a provider name
 // on a shared redactor is exactly how a second, drifting copy gets written —
 // one agent's frames would then leak what the other's mask.
 package main

@@ -185,6 +185,9 @@ func tearDownSubprocesses() {
 	if globalOpenCodeNativeManager != nil {
 		globalOpenCodeNativeManager.ShutdownAll()
 	}
+	if globalMuseCodeNativeManager != nil {
+		globalMuseCodeNativeManager.ShutdownAll()
+	}
 
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
