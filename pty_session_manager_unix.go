@@ -46,9 +46,9 @@ func (sm *SessionManager) startPTYSession(id, command string, cliArgs []string,
 	}
 
 	// pty.Start makes the child a session (and so process-group) leader with
-	// Setsid, so ownProcessGroup is not applied here (Setpgid after setsid
-	// would fail the exec). The spawn is still recorded in the ledger.
-	beginSessionSpawn(id)
+	// Setsid, so no cmd is passed: Setpgid after setsid would fail the exec.
+	// The spawn is still recorded in the ledger.
+	beginSessionSpawn(id, nil)
 	ptmx, err := pty.Start(proc)
 	if err != nil {
 		abortSessionSpawn(id)

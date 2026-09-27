@@ -536,8 +536,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	ownProcessGroup(proc)
-	beginSessionSpawn(id)
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)
 		stdin.Close()

@@ -452,3 +452,141 @@ func TestSessionErrorFramesCarryBootID(t *testing.T) {
 		}
 	}
 }
+
+func resetFenceReportForTest(t *testing.T) {
+	t.Helper()
+	resetFenceReport()
+	t.Cleanup(resetFenceReport)
+}
+
+// TestSessionCommandsWaitForTheFenceReport: until an /online fence report is
+// accepted, every session command but END is held and then Nacked.
+func TestSessionCommandsWaitForTheFenceReport(t *testing.T) {
+	resetFenceReportForTest(t)
+	ctx := context.Background()
+	input := commandMsg{Type: "codex_appserver_send", SessionID: "s1"}
+	start := commandMsg{Type: "claude_native_start", SessionID: "s2"}
+
+	if !holdForFenceReport(ctx, nil, input, 20*time.Millisecond) || !holdForFenceReport(ctx, nil, start, 20*time.Millisecond) {
+		t.Fatalf("a session command ran before the fence report")
+	}
+	if holdForFenceReport(ctx, nil, commandMsg{Type: "codex_appserver_end", SessionID: "s1"}, 20*time.Millisecond) {
+		t.Fatalf("END must never wait")
+	}
+
+	// A waiting command is released the moment the report lands.
+	released := make(chan bool, 1)
+	go func() { released <- holdForFenceReport(ctx, nil, input, 5*time.Second) }()
+	time.Sleep(50 * time.Millisecond)
+	markFenceReportApplied()
+	select {
+	case held := <-released:
+		if held {
+			t.Fatalf("command still held after the report")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("waiting command not released")
+	}
+
+	// Going offline forgets it: the next connection must learn it again.
+	resetFenceReport()
+	if !holdForFenceReport(ctx, nil, input, 20*time.Millisecond) {
+		t.Fatalf("fence report survived a disconnect")
+	}
+}
+
+func TestAcceptedOnlineAppliesTheFenceReport(t *testing.T) {
+	resetConnectivityState(t)
+	resetFencedSessions(t)
+	resetFenceReportForTest(t)
+	withBootReport(t, bootReport{BootID: "boot-g", SessionsReaped: []string{}, SessionsSurviving: []string{}})
+	c := &onlineCapture{}
+	var ok atomic.Bool
+	srv := c.server(t, func(int) int {
+		if ok.Load() {
+			return http.StatusOK
+		}
+		return http.StatusBadGateway
+	}, `{}`)
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+	cfg := &Config{AgentID: "agent-g", CommandSecret: "secret-g"}
+
+	if err := notifyOnline(context.Background(), cfg); err == nil || fenceReportApplied() {
+		t.Fatalf("a rejected /online must not apply the fence report")
+	}
+	ok.Store(true)
+	if err := notifyOnline(context.Background(), cfg); err != nil || !fenceReportApplied() {
+		t.Fatalf("an accepted /online must apply the fence report (err %v)", err)
+	}
+}
+
+// TestEnsureFenceReportRetriesUntilAccepted: a failed boot / reconnect
+// /online cannot hold session commands for the whole connection.
+func TestEnsureFenceReportRetriesUntilAccepted(t *testing.T) {
+	resetConnectivityState(t)
+	resetFenceReportForTest(t)
+	prevDelays, prevSend := fenceReportRetryDelays, sendOnlineForFenceReport
+	fenceReportRetryDelays = []time.Duration{10 * time.Millisecond}
+	var calls atomic.Int32
+	done := make(chan struct{})
+	sendOnlineForFenceReport = func(context.Context, *Config) error {
+		if calls.Add(1) < 3 {
+			return io.ErrUnexpectedEOF
+		}
+		markFenceReportApplied()
+		close(done)
+		return nil
+	}
+	t.Cleanup(func() { fenceReportRetryDelays, sendOnlineForFenceReport = prevDelays, prevSend })
+
+	ensureFenceReport(&Config{AgentID: "a", CommandSecret: "s"})
+	ensureFenceReport(&Config{AgentID: "a", CommandSecret: "s"}) // single-flight
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("fence report never retried to acceptance (calls = %d)", calls.Load())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for fenceReportRetrying.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fenceReportRetrying.Load() {
+		t.Fatalf("retry loop did not stop once applied")
+	}
+	if n := calls.Load(); n != 3 {
+		t.Fatalf("calls = %d, want 3", n)
+	}
+
+	// Unregistered: nothing is sent.
+	resetFenceReport()
+	calls.Store(0)
+	ensureFenceReport(&Config{})
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatalf("an unregistered agent sent /online")
+	}
+}
+
+// TestReconnectResetsTheFenceReport: the first connection keeps a report its
+// boot /online already applied; every later connection forgets it.
+func TestReconnectResetsTheFenceReport(t *testing.T) {
+	resetFenceReportForTest(t)
+	prev := fenceReportConnections.Load()
+	t.Cleanup(func() { fenceReportConnections.Store(prev) })
+	unregistered := &Config{} // ensureFenceReport sends nothing for it
+
+	fenceReportConnections.Store(0)
+	markFenceReportApplied()
+	beginFenceReportConnection(unregistered)
+	if !fenceReportApplied() {
+		t.Fatalf("the first connection discarded the boot report")
+	}
+	beginFenceReportConnection(unregistered)
+	if fenceReportApplied() {
+		t.Fatalf("a reconnect kept the previous connection's fence report")
+	}
+	if holdForFenceReport(context.Background(), nil, commandMsg{Type: "session_signal", SessionID: "s"}, 10*time.Millisecond) {
+		t.Fatalf("a signal (cancel) must never wait")
+	}
+}

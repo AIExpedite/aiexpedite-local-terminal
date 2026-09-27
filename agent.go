@@ -83,6 +83,10 @@ func SetOffline(offline bool, cfg ...*Config) {
 		// A disconnect that follows a reconnect attempt releases the temporary
 		// drain reservation; an explicitly offline agent cannot be routed work.
 		completeCloudReconnectDrain()
+		// The next connection must learn the fenced sessions again (a Move
+		// can happen while this device is disconnected) before it runs
+		// session commands (fenced_sessions.go).
+		resetFenceReport()
 	}
 	offlineMutex.Lock()
 	isOffline = offline

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,7 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	t.Helper()
 	path := filepath.Join(dir, spawnLedgerFileName)
 	l := newSpawnLedger(func() string { return path }, bootID)
-	l.attachJob = func(*os.Process) (uintptr, error) { return 0, nil }
+	l.attachJob = func(*os.Process, bool) (uintptr, bool, error) { return 0, false, nil }
 	l.releaseJob = func(uintptr) {}
 	l.groupOf = func(*os.Process) int { return 0 }
 	l.descendants = func(ledgerProcess) processProbeResult { return processGone }
@@ -88,7 +89,7 @@ func TestSpawnLedgerPersistsEveryChangeAtomically(t *testing.T) {
 		t.Fatalf("BeginSpawn not persisted before Start: %+v", data)
 	}
 
-	l.TrackProcess("s1", proc(101))
+	l.TrackProcess("s1", proc(101), false)
 	l.OpenLogicalSession("s2")
 	data = readLedgerFile(t, dir)
 	if len(data.Entries) != 2 {
@@ -133,7 +134,7 @@ func TestSpawnLedgerAbortAndLogicalTurns(t *testing.T) {
 	// A logical session keeps its entry between per-turn processes.
 	l.OpenLogicalSession("agy")
 	l.BeginSpawn("agy")
-	l.TrackProcess("agy", proc(7))
+	l.TrackProcess("agy", proc(7), false)
 	l.UntrackProcess("agy", 7)
 	got := readLedgerFile(t, dir).Entries
 	if len(got) != 1 || !got[0].Logical || len(got[0].PIDs) != 0 || got[0].PendingSpawns != 0 {
@@ -146,7 +147,7 @@ func TestSpawnLedgerAbortAndLogicalTurns(t *testing.T) {
 
 	// A turn that outlived its session's release does not leave a bare entry.
 	l.BeginSpawn("late")
-	l.TrackProcess("late", proc(8))
+	l.TrackProcess("late", proc(8), false)
 	l.UntrackProcess("late", 8)
 	if got := readLedgerFile(t, dir).Entries; len(got) != 0 {
 		t.Fatalf("bare entry kept after its only process: %+v", got)
@@ -158,7 +159,7 @@ func TestSpawnLedgerMissingStartTimeIsIncomplete(t *testing.T) {
 	l := newTestLedger(t, dir, "boot-1")
 	l.startToken = func(int) (string, error) { return "", fmt.Errorf("denied") }
 	l.BeginSpawn("s")
-	l.TrackProcess("s", proc(9))
+	l.TrackProcess("s", proc(9), false)
 	got := readLedgerFile(t, dir).Entries
 	if len(got) != 1 || !got[0].Incomplete || len(got[0].PIDs) != 0 {
 		t.Fatalf("a PID without a start time must mark the entry incomplete: %+v", got)
@@ -181,7 +182,7 @@ func TestSpawnLedgerIsBounded(t *testing.T) {
 
 	// Too many processes for one session: never certifiable.
 	for i := 0; i < spawnLedgerMaxPIDs+1; i++ {
-		l.TrackProcess("many", proc(1000+i))
+		l.TrackProcess("many", proc(1000+i), false)
 	}
 	for _, e := range readLedgerFile(t, dir).Entries {
 		if e.SessionID == "many" && (!e.Incomplete || len(e.PIDs) != spawnLedgerMaxPIDs) {
@@ -207,6 +208,9 @@ func TestBootReapClassification(t *testing.T) {
 			{SessionID: "idle-agy", BootID: "boot-1", Logical: true, PIDs: []ledgerProcess{}},
 			// Leader gone, but its group / job cannot be proven empty.
 			{SessionID: "left-a-tool", BootID: "boot-1", PIDs: []ledgerProcess{{PID: 5, StartTime: "t5", PGID: 5}}},
+			// Ended at boot, but uncontained: the kill proves nothing about
+			// a descendant that escaped it.
+			{SessionID: "ended-uncontained", BootID: "boot-1", PIDs: []ledgerProcess{{PID: 6, StartTime: "t6"}}},
 			{SessionID: "pending", BootID: "boot-1", PendingSpawns: 1, PIDs: []ledgerProcess{}},
 			{SessionID: "incomplete", BootID: "boot-1", Incomplete: true, PIDs: []ledgerProcess{{PID: 1, StartTime: "t1"}}},
 		},
@@ -222,14 +226,14 @@ func TestBootReapClassification(t *testing.T) {
 		switch p.PID {
 		case 1, 5:
 			return processGone
-		case 2, 3:
+		case 2, 3, 6:
 			return processOurs
 		default:
 			return processUnknown
 		}
 	}
 	l.descendants = func(p ledgerProcess) processProbeResult {
-		if p.PID == 5 {
+		if p.PID == 5 || p.PID == 6 {
 			return processUnknown
 		}
 		return processGone
@@ -238,7 +242,7 @@ func TestBootReapClassification(t *testing.T) {
 		mu.Lock()
 		ended = append(ended, p.PID)
 		mu.Unlock()
-		if p.PID == 2 {
+		if p.PID == 2 || p.PID == 6 {
 			return processGone
 		}
 		return processOurs // pid 3 refuses to die
@@ -256,11 +260,12 @@ func TestBootReapClassification(t *testing.T) {
 	if want := []string{"stuck"}; !reflect.DeepEqual(r.SessionsSurviving, want) {
 		t.Fatalf("surviving = %v, want %v", r.SessionsSurviving, want)
 	}
-	if !reflect.DeepEqual(ended, []int{2, 3}) {
+	sort.Ints(ended)
+	if !reflect.DeepEqual(ended, []int{2, 3, 6}) {
 		t.Fatalf("only processes still ours may be ended, ended = %v", ended)
 	}
 	for _, pid := range probed {
-		if pid < 1 || pid > 5 {
+		if pid < 1 || pid > 6 {
 			t.Fatalf("probed a PID the ledger never recorded: %d", pid)
 		}
 	}
@@ -274,7 +279,7 @@ func TestBootReapClassification(t *testing.T) {
 	want := map[string]string{
 		"gone": ledgerStateReaped, "ended": ledgerStateReaped, "idle-agy": ledgerStateReaped,
 		"stuck": ledgerStateSurviving, "denied": ledgerStateUnknown, "mixed": ledgerStateUnknown,
-		"left-a-tool": ledgerStateUnknown,
+		"left-a-tool": ledgerStateUnknown, "ended-uncontained": ledgerStateUnknown,
 	}
 	if !reflect.DeepEqual(states, want) {
 		t.Fatalf("persisted states = %v, want %v", states, want)
@@ -295,7 +300,7 @@ func TestBootReapClassification(t *testing.T) {
 	if r3.PreviousBootID != "boot-2" {
 		t.Fatalf("previousBootId = %q", r3.PreviousBootID)
 	}
-	if want := []string{"denied", "ended", "idle-agy", "left-a-tool", "mixed", "stuck"}; !reflect.DeepEqual(r3.SessionsReaped, want) {
+	if want := []string{"denied", "ended", "ended-uncontained", "idle-agy", "left-a-tool", "mixed", "stuck"}; !reflect.DeepEqual(r3.SessionsReaped, want) {
 		t.Fatalf("boot-3 reaped = %v, want %v", r3.SessionsReaped, want)
 	}
 	if len(r3.SessionsSurviving) != 0 {
@@ -307,7 +312,7 @@ func TestBootReapLeavesCurrentBootAlone(t *testing.T) {
 	dir := t.TempDir()
 	l := newTestLedger(t, dir, "boot-now")
 	l.BeginSpawn("live")
-	l.TrackProcess("live", proc(55))
+	l.TrackProcess("live", proc(55), false)
 	// probe / end fail the test if called: a current-boot session is never
 	// probed, ended or reported.
 	l.RunBootReap()

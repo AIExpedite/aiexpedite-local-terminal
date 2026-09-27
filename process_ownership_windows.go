@@ -13,10 +13,11 @@
 // survived the agent as orphans.
 //
 // Descendants inherit the job from the moment they are created, so a CLI's
-// own children are covered too. The CLI is assigned right after
-// CreateProcess returns, before it has had time to start children of its own;
-// a failed assignment is logged and the session runs unowned (the next boot
-// still ends it from the ledger, by recorded PID and start time).
+// own children are covered too. The CLI is created SUSPENDED
+// (prepareOwnedStart), assigned while it cannot run, and only then resumed,
+// so no child of it can ever be created outside the job. A failed
+// assignment is logged and the session runs unowned: it is then not recorded
+// "contained", so its descendants are never vouched for at the next boot.
 //
 // When a session ends normally the job's kill-on-close limit is cleared
 // before the handle is closed, so a clean end keeps exactly the behaviour it
@@ -27,8 +28,10 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -65,33 +68,93 @@ func setJobKillOnClose(job windows.Handle, on bool) error {
 	return err
 }
 
-// attachSessionJob creates a kill-on-close Job Object and assigns proc to it.
-// The returned handle must be passed to releaseSessionJob when the session
-// ends. proc's own handle is pinned for the assignment, so a process that
-// already exited and was reaped is never confused with a reused PID.
-func attachSessionJob(proc *os.Process) (uintptr, error) {
+// prepareOwnedStart creates the session process SUSPENDED: its main thread
+// does not run until trackSessionProcess has put it in its job, so no child
+// of it can ever be created outside the job.
+func prepareOwnedStart(cmd *exec.Cmd) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_SUSPENDED
+}
+
+// startedSuspended reports whether cmd was created suspended.
+func startedSuspended(cmd *exec.Cmd) bool {
+	return cmd != nil && cmd.SysProcAttr != nil &&
+		cmd.SysProcAttr.CreationFlags&windows.CREATE_SUSPENDED != 0
+}
+
+var procNtResumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
+
+// resumeProcess resumes every thread of a process created suspended.
+//
+// os/exec returns no thread handle, so the main thread must be found another
+// way. NtResumeProcess (ntdll, present on every supported Windows) resumes
+// the threads of the ONE process whose handle we already hold pinned, in one
+// call. The alternative, CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD), snapshots
+// every thread on the machine and filters by PID: it touches other processes'
+// state (which this agent deliberately never enumerates) and names threads by
+// id, which can be reused. A failed resume terminates the process (see
+// attachSessionJob), so a session never hangs suspended.
+var resumeProcess = func(h windows.Handle) error {
+	if err := procNtResumeProcess.Find(); err != nil {
+		return err
+	}
+	status, _, _ := procNtResumeProcess.Call(uintptr(h))
+	if status != 0 {
+		return fmt.Errorf("NtResumeProcess: NTSTATUS 0x%08x", uint32(status))
+	}
+	return nil
+}
+
+// attachSessionJob creates a kill-on-close Job Object and assigns proc to it,
+// then, when proc was created suspended, resumes it. A suspended process is
+// ALWAYS resumed — or, when it cannot be, terminated, so it never hangs —
+// whatever happened to the job. contained is true only when the assignment
+// happened before the process ran (suspended): then nothing it started can be
+// outside the job. The returned handle must be passed to releaseSessionJob
+// when the session ends. proc's own handle is pinned throughout, so a reused
+// PID can never be confused with it.
+func attachSessionJob(proc *os.Process, suspended bool) (uintptr, bool, error) {
 	if proc == nil {
-		return 0, errors.New("no process")
+		return 0, false, errors.New("no process")
 	}
-	job, err := windows.CreateJobObject(nil, nil)
-	if err != nil {
-		return 0, err
+	var (
+		job       windows.Handle
+		assignErr error
+		resumeErr error
+	)
+	handleErr := proc.WithHandle(func(raw uintptr) {
+		h := windows.Handle(raw)
+		job, assignErr = windows.CreateJobObject(nil, nil)
+		if assignErr == nil {
+			if assignErr = setJobKillOnClose(job, true); assignErr == nil {
+				assignErr = windows.AssignProcessToJobObject(job, h)
+			}
+			if assignErr != nil {
+				windows.CloseHandle(job)
+				job = 0
+			}
+		}
+		if suspended {
+			if resumeErr = resumeProcess(h); resumeErr != nil {
+				_ = windows.TerminateProcess(h, 1)
+			}
+		}
+	})
+	if handleErr != nil {
+		return 0, false, handleErr
 	}
-	if err := setJobKillOnClose(job, true); err != nil {
-		windows.CloseHandle(job)
-		return 0, err
-	}
-	var assignErr error
-	if err := proc.WithHandle(func(h uintptr) {
-		assignErr = windows.AssignProcessToJobObject(job, windows.Handle(h))
-	}); err != nil {
-		assignErr = err
+	if resumeErr != nil {
+		if job != 0 {
+			windows.CloseHandle(job)
+		}
+		return 0, false, fmt.Errorf("resume suspended session process: %w", resumeErr)
 	}
 	if assignErr != nil {
-		windows.CloseHandle(job)
-		return 0, assignErr
+		return 0, false, assignErr
 	}
-	return uintptr(job), nil
+	return uintptr(job), suspended, nil
 }
 
 // releaseSessionJob clears the kill-on-close limit and closes the handle.

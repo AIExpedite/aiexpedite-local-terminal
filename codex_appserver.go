@@ -599,8 +599,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	// since an installer can replace the binary in the pin→exec window.
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch("codex", executable)
 
-	ownProcessGroup(proc)
-	beginSessionSpawn(id)
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)
 		stdin.Close()

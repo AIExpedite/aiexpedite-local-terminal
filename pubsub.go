@@ -1348,6 +1348,13 @@ func runPubSubConnection(cfg *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Every (re)connection must learn the fenced sessions again before it
+	// runs session commands: a Move can land while the link is down. The
+	// first connection of the process starts unapplied already, and its
+	// boot /online may be accepted before this point, so only a later
+	// connection resets (fenced_sessions.go).
+	beginFenceReportConnection(cfg)
+
 	// Listen for shutdown or offline signal.
 	// ctx.Done() arm ensures this goroutine exits when the connection ends
 	// normally (e.g. sub.Receive returns), preventing a goroutine leak.
@@ -1839,6 +1846,12 @@ func runPubSubConnection(cfg *Config) error {
 			// A session fenced by a Move / max-park end (reported on /online,
 			// fenced_sessions.go) accepts nothing but its END: its run has
 			// moved on, so a late input must not drive the old CLI.
+			// Until an /online fence report is accepted on this connection
+			// the fence set may be incomplete: hold (then Nack) everything
+			// but END.
+			if holdForFenceReport(ctx, m, cmd, fenceReportGateWait) {
+				return
+			}
 			if refuseFencedSessionCommand(ctx, topic, m, cmd, cfg) {
 				return
 			}

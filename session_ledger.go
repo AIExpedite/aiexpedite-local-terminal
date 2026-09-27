@@ -170,7 +170,7 @@ type spawnLedger struct {
 	// whether what it started can be proven gone too (its process group on
 	// Unix, its kill-on-close job on Windows).
 	descendants func(ledgerProcess) processProbeResult
-	attachJob   func(*os.Process) (uintptr, error)
+	attachJob   func(proc *os.Process, suspended bool) (job uintptr, contained bool, err error)
 	releaseJob  func(uintptr)
 	groupOf     func(*os.Process) int
 }
@@ -374,17 +374,26 @@ func (l *spawnLedger) AbortSpawn(sessionID string) {
 }
 
 // TrackProcess records a started process for sessionID (after BeginSpawn)
-// and, on Windows, puts it in its kill-on-close Job Object.
-func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process) {
-	if sessionID == "" || proc == nil || proc.Pid <= 0 {
+// and, on Windows, puts it in its kill-on-close Job Object. suspended says the
+// process was created suspended (beginSessionSpawn): it is then assigned to
+// the job BEFORE it runs, and resumed here whatever else fails.
+func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process, suspended bool) {
+	if proc == nil || proc.Pid <= 0 {
 		return
 	}
-	// Assign the job before anything slower (file I/O), while the CLI is
-	// still starting up and has not spawned children of its own yet.
-	job, jobErr := l.attachJob(proc)
+	// First, whatever the session id: a suspended process must be resumed.
+	// Only a process assigned before it ran is "contained" (no child of it
+	// can have been created outside the job).
+	job, contained, jobErr := l.attachJob(proc, suspended)
 	if jobErr != nil {
 		fmt.Printf("%s[ledger] Could not put session %s (PID %d) in a kill-on-close job: %v%s\n",
 			colorYellow, sessionID, proc.Pid, jobErr, colorReset)
+	}
+	if sessionID == "" {
+		if job != 0 {
+			l.releaseJob(job)
+		}
+		return
 	}
 	token, tokenErr := l.startToken(proc.Pid)
 	pgid := l.groupOf(proc)
@@ -410,7 +419,7 @@ func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process) {
 	case len(e.PIDs) >= spawnLedgerMaxPIDs:
 		e.Incomplete = true
 	default:
-		e.PIDs = append(e.PIDs, ledgerProcess{PID: proc.Pid, StartTime: token, PGID: pgid, Contained: job != 0})
+		e.PIDs = append(e.PIDs, ledgerProcess{PID: proc.Pid, StartTime: token, PGID: pgid, Contained: contained})
 	}
 	l.touch(e)
 	l.persistLocked()
@@ -513,6 +522,11 @@ func (l *spawnLedger) classifyEarlierEntry(e ledgerEntry) bootReapClass {
 		case processGone:
 			fmt.Printf("%s[boot-reap] Ended PID %d left by session %s (boot %s)%s\n",
 				colorYellow, p.PID, e.SessionID, e.BootID, colorReset)
+			// Ended, but a descendant that escaped the kill is still not
+			// proven gone: the same rule as a process found already gone.
+			if l.descendants(p) != processGone {
+				unknown = true
+			}
 		case processUnknown:
 			unknown = true
 		default:
@@ -698,14 +712,23 @@ func (l *spawnLedger) AckReaped(sessionIDs []string) {
 //
 // Every CLI session spawn path calls, in order:
 //
-//	ownProcessGroup(cmd)           // Unix: Setpgid (skipped where Setsid is set)
-//	beginSessionSpawn(id)          // immediately before cmd.Start()
+//	beginSessionSpawn(id, cmd)     // immediately before cmd.Start()
 //	abortSessionSpawn(id)          // when Start failed
-//	trackSessionProcess(id, cmd)   // immediately after Start succeeded
+//	trackSessionProcess(id, cmd)   // IMMEDIATELY after Start succeeded
 //
 // and releaseLedgerSession(id) where the manager removes the session.
+// beginSessionSpawn prepares cmd for ownership (prepareOwnedStart): on Unix
+// its own process group (Setpgid, unless Setsid already makes it a leader);
+// on Windows it is created SUSPENDED, so trackSessionProcess can put it in its
+// kill-on-close job before it runs and then resume it. A nil cmd (PTY, whose
+// pty.Start sets Setsid itself) only records the spawn.
 
-func beginSessionSpawn(sessionID string) { globalSpawnLedger.BeginSpawn(sessionID) }
+func beginSessionSpawn(sessionID string, cmd *exec.Cmd) {
+	if cmd != nil {
+		prepareOwnedStart(cmd)
+	}
+	globalSpawnLedger.BeginSpawn(sessionID)
+}
 
 func abortSessionSpawn(sessionID string) { globalSpawnLedger.AbortSpawn(sessionID) }
 
@@ -713,7 +736,7 @@ func trackSessionProcess(sessionID string, cmd *exec.Cmd) {
 	if cmd == nil {
 		return
 	}
-	globalSpawnLedger.TrackProcess(sessionID, cmd.Process)
+	globalSpawnLedger.TrackProcess(sessionID, cmd.Process, startedSuspended(cmd))
 }
 
 func untrackSessionProcess(sessionID string, pid int) {

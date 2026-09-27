@@ -748,7 +748,7 @@ func (m *AntigravityNativeManager) runOneShot(
 
 	// agy already leads its own group (Setsid above). Recorded in the spawn
 	// ledger for this turn only (session_ledger.go).
-	beginSessionSpawn(session.ID)
+	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
 		abortSessionSpawn(session.ID)
 		return "", "", 0, false, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)

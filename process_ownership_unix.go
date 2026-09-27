@@ -58,9 +58,17 @@ func processGroupOf(proc *os.Process) int {
 	return pgid
 }
 
+// prepareOwnedStart makes a session process lead its own process group.
+func prepareOwnedStart(cmd *exec.Cmd) { ownProcessGroup(cmd) }
+
+// startedSuspended: Unix never starts a session process suspended.
+func startedSuspended(cmd *exec.Cmd) bool { return false }
+
 // attachSessionJob / releaseSessionJob: Job Objects are Windows-only.
-func attachSessionJob(proc *os.Process) (uintptr, error) { return 0, nil }
-func releaseSessionJob(job uintptr)                      {}
+func attachSessionJob(proc *os.Process, suspended bool) (uintptr, bool, error) {
+	return 0, false, nil
+}
+func releaseSessionJob(job uintptr) {}
 
 // signalRecordedGroup is the kill behind a seam for tests.
 var signalRecordedGroup = func(rec ledgerProcess) {

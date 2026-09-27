@@ -765,10 +765,10 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// between this pin and Start().
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
 
-	// Start the process. It leads its own process group (Unix) and is recorded
-	// in the spawn ledger so a later boot can prove it gone (session_ledger.go).
-	ownProcessGroup(proc)
-	beginSessionSpawn(id)
+	// Start the process. It is owned (its own process group on Unix, a
+	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
+	// a later boot can prove it gone (session_ledger.go).
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)
 		if finishGrokAttribution != nil {

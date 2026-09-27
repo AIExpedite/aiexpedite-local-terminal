@@ -328,6 +328,8 @@ func applyOnlineAccepted(l *spawnLedger, resp *onlineResponse) {
 	}
 	l.AckReaped(resp.sentReaped)
 	handleFencedSessions(resp.FencedSessionIDs)
+	// The fences are in force: session commands may run (holdForFenceReport).
+	markFenceReportApplied()
 }
 
 // bootReportForOnline is the ledger's report, behind a seam for tests.

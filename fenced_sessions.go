@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -130,6 +132,161 @@ func handleFencedSessions(ids []string) {
 	for _, id := range added {
 		go endFencedSession(id)
 	}
+}
+
+// ── The fence report gate ────────────────────────────────────────────────
+//
+// The Pub/Sub loop starts before the /online that answers the fence list (at
+// boot and on a tray Reconnect), so until an /online has been ACCEPTED on
+// this connection the fence set may be incomplete. Session commands other
+// than END wait for it (bounded) and are otherwise Nacked for redelivery; a
+// background loop keeps re-sending /online until one is accepted.
+
+// fenceReportGateWait bounds how long one session command waits for the
+// fence report before it is Nacked (Pub/Sub redelivers it).
+const fenceReportGateWait = 15 * time.Second
+
+var fenceReport = struct {
+	sync.Mutex
+	applied bool
+	ready   chan struct{}
+}{ready: make(chan struct{})}
+
+// markFenceReportApplied records that an accepted /online's fence list is in
+// force (called after handleFencedSessions).
+func markFenceReportApplied() {
+	fenceReport.Lock()
+	defer fenceReport.Unlock()
+	if !fenceReport.applied {
+		fenceReport.applied = true
+		close(fenceReport.ready)
+	}
+}
+
+// resetFenceReport forgets it: the agent went offline, and the next
+// connection must learn the fences again before running session commands.
+func resetFenceReport() {
+	fenceReport.Lock()
+	defer fenceReport.Unlock()
+	if fenceReport.applied {
+		fenceReport.applied = false
+		fenceReport.ready = make(chan struct{})
+	}
+}
+
+// fenceReportConnections counts Pub/Sub connections of this process.
+var fenceReportConnections atomic.Int64
+
+// beginFenceReportConnection starts a Pub/Sub connection: from the second
+// connection on it forgets the fence report, then makes sure an /online is
+// (re)sent until one is accepted.
+func beginFenceReportConnection(cfg *Config) {
+	if fenceReportConnections.Add(1) > 1 {
+		resetFenceReport()
+	}
+	ensureFenceReport(cfg)
+}
+
+func fenceReportApplied() bool {
+	fenceReport.Lock()
+	defer fenceReport.Unlock()
+	return fenceReport.applied
+}
+
+// waitFenceReport waits until the fence report is applied, ctx ends, or wait
+// elapses, and reports whether it is applied.
+func waitFenceReport(ctx context.Context, wait time.Duration) bool {
+	fenceReport.Lock()
+	if fenceReport.applied {
+		fenceReport.Unlock()
+		return true
+	}
+	ready := fenceReport.ready
+	fenceReport.Unlock()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return true
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	return fenceReportApplied()
+}
+
+// holdForFenceReport is the entry gate half that waits for the fence report.
+// END and a signal (interrupt / kill: a cancel) always pass — stopping a
+// session is always safe. Everything that starts or drives a session waits,
+// and is Nacked (never acked) for redelivery when the report has not landed
+// within wait. Returns true when it handled (Nacked) the message.
+func holdForFenceReport(ctx context.Context, m *pubsub.Message, cmd commandMsg, wait time.Duration) bool {
+	if isSessionEndCommandType(cmd.Type) || cmd.Type == "session_signal" || waitFenceReport(ctx, wait) {
+		return false
+	}
+	fmt.Printf("%s[fence] %s for session %s held: no /online fence report accepted yet — Nacked for redelivery%s\n",
+		colorYellow, cmd.Type, cmd.SessionID, colorReset)
+	if m != nil {
+		m.Nack()
+	}
+	return true
+}
+
+// fenceReportRetrying is the single-flight guard of ensureFenceReport.
+var fenceReportRetrying atomic.Bool
+
+// sendOnlineForFenceReport is the /online behind a seam for tests.
+var sendOnlineForFenceReport = func(ctx context.Context, cfg *Config) error { return notifyOnline(ctx, cfg) }
+
+// fenceReportRetryDelays is the backoff of ensureFenceReport. The first
+// delay leaves the caller's own /online (boot, Reconnect) time to land.
+var fenceReportRetryDelays = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
+
+// ensureFenceReport keeps re-sending /online until one is accepted, so a
+// failed boot / reconnect /online cannot hold session commands for the whole
+// connection. It stops when the report is applied, on shutdown, when the
+// agent is offline or unregistered, and it leaves /online to the update
+// reconciliation while an update attempt is pending (that path reports the
+// version-aware /online, which applies the fences too).
+func ensureFenceReport(cfg *Config) {
+	if cfg == nil || !fenceReportRetrying.CompareAndSwap(false, true) {
+		return
+	}
+	// Read the seams once, here, so the loop never races a test restoring them.
+	delays := append([]time.Duration(nil), fenceReportRetryDelays...)
+	send := sendOnlineForFenceReport
+	go func() {
+		defer fenceReportRetrying.Store(false)
+		for attempt := 0; ; attempt++ {
+			delay := delays[len(delays)-1]
+			if attempt < len(delays) {
+				delay = delays[attempt]
+			}
+			select {
+			case <-shutdownChan:
+				return
+			case <-time.After(delay):
+			}
+			if fenceReportApplied() || IsShutdownInProgress() || IsOffline() {
+				return
+			}
+			registered, pendingUpdate := false, false
+			cfg.WithPersistenceLock(func() {
+				registered = cfg.IsRegistered() && !cfg.OfflineMode
+				pendingUpdate = cfg.PendingUpdateAttemptID != ""
+			})
+			if !registered {
+				return
+			}
+			if !pendingUpdate {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = send(ctx, cfg)
+				cancel()
+				if fenceReportApplied() {
+					return
+				}
+			}
+		}
+	}()
 }
 
 // isSessionEndCommandType reports the END command of every session family.
