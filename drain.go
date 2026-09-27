@@ -488,7 +488,9 @@ func isWorkContinuationCommand(cmd commandMsg) bool {
 		"codex_appserver_send", "codex_appserver_end",
 		"claude_native_send", "claude_native_end",
 		"grok_acp_send", "grok_acp_end",
-		"antigravity_native_send", "antigravity_native_end":
+		"antigravity_native_send", "antigravity_native_end",
+		"opencode_native_send", "opencode_native_end",
+		"musecode_native_send", "musecode_native_end":
 		return true
 	}
 	return false
