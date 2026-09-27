@@ -33,7 +33,14 @@ import (
 //	OPENCODE_STUB_STDIN_LOG  write everything read from stdin to this file
 //	OPENCODE_STUB_SLEEP_MS   sleep this long before exiting (cancel/timeout)
 //	OPENCODE_STUB_RUN_LOG    append one line per invocation (replay counting)
-//	OPENCODE_STUB_FAIL_FIRST when set, invocation #1 uses …_FIRST_STDOUT/EXIT
+//	OPENCODE_STUB_FAIL_FIRST when set, invocation #1 uses
+//	                         …_FIRST_STDOUT/_FIRST_STDERR/_FIRST_EXIT
+//	OPENCODE_STUB_MODELS     stdout for `models` (a diagnostic, not a run)
+//	OPENCODE_STUB_AUTH       stdout for `auth …` (a diagnostic, not a run)
+//	OPENCODE_STUB_ECHO_STDIN when set, emit a text frame echoing the LAST
+//	                         whitespace-delimited token of stdin plus a
+//	                         completion frame — a real marker echo, which is
+//	                         what the maintenance smoke measures
 const openCodeStubSource = `package main
 
 import (
@@ -49,6 +56,21 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println(env("OPENCODE_STUB_VERSION", "0.9.0"))
 		return
+	}
+
+	// Diagnostics answer information, never a model run — the same distinction
+	// isOpenCodeDiagnosticInvocation draws.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "models":
+			fmt.Print(env("OPENCODE_STUB_MODELS", "anthropic/claude-sonnet-4-5
+"))
+			return
+		case "auth":
+			fmt.Print(env("OPENCODE_STUB_AUTH", "anthropic
+"))
+			return
+		}
 	}
 
 	runs := 0
@@ -84,11 +106,25 @@ func main() {
 		}
 	}
 
+	if os.Getenv("OPENCODE_STUB_ECHO_STDIN") != "" {
+		fields := strings.Fields(string(data))
+		echo := ""
+		if len(fields) > 0 {
+			echo = fields[len(fields)-1]
+		}
+		fmt.Printf("{\"type\":\"text\",\"text\":\"%s\"}\n", echo)
+		fmt.Println("{\"type\":\"session.completed\"}")
+		os.Exit(0)
+	}
+
 	stdout := unescape(os.Getenv("OPENCODE_STUB_STDOUT"))
 	exitCode, _ := strconv.Atoi(env("OPENCODE_STUB_EXIT", "0"))
 	if os.Getenv("OPENCODE_STUB_FAIL_FIRST") != "" && runs == 1 {
 		stdout = unescape(os.Getenv("OPENCODE_STUB_FIRST_STDOUT"))
 		exitCode, _ = strconv.Atoi(env("OPENCODE_STUB_FIRST_EXIT", "1"))
+		if s := unescape(os.Getenv("OPENCODE_STUB_FIRST_STDERR")); s != "" {
+			os.Stderr.WriteString(s)
+		}
 	}
 	if stdout != "" {
 		os.Stdout.WriteString(stdout)

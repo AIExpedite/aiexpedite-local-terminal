@@ -104,7 +104,13 @@ func TestApplyCliResumeSeedAntigravity(t *testing.T) {
 
 func TestApplyCliResumeSeedOpenCode(t *testing.T) {
 	callerArgs := []string{"--model", "anthropic/claude-sonnet-4-5", "fix the failing test"}
-	shaped := buildOpenCodeInteractiveArgs(callerArgs)
+	shaped, prompt := buildOpenCodeInteractiveArgs(callerArgs)
+	// The prompt left argv for the child's stdin, so the seed is inserted into a
+	// promptless argv and the resume flag still lands right after the forced
+	// `run --format json` prefix.
+	if prompt != "fix the failing test" {
+		t.Fatalf("prompt should travel on stdin, got %q", prompt)
+	}
 
 	seeded, err := applyCliResumeSeed("opencode", callerArgs, shaped, "ses_7f3aK2pQ9xLmN4", false)
 	if err != nil {
@@ -114,7 +120,6 @@ func TestApplyCliResumeSeedOpenCode(t *testing.T) {
 		"run", "--format", "json",
 		"--session", "ses_7f3aK2pQ9xLmN4",
 		"--model", "anthropic/claude-sonnet-4-5",
-		"fix the failing test",
 	}
 	if !reflect.DeepEqual(seeded, want) {
 		t.Fatalf("seeded argv =\n  %v\nwant\n  %v", seeded, want)
@@ -124,7 +129,7 @@ func TestApplyCliResumeSeedOpenCode(t *testing.T) {
 // Session control is server-owned: a caller-typed --session is still stripped,
 // so only the signed seed can put the flag on the command line.
 func TestCallerTypedOpenCodeSessionFlagIsStillStripped(t *testing.T) {
-	shaped := buildOpenCodeInteractiveArgs([]string{"--session", "ses_attackerChosen1", "do it"})
+	shaped, _ := buildOpenCodeInteractiveArgs([]string{"--session", "ses_attackerChosen1", "do it"})
 	if strings.Contains(strings.Join(shaped, " "), "--session") {
 		t.Fatalf("caller --session survived shaping: %v", shaped)
 	}

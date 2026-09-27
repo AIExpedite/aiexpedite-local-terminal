@@ -1453,3 +1453,220 @@ and carrying the model id, instead of being folded into the main rows where
 its 0 % session window stood in for a main pool that had none. Routing still
 sees those rows in Codex's shared pool (no `metric.pool` on the wire yet —
 the B6 device half), exactly as the folded rows were before.
+
+---
+
+# CLI Agent Integration — OpenCode (`opencode`) non-interactive contract
+
+## TL;DR
+
+There is **ONE** OpenCode invocation contract, in
+[opencode_argv.go](opencode_argv.go), and **ONE** launcher (`newOpenCodeCmd`).
+Both spawn sites (direct chat in [opencode_native.go](opencode_native.go),
+terminal `session_start` in [session.go](session.go)), both readiness probes
+([cliagent_usage_opencode.go](cliagent_usage_opencode.go)), the version probe and
+the `__cli_smoke__` provider
+([cliagent_smoke_opencode.go](cliagent_smoke_opencode.go)) all go through them.
+
+```
+run --format json [--session <id>]        # forced; prompt NEVER on argv
+```
+
+## Why this exists
+
+The Windows OpenCode maintenance smoke never returned a marker. A non-interactive
+`opencode run --pure --format json <prompt>` failed **identically before and
+after** a CLI update, and the outcome collapsed into one `launch_or_protocol`
+bucket — so maintenance could not tell a failed launch from a rejected flag from
+a reply we no longer parse. Four device-side gaps produced that one symptom:
+
+1. **No `opencode` row in `cliSmokeProviders`.** A smoke resolved to
+   `provider_unavailable` / `unknown_cli` without spawning anything, so the only
+   OpenCode smoke that could run was the legacy signed `session_start` one.
+2. **No legacy transport contract.** That signed request ran whatever argv the
+   publisher signed, and `--pure` is rejected during OpenCode's option parsing —
+   before inference, so no marker was ever echoed.
+3. **Both spawn sites called `exec.Command` directly.** An npm `.cmd` / `.bat`
+   shim **cannot be started by CreateProcess**, the failure Grok and Codex
+   already route around via `cliSmokeShimCommand`. It reproduces identically pre-
+   and post-update, which is exactly what the report described.
+4. **Two argv builders** (`buildOpenCodeNativeArgs` vs
+   `buildOpenCodeInteractiveArgs`) shaped the same CLI differently, so a fix in
+   one path missed the other.
+
+## Invocation contract
+
+- **Forced, always:** `run`, `--format`, `json`.
+- **`--session <id>`** is added only on the direct path, only above
+  `openCodeNativeMinVersion`, and is the **one droppable token** in the ladder
+  (`openCodeRunShapeResume` → `openCodeRunShapeNoSession`).
+- **Stripped, always:** `--format` / `-f`, `--session` / `-s`, `--continue` /
+  `-c`, `--fork`, `--print-logs` and their values (`openCodeStrippedFlags`,
+  unchanged). **Everything else a caller sends is forwarded as-is** — nothing
+  tells us whether an unknown option is boolean or consumes the next token, so
+  dropping can eat the prompt and keeping can turn a value into prompt text.
+  A forwarded flag OpenCode refuses yields `flag_rejected`, a precise diagnostic.
+- **Prompt never on argv, via two transports.** A one-shot (native turn or smoke)
+  stages it with `writeOpenCodePromptFile` (0600) and hands the open file to the
+  child as stdin, removed on every exit path. A legacy session returns it as
+  `stdinPrompt`; the session manager writes it through the live stdin pipe and
+  closes after the write (`shouldCloseStdinAfterStart` → `hasPrompt`,
+  `deferredStdinClose`). A **promptless** chat-direct start keeps that pipe open
+  for the first `SendInput`, so the two mechanisms stay distinct and are tested
+  separately. This deleted the old 24 KiB pre-spawn argv-ceiling refusal
+  (`openCodeInteractiveMaxPromptBytes`) — dead once the prompt left argv.
+- **Diagnostic invocations** (`--version`, `--help`, `models`, `auth …`) pass
+  through **verbatim**. Reshaping one into a `run` would spend a turn nobody
+  asked for, and `opencode --version` / `opencode models` are how the capability
+  probe and the usage parser query the CLI.
+
+## Legacy signed `session_start` smoke contract
+
+Mirrors Grok, because that is the shape the transport already authenticates: args
+sit inside the command's HMAC payload, so no new signed wire field is needed.
+
+- `openCodeSmokeWireRequests` holds the **two frozen wire argvs**, each followed
+  by exactly one trailing prompt token: `["run","--pure","--format","json"]`
+  (what deployed publishers sign today) and `["run","--format","json"]` (the same
+  request once `--pure` is dropped). Both are accepted for the rollout window, so
+  a publisher can drop the token later without a flag day.
+- **The child argv is derived from the ladder, never from the wire**, so `--pure`
+  is consumed by validation and never reaches OpenCode — the same split that
+  keeps Grok's empty `--tools` operand off its child's command line. No publisher
+  repo is in scope here, so *refusing* today's signed request would leave the
+  terminal-path smoke marker-less, just more precisely.
+- `openCodeMaintenanceSmokePromptPrefix` is `"Return exactly this marker and
+  nothing else: "` (Grok's wording). **The marker is grammar-agnostic on this
+  transport**: `validOpenCodeMaintenanceSmokePrompt` requires only the prefix plus
+  a non-empty, CR/LF-free suffix, byte-for-byte the rule
+  `validGrokMaintenanceSmokePrompt` applies. The publisher's grammar is not
+  visible from this repo and Grok's own transports already disagree about theirs
+  (`…_SMOKE_OK_` + 8 lowercase hex on the direct probe, `…_SMOKE_MARKER_` + 6
+  uppercase hex in the legacy fixture). Requiring the probe's grammar here would
+  leave the real deployed request unrecognized and let `--pure` reach the ordinary
+  session path.
+- **Recognition is broad; validation is exact; breadth is bounded by the reserved
+  token vocabulary, not by a guessed marker grammar.**
+  `openCodeMaintenanceSmokeRequest` treats an argv as the reserved envelope when
+  its last token is a valid marker prompt AND every other token is drawn only
+  from `{run, --pure, --format, json}`. Both frozen shapes and near-miss
+  mutations (reordered, duplicated, one token missing) are promoted and then
+  judged by exact validation, so a mutation fails **closed** instead of quietly
+  running as an ordinary session. An argv carrying anything outside that set
+  (`--model x`, a different subcommand) is ordinary traffic and passes through
+  untouched — a caller flag can never become a refusal.
+- `sessionStartArgsForCommand` promotes a recognized envelope with the private
+  control token `--aiexpedite-opencode-maintenance-smoke`; an argv that already
+  carries it is left alone. `StartSession` then validates the promoted argv with
+  `validateOpenCodeSmokeRequest` **before** general normalization, consumes the
+  control token (`extractOpenCodeMaintenanceSmokeControl` — it can never reach a
+  child), runs the ladder's argv with the prompt on the managed stdin pipe, and
+  refuses a malformed promoted request with a **fixed** error that never echoes
+  the offending token, spawning nothing.
+- The compatibility test is driven from a captured request fixture
+  ([testdata/opencode_legacy_smoke_request.json](testdata/opencode_legacy_smoke_request.json))
+  rather than a marker this repo invents.
+
+## Failure classification (`__cli_smoke__`, cliId `opencode`)
+
+Every outcome maps to **exactly one** closed diagnostic. `launch_error`
+(`cliSmokeDiagnosticLaunchError`) is new: folding a spawn failure into
+`no_envelope` would be the same fused bucket under a new name. It is listed in
+`cliSmokeVerdictSpentTurn`'s no-turn set.
+
+| Observation | `errorCategory` | `diagnostic` |
+| --- | --- | --- |
+| Spawn failed (CreateProcess refused, shim unrenderable, prompt/cwd staging failed) | `provider_unavailable` | `launch_error` |
+| Binary absent or `--version` unanswerable | `provider_unavailable` | `binary_missing` |
+| Conclusive "no usable provider" from the readiness probe | `not_authenticated` | `not_logged_in` |
+| Non-zero exit, no terminal frame, stderr shows an option-parsing rejection | `protocol` | `flag_rejected` |
+| …and the rejection names `--format` / `json` | `protocol` | `framing_rejected` |
+| Non-zero exit, no terminal frame, no recognizable rejection | `protocol` | `no_envelope` |
+| Clean exit with no terminal frame | `protocol` | `no_envelope` |
+| Malformed/truncated JSON, a frame past `openCodeNativeMaxFrameBytes`, stdout past the 1 MiB retention cap | `protocol` | `no_envelope` |
+| Error event mentioning auth | `not_authenticated` | `auth_error` |
+| Error event mentioning limit / quota / overloaded / unavailable / api error | `provider_unavailable` | `provider_error` |
+| Terminal frame whose accumulated assistant text is not the marker | `parse_failed` | `marker_mismatch` |
+| Per-attempt deadline, or the delivery context cancelled | `provider_timeout` | `timeout` |
+| Marker RNG failure | `internal_error` | `internal` |
+
+- `framing_rejected` is **never inferred from silence** — only a positive
+  rejection names it.
+- **Partial text is never matched against the marker**: overflow is recorded as a
+  byte count in the local log line, and the run reports `no_envelope`.
+- **The probe never retries** (nothing droppable in its argv). The direct path
+  retries once for a rejected `--session` via the **existing replay recovery**
+  (`openCodeRejectedSessionFlag` → clear `NativeSessionID`, rebuild with
+  `buildOpenCodeReplayPrompt`, run the no-session rung), not a bare retry — a bare
+  retry would silently start a fresh conversation, the trap
+  `looksLikeMissingOpenCodeSession` was written to avoid.
+- `binary_missing`, `not_logged_in`, `auth_error`, `launch_error` and `internal`
+  are **not cached**. A shape is remembered only while the binary stamp is
+  unchanged (`bindCLISmokeShape`).
+- Cost: OpenCode has **no quota of its own** (`cliagent_usage_opencode.go` reports
+  models, not limits), so the turn is spent against whichever provider sits behind
+  it. The shared 15-minute cooldown + singleflight bound that to one turn per
+  binary per window, and the free `opencode models` readiness pre-check
+  short-circuits an unusable install before anything is spent. The probe runs in a
+  **fresh empty cwd** so a repository's `opencode.json` cannot decide what it
+  measures.
+- `probeOpenCodeNativeCapability`'s positive cache is keyed by **(path, mtime,
+  size)** instead of a bare 5-minute TTL, so a binary replaced mid-window cannot
+  keep the previous build's resume capability and be handed an unsupported
+  `--session`. `openCodeProbeVersion` is the **only** OpenCode version probe and
+  shares that key — a plain spawn of `opencode.cmd` would cache its own `""`
+  under it and every later shim-aware probe would read the negative back.
+
+## Windows shim argument encoding
+
+- The script body contains **no argv text**. It is
+  `"%AIEXPEDITE_OPENCODE_SHIM_PATH%"` followed by one quoted
+  `%AIX_OPENCODE_ARG_n%` reference **per token of the already-built argv — flag
+  names included**, each value set in the child environment by
+  `openCodeShimCommand`. The renderer never inspects or matches a token, so it
+  imposes no argv vocabulary of its own: `run --format json`, `--session <id>`,
+  `--model <m>`, an unknown forwarded flag and its value, `models` and the
+  two-token `auth list` all render the same way. **A shim install runs the same
+  argv a native install does.** (Grok's and Codex's renderers allowlist known
+  flag names instead, which is why reusing either would refuse every OpenCode
+  launch and fall back to the plain spawn a `.cmd` shim cannot survive.)
+- **ONE character policy**, shared by this prose and the tests: `openCodeShimScript`
+  returns `ok=false` (→ `launch_error`) when a token contains a **double quote**,
+  **`%`**, **CR**, **LF** or another **control character**, when a token is
+  **empty**, or when the token count exceeds `openCodeShimMaxArgs`. Those are what
+  break the quoting or get re-read by cmd's single expansion pass. **Spaces and
+  `&` / `^` / `(` / `)` / `|` are supported** — the reference is quoted and delayed
+  expansion is off (`/v:off`) — and are asserted as successful round-trips, not
+  refusals. The cost: a value containing a literal `%` or a double quote cannot
+  run on a Windows shim install.
+- The shim is invoked **directly**, with no leading `call`: `call` performs a
+  second percent-expansion pass over the already-expanded line and would mangle a
+  path holding a paired percent sequence (`C:\Users\dev\%DEV%\opencode.cmd`).
+- **On Windows a refusal is terminal.** Falling back to a direct `.cmd` spawn
+  would fail in CreateProcess anyway, so failing closed is the honest answer.
+- `Stdin` is set by the caller on the returned `*exec.Cmd`; cmd.exe passes it to
+  the shim's child, so the prompt transport is identical on both routes.
+- Off Windows, `openCodeShimCommand` returns `(nil, false)` and callers spawn the
+  native binary directly.
+
+## Redaction
+
+- The published `cliSmokeResult` carries `markerMatched`, a shape id and counts.
+  It never carries child stdout, stderr, the prompt, the marker nonce, argv, the
+  resolved path, credentials or config.
+- `openCodeSmokeFailureLogLine(shapeID, category, diagnostic, stderrBytes,
+  stdoutBytes int)` takes **lengths only** — a function that cannot receive vendor
+  text cannot leak it, however a future caller wires it up.
+- Fixed refusal errors never echo the offending token, and the approval dialog
+  stopped rendering prompt text because the gated argv no longer carries it
+  (`gateSessionEntryCommand` strips the control token first, then shapes).
+
+## Coverage gap
+
+CI has no real `opencode` binary. Classification is unit-tested through the exec
+seam, and the Windows execution regression is covered by a functional test
+([cliagent_smoke_opencode_exec_windows_test.go](cliagent_smoke_opencode_exec_windows_test.go),
+`//go:build windows`) against a temporary fake `.cmd` shim that forwards to the
+compiled stub — proof that cmd.exe starts a shim, that stdin reaches its child and
+that the marker classifies, without a vendor binary. **The first proof against the
+real CLI is still the post-update smoke on a Windows device.**
