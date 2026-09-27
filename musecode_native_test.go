@@ -15,10 +15,10 @@ func TestParseMuseCodeEventLine(t *testing.T) {
 		ok   bool
 		want oneShotEvent
 	}{
-		{"delta", museFrameDeltaHello, true, oneShotEvent{TextDelta: "Hello", SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
-		{"delta field variant", `{"payload_type":"run.output.delta","payload":{"delta":"Hi"}}`, true, oneShotEvent{TextDelta: "Hi"}},
-		{"delta keeps a lone space", `{"payload_type":"run.output.delta","payload":{"delta":" "}}`, true, oneShotEvent{TextDelta: " "}},
-		{"delta text fallback", `{"payload_type":"run.output.delta","payload":{"text":"hi"}}`, true, oneShotEvent{TextDelta: "hi"}},
+		{"delta", museFrameDeltaHello, true, oneShotEvent{Coalesce: true, TextDelta: "Hello", SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
+		{"delta field variant", `{"payload_type":"run.output.delta","payload":{"delta":"Hi"}}`, true, oneShotEvent{Coalesce: true, TextDelta: "Hi"}},
+		{"delta keeps a lone space", `{"payload_type":"run.output.delta","payload":{"delta":" "}}`, true, oneShotEvent{Coalesce: true, TextDelta: " "}},
+		{"delta text fallback", `{"payload_type":"run.output.delta","payload":{"text":"hi"}}`, true, oneShotEvent{Coalesce: true, TextDelta: "hi"}},
 		{"completed", museFrameCompleted, true, oneShotEvent{FinalText: "Hello world", SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
 		{"failed with status", museFrameFailed402, true, oneShotEvent{
 			Failure: "[Muse Code turn failed: billing_not_configured (status 402): Billing is not configured for this account.]"}},

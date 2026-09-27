@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -87,11 +88,15 @@ func TestOneShotNative_SendStreamsFramesAndPublishesIDAfterSuccess(t *testing.T)
 		t.Fatalf("send: %v", err)
 	}
 
-	// One MESSAGE per rendered event line, then the completion. The echoed
-	// prompt (turn.input.user) and task scheduling chatter are not published.
+	// One MESSAGE per rendered event line, then the completion. The two text
+	// deltas merge into one frame; the echoed prompt (turn.input.user) and task
+	// scheduling chatter are not published.
 	msgs := sink.ofType("musecode_native_message")
-	if len(msgs) != 5 {
-		t.Fatalf("want 4 event frames + 1 completion, got %d", len(msgs))
+	if len(msgs) != 4 {
+		t.Fatalf("want 1 merged delta + task + terminal + completion frames, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Output, `"text":"Hello world"`) || !strings.Contains(msgs[0].Output, "run.output.delta") {
+		t.Fatalf("adjacent deltas must publish as one delta record, got %s", msgs[0].Output)
 	}
 	for _, f := range msgs {
 		if strings.Contains(f.Output, "turn.input.user") || strings.Contains(f.Output, "task.lifecycle.scheduled") {
@@ -412,4 +417,61 @@ func TestOneShotNative_SeedBelowVersionFloorFailsClosed(t *testing.T) {
 	if err := m.Start("s", t.TempDir(), "ws", "uid", "", nil, nil); err != nil {
 		t.Fatalf("an unseeded start below the floor must still work: %v", err)
 	}
+}
+
+func TestDeltaCoalescer(t *testing.T) {
+	render := func(text string) string { return "D:" + text }
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	emit := func(line string) { mu.Lock(); out = append(out, line); mu.Unlock() }
+	snapshot := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), out...) }
+
+	t.Run("a non-delta line flushes buffered text ahead of itself", func(t *testing.T) {
+		out = nil
+		c := newDeltaCoalescer(render, emit)
+		c.add("Hel")
+		c.add("lo")
+		c.publish("TOOL")
+		c.close()
+		if got := strings.Join(snapshot(), "|"); got != "D:Hello|TOOL" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("the size bound flushes without waiting", func(t *testing.T) {
+		out = nil
+		c := newDeltaCoalescer(render, emit)
+		c.add(strings.Repeat("x", oneShotDeltaFlushBytes))
+		if len(snapshot()) != 1 {
+			t.Fatal("a full buffer must flush immediately")
+		}
+		c.close()
+	})
+
+	t.Run("the timer flushes a stalled stream, and close flushes the rest once", func(t *testing.T) {
+		out = nil
+		c := newDeltaCoalescer(render, emit)
+		c.add("thinking")
+		deadline := time.Now().Add(5 * time.Second)
+		for len(snapshot()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := snapshot(); len(got) != 1 || got[0] != "D:thinking" {
+			t.Fatalf("stalled text must surface within the flush delay, got %q", got)
+		}
+		c.add("tail")
+		c.close()
+		time.Sleep(2 * oneShotDeltaFlushDelay)
+		if got := strings.Join(snapshot(), "|"); got != "D:thinking|D:tail" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("no renderer means no coalescing", func(t *testing.T) {
+		if newDeltaCoalescer(nil, emit).add("x") {
+			t.Fatal("a spec without DeltaFrame must publish deltas as-is")
+		}
+	})
 }

@@ -69,6 +69,10 @@ const (
 	oneShotNativeMaxPublishSize = 10_000_000
 	// Ceiling for a `--version` capability probe.
 	oneShotVersionProbeTimeout = 15 * time.Second
+	// Coalesced text deltas flush at whichever comes first: this much text,
+	// this long after the first buffered delta, or the next non-delta line.
+	oneShotDeltaFlushBytes = 4 * 1024
+	oneShotDeltaFlushDelay = 250 * time.Millisecond
 )
 
 /* --------------------------------------------------------------------------
@@ -91,6 +95,9 @@ type oneShotEvent struct {
 	// turn result and the diagnostic raw buffer but is not published: every
 	// published line costs a Pub/Sub message and a Firestore chunk write.
 	Internal bool
+	// Coalesce marks a pure text-delta line that may be merged with its
+	// neighbours into one published frame (spec.DeltaFrame).
+	Coalesce bool
 }
 
 // nativeFrameKind names a native chat kind on the wire: the part the Pub/Sub
@@ -132,6 +139,10 @@ type oneShotNativeSpec struct {
 	// ParseEventLine parses one stdout line; ok=false for a non-JSON line,
 	// which is forwarded to the UI but contributes nothing.
 	ParseEventLine func(line string) (oneShotEvent, bool)
+	// DeltaFrame, when set, renders merged Coalesce deltas as one event line
+	// in the CLI's own shape, so a token-level stream costs one publish per
+	// flush window instead of one per token.
+	DeltaFrame func(text string) string
 	// MintNativeID, when set, marks a CLI whose resume id is CALLER-SUPPLIED
 	// (the CLI creates the session under whatever id it is given). The
 	// manager mints one per logical session instead of capturing it.
@@ -752,6 +763,10 @@ func (m *oneShotNativeManager) streamEvents(
 	var state oneShotStreamState
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), oneShotNativeMaxFrameBytes)
+	deltas := newDeltaCoalescer(m.spec.DeltaFrame, func(line string) {
+		m.publishEventFrame(session, publishFn, line)
+	})
+	defer deltas.close()
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -781,8 +796,11 @@ func (m *oneShotNativeManager) streamEvents(
 			if ev.Internal {
 				continue
 			}
+			if ev.Coalesce && deltas.add(ev.TextDelta) {
+				continue
+			}
 		}
-		m.publishEventFrame(session, publishFn, line)
+		deltas.publish(line)
 	}
 	if err := scanner.Err(); err != nil {
 		// A frame beyond the cap or a read error: the output cannot be trusted
@@ -819,6 +837,72 @@ func (m *oneShotNativeManager) publishEventFrame(session *oneShotNativeSession, 
 		return
 	}
 	publishFn(msg)
+}
+
+// deltaCoalescer merges consecutive text deltas into one published frame.
+// Publishing happens under its mutex so a timer flush and the scanner's next
+// line cannot reorder frames.
+type deltaCoalescer struct {
+	render  func(string) string
+	emit    func(string)
+	mu      sync.Mutex
+	pending strings.Builder
+	timer   *time.Timer
+	closed  bool
+}
+
+func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoalescer {
+	return &deltaCoalescer{render: render, emit: emit}
+}
+
+// publish emits a non-delta line after whatever text is buffered ahead of it.
+func (c *deltaCoalescer) publish(line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked()
+	c.emit(line)
+}
+
+// add buffers a delta; false means coalescing is off and the caller publishes
+// the line itself.
+func (c *deltaCoalescer) add(text string) bool {
+	if c.render == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pending.WriteString(text)
+	if c.pending.Len() >= oneShotDeltaFlushBytes {
+		c.flushLocked()
+	} else if c.timer == nil {
+		c.timer = time.AfterFunc(oneShotDeltaFlushDelay, func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.flushLocked()
+		})
+	}
+	return true
+}
+
+func (c *deltaCoalescer) flushLocked() {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	if c.closed || c.pending.Len() == 0 {
+		return
+	}
+	text := c.pending.String()
+	c.pending.Reset()
+	c.emit(c.render(text))
+}
+
+// close flushes what is buffered and disables the timer path.
+func (c *deltaCoalescer) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked()
+	c.closed = true
 }
 
 /* --------------------------------------------------------------------------

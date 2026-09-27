@@ -78,6 +78,7 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	ProbeVersion:       museCodeProbeVersion,
 	BuildArgs:          buildMuseCodeNativeArgs,
 	ParseEventLine:     parseMuseCodeEventLine,
+	DeltaFrame:         museCodeDeltaFrame,
 	MintNativeID:       newRandomUUID,
 	ValidSeed:          isValidMuseCodeSessionID,
 	LooksLikeMissingSession: func(stdout, stderr string) bool {
@@ -232,6 +233,7 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 	case "run.output.delta":
 		// Untrimmed: a delta may be one meaningful space or newline.
 		ev.TextDelta = firstNonEmptyRaw(env.Payload.Delta, env.Payload.Text)
+		ev.Coalesce = true
 	case "run.terminal.completed":
 		ev.FinalText = env.Payload.Text
 	case "run.terminal.failed":
@@ -245,6 +247,19 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 			firstNonEmpty(env.Payload.Reason, "the run was cancelled before it completed"))
 	}
 	return ev, true
+}
+
+// museCodeDeltaFrame renders merged deltas as one `run.output.delta` record in
+// the CLI's own shape, so every consumer parses it like a native one.
+func museCodeDeltaFrame(text string) string {
+	b, err := json.Marshal(map[string]any{
+		"payload_type": "run.output.delta",
+		"payload":      map[string]string{"kind": "run_output_delta", "text": text},
+	})
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // formatMuseCodeFailure renders the device's turn-failed frame. The shape is a
