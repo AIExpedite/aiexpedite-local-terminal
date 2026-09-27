@@ -184,6 +184,27 @@ func TestClassifyOpenCodeSmokeRun_MapsEveryOutcomeOntoTheClosedSet(t *testing.T)
 			wantDiagnostic: cliSmokeDiagnosticFramingRejected,
 		},
 		{
+			name:           "a rejected output contract printed on stdout is still framing",
+			stdout:         "error: unknown option '--format'\n",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticFramingRejected,
+		},
+		{
+			name:           "a rejected flag printed on stdout is still flag_rejected",
+			stdout:         "error: unexpected argument '--pure' found\n\nUsage: opencode run [OPTIONS]\n      --format <FORMAT>\n",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticFlagRejected,
+		},
+		{
+			name:           "model text in a JSON event never reads as an option rejection",
+			stdout:         `{"type":"text","text":"unknown option --format"}` + "\n",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoEnvelope,
+		},
+		{
 			name:           "a generic non-zero exit is no_envelope",
 			stderr:         "something went wrong deep inside",
 			runErr:         exitErr,
@@ -331,7 +352,7 @@ func TestOpenCodeSmokeNoEnvelopeDiagnostic_UsageBlockDoesNotForgeFramingRejected
 	usage := "error: unexpected argument '--not-a-known-flag' found\n\n" +
 		"Usage: opencode run [OPTIONS] [PROMPT]\n\nOptions:\n" +
 		"      --format <FORMAT>  Output format [possible values: text, json]\n"
-	if got := openCodeSmokeNoEnvelopeDiagnostic([]byte(usage)); got != cliSmokeDiagnosticFlagRejected {
+	if got := openCodeSmokeNoEnvelopeDiagnostic(nil, []byte(usage)); got != cliSmokeDiagnosticFlagRejected {
 		t.Fatalf("a rejected caller flag whose usage block mentions json = %q, want flag_rejected", got)
 	}
 	// A genuine refusal of the output contract still reports framing_rejected.
@@ -339,12 +360,12 @@ func TestOpenCodeSmokeNoEnvelopeDiagnostic_UsageBlockDoesNotForgeFramingRejected
 		"error: unknown option '--format'",
 		"error: unrecognized value 'json' for --format",
 	} {
-		if got := openCodeSmokeNoEnvelopeDiagnostic([]byte(stderr)); got != cliSmokeDiagnosticFramingRejected {
+		if got := openCodeSmokeNoEnvelopeDiagnostic(nil, []byte(stderr)); got != cliSmokeDiagnosticFramingRejected {
 			t.Fatalf("%q = %q, want framing_rejected", stderr, got)
 		}
 	}
 	// And a non-rejection stays no_envelope.
-	if got := openCodeSmokeNoEnvelopeDiagnostic([]byte("panic: nil map")); got != cliSmokeDiagnosticNoEnvelope {
+	if got := openCodeSmokeNoEnvelopeDiagnostic(nil, []byte("panic: nil map")); got != cliSmokeDiagnosticNoEnvelope {
 		t.Fatalf("a non-rejection = %q, want no_envelope", got)
 	}
 }

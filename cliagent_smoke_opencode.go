@@ -728,7 +728,7 @@ func classifyOpenCodeSmokeRun(timedOut bool, stdout, stderr []byte, runErr error
 			// Exit non-zero with no terminal frame: the CLI rejected our
 			// invocation shape before producing its documented output — the
 			// pre-inference exit this probe exists to name precisely.
-			return cliUsageErrorProtocol, openCodeSmokeNoEnvelopeDiagnostic(stderr), false
+			return cliUsageErrorProtocol, openCodeSmokeNoEnvelopeDiagnostic(stdout, stderr), false
 		}
 		// A clean exit that never emitted a completion event — an updater
 		// notice on stdout, a build whose event contract moved — is a broken
@@ -783,21 +783,56 @@ func openCodeStderrErrorRegion(lower string) string {
 //   - flag_rejected — the CLI refused one of OUR options during parsing.
 //   - no_envelope — anything else; a turn MAY already have been consumed.
 //
-// The stderr bytes are read only to pick between these constants; not one byte
-// of them travels any further.
-func openCodeSmokeNoEnvelopeDiagnostic(stderr []byte) string {
-	lower := strings.ToLower(string(stderr))
-	if !openCodeOptionRejectionText(lower) {
+// BOTH streams are read, as openCodeRejectedSessionFlag does and for the same
+// reason: an OpenCode build can print its option-parse failure as a plain line
+// on STDOUT, and reading stderr alone misreported that rejection as
+// no_envelope. On stdout only the non-JSON lines count — a JSON event is the
+// CLI's documented output (possibly model text quoting "--format"), never a
+// parser error. Each stream is cut to its own error region, so a usage block
+// on one stream cannot name the flag refused on the other.
+//
+// The bytes are read only to pick between these constants; not one byte of
+// them travels any further.
+func openCodeSmokeNoEnvelopeDiagnostic(stdout, stderr []byte) string {
+	rejected, framing := false, false
+	for _, lower := range []string{
+		strings.ToLower(openCodeStdoutPlainLines(stdout)),
+		strings.ToLower(string(stderr)),
+	} {
+		if !openCodeOptionRejectionText(lower) {
+			continue
+		}
+		rejected = true
+		// Read the ERROR region only, and match the flag NAME rather than a bare
+		// `json` substring. OpenCode prints a usage block after an option error
+		// and that block lists `--format <FORMAT> … [possible values: text,
+		// json]`, so searching the whole stream for either `json` or `--format`
+		// reported every rejected CALLER flag as a broken framing contract — the
+		// precise diagnostic this probe exists to provide, inverted.
+		if strings.Contains(openCodeStderrErrorRegion(lower), "--format") {
+			framing = true
+		}
+	}
+	switch {
+	case framing:
+		return cliSmokeDiagnosticFramingRejected
+	case rejected:
+		return cliSmokeDiagnosticFlagRejected
+	default:
 		return cliSmokeDiagnosticNoEnvelope
 	}
-	// Read the ERROR region only, and match the flag NAME rather than a bare
-	// `json` substring. OpenCode prints a usage block after an option error and
-	// that block lists `--format <FORMAT> … [possible values: text, json]`, so
-	// searching the whole of stderr for either `json` or `--format` reported
-	// every rejected CALLER flag as a broken framing contract — the precise
-	// diagnostic this probe exists to provide, inverted.
-	if strings.Contains(openCodeStderrErrorRegion(lower), "--format") {
-		return cliSmokeDiagnosticFramingRejected
+}
+
+// openCodeStdoutPlainLines keeps only the stdout lines that are not JSON
+// objects: the place a build that writes parser errors to stdout puts them.
+// Bounded by the caller's stdout retention cap.
+func openCodeStdoutPlainLines(stdout []byte) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(string(stdout), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			continue
+		}
+		b.WriteString(line)
 	}
-	return cliSmokeDiagnosticFlagRejected
+	return b.String()
 }

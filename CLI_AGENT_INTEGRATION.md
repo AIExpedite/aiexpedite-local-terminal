@@ -1594,7 +1594,7 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | `exec.ErrWaitDelay` — the child RAN, a tool grandchild held the pipe | *classified from the captured output* | *(never `launch_error`)* |
 | Binary absent or `--version` unanswerable | `provider_unavailable` | `binary_missing` |
 | Conclusive "no usable provider" from the readiness probe | `not_authenticated` | `not_logged_in` |
-| Non-zero exit, no terminal frame, stderr shows an option-parsing rejection | `protocol` | `flag_rejected` |
+| Non-zero exit, no terminal frame, stderr or a non-JSON stdout line shows an option-parsing rejection | `protocol` | `flag_rejected` |
 | …and the rejection's ERROR REGION names `--format` | `protocol` | `framing_rejected` |
 | Non-zero exit, no terminal frame, no recognizable rejection | `protocol` | `no_envelope` |
 | Clean exit with no terminal frame | `protocol` | `no_envelope` |
