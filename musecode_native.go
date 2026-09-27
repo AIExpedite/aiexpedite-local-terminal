@@ -461,3 +461,46 @@ func buildMuseCodeInteractiveArgs(args []string) []string {
 func isMuseCodeSynthesizedRun(args []string) bool {
 	return len(args) >= 3 && args[0] == "exec" && args[1] == "--json" && args[2] == "--disable-approval"
 }
+
+// rewriteMuseCodePromptToFile relocates the trailing positional prompt of a
+// synthesized `muse exec` argv into an owner-only temp file referenced by
+// `--prompt-file`, and returns the rewritten argv plus the path to remove.
+//
+// Only the Windows `.cmd` shim launch needs this (StartSession): cmd.exe gets
+// one expansion pass, so oneShotShimScript refuses an operand holding a quote
+// or a line break — which a prompt routinely holds. Moving the prompt to a file
+// leaves argv with flags and a path, which the shim renderer can carry safely.
+// A non-synthesized (diagnostic) argv, or a promptless one, is returned
+// unchanged with an empty path.
+func rewriteMuseCodePromptToFile(args []string) (rewritten []string, cleanupPath string) {
+	if !isMuseCodeSynthesizedRun(args) {
+		return args, ""
+	}
+	sep := -1
+	for i, a := range args {
+		if a == "--" {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 || sep+1 >= len(args) {
+		return args, ""
+	}
+	prompt := strings.Join(args[sep+1:], " ")
+	if strings.TrimSpace(prompt) == "" {
+		return args, ""
+	}
+	path, handle, err := writeOneShotPromptFile(
+		museCodeNativeSpec.PromptDirName, museCodeNativeSpec.PromptFilePrefix, prompt)
+	if err != nil {
+		// Fall back to the positional form; a launch failure is a clearer
+		// signal than silently dropping the user's prompt.
+		return args, ""
+	}
+	_ = handle.Close() // the child reads the path, not stdin
+
+	out := make([]string, 0, sep+2)
+	out = append(out, args[:sep]...)
+	out = append(out, "--prompt-file", path)
+	return out, path
+}

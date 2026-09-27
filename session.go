@@ -512,6 +512,20 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		executable = resolveExecutable(command)
 	}
 
+	// A Windows `.cmd` / `.bat` launcher (an npm-style `muse.cmd`) cannot be
+	// started by CreateProcess directly — the same failure newOneShotCommand
+	// fixes on the native chat path. The generic session_start / takeover route
+	// resolves that same installation, so shim-launch it the same way. The
+	// prompt moves to `--prompt-file` first: cmd.exe has a single expansion
+	// pass, so oneShotShimScript refuses an operand holding a quote or a line
+	// break, and a prompt routinely holds both.
+	museShimLaunch := isMuseCodeCommand(command) && isWindowsShimPath(executable)
+	if museShimLaunch {
+		if rewritten, staged := rewriteMuseCodePromptToFile(cliArgs); staged != "" {
+			cliArgs, promptFile = rewritten, staged
+		}
+	}
+
 	logSession(id, "%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, sessionArgsForLog(cliArgs), colorReset)
 
@@ -562,6 +576,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			Dir:        proc.Dir,
 			PromptFile: promptFile,
 		})
+	}
+	if museShimLaunch {
+		// cmd.exe wrapper carrying the shim path and every non-fixed operand in
+		// its environment. The wrapper is an intermediate process, not muse
+		// itself; killSessionProcess tree-kills Windows sessions, so the shim's
+		// child goes down with it.
+		shimmed := newOneShotCommand(context.Background(), executable, cliArgs, proc.Env, proc.Dir)
+		hideWindow(shimmed)
+		proc = shimmed
 	}
 	if len(strippedVars) > 0 {
 		logSession(id, "%s[session] Stripped env vars from session %s: %s%s\n",

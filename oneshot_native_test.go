@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -580,5 +581,35 @@ func TestOneShotShimScript_KeepsVariableOperandsInTheEnvironment(t *testing.T) {
 		if _, _, ok := oneShotShimScript("muse.cmd", []string{"--prompt-file", bad}, nil); ok {
 			t.Fatalf("operand %q cannot survive cmd.exe quoting and must be refused", bad)
 		}
+	}
+}
+
+// The completion frame is the one place a full assistant turn leaves the
+// device; a tool that echoed an inherited credential must not be republished
+// verbatim there just because the streamed deltas were already redacted.
+func TestOneShotCompletionFrameRedactsCredentialShapedText(t *testing.T) {
+	secret := "mk-live-0123456789abcdef"
+	frame := oneShotCompletionFrame("done. META_API_KEY="+secret+"\n", false)
+	if strings.Contains(frame, secret) {
+		t.Fatalf("completion frame leaked the credential: %q", frame)
+	}
+	var payload struct {
+		Type  string `json:"type"`
+		Text  string `json:"text"`
+		Final bool   `json:"final"`
+	}
+	if err := json.Unmarshal([]byte(frame), &payload); err != nil {
+		t.Fatalf("completion frame is not JSON: %v", err)
+	}
+	if payload.Type != "aiexpedite.turn_complete" || !payload.Final {
+		t.Fatalf("completion envelope changed shape: %+v", payload)
+	}
+	if !strings.Contains(payload.Text, "[REDACTED]") {
+		t.Fatalf("expected a redaction marker in %q", payload.Text)
+	}
+	// Ordinary assistant text is untouched.
+	plain := oneShotCompletionFrame("hello world", true)
+	if !strings.Contains(plain, "hello world") || !strings.Contains(plain, "replayRecovery") {
+		t.Fatalf("plain completion frame altered: %q", plain)
 	}
 }

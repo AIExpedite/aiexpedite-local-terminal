@@ -590,10 +590,16 @@ func (m *oneShotNativeManager) rotateUnconfirmedID(session *oneShotNativeSession
 
 // oneShotCompletionFrame wraps the coalesced text in the terminal completion
 // envelope the frontend and ai-service recognize (same contract as OpenCode).
+//
+// The text is redacted here, not by the caller: this frame is the one place the
+// full assistant turn leaves the device (the streamed deltas already go through
+// publishEventFrame's redactAgentSecrets), so a tool that echoed an inherited
+// credential would otherwise republish it verbatim. Redaction is idempotent, so
+// a delta already masked upstream is unaffected.
 func oneShotCompletionFrame(text string, usedReplay bool) string {
 	payload := map[string]any{
 		"type":  "aiexpedite.turn_complete",
-		"text":  text,
+		"text":  redactAgentSecrets(text),
 		"final": true,
 	}
 	if usedReplay {
@@ -601,7 +607,7 @@ func oneShotCompletionFrame(text string, usedReplay bool) string {
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return text
+		return redactAgentSecrets(text)
 	}
 	return string(encoded)
 }

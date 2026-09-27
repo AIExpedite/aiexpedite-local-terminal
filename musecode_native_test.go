@@ -292,3 +292,56 @@ func TestReadOutputStream_MuseCodeRendersAssistantText(t *testing.T) {
 		t.Fatalf("a plain line must pass through, got %q", got)
 	}
 }
+
+// The Windows `.cmd` shim launch (StartSession) routes argv through cmd.exe,
+// whose single expansion pass cannot carry an operand holding a quote or a line
+// break — so the legacy positional prompt moves into a --prompt-file first.
+func TestRewriteMuseCodePromptToFile(t *testing.T) {
+	shaped := buildMuseCodeInteractiveArgs([]string{"--model", "m", "review \"this\"\nplease"})
+	rewritten, path := rewriteMuseCodePromptToFile(shaped)
+	if path == "" {
+		t.Fatalf("expected the prompt to be staged; argv=%v", shaped)
+	}
+	defer os.Remove(path)
+
+	joined := strings.Join(rewritten, " ")
+	if strings.Contains(joined, "review") || strings.Contains(joined, "please") {
+		t.Fatalf("prompt text must leave argv: %q", joined)
+	}
+	for _, a := range rewritten {
+		if a == "--" {
+			t.Fatalf("the positional separator must go with the prompt: %v", rewritten)
+		}
+	}
+	if rewritten[len(rewritten)-2] != "--prompt-file" || rewritten[len(rewritten)-1] != path {
+		t.Fatalf("argv must end with --prompt-file <path>: %v", rewritten)
+	}
+	if !isMuseCodeSynthesizedRun(rewritten) {
+		t.Fatalf("rewritten argv lost the forced headless shape: %v", rewritten)
+	}
+	if !strings.Contains(strings.Join(rewritten, " "), "--model m") {
+		t.Fatalf("forwarded flags dropped: %v", rewritten)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "review \"this\"\nplease" {
+		t.Fatalf("prompt file content changed: %q", body)
+	}
+	if info, statErr := os.Stat(path); statErr == nil && runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("prompt file must be owner-only, got %v", perm)
+		}
+	}
+
+	// A diagnostic invocation and a promptless argv are returned untouched.
+	diag := []string{"--version"}
+	if got, p := rewriteMuseCodePromptToFile(diag); p != "" || strings.Join(got, " ") != "--version" {
+		t.Fatalf("diagnostic argv must pass through: %v %q", got, p)
+	}
+	bare := buildMuseCodeInteractiveArgs([]string{"--model", "m"})
+	if got, p := rewriteMuseCodePromptToFile(bare); p != "" || strings.Join(got, " ") != strings.Join(bare, " ") {
+		t.Fatalf("promptless argv must pass through: %v %q", got, p)
+	}
+}
