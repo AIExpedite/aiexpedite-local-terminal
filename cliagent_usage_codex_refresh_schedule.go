@@ -257,7 +257,7 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 		// budget bounds these retries, and a cache wedged for hours would
 		// otherwise re-check (and log) every 15 s for the whole age-out.
 		retry := codexFreeRetryDelay(now.Sub(state.owedAt))
-		codexArmRunDebtRetry(id, fp, retry)
+		codexArmRunDebtRetry(id, fp, 0, retry)
 		fmt.Printf("%s[cli-usage] codex run refresh rung not persisted (cache busy); retrying in %ds%s\n",
 			colorYellow, int(retry.Round(time.Second).Seconds()), colorReset)
 		return true
@@ -266,7 +266,7 @@ func codexScheduleRunDebtRetry(fp string, state codexRunFreshnessState, now time
 		return false
 	}
 	delay := next.Sub(now)
-	codexArmRunDebtRetry(id, fp, delay)
+	codexArmRunDebtRetry(id, fp, next.UnixMilli(), delay)
 	fmt.Printf("%s[cli-usage] codex run refresh retry scheduled in %ds (scans=%d/%d reads=%d/%d)%s\n",
 		colorCyan, int(delay.Round(time.Second).Seconds()),
 		scans, codexRefreshAfterRunMaxAttempts, reads, codexRefreshLiveReadMaxAttempts, colorReset)
@@ -286,8 +286,10 @@ func codexRefreshSpacingRemaining(fp string, now time.Time) time.Duration {
 }
 
 // codexArmRunDebtRetry replaces the pending timer with one that fires after
-// delay for the debt generation id under the account fp.
-func codexArmRunDebtRetry(id codexDebtID, fp string, delay time.Duration) {
+// delay for the debt generation id under the account fp. rungMs is the
+// NextAttemptAtMs the timer stands for, which its callback claims before running
+// (codexClaimRunDebtRung); zero means the rung never reached disk.
+func codexArmRunDebtRetry(id codexDebtID, fp string, rungMs int64, delay time.Duration) {
 	if delay < 0 {
 		delay = 0
 	}
@@ -299,7 +301,7 @@ func codexArmRunDebtRetry(id codexDebtID, fp string, delay time.Duration) {
 	}
 	t.gen++
 	gen := t.gen
-	t.timer = time.AfterFunc(delay, func() { codexRunDebtRetryFired(gen, id, fp) })
+	t.timer = time.AfterFunc(delay, func() { codexRunDebtRetryFired(gen, id, fp, rungMs) })
 }
 
 // codexRunDebtRetryFired is the timer's callback. It re-reads the debt before
@@ -309,7 +311,12 @@ func codexArmRunDebtRetry(id codexDebtID, fp string, delay time.Duration) {
 // firing that finds a worker already running RE-ARMS it (claimWorker /
 // takeRearm) rather than starting a second, so the attempt budget cannot be
 // spent twice.
-func codexRunDebtRetryFired(gen uint64, id codexDebtID, fp string) {
+//
+// That re-arm alone cannot tell a newer run from a second trigger for the SAME
+// rung, so the rung is claimed first: a gather that nudged the due rung
+// (nudgeCodexUsageRefresh) has already cleared it, and this firing then does
+// nothing instead of re-arming the worker for an extra pass inside one interval.
+func codexRunDebtRetryFired(gen uint64, id codexDebtID, fp string, rungMs int64) {
 	t := &codexRunDebtRetryTimer
 	t.mu.Lock()
 	if gen != t.gen {
@@ -343,7 +350,38 @@ func codexRunDebtRetryFired(gen uint64, id codexDebtID, fp string) {
 	if state.debtID() != id {
 		return
 	}
+	if !codexClaimRunDebtRung(fp, id, rungMs, now) {
+		return
+	}
 	codexRunDebtWorker(base, fp)
+}
+
+// codexClaimRunDebtRung atomically consumes the persisted rung rungMs of debt
+// generation id, so the timer and a gather that both see the same due
+// NextAttemptAtMs start ONE payment pass between them rather than two — the
+// second would re-arm the running worker and spend a scan attempt inside the
+// same interval, exhausting the budget before delayed telemetry is flushed.
+//
+// Reports false only when the rung is no longer the one on disk (another trigger
+// claimed it, or a pass booked a newer one). A zero rungMs never reached disk and
+// has nothing to claim; a transaction the cache locks refused proceeds too,
+// because a lost rung is the failure this file exists to fix and a duplicate
+// pass is only an early one.
+func codexClaimRunDebtRung(fp string, id codexDebtID, rungMs int64, now time.Time) bool {
+	if rungMs == 0 {
+		return true
+	}
+	rejected := false
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs ||
+			snap.RunFloorMs != id.floorMs || snap.NextAttemptAtMs != rungMs {
+			rejected = true
+			return false
+		}
+		snap.NextAttemptAtMs = 0
+		return true
+	})
+	return !rejected
 }
 
 // stopCodexRunDebtRetry cancels the pending retry, if any. Called from
@@ -627,8 +665,13 @@ func nudgeCodexUsageRefresh(base, fp string, now time.Time, rollouts codexRollou
 			if snap.NextAttemptAtMs == 0 || snap.NextAttemptAtMs > now.UnixMilli() {
 				return wrote
 			}
+			// Claim the rung in the same write that decides to start, so the timer
+			// firing for it finds it gone (codexClaimRunDebtRung) instead of
+			// re-arming this worker for a second scan inside one interval. The pass
+			// books the next rung itself when it retires.
+			snap.NextAttemptAtMs = 0
 			start = true
-			return wrote
+			return true
 		}
 		// A floor THIS process armed and has not settled is the same live run seen
 		// from the other side — the guard payOwedCodexUsageRefresh applies before

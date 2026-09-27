@@ -209,7 +209,7 @@ func TestCodexRunDebtRetry_FiringAtTheDeadlineRetiresOnce(t *testing.T) {
 	codexUsageFreshnessNow = func() time.Time { return pinned }
 	t.Cleanup(func() { codexUsageFreshnessNow = prevNow })
 
-	codexRunDebtRetryFired(retryTimerGeneration(), state.debtID(), f.fp)
+	codexRunDebtRetryFired(retryTimerGeneration(), state.debtID(), f.fp, 0)
 	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
@@ -264,7 +264,7 @@ func TestCodexRunDebtRetry_OfflineDebtRetiresWithAMarker(t *testing.T) {
 	codexUsageFreshnessNow = func() time.Time { return pinned }
 	t.Cleanup(func() { codexUsageFreshnessNow = prevNow })
 
-	codexRunDebtRetryFired(retryTimerGeneration(), state.debtID(), f.fp)
+	codexRunDebtRetryFired(retryTimerGeneration(), state.debtID(), f.fp, 0)
 	drainCodexRunDebtLadder(t)
 
 	snap := f.snapshot(t)
@@ -365,8 +365,8 @@ func TestCodexRunDebtRetryFired_IgnoresAStaleGenerationOrAccount(t *testing.T) {
 
 	// A generation that never existed, and a live generation under a foreign
 	// fingerprint.
-	codexRunDebtRetryFired(retryTimerGeneration(), codexDebtID{floorMs: 1, owedAtMs: 2}, f.fp)
-	codexRunDebtRetryFired(retryTimerGeneration(), codexRunFreshnessForAccount(f.fp, now).debtID(), "not-this-account")
+	codexRunDebtRetryFired(retryTimerGeneration(), codexDebtID{floorMs: 1, owedAtMs: 2}, f.fp, 0)
+	codexRunDebtRetryFired(retryTimerGeneration(), codexRunFreshnessForAccount(f.fp, now).debtID(), "not-this-account", 0)
 	drainCodexRunDebtLadder(t)
 
 	after, err := os.ReadFile(f.cache)
@@ -386,7 +386,7 @@ func TestResetCodexUsageRefreshGate_StopsAFutureRung(t *testing.T) {
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
-	codexArmRunDebtRetry(state.debtID(), f.fp, 30*time.Millisecond)
+	codexArmRunDebtRetry(state.debtID(), f.fp, 0, 30*time.Millisecond)
 	if !codexRunDebtRetryPending() {
 		t.Fatal("the rung was not armed")
 	}
@@ -438,6 +438,56 @@ func TestNudgeCodexUsageRefresh_ArmsOnlyOnADueRung(t *testing.T) {
 		t.Fatal("a due rung must arm the worker")
 	}
 	drainCodexRunDebtLadder(t)
+}
+
+// The timer and a gather that both see the same due rung start ONE payment pass
+// between them: whichever claims the rung first consumes it, and the other does
+// nothing rather than re-arming the running worker for a second scan inside the
+// same interval.
+func TestCodexRunDebtRung_ClaimedOnceByNudgeAndTimer(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
+	rung := now.Add(-time.Second).UnixMilli()
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.NextAttemptAtMs = rung
+	})
+
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, codexRolloutNudgeEvidence{newest: now.Add(-time.Minute)}, state.latest) {
+		t.Fatal("a due rung must arm the worker")
+	}
+	codexUsageRefresh.waitIdle()
+	stopCodexRunDebtRetry()
+	afterNudge := f.snapshot(t)
+	if afterNudge.RefreshOwedAttempts != 2 {
+		t.Fatalf("the nudged pass spent %d scans, want 2", afterNudge.RefreshOwedAttempts)
+	}
+	if afterNudge.NextAttemptAtMs == rung {
+		t.Fatal("the nudge must consume the rung it started")
+	}
+
+	// The timer for that same rung fires late: it finds the rung claimed and
+	// spends nothing.
+	codexRunDebtRetryFired(retryTimerGeneration(), state.debtID(), f.fp, rung)
+	codexUsageRefresh.waitIdle()
+	if got := f.snapshot(t).RefreshOwedAttempts; got != afterNudge.RefreshOwedAttempts {
+		t.Fatalf("a second trigger for a claimed rung spent a scan (%d -> %d)", afterNudge.RefreshOwedAttempts, got)
+	}
+
+	// And the other order: a claimed rung is gone for everyone after the first.
+	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) {
+		snap.NextAttemptAtMs = rung
+	})
+	if !codexClaimRunDebtRung(f.fp, state.debtID(), rung, now) {
+		t.Fatal("the first claim must win")
+	}
+	if codexClaimRunDebtRung(f.fp, state.debtID(), rung, now) {
+		t.Fatal("a rung may be claimed only once")
+	}
+	if f.snapshot(t).NextAttemptAtMs != 0 {
+		t.Fatal("a claimed rung must be cleared on disk")
+	}
 }
 
 // With NO debt pending the nudge creates one floored at the rollout mtime it was
@@ -1507,7 +1557,7 @@ func TestCodexScheduleRunDebtRetry_AStaleGenerationKeepsTheLiveTimer(t *testing.
 	if stale.debtID() == live.debtID() {
 		t.Fatal("fixture must produce two distinct generations")
 	}
-	codexArmRunDebtRetry(live.debtID(), f.fp, time.Hour)
+	codexArmRunDebtRetry(live.debtID(), f.fp, 0, time.Hour)
 	t.Cleanup(stopCodexRunDebtRetry)
 	gen := retryTimerGeneration()
 

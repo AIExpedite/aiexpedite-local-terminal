@@ -2205,7 +2205,7 @@ func payOwedCodexUsageRefresh() {
 					codexRebaseFutureRunDebtRung(snap, now)
 				})
 			} else if state.nextAttemptAt.After(now) {
-				codexArmRunDebtRetry(state.debtID(), fp, state.nextAttemptAt.Sub(now))
+				codexArmRunDebtRetry(state.debtID(), fp, state.nextAttemptAt.UnixMilli(), state.nextAttemptAt.Sub(now))
 				return
 			}
 		}
