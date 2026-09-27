@@ -1975,13 +1975,22 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// nudge. Only files that cleared the login guard count, so a previous
 	// account's still-appending session cannot contribute one.
 	var newestUncoveredMtime time.Time
-	// The newest mtime among accepted candidates whose telemetry this pass DID
-	// mine. A rollout's embedded observation timestamp is stamped before the write
-	// that advances its mtime, and trailing records widen the gap, so the reading
-	// this pass just merged is normally BEHIND the file it came from. Reporting
-	// that file as owing a refresh would floor a debt no re-read could ever
-	// satisfy — the ladder would spend every scan and live read on it and could
-	// end in a false stale warning. Mined telemetry covers its own rollout.
+	// The newest mtime among accepted candidates whose telemetry this pass mined
+	// CONTEMPORANEOUSLY with their newest write. A rollout's embedded observation
+	// timestamp is stamped just before the write that advances its mtime, and the
+	// same turn's trailing records widen the gap by moments, so the reading this
+	// pass just merged is normally a little BEHIND the file it came from.
+	// Reporting that file as owing a refresh would floor a debt no re-read could
+	// ever satisfy — the ladder would spend every scan and live read on it and
+	// could end in a false stale warning.
+	//
+	// Coverage is judged per file against codexRolloutCoverageLag rather than
+	// granted to any file that yielded a frame: `ok` says the rollout holds some
+	// usable window, NOT that its latest turn emitted one. A multi-turn rollout
+	// whose earlier turn stated telemetry and whose later turn appended only
+	// completion records advances its mtime well past the frame we hold, and that
+	// later turn — whose utilization really is missing — is exactly the run the
+	// nudge exists to notice.
 	var coveredMtime time.Time
 	for _, observed := range priorObservations {
 		if observed.After(latestObservation) {
@@ -2069,14 +2078,15 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 			delete(retryEntries, retryEntry)
 		}
 		// Past the login guard: this file is the current account's, so its mtime
-		// may floor a nudged debt — unless this pass mined the file's own
-		// telemetry (a usable window, or the refusal that explains its absence),
-		// in which case the reading already carries everything the file has to
-		// say and only a LATER write could owe anything. Split here — before the
-		// no-buckets skip below — because a rollout Codex has written but whose
-		// telemetry frame has not landed yet is exactly the run the nudge exists
-		// to notice.
-		if mined := ok || !fileLimit.At.IsZero(); mined {
+		// may floor a nudged debt — unless this pass mined telemetry stamped
+		// alongside that very write (a usable window, or the refusal that
+		// explains its absence), in which case the reading already carries
+		// everything the file has to say and only a LATER write could owe
+		// anything. A frame left behind by an EARLIER turn does not cover the
+		// appends that followed it. Split here — before the no-buckets skip below
+		// — because a rollout Codex has written but whose telemetry frame has not
+		// landed yet is exactly the run the nudge exists to notice.
+		if codexRolloutMinedCoversMtime(codexRolloutMinedObservationAt(buckets, fileLimit), c.mtime) {
 			if c.mtime.After(coveredMtime) {
 				coveredMtime = c.mtime
 			}
@@ -2301,6 +2311,47 @@ type codexRolloutNudgeEvidence struct {
 	// even when the pass was cut short — a file whose telemetry was merged stays
 	// covered however the rest of the walk ended.
 	covered time.Time
+}
+
+// codexRolloutCoverageLag is how far a rollout's mtime may sit ahead of the
+// newest telemetry this pass mined from it and still count as covered by that
+// reading. A telemetry frame is stamped just before the write that carries it,
+// and the same turn's trailing records (completion events, reasoning items)
+// land within moments — that is the ordinary gap coverage exists to forgive.
+// A wider one means a LATER turn appended without telemetry of its own, so the
+// reading we hold predates the run whose utilization is missing and the file
+// still owes a refresh. Matched to codexRunFloorLocalSkew: both bound how far
+// apart two stamps written around the same moment by the same local clock may
+// legitimately sit.
+const codexRolloutCoverageLag = codexRunFloorLocalSkew
+
+// codexRolloutMinedObservationAt reports the newest moment this pass mined from
+// ONE rollout file: the latest timestamped bucket observation, or the quota
+// refusal that explains their absence. Zero when the file yielded neither a
+// stamped reading nor a refusal — a window with no observation time anchors
+// nothing, so it can cover no write.
+func codexRolloutMinedObservationAt(buckets map[string]map[string]codexRateLimitBucket, limit codexUsageLimitEvidence) time.Time {
+	var newest time.Time
+	for _, limits := range buckets {
+		for _, b := range limits {
+			if b.ObservedAtMs <= 0 {
+				continue
+			}
+			if observed := time.UnixMilli(b.ObservedAtMs); observed.After(newest) {
+				newest = observed
+			}
+		}
+	}
+	if limit.At.After(newest) {
+		newest = limit.At
+	}
+	return newest
+}
+
+// codexRolloutMinedCoversMtime answers whether telemetry mined at minedAt
+// accounts for a rollout whose newest write is mtime (codexRolloutCoverageLag).
+func codexRolloutMinedCoversMtime(minedAt, mtime time.Time) bool {
+	return !minedAt.IsZero() && !mtime.After(minedAt.Add(codexRolloutCoverageLag))
 }
 
 // codexRolloutNudgeEvidenceFor pairs the two mtimes, withholding only `newest`

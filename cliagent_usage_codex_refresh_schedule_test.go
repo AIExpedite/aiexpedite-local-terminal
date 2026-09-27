@@ -580,7 +580,9 @@ func TestCodexReconcileFromRollout_MinedTelemetryCoversItsOwnRollout(t *testing.
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	mtime := now.Add(-2 * time.Minute).Truncate(time.Second)
-	observedAt := mtime.Add(-30 * time.Second)
+	// The ordinary gap: the frame is stamped, then the same turn's trailing
+	// records land moments later and advance the mtime past it.
+	observedAt := mtime.Add(-2 * time.Second)
 	writeCodexRunRollout(t, f.home, "mined", now.Add(-10*time.Minute), observedAt, mtime, true,
 		[]map[string]any{codexRateLimitFrame(20, 30, observedAt)})
 
@@ -601,6 +603,67 @@ func TestCodexReconcileFromRollout_MinedTelemetryCoversItsOwnRollout(t *testing.
 	}
 	if snap := f.snapshot(t); snap.RefreshOwedAtMs != 0 || snap.PendingRolloutMtimeMs != 0 {
 		t.Fatalf("a covered rollout left state behind: owed=%d pending=%d", snap.RefreshOwedAtMs, snap.PendingRolloutMtimeMs)
+	}
+}
+
+// Coverage forgives the ordinary stamp/mtime gap, not an arbitrary one. A
+// multi-turn rollout whose EARLIER turn stated telemetry and whose later turn
+// appended only completion records holds a usable window — so the pass mines one
+// — while its mtime has moved well past it. Granting coverage on "the file
+// yielded a frame" would suppress the debt for the later turn, whose utilization
+// really is missing, and the card would sit stale with the live-read fallback
+// never reached.
+func TestCodexReconcileFromRollout_StaleFrameDoesNotCoverALaterAppend(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	mtime := now.Add(-2 * time.Minute).Truncate(time.Second)
+	// The earlier turn's frame, then a later turn that emitted no telemetry.
+	observedAt := mtime.Add(-10 * time.Minute)
+	writeCodexRunRollout(t, f.home, "multiturn", now.Add(-30*time.Minute), observedAt, mtime, true,
+		[]map[string]any{codexRateLimitFrame(20, 30, observedAt)})
+
+	_, _, latest, rollouts := codexReconcileFromRollout(context.Background(), f.home, f.fp, now)
+
+	if latest.Before(observedAt) {
+		t.Fatalf("the pass did not mine the earlier turn's telemetry (latest = %s)", latest)
+	}
+	if rollouts.newest.Truncate(time.Second) != mtime {
+		t.Fatalf("eligible mtime = %s, want the later append %s still owing telemetry", rollouts.newest, mtime)
+	}
+	if !rollouts.covered.IsZero() {
+		t.Fatalf("a frame %s older than the file's newest write must not cover it (covered = %s)",
+			mtime.Sub(observedAt), rollouts.covered)
+	}
+	// End to end: the nudge owes a debt floored at the uncovered append, which the
+	// live-read fallback can pay.
+	if !nudgeCodexUsageRefresh(f.home, f.fp, now, rollouts, latest) {
+		t.Fatal("a later append with no telemetry of its own must owe a refresh")
+	}
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RunFloorMs != mtime.UnixMilli() {
+		t.Fatalf("debt not floored at the uncovered append: owed=%d floor=%d want floor=%d",
+			snap.RefreshOwedAtMs, snap.RunFloorMs, mtime.UnixMilli())
+	}
+}
+
+// The coverage window is codexRolloutCoverageLag exactly, on both sides.
+func TestCodexRolloutMinedCoversMtime_Boundary(t *testing.T) {
+	minedAt := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		mined time.Time
+		mtime time.Time
+		want  bool
+	}{
+		{"no telemetry mined", time.Time{}, minedAt, false},
+		{"stamp after the write", minedAt, minedAt.Add(-time.Second), true},
+		{"inside the lag", minedAt, minedAt.Add(codexRolloutCoverageLag - time.Millisecond), true},
+		{"on the lag", minedAt, minedAt.Add(codexRolloutCoverageLag), true},
+		{"past the lag", minedAt, minedAt.Add(codexRolloutCoverageLag + time.Millisecond), false},
+	} {
+		if got := codexRolloutMinedCoversMtime(tc.mined, tc.mtime); got != tc.want {
+			t.Errorf("%s: covers = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
