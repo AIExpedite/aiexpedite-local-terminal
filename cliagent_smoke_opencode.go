@@ -569,7 +569,7 @@ func parseOpenCodeSmokeStream(stdout []byte) openCodeSmokeStream {
 			}
 			continue
 		}
-		if isOpenCodeTerminalEventType(frame.Type) {
+		if isOpenCodeTerminalEventType(frame.Type, frame.finishReason()) {
 			stream.Ended = true
 		}
 		// A line the SHARED reader cannot decode simply carries no assistant
@@ -602,6 +602,24 @@ type openCodeSmokeFrame struct {
 	Type    string          `json:"type"`
 	Error   json.RawMessage `json:"error"`
 	Message json.RawMessage `json:"message"`
+	Part    json.RawMessage `json:"part"`
+	Reason  json.RawMessage `json:"reason"`
+}
+
+// finishReason is the step's finish reason (`part.reason`, else a top-level
+// `reason`), read through the same map helper the session stream uses so both
+// transports judge a tool-call step_finish identically.
+func (f openCodeSmokeFrame) finishReason() string {
+	event := map[string]interface{}{}
+	var part map[string]interface{}
+	if len(f.Part) > 0 && json.Unmarshal(f.Part, &part) == nil {
+		event["part"] = part
+	}
+	var reason string
+	if len(f.Reason) > 0 && json.Unmarshal(f.Reason, &reason) == nil {
+		event["reason"] = reason
+	}
+	return openCodeEventFinishReason(event)
 }
 
 func parseOpenCodeSmokeFrame(line string) (openCodeSmokeFrame, bool) {

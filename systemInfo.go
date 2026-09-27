@@ -628,6 +628,12 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 			// same reason: a plain spawn of an npm `codex.cmd` would cache ""
 			// under the shared key and pin the smoke's binary_missing.
 			version = codexProbeVersion(path)
+		} else if a.ID == "opencode" {
+			// The shim-aware OpenCode probe (cliagent_smoke_opencode.go): a plain
+			// spawn of an npm `opencode.cmd` would cache "" under the shared key
+			// the smoke and native capability check read, reporting the CLI as
+			// missing.
+			version = openCodeProbeVersion(path)
 		} else {
 			version = cachedProbeVersion(path)
 		}

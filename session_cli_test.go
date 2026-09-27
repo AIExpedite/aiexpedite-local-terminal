@@ -4394,18 +4394,18 @@ func TestDetectCLITerminalEvent_OpenCodeSharesTheTurnCompletionPredicate(t *test
 	// The session stream and the maintenance probe must agree on what "the turn
 	// finished" looks like, or one of them waits forever on a frame the other
 	// already accepted.
-	for _, eventType := range []string{"session.completed", "step.completed", "turn.done", "finish", "session.idle"} {
+	for _, eventType := range []string{"session.completed", "step.completed", "turn.done", "finish", "session.idle", "step_finish"} {
 		line := `{"type":"` + eventType + `"}`
 		if !detectCLITerminalEvent("opencode", line) {
 			t.Errorf("%q must close an opencode turn", eventType)
 		}
-		if !isOpenCodeTerminalEventType(eventType) {
+		if !isOpenCodeTerminalEventType(eventType, "") {
 			t.Errorf("the shared predicate disagrees about %q", eventType)
 		}
 	}
 	for _, eventType := range []string{"text", "session.error", "tool.completed.error"} {
 		line := `{"type":"` + eventType + `"}`
-		if detectCLITerminalEvent("opencode", line) != isOpenCodeTerminalEventType(eventType) {
+		if detectCLITerminalEvent("opencode", line) != isOpenCodeTerminalEventType(eventType, "") {
 			t.Errorf("session detection and the shared predicate disagree about %q", eventType)
 		}
 	}

@@ -288,6 +288,41 @@ func TestClassifyOpenCodeSmokeRun_AStringMessageFieldIsNotMalformed(t *testing.T
 	}
 }
 
+// The `run --format json` formatter closes each model step with `step_finish`
+// (part.type `step-finish`, part.reason from the AI SDK), and a turn that calls
+// a tool emits one per step. A final step_finish must end the stream; an
+// intermediate one with a tool-call reason must not, or partial text would be
+// judged as the whole reply. Frames follow the formatter's captured shape.
+func TestClassifyOpenCodeSmokeRun_StepFinishClosesTheTurnUnlessAToolCallContinues(t *testing.T) {
+	const marker = "AIEXPEDITE_OPENCODE_SMOKE_OK_0a1b2c3d"
+	stepStart := `{"type":"step_start","timestamp":1790500000000,"sessionID":"ses_probe","part":{"id":"prt_1","sessionID":"ses_probe","messageID":"msg_1","type":"step-start"}}`
+	text := `{"type":"text","timestamp":1790500000100,"sessionID":"ses_probe","part":{"id":"prt_2","sessionID":"ses_probe","messageID":"msg_1","type":"text","text":"` + marker + `","time":{"start":1790500000050,"end":1790500000100}}}`
+	finish := func(reason string) string {
+		return `{"type":"step_finish","timestamp":1790500000200,"sessionID":"ses_probe","part":{"id":"prt_3","sessionID":"ses_probe","messageID":"msg_1","type":"step-finish","reason":"` + reason + `","cost":0,"tokens":{"input":12,"output":9,"reasoning":0,"cache":{"read":0,"write":0}}}}`
+	}
+
+	stdout := stepStart + "\n" + text + "\n" + finish("stop") + "\n"
+	category, diagnostic, matched := classifyOpenCodeSmokeRun(false, []byte(stdout), nil, nil, marker)
+	if category != "" || diagnostic != cliSmokeDiagnosticNone || !matched {
+		t.Fatalf("step_finish(stop): got (%q, %q, %v), want a clean marker success", category, diagnostic, matched)
+	}
+
+	// Only a tool-call step finished; the process then exited without the
+	// closing step — no terminal frame was seen.
+	stdout = stepStart + "\n" + text + "\n" + finish("tool-calls") + "\n"
+	if _, diagnostic, matched = classifyOpenCodeSmokeRun(false, []byte(stdout), nil, nil, marker); matched || diagnostic != cliSmokeDiagnosticNoEnvelope {
+		t.Fatalf("step_finish(tool-calls): got (%q, %v), want no_envelope", diagnostic, matched)
+	}
+
+	// The session stream agrees frame-for-frame.
+	if !detectCLITerminalEvent("opencode", finish("stop")) {
+		t.Error("session detection must close the turn on step_finish(stop)")
+	}
+	if detectCLITerminalEvent("opencode", finish("tool-calls")) {
+		t.Error("session detection must not close the turn on a tool-call step_finish")
+	}
+}
+
 // framing_rejected must be named by the FLAG, not by a bare `json` substring:
 // OpenCode prints a usage block on an option error and that block lists
 // `--format json`, so a substring match reported every rejected caller flag as a

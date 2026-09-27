@@ -482,22 +482,45 @@ var errOpenCodeSmokeRequestContract = fmt.Errorf(
    Shared event predicates
    -------------------------------------------------------------------------- */
 
-// isOpenCodeTerminalEventType reports whether a `--format json` event type
-// closes a turn. Lifted out of detectCLITerminalEvent so BOTH transports (the
-// streamed session and the maintenance probe) agree on turn completion.
+// isOpenCodeTerminalEventType reports whether a `--format json` event closes a
+// turn. Lifted out of detectCLITerminalEvent so BOTH transports (the streamed
+// session and the maintenance probe) agree on turn completion.
 //
 // Matched by suffix because the exact type name has moved across releases; an
 // unrecognised terminal event is harmless (the process-exit path still
 // flushes), a false positive is not, so `error` is excluded.
-func isOpenCodeTerminalEventType(eventType string) bool {
+//
+// `step_finish` (the `run --format json` formatter's spelling, `step-finish` /
+// `step.finish` in other builds) closes EVERY model step, including the
+// intermediate ones that end in a tool call. finishReason is the event's
+// `part.reason` (or top-level `reason`): a tool-call reason means the turn
+// continues, so that frame is not terminal. An absent reason is treated as
+// terminal, matching how `step.completed` has always been read.
+func isOpenCodeTerminalEventType(eventType, finishReason string) bool {
 	lowered := strings.ToLower(strings.TrimSpace(eventType))
 	if lowered == "" || strings.Contains(lowered, "error") {
 		return false
 	}
+	if strings.Contains(strings.ToLower(finishReason), "tool") {
+		return false
+	}
 	return strings.HasSuffix(lowered, "completed") ||
 		strings.HasSuffix(lowered, "done") ||
-		lowered == "finish" ||
+		strings.HasSuffix(lowered, "finish") ||
 		lowered == "session.idle"
+}
+
+// openCodeEventFinishReason extracts the finish reason an OpenCode event carries
+// in `part.reason` (the step_finish shape) or a top-level `reason`. Returns ""
+// when neither is a string.
+func openCodeEventFinishReason(event map[string]interface{}) string {
+	if part, ok := event["part"].(map[string]interface{}); ok {
+		if reason, ok := part["reason"].(string); ok && reason != "" {
+			return reason
+		}
+	}
+	reason, _ := event["reason"].(string)
+	return reason
 }
 
 // openCodeOptionRejectionText reports whether already-lowercased CLI text is an

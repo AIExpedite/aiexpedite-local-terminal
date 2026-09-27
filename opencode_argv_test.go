@@ -342,9 +342,9 @@ func TestExtractOpenCodeMaintenanceSmokeControl_ConsumesTheTokenEverywhere(t *te
 func TestIsOpenCodeTerminalEventType_SharedByBothTransports(t *testing.T) {
 	for _, ok := range []string{
 		"session.completed", "step.completed", "turn.done", "finish", "session.idle",
-		"  Session.Completed  ",
+		"  Session.Completed  ", "step_finish", "step-finish", "step.finish",
 	} {
-		if !isOpenCodeTerminalEventType(ok) {
+		if !isOpenCodeTerminalEventType(ok, "") || !isOpenCodeTerminalEventType(ok, "stop") {
 			t.Errorf("%q must close a turn", ok)
 		}
 	}
@@ -352,8 +352,13 @@ func TestIsOpenCodeTerminalEventType_SharedByBothTransports(t *testing.T) {
 		"", "text", "message.part.updated", "tool.completed.error",
 		"session.error", "error",
 	} {
-		if isOpenCodeTerminalEventType(no) {
+		if isOpenCodeTerminalEventType(no, "") {
 			t.Errorf("%q must not close a turn", no)
+		}
+	}
+	for _, reason := range []string{"tool-calls", "tool_calls", "Tool-Calls"} {
+		if isOpenCodeTerminalEventType("step_finish", reason) {
+			t.Errorf("a step_finish with reason %q continues the turn", reason)
 		}
 	}
 }

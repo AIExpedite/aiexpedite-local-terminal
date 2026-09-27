@@ -1748,7 +1748,7 @@ func detectCLITerminalEvent(command, line string) bool {
 		// completion event, immediately before the one-shot process exits. The
 		// predicate is shared with the maintenance probe (opencode_argv.go) so
 		// both transports agree on what "the turn finished" looks like.
-		return isOpenCodeTerminalEventType(eventType)
+		return isOpenCodeTerminalEventType(eventType, openCodeEventFinishReason(event))
 	}
 	return false
 }
