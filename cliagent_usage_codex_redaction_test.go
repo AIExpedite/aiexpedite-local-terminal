@@ -46,7 +46,7 @@ func TestCodexRunFreshness_PersistsAndPublishesNumericOnly(t *testing.T) {
 		[]map[string]any{codexRateLimitFrame(22, 32, now)}, leaky...)
 
 	triggerCodexUsageRefreshAfterRun(runStart)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	raw, err := os.ReadFile(f.cache)
 	if err != nil {
@@ -71,6 +71,7 @@ func TestCodexRunFreshness_PersistsAndPublishesNumericOnly(t *testing.T) {
 	codexRecordRunFreshness(f.fp, time.Now(), func(snap *codexRateLimitSnapshot) {
 		codexOweRunRefresh(snap, time.Now().Add(-time.Second), time.Now())
 		snap.RefreshOwedAttempts = codexRefreshAfterRunMaxAttempts
+		snap.RefreshFallbackState = codexFallbackExhausted
 	})
 	usage, ok := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
 	if !ok {
@@ -135,7 +136,7 @@ func codexSnapshotClosedStringField(path, val string) bool {
 		return codexRedactedVersion.MatchString(val)
 	case ".refreshFallbackState":
 		switch val {
-		case codexFallbackOutstanding, codexFallbackSpent, codexFallbackSkipped:
+		case codexFallbackOutstanding, codexFallbackDeferred, codexFallbackExhausted:
 			return true
 		}
 	}
@@ -168,7 +169,7 @@ func TestRunCodexSmoke_CapturePersistsNumericOnly(t *testing.T) {
 	})
 
 	runCodexSmoke(context.Background(), path, codexSmokeTestVersion)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	raw, err := os.ReadFile(cache)
 	if err != nil {
@@ -200,7 +201,7 @@ func TestCodexCaptureDriftNotice_CarriesNoPathAccountOrVendorText(t *testing.T) 
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	codexRecordRunFreshness(f.fp, now, func(snap *codexRateLimitSnapshot) { snap.CodexVersion = "codex-cli 0.149.0" })
 	state := f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
-	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackSpent)
+	codexSetRefreshFallback(f.fp, state.debtID(), codexFallbackExhausted)
 
 	usage, _ := codexUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Version: "codex-cli 0.150.0", Path: ""}, time.Now())
 
@@ -212,5 +213,36 @@ func TestCodexCaptureDriftNotice_CarriesNoPathAccountOrVendorText(t *testing.T) 
 	shape := regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC`).ReplaceAllString(usage.Notice, "<ts>")
 	if want := `Codex utilization was last observed <ts> by Codex build "codex-cli 0.149.0"; the installed build "codex-cli 0.150.0" has not reported utilization since the most recent Codex run started (<ts>). It will update once that build's telemetry is captured.`; shape != want {
 		t.Fatalf("drift notice must be versions and timestamps over fixed copy only:\n got %q\nwant %q", usage.Notice, want)
+	}
+}
+
+// The schedule's and the nudge's log lines carry fixed labels, counters and
+// durations only — never a path, an account, a fingerprint or rollout text.
+func TestCodexRefreshSchedule_LogsCarryCountersOnly(t *testing.T) {
+	const email = "schedule.secret@example.com"
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	helperCodexAuthAt(t, f.home, email, now.Add(-3*time.Hour))
+	f.fp = currentCodexAccountFingerprint()
+	observed := now.Add(-time.Hour)
+	f.seedPreRunReading(t, observed, now)
+	rollout := now.Add(-2 * codexForcedReconcileMinInterval).Truncate(time.Millisecond)
+
+	logged := captureStdout(t, func() {
+		// The nudge's "refresh owed" line, then the schedule's rung line.
+		nudgeCodexUsageRefresh(f.home, f.fp, now, rollout, observed)
+		drainCodexRunDebtLadder(t)
+	})
+
+	if !strings.Contains(logged, "[cli-usage]") {
+		t.Fatalf("expected the refresh log lines, got %q", logged)
+	}
+	for _, s := range []string{
+		email, "schedule.secret", f.home, filepath.ToSlash(f.home), f.fp,
+		"auth.json", "rollout-", "codex_rate_limits.json",
+	} {
+		if strings.Contains(logged, s) {
+			t.Errorf("refresh schedule log leaks %q:\n%s", s, logged)
+		}
 	}
 }

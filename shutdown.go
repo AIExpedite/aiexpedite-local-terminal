@@ -60,10 +60,11 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 
 	fmt.Println("[shutdown] Starting graceful shutdown sequence")
 	shutdownBrowserIdentityServer()
-	// A pending Antigravity refresh rung must not fire into a process that is
-	// exiting — including one handing off to an update below. The schedule is
-	// persisted, so the next process re-arms it.
+	// A pending refresh rung must not fire into a process that is exiting —
+	// including one handing off to an update below. Both schedules are persisted,
+	// so the next process re-arms them.
 	stopAntigravityRunDebtRetry()
+	stopCodexRunDebtRetry()
 
 	// Stop the updater before any teardown can make a draining device appear
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and

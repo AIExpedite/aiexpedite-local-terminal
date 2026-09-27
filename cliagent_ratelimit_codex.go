@@ -231,11 +231,37 @@ type codexRateLimitSnapshot struct {
 	// and resurrect a settled run as "interrupted". A floor at or below it is
 	// paid for good.
 	RunFloorPaidMs int64 `json:"runFloorPaidMs,omitempty"`
-	// RefreshFallbackState tracks the one live `account/rateLimits/read` a
-	// debt may spend once its rollout attempts are exhausted
-	// (codexLiveUsageFallback): "" = not owed yet, then outstanding / spent /
-	// skipped. Reset with the attempt counter, so it is per debt generation.
+	// RefreshFallbackState tracks the live `account/rateLimits/read`s a debt may
+	// spend once its rollout attempts are exhausted (codexLiveUsageFallback):
+	// "" = not owed yet, then outstanding / deferred / exhausted. Only
+	// `exhausted` is final for the generation; `deferred` is the resting state
+	// between rungs, so a refusal that sent nothing (offline right after a
+	// self-update) can be retried rather than ending the debt's only network
+	// recovery. Reset with the counters, so it is per debt generation.
 	RefreshFallbackState string `json:"refreshFallbackState,omitempty"`
+	// RefreshLiveReads counts the live reads that actually REACHED OpenAI for
+	// this debt generation, bounded by codexRefreshLiveReadMaxAttempts. It has
+	// its own counter because the fallback is only reachable after the rollout
+	// scan budget is spent: under one shared counter a deferred read on the last
+	// rung could never be retried, and an offline-at-settle device would never
+	// converge.
+	RefreshLiveReads int `json:"refreshLiveReads,omitempty"`
+	// NextAttemptAtMs is the rung the schedule booked for this debt
+	// (cliagent_usage_codex_refresh_schedule.go): the epoch-millisecond instant
+	// the next attempt is due. Persisted beside the debt so a self-update or a
+	// crash re-enters the ladder at the rung it was on instead of burning an
+	// attempt on every launch or dropping the schedule entirely. Zero = nothing
+	// booked.
+	NextAttemptAtMs int64 `json:"nextAttemptAtMs,omitempty"`
+	// StaleRunNoticeFloorMs / StaleRunNoticeAtMs are the bounded terminal marker
+	// codexRetireExpiredRunDebt leaves when a debt ages out unpaid: the run
+	// floor that was never observed, and when it expired. Without it a debt that
+	// kept booking free rungs (a continuously offline device) would simply
+	// vanish at the age-out and the card would go quiet instead of warning. One
+	// marker per account, overwritten by a later expiry, holding no budget and
+	// scheduling nothing. Numeric only.
+	StaleRunNoticeFloorMs int64 `json:"staleRunNoticeFloorMs,omitempty"`
+	StaleRunNoticeAtMs    int64 `json:"staleRunNoticeAtMs,omitempty"`
 	// CodexVersion is the `--version` of the Codex binary that produced the
 	// newest contributor observation; RolloutCursorVersion is the binary in
 	// use when the rollout scan cursor was last reset or first established.
@@ -245,13 +271,66 @@ type codexRateLimitSnapshot struct {
 	RolloutCursorVersion string `json:"rolloutCursorVersion,omitempty"`
 }
 
-// RefreshFallbackState values (codexLiveUsageFallback).
+// RefreshFallbackState values (codexLiveUsageFallback). Only codexFallbackExhausted
+// is final for a debt generation: a debt must never be left in a state the
+// ladder cannot leave while it still has budget.
 const (
 	codexFallbackUnset       = ""
-	codexFallbackOutstanding = "outstanding"
-	codexFallbackSpent       = "spent"
-	codexFallbackSkipped     = "skipped"
+	codexFallbackOutstanding = "outstanding" // a read is in flight
+	// codexFallbackDeferred: this attempt did not settle the debt and another
+	// rung is booked — the resting state between rungs, whether or not the read
+	// actually went out.
+	codexFallbackDeferred = "deferred"
+	// codexFallbackExhausted: the live-read budget is spent, or the outcome was
+	// terminal. Nothing re-enters the fallback from here.
+	codexFallbackExhausted = "exhausted"
 )
+
+// Legacy RefreshFallbackState values, migrated on load
+// (codexMigrateLegacyFallbackState). Both were FINAL for the generation, which
+// is the reported bug: a brief IsOffline() right after a self-update wrote
+// "skipped" and ended the debt's only network recovery for good.
+const (
+	codexLegacyFallbackSpent   = "spent"
+	codexLegacyFallbackSkipped = "skipped"
+)
+
+// codexMigrateLegacyFallbackState rewrites a fallback state written before the
+// deferred/exhausted split. It follows what each value MEANT, not that both
+// were final:
+//
+//   - "skipped" was written for offline, a disabled gate and worker retirement
+//     — no request ever left the device — so it becomes deferred with no read
+//     spent.
+//   - "spent" proves exactly one outbound read, so it becomes deferred with one
+//     read spent, leaving the second read of the new budget available.
+//
+// Mapping either to exhausted would carry the reported bug across the very
+// upgrade that ships the fix: an offline-retired debt would stay permanently
+// unpayable on every cache written before this change.
+func codexMigrateLegacyFallbackState(snap *codexRateLimitSnapshot) {
+	switch snap.RefreshFallbackState {
+	case codexLegacyFallbackSkipped:
+		snap.RefreshFallbackState = codexFallbackDeferred
+	case codexLegacyFallbackSpent:
+		snap.RefreshFallbackState = codexFallbackDeferred
+		if snap.RefreshLiveReads < 1 {
+			snap.RefreshLiveReads = 1
+		}
+	}
+}
+
+// codexClearRunFreshnessDebt drops one debt generation: its floor marker's
+// bookkeeping, both counters, the fallback state and the booked rung. The
+// expiry marker is NOT touched — codexRetireExpiredRunDebt writes it in the
+// same transaction that calls this, and it must outlive the debt it describes.
+func codexClearRunFreshnessDebt(snap *codexRateLimitSnapshot) {
+	snap.RefreshOwedAtMs = 0
+	snap.RefreshOwedAttempts = 0
+	snap.RefreshLiveReads = 0
+	snap.RefreshFallbackState = codexFallbackUnset
+	snap.NextAttemptAtMs = 0
+}
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
 // in-process. Cross-process serialization is handled separately by an
@@ -1627,6 +1706,9 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 			snap.Contributors = map[string]map[string]codexRateLimitBucket{}
 		}
 		snap.RolloutRetryEntries = codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries))
+		// Same migration the read side applies, so a mutation that inspects the
+		// fallback state — or persists the snapshot — never sees a legacy value.
+		codexMigrateLegacyFallbackState(&snap)
 	}
 	if !mutate(&snap) {
 		return false
@@ -1663,11 +1745,13 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	codexClearRolloutProgress(snap)
 	snap.RolloutRootFingerprint = ""
 	snap.RunFloorMs = 0
-	snap.RefreshOwedAtMs = 0
-	snap.RefreshOwedAttempts = 0
 	snap.ActiveRunFloorMs = 0
 	snap.RunFloorPaidMs = 0
-	snap.RefreshFallbackState = codexFallbackUnset
+	codexClearRunFreshnessDebt(snap)
+	// The expiry marker describes a run of the PREVIOUS account, so a rescope
+	// clears it too — the new account must not be warned about a run it never
+	// made.
+	snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
 	// The observations it stamped are gone. RolloutCursorVersion is kept: the
 	// progress it scoped was just cleared, so any cursor written from here on
 	// is written by the binary it already names.
@@ -1898,6 +1982,10 @@ func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
 	if err := json.Unmarshal(b, &snap); err != nil || snap.Buckets == nil {
 		return codexRateLimitSnapshot{}, false
 	}
+	// Applied on EVERY load — read side included — so a cache written before the
+	// deferred/exhausted split is judged by what its state meant rather than by
+	// a value no current code path understands.
+	codexMigrateLegacyFallbackState(&snap)
 	return snap, true
 }
 
@@ -2013,6 +2101,11 @@ type codexCacheView struct {
 	refreshOwedAtMs     int64
 	refreshOwedAttempts int
 	refreshFallback     string
+	refreshLiveReads    int
+	nextAttemptAtMs     int64
+	// Expiry marker (codexRetireExpiredRunDebt).
+	staleNoticeFloorMs int64
+	staleNoticeAtMs    int64
 	// Capture stamps (cliagent_usage_codex_capture_stamp.go).
 	codexVersion         string
 	rolloutCursorVersion string
@@ -2043,6 +2136,10 @@ func codexCacheViewFromSnapshot(snap codexRateLimitSnapshot) codexCacheView {
 		refreshOwedAtMs:      snap.RefreshOwedAtMs,
 		refreshOwedAttempts:  snap.RefreshOwedAttempts,
 		refreshFallback:      snap.RefreshFallbackState,
+		refreshLiveReads:     snap.RefreshLiveReads,
+		nextAttemptAtMs:      snap.NextAttemptAtMs,
+		staleNoticeFloorMs:   snap.StaleRunNoticeFloorMs,
+		staleNoticeAtMs:      snap.StaleRunNoticeAtMs,
 		codexVersion:         snap.CodexVersion,
 		rolloutCursorVersion: snap.RolloutCursorVersion,
 	}

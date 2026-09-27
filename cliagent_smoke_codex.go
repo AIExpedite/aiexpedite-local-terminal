@@ -46,7 +46,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -394,9 +393,54 @@ type codexSmokeEvidence struct {
 func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
 	if evidence.usageCaptured || evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
+		// codexUsageRunSettled only SPAWNS a goroutine, so the debt and its first
+		// rung may not be on disk when runCodexSmoke returns. A smoke is usually
+		// the last thing that happens before an update handoff replaces the
+		// process, which would take the unwritten debt with it — the reported
+		// "green smoke, stale utilization" case. Land it here, synchronously,
+		// under the same bounded write budget an arm gets. The asynchronous worker
+		// still runs; it simply no longer owns durability.
+		persistCodexSmokeRunDebt(floor)
 		return
 	}
+	// Unchanged: a run that spent nothing writes nothing and puts the device on
+	// no ladder.
 	codexUsageRunDisarmed(floor, time.Time{})
+}
+
+// persistCodexSmokeRunDebt records the smoke's run debt and books its first rung
+// before returning, retrying a refused cache lock under
+// codexRunFloorWriteAttempts × codexRunFloorWriteRetryDelay — the budget an arm
+// or a rollback gets. A no-op when the freshness path is disarmed (tests), and
+// idempotent with the worker's own settle: codexOweRunRefresh coalesces onto the
+// newest floor and the worker re-reads the debt from disk.
+func persistCodexSmokeRunDebt(floor time.Time) {
+	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
+		return
+	}
+	fp := currentCodexAccountFingerprint()
+	if fp == "" {
+		return
+	}
+	for attempt := 0; attempt < codexRunFloorWriteAttempts; attempt++ {
+		if attempt > 0 && !codexUsageRefresh.sleep(codexRunFloorWriteRetryDelay) {
+			return
+		}
+		now := codexUsageFreshnessNow()
+		if !codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+			codexRebaseFutureRunFreshness(snap, now, now)
+			codexOweRunRefresh(snap, floor, now)
+		}) {
+			continue
+		}
+		// The debt is on disk; book its first rung so a process replaced right
+		// now re-enters the ladder rather than waiting for the next run.
+		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+		if state.owed {
+			codexScheduleRunDebtRetry(fp, state, codexUsageFreshnessNow(), codexRetryAfterScan)
+		}
+		return
+	}
 }
 
 // codexSmokeRolloutSignal reports whether a Codex rollout was written after the
@@ -419,34 +463,10 @@ func codexSmokeRolloutSignal(floor time.Time) bool {
 	return codexSmokeRolloutWalk(ctx, filepath.Join(codexHomeBase(), "sessions"), floor)
 }
 
-// codexSmokeRolloutWalk is the tree walk behind the rollout signal. A var so a
+// codexSmokeRolloutWalk is the tree walk behind the rollout signal
+// (codexRolloutWrittenAfter, cliagent_ratelimit_codex_rollout.go). A var so a
 // test can prove the walk is skipped whenever stronger evidence settled.
 var codexSmokeRolloutWalk = codexRolloutWrittenAfter
-
-// errCodexRolloutFound stops the walk at the first qualifying rollout.
-var errCodexRolloutFound = errors.New("rollout found")
-
-// codexRolloutWrittenAfter reports whether any `rollout-*.jsonl` under root was
-// modified strictly after `after`. It stops at the first hit and at ctx expiry
-// (which reads as "not found": no evidence, so the run disarms).
-func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time) bool {
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil || entry.IsDir() {
-			return nil
-		}
-		if matched, _ := filepath.Match("rollout-*.jsonl", entry.Name()); !matched {
-			return nil
-		}
-		if info, err := entry.Info(); err == nil && info.ModTime().After(after) {
-			return errCodexRolloutFound
-		}
-		return nil
-	})
-	return errors.Is(err, errCodexRolloutFound)
-}
 
 /* --------------------------------------------------------------------------
    Classification

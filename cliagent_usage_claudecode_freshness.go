@@ -64,9 +64,11 @@ import (
 )
 
 const (
-	// claudeRefreshOwedMaxAge retires a debt no reading ever paid, matching
-	// codexRefreshOwedMaxAge. Past it the run is far enough back that a fresh
-	// reading is worth no more than the next routine gather's.
+	// claudeRefreshOwedMaxAge retires a debt no reading ever paid. Past it the run
+	// is far enough back that a fresh reading is worth no more than the next
+	// routine gather's. Claude's own bound — the Codex equivalent is deliberately
+	// longer, because its debt walks a retry ladder that has to outlive an agent
+	// self-update plus a reconnect.
 	claudeRefreshOwedMaxAge = 30 * time.Minute
 	// claudeRefreshOwedLocalSkew is the clock-skew ceiling on a persisted
 	// instant, mirroring antigravityRunFloorLocalSkew. A debt stamped further

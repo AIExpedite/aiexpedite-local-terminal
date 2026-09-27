@@ -102,6 +102,31 @@ func TestAntigravityRetryDelayForAttempt_Ladder(t *testing.T) {
 	}
 }
 
+// Contract pin for the extraction into cliagent_usage_refresh_ladder.go: the
+// rung arithmetic is now shared with Codex, whose ladder is deliberately much
+// shorter. These values are Antigravity's own and must not drift with it.
+func TestAntigravityRunDebtRetryLadder_ValuesArePinnedAfterTheSharedExtraction(t *testing.T) {
+	want := []time.Duration{time.Minute, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute}
+	if len(antigravityRunDebtRetryLadder) != len(want) {
+		t.Fatalf("ladder = %v, want %v", antigravityRunDebtRetryLadder, want)
+	}
+	for i, rung := range want {
+		if antigravityRunDebtRetryLadder[i] != rung {
+			t.Fatalf("rung %d = %s, want %s", i, antigravityRunDebtRetryLadder[i], rung)
+		}
+	}
+	if antigravityRunDebtFreeRetryDelay != 30*time.Second {
+		t.Fatalf("free rung = %s, want 30s", antigravityRunDebtFreeRetryDelay)
+	}
+	// The shared helper must behave exactly as the private copy did.
+	if got, ok := refreshRetryDelayForAttempt(2, antigravityRefreshDebtMaxAttempts, antigravityRunDebtRetryLadder); !ok || got != 2*time.Minute {
+		t.Fatalf("shared ladder rung = %s ok=%v, want 2m", got, ok)
+	}
+	if got := refreshFreeRetryDelay(5*time.Minute, antigravityRunDebtFreeRetryDelay, antigravityRunDebtRetryLadder); got != 5*time.Minute {
+		t.Fatalf("shared free rung = %s, want 5m", got)
+	}
+}
+
 // Refusals that spend no outbound read also spend no budget, so their rung has
 // to stretch with the debt's age or an offline / expired-login device would
 // re-check every 30 s for six hours.

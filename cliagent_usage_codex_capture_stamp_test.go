@@ -182,7 +182,7 @@ func TestCodexCaptureDriftNotice_InheritsTheStaleGate(t *testing.T) {
 	}
 	const detected = "codex-cli 0.150.0"
 
-	for _, fallback := range []string{codexFallbackUnset, codexFallbackSpent, codexFallbackSkipped} {
+	for _, fallback := range []string{codexFallbackExhausted} {
 		state.fallback = fallback
 		notice := codexRunFreshnessNotice(state, detected)
 		const want = `Codex utilization was last observed 2026-09-26 09:00 UTC by Codex build "codex-cli 0.149.0"; the installed build "codex-cli 0.150.0" has not reported utilization since the most recent Codex run started (2026-09-26 10:00 UTC). It will update once that build's telemetry is captured.`
@@ -199,7 +199,7 @@ func TestCodexCaptureDriftNotice_InheritsTheStaleGate(t *testing.T) {
 	if notice := codexRunFreshnessNotice(state, detected); notice != "" {
 		t.Fatalf("no notice while the fallback is in flight, got %q", notice)
 	}
-	state.fallback = codexFallbackSpent
+	state.fallback = codexFallbackExhausted
 	state.attempts = 1
 	if notice := codexRunFreshnessNotice(state, detected); notice != "" {
 		t.Fatalf("an upgrade alone must not raise drift, got %q", notice)

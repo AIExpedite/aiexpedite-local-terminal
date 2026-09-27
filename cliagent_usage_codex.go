@@ -295,6 +295,13 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		reconciled := codexReconcileForGather(scanCtx, base, usage.AccountFingerprint, now, forced)
 		cancel()
 		usage.Metrics, usageLimit, latestRolloutObservation = reconciled.metrics, reconciled.limit, reconciled.latestObservation
+		// The same evidence, acted on: a booked rung that is due, or Codex
+		// telemetry written after the cached reading with no debt recorded at all
+		// (a `codex` the user started in their own shell), arms the bounded
+		// refresh. It is handed the newest account-eligible rollout mtime this
+		// reconcile already stat-ed, never a walk of its own
+		// (cliagent_usage_codex_refresh_schedule.go).
+		nudgeCodexUsageRefresh(base, usage.AccountFingerprint, now, reconciled.newestRollout, latestRolloutObservation)
 	}
 	// An account that is OUT of quota reports no window at all — Codex nulls both
 	// `primary` and `secondary` on a refused turn — so the card fell back to

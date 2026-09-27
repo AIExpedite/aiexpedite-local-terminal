@@ -56,16 +56,27 @@ import (
 )
 
 const (
-	// codexRefreshAfterRunMaxAttempts bounds the forced reconciles one run's
-	// debt may spend (immediate, then one retry after
-	// codexRefreshAfterRunRetryDelay). Mirrors claudeUsageProbeAfterRunMaxAttempts.
-	codexRefreshAfterRunMaxAttempts = 2
+	// codexRefreshAfterRunMaxAttempts bounds the FORCED ROLLOUT SCANS one run's
+	// debt may spend across its whole lifetime — the settle pass and every
+	// scheduled rung (cliagent_usage_codex_refresh_schedule.go). They are local
+	// file I/O, so the bound is generous: the usual reason a settle finds nothing
+	// is that Codex has not flushed its rollout yet.
+	codexRefreshAfterRunMaxAttempts = 4
+	// codexRefreshLiveReadMaxAttempts bounds the live `account/rateLimits/read`s
+	// one debt may spend, counted separately (RefreshLiveReads) because the
+	// fallback is only reachable once the scan budget above is spent. Under one
+	// shared counter a deferred read on the last rung could never be retried, and
+	// an offline-at-settle device — the reported case — would never converge.
+	// Only a read that actually REACHED OpenAI counts.
+	codexRefreshLiveReadMaxAttempts = 2
 	// codexForcedReconcileBudget is the whole budget of one background forced
 	// reconcile (discovery + ordering + reads + the blocking merge).
 	codexForcedReconcileBudget = 8 * time.Second
 	// codexRefreshOwedMaxAge retires a debt nothing could pay, so it can never
-	// pin work (or a stale notice) forever.
-	codexRefreshOwedMaxAge = 30 * time.Minute
+	// pin work (or a stale notice) forever. It is the ladder's hard stop, and
+	// long enough to outlive an agent self-update plus a network reconnect: a run
+	// whose usage was never observed is still worth one read hours later.
+	codexRefreshOwedMaxAge = 6 * time.Hour
 	// codexArmedAccountCap bounds the armed-run → account map. A floor that is
 	// never settled individually (an app-server exit settles only the newest
 	// open turn) would otherwise retain its entry for the life of the process.
@@ -94,7 +105,6 @@ const (
 
 // Vars rather than consts so tests can pin them small.
 var (
-	codexRefreshAfterRunRetryDelay = 5 * time.Second
 	// codexRunFloorWriteAttempts / codexRunFloorWriteRetryDelay bound the
 	// retries armCodexUsageRunFloor spends getting a run start onto disk when
 	// the bounded cache locks refuse the write.
@@ -311,6 +321,34 @@ func (g *codexUsageRefreshGate) spawn(fn func()) {
 		defer func() { _ = recover() }()
 		fn()
 	}()
+}
+
+// trackBegin / trackEnd count the CALLER as a tracked goroutine without
+// starting one. The retry timer's callback already runs on its own goroutine and
+// must be counted before the timer lock is released, so a stop followed by
+// waitIdle either cancels it or waits it out (codexRunDebtRetryFired).
+func (g *codexUsageRefreshGate) trackBegin() {
+	g.mu.Lock()
+	g.active++
+	g.mu.Unlock()
+}
+
+func (g *codexUsageRefreshGate) trackEnd() { g.spawnDone() }
+
+// intervalRemaining reports how long codexForcedReconcileMinInterval still holds
+// a non-bypassing caller back for fp, so a rung deferred only by that spacing
+// lands after it has lapsed instead of deferring again.
+func (g *codexUsageRefreshGate) intervalRemaining(fp string, now time.Time) time.Duration {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	last, ok := g.lastRun[fp]
+	if !ok {
+		return 0
+	}
+	if since := now.Sub(last); since >= 0 && since < codexForcedReconcileMinInterval {
+		return codexForcedReconcileMinInterval - since
+	}
+	return 0
 }
 
 func (g *codexUsageRefreshGate) spawnDone() {
@@ -656,6 +694,13 @@ func (g *codexUsageRefreshGate) sleep(d time.Duration) bool {
 // resetClaudeUsageProbeGate: a worker that outlived its test would otherwise
 // write into the next test's cache.
 func resetCodexUsageRefreshGate() {
+	// FIRST, before the wait below. In-flight accounting only covers a callback
+	// that has already fired; a rung armed for minutes ahead is not in flight, so
+	// waitIdle would return and the timer later fire into a reset gate — the next
+	// test's cache, or a process being simulated as replaced. Folding the stop in
+	// here means no future caller can forget it (Antigravity's tests still call
+	// stopAntigravityRunDebtRetry by hand).
+	stopCodexRunDebtRetry()
 	codexUsageRefresh.mu.Lock()
 	close(codexUsageRefresh.cancel)
 	codexUsageRefresh.mu.Unlock()
@@ -673,20 +718,59 @@ func resetCodexUsageRefreshGate() {
 	codexUsageRefresh.driftBypass = map[string]string{}
 	codexUsageRefresh.cancel = make(chan struct{})
 	codexUsageRefresh.mu.Unlock()
+	resetCodexRefreshNudge()
 	// The binary a previous test (or process) named must not stamp this one.
 	codexResetUsageCaptureVersion()
 	resetCodexLiveRateLimitRead()
 }
 
-// codexStaleRunNoticeDue is the gate both run-freshness notices share: a debt
-// still owed after every bounded attempt, and no live fallback in flight. The
-// fallback is only owed once the attempts are spent, so the counter alone has
-// already crossed the threshold while it runs; without the second half a
-// gather landing mid-probe would show the warning and the next one would take
-// it away.
+// codexStaleRunNoticeDue is the gate both run-freshness notices share. Two ways
+// in:
+//
+//   - A LIVE debt that has run out of everything: every rollout scan spent and
+//     the live fallback `exhausted`. A fallback that is outstanding (a read in
+//     flight) or `deferred` with a rung booked is still TRYING — showing the
+//     warning mid-ladder would make it flicker on and off across gathers.
+//   - The expiry MARKER a debt left when it aged out unpaid
+//     (codexRetireExpiredRunDebt). Without it, a continuously offline debt that
+//     kept booking free rungs would simply vanish at the age-out and the card
+//     would go quiet instead of warning — which the 6 h window makes worse, not
+//     better.
 func codexStaleRunNoticeDue(state codexRunFreshnessState) bool {
+	if !state.expiredFloor.IsZero() && !state.owed {
+		return true
+	}
 	return state.owed && state.attempts >= codexRefreshAfterRunMaxAttempts &&
-		state.fallback != codexFallbackOutstanding
+		state.fallback == codexFallbackExhausted
+}
+
+// noticeFloor is the run start a run-freshness notice names: the LIVE debt's
+// floor, or — once that debt has aged out and been retired — the floor recorded
+// in the expiry marker. Both notices read it, so neither can end up printing the
+// zero time for a retired debt whose RunFloorMs is gone.
+func (s codexRunFreshnessState) noticeFloor() time.Time {
+	if s.owed {
+		return s.floor
+	}
+	return s.expiredFloor
+}
+
+// codexRunDebtExpired is the ONE answer to "is this debt over?". Every reader of
+// the age-out — codexRunFreshnessFromView, codexSettleRunFreshness, retirement
+// and the schedule's clamp — goes through it, so the predicate cannot be
+// asymmetric between them (it used to be: the view kept a debt owed on `<=`
+// while the settle expired it on `>`, and a rung landing exactly on the boundary
+// fired, found the debt still owed and re-booked the same already-due instant).
+func codexRunDebtExpired(owedAtMs int64, now time.Time) bool {
+	return owedAtMs > 0 && now.Sub(time.UnixMilli(owedAtMs)) > codexRefreshOwedMaxAge
+}
+
+// codexRunDebtExpiryInstant is the first instant codexRunDebtExpired is true for
+// a debt owed at owedAtMs — the ceiling the schedule clamps a booked rung to, so
+// the rung that fires at the deadline retires the debt instead of rescheduling
+// itself forever.
+func codexRunDebtExpiryInstant(owedAtMs int64) time.Time {
+	return time.UnixMilli(owedAtMs).Add(codexRefreshOwedMaxAge).Add(time.Millisecond)
 }
 
 /* ─────────────────────────── context markers ─────────────────────────── */
@@ -747,13 +831,35 @@ type codexRunFreshnessState struct {
 	interrupted bool
 	// fallback is the debt's RefreshFallbackState (codexLiveUsageFallback).
 	fallback string
+	// liveReads is the debt's RefreshLiveReads: reads that reached OpenAI.
+	liveReads int
+	// nextAttemptAt is the booked rung (NextAttemptAtMs), zero when none.
+	nextAttemptAt time.Time
+	// expiredFloor / expiredAt are the marker codexRetireExpiredRunDebt left for
+	// a debt that aged out unpaid: the floor never observed, and when it expired.
+	expiredFloor time.Time
+	expiredAt    time.Time
 	// codexVersion is the binary that produced the newest observation
 	// (codexCaptureDriftNotice).
 	codexVersion string
 }
 
 func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFreshnessState {
-	state := codexRunFreshnessState{attempts: view.refreshOwedAttempts, fallback: view.refreshFallback, codexVersion: view.codexVersion}
+	state := codexRunFreshnessState{
+		attempts:     view.refreshOwedAttempts,
+		fallback:     view.refreshFallback,
+		liveReads:    view.refreshLiveReads,
+		codexVersion: view.codexVersion,
+	}
+	if view.nextAttemptAtMs > 0 {
+		state.nextAttemptAt = time.UnixMilli(view.nextAttemptAtMs)
+	}
+	if view.staleNoticeFloorMs > 0 {
+		state.expiredFloor = time.UnixMilli(view.staleNoticeFloorMs)
+	}
+	if view.staleNoticeAtMs > 0 {
+		state.expiredAt = time.UnixMilli(view.staleNoticeAtMs)
+	}
 	if view.runFloorMs <= 0 {
 		return state
 	}
@@ -764,10 +870,10 @@ func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFresh
 	unobserved := state.latest.Before(state.floor) && view.runFloorPaidMs < view.runFloorMs
 	if view.refreshOwedAtMs > 0 {
 		state.owedAt = time.UnixMilli(view.refreshOwedAtMs)
-		state.owed = unobserved && now.Sub(state.owedAt) <= codexRefreshOwedMaxAge
+		state.owed = unobserved && !codexRunDebtExpired(view.refreshOwedAtMs, now)
 		return state
 	}
-	state.interrupted = unobserved && now.Sub(state.floor) <= codexRefreshOwedMaxAge
+	state.interrupted = unobserved && !codexRunDebtExpired(view.runFloorMs, now)
 	return state
 }
 
@@ -785,13 +891,22 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 		return
 	}
 	paid := snap.RunFloorMs <= 0 || snap.RunFloorPaidMs >= snap.RunFloorMs
-	expired := now.Sub(time.UnixMilli(snap.RefreshOwedAtMs)) > codexRefreshOwedMaxAge
+	expired := codexRunDebtExpired(snap.RefreshOwedAtMs, now)
 	if !paid && !expired {
 		return
 	}
-	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
-	// A settled debt raises no notice and owes no live fallback.
-	snap.RefreshFallbackState = codexFallbackUnset
+	if paid {
+		// A covering observation also answers whatever an earlier debt's expiry
+		// warned about, so the marker goes with it.
+		snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
+	} else {
+		// Expired unpaid: leave the bounded marker so the card can still say the
+		// figure is behind, instead of going quiet. Written on THIS branch only —
+		// never the paid one.
+		codexMarkRunDebtExpired(snap, now)
+	}
+	// A settled debt raises no notice, owes no live fallback and books no rung.
+	codexClearRunFreshnessDebt(snap)
 	if !paid {
 		snap.RunFloorMs = 0
 	}
@@ -802,6 +917,51 @@ func codexSettleRunFreshness(snap *codexRateLimitSnapshot, now time.Time) {
 	// snapshot before the promoted run settles, and a restart would then read
 	// an already-observed run as interrupted.
 	codexRecordPaidRunFloor(snap)
+}
+
+// codexMarkRunDebtExpired records the bounded terminal marker for a debt that
+// aged out unpaid — the floor that was never observed and the moment it expired
+// — and clears the debt. Must be called while snap.RunFloorMs still holds that
+// floor.
+//
+// One marker per account, overwritten by a later expiry. It holds no attempt
+// budget and schedules nothing; codexStaleRunNoticeDue reads it as a due notice,
+// and the next covering observation or an account rescope clears it.
+func codexMarkRunDebtExpired(snap *codexRateLimitSnapshot, now time.Time) {
+	if snap.RefreshOwedAtMs <= 0 {
+		return
+	}
+	if snap.RunFloorMs > 0 {
+		snap.StaleRunNoticeFloorMs = snap.RunFloorMs
+		snap.StaleRunNoticeAtMs = now.UnixMilli()
+	}
+	codexClearRunFreshnessDebt(snap)
+}
+
+// codexRetireExpiredRunDebt is the atomic operation every path that could WALK
+// AWAY from an over-age debt must run first. codexSettleRunFreshness only runs
+// inside a cache transaction, and a timer fire, the startup replay and the
+// gather all read an over-age debt as `owed == false` and return having written
+// nothing — the debt then sits unretired until some unrelated write settles it,
+// with no marker and no warning.
+//
+// Reports whether it retired anything, so a caller can tell an expiry from an
+// ordinary "nothing owed".
+func codexRetireExpiredRunDebt(fp string, now time.Time) bool {
+	if fp == "" {
+		return false
+	}
+	var retired bool
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || !codexRunDebtExpired(snap.RefreshOwedAtMs, now) {
+			return false
+		}
+		codexMarkRunDebtExpired(snap, now)
+		snap.RunFloorMs = 0
+		retired = true
+		return true
+	})
+	return retired
 }
 
 // codexRecordPaidRunFloor watermarks the newest run floor a contributor
@@ -963,9 +1123,26 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 			*floor, rebased = 0, true
 		}
 	}
+	// A rung left parked in the future by a backwards clock step would hold the
+	// whole ladder there, so it goes with the floors whenever anything rebased.
 	if rebased {
 		snap.RefreshOwedAttempts = 0
+		snap.RefreshLiveReads = 0
 		snap.RefreshFallbackState = codexFallbackUnset
+		snap.NextAttemptAtMs = 0
+	}
+	// The expiry marker is rebased independently of the floors: it can be dated
+	// ahead on its own (stamped just before the rollback), and it is CLEARED
+	// rather than pulled back. A marker describing a moment the machine no longer
+	// believes in cannot be cleared by any present observation, so it would be a
+	// permanent warning; dropping it at worst re-warns once when the next debt
+	// expires.
+	for _, ms := range []*int64{&snap.StaleRunNoticeFloorMs, &snap.StaleRunNoticeAtMs} {
+		if *ms > localCeilingMs {
+			snap.StaleRunNoticeFloorMs, snap.StaleRunNoticeAtMs = 0, 0
+			rebased = true
+			break
+		}
 	}
 	return rebased
 }
@@ -979,7 +1156,13 @@ func codexRebaseFutureRunFreshness(snap *codexRateLimitSnapshot, startedAt, now 
 // gate the repair write.
 func codexRunFreshnessInFuture(view codexCacheView, now time.Time) bool {
 	localCeilingMs := now.Add(codexRunFloorLocalSkew).UnixMilli()
-	for _, ms := range []int64{view.runFloorMs, view.activeRunFloorMs, view.runFloorPaidMs, view.refreshOwedAtMs} {
+	// NextAttemptAtMs is deliberately absent: a booked rung is SUPPOSED to sit
+	// ahead of now, so judging it here would call every ordinary retry a
+	// rollback. It gets its own, much wider test (codexRunDebtRetryHorizon).
+	for _, ms := range []int64{
+		view.runFloorMs, view.activeRunFloorMs, view.runFloorPaidMs, view.refreshOwedAtMs,
+		view.staleNoticeFloorMs, view.staleNoticeAtMs,
+	} {
 		if ms > localCeilingMs {
 			return true
 		}
@@ -1086,13 +1269,26 @@ func codexOweRunRefresh(snap *codexRateLimitSnapshot, floor, completedAt time.Ti
 	if snap.RunFloorMs == 0 || floorMs > snap.RunFloorMs {
 		snap.RunFloorMs = floorMs
 	}
+	// A new generation: its own scan budget, its own live-read budget, its own
+	// live fallback, and no rung inherited from the debt it replaces.
+	codexClearRunFreshnessDebt(snap)
 	snap.RefreshOwedAtMs = completedAt.UnixMilli()
-	// A new generation: its own attempt budget and its own live fallback.
-	snap.RefreshOwedAttempts = 0
-	snap.RefreshFallbackState = codexFallbackUnset
 	if snap.ActiveRunFloorMs <= snap.RunFloorMs {
 		snap.ActiveRunFloorMs = 0
 	}
+}
+
+// codexRebaseFutureRunDebtRung drops a booked rung that sits further ahead than
+// the schedule could ever legitimately book it — a backwards clock step, the
+// failure #167 fixed for the debt marker itself. Cleared rather than pulled back:
+// the debt then simply reads as due now, which is the behaviour the ladder wants.
+// Reports whether it cleared one.
+func codexRebaseFutureRunDebtRung(snap *codexRateLimitSnapshot, now time.Time) bool {
+	if snap.NextAttemptAtMs <= now.Add(codexRunDebtRetryHorizon()).UnixMilli() {
+		return false
+	}
+	snap.NextAttemptAtMs = 0
+	return true
 }
 
 // codexCountRefreshAttempt counts one bounded attempt against the debt `id`
@@ -1115,7 +1311,7 @@ func codexCountRefreshAttempt(snap *codexRateLimitSnapshot, id codexDebtID) {
 // worker's fallback runs, and maybe show it again.
 //
 // The worker check runs INSIDE the cache transaction: a retiring worker
-// releases itself before its skip write (codexSkipOutstandingFallback), and
+// releases itself before its resolving write (codexResolveOutstandingFallback), and
 // both writes serialize on the cache lock, so an outstanding written here is
 // either seen and resolved by that skip, or never written at all.
 func codexOweFallbackWhileWorkerRuns(snap *codexRateLimitSnapshot, fp string) {
@@ -1278,7 +1474,7 @@ func codexRunDebtWorker(base, fp string) {
 		return
 	}
 	for {
-		codexPayRunRefresh(base, fp)
+		state, kind := codexPayRunRefresh(base, fp)
 		if codexUsageRefresh.releaseWorker(fp) {
 			// Last chance to land a debt or attempts the cache lock refused:
 			// nothing else runs for this account until another run finishes
@@ -1286,10 +1482,16 @@ func codexRunDebtWorker(base, fp string) {
 			// still retained here (codexReconcileForGather).
 			codexFlushPendingRunDebt(fp)
 			codexRecordRefreshAttempt(fp, codexDebtID{}, 0)
-			// Nothing reschedules this worker, so a fallback it leaves
-			// outstanding would hold the stale notice back for the debt's
-			// whole age-out window. Resolve it: the notice surfaces now.
-			codexSkipOutstandingFallback(fp)
+			// Book what this pass KEPT before retiring, so a deferral (the
+			// minimum interval, offline, a failed read) is followed by another
+			// attempt on the ladder rather than by nothing until the next run
+			// happens to settle. This is the whole fix: the worker used to be the
+			// last thing that would ever look at the debt.
+			booked := codexScheduleRunDebtRetry(fp, state, codexUsageFreshnessNow(), kind)
+			// A fallback this worker leaves outstanding resolves to `deferred`
+			// when a rung is booked (the ladder will re-enter it) and only to
+			// `exhausted` when none is — which is when the notice surfaces.
+			codexResolveOutstandingFallback(fp, booked)
 			return
 		}
 	}
@@ -1307,51 +1509,85 @@ func codexRunDebtWorker(base, fp string) {
 // (codexLiveUsageFallback): the rollout scan is the one step a Codex upgrade
 // can break — a new layout, a cursor written by the old binary — and the live
 // read does not depend on either.
-func codexPayRunRefresh(base, fp string) {
-	if !codexPayRunRefreshAttempts(base, fp) {
-		return
+// It returns the debt it last looked at and the retry kind the caller must hand
+// to codexScheduleRunDebtRetry, so a pass that kept the debt always ends with a
+// rung booked against that generation.
+func codexPayRunRefresh(base, fp string) (codexRunFreshnessState, codexRunDebtRetryKind) {
+	state, kind, spent := codexPayRunRefreshAttempts(base, fp)
+	if !spent {
+		return state, kind
 	}
-	state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+	state = codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
 	if !state.owed {
-		return
+		// An over-age debt reads as not owed here too, and nothing downstream
+		// would retire it.
+		codexRetireExpiredRunDebt(fp, codexUsageFreshnessNow())
+		return state, codexRetryNone
 	}
-	codexLiveUsageFallback(fp, state)
+	return state, codexLiveUsageFallback(fp, state)
 }
 
-// codexPayRunRefreshAttempts is codexPayRunRefresh's reconcile loop. Reports
-// true only when it spent every attempt and the debt may still be owed.
-func codexPayRunRefreshAttempts(base, fp string) bool {
-	for attempt := 0; attempt < codexRefreshAfterRunMaxAttempts; attempt++ {
-		if attempt > 0 && !codexUsageRefresh.sleep(codexRefreshAfterRunRetryDelay) {
-			return false
-		}
+// codexPayRunRefreshAttempts is codexPayRunRefresh's SCAN loop. It reports the
+// debt it last looked at, the retry kind it keeps, and whether the scan budget is
+// spent so the live fallback is the caller's next step.
+//
+// One rollout scan per iteration, spaced by the ladder rather than by a fixed
+// retry delay: the loop runs a single attempt and returns, and the booked rung is
+// what brings the worker back. (It still loops when a NEWER run re-arms the
+// worker — that run gets its own attempts.)
+func codexPayRunRefreshAttempts(base, fp string) (codexRunFreshnessState, codexRunDebtRetryKind, bool) {
+	var state codexRunFreshnessState
+	for {
 		if codexUsageRefresh.takeRearm(fp) {
-			attempt = 0
+			// A newer run finished while this pass worked: its debt replaced the
+			// one on disk (and reset the counters), so look again.
+			continue
 		}
 		if !codexLandPendingRunDebt(fp) {
 			// Still unrecorded after the write budget: the process is
 			// shutting down, or the lock is wedged past every bound. The
 			// debt stays retained for the worker's last-chance flush and the
 			// next gather; a reconcile now would read `owed == false` off
-			// disk and retire a run that was never recorded.
-			return false
+			// disk and retire a run that was never recorded. Nothing to book
+			// either — there is no generation on disk to book it against.
+			return state, codexRetryNone, false
 		}
-		state := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+		now := codexUsageFreshnessNow()
+		state = codexRunFreshnessForAccount(fp, now)
 		if !state.owed {
-			return false // paid by capture, a gather, or an earlier attempt
+			// Paid by capture, a gather or an earlier attempt — or aged out, in
+			// which case nothing else would retire it.
+			codexRetireExpiredRunDebt(fp, now)
+			return state, codexRetryNone, false
 		}
 		if state.attempts >= codexRefreshAfterRunMaxAttempts {
-			// Already spent elsewhere — the startup replay's reconcile, or a
-			// gather's — so the debt goes straight to its live fallback
+			// The scan budget is spent — here or elsewhere (the startup replay's
+			// reconcile, a gather's) — so the debt goes to its live fallback
 			// instead of paying for more scans than its bound allows.
-			return true
+			return state, codexRetryNone, true
 		}
 		if !codexAwaitGatedReconcile(base, fp, state.floor) {
-			return false
+			// Shutting down or the gate was reset: nothing was sent, so nothing
+			// is spent. The rung on disk stands (codexScheduleRunDebtRetry writes
+			// nothing while disarmed) and the next process re-arms it.
+			return state, codexRetryFree, false
 		}
 		codexRecordRefreshAttempt(fp, state.debtID(), 1)
+		// Re-read: the reconcile commits through the blocking merge, so it may
+		// have paid the debt in that same write.
+		after := codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+		if !after.owed {
+			return after, codexRetryNone, false
+		}
+		if after.attempts >= codexRefreshAfterRunMaxAttempts {
+			// The scan budget ran out on THIS attempt. Reach the live fallback in
+			// the same pass rather than booking a scan rung that cannot exist —
+			// otherwise the pass would end with nothing booked and the fallback
+			// resolved to `exhausted` without ever having run.
+			return after, codexRetryNone, true
+		}
+		return after, codexRetryAfterScan, false
 	}
-	return true
 }
 
 // codexRecordRefreshAttempt counts `spent` attempts against fp's debt, folding
@@ -1447,9 +1683,44 @@ func codexAwaitGatedReconcile(base, fp string, floor time.Time) bool {
 	return true // counted as an attempt; the debt stays for the next one
 }
 
-// codexLiveUsageFallbackTries bounds how often one fallback asks the shared
-// Codex read: once, then once more after waiting out a cooldown refusal.
+// codexLiveUsageFallbackTries bounds how often ONE INVOCATION of the fallback
+// asks the shared Codex read: once, then once more after waiting out a cooldown
+// refusal. Distinct from codexRefreshLiveReadMaxAttempts, which is the debt's
+// lifetime budget of reads that actually reached OpenAI.
 const codexLiveUsageFallbackTries = 2
+
+// codexLiveReadOutbound classifies a live-probe outcome ONCE, for both the
+// accounting and the retry kind. cliagent_usage_live_probe.go returns several
+// non-cooldown results that sent no request at all and must not cost a read from
+// a two-read budget.
+//
+// An unrecognised outcome from a newer producer is treated as OUTBOUND, so an
+// unknown result can never loop for free.
+func codexLiveReadOutbound(outcome string) bool {
+	switch outcome {
+	case liveProbeOutcomeSpawnFailed, liveProbeOutcomeAccountChanged,
+		liveProbeOutcomeGated, liveProbeOutcomeCooldown:
+		return false
+	}
+	return true
+}
+
+// codexLiveReadRetryKind is the rung a finished live read asks for. `ok` pays the
+// debt (the merge clears it, so nothing is booked); a read that reached OpenAI
+// and failed books afterRead; a refusal that sent nothing books free; a cooldown
+// books spacing.
+func codexLiveReadRetryKind(outcome string) codexRunDebtRetryKind {
+	switch outcome {
+	case liveProbeOutcomeOK:
+		return codexRetryNone
+	case liveProbeOutcomeCooldown:
+		return codexRetrySpacing
+	}
+	if codexLiveReadOutbound(outcome) {
+		return codexRetryAfterRead
+	}
+	return codexRetryFree
+}
 
 // codexLiveUsageFallbackRead is the live read the fallback spends. A var so
 // tests never start a real `codex app-server`.
@@ -1457,56 +1728,101 @@ var codexLiveUsageFallbackRead = func(ctx context.Context, fp string) string {
 	return codexLiveRateLimitRead(ctx, "", fp)
 }
 
-// codexLiveUsageFallback spends at most one live `account/rateLimits/read` on
-// a debt its rollout attempts could not pay. The reading lands through the
-// ordinary capture path, so a debt it covers settles in that same write.
+// codexLiveUsageFallback spends at most one live `account/rateLimits/read` per
+// invocation on a debt its rollout attempts could not pay. The reading lands
+// through the ordinary capture path, so a debt it covers settles in that same
+// write. It reports the retry kind the caller must book.
 //
-// Bounds: once per debt generation (RefreshFallbackState), never while
-// offline or with the gate disabled (both resolve it to skipped), behind the
-// shared Codex read cooldown, one fallback per account at a time, and each
-// read inside codexLiveProbeTimeout — cancelled by shutdown or a gate reset
-// like every other wait of the worker. Only a read that actually ran —
-// whatever it returned — spends the bound; a cooldown refusal leaves the
-// state outstanding for the worker's next pass (or its retirement, which
-// resolves it to skipped).
+// Bounds: codexRefreshLiveReadMaxAttempts reads per debt generation that
+// actually reached OpenAI (RefreshLiveReads), never while offline or with the
+// gate disabled (both cost nothing and stay retryable), behind the shared Codex
+// read cooldown, one fallback per account at a time, and each read inside
+// codexLiveProbeTimeout — cancelled by shutdown or a gate reset like every other
+// wait of the worker.
+//
+// `exhausted` is the ONLY state a booked rung cannot re-enter. A refusal that
+// sent nothing used to write the final `skipped`, so a brief IsOffline() right
+// after a self-update ended the debt's only network recovery for good — the most
+// direct cause of the reported staleness.
 //
 // The read is pinned to the debt's own account: a credentials swap since the
 // run returns account_changed and the reading is dropped rather than booked
 // against the account that made the run.
-func codexLiveUsageFallback(fp string, state codexRunFreshnessState) {
+func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDebtRetryKind {
 	id := state.debtID()
-	if !id.valid() || state.fallback == codexFallbackSpent || state.fallback == codexFallbackSkipped {
-		return
+	if !id.valid() || state.fallback == codexFallbackExhausted {
+		return codexRetryNone
+	}
+	if state.liveReads >= codexRefreshLiveReadMaxAttempts {
+		codexSetRefreshFallback(fp, id, codexFallbackExhausted)
+		return codexRetryNone
 	}
 	if !codexUsageRefresh.claimFallback(fp) {
-		return
+		// Another pass owns the read; it books the rung its own outcome earns.
+		return codexRetryNone
 	}
 	defer codexUsageRefresh.releaseFallback(fp)
 	if !codexUsageRefresh.isEnabled() || IsOffline() {
-		codexSetRefreshFallback(fp, id, codexFallbackSkipped)
-		return
+		// Nothing left the device, so nothing is spent and the debt stays
+		// payable. A free rung brings it back once the device is online again.
+		codexSetRefreshFallback(fp, id, codexFallbackDeferred)
+		return codexRetryFree
 	}
 	// Outstanding BEFORE the read: a gather landing mid-probe must see the
 	// notice held back, not show it and have the next gather take it away.
 	if !codexSetRefreshFallback(fp, id, codexFallbackOutstanding) {
-		return // the debt moved on (paid, re-owed, or another account's now)
+		return codexRetryNone // the debt moved on (paid, re-owed, or another account's now)
 	}
 	codexResolveCaptureVersion()
 	for try := 0; try < codexLiveUsageFallbackTries; try++ {
 		outcome, cancelled := codexRunLiveUsageFallbackRead(fp)
 		if cancelled {
-			return // shutting down or reset: the cache may belong to someone else now
+			// Shutting down or reset: the cache may belong to someone else now,
+			// so write nothing and leave the rung on disk alone.
+			return codexRetryNone
 		}
 		if outcome != liveProbeOutcomeCooldown {
-			codexSetRefreshFallback(fp, id, codexFallbackSpent)
+			kind := codexLiveReadRetryKind(outcome)
+			codexRecordLiveReadOutcome(fp, id, outcome, kind)
 			fmt.Printf("%s[cli-usage] codex post-run live read: %s%s\n", colorCyan, outcome, colorReset)
-			return
+			return kind
 		}
 		if try+1 < codexLiveUsageFallbackTries &&
 			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(fp, time.Now())) {
-			return
+			return codexRetryNone
 		}
 	}
+	// Every try was refused by the cooldown: no read went out, so nothing is
+	// spent and the debt is deferred until the cooldown lapses.
+	codexSetRefreshFallback(fp, id, codexFallbackDeferred)
+	return codexRetrySpacing
+}
+
+// codexRecordLiveReadOutcome books one finished live read against the debt `id`
+// names: the read counter advances only for an outcome that REACHED OpenAI, and
+// the state becomes `exhausted` only once that counter is at its cap — never on
+// the first failure, which would make the second scheduled read unrunnable and
+// the two-read budget a fiction.
+func codexRecordLiveReadOutcome(fp string, id codexDebtID, outcome string, kind codexRunDebtRetryKind) {
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs {
+			return false
+		}
+		if codexLiveReadOutbound(outcome) {
+			snap.RefreshLiveReads++
+		}
+		switch {
+		case outcome == liveProbeOutcomeOK:
+			// The reading's own merge settles the debt; leave the state alone so
+			// codexSettleRunFreshness clears it with everything else.
+			return snap.RefreshLiveReads > 0
+		case snap.RefreshLiveReads >= codexRefreshLiveReadMaxAttempts, kind == codexRetryNone:
+			snap.RefreshFallbackState = codexFallbackExhausted
+		default:
+			snap.RefreshFallbackState = codexFallbackDeferred
+		}
+		return true
+	})
 }
 
 // codexRunLiveUsageFallbackRead runs one read under codexLiveProbeTimeout,
@@ -1536,7 +1852,8 @@ func codexRunLiveUsageFallbackRead(fp string) (outcome string, cancelled bool) {
 // `to`. It refuses — reporting false — when the debt is no longer that
 // generation, when the snapshot belongs to another account (writing would
 // rescope it and discard the live account's readings), or when the state has
-// already resolved: spent and skipped are final for their generation.
+// already resolved: only codexFallbackExhausted is final, so a booked rung can
+// always re-enter the fallback while budget remains.
 func codexSetRefreshFallback(fp string, id codexDebtID, to string) bool {
 	var applied bool
 	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
@@ -1544,7 +1861,7 @@ func codexSetRefreshFallback(fp string, id codexDebtID, to string) bool {
 			return false
 		}
 		switch snap.RefreshFallbackState {
-		case codexFallbackSpent, codexFallbackSkipped:
+		case codexFallbackExhausted:
 			return false
 		case to:
 			applied = true
@@ -1557,17 +1874,24 @@ func codexSetRefreshFallback(fp string, id codexDebtID, to string) bool {
 	return applied
 }
 
-// codexSkipOutstandingFallback resolves a fallback the retiring worker leaves
-// outstanding. The read comes first so the routine retirement writes nothing.
-func codexSkipOutstandingFallback(fp string) {
+// codexResolveOutstandingFallback resolves a fallback the retiring worker leaves
+// outstanding. It resolves to `deferred` when a rung IS booked — the ladder will
+// come back to it, so the notice must stay hidden — and to `exhausted` only when
+// none is, which is when the notice surfaces. The read comes first so the routine
+// retirement writes nothing.
+func codexResolveOutstandingFallback(fp string, booked bool) {
 	if codexCacheViewForAccount(fp).refreshFallback != codexFallbackOutstanding {
 		return
+	}
+	to := codexFallbackExhausted
+	if booked {
+		to = codexFallbackDeferred
 	}
 	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
 		if snap.AccountFingerprint != fp || snap.RefreshFallbackState != codexFallbackOutstanding {
 			return false
 		}
-		snap.RefreshFallbackState = codexFallbackSkipped
+		snap.RefreshFallbackState = to
 		return true
 	})
 }
@@ -1577,6 +1901,10 @@ type codexReconcileResult struct {
 	metrics           []cliAgentUsageMetric
 	limit             codexUsageLimitEvidence
 	latestObservation time.Time
+	// newestRollout is the newest ACCOUNT-ELIGIBLE rollout mtime the pass
+	// stat-ed, or zero when it did not complete. The refresh nudge is handed this
+	// rather than walking the tree again (nudgeCodexUsageRefresh).
+	newestRollout time.Time
 }
 
 // codexRunGatedReconcile runs one forced rollout reconcile for fp under the
@@ -1589,8 +1917,8 @@ func codexRunGatedReconcile(ctx context.Context, base, fp string, floor time.Tim
 		return codexReconcileResult{}, false, busy, wait
 	}
 	defer codexUsageRefresh.finish(fp, done)
-	metrics, limit, latest := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest}, true, nil, 0
+	metrics, limit, latest, newest := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
+	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, newestRollout: newest}, true, nil, 0
 }
 
 // payOwedCodexUsageRefresh pays, once, a debt the previous agent process left
@@ -1598,6 +1926,14 @@ func codexRunGatedReconcile(ctx context.Context, base, fp string, floor time.Tim
 // one the process died in the middle of (interrupted — nothing of this process
 // can be running yet at startup). Exactly one bounded forced reconcile; any
 // remainder is paid by the next run or refresh under the ordinary bounds.
+//
+// It HONOURS the rung the previous process booked (NextAttemptAtMs): a rung still
+// in the future, and inside codexRunDebtRetryHorizon(), is simply re-armed and
+// costs no attempt. It reconciles immediately only when the rung is due, absent,
+// or beyond the horizon (a backwards clock step). Otherwise every launch would
+// spend an attempt, and a device restarted three times before Codex flushed its
+// telemetry would burn the whole scan budget in seconds — the survival the
+// persisted rung exists for.
 func payOwedCodexUsageRefresh() {
 	if !codexUsageRefresh.isEnabled() {
 		return
@@ -1621,7 +1957,25 @@ func payOwedCodexUsageRefresh() {
 		}
 		state := codexRunFreshnessFromView(view, now)
 		if !state.owed && !state.interrupted {
+			// An over-age debt reads as neither, and no other path would retire
+			// it: it would sit on disk with no marker and no warning.
+			codexRetireExpiredRunDebt(fp, now)
 			return
+		}
+		// A rung the previous process booked and which is still in the future is
+		// simply re-armed here: the debt is being looked after, and spending an
+		// attempt on it now is exactly the premature exhaustion this field
+		// prevents. A rung beyond the horizon is a backwards clock step — cleared,
+		// after which the debt reads as due now and falls through.
+		if state.owed && !state.nextAttemptAt.IsZero() {
+			if state.nextAttemptAt.Sub(now) > codexRunDebtRetryHorizon() {
+				codexRecordRunFreshness(fp, now, func(snap *codexRateLimitSnapshot) {
+					codexRebaseFutureRunDebtRung(snap, now)
+				})
+			} else if state.nextAttemptAt.After(now) {
+				codexArmRunDebtRetry(state.debtID(), fp, state.nextAttemptAt.Sub(now))
+				return
+			}
 		}
 		// "Interrupted" means the floor's run belongs to a process that is
 		// gone — but this replay is spawned, so a session of THIS process can
@@ -1746,6 +2100,13 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 		view = codexCacheViewForAccount(fp)
 	}
 	state := codexRunFreshnessFromView(view, now)
+	// An over-age debt reads as not owed, and this path would return having
+	// written nothing — the debt would sit unretired, with no marker and no
+	// warning, until some unrelated write happened to settle it.
+	if !state.owed && view.refreshOwedAtMs != 0 && codexRetireExpiredRunDebt(fp, now) {
+		view = codexCacheViewForAccount(fp)
+		state = codexRunFreshnessFromView(view, now)
+	}
 	if forced || state.owed {
 		var floor time.Time
 		bypass := forced
@@ -1781,8 +2142,8 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 			}
 		}
 	}
-	metrics, limit, latest := codexReconcileFromRollout(ctx, base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest}
+	metrics, limit, latest, newest := codexReconcileFromRollout(ctx, base, fp, now)
+	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, newestRollout: newest}
 }
 
 // codexStaleRunNotice explains a card whose newest observation predates the
@@ -1798,8 +2159,14 @@ func codexStaleRunNotice(state codexRunFreshnessState) string {
 	if !state.latest.IsZero() {
 		last = "Codex utilization was last observed " + state.latest.UTC().Format(layout)
 	}
+	// A live debt still names the run it is waiting on; an expiry marker names
+	// the run whose telemetry was never found and stops promising a find.
+	if !state.owed {
+		return fmt.Sprintf("%s, before the most recent Codex run started (%s); its telemetry was never found.",
+			last, state.noticeFloor().UTC().Format(layout))
+	}
 	return fmt.Sprintf("%s, before the most recent Codex run started (%s); it will update once that run's telemetry is found.",
-		last, state.floor.UTC().Format(layout))
+		last, state.noticeFloor().UTC().Format(layout))
 }
 
 // codexRunCompletionFrame reports whether a Codex stdout line announces the end
