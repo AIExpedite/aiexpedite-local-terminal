@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseMuseCodeEventLine(t *testing.T) {
@@ -205,6 +207,75 @@ func TestMuseCodeCredentialIsRedactedFromPublishedFrames(t *testing.T) {
 	got := redactAgentSecrets("auth failed: META_API_KEY=mk-live-0123456789abcdef")
 	if strings.Contains(got, "0123456789abcdef") {
 		t.Fatalf("META_API_KEY value leaked: %q", got)
+	}
+}
+
+func TestSplitRedactionCarry(t *testing.T) {
+	cases := []struct {
+		name      string
+		text      string
+		wantEmit  string
+		wantCarry string
+	}{
+		// The carry starts where redactAgentSecrets' own `api[_-]?key` pattern
+		// would match, so the held tail is exactly what the mask needs.
+		{"a dangling credential key waits for its value", "tool output: META_API_KEY=", "tool output: META_", "API_KEY="},
+		{"a partial value is held with its key", "echo api_key: mk-live", "echo ", "api_key: mk-live"},
+		{"a long opaque tail could still grow into a blob", "token is " + strings.Repeat("a", 20), "token is ", strings.Repeat("a", 20)},
+		{"ordinary prose streams straight through", "the plan is ready now", "the plan is ready now", ""},
+		{"a short trailing word is not held back", "thinking", "thinking", ""},
+		{"a whole-buffer tail publishes rather than stalling", strings.Repeat("x", 4*1024), strings.Repeat("x", 4*1024), ""},
+		{"an oversize run is not buffered", "x " + strings.Repeat("y", agentSecretCarryMaxBytes+1), "x " + strings.Repeat("y", agentSecretCarryMaxBytes+1), ""},
+		{"empty text", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			emit, carry := splitRedactionCarry(tc.text)
+			if emit != tc.wantEmit || carry != tc.wantCarry {
+				t.Fatalf("got emit=%q carry=%q, want emit=%q carry=%q", emit, carry, tc.wantEmit, tc.wantCarry)
+			}
+			if emit+carry != tc.text {
+				t.Fatalf("the split must be lossless: %q + %q != %q", emit, carry, tc.text)
+			}
+		})
+	}
+}
+
+// A credential pair split across two coalescer flushes must not publish the
+// value verbatim: the later masked completion frame cannot retract a leaked
+// stream frame.
+func TestDeltaCoalescer_CredentialSplitAcrossFlushesIsNotPublishedRaw(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	c := newDeltaCoalescer(
+		func(text string) string { return text },
+		func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+	)
+	c.add("running tool: META_API_KEY=")
+	// The 250ms timer fires with only the key buffered.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(out)
+		mu.Unlock()
+		if n > 0 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.add("mk-live-0123456789abcdef\n")
+	c.close()
+
+	mu.Lock()
+	joined := strings.Join(out, "")
+	mu.Unlock()
+	if strings.Contains(joined, "0123456789abcdef") {
+		t.Fatalf("the split credential value leaked: %q", joined)
+	}
+	if !strings.Contains(joined, "running tool: ") {
+		t.Fatalf("the safe prefix must still stream: %q", joined)
 	}
 }
 

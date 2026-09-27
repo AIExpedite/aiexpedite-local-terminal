@@ -1858,11 +1858,36 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
-	flushBatch := func() {
+	// flushBatchTail publishes the accumulated display text. final releases a
+	// held-back redaction carry (see below) and is set only by the all-readers-
+	// done flush, so no text is lost when the stream ends.
+	flushBatchTail := func(final bool) {
 		if len(batch) == 0 {
 			return
 		}
 		output := joinStreamBatch(batch)
+		batch = batch[:0]
+		// Muse Code on the generic session_start / takeover path: the native
+		// one-shot manager redacts every frame it publishes, but this PTY path
+		// publishes joined display text verbatim, so a tool echoing an
+		// inherited META_API_KEY would reach the cloud unmasked. The same pass
+		// runs here, with a credential-shaped tail carried into the next flush
+		// so a pair split across two batches is still seen whole. Scoped to
+		// Muse: every other agent's stream frames stay byte-identical.
+		if isMuseCodeCommand(session.Command) {
+			emit := output
+			if !final {
+				var carry string
+				emit, carry = splitRedactionCarry(output)
+				if carry != "" {
+					batch = append(batch, streamBatchEntry{text: carry, fragment: true})
+				}
+			}
+			if emit == "" {
+				return
+			}
+			output = redactAgentSecrets(emit)
+		}
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -1879,9 +1904,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// Once per session — see takeUnpublishedCliConversationID.
 			ConversationID: session.takeUnpublishedCliConversationID(),
 		})
-
-		batch = batch[:0]
 	}
+
+	flushBatch := func() { flushBatchTail(false) }
 
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
@@ -2025,8 +2050,8 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					session.mu.Unlock()
 				}
 				flushCodexDeltas()
-				// All readers done — flush remaining
-				flushBatch()
+				// All readers done — flush remaining, releasing any carry.
+				flushBatchTail(true)
 				return
 			}
 

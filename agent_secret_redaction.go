@@ -45,3 +45,50 @@ func redactAgentSecrets(s string) string {
 	})
 	return out
 }
+
+// agentSecretCarryTailPattern matches a trailing credential KEY whose value has
+// not fully arrived: `api_key=`, `token: ab`, `authorization: bearer `. The
+// per-frame patterns above need the whole pair on one string, so a pair split
+// across two streamed frames would publish the value verbatim.
+var agentSecretCarryTailPattern = regexp.MustCompile(
+	`(?i)(?:authorization:\s*bearer|api[_-]?key\s*[=:]|token\s*[=:])\s*[A-Za-z0-9._\-]*$`)
+
+// agentOpaqueBlobCarryTailPattern matches a trailing opaque run long enough to
+// grow into the 80-char blob shape. The 16-char floor is where an unbroken run
+// stops looking like ordinary streamed prose: lower would hold back the tail of
+// almost every flush (and stall words like "thinking"), higher would let a
+// split blob through. Residual, by construction: a blob split at fewer than 16
+// characters publishes that leading fragment unmasked, while the run that
+// carries the rest is still masked to its first 8 characters — so no whole
+// credential streams out, but a short prefix can.
+var agentOpaqueBlobCarryTailPattern = regexp.MustCompile(`[A-Za-z0-9_-]{16,}$`)
+
+// agentSecretCarryMaxBytes bounds the held-back tail. Past it the text is
+// emitted (masked by the per-frame pass) rather than buffered without limit —
+// an unbroken multi-kilobyte run is not a credential the carry would classify.
+const agentSecretCarryMaxBytes = 4096
+
+// splitRedactionCarry splits streamed text into the part that is safe to
+// publish now and a tail to prepend to the next flush, so redactAgentSecrets
+// sees credential material whole. A masked frame cannot be retracted, so the
+// ambiguous tail waits for the bytes that would classify it; every caller
+// flushes the carry unconditionally when the stream ends.
+func splitRedactionCarry(text string) (emit string, carry string) {
+	if text == "" {
+		return "", ""
+	}
+	idx := -1
+	if loc := agentSecretCarryTailPattern.FindStringIndex(text); loc != nil {
+		idx = loc[0]
+	} else if loc := agentOpaqueBlobCarryTailPattern.FindStringIndex(text); loc != nil {
+		idx = loc[0]
+	}
+	// idx <= 0 means the ambiguous tail IS the whole buffer. Carrying it would
+	// make no forward progress — the size-bound flush would re-buffer the same
+	// bytes and the stream would stall — so it is published now and the
+	// per-frame pass masks whatever it can already classify.
+	if idx <= 0 || len(text)-idx > agentSecretCarryMaxBytes {
+		return text, ""
+	}
+	return text[:idx], text[idx:]
+}

@@ -945,10 +945,13 @@ func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoal
 }
 
 // publish emits a non-delta line after whatever text is buffered ahead of it.
+// The buffered text flushes as FINAL (no redaction carry): the line that
+// follows it is already classified, and holding a tail back past it would
+// publish the turn's text out of order.
 func (c *deltaCoalescer) publish(line string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.flushLocked()
+	c.flushLocked(true)
 	c.emit(line)
 }
 
@@ -962,18 +965,23 @@ func (c *deltaCoalescer) add(text string) bool {
 	defer c.mu.Unlock()
 	c.pending.WriteString(text)
 	if c.pending.Len() >= oneShotDeltaFlushBytes {
-		c.flushLocked()
+		c.flushLocked(false)
 	} else if c.timer == nil {
 		c.timer = time.AfterFunc(oneShotDeltaFlushDelay, func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			c.flushLocked()
+			c.flushLocked(false)
 		})
 	}
 	return true
 }
 
-func (c *deltaCoalescer) flushLocked() {
+// flushLocked publishes the buffered deltas. Unless final, a credential-shaped
+// tail stays buffered (splitRedactionCarry) so the per-frame redaction in
+// publishEventFrame sees `api_key=<value>` whole even when the pair straddles
+// two flushes — the later masked completion frame cannot retract a leaked
+// stream frame. The carry is released by the next delta or by close().
+func (c *deltaCoalescer) flushLocked(final bool) {
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil
@@ -983,6 +991,16 @@ func (c *deltaCoalescer) flushLocked() {
 	}
 	text := c.pending.String()
 	c.pending.Reset()
+	if !final {
+		emit, carry := splitRedactionCarry(text)
+		if carry != "" {
+			c.pending.WriteString(carry)
+		}
+		text = emit
+	}
+	if text == "" {
+		return
+	}
 	// The completion frame still carries the full text if a render fails.
 	if frame := c.render(text); frame != "" {
 		c.emit(frame)
@@ -993,7 +1011,7 @@ func (c *deltaCoalescer) flushLocked() {
 func (c *deltaCoalescer) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.flushLocked()
+	c.flushLocked(true)
 	c.closed = true
 }
 
