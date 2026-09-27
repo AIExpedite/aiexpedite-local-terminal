@@ -213,7 +213,10 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 		return entry.Result
 	}
 
-	result := probeOpenCodeReadinessUncached(ctx, executable, home)
+	// The card describes the install as the agent sees it, so its probes keep the
+	// process working directory. The maintenance smoke does NOT — see
+	// openCodeSmokeLoggedInDir.
+	result := probeOpenCodeReadinessUncached(ctx, executable, home, "")
 	openCodeReadinessMu.Lock()
 	switch {
 	case len(result.Providers) > 0:
@@ -244,10 +247,10 @@ func probeOpenCodeReadiness(ctx context.Context, executable, home string) openCo
 	return result
 }
 
-func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string) openCodeReadiness {
+func probeOpenCodeReadinessUncached(ctx context.Context, executable, home, dir string) openCodeReadiness {
 	out := openCodeReadiness{AuthState: openCodeAuthUnknown}
 
-	models, modelsOK := runOpenCodeProbe(ctx, executable, "models")
+	models, modelsOK := runOpenCodeProbe(ctx, executable, dir, "models")
 	if !modelsOK {
 		// Timeout, non-zero exit, or the binary vanished between detection and
 		// probe. We could not ask, so we do not answer — fail open.
@@ -292,7 +295,7 @@ func probeOpenCodeReadinessUncached(ctx context.Context, executable, home string
 	out.Providers = openCodeProvidersFromModelIDs(allModelIDs)
 	if len(out.Providers) == 0 {
 		if authCtx, release, affordable := optionalOpenCodeProbeContext(ctx); affordable {
-			if authOut, ok := runOpenCodeProbe(authCtx, executable, "auth", "list"); ok {
+			if authOut, ok := runOpenCodeProbe(authCtx, executable, dir, "auth", "list"); ok {
 				out.Providers = parseOpenCodeAuthProviders(authOut)
 			}
 			release()
@@ -340,7 +343,12 @@ func optionalOpenCodeProbeContext(ctx context.Context) (probeCtx context.Context
 // deadline the handler documents.
 // A package-level var so a test can drive readiness (and therefore the smoke's
 // free login pre-check) without spawning a real binary.
-var runOpenCodeProbe = func(ctx context.Context, executable string, args ...string) (string, bool) {
+// dir is the working directory the probe runs in, and it MATTERS: OpenCode
+// discovers a project `opencode.json` (and its provider/model entries) by walking
+// upward from cwd, so a probe that answers from the agent's own directory can
+// describe a different configuration than the turn it is a pre-check for. "" keeps
+// the process working directory, which is what the card wants.
+var runOpenCodeProbe = func(ctx context.Context, executable, dir string, args ...string) (string, bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -359,6 +367,7 @@ var runOpenCodeProbe = func(ctx context.Context, executable string, args ...stri
 		Path: executable,
 		Args: args,
 		Env:  sanitizeOpenCodeEnv(os.Environ()),
+		Dir:  dir,
 	})
 	if launchErr != nil {
 		return "", false
@@ -384,6 +393,27 @@ var runOpenCodeProbe = func(ctx context.Context, executable string, args ...stri
 //
 // The provider row's seam passes only a path, so `home` is resolved here.
 func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bool) {
+	// The cooldown replay has no run directory of its own, so make one: the
+	// pre-check must answer for the same configuration the smoke it is replaying
+	// measured, not for whatever project the agent happens to be sitting in. A
+	// directory we cannot create degrades to the process cwd rather than failing
+	// the replay.
+	dir, err := newOpenCodeSmokeRunDir()
+	if err == nil {
+		defer func() { _ = os.RemoveAll(dir) }()
+	} else {
+		dir = ""
+	}
+	return openCodeSmokeLoggedInDir(ctx, path, dir)
+}
+
+// openCodeSmokeLoggedInDir is openCodeSmokeLoggedIn with the caller's isolated
+// working directory. runOpenCodeSmoke passes the per-run empty cwd it is about to
+// spend the turn in: OpenCode resolves a project `opencode.json` upward from cwd,
+// so probing elsewhere lets a provider that is configured only in the agent's own
+// project pass the pre-check and then fail the turn — and lets a project override
+// report a premature not_logged_in.
+func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool) {
 	if strings.TrimSpace(path) == "" {
 		return false, false
 	}
@@ -394,7 +424,7 @@ func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bo
 	if err != nil {
 		home = ""
 	}
-	readiness := probeOpenCodeReadinessUncached(ctx, path, home)
+	readiness := probeOpenCodeReadinessUncached(ctx, path, home, dir)
 	switch {
 	case readiness.AuthState == openCodeAuthUnauthenticated && readiness.Conclusive:
 		return false, true

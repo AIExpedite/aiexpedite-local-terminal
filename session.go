@@ -966,14 +966,24 @@ func (s *CLISession) armCodexUsageRun(at time.Time) {
 	codexUsageRunStarted(time.UnixMilli(floor))
 }
 
-// armCodexUsageRunOnLateWrite arms the run for a stdin write SendInput stopped
-// waiting on. The timeout branch neither closes stdin nor kills the child, so
-// the abandoned writer can still deliver the prompt — and a turn that reached
-// codex with nothing armed makes both terminal-event and exit settlement
-// no-ops, skipping the post-run refresh it owes. The wait is bounded by the
-// session itself: once it is gone, a write still blocked on its stdin can
-// never reach the child.
-func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
+// finishLateStdinWrite completes the bookkeeping for a stdin write SendInput
+// stopped waiting on. The timeout branch neither closes stdin nor kills the
+// child, so the abandoned writer can still deliver the prompt — and that
+// delivery still owes two things:
+//
+//   - EOF, for ANY one-shot session holding a deferred stdin open (codex AND
+//     opencode). `opencode run` and `codex exec` both read stdin to completion
+//     before running the turn, so a prompt delivered with the pipe still open
+//     leaves the child waiting until the session's overall timeout. This used to
+//     run for codex only, so a promptless OpenCode session whose first SendInput
+//     was slow never got its EOF at all.
+//   - a codex usage floor, for a codex session only: a turn that reached codex
+//     with nothing armed makes both terminal-event and exit settlement no-ops,
+//     skipping the post-run refresh it owes.
+//
+// The wait is bounded by the session itself: once it is gone, a write still
+// blocked on its stdin can never reach the child.
+func (s *CLISession) finishLateStdinWrite(writeDone <-chan error) {
 	select {
 	case err := <-writeDone:
 		if err != nil {
@@ -992,13 +1002,18 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 		}
 	}
 	// The prompt only reached the child: a deferred one-shot session still
-	// holds its stdin open, and codex exec waits for EOF before running the
-	// turn. SendInput's own close was skipped when it gave up on this write, so
-	// close here — otherwise the run armed below never executes, and the child
-	// sits until it is killed, leaving refresh debt for a turn that never ran.
+	// holds its stdin open, and both `codex exec` and `opencode run` wait for
+	// EOF before running the turn. SendInput's own close was skipped when it
+	// gave up on this write, so close here — otherwise the turn never runs, the
+	// child sits until it is killed, and (for codex) refresh debt is left for a
+	// turn that never happened.
 	s.mu.Lock()
 	s.closeDeferredStdinLocked()
 	s.mu.Unlock()
+	// Usage accounting is codex's alone; the close above is not.
+	if !isCodexCommand(s.Command) {
+		return
+	}
 	s.armCodexUsageRun(time.Now())
 	// The prompt can arrive after the exit path has already run its settle,
 	// which found nothing armed. Settle here so the refresh is owed now,
@@ -1017,7 +1032,7 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 // forever for EOF. Deliberately NOT gated on the command: gating it on codex
 // would hang every promptless OpenCode session. Called by
 // SendInput for a write that completed in time, and by
-// armCodexUsageRunOnLateWrite for one SendInput abandoned and the writer then
+// finishLateStdinWrite for one SendInput abandoned and the writer then
 // delivered. deferredStdinClose is cleared here, so those two never
 // double-close and a second SendInput is a no-op. Caller holds s.mu.
 func (s *CLISession) closeDeferredStdinLocked() {
@@ -1123,10 +1138,13 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		}
 	case <-time.After(10 * time.Second):
 		// The child is neither killed nor its stdin closed here, so the
-		// abandoned writer can still deliver this prompt. Keep watching it, so
-		// a codex turn that does reach the child still arms its run.
-		if isCodexCommand(session.Command) {
-			go session.armCodexUsageRunOnLateWrite(writeDone)
+		// abandoned writer can still deliver this prompt. Keep watching it, so a
+		// prompt that does reach the child still closes a deferred one-shot
+		// stdin (codex, opencode) and still arms a codex run. Gated on having
+		// something to finish, so an ordinary interactive session's timed-out
+		// write does not leave a goroutine parked on it.
+		if session.deferredStdinClose || isCodexCommand(session.Command) {
+			go session.finishLateStdinWrite(writeDone)
 		}
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}

@@ -860,6 +860,27 @@ func lookupCachedProbeVersion(path string) (string, bool) {
 	return v, ok
 }
 
+// forgetCachedProbeVersion drops every cached reading for a path, so the next
+// cachedProbeVersion* call re-probes the binary as it is now. The cache stores
+// FAILURES too (a reliably dead binary must not re-spawn a doomed child on
+// every gather), which is right for a version that is a pure function of the
+// bytes on disk and wrong for a reading that failed for a reason the bytes do
+// not explain -- a launcher that was momentarily unable to start the child.
+// A caller that can tell those apart calls this to let its negative expire; see
+// openCodeProbeVersion.
+func forgetCachedProbeVersion(path string) {
+	if path == "" {
+		return
+	}
+	versionProbeMu.Lock()
+	for k := range versionProbeCache {
+		if k.Path == path {
+			delete(versionProbeCache, k)
+		}
+	}
+	versionProbeMu.Unlock()
+}
+
 // resetVersionProbeCache clears the cache. Test-only seam so a case that
 // rewrites a stub binary in place can assert re-probe behaviour deterministically.
 func resetVersionProbeCache() {

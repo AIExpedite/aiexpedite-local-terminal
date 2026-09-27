@@ -4145,7 +4145,7 @@ func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
 	writeDone := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
-		session.armCodexUsageRunOnLateWrite(writeDone)
+		session.finishLateStdinWrite(writeDone)
 		close(done)
 	}()
 	writeDone <- nil
@@ -4165,7 +4165,7 @@ func TestSendInputLateStdinWrite_ArmsTheCodexRun(t *testing.T) {
 	session.codexUsageFloorMs.Store(0)
 	late := make(chan error, 1)
 	late <- nil
-	session.armCodexUsageRunOnLateWrite(late)
+	session.finishLateStdinWrite(late)
 	if started, settled = rec.counts(); started != 2 || settled != 1 {
 		t.Fatalf("started=%d settled=%d, want the post-exit write armed and settled once", started, settled)
 	}
@@ -4188,7 +4188,7 @@ func TestSendInputLateStdinWrite_ClosesDeferredStdin(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	writeDone <- nil
-	session.armCodexUsageRunOnLateWrite(writeDone)
+	session.finishLateStdinWrite(writeDone)
 
 	if got := stdin.closes(); got != 1 {
 		t.Fatalf("stdin closed %d times, want the late write to close it once", got)
@@ -4220,13 +4220,44 @@ func TestSendInputLateStdinWrite_KeepsDeferredStdinOpenOnFailure(t *testing.T) {
 
 	writeDone := make(chan error, 1)
 	writeDone <- errors.New("broken pipe")
-	session.armCodexUsageRunOnLateWrite(writeDone)
+	session.finishLateStdinWrite(writeDone)
 
 	if got := stdin.closes(); got != 0 {
 		t.Fatalf("stdin closed %d times, want an undelivered prompt to leave it open", got)
 	}
 	if !session.deferredStdinClose {
 		t.Fatal("deferredStdinClose cleared for a write that never landed")
+	}
+}
+
+// A promptless OpenCode session holds its stdin open for its first SendInput,
+// and `opencode run` reads stdin to EOF before running the turn. When that first
+// write outlasts SendInput's ten-second wait and then lands, the late writer owes
+// the EOF — this used to run for codex only, so an OpenCode prompt could reach
+// the child while the pipe stayed open and the session hung until its overall
+// timeout. No codex usage accounting may follow for a non-codex command.
+func TestSendInputLateStdinWrite_ClosesDeferredOpenCodeStdin(t *testing.T) {
+	rec := recordCodexRunHooks(t)
+	stdin := &countingWriteCloser{}
+	session := &CLISession{
+		Command:            "opencode",
+		done:               make(chan struct{}),
+		Stdin:              stdin,
+		deferredStdinClose: true,
+	}
+
+	writeDone := make(chan error, 1)
+	writeDone <- nil
+	session.finishLateStdinWrite(writeDone)
+
+	if got := stdin.closes(); got != 1 {
+		t.Fatalf("stdin closed %d times, want the late OpenCode write to close it once", got)
+	}
+	if session.deferredStdinClose {
+		t.Fatal("deferredStdinClose still set; a later SendInput would double-close")
+	}
+	if started, settled := rec.counts(); started != 0 || settled != 0 {
+		t.Fatalf("started=%d settled=%d, want codex usage accounting untouched by an OpenCode session", started, settled)
 	}
 }
 
@@ -4259,11 +4290,11 @@ func TestSendInputLateStdinWrite_IgnoresAFailedOrAbandonedWrite(t *testing.T) {
 	failed := &CLISession{Command: "codex", done: make(chan struct{})}
 	writeDone := make(chan error, 1)
 	writeDone <- errors.New("broken pipe")
-	failed.armCodexUsageRunOnLateWrite(writeDone)
+	failed.finishLateStdinWrite(writeDone)
 
 	abandoned := &CLISession{Command: "codex", done: make(chan struct{})}
 	close(abandoned.done)
-	abandoned.armCodexUsageRunOnLateWrite(make(chan error, 1))
+	abandoned.finishLateStdinWrite(make(chan error, 1))
 
 	if started, settled := rec.counts(); started != 0 || settled != 0 {
 		t.Fatalf("started=%d settled=%d, want no run for an undelivered prompt", started, settled)

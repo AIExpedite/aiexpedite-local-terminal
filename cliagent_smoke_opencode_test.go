@@ -41,10 +41,12 @@ func openCodeSmokeEnv(t *testing.T) {
 	t.Setenv("USERPROFILE", home)
 	resetCLISmokeState()
 	resetVersionProbeCache()
+	resetOpenCodeVersionNegatives()
 	resetOpenCodeReadinessCache()
 	t.Cleanup(func() {
 		resetCLISmokeState()
 		resetVersionProbeCache()
+		resetOpenCodeVersionNegatives()
 		resetOpenCodeReadinessCache()
 	})
 }
@@ -134,7 +136,7 @@ func openCodeExitError(t *testing.T) error {
 func stubOpenCodeReadiness(t *testing.T, out string, ok bool) {
 	t.Helper()
 	original := runOpenCodeProbe
-	runOpenCodeProbe = func(context.Context, string, ...string) (string, bool) { return out, ok }
+	runOpenCodeProbe = func(context.Context, string, string, ...string) (string, bool) { return out, ok }
 	t.Cleanup(func() { runOpenCodeProbe = original })
 }
 
@@ -495,6 +497,82 @@ func TestRunOpenCodeSmoke_ConclusiveNoProviderSpendsNoTurn(t *testing.T) {
 	}
 	if *calls != 0 {
 		t.Fatalf("readiness refusal spawned %d children", *calls)
+	}
+}
+
+// A `--version` reading can fail for a reason the bytes on disk do not explain —
+// a spawn that lost a race with an installer, a probe deadline missed under load.
+// The shared cache keys on (path, mtime, size) alone, so pinning that failure
+// would keep every later caller (notably probeOpenCodeNativeCapability, whose own
+// negative window is 30 seconds) reading the same empty string until the agent
+// restarts. The negative must therefore expire — and be REUSED until it does, so
+// a reliably dead binary is not re-spawned on every gather.
+func TestOpenCodeProbeVersion_LetsATransientFailureExpire(t *testing.T) {
+	openCodeSmokeEnv(t)
+	path := buildOpenCodeStub(t)
+
+	// Stand in for the transient fault: the shared cache holds "" for this exact
+	// binary, exactly as a failed probe would have left it.
+	if got := cachedProbeVersionFunc(path, func() string { return "" }); got != "" {
+		t.Fatalf("seeded reading = %q, want the empty failure", got)
+	}
+	openCodeNoteVersionReading(path, "")
+
+	if got := openCodeProbeVersion(path); got != "" {
+		t.Fatalf("inside the negative window the cached failure must be reused, got %q", got)
+	}
+
+	backdateOpenCodeVersionNegative(path, openCodeVersionNegativeTTL+time.Second)
+	got := openCodeProbeVersion(path)
+	if got == "" {
+		t.Fatal("an expired negative must re-probe; the binary answers --version")
+	}
+	// And the recovery sticks: the positive is now what the shared cache holds.
+	if cached, ok := lookupCachedProbeVersion(path); !ok || cached != got {
+		t.Fatalf("cached reading = (%q, %v), want the recovered version %q", cached, ok, got)
+	}
+}
+
+// The readiness pre-check has to answer for the SAME configuration the turn
+// runs under: OpenCode resolves a project `opencode.json` upward from cwd, so a
+// pre-check run in the agent's own directory can pass on a provider the isolated
+// turn cannot see (and a project override can report a premature not_logged_in).
+func TestRunOpenCodeSmoke_ReadinessPrecheckRunsInTheRunDirectory(t *testing.T) {
+	openCodeSmokeEnv(t)
+	path := stubOpenCodeBinary(t)
+
+	var mu sync.Mutex
+	var probeDirs []string
+	originalProbe := runOpenCodeProbe
+	runOpenCodeProbe = func(_ context.Context, _ string, dir string, _ ...string) (string, bool) {
+		mu.Lock()
+		probeDirs = append(probeDirs, dir)
+		mu.Unlock()
+		return "anthropic/claude-sonnet-4-5\n", true
+	}
+	t.Cleanup(func() { runOpenCodeProbe = originalProbe })
+
+	_, launches := stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+		return openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	if result := runOpenCodeSmoke(context.Background(), path, "0.9.1"); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("stub turn must succeed: %+v", result)
+	}
+	mu.Lock()
+	dirs := append([]string(nil), probeDirs...)
+	mu.Unlock()
+	if len(dirs) == 0 {
+		t.Fatal("the readiness pre-check never ran")
+	}
+	turnDir := (*launches)[0].Dir
+	if turnDir == "" {
+		t.Fatal("the turn must run in an isolated directory")
+	}
+	for _, dir := range dirs {
+		if dir != turnDir {
+			t.Fatalf("readiness probe ran in %q, want the turn's directory %q", dir, turnDir)
+		}
 	}
 }
 

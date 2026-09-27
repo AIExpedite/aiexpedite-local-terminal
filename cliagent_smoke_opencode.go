@@ -158,12 +158,101 @@ var resolveOpenCodeSmokePath = func() string {
 // probe would read the negative back and report binary_missing without ever
 // spawning cmd.exe. One route, one answer.
 func openCodeProbeVersion(path string) string {
+	// A cached FAILURE must not outlive the fault that produced it. The shared
+	// cache keys on (path, mtime, size) alone, so a launcher that was momentarily
+	// unable to start the child — a spawn that lost a race with an installer, a
+	// probe deadline missed under load — would otherwise pin "" for the whole
+	// life of an unchanged binary, and probeOpenCodeNativeCapability's 30-second
+	// negative window could never recover: every later native start would read
+	// the same cached empty string. So an empty reading is kept only for
+	// openCodeVersionNegativeTTL and then dropped, which still spares a reliably
+	// dead binary the doomed child on every single gather.
+	openCodeExpireNegativeVersion(path)
+	version := openCodeCachedProbeVersion(path)
+	openCodeNoteVersionReading(path, version)
+	return version
+}
+
+// openCodeCachedProbeVersion is the cached probe itself: shim-aware on Windows,
+// the shared probe elsewhere.
+func openCodeCachedProbeVersion(path string) string {
 	if isWindowsShimPath(path) {
 		return cachedProbeVersionFunc(path, func() string {
 			return openCodeShimProbeVersion(path)
 		})
 	}
 	return cachedProbeVersion(path)
+}
+
+// openCodeVersionNegativeTTL is how long a failed `--version` reading is reused
+// before the binary is asked again. Matches probeOpenCodeNativeCapability's own
+// negative window, so the two recover together rather than one pinning the other.
+const openCodeVersionNegativeTTL = 30 * time.Second
+
+var (
+	openCodeVersionNegativeMu sync.Mutex
+	// Keyed by path only: the point is to forget, and forgetCachedProbeVersion
+	// drops every (mtime, size) entry the path has. A binary REPLACED inside the
+	// window re-keys the shared cache on its own, so a stale timestamp here can
+	// at worst schedule one extra probe of a binary that already answered.
+	openCodeVersionNegativeAt = map[string]time.Time{}
+)
+
+// resetOpenCodeVersionNegatives forgets every recorded failure window. Test-only
+// seam, beside resetVersionProbeCache, so a case that drives the negative TTL
+// starts from a known state.
+func resetOpenCodeVersionNegatives() {
+	openCodeVersionNegativeMu.Lock()
+	openCodeVersionNegativeAt = map[string]time.Time{}
+	openCodeVersionNegativeMu.Unlock()
+}
+
+// backdateOpenCodeVersionNegative moves a recorded failure window into the past.
+// Test-only seam: a case must be able to reach the far side of
+// openCodeVersionNegativeTTL without sleeping for it.
+func backdateOpenCodeVersionNegative(path string, by time.Duration) {
+	openCodeVersionNegativeMu.Lock()
+	if at, ok := openCodeVersionNegativeAt[path]; ok {
+		openCodeVersionNegativeAt[path] = at.Add(-by)
+	}
+	openCodeVersionNegativeMu.Unlock()
+}
+
+// openCodeExpireNegativeVersion drops a cached empty reading for path once it is
+// older than openCodeVersionNegativeTTL, so the next probe actually spawns.
+func openCodeExpireNegativeVersion(path string) {
+	if path == "" {
+		return
+	}
+	openCodeVersionNegativeMu.Lock()
+	at, failed := openCodeVersionNegativeAt[path]
+	expired := failed && time.Since(at) >= openCodeVersionNegativeTTL
+	if expired {
+		delete(openCodeVersionNegativeAt, path)
+	}
+	openCodeVersionNegativeMu.Unlock()
+	if expired {
+		forgetCachedProbeVersion(path)
+	}
+}
+
+// openCodeNoteVersionReading records when a reading FAILED, and forgets the
+// failure as soon as the binary answers.
+func openCodeNoteVersionReading(path, version string) {
+	if path == "" {
+		return
+	}
+	openCodeVersionNegativeMu.Lock()
+	defer openCodeVersionNegativeMu.Unlock()
+	if version == "" {
+		if _, already := openCodeVersionNegativeAt[path]; !already {
+			// Measure the window from the FIRST failure, so repeated reads of the
+			// same cached negative cannot postpone the re-probe indefinitely.
+			openCodeVersionNegativeAt[path] = time.Now()
+		}
+		return
+	}
+	delete(openCodeVersionNegativeAt, path)
 }
 
 // openCodeShimProbeVersion runs `<shim> --version` through the shared
@@ -222,11 +311,26 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 		return finish(cliUsageErrorProviderUnavailable, cliSmokeDiagnosticBinaryMissing)
 	}
 
+	// The per-run empty cwd is created BEFORE the readiness pre-check, because
+	// the pre-check has to run in it: OpenCode discovers a project
+	// `opencode.json` (and its agents/MCP/provider entries) by walking upward
+	// from cwd, so a pre-check answered from the agent's own directory can
+	// describe a different configuration than the turn below — a provider
+	// configured only in that project would pass the pre-check and then fail the
+	// turn, and a project override would report a premature not_logged_in. Both
+	// steps are turn-free, so the reordering cannot cost anything. A directory
+	// this process cannot create is a LAUNCH failure, not a missing envelope.
+	runDir, err := newOpenCodeSmokeRunDir()
+	if err != nil {
+		return finish(cliUsageErrorProviderUnavailable, cliSmokeDiagnosticLaunchError)
+	}
+	defer func() { _ = os.RemoveAll(runDir) }()
+
 	// Pre-check 2: a CONCLUSIVE "no usable provider" means the turn cannot
 	// complete. Anything inconclusive proceeds — that is what a working
 	// local-model or env-credential install looks like (see
 	// cliagent_usage_opencode.go's fail-open design).
-	if loggedIn, known := openCodeSmokeLoggedIn(ctx, path); known && !loggedIn {
+	if loggedIn, known := openCodeSmokeLoggedInDir(ctx, path, runDir); known && !loggedIn {
 		return finish(cliUsageErrorNotAuthenticated, cliSmokeDiagnosticNotLoggedIn)
 	}
 
@@ -234,23 +338,6 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	if err != nil {
 		return finish(cliUsageErrorInternal, cliSmokeDiagnosticInternal)
 	}
-
-	// A fresh empty cwd per run: OpenCode discovers a project `opencode.json`
-	// (and its agents/MCP entries) by walking upward from cwd, so probing inside
-	// the caller's workspace would let a repository's configuration decide what
-	// the smoke measures. A directory this process cannot create is a LAUNCH
-	// failure, not a missing envelope.
-	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
-	// The defer below removes this run's directory, but only if the process lives
-	// to run it: an agent killed mid-smoke leaves the entry behind forever, and
-	// nothing else prunes this tree. Reclaim in the BACKGROUND so a slow
-	// filesystem cannot add latency to a deadline-bounded health check.
-	pruneOpenCodeSmokeScratchOnce(scratch)
-	runDir, err := os.MkdirTemp(scratch, "cwd-*")
-	if err != nil {
-		return finish(cliUsageErrorProviderUnavailable, cliSmokeDiagnosticLaunchError)
-	}
-	defer func() { _ = os.RemoveAll(runDir) }()
 
 	promptPath, promptFile, err := writeOpenCodePromptFile(openCodeSmokePrompt(marker))
 	if err != nil {
@@ -341,6 +428,20 @@ const (
 	// blocking scan; the remainder is reclaimed by later smokes.
 	openCodeSmokeScratchMaxSweep = 64
 )
+
+// newOpenCodeSmokeRunDir creates the fresh empty working directory one smoke
+// (or one cooldown replay's login re-check) runs in, under the shared scratch
+// root, and reclaims orphans left by a process killed mid-smoke on the way.
+// Callers own the returned directory and must remove it.
+func newOpenCodeSmokeRunDir() (string, error) {
+	scratch := cliPromptTempDir(openCodeSmokeScratchDirName)
+	// The caller's defer removes its own directory, but only if the process lives
+	// to run it: an agent killed mid-smoke leaves the entry behind forever, and
+	// nothing else prunes this tree. Reclaim in the BACKGROUND so a slow
+	// filesystem cannot add latency to a deadline-bounded health check.
+	pruneOpenCodeSmokeScratchOnce(scratch)
+	return os.MkdirTemp(scratch, "cwd-*")
+}
 
 var openCodeSmokeScratchPruneOnce sync.Once
 

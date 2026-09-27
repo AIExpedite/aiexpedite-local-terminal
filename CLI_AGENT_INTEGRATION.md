@@ -1523,7 +1523,11 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   envelope (`isOneShotStdinPromptFormat` over `stdinPromptFormat`), never from a
   per-command test: `closeDeferredStdinLocked` is deliberately NOT gated on the
   command, because gating it on codex would hang every promptless OpenCode session
-  on a pipe nothing closes — and that hang reads as a slow model, not a bug. This deleted the old 24 KiB pre-spawn argv-ceiling refusal
+  on a pipe nothing closes — and that hang reads as a slow model, not a bug. The
+  same reasoning covers the LATE write: when the first `SendInput` outlasts its
+  ten-second wait and the abandoned writer later delivers, `finishLateStdinWrite`
+  owns the EOF for **any** session holding a deferred stdin, with codex's usage
+  accounting kept separate inside it. This deleted the old 24 KiB pre-spawn argv-ceiling refusal
   (`openCodeInteractiveMaxPromptBytes`) — dead once the prompt left argv.
 - **Diagnostic invocations** (`--version`, `--help`, `models`, `auth …`) pass
   through **verbatim**. Reshaping one into a `run` would spend a turn nobody
@@ -1650,7 +1654,12 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   models, not limits), so the turn is spent against whichever provider sits behind
   it. The shared 15-minute cooldown + singleflight bound that to one turn per
   binary per window, and the free `opencode models` readiness pre-check
-  short-circuits an unusable install before anything is spent. The probe runs in a
+  short-circuits an unusable install before anything is spent. That pre-check runs
+  in the **same** fresh cwd the turn does (`openCodeSmokeLoggedInDir`, and
+  `newOpenCodeSmokeRunDir` for the cooldown replay), because OpenCode resolves a
+  project `opencode.json` upward from cwd: answered elsewhere, it could pass on a
+  provider the isolated turn cannot see, or report a premature `not_logged_in`
+  from a project override. The probe runs in a
   **fresh empty cwd** so a repository's `opencode.json` cannot decide what it
   measures, and that directory is swept on the way in
   (`pruneOpenCodeSmokeScratchOnce`: once per process, in the BACKGROUND so a slow
@@ -1668,7 +1677,14 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   keep the previous build's resume capability and be handed an unsupported
   `--session`. `openCodeProbeVersion` is the **only** OpenCode version probe and
   shares that key — a plain spawn of `opencode.cmd` would cache its own `""`
-  under it and every later shim-aware probe would read the negative back.
+  under it and every later shim-aware probe would read the negative back. A
+  FAILED reading is reused for at most `openCodeVersionNegativeTTL` (30s, the same
+  window `probeOpenCodeNativeCapability` gives its own negative) and then dropped
+  from the shared cache: that key describes the bytes on disk, and a failure a
+  momentary launch fault produced is not a fact about them — pinning it would
+  leave every later native start reading `""` until the agent restarts, while
+  re-probing on every call would re-spawn a doomed child for a binary that is
+  simply dead.
 
 ## Windows shim argument encoding
 
