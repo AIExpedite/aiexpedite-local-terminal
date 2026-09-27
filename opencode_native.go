@@ -1726,13 +1726,28 @@ func isOpenCodeNativeCommand(t string) bool {
 // will put its option-parse errors there too. Reading stderr alone left the
 // repair silently inert on the very case it exists for.
 //
+// Each stream is judged ON ITS OWN and only inside its parser-error region — the
+// same split openCodeSmokeNoEnvelopeDiagnostic already makes over the same text:
+//
+//   - JSON stdout frames are dropped (openCodeStdoutPlainLines). A documented
+//     event is never a parser error, and model text may quote `--session`.
+//   - the usage/help block a CLI appends after an option error is dropped
+//     (openCodeStderrErrorRegion). That block lists `--session` whatever was
+//     actually refused, so `unknown option '--format'` followed by usage read as
+//     a rejected `--session`: the recovery cleared a native id the CLI had
+//     ACCEPTED and replayed the bounded transcript, truncating older context.
+//   - needle and rejection must sit in the SAME region, so neither stream can
+//     borrow the other's evidence.
+//
 // The rejection needles are shared with the maintenance smoke's classifier
 // (openCodeOptionRejectionText), and the text is read only to pick between our
 // own constants.
 func openCodeRejectedSessionFlag(stdout, stderr string) bool {
-	lower := strings.ToLower(stdout + "\n" + stderr)
-	if !strings.Contains(lower, "--session") {
-		return false
+	for _, stream := range []string{openCodeStdoutPlainLines([]byte(stdout)), stderr} {
+		region := openCodeStderrErrorRegion(strings.ToLower(stream))
+		if strings.Contains(region, "--session") && openCodeOptionRejectionText(region) {
+			return true
+		}
 	}
-	return openCodeOptionRejectionText(lower)
+	return false
 }

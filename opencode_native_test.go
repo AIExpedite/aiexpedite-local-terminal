@@ -1472,11 +1472,6 @@ func TestOpenCodeRejectedSessionFlag_OnlyAnOptionRejectionNamingSession(t *testi
 			t.Errorf("%q on stdout must read as a rejected --session", yes)
 		}
 	}
-	// The needle and the rejection may even arrive on DIFFERENT streams, which
-	// is why the two are joined before matching rather than checked per stream.
-	if !openCodeRejectedSessionFlag("unknown option", "--session") {
-		t.Error("a rejection split across the two streams must still be recognised")
-	}
 	for _, no := range []string{
 		"",
 		// The session was GONE, not the flag unknown — looksLikeMissingOpenCodeSession
@@ -1486,10 +1481,27 @@ func TestOpenCodeRejectedSessionFlag_OnlyAnOptionRejectionNamingSession(t *testi
 		"error: unknown option '--variant'",
 		// Assistant prose mentioning the flag is not a rejection.
 		"you could pass --session to resume",
+		// A DIFFERENT flag was refused and the usage block that follows documents
+		// `--session` regardless. Clearing the native id here would replay the
+		// bounded transcript over a resume the CLI had accepted.
+		"error: unknown option '--format'\nUsage: opencode run [--session <ID>] [--format <FORMAT>]\n",
+		// Same, with the usage block written lower-case and indented.
+		"error: unexpected argument '--nope' found\n  usage: opencode run --session <id>\n",
 	} {
 		if openCodeRejectedSessionFlag(no, "") || openCodeRejectedSessionFlag("", no) {
 			t.Errorf("%q must not read as a rejected --session", no)
 		}
+	}
+	// Each stream is judged on its own: evidence may not be borrowed across the
+	// two, because a real CLI writes one error message to one stream and a
+	// cross-stream match is how an unrelated usage block gets read as a rejection.
+	if openCodeRejectedSessionFlag("unknown option", "--session") {
+		t.Error("a needle on one stream and a rejection on the other must not match")
+	}
+	// A JSON stdout frame is the CLI's documented output, never a parser error,
+	// even when the model text inside it quotes both the flag and a rejection.
+	if openCodeRejectedSessionFlag(`{"type":"message","text":"unknown option '--session'"}`, "") {
+		t.Error("a JSON stdout frame quoting a rejection must not match")
 	}
 }
 
