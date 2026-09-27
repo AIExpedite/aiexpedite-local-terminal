@@ -12,12 +12,20 @@
 // environment WITHOUT the headless overlay: this is the one interactive thing
 // the agent starts, and it must be able to prompt.
 //
+// Approval: a sign-in whose argv EXACTLY matches one of the catalog's own
+// sign-in commands (builtinSignInArgvs) runs without the native dialog — the
+// owner consented to it on the setup card, and all it does is open a window
+// in which the person at the computer signs in. Anything else still takes the
+// external_write dialog every time.
+//
 // The argv is launched without a shell interpreting it:
-//   - Windows: a new console (CREATE_NEW_CONSOLE) running
-//     `cmd.exe /d /c title <title> & "<program>" <args> & echo. & pause`, built
-//     as a raw command line from validated tokens (no quotes or cmd
-//     metacharacters are accepted in the args), so the window stays until the
-//     user has read the result;
+//   - Windows: a new console (CREATE_NEW_CONSOLE, started by startInNewConsole
+//     so its stdin/stdout/stderr ARE that console) running
+//     `cmd.exe /d /c title <title> & echo <title> & echo. & "<program>" <args>
+//     & echo. & pause`, built as a raw command line from validated tokens (no
+//     quotes or cmd metacharacters are accepted in the args), so the command's
+//     prompts and output are visible and the window stays until the user has
+//     read the result;
 //   - macOS: Terminal.app via osascript `do script`, every word single-quoted
 //     for the login shell;
 //   - Linux: x-terminal-emulator, gnome-terminal, then xterm, each given the
@@ -134,12 +142,48 @@ func launchSignIn(req envSignInRequest) (envSignInResult, error) {
 	return envSignInResult{Launched: true}, nil
 }
 
+// builtinSignInArgvs are the catalog's own sign-in commands (db-content
+// dev/cliAgents/*.json and dev/setupTools/gh.json `signIn.argv`, 2026-09-26).
+// A sign-in whose argv matches one EXACTLY — same program name, same
+// arguments, same order and case, nothing extra — runs without the native
+// approval dialog. A new or changed sign-in command needs an agent release
+// before it skips the dialog; until then it is asked about each time.
+var builtinSignInArgvs = [][]string{
+	{"gh", "auth", "login", "--web", "--git-protocol", "https"}, // setupTools/gh
+	{"claude", "auth", "login"},                                 // cliAgents/claudeCode
+	{"codex", "login"},                                          // cliAgents/codex
+	{"grok", "login", "--oauth"},                                // cliAgents/grok
+	{"opencode", "auth", "login"},                               // cliAgents/opencode
+	{"agy"},                                                     // cliAgents/antigravity
+}
+
+// isBuiltinSignInArgv reports whether argv is exactly one of builtinSignInArgvs.
+func isBuiltinSignInArgv(argv []string) bool {
+	for _, known := range builtinSignInArgvs {
+		if len(known) != len(argv) {
+			continue
+		}
+		match := true
+		for i := range known {
+			if known[i] != argv[i] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // windowsSignInCommandLine is the cmd.exe command line for the Windows window.
 // Every piece is either a validated token or quoted program path, so cmd has
-// nothing to reinterpret.
+// nothing to reinterpret. The title is echoed first so the window never looks
+// empty while the command starts.
 func windowsSignInCommandLine(comspec, program string, args []string, title string) string {
 	var b strings.Builder
-	b.WriteString(`"` + comspec + `" /d /c title ` + title + ` & "` + program + `"`)
+	b.WriteString(`"` + comspec + `" /d /c title ` + title + ` & echo ` + title + ` & echo. & "` + program + `"`)
 	for _, a := range args {
 		b.WriteString(" " + a)
 	}

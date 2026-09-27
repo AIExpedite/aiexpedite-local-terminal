@@ -69,7 +69,17 @@ func effectiveEnvSetupRisk(cmd commandMsg) string {
 // envSetupCommandNeedsApproval reports whether a device command must show the
 // native approval dialog: exactly when its effective risk is one that forces
 // native approval for any other env-setup step (requiresNativeApprovalForStep).
+//
+// The one exception: a sign-in whose argv is exactly one of the catalog's own
+// sign-in commands (isBuiltinSignInArgv) and whose signed risk is not
+// destructive runs without the dialog. The owner consented on the setup card,
+// and the step only opens a visible window the person signs in through.
 func envSetupCommandNeedsApproval(cmd commandMsg) bool {
+	if cmd.Command == envSignInCommand && cmd.RiskLevel != riskDestructive {
+		if req, err := parseEnvSignInRequest(cmd.Args); err == nil && isBuiltinSignInArgv(req.Argv) {
+			return false
+		}
+	}
 	gated := cmd
 	gated.RiskLevel = effectiveEnvSetupRisk(cmd)
 	return requiresNativeApprovalForStep(gated)
