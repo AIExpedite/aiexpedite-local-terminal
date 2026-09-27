@@ -284,6 +284,62 @@ func TestDeltaCoalescer_CredentialSplitAcrossFlushesIsNotPublishedRaw(t *testing
 	}
 }
 
+func TestMaskOpaqueContinuation(t *testing.T) {
+	prefix, rest := strings.Repeat("a", 10), strings.Repeat("b", 75)
+	cases := []struct {
+		name     string
+		text     string
+		prior    int
+		wantText string
+		wantRun  int
+	}{
+		{"a continuation that completes a blob is masked", rest + " done", 10, "[REDACTED] done", 4},
+		{"a whole-text continuation is masked and the run keeps growing", rest, 10, "[REDACTED]", 85},
+		{"a short continuation of a short run streams", "ing now", 5, "ing now", 3},
+		{"no prior run leaves the text alone", rest + " x", 0, rest + " x", 1},
+		{"a leading separator breaks the run", " " + rest, 10, " " + rest, 75},
+		{"a whole-text run below the shape accumulates", prefix, 10, prefix, 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, run := maskOpaqueContinuation(tc.text, tc.prior)
+			if got != tc.wantText || run != tc.wantRun {
+				t.Fatalf("got (%q, %d), want (%q, %d)", got, run, tc.wantText, tc.wantRun)
+			}
+		})
+	}
+}
+
+// An 85-char opaque token split with fewer than 16 chars in the first timer
+// window: the short prefix is below the carry floor and publishes, the rest is
+// carried to the final flush. Neither half matches the 80-char blob pattern on
+// its own, so the continuation must be masked by run length.
+func TestDeltaCoalescer_ShortOpaquePrefixDoesNotLeakTheRest(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		out []string
+	)
+	c := newDeltaCoalescer(
+		func(text string) string { return text },
+		func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+	)
+	prefix, rest := "tok0123456", strings.Repeat("Z", 75)
+	c.add("value " + prefix)
+	time.Sleep(750 * time.Millisecond)
+	c.add(rest)
+	c.close()
+
+	mu.Lock()
+	joined := strings.Join(out, "")
+	mu.Unlock()
+	if strings.Contains(joined, rest[:40]) {
+		t.Fatalf("the carried continuation leaked: %q", joined)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Fatalf("the continuation must be masked: %q", joined)
+	}
+}
+
 // A timer window that holds NOTHING but the credential label must not publish
 // it: the value arrives in a later frame that, on its own, matches no
 // per-frame pattern, so the pair would reach the cloud complete across two

@@ -1861,6 +1861,8 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	// flushBatchTail publishes the accumulated display text. final releases a
 	// held-back redaction carry (see below) and is set only by the all-readers-
 	// done flush, so no text is lost when the stream ends.
+	// musePublishedRun feeds maskOpaqueContinuation across Muse flushes.
+	var musePublishedRun int
 	flushBatchTail := func(final bool) {
 		if len(batch) == 0 {
 			return
@@ -1886,6 +1888,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			if emit == "" {
 				return
 			}
+			emit, musePublishedRun = maskOpaqueContinuation(emit, musePublishedRun)
 			output = redactAgentSecrets(emit)
 		}
 		seq := atomic.AddInt64(&session.Seq, 1)

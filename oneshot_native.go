@@ -938,6 +938,9 @@ type deltaCoalescer struct {
 	pending strings.Builder
 	timer   *time.Timer
 	closed  bool
+	// publishedRun is the opaque run the last published delta text ended
+	// with — see maskOpaqueContinuation.
+	publishedRun int
 }
 
 func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoalescer {
@@ -1006,6 +1009,7 @@ func (c *deltaCoalescer) flushLocked(final bool) {
 	if text == "" {
 		return
 	}
+	text, c.publishedRun = maskOpaqueContinuation(text, c.publishedRun)
 	// The completion frame still carries the full text if a render fails.
 	if frame := c.render(text); frame != "" {
 		c.emit(frame)

@@ -12,7 +12,10 @@
 // one agent's frames would then leak what the other's mask.
 package main
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 var agentSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`),
@@ -58,9 +61,9 @@ var agentSecretCarryTailPattern = regexp.MustCompile(
 // stops looking like ordinary streamed prose: lower would hold back the tail of
 // almost every flush (and stall words like "thinking"), higher would let a
 // split blob through. Residual, by construction: a blob split at fewer than 16
-// characters publishes that leading fragment unmasked, while the run that
-// carries the rest is still masked to its first 8 characters — so no whole
-// credential streams out, but a short prefix can.
+// characters publishes that leading fragment unmasked; maskOpaqueContinuation
+// then masks the rest of the run once the two halves together reach the blob
+// shape — so no whole credential streams out, but a short prefix can.
 var agentOpaqueBlobCarryTailPattern = regexp.MustCompile(`[A-Za-z0-9_-]{16,}$`)
 
 // agentSecretCarryMaxBytes bounds the held-back tail. Past it the text is
@@ -95,4 +98,34 @@ func splitRedactionCarry(text string) (emit string, carry string) {
 		return text, ""
 	}
 	return text[:idx], text[idx:]
+}
+
+// agentOpaqueBlobMinLen is the run length agentOpaqueBlobPattern masks.
+const agentOpaqueBlobMinLen = 80
+
+// agentOpaqueRunChars is the character class of agentOpaqueBlobPattern.
+const agentOpaqueRunChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+
+// maskOpaqueContinuation closes the residual splitRedactionCarry leaves: a run
+// published below the carry floor (a 10-char prefix) whose continuation — up
+// to 79 chars, too short for the per-frame blob pattern on its own — follows
+// in a later flush. publishedRun is the length of the unbroken run the
+// previous published text ENDED with; when it plus this text's leading run
+// reaches the blob shape, the leading run is masked. Returns the text to
+// publish and the run length to pass into the next call. text is the raw
+// (pre-render) stream text, so the run is measured on what the CLI streamed.
+func maskOpaqueContinuation(text string, publishedRun int) (string, int) {
+	lead := len(text) - len(strings.TrimLeft(text, agentOpaqueRunChars))
+	if lead == len(text) {
+		nextRun := publishedRun + lead
+		if publishedRun > 0 && nextRun >= agentOpaqueBlobMinLen {
+			return "[REDACTED]", nextRun
+		}
+		return text, nextRun
+	}
+	tail := len(text) - len(strings.TrimRight(text, agentOpaqueRunChars))
+	if lead > 0 && publishedRun > 0 && publishedRun+lead >= agentOpaqueBlobMinLen {
+		text = "[REDACTED]" + text[lead:]
+	}
+	return text, tail
 }
