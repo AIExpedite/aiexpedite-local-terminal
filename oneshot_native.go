@@ -67,13 +67,15 @@ const (
 	oneShotCapabilityNegativeTTL = 30 * time.Second
 	// GCP Pub/Sub per-message publish ceiling, checked after marshaling.
 	oneShotNativeMaxPublishSize = 10_000_000
-	// Ceiling for a `--version` capability probe.
-	oneShotVersionProbeTimeout = 15 * time.Second
 	// Coalesced text deltas flush at whichever comes first: this much text,
 	// this long after the first buffered delta, or the next non-delta line.
 	oneShotDeltaFlushBytes = 4 * 1024
 	oneShotDeltaFlushDelay = 250 * time.Millisecond
 )
+
+// oneShotVersionProbeTimeout bounds a spawned `--version` capability probe.
+// A var so tests can shorten it.
+var oneShotVersionProbeTimeout = 15 * time.Second
 
 /* --------------------------------------------------------------------------
    Spec
@@ -1178,6 +1180,15 @@ func (m *oneShotNativeManager) probeVersionUncached() (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, executable, "--version")
 	hideWindow(cmd)
+	// CommandContext alone kills only the direct child. A Windows `.cmd`
+	// launcher (Muse Code's runs PowerShell) leaves its descendants holding
+	// the output pipe, and CombinedOutput would then block past the deadline.
+	// Kill the whole tree, and bound the pipe drain after the kill.
+	cmd.Cancel = func() error {
+		killOneShotProcessTree(cmd)
+		return nil
+	}
+	cmd.WaitDelay = oneShotNativeGracefulKillWait
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", notRunnable

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -486,5 +487,38 @@ func TestOneShotNative_CachedDetectionFailureDoesNotDisableResume(t *testing.T) 
 	}
 	if !m.supportsNativeResume() {
 		t.Fatal("the capability probe must run its own --version, not inherit a cached detection failure")
+	}
+}
+
+func TestOneShotNative_VersionProbeIsBoundedForLauncherTrees(t *testing.T) {
+	// A launcher whose child hangs and inherits the output pipe — the Windows
+	// `muse.cmd` -> PowerShell shape. Killing only the direct child used to
+	// leave CombinedOutput blocked on the pipe well past the deadline.
+	dir := t.TempDir()
+	var launcher string
+	if runtime.GOOS == "windows" {
+		launcher = filepath.Join(dir, "muse.cmd")
+		if err := os.WriteFile(launcher, []byte("@echo off\r\nping -n 60 127.0.0.1 >nul\r\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		launcher = filepath.Join(dir, "muse")
+		if err := os.WriteFile(launcher, []byte("#!/bin/sh\nsleep 60 &\nwait\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev := oneShotVersionProbeTimeout
+	oneShotVersionProbeTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { oneShotVersionProbeTimeout = prev })
+
+	spec := *museCodeNativeSpec
+	spec.ResolveExecutable = func() string { return launcher }
+	m := newOneShotNativeManager(&spec)
+	start := time.Now()
+	if _, err := m.probeVersionUncached(); err == nil {
+		t.Fatal("a probe that timed out must report the CLI as not runnable")
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("probe took %v; the deadline must bound the whole launcher tree", elapsed)
 	}
 }
