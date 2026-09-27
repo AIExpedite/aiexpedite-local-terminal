@@ -181,7 +181,7 @@ func TestTrackProcessPutsTheSessionInAJob(t *testing.T) {
 	cmd, _ := startOwnedChild(t, "grok-smoke-hang")
 	dir := t.TempDir()
 	path := filepath.Join(dir, spawnLedgerFileName)
-	l := newSpawnLedger(func() string { return path }, "boot-job")
+	l := newRealLedger(t, path, "boot-job")
 	l.BeginSpawn("s-job")
 	l.TrackProcess("s-job", cmd.Process, startedSuspended(cmd))
 
@@ -232,9 +232,35 @@ func TestBootReap_ContainedWindowsSessionIsReaped(t *testing.T) {
 		Entries: []*ledgerEntry{{SessionID: "contained", BootID: "boot-old", PIDs: []ledgerProcess{rec}}},
 	})
 	path := filepath.Join(dir, spawnLedgerFileName)
-	l := newSpawnLedger(func() string { return path }, "boot-new")
+	l := newRealLedger(t, path, "boot-new")
 	l.RunBootReap()
 	if r := l.Report(context.Background()); len(r.SessionsReaped) != 1 || r.SessionsReaped[0] != "contained" {
 		t.Fatalf("report = %+v", r)
+	}
+}
+
+// TestProcessTreeGone_JobWithAnEscapedToolIsNotEmpty: an exited per-turn
+// leader whose job still holds a tool it started is not "gone".
+func TestProcessTreeGone_JobWithAnEscapedToolIsNotEmpty(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	cmd, stdin := startOwnedChild(t, "ledger-tree-on-stdin", mockSessionKillChildPidEnv, pidFile)
+	job, _, err := attachSessionJob(cmd.Process, true)
+	if err != nil || job == 0 {
+		t.Fatalf("attachSessionJob: %v", err)
+	}
+	root := recordedProcess(t, cmd.Process)
+	if _, err := stdin.Write([]byte("go\n")); err != nil {
+		t.Fatal(err)
+	}
+	child := recordedProcess(t, proc(readPIDFile(t, pidFile)))
+	_ = cmd.Process.Kill() // only the leader
+	waitForProbe(t, root, processGone, 10*time.Second)
+	if processTreeGone(root, job) {
+		t.Fatalf("a job with a live tool read as empty")
+	}
+	_ = windows.CloseHandle(windows.Handle(job)) // the agent "dies"
+	waitForProbe(t, child, processGone, 10*time.Second)
+	if processTreeGone(root, 0) {
+		t.Fatalf("no job: nothing can be proven")
 	}
 }

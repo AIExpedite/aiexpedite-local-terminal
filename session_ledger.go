@@ -171,12 +171,20 @@ type spawnLedger struct {
 	// Unix, its kill-on-close job on Windows).
 	descendants func(ledgerProcess) processProbeResult
 	attachJob   func(proc *os.Process, suspended bool) (job uintptr, contained bool, err error)
-	releaseJob  func(uintptr)
-	groupOf     func(*os.Process) int
+	// treeGone: an exited process's group (Unix) / job (Windows) is empty.
+	treeGone func(p ledgerProcess, job uintptr) bool
+	// acquireOwnership takes the ledger's lock file for this process's life.
+	// A second live agent on the same config dir (Linux has no instance
+	// guard) must never reap or rewrite the first one's ledger.
+	acquireOwnership func() bool
+	disabled         bool
+	lockFile         *os.File // held (locked) for the life of the process
+	releaseJob       func(uintptr)
+	groupOf          func(*os.Process) int
 }
 
 func newSpawnLedger(path func() string, bootID string) *spawnLedger {
-	return &spawnLedger{
+	l := &spawnLedger{
 		path:        path,
 		bootID:      bootID,
 		jobs:        make(map[int]uintptr),
@@ -188,9 +196,16 @@ func newSpawnLedger(path func() string, bootID string) *spawnLedger {
 		end:         endRecordedProcess,
 		descendants: probeRecordedDescendants,
 		attachJob:   attachSessionJob,
+		treeGone:    processTreeGone,
 		releaseJob:  releaseSessionJob,
 		groupOf:     processGroupOf,
 	}
+	l.acquireOwnership = func() bool {
+		f := acquireLedgerLock(l.path() + ".lock")
+		l.lockFile = f
+		return f != nil
+	}
+	return l
 }
 
 // globalSpawnLedger is the agent's ledger, in the config dir.
@@ -241,6 +256,15 @@ func (l *spawnLedger) loadLocked() {
 		return
 	}
 	l.loaded = true
+	if !l.acquireOwnership() {
+		// Another live agent owns this ledger: this process neither reads,
+		// reaps nor writes it. Its own sessions stay unrecorded, which can
+		// only leave them unproven (never falsely reaped).
+		l.disabled = true
+		fmt.Printf("%s[ledger] Another agent process owns the spawn ledger — boot reap and session recording disabled for this process%s\n",
+			colorYellow, colorReset)
+		return
+	}
 	raw, err := os.ReadFile(l.path())
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -273,6 +297,9 @@ func (l *spawnLedger) loadLocked() {
 // the agent must keep running sessions, and a stale ledger file can only
 // under-certify (see the PendingSpawns / Incomplete guards).
 func (l *spawnLedger) persistLocked() {
+	if l.disabled {
+		return
+	}
 	data := ledgerFileData{Version: spawnLedgerVersion, BootID: l.bootID, Entries: l.entries}
 	if data.Entries == nil {
 		data.Entries = []*ledgerEntry{}
@@ -434,16 +461,28 @@ func (l *spawnLedger) UntrackProcess(sessionID string, pid int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.loadLocked()
-	l.releaseJobLocked(pid)
 	i, e := l.findLocked(sessionID, l.bootID)
 	if e == nil {
+		l.releaseJobLocked(pid)
 		return
 	}
 	kept := e.PIDs[:0]
 	for _, p := range e.PIDs {
 		if p.PID != pid {
 			kept = append(kept, p)
+			continue
 		}
+		// The turn's leader exited, but a tool it started may still run in
+		// its group / job. Keep the record (and the kill-on-close job) until
+		// that is proven empty: the next boot then sees a live group (never
+		// "reaped"), or the job ends the tool if the agent dies.
+		if !l.treeGone(p, l.jobs[pid]) {
+			fmt.Printf("%s[ledger] Session %s: PID %d exited but left processes in its group/job; kept for the boot reap%s\n",
+				colorYellow, sessionID, pid, colorReset)
+			kept = append(kept, p)
+			continue
+		}
+		l.releaseJobLocked(pid)
 	}
 	e.PIDs = kept
 	// A turn that outlived its session's release re-created a bare entry;
@@ -556,6 +595,11 @@ func (l *spawnLedger) RunBootReap() {
 	}
 	l.reapStarted = true
 	l.loadLocked()
+	if l.disabled {
+		l.mu.Unlock()
+		close(l.reapDone)
+		return
+	}
 	cutoff := l.now().Add(-spawnLedgerMaxAge).UnixMilli()
 	type work struct {
 		sessionID, bootID string
@@ -649,7 +693,14 @@ func (l *spawnLedger) Report(ctx context.Context) bootReport {
 	}
 	r.PreviousBootID = l.prevBootID
 	seenR, seenS := map[string]bool{}, map[string]bool{}
+	// unresolved: a session id with ANY entry that is not proven reaped
+	// (surviving, unknown, or open in this boot). A reaped entry of the same
+	// id then certifies nothing: another generation may still act.
+	unresolved := map[string]bool{}
 	for _, e := range l.entries {
+		if e.BootID == l.bootID || e.State != ledgerStateReaped {
+			unresolved[e.SessionID] = true
+		}
 		if e.BootID == l.bootID {
 			continue
 		}
@@ -666,17 +717,13 @@ func (l *spawnLedger) Report(ctx context.Context) bootReport {
 			}
 		}
 	}
-	// A session proven reaped under one boot but surviving under another
-	// cannot be certified: its id names a process that may still act.
-	if len(seenS) > 0 {
-		filtered := r.SessionsReaped[:0]
-		for _, id := range r.SessionsReaped {
-			if !seenS[id] {
-				filtered = append(filtered, id)
-			}
+	filtered := r.SessionsReaped[:0]
+	for _, id := range r.SessionsReaped {
+		if !unresolved[id] {
+			filtered = append(filtered, id)
 		}
-		r.SessionsReaped = filtered
 	}
+	r.SessionsReaped = filtered
 	sort.Strings(r.SessionsReaped)
 	sort.Strings(r.SessionsSurviving)
 	return r
@@ -748,3 +795,34 @@ func openLedgerLogicalSession(sessionID string) {
 }
 
 func releaseLedgerSession(sessionID string) { globalSpawnLedger.ReleaseSession(sessionID) }
+
+// ledgerLockWait bounds how long a starting agent waits for the ledger lock:
+// an updating agent's predecessor may still be exiting.
+var ledgerLockWait = 15 * time.Second
+
+// acquireLedgerLock takes an exclusive lock on path, retrying up to
+// ledgerLockWait, and returns the locked file (nil when not acquired). The
+// caller keeps it open for the life of the process; exit releases it.
+func acquireLedgerLock(path string) *os.File {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		fmt.Printf("%s[ledger] Cannot create the ledger lock dir: %v%s\n", colorYellow, err, colorReset)
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Printf("%s[ledger] Cannot open the ledger lock: %v%s\n", colorYellow, err, colorReset)
+		return nil
+	}
+	deadline := time.Now().Add(ledgerLockWait)
+	for {
+		ok, err := tryLockFileExclusive(f)
+		if ok {
+			return f
+		}
+		if err != nil || time.Now().After(deadline) {
+			_ = f.Close()
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}

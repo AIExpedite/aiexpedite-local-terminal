@@ -112,7 +112,7 @@ func TestBootReap_LeaderGoneGroupAliveIsNotReaped(t *testing.T) {
 		Entries: []*ledgerEntry{{SessionID: "leaky", BootID: "boot-old", PIDs: []ledgerProcess{root}}},
 	})
 	path := filepath.Join(dir, spawnLedgerFileName)
-	l := newSpawnLedger(func() string { return path }, "boot-new")
+	l := newRealLedger(t, path, "boot-new")
 	l.RunBootReap()
 	if r := l.Report(context.Background()); len(r.SessionsReaped) != 0 {
 		t.Fatalf("a session with a live group member was reported reaped: %+v", r)

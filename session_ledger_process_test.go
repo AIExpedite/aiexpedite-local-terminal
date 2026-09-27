@@ -156,7 +156,7 @@ func TestBootReapEndsAnEarlierBootsProcess(t *testing.T) {
 		Entries: []*ledgerEntry{{SessionID: "orphaned", BootID: "boot-old", PIDs: []ledgerProcess{rec}}},
 	})
 	path := filepath.Join(dir, spawnLedgerFileName)
-	l := newSpawnLedger(func() string { return path }, "boot-new")
+	l := newRealLedger(t, path, "boot-new")
 	l.RunBootReap()
 
 	r := l.Report(context.Background())

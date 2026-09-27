@@ -26,6 +26,8 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	l.releaseJob = func(uintptr) {}
 	l.groupOf = func(*os.Process) int { return 0 }
 	l.descendants = func(ledgerProcess) processProbeResult { return processGone }
+	l.treeGone = func(ledgerProcess, uintptr) bool { return true }
+	l.acquireOwnership = func() bool { return true }
 	l.startToken = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
 	l.probe = func(ledgerProcess) processProbeResult {
 		t.Fatalf("unexpected probe")
@@ -65,6 +67,19 @@ func writeLedgerFixture(t *testing.T, dir string, data ledgerFileData) {
 }
 
 func proc(pid int) *os.Process { return &os.Process{Pid: pid} }
+
+// newRealLedger is a ledger with every real seam (process probes, Job
+// Objects, the ownership lock) on path; its lock is released at cleanup.
+func newRealLedger(t *testing.T, path, bootID string) *spawnLedger {
+	t.Helper()
+	l := newSpawnLedger(func() string { return path }, bootID)
+	t.Cleanup(func() {
+		if l.lockFile != nil {
+			_ = l.lockFile.Close()
+		}
+	})
+	return l
+}
 
 func TestNewBootIDIsAUniqueUUID(t *testing.T) {
 	a, b := newBootID(), newBootID()
@@ -356,5 +371,116 @@ func TestLedgerIgnoresUnreadableFile(t *testing.T) {
 	l.RunBootReap()
 	if r := l.Report(context.Background()); len(r.SessionsReaped) != 0 || r.PreviousBootID != "" {
 		t.Fatalf("a torn ledger must certify nothing: %+v", r)
+	}
+}
+
+// TestReapedIDSuppressedWhileAnyGenerationIsUnresolved: a session id proven
+// reaped in one boot but unknown (or surviving, or open) in another is never
+// certified — the other generation may still act.
+func TestReapedIDSuppressedWhileAnyGenerationIsUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeLedgerFixture(t, dir, ledgerFileData{
+		BootID: "boot-2",
+		Entries: []*ledgerEntry{
+			{SessionID: "s-twice", BootID: "boot-1", State: ledgerStateUnknown, PIDs: []ledgerProcess{{PID: 4, StartTime: "t4"}}},
+			{SessionID: "s-twice", BootID: "boot-2", State: ledgerStateReaped, PIDs: []ledgerProcess{}},
+			{SessionID: "s-clean", BootID: "boot-2", State: ledgerStateReaped, PIDs: []ledgerProcess{}},
+			{SessionID: "s-reused", BootID: "boot-2", State: ledgerStateReaped, PIDs: []ledgerProcess{}},
+		},
+	})
+	l := newTestLedger(t, dir, "boot-3")
+	l.probe = func(ledgerProcess) processProbeResult { return processUnknown }
+	l.RunBootReap()
+	l.OpenLogicalSession("s-reused") // the same id open again in this boot
+	r := l.Report(context.Background())
+	if !reflect.DeepEqual(r.SessionsReaped, []string{"s-clean"}) {
+		t.Fatalf("reaped = %v, want only s-clean", r.SessionsReaped)
+	}
+}
+
+// TestUntrackKeepsATurnWhoseGroupOrJobIsNotEmpty: a per-turn leader that
+// exited but left a tool running keeps its record (and its job) for the boot
+// reap, so the logical session is never reaped on zero PIDs.
+func TestUntrackKeepsATurnWhoseGroupOrJobIsNotEmpty(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLedger(t, dir, "boot-1")
+	var jobReleased []uintptr
+	l.attachJob = func(*os.Process, bool) (uintptr, bool, error) { return 77, true, nil }
+	l.releaseJob = func(j uintptr) { jobReleased = append(jobReleased, j) }
+	treeGone := false
+	l.treeGone = func(p ledgerProcess, job uintptr) bool {
+		if job != 77 {
+			t.Errorf("treeGone got job %d", job)
+		}
+		return treeGone
+	}
+	l.OpenLogicalSession("agy")
+	l.BeginSpawn("agy")
+	l.TrackProcess("agy", proc(21), true)
+	l.UntrackProcess("agy", 21)
+	got := readLedgerFile(t, dir).Entries
+	if len(got) != 1 || len(got[0].PIDs) != 1 || got[0].PIDs[0].PID != 21 {
+		t.Fatalf("a turn with a live group/job was dropped: %+v", got)
+	}
+	if len(jobReleased) != 0 {
+		t.Fatalf("the job of a non-empty turn was released")
+	}
+
+	// A later boot must not certify it on descendants alone.
+	l2 := newTestLedger(t, dir, "boot-2")
+	l2.probe = func(ledgerProcess) processProbeResult { return processGone }
+	l2.descendants = func(ledgerProcess) processProbeResult { return processUnknown }
+	l2.RunBootReap()
+	if r := l2.Report(context.Background()); len(r.SessionsReaped) != 0 {
+		t.Fatalf("reported reaped with a live tool in its group: %+v", r)
+	}
+
+	// Once the group / job is empty the record goes and the job is released.
+	treeGone = true
+	l.UntrackProcess("agy", 21)
+	if got := readLedgerFile(t, dir).Entries; len(got) == 0 {
+		t.Fatalf("logical session entry lost")
+	}
+	if !reflect.DeepEqual(jobReleased, []uintptr{77}) {
+		t.Fatalf("job released = %v", jobReleased)
+	}
+}
+
+// TestSecondAgentNeverReapsTheLiveOwnersLedger: a second live agent on the
+// same config dir (Linux has no instance guard) can take no ownership of the
+// ledger, so it neither reaps nor rewrites the first one's sessions.
+func TestSecondAgentNeverReapsTheLiveOwnersLedger(t *testing.T) {
+	prev := ledgerLockWait
+	ledgerLockWait = 300 * time.Millisecond
+	t.Cleanup(func() { ledgerLockWait = prev })
+	dir := t.TempDir()
+	path := filepath.Join(dir, spawnLedgerFileName)
+
+	first := newRealLedger(t, path, "boot-first")
+	first.startToken = func(pid int) (string, error) { return "tok", nil }
+	first.attachJob = func(*os.Process, bool) (uintptr, bool, error) { return 0, false, nil }
+	first.groupOf = func(*os.Process) int { return 0 }
+	first.RunBootReap()
+	first.BeginSpawn("live")
+	first.TrackProcess("live", proc(4242), false)
+	before, _ := os.ReadFile(path)
+
+	second := newRealLedger(t, path, "boot-second")
+	second.probe = func(ledgerProcess) processProbeResult {
+		t.Fatalf("the second agent probed the owner's processes")
+		return processUnknown
+	}
+	second.end = func(ledgerProcess, time.Duration) processProbeResult {
+		t.Fatalf("the second agent ended the owner's processes")
+		return processUnknown
+	}
+	second.RunBootReap()
+	second.OpenLogicalSession("other")
+	if r := second.Report(context.Background()); len(r.SessionsReaped) != 0 || r.PreviousBootID != "" {
+		t.Fatalf("second agent report: %+v", r)
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatalf("the second agent rewrote the owner's ledger")
 	}
 }

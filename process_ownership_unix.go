@@ -94,6 +94,11 @@ func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
 	return processUnknown
 }
 
+// processTreeGone: an exited per-turn leader's process group is empty.
+func processTreeGone(p ledgerProcess, job uintptr) bool {
+	return probeRecordedDescendants(p) == processGone
+}
+
 // endRecordedProcess ends the recorded process (its whole process group when
 // it leads one), ONLY when it is still ours (alive, same start time), and
 // reports whether it and its group are gone afterwards.

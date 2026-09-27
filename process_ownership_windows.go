@@ -48,6 +48,38 @@ func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
 	return processUnknown
 }
 
+// jobBasicAccounting mirrors JOBOBJECT_BASIC_ACCOUNTING_INFORMATION.
+type jobBasicAccounting struct {
+	TotalUserTime             int64
+	TotalKernelTime           int64
+	ThisPeriodTotalUserTime   int64
+	ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount       uint32
+	TotalProcesses            uint32
+	ActiveProcesses           uint32
+	TotalTerminatedProcesses  uint32
+}
+
+const jobObjectBasicAccountingInformation = 1
+
+// jobActiveProcesses returns how many processes are still in our job.
+func jobActiveProcesses(job uintptr) (uint32, error) {
+	var info jobBasicAccounting
+	err := windows.QueryInformationJobObject(windows.Handle(job), jobObjectBasicAccountingInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil)
+	return info.ActiveProcesses, err
+}
+
+// processTreeGone: an exited per-turn leader's job holds no process. Without
+// a job nothing can be proven, so the record is kept.
+func processTreeGone(p ledgerProcess, job uintptr) bool {
+	if job == 0 {
+		return false
+	}
+	n, err := jobActiveProcesses(job)
+	return err == nil && n == 0
+}
+
 // ownProcessGroup is Unix-only (process groups); Windows uses Job Objects.
 func ownProcessGroup(cmd *exec.Cmd) {}
 
