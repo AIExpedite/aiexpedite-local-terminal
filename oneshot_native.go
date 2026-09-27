@@ -31,6 +31,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -66,6 +67,8 @@ const (
 	oneShotCapabilityNegativeTTL = 30 * time.Second
 	// GCP Pub/Sub per-message publish ceiling, checked after marshaling.
 	oneShotNativeMaxPublishSize = 10_000_000
+	// Ceiling for a `--version` capability probe.
+	oneShotVersionProbeTimeout = 15 * time.Second
 )
 
 /* --------------------------------------------------------------------------
@@ -120,6 +123,9 @@ type oneShotNativeSpec struct {
 	DefaultTurnTimeout time.Duration
 	// ResolveExecutable returns the binary to launch.
 	ResolveExecutable func() string
+	// ProbeVersion, when set, returns the installed version ("" = unknown)
+	// for the capability probe instead of spawning `<cli> --version`.
+	ProbeVersion func(executable string) string
 	// BuildArgs returns argv for one turn. nativeID is "" when the turn must
 	// not resume; promptPath is the owner-only prompt file (also on stdin).
 	BuildArgs func(nativeID, promptPath string) []string
@@ -294,6 +300,13 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 
 	if err := m.probeCapability(); err != nil {
 		return err
+	}
+	// A seed is a promise to continue a conversation; below the resume floor
+	// the CLI cannot, and the cloud sends only the follow-up text, so running
+	// it would silently start a stateless chat. Fail closed, as
+	// applyCliResumeSeed does on the raw session path.
+	if resumeSessionID != "" && !m.supportsNativeResume() {
+		return fmt.Errorf("conversation resume refused: the installed %s is below %s and cannot resume a session", m.spec.DisplayName, m.spec.MinResumeVersion)
 	}
 
 	m.mu.Lock()
@@ -1063,11 +1076,23 @@ func (m *oneShotNativeManager) probeCapability() error {
 }
 
 func (m *oneShotNativeManager) probeVersionUncached() (string, error) {
-	cmd := exec.Command(m.spec.ResolveExecutable(), "--version")
+	executable := m.spec.ResolveExecutable()
+	notRunnable := fmt.Errorf("%s CLI not found or not runnable: install it (>= %s for session resume)", m.spec.DisplayName, m.spec.MinResumeVersion)
+	if m.spec.ProbeVersion != nil {
+		if !filepath.IsAbs(executable) {
+			return "", notRunnable
+		}
+		return parseCLIVersionTriple(m.spec.ProbeVersion(executable)), nil
+	}
+	// Bounded: Start runs this on the Pub/Sub handler goroutine, and a CLI
+	// wrapper that hangs (an update check, a lock) must not wedge it.
+	ctx, cancel := context.WithTimeout(context.Background(), oneShotVersionProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "--version")
 	hideWindow(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%s CLI not found or not runnable: install it (>= %s for session resume)", m.spec.DisplayName, m.spec.MinResumeVersion)
+		return "", notRunnable
 	}
 	return parseCLIVersionTriple(string(out)), nil
 }

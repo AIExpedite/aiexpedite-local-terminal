@@ -37,6 +37,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -73,6 +75,7 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	MinResumeVersion:   museCodeNativeMinVersion,
 	DefaultTurnTimeout: museCodeNativeDefaultTurnTimeout,
 	ResolveExecutable:  resolveMuseCodeExecutable,
+	ProbeVersion:       museCodeProbeVersion,
 	BuildArgs:          buildMuseCodeNativeArgs,
 	ParseEventLine:     parseMuseCodeEventLine,
 	MintNativeID:       newRandomUUID,
@@ -105,6 +108,42 @@ func resolveMuseCodeExecutable() string {
 		return p
 	}
 	return "muse"
+}
+
+// museCodeVersionFile is where Muse Code's launcher install records the
+// installed build ("1.4.0-R4302.1"), beside the `muse` shim.
+const museCodeVersionFile = ".muse-version"
+
+// museCodeProbeVersion reports the installed Muse Code version for detection
+// and the capability probe. On a launcher install the version file beside the
+// shim is authoritative, instant, and changes on every upgrade — unlike the
+// shim itself, whose unchanged (path, mtime, size) would pin a stale or
+// failed `--version` in the shared probe cache. A cold `muse.cmd --version`
+// on Windows also takes ~4.5s through PowerShell, past the 3s detection
+// budget. Other installs fall back to the cached `--version` probe.
+func museCodeProbeVersion(executable string) string {
+	if v := readMuseCodeVersionFile(executable); v != "" {
+		return v
+	}
+	return cachedProbeVersion(executable)
+}
+
+func readMuseCodeVersionFile(executable string) string {
+	if executable == "" || !filepath.IsAbs(executable) {
+		return ""
+	}
+	f, err := os.Open(filepath.Join(filepath.Dir(executable), museCodeVersionFile))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, 64) // a version line; never read an unbounded file
+	n, _ := f.Read(buf)
+	v := strings.TrimSpace(string(buf[:n]))
+	if semverRe.FindString(v) == "" || strings.ContainsAny(v, " \t\r\n") {
+		return ""
+	}
+	return v
 }
 
 // buildMuseCodeNativeArgs builds argv for one native-chat turn. `exec --json`

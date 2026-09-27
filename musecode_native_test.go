@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -203,5 +204,52 @@ func TestMuseCodeCredentialIsRedactedFromPublishedFrames(t *testing.T) {
 	got := redactAgentSecrets("auth failed: META_API_KEY=mk-live-0123456789abcdef")
 	if strings.Contains(got, "0123456789abcdef") {
 		t.Fatalf("META_API_KEY value leaked: %q", got)
+	}
+}
+
+func TestMuseCodeProbeVersion_PrefersTheLauncherVersionFile(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "muse.cmd")
+	if err := os.WriteFile(shim, []byte("@echo off\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, museCodeVersionFile), []byte("1.4.0-R4302.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No child is spawned: the shim would not even run as a probe.
+	if got := museCodeProbeVersion(shim); got != "1.4.0-R4302.1" {
+		t.Fatalf("got %q", got)
+	}
+	if got := parseCLIVersionTriple(museCodeProbeVersion(shim)); got != "1.4.0" {
+		t.Fatalf("the capability probe must parse it, got %q", got)
+	}
+	for name, content := range map[string]string{
+		"garbage":       "not a version",
+		"multi-token":   "1.4.0 extra",
+		"oversize junk": strings.Repeat("9", 200),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, museCodeVersionFile), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := readMuseCodeVersionFile(shim); got != "" {
+			t.Errorf("%s: got %q, want \"\"", name, got)
+		}
+	}
+	if got := readMuseCodeVersionFile("muse"); got != "" {
+		t.Fatalf("a relative path must never be resolved, got %q", got)
+	}
+}
+
+func TestOneShotNative_CapabilityProbeUsesTheVersionFile(t *testing.T) {
+	m := installMuseCodeStub(t) // stub `--version` prints 1.4.0
+	exe := resolveMuseCodeExecutable()
+	if err := os.WriteFile(filepath.Join(filepath.Dir(exe), museCodeVersionFile), []byte("1.1.0-R1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.probeCapability(); err != nil {
+		t.Fatal(err)
+	}
+	if m.supportsNativeResume() {
+		t.Fatal("the launcher's recorded version (below the floor) must win over a spawned probe")
 	}
 }

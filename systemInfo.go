@@ -628,6 +628,12 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 			// same reason: a plain spawn of an npm `codex.cmd` would cache ""
 			// under the shared key and pin the smoke's binary_missing.
 			version = codexProbeVersion(path)
+		} else if a.ID == "museCode" {
+			// Muse Code's Windows `muse.cmd` is a PowerShell launcher that never
+			// changes across upgrades, so the shared (path, mtime, size) key
+			// would pin a cold-start timeout's "" (or a pre-upgrade version)
+			// for good. See museCodeProbeVersion.
+			version = museCodeProbeVersion(path)
 		} else {
 			version = cachedProbeVersion(path)
 		}

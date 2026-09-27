@@ -397,3 +397,19 @@ func TestNewRandomUUIDIsAValidV4(t *testing.T) {
 		t.Fatalf("bad uuids %q %q", a, b)
 	}
 }
+
+func TestOneShotNative_SeedBelowVersionFloorFailsClosed(t *testing.T) {
+	m := installMuseCodeStub(t)
+	t.Setenv("OPENCODE_STUB_VERSION", "muse 1.1.9")
+	err := m.Start("s", t.TempDir(), "ws", "uid", "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot resume") {
+		t.Fatalf("a seed the CLI cannot honour must refuse the start, got %v", err)
+	}
+	if m.Get("s") != nil {
+		t.Fatal("a refused start must not register a session")
+	}
+	// Without a seed the same binary still starts (replay covers follow-ups).
+	if err := m.Start("s", t.TempDir(), "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("an unseeded start below the floor must still work: %v", err)
+	}
+}
