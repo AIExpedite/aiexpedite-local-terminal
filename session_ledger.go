@@ -334,11 +334,32 @@ func (l *spawnLedger) currentLocked(sessionID string) *ledgerEntry {
 		return e
 	}
 	for len(l.entries) >= spawnLedgerMaxEntries {
-		oldest := 0
+		// Only already-reaped evidence may be evicted (oldest first):
+		// dropping it only loses a proof. An unresolved generation (live,
+		// pending, incomplete, unknown, surviving) is never evicted — it is
+		// what keeps a reaped entry of the same id from being certified.
+		oldest := -1
 		for i, e := range l.entries {
-			if e.UpdatedAt < l.entries[oldest].UpdatedAt {
+			if e.BootID == l.bootID || e.State != ledgerStateReaped {
+				continue
+			}
+			if oldest < 0 || e.UpdatedAt < l.entries[oldest].UpdatedAt {
 				oldest = i
 			}
+		}
+		if oldest < 0 {
+			// Full of unresolved entries: refuse to record this session
+			// (it can then never be certified) and make every other
+			// generation of its id permanently uncertifiable too, so an
+			// unrecorded process can never be vouched for through them.
+			for _, e := range l.entries {
+				if e.SessionID == sessionID {
+					e.Incomplete = true
+				}
+			}
+			fmt.Printf("%s[ledger] Spawn ledger full of unresolved sessions — session %s is not recorded and will never be reported reaped%s\n",
+				colorYellow, sessionID, colorReset)
+			return nil
 		}
 		l.removeAtLocked(oldest)
 	}
@@ -358,6 +379,10 @@ func (l *spawnLedger) OpenLogicalSession(sessionID string) {
 	defer l.mu.Unlock()
 	l.loadLocked()
 	e := l.currentLocked(sessionID)
+	if e == nil {
+		l.persistLocked()
+		return
+	}
 	e.Logical = true
 	l.touch(e)
 	l.persistLocked()
@@ -372,6 +397,10 @@ func (l *spawnLedger) BeginSpawn(sessionID string) {
 	defer l.mu.Unlock()
 	l.loadLocked()
 	e := l.currentLocked(sessionID)
+	if e == nil {
+		l.persistLocked()
+		return
+	}
 	e.PendingSpawns++
 	l.touch(e)
 	l.persistLocked()
@@ -435,6 +464,12 @@ func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process, suspended
 		l.jobs[proc.Pid] = job
 	}
 	e := l.currentLocked(sessionID)
+	if e == nil {
+		// Unrecorded (ledger full): the job still protects the tree while
+		// the agent lives; UntrackProcess releases it.
+		l.persistLocked()
+		return
+	}
 	if e.PendingSpawns > 0 {
 		e.PendingSpawns--
 	}

@@ -191,9 +191,12 @@ func TestSpawnLedgerIsBounded(t *testing.T) {
 	if len(got) != spawnLedgerMaxEntries {
 		t.Fatalf("want %d entries, got %d", spawnLedgerMaxEntries, len(got))
 	}
-	if got[0].SessionID != "s005" {
-		t.Fatalf("the oldest entries must be evicted first, first kept = %s", got[0].SessionID)
+	// Full of unresolved (live) entries: nothing is evicted, the newcomers
+	// are simply not recorded.
+	if got[0].SessionID != "s000" || got[len(got)-1].SessionID != "s199" {
+		t.Fatalf("an unresolved entry was evicted: first %s last %s", got[0].SessionID, got[len(got)-1].SessionID)
 	}
+	l.ReleaseSession("s000")
 
 	// Too many processes for one session: never certifiable.
 	for i := 0; i < spawnLedgerMaxPIDs+1; i++ {
@@ -536,5 +539,62 @@ func TestIncompleteGenerationBlocksAReapedOne(t *testing.T) {
 	l.RunBootReap()
 	if r := l.Report(context.Background()); len(r.SessionsReaped) != 0 {
 		t.Fatalf("certified despite an unrecorded generation: %+v", r)
+	}
+}
+
+// TestLedgerCapEvictsOnlyReapedEvidence: at the cap, only already-reaped
+// entries are evicted (oldest first). An unresolved generation is never
+// evicted; when nothing reaped is left the newcomer is refused and every
+// other generation of its id becomes uncertifiable.
+func TestLedgerCapEvictsOnlyReapedEvidence(t *testing.T) {
+	dir := t.TempDir()
+	entries := []*ledgerEntry{}
+	for i := 0; i < spawnLedgerMaxEntries; i++ {
+		e := &ledgerEntry{SessionID: fmt.Sprintf("u%03d", i), BootID: "boot-1", State: ledgerStateUnknown, UpdatedAt: int64(1_699_999_000_000 + i), PIDs: []ledgerProcess{{PID: 4, StartTime: "t"}}}
+		if i < 2 {
+			e.State = ledgerStateReaped
+			e.SessionID = fmt.Sprintf("r%d", i)
+			e.PIDs = []ledgerProcess{}
+		}
+		entries = append(entries, e)
+	}
+	// A reaped generation of an id whose other generation is unknown.
+	entries[spawnLedgerMaxEntries-1].SessionID = "twin"
+	writeLedgerFixture(t, dir, ledgerFileData{BootID: "boot-1", Entries: entries})
+
+	l := newTestLedger(t, dir, "boot-2")
+	l.probe = func(ledgerProcess) processProbeResult { return processUnknown }
+	l.RunBootReap()
+
+	l.OpenLogicalSession("new-1") // evicts r0
+	l.OpenLogicalSession("new-2") // evicts r1
+	ids := map[string]bool{}
+	for _, e := range readLedgerFile(t, dir).Entries {
+		ids[e.SessionID] = true
+	}
+	if ids["r0"] || ids["r1"] || !ids["new-1"] || !ids["new-2"] || !ids["u002"] {
+		t.Fatalf("eviction chose wrong entries: %v", ids)
+	}
+
+	// Nothing reaped is left: "twin" is refused, and its unknown
+	// generation becomes permanently uncertifiable.
+	l.BeginSpawn("twin")
+	l.TrackProcess("twin", proc(9), false)
+	var twin []*ledgerEntry
+	for _, e := range readLedgerFile(t, dir).Entries {
+		if e.SessionID == "twin" {
+			twin = append(twin, e)
+		}
+	}
+	if len(twin) != 1 || twin[0].BootID != "boot-1" || !twin[0].Incomplete {
+		t.Fatalf("twin generations = %+v", twin)
+	}
+	l3 := newTestLedger(t, dir, "boot-3")
+	l3.probe = func(ledgerProcess) processProbeResult { return processGone }
+	l3.RunBootReap()
+	for _, id := range l3.Report(context.Background()).SessionsReaped {
+		if id == "twin" {
+			t.Fatalf("a refused session id was certified")
+		}
 	}
 }

@@ -72,7 +72,14 @@ func processStartToken(pid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return processStartTokenPrefixLinux + linuxBootID() + ":" + starttime, nil
+	// The boot id is what tells two machine boots apart: without it a PID
+	// and start tick could name a different process after a reboot. No boot
+	// id, no token — the ledger then marks the record incomplete.
+	bootID := linuxBootID()
+	if bootID == "" {
+		return "", errors.New("machine boot id unavailable")
+	}
+	return processStartTokenPrefixLinux + bootID + ":" + starttime, nil
 }
 
 // probeRecordedProcess reports whether the recorded process is still ours.
@@ -91,7 +98,11 @@ func probeRecordedProcess(rec ledgerProcess) processProbeResult {
 	if err != nil {
 		return processUnknown
 	}
-	if processStartTokenPrefixLinux+linuxBootID()+":"+starttime != rec.StartTime {
+	bootID := linuxBootID()
+	if bootID == "" || strings.HasPrefix(rec.StartTime, processStartTokenPrefixLinux+":") {
+		return processUnknown // no machine boot to compare: never ours, never gone
+	}
+	if processStartTokenPrefixLinux+bootID+":"+starttime != rec.StartTime {
 		return processGone // a reused PID: not ours, never touched
 	}
 	// A zombie (Z) or dead (X) process has exited; it cannot act.
