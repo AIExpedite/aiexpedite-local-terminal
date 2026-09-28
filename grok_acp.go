@@ -536,13 +536,16 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
+		abortSessionSpawn(id)
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
 		cleanupFailedStart()
 		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
+	trackSessionProcess(id, proc)
 
 	// Clamp the requested timeout at our stale-GC ceiling. A misbehaving
 	// orchestrator that requests TimeoutMs > grokACPMaxLifetime would
@@ -621,6 +624,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
 				Type:        "grok_acp_error",
+				BootID:      agentBootID,
 				SessionID:   session.ID,
 				Seq:         int(seq),
 			})
@@ -925,6 +929,7 @@ func (m *GrokACPManager) removeSession(id string) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
@@ -953,6 +958,7 @@ func (m *GrokACPManager) removeSessionIfSame(id string, s *GrokACPSession) bool 
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(m.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
@@ -1011,6 +1017,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "grok_acp_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
 		})
@@ -1089,6 +1096,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 					Type:        "grok_acp_error",
+					BootID:      agentBootID,
 					SessionID:   session.ID,
 					Seq:         int(seq),
 				}, "grok_acp_error") {
@@ -1400,6 +1408,7 @@ func (m *GrokACPManager) watchFirstFrame(session *GrokACPSession, publishFn Publ
 		Ts:        time.Now().UnixMilli(),
 		Version:   Version,
 		Type:      "grok_acp_error",
+		BootID:    agentBootID,
 		SessionID: session.ID,
 		Seq:       int(seq),
 	})

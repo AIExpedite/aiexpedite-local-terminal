@@ -286,6 +286,9 @@ func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSe
 		NativeSessionID: resumeSessionID,
 	}
 	m.sessions[id] = session
+	// The session lives here between its per-turn processes; the ledger keeps
+	// it so a restart can report it gone (session_ledger.go).
+	openLedgerLogicalSession(id)
 
 	fmt.Printf("%s[opencode-native] Session %s registered (cwd=%s)%s\n",
 		colorCyan, id, cwd, colorReset)
@@ -683,11 +686,17 @@ func (m *OpenCodeNativeManager) runOneShot(
 		return openCodeRunResult{err: fmt.Errorf("session ended during turn")}
 	}
 
+	// opencode already leads its own group (Setsid above). Recorded in the
+	// spawn ledger for this turn only (session_ledger.go).
+	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
+		abortSessionSpawn(session.ID)
 		return openCodeRunResult{
 			err: fmt.Errorf("failed to start opencode (is OpenCode installed?): %w", err),
 		}
 	}
+	trackSessionProcess(session.ID, cmd)
+	defer untrackSessionProcess(session.ID, cmd.Process.Pid)
 	if cmd.Process != nil {
 		globalProcessRegistry.Register(cmd.Process.Pid, registryLabel)
 		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
@@ -1022,6 +1031,7 @@ func (m *OpenCodeNativeManager) publishTurnError(session *OpenCodeNativeSession,
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "opencode_native_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         seq,
 		})
@@ -1240,6 +1250,7 @@ func (m *OpenCodeNativeManager) removeSession(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
@@ -1261,6 +1272,7 @@ func (m *OpenCodeNativeManager) removeSessionIfSame(id string, s *OpenCodeNative
 		return false
 	}
 	delete(m.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
