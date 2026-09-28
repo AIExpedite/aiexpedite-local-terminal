@@ -140,13 +140,20 @@ type CLISession struct {
 	// there is nothing left to keep attributed.
 	finishGrokBillingAttribution func()
 
-	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
+	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex, opencode) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
 	// open at start (see shouldCloseStdinAfterStart) and closed by SendInput
 	// immediately after the first prompt is written, giving the child its
-	// prompt + EOF in the order codex exec requires. Reset to false once the
-	// pipe is closed so a second SendInput doesn't double-close.
+	// prompt + EOF in the order `codex exec` and `opencode run` both require.
+	// Reset to false once the pipe is closed so a second SendInput doesn't
+	// double-close.
+	//
+	// Membership is DERIVED from the CLI's stdin envelope
+	// (isOneShotStdinPromptFormat over stdinPromptFormat), never from a
+	// per-command test: OpenCode joined this flow the moment its prompt left
+	// argv, and a hand-listed set would have left its promptless sessions
+	// hanging on a pipe nothing ever closes.
 	deferredStdinClose bool
 
 	// turnSettled is true only while the LAST stream line this session produced
@@ -320,15 +327,43 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokSmokePrompt = prompt
 	}
 
+	// OpenCode's legacy signed session_start smoke, mirroring Grok's above: the
+	// promoted control token is consumed HERE so it can never reach the child,
+	// and the signed WIRE argv is validated against the frozen shapes before the
+	// general builder can strip or normalize any of its tokens. A promoted
+	// request that does not match fails CLOSED with a fixed error rather than
+	// running as an ordinary session; the child argv comes from the ladder
+	// below, so `--pure` is consumed by validation and never reaches OpenCode.
+	openCodeMaintenanceSmoke := false
+	var openCodeSmokePromptText string
+	if isOpenCodeCommand(command) {
+		args, openCodeMaintenanceSmoke = extractOpenCodeMaintenanceSmokeControl(args)
+		if openCodeMaintenanceSmoke {
+			prompt, contractErr := validateOpenCodeSmokeRequest(args)
+			if contractErr != nil {
+				return contractErr
+			}
+			openCodeSmokePromptText = prompt
+		}
+	}
+
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty when the target CLI transports its prompt outside
-	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
+	// argv (Claude/Antigravity NDJSON, Codex/OpenCode plain stdin).
 	antigravityManagedStream := isAntigravityCommand(command) && shouldUseAntigravityManagedStream(args)
 	// A maintenance smoke is always fail-closed, regardless of the workspace's
 	// ordinary Grok approval preference. This also prevents the builder from
 	// injecting --always-approve before the strict child-argv validation below.
 	enableGrokAlwaysApprove := !grokMaintenanceSmoke && sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+	if openCodeMaintenanceSmoke {
+		// The child argv is the LADDER's, never the wire's — the same split
+		// that keeps Grok's empty `--tools` operand off its child's command
+		// line. The marker prompt rides on the managed stdin pipe, so the nonce
+		// never appears in argv or a process listing.
+		cliArgs = buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+		stdinPrompt = &openCodeSmokePromptText
+	}
 
 	// Exact conversation resume (one-shot CLIs). Refused rather than ignored when
 	// it cannot be honoured: the caller sent only its follow-up text.
@@ -442,22 +477,6 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		}
 	}
 
-	// OpenCode's LEGACY session_start / PTY path carries its prompt as a
-	// trailing positional (the resident chat path in opencode_native.go writes
-	// it to a temp file consumed on stdin instead), so it is subject to the
-	// Windows CreateProcess ~32KB command-line ceiling. Refuse above the cap
-	// rather than letting CreateProcess fail with an opaque "command line too
-	// long", and measure in BYTES — a character-count check passes a multibyte
-	// prompt that still exceeds the real limit. grok solves the same problem by
-	// relocating its prompt to --prompt-file below; opencode's legacy path has
-	// no such flag, so failing closed is the honest answer.
-	if isOpenCodeCommand(command) {
-		if n := argvByteLen(cliArgs); n > openCodeInteractiveMaxPromptBytes {
-			return fmt.Errorf(
-				"opencode arguments are %d bytes, exceeding the %d-byte limit for a one-shot session; use an OpenCode chat session for long prompts",
-				n, openCodeInteractiveMaxPromptBytes)
-		}
-	}
 	// Muse Code's synthesized prompt is staged to --prompt-file below on every
 	// platform, so the CreateProcess cap above does not apply; bound it by the
 	// same limit the native chat path enforces instead.
@@ -593,6 +612,29 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		shimmed := newOneShotCommand(context.Background(), executable, cliArgs, proc.Env, proc.Dir)
 		hideWindow(shimmed)
 		proc = shimmed
+	}
+	if isOpenCodeCommand(command) {
+		// Same launcher the `__cli_smoke__` probe and the resident chat path use
+		// (newOpenCodeCmd): on Windows the `opencode.cmd` npm shim cannot be
+		// started by CreateProcess directly, so the child is routed through
+		// cmd.exe with an explicit command line carrying every token in the
+		// environment. A direct spawn here failed before the CLI ever parsed a
+		// flag — pre- and post-update identically — which is why the maintenance
+		// smoke never returned a marker. A native binary spawns directly, with
+		// the env and cwd resolved above. The shim route hands us an
+		// intermediate cmd.exe and this launch supplies a background context, so
+		// exec's own Cancel can never fire here; killSessionProcess tree-kills
+		// every Windows session, so the shim's Node child goes down with it.
+		launched, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
+			Path: executable,
+			Args: cliArgs,
+			Env:  proc.Env,
+			Dir:  proc.Dir,
+		})
+		if launchErr != nil {
+			return launchErr
+		}
+		proc = launched
 	}
 	if len(strippedVars) > 0 {
 		logSession(id, "%s[session] Stripped env vars from session %s: %s%s\n",
@@ -764,8 +806,12 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// between this pin and Start().
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
 
-	// Start the process
+	// Start the process. It is owned (its own process group on Unix, a
+	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
+	// a later boot can prove it gone (session_ledger.go).
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
+		abortSessionSpawn(id)
 		if finishGrokAttribution != nil {
 			// No child will ever write a record for this arm; release now so a
 			// failed spawn cannot leave the shared keeper running forever.
@@ -778,6 +824,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		stderrW.Close()
 		return fmt.Errorf("failed to start %s: %w", command, err)
 	}
+	trackSessionProcess(id, proc)
 
 	// The child now holds its own dup of the write ends; close the parent's
 	// copies so the read ends see EOF when (and only when) the child exits.
@@ -965,14 +1012,24 @@ func (s *CLISession) armCodexUsageRun(at time.Time) {
 	codexUsageRunStarted(time.UnixMilli(floor))
 }
 
-// armCodexUsageRunOnLateWrite arms the run for a stdin write SendInput stopped
-// waiting on. The timeout branch neither closes stdin nor kills the child, so
-// the abandoned writer can still deliver the prompt — and a turn that reached
-// codex with nothing armed makes both terminal-event and exit settlement
-// no-ops, skipping the post-run refresh it owes. The wait is bounded by the
-// session itself: once it is gone, a write still blocked on its stdin can
-// never reach the child.
-func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
+// finishLateStdinWrite completes the bookkeeping for a stdin write SendInput
+// stopped waiting on. The timeout branch neither closes stdin nor kills the
+// child, so the abandoned writer can still deliver the prompt — and that
+// delivery still owes two things:
+//
+//   - EOF, for ANY one-shot session holding a deferred stdin open (codex AND
+//     opencode). `opencode run` and `codex exec` both read stdin to completion
+//     before running the turn, so a prompt delivered with the pipe still open
+//     leaves the child waiting until the session's overall timeout. This used to
+//     run for codex only, so a promptless OpenCode session whose first SendInput
+//     was slow never got its EOF at all.
+//   - a codex usage floor, for a codex session only: a turn that reached codex
+//     with nothing armed makes both terminal-event and exit settlement no-ops,
+//     skipping the post-run refresh it owes.
+//
+// The wait is bounded by the session itself: once it is gone, a write still
+// blocked on its stdin can never reach the child.
+func (s *CLISession) finishLateStdinWrite(writeDone <-chan error) {
 	select {
 	case err := <-writeDone:
 		if err != nil {
@@ -991,13 +1048,18 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 		}
 	}
 	// The prompt only reached the child: a deferred one-shot session still
-	// holds its stdin open, and codex exec waits for EOF before running the
-	// turn. SendInput's own close was skipped when it gave up on this write, so
-	// close here — otherwise the run armed below never executes, and the child
-	// sits until it is killed, leaving refresh debt for a turn that never ran.
+	// holds its stdin open, and both `codex exec` and `opencode run` wait for
+	// EOF before running the turn. SendInput's own close was skipped when it
+	// gave up on this write, so close here — otherwise the turn never runs, the
+	// child sits until it is killed, and (for codex) refresh debt is left for a
+	// turn that never happened.
 	s.mu.Lock()
 	s.closeDeferredStdinLocked()
 	s.mu.Unlock()
+	// Usage accounting is codex's alone; the close above is not.
+	if !isCodexCommand(s.Command) {
+		return
+	}
 	s.armCodexUsageRun(time.Now())
 	// The prompt can arrive after the exit path has already run its settle,
 	// which found nothing armed. Settle here so the refresh is owed now,
@@ -1009,12 +1071,14 @@ func (s *CLISession) armCodexUsageRunOnLateWrite(writeDone <-chan error) {
 	}
 }
 
-// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex)
-// started WITHOUT a prompt held open for its first message. codex exec reads
-// stdin to EOF before running the turn, so the pipe must close once that
-// prompt is written — otherwise the child waits forever for EOF. Called by
+// closeDeferredStdinLocked closes the stdin a one-shot, stdin-fed CLI (codex or
+// opencode) started WITHOUT a prompt held open for its first message. Both
+// `codex exec` and `opencode run` read stdin to EOF before running the turn, so
+// the pipe must close once that prompt is written — otherwise the child waits
+// forever for EOF. Deliberately NOT gated on the command: gating it on codex
+// would hang every promptless OpenCode session. Called by
 // SendInput for a write that completed in time, and by
-// armCodexUsageRunOnLateWrite for one SendInput abandoned and the writer then
+// finishLateStdinWrite for one SendInput abandoned and the writer then
 // delivered. deferredStdinClose is cleared here, so those two never
 // double-close and a second SendInput is a no-op. Caller holds s.mu.
 func (s *CLISession) closeDeferredStdinLocked() {
@@ -1120,10 +1184,13 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		}
 	case <-time.After(10 * time.Second):
 		// The child is neither killed nor its stdin closed here, so the
-		// abandoned writer can still deliver this prompt. Keep watching it, so
-		// a codex turn that does reach the child still arms its run.
-		if isCodexCommand(session.Command) {
-			go session.armCodexUsageRunOnLateWrite(writeDone)
+		// abandoned writer can still deliver this prompt. Keep watching it, so a
+		// prompt that does reach the child still closes a deferred one-shot
+		// stdin (codex, opencode) and still arms a codex run. Gated on having
+		// something to finish, so an ordinary interactive session's timed-out
+		// write does not leave a goroutine parked on it.
+		if session.deferredStdinClose || isCodexCommand(session.Command) {
+			go session.finishLateStdinWrite(writeDone)
 		}
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}
@@ -1134,9 +1201,10 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		session.armCodexUsageRun(time.Now())
 	}
 
-	// One-shot, stdin-fed CLIs (codex) started without a prompt held their
-	// stdin open waiting for this first message; close it now that the prompt
-	// is written.
+	// One-shot, stdin-fed CLIs (codex, opencode) started without a prompt held
+	// their stdin open waiting for this first message; close it now that the
+	// prompt is written. Unconditional by design — see
+	// closeDeferredStdinLocked.
 	session.closeDeferredStdinLocked()
 
 	// Reset status from waiting_input back to running
@@ -1553,6 +1621,7 @@ func (sm *SessionManager) removeSession(id string) {
 	}
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
@@ -1581,6 +1650,7 @@ func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(sm.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
@@ -1641,13 +1711,21 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
-	case isOpenCodeCommand(command), isMuseCodeCommand(command):
-		// One-shot with the prompt on argv and NO stdin protocol: leaving the
-		// pipe open would hand `opencode run` / `muse exec` an input stream it
-		// waits on. Close unconditionally — unlike codex there is no "session
-		// opened with no prompt yet" case here, because this legacy path always
-		// carries its prompt positionally.
+	case isMuseCodeCommand(command):
+		// One-shot with the prompt on argv (relocated to --prompt-file) and NO
+		// stdin protocol: leaving the pipe open would hand `muse exec` an input
+		// stream it waits on. Close unconditionally — unlike codex there is no
+		// "session opened with no prompt yet" case here, because this legacy
+		// path always carries its prompt positionally.
 		return true
+	case isOpenCodeCommand(command):
+		// One-shot, stdin-fed: close the pipe right after the prompt is
+		// written, or `opencode run` waits on an input stream nothing will
+		// close. Conditional on a prompt HAVING been delivered — the prompt
+		// left argv, so a chat-direct start that opens the session on model
+		// selection and sends its first message later via SendInput must keep
+		// the pipe open, exactly as codex does. See deferredStdinClose.
+		return hasPrompt
 	case strings.HasPrefix(base, "codex"):
 		// One-shot, stdin-fed CLIs: close stdin right after start ONLY when a
 		// prompt was delivered at start (the delegate/one-shot path). When the
@@ -1728,19 +1806,10 @@ func detectCLITerminalEvent(command, line string) bool {
 		return eventType == "end"
 	case isOpenCodeCommand(command):
 		// `opencode run --format json` closes a turn with a session/step
-		// completion event, immediately before the one-shot process exits.
-		// Matched by suffix because the exact type name has moved across
-		// releases; an unrecognised terminal event is harmless (the
-		// process-exit path still flushes), a false positive is not, so
-		// `error` is excluded.
-		lowered := strings.ToLower(eventType)
-		if strings.Contains(lowered, "error") {
-			return false
-		}
-		return strings.HasSuffix(lowered, "completed") ||
-			strings.HasSuffix(lowered, "done") ||
-			lowered == "finish" ||
-			lowered == "session.idle"
+		// completion event, immediately before the one-shot process exits. The
+		// predicate is shared with the maintenance probe (opencode_argv.go) so
+		// both transports agree on what "the turn finished" looks like.
+		return isOpenCodeTerminalEventType(eventType, openCodeEventFinishReason(event))
 	}
 	return false
 }
@@ -2859,12 +2928,6 @@ func isOpenCodeCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "opencode")
 }
 
-// isOpenCodeSynthesizedRun reports whether args match the forced one-shot
-// `run --format json ...` shape that buildOpenCodeInteractiveArgs produces.
-func isOpenCodeSynthesizedRun(args []string) bool {
-	return len(args) >= 3 && args[0] == "run" && args[1] == "--format" && args[2] == "json"
-}
-
 // isResidentAgentSessionCommand reports whether a session_start command is a
 // resident CLI agent that keeps its interactive-capable env. These are exactly
 // the commands buildInteractiveCLIArgs shapes (claude/codex/grok) plus the
@@ -2911,14 +2974,15 @@ func isResidentAgentSessionCommand(command string) bool {
 //   - antigravity: prompt is sent as an Antigravity NDJSON user event via
 //     stdin using the stream-json input/output modes added in agy 1.1.15.
 //     The prompt never appears on argv, avoiding Windows CreateProcess limits.
-//   - opencode:    forced `run --format json` with the prompt as a trailing
-//     positional. `opencode run` is one-shot and does not
-//     hold a stdin protocol open, so stdinPrompt is "" and
-//     stdin is closed right after start. (The RESIDENT chat
-//     path in opencode_native.go delivers the prompt on stdin
-//     from a temp file instead; this legacy session_start /
-//     PTY path keeps it positional, which is why it enforces
-//     a byte cap the resident path does not need.)
+//   - opencode:    forced `run --format json` with the prompt on stdin,
+//     written verbatim ("plain") and the pipe closed right
+//     after the write. `opencode run` is one-shot and holds no
+//     stdin protocol open, so a start WITH a prompt closes the
+//     pipe immediately; a promptless chat-direct start keeps it
+//     open for the first SendInput. Keeping the prompt off argv
+//     also lifts the Windows CreateProcess command-line ceiling
+//     and keeps a maintenance smoke's marker nonce out of a
+//     process listing.
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -2942,7 +3006,11 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 	case isAntigravityCommand(command):
 		return buildAntigravityStreamingArgs(args)
 	case isOpenCodeCommand(command):
-		return buildOpenCodeInteractiveArgs(args), nil
+		cliArgs, prompt := buildOpenCodeInteractiveArgs(args)
+		if prompt == "" {
+			return cliArgs, nil
+		}
+		return cliArgs, &prompt
 	case isMuseCodeCommand(command):
 		return buildMuseCodeInteractiveArgs(args), nil
 	case strings.HasPrefix(base, "grok"):
@@ -2973,6 +3041,10 @@ func stdinPromptFormat(command string) string {
 		return "plain"
 	case isAntigravityCommand(command):
 		return "antigravity_ndjson"
+	case isOpenCodeCommand(command):
+		// `opencode run` reads the prompt verbatim from stdin; it parses no
+		// framing protocol of its own.
+		return "plain"
 	}
 	return ""
 }
@@ -3394,132 +3466,6 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	result = append(result, trailing...)
 	return result
 }
-
-// buildOpenCodeInteractiveArgs shapes a one-shot `opencode` invocation for the
-// legacy session_start / PTY path.
-//
-// `run --format json` is ALWAYS forced and any caller token that would re-enter
-// the interactive TUI — a bare `opencode`, a second `run`, or a `--format`
-// override — is stripped. A bare `opencode` on a headless remote session starts
-// the TUI, which emits escape-sequence noise and never exits: the identical
-// trap grok_acp.go documents for bare `grok`.
-//
-// Diagnostic invocations (`--version`, `--help`, `models`, `auth …`) are
-// returned verbatim: shaping them would turn an information request into a
-// model run, and `opencode --version` is exactly how the capability probe and
-// the usage parser query the CLI.
-//
-// The prompt stays a trailing POSITIONAL here (unlike the resident chat path in
-// opencode_native.go, which writes it to a temp file consumed on stdin), so
-// this path is subject to the Windows CreateProcess argv ceiling — see
-// openCodeInteractiveMaxPromptBytes.
-func buildOpenCodeInteractiveArgs(args []string) []string {
-	if isOpenCodeDiagnosticInvocation(args) {
-		return args
-	}
-
-	forwarded := make([]string, 0, len(args)+3)
-	prompt := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		name := a
-		inlineValue := false
-		if idx := strings.Index(a, "="); idx > 0 {
-			name = a[:idx]
-			inlineValue = true
-		}
-		if openCodeStrippedFlags[name] {
-			if !inlineValue && openCodeValuedStrippedFlags[name] {
-				i++
-			}
-			continue
-		}
-		if a == "run" && len(forwarded) == 0 && len(prompt) == 0 {
-			// Already forced below; a second `run` parses as prompt text.
-			continue
-		}
-		if strings.HasPrefix(a, "-") {
-			forwarded = append(forwarded, a)
-			// Flags the manager forwards that consume the next token.
-			if openCodeForwardedValuedFlags[name] && !inlineValue && i+1 < len(args) {
-				i++
-				forwarded = append(forwarded, args[i])
-			}
-			continue
-		}
-		prompt = append(prompt, a)
-	}
-
-	result := append([]string{"run", "--format", "json"}, forwarded...)
-	return append(result, prompt...)
-}
-
-// openCodeForwardedValuedFlags are caller flags the manager passes through that
-// take the NEXT argv token as their value. Without this the value would be
-// mistaken for prompt text and reordered behind the flags.
-var openCodeForwardedValuedFlags = map[string]bool{
-	"--model": true,
-	"-m":      true,
-	// `opencode run --variant <level>` is the provider-specific reasoning
-	// effort; the orchestrator composes it beside --model (shared-constants
-	// CLI_AGENT_EFFORT_FLAG_BY_ID). Without this entry the level would be read
-	// as prompt text and the run would silently use the default effort.
-	"--variant": true,
-	"--agent":   true,
-	"--port":    true,
-	"--host":    true,
-}
-
-// openCodeDiagnosticTokens are invocations that ask OpenCode for information
-// instead of running a prompt. Reshaping any of these into `run` would burn a
-// model call the caller never asked for.
-var openCodeDiagnosticTokens = map[string]bool{
-	"--version": true, "-version": true, "-v": true,
-	"--help": true, "-help": true, "-h": true,
-	"auth": true, "models": true, "upgrade": true, "serve": true,
-	"github": true, "mcp": true, "agent": true, "stats": true,
-}
-
-// isOpenCodeDiagnosticInvocation reports an invocation OpenCode answers with
-// information rather than a model run. Like agy, OpenCode pre-scans its whole
-// command line for `--help` / `--version`, so those are matched wherever they
-// appear; subcommands only count as the FIRST token.
-func isOpenCodeDiagnosticInvocation(args []string) bool {
-	for i, a := range args {
-		lowered := strings.ToLower(strings.TrimSpace(a))
-		if name, _, ok := strings.Cut(lowered, "="); ok {
-			lowered = name
-		}
-		switch lowered {
-		case "--version", "-version", "-v", "--help", "-help", "-h":
-			return true
-		}
-		if i == 0 && openCodeDiagnosticTokens[lowered] && !strings.HasPrefix(lowered, "-") {
-			return true
-		}
-	}
-	return false
-}
-
-// argvByteLen totals the bytes an argv slice contributes to the command line,
-// including the single separator each token needs. Used for the CreateProcess
-// ceiling check, which is a limit on the assembled command line rather than on
-// any one argument.
-func argvByteLen(args []string) int {
-	n := 0
-	for _, a := range args {
-		n += len(a) + 1
-	}
-	return n
-}
-
-// openCodeInteractiveMaxPromptBytes caps the prompt on the LEGACY positional
-// path only. Measured in BYTES, not characters: Windows CreateProcess caps the
-// whole command line near 32KB and a multibyte prompt passes a character-count
-// check while exceeding the real limit. The resident chat path
-// (opencode_native.go) is exempt — its prompt goes to a temp file consumed on
-// stdin and never touches argv.
-const openCodeInteractiveMaxPromptBytes = 24 * 1024
 
 // antigravityDiagnosticTokens are single-token invocations that ask the CLI for
 // information instead of running a prompt. Subcommands are from `agy --help` on

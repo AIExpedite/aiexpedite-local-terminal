@@ -462,6 +462,18 @@ func isMuseCodeSynthesizedRun(args []string) bool {
 	return len(args) >= 3 && args[0] == "exec" && args[1] == "--json" && args[2] == "--disable-approval"
 }
 
+// argvByteLen totals the bytes an argv slice contributes to the command line,
+// including the single separator each token needs. Kept here because Muse Code
+// is now its only consumer: the OpenCode legacy path that shared it moved its
+// prompt off argv onto stdin, so the CreateProcess ceiling check went with it.
+func argvByteLen(args []string) int {
+	n := 0
+	for _, a := range args {
+		n += len(a) + 1
+	}
+	return n
+}
+
 // checkMuseCodeLegacyPromptSize bounds a synthesized legacy-path prompt by the
 // native chat path's limit. The prompt never reaches argv (it is staged to
 // --prompt-file), so the Windows command-line cap is not the constraint here.

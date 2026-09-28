@@ -173,6 +173,7 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		Command:         redactSensitiveData(cmd.Command),
 		Args:            redactRejectionArgs(cmd),
 		RejectionReason: reason,
+		BootID:          agentBootID,
 	}
 	// Session-routed commands need Type/SessionID set so the backend can
 	// correlate the rejection with the session document. The rejection Type
@@ -779,6 +780,12 @@ type resultMsg struct {
 	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
 	ErrorCode string `json:"errorCode,omitempty"`
 
+	// BootID names the agent process that produced this frame (a random id
+	// per process start, session_ledger.go). Set on pongs, session error
+	// frames and rejections, so terminal-service can tell a same-boot
+	// "session not found" (session-level) from one after a restart.
+	BootID string `json:"bootId,omitempty"`
+
 	// Durable CLI conversation id for a resident kind whose conversation lives
 	// on THIS device's filesystem and whose id the cloud cannot otherwise learn.
 	//
@@ -1295,6 +1302,23 @@ func canPublishSignedCLIUsageFailure(cmd commandMsg, cfg *Config) bool {
 	return cfg != nil && cfg.CommandSecret != "" && verifySignature(cmd, cfg.CommandSecret)
 }
 
+// pongResult is the answer to a __ping__. Every pong names this agent
+// process's boot, so terminal-service can tell a transient drop (same boot)
+// from a restart (new boot); see session_ledger.go.
+func pongResult(cmd commandMsg) resultMsg {
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     cmd.AgentID,
+		Output:      "pong",
+		Status:      "success",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		BootID:      agentBootID,
+	}
+}
+
 // publishMsg marshals res and publishes it on topic using ctx.
 // Logs and returns any error so callers can decide whether to ack or nack.
 // publishMsg is a var, not a plain func, so tests can observe what a handler
@@ -1327,6 +1351,13 @@ var publishMsg = func(ctx context.Context, topic *pubsub.Publisher, res resultMs
 func runPubSubConnection(cfg *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Every (re)connection must learn the fenced sessions again before it
+	// runs session commands: a Move can land while the link is down. The
+	// first connection of the process starts unapplied already, and its
+	// boot /online may be accepted before this point, so only a later
+	// connection resets (fenced_sessions.go).
+	beginFenceReportConnection(cfg)
 
 	// Listen for shutdown or offline signal.
 	// ctx.Done() arm ensures this goroutine exits when the connection ends
@@ -1563,16 +1594,7 @@ func runPubSubConnection(cfg *Config) error {
 				m.Ack()
 				return
 			}
-			res := resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				AgentID:     cmd.AgentID,
-				Output:      "pong",
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-			}
+			res := pongResult(cmd)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
 			}
@@ -1825,6 +1847,18 @@ func runPubSubConnection(cfg *Config) error {
 		// session_end / codex_appserver_send / codex_appserver_end) flow
 		// through directly because they target an already-allowed session.
 		if cmd.Type != "" && cmd.Type != "execute" {
+			// A session fenced by a Move / max-park end (reported on /online,
+			// fenced_sessions.go) accepts nothing but its END: its run has
+			// moved on, so a late input must not drive the old CLI.
+			// Until an /online fence report is accepted on this connection
+			// the fence set may be incomplete: hold (then Nack) everything
+			// but END.
+			if holdForFenceReport(ctx, m, cmd, fenceReportGateWait) {
+				return
+			}
+			if refuseFencedSessionCommand(ctx, topic, m, cmd, cfg) {
+				return
+			}
 			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
 				return
 			}
@@ -6063,12 +6097,26 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// `run --format json` and strips any token that would re-enter the
 		// interactive TUI, so an orchestration start arriving as
 		// `opencode --model <m> "<prompt>"` becomes
-		// `run --format json --model <m> <prompt>` — which is what the narrow
+		// `run --format json --model <m>` — which is what the narrow
 		// `opencode run --format json *` allowlist entry matches, and what the
 		// dialog must display. Gating the RAW args instead would leave the
 		// entry unmatched and hang a headless run at the approval dialog.
+		//
+		// The prompt is deliberately absent: it now travels on the child's
+		// stdin, so the dialog no longer renders prompt text (which could carry
+		// a credential, a private path, or a maintenance smoke's marker nonce).
 		if isOpenCodeCommand(cmd.Command) {
-			allowArgs = buildOpenCodeInteractiveArgs(cmd.Args)
+			// The promoted maintenance-smoke control token is stripped FIRST so
+			// it is never displayed in the dialog nor matched against a pattern.
+			cleaned, promoted := extractOpenCodeMaintenanceSmokeControl(cmd.Args)
+			if promoted || openCodeMaintenanceSmokeRequest(cleaned) {
+				// A maintenance smoke's child argv comes from the LADDER, not
+				// from its wire tokens (`--pure` is consumed by validation), so
+				// gate and display exactly what StartSession will exec.
+				allowArgs = buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+			} else {
+				allowArgs, _ = buildOpenCodeInteractiveArgs(cleaned)
+			}
 			// Approve the synthesised shape inside session_start ONLY in signed
 			// mode (cfg.CommandSecret != ""). In unsigned mode, an unauthenticated
 			// sender must still go through the approval dialog.
@@ -6132,7 +6180,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "opencode"
-		allowArgs = buildOpenCodeNativeArgs("")
+		allowArgs = buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
 		dialogArgs = allowArgs
 		denyOutput = "opencode native session denied by user: not in allow list"
 	case "musecode_native_start":
@@ -6442,25 +6490,46 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 }
 
-// sessionStartArgsForCommand promotes the updater's reserved, signed Grok smoke
-// prompt envelope into the private in-process control consumed by
-// SessionManager. StartSession validates the exact argv contract; promoting a
-// malformed reserved request makes it fail closed rather than run as an
-// ordinary session. Unrelated no-tools requests remain unchanged.
+// sessionStartArgsForCommand promotes the updater's reserved, signed maintenance
+// smoke prompt envelope (Grok's, or OpenCode's) into the private in-process
+// control consumed by SessionManager. StartSession validates the exact argv
+// contract; promoting a RECOGNIZABLE-but-malformed reserved request makes it
+// fail closed there rather than quietly run as an ordinary session.
+//
+// An argv that already carries the control token is left alone, and an argv that
+// is not a reserved envelope passes through untouched — which is how ordinary
+// Grok and OpenCode sessions keep working, and why a caller flag such as
+// `--model x` can never become a refusal (it is outside OpenCode's reserved
+// token vocabulary, so the request is simply not maintenance traffic).
 func sessionStartArgsForCommand(cmd commandMsg) []string {
-	if !isGrokCommand(cmd.Command) {
-		return cmd.Args
+	switch {
+	case isGrokCommand(cmd.Command):
+		if _, explicit := extractGrokMaintenanceSmokeControl(cmd.Args); explicit {
+			return cmd.Args
+		}
+		if !grokMaintenanceSmokeRequest(cmd.Args) {
+			return cmd.Args
+		}
+		return prependSessionStartControlArg(grokMaintenanceSmokeControlArg, cmd.Args)
+	case isOpenCodeCommand(cmd.Command):
+		if _, explicit := extractOpenCodeMaintenanceSmokeControl(cmd.Args); explicit {
+			return cmd.Args
+		}
+		if !openCodeMaintenanceSmokeRequest(cmd.Args) {
+			return cmd.Args
+		}
+		return prependSessionStartControlArg(openCodeMaintenanceSmokeControlArg, cmd.Args)
 	}
-	if _, explicit := extractGrokMaintenanceSmokeControl(cmd.Args); explicit {
-		return cmd.Args
-	}
-	if !grokMaintenanceSmokeRequest(cmd.Args) {
-		return cmd.Args
-	}
-	out := make([]string, 0, len(cmd.Args)+1)
-	out = append(out, grokMaintenanceSmokeControlArg)
-	out = append(out, cmd.Args...)
-	return out
+	return cmd.Args
+}
+
+// prependSessionStartControlArg returns a COPY of args led by the private
+// control token. A copy because commandMsg.Args is still read by the publish
+// paths after dispatch.
+func prependSessionStartControlArg(control string, args []string) []string {
+	out := make([]string, 0, len(args)+1)
+	out = append(out, control)
+	return append(out, args...)
 }
 
 // publishSessionError publishes an error result for a session command.
@@ -6482,6 +6551,7 @@ func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, c
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6609,6 +6679,7 @@ func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cm
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "codex_appserver_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6734,6 +6805,7 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "claude_native_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -6949,6 +7021,7 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "antigravity_native_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -7098,6 +7171,7 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        "grok_acp_error",
 		SessionID:   cmd.SessionID,
 	}
@@ -7259,6 +7333,7 @@ func publishOneShotNativeError(ctx context.Context, topic *pubsub.Publisher, cmd
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
+		BootID:      agentBootID,
 		Type:        spec.frameType("error"),
 		SessionID:   cmd.SessionID,
 	}

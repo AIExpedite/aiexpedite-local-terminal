@@ -23,6 +23,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -647,6 +648,26 @@ func runMockCLI(mode string) {
 		// Block even after the child dies: taskkill /T takes descendants
 		// before the root, and a root that exited 0 here would leave the
 		// tree on its own instead of by the kill under test.
+		_ = child.Wait()
+		select {}
+
+	case "ledger-tree-on-stdin":
+		// Like session-kill-tree, but the descendant is started only after a
+		// line arrives on stdin, so a test can own this root (Job Object /
+		// process group) BEFORE it has children. Used by the boot-report
+		// ownership tests (session_ledger_*_test.go).
+		reader := bufio.NewReader(os.Stdin)
+		_, _ = reader.ReadString('\n')
+		self, err := os.Executable()
+		if err != nil {
+			os.Exit(1)
+		}
+		child := exec.Command(self)
+		env := setEnvVar(os.Environ(), mockCLIEnvVar, "grok-smoke-hang")
+		child.Env = setEnvVar(env, mockGrokSmokeHangPidEnv, os.Getenv(mockSessionKillChildPidEnv))
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
 		_ = child.Wait()
 		select {}
 

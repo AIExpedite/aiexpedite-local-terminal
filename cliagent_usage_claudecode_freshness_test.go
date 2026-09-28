@@ -2144,6 +2144,20 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 				snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
 				return true
 			})
+			// seedOwedFromCache latches its adoption to (mtime, size), and this write
+			// changes ONE DIGIT — so the size is identical and the whole test hinges
+			// on the filesystem mtime happening to tick between two writes microseconds
+			// apart. It usually does, which is why this passed; when it does not, the
+			// latch hands back the FIRST seed's verdict and the assertion below fails
+			// for a reason that has nothing to do with what it is testing. Make the
+			// stamp differ explicitly: a real replay's write is a distinct snapshot,
+			// which is exactly what this models.
+			if info, err := os.Stat(cache); err == nil {
+				bumped := info.ModTime().Add(time.Second)
+				if err := os.Chtimes(cache, bumped, bumped); err != nil {
+					t.Fatalf("bump cache mtime: %v", err)
+				}
+			}
 
 			claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
 

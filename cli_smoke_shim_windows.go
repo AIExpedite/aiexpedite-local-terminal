@@ -1,7 +1,7 @@
 //go:build windows
 
 // cli_smoke_shim_windows.go — the cmd.exe route the maintenance smokes use to
-// launch a `.cmd` / `.bat` npm shim (Grok and Codex), plus the explicit
+// launch a `.cmd` / `.bat` npm shim (Grok, Codex and OpenCode), plus the explicit
 // command-line helpers the Grok junction commands share. CreateProcess cannot
 // start a batch file directly, and letting os/exec quote one re-splits or drops
 // tokens in the shim's own re-parse, so every shim launch goes through
@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,4 +125,103 @@ func bindGrokShimProcessTree(cmd *exec.Cmd) {
 		return cmd.Process.Kill()
 	}
 	cmd.WaitDelay = grokShimWaitDelay
+}
+
+/* --------------------------------------------------------------------------
+   OpenCode shim route
+   -------------------------------------------------------------------------- */
+
+// Environment variables the OpenCode shim route uses to hand cmd.exe every
+// token of the launch as DATA rather than script text. Unlike Grok's and
+// Codex's renderers, which allowlist known flag names and carry only the paths
+// in the environment, this one carries EVERY token — flag names included — so
+// the renderer imposes no argv vocabulary of its own and a shim install runs
+// exactly the argv a native install does (`run --format json`, `--session <id>`,
+// `--model <m>`, an unknown forwarded flag and its value, `models`, the
+// two-token `auth list`).
+const (
+	openCodeShimPathEnv   = "AIEXPEDITE_OPENCODE_SHIM_PATH"
+	openCodeShimArgEnvFmt = "AIX_OPENCODE_ARG_%d"
+)
+
+// openCodeShimMaxArgs bounds the environment slots one launch may occupy. Every
+// argv the ladder and the diagnostic probes produce is far under it; the cap
+// only stops a pathological caller from rendering an unbounded script line.
+const openCodeShimMaxArgs = 64
+
+// openCodeShimScript renders the explicit cmd.exe command line for a `.cmd` /
+// `.bat` shim launch:
+//
+//	"%AIEXPEDITE_OPENCODE_SHIM_PATH%" "%AIX_OPENCODE_ARG_0%" "%AIX_OPENCODE_ARG_1%" …
+//
+// The script body contains NO argv text. The shim is invoked directly, with no
+// leading `call`: `call` performs a SECOND percent-expansion pass over the
+// already-expanded line, so a path or value legitimately containing a paired
+// percent sequence would be re-read as an environment reference and mangled.
+// One expansion pass keeps every operand literal, and a `.cmd` run directly
+// under `cmd /c` still returns the batch file's exit code.
+//
+// ONE character policy, shared by this renderer, the prose in
+// CLI_AGENT_INTEGRATION.md and the tests: a token is REFUSED (ok=false, which
+// the caller turns into launch_error) rather than escaped when it contains a
+// double quote, `%`, CR, LF or another control character, when it is empty, or
+// when the launch exceeds openCodeShimMaxArgs tokens. Those are exactly what
+// breaks the quoting or gets re-read by cmd's single expansion pass. Spaces and
+// `&` / `^` / `(` / `)` / `|` are SUPPORTED — the reference is quoted and
+// delayed expansion is off (`/v:off`) — and round-trip intact.
+func openCodeShimScript(args []string) (script string, ok bool) {
+	if len(args) > openCodeShimMaxArgs {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString(`"%` + openCodeShimPathEnv + `%"`)
+	for i, arg := range args {
+		if !openCodeShimRenderableToken(arg) {
+			return "", false
+		}
+		b.WriteString(` "%` + fmt.Sprintf(openCodeShimArgEnvFmt, i) + `%"`)
+	}
+	return b.String(), true
+}
+
+// openCodeShimRenderableToken enforces the character policy above. It is not a
+// vocabulary check: any token that cannot break the quoting is accepted,
+// whatever it names.
+func openCodeShimRenderableToken(arg string) bool {
+	if arg == "" {
+		return false
+	}
+	for _, r := range arg {
+		switch {
+		case r == '"', r == '%':
+			return false
+		case r < 0x20, r == 0x7f:
+			return false
+		}
+	}
+	return true
+}
+
+// openCodeShimCommand routes a `.cmd` / `.bat` npm shim launch of OpenCode
+// through cmd.exe with an explicit command line, so the shim's own re-parse
+// cannot re-split or drop a token. The binary path and every argv token ride in
+// the child's environment. Returns ok=false for a native binary or a launch the
+// script renderer refuses; newOpenCodeCmd turns the latter into
+// errOpenCodeShimUnrenderable.
+//
+// Stdin is set by the caller on the returned *exec.Cmd — cmd.exe passes it to
+// the shim's child, so the prompt transport is identical on both routes.
+func openCodeShimCommand(ctx context.Context, launch openCodeLaunch) (*exec.Cmd, bool) {
+	if !isWindowsShimPath(launch.Path) {
+		return nil, false
+	}
+	script, ok := openCodeShimScript(launch.Args)
+	if !ok {
+		return nil, false
+	}
+	env := setEnvVar(launch.Env, openCodeShimPathEnv, launch.Path)
+	for i, arg := range launch.Args {
+		env = setEnvVar(env, fmt.Sprintf(openCodeShimArgEnvFmt, i), arg)
+	}
+	return cliSmokeShimCommand(ctx, script, env, launch.Dir), true
 }

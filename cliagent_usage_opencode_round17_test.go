@@ -59,7 +59,7 @@ func TestRunOpenCodeProbeDerivesItsDeadlineFromTheCaller(t *testing.T) {
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
 	started := time.Now()
-	if _, ok := runOpenCodeProbe(expired, filepath.Join(t.TempDir(), "opencode"), "models"); ok {
+	if _, ok := runOpenCodeProbe(expired, filepath.Join(t.TempDir(), "opencode"), "", "models"); ok {
 		t.Fatal("a probe under an expired context is inconclusive")
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {

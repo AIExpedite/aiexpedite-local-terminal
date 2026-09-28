@@ -278,12 +278,15 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
+		abortSessionSpawn(id)
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
 		return fmt.Errorf("failed to start claude (is `claude` on PATH?): %w", err)
 	}
+	trackSessionProcess(id, proc)
 
 	session := &ClaudeNativeSession{
 		ID:            id,
@@ -338,6 +341,7 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
 				Type:        "claude_native_error",
+				BootID:      agentBootID,
 				SessionID:   session.ID,
 				Seq:         int(seq),
 			})
@@ -584,6 +588,7 @@ func (m *ClaudeNativeManager) removeSession(id string) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
+	releaseLedgerSession(id)
 }
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
@@ -612,6 +617,7 @@ func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSess
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(m.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
@@ -659,6 +665,7 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
 			Type:        "claude_native_error",
+			BootID:      agentBootID,
 			SessionID:   session.ID,
 			Seq:         int(seq),
 		})

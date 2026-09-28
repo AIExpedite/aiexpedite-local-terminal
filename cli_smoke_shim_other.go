@@ -17,6 +17,13 @@ func configureGrokWindowsCommandLine(_ *exec.Cmd, _ string) {}
 // batch shim anything would launch.
 func isWindowsShimPath(_ string) bool { return false }
 
+// openCodeShimCommand never applies off Windows: newOpenCodeCmd only consults
+// it for an isWindowsShimPath path, which never matches here, so every OpenCode
+// spawn is the native binary.
+func openCodeShimCommand(_ context.Context, _ openCodeLaunch) (*exec.Cmd, bool) {
+	return nil, false
+}
+
 // grokSmokeShimCommand never applies off Windows.
 func grokSmokeShimCommand(_ context.Context, _ grokSmokeLaunch) (*exec.Cmd, bool) {
 	return nil, false

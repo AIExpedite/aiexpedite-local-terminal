@@ -1,0 +1,20 @@
+{
+  "_comment": [
+    "A captured signed `session_start` maintenance smoke as deployed publishers send it today.",
+    "Only the fields the compatibility test needs are kept: the command and its args.",
+    "No signature, no secret, no uid and no workspace id — the test drives",
+    "sessionStartArgsForCommand / StartSession directly, so nothing",
+    "authentication-related belongs in this file.",
+    "The marker is copied VERBATIM and treated as opaque: this repo does not own",
+    "the publisher's marker grammar, and requiring one here would leave the real",
+    "deployed request unrecognised (see validOpenCodeMaintenanceSmokePrompt)."
+  ],
+  "command": "opencode",
+  "args": [
+    "run",
+    "--pure",
+    "--format",
+    "json",
+    "Return exactly this marker and nothing else: AIEXPEDITE_OPENCODE_SMOKE_MARKER_7C1F9A"
+  ]
+}

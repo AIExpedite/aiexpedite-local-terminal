@@ -46,7 +46,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -264,7 +263,7 @@ func runCodexSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	// already in the cache, so a later rung that captures nothing must not
 	// disarm a run whose telemetry did land.
 	usageCaptured := false
-	defer func() { settleOrDisarmCodexSmokeRun(floor, evidence) }()
+	defer func() { settleOrDisarmCodexSmokeRun(floor, smokeFingerprint, evidence) }()
 
 	var lastCategory, lastDiagnostic string
 	for _, shape := range codexSmokeShapeLadder(path) {
@@ -391,12 +390,88 @@ type codexSmokeEvidence struct {
 // only defers it, because payOwedCodexUsageRefresh adopts an armed, unsettled
 // floor as an interrupted run at the next start — and the post-update restart
 // is exactly when this smoke runs.
-func settleOrDisarmCodexSmokeRun(floor time.Time, evidence codexSmokeEvidence) {
+// `armedFP` is the account that was live when the probe armed its floor, so the
+// debt this settles can be refused if the credentials changed underneath it.
+func settleOrDisarmCodexSmokeRun(floor time.Time, armedFP string, evidence codexSmokeEvidence) {
 	if evidence.usageCaptured || evidence.markerSeen || evidence.completed || codexSmokeRolloutSignal(floor) {
 		codexUsageRunSettled(floor)
+		// codexUsageRunSettled only SPAWNS a goroutine, so the debt may not be on
+		// disk when runCodexSmoke returns. A smoke is usually the last thing that
+		// happens before an update handoff replaces the process, which would take
+		// the unwritten debt with it — the reported "green smoke, stale
+		// utilization" case. Land it here, synchronously, under the same bounded
+		// write budget an arm gets. The asynchronous worker still runs; it simply
+		// no longer owns durability.
+		persistCodexSmokeRunDebt(floor, armedFP)
 		return
 	}
+	// Unchanged: a run that spent nothing writes nothing and puts the device on
+	// no ladder.
 	codexUsageRunDisarmed(floor, time.Time{})
+}
+
+// persistCodexSmokeRunDebt makes the smoke's run DEBT durable before
+// runCodexSmoke returns, on the shared bounded write budget every freshness
+// write that cannot be dropped uses (codexRetryBoundedWrite). A no-op when the
+// freshness path is disarmed (tests).
+//
+// It is idempotent with codexUsageRunSettled's own asynchronous settle, which is
+// racing it for the same run: a debt whose floor already covers this run is left
+// ALONE rather than re-owed. Re-owing would open a new generation
+// (codexOweRunRefresh resets the counters and the rung), so the two writers would
+// take turns discarding each other's bookkeeping for a run neither had spent an
+// attempt on yet.
+//
+// The debt is the guarantee; the first rung is BEST EFFORT. Whichever of the two
+// writers lands second may still replace the generation, and the worker the async
+// settle starts books the rung either way — within milliseconds, and a restart
+// that finds a debt with no rung reconciles immediately
+// (payOwedCodexUsageRefresh), which is the pre-existing behaviour. What must not
+// be lost is the debt itself: a smoke is usually the last thing that happens
+// before an update handoff replaces the process.
+//
+// A credentials change since the probe armed DROPS the debt, exactly as
+// codexRefreshAfterRun does and for the same reason: the run's telemetry is
+// unreachable (the rollout scan only reads the account live now), and booking it
+// either way is wrong — under the live account it would show a stale-run warning
+// for a run that account never made, and under the armed one it would rescope the
+// cache and discard the live account's readings.
+func persistCodexSmokeRunDebt(floor time.Time, armedFP string) {
+	if !codexUsageRefresh.isEnabled() || floor.IsZero() || codexRunLifecycleStubbed() {
+		return
+	}
+	fp := currentCodexAccountFingerprint()
+	// An empty fp is the unscoped account (no derivable identity, e.g.
+	// API-key-only auth), which owes and pays debts like any other. It is a real
+	// identity, not a missing one: this function is only ever handed the
+	// fingerprint the probe captured (settleOrDisarmCodexSmokeRun), so the
+	// comparison is unconditional. Exempting "" would let a smoke that ran under
+	// API-key auth book its debt — and its stale-run warning — against a
+	// fingerprinted account the user signed into while it was still running.
+	if armedFP != fp {
+		return
+	}
+	floorMs := floor.UnixMilli()
+	landed := codexRetryBoundedWrite(func() bool {
+		now := codexUsageFreshnessNow()
+		return codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+			codexRebaseFutureRunFreshness(snap, now, now)
+			if snap.RefreshOwedAtMs != 0 && snap.RunFloorMs >= floorMs {
+				// Already owed for this run, or for a newer one that absorbed it
+				// (the coalescing rule codexOweRunRefresh documents). Keep that
+				// generation and whatever it has already booked.
+				return
+			}
+			codexOweRunRefresh(snap, floor, now)
+		})
+	})
+	if !landed {
+		return
+	}
+	now := codexUsageFreshnessNow()
+	if state := codexRunFreshnessForAccount(fp, now); state.owed && state.nextAttemptAt.IsZero() {
+		codexScheduleRunDebtRetry(fp, state, now, codexRetryAfterScan)
+	}
 }
 
 // codexSmokeRolloutSignal reports whether a Codex rollout was written after the
@@ -419,34 +494,10 @@ func codexSmokeRolloutSignal(floor time.Time) bool {
 	return codexSmokeRolloutWalk(ctx, filepath.Join(codexHomeBase(), "sessions"), floor)
 }
 
-// codexSmokeRolloutWalk is the tree walk behind the rollout signal. A var so a
+// codexSmokeRolloutWalk is the tree walk behind the rollout signal
+// (codexRolloutWrittenAfter, cliagent_ratelimit_codex_rollout.go). A var so a
 // test can prove the walk is skipped whenever stronger evidence settled.
 var codexSmokeRolloutWalk = codexRolloutWrittenAfter
-
-// errCodexRolloutFound stops the walk at the first qualifying rollout.
-var errCodexRolloutFound = errors.New("rollout found")
-
-// codexRolloutWrittenAfter reports whether any `rollout-*.jsonl` under root was
-// modified strictly after `after`. It stops at the first hit and at ctx expiry
-// (which reads as "not found": no evidence, so the run disarms).
-func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time) bool {
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil || entry.IsDir() {
-			return nil
-		}
-		if matched, _ := filepath.Match("rollout-*.jsonl", entry.Name()); !matched {
-			return nil
-		}
-		if info, err := entry.Info(); err == nil && info.ModTime().After(after) {
-			return errCodexRolloutFound
-		}
-		return nil
-	})
-	return errors.Is(err, errCodexRolloutFound)
-}
 
 /* --------------------------------------------------------------------------
    Classification

@@ -272,7 +272,11 @@ aren't command lines and so aren't on the list: finding the git checkouts
 already in your code folder and home folder, and checking whether a checkout's
 `node_modules` still matches its `package-lock.json` (both only read files), and
 opening a sign-in window (for example `gh auth login`) that you complete
-yourself. The sign-in always asks you first, showing the exact command.
+yourself. The sign-in commands of the tools AI Expedite sets up (`gh auth login
+--web --git-protocol https`, `claude auth login`, `codex login`, `grok login
+--oauth`, `opencode auth login`, `agy`) are built into the app and open without
+asking, because you chose them on the setup card; any other sign-in asks you
+first, showing the exact command.
 
 ---
 

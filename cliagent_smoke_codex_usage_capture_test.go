@@ -64,7 +64,7 @@ func TestRunCodexSmoke_OwnFramesAdvanceObservedAtWithoutRollouts(t *testing.T) {
 	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("result = %+v, want success", result)
 	}
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
 	session := codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))
 	if got := metricObservedAt(t, session); got.Before(started.Truncate(time.Second)) {
@@ -93,9 +93,9 @@ func TestRunCodexSmoke_MarkerOnlyTurnStillOwesADebt(t *testing.T) {
 	})
 
 	runCodexSmoke(context.Background(), path, codexSmokeTestVersion)
-	waitCodexUsageRefreshIdle(t)
+	drainCodexRunDebtLadder(t)
 
-	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RefreshFallbackState != codexFallbackSpent {
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 || snap.RefreshLiveReads == 0 {
 		t.Fatalf("a marker-only turn must owe a debt that reaches its fallback: %+v", snap)
 	}
 }

@@ -15,8 +15,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -73,7 +75,13 @@ const codexRolloutReadDirChunkSize = 128
 // cursor that may already have advanced past the run's rollout, and it commits
 // through the blocking merge because dropping its evidence on lock contention
 // is exactly how a finished run's utilization went missing.
-func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
+//
+// The last return is the rollout evidence this pass gathered
+// (codexRolloutNudgeEvidence). It is handed to nudgeCodexUsageRefresh so the
+// nudge can tell "Codex wrote telemetry after our reading" without a tree walk of
+// its own — and can tell that case apart from a rollout whose telemetry this pass
+// already mined, which no re-read could advance the reading to.
+func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time, codexRolloutNudgeEvidence) {
 	codexResetRolloutCursorForVersion(ctx, currentFingerprint, now)
 	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
 	floor, forced := codexForcedReconcileFrom(ctx)
@@ -81,12 +89,12 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		cursor = codexRolloutCursorBelowFloor(cursor, floor)
 	}
 	latestCachedObservation := codexLatestContributorObservation(codexContributorsForAccount(currentFingerprint))
-	contribs, limit, latestObservation, highWater, ok, producer := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, latestCachedObservation)
+	contribs, limit, latestObservation, highWater, ok, producer, rollouts := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, latestCachedObservation)
 	// Authentication can change while filesystem I/O is in progress. Never let
 	// an old-account scan clear or overwrite a live capture already scoped to the
 	// newly active account; the next refresh will reconcile under that account.
 	if codexAccountFingerprintAtBase(base) != currentFingerprint {
-		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
+		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}, codexRolloutNudgeEvidence{}
 	}
 	if ok || highWater != nil {
 		// The forced path passes ctx so its bounded lock wait is clamped to the
@@ -99,7 +107,40 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 			codexRolloutProducerVersion(producer, currentCodexUsageCaptureVersion()), false,
 		)
 	}
-	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
+	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation, rollouts
+}
+
+// errCodexRolloutFound stops the walk at the first qualifying rollout.
+var errCodexRolloutFound = errors.New("rollout found")
+
+// codexRolloutWrittenAfter reports whether any `rollout-*.jsonl` under root was
+// modified strictly after `after`. It stops at the first hit and at ctx expiry
+// (which reads as "not found": no evidence).
+//
+// It lives here, beside the discovery it shares its layout knowledge with,
+// rather than in the smoke file that used to own it. It stays a BOOLEAN on
+// purpose: in the no-match case this visits every entry with none of the file
+// caps or resumable cursor the production scanner has, so it must only ever run
+// once per operation (the smoke's settle decision). The refresh nudge, which
+// runs per gather, takes the account-eligible mtime codexReconcileFromRollout
+// already stat-ed instead — see nudgeCodexUsageRefresh.
+func codexRolloutWrittenAfter(ctx context.Context, root string, after time.Time) bool {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		if matched, _ := filepath.Match("rollout-*.jsonl", entry.Name()); !matched {
+			return nil
+		}
+		if info, err := entry.Info(); err == nil && info.ModTime().After(after) {
+			return errCodexRolloutFound
+		}
+		return nil
+	})
+	return errors.Is(err, errCodexRolloutFound)
 }
 
 // codexRolloutCursorBelowFloor restarts a forced scan just below the run
@@ -233,6 +274,20 @@ type codexRolloutScanProgress struct {
 	futureFloorNs       int64
 	futureCeilingNs     int64
 	futureCohortSize    int
+	// pendingRolloutMtimeMs is the newest ACCOUNT-ELIGIBLE rollout mtime this pass
+	// stat-ed, carried here so it lands in the SAME write that advances the cursor
+	// over those files (nudgeCodexUsageRefresh reads it back).
+	//
+	// It has to be atomic with the cursor, not a follow-up write: the cursor is what
+	// makes a rollout stop being reported, so a gap between the two — a refused
+	// write, a failed commit, or the process exiting between transactions — leaves a
+	// consumed file with no record that anything still owes attention to it, and an
+	// unmanaged run whose telemetry is unreadable then has no trigger at all. Zero
+	// when the pass did not complete or found nothing eligible.
+	pendingRolloutMtimeMs int64
+	// pendingRolloutEntry identifies the file pendingRolloutMtimeMs came from
+	// (codexRolloutBacklogEntryDigest), persisted with it for the same reason.
+	pendingRolloutEntry string
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -1801,7 +1856,7 @@ func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now ti
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
 func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool) {
-	contribs, limit, latest, highWater, ok, _ := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, priorObservations...)
+	contribs, limit, latest, highWater, ok, _, _ := codexRolloutFallbackBucketsWithProducer(ctx, base, now, cursor, priorObservations...)
 	return contribs, limit, latest, highWater, ok
 }
 
@@ -1813,9 +1868,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 // rollouts — and ones a pre-upgrade process is still appending to — are
 // rescanned, and crediting their telemetry to the new build would clear
 // capture drift that is still real.
-func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool, string) {
+//
+// It also reports what the refresh nudge needs about the tree it walked —
+// codexRolloutNudgeEvidence: the newest candidate that passed the account-login
+// guard (codexRolloutSessionMatchesAuth) and still owes telemetry, and the newest
+// one whose telemetry this pass mined and so covers itself.
+func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool, string, codexRolloutNudgeEvidence) {
 	if base == "" {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
 	}
 	// auth.json mtime is the account-login watermark (zero = missing → guard
 	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
@@ -1839,14 +1899,14 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// it; once the clock or file timestamp is corrected, the unchanged rollout
 	// remains eligible for a retry.
 	if authMod.After(now) {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
 	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
 	cancelDiscovery()
 	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
 	}
 	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
 	if len(eligibleCandidates) == 0 {
@@ -1868,9 +1928,9 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 					codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now),
 				)
 			}
-			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false, ""
+			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false, "", codexRolloutNudgeEvidence{}
 		}
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, ""
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false, "", codexRolloutNudgeEvidence{}
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -1913,6 +1973,36 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// be held eligible on its own rather than by voiding the whole pass.
 	var limitEntry string
 	var latestObservation time.Time
+	// The newest mtime among candidates this pass accepted as the CURRENT
+	// account's and whose telemetry it did NOT mine, reported to the refresh
+	// nudge. Only files that cleared the login guard count, so a previous
+	// account's still-appending session cannot contribute one.
+	var newestUncoveredMtime time.Time
+	// Identity (codexRolloutBacklogEntryDigest) of that same file, so the nudge
+	// can later tell whether a pass that mines telemetry mined it from THIS file.
+	var newestUncoveredEntry string
+	// The accepted candidates whose telemetry this pass mined
+	// CONTEMPORANEOUSLY with their newest write. A rollout's embedded observation
+	// timestamp is stamped just before the write that advances its mtime, and the
+	// same turn's trailing records widen the gap by moments, so the reading this
+	// pass just merged is normally a little BEHIND the file it came from.
+	// Reporting that file as owing a refresh would floor a debt no re-read could
+	// ever satisfy — the ladder would spend every scan and live read on it and
+	// could end in a false stale warning.
+	//
+	// Coverage is judged per file against codexRolloutCoverageLag rather than
+	// granted to any file that yielded a frame: `ok` says the rollout holds some
+	// usable window, NOT that its latest turn emitted one. A multi-turn rollout
+	// whose earlier turn stated telemetry and whose later turn appended only
+	// completion records advances its mtime well past the frame we hold, and that
+	// later turn — whose utilization really is missing — is exactly the run the
+	// nudge exists to notice.
+	//
+	// Kept per file identity, never as one newest mtime: with overlapping
+	// sessions a covered file B can carry a later mtime than an uncovered file A
+	// whose run B's reading predates, and ordering the two mtimes would call A
+	// covered on B's account.
+	coveredEntries := map[string]time.Time{}
 	for _, observed := range priorObservations {
 		if observed.After(latestObservation) {
 			latestObservation = observed
@@ -1964,7 +2054,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		}
 		attempted = append(attempted, c)
 		fileCtx, cancelFile := codexRolloutFileContext(ctx, len(selected)-i-1)
-		buckets, sessionStart, fileLimit, handled, ok, producer := codexBucketsFromRolloutFileWithProducer(fileCtx, c.path, now)
+		buckets, sessionStart, fileLimit, handled, ok, producer, coverage := codexBucketsFromRolloutFileWithProducer(fileCtx, c.path, now)
 		cancelFile()
 		retryEntry := codexRolloutBacklogEntryDigest(c)
 		retry := !handled
@@ -1997,6 +2087,20 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 			retryEntries[retryEntry] = struct{}{}
 		} else {
 			delete(retryEntries, retryEntry)
+		}
+		// Past the login guard: this file is the current account's, so its mtime
+		// may floor a nudged debt — unless this pass mined telemetry stamped
+		// alongside that very write (a usable window, or the refusal that
+		// explains its absence), in which case the reading already carries
+		// everything the file has to say and only a LATER write could owe
+		// anything. A frame left behind by an EARLIER turn does not cover the
+		// appends that followed it. Split here — before the no-buckets skip below
+		// — because a rollout Codex has written but whose telemetry frame has not
+		// landed yet is exactly the run the nudge exists to notice.
+		if codexRolloutMinedCoversMtime(coverage, c.mtime) {
+			coveredEntries[retryEntry] = c.mtime
+		} else if c.mtime.After(newestUncoveredMtime) {
+			newestUncoveredMtime, newestUncoveredEntry = c.mtime, retryEntry
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
@@ -2141,13 +2245,19 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		progress.futureCursor = futureCursor
 		progress.futureCohortSize = futureCohortSize
 		progress.futureComplete = futureComplete
+		// The evidence rides with the progress so the write that CONSUMES these
+		// files also records that one of them may still owe a refresh.
+		if eligible := codexEligibleMtimeFor(newestUncoveredMtime, progressComplete); !eligible.IsZero() {
+			progress.pendingRolloutMtimeMs = eligible.UnixMilli()
+			progress.pendingRolloutEntry = newestUncoveredEntry
+		}
 		highWater = &progress
 	}
 	if len(winners) == 0 {
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, latestObservation, highWater, false, ""
+		return nil, limit, latestObservation, highWater, false, "", codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
 	// displayed identities onto their canonical cache slots while preserving the
@@ -2188,7 +2298,185 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	if !producerKnown {
 		producer = ""
 	}
-	return acc, limit, latestObservation, highWater, true, producer
+	return acc, limit, latestObservation, highWater, true, producer, codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+}
+
+// codexRolloutNudgeEvidence is what a rollout scan tells the refresh nudge about
+// the tree it just walked (nudgeCodexUsageRefresh), so the nudge needs no
+// filepath.WalkDir of its own on a path that runs every ~30 s.
+//
+// Both fields are ACCOUNT-ELIGIBLE newest mtimes rather than the newest raw
+// stat: a previous account's session keeps appending after a `codex login`, so
+// binding that mtime to the live fingerprint would invent a debt the new account
+// can never pay.
+type codexRolloutNudgeEvidence struct {
+	// newest is the newest eligible rollout whose telemetry this pass did NOT
+	// mine — the one that may still owe a refresh. Zero when the pass was cut
+	// short by its budget or found no such file.
+	newest time.Time
+	// newestEntry identifies the file `newest` came from
+	// (codexRolloutBacklogEntryDigest — a digest, never the path). It is held
+	// beside the mtime so a later pass can release exactly that evidence.
+	newestEntry string
+	// covered holds, per file identity, the eligible rollouts this pass DID mine
+	// telemetry from, with each one's mtime. Evidence naming one of them is
+	// satisfied: the reading carries that rollout's own frames, which are stamped
+	// before the write that set its mtime, so re-reading the file can never
+	// advance the reading to its mtime. Keyed by file rather than reduced to one
+	// newest mtime, because another session's covered file says nothing about
+	// this one. Reported even when the pass was cut short — a file whose
+	// telemetry was merged stays covered however the rest of the walk ended.
+	covered map[string]time.Time
+}
+
+// covers reports whether this pass mined telemetry covering the rollout
+// identified by entry as of heldMs, the (millisecond) mtime the evidence was
+// recorded at. An empty entry names no file and is never covered.
+//
+// Identity alone is not enough: concurrent reconciles can inspect different
+// generations of the same file. A pass that mined it at T1 says nothing about
+// a telemetry-free append at T2 that another pass recorded (atomically with
+// advancing its cursor, so it will not be reported again) — releasing that on
+// T1's coverage would drop the only trigger that run ever gets. So the mtime
+// this pass covered must reach the held one.
+func (e codexRolloutNudgeEvidence) covers(entry string, heldMs int64) bool {
+	if entry == "" {
+		return false
+	}
+	mtime, ok := e.covered[entry]
+	return ok && mtime.UnixMilli() >= heldMs
+}
+
+// codexRolloutCoverageLag is how far a rollout's mtime may sit ahead of the
+// newest telemetry this pass mined from it and still count as covered by that
+// reading. A telemetry frame is stamped just before the write that carries it,
+// and the same turn's trailing records (completion events, reasoning items)
+// land within moments — that is the ordinary gap coverage exists to forgive.
+// A wider one means a LATER turn appended without telemetry of its own, so the
+// reading we hold predates the run whose utilization is missing and the file
+// still owes a refresh. Matched to codexRunFloorLocalSkew: both bound how far
+// apart two stamps written around the same moment by the same local clock may
+// legitimately sit.
+const codexRolloutCoverageLag = codexRunFloorLocalSkew
+
+// codexRolloutMinedObservationAt reports the newest moment this pass mined from
+// ONE rollout file: the latest timestamped bucket observation, or the quota
+// refusal that explains their absence. Zero when the file yielded neither a
+// stamped reading nor a refusal — a window with no observation time anchors
+// nothing, so it can cover no write.
+func codexRolloutMinedObservationAt(buckets map[string]map[string]codexRateLimitBucket, limit codexUsageLimitEvidence) time.Time {
+	var newest time.Time
+	for _, limits := range buckets {
+		for _, b := range limits {
+			if b.ObservedAtMs <= 0 {
+				continue
+			}
+			if observed := time.UnixMilli(b.ObservedAtMs); observed.After(newest) {
+				newest = observed
+			}
+		}
+	}
+	if limit.At.After(newest) {
+		newest = limit.At
+	}
+	return newest
+}
+
+// codexRolloutCoverage is what one file's scan knows about whether the telemetry
+// it mined accounts for that file's newest write.
+type codexRolloutCoverage struct {
+	// minedAt is the newest stamped observation (or quota refusal) this pass
+	// mined from the file; zero when it yielded neither.
+	minedAt time.Time
+	// laterTurn: a turn-start record follows that telemetry in the file, so a
+	// run the file has already recorded is still unaccounted for.
+	laterTurn bool
+}
+
+// codexRolloutMinedCoversMtime answers whether the telemetry this pass mined
+// accounts for a rollout whose newest write is mtime.
+//
+// Two independent conditions, and both are load-bearing:
+//
+//   - No turn began after that telemetry. Codex opens each turn with its own
+//     record (codexRolloutTurnStartTypes), so this asks the direct question —
+//     did a later run append without telemetry of its own? — rather than
+//     guessing it from timestamps. A later turn that FINISHES quickly leaves its
+//     trailing records within moments of the previous turn's frame, and no time
+//     tolerance can tell those from that frame's own trailing records.
+//   - The mtime is still within codexRolloutCoverageLag of the telemetry, which
+//     bounds a build whose turn-start record this scan does not recognise. A
+//     wider gap then reads as uncovered, the fail-safe direction: the file
+//     becomes nudge evidence and the debt reaches the live read.
+func codexRolloutMinedCoversMtime(cov codexRolloutCoverage, mtime time.Time) bool {
+	if cov.minedAt.IsZero() || cov.laterTurn {
+		return false
+	}
+	return !mtime.After(cov.minedAt.Add(codexRolloutCoverageLag))
+}
+
+// codexRolloutTurnStartTypes are the records Codex writes when a turn begins: a
+// `turn_context` carrying the turn's settings, and the `user_message` event that
+// opens it. Either one proves a NEW run started at that point in the file, which
+// is what separates an unaccounted-for turn from the trailing records of the
+// turn whose telemetry this pass already holds.
+var codexRolloutTurnStartTypes = []string{"turn_context", "user_message"}
+
+// codexRolloutLineStartsTurn reports whether a rollout record opens a turn. The
+// literal prefilter leaves the common record — which is neither — undecoded, the
+// same shape as the bucket and refusal gates above it.
+func codexRolloutLineStartsTurn(line string) bool {
+	matched := false
+	for _, t := range codexRolloutTurnStartTypes {
+		if strings.Contains(line, t) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	var envelope struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type string `json:"type"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal([]byte(line), &envelope) != nil {
+		return false
+	}
+	for _, t := range codexRolloutTurnStartTypes {
+		// The type sits on the envelope (`turn_context`) or on the payload of an
+		// `event_msg` (`user_message`); a record carrying the word anywhere else —
+		// a prompt quoting it, say — decodes to neither and is not a turn.
+		if envelope.Type == t || envelope.Payload.Type == t {
+			return true
+		}
+	}
+	return false
+}
+
+// codexRolloutNudgeEvidenceFor pairs the uncovered and covered rollouts,
+// withholding only `newest` on an unfinished pass (codexEligibleMtimeFor).
+func codexRolloutNudgeEvidenceFor(newest time.Time, newestEntry string, covered map[string]time.Time, complete bool) codexRolloutNudgeEvidence {
+	evidence := codexRolloutNudgeEvidence{newest: codexEligibleMtimeFor(newest, complete), covered: covered}
+	if !evidence.newest.IsZero() {
+		evidence.newestEntry = newestEntry
+	}
+	return evidence
+}
+
+// codexEligibleMtimeFor withholds the newest account-eligible rollout mtime
+// unless the pass actually finished. A pass cut short by its discovery or
+// selection budget has not seen the whole tree, and the nudge would then floor a
+// debt at whatever partial newest it happened to reach — asking for telemetry
+// that a file it never opened may already hold. Zero simply means "no nudge this
+// pass", which the next one retries.
+func codexEligibleMtimeFor(newest time.Time, complete bool) time.Time {
+	if !complete {
+		return time.Time{}
+	}
+	return newest
 }
 
 // codexRolloutReadingBeats orders two readings of the same (identity, limit)
@@ -2398,20 +2686,20 @@ func codexRolloutSessionStartPrefix(f *os.File) (time.Time, string) {
 var codexOpenRolloutFile = os.Open
 
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
-	buckets, sessionStart, limit, handled, ok, _ := codexBucketsFromRolloutFileWithProducer(ctx, path, now)
+	buckets, sessionStart, limit, handled, ok, _, _ := codexBucketsFromRolloutFileWithProducer(ctx, path, now)
 	return buckets, sessionStart, limit, handled, ok
 }
 
 // codexBucketsFromRolloutFileWithProducer is codexBucketsFromRolloutFile plus
 // the header's `cli_version` — the build that wrote this file ("" when the
 // header records none or could not be read).
-func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool, string) {
+func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool, string, codexRolloutCoverage) {
 	f, err := codexOpenRolloutFile(path)
 	if err != nil {
 		// Only a file that definitively vanished is handled progress. Permission
 		// failures, descriptor exhaustion, and other open errors can be transient;
 		// advancing the watermark past them would suppress a later successful read.
-		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false, ""
+		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false, "", codexRolloutCoverage{}
 	}
 	defer f.Close()
 
@@ -2439,7 +2727,17 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 	var pendingInferred map[string]interface{}
 	statedFrameSeen := false
 	finalRecordSeen := false
+	// turnAfterTelemetry: a turn began after the newest telemetry this pass has
+	// mined so far, so the reading in hand predates a run the file has already
+	// recorded. Set by a turn-start record, cleared by every reading (a merged
+	// window or a quota refusal) that follows one. Read by
+	// codexRolloutMinedCoversMtime — a time gap alone cannot tell a turn
+	// boundary from the same turn's trailing records.
+	turnAfterTelemetry := false
 	consumeLine := func(line string) {
+		if codexRolloutLineStartsTurn(line) {
+			turnAfterTelemetry = true
+		}
 		// Any later record — telemetry or not — invalidates a pending candidate.
 		// The mtime describes the file's newest append and nothing else, so only
 		// the file's FINAL record can honestly claim it. Appending a completion
@@ -2452,8 +2750,14 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
 		// these lines are exactly the ones the bucket scan discards.
-		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok && ev.At.After(limit.At) {
-			limit = ev
+		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok {
+			// A refusal IS this turn's telemetry: it is the reading that explains the
+			// absent window (codexRolloutMinedObservationAt folds it in), so the turn
+			// it belongs to is no longer unaccounted for.
+			turnAfterTelemetry = false
+			if ev.At.After(limit.At) {
+				limit = ev
+			}
 		}
 		// Cheap prefilter: only decode lines that could carry a window update.
 		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
@@ -2508,6 +2812,9 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 			// Liveness for sparse-merge is judged at the frame's own event
 			// time so an expired prior reset isn't carried onto fresh usage.
 			mergeCodexRolloutFrame(acc, updates, eventTime)
+			// This turn's window is now in hand, so nothing before the next
+			// turn-start record is unaccounted for.
+			turnAfterTelemetry = false
 		}
 	}
 	var size int64
@@ -2618,22 +2925,26 @@ func codexBucketsFromRolloutFileWithProducer(ctx context.Context, path string, n
 			mergeCodexRolloutFrame(acc, updates, inferredAt)
 		}
 	}
+	coverage := codexRolloutCoverage{
+		minedAt:   codexRolloutMinedObservationAt(acc, limit),
+		laterTurn: turnAfterTelemetry,
+	}
 	if !handled {
-		return acc, sessionStart, limit, false, len(acc) > 0, producer
+		return acc, sessionStart, limit, false, len(acc) > 0, producer, coverage
 	}
 	if len(acc) == 0 {
 		// ok=false means "no usable window here", NOT "nothing here": a log whose
 		// every turn was refused for quota is precisely the case that produces no
 		// buckets AND the evidence the card needs, so the evidence is returned
 		// alongside the miss.
-		return nil, sessionStart, limit, true, false, producer
+		return nil, sessionStart, limit, true, false, producer, coverage
 	}
 	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
 	// whose reset already passed as of `now` is applied by the display path
 	// (codexAggregateIdentity), so a stale relative reset anchored above still
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
-	return acc, sessionStart, limit, true, true, producer
+	return acc, sessionStart, limit, true, true, producer, coverage
 }
 
 func codexRolloutOpenFailureHandled(err error) bool {

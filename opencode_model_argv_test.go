@@ -8,9 +8,10 @@
 // each fails silently on its own:
 //
 //  1. buildOpenCodeInteractiveArgs must forward `--model` WITH ITS VALUE into
-//     the forced `run --format json --model <m> <prompt>` order. A value left
-//     behind is read as prompt text and the model silently reverts to
-//     OpenCode's default — the run completes, on the wrong model.
+//     the forced `run --format json --model <m>` order, returning the prompt
+//     separately for the child's stdin. A value left behind is read as prompt
+//     text and the model silently reverts to OpenCode's default — the run
+//     completes, on the wrong model.
 //  2. gateSessionEntryCommand must gate against that SYNTHESISED argv, not the
 //     raw one, so the narrow `opencode run --format json *` allowlist entry
 //     matches the argv the device will actually exec. Gating raw args instead
@@ -37,59 +38,136 @@ const openCodeTestModel = "anthropic/claude-sonnet-4-5"
 
 func TestBuildOpenCodeInteractiveArgs_ForwardsModel(t *testing.T) {
 	cases := []struct {
-		name string
-		in   []string
-		want []string
+		name       string
+		in         []string
+		want       []string
+		wantPrompt string
 	}{
 		{
-			name: "spaced --model keeps its value and lands before the prompt",
-			in:   []string{"--model", openCodeTestModel, "implement the feature"},
-			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "implement the feature"},
+			name:       "spaced --model keeps its value; the prompt leaves argv",
+			in:         []string{"--model", openCodeTestModel, "implement the feature"},
+			want:       []string{"run", "--format", "json", "--model", openCodeTestModel},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "inline --model=value is forwarded as one token",
-			in:   []string{"--model=" + openCodeTestModel, "implement the feature"},
-			want: []string{"run", "--format", "json", "--model=" + openCodeTestModel, "implement the feature"},
+			name:       "inline --model=value is forwarded as one token",
+			in:         []string{"--model=" + openCodeTestModel, "implement the feature"},
+			want:       []string{"run", "--format", "json", "--model=" + openCodeTestModel},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "short -m keeps its value",
-			in:   []string{"-m", openCodeTestModel, "implement the feature"},
-			want: []string{"run", "--format", "json", "-m", openCodeTestModel, "implement the feature"},
+			name:       "short -m keeps its value",
+			in:         []string{"-m", openCodeTestModel, "implement the feature"},
+			want:       []string{"run", "--format", "json", "-m", openCodeTestModel},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "a colon-bearing model id survives intact",
-			in:   []string{"--model", "ollama/llama3:8b", "implement the feature"},
-			want: []string{"run", "--format", "json", "--model", "ollama/llama3:8b", "implement the feature"},
+			name:       "a colon-bearing model id survives intact",
+			in:         []string{"--model", "ollama/llama3:8b", "implement the feature"},
+			want:       []string{"run", "--format", "json", "--model", "ollama/llama3:8b"},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "a caller-supplied `run` is not duplicated",
-			in:   []string{"run", "--model", openCodeTestModel, "implement the feature"},
-			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "implement the feature"},
+			name:       "a caller-supplied `run` is not duplicated",
+			in:         []string{"run", "--model", openCodeTestModel, "implement the feature"},
+			want:       []string{"run", "--format", "json", "--model", openCodeTestModel},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "a multi-word prompt stays trailing, after the flags",
-			in:   []string{"--model", openCodeTestModel, "implement", "the", "feature"},
-			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "implement", "the", "feature"},
+			name:       "a multi-word prompt is joined into the stdin prompt",
+			in:         []string{"--model", openCodeTestModel, "implement", "the", "feature"},
+			want:       []string{"run", "--format", "json", "--model", openCodeTestModel},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "--variant (reasoning effort) keeps its value beside --model",
-			in:   []string{"--model", openCodeTestModel, "--variant", "high", "implement the feature"},
-			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "--variant", "high", "implement the feature"},
+			name:       "--variant (reasoning effort) keeps its value beside --model",
+			in:         []string{"--model", openCodeTestModel, "--variant", "high", "implement the feature"},
+			want:       []string{"run", "--format", "json", "--model", openCodeTestModel, "--variant", "high"},
+			wantPrompt: "implement the feature",
 		},
 		{
-			name: "no model pins OpenCode's own default",
-			in:   []string{"implement the feature"},
-			want: []string{"run", "--format", "json", "implement the feature"},
+			name:       "no model pins OpenCode's own default",
+			in:         []string{"implement the feature"},
+			want:       []string{"run", "--format", "json"},
+			wantPrompt: "implement the feature",
+		},
+		{
+			// Arity is never guessed: nothing tells us whether an unlearned
+			// option is boolean or consumes the next token. The FLAG is
+			// forwarded; a SEPARATE operand stays with the prompt, because
+			// moving it onto argv when the option turns out to be boolean would
+			// split the prompt across argv and stdin and expose prompt text in a
+			// process listing. A bare option OpenCode needs an operand for is
+			// then refused and classifies as flag_rejected — a precise
+			// diagnostic instead of a fused failure.
+			name:       "an unlearned caller flag is forwarded and its separate operand stays with the prompt",
+			in:         []string{"--not-a-known-flag", "someValue", "implement the feature"},
+			want:       []string{"run", "--format", "json", "--not-a-known-flag"},
+			wantPrompt: "someValue implement the feature",
+		},
+		{
+			// The documented escape hatch for the case above: `--flag=value` is
+			// unambiguous, so an unlearned option's value IS forwarded intact
+			// and nothing leaks into the prompt. This is what a caller sends
+			// (and what a reviewer should reach for) before this repo has
+			// learned a newly shipped OpenCode option.
+			name:       "an unlearned caller flag keeps an inline value intact",
+			in:         []string{"--not-a-known-flag=someValue", "implement the feature"},
+			want:       []string{"run", "--format", "json", "--not-a-known-flag=someValue"},
+			wantPrompt: "implement the feature",
+		},
+		{
+			// Manager-owned positions are still taken away with their values.
+			name:       "manager-owned flags are stripped with their values",
+			in:         []string{"--format", "text", "--session", "ses_someoneElse", "--continue", "--fork", "abc", "--print-logs", "do it"},
+			want:       []string{"run", "--format", "json"},
+			wantPrompt: "do it",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildOpenCodeInteractiveArgs(tc.in)
+			got, prompt := buildOpenCodeInteractiveArgs(tc.in)
 			if strings.Join(got, "\x00") != strings.Join(tc.want, "\x00") {
 				t.Fatalf("buildOpenCodeInteractiveArgs(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 			}
+			if prompt != tc.wantPrompt {
+				t.Fatalf("stdin prompt = %q, want %q", prompt, tc.wantPrompt)
+			}
+			// The forced prefix is the shared builder's, never re-listed here.
+			forced := buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+			if strings.Join(got[:len(forced)], "\x00") != strings.Join(forced, "\x00") {
+				t.Fatalf("argv %q does not lead with the forced shape %q", got, forced)
+			}
+			// The prompt must never appear on argv — a process listing any local
+			// user can read would otherwise carry it.
+			for _, a := range got {
+				if tc.wantPrompt != "" && a == tc.wantPrompt {
+					t.Fatalf("prompt %q reached argv: %q", tc.wantPrompt, got)
+				}
+			}
 		})
+	}
+}
+
+func TestBuildOpenCodeInteractiveArgs_ForwardsUnknownFlagsAndStripsOwnedOnes(t *testing.T) {
+	// One strip policy (openCodeStrippedCallerFlagAt): every manager-owned flag
+	// goes with its value, a caller's duplicate `run` is dropped, and an
+	// unlearned flag survives — its separate operand stays with the prompt,
+	// never dropped and never re-ordered onto argv.
+	got, prompt := buildOpenCodeInteractiveArgs([]string{
+		"run", "--format", "json", "--session", "ses_x", "--fork", "abc",
+		"--continue", "--print-logs", "--model", openCodeTestModel,
+		"--not-a-known-flag", "someValue",
+	})
+	want := []string{"run", "--format", "json", "--model", openCodeTestModel, "--not-a-known-flag"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("buildOpenCodeInteractiveArgs\n got %q\nwant %q", got, want)
+	}
+	// `someValue` cannot be re-ordered ahead of the prompt (the flag's arity is
+	// unknown), so it lands in the prompt rather than being dropped.
+	if prompt != "someValue" {
+		t.Fatalf("stdin prompt = %q, want the unknown flag's trailing token", prompt)
 	}
 }
 
@@ -103,9 +181,12 @@ func TestBuildOpenCodeInteractiveArgs_DiagnosticsPassThroughUnshaped(t *testing.
 		{"auth", "list"},
 		{"serve"},
 	} {
-		got := buildOpenCodeInteractiveArgs(args)
+		got, prompt := buildOpenCodeInteractiveArgs(args)
 		if strings.Join(got, "\x00") != strings.Join(args, "\x00") {
 			t.Errorf("diagnostic %q was reshaped to %q; want verbatim", args, got)
+		}
+		if prompt != "" {
+			t.Errorf("diagnostic %q produced a stdin prompt %q", args, prompt)
 		}
 	}
 }
@@ -131,7 +212,7 @@ func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 	t.Cleanup(func() { commandApprovalDialogFn = prevDialog })
 
 	rawArgs := []string{"--model", openCodeTestModel, "implement the feature"}
-	shaped := buildOpenCodeInteractiveArgs(rawArgs)
+	shaped, _ := buildOpenCodeInteractiveArgs(rawArgs)
 
 	// Inbound execute request MUST be gated by approval dialog in both modes.
 	if !shouldGateExecuteCommand(signedCfg, al, "opencode", shaped) {
@@ -167,18 +248,24 @@ func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 	}
 }
 
-func TestOpenCodeStub_ReceivesShapedModelArgv(t *testing.T) {
+func TestOpenCodeStub_ReceivesShapedModelArgvAndStdinPrompt(t *testing.T) {
 	// End-to-end against the stub executable: the shaped argv is what the
-	// process actually receives, in order.
+	// process actually receives, in order — and the prompt arrives on stdin
+	// rather than on the command line.
 	installOpenCodeStub(t)
 
-	argvLog := filepath.Join(t.TempDir(), "argv.log")
+	dir := t.TempDir()
+	argvLog := filepath.Join(dir, "argv.log")
+	stdinLog := filepath.Join(dir, "stdin.log")
 	t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
+	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
 
-	shaped := buildOpenCodeInteractiveArgs(
+	shaped, prompt := buildOpenCodeInteractiveArgs(
 		[]string{"--model", openCodeTestModel, "implement the feature"},
 	)
-	if err := exec.Command("opencode", shaped...).Run(); err != nil {
+	cmd := exec.Command("opencode", shaped...)
+	cmd.Stdin = strings.NewReader(prompt)
+	if err := cmd.Run(); err != nil {
 		t.Fatalf("stub run failed: %v", err)
 	}
 
@@ -192,16 +279,21 @@ func TestOpenCodeStub_ReceivesShapedModelArgv(t *testing.T) {
 		"run",
 		"--format json",
 		"--model " + openCodeTestModel,
-		"implement the feature",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("stub argv %q is missing %q", got, want)
 		}
 	}
-	// Order matters: the prompt must trail the flags, or OpenCode reads the
-	// model id as prompt text.
-	if strings.Index(got, openCodeTestModel) > strings.Index(got, "implement the feature") {
-		t.Errorf("stub argv %q put the prompt before the --model value", got)
+	if strings.Contains(got, "implement the feature") {
+		t.Errorf("stub argv %q carries the prompt; it must travel on stdin", got)
+	}
+
+	delivered, err := os.ReadFile(stdinLog)
+	if err != nil {
+		t.Fatalf("read stdin log: %v", err)
+	}
+	if strings.TrimSpace(string(delivered)) != "implement the feature" {
+		t.Errorf("stub stdin = %q, want the prompt", string(delivered))
 	}
 }
 
