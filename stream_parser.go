@@ -567,9 +567,15 @@ func extractContentArray(raw map[string]interface{}) string {
 // frame boundary would split a word. A newline inside a Claude
 // `IMPLEMENTATION COMPLETE` marker made it unparseable for the orchestrator
 // (`IMPLEMENT` / `ATION COMPLETE`, `Counts: New 0,` / ` Updated 2`).
+//
+// agentText marks text the CLI streamed as the assistant's own output (a Muse
+// text delta or its terminal text). Only those entries feed the streamed-
+// credential carry in streamRedactionCarrier: an interleaved stderr line or
+// login banner must not become the value a held `api_key=` label binds to.
 type streamBatchEntry struct {
-	text     string
-	fragment bool
+	text      string
+	fragment  bool
+	agentText bool
 }
 
 // joinStreamBatch concatenates a publish batch. Two adjacent fragments join

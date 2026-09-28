@@ -652,3 +652,63 @@ func TestCheckMuseCodeLegacyPromptSize(t *testing.T) {
 		t.Fatalf("diagnostic argv must pass: %v", err)
 	}
 }
+
+// The generic session_start / takeover path merges stdout and stderr
+// asynchronously, so an unrelated line can land between the two halves of a
+// credential. The held tail must stay out of the display batch: binding
+// `META_API_KEY=` to `warning: retrying` would publish the label masked and let
+// the real value stream later, unlabelled and too short for the blob shape.
+func TestStreamRedactionCarrier_UnrelatedLineDoesNotConsumeTheCarry(t *testing.T) {
+	var c streamRedactionCarrier
+
+	first := joinStreamBatch(c.rewrite([]streamBatchEntry{
+		{text: "running tool: META_API_KEY=", fragment: true, agentText: true},
+	}, false))
+	if strings.Contains(first, "API_KEY=") {
+		t.Fatalf("the dangling label must be held, got %q", first)
+	}
+	if c.carry == "" {
+		t.Fatal("the carry must be held in the carrier, not the batch")
+	}
+
+	// An interleaved stderr line publishes on its own and leaves the carry be.
+	second := joinStreamBatch(c.rewrite([]streamBatchEntry{
+		{text: "warning: retrying"},
+	}, false))
+	if second != "warning: retrying" {
+		t.Fatalf("unrelated output must pass through verbatim, got %q", second)
+	}
+	if !strings.Contains(c.carry, "API_KEY=") {
+		t.Fatalf("the carry must survive unrelated output, got %q", c.carry)
+	}
+
+	// The value finally arrives as agent text and is masked with its label.
+	third := joinStreamBatch(c.rewrite([]streamBatchEntry{
+		{text: "mk-live-0123456789abcdef\n", fragment: true, agentText: true},
+	}, true))
+	joined := first + second + third
+	if strings.Contains(joined, "0123456789abcdef") {
+		t.Fatalf("the split credential value leaked: %q", joined)
+	}
+	if !strings.Contains(joined, "running tool: ") {
+		t.Fatalf("the safe prefix must still be published: %q", joined)
+	}
+	if c.carry != "" {
+		t.Fatalf("the final flush must release the carry, got %q", c.carry)
+	}
+}
+
+// A stream that ends while a tail is held — and whose last batch carries no
+// agent text at all — must still publish that tail.
+func TestStreamRedactionCarrier_FinalFlushReleasesHeldTail(t *testing.T) {
+	var c streamRedactionCarrier
+	if got := joinStreamBatch(c.rewrite([]streamBatchEntry{
+		{text: "plan is ready api_key", fragment: true, agentText: true},
+	}, false)); got != "plan is ready " {
+		t.Fatalf("got %q", got)
+	}
+	got := joinStreamBatch(c.rewrite(nil, true))
+	if got != "api_key" {
+		t.Fatalf("the held tail must be released on the final flush, got %q", got)
+	}
+}

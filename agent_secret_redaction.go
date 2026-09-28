@@ -165,3 +165,54 @@ func maskOpaqueContinuation(text string, publishedRun int) (string, int) {
 	}
 	return text, tail
 }
+
+// streamRedactionCarrier applies the streamed-credential redaction to a display
+// batch whose entries interleave the agent's own stream text with unrelated
+// lines (stderr, a login banner, a non-JSON error). The ambiguous tail lives
+// HERE, not in the batch: re-queuing `META_API_KEY=` as batch text let the next
+// unrelated line become the value it bound to, so the label published masked
+// while the real key streamed later on its own, unlabelled and too short for
+// the opaque-blob shape. Keeping the carry out of band means unrelated output
+// passes through untouched and the label still meets its value.
+type streamRedactionCarrier struct {
+	carry string
+	// publishedRun is the opaque run the last published agent text ended
+	// with — see maskOpaqueContinuation.
+	publishedRun int
+}
+
+// rewrite redacts entries in arrival order. An agentText entry joins the held
+// carry, feeds the continuation state, and (unless final) leaves a new
+// credential-shaped tail behind; every other entry is redacted on its own and
+// leaves the carry untouched. final releases the carry, so nothing is lost when
+// the stream ends — including when the last batch carries no agent text at all.
+func (c *streamRedactionCarrier) rewrite(entries []streamBatchEntry, final bool) []streamBatchEntry {
+	out := make([]streamBatchEntry, 0, len(entries)+1)
+	released := false
+	for _, entry := range entries {
+		if !entry.agentText {
+			if text := redactAgentSecrets(entry.text); text != "" {
+				out = append(out, streamBatchEntry{text: text, fragment: entry.fragment})
+			}
+			continue
+		}
+		text := c.carry + entry.text
+		c.carry = ""
+		released = true
+		if !final {
+			text, c.carry = splitRedactionCarry(text)
+		}
+		if text == "" {
+			continue
+		}
+		text, c.publishedRun = maskOpaqueContinuation(text, c.publishedRun)
+		out = append(out, streamBatchEntry{text: redactAgentSecrets(text), fragment: entry.fragment, agentText: true})
+	}
+	if final && !released && c.carry != "" {
+		text, run := maskOpaqueContinuation(c.carry, c.publishedRun)
+		c.publishedRun = run
+		c.carry = ""
+		out = append(out, streamBatchEntry{text: redactAgentSecrets(text), fragment: true, agentText: true})
+	}
+	return out
+}

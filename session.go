@@ -1935,38 +1935,35 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
-	// flushBatchTail publishes the accumulated display text. final releases a
-	// held-back redaction carry (see below) and is set only by the all-readers-
-	// done flush, so no text is lost when the stream ends.
-	// musePublishedRun feeds maskOpaqueContinuation across Muse flushes.
-	var musePublishedRun int
+	// flushBatchTail publishes the accumulated display text. final releases the
+	// held-back redaction carry and is set only by the all-readers-done flush,
+	// so no text is lost when the stream ends.
+	// museRedaction holds that carry for the Muse path (see below) OUT of the
+	// batch, so an interleaved stderr line cannot consume a held label's
+	// context — stdout and stderr merge asynchronously into `lines` here.
+	var museRedaction streamRedactionCarrier
 	flushBatchTail := func(final bool) {
-		if len(batch) == 0 {
+		if len(batch) == 0 && museRedaction.carry == "" {
 			return
 		}
-		output := joinStreamBatch(batch)
-		batch = batch[:0]
+		var output string
 		// Muse Code on the generic session_start / takeover path: the native
 		// one-shot manager redacts every frame it publishes, but this PTY path
 		// publishes joined display text verbatim, so a tool echoing an
 		// inherited META_API_KEY would reach the cloud unmasked. The same pass
-		// runs here, with a credential-shaped tail carried into the next flush
-		// so a pair split across two batches is still seen whole. Scoped to
-		// Muse: every other agent's stream frames stay byte-identical.
+		// runs here, with a credential-shaped tail of the agent's OWN stream
+		// text carried into the next flush so a pair split across two batches
+		// is still seen whole. Scoped to Muse: every other agent's stream
+		// frames stay byte-identical.
 		if isMuseCodeCommand(session.Command) {
-			emit := output
-			if !final {
-				var carry string
-				emit, carry = splitRedactionCarry(output)
-				if carry != "" {
-					batch = append(batch, streamBatchEntry{text: carry, fragment: true})
-				}
-			}
-			if emit == "" {
+			output = joinStreamBatch(museRedaction.rewrite(batch, final))
+			batch = batch[:0]
+			if output == "" {
 				return
 			}
-			emit, musePublishedRun = maskOpaqueContinuation(emit, musePublishedRun)
-			output = redactAgentSecrets(emit)
+		} else {
+			output = joinStreamBatch(batch)
+			batch = batch[:0]
 		}
 		seq := atomic.AddInt64(&session.Seq, 1)
 
@@ -2055,9 +2052,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				switch {
 				case ev.TextDelta != "":
 					museCodeDeltaSeen = true
-					batch = append(batch, streamBatchEntry{text: ev.TextDelta, fragment: true})
+					batch = append(batch, streamBatchEntry{text: ev.TextDelta, fragment: true, agentText: true})
 				case ev.FinalText != "" && !museCodeDeltaSeen:
-					batch = append(batch, streamBatchEntry{text: ev.FinalText, fragment: true})
+					batch = append(batch, streamBatchEntry{text: ev.FinalText, fragment: true, agentText: true})
 				case ev.Failure != "":
 					batch = append(batch, streamBatchEntry{text: "\n" + ev.Failure + "\n", fragment: true})
 				}
