@@ -29,6 +29,9 @@ func newTestLedger(t *testing.T, dir, bootID string) *spawnLedger {
 	l.treeGone = func(ledgerProcess, uintptr) bool { return true }
 	l.acquireOwnership = func() bool { return true }
 	l.startToken = func(pid int) (string, error) { return fmt.Sprintf("tok-%d", pid), nil }
+	// Every test ledger runs under the same OS boot unless a test says
+	// otherwise, so the same-boot rules below are what they exercise.
+	l.osBoot = func() osBootStamp { return osBootStamp{ID: testOSBootA} }
 	l.probe = func(ledgerProcess) processProbeResult {
 		t.Fatalf("unexpected probe")
 		return processUnknown
