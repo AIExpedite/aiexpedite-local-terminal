@@ -27,6 +27,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -426,6 +427,66 @@ func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text s
 	fmt.Printf("%s[claude-native] → %s (%d bytes)%s\n",
 		colorBlue, session.ID, len(envelope), colorReset)
 	return nil
+}
+
+// SendControl writes a stream-json control_response to the child's stdin —
+// a human's answer to a can_use_tool control_request (the voice relay
+// launches Claude with --permission-prompt-tool stdio). Only a well-formed
+// control_response object is accepted: this path must never become a way to
+// inject a user turn or any other frame. The command is signed like every
+// session command.
+func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
+	session := m.Get(id)
+	if session == nil {
+		return fmt.Errorf("claude native session %s not found", id)
+	}
+	line, err := claudeControlResponseLine(raw)
+	if err != nil {
+		return err
+	}
+	session.stdinMu.Lock()
+	defer session.stdinMu.Unlock()
+	if session.Status() == "ended" {
+		return fmt.Errorf("claude native session %s has ended", session.ID)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := fmt.Fprintln(session.Stdin, line)
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
+		}
+		return nil
+	case <-time.After(claudeNativeStdinWriteTimeout):
+		return fmt.Errorf("timeout writing control to claude native session %s", session.ID)
+	}
+}
+
+// claudeControlResponseLine validates a control payload and returns it as ONE
+// NDJSON line. Only a control_response naming a request_id passes; embedded
+// newlines are compacted away so the payload cannot split into several
+// frames (e.g. a smuggled user turn) on the child's stdin.
+func claudeControlResponseLine(raw string) (string, error) {
+	var frame struct {
+		Type     string `json:"type"`
+		Response struct {
+			RequestID string `json:"request_id"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &frame); err != nil {
+		return "", fmt.Errorf("control payload is not a single JSON object: %w", err)
+	}
+	if frame.Type != "control_response" || frame.Response.RequestID == "" {
+		return "", fmt.Errorf("control payload must be a control_response with a request_id")
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(raw)); err != nil {
+		return "", fmt.Errorf("control payload is not compactable JSON: %w", err)
+	}
+	return compact.String(), nil
 }
 
 // End shuts down a session: close stdin (Claude's graceful exit), then escalate

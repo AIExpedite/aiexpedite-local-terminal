@@ -6785,7 +6785,7 @@ func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cm
 // command kinds. Same shape as isCodexAppServerCommand / isGrokACPCommand.
 func isClaudeNativeCommand(cmdType string) bool {
 	switch cmdType {
-	case "claude_native_start", "claude_native_send", "claude_native_end":
+	case "claude_native_start", "claude_native_send", "claude_native_end", "claude_native_control":
 		return true
 	}
 	return false
@@ -6862,6 +6862,18 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			return
 		}
 		acceptRelayTurn(ctx)
+
+	case "claude_native_control":
+		// A human's answer to a tool-use approval (control_response). Never a
+		// user turn: SendControl refuses anything but a control_response.
+		if cmd.SessionID == "" || cmd.Input == "" {
+			publishClaudeNativeError(ctx, topic, cmd, "sessionID and input are required for claude_native_control")
+			return
+		}
+		if err := globalClaudeNativeManager.SendControl(cmd.SessionID, cmd.Input); err != nil {
+			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to answer claude native approval: %v", err))
+			return
+		}
 
 	case "claude_native_end":
 		if cmd.SessionID == "" {

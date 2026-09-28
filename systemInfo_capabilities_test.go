@@ -53,7 +53,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 				t.Fatalf("caps = %+v, want no concurrency hints without both probes", *caps)
 			}
 			raw, _ := json.Marshal(caps)
-			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true}` {
+			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true,"relayPermissionPrompts":true}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

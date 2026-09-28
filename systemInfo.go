@@ -120,14 +120,22 @@ type capabilitiesInfo struct {
 	// only when this is true — an older agent would reject the unknown signed
 	// field as a bad signature.
 	RelayAckWatermark bool `json:"relayAckWatermark"`
+	// RelayPermissionPrompts (DEVICE_RELAY_CAPABILITIES.PERMISSION_PROMPTS):
+	// a Claude session started with `--permission-prompt-tool stdio` launches
+	// WITHOUT --dangerously-skip-permissions and accepts a signed
+	// claude_native_control (a human's control_response). Without it a voice
+	// relay must not start Claude at all: an older agent would add the
+	// auto-approve flag regardless.
+	RelayPermissionPrompts bool `json:"relayPermissionPrompts"`
 }
 
 // newMachineCapabilities returns the capabilities every build of this agent
 // reports regardless of hardware probes: the relay protocol flags.
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
-		RelayTurnInbox:    true,
-		RelayAckWatermark: true,
+		RelayTurnInbox:         true,
+		RelayAckWatermark:      true,
+		RelayPermissionPrompts: true,
 	}
 }
 
