@@ -434,7 +434,7 @@ func isSigFailRateLimited() bool {
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
-// refreshId, riskLevel, conversationId, cliAgentCatalog
+// refreshId, riskLevel, cwd, conversationId, ackedTurnIds, cliAgentCatalog
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -488,13 +488,39 @@ type signaturePayload struct {
 	// conversationId selects durable local chat context for Antigravity starts.
 	// It affects execution just like signed Args, so it must be authenticated.
 	// omitempty preserves the existing signature shape for every other command.
-	ConversationID  string          `json:"conversationId,omitempty"`
+	ConversationID string `json:"conversationId,omitempty"`
+	// ackedTurnIds is the relay broker's signed watermark (commandMsg
+	// AckedTurnIds). Node's signCommand appends `canonical.ackedTurnIds` right
+	// after conversationId, and only for a non-empty array; omitempty drops
+	// both a nil and an empty slice here, so every command without a watermark
+	// keeps its byte-identical pre-relay canonical and an older signer / newer
+	// agent (or the reverse) still agree. terminal-service attaches the field
+	// only to a device reporting capabilities.relayAckWatermark, because an
+	// older agent would compute a canonical without it and reject the command.
+	AckedTurnIds    []string        `json:"ackedTurnIds,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
 // Returns true if signature is valid, false otherwise
 func verifySignature(cmd commandMsg, secret string) bool {
+	signatureData, err := signatureCanonical(cmd)
+	if err != nil {
+		return false
+	}
+
+	// Compute expected signature
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(signatureData)
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	// Constant-time comparison to prevent timing attacks
+	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
+}
+
+// signatureCanonical is the exact byte string Node's signCommand() HMACs
+// (JSON.stringify of its canonical object) for cmd.
+func signatureCanonical(cmd commandMsg) ([]byte, error) {
 	// Create canonical representation matching backend signCommand()
 	// Use struct to ensure consistent JSON key ordering (id, command, args, ts)
 	args := cmd.Args
@@ -516,6 +542,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		// riskLevel-gated to match the Node signer — see the field comment.
 		Cwd:             riskGatedSignatureCwd(cmd),
 		ConversationID:  cmd.ConversationID,
+		AckedTurnIds:    cmd.AckedTurnIds,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
@@ -526,18 +553,10 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(payload); err != nil {
-		return false
+		return nil, err
 	}
 	// Encode appends a trailing newline — strip it to match JSON.stringify output
-	signatureData := bytes.TrimRight(buf.Bytes(), "\n")
-
-	// Compute expected signature
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(signatureData)
-	expectedSig := hex.EncodeToString(mac.Sum(nil))
-
-	// Constant-time comparison to prevent timing attacks
-	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
 // riskGatedSignatureCwd returns the cwd to include in the signature canonical:
@@ -657,6 +676,15 @@ type commandMsg struct {
 	// SIGNED (see signaturePayload): changing it can select unrelated persisted
 	// chat context, so a tampered selector must invalidate the command HMAC.
 	ConversationID string `json:"conversationId,omitempty"`
+
+	// AckedTurnIds is the relay broker's watermark: the relay turn ids (NOT
+	// envelope ids) of this session whose `relay_turn_ack` the broker has
+	// recorded. After the command's HMAC verifies, exactly those turn inbox
+	// rows are deleted (relay_turn_inbox.go). SIGNED (see signaturePayload):
+	// an unsigned or edited watermark could otherwise delete the row that
+	// stops a redelivered SEND from running twice. More than
+	// relayAckWatermarkMax entries refuses the whole command.
+	AckedTurnIds []string `json:"ackedTurnIds,omitempty"`
 
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
 	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
@@ -804,6 +832,10 @@ type resultMsg struct {
 	// captured from a failed turn would resume a conversation containing a
 	// hidden turn the UI and the replay transcript never saw.
 	ConversationID string `json:"conversationId,omitempty"`
+
+	// RelayTurnID is the relay turn a `relay_turn_ack` frame acknowledges
+	// (relay_turn_inbox.go). Set on that frame type only.
+	RelayTurnID string `json:"relayTurnId,omitempty"`
 }
 
 /*
@@ -1741,6 +1773,40 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			// Signature verified - proceed silently
+		}
+		// ─────────────────────────────────────────────────────────────────
+
+		// ─── Relay Ack Watermark ─────────────────────────────────────────
+		// A signed `ackedTurnIds` names relay turns whose ack the broker has
+		// recorded; delete exactly those inbox rows (relay_turn_inbox.go).
+		// Over-cap is refused outright — truncating would keep rows the
+		// broker believes confirmed. Applied only when the HMAC above covered
+		// it: with no command secret nothing is authenticated, so the rows
+		// are left to TTL / teardown.
+		if len(cmd.AckedTurnIds) > 0 {
+			if err := checkRelayAckWatermark(cmd); err != nil {
+				fmt.Printf("%s[relay-inbox] %v%s\n", colorRed, err, colorReset)
+				res := makeRejectionResult(
+					cmd,
+					cfg.AgentID,
+					"error",
+					"ACK_WATERMARK_TOO_LARGE",
+					"Command rejected: "+err.Error(),
+				)
+				releasePublish, allowed := beginTrackedRejectionPublish()
+				if !allowed {
+					m.Nack()
+					return
+				}
+				defer releasePublish()
+				if err := publishMsg(ctx, topic, res); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
+				}
+				return
+			}
+			applyRelayAckWatermark(globalRelayTurnInbox, cmd, cfg.CommandSecret != "")
 		}
 		// ─────────────────────────────────────────────────────────────────
 
@@ -6353,7 +6419,27 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 // provided Pub/Sub topic. cfg is threaded through so per-family handlers
 // can apply config-driven policy (e.g. grok's API-key gate, workspace
 // containment root) without reaching for a package-level config getter.
+//
+// A command whose envelope id carries the relay prefix is a relayed voice
+// turn: it goes through the durable turn inbox HERE, before any per-kind
+// routing, so every native family and the generic PTY path share one
+// at-most-once-after-acceptance check (relay_turn_inbox.go).
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	if turnID, ok := relayTurnIDFromEnvelope(cmd.ID); ok && cmd.SessionID != "" {
+		agentID := cmd.AgentID
+		if agentID == "" && cfg != nil {
+			agentID = cfg.AgentID
+		}
+		runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
+			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
+			func(dctx context.Context) { dispatchSessionCommand(dctx, topic, cmd, cfg) })
+		return
+	}
+	dispatchSessionCommand(ctx, topic, cmd, cfg)
+}
+
+// dispatchSessionCommand is the per-kind router behind handleSessionCommand.
+func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if isCodexAppServerCommand(cmd.Type) {
 		handleCodexAppServerCommand(ctx, topic, cmd)
 		return
@@ -6456,6 +6542,8 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to send input: %v", err))
 			return
 		}
+		// The input is on the CLI's stdin: a relay turn is now owned.
+		acceptRelayTurn(ctx)
 
 	case "session_signal":
 		if cmd.SessionID == "" {
@@ -6644,6 +6732,7 @@ func handleCodexAppServerCommand(ctx context.Context, topic *pubsub.Publisher, c
 			publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("failed to send to codex app-server: %v", err))
 			return
 		}
+		acceptRelayTurn(ctx)
 
 	case "codex_appserver_end":
 		if cmd.SessionID == "" {
@@ -6772,6 +6861,7 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to claude native: %v", err))
 			return
 		}
+		acceptRelayTurn(ctx)
 
 	case "claude_native_end":
 		if cmd.SessionID == "" {
@@ -6926,7 +7016,11 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		if cmd.TimeoutMs > 0 {
 			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
 		}
-		if err := globalAntigravityNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+		// SendTurn fires the relay acceptance once the session moved
+		// idle→running for this turn — Send blocks for the whole turn, so
+		// acceptance after it returned would leave a crash mid-turn looking
+		// like a turn that never started.
+		if err := globalAntigravityNativeManager.SendTurn(cmd.SessionID, cmd.Input, publishFn, timeout, relayTurnAcceptor(ctx)); err != nil {
 			// Send publishes antigravity_native_error for ordinary turn failures
 			// (timeout, empty response, oversize). Publish here only when Send
 			// could not (missing/ended session) so the UI never stays stuck
@@ -7137,6 +7231,7 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to send to grok acp: %v", err), "")
 			return
 		}
+		acceptRelayTurn(ctx)
 
 	case "grok_acp_end":
 		if cmd.SessionID == "" {
@@ -7207,14 +7302,28 @@ type oneShotNativeCommandTarget interface {
 // unconfirmed or stale end (end_confirm.go). mgr is nil when the manager was
 // never initialized.
 func handleOneShotNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind) {
-	dispatchOneShotNativeCommand(cmd, mgr, spec, newSessionPublishFn(topic, spec.LogTag), func(errMsg string) {
+	dispatchOneShotNativeCommandAccepting(cmd, mgr, spec, newSessionPublishFn(topic, spec.LogTag), func(errMsg string) {
 		publishOneShotNativeError(ctx, topic, cmd, spec, errMsg)
-	})
+	}, relayTurnAcceptor(ctx))
+}
+
+// relayTurnSender is a one-shot target that can report the moment it owns a
+// turn (the session went idle→running). Every production manager implements
+// it; a target that does not is treated as owning the turn once Send returned
+// nil.
+type relayTurnSender interface {
+	SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func()) error
 }
 
 // dispatchOneShotNativeCommand is handleOneShotNativeCommand without the
 // Pub/Sub binding, so the lifecycle rules are testable with plain callbacks.
 func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string)) {
+	dispatchOneShotNativeCommandAccepting(cmd, mgr, spec, publishFn, publishErr, nil)
+}
+
+// dispatchOneShotNativeCommandAccepting is dispatchOneShotNativeCommand with
+// the relay acceptance callback (nil for an ordinary command).
+func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string), onAccepted func()) {
 	kind := strings.ToLower(spec.DisplayName) + " native"
 	ended := func(output, status string, exitCode int) resultMsg {
 		return resultMsg{
@@ -7283,7 +7392,13 @@ func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget
 		if cmd.TimeoutMs > 0 {
 			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
 		}
-		if err := mgr.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+		var sendErr error
+		if rs, ok := mgr.(relayTurnSender); ok {
+			sendErr = rs.SendTurn(cmd.SessionID, cmd.Input, publishFn, timeout, onAccepted)
+		} else if sendErr = mgr.Send(cmd.SessionID, cmd.Input, publishFn, timeout); sendErr == nil && onAccepted != nil {
+			onAccepted()
+		}
+		if err := sendErr; err != nil {
 			// Send publishes its own error frame for ordinary turn failures;
 			// publish here only when it could not.
 			msg := err.Error()

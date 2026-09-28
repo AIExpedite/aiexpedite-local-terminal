@@ -393,6 +393,17 @@ func (m *oneShotNativeManager) ackExisting(existing *oneShotNativeSession, id st
 
 // Send runs one user turn and leaves the logical session idle for follow-ups.
 func (m *oneShotNativeManager) Send(id, text string, publishFn PublishFunc, turnTimeout time.Duration) error {
+	return m.SendTurn(id, text, publishFn, turnTimeout, nil)
+}
+
+// SendTurn is Send that also calls onAccepted (when non-nil) once this
+// call OWNS the turn — the session moved idle→running for it, after every
+// refusal (not found, ended, a turn already in flight, oversize prompt).
+// A relayed voice turn records `accepted` in the durable turn inbox there
+// (relay_turn_inbox.go): Send blocks for the whole turn, so acceptance
+// after it returned would make a crash mid-turn look like a turn that
+// never started, and the redelivery would run it a second time.
+func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func()) error {
 	if publishFn == nil {
 		return fmt.Errorf("publishFn is required")
 	}
@@ -430,6 +441,9 @@ func (m *oneShotNativeManager) Send(id, text string, publishFn PublishFunc, turn
 	}
 	if !session.beginTurn() {
 		return fmt.Errorf("%s native session %s has ended", name, id)
+	}
+	if onAccepted != nil {
+		onAccepted()
 	}
 	defer func() {
 		if session.Status() != "ended" {
