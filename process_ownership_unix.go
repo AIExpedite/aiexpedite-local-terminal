@@ -84,8 +84,10 @@ var signalRecordedGroup = func(rec ledgerProcess) {
 // the agent does not enumerate processes to look for one. There is no kernel
 // containment equivalent to a kill-on-close Job Object here, so a Unix
 // session is never certified reaped through a process it spawned (it stays
-// unproven; the run parks rather than failing over). Linux cgroups would be
-// the way to add this proof later.
+// unproven; the run parks rather than failing over) — only an OS reboot since
+// the session's OS boot proves it gone (os_boot.go), and that proof looks at
+// no process at all. Linux cgroups would be the way to add a same-boot proof
+// later.
 func probeRecordedDescendants(rec ledgerProcess) processProbeResult {
 	return processUnknown
 }

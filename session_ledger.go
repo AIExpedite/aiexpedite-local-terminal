@@ -34,6 +34,15 @@
 //   - unknown   — its state could not be determined (access denied, an
 //     incomplete record): never listed, kept for a retry.
 //
+// One proof comes first and needs none of that: each entry also records the
+// OS boot its agent process ran under (os_boot.go). An entry whose recorded
+// OS boot is proven different from the current one ran on a machine that has
+// rebooted since, which ended every process it had — so it is reaped, on
+// every platform and whatever its containment, PID state, or incomplete /
+// pending / unknown / surviving state, and nothing is probed or signalled.
+// An entry without a recorded OS boot (written before v1.0.39) stays on the
+// rules above.
+//
 // sessionsReaped is signed into the /online body (bootReportSignature,
 // deregister.go) and a reaped entry is dropped only after an /online carrying
 // it was accepted. The ledger never enumerates other processes, never reads
@@ -143,6 +152,16 @@ type ledgerEntry struct {
 	Incomplete bool   `json:"incomplete,omitempty"`
 	State      string `json:"state,omitempty"`
 	UpdatedAt  int64  `json:"updatedAt"`
+	// OSBoot is the OS boot identity the entry's agent process ran under
+	// ("<kind>:<value>", os_boot.go) and OSUptimeMs the time since that boot
+	// when it was read. Refreshed on every change of a current-boot entry;
+	// absent when unreadable and in entries written before v1.0.39.
+	OSBoot     string `json:"osBoot,omitempty"`
+	OSUptimeMs int64  `json:"osUptimeMs,omitempty"`
+	// UnrecordedGeneration: a later generation of this session id could not
+	// be recorded (the ledger was full). This entry's OS boot says nothing
+	// about when that generation ran, so the OS-reboot proof never applies.
+	UnrecordedGeneration bool `json:"unrecordedGeneration,omitempty"`
 }
 
 type ledgerFileData struct {
@@ -186,6 +205,8 @@ type spawnLedger struct {
 	lockFile         *os.File // held (locked) for the life of the process
 	releaseJob       func(uintptr)
 	groupOf          func(*os.Process) int
+	// osBoot reads the current OS boot identity (os_boot.go).
+	osBoot func() osBootStamp
 }
 
 func newSpawnLedger(path func() string, bootID string) *spawnLedger {
@@ -204,6 +225,7 @@ func newSpawnLedger(path func() string, bootID string) *spawnLedger {
 		treeGone:    processTreeGone,
 		releaseJob:  releaseSessionJob,
 		groupOf:     processGroupOf,
+		osBoot:      readOSBootStamp,
 	}
 	l.acquireOwnership = func() bool {
 		f := acquireLedgerLock(l.path() + ".lock")
@@ -360,6 +382,7 @@ func (l *spawnLedger) currentLocked(sessionID string) *ledgerEntry {
 			for _, e := range l.entries {
 				if e.SessionID == sessionID {
 					e.Incomplete = true
+					e.UnrecordedGeneration = true
 				}
 			}
 			fmt.Printf("%s[ledger] Spawn ledger full of unresolved sessions — session %s is not recorded and will never be reported reaped%s\n",
@@ -373,7 +396,70 @@ func (l *spawnLedger) currentLocked(sessionID string) *ledgerEntry {
 	return e
 }
 
-func (l *spawnLedger) touch(e *ledgerEntry) { e.UpdatedAt = l.now().UnixMilli() }
+// touch marks a current-boot entry changed and stamps it with the OS boot it
+// runs under: this agent process lives inside one OS boot, so every process
+// the entry records was started under it. A failed read keeps the last stamp
+// (still this OS boot's); an entry never stamped cannot use the OS-reboot
+// proof.
+func (l *spawnLedger) touch(e *ledgerEntry) {
+	e.UpdatedAt = l.now().UnixMilli()
+	if e.BootID != l.bootID {
+		return
+	}
+	if s := l.osBoot(); s.ID != "" {
+		e.OSBoot, e.OSUptimeMs = s.ID, s.UptimeMs
+	}
+}
+
+// osBootStampRefreshInterval is how often the running agent re-stamps its
+// open entries (RefreshOSBootStamps).
+const osBootStampRefreshInterval = 5 * time.Minute
+
+// RefreshOSBootStamps re-reads the OS boot identity and re-stamps this boot's
+// entries. Only the wall-clock kinds change (their since-boot counter
+// grows): a recorded counter close to the old boot's whole uptime is what
+// lets the next OS boot's agent, starting below it, prove the reboot
+// (os_boot.go). Earlier boots' entries are never touched; nothing is written
+// when nothing changed.
+func (l *spawnLedger) RefreshOSBootStamps() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.loaded || l.disabled {
+		return
+	}
+	s := l.osBoot()
+	if s.ID == "" {
+		return
+	}
+	changed := false
+	for _, e := range l.entries {
+		if e.BootID != l.bootID || (e.OSBoot == s.ID && e.OSUptimeMs == s.UptimeMs) {
+			continue
+		}
+		e.OSBoot, e.OSUptimeMs = s.ID, s.UptimeMs
+		changed = true
+	}
+	if changed {
+		l.persistLocked()
+	}
+}
+
+// startOSBootStampRefresher runs RefreshOSBootStamps every interval until
+// stop is closed.
+func startOSBootStampRefresher(l *spawnLedger, every time.Duration, stop <-chan struct{}) {
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				l.RefreshOSBootStamps()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
 
 // OpenLogicalSession records a session that spawns one process per turn.
 func (l *spawnLedger) OpenLogicalSession(sessionID string) {
@@ -653,6 +739,17 @@ func (l *spawnLedger) classifyEarlierEntry(e ledgerEntry) bootReapClass {
 	}
 }
 
+// rebootProvesReaped: the entry ran under an OS boot proven different from
+// the current one, so the reboot ended every process it had. Nothing is
+// looked up. A refused later generation of its id (UnrecordedGeneration) may
+// have run under any OS boot, so it keeps the entry out of this proof.
+func rebootProvesReaped(e ledgerEntry, current osBootStamp) bool {
+	if e.UnrecordedGeneration {
+		return false
+	}
+	return osBootRebootProven(osBootStamp{ID: e.OSBoot, UptimeMs: e.OSUptimeMs}, current)
+}
+
 // RunBootReap classifies every earlier boot's session. Call once at boot,
 // before the boot-time /online (and before any session can start).
 func (l *spawnLedger) RunBootReap() {
@@ -686,9 +783,28 @@ func (l *spawnLedger) RunBootReap() {
 	l.mu.Unlock()
 	defer close(l.reapDone)
 
+	// The OS boot this agent runs under, read once. Unreadable: no entry is
+	// proven reaped by a reboot this boot.
+	currentOSBoot := l.osBoot()
+	if currentOSBoot.ID == "" {
+		fmt.Printf("%s[boot-reap] No OS boot identity readable — no session can be proven reaped by a reboot%s\n",
+			colorYellow, colorReset)
+	}
 	results := make(map[[2]string]bootReapClass, len(todo))
+	var rebooted int
 	for _, w := range todo {
-		results[[2]string{w.sessionID, w.bootID}] = l.classifyEarlierEntry(w.snapshot)
+		key := [2]string{w.sessionID, w.bootID}
+		// An OS reboot since the entry's OS boot ended every process it had:
+		// reaped, and nothing is probed or ended — a PID the entry recorded
+		// can only name another process now.
+		if w.snapshot.State != ledgerStateReaped && rebootProvesReaped(w.snapshot, currentOSBoot) {
+			fmt.Printf("%s[boot-reap] Session %s (boot %s) ran under an earlier OS boot (%s; now %s) — reaped by the reboot%s\n",
+				colorYellow, w.sessionID, w.bootID, w.snapshot.OSBoot, currentOSBoot.ID, colorReset)
+			results[key] = reapClassReaped
+			rebooted++
+			continue
+		}
+		results[key] = l.classifyEarlierEntry(w.snapshot)
 	}
 
 	l.mu.Lock()
@@ -720,8 +836,8 @@ func (l *spawnLedger) RunBootReap() {
 	}
 	l.entries = kept
 	l.persistLocked()
-	fmt.Printf("%s[boot-reap] boot %s (previous %q): %d session(s) reaped, %d surviving%s\n",
-		colorCyan, l.bootID, l.prevBootID, reaped, surviving, colorReset)
+	fmt.Printf("%s[boot-reap] boot %s (previous %q): %d session(s) reaped (%d by an OS reboot), %d surviving%s\n",
+		colorCyan, l.bootID, l.prevBootID, reaped, rebooted, surviving, colorReset)
 }
 
 // bootReport is the boot identity and restart report sent on /online.
