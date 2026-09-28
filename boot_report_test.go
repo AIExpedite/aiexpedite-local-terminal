@@ -402,12 +402,12 @@ func TestFencedSessionsAreRefusedAndEndedFirst(t *testing.T) {
 	t.Cleanup(func() { publishMsg = prevPublish })
 	cfg := &Config{AgentID: "agent-f"}
 
-	for _, typ := range []string{"codex_appserver_send", "session_input", "claude_native_start", "grok_acp_send"} {
+	for _, typ := range []string{"codex_appserver_send", "session_input", "claude_native_start", "grok_acp_send", "musecode_native_send"} {
 		if !refuseFencedSessionCommand(context.Background(), nil, nil, commandMsg{ID: "c", Type: typ, SessionID: "s-moved"}, cfg) {
 			t.Fatalf("%s for a fenced session was not refused", typ)
 		}
 	}
-	for _, typ := range []string{"codex_appserver_end", "session_end", "claude_native_end", "grok_acp_end", "antigravity_native_end", "opencode_native_end"} {
+	for _, typ := range []string{"codex_appserver_end", "session_end", "claude_native_end", "grok_acp_end", "antigravity_native_end", "opencode_native_end", "musecode_native_end"} {
 		if refuseFencedSessionCommand(context.Background(), nil, nil, commandMsg{Type: typ, SessionID: "s-moved"}, cfg) {
 			t.Fatalf("%s must be let through", typ)
 		}
@@ -415,7 +415,7 @@ func TestFencedSessionsAreRefusedAndEndedFirst(t *testing.T) {
 	if refuseFencedSessionCommand(context.Background(), nil, nil, commandMsg{Type: "codex_appserver_send", SessionID: "s-other"}, cfg) {
 		t.Fatalf("an unfenced session was refused")
 	}
-	if len(published) != 4 {
+	if len(published) != 5 {
 		t.Fatalf("published %d refusals", len(published))
 	}
 	r := published[0]
@@ -449,9 +449,11 @@ func TestSessionErrorFramesCarryBootID(t *testing.T) {
 	publishCodexAppServerError(context.Background(), nil, cmd, "x")
 	publishClaudeNativeError(context.Background(), nil, cmd, "x")
 	publishAntigravityNativeError(context.Background(), nil, cmd, "x")
-	publishOpenCodeNativeError(context.Background(), nil, cmd, "x")
+	// OpenCode and every oneshot_native.go spec share one error publisher.
+	publishOneShotNativeError(context.Background(), nil, cmd, openCodeNativeKind, "x")
+	publishOneShotNativeError(context.Background(), nil, cmd, museCodeNativeSpec.nativeFrameKind, "x")
 	publishGrokACPError(context.Background(), nil, cmd, "x", "")
-	if len(published) != 6 {
+	if len(published) != 7 {
 		t.Fatalf("published %d", len(published))
 	}
 	for _, r := range published {

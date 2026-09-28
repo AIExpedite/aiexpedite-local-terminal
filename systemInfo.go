@@ -628,6 +628,12 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 			// same reason: a plain spawn of an npm `codex.cmd` would cache ""
 			// under the shared key and pin the smoke's binary_missing.
 			version = codexProbeVersion(path)
+		} else if a.ID == "museCode" {
+			// Muse Code's Windows `muse.cmd` is a PowerShell launcher that never
+			// changes across upgrades, so the shared (path, mtime, size) key
+			// would pin a cold-start timeout's "" (or a pre-upgrade version)
+			// for good. See museCodeProbeVersion.
+			version = museCodeProbeVersion(path)
 		} else if a.ID == "opencode" {
 			// The shim-aware OpenCode probe (cliagent_smoke_opencode.go): a plain
 			// spawn of an npm `opencode.cmd` would cache "" under the shared key
@@ -660,12 +666,19 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 //   - opencode: the official install script writes $HOME/.opencode/bin, which
 //     macOS launchd/GUI-spawned agents do not inherit -- exactly the failure the
 //     grok fallback exists for.
+//   - muse:     https://dev.meta.ai/install.sh writes $MUSE_INSTALL_DIR else
+//     $HOME/.local/bin; install.ps1 writes $MUSE_INSTALL_DIR else
+//     %LOCALAPPDATA%\Programs\muse, hence the Windows-specific root.
 var installerBinDirFallbacks = map[string]struct {
 	EnvVar string
 	Rel    []string
+	// WindowsLocalAppDataRel, when set, replaces Rel on Windows and is
+	// resolved under %LOCALAPPDATA% instead of the home directory.
+	WindowsLocalAppDataRel []string
 }{
 	"grok":     {EnvVar: "GROK_BIN_DIR", Rel: []string{".grok", "bin"}},
 	"opencode": {EnvVar: "", Rel: []string{".opencode", "bin"}},
+	"muse":     {EnvVar: "MUSE_INSTALL_DIR", Rel: []string{".local", "bin"}, WindowsLocalAppDataRel: []string{"Programs", "muse"}},
 }
 
 // installerBinDirFor returns the installer bin dir for a command, or "" when
@@ -679,6 +692,13 @@ func installerBinDirFor(command string) string {
 		if d := strings.TrimSpace(os.Getenv(spec.EnvVar)); d != "" {
 			return d
 		}
+	}
+	if runtime.GOOS == "windows" && len(spec.WindowsLocalAppDataRel) > 0 {
+		base := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
+		if base == "" {
+			return ""
+		}
+		return filepath.Join(append([]string{base}, spec.WindowsLocalAppDataRel...)...)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

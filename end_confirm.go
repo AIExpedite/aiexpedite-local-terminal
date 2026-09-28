@@ -89,7 +89,8 @@ func staleEndError(kind string, id string) error {
 var killConfirmTimeout = 30 * time.Second
 
 // turnDrainConfirmTimeout bounds the turnMu drain barrier used by the
-// turn-per-process managers (antigravity, opencode). Same rationale as
+// turn-per-process managers (antigravity, opencode, and the oneshot_native.go
+// core behind Muse Code). Same rationale as
 // killConfirmTimeout: an in-flight turn normally unwinds promptly once its
 // process is cancelled/killed, and blocking forever when it does not is how
 // a device wedges. Declared as a var so tests can shorten it.

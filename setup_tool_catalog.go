@@ -101,6 +101,7 @@ var setupToolProbeAllowlist = map[string][][]string{
 	"codex":    {{"--version"}},
 	"grok":     {{"--version"}},
 	"opencode": {{"--version"}},
+	"muse":     {{"--version"}}, // museCode
 }
 
 // isAllowedSetupToolProbe reports whether `command args…` is an allowlisted

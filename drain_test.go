@@ -271,6 +271,8 @@ func TestAdmitWork_WhileDraining(t *testing.T) {
 		{"claude_native_start", commandMsg{Type: "claude_native_start"}, false},
 		{"grok_acp_start", commandMsg{Type: "grok_acp_start"}, false},
 		{"antigravity_native_start", commandMsg{Type: "antigravity_native_start"}, false},
+		{"opencode_native_start", commandMsg{Type: "opencode_native_start"}, false},
+		{"musecode_native_start", commandMsg{Type: "musecode_native_start"}, false},
 		{"unrecognised future type", commandMsg{Type: "quantum_start"}, false},
 		{"unrecognised future non-start type", commandMsg{Type: "batch_run"}, false},
 
@@ -283,6 +285,12 @@ func TestAdmitWork_WhileDraining(t *testing.T) {
 		{"claude_native_send", commandMsg{Type: "claude_native_send"}, true},
 		{"grok_acp_send", commandMsg{Type: "grok_acp_send"}, true},
 		{"antigravity_native_end", commandMsg{Type: "antigravity_native_end"}, true},
+		// One-shot-per-turn kinds register a drain work source, so their SEND /
+		// END must pass through or the drain waits out the stale-session sweep.
+		{"opencode_native_send", commandMsg{Type: "opencode_native_send"}, true},
+		{"opencode_native_end", commandMsg{Type: "opencode_native_end"}, true},
+		{"musecode_native_send", commandMsg{Type: "musecode_native_send"}, true},
+		{"musecode_native_end", commandMsg{Type: "musecode_native_end"}, true},
 
 		// Operational / demand traffic — always admitted.
 		{"ping", commandMsg{Command: "__ping__"}, true},

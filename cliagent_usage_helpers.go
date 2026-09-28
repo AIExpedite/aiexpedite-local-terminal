@@ -81,6 +81,7 @@ func cliAgentUsageRegistry() []cliAgentUsageParser {
 		&antigravityUsageParser{},
 		&grokUsageParser{},
 		&openCodeUsageParser{},
+		&museCodeUsageParser{},
 	}
 }
 

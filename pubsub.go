@@ -224,6 +224,9 @@ func rejectionResultType(cmdType string) string {
 	if isOpenCodeNativeCommand(cmdType) {
 		return "opencode_native_error"
 	}
+	if isMuseCodeNativeCommand(cmdType) {
+		return museCodeNativeSpec.frameType("error")
+	}
 	return "session_error"
 }
 
@@ -645,7 +648,8 @@ type commandMsg struct {
 
 	// Durable CLI conversation id to RESUME on a session start whose kind keeps
 	// its conversation on this device's filesystem (antigravity_native_start,
-	// opencode_native_start). Empty = start a fresh conversation.
+	// opencode_native_start, musecode_native_start). Empty = start a fresh
+	// conversation.
 	//
 	// Claude needs no equivalent field: its resume travels as an ordinary
 	// `--resume=<id>` entry in Args, which is already signed.
@@ -5945,6 +5949,11 @@ var globalAntigravityNativeManager *AntigravityNativeManager
 // opencode_native_* chunks for the frontend native chat path.
 var globalOpenCodeNativeManager *OpenCodeNativeManager
 
+// globalMuseCodeNativeManager drives Meta Muse Code chat: one `muse exec
+// --json` child per turn with exact `--session-id <uuid>` resume, publishing
+// musecode_native_* chunks. Built on the shared one-shot core.
+var globalMuseCodeNativeManager *oneShotNativeManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
@@ -6123,6 +6132,16 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			// interactive TUI and every raw invocation. Treat "Always" as one-time.
 			persistOnAlways = false
 		}
+		// Muse Code: identical reasoning — gate the synthesised `exec --json
+		// --disable-approval …` argv, approve it in signed mode, never persist
+		// "Always" (it would write a blanket `muse *`).
+		if isMuseCodeCommand(cmd.Command) {
+			allowArgs = buildMuseCodeInteractiveArgs(cmd.Args)
+			if cfg.CommandSecret != "" && !forceNative && isMuseCodeSynthesizedRun(allowArgs) {
+				return true
+			}
+			persistOnAlways = false
+		}
 		dialogArgs = allowArgs
 		denyOutput = "Command denied by user: not in allow list"
 	case "codex_appserver_start":
@@ -6164,6 +6183,20 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs = buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
 		dialogArgs = allowArgs
 		denyOutput = "opencode native session denied by user: not in allow list"
+	case "musecode_native_start":
+		// Same policy as opencode_native_start: signed mode approves the
+		// synthesised argv (the manager owns execution); unsigned mode shows the
+		// dialog. "Always" never persists: GeneratePatternFromCommand would
+		// write a blanket `muse *`, pre-approving the bare TUI and every raw
+		// `muse` execute (allowlist.go deliberately has no muse entry).
+		if cfg.CommandSecret != "" && !forceNative {
+			return true
+		}
+		allowCommand = "muse"
+		allowArgs = buildMuseCodeNativeGateArgs()
+		dialogArgs = allowArgs
+		denyOutput = "muse code native session denied by user: not in allow list"
+		persistOnAlways = false
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
 		// the shared execute allowlist or approval dialog WHEN signing is
@@ -6334,7 +6367,21 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		return
 	}
 	if isOpenCodeNativeCommand(cmd.Type) {
-		handleOpenCodeNativeCommand(ctx, topic, cmd, cfg)
+		// Typed-nil guard: a nil *OpenCodeNativeManager inside the interface
+		// would read as initialized.
+		var target oneShotNativeCommandTarget
+		if globalOpenCodeNativeManager != nil {
+			target = globalOpenCodeNativeManager
+		}
+		handleOneShotNativeCommand(ctx, topic, cmd, target, openCodeNativeKind)
+		return
+	}
+	if isMuseCodeNativeCommand(cmd.Type) {
+		var target oneShotNativeCommandTarget
+		if globalMuseCodeNativeManager != nil {
+			target = globalMuseCodeNativeManager
+		}
+		handleOneShotNativeCommand(ctx, topic, cmd, target, museCodeNativeSpec.nativeFrameKind)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
@@ -6984,230 +7031,6 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 }
 
 /* --------------------------------------------------------------------------
-   OpenCode native (one-shot `run --format json` + --session resume) routing
-   -------------------------------------------------------------------------- */
-
-// handleOpenCodeNativeCommand dispatches opencode_native_* commands to the
-// OpenCodeNativeManager. Start registers a logical session (no process); Send
-// runs one-shot `opencode run --format json` with exact `--session` resume and
-// streams each JSON event back as its own chunk; End cancels any in-flight turn
-// and drops the logical session.
-//
-// Shaped after handleAntigravityNativeCommand because the two share a process
-// model (one short-lived child per turn, logical session in between) — the
-// lifecycle edge cases the Antigravity handler encodes (idempotent start ack
-// without releasing the reservation, whitespace-only send rejection, ended
-// published even when End reports the session already gone) apply identically.
-func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
-	if globalOpenCodeNativeManager == nil {
-		publishOpenCodeNativeError(ctx, topic, cmd, "opencode native manager not initialized")
-		// Start commands leave a cloud-side `starting` session + reservation;
-		// emit ended so the orchestrator can tear them down.
-		if cmd.Type == "opencode_native_start" && cmd.SessionID != "" {
-			publishFn := newSessionPublishFn(topic, "[opencode-native]")
-			publishTerminalResult(publishFn, resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				Output:      "opencode native manager not initialized",
-				Status:      "error",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "opencode_native_ended",
-				SessionID:   cmd.SessionID,
-				ExitCode:    -1,
-			})
-		}
-		return
-	}
-
-	publishFn := newSessionPublishFn(topic, "[opencode-native]")
-
-	switch cmd.Type {
-	case "opencode_native_start":
-		if cmd.SessionID == "" {
-			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_start")
-			return
-		}
-
-		fmt.Printf("%s[opencode-native] Starting session %s (workspace=%s)%s\n",
-			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
-
-		onStarted := func() {
-			publishFn(resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				Output:      "OpenCode native started",
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "opencode_native_started",
-				SessionID:   cmd.SessionID,
-			})
-		}
-
-		err := globalOpenCodeNativeManager.Start(
-			cmd.SessionID,
-			cmd.Cwd,
-			cmd.WorkspaceID,
-			cmd.UID,
-			cmd.ConversationID,
-			publishFn,
-			onStarted,
-		)
-		if err != nil {
-			// Only emit opencode_native_ended when NO local session exists. Any
-			// Start error raised after a live session is registered must not
-			// release the cloud reservation while the manager can still accept
-			// Sends — that desync breaks later turns after Pub/Sub redelivery.
-			// (Start itself treats redelivery as an idempotent started ack.)
-			publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start opencode native: %v", err))
-			if globalOpenCodeNativeManager.Get(cmd.SessionID) == nil {
-				publishFn(resultMsg{
-					ID:          cmd.ID,
-					WorkspaceID: cmd.WorkspaceID,
-					UID:         cmd.UID,
-					Output:      redactAgentSecrets(fmt.Sprintf("start failed: %v", err)),
-					Status:      "error",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
-					Type:        "opencode_native_ended",
-					SessionID:   cmd.SessionID,
-					ExitCode:    -1,
-				})
-			}
-			return
-		}
-
-	case "opencode_native_send":
-		if cmd.SessionID == "" {
-			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_send")
-			return
-		}
-		if strings.TrimSpace(cmd.Input) == "" {
-			// Reject whitespace-only sends here too: Send() trims and returns
-			// "input is empty" before it holds a session, and the error filter
-			// below only re-publishes not-found/ended — so a spaces-only turn
-			// would otherwise leave the chat stuck running with no terminal frame.
-			publishOpenCodeNativeError(ctx, topic, cmd, "input (user turn text) is required for opencode_native_send")
-			return
-		}
-
-		// Send is synchronous for the duration of the one-shot process so
-		// Pub/Sub ack semantics match "turn accepted" after completion frames
-		// are published. Turn timeouts are enforced inside Send.
-		timeout := time.Duration(0)
-		if cmd.TimeoutMs > 0 {
-			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
-		}
-		if err := globalOpenCodeNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
-			// Send publishes opencode_native_error for ordinary turn failures
-			// (timeout, empty response, oversize frame). Publish here only when
-			// Send could NOT (missing/ended session, or a turn already in
-			// flight) so the UI never stays stuck running without a terminal
-			// frame. "session ended during turn" is covered by
-			// opencode_native_ended from End — do not double-fire.
-			msg := err.Error()
-			if strings.Contains(msg, "not found") ||
-				strings.Contains(msg, "already has a turn in flight") ||
-				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
-				publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to opencode native: %v", err))
-			}
-			return
-		}
-
-	case "opencode_native_end":
-		if cmd.SessionID == "" {
-			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_end")
-			return
-		}
-
-		fmt.Printf("%s[opencode-native] Ending session %s%s\n",
-			colorYellow, cmd.SessionID, colorReset)
-
-		// Start accounting before End removes the session from its manager, so
-		// ActiveWork cannot observe a zero between local teardown and the final
-		// cloud-owned terminal frame.
-		trackTerminalPublishStart()
-		defer trackTerminalPublishEnd()
-		if err := globalOpenCodeNativeManager.End(cmd.SessionID); err != nil {
-			// An UNCONFIRMED end (kill/turn-drain timed out; tombstone
-			// retained; process may be alive) must NOT surface as ended —
-			// that frame is shutdown evidence and the server releases the
-			// device claim on it. Publish an error instead; the server keeps
-			// the fence and the next retried end re-probes (end_confirm.go).
-			if errors.Is(err, errEndUnconfirmed) {
-				publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("end unconfirmed: %v", err))
-				return
-			}
-			// A STALE end (the session was replaced under us and the ID now
-			// belongs to a live replacement) publishes NOTHING: every frame we
-			// could emit carries cmd.SessionID, so an error frame would be
-			// misattributed to the replacement just as an ended frame would.
-			// The end itself succeeded — the session we captured is gone.
-			if errors.Is(err, errEndStaleSession) {
-				fmt.Printf("%s[opencode-native] Withholding every frame for %s — %v%s\n",
-					colorYellow, cmd.SessionID, err, colorReset)
-				return
-			}
-			// Still publish ended so the cloud can release reservations even if
-			// the local session was already gone (idempotent teardown).
-			publishFn(resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				Output:      fmt.Sprintf("end: %v", err),
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "opencode_native_ended",
-				SessionID:   cmd.SessionID,
-				ExitCode:    0,
-			})
-			return
-		}
-		publishFn(resultMsg{
-			ID:          cmd.ID,
-			WorkspaceID: cmd.WorkspaceID,
-			UID:         cmd.UID,
-			Output:      "OpenCode native ended",
-			Status:      "success",
-			Ts:          time.Now().UnixMilli(),
-			Version:     Version,
-			Type:        "opencode_native_ended",
-			SessionID:   cmd.SessionID,
-			ExitCode:    0,
-		})
-
-	default:
-		publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("unknown opencode native command type: %s", cmd.Type))
-	}
-}
-
-// publishOpenCodeNativeError surfaces a synchronous failure back to the
-// orchestrator as an `opencode_native_error` frame.
-func publishOpenCodeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
-	fmt.Printf("%s[opencode-native] Error: %s%s\n", colorRed, errMsg, colorReset)
-
-	res := resultMsg{
-		ID:          cmd.ID,
-		WorkspaceID: cmd.WorkspaceID,
-		UID:         cmd.UID,
-		Output:      redactAgentSecrets(errMsg),
-		Status:      "error",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		BootID:      agentBootID,
-		Type:        "opencode_native_error",
-		SessionID:   cmd.SessionID,
-	}
-	if err := publishMsg(ctx, topic, res); err != nil {
-		fmt.Printf("%s[opencode-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
-	}
-}
-
-/* --------------------------------------------------------------------------
    Grok ACP (JSON-RPC over stdio) command routing
    -------------------------------------------------------------------------- */
 
@@ -7357,5 +7180,164 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[grok-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Shared one-shot native routing (OpenCode, and the oneshot_native.go specs)
+   -------------------------------------------------------------------------- */
+
+// oneShotNativeCommandTarget is what handleOneShotNativeCommand drives:
+// OpenCodeNativeManager and every oneShotNativeManager.
+type oneShotNativeCommandTarget interface {
+	Start(id, cwd, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error
+	Send(id, text string, publishFn PublishFunc, turnTimeout time.Duration) error
+	End(id string) error
+	HasSession(id string) bool
+}
+
+// handleOneShotNativeCommand dispatches <prefix>_{start,send,end} for a kind
+// whose logical session outlives its per-turn child. Start registers a session
+// (no process), Send runs one turn and streams each event as its own chunk,
+// End cancels any in-flight turn and drops the session. Lifecycle rules:
+// redelivered starts re-ack without releasing the reservation; a start failure
+// publishes ended only when no local session exists; whitespace-only sends are
+// rejected here (Send's own refusal would publish nothing); and an end
+// publishes ended even when the session is already gone, except for an
+// unconfirmed or stale end (end_confirm.go). mgr is nil when the manager was
+// never initialized.
+func handleOneShotNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind) {
+	dispatchOneShotNativeCommand(cmd, mgr, spec, newSessionPublishFn(topic, spec.LogTag), func(errMsg string) {
+		publishOneShotNativeError(ctx, topic, cmd, spec, errMsg)
+	})
+}
+
+// dispatchOneShotNativeCommand is handleOneShotNativeCommand without the
+// Pub/Sub binding, so the lifecycle rules are testable with plain callbacks.
+func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string)) {
+	kind := strings.ToLower(spec.DisplayName) + " native"
+	ended := func(output, status string, exitCode int) resultMsg {
+		return resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      output,
+			Status:      status,
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        spec.frameType("ended"),
+			SessionID:   cmd.SessionID,
+			ExitCode:    exitCode,
+		}
+	}
+	startType, sendType, endType := spec.FramePrefix+"_start", spec.FramePrefix+"_send", spec.FramePrefix+"_end"
+
+	if mgr == nil {
+		publishErr(kind + " manager not initialized")
+		// A start leaves a cloud-side `starting` session + reservation.
+		if cmd.Type == startType && cmd.SessionID != "" {
+			publishTerminalResult(publishFn, ended(kind+" manager not initialized", "error", -1))
+		}
+		return
+	}
+
+	switch cmd.Type {
+	case startType:
+		if cmd.SessionID == "" {
+			publishErr("sessionID is required for " + startType)
+			return
+		}
+		fmt.Printf("%s%s Starting session %s (workspace=%s)%s\n",
+			colorCyan, spec.LogTag, cmd.SessionID, cmd.WorkspaceID, colorReset)
+		onStarted := func() {
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      spec.DisplayName + " native started",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        spec.frameType("started"),
+				SessionID:   cmd.SessionID,
+			})
+		}
+		err := mgr.Start(cmd.SessionID, cmd.Cwd, cmd.WorkspaceID, cmd.UID, cmd.ConversationID, publishFn, onStarted)
+		if err != nil {
+			publishErr(fmt.Sprintf("failed to start %s: %v", kind, err))
+			if !mgr.HasSession(cmd.SessionID) {
+				publishFn(ended(redactAgentSecrets(fmt.Sprintf("start failed: %v", err)), "error", -1))
+			}
+		}
+
+	case sendType:
+		if cmd.SessionID == "" {
+			publishErr("sessionID is required for " + sendType)
+			return
+		}
+		if strings.TrimSpace(cmd.Input) == "" {
+			publishErr("input (user turn text) is required for " + sendType)
+			return
+		}
+		timeout := time.Duration(0)
+		if cmd.TimeoutMs > 0 {
+			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
+		}
+		if err := mgr.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+			// Send publishes its own error frame for ordinary turn failures;
+			// publish here only when it could not.
+			msg := err.Error()
+			if strings.Contains(msg, "not found") ||
+				strings.Contains(msg, "already has a turn in flight") ||
+				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
+				publishErr(fmt.Sprintf("failed to send to %s: %v", kind, err))
+			}
+		}
+
+	case endType:
+		if cmd.SessionID == "" {
+			publishErr("sessionID is required for " + endType)
+			return
+		}
+		fmt.Printf("%s%s Ending session %s%s\n", colorYellow, spec.LogTag, cmd.SessionID, colorReset)
+		trackTerminalPublishStart()
+		defer trackTerminalPublishEnd()
+		if err := mgr.End(cmd.SessionID); err != nil {
+			if errors.Is(err, errEndUnconfirmed) {
+				publishErr(fmt.Sprintf("end unconfirmed: %v", err))
+				return
+			}
+			if errors.Is(err, errEndStaleSession) {
+				fmt.Printf("%s%s Withholding every frame for %s: %v%s\n",
+					colorYellow, spec.LogTag, cmd.SessionID, err, colorReset)
+				return
+			}
+			publishFn(ended(fmt.Sprintf("end: %v", err), "success", 0))
+			return
+		}
+		publishFn(ended(spec.DisplayName+" native ended", "success", 0))
+
+	default:
+		publishErr(fmt.Sprintf("unknown %s command type: %s", kind, cmd.Type))
+	}
+}
+
+// publishOneShotNativeError surfaces a synchronous failure as <prefix>_error.
+func publishOneShotNativeError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, spec nativeFrameKind, errMsg string) {
+	fmt.Printf("%s%s Error: %s%s\n", colorRed, spec.LogTag, errMsg, colorReset)
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      redactAgentSecrets(errMsg),
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		BootID:      agentBootID,
+		Type:        spec.frameType("error"),
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s%s Failed to publish error: %v%s\n", colorRed, spec.LogTag, err, colorReset)
 	}
 }

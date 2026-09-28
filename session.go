@@ -477,6 +477,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		}
 	}
 
+	// Muse Code's synthesized prompt is staged to --prompt-file below on every
+	// platform, so the CreateProcess cap above does not apply; bound it by the
+	// same limit the native chat path enforces instead.
+	if isMuseCodeCommand(command) {
+		if err := checkMuseCodeLegacyPromptSize(cliArgs); err != nil {
+			return err
+		}
+	}
+
 	// Opt-in PTY path for recognized resident TUI agents (agy/antigravity) that
 	// require a real terminal. macOS/Linux only — startPTYSession rejects on
 	// Windows (ConPTY deferred). PTY output is merged (stdout+stderr) and
@@ -520,6 +529,29 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	if executable == "" {
 		executable = resolveExecutable(command)
 	}
+
+	// A synthesized Muse prompt moves to an owner-only `--prompt-file` on every
+	// platform: argv is readable through the process list, and a prompt can hold
+	// source code or credentials (the native chat path keeps it off argv too).
+	// Staging failure refuses the launch rather than falling back to plaintext
+	// argv. The Windows `.cmd` shim launch below depends on it as well — cmd.exe
+	// has a single expansion pass, so oneShotShimScript refuses an operand
+	// holding a quote or a line break, and a prompt routinely holds both.
+	if isMuseCodeCommand(command) {
+		rewritten, staged, stageErr := rewriteMuseCodePromptToFile(cliArgs)
+		if stageErr != nil {
+			return fmt.Errorf("muse could not stage its prompt file; refusing to place the prompt on argv: %w", stageErr)
+		}
+		if staged != "" {
+			cliArgs, promptFile = rewritten, staged
+		}
+	}
+
+	// A Windows `.cmd` / `.bat` launcher (an npm-style `muse.cmd`) cannot be
+	// started by CreateProcess directly — the same failure newOneShotCommand
+	// fixes on the native chat path. The generic session_start / takeover route
+	// resolves that same installation, so shim-launch it the same way.
+	museShimLaunch := isMuseCodeCommand(command) && isWindowsShimPath(executable)
 
 	logSession(id, "%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, sessionArgsForLog(cliArgs), colorReset)
@@ -571,6 +603,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			Dir:        proc.Dir,
 			PromptFile: promptFile,
 		})
+	}
+	if museShimLaunch {
+		// cmd.exe wrapper carrying the shim path and every non-fixed operand in
+		// its environment. The wrapper is an intermediate process, not muse
+		// itself; killSessionProcess tree-kills Windows sessions, so the shim's
+		// child goes down with it.
+		shimmed := newOneShotCommand(context.Background(), executable, cliArgs, proc.Env, proc.Dir)
+		hideWindow(shimmed)
+		proc = shimmed
 	}
 	if isOpenCodeCommand(command) {
 		// Same launcher the `__cli_smoke__` probe and the resident chat path use
@@ -1670,6 +1711,13 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
+	case isMuseCodeCommand(command):
+		// One-shot with the prompt on argv (relocated to --prompt-file) and NO
+		// stdin protocol: leaving the pipe open would hand `muse exec` an input
+		// stream it waits on. Close unconditionally — unlike codex there is no
+		// "session opened with no prompt yet" case here, because this legacy
+		// path always carries its prompt positionally.
+		return true
 	case isOpenCodeCommand(command):
 		// One-shot, stdin-fed: close the pipe right after the prompt is
 		// written, or `opencode run` waits on an input stream nothing will
@@ -1732,6 +1780,12 @@ func detectCLITerminalEvent(command, line string) bool {
 	if isAntigravityCommand(command) {
 		eventType, _ := event["event"].(string)
 		return eventType == "result"
+	}
+	if isMuseCodeCommand(command) {
+		// `muse exec --json` ends every turn with run.terminal.{completed,
+		// failed,cancelled}, right before the one-shot process exits.
+		payloadType, _ := event["payload_type"].(string)
+		return strings.HasPrefix(payloadType, "run.terminal.")
 	}
 
 	eventType, _ := event["type"].(string)
@@ -1881,11 +1935,36 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
-	flushBatch := func() {
-		if len(batch) == 0 {
+	// flushBatchTail publishes the accumulated display text. final releases the
+	// held-back redaction carry and is set only by the all-readers-done flush,
+	// so no text is lost when the stream ends.
+	// museRedaction holds that carry for the Muse path (see below) OUT of the
+	// batch, so an interleaved stderr line cannot consume a held label's
+	// context — stdout and stderr merge asynchronously into `lines` here.
+	var museRedaction streamRedactionCarrier
+	flushBatchTail := func(final bool) {
+		if len(batch) == 0 && museRedaction.carry == "" {
 			return
 		}
-		output := joinStreamBatch(batch)
+		var output string
+		// Muse Code on the generic session_start / takeover path: the native
+		// one-shot manager redacts every frame it publishes, but this PTY path
+		// publishes joined display text verbatim, so a tool echoing an
+		// inherited META_API_KEY would reach the cloud unmasked. The same pass
+		// runs here, with a credential-shaped tail of the agent's OWN stream
+		// text carried into the next flush so a pair split across two batches
+		// is still seen whole. Scoped to Muse: every other agent's stream
+		// frames stay byte-identical.
+		if isMuseCodeCommand(session.Command) {
+			output = joinStreamBatch(museRedaction.rewrite(batch, final))
+			batch = batch[:0]
+			if output == "" {
+				return
+			}
+		} else {
+			output = joinStreamBatch(batch)
+			batch = batch[:0]
+		}
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -1902,12 +1981,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// Once per session — see takeUnpublishedCliConversationID.
 			ConversationID: session.takeUnpublishedCliConversationID(),
 		})
-
-		batch = batch[:0]
 	}
+
+	flushBatch := func() { flushBatchTail(false) }
 
 	var antigravityDeltas strings.Builder
 	var antigravityResultSeen bool
+	// Muse Code: whether this turn streamed any text, so its terminal
+	// record's full text is not rendered a second time.
+	var museCodeDeltaSeen bool
 
 	// Claude streams one content block at a time. Deltas inside a block join
 	// with nothing between them (see joinStreamBatch), but the boundary BETWEEN
@@ -1958,6 +2040,25 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				if family != codexCompleteFamily {
 					return // the same message in the stream's other dialect
 				}
+			}
+		}
+		if isMuseCodeCommand(session.Command) {
+			// `muse exec --json` records render as the assistant's text (deltas
+			// joined as fragments), the terminal text only when nothing
+			// streamed, and a failure in the shared turn-failed wrapper;
+			// bookkeeping and task records render nothing. A non-JSON line
+			// (banner, plain error) falls through and keeps its newline.
+			if ev, ok := parseMuseCodeEventLine(strings.TrimSpace(lineText)); ok {
+				switch {
+				case ev.TextDelta != "":
+					museCodeDeltaSeen = true
+					batch = append(batch, streamBatchEntry{text: ev.TextDelta, fragment: true, agentText: true})
+				case ev.FinalText != "" && !museCodeDeltaSeen:
+					batch = append(batch, streamBatchEntry{text: ev.FinalText, fragment: true, agentText: true})
+				case ev.Failure != "":
+					batch = append(batch, streamBatchEntry{text: "\n" + ev.Failure + "\n", fragment: true})
+				}
+				return
 			}
 		}
 		if isAntigravityCommand(session.Command) {
@@ -2026,8 +2127,8 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					session.mu.Unlock()
 				}
 				flushCodexDeltas()
-				// All readers done — flush remaining
-				flushBatch()
+				// All readers done — flush remaining, releasing any carry.
+				flushBatchTail(true)
 				return
 			}
 
@@ -2675,7 +2776,14 @@ var openCodeUnrelatedStripped = []string{
 // credentials via openCodeUnrelatedStripped.
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	stripClaudeBilling := isClaudeCommand(command)
-	stripOpenCodeUnrelated := isOpenCodeCommand(command)
+	// One-shot agents that must not see other agents' provider credentials.
+	var unrelatedStripped []string
+	switch {
+	case isOpenCodeCommand(command):
+		unrelatedStripped = openCodeUnrelatedStripped
+	case isMuseCodeCommand(command):
+		unrelatedStripped = museCodeUnrelatedStripped
+	}
 
 	filtered := make([]string, 0, len(env))
 	var stripped []string
@@ -2697,8 +2805,8 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 				}
 			}
 		}
-		if !drop && stripOpenCodeUnrelated {
-			for _, p := range openCodeUnrelatedStripped {
+		if !drop {
+			for _, p := range unrelatedStripped {
 				if strings.HasPrefix(upper, p) {
 					drop = true
 					break
@@ -2842,8 +2950,9 @@ func isResidentAgentSessionCommand(command string) bool {
 	// launches the interactive TUI, which on a headless remote session produces
 	// escape-sequence noise and never exits. Classifying it as a resident agent
 	// is what routes it through buildOpenCodeInteractiveArgs, which forces
-	// `run --format json` and can never fall through to the TUI.
-	return isAntigravityCommand(command) || isOpenCodeCommand(command)
+	// `run --format json` and can never fall through to the TUI. Muse Code is
+	// here for the same reason (buildMuseCodeInteractiveArgs forces `exec`).
+	return isAntigravityCommand(command) || isOpenCodeCommand(command) || isMuseCodeCommand(command)
 }
 
 /* --------------------------------------------------------------------------
@@ -2899,6 +3008,8 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 			return cliArgs, nil
 		}
 		return cliArgs, &prompt
+	case isMuseCodeCommand(command):
+		return buildMuseCodeInteractiveArgs(args), nil
 	case strings.HasPrefix(base, "grok"):
 		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), nil
 	default:
@@ -4339,6 +4450,14 @@ func resolveExecutable(command string) string {
 	// from StartSession can still find the official install on a PATH miss.
 	if isGrokCommand(command) {
 		if p := resolveGrokInstallerBinary(); p != "" {
+			return p
+		}
+	}
+	// Same fallback for Muse Code's installer dir (MUSE_INSTALL_DIR, else
+	// ~/.local/bin or %LOCALAPPDATA%\Programs\muse), so the generic
+	// session_start / takeover path runs the install detection reported.
+	if isMuseCodeCommand(command) {
+		if p := resolveInstallerBinary("muse", installerBinDirFor("muse")); p != "" {
 			return p
 		}
 	}

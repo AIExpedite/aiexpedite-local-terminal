@@ -1,7 +1,7 @@
 // File: cli_conversation_resume.go
 // -----------------------------------------------------------------------------
 // Exact conversation resume for the ONE-SHOT CLIs on the generic session path
-// (Antigravity `agy`, OpenCode).
+// (Antigravity `agy`, OpenCode, Muse Code `muse`).
 //
 // On session_start these CLIs run one process per turn: the prompt goes in,
 // stdin closes, the process exits and the session ends. A follow-up therefore
@@ -43,7 +43,7 @@ import (
 )
 
 // cliConversationIDPattern mirrors terminal-service's CLI_CONVERSATION_ID_RE.
-// agy mints UUIDs and OpenCode `ses_<base62>`; this is deliberately an allowlist
+// agy and Muse Code use UUIDs and OpenCode `ses_<base62>`; this is deliberately an allowlist
 // of harmless characters rather than either exact shape, because the value
 // becomes a process ARGUMENT — the one thing it must never do is start with `-`
 // or carry whitespace or quotes.
@@ -93,6 +93,12 @@ func extractCliConversationID(command, line string) string {
 		// session-id shape (`ses_…`) is accepted.
 		if _, sessionID, ok := parseOpenCodeEventLine(trimmed); ok && strings.HasPrefix(sessionID, "ses") {
 			id = sessionID
+		}
+	case isMuseCodeCommand(command):
+		// Muse Code's id is caller-supplied; an event that echoes one is only
+		// accepted in the exact UUID shape `--session-id` takes.
+		if ev, ok := parseMuseCodeEventLine(trimmed); ok && isValidMuseCodeSessionID(ev.SessionID) {
+			id = ev.SessionID
 		}
 	default:
 		return ""
@@ -173,8 +179,17 @@ func applyCliResumeSeed(command string, callerArgs, cliArgs []string, conversati
 		}
 		// buildOpenCodeInteractiveArgs leads with `run --format json`.
 		flag, insertAt = "--session", 3
+	case isMuseCodeCommand(command):
+		if isMuseCodeDiagnosticInvocation(callerArgs) {
+			return nil, fmt.Errorf("conversation resume refused: not a muse exec")
+		}
+		if !isValidMuseCodeSessionID(conversationID) {
+			return nil, fmt.Errorf("conversation resume refused: a Muse Code session id is a UUID")
+		}
+		// buildMuseCodeInteractiveArgs leads with `exec --json --disable-approval`.
+		flag, insertAt = "--session-id", 3
 	default:
-		return nil, fmt.Errorf("conversation resume is only supported for one-shot CLIs (agy, opencode); got %q", commandBaseName(command))
+		return nil, fmt.Errorf("conversation resume is only supported for one-shot CLIs (agy, opencode, muse); got %q", commandBaseName(command))
 	}
 	if len(cliArgs) < insertAt {
 		return nil, fmt.Errorf("conversation resume refused: unexpected %s argument shape", commandBaseName(command))

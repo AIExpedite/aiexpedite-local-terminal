@@ -5,13 +5,17 @@
 // Provider-neutral by design: bearer headers, `api_key=` pairs, OAuth URLs,
 // credential-file paths and long opaque blobs are shapes, not vendors. It began
 // life as `redactAntigravitySecrets` in antigravity_native.go with OpenCode
-// calling through a pass-through alias; three providers now depend on it
-// (Antigravity, OpenCode, and the Claude Code smoke probe), and a provider name
+// calling through a pass-through alias; four providers now depend on it
+// (Antigravity, OpenCode, Muse Code via the one-shot core — whose META_API_KEY
+// is covered by the `api_key=` shape — and the Claude Code smoke probe), and a provider name
 // on a shared redactor is exactly how a second, drifting copy gets written —
 // one agent's frames would then leak what the other's mask.
 package main
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 var agentSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`),
@@ -42,5 +46,173 @@ func redactAgentSecrets(s string) string {
 	out = agentOpaqueBlobPattern.ReplaceAllStringFunc(out, func(m string) string {
 		return m[:8] + "…[REDACTED]"
 	})
+	return out
+}
+
+// agentSecretCarryTailPattern matches a trailing credential KEY whose value has
+// not fully arrived: `api_key=`, `token: ab`, `authorization: bearer `. The
+// per-frame patterns above need the whole pair on one string, so a pair split
+// across two streamed frames would publish the value verbatim.
+var agentSecretCarryTailPattern = regexp.MustCompile(
+	`(?i)(?:authorization:\s*bearer|api[_-]?key\s*[=:]|token\s*[=:])\s*[A-Za-z0-9._\-]*$`)
+
+// agentSecretLabelPrefixTailPattern matches a trailing PARTIAL credential
+// label — `META_API_`, `api_ke`, `tok`, `authorization: bea` — that a flush
+// boundary cut before its separator. agentSecretCarryTailPattern needs the
+// whole label, and the value's frame then begins `KEY=mk-live-…`, which no
+// per-frame pattern matches either, so the pair would stream out complete
+// across two frames. Unanchored on the left, like the per-frame patterns it
+// feeds (they match `api_key` inside `META_API_KEY`), so even a one-letter
+// `a`/`t` tail is held; the cost is that fragment reaching the cloud one flush
+// later, and it is bounded by the longest label prefix.
+var agentSecretLabelPrefixTailPattern = regexp.MustCompile(`(?i)(?:` +
+	labelPrefixAlternation("a", "p", "i", `[_-]?`, "k", "e", "y", `\s*`) + `|` +
+	labelPrefixAlternation("t", "o", "k", "e", "n", `\s*`) + `|` +
+	labelPrefixAlternation("a", "u", "t", "h", "o", "r", "i", "z", "a", "t", "i", "o", "n", ":", `\s*`, "b", "e", "a", "r", "e") +
+	`)$`)
+
+// labelPrefixAlternation builds a regexp matching any non-empty prefix of the
+// label spelled by atoms (one regexp atom per label character):
+// a(?:p(?:i)?)? for "a", "p", "i".
+func labelPrefixAlternation(atoms ...string) string {
+	out := ""
+	for i := len(atoms) - 1; i >= 0; i-- {
+		if out == "" {
+			out = atoms[i]
+		} else {
+			out = atoms[i] + "(?:" + out + ")?"
+		}
+	}
+	return out
+}
+
+// agentOpaqueBlobCarryTailPattern matches a trailing opaque run long enough to
+// grow into the 80-char blob shape. The 16-char floor is where an unbroken run
+// stops looking like ordinary streamed prose: lower would hold back the tail of
+// almost every flush (and stall words like "thinking"), higher would let a
+// split blob through. Residual, by construction: a blob split at fewer than 16
+// characters publishes that leading fragment unmasked; maskOpaqueContinuation
+// then masks the rest of the run once the two halves together reach the blob
+// shape — so no whole credential streams out, but a short prefix can.
+var agentOpaqueBlobCarryTailPattern = regexp.MustCompile(`[A-Za-z0-9_-]{16,}$`)
+
+// agentSecretCarryMaxBytes bounds the held-back tail. Past it the text is
+// emitted (masked by the per-frame pass) rather than buffered without limit —
+// an unbroken multi-kilobyte run is not a credential the carry would classify.
+const agentSecretCarryMaxBytes = 4096
+
+// splitRedactionCarry splits streamed text into the part that is safe to
+// publish now and a tail to prepend to the next flush, so redactAgentSecrets
+// sees credential material whole. A masked frame cannot be retracted, so the
+// ambiguous tail waits for the bytes that would classify it; every caller
+// flushes the carry unconditionally when the stream ends.
+func splitRedactionCarry(text string) (emit string, carry string) {
+	if text == "" {
+		return "", ""
+	}
+	// The earliest ambiguous tail wins: holding more is always safe, and a
+	// label prefix can sit inside a longer opaque run (`x_META_API_`).
+	idx := -1
+	for _, re := range []*regexp.Regexp{
+		agentSecretCarryTailPattern,
+		agentSecretLabelPrefixTailPattern,
+		agentOpaqueBlobCarryTailPattern,
+	} {
+		if loc := re.FindStringIndex(text); loc != nil && (idx < 0 || loc[0] < idx) {
+			idx = loc[0]
+		}
+	}
+	// idx == 0 means the ambiguous tail IS the whole buffer — a timer window
+	// that held nothing but `META_API_KEY=`, or nothing but the opaque run that
+	// follows one. That is exactly the case the carry exists for, so it is
+	// carried too: publishing it would stream the label without its value (or
+	// the value without its label), and neither frame can then be matched by
+	// the per-frame pass. Progress is still guaranteed because the carry is
+	// released unconditionally once it reaches the bound below — which equals
+	// the coalescer's own flush threshold — or when the stream ends.
+	if idx < 0 || len(text)-idx >= agentSecretCarryMaxBytes {
+		return text, ""
+	}
+	return text[:idx], text[idx:]
+}
+
+// agentOpaqueBlobMinLen is the run length agentOpaqueBlobPattern masks.
+const agentOpaqueBlobMinLen = 80
+
+// agentOpaqueRunChars is the character class of agentOpaqueBlobPattern.
+const agentOpaqueRunChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+
+// maskOpaqueContinuation closes the residual splitRedactionCarry leaves: a run
+// published below the carry floor (a 10-char prefix) whose continuation — up
+// to 79 chars, too short for the per-frame blob pattern on its own — follows
+// in a later flush. publishedRun is the length of the unbroken run the
+// previous published text ENDED with; when it plus this text's leading run
+// reaches the blob shape, the leading run is masked. Returns the text to
+// publish and the run length to pass into the next call. text is the raw
+// (pre-render) stream text, so the run is measured on what the CLI streamed.
+func maskOpaqueContinuation(text string, publishedRun int) (string, int) {
+	lead := len(text) - len(strings.TrimLeft(text, agentOpaqueRunChars))
+	if lead == len(text) {
+		nextRun := publishedRun + lead
+		if publishedRun > 0 && nextRun >= agentOpaqueBlobMinLen {
+			return "[REDACTED]", nextRun
+		}
+		return text, nextRun
+	}
+	tail := len(text) - len(strings.TrimRight(text, agentOpaqueRunChars))
+	if lead > 0 && publishedRun > 0 && publishedRun+lead >= agentOpaqueBlobMinLen {
+		text = "[REDACTED]" + text[lead:]
+	}
+	return text, tail
+}
+
+// streamRedactionCarrier applies the streamed-credential redaction to a display
+// batch whose entries interleave the agent's own stream text with unrelated
+// lines (stderr, a login banner, a non-JSON error). The ambiguous tail lives
+// HERE, not in the batch: re-queuing `META_API_KEY=` as batch text let the next
+// unrelated line become the value it bound to, so the label published masked
+// while the real key streamed later on its own, unlabelled and too short for
+// the opaque-blob shape. Keeping the carry out of band means unrelated output
+// passes through untouched and the label still meets its value.
+type streamRedactionCarrier struct {
+	carry string
+	// publishedRun is the opaque run the last published agent text ended
+	// with — see maskOpaqueContinuation.
+	publishedRun int
+}
+
+// rewrite redacts entries in arrival order. An agentText entry joins the held
+// carry, feeds the continuation state, and (unless final) leaves a new
+// credential-shaped tail behind; every other entry is redacted on its own and
+// leaves the carry untouched. final releases the carry, so nothing is lost when
+// the stream ends — including when the last batch carries no agent text at all.
+func (c *streamRedactionCarrier) rewrite(entries []streamBatchEntry, final bool) []streamBatchEntry {
+	out := make([]streamBatchEntry, 0, len(entries)+1)
+	released := false
+	for _, entry := range entries {
+		if !entry.agentText {
+			if text := redactAgentSecrets(entry.text); text != "" {
+				out = append(out, streamBatchEntry{text: text, fragment: entry.fragment})
+			}
+			continue
+		}
+		text := c.carry + entry.text
+		c.carry = ""
+		released = true
+		if !final {
+			text, c.carry = splitRedactionCarry(text)
+		}
+		if text == "" {
+			continue
+		}
+		text, c.publishedRun = maskOpaqueContinuation(text, c.publishedRun)
+		out = append(out, streamBatchEntry{text: redactAgentSecrets(text), fragment: entry.fragment, agentText: true})
+	}
+	if final && !released && c.carry != "" {
+		text, run := maskOpaqueContinuation(c.carry, c.publishedRun)
+		c.publishedRun = run
+		c.carry = ""
+		out = append(out, streamBatchEntry{text: redactAgentSecrets(text), fragment: true, agentText: true})
+	}
 	return out
 }

@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.38"
+var Version = "v1.0.39"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -349,6 +349,13 @@ func StartAgent(cfg *Config) {
 	go globalOpenCodeNativeManager.CleanupStale(openCodeNativeMaxAge)
 	fmt.Println("[aiexpedite] OpenCode native manager ready")
 
+	/* 3b5b. Initialize Muse Code native manager (one-shot exec --json) ----- */
+	// Drives `muse exec --json` with exact `--session-id <uuid>` resume for
+	// Muse Code Chat, on the shared one-shot core (oneshot_native.go).
+	globalMuseCodeNativeManager = NewMuseCodeNativeManager()
+	go globalMuseCodeNativeManager.CleanupStale(oneShotNativeMaxAge)
+	fmt.Println("[aiexpedite] Muse Code native manager ready")
+
 	/* 3b6. Register in-flight work sources for the update-drain accounting -- */
 	// ActiveWork() must see every accepted session before an automatic update
 	// may install. Register one contributor per manager now that they exist so
@@ -386,6 +393,12 @@ func StartAgent(cfg *Config) {
 	registerDrainWorkSource(func() int {
 		if globalOpenCodeNativeManager != nil {
 			return globalOpenCodeNativeManager.ActiveCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalMuseCodeNativeManager != nil {
+			return globalMuseCodeNativeManager.ActiveCount()
 		}
 		return 0
 	})

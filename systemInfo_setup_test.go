@@ -389,6 +389,7 @@ func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
 		{ID: "codex", Command: "codex", VersionArgs: []string{"--version"}},
 		{ID: "grok", Command: "grok", VersionArgs: []string{"--version"}},
 		{ID: "opencode", Command: "opencode"}, // no versionArgs: defaults to --version
+		{ID: "museCode", Command: "muse"},
 	}
 	got, skipped := normalizeSetupToolCatalogReport(real)
 	if len(skipped) != 0 || len(got) != len(real) {

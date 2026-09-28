@@ -387,3 +387,27 @@ func TestResolveExecutable_GrokInstallerBinFallback(t *testing.T) {
 		t.Errorf("resolveExecutable(\"grok\") = %q, want %q (installer-bin fallback)", got, stub)
 	}
 }
+
+// TestResolveExecutable_MuseCodeInstallerBinFallback pins the Muse Code half of
+// the installer-bin fallback: a generic session_start of `muse` on a PATH miss
+// runs the binary in MUSE_INSTALL_DIR that detection already reported.
+func TestResolveExecutable_MuseCodeInstallerBinFallback(t *testing.T) {
+	binDir := t.TempDir()
+	name := "muse"
+	if runtime.GOOS == "windows" {
+		name = "muse.cmd"
+	}
+	stub := filepath.Join(binDir, name)
+	if err := os.WriteFile(stub, []byte("exit 1\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("MUSE_INSTALL_DIR", binDir)
+
+	if got := resolveExecutable("muse"); got != stub {
+		t.Errorf("resolveExecutable(\"muse\") = %q, want %q (installer-bin fallback)", got, stub)
+	}
+	if got := resolveMuseCodeExecutable(); got != stub {
+		t.Errorf("resolveMuseCodeExecutable() = %q, want %q (installer-bin fallback)", got, stub)
+	}
+}

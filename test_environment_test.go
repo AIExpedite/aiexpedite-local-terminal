@@ -17,6 +17,8 @@ func isolateTestUserHome(t *testing.T, home string) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("GROK_BIN_DIR", filepath.Join(home, ".grok", "bin"))
+	// Muse Code's Windows installer dir is under %LOCALAPPDATA%, not HOME.
+	t.Setenv("MUSE_INSTALL_DIR", filepath.Join(home, ".local", "bin"))
 }
 
 // ─────────────────────────── suite-wide sandbox ───────────────────────────
