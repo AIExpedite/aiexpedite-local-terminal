@@ -7196,6 +7196,13 @@ type oneShotNativeCommandTarget interface {
 	HasSession(id string) bool
 }
 
+// endPublicationReserver is implemented by targets that can hold a logical id
+// across End and the publication of its ended frame (oneShotNativeManager).
+type endPublicationReserver interface {
+	reserveEndPublication(id string) bool
+	releaseEndPublication(id string)
+}
+
 // handleOneShotNativeCommand dispatches <prefix>_{start,send,end} for a kind
 // whose logical session outlives its per-turn child. Start registers a session
 // (no process), Send runs one turn and streams each event as its own chunk,
@@ -7300,6 +7307,18 @@ func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget
 			return
 		}
 		fmt.Printf("%s%s Ending session %s%s\n", colorYellow, spec.LogTag, cmd.SessionID, colorReset)
+		// End frees the id before the ended frame below goes out, and that
+		// frame names the session only by id: keep it reserved through the
+		// publish so a concurrent or redelivered START cannot take it and have
+		// its live reservation released by this frame (as reapStaleSession).
+		if r, ok := mgr.(endPublicationReserver); ok {
+			if !r.reserveEndPublication(cmd.SessionID) {
+				// Another END already owns this id's ended frame.
+				publishErr(fmt.Sprintf("end already in progress for %s session %s", kind, cmd.SessionID))
+				return
+			}
+			defer r.releaseEndPublication(cmd.SessionID)
+		}
 		trackTerminalPublishStart()
 		defer trackTerminalPublishEnd()
 		if err := mgr.End(cmd.SessionID); err != nil {

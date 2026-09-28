@@ -648,6 +648,50 @@ func TestOneShotNative_StaleReapReservesTheIDThroughEndedPublication(t *testing.
 	}
 }
 
+// An explicit END has the same window as the stale reaper: End frees the id
+// before the *_end handler publishes ended, so a concurrent or redelivered
+// Start must be refused until that frame is out.
+func TestOneShotNative_ExplicitEndReservesTheIDThroughEndedPublication(t *testing.T) {
+	m := installMuseCodeStub(t)
+	cwd := startMuse(t, m, "s", "")
+	kind := m.spec.nativeFrameKind
+
+	admitted := make(chan error, 1)
+	var published []resultMsg
+	var errs []string
+	publish := func(msg resultMsg) {
+		// Racing Start, as the cloud would once the id looked free.
+		admitted <- m.Start("s", cwd, "ws", "uid", "", nil, nil)
+		published = append(published, msg)
+	}
+	cmd := commandMsg{ID: "c1", Type: kind.FramePrefix + "_end", SessionID: "s"}
+	dispatchOneShotNativeCommand(cmd, m, kind, publish, func(e string) { errs = append(errs, e) })
+
+	if err := <-admitted; err == nil {
+		t.Fatal("a Start racing the explicit END's ended publication must be refused")
+	}
+	if len(errs) != 0 || len(published) != 1 || published[0].Type != kind.frameType("ended") {
+		t.Fatalf("the END must publish exactly one ended frame, errs=%v frames=%+v", errs, published)
+	}
+	if m.Get("s") != nil {
+		t.Fatal("the ended session must not be replaced inside the reserved window")
+	}
+	if err := m.Start("s", cwd, "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("a Start after the ended frame must be admitted: %v", err)
+	}
+
+	// A second END while the id is held publishes no ended frame of its own.
+	if !m.reserveEndPublication("s") {
+		t.Fatal("reserve")
+	}
+	published, errs = nil, nil
+	dispatchOneShotNativeCommand(cmd, m, kind, func(msg resultMsg) { published = append(published, msg) }, func(e string) { errs = append(errs, e) })
+	m.releaseEndPublication("s")
+	if len(published) != 0 || len(errs) != 1 || m.Get("s") == nil {
+		t.Fatalf("a concurrent END must not end or publish, errs=%v frames=%+v", errs, published)
+	}
+}
+
 // A one-shot session must be visible to the spawn ledger the same way the
 // resident kinds are: a logical entry between turns (so a restart can certify
 // it ended rather than fence the cloud reservation), a tracked PID for the

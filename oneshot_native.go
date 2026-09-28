@@ -250,10 +250,10 @@ func (s *oneShotNativeSession) clearActiveProcess() {
 type oneShotNativeManager struct {
 	spec     *oneShotNativeSpec
 	sessions map[string]*oneShotNativeSession
-	// reaping holds ids the stale reaper has taken out of sessions but whose
-	// ended frame is still unpublished. Start refuses a reserved id so that
-	// frame can never be attributed to a replacement session (and release its
-	// cloud reservation). Guarded by mu.
+	// reaping holds ids an END (explicit or the stale reaper) has taken out of
+	// sessions but whose ended frame is still unpublished. Start refuses a
+	// reserved id so that frame can never be attributed to a replacement
+	// session (and release its cloud reservation). Guarded by mu.
 	reaping map[string]struct{}
 	mu      sync.RWMutex
 
@@ -1216,10 +1216,10 @@ func (m *oneShotNativeManager) endStaleSessions(maxAge time.Duration) {
 // replacement Start landing in the gap would have its live reservation released
 // by this stale frame.
 func (m *oneShotNativeManager) reapStaleSession(id string, session *oneShotNativeSession, workspaceID, uid string, publishFn PublishFunc) {
-	if !m.reserveForReap(id) {
+	if !m.reserveEndPublication(id) {
 		return
 	}
-	defer m.releaseReap(id)
+	defer m.releaseEndPublication(id)
 
 	m.logf(colorYellow, "Reaping stale session %s", id)
 	trackTerminalPublishStart()
@@ -1258,11 +1258,11 @@ func (m *oneShotNativeManager) ShutdownAll() {
 	}
 }
 
-// reserveForReap claims id for the stale reaper before it ends the session, so
-// the id stays off-limits until the ended frame has been published. Returns
-// false when another reaper already holds it. Caller must releaseReap on
-// every path.
-func (m *oneShotNativeManager) reserveForReap(id string) bool {
+// reserveEndPublication claims id for an END (the *_end handler or the stale
+// reaper) before it ends the session, so the id stays off-limits until the
+// ended frame has been published. Returns false when another END already holds
+// it. Caller must releaseEndPublication on every path.
+func (m *oneShotNativeManager) reserveEndPublication(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, held := m.reaping[id]; held {
@@ -1272,13 +1272,13 @@ func (m *oneShotNativeManager) reserveForReap(id string) bool {
 	return true
 }
 
-func (m *oneShotNativeManager) releaseReap(id string) {
+func (m *oneShotNativeManager) releaseEndPublication(id string) {
 	m.mu.Lock()
 	delete(m.reaping, id)
 	m.mu.Unlock()
 }
 
-// reapReservedErr refuses a Start whose id a reaper is still publishing an
+// reapReservedErr refuses a Start whose id an END is still publishing an
 // ended frame for. Caller holds m.mu. Fail closed and let the cloud retry:
 // registering here would hand that stale ended frame — which carries only the
 // logical id — to the new session and release its reservation.
@@ -1286,7 +1286,7 @@ func (m *oneShotNativeManager) reapReservedErr(id string) error {
 	if _, held := m.reaping[id]; !held {
 		return nil
 	}
-	return fmt.Errorf("%s native session %s is being reaped; retry once its ended frame is published", m.spec.DisplayName, id)
+	return fmt.Errorf("%s native session %s is being ended; retry once its ended frame is published", m.spec.DisplayName, id)
 }
 
 // removeSessionIfSame removes id only while it still maps to s; false means a
