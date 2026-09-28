@@ -647,3 +647,89 @@ func TestOneShotNative_StaleReapReservesTheIDThroughEndedPublication(t *testing.
 		t.Fatalf("a Start after the ended frame must be admitted: %v", err)
 	}
 }
+
+// A one-shot session must be visible to the spawn ledger the same way the
+// resident kinds are: a logical entry between turns (so a restart can certify
+// it ended rather than fence the cloud reservation), a tracked PID for the
+// turn's child (so the next boot can reap a survivor), and no record once the
+// session is released.
+func TestOneShotNative_TurnsAndSessionAreRecordedInTheSpawnLedger(t *testing.T) {
+	dir := t.TempDir()
+	ledger := newTestLedger(t, dir, "boot-1")
+	var mu sync.Mutex
+	var tracked []int
+	inner := ledger.startToken
+	ledger.startToken = func(pid int) (string, error) {
+		mu.Lock()
+		tracked = append(tracked, pid)
+		mu.Unlock()
+		return inner(pid)
+	}
+	prev := globalSpawnLedger
+	globalSpawnLedger = ledger
+	t.Cleanup(func() { globalSpawnLedger = prev })
+
+	m := installMuseCodeStub(t)
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameDeltaHello, museFrameCompleted))
+	startMuse(t, m, "s", "")
+
+	entries := readLedgerFile(t, dir).Entries
+	if len(entries) != 1 || entries[0].SessionID != "s" || !entries[0].Logical {
+		t.Fatalf("start must open a logical ledger entry, got %+v", entries)
+	}
+
+	sink := &frameSink{}
+	if err := m.Send("s", "say hello", sink.publish, time.Minute); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	mu.Lock()
+	turnPIDs := len(tracked)
+	mu.Unlock()
+	if turnPIDs != 1 {
+		t.Fatalf("the turn's child must be tracked in the ledger, tracked=%d", turnPIDs)
+	}
+	entries = readLedgerFile(t, dir).Entries
+	if len(entries) != 1 || !entries[0].Logical {
+		t.Fatalf("the logical entry must survive the turn, got %+v", entries)
+	}
+	// The child exited and its tree is proven empty, so the turn's PID is gone
+	// while the logical session stays.
+	if len(entries[0].PIDs) != 0 {
+		t.Fatalf("a completed turn must untrack its PID, got %+v", entries[0].PIDs)
+	}
+
+	if err := m.End("s"); err != nil {
+		t.Fatalf("end: %v", err)
+	}
+	if entries = readLedgerFile(t, dir).Entries; len(entries) != 0 {
+		t.Fatalf("End must release the ledger entry, got %+v", entries)
+	}
+}
+
+// A child that never starts must not leave a pending spawn behind: the next
+// boot would read it as "may have leaked a process" forever.
+func TestOneShotNative_FailedStartAbortsThePendingSpawn(t *testing.T) {
+	dir := t.TempDir()
+	ledger := newTestLedger(t, dir, "boot-1")
+	prev := globalSpawnLedger
+	globalSpawnLedger = ledger
+	t.Cleanup(func() { globalSpawnLedger = prev })
+
+	m := installMuseCodeStub(t)
+	startMuse(t, m, "s", "")
+	// Point the spec at a path that cannot be executed, so cmd.Start fails
+	// after beginSessionSpawn recorded the pending spawn.
+	missing := filepath.Join(t.TempDir(), "not-installed")
+	// A copy: the spec is a package-level singleton shared by every manager.
+	spec := *m.spec
+	spec.ResolveExecutable = func() string { return missing }
+	m.spec = &spec
+
+	if err := m.Send("s", "say hello", (&frameSink{}).publish, time.Minute); err == nil {
+		t.Fatal("a turn whose child cannot start must be an error")
+	}
+	entries := readLedgerFile(t, dir).Entries
+	if len(entries) != 1 || entries[0].PendingSpawns != 0 || len(entries[0].PIDs) != 0 {
+		t.Fatalf("a failed start must abort the pending spawn, got %+v", entries)
+	}
+}

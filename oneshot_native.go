@@ -362,6 +362,9 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 		nativeConfirmed: confirmed,
 	}
 	m.sessions[id] = session
+	// The session lives here between its per-turn processes, so the ledger
+	// keeps it: a restart must be able to certify it ended (session_ledger.go).
+	openLedgerLogicalSession(id)
 	m.logf(colorCyan, "Session %s registered (cwd=%s resume=%v)", id, cwd, confirmed)
 
 	if onStarted != nil {
@@ -753,11 +756,18 @@ func (m *oneShotNativeManager) runOneShot(
 	if session.Status() == "ended" {
 		return oneShotRunResult{err: fmt.Errorf("session ended during turn")}
 	}
+	// Recorded in the spawn ledger for this turn only, so the next boot can
+	// reap a surviving child (and its tools) instead of leaving an orphan
+	// holding the cloud reservation (session_ledger.go).
+	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
+		abortSessionSpawn(session.ID)
 		return oneShotRunResult{
 			err: fmt.Errorf("failed to start %s (is %s installed?): %w", commandBaseName(executable), m.spec.DisplayName, err),
 		}
 	}
+	trackSessionProcess(session.ID, cmd)
+	defer untrackSessionProcess(session.ID, cmd.Process.Pid)
 	if cmd.Process != nil {
 		globalProcessRegistry.Register(cmd.Process.Pid, registryLabel)
 		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
@@ -1292,6 +1302,7 @@ func (m *oneShotNativeManager) removeSessionIfSame(id string, s *oneShotNativeSe
 		return false
 	}
 	delete(m.sessions, id)
+	releaseLedgerSession(id)
 	return true
 }
 
