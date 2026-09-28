@@ -147,6 +147,9 @@ func StartAgent(cfg *Config) {
 	// each session reaped / surviving for the signed /online boot report.
 	// See session_ledger.go.
 	globalSpawnLedger.RunBootReap()
+	// Keep the open sessions' OS boot stamps current, so that after a reboot
+	// the next boot can prove them gone (os_boot.go).
+	startOSBootStampRefresher(globalSpawnLedger, osBootStampRefreshInterval, shutdownChan)
 
 	// Restore persisted offline state so the cloud connection respects the
 	// user's last "Disconnect from cloud" toggle across restarts.

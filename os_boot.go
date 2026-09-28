@@ -12,9 +12,9 @@
 // same-boot rules (session_ledger.go) never vouch for a session.
 //
 // Every ledger entry records the OS boot its agent process ran under
-// (ledgerEntry.OSBoot / OSUptimeMs, refreshed on every change of the entry;
-// an agent process lives inside one OS boot, so every process it spawned
-// did too). At the boot reap, an earlier agent boot's entry whose recorded OS
+// (ledgerEntry.OSBoot / OSUptimeMs, refreshed on every change of the entry
+// and periodically while the agent runs; an agent process lives inside one
+// OS boot, so every process it spawned did too). At the boot reap, an earlier agent boot's entry whose recorded OS
 // boot is PROVEN different from the current one is reaped without probing,
 // signalling or inspecting anything (osBootRebootProven).
 //
@@ -23,25 +23,29 @@
 //	linux-boot       /proc/sys/kernel/random/boot_id (random per boot) — exact
 //	darwin-session   sysctl kern.bootsessionuuid (random per boot) — exact
 //	darwin-boottime  sysctl kern.boottime, "<sec>.<usec>", read only when the
-//	                 uuid is unavailable — a wall-clock boot time
-//	win-boottime     now − GetTickCount64, whole seconds — a wall-clock boot
-//	                 time; OSUptimeMs is the GetTickCount64 reading itself
+//	                 uuid is unavailable; OSUptimeMs is CLOCK_MONOTONIC_RAW
+//	win-boottime     now − GetTickCount64, whole seconds; OSUptimeMs is the
+//	                 GetTickCount64 reading itself
 //
 // A random per-boot id proves a reboot by being different. A wall-clock boot
-// time is (wall clock − time since boot), so it also moves when the wall
-// clock does: rounding jitter, NTP slewing against the uptime counter, and
-// clock steps. Such a value proves a reboot only when:
+// time never does on its own: it is (wall clock − time since boot), so a
+// clock step within one boot moves it exactly as a reboot would, and no
+// tolerance tells the two apart. It proves a reboot only together with the
+// since-boot counter it comes with:
 //
-//   - the uptime counter went BACKWARDS (Windows only: GetTickCount64 counts
-//     from boot and includes sleep and hibernation, so within one boot it
-//     never decreases — this proof ignores the wall clock entirely); or
-//   - the boot time moved FORWARD (a later boot always starts later) by more
-//     than the slack — osBootTimeTolerance, or 1/1000 of the uptime elapsed
-//     between the two readings, whichever is larger, which no oscillator
-//     drift or NTP slew reaches — AND by at least the recorded uptime minus
-//     the slack. A reboot after the recording moves the boot time by more
-//     than the recorded uptime, always; within one boot only a forward clock
-//     step at least that large could, never jitter, drift or sleep.
+//   - the counter went BACKWARDS. GetTickCount64 and CLOCK_MONOTONIC_RAW
+//     restart at boot, include sleep and hibernation, and never decrease
+//     within one boot, whatever the wall clock does — so a smaller reading
+//     than the one recorded can only come from a later boot; AND
+//   - the boot time moved by more than osBootTimeTolerance, in either
+//     direction (a reboot's RTC may even set the clock back): the computed
+//     value jitters by rounding and by the gap between the two reads.
+//
+// A new boot whose counter has already passed the recorded reading proves
+// nothing; the entry then stays on the same-boot rules. The recorded reading
+// is refreshed while the agent runs (RefreshOSBootStamps), so it is close to
+// the old boot's whole uptime and the new boot's agent almost always starts
+// below it.
 //
 // No identity readable (on either side), different kinds, or a malformed
 // value: no proof, never a guess. The entry then stays on the same-boot rules.
@@ -59,7 +63,7 @@ import (
 type osBootStamp struct {
 	// ID is "<kind>:<value>", or "" when no identity could be read.
 	ID string
-	// UptimeMs is the time since that boot, in milliseconds, when ID was
+	// UptimeMs is the since-boot counter, in milliseconds, when ID was
 	// read. Used only by the wall-clock kinds (0 for the others).
 	UptimeMs int64
 }
@@ -73,14 +77,8 @@ const (
 
 // osBootTimeTolerance is the least a wall-clock boot time must move to count:
 // the computed value jitters by rounding and by the gap between reading the
-// clock and the uptime counter.
+// clock and the since-boot counter.
 const osBootTimeTolerance = 5 * time.Second
-
-// osBootDriftDivisor bounds the drift accepted between the wall clock and
-// the uptime counter within one boot: 1/1000 (1000 ppm) of the uptime that
-// elapsed between the two readings, far beyond any real oscillator error or
-// NTP slew rate (tens of ppm).
-const osBootDriftDivisor = 1000
 
 // splitOSBootID splits "<kind>:<value>"; both parts must be non-empty.
 func splitOSBootID(id string) (kind, value string, ok bool) {
@@ -105,20 +103,16 @@ func osBootRebootProven(recorded, current osBootStamp) bool {
 	switch rk {
 	case osBootKindLinux, osBootKindDarwinSession:
 		return rv != cv
-	case osBootKindWindowsBootTime:
-		return wallClockRebootProven(rv, cv, recorded.UptimeMs, current.UptimeMs, true)
-	case osBootKindDarwinBootTime:
-		// kern.boottime's companion uptime is itself wall-clock derived,
-		// so it proves nothing by going backwards.
-		return wallClockRebootProven(rv, cv, recorded.UptimeMs, current.UptimeMs, false)
+	case osBootKindWindowsBootTime, osBootKindDarwinBootTime:
+		return counterRebootProven(rv, cv, recorded.UptimeMs, current.UptimeMs)
 	}
 	return false
 }
 
-// wallClockRebootProven applies the wall-clock rules (see the file header).
-// monotonicUptime says the uptimes come from a counter that never decreases
-// within one boot (GetTickCount64).
-func wallClockRebootProven(recValue, curValue string, recUptimeMs, curUptimeMs int64, monotonicUptime bool) bool {
+// counterRebootProven applies the wall-clock kinds' rule (see the file
+// header): the since-boot counter restarted AND the boot time moved beyond
+// the tolerance. The wall clock alone never proves a reboot.
+func counterRebootProven(recValue, curValue string, recUptimeMs, curUptimeMs int64) bool {
 	recMs, ok := parseBootTimeMs(recValue)
 	if !ok {
 		return false
@@ -127,19 +121,14 @@ func wallClockRebootProven(recValue, curValue string, recUptimeMs, curUptimeMs i
 	if !ok || recUptimeMs <= 0 || curUptimeMs <= 0 {
 		return false
 	}
-	if monotonicUptime && curUptimeMs < recUptimeMs {
-		return true // the since-boot counter restarted: a new boot
+	if curUptimeMs >= recUptimeMs {
+		return false // the counter did not restart: same boot, or unprovable
 	}
 	moved := curMs - recMs
-	slack := osBootTimeTolerance.Milliseconds()
-	elapsed := curUptimeMs - recUptimeMs
-	if elapsed < 0 {
-		elapsed = -elapsed
+	if moved < 0 {
+		moved = -moved
 	}
-	if drift := elapsed / osBootDriftDivisor; drift > slack {
-		slack = drift
-	}
-	return moved > slack && moved >= recUptimeMs-slack
+	return moved > osBootTimeTolerance.Milliseconds()
 }
 
 // parseBootTimeMs parses "<sec>" or "<sec>.<fraction>" (a positive Unix time)

@@ -7,11 +7,11 @@
 // reading itself as the uptime.
 //
 // GetTickCount64 counts milliseconds from boot and includes time spent in
-// sleep and hibernation, so the computed boot time does not move while the
-// machine sleeps, and the counter never decreases within one boot. The value
-// still jitters (timer resolution, the gap between the two reads) and follows
-// wall-clock changes, which is why it is compared under the wall-clock rules
-// rather than for equality. Nothing about any process is read.
+// sleep and hibernation, so it never decreases within one boot, whatever the
+// wall clock does. The computed boot time jitters (timer resolution, the gap
+// between the two reads) and follows every wall-clock change, so it proves a
+// reboot only together with the tick count going backwards, and only when it
+// moved beyond the tolerance (os_boot.go). Nothing about any process is read.
 // -----------------------------------------------------------------------------
 
 package main

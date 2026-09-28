@@ -411,6 +411,56 @@ func (l *spawnLedger) touch(e *ledgerEntry) {
 	}
 }
 
+// osBootStampRefreshInterval is how often the running agent re-stamps its
+// open entries (RefreshOSBootStamps).
+const osBootStampRefreshInterval = 5 * time.Minute
+
+// RefreshOSBootStamps re-reads the OS boot identity and re-stamps this boot's
+// entries. Only the wall-clock kinds change (their since-boot counter
+// grows): a recorded counter close to the old boot's whole uptime is what
+// lets the next OS boot's agent, starting below it, prove the reboot
+// (os_boot.go). Earlier boots' entries are never touched; nothing is written
+// when nothing changed.
+func (l *spawnLedger) RefreshOSBootStamps() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.loaded || l.disabled {
+		return
+	}
+	s := l.osBoot()
+	if s.ID == "" {
+		return
+	}
+	changed := false
+	for _, e := range l.entries {
+		if e.BootID != l.bootID || (e.OSBoot == s.ID && e.OSUptimeMs == s.UptimeMs) {
+			continue
+		}
+		e.OSBoot, e.OSUptimeMs = s.ID, s.UptimeMs
+		changed = true
+	}
+	if changed {
+		l.persistLocked()
+	}
+}
+
+// startOSBootStampRefresher runs RefreshOSBootStamps every interval until
+// stop is closed.
+func startOSBootStampRefresher(l *spawnLedger, every time.Duration, stop <-chan struct{}) {
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				l.RefreshOSBootStamps()
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
 // OpenLogicalSession records a session that spawns one process per turn.
 func (l *spawnLedger) OpenLogicalSession(sessionID string) {
 	if sessionID == "" {

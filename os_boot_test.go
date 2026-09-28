@@ -53,7 +53,10 @@ func TestOSBootExactKinds(t *testing.T) {
 	}
 }
 
-// TestOSBootWindowsTolerance pins the wall-clock rules on the Windows kind.
+// TestOSBootWindowsTolerance pins the Windows rule: the tick count went
+// backwards AND the computed boot time moved beyond the tolerance. The wall
+// clock alone — jitter, drift or a clock step of any size — never proves a
+// reboot.
 func TestOSBootWindowsTolerance(t *testing.T) {
 	const boot = int64(1_727_000_000)
 	cases := []struct {
@@ -62,27 +65,28 @@ func TestOSBootWindowsTolerance(t *testing.T) {
 		want     bool
 	}{
 		// The same boot, read an hour apart: the computed value jitters by a
-		// second or two and must never count.
+		// second or two.
 		{"same boot, 1 s jitter", winStamp(boot, hourMs), winStamp(boot+1, 2*hourMs), false},
 		{"same boot, jitter backwards", winStamp(boot, hourMs), winStamp(boot-1, 2*hourMs), false},
-		{"moved exactly the tolerance", winStamp(boot, 1000), winStamp(boot+5, 2000), false},
-		{"moved beyond the tolerance, after a short uptime", winStamp(boot, 1000), winStamp(boot+6, 2000), true},
-		// A forward clock step within one boot, smaller than the uptime the
-		// session was recorded at: not proof.
-		{"same boot, 6 s clock step", winStamp(boot, hourMs), winStamp(boot+6, 2*hourMs), false},
-		{"same boot, 30 min clock step", winStamp(boot, hourMs), winStamp(boot+1800, 2*hourMs), false},
-		// Moving backwards is never a later boot.
+		// A forward clock step within one boot, even right after boot (the
+		// Codex round-1 example: recorded at 1 s of uptime, clock corrected
+		// 6 s forward, read again at 2 s): the tick count did not restart.
+		{"clock stepped 6 s forward just after boot", winStamp(boot, 1000), winStamp(boot+6, 2000), false},
+		{"clock stepped 30 min forward", winStamp(boot, hourMs), winStamp(boot+1800, 2*hourMs), false},
+		{"clock stepped a year forward", winStamp(boot, hourMs), winStamp(boot+365*86400, 2*hourMs), false},
 		{"clock stepped back a day", winStamp(boot, hourMs), winStamp(boot-86400, 2*hourMs), false},
-		// Weeks of oscillator drift against NTP within one boot, recorded
-		// right after boot: the drift slack keeps it from counting.
 		{"30 days of drift", winStamp(boot, 60_000), winStamp(boot+60, 60_000+30*dayMs), false},
-		// A reboot: the new boot's uptime is below the recorded one. Proven
-		// by the counter alone, whatever the wall clock says.
-		{"rebooted, uptime restarted", winStamp(boot, 5*hourMs), winStamp(boot+5*3600+120, 2*60_000), true},
-		{"rebooted, clock even stepped back", winStamp(boot, 5*hourMs), winStamp(boot-3600, 2*60_000), true},
-		// A reboot whose new boot has been up longer than the old one was at
-		// the recording: the boot time moved by more than that uptime.
-		{"rebooted long ago", winStamp(boot, 10*60_000), winStamp(boot+3*86400, 4*dayMs), true},
+		// A reboot: the tick count restarted below the recorded reading.
+		{"rebooted, tick restarted", winStamp(boot, 5*hourMs), winStamp(boot+5*3600+120, 2*60_000), true},
+		{"rebooted, RTC set the clock back", winStamp(boot, 5*hourMs), winStamp(boot-3600, 2*60_000), true},
+		// Tolerance: a restarted tick whose boot time barely moved is not
+		// enough on its own.
+		{"tick lower, boot time moved exactly the tolerance", winStamp(boot, hourMs), winStamp(boot+5, 60_000), false},
+		{"tick lower, boot time moved beyond the tolerance", winStamp(boot, hourMs), winStamp(boot+6, 60_000), true},
+		// A reboot whose new boot has already run longer than the recorded
+		// reading: not provable (the stamps are refreshed while the agent
+		// runs, so this needs an agent started late into the new boot).
+		{"rebooted, new boot ran longer", winStamp(boot, 10*60_000), winStamp(boot+3*86400, 4*dayMs), false},
 		{"recorded without an uptime", winStamp(boot, 0), winStamp(boot+86400, hourMs), false},
 		{"current without an uptime", winStamp(boot, hourMs), winStamp(boot+86400, 0), false},
 		{"malformed recorded value", osBootStamp{ID: osBootKindWindowsBootTime + ":abc", UptimeMs: hourMs}, winStamp(boot+86400, 60_000), false},
@@ -95,9 +99,8 @@ func TestOSBootWindowsTolerance(t *testing.T) {
 	}
 }
 
-// TestOSBootDarwinBootTimeFallback: kern.boottime is a wall-clock value whose
-// uptime is wall-clock derived too, so only a forward move beyond the slack
-// AND the recorded uptime counts — never an uptime that went down.
+// TestOSBootDarwinBootTimeFallback: kern.boottime follows the calendar clock,
+// so it counts only with CLOCK_MONOTONIC_RAW going backwards.
 func TestOSBootDarwinBootTimeFallback(t *testing.T) {
 	st := func(v string, up int64) osBootStamp {
 		return osBootStamp{ID: osBootKindDarwinBootTime + ":" + v, UptimeMs: up}
@@ -108,9 +111,10 @@ func TestOSBootDarwinBootTimeFallback(t *testing.T) {
 		want     bool
 	}{
 		{"same boot, NTP moved it 300 ms", st("1727000000.100000", hourMs), st("1727000000.400000", 2*hourMs), false},
-		{"clock stepped back, uptime reads lower", st("1727000000.000000", 5*hourMs), st("1726990000.000000", hourMs), false},
+		{"same boot, clock stepped back", st("1727000000.000000", 5*hourMs), st("1726990000.000000", 6*hourMs), false},
+		{"same boot, clock stepped forward a day", st("1727000000.000000", 5*hourMs), st("1727086400.000000", 6*hourMs), false},
 		{"rebooted", st("1727000000.000000", 5*hourMs), st("1727030000.000000", 60_000), true},
-		{"same boot, clock stepped forward 1 min", st("1727000000.000000", 5*hourMs), st("1727000060.000000", 6*hourMs), false},
+		{"rebooted, jitter only", st("1727000000.000000", 5*hourMs), st("1727000003.000000", 60_000), false},
 	}
 	for _, c := range cases {
 		if got := osBootRebootProven(c.rec, c.cur); got != c.want {

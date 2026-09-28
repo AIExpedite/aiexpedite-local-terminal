@@ -215,8 +215,9 @@ func TestNoOSBootIdentityNoRebootProof(t *testing.T) {
 }
 
 // TestWindowsBootTimeToleranceThroughTheLedger: a computed Windows boot time
-// that jittered or followed a clock step is the same boot; one whose uptime
-// counter restarted is a reboot.
+// that jittered or followed a clock step is the same boot; one whose tick
+// count restarted is a reboot; a new boot that already ran past the recorded
+// tick count proves nothing.
 func TestWindowsBootTimeToleranceThroughTheLedger(t *testing.T) {
 	const boot = int64(1_727_000_000)
 	current := winStamp(boot, 3*hourMs)
@@ -227,11 +228,13 @@ func TestWindowsBootTimeToleranceThroughTheLedger(t *testing.T) {
 	jitterID, jitterUp := rec(boot-2, hourMs)
 	stepID, stepUp := rec(boot-600, 2*hourMs)
 	rebootID, rebootUp := rec(boot-10*86400, 5*hourMs)
+	longerID, longerUp := rec(boot-10*86400, hourMs)
 	dir := t.TempDir()
 	writeLedgerFixture(t, dir, ledgerFileData{BootID: "boot-1", Entries: []*ledgerEntry{
 		{SessionID: "jitter", BootID: "boot-1", OSBoot: jitterID, OSUptimeMs: jitterUp, Incomplete: true, PIDs: []ledgerProcess{}},
 		{SessionID: "clock-step", BootID: "boot-1", OSBoot: stepID, OSUptimeMs: stepUp, Incomplete: true, PIDs: []ledgerProcess{}},
 		{SessionID: "rebooted", BootID: "boot-1", OSBoot: rebootID, OSUptimeMs: rebootUp, Incomplete: true, PIDs: []ledgerProcess{}},
+		{SessionID: "new-boot-ran-longer", BootID: "boot-1", OSBoot: longerID, OSUptimeMs: longerUp, Incomplete: true, PIDs: []ledgerProcess{}},
 	}})
 	l := newStrictLedger(t, dir, "boot-2", current, false)
 	l.RunBootReap()
@@ -424,16 +427,11 @@ func earlierOSBootStampFor(t *testing.T, current osBootStamp) osBootStamp {
 		if !ok {
 			t.Fatalf("unparseable current boot time %q", value)
 		}
-		// Booted two days earlier. Windows: recorded after a longer uptime
-		// than this boot has now (the counter restarted). The kern.boottime
-		// fallback: recorded an hour into that boot.
-		uptime := int64(hourMs)
-		if kind == osBootKindWindowsBootTime {
-			uptime = current.UptimeMs + dayMs
-		}
+		// Booted two days earlier, and recorded after a longer uptime than
+		// this boot has now: the since-boot counter restarted.
 		s = osBootStamp{
 			ID:       kind + ":" + strconv.FormatInt(ms/1000-2*86400, 10),
-			UptimeMs: uptime,
+			UptimeMs: current.UptimeMs + dayMs,
 		}
 	default:
 		t.Fatalf("unknown kind %q", kind)
@@ -442,4 +440,100 @@ func earlierOSBootStampFor(t *testing.T, current osBootStamp) osBootStamp {
 		t.Fatalf("fixture %+v is not proven earlier than %+v", s, current)
 	}
 	return s
+}
+
+// TestRefreshOSBootStampsKeepsTheCounterCurrent: the running agent re-stamps
+// only its own boot's entries, writes only on a change, and a larger recorded
+// tick count is what lets the next boot prove the reboot.
+func TestRefreshOSBootStampsKeepsTheCounterCurrent(t *testing.T) {
+	const boot = int64(1_727_000_000)
+	dir := t.TempDir()
+	writeLedgerFixture(t, dir, ledgerFileData{BootID: "boot-0", Entries: []*ledgerEntry{
+		{SessionID: "older", BootID: "boot-0", OSBoot: testOSBootA, State: ledgerStateUnknown, PIDs: []ledgerProcess{{PID: 3, StartTime: "t"}}},
+	}})
+	l := newTestLedger(t, dir, "boot-1")
+	l.probe = func(ledgerProcess) processProbeResult { return processUnknown }
+	tick := 2 * 60_000 // the session starts two minutes into the boot
+	l.osBoot = func() osBootStamp { return winStamp(boot, int64(tick)) }
+	var writes int
+	l.writeFile = func(path string, data []byte) error { writes++; return writeLedgerFileAtomic(path, data) }
+
+	l.RefreshOSBootStamps() // before the ledger is loaded: a no-op
+	if writes != 0 {
+		t.Fatalf("refresh before load wrote the ledger")
+	}
+	l.RunBootReap()
+	l.BeginSpawn("s")
+	l.TrackProcess("s", proc(41), false)
+	writes = 0
+	l.RefreshOSBootStamps() // nothing changed
+	if writes != 0 {
+		t.Fatalf("an unchanged refresh wrote the ledger %d time(s)", writes)
+	}
+	tick = int(5 * hourMs) // the session runs for hours
+	l.RefreshOSBootStamps()
+	if writes != 1 {
+		t.Fatalf("refresh wrote %d time(s), want 1", writes)
+	}
+	for _, e := range readLedgerFile(t, dir).Entries {
+		switch e.SessionID {
+		case "s":
+			if e.OSUptimeMs != 5*hourMs {
+				t.Fatalf("s not refreshed: %+v", e)
+			}
+		case "older":
+			if e.OSBoot != testOSBootA || e.OSUptimeMs != 0 {
+				t.Fatalf("an earlier boot's entry was re-stamped: %+v", e)
+			}
+		}
+	}
+
+	// The machine reboots; the agent starts ten minutes into the new boot —
+	// past the two minutes of the first stamp, well below the refreshed one.
+	l2 := newStrictLedger(t, dir, "boot-2", winStamp(boot+6*3600, 10*60_000), false)
+	l2.RunBootReap()
+	if r := l2.Report(context.Background()); !reflect.DeepEqual(r.SessionsReaped, []string{"s"}) {
+		t.Fatalf("reaped = %v, want [s]", r.SessionsReaped)
+	}
+}
+
+// TestRefresherStopsOnShutdown: the refresher ticks and exits with stop.
+func TestRefresherStopsOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	l := newTestLedger(t, dir, "boot-1")
+	var mu sync.Mutex
+	reads := 0
+	l.osBoot = func() osBootStamp {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		return osBootStamp{ID: testOSBootA}
+	}
+	l.OpenLogicalSession("s")
+	stop := make(chan struct{})
+	startOSBootStampRefresher(l, 5*time.Millisecond, stop)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := reads
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the refresher never ran (reads = %d)", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	after := reads
+	mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if reads != after {
+		t.Fatalf("the refresher kept running after stop (%d -> %d)", after, reads)
+	}
 }
