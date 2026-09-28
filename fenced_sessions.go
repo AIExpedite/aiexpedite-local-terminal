@@ -113,6 +113,12 @@ func endSessionOnDevice(sessionID string) {
 			fmt.Printf("%s[fence] Ending opencode session %s: %v%s\n", colorYellow, sessionID, err, colorReset)
 		}
 	}
+	if m := globalMuseCodeNativeManager; m != nil && m.Get(sessionID) != nil {
+		ended = true
+		if err := m.End(sessionID); err != nil {
+			fmt.Printf("%s[fence] Ending musecode session %s: %v%s\n", colorYellow, sessionID, err, colorReset)
+		}
+	}
 	if ended {
 		fmt.Printf("%s[fence] Ended fenced session %s%s\n", colorYellow, sessionID, colorReset)
 	}
@@ -388,7 +394,8 @@ func ensureFenceReport(cfg *Config) {
 func isSessionEndCommandType(t string) bool {
 	switch t {
 	case "session_end", "codex_appserver_end", "claude_native_end",
-		"grok_acp_end", "antigravity_native_end", "opencode_native_end":
+		"grok_acp_end", "antigravity_native_end", "opencode_native_end",
+		"musecode_native_end":
 		return true
 	}
 	return false

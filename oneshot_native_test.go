@@ -656,6 +656,10 @@ func TestOneShotNative_StaleReapReservesTheIDThroughEndedPublication(t *testing.
 func TestOneShotNative_TurnsAndSessionAreRecordedInTheSpawnLedger(t *testing.T) {
 	dir := t.TempDir()
 	ledger := newTestLedger(t, dir, "boot-1")
+	// The turn child really runs here: on Windows it is created suspended and
+	// only the real attach resumes it (the stub would leave it frozen).
+	ledger.attachJob = attachSessionJob
+	ledger.releaseJob = releaseSessionJob
 	var mu sync.Mutex
 	var tracked []int
 	inner := ledger.startToken
@@ -731,5 +735,20 @@ func TestOneShotNative_FailedStartAbortsThePendingSpawn(t *testing.T) {
 	entries := readLedgerFile(t, dir).Entries
 	if len(entries) != 1 || entries[0].PendingSpawns != 0 || len(entries[0].PIDs) != 0 {
 		t.Fatalf("a failed start must abort the pending spawn, got %+v", entries)
+	}
+}
+
+// A fence (Move / max-park expiry) must tear down a Muse session this process
+// holds; endSessionOnDevice is the one teardown the fence path calls.
+func TestOneShotNative_FencedSessionIsEndedOnDevice(t *testing.T) {
+	m := installMuseCodeStub(t)
+	startMuse(t, m, "s-fenced", "")
+	prev := globalMuseCodeNativeManager
+	globalMuseCodeNativeManager = m
+	t.Cleanup(func() { globalMuseCodeNativeManager = prev })
+
+	endSessionOnDevice("s-fenced")
+	if m.Get("s-fenced") != nil {
+		t.Fatal("a fenced Muse session must be ended on the device")
 	}
 }
