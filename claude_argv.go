@@ -81,7 +81,7 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 		"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
 		"--agent": true, "--agents": true, "--session-id": true,
 		"--permission-prompt-tool": true,
-		"--mcp-config": true, "--settings": true, "--json-schema": true,
+		"--mcp-config":             true, "--settings": true, "--json-schema": true,
 		"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
 	}
 

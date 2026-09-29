@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -193,6 +194,65 @@ func TestAckWatermark_ConfirmedIdDeletesExactlyItsOwnRow(t *testing.T) {
 	t.Cleanup(reloaded.release)
 	if got := len(reloaded.snapshot()); got != 2 {
 		t.Fatalf("reloaded inbox has %d rows, want 2", got)
+	}
+}
+
+// A watermark can name a turn whose own dispatch is still running — a one-shot
+// kind blocks for the whole agent turn, so the broker records the ack long
+// before dispatch returns. Deleting the row then would let a concurrent
+// Pub/Sub duplicate run the same coding turn a second time, so the deletion
+// waits for Finish.
+func TestAckWatermark_ConfirmedInFlightRowSurvivesUntilDispatchFinishes(t *testing.T) {
+	h := newRelayTurnHarness(t)
+	accepted := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runRelayTurn(context.Background(), h.inbox, relaySend("t1"), "t1", "agent-1",
+			func(r relayTurnRow) { h.mu.Lock(); h.acks = append(h.acks, r); h.mu.Unlock() },
+			func(ctx context.Context) {
+				h.mu.Lock()
+				h.runs++
+				h.mu.Unlock()
+				if err := relayTurnAcceptor(ctx)(); err != nil {
+					t.Errorf("accept: %v", err)
+				}
+				close(accepted)
+				<-release
+			})
+	}()
+	<-accepted
+
+	// The broker confirms the ack while the turn is still running.
+	if deleted := h.inbox.ConfirmAcked("sess-1", []string{"t1"}); deleted != 0 {
+		t.Fatalf("ConfirmAcked deleted %d in-flight rows, want 0", deleted)
+	}
+	if _, ok := h.inbox.snapshot()[relayTurnKey{"sess-1", "t1"}]; !ok {
+		t.Fatal("the in-flight accepted row was deleted by the watermark")
+	}
+
+	// So a duplicate arriving mid-dispatch still re-acks instead of re-running.
+	h.deliver(relaySend("t1"), true)
+	h.mu.Lock()
+	runs := h.runs
+	h.mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("runs=%d, want 1 — the confirmed row let a duplicate re-run the turn", runs)
+	}
+
+	close(release)
+	<-done
+
+	// Finish applies the deferred deletion, durably.
+	if _, ok := h.inbox.snapshot()[relayTurnKey{"sess-1", "t1"}]; ok {
+		t.Fatal("the confirmed row survived its dispatch")
+	}
+	h.inbox.release()
+	reloaded := newRelayTurnInbox(h.inbox.path)
+	t.Cleanup(reloaded.release)
+	if got := len(reloaded.snapshot()); got != 0 {
+		t.Fatalf("reloaded inbox has %d rows, want 0", got)
 	}
 }
 

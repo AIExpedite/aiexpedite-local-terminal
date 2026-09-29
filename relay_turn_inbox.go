@@ -175,11 +175,14 @@ const (
 )
 
 type relayTurnInbox struct {
-	mu        sync.Mutex
-	path      func() string
-	loaded    bool
-	rows      map[relayTurnKey]*relayTurnRow
-	inFlight  map[relayTurnKey]bool
+	mu       sync.Mutex
+	path     func() string
+	loaded   bool
+	rows     map[relayTurnKey]*relayTurnRow
+	inFlight map[relayTurnKey]bool
+	// confirmed holds rows a watermark confirmed while their own dispatch was
+	// still in flight; Finish deletes them once dispatch returns.
+	confirmed map[relayTurnKey]bool
 	now       func() time.Time
 	writeFile func(path string, data []byte) error
 	// acquireOwnership takes the inbox's cross-process lock without waiting
@@ -194,6 +197,7 @@ func newRelayTurnInbox(path func() string) *relayTurnInbox {
 		path:      path,
 		rows:      make(map[relayTurnKey]*relayTurnRow),
 		inFlight:  make(map[relayTurnKey]bool),
+		confirmed: make(map[relayTurnKey]bool),
 		now:       time.Now,
 		writeFile: writeRelayTurnInboxAtomic,
 	}
@@ -237,6 +241,7 @@ func (b *relayTurnInbox) ownLocked() bool {
 	b.lockFile = f
 	b.loaded = false
 	b.rows = make(map[relayTurnKey]*relayTurnRow)
+	b.confirmed = make(map[relayTurnKey]bool)
 	b.loadLocked()
 	return true
 }
@@ -378,18 +383,28 @@ func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTur
 	}
 	changed := b.pruneExpiredLocked()
 	key := relayTurnKey{cmd.SessionID, turnID}
+	// In flight in this process — whether or not the row is still here (a
+	// watermark or an eviction can have taken it mid-dispatch) — is never a
+	// turn to dispatch again; the running delivery acks when it accepts.
+	if b.inFlight[key] {
+		if changed {
+			_ = b.persistLocked()
+		}
+		row := relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID}
+		if r := b.rows[key]; r != nil {
+			row = *r
+		}
+		if row.State == relayTurnStateAccepted {
+			return relayTurnReack, row
+		}
+		return relayTurnInFlight, row
+	}
 	if r := b.rows[key]; r != nil {
 		if r.State == relayTurnStateAccepted {
 			if changed {
 				_ = b.persistLocked()
 			}
 			return relayTurnReack, *r
-		}
-		if b.inFlight[key] {
-			if changed {
-				_ = b.persistLocked()
-			}
-			return relayTurnInFlight, *r
 		}
 	}
 	now := b.now().UnixMilli()
@@ -443,15 +458,27 @@ func (b *relayTurnInbox) Accept(sessionID, turnID string) (relayTurnRow, bool, e
 func (b *relayTurnInbox) Finish(sessionID, turnID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.inFlight, relayTurnKey{sessionID, turnID})
+	key := relayTurnKey{sessionID, turnID}
+	delete(b.inFlight, key)
+	// A watermark that confirmed this turn while it was still dispatching
+	// deferred the deletion to here, so a Pub/Sub duplicate arriving during
+	// the dispatch still found the row and re-acked instead of re-running.
+	if b.confirmed[key] {
+		delete(b.confirmed, key)
+		if b.rows[key] != nil {
+			delete(b.rows, key)
+			_ = b.persistLocked()
+		}
+	}
 }
 
 // ConfirmAcked deletes exactly the rows named by a VERIFIED watermark for
 // sessionID and returns how many it deleted. An id with no row (already
 // expired, torn down, or confirmed by an earlier watermark) is a no-op. A row
-// that is claimed and in flight is left alone: the broker cannot have
-// recorded an ack this device has not published yet, so naming it is a
-// broker bug, and deleting it would reopen the double-run window.
+// whose own dispatch is still in flight is NOT deleted here — the broker can
+// record an ack while a one-shot kind is still running the turn — it is
+// marked and deleted by Finish, so a duplicate arriving mid-dispatch still
+// finds the row and re-acks instead of re-running.
 func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 	if sessionID == "" || len(turnIDs) == 0 {
 		return 0
@@ -468,10 +495,17 @@ func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 		if r == nil {
 			continue
 		}
-		if r.State != relayTurnStateAccepted && b.inFlight[key] {
+		if b.inFlight[key] {
+			// This delivery is still being dispatched (a one-shot kind blocks
+			// for the whole agent turn). Deleting the row now would let a
+			// concurrent duplicate re-run the same turn, so the deletion
+			// waits for Finish. A claimed row in flight is also a broker bug
+			// — it cannot have recorded an ack this device has not published.
+			b.confirmed[key] = true
 			continue
 		}
 		delete(b.rows, key)
+		delete(b.confirmed, key)
 		deleted++
 	}
 	if deleted > 0 {
@@ -494,6 +528,7 @@ func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 	for k := range b.rows {
 		if k.SessionID == sessionID && !b.inFlight[k] {
 			delete(b.rows, k)
+			delete(b.confirmed, k)
 			changed = true
 		}
 	}
