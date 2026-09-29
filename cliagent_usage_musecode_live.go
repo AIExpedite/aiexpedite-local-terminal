@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,19 +51,22 @@ const (
 	// with a model response; the host is killed as soon as the reading lands.
 	museCodeLiveProbePrompt = "Reply with a single period."
 
-	museCodeUsageLiveSchemaVersion = 1
+	museCodeUsageLiveSchemaVersion = 2
+	// museCodeUsageLiveMaxAccounts bounds the per-account readings kept; the
+	// oldest observation is dropped first.
+	museCodeUsageLiveMaxAccounts = 16
 	// museCodeUnknownAccountKey scopes a reading when nothing on disk tells
 	// accounts apart (a keychain login): the device's one Muse account.
 	museCodeUnknownAccountKey = "device"
 )
 
-// museCodeUsageLiveCache is the persisted, normalized reading. Percentages are
-// verbatim from Meta (integers, may exceed 100); times are epoch ms.
+// museCodeUsageLiveCache is one account's persisted, normalized reading.
+// Percentages are verbatim from Meta (integers, may exceed 100); times are
+// epoch ms.
 type museCodeUsageLiveCache struct {
-	SchemaVersion int    `json:"schemaVersion"`
-	AccountKey    string `json:"accountKey"`
-	ObservedAtMs  int64  `json:"observedAtMs"`
-	Window        struct {
+	AccountKey   string `json:"accountKey"`
+	ObservedAtMs int64  `json:"observedAtMs"`
+	Window       struct {
 		UsedPercent        int   `json:"usedPercent"`
 		WindowDurationMins int   `json:"windowDurationMins"`
 		ResetsAtMs         int64 `json:"resetsAtMs"`
@@ -71,6 +75,13 @@ type museCodeUsageLiveCache struct {
 		UsedPercent int   `json:"usedPercent"`
 		ResetsAtMs  int64 `json:"resetsAtMs"`
 	} `json:"weekly"`
+}
+
+// museCodeUsageLiveFile keeps one reading PER ACCOUNT, so switching accounts
+// never erases another account's reading or its minimum probe interval.
+type museCodeUsageLiveFile struct {
+	SchemaVersion int                      `json:"schemaVersion"`
+	Readings      []museCodeUsageLiveCache `json:"readings"`
 }
 
 var museCodeUsageLiveCacheMu sync.Mutex
@@ -106,6 +117,17 @@ func parseMuseCodeSubscriptionUsage(raw json.RawMessage) (museCodeUsageLiveCache
 	return out, true
 }
 
+// readMuseCodeUsageLiveFileLocked reads the cache; a missing, unreadable or
+// older-schema file reads as empty. Caller holds museCodeUsageLiveCacheMu.
+func readMuseCodeUsageLiveFileLocked() museCodeUsageLiveFile {
+	var file museCodeUsageLiveFile
+	if !readBoundedJSONFile(museCodeUsageLiveCachePath(), &file) || file.SchemaVersion != museCodeUsageLiveSchemaVersion {
+		return museCodeUsageLiveFile{SchemaVersion: museCodeUsageLiveSchemaVersion}
+	}
+	return file
+}
+
+// saveMuseCodeUsageLive replaces that account's reading and keeps the others.
 func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
 	museCodeUsageLiveCacheMu.Lock()
 	defer museCodeUsageLiveCacheMu.Unlock()
@@ -113,22 +135,31 @@ func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
 	if path == "" || entry.AccountKey == "" {
 		return false
 	}
-	entry.SchemaVersion = museCodeUsageLiveSchemaVersion
-	return writeMuseCodeJSONAtomic(path, entry)
+	file := readMuseCodeUsageLiveFileLocked()
+	kept := []museCodeUsageLiveCache{entry}
+	for _, r := range file.Readings {
+		if r.AccountKey != entry.AccountKey && r.AccountKey != "" {
+			kept = append(kept, r)
+		}
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].ObservedAtMs > kept[j].ObservedAtMs })
+	if len(kept) > museCodeUsageLiveMaxAccounts {
+		kept = kept[:museCodeUsageLiveMaxAccounts]
+	}
+	file.Readings = kept
+	return writeMuseCodeJSONAtomic(path, file)
 }
 
 // loadMuseCodeUsageLive returns the cached reading for that account, if any.
 func loadMuseCodeUsageLive(accountKey string) (museCodeUsageLiveCache, bool) {
 	museCodeUsageLiveCacheMu.Lock()
 	defer museCodeUsageLiveCacheMu.Unlock()
-	var entry museCodeUsageLiveCache
-	if !readBoundedJSONFile(museCodeUsageLiveCachePath(), &entry) {
-		return museCodeUsageLiveCache{}, false
+	for _, r := range readMuseCodeUsageLiveFileLocked().Readings {
+		if r.AccountKey == accountKey && r.ObservedAtMs > 0 {
+			return r, true
+		}
 	}
-	if entry.SchemaVersion != museCodeUsageLiveSchemaVersion || entry.AccountKey != accountKey || entry.ObservedAtMs <= 0 {
-		return museCodeUsageLiveCache{}, false
-	}
-	return entry, true
+	return museCodeUsageLiveCache{}, false
 }
 
 func writeMuseCodeJSONAtomic(path string, value any) bool {

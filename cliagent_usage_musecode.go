@@ -136,38 +136,14 @@ func museCodeCredentialPaths(home string, getenv func(string) string) []string {
 	return paths
 }
 
-// museCodeIdentity is the signed-in user as the credential file names them.
-type museCodeIdentity struct {
-	Email string
-	Name  string
-}
-
 // museCodeAuthIdentityFile names ONLY the identity fields of auth.json. The
 // token and key beside them are skipped by the decoder, never stored.
 type museCodeAuthIdentityFile struct {
 	Providers struct {
 		Meta struct {
-			UserEmail    string `json:"user_email"`
-			UserFullName string `json:"user_full_name"`
+			UserEmail string `json:"user_email"`
 		} `json:"meta"`
 	} `json:"providers"`
-}
-
-// readMuseCodeIdentity returns the first credential file's identity. A
-// keychain login, or a file without the fields, yields the zero identity.
-func readMuseCodeIdentity(home string, getenv func(string) string) museCodeIdentity {
-	for _, path := range museCodeCredentialPaths(home, getenv) {
-		var file museCodeAuthIdentityFile
-		if !readBoundedJSONFile(path, &file) {
-			continue
-		}
-		email := strings.TrimSpace(file.Providers.Meta.UserEmail)
-		if email == "" || !strings.Contains(email, "@") || len(email) > 320 {
-			continue
-		}
-		return museCodeIdentity{Email: email, Name: strings.TrimSpace(file.Providers.Meta.UserFullName)}
-	}
-	return museCodeIdentity{}
 }
 
 // museCodeAccountFingerprint keys the account for cross-device dedup. Emails
@@ -203,19 +179,26 @@ type museCodeAuthAPIKeyFile struct {
 
 // museCodeAccountFor resolves the account in Muse's own precedence:
 // META_API_KEY in the environment overrides any stored login (labelling it
-// with the stored email could name the wrong account), then an OAuth email,
-// then a stored API key.
+// with the stored email could name the wrong account); then the credential
+// files in the order Muse reads them, where the FIRST file naming an account —
+// by OAuth email, else by stored API key — decides. A lower-priority file is
+// never consulted once a higher one names someone, so a MUSE_AUTH_PATH key
+// file is not attributed to a stale login left in ~/.config/muse.
 func museCodeAccountFor(home string, getenv func(string) string) museCodeAccount {
 	if key := strings.TrimSpace(getenv("META_API_KEY")); key != "" {
 		return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(key)}
 	}
-	if identity := readMuseCodeIdentity(home, getenv); identity.Email != "" {
-		return museCodeAccount{Email: identity.Email, Fingerprint: museCodeAccountFingerprint(identity.Email)}
-	}
 	for _, path := range museCodeCredentialPaths(home, getenv) {
-		var file museCodeAuthAPIKeyFile
-		if readBoundedJSONFile(path, &file) && strings.TrimSpace(file.Providers.Meta.APIKey) != "" {
-			return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(file.Providers.Meta.APIKey)}
+		var identity museCodeAuthIdentityFile
+		if !readBoundedJSONFile(path, &identity) {
+			continue
+		}
+		if email := strings.TrimSpace(identity.Providers.Meta.UserEmail); email != "" && strings.Contains(email, "@") && len(email) <= 320 {
+			return museCodeAccount{Email: email, Fingerprint: museCodeAccountFingerprint(email)}
+		}
+		var stored museCodeAuthAPIKeyFile
+		if readBoundedJSONFile(path, &stored) && strings.TrimSpace(stored.Providers.Meta.APIKey) != "" {
+			return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(stored.Providers.Meta.APIKey)}
 		}
 	}
 	return museCodeAccount{}

@@ -547,6 +547,51 @@ func TestMuseCodeAccountFor_Precedence(t *testing.T) {
 	}
 }
 
+func TestMuseCodeAccountFor_FirstCredentialFileDecides(t *testing.T) {
+	home := isolateMuseCode(t)
+	writeMuseConfig(t, home, "auth.json", museAuthFixture) // stale OAuth login
+	keyFile := filepath.Join(t.TempDir(), "key.json")
+	if err := os.WriteFile(keyFile, []byte(`{"providers":{"meta":{"api_key":"ACTIVE-KEY"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MUSE_AUTH_PATH", keyFile)
+	got := museCodeAccountFor(home, os.Getenv)
+	if got.Email != "" || got.Fingerprint != museCodeAPIKeyFingerprint("ACTIVE-KEY") {
+		t.Fatalf("MUSE_AUTH_PATH's key must decide, not the lower-priority email: %#v", got)
+	}
+}
+
+func TestMuseCodeUsageLiveCache_KeepsOneReadingPerAccount(t *testing.T) {
+	isolateMuseCode(t)
+	base := time.Now()
+	save := func(key string, at time.Time) {
+		r, ok := parseMuseCodeSubscriptionUsage(museUsageJSON(at.Add(time.Hour), at.Add(48*time.Hour), at))
+		if !ok {
+			t.Fatal("fixture")
+		}
+		r.AccountKey = key
+		if !saveMuseCodeUsageLive(r) {
+			t.Fatal("save failed")
+		}
+	}
+	save("A", base)
+	save("B", base.Add(time.Second))
+	save("A", base.Add(2*time.Second))
+	a, okA := loadMuseCodeUsageLive("A")
+	if _, okB := loadMuseCodeUsageLive("B"); !okA || !okB || a.ObservedAtMs != base.Add(2*time.Second).UnixMilli() {
+		t.Fatalf("A→B→A must keep both accounts, A at its latest reading (okA=%v)", okA)
+	}
+	for i := 0; i < museCodeUsageLiveMaxAccounts; i++ {
+		save(fmt.Sprintf("acct-%02d", i), base.Add(time.Duration(10+i)*time.Second))
+	}
+	if _, ok := loadMuseCodeUsageLive("B"); ok {
+		t.Fatal("past the cap the oldest reading must be dropped")
+	}
+	if _, ok := loadMuseCodeUsageLive(fmt.Sprintf("acct-%02d", museCodeUsageLiveMaxAccounts-1)); !ok {
+		t.Fatal("the newest reading must be kept")
+	}
+}
+
 func TestProbeMuseCodeUsageLive_APIKeyAccountsDoNotShareACooldown(t *testing.T) {
 	isolateMuseCode(t)
 	now := time.Now()
