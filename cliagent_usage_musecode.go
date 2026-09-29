@@ -179,19 +179,25 @@ type museCodeAuthAPIKeyFile struct {
 
 // museCodeAccountFor resolves the account in Muse's own precedence:
 // META_API_KEY in the environment overrides any stored login (labelling it
-// with the stored email could name the wrong account); then the credential
-// files in the order Muse reads them, where the FIRST file naming an account —
-// by OAuth email, else by stored API key — decides. A lower-priority file is
-// never consulted once a higher one names someone, so a MUSE_AUTH_PATH key
-// file is not attributed to a stale login left in ~/.config/muse.
+// with the stored email could name the wrong account); then the FIRST
+// credential file that exists, in the order Muse reads them. That file is the
+// active credential whatever it holds: its OAuth email, else its stored API
+// key, names the account, and when it holds neither (e.g. only an access
+// token) the account is unknown. A lower-priority file is never consulted
+// once a higher one exists, so a MUSE_AUTH_PATH file is never attributed to a
+// stale login left in ~/.config/muse.
 func museCodeAccountFor(home string, getenv func(string) string) museCodeAccount {
 	if key := strings.TrimSpace(getenv("META_API_KEY")); key != "" {
 		return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(key)}
 	}
 	for _, path := range museCodeCredentialPaths(home, getenv) {
+		if info, err := os.Stat(path); err != nil || info.IsDir() || info.Size() == 0 {
+			continue
+		}
+		// This is the active credential file; the search ends here.
 		var identity museCodeAuthIdentityFile
 		if !readBoundedJSONFile(path, &identity) {
-			continue
+			return museCodeAccount{}
 		}
 		if email := strings.TrimSpace(identity.Providers.Meta.UserEmail); email != "" && strings.Contains(email, "@") && len(email) <= 320 {
 			return museCodeAccount{Email: email, Fingerprint: museCodeAccountFingerprint(email)}
@@ -200,8 +206,16 @@ func museCodeAccountFor(home string, getenv func(string) string) museCodeAccount
 		if readBoundedJSONFile(path, &stored) && strings.TrimSpace(stored.Providers.Meta.APIKey) != "" {
 			return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(stored.Providers.Meta.APIKey)}
 		}
+		return museCodeAccount{}
 	}
 	return museCodeAccount{}
+}
+
+// museCodeAccountUnchanged reports whether the account signed in now still
+// maps to accountKey. Every cache write a probe makes is gated on it: a login
+// switch while a host ran makes whatever it returned unattributable.
+func museCodeAccountUnchanged(accountKey string) bool {
+	return museCodeUsageAccountKey(currentMuseCodeAccountFingerprint()) == accountKey
 }
 
 // currentMuseCodeAccountFingerprint is the fingerprint of whoever Muse runs as

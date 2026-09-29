@@ -561,6 +561,57 @@ func TestMuseCodeAccountFor_FirstCredentialFileDecides(t *testing.T) {
 	}
 }
 
+func TestMuseCodeAccountFor_ActiveFileWithoutIdentityIsUnknown(t *testing.T) {
+	home := isolateMuseCode(t)
+	writeMuseConfig(t, home, "auth.json", museAuthFixture) // stale lower-priority login
+	active := filepath.Join(t.TempDir(), "active.json")
+	if err := os.WriteFile(active, []byte(`{"providers":{"meta":{"access_token":"T"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MUSE_AUTH_PATH", active)
+	if got := museCodeAccountFor(home, os.Getenv); got != (museCodeAccount{}) {
+		t.Fatalf("an active file that names nobody must leave the account unknown, got %#v", got)
+	}
+	t.Setenv("MUSE_AUTH_PATH", filepath.Join(t.TempDir(), "missing.json"))
+	if got := museCodeAccountFor(home, os.Getenv); got.Email != "Dev@Example.com" {
+		t.Fatalf("a MUSE_AUTH_PATH that does not exist falls through, got %#v", got)
+	}
+}
+
+func TestMuseCode_AccountSwitchMidProbeSavesNoModelCatalog(t *testing.T) {
+	isolateMuseCode(t)
+	t.Setenv("META_API_KEY", "OLD")
+	oldKey := museCodeAPIKeyFingerprint("OLD")
+	now := time.Now()
+	fake := &fakeMuseServe{
+		usage:  museUsageJSON(now.Add(time.Hour), now.Add(72*time.Hour), now),
+		models: json.RawMessage(`{"source":"providerCatalog","models":[{"modelId":"m","variants":["low"]}]}`),
+	}
+	// The login switches while the host starts.
+	startMuseCodeMSPFn = func(ctx context.Context, l string, n func(string, json.RawMessage)) (*museCodeMSPClient, error) {
+		os.Setenv("META_API_KEY", "NEW")
+		return fake.start(ctx, l, n)
+	}
+	agent := detectedCLIAgent{Detected: true, Path: "/x/muse", Version: "1.4.0"}
+	if got := probeMuseCodeUsageLive(context.Background(), agent, time.Now); got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("probe outcome %q", got)
+	}
+	if _, _, ok := loadMuseCodeModelsCache("1.4.0", oldKey, now); ok {
+		t.Fatal("the probe saved another account's catalog under the old account")
+	}
+	if _, ok := loadMuseCodeUsageLive(oldKey); ok {
+		t.Fatal("the probe saved another account's reading under the old account")
+	}
+
+	os.Setenv("META_API_KEY", "OLD")
+	if _, ok := discoverMuseCodeModels(context.Background(), agent); !ok {
+		t.Fatal("discovery still answers its caller")
+	}
+	if _, _, ok := loadMuseCodeModelsCache("1.4.0", oldKey, now); ok {
+		t.Fatal("discovery saved another account's catalog under the old account")
+	}
+}
+
 func TestMuseCodeUsageLiveCache_KeepsOneReadingPerAccount(t *testing.T) {
 	isolateMuseCode(t)
 	base := time.Now()

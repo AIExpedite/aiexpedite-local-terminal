@@ -224,7 +224,9 @@ func probeMuseCodeUsageLive(parent context.Context, agent detectedCLIAgent, now 
 	// for one the model would reject.
 	discovery, listed := museCodeListModels(ctx, client)
 	if listed {
-		saveMuseCodeModelsCache(agent.Version, accountKey, discovery, now())
+		if museCodeAccountUnchanged(accountKey) {
+			saveMuseCodeModelsCache(agent.Version, accountKey, discovery, now())
+		}
 	}
 	home, _ := os.UserHomeDir()
 	effort := museCodeProbeEffort(discovery, listed, readMuseCodeDefaultModel(home, os.Getenv))
@@ -235,7 +237,7 @@ func probeMuseCodeUsageLive(parent context.Context, agent detectedCLIAgent, now 
 		// Checked immediately before the reading is written: a login switch
 		// while the turn ran makes the reading unattributable, and it must
 		// never be cached (or start the cooldown) under the old account.
-		SameAccount: func() bool { return currentMuseCodeAccountFingerprint() == fingerprint },
+		SameAccount: func() bool { return museCodeAccountUnchanged(accountKey) },
 	})
 }
 
@@ -481,7 +483,11 @@ func discoverMuseCodeModels(ctx context.Context, detected detectedCLIAgent) (cli
 		discovery, ok := museCodeListModels(ctx, client)
 		client.Close()
 		if ok {
-			saveMuseCodeModelsCache(detected.Version, accountKey, discovery, now)
+			// Keyed to the account the host was started under, and only while
+			// that account is still the signed-in one.
+			if museCodeAccountUnchanged(accountKey) {
+				saveMuseCodeModelsCache(detected.Version, accountKey, discovery, now)
+			}
 			return discovery, true
 		}
 	}
