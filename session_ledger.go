@@ -977,7 +977,16 @@ func openLedgerLogicalSession(sessionID string) {
 	globalSpawnLedger.OpenLogicalSession(sessionID)
 }
 
-func releaseLedgerSession(sessionID string) { globalSpawnLedger.ReleaseSession(sessionID) }
+// releaseLedgerSession is the one point every manager passes when it removes
+// a session, so it also tears down the session's relay turn inbox rows
+// (relay_turn_inbox.go): a turn for a session that is gone cannot run again.
+func releaseLedgerSession(sessionID string) {
+	globalSpawnLedger.ReleaseSession(sessionID)
+	releaseRelayTurnInboxSession(sessionID)
+}
+
+// releaseRelayTurnInboxSession is a seam so tests can observe teardown.
+var releaseRelayTurnInboxSession = func(sessionID string) { globalRelayTurnInbox.ReleaseSession(sessionID) }
 
 // ledgerLockWait bounds how long a starting agent waits for the ledger lock:
 // an updating agent's predecessor may still be exiting.

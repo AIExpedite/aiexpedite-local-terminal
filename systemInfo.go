@@ -86,9 +86,68 @@ type detectedCLIAgent struct {
 	Name     string `json:"name,omitempty"`
 }
 
+// capabilitiesInfo is `terminalAgents/{agentId}.capabilities`. It carries two
+// different kinds of fact and they must not share a fate:
+//
+//   - concurrency HINTS derived from the CPU and memory probes — best-effort,
+//     absent when a probe fails;
+//   - PROTOCOL flags — what this build of the agent can speak. These are true
+//     by construction (the code is compiled in) and must be reported whether
+//     or not any hardware probe succeeded.
+//
+// Until the voice relay this struct was only allocated when BOTH probes
+// succeeded, and auth.go forwards it only when non-nil. A machine where
+// gopsutil could not read the CPU (a locked-down VM, WMI broken on Windows)
+// would then report no relay capabilities at all, and terminal-service would
+// refuse every relay to it with DEVICE_UPDATE_REQUIRED — telling the user to
+// update an agent that is already current. gatherMachineInfo therefore
+// allocates it (newMachineCapabilities) unconditionally before the probes run,
+// and applyConcurrencyHints merges the hints in only when they land.
 type capabilitiesInfo struct {
 	RecommendedConcurrentTests  int `json:"recommendedConcurrentTests,omitempty"`
 	RecommendedConcurrentBuilds int `json:"recommendedConcurrentBuilds,omitempty"`
+
+	// RelayTurnInbox (shared-constants DEVICE_RELAY_CAPABILITIES.TURN_INBOX):
+	// a session command whose envelope id carries the relay prefix goes
+	// through the durable per-session turn inbox (relay_turn_inbox.go), so a
+	// redelivered relay SEND runs at most once after it was accepted.
+	// REQUIRED by the relay. Never omitempty: a future build that reports
+	// `false` must not read as "field absent".
+	RelayTurnInbox bool `json:"relayTurnInbox"`
+	// RelayAckWatermark (DEVICE_RELAY_CAPABILITIES.ACK_WATERMARK): the agent
+	// verifies a SIGNED `ackedTurnIds` watermark on a session command and
+	// deletes exactly those inbox rows. terminal-service attaches the field
+	// only when this is true — an older agent would reject the unknown signed
+	// field as a bad signature.
+	RelayAckWatermark bool `json:"relayAckWatermark"`
+	// RelayPermissionPrompts (DEVICE_RELAY_CAPABILITIES.PERMISSION_PROMPTS):
+	// a Claude session started with `--permission-prompt-tool stdio` launches
+	// WITHOUT --dangerously-skip-permissions and accepts a signed
+	// claude_native_control (a human's control_response). Without it a voice
+	// relay must not start Claude at all: an older agent would add the
+	// auto-approve flag regardless.
+	RelayPermissionPrompts bool `json:"relayPermissionPrompts"`
+}
+
+// newMachineCapabilities returns the capabilities every build of this agent
+// reports regardless of hardware probes: the relay protocol flags.
+func newMachineCapabilities() *capabilitiesInfo {
+	return &capabilitiesInfo{
+		RelayTurnInbox:         true,
+		RelayAckWatermark:      true,
+		RelayPermissionPrompts: true,
+	}
+}
+
+// applyConcurrencyHints merges the CPU/RAM-derived concurrency hints into
+// caps when both probes landed; otherwise caps keeps only its protocol flags.
+// Recommendations cap at min(threads/cores, RAM/2 or RAM/4).
+func applyConcurrencyHints(caps *capabilitiesInfo, c *cpuInfo, m *memoryInfo) {
+	if caps == nil || c == nil || m == nil || m.TotalGB <= 0 {
+		return
+	}
+	caps.RecommendedConcurrentTests = minInt(c.Threads, int(m.TotalGB/2))
+	caps.RecommendedConcurrentBuilds = minInt(c.Cores, int(m.TotalGB/4))
 }
 
 // gpuInfo describes a single GPU adapter. Multi-GPU machines emit one
@@ -338,6 +397,10 @@ func gatherMachineInfo() *MachineInfo {
 		extrasCh <- gatherSetupExtras(ctx, currentGOOS(), runSetupProbe)
 	}()
 
+	// Protocol capabilities first, before any probe can fail — see
+	// capabilitiesInfo. The concurrency hints are merged in at the end.
+	info.Capabilities = newMachineCapabilities()
+
 	// CPU — gopsutil reads /proc/cpuinfo, sysctl, or WMI as appropriate.
 	if cpus, err := cpu.Info(); err == nil && len(cpus) > 0 {
 		physical, _ := cpu.Counts(false)
@@ -484,12 +547,8 @@ func gatherMachineInfo() *MachineInfo {
 
 	// Capability hints — cheap derivation from the gathered numbers; the
 	// LLM uses these to decide whether to run tests/builds in parallel.
-	if info.CPU != nil && info.Memory != nil && info.Memory.TotalGB > 0 {
-		info.Capabilities = &capabilitiesInfo{
-			RecommendedConcurrentTests:  minInt(info.CPU.Threads, int(info.Memory.TotalGB/2)),
-			RecommendedConcurrentBuilds: minInt(info.CPU.Cores, int(info.Memory.TotalGB/4)),
-		}
-	}
+	// A failed CPU or memory probe leaves only the protocol flags set.
+	applyConcurrencyHints(info.Capabilities, info.CPU, info.Memory)
 
 	return info
 }

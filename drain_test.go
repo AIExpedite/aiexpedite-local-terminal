@@ -283,6 +283,10 @@ func TestAdmitWork_WhileDraining(t *testing.T) {
 		{"codex_appserver_send", commandMsg{Type: "codex_appserver_send"}, true},
 		{"codex_appserver_end", commandMsg{Type: "codex_appserver_end"}, true},
 		{"claude_native_send", commandMsg{Type: "claude_native_send"}, true},
+		// A human's control_response answers a tool-use prompt on a session
+		// accepted before the drain; refusing it would leave Claude blocked on
+		// an approval nobody can give, and the drain never reaching zero work.
+		{"claude_native_control", commandMsg{Type: "claude_native_control"}, true},
 		{"grok_acp_send", commandMsg{Type: "grok_acp_send"}, true},
 		{"antigravity_native_end", commandMsg{Type: "antigravity_native_end"}, true},
 		// One-shot-per-turn kinds register a drain work source, so their SEND /

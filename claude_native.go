@@ -27,6 +27,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -368,6 +369,17 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 // manager wraps it in the NDJSON user envelope (callers never construct the
 // protocol frame themselves — unlike codex/grok which forward JSON-RPC).
 func (m *ClaudeNativeManager) Send(id string, text string) error {
+	return m.SendAccepting(id, text, nil)
+}
+
+// SendAccepting is Send that calls accept (when non-nil) at the ownership
+// boundary: under stdinMu, after every refusal, immediately BEFORE the turn is
+// written. A relayed voice turn records `accepted` in the durable turn inbox
+// there (relay_turn_inbox.go) — once the envelope is on the child's stdin the
+// turn is running, so recording it afterwards would let a crash in between
+// look like a turn that never started, and the redelivery would run it twice.
+// An accept error (the acceptance could not be made durable) refuses the turn.
+func (m *ClaudeNativeManager) SendAccepting(id string, text string, accept func() error) error {
 	session := m.Get(id)
 	if session == nil {
 		return fmt.Errorf("claude native session %s not found", id)
@@ -375,7 +387,7 @@ func (m *ClaudeNativeManager) Send(id string, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("payload is empty")
 	}
-	return m.writeUserTurn(session, text)
+	return m.writeUserTurnAccepting(session, text, accept)
 }
 
 // writeUserTurn serialises a single NDJSON user envelope to the child's stdin
@@ -384,6 +396,12 @@ func (m *ClaudeNativeManager) Send(id string, text string) error {
 // frame — this guarantees a later Send cannot interleave with an abandoned
 // write goroutine.
 func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text string) error {
+	return m.writeUserTurnAccepting(session, text, nil)
+}
+
+// writeUserTurnAccepting is writeUserTurn with the relay acceptance callback
+// (see SendAccepting).
+func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSession, text string, accept func() error) error {
 	envelope := claudeUserEnvelope(session.ID, text)
 
 	session.stdinMu.Lock()
@@ -391,6 +409,9 @@ func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text s
 
 	if session.Status() == "ended" {
 		return fmt.Errorf("claude native session %s has ended", session.ID)
+	}
+	if err := acceptRelayDelivery(accept); err != nil {
+		return err
 	}
 
 	// A follow-up turn is being delivered, so an earlier terminal `result` no
@@ -412,20 +433,98 @@ func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text s
 		if err != nil {
 			return fmt.Errorf("failed to write to claude native session %s stdin: %w", session.ID, err)
 		}
-	case <-time.After(claudeNativeStdinWriteTimeout):
-		session.closeStdin()
-		session.mu.Lock()
-		session.status = "ended"
-		session.mu.Unlock()
-		if session.Process != nil && session.Process.Process != nil {
-			_ = session.Process.Process.Kill()
-		}
+	case <-time.After(claudeNativeStdinWriteBudget):
+		terminateStalledClaudeWriter(session)
 		return fmt.Errorf("timeout writing to claude native session %s stdin — session terminated to prevent frame interleave", session.ID)
 	}
 
 	fmt.Printf("%s[claude-native] → %s (%d bytes)%s\n",
 		colorBlue, session.ID, len(envelope), colorReset)
 	return nil
+}
+
+// SendControl writes a stream-json control_response to the child's stdin —
+// a human's answer to a can_use_tool control_request (the voice relay
+// launches Claude with --permission-prompt-tool stdio). Only a well-formed
+// control_response object is accepted: this path must never become a way to
+// inject a user turn or any other frame. The command is signed like every
+// session command.
+func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
+	session := m.Get(id)
+	if session == nil {
+		return fmt.Errorf("claude native session %s not found", id)
+	}
+	line, err := claudeControlResponseLine(raw)
+	if err != nil {
+		return err
+	}
+	session.stdinMu.Lock()
+	defer session.stdinMu.Unlock()
+	if session.Status() == "ended" {
+		return fmt.Errorf("claude native session %s has ended", session.ID)
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := fmt.Fprintln(session.Stdin, line)
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
+		}
+		return nil
+	case <-time.After(claudeNativeStdinWriteBudget):
+		// Same teardown as a stalled user turn: releasing stdinMu with the
+		// write still pending would let the next turn or approval write while
+		// this one could still land late, out of order, or interleaved.
+		terminateStalledClaudeWriter(session)
+		return fmt.Errorf("timeout writing control to claude native session %s — session terminated to prevent frame interleave", session.ID)
+	}
+}
+
+// claudeNativeStdinWriteBudget is the write budget both stdin writers enforce
+// — a test seam like codexAppServerStdinWriteBudget, so the stall teardown is
+// reachable without waiting out claudeNativeStdinWriteTimeout.
+var claudeNativeStdinWriteBudget = claudeNativeStdinWriteTimeout
+
+// terminateStalledClaudeWriter tears a session down after a stdin write
+// timed out (caller holds stdinMu): close stdin so the abandoned write
+// goroutine fails instead of landing later, mark the session ended so every
+// later write is refused, and kill the child so waitForExit publishes the
+// terminal frame.
+func terminateStalledClaudeWriter(session *ClaudeNativeSession) {
+	session.closeStdin()
+	session.mu.Lock()
+	session.status = "ended"
+	session.mu.Unlock()
+	if session.Process != nil && session.Process.Process != nil {
+		_ = session.Process.Process.Kill()
+	}
+}
+
+// claudeControlResponseLine validates a control payload and returns it as ONE
+// NDJSON line. Only a control_response naming a request_id passes; embedded
+// newlines are compacted away so the payload cannot split into several
+// frames (e.g. a smuggled user turn) on the child's stdin.
+func claudeControlResponseLine(raw string) (string, error) {
+	var frame struct {
+		Type     string `json:"type"`
+		Response struct {
+			RequestID string `json:"request_id"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &frame); err != nil {
+		return "", fmt.Errorf("control payload is not a single JSON object: %w", err)
+	}
+	if frame.Type != "control_response" || frame.Response.RequestID == "" {
+		return "", fmt.Errorf("control payload must be a control_response with a request_id")
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, []byte(raw)); err != nil {
+		return "", fmt.Errorf("control payload is not compactable JSON: %w", err)
+	}
+	return compact.String(), nil
 }
 
 // End shuts down a session: close stdin (Claude's graceful exit), then escalate

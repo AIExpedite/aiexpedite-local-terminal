@@ -402,12 +402,8 @@ func TestCapabilitiesDerivation_RespectsRAMConstraint(t *testing.T) {
 		CPU:    &cpuInfo{Cores: 16, Threads: 32},
 		Memory: &memoryInfo{TotalGB: 8.0}, // tight: RAM-limited
 	}
-	if mi.CPU != nil && mi.Memory != nil && mi.Memory.TotalGB > 0 {
-		mi.Capabilities = &capabilitiesInfo{
-			RecommendedConcurrentTests:  minInt(mi.CPU.Threads, int(mi.Memory.TotalGB/2)),
-			RecommendedConcurrentBuilds: minInt(mi.CPU.Cores, int(mi.Memory.TotalGB/4)),
-		}
-	}
+	mi.Capabilities = newMachineCapabilities()
+	applyConcurrencyHints(mi.Capabilities, mi.CPU, mi.Memory)
 	if mi.Capabilities.RecommendedConcurrentTests != 4 {
 		t.Errorf("RecommendedConcurrentTests = %d, want 4 (min(32, 8/2))",
 			mi.Capabilities.RecommendedConcurrentTests)

@@ -1130,10 +1130,34 @@ func (sm *SessionManager) newestOpenCodexUsageFloor() int64 {
 	return newest
 }
 
+// sessionStdinWriteBudget is how long SendInputAccepting waits on a stdin
+// write — a test seam like claudeNativeStdinWriteBudget.
+var sessionStdinWriteBudget = 10 * time.Second
+
+// terminateStalledSessionWriterLocked tears a session down after a relayed
+// turn's stdin write timed out (caller holds session.mu): close stdin so the
+// abandoned write fails instead of landing late, mark the session ended so
+// every later input is refused, and kill the child so waitForExit publishes
+// the terminal frame.
+func terminateStalledSessionWriterLocked(session *CLISession) {
+	session.deferredStdinClose = false
+	_ = session.Stdin.Close()
+	session.Status = "ended"
+	_ = killSessionProcess(session)
+}
+
 // SendInput writes text to the stdin of the specified session.
 // For Claude and Antigravity stream-json sessions, the text is wrapped in the
 // CLI's NDJSON user-message envelope. For other CLIs it is sent as raw text.
 func (sm *SessionManager) SendInput(id, text string) error {
+	return sm.SendInputAccepting(id, text, nil)
+}
+
+// SendInputAccepting is SendInput that calls accept (when non-nil) at the ownership
+// boundary: under session.mu, after every refusal, immediately BEFORE the turn is written.
+// A relayed voice turn records `accepted` in the durable turn inbox there
+// (relay_turn_inbox.go); an accept error refuses the turn.
+func (sm *SessionManager) SendInputAccepting(id, text string, accept func() error) error {
 	sm.mu.RLock()
 	session, exists := sm.sessions[id]
 	sm.mu.RUnlock()
@@ -1147,6 +1171,9 @@ func (sm *SessionManager) SendInput(id, text string) error {
 
 	if session.Status == "ended" {
 		return fmt.Errorf("session %s has ended", id)
+	}
+	if err := acceptRelayDelivery(accept); err != nil {
+		return err
 	}
 
 	// Structured-stdin agents each use a different NDJSON envelope.
@@ -1182,7 +1209,15 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		if err != nil {
 			return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(sessionStdinWriteBudget):
+		if accept != nil {
+			// A relay turn was already accepted (and acked) above, so the
+			// abandoned write must not land later or interleave with the next
+			// input: tear the session down as the Claude, Codex, and Grok
+			// managers do on a stalled writer.
+			terminateStalledSessionWriterLocked(session)
+			return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full); session terminated", id)
+		}
 		// The child is neither killed nor its stdin closed here, so the
 		// abandoned writer can still deliver this prompt. Keep watching it, so a
 		// prompt that does reach the child still closes a deferred one-shot

@@ -80,7 +80,8 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 		"--model": true, "--system-prompt": true, "--append-system-prompt": true,
 		"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
 		"--agent": true, "--agents": true, "--session-id": true,
-		"--mcp-config": true, "--settings": true, "--json-schema": true,
+		"--permission-prompt-tool": true,
+		"--mcp-config":             true, "--settings": true, "--json-schema": true,
 		"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
 	}
 
@@ -125,7 +126,39 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 
 	result = append(result, flags...)
 
+	// A caller that names a permission-prompt tool wants every tool use
+	// ASKED, not auto-approved: the voice relay launches Claude with
+	// `--permission-prompt-tool stdio`, so each can_use_tool arrives as a
+	// control_request on stdout and a human answers it (claude_native_control).
+	// Keeping --dangerously-skip-permissions beside it would make the prompt
+	// tool dead code. The flag is in the signed args, so it cannot be injected
+	// or stripped in transit.
+	if claudeArgsNamePermissionPromptTool(flags) {
+		result = removeArg(result, "--dangerously-skip-permissions")
+	}
+
 	return result, strings.Join(promptParts, " ")
+}
+
+// claudeArgsNamePermissionPromptTool reports whether the caller's flags carry
+// --permission-prompt-tool (space or equals form).
+func claudeArgsNamePermissionPromptTool(flags []string) bool {
+	for _, f := range flags {
+		if f == "--permission-prompt-tool" || strings.HasPrefix(f, "--permission-prompt-tool=") {
+			return true
+		}
+	}
+	return false
+}
+
+func removeArg(args []string, drop string) []string {
+	out := args[:0:0]
+	for _, a := range args {
+		if a != drop {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // claudeArgvShape is one candidate no-tools print invocation. The ladder below
