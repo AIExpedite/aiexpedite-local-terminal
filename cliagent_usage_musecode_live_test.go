@@ -604,8 +604,8 @@ func TestMuseCode_AccountSwitchMidProbeSavesNoModelCatalog(t *testing.T) {
 	}
 
 	os.Setenv("META_API_KEY", "OLD")
-	if _, ok := discoverMuseCodeModels(context.Background(), agent); !ok {
-		t.Fatal("discovery still answers its caller")
+	if _, ok := discoverMuseCodeModels(context.Background(), agent); ok {
+		t.Fatal("after a switch the answer must be inconclusive, or the in-memory cache files it under the old key")
 	}
 	if _, _, ok := loadMuseCodeModelsCache("1.4.0", oldKey, now); ok {
 		t.Fatal("discovery saved another account's catalog under the old account")

@@ -57,6 +57,10 @@ const (
 	museCodeUsageLiveMaxAccounts = 16
 	// museCodeUnknownAccountKey scopes a reading when nothing on disk tells
 	// accounts apart (a keychain login): the device's one Muse account.
+	// Deliberate limit: distinguishing two keychain logins would mean reading
+	// the OS keychain secret, which this agent never does. After a keychain
+	// account switch the previous reading can show (labelled with its
+	// observedAt) until the next Refresh, at most five minutes later.
 	museCodeUnknownAccountKey = "device"
 )
 
@@ -483,11 +487,14 @@ func discoverMuseCodeModels(ctx context.Context, detected detectedCLIAgent) (cli
 		discovery, ok := museCodeListModels(ctx, client)
 		client.Close()
 		if ok {
-			// Keyed to the account the host was started under, and only while
-			// that account is still the signed-in one.
-			if museCodeAccountUnchanged(accountKey) {
-				saveMuseCodeModelsCache(detected.Version, accountKey, discovery, now)
+			// Only an answer for the account the host was started under, still
+			// signed in, is kept or returned. After a switch the answer is
+			// inconclusive: returning it would let the shared in-memory cache
+			// file it under the key computed before the switch.
+			if !museCodeAccountUnchanged(accountKey) {
+				return cliAgentModelDiscovery{}, false
 			}
+			saveMuseCodeModelsCache(detected.Version, accountKey, discovery, now)
 			return discovery, true
 		}
 	}
