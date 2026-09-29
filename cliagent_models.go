@@ -373,7 +373,13 @@ func annotateModelPoolsFromUsage(models []cliAgentModelDetail, metrics []cliAgen
 }
 
 func cliAgentModelProbeCacheKey(agentID string, detected detectedCLIAgent) string {
-	return strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
+	key := strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
+	if strings.EqualFold(agentID, "musecode") {
+		// Muse's catalog is the signed-in account's; another account must
+		// not be served this one's list for the TTL.
+		key += "\x00" + currentMuseCodeAccountFingerprint()
+	}
+	return key
 }
 
 // lookupCLIAgentModelDiscoveryCache answers from the probe cache alone. The
@@ -432,6 +438,8 @@ func discoverCLIAgentModels(ctx context.Context, agentID string, detected detect
 		return parseAntigravityModelList(out)
 	case "grok":
 		return discoverGrokModels(ctx, detected, home)
+	case "musecode":
+		return discoverMuseCodeModels(ctx, detected)
 	case "claudecode":
 		out, ok := cliAgentModelProbeRunner(ctx, detected.Path, os.Environ(), "--help")
 		if !ok {
