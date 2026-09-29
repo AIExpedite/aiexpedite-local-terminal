@@ -30,6 +30,8 @@ type fakeMuseServe struct {
 	// Windows route, where the notification is held until the next request.
 	afterTurn json.RawMessage
 	turned    bool
+	// turnEffort is the reasoningEffort the turn asked for ("" = omitted).
+	turnEffort string
 }
 
 func (f *fakeMuseServe) seen() []string {
@@ -74,6 +76,11 @@ func (f *fakeMuseServe) serve(in io.Reader, out io.WriteCloser) {
 		turned := f.turned
 		if req.Method == "turn/start" {
 			f.turned = true
+			var p struct {
+				ReasoningEffort string `json:"reasoningEffort"`
+			}
+			_ = json.Unmarshal(req.Params, &p)
+			f.turnEffort = p.ReasoningEffort
 		}
 		f.mu.Unlock()
 		if req.ID == nil {
@@ -283,6 +290,12 @@ func TestProbeMuseCodeUsageLive_TurnThenFirstUsageChanged(t *testing.T) {
 	if !ok || cached.Window.UsedPercent != 12 || cached.Weekly.UsedPercent != 140 {
 		t.Fatalf("cached=%#v ok=%v", cached, ok)
 	}
+	fake.mu.Lock()
+	effort := fake.turnEffort
+	fake.mu.Unlock()
+	if effort != "low" {
+		t.Fatalf("the default model advertises only low/high, yet the turn asked for %q", effort)
+	}
 	models, fresh, ok := loadMuseCodeModelsCache("1.4.0", time.Now())
 	if !ok || !fresh || len(models.Models) != 2 || models.DefaultModel != "muse-spark-1.3-contributor" || !models.Exhaustive {
 		t.Fatalf("models=%#v fresh=%v ok=%v", models, fresh, ok)
@@ -338,6 +351,76 @@ func TestProbeMuseCodeUsageLive_PollsWhenTheNotificationIsHeld(t *testing.T) {
 	}
 	if reads < 2 {
 		t.Fatalf("the reading must come from a poll after the turn (usage/read x%d)", reads)
+	}
+}
+
+func TestMuseCodeProbeEffort(t *testing.T) {
+	discovery := cliAgentModelDiscovery{
+		DefaultModel: "b",
+		Models: []cliAgentModelDetail{
+			{ID: "a", Efforts: []string{"minimal", "low", "high"}},
+			{ID: "b", Efforts: []string{"low", "high"}},
+			{ID: "c"},
+		},
+	}
+	cases := []struct {
+		name      string
+		discovery cliAgentModelDiscovery
+		listed    bool
+		settings  string
+		want      string
+	}{
+		{"settings model listed", discovery, true, "a", "minimal"},
+		{"settings model unknown: catalog default", discovery, true, "zzz", "low"},
+		{"no settings: catalog default", discovery, true, "", "low"},
+		{"model without efforts: omit", discovery, true, "c", ""},
+		{"no default: cheapest effort every model accepts", cliAgentModelDiscovery{Models: []cliAgentModelDetail{
+			{ID: "a", Efforts: []string{"minimal", "low", "high"}}, {ID: "b", Efforts: []string{"low", "high"}}}}, true, "", "low"},
+		{"no common effort: omit", cliAgentModelDiscovery{Models: []cliAgentModelDetail{
+			{ID: "a", Efforts: []string{"minimal"}}, {ID: "b", Efforts: []string{"high"}}}}, true, "", ""},
+		{"list unavailable: omit", cliAgentModelDiscovery{}, false, "a", ""},
+	}
+	for _, tc := range cases {
+		if got := museCodeProbeEffort(tc.discovery, tc.listed, tc.settings); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestMuseCodeLiveProbeConverse_AccountSwitchDuringTurnCachesNothing(t *testing.T) {
+	isolateMuseCode(t)
+	now := time.Now()
+	fake := &fakeMuseServe{changed: museUsageJSON(now.Add(time.Hour), now.Add(72*time.Hour), now)}
+	readings := make(chan json.RawMessage, 1)
+	client, err := fake.start(context.Background(), "", func(method string, params json.RawMessage) {
+		if method == "usage/changed" {
+			select {
+			case readings <- params:
+			default:
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got := museCodeLiveProbeConverse(ctx, client, readings, museCodeProbeTurn{
+		AccountKey:  "old-account",
+		SameAccount: func() bool { return false },
+	})
+	if got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("got %q", got)
+	}
+	if _, ok := loadMuseCodeUsageLive("old-account"); ok {
+		t.Fatal("an unattributable reading was cached under the old account")
+	}
+	fake.mu.Lock()
+	effort := fake.turnEffort
+	fake.mu.Unlock()
+	if effort != "" {
+		t.Fatalf("no effort was chosen, yet the turn sent %q", effort)
 	}
 }
 

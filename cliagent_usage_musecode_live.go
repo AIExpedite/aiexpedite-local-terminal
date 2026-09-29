@@ -13,7 +13,7 @@
 //
 //	So a Refresh click does what the Antigravity probe does: start a private
 //	`muse serve` (no session log, no writes, no shell, empty temp dir), send
-//	one trivial turn at minimal effort, and kill the host the moment the
+//	one trivial turn at the cheapest effort its model accepts, and kill the host the moment the
 //	reading lands (`usage/changed`, or a `usage/read` poll — see
 //	museCodeLiveProbeConverse for why both), normally within seconds. The reading is
 //	normalized and cached per account in musecode_usage_live.json, which the
@@ -188,30 +188,97 @@ func probeMuseCodeUsageLive(parent context.Context, agent detectedCLIAgent, now 
 	}
 	defer client.Close()
 
-	// The model list rides the same host: a query, no model call.
-	if discovery, ok := museCodeListModels(ctx, client); ok {
+	// The model list rides the same host: a query, no model call. It also
+	// names the efforts the session's model accepts, so the turn never asks
+	// for one the model would reject.
+	discovery, listed := museCodeListModels(ctx, client)
+	if listed {
 		saveMuseCodeModelsCache(agent.Version, discovery, now())
 	}
+	home, _ := os.UserHomeDir()
+	effort := museCodeProbeEffort(discovery, listed, readMuseCodeDefaultModel(home, os.Getenv))
 
-	outcome := museCodeLiveProbeConverse(ctx, client, readings, accountKey)
-	if outcome == liveProbeOutcomeOK && currentMuseCodeAccountFingerprint() != fingerprint {
-		// Someone signed in as another account while the turn ran; the
-		// reading cannot be attributed to the account signed in now.
-		return liveProbeOutcomeAccountChanged
+	return museCodeLiveProbeConverse(ctx, client, readings, museCodeProbeTurn{
+		AccountKey: accountKey,
+		Effort:     effort,
+		// Checked immediately before the reading is written: a login switch
+		// while the turn ran makes the reading unattributable, and it must
+		// never be cached (or start the cooldown) under the old account.
+		SameAccount: func() bool { return currentMuseCodeAccountFingerprint() == fingerprint },
+	})
+}
+
+// museCodeProbeTurn is what the converse step needs beyond the host.
+type museCodeProbeTurn struct {
+	AccountKey string
+	// Effort is the reasoning effort for the probe turn; "" omits the field
+	// and lets the host use its default.
+	Effort string
+	// SameAccount reports whether the account the probe started under is
+	// still signed in. nil means "not checked".
+	SameAccount func() bool
+}
+
+// museCodeProbeEffort picks the cheapest effort the probe turn's model
+// accepts. The session runs settings.json's model when the catalog lists it,
+// else the catalog default; with neither known, the cheapest effort EVERY
+// listed model accepts. "" (omit the field) when nothing is known — an effort
+// the model does not advertise can make the host reject the turn.
+func museCodeProbeEffort(discovery cliAgentModelDiscovery, listed bool, settingsModel string) string {
+	if !listed || len(discovery.Models) == 0 {
+		return ""
 	}
-	return outcome
+	find := func(id string) *cliAgentModelDetail {
+		for i := range discovery.Models {
+			if id != "" && discovery.Models[i].ID == id {
+				return &discovery.Models[i]
+			}
+		}
+		return nil
+	}
+	model := find(settingsModel)
+	if model == nil {
+		model = find(discovery.DefaultModel)
+	}
+	if model != nil {
+		if len(model.Efforts) == 0 {
+			return ""
+		}
+		return model.Efforts[0] // ordered low → high (appendEffort)
+	}
+	var common []string
+	for i, m := range discovery.Models {
+		if i == 0 {
+			common = append(common, m.Efforts...)
+			continue
+		}
+		kept := common[:0]
+		for _, e := range common {
+			if containsString(m.Efforts, e) {
+				kept = append(kept, e)
+			}
+		}
+		common = kept
+	}
+	if len(common) == 0 {
+		return ""
+	}
+	return common[0]
 }
 
 // museCodeLiveProbeConverse drives usage/read → (session/start → turn/start →
 // first usage/changed) over a started host. Split out so tests drive it with
 // pipes instead of a real Muse Code.
-func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, readings <-chan json.RawMessage, accountKey string) string {
+func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, readings <-chan json.RawMessage, turn museCodeProbeTurn) string {
 	capture := func(raw json.RawMessage) string {
 		reading, ok := parseMuseCodeSubscriptionUsage(raw)
 		if !ok {
 			return liveProbeOutcomeNoReading
 		}
-		reading.AccountKey = accountKey
+		if turn.SameAccount != nil && !turn.SameAccount() {
+			return liveProbeOutcomeAccountChanged
+		}
+		reading.AccountKey = turn.AccountKey
 		if !saveMuseCodeUsageLive(reading) {
 			return liveProbeOutcomeNoReading
 		}
@@ -246,12 +313,15 @@ func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, r
 	if json.Unmarshal(started, &session) != nil || session.Session.SessionID == "" {
 		return liveProbeOutcomeRPCError
 	}
-	if _, err := client.Call(ctx, "turn/start", map[string]any{
-		"commandId":       newMuseCodeCommandID(),
-		"sessionId":       session.Session.SessionID,
-		"input":           []map[string]any{{"type": "text", "text": museCodeLiveProbePrompt}},
-		"reasoningEffort": "minimal",
-	}); err != nil {
+	params := map[string]any{
+		"commandId": newMuseCodeCommandID(),
+		"sessionId": session.Session.SessionID,
+		"input":     []map[string]any{{"type": "text", "text": museCodeLiveProbePrompt}},
+	}
+	if turn.Effort != "" {
+		params["reasoningEffort"] = turn.Effort
+	}
+	if _, err := client.Call(ctx, "turn/start", params); err != nil {
 		return museCodeProbeErrorOutcome(ctx)
 	}
 
