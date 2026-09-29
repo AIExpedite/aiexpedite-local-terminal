@@ -141,3 +141,36 @@ func TestClaudeSendControlTimeoutTerminatesTheSession(t *testing.T) {
 		t.Fatalf("a later turn after the stall = %v, want refused", err)
 	}
 }
+
+// A relayed turn whose generic-session stdin write stalls has already been
+// accepted, so the session is torn down rather than left with a live writer
+// that could deliver the turn late or interleave it with the next input.
+func TestGenericSessionRelayWriteTimeoutTerminatesTheSession(t *testing.T) {
+	prev := sessionStdinWriteBudget
+	sessionStdinWriteBudget = 50 * time.Millisecond
+	t.Cleanup(func() { sessionStdinWriteBudget = prev })
+
+	sm := NewSessionManager(nil)
+	stdin := &blockingWriteCloser{closed: make(chan struct{})}
+	session := &CLISession{ID: "relay-generic-stall", Command: "gemini", Status: "running", Stdin: stdin}
+	sm.mu.Lock()
+	sm.sessions[session.ID] = session
+	sm.mu.Unlock()
+
+	accepted := 0
+	err := sm.SendInputAccepting(session.ID, "make the button blue", func() error { accepted++; return nil })
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted = %d, want 1", accepted)
+	}
+	select {
+	case <-stdin.closed:
+	default:
+		t.Fatal("stdin left open after a stalled relay write")
+	}
+	if err := sm.SendInput(session.ID, "next turn"); err == nil || !strings.Contains(err.Error(), "has ended") {
+		t.Fatalf("a later input after the stall = %v, want refused", err)
+	}
+}
