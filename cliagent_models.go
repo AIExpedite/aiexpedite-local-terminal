@@ -432,6 +432,8 @@ func discoverCLIAgentModels(ctx context.Context, agentID string, detected detect
 		return parseAntigravityModelList(out)
 	case "grok":
 		return discoverGrokModels(ctx, detected, home)
+	case "musecode":
+		return discoverMuseCodeModels(ctx, detected)
 	case "claudecode":
 		out, ok := cliAgentModelProbeRunner(ctx, detected.Path, os.Environ(), "--help")
 		if !ok {

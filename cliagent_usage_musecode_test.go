@@ -8,6 +8,7 @@ import (
 )
 
 func TestMuseCodeUsageParser_ReadinessStates(t *testing.T) {
+	isolateMuseCode(t)
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
 	detected := detectedCLIAgent{Name: "Muse Code", Detected: true, Version: "1.4.0", Path: "/usr/local/bin/muse"}
 
@@ -22,7 +23,9 @@ func TestMuseCodeUsageParser_ReadinessStates(t *testing.T) {
 		if usage.AuthState != museCodeAuthUnknown || usage.Authenticated != nil {
 			t.Fatalf("got authState=%q authenticated=%v", usage.AuthState, usage.Authenticated)
 		}
-		if usage.CliAgentID != "museCode" || usage.Version != "1.4.0" || len(usage.Metrics) != 0 {
+		// No reading yet: both quota rows exist but read Unknown (dashed bars).
+		if usage.CliAgentID != "museCode" || usage.Version != "1.4.0" || len(usage.Metrics) != 2 ||
+			!usage.Metrics[0].Unknown || !usage.Metrics[1].Unknown {
 			t.Fatalf("unexpected snapshot %#v", usage)
 		}
 	})
@@ -66,6 +69,7 @@ func TestMuseCodeUsageParser_ReadinessStates(t *testing.T) {
 }
 
 func TestMuseCodeUsage_GatherListsDetectedAgent(t *testing.T) {
+	isolateMuseCode(t)
 	t.Setenv("META_API_KEY", "")
 	SetCLIAgentCatalog(nil)
 	t.Cleanup(func() { SetCLIAgentCatalog(nil) })

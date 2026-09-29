@@ -29,6 +29,11 @@
 //	    (cliagent_usage_antigravity_gate.go): the probe then stops at the first
 //	    refusal, records the build, and later clicks skip the spawn entirely.
 //
+//	  - Muse Code: a private `muse serve` gets one trivial turn and is killed
+//	    as soon as its first `usage/changed` lands — Muse learns its quota only
+//	    from a model response (cliagent_usage_musecode_live.go). Spends a
+//	    turn, so at most once per museCodeLiveProbeMinInterval per account.
+//
 //	Model discovery is warmed in the same window, with the time `agy models`
 //	actually needs, so the bounded gather that follows answers from the cache.
 //
@@ -117,6 +122,7 @@ var (
 	probeCodexRateLimitsLiveFn   = probeCodexRateLimitsLive
 	probeAntigravityQuotaLiveFn  = probeAntigravityQuotaLive
 	probeGrokBillingLiveFn       = probeGrokBillingLive
+	probeMuseCodeUsageLiveFn     = probeMuseCodeUsageLive
 	warmCLIAgentModelDiscoveryFn = warmCLIAgentModelDiscovery
 	liveProbeDetectedAgents      = gatherCLIAgents
 )
@@ -213,6 +219,17 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 		run("antigravity", func() string {
 			outcome := probeAntigravityQuotaLiveUnlessGated(ctx, agent, home)
 			warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
+			return outcome
+		})
+	}
+	if agent, ok := detected["museCode"]; ok && agent.Detected {
+		// The probe's own host refreshes the model list first
+		// (cliagent_usage_musecode_live.go), so the warm below reads it
+		// from disk rather than starting a second `muse serve`.
+		warmedWithProbe["museCode"] = true
+		run("museCode", func() string {
+			outcome := probeMuseCodeUsageLiveFn(ctx, agent, time.Now)
+			warmCLIAgentModelDiscoveryFn(ctx, "museCode", agent, home)
 			return outcome
 		})
 	}

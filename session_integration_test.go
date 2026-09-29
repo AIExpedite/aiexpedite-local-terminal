@@ -107,6 +107,13 @@ func TestMain(m *testing.M) {
 	// real install, so it reads as unknown unless a test names one.
 	codexLiveUsageFallbackRead = func(context.Context, string) string { return liveProbeOutcomeSpawnFailed }
 	codexInstalledVersion = func() (string, string) { return "", "" }
+	// Same rule for Muse Code: its model discovery and live probe start a
+	// real `muse serve`, and the probe spends a turn against the developer's
+	// Meta quota. Default to "cannot start"; the tests that exercise the
+	// protocol hand in a pipe-backed fake (cliagent_usage_musecode_live_test.go).
+	startMuseCodeMSPFn = func(context.Context, string, func(string, json.RawMessage)) (*museCodeMSPClient, error) {
+		return nil, fmt.Errorf("muse serve is disabled in tests")
+	}
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through
