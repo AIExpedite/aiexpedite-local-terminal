@@ -399,3 +399,29 @@ func TestRelayTurnOneShotManagerRefusalDoesNotAccept(t *testing.T) {
 		t.Fatal("a refused turn was accepted")
 	}
 }
+
+// OpenCode records acceptance once it owns the turn and, when that record
+// fails, refuses the turn before spawning anything and returns to idle.
+func TestRelayTurnOpenCodeUnrecordedAcceptanceRefusesTheTurn(t *testing.T) {
+	mgr := NewOpenCodeNativeManager()
+	session := &OpenCodeNativeSession{ID: "s1", status: "idle"}
+	mgr.sessions["s1"] = session
+	recordErr := errors.New("inbox write failed")
+	calls := 0
+	err := mgr.SendTurn("s1", "hi", func(resultMsg) {}, time.Second, func() error { calls++; return recordErr })
+	if !errors.Is(err, recordErr) {
+		t.Fatalf("SendTurn err=%v, want the acceptance error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("acceptor calls=%d, want 1", calls)
+	}
+	if got := session.Status(); got != "idle" {
+		t.Fatalf("session status=%q after refused turn, want idle", got)
+	}
+	session.mu.Lock()
+	spawned := session.activeCancel != nil
+	session.mu.Unlock()
+	if spawned {
+		t.Fatal("a refused turn spawned opencode")
+	}
+}

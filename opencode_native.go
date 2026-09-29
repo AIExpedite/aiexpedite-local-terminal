@@ -344,7 +344,7 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 // (relay_turn_inbox.go): Send blocks for the whole turn, so acceptance
 // after it returned would make a crash mid-turn look like a turn that
 // never started, and the redelivery would run it a second time.
-func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func()) error {
+func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func() error) error {
 	if publishFn == nil {
 		return fmt.Errorf("publishFn is required")
 	}
@@ -393,15 +393,19 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 	if !session.beginTurn() {
 		return fmt.Errorf("opencode native session %s has ended", id)
 	}
-	if onAccepted != nil {
-		onAccepted()
-	}
 	defer func() {
 		if session.Status() != "ended" {
 			session.setStatus("idle")
 		}
 		session.clearActiveProcess()
 	}()
+	// Recorded before anything is spawned. A failure to record it refuses
+	// the turn; the deferred reset puts the session back to idle.
+	if onAccepted != nil {
+		if err := onAccepted(); err != nil {
+			return err
+		}
+	}
 
 	executable := resolveOpenCodeExecutable()
 

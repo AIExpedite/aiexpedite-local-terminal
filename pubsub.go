@@ -7332,6 +7332,14 @@ type relayTurnSender interface {
 	SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func() error) error
 }
 
+// Every one-shot manager must satisfy relayTurnSender; a signature drift
+// would silently fall back to accepting after the whole turn finished.
+var (
+	_ relayTurnSender = (*OpenCodeNativeManager)(nil)
+	_ relayTurnSender = (*AntigravityNativeManager)(nil)
+	_ relayTurnSender = (*oneShotNativeManager)(nil)
+)
+
 // dispatchOneShotNativeCommand is handleOneShotNativeCommand without the
 // Pub/Sub binding, so the lifecycle rules are testable with plain callbacks.
 func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string)) {
