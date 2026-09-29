@@ -1928,7 +1928,10 @@ func runPubSubConnection(cfg *Config) error {
 			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
 				return
 			}
-			handleSessionCommand(ctx, topic, cmd, cfg)
+			if !handleSessionCommand(ctx, topic, cmd, cfg) {
+				m.Nack()
+				return
+			}
 			m.Ack()
 			return
 		}
@@ -6424,18 +6427,22 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 // turn: it goes through the durable turn inbox HERE, before any per-kind
 // routing, so every native family and the generic PTY path share one
 // at-most-once-after-acceptance check (relay_turn_inbox.go).
-func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+//
+// It returns false only for a relay turn this process must hand back: another
+// agent process owns the turn inbox, so the caller Nacks and Pub/Sub
+// redelivers to the owner.
+func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) bool {
 	if turnID, ok := relayTurnIDFromEnvelope(cmd.ID); ok && cmd.SessionID != "" {
 		agentID := cmd.AgentID
 		if agentID == "" && cfg != nil {
 			agentID = cfg.AgentID
 		}
-		runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
+		return runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
 			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
 			func(dctx context.Context) { dispatchSessionCommand(dctx, topic, cmd, cfg) })
-		return
 	}
 	dispatchSessionCommand(ctx, topic, cmd, cfg)
+	return true
 }
 
 // dispatchSessionCommand is the per-kind router behind handleSessionCommand.
@@ -6538,12 +6545,12 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		logSession(cmd.SessionID, "%s[session] Sending input to session %s%s\n",
 			colorBlue, cmd.SessionID, colorReset)
 
-		if err := globalSessionManager.SendInput(cmd.SessionID, cmd.Input); err != nil {
+		// A relay turn is accepted inside SendInputAccepting, under the
+		// session lock, right before the input is written.
+		if err := globalSessionManager.SendInputAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
 			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to send input: %v", err))
 			return
 		}
-		// The input is on the CLI's stdin: a relay turn is now owned.
-		acceptRelayTurn(ctx)
 
 	case "session_signal":
 		if cmd.SessionID == "" {
@@ -6728,11 +6735,10 @@ func handleCodexAppServerCommand(ctx context.Context, topic *pubsub.Publisher, c
 			return
 		}
 
-		if err := globalCodexAppServerManager.Send(cmd.SessionID, cmd.Input); err != nil {
+		if err := globalCodexAppServerManager.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
 			publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("failed to send to codex app-server: %v", err))
 			return
 		}
-		acceptRelayTurn(ctx)
 
 	case "codex_appserver_end":
 		if cmd.SessionID == "" {
@@ -6857,11 +6863,10 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			return
 		}
 
-		if err := globalClaudeNativeManager.Send(cmd.SessionID, cmd.Input); err != nil {
+		if err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
 			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to claude native: %v", err))
 			return
 		}
-		acceptRelayTurn(ctx)
 
 	case "claude_native_control":
 		// A human's answer to a tool-use approval (control_response). Never a
@@ -7040,6 +7045,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			// covered by antigravity_native_ended from End — do not double-fire.
 			msg := err.Error()
 			if strings.Contains(msg, "not found") ||
+				strings.Contains(msg, relayAcceptanceNotRecorded) ||
 				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
 				publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to antigravity native: %v", err))
 			}
@@ -7239,11 +7245,10 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			return
 		}
 
-		if err := globalGrokACPManager.Send(cmd.SessionID, cmd.Input); err != nil {
+		if err := globalGrokACPManager.SendAccepting(cmd.SessionID, cmd.Input, relayTurnAcceptor(ctx)); err != nil {
 			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to send to grok acp: %v", err), "")
 			return
 		}
-		acceptRelayTurn(ctx)
 
 	case "grok_acp_end":
 		if cmd.SessionID == "" {
@@ -7324,7 +7329,7 @@ func handleOneShotNativeCommand(ctx context.Context, topic *pubsub.Publisher, cm
 // it; a target that does not is treated as owning the turn once Send returned
 // nil.
 type relayTurnSender interface {
-	SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func()) error
+	SendTurn(id, text string, publishFn PublishFunc, turnTimeout time.Duration, onAccepted func() error) error
 }
 
 // dispatchOneShotNativeCommand is handleOneShotNativeCommand without the
@@ -7335,7 +7340,7 @@ func dispatchOneShotNativeCommand(cmd commandMsg, mgr oneShotNativeCommandTarget
 
 // dispatchOneShotNativeCommandAccepting is dispatchOneShotNativeCommand with
 // the relay acceptance callback (nil for an ordinary command).
-func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string), onAccepted func()) {
+func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeCommandTarget, spec nativeFrameKind, publishFn PublishFunc, publishErr func(string), onAccepted func() error) {
 	kind := strings.ToLower(spec.DisplayName) + " native"
 	ended := func(output, status string, exitCode int) resultMsg {
 		return resultMsg{
@@ -7408,7 +7413,7 @@ func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeComm
 		if rs, ok := mgr.(relayTurnSender); ok {
 			sendErr = rs.SendTurn(cmd.SessionID, cmd.Input, publishFn, timeout, onAccepted)
 		} else if sendErr = mgr.Send(cmd.SessionID, cmd.Input, publishFn, timeout); sendErr == nil && onAccepted != nil {
-			onAccepted()
+			_ = onAccepted()
 		}
 		if err := sendErr; err != nil {
 			// Send publishes its own error frame for ordinary turn failures;
@@ -7416,6 +7421,7 @@ func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeComm
 			msg := err.Error()
 			if strings.Contains(msg, "not found") ||
 				strings.Contains(msg, "already has a turn in flight") ||
+				strings.Contains(msg, relayAcceptanceNotRecorded) ||
 				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
 				publishErr(fmt.Sprintf("failed to send to %s: %v", kind, err))
 			}

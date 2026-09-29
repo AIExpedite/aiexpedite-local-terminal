@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 // a signed watermark, session teardown or the TTL.
 
 type relayTurnHarness struct {
+	t     *testing.T
 	inbox *relayTurnInbox
 	mu    sync.Mutex
 	acks  []relayTurnRow
@@ -23,7 +25,7 @@ type relayTurnHarness struct {
 }
 
 func newRelayTurnHarness(t *testing.T) *relayTurnHarness {
-	return &relayTurnHarness{inbox: newTestRelayInbox(t)}
+	return &relayTurnHarness{t: t, inbox: newTestRelayInbox(t)}
 }
 
 func (h *relayTurnHarness) deliver(cmd commandMsg, accept bool) {
@@ -42,14 +44,17 @@ func (h *relayTurnHarness) deliver(cmd commandMsg, accept bool) {
 			h.runs++
 			h.mu.Unlock()
 			if accept {
-				acceptRelayTurn(ctx)
+				_ = relayTurnAcceptor(ctx)()
 			}
 		})
 }
 
-// restart simulates an agent restart: a fresh process state over the same file.
+// restart simulates an agent restart: a fresh process state over the same file
+// (the dead process's inbox lock goes with it).
 func (h *relayTurnHarness) restart() {
+	h.inbox.release()
 	h.inbox = newRelayTurnInbox(h.inbox.path)
+	h.t.Cleanup(h.inbox.release)
 }
 
 func relaySend(turnID string) commandMsg {
@@ -152,7 +157,7 @@ func TestRelayTurnDedup_ConcurrentDuplicateIsDropped(t *testing.T) {
 				h.mu.Unlock()
 				close(started)
 				<-release
-				acceptRelayTurn(ctx)
+				_ = relayTurnAcceptor(ctx)()
 			})
 	}()
 	<-started
@@ -169,9 +174,80 @@ func TestRelayTurnDedup_AcceptIsIdempotent(t *testing.T) {
 	h := newRelayTurnHarness(t)
 	runRelayTurn(context.Background(), h.inbox, relaySend("t1"), "t1", "agent-1",
 		func(r relayTurnRow) { h.acks = append(h.acks, r) },
-		func(ctx context.Context) { acceptRelayTurn(ctx); acceptRelayTurn(ctx) })
+		func(ctx context.Context) { _ = relayTurnAcceptor(ctx)(); _ = relayTurnAcceptor(ctx)() })
 	if len(h.acks) != 1 {
 		t.Fatalf("acks=%d, want 1", len(h.acks))
+	}
+}
+
+// An acceptance that could not be written is not durable: it is reported to
+// the handler (which refuses the turn), never acked, and the row stays
+// claimed, so the broker's republish runs the turn once the disk recovers.
+func TestRelayTurnDedup_UnpersistedAcceptanceIsNotAcked(t *testing.T) {
+	h := newRelayTurnHarness(t)
+	realWrite := h.inbox.writeFile
+	var acceptErr error
+	runRelayTurn(context.Background(), h.inbox, relaySend("t1"), "t1", "agent-1",
+		func(r relayTurnRow) { h.acks = append(h.acks, r) },
+		func(ctx context.Context) {
+			h.inbox.writeFile = func(string, []byte) error { return errors.New("disk full") }
+			acceptErr = relayTurnAcceptor(ctx)()
+			h.inbox.writeFile = realWrite
+		})
+	if acceptErr == nil || !strings.Contains(acceptErr.Error(), relayAcceptanceNotRecorded) {
+		t.Fatalf("accept error = %v, want the not-recorded refusal", acceptErr)
+	}
+	if len(h.acks) != 0 {
+		t.Fatalf("an acceptance that never reached the disk was acked: %+v", h.acks)
+	}
+	if r := h.inbox.snapshot()[relayTurnKey{"sess-1", "t1"}]; r.State != relayTurnStateClaimed {
+		t.Fatalf("row after a failed acceptance write = %+v, want claimed", r)
+	}
+	h.restart()
+	h.deliver(relaySend("t1"), true)
+	if h.runs != 1 || len(h.acks) != 1 {
+		t.Fatalf("republish after the disk recovered: runs=%d acks=%d, want 1/1", h.runs, len(h.acks))
+	}
+}
+
+// Two agent processes on one config dir: only the one holding the inbox lock
+// runs relay turns; the other hands every delivery back (Nack) untouched and
+// never writes the file, so the pair cannot both run a turn or clobber rows.
+func TestRelayTurnDedup_SecondProcessHandsTurnsToTheOwner(t *testing.T) {
+	owner := newRelayTurnHarness(t)
+	owner.deliver(relaySend("t1"), true)
+
+	other := &relayTurnHarness{t: t, inbox: newRelayTurnInbox(owner.inbox.path)}
+	t.Cleanup(other.inbox.release)
+	handled := runRelayTurn(context.Background(), other.inbox, relaySend("t2"), "t2", "agent-1",
+		func(r relayTurnRow) { other.acks = append(other.acks, r) },
+		func(context.Context) { other.runs++ })
+	if handled {
+		t.Fatal("a process that does not own the inbox handled a relay turn")
+	}
+	if other.runs != 0 || len(other.acks) != 0 {
+		t.Fatalf("non-owner: runs=%d acks=%d, want 0/0", other.runs, len(other.acks))
+	}
+	if other.inbox.snapshot() != nil {
+		t.Fatal("non-owner read the inbox")
+	}
+	if n := applyRelayAckWatermark(other.inbox, commandMsg{SessionID: "sess-1", AckedTurnIds: []string{"t1"}}, true); n != 0 {
+		t.Fatalf("non-owner watermark deleted %d rows", n)
+	}
+	if _, ok := owner.inbox.snapshot()[relayTurnKey{"sess-1", "t1"}]; !ok {
+		t.Fatal("the owner's row was lost")
+	}
+
+	// The owner exits: the next delivery to the survivor takes over, sees the
+	// owner's accepted row, and re-acks instead of running it again.
+	owner.inbox.release()
+	if !runRelayTurn(context.Background(), other.inbox, relaySend("t1"), "t1", "agent-1",
+		func(r relayTurnRow) { other.acks = append(other.acks, r) },
+		func(context.Context) { other.runs++ }) {
+		t.Fatal("the survivor did not take over the inbox")
+	}
+	if other.runs != 0 || len(other.acks) != 1 {
+		t.Fatalf("survivor on an accepted turn: runs=%d acks=%d, want 0/1", other.runs, len(other.acks))
 	}
 }
 
@@ -272,13 +348,13 @@ type fakeRelayOneShot struct {
 	refuse bool
 }
 
-func (f *fakeRelayOneShot) SendTurn(_, _ string, _ PublishFunc, _ time.Duration, onAccepted func()) error {
+func (f *fakeRelayOneShot) SendTurn(_, _ string, _ PublishFunc, _ time.Duration, onAccepted func() error) error {
 	f.sendCalls++
 	if f.refuse {
 		return errors.New("native session s1 not found")
 	}
 	if onAccepted != nil {
-		onAccepted()
+		return onAccepted()
 	}
 	return nil
 }
@@ -287,7 +363,7 @@ func TestRelayTurnOneShotDispatchAcceptsOnlyWhenOwned(t *testing.T) {
 	kind := openCodeNativeKind
 	cmd := commandMsg{ID: "relayturn_t1", Type: kind.FramePrefix + "_send", SessionID: "s1", Input: "hi"}
 	accepted := 0
-	onAccepted := func() { accepted++ }
+	onAccepted := func() error { accepted++; return nil }
 	noop := func(resultMsg) {}
 	noErr := func(string) {}
 
@@ -315,7 +391,7 @@ func TestRelayTurnOneShotDispatchAcceptsOnlyWhenOwned(t *testing.T) {
 func TestRelayTurnOneShotManagerRefusalDoesNotAccept(t *testing.T) {
 	mgr := NewMuseCodeNativeManager()
 	accepted := false
-	err := mgr.SendTurn("no-such-session", "hi", func(resultMsg) {}, time.Second, func() { accepted = true })
+	err := mgr.SendTurn("no-such-session", "hi", func(resultMsg) {}, time.Second, func() error { accepted = true; return nil })
 	if err == nil {
 		t.Fatal("SendTurn to an unknown session succeeded")
 	}

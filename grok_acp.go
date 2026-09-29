@@ -676,6 +676,14 @@ func (m *GrokACPManager) ArmFirstFrameWatchdog(id string, publishFn PublishFunc)
 // and rejects, and the orphaned write (if it ever wakes up) lands on a
 // closed pipe.
 func (m *GrokACPManager) Send(id string, payload string) error {
+	return m.SendAccepting(id, payload, nil)
+}
+
+// SendAccepting is Send that calls accept (when non-nil) at the ownership
+// boundary: under stdinMu, after every refusal, immediately BEFORE the turn is written.
+// A relayed voice turn records `accepted` in the durable turn inbox there
+// (relay_turn_inbox.go); an accept error refuses the turn.
+func (m *GrokACPManager) SendAccepting(id string, payload string, accept func() error) error {
 	session := m.Get(id)
 	if session == nil {
 		return fmt.Errorf("grok acp session %s not found", id)
@@ -728,6 +736,9 @@ func (m *GrokACPManager) Send(id string, payload string) error {
 	// the timeout-fail path below.
 	if session.Status() == "ended" {
 		return fmt.Errorf("grok acp session %s has ended", id)
+	}
+	if err := acceptRelayDelivery(accept); err != nil {
+		return err
 	}
 
 	writeDone := make(chan error, 1)

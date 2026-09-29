@@ -1134,6 +1134,14 @@ func (sm *SessionManager) newestOpenCodexUsageFloor() int64 {
 // For Claude and Antigravity stream-json sessions, the text is wrapped in the
 // CLI's NDJSON user-message envelope. For other CLIs it is sent as raw text.
 func (sm *SessionManager) SendInput(id, text string) error {
+	return sm.SendInputAccepting(id, text, nil)
+}
+
+// SendInputAccepting is SendInput that calls accept (when non-nil) at the ownership
+// boundary: under session.mu, after every refusal, immediately BEFORE the turn is written.
+// A relayed voice turn records `accepted` in the durable turn inbox there
+// (relay_turn_inbox.go); an accept error refuses the turn.
+func (sm *SessionManager) SendInputAccepting(id, text string, accept func() error) error {
 	sm.mu.RLock()
 	session, exists := sm.sessions[id]
 	sm.mu.RUnlock()
@@ -1147,6 +1155,9 @@ func (sm *SessionManager) SendInput(id, text string) error {
 
 	if session.Status == "ended" {
 		return fmt.Errorf("session %s has ended", id)
+	}
+	if err := acceptRelayDelivery(accept); err != nil {
+		return err
 	}
 
 	// Structured-stdin agents each use a different NDJSON envelope.

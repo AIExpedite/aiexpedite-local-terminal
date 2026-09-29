@@ -188,7 +188,9 @@ func TestAckWatermark_ConfirmedIdDeletesExactlyItsOwnRow(t *testing.T) {
 	}
 
 	// And the deletion is durable.
+	inbox.release()
 	reloaded := newRelayTurnInbox(inbox.path)
+	t.Cleanup(reloaded.release)
 	if got := len(reloaded.snapshot()); got != 2 {
 		t.Fatalf("reloaded inbox has %d rows, want 2", got)
 	}
@@ -199,7 +201,9 @@ func TestAckWatermark_ConfirmedIdDeletesExactlyItsOwnRow(t *testing.T) {
 func newTestRelayInbox(t *testing.T) *relayTurnInbox {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), relayTurnInboxFileName)
-	return newRelayTurnInbox(func() string { return path })
+	inbox := newRelayTurnInbox(func() string { return path })
+	t.Cleanup(inbox.release)
+	return inbox
 }
 
 // acceptTestRow drives one delivery of (sessionID, turnID) to `accepted`.
@@ -210,8 +214,8 @@ func acceptTestRow(t *testing.T, inbox *relayTurnInbox, sessionID, turnID string
 	if decision != relayTurnRun {
 		t.Fatalf("Begin(%s/%s) = %v, want run", sessionID, turnID, decision)
 	}
-	if _, ok := inbox.Accept(sessionID, turnID); !ok {
-		t.Fatalf("Accept(%s/%s) did not transition", sessionID, turnID)
+	if _, ok, err := inbox.Accept(sessionID, turnID); !ok || err != nil {
+		t.Fatalf("Accept(%s/%s) did not transition: %v", sessionID, turnID, err)
 	}
 	inbox.Finish(sessionID, turnID)
 }

@@ -20,12 +20,19 @@
 //     by a crash before acceptance, or by a handler that refused the turn
 //     (session not found, input rejected) — in both cases the CLI provably
 //     never started the turn, so running it now is the first run, not a second.
-//   - accepted — recorded (durably) the moment the handler OWNS the turn: the
-//     SEND was written to the CLI's stdin (Claude, Codex, Grok, the generic PTY
-//     session), or a one-shot kind (Antigravity, OpenCode, Muse Code) moved its
-//     session idle→running for this turn. Only then is the ack frame published.
-//     A redelivery that finds an accepted row re-publishes the ack and never
-//     re-runs.
+//   - accepted — recorded (durably) at the handler's OWNERSHIP BOUNDARY, after
+//     every refusal check and BEFORE the turn can start: for a persistent
+//     session (Claude, Codex, Grok, the generic PTY session) under the stdin
+//     lock immediately before the SEND is written to the CLI; for a one-shot
+//     kind (Antigravity, OpenCode, Muse Code) right after its session moved
+//     idle→running for this turn, before anything is spawned. Only once the
+//     row is on disk is the ack frame published. If the row cannot be
+//     written, the handler refuses the turn (it stays claimed and unacked,
+//     and the broker republishes) — an acceptance that is not durable is
+//     never acked. A redelivery that finds an accepted row re-publishes the
+//     ack and never re-runs. Recording before delivery means a crash in the
+//     gap between the two can DROP that turn; it can never run it twice, and
+//     the voice side then settles it failed, never succeeded.
 //
 // An accepted row is deliberately NOT deleted when its ack is published. The
 // ack can be lost between this device and the broker (publish failed, broker
@@ -53,6 +60,15 @@
 // leaves the old or the new inbox, never a torn one. It is never an in-memory
 // dedup: the redelivery that matters most is the one that arrives after the
 // agent restarted.
+//
+// Exactly ONE agent process owns the inbox, through an exclusive lock on
+// `relay-turn-inbox.json.lock` held for that process's life (the spawn
+// ledger's pattern). Two agents on one config dir (Linux has no
+// single-instance guard) would otherwise each keep their own rows and
+// in-flight set, both run the same turn, and overwrite each other's file. A
+// process that does not own the inbox hands every relay turn back to Pub/Sub
+// (Nack) untouched so the owner runs it, and retries ownership on the next
+// delivery in case the owner has exited.
 // -----------------------------------------------------------------------------
 
 package main
@@ -98,6 +114,11 @@ const (
 
 	relayTurnStateClaimed  = "claimed"
 	relayTurnStateAccepted = "accepted"
+
+	// relayAcceptanceNotRecorded prefixes the error a manager returns when it
+	// refused a relay turn because its acceptance could not be made durable.
+	// The one-shot handlers match it to publish the error frame themselves.
+	relayAcceptanceNotRecorded = "relay turn acceptance could not be recorded"
 )
 
 // relayTurnIDFromEnvelope returns the relay turnId carried by a session
@@ -148,6 +169,9 @@ const (
 	// relayTurnInFlight: another delivery of the same turn is being
 	// dispatched by this process right now and will ack when it accepts.
 	relayTurnInFlight
+	// relayTurnNotOwner: another agent process owns the inbox — hand the
+	// delivery back (Nack) untouched so the owner runs it.
+	relayTurnNotOwner
 )
 
 type relayTurnInbox struct {
@@ -158,15 +182,73 @@ type relayTurnInbox struct {
 	inFlight  map[relayTurnKey]bool
 	now       func() time.Time
 	writeFile func(path string, data []byte) error
+	// acquireOwnership takes the inbox's cross-process lock without waiting
+	// (nil while another process holds it); lockFile stays held for the life
+	// of the process once taken.
+	acquireOwnership func() *os.File
+	lockFile         *os.File
 }
 
 func newRelayTurnInbox(path func() string) *relayTurnInbox {
-	return &relayTurnInbox{
+	b := &relayTurnInbox{
 		path:      path,
 		rows:      make(map[relayTurnKey]*relayTurnRow),
 		inFlight:  make(map[relayTurnKey]bool),
 		now:       time.Now,
 		writeFile: writeRelayTurnInboxAtomic,
+	}
+	b.acquireOwnership = func() *os.File {
+		return tryAcquireRelayTurnInboxLock(b.path() + ".lock")
+	}
+	return b
+}
+
+// tryAcquireRelayTurnInboxLock takes the inbox lock file exclusively, or
+// returns nil at once when another agent process holds it. It never waits:
+// the caller hands the delivery back to Pub/Sub, which is its own retry.
+func tryAcquireRelayTurnInboxLock(path string) *os.File {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		fmt.Printf("%s[relay-inbox] Cannot create the inbox lock dir: %v%s\n", colorYellow, err, colorReset)
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		fmt.Printf("%s[relay-inbox] Cannot open the inbox lock: %v%s\n", colorYellow, err, colorReset)
+		return nil
+	}
+	if ok, _ := tryLockFileExclusive(f); !ok {
+		_ = f.Close()
+		return nil
+	}
+	return f
+}
+
+// ownLocked makes this process the inbox's exclusive owner (the first call
+// that wins the lock), then loads the file fresh under that lock. It reports
+// whether this process owns the inbox; a non-owner never reads or writes it.
+func (b *relayTurnInbox) ownLocked() bool {
+	if b.lockFile != nil {
+		return true
+	}
+	f := b.acquireOwnership()
+	if f == nil {
+		return false
+	}
+	b.lockFile = f
+	b.loaded = false
+	b.rows = make(map[relayTurnKey]*relayTurnRow)
+	b.loadLocked()
+	return true
+}
+
+// release gives up ownership (tests simulating a restart over the same file).
+func (b *relayTurnInbox) release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.lockFile != nil {
+		_ = unlockFile(b.lockFile)
+		_ = b.lockFile.Close()
+		b.lockFile = nil
 	}
 }
 
@@ -212,14 +294,15 @@ func (b *relayTurnInbox) loadLocked() {
 		b.rows[relayTurnKey{r.SessionID, r.TurnID}] = r
 	}
 	if b.pruneExpiredLocked() {
-		b.persistLocked()
+		_ = b.persistLocked()
 	}
 }
 
-// persistLocked mirrors the inbox to disk. A failure is logged, never fatal:
-// the in-memory rows still dedup every redelivery this process sees, and
-// refusing the turn over a disk error would drop it.
-func (b *relayTurnInbox) persistLocked() {
+// persistLocked mirrors the inbox to disk and returns (and logs) a failure.
+// Only Accept treats a failure as fatal — an acceptance that never reached
+// the disk must not be acked. Every other write is best-effort: the
+// in-memory rows still dedup every redelivery this process sees.
+func (b *relayTurnInbox) persistLocked() error {
 	rows := make([]*relayTurnRow, 0, len(b.rows))
 	for _, r := range b.rows {
 		rows = append(rows, r)
@@ -236,11 +319,13 @@ func (b *relayTurnInbox) persistLocked() {
 	raw, err := json.Marshal(relayTurnInboxFile{Version: relayTurnInboxVersion, Rows: rows})
 	if err != nil {
 		fmt.Printf("%s[relay-inbox] Could not encode the relay turn inbox: %v%s\n", colorRed, err, colorReset)
-		return
+		return err
 	}
 	if err := b.writeFile(b.path(), raw); err != nil {
 		fmt.Printf("%s[relay-inbox] Could not write the relay turn inbox: %v%s\n", colorRed, err, colorReset)
+		return err
 	}
+	return nil
 }
 
 // pruneExpiredLocked drops rows past the TTL (never one in flight) and
@@ -288,19 +373,21 @@ func (b *relayTurnInbox) evictForCapLocked() {
 func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTurnDecision, relayTurnRow) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.loadLocked()
+	if !b.ownLocked() {
+		return relayTurnNotOwner, relayTurnRow{}
+	}
 	changed := b.pruneExpiredLocked()
 	key := relayTurnKey{cmd.SessionID, turnID}
 	if r := b.rows[key]; r != nil {
 		if r.State == relayTurnStateAccepted {
 			if changed {
-				b.persistLocked()
+				_ = b.persistLocked()
 			}
 			return relayTurnReack, *r
 		}
 		if b.inFlight[key] {
 			if changed {
-				b.persistLocked()
+				_ = b.persistLocked()
 			}
 			return relayTurnInFlight, *r
 		}
@@ -319,27 +406,36 @@ func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTur
 	r.UID = cmd.UID
 	r.UpdatedAt = now
 	b.inFlight[key] = true
-	b.persistLocked()
+	_ = b.persistLocked()
 	return relayTurnRun, *r
 }
 
 // Accept moves a claimed row to accepted and persists it BEFORE the caller
-// publishes the ack. It returns the row and true on the transition; false when
-// the row is unknown or already accepted.
-func (b *relayTurnInbox) Accept(sessionID, turnID string) (relayTurnRow, bool) {
+// lets the turn start or publishes the ack. It returns the row and true on
+// the transition; false with a nil error when the row is unknown or already
+// accepted. A failed write returns an error and leaves the row claimed in
+// memory as well: the acceptance is not durable, so the caller must refuse
+// the turn — neither run it nor ack it.
+func (b *relayTurnInbox) Accept(sessionID, turnID string) (relayTurnRow, bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.loadLocked()
+	if !b.ownLocked() {
+		return relayTurnRow{}, false, fmt.Errorf("%s for turn %s: another agent process owns the inbox", relayAcceptanceNotRecorded, turnID)
+	}
 	r := b.rows[relayTurnKey{sessionID, turnID}]
 	if r == nil || r.State == relayTurnStateAccepted {
-		return relayTurnRow{}, false
+		return relayTurnRow{}, false, nil
 	}
+	prev := *r
 	now := b.now().UnixMilli()
 	r.State = relayTurnStateAccepted
 	r.AcceptedAt = now
 	r.UpdatedAt = now
-	b.persistLocked()
-	return *r, true
+	if err := b.persistLocked(); err != nil {
+		*r = prev
+		return relayTurnRow{}, false, fmt.Errorf("%s for turn %s: %w", relayAcceptanceNotRecorded, turnID, err)
+	}
+	return *r, true, nil
 }
 
 // Finish ends this process's dispatch of a turn. The row itself stays
@@ -362,7 +458,9 @@ func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.loadLocked()
+	if !b.ownLocked() {
+		return 0
+	}
 	deleted := 0
 	for _, id := range turnIDs {
 		key := relayTurnKey{sessionID, id}
@@ -377,7 +475,7 @@ func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 		deleted++
 	}
 	if deleted > 0 {
-		b.persistLocked()
+		_ = b.persistLocked()
 	}
 	return deleted
 }
@@ -389,7 +487,9 @@ func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.loadLocked()
+	if !b.ownLocked() {
+		return
+	}
 	changed := false
 	for k := range b.rows {
 		if k.SessionID == sessionID && !b.inFlight[k] {
@@ -398,15 +498,18 @@ func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 		}
 	}
 	if changed {
-		b.persistLocked()
+		_ = b.persistLocked()
 	}
 }
 
-// snapshot returns a copy of the current rows (tests, diagnostics).
+// snapshot returns a copy of the current rows (tests, diagnostics); nil when
+// another process owns the inbox.
 func (b *relayTurnInbox) snapshot() map[relayTurnKey]relayTurnRow {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.loadLocked()
+	if !b.ownLocked() {
+		return nil
+	}
 	out := make(map[relayTurnKey]relayTurnRow, len(b.rows))
 	for k, r := range b.rows {
 		out[k] = *r
@@ -423,29 +526,32 @@ func (b *relayTurnInbox) snapshot() map[relayTurnKey]relayTurnRow {
 // delivery: a non-relay send racing on the same session can never fire it.
 type relayTurnAcceptKey struct{}
 
-func withRelayTurnAcceptance(ctx context.Context, accept func()) context.Context {
+func withRelayTurnAcceptance(ctx context.Context, accept func() error) context.Context {
 	return context.WithValue(ctx, relayTurnAcceptKey{}, accept)
 }
 
 // relayTurnAcceptor returns the acceptance callback of the relay turn being
-// dispatched on ctx, or nil for an ordinary command.
-func relayTurnAcceptor(ctx context.Context) func() {
+// dispatched on ctx, or nil for an ordinary command. Handlers hand it to their
+// manager, which calls it at its ownership boundary — after every refusal
+// check, before the turn can start — and refuses the turn when it returns an
+// error (the acceptance could not be made durable).
+func relayTurnAcceptor(ctx context.Context) func() error {
 	if ctx == nil {
 		return nil
 	}
-	if f, ok := ctx.Value(relayTurnAcceptKey{}).(func()); ok {
+	if f, ok := ctx.Value(relayTurnAcceptKey{}).(func() error); ok {
 		return f
 	}
 	return nil
 }
 
-// acceptRelayTurn marks the relay turn dispatched on ctx (if any) accepted.
-// Handlers call it at the point they OWN the turn — the SEND written to the
-// CLI — and never on a refusal.
-func acceptRelayTurn(ctx context.Context) {
-	if f := relayTurnAcceptor(ctx); f != nil {
-		f()
+// acceptRelayDelivery is how a persistent-session manager calls the (possibly
+// nil) acceptor under its stdin lock, immediately before writing the turn.
+func acceptRelayDelivery(accept func() error) error {
+	if accept == nil {
+		return nil
 	}
+	return accept()
 }
 
 // relayTurnAckFrame is the result frame the broker's results subscriber reads:
@@ -476,39 +582,52 @@ func relayTurnAckFrame(r relayTurnRow) resultMsg {
 
 // runRelayTurn is the one inbox check every relayed session command passes
 // (handleSessionCommand, before per-kind routing). dispatch runs the kind's
-// handler with a ctx carrying the acceptance callback; the handler calls
-// acceptRelayTurn(ctx) once it owns the turn, which persists `accepted` and
-// only then publishes the ack. publishAck is injected so tests can observe
-// the frames without a Pub/Sub topic.
+// handler with a ctx carrying the acceptance callback; the handler's manager
+// calls it at its ownership boundary, which persists `accepted` and only then
+// publishes the ack. publishAck is injected so tests can observe the frames
+// without a Pub/Sub topic. It returns false only when another agent process
+// owns the inbox: the caller must Nack so Pub/Sub hands the turn to the owner.
 func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
-	publishAck func(relayTurnRow), dispatch func(context.Context)) {
+	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
 	decision, row := inbox.Begin(cmd, turnID, agentID)
 	switch decision {
+	case relayTurnNotOwner:
+		fmt.Printf("%s[relay-inbox] Another agent process owns the relay turn inbox — handing turn %s on %s back%s\n",
+			colorYellow, turnID, cmd.SessionID, colorReset)
+		return false
 	case relayTurnReack:
 		// Accepted earlier (this boot or a previous one): the broker has not
 		// recorded our ack yet. Say it again; never run the turn again.
 		fmt.Printf("%s[relay-inbox] Turn %s on %s already accepted — re-acking, not re-running%s\n",
 			colorYellow, turnID, cmd.SessionID, colorReset)
 		publishAck(row)
-		return
+		return true
 	case relayTurnInFlight:
 		// A concurrent redelivery of a turn this process is dispatching
 		// right now; that dispatch acks when it accepts.
 		fmt.Printf("%s[relay-inbox] Turn %s on %s is already being dispatched — dropping the duplicate delivery%s\n",
 			colorYellow, turnID, cmd.SessionID, colorReset)
-		return
+		return true
 	}
 	defer inbox.Finish(cmd.SessionID, turnID)
 
 	var once sync.Once
-	accept := func() {
+	var acceptErr error
+	accept := func() error {
 		once.Do(func() {
-			if r, ok := inbox.Accept(cmd.SessionID, turnID); ok {
+			r, ok, err := inbox.Accept(cmd.SessionID, turnID)
+			if err != nil {
+				acceptErr = err
+				return
+			}
+			if ok {
 				publishAck(r)
 			}
 		})
+		return acceptErr
 	}
 	dispatch(withRelayTurnAcceptance(ctx, accept))
+	return true
 }
 
 // publishRelayTurnAck publishes the ack frame the same way session frames
