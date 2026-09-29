@@ -51,8 +51,8 @@ const (
 	museCodeLiveProbePrompt = "Reply with a single period."
 
 	museCodeUsageLiveSchemaVersion = 1
-	// museCodeUnknownAccountKey scopes a reading when no identity is on disk
-	// (a keychain login): the device's one Muse account, whoever it is.
+	// museCodeUnknownAccountKey scopes a reading when nothing on disk tells
+	// accounts apart (a keychain login): the device's one Muse account.
 	museCodeUnknownAccountKey = "device"
 )
 
@@ -193,7 +193,7 @@ func probeMuseCodeUsageLive(parent context.Context, agent detectedCLIAgent, now 
 	// for one the model would reject.
 	discovery, listed := museCodeListModels(ctx, client)
 	if listed {
-		saveMuseCodeModelsCache(agent.Version, discovery, now())
+		saveMuseCodeModelsCache(agent.Version, accountKey, discovery, now())
 	}
 	home, _ := os.UserHomeDir()
 	effort := museCodeProbeEffort(discovery, listed, readMuseCodeDefaultModel(home, os.Getenv))
@@ -378,7 +378,10 @@ func museCodeProbeErrorOutcome(ctx context.Context) string {
 const museCodeModelsCacheMaxAge = 6 * time.Hour
 
 type museCodeModelsCacheFile struct {
-	Version      string                `json:"version"`
+	Version string `json:"version"`
+	// AccountKey: a provider catalog can differ by account/entitlement, so a
+	// list is only reused for the account that fetched it.
+	AccountKey   string                `json:"accountKey"`
 	FetchedAtMs  int64                 `json:"fetchedAtMs"`
 	Exhaustive   bool                  `json:"exhaustive"`
 	DefaultModel string                `json:"defaultModel,omitempty"`
@@ -395,7 +398,7 @@ func museCodeModelsCachePath() string {
 	return filepath.Join(GetConfigDir(), "musecode_models.json")
 }
 
-func saveMuseCodeModelsCache(version string, discovery cliAgentModelDiscovery, now time.Time) {
+func saveMuseCodeModelsCache(version, accountKey string, discovery cliAgentModelDiscovery, now time.Time) {
 	if len(discovery.Models) == 0 {
 		return
 	}
@@ -403,6 +406,7 @@ func saveMuseCodeModelsCache(version string, discovery cliAgentModelDiscovery, n
 	defer museCodeModelsCacheMu.Unlock()
 	_ = writeMuseCodeJSONAtomic(museCodeModelsCachePath(), museCodeModelsCacheFile{
 		Version:      version,
+		AccountKey:   accountKey,
 		FetchedAtMs:  now.UnixMilli(),
 		Exhaustive:   discovery.Exhaustive,
 		DefaultModel: discovery.DefaultModel,
@@ -410,13 +414,14 @@ func saveMuseCodeModelsCache(version string, discovery cliAgentModelDiscovery, n
 	})
 }
 
-// loadMuseCodeModelsCache returns the saved list for this installed version,
-// and whether it is still fresh.
-func loadMuseCodeModelsCache(version string, now time.Time) (discovery cliAgentModelDiscovery, fresh, ok bool) {
+// loadMuseCodeModelsCache returns the saved list for this installed version
+// and account, and whether it is still fresh.
+func loadMuseCodeModelsCache(version, accountKey string, now time.Time) (discovery cliAgentModelDiscovery, fresh, ok bool) {
 	museCodeModelsCacheMu.Lock()
 	defer museCodeModelsCacheMu.Unlock()
 	var file museCodeModelsCacheFile
-	if !readBoundedJSONFile(museCodeModelsCachePath(), &file) || len(file.Models) == 0 || file.Version != version {
+	if !readBoundedJSONFile(museCodeModelsCachePath(), &file) || len(file.Models) == 0 ||
+		file.Version != version || file.AccountKey != accountKey {
 		return cliAgentModelDiscovery{}, false, false
 	}
 	age := now.Sub(time.UnixMilli(file.FetchedAtMs))
@@ -432,7 +437,8 @@ func loadMuseCodeModelsCache(version string, now time.Time) (discovery cliAgentM
 // installed version) when the host cannot answer inside the caller's budget.
 func discoverMuseCodeModels(ctx context.Context, detected detectedCLIAgent) (cliAgentModelDiscovery, bool) {
 	now := time.Now()
-	saved, fresh, haveSaved := loadMuseCodeModelsCache(detected.Version, now)
+	accountKey := museCodeUsageAccountKey(currentMuseCodeAccountFingerprint())
+	saved, fresh, haveSaved := loadMuseCodeModelsCache(detected.Version, accountKey, now)
 	if haveSaved && fresh {
 		return saved, true
 	}
@@ -444,7 +450,7 @@ func discoverMuseCodeModels(ctx context.Context, detected detectedCLIAgent) (cli
 		discovery, ok := museCodeListModels(ctx, client)
 		client.Close()
 		if ok {
-			saveMuseCodeModelsCache(detected.Version, discovery, now)
+			saveMuseCodeModelsCache(detected.Version, accountKey, discovery, now)
 			return discovery, true
 		}
 	}

@@ -296,7 +296,7 @@ func TestProbeMuseCodeUsageLive_TurnThenFirstUsageChanged(t *testing.T) {
 	if effort != "low" {
 		t.Fatalf("the default model advertises only low/high, yet the turn asked for %q", effort)
 	}
-	models, fresh, ok := loadMuseCodeModelsCache("1.4.0", time.Now())
+	models, fresh, ok := loadMuseCodeModelsCache("1.4.0", museCodeAccountFingerprint("dev@example.com"), time.Now())
 	if !ok || !fresh || len(models.Models) != 2 || models.DefaultModel != "muse-spark-1.3-contributor" || !models.Exhaustive {
 		t.Fatalf("models=%#v fresh=%v ok=%v", models, fresh, ok)
 	}
@@ -514,6 +514,77 @@ func TestDiscoverMuseCodeModels_CacheThenHostThenStaleFallback(t *testing.T) {
 	}
 	if _, ok := discoverMuseCodeModels(context.Background(), detectedCLIAgent{Detected: true, Version: "1.5.0"}); ok {
 		t.Fatal("another version's list was reused")
+	}
+}
+
+func TestMuseCodeAccountFor_Precedence(t *testing.T) {
+	home := isolateMuseCode(t)
+	env := map[string]string{}
+	getenv := func(k string) string { return env[k] }
+
+	if got := museCodeAccountFor(home, getenv); got != (museCodeAccount{}) {
+		t.Fatalf("nothing on disk must be the unknown account, got %#v", got)
+	}
+	writeMuseConfig(t, home, "auth.json", `{"providers":{"meta":{"api_key":"KEY-ONE"}}}`)
+	one := museCodeAccountFor(home, getenv)
+	if one.Email != "" || one.Fingerprint != museCodeAPIKeyFingerprint("KEY-ONE") {
+		t.Fatalf("stored API key: %#v", one)
+	}
+	writeMuseConfig(t, home, "auth.json", `{"providers":{"meta":{"api_key":"KEY-TWO"}}}`)
+	if two := museCodeAccountFor(home, getenv); two.Fingerprint == one.Fingerprint || two.Fingerprint == "" {
+		t.Fatal("two API keys must be two accounts")
+	}
+	writeMuseConfig(t, home, "auth.json", museAuthFixture)
+	if got := museCodeAccountFor(home, getenv); got.Email != "Dev@Example.com" || got.Fingerprint != museCodeAccountFingerprint("dev@example.com") {
+		t.Fatalf("an OAuth email wins over the stored key: %#v", got)
+	}
+	env["META_API_KEY"] = "ENV-KEY"
+	if got := museCodeAccountFor(home, getenv); got.Email != "" || got.Fingerprint != museCodeAPIKeyFingerprint("ENV-KEY") {
+		t.Fatalf("META_API_KEY overrides the stored login and must not borrow its email: %#v", got)
+	}
+	if strings.Contains(museCodeAPIKeyFingerprint("ENV-KEY"), "ENV-KEY") {
+		t.Fatal("the fingerprint must not contain the key")
+	}
+}
+
+func TestProbeMuseCodeUsageLive_APIKeyAccountsDoNotShareACooldown(t *testing.T) {
+	isolateMuseCode(t)
+	now := time.Now()
+	t.Setenv("META_API_KEY", "KEY-ONE")
+	fake := &fakeMuseServe{usage: museUsageJSON(now.Add(time.Hour), now.Add(72*time.Hour), now)}
+	startMuseCodeMSPFn = fake.start
+	if got := probeMuseCodeUsageLive(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/muse"}, time.Now); got != liveProbeOutcomeOK {
+		t.Fatalf("first key: %q", got)
+	}
+	t.Setenv("META_API_KEY", "KEY-TWO")
+	if got := probeMuseCodeUsageLive(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/muse"}, time.Now); got != liveProbeOutcomeOK {
+		t.Fatalf("a different key inherited the first key's cooldown: %q", got)
+	}
+	usage, _ := museCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if usage.AccountFingerprint != museCodeAPIKeyFingerprint("KEY-TWO") || usage.Metrics[0].Unknown {
+		t.Fatalf("the current key's own reading must be shown: %#v", usage)
+	}
+}
+
+func TestMuseCodeModelCaches_AreScopedToTheAccount(t *testing.T) {
+	isolateMuseCode(t)
+	now := time.Now()
+	saveMuseCodeModelsCache("1.4.0", "account-a", cliAgentModelDiscovery{Models: []cliAgentModelDetail{{ID: "m"}}}, now)
+	if _, _, ok := loadMuseCodeModelsCache("1.4.0", "account-b", now); ok {
+		t.Fatal("another account's saved catalog was reused")
+	}
+	if _, fresh, ok := loadMuseCodeModelsCache("1.4.0", "account-a", now); !ok || !fresh {
+		t.Fatal("the account's own catalog must be reused")
+	}
+	agent := detectedCLIAgent{Detected: true, Path: "/x/muse", Version: "1.4.0"}
+	t.Setenv("META_API_KEY", "KEY-ONE")
+	a := cliAgentModelProbeCacheKey("museCode", agent)
+	t.Setenv("META_API_KEY", "KEY-TWO")
+	if b := cliAgentModelProbeCacheKey("museCode", agent); a == b {
+		t.Fatal("the in-memory model cache key must change with the account")
+	}
+	if cliAgentModelProbeCacheKey("codex", agent) != "codex\x00/x/muse\x001.4.0" {
+		t.Fatal("other agents' cache keys must be unchanged")
 	}
 }
 

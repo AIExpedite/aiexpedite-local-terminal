@@ -27,9 +27,10 @@
 // paint a red chip on a working install the user cannot act on — the worst
 // failure this parser can have.
 //
-// SECRETS: the credential file is decoded into a struct that names ONLY the
-// identity fields, so the access token and API key beside them are never held
-// in a Go value, logged, cached or published.
+// SECRETS: the credential file is decoded into structs that name ONLY the
+// identity fields — or, when no email identifies the account, only the API key,
+// which is immediately reduced to a one-way fingerprint. The access token is
+// never read; nothing secret is logged, cached or published.
 package main
 
 import (
@@ -82,10 +83,9 @@ func (p museCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 		// Login-required signal.
 		usage.AuthState = museCodeAuthUnknown
 	}
-	if identity := readMuseCodeIdentity(home, os.Getenv); identity.Email != "" {
-		usage.Account = identity.Email
-		usage.AccountFingerprint = museCodeAccountFingerprint(identity.Email)
-	}
+	identity := museCodeAccountFor(home, os.Getenv)
+	usage.Account = identity.Email
+	usage.AccountFingerprint = identity.Fingerprint
 	usage.Model = readMuseCodeDefaultModel(home, os.Getenv)
 
 	reading, ok := loadMuseCodeUsageLive(museCodeUsageAccountKey(usage.AccountFingerprint))
@@ -176,15 +176,56 @@ func museCodeAccountFingerprint(email string) string {
 	return fingerprintAccount("museCode", strings.ToLower(strings.TrimSpace(email)))
 }
 
-// currentMuseCodeAccountFingerprint is the fingerprint of whoever is signed in
-// right now, or "" when no identity is on disk.
+// museCodeAPIKeyFingerprint keys an API-key account: one-way (sha256,
+// provider-salted, truncated), so the key itself never leaves this function.
+func museCodeAPIKeyFingerprint(key string) string {
+	return fingerprintAccount("museCode:api-key", strings.TrimSpace(key))
+}
+
+// museCodeAccount is who Muse Code runs as: Email when an OAuth login names
+// it, and Fingerprint, the opaque key the usage cache, the model cache and
+// cross-device dedup use. Fingerprint is "" only for a keychain login, which
+// leaves nothing on disk to tell accounts apart.
+type museCodeAccount struct {
+	Email       string
+	Fingerprint string
+}
+
+// museCodeAuthAPIKeyFile names ONLY the stored API key (`muse auth set`),
+// read solely to fingerprint an account that has no email on disk.
+type museCodeAuthAPIKeyFile struct {
+	Providers struct {
+		Meta struct {
+			APIKey string `json:"api_key"`
+		} `json:"meta"`
+	} `json:"providers"`
+}
+
+// museCodeAccountFor resolves the account in Muse's own precedence:
+// META_API_KEY in the environment overrides any stored login (labelling it
+// with the stored email could name the wrong account), then an OAuth email,
+// then a stored API key.
+func museCodeAccountFor(home string, getenv func(string) string) museCodeAccount {
+	if key := strings.TrimSpace(getenv("META_API_KEY")); key != "" {
+		return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(key)}
+	}
+	if identity := readMuseCodeIdentity(home, getenv); identity.Email != "" {
+		return museCodeAccount{Email: identity.Email, Fingerprint: museCodeAccountFingerprint(identity.Email)}
+	}
+	for _, path := range museCodeCredentialPaths(home, getenv) {
+		var file museCodeAuthAPIKeyFile
+		if readBoundedJSONFile(path, &file) && strings.TrimSpace(file.Providers.Meta.APIKey) != "" {
+			return museCodeAccount{Fingerprint: museCodeAPIKeyFingerprint(file.Providers.Meta.APIKey)}
+		}
+	}
+	return museCodeAccount{}
+}
+
+// currentMuseCodeAccountFingerprint is the fingerprint of whoever Muse runs as
+// right now, or "" for a keychain login.
 func currentMuseCodeAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
-	identity := readMuseCodeIdentity(home, os.Getenv)
-	if identity.Email == "" {
-		return ""
-	}
-	return museCodeAccountFingerprint(identity.Email)
+	return museCodeAccountFor(home, os.Getenv).Fingerprint
 }
 
 // readMuseCodeDefaultModel returns settings.json's `model`, or "".
