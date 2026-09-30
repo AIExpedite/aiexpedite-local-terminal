@@ -1118,7 +1118,7 @@ func TestAntigravityFreshness_ALiveRunKeepsItsCrashMarker(t *testing.T) {
 
 	// A Refresh click mid-run: newer than the floor, but taken before the run
 	// spent the usage it is still spending.
-	settleAntigravityRunFreshness(started.Add(10 * time.Second).UnixMilli())
+	settleAntigravityRunFreshness(started.Add(10*time.Second).UnixMilli(), "")
 	if state := helperFreshnessState(t); state.RunFloorMs != floor.UnixMilli() {
 		t.Fatalf("state=%+v, want a live run to keep its floor for crash recovery", state)
 	}
@@ -1152,7 +1152,7 @@ func TestAntigravityFreshness_ACoveringReadingRollsTheMarkerBackToTheOldestLiveR
 		t.Fatalf("state=%+v, want the newest arm's floor %d", state, newer.UnixMilli())
 	}
 
-	settleAntigravityRunFreshness(started.Add(time.Minute).UnixMilli())
+	settleAntigravityRunFreshness(started.Add(time.Minute).UnixMilli(), "")
 	if state := helperFreshnessState(t); state.RunFloorMs != older.UnixMilli() {
 		t.Errorf("floor=%d, want it rolled back to the oldest live run %d",
 			helperFreshnessState(t).RunFloorMs, older.UnixMilli())
@@ -1385,6 +1385,101 @@ func TestAntigravityFreshness_AnotherAccountsReadingDoesNotCoverTheRun(t *testin
 			}
 			if spent := calls.Load() != 0; spent != tc.wantOwed {
 				t.Errorf("Code Assist reads=%d, want spent=%v", calls.Load(), tc.wantOwed)
+			}
+		})
+	}
+}
+
+// One pending debt at a time means a settle can find a NEWER run's floor
+// already there and retain it. The debt then still asks for that newer run's
+// reading, so it must keep that run's login: naming the settling (older) run's
+// account instead would have the worker test the retained floor against the
+// wrong identity — ignoring the snapshot that covers it, and accepting one that
+// does not.
+func TestAntigravityFreshness_ARetainedFloorKeepsTheAccountThatOwnsIt(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	cache := os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")
+	started := time.Now().Truncate(time.Second)
+	// Both runs started before either settled; the LATER completion settles
+	// first, which is what leaves its floor for the earlier one to retain.
+	olderDone, newerDone := started.Add(time.Minute), started.Add(70*time.Second)
+	older, newer := started, started.Add(time.Second)
+	h.write(t, helperLogName(older),
+		helperPIDBlock(60401)+"authenticated successfully as ada@example.com\n", older, false)
+	h.write(t, helperLogName(newer),
+		helperPIDBlock(60402)+"authenticated successfully as bob@example.com\n", newer, false)
+	// Nothing covers either run, and the worker's reads all fail, so the debt
+	// the two settles share stays pending for the assertions below.
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	antigravityUsageFreshnessNow = func() time.Time { return newerDone }
+	antigravityUsageRunSettled(newer, 60402, false, true)
+	antigravityUsageRefreshWaitIdle()
+	antigravityUsageFreshnessNow = func() time.Time { return olderDone }
+	antigravityUsageRunSettled(older, 60401, false, true)
+	antigravityUsageRefreshWaitIdle()
+
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != newerDone.UnixMilli() {
+		t.Fatalf("floor=%d, want the newer completion %d retained (state=%+v)",
+			state.RefreshOwedFloorMs, newerDone.UnixMilli(), state)
+	}
+	wantBob := fingerprintAccount("antigravity", "bob@example.com")
+	if got := antigravityDebtAccountFor(state.debtID()); got != wantBob {
+		t.Fatalf("debt account=%q, want the retained floor's own login %q", got, wantBob)
+	}
+	// And the consequence: a reading for the OLDER run's login, newer than the
+	// retained floor, neither covers the debt nor retires it.
+	helperWriteAntigravityCacheFor(t, cache, newerDone.Add(time.Second),
+		newerDone.Add(time.Second).UnixMilli(), "ada@example.com")
+	settleAntigravityRunFreshness(newerDone.Add(time.Second).UnixMilli(),
+		fingerprintAccount("antigravity", "ada@example.com"))
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 {
+		t.Errorf("state=%+v, want the retained debt still owed after the other login's reading", state)
+	}
+}
+
+// Every route that lands a reading reaches settleAntigravityRunFreshness, so
+// the account-aware rule the settle and the worker apply has to hold here too:
+// a snapshot written for another login, stamped past the floor, must not retire
+// a debt it says nothing about. A reading for the debt's own login still does.
+func TestAntigravityFreshness_ALandedReadingRetiresOnlyItsOwnAccountsDebt(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		landedAs    string
+		wantRetired bool
+	}{
+		{"another login's write", "ada@example.com", false},
+		{"the debt's own login", "bob@example.com", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			cache := os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")
+			floor := time.Now().Truncate(time.Second)
+			completed := floor.Add(time.Minute)
+			antigravityUsageFreshnessNow = func() time.Time { return completed }
+			h.write(t, helperLogName(floor),
+				helperPIDBlock(60501)+"authenticated successfully as bob@example.com\n", floor, false)
+			helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+			antigravityUsageRunSettled(floor, 60501, false, true)
+			antigravityUsageRefreshWaitIdle()
+			if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 {
+				t.Fatalf("state=%+v, want the run owed before anything lands", state)
+			}
+
+			// A reading landing through the real write path, past the floor.
+			landed := completed.Add(time.Second)
+			helperWriteAntigravityCacheFor(t, cache, landed, landed.UnixMilli(), tc.landedAs)
+			settleAntigravityRunFreshness(landed.UnixMilli(),
+				fingerprintAccount("antigravity", tc.landedAs))
+
+			state := helperFreshnessState(t)
+			if retired := state.RefreshOwedAtMs == 0; retired != tc.wantRetired {
+				t.Fatalf("retired=%v (state=%+v), want %v", retired, state, tc.wantRetired)
+			}
+			if !tc.wantRetired && state.RunFloorMs < state.RefreshOwedFloorMs {
+				t.Errorf("state=%+v, want the marker a restart adopts kept at the pending floor", state)
 			}
 		})
 	}

@@ -904,7 +904,7 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 	// here, so a run's refresh debt is retired exactly once by whichever of
 	// them covers its floor. Takes only the freshness lock — the cache lock is
 	// held here, and the package's lock order is cache -> freshness.
-	settleAntigravityRunFreshness(antigravitySnapshotObservedMs(snap))
+	settleAntigravityRunFreshness(antigravitySnapshotObservedMs(snap), snap.AccountFingerprint)
 	return true
 }
 

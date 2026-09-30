@@ -509,8 +509,18 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 		return
 	}
 
+	var (
+		// priorID is the generation this settle found, and ownsFloor says the
+		// floor it leaves behind is THIS run's completion rather than a newer
+		// run's that was already pending. Read inside the closure so both come
+		// from the same locked view of the state the update rewrote.
+		priorID   antigravityDebtID
+		ownsFloor bool
+	)
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
+		priorID = state.debtID()
+		ownsFloor = state.RefreshOwedAtMs == 0 || completionMs > state.RefreshOwedFloorMs
 		owedFloorMs := completionMs
 		if state.RefreshOwedFloorMs > owedFloorMs {
 			// One pending debt at a time: a reading that covers the newest
@@ -532,7 +542,20 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 	// The generation this run just created is the one the worker must keep
 	// scoped to this run's login. In memory only: the state file keeps its
 	// fields, and a generation nobody remembers falls back to time alone.
-	noteAntigravityDebtAccount(state.debtID(), account)
+	//
+	// When this settle did NOT advance the floor — two differently
+	// authenticated runs settling concurrently, and the NEWER completion got
+	// its debt in first — the pending debt still asks for that newer run's
+	// reading, so it must keep that run's login. Naming this (older) run's
+	// account instead would have the worker test the newer floor against the
+	// wrong identity: it would ignore the snapshot that actually covers it, and
+	// accept one that does not. An account nobody remembers for the retained
+	// generation falls back to the time-only rule, as a restart's would.
+	debtAccount := account
+	if !ownsFloor {
+		debtAccount = antigravityDebtAccountFor(priorID)
+	}
+	noteAntigravityDebtAccount(state.debtID(), debtAccount)
 	fmt.Printf("%s[antigravity-freshness] Run finished with no reading of its own (owed=true gated=%v attempts=%d)%s\n",
 		colorYellow, gated, state.Attempts, colorReset)
 	antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, false)
@@ -575,12 +598,25 @@ func antigravityAwaitPostRunReading(account string, completionMs int64) bool {
 // called from inside writeAntigravityQuotaSnapshotLocked — while the quota
 // cache lock is held — so it must never read the cache back. observedMs is the
 // landed reading's instant (antigravitySnapshotObservedMs); 0 retires nothing.
-func settleAntigravityRunFreshness(observedMs int64) {
+//
+// account is the login the landed reading describes. A debt is scoped to the
+// account of the run that raised it, and one capture poller plus one cache file
+// are shared by every armed run, so a concurrent run or a Refresh click under
+// another login can land a reading stamped after this debt's floor that says
+// nothing about the pool that run spent from. Such a reading must not retire
+// the debt — that is the same account-aware rule antigravityUsageRunSettled and
+// antigravityPayRunDebtPass apply, enforced here so no write can slip past
+// them. "" (an unidentified reading, or a generation this process does not
+// remember) keeps the time-only rule.
+func settleAntigravityRunFreshness(observedMs int64, account string) {
 	if observedMs <= 0 {
 		return
 	}
 	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
-		if state.RefreshOwedAtMs != 0 && observedMs >= state.RefreshOwedFloorMs {
+		if state.RefreshOwedAtMs != 0 && observedMs >= state.RefreshOwedFloorMs &&
+			// A leaf lock taken under the freshness lock: nothing is ever taken
+			// while antigravityDebtAccount is held, so this adds no order.
+			antigravityDebtAccountAnswers(state.debtID(), account) {
 			state.clearDebt()
 		}
 		if state.RunFloorMs != 0 && observedMs >= state.RunFloorMs {
@@ -592,6 +628,13 @@ func settleAntigravityRunFreshness(observedMs int64) {
 			// recovery refresh. Roll back to the oldest protected floor instead
 			// (a managed run, or a live direct-run candidate).
 			state.RunFloorMs = antigravityOldestProtectedFloorMs()
+			if state.RefreshOwedAtMs != 0 && state.RunFloorMs < state.RefreshOwedFloorMs {
+				// A debt this reading did NOT answer is still pending (another
+				// account's). It keeps the invariant the settle established:
+				// the marker a restart adopts is never behind the floor the
+				// debt is still asking for.
+				state.RunFloorMs = state.RefreshOwedFloorMs
+			}
 		}
 	})
 }
@@ -757,9 +800,10 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		// Scoped to the debt's own login where this process still remembers it:
 		// the capture poller is shared, so a concurrent run under another
 		// account can leave a NEWER reading that says nothing about this one.
+		debtAccount := antigravityDebtAccountFor(state.debtID())
 		if cached, ok := antigravityCachedReadingCovering(
-			antigravityDebtAccountFor(state.debtID()), state.RefreshOwedFloorMs); ok {
-			settleAntigravityRunFreshness(cached)
+			debtAccount, state.RefreshOwedFloorMs); ok {
+			settleAntigravityRunFreshness(cached, debtAccount)
 			return state, antigravityRetryNone
 		}
 		if state.Attempts >= antigravityRefreshDebtMaxAttempts {
@@ -1251,6 +1295,15 @@ func antigravityDebtAccountFor(id antigravityDebtID) string {
 		return ""
 	}
 	return d.fingerprint
+}
+
+// antigravityDebtAccountAnswers reports whether a reading belonging to account
+// may retire debt generation id. A generation whose login this process does not
+// remember, and a reading whose own account is unknown, both fall back to the
+// time-only rule; otherwise the two identities must be the same login.
+func antigravityDebtAccountAnswers(id antigravityDebtID, account string) bool {
+	owner := antigravityDebtAccountFor(id)
+	return owner == "" || account == "" || owner == account
 }
 
 // antigravityAttemptWasUnplottable reports whether the latest attempt on the

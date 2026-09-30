@@ -244,7 +244,7 @@ func TestAntigravityRunDebtRetry_FiringForAPaidDebtDoesNothing(t *testing.T) {
 	}
 
 	helperWriteAntigravityCache(t, cache, time.Now())
-	settleAntigravityRunFreshness(time.Now().UnixMilli())
+	settleAntigravityRunFreshness(time.Now().UnixMilli(), "")
 	antigravityArmRunDebtRetry(state.debtID(), 0)
 	helperDrainAntigravityRefreshSchedule(t)
 	if reads.Load() != 0 {

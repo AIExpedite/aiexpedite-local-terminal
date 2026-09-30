@@ -833,7 +833,7 @@ func TestAntigravityFreshness_ConcurrentGatedRunsOweOneDebtAndPayItOnce(t *testi
 		t.Errorf("reads=%d, want the interval to hold the second run's payment at %d", got, paid)
 	}
 	// A reading taken BEFORE the second run armed must not clear its debt.
-	settleAntigravityRunFreshness(shortFloor - time.Minute.Milliseconds())
+	settleAntigravityRunFreshness(shortFloor-time.Minute.Milliseconds(), "")
 	if helperFreshnessState(t).RefreshOwedAtMs == 0 {
 		t.Error("a reading older than the run's floor retired its debt")
 	}
