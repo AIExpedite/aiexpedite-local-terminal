@@ -7,6 +7,8 @@
 //   - packageManagers:  winget / choco / scoop (Windows), brew (macOS, Linux),
 //     apt (Linux)
 //   - virtualization:   { enabled, wsl2 } on Windows (absent elsewhere)
+//   - powerShell:       execution policy per PowerShell host on Windows
+//     (absent elsewhere; systemInfo_powershell.go)
 //   - GPU VRAM:         nvidia-smi overrides the WMI AdapterRAM value on
 //     Windows, which a uint32 caps at ~4 GB
 //
@@ -207,7 +209,8 @@ type setupExtras struct {
 	Tools           map[string]string
 	PackageManagers map[string]string
 	Virtualization  *virtualizationInfo
-	NvidiaGPUs      []gpuInfo // Windows only; nil when nvidia-smi is absent
+	PowerShell      *powerShellPolicyInfo // Windows only
+	NvidiaGPUs      []gpuInfo             // Windows only; nil when nvidia-smi is absent
 }
 
 // gatherSetupExtras runs the fixed setup probes for goos in parallel.
@@ -218,10 +221,12 @@ func gatherSetupExtras(ctx context.Context, goos string, run setupProbeRunner) s
 	type extraJob func(ctx context.Context)
 	var extra []extraJob
 	var virt *virtualizationInfo
+	var psPolicy *powerShellPolicyInfo
 	var nvidia []gpuInfo
 	if goos == "windows" {
 		extra = append(extra,
 			func(ctx context.Context) { virt = gatherVirtualizationWindows(ctx, run) },
+			func(ctx context.Context) { psPolicy = gatherPowerShellPolicyWindows(ctx, run) },
 			func(ctx context.Context) {
 				out, ok := run(ctx, "nvidia-smi", []string{
 					"--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits",
@@ -254,6 +259,7 @@ func gatherSetupExtras(ctx context.Context, goos string, run setupProbeRunner) s
 		Tools:           map[string]string{},
 		PackageManagers: map[string]string{},
 		Virtualization:  virt,
+		PowerShell:      psPolicy,
 		NvidiaGPUs:      nvidia,
 	}
 	for i, s := range specs {
@@ -293,6 +299,9 @@ func applySetupExtras(info *MachineInfo, x setupExtras) {
 	}
 	if x.Virtualization != nil {
 		info.Virtualization = x.Virtualization
+	}
+	if x.PowerShell != nil {
+		info.PowerShell = x.PowerShell
 	}
 	if len(x.NvidiaGPUs) > 0 {
 		info.GPU = applyNvidiaVRAM(info.GPU, x.NvidiaGPUs)

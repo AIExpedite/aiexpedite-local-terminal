@@ -80,6 +80,10 @@ var informationalSoftwareCodes = map[string]struct{}{
 	"missing_node":  {},
 	"missing_npm":   {},
 	"missing_codex": {},
+	// Advisory like missing_node: the server offers the per-user fix and gates
+	// npm steps on it, but a computer whose coding agent runs is not taken off
+	// routing because PowerShell blocks npm.ps1.
+	"powershell_scripts_blocked": {},
 }
 
 // marketedComparableRAM returns reported usable RAM plus slack so thresholds
@@ -223,6 +227,18 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	// agent, which the server checks.
 	if !cliAgentDetected(info, "codex") {
 		add("missing_codex", FindingWarning, "Codex CLI isn't set up yet. AIExpedite can install and sign you in with your permission.", softwareAction("missing_codex", "Install Codex", "Create a setup plan to install Codex CLI.", "Install Codex CLI, then follow its sign-in prompt."))
+	}
+
+	// PowerShell execution policy (Windows only; nil elsewhere). A blocking
+	// policy stops npm.ps1 and other local scripts, so installs would fail
+	// inside npm. The per-user fix is offered only when it lifts the block.
+	if info.PowerShell != nil && info.PowerShell.BlocksLocalScripts {
+		message, fixable := powerShellPolicyFinding(info.PowerShell)
+		var action *ReadinessAction
+		if fixable {
+			action = softwareAction("powershell_scripts_blocked", "Allow PowerShell scripts for your user", "Create a setup plan to allow PowerShell scripts for your user account (execution policy RemoteSigned, current user only).", powerShellPolicyManualCommand)
+		}
+		add("powershell_scripts_blocked", FindingWarning, message, action)
 	}
 
 	report.State = deriveReadinessState(report.Findings)

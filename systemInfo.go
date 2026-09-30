@@ -225,6 +225,10 @@ type MachineInfo struct {
 	// could be read): whether hardware virtualization is usable and whether
 	// WSL2 is set up — Docker Desktop needs both (systemInfo_setup.go).
 	Virtualization *virtualizationInfo `json:"virtualization,omitempty"`
+	// PowerShell is Windows-only (nil elsewhere, and when no host could be
+	// probed): each host's execution policy and whether it blocks local
+	// scripts such as npm.ps1 (systemInfo_powershell.go).
+	PowerShell *powerShellPolicyInfo `json:"powerShell,omitempty"`
 
 	// baseTools is Tools as the gather's own probes left it, before the
 	// setupToolCatalog results were merged in, so a later catalog pass can
