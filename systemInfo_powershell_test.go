@@ -233,7 +233,10 @@ func TestPowerShellPolicyFindingMessages(t *testing.T) {
 		{"fixable", psHost("Restricted", allUndefined(nil)), true, []string{"(Restricted)", "npm", "RemoteSigned"}},
 		{"group policy", psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"})), false, []string{"Group Policy", "IT administrator"}},
 		{"all signed", psHost("AllSigned", allUndefined(map[string]string{"LocalMachine": "AllSigned"})), false, []string{"AllSigned", powerShellPolicyManualCommand}},
-		{"process", psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"})), false, []string{"process", "remove that override first", powerShellPolicyManualCommand}},
+		{"process", psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"})), false, []string{"process", "remove that override", powerShellPolicyManualCommand}},
+		// Process outranks CurrentUser, so a Process-scoped AllSigned needs the
+		// override removed, not just the CurrentUser setter.
+		{"process all signed", psHost("AllSigned", allUndefined(map[string]string{"Process": "AllSigned"})), false, []string{"process", "remove that override", "PSExecutionPolicyPreference"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -295,5 +298,22 @@ func TestPowerShellPolicyManualCommandPerHost(t *testing.T) {
 	onlyWin := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
 	if msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win, lockedPwsh})); fixable || !strings.Contains(msg, onlyWin) || strings.Contains(msg, "pwsh -NoProfile") || !strings.Contains(msg, "IT administrator") {
 		t.Fatalf("mixed report must give the command for the host Group Policy does not own: fixable=%v msg=%q", fixable, msg)
+	}
+}
+
+func TestPowerShellPolicyFindingGroupPolicyWithProcessHost(t *testing.T) {
+	processWin := psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"}))
+	lockedPwsh := psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"}))
+	lockedPwsh.Host = powerShellHost7
+	// Neither host can be fixed by the CurrentUser setter, so it must not be
+	// offered; the Process-scoped host gets the remove-the-override guidance.
+	msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{processWin, lockedPwsh}))
+	if fixable || strings.Contains(msg, powerShellPolicyManualCommand) {
+		t.Fatalf("Group Policy + Process must not offer the CurrentUser setter: fixable=%v msg=%q", fixable, msg)
+	}
+	for _, w := range []string{"IT administrator", "PSExecutionPolicyPreference", "restart the AIExpedite agent"} {
+		if !strings.Contains(msg, w) {
+			t.Fatalf("message %q lacks %q", msg, w)
+		}
 	}
 }

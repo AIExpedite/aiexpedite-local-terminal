@@ -293,6 +293,10 @@ func (p *powerShellPolicyInfo) manualCommandWhere(keep func(*powerShellHostPolic
 	return strings.Join(cmds, "; ")
 }
 
+// powerShellProcessOverrideHint is how a person lifts a Process-scoped policy,
+// which no CurrentUser setting can override.
+const powerShellProcessOverrideHint = "remove that override (for example, unset PSExecutionPolicyPreference and restart the AIExpedite agent)"
+
 // powerShellPolicyFinding is the readiness message for a blocking policy, and
 // whether setup can offer the per-user fix.
 func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable bool) {
@@ -310,11 +314,20 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 			"AIExpedite can allow them for your user account only (RemoteSigned, no administrator rights needed) with your permission.", true
 	}
 	// Name what controls the policy (the first host that blocks and cannot be
-	// fixed, so a mixed report explains the part setup can't change).
+	// fixed, so a mixed report explains the part setup can't change). Group
+	// Policy wins, so no other branch offers the setter for a host it owns.
+	h = nil
 	for i := range p.Hosts {
-		if p.Hosts[i].BlocksLocalScripts && !p.Hosts[i].FixableByCurrentUser {
-			h = &p.Hosts[i]
+		o := &p.Hosts[i]
+		if !o.BlocksLocalScripts || o.FixableByCurrentUser {
+			continue
+		}
+		if o.BlockedBy == psScopeMachinePolicy || o.BlockedBy == psScopeUserPolicy {
+			h = o
 			break
+		}
+		if h == nil {
+			h = o
 		}
 	}
 	switch {
@@ -324,18 +337,28 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 		msg := "PowerShell's execution policy (" + h.Effective + ") is set by Group Policy and blocks local scripts, so npm and other script-based tools won't run. " +
 			"Your IT administrator controls this setting; ask them to allow local scripts (RemoteSigned). " +
 			"A per-user setting can't override Group Policy."
+		// A Process scope beats CurrentUser too, so a Process-scoped host gets
+		// the remove-the-override guidance instead of the setter.
 		if rest := p.manualCommandWhere(func(o *powerShellHostPolicy) bool {
-			return o.BlockedBy != psScopeMachinePolicy && o.BlockedBy != psScopeUserPolicy
+			return o.BlockedBy != psScopeMachinePolicy && o.BlockedBy != psScopeUserPolicy && o.BlockedBy != psScopeProcess
 		}); rest != "" {
 			msg += " For the other PowerShell host, run: " + rest
 		}
+		for i := range p.Hosts {
+			if p.Hosts[i].BlocksLocalScripts && p.Hosts[i].BlockedBy == psScopeProcess {
+				msg += " The other PowerShell host's policy is set for the process setup runs in; " + powerShellProcessOverrideHint + "."
+				break
+			}
+		}
 		return msg, false
+	// Process outranks CurrentUser whatever the policy, so it is checked before
+	// AllSigned: a Process-scoped AllSigned needs the override removed first.
+	case h.BlockedBy == psScopeProcess:
+		return "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
+			"A per-user setting can't override it; " + powerShellProcessOverrideHint + " first, then, if scripts are still blocked, run: " + manual, false
 	case strings.EqualFold(h.Effective, psPolicyAllSigned):
 		return "PowerShell's execution policy is AllSigned, which blocks unsigned scripts such as npm's, so npm won't run. " +
 			"AIExpedite won't change a policy you chose; to allow local scripts for your user, run: " + manual, false
-	case h.BlockedBy == psScopeProcess:
-		return "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
-			"A per-user setting can't override it; remove that override first (for example, unset PSExecutionPolicyPreference and restart the AIExpedite agent), then, if scripts are still blocked, run: " + manual, false
 	default:
 		return "PowerShell's execution policy (" + policy + ") blocks local scripts, so npm and other script-based tools won't run. " +
 			"To allow them for your user, run: " + manual, false
