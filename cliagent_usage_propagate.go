@@ -35,7 +35,8 @@
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its epoch rotation commits
 // (codexRotateGenerationEpoch), a cache that still renders a numeric Codex
-// metric is scheduled as a pending observation through the same gates.
+// metric — or holds a committed clear (no contributors, a generation) — is
+// scheduled as a pending observation through the same gates.
 //
 // Logs are fixed labels only (`[cli-usage] usage hint: <label>`) — never a
 // path, account, fingerprint, id or response body.
@@ -315,13 +316,20 @@ func (p *cliUsagePropagatorState) fire(gen uint64) {
 }
 
 // cliUsageRecoveryGeneration is the rotated generation of a cache whose active
-// account still renders at least one numeric Codex metric, or nil.
+// account still renders at least one numeric Codex metric, or whose contributors
+// a committed clear retired (the out-of-quota shape, a rescope), or nil. A clear
+// the previous process committed but never hinted (shutdown inside the debounce)
+// would otherwise leave the backend publishing the old numbers.
 func cliUsageRecoveryGeneration() *cliUsageGeneration {
-	metrics, generation := codexMetricsAndGenerationFromCache(time.Now(), currentCodexAccountFingerprint())
+	view := codexCacheViewForAccount(currentCodexAccountFingerprint())
+	generation := codexPublishableGeneration(view)
 	if generation == nil {
 		return nil
 	}
-	for _, m := range metrics {
+	if len(view.contributors) == 0 {
+		return generation
+	}
+	for _, m := range codexMetricsFromView(view, time.Now()) {
 		if !m.Unknown && m.Consumed != nil {
 			return generation
 		}

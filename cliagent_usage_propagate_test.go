@@ -439,3 +439,30 @@ func TestCLIUsageHint_AnAuthoritativeClearIsHinted(t *testing.T) {
 		t.Fatalf("hint = %+v, want the cleared generation {%d,%d}", cleared, snap.GenerationEpoch, snap.Generation)
 	}
 }
+
+// A clear committed by the previous process whose hint died in the debounce (an
+// update handoff) is recovered like a numeric reading: the replacement process
+// rotates the cleared snapshot onto its epoch and hints it, so the backend stops
+// publishing the old utilization.
+func TestCLIUsageHint_StartupRecoveryHintsACommittedClear(t *testing.T) {
+	withCodexGenerationEpoch(t, 515)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	codexLiveReadAt(t, f, 31, 41, now)
+	if !captureCodexRateLimitLineForAccount(`{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{}}}`, now.Add(time.Second), f.fp) {
+		t.Fatal("the authoritative clear did not land")
+	}
+	if len(codexContributorsFromSnapshot(f.snapshot(t))) != 0 {
+		t.Fatal("the clear left contributors behind")
+	}
+
+	// The previous process exits inside the debounce: its hint is never sent.
+	rec, cfg := propagatorFixture(t)
+	simulateCodexProcessRestart(t, 616)
+	startCLIUsagePropagator(cfg)
+	h := waitHints(t, rec, 1, 0)[0].hint
+	snap := f.snapshot(t)
+	if h.GenerationEpoch != 616 || snap.GenerationEpoch != 616 || h.Generation != snap.Generation {
+		t.Fatalf("recovery hint = %+v, want the rotated cleared generation {%d,%d}", h, snap.GenerationEpoch, snap.Generation)
+	}
+}

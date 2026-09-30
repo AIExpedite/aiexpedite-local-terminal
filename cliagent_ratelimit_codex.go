@@ -1831,8 +1831,12 @@ func codexNoteCommittedGeneration(snap *codexRateLimitSnapshot) {
 // codexRotateGenerationEpoch moves a loaded snapshot onto this process's epoch
 // in one bounded write, so a reading captured by the previous process (a smoke
 // just before an update handoff) is republished under an epoch the backend has
-// never applied. A cache with no contributors has nothing to publish and is left
-// for its first real write to rotate (pending). refused reports a write the
+// never applied. A cache with no contributors AND no generation has never
+// published anything and is left for its first real write to rotate (pending).
+// One with a generation but no contributors is a committed clear (an
+// authoritative empty snapshot, a rescope) whose hint the previous process may
+// have lost inside its debounce, so it rotates like any published state.
+// refused reports a write the
 // bounded locks or the filesystem turned down, which the caller retries.
 func codexRotateGenerationEpoch(now time.Time) (rotated, refused bool) {
 	if codexGenerationRotated.Load() {
@@ -1842,7 +1846,7 @@ func codexRotateGenerationEpoch(now time.Time) (rotated, refused bool) {
 	var onDisk codexRateLimitSnapshot
 	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
 		onDisk = *snap
-		if len(codexContributorsFromSnapshot(*snap)) == 0 {
+		if len(codexContributorsFromSnapshot(*snap)) == 0 && snap.Generation <= 0 {
 			empty = true
 			return false
 		}
