@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -260,7 +261,7 @@ func TestAntigravityUtilizationLines_MetricsOnly(t *testing.T) {
 		logAntigravityQuotaShapeOnce(shape) // once per distinct shape
 		antigravityApplyDiscovery(antigravityDiscoveryResult{heldOwed: 2}, time.Now())
 		antigravityFreshnessInFlight.Add(1)
-		drainAntigravityUsageWrites()
+		drainAntigravityUsageWrites(context.Background())
 		antigravityFreshnessInFlight.Add(-1)
 	})
 

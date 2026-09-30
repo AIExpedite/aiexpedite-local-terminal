@@ -1348,14 +1348,30 @@ func antigravityAttemptWasUnplottable(id antigravityDebtID) bool {
 // antigravityShutdownDrain bounds gracefulShutdown's wait for in-flight writes.
 var antigravityShutdownDrain = 5 * time.Second
 
+// antigravityShutdownDrainBudget is antigravityShutdownDrain capped at half of
+// what is left of the caller's shutdown deadline, so the backend offline notice
+// that follows always keeps the other half (logoff hands gracefulShutdown only
+// 2 s). An expired deadline leaves no drain; no deadline leaves the full bound.
+func antigravityShutdownDrainBudget(ctx context.Context, now time.Time) time.Duration {
+	budget := antigravityShutdownDrain
+	if ctx == nil {
+		return budget
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, max(deadline.Sub(now)/2, 0))
+	}
+	return budget
+}
+
 // drainAntigravityUsageWrites stops the discovery tick and waits, at most
-// antigravityShutdownDrain in total, for a tick in flight and then for this
-// feature's background writes. A tick or write still stuck after that is
-// abandoned: the floor its arm persisted at spawn is what the next process
+// antigravityShutdownDrainBudget(ctx) in total, for a tick in flight and then
+// for this feature's background writes. A tick or write still stuck after that
+// is abandoned: the floor its arm persisted at spawn is what the next process
 // adopts.
-func drainAntigravityUsageWrites() {
-	deadline := time.Now().Add(antigravityShutdownDrain)
-	tickStopped := stopAntigravityDiscoveryWithin(antigravityShutdownDrain)
+func drainAntigravityUsageWrites(ctx context.Context) {
+	budget := antigravityShutdownDrainBudget(ctx, time.Now())
+	deadline := time.Now().Add(budget)
+	tickStopped := stopAntigravityDiscoveryWithin(budget)
 	idle := antigravityUsageRefreshWaitIdleFor(time.Until(deadline))
 	if !tickStopped || !idle {
 		tickRunning := 0

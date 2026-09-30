@@ -550,7 +550,7 @@ func TestAntigravityStaleRegression_MaintenanceSmokeSurvivesUpdate(t *testing.T)
 	helperRunEncodedPowerShellAgy(t, f)
 	<-entered
 	drained := time.Now()
-	drainAntigravityUsageWrites()
+	drainAntigravityUsageWrites(context.Background())
 	if waited := time.Since(drained); waited > 2*time.Second {
 		t.Errorf("the drain waited %s on a stuck write, want it bounded", waited)
 	}
