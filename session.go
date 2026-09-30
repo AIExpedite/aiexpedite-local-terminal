@@ -840,9 +840,11 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// post-run usage refresh can never read it. Arm the run-scoped capture
 	// poller now that the process exists; waitForExit releases it as soon as the
 	// process ends. Nil for every other command. See
-	// cliagent_usage_antigravity_capture.go.
+	// cliagent_usage_antigravity_capture.go. A wrapper (PowerShell,
+	// `bash -c 'agy …'`) hands its PID to the resolver rather than being
+	// recorded as agy, exactly as on the PTY and Unix execute paths.
 	quotaCapture := armAntigravityCaptureForCommand("pipe session", command, cliArgs)
-	quotaCapture.SetPID(proc.Process.Pid)
+	quotaCapture.SetStarted(command, proc.Process.Pid)
 
 	session := &CLISession{
 		ID:                           id,

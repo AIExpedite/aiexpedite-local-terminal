@@ -1036,6 +1036,8 @@ func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
 			return []ProcessInfo{{PID: 500, Name: "bash"}, {PID: 501, ParentPID: 500, Name: "agy"}}, true
 		case 600: // `bash -c "agy …"`: the shell execs agy in place
 			return []ProcessInfo{{PID: 600, Name: "agy"}}, true
+		case 700: // `powershell -c "antigravity …"`: the supported alias
+			return []ProcessInfo{{PID: 700, Name: "powershell.exe"}, {PID: 701, ParentPID: 700, Name: "Antigravity.exe"}}, true
 		}
 		return nil, true
 	}
@@ -1060,7 +1062,7 @@ func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
 	}
 	helperStopCapture(t, direct.Finish)
 
-	for _, tc := range []struct{ root, want int }{{500, 501}, {600, 600}} {
+	for _, tc := range []struct{ root, want int }{{500, 501}, {600, 600}, {700, 701}} {
 		wrapped := startAntigravityQuotaCapture("wrapped run")
 		wrapped.SetStarted("bash", tc.root)
 		if got := pidOf(wrapped); got != tc.want {
@@ -1073,6 +1075,38 @@ func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
 			t.Errorf("the wrapper shell %d was recorded as the managed agy", tc.root)
 		}
 		helperStopCapture(t, wrapped.Finish)
+	}
+}
+
+// The resolver takes agy under either supported name, and nothing that merely
+// starts the same way.
+func TestIsAntigravityProcessName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"agy": true, "agy.exe": true, "AGY.EXE": true,
+		"antigravity": true, "Antigravity.exe": true,
+		"agy-helper.exe": false, "antigravity-updater": false, "powershell.exe": false, "": false,
+	} {
+		if got := isAntigravityProcessName(name); got != want {
+			t.Errorf("isAntigravityProcessName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// Every spawn site that can start a wrapper hands the capture the started
+// command through SetStarted, so a shell is resolved rather than recorded as
+// agy. Only the native path, which always execs agy itself, calls SetPID.
+func TestAntigravityCaptureSpawnSitesUseSetStarted(t *testing.T) {
+	for _, file := range []string{"session.go", "pty_session_unix.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if !strings.Contains(string(src), ".SetStarted(") {
+			t.Errorf("%s no longer hands its started child to SetStarted", file)
+		}
+		if strings.Contains(string(src), ".SetPID(") {
+			t.Errorf("%s calls SetPID directly, recording a possible wrapper as agy", file)
+		}
 	}
 }
 

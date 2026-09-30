@@ -54,9 +54,9 @@ const (
 	cliProcessWMICWhere = `name="claude.exe" or name="codex.exe" or name="agy.exe" or name="grok.exe"`
 	// ancestryProcessFilter / ancestryProcessWMICWhere are what a wrapped
 	// Antigravity run's tree can hold: the PowerShell / cmd intermediates and
-	// agy itself.
-	ancestryProcessFilter    = `Name='powershell.exe' OR Name='pwsh.exe' OR Name='cmd.exe' OR Name='agy.exe'`
-	ancestryProcessWMICWhere = `name="powershell.exe" or name="pwsh.exe" or name="cmd.exe" or name="agy.exe"`
+	// agy itself, under either of its names.
+	ancestryProcessFilter    = `Name='powershell.exe' OR Name='pwsh.exe' OR Name='cmd.exe' OR Name='agy.exe' OR Name='antigravity.exe'`
+	ancestryProcessWMICWhere = `name="powershell.exe" or name="pwsh.exe" or name="cmd.exe" or name="agy.exe" or name="antigravity.exe"`
 	// ancestryMaxDepth: the wrapper's child, a file-mode launcher's grandchild,
 	// and one more level of shell.
 	ancestryMaxDepth = 3

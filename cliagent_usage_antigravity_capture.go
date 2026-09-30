@@ -275,10 +275,16 @@ func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struc
 	}
 }
 
-// isAntigravityProcessName reports whether a scanned process image is agy:
-// agy.exe on Windows, agy elsewhere.
+// isAntigravityProcessName reports whether a scanned process image is agy
+// under either name isAntigravityCommand accepts (agy, antigravity; .exe on
+// Windows). An exact match, not that classifier's prefix: a scanned tree can
+// hold unrelated processes whose names merely start the same way.
 func isAntigravityProcessName(name string) bool {
-	return strings.EqualFold(name, "agy.exe") || strings.EqualFold(name, "agy")
+	switch strings.TrimSuffix(strings.ToLower(name), ".exe") {
+	case "agy", "antigravity":
+		return true
+	}
+	return false
 }
 
 // SetStarted hands a started child to the capture: its PID when the child is
