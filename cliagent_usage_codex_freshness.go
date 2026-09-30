@@ -1959,8 +1959,6 @@ func codexLiveReadRetryKind(outcome string, settled bool) codexRunDebtRetryKind 
 		}
 		// It reached OpenAI, so it costs a read exactly like a failed one.
 		return codexRetryAfterRead
-	case liveProbeOutcomeNotMerged:
-		return codexRetryAfterRead
 	case liveProbeOutcomeCooldown:
 		return codexRetrySpacing
 	}
@@ -2229,7 +2227,8 @@ func codexResolveOutstandingFallback(fp string, booked bool) {
 
 // codexReconcileResult is what one rollout reconcile hands the parser.
 type codexReconcileResult struct {
-	metrics           []cliAgentUsageMetric
+	// No metrics: the parser re-reads them with their capture generation
+	// (codexMetricsAndGenerationFromCache), so both describe one snapshot.
 	limit             codexUsageLimitEvidence
 	latestObservation time.Time
 	// rollouts is what the pass saw of the rollout tree: the newest
@@ -2249,8 +2248,8 @@ func codexRunGatedReconcile(ctx context.Context, base, fp string, floor time.Tim
 		return codexReconcileResult{}, false, busy, wait
 	}
 	defer codexUsageRefresh.finish(fp, done)
-	metrics, limit, latest, rollouts := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}, true, nil, 0
+	_, limit, latest, rollouts := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
+	return codexReconcileResult{limit: limit, latestObservation: latest, rollouts: rollouts}, true, nil, 0
 }
 
 // payOwedCodexUsageRefresh pays, once, a debt the previous agent process left
@@ -2480,8 +2479,8 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 			}
 		}
 	}
-	metrics, limit, latest, rollouts := codexReconcileFromRollout(ctx, base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}
+	_, limit, latest, rollouts := codexReconcileFromRollout(ctx, base, fp, now)
+	return codexReconcileResult{limit: limit, latestObservation: latest, rollouts: rollouts}
 }
 
 // codexStaleRunNotice explains a card whose newest observation predates the

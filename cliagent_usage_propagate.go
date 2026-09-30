@@ -348,16 +348,19 @@ func (p *cliUsagePropagatorState) sendDue() {
 		p.mu.Unlock()
 		return
 	}
-	agentID, secret := p.cfg.usageHintCredentials()
+	cfg, provider, generation, followUp, ctx := p.cfg, p.pendingProvider, *p.pending, p.followUp, p.ctx
+	p.mu.Unlock()
+
+	// Read outside mu: configPersistenceMu is held across config file writes.
+	agentID, secret := cfg.usageHintCredentials()
 	baseURL := getRegistrationURL()
 	if agentID == "" || secret == "" || baseURL == "" {
 		logCLIUsageHint("skipped_unregistered")
+		p.mu.Lock()
 		p.armLocked(cliUsageHintSpacing)
 		p.mu.Unlock()
 		return
 	}
-	provider, generation, followUp, ctx := p.pendingProvider, *p.pending, p.followUp, p.ctx
-	p.mu.Unlock()
 
 	timestamp := time.Now().UnixMilli()
 	status := sendCLIUsageObservedHint(ctx, fmt.Sprintf("%s/device/%s/cli-usage/observed", baseURL, agentID), cliUsageObservedHint{
