@@ -5327,26 +5327,16 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		return runEncodedPowerShellCommand(encoded, workDir, timeout)
 	}
 
-	// Non-PowerShell commands. Two command lines: classifyLine (the original
-	// name) drives every routing decision, and cmdLine (the name to launch) is
-	// what the transports run. They differ only when preferBatchShim swaps a
-	// bare name for its .cmd/.bat shim (`npm` -> `npm.cmd`), so PowerShell never
-	// loads npm.ps1 under a restrictive execution policy. `npm test` is still a
-	// test runner, but it runs as `npm.cmd test`.
+	// Non-PowerShell commands. classifyLine (the original name) drives every
+	// routing decision below.
 	classifyLine := buildPowerShellCommandLine(cmd, args)
-	cmdLine := classifyLine
-	if launch := preferBatchShim(cmd, args); launch != cmd {
-		fmt.Printf("%s[aiexpedite] Launching %s instead of %s (skips its .ps1 under a restrictive execution policy)%s\n",
-			colorCyan, launch, cmd, colorReset)
-		cmdLine = buildPowerShellCommandLine(launch, args)
-	}
 
 	// CLI coding agents (claude, codex) use interactive/streaming output
 	// that doesn't work with persistent PowerShell stdin pipes.
 	// Always spawn a new powershell.exe process for these commands.
-	// This branch launches from the original name, never the shim:
-	// cachedResolveClaudePath rewrites the first len("claude") characters of the
-	// line. It relies on the host's process-scoped execution-policy bypass.
+	// This branch runs before shim resolution and launches from the original
+	// name: cachedResolveClaudePath rewrites the first len("claude") characters
+	// of the line. It relies on the host's process-scoped execution-policy bypass.
 	cmdLower := strings.ToLower(cmd)
 	isCLIAgent := cmdLower == "claude" || cmdLower == "codex"
 	if isCLIAgent {
@@ -5362,6 +5352,18 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 			}
 		}
 		return runLocalCommandFallbackFn(agentLine, workDir, timeout)
+	}
+
+	// cmdLine is what every remaining transport runs. It differs from
+	// classifyLine only when preferBatchShim swaps a bare name for its .cmd/.bat
+	// shim (`npm` -> `npm.cmd`), so PowerShell never loads npm.ps1 under a
+	// restrictive execution policy. `npm test` is still a test runner, but it
+	// runs as `npm.cmd test`.
+	cmdLine := classifyLine
+	if launch := preferBatchShim(cmd, args); launch != cmd {
+		fmt.Printf("%s[aiexpedite] Launching %s instead of %s (skips its .ps1 under a restrictive execution policy)%s\n",
+			colorCyan, launch, cmd, colorReset)
+		cmdLine = buildPowerShellCommandLine(launch, args)
 	}
 
 	// Test runners need per-command non-interactive defaults (CI=1,

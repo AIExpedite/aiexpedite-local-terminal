@@ -107,6 +107,13 @@ func TestRunLocalCommandWindows_CLIAgentNeverRewritten(t *testing.T) {
 		"claude": `C:\Users\u\AppData\Roaming\npm\claude.cmd`,
 		"codex":  `C:\Users\u\AppData\Roaming\npm\codex.cmd`,
 	})
+	// The CLI-agent branch runs before shim resolution: no wasted PATH lookup
+	// and no misleading "Launching claude.cmd" log line.
+	stubbed := lookPathFn
+	lookPathFn = func(name string) (string, error) {
+		t.Errorf("preferBatchShim must not run for CLI agents; looked up %q", name)
+		return stubbed(name)
+	}
 	lines := withSpiedFallback(t)
 	// The claude branch memoizes its resolved path; don't leak it to other tests.
 	resetCachedClaudePath()
