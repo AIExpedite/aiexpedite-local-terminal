@@ -187,8 +187,11 @@ var antigravityLogIndex = struct {
 	processOnly []*antigravityProcessOnly
 	sentinel    *antigravitySentinel
 	ownRunning  int
-	ownPIDs     []int
-	managedPIDs []int
+	// ownPIDs and managedPIDs remember recent own and managed agy processes
+	// with their start tokens, so a PID the OS later reuses for a user's agy
+	// is not mistaken for ours.
+	ownPIDs     []antigravityTrackedPID
+	managedPIDs []antigravityTrackedPID
 	// pendingOwed is the newest owe-ready floor no reading has covered yet.
 	pendingOwed time.Time
 }{
@@ -406,8 +409,9 @@ func (c *antigravityOwnChild) setPID(pid int) {
 		return
 	}
 	c.pid.Store(int64(pid))
+	known := antigravityRememberedPID(pid)
 	lockAntigravityLogIndex()
-	antigravityLogIndex.ownPIDs = antigravityPushPID(antigravityLogIndex.ownPIDs, pid)
+	antigravityLogIndex.ownPIDs = antigravityPushPID(antigravityLogIndex.ownPIDs, known)
 	unlockAntigravityLogIndex()
 }
 
@@ -500,31 +504,81 @@ func noteAntigravityManagedPID(pid int) {
 	if pid <= 0 {
 		return
 	}
+	known := antigravityRememberedPID(pid)
 	lockAntigravityLogIndex()
-	antigravityLogIndex.managedPIDs = antigravityPushPID(antigravityLogIndex.managedPIDs, pid)
+	antigravityLogIndex.managedPIDs = antigravityPushPID(antigravityLogIndex.managedPIDs, known)
 	unlockAntigravityLogIndex()
 }
 
-func antigravityPushPID(ring []int, pid int) []int {
-	for _, known := range ring {
-		if known == pid {
-			return ring
+// antigravityRememberedPID pairs a just-started PID with its start token ("" when
+// it cannot be read). Called before the index lock is taken.
+func antigravityRememberedPID(pid int) antigravityTrackedPID {
+	return antigravityTrackedPID{pid: pid, token: antigravityCurrentStartToken(pid)}
+}
+
+// antigravityCurrentStartToken is the start token of the process holding pid
+// now, or "" when it cannot be read (gone, or no access).
+func antigravityCurrentStartToken(pid int) string {
+	token, err := antigravityProcessStartToken(pid)
+	if err != nil {
+		return ""
+	}
+	return token
+}
+
+// antigravityPushPID remembers p, replacing an older entry for the same PID
+// (the OS reused it for another own or managed run).
+func antigravityPushPID(ring []antigravityTrackedPID, p antigravityTrackedPID) []antigravityTrackedPID {
+	for i, known := range ring {
+		if known.pid == p.pid {
+			ring = append(ring[:i], ring[i+1:]...)
+			break
 		}
 	}
-	ring = append(ring, pid)
+	ring = append(ring, p)
 	if len(ring) > antigravityKnownPIDCap {
 		ring = ring[len(ring)-antigravityKnownPIDCap:]
 	}
 	return ring
 }
 
-func antigravityPIDIn(ring []int, pid int) bool {
+// antigravityPIDIn reports whether pid is the remembered process. token is the
+// start token of the process holding pid now ("" = unknown). Two known tokens
+// that differ mean the OS reused the PID for another process, which is not
+// ours; an unknown token on either side keeps the PID-only match.
+func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string) bool {
 	for _, known := range ring {
-		if known == pid {
-			return true
+		if known.pid == pid {
+			return known.token == "" || token == "" || known.token == token
 		}
 	}
 	return false
+}
+
+// antigravityPIDRememberedLocked reports whether any remembered own or managed
+// entry carries pid, whatever its start token.
+func antigravityPIDRememberedLocked(pid int) bool {
+	idx := &antigravityLogIndex
+	for _, ring := range [][]antigravityTrackedPID{idx.ownPIDs, idx.managedPIDs} {
+		for _, known := range ring {
+			if known.pid == pid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// antigravityOwnOrManagedNowLocked reports whether the live process holding pid
+// is a remembered own or managed run. Its start token is read only when the
+// PID is remembered at all.
+func antigravityOwnOrManagedNowLocked(pid int) bool {
+	if !antigravityPIDRememberedLocked(pid) {
+		return false
+	}
+	idx := &antigravityLogIndex
+	token := antigravityCurrentStartToken(pid)
+	return antigravityPIDIn(idx.ownPIDs, pid, token) || antigravityPIDIn(idx.managedPIDs, pid, token)
 }
 
 /* ─────────────────────────── process start hook ─────────────────────────── */
@@ -726,14 +780,24 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 	overflow := false
 	allOwn := true
 	for _, pid := range pids {
-		if antigravityPIDIn(idx.ownPIDs, pid) {
+		// The start token tells a remembered own or managed process from a
+		// user's run the OS gave the same PID.
+		known := antigravityTrackedFind(entry.pids, pid)
+		token, looked := "", false
+		switch {
+		case known != nil:
+			token = known.token
+		case antigravityPIDRememberedLocked(pid):
+			token, looked = antigravityCurrentStartToken(pid), true
+		}
+		if antigravityPIDIn(idx.ownPIDs, pid, token) {
 			continue
 		}
 		allOwn = false
-		if antigravityPIDIn(idx.managedPIDs, pid) {
+		if antigravityPIDIn(idx.managedPIDs, pid, token) {
 			continue
 		}
-		if known := antigravityTrackedFind(entry.pids, pid); known != nil {
+		if known != nil {
 			foreign = append(foreign, *known)
 			continue
 		}
@@ -741,9 +805,8 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 			overflow = true
 			continue
 		}
-		token, err := antigravityProcessStartToken(pid)
-		if err != nil {
-			token = ""
+		if !looked {
+			token = antigravityCurrentStartToken(pid)
 		}
 		foreign = append(foreign, antigravityTrackedPID{pid: pid, token: token})
 	}
@@ -848,7 +911,7 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 	// candidate: that run's own settle covers it.
 	kept := entry.pids[:0]
 	for _, p := range entry.pids {
-		if !antigravityPIDIn(idx.managedPIDs, p.pid) && !antigravityPIDIn(idx.ownPIDs, p.pid) {
+		if !antigravityPIDIn(idx.managedPIDs, p.pid, p.token) && !antigravityPIDIn(idx.ownPIDs, p.pid, p.token) {
 			kept = append(kept, p)
 		}
 	}
@@ -1246,7 +1309,7 @@ func antigravityCheckSentinel(now time.Time) {
 		untracked := false
 		for _, p := range procs {
 			if !strings.HasPrefix(strings.ToLower(p.Name), "agy") ||
-				antigravityPIDIn(idx.ownPIDs, p.PID) || antigravityPIDIn(idx.managedPIDs, p.PID) ||
+				antigravityOwnOrManagedNowLocked(p.PID) ||
 				globalProcessRegistry.IsRegistered(p.PID) || globalProcessRegistry.IsRegistered(p.ParentPID) {
 				continue
 			}
@@ -1291,10 +1354,9 @@ func antigravityStartupScan(now time.Time) (antigravityDiscoveryResult, bool) {
 	res := antigravityDiscoveryPass(antigravityQuotaBases(home), now, cachedAntigravityObservedMs())
 	if procs, ok := antigravityProcessScan(); ok {
 		lockAntigravityLogIndex()
-		idx := &antigravityLogIndex
 		for _, p := range procs {
 			if !strings.HasPrefix(strings.ToLower(p.Name), "agy") ||
-				antigravityPIDIn(idx.ownPIDs, p.PID) || antigravityPIDIn(idx.managedPIDs, p.PID) ||
+				antigravityOwnOrManagedNowLocked(p.PID) ||
 				globalProcessRegistry.IsRegistered(p.PID) || globalProcessRegistry.IsRegistered(p.ParentPID) {
 				continue
 			}

@@ -2630,11 +2630,11 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	}
 	// Do not arm until Start succeeds. Arming in runLocalCommand made the
 	// immediate probe race ahead of the child and also created a capture for a
-	// command that never spawned at all. The capture holds the child's PID
-	// (agy itself for a direct `agy …`; a `bash -c` wrapper's PID otherwise).
+	// command that never spawned at all. The capture holds agy's PID: the
+	// child's own for a direct `agy …`, resolved from a `bash -c` wrapper.
 	capture := armAntigravityCaptureForCommand("local execute", cmd, args)
 	if c.Process != nil {
-		capture.SetPID(c.Process.Pid)
+		capture.SetStarted(cmd, c.Process.Pid)
 	}
 	defer capture.Finish()
 	err := c.Wait()

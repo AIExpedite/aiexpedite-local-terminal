@@ -581,7 +581,7 @@ func TestDiscoverAntigravityModels_RegistersAnOwnChild(t *testing.T) {
 	}
 	discoverCLIAgentModels(context.Background(), "antigravity", detectedCLIAgent{Path: "agy"}, t.TempDir())
 	lockAntigravityLogIndex()
-	recorded := antigravityPIDIn(antigravityLogIndex.ownPIDs, 4242)
+	recorded := antigravityPIDIn(antigravityLogIndex.ownPIDs, 4242, "")
 	unlockAntigravityLogIndex()
 	if hooked != 1 || !recorded {
 		t.Errorf("hooked=%d recorded=%v, want the runner's start hook to record the child", hooked, recorded)

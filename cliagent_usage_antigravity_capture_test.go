@@ -951,7 +951,7 @@ func TestAntigravityRunCapture_ResolvesTheWrappedAgy(t *testing.T) {
 		t.Error("the resolver kept scanning after resolving")
 	}
 	lockAntigravityLogIndex()
-	managed := antigravityPIDIn(antigravityLogIndex.managedPIDs, 303)
+	managed := antigravityPIDIn(antigravityLogIndex.managedPIDs, 303, "")
 	unlockAntigravityLogIndex()
 	if !managed {
 		t.Error("the resolved agy was not marked managed")
@@ -975,5 +975,61 @@ func TestAntigravityRunCapture_ResolverBudget(t *testing.T) {
 	helperStopCapture(t, capture.Finish)
 	if got := scans.Load(); got != 4 {
 		t.Errorf("scans=%d, want the budget of 4", got)
+	}
+}
+
+// A spawn site hands SetStarted the child it started: a direct `agy` is the
+// run's PID at once, with no scan; a shell wrapper is walked, and a Unix shell
+// that exec'd agy in place resolves to the wrapper PID itself.
+func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	origScan, origEvery := antigravityAncestryScan, antigravityWrapperScanEvery
+	defer func() { antigravityAncestryScan, antigravityWrapperScanEvery = origScan, origEvery }()
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+	var scans atomic.Int64
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		scans.Add(1)
+		switch root {
+		case 500: // `bash -c "cd x && agy …"`: the shell forks agy
+			return []ProcessInfo{{PID: 500, Name: "bash"}, {PID: 501, ParentPID: 500, Name: "agy"}}, true
+		case 600: // `bash -c "agy …"`: the shell execs agy in place
+			return []ProcessInfo{{PID: 600, Name: "agy"}}, true
+		}
+		return nil, true
+	}
+	pidOf := func(c *antigravityRunCapture) int {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			c.mu.Lock()
+			pid := c.pid
+			c.mu.Unlock()
+			if pid != 0 {
+				return pid
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return 0
+	}
+
+	direct := startAntigravityQuotaCapture("direct run")
+	direct.SetStarted("/usr/local/bin/agy", 400)
+	if got := pidOf(direct); got != 400 || scans.Load() != 0 {
+		t.Errorf("direct agy pid=%d scans=%d, want 400 with no scan", got, scans.Load())
+	}
+	helperStopCapture(t, direct.Finish)
+
+	for _, tc := range []struct{ root, want int }{{500, 501}, {600, 600}} {
+		wrapped := startAntigravityQuotaCapture("wrapped run")
+		wrapped.SetStarted("bash", tc.root)
+		if got := pidOf(wrapped); got != tc.want {
+			t.Errorf("wrapper %d resolved pid=%d, want %d", tc.root, got, tc.want)
+		}
+		lockAntigravityLogIndex()
+		wrapperManaged := tc.root != tc.want && antigravityPIDIn(antigravityLogIndex.managedPIDs, tc.root, "")
+		unlockAntigravityLogIndex()
+		if wrapperManaged {
+			t.Errorf("the wrapper shell %d was recorded as the managed agy", tc.root)
+		}
+		helperStopCapture(t, wrapped.Finish)
 	}
 }

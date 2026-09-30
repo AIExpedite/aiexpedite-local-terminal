@@ -94,14 +94,18 @@ func TestFilterProcessAncestry(t *testing.T) {
 	}
 }
 
-// On every platform but Windows the checked scans are unavailable — never an
-// empty ok result.
+// On every platform but Windows the checked CLI scan is unavailable — never an
+// empty ok result. So is the ancestry scan, except on Linux and macOS
+// (processes_ancestry_unix_test.go).
 func TestScanChecked_UnavailableOffWindows(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("covered by the Windows backend tests")
 	}
 	if procs, ok := ScanCLIProcessesChecked(); ok || procs != nil {
 		t.Errorf("ScanCLIProcessesChecked=(%v,%v), want (nil,false)", procs, ok)
+	}
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		return
 	}
 	if procs, ok := ScanProcessAncestryChecked(1); ok || procs != nil {
 		t.Errorf("ScanProcessAncestryChecked=(%v,%v), want (nil,false)", procs, ok)

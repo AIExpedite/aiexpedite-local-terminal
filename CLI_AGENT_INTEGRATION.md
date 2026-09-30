@@ -1409,7 +1409,9 @@ can.
   SOLE PID block is the child's and its `{size, mtime}` did not change while it
   was read. While an own child runs, `ParseContext` skips the missed-run
   diagnostic and the nudge, and the nudge returns without stamping its
-  cooldown.
+  cooldown. The index remembers the last 64 own and 64 managed PIDs with their
+  start tokens, so a PID the OS reuses for a user's `agy` reads as a direct run,
+  not as ours; an unreadable token on either side falls back to the PID.
 - **Discovery tick.** One process-wide 60 s timer (`startAntigravityDiscovery`,
   from `StartAgent`; stopped by `gracefulShutdown`) runs while `agy` is
   installed. Each tick lists names only, per base, and classifies the names the
@@ -1450,18 +1452,22 @@ can.
   processes_parse.go) return `ok=false` for a failed query: PowerShell must
   print the `AIX_SCAN_OK` trailer from inside `try { … -ErrorAction Stop }`;
   WMIC's CSV header or `No Instance(s) Available.` is a valid empty result
-  whatever its exit code; no backend, and every non-Windows platform, is never
-  ok. `ScanCLIProcesses` wraps the checked scan, so the orphan scanner's
-  allowlist is unchanged.
+  whatever its exit code; no backend is never ok. Off Windows,
+  `ScanCLIProcessesChecked` is never ok; `ScanProcessAncestryChecked` reads
+  `/proc` on Linux and `sysctl kern.proc.all` on macOS
+  (processes_ancestry_*.go) and lists the root itself first, since a POSIX
+  shell given one simple command execs it in place. `ScanCLIProcesses` wraps
+  the checked scan, so the orphan scanner's allowlist is unchanged.
 - **Capture handle.** `startAntigravityQuotaCapture` /
   `armAntigravityCaptureForCommand` return `*antigravityRunCapture` (nil for a
-  command that is not agy; every method of a nil handle is a no-op). Native,
-  pipe-session, PTY and Unix execute call `SetPID(cmd.Process.Pid)` after
-  Start; the wrapped Windows chain (`runLocalCommandWindows`: encoded, file-mode,
+  command that is not agy; every method of a nil handle is a no-op). Native and
+  pipe-session call `SetPID(cmd.Process.Pid)` after Start. PTY and Unix execute
+  call `SetStarted(cmd, pid)`: `SetPID` for a direct `agy`, `SetWrapper` for a
+  shell wrapper such as `bash -c "agy …"`. The wrapped Windows chain (`runLocalCommandWindows`: encoded, file-mode,
   shell, fallback and the persistent host via `HostPID`) calls
   `SetWrapper(pid)` as each transport starts. The wrapper resolver scans the
   wrapper's tree every 5 s, at most 60 times, only while the command runs,
-  takes the first `agy.exe` within 3 levels whose start is not before the
+  takes the first `agy.exe` (`agy` off Windows) within 3 levels whose start is not before the
   capture floor (the persistent host outlives every command), marks it managed
   and stops. `Finish` stops it and settles with the PID.
 - **Managed-run evidence (in memory only).** The settle reads the run's OWN

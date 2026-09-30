@@ -25,11 +25,13 @@
 //   - runLocalCommandWindows (pubsub.go)            — the wrapped Windows transport
 //     chain, armed at function ENTRY because no single post-Start hook exists there
 //
-// Each arm returns an *antigravityRunCapture that owns the run's agy PID: the
-// first four sites call SetPID after Start; the Windows chain hands every
-// transport's wrapper PID to SetWrapper, whose resolver finds the agy process
-// that wrapper runs. Finish settles the run with that PID, so the settle can
-// read the run's OWN log block (cliagent_usage_antigravity_log_index.go).
+// Each arm returns an *antigravityRunCapture that owns the run's agy PID: a
+// site that started agy itself calls SetPID after Start; a site that started a
+// shell wrapper (`bash -c "agy …"` on the PTY and Unix execute paths, and every
+// transport of the Windows chain) hands the wrapper PID to SetWrapper, whose
+// resolver finds the agy process that wrapper runs. Finish settles the run
+// with that PID, so the settle can read the run's OWN log block
+// (cliagent_usage_antigravity_log_index.go).
 //
 // Cost discipline matters because this runs on the user's machine while they are
 // working, and the expensive part of a probe is log scanning
@@ -198,7 +200,8 @@ func (c *antigravityRunCapture) SetPID(pid int) {
 // SetWrapper starts (or re-roots, for a transport that failed over) the
 // resolver that finds the agy process a wrapper started: a PowerShell, pwsh or
 // cmd process on the Windows execute chain, the persistent PowerShell host
-// included. Descendants that started before the capture floor are never taken
+// included, or a POSIX shell on the PTY and Unix execute paths (which may exec
+// agy in place, so the Unix scan includes the wrapper itself). Descendants that started before the capture floor are never taken
 // (the persistent host outlives every command it runs).
 func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	if c == nil || wrapperPID <= 0 {
@@ -237,7 +240,7 @@ func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struc
 			continue
 		}
 		for _, p := range procs {
-			if !strings.EqualFold(p.Name, "agy.exe") {
+			if !isAntigravityProcessName(p.Name) {
 				continue
 			}
 			if !p.StartTime.IsZero() && p.StartTime.Before(notBefore) {
@@ -247,6 +250,22 @@ func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struc
 			return
 		}
 	}
+}
+
+// isAntigravityProcessName reports whether a scanned process image is agy:
+// agy.exe on Windows, agy elsewhere.
+func isAntigravityProcessName(name string) bool {
+	return strings.EqualFold(name, "agy.exe") || strings.EqualFold(name, "agy")
+}
+
+// SetStarted hands a started child to the capture: its PID when the child is
+// agy itself, otherwise the wrapper PID for the resolver to walk.
+func (c *antigravityRunCapture) SetStarted(cmd string, pid int) {
+	if isAntigravityCommand(cmd) {
+		c.SetPID(pid)
+		return
+	}
+	c.SetWrapper(pid)
 }
 
 // Finish ends the run: stops the resolver, releases the poller and settles the

@@ -384,6 +384,66 @@ func TestAntigravityCandidate_ManagedPIDIsNotACandidate(t *testing.T) {
 	}
 }
 
+// A remembered own or managed PID that the OS reuses for a user's agy is a
+// direct run: the start token, not the bare PID, decides.
+func TestAntigravityCandidate_ReusedRememberedPIDIsADirectRun(t *testing.T) {
+	for _, kind := range []string{"own", "managed"} {
+		t.Run(kind, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			var mu sync.Mutex
+			tokens := map[int]string{7101: "start-a"}
+			antigravityProcessStartToken = func(pid int) (string, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				if token, ok := tokens[pid]; ok {
+					return token, nil
+				}
+				return "", fmt.Errorf("no such process")
+			}
+			antigravityCandidateProbe = func(pid int, token string) processProbeResult {
+				mu.Lock()
+				defer mu.Unlock()
+				if token != "" && tokens[pid] == token {
+					return processOurs
+				}
+				return processGone
+			}
+			setToken := func(token string) {
+				mu.Lock()
+				defer mu.Unlock()
+				if token == "" {
+					delete(tokens, 7101)
+					return
+				}
+				tokens[7101] = token
+			}
+
+			if kind == "own" {
+				child := beginAntigravityOwnChild(h.home)
+				child.setPID(7101)
+				child.done()
+			} else {
+				noteAntigravityManagedPID(7101)
+			}
+			// The remembered process exits and the OS hands its PID to a
+			// user-started agy.
+			setToken("start-b")
+			now := time.Now().Add(-time.Hour)
+			path := h.write(t, helperLogName(now), helperPIDBlock(7101), now, false)
+			if res := h.pass(now.Add(30*time.Second), 0); !res.owed.IsZero() {
+				t.Fatalf("owed=%s while the user's run is live", res.owed)
+			}
+			if class, _ := helperEntryClass(path); class != antigravityLogCandidate {
+				t.Fatalf("class=%v, want the reused PID's log to be a direct-run candidate", class)
+			}
+			setToken("")
+			if res := h.pass(now.Add(5*time.Minute), 0); res.owed.IsZero() {
+				t.Error("the user's run on a reused PID was never owed after it exited")
+			}
+		})
+	}
+}
+
 /* ─────────────────────────── reclassification ─────────────────────────── */
 
 // DirectRunAppendedToOwnedLog: a direct run started in the same second as an
