@@ -1439,6 +1439,50 @@ func TestAntigravityFreshness_ARetainedFloorKeepsTheAccountThatOwnsIt(t *testing
 	}
 }
 
+// The same retention, with the older settle landing in the gap a concurrent
+// one can: right after the newer settle's debt update released the freshness
+// lock. The newer generation's owner must already be published by then, or the
+// older settle retains the generation with no owner and the debt falls back to
+// time-only coverage.
+func TestAntigravityFreshness_ARetainedFloorOwnerIsPublishedWithTheDebt(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	started := time.Now().Truncate(time.Second)
+	olderDone, newerDone := started.Add(time.Minute), started.Add(70*time.Second)
+	older, newer := started, started.Add(time.Second)
+	h.write(t, helperLogName(older),
+		helperPIDBlock(60411)+"authenticated successfully as ada@example.com\n", older, false)
+	h.write(t, helperLogName(newer),
+		helperPIDBlock(60412)+"authenticated successfully as bob@example.com\n", newer, false)
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	// Fires once, for the newer settle; the older settle it runs calls the
+	// hook again and must fall through (a sync.Once would deadlock re-entered).
+	fired := false
+	antigravitySettleUpdatedHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		antigravityUsageFreshnessNow = func() time.Time { return olderDone }
+		antigravityUsageRunSettled(older, 60411, false, true)
+	}
+	t.Cleanup(func() { antigravitySettleUpdatedHook = nil })
+
+	antigravityUsageFreshnessNow = func() time.Time { return newerDone }
+	antigravityUsageRunSettled(newer, 60412, false, true)
+	antigravityUsageRefreshWaitIdle()
+
+	state := helperFreshnessState(t)
+	if state.RefreshOwedFloorMs != newerDone.UnixMilli() {
+		t.Fatalf("floor=%d, want the newer completion %d retained (state=%+v)",
+			state.RefreshOwedFloorMs, newerDone.UnixMilli(), state)
+	}
+	wantBob := fingerprintAccount("antigravity", "bob@example.com")
+	if got := antigravityDebtAccountFor(state.debtID()); got != wantBob {
+		t.Fatalf("debt account=%q, want the retained floor's own login %q", got, wantBob)
+	}
+}
+
 // Every route that lands a reading reaches settleAntigravityRunFreshness, so
 // the account-aware rule the settle and the worker apply has to hold here too:
 // a snapshot written for another login, stamped past the floor, must not retire

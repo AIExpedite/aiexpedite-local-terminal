@@ -509,18 +509,13 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 		return
 	}
 
-	var (
-		// priorID is the generation this settle found, and ownsFloor says the
-		// floor it leaves behind is THIS run's completion rather than a newer
-		// run's that was already pending. Read inside the closure so both come
-		// from the same locked view of the state the update rewrote.
-		priorID   antigravityDebtID
-		ownsFloor bool
-	)
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
-		priorID = state.debtID()
-		ownsFloor = state.RefreshOwedAtMs == 0 || completionMs > state.RefreshOwedFloorMs
+		// priorID is the generation this settle found, and ownsFloor says the
+		// floor it leaves behind is THIS run's completion rather than a newer
+		// run's that was already pending.
+		priorID := state.debtID()
+		ownsFloor := state.RefreshOwedAtMs == 0 || completionMs > state.RefreshOwedFloorMs
 		owedFloorMs := completionMs
 		if state.RefreshOwedFloorMs > owedFloorMs {
 			// One pending debt at a time: a reading that covers the newest
@@ -538,24 +533,34 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 		if state.RunFloorMs < owedFloorMs {
 			state.RunFloorMs = owedFloorMs
 		}
+		// The generation this run just created is the one the worker must keep
+		// scoped to this run's login. In memory only: the state file keeps its
+		// fields, and a generation nobody remembers falls back to time alone.
+		//
+		// When this settle did NOT advance the floor — two differently
+		// authenticated runs settling concurrently, and the NEWER completion
+		// got its debt in first — the pending debt still asks for that newer
+		// run's reading, so it must keep that run's login. Naming this (older)
+		// run's account instead would have the worker test the newer floor
+		// against the wrong identity: it would ignore the snapshot that
+		// actually covers it, and accept one that does not. An account nobody
+		// remembers for the retained generation falls back to the time-only
+		// rule, as a restart's would.
+		//
+		// Published here, under the freshness lock, so a generation and its
+		// owner become visible together: a concurrent settle that retains this
+		// generation can never read it before its owner is recorded and carry
+		// "" forward over it. antigravityDebtAccount is a leaf lock (see
+		// settleAntigravityRunFreshness), so this adds no lock order.
+		debtAccount := account
+		if !ownsFloor {
+			debtAccount = antigravityDebtAccountFor(priorID)
+		}
+		noteAntigravityDebtAccount(state.debtID(), debtAccount)
 	})
-	// The generation this run just created is the one the worker must keep
-	// scoped to this run's login. In memory only: the state file keeps its
-	// fields, and a generation nobody remembers falls back to time alone.
-	//
-	// When this settle did NOT advance the floor — two differently
-	// authenticated runs settling concurrently, and the NEWER completion got
-	// its debt in first — the pending debt still asks for that newer run's
-	// reading, so it must keep that run's login. Naming this (older) run's
-	// account instead would have the worker test the newer floor against the
-	// wrong identity: it would ignore the snapshot that actually covers it, and
-	// accept one that does not. An account nobody remembers for the retained
-	// generation falls back to the time-only rule, as a restart's would.
-	debtAccount := account
-	if !ownsFloor {
-		debtAccount = antigravityDebtAccountFor(priorID)
+	if antigravitySettleUpdatedHook != nil {
+		antigravitySettleUpdatedHook()
 	}
-	noteAntigravityDebtAccount(state.debtID(), debtAccount)
 	fmt.Printf("%s[antigravity-freshness] Run finished with no reading of its own (owed=true gated=%v attempts=%d)%s\n",
 		colorYellow, gated, state.Attempts, colorReset)
 	antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, false)
@@ -1277,6 +1282,11 @@ var antigravityDebtAccount struct {
 	debtID      antigravityDebtID
 	fingerprint string
 }
+
+// antigravitySettleUpdatedHook, when set, runs right after a settle's debt
+// update releases the freshness lock. Test-only: it lets a test land a second
+// settle exactly where a concurrent one could interleave.
+var antigravitySettleUpdatedHook func()
 
 func noteAntigravityDebtAccount(id antigravityDebtID, fingerprint string) {
 	d := &antigravityDebtAccount
