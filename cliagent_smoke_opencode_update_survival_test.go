@@ -50,7 +50,9 @@ func newOpenCodeUpdateInstall(t *testing.T, version string) openCodeUpdateInstal
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeIdentityFile(t, exe, "")
+	if err := os.MkdirAll(filepath.Dir(exe), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(exe, data, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestOpenCodeSmoke_PreUpdateSmokeDoesNotUpdateAndPostUpdateSmokeTestsTheNewI
 	cmd.Env = append(os.Environ(),
 		"OPENCODE_STUB_SELF_UPDATE="+control.versionFile,
 		"OPENCODE_STUB_SELF_UPDATE_TO="+selfUpdated)
-	cmd.Env = withoutEnvVar(cmd.Env, "OPENCODE_DISABLE_AUTOUPDATE")
+	cmd.Env = stripEnvPrefixes(cmd.Env, []string{"OPENCODE_DISABLE_AUTOUPDATE="})
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("control run failed: %v\n%s", err, out)
 	}
@@ -209,17 +211,4 @@ func openCodeStubRunCount(t *testing.T, runLog string) int {
 		return 0
 	}
 	return strings.Count(string(data), "\n")
-}
-
-// withoutEnvVar drops every entry for key (case-insensitively on Windows).
-func withoutEnvVar(env []string, key string) []string {
-	out := env[:0:0]
-	for _, e := range env {
-		name, _, _ := strings.Cut(e, "=")
-		if name == key || (runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
 }

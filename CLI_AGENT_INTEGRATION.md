@@ -1724,7 +1724,8 @@ the transport change the evidence selects ships separately.
   ([opencode_binary_identity.go](opencode_binary_identity.go)) is a SHA-256 over
   the shim, `node_modules/opencode-ai/package.json` and each `opencode-*`
   platform package manifest nested under it or beside it — at most 8 files of at
-  most 64 KiB, nothing outside the shim's tree, a missing file hashed as a fixed
+  most 64 KiB, only paths inside the shim's tree and only regular files, a
+  missing file hashed as a fixed
   token; a native binary returns `""` (its stat key already changes). It is the
   opencode row's `cliSmokeProvider.identity` hook, folded into the cooldown and
   singleflight stamp (`cliSmokeProviderStamp`) and the shape binding

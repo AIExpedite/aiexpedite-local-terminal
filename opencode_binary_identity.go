@@ -13,7 +13,8 @@
 // `opencode-ai` package and of each `opencode-*` platform package it may
 // resolve, so any npm replacement changes it. Bounded by construction:
 // at most openCodeIdentityMaxFiles files, openCodeIdentityMaxFileBytes each,
-// and no I/O outside the shim's directory tree. A native binary returns "":
+// only paths inside the shim's directory tree, regular files only. A native
+// binary returns "":
 // its own (path, mtime, size) already changes when it is replaced.
 
 package main
@@ -99,8 +100,14 @@ func openCodeShimIdentityFiles(shimPath string) []string {
 }
 
 // openCodeHashIdentityFile writes at most openCodeIdentityMaxFileBytes of
-// file into h, or the missing token when it cannot be opened.
+// file into h, or the missing token when it is not a readable regular file.
+// Only a regular file is opened: a manifest path that resolves (through an npm
+// link) to a FIFO or device could otherwise block the version probe on open.
 func openCodeHashIdentityFile(h io.Writer, file string) {
+	if info, err := os.Stat(file); err != nil || !info.Mode().IsRegular() {
+		_, _ = h.Write(openCodeIdentityMissing)
+		return
+	}
 	f, err := os.Open(file)
 	if err != nil {
 		_, _ = h.Write(openCodeIdentityMissing)

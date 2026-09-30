@@ -78,10 +78,8 @@ func TestRunCLISmoke_OpenCodeCmdShimEchoesTheMarkerThroughCmdExe(t *testing.T) {
 	ordinaryLog := filepath.Join(t.TempDir(), "env-ordinary.log")
 	env := os.Environ()
 	// Drop the pins, and the argv / stdin logs the smoke's assertions below read.
-	for _, key := range []string{"OPENCODE_DISABLE_AUTOUPDATE", "OPENCODE_DISABLE_TERMINAL_TITLE",
-		"OPENCODE_STUB_ARGV_LOG", "OPENCODE_STUB_STDIN_LOG"} {
-		env = withoutEnvVar(env, key)
-	}
+	env = stripEnvPrefixes(env, []string{"OPENCODE_DISABLE_AUTOUPDATE=", "OPENCODE_DISABLE_TERMINAL_TITLE=",
+		"OPENCODE_STUB_ARGV_LOG=", "OPENCODE_STUB_STDIN_LOG="})
 	env = setEnvVar(env, "OPENCODE_STUB_ENV_LOG", ordinaryLog)
 	ordinary, err := newOpenCodeCmd(context.Background(), openCodeLaunch{
 		Path: shim,

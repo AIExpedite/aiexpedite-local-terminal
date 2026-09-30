@@ -196,3 +196,18 @@ func versionProbeKeyFor(t *testing.T, path string) versionProbeKey {
 	}
 	return versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
 }
+
+// Only a regular file is opened: a manifest path that is a directory (or, via an
+// npm link, a FIFO or device) hashes as the missing token rather than being read.
+func TestOpenCodeShimPackageIdentity_ANonRegularManifestIsTheMissingToken(t *testing.T) {
+	root := t.TempDir()
+	shim := filepath.Join(root, "opencode.cmd")
+	writeIdentityFile(t, shim, "@ECHO off\r\n")
+	absent := openCodeShimPackageIdentity(shim)
+	if err := os.MkdirAll(filepath.Join(root, "node_modules", "opencode-ai", "package.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := openCodeShimPackageIdentity(shim); got != absent {
+		t.Fatal("a directory named package.json must hash exactly like a missing manifest")
+	}
+}
