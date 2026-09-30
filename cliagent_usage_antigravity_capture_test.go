@@ -1243,3 +1243,56 @@ func TestAntigravityRunCapture_SupersededResolverRecordsNothing(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A transport that fails after its resolver already found agy is retried on a
+// new wrapper (persistent-host restart, then the fallback). The re-root must
+// drop the failed attempt's PID and resolve the retried agy, or the run that
+// actually completes is never marked managed and its evidence is missed.
+func TestAntigravityRunCapture_ReRootReplacesAResolvedPID(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		switch root {
+		case 900:
+			return []ProcessInfo{{PID: 901, Name: "agy.exe"}}, true
+		case 950:
+			return []ProcessInfo{{PID: 951, Name: "agy.exe"}}, true
+		}
+		return nil, true
+	}
+	waitPID := func(capture *antigravityRunCapture, want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			capture.mu.Lock()
+			pid := capture.pid
+			capture.mu.Unlock()
+			if pid == want {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("capture never resolved pid %d", want)
+	}
+
+	capture := startAntigravityQuotaCapture("failover after resolve")
+	capture.SetWrapper(900)
+	waitPID(capture, 901)
+	capture.SetWrapper(950) // the host failed; the command is retried
+	waitPID(capture, 951)
+
+	at := time.Now().Add(time.Second)
+	lockAntigravityLogIndex()
+	retried := antigravityPIDIn(antigravityLogIndex.managedPIDs, 951, "", time.Time{})
+	failedLive := antigravityPIDIn(antigravityLogIndex.managedPIDs, 901, "", at)
+	unlockAntigravityLogIndex()
+	if !retried {
+		t.Error("the retried agy was not marked managed")
+	}
+	if failedLive {
+		t.Error("the failed attempt's agy is still held as a live managed run")
+	}
+	helperStopCapture(t, capture.Finish)
+}

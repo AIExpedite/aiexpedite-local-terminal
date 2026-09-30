@@ -229,15 +229,22 @@ func (c *antigravityRunCapture) setPID(pid int, fromResolver bool, gen uint64) {
 // included, or a POSIX shell on the PTY and Unix execute paths (which may exec
 // agy in place, so the Unix scan includes the wrapper itself). Descendants that started before the capture floor are never taken
 // (the persistent host outlives every command it runs).
+//
+// A re-root also drops a PID the superseded transport already resolved: the
+// command is being run again, so the retried agy is this run's. The dropped
+// PID leaves the capture the way Finish releases one — handed to discovery if
+// it is still alive, otherwise marked exited.
 func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	if c == nil || wrapperPID <= 0 {
 		return
 	}
 	c.mu.Lock()
-	if c.pid != 0 || c.finished {
+	if c.finished {
 		c.mu.Unlock()
 		return
 	}
+	superseded := c.pid
+	c.pid = 0
 	if c.resolverStop != nil {
 		close(c.resolverStop)
 	}
@@ -246,7 +253,17 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	c.resolverGen++
 	gen := c.resolverGen
 	c.mu.Unlock()
+	releaseAntigravityCapturedPID(superseded, c.floor)
 	go c.resolveWrapper(wrapperPID, gen, stop, done)
+}
+
+// releaseAntigravityCapturedPID lets a capture's agy PID go: a process that
+// outlived its wrapper goes to discovery, anything else is marked exited.
+// Never called with c.mu or the index lock held.
+func releaseAntigravityCapturedPID(pid int, floor time.Time) {
+	if !handOffAntigravityDetachedManagedPID(pid, floor, antigravityUsageFreshnessNow()) {
+		noteAntigravityManagedPIDExited(pid)
+	}
 }
 
 // resolveWrapper scans the wrapper's tree — at once, through the opening ramp,
@@ -352,9 +369,7 @@ func (c *antigravityRunCapture) Finish() {
 		// (`Start-Process agy`, `agy … &`): that process goes to discovery,
 		// which owes its reading and re-reads its block for evidence when it
 		// really exits.
-		if !handOffAntigravityDetachedManagedPID(pid, c.floor, antigravityUsageFreshnessNow()) {
-			noteAntigravityManagedPIDExited(pid)
-		}
+		releaseAntigravityCapturedPID(pid, c.floor)
 
 		if c.polled {
 			antigravityCaptureMu.Lock()
