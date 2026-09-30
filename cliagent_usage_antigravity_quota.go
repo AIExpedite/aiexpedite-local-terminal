@@ -248,17 +248,30 @@ type antigravityRunLog struct {
 // antigravityRunLogs lists base's recent run logs, newest first. `agy` never
 // prunes its logs (thousands on a long-lived device), so only the newest
 // antigravityWatchedNewest names, plus the log index's candidates, are
-// stat'ed — never the whole directory. A missing or unreadable log directory
-// is no logs.
+// stat'ed — never the whole stamped directory. Unstamped (legacy) names sort
+// after every stamped one and carry no time, so they are ranked by mtime and
+// up to antigravityLegacyReadReserve of the newest keep a slot: a live run in
+// a legacy log is not truncated away by older stamped names. A missing or
+// unreadable log directory is no logs.
 func antigravityRunLogs(base string) []antigravityRunLog {
 	names, ok := antigravityListLogNames(base)
 	if !ok {
 		return nil
 	}
-	if len(names) > antigravityWatchedNewest {
-		names = names[:antigravityWatchedNewest]
-	}
 	dir := antigravityLogDir(base)
+	stampedEnd := len(names)
+	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
+		stampedEnd--
+	}
+	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], time.Time{})
+	if len(legacy) > antigravityLegacyReadReserve {
+		legacy = legacy[len(legacy)-antigravityLegacyReadReserve:]
+	}
+	stamped := names[:stampedEnd]
+	if limit := antigravityWatchedNewest - len(legacy); len(stamped) > limit {
+		stamped = stamped[:limit]
+	}
+	names = append(append([]string(nil), stamped...), legacy...)
 	paths := make([]string, 0, len(names)+antigravityCandidateCap)
 	seen := map[string]bool{}
 	for _, name := range names {

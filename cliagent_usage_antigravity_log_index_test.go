@@ -864,6 +864,43 @@ func TestAntigravityLogNames_StampedLeadLegacy(t *testing.T) {
 	}
 }
 
+// A live run in a legacy log keeps a slot in the run-log listing (port
+// discovery) even when the stamped logs alone would fill the newest-N cap;
+// the oldest legacy logs beyond the reserve are not listed.
+func TestAntigravityRunLogs_ReservesSlotsForRecentLegacyLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Truncate(time.Second)
+	for i := 0; i < antigravityWatchedNewest+8; i++ {
+		at := now.Add(-time.Duration(i+2) * time.Hour)
+		h.write(t, helperLogName(at), helperPIDBlock(50300+i), at, false)
+	}
+	for i := 0; i < antigravityLegacyReadReserve+2; i++ {
+		at := now.Add(-time.Duration(100+i) * time.Hour)
+		h.write(t, fmt.Sprintf("legacy-old-%02d.log", i), "", at, false)
+	}
+	live := h.write(t, "legacy-live.log", helperPIDBlock(50399), now, false)
+
+	files := antigravityRunLogs(h.base)
+	if len(files) > antigravityWatchedNewest {
+		t.Errorf("listed %d logs, want at most %d", len(files), antigravityWatchedNewest)
+	}
+	if len(files) == 0 || files[0].path != live {
+		t.Fatalf("files[0]=%v, want the live legacy log first", files)
+	}
+	legacyListed := 0
+	for _, file := range files {
+		if strings.HasPrefix(filepath.Base(file.path), "legacy-") {
+			legacyListed++
+		}
+		if filepath.Base(file.path) == fmt.Sprintf("legacy-old-%02d.log", antigravityLegacyReadReserve+1) {
+			t.Error("the oldest legacy log beyond the reserve was listed")
+		}
+	}
+	if legacyListed != antigravityLegacyReadReserve {
+		t.Errorf("listed %d legacy logs, want %d", legacyListed, antigravityLegacyReadReserve)
+	}
+}
+
 // The evidence a block yields: the account and each reset, a reset anchored
 // to its line's own glog time when present.
 func TestAntigravityBlockEvidence(t *testing.T) {
