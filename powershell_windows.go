@@ -109,15 +109,16 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		fmt.Println("[powershell] Using PowerShell 7+ (pwsh.exe)")
 	}
 
-	cmd := exec.Command(psExe,
-		"-NoProfile",
-		"-NoLogo",
-		"-NonInteractive",
-		// `-OutputFormat Text` prevents CLIXML error serialization on stderr
-		// for this persistent shell — see runEncodedPowerShellCommand in pubsub.go.
+	// `-OutputFormat Text` prevents CLIXML error serialization on stderr for
+	// this persistent shell — see runEncodedPowerShellCommand in pubsub.go.
+	// psHostPolicyArgs lets the .ps1 files commands call (npm.ps1) load under a
+	// restrictive execution policy — see powershell_launch.go.
+	psArgs := append([]string{"-NoProfile", "-NoLogo", "-NonInteractive"}, psHostPolicyArgs...)
+	psArgs = append(psArgs,
 		"-OutputFormat", "Text",
 		"-Command", "-", // Read commands from stdin
 	)
+	cmd := exec.Command(psExe, psArgs...)
 	hideWindow(cmd)
 	// Headless hardening: the persistent shell is the default fast path for
 	// non-agent Windows commands, so inject the authoritative non-interactive
@@ -231,26 +232,32 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		syncedPath = cur
 	}
 
-	// Reset $LASTEXITCODE to 0 before running the user command.
-	// PowerShell only updates $LASTEXITCODE when a native executable is invoked;
-	// pure-cmdlet commands (Write-Host, Get-ChildItem, etc.) leave it unchanged.
-	// On a fresh pwsh.exe session the value can be 1 (from internal startup steps),
-	// which would cause every cmdlet-only command to be reported as a failure.
-	// Resetting here means $LASTEXITCODE correctly reflects the external-process
-	// result of this command, not of some earlier unrelated invocation.
-	fullCmd.WriteString("$LASTEXITCODE = 0\n")
+	// Reset $LASTEXITCODE, $Error and the status flag before the user command —
+	// see psResetScript. On a fresh pwsh.exe session $LASTEXITCODE can be 1
+	// (from internal startup steps), which would otherwise report every
+	// cmdlet-only command as a failure.
+	fullCmd.WriteString(psResetScript)
 
 	// Wrap user command in a script block so && / || operators inside the command
 	// don't consume the delimiter. Without this, PowerShell's operator precedence
 	// causes `cmd1 && cmd2; Write-Host DELIMITER` to skip the delimiter when cmd1 fails.
-	fullCmd.WriteString(fmt.Sprintf("& { %s }", command))
+	// The status capture sits INSIDE the block: $? after `& { }` is always true,
+	// so reading it outside would never see the user command fail. It is joined
+	// with `;`, not a newline — this host reads `-Command -` from stdin, where a
+	// block split across lines waits for a blank line before it runs.
+	fullCmd.WriteString(fmt.Sprintf("& { %s; %s }", command, psStatusCaptureStatement))
 
 	// Use newlines (not ;) to separate delimiter lines — newlines are unconditional
 	// statement separators that cannot be captured by && or || operators.
-	// Capture $LASTEXITCODE immediately after the script block (before any other
-	// statements that could reset it), then emit the protocol markers.
+	// Capture the exit code immediately after the script block (before any other
+	// statements that could reset $LASTEXITCODE), then emit the protocol markers.
+	// This host's stderr is never read, so when a program never started (npm.ps1
+	// blocked, npm not installed) the PowerShell error is echoed to stdout —
+	// otherwise the step would fail with no explanation.
+	fullCmd.WriteString("\n" + psExitCaptureScript)
+	fullCmd.WriteString("\nif ($__aix_promoted) { Write-Host (($Error[0] | Out-String).TrimEnd()) }")
 	fullCmd.WriteString(fmt.Sprintf(
-		"\n$__aix_exit = $LASTEXITCODE\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
+		"\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
 		psExitCodeMarker, psDelimiter))
 
 	// Send command to PowerShell

@@ -31,6 +31,16 @@ func TestBuildFallbackProbeCommand_PreservesExitCodeOrdering(t *testing.T) {
 	if !(idxReset < idxUser && idxUser < idxCapture && idxCapture < idxSentinel && idxCapture < idxGetLoc) {
 		t.Fatalf("exit-code capture must sit between the reset, the user command, and the cwd probe; got %q", got)
 	}
+	// $? must be read by the very next statement after the user command — any
+	// statement in between overwrites it, and a blocked npm.ps1 / missing npm
+	// would never be promoted to a non-zero exit.
+	if !strings.Contains(got, userCmd+"\n"+psStatusCaptureStatement+"\n"+psExitCaptureScript) {
+		t.Errorf("status capture must directly follow the user command, then the exit capture; got %q", got)
+	}
+	// $Error is cleared up front so $Error[0] belongs to this command.
+	if idxClear := strings.Index(got, "$Error.Clear()"); idxClear < 0 || idxClear > idxUser {
+		t.Errorf("$Error.Clear() must run before the user command; got %q", got)
+	}
 	// And it must be re-raised as the process exit code.
 	if !strings.Contains(got, "exit $__aix_exit") {
 		t.Errorf("probe must re-exit with the captured code; got %q", got)

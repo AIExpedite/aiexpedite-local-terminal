@@ -368,3 +368,45 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// TestTempFileRunsWithProcessScopedBypass verifies the temp-file transport
+// still runs with `-ExecutionPolicy Bypass` in Process scope now that the flag
+// comes from psHostPolicyArgs: without it `-File` is refused under the default
+// `Restricted` policy, and so is any .ps1 (npm.ps1) the script calls.
+func TestTempFileRunsWithProcessScopedBypass(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping powershell.exe integration test in -short mode")
+	}
+
+	padding := strings.Repeat("# noise line\n", 3000)
+	script := padding + "Get-ExecutionPolicy -Scope Process\n"
+	encoded := encodeForPowerShell(script)
+	if len(encoded) <= encodedCommandFallbackThreshold {
+		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
+	}
+
+	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
+	}
+	if got := strings.TrimSpace(out); !strings.HasSuffix(got, "Bypass") {
+		t.Fatalf("expected Process-scope policy Bypass, got %q", got)
+	}
+}
+
+// TestEncodedArgRunsWithProcessScopedBypass is the same check for the
+// -EncodedCommand transport: that flag exempts only the encoded script itself,
+// so the host needs the process-scoped bypass for the .ps1 files it calls.
+func TestEncodedArgRunsWithProcessScopedBypass(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping powershell.exe integration test in -short mode")
+	}
+
+	out, err := runEncodedPowerShellViaArg(encodeForPowerShell("Get-ExecutionPolicy -Scope Process"), "", 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
+	}
+	if got := strings.TrimSpace(out); got != "Bypass" {
+		t.Fatalf("expected Process-scope policy Bypass, got %q", got)
+	}
+}

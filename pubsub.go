@@ -2312,6 +2312,7 @@ const encodedCommandFallbackThreshold = 30000
 var (
 	runEncodedPowerShellViaArgFn      = runEncodedPowerShellViaArg
 	runPowerShellCommandViaTempFileFn = runPowerShellCommandViaTempFile
+	runLocalCommandFallbackFn         = runLocalCommandFallback
 )
 
 // runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
@@ -2349,13 +2350,14 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 	// (XML error records) when stderr is piped to a non-console parent process.
 	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
 	// that leaks past filterCLIXML and back to the user.
-	psArgs := []string{
-		"-NoProfile",
-		"-NonInteractive",
+	// psHostPolicyArgs: -EncodedCommand exempts only this script from execution
+	// policy, not the .ps1 files it calls (npm.ps1) — see powershell_launch.go.
+	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
+	psArgs = append(psArgs,
 		"-OutputFormat", "Text",
 		"-EncodedCommand",
 		encodedScript,
-	}
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2425,19 +2427,15 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 		return "", fmt.Errorf("powershell temp-file fallback: close temp: %w", err)
 	}
 
-	// `-ExecutionPolicy Bypass` is required because `-File` (unlike
-	// `-EncodedCommand`) is subject to the machine's ExecutionPolicy. On
-	// clients with the default `Restricted` policy, .ps1 scripts simply
-	// won't run, so a large encoded command would silently fail where the
-	// small-script `-EncodedCommand` path succeeded. Bypass is scoped to
-	// this single process invocation and does not touch user/machine policy.
-	psArgs := []string{
-		"-NoProfile",
-		"-NonInteractive",
-		"-ExecutionPolicy", "Bypass",
+	// psHostPolicyArgs matters twice here: `-File` itself is subject to the
+	// execution policy (under the default `Restricted` the temp .ps1 would not
+	// run at all), and so is any .ps1 the script calls — see
+	// powershell_launch.go.
+	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
+	psArgs = append(psArgs,
 		"-OutputFormat", "Text",
 		"-File", tmpPath,
-	}
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2555,7 +2553,9 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	psExe := getFallbackPSExe() // prefers pwsh.exe when available
 	// `-OutputFormat Text` prevents CLIXML error serialization — see
 	// runEncodedPowerShellCommand for the full explanation.
-	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", cmdLine)
+	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
+	psArgs = append(psArgs, "-OutputFormat", "Text", "-Command", cmdLine)
+	c := exec.CommandContext(ctx, psExe, psArgs...)
 	hideWindow(c)
 	// Headless hardening: authoritative non-interactive git/editor/credential env
 	// so git/ssh/credential prompts fail fast rather than blocking.
@@ -5344,38 +5344,41 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		return runEncodedPowerShellCommand(encoded, workDir, timeout)
 	}
 
-	// Original behavior for non-PowerShell commands
-	// Construct the full command line, quoting args that contain spaces or
-	// special shell characters that PowerShell would misinterpret.
-	cmdLine := cmd
-	if len(args) > 0 {
-		for _, arg := range args {
-			if needsQuoting(arg) {
-				// Escape embedded double-quotes by doubling them, then wrap in quotes.
-				cmdLine += " \"" + strings.ReplaceAll(arg, "\"", "\"\"") + "\""
-			} else {
-				cmdLine += " " + arg
-			}
-		}
+	// Non-PowerShell commands. Two command lines: classifyLine (the original
+	// name) drives every routing decision, and cmdLine (the name to launch) is
+	// what the transports run. They differ only when preferBatchShim swaps a
+	// bare name for its .cmd/.bat shim (`npm` -> `npm.cmd`), so PowerShell never
+	// loads npm.ps1 under a restrictive execution policy. `npm test` is still a
+	// test runner, but it runs as `npm.cmd test`.
+	classifyLine := buildPowerShellCommandLine(cmd, args)
+	cmdLine := classifyLine
+	if launch := preferBatchShim(cmd, args); launch != cmd {
+		fmt.Printf("%s[aiexpedite] Launching %s instead of %s (skips its .ps1 under a restrictive execution policy)%s\n",
+			colorCyan, launch, cmd, colorReset)
+		cmdLine = buildPowerShellCommandLine(launch, args)
 	}
 
 	// CLI coding agents (claude, codex) use interactive/streaming output
 	// that doesn't work with persistent PowerShell stdin pipes.
 	// Always spawn a new powershell.exe process for these commands.
+	// This branch launches from the original name, never the shim:
+	// cachedResolveClaudePath rewrites the first len("claude") characters of the
+	// line. It relies on the host's process-scoped execution-policy bypass.
 	cmdLower := strings.ToLower(cmd)
 	isCLIAgent := cmdLower == "claude" || cmdLower == "codex"
 	if isCLIAgent {
 		fmt.Printf("%s[aiexpedite] Using dedicated process for CLI agent: %s%s\n", colorCyan, cmd, colorReset)
+		agentLine := classifyLine
 		// Resolve full path for claude since it may not be in fallback PowerShell's PATH.
 		// Result is cached after the first resolution to avoid repeated PATH lookups and
 		// filesystem scans on every Claude command.
 		if strings.HasPrefix(cmdLower, "claude") {
 			claudePath := cachedResolveClaudePath()
 			if claudePath != "" && claudePath != "claude" {
-				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
+				agentLine = claudePath + agentLine[6:] // 6 = len("claude")
 			}
 		}
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallbackFn(agentLine, workDir, timeout)
 	}
 
 	// Test runners need per-command non-interactive defaults (CI=1,
@@ -5385,17 +5388,17 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// runLocalCommandFallback calls hardenNonAgentCommand, which layers
 	// testRunnerEnvDefaults UNDER the authoritative git/editor safety overlay.
 	// See EXECUTION_LIVENESS_REDESIGN.md → test-runner profile.
-	if isTestRunnerCommand(cmdLine) {
+	if isTestRunnerCommand(classifyLine) {
 		fmt.Printf("%s[aiexpedite] Using one-shot hardened process for test runner: %s%s\n",
 			colorCyan, cmd, colorReset)
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallbackFn(cmdLine, workDir, timeout)
 	}
 
 	// Route bash-style commands (containing && or ||) through a one-shot
 	// PowerShell process on Windows when the persistent PS instance is not
 	// available. pwsh.exe is preferred (supports && natively); powershell.exe
 	// is the fallback when pwsh.exe is not on PATH.
-	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
+	if runtime.GOOS == "windows" && isBashStyleCommand(classifyLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
 		fmt.Printf("%s[aiexpedite] Routing bash-style command via one-shot powershell.exe (persistent PS unavailable)%s\n", colorCyan, colorReset)
 		return runViaShell(cmdLine, workDir, timeout)
 	}
@@ -5404,7 +5407,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	ps, err := GetPowerShell()
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Persistent PowerShell unavailable, using fallback%s\n", colorYellow, colorReset)
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallbackFn(cmdLine, workDir, timeout)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -5421,12 +5424,12 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// Process-level failure: try restarting PS once then retry.
 		if restartErr := RestartPowerShell(); restartErr != nil {
 			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout)
 		}
 
 		ps, err = GetPowerShell()
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout)
 		}
 
 		// Reuse the original context so the retry does not exceed the
@@ -5434,7 +5437,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// could allow the command to run for up to 2× the requested duration.
 		output, err = ps.Execute(ctx, cmdLine, workDir)
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout)
 		}
 	}
 
@@ -5525,24 +5528,26 @@ func resetCachedClaudePath() {
 // PowerShell so it (a) PRESERVES the user command's native exit code and (b)
 // still reports the final working directory for cd tracking.
 //
-// The exit code must be captured into $__aix_exit IMMEDIATELY after the user
-// command — before the Write-Host/Get-Location cwd probe runs — because those
-// trailing cmdlets succeed and would otherwise reset the effective exit status,
-// making `powershell -Command` exit 0 and mask a failing native command such as
-// `npm test` / `pytest` as success. $LASTEXITCODE is $null when the command ran
-// no native process (a pure cmdlet that did not fail terminally); treat that as
-// success. A terminating error aborts before the probe, so PS already exits
-// non-zero (cwd tracking is best-effort and skipped in that case).
+// The status and exit code must be captured IMMEDIATELY after the user command
+// — before the Write-Host/Get-Location cwd probe runs — because those trailing
+// cmdlets succeed and would otherwise reset the effective exit status, making
+// `powershell -Command` exit 0 and mask a failing native command such as
+// `npm test` / `pytest` as success. psExitCaptureScript also turns a program
+// that never started (not found, or its .ps1 blocked by execution policy) into
+// exit 1; its error text is already in the combined output. $LASTEXITCODE is
+// $null when the command ran no native process (a pure cmdlet that did not fail
+// terminally); treat that as success. A terminating error aborts before the
+// probe, so PS already exits non-zero (cwd tracking is best-effort and skipped
+// in that case).
 //
-// $LASTEXITCODE is reset to 0 BEFORE the user command: PowerShell only updates
-// it when a native executable runs, and a fresh pwsh.exe can start with a
-// non-zero value from internal startup steps, so a cmdlet-only fallback command
-// would otherwise capture that stale non-zero code and be reported as a failure.
-// This mirrors the persistent-shell reset in powershell_windows.go.
+// psResetScript runs BEFORE the user command, mirroring the persistent host in
+// powershell_windows.go. The user command runs at top level here (no `& { }`),
+// so the status capture follows it directly.
 func buildFallbackProbeCommand(cmdLine, sentinel string) string {
-	return "$LASTEXITCODE = 0\n" +
+	return psResetScript +
 		cmdLine +
-		"\n$__aix_exit = $LASTEXITCODE" +
+		"\n" + psStatusCaptureStatement +
+		"\n" + psExitCaptureScript +
 		"\nWrite-Host '" + sentinel + "'" +
 		"\n(Get-Location).Path" +
 		"\nif ($null -eq $__aix_exit) { exit 0 } else { exit $__aix_exit }"
@@ -5565,7 +5570,9 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 
 	// `-OutputFormat Text` prevents CLIXML error serialization — see
 	// runEncodedPowerShellCommand for the full explanation.
-	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", probeCmd)
+	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
+	psArgs = append(psArgs, "-OutputFormat", "Text", "-Command", probeCmd)
+	c := exec.CommandContext(ctx, psExe, psArgs...)
 	hideWindow(c)
 	// Headless hardening: authoritative non-interactive git/editor/credential env.
 	hardenNonAgentCommand(c, cmdLine)
@@ -5668,6 +5675,21 @@ func resolveClaudePath() string {
 // double-quotes before being embedded in a PowerShell command string.
 // Quotes are required when the arg contains spaces, literal double-quotes,
 // or PowerShell metacharacters that would be misinterpreted without quoting.
+// buildPowerShellCommandLine joins cmd and args into one PowerShell command
+// line, quoting args that contain spaces or special shell characters that
+// PowerShell would misinterpret. Embedded double quotes are doubled.
+func buildPowerShellCommandLine(cmd string, args []string) string {
+	cmdLine := cmd
+	for _, arg := range args {
+		if needsQuoting(arg) {
+			cmdLine += " \"" + strings.ReplaceAll(arg, "\"", "\"\"") + "\""
+		} else {
+			cmdLine += " " + arg
+		}
+	}
+	return cmdLine
+}
+
 func needsQuoting(s string) bool {
 	for _, r := range s {
 		switch r {
