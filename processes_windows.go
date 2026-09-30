@@ -52,6 +52,13 @@ const (
 	// cliProcessFilter / cliProcessWMICWhere are the orphan allowlist.
 	cliProcessFilter    = `Name='claude.exe' OR Name='codex.exe' OR Name='agy.exe' OR Name='grok.exe'`
 	cliProcessWMICWhere = `name="claude.exe" or name="codex.exe" or name="agy.exe" or name="grok.exe"`
+	// antigravityProcessFilter / antigravityProcessWMICWhere list every image
+	// name Antigravity ships under, for the direct-run discovery scans. Kept
+	// separate from the orphan allowlist above: the index only wants to SEE a
+	// user-started run it may owe a refresh for, and widening the allowlist
+	// would also widen what the orphan scanner may kill.
+	antigravityProcessFilter    = `Name='agy.exe' OR Name='antigravity.exe'`
+	antigravityProcessWMICWhere = `name="agy.exe" or name="antigravity.exe"`
 	// ancestryProcessFilter / ancestryProcessWMICWhere are what a wrapped
 	// Antigravity run's tree can hold: the PowerShell / cmd intermediates and
 	// agy itself, under either of its names.
@@ -100,6 +107,15 @@ func ScanCLIProcesses() []ProcessInfo {
 // failed (or has no backend), so a caller can tell it from an empty table.
 func ScanCLIProcessesChecked() ([]ProcessInfo, bool) {
 	return scanProcessesChecked(selectScanBackend(), cliProcessFilter, cliProcessWMICWhere)
+}
+
+// ScanAntigravityProcessesChecked lists live Antigravity processes under either
+// of the CLI's image names, with ok=false for a scan that failed (or has no
+// backend). Used by the Antigravity log index's direct-run discovery, which
+// must also see a run started as `antigravity` — a name the orphan allowlist
+// deliberately omits.
+func ScanAntigravityProcessesChecked() ([]ProcessInfo, bool) {
+	return scanProcessesChecked(selectScanBackend(), antigravityProcessFilter, antigravityProcessWMICWhere)
 }
 
 // ScanProcessAncestryChecked returns rootPID's descendants within

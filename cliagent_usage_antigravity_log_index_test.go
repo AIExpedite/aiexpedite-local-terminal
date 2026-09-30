@@ -975,3 +975,43 @@ func TestAntigravityPIDIn_SameSecondReuseIsForeign(t *testing.T) {
 		t.Error("a remembered run that has not exited stopped matching")
 	}
 }
+
+// TestAntigravityStartupScan_TracksTheAntigravityAlias pins that the direct-run
+// process scans accept every image name the CLI ships under. A user-started
+// `antigravity` whose log the bounded listing cannot reach is discoverable only
+// through this scan, so a narrower name set would lose its refresh entirely.
+func TestAntigravityStartupScan_TracksTheAntigravityAlias(t *testing.T) {
+	for _, name := range []string{"agy.exe", "antigravity.exe", "Antigravity", "agy"} {
+		t.Run(name, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			now := time.Now().Truncate(time.Second)
+			h.setLive(6001, true)
+			antigravityProcessScan = func() ([]ProcessInfo, bool) {
+				return []ProcessInfo{{PID: 6001, ParentPID: 1, Name: name, StartTime: now}}, true
+			}
+			if _, scanned := antigravityStartupScan(now); !scanned {
+				t.Fatal("startup scan did not run")
+			}
+			if _, _, _, _, processOnly, _ := helperIndexCounts(); processOnly != 1 {
+				t.Errorf("processOnly=%d for image %q, want the run tracked", processOnly, name)
+			}
+		})
+	}
+}
+
+// TestAntigravityStartupScan_IgnoresUnrelatedImages keeps the alias match exact:
+// a process whose name merely starts like the CLI's is not a run we may owe.
+func TestAntigravityStartupScan_IgnoresUnrelatedImages(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Truncate(time.Second)
+	h.setLive(6002, true)
+	antigravityProcessScan = func() ([]ProcessInfo, bool) {
+		return []ProcessInfo{{PID: 6002, ParentPID: 1, Name: "antigravity-updater.exe", StartTime: now}}, true
+	}
+	if _, scanned := antigravityStartupScan(now); !scanned {
+		t.Fatal("startup scan did not run")
+	}
+	if _, _, _, _, processOnly, _ := helperIndexCounts(); processOnly != 0 {
+		t.Errorf("processOnly=%d, want an unrelated image ignored", processOnly)
+	}
+}

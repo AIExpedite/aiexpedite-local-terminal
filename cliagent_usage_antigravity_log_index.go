@@ -111,9 +111,10 @@ var (
 	}
 	// antigravityProcessStartToken reads a live PID's start identity.
 	antigravityProcessStartToken = processStartToken
-	// antigravityProcessScan lists live allowlisted CLI processes; ok=false
-	// means the list could not be read (never "none running").
-	antigravityProcessScan = ScanCLIProcessesChecked
+	// antigravityProcessScan lists live Antigravity processes under either of
+	// the CLI's image names; ok=false means the list could not be read (never
+	// "none running").
+	antigravityProcessScan = ScanAntigravityProcessesChecked
 )
 
 // antigravityLogNamePattern is the second-stamped run-log name.
@@ -1360,7 +1361,7 @@ func antigravityCheckSentinel(now time.Time) {
 	if idx.sentinel != nil {
 		untracked := false
 		for _, p := range procs {
-			if !strings.HasPrefix(strings.ToLower(p.Name), "agy") ||
+			if !isAntigravityProcessName(p.Name) ||
 				antigravityOwnOrManagedNowLocked(p.PID, now) ||
 				globalProcessRegistry.IsRegistered(p.PID) || globalProcessRegistry.IsRegistered(p.ParentPID) {
 				continue
@@ -1407,7 +1408,7 @@ func antigravityStartupScan(now time.Time) (antigravityDiscoveryResult, bool) {
 	if procs, ok := antigravityProcessScan(); ok {
 		lockAntigravityLogIndex()
 		for _, p := range procs {
-			if !strings.HasPrefix(strings.ToLower(p.Name), "agy") ||
+			if !isAntigravityProcessName(p.Name) ||
 				antigravityOwnOrManagedNowLocked(p.PID, now) ||
 				globalProcessRegistry.IsRegistered(p.PID) || globalProcessRegistry.IsRegistered(p.ParentPID) {
 				continue

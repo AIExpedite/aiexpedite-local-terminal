@@ -26,6 +26,9 @@ func ScanCLIProcesses() []ProcessInfo { return nil }
 // ScanCLIProcessesChecked is unavailable here.
 func ScanCLIProcessesChecked() ([]ProcessInfo, bool) { return nil, false }
 
+// ScanAntigravityProcessesChecked is unavailable here, for the same reason.
+func ScanAntigravityProcessesChecked() ([]ProcessInfo, bool) { return nil, false }
+
 // unixAncestryMaxDepth bounds the Unix wrapper walk: the shell, the file-mode
 // launcher's inner shell, then agy.
 const unixAncestryMaxDepth = 3
