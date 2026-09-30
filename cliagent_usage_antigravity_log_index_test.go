@@ -1153,6 +1153,22 @@ func TestAntigravityCapture_DetachedAgyHandedOffPastSettledEntry(t *testing.T) {
 // A detached agy is read again at its own exit, after more than the read cap
 // of newer logs were created while it ran. Its block is in the log named for
 // its start, next to the floor, and must still be found.
+// A stamped log older than the floor's DST slack ends the stamped walk, but
+// never the search: legacy names sort after every stamped one and are still
+// read for the run's block.
+func TestAntigravityPIDBlock_ReachesLegacyPastOldStampedLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	floor := time.Now().Truncate(time.Second)
+	old := floor.Add(-48 * time.Hour)
+	h.write(t, helperLogName(old), helperPIDBlock(50030), old, false)
+	h.write(t, "legacy-run.log", helperPIDBlock(50031)+"authenticated successfully as ada@example.com\n", floor, false)
+
+	block, ok := antigravityPIDBlock(h.base, 50031, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the legacy log's block past the old stamped one", block, ok)
+	}
+}
+
 func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
 	h := helperIsolateLogIndex(t)
 	floor := time.Now().Add(-2 * time.Hour).Truncate(time.Second)

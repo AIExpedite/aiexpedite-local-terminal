@@ -278,7 +278,16 @@ func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, gen uint64, stop 
 			if !isAntigravityProcessName(p.Name) {
 				continue
 			}
-			if !p.StartTime.IsZero() && p.StartTime.Before(notBefore) {
+			// Both scan backends report subsecond creation times, so a
+			// descendant is compared with the exact floor: a detached agy that
+			// an earlier command on a persistent host started in the same
+			// second is never taken for this run's. A whole-second time (no
+			// fraction reported) falls back to the floor's second.
+			cutoff := c.floor
+			if p.StartTime.Nanosecond() == 0 {
+				cutoff = notBefore
+			}
+			if !p.StartTime.IsZero() && p.StartTime.Before(cutoff) {
 				continue
 			}
 			c.setPID(p.PID, true, gen)

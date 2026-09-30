@@ -393,14 +393,17 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	dir := antigravityLogDir(base)
 	floorSecond := sinceFloor.Truncate(time.Second)
 	since := sinceFloor.Add(-antigravityStartupDSTSlack).Truncate(time.Second)
-	var afterFloor, slack, legacy []string
-	for i, name := range names {
-		at, stamped := antigravityLogNameTime(name, time.Time{})
-		if !stamped {
-			// Unstamped names sort after every stamped one.
-			legacy = names[i:]
-			break
-		}
+	// Unstamped (legacy) names sort after every stamped one. Split them off
+	// first: the stamped-time cutoff below must not end the walk before it
+	// reaches them.
+	stampedEnd := len(names)
+	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
+		stampedEnd--
+	}
+	legacy := names[stampedEnd:]
+	var afterFloor, slack []string
+	for _, name := range names[:stampedEnd] {
+		at, _ := antigravityLogNameTime(name, time.Time{})
 		if at.Before(since) {
 			break
 		}

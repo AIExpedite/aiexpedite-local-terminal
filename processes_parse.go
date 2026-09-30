@@ -43,7 +43,7 @@ func checkedPowerShellScanScript(filter string) string {
 		` | Select-Object @{Name='Name';Expression={$_.Name}},` +
 		` @{Name='ProcessId';Expression={$_.ProcessId}},` +
 		` @{Name='ParentProcessId';Expression={$_.ParentProcessId}},` +
-		` @{Name='CreationDate';Expression={if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss') } else { '' }}}` +
+		` @{Name='CreationDate';Expression={if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss.fffffff') } else { '' }}}` +
 		` | ConvertTo-Csv -NoTypeInformation; '` + processScanOKTrailer + `' } catch { exit 3 }`
 }
 
@@ -217,6 +217,7 @@ func parseWMIDate(s string) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
+	t = t.Add(parseDateFraction(s[14:]))
 	// Look for the ±UUU offset after the fractional seconds.
 	if idx := strings.IndexAny(s[14:], "+-"); idx >= 0 {
 		signAndOffset := s[14+idx:]
@@ -235,9 +236,10 @@ func parseWMIDate(s string) time.Time {
 	return t
 }
 
-// parsePowerShellDate parses the yyyyMMddHHmmss UTC format emitted by our
-// PowerShell Select-Object expression (see scanViaPowerShell — we use
-// ToUniversalTime explicitly so the wire format is unambiguous).
+// parsePowerShellDate parses the yyyyMMddHHmmss.fffffff UTC format emitted by
+// our PowerShell Select-Object expression (see checkedPowerShellScanScript — we
+// use ToUniversalTime explicitly so the wire format is unambiguous). The
+// fraction is optional.
 func parsePowerShellDate(s string) time.Time {
 	if len(s) < 14 {
 		return time.Time{}
@@ -246,7 +248,23 @@ func parsePowerShellDate(s string) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
-	return t
+	return t.Add(parseDateFraction(s[14:]))
+}
+
+// parseDateFraction reads the ".ddd…" fractional seconds that follow a date's
+// whole seconds; zero when absent. The subsecond part is what tells apart two
+// processes created in the same second (the Antigravity wrapper resolver).
+func parseDateFraction(s string) time.Duration {
+	if len(s) < 2 || s[0] != '.' {
+		return 0
+	}
+	var frac time.Duration
+	scale := time.Second
+	for i := 1; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		scale /= 10
+		frac += time.Duration(s[i]-'0') * scale
+	}
+	return frac
 }
 
 // ─────────────────────── helpers ───────────────────────

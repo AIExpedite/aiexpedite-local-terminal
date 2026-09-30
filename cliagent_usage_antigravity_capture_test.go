@@ -1020,6 +1020,42 @@ func TestAntigravityRunCapture_ResolverRampCatchesAFastRun(t *testing.T) {
 	helperStopCapture(t, capture.Finish)
 }
 
+// A persistent host can hold a detached agy an earlier command started in the
+// same second as this run's floor. Subsecond creation times keep it out: the
+// resolver takes only the descendant created after the floor itself.
+func TestAntigravityRunCapture_ResolverSkipsSameSecondEarlierDescendant(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	origScan, origEvery, origNow := antigravityAncestryScan, antigravityWrapperScanEvery, antigravityUsageFreshnessNow
+	defer func() {
+		antigravityAncestryScan, antigravityWrapperScanEvery, antigravityUsageFreshnessNow = origScan, origEvery, origNow
+	}()
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+	floor := time.Now().Truncate(time.Second).Add(500 * time.Millisecond)
+	antigravityUsageFreshnessNow = func() time.Time { return floor }
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		return []ProcessInfo{
+			{PID: 900, Name: "powershell.exe"},
+			{PID: 901, ParentPID: 900, Name: "agy.exe", StartTime: floor.Add(-200 * time.Millisecond)},
+			{PID: 902, ParentPID: 900, Name: "agy.exe", StartTime: floor.Add(200 * time.Millisecond)},
+		}, true
+	}
+
+	capture := startAntigravityQuotaCapture("persistent host")
+	capture.SetWrapper(900)
+	deadline := time.Now().Add(5 * time.Second)
+	pid := 0
+	for pid == 0 && time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid = capture.pid
+		capture.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if pid != 902 {
+		t.Errorf("resolved pid=%d, want 902 (created after the floor), not the same-second 901", pid)
+	}
+	helperStopCapture(t, capture.Finish)
+}
+
 // A spawn site hands SetStarted the child it started: a direct `agy` is the
 // run's PID at once, with no scan; a shell wrapper is walked, and a Unix shell
 // that exec'd agy in place resolves to the wrapper PID itself.

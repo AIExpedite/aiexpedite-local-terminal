@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The checked scans must tell an EMPTY process table from a FAILED query: the
@@ -32,6 +33,24 @@ func TestInterpretPowerShellScan(t *testing.T) {
 		if ok != tc.ok || len(procs) != tc.rows {
 			t.Errorf("%s: ok=%v rows=%d, want ok=%v rows=%d", tc.name, ok, len(procs), tc.ok, tc.rows)
 		}
+	}
+}
+
+// Both backends keep the subsecond part of a creation time, which is what
+// tells apart two processes created in the same second.
+func TestProcessScanDatesKeepSubseconds(t *testing.T) {
+	want := time.Date(2026, 9, 29, 20, 43, 56, 123456700, time.UTC)
+	if got := parsePowerShellDate("20260929204356.1234567"); !got.Equal(want) {
+		t.Errorf("PowerShell date=%v, want %v", got, want)
+	}
+	if got := parsePowerShellDate("20260929204356"); !got.Equal(want.Truncate(time.Second)) {
+		t.Errorf("whole-second PowerShell date=%v, want %v", got, want.Truncate(time.Second))
+	}
+	if got := parseWMIDate("20260929224356.123456+120"); !got.Equal(want.Truncate(time.Microsecond)) {
+		t.Errorf("WMI date=%v, want %v", got, want.Truncate(time.Microsecond))
+	}
+	if !strings.Contains(checkedPowerShellScanScript("Name='agy.exe'"), "yyyyMMddHHmmss.fffffff") {
+		t.Error("PowerShell scan no longer emits subsecond creation times")
 	}
 }
 
