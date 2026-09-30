@@ -205,11 +205,63 @@ func TestClassifyOpenCodeSmokeRun_MapsEveryOutcomeOntoTheClosedSet(t *testing.T)
 			wantDiagnostic: cliSmokeDiagnosticNoEnvelope,
 		},
 		{
-			name:           "a generic non-zero exit is no_envelope",
+			name:           "a generic non-zero exit with no frame is no_output",
+			stderr:         "something went wrong deep inside",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoOutput,
+		},
+		{
+			name:           "a generic non-zero exit after frames is no_envelope",
+			stdout:         `{"type":"step_start"}` + "\n",
 			stderr:         "something went wrong deep inside",
 			runErr:         exitErr,
 			wantCategory:   cliUsageErrorProtocol,
 			wantDiagnostic: cliSmokeDiagnosticNoEnvelope,
+		},
+		{
+			name:           "an empty clean exit is no_output",
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoOutput,
+		},
+		{
+			name:           "banner-only stdout is no_output",
+			stdout:         "opencode 0.9.1 — a new version is available\n",
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoOutput,
+		},
+		{
+			name:           "frames with no terminal frame are no_envelope",
+			stdout:         `{"type":"step_start"}` + "\n" + `{"type":"text","text":"` + marker + `"}` + "\n",
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoEnvelope,
+		},
+		{
+			name:           "a frameless flag rejection keeps flag_rejected over no_output",
+			stderr:         "error: unknown option '--pure'",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticFlagRejected,
+		},
+		{
+			name:           "a frameless framing rejection keeps framing_rejected over no_output",
+			stderr:         "error: unknown option '--format'",
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticFramingRejected,
+		},
+		{
+			name:           "a timeout still outranks silence",
+			timedOut:       true,
+			runErr:         exitErr,
+			wantCategory:   cliUsageErrorProviderTimeout,
+			wantDiagnostic: cliSmokeDiagnosticTimeout,
+		},
+		{
+			name:           "a title-escape-prefixed stream with no parsable frame is no_output",
+			stdout:         "\x1b]0;opencode\x07" + `{"type":"step_finish","part":{"reason":"stop"}}` + "\n",
+			wantCategory:   cliUsageErrorProtocol,
+			wantDiagnostic: cliSmokeDiagnosticNoOutput,
 		},
 		{
 			name:           "a clean exit with no terminal frame is no_envelope, never framing",
@@ -284,6 +336,35 @@ func TestClassifyOpenCodeSmokeRun_MapsEveryOutcomeOntoTheClosedSet(t *testing.T)
 					category, diagnostic, matched, tc.wantCategory, tc.wantDiagnostic, tc.wantMatched)
 			}
 		})
+	}
+}
+
+// The frame and escape-line counts are what the device log line reports for a
+// field failure, so they must count exactly what the classifier saw.
+func TestParseOpenCodeSmokeStream_CountsFramesAndEscapeLines(t *testing.T) {
+	stdout := "banner\n" +
+		"\x1b]0;opencode\x07\n" +
+		"\xef\xbb\xbf" + `{"type":"text","text":"hidden"}` + "\n" +
+		`{"type":"step_start"}` + "\n" +
+		`{"type":"text","text":"hi"}` + "\n" +
+		`{"type":"text","text":` + "\n" + // malformed: not a frame
+		`{"type":"step_finish","part":{"reason":"stop"}}` + "\n"
+	stream := parseOpenCodeSmokeStream([]byte(stdout))
+	if stream.Frames != 3 || stream.EscLines != 2 || !stream.Ended || !stream.Malformed {
+		t.Fatalf("got frames=%d escLines=%d ended=%v malformed=%v, want 3/2/true/true",
+			stream.Frames, stream.EscLines, stream.Ended, stream.Malformed)
+	}
+
+	counts := openCodeSmokeCountsFor([]byte(stdout), []byte("err"), openCodeExitError(t))
+	if counts.Frames != 3 || counts.EscLines != 2 || !counts.Terminal ||
+		counts.StdoutBytes != len(stdout) || counts.StderrBytes != 3 || counts.Exit == 0 {
+		t.Fatalf("counts = %+v", counts)
+	}
+	if got := openCodeSmokeExitCode(nil); got != 0 {
+		t.Errorf("clean exit code = %d, want 0", got)
+	}
+	if got := openCodeSmokeExitCode(errOpenCodeShimUnrenderable); got != -1 {
+		t.Errorf("launch failure exit code = %d, want -1", got)
 	}
 }
 
@@ -680,6 +761,11 @@ func TestRunOpenCodeSmoke_NeverRetriesAndKeepsTheMarkerOffArgv(t *testing.T) {
 	}
 	if *calls != 1 {
 		t.Fatalf("the probe retried: %d children", *calls)
+	}
+	// The probe is a maintenance launch, so newOpenCodeCmd pins self-update and
+	// the terminal title off for its child (TestNewOpenCodeCmd_MaintenancePins…).
+	if !(*launches)[0].Maintenance {
+		t.Fatal("the probe's launch must be marked Maintenance")
 	}
 
 	marker := strings.TrimPrefix(seenPrompt, openCodeMaintenanceSmokePromptPrefix)

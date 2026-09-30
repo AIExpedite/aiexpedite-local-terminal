@@ -1603,8 +1603,9 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 | Conclusive "no usable provider" from the readiness probe | `not_authenticated` | `not_logged_in` |
 | Non-zero exit, no terminal frame, stderr or a non-JSON stdout line shows an option-parsing rejection | `protocol` | `flag_rejected` |
 | …and the rejection's ERROR REGION names `--format` | `protocol` | `framing_rejected` |
-| Non-zero exit, no terminal frame, no recognizable rejection | `protocol` | `no_envelope` |
-| Clean exit with no terminal frame | `protocol` | `no_envelope` |
+| The child ran and exited (any code), **zero** JSON frames arrived, nothing malformed or truncated, and no recognizable rejection | `protocol` | `no_output` |
+| Non-zero exit, frames arrived but none was terminal, no recognizable rejection | `protocol` | `no_envelope` |
+| Clean exit, frames arrived but none was terminal | `protocol` | `no_envelope` |
 | Malformed/truncated JSON, a frame past `openCodeNativeMaxFrameBytes`, stdout past the 1 MiB retention cap | `protocol` | `no_envelope` |
 | Error event mentioning auth | `not_authenticated` | `auth_error` |
 | Error event mentioning limit / quota / overloaded / unavailable / api error | `provider_unavailable` | `provider_error` |
@@ -1645,6 +1646,15 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   broken JSON. Treating the shared reader's refusal as a broken contract reported
   a healthy turn — one whose completion event carried a string `message` — as
   `no_envelope`.
+- **`no_output` is split from `no_envelope`** because the two point at
+  different faults. Not one readable frame (empty stdout, or only banner / updater
+  prose) is a transport or prompt-delivery fault; frames with no terminal frame is
+  an event-contract (or terminal-control noise) fault. A named option rejection
+  still wins over both, and a timeout still wins over everything. The device log
+  line carries `frames=<n> escLines=<n> terminal=<bool> exit=<code>` beside the
+  byte counts — `escLines` counts lines whose first byte is ESC or a UTF-8 BOM,
+  which hide a frame from the `{` check — all numbers, via
+  `openCodeSmokeCounts`, a struct that cannot hold text.
 - **The probe never retries** (nothing droppable in its argv). The direct path
   retries once for a rejected `--session` via the **existing replay recovery**
   (`openCodeRejectedSessionFlag`, which reads **both** streams because `opencode`
@@ -1692,6 +1702,47 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
   leave every later native start reading `""` until the agent restarts, while
   re-probing on every call would re-spawn a doomed child for a binary that is
   simply dead.
+
+## Maintenance pins and the shim's content identity
+
+The Windows nightly smoke exited before the marker envelope, before and after an
+update. Stage one of the fix ships the evidence and two update-safety changes;
+the transport change the evidence selects ships separately.
+
+- **Maintenance pins.** `openCodeLaunch.Maintenance` makes `newOpenCodeCmd` set
+  `OPENCODE_DISABLE_AUTOUPDATE=true` and `OPENCODE_DISABLE_TERMINAL_TITLE=true`
+  (`openCodeMaintenanceEnvPins`) BEFORE the shim route builds its env, so they
+  reach the Node grandchild behind cmd.exe; an inherited value is replaced, never
+  duplicated, and a nil `Env` starts from `os.Environ()`. Only the
+  `__cli_smoke__` probe and the legacy `session_start` smoke set the flag — a
+  pre-update smoke must not BE the update, and a title escape on stdout is noise
+  in the frame stream. Ordinary chat turns and sessions keep the user's update
+  behaviour.
+- **Shim content identity.** `npm install -g` replaces the package behind
+  `opencode.cmd` and leaves the shim byte-identical, so every (path, mtime, size)
+  cache survived the upgrade. `openCodeBinaryIdentity`
+  ([opencode_binary_identity.go](opencode_binary_identity.go)) is a SHA-256 over
+  the shim, `node_modules/opencode-ai/package.json` and each `opencode-windows-*`
+  platform package manifest nested under it or beside it — at most 8 files of at
+  most 64 KiB, only paths inside the shim's tree and only regular files, a
+  missing file hashed as a fixed
+  token; a native binary returns `""` (its stat key already changes). It is the
+  opencode row's `cliSmokeProvider.identity` hook, folded into the cooldown and
+  singleflight stamp (`cliSmokeProviderStamp`) and the shape binding
+  (`bindCLISmokeShapeWithIdentity`), and `openCodeProbeVersion` drops a cached
+  `--version` reading whose shim identity changed.
+- **The live gate.** [cliagent_smoke_opencode_live_windows_test.go](cliagent_smoke_opencode_live_windows_test.go)
+  runs only with `AIX_OPENCODE_LIVE=1` and `AIX_OPENCODE_LIVE_BIN=<affected build>`
+  (never in CI; it spends turns). It drives the real `runOpenCodeSmoke` through
+  the default os/exec pipe, a 1 MiB `CreatePipe` and a file sink, then a 64-byte
+  stdin control, the same stdin through the compiled stub on the same route, and
+  a `run --file` acceptance check. It logs closed values only — counts, the
+  diagnostic, allowlisted event-type counts, and an 8-hex SHA-256 prefix for an
+  unknown type — and names the branch the outcome table selects (A1 large pipe,
+  A2 capture file, B `--file`, B2 loopback `serve`, C1/C2 framing, D blocked).
+  A local run that does not reproduce the field failure does not close the
+  feature: it closes only when a nightly Windows smoke reports
+  `markerMatched: true` both before and after an OpenCode update.
 
 ## Windows shim argument encoding
 

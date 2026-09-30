@@ -27,8 +27,8 @@
 //     cooldown cannot do that on its own: Pub/Sub delivers several outstanding
 //     messages at a time, so a burst would otherwise have every callback miss
 //     the same empty cache and spend its own turn.
-//   - The cooldown is INVALIDATED by a binary change (path/mtime/size/version),
-//     because that is exactly the post-upgrade smoke the harness must not be
+//   - The cooldown is INVALIDATED by a binary change (path/mtime/size/version,
+//     plus a provider's content identity — cliSmokeProvider.identity), because that is exactly the post-upgrade smoke the harness must not be
 //     served a stale pre-upgrade answer for — and by a logout, which changes
 //     the answer without changing the binary.
 //   - Only verdicts that actually SPENT a turn are cached. A free pre-check
@@ -100,6 +100,13 @@ const (
 	// `result` object, Grok's `end` frame; for Codex, neither assistant text
 	// nor a turn-completion frame).
 	cliSmokeDiagnosticNoEnvelope = "no_envelope"
+	// The child RAN and exited, but not one JSON frame reached us and nothing
+	// on either stream named a rejected option. Split out of no_envelope (which
+	// then means frames arrived but none closed the turn, or the stream was
+	// malformed or truncated) because the two point at different faults:
+	// silence is a transport or prompt-delivery fault, frames without a terminal
+	// one an event-contract fault. Only OpenCode's probe separates them today.
+	cliSmokeDiagnosticNoOutput = "no_output"
 	// A well-formed envelope reporting an auth failure.
 	cliSmokeDiagnosticAuthError = "auth_error"
 	// A well-formed envelope reporting a provider-side refusal (API error
@@ -212,15 +219,30 @@ func cliSmokeBinaryStamp(path, version string) string {
 	return fmt.Sprintf("%s|%d|%d|%s", path, info.ModTime().UnixNano(), info.Size(), version)
 }
 
+// cliSmokeProviderStamp is cliSmokeBinaryStamp plus the provider's content
+// identity when it has one. A Windows npm shim is the case that needs it:
+// `npm install -g` replaces the package the shim launches while leaving the
+// shim itself byte-identical, so (path, mtime, size) alone would replay a
+// pre-upgrade verdict for the post-upgrade smoke.
+func cliSmokeProviderStamp(provider cliSmokeProvider, path, version string) string {
+	stamp := cliSmokeBinaryStamp(path, version)
+	if provider.identity != nil && path != "" {
+		stamp += "|" + provider.identity(path)
+	}
+	return stamp
+}
+
 // cliSmokeShapeKey is keyed on (path, mtime, size) — the same key the
-// `--version` probe uses in systemInfo.go. A reinstall or upgrade changes the
-// key, so a shape that stopped working is re-resolved exactly when the binary
-// changes and never re-probed in between. Paths are unique per CLI, so one
-// map serves every provider.
+// `--version` probe uses in systemInfo.go — plus the content Identity a
+// provider may supply (cliSmokeProvider.identity). A reinstall or upgrade
+// changes the key, so a shape that stopped working is re-resolved exactly when
+// the binary changes and never re-probed in between. Paths are unique per CLI,
+// so one map serves every provider.
 type cliSmokeShapeKey struct {
-	Path    string
-	ModUnix int64
-	Size    int64
+	Path     string
+	ModUnix  int64
+	Size     int64
+	Identity string
 }
 
 var (
@@ -229,11 +251,21 @@ var (
 )
 
 func cliSmokeShapeKeyFor(path string) (cliSmokeShapeKey, bool) {
+	return cliSmokeShapeKeyWithIdentity(path, nil)
+}
+
+// cliSmokeShapeKeyWithIdentity is cliSmokeShapeKeyFor with a provider's content
+// identity folded in; a nil identity yields the plain stat key.
+func cliSmokeShapeKeyWithIdentity(path string, identity func(string) string) (cliSmokeShapeKey, bool) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return cliSmokeShapeKey{}, false
 	}
-	return cliSmokeShapeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}, true
+	key := cliSmokeShapeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
+	if identity != nil {
+		key.Identity = identity(path)
+	}
+	return key, true
 }
 
 // cliSmokeRememberedShape reports the shape id previously resolved for this
@@ -261,16 +293,24 @@ func cliSmokeRememberedShape(path string) (string, bool) {
 // cache) would then collapse its ladder onto a rung the installed build may
 // reject. Same discipline runCLISmoke applies to the cooldown verdict.
 type cliSmokeShapeBinding struct {
-	path  string
-	key   cliSmokeShapeKey
-	known bool
+	path     string
+	identity func(string) string
+	key      cliSmokeShapeKey
+	known    bool
 }
 
 // bindCLISmokeShape captures the binary identity BEFORE the first child is
 // launched. An unstattable path yields an unknown binding, which never writes.
 func bindCLISmokeShape(path string) cliSmokeShapeBinding {
-	key, ok := cliSmokeShapeKeyFor(path)
-	return cliSmokeShapeBinding{path: path, key: key, known: ok}
+	return bindCLISmokeShapeWithIdentity(path, nil)
+}
+
+// bindCLISmokeShapeWithIdentity is bindCLISmokeShape for a provider with a
+// content identity. remember() re-derives the same identity, so a package
+// replaced under an unchanged shim mid-run is caught like a replaced binary.
+func bindCLISmokeShapeWithIdentity(path string, identity func(string) string) cliSmokeShapeBinding {
+	key, ok := cliSmokeShapeKeyWithIdentity(path, identity)
+	return cliSmokeShapeBinding{path: path, identity: identity, key: key, known: ok}
 }
 
 // remember stores the winning shape only while the binary on disk is still the
@@ -279,7 +319,7 @@ func (b cliSmokeShapeBinding) remember(shapeID string) {
 	if !b.known {
 		return
 	}
-	current, ok := cliSmokeShapeKeyFor(b.path)
+	current, ok := cliSmokeShapeKeyWithIdentity(b.path, b.identity)
 	if !ok || current != b.key {
 		return
 	}
@@ -367,6 +407,10 @@ type cliSmokeProvider struct {
 	loggedIn func(ctx context.Context, path string) (loggedIn, known bool)
 	// run performs the probe against an already-resolved binary.
 	run func(ctx context.Context, path, version string) cliSmokeResult
+	// identity, when set, is a content identity of what the path LAUNCHES,
+	// folded into the cooldown stamp beside (path, mtime, size, version). Nil
+	// for every provider whose resolved path is the binary itself.
+	identity func(path string) string
 }
 
 // cliSmokeProviders is keyed by the catalog cliId the harness sends as the
@@ -395,6 +439,7 @@ var cliSmokeProviders = map[string]cliSmokeProvider{
 		probeVersion: openCodeProbeVersion,
 		loggedIn:     openCodeSmokeLoggedIn,
 		run:          runOpenCodeSmoke,
+		identity:     openCodeBinaryIdentity,
 	},
 }
 
@@ -421,7 +466,7 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 	if path != "" {
 		version = provider.probeVersion(path)
 	}
-	stamp := cliSmokeBinaryStamp(path, version)
+	stamp := cliSmokeProviderStamp(provider, path, version)
 
 	// `executed` is written only by the closure below, and singleflight runs
 	// that closure synchronously in the LEADER's own goroutine — a follower's
@@ -459,7 +504,7 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 			// flight (keyed on the new stamp) may already have cached the new
 			// binary's verdict, and this late write would evict it.
 			leaderCancelled := ctx.Err() != nil
-			if !leaderCancelled && cliSmokeBinaryStamp(path, version) == stamp {
+			if !leaderCancelled && cliSmokeProviderStamp(provider, path, version) == stamp {
 				rememberCLISmokeVerdict(cliID, stamp, result)
 			}
 			return cliSmokeFlight{result: result, leaderCancelled: leaderCancelled}, nil

@@ -44,6 +44,18 @@ import (
 //	                         whitespace-delimited token of stdin plus a
 //	                         completion frame — a real marker echo, which is
 //	                         what the maintenance smoke measures
+//	OPENCODE_STUB_VERSION_FILE  when readable, `--version` prints its trimmed
+//	                         contents instead of OPENCODE_STUB_VERSION — the
+//	                         package manifest an npm upgrade rewrites
+//	OPENCODE_STUB_ENV_LOG    append one line per run recording whether the
+//	                         maintenance pins reached the child:
+//	                         "autoupdate=<value|unset> title=<value|unset>"
+//	OPENCODE_STUB_SELF_UPDATE when set to a version-file path and
+//	                         OPENCODE_DISABLE_AUTOUPDATE is NOT set, the run
+//	                         updates itself the way an npm upgrade does on
+//	                         Windows: renames its running exe aside, drops a
+//	                         copy in its place, and rewrites the version file to
+//	                         OPENCODE_STUB_SELF_UPDATE_TO at the same mtime
 const openCodeStubSource = `package main
 
 import (
@@ -57,6 +69,12 @@ import (
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		if p := os.Getenv("OPENCODE_STUB_VERSION_FILE"); p != "" {
+			if data, err := os.ReadFile(p); err == nil {
+				fmt.Println(strings.TrimSpace(string(data)))
+				return
+			}
+		}
 		fmt.Println(env("OPENCODE_STUB_VERSION", "0.9.0"))
 		return
 	}
@@ -92,6 +110,19 @@ func main() {
 			fmt.Fprintln(f, strings.Join(os.Args[1:], " "))
 			f.Close()
 		}
+	}
+
+	if p := os.Getenv("OPENCODE_STUB_ENV_LOG"); p != "" {
+		f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if err == nil {
+			fmt.Fprintf(f, "autoupdate=%s title=%s"+newline,
+				envOrUnset("OPENCODE_DISABLE_AUTOUPDATE"), envOrUnset("OPENCODE_DISABLE_TERMINAL_TITLE"))
+			f.Close()
+		}
+	}
+
+	if p := os.Getenv("OPENCODE_STUB_SELF_UPDATE"); p != "" && os.Getenv("OPENCODE_DISABLE_AUTOUPDATE") == "" {
+		selfUpdate(p, os.Getenv("OPENCODE_STUB_SELF_UPDATE_TO"))
 	}
 
 	// Always drain stdin: the parent hands us a real file, and leaving it
@@ -169,6 +200,33 @@ func env(k, def string) string {
 
 func unescape(s string) string {
 	return strings.ReplaceAll(s, "\\n", "\n")
+}
+
+func envOrUnset(k string) string {
+	if v, ok := os.LookupEnv(k); ok {
+		return v
+	}
+	return "unset"
+}
+
+// selfUpdate mimics an npm upgrade under a running CLI on Windows: the running
+// exe is renamed aside (allowed while it runs), a copy takes its place, and the
+// version file is rewritten keeping its mtime, so only its CONTENT changes.
+func selfUpdate(versionFile, next string) {
+	if exe, err := os.Executable(); err == nil {
+		if data, err := os.ReadFile(exe); err == nil {
+			aside := exe + ".old"
+			if os.Rename(exe, aside) == nil {
+				os.WriteFile(exe, data, 0o755)
+			}
+		}
+	}
+	info, err := os.Stat(versionFile)
+	if err != nil {
+		return
+	}
+	os.WriteFile(versionFile, []byte(next), 0o600)
+	os.Chtimes(versionFile, info.ModTime(), info.ModTime())
 }
 `
 

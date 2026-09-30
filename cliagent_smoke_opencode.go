@@ -24,7 +24,8 @@
 //     as stdin — never on argv;
 //   - classifies the outcome into ONE closed diagnostic, with launch_error kept
 //     distinct from no_envelope so "we could not start the child" never shares
-//     a bucket with "the child ran and produced no envelope";
+//     a bucket with "the child ran and produced no envelope", and no_output
+//     ("the child ran and not one frame arrived") split from both;
 //   - never retries: nothing in its argv is droppable.
 //
 // Retention discipline applies exactly as in cliagent_smoke.go: the child's
@@ -81,25 +82,44 @@ const openCodeSmokeWaitDelay = 2 * time.Second
 // whole process TREE down, because an OpenCode tool child otherwise holds the
 // captured pipes past the deadline and Wait would never return.
 var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, err error) {
-	prompt, openErr := os.Open(launch.PromptFile)
-	if openErr != nil {
-		return nil, nil, openErr
+	cmd, closePrompt, err := newOpenCodeSmokeCmd(ctx, launch)
+	if err != nil {
+		return nil, nil, err
 	}
-	defer prompt.Close()
-	launch.Stdin = prompt
-
-	cmd, launchErr := newOpenCodeCmd(ctx, launch)
-	if launchErr != nil {
-		return nil, nil, launchErr
-	}
+	defer closePrompt()
 	outBuf := &boundedBuffer{limit: cliSmokeMaxStdout}
 	errBuf := &boundedBuffer{limit: cliSmokeMaxStderr}
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
-	// Stdout/Stderr are plain writers, so os/exec copies the child's pipes on its
-	// own goroutines and Wait waits for those copies. A tool child that outlives
-	// the kill still holds the write end, and without a delay Wait would block on
-	// it forever — the per-attempt deadline would bound nothing.
+	if err = cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+	err = cmd.Wait()
+	return outBuf.Bytes(), errBuf.Bytes(), err
+}
+
+// newOpenCodeSmokeCmd builds the probe child with everything but its output
+// sinks: the staged prompt as stdin, the wait delay, its own process group and
+// the tree-kill Cancel. The caller sets Stdout / Stderr, starts it, and calls
+// closePrompt once the child has been reaped. Split from the seam so the opt-in
+// live Windows gate can drive the SAME child through other capture sinks.
+func newOpenCodeSmokeCmd(ctx context.Context, launch openCodeLaunch) (cmd *exec.Cmd, closePrompt func(), err error) {
+	prompt, err := os.Open(launch.PromptFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	launch.Stdin = prompt
+
+	cmd, err = newOpenCodeCmd(ctx, launch)
+	if err != nil {
+		_ = prompt.Close()
+		return nil, nil, err
+	}
+	// When Stdout/Stderr are plain writers (the seam's boundedBuffers), os/exec
+	// copies the child's pipes on its own goroutines and Wait waits for them. A
+	// tool child that outlives the kill still holds the write end, and without a
+	// delay Wait would block on it forever — the per-attempt deadline would bound
+	// nothing.
 	cmd.WaitDelay = openCodeSmokeWaitDelay
 	// Setsid on unix (hides the console window on Windows) so the child leads its
 	// own process group, exactly as runOneShot does. Without it the child shares
@@ -122,11 +142,7 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 		killOpenCodeProcessTree(cmd)
 		return nil
 	}
-	if err = cmd.Start(); err != nil {
-		return nil, nil, err
-	}
-	err = cmd.Wait()
-	return outBuf.Bytes(), errBuf.Bytes(), err
+	return cmd, func() { _ = prompt.Close() }, nil
 }
 
 /* --------------------------------------------------------------------------
@@ -180,9 +196,12 @@ func openCodeProbeVersion(path string) string {
 }
 
 // openCodeCachedProbeVersion is the cached probe itself: shim-aware on Windows,
-// the shared probe elsewhere.
+// the shared probe elsewhere. A shim's cached reading is dropped first when the
+// package behind it changed (openCodeBinaryIdentity): npm replaces the package
+// and leaves the shim — and so the cache key — untouched.
 func openCodeCachedProbeVersion(path string) string {
 	if isWindowsShimPath(path) {
+		openCodeForgetVersionOnIdentityChange(path)
 		return cachedProbeVersionFunc(path, func() string {
 			return openCodeShimProbeVersion(path)
 		})
@@ -357,7 +376,7 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 
 	// Bound BEFORE the spawn: the shape this run resolves is a fact about THESE
 	// bytes, not about whatever is at `path` when it finishes.
-	shapeBinding := bindCLISmokeShape(path)
+	shapeBinding := bindCLISmokeShapeWithIdentity(path, openCodeBinaryIdentity)
 	shape := openCodeRunShapeNoSession
 	result.ArgvShapeID = shape.ID
 
@@ -368,6 +387,10 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 		Env:        sanitizeOpenCodeEnv(os.Environ()),
 		Dir:        runDir,
 		PromptFile: promptPath,
+		// Pins self-update off (and the terminal title with it) for this child
+		// only: a pre-update smoke must not BE the update, and a title escape on
+		// stdout is noise in the frame stream. See openCodeMaintenanceEnvPins.
+		Maintenance: true,
 	})
 	// Read the PER-ATTEMPT context before cancelling it: a deadline kill reports
 	// an *exec.ExitError, not a wrapped context error, so judging by the parent
@@ -384,19 +407,65 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 		shapeBinding.remember(shape.ID)
 		return result
 	}
-	// Device-local log line: closed values plus LENGTHS — metrics, not content.
+	// Device-local log line: closed values plus COUNTS — metrics, not content.
 	// The child's bytes live no longer than the classifier that read them.
-	fmt.Print(openCodeSmokeFailureLogLine(shape.ID, category, diagnostic, len(stderr), len(stdout)))
+	fmt.Print(openCodeSmokeFailureLogLine(shape.ID, category, diagnostic,
+		openCodeSmokeCountsFor(stdout, stderr, runErr)))
 	return finish(category, diagnostic)
 }
 
+// openCodeSmokeCounts is everything the failure log line says about the child's
+// output: byte and line counts, whether a terminal frame arrived, and the exit
+// code. Numbers and a bool only — a struct that cannot hold text cannot leak it.
+//
+// Frames and EscLines are what tell the no_output / no_envelope failures apart
+// in the field: zero frames with zero bytes is a transport or prompt-delivery
+// fault, frames with EscLines > 0 is terminal-control noise in the stream, and
+// frames with neither but no terminal frame is an event-contract change.
+type openCodeSmokeCounts struct {
+	StderrBytes int
+	StdoutBytes int
+	Frames      int
+	EscLines    int
+	Terminal    bool
+	Exit        int
+}
+
+// openCodeSmokeCountsFor derives the log counts from one run's capture.
+func openCodeSmokeCountsFor(stdout, stderr []byte, runErr error) openCodeSmokeCounts {
+	stream := parseOpenCodeSmokeStream(stdout)
+	return openCodeSmokeCounts{
+		StderrBytes: len(stderr),
+		StdoutBytes: len(stdout),
+		Frames:      stream.Frames,
+		EscLines:    stream.EscLines,
+		Terminal:    stream.Ended,
+		Exit:        openCodeSmokeExitCode(runErr),
+	}
+}
+
+// openCodeSmokeExitCode is the child's exit code: 0 for a clean exit, the code
+// of an *exec.ExitError, and -1 when the error carries none (a launch failure,
+// or a WaitDelay expiry whose exit status was not observed).
+func openCodeSmokeExitCode(runErr error) int {
+	if runErr == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
+}
+
 // openCodeSmokeFailureLogLine renders the device-local diagnostic line. It takes
-// stderr/stdout LENGTHS rather than the bytes, deliberately: a function that
-// cannot receive vendor text cannot leak it, no matter how a future caller wires
-// it up. Every other argument is a value this package defines.
-func openCodeSmokeFailureLogLine(shapeID, category, diagnostic string, stderrBytes, stdoutBytes int) string {
-	return fmt.Sprintf("%s[cli-smoke] opencode shape=%s category=%s diagnostic=%s stderrBytes=%d stdoutBytes=%d%s\n",
-		colorYellow, shapeID, category, diagnostic, stderrBytes, stdoutBytes, colorReset)
+// COUNTS rather than the bytes, deliberately: a function that cannot receive
+// vendor text cannot leak it, no matter how a future caller wires it up. Every
+// other argument is a value this package defines.
+func openCodeSmokeFailureLogLine(shapeID, category, diagnostic string, counts openCodeSmokeCounts) string {
+	return fmt.Sprintf("%s[cli-smoke] opencode shape=%s category=%s diagnostic=%s stderrBytes=%d stdoutBytes=%d frames=%d escLines=%d terminal=%t exit=%d%s\n",
+		colorYellow, shapeID, category, diagnostic, counts.StderrBytes, counts.StdoutBytes,
+		counts.Frames, counts.EscLines, counts.Terminal, counts.Exit, colorReset)
 }
 
 // openCodeSmokePrompt is the one-turn instruction. It names no path, no account
@@ -519,6 +588,11 @@ func pruneOpenCodeSmokeScratch(scratch string, now time.Time) {
 // retained past the classifier), and whether the stream was TRUNCATED or
 // malformed — in which case the accumulated text is partial and must never be
 // compared against the marker.
+//
+// Frames counts the lines that decoded as JSON events; EscLines counts lines
+// whose first byte is ESC or a UTF-8 BOM (terminal-control noise that hides a
+// frame from the `{` check). Both are counts only — they feed the no_output
+// arm and the failure log line, never a published value.
 type openCodeSmokeStream struct {
 	Text         string
 	Ended        bool
@@ -526,6 +600,14 @@ type openCodeSmokeStream struct {
 	SawError     bool
 	Malformed    bool
 	Overflow     bool
+	Frames       int
+	EscLines     int
+}
+
+// openCodeLineStartsWithEscape reports a line whose first byte is ESC (a CSI or
+// OSC sequence such as a terminal-title write) or the start of a UTF-8 BOM.
+func openCodeLineStartsWithEscape(line string) bool {
+	return strings.HasPrefix(line, "\x1b") || strings.HasPrefix(line, "\xef\xbb\xbf")
 }
 
 // parseOpenCodeSmokeStream folds the JSON events OpenCode emits under
@@ -555,6 +637,9 @@ func parseOpenCodeSmokeStream(stdout []byte) openCodeSmokeStream {
 	scanner.Buffer(make([]byte, 0, 64*1024), openCodeNativeMaxFrameBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		if openCodeLineStartsWithEscape(line) {
+			stream.EscLines++
+		}
 		if line == "" || !strings.HasPrefix(line, "{") {
 			// A line that is not a JSON object (a banner, an updater notice) is
 			// skipped rather than treated as a protocol failure.
@@ -568,6 +653,7 @@ func parseOpenCodeSmokeStream(stdout []byte) openCodeSmokeStream {
 			stream.Malformed = true
 			continue
 		}
+		stream.Frames++
 		if msg := frame.errorMessage(); msg != "" {
 			if !stream.SawError {
 				stream.SawError = true
@@ -730,17 +816,28 @@ func classifyOpenCodeSmokeRun(timedOut bool, stdout, stderr []byte, runErr error
 	}
 
 	if !stream.Ended {
+		diagnostic := cliSmokeDiagnosticNoEnvelope
 		if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
 			// Exit non-zero with no terminal frame: the CLI rejected our
 			// invocation shape before producing its documented output — the
 			// pre-inference exit this probe exists to name precisely.
-			return cliUsageErrorProtocol, openCodeSmokeNoEnvelopeDiagnostic(stdout, stderr), false
+			diagnostic = openCodeSmokeNoEnvelopeDiagnostic(stdout, stderr)
 		}
 		// A clean exit that never emitted a completion event — an updater
 		// notice on stdout, a build whose event contract moved — is a broken
 		// contract, not a broken model. framing_rejected is NEVER inferred from
 		// silence: only a positive rejection names it.
-		return cliUsageErrorProtocol, cliSmokeDiagnosticNoEnvelope, false
+		//
+		// NOT ONE frame (and nothing malformed or truncated) is narrower still:
+		// the child ran and exited having said nothing we could read, which is
+		// the Windows field symptom — a transport or prompt-delivery fault
+		// rather than an event-contract one. A named option rejection keeps its
+		// own diagnostic.
+		if diagnostic == cliSmokeDiagnosticNoEnvelope &&
+			stream.Frames == 0 && !stream.Malformed && !stream.Overflow {
+			diagnostic = cliSmokeDiagnosticNoOutput
+		}
+		return cliUsageErrorProtocol, diagnostic, false
 	}
 
 	// A truncated or malformed stream reached a terminal frame but the text is

@@ -62,6 +62,7 @@ func loadOpenCodeLegacyRequest(t *testing.T) openCodeLegacyRequestFixture {
 type openCodeSessionRun struct {
 	argv    string
 	stdin   string
+	env     string // the stub's OPENCODE_STUB_ENV_LOG line: which maintenance pins it saw
 	spawned bool
 	err     error
 }
@@ -89,6 +90,13 @@ func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
 	stdinLog := filepath.Join(dir, "stdin.log")
 	t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
 	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
+	envLog := filepath.Join(dir, "env.log")
+	t.Setenv("OPENCODE_STUB_ENV_LOG", envLog)
+	// The pins must come from the launcher, never from the test's own env.
+	for _, pin := range openCodeMaintenanceEnvPins {
+		t.Setenv(pin[0], "")
+		os.Unsetenv(pin[0])
+	}
 	// A terminal frame so the session completes promptly rather than waiting out
 	// its timeout.
 	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"session.completed"}`)
@@ -114,6 +122,9 @@ func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
 	}
 	if body, err := os.ReadFile(stdinLog); err == nil {
 		run.stdin = strings.TrimSpace(string(body))
+	}
+	if body, err := os.ReadFile(envLog); err == nil {
+		run.env = strings.TrimSpace(string(body))
 	}
 	return run
 }
@@ -165,6 +176,10 @@ func TestOpenCodeLegacySmoke_DeployedPureRequestRunsTheLadderArgv(t *testing.T) 
 	}
 	if run.stdin != wantPrompt {
 		t.Fatalf("child stdin = %q, want the marker prompt %q", run.stdin, wantPrompt)
+	}
+	// A maintenance smoke must not update the CLI it is measuring.
+	if run.env != "autoupdate=true title=true" {
+		t.Fatalf("maintenance pins on the smoke child = %q, want both set", run.env)
 	}
 }
 
@@ -266,6 +281,10 @@ func TestOpenCodeLegacySmoke_NonReservedTrafficRunsAsAnOrdinarySession(t *testin
 			}
 			if run.stdin != tc.wantStdin {
 				t.Fatalf("child stdin = %q, want %q", run.stdin, tc.wantStdin)
+			}
+			// Ordinary sessions keep the user's update behaviour.
+			if run.env != "autoupdate=unset title=unset" {
+				t.Fatalf("an ordinary session carries maintenance pins: %q", run.env)
 			}
 		})
 	}

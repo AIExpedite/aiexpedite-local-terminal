@@ -61,10 +61,40 @@ func TestRunCLISmoke_OpenCodeCmdShimEchoesTheMarkerThroughCmdExe(t *testing.T) {
 	t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
 	t.Setenv("OPENCODE_STUB_STDIN_LOG", stdinLog)
 	t.Setenv("OPENCODE_STUB_ECHO_STDIN", "1")
+	envLog := filepath.Join(t.TempDir(), "env.log")
+	t.Setenv("OPENCODE_STUB_ENV_LOG", envLog)
 
 	result, replayed := runCLISmoke(context.Background(), "opencode")
 	if replayed {
 		t.Fatal("the first smoke must actually run")
+	}
+	// The maintenance pins cross cmd.exe and reach the shim's grandchild.
+	if logged, err := os.ReadFile(envLog); err != nil ||
+		strings.TrimSpace(string(logged)) != "autoupdate=true title=true" {
+		t.Fatalf("maintenance pins did not reach the shim's child: %q (err=%v)", logged, err)
+	}
+
+	// An ordinary (non-Maintenance) launch through the same shim carries none.
+	ordinaryLog := filepath.Join(t.TempDir(), "env-ordinary.log")
+	env := os.Environ()
+	// Drop the pins, and the argv / stdin logs the smoke's assertions below read.
+	env = stripEnvPrefixes(env, []string{"OPENCODE_DISABLE_AUTOUPDATE=", "OPENCODE_DISABLE_TERMINAL_TITLE=",
+		"OPENCODE_STUB_ARGV_LOG=", "OPENCODE_STUB_STDIN_LOG="})
+	env = setEnvVar(env, "OPENCODE_STUB_ENV_LOG", ordinaryLog)
+	ordinary, err := newOpenCodeCmd(context.Background(), openCodeLaunch{
+		Path: shim,
+		Args: buildOpenCodeRunArgs(openCodeRunShapeNoSession, ""),
+		Env:  env,
+		Dir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("ordinary shim launch refused: %v", err)
+	}
+	if out, runErr := ordinary.CombinedOutput(); runErr != nil {
+		t.Fatalf("ordinary shim launch failed: %v\n%s", runErr, out)
+	}
+	if logged, _ := os.ReadFile(ordinaryLog); strings.TrimSpace(string(logged)) != "autoupdate=unset title=unset" {
+		t.Fatalf("an ordinary launch carries maintenance pins: %q", logged)
 	}
 	if result.Status != cliSmokeStatusSuccess || !result.MarkerMatched {
 		t.Fatalf("a shim install must classify success with markerMatched: %+v", result)
