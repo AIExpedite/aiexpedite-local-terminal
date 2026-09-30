@@ -1127,6 +1127,37 @@ func TestCodexFencedRollout_ARefusedCounterWriteCannotAuthorizeASecondEarlyRead(
 	if *calls != 1 {
 		t.Fatalf("a restart re-authorized an early read: %d early-path calls", *calls)
 	}
+
+	// The final fallback charges the reserved early read on disk before its own
+	// read, so the debt's reads stay within the two-read budget in total.
+	codexUsageRefresh.releaseWorker(r.f.fp)
+	codexRunDebtWorker(r.f.home, r.f.fp)
+	drainCodexRunDebtLadder(t)
+	if snap := r.f.snapshot(t); *calls != codexRefreshLiveReadMaxAttempts || snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("calls=%d reads=%d, want %d outbound reads in total counting the early one",
+			*calls, snap.RefreshLiveReads, codexRefreshLiveReadMaxAttempts)
+	}
+}
+
+// Charging the reserved early read is itself a guarded write: refused, the
+// fallback sends nothing this pass rather than reading against an uncounted one.
+func TestCodexFencedRollout_ARefusedChargeSendsNoFallbackRead(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, noReadingFallback)
+	id := r.state.debtID()
+	if !codexReserveEarlyLiveRead(r.f.fp, id) {
+		t.Fatal("reservation not written")
+	}
+	state := codexRunFreshnessForAccount(r.f.fp, codexUsageFreshnessNow())
+	failCommitsMatching(t, 1, func(out string) bool { return strings.Contains(out, `"refreshLiveReads": 1`) })
+
+	kind, outbound := codexLiveUsageFallbackOutbound(r.f.fp, state)
+	if *calls != 0 || outbound || kind != codexRetrySpacing {
+		t.Fatalf("calls=%d outbound=%v kind=%v, want no read and a spacing rung", *calls, outbound, kind)
+	}
+	if snap := r.f.snapshot(t); snap.RefreshLiveReads != 0 {
+		t.Fatalf("reads=%d, want the refused charge to leave the count alone", snap.RefreshLiveReads)
+	}
 }
 
 // A refused reservation write sends no early read and books the scan rung.
@@ -1165,7 +1196,8 @@ func TestCodexFencedRollout_OfflineReleasesTheReservationForTheNextRung(t *testi
 }
 
 // A refused release write loses the opportunity — the safe direction: no early
-// read later, and the final fallback keeps its whole two-read budget.
+// read later, and the final fallback charges the held reservation as a spent
+// read, so the debt ends one read short rather than one over.
 func TestCodexFencedRollout_ARefusedReleaseLosesOnlyTheOpportunity(t *testing.T) {
 	r := newCodexFencedRun(t)
 	calls := stubCodexFallbackRead(t, noReadingFallback)
@@ -1187,7 +1219,15 @@ func TestCodexFencedRollout_ARefusedReleaseLosesOnlyTheOpportunity(t *testing.T)
 	nextRung()
 	codexPayRunRefresh(r.f.home, r.f.fp)
 	if snap := r.f.snapshot(t); *calls != 0 || snap.RefreshLiveReads != 0 {
-		t.Fatalf("calls=%d reads=%d, want the opportunity lost and the budget intact", *calls, snap.RefreshLiveReads)
+		t.Fatalf("calls=%d reads=%d, want the opportunity lost and nothing spent yet", *calls, snap.RefreshLiveReads)
+	}
+
+	codexUsageRefresh.releaseWorker(r.f.fp)
+	codexRunDebtWorker(r.f.home, r.f.fp)
+	drainCodexRunDebtLadder(t)
+	if snap := r.f.snapshot(t); *calls != codexRefreshLiveReadMaxAttempts-1 || snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("calls=%d reads=%d, want %d final read with the reservation charged",
+			*calls, snap.RefreshLiveReads, codexRefreshLiveReadMaxAttempts-1)
 	}
 }
 

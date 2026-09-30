@@ -1809,6 +1809,31 @@ func codexReleaseEarlyLiveRead(fp string, id codexDebtID) {
 	})
 }
 
+// codexChargeReservedEarlyRead records debt `id`'s reserved early read as one
+// spent live read when no count for it is on disk, and returns the debt's
+// persisted read count. ok false (refused, or the debt moved on) means no read
+// this pass. A reservation whose release write was refused is charged too although
+// nothing went out — the safe direction: one read fewer, never one more.
+func codexChargeReservedEarlyRead(fp string, id codexDebtID) (reads int, ok bool) {
+	var already bool
+	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs ||
+			snap.EarlyReadFloorMs != id.floorMs || snap.EarlyReadOwedAtMs != id.owedAtMs {
+			return false
+		}
+		if snap.RefreshLiveReads > 0 {
+			reads, already = snap.RefreshLiveReads, true
+			return false
+		}
+		snap.RefreshLiveReads = 1
+		return true
+	})
+	if already {
+		return reads, true
+	}
+	return 1, committed
+}
+
 // codexRecordRefreshAttempt counts `spent` attempts against fp's debt, folding
 // in any whose write the bounded cache locks previously refused. The count is
 // what codexStaleRunNotice gates the warning on (attempts >=
@@ -2031,6 +2056,17 @@ func codexLiveUsageFallbackOutbound(fp string, state codexRunFreshnessState) (ki
 	id := state.debtID()
 	if !id.valid() || state.fallback == codexFallbackExhausted {
 		return codexRetryNone, false
+	}
+	if state.earlyRead == id && state.liveReads+codexUsageRefresh.peekLiveReads(fp, id) == 0 {
+		// A held reservation means the early read went out, yet no count survived:
+		// its counter write was refused and the retained count died with the
+		// previous process. Charge it on disk BEFORE this read, so the reads that
+		// follow are counted on top of it and the budget stays two in total.
+		reads, ok := codexChargeReservedEarlyRead(fp, id)
+		if !ok {
+			return codexRetrySpacing, false
+		}
+		state.liveReads = reads
 	}
 	// The budget counts reads on disk PLUS any whose counter write the bounded
 	// cache locks refused (peeked, not consumed: consuming here would lose the
