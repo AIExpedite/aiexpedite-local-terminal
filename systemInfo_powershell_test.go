@@ -180,6 +180,19 @@ func TestGatherPowerShellPolicyWindows_PwshOnlyWhenOnPath(t *testing.T) {
 	}
 }
 
+func TestGatherPowerShellPolicyWindows_FailedPwshProbeStillQualifiesCommand(t *testing.T) {
+	stubSetupLookPath(t, "pwsh")
+	f := &policyProbeRunner{answers: map[string]string{"powershell": restrictedJSON}} // pwsh timed out
+	p := gatherPowerShellPolicyWindows(context.Background(), f.run)
+	if p == nil || len(p.Hosts) != 1 || !p.FixableByCurrentUser {
+		t.Fatalf("got %+v", p)
+	}
+	want := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
+	if got := p.manualCommand(); got != want {
+		t.Fatalf("pwsh is installed, so the Windows PowerShell command must name its host: got %q want %q", got, want)
+	}
+}
+
 func TestGatherPowerShellPolicyWindows_NoAnswerIsNil(t *testing.T) {
 	stubSetupLookPath(t)
 	f := &policyProbeRunner{answers: map[string]string{}} // timed out / failed

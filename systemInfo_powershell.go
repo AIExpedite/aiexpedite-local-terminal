@@ -98,6 +98,9 @@ type powerShellPolicyInfo struct {
 	// RemoteSigned lifts the block in EVERY blocking host. A mixed report (one
 	// host fixable, another locked by policy) is not fixable.
 	FixableByCurrentUser bool `json:"fixableByCurrentUser"`
+	// pwshDetected: pwsh is on PATH, even when its probe failed and Hosts has
+	// no powershell7 entry. The manual command must still name the host.
+	pwshDetected bool
 }
 
 // primaryBlockingHost is the host a message names: the first that blocks.
@@ -211,7 +214,9 @@ func summarizePowerShellPolicy(hosts []powerShellHostPolicy) *powerShellPolicyIn
 func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *powerShellPolicyInfo {
 	type probe struct{ host, cmd string }
 	probes := []probe{{powerShellHostWindows, "powershell"}}
-	if _, err := setupProbeLookPath("pwsh"); err == nil {
+	_, lookErr := setupProbeLookPath("pwsh")
+	pwshDetected := lookErr == nil
+	if pwshDetected {
 		probes = append(probes, probe{powerShellHost7, "pwsh"})
 	}
 	results := make([]*powerShellHostPolicy, len(probes))
@@ -233,14 +238,18 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 			hosts = append(hosts, *r)
 		}
 	}
-	return summarizePowerShellPolicy(hosts)
+	info := summarizePowerShellPolicy(hosts)
+	if info != nil {
+		info.pwshDetected = pwshDetected
+	}
+	return info
 }
 
 // manualCommand is what a person runs to allow local scripts in EVERY blocking
 // host. The hosts keep separate CurrentUser stores, so setting the policy in
 // one leaves the other restricted. The bare setter is only unambiguous when
 // Windows PowerShell is the only host on the computer; once PowerShell 7 is
-// installed a person may paste into either window, so the setter is invoked
+// installed (even when its probe failed) a person may paste into either window, so the setter is invoked
 // once per blocking host through that host's own executable.
 func (p *powerShellPolicyInfo) manualCommand() string {
 	return p.manualCommandWhere(func(*powerShellHostPolicy) bool { return true })
@@ -250,7 +259,7 @@ func (p *powerShellPolicyInfo) manualCommand() string {
 // accepts, or "" when it accepts none.
 func (p *powerShellPolicyInfo) manualCommandWhere(keep func(*powerShellHostPolicy) bool) string {
 	var hosts []string
-	onlyWindowsHost := true
+	onlyWindowsHost := p == nil || !p.pwshDetected
 	anyBlocking := false
 	if p != nil {
 		for i := range p.Hosts {
