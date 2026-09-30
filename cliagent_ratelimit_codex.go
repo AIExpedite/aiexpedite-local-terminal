@@ -1713,6 +1713,10 @@ func mergeCodexRateLimitCacheObserved(
 		return false, false
 	}
 	var generation cliUsageGeneration
+	// publishable reports a committed write whose rendered state moved — a fresh
+	// contributor observation, or an authoritative clear that retired one. Both
+	// change what the card must show, so both owe the backend a hint.
+	var publishable bool
 	committed = codexRateLimitCacheTransaction(ctx, path, now, waitForLocks, func(snap *codexRateLimitSnapshot) bool {
 		advanced = false
 		// A rollout scan validates the active account before it starts, but auth
@@ -1744,7 +1748,14 @@ func mergeCodexRateLimitCacheObserved(
 		// mistaken for a fresh observation and restamped.
 		before := codexContributorObservationTimes(codexContributorsFromSnapshot(*snap))
 		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
-		advanced = codexStampCaptureVersion(snap, before, fullSnapshot && (len(clears) > 0 || emptyAuthoritative), producerVersion)
+		authoritativeClear := fullSnapshot && (len(clears) > 0 || emptyAuthoritative)
+		advanced = codexStampCaptureVersion(snap, before, authoritativeClear, producerVersion)
+		// An authoritative clear is the out-of-quota / retired-window shape: it
+		// removes contributors instead of moving one forward, so `advanced` is
+		// false, yet the generation moved and the card must stop rendering the
+		// numbers the backend still holds. snap.generationBumped keeps an
+		// idempotent re-clear (nothing actually changed) from hinting.
+		publishable = advanced || (authoritativeClear && snap.generationBumped)
 		generation = cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
 		return true
 	})
@@ -1753,7 +1764,7 @@ func mergeCodexRateLimitCacheObserved(
 	// asks the backend to fetch it (cliagent_usage_propagate.go). Only for the
 	// ACTIVE account: the rollout base and requireActiveAccount already proved
 	// that inside the transaction; any other caller is checked here.
-	if committed && advanced && (rolloutAccountBase != "" || requireActiveAccount || fingerprint == currentCodexAccountFingerprint()) {
+	if committed && publishable && (rolloutAccountBase != "" || requireActiveAccount || fingerprint == currentCodexAccountFingerprint()) {
 		noteCLIUsageObservationAdvanced(codexUsageProvider, generation)
 	}
 	return committed, committed && advanced

@@ -412,3 +412,30 @@ func TestCLIUsageHint_BodyCarriesNoMetricValues(t *testing.T) {
 		}
 	}
 }
+
+// An authoritative clear — the out-of-quota shape, null or empty windows —
+// retires the cached contributors instead of moving one forward, so the merge
+// reports no advance. It still changes what the card must show, so it owes the
+// backend a hint; otherwise the old numeric utilization stays published until
+// an unrelated refresh happens to run.
+func TestCLIUsageHint_AnAuthoritativeClearIsHinted(t *testing.T) {
+	withCodexGenerationEpoch(t, 513)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	rec, cfg := propagatorFixture(t)
+	codexLiveReadAt(t, f, 31, 41, now) // rotates the epoch and hints the reading
+	startCLIUsagePropagator(cfg)
+	before := len(waitHints(t, rec, 1, 0))
+
+	if !captureCodexRateLimitLineForAccount(`{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{}}}`, now.Add(time.Second), f.fp) {
+		t.Fatal("the authoritative clear did not land")
+	}
+	hints := waitHints(t, rec, before+1, 0)
+	cleared, snap := hints[len(hints)-1].hint, f.snapshot(t)
+	if len(codexContributorsFromSnapshot(snap)) != 0 {
+		t.Fatalf("the clear left contributors behind: %+v", snap.Contributors)
+	}
+	if cleared.GenerationEpoch != snap.GenerationEpoch || cleared.Generation != snap.Generation {
+		t.Fatalf("hint = %+v, want the cleared generation {%d,%d}", cleared, snap.GenerationEpoch, snap.Generation)
+	}
+}
