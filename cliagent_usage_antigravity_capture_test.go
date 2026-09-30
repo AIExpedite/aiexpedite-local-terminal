@@ -951,7 +951,7 @@ func TestAntigravityRunCapture_ResolvesTheWrappedAgy(t *testing.T) {
 		t.Error("the resolver kept scanning after resolving")
 	}
 	lockAntigravityLogIndex()
-	managed := antigravityPIDIn(antigravityLogIndex.managedPIDs, 303, "")
+	managed := antigravityPIDIn(antigravityLogIndex.managedPIDs, 303, "", time.Time{})
 	unlockAntigravityLogIndex()
 	if !managed {
 		t.Error("the resolved agy was not marked managed")
@@ -962,11 +962,10 @@ func TestAntigravityRunCapture_ResolvesTheWrappedAgy(t *testing.T) {
 // The resolver's budget is bounded: at most antigravityWrapperMaxScans scans.
 func TestAntigravityRunCapture_ResolverBudget(t *testing.T) {
 	helperIsolateAntigravityCapture(t, "1h")
-	origScan, origEvery, origMax := antigravityAncestryScan, antigravityWrapperScanEvery, antigravityWrapperMaxScans
-	defer func() {
-		antigravityAncestryScan, antigravityWrapperScanEvery, antigravityWrapperMaxScans = origScan, origEvery, origMax
-	}()
-	antigravityWrapperScanEvery, antigravityWrapperMaxScans = time.Millisecond, 4
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan, origMax := antigravityAncestryScan, antigravityWrapperMaxScans
+	defer func() { antigravityAncestryScan, antigravityWrapperMaxScans = origScan, origMax }()
+	antigravityWrapperMaxScans = 4
 	var scans atomic.Int64
 	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) { scans.Add(1); return nil, true }
 	capture := startAntigravityQuotaCapture("unresolved run")
@@ -976,6 +975,49 @@ func TestAntigravityRunCapture_ResolverBudget(t *testing.T) {
 	if got := scans.Load(); got != 4 {
 		t.Errorf("scans=%d, want the budget of 4", got)
 	}
+}
+
+func helperResolverSchedule(t *testing.T, ramp, every time.Duration) {
+	t.Helper()
+	origRamp, origEvery := antigravityWrapperRampEvery, antigravityWrapperScanEvery
+	t.Cleanup(func() { antigravityWrapperRampEvery, antigravityWrapperScanEvery = origRamp, origEvery })
+	antigravityWrapperRampEvery, antigravityWrapperScanEvery = ramp, every
+}
+
+// A wrapped agy that fails fast is over long before one steady interval. The
+// resolver scans at once and through its opening ramp, so it still sees agy
+// alive — here only on the third scan — without waiting a steady interval.
+func TestAntigravityRunCapture_ResolverRampCatchesAFastRun(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, 10*time.Millisecond, time.Hour)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+	var scans atomic.Int64
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		if scans.Add(1) < 3 {
+			return []ProcessInfo{{PID: 700, Name: "powershell.exe"}}, true
+		}
+		return []ProcessInfo{{PID: 700, Name: "powershell.exe"}, {PID: 701, ParentPID: 700, Name: "agy.exe"}}, true
+	}
+	capture := startAntigravityQuotaCapture("fast wrapped run")
+	capture.SetWrapper(700)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid == 701 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	capture.mu.Lock()
+	pid := capture.pid
+	capture.mu.Unlock()
+	if pid != 701 {
+		t.Errorf("resolved pid=%d after %d scans, want the ramp to resolve the fast agy (701)", pid, scans.Load())
+	}
+	helperStopCapture(t, capture.Finish)
 }
 
 // A spawn site hands SetStarted the child it started: a direct `agy` is the
@@ -1025,7 +1067,7 @@ func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
 			t.Errorf("wrapper %d resolved pid=%d, want %d", tc.root, got, tc.want)
 		}
 		lockAntigravityLogIndex()
-		wrapperManaged := tc.root != tc.want && antigravityPIDIn(antigravityLogIndex.managedPIDs, tc.root, "")
+		wrapperManaged := tc.root != tc.want && antigravityPIDIn(antigravityLogIndex.managedPIDs, tc.root, "", time.Time{})
 		unlockAntigravityLogIndex()
 		if wrapperManaged {
 			t.Errorf("the wrapper shell %d was recorded as the managed agy", tc.root)

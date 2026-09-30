@@ -444,6 +444,45 @@ func TestAntigravityCandidate_ReusedRememberedPIDIsADirectRun(t *testing.T) {
 	}
 }
 
+// A user's agy that reuses a remembered PID and exits before the next pass
+// leaves no readable start token. The remembered run had already ended when
+// that log was named, so the PID alone must not claim it: it is a direct run
+// and is owed. The remembered run's own log, named while it ran, still
+// matches by PID when its token is unreadable.
+func TestAntigravityCandidate_ExitedReusedPIDIsADirectRun(t *testing.T) {
+	for _, kind := range []string{"own", "managed"} {
+		t.Run(kind, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			antigravityProcessStartToken = func(int) (string, error) { return "", fmt.Errorf("no such process") }
+			antigravityCandidateProbe = func(int, string) processProbeResult { return processGone }
+
+			ran := time.Now().Add(-time.Minute)
+			ownLog := h.write(t, helperLogName(ran), helperPIDBlock(7201), ran, false)
+			if kind == "own" {
+				child := beginAntigravityOwnChild(h.home)
+				child.setPID(7201)
+				child.done()
+			} else {
+				noteAntigravityManagedPID(7201)
+				noteAntigravityManagedPIDExited(7201)
+			}
+
+			later := time.Now().Add(time.Minute)
+			reused := h.write(t, helperLogName(later), helperPIDBlock(7201), later, false)
+			h.pass(later.Add(10*time.Second), 0)
+			if class, _ := helperEntryClass(reused); class != antigravityLogCandidate {
+				t.Fatalf("class=%v, want the exited reused PID's log to be a direct-run candidate", class)
+			}
+			if class, _ := helperEntryClass(ownLog); class == antigravityLogCandidate {
+				t.Error("the remembered run's own log became a candidate")
+			}
+			if res := h.pass(later.Add(5*time.Minute), 0); res.owed.IsZero() {
+				t.Error("the user's run on an exited reused PID was never owed")
+			}
+		})
+	}
+}
+
 /* ─────────────────────────── reclassification ─────────────────────────── */
 
 // DirectRunAppendedToOwnedLog: a direct run started in the same second as an

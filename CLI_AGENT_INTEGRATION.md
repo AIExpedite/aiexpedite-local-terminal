@@ -1411,7 +1411,10 @@ can.
   diagnostic and the nudge, and the nudge returns without stamping its
   cooldown. The index remembers the last 64 own and 64 managed PIDs with their
   start tokens, so a PID the OS reuses for a user's `agy` reads as a direct run,
-  not as ours; an unreadable token on either side falls back to the PID.
+  not as ours. When a token is unreadable (the user's run has already exited),
+  the PID still matches only a log named no later than the remembered run's
+  exit, which `Finish` and `done()` record: a run that started after ours ended
+  cannot be it.
 - **Discovery tick.** One process-wide 60 s timer (`startAntigravityDiscovery`,
   from `StartAgent`; stopped by `gracefulShutdown`) runs while `agy` is
   installed. Each tick lists names only, per base, and classifies the names the
@@ -1466,7 +1469,9 @@ can.
   shell wrapper such as `bash -c "agy …"`. The wrapped Windows chain (`runLocalCommandWindows`: encoded, file-mode,
   shell, fallback and the persistent host via `HostPID`) calls
   `SetWrapper(pid)` as each transport starts. The wrapper resolver scans the
-  wrapper's tree every 5 s, at most 60 times, only while the command runs,
+  wrapper's tree at once, then 5 more times 0.5 s apart (so an `agy` that
+  fails fast is still seen alive), then every 5 s, at most 60 scans in all,
+  only while the command runs,
   takes the first `agy.exe` (`agy` off Windows) within 3 levels whose start is not before the
   capture floor (the persistent host outlives every command), marks it managed
   and stops. `Finish` stops it and settles with the PID.
@@ -1513,7 +1518,8 @@ can.
 - **Acceptance limitations (recorded).** Each stays at "no chartable windows"
   or an older reading: an all-exhausted reply after a DIRECT run only; an
   all-exhausted reply across an agent self-update (evidence is in memory); an
-  all-exhausted wrapped Windows run shorter than one resolver tick (5 s); a
+  all-exhausted wrapped run whose `agy` exits before any resolver scan sees it
+  (after exit nothing ties its log to the wrapper rather than a direct run); a
   direct run that started and ended while no agent ran, with more than 256 logs
   started since the last reading; on macOS / Linux, a direct session still live
   across an agent restart whose log is not in the startup listing gets only the
@@ -1525,11 +1531,13 @@ can.
   few ms at that size; it starts to matter around tens of thousands of names
   per base), stats of new names, and at most 104 watched plus 64 grace stats.
   Process-only tracking needs no file stats. The wrapper resolver's
-  `Get-CimInstance` scan (about 1 s) runs every 5 s only while a wrapped managed
+  `Get-CimInstance` scan (about 1 s) runs back to back for its opening ramp,
+  then every 5 s, only while a wrapped managed
   `agy` run is live and unresolved, at most 60 times per run.
 - **Test seams.** `antigravityCandidateProbe`, `antigravityProcessStartToken`,
   `antigravityProcessScan`, `antigravityDiscoveryInterval`,
-  `antigravityAncestryScan`, `antigravityWrapperScanEvery`,
+  `antigravityAncestryScan`, `antigravityWrapperRampEvery`,
+  `antigravityWrapperScanEvery`,
   `antigravityExhaustionEvidenceFn`, `antigravityShutdownDrain` and
   `runProcessScanCommand` (Windows); `antigravityLockOrderCheck` makes taking
   the live-runs or freshness lock while holding the index lock panic. The mock

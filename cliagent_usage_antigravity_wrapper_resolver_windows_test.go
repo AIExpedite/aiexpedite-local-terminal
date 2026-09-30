@@ -56,18 +56,19 @@ func TestAntigravityWrapperResolver_EncodedPowerShellResolves(t *testing.T) {
 	}
 }
 
-// Misses: a run shorter than one resolver tick is never resolved and records
-// nothing — the recorded limitation.
-func TestAntigravityWrapperResolver_ShortRunRecordsNothing(t *testing.T) {
-	executable := helperWrappedAgyFixture(t, "0s")
+// Fast failure: a run far shorter than the shipped 5 s steady interval is
+// still resolved, because the resolver scans at once and through its opening
+// ramp, and its quota refusal is recorded.
+func TestAntigravityWrapperResolver_ShortRunResolvedByRamp(t *testing.T) {
+	executable := helperWrappedAgyFixture(t, "2s")
 	script := fmt.Sprintf(`& '%s' --print hello`, executable)
 	if out, err := runLocalCommandWindows("powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), time.Minute); err != nil {
 		t.Fatalf("wrapped run failed: %v (%s)", err, out)
 	}
 	antigravityUsageRefreshWaitIdle()
-	if got := helperBobEvidence(); len(got) != 0 {
-		t.Errorf("evidence=%v for a run shorter than a tick, want none", got)
+	if len(helperBobEvidence()) != 1 {
+		t.Error("a wrapped run shorter than one steady resolver interval recorded no evidence")
 	}
 }
 

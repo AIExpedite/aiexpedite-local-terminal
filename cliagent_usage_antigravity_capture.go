@@ -173,9 +173,15 @@ type antigravityRunCapture struct {
 	resolverDone chan struct{}
 }
 
-// Wrapper-resolver bounds: one ancestry scan every antigravityWrapperScanEvery
-// while the wrapped command runs, at most antigravityWrapperMaxScans per run.
+// Wrapper-resolver bounds: an opening ramp of antigravityWrapperRampScans
+// scans antigravityWrapperRampEvery apart (the first one right away), so an
+// agy that fails fast — a quota refusal is over in a couple of seconds — is
+// still seen alive; then one ancestry scan every antigravityWrapperScanEvery
+// while the wrapped command runs, at most antigravityWrapperMaxScans per run
+// in total.
 var (
+	antigravityWrapperRampEvery = 500 * time.Millisecond
+	antigravityWrapperRampScans = 6
 	antigravityWrapperScanEvery = 5 * time.Second
 	antigravityWrapperMaxScans  = 60
 	// antigravityAncestryScan is the resolver's scan seam.
@@ -221,19 +227,26 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	go c.resolveWrapper(wrapperPID, stop, done)
 }
 
-// resolveWrapper scans the wrapper's tree every antigravityWrapperScanEvery
-// until it finds agy, the command ends (stop), or the scan budget is spent. A
-// run shorter than one interval is never resolved — a recorded limitation.
+// resolveWrapper scans the wrapper's tree — at once, through the opening ramp,
+// then every antigravityWrapperScanEvery — until it finds agy, the command
+// ends (stop), or the scan budget is spent. An agy that has exited before any
+// scan sees it is never resolved: a recorded limitation, since after exit
+// nothing ties its log to this wrapper rather than to a concurrent direct run.
 func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	notBefore := c.floor.Truncate(time.Second)
-	ticker := time.NewTicker(antigravityWrapperScanEvery)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for scans := 0; scans < antigravityWrapperMaxScans; scans++ {
 		select {
 		case <-stop:
 			return
-		case <-ticker.C:
+		case <-timer.C:
+		}
+		if scans+1 < antigravityWrapperRampScans {
+			timer.Reset(antigravityWrapperRampEvery)
+		} else {
+			timer.Reset(antigravityWrapperScanEvery)
 		}
 		procs, ok := antigravityAncestryScan(wrapperPID)
 		if !ok {
@@ -288,6 +301,7 @@ func (c *antigravityRunCapture) Finish() {
 		c.mu.Lock()
 		pid := c.pid
 		c.mu.Unlock()
+		noteAntigravityManagedPIDExited(pid)
 
 		if c.polled {
 			antigravityCaptureMu.Lock()
