@@ -78,6 +78,9 @@ const (
 	// whole.
 	antigravityOwnChildMaxFiles = 8
 	antigravityOwnLogMaxBytes   = 256 * 1024
+	// antigravityLegacyReadReserve is the share of a PID-block search's read
+	// cap kept for unstamped (legacy) logs written since the run's floor.
+	antigravityLegacyReadReserve = 8
 	// antigravityStartupScanCap bounds the names the first pass classifies,
 	// and antigravityStartupDSTSlack widens its window: names are local time.
 	antigravityStartupScanCap  = 256
@@ -382,6 +385,12 @@ func antigravityPIDBlockIn(body []byte, pid int) ([]byte, bool) {
 // floor oldest first, then the DST-slack hour newest first, then legacy names.
 // A detached agy read again at its own exit is found even when more than the
 // read cap of newer logs were created while it ran.
+//
+// Legacy names carry no stamp, so they are ranked by mtime: only those written
+// since the slack cutoff, nearest the floor first. Up to
+// antigravityLegacyReadReserve of the read cap is kept for them, so a run in a
+// legacy log is still read when the stamped names at or after its floor alone
+// would fill the cap.
 func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bool) {
 	if pid <= 0 {
 		return nil, false
@@ -400,7 +409,7 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
 		stampedEnd--
 	}
-	legacy := names[stampedEnd:]
+	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], since)
 	var afterFloor, slack []string
 	for _, name := range names[:stampedEnd] {
 		at, _ := antigravityLogNameTime(name, time.Time{})
@@ -416,7 +425,11 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	for i, j := 0, len(afterFloor)-1; i < j; i, j = i+1, j-1 {
 		afterFloor[i], afterFloor[j] = afterFloor[j], afterFloor[i]
 	}
-	ordered := append(append(afterFloor, slack...), legacy...)
+	stamped := append(afterFloor, slack...)
+	if limit := antigravityWatchedNewest - min(len(legacy), antigravityLegacyReadReserve); len(stamped) > limit {
+		stamped = stamped[:limit]
+	}
+	ordered := append(stamped, legacy...)
 	for examined, name := range ordered {
 		if examined >= antigravityWatchedNewest {
 			break
@@ -430,6 +443,30 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 		}
 	}
 	return nil, false
+}
+
+// antigravityLegacyLogsSince keeps the unstamped names written at or after
+// since, oldest mtime first: a run's legacy log was last written no earlier
+// than the run started.
+func antigravityLegacyLogsSince(dir string, names []string, since time.Time) []string {
+	type legacyLog struct {
+		name  string
+		mtime time.Time
+	}
+	var kept []legacyLog
+	for _, name := range names {
+		stat, ok := antigravityStatLog(filepath.Join(dir, name))
+		if !ok || stat.mtime.Before(since) {
+			continue
+		}
+		kept = append(kept, legacyLog{name: name, mtime: stat.mtime})
+	}
+	sort.SliceStable(kept, func(i, j int) bool { return kept[i].mtime.Before(kept[j].mtime) })
+	out := make([]string, len(kept))
+	for i, l := range kept {
+		out[i] = l.name
+	}
+	return out
 }
 
 /* ─────────────────────────── own children ─────────────────────────── */

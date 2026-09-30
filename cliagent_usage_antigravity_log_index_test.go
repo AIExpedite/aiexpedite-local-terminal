@@ -1169,6 +1169,32 @@ func TestAntigravityPIDBlock_ReachesLegacyPastOldStampedLogs(t *testing.T) {
 	}
 }
 
+// A managed run in a legacy log is still read when the stamped logs at or
+// after its floor alone would fill the read cap; a legacy log last written
+// before the floor's slack is not a candidate.
+func TestAntigravityPIDBlock_ReservesReadsForLegacyLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	floor := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	for i := 0; i < antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(50200+i), at, false)
+	}
+	stale := floor.Add(-48 * time.Hour)
+	h.write(t, "legacy-old.log", helperPIDBlock(50040), stale, false)
+	h.write(t, "legacy-run.log", helperPIDBlock(50041)+"authenticated successfully as ada@example.com\n", floor.Add(time.Minute), false)
+
+	block, ok := antigravityPIDBlock(h.base, 50041, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the legacy log's block despite a full stamped window", block, ok)
+	}
+	if _, ok := antigravityPIDBlock(h.base, 50040, floor); ok {
+		t.Error("a legacy log last written before the floor's slack must not be read")
+	}
+	if _, ok := antigravityPIDBlock(h.base, 50200, floor); !ok {
+		t.Error("the stamped log at the floor must still be read first")
+	}
+}
+
 func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
 	h := helperIsolateLogIndex(t)
 	floor := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
