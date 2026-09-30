@@ -578,3 +578,22 @@ func TestAntigravityStaleRegression_MaintenanceSmokeSurvivesUpdate(t *testing.T)
 		}
 	}
 }
+
+// Evidence lives through the debt's retry horizon, so a reply that arrives
+// after a long outage can still chart the spent buckets, and it ends with the
+// window it names: once the reset has passed it matches nothing.
+func TestAntigravityEvidence_LivesThroughTheRetryHorizon(t *testing.T) {
+	resetAntigravityExhaustionEvidence()
+	defer resetAntigravityExhaustionEvidence()
+	now := time.Now()
+	fp := fingerprintAccount("antigravity", "ada@example.com")
+	addAntigravityExhaustionEvent(antigravityExhaustionEvent{
+		resetAtMs: now.Add(4 * time.Hour).UnixMilli(), fingerprint: fp, atMs: now.UnixMilli(),
+	}, now)
+	if got := antigravityExhaustionEvidence(now.Add(time.Hour), fp); len(got) != 1 {
+		t.Errorf("evidence after an hour=%v, want it kept past the old 10 min TTL", got)
+	}
+	if got := antigravityExhaustionEvidence(now.Add(4*time.Hour+time.Second), fp); len(got) != 0 {
+		t.Errorf("evidence after its reset=%v, want none", got)
+	}
+}

@@ -1138,7 +1138,11 @@ func antigravityCatalogCommand() string {
 // between two of them could attribute one account's exhaustion to another.
 const (
 	antigravityExhaustionMaxEvents = 4
-	antigravityExhaustionTTL       = 10 * time.Minute
+	// antigravityExhaustionTTL keeps an event for the debt's whole retry
+	// horizon: the debt it explains can wait out an outage for that long, and
+	// a later all-exhausted reply is only chartable while the event lives. An
+	// event whose reset has passed is dropped sooner (antigravityExhaustionLive).
+	antigravityExhaustionTTL = antigravityRefreshOwedMaxAge
 	// antigravityExhaustionMinReset: a shorter reset is a throttle, not a
 	// spent quota window.
 	antigravityExhaustionMinReset = 2 * time.Minute
@@ -1161,6 +1165,14 @@ var antigravityExhaustion struct {
 // antigravityExhaustionEvidenceFn is the quota routes' seam.
 var antigravityExhaustionEvidenceFn = antigravityExhaustionEvidence
 
+// antigravityExhaustionLive reports whether an event can still name a bucket:
+// within the TTL, and before its reset — after the reset the window has
+// refilled, and Google reports the next reset, which the event cannot match.
+func antigravityExhaustionLive(event antigravityExhaustionEvent, now time.Time) bool {
+	return now.Sub(time.UnixMilli(event.atMs)) <= antigravityExhaustionTTL &&
+		now.UnixMilli() < event.resetAtMs
+}
+
 // antigravityExhaustionEvidence returns the unexpired events recorded for the
 // account with this fingerprint.
 func antigravityExhaustionEvidence(now time.Time, fingerprint string) []antigravityExhaustionEvent {
@@ -1172,7 +1184,7 @@ func antigravityExhaustionEvidence(now time.Time, fingerprint string) []antigrav
 	defer e.mu.Unlock()
 	var out []antigravityExhaustionEvent
 	for _, event := range e.events {
-		if event.fingerprint == fingerprint && now.Sub(time.UnixMilli(event.atMs)) <= antigravityExhaustionTTL {
+		if event.fingerprint == fingerprint && antigravityExhaustionLive(event, now) {
 			out = append(out, event)
 		}
 	}
@@ -1226,7 +1238,7 @@ func addAntigravityExhaustionEvent(event antigravityExhaustionEvent, now time.Ti
 	defer e.mu.Unlock()
 	kept := e.events[:0]
 	for _, existing := range e.events {
-		if now.Sub(time.UnixMilli(existing.atMs)) > antigravityExhaustionTTL {
+		if !antigravityExhaustionLive(existing, now) {
 			continue
 		}
 		// The same window seen again (a detached run's block is read at wrapper

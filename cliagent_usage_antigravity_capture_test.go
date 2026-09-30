@@ -1161,3 +1161,49 @@ func TestAntigravityRunCapture_FinishBoundsTheResolverWait(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// A transport that fails over re-roots the resolver. The superseded resolver's
+// scan was already in flight; when it returns late with the failed
+// transport's agy it must not win over the fallback's.
+func TestAntigravityRunCapture_SupersededResolverRecordsNothing(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+
+	releaseOld := make(chan struct{})
+	oldScanning := make(chan struct{}, 1)
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		if root == 900 {
+			select {
+			case oldScanning <- struct{}{}:
+			default:
+			}
+			<-releaseOld
+			return []ProcessInfo{{PID: 901, Name: "agy.exe"}}, true
+		}
+		return nil, true // the fallback's agy is not up yet
+	}
+
+	capture := startAntigravityQuotaCapture("failover")
+	defer capture.Finish()
+	capture.SetWrapper(900)
+	select {
+	case <-oldScanning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first resolver never started its scan")
+	}
+	capture.SetWrapper(950) // the transport fell back
+	close(releaseOld)
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid != 0 {
+			t.Fatalf("pid=%d recorded by the superseded resolver, want none", pid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

@@ -175,6 +175,10 @@ type antigravityRunCapture struct {
 	// resolverStop ends the wrapper resolver; nil while none runs.
 	resolverStop chan struct{}
 	resolverDone chan struct{}
+	// resolverGen identifies the current resolver. SetWrapper bumps it when a
+	// transport fails over, so a superseded resolver whose scan was already in
+	// flight cannot record the failed transport's agy PID.
+	resolverGen uint64
 }
 
 // Wrapper-resolver bounds: an opening ramp of antigravityWrapperRampScans
@@ -203,8 +207,14 @@ func (c *antigravityRunCapture) SetPID(pid int) {
 	if c == nil || pid <= 0 {
 		return
 	}
+	c.setPID(pid, false, 0)
+}
+
+// setPID records pid unless one is already set or the run has finished. A
+// resolver passes its generation, and a superseded one records nothing.
+func (c *antigravityRunCapture) setPID(pid int, fromResolver bool, gen uint64) {
 	c.mu.Lock()
-	if c.pid != 0 || c.finished {
+	if c.pid != 0 || c.finished || (fromResolver && gen != c.resolverGen) {
 		c.mu.Unlock()
 		return
 	}
@@ -233,8 +243,10 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	}
 	stop, done := make(chan struct{}), make(chan struct{})
 	c.resolverStop, c.resolverDone = stop, done
+	c.resolverGen++
+	gen := c.resolverGen
 	c.mu.Unlock()
-	go c.resolveWrapper(wrapperPID, stop, done)
+	go c.resolveWrapper(wrapperPID, gen, stop, done)
 }
 
 // resolveWrapper scans the wrapper's tree — at once, through the opening ramp,
@@ -242,7 +254,7 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 // ends (stop), or the scan budget is spent. An agy that has exited before any
 // scan sees it is never resolved: a recorded limitation, since after exit
 // nothing ties its log to this wrapper rather than to a concurrent direct run.
-func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struct{}, done chan<- struct{}) {
+func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, gen uint64, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	notBefore := c.floor.Truncate(time.Second)
 	timer := time.NewTimer(0)
@@ -269,7 +281,7 @@ func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, stop <-chan struc
 			if !p.StartTime.IsZero() && p.StartTime.Before(notBefore) {
 				continue
 			}
-			c.SetPID(p.PID)
+			c.setPID(p.PID, true, gen)
 			return
 		}
 	}

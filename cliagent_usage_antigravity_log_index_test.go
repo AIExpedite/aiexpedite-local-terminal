@@ -1149,3 +1149,20 @@ func TestAntigravityCapture_DetachedAgyHandedOffPastSettledEntry(t *testing.T) {
 		t.Error("the detached agy was never owed after it exited")
 	}
 }
+
+// A detached agy is read again at its own exit, after more than the read cap
+// of newer logs were created while it ran. Its block is in the log named for
+// its start, next to the floor, and must still be found.
+func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	floor := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	h.write(t, helperLogName(floor), helperPIDBlock(50021)+"authenticated successfully as ada@example.com\n", floor, false)
+	for i := 1; i <= antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(50100+i), at, false)
+	}
+	block, ok := antigravityPIDBlock(h.base, 50021, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the detached run's own block", block, ok)
+	}
+}

@@ -1483,7 +1483,7 @@ can.
   PID block (`antigravityPIDBlock`) and, when that block names both
   `authenticated successfully as <email>` and a `RESOURCE_EXHAUSTED … Resets in
   X` of at least 2 min, keeps `{resetAtMs, fingerprint, atMs}` — at most 4
-  events, each for 10 min; the email is reduced to its fingerprint at once.
+  events, each kept until its reset passes or the 6 h debt horizon ends, whichever is first; the email is reduced to its fingerprint at once.
   Both quota routes resolve the reply's account BEFORE converting buckets
   (Code Assist through `antigravityCodeAssistIdentity`; loopback through
   `GetUserStatus`, after the CSRF-gated quota check). An OMITTED fraction

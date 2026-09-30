@@ -372,10 +372,16 @@ func antigravityPIDBlockIn(body []byte, pid int) ([]byte, bool) {
 	return nil, false
 }
 
-// antigravityPIDBlock returns pid's block from the newest logs under base whose
+// antigravityPIDBlock returns pid's block from the logs under base whose
 // name-second is not before sinceFloor (less the DST slack). It generalises
 // antigravityHTTPPortInPIDBlock: two runs that share a second-stamped file are
 // kept apart by their blocks.
+//
+// A run's block is in the log named for the second it started, just after its
+// floor, so the logs nearest the floor are read first: names at or after the
+// floor oldest first, then the DST-slack hour newest first, then legacy names.
+// A detached agy read again at its own exit is found even when more than the
+// read cap of newer logs were created while it ran.
 func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bool) {
 	if pid <= 0 {
 		return nil, false
@@ -385,16 +391,33 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 		return nil, false
 	}
 	dir := antigravityLogDir(base)
+	floorSecond := sinceFloor.Truncate(time.Second)
 	since := sinceFloor.Add(-antigravityStartupDSTSlack).Truncate(time.Second)
-	examined := 0
-	for _, name := range names {
+	var afterFloor, slack, legacy []string
+	for i, name := range names {
+		at, stamped := antigravityLogNameTime(name, time.Time{})
+		if !stamped {
+			// Unstamped names sort after every stamped one.
+			legacy = names[i:]
+			break
+		}
+		if at.Before(since) {
+			break
+		}
+		if at.Before(floorSecond) {
+			slack = append(slack, name)
+		} else {
+			afterFloor = append(afterFloor, name)
+		}
+	}
+	for i, j := 0, len(afterFloor)-1; i < j; i, j = i+1, j-1 {
+		afterFloor[i], afterFloor[j] = afterFloor[j], afterFloor[i]
+	}
+	ordered := append(append(afterFloor, slack...), legacy...)
+	for examined, name := range ordered {
 		if examined >= antigravityWatchedNewest {
 			break
 		}
-		if at, stamped := antigravityLogNameTime(name, time.Time{}); stamped && at.Before(since) {
-			break
-		}
-		examined++
 		body, ok := antigravityReadLog(filepath.Join(dir, name))
 		if !ok {
 			continue
