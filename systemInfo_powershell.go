@@ -330,8 +330,11 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 	}
 	// Name what controls the policy (the first host that blocks and cannot be
 	// fixed, so a mixed report explains the part setup can't change). Group
-	// Policy wins, so no other branch offers the setter for a host it owns.
+	// Policy wins, so no other branch offers the setter for a host it owns, and
+	// a Process scope comes next: it also outranks CurrentUser, so an AllSigned
+	// host must not hide the override a person has to remove.
 	h = nil
+	process := false
 	for i := range p.Hosts {
 		o := &p.Hosts[i]
 		if !o.BlocksLocalScripts || o.FixableByCurrentUser {
@@ -339,7 +342,13 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 		}
 		if o.BlockedBy == psScopeMachinePolicy || o.BlockedBy == psScopeUserPolicy {
 			h = o
+			process = false
 			break
+		}
+		if o.BlockedBy == psScopeProcess && !process {
+			h = o
+			process = true
+			continue
 		}
 		if h == nil {
 			h = o
@@ -375,8 +384,18 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 	// Process outranks CurrentUser whatever the policy, so it is checked before
 	// AllSigned: a Process-scoped AllSigned needs the override removed first.
 	case h.BlockedBy == psScopeProcess:
-		return "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
-			"A per-user setting can't override it; " + powerShellProcessOverrideHint + " first, then, if scripts are still blocked, run: " + manual, false
+		msg := "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
+			"A per-user setting can't override it; " + powerShellProcessOverrideHint + " first, then, if scripts are still blocked, run: " + manual
+		// A mixed report can pair the Process override with a policy the person
+		// chose, so say that AIExpedite leaves AllSigned alone either way.
+		for i := range p.Hosts {
+			o := &p.Hosts[i]
+			if o.BlocksLocalScripts && o.BlockedBy != psScopeProcess && strings.EqualFold(o.Effective, psPolicyAllSigned) {
+				msg += " The other PowerShell host is AllSigned, which blocks unsigned scripts such as npm's; AIExpedite won't change a policy you chose."
+				break
+			}
+		}
+		return msg, false
 	case strings.EqualFold(h.Effective, psPolicyAllSigned):
 		return "PowerShell's execution policy is AllSigned, which blocks unsigned scripts such as npm's, so npm won't run. " +
 			"AIExpedite won't change a policy you chose; to allow local scripts for your user, run: " + manual, false

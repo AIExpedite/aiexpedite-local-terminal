@@ -340,3 +340,20 @@ func TestPowerShellPolicyFindingGroupPolicyWithProcessHost(t *testing.T) {
 		}
 	}
 }
+
+func TestPowerShellPolicyFindingAllSignedWithProcessHost(t *testing.T) {
+	allSignedWin := psHost("AllSigned", allUndefined(map[string]string{"LocalMachine": "AllSigned"}))
+	processPwsh := psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"}))
+	processPwsh.Host = powerShellHost7
+	// Process outranks CurrentUser, so the override must be named even though
+	// the AllSigned host comes first in the report.
+	msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{allSignedWin, processPwsh}))
+	if fixable {
+		t.Fatalf("AllSigned + Process must not be fixable: %q", msg)
+	}
+	for _, w := range []string{"PSExecutionPolicyPreference", "restart the AIExpedite agent", "AllSigned", "won't change a policy you chose"} {
+		if !strings.Contains(msg, w) {
+			t.Fatalf("message %q lacks %q", msg, w)
+		}
+	}
+}
