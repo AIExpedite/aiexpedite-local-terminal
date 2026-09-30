@@ -369,6 +369,24 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
+// processPolicyProbe prints the Process-scope execution policy. PowerShell
+// keeps that scope in $env:PSExecutionPolicyPreference, which is what
+// `Get-ExecutionPolicy -Scope Process` reports. Reading the variable avoids
+// the Microsoft.PowerShell.Security module, which Windows PowerShell 5.1
+// cannot autoload when it inherits a pwsh 7 PSModulePath (as on the CI runner).
+const processPolicyProbe = "$env:PSExecutionPolicyPreference"
+
+// clearInheritedPolicyPreference unsets PSExecutionPolicyPreference for the
+// test so a value inherited from the test's own shell cannot satisfy the
+// assertion; only the host's -ExecutionPolicy flag can set it.
+func clearInheritedPolicyPreference(t *testing.T) {
+	t.Helper()
+	if prev, ok := os.LookupEnv("PSExecutionPolicyPreference"); ok {
+		os.Unsetenv("PSExecutionPolicyPreference")
+		t.Cleanup(func() { os.Setenv("PSExecutionPolicyPreference", prev) })
+	}
+}
+
 // TestTempFileRunsWithProcessScopedBypass verifies the temp-file transport
 // still runs with `-ExecutionPolicy Bypass` in Process scope now that the flag
 // comes from psHostPolicyArgs: without it `-File` is refused under the default
@@ -378,8 +396,9 @@ func TestTempFileRunsWithProcessScopedBypass(t *testing.T) {
 		t.Skip("skipping powershell.exe integration test in -short mode")
 	}
 
+	clearInheritedPolicyPreference(t)
 	padding := strings.Repeat("# noise line\n", 3000)
-	script := padding + "Get-ExecutionPolicy -Scope Process\n"
+	script := padding + processPolicyProbe + "\n"
 	encoded := encodeForPowerShell(script)
 	if len(encoded) <= encodedCommandFallbackThreshold {
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
@@ -402,7 +421,8 @@ func TestEncodedArgRunsWithProcessScopedBypass(t *testing.T) {
 		t.Skip("skipping powershell.exe integration test in -short mode")
 	}
 
-	out, err := runEncodedPowerShellViaArg(encodeForPowerShell("Get-ExecutionPolicy -Scope Process"), "", 30*time.Second)
+	clearInheritedPolicyPreference(t)
+	out, err := runEncodedPowerShellViaArg(encodeForPowerShell(processPolicyProbe), "", 30*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
 	}
