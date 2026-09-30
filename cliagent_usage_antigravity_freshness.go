@@ -1226,9 +1226,17 @@ func addAntigravityExhaustionEvent(event antigravityExhaustionEvent, now time.Ti
 	defer e.mu.Unlock()
 	kept := e.events[:0]
 	for _, existing := range e.events {
-		if now.Sub(time.UnixMilli(existing.atMs)) <= antigravityExhaustionTTL {
-			kept = append(kept, existing)
+		if now.Sub(time.UnixMilli(existing.atMs)) > antigravityExhaustionTTL {
+			continue
 		}
+		// The same window seen again (a detached run's block is read at wrapper
+		// exit and again at its own exit) replaces the older sighting instead
+		// of spending a second slot of the cap.
+		if existing.fingerprint == event.fingerprint &&
+			antigravityEvidenceNamesReset([]antigravityExhaustionEvent{existing}, time.UnixMilli(event.resetAtMs)) {
+			continue
+		}
+		kept = append(kept, existing)
 	}
 	e.events = append(kept, event)
 	if len(e.events) > antigravityExhaustionMaxEvents {

@@ -167,6 +167,23 @@ type antigravityProcessOnly struct {
 	floorMs    int64
 }
 
+// antigravityDetachedRun is a managed agy that outlived its wrapper. Its
+// capture settled at wrapper exit, before the run could spend what it spends
+// afterwards, so its own PID block is read for exhaustion evidence again when
+// the process really exits.
+type antigravityDetachedRun struct {
+	antigravityTrackedPID
+	floor    time.Time
+	handedAt time.Time
+}
+
+// antigravityDetachedEvidence is a detached managed run found exited by a pass:
+// its block is read outside the index lock (antigravityApplyDiscovery).
+type antigravityDetachedEvidence struct {
+	pid   int
+	floor time.Time
+}
+
 // antigravitySentinel stands in for live PIDs past the process-only cap: it
 // keeps the oldest of their floors armed.
 type antigravitySentinel struct {
@@ -196,6 +213,9 @@ var antigravityLogIndex = struct {
 	// is not mistaken for ours.
 	ownPIDs     []antigravityTrackedPID
 	managedPIDs []antigravityTrackedPID
+	// detached are handed-off managed runs whose evidence is read at their own
+	// exit (capped at antigravityKnownPIDCap, oldest dropped).
+	detached []antigravityDetachedRun
 	// pendingOwed is the newest owe-ready floor no reading has covered yet.
 	pendingOwed time.Time
 }{
@@ -543,8 +563,12 @@ func noteAntigravityManagedPIDExited(pid int) {
 // exits, exactly like a direct run. Reports false — the caller then marks the
 // PID exited as before — unless the live process is provably the remembered
 // one (equal, readable start tokens); a PID that is gone or unreadable is the
-// ordinary synchronous case. Never called with the index lock held.
-func handOffAntigravityDetachedManagedPID(pid int, now time.Time) bool {
+// ordinary synchronous case. A handed-off run is still a managed run for
+// evidence: floor is its capture floor, and its PID block is read again when
+// discovery sees it exit, so a RESOURCE_EXHAUSTED it hits after the wrapper
+// returned still reaches the evidence list. Never called with the index lock
+// held.
+func handOffAntigravityDetachedManagedPID(pid int, floor, now time.Time) bool {
 	if pid <= 0 {
 		return false
 	}
@@ -566,6 +590,20 @@ func handOffAntigravityDetachedManagedPID(pid int, now time.Time) bool {
 	if handed && !antigravityIndexTracksPIDLocked(pid) {
 		entry := &antigravityLogEntry{firstSeen: now, pids: []antigravityTrackedPID{{pid: pid, token: token}}}
 		antigravityTrackProcessOnlyLocked(entry, &res)
+	}
+	if handed {
+		kept := idx.detached[:0]
+		for _, d := range idx.detached {
+			if d.pid != pid {
+				kept = append(kept, d)
+			}
+		}
+		idx.detached = append(kept, antigravityDetachedRun{
+			antigravityTrackedPID: antigravityTrackedPID{pid: pid, token: token}, floor: floor, handedAt: now,
+		})
+		if len(idx.detached) > antigravityKnownPIDCap {
+			idx.detached = idx.detached[len(idx.detached)-antigravityKnownPIDCap:]
+		}
 	}
 	unlockAntigravityLogIndex()
 	for _, floorMs := range res.arm {
@@ -711,6 +749,8 @@ type antigravityDiscoveryResult struct {
 	heldOwed int
 	// needScan: the sentinel is armed and may be released by a checked scan.
 	needScan bool
+	// evidence lists detached managed runs that exited this pass.
+	evidence []antigravityDetachedEvidence
 }
 
 // antigravityDiscoveryPass runs one pass over bases. observedMs is the cached
@@ -843,6 +883,7 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 	}
 
 	antigravityEvaluateLocked(now, observedMs, &res)
+	antigravityEvaluateDetachedLocked(now, &res)
 	antigravityEnforceCapsLocked(now, observedMs, &res)
 	// Settled entries outside the newest names are forgotten; their names stay
 	// in known, so they are never classified again.
@@ -858,6 +899,24 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 	res.owed = idx.pendingOwed
 	res.needScan = idx.sentinel != nil
 	return res
+}
+
+// antigravityEvaluateDetachedLocked moves every detached managed run that has
+// exited to res.evidence, and forgets one still unresolved at the hold limit.
+// One liveness probe per entry, at most antigravityKnownPIDCap.
+func antigravityEvaluateDetachedLocked(now time.Time, res *antigravityDiscoveryResult) {
+	idx := &antigravityLogIndex
+	kept := idx.detached[:0]
+	for _, d := range idx.detached {
+		switch {
+		case antigravityCandidateProbe(d.pid, d.token) == processGone:
+			res.evidence = append(res.evidence, antigravityDetachedEvidence{pid: d.pid, floor: d.floor})
+		case now.Sub(d.handedAt) >= antigravityCandidateHoldLimit:
+		default:
+			kept = append(kept, d)
+		}
+	}
+	idx.detached = kept
 }
 
 // antigravityClassifyLogLocked (re)reads one log and classifies it.
@@ -1387,11 +1446,7 @@ func antigravityDiscoveryTick() {
 	if owed.IsZero() || antigravityOwnChildRunning() {
 		return
 	}
-	observedAt := ""
-	if snap, ok := cachedAntigravityQuotaSnapshot(); ok {
-		observedAt = snap.ObservedAt
-	}
-	nudgeAntigravityUsageRefresh(now, observedAt, owed)
+	nudgeAntigravityUsageRefresh(now, cachedAntigravityObservedMs(), owed)
 }
 
 // antigravityDiscover runs one pass and applies its floors; returns the newest
@@ -1403,6 +1458,11 @@ func antigravityDiscover(bases []string, now time.Time) time.Time {
 }
 
 func antigravityApplyDiscovery(res antigravityDiscoveryResult, now time.Time) {
+	// Before any nudge the caller sends, so the read that pays a detached run's
+	// debt already sees its evidence.
+	for _, e := range res.evidence {
+		recordAntigravityRunEvidence(e.floor, e.pid, now)
+	}
 	for _, floorMs := range res.arm {
 		armAntigravityCandidateFloor(floorMs)
 	}
@@ -1538,7 +1598,7 @@ func resetAntigravityLogIndex() {
 	idx.entries = map[string]*antigravityLogEntry{}
 	idx.newestStat = map[string]antigravityLogStat{}
 	idx.processOnly, idx.sentinel = nil, nil
-	idx.ownRunning, idx.ownPIDs, idx.managedPIDs = 0, nil, nil
+	idx.ownRunning, idx.ownPIDs, idx.managedPIDs, idx.detached = 0, nil, nil, nil
 	idx.pendingOwed = time.Time{}
 	unlockAntigravityLogIndex()
 	antigravityLiveRunsMu.Lock()

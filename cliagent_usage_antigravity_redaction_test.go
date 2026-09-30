@@ -169,7 +169,7 @@ func TestAntigravityRefreshSchedule_PersistsAndLogsMetricsOnly(t *testing.T) {
 	antigravityRefreshMinInterval = time.Nanosecond
 
 	logged := captureStdout(t, func() {
-		nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), antigravityNewestRunLog(base))
+		nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), antigravityNewestRunLog(base))
 		antigravityUsageRefreshWaitIdle()
 		// And the restart path's own line, for a booked rung in the future.
 		stopAntigravityRunDebtRetry()

@@ -313,7 +313,7 @@ func TestNudgeAntigravityUsageRefresh_CreatesADebtForAnUnseenRun(t *testing.T) {
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
-	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("the nudge ignored a run log newer than the cached reading")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -346,7 +346,7 @@ func TestNudgeAntigravityUsageRefresh_Refusals(t *testing.T) {
 		setup    func(t *testing.T)
 	}{
 		{name: "the cached reading already covers the run", logAt: now.Add(-5 * time.Minute), observed: now.Add(-time.Minute).Truncate(time.Second)},
-		{name: "a log from the reading's own second", logAt: observed.Add(900 * time.Millisecond), observed: observed},
+		{name: "a log from the reading's own second, before it", logAt: observed.Add(900 * time.Millisecond), observed: observed.Add(950 * time.Millisecond)},
 		{name: "a log still settling", logAt: now.Add(-10 * time.Second), observed: observed},
 		{name: "no run log at all", observed: observed},
 		{
@@ -404,7 +404,7 @@ func TestNudgeAntigravityUsageRefresh_Refusals(t *testing.T) {
 			}
 
 			newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
-			if nudgeAntigravityUsageRefresh(now, tc.observed.Format(time.RFC3339), newest) {
+			if nudgeAntigravityUsageRefresh(now, tc.observed.UnixMilli(), newest) {
 				t.Error("the nudge armed the worker")
 			}
 			antigravityUsageRefreshWaitIdle()
@@ -420,6 +420,26 @@ func TestNudgeAntigravityUsageRefresh_Refusals(t *testing.T) {
 	}
 }
 
+// A direct run that exits later in the same second as the cached read is owed:
+// the log index judged its floor at millisecond resolution, and the nudge must
+// not truncate it back into the reading's second.
+func TestNudgeAntigravityUsageRefresh_OwesARunLaterInTheReadingsSecond(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	now := time.Now()
+	second := now.Add(-time.Hour).Truncate(time.Second)
+	observed := second.Add(100 * time.Millisecond)
+	helperWriteAntigravityCache(t, cache, observed)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), second.Add(900*time.Millisecond)) {
+		t.Fatal("the nudge dropped a run that ended after the reading in the same second")
+	}
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want one", reads.Load())
+	}
+}
+
 // A pending debt whose booked rung has passed — a timer lost to a sleep, or a
 // process that never re-armed it — is picked up by the next gather.
 func TestNudgeAntigravityUsageRefresh_PaysADueDebt(t *testing.T) {
@@ -430,7 +450,7 @@ func TestNudgeAntigravityUsageRefresh_PaysADueDebt(t *testing.T) {
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 	helperOwedDebt(t, antigravityUsageFreshness{Attempts: 1, NextAttemptAtMs: now.Add(-time.Second).UnixMilli()})
 
-	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), time.Time{}) {
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), time.Time{}) {
 		t.Fatal("the nudge ignored a due debt")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -447,7 +467,7 @@ func TestNudgeAntigravityUsageRefresh_NeverObservedIsBehindAnyRun(t *testing.T) 
 	helperIsolateAntigravityFreshness(t)
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
 	now := time.Now()
-	if !nudgeAntigravityUsageRefresh(now, "", now.Add(-5*time.Minute)) {
+	if !nudgeAntigravityUsageRefresh(now, 0, now.Add(-5*time.Minute)) {
 		t.Fatal("the nudge ignored a run on a device that never observed a reading")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -479,7 +499,7 @@ func TestNudgeAntigravityUsageRefresh_RetiresAnAgedOutDebt(t *testing.T) {
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
-	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("an aged-out debt blocked the nudge from owing the newer run")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -514,7 +534,7 @@ func TestNudgeAntigravityUsageRefresh_ReplacesATerminalDebtForANewerRun(t *testi
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
-	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("a terminal debt blocked the nudge from owing a newer run")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -547,7 +567,7 @@ func TestNudgeAntigravityUsageRefresh_KeepsATerminalDebtForItsOwnRun(t *testing.
 	})
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-	if nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("the nudge replaced a terminal debt for the run it was booked for")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -579,7 +599,7 @@ func TestNudgeAntigravityUsageRefresh_ReplacesAnExpiredLoginDebtForANewerRun(t *
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	newest := antigravityNewestRunLog(filepath.Join(home, ".gemini", "antigravity-cli"))
-	if !nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if !nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("an expired-login debt blocked the nudge from owing a newer run")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -612,7 +632,7 @@ func TestNudgeAntigravityUsageRefresh_KeepsAnExpiredLoginDebtForItsOwnRun(t *tes
 	})
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-	if nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), newest) {
+	if nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), newest) {
 		t.Fatal("the nudge replaced an expired-login debt for the run it was booked for")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -637,11 +657,11 @@ func TestNudgeAntigravityUsageRefresh_NothingWhileAnOwnChildRuns(t *testing.T) {
 	owed := observed.Add(2 * time.Minute)
 
 	child := beginAntigravityOwnChild(t.TempDir())
-	if nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), owed) {
+	if nudgeAntigravityUsageRefresh(time.Now(), observed.UnixMilli(), owed) {
 		t.Fatal("the nudge fired while an own child was running")
 	}
 	child.done()
-	if !nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), owed) {
+	if !nudgeAntigravityUsageRefresh(time.Now(), observed.UnixMilli(), owed) {
 		t.Fatal("the nudge after the child ended was held back by a cooldown it never earned")
 	}
 	antigravityUsageRefreshWaitIdle()

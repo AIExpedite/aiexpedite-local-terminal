@@ -472,12 +472,12 @@ func antigravityMissedRun(observedAt string, owedLog time.Time, logBases int) {
 //
 // The single predicate behind both the missed-run diagnostic (which keeps
 // antigravityMissedRunSlack so a Refresh click's own `agy` does not warn about
-// itself) and the gather's refresh nudge (nudgeAntigravityUsageRefresh), which
-// passes 0: owedLog and observedAt are both fixed once a run ends, so a run
-// that finished within the slack of the last observation would fail the
-// comparison on that gather and on every gather after it — exactly the short
-// runs a maintenance smoke produces. The nudge applies its own settle guard
-// instead.
+// itself). The refresh nudge (nudgeAntigravityUsageRefresh) keeps no slack
+// and compares to the millisecond instead: owedLog and observedAt are both
+// fixed once a run ends, so a run that finished within the slack of the last
+// observation would fail the comparison on that gather and on every gather
+// after it — exactly the short runs a maintenance smoke produces. The nudge
+// applies its own settle guard instead.
 func antigravityRunBehindObservation(observedAt string, owedLog time.Time, slack time.Duration) (time.Time, bool) {
 	if owedLog.IsZero() || observedAt == "" {
 		return time.Time{}, false

@@ -217,7 +217,7 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// The same evidence, acted on: a due retry, or an owe-ready run newer
 		// than the replayed reading, arms the bounded refresh so the next gather replays
 		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
-		nudgeAntigravityUsageRefresh(now, snap.ObservedAt, owedLog)
+		nudgeAntigravityUsageRefresh(now, antigravitySnapshotObservedMs(snap), owedLog)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

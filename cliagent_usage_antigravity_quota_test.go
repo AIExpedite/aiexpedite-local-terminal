@@ -1087,11 +1087,11 @@ func TestNudgeAntigravityUsageRefresh_SeesARunTwentySecondsAfterTheReading(t *te
 		t.Fatal("the diagnostic's slack now sees the run; this case no longer pins the regression")
 	}
 	// The gather right after the run: the settle guard holds the nudge.
-	if nudgeAntigravityUsageRefresh(runEnded.Add(5*time.Second), observed.Format(time.RFC3339), runEnded) {
+	if nudgeAntigravityUsageRefresh(runEnded.Add(5*time.Second), observed.UnixMilli(), runEnded) {
 		t.Error("the nudge fired for a log that has not settled")
 	}
 	// A later gather: seen.
-	if !nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), runEnded) {
+	if !nudgeAntigravityUsageRefresh(time.Now(), observed.UnixMilli(), runEnded) {
 		t.Fatal("the nudge never saw a run that finished 20 s after the reading")
 	}
 	antigravityUsageRefreshWaitIdle()

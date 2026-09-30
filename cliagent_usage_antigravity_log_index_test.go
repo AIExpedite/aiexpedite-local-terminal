@@ -1051,6 +1051,45 @@ func TestAntigravityCapture_DetachedAgyOwedAfterItsOwnExit(t *testing.T) {
 	}
 }
 
+// A detached agy that hits RESOURCE_EXHAUSTED after its wrapper returned is
+// still a managed run for evidence: discovery re-reads its own block when it
+// exits, and the event is recorded once even though the block was also read at
+// wrapper exit.
+func TestAntigravityCapture_DetachedAgyEvidenceReadAtItsOwnExit(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	start := time.Now().Add(-time.Hour)
+	name := helperLogName(start)
+
+	h.setLive(9104, true)
+	capture := &antigravityRunCapture{floor: start, gated: true}
+	capture.SetPID(9104)
+	h.write(t, name, helperPIDBlock(9104)+"authenticated successfully as ada@example.com\n", start, false)
+	capture.Finish()
+	antigravityUsageRefreshWaitIdle()
+	fingerprint := fingerprintAccount("antigravity", "ada@example.com")
+	if got := antigravityExhaustionEvidence(time.Now(), fingerprint); len(got) != 0 {
+		t.Fatalf("evidence=%v before the detached agy hit its limit", got)
+	}
+
+	// The limit is hit after the wrapper returned; nothing is read while it lives.
+	h.write(t, name, "RESOURCE_EXHAUSTED (code 429): quota. Resets in 1h39m21s.\n", start.Add(time.Minute), true)
+	exitSeen := time.Now()
+	h.pass(exitSeen, 0)
+	if got := antigravityExhaustionEvidence(exitSeen, fingerprint); len(got) != 0 {
+		t.Fatalf("evidence=%v while the detached agy is still running", got)
+	}
+	h.setLive(9104, false)
+	h.pass(exitSeen, 0)
+	if got := antigravityExhaustionEvidence(exitSeen, fingerprint); len(got) != 1 {
+		t.Fatalf("evidence=%v, want the exhaustion the detached agy logged after its wrapper returned", got)
+	}
+	// Read once: the entry is gone, so a later pass records nothing new.
+	h.pass(exitSeen.Add(time.Minute), 0)
+	if got := antigravityExhaustionEvidence(exitSeen.Add(time.Minute), fingerprint); len(got) != 1 {
+		t.Errorf("evidence=%v, want one event", got)
+	}
+}
+
 // The ordinary case: the agy is gone when Finish runs, so it stays managed and
 // its log is never owed as a direct run.
 func TestAntigravityCapture_ExitedAgyStaysManagedAtFinish(t *testing.T) {
