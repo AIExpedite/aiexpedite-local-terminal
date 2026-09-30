@@ -57,7 +57,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -566,42 +565,20 @@ func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprin
 var antigravityLanguageServerPIDPattern = regexp.MustCompile(`Starting language server process with pid (\d+)`)
 
 // antigravityHTTPPortForPID returns the plain-HTTP port logged by the run with
-// the given PID, or 0 while that run has not logged it yet.
+// the given PID, or 0 while that run has not logged it yet. It reads only the
+// newest few logs (antigravityRunLogs, which never stats the whole unpruned
+// log directory) — this runs on every poll of the Refresh click's probe.
 func antigravityHTTPPortForPID(base string, pid int) int {
-	dir := antigravityLogDir(base)
-	if dir == "" {
-		return 0
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
-	type logFile struct {
-		path    string
-		modTime time.Time
-	}
-	files := make([]logFile, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, logFile{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
+	files := antigravityRunLogs(base)
 	if len(files) > antigravityQuotaMaxLogs {
 		files = files[:antigravityQuotaMaxLogs]
 	}
-	want := strconv.Itoa(pid)
 	for _, file := range files {
 		body, err := readBoundedHeadTail(file.path, antigravityLogScanBytes)
 		if err != nil {
 			continue
 		}
-		if port, found := antigravityHTTPPortInPIDBlock(body, want); found {
+		if port, found := antigravityHTTPPortInPIDBlock(body, pid); found {
 			return port
 		}
 	}
@@ -609,27 +586,19 @@ func antigravityHTTPPortForPID(base string, pid int) int {
 }
 
 // antigravityHTTPPortInPIDBlock scopes a log to the block the run with the
-// given PID wrote: from its startup line up to the next run's startup line (or
-// the end of the file). Two `agy` runs started in the same second can share one
-// log file, so the port is read only from that block — never paired with a PID
-// matched elsewhere in the file. found is false when no block names the PID;
-// port is 0 while the block has not logged its port yet.
-func antigravityHTTPPortInPIDBlock(body []byte, pid string) (port int, found bool) {
-	starts := antigravityLanguageServerPIDPattern.FindAllSubmatchIndex(body, -1)
-	for i, loc := range starts {
-		if string(body[loc[2]:loc[3]]) != pid {
-			continue
-		}
-		end := len(body)
-		if i+1 < len(starts) {
-			end = starts[i+1][0]
-		}
-		if ports := antigravityPortsInLog(body[loc[0]:end]); len(ports) > 0 {
-			return ports[0], true
-		}
-		return 0, true
+// given PID wrote (antigravityPIDBlockIn). Two `agy` runs started in the same
+// second can share one log file, so the port is read only from that block —
+// never paired with a PID matched elsewhere in the file. found is false when no
+// block names the PID; port is 0 while the block has not logged its port yet.
+func antigravityHTTPPortInPIDBlock(body []byte, pid int) (port int, found bool) {
+	block, found := antigravityPIDBlockIn(body, pid)
+	if !found {
+		return 0, false
 	}
-	return 0, false
+	if ports := antigravityPortsInLog(block); len(ports) > 0 {
+		return ports[0], true
+	}
+	return 0, true
 }
 
 // probeAntigravityQuotaLiveUnlessGated runs the Antigravity probe, unless a

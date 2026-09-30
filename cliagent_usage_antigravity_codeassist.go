@@ -14,11 +14,14 @@
 //
 // Boundaries, the same as those probes':
 //
-//   - Only the Refresh click calls it, and only once the loopback route is known
-//     to be gated. It never renews the login: `agy` refreshes the keyring token
-//     on its own runs, and the click's `agy models` warm-up is run first when the
-//     stored token has expired. An expired token after that is reported, not
+//   - Called by the Refresh click once the loopback route is known to be gated,
+//     and by the run-completion debt worker (cliagent_usage_antigravity_freshness.go).
+//     It never renews the login: `agy` refreshes the keyring token on its own
+//     runs, and the click's `agy models` warm-up is run first when the stored
+//     token has expired. An expired token after that is reported, not
 //     refreshed with agy's client secret.
+//   - The reply's account is resolved BEFORE its buckets are converted, so
+//     in-memory managed-run exhaustion evidence applies only to that account.
 //   - The endpoints are pinned HTTPS constants; a test override must be
 //     loopback. No proxy inheritance, redirects refused, bodies capped, decoded
 //     into allowlisted structs.
