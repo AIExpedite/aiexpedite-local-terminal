@@ -940,3 +940,38 @@ func TestAntigravityDiscovery_UnstampedNamesDoNotCrowdTheWatchedSet(t *testing.T
 		t.Errorf("class=%v, want the stamped log still watched and reclassified", class)
 	}
 }
+
+// A remembered PID whose start token cannot be read matches a log only when
+// that log's name-second is strictly before the second the remembered process
+// exited in. A log named in the SAME second cannot be told apart from a user
+// run that reused the PID inside it, so it must be read as foreign.
+func TestAntigravityPIDIn_SameSecondReuseIsForeign(t *testing.T) {
+	exited := time.Date(2026, 9, 30, 12, 0, 5, 400_000_000, time.UTC)
+	ring := []antigravityTrackedPID{{pid: 4242, token: "start-1", exitedAt: exited}}
+	sameSecond := exited.Truncate(time.Second)
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		at    time.Time
+		want  bool
+	}{
+		{"same token is always ours", "start-1", sameSecond, true},
+		{"another token is never ours", "start-2", sameSecond, false},
+		{"unknown token, earlier second", "", sameSecond.Add(-time.Second), true},
+		{"unknown token, exit second", "", sameSecond, false},
+		{"unknown token, later second", "", sameSecond.Add(time.Second), false},
+		{"unknown token, live now inside the exit second", "", exited.Add(300 * time.Millisecond), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := antigravityPIDIn(ring, 4242, tc.token, tc.at); got != tc.want {
+				t.Fatalf("antigravityPIDIn=%v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	live := []antigravityTrackedPID{{pid: 4242}}
+	if !antigravityPIDIn(live, 4242, "", sameSecond) {
+		t.Error("a remembered run that has not exited stopped matching")
+	}
+}

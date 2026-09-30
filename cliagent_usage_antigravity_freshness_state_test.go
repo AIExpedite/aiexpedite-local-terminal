@@ -92,11 +92,18 @@ func helperWriteAntigravityCache(t *testing.T, cache string, at time.Time) {
 // field, which carries only the RFC3339 second.
 func helperWriteAntigravityCacheAt(t *testing.T, cache string, at time.Time, observedAtMs int64) {
 	t.Helper()
+	helperWriteAntigravityCacheFor(t, cache, at, observedAtMs, "ada@example.com")
+}
+
+// helperWriteAntigravityCacheFor seeds a cached reading for a named account,
+// so a test can stage the one cache two overlapping logins share.
+func helperWriteAntigravityCacheFor(t *testing.T, cache string, at time.Time, observedAtMs int64, email string) {
+	t.Helper()
 	snap := antigravityQuotaSnapshot{
 		ObservedAt:         at.UTC().Format(time.RFC3339),
 		ObservedAtMs:       observedAtMs,
-		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
-		Account:            "ada@example.com",
+		AccountFingerprint: fingerprintAccount("antigravity", email),
+		Account:            email,
 		Buckets: []antigravityQuotaBucket{
 			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
 		},
@@ -1337,5 +1344,48 @@ func TestAntigravityFreshnessNotice_UnauthorizedAndScopedUnplottable(t *testing.
 	noteAntigravityCurrentAttempt(state.debtID(), "fp-a", false)
 	if notice, _ := antigravityFreshnessNotice("", now); strings.Contains(notice, "chartable") || !strings.Contains(notice, "Google returned no reading") {
 		t.Errorf("a cleared mark still worded the notice: %q", notice)
+	}
+}
+
+// One capture poller is shared by every armed run and the quota cache holds ONE
+// snapshot, so two overlapping runs under different logins read the same file.
+// A reading saved for account A, stamped after account B's run finished,
+// satisfies the instant while describing a pool B never spent from. Coverage is
+// therefore scoped to the account B's OWN PID block names: B still owes its
+// refresh, and the debt worker does not retire it against A's reading either.
+func TestAntigravityFreshness_AnotherAccountsReadingDoesNotCoverTheRun(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cachedAs string
+		wantOwed bool
+	}{
+		{"another login's reading", "ada@example.com", true},
+		{"the run's own login", "bob@example.com", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			cache := os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")
+			floor := time.Now().Truncate(time.Second)
+			completed := floor.Add(time.Minute)
+			antigravityUsageFreshnessNow = func() time.Time { return completed }
+			// The run's own block, which is where its identity comes from.
+			h.write(t, helperLogName(floor),
+				helperPIDBlock(60301)+"authenticated successfully as bob@example.com\n", floor, false)
+			// The newest reading, taken a second AFTER this run completed.
+			helperWriteAntigravityCacheFor(t, cache, completed.Add(time.Second),
+				completed.Add(time.Second).UnixMilli(), tc.cachedAs)
+			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+
+			antigravityUsageRunSettled(floor, 60301, false, true)
+			antigravityUsageRefreshWaitIdle()
+
+			state := helperFreshnessState(t)
+			if owed := state.RefreshOwedAtMs != 0; owed != tc.wantOwed {
+				t.Fatalf("owed=%v (state=%+v), want owed=%v", owed, state, tc.wantOwed)
+			}
+			if spent := calls.Load() != 0; spent != tc.wantOwed {
+				t.Errorf("Code Assist reads=%d, want spent=%v", calls.Load(), tc.wantOwed)
+			}
+		})
 	}
 }

@@ -584,8 +584,13 @@ func antigravityPushPID(ring []antigravityTrackedPID, p antigravityTrackedPID) [
 // live process (zero = unknown). Two known tokens that differ mean the OS
 // reused the PID for another process, which is not ours. When a token is
 // unknown — typically because the process has already exited — the PID still
-// matches only if that run had started by the time the remembered one ended:
-// a run that started after our process exited cannot be it.
+// matches only if that run had started STRICTLY BEFORE the second in which the
+// remembered one ended: a run that started after our process exited cannot be
+// it, and a log name carries only its second, so a run that started later
+// inside that same second is indistinguishable from ours by time alone. The
+// ambiguous second is therefore read as foreign, which costs one refresh
+// nobody owed; reading it as ours would swallow a user's run silently, which
+// is the failure this index exists to prevent.
 func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string, at time.Time) bool {
 	for _, known := range ring {
 		if known.pid != pid {
@@ -594,7 +599,8 @@ func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string, at ti
 		if known.token != "" && token != "" {
 			return known.token == token
 		}
-		return known.exitedAt.IsZero() || at.IsZero() || !at.After(known.exitedAt)
+		return known.exitedAt.IsZero() || at.IsZero() ||
+			at.Before(known.exitedAt.Truncate(time.Second))
 	}
 	return false
 }
