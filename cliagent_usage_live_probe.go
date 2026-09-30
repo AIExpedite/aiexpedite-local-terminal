@@ -108,6 +108,12 @@ const (
 	// cliagent_usage_antigravity_gate.go). Reported both when a probe met the
 	// refusal and when the click skipped the spawn because a recent probe did.
 	liveProbeOutcomeGated = "gated"
+	// The read answered but the capture path merged nothing (a stale,
+	// reset-only or unattributable window, or a cache write refused under
+	// contention). It REACHED the provider, so it costs a read like any other;
+	// reporting it as `ok` made the click log claim a reading that changed
+	// nothing.
+	liveProbeOutcomeNotMerged = "not_merged"
 )
 
 // cliUsageRefreshWantsLiveProbe reports whether a refresh carries the signed
@@ -549,7 +555,9 @@ func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprin
 			if currentCodexAccountFingerprint() != spawnedFingerprint {
 				return liveProbeOutcomeAccountChanged
 			}
-			captureCodexRateLimitLineFromProducer(string(envelope), time.Now(), spawnedFingerprint, producerVersion)
+			if !captureCodexRateLimitLineFromProducer(string(envelope), time.Now(), spawnedFingerprint, producerVersion) {
+				return liveProbeOutcomeNotMerged
+			}
 			return liveProbeOutcomeOK
 		}
 	}

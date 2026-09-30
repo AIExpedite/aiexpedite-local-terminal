@@ -73,8 +73,8 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 5 {
-		t.Fatal("expected five shared vectors")
+	if len(vectors.Vectors) != 6 {
+		t.Fatal("expected six shared vectors")
 	}
 	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
@@ -181,8 +181,8 @@ func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 5 {
-		t.Fatal("expected five shared vectors")
+	if len(vectors.Vectors) != 6 {
+		t.Fatal("expected six shared vectors")
 	}
 	if text != vectors.Vectors[2].Canonical {
 		t.Fatalf("unexpected protocol canonical bytes: %s", text)
@@ -191,5 +191,59 @@ func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
 		[]cliAgentUsageError{{Provider: "claudeCode", ErrorCategory: cliUsageErrorProtocol}})
 	if err != nil || signature != vectors.Vectors[2].Signature {
 		t.Fatalf("unexpected protocol shared-vector signature: %s (%v)", signature, err)
+	}
+}
+
+// usageGeneration is signed: canonical bytes with it match the golden vector
+// terminal-service asserts too, and a receipt without it is byte-identical to
+// one from an agent that predates the field.
+func TestCLIUsageRefreshReceiptSignsUsageGeneration(t *testing.T) {
+	data, err := os.ReadFile("testdata/cli_usage_refresh_receipt_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Vectors []struct{ Name, Canonical, Signature string } `json:"vectors"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	var canonicalWant, signatureWant string
+	for _, v := range vectors.Vectors {
+		if v.Name == "codex-usage-generation" {
+			canonicalWant, signatureWant = v.Canonical, v.Signature
+		}
+	}
+	if canonicalWant == "" {
+		t.Fatal("missing codex-usage-generation vector")
+	}
+	total, remaining, consumed := 100.0, 73.0, 27.0
+	agent := cliAgentUsage{
+		Provider: "codex", CollectedAt: "now",
+		Metrics: []cliAgentUsageMetric{{
+			Kind: "weekly", Label: "Weekly quota", Unit: "%", Total: &total, Remaining: &remaining, Consumed: &consumed,
+			ResetAt: "2026-10-06T19:39:00Z", ObservedAt: "2026-09-30T11:56:11Z",
+		}},
+		UsageGeneration: &cliUsageGeneration{Epoch: 4503599627370497, Counter: 7},
+	}
+	canonical, _, _, err := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil)
+	if err != nil || string(canonical) != canonicalWant {
+		t.Fatalf("canonical = %s (%v), want %s", canonical, err, canonicalWant)
+	}
+	if signature, _, _, err := signCLIUsageRefreshReceipt("secret", "r6", 6, true, []cliAgentUsage{agent}, nil); err != nil || signature != signatureWant {
+		t.Fatalf("signature = %s (%v), want %s", signature, err, signatureWant)
+	}
+
+	agent.UsageGeneration = nil
+	without, _, _, _ := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil)
+	if strings.Contains(string(without), "usageGeneration") {
+		t.Fatalf("an absent generation must stay absent: %s", without)
+	}
+
+	for _, bad := range []cliUsageGeneration{{Epoch: -1, Counter: 1}, {Epoch: 1, Counter: cliUsageMaxSafeInteger + 1}} {
+		agent.UsageGeneration = &bad
+		if _, _, _, err := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil); err == nil {
+			t.Fatalf("generation %+v must be refused", bad)
+		}
 	}
 }

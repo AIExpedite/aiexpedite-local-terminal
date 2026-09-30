@@ -568,3 +568,69 @@ func TestCodexUpgrade_DriftNoticeOnlyOnceTheFallbackResolved(t *testing.T) {
 		t.Fatalf("resolved fallback must show the capture-drift warning, got %q (%s)", usage.Notice, usage.NoticeSeverity)
 	}
 }
+
+// The cache the reporting Windows machine held after a successful smoke: an
+// OLDER `codex` weekly contributor (the last live read: 90%, reset R1) and a
+// NEWER `__legacy__` one (the day's run: 27%, later reset R2), an
+// authoritative full snapshot on record and no session window. The fold used
+// to publish 90% observed before the window R2 implies, so the card rendered
+// the weekly row unobservable and omitted the session row — zero numeric
+// metrics. Now the newer reading wins with its own reset and observedAt, and
+// it survives an agent restart (a reload from disk) with no new frame.
+func TestCodexUpgrade_ReportedWindowsCacheRendersTheFreshWeeklyReading(t *testing.T) {
+	withCodexGenerationEpoch(t, 9001)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-72*time.Hour))
+	r1, r2 := now.Add(3*24*time.Hour), now.Add(6*24*time.Hour+3*time.Hour)
+	liveRead, run := now.Add(-18*time.Hour), now.Add(-time.Hour)
+	seedCodexContributors(t, f, map[string]map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			codexDefaultLimitID: weeklyBucket(90, r1, liveRead),
+			codexLegacyLimitID:  weeklyBucket(27, r2, run),
+		},
+	}, nil, func(s *codexRateLimitSnapshot) {
+		s.FullSnapshotAtMs = liveRead.UnixMilli()
+		s.RunFloorMs, s.RunFloorPaidMs = run.UnixMilli(), run.UnixMilli()
+		s.GenerationEpoch, s.Generation = 0, 0 // written before generations existed
+	})
+
+	check := func(stage string) {
+		t.Helper()
+		metrics := codexMetricsFromCache(time.Now(), f.fp)
+		numeric := 0
+		for _, m := range metrics {
+			if m.Consumed != nil && !m.Unknown {
+				numeric++
+			}
+		}
+		if numeric == 0 {
+			t.Fatalf("%s: zero numeric metrics: %+v", stage, metrics)
+		}
+		weekly := codexWeeklyMetric(t, metrics)
+		if weekly.Consumed == nil || *weekly.Consumed != 27 {
+			t.Fatalf("%s: weekly = %+v, want the fresh 27%%", stage, weekly)
+		}
+		if got := metricObservedAt(t, weekly); got.Unix() != run.Unix() {
+			t.Fatalf("%s: observedAt %s, want the run's %s", stage, got, run)
+		}
+		if want := time.UnixMilli(r2.UnixMilli()).UTC().Format(time.RFC3339); weekly.ResetAt != want {
+			t.Fatalf("%s: resetAt %s, want the fresh reading's own %s", stage, weekly.ResetAt, want)
+		}
+		// The window the card derives from resetAt must contain the observation.
+		windowStart := r2.Add(-7 * 24 * time.Hour)
+		if got := metricObservedAt(t, weekly); got.Before(windowStart) {
+			t.Fatalf("%s: observedAt %s predates its own window (%s)", stage, got, windowStart)
+		}
+	}
+	check("first gather after the upgrade")
+
+	simulateCodexProcessRestart(t, 9002)
+	check("after an agent restart")
+
+	// The pre-generation cache gains this process's epoch on its first write.
+	codexRotateGenerationEpoch(time.Now())
+	if snap := f.snapshot(t); snap.GenerationEpoch != 9002 || snap.Generation != 1 {
+		t.Fatalf("pre-generation cache = {%d,%d}, want {9002,1}", snap.GenerationEpoch, snap.Generation)
+	}
+	check("after the first write")
+}

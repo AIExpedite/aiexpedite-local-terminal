@@ -1235,3 +1235,24 @@ func TestProbeAntigravityQuotaViaCodeAssist_RecordsOnlyTheSpacingClock(t *testin
 		})
 	}
 }
+
+// A read the capture path refuses (here: a window with neither a usage figure
+// nor a reset) reached OpenAI but changed nothing. It must not log as `ok`: it
+// reports not_merged, costs a read, and books the after-read rung.
+func TestCodexLiveProbeConverse_RefusedReadReportsNotMerged(t *testing.T) {
+	cache := isolateCodexCache(t)
+	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300}}}}`)
+	got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion())
+	if got != liveProbeOutcomeNotMerged {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeNotMerged)
+	}
+	if _, ok := loadCodexRateLimitSnapshot(cache); ok {
+		t.Fatal("a refused read must not write the cache")
+	}
+	if !codexLiveReadOutbound(got) {
+		t.Fatal("not_merged reached the provider and must count as outbound")
+	}
+	if kind := codexLiveReadRetryKind(got, false); kind != codexRetryAfterRead {
+		t.Fatalf("retry kind = %v, want codexRetryAfterRead", kind)
+	}
+}

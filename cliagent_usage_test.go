@@ -1375,6 +1375,15 @@ func codexRateLimitFrame(primaryPct, secondaryPct float64, now time.Time) map[st
 	}
 }
 
+// codexRateLimitFrameWithLimitID is codexRateLimitFrame as current builds write
+// it: the aggregate names the limit it describes. codexRateLimitFrame stays the
+// id-less shape of older builds.
+func codexRateLimitFrameWithLimitID(limitID string, primaryPct, secondaryPct float64, now time.Time) map[string]any {
+	frame := codexRateLimitFrame(primaryPct, secondaryPct, now)
+	frame["limit_id"] = limitID
+	return frame
+}
+
 // helperCodexAuthAt writes auth.json for email and stamps its mtime to loginAt —
 // the account-login watermark the rollout scope guard compares each session's
 // start time against. Default rollout session timestamps are 2026-06-19T11:00Z,

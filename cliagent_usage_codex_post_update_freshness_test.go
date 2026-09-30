@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -933,5 +934,365 @@ func TestCodexPostUpdate_EvidenceIsAtomicWithTheCursorThatConsumesIt(t *testing.
 	}
 	if got := codexObservedAt(t, f); !got.After(observed) {
 		t.Fatalf("observedAt %s did not advance past the pre-run reading %s", got, observed)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Fenced-rollout escalation. A same-account token refresh that rewrites
+   auth.json mid-run fences the run's own rollout (its session started before
+   the new login watermark). The fence is NOT relaxed; instead the debt spends
+   its one early, account-pinned live read in the same pass, reserved on disk
+   before the request so no sequence of rungs, restarts or refused writes can
+   take a second one.
+   ------------------------------------------------------------------------ */
+
+type codexFencedRun struct {
+	f        codexFreshnessFixture
+	runStart time.Time
+	state    codexRunFreshnessState
+}
+
+// newCodexFencedRun is a finished run whose rollout (numeric frames, appended
+// after the floor) is rejected only by the account fence: auth.json was
+// rewritten for the SAME account after the session started.
+func newCodexFencedRun(t *testing.T) codexFencedRun {
+	t.Helper()
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	writeCodexRunRollout(t, f.home, "fenced", runStart, runStart.Add(time.Minute), runStart.Add(70*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(47, 52, now)})
+	helperCodexAuthAt(t, f.home, "dev@example.com", runStart.Add(30*time.Second))
+	if currentCodexAccountFingerprint() != f.fp {
+		t.Fatal("a same-account rewrite must keep the fingerprint")
+	}
+	return codexFencedRun{f: f, runStart: runStart, state: f.oweUnpaidDebt(t, runStart, runStart.Add(90*time.Second), 0, 0)}
+}
+
+func (r codexFencedRun) earlyReserved(t *testing.T) bool {
+	t.Helper()
+	snap := r.f.snapshot(t)
+	id := r.state.debtID()
+	return snap.EarlyReadFloorMs == id.floorMs && snap.EarlyReadOwedAtMs == id.owedAtMs
+}
+
+func noReadingFallback(context.Context, string) string { return liveProbeOutcomeNoReading }
+
+// failCommitsMatching refuses the next `times` cache commits whose serialized
+// snapshot satisfies match.
+func failCommitsMatching(t *testing.T, times int, match func(out string) bool) {
+	t.Helper()
+	prev := codexCommitRateLimitSnapshot
+	left := times
+	codexCommitRateLimitSnapshot = func(path string, out []byte, now time.Time) bool {
+		if left > 0 && match(string(out)) {
+			left--
+			return false
+		}
+		return prev(path, out, now)
+	}
+	t.Cleanup(func() { codexCommitRateLimitSnapshot = prev })
+}
+
+// nextRung lets the per-account forced-reconcile interval lapse before the next
+// directly driven pass.
+func nextRung() { time.Sleep(2 * codexForcedReconcileMinInterval) }
+
+func TestCodexFencedRollout_TheDebtTakesOneEarlyLiveReadInTheSamePass(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+
+	state, kind := codexPayRunRefresh(r.f.home, r.f.fp)
+
+	if *calls != 1 {
+		t.Fatalf("early live reads = %d, want 1", *calls)
+	}
+	if state.owed || kind != codexRetryNone {
+		t.Fatalf("the pinned live read must pay the debt: state=%+v kind=%v", state, kind)
+	}
+	if got := codexObservedAt(t, r.f); got.Before(r.runStart.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s still predates the run", got)
+	}
+}
+
+// The detecting scan is attempt 1; a read that misses leaves the other three
+// scans and books the ordinary scan rung.
+func TestCodexFencedRollout_AMissedEarlyReadKeepsTheRemainingScans(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, noReadingFallback)
+
+	state, kind := codexPayRunRefresh(r.f.home, r.f.fp)
+
+	snap := r.f.snapshot(t)
+	if *calls != 1 || snap.RefreshLiveReads != 1 {
+		t.Fatalf("calls=%d reads=%d, want one early read", *calls, snap.RefreshLiveReads)
+	}
+	if snap.RefreshOwedAttempts != 1 {
+		t.Fatalf("attempts = %d, want the detecting scan counted as 1 (3 left)", snap.RefreshOwedAttempts)
+	}
+	if !state.owed || kind != codexRetryAfterScan {
+		t.Fatalf("state=%+v kind=%v, want the ordinary scan rung", state, kind)
+	}
+	if !r.earlyReserved(t) {
+		t.Fatal("an outbound early read must keep its reservation")
+	}
+}
+
+// An early read that reached OpenAI without paying, then an agent restart with
+// the debt still outstanding: the same fenced rollout takes no second early
+// read. The second read is spent only as the final fallback after the scans.
+func TestCodexFencedRollout_NoSecondEarlyReadAcrossARestart(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, noReadingFallback)
+	codexPayRunRefresh(r.f.home, r.f.fp)
+
+	simulateCodexAgentRestart(t)
+	nextRung()
+	codexPayRunRefresh(r.f.home, r.f.fp)
+
+	if snap := r.f.snapshot(t); *calls != 1 || snap.RefreshLiveReads != 1 || snap.RefreshOwedAttempts != 2 {
+		t.Fatalf("calls=%d reads=%d attempts=%d, want 1 read and 2 scans", *calls, snap.RefreshLiveReads, snap.RefreshOwedAttempts)
+	}
+
+	// The remaining scans run, then the final fallback spends the second read.
+	// (A pass driven outside the worker leaves its worker slot claimed —
+	// takeRearm records one — so hand it back first.)
+	codexUsageRefresh.releaseWorker(r.f.fp)
+	codexRunDebtWorker(r.f.home, r.f.fp)
+	drainCodexRunDebtLadder(t)
+	if snap := r.f.snapshot(t); *calls != codexRefreshLiveReadMaxAttempts || snap.RefreshLiveReads != codexRefreshLiveReadMaxAttempts {
+		t.Fatalf("calls=%d reads=%d, want the budget's %d reads in total: %+v", *calls, snap.RefreshLiveReads, codexRefreshLiveReadMaxAttempts, snap)
+	}
+}
+
+// The early read reached OpenAI but its counter write was refused: the next
+// fenced rung takes no second early read (retained count), and neither does a
+// restarted process that lost the retained count (reservation on disk).
+func TestCodexFencedRollout_ARefusedCounterWriteCannotAuthorizeASecondEarlyRead(t *testing.T) {
+	r := newCodexFencedRun(t)
+	var armed bool
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string {
+		armed = true
+		return liveProbeOutcomeNoReading
+	})
+	failCommitsMatching(t, 1, func(out string) bool {
+		if armed && strings.Contains(out, `"refreshLiveReads": 1`) {
+			armed = false
+			return true
+		}
+		return false
+	})
+
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	id := r.state.debtID()
+	if snap := r.f.snapshot(t); snap.RefreshLiveReads != 0 || codexUsageRefresh.peekLiveReads(r.f.fp, id) != 1 {
+		t.Fatalf("persisted reads=%d retained=%d, want 0 persisted and 1 retained",
+			snap.RefreshLiveReads, codexUsageRefresh.peekLiveReads(r.f.fp, id))
+	}
+	if !r.earlyReserved(t) {
+		t.Fatal("the reservation must be on disk")
+	}
+
+	nextRung()
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if *calls != 1 {
+		t.Fatalf("a retained count re-authorized an early read: %d calls", *calls)
+	}
+
+	simulateCodexAgentRestart(t) // the retained count dies with the process
+	nextRung()
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if *calls != 1 {
+		t.Fatalf("a restart re-authorized an early read: %d early-path calls", *calls)
+	}
+}
+
+// A refused reservation write sends no early read and books the scan rung.
+func TestCodexFencedRollout_NoReadWithoutADurableReservation(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	failCommitsMatching(t, 1, func(out string) bool { return strings.Contains(out, `"earlyReadFloorMs"`) })
+
+	state, kind := codexPayRunRefresh(r.f.home, r.f.fp)
+	if *calls != 0 {
+		t.Fatalf("an early read went out without its reservation: %d", *calls)
+	}
+	if !state.owed || kind != codexRetryAfterScan || r.earlyReserved(t) {
+		t.Fatalf("state=%+v kind=%v reserved=%v, want the scan rung and no reservation", state, kind, r.earlyReserved(t))
+	}
+}
+
+// Offline plus fenced defers without spending a read: the reservation is
+// released and the next (online) rung takes the early read.
+func TestCodexFencedRollout_OfflineReleasesTheReservationForTheNextRung(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+	setCodexTestOffline(t, true)
+
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if snap := r.f.snapshot(t); *calls != 0 || snap.RefreshLiveReads != 0 || r.earlyReserved(t) {
+		t.Fatalf("offline: calls=%d reads=%d reserved=%v, want nothing spent and the reservation released",
+			*calls, snap.RefreshLiveReads, r.earlyReserved(t))
+	}
+
+	setCodexTestOffline(t, false)
+	nextRung()
+	if state, _ := codexPayRunRefresh(r.f.home, r.f.fp); *calls != 1 || state.owed {
+		t.Fatalf("back online: calls=%d owed=%v, want the early read to pay", *calls, state.owed)
+	}
+}
+
+// A refused release write loses the opportunity — the safe direction: no early
+// read later, and the final fallback keeps its whole two-read budget.
+func TestCodexFencedRollout_ARefusedReleaseLosesOnlyTheOpportunity(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, noReadingFallback)
+	setCodexTestOffline(t, true)
+	reserved := false
+	failCommitsMatching(t, 1, func(out string) bool {
+		if strings.Contains(out, `"earlyReadFloorMs"`) {
+			reserved = true
+			return false
+		}
+		return reserved // the first write that drops the pair is the release
+	})
+
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if !r.earlyReserved(t) {
+		t.Fatal("the refused release must leave the reservation in place")
+	}
+	setCodexTestOffline(t, false)
+	nextRung()
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if snap := r.f.snapshot(t); *calls != 0 || snap.RefreshLiveReads != 0 {
+		t.Fatalf("calls=%d reads=%d, want the opportunity lost and the budget intact", *calls, snap.RefreshLiveReads)
+	}
+}
+
+// A newer debt over a stale reservation gets its own early opportunity — via
+// the clear on re-owing, and via the full-identity gate when a clear is
+// skipped (same owedAtMs, different floor).
+func TestCodexFencedRollout_ANewerDebtGetsItsOwnEarlyRead(t *testing.T) {
+	t.Run("cleared on re-owing", func(t *testing.T) {
+		r := newCodexFencedRun(t)
+		calls := stubCodexFallbackRead(t, noReadingFallback)
+		codexPayRunRefresh(r.f.home, r.f.fp)
+		r.state = r.f.oweUnpaidDebt(t, r.runStart, r.runStart.Add(100*time.Second), 0, 0)
+		if snap := r.f.snapshot(t); snap.EarlyReadFloorMs != 0 || snap.EarlyReadOwedAtMs != 0 {
+			t.Fatalf("a new debt inherited the reservation: %+v", snap)
+		}
+		nextRung()
+		codexPayRunRefresh(r.f.home, r.f.fp)
+		if *calls != 2 {
+			t.Fatalf("calls = %d, want the new debt's own early read", *calls)
+		}
+	})
+	t.Run("full-identity gate with the clear suppressed", func(t *testing.T) {
+		r := newCodexFencedRun(t)
+		calls := stubCodexFallbackRead(t, noReadingFallback)
+		id := r.state.debtID()
+		codexRateLimitCacheTransaction(context.Background(), r.f.cache, time.Now(), true, func(snap *codexRateLimitSnapshot) bool {
+			snap.EarlyReadFloorMs, snap.EarlyReadOwedAtMs = id.floorMs-1000, id.owedAtMs // same owedAt, other floor
+			return true
+		})
+		codexPayRunRefresh(r.f.home, r.f.fp)
+		if *calls != 1 || !r.earlyReserved(t) {
+			t.Fatalf("calls=%d reserved=%v, want a stale reservation for another floor ignored", *calls, r.earlyReserved(t))
+		}
+	})
+}
+
+// The fenced file belongs to an unrelated overlapping session; the early read
+// finds nothing. The debt's own rollout, flushed on the next rung, pays through
+// the ordinary scan, and the early read is not repeated.
+func TestCodexFencedRollout_AnUnrelatedFencedSessionThenTheRunsOwnRolloutPays(t *testing.T) {
+	r := newCodexFencedRun(t) // "fenced" is the unrelated session here
+	calls := stubCodexFallbackRead(t, noReadingFallback)
+	codexPayRunRefresh(r.f.home, r.f.fp)
+
+	own := r.runStart.Add(40 * time.Second) // started after the auth rewrite
+	writeCodexRunRollout(t, r.f.home, "own", own, own.Add(20*time.Second), own.Add(30*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(61, 62, time.Now())})
+	nextRung()
+	state, _ := codexPayRunRefresh(r.f.home, r.f.fp)
+
+	if *calls != 1 {
+		t.Fatalf("the early read was repeated: %d", *calls)
+	}
+	if state.owed {
+		t.Fatalf("the run's own rollout must pay through the scan: %+v", state)
+	}
+	if s := codexSessionMetric(t, codexMetricsFromCache(time.Now(), r.f.fp)); s.Consumed == nil || *s.Consumed != 61 {
+		t.Fatalf("session = %+v, want the run's own 61%%", s)
+	}
+}
+
+// A-B-A: rollouts written while account B was signed in stay rejected; only the
+// live read pinned to A (the account the run armed under) pays.
+func TestCodexFencedRollout_AnABASwitchKeepsBEraRolloutsRejected(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-3 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	fpA := f.fp
+	helperCodexAuthAt(t, f.home, "b@example.com", runStart.Add(10*time.Second))
+	bSession := runStart.Add(20 * time.Second)
+	writeCodexRunRollout(t, f.home, "b-era", bSession, bSession.Add(10*time.Second), bSession.Add(20*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(99, 99, now)})
+	helperCodexAuthAt(t, f.home, "dev@example.com", runStart.Add(60*time.Second)) // back to A
+	if currentCodexAccountFingerprint() != fpA {
+		t.Fatal("switching back must restore account A")
+	}
+	f.oweUnpaidDebt(t, runStart, runStart.Add(90*time.Second), 0, 0)
+	var pinned string
+	stubCodexFallbackRead(t, func(ctx context.Context, fp string) string {
+		pinned = fp
+		return capturingFallbackRead(ctx, fp)
+	})
+
+	codexPayRunRefresh(f.home, fpA)
+
+	if pinned != fpA {
+		t.Fatal("the early read was not pinned to the run's account")
+	}
+	for _, m := range codexMetricsFromCache(time.Now(), fpA) {
+		if m.Consumed != nil && *m.Consumed == 99 {
+			t.Fatalf("account B's rollout leaked into A's card: %+v", m)
+		}
+	}
+}
+
+// A long-lived session that started BEFORE the floor, appended after it, and
+// was fenced by a later same-account rewrite still escalates: relevance comes
+// from the append, not the immutable session start.
+func TestCodexFencedRollout_AResumedSessionStartedBeforeTheFloorEscalates(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	sessionStart := runStart.Add(-time.Hour)
+	writeCodexRunRollout(t, f.home, "resumed", sessionStart, runStart.Add(time.Minute), runStart.Add(70*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(47, 52, now)})
+	helperCodexAuthAt(t, f.home, "dev@example.com", runStart.Add(30*time.Second))
+	f.oweUnpaidDebt(t, runStart, runStart.Add(90*time.Second), 0, 0)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+
+	if state, _ := codexPayRunRefresh(f.home, f.fp); *calls != 1 || state.owed {
+		t.Fatalf("calls=%d owed=%v, want the early read to pay", *calls, state.owed)
+	}
+}
+
+// An unfenced silent debt does NOT escalate: the ordinary ladder is kept.
+func TestCodexFencedRollout_AnUnfencedDebtKeepsTheOrdinaryLadder(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-2 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.oweUnpaidDebt(t, runStart, runStart.Add(90*time.Second), 0, 0)
+	calls := stubCodexFallbackRead(t, capturingFallbackRead)
+
+	if _, kind := codexPayRunRefresh(f.home, f.fp); *calls != 0 || kind != codexRetryAfterScan {
+		t.Fatalf("calls=%d kind=%v, want no early read", *calls, kind)
 	}
 }

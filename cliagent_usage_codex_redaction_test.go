@@ -246,3 +246,81 @@ func TestCodexRefreshSchedule_LogsCarryCountersOnly(t *testing.T) {
 		}
 	}
 }
+
+// The fields this change persists — the capture generation and the early-read
+// reservation — are integers only, and the receipt addition is two integers.
+func TestCodexGenerationAndEarlyRead_PersistIntegersOnly(t *testing.T) {
+	withCodexGenerationEpoch(t, 4503599627370497)
+	r := newCodexFencedRun(t)
+	stubCodexFallbackRead(t, noReadingFallback)
+	codexPayRunRefresh(r.f.home, r.f.fp)
+
+	raw, err := os.ReadFile(r.f.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"generationEpoch", "generation", "earlyReadFloorMs", "earlyReadOwedAtMs"} {
+		v, ok := fields[key]
+		if !ok {
+			t.Fatalf("expected %q in the persisted snapshot", key)
+		}
+		if n, isNum := v.(float64); !isNum || n != float64(int64(n)) {
+			t.Fatalf("%q = %#v, want an integer", key, v)
+		}
+	}
+
+	canonical, _, _, err := canonicalCLIUsageRefreshReceipt("r", 1, true, []cliAgentUsage{{
+		Provider: "codex", CollectedAt: "now", UsageGeneration: &cliUsageGeneration{Epoch: 4503599627370497, Counter: 9},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(canonical), `"usageGeneration":{"epoch":4503599627370497,"counter":9}`) {
+		t.Fatalf("receipt addition is not two integers: %s", canonical)
+	}
+}
+
+// Propagator log lines are fixed labels: never a path, an account, an email, a
+// fingerprint, a thread id or a credit balance.
+func TestCLIUsageHint_LogsCarryFixedLabelsOnly(t *testing.T) {
+	const email = "hint.secret@example.com"
+	withCodexGenerationEpoch(t, 777)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	helperCodexAuthAt(t, f.home, email, now.Add(-time.Hour))
+	f.fp = currentCodexAccountFingerprint()
+	rec, cfg := propagatorFixture(t)
+	rec.status = func(cliUsageObservedHint) int { return 409 }
+
+	logged := captureStdout(t, func() {
+		captureCodexRateLimitLineForAccount(codexCurrentBuildTokenCount(t, "codex", 27, now.Add(96*time.Hour), now), now, f.fp)
+		startCLIUsagePropagator(cfg)
+		waitHints(t, rec, 2, cliUsageHintSpacing/2)
+		stopCLIUsagePropagator()
+	})
+
+	label := regexp.MustCompile(`^\[cli-usage\] usage hint: (sent|followup_sent|deferred|skipped_offline|skipped_unregistered|awaiting_rotation|rotation_retry|dropped|failed_\d+)$`)
+	ansi := regexp.MustCompile("\x1b\\[[0-9;]*m")
+	hintLines := 0
+	for _, line := range strings.Split(ansi.ReplaceAllString(logged, ""), "\n") {
+		if !strings.Contains(line, "usage hint") {
+			continue
+		}
+		hintLines++
+		if !label.MatchString(strings.TrimSpace(line)) {
+			t.Errorf("hint log line is not a fixed label: %q", line)
+		}
+	}
+	if hintLines == 0 {
+		t.Fatalf("expected usage hint log lines, got %q", logged)
+	}
+	for _, s := range []string{email, "hint.secret", f.home, filepath.ToSlash(f.home), f.fp, "123.45"} {
+		if strings.Contains(logged, s) {
+			t.Errorf("propagator log leaks %q:\n%s", s, logged)
+		}
+	}
+}

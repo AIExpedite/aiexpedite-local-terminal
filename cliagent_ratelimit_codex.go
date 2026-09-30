@@ -9,14 +9,20 @@
 //	`token_count` notification on the `codex app-server` stdout stream while a
 //	session is active, carrying:
 //	    rate_limits: {
-//	      primary:   { used_percent | utilization, resets_in_seconds | window_minutes },
-//	      secondary: { used_percent | utilization, resets_in_seconds | window_minutes },
+//	      limit_id:   "codex",
+//	      limit_name: null | "<pool display name>",
+//	      primary:    { used_percent | utilization, resets_in_seconds | resets_at, window_minutes },
+//	      secondary:  { … } | null,
+//	      credits, plan_type, …   (ignored)
 //	    }
-//	primary is the rolling 5-hour window, secondary is the weekly window — the
-//	direct analog of Claude Code's `rate_limit_event`. We accept both
-//	`used_percent` (0..100) and `utilization` (0..1), and tolerate the
-//	`5h`/`7d`/`weekly` window aliases so a minor Codex schema rename does not
-//	silently zero the card.
+//	Windows are identified by LENGTH, not position: current builds report the
+//	weekly window under `primary` (window_minutes 10080) with `secondary: null`.
+//	`limit_id` names the metered limit the aggregate describes, so every window
+//	is stored under that id and a newer reading of the limit replaces the older
+//	one; a frame without it (older builds) is stored under codexLegacyLimitID.
+//	We accept both `used_percent` (0..100) and `utilization` (0..1), and
+//	tolerate the `5h`/`7d`/`weekly` window aliases so a minor Codex schema rename
+//	does not silently zero the card.
 //
 // One consumer reads the cache this writes:
 //  1. cliagent_usage_codex.go — turns the snapshot into the real five-hour /
@@ -26,14 +32,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,6 +68,43 @@ const (
 // clobber a stricter prior contributor (e.g. `codex_other`) that the sparse
 // frame did not restate.
 const codexLegacyLimitID = "__legacy__"
+
+// codexDefaultLimitID is the limit id Codex gives the account's default limit
+// on its aggregate `rate_limits` view. An id-less aggregate (codexLegacyLimitID)
+// describes the same limit, so the two supersede each other
+// (codexSupersessionKey).
+const codexDefaultLimitID = "codex"
+
+// codexSupersessionKey is the limit a contributor id stands for when newer
+// readings replace older ones. A `__legacy__` contributor — left on disk, or
+// written by an older build whose frames carried no `limit_id` — is the
+// account's default limit, so it and `codex` resolve to one key and the newest
+// of the two wins. Every other id is its own limit.
+func codexSupersessionKey(limitID string) string {
+	if limitID == codexLegacyLimitID {
+		return codexDefaultLimitID
+	}
+	return limitID
+}
+
+// codexAggregateLimitID is the contributor id an aggregate `rate_limits` /
+// `rateLimits` container files its windows under: its own `limit_id` /
+// `limitId` when that is a non-empty string (clamped like a limit name), or
+// codexLegacyLimitID when it is missing, empty or not a string.
+func codexAggregateLimitID(rl map[string]interface{}) string {
+	v, ok := pickField(rl, "limit_id", "limitId")
+	if !ok {
+		return codexLegacyLimitID
+	}
+	s, ok := v.(string)
+	if !ok {
+		return codexLegacyLimitID
+	}
+	if s = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes); s == "" {
+		return codexLegacyLimitID
+	}
+	return s
+}
 
 // codexResetJitterMs is how much two reset timestamps may differ and still be
 // treated as the same quota window. A sparse reset-only frame recomputes
@@ -246,6 +292,25 @@ type codexRateLimitSnapshot struct {
 	// rung could never be retried, and an offline-at-settle device would never
 	// converge.
 	RefreshLiveReads int `json:"refreshLiveReads,omitempty"`
+	// EarlyReadFloorMs / EarlyReadOwedAtMs reserve a debt's ONE early live read
+	// (codexEscalateFencedRollout): the full debt identity (RunFloorMs,
+	// RefreshOwedAtMs) whose early opportunity has been claimed. Written before
+	// the request goes out, so a restart — or a counter write the locks refused —
+	// can never authorize a second early read for the same debt. Cleared with
+	// the debt (codexClearRunFreshnessDebt). Numeric only.
+	EarlyReadFloorMs  int64 `json:"earlyReadFloorMs,omitempty"`
+	EarlyReadOwedAtMs int64 `json:"earlyReadOwedAtMs,omitempty"`
+	// GenerationEpoch / Generation identify the committed contributor state
+	// (codexBumpGeneration): Generation increments on every write that changes
+	// contributors, clears or rescopes, and GenerationEpoch is the writing agent
+	// process's random epoch (codexProcessGenerationEpoch). The backend applies a
+	// generation from a signed refresh receipt and skips hints for one it already
+	// has (cliagent_usage_propagate.go). Integers only.
+	GenerationEpoch int64 `json:"generationEpoch,omitempty"`
+	Generation      int64 `json:"generation,omitempty"`
+	// generationBumped: this transaction already advanced the generation, so a
+	// rescope and the merge it precedes count as ONE new generation.
+	generationBumped bool
 	// NextAttemptAtMs is the rung the schedule booked for this debt
 	// (cliagent_usage_codex_refresh_schedule.go): the epoch-millisecond instant
 	// the next attempt is due. Persisted beside the debt so a self-update or a
@@ -340,7 +405,8 @@ func codexMigrateLegacyFallbackState(snap *codexRateLimitSnapshot) {
 }
 
 // codexClearRunFreshnessDebt drops one debt generation: its floor marker's
-// bookkeeping, both counters, the fallback state and the booked rung. The
+// bookkeeping, both counters, the fallback state, the booked rung and the
+// early-read reservation — so a newer debt never inherits the old one's. The
 // expiry marker is NOT touched — codexRetireExpiredRunDebt writes it in the
 // same transaction that calls this, and it must outlive the debt it describes.
 func codexClearRunFreshnessDebt(snap *codexRateLimitSnapshot) {
@@ -349,6 +415,7 @@ func codexClearRunFreshnessDebt(snap *codexRateLimitSnapshot) {
 	snap.RefreshLiveReads = 0
 	snap.RefreshFallbackState = codexFallbackUnset
 	snap.NextAttemptAtMs = 0
+	snap.EarlyReadFloorMs, snap.EarlyReadOwedAtMs = 0, 0
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -622,6 +689,10 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 						sawNonEmptyFullContainer = true
 					}
 				}
+				// Every window of this aggregate belongs to the limit it names.
+				// `limit_id` itself — like `limit_name`, `credits`, `plan_type`
+				// and any other non-window key — is skipped by the alias lookup.
+				limitID := codexAggregateLimitID(rl)
 				for window, val := range rl {
 					id, ok := codexWindowAliases[window]
 					if !ok {
@@ -641,7 +712,7 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 					if !ok {
 						continue
 					}
-					addContributor(id, codexLegacyLimitID, b)
+					addContributor(id, limitID, b)
 				}
 			}
 		}
@@ -1054,8 +1125,12 @@ func codexPlacementBeats(aBucket codexRateLimitBucket, aSlot string, bBucket cod
 //     of that limit is superseded — but a DISTINCT limit id that only exists on
 //     the other slot is NOT retracted (sparse frames never drop a limit they
 //     didn't mention), so it still contributes to the most-constrained fold.
-//   - The coarse `__legacy__` aggregate contributor is dropped only when a
-//     STRICTLY NEWER non-legacy placement of the same identity exists: once a
+//   - `__legacy__` and `codex` are the same limit (codexSupersessionKey): the
+//     id-less aggregate of an older build and the `limit_id: "codex"` aggregate
+//     of a current one both describe the default limit, so the newer of the two
+//     wins outright instead of folding most-constrained with a stale reading.
+//   - Otherwise the coarse `__legacy__` aggregate contributor is dropped only
+//     when a STRICTLY NEWER non-legacy placement of the same identity exists: once a
 //     named `codex_*` limit restates the metric more recently, the aggregate
 //     view is a stale duplicate. Within a single frame (equal ObservedAtMs) the
 //     aggregate and named views coexist and fold most-constrained, so a genuinely
@@ -1064,20 +1139,23 @@ func codexPlacementBeats(aBucket codexRateLimitBucket, aSlot string, bBucket cod
 // Returned in sorted-limit-id order so downstream folding is deterministic and
 // never depends on Go map iteration order.
 func codexSurvivingContributions(contribs []codexIdentityContribution) []codexIdentityContribution {
+	// Keyed by the limit each id stands for, so `__legacy__` and `codex` compete
+	// as one limit and the newest placement of either wins.
 	winners := map[string]codexIdentityContribution{}
 	for _, c := range contribs {
-		cur, ok := winners[c.limitID]
+		key := codexSupersessionKey(c.limitID)
+		cur, ok := winners[key]
 		if !ok || codexPlacementBeats(c.bucket, c.slot, cur.bucket, cur.slot) {
-			winners[c.limitID] = c
+			winners[key] = c
 		}
 	}
-	if legacy, ok := winners[codexLegacyLimitID]; ok {
-		for id, w := range winners {
-			if id == codexLegacyLimitID {
+	if legacy, ok := winners[codexDefaultLimitID]; ok && legacy.limitID == codexLegacyLimitID {
+		for key, w := range winners {
+			if key == codexDefaultLimitID {
 				continue
 			}
 			if w.bucket.ObservedAtMs > legacy.bucket.ObservedAtMs {
-				delete(winners, codexLegacyLimitID)
+				delete(winners, codexDefaultLimitID)
 				break
 			}
 		}
@@ -1169,7 +1247,10 @@ func codexIdentityDisplayBucket(parts map[string][]codexIdentityContribution, id
 //   - the SAME limit id restated under a new storage slot supersedes its old-slot
 //     copy (newest placement wins);
 //   - a stale `__legacy__` aggregate is dropped once a strictly-newer named limit
-//     of the same identity exists (the cross-shape migration case).
+//     of the same identity exists (the cross-shape migration case), and
+//     `__legacy__` / `codex` supersede each other newest-first, so the dead
+//     duplicate a pre-`limit_id` cache holds is pruned at the next write with
+//     no migration step.
 //
 // Crucially it is SPARSE-SAFE: a DISTINCT metered limit that this frame did not
 // mention — e.g. weekly limit A under `secondary` while a sparse frame only
@@ -1298,7 +1379,8 @@ func codexRateLimitLineCandidate(line string) bool {
 }
 
 // extractCodexLimitNames returns the display name of every metered limit a
-// frame describes under `rateLimitsByLimitId`, keyed by limit id. A limit whose
+// frame describes — under `rateLimitsByLimitId`, and the aggregate's own
+// `limit_name` under its `limit_id` — keyed by limit id. A limit whose
 // name is explicitly null or empty maps to "" so an authoritative snapshot can
 // forget a name the provider stopped sending; a limit that omits the field is
 // left out entirely, so a sparse update that does not restate the name keeps
@@ -1316,6 +1398,15 @@ func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
 		}
 	}
 	for _, c := range containers {
+		// The aggregate names its own limit: `limit_name` sits beside
+		// `limit_id`. An aggregate with no `limit_id` has no limit to name.
+		if v, ok := pickField(c, "rate_limits", "rateLimits"); ok {
+			if rl, ok := v.(map[string]interface{}); ok {
+				if limitID := codexAggregateLimitID(rl); limitID != codexLegacyLimitID {
+					codexRecordLimitName(names, limitID, rl)
+				}
+			}
+		}
 		v, ok := pickField(c, "rate_limits_by_limit_id", "rateLimitsByLimitId")
 		if !ok {
 			continue
@@ -1325,27 +1416,29 @@ func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
 			continue
 		}
 		for limitID, entry := range limits {
-			info, ok := entry.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			v, ok := pickField(info, "limit_name", "limitName")
-			if !ok {
-				continue
-			}
-			// Only an explicit null or empty string clears a cached name. A value
-			// of any other type (a future schema change) is not evidence the pool
-			// lost its name, so skip it rather than folding a live named pool back
-			// into the main one.
-			switch s := v.(type) {
-			case nil:
-				names[limitID] = ""
-			case string:
-				names[limitID] = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
+			if info, ok := entry.(map[string]interface{}); ok {
+				codexRecordLimitName(names, limitID, info)
 			}
 		}
 	}
 	return names
+}
+
+// codexRecordLimitName records info's `limit_name` / `limitName` under limitID.
+// Only an explicit null or empty string clears a cached name. A value of any
+// other type (a future schema change) is not evidence the pool lost its name,
+// so it is skipped rather than folding a live named pool back into the main one.
+func codexRecordLimitName(names map[string]string, limitID string, info map[string]interface{}) {
+	v, ok := pickField(info, "limit_name", "limitName")
+	if !ok {
+		return
+	}
+	switch s := v.(type) {
+	case nil:
+		names[limitID] = ""
+	case string:
+		names[limitID] = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
+	}
 }
 
 // codexLimitNameMaxBytes bounds a pool name before it is composed into a metric
@@ -1619,6 +1712,7 @@ func mergeCodexRateLimitCacheObserved(
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return false, false
 	}
+	var generation cliUsageGeneration
 	committed = codexRateLimitCacheTransaction(ctx, path, now, waitForLocks, func(snap *codexRateLimitSnapshot) bool {
 		advanced = false
 		// A rollout scan validates the active account before it starts, but auth
@@ -1651,9 +1745,123 @@ func mergeCodexRateLimitCacheObserved(
 		before := codexContributorObservationTimes(codexContributorsFromSnapshot(*snap))
 		codexMergeContributorsIntoSnapshot(snap, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, rolloutHighWater, rolloutAccountBase, limitNames)
 		advanced = codexStampCaptureVersion(snap, before, fullSnapshot && (len(clears) > 0 || emptyAuthoritative), producerVersion)
+		generation = cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
 		return true
 	})
+	// Every capture path — live frames, the rollout scan, the live probe, the
+	// smoke — funnels through here, so this is the one place a fresh reading
+	// asks the backend to fetch it (cliagent_usage_propagate.go). Only for the
+	// ACTIVE account: the rollout base and requireActiveAccount already proved
+	// that inside the transaction; any other caller is checked here.
+	if committed && advanced && (rolloutAccountBase != "" || requireActiveAccount || fingerprint == currentCodexAccountFingerprint()) {
+		noteCLIUsageObservationAdvanced(codexUsageProvider, generation)
+	}
 	return committed, committed && advanced
+}
+
+// codexUsageProvider is the provider id Codex usage is published under.
+const codexUsageProvider = "codex"
+
+// codexProcessGenerationEpoch is this agent process's generation epoch: drawn
+// once at start, uniform in [1, 2^53-1] so it stays a JavaScript-safe integer on
+// the wire and in Firestore. It is NOT derived from the clock, so two restarts
+// in the same millisecond (or under a frozen test clock) still get distinct
+// epochs; a collision is ~2^-53 per restart. The backend replaces an applied
+// generation from a different epoch instead of comparing counters across
+// epochs, so a restored, rolled-back or copied cache — or a restart — can never
+// be suppressed by an old, higher applied counter.
+var codexProcessGenerationEpoch atomic.Int64
+
+// codexDrawGenerationEpoch is the draw; a var so a test can force a value or a
+// collision.
+var codexDrawGenerationEpoch = func() int64 {
+	const maxSafe = int64(1)<<53 - 1
+	if n, err := rand.Int(rand.Reader, big.NewInt(maxSafe)); err == nil {
+		return n.Int64() + 1
+	}
+	// crypto/rand does not fail on supported platforms; never publish epoch 0.
+	return time.Now().UnixNano()&maxSafe | 1
+}
+
+// codexGenerationRotated reports whether a write carrying this process's epoch
+// has committed. Until it has, the cache may still hold a snapshot published by
+// an earlier process (or restored from a backup) under ITS epoch, so ParseContext
+// omits UsageGeneration and the propagator sends no hint.
+var codexGenerationRotated atomic.Bool
+
+func init() { codexProcessGenerationEpoch.Store(codexDrawGenerationEpoch()) }
+
+// codexBumpGeneration advances the snapshot's generation for a write that
+// changed what the card renders — at most once per transaction. A snapshot from
+// any other epoch restarts at counter 1 under this process's epoch.
+func codexBumpGeneration(snap *codexRateLimitSnapshot) {
+	if snap.generationBumped {
+		return
+	}
+	snap.generationBumped = true
+	if epoch := codexProcessGenerationEpoch.Load(); snap.GenerationEpoch != epoch {
+		snap.GenerationEpoch, snap.Generation = epoch, 1
+		return
+	}
+	snap.Generation++
+}
+
+// codexNoteCommittedGeneration runs after every committed cache write: the
+// first one carrying this process's epoch completes the rotation.
+func codexNoteCommittedGeneration(snap *codexRateLimitSnapshot) {
+	if snap.GenerationEpoch == 0 || snap.GenerationEpoch != codexProcessGenerationEpoch.Load() {
+		return
+	}
+	if codexGenerationRotated.CompareAndSwap(false, true) {
+		noteCLIUsageGenerationRotated()
+	}
+}
+
+// codexRotateGenerationEpoch moves a loaded snapshot onto this process's epoch
+// in one bounded write, so a reading captured by the previous process (a smoke
+// just before an update handoff) is republished under an epoch the backend has
+// never applied. A cache with no contributors has nothing to publish and is left
+// for its first real write to rotate (pending). refused reports a write the
+// bounded locks or the filesystem turned down, which the caller retries.
+func codexRotateGenerationEpoch(now time.Time) (rotated, refused bool) {
+	if codexGenerationRotated.Load() {
+		return true, false
+	}
+	empty := false
+	var onDisk codexRateLimitSnapshot
+	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), now, true, func(snap *codexRateLimitSnapshot) bool {
+		onDisk = *snap
+		if len(codexContributorsFromSnapshot(*snap)) == 0 {
+			empty = true
+			return false
+		}
+		if snap.GenerationEpoch == codexProcessGenerationEpoch.Load() {
+			// Already this epoch (a forced collision, or a write that raced this
+			// one): nothing to write.
+			return false
+		}
+		codexBumpGeneration(snap)
+		return true
+	})
+	if !committed && !empty {
+		// A read that found this epoch on disk completes the rotation too.
+		codexNoteCommittedGeneration(&onDisk)
+	}
+	if codexGenerationRotated.Load() {
+		return true, false
+	}
+	return false, !empty
+}
+
+// codexContributorStateJSON is the rendered-state fingerprint a merge compares
+// before and after itself to decide whether the generation moves. Map keys
+// marshal sorted, so equal state always compares equal.
+func codexContributorStateJSON(snap *codexRateLimitSnapshot) string {
+	out, _ := json.Marshal(struct {
+		C map[string]map[string]codexRateLimitBucket `json:"c"`
+		N map[string]string                          `json:"n"`
+	}{snap.Contributors, snap.LimitNames})
+	return string(out)
 }
 
 // codexRateLimitCacheTransaction runs mutate as one read-modify-write of the
@@ -1745,6 +1953,7 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 	if !codexCommitRateLimitSnapshot(path, out, now) {
 		return false
 	}
+	codexNoteCommittedGeneration(&snap)
 	return true
 }
 
@@ -1792,6 +2001,9 @@ func codexScopeSnapshotToAccount(snap *codexRateLimitSnapshot, fingerprint strin
 	// is written by the binary it already names.
 	snap.CodexVersion = ""
 	snap.AccountFingerprint = fingerprint
+	// Always a new generation: account B's state is never "the same" as A's,
+	// even when both are empty or land within one second.
+	codexBumpGeneration(snap)
 }
 
 // codexMergeContributorsIntoSnapshot is the body of the contributor merge,
@@ -1810,6 +2022,12 @@ func codexMergeContributorsIntoSnapshot(
 	rolloutAccountBase string,
 	limitNames map[string]string,
 ) {
+	stateBefore := codexContributorStateJSON(snap)
+	defer func() {
+		if codexContributorStateJSON(snap) != stateBefore {
+			codexBumpGeneration(snap)
+		}
+	}()
 	// Migrate legacy cache files written before Contributors existed: each
 	// pre-existing aggregated bucket becomes a single __legacy__ contributor
 	// so subsequent sparse updates can merge against it instead of starting
@@ -2170,6 +2388,12 @@ type codexCacheView struct {
 	refreshFallback     string
 	refreshLiveReads    int
 	nextAttemptAtMs     int64
+	// Early live-read reservation (codexEscalateFencedRollout).
+	earlyReadFloorMs  int64
+	earlyReadOwedAtMs int64
+	// Capture generation (codexBumpGeneration) of the snapshot this view read.
+	generationEpoch int64
+	generation      int64
 	// Expiry marker (codexRetireExpiredRunDebt).
 	staleNoticeFloorMs int64
 	staleNoticeAtMs    int64
@@ -2208,6 +2432,10 @@ func codexCacheViewFromSnapshot(snap codexRateLimitSnapshot) codexCacheView {
 		refreshFallback:      snap.RefreshFallbackState,
 		refreshLiveReads:     snap.RefreshLiveReads,
 		nextAttemptAtMs:      snap.NextAttemptAtMs,
+		earlyReadFloorMs:     snap.EarlyReadFloorMs,
+		earlyReadOwedAtMs:    snap.EarlyReadOwedAtMs,
+		generationEpoch:      snap.GenerationEpoch,
+		generation:           snap.Generation,
 		staleNoticeFloorMs:   snap.StaleRunNoticeFloorMs,
 		staleNoticeAtMs:      snap.StaleRunNoticeAtMs,
 		pendingRolloutMs:     snap.PendingRolloutMtimeMs,
@@ -2271,7 +2499,29 @@ func codexPoolModelID(name string) string {
 // caller-supplied one — otherwise a previous account's windows could surface
 // under the current account after a credentials swap.
 func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
+	return codexMetricsFromView(codexCacheViewForAccount(currentFingerprint), now)
+}
+
+// codexMetricsAndGenerationFromCache is codexMetricsFromCache plus the capture
+// generation of the SAME read, so a receipt's metrics and its usageGeneration
+// always describe one snapshot. The generation is nil until this process's
+// epoch rotation has committed (codexGenerationRotated) or when the snapshot is
+// not on this process's epoch: a restored or pre-restart snapshot is never
+// published under its old epoch.
+func codexMetricsAndGenerationFromCache(now time.Time, currentFingerprint string) ([]cliAgentUsageMetric, *cliUsageGeneration) {
 	view := codexCacheViewForAccount(currentFingerprint)
+	return codexMetricsFromView(view, now), codexPublishableGeneration(view)
+}
+
+func codexPublishableGeneration(view codexCacheView) *cliUsageGeneration {
+	if !codexGenerationRotated.Load() || view.generation <= 0 ||
+		view.generationEpoch != codexProcessGenerationEpoch.Load() {
+		return nil
+	}
+	return &cliUsageGeneration{Epoch: view.generationEpoch, Counter: view.generation}
+}
+
+func codexMetricsFromView(view codexCacheView, now time.Time) []cliAgentUsageMetric {
 	mainContributors, pools := codexSplitContributorsByPool(view)
 	parts := codexPartitionByIdentity(mainContributors)
 

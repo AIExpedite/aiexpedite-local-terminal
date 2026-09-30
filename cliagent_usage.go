@@ -113,6 +113,19 @@ type cliAgentUsage struct {
 	Notice         string `json:"notice,omitempty"`
 	NoticeSeverity string `json:"noticeSeverity,omitempty"`
 	NoticeURL      string `json:"noticeUrl,omitempty"`
+	// UsageGeneration identifies the device-side capture state these metrics
+	// were read from (codexMetricsAndGenerationFromCache). Signed in the refresh
+	// receipt, so the backend can record which generation it applied and skip a
+	// usage hint for one it already has (cliagent_usage_propagate.go). Only
+	// Codex sets it; integers only.
+	UsageGeneration *cliUsageGeneration `json:"usageGeneration,omitempty"`
+}
+
+// cliUsageGeneration is one capture generation: a per-agent-process random
+// epoch and a counter that only moves forward within it.
+type cliUsageGeneration struct {
+	Epoch   int64 `json:"epoch"`
+	Counter int64 `json:"counter"`
 }
 
 // These are the signed-refresh contract's collection caps. The demand-driven

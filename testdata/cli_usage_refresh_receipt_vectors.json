@@ -40,6 +40,14 @@
       "refreshId": "r5",
       "secret": "secret",
       "signature": "ee0113a79a1c00fd2185ec261d6db1bbe3cd193ce74c21ebe34e0374ebd0db78"
+    },
+    {
+      "name": "codex-usage-generation",
+      "secret": "secret",
+      "refreshId": "r6",
+      "challengeTs": 6,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r6\",\"challengeTs\":6,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"metrics\":[{\"kind\":\"weekly\",\"label\":\"Weekly quota\",\"unit\":\"%\",\"total\":\"100\",\"remaining\":\"73\",\"consumed\":\"27\",\"resetAt\":\"2026-10-06T19:39:00Z\",\"observedAt\":\"2026-09-30T11:56:11Z\"}],\"collectedAt\":\"now\",\"usageGeneration\":{\"epoch\":4503599627370497,\"counter\":7}}],\"errors\":[]}",
+      "signature": "7438f700fac112c2ce439bd3b02e3dfeb9d318436c503df0047870ddff9a2e3f"
     }
   ]
 }

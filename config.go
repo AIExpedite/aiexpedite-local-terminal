@@ -393,6 +393,16 @@ func (cfg *Config) MutateAndSaveRollback(path string, mutate, rollback func()) e
 	return nil
 }
 
+// usageHintCredentials reads the live agent id and command secret under the
+// writer lock, so the usage propagator (cliagent_usage_propagate.go) picks up a
+// rotated secret or a fresh registration on its next send and never reads a
+// half-written pair.
+func (cfg *Config) usageHintCredentials() (agentID, secret string) {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
+	return cfg.AgentID, cfg.CommandSecret
+}
+
 // WithPersistenceLock provides a consistent snapshot for updater bookkeeping
 // reads that must not interleave with another config mutation.
 func (cfg *Config) WithPersistenceLock(read func()) {

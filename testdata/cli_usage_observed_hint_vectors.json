@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "codex-observed-hint",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "provider": "codex",
+      "generationEpoch": 4503599627370497,
+      "generation": 7,
+      "message": "agent-1:1790000000000:codex:4503599627370497:7",
+      "signature": "68c2b39c907d4cea12043bbd2dbe10d4213b3f25760bd3c722ae1031fb53d95e"
+    }
+  ]
+}
