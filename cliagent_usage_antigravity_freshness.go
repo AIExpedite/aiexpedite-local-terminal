@@ -1329,13 +1329,20 @@ func antigravityAttemptWasUnplottable(id antigravityDebtID) bool {
 var antigravityShutdownDrain = 5 * time.Second
 
 // drainAntigravityUsageWrites stops the discovery tick and waits, at most
-// antigravityShutdownDrain, for this feature's background writes. A write
-// still stuck after that is abandoned: the floor its arm persisted at spawn
-// is what the next process adopts.
+// antigravityShutdownDrain in total, for a tick in flight and then for this
+// feature's background writes. A tick or write still stuck after that is
+// abandoned: the floor its arm persisted at spawn is what the next process
+// adopts.
 func drainAntigravityUsageWrites() {
-	stopAntigravityDiscovery()
-	if !antigravityUsageRefreshWaitIdleFor(antigravityShutdownDrain) {
-		fmt.Printf("%s[antigravity-freshness] shutdown drain timed out: inFlight=%d%s\n",
-			colorYellow, antigravityFreshnessInFlight.Load(), colorReset)
+	deadline := time.Now().Add(antigravityShutdownDrain)
+	tickStopped := stopAntigravityDiscoveryWithin(antigravityShutdownDrain)
+	idle := antigravityUsageRefreshWaitIdleFor(time.Until(deadline))
+	if !tickStopped || !idle {
+		tickRunning := 0
+		if !tickStopped {
+			tickRunning = 1
+		}
+		fmt.Printf("%s[antigravity-freshness] shutdown drain timed out: inFlight=%d tickRunning=%d%s\n",
+			colorYellow, antigravityFreshnessInFlight.Load(), tickRunning, colorReset)
 	}
 }

@@ -1325,16 +1325,43 @@ func startAntigravityDiscovery() {
 
 // stopAntigravityDiscovery stops the tick and waits for a pass in flight.
 func stopAntigravityDiscovery() {
+	if done := signalAntigravityDiscoveryStop(); done != nil {
+		<-done
+	}
+}
+
+// stopAntigravityDiscoveryWithin stops the tick and waits at most d for a pass
+// in flight — a Windows sentinel scan can sit in its 20 s command timeout. It
+// reports false when the pass is still running; that pass returns on its own
+// and shutdown does not wait for it.
+func stopAntigravityDiscoveryWithin(d time.Duration) bool {
+	done := signalAntigravityDiscoveryStop()
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(max(d, 0))
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// signalAntigravityDiscoveryStop closes the tick's stop channel and returns its
+// done channel (nil when the tick is not running).
+func signalAntigravityDiscoveryStop() chan struct{} {
 	d := &antigravityDiscovery
 	d.mu.Lock()
 	stop, done := d.stop, d.done
 	d.stop, d.done = nil, nil
 	d.mu.Unlock()
 	if stop == nil {
-		return
+		return nil
 	}
 	close(stop)
-	<-done
+	return done
 }
 
 // antigravityDiscoveryRunning reports whether the tick is running.
@@ -1471,10 +1498,14 @@ func antigravityStartupScan(now time.Time) (antigravityDiscoveryResult, bool) {
 	return res, true
 }
 
+// antigravityIndexTracksPIDLocked reports whether something already watches
+// pid for its exit: a live candidate's PID, or a process-only entry. A settled,
+// owned or noPID entry can still list the PID from an earlier classification,
+// but nothing evaluates it, so it does not count.
 func antigravityIndexTracksPIDLocked(pid int) bool {
 	idx := &antigravityLogIndex
 	for _, entry := range idx.entries {
-		if antigravityTrackedFind(entry.pids, pid) != nil {
+		if entry.class == antigravityLogCandidate && antigravityTrackedFind(entry.pids, pid) != nil {
 			return true
 		}
 	}

@@ -327,3 +327,31 @@ func TestDrainAntigravityUsageWrites_StopsDiscoveryAndDrainsBounded(t *testing.T
 		t.Errorf("waited %s on a stuck write, want about the %s bound", waited, antigravityShutdownDrain)
 	}
 }
+
+// A discovery tick stuck in a slow process scan must not stretch the drain: the
+// stop waits inside the same antigravityShutdownDrain budget as the writes.
+func TestDrainAntigravityUsageWrites_BoundsAStuckDiscoveryTick(t *testing.T) {
+	origDrain := antigravityShutdownDrain
+	defer func() { antigravityShutdownDrain = origDrain }()
+	antigravityShutdownDrain = 300 * time.Millisecond
+
+	stop, done := make(chan struct{}), make(chan struct{})
+	antigravityDiscovery.mu.Lock()
+	antigravityDiscovery.stop, antigravityDiscovery.done = stop, done
+	antigravityDiscovery.mu.Unlock()
+	defer close(done)
+
+	start := time.Now()
+	drainAntigravityUsageWrites()
+	if waited := time.Since(start); waited > antigravityShutdownDrain+2*time.Second {
+		t.Errorf("waited %s on a stuck discovery tick, want about the %s bound", waited, antigravityShutdownDrain)
+	}
+	if antigravityDiscoveryRunning() {
+		t.Error("the discovery tick is still registered after the drain")
+	}
+	select {
+	case <-stop:
+	default:
+		t.Error("the stuck tick was never told to stop")
+	}
+}

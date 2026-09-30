@@ -1073,3 +1073,40 @@ func TestAntigravityCapture_ExitedAgyStaysManagedAtFinish(t *testing.T) {
 		t.Errorf("owed=%s for a managed run that exited with its wrapper", res.owed)
 	}
 }
+
+// Discovery can see a managed agy's log as a candidate before SetPID records
+// the PID; the next change then settles the log with that PID still listed.
+// A settled entry is never evaluated, so it must not count as tracking when
+// the agy outlives its wrapper: the hand-off still goes to process-only and the
+// run is owed after its own exit.
+func TestAntigravityCapture_DetachedAgyHandedOffPastSettledEntry(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	start := time.Now().Add(-time.Hour)
+
+	h.setLive(9103, true)
+	name := helperLogName(start)
+	h.write(t, name, helperPIDBlock(9103), start, false)
+	h.pass(start.Add(time.Second), 0)
+	if _, candidates, _, _, _, _ := helperIndexCounts(); candidates != 1 {
+		t.Fatalf("candidates=%d, want the log first seen as a candidate", candidates)
+	}
+	capture := &antigravityRunCapture{floor: start, gated: true}
+	capture.SetPID(9103)
+	h.write(t, name, "I0929 20:43:57.000000 1 main.go:1] still running\n", start.Add(2*time.Second), true)
+	h.pass(start.Add(3*time.Second), 0)
+	if _, candidates, _, _, _, _ := helperIndexCounts(); candidates != 0 {
+		t.Fatalf("candidates=%d, want the managed log settled", candidates)
+	}
+
+	capture.Finish()
+	antigravityUsageRefreshWaitIdle()
+	if _, _, _, _, processOnly, _ := helperIndexCounts(); processOnly != 1 {
+		t.Fatalf("processOnly=%d, want the detached agy tracked by discovery despite the settled entry", processOnly)
+	}
+	h.setLive(9103, false)
+	exitSeen := start.Add(20 * time.Minute)
+	h.pass(exitSeen, 0)
+	if res := h.pass(exitSeen.Add(2*time.Minute), 0); res.owed.IsZero() {
+		t.Error("the detached agy was never owed after it exited")
+	}
+}
