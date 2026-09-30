@@ -901,6 +901,49 @@ func TestAntigravityRunLogs_ReservesSlotsForRecentLegacyLogs(t *testing.T) {
 	}
 }
 
+// Many retained legacy logs are stat'ed once per TTL, not on every listing:
+// repeated capture probes reuse the memoised mtimes until the TTL lapses or
+// the legacy name set changes.
+func TestAntigravityRunLogs_MemoisesLegacyStats(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Truncate(time.Second)
+	for i := 0; i < antigravityLegacyReadReserve+4; i++ {
+		at := now.Add(-time.Duration(100+i) * time.Hour)
+		h.write(t, fmt.Sprintf("legacy-%02d.log", i), "", at, false)
+	}
+	dir := antigravityLogDir(h.base)
+	first := antigravityRunLogs(h.base)
+
+	// Touch the oldest legacy log: within the TTL the memo still ranks it old.
+	oldest := filepath.Join(dir, fmt.Sprintf("legacy-%02d.log", antigravityLegacyReadReserve+3))
+	if err := os.Chtimes(oldest, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if again := antigravityRunLogs(h.base); len(again) != len(first) || again[0].path == oldest {
+			t.Fatalf("listing %d re-ranked legacy logs inside the TTL", i)
+		}
+	}
+
+	// A new legacy name invalidates the memo at once.
+	added := h.write(t, "legacy-new.log", "", now.Add(-time.Minute), false)
+	files := antigravityRunLogs(h.base)
+	if len(files) < 2 || files[0].path != oldest || files[1].path != added {
+		t.Fatalf("after a new legacy name: files=%v, want the touched then the new log first", files)
+	}
+
+	// And so does the TTL lapsing.
+	orig := antigravityLegacyStatTTL
+	antigravityLegacyStatTTL = 0
+	t.Cleanup(func() { antigravityLegacyStatTTL = orig })
+	if err := os.Chtimes(added, now.Add(time.Second), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if files := antigravityRunLogs(h.base); len(files) == 0 || files[0].path != added {
+		t.Fatalf("after the TTL: files=%v, want the re-touched log first", files)
+	}
+}
+
 // The evidence a block yields: the account and each reset, a reset anchored
 // to its line's own glog time when present.
 func TestAntigravityBlockEvidence(t *testing.T) {

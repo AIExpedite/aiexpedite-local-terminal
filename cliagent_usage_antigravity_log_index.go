@@ -45,6 +45,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -448,25 +449,72 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 // antigravityLegacyLogsSince keeps the unstamped names written at or after
 // since, oldest mtime first: a run's legacy log was last written no earlier
 // than the run started.
+//
+// Legacy names carry no stamp, so ranking them needs every one's mtime. A
+// handful is stat'ed on each call; past antigravityLegacyReadReserve the
+// mtimes are memoised per directory for antigravityLegacyStatTTL (and while
+// the legacy name set is unchanged), so a device retaining many legacy logs
+// pays at most one full legacy stat pass per TTL however often capture
+// probes and PID-block reads list its logs.
 func antigravityLegacyLogsSince(dir string, names []string, since time.Time) []string {
-	type legacyLog struct {
-		name  string
-		mtime time.Time
-	}
-	var kept []legacyLog
-	for _, name := range names {
-		stat, ok := antigravityStatLog(filepath.Join(dir, name))
-		if !ok || stat.mtime.Before(since) {
-			continue
+	var out []string
+	for _, l := range antigravityLegacyLogMtimes(dir, names) {
+		if !l.mtime.Before(since) {
+			out = append(out, l.name)
 		}
-		kept = append(kept, legacyLog{name: name, mtime: stat.mtime})
-	}
-	sort.SliceStable(kept, func(i, j int) bool { return kept[i].mtime.Before(kept[j].mtime) })
-	out := make([]string, len(kept))
-	for i, l := range kept {
-		out[i] = l.name
 	}
 	return out
+}
+
+// antigravityLegacyLog is one unstamped log and its last-seen mtime.
+type antigravityLegacyLog struct {
+	name  string
+	mtime time.Time
+}
+
+// antigravityLegacyStatTTL bounds how long a directory's memoised legacy
+// mtimes are reused. A var so tests can pin it.
+var antigravityLegacyStatTTL = antigravityCandidateSettle
+
+var antigravityLegacyStatMemo = struct {
+	sync.Mutex
+	byDir map[string]antigravityLegacyStatEntry
+}{byDir: map[string]antigravityLegacyStatEntry{}}
+
+type antigravityLegacyStatEntry struct {
+	at    time.Time
+	names []string
+	logs  []antigravityLegacyLog
+}
+
+// antigravityLegacyLogMtimes stats names (all unstamped) and returns the
+// readable ones oldest mtime first, memoised as antigravityLegacyLogsSince
+// describes.
+func antigravityLegacyLogMtimes(dir string, names []string) []antigravityLegacyLog {
+	memoise := len(names) > antigravityLegacyReadReserve
+	if memoise {
+		antigravityLegacyStatMemo.Lock()
+		entry, ok := antigravityLegacyStatMemo.byDir[dir]
+		antigravityLegacyStatMemo.Unlock()
+		if ok && time.Since(entry.at) < antigravityLegacyStatTTL && slices.Equal(entry.names, names) {
+			return entry.logs
+		}
+	}
+	logs := make([]antigravityLegacyLog, 0, len(names))
+	for _, name := range names {
+		if stat, ok := antigravityStatLog(filepath.Join(dir, name)); ok {
+			logs = append(logs, antigravityLegacyLog{name: name, mtime: stat.mtime})
+		}
+	}
+	sort.SliceStable(logs, func(i, j int) bool { return logs[i].mtime.Before(logs[j].mtime) })
+	if memoise {
+		antigravityLegacyStatMemo.Lock()
+		antigravityLegacyStatMemo.byDir[dir] = antigravityLegacyStatEntry{
+			at: time.Now(), names: slices.Clone(names), logs: logs,
+		}
+		antigravityLegacyStatMemo.Unlock()
+	}
+	return logs
 }
 
 /* ─────────────────────────── own children ─────────────────────────── */
