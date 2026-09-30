@@ -286,8 +286,16 @@ func antigravityListLogNames(base string) ([]string, bool) {
 			names = append(names, entry.Name())
 		}
 	}
-	// Second-stamped names sort chronologically; newest first.
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	// Second-stamped names sort chronologically; newest first. They lead every
+	// unstamped (legacy) name, which would otherwise sort after `cli-…` and
+	// crowd the current run out of any newest-N cap.
+	sort.Slice(names, func(i, j int) bool {
+		iStamped := antigravityLogNamePattern.MatchString(names[i])
+		if iStamped != antigravityLogNamePattern.MatchString(names[j]) {
+			return iStamped
+		}
+		return names[i] > names[j]
+	})
 	return names, true
 }
 

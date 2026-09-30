@@ -796,6 +796,35 @@ func TestAntigravityPIDBlock_OnlyTheRequestedRun(t *testing.T) {
 	}
 }
 
+// Unstamped legacy names sort after `cli-…` lexically. At least
+// antigravityWatchedNewest of them must not push the current stamped run out
+// of the newest-N cap, for the run-log listing (port discovery) or for a
+// managed run's PID block.
+func TestAntigravityLogNames_StampedLeadLegacy(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Truncate(time.Second)
+	old := now.Add(-48 * time.Hour)
+	for i := 0; i < antigravityWatchedNewest+8; i++ {
+		h.write(t, fmt.Sprintf("legacy-%03d.log", i), "", old, false)
+	}
+	current := h.write(t, helperLogName(now), helperPIDBlock(50011), now, false)
+
+	names, ok := antigravityListLogNames(h.base)
+	if !ok || len(names) == 0 || names[0] != filepath.Base(current) {
+		t.Fatalf("names[0]=%v, want the stamped run %q first", names, filepath.Base(current))
+	}
+	found := false
+	for _, file := range antigravityRunLogs(h.base) {
+		found = found || file.path == current
+	}
+	if !found {
+		t.Error("antigravityRunLogs dropped the stamped run behind legacy names")
+	}
+	if _, ok := antigravityPIDBlock(h.base, 50011, now); !ok {
+		t.Error("antigravityPIDBlock did not reach the stamped run behind legacy names")
+	}
+}
+
 // The evidence a block yields: the account and each reset, a reset anchored
 // to its line's own glog time when present.
 func TestAntigravityBlockEvidence(t *testing.T) {
