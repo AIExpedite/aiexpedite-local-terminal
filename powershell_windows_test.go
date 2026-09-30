@@ -165,6 +165,9 @@ func TestRunLocalCommandWindows_LaunchesCmdShimNotPs1(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// runLocalCommandWindows starts the global persistent host; don't leave it
+	// (and its synced test PATH) running for later tests.
+	t.Cleanup(ShutdownPowerShell)
 
 	if got := preferBatchShim("aixshim", []string{"--version"}); got != "aixshim.cmd" {
 		t.Fatalf("preferBatchShim = %q, want aixshim.cmd", got)
