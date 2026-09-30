@@ -108,6 +108,9 @@ func TestRunLocalCommandWindows_CLIAgentNeverRewritten(t *testing.T) {
 		"codex":  `C:\Users\u\AppData\Roaming\npm\codex.cmd`,
 	})
 	lines := withSpiedFallback(t)
+	// The claude branch memoizes its resolved path; don't leak it to other tests.
+	resetCachedClaudePath()
+	t.Cleanup(resetCachedClaudePath)
 
 	if _, err := runLocalCommandWindows("claude", []string{"--version"}, "", 5*time.Second); err != nil {
 		t.Fatalf("claude: unexpected error %v", err)
@@ -166,10 +169,21 @@ func TestPsExitCaptureScript_Contract(t *testing.T) {
 	}
 }
 
-func TestPsHostPolicyArgs_ProcessScopedBypass(t *testing.T) {
-	joined := strings.Join(psHostPolicyArgs, " ")
-	if joined != "-ExecutionPolicy Bypass" {
-		t.Fatalf("psHostPolicyArgs = %q, want -ExecutionPolicy Bypass", joined)
+func TestPsHostArgs_ProcessScopedBypassThenTransport(t *testing.T) {
+	got := strings.Join(psHostArgs("-Command", "npm --version"), " ")
+	want := "-NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -Command npm --version"
+	if got != want {
+		t.Fatalf("psHostArgs = %q, want %q", got, want)
+	}
+	// Each call returns a fresh slice: appending to one must never leak into
+	// psHostPolicyArgs or a later call.
+	a := psHostArgs("-File", "a.ps1")
+	_ = append(a[:len(a)-1], "b.ps1")
+	if strings.Join(psHostPolicyArgs, " ") != "-ExecutionPolicy Bypass" {
+		t.Fatalf("psHostPolicyArgs mutated: %q", psHostPolicyArgs)
+	}
+	if b := psHostArgs("-File", "c.ps1"); b[len(b)-1] != "c.ps1" {
+		t.Fatalf("psHostArgs shared backing array: %q", b)
 	}
 }
 

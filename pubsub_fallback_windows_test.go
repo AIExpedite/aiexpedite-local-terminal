@@ -1,9 +1,10 @@
 //go:build windows
 
 // File: pubsub_fallback_windows_test.go
-// Windows integration test: a failing native command routed through the one-shot
-// fallback PowerShell must surface a non-zero exit (an *exec.ExitError), not be
-// masked as success by the trailing cwd probe. This is the path detected test
+// Windows integration tests: a failing native command — or a program that never
+// started — routed through the one-shot fallback PowerShell must surface a
+// non-zero exit (an *exec.ExitError), not be masked as success by the trailing
+// cwd probe; the host runs with a process-scoped execution-policy bypass. This is the path detected test
 // runners (npm test / pytest) take on Windows — see runLocalCommand's
 // test-runner routing and buildFallbackProbeCommand.
 package main

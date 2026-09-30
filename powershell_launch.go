@@ -5,7 +5,7 @@
 //
 // Three pieces, all process-scoped — nothing here touches the CurrentUser or
 // LocalMachine execution policy:
-//   - psHostPolicyArgs: every PowerShell host the agent spawns runs with
+//   - psHostArgs: every PowerShell host the agent spawns runs with
 //     `-ExecutionPolicy Bypass`, which applies to that process only.
 //   - preferBatchShim: a bare command whose PATH hit is a .cmd/.bat shim
 //     (`npm` -> npm.cmd) is launched by that name, so PowerShell never loads the
@@ -35,6 +35,21 @@ import (
 // the default `Restricted` policy. `-EncodedCommand` exempts only the encoded
 // script itself, not the .ps1 files that script calls.
 var psHostPolicyArgs = []string{"-ExecutionPolicy", "Bypass"}
+
+// psHostArgs is the argv for a powershell.exe / pwsh.exe host the agent starts
+// to run commands: the shared flags, then the transport (`-Command <line>`,
+// `-EncodedCommand <b64>`, `-File <path>`, `-Command -`), which must come last.
+// `-OutputFormat Text` stops PowerShell from serializing stderr as CLIXML (XML
+// error records) when stderr is piped to a non-console parent; without it any
+// PowerShell error surfaces as `#< CLIXML <Objs ...>` noise that leaks past
+// filterCLIXML back to the user.
+func psHostArgs(transport ...string) []string {
+	args := make([]string, 0, 6+len(transport))
+	args = append(args, "-NoProfile", "-NonInteractive")
+	args = append(args, psHostPolicyArgs...)
+	args = append(args, "-OutputFormat", "Text")
+	return append(args, transport...)
+}
 
 // lookPathFn resolves a bare command name the way Go's exec does (PATHEXT on
 // Windows, which does not include .PS1). Test seam.

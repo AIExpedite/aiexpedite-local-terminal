@@ -109,16 +109,10 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		fmt.Println("[powershell] Using PowerShell 7+ (pwsh.exe)")
 	}
 
-	// `-OutputFormat Text` prevents CLIXML error serialization on stderr for
-	// this persistent shell — see runEncodedPowerShellCommand in pubsub.go.
-	// psHostPolicyArgs lets the .ps1 files commands call (npm.ps1) load under a
-	// restrictive execution policy — see powershell_launch.go.
-	psArgs := append([]string{"-NoProfile", "-NoLogo", "-NonInteractive"}, psHostPolicyArgs...)
-	psArgs = append(psArgs,
-		"-OutputFormat", "Text",
-		"-Command", "-", // Read commands from stdin
-	)
-	cmd := exec.Command(psExe, psArgs...)
+	// psHostArgs: no CLIXML on stderr, and a process-scoped execution-policy
+	// bypass so the .ps1 files commands call (npm.ps1) load — see
+	// powershell_launch.go. `-Command -` reads commands from stdin.
+	cmd := exec.Command(psExe, psHostArgs("-NoLogo", "-Command", "-")...)
 	hideWindow(cmd)
 	// Headless hardening: the persistent shell is the default fast path for
 	// non-agent Windows commands, so inject the authoritative non-interactive

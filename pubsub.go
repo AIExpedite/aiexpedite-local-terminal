@@ -2346,18 +2346,10 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 // messages to avoid false "exit status 1" errors when commands produce valid
 // output.
 func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout time.Duration) (string, error) {
-	// `-OutputFormat Text` prevents PowerShell from serializing stderr as CLIXML
-	// (XML error records) when stderr is piped to a non-console parent process.
-	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
-	// that leaks past filterCLIXML and back to the user.
-	// psHostPolicyArgs: -EncodedCommand exempts only this script from execution
-	// policy, not the .ps1 files it calls (npm.ps1) — see powershell_launch.go.
-	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
-	psArgs = append(psArgs,
-		"-OutputFormat", "Text",
-		"-EncodedCommand",
-		encodedScript,
-	)
+	// psHostArgs carries `-OutputFormat Text` (no CLIXML stderr) and the
+	// process-scoped bypass: -EncodedCommand exempts only this script from
+	// execution policy, not the .ps1 files it calls (npm.ps1).
+	psArgs := psHostArgs("-EncodedCommand", encodedScript)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2427,15 +2419,10 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 		return "", fmt.Errorf("powershell temp-file fallback: close temp: %w", err)
 	}
 
-	// psHostPolicyArgs matters twice here: `-File` itself is subject to the
-	// execution policy (under the default `Restricted` the temp .ps1 would not
-	// run at all), and so is any .ps1 the script calls — see
-	// powershell_launch.go.
-	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
-	psArgs = append(psArgs,
-		"-OutputFormat", "Text",
-		"-File", tmpPath,
-	)
+	// psHostArgs' process-scoped bypass matters twice here: `-File` itself is
+	// subject to the execution policy (under the default `Restricted` the temp
+	// .ps1 would not run at all), and so is any .ps1 the script calls.
+	psArgs := psHostArgs("-File", tmpPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -2551,11 +2538,7 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	defer cancel()
 
 	psExe := getFallbackPSExe() // prefers pwsh.exe when available
-	// `-OutputFormat Text` prevents CLIXML error serialization — see
-	// runEncodedPowerShellCommand for the full explanation.
-	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
-	psArgs = append(psArgs, "-OutputFormat", "Text", "-Command", cmdLine)
-	c := exec.CommandContext(ctx, psExe, psArgs...)
+	c := exec.CommandContext(ctx, psExe, psHostArgs("-Command", cmdLine)...)
 	hideWindow(c)
 	// Headless hardening: authoritative non-interactive git/editor/credential env
 	// so git/ssh/credential prompts fail fast rather than blocking.
@@ -5568,11 +5551,7 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	const cwdSentinel = "<<<AIX_CWD_PROBE>>>"
 	probeCmd := buildFallbackProbeCommand(cmdLine, cwdSentinel)
 
-	// `-OutputFormat Text` prevents CLIXML error serialization — see
-	// runEncodedPowerShellCommand for the full explanation.
-	psArgs := append([]string{"-NoProfile", "-NonInteractive"}, psHostPolicyArgs...)
-	psArgs = append(psArgs, "-OutputFormat", "Text", "-Command", probeCmd)
-	c := exec.CommandContext(ctx, psExe, psArgs...)
+	c := exec.CommandContext(ctx, psExe, psHostArgs("-Command", probeCmd)...)
 	hideWindow(c)
 	// Headless hardening: authoritative non-interactive git/editor/credential env.
 	hardenNonAgentCommand(c, cmdLine)
