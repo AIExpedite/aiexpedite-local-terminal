@@ -33,8 +33,9 @@
 //   - Retry: a kept debt is never left with nothing scheduled to return to it.
 //     antigravityScheduleRunDebtRetry persists NextAttemptAtMs and arms one
 //     process-wide timer on a bounded ladder
-//     (cliagent_usage_antigravity_refresh_schedule.go), and a gather that sees
-//     a run log newer than the cached reading nudges the same worker.
+//     (cliagent_usage_antigravity_refresh_schedule.go), and a gather or a
+//     discovery tick that sees an owe-ready run newer than the cached reading
+//     nudges the same worker.
 //   - Discover: runs no spawn path armed (a direct `agy` in the user's own
 //     shell) are found by the log index's discovery tick
 //     (cliagent_usage_antigravity_log_index.go) and owed only once every

@@ -214,8 +214,8 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		antigravityMissedRun(snap.ObservedAt, owedLog, len(quotaBases))
 	}
 	if !gotFresh && !ownChildRunning {
-		// The same evidence, acted on: a due retry, or a run log newer than the
-		// replayed reading, arms the bounded refresh so the next gather replays
+		// The same evidence, acted on: a due retry, or an owe-ready run newer
+		// than the replayed reading, arms the bounded refresh so the next gather replays
 		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
 		nudgeAntigravityUsageRefresh(now, snap.ObservedAt, owedLog)
 	}

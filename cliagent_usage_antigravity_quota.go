@@ -439,7 +439,7 @@ func fetchAntigravityQuotaDetailed(ctx context.Context, base string, now time.Ti
 // Load-bearing, not a fudge factor: the Refresh-click live probe
 // (probeAntigravityQuotaLive) starts its own `agy`, and that process keeps
 // writing its log for seconds after the reading the probe already persisted. A
-// bare `newestLog > observedAt` comparison would therefore warn on every
+// bare `log > observedAt` comparison would therefore warn on every
 // successful refresh, which is the opposite of the signal this exists to give.
 const antigravityMissedRunSlack = 60 * time.Second
 
@@ -455,17 +455,17 @@ const antigravityMissedRunSlack = 60 * time.Second
 // snapshot). Without it both look identical from the outside: observed_stale.
 //
 // Timestamps and counts only — no paths, no log text, no account.
-func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) {
-	observed, behind := antigravityRunBehindObservation(observedAt, newestLog, antigravityMissedRunSlack)
+func antigravityMissedRun(observedAt string, owedLog time.Time, logBases int) {
+	observed, behind := antigravityRunBehindObservation(observedAt, owedLog, antigravityMissedRunSlack)
 	if !behind {
 		return
 	}
 	fmt.Printf("%s[antigravity-quota] a run completed after the last observation (observedAt=%s newestRunLog=%s behindBy=%s basesWalked=%d) — that run's quota was never captured%s\n",
-		colorYellow, observed.UTC().Format(time.RFC3339), newestLog.UTC().Format(time.RFC3339),
-		newestLog.Sub(observed).Round(time.Second), logBases, colorReset)
+		colorYellow, observed.UTC().Format(time.RFC3339), owedLog.UTC().Format(time.RFC3339),
+		owedLog.Sub(observed).Round(time.Second), logBases, colorReset)
 }
 
-// antigravityRunBehindObservation reports whether the newest run log postdates
+// antigravityRunBehindObservation reports whether an owe-ready run's floor postdates
 // the reading observed at observedAt by more than slack, and returns the parsed
 // observation. No log, or an observation that cannot be parsed, is not evidence
 // of anything.
@@ -473,20 +473,20 @@ func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) 
 // The single predicate behind both the missed-run diagnostic (which keeps
 // antigravityMissedRunSlack so a Refresh click's own `agy` does not warn about
 // itself) and the gather's refresh nudge (nudgeAntigravityUsageRefresh), which
-// passes 0: newestLog and observedAt are both fixed once a run ends, so a run
+// passes 0: owedLog and observedAt are both fixed once a run ends, so a run
 // that finished within the slack of the last observation would fail the
 // comparison on that gather and on every gather after it — exactly the short
 // runs a maintenance smoke produces. The nudge applies its own settle guard
 // instead.
-func antigravityRunBehindObservation(observedAt string, newestLog time.Time, slack time.Duration) (time.Time, bool) {
-	if newestLog.IsZero() || observedAt == "" {
+func antigravityRunBehindObservation(observedAt string, owedLog time.Time, slack time.Duration) (time.Time, bool) {
+	if owedLog.IsZero() || observedAt == "" {
 		return time.Time{}, false
 	}
 	observed, err := time.Parse(time.RFC3339, observedAt)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return observed, newestLog.After(observed.Add(slack))
+	return observed, owedLog.After(observed.Add(slack))
 }
 
 // fetchAntigravityQuotaOnPort runs the quota + identity RPC pair against ONE
