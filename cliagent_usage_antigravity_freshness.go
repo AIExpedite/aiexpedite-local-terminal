@@ -35,6 +35,10 @@
 //     process-wide timer on a bounded ladder
 //     (cliagent_usage_antigravity_refresh_schedule.go), and a gather that sees
 //     a run log newer than the cached reading nudges the same worker.
+//   - Discover: runs no spawn path armed (a direct `agy` in the user's own
+//     shell) are found by the log index's discovery tick
+//     (cliagent_usage_antigravity_log_index.go) and owed only once every
+//     process of the run has exited; the agent's own `agy` children never owe.
 //   - Survive: the debt and its schedule are a file, so StartAgent's
 //     payOwedAntigravityUsageRefresh re-arms a pending schedule, or pays one
 //     bounded attempt for a run the previous process never settled (crash,
@@ -132,12 +136,14 @@ var (
 )
 
 func antigravityRegisterLiveRun(floorMs int64) {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	antigravityLiveRuns[floorMs]++
 	antigravityLiveRunsMu.Unlock()
 }
 
 func antigravityReleaseLiveRun(floorMs int64) {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	if n := antigravityLiveRuns[floorMs]; n > 1 {
 		antigravityLiveRuns[floorMs] = n - 1
@@ -147,11 +153,14 @@ func antigravityReleaseLiveRun(floorMs int64) {
 	antigravityLiveRunsMu.Unlock()
 }
 
-// antigravityOldestLiveRunFloorMs is the floor of the earliest run still armed,
-// or 0 when none is. Called from inside updateAntigravityUsageFreshness's
-// mutate, so the lock order is cache -> freshness -> live runs; nothing may take
-// these in the other direction.
+// antigravityOldestLiveRunFloorMs is the floor of the earliest MANAGED run still
+// armed, or 0 when none is — the nudge's "a run of this process settles itself"
+// check. The floors a restart must keep also include live direct-run
+// candidates: antigravityOldestProtectedFloorMs. The lock order is cache ->
+// freshness -> live runs; nothing may take these in the other direction, and
+// the log-index lock is never held while taking any of them.
 func antigravityOldestLiveRunFloorMs() int64 {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	defer antigravityLiveRunsMu.Unlock()
 	oldest := int64(0)
@@ -236,6 +245,14 @@ type antigravityDebtID struct {
 	owedAtMs int64
 }
 
+// equal compares two states field by field. It is a plain == on purpose: a
+// future field that is not comparable (a slice, a map) then fails to COMPILE
+// here rather than silently turning every update into a write — or, worse,
+// into none.
+func (state antigravityUsageFreshness) equal(other antigravityUsageFreshness) bool {
+	return state == other
+}
+
 func (state antigravityUsageFreshness) debtID() antigravityDebtID {
 	return antigravityDebtID{floorMs: state.RefreshOwedFloorMs, owedAtMs: state.RefreshOwedAtMs}
 }
@@ -300,12 +317,13 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 // is cache → freshness (writeAntigravityQuotaSnapshotLocked settles while
 // holding the cache lock), so nothing under this lock may read the cache.
 func updateAntigravityUsageFreshness(mutate func(*antigravityUsageFreshness)) antigravityUsageFreshness {
+	antigravityAssertIndexUnlocked("freshness")
 	antigravityFreshnessMu.Lock()
 	defer antigravityFreshnessMu.Unlock()
 	state := readAntigravityUsageFreshnessLocked()
 	before := state
 	mutate(&state)
-	if state != before {
+	if !state.equal(before) {
 		writeAntigravityUsageFreshnessLocked(state)
 	}
 	return state
@@ -406,14 +424,20 @@ func armAntigravityUsageRunFloor(now time.Time) time.Time {
 // to the Code Assist route instead of a retry the build will refuse, and the
 // notice accessor leaves the wording to antigravityGateNotice.
 //
-// Called from the capture's finish() on its own goroutine: it must NOT wait for
+// pid is the run's own agy process when the capture handle knows it (0
+// otherwise). Its log block is read for exhaustion evidence, kept in memory
+// only (recordAntigravityRunEvidence) — the one input that lets an omitted
+// Code Assist bucket be charted as consumed.
+//
+// Called from the capture's Finish on its own goroutine: it must NOT wait for
 // the poller, which is ref-counted and outlives a short run whenever a longer
 // one is still armed.
-func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) {
+func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gated bool) {
 	if floor.IsZero() {
 		return
 	}
 	now := antigravityUsageFreshnessNow()
+	recordAntigravityRunEvidence(floor, pid, now)
 	// The run is over, so the reading that covers it is one taken at or after
 	// this instant — never one taken while the run was still accruing usage.
 	// The completion is also what the debt asks for, so the payment's own
@@ -446,7 +470,7 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 			if state.RunFloorMs != 0 && state.RunFloorMs <= completionMs &&
 				state.RefreshOwedAtMs == 0 {
-				state.RunFloorMs = antigravityOldestLiveRunFloorMs()
+				state.RunFloorMs = antigravityOldestProtectedFloorMs()
 			}
 		})
 		return
@@ -528,8 +552,9 @@ func settleAntigravityRunFreshness(observedMs int64) {
 			// going does not hold the usage that run is still spending, so
 			// dropping the marker outright would leave a crash or self-update
 			// before its settle with neither a floor nor a debt, and no
-			// recovery refresh. Roll back to the oldest live run instead.
-			state.RunFloorMs = antigravityOldestLiveRunFloorMs()
+			// recovery refresh. Roll back to the oldest protected floor instead
+			// (a managed run, or a live direct-run candidate).
+			state.RunFloorMs = antigravityOldestProtectedFloorMs()
 		}
 	})
 }
@@ -601,14 +626,24 @@ func antigravityReleaseRunDebtWorker() bool {
 	return true
 }
 
-// antigravityUsageRefreshWaitIdle blocks until no debt worker is in flight,
-// bounded. Test seam only — production never waits on a refresh, which is why
-// this polls the single-flight flag rather than adding a WaitGroup the settle
-// goroutine would have to touch on every run.
+// antigravityUsageRefreshWaitIdle blocks until no background write of this
+// feature is in flight, bounded. Tests wait on it; gracefulShutdown drains
+// with the shorter antigravityUsageRefreshWaitIdleFor. It polls the counter
+// rather than adding a WaitGroup the settle goroutine would have to touch on
+// every run.
 func antigravityUsageRefreshWaitIdle() {
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+	antigravityUsageRefreshWaitIdleFor(30 * time.Second)
+}
+
+// antigravityUsageRefreshWaitIdleFor waits at most d and reports whether
+// nothing was left in flight.
+func antigravityUsageRefreshWaitIdleFor(d time.Duration) bool {
+	for deadline := time.Now().Add(d); ; {
 		if antigravityFreshnessInFlight.Load() == 0 {
-			return
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -718,8 +753,12 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
 		// No version: the probe resolves it itself, and only once it knows a
 		// login exists, so a no_login debt never spawns `<agy> --version`.
+		takeAntigravityCodeAssistAttempt()
 		outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
 		cancel()
+		note := takeAntigravityCodeAssistAttempt()
+		noteAntigravityCurrentAttempt(state.debtID(), note.fingerprint,
+			outcome == liveProbeOutcomeCodeAssistBadResponse && note.unplottable)
 		antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
 		fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
 			colorCyan, state.Attempts+1, antigravityRefreshDebtMaxAttempts, outcome, colorReset)
@@ -844,7 +883,16 @@ func payOwedAntigravityUsageRefresh() {
 // the run's own settle, so the run would end with no refresh at all. The live
 // run's settle path owes it a refresh when it finishes; leave the floor to it.
 // (codexOweInterruptedRun guards the same race with codexUsageRefresh.armedLocally.)
+//
+// The log index's startup scan runs FIRST (antigravityStartupScan): it finds
+// direct runs that started or ended while no agent was running. Its candidate
+// floors are applied only AFTER the previous process's floor has been adopted,
+// so a floor armed now can never mask the one a crash or update left behind.
 func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
+	scan, scanned := antigravityStartupScan(startedAt)
+	if scanned {
+		defer antigravityApplyDiscovery(scan, antigravityUsageFreshnessNow())
+	}
 	now := antigravityUsageFreshnessNow()
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
@@ -933,6 +981,12 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	// failing read is something that heals itself.
 	cause := "Google returned no reading for the stored login; it will update on the next run that reports one."
 	switch state.Outcome {
+	case liveProbeOutcomeCodeAssistUnauthorized:
+		cause = "Google refused the stored login's quota read, so the reading could not be updated."
+	case liveProbeOutcomeCodeAssistBadResponse:
+		if antigravityAttemptWasUnplottable(state.debtID()) {
+			cause = "Google answered for the stored login with no chartable quota windows, so the reading could not be updated."
+		}
 	case liveProbeOutcomeCodeAssistNoLogin:
 		cause = "No Antigravity login is stored on this device, so no reading can be taken; sign in with the CLI to restore it."
 	case liveProbeOutcomeCodeAssistTokenExpired:
@@ -978,4 +1032,167 @@ func antigravityCatalogCommand() string {
 		}
 	}
 	return "agy"
+}
+
+/* ──────────────────────────── evidence ──────────────────────────── */
+
+// Managed-run exhaustion evidence. Google's quota reply OMITS remainingFraction
+// for a bucket with nothing left, so an account whose every bucket is spent
+// answers with nothing chartable. The one trustworthy statement that a
+// specific bucket is spent is a managed run's OWN log block: it names the
+// account it authenticated as and the RESOURCE_EXHAUSTED reset it hit. That is
+// kept here, in memory only — never persisted, never logged (the email is
+// reduced to its fingerprint at once) — and applied by
+// antigravitySnapshotFromGroups to an omitted bucket of the same account whose
+// reset matches. Direct (user-shell) runs never contribute: a login switched
+// between two of them could attribute one account's exhaustion to another.
+const (
+	antigravityExhaustionMaxEvents = 4
+	antigravityExhaustionTTL       = 10 * time.Minute
+	// antigravityExhaustionMinReset: a shorter reset is a throttle, not a
+	// spent quota window.
+	antigravityExhaustionMinReset = 2 * time.Minute
+	// antigravityExhaustionMatch is how close an event's reset must be to a
+	// bucket's own reset to name that bucket.
+	antigravityExhaustionMatch = 2 * time.Minute
+)
+
+type antigravityExhaustionEvent struct {
+	resetAtMs   int64
+	fingerprint string
+	atMs        int64
+}
+
+var antigravityExhaustion struct {
+	mu     sync.Mutex
+	events []antigravityExhaustionEvent
+}
+
+// antigravityExhaustionEvidenceFn is the quota routes' seam.
+var antigravityExhaustionEvidenceFn = antigravityExhaustionEvidence
+
+// antigravityExhaustionEvidence returns the unexpired events recorded for the
+// account with this fingerprint.
+func antigravityExhaustionEvidence(now time.Time, fingerprint string) []antigravityExhaustionEvent {
+	if fingerprint == "" {
+		return nil
+	}
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []antigravityExhaustionEvent
+	for _, event := range e.events {
+		if event.fingerprint == fingerprint && now.Sub(time.UnixMilli(event.atMs)) <= antigravityExhaustionTTL {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+// recordAntigravityRunEvidence reads a finished managed run's own PID block
+// and records its exhaustion events. Needs both the authenticated account and
+// a quota reset in THAT block; anything else records nothing.
+func recordAntigravityRunEvidence(floor time.Time, pid int, now time.Time) {
+	if pid <= 0 {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	for _, base := range antigravityQuotaBases(home) {
+		block, found := antigravityPIDBlock(base, pid, floor)
+		if !found {
+			continue
+		}
+		email, resets := antigravityBlockEvidence(block, now)
+		fingerprint := fingerprintAccount("antigravity", email)
+		if fingerprint == "" {
+			return
+		}
+		for _, reset := range resets {
+			if reset.Sub(now) < antigravityExhaustionMinReset {
+				continue
+			}
+			addAntigravityExhaustionEvent(antigravityExhaustionEvent{
+				resetAtMs: reset.UnixMilli(), fingerprint: fingerprint, atMs: now.UnixMilli(),
+			}, now)
+		}
+		return
+	}
+}
+
+func addAntigravityExhaustionEvent(event antigravityExhaustionEvent, now time.Time) {
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	kept := e.events[:0]
+	for _, existing := range e.events {
+		if now.Sub(time.UnixMilli(existing.atMs)) <= antigravityExhaustionTTL {
+			kept = append(kept, existing)
+		}
+	}
+	e.events = append(kept, event)
+	if len(e.events) > antigravityExhaustionMaxEvents {
+		e.events = e.events[len(e.events)-antigravityExhaustionMaxEvents:]
+	}
+}
+
+// resetAntigravityExhaustionEvidence forgets every event. Tests, and the model
+// of a restart: evidence never survives one.
+func resetAntigravityExhaustionEvidence() {
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	e.events = nil
+	e.mu.Unlock()
+}
+
+/* ─────────────────────────── attempt marks ─────────────────────────── */
+
+// antigravityCurrentAttempt is the latest payment attempt on a debt: the debt
+// generation it was spent on, the account it resolved, and whether Google's
+// 200 had nothing chartable. In memory only; the persisted outcome stays
+// codeassist_bad_response. The notice uses the finer wording only while the
+// debt it words is the one this attempt was for, so a new generation, another
+// outcome or a retirement clears it without touching the state file.
+type antigravityCurrentAttempt struct {
+	debtID             antigravityDebtID
+	attemptFingerprint string
+	unplottable        bool
+}
+
+var antigravityAttempt struct {
+	mu      sync.Mutex
+	current antigravityCurrentAttempt
+}
+
+func noteAntigravityCurrentAttempt(id antigravityDebtID, fingerprint string, unplottable bool) {
+	a := &antigravityAttempt
+	a.mu.Lock()
+	a.current = antigravityCurrentAttempt{debtID: id, attemptFingerprint: fingerprint, unplottable: unplottable}
+	a.mu.Unlock()
+}
+
+// antigravityAttemptWasUnplottable reports whether the latest attempt on the
+// debt generation id got a 200 with nothing chartable.
+func antigravityAttemptWasUnplottable(id antigravityDebtID) bool {
+	a := &antigravityAttempt
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.current.unplottable && a.current.debtID == id
+}
+
+// antigravityShutdownDrain bounds gracefulShutdown's wait for in-flight writes.
+var antigravityShutdownDrain = 5 * time.Second
+
+// drainAntigravityUsageWrites stops the discovery tick and waits, at most
+// antigravityShutdownDrain, for this feature's background writes. A write
+// still stuck after that is abandoned: the floor its arm persisted at spawn
+// is what the next process adopts.
+func drainAntigravityUsageWrites() {
+	stopAntigravityDiscovery()
+	if !antigravityUsageRefreshWaitIdleFor(antigravityShutdownDrain) {
+		fmt.Printf("%s[antigravity-freshness] shutdown drain timed out: inFlight=%d%s\n",
+			colorYellow, antigravityFreshnessInFlight.Load(), colorReset)
+	}
 }

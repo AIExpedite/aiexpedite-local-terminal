@@ -36,6 +36,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -431,7 +432,14 @@ func discoverCLIAgentModels(ctx context.Context, agentID string, detected detect
 	case "codex":
 		return discoverCodexModels(home, detected.Version)
 	case "antigravity":
-		out, ok := cliAgentModelProbeRunner(ctx, detected.Path, sanitizeAntigravityEnv(os.Environ()), "models")
+		// `agy models` writes a run log like any other agy process. Register it
+		// as the agent's OWN child so the log index never takes that log for a
+		// finished run owing a utilization refresh
+		// (cliagent_usage_antigravity_log_index.go). done() is deferred first,
+		// so a start failure or a panicking runner still releases it.
+		child := beginAntigravityOwnChild(home)
+		defer child.done()
+		out, ok := cliAgentModelProbeRunner(withProcessStartHook(ctx, child.setPID), detected.Path, sanitizeAntigravityEnv(os.Environ()), "models")
 		if !ok {
 			return cliAgentModelDiscovery{}, false
 		}
@@ -472,11 +480,19 @@ func runCLIAgentModelProbe(ctx context.Context, executable string, env []string,
 	cmd := exec.CommandContext(probeCtx, executable, args...)
 	hideWindow(cmd)
 	cmd.Env = env
-	out, err := cmd.CombinedOutput()
-	if err != nil {
+	// Start / hook / Wait rather than CombinedOutput, so a caller that attached
+	// a process-start hook (withProcessStartHook) learns the child's PID.
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
 		return "", false
 	}
-	return string(out), true
+	processStartHookFrom(ctx)(cmd.Process.Pid)
+	if err := cmd.Wait(); err != nil {
+		return "", false
+	}
+	return out.String(), true
 }
 
 /* --------------------------------------------------------------------------

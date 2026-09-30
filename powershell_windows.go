@@ -385,6 +385,16 @@ func (ps *PersistentPowerShell) IsHealthy() bool {
 	return ps.healthy.Load()
 }
 
+// HostPID is the persistent host process's PID (0 when unknown). Commands run
+// as its descendants, so an Antigravity capture resolves the agy a command
+// starts from here. cmd is set once at construction, so no lock is needed.
+func (ps *PersistentPowerShell) HostPID() int {
+	if ps == nil || ps.cmd == nil || ps.cmd.Process == nil {
+		return 0
+	}
+	return ps.cmd.Process.Pid
+}
+
 // forceKill terminates the PowerShell process WITHOUT acquiring the mutex.
 // This is safe to call even when Execute holds the mutex (e.g., during a
 // stuck command). Killing the process will cause the reader goroutine in

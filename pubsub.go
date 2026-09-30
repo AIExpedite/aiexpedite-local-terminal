@@ -2326,16 +2326,19 @@ var (
 // invoke `powershell.exe -File <path>` instead. The transport differs but
 // the semantics (one-shot fresh process, default/empty stdin for any child
 // tools spawned by the script, CLIXML filtering, error shape) are identical.
-func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
+//
+// onStart (may be nil) is called with the wrapper process's PID as soon as it
+// starts, so an armed Antigravity capture can resolve the agy it runs.
+func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 	if len(encodedScript) > encodedCommandFallbackThreshold {
 		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
 		if decodeErr != nil {
 			return "", fmt.Errorf("powershell temp-file fallback: decode failed: %w", decodeErr)
 		}
 		fmt.Printf("%s[aiexpedite] PowerShell script %d chars encoded — routing via temp .ps1 file (over -EncodedCommand cmdline limit)%s\n", colorCyan, len(encodedScript), colorReset)
-		return runPowerShellCommandViaTempFileFn(script, workDir, timeout)
+		return runPowerShellCommandViaTempFileFn(script, workDir, timeout, onStart)
 	}
-	return runEncodedPowerShellViaArgFn(encodedScript, workDir, timeout)
+	return runEncodedPowerShellViaArgFn(encodedScript, workDir, timeout, onStart)
 }
 
 // runEncodedPowerShellViaArg invokes powershell.exe with the script passed as
@@ -2344,7 +2347,7 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 // It captures stdout and stderr separately and filters CLIXML progress
 // messages to avoid false "exit status 1" errors when commands produce valid
 // output.
-func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout time.Duration) (string, error) {
+func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 	// `-OutputFormat Text` prevents PowerShell from serializing stderr as CLIXML
 	// (XML error records) when stderr is piped to a non-console parent process.
 	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
@@ -2384,6 +2387,7 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-encoded")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
+	notifyProcessStart(onStart, c)
 	err := c.Wait()
 
 	return assemblePowerShellOutput(stdout.String(), stderr.String(), err)
@@ -2402,7 +2406,7 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 // -EncodedCommand path. The temp-file transport preserves the original
 // stdin semantics. Error/output semantics match runEncodedPowerShellViaArg
 // exactly.
-func runPowerShellCommandViaTempFile(script string, workDir string, timeout time.Duration) (string, error) {
+func runPowerShellCommandViaTempFile(script string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 	tmp, err := os.CreateTemp("", "aiexpedite-ps-*.ps1")
 	if err != nil {
 		return "", fmt.Errorf("powershell temp-file fallback: create temp: %w", err)
@@ -2461,6 +2465,7 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-tempfile")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
+	notifyProcessStart(onStart, c)
 
 	waitErr := c.Wait()
 	return assemblePowerShellOutput(stdout.String(), stderr.String(), waitErr)
@@ -2548,7 +2553,7 @@ func isPowerShellSpecificCommand(cmd string) bool {
 // powershell.exe is used in preference to cmd.exe so that a failed `cd` (e.g.
 // to a non-existent path) sets a non-zero exit code and the error propagates —
 // cmd.exe's `cd` exits 0 even on failure, masking the problem.
-func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string, error) {
+func runViaShell(cmdLine string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -2577,6 +2582,7 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 		globalProcessRegistry.Register(c.Process.Pid, "pubsub:shell")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
+	notifyProcessStart(onStart, c)
 	err := c.Wait()
 	return combined.String(), err
 }
@@ -2624,8 +2630,13 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	}
 	// Do not arm until Start succeeds. Arming in runLocalCommand made the
 	// immediate probe race ahead of the child and also created a capture for a
-	// command that never spawned at all.
-	defer armAntigravityCaptureForCommand("local execute", cmd, args)()
+	// command that never spawned at all. The capture holds the child's PID
+	// (agy itself for a direct `agy …`; a `bash -c` wrapper's PID otherwise).
+	capture := armAntigravityCaptureForCommand("local execute", cmd, args)
+	if c.Process != nil {
+		capture.SetPID(c.Process.Pid)
+	}
+	defer capture.Finish()
 	err := c.Wait()
 	return combined.String(), err
 }
@@ -5320,7 +5331,14 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// exits between two ticks is never sampled, and with no memoized port the
 	// tail window is skipped too. What it does buy is that a sequential failover
 	// through the chain below cannot double-arm.
-	defer armAntigravityCaptureForCommand("windows execute", cmd, args)()
+	//
+	// Every transport hands its wrapper PID to the capture as soon as it
+	// starts (onStart), and the persistent PowerShell hands its host's: the
+	// capture's resolver then finds the agy process that wrapper runs, so the
+	// run's settle can read agy's own log block.
+	capture := armAntigravityCaptureForCommand("windows execute", cmd, args)
+	defer capture.Finish()
+	onStart := capture.SetWrapper
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
 	isEncodedPowerShell := strings.ToLower(cmd) == "powershell" &&
@@ -5328,7 +5346,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		strings.ToLower(args[0]) == "-encodedcommand"
 
 	if isEncodedPowerShell {
-		return runEncodedPowerShellCommand(args[1], workDir, timeout)
+		return runEncodedPowerShellCommand(args[1], workDir, timeout, onStart)
 	}
 
 	// Check if this is a regular PowerShell command with -Command that needs encoding
@@ -5341,7 +5359,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// Encode the script locally to prevent escaping issues
 		script := strings.Join(args[1:], " ")
 		encoded := encodeForPowerShell(script)
-		return runEncodedPowerShellCommand(encoded, workDir, timeout)
+		return runEncodedPowerShellCommand(encoded, workDir, timeout, onStart)
 	}
 
 	// Original behavior for non-PowerShell commands
@@ -5375,7 +5393,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
 			}
 		}
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 	}
 
 	// Test runners need per-command non-interactive defaults (CI=1,
@@ -5388,7 +5406,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	if isTestRunnerCommand(cmdLine) {
 		fmt.Printf("%s[aiexpedite] Using one-shot hardened process for test runner: %s%s\n",
 			colorCyan, cmd, colorReset)
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 	}
 
 	// Route bash-style commands (containing && or ||) through a one-shot
@@ -5397,19 +5415,20 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// is the fallback when pwsh.exe is not on PATH.
 	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
 		fmt.Printf("%s[aiexpedite] Routing bash-style command via one-shot powershell.exe (persistent PS unavailable)%s\n", colorCyan, colorReset)
-		return runViaShell(cmdLine, workDir, timeout)
+		return runViaShell(cmdLine, workDir, timeout, onStart)
 	}
 
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
 	ps, err := GetPowerShell()
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Persistent PowerShell unavailable, using fallback%s\n", colorYellow, colorReset)
-		return runLocalCommandFallback(cmdLine, workDir, timeout)
+		return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	capture.SetWrapper(ps.HostPID())
 	output, err := ps.Execute(ctx, cmdLine, workDir)
 	if err != nil {
 		// ExitCodeError means the command ran but exited non-zero — the PS
@@ -5421,20 +5440,21 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// Process-level failure: try restarting PS once then retry.
 		if restartErr := RestartPowerShell(); restartErr != nil {
 			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 		}
 
 		ps, err = GetPowerShell()
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 		}
+		capture.SetWrapper(ps.HostPID())
 
 		// Reuse the original context so the retry does not exceed the
 		// caller-requested timeout.  Creating a fresh full-timeout context here
 		// could allow the command to run for up to 2× the requested duration.
 		output, err = ps.Execute(ctx, cmdLine, workDir)
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir, timeout)
+			return runLocalCommandFallback(cmdLine, workDir, timeout, onStart)
 		}
 	}
 
@@ -5552,7 +5572,7 @@ func buildFallbackProbeCommand(cmdLine, sentinel string) string {
 // Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
 // After the command runs, it queries the final working directory so that cd
 // commands are tracked even through the fallback path.
-func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration) (string, error) {
+func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -5585,6 +5605,7 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 		globalProcessRegistry.Register(c.Process.Pid, "pubsub:fallback")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
+	notifyProcessStart(onStart, c)
 	err := c.Wait()
 	rawOut := combined.Bytes()
 	out := string(rawOut)
@@ -7480,5 +7501,12 @@ func publishOneShotNativeError(ctx context.Context, topic *pubsub.Publisher, cmd
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s%s Failed to publish error: %v%s\n", colorRed, spec.LogTag, err, colorReset)
+	}
+}
+
+// notifyProcessStart hands a started transport's PID to its onStart hook.
+func notifyProcessStart(onStart func(pid int), c *exec.Cmd) {
+	if onStart != nil && c != nil && c.Process != nil {
+		onStart(c.Process.Pid)
 	}
 }

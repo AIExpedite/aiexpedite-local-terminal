@@ -252,11 +252,16 @@ func antigravityRunDebtRetryPending() bool {
 	return t.timer != nil
 }
 
-// nudgeAntigravityUsageRefresh is the gather's trigger. It arms the debt worker
-// when a pending debt's booked attempt is due, or — with no debt pending —
-// creates one floored at the newest run log when that log postdates the cached
-// reading (antigravityRunBehindObservation with no slack). That second half is
-// what makes a run converge when no spawn path classified it.
+// nudgeAntigravityUsageRefresh is the gather's and the discovery tick's
+// trigger. It arms the debt worker when a pending debt's booked attempt is due,
+// or — with no debt pending — creates one floored at the owe-ready log (a
+// finished foreign run, as the log index classifies it) when that floor
+// postdates the cached reading (antigravityRunBehindObservation with no
+// slack). That second half is what makes a direct run converge.
+//
+// Nothing at all while one of the agent's own `agy` children runs: its log
+// cannot be classified until it ends, and the cooldown is not stamped, so the
+// next tick is not held back by a nudge that did nothing.
 //
 // Bounds: nothing while the minimum interval since the last outbound read
 // (including a Refresh click's) is running, nothing more than once per
@@ -271,7 +276,7 @@ func antigravityRunDebtRetryPending() bool {
 // Never blocks the gather: one small state-file read-modify-write, and the
 // worker runs on its own goroutine.
 func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog time.Time) bool {
-	if IsShutdownInProgress() || IsOffline() {
+	if IsShutdownInProgress() || IsOffline() || antigravityOwnChildRunning() {
 		return false
 	}
 	n := &antigravityRefreshNudge

@@ -800,9 +800,11 @@ func (m *AntigravityNativeManager) runOneShot(
 	// killed by End/timeout still releases exactly once — and release it on
 	// every return path, including the timeout and transcript-replay retries.
 	// Never fails and never blocks; a missed capture costs freshness, not the
-	// turn. See cliagent_usage_antigravity_capture.go.
-	finishQuotaCapture := startAntigravityQuotaCapture("native turn")
-	defer finishQuotaCapture()
+	// turn. The capture owns the run's agy PID, so its settle can read the
+	// run's own log block. See cliagent_usage_antigravity_capture.go.
+	quotaCapture := startAntigravityQuotaCapture("native turn")
+	quotaCapture.SetPID(cmd.Process.Pid)
+	defer quotaCapture.Finish()
 
 	var timedOutFlag atomic.Bool
 	timer := time.AfterFunc(turnTimeout, func() {

@@ -123,14 +123,14 @@ type CLISession struct {
 	cliConversationID        string
 	cliConversationPublished bool
 
-	// finishQuotaCapture releases the run-scoped Antigravity quota poller armed
-	// at spawn (cliagent_usage_antigravity_capture.go). For a command that is
-	// not agy it is armAntigravityCaptureForCommand's no-op release, so this
-	// path holds no per-command condition of its own. waitForExit calls it
+	// quotaCapture is the run-scoped Antigravity capture armed at spawn
+	// (cliagent_usage_antigravity_capture.go), holding the child's PID. For a
+	// command that is not agy it is nil, whose methods are no-ops, so this
+	// path holds no per-command condition of its own. waitForExit finishes it
 	// exactly once, immediately after the process is reaped, so the poller's
 	// final read — and its tail window — still happen while the language
 	// server's loopback socket may answer.
-	finishQuotaCapture func()
+	quotaCapture *antigravityRunCapture
 
 	// finishGrokBillingAttribution releases the run-scoped Grok attribution
 	// keeper armed at spawn (cliagent_ratelimit_grok.go). Set only for a DIRECT
@@ -841,7 +841,8 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// poller now that the process exists; waitForExit releases it as soon as the
 	// process ends. Nil for every other command. See
 	// cliagent_usage_antigravity_capture.go.
-	finishQuotaCapture := armAntigravityCaptureForCommand("pipe session", command, cliArgs)
+	quotaCapture := armAntigravityCaptureForCommand("pipe session", command, cliArgs)
+	quotaCapture.SetPID(proc.Process.Pid)
 
 	session := &CLISession{
 		ID:                           id,
@@ -861,7 +862,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokLimitNoticeScope:         grokLimitScope,
 		grokProducerContested:        grokProducerContested,
 		antigravityManagedStream:     antigravityManagedStream,
-		finishQuotaCapture:           finishQuotaCapture,
+		quotaCapture:                 quotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
 		// The child is running now, so the pin can be confirmed against the
 		// binary still on disk: a replacement that landed in the pin→Start
@@ -2583,9 +2584,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// than after the stream drain below. Every useful read has to happen while
 	// the process is alive; stopping promptly also frees its idle loopback
 	// connection. Non-blocking, and a no-op for every non-agy session.
-	if session.finishQuotaCapture != nil {
-		session.finishQuotaCapture()
-	}
+	session.quotaCapture.Finish()
 
 	// Same timing for the Grok attribution keeper: the reaped child writes no
 	// further billing records, so holding the marker past this point would only

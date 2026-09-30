@@ -414,7 +414,7 @@ func TestAntigravityFreshness_SurvivesAnInstallTreeMigrationMidCapture(t *testin
 	helperWriteJSON(t, filepath.Join(legacy, "config.json"), map[string]any{})
 	old := helperStartCaptureServer(t, legacy, helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("migration run")
+	finish := startAntigravityQuotaCapture("migration run").Finish
 	defer helperStopCapture(t, finish)
 	helperAwaitSnapshot(t, cache, time.Time{}, "a capture from the legacy install")
 
@@ -455,7 +455,7 @@ func TestAntigravityFreshness_AdvancedObservedAtSurvivesTheSignedRefresh(t *test
 		t.Fatalf("parse seed: %v", err)
 	}
 
-	finish := startAntigravityQuotaCapture("signed refresh run")
+	finish := startAntigravityQuotaCapture("signed refresh run").Finish
 	helperAwaitSnapshot(t, cache, stale, "a capture newer than the stale seed")
 	helperStopCapture(t, finish)
 	server.srv.Close()
@@ -596,7 +596,7 @@ func TestAntigravityFreshness_ConcurrentRunsShareOnePoller(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			finish := startAntigravityQuotaCapture(fmt.Sprintf("run %d", n))
+			finish := startAntigravityQuotaCapture(fmt.Sprintf("run %d", n)).Finish
 			time.Sleep(time.Duration(50+n*30) * time.Millisecond)
 			finish()
 		}(i)
@@ -653,7 +653,7 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 	restore := runEncodedPowerShellViaArgFn
 	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
 	var ran atomic.Int64
-	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration, _ func(int)) (string, error) {
 		ran.Add(1)
 		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
 		if decodeErr != nil {
@@ -711,7 +711,7 @@ func TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing(t *testing.T) {
 
 	restore := runEncodedPowerShellViaArgFn
 	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
-	runEncodedPowerShellViaArgFn = func(string, string, time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(string, string, time.Duration, func(int)) (string, error) {
 		return "ok", nil
 	}
 
@@ -746,7 +746,7 @@ func TestAntigravityFreshness_SurvivesACLIUpdateBetweenSmokes(t *testing.T) {
 	legacy := filepath.Join(home, ".agy")
 	helperWriteJSON(t, filepath.Join(legacy, "config.json"), map[string]any{})
 	first := helperStartCaptureServer(t, legacy, helperQuotaJSON, helperStatusJSON)
-	firstRun := startAntigravityQuotaCapture("smoke one")
+	firstRun := startAntigravityQuotaCapture("smoke one").Finish
 	preUpdate := helperAwaitSnapshot(t, cache, stale, "the pre-update observation")
 	helperStopCapture(t, firstRun)
 	first.srv.Close()
@@ -767,7 +767,7 @@ func TestAntigravityFreshness_SurvivesACLIUpdateBetweenSmokes(t *testing.T) {
 
 	// Smoke two, on the updated install.
 	helperStartCaptureServer(t, modern, helperQuotaJSON, helperStatusJSON)
-	secondRun := startAntigravityQuotaCapture("smoke two")
+	secondRun := startAntigravityQuotaCapture("smoke two").Finish
 	helperAwaitSnapshot(t, cache, preUpdateObserved, "the post-update observation")
 	helperStopCapture(t, secondRun)
 
@@ -795,11 +795,11 @@ func TestAntigravityFreshness_ConcurrentGatedRunsOweOneDebtAndPayItOnce(t *testi
 	antigravityRefreshMinInterval = time.Hour
 	t.Cleanup(func() { antigravityUsageRefreshWaitIdle(); antigravityRefreshMinInterval = origInterval })
 
-	first := startAntigravityQuotaCapture("short run")
+	first := startAntigravityQuotaCapture("short run").Finish
 	// The long run holds the poller open. The short run's settle must not wait
 	// on it: the debt is decided off the poller precisely so a finished run's
 	// refresh is never parked behind a live interactive session.
-	long := startAntigravityQuotaCapture("long run")
+	long := startAntigravityQuotaCapture("long run").Finish
 	released := false
 	t.Cleanup(func() {
 		if !released {

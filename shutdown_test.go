@@ -291,3 +291,39 @@ func TestGracefulShutdownStopsTheCodexRefreshSchedule(t *testing.T) {
 		t.Error("shutdown cleared the persisted rung instead of leaving it for the next process")
 	}
 }
+
+// gracefulShutdown's Antigravity step stops the discovery tick and drains the
+// feature's in-flight writes, bounded: it waits for a write that finishes, and
+// returns within its bound when one is stuck.
+func TestDrainAntigravityUsageWrites_StopsDiscoveryAndDrainsBounded(t *testing.T) {
+	origInterval, origDrain := antigravityDiscoveryInterval, antigravityShutdownDrain
+	defer func() { antigravityDiscoveryInterval, antigravityShutdownDrain = origInterval, origDrain }()
+	antigravityDiscoveryInterval = time.Hour
+	antigravityShutdownDrain = 300 * time.Millisecond
+
+	startAntigravityDiscovery()
+	antigravityFreshnessInFlight.Add(1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		antigravityFreshnessInFlight.Add(-1)
+	}()
+	start := time.Now()
+	drainAntigravityUsageWrites()
+	if antigravityDiscoveryRunning() {
+		t.Error("the discovery tick survived the shutdown drain")
+	}
+	if antigravityFreshnessInFlight.Load() != 0 {
+		t.Error("the drain returned before the in-flight write finished")
+	}
+	if waited := time.Since(start); waited > antigravityShutdownDrain {
+		t.Errorf("waited %s for a write that finished in 50ms", waited)
+	}
+
+	antigravityFreshnessInFlight.Add(1)
+	defer antigravityFreshnessInFlight.Add(-1)
+	start = time.Now()
+	drainAntigravityUsageWrites()
+	if waited := time.Since(start); waited < antigravityShutdownDrain || waited > antigravityShutdownDrain+2*time.Second {
+		t.Errorf("waited %s on a stuck write, want about the %s bound", waited, antigravityShutdownDrain)
+	}
+}

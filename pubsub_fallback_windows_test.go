@@ -19,7 +19,7 @@ func TestRunLocalCommandFallback_PropagatesNativeFailure(t *testing.T) {
 	// failing `npm test`/`pytest`. The trailing Write-Host/(Get-Location).Path
 	// probe succeeds, so without the $LASTEXITCODE capture this would report
 	// success.
-	_, err := runLocalCommandFallback("cmd /c exit 3", "", 30*time.Second)
+	_, err := runLocalCommandFallback("cmd /c exit 3", "", 30*time.Second, nil)
 	if err == nil {
 		t.Fatalf("expected a non-zero exit error from a failing native command, got nil")
 	}
@@ -31,7 +31,7 @@ func TestRunLocalCommandFallback_PropagatesNativeFailure(t *testing.T) {
 func TestRunLocalCommandFallback_SucceedsOnPassingCommand(t *testing.T) {
 	// A passing native command must still report success (no false failure from
 	// the $null-guard or the probe).
-	_, err := runLocalCommandFallback("cmd /c exit 0", "", 30*time.Second)
+	_, err := runLocalCommandFallback("cmd /c exit 0", "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected success for a passing command, got %v", err)
 	}

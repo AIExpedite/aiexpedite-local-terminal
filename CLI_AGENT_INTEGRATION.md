@@ -1161,7 +1161,7 @@ Claude (`triggerClaudeUsageProbeAfterRun`) already have, at a fraction of the
 size: no rollout scanning, no cursor, one outbound read.
 
 - **Arm.** `startAntigravityQuotaCapture` calls `armAntigravityUsageRunFloor(now)`
-  and keeps the returned floor in the `finish` closure. All five spawn sites
+  and keeps the returned floor in the run's capture handle. All five spawn sites
   inherit it, because they all reach that function — no new call sites. The
   floor is returned immediately and PERSISTED on a goroutine, like
   `armCodexUsageRunFloor`: this is the spawn path (the Windows chain arms at
@@ -1169,8 +1169,8 @@ size: no rollout scanning, no cursor, one outbound read.
   race with its own settle costs nothing — the arm only raises the floor, and a
   floor left behind for a run that did get its reading is dropped by the
   payment's cached-reading check before any request is sent.
-- **Settle.** That `finish` runs `antigravityUsageRunSettled(floor, captured,
-  gated)` on its own goroutine, inside the existing `sync.Once`. It must **not**
+- **Settle.** The handle's `Finish` runs `antigravityUsageRunSettled(floor, pid,
+  captured, gated)` on its own goroutine, inside its `sync.Once`. It must **not**
   wait for the poller: the poller is refcounted and exits only when the LAST
   armed run releases, so settling there would park a finished run's refresh
   behind a long interactive session sharing it. The decision is a time
@@ -1249,9 +1249,10 @@ size: no rollout scanning, no cursor, one outbound read.
   a settler: the in-run loopback, the Code Assist read, a Refresh click, a
   concurrent run's poller. The lock order is cache → freshness → live runs;
   nothing under the freshness lock may read the cache. A covering reading also
-  retires the run FLOOR — but only down to the oldest run still armed
-  (`antigravityOldestLiveRunFloorMs`, the process-local registry
-  `armAntigravityUsageRunFloor` writes and the settle releases). A reading taken
+  retires the run FLOOR — but only down to the oldest floor still protected
+  (`antigravityOldestProtectedFloorMs`: the managed runs
+  `armAntigravityUsageRunFloor` registers and the settle releases, plus live
+  direct-run candidates — see Run discovery below). A reading taken
   while a run is going does not hold the usage that run is still spending, so
   dropping the marker outright would leave a crash or self-update before that
   run's settle with neither a floor nor a debt, and no recovery refresh.
@@ -1348,10 +1349,12 @@ gives the debt a bounded schedule and a second, state-independent trigger.
   timer (before the update-handoff return, so a rung cannot fire into an exiting
   process); the next process re-arms it from the file.
 - **The gather's nudge.** After the notice/gate switch, `ParseContext` calls
-  `nudgeAntigravityUsageRefresh(now, observedAt, newestLog)`. It arms the worker
-  when a pending debt's booked rung is due (a timer lost to sleep), or — with no
-  debt pending — creates one floored at the newest run log when that log
-  postdates the replayed reading. That second trigger is what makes a run
+  `nudgeAntigravityUsageRefresh(now, observedAt, owedLog)` — the discovery tick
+  calls the same entry point. It arms the worker when a pending debt's booked
+  rung is due (a timer lost to sleep), or — with no debt pending — creates one
+  floored at the newest OWE-READY run (a finished foreign run as the log index
+  classifies it; see Run discovery below) when that floor postdates the
+  replayed reading. That second trigger is what makes a run
   converge when no spawn path classified it, including an `agy` the user ran in
   their own shell: it reads the user's own quota with the login `agy` already
   stored, exactly as the Refresh click does. Both the nudge and the
@@ -1372,8 +1375,8 @@ gives the debt a bounded schedule and a second, state-independent trigger.
   reads `antigravityQuotaGateFor("", now)` once at arm time. A matching marker
   still arms the run floor and still settles with `gated: true` (reusing that
   one read), but starts no poller goroutine and scans no logs; the gather on
-  such a build resolves `newestLog` through `antigravityNewestRunLog` (a
-  `ReadDir`, no log bodies) and skips port discovery and the loopback fetch. A
+  such a build skips port discovery and the loopback fetch; its owe-ready run
+  comes from the log index like every other build's. A
   same-version server-side fix is then picked up at the marker's 24 h recheck
   rather than on the next run — the gate's existing contract for the click,
   extended to the run path. `antigravityCaptureStopped` returns an
@@ -1381,6 +1384,151 @@ gives the debt a bounded schedule and a second, state-independent trigger.
 - **Cost.** Nothing grows with workspace size. At most five reads per unpaid
   run, and at most one read per `antigravityRefreshMinInterval` per device
   whichever trigger fires; the retry lines log counters and durations only.
+
+### Run discovery, managed-run evidence and the propagation bound
+
+After an `agy` update the card could still show Antigravity with no numeric
+metric although the post-update maintenance smoke passed. The debt machinery
+above was sound; three gaps kept utilization unobservable. Every `agy` log was
+treated as a finished run — including the agent's OWN `agy models` children, so
+each model probe owed a read ("behindBy=1s; refresh owed") — a direct run was
+judged finished after 60 s of log silence whether or not it was still running,
+and nothing noticed a direct run until a gather happened. Google also OMITS
+`remainingFraction` for a bucket with nothing left, so an account whose every
+bucket is spent answered with nothing chartable.
+[`cliagent_usage_antigravity_log_index.go`](cliagent_usage_antigravity_log_index.go)
+closes the first three; managed-run evidence closes the last where it safely
+can.
+
+- **Own children.** `agy models` (`discoverCLIAgentModels`, which now runs
+  Start → hook → Wait so `withProcessStartHook` hands it the PID) and the
+  Refresh click's live probe call `beginAntigravityOwnChild(home)` before they
+  start, with `defer child.done()` registered first (a start failure, an early
+  return or a panic still releases it) and `setPID` after Start. `done()`
+  reads at most 8 new files whole (under 256 KB) and OWNS a file only when its
+  SOLE PID block is the child's and its `{size, mtime}` did not change while it
+  was read. While an own child runs, `ParseContext` skips the missed-run
+  diagnostic and the nudge, and the nudge returns without stamping its
+  cooldown.
+- **Discovery tick.** One process-wide 60 s timer (`startAntigravityDiscovery`,
+  from `StartAgent`; stopped by `gracefulShutdown`) runs while `agy` is
+  installed. Each tick lists names only, per base, and classifies the names the
+  previous tick did not have. It re-stats a bounded watched set — the newest 32
+  names, up to 32 owned files, 8 candidates and up to 32 `noPID` logs — plus a
+  collision-grace list of at most 64, and reclassifies any file whose size or
+  mtime changed: an owned file that grows becomes foreign (a direct run started
+  in the same second appended its block), a `noPID` file that gains a block
+  becomes a candidate. An owned or `noPID` entry evicted by its cap stays in
+  the grace list until its name-second is more than 2 min old
+  (`antigravityCollisionGrace`): after that no new run can share the name.
+  Gathers use the same pass (`antigravityNewestOwedLog`) and stat at most the
+  newest 32 names plus the candidates — never all of `agy`'s unpruned logs.
+- **Candidates.** A foreign log newer than the reading holds up to 4 foreign
+  PIDs (a 5th sets `pidOverflow`) with their `processStartToken`s. Managed and
+  own PIDs never count. A live PID (`probeRecordedProcess`: ours or unknown)
+  keeps the run live and arms its first-seen instant as a protected floor
+  (`armAntigravityCandidateFloor`, persisted as `runFloorMs` so a restart
+  adopts it); `antigravityOldestProtectedFloorMs` (managed runs plus
+  candidates) replaces the managed-only floor wherever a reading rolls the
+  floor back. Once every PID is gone (a recycled PID is gone) the run is owed
+  when the exit has been seen, or the log idle, for 60 s — floor
+  `max(log mtime, exit seen)` — or released without a read when a reading lands
+  after the exit. A run held only by unreadable or overflowing PIDs is owed at
+  6 h with one counter line. Past 8 candidates, live PIDs move to
+  process-only tracking (up to 64); past that a sentinel keeps the oldest floor
+  armed and is released only by an OK `ScanCLIProcessesChecked` showing no
+  untracked unmanaged `agy`, or at 6 h. A `noPID` log is owed after 60 s idle
+  and is never dropped silently.
+- **Startup scan.** `adoptAndPayOwedAntigravityRunDebt` runs the first pass
+  before adopting: every name whose `cli-YYYYMMDD_HHMMSS` start (local time,
+  less 1 h of DST slack) is at or after the cached reading, capped at the newest
+  256, plus live unmanaged `agy` from an OK checked scan. Its floors are applied
+  only after the previous process's floor was adopted, so a candidate armed now
+  cannot mask it.
+- **Checked scans.** `ScanCLIProcessesChecked` and
+  `ScanProcessAncestryChecked(rootPID)` (processes_windows.go, rules in
+  processes_parse.go) return `ok=false` for a failed query: PowerShell must
+  print the `AIX_SCAN_OK` trailer from inside `try { … -ErrorAction Stop }`;
+  WMIC's CSV header or `No Instance(s) Available.` is a valid empty result
+  whatever its exit code; no backend, and every non-Windows platform, is never
+  ok. `ScanCLIProcesses` wraps the checked scan, so the orphan scanner's
+  allowlist is unchanged.
+- **Capture handle.** `startAntigravityQuotaCapture` /
+  `armAntigravityCaptureForCommand` return `*antigravityRunCapture` (nil for a
+  command that is not agy; every method of a nil handle is a no-op). Native,
+  pipe-session, PTY and Unix execute call `SetPID(cmd.Process.Pid)` after
+  Start; the wrapped Windows chain (`runLocalCommandWindows`: encoded, file-mode,
+  shell, fallback and the persistent host via `HostPID`) calls
+  `SetWrapper(pid)` as each transport starts. The wrapper resolver scans the
+  wrapper's tree every 5 s, at most 60 times, only while the command runs,
+  takes the first `agy.exe` within 3 levels whose start is not before the
+  capture floor (the persistent host outlives every command), marks it managed
+  and stops. `Finish` stops it and settles with the PID.
+- **Managed-run evidence (in memory only).** The settle reads the run's OWN
+  PID block (`antigravityPIDBlock`) and, when that block names both
+  `authenticated successfully as <email>` and a `RESOURCE_EXHAUSTED … Resets in
+  X` of at least 2 min, keeps `{resetAtMs, fingerprint, atMs}` — at most 4
+  events, each for 10 min; the email is reduced to its fingerprint at once.
+  Both quota routes resolve the reply's account BEFORE converting buckets
+  (Code Assist through `antigravityCodeAssistIdentity`; loopback through
+  `GetUserStatus`, after the CSRF-gated quota check). An OMITTED fraction
+  (`antigravityWireFraction` keeps omitted, null, valid and invalid apart) is
+  charted as fully consumed only against an event with the same fingerprint
+  whose reset is within 2 min of the bucket's; null and invalid are skipped; a
+  failed identity lookup applies no evidence. Direct runs never contribute (a
+  login switch between two direct runs could attribute one account's
+  exhaustion to another).
+- **Propagation bound.** Local cache, from run exit to a persisted reading,
+  with the tick running: a managed run lands by exit + 70 s (exit + 3 min when
+  the first read fails and the 60 s rung succeeds); a direct run by
+  exit + 2.5 min (exit + 3.5 min). The ladder's worst case is about 41 min,
+  after which the notice reports the failure. The card then follows the
+  existing active loop (`__cli_usage_refresh__` about every 5 min for 45 min
+  after a wake): managed runs wake the device, so their reading reaches the
+  card within about 5.5 min; a direct run does not, so its landed reading is
+  published at the next wake or when the CLI Agents tab is opened.
+- **Update survival.** `gracefulShutdown` stops the tick and drains in-flight
+  writes for up to 5 s (`drainAntigravityUsageWrites`), so a settle or arm
+  racing an update handoff lands; a write still stuck is abandoned and the
+  floor its arm persisted at spawn is adopted by the next process.
+- **Notices.** `codeassist_unauthorized` is worded "Google refused the stored
+  login's quota read, so the reading could not be updated." A spent
+  `codeassist_bad_response` debt uses the unplottable wording only while the
+  latest in-memory attempt on THAT debt generation got a 200 with nothing
+  chartable (`antigravityCurrentAttempt`); another outcome, a new generation or
+  a retirement clears it. The persisted outcome set is unchanged.
+- **Strict redaction.** Nothing new is persisted: the freshness file keeps its
+  fields and outcome values, and the signed refresh gains no field. New log
+  lines are fixed labels plus integer counters only —
+  `[antigravity-quota] quota reply shape: groups=N buckets=N …` once per
+  distinct shape (at most 8 per process), the discovery hold counter and the
+  shutdown drain line. Google's status / reason strings, bucket keys, windows,
+  paths, PIDs and emails are never logged; only the HTTP status is, as before.
+- **Acceptance limitations (recorded).** Each stays at "no chartable windows"
+  or an older reading: an all-exhausted reply after a DIRECT run only; an
+  all-exhausted reply across an agent self-update (evidence is in memory); an
+  all-exhausted wrapped Windows run shorter than one resolver tick (5 s); a
+  direct run that started and ended while no agent ran, with more than 256 logs
+  started since the last reading; on macOS / Linux, a direct session still live
+  across an agent restart whose log is not in the startup listing gets only the
+  adopted reading; and more than 64 owned / `noPID` evictions inside one 2-min
+  collision window, where a same-second direct run appended to an overflowed
+  file is missed until another run owes a read.
+- **Cost.** `agy` never prunes its logs (3,706 after 11 weeks on the reporting
+  device, about 50 a day). A tick is one name-only `ReadDir` per base (O(n), a
+  few ms at that size; it starts to matter around tens of thousands of names
+  per base), stats of new names, and at most 104 watched plus 64 grace stats.
+  Process-only tracking needs no file stats. The wrapper resolver's
+  `Get-CimInstance` scan (about 1 s) runs every 5 s only while a wrapped managed
+  `agy` run is live and unresolved, at most 60 times per run.
+- **Test seams.** `antigravityCandidateProbe`, `antigravityProcessStartToken`,
+  `antigravityProcessScan`, `antigravityDiscoveryInterval`,
+  `antigravityAncestryScan`, `antigravityWrapperScanEvery`,
+  `antigravityExhaustionEvidenceFn`, `antigravityShutdownDrain` and
+  `runProcessScanCommand` (Windows); `antigravityLockOrderCheck` makes taking
+  the live-runs or freshness lock while holding the index lock panic. The mock
+  CLI mode `antigravity-pid-block` writes a real second-stamped log with its own
+  PID block (and, with `TEST_MOCK_AGY_EXHAUSTED_AS`, a login and a 429).
 
 # Live usage probe — the Refresh click on the CLI Agents card
 

@@ -44,6 +44,15 @@ import (
 )
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
+
+// mockAgyExhaustedEnv / mockAgySleepEnv configure the "antigravity-pid-block"
+// mock: the address its block authenticates as (plus a quota reset), and how
+// long it stays alive.
+const (
+	mockAgyExhaustedEnv = "TEST_MOCK_AGY_EXHAUSTED_AS"
+	mockAgySleepEnv     = "TEST_MOCK_AGY_SLEEP"
+)
+
 const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
 
 // mockGrokSmokeHangPidEnv names a file the `grok-smoke-hang` mode writes its
@@ -355,6 +364,29 @@ func runMockCLI(mode string) {
 
 	case "antigravity-diagnostic":
 		fmt.Println("agy version 1.2.3")
+		os.Exit(0)
+
+	case "antigravity-pid-block":
+		// A run that logs like a real agy: its own second-stamped log under
+		// $HOME, opening with its language-server PID block. With
+		// mockAgyExhaustedEnv set it also authenticates as that address and
+		// hits a quota reset; mockAgySleepEnv keeps it alive that long.
+		home, _ := os.UserHomeDir()
+		logDir := antigravityLogDir(filepath.Join(home, ".gemini", "antigravity-cli"))
+		_ = os.MkdirAll(logDir, 0o755)
+		block := fmt.Sprintf("I0101 00:00:00.000000 1 main.go:1] Starting language server process with pid %d\n", os.Getpid())
+		if email := os.Getenv(mockAgyExhaustedEnv); email != "" {
+			block += "authenticated successfully as " + email + "\n" +
+				"RESOURCE_EXHAUSTED (code 429): You have exhausted your capacity. Resets in 1h39m21s.\n"
+		}
+		name := "cli-" + time.Now().Format("20060102_150405") + ".log"
+		if f, err := os.OpenFile(filepath.Join(logDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+			_, _ = f.WriteString(block)
+			_ = f.Close()
+		}
+		if d, err := time.ParseDuration(os.Getenv(mockAgySleepEnv)); err == nil {
+			time.Sleep(d)
+		}
 		os.Exit(0)
 
 	case "stream-burst":

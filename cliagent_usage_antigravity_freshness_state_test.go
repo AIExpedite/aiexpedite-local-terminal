@@ -134,7 +134,7 @@ func TestAntigravityFreshness_ReadingClearsOnlyAtOrAfterTheRunCompleted(t *testi
 			helperWriteAntigravityCache(t, cache, tc.observed)
 			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-			antigravityUsageRunSettled(floor, false, true)
+			antigravityUsageRunSettled(floor, 0, false, true)
 			antigravityUsageRefreshWaitIdle()
 
 			if owing := helperFreshnessState(t).RefreshOwedAtMs != 0; owing != tc.wantOwing {
@@ -179,7 +179,7 @@ func TestAntigravityFreshness_SubSecondBoundaryIsExact(t *testing.T) {
 			helperWriteAntigravityCacheAt(t, cache, completed, tc.observedMs)
 			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-			antigravityUsageRunSettled(floor, false, true)
+			antigravityUsageRunSettled(floor, 0, false, true)
 			antigravityUsageRefreshWaitIdle()
 
 			if owing := helperFreshnessState(t).RefreshOwedAtMs != 0; owing != tc.wantOwing {
@@ -253,7 +253,7 @@ func TestAntigravityFreshness_AttemptCapIsHonoured(t *testing.T) {
 	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 	antigravityRefreshMinInterval = time.Nanosecond
 
-	antigravityUsageRunSettled(floor, false, true)
+	antigravityUsageRunSettled(floor, 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if got := calls.Load(); got != int64(antigravityRefreshAfterRunMaxAttempts) {
 		t.Fatalf("reads=%d, want the settle pass's %d", got, antigravityRefreshAfterRunMaxAttempts)
@@ -287,7 +287,7 @@ func TestAntigravityFreshness_MinimumIntervalBlocksTheNextRunsPayment(t *testing
 	helperWriteAntigravityCache(t, cache, time.Now().Add(-time.Hour))
 	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNotSigned })
 
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	first := calls.Load()
 	if first == 0 {
@@ -296,7 +296,7 @@ func TestAntigravityFreshness_MinimumIntervalBlocksTheNextRunsPayment(t *testing
 
 	// A second run seconds later: the debt's floor advances, its budget resets,
 	// and the interval — not the cap — is what holds the outbound call back.
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if got := calls.Load(); got != first {
 		t.Errorf("reads=%d, want the interval to block the second run's payment (was %d)", got, first)
@@ -363,7 +363,7 @@ func TestAntigravityFreshness_SingleFlightBlocksAConcurrentPayment(t *testing.T)
 		return liveProbeOutcomeCodeAssistHTTPError
 	})
 
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	select {
 	case <-entered:
 	case <-time.After(30 * time.Second):
@@ -396,7 +396,7 @@ func TestAntigravityFreshness_LocalRefusalsDecideWhetherToKeepSpending(t *testin
 			helperWriteAntigravityCache(t, cache, time.Now().Add(-time.Hour))
 			calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return tc.outcome })
 
-			antigravityUsageRunSettled(time.Now(), false, true)
+			antigravityUsageRunSettled(time.Now(), 0, false, true)
 			antigravityUsageRefreshWaitIdle()
 
 			state := helperFreshnessState(t)
@@ -483,7 +483,7 @@ func TestAntigravityFreshness_ARunSettlingDuringTheStartupReplayIsStillPaid(t *t
 
 	// A real run finishes while that single attempt is still in flight.
 	runFloor := time.Now()
-	antigravityUsageRunSettled(runFloor, false, true)
+	antigravityUsageRunSettled(runFloor, 0, false, true)
 	release()
 	antigravityUsageRefreshWaitIdle()
 
@@ -523,7 +523,7 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 	clockMs.Store(now.UnixMilli())
 	antigravityUsageFreshnessNow = func() time.Time { return time.UnixMilli(clockMs.Add(1)) }
 
-	antigravityUsageRunSettled(now.Add(-time.Minute), false, true)
+	antigravityUsageRunSettled(now.Add(-time.Minute), 0, false, true)
 	select {
 	case <-entered:
 	case <-time.After(30 * time.Second):
@@ -535,7 +535,7 @@ func TestAntigravityFreshness_AttemptsAreChargedToTheDebtTheyWereSpentOn(t *test
 	// pending generation with its own newer floor.
 	second := now.Add(time.Second)
 	clockMs.Store(second.UnixMilli())
-	antigravityUsageRunSettled(second, false, true)
+	antigravityUsageRunSettled(second, 0, false, true)
 	if helperFreshnessState(t).debtID() == before {
 		t.Fatal("the second run did not replace the pending debt")
 	}
@@ -651,7 +651,7 @@ func TestAntigravityFreshness_OfflineKeepsTheDebtAndSpendsNothing(t *testing.T) 
 		offlineMutex.Unlock()
 	})
 
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if calls.Load() != 0 {
 		t.Errorf("reads=%d while offline, want none", calls.Load())
@@ -686,7 +686,7 @@ func TestAntigravityFreshness_UninstalledAgyRetiresTheDebt(t *testing.T) {
 	// An empty PATH and an installer dir that holds nothing: `agy` is gone.
 	t.Setenv("PATH", t.TempDir())
 
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if calls.Load() != 0 {
 		t.Errorf("reads=%d for an uninstalled CLI, want none", calls.Load())
@@ -890,7 +890,7 @@ func TestSettleAntigravityRunFreshness_AnyPersistedReadingRetiresTheDebt(t *test
 	floor := time.Now()
 	helperWriteAntigravityCache(t, cache, floor.Add(-time.Hour))
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
-	antigravityUsageRunSettled(floor, false, true)
+	antigravityUsageRunSettled(floor, 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if helperFreshnessState(t).RefreshOwedAtMs == 0 {
 		t.Fatal("no debt to retire")
@@ -921,7 +921,7 @@ func TestAntigravityFreshness_StateFileCarriesNothingIdentifying(t *testing.T) {
 	helperWriteAntigravityCache(t, cache, time.Now().Add(-time.Hour))
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-	antigravityUsageRunSettled(time.Now(), false, true)
+	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 
 	raw, err := os.ReadFile(statePath)
@@ -1051,7 +1051,7 @@ func TestAntigravityFreshness_ACaptureDuringTheRunIsNotCoverage(t *testing.T) {
 	helperWriteAntigravityCache(t, cache, floor.Add(30*time.Second))
 	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
-	antigravityUsageRunSettled(floor, true, false)
+	antigravityUsageRunSettled(floor, 0, true, false)
 	antigravityUsageRefreshWaitIdle()
 
 	state := helperFreshnessState(t)
@@ -1083,7 +1083,7 @@ func TestAntigravityFreshness_ThePostRunTailReadingCoversTheRun(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		helperWriteAntigravityCache(t, cache, completed)
 	}()
-	antigravityUsageRunSettled(floor, true, false)
+	antigravityUsageRunSettled(floor, 0, true, false)
 	antigravityUsageRefreshWaitIdle()
 
 	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
@@ -1120,7 +1120,7 @@ func TestAntigravityFreshness_ALiveRunKeepsItsCrashMarker(t *testing.T) {
 	completed := started.Add(time.Minute)
 	antigravityUsageFreshnessNow = func() time.Time { return completed }
 	helperWriteAntigravityCache(t, cache, completed)
-	antigravityUsageRunSettled(floor, false, true)
+	antigravityUsageRunSettled(floor, 0, false, true)
 	antigravityUsageRefreshWaitIdle()
 	if state := helperFreshnessState(t); state.RunFloorMs != 0 || state.RefreshOwedAtMs != 0 {
 		t.Errorf("state=%+v, want a settled and covered run to leave nothing behind", state)
@@ -1257,5 +1257,85 @@ func TestAntigravityFreshness_DebtAtTheSixHourEdge(t *testing.T) {
 				t.Errorf("state=%+v reads=%d, want a debt past the window retired unpaid", state, calls.Load())
 			}
 		})
+	}
+}
+
+// equal is the update's only write trigger: every field is compared, and an
+// unchanged state is equal, so updateAntigravityUsageFreshness writes nothing.
+func TestAntigravityUsageFreshness_Equal(t *testing.T) {
+	base := antigravityUsageFreshness{
+		SchemaVersion: 1, RunFloorMs: 1, RefreshOwedFloorMs: 2, RefreshOwedAtMs: 3, LastPaidAtMs: 4,
+		Attempts: 5, Gated: true, AccountFingerprint: "fp", Outcome: "o", NextAttemptAtMs: 6,
+	}
+	if !base.equal(base) {
+		t.Fatal("a state is not equal to itself")
+	}
+	for name, mutate := range map[string]func(*antigravityUsageFreshness){
+		"schemaVersion":      func(s *antigravityUsageFreshness) { s.SchemaVersion++ },
+		"runFloorMs":         func(s *antigravityUsageFreshness) { s.RunFloorMs++ },
+		"refreshOwedFloorMs": func(s *antigravityUsageFreshness) { s.RefreshOwedFloorMs++ },
+		"refreshOwedAtMs":    func(s *antigravityUsageFreshness) { s.RefreshOwedAtMs++ },
+		"lastPaidAtMs":       func(s *antigravityUsageFreshness) { s.LastPaidAtMs++ },
+		"attempts":           func(s *antigravityUsageFreshness) { s.Attempts++ },
+		"gated":              func(s *antigravityUsageFreshness) { s.Gated = false },
+		"accountFingerprint": func(s *antigravityUsageFreshness) { s.AccountFingerprint = "other" },
+		"outcome":            func(s *antigravityUsageFreshness) { s.Outcome = "other" },
+		"nextAttemptAtMs":    func(s *antigravityUsageFreshness) { s.NextAttemptAtMs++ },
+	} {
+		changed := base
+		mutate(&changed)
+		if base.equal(changed) {
+			t.Errorf("a change to %s compared equal", name)
+		}
+	}
+
+	helperIsolateAntigravityFreshness(t)
+	updateAntigravityUsageFreshness(func(s *antigravityUsageFreshness) {})
+	if _, err := os.Stat(antigravityFreshnessPath()); err == nil {
+		t.Error("an unchanged state was written")
+	}
+}
+
+// The unauthorized and unplottable wordings. Unplottable is used only while
+// the latest in-memory attempt was for the SAME debt generation; the notice
+// still appears only once the budget is spent (5 attempts, not 4), clamped.
+func TestAntigravityFreshnessNotice_UnauthorizedAndScopedUnplottable(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	floor := now.Add(-5 * time.Minute)
+	write := func(t *testing.T, attempts int, outcome string) antigravityUsageFreshness {
+		state := antigravityUsageFreshness{
+			SchemaVersion: antigravityFreshnessSchema, RefreshOwedFloorMs: floor.UnixMilli(),
+			RefreshOwedAtMs: floor.UnixMilli(), Attempts: attempts, Outcome: outcome,
+		}
+		helperWriteJSON(t, antigravityFreshnessPath(), state)
+		return state
+	}
+	helperIsolateAntigravityFreshness(t)
+	t.Cleanup(func() { noteAntigravityCurrentAttempt(antigravityDebtID{}, "", false) })
+
+	write(t, antigravityRefreshDebtMaxAttempts, liveProbeOutcomeCodeAssistUnauthorized)
+	if notice, _ := antigravityFreshnessNotice("", now); !strings.Contains(notice, "Google refused the stored login's quota read") {
+		t.Errorf("unauthorized notice=%q", notice)
+	}
+
+	state := write(t, antigravityRefreshDebtMaxAttempts-1, liveProbeOutcomeCodeAssistBadResponse)
+	noteAntigravityCurrentAttempt(state.debtID(), "fp-a", true)
+	if notice, pending := antigravityFreshnessNotice("", now); notice != "" || !pending {
+		t.Errorf("notice=%q at 4 attempts, want none yet", notice)
+	}
+	state = write(t, antigravityRefreshDebtMaxAttempts, liveProbeOutcomeCodeAssistBadResponse)
+	notice, _ := antigravityFreshnessNotice("", now)
+	if !strings.Contains(notice, "no chartable quota windows") || len(notice) > antigravityFreshnessNoticeLimit {
+		t.Errorf("unplottable notice=%q", notice)
+	}
+	// Another debt generation's mark does not word this debt.
+	noteAntigravityCurrentAttempt(antigravityDebtID{floorMs: 1, owedAtMs: 1}, "fp-b", true)
+	if notice, _ := antigravityFreshnessNotice("", now); strings.Contains(notice, "chartable") {
+		t.Errorf("another debt's mark worded this one: %q", notice)
+	}
+	// A later non-unplottable attempt on the same debt clears it.
+	noteAntigravityCurrentAttempt(state.debtID(), "fp-a", false)
+	if notice, _ := antigravityFreshnessNotice("", now); strings.Contains(notice, "chartable") || !strings.Contains(notice, "Google returned no reading") {
+		t.Errorf("a cleared mark still worded the notice: %q", notice)
 	}
 }

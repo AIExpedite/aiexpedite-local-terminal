@@ -624,3 +624,28 @@ func TestNudgeAntigravityUsageRefresh_KeepsAnExpiredLoginDebtForItsOwnRun(t *tes
 		t.Errorf("reads=%d, want no attempt", reads.Load())
 	}
 }
+
+// While one of the agent's own `agy` children runs, the nudge does nothing and
+// does not stamp its cooldown: the next nudge after the child ends still fires.
+func TestNudgeAntigravityUsageRefresh_NothingWhileAnOwnChildRuns(t *testing.T) {
+	_, cache := helperIsolateAntigravityFreshness(t)
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	observed := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	helperWriteAntigravityCache(t, cache, observed)
+	owed := observed.Add(2 * time.Minute)
+
+	child := beginAntigravityOwnChild(t.TempDir())
+	if nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), owed) {
+		t.Fatal("the nudge fired while an own child was running")
+	}
+	child.done()
+	if !nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), owed) {
+		t.Fatal("the nudge after the child ended was held back by a cooldown it never earned")
+	}
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want one", reads.Load())
+	}
+}

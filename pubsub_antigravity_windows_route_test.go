@@ -30,11 +30,11 @@ func helperStubWindowsTransports(t *testing.T) (viaArg, viaTempFile *int) {
 		runEncodedPowerShellViaArgFn, runPowerShellCommandViaTempFileFn = restoreArg, restoreFile
 	})
 	argHits, fileHits := 0, 0
-	runEncodedPowerShellViaArgFn = func(string, string, time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(string, string, time.Duration, func(int)) (string, error) {
 		argHits++
 		return "stub", nil
 	}
-	runPowerShellCommandViaTempFileFn = func(string, string, time.Duration) (string, error) {
+	runPowerShellCommandViaTempFileFn = func(string, string, time.Duration, func(int)) (string, error) {
 		fileHits++
 		return "stub", nil
 	}
@@ -114,7 +114,7 @@ func TestWindowsRoute_FailoverDoesNotDoubleArm(t *testing.T) {
 	restoreArg := runEncodedPowerShellViaArgFn
 	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restoreArg })
 	calls := 0
-	runEncodedPowerShellViaArgFn = func(encoded, workDir string, timeout time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(encoded, workDir string, timeout time.Duration, _ func(int)) (string, error) {
 		calls++
 		script, err := decodeBase64PowerShellStrict(encoded)
 		if err != nil || !strings.Contains(script, "agy") {

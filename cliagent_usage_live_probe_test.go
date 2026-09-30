@@ -1235,3 +1235,44 @@ func TestProbeAntigravityQuotaViaCodeAssist_RecordsOnlyTheSpacingClock(t *testin
 		})
 	}
 }
+
+// The Refresh click's own `agy` is registered as the agent's own child: a
+// start failure releases it, and the log it writes while being torn down is
+// owned — it never owes a refresh.
+func TestProbeAntigravityQuotaLive_OwnChild(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "none.json"))
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+
+	if got := probeAntigravityQuotaLive(context.Background(), filepath.Join(t.TempDir(), "missing-agy"), home); got != liveProbeOutcomeSpawnFailed {
+		t.Fatalf("outcome=%q, want spawn_failed", got)
+	}
+	if antigravityOwnChildRunning() {
+		t.Fatal("a start failure left the own child counted as running")
+	}
+
+	_, executable := helperMockAgyOnPath(t, "antigravity-pid-block")
+	probeAntigravityQuotaLive(context.Background(), executable, home)
+	if antigravityOwnChildRunning() {
+		t.Fatal("the probe's child is still counted as running")
+	}
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	owed := antigravityNewestOwedLog([]string{base}, time.Now().Add(10*time.Minute))
+	if !owed.IsZero() {
+		t.Errorf("the probe's own log owed a refresh (floor %s)", owed)
+	}
+	lockAntigravityLogIndex()
+	owned := 0
+	for _, entry := range antigravityLogIndex.entries {
+		if entry.class == antigravityLogOwned {
+			owned++
+		}
+	}
+	unlockAntigravityLogIndex()
+	if owned != 1 {
+		t.Errorf("owned=%d, want the probe's log owned", owned)
+	}
+}

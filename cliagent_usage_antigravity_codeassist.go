@@ -42,6 +42,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -282,14 +283,16 @@ func antigravityCodeAssistIdentity(ctx context.Context, client *http.Client, tok
 	return strings.TrimSpace(info.Email)
 }
 
-// fetchAntigravityQuotaCodeAssist performs the one quota request. The
-// response is the same QuotaSummary shape the loopback server relays, either
-// bare or under a "response" envelope; both are accepted.
-func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, accessToken, version string, now time.Time) (antigravityQuotaSnapshot, string) {
+// fetchAntigravityQuotaCodeAssist performs the one quota request and returns
+// the raw groups: conversion waits until the reply's account is known, because
+// exhaustion evidence applies only to that account. The response is the same
+// QuotaSummary shape the loopback server relays, either bare or under a
+// "response" envelope; both are accepted.
+func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, accessToken, version string) ([]antigravityQuotaGroupWire, string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		antigravityPinnedURL(antigravityCodeAssistURLEnv, antigravityCodeAssistEndpoint), bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistHTTPError
+		return nil, liveProbeOutcomeCodeAssistHTTPError
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -297,7 +300,7 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 	req.Header.Set("User-Agent", antigravityCodeAssistUserAgent(version))
 	resp, err := client.Do(req)
 	if err != nil {
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistHTTPError
+		return nil, liveProbeOutcomeCodeAssistHTTPError
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, antigravityCodeAssistMaxBody))
@@ -307,19 +310,20 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		// 401 (the token) and 403 (the licence / client identity) are worth
 		// telling apart on the device: a 403 on a valid token is the client
-		// rule above, not the login.
+		// rule above, not the login. Only the status code is logged — never
+		// Google's status / reason strings.
 		fmt.Printf("%s[cli-usage] Antigravity Code Assist quota request refused with %d%s\n", colorYellow, resp.StatusCode, colorReset)
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistUnauthorized
+		return nil, liveProbeOutcomeCodeAssistUnauthorized
 	case resp.StatusCode != http.StatusOK:
 		// The status class is the one diagnostic worth having on the device
 		// (a 400 says the request shape moved, a 5xx says Google did), and it
 		// carries nothing of the user's.
 		fmt.Printf("%s[cli-usage] Antigravity Code Assist quota request answered %d%s\n", colorYellow, resp.StatusCode, colorReset)
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistHTTPError
+		return nil, liveProbeOutcomeCodeAssistHTTPError
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, antigravityCodeAssistMaxBody))
 	if err != nil {
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistBadResponse
+		return nil, liveProbeOutcomeCodeAssistBadResponse
 	}
 	var wrapped struct {
 		Groups   []antigravityQuotaGroupWire `json:"groups"`
@@ -328,17 +332,13 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 		} `json:"response"`
 	}
 	if json.Unmarshal(body, &wrapped) != nil {
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistBadResponse
+		return nil, liveProbeOutcomeCodeAssistBadResponse
 	}
 	groups := wrapped.Groups
 	if len(groups) == 0 {
 		groups = wrapped.Response.Groups
 	}
-	snap, ok := antigravitySnapshotFromGroups(groups, now)
-	if !ok {
-		return antigravityQuotaSnapshot{}, liveProbeOutcomeCodeAssistBadResponse
-	}
-	return snap, liveProbeOutcomeCodeAssistOK
+	return groups, liveProbeOutcomeCodeAssistOK
 }
 
 // probeAntigravityQuotaCodeAssist reads the quota from Google with the stored
@@ -350,6 +350,12 @@ func fetchAntigravityQuotaCodeAssist(ctx context.Context, client *http.Client, a
 // `<agy> --version` on a cold cache, and the two local refusals above it must
 // stay free — a debt nothing on this machine can pay (no login, an expired
 // token) never starts a child.
+//
+// The account is resolved BEFORE the buckets are converted, so managed-run
+// exhaustion evidence (in memory, cliagent_usage_antigravity_freshness.go) is
+// applied only to the account it was recorded for. A 200 with nothing
+// chartable stays codeassist_bad_response on disk; the finer "unplottable"
+// fact is noted in memory for the notice wording only.
 func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now func() time.Time) string {
 	tok, ok := antigravityStoredToken(ctx)
 	if !ok {
@@ -362,13 +368,26 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	client := antigravityCodeAssistClient()
 	defer client.CloseIdleConnections()
 
-	snap, outcome := fetchAntigravityQuotaCodeAssist(ctx, client, tok.AccessToken, version, now())
+	groups, outcome := fetchAntigravityQuotaCodeAssist(ctx, client, tok.AccessToken, version)
 	if outcome != liveProbeOutcomeCodeAssistOK {
 		return outcome
 	}
 	// Identity from the same credential, in the same probe: the quota and the
 	// account it is cached under can never come from two different logins.
-	snap.Account = antigravityCodeAssistIdentity(ctx, client, tok)
+	account := antigravityCodeAssistIdentity(ctx, client, tok)
+	fingerprint := fingerprintAccount("antigravity", account)
+	var evidence []antigravityExhaustionEvent
+	if fingerprint != "" {
+		evidence = antigravityExhaustionEvidenceFn(now(), fingerprint)
+	}
+	snap, shape, plottable := antigravitySnapshotFromGroups(groups, now(), evidence)
+	logAntigravityQuotaShapeOnce(shape)
+	if !plottable {
+		noteAntigravityCodeAssistAttempt(fingerprint, true)
+		return liveProbeOutcomeCodeAssistBadResponse
+	}
+	noteAntigravityCodeAssistAttempt(fingerprint, false)
+	snap.Account = account
 	// Attest the route on the cached reading itself, not only in memory: the
 	// gather that replays it may belong to a later process (a restart or a
 	// self-update), and a settings.json naming another account needs the
@@ -378,6 +397,64 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	if !persisted {
 		return liveProbeOutcomeCodeAssistNotSigned
 	}
-	noteAntigravityLiveProducer(fingerprintAccount("antigravity", snap.Account), now())
+	noteAntigravityLiveProducer(fingerprint, now())
 	return liveProbeOutcomeCodeAssistOK
+}
+
+// antigravityQuotaShapesLogged bounds logAntigravityQuotaShapeOnce.
+const antigravityQuotaShapesMax = 8
+
+var antigravityQuotaShapesLogged struct {
+	mu   sync.Mutex
+	seen map[antigravityQuotaShape]bool
+}
+
+// logAntigravityQuotaShapeOnce prints a reply's shape counters — integers
+// only, never a key, window, status string, reason or account — once per
+// distinct shape per process, for at most antigravityQuotaShapesMax shapes.
+// It is how a reply that stopped charting (every bucket omitted, a renamed
+// window) becomes diagnosable from agent.log without logging the reply.
+func logAntigravityQuotaShapeOnce(shape antigravityQuotaShape) {
+	logged := &antigravityQuotaShapesLogged
+	logged.mu.Lock()
+	if logged.seen == nil {
+		logged.seen = map[antigravityQuotaShape]bool{}
+	}
+	if logged.seen[shape] || len(logged.seen) >= antigravityQuotaShapesMax {
+		logged.mu.Unlock()
+		return
+	}
+	logged.seen[shape] = true
+	logged.mu.Unlock()
+	fmt.Printf("%s[antigravity-quota] quota reply shape: %s%s\n", colorCyan, shape, colorReset)
+}
+
+// antigravityCodeAssistAttemptNote is what the latest Code Assist read learned
+// that the closed outcome code cannot carry: the account it resolved, and
+// whether a 200 had nothing chartable. In memory only.
+type antigravityCodeAssistAttemptNote struct {
+	fingerprint string
+	unplottable bool
+}
+
+var antigravityCodeAssistLastAttempt struct {
+	mu   sync.Mutex
+	note antigravityCodeAssistAttemptNote
+}
+
+func noteAntigravityCodeAssistAttempt(fingerprint string, unplottable bool) {
+	last := &antigravityCodeAssistLastAttempt
+	last.mu.Lock()
+	last.note = antigravityCodeAssistAttemptNote{fingerprint: fingerprint, unplottable: unplottable}
+	last.mu.Unlock()
+}
+
+// takeAntigravityCodeAssistAttempt returns and clears the latest note.
+func takeAntigravityCodeAssistAttempt() antigravityCodeAssistAttemptNote {
+	last := &antigravityCodeAssistLastAttempt
+	last.mu.Lock()
+	defer last.mu.Unlock()
+	note := last.note
+	last.note = antigravityCodeAssistAttemptNote{}
+	return note
 }

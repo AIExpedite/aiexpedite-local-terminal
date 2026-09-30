@@ -389,3 +389,69 @@ func TestProbeAntigravityQuotaCodeAssist_IdentifiesItselfAsTheAntigravityClient(
 		t.Errorf("fallback User-Agent=%q", got)
 	}
 }
+
+// The reply's account is resolved BEFORE its buckets are converted: the
+// evidence seam is asked with the account's fingerprint, and an all-omitted
+// reply that no evidence names is codeassist_bad_response — persisted as that
+// outcome only — with the finer "unplottable" fact noted in memory for the
+// account the attempt resolved.
+func TestProbeAntigravityQuotaCodeAssist_IdentityBeforeConversion(t *testing.T) {
+	helperStubAntigravityKeyring(t, helperStoredLogin())
+	_, userinfoCalls := helperCodeAssistServers(t,
+		func(string) (int, string) { return http.StatusOK, helperAllOmittedJSON },
+		helperUserinfoAda)
+	var askedFor []string
+	orig := antigravityExhaustionEvidenceFn
+	defer func() { antigravityExhaustionEvidenceFn = orig }()
+	antigravityExhaustionEvidenceFn = func(_ time.Time, fingerprint string) []antigravityExhaustionEvent {
+		askedFor = append(askedFor, fingerprint)
+		return nil
+	}
+	takeAntigravityCodeAssistAttempt()
+
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistBadResponse {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeCodeAssistBadResponse)
+	}
+	ada := fingerprintAccount("antigravity", "ada@example.com")
+	if atomic.LoadInt32(userinfoCalls) != 1 || len(askedFor) != 1 || askedFor[0] != ada {
+		t.Errorf("userinfo=%d evidence=%v, want the identity resolved before conversion", atomic.LoadInt32(userinfoCalls), askedFor)
+	}
+	if note := takeAntigravityCodeAssistAttempt(); !note.unplottable || note.fingerprint != ada {
+		t.Errorf("note=%+v, want an unplottable mark for ada", note)
+	}
+	if _, err := os.Stat(os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")); err == nil {
+		t.Error("an unplottable reply was cached")
+	}
+
+	// With evidence for ada's 5h reset, the same reply charts that bucket.
+	reset, _ := time.Parse(time.RFC3339, "2126-08-12T04:37:41Z")
+	antigravityExhaustionEvidenceFn = func(_ time.Time, fingerprint string) []antigravityExhaustionEvent {
+		return []antigravityExhaustionEvent{{resetAtMs: reset.UnixMilli(), fingerprint: fingerprint}}
+	}
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistOK {
+		t.Fatalf("outcome=%q with evidence, want ok", got)
+	}
+}
+
+// A 403 logs its status code and nothing of Google's body.
+func TestProbeAntigravityQuotaCodeAssist_RefusalLogsOnlyTheStatus(t *testing.T) {
+	helperStubAntigravityKeyring(t, helperStoredLogin())
+	helperCodeAssistServers(t,
+		func(string) (int, string) {
+			return http.StatusForbidden, `{"error":{"status":"PERMISSION_DENIED","message":"secret-reason-DO-NOT-LOG"}}`
+		},
+		helperUserinfoAda)
+	logged := captureStdout(t, func() {
+		if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistUnauthorized {
+			t.Errorf("outcome=%q, want unauthorized", got)
+		}
+	})
+	if !strings.Contains(logged, "refused with 403") {
+		t.Errorf("log=%q, want the status code", logged)
+	}
+	for _, leak := range []string{"PERMISSION_DENIED", "secret-reason", "ada@"} {
+		if strings.Contains(logged, leak) {
+			t.Errorf("log leaked %q: %q", leak, logged)
+		}
+	}
+}

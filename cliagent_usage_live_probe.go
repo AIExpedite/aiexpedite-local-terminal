@@ -711,6 +711,13 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 	ctx, cancel := context.WithTimeout(parent, antigravityLiveProbeTimeout)
 	defer cancel()
 
+	// The probe's own `agy` writes a run log; registered as the agent's OWN
+	// child, that log is never taken for a finished run owing a refresh. done()
+	// is deferred FIRST, so it runs last — after the kill-tree wait below — and
+	// a start failure or an early return still releases it.
+	child := beginAntigravityOwnChild(home)
+	defer child.done()
+
 	workDir, err := os.MkdirTemp("", "aix-agy-usage-")
 	if err != nil {
 		return liveProbeOutcomeSpawnFailed
@@ -728,6 +735,7 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 	if err := cmd.Start(); err != nil {
 		return liveProbeOutcomeSpawnFailed
 	}
+	child.setPID(cmd.Process.Pid)
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
