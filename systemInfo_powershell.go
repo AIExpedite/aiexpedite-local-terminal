@@ -238,19 +238,24 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 
 // manualCommand is what a person runs to allow local scripts in EVERY blocking
 // host. The hosts keep separate CurrentUser stores, so setting the policy in
-// one leaves the other restricted: unless Windows PowerShell is the only host
-// that blocks (the window a person opens by default), the setter is invoked
+// one leaves the other restricted. The bare setter is only unambiguous when
+// Windows PowerShell is the only host on the computer; once PowerShell 7 is
+// installed a person may paste into either window, so the setter is invoked
 // once per blocking host through that host's own executable.
 func (p *powerShellPolicyInfo) manualCommand() string {
 	var hosts []string
+	onlyWindowsHost := true
 	if p != nil {
 		for _, h := range p.Hosts {
+			if h.Host != powerShellHostWindows {
+				onlyWindowsHost = false
+			}
 			if h.BlocksLocalScripts {
 				hosts = append(hosts, h.Host)
 			}
 		}
 	}
-	if len(hosts) == 0 || (len(hosts) == 1 && hosts[0] == powerShellHostWindows) {
+	if len(hosts) == 0 || (onlyWindowsHost && len(hosts) == 1) {
 		return powerShellPolicyManualCommand
 	}
 	cmds := make([]string, 0, len(hosts))

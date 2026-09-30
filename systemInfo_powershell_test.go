@@ -248,8 +248,13 @@ func TestPowerShellPolicyManualCommandPerHost(t *testing.T) {
 	pwshOK.Host = powerShellHost7
 	winOK := psHost("RemoteSigned", allUndefined(map[string]string{"LocalMachine": "RemoteSigned"}))
 
-	if got := summarizePowerShellPolicy([]powerShellHostPolicy{win, pwshOK}).manualCommand(); got != powerShellPolicyManualCommand {
-		t.Fatalf("Windows PowerShell only: got %q", got)
+	if got := summarizePowerShellPolicy([]powerShellHostPolicy{win}).manualCommand(); got != powerShellPolicyManualCommand {
+		t.Fatalf("no PowerShell 7 installed: got %q", got)
+	}
+	// PowerShell 7 is installed but permissive: pasting the bare setter into a
+	// pwsh window would leave Windows PowerShell blocked.
+	if got := summarizePowerShellPolicy([]powerShellHostPolicy{win, pwshOK}).manualCommand(); got != `powershell -NoProfile -Command "`+powerShellPolicyManualCommand+`"` {
+		t.Fatalf("Windows PowerShell blocks alongside a permissive pwsh: got %q", got)
 	}
 	want := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"; pwsh -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
 	both := summarizePowerShellPolicy([]powerShellHostPolicy{win, pwsh})
