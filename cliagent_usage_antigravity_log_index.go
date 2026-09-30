@@ -589,6 +589,10 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 	type newestName struct {
 		path, base string
 		nameAt     time.Time
+		// orderAt ranks the name among the newest: its stamp, or the zero time
+		// for an unstamped (legacy) name, so such names never crowd out the
+		// stamped ones every current agy writes.
+		orderAt time.Time
 	}
 	var newest []newestName
 	for _, base := range bases {
@@ -603,8 +607,12 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		for _, name := range names {
 			current[name] = struct{}{}
 			path := filepath.Join(dir, name)
-			nameAt, _ := antigravityLogNameTime(name, now)
-			newest = append(newest, newestName{path: path, base: base, nameAt: nameAt})
+			nameAt, stamped := antigravityLogNameTime(name, now)
+			orderAt := nameAt
+			if !stamped {
+				orderAt = time.Time{}
+			}
+			newest = append(newest, newestName{path: path, base: base, nameAt: nameAt, orderAt: orderAt})
 			isNew := false
 			if !idx.primed {
 				// Startup scan: names at or after the cached reading, less the
@@ -640,7 +648,7 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 
 	// Watched set: the newest names, then every owned / candidate / noPID /
 	// grace entry. A size or mtime change reclassifies the file.
-	sort.SliceStable(newest, func(i, j int) bool { return newest[i].nameAt.After(newest[j].nameAt) })
+	sort.SliceStable(newest, func(i, j int) bool { return newest[i].orderAt.After(newest[j].orderAt) })
 	if len(newest) > antigravityWatchedNewest {
 		newest = newest[:antigravityWatchedNewest]
 	}
@@ -1322,9 +1330,14 @@ func antigravityIndexTracksPIDLocked(pid int) bool {
 
 // antigravityNewestOwedLog is the gather's view: the newest owe-ready floor
 // under bases (zero when none). It runs a pass, so a gather sees what the tick
-// would, but never nudges — the gather does that itself.
+// would, but never nudges — the gather does that itself — and never runs the
+// sentinel's process scan (a PowerShell child of about a second): that would
+// spend the gather budget every provider shares. The tick owns that scan.
 func antigravityNewestOwedLog(bases []string, now time.Time) time.Time {
-	return antigravityDiscover(bases, now)
+	res := antigravityDiscoveryPass(bases, now, cachedAntigravityObservedMs())
+	res.needScan = false
+	antigravityApplyDiscovery(res, now)
+	return res.owed
 }
 
 // resetAntigravityLogIndex clears the index. Tests only.

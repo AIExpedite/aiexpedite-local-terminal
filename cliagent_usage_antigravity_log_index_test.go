@@ -770,3 +770,45 @@ func TestProcessStartHook(t *testing.T) {
 	processStartHookFrom(context.Background())(7) // no hook: no panic
 	processStartHookFrom(nil)(7)
 }
+
+// The gather's pass never runs the sentinel's process scan (it would spend the
+// shared gather budget on a PowerShell child); the tick's pass does.
+func TestAntigravityNewestOwedLog_NeverRunsTheSentinelScan(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	var scans atomic.Int64
+	antigravityProcessScan = func() ([]ProcessInfo, bool) { scans.Add(1); return nil, false }
+	lockAntigravityLogIndex()
+	antigravityLogIndex.sentinel = &antigravitySentinel{firstSeen: time.Now()}
+	unlockAntigravityLogIndex()
+
+	antigravityNewestOwedLog([]string{h.base}, time.Now())
+	if scans.Load() != 0 {
+		t.Errorf("the gather's pass ran %d process scans, want none", scans.Load())
+	}
+	h.pass(time.Now(), 0)
+	if scans.Load() != 1 {
+		t.Errorf("the tick's pass ran %d process scans, want one", scans.Load())
+	}
+}
+
+// Unstamped (legacy) names never crowd the stamped ones out of the newest
+// watched names: a settled stamped log appended to after 40 unstamped logs
+// exist is still re-stat'ed and reclassified.
+func TestAntigravityDiscovery_UnstampedNamesDoNotCrowdTheWatchedSet(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour).Truncate(time.Second)
+	// A managed run's log: settled, so only the newest-name watch re-stats it.
+	noteAntigravityManagedPID(70001)
+	stamped := h.write(t, helperLogName(now), helperPIDBlock(70001), now, false)
+	for i := 0; i < 40; i++ {
+		h.write(t, fmt.Sprintf("legacy-%02d.log", i), "I0929 starting\n", now, false)
+	}
+	h.pass(now.Add(time.Second), now.Add(time.Hour).UnixMilli())
+
+	h.setLive(70002, true)
+	h.write(t, filepath.Base(stamped), helperPIDBlock(70002), now.Add(2*time.Second), true)
+	h.pass(now.Add(10*time.Second), now.Add(time.Hour).UnixMilli())
+	if class, _ := helperEntryClass(stamped); class != antigravityLogCandidate {
+		t.Errorf("class=%v, want the stamped log still watched and reclassified", class)
+	}
+}
