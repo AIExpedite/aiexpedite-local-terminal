@@ -10,7 +10,7 @@
 // maintenance harness needs a fresh answer for.
 //
 // The identity hashes the shim's own bytes plus the package.json of the
-// `opencode-ai` package and of each `opencode-*` platform package it may
+// `opencode-ai` package and of each `opencode-windows-*` platform package it may
 // resolve, so any npm replacement changes it. Bounded by construction:
 // at most openCodeIdentityMaxFiles files, openCodeIdentityMaxFileBytes each,
 // only paths inside the shim's directory tree, regular files only. A native
@@ -37,6 +37,10 @@ const (
 	openCodeIdentityMaxFileBytes = 64 << 10
 	// openCodeIdentityPackageName is the npm package the shim launches.
 	openCodeIdentityPackageName = "opencode-ai"
+	// openCodeIdentityPlatformPrefix names the per-platform binary packages
+	// opencode-ai installs (opencode-windows-x64, …-baseline, …-arm64). Only a
+	// Windows shim is hashed, so only Windows platform packages can apply.
+	openCodeIdentityPlatformPrefix = "opencode-windows-"
 )
 
 // openCodeIdentityMissing is hashed in place of a file that is absent or
@@ -76,7 +80,7 @@ func openCodeShimPackageIdentity(shimPath string) string {
 }
 
 // openCodeShimIdentityFiles lists, in a stable order, the files the identity
-// covers: the shim, the opencode-ai manifest, then each opencode-* platform
+// covers: the shim, the opencode-ai manifest, then each opencode-windows-* platform
 // package manifest nested under opencode-ai or installed beside it. Capped at
 // openCodeIdentityMaxFiles.
 func openCodeShimIdentityFiles(shimPath string) []string {
@@ -84,14 +88,15 @@ func openCodeShimIdentityFiles(shimPath string) []string {
 	pkg := filepath.Join(modules, openCodeIdentityPackageName)
 	files := []string{shimPath, filepath.Join(pkg, "package.json")}
 	for _, dir := range []string{filepath.Join(pkg, "node_modules"), modules} {
-		matches, _ := filepath.Glob(filepath.Join(dir, "opencode-*", "package.json"))
+		// The platform-package prefix, not a bare `opencode-*`: npm's global
+		// node_modules can hold unrelated `opencode-*` packages (plugins) that
+		// would otherwise crowd the real platform package out of the file cap
+		// and churn the identity whenever they update.
+		matches, _ := filepath.Glob(filepath.Join(dir, openCodeIdentityPlatformPrefix+"*", "package.json"))
 		sort.Strings(matches)
 		for _, match := range matches {
 			if len(files) >= openCodeIdentityMaxFiles {
 				return files
-			}
-			if filepath.Base(filepath.Dir(match)) == openCodeIdentityPackageName {
-				continue // already the second entry
 			}
 			files = append(files, match)
 		}

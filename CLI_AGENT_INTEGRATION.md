@@ -1722,7 +1722,7 @@ the transport change the evidence selects ships separately.
   `opencode.cmd` and leaves the shim byte-identical, so every (path, mtime, size)
   cache survived the upgrade. `openCodeBinaryIdentity`
   ([opencode_binary_identity.go](opencode_binary_identity.go)) is a SHA-256 over
-  the shim, `node_modules/opencode-ai/package.json` and each `opencode-*`
+  the shim, `node_modules/opencode-ai/package.json` and each `opencode-windows-*`
   platform package manifest nested under it or beside it — at most 8 files of at
   most 64 KiB, only paths inside the shim's tree and only regular files, a
   missing file hashed as a fixed

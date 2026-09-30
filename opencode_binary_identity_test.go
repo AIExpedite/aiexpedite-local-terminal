@@ -118,7 +118,7 @@ func TestOpenCodeShimIdentityFiles_AreBoundedInCountAndSize(t *testing.T) {
 	shim := openCodeShimFixture(t)
 	modules := filepath.Join(filepath.Dir(shim), "node_modules")
 	for i := 0; i < 20; i++ {
-		writeIdentityFile(t, filepath.Join(modules, "opencode-extra-"+string(rune('a'+i)), "package.json"), `{}`)
+		writeIdentityFile(t, filepath.Join(modules, "opencode-windows-extra-"+string(rune('a'+i)), "package.json"), `{}`)
 	}
 	files := openCodeShimIdentityFiles(shim)
 	if len(files) != openCodeIdentityMaxFiles {
@@ -209,5 +209,24 @@ func TestOpenCodeShimPackageIdentity_ANonRegularManifestIsTheMissingToken(t *tes
 	}
 	if got := openCodeShimPackageIdentity(shim); got != absent {
 		t.Fatal("a directory named package.json must hash exactly like a missing manifest")
+	}
+}
+
+// An unrelated `opencode-*` package in npm's global node_modules (a plugin) is
+// neither hashed nor able to crowd the real platform package out of the cap.
+func TestOpenCodeShimIdentityFiles_IgnoreUnrelatedOpenCodePackages(t *testing.T) {
+	shim := openCodeShimFixture(t)
+	before := openCodeShimPackageIdentity(shim)
+	modules := filepath.Join(filepath.Dir(shim), "node_modules")
+	for i := 0; i < 20; i++ {
+		writeIdentityFile(t, filepath.Join(modules, "opencode-plugin-"+string(rune('a'+i)), "package.json"), `{}`)
+	}
+	if openCodeShimPackageIdentity(shim) != before {
+		t.Fatal("unrelated opencode-* packages changed the identity")
+	}
+	for _, f := range openCodeShimIdentityFiles(shim) {
+		if strings.Contains(f, "opencode-plugin-") {
+			t.Fatalf("identity reads an unrelated package: %s", f)
+		}
 	}
 }
