@@ -168,6 +168,10 @@ type antigravityRunCapture struct {
 
 	mu  sync.Mutex
 	pid int
+	// finished is set by Finish once it has stopped waiting for the resolver.
+	// A scan that returns after that must not record a PID: the run is over,
+	// and the PID it found may already belong to somebody else's process.
+	finished bool
 	// resolverStop ends the wrapper resolver; nil while none runs.
 	resolverStop chan struct{}
 	resolverDone chan struct{}
@@ -184,6 +188,12 @@ var (
 	antigravityWrapperRampScans = 6
 	antigravityWrapperScanEvery = 5 * time.Second
 	antigravityWrapperMaxScans  = 60
+	// antigravityWrapperFinishGrace bounds how long Finish waits for a scan
+	// that is already in flight when the command returns. A scan normally
+	// takes about a second, but a stalled WMI/CIM provider can hang far
+	// longer, and the execute path must not be held open behind it: past the
+	// grace the run settles without the resolver's PID.
+	antigravityWrapperFinishGrace = 3 * time.Second
 	// antigravityAncestryScan is the resolver's scan seam.
 	antigravityAncestryScan = ScanProcessAncestryChecked
 )
@@ -194,7 +204,7 @@ func (c *antigravityRunCapture) SetPID(pid int) {
 		return
 	}
 	c.mu.Lock()
-	if c.pid != 0 {
+	if c.pid != 0 || c.finished {
 		c.mu.Unlock()
 		return
 	}
@@ -214,7 +224,7 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 		return
 	}
 	c.mu.Lock()
-	if c.pid != 0 {
+	if c.pid != 0 || c.finished {
 		c.mu.Unlock()
 		return
 	}
@@ -296,9 +306,19 @@ func (c *antigravityRunCapture) Finish() {
 		c.mu.Unlock()
 		if stop != nil {
 			close(stop)
-			<-done
+			// Wait for a scan already in flight — it may be the one that
+			// resolves this run — but only for the grace: the resolver runs an
+			// external process table query on Windows, and a provider that
+			// never answers must not hold the command's return path open.
+			grace := time.NewTimer(antigravityWrapperFinishGrace)
+			select {
+			case <-done:
+			case <-grace.C:
+			}
+			grace.Stop()
 		}
 		c.mu.Lock()
+		c.finished = true
 		pid := c.pid
 		c.mu.Unlock()
 		noteAntigravityManagedPIDExited(pid)

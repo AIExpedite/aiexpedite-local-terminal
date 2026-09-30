@@ -361,13 +361,24 @@ func TestAntigravityStaleRegression_ABurstOfRunsIsBounded(t *testing.T) {
 /* ─────────── discovery, managed-run evidence and update survival ─────────── */
 
 // helperPinFreshnessClock pins the freshness clock (the discovery tick, the
-// nudge and the debt worker all read it) and returns a setter.
+// nudge and the debt worker all read it) and returns a setter. Cleanup releases
+// the pin from inside the installed function rather than restoring the package
+// variable: a debt worker this test started can outlive it, and writing the
+// variable while that worker reads it is a data race.
 func helperPinFreshnessClock(t *testing.T, at time.Time) func(time.Time) {
 	t.Helper()
 	orig := antigravityUsageFreshnessNow
-	t.Cleanup(func() { antigravityUsageFreshnessNow = orig })
 	var mu sync.Mutex
-	antigravityUsageFreshnessNow = func() time.Time { mu.Lock(); defer mu.Unlock(); return at }
+	pinned := true
+	antigravityUsageFreshnessNow = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		if !pinned {
+			return orig()
+		}
+		return at
+	}
+	t.Cleanup(func() { mu.Lock(); pinned = false; mu.Unlock() })
 	return func(next time.Time) { mu.Lock(); at = next; mu.Unlock() }
 }
 

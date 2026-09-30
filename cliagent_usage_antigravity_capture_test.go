@@ -1075,3 +1075,55 @@ func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
 		helperStopCapture(t, wrapped.Finish)
 	}
 }
+
+// Finish must not hold the command's return path open behind a scan that never
+// answers (a wedged WMI/CIM provider): it waits at most the grace, then settles
+// the run without the resolver's PID. A PID the stalled scan reports after that
+// is dropped — the run is over, and the PID may already be somebody else's.
+func TestAntigravityRunCapture_FinishBoundsTheResolverWait(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan, origGrace := antigravityAncestryScan, antigravityWrapperFinishGrace
+	defer func() { antigravityAncestryScan, antigravityWrapperFinishGrace = origScan, origGrace }()
+	antigravityWrapperFinishGrace = 50 * time.Millisecond
+
+	release := make(chan struct{})
+	scanning := make(chan struct{}, 1)
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		select {
+		case scanning <- struct{}{}:
+		default:
+		}
+		<-release // a provider that never answers
+		return []ProcessInfo{{PID: 801, Name: "agy.exe"}}, true
+	}
+	defer close(release)
+
+	capture := startAntigravityQuotaCapture("wedged scan")
+	capture.SetWrapper(800)
+	select {
+	case <-scanning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resolver never started its first scan")
+	}
+
+	returned := make(chan struct{})
+	go func() { defer close(returned); capture.Finish() }()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Finish blocked on the stalled ancestry scan instead of bounding the wait")
+	}
+
+	release <- struct{}{} // let the stalled scan report its PID, too late
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid != 0 {
+			t.Fatalf("pid=%d recorded after Finish, want the late scan dropped", pid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

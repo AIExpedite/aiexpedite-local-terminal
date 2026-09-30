@@ -24,10 +24,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // scanBackend selects how we query the Windows process table. Decided lazily
@@ -60,15 +62,29 @@ const (
 	ancestryMaxDepth = 3
 )
 
+// processScanTimeout bounds one scan query. Get-CimInstance answers in about a
+// second, but a wedged WMI/CIM provider can hang indefinitely, and callers —
+// the Antigravity wrapper resolver most of all — wait on the result inline.
+// A timed-out scan is a failed scan: ok=false, never an empty process table.
+const processScanTimeout = 20 * time.Second
+
 // runProcessScanCommand runs one scan command and returns both streams. A seam
 // so tests can drive the checked-scan rules without the real process table.
 var runProcessScanCommand = func(name string, args ...string) (stdout, stderr []byte, err error) {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), processScanTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	hideWindow(cmd)
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
 	err = cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Report the timeout itself: a killed query can leave partial output
+		// on stdout, which the empty-vs-failed rules would otherwise read as
+		// a valid (possibly empty) table.
+		return nil, errOut.Bytes(), fmt.Errorf("process scan timed out after %s: %w", processScanTimeout, ctxErr)
+	}
 	return out.Bytes(), errOut.Bytes(), err
 }
 
