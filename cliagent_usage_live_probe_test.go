@@ -855,8 +855,8 @@ func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
 	if spawnedUnder == currentCodexAccountFingerprint() {
 		t.Fatal("fixture must sign a different account in than the one spawned")
 	}
-	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChanged {
-		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChanged)
+	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChangedAfterRead {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChangedAfterRead)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
 		t.Errorf("a reading from another account must not be cached (stat err=%v)", err)
@@ -1274,5 +1274,26 @@ func TestProbeAntigravityQuotaLive_OwnChild(t *testing.T) {
 	unlockAntigravityLogIndex()
 	if owned != 1 {
 		t.Errorf("owned=%d, want the probe's log owned", owned)
+	}
+}
+
+// A read the capture path refuses (here: a window with neither a usage figure
+// nor a reset) reached OpenAI but changed nothing. It must not log as `ok`: it
+// reports not_merged, costs a read, and books the after-read rung.
+func TestCodexLiveProbeConverse_RefusedReadReportsNotMerged(t *testing.T) {
+	cache := isolateCodexCache(t)
+	stdin, stdout, _ := fakeCodexAppServer(t, `{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300}}}}`)
+	got := codexLiveProbeConverse(stdin, stdout, currentCodexAccountFingerprint(), currentCodexUsageCaptureVersion())
+	if got != liveProbeOutcomeNotMerged {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeNotMerged)
+	}
+	if _, ok := loadCodexRateLimitSnapshot(cache); ok {
+		t.Fatal("a refused read must not write the cache")
+	}
+	if !codexLiveReadOutbound(got) {
+		t.Fatal("not_merged reached the provider and must count as outbound")
+	}
+	if kind := codexLiveReadRetryKind(got, false); kind != codexRetryAfterRead {
+		t.Fatalf("retry kind = %v, want codexRetryAfterRead", kind)
 	}
 }

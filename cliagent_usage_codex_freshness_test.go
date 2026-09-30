@@ -501,14 +501,13 @@ func TestCodexForcedReconcile_WaitsForContendedCacheLock(t *testing.T) {
 		t.Fatalf("precondition: routine scan committed under a held lock (observedAt %s)", got)
 	}
 
-	var res codexReconcileResult
 	var ran bool
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		res, ran, _, _ = codexRunGatedReconcile(ctx, f.home, f.fp, runStart, true, time.Now())
+		_, ran, _, _ = codexRunGatedReconcile(ctx, f.home, f.fp, runStart, true, time.Now())
 	}()
 	time.Sleep(150 * time.Millisecond)
 	codexRateLimitMu.Unlock()
@@ -517,7 +516,7 @@ func TestCodexForcedReconcile_WaitsForContendedCacheLock(t *testing.T) {
 	if !ran {
 		t.Fatal("forced reconcile did not run")
 	}
-	if got := metricObservedAt(t, codexSessionMetric(t, res.metrics)); got.UnixMilli() < runStart.UnixMilli() {
+	if got := metricObservedAt(t, codexSessionMetric(t, codexMetricsFromCache(time.Now(), f.fp))); got.UnixMilli() < runStart.UnixMilli() {
 		t.Fatalf("contended forced reconcile dropped the run's evidence; observedAt=%s", got)
 	}
 }

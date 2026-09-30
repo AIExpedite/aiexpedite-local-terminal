@@ -87,6 +87,19 @@ type canonicalCLIUsageProvider struct {
 	Notice               string                         `json:"notice,omitempty"`
 	NoticeSeverity       string                         `json:"noticeSeverity,omitempty"`
 	NoticeURL            string                         `json:"noticeUrl,omitempty"`
+	// UsageGeneration is signed so the backend records the capture generation
+	// it applied from this receipt. Absent stays absent: a receipt without it
+	// canonicalises byte-identically to one from an agent that predates it.
+	UsageGeneration *cliUsageGeneration `json:"usageGeneration,omitempty"`
+}
+
+// cliUsageMaxSafeInteger is JavaScript's Number.MAX_SAFE_INTEGER: a generation
+// the backend could not represent exactly is refused rather than signed.
+const cliUsageMaxSafeInteger = int64(1)<<53 - 1
+
+func validCLIUsageGeneration(g *cliUsageGeneration) bool {
+	return g == nil || (g.Epoch >= 0 && g.Epoch <= cliUsageMaxSafeInteger &&
+		g.Counter >= 0 && g.Counter <= cliUsageMaxSafeInteger)
 }
 
 func canonicalFloat(value *float64) (*string, error) {
@@ -159,7 +172,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 		}
 	}
-	if len(agent.ModelDetails) > cliUsageMaxModelsPerProvider {
+	if len(agent.ModelDetails) > cliUsageMaxModelsPerProvider || !validCLIUsageGeneration(agent.UsageGeneration) {
 		return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 	}
 	var modelDetails []canonicalCLIUsageModelDetail
@@ -221,6 +234,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 		Authenticated: agent.Authenticated, AuthState: agent.AuthState,
 		LoginExpiresAt: agent.LoginExpiresAt, LoginExpirationState: agent.LoginExpirationState,
 		Notice: agent.Notice, NoticeSeverity: agent.NoticeSeverity, NoticeURL: agent.NoticeURL,
+		UsageGeneration: agent.UsageGeneration,
 	}, nil
 }
 

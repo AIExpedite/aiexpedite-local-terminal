@@ -302,7 +302,7 @@ func TestAntigravityUtilization_PublishedShapeUnchanged(t *testing.T) {
 		v    any
 		want string
 	}{
-		{"cliAgentUsage", cliAgentUsage{}, "account accountFingerprint authState authenticated cliAgentId collectedAt dataSource loginExpirationState loginExpiresAt metrics model modelDetails models modelsExhaustive name notice noticeSeverity noticeUrl path plan provider version"},
+		{"cliAgentUsage", cliAgentUsage{}, "account accountFingerprint authState authenticated cliAgentId collectedAt dataSource loginExpirationState loginExpiresAt metrics model modelDetails models modelsExhaustive name notice noticeSeverity noticeUrl path plan provider usageGeneration version"},
 		{"cliAgentUsageMetric", cliAgentUsageMetric{}, "consumed kind label model observedAt remaining resetAt total unit unknown"},
 	} {
 		if got := jsonNames(tc.v); got != tc.want {

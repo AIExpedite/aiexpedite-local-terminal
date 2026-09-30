@@ -175,8 +175,8 @@ func TestCLIUsageReceiptCarriesModelPool(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 5 {
-		t.Fatal("expected five shared vectors")
+	if len(vectors.Vectors) < 5 {
+		t.Fatal("expected the model-details-with-pool shared vector")
 	}
 	vector := vectors.Vectors[4]
 	if vector.Name != "model-details-with-pool" || string(canonical) != vector.Canonical {

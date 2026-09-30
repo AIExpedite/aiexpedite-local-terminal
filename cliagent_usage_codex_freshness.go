@@ -904,6 +904,9 @@ type codexRunFreshnessState struct {
 	fallback string
 	// liveReads is the debt's RefreshLiveReads: reads that reached OpenAI.
 	liveReads int
+	// earlyRead is the debt identity whose early live read is reserved
+	// (EarlyReadFloorMs / EarlyReadOwedAtMs), the zero id when none.
+	earlyRead codexDebtID
 	// nextAttemptAt is the booked rung (NextAttemptAtMs), zero when none.
 	nextAttemptAt time.Time
 	// expiredFloor is the floor from the marker codexRetireExpiredRunDebt left for
@@ -921,6 +924,7 @@ func codexRunFreshnessFromView(view codexCacheView, now time.Time) codexRunFresh
 		attempts:     view.refreshOwedAttempts,
 		fallback:     view.refreshFallback,
 		liveReads:    view.refreshLiveReads,
+		earlyRead:    codexDebtID{floorMs: view.earlyReadFloorMs, owedAtMs: view.earlyReadOwedAtMs},
 		codexVersion: view.codexVersion,
 	}
 	if view.nextAttemptAtMs > 0 {
@@ -1697,12 +1701,15 @@ func codexPayRunRefreshAttempts(base, fp string) (codexRunFreshnessState, codexR
 			// instead of paying for more scans than its bound allows.
 			return state, codexRetryNone, true
 		}
-		if !codexAwaitGatedReconcile(base, fp, state.floor) {
+		ran, fenced := codexAwaitGatedReconcile(base, fp, state.floor)
+		if !ran {
 			// Shutting down or the gate was reset: nothing was sent, so nothing
 			// is spent. The rung on disk stands (codexScheduleRunDebtRetry writes
 			// nothing while disarmed) and the next process re-arms it.
 			return state, codexRetryFree, false
 		}
+		// The detecting scan is THIS attempt, fenced or not, so the scan bound
+		// is unchanged by an escalation below.
 		codexRecordRefreshAttempt(fp, state.debtID(), 1)
 		// Re-read: the reconcile commits through the blocking merge, so it may
 		// have paid the debt in that same write.
@@ -1717,8 +1724,114 @@ func codexPayRunRefreshAttempts(base, fp string) (codexRunFreshnessState, codexR
 			// resolved to `exhausted` without ever having run.
 			return after, codexRetryNone, true
 		}
+		if fenced {
+			if paid := codexEscalateFencedRollout(fp, after); !paid.owed {
+				return paid, codexRetryNone, false
+			}
+		}
+		// The ordinary next scan rung, with the remaining attempts intact —
+		// whether or not an early read was taken and missed.
 		return after, codexRetryAfterScan, false
 	}
+}
+
+/* ─────────────────────────── fenced escalation ─────────────────────────── */
+
+// codexEscalateFencedRollout spends a debt's ONE early live read, in the same
+// pass, when a forced scan found the run's rollout era rejected by the account
+// fence (fencedSinceFloor). The fence is not relaxed — a rollout started before
+// the latest auth.json write stays rejected, because a same-account token
+// refresh cannot be told apart from an A→B→A switch — so waiting out the rest of
+// the scan ladder (about 20 minutes) before the account-pinned read that CAN pay
+// it bought nothing.
+//
+// The read is one of the debt's codexRefreshLiveReadMaxAttempts reads, pinned to
+// the debt's account and bounded by the offline gate and the shared cooldown
+// exactly like the final fallback (codexLiveUsageFallback). It is taken at most
+// once per debt, across rungs and restarts: the full debt identity is reserved
+// on disk BEFORE the request (codexReserveEarlyLiveRead), and no read is issued
+// without that reservation. A read that sent nothing releases it; one that went
+// out keeps it, so even a refused counter write followed by a restart cannot
+// authorize a second early read.
+//
+// It returns the debt as it stands afterwards; the caller books the ordinary
+// scan rung when it is still owed.
+func codexEscalateFencedRollout(fp string, state codexRunFreshnessState) codexRunFreshnessState {
+	id := state.debtID()
+	if !codexEarlyLiveReadOpen(fp, state) || !codexReserveEarlyLiveRead(fp, id) {
+		return state
+	}
+	fmt.Printf("%s[cli-usage] codex post-run rollout fenced by account guard; early live read reserved%s\n", colorCyan, colorReset)
+	if _, outbound := codexLiveUsageFallbackOutbound(fp, state); !outbound {
+		// Nothing left the device (offline, cooldown, spawn failure, account
+		// changed…): give the opportunity back so a later rung can take it. A
+		// refused release loses it — the safe direction: the debt keeps its full
+		// read budget for the final fallback and never gains a read.
+		codexReleaseEarlyLiveRead(fp, id)
+	}
+	return codexRunFreshnessForAccount(fp, codexUsageFreshnessNow())
+}
+
+// codexEarlyLiveReadOpen is the early read's gate: this debt's early opportunity
+// is unclaimed — judged on the full {floor, owedAt} identity, never one
+// timestamp — and no live read has been spent on it, on disk or retained after a
+// refused counter write.
+func codexEarlyLiveReadOpen(fp string, state codexRunFreshnessState) bool {
+	id := state.debtID()
+	return id.valid() && state.earlyRead != id &&
+		state.liveReads+codexUsageRefresh.peekLiveReads(fp, id) == 0
+}
+
+// codexReserveEarlyLiveRead persists the reservation for debt `id`, guarded on
+// the debt still being that generation, the gate still open, and the snapshot
+// still the account's. Reports whether it committed; false means no early read
+// this pass.
+func codexReserveEarlyLiveRead(fp string, id codexDebtID) bool {
+	return codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs ||
+			(snap.EarlyReadFloorMs == id.floorMs && snap.EarlyReadOwedAtMs == id.owedAtMs) || snap.RefreshLiveReads > 0 {
+			return false
+		}
+		snap.EarlyReadFloorMs, snap.EarlyReadOwedAtMs = id.floorMs, id.owedAtMs
+		return true
+	})
+}
+
+// codexReleaseEarlyLiveRead clears debt `id`'s reservation after an early read
+// that sent nothing, under the same generation guard.
+func codexReleaseEarlyLiveRead(fp string, id codexDebtID) {
+	codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.EarlyReadFloorMs != id.floorMs || snap.EarlyReadOwedAtMs != id.owedAtMs {
+			return false
+		}
+		snap.EarlyReadFloorMs, snap.EarlyReadOwedAtMs = 0, 0
+		return true
+	})
+}
+
+// codexChargeReservedEarlyRead records debt `id`'s reserved early read as one
+// spent live read when no count for it is on disk, and returns the debt's
+// persisted read count. ok false (refused, or the debt moved on) means no read
+// this pass. A reservation whose release write was refused is charged too although
+// nothing went out — the safe direction: one read fewer, never one more.
+func codexChargeReservedEarlyRead(fp string, id codexDebtID) (reads int, ok bool) {
+	var already bool
+	committed := codexRateLimitCacheTransaction(context.Background(), codexRateLimitCachePath(), codexUsageFreshnessNow(), true, func(snap *codexRateLimitSnapshot) bool {
+		if snap.AccountFingerprint != fp || snap.RefreshOwedAtMs != id.owedAtMs || snap.RunFloorMs != id.floorMs ||
+			snap.EarlyReadFloorMs != id.floorMs || snap.EarlyReadOwedAtMs != id.owedAtMs {
+			return false
+		}
+		if snap.RefreshLiveReads > 0 {
+			reads, already = snap.RefreshLiveReads, true
+			return false
+		}
+		snap.RefreshLiveReads = 1
+		return true
+	})
+	if already {
+		return reads, true
+	}
+	return 1, committed
 }
 
 // codexRecordRefreshAttempt counts `spent` attempts against fp's debt, folding
@@ -1800,30 +1913,31 @@ func codexFlushPendingRunDebt(fp string) bool {
 // codexAwaitGatedReconcile runs one background forced reconcile, waiting (at
 // most once each) for an in-flight reconcile to finish or for the interval to
 // admit it. Reports false only when the process is shutting down or the gate
-// was reset.
-func codexAwaitGatedReconcile(base, fp string, floor time.Time) bool {
+// was reset. fenced relays the reconcile's fencedSinceFloor
+// (codexRolloutNudgeEvidence) when it ran.
+func codexAwaitGatedReconcile(base, fp string, floor time.Time) (ok, fenced bool) {
 	for try := 0; try < 3; try++ {
 		ctx, cancel := context.WithTimeout(context.Background(), codexForcedReconcileBudget)
-		_, ran, busy, wait := codexRunGatedReconcile(ctx, base, fp, floor, false, codexUsageFreshnessNow())
+		res, ran, busy, wait := codexRunGatedReconcile(ctx, base, fp, floor, false, codexUsageFreshnessNow())
 		cancel()
 		switch {
 		case ran:
-			return true
+			return true, res.rollouts.fencedSinceFloor
 		case busy != nil:
 			select {
 			case <-busy:
 			case <-shutdownChan:
-				return false
+				return false, false
 			case <-codexUsageRefresh.cancelCh():
-				return false
+				return false, false
 			}
 		default:
 			if !codexUsageRefresh.sleep(wait) {
-				return false
+				return false, false
 			}
 		}
 	}
-	return true // counted as an attempt; the debt stays for the next one
+	return true, false // counted as an attempt; the debt stays for the next one
 }
 
 // codexLiveUsageFallbackTries bounds how often ONE INVOCATION of the fallback
@@ -1838,7 +1952,10 @@ const codexLiveUsageFallbackTries = 2
 // a two-read budget.
 //
 // An unrecognised outcome from a newer producer is treated as OUTBOUND, so an
-// unknown result can never loop for free.
+// unknown result can never loop for free. liveProbeOutcomeNotMerged is outbound
+// by definition: the read answered, the merge refused it. So is
+// liveProbeOutcomeAccountChangedAfterRead; only the pre-spawn account_changed
+// sent nothing.
 func codexLiveReadOutbound(outcome string) bool {
 	switch outcome {
 	case liveProbeOutcomeSpawnFailed, liveProbeOutcomeAccountChanged,
@@ -1853,12 +1970,11 @@ func codexLiveReadOutbound(outcome string) bool {
 // OpenAI and left the debt standing books afterRead; a refusal that sent nothing
 // books free; a cooldown books spacing.
 //
-// `settled` is a fact separate from `ok` because the probe reports the RPC, not
-// the merge: codexLiveProbeConverse hands its frame to
-// captureCodexRateLimitLineFromProducer and returns liveProbeOutcomeOK without
-// consulting the boolean that says whether the reading landed. A window refused
-// as stale or reset-only, or a cache write refused under contention, therefore
-// answers `ok` with the debt still on disk. Booking nothing there ended the
+// `settled` is a fact separate from `ok`: a read that merged (`ok`) may still
+// not cover THIS debt's floor. A read the capture path refused outright — a
+// window refused as stale or reset-only, or a cache write refused under
+// contention — answers liveProbeOutcomeNotMerged, which reached OpenAI and so
+// books afterRead like any failed read. Booking nothing for either ended the
 // ladder on a read that paid nothing, and the worker then resolved the
 // outstanding fallback to `exhausted`, so the second read the budget promises
 // was never run.
@@ -1891,8 +2007,8 @@ func codexRunDebtStillOwed(fp string, id codexDebtID) bool {
 	return state.owed && state.debtID() == id
 }
 
-// codexLiveReadLandedSuffix annotates the one outcome whose name does not settle
-// the question on its own. Fixed labels only, like every other line this path
+// codexLiveReadLandedSuffix annotates an `ok` that merged a reading which still
+// did not settle this debt. Fixed labels only, like every other line this path
 // prints (cliagent_usage_codex_redaction_test.go).
 func codexLiveReadLandedSuffix(outcome string, settled bool) string {
 	if outcome != liveProbeOutcomeOK || settled {
@@ -1928,9 +2044,29 @@ var codexLiveUsageFallbackRead = func(ctx context.Context, fp string) string {
 // run returns account_changed and the reading is dropped rather than booked
 // against the account that made the run.
 func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDebtRetryKind {
+	kind, _ := codexLiveUsageFallbackOutbound(fp, state)
+	return kind
+}
+
+// codexLiveUsageFallbackOutbound is codexLiveUsageFallback plus whether a read
+// may have left the device — every outcome codexLiveReadOutbound counts, and a
+// read cancelled mid-flight (it may have gone out). The early read releases its
+// reservation only when this is false.
+func codexLiveUsageFallbackOutbound(fp string, state codexRunFreshnessState) (kind codexRunDebtRetryKind, outbound bool) {
 	id := state.debtID()
 	if !id.valid() || state.fallback == codexFallbackExhausted {
-		return codexRetryNone
+		return codexRetryNone, false
+	}
+	if state.earlyRead == id && state.liveReads+codexUsageRefresh.peekLiveReads(fp, id) == 0 {
+		// A held reservation means the early read went out, yet no count survived:
+		// its counter write was refused and the retained count died with the
+		// previous process. Charge it on disk BEFORE this read, so the reads that
+		// follow are counted on top of it and the budget stays two in total.
+		reads, ok := codexChargeReservedEarlyRead(fp, id)
+		if !ok {
+			return codexRetrySpacing, false
+		}
+		state.liveReads = reads
 	}
 	// The budget counts reads on disk PLUS any whose counter write the bounded
 	// cache locks refused (peeked, not consumed: consuming here would lose the
@@ -1938,23 +2074,23 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 	// refused write would re-authorize a read the debt had already spent.
 	if state.liveReads+codexUsageRefresh.peekLiveReads(fp, id) >= codexRefreshLiveReadMaxAttempts {
 		codexSetRefreshFallback(fp, id, codexFallbackExhausted)
-		return codexRetryNone
+		return codexRetryNone, false
 	}
 	if !codexUsageRefresh.claimFallback(fp) {
 		// Another pass owns the read; it books the rung its own outcome earns.
-		return codexRetryNone
+		return codexRetryNone, false
 	}
 	defer codexUsageRefresh.releaseFallback(fp)
 	if !codexUsageRefresh.isEnabled() || IsOffline() {
 		// Nothing left the device, so nothing is spent and the debt stays
 		// payable. A free rung brings it back once the device is online again.
 		codexSetRefreshFallback(fp, id, codexFallbackDeferred)
-		return codexRetryFree
+		return codexRetryFree, false
 	}
 	// Outstanding BEFORE the read: a gather landing mid-probe must see the
 	// notice held back, not show it and have the next gather take it away.
 	if !codexSetRefreshFallback(fp, id, codexFallbackOutstanding) {
-		return codexRetryNone // the debt moved on (paid, re-owed, or another account's now)
+		return codexRetryNone, false // the debt moved on (paid, re-owed, or another account's now)
 	}
 	codexResolveCaptureVersion()
 	for try := 0; try < codexLiveUsageFallbackTries; try++ {
@@ -1969,8 +2105,8 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 			// `exhausted` — persisting a terminal verdict for a read that was
 			// cancelled, so the next process refused the debt for good. During
 			// shutdown neither write happens at all now; a gate reset books a free
-			// rung it then cancels, which is harmless.
-			return codexRetryFree
+			// rung it then cancels, which is harmless. It may have gone out.
+			return codexRetryFree, true
 		}
 		if outcome != liveProbeOutcomeCooldown {
 			// An `ok` only proves the RPC answered. Ask the cache whether the
@@ -1980,19 +2116,19 @@ func codexLiveUsageFallback(fp string, state codexRunFreshnessState) codexRunDeb
 			codexRecordLiveReadOutcome(fp, id, outcome, settled, kind)
 			fmt.Printf("%s[cli-usage] codex post-run live read: %s%s%s\n",
 				colorCyan, outcome, codexLiveReadLandedSuffix(outcome, settled), colorReset)
-			return kind
+			return kind, codexLiveReadOutbound(outcome)
 		}
 		if try+1 < codexLiveUsageFallbackTries &&
 			!codexUsageRefresh.sleep(codexLiveRateLimitCooldownRemaining(fp, time.Now())) {
 			// Same as the cancellation above: the cooldown wait was interrupted, no
 			// read went out, so the debt stays retryable.
-			return codexRetryFree
+			return codexRetryFree, false
 		}
 	}
 	// Every try was refused by the cooldown: no read went out, so nothing is
 	// spent and the debt is deferred until the cooldown lapses.
 	codexSetRefreshFallback(fp, id, codexFallbackDeferred)
-	return codexRetrySpacing
+	return codexRetrySpacing, false
 }
 
 // codexRecordLiveReadOutcome books one finished live read against the debt `id`
@@ -2129,7 +2265,8 @@ func codexResolveOutstandingFallback(fp string, booked bool) {
 
 // codexReconcileResult is what one rollout reconcile hands the parser.
 type codexReconcileResult struct {
-	metrics           []cliAgentUsageMetric
+	// No metrics: the parser re-reads them with their capture generation
+	// (codexMetricsAndGenerationFromCache), so both describe one snapshot.
 	limit             codexUsageLimitEvidence
 	latestObservation time.Time
 	// rollouts is what the pass saw of the rollout tree: the newest
@@ -2149,8 +2286,8 @@ func codexRunGatedReconcile(ctx context.Context, base, fp string, floor time.Tim
 		return codexReconcileResult{}, false, busy, wait
 	}
 	defer codexUsageRefresh.finish(fp, done)
-	metrics, limit, latest, rollouts := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}, true, nil, 0
+	_, limit, latest, rollouts := codexReconcileFromRollout(withCodexForcedReconcile(ctx, floor), base, fp, now)
+	return codexReconcileResult{limit: limit, latestObservation: latest, rollouts: rollouts}, true, nil, 0
 }
 
 // payOwedCodexUsageRefresh pays, once, a debt the previous agent process left
@@ -2380,8 +2517,8 @@ func codexReconcileForGather(ctx context.Context, base, fp string, now time.Time
 			}
 		}
 	}
-	metrics, limit, latest, rollouts := codexReconcileFromRollout(ctx, base, fp, now)
-	return codexReconcileResult{metrics: metrics, limit: limit, latestObservation: latest, rollouts: rollouts}
+	_, limit, latest, rollouts := codexReconcileFromRollout(ctx, base, fp, now)
+	return codexReconcileResult{limit: limit, latestObservation: latest, rollouts: rollouts}
 }
 
 // codexStaleRunNotice explains a card whose newest observation predates the

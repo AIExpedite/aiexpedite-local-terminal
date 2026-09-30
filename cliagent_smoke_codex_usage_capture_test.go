@@ -129,3 +129,60 @@ func TestRunCodexSmoke_CaptureOnAnEarlierRungStillSettles(t *testing.T) {
 		t.Fatalf("settled=%d disarmed=%d walks=%d, want the earlier rung's capture to settle without a walk", settled, disarmed, *walks)
 	}
 }
+
+// codexSmokeTokenCountLineWithLimitID is codexSmokeTokenCountLine as current
+// builds print it: the aggregate carries `limit_id`.
+func codexSmokeTokenCountLineWithLimitID(t *testing.T, limitID string, primaryPct, secondaryPct float64, now time.Time) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]any{
+		"type": "event_msg",
+		"payload": map[string]any{
+			"type":        "token_count",
+			"info":        map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+			"rate_limits": codexRateLimitFrameWithLimitID(limitID, primaryPct, secondaryPct, now),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(line)
+}
+
+// A `limit_id: "codex"` smoke frame against a cache already holding an OLDER
+// `codex` contributor with higher usage: the smoke's reading is what the card
+// shows — its value and its observedAt — and the capture generation advanced.
+func TestRunCodexSmoke_LimitIDFrameWinsOverAnOlderCodexReading(t *testing.T) {
+	f, path := codexSmokeCaptureEnv(t)
+	older := time.Now().Add(-20 * time.Minute)
+	if !captureCodexRateLimitLineForAccount(codexSmokeTokenCountLineWithLimitID(t, "codex", 88, 90, older), older, f.fp) {
+		t.Fatal("seeding the older codex reading failed")
+	}
+	before := f.snapshot(t)
+	started := time.Now()
+	stubCodexSmokeExec(t, func(ctx context.Context, launch codexSmokeLaunch) ([]byte, []byte, error) {
+		frames := append(codexPreUpdateFrames(codexMarkerFromLaunch(t, launch)),
+			[]byte(codexSmokeTokenCountLineWithLimitID(t, "codex", 14, 27, time.Now())+"\n")...)
+		return frames, nil, nil
+	})
+
+	if result := runCodexSmoke(context.Background(), path, codexSmokeTestVersion); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("result = %+v, want success", result)
+	}
+	drainCodexRunDebtLadder(t)
+
+	metrics := codexMetricsFromCache(time.Now(), f.fp)
+	session, weekly := codexSessionMetric(t, metrics), codexWeeklyMetric(t, metrics)
+	if session.Consumed == nil || *session.Consumed != 14 || weekly.Consumed == nil || *weekly.Consumed != 27 {
+		t.Fatalf("session=%+v weekly=%+v, want the smoke's 14%% / 27%%", session, weekly)
+	}
+	for _, m := range []cliAgentUsageMetric{session, weekly} {
+		if got := metricObservedAt(t, m); got.Before(started.Truncate(time.Second)) {
+			t.Fatalf("observedAt %s predates the smoke %s", got, started)
+		}
+	}
+	after := f.snapshot(t)
+	if after.GenerationEpoch == before.GenerationEpoch && after.Generation <= before.Generation {
+		t.Fatalf("generation did not advance: {%d,%d} → {%d,%d}",
+			before.GenerationEpoch, before.Generation, after.GenerationEpoch, after.Generation)
+	}
+}

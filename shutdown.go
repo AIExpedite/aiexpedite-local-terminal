@@ -70,6 +70,9 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// write racing an update handoff lands before this process dies and the
 	// floor it persisted is adopted by the next one.
 	drainAntigravityUsageWrites()
+	// No usage hint goes out after this; a pending one is recovered by the next
+	// process from the cache it rotates.
+	stopCLIUsagePropagator()
 
 	// Stop the updater before any teardown can make a draining device appear
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
