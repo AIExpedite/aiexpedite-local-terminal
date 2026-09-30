@@ -182,6 +182,8 @@ func TestCodexLiveFallback_OutcomeClassification(t *testing.T) {
 		{"not_attributable", liveProbeOutcomeNotSigned, false, true, codexRetryAfterRead},
 		{"spawn_failed", liveProbeOutcomeSpawnFailed, false, false, codexRetryFree},
 		{"account_changed", liveProbeOutcomeAccountChanged, false, false, codexRetryFree},
+		// The switch landed after the read answered: it reached OpenAI.
+		{"account_changed_after_read", liveProbeOutcomeAccountChangedAfterRead, false, true, codexRetryAfterRead},
 		{"gated", liveProbeOutcomeGated, false, false, codexRetryFree},
 		{"cooldown", liveProbeOutcomeCooldown, false, false, codexRetrySpacing},
 		{"unknown", "some_future_outcome", false, true, codexRetryAfterRead},

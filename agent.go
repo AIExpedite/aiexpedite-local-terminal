@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.1"
+var Version = "v1.1.2"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -426,6 +426,12 @@ func StartAgent(cfg *Config) {
 	}
 
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
+
+	// The usage propagator asks terminal-service to fetch a fresh CLI usage
+	// reading this device captured on its own (a shell-run `codex`, the smoke,
+	// a post-run debt payment). Started regardless of offline mode: it holds
+	// its hints while offline and sends once the device is back.
+	startCLIUsagePropagator(cfg)
 
 	// If the user disconnected from cloud in a previous session, skip the
 	// Pub/Sub loop entirely on boot. The tray "Reconnect to cloud" handler

@@ -1888,7 +1888,9 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// to the old account. The start time, fixed when the session began, stays on
 	// the correct side of the login. (Residual caveat: a token refresh that
 	// rewrites auth.json mid-session can over-reject same-account logs that
-	// started earlier; that degrades to Unknown, never to cross-account bleed.)
+	// started earlier; never cross-account bleed. A forced pass reports that case
+	// as fencedSinceFloor, and the run debt then spends its early, account-pinned
+	// live read instead of waiting out the scan ladder.)
 	var authMod time.Time
 	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
 		authMod = info.ModTime()
@@ -2003,6 +2005,12 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	// whose run B's reading predates, and ordering the two mtimes would call A
 	// covered on B's account.
 	coveredEntries := map[string]time.Time{}
+	// fencedAfterFloor: a forced pass met a candidate appended at or after the
+	// run floor that ONLY the account fence rejected (its session started before
+	// the latest auth.json write). Relevance comes from the append, not the
+	// immutable session start, so a long-lived or resumed session that began
+	// before the floor still counts.
+	fencedAfterFloor := false
 	for _, observed := range priorObservations {
 		if observed.After(latestObservation) {
 			latestObservation = observed
@@ -2081,6 +2089,9 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 				delete(retryEntries, retryEntry)
 			}
 			if !accept {
+				if !sessionStart.IsZero() && !runFloor.IsZero() && !c.mtime.Before(runFloor) {
+					fencedAfterFloor = true
+				}
 				continue
 			}
 		} else if retry {
@@ -2253,11 +2264,21 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 		}
 		highWater = &progress
 	}
+	evidence := codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+	// Fenced only when nothing this pass ACCEPTED already covers the floor: an
+	// accepted reading at or after it pays the debt through the normal merge.
+	evidence.fencedSinceFloor = fencedAfterFloor
+	for _, w := range winners {
+		if w.bucket.ObservedAtMs >= runFloor.UnixMilli() {
+			evidence.fencedSinceFloor = false
+			break
+		}
+	}
 	if len(winners) == 0 {
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, latestObservation, highWater, false, "", codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+		return nil, limit, latestObservation, highWater, false, "", evidence
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
 	// displayed identities onto their canonical cache slots while preserving the
@@ -2298,7 +2319,7 @@ func codexRolloutFallbackBucketsWithProducer(ctx context.Context, base string, n
 	if !producerKnown {
 		producer = ""
 	}
-	return acc, limit, latestObservation, highWater, true, producer, codexRolloutNudgeEvidenceFor(newestUncoveredMtime, newestUncoveredEntry, coveredEntries, progressComplete)
+	return acc, limit, latestObservation, highWater, true, producer, evidence
 }
 
 // codexRolloutNudgeEvidence is what a rollout scan tells the refresh nudge about
@@ -2327,6 +2348,13 @@ type codexRolloutNudgeEvidence struct {
 	// this one. Reported even when the pass was cut short — a file whose
 	// telemetry was merged stays covered however the rest of the walk ended.
 	covered map[string]time.Time
+	// fencedSinceFloor is set by a FORCED pass when a rollout appended at or
+	// after the run floor was rejected only by the account fence and nothing it
+	// accepted covers the floor. It is a reason for the debt worker to spend its
+	// early live read now (codexEscalateFencedRollout), not proof that scans are
+	// useless: the fenced file may be an unrelated overlapping session while the
+	// debt's own rollout has not flushed yet.
+	fencedSinceFloor bool
 }
 
 // covers reports whether this pass mined telemetry covering the rollout

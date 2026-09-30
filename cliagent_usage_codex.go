@@ -281,7 +281,6 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	// racing it — stamps the binary detected here, unless an upgrade has already
 	// overtaken this pass and published the newer build.
 	publishCodexUsageCaptureVersionFrom(detected.Path, detected.Version)
-	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time
 	forced := codexUsageForceRefresh(ctx)
@@ -294,7 +293,7 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		scanCtx, cancel := context.WithTimeout(ctx, scanBudget)
 		reconciled := codexReconcileForGather(scanCtx, base, usage.AccountFingerprint, now, forced)
 		cancel()
-		usage.Metrics, usageLimit, latestRolloutObservation = reconciled.metrics, reconciled.limit, reconciled.latestObservation
+		usageLimit, latestRolloutObservation = reconciled.limit, reconciled.latestObservation
 		// The same evidence, acted on: a booked rung that is due, or Codex
 		// telemetry written after the cached reading with no debt recorded at all
 		// (a `codex` the user started in their own shell), arms the bounded
@@ -304,6 +303,11 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		// (cliagent_usage_codex_refresh_schedule.go).
 		nudgeCodexUsageRefresh(base, usage.AccountFingerprint, now, reconciled.rollouts, latestRolloutObservation)
 	}
+	// The published metrics and their capture generation come from ONE final
+	// read, so a receipt can never pair one snapshot's numbers with another's
+	// generation — including a merge the reconcile above (or a racing capture)
+	// just committed.
+	usage.Metrics, usage.UsageGeneration = codexMetricsAndGenerationFromCache(now, usage.AccountFingerprint)
 	// An account that is OUT of quota reports no window at all — Codex nulls both
 	// `primary` and `secondary` on a refused turn — so the card fell back to
 	// "Usage unobservable", which reads as "we can't see it" when the truth is
@@ -351,6 +355,8 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 			usage.LoginExpirationState = loginExpirationNotReported
 			usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
 			usage.NoticeSeverity = "error"
+			// UsageGeneration is kept: the Unknown state is what the backend
+			// must apply for this generation.
 			usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
 		}
 	} else if usage.Authenticated == nil && strings.TrimSpace(detected.Path) != "" {

@@ -65,6 +65,9 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// so the next process re-arms them.
 	stopAntigravityRunDebtRetry()
 	stopCodexRunDebtRetry()
+	// No usage hint goes out after this; a pending one is recovered by the next
+	// process from the cache it rotates.
+	stopCLIUsagePropagator()
 
 	// Stop the updater before any teardown can make a draining device appear
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
