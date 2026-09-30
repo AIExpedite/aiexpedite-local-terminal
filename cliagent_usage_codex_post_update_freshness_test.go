@@ -1039,6 +1039,27 @@ func TestCodexFencedRollout_AMissedEarlyReadKeepsTheRemainingScans(t *testing.T)
 	}
 }
 
+// An account switch that lands after account/rateLimits/read answered drops the
+// reading, but the request went out: the reservation stays held, so the next
+// fenced rung takes no second early read.
+func TestCodexFencedRollout_AnAccountChangeAfterTheReadKeepsTheReservation(t *testing.T) {
+	r := newCodexFencedRun(t)
+	calls := stubCodexFallbackRead(t, func(context.Context, string) string {
+		return liveProbeOutcomeAccountChangedAfterRead
+	})
+
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if *calls != 1 || !r.earlyReserved(t) {
+		t.Fatalf("calls=%d reserved=%v, want one outbound early read that keeps its reservation", *calls, r.earlyReserved(t))
+	}
+
+	nextRung()
+	codexPayRunRefresh(r.f.home, r.f.fp)
+	if *calls != 1 {
+		t.Fatalf("early live reads = %d, want 1: the reservation must bound the early path", *calls)
+	}
+}
+
 // An early read that reached OpenAI without paying, then an agent restart with
 // the debt still outstanding: the same fenced rollout takes no second early
 // read. The second read is spent only as the final fallback after the scans.

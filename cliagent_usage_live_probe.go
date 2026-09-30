@@ -104,6 +104,12 @@ const (
 	// The signed-in account changed while the probe ran, so the reading can
 	// not be attributed to the account that is signed in now.
 	liveProbeOutcomeAccountChanged = "account_changed"
+	// The account changed AFTER account/rateLimits/read answered. The reading
+	// is dropped exactly as for account_changed, but the request already
+	// REACHED the provider, so it costs a read. Reporting it as account_changed
+	// (sent nothing) released the early-read reservation and let every later
+	// fenced rung issue another early read.
+	liveProbeOutcomeAccountChangedAfterRead = "account_changed_after_read"
 	// The installed build refuses loopback quota reads (Antigravity ≥ 1.2.2,
 	// cliagent_usage_antigravity_gate.go). Reported both when a probe met the
 	// refusal and when the click skipped the spawn because a recent probe did.
@@ -553,7 +559,7 @@ func codexLiveProbeConverse(stdin io.Writer, stdout io.Reader, spawnedFingerprin
 				return liveProbeOutcomeRPCError
 			}
 			if currentCodexAccountFingerprint() != spawnedFingerprint {
-				return liveProbeOutcomeAccountChanged
+				return liveProbeOutcomeAccountChangedAfterRead
 			}
 			if !captureCodexRateLimitLineFromProducer(string(envelope), time.Now(), spawnedFingerprint, producerVersion) {
 				return liveProbeOutcomeNotMerged

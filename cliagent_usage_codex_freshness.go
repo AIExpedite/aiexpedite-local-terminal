@@ -1928,7 +1928,9 @@ const codexLiveUsageFallbackTries = 2
 //
 // An unrecognised outcome from a newer producer is treated as OUTBOUND, so an
 // unknown result can never loop for free. liveProbeOutcomeNotMerged is outbound
-// by definition: the read answered, the merge refused it.
+// by definition: the read answered, the merge refused it. So is
+// liveProbeOutcomeAccountChangedAfterRead; only the pre-spawn account_changed
+// sent nothing.
 func codexLiveReadOutbound(outcome string) bool {
 	switch outcome {
 	case liveProbeOutcomeSpawnFailed, liveProbeOutcomeAccountChanged,

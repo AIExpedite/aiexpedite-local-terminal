@@ -855,8 +855,8 @@ func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
 	if spawnedUnder == currentCodexAccountFingerprint() {
 		t.Fatal("fixture must sign a different account in than the one spawned")
 	}
-	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChanged {
-		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChanged)
+	if got := codexLiveProbeConverse(stdin, stdout, spawnedUnder, currentCodexUsageCaptureVersion()); got != liveProbeOutcomeAccountChangedAfterRead {
+		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeAccountChangedAfterRead)
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
 		t.Errorf("a reading from another account must not be cached (stat err=%v)", err)
