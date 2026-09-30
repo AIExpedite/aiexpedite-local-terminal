@@ -534,6 +534,49 @@ func noteAntigravityManagedPIDExited(pid int) {
 	unlockAntigravityLogIndex()
 }
 
+// handOffAntigravityDetachedManagedPID hands a managed agy that outlived the
+// command that launched it — `Start-Process agy`, `agy … &` — to discovery.
+// Settling it with its wrapper would stamp a live process as exited and keep
+// its log classified as managed, so the usage it spends after the wrapper
+// returns would never be owed. Instead it leaves the managed ring and is
+// tracked process-only, with a candidate floor armed at now: owed once it
+// exits, exactly like a direct run. Reports false — the caller then marks the
+// PID exited as before — unless the live process is provably the remembered
+// one (equal, readable start tokens); a PID that is gone or unreadable is the
+// ordinary synchronous case. Never called with the index lock held.
+func handOffAntigravityDetachedManagedPID(pid int, now time.Time) bool {
+	if pid <= 0 {
+		return false
+	}
+	token := antigravityCurrentStartToken(pid)
+	if token == "" {
+		return false
+	}
+	var res antigravityDiscoveryResult
+	handed := false
+	lockAntigravityLogIndex()
+	idx := &antigravityLogIndex
+	for i, known := range idx.managedPIDs {
+		if known.pid == pid && known.exitedAt.IsZero() && known.token == token {
+			idx.managedPIDs = append(idx.managedPIDs[:i], idx.managedPIDs[i+1:]...)
+			handed = true
+			break
+		}
+	}
+	if handed && !antigravityIndexTracksPIDLocked(pid) {
+		entry := &antigravityLogEntry{firstSeen: now, pids: []antigravityTrackedPID{{pid: pid, token: token}}}
+		antigravityTrackProcessOnlyLocked(entry, &res)
+	}
+	unlockAntigravityLogIndex()
+	for _, floorMs := range res.arm {
+		armAntigravityCandidateFloor(floorMs)
+	}
+	for _, floorMs := range res.release {
+		releaseAntigravityCandidateFloor(floorMs)
+	}
+	return handed
+}
+
 // antigravityMarkPIDExited stamps the remembered entry for pid with its exit
 // time. The first stamp wins. Caller holds the index lock.
 func antigravityMarkPIDExited(ring []antigravityTrackedPID, pid int, at time.Time) {

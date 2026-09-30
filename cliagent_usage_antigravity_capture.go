@@ -327,7 +327,12 @@ func (c *antigravityRunCapture) Finish() {
 		c.finished = true
 		pid := c.pid
 		c.mu.Unlock()
-		noteAntigravityManagedPIDExited(pid)
+		// A wrapper can return while the agy it launched keeps running
+		// (`Start-Process agy`, `agy … &`): that process goes to discovery,
+		// which owes its reading when it really exits.
+		if !handOffAntigravityDetachedManagedPID(pid, antigravityUsageFreshnessNow()) {
+			noteAntigravityManagedPIDExited(pid)
+		}
 
 		if c.polled {
 			antigravityCaptureMu.Lock()

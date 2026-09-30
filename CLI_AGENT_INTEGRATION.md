@@ -1474,7 +1474,11 @@ can.
   only while the command runs,
   takes the first `agy.exe` (`agy` off Windows) within 3 levels whose start is not before the
   capture floor (the persistent host outlives every command), marks it managed
-  and stops. `Finish` stops it and settles with the PID.
+  and stops. `Finish` stops it and settles with the PID. An `agy` still alive
+  at `Finish` (same start token) was launched asynchronously
+  (`Start-Process agy`, `agy … &`): `handOffAntigravityDetachedManagedPID`
+  moves it from the managed ring to process-only discovery with a candidate
+  floor, so it is owed after its own exit rather than settled with its wrapper.
 - **Managed-run evidence (in memory only).** The settle reads the run's OWN
   PID block (`antigravityPIDBlock`) and, when that block names both
   `authenticated successfully as <email>` and a `RESOURCE_EXHAUSTED … Resets in

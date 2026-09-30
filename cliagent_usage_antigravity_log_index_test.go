@@ -1015,3 +1015,61 @@ func TestAntigravityStartupScan_IgnoresUnrelatedImages(t *testing.T) {
 		t.Errorf("processOnly=%d, want an unrelated image ignored", processOnly)
 	}
 }
+
+// A wrapper that launches agy asynchronously (`Start-Process agy`, `agy … &`)
+// returns while that agy still runs. Finish must not stamp the live process
+// exited and keep its log managed: it goes to discovery, is not owed while it
+// lives, and is owed once it exits.
+func TestAntigravityCapture_DetachedAgyOwedAfterItsOwnExit(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	start := time.Now().Add(-time.Hour)
+
+	h.setLive(9101, true)
+	capture := &antigravityRunCapture{floor: start, gated: true}
+	capture.SetPID(9101)
+	h.write(t, helperLogName(start), helperPIDBlock(9101), start, false)
+	capture.Finish()
+	antigravityUsageRefreshWaitIdle()
+
+	lockAntigravityLogIndex()
+	stillManaged := antigravityPIDIn(antigravityLogIndex.managedPIDs, 9101, "tok-9101", time.Time{})
+	unlockAntigravityLogIndex()
+	if stillManaged {
+		t.Fatal("a live agy that outlived its wrapper is still remembered as managed")
+	}
+	if _, _, _, _, processOnly, _ := helperIndexCounts(); processOnly != 1 {
+		t.Fatalf("processOnly=%d, want the detached agy tracked by discovery", processOnly)
+	}
+	if res := h.pass(start.Add(10*time.Minute), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s while the detached agy is still running", res.owed)
+	}
+	h.setLive(9101, false)
+	exitSeen := start.Add(20 * time.Minute)
+	h.pass(exitSeen, 0)
+	if res := h.pass(exitSeen.Add(2*time.Minute), 0); res.owed.IsZero() {
+		t.Error("the detached agy was never owed after it exited")
+	}
+}
+
+// The ordinary case: the agy is gone when Finish runs, so it stays managed and
+// its log is never owed as a direct run.
+func TestAntigravityCapture_ExitedAgyStaysManagedAtFinish(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	start := time.Now().Add(-time.Hour)
+
+	h.setLive(9102, true)
+	capture := &antigravityRunCapture{floor: start, gated: true}
+	capture.SetPID(9102)
+	h.write(t, helperLogName(start), helperPIDBlock(9102), start, false)
+	h.setLive(9102, false)
+	capture.Finish()
+	antigravityUsageRefreshWaitIdle()
+
+	if _, _, _, _, processOnly, _ := helperIndexCounts(); processOnly != 0 {
+		t.Fatalf("processOnly=%d, want an exited managed agy left managed", processOnly)
+	}
+	h.pass(start.Add(time.Minute), 0)
+	if res := h.pass(start.Add(5*time.Minute), 0); !res.owed.IsZero() {
+		t.Errorf("owed=%s for a managed run that exited with its wrapper", res.owed)
+	}
+}
