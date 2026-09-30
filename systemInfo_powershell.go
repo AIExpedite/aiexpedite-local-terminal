@@ -243,17 +243,32 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 // installed a person may paste into either window, so the setter is invoked
 // once per blocking host through that host's own executable.
 func (p *powerShellPolicyInfo) manualCommand() string {
+	return p.manualCommandWhere(func(*powerShellHostPolicy) bool { return true })
+}
+
+// manualCommandWhere is manualCommand limited to the blocking hosts keep
+// accepts, or "" when it accepts none.
+func (p *powerShellPolicyInfo) manualCommandWhere(keep func(*powerShellHostPolicy) bool) string {
 	var hosts []string
 	onlyWindowsHost := true
+	anyBlocking := false
 	if p != nil {
-		for _, h := range p.Hosts {
+		for i := range p.Hosts {
+			h := &p.Hosts[i]
 			if h.Host != powerShellHostWindows {
 				onlyWindowsHost = false
 			}
-			if h.BlocksLocalScripts {
+			if !h.BlocksLocalScripts {
+				continue
+			}
+			anyBlocking = true
+			if keep(h) {
 				hosts = append(hosts, h.Host)
 			}
 		}
+	}
+	if len(hosts) == 0 && anyBlocking {
+		return ""
 	}
 	if len(hosts) == 0 || (onlyWindowsHost && len(hosts) == 1) {
 		return powerShellPolicyManualCommand
@@ -295,14 +310,23 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 	}
 	switch {
 	case h.BlockedBy == psScopeMachinePolicy || h.BlockedBy == psScopeUserPolicy:
-		return "PowerShell's execution policy (" + h.Effective + ") is set by Group Policy and blocks local scripts, so npm and other script-based tools won't run. " +
-			"Your IT administrator controls this setting; ask them to allow scripts, or where permitted run: " + manual, false
+		// The CurrentUser setter cannot beat Group Policy, so it is offered
+		// only for the other blocking hosts that Group Policy does not own.
+		msg := "PowerShell's execution policy (" + h.Effective + ") is set by Group Policy and blocks local scripts, so npm and other script-based tools won't run. " +
+			"Your IT administrator controls this setting; ask them to allow local scripts (RemoteSigned). " +
+			"A per-user setting can't override Group Policy."
+		if rest := p.manualCommandWhere(func(o *powerShellHostPolicy) bool {
+			return o.BlockedBy != psScopeMachinePolicy && o.BlockedBy != psScopeUserPolicy
+		}); rest != "" {
+			msg += " For the other PowerShell host, run: " + rest
+		}
+		return msg, false
 	case strings.EqualFold(h.Effective, psPolicyAllSigned):
 		return "PowerShell's execution policy is AllSigned, which blocks unsigned scripts such as npm's, so npm won't run. " +
 			"AIExpedite won't change a policy you chose; to allow local scripts for your user, run: " + manual, false
 	case h.BlockedBy == psScopeProcess:
 		return "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
-			"A per-user setting can't override it; remove that override, then run: " + manual, false
+			"A per-user setting can't override it; remove that override first (for example, unset PSExecutionPolicyPreference and restart the AIExpedite agent), then, if scripts are still blocked, run: " + manual, false
 	default:
 		return "PowerShell's execution policy (" + policy + ") blocks local scripts, so npm and other script-based tools won't run. " +
 			"To allow them for your user, run: " + manual, false

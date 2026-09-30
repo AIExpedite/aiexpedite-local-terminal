@@ -218,9 +218,9 @@ func TestPowerShellPolicyFindingMessages(t *testing.T) {
 		want    []string
 	}{
 		{"fixable", psHost("Restricted", allUndefined(nil)), true, []string{"(Restricted)", "npm", "RemoteSigned"}},
-		{"group policy", psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"})), false, []string{"Group Policy", "IT administrator", powerShellPolicyManualCommand}},
+		{"group policy", psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"})), false, []string{"Group Policy", "IT administrator"}},
 		{"all signed", psHost("AllSigned", allUndefined(map[string]string{"LocalMachine": "AllSigned"})), false, []string{"AllSigned", powerShellPolicyManualCommand}},
-		{"process", psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"})), false, []string{"process", powerShellPolicyManualCommand}},
+		{"process", psHost("Restricted", allUndefined(map[string]string{"Process": "Restricted"})), false, []string{"process", "remove that override first", powerShellPolicyManualCommand}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -232,6 +232,11 @@ func TestPowerShellPolicyFindingMessages(t *testing.T) {
 				if !strings.Contains(msg, w) {
 					t.Fatalf("message %q lacks %q", msg, w)
 				}
+			}
+			// The CurrentUser command cannot beat a Group Policy scope, so it
+			// must never be offered as the way out of one.
+			if c.name == "group policy" && strings.Contains(msg, powerShellPolicyManualCommand) {
+				t.Fatalf("group policy message must not offer the CurrentUser command: %q", msg)
 			}
 			if strings.Contains(msg, "Unrestricted") || strings.Contains(msg, "Bypass") {
 				t.Fatalf("message must never suggest turning signing off: %q", msg)
@@ -272,7 +277,10 @@ func TestPowerShellPolicyManualCommandPerHost(t *testing.T) {
 
 	lockedPwsh := psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"}))
 	lockedPwsh.Host = powerShellHost7
-	if msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win, lockedPwsh})); fixable || !strings.Contains(msg, want) {
-		t.Fatalf("mixed report must give the command for both hosts: fixable=%v msg=%q", fixable, msg)
+	// Group Policy owns pwsh, so the setter is offered for Windows PowerShell
+	// only: pasting it into pwsh could never lift a Group Policy block.
+	onlyWin := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
+	if msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win, lockedPwsh})); fixable || !strings.Contains(msg, onlyWin) || strings.Contains(msg, "pwsh -NoProfile") || !strings.Contains(msg, "IT administrator") {
+		t.Fatalf("mixed report must give the command for the host Group Policy does not own: fixable=%v msg=%q", fixable, msg)
 	}
 }
