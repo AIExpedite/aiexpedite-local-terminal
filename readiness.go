@@ -236,7 +236,7 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		message, fixable := powerShellPolicyFinding(info.PowerShell)
 		var action *ReadinessAction
 		if fixable {
-			action = softwareAction("powershell_scripts_blocked", "Allow PowerShell scripts for your user", "Create a setup plan to allow PowerShell scripts for your user account (execution policy RemoteSigned, current user only).", powerShellPolicyManualCommand)
+			action = softwareAction("powershell_scripts_blocked", "Allow PowerShell scripts for your user", "Create a setup plan to allow PowerShell scripts for your user account (execution policy RemoteSigned, current user only).", info.PowerShell.manualCommand())
 		}
 		add("powershell_scripts_blocked", FindingWarning, message, action)
 	}

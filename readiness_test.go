@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -489,5 +490,22 @@ func TestEvaluateReadiness_PermissivePowerShellPolicyHasNoFinding(t *testing.T) 
 	// macOS / Linux / an older gather: no powerShell block at all.
 	if report := evaluateReadiness(healthyMachine()); findFinding(report.Findings, "powershell_scripts_blocked") != nil {
 		t.Fatal("nil PowerShell must never produce the finding")
+	}
+}
+
+func TestEvaluateReadiness_PowerShellActionCoversEveryBlockingHost(t *testing.T) {
+	win := psHost("Restricted", allUndefined(nil))
+	pwsh := psHost("Restricted", allUndefined(nil))
+	pwsh.Host = powerShellHost7
+	info := healthyMachine()
+	info.PowerShell = summarizePowerShellPolicy([]powerShellHostPolicy{win, pwsh})
+	a := findAction(evaluateReadiness(info).Actions, "powershell_scripts_blocked")
+	if a == nil {
+		t.Fatal("expected the per-user fix action")
+	}
+	for _, exe := range []string{"powershell -NoProfile", "pwsh -NoProfile"} {
+		if !strings.Contains(a.ManualInstruction, exe) {
+			t.Fatalf("manual instruction %q must run the setter in %s", a.ManualInstruction, exe)
+		}
 	}
 }

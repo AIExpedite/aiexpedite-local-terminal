@@ -49,8 +49,15 @@ const (
 	psScopeDefault       = "Default" // no scope defines a policy
 )
 
-// powerShellPolicyManualCommand is what a person can run themselves.
+// powerShellPolicyManualCommand is what a person can run themselves in the
+// PowerShell host that blocks.
 const powerShellPolicyManualCommand = "Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
+
+// powerShellHostExe is the executable whose CurrentUser store a host reads.
+var powerShellHostExe = map[string]string{
+	powerShellHostWindows: "powershell",
+	powerShellHost7:       "pwsh",
+}
 
 // psScopePrecedence is the order PowerShell resolves the effective policy in:
 // the first scope with a defined policy wins.
@@ -229,6 +236,34 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 	return summarizePowerShellPolicy(hosts)
 }
 
+// manualCommand is what a person runs to allow local scripts in EVERY blocking
+// host. The hosts keep separate CurrentUser stores, so setting the policy in
+// one leaves the other restricted: unless Windows PowerShell is the only host
+// that blocks (the window a person opens by default), the setter is invoked
+// once per blocking host through that host's own executable.
+func (p *powerShellPolicyInfo) manualCommand() string {
+	var hosts []string
+	if p != nil {
+		for _, h := range p.Hosts {
+			if h.BlocksLocalScripts {
+				hosts = append(hosts, h.Host)
+			}
+		}
+	}
+	if len(hosts) == 0 || (len(hosts) == 1 && hosts[0] == powerShellHostWindows) {
+		return powerShellPolicyManualCommand
+	}
+	cmds := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		exe, ok := powerShellHostExe[host]
+		if !ok {
+			exe = powerShellHostExe[powerShellHostWindows]
+		}
+		cmds = append(cmds, exe+` -NoProfile -Command "`+powerShellPolicyManualCommand+`"`)
+	}
+	return strings.Join(cmds, "; ")
+}
+
 // powerShellPolicyFinding is the readiness message for a blocking policy, and
 // whether setup can offer the per-user fix.
 func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable bool) {
@@ -236,6 +271,7 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 	if h == nil {
 		return "", false
 	}
+	manual := p.manualCommand()
 	policy := h.Effective
 	if strings.EqualFold(policy, psPolicyDefault) || strings.EqualFold(policy, psPolicyUndefined) {
 		policy = psPolicyRestricted
@@ -255,15 +291,15 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 	switch {
 	case h.BlockedBy == psScopeMachinePolicy || h.BlockedBy == psScopeUserPolicy:
 		return "PowerShell's execution policy (" + h.Effective + ") is set by Group Policy and blocks local scripts, so npm and other script-based tools won't run. " +
-			"Your IT administrator controls this setting; ask them to allow scripts, or where permitted run: " + powerShellPolicyManualCommand, false
+			"Your IT administrator controls this setting; ask them to allow scripts, or where permitted run: " + manual, false
 	case strings.EqualFold(h.Effective, psPolicyAllSigned):
 		return "PowerShell's execution policy is AllSigned, which blocks unsigned scripts such as npm's, so npm won't run. " +
-			"AIExpedite won't change a policy you chose; to allow local scripts for your user, run: " + powerShellPolicyManualCommand, false
+			"AIExpedite won't change a policy you chose; to allow local scripts for your user, run: " + manual, false
 	case h.BlockedBy == psScopeProcess:
 		return "PowerShell's execution policy (" + h.Effective + ") is set for the PowerShell process setup runs in (for example by the PSExecutionPolicyPreference environment variable), so npm and other script-based tools won't run. " +
-			"A per-user setting can't override it; remove that override, then run: " + powerShellPolicyManualCommand, false
+			"A per-user setting can't override it; remove that override, then run: " + manual, false
 	default:
 		return "PowerShell's execution policy (" + policy + ") blocks local scripts, so npm and other script-based tools won't run. " +
-			"To allow them for your user, run: " + powerShellPolicyManualCommand, false
+			"To allow them for your user, run: " + manual, false
 	}
 }

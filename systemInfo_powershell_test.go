@@ -239,3 +239,35 @@ func TestPowerShellPolicyFindingMessages(t *testing.T) {
 		})
 	}
 }
+
+func TestPowerShellPolicyManualCommandPerHost(t *testing.T) {
+	win := psHost("Restricted", allUndefined(nil))
+	pwsh := psHost("Restricted", allUndefined(nil))
+	pwsh.Host = powerShellHost7
+	pwshOK := psHost("RemoteSigned", allUndefined(map[string]string{"LocalMachine": "RemoteSigned"}))
+	pwshOK.Host = powerShellHost7
+	winOK := psHost("RemoteSigned", allUndefined(map[string]string{"LocalMachine": "RemoteSigned"}))
+
+	if got := summarizePowerShellPolicy([]powerShellHostPolicy{win, pwshOK}).manualCommand(); got != powerShellPolicyManualCommand {
+		t.Fatalf("Windows PowerShell only: got %q", got)
+	}
+	want := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"; pwsh -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
+	both := summarizePowerShellPolicy([]powerShellHostPolicy{win, pwsh})
+	if got := both.manualCommand(); got != want {
+		t.Fatalf("both hosts block: got %q, want %q", got, want)
+	}
+	if msg, fixable := powerShellPolicyFinding(both); !fixable || strings.Contains(msg, want) {
+		// The fixable message names no command; the action carries it.
+		t.Fatalf("both hosts fixable: fixable=%v msg=%q", fixable, msg)
+	}
+	onlyPwsh := summarizePowerShellPolicy([]powerShellHostPolicy{winOK, pwsh}).manualCommand()
+	if onlyPwsh != `pwsh -NoProfile -Command "`+powerShellPolicyManualCommand+`"` {
+		t.Fatalf("PowerShell 7 only must target pwsh: got %q", onlyPwsh)
+	}
+
+	lockedPwsh := psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"}))
+	lockedPwsh.Host = powerShellHost7
+	if msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win, lockedPwsh})); fixable || !strings.Contains(msg, want) {
+		t.Fatalf("mixed report must give the command for both hosts: fixable=%v msg=%q", fixable, msg)
+	}
+}
