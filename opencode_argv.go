@@ -307,6 +307,38 @@ type openCodeLaunch struct {
 	// which wires its own pipe after the child is built, and by the diagnostic
 	// probes, which send nothing.
 	Stdin *os.File
+	// Maintenance marks a maintenance smoke child (the `__cli_smoke__` probe
+	// and the legacy session_start smoke). newOpenCodeCmd applies
+	// openCodeMaintenanceEnvPins to it. Ordinary runs never set it: pinning
+	// self-update off for them would change the user's update behaviour.
+	Maintenance bool
+}
+
+// openCodeMaintenanceEnvPins are the env values every maintenance smoke child
+// runs with.
+//
+//   - OPENCODE_DISABLE_AUTOUPDATE: a pre-update smoke that updates the CLI in
+//     the background replaces its own install mid-turn (on Windows an npm
+//     update renames the running package aside), and the harness's
+//     "before / after" comparison stops meaning anything.
+//   - OPENCODE_DISABLE_TERMINAL_TITLE: a terminal-title OSC write on stdout
+//     sits in front of the JSON frame stream the smoke parses.
+var openCodeMaintenanceEnvPins = [][2]string{
+	{"OPENCODE_DISABLE_AUTOUPDATE", "true"},
+	{"OPENCODE_DISABLE_TERMINAL_TITLE", "true"},
+}
+
+// withOpenCodeMaintenanceEnv returns env with every maintenance pin set,
+// replacing an inherited value rather than appending a duplicate. A nil env
+// starts from os.Environ(), which is what the child would otherwise inherit.
+func withOpenCodeMaintenanceEnv(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	for _, pin := range openCodeMaintenanceEnvPins {
+		env = setEnvVar(env, pin[0], pin[1])
+	}
+	return env
 }
 
 // errOpenCodeShimUnrenderable is the typed refusal a Windows `.cmd` / `.bat`
@@ -329,6 +361,11 @@ var errOpenCodeShimUnrenderable = fmt.Errorf("opencode launch cannot be rendered
 func newOpenCodeCmd(ctx context.Context, launch openCodeLaunch) (*exec.Cmd, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if launch.Maintenance {
+		// Before the shim route builds its env, so the pins reach the Node
+		// grandchild behind cmd.exe as well as a native binary.
+		launch.Env = withOpenCodeMaintenanceEnv(launch.Env)
 	}
 	var cmd *exec.Cmd
 	if isWindowsShimPath(launch.Path) {

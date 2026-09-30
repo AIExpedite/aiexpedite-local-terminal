@@ -49,6 +49,12 @@ func TestRunOpenCodeSmoke_ResultAndLogCarryNoVendorText(t *testing.T) {
 			stdout: `{"type":"text","text":"` + openCodeSecretPath + `"}`,
 		},
 		{
+			// no_output: not one frame, only vendor prose on both streams.
+			name:   "no output",
+			stdout: "opencode: updating from " + openCodeSecretPath + "\n",
+			stderr: "key " + openCodeSecretToken,
+		},
+		{
 			name:   "auth error event",
 			stdout: `{"type":"error","error":{"message":"authentication failed for ` + openCodeSecretToken + `"}}`,
 		},
@@ -123,15 +129,17 @@ func TestRunOpenCodeSmoke_ResultAndLogCarryNoVendorText(t *testing.T) {
 }
 
 func TestOpenCodeSmokeFailureLogLine_CarriesOnlyClosedValues(t *testing.T) {
-	// The signature takes LENGTHS, not bytes: a function that cannot receive
+	// The signature takes COUNTS, not bytes: a function that cannot receive
 	// vendor text cannot leak it, however a future caller wires it up.
 	line := openCodeSmokeFailureLogLine(
-		openCodeRunShapeIDPlain, cliUsageErrorProtocol, cliSmokeDiagnosticLaunchError, 4096, 128)
+		openCodeRunShapeIDPlain, cliUsageErrorProtocol, cliSmokeDiagnosticNoOutput,
+		openCodeSmokeCounts{StderrBytes: 4096, StdoutBytes: 128, Frames: 3, EscLines: 2, Terminal: false, Exit: 1})
 	for _, want := range []string{
 		"opencode", openCodeRunShapeIDPlain,
 		"category=" + cliUsageErrorProtocol,
-		"diagnostic=" + cliSmokeDiagnosticLaunchError,
+		"diagnostic=" + cliSmokeDiagnosticNoOutput,
 		"stderrBytes=4096", "stdoutBytes=128",
+		"frames=3", "escLines=2", "terminal=false", "exit=1",
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log line %q is missing %q", line, want)

@@ -17,7 +17,9 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -462,5 +464,82 @@ func TestOpenCodeSessionStartGate_ShowsAndMatchesTheArgvThatWillExec(t *testing.
 	// The narrow default entry must still not cover a RAW execute of the shape.
 	if al.IsAllowed("opencode", buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")) {
 		t.Error("the synthesized shape became allowlisted for raw execute")
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Maintenance env pins
+   -------------------------------------------------------------------------- */
+
+// openCodeEnvValues returns every value env holds for key (Windows env names
+// compare case-insensitively, as setEnvVar does there).
+func openCodeEnvValues(env []string, key string) []string {
+	var values []string
+	for _, e := range env {
+		name, value, ok := strings.Cut(e, "=")
+		if !ok {
+			continue
+		}
+		if name == key || (runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// A maintenance launch pins self-update and the terminal title off — replacing
+// an inherited value rather than appending a duplicate the child might read
+// first — and an ordinary launch carries neither pin.
+func TestNewOpenCodeCmd_MaintenancePinsOnlyMaintenanceLaunches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode")
+	inherited := []string{"PATH=/usr/bin", "OPENCODE_DISABLE_AUTOUPDATE=false"}
+
+	maint, err := newOpenCodeCmd(context.Background(), openCodeLaunch{
+		Path: path, Args: []string{"run"}, Env: inherited, Maintenance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pin := range openCodeMaintenanceEnvPins {
+		if got := openCodeEnvValues(maint.Env, pin[0]); len(got) != 1 || got[0] != pin[1] {
+			t.Errorf("maintenance env %s = %q, want exactly [%q]", pin[0], got, pin[1])
+		}
+	}
+	if got := openCodeEnvValues(maint.Env, "PATH"); len(got) != 1 || got[0] != "/usr/bin" {
+		t.Errorf("maintenance launch dropped the caller's env: PATH=%q", got)
+	}
+	// The caller's slice is never written through.
+	if inherited[1] != "OPENCODE_DISABLE_AUTOUPDATE=false" {
+		t.Errorf("the caller's env slice was mutated: %q", inherited)
+	}
+
+	ordinary, err := newOpenCodeCmd(context.Background(), openCodeLaunch{
+		Path: path, Args: []string{"run"}, Env: []string{"PATH=/usr/bin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pin := range openCodeMaintenanceEnvPins {
+		if got := openCodeEnvValues(ordinary.Env, pin[0]); len(got) != 0 {
+			t.Errorf("an ordinary launch carries the %s pin: %q", pin[0], got)
+		}
+	}
+}
+
+// A nil Env means "inherit", so the pins are layered on os.Environ() rather
+// than replacing the whole environment with two variables.
+func TestNewOpenCodeCmd_MaintenancePinsOnANilEnvKeepTheProcessEnvironment(t *testing.T) {
+	t.Setenv("AIX_OPENCODE_PIN_PROBE", "kept")
+	cmd, err := newOpenCodeCmd(context.Background(), openCodeLaunch{
+		Path: filepath.Join(t.TempDir(), "opencode"), Maintenance: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := openCodeEnvValues(cmd.Env, "AIX_OPENCODE_PIN_PROBE"); len(got) != 1 || got[0] != "kept" {
+		t.Errorf("inherited env lost: %q", got)
+	}
+	if got := openCodeEnvValues(cmd.Env, "OPENCODE_DISABLE_AUTOUPDATE"); len(got) != 1 || got[0] != "true" {
+		t.Errorf("pin missing on a nil env: %q", got)
 	}
 }

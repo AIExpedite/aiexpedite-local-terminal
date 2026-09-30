@@ -625,11 +625,14 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// intermediate cmd.exe and this launch supplies a background context, so
 		// exec's own Cancel can never fire here; killSessionProcess tree-kills
 		// every Windows session, so the shim's Node child goes down with it.
+		// A maintenance smoke also runs with self-update and the terminal title
+		// pinned off (openCodeMaintenanceEnvPins); an ordinary session does not.
 		launched, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
-			Path: executable,
-			Args: cliArgs,
-			Env:  proc.Env,
-			Dir:  proc.Dir,
+			Path:        executable,
+			Args:        cliArgs,
+			Env:         proc.Env,
+			Dir:         proc.Dir,
+			Maintenance: openCodeMaintenanceSmoke,
 		})
 		if launchErr != nil {
 			return launchErr

@@ -72,6 +72,51 @@ func TestRunCLISmoke_OpenCodeCooldownReplaysButNotAcrossAnUpgrade(t *testing.T) 
 	}
 }
 
+// The Windows npm upgrade: the shim on PATH keeps its bytes, size and mtime
+// while the package behind it is replaced, and the cached `--version` reading
+// has not caught up yet. Only the provider's content identity can tell the two
+// installs apart, so the post-upgrade smoke must execute rather than replay.
+//
+// The identity hook is pointed at the platform-neutral hash so the plumbing is
+// exercised on every OS (openCodeBinaryIdentity only hashes `.cmd` paths).
+func TestRunCLISmoke_OpenCodePackageOnlyUpgradeIsNotReplayed(t *testing.T) {
+	openCodeSmokeEnv(t)
+	shim := openCodeShimFixture(t)
+	stubOpenCodeSmokePath(t, shim)
+	stubOpenCodeReadiness(t, "", false)
+	seedProbeVersion(t, shim, "opencode 0.9.1")
+	original := cliSmokeProviders["opencode"]
+	withIdentity := original
+	withIdentity.identity = openCodeShimPackageIdentity
+	cliSmokeProviders["opencode"] = withIdentity
+	t.Cleanup(func() { cliSmokeProviders["opencode"] = original })
+	calls, _ := stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+		return openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)), nil, nil
+	})
+
+	if _, replayed := runCLISmoke(context.Background(), "opencode"); replayed {
+		t.Fatal("the first smoke cannot be a replay")
+	}
+	if _, replayed := runCLISmoke(context.Background(), "opencode"); !replayed || *calls != 1 {
+		t.Fatalf("an unchanged install must replay inside the cooldown (calls=%d)", *calls)
+	}
+
+	manifest := filepath.Join(filepath.Dir(shim), "node_modules", "opencode-ai", "package.json")
+	rewriteKeepingStat(t, manifest, `{"name":"opencode-ai","version":"0.9.2"}`)
+	// Keep the stale version reading under the unchanged shim key, so the stamp
+	// differs ONLY by the identity. (On Windows the version probe would drop it
+	// on the identity change; settle that first so the seed is what is read.)
+	openCodeForgetVersionOnIdentityChange(shim)
+	seedProbeVersion(t, shim, "opencode 0.9.1")
+
+	if _, replayed := runCLISmoke(context.Background(), "opencode"); replayed {
+		t.Fatal("a package-only upgrade replayed the pre-upgrade verdict")
+	}
+	if *calls != 2 {
+		t.Fatalf("the post-upgrade smoke did not execute: calls=%d", *calls)
+	}
+}
+
 func TestRunCLISmoke_OpenCodeConcurrentCallersShareOneTurn(t *testing.T) {
 	openCodeSmokeEnv(t)
 	path := stubOpenCodeBinary(t)
