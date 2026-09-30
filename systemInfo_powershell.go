@@ -101,6 +101,10 @@ type powerShellPolicyInfo struct {
 	// pwshDetected: pwsh is on PATH, even when its probe failed and Hosts has
 	// no powershell7 entry. The manual command must still name the host.
 	pwshDetected bool
+	// windowsUnclassified: the Windows PowerShell probe failed, so Hosts has no
+	// windowsPowerShell entry. One-shot setup commands run in that host, so the
+	// report is never fixable from pwsh alone and the manual command covers it.
+	windowsUnclassified bool
 }
 
 // primaryBlockingHost is the host a message names: the first that blocks.
@@ -241,6 +245,12 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 	info := summarizePowerShellPolicy(hosts)
 	if info != nil {
 		info.pwshDetected = pwshDetected
+		// probes[0] is always Windows PowerShell. Without its answer an
+		// approved step could not cover the host one-shot setup commands use.
+		if results[0] == nil {
+			info.windowsUnclassified = true
+			info.FixableByCurrentUser = false
+		}
 	}
 	return info
 }
@@ -275,6 +285,11 @@ func (p *powerShellPolicyInfo) manualCommandWhere(keep func(*powerShellHostPolic
 				hosts = append(hosts, h.Host)
 			}
 		}
+	}
+	// Windows PowerShell's policy is unknown, so it may block too; name it
+	// whenever another host blocks rather than leave it out of the command.
+	if p != nil && p.windowsUnclassified && anyBlocking {
+		hosts = append([]string{powerShellHostWindows}, hosts...)
 	}
 	if len(hosts) == 0 && anyBlocking {
 		return ""
@@ -329,6 +344,12 @@ func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable b
 		if h == nil {
 			h = o
 		}
+	}
+	if h == nil {
+		// Every host that answered is fixable, but Windows PowerShell could not
+		// be read, so the per-user change is not offered automatically.
+		return "PowerShell's execution policy (" + policy + ") blocks local scripts, so npm and other script-based tools won't run. " +
+			"Windows PowerShell's policy couldn't be read, so AIExpedite won't change it automatically; to allow local scripts for your user, run: " + manual, false
 	}
 	switch {
 	case h.BlockedBy == psScopeMachinePolicy || h.BlockedBy == psScopeUserPolicy:

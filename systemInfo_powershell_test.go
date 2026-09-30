@@ -193,6 +193,29 @@ func TestGatherPowerShellPolicyWindows_FailedPwshProbeStillQualifiesCommand(t *t
 	}
 }
 
+func TestGatherPowerShellPolicyWindows_FailedWindowsProbeWithholdsFix(t *testing.T) {
+	stubSetupLookPath(t, "pwsh")
+	// Windows PowerShell timed out; only pwsh answered, and it is fixable.
+	f := &policyProbeRunner{answers: map[string]string{"pwsh": restrictedJSON}}
+	p := gatherPowerShellPolicyWindows(context.Background(), f.run)
+	if p == nil || len(p.Hosts) != 1 || p.Hosts[0].Host != powerShellHost7 || !p.BlocksLocalScripts {
+		t.Fatalf("got %+v", p)
+	}
+	// One-shot setup commands run in Windows PowerShell, so a step built from
+	// pwsh alone could leave npm blocked there.
+	if p.FixableByCurrentUser {
+		t.Fatal("the fix must be withheld while Windows PowerShell is unclassified")
+	}
+	want := `powershell -NoProfile -Command "` + powerShellPolicyManualCommand + `"; pwsh -NoProfile -Command "` + powerShellPolicyManualCommand + `"`
+	if got := p.manualCommand(); got != want {
+		t.Fatalf("manual command must cover the unread Windows PowerShell host: got %q want %q", got, want)
+	}
+	msg, fixable := powerShellPolicyFinding(p)
+	if fixable || !strings.Contains(msg, "couldn't be read") || !strings.Contains(msg, want) {
+		t.Fatalf("fixable=%v msg=%q", fixable, msg)
+	}
+}
+
 func TestGatherPowerShellPolicyWindows_NoAnswerIsNil(t *testing.T) {
 	stubSetupLookPath(t)
 	f := &policyProbeRunner{answers: map[string]string{}} // timed out / failed
