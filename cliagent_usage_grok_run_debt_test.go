@@ -1018,3 +1018,41 @@ func TestGrokCompletionMs_RoundsUp(t *testing.T) {
 		t.Fatalf("sub-millisecond = %d, want %d", got, at.UnixMilli()+1)
 	}
 }
+
+func TestGrokRunDebt_WaitsForTheRoundedCompletionBoundary(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	floor := armGrokUsageRunFloor(h.clock())
+
+	// The run completes 0.7 ms into a millisecond; its boundary rounds up.
+	h.advance(700 * time.Microsecond)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("the run must owe a read")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := h.reads.Load(); got != 0 {
+		t.Fatalf("reads = %d, want none before the rounded boundary", got)
+	}
+
+	// Once the clock reaches the boundary the read goes out and pays the debt.
+	h.advance(300 * time.Microsecond)
+	h.idle()
+	if got := h.reads.Load(); got != 1 {
+		t.Fatalf("reads = %d, want one read at the boundary", got)
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, want the boundary read to pay the debt", state)
+	}
+}
+
+func TestGrokBillingReadOnce_ClockRollbackDoesNotWait(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// A completion a minute "in the future" is a clock step, not rounding.
+	if got := grokBillingReadOnce(ctx, "", "fp-ada", h.clock, h.clock().Add(time.Minute)); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome = %q, want ok without waiting for the future completion", got)
+	}
+	if got := h.reads.Load(); got != 1 {
+		t.Fatalf("reads = %d, want 1", got)
+	}
+}

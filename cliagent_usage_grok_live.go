@@ -332,10 +332,21 @@ type grokBillingRead struct {
 // run was still live — cannot reflect that run, so the caller waits it out and
 // sends its own, still one request at a time.
 func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now func() time.Time, notBefore time.Time) string {
-	if n := now(); notBefore.After(n) {
-		// A clock stepped back: a completion "in the future" must not make
-		// every flight look too early.
-		notBefore = n
+	for n := now(); notBefore.After(n); n = now() {
+		if notBefore.Sub(n) > time.Millisecond {
+			// A clock stepped back: a completion "in the future" must not make
+			// every flight look too early.
+			notBefore = n
+			break
+		}
+		// grokCompletionMs rounded the completion up to the next millisecond;
+		// a read sent before that boundary could not pay the debt, so wait
+		// the sub-millisecond out instead of clamping it away.
+		select {
+		case <-ctx.Done():
+			return liveProbeOutcomeTimeout
+		case <-time.After(notBefore.Sub(n)):
+		}
 	}
 	for {
 		ch := grokBillingReadGroup.DoChan("grok:"+fingerprint, func() (any, error) {
