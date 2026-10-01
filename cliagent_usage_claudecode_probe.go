@@ -1108,6 +1108,16 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // while this gather's request is out. The caller releases it once its attempt
 // is over — see releaseClaudeRunDebtClaim.
 func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time, chargedLease int64) {
+	supersedes, chargedDebt, chargedLease, _ = g.seedOwedFromCacheLeased(ctx, fingerprint, token, generation, now, latest)
+	return supersedes, chargedDebt, chargedLease
+}
+
+// seedOwedFromCacheLeased is seedOwedFromCache plus `leasedElsewhere`: true when
+// the debt was declined because ANOTHER process's live claim lease says its
+// request for it is on the wire. The debt is then left unadopted, so a fresh
+// process's gather has no owed baseline and never reaches the later
+// reservation that stands down under the same lease — it must hear it here.
+func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time, chargedLease int64, leasedElsewhere bool) {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
 	// One-shot, for the post-latch stamp recheck below.
@@ -1163,7 +1173,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					continue
 				}
 			}
-			return superseded, time.Time{}, 0
+			return superseded, time.Time{}, 0, false
 		}
 		if pending := g.seedingCh; pending != nil {
 			g.mu.Unlock()
@@ -1175,7 +1185,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			select {
 			case <-pending:
 			case <-ctx.Done():
-				return time.Time{}, time.Time{}, 0
+				return time.Time{}, time.Time{}, 0, false
 			}
 			continue
 		}
@@ -1382,7 +1392,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 				// lease says a request for this debt is already on the wire.
 				lockNow := time.Now()
 				if _, live := claudeRunDebtLeaseLive(snap, lockNow); live {
-					lockedInFlight = true
+					lockedInFlight, leasedElsewhere = true, true
 					return false
 				}
 				if !charge(snap) {
@@ -1490,9 +1500,9 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		}
 		// A debt was adopted, so the caller has a probe to issue: report no
 		// re-read even if the cache moved, or it would return before reaching it.
-		return time.Time{}, chargedDebt, chargedLease
+		return time.Time{}, chargedDebt, chargedLease, false
 	}
-	return g.supersedingObservationLocked(landed, latest, now), chargedDebt, chargedLease
+	return g.supersedingObservationLocked(landed, latest, now), chargedDebt, chargedLease, leasedElsewhere
 }
 
 // supersedingObservationLocked decides whether `observation` — the freshest
@@ -2365,7 +2375,7 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// not that reading. The verdict is carried instead, and answers the forced
 	// gather only if its own attempts produce nothing — re-reading a cache that
 	// advanced still beats publishing the view it loaded before.
-	seeded, seedCharged, seedLease := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
+	seeded, seedCharged, seedLease, seedLeasedElsewhere := claudeUsageProbe.seedOwedFromCacheLeased(ctx, fingerprint, accessToken, generation, now, latest)
 	// The seed charges the adopted debt's durable attempt against the request this
 	// gather is about to issue, but it can only establish that begin() would admit
 	// one as of the moment it charged: the startup replay sitting between its own
@@ -2421,6 +2431,13 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	}()
 	if !seeded.IsZero() && !forced {
 		return true
+	}
+	// The seed declined the persisted debt because another process's claim lease
+	// has its request on the wire. Left unadopted, the debt is invisible to the
+	// `owing` reservation below, so a stale-TTL routine probe would be the same
+	// duplicate that reservation's own lease refusal stands down from.
+	if seedLeasedElsewhere && !forced {
+		return claudeUsageProbe.refreshLandedSince(generation, fingerprint, latest)
 	}
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
 	// BEFORE the run is not "fresh enough" just because it is recent, and this is

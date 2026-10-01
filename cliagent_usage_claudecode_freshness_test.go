@@ -4012,6 +4012,69 @@ func TestClaudeUsageProbe_GatherStandsDownUnderAnotherProcesssLease(t *testing.T
 	}
 }
 
+// The same stand-down for a FRESH process: no debt recorded in memory, so the
+// seed is the one that meets the foreign lease. It declines the debt unadopted
+// and must say why, or the gather skips the reservation and falls through to a
+// stale-TTL routine probe alongside the leased request.
+func TestClaudeUsageProbe_FreshProcessGatherStandsDownWhenTheSeedMeetsAForeignLease(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	foreignLease := now.Add(claudeRunDebtClaimLease() / 2).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAttempts, snap.AttemptClaimedUntilMs = 1, foreignLease
+		return true
+	}) {
+		t.Fatal("precondition: could not persist the foreign lease")
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("precondition: in-memory debt=%v, want none (a fresh process)", owed)
+	}
+
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Fatalf("the gather issued %d requests under another process's lease, want 0", n)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.AttemptClaimedUntilMs != foreignLease {
+		t.Errorf("attempts=%d lease=%d, want the foreign charge %d and lease %d untouched",
+			snap.RefreshOwedAttempts, snap.AttemptClaimedUntilMs, 1, foreignLease)
+	}
+}
+
+// Restoring the persisted wait never puts an OLDER credential's stamp over the
+// one a concurrent 401 recorded locally, while a newer persisted stamp, or one
+// replacing the previously restored wait, is still adopted.
+func TestClaudeUsageProbe_RestoreAuthWaitKeepsANewerLocalWait(t *testing.T) {
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+	old := claudeCredStamp{modNs: 100, size: 1}
+	rewritten := claudeCredStamp{modNs: 200, size: 1}
+
+	claudeUsageProbe.noteAuthWait(rewritten)
+	claudeUsageProbe.restoreAuthWait(old)
+	if got := claudeUsageProbe.authWaitStamp(); got != rewritten {
+		t.Fatalf("in-memory wait=%+v, want the locally recorded newer %+v kept", got, rewritten)
+	}
+
+	newer := claudeCredStamp{modNs: 300, size: 1}
+	claudeUsageProbe.restoreAuthWait(newer)
+	if got := claudeUsageProbe.authWaitStamp(); got != newer {
+		t.Fatalf("in-memory wait=%+v, want the persisted newer %+v adopted", got, newer)
+	}
+
+	// A wait that is still the restored one follows the disk.
+	replaced := claudeCredStamp{modNs: 250, size: 2}
+	claudeUsageProbe.restoreAuthWait(replaced)
+	if got := claudeUsageProbe.authWaitStamp(); got != replaced {
+		t.Errorf("in-memory wait=%+v, want the replaced persisted %+v", got, replaced)
+	}
+}
+
 // The click's early refund of the seed's charge is best-effort; when another
 // writer holds the cache then, the refund is retried once the click is over, so
 // a contended cache never turns a click into a spent automatic slot.

@@ -446,6 +446,14 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 // only while it is still the one restored from disk: a wait this process
 // recorded itself (a 401 never persisted without a debt, or not persisted yet)
 // is newer evidence and stands.
+//
+// The same rule holds for a non-zero stamp: it replaces the in-memory wait only
+// when there is none, when the wait is still the one restored before, or when
+// the persisted wait is on a strictly newer credential write. A gather that
+// read the cache before a concurrent 401 on a rewritten credential recorded its
+// stamp must not put the older stamp back — the failing attempt would persist
+// it, and every later automatic attempt would then mistake the still-rejected
+// credential for a changed one and resend it until the budget ran out.
 func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -456,7 +464,8 @@ func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
 		g.authWaitRestored = claudeCredStamp{}
 		return
 	}
-	if g.authWait != stamp {
+	if g.authWait != stamp &&
+		(g.authWait.isZero() || g.authWait == g.authWaitRestored || stamp.modNs > g.authWait.modNs) {
 		g.authWait, g.authWaitNudged = stamp, claudeCredStamp{}
 	}
 	g.authWaitRestored = stamp
