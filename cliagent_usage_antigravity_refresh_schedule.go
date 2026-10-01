@@ -13,10 +13,12 @@
 //     timer runs a single attempt, and whatever that attempt keeps is
 //     scheduled again. A restart or self-update re-arms the persisted
 //     schedule (adoptAndPayOwedAntigravityRunDebt).
-//   - A state-independent nudge from the gather. When the CLI's newest run log
-//     postdates the cached reading, nudgeAntigravityUsageRefresh arms the same
-//     worker, so a run converges even when no spawn path classified it (a run
-//     the user started in their own shell).
+//   - A state-independent nudge from the gather and the discovery tick. When
+//     the log index's newest OWE-READY run (a finished foreign run,
+//     cliagent_usage_antigravity_log_index.go) postdates the cached reading,
+//     nudgeAntigravityUsageRefresh arms the same worker, so a run converges
+//     even when no spawn path classified it (a run the user started in their
+//     own shell).
 //
 // Cost: at most antigravityRefreshDebtMaxAttempts outbound Code Assist reads per
 // unpaid run, spaced by the ladder and by antigravityRefreshMinInterval; rungs
@@ -252,11 +254,16 @@ func antigravityRunDebtRetryPending() bool {
 	return t.timer != nil
 }
 
-// nudgeAntigravityUsageRefresh is the gather's trigger. It arms the debt worker
-// when a pending debt's booked attempt is due, or — with no debt pending —
-// creates one floored at the newest run log when that log postdates the cached
-// reading (antigravityRunBehindObservation with no slack). That second half is
-// what makes a run converge when no spawn path classified it.
+// nudgeAntigravityUsageRefresh is the gather's and the discovery tick's
+// trigger. It arms the debt worker when a pending debt's booked attempt is due,
+// or — with no debt pending — creates one floored at the owe-ready log (a
+// finished foreign run, as the log index classifies it) when that floor
+// postdates the cached reading (antigravityRunBehindObservation with no
+// slack). That second half is what makes a direct run converge.
+//
+// Nothing at all while one of the agent's own `agy` children runs: its log
+// cannot be classified until it ends, and the cooldown is not stamped, so the
+// next tick is not held back by a nudge that did nothing.
 //
 // Bounds: nothing while the minimum interval since the last outbound read
 // (including a Refresh click's) is running, nothing more than once per
@@ -270,8 +277,8 @@ func antigravityRunDebtRetryPending() bool {
 //
 // Never blocks the gather: one small state-file read-modify-write, and the
 // worker runs on its own goroutine.
-func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog time.Time) bool {
-	if IsShutdownInProgress() || IsOffline() {
+func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.Time) bool {
+	if IsShutdownInProgress() || IsOffline() || antigravityOwnChildRunning() {
 		return false
 	}
 	n := &antigravityRefreshNudge
@@ -281,16 +288,14 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 		return false
 	}
 
-	// Never observed at all is behind any run; otherwise the shared predicate.
-	// The card's observedAt is whole seconds, and the debt worker reads within
-	// a second of a run ending, so the log is compared at the same resolution:
-	// a log from the reading's own second is the run that reading covered, not
-	// a missed one.
-	behind := observedAt == "" && !newestLog.IsZero()
-	if observedAt != "" {
-		_, behind = antigravityRunBehindObservation(observedAt, newestLog.Truncate(time.Second), 0)
-	}
-	settled := behind && now.Sub(newestLog) >= antigravityRefreshMinInterval
+	// observedMs is antigravitySnapshotObservedMs of the cached reading (0:
+	// never observed, which is behind any run). Compared to the millisecond —
+	// the resolution the log index judged the floor owe-ready at — so a direct
+	// run that exits later in the same second as a read is still owed. A reading
+	// cached without ObservedAtMs resolves to the start of its second, which can
+	// only cost one extra refresh.
+	behind := !owedLog.IsZero() && (observedMs == 0 || owedLog.UnixMilli() > observedMs)
+	settled := behind && now.Sub(owedLog) >= antigravityRefreshMinInterval
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := antigravityOldestLiveRunFloorMs() != 0
 
@@ -311,7 +316,7 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 		}
 		if state.RefreshOwedAtMs != 0 &&
 			(state.Attempts >= antigravityRefreshDebtMaxAttempts || state.Outcome == liveProbeOutcomeCodeAssistTokenExpired) &&
-			settled && !liveRun && newestLog.UnixMilli() > state.RefreshOwedFloorMs {
+			settled && !liveRun && owedLog.UnixMilli() > state.RefreshOwedFloorMs {
 			// A terminal debt (no_login, an exhausted ladder) and a settled run
 			// newer than its floor: that run — perhaps after the user signed
 			// in — owes its own refresh, exactly as a settle whose floor moved
@@ -335,7 +340,7 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 			return
 		}
 		state.clearDebt()
-		state.RefreshOwedFloorMs, state.RefreshOwedAtMs = newestLog.UnixMilli(), now.UnixMilli()
+		state.RefreshOwedFloorMs, state.RefreshOwedAtMs = owedLog.UnixMilli(), now.UnixMilli()
 		_, state.Gated = antigravityQuotaGateFor("", now)
 		start, created = true, true
 	})
@@ -345,7 +350,7 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 	n.lastAt = now
 	if created {
 		fmt.Printf("%s[antigravity-freshness] A run finished after the cached reading with no refresh owed (behindBy=%s); refresh owed%s\n",
-			colorYellow, antigravityBehindBy(observedAt, newestLog), colorReset)
+			colorYellow, antigravityBehindBy(observedMs, owedLog), colorReset)
 	}
 	antigravityStartRunDebtWorker(1, false)
 	return true
@@ -353,10 +358,9 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedAt string, newestLog ti
 
 // antigravityBehindBy renders how far a run log postdates the reading, for the
 // nudge's log line; "never" when nothing was ever observed.
-func antigravityBehindBy(observedAt string, newestLog time.Time) string {
-	observed, err := time.Parse(time.RFC3339, observedAt)
-	if err != nil {
+func antigravityBehindBy(observedMs int64, owedLog time.Time) string {
+	if observedMs == 0 {
 		return "never"
 	}
-	return newestLog.Sub(observed).Round(time.Second).String()
+	return owedLog.Sub(time.UnixMilli(observedMs)).Round(time.Second).String()
 }

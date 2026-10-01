@@ -204,19 +204,8 @@ func antigravityLogDir(base string) string {
 // discoverAntigravityHTTPPorts returns candidate loopback ports, newest run
 // first. Ports are read from the CLI's own logs — the server picks a random one
 // per run, so there is nothing to hard-code and nothing to scan for.
-//
-// The second return is the newest log mtime seen in this base, which is the
-// closest thing the device has to "when did an agy run last happen here". It is
-// returned rather than re-derived so the missed-run backstop
-// (antigravityMissedRun) and the gather's refresh nudge reuse the ReadDir this
-// function already paid for instead of walking the same directory a second time
-// on every refresh.
-func discoverAntigravityHTTPPorts(base string) ([]int, time.Time) {
+func discoverAntigravityHTTPPorts(base string) []int {
 	files := antigravityRunLogs(base)
-	if len(files) == 0 {
-		return nil, time.Time{}
-	}
-	newestLog := files[0].modTime
 	if len(files) > antigravityQuotaMaxLogs {
 		files = files[:antigravityQuotaMaxLogs]
 	}
@@ -235,22 +224,19 @@ func discoverAntigravityHTTPPorts(base string) ([]int, time.Time) {
 			seen[port] = true
 			ports = append(ports, port)
 			if len(ports) >= antigravityQuotaMaxPorts {
-				return ports, newestLog
+				return ports
 			}
 		}
 	}
-	return ports, newestLog
+	return ports
 }
 
-// antigravityNewestRunLog is the newest run-log mtime under base, or the zero
-// time when there is none — the ReadDir-only half of
-// discoverAntigravityHTTPPorts, for a gather on a CSRF-gated build that has no
-// server to discover and so must not pay for reading log bodies.
+// antigravityNewestRunLog is the newest OWE-READY run under base: a finished
+// foreign run no reading covers yet, as the log index classifies it
+// (cliagent_usage_antigravity_log_index.go). Zero when there is none. The
+// agent's own `agy` children and runs still in progress are never returned.
 func antigravityNewestRunLog(base string) time.Time {
-	if files := antigravityRunLogs(base); len(files) > 0 {
-		return files[0].modTime
-	}
-	return time.Time{}
+	return antigravityNewestOwedLog([]string{base}, antigravityUsageFreshnessNow())
 }
 
 // antigravityRunLog is one CLI run log: where it is and when it last changed.
@@ -259,27 +245,50 @@ type antigravityRunLog struct {
 	modTime time.Time
 }
 
-// antigravityRunLogs lists base's run logs, newest first, from directory
-// metadata alone. A missing or unreadable log directory is no logs.
+// antigravityRunLogs lists base's recent run logs, newest first. `agy` never
+// prunes its logs (thousands on a long-lived device), so only the newest
+// antigravityWatchedNewest names, plus the log index's candidates, are
+// stat'ed — never the whole stamped directory. Unstamped (legacy) names sort
+// after every stamped one and carry no time, so they are ranked by mtime and
+// up to antigravityLegacyReadReserve of the newest keep a slot: a live run in
+// a legacy log is not truncated away by older stamped names. A missing or
+// unreadable log directory is no logs.
 func antigravityRunLogs(base string) []antigravityRunLog {
+	names, ok := antigravityListLogNames(base)
+	if !ok {
+		return nil
+	}
 	dir := antigravityLogDir(base)
-	if dir == "" {
-		return nil
+	stampedEnd := len(names)
+	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
+		stampedEnd--
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
+	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], time.Time{}, false)
+	if len(legacy) > antigravityLegacyReadReserve {
+		legacy = legacy[len(legacy)-antigravityLegacyReadReserve:]
 	}
-	files := make([]antigravityRunLog, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
-			continue
+	stamped := names[:stampedEnd]
+	if limit := antigravityWatchedNewest - len(legacy); len(stamped) > limit {
+		stamped = stamped[:limit]
+	}
+	names = append(append([]string(nil), stamped...), legacy...)
+	paths := make([]string, 0, len(names)+antigravityCandidateCap)
+	seen := map[string]bool{}
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	for _, path := range antigravityCandidatePaths(base) {
+		if !seen[path] {
+			paths = append(paths, path)
 		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
+	}
+	files := make([]antigravityRunLog, 0, len(paths))
+	for _, path := range paths {
+		if stat, ok := antigravityStatLog(path); ok {
+			files = append(files, antigravityRunLog{path: path, modTime: stat.mtime})
 		}
-		files = append(files, antigravityRunLog{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime.After(files[j].modTime) })
 	return files
@@ -411,34 +420,30 @@ func antigravityPostJSONOutcome(ctx context.Context, client *http.Client, port i
 // (snapshot, true) only when at least one usable bucket came back — a server
 // that answers with an empty quota (signed out, or a plan with no metered pool)
 // must not overwrite a good cached reading with nothing.
-// The newest log mtime under this base is returned alongside, so a caller that
-// ends up replaying a cached snapshot can tell whether a run has happened since
-// that snapshot was taken (antigravityMissedRun) without a second directory
-// walk.
-func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (antigravityQuotaSnapshot, time.Time, bool) {
-	snap, newestLog, ok, _ := fetchAntigravityQuotaDetailed(ctx, base, now)
-	return snap, newestLog, ok
+func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (antigravityQuotaSnapshot, bool) {
+	snap, ok, _ := fetchAntigravityQuotaDetailed(ctx, base, now)
+	return snap, ok
 }
 
 // fetchAntigravityQuotaDetailed is fetchAntigravityQuota plus whether a live
 // server REFUSED the read (gated). A gated port is still a live server, so it
 // ends the walk: no other port from the same logs will answer differently.
-func fetchAntigravityQuotaDetailed(ctx context.Context, base string, now time.Time) (snap antigravityQuotaSnapshot, newestLog time.Time, ok, gated bool) {
-	ports, newestLog := discoverAntigravityHTTPPorts(base)
+func fetchAntigravityQuotaDetailed(ctx context.Context, base string, now time.Time) (snap antigravityQuotaSnapshot, ok, gated bool) {
+	ports := discoverAntigravityHTTPPorts(base)
 	if len(ports) == 0 {
-		return antigravityQuotaSnapshot{}, newestLog, false, false
+		return antigravityQuotaSnapshot{}, false, false
 	}
 	client := antigravityLoopbackClient()
 	defer client.CloseIdleConnections()
 	for _, port := range ports {
 		switch snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, port, now); outcome {
 		case antigravityFetchOK:
-			return snap, newestLog, true, false
+			return snap, true, false
 		case antigravityFetchGated:
-			return antigravityQuotaSnapshot{}, newestLog, false, true
+			return antigravityQuotaSnapshot{}, false, true
 		}
 	}
-	return antigravityQuotaSnapshot{}, newestLog, false, false
+	return antigravityQuotaSnapshot{}, false, false
 }
 
 // antigravityMissedRunSlack is how far a log may postdate the observation it
@@ -447,7 +452,7 @@ func fetchAntigravityQuotaDetailed(ctx context.Context, base string, now time.Ti
 // Load-bearing, not a fudge factor: the Refresh-click live probe
 // (probeAntigravityQuotaLive) starts its own `agy`, and that process keeps
 // writing its log for seconds after the reading the probe already persisted. A
-// bare `newestLog > observedAt` comparison would therefore warn on every
+// bare `log > observedAt` comparison would therefore warn on every
 // successful refresh, which is the opposite of the signal this exists to give.
 const antigravityMissedRunSlack = 60 * time.Second
 
@@ -463,38 +468,38 @@ const antigravityMissedRunSlack = 60 * time.Second
 // snapshot). Without it both look identical from the outside: observed_stale.
 //
 // Timestamps and counts only — no paths, no log text, no account.
-func antigravityMissedRun(observedAt string, newestLog time.Time, logBases int) {
-	observed, behind := antigravityRunBehindObservation(observedAt, newestLog, antigravityMissedRunSlack)
+func antigravityMissedRun(observedAt string, owedLog time.Time, logBases int) {
+	observed, behind := antigravityRunBehindObservation(observedAt, owedLog, antigravityMissedRunSlack)
 	if !behind {
 		return
 	}
 	fmt.Printf("%s[antigravity-quota] a run completed after the last observation (observedAt=%s newestRunLog=%s behindBy=%s basesWalked=%d) — that run's quota was never captured%s\n",
-		colorYellow, observed.UTC().Format(time.RFC3339), newestLog.UTC().Format(time.RFC3339),
-		newestLog.Sub(observed).Round(time.Second), logBases, colorReset)
+		colorYellow, observed.UTC().Format(time.RFC3339), owedLog.UTC().Format(time.RFC3339),
+		owedLog.Sub(observed).Round(time.Second), logBases, colorReset)
 }
 
-// antigravityRunBehindObservation reports whether the newest run log postdates
+// antigravityRunBehindObservation reports whether an owe-ready run's floor postdates
 // the reading observed at observedAt by more than slack, and returns the parsed
 // observation. No log, or an observation that cannot be parsed, is not evidence
 // of anything.
 //
 // The single predicate behind both the missed-run diagnostic (which keeps
 // antigravityMissedRunSlack so a Refresh click's own `agy` does not warn about
-// itself) and the gather's refresh nudge (nudgeAntigravityUsageRefresh), which
-// passes 0: newestLog and observedAt are both fixed once a run ends, so a run
-// that finished within the slack of the last observation would fail the
-// comparison on that gather and on every gather after it — exactly the short
-// runs a maintenance smoke produces. The nudge applies its own settle guard
-// instead.
-func antigravityRunBehindObservation(observedAt string, newestLog time.Time, slack time.Duration) (time.Time, bool) {
-	if newestLog.IsZero() || observedAt == "" {
+// itself). The refresh nudge (nudgeAntigravityUsageRefresh) keeps no slack
+// and compares to the millisecond instead: owedLog and observedAt are both
+// fixed once a run ends, so a run that finished within the slack of the last
+// observation would fail the comparison on that gather and on every gather
+// after it — exactly the short runs a maintenance smoke produces. The nudge
+// applies its own settle guard instead.
+func antigravityRunBehindObservation(observedAt string, owedLog time.Time, slack time.Duration) (time.Time, bool) {
+	if owedLog.IsZero() || observedAt == "" {
 		return time.Time{}, false
 	}
 	observed, err := time.Parse(time.RFC3339, observedAt)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return observed, newestLog.After(observed.Add(slack))
+	return observed, owedLog.After(observed.Add(slack))
 }
 
 // fetchAntigravityQuotaOnPort runs the quota + identity RPC pair against ONE
@@ -522,13 +527,12 @@ func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client
 	case antigravityRPCFailed:
 		return antigravityQuotaSnapshot{}, antigravityFetchFailed
 	}
-	snap, ok := antigravitySnapshotFromGroups(quota.Response.Groups, now)
-	if !ok {
-		return antigravityQuotaSnapshot{}, antigravityFetchFailed
-	}
 	// Identity comes from the same server, on the same port, in the same
 	// probe — so the quota and the account it belongs to can never be
-	// stitched together from two different signed-in sessions.
+	// stitched together from two different signed-in sessions. It is resolved
+	// BEFORE the buckets are converted (after the CSRF-gated quota check),
+	// because exhaustion evidence applies only to the account it names; a
+	// failed lookup applies none.
 	var status struct {
 		UserStatus struct {
 			Name       string `json:"name"`
@@ -540,10 +544,21 @@ func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client
 			} `json:"planStatus"`
 		} `json:"userStatus"`
 	}
+	account, plan := "", ""
 	if antigravityPostJSON(ctx, client, port, antigravityStatusRPC, &status) {
-		snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
-		snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
+		account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
+		plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
 	}
+	var evidence []antigravityExhaustionEvent
+	if fingerprint := fingerprintAccount("antigravity", account); fingerprint != "" {
+		evidence = antigravityExhaustionEvidenceFn(now, fingerprint)
+	}
+	snap, shape, ok := antigravitySnapshotFromGroups(quota.Response.Groups, now, evidence)
+	logAntigravityQuotaShapeOnce(shape)
+	if !ok {
+		return antigravityQuotaSnapshot{}, antigravityFetchFailed
+	}
+	snap.Account, snap.Plan = account, plan
 	return snap, antigravityFetchOK
 }
 
@@ -552,15 +567,71 @@ func fetchAntigravityQuotaOnPortOutcome(ctx context.Context, client *http.Client
 type antigravityQuotaGroupWire struct {
 	DisplayName string `json:"displayName"`
 	Buckets     []struct {
-		BucketID    string `json:"bucketId"`
-		DisplayName string `json:"displayName"`
-		Window      string `json:"window"`
-		// Pointer so an absent or null fraction is distinguishable from a
-		// real 0 — decoded into a plain float64 it would silently become
-		// "100% consumed".
-		RemainingFraction *float64 `json:"remainingFraction"`
-		ResetTime         string   `json:"resetTime"`
+		BucketID          string                  `json:"bucketId"`
+		DisplayName       string                  `json:"displayName"`
+		Window            string                  `json:"window"`
+		RemainingFraction antigravityWireFraction `json:"remainingFraction"`
+		ResetTime         string                  `json:"resetTime"`
 	} `json:"buckets"`
+}
+
+// antigravityFractionState is what the wire said about a bucket's
+// remainingFraction. Omitted and null are NOT the same fact: Google omits the
+// field for a bucket with nothing left (proto3 drops a zero), while null says
+// nothing at all — so neither may silently become "100% consumed", and only an
+// omitted one may be charted as exhausted, and only with evidence
+// (antigravitySnapshotFromGroups).
+type antigravityFractionState int
+
+const (
+	antigravityFractionOmitted antigravityFractionState = iota
+	antigravityFractionNull
+	antigravityFractionValid
+	antigravityFractionInvalid
+)
+
+// antigravityWireFraction decodes remainingFraction with its presence. A value
+// that is not a number in [0, 1] is Invalid rather than a decode error, so one
+// malformed bucket cannot fail the whole reply.
+type antigravityWireFraction struct {
+	State antigravityFractionState
+	Value float64
+}
+
+func (f *antigravityWireFraction) UnmarshalJSON(raw []byte) error {
+	raw = bytes.TrimSpace(raw)
+	if string(raw) == "null" {
+		*f = antigravityWireFraction{State: antigravityFractionNull}
+		return nil
+	}
+	var v float64
+	if json.Unmarshal(raw, &v) != nil || math.IsNaN(v) || v < 0 || v > 1 {
+		*f = antigravityWireFraction{State: antigravityFractionInvalid}
+		return nil
+	}
+	*f = antigravityWireFraction{State: antigravityFractionValid, Value: v}
+	return nil
+}
+
+// antigravityQuotaShape counts what a quota reply held — integers only, the
+// one diagnostic about a reply that is safe to log (logAntigravityQuotaShapeOnce).
+type antigravityQuotaShape struct {
+	Groups              int
+	Buckets             int
+	WindowsRecognised   int
+	WindowsUnrecognised int
+	FractionValid       int
+	FractionOmitted     int
+	FractionNull        int
+	FractionInvalid     int
+	ResetMissing        int
+	OmittedCharted      int
+}
+
+func (s antigravityQuotaShape) String() string {
+	return fmt.Sprintf("groups=%d buckets=%d windowsRecognised=%d windowsUnrecognised=%d fractionValid=%d fractionOmitted=%d fractionNull=%d fractionInvalid=%d resetMissing=%d omittedCharted=%d",
+		s.Groups, s.Buckets, s.WindowsRecognised, s.WindowsUnrecognised, s.FractionValid,
+		s.FractionOmitted, s.FractionNull, s.FractionInvalid, s.ResetMissing, s.OmittedCharted)
 }
 
 // antigravitySnapshotFromGroups turns a QuotaSummary into the persisted
@@ -568,17 +639,45 @@ type antigravityQuotaGroupWire struct {
 // cannot plot is not an observation, and counting raw buckets would let a
 // schema change pass as success and overwrite the last usable cached reading
 // with rows that all render Unknown.
-func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time) (antigravityQuotaSnapshot, bool) {
+//
+// An OMITTED fraction is unknown unless evidence names that bucket: a managed
+// run of the same account hit RESOURCE_EXHAUSTED with a reset within
+// antigravityExhaustionMatch of the bucket's own reset. Only then is it
+// charted as fully consumed. Null and invalid fractions are always skipped.
+func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time, evidence []antigravityExhaustionEvent) (antigravityQuotaSnapshot, antigravityQuotaShape, bool) {
 	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339), ObservedAtMs: now.UnixMilli()}
+	shape := antigravityQuotaShape{Groups: len(groups)}
 	plottable := 0
 	for _, group := range groups {
 		for _, bucket := range group.Buckets {
-			// A bucket with no usable fraction is not a reading. Keeping it
-			// would both render as 100% consumed and let a malformed payload
-			// count as an observation that replaces a good cached one.
-			if bucket.RemainingFraction == nil ||
-				math.IsNaN(*bucket.RemainingFraction) ||
-				*bucket.RemainingFraction < 0 || *bucket.RemainingFraction > 1 {
+			shape.Buckets++
+			_, _, recognised := antigravityWindowKind(bucket.Window)
+			if recognised {
+				shape.WindowsRecognised++
+			} else {
+				shape.WindowsUnrecognised++
+			}
+			reset, resetErr := time.Parse(time.RFC3339, bucket.ResetTime)
+			if resetErr != nil {
+				shape.ResetMissing++
+			}
+			var fraction float64
+			switch bucket.RemainingFraction.State {
+			case antigravityFractionValid:
+				shape.FractionValid++
+				fraction = bucket.RemainingFraction.Value
+			case antigravityFractionOmitted:
+				shape.FractionOmitted++
+				if resetErr != nil || !antigravityEvidenceNamesReset(evidence, reset) {
+					continue
+				}
+				shape.OmittedCharted++
+				fraction = 0
+			case antigravityFractionNull:
+				shape.FractionNull++
+				continue
+			default:
+				shape.FractionInvalid++
 				continue
 			}
 			snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
@@ -586,18 +685,33 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 				Group:             group.DisplayName,
 				DisplayName:       bucket.DisplayName,
 				Window:            bucket.Window,
-				RemainingFraction: *bucket.RemainingFraction,
+				RemainingFraction: fraction,
 				ResetTime:         bucket.ResetTime,
 			})
-			if _, _, ok := antigravityWindowKind(bucket.Window); ok {
+			if recognised {
 				plottable++
 			}
 		}
 	}
 	if plottable == 0 {
-		return antigravityQuotaSnapshot{}, false
+		return antigravityQuotaSnapshot{}, shape, false
 	}
-	return snap, true
+	return snap, shape, true
+}
+
+// antigravityEvidenceNamesReset reports whether an exhaustion event's reset is
+// within antigravityExhaustionMatch of a bucket's reset.
+func antigravityEvidenceNamesReset(evidence []antigravityExhaustionEvent, reset time.Time) bool {
+	for _, event := range evidence {
+		delta := time.UnixMilli(event.resetAtMs).Sub(reset)
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta <= antigravityExhaustionMatch {
+			return true
+		}
+	}
+	return false
 }
 
 // loadAntigravityQuotaSnapshot reads the cached snapshot, scoped to the current
@@ -803,7 +917,7 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 	// here, so a run's refresh debt is retired exactly once by whichever of
 	// them covers its floor. Takes only the freshness lock — the cache lock is
 	// held here, and the package's lock order is cache -> freshness.
-	settleAntigravityRunFreshness(antigravitySnapshotObservedMs(snap))
+	settleAntigravityRunFreshness(antigravitySnapshotObservedMs(snap), snap.AccountFingerprint)
 	return true
 }
 

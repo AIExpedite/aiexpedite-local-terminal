@@ -52,3 +52,6 @@ func GetTrackedCwd() string {
 
 // ShutdownPowerShell is a no-op on non-Windows platforms.
 func ShutdownPowerShell() {}
+
+// HostPID is a stub (never called on non-Windows).
+func (ps *PersistentPowerShell) HostPID() int { return 0 }

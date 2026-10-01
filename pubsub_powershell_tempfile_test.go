@@ -21,12 +21,12 @@ func withSpiedTransports(t *testing.T) (called *struct{ arg, tempFile bool }, la
 	origArg := runEncodedPowerShellViaArgFn
 	origTempFile := runPowerShellCommandViaTempFileFn
 
-	runEncodedPowerShellViaArgFn = func(encoded string, workDir string, timeout time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(encoded string, workDir string, timeout time.Duration, _ func(int)) (string, error) {
 		flags.arg = true
 		*captured = encoded
 		return "arg-stub", nil
 	}
-	runPowerShellCommandViaTempFileFn = func(script string, workDir string, timeout time.Duration) (string, error) {
+	runPowerShellCommandViaTempFileFn = func(script string, workDir string, timeout time.Duration, _ func(int)) (string, error) {
 		flags.tempFile = true
 		*captured = script
 		return "tempfile-stub", nil
@@ -49,7 +49,7 @@ func TestSmallEncodedScriptUsesArgPath(t *testing.T) {
 		t.Fatalf("test setup invariant violated: short script encoded to %d chars", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 5*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 5*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestLargeEncodedScriptUsesTempFilePath(t *testing.T) {
 		t.Fatalf("test setup invariant violated: large script encoded to only %d chars", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 5*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 5*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestTempFileExecutesLargeScript(t *testing.T) {
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected temp-file large script to succeed, got error: %v\noutput: %s", err, out)
 	}
@@ -133,7 +133,7 @@ func TestInvalidBase64AboveThresholdReturnsError(t *testing.T) {
 	// the decoder. Sized above the threshold so the fallback path is taken.
 	bad := strings.Repeat("!", encodedCommandFallbackThreshold+10)
 
-	out, err := runEncodedPowerShellCommand(bad, "", 5*time.Second)
+	out, err := runEncodedPowerShellCommand(bad, "", 5*time.Second, nil)
 	if err == nil {
 		t.Fatalf("expected decode error to surface, got nil (output: %q)", out)
 	}
@@ -166,7 +166,7 @@ Write-Output "EXISTS-DURING:$(Test-Path -LiteralPath $path)"
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v\noutput: %s", err, out)
 	}
@@ -226,7 +226,7 @@ Write-Output 'cjk-中文-cjk'
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected success, got error: %v\noutput: %s", err, out)
 	}
@@ -326,7 +326,7 @@ if ($null -eq $line -or $line.Length -eq 0) {
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
-	out, runErr := runEncodedPowerShellCommand(encoded, "", 15*time.Second)
+	out, runErr := runEncodedPowerShellCommand(encoded, "", 15*time.Second, nil)
 	if runErr != nil {
 		t.Fatalf("expected success, got error: %v\noutput: %s", runErr, out)
 	}
@@ -404,7 +404,7 @@ func TestTempFileRunsWithProcessScopedBypass(t *testing.T) {
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
-	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
+	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
 	}
@@ -422,7 +422,7 @@ func TestEncodedArgRunsWithProcessScopedBypass(t *testing.T) {
 	}
 
 	clearInheritedPolicyPreference(t)
-	out, err := runEncodedPowerShellViaArg(encodeForPowerShell(processPolicyProbe), "", 30*time.Second)
+	out, err := runEncodedPowerShellViaArg(encodeForPowerShell(processPolicyProbe), "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
 	}

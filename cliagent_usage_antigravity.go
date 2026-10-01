@@ -86,35 +86,33 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	defer cancel()
 	var fresh antigravityQuotaSnapshot
 	var gotFresh bool
-	// The newest run log across EVERY base walked, not just the winning one: a
-	// legacy ~/.agy run must not look invisible because the modern tree happens
-	// to hold older logs.
-	var newestLog time.Time
 	// A build known to refuse loopback reads (cliagent_usage_antigravity_gate.go)
-	// gets no port discovery and no loopback fetch: only the log mtimes the
-	// missed-run diagnostic and the refresh nudge need, which cost a ReadDir
-	// rather than up to antigravityQuotaMaxLogs log-body reads.
+	// gets no port discovery and no loopback fetch.
 	gate, gatedBuild := antigravityQuotaGateFor(detected.Version, now)
 	// gatedNow: a live server answered this gather with the CSRF refusal — the
 	// one case where "no fresh reading" is a fact about the build rather than
 	// about timing.
 	gatedNow := false
-	for _, quotaBase := range quotaBases {
-		var baseNewestLog time.Time
-		if gatedBuild {
-			baseNewestLog = antigravityNewestRunLog(quotaBase)
-		} else {
+	if !gatedBuild {
+		for _, quotaBase := range quotaBases {
 			var baseGated bool
-			fresh, baseNewestLog, gotFresh, baseGated = fetchAntigravityQuotaDetailed(quotaCtx, quotaBase, now)
+			fresh, gotFresh, baseGated = fetchAntigravityQuotaDetailed(quotaCtx, quotaBase, now)
 			gatedNow = gatedNow || baseGated
-		}
-		if baseNewestLog.After(newestLog) {
-			newestLog = baseNewestLog
-		}
-		if gotFresh {
-			break
+			if gotFresh {
+				break
+			}
 		}
 	}
+	// The newest OWE-READY run across every base (a legacy ~/.agy run must not
+	// look invisible because the modern tree holds older logs): a finished
+	// foreign run no reading covers yet, as the log index classifies it
+	// (cliagent_usage_antigravity_log_index.go). The agent's own `agy`
+	// children, managed runs and runs still going never count — the newest log
+	// by mtime did, which is how every `agy models` probe owed a refresh.
+	owedLog := antigravityNewestOwedLog(quotaBases, now)
+	// While the agent's own `agy` child is running, a log it is still writing
+	// cannot be classified yet: neither the diagnostic nor the nudge acts.
+	ownChildRunning := antigravityOwnChildRunning()
 	if gatedNow {
 		noteAntigravityQuotaGate(detected.Version, now)
 		gate, gatedBuild = antigravityQuotaGateFor(detected.Version, now)
@@ -206,20 +204,20 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// ever worded by one source.
 		usage.Notice = freshnessNotice
 		usage.NoticeSeverity = "warning"
-	case !gotFresh && !freshnessPending:
-		// Replaying. If the CLI's own logs show a run finished after this
+	case !gotFresh && !freshnessPending && !ownChildRunning:
+		// Replaying. If the log index shows a foreign run finished after this
 		// reading was taken, that run's quota was never captured — say so, once,
 		// so the next maintenance pass can tell an unrecognised transport from a
 		// server that refused to attribute its reading. Skipped while a debt is
 		// pending: the debt is the better signal for the same run, and the pair
 		// would double-report it.
-		antigravityMissedRun(snap.ObservedAt, newestLog, len(quotaBases))
+		antigravityMissedRun(snap.ObservedAt, owedLog, len(quotaBases))
 	}
-	if !gotFresh {
-		// The same evidence, acted on: a due retry, or a run log newer than the
-		// replayed reading, arms the bounded refresh so the next gather replays
+	if !gotFresh && !ownChildRunning {
+		// The same evidence, acted on: a due retry, or an owe-ready run newer
+		// than the replayed reading, arms the bounded refresh so the next gather replays
 		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
-		nudgeAntigravityUsageRefresh(now, snap.ObservedAt, newestLog)
+		nudgeAntigravityUsageRefresh(now, antigravitySnapshotObservedMs(snap), owedLog)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

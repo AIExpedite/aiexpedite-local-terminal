@@ -11,9 +11,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +48,7 @@ func TestAntigravityClassify_MatchingPayloadNeverEscapes(t *testing.T) {
 		if !commandRunsAntigravity("powershell.exe", args) {
 			t.Error("a wrapped agy payload must classify as a spawn")
 		}
-		release := armAntigravityCaptureForCommand("windows execute", "powershell.exe", args)
+		release := armAntigravityCaptureForCommand("windows execute", "powershell.exe", args).Finish
 		helperAwaitSnapshot(t, cache, time.Time{}, "a capture under the wrapped payload")
 		helperStopCapture(t, release)
 	})
@@ -122,7 +126,7 @@ func TestAntigravityClassify_NonMatchingPayloadNeverEscapes(t *testing.T) {
 			t.Error("an npm payload must not classify as an agy spawn")
 		}
 		// Arming is the other half: a no-op release must also be silent.
-		armAntigravityCaptureForCommand("windows execute", "powershell.exe", args)()
+		armAntigravityCaptureForCommand("windows execute", "powershell.exe", args).Finish()
 	})
 	helperAssertNoSecrets(t, "the agent log", logged)
 	if got := antigravityCaptureArms.Load(); got != 0 {
@@ -166,7 +170,7 @@ func TestAntigravityRefreshSchedule_PersistsAndLogsMetricsOnly(t *testing.T) {
 	antigravityRefreshMinInterval = time.Nanosecond
 
 	logged := captureStdout(t, func() {
-		nudgeAntigravityUsageRefresh(now, observed.Format(time.RFC3339), antigravityNewestRunLog(base))
+		nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), antigravityNewestRunLog(base))
 		antigravityUsageRefreshWaitIdle()
 		// And the restart path's own line, for a booked rung in the future.
 		stopAntigravityRunDebtRetry()
@@ -214,5 +218,96 @@ func TestAntigravityRefreshSchedule_PersistsAndLogsMetricsOnly(t *testing.T) {
 	var next int64
 	if err := json.Unmarshal(decoded["nextAttemptAtMs"], &next); err != nil || next <= now.UnixMilli() {
 		t.Errorf("nextAttemptAtMs=%s, want one future epoch-millisecond int", decoded["nextAttemptAtMs"])
+	}
+}
+
+// helperANSI strips the terminal colour codes the agent log carries.
+var helperANSI = regexp.MustCompile(string(rune(0x1b)) + `\[[0-9;]*m`)
+
+// helperMetricsOnlyLine is the shape every NEW log line of the utilization
+// capture must have: a fixed lowercase label, then integer counters only.
+var helperMetricsOnlyLine = regexp.MustCompile(`^[a-z\-\[\] ]+: ([a-zA-Z]+=-?\d+ ?)+$`)
+
+// Strict redaction for the new lines: a reply planted with secrets in its
+// keys, windows, status / reason strings and an account, plus a 300 KB body,
+// logs its shape as integers and nothing else; the discovery hold counter and
+// the shutdown drain line are counters too.
+func TestAntigravityUtilizationLines_MetricsOnly(t *testing.T) {
+	helperIsolateLogIndex(t)
+	antigravityQuotaShapesLogged.mu.Lock()
+	antigravityQuotaShapesLogged.seen = nil
+	antigravityQuotaShapesLogged.mu.Unlock()
+
+	const secret = "sk-live-DO-NOT-LEAK-0987654321"
+	big := strings.Repeat("x", 300*1024)
+	raw := `{"response":{"status":"` + secret + `","reason":"` + secret + `","groups":[{"displayName":"` + secret + `","buckets":[
+	  {"bucketId":"` + secret + `","window":"` + secret + `","remainingFraction":0.5,"resetTime":"` + secret + `"},
+	  {"bucketId":"ada@example.com","window":"5h","displayName":"` + big + `"}]}]}}`
+	var reply struct {
+		Response struct {
+			Groups []antigravityQuotaGroupWire `json:"groups"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
+		t.Fatal(err)
+	}
+
+	origDrain := antigravityShutdownDrain
+	antigravityShutdownDrain = 10 * time.Millisecond
+	defer func() { antigravityShutdownDrain = origDrain }()
+	logged := captureStdout(t, func() {
+		_, shape, _ := antigravitySnapshotFromGroups(reply.Response.Groups, time.Now(), nil)
+		logAntigravityQuotaShapeOnce(shape)
+		logAntigravityQuotaShapeOnce(shape) // once per distinct shape
+		antigravityApplyDiscovery(antigravityDiscoveryResult{heldOwed: 2}, time.Now())
+		antigravityFreshnessInFlight.Add(1)
+		drainAntigravityUsageWrites(context.Background())
+		antigravityFreshnessInFlight.Add(-1)
+	})
+
+	var lines []string
+	for _, line := range strings.Split(helperANSI.ReplaceAllString(logged, ""), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines=%q, want the shape (once), the hold counter and the drain line", lines)
+	}
+	for _, line := range lines {
+		if !helperMetricsOnlyLine.MatchString(line) {
+			t.Errorf("line %q is not metrics-only", line)
+		}
+		for _, leak := range []string{secret, "ada@", "xxxx"} {
+			if strings.Contains(line, leak) {
+				t.Errorf("line %q leaked %q", line, leak)
+			}
+		}
+	}
+}
+
+// The published usage entry and each metric keep exactly today's fields: the
+// capture's evidence, shape counters and attempt marks never leave the device.
+func TestAntigravityUtilization_PublishedShapeUnchanged(t *testing.T) {
+	jsonNames := func(v any) string {
+		typ := reflect.TypeOf(v)
+		names := make([]string, 0, typ.NumField())
+		for i := 0; i < typ.NumField(); i++ {
+			names = append(names, strings.Split(typ.Field(i).Tag.Get("json"), ",")[0])
+		}
+		sort.Strings(names)
+		return strings.Join(names, " ")
+	}
+	for _, tc := range []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"cliAgentUsage", cliAgentUsage{}, "account accountFingerprint authState authenticated cliAgentId collectedAt dataSource loginExpirationState loginExpiresAt metrics model modelDetails models modelsExhaustive name notice noticeSeverity noticeUrl path plan provider usageGeneration version"},
+		{"cliAgentUsageMetric", cliAgentUsageMetric{}, "consumed kind label model observedAt remaining resetAt total unit unknown"},
+	} {
+		if got := jsonNames(tc.v); got != tc.want {
+			t.Errorf("%s fields=%q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

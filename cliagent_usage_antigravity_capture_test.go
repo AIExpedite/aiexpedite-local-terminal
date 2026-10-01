@@ -210,7 +210,7 @@ func TestAntigravityQuotaCapture_WritesSnapshotObservedDuringTheRun(t *testing.T
 	// RFC3339 has one-second resolution, so the run window has to be compared
 	// against the truncated start instant.
 	start := time.Now().UTC().Truncate(time.Second)
-	finish := startAntigravityQuotaCapture("test run")
+	finish := startAntigravityQuotaCapture("test run").Finish
 	snap := helperAwaitSnapshot(t, cache, time.Time{}, "the first mid-run capture")
 	helperStopCapture(t, finish)
 	end := time.Now().UTC()
@@ -241,9 +241,9 @@ func TestAntigravityQuotaCapture_SingleFlightUntilLastFinish(t *testing.T) {
 	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 
-	first := startAntigravityQuotaCapture("run one")
+	first := startAntigravityQuotaCapture("run one").Finish
 	stopped := antigravityCaptureStopped()
-	second := startAntigravityQuotaCapture("run two")
+	second := startAntigravityQuotaCapture("run two").Finish
 	if antigravityCaptureStopped() != stopped {
 		t.Fatal("the second arm started a second poller instead of joining the first")
 	}
@@ -285,8 +285,8 @@ func TestAntigravityQuotaCapture_SettlesOncePerRunNotPerPollerExit(t *testing.T)
 	// No server: nothing can capture, so every run finishes owing a refresh.
 	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
 
-	short := startAntigravityQuotaCapture("short run")
-	long := startAntigravityQuotaCapture("long run")
+	short := startAntigravityQuotaCapture("short run").Finish
+	long := startAntigravityQuotaCapture("long run").Finish
 	stopped := antigravityCaptureStopped()
 	short()
 	short() // idempotent: the second release must not settle a second time
@@ -325,7 +325,7 @@ func TestAntigravityQuotaCapture_ProbesImmediatelyOnArm(t *testing.T) {
 	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("immediate run")
+	finish := startAntigravityQuotaCapture("immediate run").Finish
 	snap := helperAwaitSnapshot(t, cache, time.Time{}, "the arm-time probe")
 	if snap.AccountFingerprint == "" {
 		t.Errorf("arm-time snapshot is not attributable: %+v", snap)
@@ -339,7 +339,7 @@ func TestAntigravityQuotaCapture_ProbesImmediatelyOnArm(t *testing.T) {
 func TestAntigravityQuotaCapture_DiscoversServerThatBindsAfterArm(t *testing.T) {
 	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 
-	finish := startAntigravityQuotaCapture("late-server run")
+	finish := startAntigravityQuotaCapture("late-server run").Finish
 	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 	if _, err := os.Stat(cache); err == nil {
@@ -362,7 +362,7 @@ func TestAntigravityQuotaCapture_RetriesAfterAnIdentityBlip(t *testing.T) {
 		helperQuotaJSON, helperStatusJSON)
 	server.identityDown.Store(true)
 
-	finish := startAntigravityQuotaCapture("blippy run")
+	finish := startAntigravityQuotaCapture("blippy run").Finish
 	defer helperStopCapture(t, finish)
 
 	// Let several ticks land while identity is down.
@@ -392,7 +392,7 @@ func TestAntigravityQuotaCapture_MemoizesThePortAcrossAttempts(t *testing.T) {
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	server := helperStartCaptureServer(t, base, helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("memo run")
+	finish := startAntigravityQuotaCapture("memo run").Finish
 	defer helperStopCapture(t, finish)
 	helperAwaitSnapshot(t, cache, time.Time{}, "the first capture")
 
@@ -421,7 +421,7 @@ func TestAntigravityQuotaCapture_RediscoversAfterTheMemoizedPortDies(t *testing.
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	first := helperStartCaptureServer(t, base, helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("restart run")
+	finish := startAntigravityQuotaCapture("restart run").Finish
 	defer helperStopCapture(t, finish)
 	helperAwaitSnapshot(t, cache, time.Time{}, "the first capture")
 
@@ -455,7 +455,7 @@ func TestAntigravityQuotaCapture_KeepsPollingMemoizedPortAfterDiscoveryCap(t *te
 	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("capped run")
+	finish := startAntigravityQuotaCapture("capped run").Finish
 
 	// The quota RPC is issued once per tick. Reaching beyond the discovery cap
 	// proves the memoized-port tail loop did not park with the process alive.
@@ -490,7 +490,7 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 		"workspaceId": "ws-123",
 	})
 
-	finish := startAntigravityQuotaCapture("redaction run")
+	finish := startAntigravityQuotaCapture("redaction run").Finish
 	helperAwaitSnapshot(t, cache, time.Time{}, "a capture to inspect")
 	helperStopCapture(t, finish)
 
@@ -566,7 +566,7 @@ func TestAntigravityQuotaCapture_TailProbesAfterLastFinish(t *testing.T) {
 		return quotaJSON.Load().(string)
 	}, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("tail run")
+	finish := startAntigravityQuotaCapture("tail run").Finish
 	helperAwaitSnapshot(t, cache, time.Time{}, "the arm-time capture")
 
 	// observedAt has one-second resolution, so the release instant has to fall
@@ -631,7 +631,7 @@ func TestAntigravityQuotaCapture_TailProbeNeverRediscovers(t *testing.T) {
 	// No server, and no log advertising one: the arm-time probe finds nothing
 	// and no port is ever memoized.
 
-	finish := startAntigravityQuotaCapture("no-server run")
+	finish := startAntigravityQuotaCapture("no-server run").Finish
 	released := time.Now()
 	helperStopCapture(t, finish)
 
@@ -656,7 +656,7 @@ func TestArmAntigravityCaptureForCommand_NoOpForOtherCommands(t *testing.T) {
 	// Capture state is process-global, so an earlier test's finished poller may
 	// still be the retained handle. Only a CHANGE means a poller was started.
 	before := antigravityCaptureStopped()
-	release := armAntigravityCaptureForCommand("test", "git", []string{"status"})
+	release := armAntigravityCaptureForCommand("test", "git", []string{"status"}).Finish
 	if got := antigravityCaptureArms.Load(); got != 0 {
 		t.Errorf("arms=%d, want 0 for a command that never spawns agy", got)
 	}
@@ -678,7 +678,7 @@ func TestArmAntigravityCaptureForCommand_ArmsWrappedAgyOnce(t *testing.T) {
 	release := armAntigravityCaptureForCommand("test", "powershell.exe", []string{
 		"-NoProfile", "-NonInteractive", "-EncodedCommand",
 		encodeForPowerShell(`Set-Location C:\tmp; & 'C:\t\agy.cmd' -p "hi"`),
-	})
+	}).Finish
 	if got := antigravityCaptureArms.Load(); got != 1 {
 		t.Fatalf("arms=%d, want exactly one for a wrapped agy payload", got)
 	}
@@ -695,6 +695,10 @@ func helperResetAntigravityLiveRuns() {
 	antigravityLiveRunsMu.Lock()
 	antigravityLiveRuns = map[int64]int{}
 	antigravityLiveRunsMu.Unlock()
+	// The log index, its candidate floors and the in-memory exhaustion
+	// evidence are process-global too.
+	resetAntigravityLogIndex()
+	resetAntigravityExhaustionEvidence()
 }
 
 // A build the gate marker already knows refuses loopback reads gets NO poller:
@@ -710,7 +714,7 @@ func TestAntigravityQuotaCapture_GatedBuildStartsNoPoller(t *testing.T) {
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	logged := captureStdout(t, func() {
-		finish := startAntigravityQuotaCapture("gated run")
+		finish := startAntigravityQuotaCapture("gated run").Finish
 		antigravityCaptureMu.Lock()
 		refs := antigravityCaptureRefs
 		antigravityCaptureMu.Unlock()
@@ -795,7 +799,7 @@ func TestAntigravityQuotaCapture_GateMarkerIsPerInstalledBuild(t *testing.T) {
 			helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 			captureStdout(t, func() {
-				finish := startAntigravityQuotaCapture("build check")
+				finish := startAntigravityQuotaCapture("build check").Finish
 				antigravityCaptureMu.Lock()
 				polled := antigravityCaptureRefs == 1
 				antigravityCaptureMu.Unlock()
@@ -818,7 +822,7 @@ func TestAntigravityQuotaCapture_PollerStampsTheInstalledBuild(t *testing.T) {
 	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
 
 	captureStdout(t, func() {
-		finish := startAntigravityQuotaCapture("stamp run")
+		finish := startAntigravityQuotaCapture("stamp run").Finish
 		deadline := time.Now().Add(10 * time.Second)
 		for hits.Load() == 0 && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
@@ -847,7 +851,7 @@ func TestAntigravityQuotaCapture_UnprobedBuildPersistsNoMarker(t *testing.T) {
 
 	var atRefusal int64
 	logged := captureStdout(t, func() {
-		finish := startAntigravityQuotaCapture("unprobed run")
+		finish := startAntigravityQuotaCapture("unprobed run").Finish
 		deadline := time.Now().Add(10 * time.Second)
 		for hits.Load() == 0 && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
@@ -869,4 +873,426 @@ func TestAntigravityQuotaCapture_UnprobedBuildPersistsNoMarker(t *testing.T) {
 	if _, err := os.Stat(gatePath); !os.IsNotExist(err) {
 		t.Errorf("an unprobed build's refusal wrote a marker (stat err=%v)", err)
 	}
+}
+
+// The handle contract: a non-agy command's handle is nil and every method is a
+// no-op; Finish is idempotent and stops a running wrapper resolver.
+func TestAntigravityRunCapture_HandleContract(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	var none *antigravityRunCapture
+	none.SetPID(1)
+	none.SetWrapper(1)
+	none.Finish()
+	if armAntigravityCaptureForCommand("test", "git", []string{"status"}) != nil {
+		t.Error("a non-agy command got a capture handle")
+	}
+
+	origScan, origEvery := antigravityAncestryScan, antigravityWrapperScanEvery
+	defer func() { antigravityAncestryScan, antigravityWrapperScanEvery = origScan, origEvery }()
+	var scans atomic.Int64
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) { scans.Add(1); return nil, true }
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+
+	capture := startAntigravityQuotaCapture("contract run")
+	capture.SetWrapper(100)
+	time.Sleep(30 * time.Millisecond)
+	helperStopCapture(t, capture.Finish)
+	capture.Finish()
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want Finish idempotent", got)
+	}
+	after := scans.Load()
+	time.Sleep(30 * time.Millisecond)
+	if scans.Load() != after || after == 0 {
+		t.Errorf("scans=%d then %d, want the resolver to have run and stopped at Finish", after, scans.Load())
+	}
+}
+
+// The wrapper resolver takes the first agy in the wrapper's tree that started
+// after the capture floor, retains it, marks it managed and stops scanning.
+func TestAntigravityRunCapture_ResolvesTheWrappedAgy(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	origScan, origEvery := antigravityAncestryScan, antigravityWrapperScanEvery
+	defer func() { antigravityAncestryScan, antigravityWrapperScanEvery = origScan, origEvery }()
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+	var scans atomic.Int64
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		scans.Add(1)
+		if root != 300 {
+			return nil, false
+		}
+		return []ProcessInfo{
+			{PID: 301, ParentPID: 300, Name: "powershell.exe", StartTime: time.Now()},
+			{PID: 302, ParentPID: 300, Name: "agy.exe", StartTime: time.Now().Add(-time.Hour)}, // before the floor: a persistent host's older child
+			{PID: 303, ParentPID: 301, Name: "agy.exe", StartTime: time.Now().Add(time.Second)},
+		}, true
+	}
+	capture := startAntigravityQuotaCapture("wrapped run")
+	capture.SetWrapper(300)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid != 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	capture.mu.Lock()
+	pid := capture.pid
+	capture.mu.Unlock()
+	if pid != 303 {
+		t.Errorf("resolved pid=%d, want the agy started after the floor (303)", pid)
+	}
+	stopped := scans.Load()
+	time.Sleep(30 * time.Millisecond)
+	if scans.Load() != stopped {
+		t.Error("the resolver kept scanning after resolving")
+	}
+	lockAntigravityLogIndex()
+	managed := antigravityPIDIn(antigravityLogIndex.managedPIDs, 303, "", time.Time{})
+	unlockAntigravityLogIndex()
+	if !managed {
+		t.Error("the resolved agy was not marked managed")
+	}
+	helperStopCapture(t, capture.Finish)
+}
+
+// The resolver's budget is bounded: at most antigravityWrapperMaxScans scans.
+func TestAntigravityRunCapture_ResolverBudget(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan, origMax := antigravityAncestryScan, antigravityWrapperMaxScans
+	defer func() { antigravityAncestryScan, antigravityWrapperMaxScans = origScan, origMax }()
+	antigravityWrapperMaxScans = 4
+	var scans atomic.Int64
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) { scans.Add(1); return nil, true }
+	capture := startAntigravityQuotaCapture("unresolved run")
+	capture.SetWrapper(400)
+	time.Sleep(50 * time.Millisecond)
+	helperStopCapture(t, capture.Finish)
+	if got := scans.Load(); got != 4 {
+		t.Errorf("scans=%d, want the budget of 4", got)
+	}
+}
+
+func helperResolverSchedule(t *testing.T, ramp, every time.Duration) {
+	t.Helper()
+	origRamp, origEvery := antigravityWrapperRampEvery, antigravityWrapperScanEvery
+	t.Cleanup(func() { antigravityWrapperRampEvery, antigravityWrapperScanEvery = origRamp, origEvery })
+	antigravityWrapperRampEvery, antigravityWrapperScanEvery = ramp, every
+}
+
+// A wrapped agy that fails fast is over long before one steady interval. The
+// resolver scans at once and through its opening ramp, so it still sees agy
+// alive — here only on the third scan — without waiting a steady interval.
+func TestAntigravityRunCapture_ResolverRampCatchesAFastRun(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, 10*time.Millisecond, time.Hour)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+	var scans atomic.Int64
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		if scans.Add(1) < 3 {
+			return []ProcessInfo{{PID: 700, Name: "powershell.exe"}}, true
+		}
+		return []ProcessInfo{{PID: 700, Name: "powershell.exe"}, {PID: 701, ParentPID: 700, Name: "agy.exe"}}, true
+	}
+	capture := startAntigravityQuotaCapture("fast wrapped run")
+	capture.SetWrapper(700)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid == 701 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	capture.mu.Lock()
+	pid := capture.pid
+	capture.mu.Unlock()
+	if pid != 701 {
+		t.Errorf("resolved pid=%d after %d scans, want the ramp to resolve the fast agy (701)", pid, scans.Load())
+	}
+	helperStopCapture(t, capture.Finish)
+}
+
+// A persistent host can hold a detached agy an earlier command started in the
+// same second as this run's floor. Subsecond creation times keep it out: the
+// resolver takes only the descendant created after the floor itself.
+func TestAntigravityRunCapture_ResolverSkipsSameSecondEarlierDescendant(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	origScan, origEvery, origNow := antigravityAncestryScan, antigravityWrapperScanEvery, antigravityUsageFreshnessNow
+	defer func() {
+		antigravityAncestryScan, antigravityWrapperScanEvery, antigravityUsageFreshnessNow = origScan, origEvery, origNow
+	}()
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+	floor := time.Now().Truncate(time.Second).Add(500 * time.Millisecond)
+	antigravityUsageFreshnessNow = func() time.Time { return floor }
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		return []ProcessInfo{
+			{PID: 900, Name: "powershell.exe"},
+			{PID: 901, ParentPID: 900, Name: "agy.exe", StartTime: floor.Add(-200 * time.Millisecond)},
+			{PID: 902, ParentPID: 900, Name: "agy.exe", StartTime: floor.Add(200 * time.Millisecond)},
+		}, true
+	}
+
+	capture := startAntigravityQuotaCapture("persistent host")
+	capture.SetWrapper(900)
+	deadline := time.Now().Add(5 * time.Second)
+	pid := 0
+	for pid == 0 && time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid = capture.pid
+		capture.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	if pid != 902 {
+		t.Errorf("resolved pid=%d, want 902 (created after the floor), not the same-second 901", pid)
+	}
+	helperStopCapture(t, capture.Finish)
+}
+
+// A spawn site hands SetStarted the child it started: a direct `agy` is the
+// run's PID at once, with no scan; a shell wrapper is walked, and a Unix shell
+// that exec'd agy in place resolves to the wrapper PID itself.
+func TestAntigravityRunCapture_SetStartedDirectAndWrapped(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	origScan, origEvery := antigravityAncestryScan, antigravityWrapperScanEvery
+	defer func() { antigravityAncestryScan, antigravityWrapperScanEvery = origScan, origEvery }()
+	antigravityWrapperScanEvery = 5 * time.Millisecond
+	var scans atomic.Int64
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		scans.Add(1)
+		switch root {
+		case 500: // `bash -c "cd x && agy …"`: the shell forks agy
+			return []ProcessInfo{{PID: 500, Name: "bash"}, {PID: 501, ParentPID: 500, Name: "agy"}}, true
+		case 600: // `bash -c "agy …"`: the shell execs agy in place
+			return []ProcessInfo{{PID: 600, Name: "agy"}}, true
+		case 700: // `powershell -c "antigravity …"`: the supported alias
+			return []ProcessInfo{{PID: 700, Name: "powershell.exe"}, {PID: 701, ParentPID: 700, Name: "Antigravity.exe"}}, true
+		}
+		return nil, true
+	}
+	pidOf := func(c *antigravityRunCapture) int {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			c.mu.Lock()
+			pid := c.pid
+			c.mu.Unlock()
+			if pid != 0 {
+				return pid
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return 0
+	}
+
+	direct := startAntigravityQuotaCapture("direct run")
+	direct.SetStarted("/usr/local/bin/agy", 400)
+	if got := pidOf(direct); got != 400 || scans.Load() != 0 {
+		t.Errorf("direct agy pid=%d scans=%d, want 400 with no scan", got, scans.Load())
+	}
+	helperStopCapture(t, direct.Finish)
+
+	for _, tc := range []struct{ root, want int }{{500, 501}, {600, 600}, {700, 701}} {
+		wrapped := startAntigravityQuotaCapture("wrapped run")
+		wrapped.SetStarted("bash", tc.root)
+		if got := pidOf(wrapped); got != tc.want {
+			t.Errorf("wrapper %d resolved pid=%d, want %d", tc.root, got, tc.want)
+		}
+		lockAntigravityLogIndex()
+		wrapperManaged := tc.root != tc.want && antigravityPIDIn(antigravityLogIndex.managedPIDs, tc.root, "", time.Time{})
+		unlockAntigravityLogIndex()
+		if wrapperManaged {
+			t.Errorf("the wrapper shell %d was recorded as the managed agy", tc.root)
+		}
+		helperStopCapture(t, wrapped.Finish)
+	}
+}
+
+// The resolver takes agy under either supported name, and nothing that merely
+// starts the same way.
+func TestIsAntigravityProcessName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"agy": true, "agy.exe": true, "AGY.EXE": true,
+		"antigravity": true, "Antigravity.exe": true,
+		"agy-helper.exe": false, "antigravity-updater": false, "powershell.exe": false, "": false,
+	} {
+		if got := isAntigravityProcessName(name); got != want {
+			t.Errorf("isAntigravityProcessName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// Every spawn site that can start a wrapper hands the capture the started
+// command through SetStarted, so a shell is resolved rather than recorded as
+// agy. Only the native path, which always execs agy itself, calls SetPID.
+func TestAntigravityCaptureSpawnSitesUseSetStarted(t *testing.T) {
+	for _, file := range []string{"session.go", "pty_session_unix.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if !strings.Contains(string(src), ".SetStarted(") {
+			t.Errorf("%s no longer hands its started child to SetStarted", file)
+		}
+		if strings.Contains(string(src), ".SetPID(") {
+			t.Errorf("%s calls SetPID directly, recording a possible wrapper as agy", file)
+		}
+	}
+}
+
+// Finish must not hold the command's return path open behind a scan that never
+// answers (a wedged WMI/CIM provider): it waits at most the grace, then settles
+// the run without the resolver's PID. A PID the stalled scan reports after that
+// is dropped — the run is over, and the PID may already be somebody else's.
+func TestAntigravityRunCapture_FinishBoundsTheResolverWait(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan, origGrace := antigravityAncestryScan, antigravityWrapperFinishGrace
+	defer func() { antigravityAncestryScan, antigravityWrapperFinishGrace = origScan, origGrace }()
+	antigravityWrapperFinishGrace = 50 * time.Millisecond
+
+	release := make(chan struct{})
+	scanning := make(chan struct{}, 1)
+	antigravityAncestryScan = func(int) ([]ProcessInfo, bool) {
+		select {
+		case scanning <- struct{}{}:
+		default:
+		}
+		<-release // a provider that never answers
+		return []ProcessInfo{{PID: 801, Name: "agy.exe"}}, true
+	}
+	defer close(release)
+
+	capture := startAntigravityQuotaCapture("wedged scan")
+	capture.SetWrapper(800)
+	select {
+	case <-scanning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the resolver never started its first scan")
+	}
+
+	returned := make(chan struct{})
+	go func() { defer close(returned); capture.Finish() }()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Finish blocked on the stalled ancestry scan instead of bounding the wait")
+	}
+
+	release <- struct{}{} // let the stalled scan report its PID, too late
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid != 0 {
+			t.Fatalf("pid=%d recorded after Finish, want the late scan dropped", pid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A transport that fails over re-roots the resolver. The superseded resolver's
+// scan was already in flight; when it returns late with the failed
+// transport's agy it must not win over the fallback's.
+func TestAntigravityRunCapture_SupersededResolverRecordsNothing(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+
+	releaseOld := make(chan struct{})
+	oldScanning := make(chan struct{}, 1)
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		if root == 900 {
+			select {
+			case oldScanning <- struct{}{}:
+			default:
+			}
+			<-releaseOld
+			return []ProcessInfo{{PID: 901, Name: "agy.exe"}}, true
+		}
+		return nil, true // the fallback's agy is not up yet
+	}
+
+	capture := startAntigravityQuotaCapture("failover")
+	defer capture.Finish()
+	capture.SetWrapper(900)
+	select {
+	case <-oldScanning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first resolver never started its scan")
+	}
+	capture.SetWrapper(950) // the transport fell back
+	close(releaseOld)
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		capture.mu.Lock()
+		pid := capture.pid
+		capture.mu.Unlock()
+		if pid != 0 {
+			t.Fatalf("pid=%d recorded by the superseded resolver, want none", pid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A transport that fails after its resolver already found agy is retried on a
+// new wrapper (persistent-host restart, then the fallback). The re-root must
+// drop the failed attempt's PID and resolve the retried agy, or the run that
+// actually completes is never marked managed and its evidence is missed.
+func TestAntigravityRunCapture_ReRootReplacesAResolvedPID(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "1h")
+	helperResolverSchedule(t, time.Millisecond, time.Millisecond)
+	origScan := antigravityAncestryScan
+	defer func() { antigravityAncestryScan = origScan }()
+	antigravityAncestryScan = func(root int) ([]ProcessInfo, bool) {
+		switch root {
+		case 900:
+			return []ProcessInfo{{PID: 901, Name: "agy.exe"}}, true
+		case 950:
+			return []ProcessInfo{{PID: 951, Name: "agy.exe"}}, true
+		}
+		return nil, true
+	}
+	waitPID := func(capture *antigravityRunCapture, want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			capture.mu.Lock()
+			pid := capture.pid
+			capture.mu.Unlock()
+			if pid == want {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("capture never resolved pid %d", want)
+	}
+
+	capture := startAntigravityQuotaCapture("failover after resolve")
+	capture.SetWrapper(900)
+	waitPID(capture, 901)
+	capture.SetWrapper(950) // the host failed; the command is retried
+	waitPID(capture, 951)
+
+	at := time.Now().Add(time.Second)
+	lockAntigravityLogIndex()
+	retried := antigravityPIDIn(antigravityLogIndex.managedPIDs, 951, "", time.Time{})
+	failedLive := antigravityPIDIn(antigravityLogIndex.managedPIDs, 901, "", at)
+	unlockAntigravityLogIndex()
+	if !retried {
+		t.Error("the retried agy was not marked managed")
+	}
+	if failedLive {
+		t.Error("the failed attempt's agy is still held as a live managed run")
+	}
+	helperStopCapture(t, capture.Finish)
 }

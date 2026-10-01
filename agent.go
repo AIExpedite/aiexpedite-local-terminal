@@ -185,7 +185,12 @@ func StartAgent(cfg *Config) {
 	// the in-run poller captures nothing, so a run cut off by a crash, restart
 	// or self-update is paid here with one bounded Code Assist read. Placed
 	// after isOffline is published above, so the attempt honours offline mode.
+	// Its replay runs the log index's startup scan first; the discovery tick
+	// then finds direct `agy` runs (the user's own shell) as they finish, so
+	// they owe a refresh without waiting for a gather
+	// (cliagent_usage_antigravity_log_index.go).
 	payOwedAntigravityUsageRefresh()
+	startAntigravityDiscovery()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

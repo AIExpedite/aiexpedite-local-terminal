@@ -33,8 +33,13 @@
 //   - Retry: a kept debt is never left with nothing scheduled to return to it.
 //     antigravityScheduleRunDebtRetry persists NextAttemptAtMs and arms one
 //     process-wide timer on a bounded ladder
-//     (cliagent_usage_antigravity_refresh_schedule.go), and a gather that sees
-//     a run log newer than the cached reading nudges the same worker.
+//     (cliagent_usage_antigravity_refresh_schedule.go), and a gather or a
+//     discovery tick that sees an owe-ready run newer than the cached reading
+//     nudges the same worker.
+//   - Discover: runs no spawn path armed (a direct `agy` in the user's own
+//     shell) are found by the log index's discovery tick
+//     (cliagent_usage_antigravity_log_index.go) and owed only once every
+//     process of the run has exited; the agent's own `agy` children never owe.
 //   - Survive: the debt and its schedule are a file, so StartAgent's
 //     payOwedAntigravityUsageRefresh re-arms a pending schedule, or pays one
 //     bounded attempt for a run the previous process never settled (crash,
@@ -132,12 +137,14 @@ var (
 )
 
 func antigravityRegisterLiveRun(floorMs int64) {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	antigravityLiveRuns[floorMs]++
 	antigravityLiveRunsMu.Unlock()
 }
 
 func antigravityReleaseLiveRun(floorMs int64) {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	if n := antigravityLiveRuns[floorMs]; n > 1 {
 		antigravityLiveRuns[floorMs] = n - 1
@@ -147,11 +154,14 @@ func antigravityReleaseLiveRun(floorMs int64) {
 	antigravityLiveRunsMu.Unlock()
 }
 
-// antigravityOldestLiveRunFloorMs is the floor of the earliest run still armed,
-// or 0 when none is. Called from inside updateAntigravityUsageFreshness's
-// mutate, so the lock order is cache -> freshness -> live runs; nothing may take
-// these in the other direction.
+// antigravityOldestLiveRunFloorMs is the floor of the earliest MANAGED run still
+// armed, or 0 when none is — the nudge's "a run of this process settles itself"
+// check. The floors a restart must keep also include live direct-run
+// candidates: antigravityOldestProtectedFloorMs. The lock order is cache ->
+// freshness -> live runs; nothing may take these in the other direction, and
+// the log-index lock is never held while taking any of them.
 func antigravityOldestLiveRunFloorMs() int64 {
+	antigravityAssertIndexUnlocked("live-runs")
 	antigravityLiveRunsMu.Lock()
 	defer antigravityLiveRunsMu.Unlock()
 	oldest := int64(0)
@@ -236,6 +246,14 @@ type antigravityDebtID struct {
 	owedAtMs int64
 }
 
+// equal compares two states field by field. It is a plain == on purpose: a
+// future field that is not comparable (a slice, a map) then fails to COMPILE
+// here rather than silently turning every update into a write — or, worse,
+// into none.
+func (state antigravityUsageFreshness) equal(other antigravityUsageFreshness) bool {
+	return state == other
+}
+
 func (state antigravityUsageFreshness) debtID() antigravityDebtID {
 	return antigravityDebtID{floorMs: state.RefreshOwedFloorMs, owedAtMs: state.RefreshOwedAtMs}
 }
@@ -300,12 +318,13 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 // is cache → freshness (writeAntigravityQuotaSnapshotLocked settles while
 // holding the cache lock), so nothing under this lock may read the cache.
 func updateAntigravityUsageFreshness(mutate func(*antigravityUsageFreshness)) antigravityUsageFreshness {
+	antigravityAssertIndexUnlocked("freshness")
 	antigravityFreshnessMu.Lock()
 	defer antigravityFreshnessMu.Unlock()
 	state := readAntigravityUsageFreshnessLocked()
 	before := state
 	mutate(&state)
-	if state != before {
+	if !state.equal(before) {
 		writeAntigravityUsageFreshnessLocked(state)
 	}
 	return state
@@ -346,6 +365,38 @@ func antigravityObservedCovers(observedMs, floorMs int64) bool {
 		return true
 	}
 	return observedMs > 0 && observedMs >= floorMs
+}
+
+// antigravityCachedReadingCovers reports whether the CACHED reading holds the
+// usage of a run that ended at floorMs under account.
+//
+// The time-only form above is not enough on its own here. One capture poller is
+// shared by every armed run (cliagent_usage_antigravity_capture.go) and the
+// cache holds ONE snapshot, so two overlapping runs under different logins both
+// see the same file: a reading saved for the other run's account, stamped after
+// this run finished, satisfies the instant while describing a pool this run
+// never spent from. account is this run's own identity, read from the block its
+// PID owns; "" (no block, or no account in it) keeps the time-only rule.
+func antigravityCachedReadingCovers(account string, floorMs int64) bool {
+	_, ok := antigravityCachedReadingCovering(account, floorMs)
+	return ok
+}
+
+// antigravityCachedReadingCovering is antigravityCachedReadingCovers plus the
+// instant the covering reading was taken, which the debt worker retires with.
+func antigravityCachedReadingCovering(account string, floorMs int64) (int64, bool) {
+	if floorMs == 0 {
+		return 0, true
+	}
+	snap, ok := cachedAntigravityQuotaSnapshot()
+	if !ok {
+		return 0, false
+	}
+	if account != "" && snap.AccountFingerprint != account {
+		return 0, false
+	}
+	observedMs := antigravitySnapshotObservedMs(snap)
+	return observedMs, antigravityObservedCovers(observedMs, floorMs)
 }
 
 /* ───────────────────────────────── arm ───────────────────────────────── */
@@ -406,14 +457,20 @@ func armAntigravityUsageRunFloor(now time.Time) time.Time {
 // to the Code Assist route instead of a retry the build will refuse, and the
 // notice accessor leaves the wording to antigravityGateNotice.
 //
-// Called from the capture's finish() on its own goroutine: it must NOT wait for
+// pid is the run's own agy process when the capture handle knows it (0
+// otherwise). Its log block is read for exhaustion evidence, kept in memory
+// only (recordAntigravityRunEvidence) — the one input that lets an omitted
+// Code Assist bucket be charted as consumed.
+//
+// Called from the capture's Finish on its own goroutine: it must NOT wait for
 // the poller, which is ref-counted and outlives a short run whenever a longer
 // one is still armed.
-func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) {
+func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gated bool) {
 	if floor.IsZero() {
 		return
 	}
 	now := antigravityUsageFreshnessNow()
+	account := recordAntigravityRunEvidence(floor, pid, now)
 	// The run is over, so the reading that covers it is one taken at or after
 	// this instant — never one taken while the run was still accruing usage.
 	// The completion is also what the debt asks for, so the payment's own
@@ -429,9 +486,9 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 	// reading for this run — a concurrent run's poller, a Refresh click, this
 	// poller's own tail — but only one taken at or after the completion holds
 	// the usage this run just spent.
-	covered := antigravityObservedCovers(cachedAntigravityObservedMs(), completionMs)
+	covered := antigravityCachedReadingCovers(account, completionMs)
 	if !covered && capturedDuringRun && !gated {
-		covered = antigravityAwaitPostRunReading(completionMs)
+		covered = antigravityAwaitPostRunReading(account, completionMs)
 	}
 	// The run is over either way: stop protecting its floor from the GC below
 	// before deciding what to persist for it.
@@ -446,7 +503,7 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 			if state.RunFloorMs != 0 && state.RunFloorMs <= completionMs &&
 				state.RefreshOwedAtMs == 0 {
-				state.RunFloorMs = antigravityOldestLiveRunFloorMs()
+				state.RunFloorMs = antigravityOldestProtectedFloorMs()
 			}
 		})
 		return
@@ -454,6 +511,11 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
+		// priorID is the generation this settle found, and ownsFloor says the
+		// floor it leaves behind is THIS run's completion rather than a newer
+		// run's that was already pending.
+		priorID := state.debtID()
+		ownsFloor := state.RefreshOwedAtMs == 0 || completionMs > state.RefreshOwedFloorMs
 		owedFloorMs := completionMs
 		if state.RefreshOwedFloorMs > owedFloorMs {
 			// One pending debt at a time: a reading that covers the newest
@@ -471,7 +533,34 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 		if state.RunFloorMs < owedFloorMs {
 			state.RunFloorMs = owedFloorMs
 		}
+		// The generation this run just created is the one the worker must keep
+		// scoped to this run's login. In memory only: the state file keeps its
+		// fields, and a generation nobody remembers falls back to time alone.
+		//
+		// When this settle did NOT advance the floor — two differently
+		// authenticated runs settling concurrently, and the NEWER completion
+		// got its debt in first — the pending debt still asks for that newer
+		// run's reading, so it must keep that run's login. Naming this (older)
+		// run's account instead would have the worker test the newer floor
+		// against the wrong identity: it would ignore the snapshot that
+		// actually covers it, and accept one that does not. An account nobody
+		// remembers for the retained generation falls back to the time-only
+		// rule, as a restart's would.
+		//
+		// Published here, under the freshness lock, so a generation and its
+		// owner become visible together: a concurrent settle that retains this
+		// generation can never read it before its owner is recorded and carry
+		// "" forward over it. antigravityDebtAccount is a leaf lock (see
+		// settleAntigravityRunFreshness), so this adds no lock order.
+		debtAccount := account
+		if !ownsFloor {
+			debtAccount = antigravityDebtAccountFor(priorID)
+		}
+		noteAntigravityDebtAccount(state.debtID(), debtAccount)
 	})
+	if antigravitySettleUpdatedHook != nil {
+		antigravitySettleUpdatedHook()
+	}
 	fmt.Printf("%s[antigravity-freshness] Run finished with no reading of its own (owed=true gated=%v attempts=%d)%s\n",
 		colorYellow, gated, state.Attempts, colorReset)
 	antigravityStartRunDebtWorker(antigravityRefreshAfterRunMaxAttempts, false)
@@ -490,13 +579,13 @@ func antigravityUsageRunSettled(floor time.Time, capturedDuringRun, gated bool) 
 // short run sharing it with a long interactive session would otherwise park its
 // settle for the length of that session. Runs on the settle goroutine, so it
 // delays nothing but the debt decision it is making.
-func antigravityAwaitPostRunReading(completionMs int64) bool {
+func antigravityAwaitPostRunReading(account string, completionMs int64) bool {
 	// Wall clock, not antigravityUsageFreshnessNow: this is a real wait for a
 	// real write, and a test that pins the logical clock must not turn it into
 	// a spin. antigravityCaptureTailEnv shrinks it where a test needs it short.
 	deadline := time.Now().Add(antigravityCaptureTailGraceValue() + antigravityPostRunReadingGrace)
 	for {
-		if antigravityObservedCovers(cachedAntigravityObservedMs(), completionMs) {
+		if antigravityCachedReadingCovers(account, completionMs) {
 			return true
 		}
 		remaining := time.Until(deadline)
@@ -514,12 +603,25 @@ func antigravityAwaitPostRunReading(completionMs int64) bool {
 // called from inside writeAntigravityQuotaSnapshotLocked — while the quota
 // cache lock is held — so it must never read the cache back. observedMs is the
 // landed reading's instant (antigravitySnapshotObservedMs); 0 retires nothing.
-func settleAntigravityRunFreshness(observedMs int64) {
+//
+// account is the login the landed reading describes. A debt is scoped to the
+// account of the run that raised it, and one capture poller plus one cache file
+// are shared by every armed run, so a concurrent run or a Refresh click under
+// another login can land a reading stamped after this debt's floor that says
+// nothing about the pool that run spent from. Such a reading must not retire
+// the debt — that is the same account-aware rule antigravityUsageRunSettled and
+// antigravityPayRunDebtPass apply, enforced here so no write can slip past
+// them. "" (an unidentified reading, or a generation this process does not
+// remember) keeps the time-only rule.
+func settleAntigravityRunFreshness(observedMs int64, account string) {
 	if observedMs <= 0 {
 		return
 	}
 	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
-		if state.RefreshOwedAtMs != 0 && observedMs >= state.RefreshOwedFloorMs {
+		if state.RefreshOwedAtMs != 0 && observedMs >= state.RefreshOwedFloorMs &&
+			// A leaf lock taken under the freshness lock: nothing is ever taken
+			// while antigravityDebtAccount is held, so this adds no order.
+			antigravityDebtAccountAnswers(state.debtID(), account) {
 			state.clearDebt()
 		}
 		if state.RunFloorMs != 0 && observedMs >= state.RunFloorMs {
@@ -528,8 +630,16 @@ func settleAntigravityRunFreshness(observedMs int64) {
 			// going does not hold the usage that run is still spending, so
 			// dropping the marker outright would leave a crash or self-update
 			// before its settle with neither a floor nor a debt, and no
-			// recovery refresh. Roll back to the oldest live run instead.
-			state.RunFloorMs = antigravityOldestLiveRunFloorMs()
+			// recovery refresh. Roll back to the oldest protected floor instead
+			// (a managed run, or a live direct-run candidate).
+			state.RunFloorMs = antigravityOldestProtectedFloorMs()
+			if state.RefreshOwedAtMs != 0 && state.RunFloorMs < state.RefreshOwedFloorMs {
+				// A debt this reading did NOT answer is still pending (another
+				// account's). It keeps the invariant the settle established:
+				// the marker a restart adopts is never behind the floor the
+				// debt is still asking for.
+				state.RunFloorMs = state.RefreshOwedFloorMs
+			}
 		}
 	})
 }
@@ -601,14 +711,24 @@ func antigravityReleaseRunDebtWorker() bool {
 	return true
 }
 
-// antigravityUsageRefreshWaitIdle blocks until no debt worker is in flight,
-// bounded. Test seam only — production never waits on a refresh, which is why
-// this polls the single-flight flag rather than adding a WaitGroup the settle
-// goroutine would have to touch on every run.
+// antigravityUsageRefreshWaitIdle blocks until no background write of this
+// feature is in flight, bounded. Tests wait on it; gracefulShutdown drains
+// with the shorter antigravityUsageRefreshWaitIdleFor. It polls the counter
+// rather than adding a WaitGroup the settle goroutine would have to touch on
+// every run.
 func antigravityUsageRefreshWaitIdle() {
-	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+	antigravityUsageRefreshWaitIdleFor(30 * time.Second)
+}
+
+// antigravityUsageRefreshWaitIdleFor waits at most d and reports whether
+// nothing was left in flight.
+func antigravityUsageRefreshWaitIdleFor(d time.Duration) bool {
+	for deadline := time.Now().Add(d); ; {
 		if antigravityFreshnessInFlight.Load() == 0 {
-			return
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -682,8 +802,13 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		// Any route may have landed a reading since the settle: a concurrent
 		// run's poller, a Refresh click, or the poller's own 2 s tail on an
 		// ungated build.
-		if cached := cachedAntigravityObservedMs(); antigravityObservedCovers(cached, state.RefreshOwedFloorMs) {
-			settleAntigravityRunFreshness(cached)
+		// Scoped to the debt's own login where this process still remembers it:
+		// the capture poller is shared, so a concurrent run under another
+		// account can leave a NEWER reading that says nothing about this one.
+		debtAccount := antigravityDebtAccountFor(state.debtID())
+		if cached, ok := antigravityCachedReadingCovering(
+			debtAccount, state.RefreshOwedFloorMs); ok {
+			settleAntigravityRunFreshness(cached, debtAccount)
 			return state, antigravityRetryNone
 		}
 		if state.Attempts >= antigravityRefreshDebtMaxAttempts {
@@ -718,8 +843,12 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
 		// No version: the probe resolves it itself, and only once it knows a
 		// login exists, so a no_login debt never spawns `<agy> --version`.
+		takeAntigravityCodeAssistAttempt()
 		outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
 		cancel()
+		note := takeAntigravityCodeAssistAttempt()
+		noteAntigravityCurrentAttempt(state.debtID(), note.fingerprint,
+			outcome == liveProbeOutcomeCodeAssistBadResponse && note.unplottable)
 		antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
 		fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
 			colorCyan, state.Attempts+1, antigravityRefreshDebtMaxAttempts, outcome, colorReset)
@@ -844,7 +973,16 @@ func payOwedAntigravityUsageRefresh() {
 // the run's own settle, so the run would end with no refresh at all. The live
 // run's settle path owes it a refresh when it finishes; leave the floor to it.
 // (codexOweInterruptedRun guards the same race with codexUsageRefresh.armedLocally.)
+//
+// The log index's startup scan runs FIRST (antigravityStartupScan): it finds
+// direct runs that started or ended while no agent was running. Its candidate
+// floors are applied only AFTER the previous process's floor has been adopted,
+// so a floor armed now can never mask the one a crash or update left behind.
 func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
+	scan, scanned := antigravityStartupScan(startedAt)
+	if scanned {
+		defer antigravityApplyDiscovery(scan, antigravityUsageFreshnessNow())
+	}
 	now := antigravityUsageFreshnessNow()
 	state := updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
 		antigravityRebaseFutureFreshness(state, now)
@@ -933,6 +1071,12 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 	// failing read is something that heals itself.
 	cause := "Google returned no reading for the stored login; it will update on the next run that reports one."
 	switch state.Outcome {
+	case liveProbeOutcomeCodeAssistUnauthorized:
+		cause = "Google refused the stored login's quota read, so the reading could not be updated."
+	case liveProbeOutcomeCodeAssistBadResponse:
+		if antigravityAttemptWasUnplottable(state.debtID()) {
+			cause = "Google answered for the stored login with no chartable quota windows, so the reading could not be updated."
+		}
 	case liveProbeOutcomeCodeAssistNoLogin:
 		cause = "No Antigravity login is stored on this device, so no reading can be taken; sign in with the CLI to restore it."
 	case liveProbeOutcomeCodeAssistTokenExpired:
@@ -978,4 +1122,263 @@ func antigravityCatalogCommand() string {
 		}
 	}
 	return "agy"
+}
+
+/* ──────────────────────────── evidence ──────────────────────────── */
+
+// Managed-run exhaustion evidence. Google's quota reply OMITS remainingFraction
+// for a bucket with nothing left, so an account whose every bucket is spent
+// answers with nothing chartable. The one trustworthy statement that a
+// specific bucket is spent is a managed run's OWN log block: it names the
+// account it authenticated as and the RESOURCE_EXHAUSTED reset it hit. That is
+// kept here, in memory only — never persisted, never logged (the email is
+// reduced to its fingerprint at once) — and applied by
+// antigravitySnapshotFromGroups to an omitted bucket of the same account whose
+// reset matches. Direct (user-shell) runs never contribute: a login switched
+// between two of them could attribute one account's exhaustion to another.
+const (
+	antigravityExhaustionMaxEvents = 4
+	// antigravityExhaustionTTL keeps an event for the debt's whole retry
+	// horizon: the debt it explains can wait out an outage for that long, and
+	// a later all-exhausted reply is only chartable while the event lives. An
+	// event whose reset has passed is dropped sooner (antigravityExhaustionLive).
+	antigravityExhaustionTTL = antigravityRefreshOwedMaxAge
+	// antigravityExhaustionMinReset: a shorter reset is a throttle, not a
+	// spent quota window.
+	antigravityExhaustionMinReset = 2 * time.Minute
+	// antigravityExhaustionMatch is how close an event's reset must be to a
+	// bucket's own reset to name that bucket.
+	antigravityExhaustionMatch = 2 * time.Minute
+)
+
+type antigravityExhaustionEvent struct {
+	resetAtMs   int64
+	fingerprint string
+	atMs        int64
+}
+
+var antigravityExhaustion struct {
+	mu     sync.Mutex
+	events []antigravityExhaustionEvent
+}
+
+// antigravityExhaustionEvidenceFn is the quota routes' seam.
+var antigravityExhaustionEvidenceFn = antigravityExhaustionEvidence
+
+// antigravityExhaustionLive reports whether an event can still name a bucket:
+// within the TTL, and before its reset — after the reset the window has
+// refilled, and Google reports the next reset, which the event cannot match.
+func antigravityExhaustionLive(event antigravityExhaustionEvent, now time.Time) bool {
+	return now.Sub(time.UnixMilli(event.atMs)) <= antigravityExhaustionTTL &&
+		now.UnixMilli() < event.resetAtMs
+}
+
+// antigravityExhaustionEvidence returns the unexpired events recorded for the
+// account with this fingerprint.
+func antigravityExhaustionEvidence(now time.Time, fingerprint string) []antigravityExhaustionEvent {
+	if fingerprint == "" {
+		return nil
+	}
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []antigravityExhaustionEvent
+	for _, event := range e.events {
+		if event.fingerprint == fingerprint && antigravityExhaustionLive(event, now) {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+// recordAntigravityRunEvidence reads a finished managed run's own PID block
+// and records its exhaustion events. Needs both the authenticated account and
+// a quota reset in THAT block; anything else records nothing.
+//
+// It returns the account the run authenticated as ("" when its block named
+// none), which is the run's own identity — read from the block the run's PID
+// owns, never from settings.json or the cache. The settle scopes its coverage
+// check to it: the capture poller is shared process-wide, so without the
+// account a reading saved for a CONCURRENT run under another login would pass
+// the time-only check and retire a run whose quota the cache cannot report.
+func recordAntigravityRunEvidence(floor time.Time, pid int, now time.Time) string {
+	if pid <= 0 {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	for _, base := range antigravityQuotaBases(home) {
+		block, found := antigravityPIDBlock(base, pid, floor)
+		if !found {
+			continue
+		}
+		email, resets := antigravityBlockEvidence(block, now)
+		fingerprint := fingerprintAccount("antigravity", email)
+		if fingerprint == "" {
+			return ""
+		}
+		for _, reset := range resets {
+			if reset.Sub(now) < antigravityExhaustionMinReset {
+				continue
+			}
+			addAntigravityExhaustionEvent(antigravityExhaustionEvent{
+				resetAtMs: reset.UnixMilli(), fingerprint: fingerprint, atMs: now.UnixMilli(),
+			}, now)
+		}
+		return fingerprint
+	}
+	return ""
+}
+
+func addAntigravityExhaustionEvent(event antigravityExhaustionEvent, now time.Time) {
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	kept := e.events[:0]
+	for _, existing := range e.events {
+		if !antigravityExhaustionLive(existing, now) {
+			continue
+		}
+		// The same window seen again (a detached run's block is read at wrapper
+		// exit and again at its own exit) replaces the older sighting instead
+		// of spending a second slot of the cap.
+		if existing.fingerprint == event.fingerprint &&
+			antigravityEvidenceNamesReset([]antigravityExhaustionEvent{existing}, time.UnixMilli(event.resetAtMs)) {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	e.events = append(kept, event)
+	if len(e.events) > antigravityExhaustionMaxEvents {
+		e.events = e.events[len(e.events)-antigravityExhaustionMaxEvents:]
+	}
+}
+
+// resetAntigravityExhaustionEvidence forgets every event. Tests, and the model
+// of a restart: evidence never survives one.
+func resetAntigravityExhaustionEvidence() {
+	e := &antigravityExhaustion
+	e.mu.Lock()
+	e.events = nil
+	e.mu.Unlock()
+}
+
+/* ─────────────────────────── attempt marks ─────────────────────────── */
+
+// antigravityCurrentAttempt is the latest payment attempt on a debt: the debt
+// generation it was spent on, the account it resolved, and whether Google's
+// 200 had nothing chartable. In memory only; the persisted outcome stays
+// codeassist_bad_response. The notice uses the finer wording only while the
+// debt it words is the one this attempt was for, so a new generation, another
+// outcome or a retirement clears it without touching the state file.
+type antigravityCurrentAttempt struct {
+	debtID             antigravityDebtID
+	attemptFingerprint string
+	unplottable        bool
+}
+
+var antigravityAttempt struct {
+	mu      sync.Mutex
+	current antigravityCurrentAttempt
+}
+
+func noteAntigravityCurrentAttempt(id antigravityDebtID, fingerprint string, unplottable bool) {
+	a := &antigravityAttempt
+	a.mu.Lock()
+	a.current = antigravityCurrentAttempt{debtID: id, attemptFingerprint: fingerprint, unplottable: unplottable}
+	a.mu.Unlock()
+}
+
+// antigravityDebtAccount is the login the run that created a debt generation
+// authenticated as, so the worker can tell a reading that answers THAT run from
+// one a concurrent run under another account left in the shared cache. In
+// memory only, exactly like the attempt mark: the state file gains no field,
+// and a generation this process does not remember (a restart, a debt raised by
+// a discovered direct run) simply falls back to the time-only rule.
+var antigravityDebtAccount struct {
+	mu          sync.Mutex
+	debtID      antigravityDebtID
+	fingerprint string
+}
+
+// antigravitySettleUpdatedHook, when set, runs right after a settle's debt
+// update releases the freshness lock. Test-only: it lets a test land a second
+// settle exactly where a concurrent one could interleave.
+var antigravitySettleUpdatedHook func()
+
+func noteAntigravityDebtAccount(id antigravityDebtID, fingerprint string) {
+	d := &antigravityDebtAccount
+	d.mu.Lock()
+	d.debtID, d.fingerprint = id, fingerprint
+	d.mu.Unlock()
+}
+
+// antigravityDebtAccountFor is the remembered login of debt generation id, or
+// "" when this process never recorded one for it.
+func antigravityDebtAccountFor(id antigravityDebtID) string {
+	d := &antigravityDebtAccount
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.debtID != id {
+		return ""
+	}
+	return d.fingerprint
+}
+
+// antigravityDebtAccountAnswers reports whether a reading belonging to account
+// may retire debt generation id. A generation whose login this process does not
+// remember, and a reading whose own account is unknown, both fall back to the
+// time-only rule; otherwise the two identities must be the same login.
+func antigravityDebtAccountAnswers(id antigravityDebtID, account string) bool {
+	owner := antigravityDebtAccountFor(id)
+	return owner == "" || account == "" || owner == account
+}
+
+// antigravityAttemptWasUnplottable reports whether the latest attempt on the
+// debt generation id got a 200 with nothing chartable.
+func antigravityAttemptWasUnplottable(id antigravityDebtID) bool {
+	a := &antigravityAttempt
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.current.unplottable && a.current.debtID == id
+}
+
+// antigravityShutdownDrain bounds gracefulShutdown's wait for in-flight writes.
+var antigravityShutdownDrain = 5 * time.Second
+
+// antigravityShutdownDrainBudget is antigravityShutdownDrain capped at half of
+// what is left of the caller's shutdown deadline, so the backend offline notice
+// that follows always keeps the other half (logoff hands gracefulShutdown only
+// 2 s). An expired deadline leaves no drain; no deadline leaves the full bound.
+func antigravityShutdownDrainBudget(ctx context.Context, now time.Time) time.Duration {
+	budget := antigravityShutdownDrain
+	if ctx == nil {
+		return budget
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, max(deadline.Sub(now)/2, 0))
+	}
+	return budget
+}
+
+// drainAntigravityUsageWrites stops the discovery tick and waits, at most
+// antigravityShutdownDrainBudget(ctx) in total, for a tick in flight and then
+// for this feature's background writes. A tick or write still stuck after that
+// is abandoned: the floor its arm persisted at spawn is what the next process
+// adopts.
+func drainAntigravityUsageWrites(ctx context.Context) {
+	budget := antigravityShutdownDrainBudget(ctx, time.Now())
+	deadline := time.Now().Add(budget)
+	tickStopped := stopAntigravityDiscoveryWithin(budget)
+	idle := antigravityUsageRefreshWaitIdleFor(time.Until(deadline))
+	if !tickStopped || !idle {
+		tickRunning := 0
+		if !tickStopped {
+			tickRunning = 1
+		}
+		fmt.Printf("%s[antigravity-freshness] shutdown drain timed out: inFlight=%d tickRunning=%d%s\n",
+			colorYellow, antigravityFreshnessInFlight.Load(), tickRunning, colorReset)
+	}
 }

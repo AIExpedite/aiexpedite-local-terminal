@@ -25,6 +25,14 @@
 //   - runLocalCommandWindows (pubsub.go)            — the wrapped Windows transport
 //     chain, armed at function ENTRY because no single post-Start hook exists there
 //
+// Each arm returns an *antigravityRunCapture that owns the run's agy PID: a
+// site that started agy itself calls SetPID after Start; a site that started a
+// shell wrapper (`bash -c "agy …"` on the PTY and Unix execute paths, and every
+// transport of the Windows chain) hands the wrapper PID to SetWrapper, whose
+// resolver finds the agy process that wrapper runs. Finish settles the run
+// with that PID, so the settle can read the run's OWN log block
+// (cliagent_usage_antigravity_log_index.go).
+//
 // Cost discipline matters because this runs on the user's machine while they are
 // working, and the expensive part of a probe is log scanning
 // (antigravityQuotaMaxLogs files × 2×antigravityLogScanBytes), not the RPC. So:
@@ -46,6 +54,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -127,8 +136,8 @@ var (
 )
 
 // armAntigravityCaptureForCommand arms the quota poller when spawning cmd+args
-// would start `agy`, and returns the release function. When it would not, the
-// returned release is a no-op and nothing is armed.
+// would start `agy`, and returns the run's capture handle. When it would not,
+// the handle is nil, and every method of a nil handle is a no-op.
 //
 // Every spawn site goes through this rather than pairing its own
 // commandRunsAntigravity check with startAntigravityQuotaCapture: a site that
@@ -136,22 +145,278 @@ var (
 // classifier, which is exactly how the Windows execute path ended up arming
 // nothing at all. label is a fixed internal string ("windows execute", "local
 // execute", …) and must never carry a command line, path or prompt.
-func armAntigravityCaptureForCommand(label, cmd string, args []string) func() {
+func armAntigravityCaptureForCommand(label, cmd string, args []string) *antigravityRunCapture {
 	if !commandRunsAntigravity(cmd, args) {
-		return func() {}
+		return nil
 	}
 	return startAntigravityQuotaCapture(label)
 }
 
+// antigravityRunCapture is one armed `agy` run. It owns the run's agy PID —
+// set directly (SetPID) where the spawn site started agy itself, or resolved
+// from a wrapper (SetWrapper) on the Windows execute chain — and Finish
+// consumes it: the settle reads that PID's own log block for exhaustion
+// evidence (in memory only) and marks the PID managed, so the log index never
+// mistakes the run for a direct one.
+//
+// A nil handle (a command that does not run agy) is a no-op everywhere.
+type antigravityRunCapture struct {
+	floor  time.Time
+	gated  bool
+	polled bool
+	once   sync.Once
+
+	mu  sync.Mutex
+	pid int
+	// finished is set by Finish once it has stopped waiting for the resolver.
+	// A scan that returns after that must not record a PID: the run is over,
+	// and the PID it found may already belong to somebody else's process.
+	finished bool
+	// resolverStop ends the wrapper resolver; nil while none runs.
+	resolverStop chan struct{}
+	resolverDone chan struct{}
+	// resolverGen identifies the current resolver. SetWrapper bumps it when a
+	// transport fails over, so a superseded resolver whose scan was already in
+	// flight cannot record the failed transport's agy PID.
+	resolverGen uint64
+}
+
+// Wrapper-resolver bounds: an opening ramp of antigravityWrapperRampScans
+// scans antigravityWrapperRampEvery apart (the first one right away), so an
+// agy that fails fast — a quota refusal is over in a couple of seconds — is
+// still seen alive; then one ancestry scan every antigravityWrapperScanEvery
+// while the wrapped command runs, at most antigravityWrapperMaxScans per run
+// in total.
+var (
+	antigravityWrapperRampEvery = 500 * time.Millisecond
+	antigravityWrapperRampScans = 6
+	antigravityWrapperScanEvery = 5 * time.Second
+	antigravityWrapperMaxScans  = 60
+	// antigravityWrapperFinishGrace bounds how long Finish waits for a scan
+	// that is already in flight when the command returns. A scan normally
+	// takes about a second, but a stalled WMI/CIM provider can hang far
+	// longer, and the execute path must not be held open behind it: past the
+	// grace the run settles without the resolver's PID.
+	antigravityWrapperFinishGrace = 3 * time.Second
+	// antigravityAncestryScan is the resolver's scan seam.
+	antigravityAncestryScan = ScanProcessAncestryChecked
+)
+
+// SetPID records the run's agy PID right after Start. The first PID wins.
+func (c *antigravityRunCapture) SetPID(pid int) {
+	if c == nil || pid <= 0 {
+		return
+	}
+	c.setPID(pid, false, 0)
+}
+
+// setPID records pid unless one is already set or the run has finished. A
+// resolver passes its generation, and a superseded one records nothing.
+func (c *antigravityRunCapture) setPID(pid int, fromResolver bool, gen uint64) {
+	c.mu.Lock()
+	if c.pid != 0 || c.finished || (fromResolver && gen != c.resolverGen) {
+		c.mu.Unlock()
+		return
+	}
+	c.pid = pid
+	c.mu.Unlock()
+	noteAntigravityManagedPID(pid)
+}
+
+// SetWrapper starts (or re-roots, for a transport that failed over) the
+// resolver that finds the agy process a wrapper started: a PowerShell, pwsh or
+// cmd process on the Windows execute chain, the persistent PowerShell host
+// included, or a POSIX shell on the PTY and Unix execute paths (which may exec
+// agy in place, so the Unix scan includes the wrapper itself). Descendants that started before the capture floor are never taken
+// (the persistent host outlives every command it runs).
+//
+// A re-root also drops a PID the superseded transport already resolved: the
+// command is being run again, so the retried agy is this run's. The dropped
+// PID leaves the capture the way Finish releases one — handed to discovery if
+// it is still alive, otherwise marked exited.
+func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
+	if c == nil || wrapperPID <= 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.finished {
+		c.mu.Unlock()
+		return
+	}
+	superseded := c.pid
+	c.pid = 0
+	if c.resolverStop != nil {
+		close(c.resolverStop)
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	c.resolverStop, c.resolverDone = stop, done
+	c.resolverGen++
+	gen := c.resolverGen
+	c.mu.Unlock()
+	releaseAntigravityCapturedPID(superseded, c.floor)
+	go c.resolveWrapper(wrapperPID, gen, stop, done)
+}
+
+// releaseAntigravityCapturedPID lets a capture's agy PID go: a process that
+// outlived its wrapper goes to discovery, anything else is marked exited.
+// Never called with c.mu or the index lock held.
+func releaseAntigravityCapturedPID(pid int, floor time.Time) {
+	if !handOffAntigravityDetachedManagedPID(pid, floor, antigravityUsageFreshnessNow()) {
+		noteAntigravityManagedPIDExited(pid)
+	}
+}
+
+// resolveWrapper scans the wrapper's tree — at once, through the opening ramp,
+// then every antigravityWrapperScanEvery — until it finds agy, the command
+// ends (stop), or the scan budget is spent. An agy that has exited before any
+// scan sees it is never resolved: a recorded limitation, since after exit
+// nothing ties its log to this wrapper rather than to a concurrent direct run.
+func (c *antigravityRunCapture) resolveWrapper(wrapperPID int, gen uint64, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	notBefore := c.floor.Truncate(time.Second)
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for scans := 0; scans < antigravityWrapperMaxScans; scans++ {
+		select {
+		case <-stop:
+			return
+		case <-timer.C:
+		}
+		if scans+1 < antigravityWrapperRampScans {
+			timer.Reset(antigravityWrapperRampEvery)
+		} else {
+			timer.Reset(antigravityWrapperScanEvery)
+		}
+		procs, ok := antigravityAncestryScan(wrapperPID)
+		if !ok {
+			continue
+		}
+		for _, p := range procs {
+			if !isAntigravityProcessName(p.Name) {
+				continue
+			}
+			// Both scan backends report subsecond creation times, so a
+			// descendant is compared with the exact floor: a detached agy that
+			// an earlier command on a persistent host started in the same
+			// second is never taken for this run's. A whole-second time (no
+			// fraction reported) falls back to the floor's second.
+			cutoff := c.floor
+			if p.StartTime.Nanosecond() == 0 {
+				cutoff = notBefore
+			}
+			if !p.StartTime.IsZero() && p.StartTime.Before(cutoff) {
+				continue
+			}
+			c.setPID(p.PID, true, gen)
+			return
+		}
+	}
+}
+
+// isAntigravityProcessName reports whether a scanned process image is agy
+// under either name isAntigravityCommand accepts (agy, antigravity; .exe on
+// Windows). An exact match, not that classifier's prefix: a scanned tree can
+// hold unrelated processes whose names merely start the same way.
+func isAntigravityProcessName(name string) bool {
+	switch strings.TrimSuffix(strings.ToLower(name), ".exe") {
+	case "agy", "antigravity":
+		return true
+	}
+	return false
+}
+
+// SetStarted hands a started child to the capture: its PID when the child is
+// agy itself, otherwise the wrapper PID for the resolver to walk.
+func (c *antigravityRunCapture) SetStarted(cmd string, pid int) {
+	if isAntigravityCommand(cmd) {
+		c.SetPID(pid)
+		return
+	}
+	c.SetWrapper(pid)
+}
+
+// Finish ends the run: stops the resolver, releases the poller and settles the
+// run's freshness off the caller's goroutine. Idempotent.
+func (c *antigravityRunCapture) Finish() {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		antigravityCaptureFinishes.Add(1)
+
+		c.mu.Lock()
+		stop, done := c.resolverStop, c.resolverDone
+		c.resolverStop, c.resolverDone = nil, nil
+		c.mu.Unlock()
+		if stop != nil {
+			close(stop)
+			// Wait for a scan already in flight — it may be the one that
+			// resolves this run — but only for the grace: the resolver runs an
+			// external process table query on Windows, and a provider that
+			// never answers must not hold the command's return path open.
+			grace := time.NewTimer(antigravityWrapperFinishGrace)
+			select {
+			case <-done:
+			case <-grace.C:
+			}
+			grace.Stop()
+		}
+		c.mu.Lock()
+		c.finished = true
+		pid := c.pid
+		c.mu.Unlock()
+		// A wrapper can return while the agy it launched keeps running
+		// (`Start-Process agy`, `agy … &`): that process goes to discovery,
+		// which owes its reading and re-reads its block for evidence when it
+		// really exits.
+		releaseAntigravityCapturedPID(pid, c.floor)
+
+		if c.polled {
+			antigravityCaptureMu.Lock()
+			antigravityCaptureRefs--
+			var stop chan struct{}
+			if antigravityCaptureRefs <= 0 {
+				antigravityCaptureRefs = 0
+				// Leave antigravityCaptureDone in place: it is the only handle
+				// on the in-flight shutdown, and the next arm replaces it.
+				stop, antigravityCaptureStop = antigravityCaptureStop, nil
+			}
+			antigravityCaptureMu.Unlock()
+
+			if stop != nil {
+				close(stop)
+			}
+		}
+
+		// Settle THIS run, off the caller's goroutine and without waiting for
+		// the poller: the poller is ref-counted and exits only when the last
+		// armed run releases, so settling there would park a finished run's
+		// refresh behind a long interactive session sharing it. Counted in
+		// antigravityFreshnessInFlight like every other background write this
+		// feature owns: the settle can wait out the post-release tail, and a
+		// goroutine nobody can wait for would write the state file after its
+		// owner (a test's temp dir, or an agent shutting down) has already gone.
+		floor, gated := c.floor, c.gated
+		antigravityFreshnessInFlight.Add(1)
+		go func() {
+			defer antigravityFreshnessInFlight.Add(-1)
+			// A reading persisted at or after this run armed means the poller
+			// found a server for it, so the tail is being paid.
+			antigravityUsageRunSettled(floor, pid,
+				antigravityCaptureLastPersistedMs.Load() >= floor.UnixMilli(), gated)
+		}()
+	})
+}
+
 // startAntigravityQuotaCapture arms the shared quota poller for one `agy` run
-// and returns the release function.
+// and returns its capture handle.
 //
 // Contract, relied on by every spawn path: it never blocks the caller, never
-// returns an error, and the returned finish is idempotent — a failed capture
+// returns an error, and the handle's Finish is idempotent — a failed capture
 // costs freshness, never the run. label is a fixed internal string ("native
 // turn", "PTY session", …) used only for logging; it must never carry a command
 // line, path or prompt.
-func startAntigravityQuotaCapture(label string) (finish func()) {
+func startAntigravityQuotaCapture(label string) *antigravityRunCapture {
 	antigravityCaptureArms.Add(1)
 	now := antigravityUsageFreshnessNow()
 	// Arm this run's freshness floor. Every spawn site reaches here — directly
@@ -182,47 +447,7 @@ func startAntigravityQuotaCapture(label string) (finish func()) {
 		antigravityCaptureMu.Unlock()
 	}
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			antigravityCaptureFinishes.Add(1)
-
-			if polled {
-				antigravityCaptureMu.Lock()
-				antigravityCaptureRefs--
-				var stop chan struct{}
-				if antigravityCaptureRefs <= 0 {
-					antigravityCaptureRefs = 0
-					// Leave antigravityCaptureDone in place: it is the only handle
-					// on the in-flight shutdown, and the next arm replaces it.
-					stop, antigravityCaptureStop = antigravityCaptureStop, nil
-				}
-				antigravityCaptureMu.Unlock()
-
-				if stop != nil {
-					close(stop)
-				}
-			}
-
-			// Settle THIS run, off the caller's goroutine and without waiting
-			// for the poller: the poller is ref-counted and exits only when the
-			// last armed run releases, so settling there would park a finished
-			// run's refresh behind a long interactive session sharing it.
-			// Counted in antigravityFreshnessInFlight like every other
-			// background write this feature owns: the settle can wait out the
-			// post-release tail, and a goroutine nobody can wait for would
-			// write the state file after its owner (a test's temp dir, or an
-			// agent shutting down) has already gone.
-			antigravityFreshnessInFlight.Add(1)
-			go func() {
-				defer antigravityFreshnessInFlight.Add(-1)
-				// A reading persisted at or after this run armed means the
-				// poller found a server for it, so the tail is being paid.
-				antigravityUsageRunSettled(floor,
-					antigravityCaptureLastPersistedMs.Load() >= floor.UnixMilli(), gated)
-			}()
-		})
-	}
+	return &antigravityRunCapture{floor: floor, gated: gated, polled: polled}
 }
 
 // antigravityCaptureStopped returns the current poller's completion channel,
@@ -452,7 +677,7 @@ func antigravityCaptureAttempt(client *http.Client, memoPort *int, allowDiscover
 	// self-update that migrates ~/.agy → ~/.gemini/antigravity-cli mid-flight is
 	// picked up without restarting the agent.
 	for _, base := range antigravityQuotaBases(home) {
-		ports, _ := discoverAntigravityHTTPPorts(base)
+		ports := discoverAntigravityHTTPPorts(base)
 		for _, port := range ports {
 			switch snap, outcome := fetchAntigravityQuotaOnPortOutcome(ctx, client, port, now); outcome {
 			case antigravityFetchOK:

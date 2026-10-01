@@ -259,7 +259,7 @@ func TestAntigravityQuotaCapture_StopsAtTheFirstRefusal(t *testing.T) {
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	_, hits := helperGatedAntigravityServer(t, base)
 
-	finish := startAntigravityQuotaCapture("test gated run")
+	finish := startAntigravityQuotaCapture("test gated run").Finish
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(gatePath); err == nil {

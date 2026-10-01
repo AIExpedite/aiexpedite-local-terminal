@@ -71,8 +71,14 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 	// session path (startPTYSession) and the `execute` path in pubsub.go, and
 	// both direct `agy …` argv and shell-wrapped `bash -c "agy …"` payloads. The
 	// defer releases it on EVERY exit route — normal exit, overall timeout and
-	// prompt-abort. See cliagent_usage_antigravity_capture.go.
-	defer armAntigravityCaptureForCommand("PTY session", cmd, args)()
+	// prompt-abort. The capture holds agy's PID for the run's settle: the
+	// child's own for a direct `agy …`, resolved from the shell for a wrapper.
+	// See cliagent_usage_antigravity_capture.go.
+	capture := armAntigravityCaptureForCommand("PTY session", cmd, args)
+	if c.Process != nil {
+		capture.SetStarted(cmd, c.Process.Pid)
+	}
+	defer capture.Finish()
 
 	norm := NewPTYNormalizer(DefaultRedrawInterval)
 	var sb strings.Builder

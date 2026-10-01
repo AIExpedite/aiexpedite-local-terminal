@@ -21,7 +21,7 @@ func TestRunLocalCommandFallback_PropagatesNativeFailure(t *testing.T) {
 	// failing `npm test`/`pytest`. The trailing Write-Host/(Get-Location).Path
 	// probe succeeds, so without the $LASTEXITCODE capture this would report
 	// success.
-	_, err := runLocalCommandFallback("cmd /c exit 3", "", 30*time.Second)
+	_, err := runLocalCommandFallback("cmd /c exit 3", "", 30*time.Second, nil)
 	if err == nil {
 		t.Fatalf("expected a non-zero exit error from a failing native command, got nil")
 	}
@@ -33,7 +33,7 @@ func TestRunLocalCommandFallback_PropagatesNativeFailure(t *testing.T) {
 func TestRunLocalCommandFallback_SucceedsOnPassingCommand(t *testing.T) {
 	// A passing native command must still report success (no false failure from
 	// the $null-guard or the probe).
-	_, err := runLocalCommandFallback("cmd /c exit 0", "", 30*time.Second)
+	_, err := runLocalCommandFallback("cmd /c exit 0", "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected success for a passing command, got %v", err)
 	}
@@ -44,7 +44,7 @@ func TestRunLocalCommandFallback_SucceedsOnPassingCommand(t *testing.T) {
 // computer setup instead of a masked success — and keep PowerShell's own
 // "not recognized" text as the output.
 func TestRunLocalCommandFallback_MissingProgramFails(t *testing.T) {
-	out, err := runLocalCommandFallback("aix-definitely-missing-cmd --version", "", 30*time.Second)
+	out, err := runLocalCommandFallback("aix-definitely-missing-cmd --version", "", 30*time.Second, nil)
 	if err == nil {
 		t.Fatalf("expected a non-zero exit for a missing program, got nil; output: %s", out)
 	}
@@ -60,7 +60,7 @@ func TestRunLocalCommandFallback_MissingProgramFails(t *testing.T) {
 // Every fallback host runs with a process-scoped `-ExecutionPolicy Bypass` so
 // npm.ps1 and other .ps1 shims load under a restrictive machine policy.
 func TestRunLocalCommandFallback_ProcessScopeBypass(t *testing.T) {
-	out, err := runLocalCommandFallback("Get-ExecutionPolicy -Scope Process", "", 30*time.Second)
+	out, err := runLocalCommandFallback("Get-ExecutionPolicy -Scope Process", "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v\noutput: %s", err, out)
 	}
@@ -71,7 +71,7 @@ func TestRunLocalCommandFallback_ProcessScopeBypass(t *testing.T) {
 
 // A handled error is never promoted to a failure.
 func TestRunLocalCommandFallback_HandledMissingProgramSucceeds(t *testing.T) {
-	out, err := runLocalCommandFallback("try { aix-definitely-missing-cmd } catch { 'handled' }", "", 30*time.Second)
+	out, err := runLocalCommandFallback("try { aix-definitely-missing-cmd } catch { 'handled' }", "", 30*time.Second, nil)
 	if err != nil {
 		t.Fatalf("expected a handled error to exit 0, got %v\noutput: %s", err, out)
 	}

@@ -105,7 +105,7 @@ func TestFetchAntigravityQuota_ReadsLoopbackServerDiscoveredFromLogs(t *testing.
 	helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
 
 	now := time.Date(2026, 8, 11, 12, 5, 0, 0, time.UTC)
-	snap, _, ok := fetchAntigravityQuota(context.Background(), base, now)
+	snap, ok := fetchAntigravityQuota(context.Background(), base, now)
 	if !ok {
 		t.Fatalf("expected a quota snapshot")
 	}
@@ -126,13 +126,13 @@ func TestFetchAntigravityQuota_NoServerRunning(t *testing.T) {
 	helperWriteAntigravityLog(t, base, "cli-old.log",
 		"server.go:584] Language server listening on random port at 1 for HTTP\n")
 
-	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("expected no snapshot when nothing answers")
 	}
 }
 
 func TestFetchAntigravityQuota_NoLogsIsNotAnError(t *testing.T) {
-	if _, _, ok := fetchAntigravityQuota(context.Background(), t.TempDir(), time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), t.TempDir(), time.Now()); ok {
 		t.Errorf("expected no snapshot without logs")
 	}
 }
@@ -143,7 +143,7 @@ func TestFetchAntigravityQuota_EmptyGroupsIsNotASnapshot(t *testing.T) {
 	base := t.TempDir()
 	helperAntigravityServer(t, base, `{"response":{"groups":[]}}`, helperStatusJSON)
 
-	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("an empty quota payload must not count as an observation")
 	}
 }
@@ -157,7 +157,7 @@ func TestFetchAntigravityQuota_UnrecognizedWindowsAreNotASnapshot(t *testing.T) 
 	  {"bucketId":"gemini-fortnightly","window":"fortnightly","remainingFraction":0.5,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("a response with no plottable bucket must not count as an observation")
 	}
 }
@@ -226,7 +226,7 @@ func TestDiscoverAntigravityHTTPPorts_PrefersNewestLogAndLastLine(t *testing.T) 
 			"server.go:584] Language server listening on random port at 22222 for HTTP\n"+
 			"server.go:584] Language server listening on random port at 33333 for HTTP\n")
 
-	ports, _ := discoverAntigravityHTTPPorts(base)
+	ports := discoverAntigravityHTTPPorts(base)
 	if len(ports) < 3 {
 		t.Fatalf("ports=%v, want at least 3 candidates", ports)
 	}
@@ -538,7 +538,7 @@ func TestDiscoverAntigravityHTTPPorts_ReadsBoundedHeadAndTail(t *testing.T) {
 		t.Fatalf("fixture must exceed the scan window, got %d bytes", info.Size())
 	}
 
-	ports, _ := discoverAntigravityHTTPPorts(base)
+	ports := discoverAntigravityHTTPPorts(base)
 	if len(ports) != 2 {
 		t.Fatalf("ports=%v, want both the startup and restart ports", ports)
 	}
@@ -558,7 +558,7 @@ func TestFetchAntigravityQuota_SkipsBucketsWithoutARemainingFraction(t *testing.
 	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":null,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("buckets with no usable fraction must not count as an observation")
 	}
 }
@@ -570,7 +570,7 @@ func TestFetchAntigravityQuota_SkipsOutOfRangeFraction(t *testing.T) {
 	  {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":42,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
 		helperStatusJSON)
 
-	if _, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
 		t.Errorf("a fraction outside 0..1 must not be plotted")
 	}
 }
@@ -584,7 +584,7 @@ func TestFetchAntigravityQuota_KeepsValidBucketsBesideMalformedOnes(t *testing.T
 	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
 		helperStatusJSON)
 
-	snap, _, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
+	snap, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
 	if !ok {
 		t.Fatalf("expected the usable bucket to yield a snapshot")
 	}
@@ -799,7 +799,7 @@ func TestDiscoverAntigravityHTTPPorts_AcceptsTheToleratedPortSpelling(t *testing
 		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
 			"server.go:584] Language server listening on port 55551 for HTTP\n")
 
-	ports, _ := discoverAntigravityHTTPPorts(base)
+	ports := discoverAntigravityHTTPPorts(base)
 	if len(ports) != 1 || ports[0] != 55551 {
 		t.Fatalf("ports=%v, want just the post-update HTTP port 55551", ports)
 	}
@@ -813,7 +813,7 @@ func TestDiscoverAntigravityHTTPPorts_IgnoresAnHTTPSOnlyLog(t *testing.T) {
 		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
 			"server.go:577] Language server listening on port 22222 for HTTPS (gRPC)\n")
 
-	if ports, _ := discoverAntigravityHTTPPorts(base); len(ports) != 0 {
+	if ports := discoverAntigravityHTTPPorts(base); len(ports) != 0 {
 		t.Errorf("ports=%v, want none — no plain-HTTP listener was advertised", ports)
 	}
 }
@@ -1011,9 +1011,8 @@ func TestAntigravityMissedRun_SilentWithoutAParseableObservation(t *testing.T) {
 	}
 }
 
-// The backstop reuses the stat discovery already paid for rather than walking
-// the log directory a second time on every refresh.
-func TestDiscoverAntigravityHTTPPorts_ReportsTheNewestLogMtime(t *testing.T) {
+// Discovery reads the newest logs first, so the newest run's listener leads.
+func TestDiscoverAntigravityHTTPPorts_NewestLogFirst(t *testing.T) {
 	base := t.TempDir()
 	helperWriteAntigravityLog(t, base, "old.log",
 		"server.go:584] Language server listening on random port at 44441 for HTTP\n")
@@ -1029,18 +1028,12 @@ func TestDiscoverAntigravityHTTPPorts_ReportsTheNewestLogMtime(t *testing.T) {
 		t.Fatalf("chtimes: %v", err)
 	}
 
-	ports, newestLog := discoverAntigravityHTTPPorts(base)
-	if len(ports) != 2 {
-		t.Errorf("ports=%v, want both listeners", ports)
+	ports := discoverAntigravityHTTPPorts(base)
+	if len(ports) != 2 || ports[0] != 44442 {
+		t.Errorf("ports=%v, want both listeners, the newer log's first", ports)
 	}
-	if !newestLog.Equal(newest.Truncate(time.Second)) && newestLog.Sub(newest).Abs() > time.Second {
-		t.Errorf("newestLog=%s, want the newer file's mtime %s", newestLog, newest)
-	}
-
-	// An unreadable (here: absent) log directory reports no run rather than a
-	// zero-value instant that could be mistaken for one.
-	if ports, newestLog := discoverAntigravityHTTPPorts(t.TempDir()); len(ports) != 0 || !newestLog.IsZero() {
-		t.Errorf("empty base gave ports=%v newestLog=%s, want none and the zero time", ports, newestLog)
+	if ports := discoverAntigravityHTTPPorts(t.TempDir()); len(ports) != 0 {
+		t.Errorf("empty base gave ports=%v, want none", ports)
 	}
 }
 
@@ -1094,11 +1087,11 @@ func TestNudgeAntigravityUsageRefresh_SeesARunTwentySecondsAfterTheReading(t *te
 		t.Fatal("the diagnostic's slack now sees the run; this case no longer pins the regression")
 	}
 	// The gather right after the run: the settle guard holds the nudge.
-	if nudgeAntigravityUsageRefresh(runEnded.Add(5*time.Second), observed.Format(time.RFC3339), runEnded) {
+	if nudgeAntigravityUsageRefresh(runEnded.Add(5*time.Second), observed.UnixMilli(), runEnded) {
 		t.Error("the nudge fired for a log that has not settled")
 	}
 	// A later gather: seen.
-	if !nudgeAntigravityUsageRefresh(time.Now(), observed.Format(time.RFC3339), runEnded) {
+	if !nudgeAntigravityUsageRefresh(time.Now(), observed.UnixMilli(), runEnded) {
 		t.Fatal("the nudge never saw a run that finished 20 s after the reading")
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -1107,10 +1100,14 @@ func TestNudgeAntigravityUsageRefresh_SeesARunTwentySecondsAfterTheReading(t *te
 	}
 }
 
-// The gated gather's mtime-only helper agrees with the discovery walk it
-// replaces, including for logs that name no port at all — it never needs to
-// read a body to answer.
-func TestAntigravityNewestRunLog_AgreesWithDiscovery(t *testing.T) {
+// The newest-log helper answers with the newest OWE-READY run as the log index
+// classifies it: logs with no PID block, settled for longer than the settle
+// window and newer than any reading, are owed at their mtime. Non-log files
+// and directories are never runs.
+func TestAntigravityNewestRunLog_IsTheNewestOweReadyRun(t *testing.T) {
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "none.json"))
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
 	base := t.TempDir()
 	logDir := antigravityLogDir(base)
 	helperWriteAntigravityLog(t, base, "a.log", "server.go:584] Language server listening on random port at 44441 for HTTP\n")
@@ -1131,15 +1128,120 @@ func TestAntigravityNewestRunLog_AgreesWithDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, discovered := discoverAntigravityHTTPPorts(base)
 	got := antigravityNewestRunLog(base)
-	if !got.Equal(discovered) {
-		t.Errorf("newest=%s, discovery=%s, want them to agree", got, discovered)
-	}
 	if got.Sub(newer).Abs() > time.Second {
 		t.Errorf("newest=%s, want the newest .log file's mtime %s", got, newer)
 	}
+	resetAntigravityLogIndex()
 	if empty := antigravityNewestRunLog(t.TempDir()); !empty.IsZero() {
 		t.Errorf("no log dir gave %s, want the zero time", empty)
+	}
+}
+
+/* ─────────────────── fraction presence and exhaustion evidence ─────────────────── */
+
+// helperGroupsJSON decodes a reply's groups exactly as both routes do.
+func helperGroupsJSON(t *testing.T, raw string) []antigravityQuotaGroupWire {
+	t.Helper()
+	var reply struct {
+		Response struct {
+			Groups []antigravityQuotaGroupWire `json:"groups"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return reply.Response.Groups
+}
+
+const helperAllOmittedJSON = `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+  {"bucketId":"gemini-5h","window":"5h","resetTime":"2126-08-12T04:37:41Z"},
+  {"bucketId":"gemini-weekly","window":"weekly","resetTime":"2126-08-14T14:17:13Z"}]}]}}`
+
+// Omitted with no evidence: the bucket is unknown, and a reply whose every
+// bucket is omitted is not an observation at all.
+func TestAntigravitySnapshotFromGroups_OmittedIsUnknownWithoutEvidence(t *testing.T) {
+	_, shape, ok := antigravitySnapshotFromGroups(helperGroupsJSON(t, helperAllOmittedJSON), time.Now(), nil)
+	if ok {
+		t.Fatal("an all-omitted reply with no evidence counted as a reading")
+	}
+	if shape.FractionOmitted != 2 || shape.OmittedCharted != 0 || shape.Buckets != 2 {
+		t.Errorf("shape=%+v, want two omitted, none charted", shape)
+	}
+}
+
+// Evidence names a bucket when its reset is within two minutes of the bucket's
+// and it was recorded for the same account; 3 min off, or another account's
+// fingerprint (the caller filters by fingerprint), charts nothing.
+func TestAntigravitySnapshotFromGroups_EvidenceChartsTheMatchingBucket(t *testing.T) {
+	reset, _ := time.Parse(time.RFC3339, "2126-08-12T04:37:41Z")
+	near := []antigravityExhaustionEvent{{resetAtMs: reset.Add(90 * time.Second).UnixMilli(), fingerprint: "fp-a"}}
+	snap, shape, ok := antigravitySnapshotFromGroups(helperGroupsJSON(t, helperAllOmittedJSON), time.Now(), near)
+	if !ok || len(snap.Buckets) != 1 || snap.Buckets[0].BucketID != "gemini-5h" || snap.Buckets[0].RemainingFraction != 0 {
+		t.Fatalf("snap=%+v ok=%v, want only the 5h bucket charted fully consumed", snap, ok)
+	}
+	if shape.OmittedCharted != 1 {
+		t.Errorf("omittedCharted=%d, want 1", shape.OmittedCharted)
+	}
+	metrics := antigravityQuotaMetrics(snap, time.Now())
+	if len(metrics) != 1 || metrics[0].Consumed == nil || *metrics[0].Consumed != 100 {
+		t.Errorf("metrics=%+v, want the bucket at 100%% consumed", metrics)
+	}
+
+	far := []antigravityExhaustionEvent{{resetAtMs: reset.Add(3 * time.Minute).UnixMilli(), fingerprint: "fp-a"}}
+	if _, _, ok := antigravitySnapshotFromGroups(helperGroupsJSON(t, helperAllOmittedJSON), time.Now(), far); ok {
+		t.Error("evidence three minutes off charted a bucket")
+	}
+}
+
+// null, a string, a bool and an object are skipped; 0 is a real reading.
+func TestAntigravityWireFraction_States(t *testing.T) {
+	raw := `{"response":{"groups":[{"displayName":"G","buckets":[
+	  {"bucketId":"null","window":"5h","remainingFraction":null},
+	  {"bucketId":"string","window":"5h","remainingFraction":"0.5"},
+	  {"bucketId":"bool","window":"5h","remainingFraction":true},
+	  {"bucketId":"object","window":"5h","remainingFraction":{}},
+	  {"bucketId":"range","window":"5h","remainingFraction":1.5},
+	  {"bucketId":"zero","window":"weekly","remainingFraction":0}]}]}}`
+	snap, shape, ok := antigravitySnapshotFromGroups(helperGroupsJSON(t, raw), time.Now(), nil)
+	if !ok || len(snap.Buckets) != 1 || snap.Buckets[0].BucketID != "zero" {
+		t.Fatalf("snap=%+v ok=%v, want only the explicit 0", snap, ok)
+	}
+	if shape.FractionNull != 1 || shape.FractionInvalid != 4 || shape.FractionValid != 1 || shape.ResetMissing != 6 {
+		t.Errorf("shape=%+v", shape)
+	}
+}
+
+// Loopback: identity is resolved before conversion, so evidence applies only
+// to the account the server names; when GetUserStatus fails no evidence is
+// applied and an all-omitted reply is not a reading.
+func TestFetchAntigravityQuotaOnPort_EvidenceNeedsTheServersIdentity(t *testing.T) {
+	reset, _ := time.Parse(time.RFC3339, "2126-08-12T04:37:41Z")
+	var askedFor []string
+	orig := antigravityExhaustionEvidenceFn
+	defer func() { antigravityExhaustionEvidenceFn = orig }()
+	antigravityExhaustionEvidenceFn = func(_ time.Time, fingerprint string) []antigravityExhaustionEvent {
+		askedFor = append(askedFor, fingerprint)
+		return []antigravityExhaustionEvent{{resetAtMs: reset.UnixMilli(), fingerprint: fingerprint}}
+	}
+
+	base := t.TempDir()
+	helperAntigravityServer(t, base, helperAllOmittedJSON, helperStatusJSON)
+	snap, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
+	if !ok || snap.Account != "ada@example.com" || len(snap.Buckets) != 1 {
+		t.Fatalf("snap=%+v ok=%v, want the 5h bucket charted for ada", snap, ok)
+	}
+	if len(askedFor) != 1 || askedFor[0] != fingerprintAccount("antigravity", "ada@example.com") {
+		t.Errorf("evidence asked for %v, want ada's fingerprint only", askedFor)
+	}
+
+	askedFor = nil
+	base = t.TempDir()
+	helperAntigravityServer(t, base, helperAllOmittedJSON, "")
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+		t.Error("with no identity, evidence was applied")
+	}
+	if len(askedFor) != 0 {
+		t.Errorf("evidence consulted without an identity: %v", askedFor)
 	}
 }

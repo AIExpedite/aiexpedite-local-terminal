@@ -544,3 +544,55 @@ func TestOpenCodeModelsAreNeverExhaustive(t *testing.T) {
 		t.Fatal("a listed model dropped for an unreportable id makes the set non-exhaustive")
 	}
 }
+
+// `agy models` is registered as the agent's own `agy` child for as long as it
+// runs, so its log is never taken for a run owing a refresh. A runner that
+// never calls the start hook records no PID; one that panics still releases
+// the running count.
+func TestDiscoverAntigravityModels_RegistersAnOwnChild(t *testing.T) {
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+	prev := cliAgentModelProbeRunner
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+
+	sawRunning := false
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
+		sawRunning = antigravityOwnChildRunning()
+		return realAntigravityModels, true
+	}
+	if _, ok := discoverCLIAgentModels(context.Background(), "antigravity", detectedCLIAgent{Path: "agy"}, t.TempDir()); !ok {
+		t.Fatal("discovery failed")
+	}
+	if !sawRunning || antigravityOwnChildRunning() {
+		t.Errorf("running during=%v after=%v, want counted only while it ran", sawRunning, antigravityOwnChildRunning())
+	}
+	lockAntigravityLogIndex()
+	pids := len(antigravityLogIndex.ownPIDs)
+	unlockAntigravityLogIndex()
+	if pids != 0 {
+		t.Errorf("a hook-less runner recorded %d PIDs", pids)
+	}
+
+	var hooked int
+	cliAgentModelProbeRunner = func(ctx context.Context, _ string, _ []string, _ ...string) (string, bool) {
+		processStartHookFrom(ctx)(4242)
+		hooked++
+		return realAntigravityModels, true
+	}
+	discoverCLIAgentModels(context.Background(), "antigravity", detectedCLIAgent{Path: "agy"}, t.TempDir())
+	lockAntigravityLogIndex()
+	recorded := antigravityPIDIn(antigravityLogIndex.ownPIDs, 4242, "", time.Time{})
+	unlockAntigravityLogIndex()
+	if hooked != 1 || !recorded {
+		t.Errorf("hooked=%d recorded=%v, want the runner's start hook to record the child", hooked, recorded)
+	}
+
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) { panic("boom") }
+	func() {
+		defer func() { _ = recover() }()
+		discoverCLIAgentModels(context.Background(), "antigravity", detectedCLIAgent{Path: "agy"}, t.TempDir())
+	}()
+	if antigravityOwnChildRunning() {
+		t.Error("a panicking runner left the own child counted as running")
+	}
+}

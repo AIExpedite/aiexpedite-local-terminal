@@ -65,6 +65,12 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// so the next process re-arms them.
 	stopAntigravityRunDebtRetry()
 	stopCodexRunDebtRetry()
+	// Antigravity's discovery tick stops, then its in-flight state writes (a
+	// run's settle, an arm persisting its floor) get a bounded drain, so a
+	// write racing an update handoff lands before this process dies and the
+	// floor it persisted is adopted by the next one. The drain takes at most half
+	// of the caller's remaining deadline, leaving the rest for notifyOffline.
+	drainAntigravityUsageWrites(ctx)
 	// No usage hint goes out after this; a pending one is recovered by the next
 	// process from the cache it rotates.
 	stopCLIUsagePropagator()

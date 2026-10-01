@@ -79,7 +79,7 @@ func withSpiedFallback(t *testing.T) *[]string {
 	orig := runLocalCommandFallbackFn
 	t.Cleanup(func() { runLocalCommandFallbackFn = orig })
 	var lines []string
-	runLocalCommandFallbackFn = func(cmdLine, workDir string, timeout time.Duration) (string, error) {
+	runLocalCommandFallbackFn = func(cmdLine, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
 		lines = append(lines, cmdLine)
 		return "fallback-stub", nil
 	}

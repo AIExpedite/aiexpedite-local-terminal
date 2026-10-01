@@ -96,10 +96,15 @@ jobs:
       #   - Race detector is slow (~2x runtime); running on every platform
       #     wastes CI minutes.
       #   - Race issues are platform-independent in this codebase.
+      #
+      # -timeout bounds the whole package binary, not one test. The root
+      # package's serial suite already runs ~290s under -race on
+      # ubuntu-latest, so a 5m budget failed on suite growth alone (the test
+      # "running" at the deadline had been going for 0s), not on a hang.
       - name: go test
         if: runner.os == 'Linux'
-        run: go test -race -timeout 5m ./...
+        run: go test -race -timeout 10m ./...
 
       - name: go test (no race)
         if: runner.os != 'Linux'
-        run: go test -timeout 5m ./...
+        run: go test -timeout 10m ./...

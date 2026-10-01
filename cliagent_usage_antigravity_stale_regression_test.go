@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,10 +38,16 @@ type helperStaleRegression struct {
 
 func helperStaleRegressionFixture(t *testing.T, keyring map[string]any, userinfo func(string) (int, string)) helperStaleRegression {
 	t.Helper()
+	return helperStaleRegressionFixtureQuota(t, keyring,
+		func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture }, userinfo)
+}
+
+// helperStaleRegressionFixtureQuota is helperStaleRegressionFixture with the
+// Code Assist reply chosen by the caller.
+func helperStaleRegressionFixtureQuota(t *testing.T, keyring map[string]any, quota, userinfo func(string) (int, string)) helperStaleRegression {
+	t.Helper()
 	helperStubAntigravityKeyring(t, keyring)
-	quotaCalls, _ := helperCodeAssistServers(t,
-		func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
-		userinfo)
+	quotaCalls, _ := helperCodeAssistServers(t, quota, userinfo)
 	// After helperCodeAssistServers, which points the cache at its own dir.
 	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 	helperIsolateAntigravityGate(t)
@@ -93,7 +100,7 @@ func helperRunEncodedPowerShellAgy(t *testing.T, f helperStaleRegression) {
 	t.Helper()
 	restore := runEncodedPowerShellViaArgFn
 	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
-	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration) (string, error) {
+	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration, _ func(int)) (string, error) {
 		script, err := decodeBase64PowerShellStrict(encodedScript)
 		if err != nil {
 			return "", err
@@ -348,5 +355,245 @@ func TestAntigravityStaleRegression_ABurstOfRunsIsBounded(t *testing.T) {
 	}
 	if until := time.Until(time.UnixMilli(state.NextAttemptAtMs)); until > antigravityRefreshMinInterval+time.Second {
 		t.Errorf("next attempt is %s away, want it bounded by the interval", until)
+	}
+}
+
+/* ─────────── discovery, managed-run evidence and update survival ─────────── */
+
+// helperPinFreshnessClock pins the freshness clock (the discovery tick, the
+// nudge and the debt worker all read it) and returns a setter. Cleanup releases
+// the pin from inside the installed function rather than restoring the package
+// variable: a debt worker this test started can outlive it, and writing the
+// variable while that worker reads it is a data race.
+func helperPinFreshnessClock(t *testing.T, at time.Time) func(time.Time) {
+	t.Helper()
+	orig := antigravityUsageFreshnessNow
+	var mu sync.Mutex
+	pinned := true
+	antigravityUsageFreshnessNow = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		if !pinned {
+			return orig()
+		}
+		return at
+	}
+	t.Cleanup(func() { mu.Lock(); pinned = false; mu.Unlock() })
+	return func(next time.Time) { mu.Lock(); at = next; mu.Unlock() }
+}
+
+// helperRunPlainAgy is a DIRECT run: the user's own shell, a plain exec with
+// no capture, no gather and no cloud loop.
+func helperRunPlainAgy(t *testing.T, f helperStaleRegression) {
+	t.Helper()
+	cmd := exec.Command(f.executable, "--print", "hello")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("plain agy run failed: %v (%s)", err, out)
+	}
+}
+
+// DirectRunDiscoveredWithoutGather: nothing classifies the run and nothing
+// gathers. The discovery tick alone finds it, holds it until it has exited and
+// settled, owes it, and the debt worker lands a numeric reading within
+// exit + 2.5 min on the pinned clock.
+func TestAntigravityStaleRegression_DirectRunDiscoveredWithoutGather(t *testing.T) {
+	f := helperStaleRegressionFixture(t, helperStoredLogin(), helperUserinfoAda)
+	t.Setenv(mockCLIEnvVar, "antigravity-pid-block")
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+
+	exit := time.Now()
+	helperRunPlainAgy(t, f)
+	setClock := helperPinFreshnessClock(t, exit.Add(time.Second))
+	antigravityDiscoveryTick()
+	if got := atomic.LoadInt32(f.quotaCalls); got != 0 {
+		t.Fatalf("Code Assist reads=%d before the run settled", got)
+	}
+	setClock(exit.Add(61 * time.Second))
+	antigravityDiscoveryTick()
+	helperDrainAntigravityRefreshSchedule(t)
+
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	landed := time.UnixMilli(antigravitySnapshotObservedMs(snap))
+	if landed.Before(exit.Truncate(time.Second)) || landed.After(exit.Add(150*time.Second)) {
+		t.Errorf("reading landed at %s, want within exit + 2.5 min of %s", landed, exit)
+	}
+	if got := atomic.LoadInt32(f.quotaCalls); got < 1 || got > 2 {
+		t.Errorf("Code Assist reads=%d, want at most two for one run", got)
+	}
+	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
+	for _, m := range usage.Metrics {
+		if m.Unknown || m.Consumed == nil {
+			t.Errorf("metric %+v is not numeric", m)
+		}
+	}
+}
+
+// helperAllExhaustedReply is Google's reply for an account with nothing left:
+// every fraction omitted. The 5h bucket resets 1h39m21s from now, the reset
+// the mock's own 429 names.
+func helperAllExhaustedReply() string {
+	reset := time.Now().Add(time.Hour + 39*time.Minute + 21*time.Second).UTC().Format(time.RFC3339)
+	weekly := time.Now().Add(72 * time.Hour).UTC().Format(time.RFC3339)
+	return `{"groups":[{"displayName":"Gemini Models","buckets":[` +
+		`{"bucketId":"gemini-5h","window":"5h","resetTime":"` + reset + `"},` +
+		`{"bucketId":"gemini-weekly","window":"weekly","resetTime":"` + weekly + `"}]}]}`
+}
+
+func helperUserinfoBob(string) (int, string) {
+	return http.StatusOK, `{"sub":"456","email":"bob@example.com"}`
+}
+
+// AllExhaustedReply: a MANAGED turn whose own log block holds account B's 429
+// makes B's all-omitted reply chartable (the 5h bucket at 100% consumed). The
+// same reply after a restart (evidence is in memory only) stays unknown, the
+// recorded limitation.
+func TestAntigravityStaleRegression_AllExhaustedReply(t *testing.T) {
+	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
+		func(string) (int, string) { return http.StatusOK, helperAllExhaustedReply() }, helperUserinfoBob)
+	t.Setenv(mockCLIEnvVar, "antigravity-pid-block")
+	t.Setenv(mockAgyExhaustedEnv, "bob@example.com")
+	resetAntigravityLogIndex()
+	resetAntigravityExhaustionEvidence()
+	t.Cleanup(func() { resetAntigravityLogIndex(); resetAntigravityExhaustionEvidence() })
+
+	helperRunDirectAgy(t, f) // tty=false execute: a managed run whose PID the capture holds
+	helperDrainAntigravityRefreshSchedule(t)
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	if snap.Account != "bob@example.com" || len(snap.Buckets) != 1 || snap.Buckets[0].RemainingFraction != 0 {
+		t.Fatalf("snap=%+v, want bob's 5h bucket charted as fully consumed", snap)
+	}
+	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
+	if len(usage.Metrics) != 1 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 100 {
+		t.Errorf("metrics=%+v, want the exhausted bucket numeric at 100%%", usage.Metrics)
+	}
+
+	// After a self-update the evidence is gone: the same reply is unplottable.
+	resetAntigravityExhaustionEvidence()
+	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistBadResponse {
+		t.Errorf("outcome=%q after a restart, want the reply unplottable", got)
+	}
+}
+
+// The direct-run half of the same case: a user-shell run's 429 is never
+// evidence, so its debt is paid with an unplottable reply and the card keeps
+// its older reading.
+func TestAntigravityStaleRegression_AllExhaustedAfterADirectRunStaysUnknown(t *testing.T) {
+	f := helperStaleRegressionFixtureQuota(t, helperStoredLogin(),
+		func(string) (int, string) { return http.StatusOK, helperAllExhaustedReply() }, helperUserinfoBob)
+	t.Setenv(mockCLIEnvVar, "antigravity-pid-block")
+	t.Setenv(mockAgyExhaustedEnv, "bob@example.com")
+	resetAntigravityLogIndex()
+	resetAntigravityExhaustionEvidence()
+	t.Cleanup(func() { resetAntigravityLogIndex(); resetAntigravityExhaustionEvidence() })
+
+	exit := time.Now()
+	helperRunPlainAgy(t, f)
+	setClock := helperPinFreshnessClock(t, exit.Add(time.Second))
+	antigravityDiscoveryTick()
+	setClock(exit.Add(61 * time.Second))
+	antigravityDiscoveryTick()
+	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
+
+	if got := atomic.LoadInt32(f.quotaCalls); got < 1 {
+		t.Fatal("the direct run's debt was never paid")
+	}
+	if state := helperFreshnessState(t); state.Outcome != liveProbeOutcomeCodeAssistBadResponse {
+		t.Errorf("outcome=%q, want the reply recorded as unplottable", state.Outcome)
+	}
+	if _, observed := helperParsedObservedAt(t, f.home, time.Now()); !observed.Equal(f.stale) {
+		t.Errorf("observedAt=%s, want the older reading kept", observed)
+	}
+}
+
+// ConcurrentMultiAccountEvidence: two managed runs share one second-stamped
+// log; only A's block holds the 429. Only A gets evidence, and B's identical
+// reset is never charted from A's block.
+func TestAntigravityEvidence_OnlyTheRunsOwnBlockCounts(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Truncate(time.Second)
+	h.write(t, helperLogName(now),
+		helperPIDBlock(60001)+"authenticated successfully as ada@example.com\n"+
+			"RESOURCE_EXHAUSTED (code 429): exhausted. Resets in 1h39m21s.\n"+
+			helperPIDBlock(60002)+"authenticated successfully as bob@example.com\n",
+		now, false)
+	settled := now.Add(5 * time.Second)
+	recordAntigravityRunEvidence(now, 60001, settled)
+	recordAntigravityRunEvidence(now, 60002, settled)
+	if got := antigravityExhaustionEvidence(settled, fingerprintAccount("antigravity", "ada@example.com")); len(got) != 1 {
+		t.Errorf("ada evidence=%v, want one event", got)
+	}
+	if got := antigravityExhaustionEvidence(settled, fingerprintAccount("antigravity", "bob@example.com")); len(got) != 0 {
+		t.Errorf("bob evidence=%v, want none from ada's block", got)
+	}
+	if got := antigravityExhaustionEvidence(settled.Add(antigravityExhaustionTTL+time.Second), fingerprintAccount("antigravity", "ada@example.com")); len(got) != 0 {
+		t.Error("evidence outlived its TTL")
+	}
+}
+
+// MaintenanceSmokeSurvivesUpdate: the Antigravity maintenance smoke arrives
+// as a Windows encoded-PowerShell execute. The agent is told to shut down the
+// moment the command returns; its payment is stuck, so the bounded drain gives
+// up. The next process adopts the persisted debt and the card ends numeric,
+// observed after the smoke.
+func TestAntigravityStaleRegression_MaintenanceSmokeSurvivesUpdate(t *testing.T) {
+	f := helperStaleRegressionFixture(t, helperStoredLogin(), helperUserinfoAda)
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+	_, entered, release := helperBlockingCodeAssistStub(t, liveProbeOutcomeCodeAssistHTTPError)
+	origDrain := antigravityShutdownDrain
+	antigravityShutdownDrain = 200 * time.Millisecond
+	t.Cleanup(func() { antigravityShutdownDrain = origDrain })
+
+	smokeStarted := time.Now()
+	helperRunEncodedPowerShellAgy(t, f)
+	<-entered
+	drained := time.Now()
+	drainAntigravityUsageWrites(context.Background())
+	if waited := time.Since(drained); waited > 2*time.Second {
+		t.Errorf("the drain waited %s on a stuck write, want it bounded", waited)
+	}
+	release()
+	antigravityUsageRefreshWaitIdle()
+	stopAntigravityRunDebtRetry()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 && state.RunFloorMs == 0 {
+		t.Fatalf("state=%+v, want the smoke's debt or floor on disk for the next process", state)
+	}
+
+	// The next process (after the update): in-process state is gone, the real
+	// Code Assist read answers, and StartAgent's replay adopts the debt.
+	helperResetAntigravityLiveRuns()
+	probeAntigravityQuotaCodeAssistFn = probeAntigravityQuotaCodeAssist
+	adoptAndPayOwedAntigravityRunDebt(time.Now())
+	helperDrainAntigravityRefreshSchedule(t)
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	if antigravitySnapshotObservedMs(snap) < smokeStarted.UnixMilli() {
+		t.Errorf("observedAt=%s predates the smoke", snap.ObservedAt)
+	}
+	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
+	for _, m := range usage.Metrics {
+		if m.Unknown || m.Consumed == nil {
+			t.Errorf("metric %+v is not numeric after the update", m)
+		}
+	}
+}
+
+// Evidence lives through the debt's retry horizon, so a reply that arrives
+// after a long outage can still chart the spent buckets, and it ends with the
+// window it names: once the reset has passed it matches nothing.
+func TestAntigravityEvidence_LivesThroughTheRetryHorizon(t *testing.T) {
+	resetAntigravityExhaustionEvidence()
+	defer resetAntigravityExhaustionEvidence()
+	now := time.Now()
+	fp := fingerprintAccount("antigravity", "ada@example.com")
+	addAntigravityExhaustionEvent(antigravityExhaustionEvent{
+		resetAtMs: now.Add(4 * time.Hour).UnixMilli(), fingerprint: fp, atMs: now.UnixMilli(),
+	}, now)
+	if got := antigravityExhaustionEvidence(now.Add(time.Hour), fp); len(got) != 1 {
+		t.Errorf("evidence after an hour=%v, want it kept past the old 10 min TTL", got)
+	}
+	if got := antigravityExhaustionEvidence(now.Add(4*time.Hour+time.Second), fp); len(got) != 0 {
+		t.Errorf("evidence after its reset=%v, want none", got)
 	}
 }

@@ -4,14 +4,17 @@
 // File: processes_windows.go
 // -----------------------------------------------------------------------------
 // Windows OS process scanner. Queries the local process table for processes
-// that match the orphan-scanner allowlist (claude/codex/agy). Used by
-// orphanScanner.go to identify candidate orphans.
+// that match the orphan-scanner allowlist (claude/codex/agy/grok). Used by
+// orphanScanner.go to identify candidate orphans, and — through the CHECKED
+// variants — by the Antigravity utilization index, which must tell "nothing is
+// running" from "the table could not be read".
 //
 // Data source: Microsoft deprecated WMIC starting with Windows 11 24H2 and it
 // may be missing entirely on those systems. We prefer PowerShell's Get-CimInstance
 // (the modern replacement) and fall back to `wmic` only when Get-CimInstance
 // is unavailable. Both return equivalent data. Selection happens once at first
-// use and is cached for the process lifetime.
+// use and is cached for the process lifetime. The parsing and the empty-vs-
+// failed rules live in processes_parse.go.
 //
 // No third-party Go dependencies — uses the stdlib plus tools shipped with
 // Windows.
@@ -21,24 +24,13 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv"
+	"context"
 	"fmt"
-	"io"
 	"os/exec"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-// ProcessInfo describes a running OS process at scan time.
-type ProcessInfo struct {
-	PID       int
-	ParentPID int
-	Name      string // lowercased, e.g. "claude.exe"
-	StartTime time.Time
-}
 
 // scanBackend selects how we query the Windows process table. Decided lazily
 // on first call to ScanCLIProcesses and cached for the remainder of the run.
@@ -56,18 +48,115 @@ var (
 	scanBackendOnce  sync.Once
 )
 
+const (
+	// cliProcessFilter / cliProcessWMICWhere are the orphan allowlist.
+	cliProcessFilter    = `Name='claude.exe' OR Name='codex.exe' OR Name='agy.exe' OR Name='grok.exe'`
+	cliProcessWMICWhere = `name="claude.exe" or name="codex.exe" or name="agy.exe" or name="grok.exe"`
+	// antigravityProcessFilter / antigravityProcessWMICWhere list every image
+	// name Antigravity ships under, for the direct-run discovery scans. Kept
+	// separate from the orphan allowlist above: the index only wants to SEE a
+	// user-started run it may owe a refresh for, and widening the allowlist
+	// would also widen what the orphan scanner may kill.
+	antigravityProcessFilter    = `Name='agy.exe' OR Name='antigravity.exe'`
+	antigravityProcessWMICWhere = `name="agy.exe" or name="antigravity.exe"`
+	// ancestryProcessFilter / ancestryProcessWMICWhere are what a wrapped
+	// Antigravity run's tree can hold: the PowerShell / cmd intermediates and
+	// agy itself, under either of its names.
+	ancestryProcessFilter    = `Name='powershell.exe' OR Name='pwsh.exe' OR Name='cmd.exe' OR Name='agy.exe' OR Name='antigravity.exe'`
+	ancestryProcessWMICWhere = `name="powershell.exe" or name="pwsh.exe" or name="cmd.exe" or name="agy.exe" or name="antigravity.exe"`
+	// ancestryMaxDepth: the wrapper's child, a file-mode launcher's grandchild,
+	// and one more level of shell.
+	ancestryMaxDepth = 3
+)
+
+// processScanTimeout bounds one scan query. Get-CimInstance answers in about a
+// second, but a wedged WMI/CIM provider can hang indefinitely, and callers —
+// the Antigravity wrapper resolver most of all — wait on the result inline.
+// A timed-out scan is a failed scan: ok=false, never an empty process table.
+const processScanTimeout = 20 * time.Second
+
+// runProcessScanCommand runs one scan command and returns both streams. A seam
+// so tests can drive the checked-scan rules without the real process table.
+var runProcessScanCommand = func(name string, args ...string) (stdout, stderr []byte, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), processScanTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	hideWindow(cmd)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	err = cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Report the timeout itself: a killed query can leave partial output
+		// on stdout, which the empty-vs-failed rules would otherwise read as
+		// a valid (possibly empty) table.
+		return nil, errOut.Bytes(), fmt.Errorf("process scan timed out after %s: %w", processScanTimeout, ctxErr)
+	}
+	return out.Bytes(), errOut.Bytes(), err
+}
+
 // ScanCLIProcesses returns all currently-running processes whose image name
-// matches the orphan allowlist (claude / codex). Returns an empty
-// slice on error so the caller can treat it as a no-op rather than crashing.
+// matches the orphan allowlist. Returns an empty slice on error so the caller
+// can treat it as a no-op rather than crashing.
 func ScanCLIProcesses() []ProcessInfo {
-	backend := selectScanBackend()
+	procs, _ := ScanCLIProcessesChecked()
+	return procs
+}
+
+// ScanCLIProcessesChecked is ScanCLIProcesses with ok=false for a scan that
+// failed (or has no backend), so a caller can tell it from an empty table.
+func ScanCLIProcessesChecked() ([]ProcessInfo, bool) {
+	return scanProcessesChecked(selectScanBackend(), cliProcessFilter, cliProcessWMICWhere)
+}
+
+// ScanAntigravityProcessesChecked lists live Antigravity processes under either
+// of the CLI's image names, with ok=false for a scan that failed (or has no
+// backend). Used by the Antigravity log index's direct-run discovery, which
+// must also see a run started as `antigravity` — a name the orphan allowlist
+// deliberately omits.
+func ScanAntigravityProcessesChecked() ([]ProcessInfo, bool) {
+	return scanProcessesChecked(selectScanBackend(), antigravityProcessFilter, antigravityProcessWMICWhere)
+}
+
+// ScanProcessAncestryChecked returns rootPID's descendants within
+// ancestryMaxDepth levels, intermediates (powershell, pwsh, cmd) included,
+// nearest first. Used only by the Antigravity wrapper resolver: the allowlisted
+// scan above lists only the CLIs, so a grandchild could never be linked to its
+// wrapper through it.
+func ScanProcessAncestryChecked(rootPID int) ([]ProcessInfo, bool) {
+	if rootPID <= 0 {
+		return nil, false
+	}
+	procs, ok := scanProcessesChecked(selectScanBackend(), ancestryProcessFilter, ancestryProcessWMICWhere)
+	if !ok {
+		return nil, false
+	}
+	return filterProcessAncestry(procs, rootPID, ancestryMaxDepth), true
+}
+
+// scanProcessesChecked runs one query on the given backend.
+func scanProcessesChecked(backend scanBackend, filter, wmicWhere string) ([]ProcessInfo, bool) {
 	switch backend {
 	case backendPowerShell:
-		return scanViaPowerShell()
+		stdout, _, err := runProcessScanCommand("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+			checkedPowerShellScanScript(filter))
+		procs, ok := interpretPowerShellScan(stdout, err)
+		if !ok {
+			// Log once per scan — helps diagnose Win11 24H2 rollouts breaking
+			// the backend assumption silently.
+			fmt.Printf("%s[orphan-scanner] PowerShell scan failed: %v%s\n", colorRed, err, colorReset)
+		}
+		return procs, ok
 	case backendWMIC:
-		return scanViaWMIC()
+		stdout, stderr, err := runProcessScanCommand("wmic", "process", "where", wmicWhere,
+			"get", "ProcessId,ParentProcessId,Name,CreationDate", "/format:csv")
+		procs, ok := interpretWMICScan(stdout, stderr, err)
+		if !ok {
+			fmt.Printf("%s[orphan-scanner] wmic scan failed: %v%s\n", colorRed, err, colorReset)
+		}
+		return procs, ok
 	default:
-		return nil
+		return nil, false
 	}
 }
 
@@ -96,129 +185,6 @@ func selectScanBackend() scanBackend {
 	return scanBackend(scanBackendValue.Load())
 }
 
-// scanViaPowerShell queries the process table using Get-CimInstance Win32_Process,
-// the modern WMI-over-PS equivalent of `wmic process`. Output is CSV-formatted
-// so the parser can be shared with the WMIC path. We emit CreationDate in UTC
-// (ToUniversalTime + yyyyMMddHHmmss) so the Go parser can anchor unambiguously
-// and doesn't need to assume time.Local matches the system timezone.
-func scanViaPowerShell() []ProcessInfo {
-	script := `$ErrorActionPreference = 'SilentlyContinue';` +
-		` Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='codex.exe' OR Name='agy.exe' OR Name='grok.exe'"` +
-		` | Select-Object @{Name='Name';Expression={$_.Name}},` +
-		` @{Name='ProcessId';Expression={$_.ProcessId}},` +
-		` @{Name='ParentProcessId';Expression={$_.ParentProcessId}},` +
-		` @{Name='CreationDate';Expression={if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('yyyyMMddHHmmss') } else { '' }}}` +
-		` | ConvertTo-Csv -NoTypeInformation`
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
-	hideWindow(cmd)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		// Log once per scan — helps diagnose Win11 24H2 rollouts breaking the
-		// backend assumption silently.
-		fmt.Printf("%s[orphan-scanner] PowerShell scan failed: %v%s\n", colorRed, err, colorReset)
-		return nil
-	}
-	return parseCSVOutput(&out, parsePowerShellDate)
-}
-
-// scanViaWMIC queries via the legacy `wmic` tool. Kept as a fallback for Windows
-// versions where PowerShell is unavailable.
-func scanViaWMIC() []ProcessInfo {
-	whereClause := `name="claude.exe" or name="codex.exe" or name="agy.exe" or name="grok.exe"`
-	args := []string{
-		"process",
-		"where", whereClause,
-		"get", "ProcessId,ParentProcessId,Name,CreationDate",
-		"/format:csv",
-	}
-	cmd := exec.Command("wmic", args...)
-	hideWindow(cmd)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	// wmic exits non-zero when the WHERE clause matches nothing — that's a
-	// normal "no orphans" case, not an error. If stdout is empty AND the run
-	// failed, log once so a Win11 24H2 upgrade that removes wmic is visible.
-	runErr := cmd.Run()
-	if runErr != nil && out.Len() == 0 {
-		fmt.Printf("%s[orphan-scanner] wmic invocation failed and produced no output: %v%s\n",
-			colorRed, runErr, colorReset)
-	}
-	return parseCSVOutput(&out, parseWMIDate)
-}
-
-// parseCSVOutput parses CSV rows (header + data) and extracts a ProcessInfo per
-// valid row. dateParser converts the CreationDate field to time.Time.
-// Returns an empty slice (never nil) so callers can treat it uniformly.
-func parseCSVOutput(r io.Reader, dateParser func(string) time.Time) []ProcessInfo {
-	reader := csv.NewReader(r)
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-
-	var header []string
-	out := make([]ProcessInfo, 0, 8)
-	for {
-		row, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Malformed row — continue parsing remaining rows. We deliberately
-			// don't log here to avoid flooding on a consistently broken backend;
-			// the per-scan empty-result diagnostic in the scanner covers that.
-			continue
-		}
-		if len(row) < 2 {
-			continue
-		}
-		if header == nil {
-			lowered := make([]string, len(row))
-			for i, v := range row {
-				lowered[i] = strings.ToLower(strings.TrimSpace(v))
-			}
-			if contains(lowered, "name") && contains(lowered, "processid") {
-				header = lowered
-			}
-			continue
-		}
-
-		idxName := indexOf(header, "name")
-		idxPID := indexOf(header, "processid")
-		idxParent := indexOf(header, "parentprocessid")
-		idxCreated := indexOf(header, "creationdate")
-		if idxName < 0 || idxPID < 0 {
-			continue
-		}
-
-		name := strings.ToLower(strings.TrimSpace(getField(row, idxName)))
-		if name == "" {
-			continue
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(getField(row, idxPID)))
-		if err != nil || pid <= 0 {
-			continue
-		}
-		parent := 0
-		if idxParent >= 0 {
-			if v, err := strconv.Atoi(strings.TrimSpace(getField(row, idxParent))); err == nil && v > 0 {
-				parent = v
-			}
-		}
-		startTime := time.Time{}
-		if idxCreated >= 0 && dateParser != nil {
-			startTime = dateParser(strings.TrimSpace(getField(row, idxCreated)))
-		}
-
-		out = append(out, ProcessInfo{
-			PID:       pid,
-			ParentPID: parent,
-			Name:      name,
-			StartTime: startTime,
-		})
-	}
-	return out
-}
-
 // KillProcessTree force-kills the given PID and all its descendants using the
 // same `taskkill /F /T /PID` pattern used in cleanup_windows.go.
 func KillProcessTree(pid int) error {
@@ -228,73 +194,4 @@ func KillProcessTree(pid int) error {
 	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
 	hideWindow(cmd)
 	return cmd.Run()
-}
-
-// ─────────────────────── date parsers ───────────────────────
-
-// parseWMIDate parses WMI's CIM_DATETIME format "yyyymmddHHMMSS.mmmmmm±UUU"
-// where ±UUU is minutes offset from UTC. We respect the embedded offset rather
-// than assuming the Go process's local timezone matches the WMI source (they
-// can differ when TZ env var overrides the default).
-func parseWMIDate(s string) time.Time {
-	if len(s) < 14 {
-		return time.Time{}
-	}
-	// Start with the calendar portion in UTC; we'll apply the offset afterwards.
-	t, err := time.ParseInLocation("20060102150405", s[:14], time.UTC)
-	if err != nil {
-		return time.Time{}
-	}
-	// Look for the ±UUU offset after the fractional seconds.
-	if idx := strings.IndexAny(s[14:], "+-"); idx >= 0 {
-		signAndOffset := s[14+idx:]
-		if len(signAndOffset) >= 4 {
-			sign := signAndOffset[0]
-			if mins, err := strconv.Atoi(signAndOffset[1:4]); err == nil {
-				offset := time.Duration(mins) * time.Minute
-				if sign == '+' {
-					t = t.Add(-offset)
-				} else {
-					t = t.Add(offset)
-				}
-			}
-		}
-	}
-	return t
-}
-
-// parsePowerShellDate parses the yyyyMMddHHmmss UTC format emitted by our
-// PowerShell Select-Object expression (see scanViaPowerShell — we use
-// ToUniversalTime explicitly so the wire format is unambiguous).
-func parsePowerShellDate(s string) time.Time {
-	if len(s) < 14 {
-		return time.Time{}
-	}
-	t, err := time.ParseInLocation("20060102150405", s[:14], time.UTC)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
-}
-
-// ─────────────────────── helpers ───────────────────────
-
-func contains(haystack []string, needle string) bool {
-	return indexOf(haystack, needle) >= 0
-}
-
-func indexOf(haystack []string, needle string) int {
-	for i, v := range haystack {
-		if v == needle {
-			return i
-		}
-	}
-	return -1
-}
-
-func getField(row []string, idx int) string {
-	if idx < 0 || idx >= len(row) {
-		return ""
-	}
-	return row[idx]
 }
