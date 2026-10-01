@@ -333,6 +333,15 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 	}
 }
 
+// readAntigravityUsageFreshness reads the persisted state under the freshness
+// lock, for callers that only look.
+func readAntigravityUsageFreshness() antigravityUsageFreshness {
+	antigravityAssertIndexUnlocked("freshness")
+	antigravityFreshnessMu.Lock()
+	defer antigravityFreshnessMu.Unlock()
+	return readAntigravityUsageFreshnessLocked()
+}
+
 // updateAntigravityUsageFreshness applies mutate to the persisted state under
 // the freshness lock and returns the result. Callers MUST NOT hold
 // antigravityQuotaCacheMu-dependent state here: the lock order in this package
@@ -1132,9 +1141,7 @@ func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
 // gated debt that exhausted its ladder would else never say anything.
 // Timestamps and fixed text only — never a path, an account or log text.
 func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, bool) {
-	antigravityFreshnessMu.Lock()
-	state := readAntigravityUsageFreshnessLocked()
-	antigravityFreshnessMu.Unlock()
+	state := readAntigravityUsageFreshness()
 
 	antigravityRebaseFutureFreshness(&state, now)
 	if state.RefreshOwedAtMs == 0 ||

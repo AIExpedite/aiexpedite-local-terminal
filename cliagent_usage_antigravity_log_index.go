@@ -1828,10 +1828,7 @@ func antigravityNudgeProvenFloor(now time.Time, observedMs int64, owed antigravi
 // antigravityDebtCoversFloor reports whether a pending debt already asks for a
 // reading at or after floor. Never called with the index lock held.
 func antigravityDebtCoversFloor(floor time.Time) bool {
-	antigravityAssertIndexUnlocked("freshness")
-	antigravityFreshnessMu.Lock()
-	state := readAntigravityUsageFreshnessLocked()
-	antigravityFreshnessMu.Unlock()
+	state := readAntigravityUsageFreshness()
 	return state.RefreshOwedAtMs != 0 && state.RefreshOwedFloorMs >= floor.UnixMilli()
 }
 
