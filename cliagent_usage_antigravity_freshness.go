@@ -211,14 +211,26 @@ type antigravityUsageFreshness struct {
 	// Legitimately up to the longest rung in the future, so it has its own
 	// rebase rule rather than antigravityRunFloorLocalSkew's.
 	NextAttemptAtMs int64 `json:"nextAttemptAtMs,omitempty"`
+	// LoginRenewedAtMs is when this debt started its one stored-login renewal
+	// (renewAntigravityStoredLogin; 0 = none yet). Stamped BEFORE the child is
+	// spawned, so a restart or self-update loop can never renew twice for the
+	// same debt.
+	LoginRenewedAtMs int64 `json:"loginRenewedAtMs,omitempty"`
 }
 
 // clearDebt drops the pending debt and everything that only describes it,
 // leaving the run floor and the spacing clock alone.
 func (state *antigravityUsageFreshness) clearDebt() {
 	state.RefreshOwedFloorMs, state.RefreshOwedAtMs = 0, 0
-	state.Attempts, state.Outcome, state.Gated = 0, "", false
-	state.NextAttemptAtMs = 0
+	state.resetDebtProgress()
+	state.Gated = false
+}
+
+// resetDebtProgress gives a debt generation a fresh budget, schedule and
+// renewal.
+func (state *antigravityUsageFreshness) resetDebtProgress() {
+	state.Attempts, state.Outcome, state.NextAttemptAtMs = 0, "", 0
+	state.LoginRenewedAtMs = 0
 }
 
 var (
@@ -523,9 +535,9 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 			owedFloorMs = state.RefreshOwedFloorMs
 		}
 		if state.RefreshOwedAtMs == 0 || state.RefreshOwedFloorMs != owedFloorMs {
-			// A new run, or a floor that moved: this debt gets its own budget
-			// and its own schedule.
-			state.Attempts, state.Outcome, state.NextAttemptAtMs = 0, "", 0
+			// A new run, or a floor that moved: this debt gets its own budget,
+			// its own schedule and its own renewal.
+			state.resetDebtProgress()
 		}
 		state.RefreshOwedFloorMs = owedFloorMs
 		state.RefreshOwedAtMs = now.UnixMilli()
@@ -557,6 +569,7 @@ func antigravityUsageRunSettled(floor time.Time, pid int, capturedDuringRun, gat
 			debtAccount = antigravityDebtAccountFor(priorID)
 		}
 		noteAntigravityDebtAccount(state.debtID(), debtAccount)
+		noteAntigravityDebtRoute(state.debtID(), antigravityDebtRouteSettle)
 	})
 	if antigravitySettleUpdatedHook != nil {
 		antigravitySettleUpdatedHook()
@@ -765,29 +778,34 @@ func antigravityRetireRunDebt(reason string) {
 // previous outbound read by antigravityRefreshMinInterval; a retry within the
 // same pass bypasses that interval, because it is the same unpaid run.
 //
-// It never runs a model turn. The Refresh click may run the `agy models`
-// warm-up to make the CLI refresh its own keyring token; doing that behind the
-// user's back on run teardown is a different class of side effect, so a
-// token_expired debt is KEPT (the next real run refreshes the keyring for free)
-// and only a no_login debt stops attempting, since nothing here can pay it.
-// The one child this can start is the bounded `<agy> --version` behind
-// antigravityCodeAssistBuildVersion's cache, only on a cold cache, and only
-// once the probe has found a usable stored login.
+// It never runs a model turn. A token_expired debt whose stored token is past
+// its expiry renews the login ONCE per debt (renewAntigravityStoredLogin: `agy
+// models` as the agent's own child, at most once per
+// antigravityLoginRenewMinInterval on the device) and reads again in the same
+// attempt. Waiting for "the next real run" to renew it is what left a passing
+// smoke stale: the smoke that just finished WAS that run. A renewal that does
+// not help (still_expired, spaced, unavailable) keeps the debt on the free
+// rung, and only a no_login debt stops attempting, since nothing here can pay
+// it. Apart from that child, the one it can start is the bounded `<agy>
+// --version` behind antigravityCodeAssistBuildVersion's cache, only on a cold
+// cache, and only once the probe has found a usable stored login.
 //
 // Whatever the pass KEEPS it hands to antigravityScheduleRunDebtRetry before
 // returning, so a deferral (the minimum interval, offline, an expired login) or
 // a read that failed is always followed by another attempt on the retry ladder
 // rather than by nothing until the next run happens to settle.
 func antigravityPayRunDebt(maxAttempts int, bypassInterval bool) {
-	state, retry := antigravityPayRunDebtPass(maxAttempts, bypassInterval)
+	state, retry, tokenExpiryMs := antigravityPayRunDebtPass(maxAttempts, bypassInterval)
 	if retry != antigravityRetryNone {
-		antigravityScheduleRunDebtRetry(state, antigravityUsageFreshnessNow(), retry)
+		antigravityScheduleRunDebtRetry(state, antigravityUsageFreshnessNow(), retry, tokenExpiryMs)
 	}
 }
 
 // antigravityPayRunDebtPass is antigravityPayRunDebt's body. It returns the
-// debt it last looked at, so the schedule is booked against that generation.
-func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravityUsageFreshness, antigravityRunDebtRetryKind) {
+// debt it last looked at, so the schedule is booked against that generation,
+// and — for antigravityRetryLoginRenew only — the stored token's expiry the
+// retry waits for (0 otherwise).
+func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravityUsageFreshness, antigravityRunDebtRetryKind, int64) {
 	var state antigravityUsageFreshness
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
@@ -797,7 +815,7 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		var owed bool
 		state, owed = antigravityPendingDebt(now)
 		if !owed {
-			return state, antigravityRetryNone
+			return state, antigravityRetryNone, 0
 		}
 		// Any route may have landed a reading since the settle: a concurrent
 		// run's poller, a Refresh click, or the poller's own 2 s tail on an
@@ -809,49 +827,51 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 		if cached, ok := antigravityCachedReadingCovering(
 			debtAccount, state.RefreshOwedFloorMs); ok {
 			settleAntigravityRunFreshness(cached, debtAccount)
-			return state, antigravityRetryNone
+			antigravityCloseRunDebt(state, liveProbeOutcomeCodeAssistOK, cached, false)
+			return state, antigravityRetryNone, 0
 		}
 		if state.Attempts >= antigravityRefreshDebtMaxAttempts {
 			// Out of budget: the debt keeps its Outcome until the age-out so
 			// the card can say why the figure is behind. Handed to the
 			// schedule anyway, which books nothing for a spent budget and
 			// clears the rung this pass was running on.
-			return state, antigravityRetryAfterRead
+			antigravityCloseRunDebt(state, state.Outcome, 0, false)
+			return state, antigravityRetryAfterRead, 0
 		}
 		// An uninstall between the run and now must not leave a debt retrying,
 		// or a notice, on a provider the card no longer shows.
 		path := antigravityExecutablePath()
 		if path == "" {
 			antigravityRetireRunDebt("agy is no longer installed")
-			return state, antigravityRetryNone
+			return state, antigravityRetryNone, 0
 		}
 		// An offline agent makes no outbound request. The debt stays pending
 		// and keeps its budget: offline is temporary, and checking costs nothing.
 		if IsOffline() {
 			fmt.Printf("%s[antigravity-freshness] Run refresh deferred: the agent is offline (debt kept)%s\n",
 				colorYellow, colorReset)
-			return state, antigravityRetryFree
+			return state, antigravityRetryFree, 0
 		}
 		if !bypassInterval && attempt == 0 && state.LastPaidAtMs > 0 {
 			if since := now.Sub(time.UnixMilli(state.LastPaidAtMs)); since >= 0 && since < antigravityRefreshMinInterval {
 				fmt.Printf("%s[antigravity-freshness] Run refresh deferred: last read %ds ago (minimum %ds, debt kept)%s\n",
 					colorCyan, int(since.Seconds()), int(antigravityRefreshMinInterval.Seconds()), colorReset)
-				return state, antigravityRetrySpacing
+				return state, antigravityRetrySpacing, 0
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
-		// No version: the probe resolves it itself, and only once it knows a
-		// login exists, so a no_login debt never spawns `<agy> --version`.
-		takeAntigravityCodeAssistAttempt()
-		outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
-		cancel()
-		note := takeAntigravityCodeAssistAttempt()
-		noteAntigravityCurrentAttempt(state.debtID(), note.fingerprint,
-			outcome == liveProbeOutcomeCodeAssistBadResponse && note.unplottable)
-		antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
-		fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
-			colorCyan, state.Attempts+1, antigravityRefreshDebtMaxAttempts, outcome, colorReset)
+		outcome, note := antigravityRunDebtRead(state)
+		if outcome == liveProbeOutcomeCodeAssistTokenExpired &&
+			antigravityRenewLoginForDebt(state, note.tokenExpiryMs) == antigravityLoginRenewed {
+			// The same attempt: the expired read spent nothing, so this one is
+			// neither spaced nor a second charge against maxAttempts.
+			if fresh, still := antigravityPendingDebt(antigravityUsageFreshnessNow()); still {
+				state = fresh
+				outcome, note = antigravityRunDebtRead(state)
+			} else {
+				return fresh, antigravityRetryNone, 0
+			}
+		}
 
 		switch outcome {
 		case liveProbeOutcomeCodeAssistOK:
@@ -859,17 +879,80 @@ func antigravityPayRunDebtPass(maxAttempts int, bypassInterval bool) (antigravit
 			// hook, so the schedule finds nothing to book. The one way it did
 			// not is an unattributable reading (codeassist_not_attributable),
 			// which is reported as its own outcome and keeps retrying.
-			return state, antigravityRetryAfterRead
+			if after, still := antigravityPendingDebt(antigravityUsageFreshnessNow()); !still || after.debtID() != state.debtID() {
+				antigravityCloseRunDebt(state, outcome, cachedAntigravityObservedMs(), true)
+			}
+			return state, antigravityRetryAfterRead, 0
 		case liveProbeOutcomeCodeAssistNoLogin:
 			// Terminal: nothing on this device can pay it.
-			return state, antigravityRetryNone
+			antigravityCloseRunDebt(state, outcome, 0, false)
+			return state, antigravityRetryNone, 0
 		case liveProbeOutcomeCodeAssistTokenExpired:
-			// The next real `agy` run refreshes the keyring token for free;
-			// until then a local check is all a retry costs.
-			return state, antigravityRetryFree
+			if note.tokenExpiryMs > antigravityUsageFreshnessNow().UnixMilli() {
+				// Inside the skew band: nothing can use or renew the token
+				// until it actually expires, which is at most the skew away.
+				return state, antigravityRetryLoginRenew, note.tokenExpiryMs
+			}
+			// Renewed once already for this debt, or the renewal did not help:
+			// a later `agy` run may still renew it, and until then a local
+			// check is all a retry costs.
+			return state, antigravityRetryFree, 0
 		}
 	}
-	return state, antigravityRetryAfterRead
+	return state, antigravityRetryAfterRead, 0
+}
+
+// antigravityRunDebtRead spends one Code Assist read on debt generation state
+// and books it.
+func antigravityRunDebtRead(state antigravityUsageFreshness) (string, antigravityCodeAssistAttemptNote) {
+	ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
+	// No version: the probe resolves it itself, and only once it knows a
+	// login exists, so a no_login debt never spawns `<agy> --version`.
+	takeAntigravityCodeAssistAttempt()
+	outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
+	cancel()
+	note := takeAntigravityCodeAssistAttempt()
+	noteAntigravityCurrentAttempt(state.debtID(), note.fingerprint,
+		outcome == liveProbeOutcomeCodeAssistBadResponse && note.unplottable)
+	antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())
+	fmt.Printf("%s[antigravity-freshness] Run refresh attempt %d/%d finished (%s)%s\n",
+		colorCyan, state.Attempts+1, antigravityRefreshDebtMaxAttempts, outcome, colorReset)
+	return outcome, note
+}
+
+// antigravityLoginRenewTimeout bounds the renewal child: the model probe's own
+// 20 s cap plus room to start it.
+const antigravityLoginRenewTimeout = 25 * time.Second
+
+// antigravityRenewLoginForDebt runs the debt's one stored-login renewal when
+// the token is already past its expiry and the debt has not renewed yet. The
+// stamp is persisted BEFORE the child starts, so a crash, restart or
+// self-update loop cannot renew twice for one debt. A token still inside the
+// skew band, a debt that already renewed, a newer generation, offline or a
+// shutdown starts nothing and reports "" (no renewal).
+func antigravityRenewLoginForDebt(state antigravityUsageFreshness, tokenExpiryMs int64) string {
+	now := antigravityUsageFreshnessNow()
+	if tokenExpiryMs > now.UnixMilli() || IsShutdownInProgress() || IsOffline() {
+		return ""
+	}
+	id := state.debtID()
+	stamped := false
+	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+		if state.RefreshOwedAtMs == 0 || state.debtID() != id || state.LoginRenewedAtMs != 0 {
+			return
+		}
+		state.LoginRenewedAtMs = now.UnixMilli()
+		stamped = true
+	})
+	if !stamped {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), antigravityLoginRenewTimeout)
+	defer cancel()
+	result := renewAntigravityStoredLoginFn(ctx, now)
+	fmt.Printf("%s[antigravity-freshness] Stored login renewal finished (%s)%s\n",
+		colorCyan, result, colorReset)
+	return result
 }
 
 // antigravityOutcomeSpentRead reports whether a Code Assist outcome reached
@@ -1002,7 +1085,7 @@ func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
 			return
 		}
 		state.RefreshOwedFloorMs, state.RefreshOwedAtMs = state.RunFloorMs, now.UnixMilli()
-		state.Attempts, state.Outcome, state.NextAttemptAtMs = 0, "", 0
+		state.resetDebtProgress()
 		// The build that refused is remembered per build, not per run, so the
 		// marker is the honest source for a debt adopted across a restart.
 		_, state.Gated = antigravityQuotaGateFor("", now)
@@ -1010,6 +1093,7 @@ func adoptAndPayOwedAntigravityRunDebt(startedAt time.Time) {
 	if state.RefreshOwedAtMs == 0 {
 		return
 	}
+	noteAntigravityDebtRoute(state.debtID(), antigravityDebtRouteAdopted)
 	// A retry the previous process booked and that is not due yet is honoured
 	// as booked: arm the remainder and spend nothing now. Paying at once here
 	// would let a restart loop burn the whole budget in seconds.
@@ -1334,6 +1418,69 @@ func antigravityDebtAccountFor(id antigravityDebtID) string {
 func antigravityDebtAccountAnswers(id antigravityDebtID, account string) bool {
 	owner := antigravityDebtAccountFor(id)
 	return owner == "" || account == "" || owner == account
+}
+
+// The route that raised a debt generation, for its close-out line only:
+// antigravityUsageRunSettled (a managed run's completion), the nudge (a run the
+// log index found) or the startup replay. In memory only, the same leaf-lock
+// shape as antigravityDebtAccount; a generation nobody noted (a restart) reports
+// adopted.
+const (
+	antigravityDebtRouteSettle  = "settle"
+	antigravityDebtRouteNudge   = "nudge"
+	antigravityDebtRouteAdopted = "adopted"
+)
+
+var antigravityDebtRoute struct {
+	mu     sync.Mutex
+	debtID antigravityDebtID
+	route  string
+	closed bool
+}
+
+func noteAntigravityDebtRoute(id antigravityDebtID, route string) {
+	d := &antigravityDebtRoute
+	d.mu.Lock()
+	d.debtID, d.route, d.closed = id, route, false
+	d.mu.Unlock()
+}
+
+// antigravityCloseRunDebt prints the one close-out line of debt generation
+// state: how it ended (a closed outcome code), how long after the run the
+// reading it got was taken (-1: none), the reads it spent and whether it
+// renewed the login. Integers and closed-set codes only. A generation already
+// closed in this process prints nothing, so a spent debt the worker looks at
+// again stays one line. read says the outcome came from a read this pass spent
+// (not yet in state.Attempts).
+func antigravityCloseRunDebt(state antigravityUsageFreshness, outcome string, observedMs int64, read bool) {
+	id := state.debtID()
+	d := &antigravityDebtRoute
+	d.mu.Lock()
+	if d.debtID != id {
+		d.debtID, d.route, d.closed = id, antigravityDebtRouteAdopted, false
+	}
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	d.closed = true
+	route := d.route
+	d.mu.Unlock()
+
+	runToReadSec := int64(-1)
+	if observedMs > 0 && state.RefreshOwedFloorMs > 0 {
+		runToReadSec = max((observedMs-state.RefreshOwedFloorMs)/1000, 0)
+	}
+	attempts := state.Attempts
+	if read && antigravityOutcomeSpentRead(outcome) {
+		attempts++
+	}
+	renewals := 0
+	if state.LoginRenewedAtMs != 0 {
+		renewals = 1
+	}
+	fmt.Printf("%s[antigravity-freshness] Run refresh closed (route=%s outcome=%s runToReadSec=%d attempts=%d renewals=%d)%s\n",
+		colorCyan, route, firstNonEmpty(outcome, "none"), runToReadSec, attempts, renewals, colorReset)
 }
 
 // antigravityAttemptWasUnplottable reports whether the latest attempt on the

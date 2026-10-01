@@ -92,6 +92,13 @@ const (
 	// once it lapses the next attempt cannot defer on it again — so it waits
 	// just the short rung and the interval's remainder, never an age backoff.
 	antigravityRetrySpacing
+	// antigravityRetryLoginRenew: the stored token is inside
+	// antigravityTokenExpirySkew but not yet past its expiry, so neither a read
+	// nor `agy models` can use it — `agy` itself still considers it valid. The
+	// retry is booked at the expiry itself (the expiry travels beside the kind,
+	// antigravityScheduleRunDebtRetry's tokenExpiryMs), when the pass can renew
+	// it, instead of on the age backoff. Spends no budget.
+	antigravityRetryLoginRenew
 )
 
 // antigravityRetryDelayForAttempt is the ladder: the delay before the next
@@ -119,7 +126,8 @@ func antigravityFreeRetryDelay(owedFor time.Duration) time.Duration {
 // antigravityRunDebtRetryHorizon is the furthest ahead a legitimately booked
 // NextAttemptAtMs can sit: the longest delay the schedule can pick (a rung, or
 // the minimum interval it is pushed out to), plus the local skew the floors
-// already tolerate. Anything further is a backwards clock step.
+// already tolerate. Anything further is a backwards clock step. The login-renew
+// rung is clamped to the free rung, so it never extends this.
 func antigravityRunDebtRetryHorizon() time.Duration {
 	longest := antigravityRunDebtFreeRetryDelay
 	if antigravityRefreshMinInterval > longest {
@@ -136,12 +144,14 @@ func antigravityRunDebtRetryHorizon() time.Duration {
 // antigravityScheduleRunDebtRetry books the next attempt for the debt state
 // names, persists it as NextAttemptAtMs and arms the process-wide timer —
 // replacing any pending one, so concurrent settles cannot multiply attempts.
-// kind picks the rung (antigravityRunDebtRetryKind).
+// kind picks the rung (antigravityRunDebtRetryKind); tokenExpiryMs is the
+// stored token's expiry for antigravityRetryLoginRenew and ignored for every
+// other kind.
 // Returns false when nothing was booked: the debt is gone or was replaced by a
 // newer generation (whose own pass books it), its budget is spent (it keeps its
 // Outcome until the age-out so the notice can explain it), or the process is
 // shutting down.
-func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.Time, kind antigravityRunDebtRetryKind) bool {
+func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.Time, kind antigravityRunDebtRetryKind, tokenExpiryMs int64) bool {
 	if IsShutdownInProgress() {
 		return false
 	}
@@ -156,8 +166,23 @@ func antigravityScheduleRunDebtRetry(state antigravityUsageFreshness, now time.T
 			state.NextAttemptAtMs = 0
 			return
 		}
+		if kind == antigravityRetryLoginRenew && tokenExpiryMs > 0 {
+			// The moment the token expires, and never later than the free rung:
+			// this rung waits for a clock, not for the minimum interval — the
+			// read it was refused spent nothing.
+			next = time.UnixMilli(tokenExpiryMs).Add(time.Second)
+			if earliest := now.Add(time.Second); next.Before(earliest) {
+				next = earliest
+			}
+			if latest := now.Add(antigravityRunDebtFreeRetryDelay); next.After(latest) {
+				next = latest
+			}
+			state.NextAttemptAtMs = next.UnixMilli()
+			return
+		}
 		switch kind {
-		case antigravityRetryFree:
+		case antigravityRetryFree, antigravityRetryLoginRenew:
+			// A login-renew rung with no expiry to wait for is a plain free one.
 			delay = antigravityFreeRetryDelay(now.Sub(time.UnixMilli(state.RefreshOwedAtMs)))
 		case antigravityRetrySpacing:
 			delay = antigravityRunDebtFreeRetryDelay
@@ -270,14 +295,21 @@ func antigravityRunDebtRetryPending() bool {
 // antigravityRefreshNudgeCooldown, and nothing for a log younger than the
 // minimum interval — that settle guard stands in for the slack the diagnostic
 // keeps, so a run still writing its log, or a Refresh click's own `agy`, is not
-// mistaken for a missed one. A nudge never touches a debt that already exists
-// (one pending debt at a time) and never lowers RunFloorMs; a log mtime is only
-// ever an owed floor, and the debt it creates is bounded by the age-out from
-// the moment it was created.
+// mistaken for a missed one. A floor the log index PROVED (every process of the
+// run gone by its start token, or gone at first sight with the log unchanged
+// since — antigravityOwedFloor.Proven) skips that guard: the run is over, and
+// waiting another minute is exactly what left a direct run's reading stale past
+// the maintenance window. The cooldown and the read spacing still apply to it,
+// and a refused nudge stamps no cooldown, so the exit watch can retry it within
+// seconds. A nudge never touches a debt that already exists (one pending debt
+// at a time) and never lowers RunFloorMs; a log mtime is only ever an owed
+// floor, and the debt it creates is bounded by the age-out from the moment it
+// was created.
 //
 // Never blocks the gather: one small state-file read-modify-write, and the
 // worker runs on its own goroutine.
-func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.Time) bool {
+func nudgeAntigravityUsageRefreshFloor(now time.Time, observedMs int64, owed antigravityOwedFloor) bool {
+	owedLog := owed.At
 	if IsShutdownInProgress() || IsOffline() || antigravityOwnChildRunning() {
 		return false
 	}
@@ -295,7 +327,7 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.
 	// cached without ObservedAtMs resolves to the start of its second, which can
 	// only cost one extra refresh.
 	behind := !owedLog.IsZero() && (observedMs == 0 || owedLog.UnixMilli() > observedMs)
-	settled := behind && now.Sub(owedLog) >= antigravityRefreshMinInterval
+	settled := behind && (owed.Proven || now.Sub(owedLog) >= antigravityRefreshMinInterval)
 	// A run of this process that is still going settles itself when it ends.
 	liveRun := antigravityOldestLiveRunFloorMs() != 0
 
@@ -342,6 +374,9 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.
 		state.clearDebt()
 		state.RefreshOwedFloorMs, state.RefreshOwedAtMs = owedLog.UnixMilli(), now.UnixMilli()
 		_, state.Gated = antigravityQuotaGateFor("", now)
+		// Published with the generation, as the settle publishes its account:
+		// a leaf lock, so no lock order is added.
+		noteAntigravityDebtRoute(state.debtID(), antigravityDebtRouteNudge)
 		start, created = true, true
 	})
 	if !start {
@@ -349,11 +384,17 @@ func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.
 	}
 	n.lastAt = now
 	if created {
-		fmt.Printf("%s[antigravity-freshness] A run finished after the cached reading with no refresh owed (behindBy=%s); refresh owed%s\n",
-			colorYellow, antigravityBehindBy(observedMs, owedLog), colorReset)
+		fmt.Printf("%s[antigravity-freshness] A run finished after the cached reading with no refresh owed (behindBy=%s proven=%v); refresh owed%s\n",
+			colorYellow, antigravityBehindBy(observedMs, owedLog), owed.Proven, colorReset)
 	}
 	antigravityStartRunDebtWorker(1, false)
 	return true
+}
+
+// nudgeAntigravityUsageRefresh is nudgeAntigravityUsageRefreshFloor for a
+// floor nothing proved: the minute's settle guard applies.
+func nudgeAntigravityUsageRefresh(now time.Time, observedMs int64, owedLog time.Time) bool {
+	return nudgeAntigravityUsageRefreshFloor(now, observedMs, antigravityOwedFloor{At: owedLog})
 }
 
 // antigravityBehindBy renders how far a run log postdates the reading, for the

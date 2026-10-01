@@ -161,7 +161,7 @@ func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
 		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
 	})
 	now := time.Now()
-	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetryFree) {
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetryFree, 0) {
 		t.Fatal("the free rung was not booked")
 	}
 	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < 29*time.Minute {
@@ -175,7 +175,7 @@ func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
 		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
 		LastPaidAtMs: now.Add(-10 * time.Second).UnixMilli(),
 	})
-	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetrySpacing) {
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetrySpacing, 0) {
 		t.Fatal("the spacing rung was not booked")
 	}
 	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < antigravityRefreshMinInterval-15*time.Second ||
@@ -200,7 +200,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
+			antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead, 0)
 		}()
 	}
 	wg.Wait()
@@ -218,7 +218,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 	// Now let the schedule run on a short ladder: a single timer means one
 	// attempt per firing, and the budget caps the total.
 	helperPinAntigravityRefreshSchedule(t, 10*time.Millisecond, 10*time.Millisecond)
-	antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
+	antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead, 0)
 	helperDrainAntigravityRefreshSchedule(t)
 	if got := reads.Load(); got != antigravityRefreshDebtMaxAttempts {
 		t.Errorf("reads=%d, want exactly the lifetime budget %d", got, antigravityRefreshDebtMaxAttempts)

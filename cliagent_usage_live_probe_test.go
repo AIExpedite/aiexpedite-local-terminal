@@ -1216,7 +1216,7 @@ func TestProbeAntigravityQuotaViaCodeAssist_RecordsOnlyTheSpacingClock(t *testin
 			}
 
 			clickAt := time.Now()
-			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}, t.TempDir()); got != tc.outcome {
+			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != tc.outcome {
 				t.Fatalf("outcome=%q, want %q", got, tc.outcome)
 			}
 

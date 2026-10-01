@@ -629,13 +629,13 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 	if gate, ok := antigravityQuotaGateFor(agent.Version, now); ok {
 		fmt.Printf("%s[cli-usage] Antigravity loopback quota probe skipped: build %s refused it at %s (retried after %s); reading from Google with the stored login%s\n",
 			colorYellow, firstNonEmpty(agent.Version, gate.Version, "unknown"), gate.ObservedAt, antigravityQuotaGateRecheck, colorReset)
-		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent)
 	}
 	outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
 	switch outcome {
 	case liveProbeOutcomeGated:
 		noteAntigravityQuotaGate(agent.Version, now)
-		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent)
 	case liveProbeOutcomeOK:
 		clearAntigravityQuotaGate()
 	}
@@ -643,16 +643,19 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 }
 
 // probeAntigravityQuotaViaCodeAssist runs the Code Assist read. The agent
-// never renews the stored login itself; when the token has expired it runs the
-// click's `agy models` warm-up first — `agy` refreshes its keyring token on
-// every run — and tries once more. (The warm-up is cached for the click, so
-// the caller's later warm is a no-op.)
-func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
+// never refreshes the stored login with agy's credentials; when the token has
+// expired it has `agy` renew it (renewAntigravityStoredLogin: an uncached `agy
+// models` — a cached model list would spawn nothing, and renew nothing) and
+// tries once more. The renewal stores the fresh list, so the caller's later
+// warm is a cache hit, and it shares its spacing with the debt worker's
+// renewals.
+func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent) string {
 	version := antigravityCodeAssistBuildVersion(agent.Version)
 	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
 	antigravityRecordClickRead(outcome, time.Now())
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
-		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
+		renewal := renewAntigravityStoredLoginFn(ctx, time.Now())
+		fmt.Printf("%s[cli-usage] Antigravity stored login renewal finished (%s)%s\n", colorCyan, renewal, colorReset)
 		outcome = probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
 		antigravityRecordClickRead(outcome, time.Now())
 	}

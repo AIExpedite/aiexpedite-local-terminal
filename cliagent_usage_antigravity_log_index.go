@@ -86,8 +86,9 @@ const (
 	// and antigravityStartupDSTSlack widens its window: names are local time.
 	antigravityStartupScanCap  = 256
 	antigravityStartupDSTSlack = time.Hour
-	// antigravityCandidateSettle is how long an exited candidate, or a noPID
-	// log, must stay quiet before its run is owed.
+	// antigravityCandidateSettle is how long an exited candidate whose exit is
+	// not proven (antigravityExitProvenLocked), a noPID log, or a process-only
+	// PID with no start token must stay quiet before its run is owed.
 	antigravityCandidateSettle = 60 * time.Second
 	// antigravityCandidateHoldLimit bounds how long a candidate held only by
 	// unreadable or overflowing PIDs may stay armed.
@@ -100,6 +101,14 @@ const (
 var (
 	// antigravityDiscoveryInterval is the discovery tick.
 	antigravityDiscoveryInterval = 60 * time.Second
+	// antigravityExitWatchInterval is the fast exit watch's poll, which runs
+	// only while a direct run is tracked (antigravityExitWatchWantedLocked).
+	antigravityExitWatchInterval = 5 * time.Second
+	// antigravityExitStableFor is how long a log whose every PID was already
+	// gone at first sight must stay unchanged before its exit counts as proven:
+	// long enough that a run still writing its startup lines, or a same-second
+	// run appending to the shared file, shows up as a change.
+	antigravityExitStableFor = 5 * time.Second
 	// antigravityCollisionGrace is how long after its name-second a file can
 	// still be appended to by a run started in that same second (or by its own
 	// run finishing its startup lines).
@@ -160,6 +169,10 @@ type antigravityLogEntry struct {
 	floorMs int64
 	// grace: evicted by a cap, still watched until the collision window ends.
 	grace bool
+	// stableStat is the log's size and mtime as first seen unchanged, at
+	// stableAt — the gone-at-first-sight half of a proven exit.
+	stableStat antigravityLogStat
+	stableAt   time.Time
 }
 
 // antigravityProcessOnly is a live PID of an evicted candidate, tracked
@@ -223,8 +236,11 @@ var antigravityLogIndex = struct {
 	// detached are handed-off managed runs whose evidence is read at their own
 	// exit (capped at antigravityKnownPIDCap, oldest dropped).
 	detached []antigravityDetachedRun
-	// pendingOwed is the newest owe-ready floor no reading has covered yet.
-	pendingOwed time.Time
+	// pendingOwed is the newest owe-ready floor no reading has covered yet, and
+	// pendingOwedProven says its run's exit was PROVEN (antigravityExitProvenLocked)
+	// and no debt covers it yet — what keeps the exit watch nudging it.
+	pendingOwed       time.Time
+	pendingOwedProven bool
 }{
 	known:      map[string]map[string]struct{}{},
 	entries:    map[string]*antigravityLogEntry{},
@@ -785,6 +801,9 @@ func handOffAntigravityDetachedManagedPID(pid int, floor, now time.Time) bool {
 	for _, floorMs := range res.release {
 		releaseAntigravityCandidateFloor(floorMs)
 	}
+	if handed {
+		wakeAntigravityExitWatch()
+	}
 	return handed
 }
 
@@ -927,8 +946,10 @@ func processStartHookFrom(ctx context.Context) func(pid int) {
 type antigravityDiscoveryResult struct {
 	arm     []int64
 	release []int64
-	// owed is the newest owe-ready floor no reading covers yet (zero = none).
-	owed time.Time
+	// owed is the newest owe-ready floor no reading covers yet (zero = none),
+	// and owedProven whether its run's exit was proven.
+	owed       time.Time
+	owedProven bool
 	// heldOwed counts candidates owed at the hold limit this pass.
 	heldOwed int
 	// needScan: the sentinel is armed and may be released by a checked scan.
@@ -1077,12 +1098,19 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		}
 	}
 
-	if !idx.pendingOwed.IsZero() && observedMs >= idx.pendingOwed.UnixMilli() {
-		idx.pendingOwed = time.Time{}
-	}
-	res.owed = idx.pendingOwed
+	antigravityPublishOwedLocked(observedMs, &res)
 	res.needScan = idx.sentinel != nil
 	return res
+}
+
+// antigravityPublishOwedLocked drops a pending floor a reading has covered and
+// hands what is left to the pass's result.
+func antigravityPublishOwedLocked(observedMs int64, res *antigravityDiscoveryResult) {
+	idx := &antigravityLogIndex
+	if !idx.pendingOwed.IsZero() && observedMs >= idx.pendingOwed.UnixMilli() {
+		idx.pendingOwed, idx.pendingOwedProven = time.Time{}, false
+	}
+	res.owed, res.owedProven = idx.pendingOwed, idx.pendingOwedProven
 }
 
 // antigravityEvaluateDetachedLocked moves every detached managed run that has
@@ -1209,6 +1237,22 @@ func antigravityEvaluateLocked(now time.Time, observedMs int64, res *antigravity
 		}
 	}
 
+	antigravityEvaluateProcessOnlyLocked(now, observedMs, res)
+
+	if s := idx.sentinel; s != nil && now.Sub(s.firstSeen) >= antigravityCandidateHoldLimit {
+		antigravityOweLocked(now)
+		res.heldOwed++
+		res.release = append(res.release, s.floorMs)
+		idx.sentinel = nil
+	}
+}
+
+// antigravityEvaluateProcessOnlyLocked decides, for every process-only PID,
+// whether it is live, released or owed. A PID tracked by its start token that
+// is now gone is a proven exit and owed at once; one with no token waits the
+// settle window.
+func antigravityEvaluateProcessOnlyLocked(now time.Time, observedMs int64, res *antigravityDiscoveryResult) {
+	idx := &antigravityLogIndex
 	kept := idx.processOnly[:0]
 	for _, p := range idx.processOnly {
 		switch antigravityCandidateProbe(p.pid, p.token) {
@@ -1221,6 +1265,9 @@ func antigravityEvaluateLocked(now time.Time, observedMs int64, res *antigravity
 		}
 		switch {
 		case !p.exitSeenAt.IsZero() && observedMs >= p.exitSeenAt.UnixMilli():
+			res.release = append(res.release, p.floorMs)
+		case !p.exitSeenAt.IsZero() && p.token != "":
+			antigravityOweFloorLocked(p.exitSeenAt, true)
 			res.release = append(res.release, p.floorMs)
 		case !p.exitSeenAt.IsZero() && now.Sub(p.exitSeenAt) >= antigravityCandidateSettle:
 			antigravityOweLocked(p.exitSeenAt)
@@ -1301,21 +1348,83 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 		entry.class = antigravityLogSettled
 		return
 	}
-	if now.Sub(entry.exitSeenAt) >= antigravityCandidateSettle || now.Sub(entry.mtime) >= antigravityCandidateSettle {
-		floor := entry.mtime
-		if entry.exitSeenAt.After(floor) {
-			floor = entry.exitSeenAt
-		}
-		antigravityOweLocked(floor)
-		antigravityReleaseEntryFloorLocked(entry, res)
-		entry.class = antigravityLogSettled
+	floor := entry.mtime
+	if entry.exitSeenAt.After(floor) {
+		floor = entry.exitSeenAt
 	}
+	proven, awaitingProof := antigravityExitProvenLocked(entry, now)
+	switch {
+	case proven:
+		// Every process of the run is provably gone: owed now, not a settle
+		// window later, and nudged without the nudge's own settle guard.
+		antigravityOweFloorLocked(floor, true)
+	case now.Sub(entry.exitSeenAt) >= antigravityCandidateSettle:
+	// An idle log alone does not owe a run gone at first sight: the next
+	// observation (at most one exit-watch poll away) proves it, and owing it
+	// unproven here would put it behind the nudge's minute guard.
+	case !awaitingProof && now.Sub(entry.mtime) >= antigravityCandidateSettle:
+	default:
+		return
+	}
+	if !proven {
+		antigravityOweLocked(floor)
+	}
+	antigravityReleaseEntryFloorLocked(entry, res)
+	entry.class = antigravityLogSettled
 }
 
-// antigravityOweLocked records an owe-ready floor.
+// antigravityExitProvenLocked reports whether an exited candidate's run is
+// PROVEN over (every tracked PID already probed gone by the caller):
+//
+//   - every PID was seen live and recorded with its start token, and that
+//     process is gone now; or
+//   - some PID was already gone when first seen (no token: a short `agy -p`
+//     smoke that started and ended between passes), and the log's size and
+//     mtime have stayed unchanged across two observations at least
+//     antigravityExitStableFor apart — so a run still writing its startup
+//     lines, or a same-second append to the shared file, is not owed early.
+//
+// pidOverflow is never proof. awaitingProof says the second rule applies and
+// has not been met yet.
+func antigravityExitProvenLocked(entry *antigravityLogEntry, now time.Time) (proven, awaitingProof bool) {
+	if entry.pidOverflow || len(entry.pids) == 0 {
+		return false, false
+	}
+	goneAtFirstSight := false
+	for _, p := range entry.pids {
+		if p.token == "" {
+			goneAtFirstSight = true
+		}
+	}
+	if !goneAtFirstSight {
+		return true, false
+	}
+	stat := antigravityLogStat{size: entry.size, mtime: entry.mtime}
+	if entry.stableAt.IsZero() || entry.stableStat != stat || now.Before(entry.stableAt) {
+		entry.stableStat, entry.stableAt = stat, now
+		return false, true
+	}
+	if now.Sub(entry.stableAt) < antigravityExitStableFor {
+		return false, true
+	}
+	return true, false
+}
+
+// antigravityOweLocked records an owe-ready floor nothing proved.
 func antigravityOweLocked(floor time.Time) {
-	if floor.After(antigravityLogIndex.pendingOwed) {
-		antigravityLogIndex.pendingOwed = floor
+	antigravityOweFloorLocked(floor, false)
+}
+
+// antigravityOweFloorLocked records an owe-ready floor; proven marks a run whose
+// exit was proven (antigravityExitProvenLocked). The newest floor wins, with
+// its own proof.
+func antigravityOweFloorLocked(floor time.Time, proven bool) {
+	idx := &antigravityLogIndex
+	switch {
+	case floor.After(idx.pendingOwed):
+		idx.pendingOwed, idx.pendingOwedProven = floor, proven
+	case floor.Equal(idx.pendingOwed) && proven:
+		idx.pendingOwedProven = true
 	}
 }
 
@@ -1550,20 +1659,188 @@ func startAntigravityDiscovery() {
 	}
 	stop, done := make(chan struct{}), make(chan struct{})
 	d.stop, d.done = stop, done
-	interval := antigravityDiscoveryInterval
+	interval, watchInterval := antigravityDiscoveryInterval, antigravityExitWatchInterval
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// The fast exit watch lives on the tick's goroutine, so it starts and
+		// stops with it and never runs concurrently with a pass of its own
+		// tick. Its ticker exists only while a direct run is tracked.
+		var watch *time.Ticker
+		var watchC <-chan time.Time
+		defer func() {
+			if watch != nil {
+				watch.Stop()
+			}
+			antigravityExitWatchActive.Store(false)
+		}()
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 				antigravityDiscoveryTick()
+			case <-antigravityExitWatchWake:
+			case <-watchC:
+				antigravityExitWatchPoll()
 			}
+			switch wanted := antigravityExitWatchWanted(); {
+			case wanted && watch == nil:
+				watch = time.NewTicker(watchInterval)
+				watchC = watch.C
+			case !wanted && watch != nil:
+				watch.Stop()
+				watch, watchC = nil, nil
+			}
+			antigravityExitWatchActive.Store(watch != nil)
 		}
 	}()
+}
+
+/* ─────────────────────────── fast exit watch ─────────────────────────── */
+
+// The fast exit watch closes the gap between a direct run's exit and its debt.
+// The tick lists the log directory once a minute; the watch, every
+// antigravityExitWatchInterval and only while a candidate, a process-only PID or
+// an unpaid proven floor is tracked, probes the tracked PIDs by start token and
+// stats each tracked candidate file — never a directory listing, never the
+// sentinel's process scan. Its cost is bounded by the existing caps
+// (antigravityCandidateCap × antigravityCandidateMaxPIDs probes plus
+// antigravityCandidateCap stats, and antigravityProcessOnlyCap probes).
+var (
+	// antigravityExitWatchWake asks the tick's goroutine to re-decide whether
+	// the watch should run, after a pass outside it (a gather, the startup
+	// scan, a detached hand-off) changed what is tracked.
+	antigravityExitWatchWake = make(chan struct{}, 1)
+	// antigravityExitWatchActive reports whether the watch's ticker exists.
+	antigravityExitWatchActive atomic.Bool
+)
+
+func wakeAntigravityExitWatch() {
+	select {
+	case antigravityExitWatchWake <- struct{}{}:
+	default:
+	}
+}
+
+// antigravityExitWatchWanted reports whether anything is tracked that the
+// watch can move: a candidate (live, or exited and awaiting its stability
+// check), a process-only PID, or a proven floor no debt covers yet.
+func antigravityExitWatchWanted() bool {
+	lockAntigravityLogIndex()
+	defer unlockAntigravityLogIndex()
+	idx := &antigravityLogIndex
+	if len(idx.processOnly) > 0 || idx.pendingOwedProven {
+		return true
+	}
+	for _, entry := range idx.entries {
+		if entry.class == antigravityLogCandidate {
+			return true
+		}
+	}
+	return false
+}
+
+// antigravityExitWatchPoll is one watch poll: the tracked-only pass, then — when
+// it owed a run — one full discovery pass, and a nudge for an unpaid proven
+// floor. A nudge refused by the cooldown, the read spacing or a running own
+// child stamps nothing, so the next poll (seconds later) retries it; once a
+// debt covers the floor the watch stops tracking it and the debt's own retry
+// schedule owns it.
+func antigravityExitWatchPoll() {
+	if IsShutdownInProgress() {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	now := antigravityUsageFreshnessNow()
+	observedMs := cachedAntigravityObservedMs()
+	res, newlyOwed := antigravityExitWatchPass(now, observedMs)
+	antigravityApplyDiscovery(res, now)
+	owed := antigravityOwedFloor{At: res.owed, Proven: res.owedProven}
+	if newlyOwed {
+		owed = antigravityDiscover(antigravityQuotaBases(home), now)
+	}
+	antigravityNudgeProvenFloor(now, observedMs, owed)
+}
+
+// antigravityExitWatchPass re-evaluates only what is tracked: each candidate's
+// file is stat'ed (and re-read only when it changed while no tracked PID is
+// live — a live run's growing log is the tick's business), then candidates and
+// process-only PIDs are evaluated exactly as a pass would. newlyOwed says the
+// pending floor moved.
+func antigravityExitWatchPass(now time.Time, observedMs int64) (antigravityDiscoveryResult, bool) {
+	var res antigravityDiscoveryResult
+	lockAntigravityLogIndex()
+	defer unlockAntigravityLogIndex()
+	idx := &antigravityLogIndex
+	before := idx.pendingOwed
+	for _, entry := range idx.entries {
+		if entry.class != antigravityLogCandidate {
+			continue
+		}
+		stat, ok := antigravityStatLog(entry.path)
+		if !ok || stat == (antigravityLogStat{size: entry.size, mtime: entry.mtime}) {
+			continue
+		}
+		if !antigravityCandidateLiveLocked(entry) {
+			antigravityClassifyLogLocked(entry, stat, now, observedMs, &res)
+		}
+	}
+	for _, entry := range idx.entries {
+		if entry.class == antigravityLogCandidate {
+			antigravityEvaluateCandidateLocked(entry, now, observedMs, &res)
+		}
+	}
+	antigravityEvaluateProcessOnlyLocked(now, observedMs, &res)
+	antigravityPublishOwedLocked(observedMs, &res)
+	return res, idx.pendingOwed.After(before)
+}
+
+// antigravityCandidateLiveLocked reports whether any tracked process of the
+// candidate is still running (or cannot be read, or is past the tracked set).
+func antigravityCandidateLiveLocked(entry *antigravityLogEntry) bool {
+	if entry.pidOverflow {
+		return true
+	}
+	for _, p := range entry.pids {
+		if antigravityCandidateProbe(p.pid, p.token) != processGone {
+			return true
+		}
+	}
+	return false
+}
+
+// antigravityNudgeProvenFloor nudges an unpaid proven floor, and stops tracking
+// it once a debt covers it.
+func antigravityNudgeProvenFloor(now time.Time, observedMs int64, owed antigravityOwedFloor) {
+	if !owed.Proven || owed.At.IsZero() {
+		return
+	}
+	if !antigravityDebtCoversFloor(owed.At) {
+		nudgeAntigravityUsageRefreshFloor(now, observedMs, owed)
+		if !antigravityDebtCoversFloor(owed.At) {
+			return
+		}
+	}
+	lockAntigravityLogIndex()
+	if idx := &antigravityLogIndex; !idx.pendingOwed.After(owed.At) {
+		idx.pendingOwedProven = false
+	}
+	unlockAntigravityLogIndex()
+}
+
+// antigravityDebtCoversFloor reports whether a pending debt already asks for a
+// reading at or after floor. Never called with the index lock held.
+func antigravityDebtCoversFloor(floor time.Time) bool {
+	antigravityAssertIndexUnlocked("freshness")
+	antigravityFreshnessMu.Lock()
+	state := readAntigravityUsageFreshnessLocked()
+	antigravityFreshnessMu.Unlock()
+	return state.RefreshOwedAtMs != 0 && state.RefreshOwedFloorMs >= floor.UnixMilli()
 }
 
 // stopAntigravityDiscovery stops the tick and waits for a pass in flight.
@@ -1627,21 +1904,30 @@ func antigravityDiscoveryTick() {
 	}
 	now := antigravityUsageFreshnessNow()
 	owed := antigravityDiscover(antigravityQuotaBases(home), now)
-	if owed.IsZero() || antigravityOwnChildRunning() {
+	if owed.At.IsZero() || antigravityOwnChildRunning() {
 		return
 	}
-	nudgeAntigravityUsageRefresh(now, cachedAntigravityObservedMs(), owed)
+	nudgeAntigravityUsageRefreshFloor(now, cachedAntigravityObservedMs(), owed)
+}
+
+// antigravityOwedFloor is the newest owe-ready floor no reading covers yet
+// (At zero: none), and whether its run's exit was proven — which lets the nudge
+// owe it without the minute's settle guard.
+type antigravityOwedFloor struct {
+	At     time.Time
+	Proven bool
 }
 
 // antigravityDiscover runs one pass and applies its floors; returns the newest
 // owe-ready floor no reading covers yet.
-func antigravityDiscover(bases []string, now time.Time) time.Time {
+func antigravityDiscover(bases []string, now time.Time) antigravityOwedFloor {
 	res := antigravityDiscoveryPass(bases, now, cachedAntigravityObservedMs())
 	antigravityApplyDiscovery(res, now)
-	return res.owed
+	return antigravityOwedFloor{At: res.owed, Proven: res.owedProven}
 }
 
 func antigravityApplyDiscovery(res antigravityDiscoveryResult, now time.Time) {
+	defer wakeAntigravityExitWatch()
 	// Before any nudge the caller sends, so the read that pays a detached run's
 	// debt already sees its evidence.
 	for _, e := range res.evidence {
@@ -1766,11 +2052,16 @@ func antigravityIndexTracksPIDLocked(pid int) bool {
 // would, but never nudges — the gather does that itself — and never runs the
 // sentinel's process scan (a PowerShell child of about a second): that would
 // spend the gather budget every provider shares. The tick owns that scan.
-func antigravityNewestOwedLog(bases []string, now time.Time) time.Time {
+func antigravityNewestOwedFloor(bases []string, now time.Time) antigravityOwedFloor {
 	res := antigravityDiscoveryPass(bases, now, cachedAntigravityObservedMs())
 	res.needScan = false
 	antigravityApplyDiscovery(res, now)
-	return res.owed
+	return antigravityOwedFloor{At: res.owed, Proven: res.owedProven}
+}
+
+// antigravityNewestOwedLog is antigravityNewestOwedFloor's instant alone.
+func antigravityNewestOwedLog(bases []string, now time.Time) time.Time {
+	return antigravityNewestOwedFloor(bases, now).At
 }
 
 // resetAntigravityLogIndex clears the index. Tests only.
@@ -1784,7 +2075,7 @@ func resetAntigravityLogIndex() {
 	idx.processOnly, idx.sentinel = nil, nil
 	idx.ownRunning, idx.ownPIDs, idx.managedPIDs, idx.detached = 0, nil, nil, nil
 	idx.ownBlocks = nil
-	idx.pendingOwed = time.Time{}
+	idx.pendingOwed, idx.pendingOwedProven = time.Time{}, false
 	unlockAntigravityLogIndex()
 	antigravityLiveRunsMu.Lock()
 	antigravityCandidateFloors = map[int64]int{}

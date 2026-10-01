@@ -387,24 +387,40 @@ func cliAgentModelProbeCacheKey(agentID string, detected detectedCLIAgent) strin
 // second result is false when there is no live entry — the caller decides
 // whether it may probe.
 func lookupCLIAgentModelDiscoveryCache(agentID string, detected detectedCLIAgent, now time.Time) (cliAgentModelDiscovery, bool) {
+	result, ok, _ := lookupCLIAgentModelDiscoveryEntry(agentID, detected, now)
+	return result, ok
+}
+
+func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
+	if result, ok, cached := lookupCLIAgentModelDiscoveryEntry(agentID, detected, now); cached {
+		return result, ok
+	}
+	return refreshCLIAgentModelDiscovery(ctx, agentID, detected, home, now)
+}
+
+// lookupCLIAgentModelDiscoveryEntry is the cache read both callers share:
+// cached is false when there is no live entry, whatever its verdict was.
+func lookupCLIAgentModelDiscoveryEntry(agentID string, detected detectedCLIAgent, now time.Time) (cliAgentModelDiscovery, bool, bool) {
 	cliAgentModelProbeMu.Lock()
 	entry, cached := cliAgentModelProbeCache[cliAgentModelProbeCacheKey(agentID, detected)]
 	cliAgentModelProbeMu.Unlock()
 	if cached && now.Sub(entry.At) < cliAgentModelProbeTTL {
-		return entry.Result, entry.OK
+		return entry.Result, entry.OK, true
 	}
-	return cliAgentModelDiscovery{}, false
+	return cliAgentModelDiscovery{}, false, false
 }
 
-func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
+// refreshCLIAgentModelDiscovery runs the agent's probe whatever the cache holds
+// and stores the answer under the current generation, by the same rules a cache
+// miss follows. The Antigravity login renewal runs `agy models` through it
+// (renewAntigravityStoredLogin): that child is what makes `agy` renew its
+// keyring token, so a warm cache must not turn it into a no-op, and the list it
+// returns is the freshest there is.
+func refreshCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
 	key := cliAgentModelProbeCacheKey(agentID, detected)
 	cliAgentModelProbeMu.Lock()
-	entry, cached := cliAgentModelProbeCache[key]
 	generation := cliAgentModelProbeGeneration
 	cliAgentModelProbeMu.Unlock()
-	if cached && now.Sub(entry.At) < cliAgentModelProbeTTL {
-		return entry.Result, entry.OK
-	}
 	result, ok := discoverCLIAgentModels(ctx, agentID, detected, home)
 	if !ok && ctx != nil && ctx.Err() != nil {
 		// The probe lost its deadline rather than answering. Caching that miss
