@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -439,5 +440,72 @@ func TestGatherReadinessOnly_CanceledContextIsBlocked(t *testing.T) {
 	// failures in the session tests.
 	if !drainMachineInfoGathers(200 * time.Millisecond) {
 		t.Fatal("an inspection that was already over must not start a machine-info gather")
+	}
+}
+
+func withPowerShell(effective string, scopes map[string]string) *MachineInfo {
+	info := healthyMachine()
+	info.PowerShell = summarizePowerShellPolicy([]powerShellHostPolicy{psHost(effective, scopes)})
+	return info
+}
+
+func TestEvaluateReadiness_FixablePowerShellPolicyIsInformational(t *testing.T) {
+	report := evaluateReadiness(withPowerShell("Restricted", allUndefined(nil)))
+	f := findFinding(report.Findings, "powershell_scripts_blocked")
+	if f == nil || f.Severity != FindingWarning {
+		t.Fatalf("expected the blocked-scripts warning, got %+v", report.Findings)
+	}
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("a blocking policy is advisory only (ready_with_warnings), got %s", report.State)
+	}
+	a := findAction(report.Actions, "powershell_scripts_blocked")
+	if a == nil || a.Kind != ReadinessActionKindSoftwareUpdate || a.ManualInstruction != powerShellPolicyManualCommand {
+		t.Fatalf("expected the per-user fix action, got %+v", report.Actions)
+	}
+}
+
+func TestEvaluateReadiness_UnfixablePowerShellPolicyHasNoAction(t *testing.T) {
+	for name, info := range map[string]*MachineInfo{
+		"group policy": withPowerShell("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted", "CurrentUser": "RemoteSigned"})),
+		"all signed":   withPowerShell("AllSigned", allUndefined(map[string]string{"LocalMachine": "AllSigned"})),
+	} {
+		report := evaluateReadiness(info)
+		if findFinding(report.Findings, "powershell_scripts_blocked") == nil {
+			t.Fatalf("%s: expected the finding", name)
+		}
+		requireNoReadinessActions(t, report)
+		if report.State != ReadinessReadyWithWarnings {
+			t.Fatalf("%s: got %s", name, report.State)
+		}
+	}
+}
+
+func TestEvaluateReadiness_PermissivePowerShellPolicyHasNoFinding(t *testing.T) {
+	for _, policy := range []string{"RemoteSigned", "Bypass", "Unrestricted"} {
+		report := evaluateReadiness(withPowerShell(policy, allUndefined(map[string]string{"LocalMachine": policy})))
+		if report.State != ReadinessReady || len(report.Findings) != 0 {
+			t.Fatalf("%s: expected ready with no findings, got %s %+v", policy, report.State, report.Findings)
+		}
+	}
+	// macOS / Linux / an older gather: no powerShell block at all.
+	if report := evaluateReadiness(healthyMachine()); findFinding(report.Findings, "powershell_scripts_blocked") != nil {
+		t.Fatal("nil PowerShell must never produce the finding")
+	}
+}
+
+func TestEvaluateReadiness_PowerShellActionCoversEveryBlockingHost(t *testing.T) {
+	win := psHost("Restricted", allUndefined(nil))
+	pwsh := psHost("Restricted", allUndefined(nil))
+	pwsh.Host = powerShellHost7
+	info := healthyMachine()
+	info.PowerShell = summarizePowerShellPolicy([]powerShellHostPolicy{win, pwsh})
+	a := findAction(evaluateReadiness(info).Actions, "powershell_scripts_blocked")
+	if a == nil {
+		t.Fatal("expected the per-user fix action")
+	}
+	for _, exe := range []string{"powershell -NoProfile", "pwsh -NoProfile"} {
+		if !strings.Contains(a.ManualInstruction, exe) {
+			t.Fatalf("manual instruction %q must run the setter in %s", a.ManualInstruction, exe)
+		}
 	}
 }
