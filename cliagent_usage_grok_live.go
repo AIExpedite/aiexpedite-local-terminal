@@ -322,6 +322,10 @@ var grokBillingLiveReadFn = probeGrokBillingLive
 // shares.
 func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now func() time.Time) string {
 	ch := grokBillingReadGroup.DoChan("grok:"+fingerprint, func() (any, error) {
+		// Counted as this feature's in-flight work for as long as the read
+		// runs, so a waiter that gave up early still sees its settle land.
+		grokFreshnessInFlight.Add(1)
+		defer grokFreshnessInFlight.Add(-1)
 		readCtx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
 		defer cancel()
 		outcome := grokBillingLiveReadFn(readCtx, grokPath, now)

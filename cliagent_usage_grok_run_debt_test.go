@@ -668,3 +668,66 @@ func TestDrainGrokUsageWrites_WaitsForAnInFlightPersist(t *testing.T) {
 		t.Fatalf("state = %+v, want the armed floor on disk after the drain", h.state())
 	}
 }
+
+// A rung booked by an earlier failed read must not outlive an auth refusal:
+// left in place it falls due, and every gather (or a restart) would send
+// another read — and, for `unauthorized`, another `grok models` renewal.
+func TestGrokRunDebt_AuthRefusalCancelsAnEarlierRung(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	h.runAndSettle(time.Second)
+	if h.state().NextAttemptAtMs == 0 || !grokRunDebtRetryPending() {
+		t.Fatalf("fixture: no rung booked after http_error: %+v", h.state())
+	}
+
+	h.outcome.Store(grokLiveOutcomeUnauthorized)
+	h.advance(time.Minute)
+	h.pass()
+	state := h.state()
+	if state.LastOutcome != grokLiveOutcomeUnauthorized || state.NextAttemptAtMs != 0 || grokRunDebtRetryPending() {
+		t.Fatalf("state = %+v pending=%t, want the earlier rung cancelled", state, grokRunDebtRetryPending())
+	}
+	if h.reads.Load() != 2 {
+		t.Fatalf("fixture reads = %d", h.reads.Load())
+	}
+
+	// Past where the old rung would have fallen due: gathers send nothing.
+	for i := 0; i < 3; i++ {
+		h.advance(10 * time.Minute)
+		nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+		h.idle()
+	}
+	// Nor does an update restart.
+	stopGrokRunDebtRetry()
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, an auth-stopped debt was read by a gather or a restart", h.reads.Load())
+	}
+	if !h.state().owed() {
+		t.Fatal("the debt must stay open for the next run")
+	}
+
+	// The next run that settles still reads.
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.runAndSettle(time.Second)
+	if h.reads.Load() != 3 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the next run to read and pay", h.reads.Load(), h.state())
+	}
+}
+
+// The restart replay keys "stay idle" on the debt's own auth outcome, not on
+// the spacing clock — which outlives debts — so a fresh debt a run settled
+// just before the hand-off is still paid at start.
+func TestPayOwedGrokUsageRefresh_FreshDebtIsPaidDespiteAnOldSpacingClock(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{
+		CompletionMs: h.clock().Add(-time.Second).UnixMilli(), OwedAtMs: h.clock().Add(-time.Second).UnixMilli(),
+		LastAttemptAtMs: h.clock().Add(-time.Hour).UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the fresh debt paid at start", h.reads.Load(), h.state())
+	}
+}

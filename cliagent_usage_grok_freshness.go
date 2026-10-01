@@ -588,6 +588,11 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 			return
 		}
 		s.LastOutcome = outcome
+		if grokAuthOutcome(outcome) {
+			// Idle until a new run settles: drop any rung an earlier failed read
+			// booked, or a gather (or a restart) would find it due and read again.
+			s.NextAttemptAtMs = 0
+		}
 		if grokOutcomeSpendsBudget(outcome) && s.Attempts < grokRunDebtMaxAttempts {
 			s.Attempts++
 		}
@@ -610,6 +615,10 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		// login would otherwise cost a billing GET, and for `unauthorized` a
 		// `grok models` renewal, on every gather. The next run that settles
 		// gets one read (a smoke even inside the spacing); a click clears it.
+		// The rung an earlier failed read armed is cancelled with it.
+		if booked.debtID() == id {
+			stopGrokRunDebtRetry()
+		}
 		return booked, grokRetryNone
 	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed, liveProbeOutcomeTimeout:
 		// Local conditions, or this caller stopped waiting while the shared
@@ -817,7 +826,26 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 		fmt.Printf("%s[cli-usage] grok refresh: resumed attempts=%d%s\n", colorCyan, state.Attempts, colorReset)
 		return
 	}
+	if state.NextAttemptAtMs == 0 && grokAuthOutcome(state.LastOutcome) {
+		// Idle after an auth refusal, by design: a restart is not a new run,
+		// so it must not spend another read (or `grok models` renewal) on a
+		// login xAI just refused. The next run that settles reads. Keyed on the
+		// debt's own LastOutcome — cleared with the debt — rather than the
+		// spacing clock, which outlives debts and would also idle a fresh debt
+		// a run settled just before the hand-off.
+		return
+	}
 	grokStartRunDebtWorker(false)
+}
+
+// grokAuthOutcome reports the outcomes the auth notice owns: no read can pay
+// them until the login changes.
+func grokAuthOutcome(outcome string) bool {
+	switch outcome {
+	case grokLiveOutcomeNoLogin, grokLiveOutcomeNoAccount, grokLiveOutcomeUnauthorized:
+		return true
+	}
+	return false
 }
 
 /* ──────────────────────────────── smoke ─────────────────────────────── */
