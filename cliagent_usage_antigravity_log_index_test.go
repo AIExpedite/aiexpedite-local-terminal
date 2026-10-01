@@ -206,6 +206,53 @@ func TestAntigravityOwnChild_StartFailureReleases(t *testing.T) {
 	}
 }
 
+// An own child whose block lands in a log another run created in the same
+// second, and that exits inside that second (its start token then
+// unreadable), is still recognised as ours: done() claims the appended block,
+// so only the other run is a candidate — whether the pass classifies the file
+// after done() or already did before it.
+func TestAntigravityOwnChild_ClaimsBlockAppendedToSameSecondLog(t *testing.T) {
+	for _, passFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("passBeforeDone=%v", passFirst), func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			// Named a moment ahead, so the child's exit is never after the
+			// name's second: the ambiguous case antigravityPIDIn reads foreign.
+			at := time.Now().Add(2 * time.Second).Truncate(time.Second)
+			h.setLive(4402, true)
+			path := h.write(t, helperLogName(at), helperPIDBlock(4402), at, false)
+
+			child := beginAntigravityOwnChild(h.home)
+			h.setLive(4401, true)
+			child.setPID(4401)
+			h.write(t, helperLogName(at), helperPIDBlock(4401), at, true)
+			h.setLive(4401, false)
+			if passFirst {
+				lockAntigravityLogIndex()
+				antigravityMarkPIDExited(antigravityLogIndex.ownPIDs, 4401, time.Now())
+				unlockAntigravityLogIndex()
+				h.pass(time.Now(), 0)
+			}
+			child.done()
+			h.pass(time.Now(), 0)
+
+			lockAntigravityLogIndex()
+			entry := antigravityLogIndex.entries[path]
+			var pids []int
+			class := antigravityLogSettled
+			if entry != nil {
+				class = entry.class
+				for _, p := range entry.pids {
+					pids = append(pids, p.pid)
+				}
+			}
+			unlockAntigravityLogIndex()
+			if class != antigravityLogCandidate || len(pids) != 1 || pids[0] != 4402 {
+				t.Errorf("class=%v pids=%v, want a candidate for the other run (4402) only", class, pids)
+			}
+		})
+	}
+}
+
 /* ─────────────────────────── candidates ─────────────────────────── */
 
 // A live foreign run is a candidate, armed and never owed while it lives. Once
@@ -1272,6 +1319,30 @@ func TestAntigravityPIDBlock_ReservesReadsForLegacyLogs(t *testing.T) {
 	}
 	if _, ok := antigravityPIDBlock(h.base, 50200, floor); !ok {
 		t.Error("the stamped log at the floor must still be read first")
+	}
+}
+
+// A run that appends to an older legacy log inside the memo's TTL changes no
+// name, so a memoised listing still ranks that log old; the PID-block read
+// stats legacy logs fresh and finds the run's block anyway, and refreshes the
+// memo for the listings after it.
+func TestAntigravityPIDBlock_SeesLegacyAppendInsideTheMemoTTL(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	floor := time.Now().Truncate(time.Second)
+	old := floor.Add(-100 * time.Hour)
+	for i := 0; i < antigravityLegacyReadReserve+4; i++ {
+		h.write(t, fmt.Sprintf("legacy-%02d.log", i), "", old.Add(-time.Duration(i)*time.Hour), false)
+	}
+	antigravityRunLogs(h.base) // fills the memo
+	appended := h.write(t, "legacy-11.log",
+		helperPIDBlock(50051)+"authenticated successfully as ada@example.com\n", floor.Add(time.Second), true)
+
+	block, ok := antigravityPIDBlock(h.base, 50051, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Fatalf("block=%q ok=%v, want the run appended to an old legacy log", block, ok)
+	}
+	if files := antigravityRunLogs(h.base); len(files) == 0 || files[0].path != appended {
+		t.Errorf("files=%v, want the appended legacy log ranked newest after the fresh read", files)
 	}
 }
 

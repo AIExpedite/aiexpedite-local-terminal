@@ -217,6 +217,9 @@ var antigravityLogIndex = struct {
 	// is not mistaken for ours.
 	ownPIDs     []antigravityTrackedPID
 	managedPIDs []antigravityTrackedPID
+	// ownBlocks are own-child blocks appended to logs other runs created
+	// (capped at antigravityKnownPIDCap, oldest dropped).
+	ownBlocks []antigravityOwnBlock
 	// detached are handed-off managed runs whose evidence is read at their own
 	// exit (capped at antigravityKnownPIDCap, oldest dropped).
 	detached []antigravityDetachedRun
@@ -410,7 +413,9 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
 		stampedEnd--
 	}
-	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], since)
+	// Read once per run, so the legacy mtimes are stat'ed fresh: a run that
+	// appended to an older legacy log inside the memo's TTL is still found.
+	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], since, true)
 	var afterFloor, slack []string
 	for _, name := range names[:stampedEnd] {
 		at, _ := antigravityLogNameTime(name, time.Time{})
@@ -455,10 +460,13 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 // mtimes are memoised per directory for antigravityLegacyStatTTL (and while
 // the legacy name set is unchanged), so a device retaining many legacy logs
 // pays at most one full legacy stat pass per TTL however often capture
-// probes and PID-block reads list its logs.
-func antigravityLegacyLogsSince(dir string, names []string, since time.Time) []string {
+// probes list its logs. fresh skips the memo (and refreshes it): appending to
+// an existing legacy log changes no name, so only a stat sees it. PID-block
+// reads pass it — they run once per run, and a stale mtime there would lose
+// the run's evidence.
+func antigravityLegacyLogsSince(dir string, names []string, since time.Time, fresh bool) []string {
 	var out []string
-	for _, l := range antigravityLegacyLogMtimes(dir, names) {
+	for _, l := range antigravityLegacyLogMtimes(dir, names, fresh) {
 		if !l.mtime.Before(since) {
 			out = append(out, l.name)
 		}
@@ -490,9 +498,9 @@ type antigravityLegacyStatEntry struct {
 // antigravityLegacyLogMtimes stats names (all unstamped) and returns the
 // readable ones oldest mtime first, memoised as antigravityLegacyLogsSince
 // describes.
-func antigravityLegacyLogMtimes(dir string, names []string) []antigravityLegacyLog {
+func antigravityLegacyLogMtimes(dir string, names []string, fresh bool) []antigravityLegacyLog {
 	memoise := len(names) > antigravityLegacyReadReserve
-	if memoise {
+	if memoise && !fresh {
 		antigravityLegacyStatMemo.Lock()
 		entry, ok := antigravityLegacyStatMemo.byDir[dir]
 		antigravityLegacyStatMemo.Unlock()
@@ -525,19 +533,42 @@ func antigravityLegacyLogMtimes(dir string, names []string) []antigravityLegacyL
 type antigravityOwnChild struct {
 	bases  []string
 	before map[string]struct{}
-	pid    atomic.Int64
-	once   sync.Once
+	// appendable holds the pre-start size of each existing log named for the
+	// second the child began in: agy names a log for the second its first run
+	// started, so the child may append its block to one of these instead of
+	// creating a new name.
+	appendable map[string]int64
+	pid        atomic.Int64
+	once       sync.Once
+}
+
+// antigravityOwnBlock is an own child's PID block that done() found appended
+// to a log another run had already created. The block is ours whatever the
+// PID's start token reads later.
+type antigravityOwnBlock struct {
+	path string
+	pid  int
 }
 
 // beginAntigravityOwnChild records the log names present before an own child
 // starts and counts it as running. The caller registers `defer child.done()`
 // immediately, so a start failure, an early return or a panic releases it.
 func beginAntigravityOwnChild(home string) *antigravityOwnChild {
-	child := &antigravityOwnChild{bases: antigravityQuotaBases(home), before: map[string]struct{}{}}
+	child := &antigravityOwnChild{
+		bases: antigravityQuotaBases(home), before: map[string]struct{}{}, appendable: map[string]int64{},
+	}
+	second := time.Now().Truncate(time.Second)
 	for _, base := range child.bases {
 		names, _ := antigravityListLogNames(base)
 		for _, name := range names {
-			child.before[filepath.Join(antigravityLogDir(base), name)] = struct{}{}
+			path := filepath.Join(antigravityLogDir(base), name)
+			child.before[path] = struct{}{}
+			if at, stamped := antigravityLogNameTime(name, time.Time{}); stamped && !at.Before(second) &&
+				len(child.appendable) < antigravityOwnChildMaxFiles {
+				if stat, ok := antigravityStatLog(path); ok {
+					child.appendable[path] = stat.size
+				}
+			}
 		}
 	}
 	lockAntigravityLogIndex()
@@ -560,8 +591,11 @@ func (c *antigravityOwnChild) setPID(pid int) {
 
 // done releases the running count and claims the child's logs: up to
 // antigravityOwnChildMaxFiles new files, each read whole, owned only when its
-// SOLE PID block is the child's and it did not change while being read.
-// Idempotent.
+// SOLE PID block is the child's and it did not change while being read. A
+// same-second log that existed before the child started is never owned
+// whole; when the child's block is in the bytes appended since, that block is
+// remembered as ours, so a child that exits inside the name's second (its
+// start token then unreadable) is not read as a foreign run. Idempotent.
 func (c *antigravityOwnChild) done() {
 	if c == nil {
 		return
@@ -603,6 +637,22 @@ func (c *antigravityOwnChild) done() {
 				}
 			}
 		}
+		var appended []string
+		if pid := int(c.pid.Load()); pid > 0 {
+			for path, preSize := range c.appendable {
+				stat, ok := antigravityStatLog(path)
+				if !ok || stat.size <= preSize || stat.size > antigravityOwnLogMaxBytes {
+					continue
+				}
+				body, ok := antigravityReadLog(path)
+				if !ok || int64(len(body)) < preSize {
+					continue
+				}
+				if _, found := antigravityPIDBlockIn(body[preSize:], pid); found {
+					appended = append(appended, path)
+				}
+			}
+		}
 
 		var released []int64
 		lockAntigravityLogIndex()
@@ -611,6 +661,18 @@ func (c *antigravityOwnChild) done() {
 			antigravityLogIndex.ownRunning = 0
 		}
 		antigravityMarkPIDExited(antigravityLogIndex.ownPIDs, int(c.pid.Load()), time.Now())
+		for _, path := range appended {
+			blocks := append(antigravityLogIndex.ownBlocks, antigravityOwnBlock{path: path, pid: int(c.pid.Load())})
+			if len(blocks) > antigravityKnownPIDCap {
+				blocks = blocks[len(blocks)-antigravityKnownPIDCap:]
+			}
+			antigravityLogIndex.ownBlocks = blocks
+			// A pass that classified the file while the child's PID read as
+			// foreign reclassifies it on its next stat.
+			if entry := antigravityLogIndex.entries[path]; entry != nil && entry.class != antigravityLogOwned {
+				entry.size = -1
+			}
+		}
 		for _, cl := range claims {
 			entry := antigravityLogIndex.entries[cl.path]
 			if entry == nil {
@@ -794,6 +856,17 @@ func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string, at ti
 		}
 		return known.exitedAt.IsZero() || at.IsZero() ||
 			at.Before(known.exitedAt.Truncate(time.Second))
+	}
+	return false
+}
+
+// antigravityOwnBlockLocked reports whether done() claimed pid's block in the
+// log at path.
+func antigravityOwnBlockLocked(path string, pid int) bool {
+	for _, b := range antigravityLogIndex.ownBlocks {
+		if b.pid == pid && b.path == path {
+			return true
+		}
 	}
 	return false
 }
@@ -1055,7 +1128,7 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 		case antigravityPIDRememberedLocked(pid):
 			token, looked = antigravityCurrentStartToken(pid), true
 		}
-		if antigravityPIDIn(idx.ownPIDs, pid, token, startedBy) {
+		if antigravityPIDIn(idx.ownPIDs, pid, token, startedBy) || antigravityOwnBlockLocked(entry.path, pid) {
 			continue
 		}
 		allOwn = false
@@ -1710,6 +1783,7 @@ func resetAntigravityLogIndex() {
 	idx.newestStat = map[string]antigravityLogStat{}
 	idx.processOnly, idx.sentinel = nil, nil
 	idx.ownRunning, idx.ownPIDs, idx.managedPIDs, idx.detached = 0, nil, nil, nil
+	idx.ownBlocks = nil
 	idx.pendingOwed = time.Time{}
 	unlockAntigravityLogIndex()
 	antigravityLiveRunsMu.Lock()

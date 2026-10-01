@@ -263,7 +263,7 @@ func antigravityRunLogs(base string) []antigravityRunLog {
 	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
 		stampedEnd--
 	}
-	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], time.Time{})
+	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], time.Time{}, false)
 	if len(legacy) > antigravityLegacyReadReserve {
 		legacy = legacy[len(legacy)-antigravityLegacyReadReserve:]
 	}
