@@ -163,12 +163,10 @@ func TestClaudeRunDebtLadder_PersistsIntegersAndLogsClosedLabels(t *testing.T) {
 	var snap claudeRateLimitSnapshot
 	out := captureStdout(t, func() {
 		triggerClaudeUsageProbeAfterRun()
-		waitForClaudeDebt(t, cache, 5*time.Second)
 		claudeFreshnessWaitIdle(t)
 		snap = claudeCacheSnapshot(t, cache)
 		fail.Store(false)
-		waitForClaudeProbeReading(t, cache, 10*time.Second)
-		claudeFreshnessWaitIdle(t)
+		waitForClaudeDebtPaid(t, cache, 10*time.Second)
 	})
 
 	if snap.NextAttemptAtMs == 0 {

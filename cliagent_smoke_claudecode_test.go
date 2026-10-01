@@ -1333,7 +1333,8 @@ func TestClaudeSmokeDebt_FailedTrailingProbeBooksExactlyOneRung(t *testing.T) {
 
 	booked := time.Now()
 	settleOrDisarmClaudeSmokeRun(true)
-	waitForClaudeDebt(t, cache, 5*time.Second)
+	// Idle covers the whole settlement; polling the file instead could make its
+	// best-effort writes fail on Windows (see waitForClaudeDebtPaid).
 	claudeFreshnessWaitIdle(t)
 
 	if got := atomic.LoadInt64(calls); got != 1 {

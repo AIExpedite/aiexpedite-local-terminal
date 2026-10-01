@@ -56,17 +56,27 @@ func assertClaudeRowsNumericAfter(t *testing.T, rows []cliAgentUsageMetric, afte
 	}
 }
 
-// waitForClaudeDebtPaid polls until the durable debt is gone.
+// waitForClaudeDebtPaid waits until the run's debt is settled and the ladder is
+// at rest, then checks the durable debt is gone too.
+//
+// It polls IN-MEMORY state only and reads the cache once at the end. On Windows
+// an open read handle makes the writers' replace-by-rename fail, and those
+// writes are best-effort — so a test polling the file while the ladder writes it
+// can drop the very charge or rung it is about to assert on.
 func waitForClaudeDebtPaid(t *testing.T, cache string, within time.Duration) {
 	t.Helper()
 	for deadline := time.Now().Add(within); time.Now().Before(deadline); {
-		if snap, ok := loadClaudeRateLimitSnapshot(cache); ok && snap.RefreshOwedAtMs == 0 && snap.LastProbeObservedAtMs != 0 {
-			return
+		claudeUsageProbe.mu.Lock()
+		idle := !claudeUsageProbe.inFlight && claudeUsageProbe.settling == 0
+		claudeUsageProbe.mu.Unlock()
+		if idle && claudeUsageProbe.owedObservation().IsZero() && !claudeRunDebtRetryPending() {
+			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	snap, _ := loadClaudeRateLimitSnapshot(cache)
-	t.Fatalf("the run's debt was never paid: %+v", snap)
+	if snap, ok := loadClaudeRateLimitSnapshot(cache); !ok || snap.RefreshOwedAtMs != 0 || snap.LastProbeObservedAtMs == 0 {
+		t.Fatalf("the run's debt was never paid: %+v", snap)
+	}
 }
 
 // Terminal-managed smoke: the smoke passes, its first trailing request times out
@@ -178,7 +188,9 @@ func TestClaudeStaleRegression_RungSurvivesAnAgentUpdate(t *testing.T) {
 
 	runEnded := time.Now()
 	triggerClaudeUsageProbeAfterRun()
-	waitForClaudeDebt(t, cache, 5*time.Second)
+	// The trigger counts its settlement before returning, so waiting for idle
+	// covers the owe, the attempt and the booking without reading the file
+	// while they write it (see waitForClaudeDebtPaid).
 	claudeFreshnessWaitIdle(t)
 	snap := claudeCacheSnapshot(t, cache)
 	if snap.NextAttemptAtMs == 0 || snap.RefreshOwedAttempts != 1 {

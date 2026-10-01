@@ -9,10 +9,13 @@ package main
 // do not call t.Parallel().
 
 import (
+	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -339,5 +342,80 @@ func TestResetClaudeUsageProbeGate_StopsThePendingRung(t *testing.T) {
 	resetClaudeUsageProbeGate()
 	if claudeRunDebtRetryPending() {
 		t.Fatal("resetClaudeUsageProbeGate left the rung armed")
+	}
+}
+
+// A rung that fires after its debt was paid elsewhere (a Refresh click, a
+// gather) sends nothing.
+func TestClaudeRunDebtRetryFired_PaidDebtSendsNothing(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	claudeArmRunDebtRetry(time.Hour)
+	claudeRunDebtRetryTimer.mu.Lock()
+	gen := claudeRunDebtRetryTimer.gen
+	claudeRunDebtRetryTimer.mu.Unlock()
+	claudeRunDebtRetryFired(gen)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("a rung with no debt left sent %d requests", got)
+	}
+	if claudeRunDebtRetryPending() {
+		t.Fatal("a rung with no debt left re-armed itself")
+	}
+}
+
+// A Refresh click inside a 429 hold does not override it: nothing is sent, and
+// the log says the card is held rather than leaving a stale card unexplained.
+func TestClaudeForcedRefreshDuringAHoldLogsHeld(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	claudeUsageProbe.holdUntil(time.Now().Add(time.Hour))
+
+	out := captureStdout(t, func() {
+		refreshClaudeUsageIfStale(WithClaudeUsageForceProbe(context.Background()), time.Now(), time.Time{},
+			probeTestToken, currentClaudeAccountFingerprint())
+	})
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("a forced refresh inside a hold sent %d requests", got)
+	}
+	if !strings.Contains(out, "refresh outcome=held") {
+		t.Fatalf("a forced refresh inside a hold did not log held: %q", out)
+	}
+}
+
+// A rung pays the PERSISTED (millisecond) instant of a debt the gate recorded at
+// nanosecond precision; paying it must clear the gate's debt too, or the paid
+// run is still "owed" in memory.
+func TestClaudeRunDebtRung_PayingTheDebtClearsTheGate(t *testing.T) {
+	resets := time.Now().Add(time.Hour)
+	var fail atomic.Bool
+	fail.Store(true)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":5,"resets_at":%d}]}`, resets.Unix())
+	})
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	triggerClaudeUsageProbeAfterRun()
+	claudeFreshnessWaitIdle(t)
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.NextAttemptAtMs == 0 {
+		t.Fatalf("precondition: no rung booked: %+v", snap)
+	}
+	stopClaudeRunDebtRetry()
+
+	fail.Store(false)
+	payOwedClaudeUsageRefreshAt(time.UnixMilli(snap.NextAttemptAtMs))
+	claudeFreshnessWaitIdle(t)
+
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("the paid debt is still on the gate: %v", owed)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("the paid debt is still on disk: %+v", snap)
 	}
 }

@@ -87,7 +87,8 @@ func TestClaudeOwedRefresh_SurvivesAgentRestart(t *testing.T) {
 	// finished run to the durable debt, not just the replay that reads it.
 	runEnded := time.Now()
 	triggerClaudeUsageProbeAfterRun()
-	waitForClaudeDebt(t, cache, 5*time.Second)
+	// Idle covers the whole settlement (owe, attempt, rung) without reading the
+	// file while it is written (see waitForClaudeDebtPaid).
 	claudeFreshnessWaitIdle(t)
 	snap := claudeCacheSnapshot(t, cache)
 	if snap.RefreshOwedAtMs < runEnded.Truncate(time.Millisecond).UnixMilli() {
@@ -147,7 +148,8 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 	seedClaudeProbeReading(t, cache, preSmoke)
 
 	settleOrDisarmClaudeSmokeRun(true)
-	waitForClaudeDebt(t, cache, 5*time.Second)
+	// Idle covers the whole settlement (owe, attempt, rung) without reading the
+	// file while it is written (see waitForClaudeDebtPaid).
 	claudeFreshnessWaitIdle(t)
 	snap := claudeCacheSnapshot(t, cache)
 	smokeDebt := snap.RefreshOwedAtMs
