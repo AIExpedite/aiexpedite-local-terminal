@@ -539,6 +539,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	}) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
+	// Again once the gather's seed may have restored a persisted wait and
+	// re-armed its rung: in a fresh process the call above finds no wait to
+	// compare against, so a credential rewritten before the restart would
+	// otherwise leave that rung standing until its time. A no-op when the call
+	// above already claimed this stamp's nudge.
+	nudgeClaudeCredentialChanged(credStamp)
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived

@@ -243,3 +243,34 @@ func TestClaudeUnpersistedRetryDelay(t *testing.T) {
 		t.Errorf("old debt: retry in %v, want the age backoff %v", got, want)
 	}
 }
+
+// A credential rewritten before a restart makes the persisted rung due on the
+// startup replay: the wait is restored from disk first, so the rewrite can
+// claim its nudge instead of the future rung standing for its full delay.
+func TestNudgeClaudeCredentialChanged_RestartAfterARewritePaysTheRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	// A stamp the fixture credential file does not carry: it was rewritten.
+	claudeUsageProbe.noteAuthWait(claudeCredStamp{modNs: 1, size: 1})
+	claudeBookRunDebtRung("", owed, now, claudeRungAfter, 10*time.Minute)
+	if snap, ok := loadClaudeRateLimitSnapshot(cache); !ok || snap.AuthWaitCredStampNs != 1 || snap.NextAttemptAtMs <= now.UnixMilli() {
+		t.Fatalf("snap=%+v, want the wait and a future rung persisted", snap)
+	}
+
+	// Restart: nothing in memory survives.
+	stopClaudeRunDebtRetry()
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	payOwedClaudeUsageRefreshAt(time.Now())
+	waitForClaudeCondition(t, 5*time.Second, "the restart left the rewritten credential's rung standing", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want one attempt for the rewrite", got)
+	}
+}

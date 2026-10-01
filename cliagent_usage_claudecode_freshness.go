@@ -884,6 +884,9 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	if trigger.honoursRung() && snap.NextAttemptAtMs > now.UnixMilli() {
 		if until := time.UnixMilli(snap.NextAttemptAtMs).Sub(now); until <= claudeRunDebtRetryHorizon() {
 			claudeArmRunDebtRetry(until, claudeDebtTriggerTimer)
+			// The wait was restored just above, so a credential rewritten before
+			// the restart can now claim its nudge and make that rung due.
+			nudgeClaudeCredentialChanged(identity.credStamp)
 			return claudeProbeResult{}
 		}
 	}
@@ -1015,13 +1018,26 @@ func claudeRunDebtRefused(fingerprint string, owed, now time.Time, refusal claud
 // proves nothing about this process's credential and clears no wait.
 func settleClaudeRunDebtAt(owed time.Time, result claudeProbeResult, probed claudeCredStamp) func(*claudeRateLimitSnapshot) bool {
 	retire := retireClaudeRefreshDebtAt(owed)
+	clearWait := clearClaudeProvenAuthWait(probed)
 	return func(snap *claudeRateLimitSnapshot) bool {
 		changed := retire(snap)
-		if result.credProven && !probed.isZero() &&
-			snap.AuthWaitCredStampNs == probed.modNs && snap.AuthWaitCredSize == probed.size {
-			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+		if result.credProven && clearWait(snap) {
 			changed = true
 		}
 		return changed
+	}
+}
+
+// clearClaudeProvenAuthWait drops the persisted credential wait only while it
+// is still for `probed`, the credential the endpoint just answered with a 2xx.
+// A wait persisted for any other (rewritten) credential is left alone, and a
+// cache with no matching wait is not rewritten.
+func clearClaudeProvenAuthWait(probed claudeCredStamp) func(*claudeRateLimitSnapshot) bool {
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if probed.isZero() || snap.AuthWaitCredStampNs != probed.modNs || snap.AuthWaitCredSize != probed.size {
+			return false
+		}
+		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+		return true
 	}
 }

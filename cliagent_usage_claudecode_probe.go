@@ -2140,6 +2140,17 @@ func probeClaudeUsageResult(
 		return result, false, time.Time{}
 	}
 	result.credProven = true
+	// A 2xx proves this credential even when its body yields no reading. The
+	// merge below clears the persisted wait for it on success; every other exit
+	// from here (unreadable, oversized, malformed, windowless, or unpersisted)
+	// must clear it too, or the next seed or restart restores a wait for a
+	// credential the endpoint just accepted. Scoped like the 429 hold above.
+	defer func() {
+		if result.code != claudeProbeOK {
+			mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), identity.fingerprint,
+				[]string{scopeBefore}, clearClaudeProvenAuthWait(identity.credStamp))
+		}
+	}()
 
 	// Read at most the cap + 1 byte so an oversized body is DETECTED rather than
 	// silently truncated into a JSON parse error — a truncated payload must never

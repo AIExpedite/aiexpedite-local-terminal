@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3842,4 +3843,52 @@ func TestClaudeUsageProbe_After401WaitsForACredentialRewrite(t *testing.T) {
 			t.Errorf("interval=%v after two unstamped 401s, want the doubled 2s", interval)
 		}
 	})
+}
+
+// A 2xx proves the credential even when its body yields no reading, so the
+// persisted wait for that credential is cleared on disk too: otherwise the next
+// seed or restart restores it and suppresses automatic probes of a credential
+// the endpoint just accepted. A wait for a different credential is kept.
+func TestClaudeUsageProbe_UnplottableTwoHundredClearsThePersistedWait(t *testing.T) {
+	stamp := claudeCredStamp{modNs: 100, size: 10}
+	other := claudeCredStamp{modNs: 200, size: 10}
+	bodies := map[string]string{
+		"malformed":  `{not json`,
+		"no windows": `{}`,
+		"oversized":  strings.Repeat(" ", claudeUsageProbeMaxBody+1),
+	}
+	for name, body := range bodies {
+		for _, tc := range []struct {
+			label    string
+			wait     claudeCredStamp
+			wantKept bool
+		}{{"same credential", stamp, false}, {"other credential", other, true}} {
+			t.Run(name+"/"+tc.label, func(t *testing.T) {
+				cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = io.WriteString(w, body)
+				})
+				seed, _ := json.Marshal(claudeRateLimitSnapshot{
+					Buckets:             map[string]claudeRateLimitBucket{},
+					AuthWaitCredStampNs: tc.wait.modNs, AuthWaitCredSize: tc.wait.size,
+				})
+				if err := os.WriteFile(cache, seed, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				id := claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp}
+				r, refreshed, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+					func() claudeUsageProbeIdentity { return id }, time.Time{}, true)
+				if refreshed || !r.credProven || r.code == claudeProbeOK {
+					t.Fatalf("result=%+v refreshed=%v, want a proven credential with no reading", r, refreshed)
+				}
+				snap, ok := loadClaudeRateLimitSnapshot(cache)
+				if !ok {
+					t.Fatal("cache unreadable after the probe")
+				}
+				kept := snap.AuthWaitCredStampNs == tc.wait.modNs && snap.AuthWaitCredSize == tc.wait.size
+				if kept != tc.wantKept {
+					t.Errorf("persisted wait=%d/%d, want kept=%v", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize, tc.wantKept)
+				}
+			})
+		}
+	}
 }
