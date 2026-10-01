@@ -2707,9 +2707,10 @@ func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 // reporting false when it never will, when the wait is too long to hold a timer
 // for, when another run already owns the trailing timer, or when the process is
 // shutting down. On false, the kind says what the debt should be scheduled as:
-// a wait too long to sleep through is booked on the ladder by claudeRunDebtRetryKindForRefusal;
-// every other refusal books nothing (an owned trailing timer belongs to a holder
-// that pays the same coalesced debt and books its own rung).
+// a wait too long to sleep through is classified by
+// claudeRunDebtRetryKindForRefusal and booked on the ladder; every other refusal
+// books nothing (an owned trailing timer belongs to a holder that pays the same
+// coalesced debt and books its own rung).
 //
 // Waiting rather than dropping is the point: the minimum interval is checked in
 // begin() before any baseline is consulted, so a routine gather (or another run)

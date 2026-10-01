@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1006,16 +1007,20 @@ const (
 // such read holds the file for microseconds, so a failure here is almost always
 // gone a few milliseconds later — whereas giving up loses a probe reading the
 // account-scoped endpoint was already asked for, or the debt charge and retry
-// rung the refresh ladder depends on. Elsewhere a rename failure is a real error
-// and the retries cost only the bounded backoff before it is returned.
+// rung the refresh ladder depends on.
+//
+// Only a permission error is retried — that is how the sharing violation
+// surfaces ("Access is denied"). Anything else (a missing temp file, a
+// cross-device rename) is permanent and returned at once, so a broken data dir
+// does not sleep under the cache lock on every write.
 func renameClaudeRateLimitCache(tmp, path string) error {
 	var err error
 	for attempt := 0; attempt < claudeRateLimitCacheRenameAttempts; attempt++ {
 		if attempt > 0 {
 			time.Sleep(claudeRateLimitCacheRenameBackoff)
 		}
-		if err = os.Rename(tmp, path); err == nil {
-			return nil
+		if err = os.Rename(tmp, path); err == nil || !errors.Is(err, fs.ErrPermission) {
+			return err
 		}
 	}
 	return err

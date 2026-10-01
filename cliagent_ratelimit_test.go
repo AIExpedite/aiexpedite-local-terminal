@@ -1756,3 +1756,17 @@ func TestRenameClaudeRateLimitCache_SurvivesABriefReader(t *testing.T) {
 		t.Fatalf("cache holds %q, want the new snapshot", got)
 	}
 }
+
+// A permanent rename failure is returned at once rather than retried under the
+// cache lock.
+func TestRenameClaudeRateLimitCache_PermanentFailureIsNotRetried(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now()
+	err := renameClaudeRateLimitCache(filepath.Join(dir, "missing.tmp"), filepath.Join(dir, "rl.json"))
+	if err == nil {
+		t.Fatal("renaming a missing temp file succeeded")
+	}
+	if elapsed := time.Since(start); elapsed >= claudeRateLimitCacheRenameBackoff {
+		t.Fatalf("a permanent failure took %s — it was retried", elapsed)
+	}
+}
