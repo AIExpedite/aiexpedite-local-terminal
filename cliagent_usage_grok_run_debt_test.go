@@ -278,16 +278,51 @@ func TestGrokRunDebt_FreeRungsSpendNoBudget(t *testing.T) {
 	}
 }
 
-func TestGrokRunDebt_AuthOutcomesRetireTheDebt(t *testing.T) {
+func TestGrokRunDebt_AuthOutcomesStopTheDebtWithoutReopeningOnEveryGather(t *testing.T) {
 	for _, outcome := range []string{grokLiveOutcomeNoLogin, grokLiveOutcomeUnauthorized, grokLiveOutcomeNoAccount} {
 		t.Run(outcome, func(t *testing.T) {
 			h := newGrokDebtHarness(t)
 			h.outcome.Store(outcome)
 			h.runAndSettle(time.Second)
-			if state := h.state(); state.owed() || grokRunDebtRetryPending() {
-				t.Fatalf("state = %+v, want the debt retired with no rung", state)
+			state := h.state()
+			if state.Attempts != grokRunDebtMaxAttempts || state.NextAttemptAtMs != 0 || grokRunDebtRetryPending() {
+				t.Fatalf("state = %+v, want the budget spent and no rung", state)
+			}
+
+			// Gathers keep finding the unread log record. Inside the cooling
+			// window none of them may read (an `unauthorized` read also spawns
+			// a login renewal).
+			for i := 0; i < 5; i++ {
+				h.advance(grokRefreshNudgeCooldown + time.Second)
+				nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+				h.idle()
+			}
+			if h.reads.Load() != 1 {
+				t.Fatalf("reads = %d, a stopped debt was reopened by the gather", h.reads.Load())
+			}
+
+			// After the longest rung the login gets one more try.
+			h.advance(grokRunDebtRetryLadder[len(grokRunDebtRetryLadder)-1])
+			nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+			h.idle()
+			if h.reads.Load() != 2 {
+				t.Fatalf("reads = %d, want one retry after the cooling window", h.reads.Load())
 			}
 		})
+	}
+}
+
+func TestGrokRunDebt_SuccessfulClickClearsAStoppedDebt(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeUnauthorized)
+	h.runAndSettle(time.Second)
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.advance(time.Second)
+	if got := grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock); got != grokLiveOutcomeOK {
+		t.Fatalf("click = %q", got)
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, a successful click must clear the stopped debt", state)
 	}
 }
 

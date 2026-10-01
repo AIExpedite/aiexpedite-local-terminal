@@ -512,6 +512,17 @@ func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
 	return state, state.owed()
 }
 
+// grokExhaustRunDebt spends the remaining budget of debt generation id and
+// books no rung, so it sits out grokDebtExhausted's cooling window.
+func grokExhaustRunDebt(id grokDebtID, label string) {
+	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+		if state.debtID() == id {
+			state.Attempts, state.NextAttemptAtMs = grokRunDebtMaxAttempts, 0
+		}
+	})
+	fmt.Printf("%s[cli-usage] grok refresh: stopped %s attempts=%d%s\n", colorYellow, label, grokRunDebtMaxAttempts, colorReset)
+}
+
 // grokRetireRunDebt drops the debt for a case no retry can fix.
 func grokRetireRunDebt(label string, attempts int) {
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
@@ -583,8 +594,13 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		// grokBillingReadOnce already retired the debt through the settle.
 		return booked, grokRetryNone
 	case grokLiveOutcomeNoLogin, grokLiveOutcomeNoAccount, grokLiveOutcomeUnauthorized:
-		// The auth notice covers these; no retry can pay them.
-		grokRetireRunDebt(outcome, attempts)
+		// The auth notice covers these and no retry can pay them. The debt's
+		// budget is spent rather than the debt dropped: a dropped debt lets the
+		// next gather's nudge open a new one at once, so a rejected login would
+		// cost a billing GET — and, for `unauthorized`, a `grok models` renewal
+		// — on every gather. Spent, it cools off like any exhausted debt
+		// (grokDebtExhausted); a successful click still clears it.
+		grokExhaustRunDebt(id, outcome)
 		return booked, grokRetryNone
 	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed:
 		return booked, grokRetryFree

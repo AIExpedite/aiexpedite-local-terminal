@@ -678,7 +678,9 @@ same bounded run-completion refresh Codex and Antigravity have:
   account shared with the Refresh click, and an `ok` (from either) retires the
   debt. `http_error` / `bad_response` spend budget; `login_busy` /
   `write_failed` / offline book free rungs; `no_login` / `no_account` /
-  `unauthorized` retire the debt (the auth notice covers them). A newer run
+  `unauthorized` spend the rest of the budget (the auth notice covers them; a
+  dropped debt would let every gather re-open it, and `unauthorized` spawns a
+  `grok models` renewal). A newer run
   moves the debt forward but keeps its attempt count, and an exhausted debt
   re-opens only after the longest rung has passed since its last read. A
   debt whose account is no longer signed in is retired unpaid; one older than
