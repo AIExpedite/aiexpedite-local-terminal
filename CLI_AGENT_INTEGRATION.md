@@ -671,9 +671,12 @@ same bounded run-completion refresh Codex and Antigravity have:
   spawns, and `grokUsageRunSettled` at exit, after
   `persistGrokManagedBillingSnapshot`. A run is covered when a reading for the
   signed-in account was taken at or after it **completed**; otherwise a debt is
-  saved to `grok_usage_freshness.json` and the worker starts. A smoke settles
-  only when a rung reached inference (an `end` frame or model text) and
-  otherwise disarms.
+  saved to `grok_usage_freshness.json` and the worker starts. Each live run
+  gets its own floor (a taken millisecond moves it earlier), so runs armed in
+  the same millisecond keep their own account. A smoke disarms only when every
+  rung failed **provably before inference** (a spawn that never started, a
+  rejected flag or framing, an auth refusal); a timeout, a no-envelope exit or
+  a provider error may have been charged, so it settles like any other run.
 - **Pay.** A process-wide single-flight worker spends at most 4 outbound reads
   per debt on the shared ladder (1 m / 2 m / 8 m / 30 m), at least 60 s apart.
   The read goes through `grokBillingReadOnce`, one `singleflight` flight per
@@ -691,8 +694,9 @@ same bounded run-completion refresh Codex and Antigravity have:
   last read. A debt whose account is no longer signed in is retired unpaid;
   one older than 6 h ages out.
 - **Smoke.** The smoke waits for its first read up to
-  `grokSmokeUsageSettleBudget` — the whole read budget, login renewal
-  included (30 s), bounded by its own context — because terminal-service only
+  `grokSmokeUsageSettleBudget` — two whole read budgets, login renewal
+  included, because a Refresh flight sent just before the smoke completed
+  must be outwaited before the smoke's own read; bounded by its own context — because terminal-service only
   asks for Grok usage on its own wakes: the signed `__cli_usage_refresh__` sent
   right after the smoke result must already find the number, even on a device
   whose token expired. That read bypasses the 60 s spacing, and a smoke that

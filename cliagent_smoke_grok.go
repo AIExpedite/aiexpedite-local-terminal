@@ -332,7 +332,7 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		Env: env, Cwd: isolatedCwd, Args: buildGrokNoToolsSmokeArgs(ladder[0], promptFile),
 	}, isolatedHome)
 
-	spawned, reachedInference := false, false
+	spawned, maySpend := false, false
 	// Armed before the first rung spawns: every rung that reaches inference
 	// spends credits, and none of them logs a number of its own. A contested
 	// credential surface bills an account the copied login may not name, so
@@ -363,7 +363,7 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		if usageFloor.IsZero() {
 			return
 		}
-		refresh := settleOrDisarmGrokSmokeRun(ctx, usageFloor, reachedInference)
+		refresh := settleOrDisarmGrokSmokeRun(ctx, usageFloor, maySpend)
 		fmt.Printf("%s[cli-smoke] grok usage refresh: %s%s\n", colorCyan, refresh, colorReset)
 	}()
 
@@ -388,13 +388,10 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		cancel()
 
 		result.ArgvShapeID = shape.ID
-		if stream := parseGrokSmokeStream(stdout); stream.Ended || stream.Text != "" {
-			// An `end` frame or any model text: this rung spent a turn,
-			// whatever the marker verdict.
-			reachedInference = true
-		}
-
 		category, diagnostic, matched := classifyGrokSmokeRun(timedOut, stdout, stderr, runErr, marker)
+		if grokSmokeRungMaySpend(stdout, runErr, timedOut, diagnostic) {
+			maySpend = true
+		}
 		if category == "" {
 			result.Status = cliSmokeStatusSuccess
 			result.MarkerMatched = matched
@@ -421,6 +418,34 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 
 	result.MarkerMatched = false
 	return finish(lastCategory, lastDiagnostic)
+}
+
+// grokSmokeRungMaySpend reports whether one rung may have spent credits, so
+// the smoke keeps its usage debt. An `end` frame or any model text spent a
+// turn, whatever the marker verdict. Otherwise only failures PROVEN to happen
+// before inference spend nothing: a spawn that never started, the CLI refusing
+// our flags or framing while parsing options, and an auth refusal. Everything
+// else — a timeout, a no-envelope exit, a provider error frame — may have been
+// accepted and charged with nothing on stdout to show for it, and a headless
+// run logs no billing record of its own, so disarming would leave the card
+// stale with no read owed.
+func grokSmokeRungMaySpend(stdout []byte, runErr error, timedOut bool, diagnostic string) bool {
+	if stream := parseGrokSmokeStream(stdout); stream.Ended || stream.Text != "" {
+		return true
+	}
+	if timedOut {
+		return true
+	}
+	var exitErr *exec.ExitError
+	if runErr != nil && !errors.As(runErr, &exitErr) {
+		// The child never ran (exec.Cmd.Start failed): nothing reached xAI.
+		return false
+	}
+	switch diagnostic {
+	case cliSmokeDiagnosticFlagRejected, cliSmokeDiagnosticFramingRejected, cliSmokeDiagnosticAuthError:
+		return false
+	}
+	return true
 }
 
 // grokSmokeFailureLogLine renders the device-local diagnostic line. It takes

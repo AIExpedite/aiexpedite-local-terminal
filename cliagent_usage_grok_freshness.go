@@ -102,6 +102,14 @@ var (
 	grokUsageHomeFingerprint = grokAccountFingerprintFor
 )
 
+// grokRunDebtPassWait is how long a debt pass waits for its read. A
+// same-account flight sent BEFORE the run completed (a Refresh click) cannot
+// pay the debt, yet the pass must outwait it before sending its own — one
+// request at a time — so the wait covers two whole reads, not one.
+func grokRunDebtPassWait() time.Duration {
+	return 2*grokRunDebtReadTimeout + grokRunDebtReadWaitSlack
+}
+
 // grokUsageFreshness is the persisted state. Every field is a number, the
 // hashed fingerprint, or a closed outcome code.
 type grokUsageFreshness struct {
@@ -170,7 +178,9 @@ var (
 	grokRefreshWorkerBypass bool
 
 	grokLiveRunsMu sync.Mutex
-	grokLiveRuns   = map[int64]int{}
+	// grokLiveRuns holds the armed floors; each live run has its own
+	// (armGrokUsageRunFloorFor), so the count is 0 or 1.
+	grokLiveRuns = map[int64]int{}
 	// grokLiveRunAccounts is the account each armed floor was spawned under,
 	// frozen at arm: an isolated child keeps its copied login for its whole
 	// life, so its debt belongs to that account even if the persistent login
@@ -297,16 +307,23 @@ func armGrokUsageRunFloorFor(now time.Time, credentialHome string) time.Time {
 	if !grokUsageRefreshEnabled.Load() {
 		return time.Time{}
 	}
-	floorMs := now.UnixMilli()
 	fingerprint := grokUsageCurrentFingerprint()
 	if credentialHome != "" {
 		fingerprint = grokUsageHomeFingerprint(credentialHome)
 	}
+	// Every live run gets a floor of its own, so each keeps the account it
+	// was spawned under: two runs armed in the same millisecond (isolated
+	// copies of different logins) must not share one binding. A taken
+	// millisecond moves the floor EARLIER, never later — a floor is a lower
+	// bound, and an earlier one only makes a reading prove less.
+	floor := now
 	grokLiveRunsMu.Lock()
-	grokLiveRuns[floorMs]++
-	if _, ok := grokLiveRunAccounts[floorMs]; !ok {
-		grokLiveRunAccounts[floorMs] = fingerprint
+	for grokLiveRuns[floor.UnixMilli()] > 0 {
+		floor = floor.Add(-time.Millisecond)
 	}
+	floorMs := floor.UnixMilli()
+	grokLiveRuns[floorMs] = 1
+	grokLiveRunAccounts[floorMs] = fingerprint
 	grokLiveRunsMu.Unlock()
 	grokFreshnessInFlight.Add(1)
 	go func() {
@@ -321,7 +338,7 @@ func armGrokUsageRunFloorFor(now time.Time, credentialHome string) time.Time {
 			}
 		})
 	}()
-	return now
+	return floor
 }
 
 // grokLiveRunAccount is the account an armed floor was spawned under; false
@@ -371,12 +388,8 @@ func grokOldestLiveFloorLocked() grokLiveFloor {
 func grokReleaseLiveRun(floorMs int64) grokLiveFloor {
 	grokLiveRunsMu.Lock()
 	defer grokLiveRunsMu.Unlock()
-	if n := grokLiveRuns[floorMs]; n > 1 {
-		grokLiveRuns[floorMs] = n - 1
-	} else {
-		delete(grokLiveRuns, floorMs)
-		delete(grokLiveRunAccounts, floorMs)
-	}
+	delete(grokLiveRuns, floorMs)
+	delete(grokLiveRunAccounts, floorMs)
 	return grokOldestLiveFloorLocked()
 }
 
@@ -660,7 +673,7 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout+grokRunDebtReadWaitSlack)
+	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtPassWait())
 	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow, time.UnixMilli(state.CompletionMs))
 	cancel()
 	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {
@@ -962,21 +975,23 @@ func grokAuthOutcome(outcome string) bool {
 
 // grokSmokeUsageSettleBudget bounds how long a passing smoke waits for its
 // first read, so the signed refresh that follows the smoke result already
-// finds the fresh number. It covers the WHOLE read, login renewal included
-// (grokRunDebtReadTimeout): on a device whose access token expired the read
-// must run `grok models` first, and terminal-service only asks for Grok usage
-// on its own wakes — a reading that lands after the smoke result is not seen
-// until the next one. Still bounded by the smoke's own context. A var for
-// tests.
-var grokSmokeUsageSettleBudget = grokRunDebtReadTimeout + grokRunDebtReadWaitSlack
+// finds the fresh number. It covers the WHOLE pass (grokRunDebtPassWait):
+// outwaiting a Refresh flight sent just before the smoke completed, then its
+// own read, login renewal included — on a device whose access token expired
+// the read must run `grok models` first, and terminal-service only asks for
+// Grok usage on its own wakes, so a reading that lands after the smoke result
+// is not seen until the next one. The common case returns as soon as the read
+// does; still bounded by the smoke's own context. A var for tests.
+var grokSmokeUsageSettleBudget = grokRunDebtPassWait()
 
-// settleOrDisarmGrokSmokeRun settles the smoke's run when a rung reached
-// inference — and then waits, bounded by grokSmokeUsageSettleBudget and ctx,
-// for its first read — or disarms it when no rung did. Returns a closed label
-// for the smoke's log line; the smoke verdict never depends on it. The caller
-// arms the floor, so a zero floor (refresh disabled) never reaches here.
-func settleOrDisarmGrokSmokeRun(ctx context.Context, floor time.Time, reachedInference bool) string {
-	if !reachedInference {
+// settleOrDisarmGrokSmokeRun settles the smoke's run when a rung may have
+// spent credits (grokSmokeRungMaySpend) — and then waits, bounded by
+// grokSmokeUsageSettleBudget and ctx, for its first read — or disarms it when
+// every rung failed before inference. Returns a closed label for the smoke's
+// log line; the smoke verdict never depends on it. The caller arms the floor,
+// so a zero floor (refresh disabled) never reaches here.
+func settleOrDisarmGrokSmokeRun(ctx context.Context, floor time.Time, maySpend bool) string {
+	if !maySpend {
 		disarmGrokUsageRunFloor(floor)
 		return "not_owed"
 	}

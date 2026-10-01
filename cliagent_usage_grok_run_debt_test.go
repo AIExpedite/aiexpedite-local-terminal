@@ -640,7 +640,7 @@ func TestGrokRunDebt_OkWithoutAPercentagePaysNothing(t *testing.T) {
 func TestGrokRunDebt_CallerTimeoutSpendsNothingAndTheFlightStillPays(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	h.block = make(chan struct{})
-	grokRunDebtReadWaitSlack = -grokRunDebtReadTimeout + 20*time.Millisecond // the pass waits 20 ms
+	grokRunDebtReadWaitSlack = -2*grokRunDebtReadTimeout + 20*time.Millisecond // the pass waits 20 ms
 
 	floor := armGrokUsageRunFloor(h.clock())
 	h.advance(time.Second)
@@ -1054,5 +1054,72 @@ func TestGrokBillingReadOnce_ClockRollbackDoesNotWait(t *testing.T) {
 	}
 	if got := h.reads.Load(); got != 1 {
 		t.Fatalf("reads = %d, want 1", got)
+	}
+}
+
+// Two isolated runs that copied different logins and armed in the same
+// millisecond each keep their own account: the second run's exit under its
+// own (still signed-in) login owes a read, the first one's does not.
+func TestGrokRunDebt_SameMillisecondFloorsKeepTheirOwnAccounts(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	orig := grokUsageHomeFingerprint
+	t.Cleanup(func() { grokUsageHomeFingerprint = orig })
+	grokUsageHomeFingerprint = func(home string) string { return "fp-" + home }
+
+	adaFloor := armGrokUsageRunFloorFor(h.clock(), "ada")
+	bobFloor := armGrokUsageRunFloorFor(h.clock(), "bob")
+	if adaFloor.UnixMilli() == bobFloor.UnixMilli() {
+		t.Fatalf("both runs share floor %d", adaFloor.UnixMilli())
+	}
+	if bobFloor.After(h.clock()) {
+		t.Fatalf("bob's floor %s is after its arm %s; a floor may only move earlier", bobFloor, h.clock())
+	}
+	h.signIn("fp-bob")
+	h.advance(time.Second)
+	if !grokUsageRunSettled(bobFloor) {
+		t.Fatal("bob's run under bob's login must owe a read")
+	}
+	h.idle()
+	if grokUsageRunSettled(adaFloor) {
+		t.Fatal("ada's run opened a debt against bob's login")
+	}
+	h.idle()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want only bob's run paid", h.reads.Load())
+	}
+}
+
+// A smoke whose completion finds a same-account Refresh flight already in the
+// air must outwait that flight AND send its own read inside its budget, so the
+// signed refresh after the smoke already finds the post-completion reading.
+func TestGrokRunDebt_SmokeOutwaitsAPreCompletionFlight(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	const readTook = 200 * time.Millisecond
+	grokRunDebtReadTimeout, grokRunDebtReadWaitSlack = 250*time.Millisecond, 50*time.Millisecond
+	grokSmokeUsageSettleBudget = grokRunDebtPassWait()
+	read := grokBillingLiveReadFn
+	grokBillingLiveReadFn = func(ctx context.Context, path string, now func() time.Time) string {
+		outcome := read(ctx, path, now)
+		time.Sleep(readTook)
+		return outcome
+	}
+	floor := armGrokUsageRunFloor(h.clock())
+
+	click := make(chan string, 1)
+	go func() { click <- grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock, time.Time{}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reads.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	h.advance(time.Second)
+	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != grokLiveOutcomeOK {
+		t.Fatalf("smoke refresh = %q, want ok after outwaiting the earlier flight", got)
+	}
+	if got := <-click; got != grokLiveOutcomeOK {
+		t.Fatalf("click = %q, want ok", got)
+	}
+	if got := h.reads.Load(); got != 2 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the smoke's own read to pay the debt", got, h.state())
 	}
 }
