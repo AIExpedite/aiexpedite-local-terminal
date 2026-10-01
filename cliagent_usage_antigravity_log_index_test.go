@@ -1359,3 +1359,110 @@ func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
 		t.Errorf("block=%q ok=%v, want the detached run's own block", block, ok)
 	}
 }
+
+// helperPIDBlockAt is one run's block whose startup line carries at as its
+// glog time, as agy writes it.
+func helperPIDBlockAt(pid int, at time.Time) string {
+	return at.In(time.Local).Format("I0102 15:04:05.000000") +
+		fmt.Sprintf(" 1 main.go:1] Starting language server process with pid %d\n", pid)
+}
+
+// An unstamped (legacy) log has no name-second, so a remembered PID whose
+// start token can no longer be read is matched by its block's own startup
+// time: a block that started before the remembered run exited is that run, one
+// that started after it (or whose start cannot be read) is a user's run on a
+// reused PID and must be owed.
+func TestAntigravityCandidate_LegacyLogReusedPIDNeedsItsBlockTime(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		block     func(pid int, exited time.Time) string
+		candidate bool
+	}{
+		{"block started before the exit is ours", func(pid int, exited time.Time) string {
+			return helperPIDBlockAt(pid, exited.Add(-time.Minute))
+		}, false},
+		{"block started after the exit is a direct run", func(pid int, exited time.Time) string {
+			return helperPIDBlockAt(pid, exited.Add(time.Minute))
+		}, true},
+		{"block with no start time is a direct run", func(pid int, _ time.Time) string {
+			return fmt.Sprintf("Starting language server process with pid %d\n", pid)
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := helperIsolateLogIndex(t)
+			antigravityProcessStartToken = func(int) (string, error) { return "", fmt.Errorf("no such process") }
+			antigravityCandidateProbe = func(int, string) processProbeResult { return processGone }
+
+			noteAntigravityManagedPID(7301)
+			noteAntigravityManagedPIDExited(7301)
+			exited := time.Now().Truncate(time.Second)
+
+			legacy := h.write(t, "legacy.log", tc.block(7301, exited), exited.Add(2*time.Minute), false)
+			h.pass(exited.Add(2*time.Minute+10*time.Second), 0)
+			class, _ := helperEntryClass(legacy)
+			if got := class == antigravityLogCandidate; got != tc.candidate {
+				t.Fatalf("class=%v, want candidate=%v", class, tc.candidate)
+			}
+			if !tc.candidate {
+				return
+			}
+			if res := h.pass(exited.Add(10*time.Minute), 0); res.owed.IsZero() {
+				t.Error("the user's run on an exited reused PID in a legacy log was never owed")
+			}
+		})
+	}
+}
+
+// A run appended to an old unstamped (legacy) log is seen even when 32
+// stamped logs fill the newest names: legacy logs keep reserved watched slots,
+// so the settled legacy entry is re-stat'ed and reclassified.
+func TestAntigravityDiscovery_ReservesWatchedSlotsForLegacyLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	start := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	noteAntigravityManagedPID(70001)
+	legacy := h.write(t, "legacy.log", helperPIDBlock(70001), start, false)
+	for i := 0; i < 40; i++ {
+		at := start.Add(time.Duration(i+1) * time.Second)
+		h.write(t, helperLogName(at), helperPIDBlock(70001), at, false)
+	}
+	observed := start.Add(time.Hour)
+	h.pass(observed.Add(time.Minute), observed.UnixMilli())
+
+	h.setLive(70002, true)
+	appended := observed.Add(5 * time.Minute)
+	h.write(t, "legacy.log", helperPIDBlock(70002), appended, true)
+	h.pass(appended.Add(10*time.Second), observed.UnixMilli())
+	if class, _ := helperEntryClass(legacy); class != antigravityLogCandidate {
+		t.Fatalf("class=%v, want the appended legacy log reclassified as a candidate", class)
+	}
+}
+
+// With more legacy logs than reserved slots, one written again after the
+// reading rises into the slots and is classified on the pass it rises in.
+func TestAntigravityDiscovery_LegacyLogRisingIntoTheWatchedSetIsClassified(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	orig := antigravityLegacyStatTTL
+	antigravityLegacyStatTTL = 0
+	t.Cleanup(func() { antigravityLegacyStatTTL = orig })
+
+	start := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	noteAntigravityManagedPID(70001)
+	oldest := h.write(t, "legacy-00.log", helperPIDBlock(70001), start, false)
+	for i := 1; i <= antigravityLegacyReadReserve+2; i++ {
+		h.write(t, fmt.Sprintf("legacy-%02d.log", i), helperPIDBlock(70001), start.Add(time.Duration(i)*time.Minute), false)
+	}
+	observed := start.Add(time.Hour)
+	h.pass(observed.Add(time.Minute), observed.UnixMilli())
+	h.pass(observed.Add(2*time.Minute), observed.UnixMilli())
+	if _, tracked := helperEntryClass(oldest); tracked {
+		t.Fatal("the oldest legacy log was still watched; the test needs it outside the reserved slots")
+	}
+
+	h.setLive(70002, true)
+	appended := observed.Add(5 * time.Minute)
+	h.write(t, "legacy-00.log", helperPIDBlock(70002), appended, true)
+	h.pass(appended.Add(10*time.Second), observed.UnixMilli())
+	if class, _ := helperEntryClass(oldest); class != antigravityLogCandidate {
+		t.Fatalf("class=%v, want the risen legacy log classified as a candidate", class)
+	}
+}

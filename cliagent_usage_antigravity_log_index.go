@@ -141,6 +141,9 @@ type antigravityTrackedPID struct {
 	// exitedAt is when a remembered own or managed run ended; zero while it
 	// runs, and always zero for a candidate's PID.
 	exitedAt time.Time
+	// startedAt is, for a candidate's PID in an unstamped (legacy) log, when
+	// its block's startup line says the run started (zero = unknown).
+	startedAt time.Time
 }
 
 type antigravityLogEntry struct {
@@ -845,7 +848,8 @@ func antigravityPushPID(ring []antigravityTrackedPID, p antigravityTrackedPID) [
 // inside that same second is indistinguishable from ours by time alone. The
 // ambiguous second is therefore read as foreign, which costs one refresh
 // nobody owed; reading it as ours would swallow a user's run silently, which
-// is the failure this index exists to prevent.
+// is the failure this index exists to prevent. For the same reason an unknown
+// start (zero at) cannot be matched to a remembered run that has ended.
 func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string, at time.Time) bool {
 	for _, known := range ring {
 		if known.pid != pid {
@@ -854,8 +858,8 @@ func antigravityPIDIn(ring []antigravityTrackedPID, pid int, token string, at ti
 		if known.token != "" && token != "" {
 			return known.token == token
 		}
-		return known.exitedAt.IsZero() || at.IsZero() ||
-			at.Before(known.exitedAt.Truncate(time.Second))
+		return known.exitedAt.IsZero() ||
+			(!at.IsZero() && at.Before(known.exitedAt.Truncate(time.Second)))
 	}
 	return false
 }
@@ -947,10 +951,30 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 	// Listing and stat'ing happen before the lock: names only, then the few
 	// files the pass needs.
 	listings := map[string][]string{}
+	// recentLegacy holds, per base, the unstamped names most recently written
+	// (at most antigravityLegacyReadReserve): they get watched slots of their
+	// own, as antigravityPIDBlock reserves reads for them, so a run appended to
+	// an existing legacy log is still seen.
+	recentLegacy := map[string]map[string]bool{}
 	for _, base := range bases {
-		if names, ok := antigravityListLogNames(base); ok {
-			listings[base] = names
+		names, ok := antigravityListLogNames(base)
+		if !ok {
+			continue
 		}
+		listings[base] = names
+		stampedEnd := len(names)
+		for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
+			stampedEnd--
+		}
+		if stampedEnd == len(names) {
+			continue
+		}
+		logs := antigravityLegacyLogMtimes(antigravityLogDir(base), names[stampedEnd:], false)
+		recent := map[string]bool{}
+		for i := len(logs) - 1; i >= 0 && len(recent) < antigravityLegacyReadReserve; i-- {
+			recent[logs[i].name] = true
+		}
+		recentLegacy[base] = recent
 	}
 
 	lockAntigravityLogIndex()
@@ -965,8 +989,9 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		// for an unstamped (legacy) name, so such names never crowd out the
 		// stamped ones every current agy writes.
 		orderAt time.Time
+		legacy  bool
 	}
-	var newest []newestName
+	var newest, legacyNewest []newestName
 	for _, base := range bases {
 		names, listed := listings[base]
 		if !listed {
@@ -984,7 +1009,11 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 			if !stamped {
 				orderAt = time.Time{}
 			}
-			newest = append(newest, newestName{path: path, base: base, nameAt: nameAt, orderAt: orderAt})
+			if stamped {
+				newest = append(newest, newestName{path: path, base: base, nameAt: nameAt, orderAt: orderAt})
+			} else if recentLegacy[base][name] {
+				legacyNewest = append(legacyNewest, newestName{path: path, base: base, nameAt: nameAt, legacy: true})
+			}
 			isNew := false
 			if !idx.primed {
 				// Startup scan: names at or after the cached reading, less the
@@ -1018,12 +1047,17 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		antigravityClassifyLogLocked(entry, stat, now, observedMs, &res)
 	}
 
-	// Watched set: the newest names, then every owned / candidate / noPID /
-	// grace entry. A size or mtime change reclassifies the file.
+	// Watched set: the newest names (a reserved share for the most recently
+	// written legacy ones), then every owned / candidate / noPID / grace
+	// entry. A size or mtime change reclassifies the file.
 	sort.SliceStable(newest, func(i, j int) bool { return newest[i].orderAt.After(newest[j].orderAt) })
-	if len(newest) > antigravityWatchedNewest {
-		newest = newest[:antigravityWatchedNewest]
+	if len(legacyNewest) > antigravityLegacyReadReserve {
+		legacyNewest = legacyNewest[:antigravityLegacyReadReserve]
 	}
+	if limit := antigravityWatchedNewest - len(legacyNewest); len(newest) > limit {
+		newest = newest[:limit]
+	}
+	newest = append(newest, legacyNewest...)
 	watchedNewest := map[string]bool{}
 	for _, n := range newest {
 		watchedNewest[n.path] = true
@@ -1039,7 +1073,11 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		}
 		prevStat, seen := idx.newestStat[n.path]
 		idx.newestStat[n.path] = stat
-		if seen && prevStat != stat {
+		// A legacy name not watched last pass rose into its reserved slots
+		// because it was written again; written after the reading, that write
+		// may be a run nobody has refreshed for.
+		risen := !seen && n.legacy && (observedMs == 0 || stat.mtime.After(observed))
+		if (seen && prevStat != stat) || risen {
 			entry := &antigravityLogEntry{path: n.path, base: n.base, nameAt: n.nameAt, firstSeen: now}
 			idx.entries[n.path] = entry
 			delete(idx.newestStat, n.path)
@@ -1118,6 +1156,10 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 	overflow := false
 	allOwn := true
 	for _, pid := range pids {
+		at := startedBy
+		if at.IsZero() {
+			at = antigravityBlockStartedAt(body, pid)
+		}
 		// The start token tells a remembered own or managed process from a
 		// user's run the OS gave the same PID.
 		known := antigravityTrackedFind(entry.pids, pid)
@@ -1128,11 +1170,11 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 		case antigravityPIDRememberedLocked(pid):
 			token, looked = antigravityCurrentStartToken(pid), true
 		}
-		if antigravityPIDIn(idx.ownPIDs, pid, token, startedBy) || antigravityOwnBlockLocked(entry.path, pid) {
+		if antigravityPIDIn(idx.ownPIDs, pid, token, at) || antigravityOwnBlockLocked(entry.path, pid) {
 			continue
 		}
 		allOwn = false
-		if antigravityPIDIn(idx.managedPIDs, pid, token, startedBy) {
+		if antigravityPIDIn(idx.managedPIDs, pid, token, at) {
 			continue
 		}
 		if known != nil {
@@ -1146,7 +1188,11 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 		if !looked {
 			token = antigravityCurrentStartToken(pid)
 		}
-		foreign = append(foreign, antigravityTrackedPID{pid: pid, token: token})
+		tracked := antigravityTrackedPID{pid: pid, token: token}
+		if startedBy.IsZero() {
+			tracked.startedAt = at
+		}
+		foreign = append(foreign, tracked)
 	}
 	switch {
 	case len(pids) == 0:
@@ -1250,7 +1296,11 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 	startedBy := antigravityLogStartedBy(entry)
 	kept := entry.pids[:0]
 	for _, p := range entry.pids {
-		if !antigravityPIDIn(idx.managedPIDs, p.pid, p.token, startedBy) && !antigravityPIDIn(idx.ownPIDs, p.pid, p.token, startedBy) {
+		at := startedBy
+		if at.IsZero() {
+			at = p.startedAt
+		}
+		if !antigravityPIDIn(idx.managedPIDs, p.pid, p.token, at) && !antigravityPIDIn(idx.ownPIDs, p.pid, p.token, at) {
 			kept = append(kept, p)
 		}
 	}
@@ -1867,4 +1917,22 @@ func antigravityLineTime(line []byte, at time.Time) time.Time {
 func antigravityLogStartedBy(entry *antigravityLogEntry) time.Time {
 	at, _ := antigravityLogNameTime(filepath.Base(entry.path), time.Time{})
 	return at
+}
+
+// antigravityBlockStartedAt is when pid's block in an unstamped log says its
+// run started: the glog time of its startup line, to the second. Zero when the
+// block or its time is missing, so the run's start stays unknown.
+func antigravityBlockStartedAt(body []byte, pid int) time.Time {
+	want := strconv.Itoa(pid)
+	for _, loc := range antigravityLanguageServerPIDPattern.FindAllSubmatchIndex(body, -1) {
+		if string(body[loc[2]:loc[3]]) != want {
+			continue
+		}
+		line := body[bytes.LastIndexByte(body[:loc[0]], '\n')+1 : loc[0]]
+		if !antigravityGlogPrefix.Match(bytes.TrimSpace(line)) {
+			return time.Time{}
+		}
+		return antigravityLineTime(line, time.Now())
+	}
+	return time.Time{}
 }
