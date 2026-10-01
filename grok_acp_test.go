@@ -18,12 +18,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2121,5 +2123,144 @@ func TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog(t *testing.T) {
 	case <-session.streamDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("readStream did not exit after stdout/stderr closed")
+	}
+}
+
+// An ACP session logs no billing record of its own (the `no-record` merge), so
+// its exit owes one live billing read — paid off the exit path: the terminal
+// `grok_acp_ended` frame goes out while that read is still in flight.
+func TestGrokACPLifecycle_ExitOwesOneBillingReadWithoutDelayingEnded(t *testing.T) {
+	home := isolateGrok(t)
+	seedGrokHomeWithLogin(t, home)
+	t.Setenv("XAI_API_KEY", "")
+	withTempGrokSessionStore(t)
+	grokEnableRunRefresh(t)
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	calls := grokBillingServer(t, func(string) (int, string) {
+		entered <- struct{}{}
+		<-release
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	binDir := t.TempDir()
+	mockName := "grok"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(binDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-quick-exit")
+
+	var mu sync.Mutex
+	ended := false
+	m := NewGrokACPManager(nil)
+	id := fmt.Sprintf("grok-usage-refresh-test-%d", time.Now().UnixNano())
+	if err := m.Start(id, t.TempDir(), nil, "ws", "uid", GrokStartOptions{}, func(res resultMsg) {
+		if res.Type == "grok_acp_ended" {
+			mu.Lock()
+			ended = true
+			mu.Unlock()
+		}
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the session's exit never owed a billing read")
+	}
+	if !waitUntil(time.Now().Add(10*time.Second), func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return ended
+	}) {
+		t.Fatal("grok_acp_ended waited on the billing read")
+	}
+	once.Do(func() { close(release) })
+	grokUsageRefreshWaitFor(10 * time.Second)
+
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("billing reads = %d, want exactly one", got)
+	}
+	var state grokUsageFreshness
+	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
+		t.Fatalf("debt left after the paid read: %+v", state)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].Unknown || usage.Metrics[0].Consumed == nil {
+		t.Fatalf("row after the ACP refresh = %+v, want a numeric reading", usage)
+	}
+}
+
+// An ACP session whose credentials are contested (API-key fallback with an
+// inherited XAI_API_KEY) may bill an account the copied login does not name:
+// it arms no refresh debt, so no billing read (or renewal) is spent on that
+// login. The same session without the override owes and pays one read.
+func TestGrokACPLifecycle_ContestedCredentialsOweNoRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		key       string
+		wantReads int64
+	}{
+		{name: "copied login only", key: "", wantReads: 1},
+		{name: "api key fallback", key: "xai-contested-sentinel", wantReads: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newGrokDebtHarness(t)
+			orig := grokUsageHomeFingerprint
+			t.Cleanup(func() { grokUsageHomeFingerprint = orig })
+			grokUsageHomeFingerprint = func(string) string { return h.fingerprint() }
+
+			realHome := t.TempDir()
+			seedGrokHomeWithLogin(t, realHome)
+			t.Setenv("GROK_HOME", realHome)
+			t.Setenv("XAI_API_KEY", tc.key)
+			withTempGrokSessionStore(t)
+
+			testExe, err := os.Executable()
+			if err != nil {
+				t.Fatalf("os.Executable: %v", err)
+			}
+			binDir := t.TempDir()
+			mockName := "grok"
+			if runtime.GOOS == "windows" {
+				mockName += ".exe"
+			}
+			if err := copyTestBinary(testExe, filepath.Join(binDir, mockName)); err != nil {
+				t.Fatalf("copy mock binary: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(mockCLIEnvVar, "grok-acp-billing")
+
+			m := NewGrokACPManager(nil)
+			id := fmt.Sprintf("grok-contested-test-%d", time.Now().UnixNano())
+			opts := GrokStartOptions{AllowAPIKeyFallback: tc.key != ""}
+			if err := m.Start(id, t.TempDir(), nil, "ws", "uid", opts, func(resultMsg) {}); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if !waitUntil(time.Now().Add(10*time.Second), func() bool { return m.ActiveCount() == 0 }) {
+				t.Fatal("managed Grok mock did not exit")
+			}
+			if !waitUntil(time.Now().Add(5*time.Second), func() bool { return h.reads.Load() >= tc.wantReads }) {
+				t.Fatalf("reads = %d, want %d", h.reads.Load(), tc.wantReads)
+			}
+			h.idle()
+			if got := h.reads.Load(); got != tc.wantReads {
+				t.Fatalf("reads = %d, want %d", got, tc.wantReads)
+			}
+			if state := h.state(); tc.wantReads == 0 && (state.owed() || state.RunFloorMs != 0) {
+				t.Fatalf("state = %+v, a contested session must arm nothing", state)
+			}
+		})
 	}
 }

@@ -1156,3 +1156,36 @@ func TestGrokVersionProbes_AllRouteThroughTheShimAwareProbe(t *testing.T) {
 		}
 	}
 }
+
+// Only a failure proven to happen before inference lets the smoke disarm its
+// usage floor; an ambiguous one keeps the debt, because a headless run that
+// was charged logs no billing record of its own.
+func TestGrokSmokeRungMaySpend(t *testing.T) {
+	exit := grokExitError(t)
+	spawnFailed := &exec.Error{Name: "grok", Err: exec.ErrNotFound}
+	cases := []struct {
+		name       string
+		stdout     string
+		runErr     error
+		timedOut   bool
+		diagnostic string
+		want       bool
+	}{
+		{"end frame", `{"type":"end"}`, nil, false, cliSmokeDiagnosticNone, true},
+		{"model text", `{"type":"text","text":"nope"}`, exit, false, cliSmokeDiagnosticNoEnvelope, true},
+		{"timeout before any frame", "", exit, true, cliSmokeDiagnosticTimeout, true},
+		{"no-envelope exit", "", exit, false, cliSmokeDiagnosticNoEnvelope, true},
+		{"provider error frame", `{"type":"error","message":"api error"}`, exit, false, cliSmokeDiagnosticProviderError, true},
+		{"flag rejected", "", exit, false, cliSmokeDiagnosticFlagRejected, false},
+		{"framing rejected", "", exit, false, cliSmokeDiagnosticFramingRejected, false},
+		{"auth refusal", `{"type":"error","message":"Not logged in."}`, exit, false, cliSmokeDiagnosticAuthError, false},
+		{"spawn failed", "", spawnFailed, false, cliSmokeDiagnosticNoEnvelope, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := grokSmokeRungMaySpend([]byte(tc.stdout), tc.runErr, tc.timedOut, tc.diagnostic); got != tc.want {
+				t.Fatalf("grokSmokeRungMaySpend = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}

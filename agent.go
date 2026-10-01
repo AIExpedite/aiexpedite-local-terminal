@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.3"
+var Version = "v1.1.4"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -191,6 +191,13 @@ func StartAgent(cfg *Config) {
 	// (cliagent_usage_antigravity_log_index.go).
 	payOwedAntigravityUsageRefresh()
 	startAntigravityDiscovery()
+	// And for Grok: its headless runs log no usage figure, so every finished
+	// run owes one live billing read (cliagent_usage_grok_freshness.go). Re-arm
+	// a schedule the previous process booked, or pay one attempt for a run that
+	// settled — or was cut off — just before a restart or self-update. After
+	// isOffline is published above, so the attempt honours offline mode.
+	SetGrokUsageRefreshEnabled(true)
+	payOwedGrokUsageRefresh()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

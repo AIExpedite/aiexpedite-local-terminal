@@ -1528,6 +1528,47 @@ mcps = false
 		t.Fatalf("post-update usage freshness did not advance: pre=%q (%v) post=%q (%v)",
 			pre.Metrics[0].ObservedAt, preErr, post.Metrics[0].ObservedAt, postErr)
 	}
+
+	// The records above carry no percentage (Grok ≥ 1.0.40), so the row is
+	// Unknown however fresh. With the run-completion refresh armed — as
+	// StartAgent arms it — the same terminal-managed smoke owes one live billing
+	// read, and the signed refresh after it reports that number.
+	if !post.Metrics[0].Unknown {
+		t.Fatalf("fixture drifted: the percent-less smoke record plotted a number: %+v", post.Metrics[0])
+	}
+	grokEnableRunRefresh(t)
+	reads := grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
+	if _, _, _, err := captureSessionWithConfig(t, "grok-maintenance-smoke-v2", "grok", dispatchedSmokeArgs, projectCwd, &Config{
+		EnableGrokAlwaysApprove: true,
+	}); err != nil {
+		t.Fatalf("refreshed session: %v", err)
+	}
+	if !grokUsageRefreshWaitFor(15 * time.Second) {
+		t.Fatal("the session's refresh debt never settled")
+	}
+	if got := atomic.LoadInt32(reads); got != 1 {
+		t.Fatalf("billing reads = %d, want exactly one for the finished session", got)
+	}
+	resetVersionProbeCache()
+	usage, errs := GatherCLIAgentUsageOnly(context.Background())
+	if len(errs) != 0 || len(usage) != 1 || len(usage[0].Metrics) != 1 {
+		t.Fatalf("refreshed usage = %+v errors=%+v", usage, errs)
+	}
+	_, normalized, normalizedErrs, err := prepareCLIUsageRefreshResult(
+		"signed-refresh-secret", "refreshed", time.Now().UnixMilli(), true, usage, errs)
+	if err != nil || len(normalizedErrs) != 0 || len(normalized) != 1 || len(normalized[0].Metrics) != 1 {
+		t.Fatalf("refreshed signed refresh: usage=%+v errors=%+v err=%v", normalized, normalizedErrs, err)
+	}
+	refreshed := normalized[0].Metrics[0]
+	if refreshed.Unknown || refreshed.Consumed == nil || *refreshed.Consumed != 9 {
+		t.Fatalf("signed refresh after the session = %+v, want the debt's numeric reading", refreshed)
+	}
+	if observed, err := time.Parse(time.RFC3339Nano, refreshed.ObservedAt); err != nil || !observed.After(postObserved) {
+		t.Fatalf("refreshed observedAt %q (%v) does not postdate the previous smoke %s", refreshed.ObservedAt, err, postObserved)
+	}
 }
 
 func TestSessionLifecycle_GrokOrdinaryNoToolsPreservesNormalAuthAndHome(t *testing.T) {

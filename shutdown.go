@@ -69,6 +69,7 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	stopAntigravityRunDebtRetry()
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()
+	stopGrokRunDebtRetry()
 	persistClaudeRunDebtForShutdown()
 	// Antigravity's discovery tick stops, then its in-flight state writes (a
 	// run's settle, an arm persisting its floor) get a bounded drain, so a
@@ -76,6 +77,10 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// floor it persisted is adopted by the next one. The drain takes at most half
 	// of the caller's remaining deadline, leaving the rest for notifyOffline.
 	drainAntigravityUsageWrites(ctx)
+	// The same for Grok's run-completion refresh: an async arm or settle still
+	// writing its debt must land before an update hand-off, or the next process
+	// has nothing to adopt.
+	drainGrokUsageWrites(ctx)
 	// No usage hint goes out after this; a pending one is recovered by the next
 	// process from the cache it rotates.
 	stopCLIUsagePropagator()

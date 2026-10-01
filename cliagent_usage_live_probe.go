@@ -132,7 +132,7 @@ func cliUsageRefreshWantsLiveProbe(cmd commandMsg) bool {
 var (
 	probeCodexRateLimitsLiveFn   = probeCodexRateLimitsLive
 	probeAntigravityQuotaLiveFn  = probeAntigravityQuotaLive
-	probeGrokBillingLiveFn       = probeGrokBillingLive
+	probeGrokBillingLiveFn       = probeGrokBillingLiveShared
 	probeMuseCodeUsageLiveFn     = probeMuseCodeUsageLive
 	warmCLIAgentModelDiscoveryFn = warmCLIAgentModelDiscovery
 	liveProbeDetectedAgents      = gatherCLIAgents

@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -253,6 +254,30 @@ func readJSONFile(path string, into any) bool {
 		return false
 	}
 	return unmarshalJSON(b, into)
+}
+
+// writeJSONFileAtomic is readJSONFile's writer: it replaces path with value's
+// JSON through a temp file and a rename, so a reader — or the next process
+// after a crash or self-update — never sees a truncated file. The pid +
+// nanosecond suffix keeps concurrent writers off one temp file. Owner-only
+// (0600); false on any error.
+func writeJSONFileAtomic(path string, value any) bool {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return false
+	}
+	out, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return false
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return false
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return false
+	}
+	return true
 }
 
 // expandHome joins a home dir with a relative path, returning "" if either

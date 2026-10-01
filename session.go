@@ -186,6 +186,13 @@ type CLISession struct {
 	codexCaptureVersion string
 	codexUsageSettled   atomic.Bool
 
+	// grokUsageFloorMs is the run floor a credit-spending grok session armed
+	// before its child spawned (armGrokUsageRunFloor; 0 for every other
+	// session and for grok subcommand carve-outs). grokUsageSettled makes the
+	// exit settle it exactly once.
+	grokUsageFloorMs atomic.Int64
+	grokUsageSettled atomic.Bool
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -734,6 +741,9 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// in both cases only while nothing else the child carries contests it.
 	var grokLimitScope grokLimitNoticeScope
 	var grokProducerContested bool
+	// grokUsageContested: the child may bill an account the login it carries
+	// does not name, so a live billing read could not pay for this run.
+	var grokUsageContested bool
 	if isGrokCommand(command) && isolatedGrokHome != "" {
 		// From the credential surface the smoke child is SPAWNED with, not the
 		// isolated home alone: sanitizeGrokMaintenanceSmokeEnv strips the env
@@ -746,6 +756,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// The SAME verdict gates the billing merge on exit, resolved once from
 		// the pre-spawn surface rather than re-derived after the run.
 		grokProducerContested = grokManagedRunProducerContested(managedLaunch, isolatedGrokHome)
+		grokUsageContested = grokProducerContested
 	}
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		// The identity is CAPTURED here and re-asserted as-is for the life of the
@@ -798,6 +809,8 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		ensureGrokBillingIdentityNamed(grokBase, directIdentity)
 		// Same single decision, third use: a contested arm caches no notice.
 		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
+		// Fourth use: an override (or unresolved) run owes the login no read.
+		grokUsageContested = strings.EqualFold(directIdentity, grokContestedBillingIdentity)
 	}
 
 	// Pinned BEFORE the spawn, never read from the struct literal below. A
@@ -808,6 +821,16 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// installer holds none of our locks, so the file can also be replaced
 	// between this pin and Start().
 	codexCaptureVersionPin := codexCaptureVersionPinForLaunch(command, executable)
+
+	// A grok turn (the managed `-p` path or a maintenance smoke) spends
+	// credits and logs no number of its own, so it owes one live billing read
+	// when it ends (cliagent_usage_grok_freshness.go). Subcommand carve-outs
+	// (`grok login`, `grok models`) spend nothing, and a run whose credentials
+	// are contested is billed to an account the read cannot reach.
+	var grokUsageFloor time.Time
+	if isGrokCommand(command) && !grokUsageContested && (isolatedGrokHome != "" || isManagedGrokPromptArgv(cliArgs)) {
+		grokUsageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedGrokHome)
+	}
 
 	// Start the process. It is owned (its own process group on Unix, a
 	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
@@ -820,6 +843,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			// failed spawn cannot leave the shared keeper running forever.
 			finishGrokAttribution()
 		}
+		disarmGrokUsageRunFloor(grokUsageFloor)
 		stdin.Close()
 		stdoutR.Close()
 		stdoutW.Close()
@@ -880,6 +904,9 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
+	}
+	if !grokUsageFloor.IsZero() {
+		session.grokUsageFloorMs.Store(grokUsageFloor.UnixMilli())
 	}
 
 	sm.sessions[id] = session
@@ -2651,6 +2678,12 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		// copy hands the credential to the real home before the copy dies.
 		cleanupIsolatedGrokHome(session.isolatedGrokHome, session.ID)
 	}
+	// Smoke or direct `grok -p`: the turn spent credits and logged no number,
+	// so it owes one live billing read. Asynchronous — never delays
+	// session_ended.
+	if floor := session.grokUsageFloorMs.Load(); floor > 0 && session.grokUsageSettled.CompareAndSwap(false, true) {
+		grokUsageRunSettledAsync(time.UnixMilli(floor))
+	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish
 	// and the asyncPublish semaphore has 5 slots, so a fully-loaded queue at
@@ -3939,6 +3972,18 @@ func grokPromptTempDir() string {
 	return cliPromptTempDir("grok-prompts")
 }
 
+// isManagedGrokPromptArgv reports whether argv came from buildGrokInteractiveArgs'
+// managed `-p` path — the one that runs a credit-spending turn — rather than a
+// subcommand carve-out (`grok login`, `grok models`, `grok mcp add …`), which
+// is returned verbatim. The managed path always emits the streaming-json +
+// no-auto-update sentinels at the head of argv.
+func isManagedGrokPromptArgv(cliArgs []string) bool {
+	return len(cliArgs) >= 3 &&
+		cliArgs[0] == "--output-format" &&
+		cliArgs[1] == "streaming-json" &&
+		cliArgs[2] == "--no-auto-update"
+}
+
 // Best-effort: on any temp-file write error, or when the argv was NOT produced
 // by buildGrokInteractiveArgs' managed `-p` path (subcommand carve-outs return
 // user args verbatim — see the carve-out `return args` at the top of
@@ -3954,17 +3999,10 @@ func grokPromptTempDir() string {
 // managed path always emits the streaming-json + no-auto-update sentinels at
 // the head of argv, so anchor the rewrite to that signature.
 func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath string) {
-	// Managed-path gate: only the buildGrokInteractiveArgs managed `-p` path
-	// emits `--output-format streaming-json --no-auto-update` as the first
-	// three tokens (see the unconditional prepend in that function). The
-	// subcommand carve-out returns user args verbatim and does NOT carry these
-	// sentinels, so a verbatim argv ending in `-p <value>` (e.g. a child
-	// command's own flag in `grok mcp add svc -- python server.py -p 8000`)
-	// falls through unchanged.
-	if len(cliArgs) < 3 ||
-		cliArgs[0] != "--output-format" ||
-		cliArgs[1] != "streaming-json" ||
-		cliArgs[2] != "--no-auto-update" {
+	// Managed-path gate (isManagedGrokPromptArgv): a subcommand carve-out's
+	// verbatim argv ending in `-p <value>` (e.g. a child command's own flag in
+	// `grok mcp add svc -- python server.py -p 8000`) falls through unchanged.
+	if !isManagedGrokPromptArgv(cliArgs) {
 		return cliArgs, ""
 	}
 	// buildGrokInteractiveArgs always emits the separate-value form with the

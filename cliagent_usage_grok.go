@@ -7,10 +7,12 @@
 // `cached_token` and usage ties to the terminal computer user's Grok / X
 // account.
 //
-// Credentials contain no request- or token-level quota. Capacity instead comes
-// from Grok's account-bound billing log: legacy records may expose a numeric
-// percentage, while Grok 1.0 records confirm an unmetered period with freshness.
-// Without a usable record the parser emits an Unknown placeholder.
+// Credentials contain no request- or token-level quota. The credit percentage
+// comes from the live billing read (cliagent_usage_grok_live.go), which a
+// Refresh click sends and every finished Grok run owes once
+// (cliagent_usage_grok_freshness.go). Grok's account-bound billing log adds the
+// period and tier; Grok ≥ 1.0.40 records carry no percentage of their own.
+// Without a usable observation the parser emits an Unknown placeholder.
 package main
 
 import (
@@ -156,11 +158,16 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	// Grok's real quota is a credit pool over a billing period, not the
-	// request/token counters this card used to guess at. The CLI logs the pool
-	// it fetched for itself; when that log has a usable record we plot it and
-	// take the subscription tier from the same record (the auth file rarely
-	// carries a plan).
-	snap, ok := grokNewestBillingObservation(base, usage.AccountFingerprint)
+	// request/token counters this card used to guess at. The number comes from
+	// the live billing read (a Refresh click, or the bounded refresh a finished
+	// run owes); the CLI's own log supplies the period, the tier, and the proof
+	// that a run happened since.
+	snap, ok, owesRefresh := grokNewestBillingObservation(base, usage.AccountFingerprint, now)
+	if owesRefresh {
+		// A run nobody read the number for — usually one the user started in
+		// their own shell. Bounded and off this goroutine.
+		nudgeGrokUsageRefresh(now, usage.AccountFingerprint)
+	}
 	if ok {
 		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
@@ -258,8 +265,8 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 }
 
 // grokNewestBillingObservation resolves the ONE billing observation the card
-// publishes for the account signed in now: the NEWEST of every local source,
-// so no older source can pin a stale `observedAt`.
+// publishes for the account signed in now. The default is the NEWEST of every
+// local source, so no older source can pin a stale `observedAt`.
 //
 // The sources, and who writes them:
 //   - the persistent log tail (readGrokBillingSnapshot) — a direct (PTY) run's
@@ -267,33 +274,54 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 //     line the session start appends; AND every managed run's record (an ACP
 //     session, a session_start smoke, a `__cli_smoke__` probe), which
 //     persistGrokManagedBillingSnapshot merges here from the isolated home;
-//   - the live billing cache (loadGrokBillingLiveSnapshot) — the Refresh
-//     click asking xAI directly.
+//   - the live billing cache (loadGrokBillingLiveSnapshot) — the live read a
+//     Refresh click or a finished run's refresh debt sends to xAI
+//     (cliagent_usage_grok_freshness.go).
 //
-// Whichever carries the later ObservedAt wins; the TUI writing a fresher line
-// afterwards wins back the same way. This is what makes "usage freshens after
-// an upgrade" hold for a direct run, a terminal (session) run and a smoke
-// alike: each advances one of these sources, and the newest is what refresh
-// reports.
+// One exception to newest-wins: Grok ≥ 1.0.40 logs records with no usage
+// percentage, so a newer UNMETERED observation — a log record, or a live read
+// xAI answered without one — would otherwise push the other source's number
+// off the card. When both name the same billing period and that
+// period is still open at now, the numeric reading wins and keeps its own
+// (older) ObservedAt. Across a rollover the newer record still wins, so an
+// empty new pool never borrows the old figure.
+//
+// owesRefresh reports that the log holds a record newer than every live
+// reading — a run (often one the user started in their own shell) whose number
+// was never read. Parse hands that to nudgeGrokUsageRefresh.
 //
 // The account gate is upstream of this choice and is never widened by it: a
 // log record whose producer identity does not name the current account is
 // refused by readGrokBillingSnapshot, and a live entry cached under another
 // fingerprint is refused by loadGrokBillingLiveSnapshot — an older reading is
 // never "aged forward" by a foreign newer one.
-func grokNewestBillingObservation(base, fingerprint string) (grokBillingSnapshot, bool) {
-	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
-	if live, liveOK := loadGrokBillingLiveSnapshot(fingerprint); liveOK && (!ok || live.ObservedAt.After(snap.ObservedAt)) {
-		// The billing response carries the credit pool, not the plan name —
-		// only the TUI's log line states the tier. Carry the log's tier across
-		// so a live refresh doesn't blank the displayed plan; a later log line
-		// that states a tier still overrides it the next time the log wins.
-		if live.SubscriptionTier == "" && ok {
-			live.SubscriptionTier = snap.SubscriptionTier
-		}
-		return live, true
+func grokNewestBillingObservation(base, fingerprint string, now time.Time) (snap grokBillingSnapshot, ok bool, owesRefresh bool) {
+	snap, ok = readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	live, liveOK := loadGrokBillingLiveSnapshot(fingerprint)
+	owesRefresh = ok && !snap.HasUsedPercent && (!liveOK || snap.ObservedAt.After(live.ObservedAt))
+	if !liveOK {
+		return snap, ok, owesRefresh
 	}
-	return snap, ok
+	// The billing response carries the credit pool, not the plan name — only
+	// the TUI's log line states the tier. Carry the log's tier across so a
+	// live reading doesn't blank the displayed plan; a later log line that
+	// states a tier still overrides it the next time the log wins.
+	if live.SubscriptionTier == "" && ok {
+		live.SubscriptionTier = snap.SubscriptionTier
+	}
+	if !ok {
+		return live, true, owesRefresh
+	}
+	newer, older := live, snap
+	if !live.ObservedAt.After(snap.ObservedAt) {
+		newer, older = snap, live
+	}
+	// Same open period: a number beats a newer percent-less observation in
+	// either direction, and keeps its own (older) ObservedAt.
+	if !newer.HasUsedPercent && older.HasUsedPercent && older.samePeriod(newer) && now.Before(newer.PeriodEnd) {
+		return older, true, owesRefresh
+	}
+	return newer, true, owesRefresh
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,
