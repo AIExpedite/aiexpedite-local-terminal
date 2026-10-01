@@ -4261,3 +4261,41 @@ func TestClaudeUsageProbe_ClickRefundRetriesWhenTheEarlyRefundIsContended(t *tes
 		t.Errorf("AttemptClaimedUntilMs=%d, want the seed's lease released", snap.AttemptClaimedUntilMs)
 	}
 }
+
+// Settling an older debt clears neither a replacement debt nor a credential
+// wait another process persisted for a REWRITTEN credential: only the wait for
+// the stamp this attempt's 2xx proved goes, and a shared reading proves none.
+func TestSettleClaudeRunDebtAt_ClearsOnlyTheProvenCredentialWait(t *testing.T) {
+	now := time.Now()
+	older, newer := now.Add(-10*time.Minute), now.Add(-time.Minute)
+	probed := claudeCredStamp{modNs: 100, size: 10}
+	rewritten := claudeCredStamp{modNs: 200, size: 10}
+	proven := claudeProbeResult{code: claudeProbeOK, issued: true, credProven: true}
+	shared := claudeProbeResult{code: claudeProbeShared, issued: true}
+	snapWith := func(owed time.Time, wait claudeCredStamp) *claudeRateLimitSnapshot {
+		return &claudeRateLimitSnapshot{
+			RefreshOwedAtMs: owed.UnixMilli(), RefreshOwedAttempts: 2,
+			AuthWaitCredStampNs: wait.modNs, AuthWaitCredSize: wait.size,
+		}
+	}
+
+	snap := snapWith(newer, rewritten)
+	if settleClaudeRunDebtAt(older, proven, probed)(snap) {
+		t.Error("settling an older debt over another credential's wait reported a change")
+	}
+	if snap.RefreshOwedAtMs != newer.UnixMilli() || snap.AuthWaitCredStampNs != rewritten.modNs || snap.AuthWaitCredSize != rewritten.size {
+		t.Errorf("snap=%+v, want the replacement debt and the rewritten credential's wait kept", snap)
+	}
+
+	snap = snapWith(older, probed)
+	settleClaudeRunDebtAt(older, shared, probed)(snap)
+	if snap.RefreshOwedAtMs != 0 || snap.AuthWaitCredStampNs != probed.modNs {
+		t.Errorf("snap=%+v, want a shared reading to settle the debt but keep the wait", snap)
+	}
+
+	snap = snapWith(older, probed)
+	settleClaudeRunDebtAt(older, proven, probed)(snap)
+	if snap.RefreshOwedAtMs != 0 || snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		t.Errorf("snap=%+v, want the debt and the proven credential's wait cleared", snap)
+	}
+}

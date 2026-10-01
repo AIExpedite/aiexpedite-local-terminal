@@ -975,8 +975,8 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		// The covering merge settled the debt in its own write; this clears a
 		// debt a SHARED covering reading answered (another writer's partial
 		// write cannot settle it there) and the credential wait the request
-		// ended. A no-op when both are already gone.
-		mutateClaudeRateLimitSnapshot(path, fingerprint, settleClaudeRunDebtAt(owed))
+		// proved over. A no-op when both are already gone.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, settleClaudeRunDebtAt(owed, result, identity.credStamp))
 		return result
 	}
 	claudeBookRunDebtRungFor(fingerprint, owed, now, result)
@@ -1006,12 +1006,19 @@ func claudeRunDebtRefused(fingerprint string, owed, now time.Time, refusal claud
 }
 
 // settleClaudeRunDebtAt clears the debt judged at `owed` (if still standing)
-// together with the credential wait an issued request ended.
-func settleClaudeRunDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bool {
+// together with the credential wait the request proved over: only when the
+// endpoint answered `probed` with a 2xx, and only while the persisted wait is
+// still for that very stamp. Another process can persist a 401 wait for a
+// REWRITTEN credential (under a newer debt) while this attempt for the older
+// one is finishing; clearing that wait would let a restart resend the newly
+// rejected token on the replacement debt's bounded budget. A shared reading
+// proves nothing about this process's credential and clears no wait.
+func settleClaudeRunDebtAt(owed time.Time, result claudeProbeResult, probed claudeCredStamp) func(*claudeRateLimitSnapshot) bool {
 	retire := retireClaudeRefreshDebtAt(owed)
 	return func(snap *claudeRateLimitSnapshot) bool {
 		changed := retire(snap)
-		if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		if result.credProven && !probed.isZero() &&
+			snap.AuthWaitCredStampNs == probed.modNs && snap.AuthWaitCredSize == probed.size {
 			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
 			changed = true
 		}

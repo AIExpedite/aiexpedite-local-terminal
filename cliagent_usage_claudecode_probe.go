@@ -1664,8 +1664,10 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 // finish releases the single-flight slot and records the outcome. The failure
 // streak follows the attempt result (claudeProbeResult.streak): a reading
 // clears it, only the outcomes that say the endpoint or our handling of it is
-// unhealthy grow it, and a refusal that asked nothing leaves it alone. Any
-// issued outcome other than a 401 ends a credential wait.
+// unhealthy grow it, and a refusal that asked nothing leaves it alone. Only a
+// 2xx for the credential ends a credential wait: a stamped token the endpoint
+// rejected and that then merely timed out (or met a 5xx) was never shown to
+// work, and clearing the wait would let the next automatic probe resend it.
 //
 // `observedAt` is the observation the cache holds for the windows the probe
 // wrote and `fingerprint` the account it wrote them under, both recorded only
@@ -1693,7 +1695,7 @@ func (g *claudeUsageProbeGate) finish(result claudeProbeResult, refreshed bool, 
 			g.failures++
 		}
 	}
-	if result.issued && result.code != claudeProbeHTTP401 {
+	if result.credProven {
 		g.authWait, g.authWaitNudged, g.authWaitRestored = claudeCredStamp{}, claudeCredStamp{}, claudeCredStamp{}
 		g.authWaitSeq++
 	}
@@ -2137,6 +2139,7 @@ func probeClaudeUsageResult(
 		}
 		return result, false, time.Time{}
 	}
+	result.credProven = true
 
 	// Read at most the cap + 1 byte so an oversized body is DETECTED rather than
 	// silently truncated into a JSON parse error — a truncated payload must never
@@ -2895,11 +2898,15 @@ const (
 // send nothing — no credential, an expired one, a rejected override).
 // `credStamped` records whether the credential came from a file with a stamp,
 // which decides whether a 401 can wait on a rewrite or must back off.
+// `credProven` records that the endpoint answered this credential with a 2xx —
+// the only evidence that it works, and so the only one that ends a credential
+// wait. A timeout, a transport error, a 5xx or a shared reading proves nothing.
 type claudeProbeResult struct {
 	code        claudeProbeCode
 	admitted    bool
 	issued      bool
 	credStamped bool
+	credProven  bool
 }
 
 // claudeStreakEffect is what an attempt does to the consecutive-failure streak.

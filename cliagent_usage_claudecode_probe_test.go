@@ -3789,6 +3789,39 @@ func TestClaudeUsageProbe_After401WaitsForACredentialRewrite(t *testing.T) {
 			t.Errorf("automatic attempt after a successful click=%+v, want it admitted", r)
 		}
 	})
+	t.Run("a click that fails inconclusively keeps the wait", func(t *testing.T) {
+		var served int64
+		_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+			if atomic.AddInt64(&served, 1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			// Issued, but no answer about the credential.
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+		stamp := claudeCredStamp{modNs: 100, size: 10}
+		same := resolve(claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp})
+		start := time.Now()
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, false); r.code != claudeProbeHTTP401 {
+			t.Fatalf("first attempt=%+v, want http_401", r)
+		}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, true); r.code != claudeProbeHTTP5xx || !r.issued {
+			t.Fatalf("click=%+v, want an issued http_5xx", r)
+		}
+		if got := claudeUsageProbe.authWaitStamp(); got != stamp {
+			t.Fatalf("authWait=%+v after an inconclusive click, want %+v kept", got, stamp)
+		}
+		// The rejected token was never shown to work, so the next automatic
+		// attempt must not resend it.
+		r, _, _ := probeClaudeUsageResult(context.Background(), start.Add(time.Hour), same, time.Time{}, false)
+		if r.code != claudeProbeCredentialExpired || r.issued {
+			t.Errorf("automatic attempt after an inconclusive click=%+v, want not-admitted credential_expired", r)
+		}
+		if got := atomic.LoadInt64(calls); got != 2 {
+			t.Errorf("request count=%d, want only the 401 and the click", got)
+		}
+	})
 	t.Run("unstamped doubles the backoff", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, unauthorized)
 		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
