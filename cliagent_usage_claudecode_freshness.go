@@ -790,9 +790,12 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	// processes both passed the unlocked retirement test on) sends nothing and
 	// books a free rung.
 	if !mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+		// Usually a lock race with the stream capture of the very turn that owed
+		// this debt, so a fresh debt retries promptly rather than on the free
+		// rung's floor — see claudeUnpersistedRetryDelay.
 		result := claudeProbeResult{code: claudeProbeReserveFailed}
 		logClaudeUsageProbeResult(result)
-		claudeBookRunDebtRungFor(fingerprint, owed, now, result)
+		claudeBookRunDebtRung(fingerprint, owed, now, claudeRungAfter, claudeUnpersistedRetryDelay(now.Sub(owed)))
 		return result
 	}
 
@@ -806,6 +809,11 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		// Safe in the crash direction: a crash between the reservation and this
 		// refund keeps the slot spent, which only spends the budget faster.
 		mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
+		// A probe that took the slot since the pre-check is joined exactly like
+		// one the pre-check saw.
+		if result.code == claudeProbeInFlight {
+			return claudeRunDebtRefused(fingerprint, owed, now, result.code)
+		}
 	}
 	if settled {
 		// The covering merge settled the debt in its own write; this clears a

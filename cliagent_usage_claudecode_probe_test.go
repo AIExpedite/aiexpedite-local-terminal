@@ -2509,16 +2509,6 @@ func TestClaudeUsageProbeAfterRun_LongSpacingBooksAPersistedRung(t *testing.T) {
 	}
 }
 
-// claudeUsageProbeAfterRunAsyncForTest mirrors what triggerClaudeUsageProbeAfterRun
-// does in production — run the post-run path on its own goroutine — without the
-// armed-gate precheck the tests set up explicitly.
-func claudeUsageProbeAfterRunAsyncForTest(completedAt time.Time) {
-	go func() {
-		defer func() { _ = recover() }()
-		claudeUsageProbeAfterRun(completedAt)
-	}()
-}
-
 // A user-initiated refresh that lands while a post-run probe is already on the
 // wire must JOIN it, not be turned away by the single-flight latch. Being turned
 // away is what let the Refresh button sign a receipt from the buckets loaded

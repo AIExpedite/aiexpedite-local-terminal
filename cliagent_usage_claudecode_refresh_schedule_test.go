@@ -9,16 +9,12 @@ import (
 	"time"
 )
 
-// waitForClaudeCondition polls cond until it holds or `within` elapses — for
-// effects a retry rung produces on the timer's goroutine.
+// waitForClaudeCondition fails the test unless cond holds within `within` —
+// for effects a retry rung produces on the timer's goroutine.
 func waitForClaudeCondition(t *testing.T, within time.Duration, msg string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(within)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal(msg)
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !waitUntil(time.Now().Add(within), cond) {
+		t.Fatal(msg)
 	}
 }
 
@@ -29,7 +25,7 @@ func pinClaudeRunDebtLadder(t *testing.T, ladder []time.Duration, free, slack ti
 	origLadder, origFree, origSlack := claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack
 	claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = ladder, free, slack
 	t.Cleanup(func() {
-		resetClaudeRunDebtRetry()
+		stopClaudeRunDebtRetry()
 		claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = origLadder, origFree, origSlack
 	})
 }
@@ -194,5 +190,26 @@ func TestNudgeClaudeCredentialChanged_OneAttemptPerRewrite(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("request count=%d, want one attempt for one rewrite", got)
+	}
+}
+
+// A write the cache locks refused retries promptly for a FRESH debt (a lock
+// race with its own turn's stream capture) — at the floor's end when the gate
+// is spacing, else after the rung slack — and on the age backoff once the debt
+// is older, so a wedged cache is not re-checked every second for hours.
+func TestClaudeUnpersistedRetryDelay(t *testing.T) {
+	_, _ = armClaudeUsageProbe(t, unreachableProbeHandler)
+	if got := claudeUnpersistedRetryDelay(time.Second); got != claudeRunDebtRungSlack {
+		t.Errorf("fresh debt, gate open: retry in %v, want the rung slack %v", got, claudeRunDebtRungSlack)
+	}
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "5000")
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.lastAttempt = time.Now()
+	claudeUsageProbe.mu.Unlock()
+	if got := claudeUnpersistedRetryDelay(time.Second); got < 5*time.Second || got > 5*time.Second+2*claudeRunDebtRungSlack {
+		t.Errorf("fresh debt inside the floor: retry in %v, want the floor's end", got)
+	}
+	if got, want := claudeUnpersistedRetryDelay(2*time.Hour), claudeFreeRetryDelay(2*time.Hour); got != want {
+		t.Errorf("old debt: retry in %v, want the age backoff %v", got, want)
 	}
 }

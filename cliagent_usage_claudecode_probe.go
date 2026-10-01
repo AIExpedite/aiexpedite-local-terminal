@@ -2636,8 +2636,11 @@ func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 	defer claudeUsageProbe.endSettling()
 	fingerprint, onDisk := claudeOweRunRefresh(completedAt)
 	if !onDisk {
-		if claudeUsageProbe.armedForProbe() && time.Since(completedAt) < claudeRefreshOwedMaxAge {
-			claudeArmRunDebtReowe(completedAt, claudeFreeRetryDelay(time.Since(completedAt)))
+		if owedFor := time.Since(completedAt); claudeUsageProbe.armedForProbe() && owedFor < claudeRefreshOwedMaxAge {
+			retry := claudeUnpersistedRetryDelay(owedFor)
+			claudeArmRunDebtReowe(completedAt, retry)
+			fmt.Printf("%s[claude-usage] run refresh debt not persisted (cache busy); retrying in %dms%s\n",
+				colorYellow, retry.Milliseconds(), colorReset)
 		}
 		return
 	}
@@ -2662,7 +2665,8 @@ func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 // buckets as an account transition.
 //
 // Reports the attempt result and whether the reading now on disk covers the
-// debt (and the in-memory debt was settled with it).
+// debt (and the in-memory debt was settled with it). A probe that turns out to
+// be in flight is left to the caller, which joins it (claudeRunDebtRefused).
 func claudeUsageProbeAttemptAs(baseline time.Time, identity claudeUsageProbeIdentity) (result claudeProbeResult, settled bool) {
 	// The WHOLE-probe bound, not the request bound. This context is a root the
 	// attempt fabricates for itself — there is no gather deadline above it to
@@ -2686,15 +2690,6 @@ func claudeUsageProbeAttemptAs(baseline time.Time, identity claudeUsageProbeIden
 	if (refreshed || result.code == claudeProbeShared) && claudeUsageObservationCovers(observedAt, baseline) {
 		claudeUsageProbe.settleOwed(baseline)
 		return result, true
-	}
-	if result.code == claudeProbeInFlight {
-		// The holder never owns the debt schedule: join it, and settle only on a
-		// reading for this account that covers the debt — a routine probe
-		// admitted before this run finished persists a PRE-run reading.
-		if _, joinedAt := claudeUsageProbe.joinInFlight(ctx, identity.fingerprint); claudeUsageObservationCovers(joinedAt, baseline) {
-			claudeUsageProbe.settleOwed(baseline)
-			return result, true
-		}
 	}
 	return result, false
 }

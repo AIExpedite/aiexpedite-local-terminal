@@ -106,6 +106,29 @@ func claudeFreeRetryDelay(owedFor time.Duration) time.Duration {
 	return refreshFreeRetryDelay(owedFor, claudeRunDebtFreeRetryDelay, claudeRunDebtRetryLadder)
 }
 
+// claudeUnpersistedRetryDelay is the in-process retry for a debt or rung whose
+// write the cache locks refused. A FRESH run usually lost a lock race to the
+// stream capture of its own turn, so it retries as soon as a probe could go out
+// anyway (the floor's end, or the rung slack) rather than on the free rung's
+// 15 s floor — a burst of turns must not delay its refresh past the window the
+// old trailing probe covered. Past that first window the age backoff applies,
+// so a cache wedged for hours is re-checked a couple of dozen times, not every
+// second.
+func claudeUnpersistedRetryDelay(owedFor time.Duration) time.Duration {
+	retry := claudeFreeRetryDelay(owedFor)
+	if owedFor >= claudeRunDebtFreeRetryDelay {
+		return retry
+	}
+	short := claudeRunDebtRungSlack
+	if kind, d := claudeRunDebtRungFor(claudeProbeResult{code: claudeUsageProbe.refusal(time.Now(), false)}); kind == claudeRungAfter {
+		short = d
+	}
+	if short < retry {
+		retry = short
+	}
+	return retry
+}
+
 // claudeRunDebtRetryHorizon is the furthest ahead a legitimately booked rung
 // can sit: a maximum-length 429 hold plus its slack, or the longest ladder
 // rung, plus the skew the debt itself tolerates. Anything further is a
@@ -252,7 +275,7 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 		return false
 	}
 	if !committed {
-		retry := claudeFreeRetryDelay(now.Sub(owed))
+		retry := claudeUnpersistedRetryDelay(now.Sub(owed))
 		claudeArmRunDebtRetry(retry, claudeDebtTriggerTimer)
 		fmt.Printf("%s[claude-usage] run refresh rung not persisted (cache busy); retrying in %ds%s\n",
 			colorYellow, int(retry.Round(time.Second).Seconds()), colorReset)
@@ -332,10 +355,6 @@ func stopClaudeRunDebtRetry() {
 	}
 	t.gen++
 }
-
-// resetClaudeRunDebtRetry is stopClaudeRunDebtRetry for tests that only want
-// the timer gone, without the rest of resetClaudeUsageProbeGate.
-func resetClaudeRunDebtRetry() { stopClaudeRunDebtRetry() }
 
 // claudeRunDebtRetryPending reports whether a retry timer is armed.
 func claudeRunDebtRetryPending() bool {
