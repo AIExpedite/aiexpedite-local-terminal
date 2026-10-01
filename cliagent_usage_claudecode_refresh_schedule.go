@@ -308,6 +308,13 @@ func claudeArmRunDebtRetryFn(delay time.Duration, run func()) {
 	t := &claudeRunDebtRetryTimer
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	claudeArmRunDebtRetryLocked(delay, run)
+}
+
+// claudeArmRunDebtRetryLocked replaces the pending retry with `run` after
+// `delay`. The caller holds claudeRunDebtRetryTimer.mu.
+func claudeArmRunDebtRetryLocked(delay time.Duration, run func()) {
+	t := &claudeRunDebtRetryTimer
 	if t.timer != nil {
 		t.timer.Stop()
 	}
@@ -370,16 +377,25 @@ func claudeRunDebtRetryPending() bool {
 // at once — still subject to single flight, the 60 s floor and a hold. One
 // nudge per new stamp, not one per gather: the gate remembers it.
 //
+// The nudge is claimed only while a rung is pending, and the claim and the
+// re-arm happen under the timer lock. With no timer (an attempt is still
+// finishing and has not booked its next rung yet) the stamp stays unclaimed,
+// so the first gather after that rung is booked still makes it due.
+//
 // No stamp (a Keychain login) never nudges; the expiry pre-check re-reads
 // expiresAt on every attempt there, and the age backoff covers the rest.
 func nudgeClaudeCredentialChanged(stamp claudeCredStamp) {
-	if stamp.isZero() || !claudeUsageProbe.takeCredentialNudge(stamp) {
+	if stamp.isZero() {
 		return
 	}
-	if !claudeRunDebtRetryPending() {
+	t := &claudeRunDebtRetryTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Lock order timer → gate, as in claudeRunDebtRetryFired.
+	if t.timer == nil || !claudeUsageProbe.takeCredentialNudge(stamp) {
 		return
 	}
-	claudeArmRunDebtRetry(0, claudeDebtTriggerNudge)
+	claudeArmRunDebtRetryLocked(0, func() { claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerNudge) })
 }
 
 // claudeUsageRefreshForceReason picks how a __cli_usage_refresh__ forces

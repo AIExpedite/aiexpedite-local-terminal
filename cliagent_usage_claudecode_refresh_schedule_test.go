@@ -152,6 +152,36 @@ func TestGracefulShutdown_StopsTheClaudeRunDebtRetry(t *testing.T) {
 	}
 }
 
+// A rewrite seen while no rung is pending (the previous attempt is still
+// finishing and has not booked its next rung) must not use up the nudge: the
+// first gather after the rung is booked still makes it due.
+func TestNudgeClaudeCredentialChanged_NoPendingRungKeepsTheNudge(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	claudeUsageProbe.noteAuthWait(claudeCredStamp{modNs: 1, size: 1})
+	stopClaudeRunDebtRetry()
+
+	rewritten := claudeCredStamp{modNs: 2, size: 1}
+	nudgeClaudeCredentialChanged(rewritten)
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("a nudge with no rung pending sent %d requests, want 0", got)
+	}
+	if claudeRunDebtRetryPending() {
+		t.Fatal("a nudge with no rung pending armed a retry")
+	}
+
+	claudeBookRunDebtRung("", owed, now, claudeRungAfter, time.Hour)
+	nudgeClaudeCredentialChanged(rewritten)
+	waitForClaudeCondition(t, 5*time.Second, "the rewrite seen before the rung was booked never nudged it", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+}
+
 // A credential rewrite the schedule is waiting on makes the pending rung due
 // at once — one attempt per new stamp, not one per gather.
 func TestNudgeClaudeCredentialChanged_OneAttemptPerRewrite(t *testing.T) {
