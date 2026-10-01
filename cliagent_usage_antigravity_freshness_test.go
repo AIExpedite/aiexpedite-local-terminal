@@ -895,3 +895,198 @@ func TestAntigravityFreshness_UnpayableDebtWarnsOnTheCard(t *testing.T) {
 		t.Errorf("notice=%q, want it to name the reading the card is showing", usage.Notice)
 	}
 }
+
+/* ─────────────────────── expired-login renewal in the pass ─────────────────────── */
+
+// helperRenewalPass is one debt worker under test: a stored login whose expiry
+// the renewal stub moves, a Code Assist stand-in that refuses an expired token
+// locally (noting its expiry, as the real probe does) and otherwise lands a
+// reading through the persist hook, and a renewal stub that answers `result`.
+type helperRenewalPass struct {
+	setExpiry func(time.Time)
+	reads     atomic.Int32 // reads that reached "Google"
+	refusals  atomic.Int32 // local token_expired refusals
+	renewals  atomic.Int32
+	result    atomic.Value // string
+}
+
+func helperIsolateRenewalPass(t *testing.T, expiry time.Time, result string) *helperRenewalPass {
+	t.Helper()
+	helperIsolateAntigravityFreshness(t)
+	p := &helperRenewalPass{setExpiry: helperMutableAntigravityKeyring(t, expiry)}
+	p.result.Store(result)
+	origProbe, origRenew := probeAntigravityQuotaCodeAssistFn, renewAntigravityStoredLoginFn
+	t.Cleanup(func() {
+		helperStopAntigravityRefreshSchedule()
+		probeAntigravityQuotaCodeAssistFn, renewAntigravityStoredLoginFn = origProbe, origRenew
+	})
+	probeAntigravityQuotaCodeAssistFn = func(ctx context.Context, _ string, now func() time.Time) string {
+		tok, ok := antigravityStoredToken(ctx)
+		if !ok {
+			return liveProbeOutcomeCodeAssistNoLogin
+		}
+		if !now().Add(antigravityTokenExpirySkew).Before(tok.Expiry) {
+			p.refusals.Add(1)
+			noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
+			return liveProbeOutcomeCodeAssistTokenExpired
+		}
+		p.reads.Add(1)
+		settleAntigravityRunFreshness(now().UnixMilli(), "")
+		return liveProbeOutcomeCodeAssistOK
+	}
+	renewAntigravityStoredLoginFn = func(context.Context, time.Time) string {
+		p.renewals.Add(1)
+		got := p.result.Load().(string)
+		if got == antigravityLoginRenewed {
+			p.setExpiry(time.Now().Add(time.Hour))
+		}
+		return got
+	}
+	return p
+}
+
+// An expired login is renewed and read again in the SAME pass, and the debt is
+// paid — even by a scheduled pass that may spend only one attempt.
+func TestAntigravityPayRunDebt_ExpiredLoginRenewsAndPaysInOnePass(t *testing.T) {
+	for _, maxAttempts := range []int{antigravityRefreshAfterRunMaxAttempts, 1} {
+		t.Run(fmt.Sprintf("maxAttempts=%d", maxAttempts), func(t *testing.T) {
+			p := helperIsolateRenewalPass(t, time.Now().Add(-time.Minute), antigravityLoginRenewed)
+			helperOwedDebt(t, antigravityUsageFreshness{})
+
+			var kind antigravityRunDebtRetryKind
+			logged := captureStdout(t, func() {
+				_, kind, _ = antigravityPayRunDebtPass(maxAttempts, false)
+			})
+			if p.refusals.Load() != 1 || p.renewals.Load() != 1 || p.reads.Load() != 1 {
+				t.Fatalf("refusals=%d renewals=%d reads=%d, want expired → renewed → one read",
+					p.refusals.Load(), p.renewals.Load(), p.reads.Load())
+			}
+			if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+				t.Errorf("state=%+v, want the debt paid", state)
+			}
+			if kind != antigravityRetryAfterRead {
+				t.Errorf("kind=%v, want the OK branch's", kind)
+			}
+			if !strings.Contains(logged, "Run refresh closed (route=adopted outcome=codeassist_ok") ||
+				!strings.Contains(logged, "attempts=1 renewals=1)") {
+				t.Errorf("no close-out line for the paid debt: %q", logged)
+			}
+		})
+	}
+}
+
+// A renewal that did not help keeps the debt on the free rung, and the same
+// debt never renews a second time — however many passes look at it.
+func TestAntigravityPayRunDebt_StillExpiredKeepsTheFreeRungAndRenewsOnce(t *testing.T) {
+	p := helperIsolateRenewalPass(t, time.Now().Add(-time.Minute), antigravityLoginStillExpired)
+	helperOwedDebt(t, antigravityUsageFreshness{})
+
+	for i := 0; i < 3; i++ {
+		if _, kind, _ := antigravityPayRunDebtPass(1, true); kind != antigravityRetryFree {
+			t.Fatalf("pass %d kind=%v, want the free rung", i, kind)
+		}
+	}
+	if p.renewals.Load() != 1 {
+		t.Errorf("renewals=%d, want exactly one per debt", p.renewals.Load())
+	}
+	state := helperFreshnessState(t)
+	if state.RefreshOwedAtMs == 0 || state.LoginRenewedAtMs == 0 || state.Attempts != 0 ||
+		state.Outcome != liveProbeOutcomeCodeAssistTokenExpired {
+		t.Errorf("state=%+v, want the debt kept with its renewal stamped and its budget intact", state)
+	}
+	notice, _ := antigravityFreshnessNotice(helperStaleObservedAt, time.Now())
+	if !strings.Contains(notice, "could not be renewed") {
+		t.Errorf("notice=%q, want it to say the renewal did not help", notice)
+	}
+
+	// A new debt generation gets its own renewal.
+	now := time.Now()
+	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+		state.clearDebt()
+		state.RefreshOwedFloorMs, state.RefreshOwedAtMs = now.UnixMilli(), now.UnixMilli()
+	})
+	antigravityPayRunDebtPass(1, true)
+	if p.renewals.Load() != 2 {
+		t.Errorf("renewals=%d, want the next generation renewed once more", p.renewals.Load())
+	}
+}
+
+// A spaced or unavailable renewal spends no read and falls back to the free
+// rung; no login and a token still inside the skew never renew.
+func TestAntigravityPayRunDebt_RenewalRefusalsSpendNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		expiry       time.Duration
+		noLogin      bool
+		result       string
+		wantKind     antigravityRunDebtRetryKind
+		wantRenewals int32
+	}{
+		{name: "spaced", expiry: -time.Minute, result: antigravityLoginSpaced, wantKind: antigravityRetryFree, wantRenewals: 1},
+		{name: "unavailable", expiry: -time.Minute, result: antigravityLoginUnavailable, wantKind: antigravityRetryFree, wantRenewals: 1},
+		{name: "no login", noLogin: true, result: antigravityLoginRenewed, wantKind: antigravityRetryNone},
+		{name: "inside the skew band", expiry: 10 * time.Second, result: antigravityLoginRenewed, wantKind: antigravityRetryLoginRenew},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expiry := time.Now().Add(tc.expiry)
+			p := helperIsolateRenewalPass(t, expiry, tc.result)
+			if tc.noLogin {
+				helperStubAntigravityKeyring(t, nil)
+			}
+			helperOwedDebt(t, antigravityUsageFreshness{})
+
+			_, kind, tokenExpiryMs := antigravityPayRunDebtPass(1, true)
+			if kind != tc.wantKind || p.renewals.Load() != tc.wantRenewals || p.reads.Load() != 0 {
+				t.Errorf("kind=%v renewals=%d reads=%d, want kind=%v renewals=%d and no read",
+					kind, p.renewals.Load(), p.reads.Load(), tc.wantKind, tc.wantRenewals)
+			}
+			if tc.wantKind == antigravityRetryLoginRenew && tokenExpiryMs != expiry.UnixMilli() {
+				t.Errorf("tokenExpiryMs=%d, want the stored token's expiry %d", tokenExpiryMs, expiry.UnixMilli())
+			}
+			if state := helperFreshnessState(t); tc.wantKind != antigravityRetryNone && state.Attempts != 0 {
+				t.Errorf("attempts=%d, want a refusal that sent nothing to spend no budget", state.Attempts)
+			}
+		})
+	}
+}
+
+// A spaced renewal started no child, so it must not use up the debt's one
+// renewal: once the device spacing has elapsed, a later retry of the same debt
+// renews and pays. An unavailable renewal did try, so it keeps the stamp.
+func TestAntigravityPayRunDebt_SpacedRenewalKeepsTheDebtsRenewal(t *testing.T) {
+	p := helperIsolateRenewalPass(t, time.Now().Add(-time.Minute), antigravityLoginSpaced)
+	helperOwedDebt(t, antigravityUsageFreshness{})
+
+	for i := 0; i < 2; i++ {
+		if _, kind, _ := antigravityPayRunDebtPass(1, true); kind != antigravityRetryFree {
+			t.Fatalf("spaced pass %d kind=%v, want the free rung", i, kind)
+		}
+		if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.LoginRenewedAtMs != 0 {
+			t.Fatalf("spaced pass %d state=%+v, want the debt kept with no renewal stamped", i, state)
+		}
+	}
+	if p.renewals.Load() != 2 {
+		t.Fatalf("renewals=%d, want each spaced pass to ask again", p.renewals.Load())
+	}
+
+	p.result.Store(antigravityLoginRenewed)
+	antigravityPayRunDebtPass(1, true)
+	if p.renewals.Load() != 3 || p.reads.Load() != 1 {
+		t.Errorf("renewals=%d reads=%d, want the spacing's end to renew and read", p.renewals.Load(), p.reads.Load())
+	}
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want the debt paid", state)
+	}
+
+	p.result.Store(antigravityLoginUnavailable)
+	p.setExpiry(time.Now().Add(-time.Minute))
+	helperOwedDebt(t, antigravityUsageFreshness{})
+	antigravityPayRunDebtPass(1, true)
+	antigravityPayRunDebtPass(1, true)
+	if p.renewals.Load() != 4 {
+		t.Errorf("renewals=%d, want an unavailable renewal to use up the debt's one", p.renewals.Load())
+	}
+	if state := helperFreshnessState(t); state.LoginRenewedAtMs == 0 {
+		t.Errorf("state=%+v, want the unavailable renewal stamped", state)
+	}
+}

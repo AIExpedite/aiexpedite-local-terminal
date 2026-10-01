@@ -55,6 +55,13 @@ func processStartToken(pid int) (string, error) {
 	return darwinStartToken(kp)
 }
 
+// processStartTokenErrGone reports whether a processStartToken error proves no
+// process holds the PID (the kernel returned no record for it). Any other
+// error leaves the process unread, not gone.
+func processStartTokenErrGone(err error) bool {
+	return errors.Is(err, unix.EIO) || errors.Is(err, unix.ESRCH)
+}
+
 // probeRecordedProcess reports whether the recorded process is still ours.
 func probeRecordedProcess(rec ledgerProcess) processProbeResult {
 	if rec.PID <= 0 || !strings.HasPrefix(rec.StartTime, processStartTokenPrefixDarwin) {

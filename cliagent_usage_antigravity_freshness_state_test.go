@@ -1528,3 +1528,39 @@ func TestAntigravityFreshness_ALandedReadingRetiresOnlyItsOwnAccountsDebt(t *tes
 		})
 	}
 }
+
+// loginRenewedAtMs is the one field the renewal adds: it round-trips, a cleared
+// debt and a new generation both start without it, and a state file written
+// before it existed reads as "not renewed".
+func TestAntigravityFreshness_LoginRenewedAtMsPersistence(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	now := time.Now()
+	stamp := now.Add(-time.Second).UnixMilli()
+	helperOwedDebt(t, antigravityUsageFreshness{LoginRenewedAtMs: stamp, RunFloorMs: now.Add(-time.Minute).UnixMilli()})
+	if got := helperFreshnessState(t).LoginRenewedAtMs; got != stamp {
+		t.Fatalf("loginRenewedAtMs=%d, want %d round-tripped", got, stamp)
+	}
+
+	cleared := helperFreshnessState(t)
+	cleared.clearDebt()
+	if cleared.LoginRenewedAtMs != 0 {
+		t.Error("clearDebt kept the renewal stamp")
+	}
+
+	// A settle whose floor moves starts a new generation with its own renewal.
+	antigravityUsageRunSettled(now.Add(-time.Second), 0, false, true)
+	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.LoginRenewedAtMs != 0 {
+		t.Errorf("state=%+v, want a new generation with no renewal stamped", state)
+	}
+
+	// An older agent's file, without the field.
+	if err := os.WriteFile(antigravityFreshnessPath(), []byte(`{"schemaVersion":1,"refreshOwedFloorMs":1,"refreshOwedAtMs":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := helperFreshnessState(t).LoginRenewedAtMs; got != 0 {
+		t.Errorf("loginRenewedAtMs=%d from an older file, want 0", got)
+	}
+}

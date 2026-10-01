@@ -43,6 +43,13 @@ func processStartToken(pid int) (string, error) {
 	return startTokenOfHandle(h)
 }
 
+// processStartTokenErrGone reports whether a processStartToken error proves no
+// process holds the PID (ERROR_INVALID_PARAMETER: no process object has it).
+// Any other error (access denied, …) leaves the process unread, not gone.
+func processStartTokenErrGone(err error) bool {
+	return errors.Is(err, windows.ERROR_INVALID_PARAMETER)
+}
+
 func startTokenOfHandle(h windows.Handle) (string, error) {
 	var created, exited, kernel, user windows.Filetime
 	if err := windows.GetProcessTimes(h, &created, &exited, &kernel, &user); err != nil {

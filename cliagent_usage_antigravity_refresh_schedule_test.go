@@ -161,7 +161,7 @@ func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
 		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
 	})
 	now := time.Now()
-	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetryFree) {
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetryFree, 0) {
 		t.Fatal("the free rung was not booked")
 	}
 	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < 29*time.Minute {
@@ -175,7 +175,7 @@ func TestAntigravityFreeRetryDelay_GrowsWithTheDebtsAge(t *testing.T) {
 		RefreshOwedFloorMs: owedAt.UnixMilli(), RefreshOwedAtMs: owedAt.UnixMilli(),
 		LastPaidAtMs: now.Add(-10 * time.Second).UnixMilli(),
 	})
-	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetrySpacing) {
+	if !antigravityScheduleRunDebtRetry(state, now, antigravityRetrySpacing, 0) {
 		t.Fatal("the spacing rung was not booked")
 	}
 	if until := time.UnixMilli(helperFreshnessState(t).NextAttemptAtMs).Sub(now); until < antigravityRefreshMinInterval-15*time.Second ||
@@ -200,7 +200,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
+			antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead, 0)
 		}()
 	}
 	wg.Wait()
@@ -218,7 +218,7 @@ func TestAntigravityScheduleRunDebtRetry_ConcurrentSettlesArmOneBoundedSchedule(
 	// Now let the schedule run on a short ladder: a single timer means one
 	// attempt per firing, and the budget caps the total.
 	helperPinAntigravityRefreshSchedule(t, 10*time.Millisecond, 10*time.Millisecond)
-	antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead)
+	antigravityScheduleRunDebtRetry(state, time.Now(), antigravityRetryAfterRead, 0)
 	helperDrainAntigravityRefreshSchedule(t)
 	if got := reads.Load(); got != antigravityRefreshDebtMaxAttempts {
 		t.Errorf("reads=%d, want exactly the lifetime budget %d", got, antigravityRefreshDebtMaxAttempts)
@@ -667,5 +667,111 @@ func TestNudgeAntigravityUsageRefresh_NothingWhileAnOwnChildRuns(t *testing.T) {
 	antigravityUsageRefreshWaitIdle()
 	if reads.Load() != 1 {
 		t.Errorf("reads=%d, want one", reads.Load())
+	}
+}
+
+// The login-renew rung waits for the stored token's expiry (+1 s), clamped to
+// [now + 1 s, now + the free rung], never pushed out to the read spacing; every
+// other kind ignores the expiry argument.
+func TestAntigravityScheduleRunDebtRetry_LoginRenewRungWaitsForTheExpiry(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	helperPinAntigravityRefreshSchedule(t, time.Hour, 30*time.Second)
+	now := time.Now()
+	for _, tc := range []struct {
+		name     string
+		kind     antigravityRunDebtRetryKind
+		expiry   int64
+		wantNext time.Time
+	}{
+		{name: "at the expiry plus a second", kind: antigravityRetryLoginRenew, expiry: now.Add(10 * time.Second).UnixMilli(), wantNext: now.Add(11 * time.Second)},
+		{name: "an expiry already past", kind: antigravityRetryLoginRenew, expiry: now.Add(-time.Minute).UnixMilli(), wantNext: now.Add(time.Second)},
+		{name: "an expiry far ahead is clamped to the free rung", kind: antigravityRetryLoginRenew, expiry: now.Add(time.Hour).UnixMilli(), wantNext: now.Add(30 * time.Second)},
+		{name: "no expiry known is a plain free rung, spaced", kind: antigravityRetryLoginRenew, wantNext: now.Add(59 * time.Second)},
+		{name: "spacing ignores the expiry", kind: antigravityRetrySpacing, expiry: now.Add(10 * time.Second).UnixMilli(), wantNext: now.Add(30 * time.Second)},
+		{name: "after a read ignores the expiry", kind: antigravityRetryAfterRead, expiry: now.Add(10 * time.Second).UnixMilli(), wantNext: now.Add(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperStopAntigravityRefreshSchedule()
+			// The read spacing would push any other rung out to lastPaid + 60 s.
+			state := helperOwedDebt(t, antigravityUsageFreshness{
+				RefreshOwedFloorMs: now.UnixMilli(), RefreshOwedAtMs: now.UnixMilli(),
+				LastPaidAtMs: now.Add(-time.Second).UnixMilli(),
+			})
+			if tc.kind == antigravityRetrySpacing || tc.kind == antigravityRetryAfterRead {
+				state.LastPaidAtMs = 0
+				helperWriteJSON(t, antigravityFreshnessPath(), state)
+			}
+			if !antigravityScheduleRunDebtRetry(state, now, tc.kind, tc.expiry) {
+				t.Fatal("nothing was booked")
+			}
+			if got := helperFreshnessState(t).NextAttemptAtMs; got != tc.wantNext.UnixMilli() {
+				t.Errorf("next=%s, want %s", time.UnixMilli(got).Sub(now), tc.wantNext.Sub(now))
+			}
+		})
+	}
+	if antigravityRunDebtRetryHorizon() < antigravityRunDebtFreeRetryDelay {
+		t.Error("the horizon is shorter than the login-renew rung's clamp")
+	}
+}
+
+// A floor the log index PROVED is owed at once; an unproven one still waits the
+// minute's settle guard. The cooldown and the read spacing hold a proven floor
+// back all the same, and a refusal stamps no cooldown.
+func TestNudgeAntigravityUsageRefreshFloor_ProvenSkipsOnlyTheSettleGuard(t *testing.T) {
+	now := time.Now()
+	observed := now.Add(-time.Hour).Truncate(time.Second)
+	exit := now.Add(-2 * time.Second)
+	for _, tc := range []struct {
+		name   string
+		proven bool
+		state  *antigravityUsageFreshness
+		setup  func()
+		want   bool
+	}{
+		{name: "proven, two seconds after the exit", proven: true, want: true},
+		{name: "unproven, two seconds after the exit", proven: false, want: false},
+		{name: "proven, inside the read spacing", proven: true, state: &antigravityUsageFreshness{LastPaidAtMs: now.Add(-5 * time.Second).UnixMilli()}},
+		{name: "proven, inside the nudge cooldown", proven: true, setup: func() {
+			antigravityRefreshNudge.mu.Lock()
+			antigravityRefreshNudge.lastAt = now.Add(-time.Second)
+			antigravityRefreshNudge.mu.Unlock()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cache := helperIsolateAntigravityFreshness(t)
+			helperWriteAntigravityCache(t, cache, observed)
+			reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+			if tc.state != nil {
+				s := *tc.state
+				s.SchemaVersion = antigravityFreshnessSchema
+				helperWriteJSON(t, antigravityFreshnessPath(), s)
+			}
+			if tc.setup != nil {
+				tc.setup()
+			}
+			antigravityRefreshNudge.mu.Lock()
+			cooldownBefore := antigravityRefreshNudge.lastAt
+			antigravityRefreshNudge.mu.Unlock()
+
+			got := nudgeAntigravityUsageRefreshFloor(now, observed.UnixMilli(), antigravityOwedFloor{At: exit, Proven: tc.proven})
+			antigravityUsageRefreshWaitIdle()
+			if got != tc.want {
+				t.Fatalf("nudged=%v, want %v", got, tc.want)
+			}
+			if wantReads := map[bool]int64{true: 1, false: 0}[tc.want]; reads.Load() != wantReads {
+				t.Errorf("reads=%d, want %d", reads.Load(), wantReads)
+			}
+			antigravityRefreshNudge.mu.Lock()
+			cooldownAfter := antigravityRefreshNudge.lastAt
+			antigravityRefreshNudge.mu.Unlock()
+			if !tc.want && !cooldownAfter.Equal(cooldownBefore) {
+				t.Error("a refused nudge stamped the cooldown")
+			}
+			// The legacy entry point is the unproven floor.
+			if !tc.proven && tc.state == nil && tc.setup == nil &&
+				nudgeAntigravityUsageRefresh(now, observed.UnixMilli(), exit) != tc.want {
+				t.Error("nudgeAntigravityUsageRefresh disagrees with the unproven floor")
+			}
+		})
 	}
 }

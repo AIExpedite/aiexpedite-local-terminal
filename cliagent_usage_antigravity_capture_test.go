@@ -131,12 +131,19 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 // run-completion debt worker spends, and reports how many times it ran.
 func helperStubAntigravityCodeAssistOutcome(t *testing.T, outcome func() string) *atomic.Int64 {
 	t.Helper()
+	return helperStubAntigravityCodeAssistOutcomeCtx(t, func(context.Context) string { return outcome() })
+}
+
+// helperStubAntigravityCodeAssistOutcomeCtx is helperStubAntigravityCodeAssistOutcome
+// for a stub that notes on the probe's own context (a skew expiry).
+func helperStubAntigravityCodeAssistOutcomeCtx(t *testing.T, outcome func(context.Context) string) *atomic.Int64 {
+	t.Helper()
 	orig := probeAntigravityQuotaCodeAssistFn
 	t.Cleanup(func() { probeAntigravityQuotaCodeAssistFn = orig })
 	var calls atomic.Int64
-	probeAntigravityQuotaCodeAssistFn = func(context.Context, string, func() time.Time) string {
+	probeAntigravityQuotaCodeAssistFn = func(ctx context.Context, _ string, _ func() time.Time) string {
 		calls.Add(1)
-		return outcome()
+		return outcome(ctx)
 	}
 	return &calls
 }

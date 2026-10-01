@@ -108,8 +108,11 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 	// foreign run no reading covers yet, as the log index classifies it
 	// (cliagent_usage_antigravity_log_index.go). The agent's own `agy`
 	// children, managed runs and runs still going never count — the newest log
-	// by mtime did, which is how every `agy models` probe owed a refresh.
-	owedLog := antigravityNewestOwedLog(quotaBases, now)
+	// by mtime did, which is how every `agy models` probe owed a refresh. A
+	// floor whose run's exit the index PROVED is nudged without the minute's
+	// settle guard (nudgeAntigravityUsageRefreshFloor).
+	owed := antigravityNewestOwedFloor(quotaBases, now)
+	owedLog := owed.At
 	// While the agent's own `agy` child is running, a log it is still writing
 	// cannot be classified yet: neither the diagnostic nor the nudge acts.
 	ownChildRunning := antigravityOwnChildRunning()
@@ -217,7 +220,7 @@ func (p antigravityUsageParser) ParseContext(ctx context.Context, home string, d
 		// The same evidence, acted on: a due retry, or an owe-ready run newer
 		// than the replayed reading, arms the bounded refresh so the next gather replays
 		// a reading taken after that run (cliagent_usage_antigravity_refresh_schedule.go).
-		nudgeAntigravityUsageRefresh(now, antigravitySnapshotObservedMs(snap), owedLog)
+		nudgeAntigravityUsageRefreshFloor(now, antigravitySnapshotObservedMs(snap), owed)
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)
