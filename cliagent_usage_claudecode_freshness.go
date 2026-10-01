@@ -584,7 +584,13 @@ func releaseClaudeRunDebtClaim(leaseMs int64) func(*claudeRateLimitSnapshot) boo
 // reserve too before either response landed — two requests in one wave on an
 // account-scoped endpoint. On success leaseMs is the lease written, for the
 // caller to hand to releaseClaudeRunDebtClaim once its attempt is over.
-func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk bool, leaseMs int64) {
+//
+// `leasedElsewhere` reports a refusal by ANOTHER process's live claim lease:
+// that process has a request for this debt on the wire now, so the caller must
+// send nothing of its own until it lands — not even a routine stale-TTL probe,
+// which the cross-process dedupe cannot see coming because the leased request
+// has not persisted anything yet.
+func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk, leasedElsewhere bool, leaseMs int64) {
 	charge := adjustClaudeRefreshAttemptsAt(owed, +1)
 	owedMs := owed.UnixMilli()
 	locked := false
@@ -593,6 +599,7 @@ func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onD
 		onDisk = snap.RefreshOwedAtMs == owedMs
 		now := time.Now()
 		if _, live := claudeRunDebtLeaseLive(snap, now); live {
+			leasedElsewhere = true
 			return false
 		}
 		if !charge(snap) {
@@ -606,7 +613,7 @@ func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onD
 	}
 	// The lock was never granted: the debt may well be on disk, so this is a
 	// refused reservation, not an untracked debt.
-	return reserved, onDisk || !locked, leaseMs
+	return reserved, onDisk || !locked, leasedElsewhere, leaseMs
 }
 
 // claudePublishRunDebtClaim writes the claim lease for an attempt that has just

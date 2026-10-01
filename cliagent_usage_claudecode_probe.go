@@ -2385,20 +2385,30 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// request, so a crash mid-click leaves nothing spent — while the lease it
 	// published is kept until the click's attempt is over, so another process
 	// still cannot reserve alongside it.
+	//
+	// That early refund is best-effort like every cache write, so when it does
+	// not land (another writer holding the gate or the file lock) the charge is
+	// kept as clickCharge and refunded again once the click is over, issued or
+	// not: a contended cache must not turn a click into a spent automatic slot.
+	// Keyed to the instant, so a debt settled or replaced meanwhile refuses it.
 	issuedOwn := false
 	charged, lease := seedCharged, seedLease
+	clickCharge := time.Time{}
 	if forced && !charged.IsZero() {
-		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, adjustClaudeRefreshAttemptsAt(charged, -1))
+		if !mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, adjustClaudeRefreshAttemptsAt(charged, -1)) {
+			clickCharge = charged
+		}
 		charged = time.Time{}
 	}
 	defer func() {
-		if charged.IsZero() && lease == 0 {
+		if charged.IsZero() && clickCharge.IsZero() && lease == 0 {
 			return
 		}
 		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
 			released := lease != 0 && releaseClaudeRunDebtClaim(lease)(snap)
 			refunded := !charged.IsZero() && !issuedOwn && adjustClaudeRefreshAttemptsAt(charged, -1)(snap)
-			return released || refunded
+			clickRefunded := !clickCharge.IsZero() && adjustClaudeRefreshAttemptsAt(clickCharge, -1)(snap)
+			return released || refunded || clickRefunded
 		})
 	}()
 	if !seeded.IsZero() && !forced {
@@ -2418,10 +2428,19 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// does not probe FOR the debt; the TTL still applies. A debt only this
 	// process holds (its durable write was dropped, and a re-owe rung is armed)
 	// has no budget on disk to charge, and the gate's floor bounds it.
+	//
+	// A refusal by ANOTHER process's live claim lease is different: its request
+	// for this debt is on the wire now and has persisted nothing yet, so the
+	// observation dedupe below cannot see it. Falling through to a stale-TTL
+	// routine probe would send a duplicate in the same wave, so the gather stands
+	// down and reports only whether the shared cache already moved — the next
+	// gather reads the leased reading.
 	if owing && !forced && charged.IsZero() && !claudeUsageProbe.blockedFromIssuing(now) {
-		switch reserved, onDisk, reservedLease := claudeReserveRunDebtSlot(fingerprint, owed); {
+		switch reserved, onDisk, leasedElsewhere, reservedLease := claudeReserveRunDebtSlot(fingerprint, owed); {
 		case reserved:
 			charged, lease = owed, reservedLease
+		case leasedElsewhere:
+			return claudeUsageProbe.refreshLandedSince(generation, fingerprint, latest)
 		case onDisk:
 			owing = false
 		}

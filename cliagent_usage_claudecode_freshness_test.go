@@ -3676,7 +3676,7 @@ func TestClaudeReserveRunDebtSlot_RefusedWhileAnotherAttemptHoldsTheLease(t *tes
 	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &owner, &ownerInFlight, &lease)) {
 		t.Fatal("the owner's claim was refused")
 	}
-	reserved, onDisk, _ := claudeReserveRunDebtSlot(fp, owed)
+	reserved, onDisk, _, _ := claudeReserveRunDebtSlot(fp, owed)
 	if reserved || !onDisk {
 		t.Fatalf("reserved=%v onDisk=%v under a live lease, want a refusal of a debt that is on disk", reserved, onDisk)
 	}
@@ -3687,7 +3687,7 @@ func TestClaudeReserveRunDebtSlot_RefusedWhileAnotherAttemptHoldsTheLease(t *tes
 	if !mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtClaim(lease)) {
 		t.Fatal("the owner could not release its lease")
 	}
-	if reserved, _, _ := claudeReserveRunDebtSlot(fp, owed); !reserved {
+	if reserved, _, _, _ := claudeReserveRunDebtSlot(fp, owed); !reserved {
 		t.Error("the reservation was still refused after the lease was released")
 	}
 }
@@ -3807,7 +3807,7 @@ func TestClaudeReserveRunDebtSlot_PublishesALeaseThatRefusesASecondReservation(t
 	claudeOweRunRefresh(owed)
 	fp := currentClaudeAccountFingerprint()
 
-	reserved, onDisk, lease := claudeReserveRunDebtSlot(fp, owed)
+	reserved, onDisk, _, lease := claudeReserveRunDebtSlot(fp, owed)
 	if !reserved || !onDisk || lease <= now.UnixMilli() {
 		t.Fatalf("reserved=%v onDisk=%v lease=%d, want a granted reservation with a future lease", reserved, onDisk, lease)
 	}
@@ -3815,7 +3815,7 @@ func TestClaudeReserveRunDebtSlot_PublishesALeaseThatRefusesASecondReservation(t
 		t.Fatalf("lease=%d attempts=%d on disk, want the published lease %d and one slot", snap.AttemptClaimedUntilMs, snap.RefreshOwedAttempts, lease)
 	}
 
-	if again, onDisk, _ := claudeReserveRunDebtSlot(fp, owed); again || !onDisk {
+	if again, onDisk, _, _ := claudeReserveRunDebtSlot(fp, owed); again || !onDisk {
 		t.Fatalf("reserved=%v onDisk=%v, want the second reservation refused by the first one's lease", again, onDisk)
 	}
 	elsewhere, inFlight := false, time.Time{}
@@ -3830,7 +3830,7 @@ func TestClaudeReserveRunDebtSlot_PublishesALeaseThatRefusesASecondReservation(t
 	if !mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtClaim(lease)) {
 		t.Fatal("the gather could not release its lease")
 	}
-	if again, _, _ := claudeReserveRunDebtSlot(fp, owed); !again {
+	if again, _, _, _ := claudeReserveRunDebtSlot(fp, owed); !again {
 		t.Error("the reservation was still refused after the lease was released")
 	}
 }
@@ -3856,7 +3856,7 @@ func TestClaudeUsageProbeGate_CacheSeedChargePublishesALease(t *testing.T) {
 	if snap := claudeCacheSnapshot(t, cache); snap.AttemptClaimedUntilMs != lease {
 		t.Fatalf("lease on disk=%d, want the seed's %d", snap.AttemptClaimedUntilMs, lease)
 	}
-	if reserved, onDisk, _ := claudeReserveRunDebtSlot(fp, owed); reserved || !onDisk {
+	if reserved, onDisk, _, _ := claudeReserveRunDebtSlot(fp, owed); reserved || !onDisk {
 		t.Fatalf("reserved=%v onDisk=%v, want another reservation refused while the seed's attempt is out", reserved, onDisk)
 	}
 }
@@ -3925,5 +3925,93 @@ func TestClaudeUsageProbeGate_CacheSeedRestoresAPersistedCredentialWait(t *testi
 	}
 	if n := atomic.LoadInt64(calls); n != 0 {
 		t.Errorf("the seed issued %d requests, want 0", n)
+	}
+}
+
+// A gather whose debt reservation is refused by ANOTHER process's live claim
+// lease stands down, even when its cached reading is also stale by the TTL: the
+// leased request has persisted nothing yet, so a routine stale-cache probe
+// would be a duplicate in the same wave on an account-scoped endpoint.
+func TestClaudeUsageProbe_GatherStandsDownUnderAnotherProcesssLease(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	claudeUsageProbe.recordOwed(owed)
+	// Another process has charged the debt and has its request on the wire.
+	foreignLease := now.Add(claudeRunDebtClaimLease() / 2).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAttempts, snap.AttemptClaimedUntilMs = 1, foreignLease
+		return true
+	}) {
+		t.Fatal("precondition: could not persist the foreign lease")
+	}
+
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Fatalf("the gather issued %d requests under another process's lease, want 0", n)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.AttemptClaimedUntilMs != foreignLease {
+		t.Errorf("attempts=%d lease=%d, want the foreign charge %d and lease %d untouched",
+			snap.RefreshOwedAttempts, snap.AttemptClaimedUntilMs, 1, foreignLease)
+	}
+}
+
+// The click's early refund of the seed's charge is best-effort; when another
+// writer holds the cache then, the refund is retried once the click is over, so
+// a contended cache never turns a click into a spent automatic slot.
+func TestClaudeUsageProbe_ClickRefundRetriesWhenTheEarlyRefundIsContended(t *testing.T) {
+	released := make(chan struct{})
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-released
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	originalWait := claudeRateLimitBestEffortGateWait
+	claudeRateLimitBestEffortGateWait = 20 * time.Millisecond
+	originalHook := claudeUsageProbeAfterSeedCharge
+	t.Cleanup(func() {
+		claudeRateLimitBestEffortGateWait = originalWait
+		claudeUsageProbeAfterSeedCharge = originalHook
+	})
+	// Another writer takes the cache right after the seed charged, and keeps it
+	// until well past the early refund's best-effort wait.
+	var once sync.Once
+	claudeUsageProbeAfterSeedCharge = func() {
+		once.Do(func() {
+			lockClaudeRateLimitCache()
+			time.AfterFunc(300*time.Millisecond, func() {
+				unlockClaudeRateLimitCache()
+				close(released)
+			})
+		})
+	}
+
+	clickCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
+	refreshClaudeUsageIfStale(clickCtx, now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n == 0 {
+		t.Fatal("the click issued no request")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 0 {
+		t.Errorf("RefreshOwedAttempts=%d, want 0: the contended refund must be retried", snap.RefreshOwedAttempts)
+	}
+	if snap.AttemptClaimedUntilMs != 0 {
+		t.Errorf("AttemptClaimedUntilMs=%d, want the seed's lease released", snap.AttemptClaimedUntilMs)
 	}
 }
