@@ -1096,7 +1096,12 @@ func (g *claudeUsageProbeGate) refreshLandedSince(generation uint64, fingerprint
 // back whether a request of its own actually went out and refunds this charge
 // when none did — the mirror of payOwedClaudeUsageRefreshAt's own refund, and
 // what keeps one HTTP request from costing the two attempts the cap allows.
-func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time) {
+//
+// The THIRD return is the claim lease the charge published with it (zero when
+// nothing was charged), so another process cannot reserve for the same debt
+// while this gather's request is out. The caller releases it once its attempt
+// is over — see releaseClaudeRunDebtClaim.
+func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time, chargedLease int64) {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
 	// One-shot, for the post-latch stamp recheck below.
@@ -1152,7 +1157,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					continue
 				}
 			}
-			return superseded, time.Time{}
+			return superseded, time.Time{}, 0
 		}
 		if pending := g.seedingCh; pending != nil {
 			g.mu.Unlock()
@@ -1164,7 +1169,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			select {
 			case <-pending:
 			case <-ctx.Done():
-				return time.Time{}, time.Time{}
+				return time.Time{}, time.Time{}, 0
 			}
 			continue
 		}
@@ -1201,7 +1206,15 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		g.mu.Unlock()
 		close(seeding)
 	}()
-	persisted, attempts, held := claudePersistedProbeStateFor(fingerprint)
+	persisted, attempts, held, authWait := claudePersistedProbeStateWithWaitFor(fingerprint)
+	// The credential wait a previous attempt (or process) persisted, restored
+	// before this gather can be admitted — as payOwedClaudeUsageRefreshAt does,
+	// but that runs on a spawned goroutine this gather can beat after a restart.
+	// Without it the gather finds no in-memory wait and re-sends the unchanged
+	// token the endpoint already answered 401 for; a few such starts spend the
+	// debt's whole budget on it and retire the debt without ever waiting for a
+	// credential rewrite. noteAuthWait ignores a zero stamp.
+	g.noteAuthWait(authWait)
 	// A debt the replay would retire without a request is not adopted either:
 	// this read races the replay, and adopting a capped, aged-out or skewed debt
 	// would let the gather spend the uncharged request the cap exists to refuse.
@@ -1359,11 +1372,19 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 				}
 				// The same, for another PROCESS's attempt: its durable claim
 				// lease says a request for this debt is already on the wire.
-				if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
+				lockNow := time.Now()
+				if _, live := claudeRunDebtLeaseLive(snap, lockNow); live {
 					lockedInFlight = true
 					return false
 				}
-				return charge(snap)
+				if !charge(snap) {
+					return false
+				}
+				// And publish this gather's own claim, so another process's
+				// gather or rung cannot reserve for the same debt while this
+				// request is out.
+				chargedLease = claudePublishRunDebtClaim(snap, lockNow)
+				return true
 			})
 		claudeUsageProbeAfterSeedCharge()
 		if lockedHeld || lockedInFlight {
@@ -1416,7 +1437,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 			// describes the file — and an uncharged debt is not adopted. The
 			// reading sampled above still travels, so a settlement that landed in
 			// the gap is reported to the caller as a re-read.
-			persisted = time.Time{}
+			persisted, chargedLease = time.Time{}, 0
 		}
 	}
 	g.mu.Lock()
@@ -1461,9 +1482,9 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		}
 		// A debt was adopted, so the caller has a probe to issue: report no
 		// re-read even if the cache moved, or it would return before reaching it.
-		return time.Time{}, chargedDebt
+		return time.Time{}, chargedDebt, chargedLease
 	}
-	return g.supersedingObservationLocked(landed, latest, now), chargedDebt
+	return g.supersedingObservationLocked(landed, latest, now), chargedDebt, chargedLease
 }
 
 // supersedingObservationLocked decides whether `observation` — the freshest
@@ -2336,7 +2357,7 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// not that reading. The verdict is carried instead, and answers the forced
 	// gather only if its own attempts produce nothing — re-reading a cache that
 	// advanced still beats publishing the view it loaded before.
-	seeded, seedCharged := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
+	seeded, seedCharged, seedLease := claudeUsageProbe.seedOwedFromCache(ctx, fingerprint, accessToken, generation, now, latest)
 	// The seed charges the adopted debt's durable attempt against the request this
 	// gather is about to issue, but it can only establish that begin() would admit
 	// one as of the moment it charged: the startup replay sitting between its own
@@ -2354,14 +2375,20 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// it) or replaced while we probed refuses the refund rather than inventing an
 	// attempt. Best-effort like the charge itself: a contended cache drops it,
 	// which only ever spends the budget faster, never wrongly.
+	//
+	// The claim lease the charge published is released on every path, issued or
+	// not: once this gather's attempt is over, nothing of ours is on the wire.
 	issuedOwn := false
-	charged := seedCharged
+	charged, lease := seedCharged, seedLease
 	defer func() {
-		if issuedOwn || charged.IsZero() {
+		if charged.IsZero() {
 			return
 		}
-		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint,
-			adjustClaudeRefreshAttemptsAt(charged, -1))
+		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
+			released := lease != 0 && releaseClaudeRunDebtClaim(lease)(snap)
+			refunded := !issuedOwn && adjustClaudeRefreshAttemptsAt(charged, -1)(snap)
+			return released || refunded
+		})
 	}()
 	if !seeded.IsZero() && !forced {
 		return true
@@ -2381,9 +2408,9 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// process holds (its durable write was dropped, and a re-owe rung is armed)
 	// has no budget on disk to charge, and the gate's floor bounds it.
 	if owing && !forced && charged.IsZero() && !claudeUsageProbe.blockedFromIssuing(now) {
-		switch reserved, onDisk := claudeReserveRunDebtSlot(fingerprint, owed); {
+		switch reserved, onDisk, reservedLease := claudeReserveRunDebtSlot(fingerprint, owed); {
 		case reserved:
-			charged = owed
+			charged, lease = owed, reservedLease
 		case onDisk:
 			owing = false
 		}

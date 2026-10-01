@@ -361,9 +361,20 @@ func claudeOweRunRefreshNow(baseline time.Time) {
 // a reader sees a whole file or the previous whole file, and taking the gate for
 // a read would queue this behind writers on the gather path.
 func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts int, held time.Time) {
+	owed, attempts, held, _ = claudePersistedProbeStateWithWaitFor(fingerprint)
+	return owed, attempts, held
+}
+
+// claudePersistedProbeStateWithWaitFor is claudePersistedProbeStateFor plus the
+// persisted credential wait (AuthWaitCredStampNs / AuthWaitCredSize), from the
+// same single unlocked read. The gather's seed restores that wait before it can
+// be admitted, as the startup replay does: a first gather that beats the replay
+// after a restart would otherwise re-send the very token the endpoint answered
+// 401 for, and a few such starts would spend the debt's whole budget on it.
+func claudePersistedProbeStateWithWaitFor(fingerprint string) (owed time.Time, attempts int, held time.Time, wait claudeCredStamp) {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	if !ok || snap.AccountFingerprint != fingerprint {
-		return time.Time{}, 0, time.Time{}
+		return time.Time{}, 0, time.Time{}, claudeCredStamp{}
 	}
 	if snap.RefreshOwedAtMs != 0 {
 		owed, attempts = time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
@@ -371,7 +382,8 @@ func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts 
 	if snap.HeldUntilMs > 0 {
 		held = time.UnixMilli(snap.HeldUntilMs)
 	}
-	return owed, attempts, held
+	wait = claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize}
+	return owed, attempts, held, wait
 }
 
 // claudeRefreshDebtRetired reports whether a persisted debt is past paying:
@@ -519,8 +531,7 @@ func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bo
 			return false
 		}
 		snap.NextAttemptAtMs = 0
-		snap.AttemptClaimedUntilMs = now.Add(claudeRunDebtClaimLease()).UnixMilli()
-		*leaseMs = snap.AttemptClaimedUntilMs
+		*leaseMs = claudePublishRunDebtClaim(snap, now)
 		return true
 	}
 }
@@ -566,21 +577,45 @@ func releaseClaudeRunDebtClaim(leaseMs int64) func(*claudeRateLimitSnapshot) boo
 // disk to charge at all, so a refused reservation (the cap, a contended lock,
 // another process's live claim) can be told apart from a debt only this
 // process holds.
-func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk bool) {
+//
+// A granted reservation also PUBLISHES a claim lease, as the rung claim does:
+// honouring other processes' leases is only half of it, and a reservation that
+// left AttemptClaimedUntilMs unset would let a second process's gather or rung
+// reserve too before either response landed — two requests in one wave on an
+// account-scoped endpoint. On success leaseMs is the lease written, for the
+// caller to hand to releaseClaudeRunDebtClaim once its attempt is over.
+func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk bool, leaseMs int64) {
 	charge := adjustClaudeRefreshAttemptsAt(owed, +1)
 	owedMs := owed.UnixMilli()
 	locked := false
 	reserved = mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
 		locked = true
 		onDisk = snap.RefreshOwedAtMs == owedMs
-		if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
+		now := time.Now()
+		if _, live := claudeRunDebtLeaseLive(snap, now); live {
 			return false
 		}
-		return charge(snap)
+		if !charge(snap) {
+			return false
+		}
+		leaseMs = claudePublishRunDebtClaim(snap, now)
+		return true
 	})
+	if !reserved {
+		leaseMs = 0
+	}
 	// The lock was never granted: the debt may well be on disk, so this is a
 	// refused reservation, not an untracked debt.
-	return reserved, onDisk || !locked
+	return reserved, onDisk || !locked, leaseMs
+}
+
+// claudePublishRunDebtClaim writes the claim lease for an attempt that has just
+// charged the debt's budget under the cache lock, and returns it. Every path
+// that charges the budget publishes one, so no other process can reserve for
+// the same debt while this attempt's request is out.
+func claudePublishRunDebtClaim(snap *claudeRateLimitSnapshot, now time.Time) int64 {
+	snap.AttemptClaimedUntilMs = now.Add(claudeRunDebtClaimLease()).UnixMilli()
+	return snap.AttemptClaimedUntilMs
 }
 
 // dropClaudeSkewedHold clears a 429 hold ONLY while it is still the exact value
