@@ -2278,10 +2278,14 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 	claudeOweRunRefresh(runEnded)
 
 	// Each pass is a fresh process inheriting the same cache: only the gate is
-	// reset, exactly as a self-update restart leaves things.
+	// reset, exactly as a self-update restart leaves things. Each starts once
+	// the previous pass's in-flight lease has expired — inside it, the claimed
+	// rung is still being paid and a later start must not adopt it.
+	lease := claudeUsageProbeWholeTimeout + claudeUsageProbeTrailingSlack + time.Millisecond
 	for attempt := 1; attempt <= claudeRefreshDebtMaxAttempts; attempt++ {
 		resetClaudeUsageProbeGate()
 		SetClaudeUsageProbeDisabled(false)
+		now = now.Add(lease)
 		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
 		if got := claudeUsageProbe.owedObservation(); got.UnixMilli() != runEnded.UnixMilli() {
 			t.Fatalf("pass %d adopted owed=%v, want the persisted debt %v", attempt, got, runEnded)
@@ -2299,6 +2303,7 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 	// another uncharged request for it.
 	resetClaudeUsageProbeGate()
 	SetClaudeUsageProbeDisabled(false)
+	now = now.Add(lease)
 	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
 	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
 		t.Errorf("a capped debt was adopted as %v; the gather would issue an uncharged request for it", got)

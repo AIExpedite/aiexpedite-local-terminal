@@ -16,6 +16,7 @@ import (
 	"go/token"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -575,6 +576,75 @@ func TestClaudeGather_SeedDoesNotAdoptADebtWithAFutureRung(t *testing.T) {
 	}
 	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
 		t.Fatalf("the seed adopted a debt whose rung is not due: %v", got)
+	}
+}
+
+// A gather seed that pays a due rung CLAIMS it, as the replay does: the charge
+// writes an in-flight lease, so another agent process whose gather reaches the
+// same rung finds it pending and neither charges nor sends.
+func TestClaudeGather_SeedClaimsTheDueRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest, owed, due := now.Add(-2*time.Minute), now.Add(-time.Minute), now.Add(-time.Second)
+	seedClaudeBookedRung(t, cache, fp, latest, owed, 1, due)
+
+	simulateClaudeAgentRestart(t)
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1 for the due rung", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 2 || snap.NextAttemptAtMs <= now.UnixMilli() {
+		t.Fatalf("the seed must charge once and leave an in-flight lease: %+v", snap)
+	}
+
+	// The other process: a fresh gate whose gather reaches the seed while the
+	// lease is live.
+	simulateClaudeAgentRestart(t)
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1 — a second process paid the claimed rung", got)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 2 {
+		t.Fatalf("attempts=%d, want 2 — a second process charged the claimed rung", got)
+	}
+}
+
+// A seed whose judged counter moved before its locked charge — another
+// process charged the same debt in the gap — has lost the rung: it neither
+// charges nor adopts, so it sends nothing at that ladder instant.
+func TestClaudeGather_SeedThatLosesTheRungSendsNothing(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest, owed, due := now.Add(-2*time.Minute), now.Add(-time.Minute), now.Add(-time.Second)
+	seedClaudeBookedRung(t, cache, fp, latest, owed, 1, due)
+
+	originalHook := claudeUsageProbeBeforeSeedCharge
+	t.Cleanup(func() { claudeUsageProbeBeforeSeedCharge = originalHook })
+	var once sync.Once
+	claudeUsageProbeBeforeSeedCharge = func() {
+		once.Do(func() {
+			if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+				t.Error("the other process's charge did not write the cache")
+			}
+		})
+	}
+
+	simulateClaudeAgentRestart(t)
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the seed paid a rung another process charged", got)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 2 {
+		t.Fatalf("attempts=%d, want 2 — only the other process's charge", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Fatalf("the seed adopted a debt whose rung it lost: %v", got)
 	}
 }
 

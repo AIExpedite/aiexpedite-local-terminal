@@ -1356,7 +1356,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// on the same side of the request here as it does in payOwedClaudeUsageRefreshAt.
 	//
 	// Keyed to the instant read above and bounded at the cap inside
-	// adjustClaudeRefreshAttemptsAt, so a refused charge — contended cache, a debt
+	// claimClaudeRefreshRungAt, so a refused charge — contended cache, a debt
 	// another writer settled or replaced while we read, or a count two overlapping
 	// processes both passed the unlocked retirement test on — means "do not adopt".
 	// That degrades to the pre-seed behaviour: the gather still probes on its own
@@ -1411,7 +1411,22 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	}
 	claudeUsageProbeBeforeSeedCharge()
 	if uncovered {
-		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
+		// The charge is a CLAIM on the rung this seed judged due, the same
+		// compare-and-swap the startup replay makes (claimClaudeRefreshRungAt):
+		// the single flight is process-local, so two agent processes whose
+		// gathers reach the same due rung would otherwise both charge and both
+		// send — two budget slots at one ladder instant. The loser finds the
+		// counter or the rung moved and neither charges nor adopts; the winner's
+		// lease keeps every other routine payer off the debt while its request
+		// is out. A refunded charge leaves the lease to expire on its own, which
+		// only defers the next payer by one probe's length.
+		judgedNextMs := int64(0)
+		if !rung.IsZero() {
+			judgedNextMs = rung.UnixMilli()
+		}
+		lost := false
+		lease := now.Add(claudeUsageProbeWholeTimeout + claudeUsageProbeTrailingSlack).UnixMilli()
+		charge := claimClaudeRefreshRungAt(persisted, attempts, judgedNextMs, lease, &lost)
 		lockedHeldMs := int64(0)
 		lockedObserved := time.Time{}
 		lockedHeld := false
@@ -1479,11 +1494,13 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		if !lockedRung.IsZero() {
 			g.deferOwedUntil(persisted, lockedRung)
 		}
-		if lockedHeld || lockedInFlight || !lockedRung.IsZero() {
+		if lockedHeld || lockedInFlight || !lockedRung.IsZero() || lost {
 			// Declined for a reason that can change without the snapshot changing,
 			// so the latch is left unclaimed exactly as the pre-check leaves it:
 			// the gather after the hold expires — or after the in-flight probe
 			// lands without settling this debt — must reach the adoption again.
+			// A lost claim is left unclaimed too: the other payer's request may
+			// fail, and the next gather re-judges the debt from what it left.
 			// `charged` is false, so the debt is un-adopted by the branch below and
 			// its counter stays where the next start can still spend it.
 			claudeUsageProbeSeedBlocked()
