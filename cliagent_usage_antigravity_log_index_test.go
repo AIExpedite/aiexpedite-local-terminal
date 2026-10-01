@@ -1404,3 +1404,148 @@ func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
 		t.Errorf("block=%q ok=%v, want the detached run's own block", block, ok)
 	}
 }
+
+/* ─────────────────────────── fast exit watch ─────────────────────────── */
+
+// The watch is wanted only while something it can move is tracked: a live
+// candidate, an unpaid proven floor — and no longer once a debt covers that
+// floor, so a terminal no_login debt leaves no polling behind.
+func TestAntigravityExitWatch_WantedOnlyWhileWorkIsTracked(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	if antigravityExitWatchWanted() {
+		t.Fatal("wanted with nothing tracked")
+	}
+	now := time.Now()
+	h.setLive(7201, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7201), now, false)
+	h.pass(now, 0)
+	if !antigravityExitWatchWanted() {
+		t.Fatal("not wanted while a live direct run is tracked")
+	}
+
+	h.setLive(7201, false)
+	res, newlyOwed := antigravityExitWatchPass(now.Add(5*time.Second), 0)
+	antigravityApplyDiscovery(res, now.Add(5*time.Second))
+	if !newlyOwed || !res.owedProven {
+		t.Fatalf("newlyOwed=%v proven=%v, want the exit owed and proven on the watch's own pass", newlyOwed, res.owedProven)
+	}
+	if !antigravityExitWatchWanted() {
+		t.Fatal("not wanted while the proven floor is unpaid")
+	}
+
+	antigravityNudgeProvenFloor(now.Add(5*time.Second), 0, antigravityOwedFloor{At: res.owed, Proven: true})
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.Outcome != liveProbeOutcomeCodeAssistNoLogin {
+		t.Fatalf("state=%+v, want the proven floor owed and found unpayable", state)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want one attempt for the proven floor", reads.Load())
+	}
+	if antigravityExitWatchWanted() {
+		t.Error("still wanted once a (terminal) debt covers the floor")
+	}
+}
+
+// A poll re-evaluates only what is tracked: a log a NEW run wrote in the
+// meantime is left for the tick's listing.
+func TestAntigravityExitWatchPass_NeverListsTheLogDirectory(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now()
+	h.setLive(7301, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7301), now, false)
+	h.pass(now, 0)
+
+	other := h.write(t, helperLogName(now.Add(2*time.Second)), helperPIDBlock(7302), now.Add(2*time.Second), false)
+	antigravityExitWatchPass(now.Add(5*time.Second), 0)
+	if _, tracked := helperEntryClass(other); tracked {
+		t.Error("the watch classified a log it was never tracking")
+	}
+	if _, candidates, _, _, _, _ := helperIndexCounts(); candidates != 1 {
+		t.Errorf("candidates=%d, want only the tracked run", candidates)
+	}
+}
+
+// A nudge refused by the cooldown leaves the proven floor tracked and stamps
+// nothing, so the next poll seconds later pays it.
+func TestAntigravityExitWatch_RetriesARefusedNudge(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	now := time.Now()
+	h.setLive(7401, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7401), now, false)
+	h.pass(now, 0)
+	h.setLive(7401, false)
+	res, _ := antigravityExitWatchPass(now.Add(time.Second), 0)
+	owed := antigravityOwedFloor{At: res.owed, Proven: res.owedProven}
+
+	cooldown := now.Add(-30 * time.Second)
+	antigravityRefreshNudge.mu.Lock()
+	antigravityRefreshNudge.lastAt = cooldown
+	antigravityRefreshNudge.mu.Unlock()
+	antigravityNudgeProvenFloor(now.Add(time.Second), 0, owed)
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 0 || !antigravityExitWatchWanted() {
+		t.Fatalf("reads=%d wanted=%v, want the refused floor kept for the next poll", reads.Load(), antigravityExitWatchWanted())
+	}
+	antigravityRefreshNudge.mu.Lock()
+	stamped := !antigravityRefreshNudge.lastAt.Equal(cooldown)
+	antigravityRefreshNudge.mu.Unlock()
+	if stamped {
+		t.Error("a refused nudge stamped the cooldown")
+	}
+
+	// Next poll, once the cooldown has lapsed (moved back rather than the
+	// clock forward: the debt is stamped with the wall clock).
+	antigravityRefreshNudge.mu.Lock()
+	antigravityRefreshNudge.lastAt = now.Add(-antigravityRefreshNudgeCooldown - time.Second)
+	antigravityRefreshNudge.mu.Unlock()
+	antigravityNudgeProvenFloor(now.Add(time.Second), 0, owed)
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the retried nudge paid once", reads.Load())
+	}
+	if antigravityExitWatchWanted() {
+		t.Error("the watch still tracks a floor its debt now owns")
+	}
+}
+
+// End to end on the tick's goroutine: tracking a live direct run starts the
+// watch, the run's exit is owed and paid within polls, and the watch stops.
+func TestAntigravityExitWatch_StartsAndStopsWithTheTick(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	origTick, origWatch := antigravityDiscoveryInterval, antigravityExitWatchInterval
+	antigravityDiscoveryInterval, antigravityExitWatchInterval = time.Hour, 10*time.Millisecond
+	startAntigravityDiscovery()
+	t.Cleanup(func() {
+		stopAntigravityDiscovery()
+		antigravityDiscoveryInterval, antigravityExitWatchInterval = origTick, origWatch
+	})
+
+	await := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+	if antigravityExitWatchActive.Load() {
+		t.Fatal("the watch runs with nothing tracked")
+	}
+	now := time.Now()
+	h.setLive(7501, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7501), now, false)
+	h.pass(now, 0) // a gather's pass: wakes the tick's goroutine
+	await("the watch to start", antigravityExitWatchActive.Load)
+
+	h.setLive(7501, false)
+	await("the exit to be paid", func() bool { return reads.Load() == 1 })
+	await("the watch to stop", func() bool { return !antigravityExitWatchActive.Load() })
+
+	stopAntigravityDiscovery()
+	if antigravityExitWatchActive.Load() {
+		t.Error("the watch outlived the tick")
+	}
+}
