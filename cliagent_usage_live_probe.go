@@ -660,7 +660,9 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 // The renewal starts that spacing clock before its child runs, so a child the
 // click's budget cancels part-way spends the device's renewal for nothing. The
 // click therefore renews only when, after any wait, its budget still covers the
-// child's own cap (antigravityClickRenewalFits); otherwise it renews nothing
+// whole renewal bound the debt worker grants it (antigravityLoginRenewTimeout:
+// the keyring re-read and executable lookup before the child, then the child's
+// own cap; antigravityClickRenewalFits); otherwise it renews nothing
 // and leaves the renewal to the debt worker. The final read is not reserved
 // for: a renewed login stays in the keyring for the next read either way.
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent) string {
@@ -696,10 +698,12 @@ func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAg
 var antigravityClickExpiryWaitFn = sleepWithContext
 
 // antigravityClickRenewalFits reports whether ctx, after waiting wait, still
-// leaves the renewal child its whole cap (cliAgentModelProbeTimeout).
+// leaves the renewal its whole bound (antigravityLoginRenewTimeout), not just
+// the child's cap: the renewal re-reads the keyring and resolves the
+// executable before the child starts.
 func antigravityClickRenewalFits(ctx context.Context, wait time.Duration) bool {
 	deadline, ok := ctx.Deadline()
-	return !ok || time.Until(deadline)-wait >= cliAgentModelProbeTimeout
+	return !ok || time.Until(deadline)-wait >= antigravityLoginRenewTimeout
 }
 
 // antigravityCodeAssistBuildVersion resolves the `agy` build the Code Assist

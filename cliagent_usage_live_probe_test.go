@@ -1410,8 +1410,9 @@ func TestProbeAntigravityQuotaViaCodeAssist_WaitsOutTheSkewBandBeforeRenewing(t 
 }
 
 // The renewal starts the shared spacing clock before its child runs, so a click
-// renews only when its budget, after any skew wait, still covers the child's
-// whole cap; otherwise it waits for nothing and renews nothing, leaving the
+// renews only when its budget, after any skew wait, still covers the whole
+// renewal bound (keyring re-read and executable lookup, then the child's cap);
+// otherwise it waits for nothing and renews nothing, leaving the
 // device's renewal to the debt worker.
 func TestProbeAntigravityQuotaViaCodeAssist_RenewsOnlyWhenTheBudgetCoversTheChild(t *testing.T) {
 	for _, tc := range []struct {
@@ -1426,6 +1427,8 @@ func TestProbeAntigravityQuotaViaCodeAssist_RenewsOnlyWhenTheBudgetCoversTheChil
 			wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
 		{name: "expired, budget short of the child", left: -time.Second, budget: cliAgentModelProbeTimeout - time.Second,
 			wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
+		{name: "expired, budget covers the child but not the pre-child work", left: -time.Second,
+			budget: antigravityLoginRenewTimeout - time.Second, wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
 		{name: "expired, full budget", left: -time.Second, budget: cliUsageLiveProbeBudget,
 			wantSpawned: 1, wantOutcome: liveProbeOutcomeCodeAssistOK},
 	} {
