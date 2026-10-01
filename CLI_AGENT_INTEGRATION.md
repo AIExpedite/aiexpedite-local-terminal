@@ -1223,12 +1223,32 @@ size: no rollout scanning, no cursor, one outbound read.
   follow-up gather cannot send a second read seconds later. **Ceiling: one
   outbound call per minute, whatever the run volume** — 200 short runs in an
   hour still spend at most 60.
-- **It never runs a model turn.** The click may run the `agy models` warm-up to
-  make the CLI refresh its own keyring token; doing that behind the user's back
-  on run teardown is a different class of side effect. So `codeassist_token_expired`
-  KEEPS the debt and its budget (the next real run refreshes the keyring for
-  free, and the schedule re-checks on its free rung) and only
-  `codeassist_no_login` stops attempting. The build the request
+- **It never runs a model turn, and it renews an expired login once.** Since
+  `agy` 1.2.2 the debt is the only route that returns numbers, so an expired
+  stored login that nothing renews inside the controller's 90 s + 30 s window
+  is a stale card. `codeassist_token_expired` with the token already PAST its
+  expiry stamps `loginRenewedAtMs` on the debt (persisted BEFORE the child
+  starts, so a restart or self-update loop cannot renew twice for one debt),
+  runs `renewAntigravityStoredLogin` — an uncached `agy models` through
+  `refreshCLIAgentModelDiscovery`, i.e. the same child model discovery already
+  runs every 30 minutes, registered as an own child (`beginAntigravityOwnChild`)
+  so its log never owes, its list stored back into the model-probe cache — and
+  on `renewed` reads again in the SAME attempt (the expired read spent nothing,
+  so the second one is neither spaced nor charged twice; a scheduled pass with
+  one attempt still takes it). The renewal is single-flighted and spaced
+  `antigravityLoginRenewMinInterval` (5 min) per device, shared with the
+  Refresh click; it maps its closed result (`renewed` / `still_expired` /
+  `spaced` / `unavailable`) from the keyring expiry before and after the child,
+  and never reads, logs or persists the token. Anything but `renewed` keeps the
+  debt on the free rung, as before. A token INSIDE the 15 s skew but not yet
+  expired (`agy` still considers it valid, so `agy models` would not renew it)
+  books `antigravityRetryLoginRenew` at its expiry + 1 s (clamped to
+  [now + 1 s, now + the free rung]). Offline, uninstalled, shutdown and
+  `codeassist_no_login` are decided before any renewal and never spawn one; the
+  token is never refreshed with `agy`'s client secret. The renewal relies on
+  `agy` writing a renewed token back to the keyring, which only a real device
+  can prove — the device log line `Stored login renewal finished (renewed |
+  still_expired | …)` shows it. The build the request
   identifies itself as comes from `antigravityCodeAssistBuildVersion` — the same
   cached `--version` detection already ran, shared with the click; on a cold
   cache that is one short `<agy> --version` child (bounded by
@@ -1281,16 +1301,25 @@ size: no rollout scanning, no cursor, one outbound read.
 - **Report.** `antigravityFreshnessNotice(lastObservedAt, now) (notice, pending)`
   is the single accessor — no caller reads the state file. `notice` is empty
   until the debt's budget (`antigravityRefreshDebtMaxAttempts`) is spent, except
-  for an expired stored login, which no attempt of ours can pay and is worded
-  at once ("the next Antigravity run renews it"). The three causes are a missing
+  for an expired stored login, which is worded at once ("the next Antigravity
+  run renews it", or — once the debt's own renewal ran and did not help — "could
+  not be renewed; sign in again with the CLI if the next run does not restore
+  the reading"). The three causes are a missing
   login, an expired one, and a read that kept failing. It is worded on a gated
   build too: `ParseContext` lets the gate banner own the card while the gate is
   the newer fact, and renders this notice in the gated arm otherwise — before,
   every current (gated) build's spent debt could never say anything. `pending`
   doubles as the "is a debt owed" query, and suppresses `antigravityMissedRun`
   for the same run so the pair cannot double-report it.
-- **Redaction.** The state file holds `schemaVersion`, five epoch-millisecond
-  fields (the fifth is the schedule's `nextAttemptAtMs`), an attempt count, the `gated` bool, the hashed `accountFingerprint`
+- **Close-out.** Each debt the worker sees end (paid, `no_login`, or out of
+  budget) prints one line: `Run refresh closed (route=settle|nudge|adopted
+  outcome=<code> runToReadSec=<int> attempts=<n> renewals=<n>)`. `route` is in
+  memory only (a generation nobody noted, e.g. after a restart, reports
+  `adopted`); `runToReadSec` is the reading's instant less `refreshOwedFloorMs`
+  (-1 when no reading paid it), `renewals` comes from `loginRenewedAtMs`.
+- **Redaction.** The state file holds `schemaVersion`, six epoch-millisecond
+  fields (the fifth is the schedule's `nextAttemptAtMs`, the sixth the debt's
+  `loginRenewedAtMs`), an attempt count, the `gated` bool, the hashed `accountFingerprint`
   (written by the PAYMENT — at arm time no server has named an account; it is
   diagnostic only, since clearing is decided by time alone) and a closed-set
   `codeassist_*` outcome. Never a token, a keyring payload, `settings.json`
@@ -1303,7 +1332,11 @@ size: no rollout scanning, no cursor, one outbound read.
 - **Test seams.** `AIEXPEDITE_AGY_FRESHNESS` relocates the state file;
   `antigravityRefreshAfterRunRetryDelay`, `antigravityRefreshMinInterval`,
   `antigravityRunDebtRetryLadder`, `antigravityRunDebtFreeRetryDelay` and
-  `antigravityRefreshNudgeCooldown` are vars so a test pins them small;
+  `antigravityRefreshNudgeCooldown`, `antigravityLoginRenewMinInterval`,
+  `antigravityExitWatchInterval` and `antigravityExitStableFor` are vars so a
+  test pins them small; `renewAntigravityStoredLoginFn`,
+  `refreshCLIAgentModelDiscoveryFn` and `antigravityLoginRenewDetectedFn` drive
+  the renewal without a real `agy`;
   `antigravityUsageRefreshWaitIdle` waits the single-flight worker (and a firing
   rung) out, and `stopAntigravityRunDebtRetry` cancels a pending rung. The mock CLI mode `antigravity-quota-gated`
   (`session_integration_test.go`) is a child-owned language server that refuses
@@ -1363,7 +1396,10 @@ gives the debt a bounded schedule and a second, state-independent trigger.
   diagnostic keeps `antigravityMissedRunSlack` (60 s), while the nudge passes 0
   — both instants are fixed once a run ends, so a run that finished inside the
   slack would be invisible to it forever — and instead requires the log to be at
-  least `antigravityRefreshMinInterval` old (the settle guard), compares at the
+  least `antigravityRefreshMinInterval` old (the settle guard) UNLESS the log
+  index proved the run's exit (`nudgeAntigravityUsageRefreshFloor` with
+  `antigravityOwedFloor.Proven`; `nudgeAntigravityUsageRefresh` is the
+  non-proven wrapper), compares at the
   card's one-second resolution, and skips while a run of this process is still
   live. Bounded by the minimum interval (which a click's read now feeds) and
   `antigravityRefreshNudgeCooldown` (60 s); it never touches an existing debt,
@@ -1436,14 +1472,54 @@ can.
   adopts it); `antigravityOldestProtectedFloorMs` (managed runs plus
   candidates) replaces the managed-only floor wherever a reading rolls the
   floor back. Once every PID is gone (a recycled PID is gone) the run is owed
-  when the exit has been seen, or the log idle, for 60 s — floor
-  `max(log mtime, exit seen)` — or released without a read when a reading lands
-  after the exit. A run held only by unreadable or overflowing PIDs is owed at
+  — floor `max(log mtime, exit seen)` — or released without a read when a
+  reading lands after the exit. It is owed AT ONCE, and marked proven, when its
+  exit is proven (`antigravityExitProvenLocked`): every PID was recorded live
+  with its start token and is gone now, or every PID was already gone at first
+  sight (a short `agy -p` smoke that started and ended between passes) and the
+  log's size and mtime stayed unchanged across two observations at least
+  `antigravityExitStableFor` (5 s) apart — an append inside that window (a run
+  still writing its startup lines, a same-second run sharing the file) restarts
+  the check — or was last written a whole 60 s before. An unreadable PID or
+  `pidOverflow` is never proof. A log that keeps changing after its run is gone
+  keeps the old bound (60 s after the exit was seen), as do `noPID` logs, the
+  sentinel and hold-limit owes. A process-only PID tracked by its token is
+  proven the same way. A proven floor reaches the nudge as
+  `antigravityOwedFloor{At, Proven: true}`, which skips the nudge's 60 s settle
+  guard (cooldown and read spacing still apply). A run held only by unreadable or overflowing PIDs is owed at
   6 h with one counter line. Past 8 candidates, live PIDs move to
   process-only tracking (up to 64); past that a sentinel keeps the oldest floor
   armed and is released only by an OK `ScanCLIProcessesChecked` showing no
   untracked unmanaged `agy`, or at 6 h. A `noPID` log is owed after 60 s idle
   and is never dropped silently.
+- **Fast exit watch.** On the discovery tick's own goroutine, a second ticker
+  (`antigravityExitWatchInterval`, 5 s) exists only while a candidate (live, or
+  exited and awaiting its stability check), a process-only PID or an unpaid
+  proven floor is tracked (`antigravityExitWatchWanted`); a pass outside the
+  tick (a gather, the startup scan, a detached hand-off) wakes it to re-decide.
+  Each poll (`antigravityExitWatchPass`) probes the tracked PIDs by start token
+  and stats each tracked candidate file — at most 8 × 4 `OpenProcess` checks
+  plus 8 stats, and the process-only PIDs (≤ 64) — under the index lock, with no
+  directory listing and no sentinel scan; a changed file is re-read only once
+  none of its PIDs is live. When it owes a run it drops the lock, runs one
+  discovery pass and nudges with `proven`. While a proven floor is unpaid each
+  poll re-nudges it, so a nudge refused by the cooldown, the read spacing or a
+  running own child (the renewal's own `agy models`) is retried within 5 s; a
+  nudge that starts the worker stamps the cooldown, so this cannot multiply
+  reads. Once a debt covers the floor the watch stops tracking it
+  (`pendingOwedProven` cleared) and the debt's own schedule owns it, so a
+  terminal `no_login` debt leaves no 5 s polling behind. It stops with the tick.
+- **Freshness bounds (direct and managed).** A managed run with a valid login is
+  read at settle, ~1–8 s after the run, or by `max(now + 30 s, lastRead + 60 s)`
+  under the read spacing (≤ ~60 s). An expired login is renewed and read again
+  in the same pass (≤ ~35 s); a token inside the skew band is retried at its
+  expiry + 1 s (≤ ~50 s). A direct run is first seen by the next listing (the
+  60 s tick, or a gather every 15 s while the maintenance controller polls),
+  proven within one 5 s watch poll and nudged: ≤ ~35 s with the controller
+  polling, ≤ ~70 s on ticks alone, ≤ ~90 s once the 60 s read spacing or the
+  nudge cooldown applies. Budgets are unchanged: ≤ 5 outbound reads per debt,
+  the 6 h age-out and the ladder; a renewal is a local child, capped at one per
+  debt (persisted) and one per 5 min per device.
 - **Startup scan.** `adoptAndPayOwedAntigravityRunDebt` runs the first pass
   before adopting: every name whose `cli-YYYYMMDD_HHMMSS` start (local time,
   less 1 h of DST slack) is at or after the cached reading, capped at the newest

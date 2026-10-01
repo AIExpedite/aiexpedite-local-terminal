@@ -30,6 +30,11 @@
 //     writeAntigravityQuotaSnapshotLocked, so ANY route that lands a reading at
 //     or after the floor (in-run loopback, Code Assist, a Refresh click, a
 //     concurrent run's poller) retires the debt exactly once.
+//   - Renew: a read refused for an expired stored login renews it once per
+//     debt (renewAntigravityStoredLogin: `agy models` as the agent's own
+//     child, at most once per five minutes on the device) and reads again in
+//     the same attempt; a token still inside the skew band is retried the
+//     moment it expires. LoginRenewedAtMs is stamped before the child starts.
 //   - Retry: a kept debt is never left with nothing scheduled to return to it.
 //     antigravityScheduleRunDebtRetry persists NextAttemptAtMs and arms one
 //     process-wide timer on a bounded ladder
@@ -39,16 +44,20 @@
 //   - Discover: runs no spawn path armed (a direct `agy` in the user's own
 //     shell) are found by the log index's discovery tick
 //     (cliagent_usage_antigravity_log_index.go) and owed only once every
-//     process of the run has exited; the agent's own `agy` children never owe.
+//     process of the run has exited — at once when that exit is proven, which
+//     the fast exit watch checks every few seconds while such a run is
+//     tracked; the agent's own `agy` children never owe.
 //   - Survive: the debt and its schedule are a file, so StartAgent's
 //     payOwedAntigravityUsageRefresh re-arms a pending schedule, or pays one
 //     bounded attempt for a run the previous process never settled (crash,
 //     restart, self-update).
 //   - Report: a debt that outlived its attempts surfaces through
 //     antigravityFreshnessNotice; while a gated build's own banner is the newer
-//     fact, antigravityGateNotice owns the wording instead.
+//     fact, antigravityGateNotice owns the wording instead. Each debt the
+//     worker sees end prints one close-out line (route, outcome, runToReadSec,
+//     attempts, renewals).
 //
-// Redaction: the state file holds schemaVersion, five epoch-millisecond fields,
+// Redaction: the state file holds schemaVersion, six epoch-millisecond fields,
 // an attempt count, the gated bool, the hashed account fingerprint and a
 // closed-set outcome code. Never a token, a keyring payload, settings.json
 // contents, an account email, a command line, a prompt, a port or log text. The
@@ -1016,7 +1025,8 @@ func antigravityRecordRefreshAttempt(id antigravityDebtID, outcome string, now t
 				state.Attempts = antigravityRefreshDebtMaxAttempts
 			}
 		case liveProbeOutcomeCodeAssistTokenExpired:
-			// Keep the debt and its budget: the next real `agy` run refreshes
+			// Keep the debt and its budget: the pass renews the login once per
+			// debt, and otherwise the next real `agy` run refreshes
 			// the keyring token for free, and this cost no request.
 		default:
 			if state.RefreshOwedAtMs != 0 {
@@ -1165,6 +1175,11 @@ func antigravityFreshnessNotice(lastObservedAt string, now time.Time) (string, b
 		cause = "No Antigravity login is stored on this device, so no reading can be taken; sign in with the CLI to restore it."
 	case liveProbeOutcomeCodeAssistTokenExpired:
 		cause = "The stored Antigravity login has expired; the next Antigravity run renews it and the reading updates then."
+		if state.LoginRenewedAtMs != 0 {
+			// The agent's own renewal ran and did not help, which is the
+			// one case a later run is not certain to fix either.
+			cause = "The stored Antigravity login has expired and could not be renewed; sign in again with the CLI if the next Antigravity run does not restore the reading."
+		}
 	}
 	notice := fmt.Sprintf("%s, before the most recent Antigravity run finished (%s). %s",
 		last, time.UnixMilli(state.RefreshOwedFloorMs).UTC().Format(layout), cause)
