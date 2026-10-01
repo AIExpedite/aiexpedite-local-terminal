@@ -572,7 +572,7 @@ func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates 
 // errClaudeRateLimitCacheRescoped is returned when the snapshot found UNDER THE
 // LOCK belongs to an account this write may not describe. It is a fact about
 // the cache, not about the endpoint, so a caller must not fold it into its
-// provider failure backoff — see the scope note in probeClaudeUsageAdmitted.
+// provider failure backoff — see the scope note in probeClaudeUsageResult.
 var errClaudeRateLimitCacheRescoped = errors.New("claude rate-limit cache: re-scoped to another account")
 
 // mergeClaudeRateLimitCacheCheckedScoped is mergeClaudeRateLimitCacheChecked

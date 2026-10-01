@@ -412,7 +412,7 @@ func claudeRateLimitCacheStamp() (modUnixNano, size int64) {
 // claudeHoldUsageProbe mirrors a 429 Retry-After to disk beside the gate's own
 // in-memory heldUntil, so a restart inside the hold window still sees it.
 //
-// Takes the fingerprint the caller already resolved: probeClaudeUsageAdmitted
+// Takes the fingerprint the caller already resolved: probeClaudeUsageResult
 // reads the credential exactly once per probe, and a second read here would
 // spend a macOS `security` spawn to learn what it is holding.
 //

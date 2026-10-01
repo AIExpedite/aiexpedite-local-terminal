@@ -21,6 +21,27 @@ import (
 	"time"
 )
 
+// runClaudeUsageProbe, probeClaudeUsage and probeClaudeUsageAdmitted are the
+// pre-contract call shapes many cases here are written against, kept as thin
+// adapters over probeClaudeUsageResult — the probe's one production entry
+// point — so those cases still read as they did. `forced` is a claimed click.
+func runClaudeUsageProbe(ctx context.Context, now time.Time, forced bool) (bool, *cliAgentUsageError) {
+	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now, forced)
+	return refreshed, probeErr
+}
+
+func probeClaudeUsage(ctx context.Context, now time.Time, resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time, forced bool) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
+	_, _, refreshed, observedAt, probeErr = probeClaudeUsageAdmitted(ctx, now, resolveIdentity, dedupeBaseline, forced)
+	return refreshed, observedAt, probeErr
+}
+
+func probeClaudeUsageAdmitted(ctx context.Context, now time.Time, resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time, forced bool) (admitted, issued, refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
+	result, refreshed, observedAt := probeClaudeUsageResult(ctx, now, resolveIdentity, dedupeBaseline, forced)
+	return result.admitted, result.issued, refreshed, observedAt, result.err()
+}
+
 // probeTestToken is the access token the credential fixture carries, so the
 // handler can assert the Authorization header the probe actually sends.
 const probeTestToken = "sk-ant-oat-test-token"

@@ -551,7 +551,7 @@ func WithClaudeUsageForceProbe(ctx context.Context, reason claudeForceReason) co
 //
 // Its only caller is refreshClaudeUsageIfStale, the one path a user-initiated
 // refresh takes. Once claimed the bypass travels as an explicit argument down
-// through probeClaudeUsage to begin(), which never reads it from anywhere else —
+// through probeClaudeUsageResult to begin(), which never reads it from anywhere else —
 // so a concurrent post-run or routine probe can neither consume it nor be
 // accelerated by it.
 func claimClaudeUsageForceProbe(ctx context.Context) claudeForceReason {
@@ -601,7 +601,7 @@ var claudeUsageProbeDrainTimeout = 5 * time.Second
 // resetOpenCodeReadinessCache.
 //
 // The drain is load-bearing, not tidiness. triggerClaudeUsageProbeAfterRun runs
-// the probe on a goroutine, and probeClaudeUsage resolves the endpoint AFTER
+// the probe on a goroutine, and probeClaudeUsageResult resolves the endpoint AFTER
 // claiming the gate. A goroutine descheduled between those two points outlives
 // its test: cleanup disarms the gate and t.Setenv restores
 // AIEXPEDITE_CLAUDE_USAGE_PROBE_URL, and the goroutine then resumes and resolves
@@ -1288,7 +1288,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	//
 	// An EMPTY token is the same kind of refusal, and it is decided here rather
 	// than inside blockedFromIssuing because it is a fact about this gather's
-	// credential read, not about the gate: the gather hands probeClaudeUsageAdmitted
+	// credential read, not about the gate: the gather hands probeClaudeUsageResult
 	// a fixed identity, so a token that is empty now is still empty when that
 	// admitted probe reaches its empty-token exit — which refunds the throttle slot
 	// and returns issued=false without asking the endpoint anything. On the common
@@ -1564,7 +1564,7 @@ func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 	}
 	// A rejected endpoint override (malformed or non-loopback) is the one
 	// refusal that lives PAST admission: begin() lets the probe through, it
-	// resolves the credential, and probeClaudeUsage then returns issued=false
+	// resolves the credential, and probeClaudeUsageResult then returns issued=false
 	// without putting anything on the wire. The gather never reports that flag
 	// back here — the adoption hands the debt to a later `owing` branch — so
 	// unlike the startup replay, which refunds its charge on that same exit,
@@ -1708,7 +1708,7 @@ type claudeUsageProbeIdentity struct {
 	// all (an empty scope is a real value — an unscoped cache — so it cannot
 	// double as "absent").
 	//
-	// It exists because probeClaudeUsageAdmitted's sample of the live scope is
+	// It exists because probeClaudeUsageResult's sample of the live scope is
 	// only an at-or-older-than-the-token value when the credential is resolved
 	// there and then. A pre-resolved identity breaks that: the startup replay
 	// reads the credential, judges the hold, charges the attempt and only then
@@ -1837,81 +1837,26 @@ func claudeUsageProbeURL() string {
 	return ""
 }
 
-// runClaudeUsageProbe performs at most one bounded request and merges any
-// windows it read into the shared rate-limit cache with ObservedAtMs = now.
+// probeClaudeUsageResult performs at most one bounded request and merges any
+// windows it read into the shared rate-limit cache with ObservedAtMs = now. It
+// reports the ONE attempt result the contract maps onto the backoff, the
+// run-debt rung and the budget (claudeProbeResult). `bypass` is a claimed CLICK.
+// resolveIdentity is invoked ONLY once the gate has admitted the probe, so a
+// throttled or opted-out call never touches the credential store.
 //
-// Returns whether the cache was refreshed, plus a redacted failure record. The
-// record carries only a category — the message field is local-only diagnostic
-// input everywhere else in this file's neighbourhood, and here it is
-// deliberately never populated from the response body or the credential.
-// runClaudeUsageProbe is the POST-RUN entry point: a Claude run has just
-// finished and consumed quota, so only an observation recorded after `now` can
-// substitute for this probe.
-//
-// `forced` must be a bypass the caller CLAIMED (claimForce); it is never read
-// from the gate here, so a post-run probe cannot spend a refresh's bypass.
-func runClaudeUsageProbe(ctx context.Context, now time.Time, forced bool) (bool, *cliAgentUsageError) {
-	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now, forced)
-	return refreshed, probeErr
-}
-
-// probeClaudeUsage is runClaudeUsageProbe with the credential supplied by the
-// caller. resolveToken is invoked ONLY once the gate has admitted the probe, so
-// a throttled or opted-out call never touches the credential store at all.
+// `admitted` comes from admit()'s own answer, never reconstructed by comparing
+// the caller's instant with the gate's lastAttempt: two goroutines can read the
+// same wall instant on Windows' coarse clock (0.5–15.6 ms ticks), which made a
+// refused post-run probe judge itself admitted and drop its retry.
 //
 // `observedAt` is the observation the CACHE ends up holding for the windows this
-// probe wrote, which is not always the `now` it stamped: `now` is captured by
-// the caller before the request, so a status-line render landing while the
-// request is in flight legitimately keeps its newer reading and this probe's
-// bucket is refused as older. A caller settling a post-run debt must judge that
-// instant, not the bare `refreshed` — see refreshClaudeUsageIfStale.
-//
+// probe wrote, which is not always `now`: a status-line render landing while
+// the request is in flight legitimately keeps its newer reading. A caller
+// settling a post-run debt must judge that instant, not the bare `refreshed`.
 // It is ALSO populated, with `refreshed` false, when the cross-process dedupe
-// suppressed the request because another writer had already recorded a reading:
-// that reading is in the shared cache now, so a caller that loaded its view
-// earlier must still re-read. Every other non-refreshing path — opted out, no
-// credential, throttled, failed — returns a zero instant, so "non-zero"
-// unambiguously means the shared cache holds this observation.
-func probeClaudeUsage(
-	ctx context.Context,
-	now time.Time,
-	resolveIdentity func() claudeUsageProbeIdentity,
-	dedupeBaseline time.Time,
-	forced bool,
-) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
-	_, _, refreshed, observedAt, probeErr = probeClaudeUsageAdmitted(ctx, now, resolveIdentity, dedupeBaseline, forced)
-	return refreshed, observedAt, probeErr
-}
-
-// probeClaudeUsageAdmitted is probeClaudeUsage reporting, in addition, whether
-// THIS call was the one begin() admitted to the single-flight slot. A caller
-// settling a post-run debt needs that fact directly: "admitted and it
-// skipped/failed" leaves the debt for the next gather, while "refused by the
-// latch" means the debt has not had its turn and must retry behind the holder.
-//
-// It is reported here, from begin()'s own answer, rather than reconstructed
-// afterwards by comparing the caller's instant with the gate's lastAttempt
-// (what admittedAt did until v1.0.27). That comparison assumed two goroutines
-// never read the same wall instant, which is false on Windows: Go's clock there
-// advances on the interrupt tick (0.5–15.6 ms), so a post-run probe refused a
-// few milliseconds behind a routine gather read the gather's instant, judged
-// itself admitted, and dropped the retry — the run's utilization never moved
-// (TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal and the
-// native-lifecycle freshness test failing only on the windows-latest runner).
-func probeClaudeUsageAdmitted(
-	ctx context.Context,
-	now time.Time,
-	resolveIdentity func() claudeUsageProbeIdentity,
-	dedupeBaseline time.Time,
-	forced bool,
-) (admitted, issued, refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
-	result, refreshed, observedAt := probeClaudeUsageResult(ctx, now, resolveIdentity, dedupeBaseline, forced)
-	return result.admitted, result.issued, refreshed, observedAt, result.err()
-}
-
-// probeClaudeUsageResult is the probe itself, reporting the ONE attempt result
-// the contract in cliagent_usage_claudecode_refresh_schedule.go maps onto the
-// backoff, the run-debt rung and the budget. `bypass` is a claimed CLICK.
+// suppressed the request because another writer already recorded a reading
+// (result `shared`): the caller must still re-read. Every other non-refreshing
+// path returns a zero instant.
 func probeClaudeUsageResult(
 	ctx context.Context,
 	now time.Time,
@@ -2334,7 +2279,7 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 //
 // The identity carries NO pinned cache scope: a caller handing in only a token
 // and a fingerprint has not told us when it read them, so the only sound sample
-// is the live one probeClaudeUsageAdmitted takes for itself. A caller that did
+// is the live one probeClaudeUsageResult takes for itself. A caller that did
 // sample the scope before its own credential read passes the identity directly
 // through refreshClaudeUsageIfStaleAs instead.
 func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, latest time.Time, accessToken, fingerprint string) bool {
@@ -2349,7 +2294,7 @@ func refreshClaudeUsageIfStaleFrom(ctx context.Context, generation uint64, now, 
 //
 // The gather path needs it. It decodes the credential near the top of
 // claudeCodeUsageParser.ParseContext and only reaches the probe after the rest of
-// the scan, so probeClaudeUsageAdmitted's own sample sits well AFTER that read:
+// the scan, so probeClaudeUsageResult's own sample sits well AFTER that read:
 // a `/login` to B plus a B writer re-scoping the snapshot in that gap would make
 // the sample name B while this request still carries A's token, and the locked
 // guards would then admit B as a write target and clear B's fresh buckets as an
