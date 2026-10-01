@@ -75,13 +75,15 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 	grokUsageRefreshGrokPath = func() string { return "" }
 	grokBillingLiveReadFn = func(_ context.Context, _ string, now func() time.Time) string {
 		h.reads.Add(1)
+		// Stamped when the request is sent, as probeGrokBillingLive does.
+		sentAt := now()
 		if h.block != nil {
 			<-h.block
 		}
 		outcome := h.outcome.Load().(string)
 		if outcome == grokLiveOutcomeOK {
 			saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
-				ObservedAt: now(), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 36, HasUsedPercent: !h.unmetered.Load(),
+				ObservedAt: sentAt, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 36, HasUsedPercent: !h.unmetered.Load(),
 			}, h.fingerprint()))
 		}
 		return outcome
@@ -363,7 +365,7 @@ func TestGrokRunDebt_SuccessfulClickClearsAStoppedDebt(t *testing.T) {
 	h.runAndSettle(time.Second)
 	h.outcome.Store(grokLiveOutcomeOK)
 	h.advance(time.Second)
-	if got := grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock); got != grokLiveOutcomeOK {
+	if got := grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock, time.Time{}); got != grokLiveOutcomeOK {
 		t.Fatalf("click = %q", got)
 	}
 	if state := h.state(); state.owed() {
@@ -491,7 +493,7 @@ func TestGrokBillingReadOnce_DifferentAccountsNeverShareARead(t *testing.T) {
 		wg.Add(1)
 		go func(i int, fp string) {
 			defer wg.Done()
-			outcomes[i] = grokBillingReadOnce(context.Background(), "", fp, h.clock)
+			outcomes[i] = grokBillingReadOnce(context.Background(), "", fp, h.clock, time.Time{})
 		}(i, fp)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -663,7 +665,7 @@ func TestGrokBillingReadOnce_CallerTimeoutReportsTimeout(t *testing.T) {
 	h.block = make(chan struct{})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if got := grokBillingReadOnce(ctx, "", "fp-ada", h.clock); got != liveProbeOutcomeTimeout {
+	if got := grokBillingReadOnce(ctx, "", "fp-ada", h.clock, time.Time{}); got != liveProbeOutcomeTimeout {
 		t.Fatalf("outcome = %q, want %q", got, liveProbeOutcomeTimeout)
 	}
 	close(h.block)
@@ -903,5 +905,65 @@ func TestGrokRunDebt_RetiringAnOldDebtKeepsALiveRunsFloor(t *testing.T) {
 	h.idle()
 	if h.reads.Load() != reads+1 {
 		t.Fatalf("reads = %d, want bob's interrupted run paid once after restart", h.reads.Load()-reads)
+	}
+}
+
+// A debt retirement that read an old generation never deletes the debt a
+// newer run opened while the retiring pass was out.
+func TestGrokRunDebt_RetireLeavesANewerDebtGeneration(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{OwedAtMs: h.clock().UnixMilli(), CompletionMs: h.clock().UnixMilli(), AccountFingerprint: "fp-ada"})
+	inspected := h.state().debtID()
+
+	// The login switched to B and a B run settled before the retirement landed.
+	h.signIn("fp-bob")
+	h.advance(time.Second)
+	h.write(grokUsageFreshness{OwedAtMs: h.clock().UnixMilli(), CompletionMs: h.clock().UnixMilli(), AccountFingerprint: "fp-bob"})
+	grokRetireRunDebt(inspected, "account_changed", 0)
+	if state := h.state(); !state.owed() || state.AccountFingerprint != "fp-bob" {
+		t.Fatalf("state = %+v, want B's newer debt kept", state)
+	}
+
+	grokRetireRunDebt(h.state().debtID(), "account_changed", 0)
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, want the inspected generation retired", state)
+	}
+}
+
+// A run-completion read never joins a flight sent before the run completed:
+// that response cannot include the run, so it must not pay the debt.
+func TestGrokRunDebt_FlightSentBeforeCompletionNeverPaysTheDebt(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.block = make(chan struct{})
+	floor := armGrokUsageRunFloor(h.clock())
+
+	// A Refresh click sends its request while the run is still live.
+	click := make(chan string, 1)
+	go func() { click <- grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock, time.Time{}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reads.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	// The run completes; its debt worker finds the click's flight in the air.
+	h.advance(time.Second)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("the run must owe a read")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(h.block)
+	h.idle()
+
+	if got := <-click; got != grokLiveOutcomeOK {
+		t.Fatalf("click = %q, want ok", got)
+	}
+	if got := h.reads.Load(); got != 2 {
+		t.Fatalf("reads = %d, want the debt to send its own post-completion read", got)
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, want the post-completion read to pay the debt", state)
+	}
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada"); !ok || snap.ObservedAt.Before(h.clock()) {
+		t.Fatalf("live reading = %+v ok=%t, want one sent at or after completion", snap, ok)
 	}
 }

@@ -315,44 +315,69 @@ var grokBillingReadGroup singleflight.Group
 // requests without a loopback server.
 var grokBillingLiveReadFn = probeGrokBillingLive
 
+// grokBillingRead is one flight's result: its outcome and when it started.
+type grokBillingRead struct {
+	outcome   string
+	startedAt time.Time
+}
+
 // grokBillingReadOnce runs one live read for fingerprint's account, joining a
 // read already in flight for it. An `ok` reading retires any open run debt it
 // covers. The flight runs on its own bounded context so a caller that stops
 // waiting (the smoke's settle budget) never cancels a read another caller
 // shares.
-func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now func() time.Time) string {
-	ch := grokBillingReadGroup.DoChan("grok:"+fingerprint, func() (any, error) {
-		// Counted as this feature's in-flight work for as long as the read
-		// runs, so a waiter that gave up early still sees its settle land.
-		grokFreshnessInFlight.Add(1)
-		defer grokFreshnessInFlight.Add(-1)
-		readCtx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
-		defer cancel()
-		outcome := grokBillingLiveReadFn(readCtx, grokPath, now)
-		if outcome == grokLiveOutcomeOK {
-			// Only a reading with a percentage pays a run's debt; one that
-			// names a period alone leaves the card without a number.
-			if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && snap.HasUsedPercent {
-				settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
+//
+// notBefore (zero for the Refresh click) is the run completion the caller's
+// read must postdate: a flight that started earlier — a click sent while the
+// run was still live — cannot reflect that run, so the caller waits it out and
+// sends its own, still one request at a time.
+func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now func() time.Time, notBefore time.Time) string {
+	if n := now(); notBefore.After(n) {
+		// A clock stepped back: a completion "in the future" must not make
+		// every flight look too early.
+		notBefore = n
+	}
+	for {
+		ch := grokBillingReadGroup.DoChan("grok:"+fingerprint, func() (any, error) {
+			// Counted as this feature's in-flight work for as long as the read
+			// runs, so a waiter that gave up early still sees its settle land.
+			grokFreshnessInFlight.Add(1)
+			defer grokFreshnessInFlight.Add(-1)
+			startedAt := now()
+			readCtx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
+			defer cancel()
+			outcome := grokBillingLiveReadFn(readCtx, grokPath, now)
+			if outcome == grokLiveOutcomeOK {
+				// Only a reading with a percentage pays a run's debt; one that
+				// names a period alone leaves the card without a number. The
+				// reading is stamped with when its request was sent, so it only
+				// covers runs that completed before xAI could have answered.
+				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && snap.HasUsedPercent {
+					settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
+				}
 			}
+			return grokBillingRead{outcome: outcome, startedAt: startedAt}, nil
+		})
+		select {
+		case res := <-ch:
+			read, _ := res.Val.(grokBillingRead)
+			if !notBefore.IsZero() && read.startedAt.Before(notBefore) {
+				continue
+			}
+			return read.outcome
+		case <-ctx.Done():
+			// This caller stopped waiting; the flight goes on and its own ok
+			// still settles any debt it covers. Not a failed read, so it spends
+			// nothing.
+			return liveProbeOutcomeTimeout
 		}
-		return outcome, nil
-	})
-	select {
-	case res := <-ch:
-		outcome, _ := res.Val.(string)
-		return outcome
-	case <-ctx.Done():
-		// This caller stopped waiting; the flight goes on and its own ok still
-		// settles any debt it covers. Not a failed read, so it spends nothing.
-		return liveProbeOutcomeTimeout
 	}
 }
 
 // probeGrokBillingLiveShared is the Refresh click's read: the signed-in
 // account's flight.
 func probeGrokBillingLiveShared(ctx context.Context, grokPath string, now func() time.Time) string {
-	return grokBillingReadOnce(ctx, grokPath, grokAccountFingerprintFor(grokPersistentHome()), now)
+	return grokBillingReadOnce(ctx, grokPath, grokAccountFingerprintFor(grokPersistentHome()), now, time.Time{})
 }
 
 // probeGrokBillingLive reads the credit pool from xAI and caches it for the
@@ -434,12 +459,16 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			return grokLiveOutcomeNoLogin
 		}
 	}
+	// sentAt is when the request that answered was sent: xAI's figure is at
+	// least that fresh, and a run that completed after it may not be in it.
+	sentAt := now()
 	config, err := fetchGrokBillingLive(ctx, client, token)
 	if errors.Is(err, errGrokBillingUnauthorized) && !renewed {
 		renew()
 		if token, _, _ = grokFreshestPresentedToken(base, fingerprint, now()); token == "" {
 			return grokLiveOutcomeNoLogin
 		}
+		sentAt = now()
 		config, err = fetchGrokBillingLive(ctx, client, token)
 	}
 	switch {
@@ -456,7 +485,7 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		return grokLiveOutcomeHTTPError
 	}
 
-	observedAt := now().UTC()
+	observedAt := sentAt.UTC()
 	var rec grokBillingRecord
 	// Nanosecond precision: Grok's own log stamps carry milliseconds, and the
 	// parser's newest-wins comparison must not see a same-second log record as

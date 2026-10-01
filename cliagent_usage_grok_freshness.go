@@ -589,12 +589,16 @@ func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
 	return state, state.owed()
 }
 
-// grokRetireRunDebt drops the debt for a case no retry can fix. The restart
+// grokRetireRunDebt drops the debt generation id for a case no retry can fix.
+// A debt a newer run opened since id was inspected is left alone. The restart
 // marker falls back to the oldest run still live (possibly under another
 // account), so retiring an old debt never forgets a run in progress.
-func grokRetireRunDebt(label string, attempts int) {
+func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 	oldest := grokOldestLiveFloor()
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+		if !state.owed() || state.debtID() != id {
+			return
+		}
 		state.clearDebt()
 		state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 	})
@@ -613,7 +617,7 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 	fingerprint := grokUsageCurrentFingerprint()
 	if fingerprint == "" || fingerprint != state.AccountFingerprint {
 		// Never paid against another login; the new one owes nothing yet.
-		grokRetireRunDebt("account_changed", state.Attempts)
+		grokRetireRunDebt(state.debtID(), "account_changed", state.Attempts)
 		return state, grokRetryNone
 	}
 	if grokObservationCovers(fingerprint, state.CompletionMs) {
@@ -643,7 +647,7 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout+grokRunDebtReadWaitSlack)
-	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow)
+	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow, time.UnixMilli(state.CompletionMs))
 	cancel()
 	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {
 		// xAI answered with a period but no percentage: nothing for the card,
