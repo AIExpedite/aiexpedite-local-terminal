@@ -30,6 +30,13 @@ func simulateClaudeAgentRestart(t *testing.T) {
 	SetClaudeUsageProbeDisabled(false)
 }
 
+// claudeAfterFirstRung is a start instant past the first retry rung a failed
+// run attempt books: a restart BEFORE it re-arms the rung rather than spending
+// it early, which is its own test.
+func claudeAfterFirstRung() time.Time {
+	return time.Now().Add(claudeRunDebtRetryLadder[0] + claudeRunDebtRungSlack + time.Second)
+}
+
 // claudeObservedAt is the stalest row the card would show, which is what the
 // ticket's "observedAt" refers to.
 func claudeObservedAt(t *testing.T, now time.Time) time.Time {
@@ -96,7 +103,7 @@ func TestClaudeOwedRefresh_SurvivesAgentRestart(t *testing.T) {
 
 	refuse.Store(false)
 	simulateClaudeAgentRestart(t)
-	payOwedClaudeUsageRefreshAt(time.Now())
+	payOwedClaudeUsageRefreshAt(claudeAfterFirstRung())
 	claudeFreshnessWaitIdle(t)
 
 	if got := atomic.LoadInt64(calls) - before; got != 1 {
@@ -150,7 +157,7 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 
 	refuse.Store(false)
 	simulateClaudeAgentRestart(t)
-	payOwedClaudeUsageRefreshAt(time.Now())
+	payOwedClaudeUsageRefreshAt(claudeAfterFirstRung())
 	claudeFreshnessWaitIdle(t)
 
 	if got := atomic.LoadInt64(calls) - before; got != 1 {
@@ -165,7 +172,7 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 }
 
 // The replay is exactly ONE attempt when it finds nothing; the remainder is
-// left to the next run, refresh or routine gather under the ordinary bounds.
+// left to the rung it books, under the shared request budget.
 func TestClaudeOwedRefresh_RestartReplayIsExactlyOneAttempt(t *testing.T) {
 	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
 	now := time.Now()
@@ -188,7 +195,7 @@ func TestClaudeOwedRefresh_RestartReplayIsExactlyOneAttempt(t *testing.T) {
 	}
 }
 
-// Repeated restarts retire the debt at the attempt cap rather than issuing one
+// Repeated restarts retire the debt at the request cap rather than issuing one
 // request per start for the whole of claudeRefreshOwedMaxAge.
 func TestClaudeOwedRefresh_RepeatedRestartsRetireAtTheAttemptCap(t *testing.T) {
 	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
@@ -196,14 +203,16 @@ func TestClaudeOwedRefresh_RepeatedRestartsRetireAtTheAttemptCap(t *testing.T) {
 	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
 	claudeOweRunRefresh(now.Add(-time.Minute))
 
-	for i := 0; i < claudeUsageProbeAfterRunMaxAttempts+3; i++ {
+	// Each start lands after the rung the previous one booked, so every start
+	// is due; only the budget stops them.
+	for i := 0; i < claudeRefreshOwedMaxRequests+3; i++ {
 		simulateClaudeAgentRestart(t)
-		payOwedClaudeUsageRefreshAt(now)
+		payOwedClaudeUsageRefreshAt(now.Add(time.Duration(i) * 20 * time.Minute))
 		claudeFreshnessWaitIdle(t)
 	}
 
-	if atomic.LoadInt64(calls) != claudeUsageProbeAfterRunMaxAttempts {
-		t.Fatalf("request count=%d, want the cap %d", atomic.LoadInt64(calls), claudeUsageProbeAfterRunMaxAttempts)
+	if atomic.LoadInt64(calls) != claudeRefreshOwedMaxRequests {
+		t.Fatalf("request count=%d, want the cap %d", atomic.LoadInt64(calls), claudeRefreshOwedMaxRequests)
 	}
 	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
 		t.Fatalf("a debt at the attempt cap must be retired, paid or not: %+v", snap)
@@ -329,5 +338,152 @@ func TestStartAgent_ReplaysTheOwedClaudeRefreshAfterArmingAndOffline(t *testing.
 	}
 	if replay < offline {
 		t.Error("payOwedClaudeUsageRefresh runs before isOffline is published; a disconnected agent would make the outbound call it was told not to")
+	}
+}
+
+/* --------------------------------------------------------------------------
+   The retry ladder across an update hand-off
+   -------------------------------------------------------------------------- */
+
+// The debt, its request counter, its rung, the 429 hold and the credential
+// stamp being waited on all survive a restart — and the new process re-arms
+// the rung rather than spending it or re-sending the 401'd token.
+func TestClaudeOwedRefresh_ScheduleStateSurvivesRestart(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerRun); result.code != claudeProbeHTTP401 {
+		t.Fatalf("precondition: result=%+v, want http_401", result)
+	}
+	hold := now.Add(30 * time.Minute)
+	claudeHoldUsageProbe("", hold)
+	before := claudeCacheSnapshot(t, cache)
+	if before.RefreshOwedAttempts != 1 || before.NextAttemptAtMs == 0 || before.HeldUntilMs == 0 ||
+		before.AuthWaitCredStampNs == 0 || before.AuthWaitCredSize == 0 {
+		t.Fatalf("precondition: schedule state not persisted: %+v", before)
+	}
+
+	simulateClaudeAgentRestart(t)
+	payOwedClaudeUsageRefreshAt(time.Now())
+	claudeFreshnessWaitIdle(t)
+
+	after := claudeCacheSnapshot(t, cache)
+	if after.RefreshOwedAtMs != before.RefreshOwedAtMs || after.RefreshOwedAttempts != 1 ||
+		after.HeldUntilMs != before.HeldUntilMs || after.AuthWaitCredStampNs != before.AuthWaitCredStampNs ||
+		after.AuthWaitCredSize != before.AuthWaitCredSize {
+		t.Errorf("schedule state changed across the restart:\nbefore %+v\n after %+v", before, after)
+	}
+	if after.NextAttemptAtMs < before.NextAttemptAtMs || !claudeRunDebtRetryPending() {
+		t.Errorf("rung %d -> %d pending=%v, want it re-armed, not spent", before.NextAttemptAtMs, after.NextAttemptAtMs, claudeRunDebtRetryPending())
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want no request from the restart", got)
+	}
+	if !claudeUsageProbe.awaitingCredentialChange(claudeCredStamp{modNs: after.AuthWaitCredStampNs, size: after.AuthWaitCredSize}) {
+		t.Error("the new process must still be waiting on the 401'd credential")
+	}
+}
+
+// A 429 hold persisted before the update is paid when the hold ends — the
+// replay books a rung at the hold's end instead of returning with nothing
+// scheduled.
+func TestClaudeOwedRefresh_PreUpdateHoldIsPaidWhenItEnds(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	pinClaudeRunDebtLadder(t, []time.Duration{50 * time.Millisecond}, 50*time.Millisecond, 20*time.Millisecond)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	seedClaudeRefreshDebt(t, cache, "", now.Add(-time.Minute), 0, now.Add(300*time.Millisecond))
+
+	simulateClaudeAgentRestart(t)
+	if result := claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerStartup); result.code != claudeProbeHeld {
+		t.Fatalf("result=%+v, want the replay held", result)
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("a held replay sent %d requests", got)
+	}
+	waitForClaudeCondition(t, 10*time.Second, "the held debt was never paid once the hold ended", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want exactly the one request after the hold", got)
+	}
+}
+
+// An expired stored token plus a credential rewrite after the restart
+// converges without ever sending the expired token (no 401).
+func TestClaudeOwedRefresh_ExpiredTokenConvergesOnCredentialRewrite(t *testing.T) {
+	const expiredToken, freshToken = "sk-ant-oat-expired", "sk-ant-oat-refreshed-by-claude-code"
+	var unauthorized int64
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+freshToken {
+			atomic.AddInt64(&unauthorized, 1)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		claudeProbeOKHandler(w, r)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	writeClaudeProbeCredentialExpiring(t, configDir, expiredToken, time.Now().Add(-time.Hour))
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+
+	simulateClaudeAgentRestart(t)
+	if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerStartup); result.code != claudeProbeCredentialExpired {
+		t.Fatalf("result=%+v, want the expired token held back", result)
+	}
+
+	// Claude Code's next run refreshes the token and rewrites the file; the
+	// next gather sees the new stamp and nudges the pending rung.
+	writeClaudeProbeCredentialExpiring(t, configDir, freshToken, time.Now().Add(8*time.Hour))
+	_, stamp, ok := readClaudeCredentialsRawStamped(context.Background(), configDir)
+	if !ok {
+		t.Fatal("the rewritten credential is unreadable")
+	}
+	nudgeClaudeCredentialChanged(stamp)
+	waitForClaudeCondition(t, 10*time.Second, "the rewritten credential never paid the debt", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	if got := atomic.LoadInt64(&unauthorized); got != 0 {
+		t.Errorf("the expired token reached the endpoint %d times, want 0", got)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+}
+
+// Explicit offline mode at start books a free rung rather than leaving the debt
+// with nothing scheduled, and that rung pays the debt after SetOffline(false).
+func TestClaudeOwedRefresh_OfflineStartIsPaidAfterReconnect(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	pinClaudeRunDebtLadder(t, []time.Duration{50 * time.Millisecond}, 50*time.Millisecond, 10*time.Millisecond)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	SetOffline(true)
+	t.Cleanup(func() { SetOffline(false) })
+
+	simulateClaudeAgentRestart(t)
+	payOwedClaudeUsageRefreshAt(time.Now())
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("an offline start sent %d requests", got)
+	}
+	if !claudeRunDebtRetryPending() || claudeCacheSnapshot(t, cache).NextAttemptAtMs == 0 {
+		t.Fatal("an offline start must book a rung")
+	}
+
+	SetOffline(false)
+	waitForClaudeCondition(t, 10*time.Second, "the offline rung never paid the debt after reconnecting", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
 	}
 }

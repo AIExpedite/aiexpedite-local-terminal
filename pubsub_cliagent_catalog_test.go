@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestHandleCLIUsageRefreshCommand_PersistsAndRefreshesChangedCatalog(t *testing.T) {
@@ -151,5 +152,25 @@ func TestPrepareCLIUsageRefreshResult_CachesOnlyValidatedNormalizedSnapshot(t *t
 	}
 	if &got[0] != &normalized[0] {
 		t.Fatal("cache does not contain the exact normalized snapshot returned for publishing")
+	}
+}
+
+// The force reason a __cli_usage_refresh__ carries: a click is `click`, an
+// automatic refresh with a debt owed is `debt`, and one with nothing owed is
+// not forced at all.
+func TestClaudeUsageRefreshForceReason(t *testing.T) {
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+	automatic := commandMsg{Command: "__cli_usage_refresh__"}
+	if got := claudeUsageRefreshForceReason(automatic); got != claudeForceNone {
+		t.Errorf("automatic refresh, nothing owed: reason=%v, want none", got)
+	}
+	claudeUsageProbe.recordOwed(time.Now())
+	if got := claudeUsageRefreshForceReason(automatic); got != claudeForceDebt {
+		t.Errorf("automatic refresh, debt owed: reason=%v, want debt", got)
+	}
+	click := commandMsg{Command: "__cli_usage_refresh__", Args: []string{cliUsageLiveProbeArg}}
+	if got := claudeUsageRefreshForceReason(click); got != claudeForceClick {
+		t.Errorf("click: reason=%v, want click (debt owed or not)", got)
 	}
 }
