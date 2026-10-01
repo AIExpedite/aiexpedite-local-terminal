@@ -1297,3 +1297,77 @@ func TestCodexLiveProbeConverse_RefusedReadReportsNotMerged(t *testing.T) {
 		t.Fatalf("retry kind = %v, want codexRetryAfterRead", kind)
 	}
 }
+
+// The Refresh click and the run-completion debt share one per-account flight
+// (grokBillingReadOnce): a click that lands while a debt rung is reading joins
+// it instead of sending a second request, and the shared ok retires the debt.
+func TestGrokBillingLive_ClickJoinsAnInFlightDebtRead(t *testing.T) {
+	home := isolateGrok(t)
+	grokEnableRunRefresh(t)
+	writeGrokAuth(t, home, "access-A", "dan@example.com", time.Now().Add(5*time.Hour))
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	calls := grokBillingServer(t, func(string) (int, string) {
+		entered <- struct{}{}
+		<-release
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	floor := armGrokUsageRunFloor(time.Now())
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("a run with no reading must owe one")
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the debt read never reached the endpoint")
+	}
+	click := make(chan string, 1)
+	go func() { click <- probeGrokBillingLiveShared(context.Background(), "", time.Now) }()
+	time.Sleep(50 * time.Millisecond)
+	once.Do(func() { close(release) })
+
+	if got := <-click; got != grokLiveOutcomeOK {
+		t.Fatalf("click outcome = %q, want the shared ok", got)
+	}
+	grokUsageRefreshWaitFor(10 * time.Second)
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("billing requests = %d, want the click to share the debt's one read", got)
+	}
+	var state grokUsageFreshness
+	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
+		t.Fatalf("debt left after the shared ok: %+v", state)
+	}
+}
+
+func TestGrokBillingLive_SuccessfulClickRetiresAnOpenDebt(t *testing.T) {
+	home := isolateGrok(t)
+	grokEnableRunRefresh(t)
+	writeGrokAuth(t, home, "access-A", "dan@example.com", time.Now().Add(5*time.Hour))
+	failing := atomic.Bool{}
+	failing.Store(true)
+	grokBillingServer(t, func(string) (int, string) {
+		if failing.Load() {
+			return http.StatusBadGateway, `{}`
+		}
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+
+	grokUsageRunSettled(armGrokUsageRunFloor(time.Now()))
+	grokUsageRefreshWaitFor(10 * time.Second)
+	var state grokUsageFreshness
+	if !readJSONFile(grokUsageFreshnessPath(), &state) || !state.owed() || state.Attempts != 1 {
+		t.Fatalf("state after a failed read = %+v, want an open debt", state)
+	}
+
+	failing.Store(false)
+	if got := probeGrokBillingLiveShared(context.Background(), "", time.Now); got != grokLiveOutcomeOK {
+		t.Fatalf("click outcome = %q", got)
+	}
+	state = grokUsageFreshness{}
+	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
+		t.Fatalf("a successful click left the debt open: %+v", state)
+	}
+}

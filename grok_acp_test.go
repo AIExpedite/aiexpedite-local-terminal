@@ -18,12 +18,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -2121,5 +2123,81 @@ func TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog(t *testing.T) {
 	case <-session.streamDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("readStream did not exit after stdout/stderr closed")
+	}
+}
+
+// An ACP session logs no billing record of its own (the `no-record` merge), so
+// its exit owes one live billing read — paid off the exit path: the terminal
+// `grok_acp_ended` frame goes out while that read is still in flight.
+func TestGrokACPLifecycle_ExitOwesOneBillingReadWithoutDelayingEnded(t *testing.T) {
+	home := isolateGrok(t)
+	seedGrokHomeWithLogin(t, home)
+	t.Setenv("XAI_API_KEY", "")
+	withTempGrokSessionStore(t)
+	grokEnableRunRefresh(t)
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	calls := grokBillingServer(t, func(string) (int, string) {
+		entered <- struct{}{}
+		<-release
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	binDir := t.TempDir()
+	mockName := "grok"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(binDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-quick-exit")
+
+	var mu sync.Mutex
+	ended := false
+	m := NewGrokACPManager(nil)
+	id := fmt.Sprintf("grok-usage-refresh-test-%d", time.Now().UnixNano())
+	if err := m.Start(id, t.TempDir(), nil, "ws", "uid", GrokStartOptions{}, func(res resultMsg) {
+		if res.Type == "grok_acp_ended" {
+			mu.Lock()
+			ended = true
+			mu.Unlock()
+		}
+	}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the session's exit never owed a billing read")
+	}
+	if !waitUntil(time.Now().Add(10*time.Second), func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return ended
+	}) {
+		t.Fatal("grok_acp_ended waited on the billing read")
+	}
+	once.Do(func() { close(release) })
+	grokUsageRefreshWaitFor(10 * time.Second)
+
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Fatalf("billing reads = %d, want exactly one", got)
+	}
+	var state grokUsageFreshness
+	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
+		t.Fatalf("debt left after the paid read: %+v", state)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].Unknown || usage.Metrics[0].Consumed == nil {
+		t.Fatalf("row after the ACP refresh = %+v, want a numeric reading", usage)
 	}
 }

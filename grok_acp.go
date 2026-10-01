@@ -203,6 +203,11 @@ type GrokACPSession struct {
 	// refuses to merge this session's billing record when it is set — the
 	// billing twin of limitNoticeScope's refusal to cache its notices.
 	producerContested bool
+	// grokUsageFloorMs is the run floor armed before the child spawned
+	// (armGrokUsageRunFloor); grokUsageSettled makes its settle happen once,
+	// whichever exit path gets there first.
+	grokUsageFloorMs atomic.Int64
+	grokUsageSettled atomic.Bool
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -536,9 +541,13 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
+	// Armed before the spawn: every turn of this session spends credits, and
+	// an ACP child logs no number of its own.
+	usageFloor := armGrokUsageRunFloor(time.Now())
 	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)
+		disarmGrokUsageRunFloor(usageFloor)
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
@@ -579,6 +588,9 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		processExited:     make(chan struct{}),
 		streamDone:        make(chan struct{}),
 		firstFrame:        make(chan struct{}),
+	}
+	if !usageFloor.IsZero() {
+		session.grokUsageFloorMs.Store(usageFloor.UnixMilli())
 	}
 
 	m.sessions[id] = session
@@ -1291,6 +1303,11 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		// must not read as a successful merge in the logs.
 		fmt.Printf("%s[grok-acp] managed billing snapshot: %s%s\n",
 			colorCyan, outcome, colorReset)
+	}
+	// The session spent credits and logged no number; it owes one live read.
+	// Off this goroutine: the read must never delay grok_acp_ended.
+	if floor := session.grokUsageFloorMs.Load(); floor > 0 && session.grokUsageSettled.CompareAndSwap(false, true) {
+		grokUsageRunSettledAsync(time.UnixMilli(floor))
 	}
 
 	// Scan for and upload whatever media this session wrote before announcing

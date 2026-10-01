@@ -14,9 +14,14 @@
 // We only READ what the CLI already wrote — no request is made to xAI. `ts` is
 // the provider observation time (the instant Grok fetched the figure), which is
 // why it maps onto ObservedAt rather than CollectedAt: a later gather that finds
-// no new line must not make an old percentage look current. For Grok 1.0's
-// provider-confirmed unmetered records the same timestamp proves that billing
-// was freshly checked even though no numeric percentage was exposed.
+// no new line must not make an old percentage look current.
+//
+// Grok ≥ 1.0.40 TUI records carry no `creditUsagePercent`, and headless runs
+// (`grok -p`, ACP, the maintenance smoke) log no billing record at all — their
+// managed merge reports `no-record`. The number therefore comes from the live
+// billing read (cliagent_usage_grok_live.go), which every finished run owes
+// once (cliagent_usage_grok_freshness.go); a percent-less record still proves
+// the period and when billing was last checked.
 package main
 
 import (
@@ -238,6 +243,16 @@ type grokBillingSnapshot struct {
 	HasOnDemand      bool
 	HasOnDemandUsed  bool
 	SubscriptionTier string
+}
+
+// samePeriod reports whether two observations name the same billing period:
+// the same period type and the same parsed end. Ends compare truncated to the
+// second — the live cache stores RFC3339 seconds while log records carry
+// microseconds, so an exact comparison would never match.
+func (s grokBillingSnapshot) samePeriod(other grokBillingSnapshot) bool {
+	return s.PeriodType != "" && s.PeriodType == other.PeriodType &&
+		s.HasPeriodEnd && other.HasPeriodEnd &&
+		s.PeriodEnd.Truncate(time.Second).Equal(other.PeriodEnd.Truncate(time.Second))
 }
 
 // grokBillingLogPath resolves the CLI's unified log inside an already-resolved

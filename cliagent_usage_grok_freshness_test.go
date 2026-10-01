@@ -16,6 +16,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -295,7 +296,7 @@ func TestGrokNewestBillingObservation_MergedSmokeRecordNewerThanLiveCacheWins(t 
 	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
 	grokFreshnessLive(t, fingerprint, logAt.Add(-time.Hour))
 
-	snap, ok := grokNewestBillingObservation(home, fingerprint)
+	snap, ok, _ := grokNewestBillingObservation(home, fingerprint, logAt)
 	if !ok || !snap.ObservedAt.Equal(logAt) {
 		t.Fatalf("observation = %+v ok=%t, want the newer log record at %s", snap, ok, logAt)
 	}
@@ -310,7 +311,7 @@ func TestGrokNewestBillingObservation_LiveCacheNewerThanLogWinsAndKeepsTheTier(t
 	liveAt := logAt.Add(time.Hour)
 	grokFreshnessLive(t, fingerprint, liveAt)
 
-	snap, ok := grokNewestBillingObservation(home, fingerprint)
+	snap, ok, _ := grokNewestBillingObservation(home, fingerprint, logAt)
 	if !ok || !snap.ObservedAt.Equal(liveAt) {
 		t.Fatalf("observation = %+v ok=%t, want the newer live reading at %s", snap, ok, liveAt)
 	}
@@ -335,15 +336,148 @@ func TestGrokNewestBillingObservation_ForeignSourcesNeverAgeTheObservationForwar
 	// And a newer live reading cached for someone else.
 	grokFreshnessLive(t, fingerprintAccount("grok", "intruder@example.com"), logAt.Add(3*time.Hour))
 
-	if snap, ok := grokNewestBillingObservation(home, fingerprint); ok {
+	if snap, ok, _ := grokNewestBillingObservation(home, fingerprint, logAt); ok {
 		t.Fatalf("foreign sources produced an observation for the current account: %+v", snap)
 	}
 
 	// Our own live reading, older than the foreign record, is still the answer
 	// for our account — recency never lets the foreign record through.
 	grokFreshnessLive(t, fingerprint, logAt.Add(time.Hour))
-	snap, ok := grokNewestBillingObservation(home, fingerprint)
+	snap, ok, _ := grokNewestBillingObservation(home, fingerprint, logAt)
 	if !ok || !snap.ObservedAt.Equal(logAt.Add(time.Hour)) {
 		t.Fatalf("observation = %+v ok=%t, want our own live reading", snap, ok)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Same-period numeric preference
+   --------------------------------------------------------------------------
+   Grok ≥ 1.0.40 logs percent-less records, so a newer unmetered record used to
+   push the live read's number off the card. Inside the same OPEN period the
+   number wins with its own observedAt, and a refresh is owed. Across a
+   rollover the newer record still wins.
+   ------------------------------------------------------------------------ */
+
+// grokSamePeriodEnd is a period end as Grok's log writes it (microseconds).
+const grokSamePeriodEnd = "2026-09-24T22:28:32.746607+00:00"
+
+// appendGrokUnmeteredRecordAt appends a percent-less (Grok ≥ 1.0.40) record
+// naming a weekly period that ends at end.
+func appendGrokUnmeteredRecordAt(t *testing.T, home string, observedAt time.Time, end string) {
+	t.Helper()
+	f, err := os.OpenFile(grokBillingLogPath(home), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, `{"ts":%q,"msg":"billing: fetched credits config","ctx":{"config":{`+
+		`"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":%q}},"subscriptionTier":"SuperGrok"}}`+"\n",
+		observedAt.UTC().Format(time.RFC3339Nano), end); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// grokFreshnessLiveInPeriod caches a numeric live reading for a weekly period
+// ending at end (stored, as production does, to the second).
+func grokFreshnessLiveInPeriod(t *testing.T, fingerprint string, at time.Time, end string) {
+	t.Helper()
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	periodEnd, err := time.Parse(time.RFC3339Nano, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: at, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 36, HasUsedPercent: true,
+		PeriodEnd: periodEnd, HasPeriodEnd: true,
+	}, fingerprint)) {
+		t.Fatal("live cache not saved")
+	}
+}
+
+func TestGrokNewestBillingObservation_NumericBeatsNewerUnmeteredInTheSameOpenPeriod(t *testing.T) {
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt.Add(-48*time.Hour))
+	liveAt := logAt.Add(-time.Hour)
+	grokFreshnessLiveInPeriod(t, fingerprint, liveAt, grokSamePeriodEnd)
+	appendGrokUnmeteredRecordAt(t, home, logAt, grokSamePeriodEnd)
+
+	now := logAt.Add(time.Minute)
+	snap, ok, owes := grokNewestBillingObservation(home, fingerprint, now)
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 36 {
+		t.Fatalf("observation = %+v ok=%t, want the numeric live reading", snap, ok)
+	}
+	if !snap.ObservedAt.Equal(liveAt) {
+		t.Errorf("ObservedAt = %s, want the live reading's own %s", snap.ObservedAt, liveAt)
+	}
+	if snap.SubscriptionTier != "SuperGrok" {
+		t.Errorf("tier not inherited from the log: %+v", snap)
+	}
+	if !owes {
+		t.Error("a newer unmetered record must owe a refresh")
+	}
+	metrics := grokBillingMetrics(snap, now)
+	if len(metrics) != 1 || metrics[0].Unknown || metrics[0].ObservedAt != liveAt.Format(time.RFC3339) {
+		t.Fatalf("card row = %+v, want the numeric reading with its own observedAt", metrics)
+	}
+}
+
+func TestGrokBillingSnapshotSamePeriod_SecondsMatchMicroseconds(t *testing.T) {
+	micro, _ := time.Parse(time.RFC3339Nano, grokSamePeriodEnd)
+	seconds, _ := time.Parse(time.RFC3339, "2026-09-24T22:28:32Z")
+	a := grokBillingSnapshot{PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", PeriodEnd: micro, HasPeriodEnd: true}
+	b := grokBillingSnapshot{PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", PeriodEnd: seconds, HasPeriodEnd: true}
+	if !a.samePeriod(b) || !b.samePeriod(a) {
+		t.Fatal("the same instant at second and microsecond precision must be the same period")
+	}
+	c := b
+	c.PeriodEnd = seconds.Add(time.Second)
+	if a.samePeriod(c) {
+		t.Fatal("a different end is a different period")
+	}
+	d := b
+	d.PeriodType = "USAGE_PERIOD_TYPE_DAILY"
+	if a.samePeriod(d) {
+		t.Fatal("a different period type is a different period")
+	}
+	if (grokBillingSnapshot{}).samePeriod(grokBillingSnapshot{}) {
+		t.Fatal("two unnamed periods are not the same period")
+	}
+}
+
+func TestGrokNewestBillingObservation_NewerUnmeteredWinsAcrossARollover(t *testing.T) {
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+
+	t.Run("different period end", func(t *testing.T) {
+		home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt.Add(-48*time.Hour))
+		grokFreshnessLiveInPeriod(t, fingerprint, logAt.Add(-time.Hour), grokSamePeriodEnd)
+		appendGrokUnmeteredRecordAt(t, home, logAt, "2026-10-01T22:28:32.746607+00:00")
+		snap, ok, _ := grokNewestBillingObservation(home, fingerprint, logAt.Add(time.Minute))
+		if !ok || snap.HasUsedPercent || !snap.ObservedAt.Equal(logAt) {
+			t.Fatalf("observation = %+v, want the newer unmetered record of the new period", snap)
+		}
+	})
+	t.Run("period has ended", func(t *testing.T) {
+		home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt.Add(-48*time.Hour))
+		grokFreshnessLiveInPeriod(t, fingerprint, logAt.Add(-time.Hour), grokSamePeriodEnd)
+		appendGrokUnmeteredRecordAt(t, home, logAt, grokSamePeriodEnd)
+		end, _ := time.Parse(time.RFC3339Nano, grokSamePeriodEnd)
+		snap, ok, _ := grokNewestBillingObservation(home, fingerprint, end.Add(time.Minute))
+		if !ok || snap.HasUsedPercent || !snap.ObservedAt.Equal(logAt) {
+			t.Fatalf("observation = %+v, want the newer record once the period ended", snap)
+		}
+	})
+}
+
+func TestGrokNewestBillingObservation_NewerNumericLogRecordStillWins(t *testing.T) {
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
+	grokFreshnessLiveInPeriod(t, fingerprint, logAt.Add(-time.Hour), grokSamePeriodEnd)
+
+	snap, ok, owes := grokNewestBillingObservation(home, fingerprint, logAt.Add(time.Minute))
+	if !ok || !snap.ObservedAt.Equal(logAt) || !snap.HasUsedPercent {
+		t.Fatalf("observation = %+v, want the newer numeric log record", snap)
+	}
+	if owes {
+		t.Error("a numeric record owes no refresh")
 	}
 }

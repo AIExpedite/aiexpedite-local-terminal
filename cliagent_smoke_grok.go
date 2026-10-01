@@ -332,22 +332,34 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		Env: env, Cwd: isolatedCwd, Args: buildGrokNoToolsSmokeArgs(ladder[0], promptFile),
 	}, isolatedHome)
 
-	spawned := false
+	spawned, reachedInference := false, false
+	// Armed before the first rung spawns: every rung that reaches inference
+	// spends credits, and none of them logs a number of its own.
+	usageFloor := armGrokUsageRunFloor(time.Now())
 	// The billing merge runs after the LAST child exits, whatever the verdict:
 	// a rung that reached inference fetched credits into the isolated log even
 	// when the model then answered the wrong text, and that observation is
 	// exactly what the post-update usage refresh must see.
 	defer func() {
-		if !spawned {
+		if spawned {
+			outcome, persistErr := persistGrokManagedBillingSnapshot(isolatedHome, persistentHome, producerContested)
+			if persistErr != nil {
+				fmt.Printf("%s[cli-smoke] grok billing snapshot not persisted (%s): %v%s\n",
+					colorYellow, outcome, persistErr, colorReset)
+			} else {
+				fmt.Printf("%s[cli-smoke] grok billing snapshot: %s%s\n", colorCyan, outcome, colorReset)
+			}
+		}
+		// Grok's headless runs log no percentage, so the number comes from one
+		// live read the run now owes. The signed refresh that follows the smoke
+		// result arrives at once, so the first read is waited for — bounded by
+		// grokSmokeUsageSettleBudget; past it the debt stays on the ladder. The
+		// verdict above never depends on it.
+		if usageFloor.IsZero() {
 			return
 		}
-		outcome, persistErr := persistGrokManagedBillingSnapshot(isolatedHome, persistentHome, producerContested)
-		if persistErr != nil {
-			fmt.Printf("%s[cli-smoke] grok billing snapshot not persisted (%s): %v%s\n",
-				colorYellow, outcome, persistErr, colorReset)
-			return
-		}
-		fmt.Printf("%s[cli-smoke] grok billing snapshot: %s%s\n", colorCyan, outcome, colorReset)
+		refresh := settleOrDisarmGrokSmokeRun(ctx, usageFloor, reachedInference)
+		fmt.Printf("%s[cli-smoke] grok usage refresh: %s%s\n", colorCyan, refresh, colorReset)
 	}()
 
 	var lastCategory, lastDiagnostic string
@@ -371,6 +383,11 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 		cancel()
 
 		result.ArgvShapeID = shape.ID
+		if stream := parseGrokSmokeStream(stdout); stream.Ended || stream.Text != "" {
+			// An `end` frame or any model text: this rung spent a turn,
+			// whatever the marker verdict.
+			reachedInference = true
+		}
 
 		category, diagnostic, matched := classifyGrokSmokeRun(timedOut, stdout, stderr, runErr, marker)
 		if category == "" {

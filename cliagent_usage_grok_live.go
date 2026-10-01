@@ -1,5 +1,6 @@
 // cliagent_usage_grok_live.go — reads Grok Build's credit pool straight from
-// xAI when the user clicks Refresh on the CLI Agents card.
+// xAI when the user clicks Refresh on the CLI Agents card, and after a Grok
+// run finishes (cliagent_usage_grok_freshness.go).
 //
 // Why this exists:
 //
@@ -17,8 +18,10 @@
 //
 // Boundaries:
 //
-//   - Only the signed live-probe refresh calls it (a user click), never the
-//     periodic gather or a page load.
+//   - Only the click and the bounded run-completion debt call it, through one
+//     per-account single flight (grokBillingReadOnce) — never the periodic
+//     gather or a page load. The debt spends at most grokRunDebtMaxAttempts
+//     reads per unpaid run.
 //   - The endpoint is a pinned HTTPS constant; no proxy inheritance, redirects
 //     refused, 64 KB body cap, decoded into an allow-listed struct.
 //   - The token is the one Grok's own resolver presents (same scope precedence
@@ -50,6 +53,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -297,6 +302,49 @@ func fetchGrokBillingLive(ctx context.Context, client *http.Client, token string
 		return grokBillingConfig{}, err
 	}
 	return decoded.Config, nil
+}
+
+// grokBillingReadGroup is the live read's single flight, shared by the Refresh
+// click and the run-completion debt (cliagent_usage_grok_freshness.go), so the
+// two never send two requests — or run two login renewals — at once. Keyed by
+// account: a caller for a newly signed-in account never joins a read for the
+// previous one.
+var grokBillingReadGroup singleflight.Group
+
+// grokBillingLiveReadFn is the read the flight runs; a seam so tests can count
+// requests without a loopback server.
+var grokBillingLiveReadFn = probeGrokBillingLive
+
+// grokBillingReadOnce runs one live read for fingerprint's account, joining a
+// read already in flight for it. An `ok` reading retires any open run debt it
+// covers. The flight runs on its own bounded context so a caller that stops
+// waiting (the smoke's settle budget) never cancels a read another caller
+// shares.
+func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now func() time.Time) string {
+	ch := grokBillingReadGroup.DoChan("grok:"+fingerprint, func() (any, error) {
+		readCtx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
+		defer cancel()
+		outcome := grokBillingLiveReadFn(readCtx, grokPath, now)
+		if outcome == grokLiveOutcomeOK {
+			if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok {
+				settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
+			}
+		}
+		return outcome, nil
+	})
+	select {
+	case res := <-ch:
+		outcome, _ := res.Val.(string)
+		return outcome
+	case <-ctx.Done():
+		return grokLiveOutcomeHTTPError
+	}
+}
+
+// probeGrokBillingLiveShared is the Refresh click's read: the signed-in
+// account's flight.
+func probeGrokBillingLiveShared(ctx context.Context, grokPath string, now func() time.Time) string {
+	return grokBillingReadOnce(ctx, grokPath, grokAccountFingerprintFor(grokPersistentHome()), now)
 }
 
 // probeGrokBillingLive reads the credit pool from xAI and caches it for the

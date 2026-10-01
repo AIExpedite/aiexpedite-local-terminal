@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -244,5 +246,112 @@ func TestGrokUsage_ContestedSmokeProducerNeverMergesItsRecord(t *testing.T) {
 	}
 	if observed := grokObservedAtViaSignedRefresh(t, "refresh-merged"); !observed.After(dayBefore) {
 		t.Fatalf("uncontested smoke did not advance the observation: %s", observed)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Run-completion refresh (cliagent_usage_grok_freshness.go)
+   --------------------------------------------------------------------------
+   Grok ≥ 1.0.40 headless children log NO billing record — every managed run
+   on the reporting device merged `no-record` — so the smoke above alone left
+   the card stale. A smoke that reached inference now owes one live billing
+   read and waits, bounded, for it, so the signed refresh right after the smoke
+   already publishes a fresh number.
+   ------------------------------------------------------------------------ */
+
+// grokEnableRunRefresh opts this test into the run-completion refresh with an
+// isolated state file, and never lets a renewal spawn the CLI.
+func grokEnableRunRefresh(t *testing.T) {
+	t.Helper()
+	t.Setenv(grokUsageFreshnessEnv, filepath.Join(t.TempDir(), "grok_usage_freshness.json"))
+	origURL, origRenew, origPath, origBudget := grokBillingLiveURL, runGrokLoginRenewal, grokUsageRefreshGrokPath, grokSmokeUsageSettleBudget
+	runGrokLoginRenewal = func(context.Context, string, string) { t.Error("renewal must not run for a valid token") }
+	grokUsageRefreshGrokPath = func() string { return "" }
+	SetGrokUsageRefreshEnabled(true)
+	t.Cleanup(func() {
+		stopGrokRunDebtRetry()
+		grokUsageRefreshWaitFor(15 * time.Second)
+		SetGrokUsageRefreshEnabled(false)
+		grokBillingLiveURL, runGrokLoginRenewal, grokUsageRefreshGrokPath, grokSmokeUsageSettleBudget = origURL, origRenew, origPath, origBudget
+		grokLiveRunsMu.Lock()
+		grokLiveRuns = map[int64]int{}
+		grokLiveRunsMu.Unlock()
+	})
+}
+
+// stubGrokSmokeNoBillingRecord stubs a smoke child that completes its turn and
+// logs no billing record — the `no-record` shape.
+func stubGrokSmokeNoBillingRecord(t *testing.T) *int {
+	t.Helper()
+	path := stubGrokBinary(t)
+	stubGrokSmokePath(t, path)
+	seedProbeVersion(t, path, "grok 1.0.40")
+	calls, _ := stubGrokSmokeExec(t, func(ctx context.Context, launch grokSmokeLaunch) ([]byte, []byte, error) {
+		return grokSuccessFrames(grokMarkerFromLaunch(t, launch)), nil, nil
+	})
+	return calls
+}
+
+func TestGrokUsage_SmokeWithNoBillingRecordPublishesAFreshNumber(t *testing.T) {
+	grokSmokeEnv(t)
+	grokEnableRunRefresh(t)
+	reads := grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	stubGrokSmokeNoBillingRecord(t)
+
+	before := time.Now()
+	res, replayed := runCLISmoke(context.Background(), "grok")
+	if replayed || res.Status != cliSmokeStatusSuccess || !res.MarkerMatched {
+		t.Fatalf("smoke = %+v replayed=%t", res, replayed)
+	}
+	// No wait here: the smoke itself waited for its first read, which is what
+	// lets the signed refresh that follows it find the number.
+	if got := atomic.LoadInt32(reads); got != 1 {
+		t.Fatalf("billing reads = %d, want exactly one", got)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true, Path: "grok", Version: "grok 1.0.40"}, time.Now())
+	if !ok || len(usage.Metrics) != 1 {
+		t.Fatalf("parse = %+v ok=%t", usage, ok)
+	}
+	metric := usage.Metrics[0]
+	if metric.Unknown || metric.Label != "Weekly credits" || metric.Consumed == nil || *metric.Consumed != 9 {
+		t.Fatalf("row = %+v, want numeric Weekly credits from the live read", metric)
+	}
+	observed := grokObservedAtViaSignedRefresh(t, "refresh-after-smoke")
+	if observed.Before(before.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s predates the smoke (%s)", observed, before)
+	}
+	var state grokUsageFreshness
+	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
+		t.Fatalf("debt left after a paid read: %+v", state)
+	}
+}
+
+func TestGrokUsage_SlowBillingReadNeverDelaysTheSmokeVerdictPastItsBudget(t *testing.T) {
+	grokSmokeEnv(t)
+	grokEnableRunRefresh(t)
+	grokSmokeUsageSettleBudget = 100 * time.Millisecond
+	release := make(chan struct{})
+	grokBillingServer(t, func(string) (int, string) {
+		<-release
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	// Registered after the server, so it runs before the server's Close waits
+	// on the parked handler.
+	t.Cleanup(func() { close(release) })
+	stubGrokSmokeNoBillingRecord(t)
+
+	start := time.Now()
+	res, _ := runCLISmoke(context.Background(), "grok")
+	if res.Status != cliSmokeStatusSuccess || !res.MarkerMatched {
+		t.Fatalf("smoke verdict changed by a slow read: %+v", res)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("smoke took %s, the settle budget is %s", elapsed, grokSmokeUsageSettleBudget)
+	}
+	var state grokUsageFreshness
+	if !readJSONFile(grokUsageFreshnessPath(), &state) || !state.owed() {
+		t.Fatalf("debt not on disk while the read is still in flight: %+v", state)
 	}
 }

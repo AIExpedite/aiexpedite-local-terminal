@@ -647,15 +647,76 @@ never published or logged (`grokSmokeFailureLogLine` takes the stderr
    billing cache, so a direct (ACP) run, a terminal (session) run and a smoke
    all advance `latestObservedAt`. The account gate is upstream of that choice:
    a foreign record or a foreign live entry never ages the observation forward.
+   One exception: when the newest record carries no percentage and an older
+   live reading does, and both name the **same, still-open** billing period
+   (`grokBillingSnapshot.samePeriod`, ends compared to the second), the number
+   wins with its own older `observedAt` — and a refresh is owed. Across a
+   period rollover the newer record still wins, so an empty new pool never
+   borrows the old figure.
+
+### Run-completion refresh
+
+Grok ≥ 1.0.40 TUI records carry no `creditUsagePercent`, and headless Grok
+(smoke, ACP, PTY `grok -p`) logs no billing record at all — every managed exit
+merges `no-record`. The only source of a number is the live billing read
+(below), so every finished Grok run owes one
+([cliagent_usage_grok_freshness.go](cliagent_usage_grok_freshness.go)), the
+same bounded run-completion refresh Codex and Antigravity have:
+
+- **Arm / settle.** `runGrokSmoke`, `GrokACPManager.Start` and the PTY `grok`
+  path (the managed `-p` argv or a maintenance smoke; subcommand carve-outs such
+  as `grok login` spend nothing) call `armGrokUsageRunFloor` before the child
+  spawns, and `grokUsageRunSettled` at exit, after
+  `persistGrokManagedBillingSnapshot`. A run is covered when a reading for the
+  signed-in account was taken at or after it **completed**; otherwise a debt is
+  saved to `grok_usage_freshness.json` and the worker starts. A smoke settles
+  only when a rung reached inference (an `end` frame or model text) and
+  otherwise disarms.
+- **Pay.** A process-wide single-flight worker spends at most 4 outbound reads
+  per debt on the shared ladder (1 m / 2 m / 8 m / 30 m), at least 60 s apart.
+  The read goes through `grokBillingReadOnce`, one `singleflight` flight per
+  account shared with the Refresh click, and an `ok` (from either) retires the
+  debt. `http_error` / `bad_response` spend budget; `login_busy` /
+  `write_failed` / offline book free rungs; `no_login` / `no_account` /
+  `unauthorized` retire the debt (the auth notice covers them). A newer run
+  moves the debt forward but keeps its attempt count, and an exhausted debt
+  re-opens only after the longest rung has passed since its last read. A
+  debt whose account is no longer signed in is retired unpaid; one older than
+  6 h ages out.
+- **Smoke.** The smoke waits up to `grokSmokeUsageSettleBudget` (10 s, bounded
+  by its own context) for its first read, which bypasses the 60 s spacing but
+  not the cap: the signed `__cli_usage_refresh__` sent right after the smoke
+  result then already finds the number. The verdict never depends on it; past
+  the budget the debt stays on the ladder.
+- **Direct runs.** When `Parse` finds a log record newer than every live
+  reading (a `grok` the user ran in their own shell), it calls
+  `nudgeGrokUsageRefresh`, at most once a minute and never while a run of this
+  process is live.
+- **Survive.** `StartAgent` calls `payOwedGrokUsageRefresh`, which re-arms a
+  booked rung, pays one attempt for a debt with none, and owes one read for a
+  floor the previous process never settled; `gracefulShutdown` stops the timer
+  first. Offline sends nothing and keeps the debt.
+- **Redaction.** The state file holds epoch-ms integers, a counter, the hashed
+  account fingerprint and a closed outcome code; log lines are
+  `[cli-usage] grok refresh: <label> attempts=<n>`.
+
+A debt paid after an ACP session ends reaches terminal-service at the next
+wake (session start, command dispatch, the CLI Agents tab) — Grok readings are
+not pushed through `cli-usage/observed`.
 
 Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 (classification, budget, cooldown, redaction, prompt file),
 [cliagent_usage_grok_freshness_test.go](cliagent_usage_grok_freshness_test.go)
-(newest-source selection) and
+(newest-source selection, same-period numeric preference),
+[cliagent_usage_grok_run_debt_test.go](cliagent_usage_grok_run_debt_test.go)
+(debt bounds),
+[cliagent_usage_grok_refresh_restart_test.go](cliagent_usage_grok_refresh_restart_test.go)
+(restart / self-update) and
 [cliagent_usage_grok_post_update_freshness_test.go](cliagent_usage_grok_post_update_freshness_test.go)
 (the upgrade end to end across the smoke and usage layers). The end-to-end
-"real grok binary echoes the marker" case stays a manual pre-release check on
-a Windows device.
+"real grok binary echoes the marker" case, and a numeric Grok row whose
+`observedAt` follows a passing smoke against the real xAI endpoint, stay
+manual pre-release checks on a Windows device.
 
 ## Why ACP, not TUI scraping
 
@@ -1573,8 +1634,10 @@ provider for its current figures before the gather runs
     probe re-wraps its own response before `captureCodexRateLimitLine`.
   - Grok — GET `cli-chat-proxy.grok.com/v1/billing?format=credits` with the
     token Grok's resolver presents ([`cliagent_usage_grok_live.go`](cliagent_usage_grok_live.go)).
-    Headless Grok (`grok -p`, ACP) never fetches credits, so no run could
-    refresh this. The agent never renews the login itself; an expired token or
+    Headless Grok (`grok -p`, ACP) never fetches credits, so the same read is
+    also owed once by every finished run (see "Run-completion refresh"), and a
+    click joins a debt's read already in flight for the account rather than
+    sending a second one. The agent never renews the login itself; an expired token or
     a 401 runs `grok models` once against the real home so Grok renews, then the
     request is retried once.
   - Antigravity — `agy -p` in an empty temp dir, only to start its language

@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,5 +123,69 @@ func TestGrokManagedBillingMergeAndReceiptCarryOnlyAllowlistedFields(t *testing.
 	// the signed body for its absence of sentinels to mean anything.
 	if !strings.Contains(string(body), "grok") {
 		t.Fatalf("the signed body does not include the grok provider: %s", body)
+	}
+}
+
+// The run-completion refresh debt (cliagent_usage_grok_freshness.go) is a
+// third surface: a state file on disk and device log lines. A full debt cycle
+// against a loopback endpoint — one failed read whose body carries a sentinel,
+// then a paid one — must leave only integers, the hashed fingerprint and closed
+// codes in the file, and only fixed labels and counters in the log.
+func TestGrokRunDebtStateAndLogsCarryOnlyMetrics(t *testing.T) {
+	home := isolateGrok(t)
+	grokEnableRunRefresh(t)
+	email := "ada-sentinel@example.com"
+	writeGrokAuth(t, home, "credential-sentinel", email, time.Now().Add(5*time.Hour))
+	failFirst := true
+	grokBillingServer(t, func(string) (int, string) {
+		if failFirst {
+			failFirst = false
+			return http.StatusInternalServerError, `{"error":"tool-result-sentinel prompt-sentinel"}`
+		}
+		return http.StatusOK, strings.Replace(grokFixtureBody(time.Now().Add(72*time.Hour)),
+			`"isUnifiedBillingUser":true`, `"isUnifiedBillingUser":true,"rawConfig":"raw-config-sentinel"`, 1)
+	})
+
+	var midCycle []byte
+	logged := captureStdout(t, func() {
+		floor := armGrokUsageRunFloor(time.Now())
+		grokUsageRunSettled(floor)
+		grokUsageRefreshWaitFor(10 * time.Second)
+		midCycle, _ = os.ReadFile(grokUsageFreshnessPath())
+		grokStartRunDebtWorker(true)
+		grokUsageRefreshWaitFor(10 * time.Second)
+	})
+
+	if len(midCycle) == 0 {
+		t.Fatal("no debt state was written after the failed read")
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(midCycle, &fields); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"schemaVersion": true, "runFloorMs": true, "completionMs": true, "owedAtMs": true,
+		"nextAttemptAtMs": true, "lastAttemptAtMs": true, "attempts": true,
+		"accountFingerprint": true, "lastOutcome": true,
+	}
+	for key := range fields {
+		if !allowed[key] {
+			t.Errorf("state file carries a non-allowlisted field %q", key)
+		}
+	}
+	if fields["lastOutcome"] != grokLiveOutcomeHTTPError {
+		t.Errorf("lastOutcome = %v, want the closed code", fields["lastOutcome"])
+	}
+	final, _ := os.ReadFile(grokUsageFreshnessPath())
+	for what, body := range map[string][]byte{"state file": midCycle, "final state file": final, "device log": []byte(logged)} {
+		assertNoGrokSentinels(t, what, body)
+		for _, secret := range []string{email, "user-" + email, home, filepath.ToSlash(home)} {
+			if strings.Contains(string(body), secret) {
+				t.Fatalf("%s leaked %q", what, secret)
+			}
+		}
+	}
+	if !strings.Contains(logged, "grok refresh: ok") {
+		t.Fatalf("the paid read was not logged as its closed outcome: %q", logged)
 	}
 }
