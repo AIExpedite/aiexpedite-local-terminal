@@ -1,0 +1,198 @@
+package main
+
+import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// waitForClaudeCondition polls cond until it holds or `within` elapses — for
+// effects a retry rung produces on the timer's goroutine.
+func waitForClaudeCondition(t *testing.T, within time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// pinClaudeRunDebtLadder shrinks the retry ladder and the free rung so a test
+// can watch rungs fire without waiting minutes.
+func pinClaudeRunDebtLadder(t *testing.T, ladder []time.Duration, free, slack time.Duration) {
+	t.Helper()
+	origLadder, origFree, origSlack := claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack
+	claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = ladder, free, slack
+	t.Cleanup(func() {
+		resetClaudeRunDebtRetry()
+		claudeRunDebtRetryLadder, claudeRunDebtFreeRetryDelay, claudeRunDebtRungSlack = origLadder, origFree, origSlack
+	})
+}
+
+// The budgeted ladder: 15 s after the first request, then 60 s and 4 min; the
+// request that spends the budget retires the debt instead of booking a rung.
+// The ladder's last rung (15 min) is the free rung's ceiling.
+func TestClaudeRunDebtRung_BudgetedLadder(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	// Whole milliseconds, the resolution NextAttemptAtMs is stored at.
+	now := time.UnixMilli(time.Now().UnixMilli())
+	owed := now.Add(-time.Minute)
+	for attempts, want := range map[int]time.Duration{1: 15 * time.Second, 2: time.Minute, 3: 4 * time.Minute} {
+		seedClaudeRefreshDebt(t, cache, "", owed, attempts, time.Time{})
+		if !claudeBookRunDebtRung("", owed, now, claudeRungBudgeted, 0) {
+			t.Fatalf("attempts=%d: nothing booked", attempts)
+		}
+		if got := time.UnixMilli(claudeCacheSnapshot(t, cache).NextAttemptAtMs).Sub(now); got != want {
+			t.Errorf("attempts=%d: rung in %v, want %v", attempts, got, want)
+		}
+	}
+	claudeUsageProbe.recordOwed(owed)
+	seedClaudeRefreshDebt(t, cache, "", owed, claudeRefreshOwedMaxRequests, time.Time{})
+	if claudeBookRunDebtRung("", owed, now, claudeRungBudgeted, 0) {
+		t.Error("a debt that spent its budget must not book another rung")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Errorf("a spent budget must retire the debt: %+v", snap)
+	}
+	if !claudeUsageProbe.owedObservation().IsZero() {
+		t.Error("retirement must drop the in-memory debt too, or the gather re-pays it uncharged")
+	}
+}
+
+// Free rungs back off with the debt's age — at least the free floor, at most
+// the longest rung — and never land past the age-out.
+func TestClaudeRunDebtRung_FreeRungBacksOffWithAge(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	// Whole milliseconds, the resolution NextAttemptAtMs is stored at.
+	now := time.UnixMilli(time.Now().UnixMilli())
+	for owedFor, want := range map[time.Duration]time.Duration{
+		5 * time.Second: claudeRunDebtFreeRetryDelay,
+		2 * time.Minute: 2 * time.Minute,
+		2 * time.Hour:   15 * time.Minute,
+	} {
+		owed := now.Add(-owedFor)
+		seedClaudeRefreshDebt(t, cache, "", owed, 0, time.Time{})
+		claudeBookRunDebtRung("", owed, now, claudeRungFree, 0)
+		if got := time.UnixMilli(claudeCacheSnapshot(t, cache).NextAttemptAtMs).Sub(now); got != want {
+			t.Errorf("owed for %v: free rung in %v, want %v", owedFor, got, want)
+		}
+	}
+	owed := now.Add(-claudeRefreshOwedMaxAge + time.Minute)
+	seedClaudeRefreshDebt(t, cache, "", owed, 0, time.Time{})
+	claudeBookRunDebtRung("", owed, now, claudeRungFree, 0)
+	if got, deadline := claudeCacheSnapshot(t, cache).NextAttemptAtMs, owed.Add(claudeRefreshOwedMaxAge).UnixMilli(); got > deadline+1 {
+		t.Errorf("rung %d lands past the age-out %d", got, deadline)
+	}
+}
+
+// A held debt's rung lands at the hold's end (plus slack), not on the ladder.
+func TestClaudeRunDebtRung_HeldDebtWaitsForTheHold(t *testing.T) {
+	_, _ = armClaudeUsageProbe(t, unreachableProbeHandler)
+	claudeUsageProbe.holdUntil(time.Now().Add(10 * time.Minute))
+	for _, result := range []claudeProbeResult{
+		{code: claudeProbeHeld},
+		{code: claudeProbeHTTP429, issued: true},
+	} {
+		kind, delay := claudeRunDebtRungFor(result)
+		if kind != claudeRungAfter || delay < 10*time.Minute-time.Second || delay > 10*time.Minute+2*claudeRunDebtRungSlack {
+			t.Errorf("%s: rung %v in %v, want at the hold's end", result.code, kind, delay)
+		}
+	}
+}
+
+// A stale generation's callback does nothing: a timer replaced or stopped
+// after it fired but before its callback took the lock must not attempt.
+func TestClaudeRunDebtRetry_StaleGenerationIsANoOp(t *testing.T) {
+	_, _ = armClaudeUsageProbe(t, unreachableProbeHandler)
+	var ran atomic.Int64
+	claudeArmRunDebtRetryFn(time.Hour, func() { ran.Add(1) })
+	claudeRunDebtRetryTimer.mu.Lock()
+	stale := claudeRunDebtRetryTimer.gen
+	claudeRunDebtRetryTimer.mu.Unlock()
+	stopClaudeRunDebtRetry()
+
+	claudeRunDebtRetryFired(stale, func() { ran.Add(1) })
+	if ran.Load() != 0 {
+		t.Error("a stopped generation's callback ran")
+	}
+	if claudeRunDebtRetryPending() {
+		t.Error("stop must leave no timer armed")
+	}
+
+	claudeArmRunDebtRetryFn(0, func() { ran.Add(1) })
+	waitForClaudeCondition(t, 5*time.Second, "the live generation never fired", func() bool { return ran.Load() == 1 })
+}
+
+// gracefulShutdown stops the Claude retry timer beside Codex's and
+// Antigravity's, so a rung cannot fire into a process handing off to an update.
+func TestGracefulShutdown_StopsTheClaudeRunDebtRetry(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "shutdown.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse shutdown.go: %v", err)
+	}
+	found := false
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "gracefulShutdown" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "stopClaudeRunDebtRetry" {
+					found = true
+				}
+			}
+			return true
+		})
+	}
+	if !found {
+		t.Fatal("gracefulShutdown no longer stops the Claude run-debt retry timer")
+	}
+}
+
+// A credential rewrite the schedule is waiting on makes the pending rung due
+// at once — one attempt per new stamp, not one per gather.
+func TestNudgeClaudeCredentialChanged_OneAttemptPerRewrite(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	waitedOn := claudeCredStamp{modNs: 1, size: 1}
+	claudeUsageProbe.noteAuthWait(waitedOn)
+	claudeBookRunDebtRung("", owed, now, claudeRungAfter, time.Hour)
+
+	nudgeClaudeCredentialChanged(waitedOn)
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("the credential still being waited on nudged %d requests, want 0", got)
+	}
+
+	// The real fixture file is what the attempt reads; its stamp differs from
+	// the one waited on, which is exactly a rewrite.
+	rewritten := claudeCredStamp{modNs: 2, size: 1}
+	nudgeClaudeCredentialChanged(rewritten)
+	waitForClaudeCondition(t, 5*time.Second, "the nudge never paid the debt", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+
+	// A second gather seeing the same rewrite earns nothing more.
+	later := time.Now()
+	claudeOweRunRefresh(later)
+	claudeUsageProbe.noteAuthWait(waitedOn)
+	claudeUsageProbe.takeCredentialNudge(rewritten)
+	claudeBookRunDebtRung("", later, later, claudeRungAfter, time.Hour)
+	nudgeClaudeCredentialChanged(rewritten)
+	nudgeClaudeCredentialChanged(rewritten)
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want one attempt for one rewrite", got)
+	}
+}

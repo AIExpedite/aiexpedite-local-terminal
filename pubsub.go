@@ -1089,12 +1089,18 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	if cliUsageRefreshWantsLiveProbe(cmd) {
 		runCLIUsageLiveProbes(ctx)
 	}
-	// Same reasoning for Claude's utilization probe: its minimum interval exists
-	// to bound background traffic, not to hold back a reading the user just
-	// asked for. Without this the receipt can be signed from a cache whose
-	// newest observation predates the run that prompted the refresh.
+	// Claude's utilization probe is forced only for a reason
+	// (claudeUsageRefreshForceReason): a CLICK bypasses its minimum interval,
+	// which exists to bound background traffic, not to hold back a reading the
+	// user just asked for. An automatic refresh — terminal-service's Active
+	// loop, opening the tab — is forced as `debt` only while a run's refresh is
+	// owed, which bypasses nothing and is charged to that debt's budget; with
+	// nothing owed it is not forced at all and follows the staleness TTL.
+	// Forcing every automatic refresh walked past the 60 s floor and the failure
+	// backoff on an endpoint rate-limited per account, and the 429s it earned
+	// were what kept the card's numbers unobservable after a passing smoke.
 	//
-	// The bypass rides on THIS gather's context rather than a process-global
+	// The ticket rides on THIS gather's context rather than a process-global
 	// flag. Claude's parser reaches the same code from the routine six-hour
 	// machine-info gather, and a package-level flag lets that gather claim the
 	// bypass we just armed — leaving this refresh unforced, skipping the join
@@ -1103,7 +1109,7 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// Codex gets the equivalent: its parser runs a forced rollout reconcile that
 	// bypasses the per-account interval (never the single flight), so a run that
 	// just finished is reflected in the reading this receipt signs.
-	usageCtx := WithCodexUsageForceRefresh(WithClaudeUsageForceProbe(ctx))
+	usageCtx := WithCodexUsageForceRefresh(WithClaudeUsageForceProbe(ctx, claudeUsageRefreshForceReason(cmd)))
 	usage, errs := GatherCLIAgentUsageOnly(usageCtx)
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that

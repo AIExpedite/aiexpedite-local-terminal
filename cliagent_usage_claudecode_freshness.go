@@ -5,20 +5,20 @@
 //
 //	cliagent_usage_claudecode_probe.go already knows that a finished run needs a
 //	reading newer than it: triggerClaudeUsageProbeAfterRun records the debt on
-//	claudeUsageProbeGate.owedBaseline and schedules a bounded trailing probe.
-//	That debt is a struct field, and it dies with the process. A run (or a
-//	`__cli_smoke__` turn) that finished moments before an agent self-update
-//	therefore left nothing behind: the new process started with an empty gate,
-//	the next gather found a reading younger than claudeUsageProbeStaleAfter, and
-//	the CLI Agents card kept showing a PRE-update utilization for the whole TTL
-//	— a passing post-update smoke beside a stale card, which is exactly the
-//	symptom reported.
+//	claudeUsageProbeGate.owedBaseline. That debt is a struct field, and it dies
+//	with the process. A run (or a `__cli_smoke__` turn) that finished moments
+//	before an agent self-update therefore left nothing behind: the new process
+//	started with an empty gate, the next gather found a reading younger than
+//	claudeUsageProbeStaleAfter, and the CLI Agents card kept showing a
+//	PRE-update utilization for the whole TTL — a passing post-update smoke
+//	beside a stale card, which is exactly the symptom reported.
 //
 //	Codex (cliagent_usage_codex_freshness.go) and Antigravity
 //	(cliagent_usage_antigravity_freshness.go) already close this loop by
-//	persisting the debt and replaying it once from StartAgent. This file is the
-//	Claude equivalent, reusing the existing probe, gate, merge and lock ladder
-//	rather than adding a second mechanism.
+//	persisting the debt and walking a retry ladder that survives a restart. This
+//	file is the Claude equivalent, reusing the existing probe, gate, merge and
+//	lock ladder rather than adding a second mechanism; the ladder's clock is
+//	cliagent_usage_claudecode_refresh_schedule.go.
 //
 // Lifecycle:
 //
@@ -29,8 +29,10 @@
 //     advances. A repeat owe for the same baseline and the startup replay's
 //     re-seeding both leave it alone, or the cap would be reset out of
 //     existence on every restart.
-//   - Pay — the in-process trailing probe pays it first (unchanged).
-//     payOwedClaudeUsageRefresh is the backstop for when the process died.
+//   - Pay — every automatic attempt goes through claudeRunDebtAttemptAt
+//     (cliagent_usage_claudecode_refresh_schedule.go): the run's own immediate
+//     attempt, the persisted retry rung, and payOwedClaudeUsageRefresh at start.
+//     Each one reserves a slot of the shared request budget before it sends.
 //   - Settle — cleared inside mergeClaudeRateLimitCacheSerialized, in the same
 //     locked write that carries the covering reading, and only for a PROBE
 //     write: that is the one writer which samples every window, so it is the
@@ -41,7 +43,7 @@
 //     the merge.
 //   - Hold — a 429 Retry-After is mirrored to HeldUntilMs so a restart inside
 //     the window does not re-storm an account-scoped endpoint.
-//   - Retire — aged out, at the attempt cap, stamped implausibly far ahead, or
+//   - Retire — aged out, at the request cap, stamped implausibly far ahead, or
 //     opted out: cleared without spending a request.
 //
 // Accepted gap: there is no persisted active-run FLOOR (Codex's RunFloorMs). A
@@ -50,13 +52,14 @@
 // routine gather. Adding an armed-floor field is a second state machine
 // (arm / disarm / adopt) for a strictly rarer case than the one this fixes.
 //
-// Nothing new is published: the debt is three integers in a file the agent
-// already writes. No credential, path, config fragment or identity crosses a
-// new boundary.
+// Nothing new is published: the debt and its schedule are integers in a file
+// the agent already writes. No credential, path, config fragment or identity
+// crosses a new boundary.
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -64,12 +67,16 @@ import (
 )
 
 const (
-	// claudeRefreshOwedMaxAge retires a debt no reading ever paid. Past it the run
-	// is far enough back that a fresh reading is worth no more than the next
-	// routine gather's. Claude's own bound — the Codex equivalent is deliberately
-	// longer, because its debt walks a retry ladder that has to outlive an agent
-	// self-update plus a reconnect.
-	claudeRefreshOwedMaxAge = 30 * time.Minute
+	// claudeRefreshOwedMaxAge retires a debt no reading ever paid. The debt walks
+	// a retry ladder that has to outlive an agent self-update, a 429 hold and an
+	// expired token waiting on Claude Code's next refresh, so it matches the
+	// Codex and Antigravity age-out rather than the old single-replay bound.
+	claudeRefreshOwedMaxAge = 6 * time.Hour
+	// claudeRefreshOwedMaxRequests caps the endpoint requests one debt may
+	// cost across EVERY automatic path — the run's immediate attempt, the
+	// retry ladder, the startup replay and a debt-forced refresh — counted by
+	// RefreshOwedAttempts. A user's click is not counted.
+	claudeRefreshOwedMaxRequests = 4
 	// claudeRefreshOwedLocalSkew is the clock-skew ceiling on a persisted
 	// instant, mirroring antigravityRunFloorLocalSkew. A debt stamped further
 	// ahead than this is a backwards clock step, not skew: left in place it
@@ -182,9 +189,7 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 		if snap.AccountFingerprint != fingerprint {
 			// Any other fingerprint transition is an account boundary, including
 			// an unscoped -> scoped flip — the same rule the merge applies.
-			snap.Buckets = map[string]claudeRateLimitBucket{}
-			snap.LastProbeObservedAtMs = 0
-			snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
+			resetClaudeProbeAccountState(&snap)
 			snap.AccountFingerprint = fingerprint
 		}
 		if !fn(&snap) {
@@ -237,19 +242,24 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 //
 // An unchanged (or older) instant is a no-op: it neither rewrites the cache nor
 // touches RefreshOwedAttempts. Resetting the counter on an unchanged instant
-// would hand the same debt a fresh pair of attempts on every restart and
-// silently undo the cap.
+// would hand the same debt a fresh budget on every restart and silently undo
+// the cap.
+//
+// Reports the fingerprint the debt was written under and whether a debt at or
+// after `baseline` is on disk when it returns, so a caller can book its rung
+// under the same account and arm an in-process rung for a write the cache locks
+// dropped.
 //
 // A kill between the run's end and this write loses the debt. That is the same
 // accepted gap as a turn killed mid-flight, not a new one.
-func claudeOweRunRefresh(baseline time.Time) {
+func claudeOweRunRefresh(baseline time.Time) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
-		return
+		return "", false
 	}
 	// When the user has opted out, nothing in this process (or the next) can ever
 	// pay a debt, so recording one would leave a permanent unpayable marker.
 	if !claudeUsageProbe.armedForProbe() {
-		return
+		return "", false
 	}
 	path := claudeRateLimitCachePath()
 	// Sampled BEFORE the credential read, not after: it names the scope this debt
@@ -262,7 +272,7 @@ func claudeOweRunRefresh(baseline time.Time) {
 	// allowed. See mutateClaudeRateLimitSnapshotScoped, which judges it under the
 	// same lock the write takes.
 	scopeBefore := claudeRateLimitCacheScope()
-	fingerprint := currentClaudeAccountFingerprint()
+	fingerprint = currentClaudeAccountFingerprint()
 	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
 	// dir not yet readable) resolves to exactly the same "" a genuine accountless
 	// claude.ai login does, and mutateClaudeRateLimitSnapshot cannot tell the two
@@ -284,22 +294,48 @@ func claudeOweRunRefresh(baseline time.Time) {
 	// sampled scope or the resolved fingerprint); a flip that overtook the sample
 	// is refused by the allow-list above.
 	baselineMs := baseline.UnixMilli()
-	mutateClaudeRateLimitSnapshotScoped(path, fingerprint, []string{scopeBefore},
+	wrote := mutateClaudeRateLimitSnapshotScoped(path, fingerprint, []string{scopeBefore},
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
+				onDisk = true
 				return false
 			}
 			snap.RefreshOwedAtMs = baselineMs
 			// The instant genuinely advanced: a newer run is owed, so this debt
-			// gets its own budget.
+			// gets its own budget, and is due at once rather than on the rung an
+			// older debt booked.
 			snap.RefreshOwedAttempts = 0
+			snap.NextAttemptAtMs = 0
 			return true
 		})
+	return fingerprint, wrote || onDisk
+}
+
+// claudeOweRunRefreshNow is the SYNCHRONOUS owe for a `__cli_smoke__` turn,
+// mirroring persistCodexSmokeRunDebt: a smoke is often the last thing that
+// happens before an update hand-off replaces the process, so its debt — and
+// the first rung — must be on disk before runClaudeCodeSmoke returns, not on a
+// goroutine the hand-off can outrun. The in-memory debt is recorded too, so
+// the immediate attempt the caller triggers next pays this run.
+func claudeOweRunRefreshNow(baseline time.Time) {
+	if baseline.IsZero() || !claudeUsageProbe.armedForProbe() {
+		return
+	}
+	claudeUsageProbe.recordOwed(baseline)
+	fingerprint, onDisk := claudeOweRunRefresh(baseline)
+	if !onDisk {
+		return
+	}
+	// The first rung. The immediate attempt the caller triggers next replaces it
+	// with whatever its result books; a hand-off that lands before that attempt
+	// finishes leaves this one for the next process to re-arm.
+	now := time.Now()
+	claudeBookRunDebtRung(fingerprint, baseline, now, claudeRungAfter, claudeRunDebtRetryLadder[0])
 }
 
 // claudePersistedProbeStateFor reports what a previous process left on the
-// snapshot for `fingerprint`: the outstanding debt, how many replay attempts it
-// has already cost, and any 429 hold still on record. All zero when there is
+// snapshot for `fingerprint`: the outstanding debt, how many requests it has
+// already cost, and any 429 hold still on record. All zero when there is
 // none, when the cache belongs to another account, or when the file is missing
 // or corrupt — this is a freshness optimisation, and the next run rewrites it.
 //
@@ -340,14 +376,14 @@ func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts 
 
 // claudeRefreshDebtRetired reports whether a persisted debt is past paying:
 // stamped in the future beyond the skew ceiling, older than the age limit, or
-// already at the attempt cap. The ONE rule for both readers of the durable debt
+// already at the request cap. The ONE rule for both readers of the durable debt
 // — the startup replay, which retires it, and the gather's seed, which must then
 // refuse to adopt it — so a gather that reaches the seed before the replay
 // cannot issue an uncharged request for a debt the cap has already retired.
 func claudeRefreshDebtRetired(owed time.Time, attempts int, now time.Time) bool {
 	return owed.After(now.Add(claudeRefreshOwedLocalSkew)) ||
 		now.Sub(owed) > claudeRefreshOwedMaxAge ||
-		attempts >= claudeUsageProbeAfterRunMaxAttempts
+		attempts >= claudeRefreshOwedMaxRequests
 }
 
 // claudeRateLimitCacheStamp identifies the CONTENTS of the snapshot file without
@@ -440,12 +476,30 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	return func(snap *claudeRateLimitSnapshot) bool {
 		next := snap.RefreshOwedAttempts + delta
 		if snap.RefreshOwedAtMs != owedMs || next < 0 ||
-			(delta > 0 && next > claudeUsageProbeAfterRunMaxAttempts) {
+			(delta > 0 && next > claudeRefreshOwedMaxRequests) {
 			return false
 		}
 		snap.RefreshOwedAttempts += delta
 		return true
 	}
+}
+
+// claudeReserveRunDebtSlot charges one request to the debt at `owed`, durably,
+// for a gather about to probe for it. `onDisk` reports whether that debt was on
+// disk to charge at all, so a refused reservation (the cap, a contended lock)
+// can be told apart from a debt only this process holds.
+func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk bool) {
+	charge := adjustClaudeRefreshAttemptsAt(owed, +1)
+	owedMs := owed.UnixMilli()
+	locked := false
+	reserved = mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
+		locked = true
+		onDisk = snap.RefreshOwedAtMs == owedMs
+		return charge(snap)
+	})
+	// The lock was never granted: the debt may well be on disk, so this is a
+	// refused reservation, not an untracked debt.
+	return reserved, onDisk || !locked
 }
 
 // dropClaudeSkewedHold clears a 429 hold ONLY while it is still the exact value
@@ -509,11 +563,16 @@ func claudeHoldSkewCeilingRebased(now time.Time) int64 {
 
 /* ────────────────────────────────── pay ──────────────────────────────────── */
 
-// payOwedClaudeUsageRefresh replays, at most once per agent start, the refresh a
+// payOwedClaudeUsageRefresh resumes, once per agent start, the refresh a
 // previous process owed — a Claude run or smoke that finished just before a
 // crash, restart or self-update. Called from StartAgent beside
 // payOwedCodexUsageRefresh and payOwedAntigravityUsageRefresh, and AFTER
-// isOffline is published so the attempt honours offline mode.
+// isOffline is published so the attempt honours offline mode. A rung booked in
+// the future is re-armed on the timer rather than spent early; a due one makes
+// one attempt; a refusal (a persisted hold, an expired credential, offline
+// mode) books the matching rung instead of leaving nothing scheduled. Pub/Sub
+// connectivity plays no part: the timer runs whether or not the subscription
+// has reconnected.
 //
 // Runs on its own goroutine: it reads the credential store (a `security` spawn
 // on macOS), the cache, and possibly the network, and StartAgent must wait for
@@ -544,6 +603,21 @@ func payOwedClaudeUsageRefresh() {
 // goroutine and with the clock injected so the bounds are testable without wall
 // time.
 func payOwedClaudeUsageRefreshAt(now time.Time) {
+	claudeRunDebtAttemptAt(now, claudeDebtTriggerStartup)
+}
+
+// claudeRunDebtAttemptAt is the ONE automatic attempt on the persisted run debt,
+// shared by the run's immediate attempt, a retry rung firing, a credential
+// nudge and the startup replay — so the budget, the refusals and the rung
+// booking cannot differ between them. It returns the attempt result (zero when
+// nothing was attempted: nothing owed, retired, already covered, or a future
+// rung re-armed).
+//
+// Order: resolve the identity once; retire what is past paying; refuse locally
+// (booking a free rung) whatever the gate or the credential already rules out;
+// reserve one budget slot DURABLY; attempt; refund the slot if nothing was sent;
+// book the rung the result calls for.
+func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeProbeResult {
 	path := claudeRateLimitCachePath()
 
 	// ONE credential read, resolved ONCE, for both halves of this replay: the
@@ -596,14 +670,14 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// mutateClaudeRateLimitSnapshot refuses that write under the cache lock.
 	if !claudeUsageProbe.armedForProbe() {
 		mutateClaudeRateLimitSnapshot(path, fingerprint, clearClaudeRefreshDebt)
-		return
+		return claudeProbeResult{code: claudeUsageProbe.refusal(now, false)}
 	}
 
 	snap, ok := loadClaudeRateLimitSnapshot(path)
 	if !ok || snap.AccountFingerprint != fingerprint {
 		// No cache, or one belonging to an account this device is no longer
 		// signed in to. Either way there is nothing this process may pay.
-		return
+		return claudeProbeResult{}
 	}
 
 	// A hold stamped further ahead than a Retry-After could legitimately reach is
@@ -624,12 +698,12 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	default:
 		held = time.UnixMilli(snap.HeldUntilMs)
 		// Carry the surviving hold into this process's gate too, so the ordinary
-		// gather and trailing-probe paths honour it just as the replay does.
+		// gather and run-debt paths honour it just as the replay does.
 		claudeUsageProbe.holdUntil(held)
 	}
 
 	if snap.RefreshOwedAtMs == 0 {
-		return
+		return claudeProbeResult{}
 	}
 	owed := time.UnixMilli(snap.RefreshOwedAtMs)
 
@@ -645,7 +719,8 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 		// clear would silently discard it and leave that run's card stale —
 		// the very failure this file exists to fix.
 		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
-		return
+		claudeUsageProbe.dropOwedThrough(owed)
+		return claudeProbeResult{}
 	}
 
 	// Coverage pre-check, BEFORE anything is charged. A settlement write can be
@@ -657,7 +732,8 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 		// Same rule: the reading covers the debt we read, and says nothing about
 		// a newer one recorded since.
 		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
-		return
+		claudeUsageProbe.settleOwed(owed)
+		return claudeProbeResult{}
 	}
 
 	// Seed the in-memory gate from the persisted value so refreshClaudeUsageIfStale's
@@ -666,55 +742,115 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	// RefreshOwedAttempts and undo the cap.
 	claudeUsageProbe.recordOwed(owed)
 
-	// Offline, a live hold, or no readable token: return AHEAD of the charge and
-	// leave the debt and its counter exactly as found, so a device coming back
-	// online — or one whose Keychain answers on the next start — inside the age
-	// window can still pay. Charging here would spend the cap on restarts that
-	// never asked the endpoint anything.
-	//
-	// The empty token is decided HERE, from the identity pinned at the top,
-	// rather than only refunded afterwards: the attempt would reach
-	// probeClaudeUsageAdmitted's empty-token exit and return issued=false without
-	// asking anything, and a charge-then-refund pair is two best-effort cache
-	// writes where a transiently unreadable credential store needs none. Same
-	// rule the gather's seed charge already applies before it charges.
-	if IsOffline() || (!held.IsZero() && now.Before(held)) || identity.token == "" {
-		return
+	// A credential wait a previous attempt (or process) recorded survives the
+	// restart, so the same expired or 401'd token is not re-sent on start.
+	if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		claudeUsageProbe.noteAuthWait(claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize})
 	}
 
-	// Charged at exactly one point: after every refusal has been cleared and
-	// immediately before the request goes out. A crash mid-request still costs
-	// the attempt, so a restart loop cannot replay the same debt forever.
+	// A rung booked in the future stands: the timer and the startup replay
+	// re-arm it rather than spending it early. One stamped beyond any rung the
+	// schedule can book is a backwards clock step and is treated as due.
+	if trigger.honoursRung() && snap.NextAttemptAtMs > now.UnixMilli() {
+		if until := time.UnixMilli(snap.NextAttemptAtMs).Sub(now); until <= claudeRunDebtRetryHorizon() {
+			claudeArmRunDebtRetry(until, claudeDebtTriggerTimer)
+			return claudeProbeResult{}
+		}
+	}
+
+	// Refusals AHEAD of the reservation, so a refusal costs no budget and no
+	// charge-then-refund pair of best-effort writes: the gate (offline, a live
+	// hold, the 60 s floor or failure backoff), no readable token, or a token
+	// this device can see has expired — or was answered 401 while the
+	// credential file is unchanged. Each books its rung instead of returning
+	// with nothing scheduled, which is how a pre-update hold or an expired
+	// token used to strand the debt until it aged out.
 	//
-	// The charge must reach DISK before the request does. The write is
-	// best-effort like every other non-verified one here, so another cache
-	// writer holding the gate or the flock past claudeRateLimitBestEffortGateWait
-	// drops it — and probing anyway would leave the counter untouched, so a
-	// device whose cache is persistently contended would issue one startup
-	// request per restart forever. That counter is the only thing bounding a
-	// crash-looping agent against an account-scoped endpoint, so an uncharged
-	// attempt does not go out. The debt and its counter are left exactly as
-	// found, so the next start still pays it — and this process's own trailing
-	// probe or gather can still pay it now, from the gate seeded just above.
+	// The empty token is decided HERE, from the identity pinned at the top: the
+	// attempt would reach probeClaudeUsageResult's no_credential exit anyway,
+	// and a transiently unreadable credential store needs no writes at all.
+	refusal := claudeUsageProbe.refusal(now, false)
+	if refusal == "" && identity.token == "" {
+		refusal = claudeProbeNoCredential
+	}
+	if refusal == "" && (identity.tokenExpired(now) || claudeUsageProbe.awaitingCredentialChange(identity.credStamp)) {
+		claudeUsageProbe.noteAuthWait(identity.credStamp)
+		refusal = claudeProbeCredentialExpired
+	}
+	if refusal != "" {
+		return claudeRunDebtRefused(fingerprint, owed, now, refusal)
+	}
+
+	// Reserve one slot of the debt's request budget, DURABLY, before any
+	// network I/O. A crash or an update hand-off between here and the response
+	// leaves the slot spent, so no sequence of restarts can exceed the cap — the
+	// counter is the only thing bounding a crash-looping agent against an
+	// account-scoped endpoint. A reservation the cache refuses (contention, an
+	// I/O error, a debt replaced while we read, or a count two overlapping
+	// processes both passed the unlocked retirement test on) sends nothing and
+	// books a free rung.
 	if !mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1)) {
-		return
+		result := claudeProbeResult{code: claudeProbeReserveFailed}
+		logClaudeUsageProbeResult(result)
+		claudeBookRunDebtRungFor(fingerprint, owed, now, result)
+		return result
 	}
 
 	// ONE bounded attempt, through the ordinary single-flight probe, issued with
-	// the identity this replay charged under — never a freshly resolved one.
-	// Whatever it finds (or fails to find) is left to the ordinary gather/refresh
-	// bounds; the merge that carries a covering reading settles the debt in its
-	// own write.
-	if done, issued := claudeUsageProbeAttemptIssuedAs(owed, func() claudeUsageProbeIdentity { return identity }); done && issued {
-		return
+	// the identity this attempt reserved under — never a freshly resolved one.
+	result, settled := claudeUsageProbeAttemptAs(owed, identity)
+	if !result.issued {
+		// Nothing left this process, so the slot bought nothing: the gate
+		// refused in the gap since the pre-check, or the attempt was admitted
+		// and returned before asking anything (a rejected endpoint override).
+		// Safe in the crash direction: a crash between the reservation and this
+		// refund keeps the slot spent, which only spends the budget faster.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
 	}
-	// Nothing left this process, so the charge above bought nothing: either the
-	// gate never admitted the attempt — a concurrent gather held the single-flight
-	// slot — or it was admitted and returned before asking anything, which with a
-	// pinned non-empty token means a rejected endpoint override.
-	// Refund it, or two unlucky starts would retire a debt that was never once put
-	// to the endpoint, leaving exactly the stale card this path exists to clear.
-	// Safe in the crash direction: a crash between the charge and the refund keeps
-	// the charge, which only ever spends the budget faster.
-	mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
+	if settled {
+		// The covering merge settled the debt in its own write; this clears a
+		// debt a SHARED covering reading answered (another writer's partial
+		// write cannot settle it there) and the credential wait the request
+		// ended. A no-op when both are already gone.
+		mutateClaudeRateLimitSnapshot(path, fingerprint, settleClaudeRunDebtAt(owed))
+		return result
+	}
+	claudeBookRunDebtRungFor(fingerprint, owed, now, result)
+	return result
+}
+
+// claudeRunDebtRefused handles a refusal that sent nothing: it books the rung
+// the refusal calls for. A probe in flight is JOINED first — the holder never
+// owns the debt schedule, and a routine probe admitted before this run finished
+// persists a PRE-run reading, so the debt settles only on a covering one.
+// Needs no credential: the fingerprint and the debt are the caller's.
+func claudeRunDebtRefused(fingerprint string, owed, now time.Time, refusal claudeProbeCode) claudeProbeResult {
+	result := claudeProbeResult{code: refusal}
+	if refusal == claudeProbeInFlight {
+		ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeJoinTimeout)
+		_, joinedAt := claudeUsageProbe.joinInFlight(ctx, fingerprint)
+		cancel()
+		if claudeUsageObservationCovers(joinedAt, owed) {
+			claudeUsageProbe.settleOwed(owed)
+			mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, retireClaudeRefreshDebtAt(owed))
+			return result
+		}
+	}
+	logClaudeUsageProbeResult(result)
+	claudeBookRunDebtRungFor(fingerprint, owed, now, result)
+	return result
+}
+
+// settleClaudeRunDebtAt clears the debt judged at `owed` (if still standing)
+// together with the credential wait an issued request ended.
+func settleClaudeRunDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bool {
+	retire := retireClaudeRefreshDebtAt(owed)
+	return func(snap *claudeRateLimitSnapshot) bool {
+		changed := retire(snap)
+		if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+			changed = true
+		}
+		return changed
+	}
 }

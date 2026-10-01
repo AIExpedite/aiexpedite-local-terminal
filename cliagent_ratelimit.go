@@ -158,8 +158,8 @@ type claudeRateLimitSnapshot struct {
 	// a run that finished moments before an agent self-update left nothing
 	// behind, and the next gather treated the pre-run reading as fresh for the
 	// whole claudeUsageProbeStaleAfter window: a passing post-update smoke beside
-	// a stale utilization card. StartAgent's payOwedClaudeUsageRefresh replays it
-	// once. Codex (RefreshOwedAtMs in codexRateLimitSnapshot) and Antigravity
+	// a stale utilization card. The run-debt retry ladder pays it, and
+	// StartAgent's payOwedClaudeUsageRefresh resumes that ladder. Codex (RefreshOwedAtMs in codexRateLimitSnapshot) and Antigravity
 	// carry the same field for the same reason.
 	//
 	// It lives HERE rather than in a state file of its own because this snapshot
@@ -167,11 +167,14 @@ type claudeRateLimitSnapshot struct {
 	// fingerprint flip, which is exactly the scoping a debt needs: a /login to
 	// another account must not pay one account's debt against another's quota.
 	RefreshOwedAtMs int64 `json:"refreshOwedAtMs,omitempty"`
-	// RefreshOwedAttempts bounds one debt. Each agent start spends at most one
-	// replay, so the age limit alone would let a crash-looping agent issue a
-	// request per restart for the whole of claudeRefreshOwedMaxAge; this counter
-	// is what actually caps it. It resets ONLY when RefreshOwedAtMs advances —
-	// see claudeOweRunRefresh.
+	// RefreshOwedAttempts is the ONE counter of endpoint requests a debt has
+	// cost, across every automatic path — the run's attempt, the retry ladder,
+	// the startup replay and a debt-forced refresh — each of which reserves a
+	// slot here before it sends. The age limit alone would let a crash-looping
+	// agent issue a request per restart for the whole of claudeRefreshOwedMaxAge;
+	// this counter (capped at claudeRefreshOwedMaxRequests) is what actually
+	// bounds it. It resets ONLY when RefreshOwedAtMs advances — see
+	// claudeOweRunRefresh.
 	RefreshOwedAttempts int `json:"refreshOwedAttempts,omitempty"`
 	// HeldUntilMs mirrors claudeUsageProbeGate.heldUntil, the floor a 429
 	// Retry-After imposes. In memory only, a restart inside the hold window
@@ -181,17 +184,42 @@ type claudeRateLimitSnapshot struct {
 	// on the way out by payOwedClaudeUsageRefresh, so a hostile or skewed value
 	// cannot disable utilization for days.
 	HeldUntilMs int64 `json:"heldUntilMs,omitempty"`
+	// NextAttemptAtMs is the debt's booked retry rung
+	// (cliagent_usage_claudecode_refresh_schedule.go): the instant the next
+	// automatic attempt is due. Persisted so an agent restart or self-update
+	// re-arms the rung instead of spending it early or dropping it — the same
+	// field Codex and Antigravity carry. Cleared with the debt.
+	NextAttemptAtMs int64 `json:"nextAttemptAtMs,omitempty"`
+	// AuthWaitCredStampNs / AuthWaitCredSize are the credential-file stamp
+	// (mtime, size) an expired token or a 401 was seen under. While the file
+	// still carries it, no automatic attempt re-sends the same token; Claude
+	// Code rewriting the file is the signal to try again. Numbers only — never
+	// the token or the path. Zero on macOS Keychain logins, which have no file.
+	AuthWaitCredStampNs int64 `json:"authWaitCredStampNs,omitempty"`
+	AuthWaitCredSize    int64 `json:"authWaitCredSize,omitempty"`
 }
 
-// clearClaudeRefreshDebt drops the owed-refresh marker and its attempt counter,
+// resetClaudeProbeAccountState drops everything on the snapshot that describes
+// ONE account's probe state — buckets, probe evidence, debt, hold, rung and
+// credential wait — for a fingerprint transition. Shared by the merge and the
+// marker writer so the two account-boundary rules cannot drift.
+func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
+	snap.Buckets = map[string]claudeRateLimitBucket{}
+	snap.LastProbeObservedAtMs = 0
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
+	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
+}
+
+// clearClaudeRefreshDebt drops the owed-refresh marker, its attempt counter and
+// its booked rung,
 // reporting whether anything changed. The HOLD is deliberately not touched: a
 // paid, retired or account-scoped-away debt says nothing about whether the
 // service has asked us to slow down.
 func clearClaudeRefreshDebt(snap *claudeRateLimitSnapshot) bool {
-	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 {
+	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 && snap.NextAttemptAtMs == 0 {
 		return false
 	}
-	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 0, 0, 0
 	return true
 }
 
@@ -793,15 +821,13 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		return time.Time{}, errClaudeRateLimitCacheRescoped
 	}
 	if snap.AccountFingerprint != fingerprint {
-		snap.Buckets = map[string]claudeRateLimitBucket{}
 		// Probe evidence is an observation about ONE account's quota, so it
-		// crosses an account boundary no more than a bucket does.
-		snap.LastProbeObservedAtMs = 0
-		// Neither does a post-run debt or a 429 hold. Paying the previous
-		// account's debt against this one's quota would spend a request for a
-		// reading that can never cover it, and inheriting its hold would park
-		// the new account's probe behind backpressure it never earned.
-		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
+		// crosses an account boundary no more than a bucket does. Neither does a
+		// post-run debt, its rung, or a 429 hold: paying the previous account's
+		// debt against this one's quota would spend a request for a reading that
+		// can never cover it, and inheriting its hold would park the new
+		// account's probe behind backpressure it never earned.
+		resetClaudeProbeAccountState(&snap)
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {

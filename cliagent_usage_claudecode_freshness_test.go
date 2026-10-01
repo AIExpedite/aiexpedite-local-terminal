@@ -137,7 +137,7 @@ func TestClaudeOweRunRefresh_NewerBaselineResetsTheAttemptBudget(t *testing.T) {
 	first := time.Now().Add(-time.Minute)
 	claudeOweRunRefresh(first)
 	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-		snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
+		snap.RefreshOwedAttempts = claudeRefreshOwedMaxRequests
 		return true
 	})
 
@@ -949,7 +949,7 @@ func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheReplayWouldRetire(t *testing
 		owedAgo  time.Duration
 		attempts int
 	}{
-		{"at the attempt cap", time.Minute, claudeUsageProbeAfterRunMaxAttempts},
+		{"at the attempt cap", time.Minute, claudeRefreshOwedMaxRequests},
 		{"past the age limit", claudeRefreshOwedMaxAge + time.Minute, 0},
 		{"stamped beyond the skew ceiling", -2 * claudeRefreshOwedLocalSkew, 0},
 	}
@@ -1422,10 +1422,10 @@ func TestPayOwedClaudeUsageRefresh_DeclinesTheChargeWhenTheCredentialStoreYields
 // B's token: the merge that carried B's reading would drop A's buckets as an
 // account transition — B's quota spent on A's run, and A's readings erased.
 //
-// Driven through claudeUsageProbeAttemptIssuedAs, which is the binding itself:
+// Driven through claudeUsageProbeAttemptAs, which is the binding itself:
 // the on-disk credential is swapped to another token before the attempt, and the
 // request must still carry the pinned one and persist under the pinned scope.
-func TestClaudeUsageProbeAttemptIssuedAs_IssuesWithThePinnedIdentity(t *testing.T) {
+func TestClaudeUsageProbeAttemptAs_IssuesWithThePinnedIdentity(t *testing.T) {
 	const pinnedToken = "sk-ant-oat-pinned"
 	const pinnedFingerprint = "account-a"
 
@@ -1445,11 +1445,9 @@ func TestClaudeUsageProbeAttemptIssuedAs_IssuesWithThePinnedIdentity(t *testing.
 	writeClaudeProbeCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "sk-ant-oat-other-account")
 
 	identity := claudeUsageProbeIdentity{token: pinnedToken, fingerprint: pinnedFingerprint}
-	done, issued := claudeUsageProbeAttemptIssuedAs(now.Add(-time.Minute), func() claudeUsageProbeIdentity {
-		return identity
-	})
-	if !done || !issued {
-		t.Fatalf("done=%v issued=%v, want the pinned attempt to spend its turn", done, issued)
+	result, settled := claudeUsageProbeAttemptAs(now.Add(-time.Minute), identity)
+	if !settled || !result.issued || result.code != claudeProbeOK {
+		t.Fatalf("result=%+v settled=%v, want the pinned attempt to spend its turn and pay", result, settled)
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Fatalf("request count=%d, want exactly 1", got)
@@ -1822,7 +1820,7 @@ func TestClaudeUsageProbe_UnissuedAdmissionRefundsTheThrottleSlot(t *testing.T) 
 	if !claudeUsageProbe.begin(time.Now(), false) {
 		t.Fatal("the next attempt was throttled by an admission that issued nothing")
 	}
-	claudeUsageProbe.finish(nil, false, time.Time{}, "")
+	claudeUsageProbe.finish(claudeProbeResult{}, false, time.Time{}, "")
 	if n := atomic.LoadInt64(calls); n != 0 {
 		t.Errorf("issued %d requests, want 0", n)
 	}
@@ -1836,15 +1834,15 @@ func TestAdjustClaudeRefreshAttemptsAt_RefusesAChargePastTheCap(t *testing.T) {
 	fp := currentClaudeAccountFingerprint()
 	judged := time.Now().Add(-time.Minute)
 
-	seedClaudeRefreshDebt(t, cache, fp, judged, claudeUsageProbeAfterRunMaxAttempts-1, time.Time{})
+	seedClaudeRefreshDebt(t, cache, fp, judged, claudeRefreshOwedMaxRequests-1, time.Time{})
 	if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
 		t.Fatal("the first charge up to the cap must land")
 	}
 	if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
 		t.Fatal("a second charge that read the same pre-cap count was allowed past the cap")
 	}
-	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeUsageProbeAfterRunMaxAttempts {
-		t.Fatalf("attempts=%d, want the cap %d", got, claudeUsageProbeAfterRunMaxAttempts)
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeRefreshOwedMaxRequests {
+		t.Fatalf("attempts=%d, want the cap %d", got, claudeRefreshOwedMaxRequests)
 	}
 }
 
@@ -1922,7 +1920,7 @@ func TestRefreshClaudeUsageIfStale_OwingGatherJoinsTheInFlightPayer(t *testing.T
 	covering := runEnded.Add(time.Second)
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		claudeUsageProbe.finish(nil, true, covering, fp)
+		claudeUsageProbe.finish(claudeProbeResult{}, true, covering, fp)
 	}()
 
 	generation := claudeUsageProbe.refreshGeneration()
@@ -1976,7 +1974,7 @@ func TestRefreshClaudeUsageIfStale_ReportsADedupedReplayThatLandedAfterTheSeed(t
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond) // let the joiner park on doneCh
-	claudeUsageProbe.finish(nil, false, latest.Add(time.Minute), fp)
+	claudeUsageProbe.finish(claudeProbeResult{}, false, latest.Add(time.Minute), fp)
 
 	if at := <-joined; !at.IsZero() {
 		t.Fatalf("joinInFlight()=%v, want a joined-but-unusable answer — a forced refresh never inherits a dedupe", at)
@@ -2122,7 +2120,7 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 			seedClaudeProbeReading(t, cache, latest)
 			owed := now.Add(-time.Minute)
 			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-				snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed.UnixMilli(), claudeUsageProbeAfterRunMaxAttempts-1
+				snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed.UnixMilli(), claudeRefreshOwedMaxRequests-1
 				return true
 			})
 
@@ -2141,7 +2139,7 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 
 			// The replay charges the final attempt and fails, rewriting the snapshot.
 			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-				snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
+				snap.RefreshOwedAttempts = claudeRefreshOwedMaxRequests
 				return true
 			})
 			// seedOwedFromCache latches its adoption to (mtime, size), and this write
@@ -2237,7 +2235,7 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 
 	// Each pass is a fresh process inheriting the same cache: only the gate is
 	// reset, exactly as a self-update restart leaves things.
-	for attempt := 1; attempt <= claudeUsageProbeAfterRunMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= claudeRefreshOwedMaxRequests; attempt++ {
 		resetClaudeUsageProbeGate()
 		SetClaudeUsageProbeDisabled(false)
 		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
@@ -2261,8 +2259,8 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
 		t.Errorf("a capped debt was adopted as %v; the gather would issue an uncharged request for it", got)
 	}
-	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != claudeUsageProbeAfterRunMaxAttempts {
-		t.Errorf("RefreshOwedAttempts=%d, want it held at the cap %d", attempts, claudeUsageProbeAfterRunMaxAttempts)
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != claudeRefreshOwedMaxRequests {
+		t.Errorf("RefreshOwedAttempts=%d, want it held at the cap %d", attempts, claudeRefreshOwedMaxRequests)
 	}
 }
 
@@ -2521,7 +2519,7 @@ func TestClaudeUsageProbeGate_CacheSeedLeavesADebtUnchargedWhileAProbeIsInFlight
 	finish := func() {
 		if !finished {
 			finished = true
-			claudeUsageProbe.finish(nil, false, time.Time{}, fp)
+			claudeUsageProbe.finish(claudeProbeResult{}, false, time.Time{}, fp)
 		}
 	}
 	t.Cleanup(finish)
@@ -3377,4 +3375,227 @@ func TestRefreshClaudeUsageIfStaleAs_JudgesTheGathersPinnedScope(t *testing.T) {
 	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
 		t.Errorf("five-hour utilization=%v, want the new account's own 9 — account A's reading overwrote it", got)
 	}
+}
+
+/* --------------------------------------------------------------------------
+   One request budget per debt, across every automatic path
+   -------------------------------------------------------------------------- */
+
+// A mix of immediate, timer, startup and debt-forced refresh attempts on one
+// unchanged debt sends no more than claudeRefreshOwedMaxRequests requests, and
+// a user's click is not counted against it.
+func TestClaudeRunDebt_SharedBudgetAcrossEveryAutomaticPath(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	// Rungs that are always due, so every path below — and every timer they
+	// arm, firing concurrently — gets to try.
+	pinClaudeRunDebtLadder(t, []time.Duration{time.Millisecond}, time.Millisecond, time.Millisecond)
+	start := time.Now()
+	seedClaudeProbeReading(t, cache, start.Add(-time.Hour))
+	claudeOweRunRefresh(start.Add(-time.Minute))
+
+	debtCtx := func() context.Context { return WithClaudeUsageForceProbe(context.Background(), claudeForceDebt) }
+	for i := 0; i < 2*claudeRefreshOwedMaxRequests; i++ {
+		claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerRun)
+		claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerTimer)
+		// A debt-forced refresh, with a reading fresh enough that only the owed
+		// debt — never the staleness TTL — could make it probe.
+		refreshClaudeUsageIfStale(debtCtx(), time.Now(), time.Now(), probeTestToken, "")
+		time.Sleep(5 * time.Millisecond)
+		claudeFreshnessWaitIdle(t)
+		simulateClaudeAgentRestart(t)
+		payOwedClaudeUsageRefreshAt(time.Now())
+		claudeFreshnessWaitIdle(t)
+	}
+	if got := atomic.LoadInt64(calls); got != claudeRefreshOwedMaxRequests {
+		t.Fatalf("one unpaid debt cost %d requests across the automatic paths, want exactly the budget %d",
+			got, claudeRefreshOwedMaxRequests)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Errorf("a debt that spent its budget must be retired: %+v", snap)
+	}
+
+	// A click is the user's, not the debt's.
+	before := atomic.LoadInt64(calls)
+	clickCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
+	refreshClaudeUsageIfStale(clickCtx, time.Now(), start.Add(-time.Hour), probeTestToken, "")
+	if got := atomic.LoadInt64(calls) - before; got != 1 {
+		t.Errorf("a click sent %d requests, want 1 regardless of the spent budget", got)
+	}
+}
+
+// A restart between a reserved slot and the response leaves the slot spent:
+// the total across restarts stays within the budget.
+func TestClaudeRunDebt_ReservedSlotSurvivesACrash(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	// The slot a process reserved just before it died mid-request.
+	if !mutateClaudeRateLimitSnapshot(cache, "", adjustClaudeRefreshAttemptsAt(owed, +1)) {
+		t.Fatal("precondition: the reservation must reach disk")
+	}
+
+	for i := 0; i < claudeRefreshOwedMaxRequests+2; i++ {
+		simulateClaudeAgentRestart(t)
+		payOwedClaudeUsageRefreshAt(now.Add(time.Duration(i+1) * 20 * time.Minute))
+		claudeFreshnessWaitIdle(t)
+	}
+	if got := atomic.LoadInt64(calls); got != claudeRefreshOwedMaxRequests-1 {
+		t.Fatalf("requests across restarts=%d, want %d — the crashed attempt's slot stays spent",
+			got, claudeRefreshOwedMaxRequests-1)
+	}
+}
+
+// A reservation the cache refuses sends nothing and books a free rung.
+func TestClaudeRunDebt_FailedReservationSendsNothing(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	original := claudeRateLimitBestEffortGateWait
+	claudeRateLimitBestEffortGateWait = 20 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitBestEffortGateWait = original })
+
+	lockClaudeRateLimitCache()
+	result := claudeRunDebtAttemptAt(now, claudeDebtTriggerRun)
+	unlockClaudeRateLimitCache()
+
+	if result.code != claudeProbeReserveFailed || result.issued {
+		t.Errorf("result=%+v, want not-admitted reserve_failed", result)
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0 — an unreserved attempt must not send", got)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Error("a refused reservation must still leave a rung armed")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAttempts != 0 {
+		t.Errorf("RefreshOwedAttempts=%d, want nothing charged", snap.RefreshOwedAttempts)
+	}
+}
+
+// A routine probe is already in flight when a run records a newer debt. The
+// run's attempt joins it, finds its reading does not cover the debt, and a free
+// rung later pays it.
+func TestClaudeRunDebt_JoinsANonCoveringProbeThenARungPays(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	pinClaudeRunDebtLadder(t, []time.Duration{50 * time.Millisecond}, 50*time.Millisecond, 20*time.Millisecond)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+
+	// The routine probe holding the slot, admitted BEFORE the run finished.
+	if !claudeUsageProbe.begin(time.Now(), false) {
+		t.Fatal("precondition: the routine probe must hold the slot")
+	}
+	preRun := time.Now().Add(-time.Second)
+	owed := time.Now()
+	claudeOweRunRefresh(owed)
+
+	done := make(chan claudeProbeResult, 1)
+	go func() { done <- claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerRun) }()
+	time.Sleep(50 * time.Millisecond)
+	// The routine probe lands a PRE-run reading.
+	claudeUsageProbe.finish(claudeProbeResult{code: claudeProbeOK, admitted: true, issued: true}, true, preRun, "")
+	if result := <-done; result.code != claudeProbeInFlight {
+		t.Fatalf("result=%+v, want the run's attempt to have joined the holder", result)
+	}
+
+	waitForClaudeCondition(t, 10*time.Second, "the rung never paid the debt the joined probe did not cover", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want exactly the rung's one request", got)
+	}
+}
+
+// A held, credential-expired or offline replay books a free rung and charges
+// nothing; a rung already booked in the future is re-armed, not spent.
+func TestClaudeRunDebt_RefusedReplaysBookARungAndChargeNothing(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, cache string, owed time.Time)
+		want  claudeProbeCode
+	}{
+		{name: "held", want: claudeProbeHeld, setup: func(t *testing.T, cache string, owed time.Time) {
+			seedClaudeRefreshDebt(t, cache, "", owed, 0, time.Now().Add(10*time.Minute))
+		}},
+		{name: "credential expired", want: claudeProbeCredentialExpired, setup: func(t *testing.T, cache string, owed time.Time) {
+			writeClaudeProbeCredentialExpiring(t, os.Getenv("CLAUDE_CONFIG_DIR"), probeTestToken, time.Now().Add(-time.Hour))
+		}},
+		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T, cache string, owed time.Time) {
+			was := isOffline
+			isOffline = true
+			t.Cleanup(func() { isOffline = was })
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+			now := time.Now()
+			seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+			owed := now.Add(-time.Minute)
+			claudeOweRunRefresh(owed)
+			tc.setup(t, cache, owed)
+
+			if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerStartup); result.code != tc.want || result.issued {
+				t.Fatalf("result=%+v, want not-admitted %q", result, tc.want)
+			}
+			snap := claudeCacheSnapshot(t, cache)
+			if atomic.LoadInt64(calls) != 0 || snap.RefreshOwedAttempts != 0 {
+				t.Errorf("requests=%d attempts=%d, want a refusal to cost nothing", atomic.LoadInt64(calls), snap.RefreshOwedAttempts)
+			}
+			if snap.NextAttemptAtMs <= now.UnixMilli() || !claudeRunDebtRetryPending() {
+				t.Errorf("NextAttemptAtMs=%d pending=%v, want a rung booked ahead and armed", snap.NextAttemptAtMs, claudeRunDebtRetryPending())
+			}
+
+			// Restart before the rung: it is re-armed, not spent early.
+			booked := snap.NextAttemptAtMs
+			simulateClaudeAgentRestart(t)
+			if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerStartup); result.code != "" {
+				t.Errorf("a future rung was spent early: %+v", result)
+			}
+			if !claudeRunDebtRetryPending() || claudeCacheSnapshot(t, cache).NextAttemptAtMs != booked {
+				t.Error("the persisted rung must be re-armed unchanged")
+			}
+		})
+	}
+}
+
+// Retiring a debt clears only the debt fields: the buckets and the 429 hold
+// survive a reload.
+func TestClaudeRunDebt_RetirementKeepsBucketsAndHold(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	hold := now.Add(time.Hour)
+	seedClaudeRefreshDebt(t, cache, "", now.Add(-time.Minute), claudeRefreshOwedMaxRequests, hold)
+	bucketsBefore := claudeCacheSnapshot(t, cache).Buckets
+
+	payOwedClaudeUsageRefreshAt(now)
+	claudeFreshnessWaitIdle(t)
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs != 0 {
+		t.Errorf("debt fields survived retirement: %+v", snap)
+	}
+	if snap.HeldUntilMs != hold.UnixMilli() {
+		t.Errorf("HeldUntilMs=%d, want the hold %d left alone", snap.HeldUntilMs, hold.UnixMilli())
+	}
+	if got, _ := json.Marshal(snap.Buckets); string(got) != string(mustJSON(t, bucketsBefore)) {
+		t.Errorf("buckets changed on retirement:\n got %s\nwant %s", got, mustJSON(t, bucketsBefore))
+	}
+	if atomic.LoadInt64(calls) != 0 {
+		t.Error("retirement must not spend a request")
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
