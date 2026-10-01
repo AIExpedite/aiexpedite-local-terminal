@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,7 +24,14 @@ type helperLogIndex struct {
 	mu         sync.Mutex
 	live       map[int]bool
 	unknown    map[int]bool
+	// unreadable PIDs answer the start-token read with
+	// errHelperTokenUnreadable (access denied), not "no such process".
+	unreadable map[int]bool
 }
+
+// errHelperTokenUnreadable is a start-token read failure that does not prove
+// the process gone; every other stubbed failure does.
+var errHelperTokenUnreadable = errors.New("access denied")
 
 func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	t.Helper()
@@ -35,12 +43,12 @@ func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	t.Setenv("USERPROFILE", home)
 	idx := &helperLogIndex{
 		home: home, base: filepath.Join(home, ".gemini", "antigravity-cli"),
-		live: map[int]bool{}, unknown: map[int]bool{},
+		live: map[int]bool{}, unknown: map[int]bool{}, unreadable: map[int]bool{},
 	}
 	if err := os.MkdirAll(antigravityLogDir(idx.base), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	origProbe, origToken, origScan := antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan
+	origProbe, origToken, origScan, origGone := antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan, antigravityStartTokenErrGone
 	antigravityCandidateProbe = func(pid int, token string) processProbeResult {
 		idx.mu.Lock()
 		defer idx.mu.Unlock()
@@ -57,14 +65,19 @@ func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	antigravityProcessStartToken = func(pid int) (string, error) {
 		idx.mu.Lock()
 		defer idx.mu.Unlock()
+		if idx.unreadable[pid] {
+			return "", errHelperTokenUnreadable
+		}
 		if idx.live[pid] || idx.unknown[pid] {
 			return fmt.Sprintf("tok-%d", pid), nil
 		}
 		return "", fmt.Errorf("no such process")
 	}
+	antigravityStartTokenErrGone = func(err error) bool { return !errors.Is(err, errHelperTokenUnreadable) }
 	antigravityProcessScan = func() ([]ProcessInfo, bool) { return nil, false }
 	t.Cleanup(func() {
 		antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan = origProbe, origToken, origScan
+		antigravityStartTokenErrGone = origGone
 		antigravityUsageRefreshWaitIdle()
 		resetAntigravityLogIndex()
 		resetAntigravityExhaustionEvidence()
@@ -352,6 +365,28 @@ func TestAntigravityCandidate_UnknownOrOverflowIsNeverProven(t *testing.T) {
 		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
 			t.Fatalf("at +%s owed=%s proven=%v, want neither run owed", at, res.owed, res.owedProven)
 		}
+	}
+}
+
+// A PID whose start token cannot be read for a reason other than its process
+// being gone (access denied, a transient /proc or sysctl failure) may still be
+// running a long turn with a quiet log: an unchanged log is not proof of its
+// exit. It keeps the settle window and is owed unproven after it.
+func TestAntigravityCandidate_UnreadablePIDIsNotGoneAtFirstSight(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	h.mu.Lock()
+	h.unreadable[5181] = true
+	h.mu.Unlock()
+	h.write(t, helperLogName(now), helperPIDBlock(5181), now, false)
+	for _, at := range []time.Duration{time.Second, 10 * time.Second, 30 * time.Second} {
+		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
+			t.Fatalf("at +%s owed=%s proven=%v, want an unreadable PID's run unowed inside the settle window", at, res.owed, res.owedProven)
+		}
+	}
+	res := h.pass(now.Add(time.Second+antigravityCandidateSettle), 0)
+	if !res.owed.Equal(now.Add(time.Second)) || res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor after the settle window, unproven", res.owed, res.owedProven)
 	}
 }
 

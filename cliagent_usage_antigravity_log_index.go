@@ -124,6 +124,9 @@ var (
 	}
 	// antigravityProcessStartToken reads a live PID's start identity.
 	antigravityProcessStartToken = processStartToken
+	// antigravityStartTokenErrGone reports whether a start-token read error
+	// proves the PID's process gone.
+	antigravityStartTokenErrGone = processStartTokenErrGone
 	// antigravityProcessScan lists live Antigravity processes under either of
 	// the CLI's image names; ok=false means the list could not be read (never
 	// "none running").
@@ -150,6 +153,11 @@ type antigravityTrackedPID struct {
 	// exitedAt is when a remembered own or managed run ended; zero while it
 	// runs, and always zero for a candidate's PID.
 	exitedAt time.Time
+	// unread marks a candidate PID whose start token could not be read for a
+	// reason other than its process being gone (access denied, a transient
+	// /proc or sysctl failure): the run may still be going, so its exit is
+	// never proven (antigravityExitProvenLocked) and it keeps the settle window.
+	unread bool
 }
 
 type antigravityLogEntry struct {
@@ -836,6 +844,17 @@ func antigravityCurrentStartToken(pid int) string {
 	return token
 }
 
+// antigravityCandidatePID reads a candidate PID at first sight: its start token
+// when live, an empty token when its process is provably gone, and an empty
+// token marked unread when the read failed for any other reason.
+func antigravityCandidatePID(pid int) antigravityTrackedPID {
+	token, err := antigravityProcessStartToken(pid)
+	if err != nil {
+		return antigravityTrackedPID{pid: pid, unread: !antigravityStartTokenErrGone(err)}
+	}
+	return antigravityTrackedPID{pid: pid, token: token}
+}
+
 // antigravityPushPID remembers p, replacing an older entry for the same PID
 // (the OS reused it for another own or managed run).
 func antigravityPushPID(ring []antigravityTrackedPID, p antigravityTrackedPID) []antigravityTrackedPID {
@@ -1150,11 +1169,13 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 		// user's run the OS gave the same PID.
 		known := antigravityTrackedFind(entry.pids, pid)
 		token, looked := "", false
+		var read antigravityTrackedPID
 		switch {
 		case known != nil:
 			token = known.token
 		case antigravityPIDRememberedLocked(pid):
-			token, looked = antigravityCurrentStartToken(pid), true
+			read, looked = antigravityCandidatePID(pid), true
+			token = read.token
 		}
 		if antigravityPIDIn(idx.ownPIDs, pid, token, startedBy) || antigravityOwnBlockLocked(entry.path, pid) {
 			continue
@@ -1172,9 +1193,9 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 			continue
 		}
 		if !looked {
-			token = antigravityCurrentStartToken(pid)
+			read = antigravityCandidatePID(pid)
 		}
-		foreign = append(foreign, antigravityTrackedPID{pid: pid, token: token})
+		foreign = append(foreign, read)
 	}
 	switch {
 	case len(pids) == 0:
@@ -1380,13 +1401,19 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 //     log last written a whole settle window ago (a run that ended while the
 //     agent was down) needs no second look.
 //
-// pidOverflow is never proof.
+// pidOverflow is never proof, and neither is a PID whose start token could not
+// be read for a reason other than its process being gone (unread): that run
+// keeps the settle window.
 func antigravityExitProvenLocked(entry *antigravityLogEntry, now time.Time) bool {
 	if entry.pidOverflow || len(entry.pids) == 0 {
 		return false
 	}
 	goneAtFirstSight := false
 	for _, p := range entry.pids {
+		if p.unread {
+			// Unreadable is not gone: the run may still be going.
+			return false
+		}
 		if p.token == "" {
 			goneAtFirstSight = true
 		}
