@@ -932,7 +932,23 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 		// skew ceiling. Without this the rebased floor (now) would read as
 		// armed after startedAt and the interrupted run would go unpaid.
 		inherited := state.RunFloorMs != floorBefore || state.RunFloorMs < startedAt.UnixMilli()
-		if state.owed() || state.RunFloorMs == 0 || !inherited {
+		if state.RunFloorMs == 0 || !inherited {
+			return
+		}
+		if state.owed() {
+			// A floor armed after the debt's last read, under the debt's own
+			// account, is a run that started after an auth refusal idled the
+			// debt (a re-login to the same account clears nothing) and was cut
+			// off before it settled. Its settle would have woken the debt, so
+			// the restart does it in its place; otherwise the idle below would
+			// leave that run's usage unread.
+			if grokAuthOutcome(state.LastOutcome) && state.NextAttemptAtMs == 0 &&
+				state.RunFloorMs > state.LastAttemptAtMs && fingerprint != "" &&
+				fingerprint == state.RunFloorAccount && fingerprint == state.AccountFingerprint &&
+				now.Sub(time.UnixMilli(state.RunFloorMs)) <= grokRunDebtMaxAge {
+				grokOweRead(state, now, grokCompletionMs(now), fingerprint)
+				state.LastOutcome = ""
+			}
 			return
 		}
 		// A floor with no debt beside it belongs to a run the previous process

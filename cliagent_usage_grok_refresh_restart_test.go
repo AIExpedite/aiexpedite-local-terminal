@@ -119,3 +119,45 @@ func TestPayOwedGrokUsageRefresh_OfflineSendsNothingAndKeepsTheDebt(t *testing.T
 		t.Fatalf("state = %+v, want the debt kept with its budget", state)
 	}
 }
+
+// An auth refusal idles the debt until a new run settles. A run armed after
+// that refusal (the user re-logged in to the same account) but cut off before
+// its settle leaves only its floor; the restart treats it as the new run it
+// is and reads, instead of honouring the stale auth idle.
+func TestPayOwedGrokUsageRefresh_InterruptedRunWakesAnAuthIdledDebt(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{
+		RunFloorMs: h.clock().Add(-time.Minute).UnixMilli(), RunFloorAccount: "fp-ada",
+		CompletionMs: h.clock().Add(-time.Hour).UnixMilli(), OwedAtMs: h.clock().Add(-time.Hour).UnixMilli(),
+		LastAttemptAtMs: h.clock().Add(-50 * time.Minute).UnixMilli(), Attempts: 1,
+		AccountFingerprint: "fp-ada", LastOutcome: grokLiveOutcomeUnauthorized,
+	})
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the interrupted run paid once", h.reads.Load())
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, want the debt paid by the ok read", state)
+	}
+}
+
+// A floor no newer than the refusing read is the debt's own run: the restart
+// keeps the auth idle and sends nothing.
+func TestPayOwedGrokUsageRefresh_AuthIdledDebtStaysIdleForItsOwnFloor(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{
+		RunFloorMs: h.clock().Add(-time.Hour - time.Minute).UnixMilli(), RunFloorAccount: "fp-ada",
+		CompletionMs: h.clock().Add(-time.Hour).UnixMilli(), OwedAtMs: h.clock().Add(-time.Hour).UnixMilli(),
+		LastAttemptAtMs: h.clock().Add(-50 * time.Minute).UnixMilli(), Attempts: 1,
+		AccountFingerprint: "fp-ada", LastOutcome: grokLiveOutcomeUnauthorized,
+	})
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, an auth-idled debt with no newer run must stay idle", h.reads.Load())
+	}
+	if state := h.state(); !state.owed() || state.LastOutcome != grokLiveOutcomeUnauthorized {
+		t.Fatalf("state = %+v, want the idle debt kept", state)
+	}
+}
