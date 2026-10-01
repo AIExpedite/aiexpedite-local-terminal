@@ -982,11 +982,43 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
 		return time.Time{}, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameClaudeRateLimitCache(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return time.Time{}, err
 	}
 	return observed, nil
+}
+
+// claudeRateLimitCacheRenameAttempts / claudeRateLimitCacheRenameBackoff bound
+// renameClaudeRateLimitCache: at most ~80 ms of retries, held inside the cache
+// lock and well inside claudeRateLimitVerifiedPersistBudget.
+const (
+	claudeRateLimitCacheRenameAttempts = 5
+	claudeRateLimitCacheRenameBackoff  = 20 * time.Millisecond
+)
+
+// renameClaudeRateLimitCache is the replace step of every Claude cache writer
+// (the merge and mutateClaudeRateLimitSnapshotStampedScoped), retried briefly.
+//
+// On Windows a rename over a file another handle has open fails with a sharing
+// violation, and this cache is read WITHOUT the lock by design (the gather, the
+// startup replay, the refresh ladder's pre-check, a second agent channel). Each
+// such read holds the file for microseconds, so a failure here is almost always
+// gone a few milliseconds later — whereas giving up loses a probe reading the
+// account-scoped endpoint was already asked for, or the debt charge and retry
+// rung the refresh ladder depends on. Elsewhere a rename failure is a real error
+// and the retries cost only the bounded backoff before it is returned.
+func renameClaudeRateLimitCache(tmp, path string) error {
+	var err error
+	for attempt := 0; attempt < claudeRateLimitCacheRenameAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(claudeRateLimitCacheRenameBackoff)
+		}
+		if err = os.Rename(tmp, path); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of

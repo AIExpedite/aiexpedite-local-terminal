@@ -1722,3 +1722,37 @@ func TestMergeClaudeRateLimitCacheCheckedScoped_AdmitsTheSampledAndOwnScopes(t *
 		t.Errorf("an unguarded merge was refused: %v", err)
 	}
 }
+
+// An unlocked reader holding the cache open for a moment must not cost the
+// writer its rename. On Windows a rename over an open file fails with a sharing
+// violation; renameClaudeRateLimitCache retries past it. Elsewhere the rename
+// simply succeeds on the first try.
+func TestRenameClaudeRateLimitCache_SurvivesABriefReader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rl.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(path, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte(`{"new":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(claudeRateLimitCacheRenameBackoff + 10*time.Millisecond)
+		_ = reader.Close()
+		close(released)
+	}()
+	t.Cleanup(func() { <-released })
+
+	if err := renameClaudeRateLimitCache(tmp, path); err != nil {
+		t.Fatalf("rename failed behind a brief reader: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != `{"new":true}` {
+		t.Fatalf("cache holds %q, want the new snapshot", got)
+	}
+}
