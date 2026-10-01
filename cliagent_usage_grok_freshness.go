@@ -82,8 +82,10 @@ var (
 	grokRefreshMinInterval = time.Minute
 	// grokRefreshNudgeCooldown bounds how often the gather may arm the worker.
 	grokRefreshNudgeCooldown = time.Minute
-	// grokRunDebtReadTimeout bounds one debt read, renewal included.
-	grokRunDebtReadTimeout = grokBillingLiveTimeout + grokLoginRenewTimeout + grokLoginRenewGap
+	// grokRunDebtReadTimeout bounds one debt read, renewal included: a token
+	// refused on the first GET waits its turn, renews, and sends a second GET,
+	// so both GETs fit inside it rather than the retry being cut off.
+	grokRunDebtReadTimeout = 2*grokBillingLiveTimeout + grokLoginRenewTimeout + grokLoginRenewGap
 	// grokRunDebtReadWaitSlack is how much longer a waiter gives the shared
 	// read than the read gives itself, so the read's own deadline — a real
 	// outcome — fires before the waiter gives up with a `timeout`.
@@ -154,6 +156,11 @@ var (
 
 	grokLiveRunsMu sync.Mutex
 	grokLiveRuns   = map[int64]int{}
+	// grokLiveRunAccounts is the account each armed floor was spawned under,
+	// frozen at arm: an isolated child keeps its copied login for its whole
+	// life, so its debt belongs to that account even if the persistent login
+	// changes before it exits.
+	grokLiveRunAccounts = map[int64]string{}
 
 	// grokLastRefreshOutcome is the newest pass's closed outcome, for the
 	// smoke's log line.
@@ -267,8 +274,12 @@ func armGrokUsageRunFloor(now time.Time) time.Time {
 		return time.Time{}
 	}
 	floorMs := now.UnixMilli()
+	fingerprint := grokUsageCurrentFingerprint()
 	grokLiveRunsMu.Lock()
 	grokLiveRuns[floorMs]++
+	if _, ok := grokLiveRunAccounts[floorMs]; !ok {
+		grokLiveRunAccounts[floorMs] = fingerprint
+	}
 	grokLiveRunsMu.Unlock()
 	grokFreshnessInFlight.Add(1)
 	go func() {
@@ -284,6 +295,18 @@ func armGrokUsageRunFloor(now time.Time) time.Time {
 		})
 	}()
 	return now
+}
+
+// grokLiveRunAccount is the account an armed floor was spawned under; false
+// when the floor is not armed in this process.
+func grokLiveRunAccount(floorMs int64) (string, bool) {
+	grokLiveRunsMu.Lock()
+	defer grokLiveRunsMu.Unlock()
+	if grokLiveRuns[floorMs] == 0 {
+		return "", false
+	}
+	fingerprint, ok := grokLiveRunAccounts[floorMs]
+	return fingerprint, ok
 }
 
 func grokRunIsLive(floorMs int64) bool {
@@ -319,6 +342,7 @@ func grokReleaseLiveRun(floorMs int64) int64 {
 		grokLiveRuns[floorMs] = n - 1
 	} else {
 		delete(grokLiveRuns, floorMs)
+		delete(grokLiveRunAccounts, floorMs)
 	}
 	return grokOldestLiveFloorLocked()
 }
@@ -377,8 +401,19 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 	if completionMs < floorMs {
 		completionMs = floorMs
 	}
+	armedFingerprint, armed := grokLiveRunAccount(floorMs)
 	oldest := grokReleaseLiveRun(floorMs)
 	fingerprint := grokUsageCurrentFingerprint()
+	if armed && armedFingerprint != fingerprint {
+		// The run spent the account it was spawned under, which is no longer
+		// signed in. The live read can only use the current login, so a debt
+		// now would refresh — and spend budget on — the wrong account.
+		updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+			grokDropSettledFloor(state, floorMs, oldest)
+		})
+		fmt.Printf("%s[cli-usage] grok refresh: skipped account_changed%s\n", colorYellow, colorReset)
+		return false
+	}
 	if fingerprint == "" || grokObservationCovers(fingerprint, completionMs) {
 		// Covered, or no account a read could be scoped to (the auth notice
 		// owns that case).

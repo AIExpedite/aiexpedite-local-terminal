@@ -63,6 +63,7 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 		grokSmokeUsageSettleBudget, grokRunDebtReadTimeout, grokRunDebtReadWaitSlack = origBudget, origReadTimeout, origSlack
 		grokLiveRunsMu.Lock()
 		grokLiveRuns = map[int64]int{}
+		grokLiveRunAccounts = map[int64]string{}
 		grokLiveRunsMu.Unlock()
 		grokRefreshNudge.mu.Lock()
 		grokRefreshNudge.lastAt = time.Time{}
@@ -382,6 +383,36 @@ func TestGrokRunDebt_AccountChangeRetiresWithoutARequest(t *testing.T) {
 	}
 	if h.state().owed() {
 		t.Fatalf("debt kept after the account changed: %+v", h.state())
+	}
+}
+
+func TestGrokRunDebt_RunIsBoundToTheAccountItWasArmedUnder(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	// An isolated child spawned with ada's copied login; the persistent login
+	// switches to bob before it exits.
+	floor := armGrokUsageRunFloor(h.clock())
+	h.signIn("fp-bob")
+	h.advance(time.Second)
+	if grokUsageRunSettled(floor) {
+		t.Fatal("a run armed under another account opened a debt against the current one")
+	}
+	h.idle()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, ada's run must never be read against bob's login", h.reads.Load())
+	}
+	if state := h.state(); state.owed() || state.RunFloorMs != 0 {
+		t.Fatalf("state = %+v, want nothing owed and no floor left behind", state)
+	}
+
+	// Same account at both ends still owes the read.
+	floor = armGrokUsageRunFloor(h.clock())
+	h.advance(time.Second)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("a run settled under its own account owed nothing")
+	}
+	h.idle()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want one", h.reads.Load())
 	}
 }
 

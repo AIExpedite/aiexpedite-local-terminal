@@ -275,6 +275,7 @@ func grokEnableRunRefresh(t *testing.T) {
 		grokBillingLiveURL, runGrokLoginRenewal, grokUsageRefreshGrokPath, grokSmokeUsageSettleBudget = origURL, origRenew, origPath, origBudget
 		grokLiveRunsMu.Lock()
 		grokLiveRuns = map[int64]int{}
+		grokLiveRunAccounts = map[int64]string{}
 		grokLiveRunsMu.Unlock()
 	})
 }
