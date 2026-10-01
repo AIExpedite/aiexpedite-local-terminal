@@ -868,12 +868,6 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		return claudeProbeResult{}
 	}
 
-	// Seed the in-memory gate from the persisted value so refreshClaudeUsageIfStale's
-	// `owing` branch — and any run that finishes in this process — sees a debt
-	// this process did not record. recordOwed, never an owe: re-owing would reset
-	// RefreshOwedAttempts and undo the cap.
-	claudeUsageProbe.recordOwed(owed)
-
 	// A credential wait a previous attempt (or process) recorded survives the
 	// restart, so the same expired or 401'd token is not re-sent on start; one
 	// another process has since cleared drops the wait it was restored into.
@@ -891,6 +885,19 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 			return claudeProbeResult{}
 		}
 	}
+
+	// Seed the in-memory gate from the persisted value so refreshClaudeUsageIfStale's
+	// `owing` branch — and any run that finishes in this process — sees a debt
+	// this process did not record. recordOwed, never an owe: re-owing would reset
+	// RefreshOwedAttempts and undo the cap.
+	//
+	// Only AFTER the future-rung check above. seedOwedFromCache tells a debt this
+	// process owes from one it merely found on disk by comparing the in-memory
+	// baseline with the persisted one, so a restored debt recorded while its rung
+	// still stands would read as locally owed: a first gather racing this replay
+	// would charge and send at once instead of re-arming the rung, collapsing the
+	// ladder on every restart. That debt is recorded here when its rung fires.
+	claudeUsageProbe.recordOwed(owed)
 
 	// Refusals AHEAD of the reservation, so a refusal costs no budget and no
 	// charge-then-refund pair of best-effort writes: the gate (offline, a live

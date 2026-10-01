@@ -4098,6 +4098,45 @@ func TestClaudeUsageProbe_FreshProcessGatherHonoursAFuturePersistedRung(t *testi
 	}
 }
 
+// The startup replay that re-arms a future rung does not record the restored
+// debt in memory first. Recorded, it would read as owed by this process, and a
+// first gather racing the replay would charge and send ahead of the rung.
+func TestClaudeRunDebtAttempt_FutureRungLeavesTheRestoredDebtUnrecorded(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	stopClaudeRunDebtRetry()
+	t.Cleanup(stopClaudeRunDebtRetry)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	rung := now.Add(4 * time.Minute).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 1, rung
+		return true
+	}) {
+		t.Fatal("precondition: could not persist the rung")
+	}
+
+	claudeRunDebtAttemptAt(now, claudeDebtTriggerStartup)
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("in-memory debt=%v after re-arming a future rung, want none", owed)
+	}
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Fatalf("issued %d requests ahead of the booked rung, want 0", n)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != rung {
+		t.Errorf("attempts=%d rung=%d, want the charge 1 and rung %d untouched",
+			snap.RefreshOwedAttempts, snap.NextAttemptAtMs, rung)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Error("the future rung must stay armed")
+	}
+}
+
 // Restoring the persisted wait never puts an OLDER credential's stamp over the
 // one a concurrent 401 recorded locally, while a newer persisted stamp, or one
 // replacing the previously restored wait, is still adopted.
