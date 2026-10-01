@@ -1848,6 +1848,48 @@ func TestAdjustClaudeRefreshAttemptsAt_RefusesAChargePastTheCap(t *testing.T) {
 	}
 }
 
+// Another agent process paid the debt's rungs up to the cap while this one's
+// trailing probe slept. The refused charge must stop the request — a send would
+// be one past the cross-process cap — and drop the gate's copy so a routine
+// gather does not pay the spent budget uncharged either.
+func TestClaudeUsageProbeAfterRun_SendsNothingForADebtAtTheCap(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	owed := time.Now().Add(-time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, claudeRefreshDebtMaxAttempts, time.Time{})
+
+	claudeUsageProbeAfterRun(owed)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the debt's budget is already spent", got)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeRefreshDebtMaxAttempts {
+		t.Fatalf("attempts=%d, want the cap %d unchanged", got, claudeRefreshDebtMaxAttempts)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Fatalf("the gate still owes %v for a spent debt", got)
+	}
+}
+
+// The counterpart: a debt with budget left is charged and sent as before.
+func TestClaudeUsageProbeAfterRun_ChargesAndSendsBelowTheCap(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	owed := time.Now().Add(-time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, claudeRefreshDebtMaxAttempts-1, time.Time{})
+
+	claudeUsageProbeAfterRun(owed)
+
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1 — the last budget slot must still be spent", got)
+	}
+	// The charge took the counter to the cap, so the ladder retired the debt
+	// rather than booking a fifth rung.
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("a debt whose last slot was spent must be retired, got %+v", snap)
+	}
+}
+
 // A rejected endpoint override sends nothing, so the attempt must report
 // itself as NOT issued — otherwise the startup replay keeps its durable charge
 // and two such starts retire a debt no request was ever made for.

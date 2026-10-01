@@ -2851,13 +2851,17 @@ type claudeChargedAttempt struct {
 // anything. Keyed to the instant the caller is paying and never re-scoping the
 // cache (mutateClaudeRefreshDebt), and refunded when nothing went out.
 //
-// Unlike the replay's charge, a refused one does not stop the attempt: the
-// in-process trailing probe predates the durable debt and must keep working when
-// the cache is contended or the debt never reached disk.
+// A refused charge stops the attempt ONLY when the matching durable debt is
+// spent — at the attempt cap or past the age-out (claudeRefreshDebtRetired),
+// typically because another agent process paid its rungs while this one slept.
+// Sending then would be a request past the cross-process cap. Any other refusal
+// (a contended cache, a debt that never reached disk or has already moved on)
+// still sends: the in-process trailing probe predates the durable debt and must
+// keep working without it.
 func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 	path := claudeRateLimitCachePath()
 	var identity claudeUsageProbeIdentity
-	resolved, charged := false, false
+	resolved, charged, spent := false, false, false
 	// The counter as the charge left it, for the log line — read under the
 	// charge's own lock rather than by a second cache read.
 	attempts := 0
@@ -2868,15 +2872,29 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 			charge := adjustClaudeRefreshAttemptsAt(baseline, +1)
 			charged = mutateClaudeRefreshDebt(path, identity.fingerprint, func(snap *claudeRateLimitSnapshot) bool {
 				if !charge(snap) {
+					spent = snap.RefreshOwedAtMs == baseline.UnixMilli() &&
+						claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, time.Now())
+					attempts = snap.RefreshOwedAttempts
 					return false
 				}
 				attempts = snap.RefreshOwedAttempts
 				return true
 			})
+			if spent {
+				// Withhold the token, so the admitted attempt asks nothing and
+				// refunds its throttle slot like any tokenless one.
+				return claudeUsageProbeIdentity{}
+			}
 		}
 		return identity
 	}
 	result := claudeUsageProbeAttemptIssuedAs(baseline, resolve)
+	if spent {
+		// The ladder or the replay retires the durable record; the gate's copy
+		// goes now, or a routine gather keeps paying a spent budget uncharged.
+		claudeUsageProbe.retireOwed(baseline)
+		result.done, result.kept, result.outcome = true, claudeRetryNone, claudeRefreshOutcomeRetired
+	}
 	if charged && !result.issued &&
 		mutateClaudeRefreshDebt(path, identity.fingerprint, adjustClaudeRefreshAttemptsAt(baseline, -1)) {
 		attempts--
