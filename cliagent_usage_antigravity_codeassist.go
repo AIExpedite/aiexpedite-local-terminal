@@ -371,7 +371,7 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 		// The expiry travels beside the closed outcome, in memory only, so the
 		// debt worker can tell a token inside the skew band (book a retry at its
 		// expiry) from one already past it (renew it) without a second read.
-		noteAntigravityCodeAssistTokenExpiry(tok.Expiry.UnixMilli())
+		noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
 		return liveProbeOutcomeCodeAssistTokenExpired
 	}
 	version = antigravityCodeAssistBuildVersion(version)
@@ -393,10 +393,10 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	snap, shape, plottable := antigravitySnapshotFromGroups(groups, now(), evidence)
 	logAntigravityQuotaShapeOnce(shape)
 	if !plottable {
-		noteAntigravityCodeAssistAttempt(fingerprint, true)
+		noteAntigravityCodeAssistAttempt(ctx, fingerprint, true)
 		return liveProbeOutcomeCodeAssistBadResponse
 	}
-	noteAntigravityCodeAssistAttempt(fingerprint, false)
+	noteAntigravityCodeAssistAttempt(ctx, fingerprint, false)
 	snap.Account = account
 	// Attest the route on the cached reading itself, not only in memory: the
 	// gather that replays it may belong to a later process (a restart or a
@@ -439,9 +439,9 @@ func logAntigravityQuotaShapeOnce(shape antigravityQuotaShape) {
 	fmt.Printf("%s[antigravity-quota] quota reply shape: %s%s\n", colorCyan, shape, colorReset)
 }
 
-// antigravityCodeAssistAttemptNote is what the latest Code Assist read learned
-// that the closed outcome code cannot carry: the account it resolved, whether a
-// 200 had nothing chartable, and — for codeassist_token_expired — the stored
+// antigravityCodeAssistAttemptNote is what one Code Assist read learned that
+// the closed outcome code cannot carry: the account it resolved, whether a 200
+// had nothing chartable, and — for codeassist_token_expired — the stored
 // token's expiry (epoch ms). In memory only.
 type antigravityCodeAssistAttemptNote struct {
 	fingerprint   string
@@ -449,33 +449,56 @@ type antigravityCodeAssistAttemptNote struct {
 	tokenExpiryMs int64
 }
 
-var antigravityCodeAssistLastAttempt struct {
+// antigravityCodeAssistAttempt holds the note of ONE probe. It travels in that
+// probe's context (withAntigravityCodeAssistAttempt), never in a process-wide
+// slot: a Refresh click and the run-debt worker can read at the same time, and
+// a shared latest-note slot would let one take — or clear — the other's skew
+// expiry, so a debt could renew while `agy` still holds the token valid.
+type antigravityCodeAssistAttempt struct {
 	mu   sync.Mutex
 	note antigravityCodeAssistAttemptNote
 }
 
-func noteAntigravityCodeAssistAttempt(fingerprint string, unplottable bool) {
-	last := &antigravityCodeAssistLastAttempt
-	last.mu.Lock()
-	last.note = antigravityCodeAssistAttemptNote{fingerprint: fingerprint, unplottable: unplottable}
-	last.mu.Unlock()
+type antigravityCodeAssistAttemptKey struct{}
+
+// withAntigravityCodeAssistAttempt scopes a note to the probe run with the
+// returned context; take reads it once the probe returns.
+func withAntigravityCodeAssistAttempt(ctx context.Context) (context.Context, *antigravityCodeAssistAttempt) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attempt := &antigravityCodeAssistAttempt{}
+	return context.WithValue(ctx, antigravityCodeAssistAttemptKey{}, attempt), attempt
 }
 
-func noteAntigravityCodeAssistTokenExpiry(expiryMs int64) {
-	last := &antigravityCodeAssistLastAttempt
-	last.mu.Lock()
-	last.note = antigravityCodeAssistAttemptNote{tokenExpiryMs: expiryMs}
-	last.mu.Unlock()
+// take returns the probe's note.
+func (a *antigravityCodeAssistAttempt) take() antigravityCodeAssistAttemptNote {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.note
 }
 
-// takeAntigravityCodeAssistAttempt returns and clears the latest note.
-func takeAntigravityCodeAssistAttempt() antigravityCodeAssistAttemptNote {
-	last := &antigravityCodeAssistLastAttempt
-	last.mu.Lock()
-	defer last.mu.Unlock()
-	note := last.note
-	last.note = antigravityCodeAssistAttemptNote{}
-	return note
+// setAntigravityCodeAssistAttempt records note on the probe ctx carries; a
+// probe run without one notes nothing.
+func setAntigravityCodeAssistAttempt(ctx context.Context, note antigravityCodeAssistAttemptNote) {
+	if ctx == nil {
+		return
+	}
+	attempt, _ := ctx.Value(antigravityCodeAssistAttemptKey{}).(*antigravityCodeAssistAttempt)
+	if attempt == nil {
+		return
+	}
+	attempt.mu.Lock()
+	attempt.note = note
+	attempt.mu.Unlock()
+}
+
+func noteAntigravityCodeAssistAttempt(ctx context.Context, fingerprint string, unplottable bool) {
+	setAntigravityCodeAssistAttempt(ctx, antigravityCodeAssistAttemptNote{fingerprint: fingerprint, unplottable: unplottable})
+}
+
+func noteAntigravityCodeAssistTokenExpiry(ctx context.Context, expiryMs int64) {
+	setAntigravityCodeAssistAttempt(ctx, antigravityCodeAssistAttemptNote{tokenExpiryMs: expiryMs})
 }
 
 /* ─────────────────────────── login renewal ─────────────────────────── */

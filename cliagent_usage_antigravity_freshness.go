@@ -926,10 +926,10 @@ func antigravityRunDebtRead(state antigravityUsageFreshness) (string, antigravit
 	ctx, cancel := context.WithTimeout(context.Background(), antigravityCodeAssistTimeout)
 	// No version: the probe resolves it itself, and only once it knows a
 	// login exists, so a no_login debt never spawns `<agy> --version`.
-	takeAntigravityCodeAssistAttempt()
+	ctx, attempt := withAntigravityCodeAssistAttempt(ctx)
 	outcome := probeAntigravityQuotaCodeAssistFn(ctx, "", antigravityUsageFreshnessNow)
 	cancel()
-	note := takeAntigravityCodeAssistAttempt()
+	note := attempt.take()
 	noteAntigravityCurrentAttempt(state.debtID(), note.fingerprint,
 		outcome == liveProbeOutcomeCodeAssistBadResponse && note.unplottable)
 	antigravityRecordRefreshAttempt(state.debtID(), outcome, antigravityUsageFreshnessNow())

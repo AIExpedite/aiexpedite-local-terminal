@@ -927,7 +927,7 @@ func helperIsolateRenewalPass(t *testing.T, expiry time.Time, result string) *he
 		}
 		if !now().Add(antigravityTokenExpirySkew).Before(tok.Expiry) {
 			p.refusals.Add(1)
-			noteAntigravityCodeAssistTokenExpiry(tok.Expiry.UnixMilli())
+			noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
 			return liveProbeOutcomeCodeAssistTokenExpired
 		}
 		p.reads.Add(1)

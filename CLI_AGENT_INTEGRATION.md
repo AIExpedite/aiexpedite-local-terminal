@@ -1114,10 +1114,16 @@ as `codeassist_unauthorized` on every Refresh (found and verified on AIE2,
 2026-09-15; v1.0.26 carries the header). The account is named by the stored `id_token` else
 Google's userinfo, persisted through the same allowlisted snapshot path under
 that account's fingerprint. Only the Refresh click runs it, only once the
-loopback route is known gated; the agent never renews the login (an expired
-token gets the click's `agy models` warm-up first — `agy` refreshes its
-keyring token on every run — then one retry; still expired is reported as
-`codeassist_token_expired`). Endpoint overrides are loopback-only, redirects
+loopback route is known gated; the agent never refreshes the token itself (an
+expired token gets `renewAntigravityStoredLogin` — an uncached `agy models`,
+since `agy` refreshes its keyring token on every run — then one retry; still
+expired is reported as `codeassist_token_expired`). A token inside the 15 s
+skew is first waited out to its expiry + 1 s, and the click renews only when
+its remaining budget, after that wait, still covers the child's 20 s cap —
+the renewal starts the device's shared 5-minute spacing clock, so a child the
+click's budget would cancel is left to the debt worker instead. Each probe's
+expiry note travels in its own context, so a click and a debt read running
+together never take each other's. Endpoint overrides are loopback-only, redirects
 are refused, no proxy is inherited, the refresh token is never decoded.
 Outcomes are the `codeassist_*` codes in the device log; a non-2xx status is
 logged by number so a moved request shape (400) is distinguishable from

@@ -408,16 +408,16 @@ func TestProbeAntigravityQuotaCodeAssist_IdentityBeforeConversion(t *testing.T) 
 		askedFor = append(askedFor, fingerprint)
 		return nil
 	}
-	takeAntigravityCodeAssistAttempt()
+	ctx, attempt := withAntigravityCodeAssistAttempt(context.Background())
 
-	if got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistBadResponse {
+	if got := probeAntigravityQuotaCodeAssist(ctx, "1.2.3", time.Now); got != liveProbeOutcomeCodeAssistBadResponse {
 		t.Fatalf("outcome=%q, want %q", got, liveProbeOutcomeCodeAssistBadResponse)
 	}
 	ada := fingerprintAccount("antigravity", "ada@example.com")
 	if atomic.LoadInt32(userinfoCalls) != 1 || len(askedFor) != 1 || askedFor[0] != ada {
 		t.Errorf("userinfo=%d evidence=%v, want the identity resolved before conversion", atomic.LoadInt32(userinfoCalls), askedFor)
 	}
-	if note := takeAntigravityCodeAssistAttempt(); !note.unplottable || note.fingerprint != ada {
+	if note := attempt.take(); !note.unplottable || note.fingerprint != ada {
 		t.Errorf("note=%+v, want an unplottable mark for ada", note)
 	}
 	if _, err := os.Stat(os.Getenv("AIEXPEDITE_AGY_QUOTA_CACHE")); err == nil {
@@ -478,9 +478,9 @@ func TestProbeAntigravityQuotaCodeAssist_TokenExpirySkewBoundary(t *testing.T) {
 			quotaCalls, _ := helperCodeAssistServers(t,
 				func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
 				func(string) (int, string) { return http.StatusOK, `{"email":"ada@example.com"}` })
-			takeAntigravityCodeAssistAttempt()
-			got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", func() time.Time { return now })
-			note := takeAntigravityCodeAssistAttempt()
+			ctx, attempt := withAntigravityCodeAssistAttempt(context.Background())
+			got := probeAntigravityQuotaCodeAssist(ctx, "1.2.3", func() time.Time { return now })
+			note := attempt.take()
 			if got != tc.want {
 				t.Fatalf("outcome=%q, want %q", got, tc.want)
 			}
@@ -493,5 +493,26 @@ func TestProbeAntigravityQuotaCodeAssist_TokenExpirySkewBoundary(t *testing.T) {
 				t.Errorf("tokenExpiryMs=%d on a read that was sent, want 0", note.tokenExpiryMs)
 			}
 		})
+	}
+}
+
+// A Refresh click and the run-debt worker can read at the same time; each
+// probe's note stays on its own context, so the click's read landing between
+// the debt's probe and its take neither replaces nor clears the debt's skew
+// expiry — and a probe run without an attempt notes nothing at all.
+func TestAntigravityCodeAssistAttempt_NoteIsScopedToItsProbe(t *testing.T) {
+	debtCtx, debt := withAntigravityCodeAssistAttempt(context.Background())
+	clickCtx, click := withAntigravityCodeAssistAttempt(context.Background())
+	expiry := time.Now().Add(10 * time.Second).UnixMilli()
+
+	noteAntigravityCodeAssistTokenExpiry(debtCtx, expiry)
+	noteAntigravityCodeAssistAttempt(clickCtx, "fp-click", false)
+	if got := click.take(); got.fingerprint != "fp-click" || got.tokenExpiryMs != 0 {
+		t.Errorf("click note=%+v, want only its own fingerprint", got)
+	}
+	noteAntigravityCodeAssistTokenExpiry(context.Background(), 1)
+
+	if got := debt.take(); got.tokenExpiryMs != expiry || got.fingerprint != "" {
+		t.Errorf("debt note=%+v, want its own skew expiry %d", got, expiry)
 	}
 }

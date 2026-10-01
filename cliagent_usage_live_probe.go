@@ -655,16 +655,30 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 // nothing yet start the shared five-minute spacing clock — and a debt retrying
 // after the real expiry would then spend its one renewal on `spaced`. The click
 // therefore waits for the noted expiry first (at most the skew), as the debt
-// worker's antigravityRetryLoginRenew rung does, and renews nothing if its
-// budget ends before then.
+// worker's antigravityRetryLoginRenew rung does.
+//
+// The renewal starts that spacing clock before its child runs, so a child the
+// click's budget cancels part-way spends the device's renewal for nothing. The
+// click therefore renews only when, after any wait, its budget still covers the
+// child's own cap (antigravityClickRenewalFits); otherwise it renews nothing
+// and leaves the renewal to the debt worker. The final read is not reserved
+// for: a renewed login stays in the keyring for the next read either way.
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent) string {
 	version := antigravityCodeAssistBuildVersion(agent.Version)
-	takeAntigravityCodeAssistAttempt()
-	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
-	note := takeAntigravityCodeAssistAttempt()
+	probeCtx, attempt := withAntigravityCodeAssistAttempt(ctx)
+	outcome := probeAntigravityQuotaCodeAssistFn(probeCtx, version, time.Now)
+	note := attempt.take()
 	antigravityRecordClickRead(outcome, time.Now())
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
-		if wait := time.Until(time.UnixMilli(note.tokenExpiryMs).Add(time.Second)); note.tokenExpiryMs > 0 && wait > 0 {
+		var wait time.Duration
+		if note.tokenExpiryMs > 0 {
+			wait = max(time.Until(time.UnixMilli(note.tokenExpiryMs).Add(time.Second)), 0)
+		}
+		if !antigravityClickRenewalFits(ctx, wait) {
+			fmt.Printf("%s[cli-usage] Antigravity stored login renewal skipped (budget)%s\n", colorCyan, colorReset)
+			return outcome
+		}
+		if wait > 0 {
 			if antigravityClickExpiryWaitFn(ctx, wait) != nil {
 				return outcome
 			}
@@ -680,6 +694,13 @@ func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAg
 // antigravityClickExpiryWaitFn waits for a token inside the skew band to
 // expire; a seam so tests need not sleep.
 var antigravityClickExpiryWaitFn = sleepWithContext
+
+// antigravityClickRenewalFits reports whether ctx, after waiting wait, still
+// leaves the renewal child its whole cap (cliAgentModelProbeTimeout).
+func antigravityClickRenewalFits(ctx context.Context, wait time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Until(deadline)-wait >= cliAgentModelProbeTimeout
+}
 
 // antigravityCodeAssistBuildVersion resolves the `agy` build the Code Assist
 // request identifies itself as. Google licenses that endpoint per client and

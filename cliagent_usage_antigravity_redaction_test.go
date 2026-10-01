@@ -325,10 +325,10 @@ func TestAntigravityLoginRenewal_PersistsAndLogsMetricsOnly(t *testing.T) {
 		setExpiry(time.Now().Add(time.Hour))
 		return realAntigravityModels, true
 	})
-	helperStubAntigravityCodeAssistOutcome(t, func() string {
+	helperStubAntigravityCodeAssistOutcomeCtx(t, func(ctx context.Context) string {
 		if !antigravityStoredLoginUsable(context.Background(), time.Now()) {
 			tok, _ := antigravityStoredToken(context.Background())
-			noteAntigravityCodeAssistTokenExpiry(tok.Expiry.UnixMilli())
+			noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
 			return liveProbeOutcomeCodeAssistTokenExpired
 		}
 		return liveProbeOutcomeCodeAssistHTTPError
