@@ -222,6 +222,7 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 		return false
 	}
 	wait := claudeUsageProbe.authWaitStamp()
+	pendingClear, _ := claudeUsageProbe.pendingAuthClear()
 	owedMs := owed.UnixMilli()
 	var next time.Time
 	attempts := 0
@@ -267,6 +268,11 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 	})
 	if committed && !retired {
 		claudeUsageProbe.markAuthWaitPersisted(wait)
+		// The booking wrote this process's wait over the one a pending clear
+		// was owed for, which settles it.
+		if pendingClear != wait {
+			claudeUsageProbe.settlePendingAuthClear(pendingClear)
+		}
 	}
 	if retired {
 		claudeUsageProbe.dropOwedThrough(owed)
@@ -446,6 +452,53 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 	}
 	g.authWaitRestored = claudeCredStamp{}
 	g.authWaitSeq++
+	// A fresh rejection of the credential an earlier 2xx proved supersedes that
+	// proof's pending durable clear.
+	if g.authClearPending == stamp {
+		g.authClearPending, g.authClearFingerprint = claudeCredStamp{}, ""
+	}
+}
+
+// notePendingAuthClear records a proven credential whose persisted wait could
+// not be cleared, and reports whether the caller should start the retry loop
+// (false when one is already running).
+func (g *claudeUsageProbeGate) notePendingAuthClear(fingerprint string, stamp claudeCredStamp) bool {
+	if stamp.isZero() {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.authClearPending, g.authClearFingerprint = stamp, fingerprint
+	if g.authClearRetrying {
+		return false
+	}
+	g.authClearRetrying = true
+	return true
+}
+
+// pendingAuthClear returns the proven credential whose durable clear is still
+// owed, zero for none, and the account it was proved under.
+func (g *claudeUsageProbeGate) pendingAuthClear() (claudeCredStamp, string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.authClearPending, g.authClearFingerprint
+}
+
+// settlePendingAuthClear drops the pending clear for `stamp`, leaving a newer
+// one recorded since alone.
+func (g *claudeUsageProbeGate) settlePendingAuthClear(stamp claudeCredStamp) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.authClearPending == stamp {
+		g.authClearPending, g.authClearFingerprint = claudeCredStamp{}, ""
+	}
+}
+
+// endPendingAuthClearRetry marks the background retry loop as finished.
+func (g *claudeUsageProbeGate) endPendingAuthClearRetry() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.authClearRetrying = false
 }
 
 // authWaitReadSeq is taken BEFORE reading the persisted wait and handed to
@@ -502,6 +555,11 @@ func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp, readSeq ui
 	defer g.mu.Unlock()
 	if readSeq != g.authWaitSeq {
 		return
+	}
+	// A wait for a credential this process proved, whose durable clear is
+	// still pending, is stale on disk: read it as cleared.
+	if !stamp.isZero() && stamp == g.authClearPending {
+		stamp = claudeCredStamp{}
 	}
 	if stamp.isZero() {
 		if !g.authWaitRestored.isZero() && g.authWait == g.authWaitRestored {

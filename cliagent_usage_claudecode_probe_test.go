@@ -3892,3 +3892,77 @@ func TestClaudeUsageProbe_UnplottableTwoHundredClearsThePersistedWait(t *testing
 		}
 	}
 }
+
+// A 2xx whose durable clear the cache refuses must not leave the wait to be
+// restored later: the proven stamp is read as cleared while the clear is
+// pending, and a retry writes the clear once the cache accepts it.
+func TestClaudeUsageProbe_RefusedProvenClearIsRetried(t *testing.T) {
+	stamp := claudeCredStamp{modNs: 100, size: 10}
+	for _, tc := range []struct {
+		name       string
+		background bool
+	}{{"explicit retry", false}, {"background retry", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{}`)
+			})
+			seed, _ := json.Marshal(claudeRateLimitSnapshot{
+				Buckets:             map[string]claudeRateLimitBucket{},
+				AuthWaitCredStampNs: stamp.modNs, AuthWaitCredSize: stamp.size,
+			})
+			if err := os.WriteFile(cache, seed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			prevDelays := claudePendingAuthClearRetryDelays
+			t.Cleanup(func() { claudePendingAuthClearRetryDelays = prevDelays })
+			claudePendingAuthClearRetryDelays = nil
+			if tc.background {
+				claudePendingAuthClearRetryDelays = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond}
+			}
+			var failWrites atomic.Bool
+			failWrites.Store(true)
+			prevWrite := claudeRateLimitCacheWriteFile
+			t.Cleanup(func() { claudeRateLimitCacheWriteFile = prevWrite })
+			claudeRateLimitCacheWriteFile = func(name string, data []byte, perm os.FileMode) error {
+				if failWrites.Load() {
+					return fmt.Errorf("cache busy")
+				}
+				return prevWrite(name, data, perm)
+			}
+
+			id := claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp}
+			r, _, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+				func() claudeUsageProbeIdentity { return id }, time.Time{}, true)
+			if !r.credProven || r.code != claudeProbeNoWindows {
+				t.Fatalf("result=%+v, want a proven credential with no windows", r)
+			}
+			if snap, _ := loadClaudeRateLimitSnapshot(cache); snap.AuthWaitCredStampNs != stamp.modNs {
+				t.Fatalf("persisted wait=%d, want the refused clear to leave it", snap.AuthWaitCredStampNs)
+			}
+
+			// While the clear is pending, a read of that stamp restores nothing.
+			claudeUsageProbe.restoreAuthWait(stamp, claudeUsageProbe.authWaitReadSeq())
+			if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+				t.Fatalf("restored wait=%+v while its durable clear is pending, want none", got)
+			}
+
+			failWrites.Store(false)
+			if !tc.background && !claudeRetryPendingAuthClear() {
+				t.Fatal("retry with a writable cache did not settle the pending clear")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				snap, _ := loadClaudeRateLimitSnapshot(cache)
+				pending, _ := claudeUsageProbe.pendingAuthClear()
+				if snap.AuthWaitCredStampNs == 0 && snap.AuthWaitCredSize == 0 && pending.isZero() {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("persisted wait=%d/%d pending=%+v, want the clear written and settled",
+						snap.AuthWaitCredStampNs, snap.AuthWaitCredSize, pending)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
+	}
+}

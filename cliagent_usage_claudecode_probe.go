@@ -393,6 +393,14 @@ type claudeUsageProbeGate struct {
 	authWaitNudged   claudeCredStamp
 	authWaitRestored claudeCredStamp
 	authWaitSeq      uint64
+	// authClearPending is a credential a 2xx proved whose persisted wait could
+	// not be cleared (the cache was busy). Until a retry clears it
+	// (claudeRetryPendingAuthClear), a read finding that stamp on disk treats it
+	// as already cleared. authClearFingerprint is the account it was proved
+	// under; authClearRetrying marks the one background retry loop.
+	authClearPending     claudeCredStamp
+	authClearFingerprint string
+	authClearRetrying    bool
 	// owedBaseline is the newest run completion for which we still owe an
 	// observation. The persisted debt and its retry rung
 	// (cliagent_usage_claudecode_refresh_schedule.go) pay it; the throttle may
@@ -662,6 +670,8 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.authWaitNudged = claudeCredStamp{}
 	claudeUsageProbe.authWaitRestored = claudeCredStamp{}
 	claudeUsageProbe.authWaitSeq = 0
+	claudeUsageProbe.authClearPending = claudeCredStamp{}
+	claudeUsageProbe.authClearFingerprint = ""
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
@@ -1228,6 +1238,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 		g.mu.Unlock()
 		close(seeding)
 	}()
+	claudeRetryPendingAuthClear()
 	authWaitSeq := g.authWaitReadSeq()
 	persisted, attempts, held, authWait, rung := claudePersistedProbeStateWithWaitFor(fingerprint)
 	// The credential wait a previous attempt (or process) persisted, restored
@@ -2145,10 +2156,13 @@ func probeClaudeUsageResult(
 	// from here (unreadable, oversized, malformed, windowless, or unpersisted)
 	// must clear it too, or the next seed or restart restores a wait for a
 	// credential the endpoint just accepted. Scoped like the 429 hold above.
+	// A clear the cache refuses (lock contention, a failed write) is retried
+	// rather than dropped: left on disk, the wait would be restored by the next
+	// seed or restart for a credential the endpoint just accepted.
 	defer func() {
-		if result.code != claudeProbeOK {
-			mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), identity.fingerprint,
-				[]string{scopeBefore}, clearClaudeProvenAuthWait(identity.credStamp))
+		if result.code != claudeProbeOK &&
+			!claudeClearProvenAuthWaitDurably(identity.fingerprint, []string{scopeBefore}, identity.credStamp) {
+			claudeQueuePendingAuthClear(identity.fingerprint, identity.credStamp)
 		}
 	}()
 

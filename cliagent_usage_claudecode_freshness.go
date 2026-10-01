@@ -803,6 +803,7 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		return claudeProbeResult{code: claudeUsageProbe.refusal(now, false)}
 	}
 
+	claudeRetryPendingAuthClear()
 	authWaitSeq := claudeUsageProbe.authWaitReadSeq()
 	snap, ok := loadClaudeRateLimitSnapshot(path)
 	if !ok || snap.AccountFingerprint != fingerprint {
@@ -1040,4 +1041,64 @@ func clearClaudeProvenAuthWait(probed claudeCredStamp) func(*claudeRateLimitSnap
 		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
 		return true
 	}
+}
+
+// claudeClearProvenAuthWaitDurably applies clearClaudeProvenAuthWait and
+// reports whether the cache no longer holds a wait for `probed`: true when the
+// clear was written or there was nothing to clear, false when the cache
+// refused the write (the gate or file lock was busy, or the write failed).
+func claudeClearProvenAuthWaitDurably(fingerprint string, allowedScopes []string, probed claudeCredStamp) bool {
+	if probed.isZero() {
+		return true
+	}
+	ran, matched := false, false
+	clear := clearClaudeProvenAuthWait(probed)
+	wrote := mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), fingerprint, allowedScopes,
+		func(snap *claudeRateLimitSnapshot) bool {
+			ran = true
+			matched = clear(snap)
+			return matched
+		})
+	return wrote || (ran && !matched)
+}
+
+// claudePendingAuthClearRetryDelays spaces the background retries of a proven
+// credential's durable clear. Bounded: once they run out, the seed and replay
+// reads (claudeRetryPendingAuthClear) keep retrying for the life of the process.
+var claudePendingAuthClearRetryDelays = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute}
+
+// claudeQueuePendingAuthClear remembers a durable clear the cache refused and
+// starts the one background loop that retries it.
+func claudeQueuePendingAuthClear(fingerprint string, probed claudeCredStamp) {
+	if !claudeUsageProbe.notePendingAuthClear(fingerprint, probed) {
+		return
+	}
+	go func() {
+		defer claudeUsageProbe.endPendingAuthClearRetry()
+		for _, delay := range claudePendingAuthClearRetryDelays {
+			time.Sleep(delay)
+			if IsShutdownInProgress() || claudeRetryPendingAuthClear() {
+				return
+			}
+		}
+	}()
+}
+
+// claudeRetryPendingAuthClear retries a pending durable clear, true once none
+// is pending. A cache that no longer carries that wait for that account (a
+// peer cleared it, a booking overwrote it, or the account moved on) settles it
+// without a write.
+func claudeRetryPendingAuthClear() bool {
+	stamp, fingerprint := claudeUsageProbe.pendingAuthClear()
+	if stamp.isZero() {
+		return true
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != fingerprint ||
+		snap.AuthWaitCredStampNs != stamp.modNs || snap.AuthWaitCredSize != stamp.size ||
+		claudeClearProvenAuthWaitDurably(fingerprint, nil, stamp) {
+		claudeUsageProbe.settlePendingAuthClear(stamp)
+		return true
+	}
+	return false
 }
