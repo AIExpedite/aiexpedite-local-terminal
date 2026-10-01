@@ -866,10 +866,9 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	claudeUsageProbe.recordOwed(owed)
 
 	// A credential wait a previous attempt (or process) recorded survives the
-	// restart, so the same expired or 401'd token is not re-sent on start.
-	if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
-		claudeUsageProbe.noteAuthWait(claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize})
-	}
+	// restart, so the same expired or 401'd token is not re-sent on start; one
+	// another process has since cleared drops the wait it was restored into.
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize})
 
 	// A rung booked in the future stands: the timer and the startup replay
 	// re-arm it rather than spending it early. One stamped beyond any rung the

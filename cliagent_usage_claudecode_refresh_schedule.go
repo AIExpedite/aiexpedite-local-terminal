@@ -439,6 +439,29 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 	}
 }
 
+// restoreAuthWait mirrors the credential wait persisted in the cache. A
+// non-zero stamp is recorded as noteAuthWait does and remembered as restored. A
+// zero one means the persisted wait was cleared — another process's probe
+// succeeded with that credential — so the in-memory wait is dropped too, but
+// only while it is still the one restored from disk: a wait this process
+// recorded itself (a 401 never persisted without a debt, or not persisted yet)
+// is newer evidence and stands.
+func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if stamp.isZero() {
+		if !g.authWaitRestored.isZero() && g.authWait == g.authWaitRestored {
+			g.authWait, g.authWaitNudged = claudeCredStamp{}, claudeCredStamp{}
+		}
+		g.authWaitRestored = claudeCredStamp{}
+		return
+	}
+	if g.authWait != stamp {
+		g.authWait, g.authWaitNudged = stamp, claudeCredStamp{}
+	}
+	g.authWaitRestored = stamp
+}
+
 // authWaitStamp returns the stamp being waited on, zero for none.
 func (g *claudeUsageProbeGate) authWaitStamp() claudeCredStamp {
 	g.mu.Lock()

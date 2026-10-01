@@ -3928,6 +3928,56 @@ func TestClaudeUsageProbeGate_CacheSeedRestoresAPersistedCredentialWait(t *testi
 	}
 }
 
+// A restored credential wait that another process later clears on disk (its
+// probe succeeded with the same credential) is dropped by the next seed, so this
+// process does not keep refusing a working token as credential_expired. A wait
+// this process recorded itself, never persisted, survives the same read.
+func TestClaudeUsageProbeGate_CacheSeedDropsARestoredWaitClearedOnDisk(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	wait := claudeCredStamp{modNs: 12345, size: 678}
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = wait.modNs, wait.size
+		return true
+	}) {
+		t.Fatal("precondition: could not persist the credential wait")
+	}
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
+	if !claudeUsageProbe.awaitingCredentialChange(wait) {
+		t.Fatalf("precondition: in-memory wait=%+v, want %+v restored", claudeUsageProbe.authWaitStamp(), wait)
+	}
+
+	// Another process's successful probe clears the persisted wait.
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+		return true
+	}) {
+		t.Fatal("could not clear the persisted credential wait")
+	}
+	claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
+	if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+		t.Fatalf("in-memory wait=%+v after the peer cleared it on disk, want none", got)
+	}
+
+	// A wait recorded locally (a 401 with no debt to persist it) is not
+	// mistaken for a cleared persisted one.
+	local := claudeCredStamp{modNs: 999, size: 1}
+	claudeUsageProbe.noteAuthWait(local)
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	if !claudeUsageProbe.awaitingCredentialChange(local) {
+		t.Errorf("in-memory wait=%+v, want the locally recorded %+v kept", claudeUsageProbe.authWaitStamp(), local)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("the seeds issued %d requests, want 0", n)
+	}
+}
+
 // A gather whose debt reservation is refused by ANOTHER process's live claim
 // lease stands down, even when its cached reading is also stale by the TTL: the
 // leased request has persisted nothing yet, so a routine stale-cache probe
