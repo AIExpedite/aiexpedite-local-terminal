@@ -361,7 +361,7 @@ func claudeOweRunRefreshNow(baseline time.Time) {
 // a reader sees a whole file or the previous whole file, and taking the gate for
 // a read would queue this behind writers on the gather path.
 func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts int, held time.Time) {
-	owed, attempts, held, _ = claudePersistedProbeStateWithWaitFor(fingerprint)
+	owed, attempts, held, _, _ = claudePersistedProbeStateWithWaitFor(fingerprint)
 	return owed, attempts, held
 }
 
@@ -371,10 +371,14 @@ func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts 
 // be admitted, as the startup replay does: a first gather that beats the replay
 // after a restart would otherwise re-send the very token the endpoint answered
 // 401 for, and a few such starts would spend the debt's whole budget on it.
-func claudePersistedProbeStateWithWaitFor(fingerprint string) (owed time.Time, attempts int, held time.Time, wait claudeCredStamp) {
+//
+// `rung` is the booked retry rung (NextAttemptAtMs), zero when none, for the
+// same reason: a first gather that beats the replay must re-arm a future rung
+// rather than spend it early, as claudeRunDebtAttemptAt does.
+func claudePersistedProbeStateWithWaitFor(fingerprint string) (owed time.Time, attempts int, held time.Time, wait claudeCredStamp, rung time.Time) {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	if !ok || snap.AccountFingerprint != fingerprint {
-		return time.Time{}, 0, time.Time{}, claudeCredStamp{}
+		return time.Time{}, 0, time.Time{}, claudeCredStamp{}, time.Time{}
 	}
 	if snap.RefreshOwedAtMs != 0 {
 		owed, attempts = time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
@@ -383,7 +387,10 @@ func claudePersistedProbeStateWithWaitFor(fingerprint string) (owed time.Time, a
 		held = time.UnixMilli(snap.HeldUntilMs)
 	}
 	wait = claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize}
-	return owed, attempts, held, wait
+	if snap.NextAttemptAtMs > 0 {
+		rung = time.UnixMilli(snap.NextAttemptAtMs)
+	}
+	return owed, attempts, held, wait, rung
 }
 
 // claudeRefreshDebtRetired reports whether a persisted debt is past paying:

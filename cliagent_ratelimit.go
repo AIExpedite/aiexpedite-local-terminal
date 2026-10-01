@@ -530,7 +530,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false, nil)
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false, nil, claudeCredStamp{})
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -574,7 +574,7 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // it — and that treats an unserialized write as a failure. See
 // mergeClaudeRateLimitCacheInto.
 func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, nil)
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, nil, claudeCredStamp{})
 }
 
 // errClaudeRateLimitCacheRescoped is returned when the snapshot found UNDER THE
@@ -606,7 +606,16 @@ var errClaudeRateLimitCacheRescoped = errors.New("claude rate-limit cache: re-sc
 // added to protect. An empty `allowedScopes` disables the guard, which is what
 // every writer that resolves its identity immediately before writing wants.
 func mergeClaudeRateLimitCacheCheckedScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, allowedScopes)
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, allowedScopes, claudeCredStamp{})
+}
+
+// mergeClaudeRateLimitCacheProbeScoped is mergeClaudeRateLimitCacheCheckedScoped
+// for the utilization probe, carrying the credential stamp the probe's request
+// was made with. The probe's reading proves THAT credential works, so the merge
+// clears a persisted credential wait only when it is still for that stamp — see
+// mergeClaudeRateLimitCacheLocked.
+func mergeClaudeRateLimitCacheProbeScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, claudeRateLimitSourceProbe, true, allowedScopes, probedCred)
 }
 
 // claudeCacheScopeRejects reports whether a snapshot found on disk under
@@ -663,12 +672,12 @@ func claudeCacheScopeRejects(onDisk, fingerprint string, allowed []string) bool 
 // in both modes: there is no evidence of a competing holder, only of a
 // filesystem that will not give us the lock file (a read-only data dir fails the
 // write below anyway, which the verified caller does see).
-func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool, allowedScopes []string) (time.Time, error) {
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	if !verified {
-		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes)
+		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes, probedCred)
 	}
 	// A verified merge is bounded END TO END, not merely across its two lock
 	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
@@ -705,7 +714,7 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	}
 	done := make(chan persistResult, 1)
 	go func() {
-		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline, allowedScopes)
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline, allowedScopes, probedCred)
 		done <- persistResult{observed: observed, err: err}
 	}()
 	timer := time.NewTimer(time.Until(deadline))
@@ -735,9 +744,9 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // then drop the merge); a non-zero one selects the verified contract, clamping
 // both waits to what is left of the caller's budget and reporting the failure
 // rather than dropping it. Neither contract writes behind a confirmed holder.
-func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string) (time.Time, error) {
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
 	return withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
-		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes)
+		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes, probedCred)
 	})
 }
 
@@ -807,7 +816,7 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 
 // mergeClaudeRateLimitCacheLocked is the read-merge-rename itself. Callers MUST
 // already hold the ladder withClaudeRateLimitCacheLocked takes.
-func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -929,6 +938,14 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// credential would otherwise leave the stamp on disk, and after a restart
 	// the replay would reload it and refuse a working token until Claude Code
 	// happened to rewrite the file.
+	//
+	// Only the wait for the credential THIS probe sent is proven over. Two
+	// processes can overlap a credential rewrite: a success with the old
+	// credential can merge after the other process got a 401 for the new one
+	// and persisted its stamp, and clearing that newer wait would let the next
+	// start resend the rejected token on the debt's bounded budget. A probe that
+	// carries no stamp (a writer outside the probe path, or a Keychain login)
+	// proves nothing about a stamped wait and leaves it alone.
 	if source == claudeRateLimitSourceProbe {
 		for _, bucket := range updates {
 			if !bucket.usageKnown {
@@ -937,7 +954,9 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 			if bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
 				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
 			}
-			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+			if snap.AuthWaitCredStampNs == probedCred.modNs && snap.AuthWaitCredSize == probedCred.size {
+				snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+			}
 		}
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)

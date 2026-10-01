@@ -3790,7 +3790,20 @@ func TestMergeClaudeRateLimitCache_ProbeReadingClearsTheCredentialWait(t *testin
 		t.Fatal("a non-probe reading must leave the credential wait alone")
 	}
 
-	mergeClaudeRateLimitCacheFromSource(cache, reading(now), now, fp, claudeRateLimitSourceProbe)
+	// A probe that sent a DIFFERENT credential (another process's 401 for a
+	// rewritten one landed first) proves nothing about the newer wait.
+	if _, err := mergeClaudeRateLimitCacheProbeScoped(context.Background(), cache, reading(now.Add(-10*time.Minute)), now, fp,
+		nil, claudeCredStamp{modNs: 111, size: 678}); err != nil {
+		t.Fatalf("probe merge: %v", err)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs != 12345 || snap.AuthWaitCredSize != 678 {
+		t.Fatalf("stamp=%d size=%d, want a probe with another credential to leave the wait alone", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize)
+	}
+
+	if _, err := mergeClaudeRateLimitCacheProbeScoped(context.Background(), cache, reading(now), now, fp,
+		nil, claudeCredStamp{modNs: 12345, size: 678}); err != nil {
+		t.Fatalf("probe merge: %v", err)
+	}
 	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
 		t.Errorf("stamp=%d size=%d, want the probe reading to clear the credential wait", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize)
 	}
@@ -4043,6 +4056,45 @@ func TestClaudeUsageProbe_FreshProcessGatherStandsDownWhenTheSeedMeetsAForeignLe
 	if snap.RefreshOwedAttempts != 1 || snap.AttemptClaimedUntilMs != foreignLease {
 		t.Errorf("attempts=%d lease=%d, want the foreign charge %d and lease %d untouched",
 			snap.RefreshOwedAttempts, snap.AttemptClaimedUntilMs, 1, foreignLease)
+	}
+}
+
+// A fresh process whose first gather beats the startup replay honours the
+// persisted retry rung, as the replay does: no charge, no request, the rung
+// re-armed on this process's timer. Otherwise every restart spends a slot of the
+// debt's budget inside the interval the rung was booked to preserve.
+func TestClaudeUsageProbe_FreshProcessGatherHonoursAFuturePersistedRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	stopClaudeRunDebtRetry()
+	t.Cleanup(stopClaudeRunDebtRetry)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	rung := now.Add(4 * time.Minute).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 1, rung
+		return true
+	}) {
+		t.Fatal("precondition: could not persist the rung")
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Fatalf("precondition: in-memory debt=%v, want none (a fresh process)", owed)
+	}
+
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Fatalf("the gather issued %d requests ahead of the booked rung, want 0", n)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != rung {
+		t.Errorf("attempts=%d rung=%d, want the charge 1 and rung %d untouched",
+			snap.RefreshOwedAttempts, snap.NextAttemptAtMs, rung)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Error("the future rung must be re-armed on this process's timer")
 	}
 }
 

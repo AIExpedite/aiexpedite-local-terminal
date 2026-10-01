@@ -1119,9 +1119,10 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 
 // seedOwedFromCacheLeased is seedOwedFromCache plus `leasedElsewhere`: true when
 // the debt was declined because ANOTHER process's live claim lease says its
-// request for it is on the wire. The debt is then left unadopted, so a fresh
-// process's gather has no owed baseline and never reaches the later
-// reservation that stands down under the same lease — it must hear it here.
+// request for it is on the wire, or because its persisted retry rung is still in
+// the future. The debt is then left unadopted, so a fresh process's gather has
+// no owed baseline and never reaches the later reservation that stands down
+// under the same lease — it must hear it here.
 func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fingerprint, token string, generation uint64, now, latest time.Time) (supersedes, chargedDebt time.Time, chargedLease int64, leasedElsewhere bool) {
 	var stampMod, stampSize int64
 	var seeding chan struct{}
@@ -1228,7 +1229,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 		close(seeding)
 	}()
 	authWaitSeq := g.authWaitReadSeq()
-	persisted, attempts, held, authWait := claudePersistedProbeStateWithWaitFor(fingerprint)
+	persisted, attempts, held, authWait, rung := claudePersistedProbeStateWithWaitFor(fingerprint)
 	// The credential wait a previous attempt (or process) persisted, restored
 	// before this gather can be admitted — as payOwedClaudeUsageRefreshAt does,
 	// but that runs on a spawned goroutine this gather can beat after a restart.
@@ -1335,6 +1336,27 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 	if uncovered && (ctx.Err() != nil || token == "" || g.blockedFromIssuing(now)) {
 		claudeUsageProbeSeedBlocked()
 		persisted, uncovered, latch = time.Time{}, false, false
+	}
+	// A retry rung booked in the future stands, as it does for the timer and the
+	// startup replay (claudeRunDebtAttemptAt): a first gather that beats the
+	// replay after a restart must not spend it early, or repeated restarts
+	// collapse the ladder and exhaust the debt's request budget inside the very
+	// interval the rung was booked to preserve. The debt is left unadopted and
+	// uncharged, the rung is re-armed when this process has no timer pending, and
+	// the caller stands down as it does under a foreign lease. One stamped beyond
+	// the horizon is a backwards clock step and is treated as due, as there. The
+	// latch is left unclaimed: the rung coming due does not touch the snapshot.
+	//
+	// Only for a debt this process does not already owe: one it recorded or
+	// adopted earlier is paid by its own gathers under the gate's floor, exactly
+	// as before, and the rung it booked is its own timer's.
+	if uncovered && rung.After(now) && rung.Sub(now) <= claudeRunDebtRetryHorizon() &&
+		g.owedObservation().UnixMilli() < persisted.UnixMilli() {
+		claudeUsageProbeSeedBlocked()
+		if !claudeRunDebtRetryPending() {
+			claudeArmRunDebtRetry(rung.Sub(now), claudeDebtTriggerTimer)
+		}
+		persisted, uncovered, latch, leasedElsewhere = time.Time{}, false, false, true
 	}
 	claudeUsageProbeBeforeSeedCharge()
 	if uncovered {
@@ -2175,8 +2197,8 @@ func probeClaudeUsageResult(
 	// under, and the new login's own gather will probe for itself. probeErr stays
 	// nil for the same reason — the endpoint did nothing wrong, so this must not
 	// extend the failure backoff for the account that just signed in.
-	persisted, err := mergeClaudeRateLimitCacheCheckedScoped(ctx, claudeRateLimitCachePath(), updates, now,
-		identity.fingerprint, claudeRateLimitSourceProbe, []string{scopeBefore})
+	persisted, err := mergeClaudeRateLimitCacheProbeScoped(ctx, claudeRateLimitCachePath(), updates, now,
+		identity.fingerprint, []string{scopeBefore}, identity.credStamp)
 	if err != nil {
 		if errors.Is(err, errClaudeRateLimitCacheRescoped) {
 			// The endpoint answered; the reading just belongs to a login the
@@ -2440,7 +2462,8 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 		return true
 	}
 	// The seed declined the persisted debt because another process's claim lease
-	// has its request on the wire. Left unadopted, the debt is invisible to the
+	// has its request on the wire, or its booked retry rung is still in the
+	// future (and now armed). Left unadopted, the debt is invisible to the
 	// `owing` reservation below, so a stale-TTL routine probe would be the same
 	// duplicate that reservation's own lease refusal stands down from.
 	if seedLeasedElsewhere && !forced {
