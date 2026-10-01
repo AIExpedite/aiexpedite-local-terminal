@@ -59,6 +59,10 @@ const (
 	// grokUsageFreshnessEnv relocates the state file (tests isolate from the
 	// real machine; mirrors AIEXPEDITE_GROK_BILLING_LIVE_CACHE).
 	grokUsageFreshnessEnv = "AIEXPEDITE_GROK_USAGE_FRESHNESS"
+
+	// grokRefreshOutcomeUnmetered is the debt's own closed label for an `ok`
+	// read that carried no percentage: it pays nothing and spends budget.
+	grokRefreshOutcomeUnmetered = "unmetered"
 )
 
 // Vars rather than consts so tests can pin them small.
@@ -80,7 +84,11 @@ var (
 	grokRefreshNudgeCooldown = time.Minute
 	// grokRunDebtReadTimeout bounds one debt read, renewal included.
 	grokRunDebtReadTimeout = grokBillingLiveTimeout + grokLoginRenewTimeout + grokLoginRenewGap
-	grokUsageFreshnessNow  = time.Now
+	// grokRunDebtReadWaitSlack is how much longer a waiter gives the shared
+	// read than the read gives itself, so the read's own deadline — a real
+	// outcome — fires before the waiter gives up with a `timeout`.
+	grokRunDebtReadWaitSlack = 5 * time.Second
+	grokUsageFreshnessNow    = time.Now
 	// grokUsageRefreshGrokPath resolves the CLI the read may renew the login
 	// with; a seam so tests never touch a real install.
 	grokUsageRefreshGrokPath = grokLoginKeeperBinary
@@ -228,11 +236,12 @@ func grokDebtExhausted(state grokUsageFreshness, now time.Time) bool {
 	return now.Sub(time.UnixMilli(state.LastAttemptAtMs)) < cooling
 }
 
-// grokObservationCovers reports whether a reading for fingerprint was taken at
-// or after completionMs: the live read (with or without a percentage — it is
-// everything the endpoint has), or a numeric log record.
+// grokObservationCovers reports whether a NUMERIC reading for fingerprint was
+// taken at or after completionMs — the live read or a log record. A reading
+// without a percentage pays nothing: the card would still have no number, and
+// retiring the debt on it would stop the ladder that can still get one.
 func grokObservationCovers(fingerprint string, completionMs int64) bool {
-	if live, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && live.ObservedAt.UnixMilli() >= completionMs {
+	if live, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && live.HasUsedPercent && live.ObservedAt.UnixMilli() >= completionMs {
 		return true
 	}
 	base := grokPersistentHome()
@@ -512,17 +521,6 @@ func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
 	return state, state.owed()
 }
 
-// grokExhaustRunDebt spends the remaining budget of debt generation id and
-// books no rung, so it sits out grokDebtExhausted's cooling window.
-func grokExhaustRunDebt(id grokDebtID, label string) {
-	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
-		if state.debtID() == id {
-			state.Attempts, state.NextAttemptAtMs = grokRunDebtMaxAttempts, 0
-		}
-	})
-	fmt.Printf("%s[cli-usage] grok refresh: stopped %s attempts=%d%s\n", colorYellow, label, grokRunDebtMaxAttempts, colorReset)
-}
-
 // grokRetireRunDebt drops the debt for a case no retry can fix.
 func grokRetireRunDebt(label string, attempts int) {
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
@@ -552,9 +550,13 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		grokLastRefreshOutcome.Store("covered")
 		return state, grokRetryNone
 	}
-	if state.Attempts >= grokRunDebtMaxAttempts {
+	if state.Attempts >= grokRunDebtMaxAttempts && !(bypassInterval && state.CompletionMs > state.LastAttemptAtMs) {
 		// Kept until it cools off (grokDebtExhausted), so a burst of runs
 		// during an outage cannot re-open the budget; nothing more is booked.
+		// The one exception is a smoke that finished after the last read: it
+		// gets a single read, so a transient refusal earlier cannot leave the
+		// card stale after a green smoke. Smokes are rare and cooldown-bound,
+		// so this cannot turn into a loop.
 		grokLastRefreshOutcome.Store("exhausted")
 		return state, grokRetryNone
 	}
@@ -569,17 +571,24 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout+grokRunDebtReadWaitSlack)
 	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow)
 	cancel()
+	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {
+		// xAI answered with a period but no percentage: nothing for the card,
+		// so the read pays nothing and the ladder tries again.
+		outcome = grokRefreshOutcomeUnmetered
+	}
 	id := state.debtID()
 	booked := updateGrokUsageFreshness(func(s *grokUsageFreshness) {
 		s.LastAttemptAtMs = grokUsageFreshnessNow().UnixMilli()
 		if s.debtID() != id {
+			// Paid (an ok that landed through the shared flight) or replaced
+			// by a newer run while this read was out: nothing to charge.
 			return
 		}
 		s.LastOutcome = outcome
-		if grokOutcomeSpendsBudget(outcome) {
+		if grokOutcomeSpendsBudget(outcome) && s.Attempts < grokRunDebtMaxAttempts {
 			s.Attempts++
 		}
 	})
@@ -595,26 +604,29 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		// grokBillingReadOnce already retired the debt through the settle.
 		return booked, grokRetryNone
 	case grokLiveOutcomeNoLogin, grokLiveOutcomeNoAccount, grokLiveOutcomeUnauthorized:
-		// The auth notice covers these and no retry can pay them. The debt's
-		// budget is spent rather than the debt dropped: a dropped debt lets the
-		// next gather's nudge open a new one at once, so a rejected login would
-		// cost a billing GET — and, for `unauthorized`, a `grok models` renewal
-		// — on every gather. Spent, it cools off like any exhausted debt
-		// (grokDebtExhausted); a successful click still clears it.
-		grokExhaustRunDebt(id, outcome)
+		// The auth notice covers these. Each one spends a single attempt and
+		// books NO rung: the debt stays open but idle, so the gather's nudge
+		// (which only starts a booked, due rung) cannot re-open it — a rejected
+		// login would otherwise cost a billing GET, and for `unauthorized` a
+		// `grok models` renewal, on every gather. The next run that settles
+		// gets one read (a smoke even inside the spacing); a click clears it.
 		return booked, grokRetryNone
-	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed:
+	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed, liveProbeOutcomeTimeout:
+		// Local conditions, or this caller stopped waiting while the shared
+		// flight goes on (its own ok still retires the debt): no budget spent.
 		return booked, grokRetryFree
 	default:
 		return booked, grokRetryAfterRead
 	}
 }
 
-// grokOutcomeSpendsBudget: a read that reached xAI and came back unusable.
-// login_busy and write_failed are local conditions and book free rungs.
+// grokOutcomeSpendsBudget: a read that reached xAI and could not pay the
+// debt. login_busy, write_failed and a caller timeout are local conditions
+// and book free rungs.
 func grokOutcomeSpendsBudget(outcome string) bool {
 	switch outcome {
-	case grokLiveOutcomeHTTPError, grokLiveOutcomeBadResponse:
+	case grokLiveOutcomeHTTPError, grokLiveOutcomeBadResponse, grokRefreshOutcomeUnmetered,
+		grokLiveOutcomeNoLogin, grokLiveOutcomeNoAccount, grokLiveOutcomeUnauthorized:
 		return true
 	}
 	return false
@@ -812,8 +824,13 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 
 // grokSmokeUsageSettleBudget bounds how long a passing smoke waits for its
 // first read, so the signed refresh that follows the smoke result already
-// finds the fresh number. A var for tests.
-var grokSmokeUsageSettleBudget = 10 * time.Second
+// finds the fresh number. It covers the WHOLE read, login renewal included
+// (grokRunDebtReadTimeout): on a device whose access token expired the read
+// must run `grok models` first, and terminal-service only asks for Grok usage
+// on its own wakes — a reading that lands after the smoke result is not seen
+// until the next one. Still bounded by the smoke's own context. A var for
+// tests.
+var grokSmokeUsageSettleBudget = grokRunDebtReadTimeout + grokRunDebtReadWaitSlack
 
 // settleOrDisarmGrokSmokeRun settles the smoke's run when a rung reached
 // inference — and then waits, bounded by grokSmokeUsageSettleBudget and ctx,
@@ -839,4 +856,18 @@ func settleOrDisarmGrokSmokeRun(ctx context.Context, floor time.Time, reachedInf
 		return outcome
 	}
 	return "pending"
+}
+
+// drainGrokUsageWrites waits, bounded, for this feature's background work —
+// an arm persisting its floor, a settle writing its debt — so an update
+// hand-off does not exit before the debt the next process must adopt is on
+// disk. Same budget rule as drainAntigravityUsageWrites (at most half of what
+// is left of the shutdown deadline). A read still in flight past it is
+// abandoned: its debt was written before the read started.
+func drainGrokUsageWrites(ctx context.Context) {
+	budget := antigravityShutdownDrainBudget(ctx, time.Now())
+	if !grokUsageRefreshWaitFor(budget) {
+		fmt.Printf("%s[cli-usage] grok refresh: shutdown drain timed out inFlight=%d%s\n",
+			colorYellow, grokFreshnessInFlight.Load(), colorReset)
+	}
 }

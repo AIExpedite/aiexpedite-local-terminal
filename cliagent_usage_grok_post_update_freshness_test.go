@@ -355,3 +355,49 @@ func TestGrokUsage_SlowBillingReadNeverDelaysTheSmokeVerdictPastItsBudget(t *tes
 		t.Fatalf("debt not on disk while the read is still in flight: %+v", state)
 	}
 }
+
+// The reporting device's token had expired, so the smoke's read must let Grok
+// renew the login first (`grok models`, up to grokLoginRenewTimeout) — longer
+// than a 10 s settle budget. terminal-service only asks for Grok usage on its
+// own wakes, so the signed refresh right after the smoke must already see the
+// new percent: the smoke waits for the whole read, renewal included.
+func TestGrokUsage_SmokeWaitsForALoginRenewalLongerThanTenSeconds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out a renewal longer than ten seconds")
+	}
+	isolateGrok(t)
+	persistent := grokSmokeEnv(t)
+	grokEnableRunRefresh(t)
+	writeGrokAuth(t, persistent, "stale", "ada@example.com", time.Now().Add(-time.Minute))
+	renewals := 0
+	runGrokLoginRenewal = func(_ context.Context, _ string, base string) {
+		renewals++
+		time.Sleep(11 * time.Second)
+		writeGrokAuth(t, base, "fresh", "ada@example.com", time.Now().Add(6*time.Hour))
+	}
+	grokBillingServer(t, func(auth string) (int, string) {
+		if auth != "Bearer fresh" {
+			return http.StatusUnauthorized, `{}`
+		}
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	stubGrokSmokeNoBillingRecord(t)
+
+	before := time.Now()
+	res, _ := runCLISmoke(context.Background(), "grok")
+	if res.Status != cliSmokeStatusSuccess || !res.MarkerMatched {
+		t.Fatalf("smoke = %+v", res)
+	}
+	if renewals != 1 {
+		t.Fatalf("renewals = %d, want the read to renew the expired login once", renewals)
+	}
+	// No wait here: the signed refresh follows the smoke result at once.
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true, Path: "grok", Version: "grok 1.0.40"}, time.Now())
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].Unknown ||
+		usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 9 {
+		t.Fatalf("row right after the smoke = %+v, want the renewed read's 9%%", usage)
+	}
+	if observed := grokObservedAtViaSignedRefresh(t, "refresh-after-renewal"); observed.Before(before.Truncate(time.Second)) {
+		t.Fatalf("observedAt %s predates the smoke", observed)
+	}
+}

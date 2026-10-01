@@ -32,6 +32,8 @@ type grokDebtHarness struct {
 	outcome atomic.Value
 	// block, when set, parks every read until it is closed.
 	block chan struct{}
+	// unmetered makes an `ok` read save a reading with no percentage.
+	unmetered atomic.Bool
 }
 
 func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
@@ -45,7 +47,7 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 	t.Setenv("GROK_HOME", filepath.Join(dir, "grok-home"))
 
 	origNow, origFP, origRead, origPath := grokUsageFreshnessNow, grokUsageCurrentFingerprint, grokBillingLiveReadFn, grokUsageRefreshGrokPath
-	origBudget := grokSmokeUsageSettleBudget
+	origBudget, origReadTimeout, origSlack := grokSmokeUsageSettleBudget, grokRunDebtReadTimeout, grokRunDebtReadWaitSlack
 	t.Cleanup(func() {
 		stopGrokRunDebtRetry()
 		if h.block != nil {
@@ -58,7 +60,7 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 		grokUsageRefreshWaitFor(5 * time.Second)
 		SetGrokUsageRefreshEnabled(false)
 		grokUsageFreshnessNow, grokUsageCurrentFingerprint, grokBillingLiveReadFn, grokUsageRefreshGrokPath = origNow, origFP, origRead, origPath
-		grokSmokeUsageSettleBudget = origBudget
+		grokSmokeUsageSettleBudget, grokRunDebtReadTimeout, grokRunDebtReadWaitSlack = origBudget, origReadTimeout, origSlack
 		grokLiveRunsMu.Lock()
 		grokLiveRuns = map[int64]int{}
 		grokLiveRunsMu.Unlock()
@@ -78,7 +80,7 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 		outcome := h.outcome.Load().(string)
 		if outcome == grokLiveOutcomeOK {
 			saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
-				ObservedAt: now(), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 36, HasUsedPercent: true,
+				ObservedAt: now(), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 36, HasUsedPercent: !h.unmetered.Load(),
 			}, h.fingerprint()))
 		}
 		return outcome
@@ -248,13 +250,29 @@ func TestGrokRunDebt_SpacingAndSmokeBypass(t *testing.T) {
 	state := h.state()
 	state.Attempts = grokRunDebtMaxAttempts
 	h.write(state)
+	// A spent budget stops an ordinary run's settle...
+	h.advance(2 * time.Minute)
+	h.runAndSettle(time.Second)
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, an ordinary run must not read past the cap", h.reads.Load())
+	}
+	// ...but a smoke that finished after the last read gets exactly one, so
+	// earlier refusals cannot leave the card stale after a green smoke.
 	floor = armGrokUsageRunFloor(h.clock())
 	h.advance(time.Second)
-	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != "exhausted" {
-		t.Fatalf("smoke refresh = %q, want exhausted for a spent budget", got)
+	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != grokLiveOutcomeHTTPError {
+		t.Fatalf("smoke refresh = %q, want its one read past the cap", got)
 	}
-	if h.reads.Load() != 2 {
-		t.Fatalf("reads = %d, a smoke must not exceed the cap", h.reads.Load())
+	if h.reads.Load() != 3 || h.state().Attempts != grokRunDebtMaxAttempts {
+		t.Fatalf("reads=%d state=%+v, want one smoke read with the attempt count held at the cap", h.reads.Load(), h.state())
+	}
+	// A second smoke in the same instant as that read gets nothing more.
+	floor = armGrokUsageRunFloor(h.clock())
+	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != "exhausted" {
+		t.Fatalf("smoke refresh = %q, want exhausted", got)
+	}
+	if h.reads.Load() != 3 {
+		t.Fatalf("reads = %d, want no read for a smoke no newer than the last one", h.reads.Load())
 	}
 }
 
@@ -280,37 +298,61 @@ func TestGrokRunDebt_FreeRungsSpendNoBudget(t *testing.T) {
 	}
 }
 
-func TestGrokRunDebt_AuthOutcomesStopTheDebtWithoutReopeningOnEveryGather(t *testing.T) {
+func TestGrokRunDebt_AuthOutcomesSpendOneAttemptAndNeverReopenOnAGather(t *testing.T) {
 	for _, outcome := range []string{grokLiveOutcomeNoLogin, grokLiveOutcomeUnauthorized, grokLiveOutcomeNoAccount} {
 		t.Run(outcome, func(t *testing.T) {
 			h := newGrokDebtHarness(t)
 			h.outcome.Store(outcome)
 			h.runAndSettle(time.Second)
 			state := h.state()
-			if state.Attempts != grokRunDebtMaxAttempts || state.NextAttemptAtMs != 0 || grokRunDebtRetryPending() {
-				t.Fatalf("state = %+v, want the budget spent and no rung", state)
+			if !state.owed() || state.Attempts != 1 || state.NextAttemptAtMs != 0 || grokRunDebtRetryPending() {
+				t.Fatalf("state = %+v, want one attempt spent, the debt kept, and no rung", state)
 			}
 
-			// Gathers keep finding the unread log record. Inside the cooling
-			// window none of them may read (an `unauthorized` read also spawns
-			// a login renewal).
+			// Gathers keep finding the unread log record, well past any
+			// cooling window. None of them may read (an `unauthorized` read
+			// also spawns a login renewal).
 			for i := 0; i < 5; i++ {
-				h.advance(grokRefreshNudgeCooldown + time.Second)
+				h.advance(10 * time.Minute)
 				nudgeGrokUsageRefresh(h.clock(), "fp-ada")
 				h.idle()
 			}
 			if h.reads.Load() != 1 {
-				t.Fatalf("reads = %d, a stopped debt was reopened by the gather", h.reads.Load())
+				t.Fatalf("reads = %d, a gather re-opened an auth-stopped debt", h.reads.Load())
 			}
 
-			// After the longest rung the login gets one more try.
-			h.advance(grokRunDebtRetryLadder[len(grokRunDebtRetryLadder)-1])
-			nudgeGrokUsageRefresh(h.clock(), "fp-ada")
-			h.idle()
-			if h.reads.Load() != 2 {
-				t.Fatalf("reads = %d, want one retry after the cooling window", h.reads.Load())
+			// The next run that settles still gets its read — one transient
+			// refusal does not stop refreshes — and each refusal spends one
+			// attempt until the cap.
+			for want := int64(2); want <= grokRunDebtMaxAttempts; want++ {
+				h.runAndSettle(time.Second)
+				if h.reads.Load() != want {
+					t.Fatalf("reads = %d, want %d", h.reads.Load(), want)
+				}
+				h.advance(2 * time.Minute)
+			}
+			h.runAndSettle(time.Second)
+			if h.reads.Load() != grokRunDebtMaxAttempts {
+				t.Fatalf("reads = %d, refusals must stop at the cap", h.reads.Load())
 			}
 		})
+	}
+}
+
+func TestGrokRunDebt_SmokeAfterATransientRefusalReadsAndPublishes(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeUnauthorized)
+	h.runAndSettle(time.Second)
+
+	// The login recovers; the maintenance smoke runs seconds later.
+	h.outcome.Store(grokLiveOutcomeOK)
+	floor := armGrokUsageRunFloor(h.clock())
+	h.advance(5 * time.Second)
+	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != grokLiveOutcomeOK {
+		t.Fatalf("smoke refresh = %q, want ok", got)
+	}
+	if h.reads.Load() != 2 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the smoke's read to pay the debt", h.reads.Load(), h.state())
 	}
 }
 
@@ -530,5 +572,99 @@ func TestGrokRunDebt_LateArmPersistNeverLeavesAStaleFloor(t *testing.T) {
 	h.idle()
 	if state := h.state(); state.RunFloorMs != 0 {
 		t.Fatalf("state = %+v, a persist landing after the settle left a floor", state)
+	}
+}
+
+// xAI can answer 200 with a period and no creditUsagePercent. That is no
+// number for the card, so it must not pay the debt: the read spends an
+// attempt and the ladder tries again.
+func TestGrokRunDebt_OkWithoutAPercentagePaysNothing(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.unmetered.Store(true)
+	h.runAndSettle(time.Second)
+	state := h.state()
+	if !state.owed() || state.Attempts != 1 || state.LastOutcome != grokRefreshOutcomeUnmetered {
+		t.Fatalf("state = %+v, want the debt kept with one attempt spent as unmetered", state)
+	}
+	if state.NextAttemptAtMs == 0 || !grokRunDebtRetryPending() {
+		t.Fatalf("no rung booked after an unmetered read: %+v", state)
+	}
+	if grokObservationCovers("fp-ada", state.CompletionMs) {
+		t.Fatal("a percent-less live reading counted as covering the run")
+	}
+
+	// The next rung gets a number and pays.
+	h.unmetered.Store(false)
+	h.advance(time.Minute)
+	h.pass()
+	if h.reads.Load() != 2 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the numeric read to pay", h.reads.Load(), h.state())
+	}
+}
+
+// A caller that stops waiting on the shared read is not a failed read: it
+// spends no budget, and the flight's own ok still retires the debt.
+func TestGrokRunDebt_CallerTimeoutSpendsNothingAndTheFlightStillPays(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.block = make(chan struct{})
+	grokRunDebtReadWaitSlack = -grokRunDebtReadTimeout + 20*time.Millisecond // the pass waits 20 ms
+
+	floor := armGrokUsageRunFloor(h.clock())
+	h.advance(time.Second)
+	grokUsageRunSettled(floor)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.state().LastOutcome != liveProbeOutcomeTimeout && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if state := h.state(); state.LastOutcome != liveProbeOutcomeTimeout || state.Attempts != 0 || !state.owed() {
+		t.Fatalf("state = %+v, want a timeout that spends nothing", state)
+	}
+
+	close(h.block)
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads=%d state=%+v, want the late ok from the same flight to retire the debt", h.reads.Load(), h.state())
+	}
+}
+
+func TestGrokBillingReadOnce_CallerTimeoutReportsTimeout(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.block = make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if got := grokBillingReadOnce(ctx, "", "fp-ada", h.clock); got != liveProbeOutcomeTimeout {
+		t.Fatalf("outcome = %q, want %q", got, liveProbeOutcomeTimeout)
+	}
+	close(h.block)
+	h.idle()
+}
+
+// gracefulShutdown drains this feature's background writes, so an update
+// hand-off cannot exit before an arm's floor (or a settle's debt) is on disk.
+func TestDrainGrokUsageWrites_WaitsForAnInFlightPersist(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	grokFreshnessMu.Lock() // park the arm's persist
+	floor := armGrokUsageRunFloor(h.clock())
+	drained := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		drainGrokUsageWrites(ctx)
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		grokFreshnessMu.Unlock()
+		t.Fatal("the drain returned while a persist was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	grokFreshnessMu.Unlock()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain never returned")
+	}
+	if h.state().RunFloorMs != floor.UnixMilli() {
+		t.Fatalf("state = %+v, want the armed floor on disk after the drain", h.state())
 	}
 }

@@ -481,3 +481,33 @@ func TestGrokNewestBillingObservation_NewerNumericLogRecordStillWins(t *testing.
 		t.Error("a numeric record owes no refresh")
 	}
 }
+
+// The live endpoint can answer with a period and no percentage. A NEWER
+// percent-less live reading must not outrank an older numeric log record for
+// the same open period either.
+func TestGrokNewestBillingObservation_NumericLogBeatsNewerUnmeteredLiveInTheSamePeriod(t *testing.T) {
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
+	logSnap, ok := readGrokBillingSnapshot(home, grokIdentityCandidates(home))
+	if !ok || !logSnap.HasUsedPercent || !logSnap.HasPeriodEnd {
+		t.Fatalf("fixture log record = %+v", logSnap)
+	}
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	liveAt := logAt.Add(time.Hour)
+	if !saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: liveAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+	}, fingerprint)) {
+		t.Fatal("live cache not saved")
+	}
+
+	snap, ok, _ := grokNewestBillingObservation(home, fingerprint, liveAt.Add(time.Minute))
+	if !ok || !snap.HasUsedPercent || !snap.ObservedAt.Equal(logAt) {
+		t.Fatalf("observation = %+v, want the numeric log record with its own observedAt", snap)
+	}
+
+	// Once the period has ended, the newer reading wins as before.
+	snap, _, _ = grokNewestBillingObservation(home, fingerprint, logSnap.PeriodEnd.Add(time.Minute))
+	if snap.HasUsedPercent || !snap.ObservedAt.Equal(liveAt) {
+		t.Fatalf("observation after the period = %+v, want the newer live reading", snap)
+	}
+}

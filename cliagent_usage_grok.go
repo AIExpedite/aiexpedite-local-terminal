@@ -279,8 +279,9 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 //     (cliagent_usage_grok_freshness.go).
 //
 // One exception to newest-wins: Grok ≥ 1.0.40 logs records with no usage
-// percentage, so a newer UNMETERED log record would otherwise push the live
-// read's number off the card. When both name the same billing period and that
+// percentage, so a newer UNMETERED observation — a log record, or a live read
+// xAI answered without one — would otherwise push the other source's number
+// off the card. When both name the same billing period and that
 // period is still open at now, the numeric reading wins and keeps its own
 // (older) ObservedAt. Across a rollover the newer record still wins, so an
 // empty new pool never borrows the old figure.
@@ -308,13 +309,19 @@ func grokNewestBillingObservation(base, fingerprint string, now time.Time) (snap
 	if live.SubscriptionTier == "" && ok {
 		live.SubscriptionTier = snap.SubscriptionTier
 	}
-	if !ok || live.ObservedAt.After(snap.ObservedAt) {
+	if !ok {
 		return live, true, owesRefresh
 	}
-	if !snap.HasUsedPercent && live.HasUsedPercent && live.samePeriod(snap) && now.Before(snap.PeriodEnd) {
-		return live, true, owesRefresh
+	newer, older := live, snap
+	if !live.ObservedAt.After(snap.ObservedAt) {
+		newer, older = snap, live
 	}
-	return snap, ok, owesRefresh
+	// Same open period: a number beats a newer percent-less observation in
+	// either direction, and keeps its own (older) ObservedAt.
+	if !newer.HasUsedPercent && older.HasUsedPercent && older.samePeriod(newer) && now.Before(newer.PeriodEnd) {
+		return older, true, owesRefresh
+	}
+	return newer, true, owesRefresh
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,

@@ -647,10 +647,12 @@ never published or logged (`grokSmokeFailureLogLine` takes the stderr
    billing cache, so a direct (ACP) run, a terminal (session) run and a smoke
    all advance `latestObservedAt`. The account gate is upstream of that choice:
    a foreign record or a foreign live entry never ages the observation forward.
-   One exception: when the newest record carries no percentage and an older
-   live reading does, and both name the **same, still-open** billing period
+   One exception: when the newest observation carries no percentage (a log
+   record, or a live read xAI answered without one) and the older source does,
+   and both name the **same, still-open** billing period
    (`grokBillingSnapshot.samePeriod`, ends compared to the second), the number
-   wins with its own older `observedAt` — and a refresh is owed. Across a
+   wins with its own older `observedAt` (a newer percent-less log record also
+   owes a refresh). Across a
    period rollover the newer record still wins, so an empty new pool never
    borrows the old figure.
 
@@ -675,21 +677,28 @@ same bounded run-completion refresh Codex and Antigravity have:
 - **Pay.** A process-wide single-flight worker spends at most 4 outbound reads
   per debt on the shared ladder (1 m / 2 m / 8 m / 30 m), at least 60 s apart.
   The read goes through `grokBillingReadOnce`, one `singleflight` flight per
-  account shared with the Refresh click, and an `ok` (from either) retires the
-  debt. `http_error` / `bad_response` spend budget; `login_busy` /
-  `write_failed` / offline book free rungs; `no_login` / `no_account` /
-  `unauthorized` spend the rest of the budget (the auth notice covers them; a
-  dropped debt would let every gather re-open it, and `unauthorized` spawns a
-  `grok models` renewal). A newer run
-  moves the debt forward but keeps its attempt count, and an exhausted debt
-  re-opens only after the longest rung has passed since its last read. A
-  debt whose account is no longer signed in is retired unpaid; one older than
-  6 h ages out.
-- **Smoke.** The smoke waits up to `grokSmokeUsageSettleBudget` (10 s, bounded
-  by its own context) for its first read, which bypasses the 60 s spacing but
-  not the cap: the signed `__cli_usage_refresh__` sent right after the smoke
-  result then already finds the number. The verdict never depends on it; past
-  the budget the debt stays on the ladder.
+  account shared with the Refresh click. Only a reading **with a percentage**
+  pays: an `ok` that names a period alone is booked as `unmetered`, spends an
+  attempt and stays on the ladder. `http_error` / `bad_response` spend budget;
+  `login_busy` / `write_failed` / offline, and a caller that stopped waiting on
+  the shared flight (`timeout` — the flight's own `ok` still pays), book free
+  rungs. `no_login` / `no_account` / `unauthorized` spend one attempt each and
+  book no rung: the gather's nudge only starts a booked rung, so a rejected
+  login cannot cost a billing GET (and, for `unauthorized`, a `grok models`
+  renewal) on every gather, while the next run that settles still reads. A
+  newer run moves the debt forward but keeps its attempt count, and an
+  exhausted debt re-opens only after the longest rung has passed since its
+  last read. A debt whose account is no longer signed in is retired unpaid;
+  one older than 6 h ages out.
+- **Smoke.** The smoke waits for its first read up to
+  `grokSmokeUsageSettleBudget` — the whole read budget, login renewal
+  included (30 s), bounded by its own context — because terminal-service only
+  asks for Grok usage on its own wakes: the signed `__cli_usage_refresh__` sent
+  right after the smoke result must already find the number, even on a device
+  whose token expired. That read bypasses the 60 s spacing, and a smoke that
+  finished after the last read gets it even when the budget is spent, so an
+  earlier transient refusal cannot leave the card stale after a green smoke.
+  The verdict never depends on it.
 - **Direct runs.** When `Parse` finds a log record newer than every live
   reading (a `grok` the user ran in their own shell), it calls
   `nudgeGrokUsageRefresh`, at most once a minute and never while a run of this
@@ -697,7 +706,9 @@ same bounded run-completion refresh Codex and Antigravity have:
 - **Survive.** `StartAgent` calls `payOwedGrokUsageRefresh`, which re-arms a
   booked rung, pays one attempt for a debt with none, and owes one read for a
   floor the previous process never settled; `gracefulShutdown` stops the timer
-  first. Offline sends nothing and keeps the debt.
+  first and then drains in-flight arms and settles (`drainGrokUsageWrites`,
+  bounded like Antigravity's), so an update hand-off cannot exit before the
+  debt is on disk. Offline sends nothing and keeps the debt.
 - **Redaction.** The state file holds epoch-ms integers, a counter, the hashed
   account fingerprint and a closed outcome code; log lines are
   `[cli-usage] grok refresh: <label> attempts=<n>`.

@@ -326,7 +326,9 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 		defer cancel()
 		outcome := grokBillingLiveReadFn(readCtx, grokPath, now)
 		if outcome == grokLiveOutcomeOK {
-			if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok {
+			// Only a reading with a percentage pays a run's debt; one that
+			// names a period alone leaves the card without a number.
+			if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && snap.HasUsedPercent {
 				settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
 			}
 		}
@@ -337,7 +339,9 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 		outcome, _ := res.Val.(string)
 		return outcome
 	case <-ctx.Done():
-		return grokLiveOutcomeHTTPError
+		// This caller stopped waiting; the flight goes on and its own ok still
+		// settles any debt it covers. Not a failed read, so it spends nothing.
+		return liveProbeOutcomeTimeout
 	}
 }
 
