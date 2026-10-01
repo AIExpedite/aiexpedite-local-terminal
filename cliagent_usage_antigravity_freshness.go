@@ -945,7 +945,8 @@ const antigravityLoginRenewTimeout = 25 * time.Second
 // antigravityRenewLoginForDebt runs the debt's one stored-login renewal when
 // the token is already past its expiry and the debt has not renewed yet. The
 // stamp is persisted BEFORE the child starts, so a crash, restart or
-// self-update loop cannot renew twice for one debt. A token still inside the
+// self-update loop cannot renew twice for one debt; a spaced result started no
+// child, so it releases the stamp for a later retry. A token still inside the
 // skew band, a debt that already renewed, a newer generation, offline or a
 // shutdown starts nothing and reports "" (no renewal).
 func antigravityRenewLoginForDebt(state antigravityUsageFreshness, tokenExpiryMs int64) string {
@@ -968,6 +969,16 @@ func antigravityRenewLoginForDebt(state antigravityUsageFreshness, tokenExpiryMs
 	ctx, cancel := context.WithTimeout(context.Background(), antigravityLoginRenewTimeout)
 	defer cancel()
 	result := renewAntigravityStoredLoginFn(ctx, now)
+	if result == antigravityLoginSpaced {
+		// Another caller's renewal holds the device spacing clock, so this one
+		// started no child: hand the debt its renewal back, or every later
+		// retry would skip it long after the spacing has elapsed.
+		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) {
+			if state.debtID() == id && state.LoginRenewedAtMs == now.UnixMilli() {
+				state.LoginRenewedAtMs = 0
+			}
+		})
+	}
 	fmt.Printf("%s[antigravity-freshness] Stored login renewal finished (%s)%s\n",
 		colorCyan, result, colorReset)
 	return result

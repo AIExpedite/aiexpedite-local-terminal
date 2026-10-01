@@ -1049,3 +1049,44 @@ func TestAntigravityPayRunDebt_RenewalRefusalsSpendNothing(t *testing.T) {
 		})
 	}
 }
+
+// A spaced renewal started no child, so it must not use up the debt's one
+// renewal: once the device spacing has elapsed, a later retry of the same debt
+// renews and pays. An unavailable renewal did try, so it keeps the stamp.
+func TestAntigravityPayRunDebt_SpacedRenewalKeepsTheDebtsRenewal(t *testing.T) {
+	p := helperIsolateRenewalPass(t, time.Now().Add(-time.Minute), antigravityLoginSpaced)
+	helperOwedDebt(t, antigravityUsageFreshness{})
+
+	for i := 0; i < 2; i++ {
+		if _, kind, _ := antigravityPayRunDebtPass(1, true); kind != antigravityRetryFree {
+			t.Fatalf("spaced pass %d kind=%v, want the free rung", i, kind)
+		}
+		if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.LoginRenewedAtMs != 0 {
+			t.Fatalf("spaced pass %d state=%+v, want the debt kept with no renewal stamped", i, state)
+		}
+	}
+	if p.renewals.Load() != 2 {
+		t.Fatalf("renewals=%d, want each spaced pass to ask again", p.renewals.Load())
+	}
+
+	p.result.Store(antigravityLoginRenewed)
+	antigravityPayRunDebtPass(1, true)
+	if p.renewals.Load() != 3 || p.reads.Load() != 1 {
+		t.Errorf("renewals=%d reads=%d, want the spacing's end to renew and read", p.renewals.Load(), p.reads.Load())
+	}
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs != 0 {
+		t.Errorf("state=%+v, want the debt paid", state)
+	}
+
+	p.result.Store(antigravityLoginUnavailable)
+	p.setExpiry(time.Now().Add(-time.Minute))
+	helperOwedDebt(t, antigravityUsageFreshness{})
+	antigravityPayRunDebtPass(1, true)
+	antigravityPayRunDebtPass(1, true)
+	if p.renewals.Load() != 4 {
+		t.Errorf("renewals=%d, want an unavailable renewal to use up the debt's one", p.renewals.Load())
+	}
+	if state := helperFreshnessState(t); state.LoginRenewedAtMs == 0 {
+		t.Errorf("state=%+v, want the unavailable renewal stamped", state)
+	}
+}
