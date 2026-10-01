@@ -555,6 +555,7 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 	if state.Attempts >= grokRunDebtMaxAttempts {
 		// Kept until it cools off (grokDebtExhausted), so a burst of runs
 		// during an outage cannot re-open the budget; nothing more is booked.
+		grokLastRefreshOutcome.Store("exhausted")
 		return state, grokRetryNone
 	}
 	if IsOffline() {

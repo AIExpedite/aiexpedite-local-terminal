@@ -250,7 +250,9 @@ func TestGrokRunDebt_SpacingAndSmokeBypass(t *testing.T) {
 	h.write(state)
 	floor = armGrokUsageRunFloor(h.clock())
 	h.advance(time.Second)
-	settleOrDisarmGrokSmokeRun(context.Background(), floor, true)
+	if got := settleOrDisarmGrokSmokeRun(context.Background(), floor, true); got != "exhausted" {
+		t.Fatalf("smoke refresh = %q, want exhausted for a spent budget", got)
+	}
 	if h.reads.Load() != 2 {
 		t.Fatalf("reads = %d, a smoke must not exceed the cap", h.reads.Load())
 	}
