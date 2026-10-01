@@ -649,11 +649,26 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 // tries once more. The renewal stores the fresh list, so the caller's later
 // warm is a cache hit, and it shares its spacing with the debt worker's
 // renewals.
+//
+// A token inside antigravityTokenExpirySkew but not yet past its expiry is one
+// `agy` still considers valid, so an `agy models` started now would renew
+// nothing yet start the shared five-minute spacing clock — and a debt retrying
+// after the real expiry would then spend its one renewal on `spaced`. The click
+// therefore waits for the noted expiry first (at most the skew), as the debt
+// worker's antigravityRetryLoginRenew rung does, and renews nothing if its
+// budget ends before then.
 func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent) string {
 	version := antigravityCodeAssistBuildVersion(agent.Version)
+	takeAntigravityCodeAssistAttempt()
 	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
+	note := takeAntigravityCodeAssistAttempt()
 	antigravityRecordClickRead(outcome, time.Now())
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
+		if wait := time.Until(time.UnixMilli(note.tokenExpiryMs).Add(time.Second)); note.tokenExpiryMs > 0 && wait > 0 {
+			if antigravityClickExpiryWaitFn(ctx, wait) != nil {
+				return outcome
+			}
+		}
 		renewal := renewAntigravityStoredLoginFn(ctx, time.Now())
 		fmt.Printf("%s[cli-usage] Antigravity stored login renewal finished (%s)%s\n", colorCyan, renewal, colorReset)
 		outcome = probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
@@ -661,6 +676,10 @@ func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAg
 	}
 	return outcome
 }
+
+// antigravityClickExpiryWaitFn waits for a token inside the skew band to
+// expire; a seam so tests need not sleep.
+var antigravityClickExpiryWaitFn = sleepWithContext
 
 // antigravityCodeAssistBuildVersion resolves the `agy` build the Code Assist
 // request identifies itself as. Google licenses that endpoint per client and

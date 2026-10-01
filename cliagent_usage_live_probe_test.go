@@ -1336,3 +1336,75 @@ func TestProbeAntigravityQuotaViaCodeAssist_RenewsDespiteAWarmModelCache(t *test
 		t.Errorf("lastPaidAtMs=%d, want the post-renewal read on the spacing clock", paid)
 	}
 }
+
+// A click whose read meets a token inside the skew band — still valid to `agy`,
+// so `agy models` would renew nothing — waits for the noted expiry before it
+// renews, and when its budget ends first it renews nothing: the shared spacing
+// clock stays free for the debt worker's renewal after the real expiry.
+func TestProbeAntigravityQuotaViaCodeAssist_WaitsOutTheSkewBandBeforeRenewing(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		budgetEnds  bool
+		wantOutcome string
+		wantSpawned int32
+		wantReads   int32
+	}{
+		{name: "expiry passes, then renews", wantOutcome: liveProbeOutcomeCodeAssistOK, wantSpawned: 1, wantReads: 2},
+		{name: "budget ends first", budgetEnds: true, wantOutcome: liveProbeOutcomeCodeAssistTokenExpired, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityFreshness(t)
+			helperIsolateLogIndex(t)
+			expiry := time.Now().Add(10 * time.Second)
+			setExpiry := helperMutableAntigravityKeyring(t, expiry)
+			expired := false
+			spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+				if !expired {
+					t.Error("renewal started while the token was still valid to agy")
+				}
+				setExpiry(time.Now().Add(time.Hour))
+				return realAntigravityModels, true
+			})
+			var reads atomic.Int32
+			helperStubAntigravityCodeAssistOutcome(t, func() string {
+				reads.Add(1)
+				if antigravityStoredLoginUsable(context.Background(), time.Now()) {
+					return liveProbeOutcomeCodeAssistOK
+				}
+				noteAntigravityCodeAssistTokenExpiry(expiry.UnixMilli())
+				return liveProbeOutcomeCodeAssistTokenExpired
+			})
+			origWait := antigravityClickExpiryWaitFn
+			t.Cleanup(func() { antigravityClickExpiryWaitFn = origWait })
+			var waited time.Duration
+			antigravityClickExpiryWaitFn = func(_ context.Context, d time.Duration) error {
+				waited = d
+				if tc.budgetEnds {
+					return context.DeadlineExceeded
+				}
+				// The token has now actually expired.
+				expired = true
+				setExpiry(time.Now().Add(-time.Second))
+				return nil
+			}
+
+			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != tc.wantOutcome {
+				t.Fatalf("outcome=%q, want %q", got, tc.wantOutcome)
+			}
+			if waited <= 0 || waited > antigravityTokenExpirySkew+time.Second {
+				t.Errorf("waited %v, want up to the noted expiry + 1s", waited)
+			}
+			if spawned.Load() != tc.wantSpawned || reads.Load() != tc.wantReads {
+				t.Errorf("renewal children=%d reads=%d, want %d and %d", spawned.Load(), reads.Load(), tc.wantSpawned, tc.wantReads)
+			}
+			if tc.budgetEnds {
+				antigravityLoginRenewal.mu.Lock()
+				lastAt := antigravityLoginRenewal.lastAt
+				antigravityLoginRenewal.mu.Unlock()
+				if !lastAt.IsZero() {
+					t.Errorf("renewal spacing clock started at %s, want it free for the debt's renewal", lastAt)
+				}
+			}
+		})
+	}
+}
