@@ -676,6 +676,12 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtPassWait())
 	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow, time.UnixMilli(state.CompletionMs))
 	cancel()
+	if outcome == liveProbeOutcomeAccountChanged {
+		// The login switched after the check above; the probe stopped before
+		// presenting the new account's credential, so nothing was spent.
+		grokRetireRunDebt(state.debtID(), "account_changed", state.Attempts)
+		return state, grokRetryNone
+	}
 	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {
 		// xAI answered with a period but no percentage: nothing for the card,
 		// so the read pays nothing and the ladder tries again.

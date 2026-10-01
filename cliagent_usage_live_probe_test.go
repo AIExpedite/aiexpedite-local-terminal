@@ -410,6 +410,23 @@ func TestProbeGrokBillingLive_ExpiredTokenLetsGrokRenewThenRetries(t *testing.T)
 	}
 }
 
+func TestProbeGrokBillingLiveFor_SwitchedAccountSendsNothing(t *testing.T) {
+	home := isolateGrok(t)
+	writeGrokAuth(t, home, "stale-a", "ada@example.com", time.Now().Add(-time.Minute))
+	expected := grokAccountFingerprintFor(home)
+	writeGrokAuth(t, home, "stale-b", "bob@example.com", time.Now().Add(-time.Minute))
+	renewals := 0
+	runGrokLoginRenewal = func(context.Context, string, string) { renewals++ }
+	calls := grokBillingServer(t, func(string) (int, string) { return http.StatusOK, `{}` })
+
+	if got := probeGrokBillingLiveFor(context.Background(), "grok", expected, time.Now); got != liveProbeOutcomeAccountChanged {
+		t.Fatalf("outcome=%q, want account_changed", got)
+	}
+	if renewals != 0 || atomic.LoadInt32(calls) != 0 {
+		t.Errorf("renewals=%d requests=%d, want the other account neither renewed nor contacted", renewals, atomic.LoadInt32(calls))
+	}
+}
+
 func TestProbeGrokBillingLive_UnauthorizedRenewsOnceThenGivesUp(t *testing.T) {
 	home := isolateGrok(t)
 	writeGrokAuth(t, home, "revoked", "dan@example.com", time.Now().Add(time.Hour))

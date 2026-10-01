@@ -73,7 +73,7 @@ func newGrokDebtHarness(t *testing.T) *grokDebtHarness {
 	grokUsageFreshnessNow = h.clock
 	grokUsageCurrentFingerprint = h.fingerprint
 	grokUsageRefreshGrokPath = func() string { return "" }
-	grokBillingLiveReadFn = func(_ context.Context, _ string, now func() time.Time) string {
+	grokBillingLiveReadFn = func(_ context.Context, _, _ string, now func() time.Time) string {
 		h.reads.Add(1)
 		// Stamped when the request is sent, as probeGrokBillingLive does.
 		sentAt := now()
@@ -385,6 +385,37 @@ func TestGrokRunDebt_AccountChangeRetiresWithoutARequest(t *testing.T) {
 	}
 	if h.state().owed() {
 		t.Fatalf("debt kept after the account changed: %+v", h.state())
+	}
+}
+
+func TestGrokRunDebt_AccountSwitchDuringThePassReachesTheProbeAsTheDebtAccount(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	h.runAndSettle(time.Second)
+
+	// The login switches after the pass checked the debt's account but before
+	// the probe runs: the probe must be told the debt's account, and its
+	// account_changed retires the debt without spending budget.
+	read := grokBillingLiveReadFn
+	var gotFP string
+	grokBillingLiveReadFn = func(ctx context.Context, path, fp string, now func() time.Time) string {
+		h.signIn("fp-bob")
+		gotFP = fp
+		if fp != h.fingerprint() {
+			return liveProbeOutcomeAccountChanged
+		}
+		return read(ctx, path, fp, now)
+	}
+	h.advance(time.Minute)
+	h.pass()
+	if gotFP != "fp-ada" {
+		t.Fatalf("probe pinned to %q, want the debt's account fp-ada", gotFP)
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("debt kept after the probe saw another account: %+v", state)
+	}
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, the switched pass must not reach xAI", h.reads.Load())
 	}
 }
 
@@ -1098,8 +1129,8 @@ func TestGrokRunDebt_SmokeOutwaitsAPreCompletionFlight(t *testing.T) {
 	grokRunDebtReadTimeout, grokRunDebtReadWaitSlack = 250*time.Millisecond, 50*time.Millisecond
 	grokSmokeUsageSettleBudget = grokRunDebtPassWait()
 	read := grokBillingLiveReadFn
-	grokBillingLiveReadFn = func(ctx context.Context, path string, now func() time.Time) string {
-		outcome := read(ctx, path, now)
+	grokBillingLiveReadFn = func(ctx context.Context, path, fp string, now func() time.Time) string {
+		outcome := read(ctx, path, fp, now)
 		time.Sleep(readTook)
 		return outcome
 	}

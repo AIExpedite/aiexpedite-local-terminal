@@ -311,9 +311,9 @@ func fetchGrokBillingLive(ctx context.Context, client *http.Client, token string
 // previous one.
 var grokBillingReadGroup singleflight.Group
 
-// grokBillingLiveReadFn is the read the flight runs; a seam so tests can count
-// requests without a loopback server.
-var grokBillingLiveReadFn = probeGrokBillingLive
+// grokBillingLiveReadFn is the read the flight runs, pinned to the flight's
+// account; a seam so tests can count requests without a loopback server.
+var grokBillingLiveReadFn = probeGrokBillingLiveFor
 
 // grokBillingRead is one flight's result: its outcome and when it started.
 type grokBillingRead struct {
@@ -357,7 +357,7 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 			startedAt := now()
 			readCtx, cancel := context.WithTimeout(context.Background(), grokRunDebtReadTimeout)
 			defer cancel()
-			outcome := grokBillingLiveReadFn(readCtx, grokPath, now)
+			outcome := grokBillingLiveReadFn(readCtx, grokPath, fingerprint, now)
 			if outcome == grokLiveOutcomeOK {
 				// Only a reading with a percentage pays a run's debt; one that
 				// names a period alone leaves the card without a number. The
@@ -391,9 +391,18 @@ func probeGrokBillingLiveShared(ctx context.Context, grokPath string, now func()
 	return grokBillingReadOnce(ctx, grokPath, grokAccountFingerprintFor(grokPersistentHome()), now, time.Time{})
 }
 
-// probeGrokBillingLive reads the credit pool from xAI and caches it for the
-// gather that follows. Returns a closed outcome code.
+// probeGrokBillingLive reads the credit pool from xAI for whichever account is
+// signed in and caches it for the gather that follows.
 func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.Time) string {
+	return probeGrokBillingLiveFor(ctx, grokPath, "", now)
+}
+
+// probeGrokBillingLiveFor reads the credit pool from xAI and caches it for the
+// gather that follows. Returns a closed outcome code. A non-empty expected
+// pins the read to that account: if the login switched away from it, the probe
+// returns account_changed before presenting — or renewing — the other
+// account's credential.
+func probeGrokBillingLiveFor(ctx context.Context, grokPath, expected string, now func() time.Time) string {
 	base := grokPersistentHome()
 	if base == "" {
 		return grokLiveOutcomeNoLogin
@@ -401,6 +410,10 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 	fingerprint := grokAccountFingerprintFor(base)
 	if fingerprint == "" {
 		return grokLiveOutcomeNoAccount
+	}
+	switched := func() bool { return expected != "" && grokAccountFingerprintFor(base) != expected }
+	if switched() {
+		return liveProbeOutcomeAccountChanged
 	}
 	client := grokBillingLiveClient()
 	defer client.CloseIdleConnections()
@@ -454,6 +467,10 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			renewalBlocked = true
 			return
 		}
+		if switched() {
+			// Never rotate another account's login on this flight's behalf.
+			return
+		}
 		runGrokLoginRenewal(ctx, grokPath, base)
 		// Every live copy of the login now holds a superseded refresh token;
 		// hand them the renewed file before xAI's grace window closes — still
@@ -470,6 +487,11 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 			return grokLiveOutcomeNoLogin
 		}
 	}
+	// The token was read from the home as it is now: a switch since the check
+	// above means it is another account's.
+	if switched() {
+		return liveProbeOutcomeAccountChanged
+	}
 	// sentAt is when the request that answered was sent: xAI's figure is at
 	// least that fresh, and a run that completed after it may not be in it.
 	sentAt := now()
@@ -478,6 +500,9 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 		renew()
 		if token, _, _ = grokFreshestPresentedToken(base, fingerprint, now()); token == "" {
 			return grokLiveOutcomeNoLogin
+		}
+		if switched() {
+			return liveProbeOutcomeAccountChanged
 		}
 		sentAt = now()
 		config, err = fetchGrokBillingLive(ctx, client, token)
