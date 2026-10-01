@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,7 +24,14 @@ type helperLogIndex struct {
 	mu         sync.Mutex
 	live       map[int]bool
 	unknown    map[int]bool
+	// unreadable PIDs answer the start-token read with
+	// errHelperTokenUnreadable (access denied), not "no such process".
+	unreadable map[int]bool
 }
+
+// errHelperTokenUnreadable is a start-token read failure that does not prove
+// the process gone; every other stubbed failure does.
+var errHelperTokenUnreadable = errors.New("access denied")
 
 func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	t.Helper()
@@ -35,12 +43,12 @@ func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	t.Setenv("USERPROFILE", home)
 	idx := &helperLogIndex{
 		home: home, base: filepath.Join(home, ".gemini", "antigravity-cli"),
-		live: map[int]bool{}, unknown: map[int]bool{},
+		live: map[int]bool{}, unknown: map[int]bool{}, unreadable: map[int]bool{},
 	}
 	if err := os.MkdirAll(antigravityLogDir(idx.base), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	origProbe, origToken, origScan := antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan
+	origProbe, origToken, origScan, origGone := antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan, antigravityStartTokenErrGone
 	antigravityCandidateProbe = func(pid int, token string) processProbeResult {
 		idx.mu.Lock()
 		defer idx.mu.Unlock()
@@ -57,14 +65,19 @@ func helperIsolateLogIndex(t *testing.T) *helperLogIndex {
 	antigravityProcessStartToken = func(pid int) (string, error) {
 		idx.mu.Lock()
 		defer idx.mu.Unlock()
+		if idx.unreadable[pid] {
+			return "", errHelperTokenUnreadable
+		}
 		if idx.live[pid] || idx.unknown[pid] {
 			return fmt.Sprintf("tok-%d", pid), nil
 		}
 		return "", fmt.Errorf("no such process")
 	}
+	antigravityStartTokenErrGone = func(err error) bool { return !errors.Is(err, errHelperTokenUnreadable) }
 	antigravityProcessScan = func() ([]ProcessInfo, bool) { return nil, false }
 	t.Cleanup(func() {
 		antigravityCandidateProbe, antigravityProcessStartToken, antigravityProcessScan = origProbe, origToken, origScan
+		antigravityStartTokenErrGone = origGone
 		antigravityUsageRefreshWaitIdle()
 		resetAntigravityLogIndex()
 		resetAntigravityExhaustionEvidence()
@@ -292,21 +305,98 @@ func TestAntigravityCandidate_OwedOnlyAfterExit(t *testing.T) {
 	}
 }
 
-// A candidate whose log is still being written when the exit is seen waits the
-// settle window after that exit.
-func TestAntigravityCandidate_SettlesAfterExitSeen(t *testing.T) {
+// A candidate seen live (its start token recorded) whose process is then gone
+// has a PROVEN exit: it is owed on that same pass, floored at the exit-seen
+// instant, however recently its log was written — no settle window.
+func TestAntigravityCandidate_ProvenExitIsOwedOnTheSamePass(t *testing.T) {
 	h := helperIsolateLogIndex(t)
 	now := time.Now().Add(-time.Hour)
 	h.setLive(5101, true)
 	h.write(t, helperLogName(now), helperPIDBlock(5101), now, false)
 	h.pass(now.Add(5*time.Second), 0)
 	h.setLive(5101, false)
-	if res := h.pass(now.Add(10*time.Second), 0); !res.owed.IsZero() {
-		t.Fatalf("owed=%s inside the settle window", res.owed)
+	res := h.pass(now.Add(10*time.Second), 0)
+	if !res.owed.Equal(now.Add(10*time.Second)) || !res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor, proven", res.owed, res.owedProven)
 	}
-	res := h.pass(now.Add(10*time.Second+antigravityCandidateSettle), 0)
-	if !res.owed.Equal(now.Add(10 * time.Second)) {
-		t.Errorf("owed=%s, want the exit-seen floor", res.owed)
+}
+
+// A run whose every PID was already gone at first sight (a short smoke that
+// started and ended between passes) is proven only once its log has stayed
+// unchanged for antigravityExitStableFor; an append inside that window — a
+// same-second run sharing the file — restarts the check.
+func TestAntigravityCandidate_GoneAtFirstSightNeedsAStableLog(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	name := helperLogName(now)
+	h.write(t, name, helperPIDBlock(5151), now, false)
+
+	if res := h.pass(now.Add(time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s at first sight, want the stability check first", res.owed)
+	}
+	// Changed inside the window (same mtime second, larger file).
+	h.write(t, name, "I0929 20:43:57.000000 1 server.go:1] still writing\n", now, true)
+	if res := h.pass(now.Add(5*time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s after an append inside the window", res.owed)
+	}
+	if res := h.pass(now.Add(9*time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s only 4 s after the append", res.owed)
+	}
+	res := h.pass(now.Add(10*time.Second), 0)
+	if !res.owed.Equal(now.Add(time.Second)) || !res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor once stable for 5 s, proven", res.owed, res.owedProven)
+	}
+}
+
+// Unreadable PIDs and an overflowing PID set are never proof of an exit.
+func TestAntigravityCandidate_UnknownOrOverflowIsNeverProven(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	h.mu.Lock()
+	h.unknown[5161] = true
+	h.mu.Unlock()
+	h.write(t, helperLogName(now), helperPIDBlock(5161), now, false)
+	body := ""
+	for pid := 5171; pid <= 5175; pid++ {
+		body += helperPIDBlock(pid)
+	}
+	h.write(t, helperLogName(now.Add(time.Second)), body, now, false)
+	for _, at := range []time.Duration{time.Second, 10 * time.Second, 2 * time.Minute} {
+		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
+			t.Fatalf("at +%s owed=%s proven=%v, want neither run owed", at, res.owed, res.owedProven)
+		}
+	}
+}
+
+// A PID whose start token cannot be read for a reason other than its process
+// being gone (access denied, a transient /proc or sysctl failure) may still be
+// running a long turn with a quiet log: an unchanged log is not proof of its
+// exit, and neither is the settle window passing while it stays unreadable. It
+// stays live until a re-read proves it gone, then keeps the settle window and
+// is owed unproven after it.
+func TestAntigravityCandidate_UnreadablePIDIsNotGoneAtFirstSight(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	h.mu.Lock()
+	h.unreadable[5181] = true
+	h.mu.Unlock()
+	h.write(t, helperLogName(now), helperPIDBlock(5181), now, false)
+	for _, at := range []time.Duration{time.Second, 10 * time.Second, 30 * time.Second, 2 * antigravityCandidateSettle, 5 * antigravityCandidateSettle} {
+		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
+			t.Fatalf("at +%s owed=%s proven=%v, want an unreadable PID's run held live", at, res.owed, res.owedProven)
+		}
+	}
+	// The process exits: the next re-read proves it gone.
+	h.mu.Lock()
+	delete(h.unreadable, 5181)
+	h.mu.Unlock()
+	gone := now.Add(6 * antigravityCandidateSettle)
+	if res := h.pass(gone, 0); !res.owed.IsZero() || res.owedProven {
+		t.Fatalf("owed=%s proven=%v at exit, want the settle window first", res.owed, res.owedProven)
+	}
+	res := h.pass(gone.Add(antigravityCandidateSettle), 0)
+	if !res.owed.Equal(gone) || res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor after the settle window, unproven", res.owed, res.owedProven)
 	}
 }
 
@@ -1357,5 +1447,150 @@ func TestAntigravityPIDBlock_FindsTheRunBehindManyNewerLogs(t *testing.T) {
 	block, ok := antigravityPIDBlock(h.base, 50021, floor)
 	if !ok || !strings.Contains(string(block), "ada@example.com") {
 		t.Errorf("block=%q ok=%v, want the detached run's own block", block, ok)
+	}
+}
+
+/* ─────────────────────────── fast exit watch ─────────────────────────── */
+
+// The watch is wanted only while something it can move is tracked: a live
+// candidate, an unpaid proven floor — and no longer once a debt covers that
+// floor, so a terminal no_login debt leaves no polling behind.
+func TestAntigravityExitWatch_WantedOnlyWhileWorkIsTracked(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	if antigravityExitWatchWanted() {
+		t.Fatal("wanted with nothing tracked")
+	}
+	now := time.Now()
+	h.setLive(7201, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7201), now, false)
+	h.pass(now, 0)
+	if !antigravityExitWatchWanted() {
+		t.Fatal("not wanted while a live direct run is tracked")
+	}
+
+	h.setLive(7201, false)
+	res, newlyOwed := antigravityExitWatchPass(now.Add(5*time.Second), 0)
+	antigravityApplyDiscovery(res, now.Add(5*time.Second))
+	if !newlyOwed || !res.owedProven {
+		t.Fatalf("newlyOwed=%v proven=%v, want the exit owed and proven on the watch's own pass", newlyOwed, res.owedProven)
+	}
+	if !antigravityExitWatchWanted() {
+		t.Fatal("not wanted while the proven floor is unpaid")
+	}
+
+	antigravityNudgeProvenFloor(now.Add(5*time.Second), 0, antigravityOwedFloor{At: res.owed, Proven: true})
+	antigravityUsageRefreshWaitIdle()
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.Outcome != liveProbeOutcomeCodeAssistNoLogin {
+		t.Fatalf("state=%+v, want the proven floor owed and found unpayable", state)
+	}
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want one attempt for the proven floor", reads.Load())
+	}
+	if antigravityExitWatchWanted() {
+		t.Error("still wanted once a (terminal) debt covers the floor")
+	}
+}
+
+// A poll re-evaluates only what is tracked: a log a NEW run wrote in the
+// meantime is left for the tick's listing.
+func TestAntigravityExitWatchPass_NeverListsTheLogDirectory(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now()
+	h.setLive(7301, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7301), now, false)
+	h.pass(now, 0)
+
+	other := h.write(t, helperLogName(now.Add(2*time.Second)), helperPIDBlock(7302), now.Add(2*time.Second), false)
+	antigravityExitWatchPass(now.Add(5*time.Second), 0)
+	if _, tracked := helperEntryClass(other); tracked {
+		t.Error("the watch classified a log it was never tracking")
+	}
+	if _, candidates, _, _, _, _ := helperIndexCounts(); candidates != 1 {
+		t.Errorf("candidates=%d, want only the tracked run", candidates)
+	}
+}
+
+// A nudge refused by the cooldown leaves the proven floor tracked and stamps
+// nothing, so the next poll seconds later pays it.
+func TestAntigravityExitWatch_RetriesARefusedNudge(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistHTTPError })
+	now := time.Now()
+	h.setLive(7401, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7401), now, false)
+	h.pass(now, 0)
+	h.setLive(7401, false)
+	res, _ := antigravityExitWatchPass(now.Add(time.Second), 0)
+	owed := antigravityOwedFloor{At: res.owed, Proven: res.owedProven}
+
+	cooldown := now.Add(-30 * time.Second)
+	antigravityRefreshNudge.mu.Lock()
+	antigravityRefreshNudge.lastAt = cooldown
+	antigravityRefreshNudge.mu.Unlock()
+	antigravityNudgeProvenFloor(now.Add(time.Second), 0, owed)
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 0 || !antigravityExitWatchWanted() {
+		t.Fatalf("reads=%d wanted=%v, want the refused floor kept for the next poll", reads.Load(), antigravityExitWatchWanted())
+	}
+	antigravityRefreshNudge.mu.Lock()
+	stamped := !antigravityRefreshNudge.lastAt.Equal(cooldown)
+	antigravityRefreshNudge.mu.Unlock()
+	if stamped {
+		t.Error("a refused nudge stamped the cooldown")
+	}
+
+	// Next poll, once the cooldown has lapsed (moved back rather than the
+	// clock forward: the debt is stamped with the wall clock).
+	antigravityRefreshNudge.mu.Lock()
+	antigravityRefreshNudge.lastAt = now.Add(-antigravityRefreshNudgeCooldown - time.Second)
+	antigravityRefreshNudge.mu.Unlock()
+	antigravityNudgeProvenFloor(now.Add(time.Second), 0, owed)
+	antigravityUsageRefreshWaitIdle()
+	if reads.Load() != 1 {
+		t.Errorf("reads=%d, want the retried nudge paid once", reads.Load())
+	}
+	if antigravityExitWatchWanted() {
+		t.Error("the watch still tracks a floor its debt now owns")
+	}
+}
+
+// End to end on the tick's goroutine: tracking a live direct run starts the
+// watch, the run's exit is owed and paid within polls, and the watch stops.
+func TestAntigravityExitWatch_StartsAndStopsWithTheTick(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	reads := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	origTick, origWatch := antigravityDiscoveryInterval, antigravityExitWatchInterval
+	antigravityDiscoveryInterval, antigravityExitWatchInterval = time.Hour, 10*time.Millisecond
+	startAntigravityDiscovery()
+	t.Cleanup(func() {
+		stopAntigravityDiscovery()
+		antigravityDiscoveryInterval, antigravityExitWatchInterval = origTick, origWatch
+	})
+
+	await := func(what string, cond func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+		}
+	}
+	if antigravityExitWatchActive.Load() {
+		t.Fatal("the watch runs with nothing tracked")
+	}
+	now := time.Now()
+	h.setLive(7501, true)
+	h.write(t, helperLogName(now), helperPIDBlock(7501), now, false)
+	h.pass(now, 0) // a gather's pass: wakes the tick's goroutine
+	await("the watch to start", antigravityExitWatchActive.Load)
+
+	h.setLive(7501, false)
+	await("the exit to be paid", func() bool { return reads.Load() == 1 })
+	await("the watch to stop", func() bool { return !antigravityExitWatchActive.Load() })
+
+	stopAntigravityDiscovery()
+	if antigravityExitWatchActive.Load() {
+		t.Error("the watch outlived the tick")
 	}
 }

@@ -1216,7 +1216,7 @@ func TestProbeAntigravityQuotaViaCodeAssist_RecordsOnlyTheSpacingClock(t *testin
 			}
 
 			clickAt := time.Now()
-			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}, t.TempDir()); got != tc.outcome {
+			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != tc.outcome {
 				t.Fatalf("outcome=%q, want %q", got, tc.outcome)
 			}
 
@@ -1369,5 +1369,183 @@ func TestGrokBillingLive_SuccessfulClickRetiresAnOpenDebt(t *testing.T) {
 	state = grokUsageFreshness{}
 	if readJSONFile(grokUsageFreshnessPath(), &state) && state.owed() {
 		t.Fatalf("a successful click left the debt open: %+v", state)
+	}
+}
+
+// The click's renewal is not a cached warm-up: with a model list cached minutes
+// ago, an expired login still starts one `agy models`, and the read after it is
+// booked on the spacing clock like the first.
+func TestProbeAntigravityQuotaViaCodeAssist_RenewsDespiteAWarmModelCache(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	helperIsolateLogIndex(t)
+	setExpiry := helperMutableAntigravityKeyring(t, time.Now().Add(-time.Minute))
+	spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+		setExpiry(time.Now().Add(time.Hour))
+		return realAntigravityModels, true
+	})
+	detected, _ := antigravityLoginRenewDetectedFn()
+	if _, ok := cachedCLIAgentModelDiscovery(context.Background(), "antigravity", detected, "", time.Now().Add(-5*time.Minute)); !ok {
+		t.Fatal("could not warm the model cache")
+	}
+	warmed := spawned.Load()
+	// The warm-up child renewed it; the login has expired again since.
+	setExpiry(time.Now().Add(-time.Minute))
+	var reads atomic.Int32
+	helperStubAntigravityCodeAssistOutcome(t, func() string {
+		reads.Add(1)
+		if antigravityStoredLoginUsable(context.Background(), time.Now()) {
+			return liveProbeOutcomeCodeAssistOK
+		}
+		return liveProbeOutcomeCodeAssistTokenExpired
+	})
+
+	clickAt := time.Now()
+	if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != liveProbeOutcomeCodeAssistOK {
+		t.Fatalf("outcome=%q, want the read after the renewal to succeed", got)
+	}
+	if spawned.Load()-warmed != 1 || reads.Load() != 2 {
+		t.Errorf("renewal children=%d reads=%d, want one `agy models` between two reads", spawned.Load()-warmed, reads.Load())
+	}
+	if paid := helperFreshnessState(t).LastPaidAtMs; paid < clickAt.UnixMilli() {
+		t.Errorf("lastPaidAtMs=%d, want the post-renewal read on the spacing clock", paid)
+	}
+}
+
+// A click whose read meets a token inside the skew band — still valid to `agy`,
+// so `agy models` would renew nothing — waits for the noted expiry before it
+// renews, and when its budget ends first it renews nothing: the shared spacing
+// clock stays free for the debt worker's renewal after the real expiry.
+func TestProbeAntigravityQuotaViaCodeAssist_WaitsOutTheSkewBandBeforeRenewing(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		budgetEnds  bool
+		wantOutcome string
+		wantSpawned int32
+		wantReads   int32
+	}{
+		{name: "expiry passes, then renews", wantOutcome: liveProbeOutcomeCodeAssistOK, wantSpawned: 1, wantReads: 2},
+		{name: "budget ends first", budgetEnds: true, wantOutcome: liveProbeOutcomeCodeAssistTokenExpired, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityFreshness(t)
+			helperIsolateLogIndex(t)
+			expiry := time.Now().Add(10 * time.Second)
+			setExpiry := helperMutableAntigravityKeyring(t, expiry)
+			expired := false
+			spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+				if !expired {
+					t.Error("renewal started while the token was still valid to agy")
+				}
+				setExpiry(time.Now().Add(time.Hour))
+				return realAntigravityModels, true
+			})
+			var reads atomic.Int32
+			helperStubAntigravityCodeAssistOutcomeCtx(t, func(ctx context.Context) string {
+				reads.Add(1)
+				if antigravityStoredLoginUsable(context.Background(), time.Now()) {
+					return liveProbeOutcomeCodeAssistOK
+				}
+				noteAntigravityCodeAssistTokenExpiry(ctx, expiry.UnixMilli())
+				return liveProbeOutcomeCodeAssistTokenExpired
+			})
+			origWait := antigravityClickExpiryWaitFn
+			t.Cleanup(func() { antigravityClickExpiryWaitFn = origWait })
+			var waited time.Duration
+			antigravityClickExpiryWaitFn = func(_ context.Context, d time.Duration) error {
+				waited = d
+				if tc.budgetEnds {
+					return context.DeadlineExceeded
+				}
+				// The token has now actually expired.
+				expired = true
+				setExpiry(time.Now().Add(-time.Second))
+				return nil
+			}
+
+			if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != tc.wantOutcome {
+				t.Fatalf("outcome=%q, want %q", got, tc.wantOutcome)
+			}
+			if waited <= 0 || waited > antigravityTokenExpirySkew+time.Second {
+				t.Errorf("waited %v, want up to the noted expiry + 1s", waited)
+			}
+			if spawned.Load() != tc.wantSpawned || reads.Load() != tc.wantReads {
+				t.Errorf("renewal children=%d reads=%d, want %d and %d", spawned.Load(), reads.Load(), tc.wantSpawned, tc.wantReads)
+			}
+			if tc.budgetEnds {
+				antigravityLoginRenewal.mu.Lock()
+				lastAt := antigravityLoginRenewal.lastAt
+				antigravityLoginRenewal.mu.Unlock()
+				if !lastAt.IsZero() {
+					t.Errorf("renewal spacing clock started at %s, want it free for the debt's renewal", lastAt)
+				}
+			}
+		})
+	}
+}
+
+// The renewal starts the shared spacing clock before its child runs, so a click
+// renews only when its budget, after any skew wait, still covers the whole
+// renewal bound (keyring re-read and executable lookup, then the child's cap);
+// otherwise it waits for nothing and renews nothing, leaving the
+// device's renewal to the debt worker.
+func TestProbeAntigravityQuotaViaCodeAssist_RenewsOnlyWhenTheBudgetCoversTheChild(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		left        time.Duration
+		budget      time.Duration
+		wantWait    bool
+		wantSpawned int32
+		wantOutcome string
+	}{
+		{name: "skew wait leaves too little", left: 10 * time.Second, budget: cliUsageLiveProbeBudget,
+			wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
+		{name: "expired, budget short of the child", left: -time.Second, budget: cliAgentModelProbeTimeout - time.Second,
+			wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
+		{name: "expired, budget covers the child but not the pre-child work", left: -time.Second,
+			budget: antigravityLoginRenewTimeout - time.Second, wantOutcome: liveProbeOutcomeCodeAssistTokenExpired},
+		{name: "expired, full budget", left: -time.Second, budget: cliUsageLiveProbeBudget,
+			wantSpawned: 1, wantOutcome: liveProbeOutcomeCodeAssistOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			helperIsolateAntigravityFreshness(t)
+			helperIsolateLogIndex(t)
+			expiry := time.Now().Add(tc.left)
+			setExpiry := helperMutableAntigravityKeyring(t, expiry)
+			spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+				setExpiry(time.Now().Add(time.Hour))
+				return realAntigravityModels, true
+			})
+			helperStubAntigravityCodeAssistOutcomeCtx(t, func(ctx context.Context) string {
+				if antigravityStoredLoginUsable(context.Background(), time.Now()) {
+					return liveProbeOutcomeCodeAssistOK
+				}
+				noteAntigravityCodeAssistTokenExpiry(ctx, expiry.UnixMilli())
+				return liveProbeOutcomeCodeAssistTokenExpired
+			})
+			origWait := antigravityClickExpiryWaitFn
+			t.Cleanup(func() { antigravityClickExpiryWaitFn = origWait })
+			waited := false
+			antigravityClickExpiryWaitFn = func(context.Context, time.Duration) error {
+				waited = true
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), tc.budget)
+			defer cancel()
+
+			if got := probeAntigravityQuotaViaCodeAssist(ctx, detectedCLIAgent{Version: "1.2.3"}); got != tc.wantOutcome {
+				t.Fatalf("outcome=%q, want %q", got, tc.wantOutcome)
+			}
+			if waited != tc.wantWait || spawned.Load() != tc.wantSpawned {
+				t.Errorf("waited=%v renewal children=%d, want %v and %d", waited, spawned.Load(), tc.wantWait, tc.wantSpawned)
+			}
+			if tc.wantSpawned == 0 {
+				antigravityLoginRenewal.mu.Lock()
+				lastAt := antigravityLoginRenewal.lastAt
+				antigravityLoginRenewal.mu.Unlock()
+				if !lastAt.IsZero() {
+					t.Errorf("renewal spacing clock started at %s, want it free for the debt's renewal", lastAt)
+				}
+			}
+		})
 	}
 }

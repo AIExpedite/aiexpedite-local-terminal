@@ -629,13 +629,13 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 	if gate, ok := antigravityQuotaGateFor(agent.Version, now); ok {
 		fmt.Printf("%s[cli-usage] Antigravity loopback quota probe skipped: build %s refused it at %s (retried after %s); reading from Google with the stored login%s\n",
 			colorYellow, firstNonEmpty(agent.Version, gate.Version, "unknown"), gate.ObservedAt, antigravityQuotaGateRecheck, colorReset)
-		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent)
 	}
 	outcome := probeAntigravityQuotaLiveFn(ctx, agent.Path, home)
 	switch outcome {
 	case liveProbeOutcomeGated:
 		noteAntigravityQuotaGate(agent.Version, now)
-		return probeAntigravityQuotaViaCodeAssist(ctx, agent, home)
+		return probeAntigravityQuotaViaCodeAssist(ctx, agent)
 	case liveProbeOutcomeOK:
 		clearAntigravityQuotaGate()
 	}
@@ -643,20 +643,67 @@ func probeAntigravityQuotaLiveUnlessGated(ctx context.Context, agent detectedCLI
 }
 
 // probeAntigravityQuotaViaCodeAssist runs the Code Assist read. The agent
-// never renews the stored login itself; when the token has expired it runs the
-// click's `agy models` warm-up first — `agy` refreshes its keyring token on
-// every run — and tries once more. (The warm-up is cached for the click, so
-// the caller's later warm is a no-op.)
-func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent, home string) string {
+// never refreshes the stored login with agy's credentials; when the token has
+// expired it has `agy` renew it (renewAntigravityStoredLogin: an uncached `agy
+// models` — a cached model list would spawn nothing, and renew nothing) and
+// tries once more. The renewal stores the fresh list, so the caller's later
+// warm is a cache hit, and it shares its spacing with the debt worker's
+// renewals.
+//
+// A token inside antigravityTokenExpirySkew but not yet past its expiry is one
+// `agy` still considers valid, so an `agy models` started now would renew
+// nothing yet start the shared five-minute spacing clock — and a debt retrying
+// after the real expiry would then spend its one renewal on `spaced`. The click
+// therefore waits for the noted expiry first (at most the skew), as the debt
+// worker's antigravityRetryLoginRenew rung does.
+//
+// The renewal starts that spacing clock before its child runs, so a child the
+// click's budget cancels part-way spends the device's renewal for nothing. The
+// click therefore renews only when, after any wait, its budget still covers the
+// whole renewal bound the debt worker grants it (antigravityLoginRenewTimeout:
+// the keyring re-read and executable lookup before the child, then the child's
+// own cap; antigravityClickRenewalFits); otherwise it renews nothing
+// and leaves the renewal to the debt worker. The final read is not reserved
+// for: a renewed login stays in the keyring for the next read either way.
+func probeAntigravityQuotaViaCodeAssist(ctx context.Context, agent detectedCLIAgent) string {
 	version := antigravityCodeAssistBuildVersion(agent.Version)
-	outcome := probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
+	probeCtx, attempt := withAntigravityCodeAssistAttempt(ctx)
+	outcome := probeAntigravityQuotaCodeAssistFn(probeCtx, version, time.Now)
+	note := attempt.take()
 	antigravityRecordClickRead(outcome, time.Now())
 	if outcome == liveProbeOutcomeCodeAssistTokenExpired {
-		warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
+		var wait time.Duration
+		if note.tokenExpiryMs > 0 {
+			wait = max(time.Until(time.UnixMilli(note.tokenExpiryMs).Add(time.Second)), 0)
+		}
+		if !antigravityClickRenewalFits(ctx, wait) {
+			fmt.Printf("%s[cli-usage] Antigravity stored login renewal skipped (budget)%s\n", colorCyan, colorReset)
+			return outcome
+		}
+		if wait > 0 {
+			if antigravityClickExpiryWaitFn(ctx, wait) != nil {
+				return outcome
+			}
+		}
+		renewal := renewAntigravityStoredLoginFn(ctx, time.Now())
+		fmt.Printf("%s[cli-usage] Antigravity stored login renewal finished (%s)%s\n", colorCyan, renewal, colorReset)
 		outcome = probeAntigravityQuotaCodeAssistFn(ctx, version, time.Now)
 		antigravityRecordClickRead(outcome, time.Now())
 	}
 	return outcome
+}
+
+// antigravityClickExpiryWaitFn waits for a token inside the skew band to
+// expire; a seam so tests need not sleep.
+var antigravityClickExpiryWaitFn = sleepWithContext
+
+// antigravityClickRenewalFits reports whether ctx, after waiting wait, still
+// leaves the renewal its whole bound (antigravityLoginRenewTimeout), not just
+// the child's cap: the renewal re-reads the keyring and resolves the
+// executable before the child starts.
+func antigravityClickRenewalFits(ctx context.Context, wait time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Until(deadline)-wait >= antigravityLoginRenewTimeout
 }
 
 // antigravityCodeAssistBuildVersion resolves the `agy` build the Code Assist

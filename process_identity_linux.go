@@ -82,6 +82,13 @@ func processStartToken(pid int) (string, error) {
 	return processStartTokenPrefixLinux + bootID + ":" + starttime, nil
 }
 
+// processStartTokenErrGone reports whether a processStartToken error proves no
+// process holds the PID. Any other error (permissions, a missing boot id, a
+// malformed stat) leaves the process unread, not gone.
+func processStartTokenErrGone(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH)
+}
+
 // probeRecordedProcess reports whether the recorded process is still ours.
 func probeRecordedProcess(rec ledgerProcess) processProbeResult {
 	if rec.PID <= 0 || !strings.HasPrefix(rec.StartTime, processStartTokenPrefixLinux) {

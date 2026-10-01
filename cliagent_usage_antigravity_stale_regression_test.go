@@ -597,3 +597,162 @@ func TestAntigravityEvidence_LivesThroughTheRetryHorizon(t *testing.T) {
 		t.Errorf("evidence after its reset=%v, want none", got)
 	}
 }
+
+/* ─────────────── the smoke window: expired logins and direct runs ─────────────── */
+
+// helperExpiredStoredLogin replaces the fixture's stored login with one that
+// has already expired, and returns the setter a renewal (or a later real run)
+// moves its expiry with.
+func helperExpiredStoredLogin(t *testing.T) func(time.Time) {
+	t.Helper()
+	return helperMutableAntigravityKeyring(t, time.Now().Add(-time.Minute))
+}
+
+// Terminal-managed: the smoke's stored login has expired. The debt renews it
+// once (`agy` writes the renewed token back to the keyring) and reads again in
+// the same pass, so the card is numeric, observed after the run, well inside
+// the controller's 90 s + 30 s window — not parked waiting for a later run.
+func TestAntigravityStaleRegression_ManagedRunWithAnExpiredLoginConverges(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, helperStaleRegression)
+	}{
+		{"direct agy", helperRunDirectAgy},
+		{"windows encoded powershell", helperRunEncodedPowerShellAgy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := helperStaleRegressionFixture(t, helperStoredLogin(), helperUserinfoAda)
+			setExpiry := helperExpiredStoredLogin(t)
+			resetAntigravityLogIndex()
+			t.Cleanup(resetAntigravityLogIndex)
+			spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+				setExpiry(time.Now().Add(time.Hour))
+				return realAntigravityModels, true
+			})
+
+			startedAt := time.Now()
+			tc.run(t, f)
+			antigravityUsageRefreshWaitIdle()
+			helperStopAntigravityRefreshSchedule()
+			snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+
+			if spawned.Load() != 1 {
+				t.Errorf("renewals=%d, want exactly one", spawned.Load())
+			}
+			if got := atomic.LoadInt32(f.quotaCalls); got != 1 {
+				t.Errorf("Code Assist reads=%d, want one (the expired read sends nothing)", got)
+			}
+			landed := time.UnixMilli(antigravitySnapshotObservedMs(snap))
+			if landed.Before(startedAt) || landed.Sub(startedAt) > 120*time.Second {
+				t.Errorf("reading landed %s after the run started, want inside the 120 s window", landed.Sub(startedAt))
+			}
+			usage, _ := helperParsedObservedAt(t, f.home, time.Now())
+			for _, m := range usage.Metrics {
+				if m.Unknown || m.Consumed == nil {
+					t.Errorf("metric %+v is not numeric", m)
+				}
+			}
+			if usage.Notice != "" {
+				t.Errorf("notice=%q, want none once the renewed read landed", usage.Notice)
+			}
+		})
+	}
+}
+
+// Direct: a short smoke in the user's shell, gone before the first pass sees
+// it. The tick's listing finds the log, the exit watch proves the exit 5 s
+// later and nudges without the minute's settle guard, and the reading lands
+// within 90 s of the exit on the pinned clock.
+func TestAntigravityStaleRegression_DirectRunConvergesThroughTheExitWatch(t *testing.T) {
+	f := helperStaleRegressionFixture(t, helperStoredLogin(), helperUserinfoAda)
+	t.Setenv(mockCLIEnvVar, "antigravity-pid-block")
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+
+	exit := time.Now()
+	helperRunPlainAgy(t, f)
+	setClock := helperPinFreshnessClock(t, exit.Add(time.Second))
+	antigravityDiscoveryTick()
+	if got := atomic.LoadInt32(f.quotaCalls); got != 0 {
+		t.Fatalf("Code Assist reads=%d before the exit was proven", got)
+	}
+	setClock(exit.Add(time.Second + antigravityExitWatchInterval + time.Second))
+	antigravityExitWatchPoll()
+	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
+
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	landed := time.UnixMilli(antigravitySnapshotObservedMs(snap))
+	if landed.Before(exit.Truncate(time.Second)) || landed.After(exit.Add(90*time.Second)) {
+		t.Errorf("reading landed at %s, want within exit + 90 s of %s", landed, exit)
+	}
+	if got := atomic.LoadInt32(f.quotaCalls); got != 1 {
+		t.Errorf("Code Assist reads=%d, want one for one run", got)
+	}
+	if antigravityExitWatchWanted() {
+		t.Error("the watch still tracks a run whose reading landed")
+	}
+}
+
+// Post-update survival: the smoke's debt meets an expired login whose renewal
+// does not help, and the agent then restarts three times (a self-update loop).
+// The persisted stamp keeps every later process from renewing again for the
+// same debt; once a real `agy` run renews the login, the adopted debt is paid
+// and its reading survives.
+func TestAntigravityStaleRegression_ExpiredLoginRenewsOnceAcrossRestarts(t *testing.T) {
+	f := helperStaleRegressionFixture(t, helperStoredLogin(), helperUserinfoAda)
+	setExpiry := helperExpiredStoredLogin(t)
+	resetAntigravityLogIndex()
+	t.Cleanup(resetAntigravityLogIndex)
+	spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+		return realAntigravityModels, true // `agy models` ran, the login is still expired
+	})
+
+	smokeStarted := time.Now()
+	helperRunEncodedPowerShellAgy(t, f)
+	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
+	if spawned.Load() != 1 {
+		t.Fatalf("renewals=%d after the smoke, want one", spawned.Load())
+	}
+	if state := helperFreshnessState(t); state.RefreshOwedAtMs == 0 || state.LoginRenewedAtMs == 0 {
+		t.Fatalf("state=%+v, want the debt kept with its renewal stamped", state)
+	}
+
+	for restart := 1; restart <= 3; restart++ {
+		// A new process: nothing in memory survives, not even the spacing clock.
+		helperResetAntigravityLiveRuns()
+		resetAntigravityLoginRenewal()
+		updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) { state.NextAttemptAtMs = 0 })
+		adoptAndPayOwedAntigravityRunDebt(time.Now())
+		antigravityUsageRefreshWaitIdle()
+		helperStopAntigravityRefreshSchedule()
+		if spawned.Load() != 1 {
+			t.Fatalf("restart %d: renewals=%d, want the debt's one renewal never repeated", restart, spawned.Load())
+		}
+	}
+	if got := atomic.LoadInt32(f.quotaCalls); got != 0 {
+		t.Fatalf("Code Assist reads=%d with an expired login, want none sent", got)
+	}
+
+	// A later real run renewed the keyring; the next process pays the debt.
+	setExpiry(time.Now().Add(time.Hour))
+	helperResetAntigravityLiveRuns()
+	updateAntigravityUsageFreshness(func(state *antigravityUsageFreshness) { state.NextAttemptAtMs = 0 })
+	adoptAndPayOwedAntigravityRunDebt(time.Now())
+	antigravityUsageRefreshWaitIdle()
+	helperStopAntigravityRefreshSchedule()
+	snap := helperAwaitPaidRefresh(t, f.cache, f.stale)
+	if antigravitySnapshotObservedMs(snap) < smokeStarted.UnixMilli() {
+		t.Errorf("observedAt=%s predates the smoke", snap.ObservedAt)
+	}
+	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
+	for _, m := range usage.Metrics {
+		if m.Unknown || m.Consumed == nil {
+			t.Errorf("metric %+v is not numeric after the update", m)
+		}
+	}
+	if spawned.Load() != 1 {
+		t.Errorf("renewals=%d, want one for the whole debt", spawned.Load())
+	}
+}

@@ -16,10 +16,10 @@
 //
 //   - Called by the Refresh click once the loopback route is known to be gated,
 //     and by the run-completion debt worker (cliagent_usage_antigravity_freshness.go).
-//     It never renews the login: `agy` refreshes the keyring token on its own
-//     runs, and the click's `agy models` warm-up is run first when the stored
-//     token has expired. An expired token after that is reported, not
-//     refreshed with agy's client secret.
+//     The read never renews the login itself: `agy` refreshes the keyring token
+//     on its own runs, so an expired token is renewed by running `agy models`
+//     as the agent's own child (renewAntigravityStoredLogin) and reading again.
+//     The token is never refreshed with agy's client secret.
 //   - The reply's account is resolved BEFORE its buckets are converted, so
 //     in-memory managed-run exhaustion evidence applies only to that account.
 //   - The endpoints are pinned HTTPS constants; a test override must be
@@ -60,8 +60,11 @@ const (
 	antigravityCodeAssistMaxBody = 256 * 1024
 	// antigravityTokenExpirySkew treats a token this close to expiry as
 	// expired, so the request is not sent with a credential that dies in
-	// flight.
-	antigravityTokenExpirySkew = time.Minute
+	// flight. 15 s covers the 8 s request plus the userinfo call. It must stay
+	// close to the margin `agy` itself renews at (Go's oauth2 refreshes about
+	// 10 s before expiry): a wider band makes a token `agy` still considers
+	// valid "expired" here, and no `agy models` run would renew it.
+	antigravityTokenExpirySkew = 15 * time.Second
 
 	// The keyring entry `agy` writes (service / user, joined as
 	// "service:user" for the Windows credential name).
@@ -365,6 +368,10 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 		return liveProbeOutcomeCodeAssistNoLogin
 	}
 	if !tok.Expiry.IsZero() && !now().Add(antigravityTokenExpirySkew).Before(tok.Expiry) {
+		// The expiry travels beside the closed outcome, in memory only, so the
+		// debt worker can tell a token inside the skew band (book a retry at its
+		// expiry) from one already past it (renew it) without a second read.
+		noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
 		return liveProbeOutcomeCodeAssistTokenExpired
 	}
 	version = antigravityCodeAssistBuildVersion(version)
@@ -386,10 +393,10 @@ func probeAntigravityQuotaCodeAssist(ctx context.Context, version string, now fu
 	snap, shape, plottable := antigravitySnapshotFromGroups(groups, now(), evidence)
 	logAntigravityQuotaShapeOnce(shape)
 	if !plottable {
-		noteAntigravityCodeAssistAttempt(fingerprint, true)
+		noteAntigravityCodeAssistAttempt(ctx, fingerprint, true)
 		return liveProbeOutcomeCodeAssistBadResponse
 	}
-	noteAntigravityCodeAssistAttempt(fingerprint, false)
+	noteAntigravityCodeAssistAttempt(ctx, fingerprint, false)
 	snap.Account = account
 	// Attest the route on the cached reading itself, not only in memory: the
 	// gather that replays it may belong to a later process (a restart or a
@@ -432,32 +439,197 @@ func logAntigravityQuotaShapeOnce(shape antigravityQuotaShape) {
 	fmt.Printf("%s[antigravity-quota] quota reply shape: %s%s\n", colorCyan, shape, colorReset)
 }
 
-// antigravityCodeAssistAttemptNote is what the latest Code Assist read learned
-// that the closed outcome code cannot carry: the account it resolved, and
-// whether a 200 had nothing chartable. In memory only.
+// antigravityCodeAssistAttemptNote is what one Code Assist read learned that
+// the closed outcome code cannot carry: the account it resolved, whether a 200
+// had nothing chartable, and — for codeassist_token_expired — the stored
+// token's expiry (epoch ms). In memory only.
 type antigravityCodeAssistAttemptNote struct {
-	fingerprint string
-	unplottable bool
+	fingerprint   string
+	unplottable   bool
+	tokenExpiryMs int64
 }
 
-var antigravityCodeAssistLastAttempt struct {
+// antigravityCodeAssistAttempt holds the note of ONE probe. It travels in that
+// probe's context (withAntigravityCodeAssistAttempt), never in a process-wide
+// slot: a Refresh click and the run-debt worker can read at the same time, and
+// a shared latest-note slot would let one take — or clear — the other's skew
+// expiry, so a debt could renew while `agy` still holds the token valid.
+type antigravityCodeAssistAttempt struct {
 	mu   sync.Mutex
 	note antigravityCodeAssistAttemptNote
 }
 
-func noteAntigravityCodeAssistAttempt(fingerprint string, unplottable bool) {
-	last := &antigravityCodeAssistLastAttempt
-	last.mu.Lock()
-	last.note = antigravityCodeAssistAttemptNote{fingerprint: fingerprint, unplottable: unplottable}
-	last.mu.Unlock()
+type antigravityCodeAssistAttemptKey struct{}
+
+// withAntigravityCodeAssistAttempt scopes a note to the probe run with the
+// returned context; take reads it once the probe returns.
+func withAntigravityCodeAssistAttempt(ctx context.Context) (context.Context, *antigravityCodeAssistAttempt) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attempt := &antigravityCodeAssistAttempt{}
+	return context.WithValue(ctx, antigravityCodeAssistAttemptKey{}, attempt), attempt
 }
 
-// takeAntigravityCodeAssistAttempt returns and clears the latest note.
-func takeAntigravityCodeAssistAttempt() antigravityCodeAssistAttemptNote {
-	last := &antigravityCodeAssistLastAttempt
-	last.mu.Lock()
-	defer last.mu.Unlock()
-	note := last.note
-	last.note = antigravityCodeAssistAttemptNote{}
-	return note
+// take returns the probe's note.
+func (a *antigravityCodeAssistAttempt) take() antigravityCodeAssistAttemptNote {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.note
+}
+
+// setAntigravityCodeAssistAttempt records note on the probe ctx carries; a
+// probe run without one notes nothing.
+func setAntigravityCodeAssistAttempt(ctx context.Context, note antigravityCodeAssistAttemptNote) {
+	if ctx == nil {
+		return
+	}
+	attempt, _ := ctx.Value(antigravityCodeAssistAttemptKey{}).(*antigravityCodeAssistAttempt)
+	if attempt == nil {
+		return
+	}
+	attempt.mu.Lock()
+	attempt.note = note
+	attempt.mu.Unlock()
+}
+
+func noteAntigravityCodeAssistAttempt(ctx context.Context, fingerprint string, unplottable bool) {
+	setAntigravityCodeAssistAttempt(ctx, antigravityCodeAssistAttemptNote{fingerprint: fingerprint, unplottable: unplottable})
+}
+
+func noteAntigravityCodeAssistTokenExpiry(ctx context.Context, expiryMs int64) {
+	setAntigravityCodeAssistAttempt(ctx, antigravityCodeAssistAttemptNote{tokenExpiryMs: expiryMs})
+}
+
+/* ─────────────────────────── login renewal ─────────────────────────── */
+
+// Login renewal outcomes — a closed set, logged on the device only.
+const (
+	antigravityLoginRenewed      = "renewed"
+	antigravityLoginStillExpired = "still_expired"
+	antigravityLoginSpaced       = "spaced"
+	antigravityLoginUnavailable  = "unavailable"
+)
+
+// antigravityLoginRenewMinInterval spaces renewals across the whole agent
+// process: the debt worker and the Refresh click share it, so the two together
+// never start more than one renewal `agy models` per interval. A var so tests
+// can pin it.
+var antigravityLoginRenewMinInterval = 5 * time.Minute
+
+// Seams so tests drive the renewal without a real `agy`.
+var (
+	renewAntigravityStoredLoginFn   = renewAntigravityStoredLogin
+	refreshCLIAgentModelDiscoveryFn = refreshCLIAgentModelDiscovery
+	antigravityLoginRenewDetectedFn = antigravityLoginRenewDetected
+)
+
+// antigravityLoginRenewal is the process-wide single flight and spacing clock.
+var antigravityLoginRenewal struct {
+	mu       sync.Mutex
+	lastAt   time.Time
+	inFlight chan struct{}
+	result   string
+}
+
+// renewAntigravityStoredLogin makes `agy` renew the login it keeps in the OS
+// keyring by running `agy models` — the child model discovery already runs
+// every half hour, which spends no model turn — and reports, from the keyring's
+// own expiry before and after, whether the stored token is now usable:
+//
+//   - renewed: valid past antigravityTokenExpirySkew (already before the child
+//     when a concurrent `agy` run renewed it — nothing is spawned then);
+//   - still_expired: the child ran and the stored token is still expired;
+//   - spaced: a renewal started within antigravityLoginRenewMinInterval;
+//   - unavailable: no executable or home, or the child failed to start or
+//     timed out without the token changing.
+//
+// The child goes through refreshCLIAgentModelDiscovery → discoverCLIAgentModels,
+// so it is registered as the agent's own child (beginAntigravityOwnChild), its
+// run log never owes a refresh, and the fresh list lands in the model-probe
+// cache. A caller arriving while a renewal runs shares its result.
+//
+// It reads nothing of the token but its expiry, and never logs or persists it.
+func renewAntigravityStoredLogin(ctx context.Context, now time.Time) string {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r := &antigravityLoginRenewal
+	r.mu.Lock()
+	if wait := r.inFlight; wait != nil {
+		r.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return antigravityLoginUnavailable
+		}
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.result
+	}
+	if !r.lastAt.IsZero() && !now.Before(r.lastAt) && now.Sub(r.lastAt) < antigravityLoginRenewMinInterval {
+		r.mu.Unlock()
+		return antigravityLoginSpaced
+	}
+	r.lastAt = now
+	done := make(chan struct{})
+	r.inFlight = done
+	r.mu.Unlock()
+
+	result := antigravityLoginUnavailable
+	defer func() {
+		r.mu.Lock()
+		r.result, r.inFlight = result, nil
+		r.mu.Unlock()
+		close(done)
+	}()
+	result = renewAntigravityStoredLoginOnce(ctx, now)
+	return result
+}
+
+func renewAntigravityStoredLoginOnce(ctx context.Context, now time.Time) string {
+	if antigravityStoredLoginUsable(ctx, now) {
+		return antigravityLoginRenewed
+	}
+	detected, ok := antigravityLoginRenewDetectedFn()
+	home, err := os.UserHomeDir()
+	if !ok || err != nil || home == "" {
+		return antigravityLoginUnavailable
+	}
+	started := time.Now()
+	_, probed := refreshCLIAgentModelDiscoveryFn(ctx, "antigravity", detected, home, now)
+	// The caller's clock, moved on by the time the child actually took.
+	if antigravityStoredLoginUsable(ctx, now.Add(time.Since(started))) {
+		return antigravityLoginRenewed
+	}
+	if !probed {
+		return antigravityLoginUnavailable
+	}
+	return antigravityLoginStillExpired
+}
+
+// antigravityStoredLoginUsable reports whether the keyring holds a token the
+// Code Assist read would send at now: present, and not inside the skew.
+func antigravityStoredLoginUsable(ctx context.Context, now time.Time) bool {
+	tok, ok := antigravityStoredToken(ctx)
+	return ok && (tok.Expiry.IsZero() || now.Add(antigravityTokenExpirySkew).Before(tok.Expiry))
+}
+
+// antigravityLoginRenewDetected is the installed CLI as gatherCLIAgents detects
+// it (resolved path, cached --version), so the list the renewal stores lands
+// under the model-probe cache key the gather reads.
+func antigravityLoginRenewDetected() (detectedCLIAgent, bool) {
+	path := antigravityExecutablePath()
+	if path == "" {
+		return detectedCLIAgent{}, false
+	}
+	return detectedCLIAgent{Detected: true, Path: path, Name: "Antigravity", Version: cachedProbeVersion(path)}, true
+}
+
+// resetAntigravityLoginRenewal forgets the spacing clock. Tests only.
+func resetAntigravityLoginRenewal() {
+	r := &antigravityLoginRenewal
+	r.mu.Lock()
+	r.lastAt, r.result = time.Time{}, ""
+	r.mu.Unlock()
 }

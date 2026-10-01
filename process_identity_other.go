@@ -12,6 +12,11 @@ func processStartToken(pid int) (string, error) {
 	return "", errors.New("process start time unavailable on this platform")
 }
 
+// processStartTokenErrGone never proves a PID gone where no process can be read.
+func processStartTokenErrGone(err error) bool {
+	return false
+}
+
 func probeRecordedProcess(rec ledgerProcess) processProbeResult {
 	return processUnknown
 }

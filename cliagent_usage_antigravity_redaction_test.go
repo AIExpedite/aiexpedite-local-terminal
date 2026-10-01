@@ -311,3 +311,72 @@ func TestAntigravityUtilization_PublishedShapeUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// The login renewal adds one persisted field — loginRenewedAtMs, an
+// epoch-millisecond int — and two log lines, the renewal's and the debt's
+// close-out. Both lines are closed-set codes and integers: no path, email,
+// PID, port or token.
+func TestAntigravityLoginRenewal_PersistsAndLogsMetricsOnly(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	helperIsolateLogIndex(t)
+	setExpiry := helperMutableAntigravityKeyring(t, time.Now().Add(-time.Minute))
+	helperIsolateLoginRenewal(t, func(ctx context.Context) (string, bool) {
+		processStartHookFrom(ctx)(54452)
+		setExpiry(time.Now().Add(time.Hour))
+		return realAntigravityModels, true
+	})
+	helperStubAntigravityCodeAssistOutcomeCtx(t, func(ctx context.Context) string {
+		if !antigravityStoredLoginUsable(context.Background(), time.Now()) {
+			tok, _ := antigravityStoredToken(context.Background())
+			noteAntigravityCodeAssistTokenExpiry(ctx, tok.Expiry.UnixMilli())
+			return liveProbeOutcomeCodeAssistTokenExpired
+		}
+		return liveProbeOutcomeCodeAssistHTTPError
+	})
+	helperOwedDebt(t, antigravityUsageFreshness{})
+
+	logged := captureStdout(t, func() { antigravityPayRunDebtPass(1, true) })
+	raw, err := os.ReadFile(antigravityFreshnessPath())
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("state is not a JSON object: %v", err)
+	}
+	var renewedAt int64
+	if err := json.Unmarshal(decoded["loginRenewedAtMs"], &renewedAt); err != nil || renewedAt <= 0 {
+		t.Errorf("loginRenewedAtMs=%s, want one epoch-millisecond int", decoded["loginRenewedAtMs"])
+	}
+
+	// Close-out on a terminal outcome, so its line is in the log too.
+	helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistNoLogin })
+	logged += captureStdout(t, func() { antigravityPayRunDebtPass(1, true) })
+
+	renewal := regexp.MustCompile(`^\[antigravity-freshness\] Stored login renewal finished \((renewed|still_expired|spaced|unavailable)\)$`)
+	closed := regexp.MustCompile(`^\[antigravity-freshness\] Run refresh closed \(route=(settle|nudge|adopted) outcome=[a-z_]+ runToReadSec=-?\d+ attempts=\d+ renewals=\d+\)$`)
+	var sawRenewal, sawClosed bool
+	for _, line := range strings.Split(helperANSI.ReplaceAllString(logged, ""), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.Contains(line, "Stored login renewal"):
+			sawRenewal = true
+			if !renewal.MatchString(line) {
+				t.Errorf("renewal line is not closed-set: %q", line)
+			}
+		case strings.Contains(line, "Run refresh closed"):
+			sawClosed = true
+			if !closed.MatchString(line) {
+				t.Errorf("close-out line is not closed-set and integers: %q", line)
+			}
+		}
+	}
+	if !sawRenewal || !sawClosed {
+		t.Fatalf("renewal=%v closeOut=%v, want both lines logged: %q", sawRenewal, sawClosed, logged)
+	}
+	for _, forbidden := range []string{"54452", "access-renew-secret", "never-read", "@", "/opt/agy", `\`} {
+		if strings.Contains(logged, forbidden) {
+			t.Errorf("the agent log leaked %q:\n%s", forbidden, logged)
+		}
+	}
+}
