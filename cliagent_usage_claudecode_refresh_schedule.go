@@ -221,7 +221,7 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 	if IsShutdownInProgress() || !claudeUsageProbe.armedForProbe() {
 		return false
 	}
-	wait := claudeUsageProbe.authWaitStamp()
+	var wait claudeCredStamp
 	pendingClear, _ := claudeUsageProbe.pendingAuthClear()
 	owedMs := owed.UnixMilli()
 	var next time.Time
@@ -262,6 +262,12 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 			next = deadline
 		}
 		snap.NextAttemptAtMs = next.UnixMilli()
+		// Sampled under the cache lock, not before it: a concurrent 2xx that
+		// cleared the wait in memory before this write found nothing on disk to
+		// clear, so persisting the earlier sample would resurrect a wait on a
+		// credential just proven valid. One that clears after this write finds
+		// the stamp on disk and clears it (or queues the clear).
+		wait = claudeUsageProbe.authWaitStamp()
 		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = wait.modNs, wait.size
 		attempts = snap.RefreshOwedAttempts
 		return true

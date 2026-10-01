@@ -1707,8 +1707,7 @@ func (g *claudeUsageProbeGate) finish(result claudeProbeResult, refreshed bool, 
 		}
 	}
 	if result.credProven {
-		g.authWait, g.authWaitNudged, g.authWaitRestored = claudeCredStamp{}, claudeCredStamp{}, claudeCredStamp{}
-		g.authWaitSeq++
+		g.dropAuthWaitLocked()
 	}
 	// Release every joiner AFTER the outcome is recorded, so a waiter that wakes
 	// and re-samples refreshes cannot observe the pre-probe count.
@@ -1717,6 +1716,18 @@ func (g *claudeUsageProbeGate) finish(result claudeProbeResult, refreshed bool, 
 		g.doneCh = nil
 	}
 	g.mu.Unlock()
+}
+
+// dropAuthWait forgets the credential wait: a 2xx proved the credential.
+func (g *claudeUsageProbeGate) dropAuthWait() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.dropAuthWaitLocked()
+}
+
+func (g *claudeUsageProbeGate) dropAuthWaitLocked() {
+	g.authWait, g.authWaitNudged, g.authWaitRestored = claudeCredStamp{}, claudeCredStamp{}, claudeCredStamp{}
+	g.authWaitSeq++
 }
 
 // armedForProbe reports whether a probe could run at all in this process.
@@ -2151,6 +2162,11 @@ func probeClaudeUsageResult(
 		return result, false, time.Time{}
 	}
 	result.credProven = true
+	// Drop the in-memory wait BEFORE any durable clear below. A retry booking
+	// from an earlier 401 re-samples the wait under the cache lock; dropped
+	// first, a booking that writes after the durable clear writes no wait, and
+	// one that writes before it is overwritten by that clear.
+	claudeUsageProbe.dropAuthWait()
 	// A 2xx proves this credential even when its body yields no reading. The
 	// merge below clears the persisted wait for it on success; every other exit
 	// from here (unreadable, oversized, malformed, windowless, or unpersisted)

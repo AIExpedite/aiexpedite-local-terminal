@@ -4299,3 +4299,49 @@ func TestSettleClaudeRunDebtAt_ClearsOnlyTheProvenCredentialWait(t *testing.T) {
 		t.Errorf("snap=%+v, want the debt and the proven credential's wait cleared", snap)
 	}
 }
+
+// A retry booking that is waiting for the cache lock when a concurrent 2xx
+// drops the in-memory wait writes no wait: it samples the wait under the lock,
+// so it cannot resurrect a stale 401 wait on a credential just proven valid
+// (whose durable clear found nothing on disk to clear).
+func TestClaudeBookRunDebtRung_SamplesTheAuthWaitUnderTheCacheLock(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	b := claudeCredStamp{modNs: 200, size: 1}
+	claudeUsageProbe.noteAuthWait(b)
+
+	locked, release := make(chan struct{}), make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		mutateClaudeRateLimitSnapshot(cache, fp, func(*claudeRateLimitSnapshot) bool {
+			close(locked)
+			<-release
+			return false
+		})
+	}()
+	<-locked
+	booked := make(chan bool, 1)
+	go func() { booked <- claudeBookRunDebtRung(fp, owed, now, claudeRungFree, 0) }()
+	// Let the booking reach the lock, then prove the credential while it waits.
+	time.Sleep(50 * time.Millisecond)
+	claudeUsageProbe.dropAuthWait()
+	close(release)
+	<-holderDone
+	if !<-booked {
+		t.Fatal("precondition: the rung was not booked")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.NextAttemptAtMs == 0 {
+		t.Fatal("precondition: no rung persisted")
+	}
+	if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		t.Fatalf("persisted wait=(%d,%d), want none after the credential was proven", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0", n)
+	}
+}
