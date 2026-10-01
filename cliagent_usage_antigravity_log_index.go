@@ -1352,22 +1352,16 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 	if entry.exitSeenAt.After(floor) {
 		floor = entry.exitSeenAt
 	}
-	proven, awaitingProof := antigravityExitProvenLocked(entry, now)
 	switch {
-	case proven:
+	case antigravityExitProvenLocked(entry, now):
 		// Every process of the run is provably gone: owed now, not a settle
 		// window later, and nudged without the nudge's own settle guard.
 		antigravityOweFloorLocked(floor, true)
 	case now.Sub(entry.exitSeenAt) >= antigravityCandidateSettle:
-	// An idle log alone does not owe a run gone at first sight: the next
-	// observation (at most one exit-watch poll away) proves it, and owing it
-	// unproven here would put it behind the nudge's minute guard.
-	case !awaitingProof && now.Sub(entry.mtime) >= antigravityCandidateSettle:
+		// A log that kept changing after its run was gone: the old bound.
+		antigravityOweLocked(floor)
 	default:
 		return
-	}
-	if !proven {
-		antigravityOweLocked(floor)
 	}
 	antigravityReleaseEntryFloorLocked(entry, res)
 	entry.class = antigravityLogSettled
@@ -1382,13 +1376,14 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 //     smoke that started and ended between passes), and the log's size and
 //     mtime have stayed unchanged across two observations at least
 //     antigravityExitStableFor apart — so a run still writing its startup
-//     lines, or a same-second append to the shared file, is not owed early.
+//     lines, or a same-second append to the shared file, is not owed early. A
+//     log last written a whole settle window ago (a run that ended while the
+//     agent was down) needs no second look.
 //
-// pidOverflow is never proof. awaitingProof says the second rule applies and
-// has not been met yet.
-func antigravityExitProvenLocked(entry *antigravityLogEntry, now time.Time) (proven, awaitingProof bool) {
+// pidOverflow is never proof.
+func antigravityExitProvenLocked(entry *antigravityLogEntry, now time.Time) bool {
 	if entry.pidOverflow || len(entry.pids) == 0 {
-		return false, false
+		return false
 	}
 	goneAtFirstSight := false
 	for _, p := range entry.pids {
@@ -1396,18 +1391,15 @@ func antigravityExitProvenLocked(entry *antigravityLogEntry, now time.Time) (pro
 			goneAtFirstSight = true
 		}
 	}
-	if !goneAtFirstSight {
-		return true, false
+	if !goneAtFirstSight || now.Sub(entry.mtime) >= antigravityCandidateSettle {
+		return true
 	}
 	stat := antigravityLogStat{size: entry.size, mtime: entry.mtime}
 	if entry.stableAt.IsZero() || entry.stableStat != stat || now.Before(entry.stableAt) {
 		entry.stableStat, entry.stableAt = stat, now
-		return false, true
+		return false
 	}
-	if now.Sub(entry.stableAt) < antigravityExitStableFor {
-		return false, true
-	}
-	return true, false
+	return now.Sub(entry.stableAt) >= antigravityExitStableFor
 }
 
 // antigravityOweLocked records an owe-ready floor nothing proved.

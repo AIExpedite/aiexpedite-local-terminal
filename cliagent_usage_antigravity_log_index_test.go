@@ -292,21 +292,66 @@ func TestAntigravityCandidate_OwedOnlyAfterExit(t *testing.T) {
 	}
 }
 
-// A candidate whose log is still being written when the exit is seen waits the
-// settle window after that exit.
-func TestAntigravityCandidate_SettlesAfterExitSeen(t *testing.T) {
+// A candidate seen live (its start token recorded) whose process is then gone
+// has a PROVEN exit: it is owed on that same pass, floored at the exit-seen
+// instant, however recently its log was written — no settle window.
+func TestAntigravityCandidate_ProvenExitIsOwedOnTheSamePass(t *testing.T) {
 	h := helperIsolateLogIndex(t)
 	now := time.Now().Add(-time.Hour)
 	h.setLive(5101, true)
 	h.write(t, helperLogName(now), helperPIDBlock(5101), now, false)
 	h.pass(now.Add(5*time.Second), 0)
 	h.setLive(5101, false)
-	if res := h.pass(now.Add(10*time.Second), 0); !res.owed.IsZero() {
-		t.Fatalf("owed=%s inside the settle window", res.owed)
+	res := h.pass(now.Add(10*time.Second), 0)
+	if !res.owed.Equal(now.Add(10*time.Second)) || !res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor, proven", res.owed, res.owedProven)
 	}
-	res := h.pass(now.Add(10*time.Second+antigravityCandidateSettle), 0)
-	if !res.owed.Equal(now.Add(10 * time.Second)) {
-		t.Errorf("owed=%s, want the exit-seen floor", res.owed)
+}
+
+// A run whose every PID was already gone at first sight (a short smoke that
+// started and ended between passes) is proven only once its log has stayed
+// unchanged for antigravityExitStableFor; an append inside that window — a
+// same-second run sharing the file — restarts the check.
+func TestAntigravityCandidate_GoneAtFirstSightNeedsAStableLog(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	name := helperLogName(now)
+	h.write(t, name, helperPIDBlock(5151), now, false)
+
+	if res := h.pass(now.Add(time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s at first sight, want the stability check first", res.owed)
+	}
+	// Changed inside the window (same mtime second, larger file).
+	h.write(t, name, "I0929 20:43:57.000000 1 server.go:1] still writing\n", now, true)
+	if res := h.pass(now.Add(5*time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s after an append inside the window", res.owed)
+	}
+	if res := h.pass(now.Add(9*time.Second), 0); !res.owed.IsZero() {
+		t.Fatalf("owed=%s only 4 s after the append", res.owed)
+	}
+	res := h.pass(now.Add(10*time.Second), 0)
+	if !res.owed.Equal(now.Add(time.Second)) || !res.owedProven {
+		t.Errorf("owed=%s proven=%v, want the exit-seen floor once stable for 5 s, proven", res.owed, res.owedProven)
+	}
+}
+
+// Unreadable PIDs and an overflowing PID set are never proof of an exit.
+func TestAntigravityCandidate_UnknownOrOverflowIsNeverProven(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	now := time.Now().Add(-time.Hour)
+	h.mu.Lock()
+	h.unknown[5161] = true
+	h.mu.Unlock()
+	h.write(t, helperLogName(now), helperPIDBlock(5161), now, false)
+	body := ""
+	for pid := 5171; pid <= 5175; pid++ {
+		body += helperPIDBlock(pid)
+	}
+	h.write(t, helperLogName(now.Add(time.Second)), body, now, false)
+	for _, at := range []time.Duration{time.Second, 10 * time.Second, 2 * time.Minute} {
+		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
+			t.Fatalf("at +%s owed=%s proven=%v, want neither run owed", at, res.owed, res.owedProven)
+		}
 	}
 }
 

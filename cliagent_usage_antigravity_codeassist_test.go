@@ -270,18 +270,19 @@ func TestAntigravityPinnedURL_OverrideMustBeLoopback(t *testing.T) {
 
 // TestProbeAntigravityQuotaLiveUnlessGated_GatedBuildReadsFromGoogle: the
 // click's Antigravity outcome on a gated build is the Code Assist route's, and
-// an expired stored token gets one `agy` warm-up (which refreshes the keyring)
-// before the single retry.
+// an expired stored token gets one login renewal (`agy models`, which refreshes
+// the keyring) before the single retry.
 func TestProbeAntigravityQuotaLiveUnlessGated_GatedBuildReadsFromGoogle(t *testing.T) {
 	helperIsolateAntigravityGate(t)
 	stubLiveProbes(t)
 	noteAntigravityQuotaGate("1.2.3", time.Now())
 	var spawned, warmed, reads int32
 	probeAntigravityQuotaLiveFn = func(context.Context, string, string) string { atomic.AddInt32(&spawned, 1); return liveProbeOutcomeOK }
-	warmCLIAgentModelDiscoveryFn = func(_ context.Context, id string, _ detectedCLIAgent, _ string) {
-		if id == "antigravity" {
-			atomic.AddInt32(&warmed, 1)
-		}
+	origRenew := renewAntigravityStoredLoginFn
+	t.Cleanup(func() { renewAntigravityStoredLoginFn = origRenew })
+	renewAntigravityStoredLoginFn = func(context.Context, time.Time) string {
+		atomic.AddInt32(&warmed, 1)
+		return antigravityLoginRenewed
 	}
 	probeAntigravityQuotaCodeAssistFn = func(context.Context, string, func() time.Time) string {
 		if atomic.AddInt32(&reads, 1) == 1 {
@@ -297,7 +298,7 @@ func TestProbeAntigravityQuotaLiveUnlessGated_GatedBuildReadsFromGoogle(t *testi
 		t.Error("a gated build spawned the loopback probe")
 	}
 	if warmed != 1 || reads != 2 {
-		t.Errorf("warm=%d reads=%d, want one agy warm-up between the expired read and its retry", warmed, reads)
+		t.Errorf("renewals=%d reads=%d, want one login renewal between the expired read and its retry", warmed, reads)
 	}
 }
 
