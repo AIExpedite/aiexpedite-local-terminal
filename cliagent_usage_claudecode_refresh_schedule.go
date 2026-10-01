@@ -496,19 +496,28 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 
 // notePendingAuthClear records a proven credential whose persisted wait could
 // not be cleared, and reports whether the caller should start the retry loop
-// (false when one is already running).
-func (g *claudeUsageProbeGate) notePendingAuthClear(fingerprint string, stamp claudeCredStamp) bool {
+// (false when one is already running) along with that loop's generation.
+func (g *claudeUsageProbeGate) notePendingAuthClear(fingerprint string, stamp claudeCredStamp) (uint64, bool) {
 	if stamp.isZero() {
-		return false
+		return 0, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.authClearPending, g.authClearFingerprint = stamp, fingerprint
 	if g.authClearRetrying {
-		return false
+		return 0, false
 	}
 	g.authClearRetrying = true
-	return true
+	g.authClearGen++
+	return g.authClearGen, true
+}
+
+// authClearRetryCurrent reports whether the retry loop of generation `gen` is
+// still the live one.
+func (g *claudeUsageProbeGate) authClearRetryCurrent(gen uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.authClearRetrying && g.authClearGen == gen
 }
 
 // pendingAuthClear returns the proven credential whose durable clear is still
@@ -529,11 +538,14 @@ func (g *claudeUsageProbeGate) settlePendingAuthClear(stamp claudeCredStamp) {
 	}
 }
 
-// endPendingAuthClearRetry marks the background retry loop as finished.
-func (g *claudeUsageProbeGate) endPendingAuthClearRetry() {
+// endPendingAuthClearRetry marks the background retry loop of generation
+// `gen` as finished; a loop a reset already replaced changes nothing.
+func (g *claudeUsageProbeGate) endPendingAuthClearRetry(gen uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.authClearRetrying = false
+	if g.authClearGen == gen {
+		g.authClearRetrying = false
+	}
 }
 
 // authWaitReadSeq is taken BEFORE reading the persisted wait and handed to

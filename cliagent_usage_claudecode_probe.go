@@ -397,10 +397,12 @@ type claudeUsageProbeGate struct {
 	// not be cleared (the cache was busy). Until a retry clears it
 	// (claudeRetryPendingAuthClear), a read finding that stamp on disk treats it
 	// as already cleared. authClearFingerprint is the account it was proved
-	// under; authClearRetrying marks the one background retry loop.
+	// under; authClearRetrying marks the one background retry loop, and
+	// authClearGen is its generation, so a loop a gate reset abandoned exits.
 	authClearPending     claudeCredStamp
 	authClearFingerprint string
 	authClearRetrying    bool
+	authClearGen         uint64
 	// owedBaseline is the newest run completion for which we still owe an
 	// observation. The persisted debt and its retry rung
 	// (cliagent_usage_claudecode_refresh_schedule.go) pay it; the throttle may
@@ -672,6 +674,8 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.authWaitSeq = 0
 	claudeUsageProbe.authClearPending = claudeCredStamp{}
 	claudeUsageProbe.authClearFingerprint = ""
+	claudeUsageProbe.authClearRetrying = false
+	claudeUsageProbe.authClearGen++
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""

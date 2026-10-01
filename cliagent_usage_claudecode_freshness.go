@@ -1077,14 +1077,16 @@ var claudePendingAuthClearRetryDelays = []time.Duration{time.Second, 5 * time.Se
 // claudeQueuePendingAuthClear remembers a durable clear the cache refused and
 // starts the one background loop that retries it.
 func claudeQueuePendingAuthClear(fingerprint string, probed claudeCredStamp) {
-	if !claudeUsageProbe.notePendingAuthClear(fingerprint, probed) {
+	gen, start := claudeUsageProbe.notePendingAuthClear(fingerprint, probed)
+	if !start {
 		return
 	}
+	delays := claudePendingAuthClearRetryDelays
 	go func() {
-		defer claudeUsageProbe.endPendingAuthClearRetry()
-		for _, delay := range claudePendingAuthClearRetryDelays {
+		defer claudeUsageProbe.endPendingAuthClearRetry(gen)
+		for _, delay := range delays {
 			time.Sleep(delay)
-			if IsShutdownInProgress() || claudeRetryPendingAuthClear() {
+			if IsShutdownInProgress() || !claudeUsageProbe.authClearRetryCurrent(gen) || claudeRetryPendingAuthClear() {
 				return
 			}
 		}
