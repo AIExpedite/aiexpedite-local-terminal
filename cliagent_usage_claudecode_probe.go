@@ -2868,7 +2868,19 @@ type claudeChargedAttempt struct {
 // anything. Keyed to the instant the caller is paying and never re-scoping the
 // cache (mutateClaudeRefreshDebt), and refunded when nothing went out.
 //
-// A refused charge stops the attempt ONLY when the matching durable debt is
+// The charge is a CLAIM on the rung — the same compare-and-swap and in-flight
+// lease the startup replay and the gather seed make (claimClaudeRefreshRungAt),
+// judged on the locked read itself since this path made no earlier one. An old
+// process's trailing probe that wakes while a replacement process is paying the
+// same persisted debt would otherwise charge and send for the rung the
+// replacement already claimed: two budget slots at one ladder instant. So a
+// rung or lease still pending for this debt (claudeRefreshRungPending) refuses
+// the charge and sends nothing; the gate defers to it and this process's timer
+// is armed for it, as the replay does when it loses its claim, so the debt is
+// looked at again should the holder exit before booking. A rung already due is
+// claimed, which makes the other process's timer lose its claim instead.
+//
+// A refused charge also stops the attempt when the matching durable debt is
 // spent — at the attempt cap or past the age-out (claudeRefreshDebtRetired),
 // typically because another agent process paid its rungs while this one slept.
 // Sending then would be a request past the cross-process cap. Any other refusal
@@ -2879,6 +2891,9 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 	path := claudeRateLimitCachePath()
 	var identity claudeUsageProbeIdentity
 	resolved, charged, spent := false, false, false
+	// A rung or lease another payer holds on this debt, found under the charge's
+	// lock; zero when none binds.
+	var heldRung time.Time
 	// The counter as the charge left it, for the log line — read under the
 	// charge's own lock rather than by a second cache read.
 	attempts := 0
@@ -2886,9 +2901,20 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 		identity = claudeUsageProbeStoredIdentity()
 		resolved = true
 		if identity.token != "" {
-			charge := adjustClaudeRefreshAttemptsAt(baseline, +1)
+			now := time.Now()
+			lease := now.Add(claudeUsageProbeWholeTimeout + claudeUsageProbeTrailingSlack).UnixMilli()
 			charged = mutateClaudeRefreshDebt(path, identity.fingerprint, func(snap *claudeRateLimitSnapshot) bool {
-				if !charge(snap) {
+				if snap.RefreshOwedAtMs == baseline.UnixMilli() && snap.NextAttemptAtMs != 0 {
+					if next := time.UnixMilli(snap.NextAttemptAtMs); claudeRefreshRungPending(next, now) {
+						heldRung = next
+						attempts = snap.RefreshOwedAttempts
+						return false
+					}
+				}
+				// Judged on this locked read, so the compare cannot lose; what the
+				// claim adds over a bare charge is the lease it writes.
+				lost := false
+				if !claimClaudeRefreshRungAt(baseline, snap.RefreshOwedAttempts, snap.NextAttemptAtMs, lease, &lost)(snap) {
 					spent = snap.RefreshOwedAtMs == baseline.UnixMilli() &&
 						claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, time.Now())
 					attempts = snap.RefreshOwedAttempts
@@ -2897,7 +2923,7 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 				attempts = snap.RefreshOwedAttempts
 				return true
 			})
-			if spent {
+			if spent || !heldRung.IsZero() {
 				// Withhold the token, so the admitted attempt asks nothing and
 				// refunds its throttle slot like any tokenless one.
 				return claudeUsageProbeIdentity{}
@@ -2906,11 +2932,17 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 		return identity
 	}
 	result := claudeUsageProbeAttemptIssuedAs(baseline, resolve)
-	if spent {
+	switch {
+	case spent:
 		// The ladder or the replay retires the durable record; the gate's copy
 		// goes now, or a routine gather keeps paying a spent budget uncharged.
 		claudeUsageProbe.retireOwed(baseline)
 		result.done, result.kept, result.outcome = true, claudeRetryNone, claudeRefreshOutcomeRetired
+	case !heldRung.IsZero():
+		// Another payer's rung, which books whatever it keeps.
+		claudeUsageProbe.deferOwedUntil(baseline, heldRung)
+		claudeArmRunDebtRetry(time.Until(heldRung))
+		result.done, result.kept, result.outcome = true, claudeRetryNone, claudeRefreshOutcomeRefused
 	}
 	if charged && !result.issued &&
 		mutateClaudeRefreshDebt(path, identity.fingerprint, adjustClaudeRefreshAttemptsAt(baseline, -1)) {

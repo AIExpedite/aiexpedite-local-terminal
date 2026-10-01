@@ -1890,6 +1890,70 @@ func TestClaudeUsageProbeAfterRun_ChargesAndSendsBelowTheCap(t *testing.T) {
 	}
 }
 
+// A replacement process claimed the persisted rung (its lease is still ahead)
+// when this process's old trailing probe wakes. The trailing charge is a claim
+// too, so it must send nothing and charge nothing — not spend a second budget
+// slot at the same ladder instant — and leave the lease for its holder.
+func TestClaudeUsageProbeAfterRun_SendsNothingForARungAnotherPayerClaimed(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	owed := time.Now().Add(-time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, 1, time.Time{})
+	lease := time.Now().Add(time.Minute).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = lease
+		return true
+	}) {
+		t.Fatal("seeding the claim lease did not write the cache")
+	}
+
+	claudeUsageProbeAfterRun(owed)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the rung belongs to the process that claimed it", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != lease || snap.RefreshOwedAtMs != owed.UnixMilli() {
+		t.Fatalf("the debt must be left exactly as the holder claimed it, got %+v", snap)
+	}
+	if !claudeUsageProbe.owedRungPending(owed, time.Now()) {
+		t.Fatal("the gate must defer its routine payers to the claimed rung")
+	}
+}
+
+// A rung already due is CLAIMED by the trailing charge — it writes the lease in
+// the same write as the charge — so another process's timer for that rung
+// loses its own claim instead of sending a second request.
+func TestClaudeUsageProbeChargedAttempt_ClaimsADueRung(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	owed := time.Now().Add(-5 * time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, 1, time.Time{})
+	due := time.Now().Add(-time.Second).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = due
+		return true
+	}) {
+		t.Fatal("seeding the due rung did not write the cache")
+	}
+
+	// Called directly, so no rung is booked over the lease afterwards.
+	if result := claudeUsageProbeChargedAttempt(owed); !result.issued {
+		t.Fatalf("the due rung's attempt was not issued: %+v", result)
+	}
+
+	if leaseMs := claudeCacheSnapshot(t, cache).NextAttemptAtMs; leaseMs <= time.Now().UnixMilli() {
+		t.Fatalf("NextAttemptAtMs during the attempt=%d, want an in-flight lease ahead of now", leaseMs)
+	}
+	lost := false
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRefreshRungAt(owed, 1, due, time.Now().Add(time.Minute).UnixMilli(), &lost)) || !lost {
+		t.Fatalf("a second payer that judged the same due rung must lose its claim (lost=%v)", lost)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 2 {
+		t.Fatalf("attempts=%d, want 2 — only the trailing probe's charge", got)
+	}
+}
+
 // A rejected endpoint override sends nothing, so the attempt must report
 // itself as NOT issued — otherwise the startup replay keeps its durable charge
 // and two such starts retire a debt no request was ever made for.

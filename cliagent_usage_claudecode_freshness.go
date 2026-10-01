@@ -490,10 +490,11 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	}
 }
 
-// claimClaudeRefreshRungAt is the replay's charge — and the gather seed's — made
-// a CLAIM on the rung the caller judged due: it charges one attempt ONLY while
-// the debt instant, the attempt counter AND NextAttemptAtMs are all still what
-// the unlocked read saw, and in the same write moves NextAttemptAtMs to
+// claimClaudeRefreshRungAt is the charge the replay, the gather seed and the
+// trailing probe make, made a CLAIM on the rung the caller judged due: it
+// charges one attempt ONLY while the debt instant, the attempt counter AND
+// NextAttemptAtMs are all still what the caller's read saw (the trailing probe
+// judges on the locked read itself), and in the same write moves NextAttemptAtMs to
 // `leaseUntilMs` — an in-flight lease the attempt's own booking overwrites once
 // it knows the outcome, or that simply expires after a gather's attempt.
 //
