@@ -826,3 +826,82 @@ func TestGrokRunDebt_SmokeDuringAnAuthRefusalStillReads(t *testing.T) {
 		t.Fatalf("reads = %d, want the smoke's bypass pass to read after the refusal", h.reads.Load())
 	}
 }
+
+func TestGrokRunDebt_IsolatedRunIsBoundToItsCopiedLogin(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	orig := grokUsageHomeFingerprint
+	t.Cleanup(func() { grokUsageHomeFingerprint = orig })
+	// The isolated home was copied from ada's login; the persistent home is
+	// switched to bob before the arm runs.
+	grokUsageHomeFingerprint = func(home string) string {
+		if home == "isolated-home" {
+			return "fp-ada"
+		}
+		return ""
+	}
+	h.signIn("fp-bob")
+	floor := armGrokUsageRunFloorFor(h.clock(), "isolated-home")
+	h.idle()
+	if state := h.state(); state.RunFloorAccount != "fp-ada" {
+		t.Fatalf("RunFloorAccount = %q, want the copied login's account", state.RunFloorAccount)
+	}
+	h.advance(time.Second)
+	if grokUsageRunSettled(floor) {
+		t.Fatal("ada's isolated run opened a debt against bob's login")
+	}
+	h.idle()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, an isolated run must never refresh another account", h.reads.Load())
+	}
+}
+
+func TestGrokRunDebt_RestartNeverAdoptsAFloorArmedUnderAnotherAccount(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	// The old process died mid-run under ada; bob signed in before restart.
+	h.write(grokUsageFreshness{RunFloorMs: h.clock().Add(-30 * time.Second).UnixMilli(), RunFloorAccount: "fp-ada"})
+	h.signIn("fp-bob")
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, ada's interrupted run must never be paid against bob", h.reads.Load())
+	}
+	if state := h.state(); state.owed() || state.RunFloorMs != 0 || state.RunFloorAccount != "" {
+		t.Fatalf("state = %+v, want the foreign floor dropped", state)
+	}
+}
+
+func TestGrokRunDebt_RetiringAnOldDebtKeepsALiveRunsFloor(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	h.runAndSettle(time.Second) // ada owes a read, booked on a rung
+	if !h.state().owed() {
+		t.Fatalf("state = %+v, want ada's debt owed", h.state())
+	}
+	// Bob signs in and starts a run that is still live when ada's rung fires.
+	h.signIn("fp-bob")
+	h.advance(time.Minute)
+	bobFloor := armGrokUsageRunFloor(h.clock())
+	h.idle()
+	h.pass() // account_changed: ada's debt is retired
+	state := h.state()
+	if state.owed() {
+		t.Fatalf("state = %+v, want ada's debt retired", state)
+	}
+	if state.RunFloorMs != bobFloor.UnixMilli() || state.RunFloorAccount != "fp-bob" {
+		t.Fatalf("state = %+v, want bob's live floor kept as the restart marker", state)
+	}
+
+	// The process dies before bob's run settles: the restart owes it a read.
+	grokLiveRunsMu.Lock()
+	grokLiveRuns = map[int64]int{}
+	grokLiveRunAccounts = map[int64]string{}
+	grokLiveRunsMu.Unlock()
+	h.outcome.Store(grokLiveOutcomeOK)
+	reads := h.reads.Load()
+	h.advance(time.Second)
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != reads+1 {
+		t.Fatalf("reads = %d, want bob's interrupted run paid once after restart", h.reads.Load()-reads)
+	}
+}

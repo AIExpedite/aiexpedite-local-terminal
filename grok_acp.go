@@ -543,7 +543,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 
 	// Armed before the spawn: every turn of this session spends credits, and
 	// an ACP child logs no number of its own.
-	usageFloor := armGrokUsageRunFloor(time.Now())
+	usageFloor := armGrokUsageRunFloorFor(time.Now(), isolatedHome)
 	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)

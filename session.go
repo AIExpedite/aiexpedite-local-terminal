@@ -822,7 +822,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// (`grok login`, `grok models`) spend nothing.
 	var grokUsageFloor time.Time
 	if isGrokCommand(command) && (isolatedGrokHome != "" || isManagedGrokPromptArgv(cliArgs)) {
-		grokUsageFloor = armGrokUsageRunFloor(time.Now())
+		grokUsageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedGrokHome)
 	}
 
 	// Start the process. It is owned (its own process group on Unix, a

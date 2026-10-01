@@ -166,7 +166,7 @@ func TestGrokRunDebtStateAndLogsCarryOnlyMetrics(t *testing.T) {
 	allowed := map[string]bool{
 		"schemaVersion": true, "runFloorMs": true, "completionMs": true, "owedAtMs": true,
 		"nextAttemptAtMs": true, "lastAttemptAtMs": true, "attempts": true,
-		"accountFingerprint": true, "lastOutcome": true,
+		"accountFingerprint": true, "runFloorAccount": true, "lastOutcome": true,
 	}
 	for key := range fields {
 		if !allowed[key] {

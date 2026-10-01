@@ -67,7 +67,7 @@ func TestPayOwedGrokUsageRefresh_InterruptedRunIsOwedOneRead(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	// A floor armed by the old process, never settled: the update replaced
 	// the process mid-run.
-	h.write(grokUsageFreshness{RunFloorMs: h.clock().Add(-30 * time.Second).UnixMilli()})
+	h.write(grokUsageFreshness{RunFloorMs: h.clock().Add(-30 * time.Second).UnixMilli(), RunFloorAccount: "fp-ada"})
 	payOwedGrokUsageRefresh()
 	h.idle()
 	if h.reads.Load() != 1 {

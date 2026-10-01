@@ -335,7 +335,7 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 	spawned, reachedInference := false, false
 	// Armed before the first rung spawns: every rung that reaches inference
 	// spends credits, and none of them logs a number of its own.
-	usageFloor := armGrokUsageRunFloor(time.Now())
+	usageFloor := armGrokUsageRunFloorFor(time.Now(), isolatedHome)
 	// The billing merge runs after the LAST child exits, whatever the verdict:
 	// a rung that reached inference fetched credits into the isolated log even
 	// when the model then answered the wrong text, and that observation is

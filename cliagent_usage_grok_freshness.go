@@ -96,6 +96,9 @@ var (
 	grokUsageRefreshGrokPath = grokLoginKeeperBinary
 	// grokUsageCurrentFingerprint is the account signed in now.
 	grokUsageCurrentFingerprint = func() string { return grokAccountFingerprintFor(grokPersistentHome()) }
+	// grokUsageHomeFingerprint is the account an explicit Grok home (a run's
+	// isolated copy of the login) is signed in as.
+	grokUsageHomeFingerprint = grokAccountFingerprintFor
 )
 
 // grokUsageFreshness is the persisted state. Every field is a number, the
@@ -106,6 +109,9 @@ type grokUsageFreshness struct {
 	// debt's floor. A restart that finds it with no debt beside it owes the
 	// interrupted run one read.
 	RunFloorMs int64 `json:"runFloorMs,omitempty"`
+	// RunFloorAccount is the account RunFloorMs's run was spawned under, so a
+	// restart never adopts that run's debt against a different login.
+	RunFloorAccount string `json:"runFloorAccount,omitempty"`
 	// CompletionMs is the instant a reading must be taken at or after to pay
 	// the debt, and OwedAtMs when the debt was created (0 = nothing owed).
 	CompletionMs int64 `json:"completionMs,omitempty"`
@@ -124,6 +130,14 @@ type grokUsageFreshness struct {
 }
 
 func (state grokUsageFreshness) owed() bool { return state.OwedAtMs != 0 }
+
+// setRunFloor moves the restart marker, always together with its account.
+func (state *grokUsageFreshness) setRunFloor(floorMs int64, fingerprint string) {
+	state.RunFloorMs, state.RunFloorAccount = floorMs, fingerprint
+	if floorMs == 0 {
+		state.RunFloorAccount = ""
+	}
+}
 
 func (state *grokUsageFreshness) clearDebt() {
 	state.CompletionMs, state.OwedAtMs, state.NextAttemptAtMs = 0, 0, 0
@@ -262,19 +276,31 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 /* ──────────────────────────────── arm ──────────────────────────────── */
 
 // armGrokUsageRunFloor records that a run which can spend credits is starting
-// and returns its floor; zero when the refresh is disabled.
+// against the persistent login and returns its floor; zero when the refresh
+// is disabled.
+func armGrokUsageRunFloor(now time.Time) time.Time {
+	return armGrokUsageRunFloorFor(now, "")
+}
+
+// armGrokUsageRunFloorFor is armGrokUsageRunFloor for a run whose child bills
+// the login copied into credentialHome (an isolated smoke / ACP / PTY home):
+// the floor is bound to THAT account, not to whatever the persistent home is
+// signed in as when the arm runs. An empty home means the persistent login.
 //
 // The floor is registered as live on the caller's goroutine, but persisted off
 // it, as armAntigravityUsageRunFloor does: the ACP manager arms while holding
 // its own mutex across the spawn, and a slow disk must not stall that. A
 // persist that lands after the run already settled is skipped, so it can
 // never leave a stale floor for the next start to adopt.
-func armGrokUsageRunFloor(now time.Time) time.Time {
+func armGrokUsageRunFloorFor(now time.Time, credentialHome string) time.Time {
 	if !grokUsageRefreshEnabled.Load() {
 		return time.Time{}
 	}
 	floorMs := now.UnixMilli()
 	fingerprint := grokUsageCurrentFingerprint()
+	if credentialHome != "" {
+		fingerprint = grokUsageHomeFingerprint(credentialHome)
+	}
 	grokLiveRunsMu.Lock()
 	grokLiveRuns[floorMs]++
 	if _, ok := grokLiveRunAccounts[floorMs]; !ok {
@@ -290,7 +316,7 @@ func armGrokUsageRunFloor(now time.Time) time.Time {
 			}
 			grokRebaseFutureFreshness(state, now)
 			if floorMs > state.RunFloorMs {
-				state.RunFloorMs = floorMs
+				state.setRunFloor(floorMs, fingerprint)
 			}
 		})
 	}()
@@ -315,27 +341,33 @@ func grokRunIsLive(floorMs int64) bool {
 	return grokLiveRuns[floorMs] > 0
 }
 
-// grokOldestLiveFloor is the floor of the earliest run still armed (0 when
-// none). Lock order: freshness -> live runs; never the reverse.
-func grokOldestLiveFloor() int64 {
+// grokLiveFloor is an armed floor and the account it was spawned under.
+type grokLiveFloor struct {
+	floorMs     int64
+	fingerprint string
+}
+
+// grokOldestLiveFloor is the earliest run still armed (zero when none).
+// Lock order: freshness -> live runs; never the reverse.
+func grokOldestLiveFloor() grokLiveFloor {
 	grokLiveRunsMu.Lock()
 	defer grokLiveRunsMu.Unlock()
 	return grokOldestLiveFloorLocked()
 }
 
-func grokOldestLiveFloorLocked() int64 {
+func grokOldestLiveFloorLocked() grokLiveFloor {
 	oldest := int64(0)
 	for f := range grokLiveRuns {
 		if oldest == 0 || f < oldest {
 			oldest = f
 		}
 	}
-	return oldest
+	return grokLiveFloor{floorMs: oldest, fingerprint: grokLiveRunAccounts[oldest]}
 }
 
 // grokReleaseLiveRun forgets an armed floor and returns the oldest one still
-// live (0 when none).
-func grokReleaseLiveRun(floorMs int64) int64 {
+// live (zero when none).
+func grokReleaseLiveRun(floorMs int64) grokLiveFloor {
 	grokLiveRunsMu.Lock()
 	defer grokLiveRunsMu.Unlock()
 	if n := grokLiveRuns[floorMs]; n > 1 {
@@ -349,11 +381,11 @@ func grokReleaseLiveRun(floorMs int64) int64 {
 
 // grokDropSettledFloor rolls the restart marker back once its run is
 // accounted for — to the oldest run still live, or the debt's own floor.
-func grokDropSettledFloor(state *grokUsageFreshness, floorMs, oldestLive int64) {
+func grokDropSettledFloor(state *grokUsageFreshness, floorMs int64, oldestLive grokLiveFloor) {
 	if state.RunFloorMs == 0 || state.RunFloorMs > floorMs || state.owed() {
 		return
 	}
-	state.RunFloorMs = oldestLive
+	state.setRunFloor(oldestLive.floorMs, oldestLive.fingerprint)
 }
 
 // disarmGrokUsageRunFloor withdraws a run that never reached inference (a
@@ -425,7 +457,7 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 	state := updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		grokOweRead(state, now, completionMs, fingerprint)
 		if state.RunFloorMs < floorMs {
-			state.RunFloorMs = floorMs
+			state.setRunFloor(floorMs, fingerprint)
 		}
 	})
 	fmt.Printf("%s[cli-usage] grok refresh: owed attempts=%d%s\n", colorCyan, state.Attempts, colorReset)
@@ -467,7 +499,7 @@ func settleGrokRunFreshness(observedMs int64, fingerprint string) {
 			state.clearDebt()
 		}
 		if !state.owed() && state.RunFloorMs != 0 && observedMs >= state.RunFloorMs {
-			state.RunFloorMs = oldest
+			state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 		}
 	})
 }
@@ -546,21 +578,25 @@ func grokUsageRefreshWaitIdle(ctx context.Context) bool {
 // grokPendingDebt returns the unpaid debt, rebasing a rolled-back clock and
 // retiring one past grokRunDebtMaxAge.
 func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
+	oldest := grokOldestLiveFloor()
 	state := updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		grokRebaseFutureFreshness(state, now)
 		if state.owed() && now.Sub(time.UnixMilli(state.OwedAtMs)) > grokRunDebtMaxAge {
 			state.clearDebt()
-			state.RunFloorMs = 0
+			state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 		}
 	})
 	return state, state.owed()
 }
 
-// grokRetireRunDebt drops the debt for a case no retry can fix.
+// grokRetireRunDebt drops the debt for a case no retry can fix. The restart
+// marker falls back to the oldest run still live (possibly under another
+// account), so retiring an old debt never forgets a run in progress.
 func grokRetireRunDebt(label string, attempts int) {
+	oldest := grokOldestLiveFloor()
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		state.clearDebt()
-		state.RunFloorMs = 0
+		state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 	})
 	grokLastRefreshOutcome.Store(label)
 	fmt.Printf("%s[cli-usage] grok refresh: retired %s attempts=%d%s\n", colorYellow, label, attempts, colorReset)
@@ -799,7 +835,7 @@ func nudgeGrokUsageRefresh(now time.Time, fingerprint string) bool {
 	if !grokUsageRefreshEnabled.Load() || fingerprint == "" || IsShutdownInProgress() || IsOffline() {
 		return false
 	}
-	if grokOldestLiveFloor() != 0 {
+	if grokOldestLiveFloor().floorMs != 0 {
 		return false
 	}
 	n := &grokRefreshNudge
@@ -857,9 +893,13 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 			return
 		}
 		// A floor with no debt beside it belongs to a run the previous process
-		// was cut off in. It owes a reading taken from now on.
-		if fingerprint == "" || now.Sub(time.UnixMilli(state.RunFloorMs)) > grokRunDebtMaxAge {
-			state.RunFloorMs = 0
+		// was cut off in. It owes a reading taken from now on, but only under
+		// the account it was spawned under: the read can use only the current
+		// login, so a run armed under another one is dropped, never paid
+		// against this one.
+		if fingerprint == "" || fingerprint != state.RunFloorAccount ||
+			now.Sub(time.UnixMilli(state.RunFloorMs)) > grokRunDebtMaxAge {
+			state.setRunFloor(0, "")
 			return
 		}
 		grokOweRead(state, now, now.UnixMilli(), fingerprint)
