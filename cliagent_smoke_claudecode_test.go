@@ -1143,7 +1143,12 @@ func TestRunClaudeCodeSmoke_OwesARefreshOnlyForASpentTurn(t *testing.T) {
 			runClaudeCodeSmoke(context.Background(), path, version)
 
 			if tc.wantOwed {
-				waitForClaudeDebt(t, cache, 5*time.Second)
+				// SYNCHRONOUS: the debt and its first rung are on disk the moment
+				// the smoke returns — a smoke is often the last step before an
+				// update hand-off, which a goroutine's write could miss.
+				if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs == 0 || snap.NextAttemptAtMs == 0 {
+					t.Fatalf("debt=%d rung=%d when the smoke returned, want both on disk", snap.RefreshOwedAtMs, snap.NextAttemptAtMs)
+				}
 			}
 			claudeFreshnessWaitIdle(t)
 

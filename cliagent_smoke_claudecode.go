@@ -273,17 +273,19 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 // which those verdicts cannot supply; collapsing the two would owe on every
 // timeout and reintroduce the unpayable debt the disarm rule exists to avoid.
 //
-// Owing goes through triggerClaudeUsageProbeAfterRun rather than writing
-// RefreshOwedAtMs directly: that call already records the debt on the gate,
-// persists it off the hot path, and schedules the bounded trailing probe — so a
-// smoke mid-session fetches fresh numbers inside the probe's own window instead
-// of sitting on a disk marker until the gather TTL, while a smoke just before a
-// self-update still leaves the durable debt for the startup replay.
+// The debt and its first rung are written SYNCHRONOUSLY (claudeOweRunRefreshNow)
+// before this returns, mirroring the Codex smoke: a smoke is often the last
+// thing that happens before an update hand-off replaces the process, and a
+// debt left to a goroutine can be outrun by it. triggerClaudeUsageProbeAfterRunAt
+// then makes the run's immediate attempt off the hot path, exactly as a direct
+// or terminal-managed run does; its repeat owe of the same instant is a no-op.
 func settleOrDisarmClaudeSmokeRun(spentTurn bool) {
 	if !spentTurn {
 		return
 	}
-	triggerClaudeUsageProbeAfterRun()
+	completedAt := time.Now()
+	claudeOweRunRefreshNow(completedAt)
+	triggerClaudeUsageProbeAfterRunAt(completedAt)
 }
 
 // claudeSmokeReachedInference reports whether the child returned the CLI's

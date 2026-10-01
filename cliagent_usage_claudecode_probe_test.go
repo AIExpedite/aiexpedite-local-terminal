@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,27 @@ import (
 	"testing"
 	"time"
 )
+
+// runClaudeUsageProbe, probeClaudeUsage and probeClaudeUsageAdmitted are the
+// pre-contract call shapes many cases here are written against, kept as thin
+// adapters over probeClaudeUsageResult — the probe's one production entry
+// point — so those cases still read as they did. `forced` is a claimed click.
+func runClaudeUsageProbe(ctx context.Context, now time.Time, forced bool) (bool, *cliAgentUsageError) {
+	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now, forced)
+	return refreshed, probeErr
+}
+
+func probeClaudeUsage(ctx context.Context, now time.Time, resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time, forced bool) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
+	_, _, refreshed, observedAt, probeErr = probeClaudeUsageAdmitted(ctx, now, resolveIdentity, dedupeBaseline, forced)
+	return refreshed, observedAt, probeErr
+}
+
+func probeClaudeUsageAdmitted(ctx context.Context, now time.Time, resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time, forced bool) (admitted, issued, refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
+	result, refreshed, observedAt := probeClaudeUsageResult(ctx, now, resolveIdentity, dedupeBaseline, forced)
+	return result.admitted, result.issued, refreshed, observedAt, result.err()
+}
 
 // probeTestToken is the access token the credential fixture carries, so the
 // handler can assert the Authorization header the probe actually sends.
@@ -602,7 +624,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 
 	t.Run("a forced refresh probes a fresh observation", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
-		forceCtx := WithClaudeUsageForceProbe(context.Background())
+		forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 		if !refreshClaudeUsageIfStale(forceCtx, now, now.Add(-time.Minute), probeTestToken, "") {
 			t.Error("a user-initiated refresh must probe regardless of age")
 		}
@@ -1207,7 +1229,7 @@ func TestClaudeUsageProbe_BackgroundProbeCannotSpendTheRefreshBypass(t *testing.
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "600000")
 
 	// The refresh handler arms the bypass on its own gather context...
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	// ...and a post-run probe reaches the gate before the refresh reads it.
 	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("post-run probe: refreshed=%v err=%+v", refreshed, probeErr)
@@ -1260,7 +1282,7 @@ func TestClaudeUsageProbe_RoutineGatherCannotClaimTheRefreshBypass(t *testing.T)
 
 	// The refresh handler arms the bypass, then a routine machine-info gather —
 	// a plain context, a cache young enough to pass the TTL — runs first.
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), now, probeTestToken, "") {
 		t.Error("a routine gather must stand down on a fresh cache, not spend the refresh's bypass")
 	}
@@ -1290,14 +1312,14 @@ func TestClaudeUsageProbe_RoutineGatherCannotClaimTheRefreshBypass(t *testing.T)
 
 // A bypass is spent at most once, and only a context that carries one has it.
 func TestClaudeUsageForceProbeTicket_ClaimedOnceAndOnlyWhenCarried(t *testing.T) {
-	if claimClaudeUsageForceProbe(context.Background()) {
+	if claimClaudeUsageForceProbe(context.Background()) != claudeForceNone {
 		t.Error("a context with no ticket must never report a bypass")
 	}
 	if claudeUsageForceProbePending(context.Background()) {
 		t.Error("a context with no ticket has nothing pending")
 	}
 
-	ctx := WithClaudeUsageForceProbe(context.Background())
+	ctx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	// A derived context inherits its parent's ticket — the gather wraps the
 	// handler's context in a timeout before the parser ever sees it.
 	derived, cancel := context.WithCancel(ctx)
@@ -1305,10 +1327,10 @@ func TestClaudeUsageForceProbeTicket_ClaimedOnceAndOnlyWhenCarried(t *testing.T)
 	if !claudeUsageForceProbePending(derived) {
 		t.Fatal("a derived context must still carry the refresh's bypass")
 	}
-	if !claimClaudeUsageForceProbe(derived) {
-		t.Fatal("the first claim must take the bypass")
+	if claimClaudeUsageForceProbe(derived) != claudeForceClick {
+		t.Fatal("the first claim must take the bypass, with its reason")
 	}
-	if claimClaudeUsageForceProbe(ctx) {
+	if claimClaudeUsageForceProbe(ctx) != claudeForceNone {
 		t.Error("the bypass must be spent at most once, on either end of the derivation")
 	}
 	if claudeUsageForceProbePending(ctx) {
@@ -1316,9 +1338,12 @@ func TestClaudeUsageForceProbeTicket_ClaimedOnceAndOnlyWhenCarried(t *testing.T)
 	}
 
 	// Two refreshes overlapping in one process own one ticket each.
-	other := WithClaudeUsageForceProbe(context.Background())
-	if !claimClaudeUsageForceProbe(other) {
-		t.Error("a second refresh must own its own bypass, not inherit the spent one")
+	other := WithClaudeUsageForceProbe(context.Background(), claudeForceDebt)
+	if claimClaudeUsageForceProbe(other) != claudeForceDebt {
+		t.Error("a second refresh must own its own ticket, not inherit the spent one")
+	}
+	if WithClaudeUsageForceProbe(context.Background(), claudeForceNone) != context.Background() {
+		t.Error("no reason must leave the context untouched")
 	}
 }
 
@@ -1386,7 +1411,7 @@ func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
 	t.Run("streak counter is bounded", func(t *testing.T) {
 		g := &claudeUsageProbeGate{}
 		for i := 0; i < claudeUsageProbeMaxFailureStreak*4; i++ {
-			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false, time.Time{}, "")
+			g.finish(claudeProbeResult{code: claudeProbeParseFailed, issued: true}, false, time.Time{}, "")
 		}
 		if g.failures > claudeUsageProbeMaxFailureStreak {
 			t.Errorf("failures=%d, want it capped at %d", g.failures, claudeUsageProbeMaxFailureStreak)
@@ -1457,17 +1482,10 @@ func TestResetClaudeUsageProbeGate_DrainsInFlightProbe(t *testing.T) {
 	}
 }
 
-// A settlement still running must not outlive the reset. The slot
-// reserveTrailing guards is process-wide and carries no gate generation, so a
-// straggler that reaches it after the reset makes the NEXT caller's debt look
-// already-owned — and awaitEligible answers a refused reservation by dropping
-// the debt, which silently disables the trailing probe from then on.
-//
-// The window is the stretch between entering the settlement and reserving:
-// cancelling the sleep is not enough, because a straggler that has not reached
-// the reserve yet has no sleep to cancel. Simulating that straggler with the
-// gate's own bracket is what makes the assertion deterministic — parking a real
-// settlement on a trailing wait cannot pin it to a chosen instruction.
+// A run-debt attempt still running must not outlive the reset: it writes the
+// cache after its caller moved on, and a straggler that lands after the reset
+// writes into the NEXT test's cache. Simulating that straggler with the gate's
+// own bracket is what makes the assertion deterministic.
 func TestResetClaudeUsageProbeGate_DrainsRunningSettlement(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -1492,7 +1510,7 @@ func TestResetClaudeUsageProbeGate_DrainsRunningSettlement(t *testing.T) {
 	select {
 	case <-resetReturned:
 		t.Fatal("resetClaudeUsageProbeGate returned while a settlement was still running — " +
-			"the straggler can still reserve the trailing slot and starve every later run")
+			"the straggler can still write into the next caller's cache")
 	case <-time.After(150 * time.Millisecond):
 		// Still blocked, as required.
 	}
@@ -1510,61 +1528,31 @@ func TestResetClaudeUsageProbeGate_DrainsRunningSettlement(t *testing.T) {
 	if settling != 0 {
 		t.Errorf("settling=%d after the reset, want 0", settling)
 	}
-	// The slot is genuinely reusable: a later caller must be able to claim it.
-	if !claudeUsageProbe.reserveTrailing() {
-		t.Fatal("the trailing slot leaked across the reset — later runs can never schedule a trailing probe")
-	}
-	claudeUsageProbe.releaseTrailing()
 }
 
-// A settlement asleep on a trailing wait is CANCELLED by the reset, not waited
-// out. Its wait can be minutes (claudeUsageProbeMaxTrailingWait is 5m) and the
-// drain budget is seconds, so without the cancel the drain would time out and
-// return with the straggler still live — the very leak above.
-func TestResetClaudeUsageProbeGate_CancelsParkedSettlement(t *testing.T) {
-	base := time.Now()
-	armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":52,"resets_at":%d}]}`,
-			base.Add(time.Hour).Unix())
-	})
-
-	// A wait far longer than the drain budget, but well inside the trailing cap
-	// so the settlement really does reserve the slot and sleep.
-	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000") // 1m
-	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
-		t.Fatal("precondition: the first probe should run")
+// A run-debt rung armed minutes ahead is STOPPED by the reset, not left to fire
+// into the next test's cache (or waited out by the drain).
+func TestResetClaudeUsageProbeGate_StopsThePendingRetryRung(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	owed := time.Now().Add(-time.Second)
+	seedClaudeRefreshDebt(t, cache, "", owed, 0, time.Time{})
+	if !claudeBookRunDebtRung("", owed, time.Now(), claudeRungAfter, time.Hour) {
+		t.Fatal("precondition: the rung must be booked")
 	}
-	claudeUsageProbeAfterRunAsyncForTest(time.Now())
-
-	// Wait for the straggler to actually take the slot and park on it.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		claudeUsageProbe.mu.Lock()
-		reserved := claudeUsageProbe.trailingScheduled
-		claudeUsageProbe.mu.Unlock()
-		if reserved {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the settlement never reserved the trailing slot")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("precondition: the rung must arm the timer")
 	}
 
 	start := time.Now()
 	resetClaudeUsageProbeGate()
 	if elapsed := time.Since(start); elapsed >= claudeUsageProbeDrainTimeout {
-		t.Errorf("reset took %v — it waited out the trailing sleep instead of cancelling it", elapsed)
+		t.Errorf("reset took %v — it waited instead of stopping the rung", elapsed)
 	}
-
-	claudeUsageProbe.mu.Lock()
-	settling, reserved := claudeUsageProbe.settling, claudeUsageProbe.trailingScheduled
-	claudeUsageProbe.mu.Unlock()
-	if settling != 0 {
-		t.Errorf("settling=%d after the reset, want 0", settling)
+	if claudeRunDebtRetryPending() {
+		t.Error("the retry rung is still armed after the reset")
 	}
-	if reserved {
-		t.Error("the trailing slot is still held after the reset")
+	if snap := claudeCacheSnapshot(t, cache); snap.NextAttemptAtMs == 0 {
+		t.Error("the reset must leave the persisted rung for the next process to re-arm")
 	}
 }
 
@@ -2043,7 +2031,7 @@ func TestRefreshClaudeUsageIfStale_DedupesAgainstAnotherWriter(t *testing.T) {
 	}
 
 	// A user-initiated refresh is not deduped — somebody is looking at the card.
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	if !refreshClaudeUsageIfStale(forceCtx, now.Add(time.Second), time.Time{}, probeTestToken, "") {
 		t.Error("a forced refresh must not be suppressed by the shared-cache check")
 	}
@@ -2389,9 +2377,10 @@ func countClaudeCredentialReads(t *testing.T) *int64 {
 	return &reads
 }
 
-// The post-run wrapper must not resolve credentials during per-run preflight.
-// A burst that coalesces its HTTP requests but still pays a Keychain spawn per
-// run has only moved the cost.
+// The post-run wrapper resolves the credential once per run to make the debt
+// durable (the fingerprint scopes it), and once more only for an attempt that
+// can actually go out — a burst refused by the floor books its rung under the
+// fingerprint it already has instead of paying a second Keychain spawn per run.
 func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.T) {
 	base := time.Now()
 	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2402,22 +2391,24 @@ func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.
 	reads := countClaudeCredentialReads(t)
 
 	// One run probes immediately; nine more land inside the throttle window and
-	// must coalesce onto a single trailing probe.
+	// must coalesce onto a single retry rung. Turns of one session finish one
+	// after another, so the runs are settled in sequence.
 	var last time.Time
 	for i := 0; i < 10; i++ {
 		last = time.Now()
-		claudeUsageProbeAfterRunAsyncForTest(last)
+		claudeUsageProbeAfterRun(last)
 		time.Sleep(3 * time.Millisecond)
 	}
 	waitForObservationAfter(t, last, 8*time.Second, "the coalesced trailing probe never landed")
 
 	if got := atomic.LoadInt64(calls); got > 2 {
-		t.Errorf("request count=%d, want <= 2 (immediate + one trailing)", got)
+		t.Errorf("request count=%d, want <= 2 (immediate + one retry rung)", got)
 	}
-	// One read per probe that actually happened — never one per run.
-	if got := atomic.LoadInt64(reads); got > 2 {
-		t.Errorf("credential store read %d times across 10 runs, want <= 2 — the per-run "+
-			"preflight must not resolve credentials", got)
+	// One read per run for the durable owe, plus one per attempt that could go
+	// out — never two per refused run.
+	if got, max := atomic.LoadInt64(reads), int64(10)+atomic.LoadInt64(calls)+1; got > max {
+		t.Errorf("credential store read %d times across 10 runs, want <= %d — a refused "+
+			"run must not resolve credentials twice", got, max)
 	}
 }
 
@@ -2497,54 +2488,47 @@ func TestClaudeUsageProbeAfterRun_DebtSurvivesRefusalAndFailure(t *testing.T) {
 	})
 }
 
-// A long-wait debt records without reserving the timer. Reserving a slot that no
-// timer will ever release would permanently disable trailing probes: every later
-// run would see the slot held and decline to schedule.
-func TestClaudeUsageProbeAfterRun_LongWaitDoesNotLeakTheTimerSlot(t *testing.T) {
+// A run refused by a long spacing does not park a goroutine or drop the debt:
+// it books a persisted rung at the end of that spacing, and a click still pays
+// the debt at once.
+func TestClaudeUsageProbeAfterRun_LongSpacingBooksAPersistedRung(t *testing.T) {
 	base := time.Now()
-	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":48,"resets_at":%d}]}`,
 			base.Add(time.Hour).Unix())
 	})
 
-	// An interval far beyond the trailing-wait cap, so the debt is recorded but
-	// no timer is created.
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "3600000") // 1h
 	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
 		t.Fatal("precondition: the first probe should run")
 	}
-	claudeUsageProbeAfterRun(time.Now()) // wait ~1h > cap: record only
+	completed := time.Now()
+	claudeUsageProbeAfterRun(completed)
 
-	if claudeUsageProbe.trailingScheduled {
-		t.Error("the long-wait path must not reserve a timer slot it will never release")
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want the spacing to hold the run's attempt back", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != completed.UnixMilli() {
+		t.Fatalf("RefreshOwedAtMs=%d, want the run's debt %d on disk", snap.RefreshOwedAtMs, completed.UnixMilli())
+	}
+	if snap.RefreshOwedAttempts != 0 {
+		t.Errorf("RefreshOwedAttempts=%d, want a refusal to spend no budget", snap.RefreshOwedAttempts)
+	}
+	if until := time.UnixMilli(snap.NextAttemptAtMs).Sub(time.Now()); until < 50*time.Minute {
+		t.Errorf("rung in %v, want it at the end of the 1h spacing", until)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Error("the rung must arm the timer")
 	}
 
-	// A gather pays the long-wait debt.
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	if !refreshClaudeUsageIfStale(forceCtx, time.Now(), time.Time{}, probeTestToken, "") {
-		t.Fatal("a forced gather should pay the long-wait debt")
+		t.Fatal("a click should pay the debt despite the spacing")
 	}
-
-	// Now a normal throttled run must still be able to schedule a trailing probe.
-	// With the slot leaked, this never fires.
-	t.Setenv(claudeUsageProbeMinIntervalEnv, "400")
-	last := time.Now()
-	claudeUsageProbeAfterRunAsyncForTest(last)
-	waitForObservationAfter(t, last, 8*time.Second,
-		"no trailing probe was scheduled after a long-wait debt — the timer slot leaked")
-	if got := atomic.LoadInt64(calls); got > 4 {
-		t.Errorf("request count=%d, want a small bounded number", got)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Errorf("debt=%d rung=%d, want both settled by the click's covering reading", snap.RefreshOwedAtMs, snap.NextAttemptAtMs)
 	}
-}
-
-// claudeUsageProbeAfterRunAsyncForTest mirrors what triggerClaudeUsageProbeAfterRun
-// does in production — run the post-run path on its own goroutine — without the
-// armed-gate precheck the tests set up explicitly.
-func claudeUsageProbeAfterRunAsyncForTest(completedAt time.Time) {
-	go func() {
-		defer func() { _ = recover() }()
-		claudeUsageProbeAfterRun(completedAt)
-	}()
 }
 
 // A user-initiated refresh that lands while a post-run probe is already on the
@@ -2572,7 +2556,7 @@ func TestClaudeUsageProbe_ForcedRefreshJoinsInFlightProbe(t *testing.T) {
 	<-inFlight
 
 	// The user presses Refresh mid-flight.
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
@@ -2617,7 +2601,7 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testin
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
@@ -2681,7 +2665,7 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterUnusableSecondJoin(t *testing
 	}
 	t.Cleanup(func() { claudeUsageProbeBeforeForcedAttempt = realHook })
 
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	if !refreshClaudeUsageIfStale(forceCtx, now, time.Time{}, probeTestToken, "") {
 		t.Fatal("a failed second join must leave the forced refresh one attempt of its own")
 	}
@@ -2731,7 +2715,7 @@ func TestClaudeUsageProbe_ForcedRefreshDoesNotSettleRunDebtWithPreRunJoin(t *tes
 
 	// The run completes, then the user presses Refresh mid-flight.
 	claudeUsageProbe.recordOwed(runAt)
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
@@ -2778,7 +2762,7 @@ func TestClaudeUsageProbe_ForcedRefreshSettlesRunDebtWithPostRunJoin(t *testing.
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), postRun, false) }()
 	<-inFlight
 
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
@@ -2835,7 +2819,7 @@ func TestClaudeUsageProbe_ForcedRefreshRejectsAJoinFromAnotherAccount(t *testing
 	}()
 	<-inFlight
 
-	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	forceCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
@@ -2879,7 +2863,7 @@ func TestClaudeUsageProbe_ForcedRefreshJoinHonorsContext(t *testing.T) {
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
-	ctx, cancel := context.WithCancel(WithClaudeUsageForceProbe(context.Background()))
+	ctx, cancel := context.WithCancel(WithClaudeUsageForceProbe(context.Background(), claudeForceClick))
 	cancel()
 	start := time.Now()
 	if refreshClaudeUsageIfStale(ctx, now, time.Time{}, probeTestToken, "") {
@@ -3144,12 +3128,13 @@ func TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal(t *testing.T) 
 		t.Fatal("the post-run probe never returned")
 	}
 
-	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); latest.Before(completed.Truncate(time.Millisecond)) {
-		t.Errorf("observation %v did not advance past the run %v — the refused post-run probe was dropped", latest, completed)
-	}
-	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
-		t.Errorf("debt %v still outstanding after the retry", owed)
-	}
+	// The run joined the winner, found its reading did not cover the debt, and
+	// booked a rung at the floor: the retry lands from the timer, not inline.
+	waitForObservationAfter(t, completed.Truncate(time.Millisecond), 8*time.Second,
+		"the refused post-run probe was dropped — no rung paid the debt")
+	waitForClaudeCondition(t, 5*time.Second, "debt still outstanding after the retry", func() bool {
+		return claudeUsageProbe.owedObservation().IsZero()
+	})
 	if got := atomic.LoadInt64(calls); got != 2 {
 		t.Errorf("request count=%d, want 2 (the winner plus one retry)", got)
 	}
@@ -3171,7 +3156,7 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 	if !claudeUsageProbe.begin(holderAt, false) {
 		t.Fatal("the holder must take the slot")
 	}
-	t.Cleanup(func() { claudeUsageProbe.finish(nil, false, time.Time{}, "") })
+	t.Cleanup(func() { claudeUsageProbe.finish(claudeProbeResult{}, false, time.Time{}, "") })
 
 	// Same instant as the holder — what a coarse clock hands the loser.
 	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(
@@ -3187,7 +3172,7 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 	}
 
 	// Release the slot: the same call at the same instant is now admitted.
-	claudeUsageProbe.finish(nil, false, time.Time{}, "")
+	claudeUsageProbe.finish(claudeProbeResult{}, false, time.Time{}, "")
 	admitted, issued, _, _, _ = probeClaudeUsageAdmitted(
 		context.Background(), holderAt, func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }, holderAt, false)
 	if !admitted {
@@ -3418,5 +3403,566 @@ func TestClaudeUsageProbeGate_CacheSeedIsAccountScoped(t *testing.T) {
 	claudeUsageProbe.seedOwedFromCache(context.Background(), "someone-else", probeTestToken, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("another account's debt was seeded onto this gather: %v", owed)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Attempt result contract (claudeProbeResult)
+   -------------------------------------------------------------------------- */
+
+// claudeProbeFailures samples the gate's consecutive-failure streak.
+func claudeProbeFailures() int {
+	claudeUsageProbe.mu.Lock()
+	defer claudeUsageProbe.mu.Unlock()
+	return claudeUsageProbe.failures
+}
+
+// writeClaudeProbeCredentialExpiring writes the fixture credential with an
+// access-token expiry, so the pre-send expiry check has something to judge.
+func writeClaudeProbeCredentialExpiring(t *testing.T, configDir, token string, expiresAt time.Time) {
+	t.Helper()
+	body := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":"rt","expiresAt":%d,"subscriptionType":"max"}}`,
+		token, expiresAt.UnixMilli())
+	if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// claudeProbeOKHandler answers every request with a plottable five-hour window.
+func claudeProbeOKHandler(w http.ResponseWriter, _ *http.Request) {
+	fmt.Fprintf(w, `{"five_hour":{"used_percentage":33,"resets_at":%d,"status":"allowed"}}`,
+		time.Now().Add(3*time.Hour).Unix())
+}
+
+// Every not-admitted reason in the contract: no request reaches the network,
+// nothing is issued, the cache is untouched, and the failure streak moves only
+// for a rejected override (whose misconfiguration persists).
+func TestClaudeProbeResult_NotAdmittedReasonsSendNothing(t *testing.T) {
+	stamped := claudeUsageProbeIdentity{token: probeTestToken, credStamp: claudeCredStamp{modNs: 1, size: 1}}
+	cases := []struct {
+		name       string
+		setup      func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool)
+		want       claudeProbeCode
+		admitted   bool
+		growStreak bool
+	}{
+		{name: "unarmed", want: claudeProbeUnarmed, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			claudeUsageProbe.mu.Lock()
+			claudeUsageProbe.armed, claudeUsageProbe.optedOut = false, false
+			claudeUsageProbe.mu.Unlock()
+			return context.Background(), stamped, false
+		}},
+		{name: "opted out", want: claudeProbeOptedOut, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			SetClaudeUsageProbeDisabled(true)
+			return context.Background(), stamped, false
+		}},
+		{name: "cancelled", want: claudeProbeCancelled, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, stamped, false
+		}},
+		{name: "in flight", want: claudeProbeInFlight, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			if !claudeUsageProbe.begin(time.Now(), true) {
+				t.Fatal("precondition: could not take the slot")
+			}
+			t.Cleanup(func() { claudeUsageProbe.finish(claudeProbeResult{}, false, time.Time{}, "") })
+			return context.Background(), stamped, false
+		}},
+		{name: "spacing", want: claudeProbeSpacing, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+			claudeUsageProbe.mu.Lock()
+			claudeUsageProbe.lastAttempt = time.Now()
+			claudeUsageProbe.mu.Unlock()
+			return context.Background(), stamped, false
+		}},
+		{name: "held", want: claudeProbeHeld, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			claudeUsageProbe.holdUntil(time.Now().Add(time.Hour))
+			// Even a click: the service has told us to stop.
+			return context.Background(), stamped, true
+		}},
+		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			was := isOffline
+			isOffline = true
+			t.Cleanup(func() { isOffline = was })
+			return context.Background(), stamped, false
+		}},
+		{name: "no credential", want: claudeProbeNoCredential, admitted: true, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			return context.Background(), claudeUsageProbeIdentity{}, false
+		}},
+		{name: "credential expired", want: claudeProbeCredentialExpired, admitted: true, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			id := stamped
+			id.expiresAtMs = time.Now().Add(-time.Hour).UnixMilli()
+			return context.Background(), id, false
+		}},
+		{name: "bad override", want: claudeProbeBadOverride, admitted: true, growStreak: true, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
+			t.Setenv(claudeUsageProbeEndpointEnv, "https://example.com/api/oauth/usage")
+			return context.Background(), stamped, false
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			before, _ := os.ReadFile(cache)
+			ctx, identity, bypass := tc.setup(t)
+			failuresBefore := claudeProbeFailures()
+
+			result, refreshed, _ := probeClaudeUsageResult(ctx, time.Now(),
+				func() claudeUsageProbeIdentity { return identity }, time.Time{}, bypass)
+
+			if result.code != tc.want || result.admitted != tc.admitted || result.issued || refreshed {
+				t.Errorf("result=%+v refreshed=%v, want not-admitted %q (admitted=%v)", result, refreshed, tc.want, tc.admitted)
+			}
+			if got := atomic.LoadInt64(calls); got != 0 {
+				t.Errorf("request count=%d, want 0", got)
+			}
+			if grew := claudeProbeFailures() - failuresBefore; (grew == 1) != tc.growStreak || grew > 1 {
+				t.Errorf("failures grew by %d, want growth=%v", grew, tc.growStreak)
+			}
+			if after, _ := os.ReadFile(cache); string(after) != string(before) {
+				t.Error("a refusal changed the cache")
+			}
+			if result.err() != nil && tc.want != claudeProbeBadOverride {
+				t.Errorf("err=%+v, want no error record for a refusal", result.err())
+			}
+		})
+	}
+}
+
+// Every issued outcome in the contract, over a loopback server: the code, that
+// exactly one request went out, the failure-streak effect, and whether the
+// cache changed on disk (a reading, or a 429's persisted hold — never buckets
+// on a failure).
+func TestClaudeProbeResult_IssuedOutcomes(t *testing.T) {
+	oversized := strings.Repeat("x", claudeUsageProbeMaxBody+64)
+	status := func(code int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }
+	}
+	cases := []struct {
+		name     string
+		handler  http.HandlerFunc
+		stamp    claudeCredStamp
+		ctx      func(t *testing.T) context.Context
+		want     claudeProbeCode
+		streak   claudeStreakEffect
+		changed  bool
+		category string
+	}{
+		{name: "ok", handler: claudeProbeOKHandler, want: claudeProbeOK, streak: claudeStreakReset, changed: true},
+		{name: "401 stamped", handler: status(http.StatusUnauthorized), stamp: claudeCredStamp{1, 1}, want: claudeProbeHTTP401, streak: claudeStreakKeep, category: cliUsageErrorNotAuthenticated},
+		{name: "401 unstamped", handler: status(http.StatusUnauthorized), want: claudeProbeHTTP401, streak: claudeStreakGrow, category: cliUsageErrorNotAuthenticated},
+		{name: "403", handler: status(http.StatusForbidden), stamp: claudeCredStamp{1, 1}, want: claudeProbeHTTP401, streak: claudeStreakKeep, category: cliUsageErrorNotAuthenticated},
+		{name: "429 with Retry-After", handler: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}, want: claudeProbeHTTP429, streak: claudeStreakKeep, changed: true, category: cliUsageErrorProviderUnavailable},
+		{name: "429 without Retry-After", handler: status(http.StatusTooManyRequests), want: claudeProbeHTTP429, streak: claudeStreakKeep, category: cliUsageErrorProviderUnavailable},
+		{name: "500", handler: status(http.StatusInternalServerError), want: claudeProbeHTTP5xx, streak: claudeStreakGrow, category: cliUsageErrorProviderUnavailable},
+		{name: "404", handler: status(http.StatusNotFound), want: claudeProbeHTTPOther, streak: claudeStreakGrow, category: cliUsageErrorProviderUnavailable},
+		{name: "malformed json", handler: func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "{not json") },
+			want: claudeProbeParseFailed, streak: claudeStreakGrow, category: cliUsageErrorParseFailed},
+		{name: "no plottable window", handler: func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, `{"five_hour":{"status":"allowed"}}`)
+		}, want: claudeProbeNoWindows, streak: claudeStreakGrow, category: cliUsageErrorParseFailed},
+		{name: "oversized body", handler: func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprintf(w, `{"five_hour":{"used_percentage":10},"pad":%q}`, oversized)
+		}, want: claudeProbeHTTPOther, streak: claudeStreakGrow, category: cliUsageErrorProviderUnavailable},
+		{name: "timeout", handler: func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+		}, ctx: func(t *testing.T) context.Context {
+			ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+			t.Cleanup(cancel)
+			return ctx
+		}, want: claudeProbeTimeout, streak: claudeStreakGrow, category: cliUsageErrorProviderTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, calls := armClaudeUsageProbe(t, tc.handler)
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			before, _ := os.ReadFile(cache)
+			claudeUsageProbe.mu.Lock()
+			claudeUsageProbe.failures = 2
+			claudeUsageProbe.mu.Unlock()
+			ctx := context.Background()
+			if tc.ctx != nil {
+				ctx = tc.ctx(t)
+			}
+			identity := claudeUsageProbeIdentity{token: probeTestToken, credStamp: tc.stamp}
+
+			result, _, _ := probeClaudeUsageResult(ctx, time.Now(),
+				func() claudeUsageProbeIdentity { return identity }, time.Time{}, false)
+
+			if result.code != tc.want || !result.issued || !result.admitted {
+				t.Fatalf("result=%+v, want issued %q", result, tc.want)
+			}
+			if got := atomic.LoadInt64(calls); got != 1 {
+				t.Errorf("request count=%d, want 1", got)
+			}
+			wantFailures := map[claudeStreakEffect]int{claudeStreakKeep: 2, claudeStreakReset: 0, claudeStreakGrow: 3}[tc.streak]
+			if got := claudeProbeFailures(); got != wantFailures {
+				t.Errorf("failures=%d, want %d", got, wantFailures)
+			}
+			if after, _ := os.ReadFile(cache); (string(after) != string(before)) != tc.changed {
+				t.Errorf("cache changed=%v, want %v", string(after) != string(before), tc.changed)
+			}
+			if got := result.category(); got != tc.category {
+				t.Errorf("category=%q, want %q", got, tc.category)
+			}
+		})
+	}
+}
+
+// The issued outcomes that need their own fixture: a covering reading another
+// writer already persisted (shared), a dial failure, and a verified cache write
+// that fails (persist_failed).
+func TestClaudeProbeResult_SharedNetworkAndPersistFailed(t *testing.T) {
+	t.Run("shared", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+		seedClaudeProbeReading(t, cache, time.Now())
+		result, refreshed, observedAt := probeClaudeUsageResult(context.Background(), time.Now(),
+			claudeUsageProbeStoredIdentity, time.Now().Add(-time.Minute), false)
+		if result.code != claudeProbeShared || !result.issued || refreshed || observedAt.IsZero() {
+			t.Errorf("result=%+v refreshed=%v observedAt=%v, want shared", result, refreshed, observedAt)
+		}
+		if got := atomic.LoadInt64(calls); got != 0 {
+			t.Errorf("request count=%d, want the shared reading to stand in for the request", got)
+		}
+	})
+	t.Run("network", func(t *testing.T) {
+		_, _ = armClaudeUsageProbe(t, claudeProbeOKHandler)
+		dead := httptest.NewServer(http.HandlerFunc(claudeProbeOKHandler))
+		dead.Close()
+		t.Setenv(claudeUsageProbeEndpointEnv, dead.URL)
+		result, _, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+			claudeUsageProbeStoredIdentity, time.Time{}, false)
+		if result.code != claudeProbeNetwork || !result.issued {
+			t.Errorf("result=%+v, want issued network", result)
+		}
+	})
+	t.Run("persist failed", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+		blocker := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(blocker, "rl.json"))
+		result, refreshed, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+			claudeUsageProbeStoredIdentity, time.Time{}, false)
+		if result.code != claudeProbePersistFailed || !result.issued || refreshed {
+			t.Errorf("result=%+v refreshed=%v, want issued persist_failed", result, refreshed)
+		}
+		if got := atomic.LoadInt64(calls); got != 1 {
+			t.Errorf("request count=%d, want 1", got)
+		}
+	})
+}
+
+// Unnamed paths: a refusal the contract does not name books a free rung (never
+// a budgeted one), as does a failed reservation; an unnamed outcome after a
+// request went out walks the budgeted ladder.
+func TestClaudeRunDebtRungFor_UnnamedPaths(t *testing.T) {
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+	for _, code := range []claudeProbeCode{"some_future_refusal", claudeProbeReserveFailed, claudeProbeOffline,
+		claudeProbeNoCredential, claudeProbeCredentialExpired, claudeProbeBadOverride} {
+		if kind, _ := claudeRunDebtRungFor(claudeProbeResult{code: code}); kind != claudeRungFree {
+			t.Errorf("%s: rung kind=%v, want free", code, kind)
+		}
+	}
+	if kind, _ := claudeRunDebtRungFor(claudeProbeResult{code: "some_future_outcome", issued: true}); kind != claudeRungBudgeted {
+		t.Errorf("an unnamed issued outcome booked %v, want the budgeted ladder", kind)
+	}
+	for _, code := range []claudeProbeCode{claudeProbeUnarmed, claudeProbeOptedOut, claudeProbeCancelled} {
+		if kind, _ := claudeRunDebtRungFor(claudeProbeResult{code: code}); kind != claudeRungNone {
+			t.Errorf("%s: rung kind=%v, want none", code, kind)
+		}
+	}
+}
+
+// An expired token: a debt-forced (automatic) gather sends nothing, while a
+// click may send exactly once so a wrong local clock cannot hide the numbers.
+func TestClaudeUsageProbe_ExpiredTokenOnlyAClickSends(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	claudeUsageProbe.recordOwed(time.Now().Add(-time.Minute))
+	expired := claudeUsageProbeIdentity{token: probeTestToken, expiresAtMs: time.Now().Add(-2 * time.Hour).UnixMilli()}
+
+	debtCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceDebt)
+	refreshClaudeUsageIfStaleAs(debtCtx, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{}, expired)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("a debt-forced gather sent %d requests with an expired token, want 0", got)
+	}
+
+	clickCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
+	if !refreshClaudeUsageIfStaleAs(clickCtx, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{}, expired) {
+		t.Fatal("a click must still reach the endpoint")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("a click sent %d requests, want exactly 1", got)
+	}
+}
+
+// Inside the 60 s floor a debt-forced gather is refused as spacing and sends
+// nothing; a click bypasses the floor and may send.
+func TestClaudeUsageProbe_DebtForcedRespectsTheFloorClickDoesNot(t *testing.T) {
+	_, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("precondition: the first probe should run")
+	}
+	claudeUsageProbe.recordOwed(time.Now())
+
+	debtCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceDebt)
+	refreshClaudeUsageIfStale(debtCtx, time.Now(), time.Now().Add(-time.Second), probeTestToken, "")
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("a debt-forced gather inside the floor sent a request (count=%d)", got)
+	}
+	if code := claudeUsageProbe.refusal(time.Now(), false); code != claudeProbeSpacing {
+		t.Fatalf("refusal=%q, want spacing", code)
+	}
+
+	clickCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
+	if !refreshClaudeUsageIfStale(clickCtx, time.Now(), time.Now().Add(-time.Second), probeTestToken, "") {
+		t.Fatal("a click must bypass the floor")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want the click's own request", got)
+	}
+}
+
+// After a 401 an unchanged credential stamp sends nothing more; a changed one
+// (Claude Code rewrote the file) sends exactly one. With no stamp to wait on —
+// a Keychain login — the failure backoff doubles instead.
+func TestClaudeUsageProbe_After401WaitsForACredentialRewrite(t *testing.T) {
+	unauthorized := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusUnauthorized) }
+	resolve := func(id claudeUsageProbeIdentity) func() claudeUsageProbeIdentity {
+		return func() claudeUsageProbeIdentity { return id }
+	}
+	t.Run("stamped", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, unauthorized)
+		old := claudeUsageProbeIdentity{token: probeTestToken, credStamp: claudeCredStamp{modNs: 100, size: 10}}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), time.Now(), resolve(old), time.Time{}, false); r.code != claudeProbeHTTP401 {
+			t.Fatalf("first attempt=%+v, want http_401", r)
+		}
+		r, _, _ := probeClaudeUsageResult(context.Background(), time.Now(), resolve(old), time.Time{}, false)
+		if r.code != claudeProbeCredentialExpired || r.issued {
+			t.Errorf("unchanged stamp: result=%+v, want not-admitted credential_expired", r)
+		}
+		if got := atomic.LoadInt64(calls); got != 1 {
+			t.Fatalf("unchanged stamp sent %d requests in total, want 1", got)
+		}
+		rewritten := old
+		rewritten.credStamp = claudeCredStamp{modNs: 200, size: 10}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), time.Now(), resolve(rewritten), time.Time{}, false); !r.issued {
+			t.Errorf("changed stamp: result=%+v, want a request", r)
+		}
+		if got := atomic.LoadInt64(calls); got != 2 {
+			t.Errorf("request count=%d, want exactly one more after the rewrite", got)
+		}
+	})
+	t.Run("a click that succeeds ends the in-memory wait", func(t *testing.T) {
+		var served int64
+		_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			if atomic.AddInt64(&served, 1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			claudeProbeOKHandler(w, r)
+		})
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+		same := resolve(claudeUsageProbeIdentity{token: probeTestToken, credStamp: claudeCredStamp{modNs: 100, size: 10}})
+		start := time.Now()
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, false); r.code != claudeProbeHTTP401 {
+			t.Fatalf("first attempt=%+v, want http_401", r)
+		}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, true); r.code != claudeProbeOK {
+			t.Fatalf("click=%+v, want ok with the unchanged credential", r)
+		}
+		if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+			t.Fatalf("authWait=%+v after a successful click, want cleared", got)
+		}
+		// The token is proven good, so a later automatic attempt in this same
+		// process must not be refused as if it were still awaiting a rewrite.
+		r, _, _ := probeClaudeUsageResult(context.Background(), start.Add(1100*time.Millisecond), same, time.Time{}, false)
+		if r.code == claudeProbeCredentialExpired {
+			t.Errorf("automatic attempt after a successful click=%+v, want it admitted", r)
+		}
+	})
+	t.Run("a click that fails inconclusively keeps the wait", func(t *testing.T) {
+		var served int64
+		_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+			if atomic.AddInt64(&served, 1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			// Issued, but no answer about the credential.
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+		stamp := claudeCredStamp{modNs: 100, size: 10}
+		same := resolve(claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp})
+		start := time.Now()
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, false); r.code != claudeProbeHTTP401 {
+			t.Fatalf("first attempt=%+v, want http_401", r)
+		}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, true); r.code != claudeProbeHTTP5xx || !r.issued {
+			t.Fatalf("click=%+v, want an issued http_5xx", r)
+		}
+		if got := claudeUsageProbe.authWaitStamp(); got != stamp {
+			t.Fatalf("authWait=%+v after an inconclusive click, want %+v kept", got, stamp)
+		}
+		// The rejected token was never shown to work, so the next automatic
+		// attempt must not resend it.
+		r, _, _ := probeClaudeUsageResult(context.Background(), start.Add(time.Hour), same, time.Time{}, false)
+		if r.code != claudeProbeCredentialExpired || r.issued {
+			t.Errorf("automatic attempt after an inconclusive click=%+v, want not-admitted credential_expired", r)
+		}
+		if got := atomic.LoadInt64(calls); got != 2 {
+			t.Errorf("request count=%d, want only the 401 and the click", got)
+		}
+	})
+	t.Run("unstamped doubles the backoff", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, unauthorized)
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+		keychain := resolve(claudeUsageProbeIdentity{token: probeTestToken})
+		start := time.Now()
+		for i, at := range []time.Duration{0, 1100 * time.Millisecond} {
+			if r, _, _ := probeClaudeUsageResult(context.Background(), start.Add(at), keychain, time.Time{}, false); r.code != claudeProbeHTTP401 {
+				t.Fatalf("attempt %d=%+v, want http_401", i, r)
+			}
+		}
+		if got := atomic.LoadInt64(calls); got != 2 {
+			t.Fatalf("request count=%d, want 2 — no stamp means no credential wait", got)
+		}
+		claudeUsageProbe.mu.Lock()
+		interval := claudeUsageProbe.interval()
+		claudeUsageProbe.mu.Unlock()
+		if interval != 2*time.Second {
+			t.Errorf("interval=%v after two unstamped 401s, want the doubled 2s", interval)
+		}
+	})
+}
+
+// A 2xx proves the credential even when its body yields no reading, so the
+// persisted wait for that credential is cleared on disk too: otherwise the next
+// seed or restart restores it and suppresses automatic probes of a credential
+// the endpoint just accepted. A wait for a different credential is kept.
+func TestClaudeUsageProbe_UnplottableTwoHundredClearsThePersistedWait(t *testing.T) {
+	stamp := claudeCredStamp{modNs: 100, size: 10}
+	other := claudeCredStamp{modNs: 200, size: 10}
+	bodies := map[string]string{
+		"malformed":  `{not json`,
+		"no windows": `{}`,
+		"oversized":  strings.Repeat(" ", claudeUsageProbeMaxBody+1),
+	}
+	for name, body := range bodies {
+		for _, tc := range []struct {
+			label    string
+			wait     claudeCredStamp
+			wantKept bool
+		}{{"same credential", stamp, false}, {"other credential", other, true}} {
+			t.Run(name+"/"+tc.label, func(t *testing.T) {
+				cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = io.WriteString(w, body)
+				})
+				seed, _ := json.Marshal(claudeRateLimitSnapshot{
+					Buckets:             map[string]claudeRateLimitBucket{},
+					AuthWaitCredStampNs: tc.wait.modNs, AuthWaitCredSize: tc.wait.size,
+				})
+				if err := os.WriteFile(cache, seed, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				id := claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp}
+				r, refreshed, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+					func() claudeUsageProbeIdentity { return id }, time.Time{}, true)
+				if refreshed || !r.credProven || r.code == claudeProbeOK {
+					t.Fatalf("result=%+v refreshed=%v, want a proven credential with no reading", r, refreshed)
+				}
+				snap, ok := loadClaudeRateLimitSnapshot(cache)
+				if !ok {
+					t.Fatal("cache unreadable after the probe")
+				}
+				kept := snap.AuthWaitCredStampNs == tc.wait.modNs && snap.AuthWaitCredSize == tc.wait.size
+				if kept != tc.wantKept {
+					t.Errorf("persisted wait=%d/%d, want kept=%v", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize, tc.wantKept)
+				}
+			})
+		}
+	}
+}
+
+// A 2xx whose durable clear the cache refuses must not leave the wait to be
+// restored later: the proven stamp is read as cleared while the clear is
+// pending, and a retry writes the clear once the cache accepts it.
+func TestClaudeUsageProbe_RefusedProvenClearIsRetried(t *testing.T) {
+	stamp := claudeCredStamp{modNs: 100, size: 10}
+	for _, tc := range []struct {
+		name       string
+		background bool
+	}{{"explicit retry", false}, {"background retry", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{}`)
+			})
+			seed, _ := json.Marshal(claudeRateLimitSnapshot{
+				Buckets:             map[string]claudeRateLimitBucket{},
+				AuthWaitCredStampNs: stamp.modNs, AuthWaitCredSize: stamp.size,
+			})
+			if err := os.WriteFile(cache, seed, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			prevDelays := claudePendingAuthClearRetryDelays
+			t.Cleanup(func() { claudePendingAuthClearRetryDelays = prevDelays })
+			claudePendingAuthClearRetryDelays = nil
+			if tc.background {
+				claudePendingAuthClearRetryDelays = []time.Duration{10 * time.Millisecond, 10 * time.Millisecond}
+			}
+			var failWrites atomic.Bool
+			failWrites.Store(true)
+			prevWrite := claudeRateLimitCacheWriteFile
+			t.Cleanup(func() { claudeRateLimitCacheWriteFile = prevWrite })
+			claudeRateLimitCacheWriteFile = func(name string, data []byte, perm os.FileMode) error {
+				if failWrites.Load() {
+					return fmt.Errorf("cache busy")
+				}
+				return prevWrite(name, data, perm)
+			}
+
+			id := claudeUsageProbeIdentity{token: probeTestToken, credStamp: stamp}
+			r, _, _ := probeClaudeUsageResult(context.Background(), time.Now(),
+				func() claudeUsageProbeIdentity { return id }, time.Time{}, true)
+			if !r.credProven || r.code != claudeProbeNoWindows {
+				t.Fatalf("result=%+v, want a proven credential with no windows", r)
+			}
+			if snap, _ := loadClaudeRateLimitSnapshot(cache); snap.AuthWaitCredStampNs != stamp.modNs {
+				t.Fatalf("persisted wait=%d, want the refused clear to leave it", snap.AuthWaitCredStampNs)
+			}
+
+			// While the clear is pending, a read of that stamp restores nothing.
+			claudeUsageProbe.restoreAuthWait(stamp, claudeUsageProbe.authWaitReadSeq())
+			if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+				t.Fatalf("restored wait=%+v while its durable clear is pending, want none", got)
+			}
+
+			failWrites.Store(false)
+			if !tc.background && !claudeRetryPendingAuthClear() {
+				t.Fatal("retry with a writable cache did not settle the pending clear")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				snap, _ := loadClaudeRateLimitSnapshot(cache)
+				pending, _ := claudeUsageProbe.pendingAuthClear()
+				if snap.AuthWaitCredStampNs == 0 && snap.AuthWaitCredSize == 0 && pending.isZero() {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("persisted wait=%d/%d pending=%+v, want the clear written and settled",
+						snap.AuthWaitCredStampNs, snap.AuthWaitCredSize, pending)
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		})
 	}
 }

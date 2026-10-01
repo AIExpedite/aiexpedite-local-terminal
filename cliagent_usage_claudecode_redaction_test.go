@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -130,4 +131,118 @@ func assertClaudeSnapshotStringsRedacted(t *testing.T, path string, v any) {
 			t.Errorf("snapshot field %s holds free text %q", path, val)
 		}
 	}
+}
+
+// A failing debt attempt carrying a sentinel token, a sentinel response body
+// and a prose Retry-After: none of the three reaches the snapshot, the device
+// log line or the published usage, and the schedule fields it adds are numbers.
+func TestClaudeRunDebtSchedule_PersistsLogsAndPublishesNumericOnly(t *testing.T) {
+	const (
+		tokenSentinel = "sk-ant-oat-SENTINEL-never-persist-4e1a"
+		bodySentinel  = "BODY_SENTINEL_never_persist_77c0"
+		proseRetry    = "please wait until the PROSE_SENTINEL quota frees up"
+	)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", proseRetry)
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, bodySentinel)
+	})
+	writeClaudeProbeCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), tokenSentinel)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+
+	logged := captureStdout(t, func() {
+		if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerRun); result.code != claudeProbeHTTP429 {
+			t.Errorf("result=%+v, want http_429", result)
+		}
+	})
+	// A credential wait is persisted beside the rung on the next booking.
+	claudeUsageProbe.noteAuthWait(claudeCredStamp{modNs: 1, size: 2})
+	claudeBookRunDebtRung("", now.Add(-time.Minute), now, claudeRungFree, 0)
+
+	forbidden := []string{tokenSentinel, "SENTINEL", bodySentinel, proseRetry, "PROSE_SENTINEL", os.Getenv("CLAUDE_CONFIG_DIR")}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage, ok := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	published, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range forbidden {
+		for surface, text := range map[string]string{"snapshot": string(raw), "log": logged, "published usage": string(published)} {
+			if s != "" && strings.Contains(text, s) {
+				t.Errorf("%s leaks %q", surface, s)
+			}
+		}
+	}
+	if !strings.Contains(logged, "issued http_429") {
+		t.Errorf("log line %q does not carry the fixed result code", logged)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	assertClaudeSnapshotStringsRedacted(t, "", decoded)
+	for _, field := range []string{"nextAttemptAtMs", "authWaitCredStampNs", "authWaitCredSize", "refreshOwedAttempts", "attemptClaimedUntilMs"} {
+		if v, present := decoded[field]; present {
+			if _, isNumber := v.(float64); !isNumber {
+				t.Errorf("%s=%v (%T), want a number", field, v, v)
+			}
+		}
+	}
+	for _, field := range []string{"nextAttemptAtMs", "authWaitCredStampNs", "authWaitCredSize"} {
+		if _, present := decoded[field]; !present {
+			t.Errorf("%s was not persisted", field)
+		}
+	}
+}
+
+// A failing probe with NO debt owed leaves the cache byte-identical; a failing
+// attempt on an owed debt leaves the bucket bytes identical and changes only
+// the bounded schedule fields — RefreshOwedAttempts and NextAttemptAtMs.
+func TestClaudeRunDebtSchedule_FailureTouchesOnlyScheduleFields(t *testing.T) {
+	t.Run("no debt", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+		seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+		before, _ := os.ReadFile(cache)
+		refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "")
+		if atomic.LoadInt64(calls) != 1 {
+			t.Fatal("precondition: the stale gather should probe")
+		}
+		if after, _ := os.ReadFile(cache); string(after) != string(before) {
+			t.Errorf("a failed probe with no debt changed the cache:\n got %s\nwant %s", after, before)
+		}
+	})
+	t.Run("owed debt", func(t *testing.T) {
+		cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+		now := time.Now()
+		seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+		claudeOweRunRefresh(now.Add(-time.Minute))
+		before := claudeCacheSnapshot(t, cache)
+		bucketsBefore, _ := json.Marshal(before.Buckets)
+
+		if result := claudeRunDebtAttemptAt(now, claudeDebtTriggerRun); result.code != claudeProbeHTTP5xx {
+			t.Fatalf("result=%+v, want http_5xx", result)
+		}
+
+		after := claudeCacheSnapshot(t, cache)
+		if bucketsAfter, _ := json.Marshal(after.Buckets); string(bucketsAfter) != string(bucketsBefore) {
+			t.Errorf("bucket bytes changed:\n got %s\nwant %s", bucketsAfter, bucketsBefore)
+		}
+		if after.RefreshOwedAttempts != 1 || after.NextAttemptAtMs == 0 {
+			t.Errorf("attempts=%d rung=%d, want the slot spent and a rung booked", after.RefreshOwedAttempts, after.NextAttemptAtMs)
+		}
+		after.RefreshOwedAttempts, after.NextAttemptAtMs = before.RefreshOwedAttempts, before.NextAttemptAtMs
+		after.Buckets, before.Buckets = nil, nil
+		if a, b := mustJSON(t, after), mustJSON(t, before); string(a) != string(b) {
+			t.Errorf("fields beyond the schedule changed:\n got %s\nwant %s", a, b)
+		}
+	})
 }

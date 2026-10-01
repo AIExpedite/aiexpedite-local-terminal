@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -252,15 +253,45 @@ func readClaudeKeychainCredential(ctx context.Context) ([]byte, bool) {
 // non-default profile we read only its on-disk file, and report "no credential"
 // when it is absent instead of guessing.
 func readClaudeCredentialsRaw(ctx context.Context, base string) ([]byte, bool) {
+	raw, _, ok := readClaudeCredentialsRawStamped(ctx, base)
+	return raw, ok
+}
+
+// claudeCredStamp identifies the CONTENTS of the credential file without
+// keeping any of them: modification time and size. Claude Code rewrites the
+// file whenever it refreshes the access token, so a changed stamp is the signal
+// that a token the usage probe saw expire (or answered 401) has been replaced.
+// Zero for a Keychain credential, which has no file to stamp.
+type claudeCredStamp struct {
+	modNs int64
+	size  int64
+}
+
+func (s claudeCredStamp) isZero() bool { return s.modNs == 0 && s.size == 0 }
+
+// readClaudeCredentialsRawStamped is readClaudeCredentialsRaw plus the stamp of
+// the file it read, taken from the SAME open handle so the stamp describes the
+// bytes returned. No extra read: one open, one fstat.
+func readClaudeCredentialsRawStamped(ctx context.Context, base string) ([]byte, claudeCredStamp, bool) {
 	if usingDefaultClaudeConfigDir() {
 		if raw, ok := claudeKeychainReader(ctx); ok {
-			return raw, true
+			return raw, claudeCredStamp{}, true
 		}
 	}
-	if raw, err := os.ReadFile(expandHome(base, ".credentials.json")); err == nil {
-		return raw, true
+	f, err := os.Open(expandHome(base, ".credentials.json"))
+	if err != nil {
+		return nil, claudeCredStamp{}, false
 	}
-	return nil, false
+	defer f.Close()
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, claudeCredStamp{}, false
+	}
+	stamp := claudeCredStamp{}
+	if info, err := f.Stat(); err == nil {
+		stamp = claudeCredStamp{modNs: info.ModTime().UnixNano(), size: info.Size()}
+	}
+	return raw, stamp, true
 }
 
 // usingDefaultClaudeConfigDir reports whether Claude Code is resolving to its
@@ -406,14 +437,21 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// claudeUsageProbeIdentity.scope. One small local JSON read, of the same file
 	// this parser loads a few lines further down.
 	cacheScopeAtCredentialRead := claudeRateLimitCacheScope()
-	if raw, ok := readClaudeCredentialsRaw(ctx, base); ok {
+	// The token's expiry and the credential file's stamp travel to the probe
+	// with the token, so it can refuse to send one it can see has expired and
+	// notice when Claude Code has rewritten it — from this same read.
+	oauthExpiresAtMs := int64(0)
+	credStamp := claudeCredStamp{}
+	if raw, stamp, ok := readClaudeCredentialsRawStamped(ctx, base); ok {
 		credentialFound = true
+		credStamp = stamp
 		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
 			credentialUsable = applyClaudeAuthState(usage, creds, now)
 			usage.Account = creds.claudeCredentialAccount()
 			usage.Plan = creds.ClaudeAiOauth.SubscriptionType
 			oauthAccessToken = creds.ClaudeAiOauth.AccessToken
+			oauthExpiresAtMs = creds.ClaudeAiOauth.ExpiresAt
 
 			// Auth notice for a credential that cannot renew itself. Chat-direct
 			// Claude spawns `claude --output-format stream-json` with env
@@ -488,14 +526,25 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// the pre-replay reading for the whole staleness TTL.
 	generation := claudeUsageProbe.refreshGeneration()
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
+	// A credential rewrite the run-debt schedule is waiting on (an expired token
+	// or a 401) makes its pending rung due now rather than at the age backoff.
+	nudgeClaudeCredentialChanged(credStamp)
 	if refreshClaudeUsageIfStaleAs(ctx, generation, now, claudeSnapshotFreshness(view, now), claudeUsageProbeIdentity{
 		token:       oauthAccessToken,
 		fingerprint: usage.AccountFingerprint,
 		scope:       cacheScopeAtCredentialRead,
 		scopePinned: true,
+		expiresAtMs: oauthExpiresAtMs,
+		credStamp:   credStamp,
 	}) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
+	// Again once the gather's seed may have restored a persisted wait and
+	// re-armed its rung: in a fresh process the call above finds no wait to
+	// compare against, so a credential rewritten before the restart would
+	// otherwise leave that rung standing until its time. A no-op when the call
+	// above already claimed this stamp's nudge.
+	nudgeClaudeCredentialChanged(credStamp)
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
