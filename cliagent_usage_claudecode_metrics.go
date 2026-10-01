@@ -91,6 +91,23 @@ type claudeRateLimitView struct {
 	// probedAtMs is the newest instant the utilization probe persisted a reading
 	// at, carried across from claudeRateLimitSnapshot.LastProbeObservedAtMs.
 	probedAtMs int64
+	// probeWeeklyAtMs is the newest instant a probe returned a WEEKLY window,
+	// carried across from claudeRateLimitSnapshot.LastProbeWeeklyObservedAtMs.
+	// Per-model weekly buckets observed before it are superseded in the weekly
+	// row (aggregateWeeklyMetric).
+	probeWeeklyAtMs int64
+}
+
+// claudeRateLimitViewFromSnapshot is the view of ONE snapshot, for a caller
+// already holding it (the seed's locked freshness check). Carries the same
+// snapshot-level probe evidence loadMergedClaudeRateLimitView does, so a check
+// made under the lock and one made off it judge the same rows.
+func claudeRateLimitViewFromSnapshot(snap claudeRateLimitSnapshot) claudeRateLimitView {
+	return claudeRateLimitView{
+		buckets:         snap.Buckets,
+		probedAtMs:      snap.LastProbeObservedAtMs,
+		probeWeeklyAtMs: snap.LastProbeWeeklyObservedAtMs,
+	}
 }
 
 // probeObservedAtMs is the newest instant a PROBE reading is on record for this
@@ -124,6 +141,9 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 		if snap.LastProbeObservedAtMs > view.probedAtMs {
 			view.probedAtMs = snap.LastProbeObservedAtMs
 		}
+		if snap.LastProbeWeeklyObservedAtMs > view.probeWeeklyAtMs {
+			view.probeWeeklyAtMs = snap.LastProbeWeeklyObservedAtMs
+		}
 		for window, bucket := range snap.Buckets {
 			prev, seen := view.buckets[window]
 			if !seen || bucket.ObservedAtMs > prev.ObservedAtMs {
@@ -147,25 +167,34 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 // fallback entry after the local credentials were removed.
 //
 // This is the load-then-shape convenience form. The parser itself takes the
-// split path (claudeCodeMetricsFromBuckets) because it has already read the
-// cache to decide whether to spend a utilization probe.
+// split path (claudeCodeMetricsFromView) because it has already read the cache
+// to decide whether to spend a utilization probe.
 func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	return claudeCodeMetricsFromBuckets(loadMergedClaudeRateLimitBuckets(currentFingerprint), now)
+	return claudeCodeMetricsFromView(loadMergedClaudeRateLimitView(currentFingerprint), now)
 }
 
-// claudeCodeMetricsFromBuckets shapes already-loaded buckets into the metric
-// rows. Split from the loading half so a caller that has just read the cache for
-// another reason — the parser's staleness check, which must know the freshest
-// observation before deciding whether to probe — does not read it a second time.
-// Each load also re-parses Claude's settings.json to locate the pinned hook
-// cache, so the duplicate was not free.
+// claudeCodeMetricsFromBuckets is claudeCodeMetricsFromView for bare buckets
+// with no snapshot-level probe evidence, so nothing is superseded. Kept for the
+// tests that shape hand-built buckets; production shapes from a view.
 func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now time.Time) []cliAgentUsageMetric {
+	return claudeCodeMetricsFromView(claudeRateLimitView{buckets: buckets}, now)
+}
+
+// claudeCodeMetricsFromView shapes an already-loaded view into the metric rows —
+// the one shaping entry point. Split from the loading half so a caller that has
+// just read the cache for another reason — the parser's staleness check, which
+// must know the freshest observation before deciding whether to probe — does not
+// read it a second time. Each load also re-parses Claude's settings.json to
+// locate the pinned hook cache, so the duplicate was not free.
+func claudeCodeMetricsFromView(view claudeRateLimitView, now time.Time) []cliAgentUsageMetric {
+	buckets := view.buckets
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, "5-hour session window", now)
 	// Weekly is reported under seven_day; some plans split it per-model. When
 	// both per-model buckets are present we aggregate CONSERVATIVELY so an
-	// exhausted Opus quota isn't hidden behind a healthier Sonnet number.
-	weekly := aggregateWeeklyMetric(buckets, now)
+	// exhausted Opus quota isn't hidden behind a healthier Sonnet number — but
+	// only across readings the newest weekly probe has not superseded.
+	weekly := aggregateWeeklyMetric(buckets, view.probeWeeklyAtMs, now)
 	// Fable is metered SEPARATELY from the weekly quota above — Claude Code's
 	// own /usage panel shows it as its own meter — so it is deliberately NOT
 	// folded into the aggregate. Always emitted: observedMetricOrUnknown returns
@@ -245,7 +274,16 @@ func claudeWeeklyWindowIDs() []string {
 // bucket and any per-model split (`seven_day_sonnet`, `seven_day_opus`). This
 // prevents a healthy Sonnet bucket from masking a depleted Opus bucket on
 // plans that emit them separately.
-func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
+//
+// probeWeeklyAtMs supersedes per-model readings: the probe writes every weekly
+// window the endpoint supplies and stamps them all with one instant, so a
+// per-model bucket observed BEFORE the newest probe that returned a weekly
+// window is one the endpoint no longer reports. Counting it pinned the row to an
+// old high-water mark (worst wins) that no probe could move, and the freshness
+// check then refused to re-probe it. See claudeWeeklyBucketsAfterSupersession
+// for the exceptions.
+func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, probeWeeklyAtMs int64, now time.Time) cliAgentUsageMetric {
+	buckets = claudeWeeklyBucketsAfterSupersession(buckets, probeWeeklyAtMs, now)
 	windowIDs := claudeWeeklyWindowIDs()
 	var (
 		observed      bool
@@ -343,6 +381,57 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		Total: floatPtr(100), Consumed: floatPtr(worstUsed), Remaining: floatPtr(100 - worstUsed),
 		ResetAt: resetAt, ObservedAt: observedAt,
 	}
+}
+
+// claudeWeeklyBucketsAfterSupersession drops the per-model weekly buckets the
+// newest weekly probe superseded (see aggregateWeeklyMetric), returning the
+// input unchanged when nothing is dropped.
+//
+// Two exceptions, both load-bearing:
+//
+//   - A still-live `rejected` bucket keeps counting. It is a hard per-model
+//     refusal the endpoint may not model, and hiding it behind a healthy
+//     unified number would tell the user they can run a model they cannot.
+//   - When supersession would leave the weekly row with no reading at all, the
+//     unfiltered buckets are used: an old reading beats an Unknown row.
+//
+// The unified `seven_day` is never superseded: the probe overwrites it whenever
+// it returns it, and when it does not, the probe said nothing about it.
+func claudeWeeklyBucketsAfterSupersession(buckets map[string]claudeRateLimitBucket, probeWeeklyAtMs int64, now time.Time) map[string]claudeRateLimitBucket {
+	if probeWeeklyAtMs <= 0 {
+		return buckets
+	}
+	var kept map[string]claudeRateLimitBucket
+	remaining := false
+	for _, id := range claudeWeeklyWindowIDs() {
+		b, ok := buckets[id]
+		if !ok {
+			continue
+		}
+		superseded := id != claudeWindowSevenDay && b.hasObservedUsage() &&
+			b.ObservedAtMs < probeWeeklyAtMs && !claudeBucketLiveRejected(b, now)
+		if !superseded {
+			remaining = remaining || b.hasObservedUsage()
+			continue
+		}
+		if kept == nil {
+			kept = make(map[string]claudeRateLimitBucket, len(buckets))
+			for k, v := range buckets {
+				kept[k] = v
+			}
+		}
+		delete(kept, id)
+	}
+	if kept == nil || !remaining {
+		return buckets
+	}
+	return kept
+}
+
+// claudeBucketLiveRejected reports a window the service refused that has not
+// reset yet.
+func claudeBucketLiveRejected(b claudeRateLimitBucket, now time.Time) bool {
+	return b.Status == claudeRateLimitStatusRejected && (b.ResetsAtMs <= 0 || now.UnixMilli() < b.ResetsAtMs)
 }
 
 // observedMetricOrUnknown returns a real percentage metric for the first window
@@ -472,7 +561,7 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 
 // stalestClaudeRowObservation returns the age of the snapshot as the DISPLAYED
 // CARD sees it: the oldest of the observations the three rows
-// claudeCodeMetricsFromBuckets emits actually SHOW, rather than the newest
+// claudeCodeMetricsFromView emits actually SHOW, rather than the newest
 // reading anywhere in the cache. Per row it asks claudeRowObservationsMs, which
 // reads the emitted metric rather than re-deriving which bucket the row picked.
 //
@@ -509,7 +598,7 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.Time {
 	probedAt := view.probeObservedAtMs()
 	stalest := int64(0)
-	for _, displayed := range claudeRowObservationsMs(view.buckets, now) {
+	for _, displayed := range claudeRowObservationsMs(view, now) {
 		if displayed <= 0 {
 			continue // never observed — see the doc comment
 		}
@@ -539,9 +628,11 @@ func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.T
 // newest-across-candidates freshness check called that row fresh on every
 // gather, suppressed the probe for the full staleness TTL, and left the visible
 // value hours old indefinitely. Freshness has to follow the bucket that actually
-// determines the row.
-func claudeRowObservationsMs(buckets map[string]claudeRateLimitBucket, now time.Time) []int64 {
-	metrics := claudeCodeMetricsFromBuckets(buckets, now)
+// determines the row — including which per-model weekly buckets a newer weekly
+// probe has superseded, so a superseded reading neither shows nor holds the
+// freshness check down.
+func claudeRowObservationsMs(view claudeRateLimitView, now time.Time) []int64 {
+	metrics := claudeCodeMetricsFromView(view, now)
 	out := make([]int64, 0, len(metrics))
 	for _, m := range metrics {
 		out = append(out, observedAtMsFromRFC3339(m.ObservedAt))

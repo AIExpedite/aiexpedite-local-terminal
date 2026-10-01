@@ -89,14 +89,21 @@ func TestClaudeOwedRefresh_SurvivesAgentRestart(t *testing.T) {
 	triggerClaudeUsageProbeAfterRun()
 	waitForClaudeDebt(t, cache, 5*time.Second)
 	claudeFreshnessWaitIdle(t)
-	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs < runEnded.Truncate(time.Millisecond).UnixMilli() {
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs < runEnded.Truncate(time.Millisecond).UnixMilli() {
 		t.Fatalf("the run's debt was not persisted at its completion: %+v", snap)
+	}
+	// The failed trailing attempt booked the ladder's next rung on disk, which is
+	// what the new process re-arms.
+	if snap.NextAttemptAtMs == 0 {
+		t.Fatalf("the failed trailing attempt booked no retry rung: %+v", snap)
 	}
 	before := atomic.LoadInt64(calls)
 
 	refuse.Store(false)
 	simulateClaudeAgentRestart(t)
-	payOwedClaudeUsageRefreshAt(time.Now())
+	// The new process starts once that rung has come due.
+	payOwedClaudeUsageRefreshAt(time.UnixMilli(snap.NextAttemptAtMs))
 	claudeFreshnessWaitIdle(t)
 
 	if got := atomic.LoadInt64(calls) - before; got != 1 {
@@ -142,15 +149,19 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 	settleOrDisarmClaudeSmokeRun(true)
 	waitForClaudeDebt(t, cache, 5*time.Second)
 	claudeFreshnessWaitIdle(t)
-	smokeDebt := claudeCacheSnapshot(t, cache).RefreshOwedAtMs
+	snap := claudeCacheSnapshot(t, cache)
+	smokeDebt := snap.RefreshOwedAtMs
 	if smokeDebt == 0 {
 		t.Fatal("a smoke that reached inference must owe a refresh")
+	}
+	if snap.NextAttemptAtMs == 0 {
+		t.Fatalf("the smoke's failed trailing attempt booked no retry rung: %+v", snap)
 	}
 	before := atomic.LoadInt64(calls)
 
 	refuse.Store(false)
 	simulateClaudeAgentRestart(t)
-	payOwedClaudeUsageRefreshAt(time.Now())
+	payOwedClaudeUsageRefreshAt(time.UnixMilli(snap.NextAttemptAtMs))
 	claudeFreshnessWaitIdle(t)
 
 	if got := atomic.LoadInt64(calls) - before; got != 1 {
@@ -165,7 +176,7 @@ func TestClaudeOwedRefresh_SmokeDebtSurvivesAgentRestart(t *testing.T) {
 }
 
 // The replay is exactly ONE attempt when it finds nothing; the remainder is
-// left to the next run, refresh or routine gather under the ordinary bounds.
+// booked on the retry ladder rather than attempted back to back.
 func TestClaudeOwedRefresh_RestartReplayIsExactlyOneAttempt(t *testing.T) {
 	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
 	now := time.Now()
@@ -186,24 +197,35 @@ func TestClaudeOwedRefresh_RestartReplayIsExactlyOneAttempt(t *testing.T) {
 	if snap.RefreshOwedAttempts != 1 {
 		t.Fatalf("RefreshOwedAttempts=%d, want exactly 1", snap.RefreshOwedAttempts)
 	}
+	if want := now.Add(claudeRunDebtRetryLadder[0]).UnixMilli(); snap.NextAttemptAtMs < want {
+		t.Fatalf("NextAttemptAtMs=%d, want the first rung (>= %d)", snap.NextAttemptAtMs, want)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("the replay booked a rung but armed no timer for it")
+	}
 }
 
 // Repeated restarts retire the debt at the attempt cap rather than issuing one
-// request per start for the whole of claudeRefreshOwedMaxAge.
+// request per start for the whole of claudeRefreshOwedMaxAge — each start
+// arriving as its persisted rung comes due.
 func TestClaudeOwedRefresh_RepeatedRestartsRetireAtTheAttemptCap(t *testing.T) {
 	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
 	now := time.Now()
 	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
 	claudeOweRunRefresh(now.Add(-time.Minute))
 
-	for i := 0; i < claudeUsageProbeAfterRunMaxAttempts+3; i++ {
+	at := now
+	for i := 0; i < claudeRefreshDebtMaxAttempts+3; i++ {
 		simulateClaudeAgentRestart(t)
-		payOwedClaudeUsageRefreshAt(now)
+		payOwedClaudeUsageRefreshAt(at)
 		claudeFreshnessWaitIdle(t)
+		if snap, ok := loadClaudeRateLimitSnapshot(cache); ok && snap.NextAttemptAtMs > 0 {
+			at = time.UnixMilli(snap.NextAttemptAtMs)
+		}
 	}
 
-	if atomic.LoadInt64(calls) != claudeUsageProbeAfterRunMaxAttempts {
-		t.Fatalf("request count=%d, want the cap %d", atomic.LoadInt64(calls), claudeUsageProbeAfterRunMaxAttempts)
+	if atomic.LoadInt64(calls) != claudeRefreshDebtMaxAttempts {
+		t.Fatalf("request count=%d, want the cap %d", atomic.LoadInt64(calls), claudeRefreshDebtMaxAttempts)
 	}
 	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
 		t.Fatalf("a debt at the attempt cap must be retired, paid or not: %+v", snap)

@@ -496,7 +496,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	}) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
-	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
+	usage.Metrics = claudeCodeMetricsFromView(view, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1313,4 +1314,39 @@ func TestRunCLISmoke_ReplaysAndFollowersOweNoRefresh(t *testing.T) {
 			t.Fatalf("debt %v is not from this run", debt)
 		}
 	})
+}
+
+// A passing smoke whose trailing probe fails books exactly one rung on the
+// retry ladder; a smoke that never reached inference books nothing.
+func TestClaudeSmokeDebt_FailedTrailingProbeBooksExactlyOneRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+
+	settleOrDisarmClaudeSmokeRun(false)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("a smoke that spent no turn owed or booked something: %+v", snap)
+	}
+	if claudeRunDebtRetryPending() || atomic.LoadInt64(calls) != 0 {
+		t.Fatal("a smoke that spent no turn armed a rung or probed")
+	}
+
+	booked := time.Now()
+	settleOrDisarmClaudeSmokeRun(true)
+	waitForClaudeDebt(t, cache, 5*time.Second)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want the one trailing attempt", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 {
+		t.Fatalf("RefreshOwedAttempts=%d, want the trailing attempt charged once", snap.RefreshOwedAttempts)
+	}
+	if min := booked.Add(claudeRunDebtRetryLadder[0]).UnixMilli(); snap.NextAttemptAtMs < min {
+		t.Fatalf("NextAttemptAtMs=%d, want the first rung (>= %d)", snap.NextAttemptAtMs, min)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("the booked rung has no timer")
+	}
 }

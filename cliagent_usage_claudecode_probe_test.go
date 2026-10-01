@@ -707,7 +707,7 @@ func TestStalestClaudeRowObservation_FollowsTheConstrainingWeeklyBucket(t *testi
 		},
 	}
 
-	weekly := aggregateWeeklyMetric(buckets, now)
+	weekly := aggregateWeeklyMetric(buckets, 0, now)
 	if weekly.ObservedAt != observedAtRFC3339(stale.UnixMilli()) {
 		t.Fatalf("precondition: weekly row displays ObservedAt=%q, want the constraining Opus reading %q",
 			weekly.ObservedAt, observedAtRFC3339(stale.UnixMilli()))
@@ -3175,7 +3175,7 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 
 	// Same instant as the holder — what a coarse clock hands the loser.
 	admitted, issued, refreshed, observedAt, probeErr := probeClaudeUsageAdmitted(
-		context.Background(), holderAt, claudeUsageProbeStoredIdentity, holderAt, false)
+		context.Background(), holderAt, claudeUsageProbeStoredIdentity, holderAt, false, claudeUsageProbeTimeout)
 	if admitted || issued {
 		t.Errorf("a probe refused by the single-flight latch reported admitted=%v issued=%v", admitted, issued)
 	}
@@ -3189,7 +3189,7 @@ func TestClaudeUsageProbe_RefusedAtTheHoldersInstantIsNotAdmitted(t *testing.T) 
 	// Release the slot: the same call at the same instant is now admitted.
 	claudeUsageProbe.finish(nil, false, time.Time{}, "")
 	admitted, issued, _, _, _ = probeClaudeUsageAdmitted(
-		context.Background(), holderAt, func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }, holderAt, false)
+		context.Background(), holderAt, func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }, holderAt, false, claudeUsageProbeTimeout)
 	if !admitted {
 		t.Error("with the slot free, the attempt must report itself admitted")
 	}
@@ -3269,9 +3269,11 @@ func TestClaudeUsageProbeAfterRun_PersistenceGetsItsOwnBudget(t *testing.T) {
 
 // A post-run probe resolves the stored credential only after it owns the gate.
 // On macOS that phase has its own bounded Keychain command, so the root deadline
-// and every joiner must leave room for it in addition to request and persist.
+// and every joiner must leave room for it in addition to request and persist —
+// and the request is the TRAILING bound, the longer of the two, so a forced
+// refresh joining a post-run probe on the wire waits it out.
 func TestClaudeUsageProbeWholeTimeoutIncludesCredentialLookup(t *testing.T) {
-	want := machineInfoProbeTimeout + claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
+	want := machineInfoProbeTimeout + claudeUsageProbeTrailingRequestTimeout + claudeRateLimitVerifiedPersistBudget
 	if claudeUsageProbeWholeTimeout != want {
 		t.Fatalf("whole timeout=%v, want credential + request + persist = %v",
 			claudeUsageProbeWholeTimeout, want)
@@ -3418,5 +3420,200 @@ func TestClaudeUsageProbeGate_CacheSeedIsAccountScoped(t *testing.T) {
 	claudeUsageProbe.seedOwedFromCache(context.Background(), "someone-else", probeTestToken, claudeUsageProbe.refreshGeneration(), time.Now(), time.Time{})
 	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
 		t.Fatalf("another account's debt was seeded onto this gather: %v", owed)
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Weekly supersession and the trailing request bound                          */
+/* -------------------------------------------------------------------------- */
+
+// claudeWeeklyRow is the unscoped weekly row of the card.
+func claudeWeeklyRow(t *testing.T, metrics []cliAgentUsageMetric) cliAgentUsageMetric {
+	t.Helper()
+	for _, m := range metrics {
+		if m.Kind == limitKindWeekly && m.Model == "" {
+			return m
+		}
+	}
+	t.Fatalf("no weekly row in %+v", metrics)
+	return cliAgentUsageMetric{}
+}
+
+// A per-model bucket observed before the newest weekly probe is superseded: a
+// fresh probe reading of 20% replaces an older Opus 90%, and the row carries the
+// probe's observation.
+func TestClaudeWeeklyRow_PreProbePerModelBucketIsSuperseded(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	probedAt := now.Add(-time.Minute)
+	reset := now.Add(72 * time.Hour).UnixMilli()
+	view := claudeRateLimitView{
+		buckets: map[string]claudeRateLimitBucket{
+			claudeWindowSevenDay: {
+				UsedPercentage: 20, ResetsAtMs: reset, ObservedAtMs: probedAt.UnixMilli(),
+				UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceProbe,
+			},
+			claudeWindowSevenDayOpus: {
+				UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: now.Add(-5 * time.Hour).UnixMilli(),
+				UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceStream,
+			},
+		},
+		probedAtMs:      probedAt.UnixMilli(),
+		probeWeeklyAtMs: probedAt.UnixMilli(),
+	}
+	weekly := claudeWeeklyRow(t, claudeCodeMetricsFromView(view, now))
+	if weekly.Consumed == nil || *weekly.Consumed != 20 {
+		t.Fatalf("weekly row = %+v, want the probe's 20%%", weekly)
+	}
+	if weekly.ObservedAt != observedAtRFC3339(probedAt.UnixMilli()) {
+		t.Fatalf("weekly ObservedAt=%q, want the probe's %q", weekly.ObservedAt, observedAtRFC3339(probedAt.UnixMilli()))
+	}
+	if got := stalestClaudeRowObservation(view, now); !got.Equal(probedAt) {
+		t.Fatalf("freshness=%v, want the probe's instant %v — a superseded bucket must not pin it", got, probedAt)
+	}
+}
+
+// A probe that returned only the session window says nothing about the weekly
+// buckets, so an older per-model reading still constrains the row.
+func TestClaudeWeeklyRow_SessionOnlyProbeSupersedesNothing(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	reset := now.Add(72 * time.Hour).UnixMilli()
+	old := now.Add(-3 * time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayOpus: {UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: old.UnixMilli(), usageKnown: true},
+	}, old, fp, claudeRateLimitSourceStream)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, fp, claudeRateLimitSourceProbe)
+
+	if snap := claudeCacheSnapshot(t, cache); snap.LastProbeWeeklyObservedAtMs != 0 {
+		t.Fatalf("a session-only probe recorded weekly evidence: %+v", snap)
+	}
+	weekly := claudeWeeklyRow(t, claudeCodeMetricsFromCache(now, fp))
+	if weekly.Consumed == nil || *weekly.Consumed != 90 {
+		t.Fatalf("weekly row = %+v, want the Opus 90%% still constraining", weekly)
+	}
+}
+
+// A status-line seven_day written AFTER a weekly probe overwrites that window's
+// provenance, but not the snapshot-level evidence: the old per-model bucket
+// stays superseded.
+func TestClaudeWeeklyRow_LaterStatusLineDoesNotUndoSupersession(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	reset := now.Add(72 * time.Hour).UnixMilli()
+	old := now.Add(-3 * time.Hour)
+	probedAt := now.Add(-2 * time.Minute)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayOpus: {UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: old.UnixMilli(), usageKnown: true},
+	}, old, fp, claudeRateLimitSourceStream)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {UsedPercentage: 20, ResetsAtMs: reset, ObservedAtMs: probedAt.UnixMilli(), usageKnown: true},
+	}, probedAt, fp, claudeRateLimitSourceProbe)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {UsedPercentage: 25, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, fp, claudeRateLimitSourceStatusLine)
+
+	if snap := claudeCacheSnapshot(t, cache); snap.LastProbeWeeklyObservedAtMs != probedAt.UnixMilli() {
+		t.Fatalf("LastProbeWeeklyObservedAtMs=%d, want the probe's %d", snap.LastProbeWeeklyObservedAtMs, probedAt.UnixMilli())
+	}
+	weekly := claudeWeeklyRow(t, claudeCodeMetricsFromCache(now, fp))
+	if weekly.Consumed == nil || *weekly.Consumed != 25 {
+		t.Fatalf("weekly row = %+v, want the status line's 25%% with Opus superseded", weekly)
+	}
+}
+
+// A still-live REJECTED per-model bucket keeps constraining the row: a hard
+// refusal the endpoint may not model is never hidden behind a healthy number.
+func TestClaudeWeeklyRow_LiveRejectedPerModelBucketStillConstrains(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	probedAt := now.Add(-time.Minute)
+	reset := now.Add(72 * time.Hour).UnixMilli()
+	view := claudeRateLimitView{
+		buckets: map[string]claudeRateLimitBucket{
+			claudeWindowSevenDay: {
+				UsedPercentage: 20, ResetsAtMs: reset, ObservedAtMs: probedAt.UnixMilli(),
+				UsageObserved: usageObservedPtr(true),
+			},
+			claudeWindowSevenDayOpus: {
+				UsedPercentage: 100, ResetsAtMs: reset, ObservedAtMs: now.Add(-time.Hour).UnixMilli(),
+				UsageObserved: usageObservedPtr(true), Status: claudeRateLimitStatusRejected,
+			},
+		},
+		probeWeeklyAtMs: probedAt.UnixMilli(),
+	}
+	weekly := claudeWeeklyRow(t, claudeCodeMetricsFromView(view, now))
+	if weekly.Consumed == nil || *weekly.Consumed != 100 {
+		t.Fatalf("weekly row = %+v, want the live rejected Opus bucket's 100%%", weekly)
+	}
+}
+
+// The seed's LOCKED freshness check builds its view from the snapshot it holds,
+// and must judge it exactly like the unlocked loader: once a weekly probe covers
+// an old per-model bucket, that bucket no longer reads as stale.
+func TestClaudeRateLimitViewFromSnapshot_JudgesSupersededWeeklyAsFresh(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	probedAt := now.Add(-time.Minute)
+	old := now.Add(-5 * time.Hour)
+	reset := now.Add(72 * time.Hour).UnixMilli()
+	snap := claudeRateLimitSnapshot{
+		Buckets: map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: probedAt.UnixMilli(), UsageObserved: usageObservedPtr(true)},
+			claudeWindowSevenDay: {UsedPercentage: 20, ResetsAtMs: reset,
+				ObservedAtMs: probedAt.UnixMilli(), UsageObserved: usageObservedPtr(true)},
+			claudeWindowSevenDayOpus: {UsedPercentage: 90, ResetsAtMs: reset,
+				ObservedAtMs: old.UnixMilli(), UsageObserved: usageObservedPtr(true)},
+		},
+		LastProbeObservedAtMs:       probedAt.UnixMilli(),
+		LastProbeWeeklyObservedAtMs: probedAt.UnixMilli(),
+	}
+	if got := claudeSnapshotFreshness(claudeRateLimitViewFromSnapshot(snap), now); !got.Equal(probedAt) {
+		t.Fatalf("locked freshness=%v, want the probe's %v", got, probedAt)
+	}
+	// Without the weekly evidence the same buckets read as the old Opus row —
+	// the stale-card state the evidence exists to end.
+	snap.LastProbeWeeklyObservedAtMs = 0
+	snap.LastProbeObservedAtMs = 0
+	if got := claudeSnapshotFreshness(claudeRateLimitViewFromSnapshot(snap), now); !got.Equal(old) {
+		t.Fatalf("freshness without weekly evidence=%v, want the Opus reading %v", got, old)
+	}
+}
+
+// The gather keeps its 3s request bound, while the post-run debt path's longer
+// bound reaches the HTTP client AND the dialer: an endpoint that accepts and
+// answers after 4s fails the gather and pays the trailing attempt.
+func TestClaudeUsageProbe_TrailingAttemptOutlastsTheGatherTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out a 4s stand-in twice")
+	}
+	resets := time.Now().Add(time.Hour)
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(4 * time.Second):
+		case <-r.Context().Done():
+			return
+		}
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":42,"resets_at":%d}]}`, resets.Unix())
+	})
+	identity := func() claudeUsageProbeIdentity {
+		return claudeUsageProbeIdentity{token: probeTestToken, fingerprint: currentClaudeAccountFingerprint()}
+	}
+
+	_, issued, refreshed, _, probeErr := probeClaudeUsageAdmitted(context.Background(), time.Now(), identity, time.Time{}, false, claudeUsageProbeTimeout)
+	if !issued || refreshed || probeErr == nil || probeErr.ErrorCategory != cliUsageErrorProviderTimeout {
+		t.Fatalf("gather path: issued=%v refreshed=%v err=%+v, want a timeout at the 3s bound", issued, refreshed, probeErr)
+	}
+
+	baseline := time.Now()
+	claudeUsageProbe.recordOwed(baseline)
+	result := claudeUsageProbeAttemptIssuedAs(baseline, identity)
+	if !result.done || !result.issued || result.kept != claudeRetryNone || result.outcome != claudeRefreshOutcomeOK {
+		t.Fatalf("trailing attempt = %+v, want it paid inside the trailing bound", result)
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Fatalf("request count=%d, want 2", got)
 	}
 }

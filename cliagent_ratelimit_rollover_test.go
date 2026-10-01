@@ -277,7 +277,7 @@ func TestWeeklyAggregateReportsALiveResetWhenNoSubWindowWasObserved(t *testing.T
 		claudeWindowSevenDay: {ResetsAtMs: reset.UnixMilli(), UsageObserved: usageObservedPtr(false)},
 	}
 
-	metric := aggregateWeeklyMetric(buckets, now)
+	metric := aggregateWeeklyMetric(buckets, 0, now)
 	if !metric.Unknown {
 		t.Fatalf("metric = %+v, want Unknown", metric)
 	}
@@ -297,7 +297,7 @@ func TestWeeklyAggregateStillReportsAnObservedSubWindow(t *testing.T) {
 		claudeWindowSevenDaySonnet: {UsedPercentage: 12, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli()},
 	}
 
-	metric := aggregateWeeklyMetric(buckets, now)
+	metric := aggregateWeeklyMetric(buckets, 0, now)
 	if metric.Unknown || metric.Consumed == nil || *metric.Consumed != 64 {
 		t.Fatalf("metric = %+v, want the worst observed sub-window (64%%)", metric)
 	}
@@ -320,7 +320,7 @@ func TestWeeklyAggregateUsesOldestObservationAcrossTiedConstraints(t *testing.T)
 		},
 	}
 
-	metric := aggregateWeeklyMetric(buckets, now)
+	metric := aggregateWeeklyMetric(buckets, 0, now)
 	if metric.ObservedAt != observedAtRFC3339(stale.UnixMilli()) {
 		t.Fatalf("ObservedAt=%q, want oldest tied constraint %q",
 			metric.ObservedAt, observedAtRFC3339(stale.UnixMilli()))
@@ -344,4 +344,48 @@ func metricByLabel(t *testing.T, metrics []cliAgentUsageMetric, label string) cl
 	}
 	t.Fatalf("no metric labelled %q in %+v", label, metrics)
 	return cliAgentUsageMetric{}
+}
+
+// Once a newer weekly probe supersedes per-model readings, a tied per-model
+// bucket observed BEFORE that probe no longer drags the row's freshness back to
+// its own stale instant: the endpoint's current answer is the unified reading.
+func TestWeeklyAggregateTieNoLongerReportsASupersededObservation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	probedAt := now.Add(-time.Minute)
+	stale := now.Add(-20 * time.Minute)
+	reset := now.Add(60 * time.Hour).UnixMilli()
+	buckets := map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay:     {UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: probedAt.UnixMilli()},
+		claudeWindowSevenDayOpus: {UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: stale.UnixMilli()},
+	}
+
+	metric := aggregateWeeklyMetric(buckets, probedAt.UnixMilli(), now)
+	if metric.ObservedAt != observedAtRFC3339(probedAt.UnixMilli()) {
+		t.Fatalf("ObservedAt=%q, want the probe's %q", metric.ObservedAt, observedAtRFC3339(probedAt.UnixMilli()))
+	}
+}
+
+// A rolled-over per-model bucket is neutralised with or without supersession,
+// and the aggregate keeps the unified bucket's live reset either way.
+func TestWeeklyAggregateRolledOverPerModelBucketStaysNeutralisedUnderSupersession(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	probedAt := now.Add(-time.Minute)
+	liveReset := now.Add(60 * time.Hour).UnixMilli()
+	buckets := map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {UsedPercentage: 30, ResetsAtMs: liveReset, ObservedAtMs: probedAt.UnixMilli()},
+		claudeWindowSevenDayOpus: {
+			UsedPercentage: 95, ResetsAtMs: now.Add(-time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-3 * time.Hour).UnixMilli(),
+		},
+	}
+
+	for _, probeWeeklyAtMs := range []int64{0, probedAt.UnixMilli()} {
+		metric := aggregateWeeklyMetric(buckets, probeWeeklyAtMs, now)
+		if metric.Unknown || metric.Consumed == nil || *metric.Consumed != 30 {
+			t.Fatalf("probeWeeklyAtMs=%d: metric = %+v, want the unified 30%%", probeWeeklyAtMs, metric)
+		}
+		if metric.ResetAt != time.UnixMilli(liveReset).UTC().Format(time.RFC3339) {
+			t.Fatalf("probeWeeklyAtMs=%d: ResetAt = %q, want the unified bucket's live reset", probeWeeklyAtMs, metric.ResetAt)
+		}
+	}
 }

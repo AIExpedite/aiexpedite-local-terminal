@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -129,5 +130,84 @@ func assertClaudeSnapshotStringsRedacted(t *testing.T, path string, v any) {
 			!claudeRedactedEnum.MatchString(val) {
 			t.Errorf("snapshot field %s holds free text %q", path, val)
 		}
+	}
+}
+
+// claudeRefreshOutcomeLine is the ONLY shape a Claude refresh log line may take:
+// a fixed prefix, a label from the closed set, and two integers.
+var claudeRefreshOutcomeLine = regexp.MustCompile(
+	`^(\x1b\[\d+m)?\[claude-usage\] refresh outcome=(ok|held|timeout|unauthorized|http_error|parse_failed|not_covering|refused|scheduled|retired) attempts=\d+/\d+(\x1b\[0m)?$`)
+
+// The ladder's persisted additions are integers, and every refresh outcome it
+// logs is a closed-set label plus integers — no token, path, fingerprint or
+// response body, even when the failing response carries them.
+func TestClaudeRunDebtLadder_PersistsIntegersAndLogsClosedLabels(t *testing.T) {
+	const tokenMarker = "sk-ant-oat-LEAK-in-error-body-41d0"
+	resets := time.Now().Add(time.Hour)
+	var fail atomic.Bool
+	fail.Store(true)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprintf(w, `{"error":%q,"path":"C:\\Users\\someone\\.claude"}`, tokenMarker)
+			return
+		}
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":11,"resets_at":%d},{"kind":"weekly_all","percent":22,"resets_at":%d}]}`,
+			resets.Unix(), resets.Unix())
+	})
+	pinClaudeRunDebtLadder(t, []time.Duration{100 * time.Millisecond}, 100*time.Millisecond)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	fp := currentClaudeAccountFingerprint()
+	home, _ := os.UserHomeDir()
+
+	var snap claudeRateLimitSnapshot
+	out := captureStdout(t, func() {
+		triggerClaudeUsageProbeAfterRun()
+		waitForClaudeDebt(t, cache, 5*time.Second)
+		claudeFreshnessWaitIdle(t)
+		snap = claudeCacheSnapshot(t, cache)
+		fail.Store(false)
+		waitForClaudeProbeReading(t, cache, 10*time.Second)
+		claudeFreshnessWaitIdle(t)
+	})
+
+	if snap.NextAttemptAtMs == 0 {
+		t.Fatalf("the failed attempt booked no rung: %+v", snap)
+	}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := decoded["lastProbeWeeklyObservedAtMs"]; !ok {
+		t.Error("a weekly probe reading persisted no lastProbeWeeklyObservedAtMs")
+	} else if _, isNumber := v.(float64); !isNumber {
+		t.Errorf("lastProbeWeeklyObservedAtMs is %T, want a number", v)
+	}
+	assertClaudeSnapshotStringsRedacted(t, "", decoded)
+	if strings.Contains(string(raw), tokenMarker) {
+		t.Error("the persisted snapshot leaks the error body")
+	}
+
+	lines := 0
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "[claude-usage]") {
+			continue
+		}
+		lines++
+		if !claudeRefreshOutcomeLine.MatchString(strings.TrimRight(line, "\r")) {
+			t.Errorf("refresh log line is not a closed label plus integers: %q", line)
+		}
+		for _, leak := range []string{tokenMarker, probeTestToken, "Users", fp, home} {
+			if leak != "" && strings.Contains(line, leak) {
+				t.Errorf("refresh log line leaks %q: %q", leak, line)
+			}
+		}
+	}
+	if lines == 0 {
+		t.Fatal("the ladder logged no refresh outcome at all")
 	}
 }

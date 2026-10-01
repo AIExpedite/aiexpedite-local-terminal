@@ -181,6 +181,20 @@ type claudeRateLimitSnapshot struct {
 	// on the way out by payOwedClaudeUsageRefresh, so a hostile or skewed value
 	// cannot disable utilization for days.
 	HeldUntilMs int64 `json:"heldUntilMs,omitempty"`
+	// NextAttemptAtMs is the persisted rung of the run-refresh retry ladder
+	// (cliagent_usage_claudecode_refresh_schedule.go): when the next attempt at
+	// RefreshOwedAtMs is due. Persisted so a restart or self-update re-arms the
+	// remaining schedule instead of replaying early or dropping it. Cleared with
+	// the debt.
+	NextAttemptAtMs int64 `json:"nextAttemptAtMs,omitempty"`
+	// LastProbeWeeklyObservedAtMs is the newest instant a PROBE returned a weekly
+	// window (claudeWeeklyWindowIDs) with a usage reading. A per-model
+	// seven_day_* bucket observed before it is superseded in the weekly
+	// aggregate (aggregateWeeklyMetric). Kept apart from LastProbeObservedAtMs
+	// because a probe that returned no weekly window says nothing about the
+	// per-model buckets, and apart from per-bucket provenance because a later
+	// status-line seven_day write overwrites Source and would erase the evidence.
+	LastProbeWeeklyObservedAtMs int64 `json:"lastProbeWeeklyObservedAtMs,omitempty"`
 }
 
 // clearClaudeRefreshDebt drops the owed-refresh marker and its attempt counter,
@@ -188,10 +202,10 @@ type claudeRateLimitSnapshot struct {
 // paid, retired or account-scoped-away debt says nothing about whether the
 // service has asked us to slow down.
 func clearClaudeRefreshDebt(snap *claudeRateLimitSnapshot) bool {
-	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 {
+	if snap.RefreshOwedAtMs == 0 && snap.RefreshOwedAttempts == 0 && snap.NextAttemptAtMs == 0 {
 		return false
 	}
-	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = 0, 0
+	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 0, 0, 0
 	return true
 }
 
@@ -796,12 +810,12 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 		// Probe evidence is an observation about ONE account's quota, so it
 		// crosses an account boundary no more than a bucket does.
-		snap.LastProbeObservedAtMs = 0
-		// Neither does a post-run debt or a 429 hold. Paying the previous
-		// account's debt against this one's quota would spend a request for a
-		// reading that can never cover it, and inheriting its hold would park
-		// the new account's probe behind backpressure it never earned.
-		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
+		snap.LastProbeObservedAtMs, snap.LastProbeWeeklyObservedAtMs = 0, 0
+		// Neither does a post-run debt, its retry rung or a 429 hold. Paying the
+		// previous account's debt against this one's quota would spend a request
+		// for a reading that can never cover it, and inheriting its hold would
+		// park the new account's probe behind backpressure it never earned.
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs, snap.NextAttemptAtMs = 0, 0, 0, 0
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -892,6 +906,14 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		for _, bucket := range updates {
 			if bucket.usageKnown && bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
 				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
+			}
+		}
+		// Same rule, for the weekly windows only: the instant before which a
+		// per-model weekly bucket is superseded (see LastProbeWeeklyObservedAtMs).
+		for _, window := range claudeWeeklyWindowIDs() {
+			if bucket, ok := updates[window]; ok && bucket.usageKnown &&
+				bucket.ObservedAtMs > snap.LastProbeWeeklyObservedAtMs {
+				snap.LastProbeWeeklyObservedAtMs = bucket.ObservedAtMs
 			}
 		}
 	}

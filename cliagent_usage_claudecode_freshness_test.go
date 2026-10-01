@@ -137,7 +137,7 @@ func TestClaudeOweRunRefresh_NewerBaselineResetsTheAttemptBudget(t *testing.T) {
 	first := time.Now().Add(-time.Minute)
 	claudeOweRunRefresh(first)
 	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-		snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
+		snap.RefreshOwedAttempts = claudeRefreshDebtMaxAttempts
 		return true
 	})
 
@@ -949,7 +949,7 @@ func TestClaudeUsageProbeGate_CacheSeedSkipsADebtTheReplayWouldRetire(t *testing
 		owedAgo  time.Duration
 		attempts int
 	}{
-		{"at the attempt cap", time.Minute, claudeUsageProbeAfterRunMaxAttempts},
+		{"at the attempt cap", time.Minute, claudeRefreshDebtMaxAttempts},
 		{"past the age limit", claudeRefreshOwedMaxAge + time.Minute, 0},
 		{"stamped beyond the skew ceiling", -2 * claudeRefreshOwedLocalSkew, 0},
 	}
@@ -1445,10 +1445,10 @@ func TestClaudeUsageProbeAttemptIssuedAs_IssuesWithThePinnedIdentity(t *testing.
 	writeClaudeProbeCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "sk-ant-oat-other-account")
 
 	identity := claudeUsageProbeIdentity{token: pinnedToken, fingerprint: pinnedFingerprint}
-	done, issued := claudeUsageProbeAttemptIssuedAs(now.Add(-time.Minute), func() claudeUsageProbeIdentity {
+	result := claudeUsageProbeAttemptIssuedAs(now.Add(-time.Minute), func() claudeUsageProbeIdentity {
 		return identity
 	})
-	if !done || !issued {
+	if done, issued := result.done, result.issued; !done || !issued {
 		t.Fatalf("done=%v issued=%v, want the pinned attempt to spend its turn", done, issued)
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -1809,7 +1809,7 @@ func TestClaudeUsageProbe_UnissuedAdmissionRefundsTheThrottleSlot(t *testing.T) 
 	claudeUsageProbe.mu.Unlock()
 
 	noToken := func() claudeUsageProbeIdentity { return claudeUsageProbeIdentity{} }
-	admitted, issued, _, _, _ := probeClaudeUsageAdmitted(context.Background(), time.Now(), noToken, time.Time{}, false)
+	admitted, issued, _, _, _ := probeClaudeUsageAdmitted(context.Background(), time.Now(), noToken, time.Time{}, false, claudeUsageProbeTimeout)
 	if !admitted || issued {
 		t.Fatalf("admitted=%v issued=%v, want an admitted attempt that issued nothing", admitted, issued)
 	}
@@ -1836,15 +1836,15 @@ func TestAdjustClaudeRefreshAttemptsAt_RefusesAChargePastTheCap(t *testing.T) {
 	fp := currentClaudeAccountFingerprint()
 	judged := time.Now().Add(-time.Minute)
 
-	seedClaudeRefreshDebt(t, cache, fp, judged, claudeUsageProbeAfterRunMaxAttempts-1, time.Time{})
+	seedClaudeRefreshDebt(t, cache, fp, judged, claudeRefreshDebtMaxAttempts-1, time.Time{})
 	if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
 		t.Fatal("the first charge up to the cap must land")
 	}
 	if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(judged, +1)) {
 		t.Fatal("a second charge that read the same pre-cap count was allowed past the cap")
 	}
-	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeUsageProbeAfterRunMaxAttempts {
-		t.Fatalf("attempts=%d, want the cap %d", got, claudeUsageProbeAfterRunMaxAttempts)
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeRefreshDebtMaxAttempts {
+		t.Fatalf("attempts=%d, want the cap %d", got, claudeRefreshDebtMaxAttempts)
 	}
 }
 
@@ -1858,7 +1858,7 @@ func TestClaudeUsageProbe_RejectedEndpointIsNotIssued(t *testing.T) {
 	identity := func() claudeUsageProbeIdentity {
 		return claudeUsageProbeIdentity{token: "token", fingerprint: currentClaudeAccountFingerprint()}
 	}
-	admitted, issued, refreshed, _, probeErr := probeClaudeUsageAdmitted(context.Background(), time.Now(), identity, time.Time{}, false)
+	admitted, issued, refreshed, _, probeErr := probeClaudeUsageAdmitted(context.Background(), time.Now(), identity, time.Time{}, false, claudeUsageProbeTimeout)
 	if !admitted || issued || refreshed {
 		t.Fatalf("admitted=%v issued=%v refreshed=%v, want an admitted attempt that issued nothing", admitted, issued, refreshed)
 	}
@@ -2122,7 +2122,7 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 			seedClaudeProbeReading(t, cache, latest)
 			owed := now.Add(-time.Minute)
 			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-				snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed.UnixMilli(), claudeUsageProbeAfterRunMaxAttempts-1
+				snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed.UnixMilli(), claudeRefreshDebtMaxAttempts-1
 				return true
 			})
 
@@ -2141,7 +2141,7 @@ func TestClaudeUsageProbeGate_CacheReSeedDropsAnAdoptedDebtThatWasRetired(t *tes
 
 			// The replay charges the final attempt and fails, rewriting the snapshot.
 			mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
-				snap.RefreshOwedAttempts = claudeUsageProbeAfterRunMaxAttempts
+				snap.RefreshOwedAttempts = claudeRefreshDebtMaxAttempts
 				return true
 			})
 			// seedOwedFromCache latches its adoption to (mtime, size), and this write
@@ -2237,7 +2237,7 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 
 	// Each pass is a fresh process inheriting the same cache: only the gate is
 	// reset, exactly as a self-update restart leaves things.
-	for attempt := 1; attempt <= claudeUsageProbeAfterRunMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= claudeRefreshDebtMaxAttempts; attempt++ {
 		resetClaudeUsageProbeGate()
 		SetClaudeUsageProbeDisabled(false)
 		claudeUsageProbe.seedOwedFromCache(context.Background(), fp, probeTestToken, claudeUsageProbe.refreshGeneration(), now, latest)
@@ -2261,8 +2261,8 @@ func TestClaudeUsageProbeGate_CacheSeedChargesTheDebtItAdopts(t *testing.T) {
 	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
 		t.Errorf("a capped debt was adopted as %v; the gather would issue an uncharged request for it", got)
 	}
-	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != claudeUsageProbeAfterRunMaxAttempts {
-		t.Errorf("RefreshOwedAttempts=%d, want it held at the cap %d", attempts, claudeUsageProbeAfterRunMaxAttempts)
+	if _, attempts, _ := claudePersistedProbeStateFor(fp); attempts != claudeRefreshDebtMaxAttempts {
+		t.Errorf("RefreshOwedAttempts=%d, want it held at the cap %d", attempts, claudeRefreshDebtMaxAttempts)
 	}
 }
 
@@ -3376,5 +3376,151 @@ func TestRefreshClaudeUsageIfStaleAs_JudgesTheGathersPinnedScope(t *testing.T) {
 	}
 	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 9 {
 		t.Errorf("five-hour utilization=%v, want the new account's own 9 — account A's reading overwrote it", got)
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* The four-request budget and the persisted rung                              */
+/* -------------------------------------------------------------------------- */
+
+// The locked charge accepts the 3rd and 4th attempt — the ladder's last two
+// rungs — and refuses a 5th. Left at the old cap of 2 those rungs would be
+// refused under the lock and never send.
+func TestAdjustClaudeRefreshAttemptsAt_AcceptsTheWholeDebtBudget(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	owed := time.Now().Add(-time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, 2, time.Time{})
+
+	for want := 3; want <= claudeRefreshDebtMaxAttempts; want++ {
+		if !mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+			t.Fatalf("charge %d was refused", want)
+		}
+	}
+	if mutateClaudeRateLimitSnapshot(cache, fp, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+		t.Fatal("a charge past the four-request budget was accepted")
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != claudeRefreshDebtMaxAttempts {
+		t.Fatalf("attempts=%d, want %d", got, claudeRefreshDebtMaxAttempts)
+	}
+	if claudeRefreshDebtRetired(owed, claudeRefreshDebtMaxAttempts-1, time.Now()) {
+		t.Fatal("a debt with one request left was retired")
+	}
+	if !claudeRefreshDebtRetired(owed, claudeRefreshDebtMaxAttempts, time.Now()) {
+		t.Fatal("a debt that spent its budget was not retired")
+	}
+}
+
+// A debt whose only remnant is a booked rung is still something to clear.
+func TestClearClaudeRefreshDebt_ClearsALoneRung(t *testing.T) {
+	snap := claudeRateLimitSnapshot{NextAttemptAtMs: time.Now().UnixMilli()}
+	if !clearClaudeRefreshDebt(&snap) {
+		t.Fatal("a lone NextAttemptAtMs was reported as nothing to clear")
+	}
+	if snap.NextAttemptAtMs != 0 {
+		t.Fatalf("NextAttemptAtMs=%d, want 0", snap.NextAttemptAtMs)
+	}
+	if clearClaudeRefreshDebt(&snap) {
+		t.Fatal("an empty debt reported a change")
+	}
+}
+
+// The rung belongs to one debt: a newer run's owe, the settling probe merge,
+// and an account switch all clear it.
+func TestClaudeNextAttemptAt_ClearedWithItsDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	book := func(owed time.Time) {
+		t.Helper()
+		seedClaudeRefreshDebt(t, cache, fp, owed, 1, time.Time{})
+		if !claudeScheduleRunDebtRetry(fp, owed, claudeRetryAfterRequest, time.Now()) {
+			t.Fatal("precondition: the rung was not booked")
+		}
+		stopClaudeRunDebtRetry()
+	}
+
+	// A newer run advances the debt.
+	book(time.Now().Add(-time.Minute))
+	claudeOweRunRefresh(time.Now())
+	if snap := claudeCacheSnapshot(t, cache); snap.NextAttemptAtMs != 0 || snap.RefreshOwedAttempts != 0 {
+		t.Fatalf("a newer run kept the old debt's rung or budget: %+v", snap)
+	}
+
+	// The covering probe merge settles it.
+	owed := time.Now().Add(-time.Minute)
+	book(owed)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 9, ResetsAtMs: time.Now().Add(time.Hour).UnixMilli(),
+			ObservedAtMs: time.Now().UnixMilli(), usageKnown: true},
+	}, time.Now(), fp, claudeRateLimitSourceProbe)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("a settled debt kept its rung: %+v", snap)
+	}
+
+	// An account switch drops it with everything else.
+	book(time.Now().Add(-time.Minute))
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 9, ResetsAtMs: time.Now().Add(time.Hour).UnixMilli(),
+			ObservedAtMs: time.Now().UnixMilli(), usageKnown: true},
+	}, time.Now(), fp+"0ther", claudeRateLimitSourceStatusLine)
+	if snap := claudeCacheSnapshot(t, cache); snap.NextAttemptAtMs != 0 || snap.LastProbeWeeklyObservedAtMs != 0 {
+		t.Fatalf("an account switch kept the previous account's rung or weekly evidence: %+v", snap)
+	}
+}
+
+// The startup replay honours a rung the previous process booked: it arms the
+// timer for it instead of attempting early.
+func TestPayOwedClaudeUsageRefresh_ArmsAFutureRungInsteadOfAttemptingEarly(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, 1, time.Time{})
+	next := now.Add(2 * time.Minute)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = next.UnixMilli()
+		return true
+	})
+
+	simulateClaudeAgentRestart(t)
+	payOwedClaudeUsageRefreshAt(now)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("the replay sent %d requests before its rung was due", got)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("the replay did not arm the persisted rung")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != next.UnixMilli() {
+		t.Fatalf("re-arming changed the debt: %+v", snap)
+	}
+	// The debt is on the gate too, so this process's gathers still owe it.
+	if owedNow := claudeUsageProbe.owedObservation(); owedNow.UnixMilli() != owed.UnixMilli() {
+		t.Fatalf("gate debt=%v, want the replayed %v", owedNow, owed)
+	}
+}
+
+// A rung further out than any the ladder can book is a backwards clock step,
+// not a schedule: the replay attempts now.
+func TestPayOwedClaudeUsageRefresh_ARungPastTheHorizonIsAttemptedNow(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	seedClaudeRefreshDebt(t, cache, fp, now.Add(-time.Minute), 0, time.Time{})
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = now.Add(6 * time.Hour).UnixMilli()
+		return true
+	})
+
+	simulateClaudeAgentRestart(t)
+	payOwedClaudeUsageRefreshAt(now)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want the replay's one attempt", got)
 	}
 }
