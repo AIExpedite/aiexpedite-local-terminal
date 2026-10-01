@@ -371,7 +371,9 @@ func TestAntigravityCandidate_UnknownOrOverflowIsNeverProven(t *testing.T) {
 // A PID whose start token cannot be read for a reason other than its process
 // being gone (access denied, a transient /proc or sysctl failure) may still be
 // running a long turn with a quiet log: an unchanged log is not proof of its
-// exit. It keeps the settle window and is owed unproven after it.
+// exit, and neither is the settle window passing while it stays unreadable. It
+// stays live until a re-read proves it gone, then keeps the settle window and
+// is owed unproven after it.
 func TestAntigravityCandidate_UnreadablePIDIsNotGoneAtFirstSight(t *testing.T) {
 	h := helperIsolateLogIndex(t)
 	now := time.Now().Add(-time.Hour)
@@ -379,13 +381,21 @@ func TestAntigravityCandidate_UnreadablePIDIsNotGoneAtFirstSight(t *testing.T) {
 	h.unreadable[5181] = true
 	h.mu.Unlock()
 	h.write(t, helperLogName(now), helperPIDBlock(5181), now, false)
-	for _, at := range []time.Duration{time.Second, 10 * time.Second, 30 * time.Second} {
+	for _, at := range []time.Duration{time.Second, 10 * time.Second, 30 * time.Second, 2 * antigravityCandidateSettle, 5 * antigravityCandidateSettle} {
 		if res := h.pass(now.Add(at), 0); !res.owed.IsZero() || res.owedProven {
-			t.Fatalf("at +%s owed=%s proven=%v, want an unreadable PID's run unowed inside the settle window", at, res.owed, res.owedProven)
+			t.Fatalf("at +%s owed=%s proven=%v, want an unreadable PID's run held live", at, res.owed, res.owedProven)
 		}
 	}
-	res := h.pass(now.Add(time.Second+antigravityCandidateSettle), 0)
-	if !res.owed.Equal(now.Add(time.Second)) || res.owedProven {
+	// The process exits: the next re-read proves it gone.
+	h.mu.Lock()
+	delete(h.unreadable, 5181)
+	h.mu.Unlock()
+	gone := now.Add(6 * antigravityCandidateSettle)
+	if res := h.pass(gone, 0); !res.owed.IsZero() || res.owedProven {
+		t.Fatalf("owed=%s proven=%v at exit, want the settle window first", res.owed, res.owedProven)
+	}
+	res := h.pass(gone.Add(antigravityCandidateSettle), 0)
+	if !res.owed.Equal(gone) || res.owedProven {
 		t.Errorf("owed=%s proven=%v, want the exit-seen floor after the settle window, unproven", res.owed, res.owedProven)
 	}
 }

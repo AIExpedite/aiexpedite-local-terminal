@@ -155,8 +155,9 @@ type antigravityTrackedPID struct {
 	exitedAt time.Time
 	// unread marks a candidate PID whose start token could not be read for a
 	// reason other than its process being gone (access denied, a transient
-	// /proc or sysctl failure): the run may still be going, so its exit is
-	// never proven (antigravityExitProvenLocked) and it keeps the settle window.
+	// /proc or sysctl failure): the run may still be going, so it stays live
+	// until a re-read proves it gone (antigravityTrackedPIDProbe), its exit is
+	// never proven (antigravityExitProvenLocked), and it keeps the settle window.
 	unread bool
 }
 
@@ -844,6 +845,21 @@ func antigravityCurrentStartToken(pid int) string {
 	return token
 }
 
+// antigravityTrackedPIDProbe probes one tracked candidate PID. An unread PID
+// has no start token to compare, so it is re-read on every probe: a process
+// provably gone is gone, and anything else (still unreadable, or some process
+// holding the PID) is unknown. That holds the run live until the hold limit
+// rather than letting the settle window owe a run that may still be going.
+func antigravityTrackedPIDProbe(p antigravityTrackedPID) processProbeResult {
+	if p.unread {
+		if _, err := antigravityProcessStartToken(p.pid); err != nil && antigravityStartTokenErrGone(err) {
+			return processGone
+		}
+		return processUnknown
+	}
+	return antigravityCandidateProbe(p.pid, p.token)
+}
+
 // antigravityCandidatePID reads a candidate PID at first sight: its start token
 // when live, an empty token when its process is provably gone, and an empty
 // token marked unread when the read failed for any other reason.
@@ -1276,7 +1292,7 @@ func antigravityEvaluateProcessOnlyLocked(now time.Time, observedMs int64, res *
 	idx := &antigravityLogIndex
 	kept := idx.processOnly[:0]
 	for _, p := range idx.processOnly {
-		switch antigravityCandidateProbe(p.pid, p.token) {
+		switch antigravityTrackedPIDProbe(p.antigravityTrackedPID) {
 		case processGone:
 			if p.exitSeenAt.IsZero() {
 				p.exitSeenAt = now
@@ -1331,7 +1347,7 @@ func antigravityEvaluateCandidateLocked(entry *antigravityLogEntry, now time.Tim
 
 	live, ours := entry.pidOverflow, false
 	for _, p := range entry.pids {
-		switch antigravityCandidateProbe(p.pid, p.token) {
+		switch antigravityTrackedPIDProbe(p) {
 		case processOurs:
 			live, ours = true, true
 		case processUnknown:
@@ -1826,7 +1842,7 @@ func antigravityCandidateLiveLocked(entry *antigravityLogEntry) bool {
 		return true
 	}
 	for _, p := range entry.pids {
-		if antigravityCandidateProbe(p.pid, p.token) != processGone {
+		if antigravityTrackedPIDProbe(p) != processGone {
 			return true
 		}
 	}
