@@ -618,6 +618,17 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		// The rung an earlier failed read armed is cancelled with it.
 		if booked.debtID() == id {
 			stopGrokRunDebtRetry()
+			// A start that arrived while this read was out — the old rung
+			// firing, or a gather that saw its timestamp — asked to pay the
+			// debt this refusal just idled. Taking it would land inside the
+			// spacing and book a fresh rung, i.e. another read (and renewal)
+			// with no new run. A new run's settle moves the debt id, so it
+			// never reaches here; a smoke's bypass is kept for its pass.
+			grokRefreshWorkerMu.Lock()
+			if !grokRefreshWorkerBypass {
+				grokRefreshWorkerRearm = false
+			}
+			grokRefreshWorkerMu.Unlock()
 		}
 		return booked, grokRetryNone
 	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed, liveProbeOutcomeTimeout:

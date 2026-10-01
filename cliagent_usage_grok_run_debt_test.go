@@ -731,3 +731,67 @@ func TestPayOwedGrokUsageRefresh_FreshDebtIsPaidDespiteAnOldSpacingClock(t *test
 		t.Fatalf("reads=%d state=%+v, want the fresh debt paid at start", h.reads.Load(), h.state())
 	}
 }
+
+// grokStartOverlappingAuthRefusal books a rung with an http_error, then runs
+// the next read blocked as an `unauthorized`, calls during() while it is
+// blocked, and releases it.
+func grokStartOverlappingAuthRefusal(t *testing.T, h *grokDebtHarness, during func()) {
+	t.Helper()
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	h.runAndSettle(time.Second)
+	if !grokRunDebtRetryPending() {
+		t.Fatal("fixture: no rung booked")
+	}
+	h.advance(time.Minute)
+	h.block = make(chan struct{})
+	h.outcome.Store(grokLiveOutcomeUnauthorized)
+	grokStartRunDebtWorker(false)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reads.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if h.reads.Load() != 2 {
+		t.Fatal("the overlapping read never started")
+	}
+	during()
+	grokRefreshWorkerMu.Lock()
+	rearmed := grokRefreshWorkerRearm
+	grokRefreshWorkerMu.Unlock()
+	if !rearmed {
+		t.Fatal("fixture: the start during the read did not re-arm the worker")
+	}
+	close(h.block)
+	h.idle()
+}
+
+// The old rung firing while a refusal is in flight must not turn into another
+// read once that refusal idles the debt.
+func TestGrokRunDebt_RungFiringDuringAnAuthRefusalIsDropped(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	grokStartOverlappingAuthRefusal(t, h, func() {
+		grokArmRunDebtRetry(h.state().debtID(), 0) // the rung comes due now
+		deadline := time.Now().Add(5 * time.Second)
+		for grokRunDebtRetryPending() && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond) // let the callback reach the worker claim
+	})
+	if grokRunDebtRetryPending() || h.state().NextAttemptAtMs != 0 {
+		t.Fatalf("state = %+v pending=%t, want no rung left", h.state(), grokRunDebtRetryPending())
+	}
+	h.advance(10 * time.Minute)
+	nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+	h.idle()
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, want no read after the refusal", h.reads.Load())
+	}
+}
+
+// A smoke that settles during the refusal still gets its own pass.
+func TestGrokRunDebt_SmokeDuringAnAuthRefusalStillReads(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	grokStartOverlappingAuthRefusal(t, h, func() { grokStartRunDebtWorker(true) })
+	if h.reads.Load() != 3 {
+		t.Fatalf("reads = %d, want the smoke's bypass pass to read after the refusal", h.reads.Load())
+	}
+}
