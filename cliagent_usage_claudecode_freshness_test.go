@@ -3861,6 +3861,41 @@ func TestClaudeUsageProbeGate_CacheSeedChargePublishesALease(t *testing.T) {
 	}
 }
 
+// A click whose gather adopts a persisted debt through the seed issues its
+// request but is never charged to the debt's budget, even when that request
+// fails: repeated clicks must not exhaust the automatic attempts and retire the
+// debt. The seed's lease is still released once the click is over.
+func TestClaudeUsageProbe_ClickAdoptingAPersistedDebtIsNotCharged(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest := now.Add(-time.Hour)
+	seedClaudeProbeReading(t, cache, latest)
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+
+	// A restart: the debt is only on disk, so the click's seed adopts it.
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+
+	clickCtx := WithClaudeUsageForceProbe(context.Background(), claudeForceClick)
+	refreshClaudeUsageIfStale(clickCtx, now, latest, probeTestToken, fp)
+
+	if n := atomic.LoadInt64(calls); n == 0 {
+		t.Fatal("the click issued no request")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != owed.UnixMilli() {
+		t.Fatalf("RefreshOwedAtMs=%d, want the debt %d left in place", snap.RefreshOwedAtMs, owed.UnixMilli())
+	}
+	if snap.RefreshOwedAttempts != 0 {
+		t.Errorf("RefreshOwedAttempts=%d, want 0: a click is not charged to the debt's budget", snap.RefreshOwedAttempts)
+	}
+	if snap.AttemptClaimedUntilMs != 0 {
+		t.Errorf("AttemptClaimedUntilMs=%d, want the seed's lease released", snap.AttemptClaimedUntilMs)
+	}
+}
+
 // A gather that beats the startup replay after a restart restores the persisted
 // credential wait in its seed, so it does not re-send the token the endpoint
 // already answered 401 for.

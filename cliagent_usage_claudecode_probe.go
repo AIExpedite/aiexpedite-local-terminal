@@ -2378,15 +2378,26 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	//
 	// The claim lease the charge published is released on every path, issued or
 	// not: once this gather's attempt is over, nothing of ours is on the wire.
+	//
+	// A CLICK is never charged to the debt's budget, issued or not: the cap
+	// bounds only the automatic paths. The seed cannot tell a click from a
+	// routine gather, so its charge is refunded here at once — before the
+	// request, so a crash mid-click leaves nothing spent — while the lease it
+	// published is kept until the click's attempt is over, so another process
+	// still cannot reserve alongside it.
 	issuedOwn := false
 	charged, lease := seedCharged, seedLease
+	if forced && !charged.IsZero() {
+		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, adjustClaudeRefreshAttemptsAt(charged, -1))
+		charged = time.Time{}
+	}
 	defer func() {
-		if charged.IsZero() {
+		if charged.IsZero() && lease == 0 {
 			return
 		}
 		mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
 			released := lease != 0 && releaseClaudeRunDebtClaim(lease)(snap)
-			refunded := !issuedOwn && adjustClaudeRefreshAttemptsAt(charged, -1)(snap)
+			refunded := !charged.IsZero() && !issuedOwn && adjustClaudeRefreshAttemptsAt(charged, -1)(snap)
 			return released || refunded
 		})
 	}()
