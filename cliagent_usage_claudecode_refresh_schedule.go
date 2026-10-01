@@ -459,6 +459,11 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 // stamp must not put the older stamp back — the failing attempt would persist
 // it, and every later automatic attempt would then mistake the still-rejected
 // credential for a changed one and resend it until the budget ran out.
+//
+// Restoring the stamp a local wait already holds leaves that wait local: a
+// seed that read stamp B before a concurrent 401 on B was noted must not mark
+// the newer local wait restored again, or a later read of a peer's earlier
+// on-disk clear would drop it.
 func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -467,6 +472,9 @@ func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
 			g.authWait, g.authWaitNudged = claudeCredStamp{}, claudeCredStamp{}
 		}
 		g.authWaitRestored = claudeCredStamp{}
+		return
+	}
+	if g.authWait == stamp && g.authWaitRestored != stamp {
 		return
 	}
 	if g.authWait != stamp &&

@@ -4091,6 +4091,32 @@ func TestClaudeUsageProbe_SameStampLocalWaitSurvivesAStaleRestoredClear(t *testi
 	}
 }
 
+// The reverse interleaving: a seed that read stamp B before a concurrent local
+// 401 on B restores B only after noteAuthWait ran. That restore must not mark
+// the local wait restored again, so a peer's earlier on-disk clear read by a
+// later seed still leaves it standing.
+func TestClaudeUsageProbe_SameStampRestoreAfterLocalWaitKeepsItLocal(t *testing.T) {
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+	b := claudeCredStamp{modNs: 200, size: 1}
+
+	claudeUsageProbe.noteAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	if !claudeUsageProbe.awaitingCredentialChange(b) {
+		t.Fatalf("in-memory wait=%+v, want the local same-stamp wait %+v kept", claudeUsageProbe.authWaitStamp(), b)
+	}
+
+	// A wait that was only ever restored still follows the persisted clear.
+	resetClaudeUsageProbeGate()
+	claudeUsageProbe.restoreAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+		t.Fatalf("in-memory wait=%+v, want a restored-only wait dropped by the persisted clear", got)
+	}
+}
+
 // The click's early refund of the seed's charge is best-effort; when another
 // writer holds the cache then, the refund is retried once the click is over, so
 // a contended cache never turns a click into a spent automatic slot.
