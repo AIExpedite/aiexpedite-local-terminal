@@ -468,6 +468,45 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	}
 }
 
+// claimClaudeRefreshRungAt is the replay's charge, made a CLAIM on the rung the
+// caller judged due: it charges one attempt ONLY while the debt instant, the
+// attempt counter AND NextAttemptAtMs are all still what the unlocked read saw,
+// and in the same write moves NextAttemptAtMs to `leaseUntilMs` — an in-flight
+// lease the attempt's own booking overwrites once it knows the outcome.
+//
+// adjustClaudeRefreshAttemptsAt alone serializes the charges but does not make
+// them exclusive. The single flight is process-local, and the cross-process
+// dedupe only suppresses a probe once a COVERING reading is on disk, so two agent
+// processes (a release and a dev agent, or the two sides of a restart) that
+// re-armed the same persisted rung would both charge and both send on a failing
+// endpoint — two budget slots spent at one ladder instant, and the debt retired
+// after fewer distinct retries than the ladder promises. With the claim, the
+// process that loses the race finds the counter or the rung moved and sends
+// nothing; one reading the file after the claim finds a lease still in the
+// future and only arms its timer for it. A crash mid-request leaves the lease,
+// so the next start waits it out and then pays — never stranded.
+//
+// `lost` reports a refusal because another writer claimed or re-booked this
+// debt first, as distinct from a dropped write or a debt at the cap.
+func claimClaudeRefreshRungAt(owed time.Time, judgedAttempts int, judgedNextMs, leaseUntilMs int64, lost *bool) func(*claudeRateLimitSnapshot) bool {
+	owedMs := owed.UnixMilli()
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs != owedMs {
+			return false
+		}
+		if snap.RefreshOwedAttempts != judgedAttempts || snap.NextAttemptAtMs != judgedNextMs {
+			*lost = true
+			return false
+		}
+		if snap.RefreshOwedAttempts+1 > claudeRefreshDebtMaxAttempts {
+			return false
+		}
+		snap.RefreshOwedAttempts++
+		snap.NextAttemptAtMs = leaseUntilMs
+		return true
+	}
+}
+
 // dropClaudeSkewedHold clears a 429 hold ONLY while it is still the exact value
 // the caller judged skewed. Sibling of retireClaudeRefreshDebtAt and there for
 // the same reason: the read that spotted the skew is unlocked, so a probe that
@@ -738,8 +777,25 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 	//
 	// A refused charge still books a rung: a contended cache is retried at the
 	// free delay, and a debt already at the cap is retired by the schedule.
-	if !mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1)) {
-		claudeScheduleRunDebtRetry(fingerprint, owed, claudeRetryFree, now)
+	//
+	// The charge is a CLAIM on the rung this replay judged due (see
+	// claimClaudeRefreshRungAt), so another agent process that armed the same
+	// persisted rung cannot pay it too. Losing the claim sends nothing and books
+	// nothing — the winner books whatever it keeps — but a lease or rung it left
+	// in the future is armed here too, so this process still looks again should
+	// the winner exit before booking.
+	lost := false
+	lease := now.Add(claudeUsageProbeWholeTimeout + claudeUsageProbeTrailingSlack).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(path, fingerprint,
+		claimClaudeRefreshRungAt(owed, snap.RefreshOwedAttempts, snap.NextAttemptAtMs, lease, &lost)) {
+		if !lost {
+			claudeScheduleRunDebtRetry(fingerprint, owed, claudeRetryFree, now)
+			return
+		}
+		if again, ok := loadClaudeRateLimitSnapshot(path); ok && again.RefreshOwedAtMs == owed.UnixMilli() &&
+			again.NextAttemptAtMs > now.UnixMilli() {
+			claudeArmRunDebtRetry(time.UnixMilli(again.NextAttemptAtMs).Sub(now))
+		}
 		return
 	}
 

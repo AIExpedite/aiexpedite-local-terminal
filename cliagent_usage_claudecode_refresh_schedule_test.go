@@ -419,3 +419,92 @@ func TestClaudeRunDebtRung_PayingTheDebtClearsTheGate(t *testing.T) {
 		t.Fatalf("the paid debt is still on disk: %+v", snap)
 	}
 }
+
+// Two agent processes that armed the same persisted rung both judge it due on
+// an unlocked read. The locked claim lets exactly one of them charge: the other
+// finds the counter and the rung moved, and is told it lost rather than that
+// the write was dropped — so it neither charges, sends, nor books a rung.
+func TestClaimClaudeRefreshRungAt_OnlyOneProcessClaimsARung(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	owed := now.Add(-2 * time.Minute)
+	seedClaudeRefreshDebt(t, cache, fp, owed, 1, time.Time{})
+	due := now.Add(-time.Second).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(s *claudeRateLimitSnapshot) bool { s.NextAttemptAtMs = due; return true }) {
+		t.Fatal("seeding the rung did not write the cache")
+	}
+	lease := now.Add(time.Minute).UnixMilli()
+
+	// Both judged {attempts: 1, next: due}; the first one to the lock wins.
+	var lostA, lostB bool
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRefreshRungAt(owed, 1, due, lease, &lostA)) || lostA {
+		t.Fatalf("the first claim must land (lost=%v)", lostA)
+	}
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRefreshRungAt(owed, 1, due, lease, &lostB)) {
+		t.Fatal("a second process claimed a rung already claimed — two requests at one ladder instant")
+	}
+	if !lostB {
+		t.Fatal("the losing claim must report lost, or it would book a rung of its own")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 2 || snap.NextAttemptAtMs != lease {
+		t.Fatalf("want one charge and the in-flight lease, got %+v", snap)
+	}
+
+	// A refusal that is not a lost race stays distinguishable: a newer debt, or
+	// a debt already at the cap.
+	var lostC bool
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRefreshRungAt(owed.Add(time.Second), 2, lease, lease, &lostC)) || lostC {
+		t.Fatalf("a claim on another debt instant must refuse without reporting lost (lost=%v)", lostC)
+	}
+	seedClaudeRefreshDebt(t, cache, fp, owed, claudeRefreshDebtMaxAttempts, time.Time{})
+	var lostD bool
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRefreshRungAt(owed, claudeRefreshDebtMaxAttempts, lease, lease, &lostD)) || lostD {
+		t.Fatalf("a claim past the cap must refuse without reporting lost (lost=%v)", lostD)
+	}
+}
+
+// While one process's claimed attempt is in flight, a replay that reads the
+// file finds the lease in the future: it arms its timer for it and sends and
+// charges nothing.
+func TestPayOwedClaudeUsageRefresh_InFlightLeaseSendsNothingElse(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	seedClaudeRefreshDebt(t, cache, fp, time.Now().Add(-time.Minute), 1, time.Time{})
+
+	done := make(chan struct{})
+	go func() { defer close(done); payOwedClaudeUsageRefreshAt(time.Now()) }()
+	waitForClaudeCalls(t, calls, 1, 5*time.Second)
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 2 || snap.NextAttemptAtMs <= time.Now().UnixMilli() {
+		t.Fatalf("the in-flight attempt must hold a charge and a future lease: %+v", snap)
+	}
+	payOwedClaudeUsageRefreshAt(time.Now())
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 2 {
+		t.Fatalf("attempts=%d, want 2 — a replay during the lease charged the budget", got)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("a replay that found the lease must arm its timer for it")
+	}
+
+	close(release)
+	<-done
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1", got)
+	}
+}
