@@ -73,3 +73,51 @@ func TestRefreshCLIAgentModelDiscovery_DoesNotStoreADeadlineMissOrAPreResetResul
 		t.Error("a pre-reset answer was stored")
 	}
 }
+
+// An inconclusive forced refresh (nonzero exit, unparseable output) inside the
+// TTL keeps the successful entry it would have replaced; a cold miss still
+// caches the miss.
+func TestRefreshCLIAgentModelDiscovery_InconclusiveKeepsALiveSuccessfulEntry(t *testing.T) {
+	resetCLIAgentModelProbeCache()
+	t.Cleanup(resetCLIAgentModelProbeCache)
+	prev := cliAgentModelProbeRunner
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+	detected := detectedCLIAgent{Detected: true, Path: "/usr/local/bin/agy", Version: "1.2.3"}
+	now := time.Now()
+
+	answer := realAntigravityModels
+	answerOK := true
+	calls := 0
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
+		calls++
+		return answer, answerOK
+	}
+	if _, ok := cachedCLIAgentModelDiscovery(context.Background(), "antigravity", detected, "", now); !ok {
+		t.Fatal("the cold probe did not fill the cache")
+	}
+
+	for name, fail := range map[string]func(){
+		"nonzero exit": func() { answer, answerOK = "", false },
+		"unparseable":  func() { answer, answerOK = "not a model list", true },
+	} {
+		fail()
+		if _, ok := refreshCLIAgentModelDiscovery(context.Background(), "antigravity", detected, "", now.Add(time.Minute)); ok {
+			t.Fatalf("%s: the forced refresh reported a list", name)
+		}
+		got, ok, cached := lookupCLIAgentModelDiscoveryEntry("antigravity", detected, now.Add(2*time.Minute))
+		if !cached || !ok || len(got.Models) == 0 {
+			t.Errorf("%s: cached=%v ok=%v models=%d, want the earlier catalog kept", name, cached, ok, len(got.Models))
+		}
+	}
+
+	// Once the successful entry has aged out, the miss is cached as before.
+	answer, answerOK = "", false
+	later := now.Add(cliAgentModelProbeTTL + time.Minute)
+	refreshCLIAgentModelDiscovery(context.Background(), "antigravity", detected, "", later)
+	if _, ok, cached := lookupCLIAgentModelDiscoveryEntry("antigravity", detected, later); !cached || ok {
+		t.Errorf("cached=%v ok=%v, want an expired entry replaced by the miss", cached, ok)
+	}
+	if calls != 4 {
+		t.Errorf("calls=%d, want every forced refresh to probe", calls)
+	}
+}

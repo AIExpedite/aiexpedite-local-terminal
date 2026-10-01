@@ -433,11 +433,22 @@ func refreshCLIAgentModelDiscovery(ctx context.Context, agentID string, detected
 	// A reset while this probe ran means a forced refresh wants a FRESH
 	// answer: this one is returned to its own caller but never stored, so the
 	// refresh cannot find it and reuse a pre-reset list for the whole TTL.
-	if generation == cliAgentModelProbeGeneration {
+	// An inconclusive answer (nonzero exit, unrecognised output) never
+	// replaces a live successful entry: a forced refresh runs inside the TTL,
+	// and storing its miss would hide a catalog the CLI just answered for the
+	// rest of it. A cache miss has no live entry, so it still caches the miss.
+	if generation == cliAgentModelProbeGeneration && (ok || !cliAgentModelProbeEntryLiveOK(key, now)) {
 		cliAgentModelProbeCache[key] = cliAgentModelProbeEntry{At: now, Result: result, OK: ok}
 	}
 	cliAgentModelProbeMu.Unlock()
 	return result, ok
+}
+
+// cliAgentModelProbeEntryLiveOK reports whether key holds a successful entry
+// still inside its TTL. The caller holds cliAgentModelProbeMu.
+func cliAgentModelProbeEntryLiveOK(key string, now time.Time) bool {
+	entry, cached := cliAgentModelProbeCache[key]
+	return cached && entry.OK && now.Sub(entry.At) < cliAgentModelProbeTTL
 }
 
 // discoverCLIAgentModels runs the one probe this agent supports. ok=false means
