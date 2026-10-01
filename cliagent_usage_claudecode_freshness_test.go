@@ -3631,7 +3631,9 @@ func TestClaimClaudeRunDebtRungAt_SecondClaimOfTheSameRungIsRefused(t *testing.T
 	}
 
 	first := false
-	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &first)) || first {
+	var firstInFlight time.Time
+	var lease int64
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &first, &firstInFlight, &lease)) || first {
 		t.Fatalf("the first claim of the rung was refused (claimedElsewhere=%v)", first)
 	}
 	snap := claudeCacheSnapshot(t, cache)
@@ -3640,11 +3642,82 @@ func TestClaimClaudeRunDebtRungAt_SecondClaimOfTheSameRungIsRefused(t *testing.T
 	}
 
 	second := false
-	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &second)) || !second {
+	var secondInFlight time.Time
+	var unused int64
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &second, &secondInFlight, &unused)) || !second {
 		t.Fatalf("a second claim of the same rung was granted (claimedElsewhere=%v)", second)
 	}
 	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
 		t.Errorf("attempts=%d, want the refused claim to charge nothing", got)
+	}
+}
+
+// A process that loads the snapshot AFTER another claimed the rung reads
+// NextAttemptAtMs == 0. The claim's lease is what tells it an attempt is still
+// in flight; once the owner releases it (or it lapses) the debt is claimable.
+func TestClaimClaudeRunDebtRungAt_LeaseRefusesAZeroRungClaimWhileInFlight(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	fp := currentClaudeAccountFingerprint()
+
+	owner, ownerInFlight := false, time.Time{}
+	var lease int64
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &owner, &ownerInFlight, &lease)) || owner {
+		t.Fatalf("the owner's claim was refused (claimedElsewhere=%v)", owner)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.NextAttemptAtMs != 0 || snap.AttemptClaimedUntilMs != lease || lease <= now.UnixMilli() {
+		t.Fatalf("rung=%d lease=%d (returned %d), want the rung cleared and a future lease on disk",
+			snap.NextAttemptAtMs, snap.AttemptClaimedUntilMs, lease)
+	}
+
+	late, lateInFlight := false, time.Time{}
+	var unused int64
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &late, &lateInFlight, &unused)) || !late {
+		t.Fatalf("a zero-rung claim was granted while the owner's attempt is in flight (claimedElsewhere=%v)", late)
+	}
+	if lateInFlight.UnixMilli() != lease {
+		t.Errorf("inFlightUntil=%d, want the owner's lease %d so the caller looks again then", lateInFlight.UnixMilli(), lease)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
+		t.Errorf("attempts=%d, want the refused claim to charge nothing", got)
+	}
+
+	// A release keyed to some other lease leaves the owner's alone.
+	if mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtClaim(lease+1)) {
+		t.Error("a release for another lease cleared the owner's")
+	}
+	if !mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtClaim(lease)) {
+		t.Fatal("the owner could not release its lease")
+	}
+	after, afterInFlight := false, time.Time{}
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &after, &afterInFlight, &unused)) || after {
+		t.Fatalf("the debt was not claimable after the release (claimedElsewhere=%v)", after)
+	}
+}
+
+// A lease further ahead than any this code writes is a clock step, not an
+// attempt in flight, and must not block the debt.
+func TestClaimClaudeRunDebtRungAt_IgnoresALeaseBeyondTheCeiling(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	fp := currentClaudeAccountFingerprint()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.AttemptClaimedUntilMs = now.Add(time.Hour).UnixMilli()
+		return true
+	}) {
+		t.Fatal("precondition: could not seed the skewed lease")
+	}
+	elsewhere, inFlight := false, time.Time{}
+	var lease int64
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &elsewhere, &inFlight, &lease)) || elsewhere {
+		t.Fatalf("a skewed lease blocked the claim (claimedElsewhere=%v)", elsewhere)
 	}
 }
 

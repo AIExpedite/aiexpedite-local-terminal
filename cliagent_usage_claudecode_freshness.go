@@ -487,13 +487,33 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 // claimClaudeRunDebtRungAt reserves one budget slot for the debt at `owed` AND
 // claims the persisted rung rungMs the caller read, in one locked write, so two
 // processes that both found the same rung due issue ONE request between them.
+//
+// The claim leaves a durable lease (AttemptClaimedUntilMs) rather than just
+// clearing the rung: a process that loads the snapshot AFTER the claim reads
+// NextAttemptAtMs == 0, which on its own is indistinguishable from a debt that
+// was never booked, and would reserve a second slot while the first request is
+// still out. While a live lease stands every claim is refused and
+// *inFlightUntil names when it ends, so the caller can look again then — the
+// owner's process alone holds the timer for what follows, and it may crash.
+//
 // When the debt still stands but its rung is no longer rungMs (another trigger
 // claimed it, or a newer booking replaced it), it writes nothing and sets
-// *claimedElsewhere. Any other refusal is adjustClaudeRefreshAttemptsAt's.
-func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bool) func(*claudeRateLimitSnapshot) bool {
+// *claimedElsewhere. Any other refusal is adjustClaudeRefreshAttemptsAt's. On
+// success *leaseMs is the lease written, for releaseClaudeRunDebtClaim.
+func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bool, inFlightUntil *time.Time, leaseMs *int64) func(*claudeRateLimitSnapshot) bool {
 	reserve := adjustClaudeRefreshAttemptsAt(owed, +1)
 	owedMs := owed.UnixMilli()
 	return func(snap *claudeRateLimitSnapshot) bool {
+		// Judged at lock time: the lease measures a real request in flight.
+		now := time.Now()
+		lease := claudeRunDebtClaimLease()
+		// A lease beyond any this code writes is a backwards clock step, not an
+		// attempt in flight, and is ignored rather than honoured for hours.
+		if held := snap.AttemptClaimedUntilMs; held > now.UnixMilli() && held <= now.Add(lease).UnixMilli() {
+			*claimedElsewhere = true
+			*inFlightUntil = time.UnixMilli(held)
+			return false
+		}
 		if snap.RefreshOwedAtMs == owedMs && snap.NextAttemptAtMs != rungMs {
 			*claimedElsewhere = true
 			return false
@@ -502,6 +522,29 @@ func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bo
 			return false
 		}
 		snap.NextAttemptAtMs = 0
+		snap.AttemptClaimedUntilMs = now.Add(lease).UnixMilli()
+		*leaseMs = snap.AttemptClaimedUntilMs
+		return true
+	}
+}
+
+// claudeRunDebtClaimLease bounds how long a claimed attempt may be in flight:
+// the whole probe (credential read, request, verified persist) plus slack.
+// Shorter than the first ladder rung, so a crashed owner delays nothing it
+// booked.
+func claudeRunDebtClaimLease() time.Duration {
+	return claudeUsageProbeWholeTimeout + claudeRunDebtRungSlack
+}
+
+// releaseClaudeRunDebtClaim ends the lease leaseMs once its attempt is over,
+// ONLY while it is still that lease — another process may have taken a new one
+// after this one lapsed. Best-effort: a dropped release just expires.
+func releaseClaudeRunDebtClaim(leaseMs int64) func(*claudeRateLimitSnapshot) bool {
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.AttemptClaimedUntilMs != leaseMs {
+			return false
+		}
+		snap.AttemptClaimedUntilMs = 0
 		return true
 	}
 }
@@ -820,9 +863,20 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	// on an account-scoped endpoint. A rung that is no longer the one read was
 	// claimed by another trigger or replaced by a newer booking, whose owner
 	// schedules what follows, so this attempt does nothing.
+	//
+	// The claim also leaves a lease, so a process that reads the snapshot after
+	// the rung was cleared still sees the attempt in flight. That process looks
+	// again once the lease ends: by then the owner has settled the debt or
+	// booked the next rung, which the timer honours — or it crashed, and the
+	// rung it never booked is due.
 	claimedElsewhere := false
-	if !mutateClaudeRateLimitSnapshot(path, fingerprint, claimClaudeRunDebtRungAt(owed, snap.NextAttemptAtMs, &claimedElsewhere)) {
+	var inFlightUntil time.Time
+	var leaseMs int64
+	if !mutateClaudeRateLimitSnapshot(path, fingerprint, claimClaudeRunDebtRungAt(owed, snap.NextAttemptAtMs, &claimedElsewhere, &inFlightUntil, &leaseMs)) {
 		if claimedElsewhere {
+			if !inFlightUntil.IsZero() {
+				claudeArmRunDebtRetry(time.Until(inFlightUntil)+claudeRunDebtRungSlack, claudeDebtTriggerTimer)
+			}
 			return claudeProbeResult{}
 		}
 		// Usually a lock race with the stream capture of the very turn that owed
@@ -833,6 +887,8 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		claudeBookRunDebtRung(fingerprint, owed, now, claudeRungAfter, claudeUnpersistedRetryDelay(now.Sub(owed)))
 		return result
 	}
+
+	defer mutateClaudeRateLimitSnapshot(path, fingerprint, releaseClaudeRunDebtClaim(leaseMs))
 
 	// ONE bounded attempt, through the ordinary single-flight probe, issued with
 	// the identity this attempt reserved under — never a freshly resolved one.

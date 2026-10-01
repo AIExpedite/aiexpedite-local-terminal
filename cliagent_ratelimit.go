@@ -197,6 +197,13 @@ type claudeRateLimitSnapshot struct {
 	// the token or the path. Zero on macOS Keychain logins, which have no file.
 	AuthWaitCredStampNs int64 `json:"authWaitCredStampNs,omitempty"`
 	AuthWaitCredSize    int64 `json:"authWaitCredSize,omitempty"`
+	// AttemptClaimedUntilMs is the lease of a scheduled debt attempt that has
+	// claimed its rung and may still be waiting on the endpoint
+	// (claimClaudeRunDebtRungAt). The gate is process-local, so this is how a
+	// second agent process sharing the cache tells an attempt in flight from a
+	// debt that is simply due. Released by its owner when the attempt ends; a
+	// crashed owner's lease expires on its own.
+	AttemptClaimedUntilMs int64 `json:"attemptClaimedUntilMs,omitempty"`
 }
 
 // resetClaudeProbeAccountState drops everything on the snapshot that describes
@@ -208,6 +215,7 @@ func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
 	snap.LastProbeObservedAtMs = 0
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
+	snap.AttemptClaimedUntilMs = 0
 }
 
 // clearClaudeRefreshDebt drops the owed-refresh marker, its attempt counter and

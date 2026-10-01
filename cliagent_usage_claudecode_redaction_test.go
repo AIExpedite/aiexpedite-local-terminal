@@ -190,7 +190,7 @@ func TestClaudeRunDebtSchedule_PersistsLogsAndPublishesNumericOnly(t *testing.T)
 		t.Fatal(err)
 	}
 	assertClaudeSnapshotStringsRedacted(t, "", decoded)
-	for _, field := range []string{"nextAttemptAtMs", "authWaitCredStampNs", "authWaitCredSize", "refreshOwedAttempts"} {
+	for _, field := range []string{"nextAttemptAtMs", "authWaitCredStampNs", "authWaitCredSize", "refreshOwedAttempts", "attemptClaimedUntilMs"} {
 		if v, present := decoded[field]; present {
 			if _, isNumber := v.(float64); !isNumber {
 				t.Errorf("%s=%v (%T), want a number", field, v, v)
