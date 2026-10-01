@@ -65,7 +65,11 @@ func installedClaudeRateLimitCachePath(home string) string {
 	return extractInstalledPinnedPath(sl.Command, "RL_CACHE")
 }
 
-// loadMergedClaudeRateLimitBuckets reads every cache this machine could have
+// loadMergedClaudeRateLimitBuckets is loadMergedClaudeRateLimitView's buckets
+// alone, with no snapshot-level probe evidence — kept for tests that only need
+// the windows; production reads the view so weekly supersession applies.
+//
+// The loader reads every cache this machine could have
 // captured into — our own config dir plus the one the installed hook pins — and
 // returns the freshest observation per window.
 //

@@ -585,7 +585,13 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 // give-up behaviour can pin it small: CI runs this package under `go test -race
 // -timeout 5m`, where a hard-coded five-second sleep is pure wall-clock spent
 // asserting one boolean.
-var claudeUsageProbeDrainTimeout = 5 * time.Second
+//
+// Sized from claudeUsageProbeWholeTimeout, not a fixed figure: a post-run probe
+// on the wire may legitimately take the whole of it (credential lookup, the 10s
+// trailing request, the persist), and a drain that gave up first let that probe
+// finish inside the NEXT test — writing its cache and booking a ladder rung
+// there. The wait only lasts as long as something is actually in flight.
+var claudeUsageProbeDrainTimeout = claudeUsageProbeWholeTimeout + time.Second
 
 // resetClaudeUsageProbeGate drains any in-flight probe, cancels any sleeping
 // trailing probe, then clears the throttle/latch. Test-only seam, mirroring
@@ -601,7 +607,8 @@ var claudeUsageProbeDrainTimeout = 5 * time.Second
 // LIFO and the t.Setenv calls register first), so waiting here closes the window.
 //
 // Bounded by claudeUsageProbeDrainTimeout so a wedged probe cannot hang the
-// suite; the probe's own 3s timeout means a live one drains far inside it.
+// suite; a live probe is bounded by claudeUsageProbeWholeTimeout, which the
+// drain covers.
 func resetClaudeUsageProbeGate() {
 	// A pending ladder rung must not fire into the next test's cache; a rung that
 	// already fired is counted in `settling`, so the drain below waits it out.
@@ -2778,21 +2785,28 @@ func claudeUsageProbeChargedAttempt(baseline time.Time) claudeChargedAttempt {
 	path := claudeRateLimitCachePath()
 	var identity claudeUsageProbeIdentity
 	resolved, charged := false, false
+	// The counter as the charge left it, for the log line — read under the
+	// charge's own lock rather than by a second cache read.
+	attempts := 0
 	resolve := func() claudeUsageProbeIdentity {
 		identity = claudeUsageProbeStoredIdentity()
 		resolved = true
 		if identity.token != "" {
-			charged = mutateClaudeRefreshDebt(path, identity.fingerprint, adjustClaudeRefreshAttemptsAt(baseline, +1))
+			charge := adjustClaudeRefreshAttemptsAt(baseline, +1)
+			charged = mutateClaudeRefreshDebt(path, identity.fingerprint, func(snap *claudeRateLimitSnapshot) bool {
+				if !charge(snap) {
+					return false
+				}
+				attempts = snap.RefreshOwedAttempts
+				return true
+			})
 		}
 		return identity
 	}
 	result := claudeUsageProbeAttemptIssuedAs(baseline, resolve)
-	if charged && !result.issued {
-		mutateClaudeRefreshDebt(path, identity.fingerprint, adjustClaudeRefreshAttemptsAt(baseline, -1))
-	}
-	attempts := 0
-	if resolved {
-		_, attempts, _ = claudePersistedProbeStateFor(identity.fingerprint)
+	if charged && !result.issued &&
+		mutateClaudeRefreshDebt(path, identity.fingerprint, adjustClaudeRefreshAttemptsAt(baseline, -1)) {
+		attempts--
 	}
 	logClaudeUsageRefreshOutcome(result.outcome, attempts)
 	return claudeChargedAttempt{claudeRunDebtAttempt: result, fingerprint: identity.fingerprint, resolved: resolved}
@@ -2852,7 +2866,11 @@ func claudeUsageProbeAttemptIssuedAs(
 	// Same rule as the gather path: a write that left the run's window owned by
 	// an older reading has not paid this debt, even though it succeeded.
 	if refreshed && covered {
-		claudeUsageProbe.settleOwed(baseline)
+		// By coverage, not by the baseline: a rung or the replay pays the
+		// PERSISTED instant, which is millisecond-truncated, while the gate may
+		// hold the same run at nanosecond precision — settleOwed would see the
+		// truncated instant as older and leave the paid debt on the gate.
+		claudeUsageProbe.settleOwedIfCovered(observedAt)
 		return claudeRunDebtAttempt{done: true, issued: issued, outcome: claudeRefreshOutcomeOK}
 	}
 	// Everything below leaves the debt standing for the ladder. Whether this was

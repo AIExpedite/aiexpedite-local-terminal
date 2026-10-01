@@ -313,6 +313,12 @@ func claudeRunDebtRetryFired(gen uint64) {
 	if IsShutdownInProgress() || !claudeUsageProbe.armedForProbe() {
 		return
 	}
+	// A rung that outlived its debt — paid by a Refresh click, a gather or
+	// another channel — ends here, on one unlocked file read, before the replay
+	// resolves the credential (a `security` spawn on macOS) to learn the same.
+	if snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath()); !ok || snap.RefreshOwedAtMs == 0 {
+		return
+	}
 	payOwedClaudeUsageRefreshAt(time.Now())
 }
 
