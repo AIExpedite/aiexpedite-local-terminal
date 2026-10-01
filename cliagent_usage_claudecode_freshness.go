@@ -506,12 +506,9 @@ func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bo
 	return func(snap *claudeRateLimitSnapshot) bool {
 		// Judged at lock time: the lease measures a real request in flight.
 		now := time.Now()
-		lease := claudeRunDebtClaimLease()
-		// A lease beyond any this code writes is a backwards clock step, not an
-		// attempt in flight, and is ignored rather than honoured for hours.
-		if held := snap.AttemptClaimedUntilMs; held > now.UnixMilli() && held <= now.Add(lease).UnixMilli() {
+		if until, live := claudeRunDebtLeaseLive(snap, now); live {
 			*claimedElsewhere = true
-			*inFlightUntil = time.UnixMilli(held)
+			*inFlightUntil = until
 			return false
 		}
 		if snap.RefreshOwedAtMs == owedMs && snap.NextAttemptAtMs != rungMs {
@@ -522,10 +519,25 @@ func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bo
 			return false
 		}
 		snap.NextAttemptAtMs = 0
-		snap.AttemptClaimedUntilMs = now.Add(lease).UnixMilli()
+		snap.AttemptClaimedUntilMs = now.Add(claudeRunDebtClaimLease()).UnixMilli()
 		*leaseMs = snap.AttemptClaimedUntilMs
 		return true
 	}
+}
+
+// claudeRunDebtLeaseLive reports whether another attempt's claim on the debt
+// (AttemptClaimedUntilMs) is still in flight at `now`, and until when. Every
+// path that charges the debt's budget honours it, not only the rung claim: a
+// gather or seed that reserved past it would send a second request while the
+// owner's is still out. A lease beyond any this code writes is a backwards
+// clock step, not an attempt in flight, and is ignored rather than honoured
+// for hours.
+func claudeRunDebtLeaseLive(snap *claudeRateLimitSnapshot, now time.Time) (time.Time, bool) {
+	held := snap.AttemptClaimedUntilMs
+	if held <= now.UnixMilli() || held > now.Add(claudeRunDebtClaimLease()).UnixMilli() {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(held), true
 }
 
 // claudeRunDebtClaimLease bounds how long a claimed attempt may be in flight:
@@ -551,8 +563,9 @@ func releaseClaudeRunDebtClaim(leaseMs int64) func(*claudeRateLimitSnapshot) boo
 
 // claudeReserveRunDebtSlot charges one request to the debt at `owed`, durably,
 // for a gather about to probe for it. `onDisk` reports whether that debt was on
-// disk to charge at all, so a refused reservation (the cap, a contended lock)
-// can be told apart from a debt only this process holds.
+// disk to charge at all, so a refused reservation (the cap, a contended lock,
+// another process's live claim) can be told apart from a debt only this
+// process holds.
 func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onDisk bool) {
 	charge := adjustClaudeRefreshAttemptsAt(owed, +1)
 	owedMs := owed.UnixMilli()
@@ -560,6 +573,9 @@ func claudeReserveRunDebtSlot(fingerprint string, owed time.Time) (reserved, onD
 	reserved = mutateClaudeRateLimitSnapshot(claudeRateLimitCachePath(), fingerprint, func(snap *claudeRateLimitSnapshot) bool {
 		locked = true
 		onDisk = snap.RefreshOwedAtMs == owedMs
+		if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
+			return false
+		}
 		return charge(snap)
 	})
 	// The lock was never granted: the debt may well be on disk, so this is a

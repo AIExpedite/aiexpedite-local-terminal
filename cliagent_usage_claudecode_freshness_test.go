@@ -3655,6 +3655,38 @@ func TestClaimClaudeRunDebtRungAt_SecondClaimOfTheSameRungIsRefused(t *testing.T
 // A process that loads the snapshot AFTER another claimed the rung reads
 // NextAttemptAtMs == 0. The claim's lease is what tells it an attempt is still
 // in flight; once the owner releases it (or it lapses) the debt is claimable.
+// A gather's reservation honours another process's claim lease just as the rung
+// claim does: while that attempt is on the wire, charging the budget would send a
+// second request for the same debt.
+func TestClaudeReserveRunDebtSlot_RefusedWhileAnotherAttemptHoldsTheLease(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	fp := currentClaudeAccountFingerprint()
+
+	owner, ownerInFlight := false, time.Time{}
+	var lease int64
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, 0, &owner, &ownerInFlight, &lease)) {
+		t.Fatal("the owner's claim was refused")
+	}
+	reserved, onDisk := claudeReserveRunDebtSlot(fp, owed)
+	if reserved || !onDisk {
+		t.Fatalf("reserved=%v onDisk=%v under a live lease, want a refusal of a debt that is on disk", reserved, onDisk)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
+		t.Errorf("attempts=%d, want only the owner's charge", got)
+	}
+
+	if !mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtClaim(lease)) {
+		t.Fatal("the owner could not release its lease")
+	}
+	if reserved, _ := claudeReserveRunDebtSlot(fp, owed); !reserved {
+		t.Error("the reservation was still refused after the lease was released")
+	}
+}
+
 func TestClaimClaudeRunDebtRungAt_LeaseRefusesAZeroRungClaimWhileInFlight(t *testing.T) {
 	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
 	now := time.Now()

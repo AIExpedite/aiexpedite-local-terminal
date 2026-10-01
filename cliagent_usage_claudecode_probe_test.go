@@ -3761,6 +3761,34 @@ func TestClaudeUsageProbe_After401WaitsForACredentialRewrite(t *testing.T) {
 			t.Errorf("request count=%d, want exactly one more after the rewrite", got)
 		}
 	})
+	t.Run("a click that succeeds ends the in-memory wait", func(t *testing.T) {
+		var served int64
+		_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			if atomic.AddInt64(&served, 1) == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			claudeProbeOKHandler(w, r)
+		})
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+		same := resolve(claudeUsageProbeIdentity{token: probeTestToken, credStamp: claudeCredStamp{modNs: 100, size: 10}})
+		start := time.Now()
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, false); r.code != claudeProbeHTTP401 {
+			t.Fatalf("first attempt=%+v, want http_401", r)
+		}
+		if r, _, _ := probeClaudeUsageResult(context.Background(), start, same, time.Time{}, true); r.code != claudeProbeOK {
+			t.Fatalf("click=%+v, want ok with the unchanged credential", r)
+		}
+		if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+			t.Fatalf("authWait=%+v after a successful click, want cleared", got)
+		}
+		// The token is proven good, so a later automatic attempt in this same
+		// process must not be refused as if it were still awaiting a rewrite.
+		r, _, _ := probeClaudeUsageResult(context.Background(), start.Add(1100*time.Millisecond), same, time.Time{}, false)
+		if r.code == claudeProbeCredentialExpired {
+			t.Errorf("automatic attempt after a successful click=%+v, want it admitted", r)
+		}
+	})
 	t.Run("unstamped doubles the backoff", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, unauthorized)
 		t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")

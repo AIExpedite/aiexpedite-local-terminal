@@ -1357,6 +1357,12 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					lockedInFlight = true
 					return false
 				}
+				// The same, for another PROCESS's attempt: its durable claim
+				// lease says a request for this debt is already on the wire.
+				if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
+					lockedInFlight = true
+					return false
+				}
 				return charge(snap)
 			})
 		claudeUsageProbeAfterSeedCharge()
