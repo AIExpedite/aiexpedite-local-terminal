@@ -796,6 +796,7 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		return claudeProbeResult{code: claudeUsageProbe.refusal(now, false)}
 	}
 
+	authWaitSeq := claudeUsageProbe.authWaitReadSeq()
 	snap, ok := loadClaudeRateLimitSnapshot(path)
 	if !ok || snap.AccountFingerprint != fingerprint {
 		// No cache, or one belonging to an account this device is no longer
@@ -868,7 +869,7 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	// A credential wait a previous attempt (or process) recorded survives the
 	// restart, so the same expired or 401'd token is not re-sent on start; one
 	// another process has since cleared drops the wait it was restored into.
-	claudeUsageProbe.restoreAuthWait(claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize})
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{modNs: snap.AuthWaitCredStampNs, size: snap.AuthWaitCredSize}, authWaitSeq)
 
 	// A rung booked in the future stands: the timer and the startup replay
 	// re-arm it rather than spending it early. One stamped beyond any rung the

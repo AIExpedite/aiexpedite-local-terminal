@@ -265,6 +265,9 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 		attempts = snap.RefreshOwedAttempts
 		return true
 	})
+	if committed && !retired {
+		claudeUsageProbe.markAuthWaitPersisted(wait)
+	}
 	if retired {
 		claudeUsageProbe.dropOwedThrough(owed)
 		fmt.Printf("%s[claude-usage] run refresh retired: request budget spent (%d/%d)%s\n",
@@ -442,6 +445,34 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 		g.authWait, g.authWaitNudged = stamp, claudeCredStamp{}
 	}
 	g.authWaitRestored = claudeCredStamp{}
+	g.authWaitSeq++
+}
+
+// authWaitReadSeq is taken BEFORE reading the persisted wait and handed to
+// restoreAuthWait with what was read, so a read that started before a local
+// change to the wait (a 401 noted, the wait persisted, a success clearing it)
+// cannot be applied over it.
+func (g *claudeUsageProbeGate) authWaitReadSeq() uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.authWaitSeq
+}
+
+// markAuthWaitPersisted records that the local wait on `stamp` reached disk.
+// From then on the on-disk copy is this wait, so a later read finding it
+// cleared — a peer probed successfully with that credential after this write —
+// drops it, as it would a restored one. A wait replaced since the booking read
+// it is left alone.
+func (g *claudeUsageProbeGate) markAuthWaitPersisted(stamp claudeCredStamp) {
+	if stamp.isZero() {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.authWait == stamp {
+		g.authWaitRestored = stamp
+		g.authWaitSeq++
+	}
 }
 
 // restoreAuthWait mirrors the credential wait persisted in the cache. A
@@ -460,13 +491,18 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 // it, and every later automatic attempt would then mistake the still-rejected
 // credential for a changed one and resend it until the budget ran out.
 //
-// Restoring the stamp a local wait already holds leaves that wait local: a
-// seed that read stamp B before a concurrent 401 on B was noted must not mark
-// the newer local wait restored again, or a later read of a peer's earlier
-// on-disk clear would drop it.
-func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp) {
+// readSeq is authWaitReadSeq taken before the read. A read that started before
+// a local change to the wait is dropped whole: it cannot say anything newer
+// than what this process just recorded. Restoring the stamp a local wait
+// already holds leaves that wait local until the wait is persisted
+// (markAuthWaitPersisted), so a read of a peer's on-disk clear made before this
+// process wrote the wait cannot drop it, while one made after can.
+func (g *claudeUsageProbeGate) restoreAuthWait(stamp claudeCredStamp, readSeq uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if readSeq != g.authWaitSeq {
+		return
+	}
 	if stamp.isZero() {
 		if !g.authWaitRestored.isZero() && g.authWait == g.authWaitRestored {
 			g.authWait, g.authWaitNudged = claudeCredStamp{}, claudeCredStamp{}

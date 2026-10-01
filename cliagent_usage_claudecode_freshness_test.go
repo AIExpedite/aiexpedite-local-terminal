@@ -3969,7 +3969,7 @@ func TestClaudeUsageProbeGate_CacheSeedDropsARestoredWaitClearedOnDisk(t *testin
 	// mistaken for a cleared persisted one.
 	local := claudeCredStamp{modNs: 999, size: 1}
 	claudeUsageProbe.noteAuthWait(local)
-	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, claudeUsageProbe.authWaitReadSeq())
 	if !claudeUsageProbe.awaitingCredentialChange(local) {
 		t.Errorf("in-memory wait=%+v, want the locally recorded %+v kept", claudeUsageProbe.authWaitStamp(), local)
 	}
@@ -4056,20 +4056,20 @@ func TestClaudeUsageProbe_RestoreAuthWaitKeepsANewerLocalWait(t *testing.T) {
 	rewritten := claudeCredStamp{modNs: 200, size: 1}
 
 	claudeUsageProbe.noteAuthWait(rewritten)
-	claudeUsageProbe.restoreAuthWait(old)
+	claudeUsageProbe.restoreAuthWait(old, claudeUsageProbe.authWaitReadSeq())
 	if got := claudeUsageProbe.authWaitStamp(); got != rewritten {
 		t.Fatalf("in-memory wait=%+v, want the locally recorded newer %+v kept", got, rewritten)
 	}
 
 	newer := claudeCredStamp{modNs: 300, size: 1}
-	claudeUsageProbe.restoreAuthWait(newer)
+	claudeUsageProbe.restoreAuthWait(newer, claudeUsageProbe.authWaitReadSeq())
 	if got := claudeUsageProbe.authWaitStamp(); got != newer {
 		t.Fatalf("in-memory wait=%+v, want the persisted newer %+v adopted", got, newer)
 	}
 
 	// A wait that is still the restored one follows the disk.
 	replaced := claudeCredStamp{modNs: 250, size: 2}
-	claudeUsageProbe.restoreAuthWait(replaced)
+	claudeUsageProbe.restoreAuthWait(replaced, claudeUsageProbe.authWaitReadSeq())
 	if got := claudeUsageProbe.authWaitStamp(); got != replaced {
 		t.Errorf("in-memory wait=%+v, want the replaced persisted %+v", got, replaced)
 	}
@@ -4083,9 +4083,9 @@ func TestClaudeUsageProbe_SameStampLocalWaitSurvivesAStaleRestoredClear(t *testi
 	t.Cleanup(resetClaudeUsageProbeGate)
 	b := claudeCredStamp{modNs: 200, size: 1}
 
-	claudeUsageProbe.restoreAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(b, claudeUsageProbe.authWaitReadSeq())
 	claudeUsageProbe.noteAuthWait(b)
-	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, claudeUsageProbe.authWaitReadSeq())
 	if !claudeUsageProbe.awaitingCredentialChange(b) {
 		t.Fatalf("in-memory wait=%+v, want the local same-stamp wait %+v kept", claudeUsageProbe.authWaitStamp(), b)
 	}
@@ -4100,20 +4100,59 @@ func TestClaudeUsageProbe_SameStampRestoreAfterLocalWaitKeepsItLocal(t *testing.
 	t.Cleanup(resetClaudeUsageProbeGate)
 	b := claudeCredStamp{modNs: 200, size: 1}
 
+	staleRead := claudeUsageProbe.authWaitReadSeq()
 	claudeUsageProbe.noteAuthWait(b)
-	claudeUsageProbe.restoreAuthWait(b)
-	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	claudeUsageProbe.restoreAuthWait(b, staleRead)
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, claudeUsageProbe.authWaitReadSeq())
 	if !claudeUsageProbe.awaitingCredentialChange(b) {
 		t.Fatalf("in-memory wait=%+v, want the local same-stamp wait %+v kept", claudeUsageProbe.authWaitStamp(), b)
 	}
 
 	// A wait that was only ever restored still follows the persisted clear.
 	resetClaudeUsageProbeGate()
-	claudeUsageProbe.restoreAuthWait(b)
-	claudeUsageProbe.restoreAuthWait(b)
-	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	claudeUsageProbe.restoreAuthWait(b, claudeUsageProbe.authWaitReadSeq())
+	claudeUsageProbe.restoreAuthWait(b, claudeUsageProbe.authWaitReadSeq())
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, claudeUsageProbe.authWaitReadSeq())
 	if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
 		t.Fatalf("in-memory wait=%+v, want a restored-only wait dropped by the persisted clear", got)
+	}
+}
+
+// A local wait on B that the retry booking persisted is the on-disk copy from
+// then on: a read made after that write finding the wait cleared — another
+// process succeeded with B — drops it, while a read that started before the
+// write is ignored whole.
+func TestClaudeUsageProbe_PersistedLocalWaitAcceptsAPeersLaterClear(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	b := claudeCredStamp{modNs: 200, size: 1}
+
+	claudeUsageProbe.noteAuthWait(b)
+	beforeWrite := claudeUsageProbe.authWaitReadSeq()
+	if !claudeBookRunDebtRung(fp, owed, now, claudeRungFree, 0) {
+		t.Fatal("precondition: the rung was not booked")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs != b.modNs || snap.AuthWaitCredSize != b.size {
+		t.Fatalf("persisted wait=(%d,%d), want %+v", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize, b)
+	}
+	// A read that started before the write (it saw a peer's earlier clear) is
+	// not applied over the persisted local wait.
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, beforeWrite)
+	if !claudeUsageProbe.awaitingCredentialChange(b) {
+		t.Fatalf("in-memory wait=%+v, want %+v kept against a read from before the write", claudeUsageProbe.authWaitStamp(), b)
+	}
+
+	// Reads after the write: the same stamp, then a peer's clear.
+	claudeUsageProbe.restoreAuthWait(b, claudeUsageProbe.authWaitReadSeq())
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{}, claudeUsageProbe.authWaitReadSeq())
+	if got := claudeUsageProbe.authWaitStamp(); !got.isZero() {
+		t.Fatalf("in-memory wait=%+v, want the persisted local wait dropped by the peer's later clear", got)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("issued %d requests, want 0", n)
 	}
 }
 

@@ -386,9 +386,13 @@ type claudeUsageProbeGate struct {
 	// restored into authWait, so a later read finding it cleared on disk (another
 	// process's probe succeeded with that credential) can drop it here too —
 	// without touching a wait this process recorded itself and never persisted.
+	// authWaitSeq counts local changes to the wait (a 401 noted, the wait
+	// persisted, a success clearing it), so restoreAuthWait can refuse a read of
+	// the cache that started before one of them.
 	authWait         claudeCredStamp
 	authWaitNudged   claudeCredStamp
 	authWaitRestored claudeCredStamp
+	authWaitSeq      uint64
 	// owedBaseline is the newest run completion for which we still owe an
 	// observation. The persisted debt and its retry rung
 	// (cliagent_usage_claudecode_refresh_schedule.go) pay it; the throttle may
@@ -657,6 +661,7 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.authWait = claudeCredStamp{}
 	claudeUsageProbe.authWaitNudged = claudeCredStamp{}
 	claudeUsageProbe.authWaitRestored = claudeCredStamp{}
+	claudeUsageProbe.authWaitSeq = 0
 	claudeUsageProbe.owedBaseline = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
@@ -1222,6 +1227,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 		g.mu.Unlock()
 		close(seeding)
 	}()
+	authWaitSeq := g.authWaitReadSeq()
 	persisted, attempts, held, authWait := claudePersistedProbeStateWithWaitFor(fingerprint)
 	// The credential wait a previous attempt (or process) persisted, restored
 	// before this gather can be admitted — as payOwedClaudeUsageRefreshAt does,
@@ -1232,7 +1238,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 	// credential rewrite. A wait that has since disappeared from disk — another
 	// process sharing the cache probed successfully with that credential — is
 	// dropped here as well, if it is the one restored from disk.
-	g.restoreAuthWait(authWait)
+	g.restoreAuthWait(authWait, authWaitSeq)
 	// A debt the replay would retire without a request is not adopted either:
 	// this read races the replay, and adopting a capped, aged-out or skewed debt
 	// would let the gather spend the uncharged request the cap exists to refuse.
@@ -1667,6 +1673,7 @@ func (g *claudeUsageProbeGate) finish(result claudeProbeResult, refreshed bool, 
 	}
 	if result.issued && result.code != claudeProbeHTTP401 {
 		g.authWait, g.authWaitNudged, g.authWaitRestored = claudeCredStamp{}, claudeCredStamp{}, claudeCredStamp{}
+		g.authWaitSeq++
 	}
 	// Release every joiner AFTER the outcome is recorded, so a waiter that wakes
 	// and re-samples refreshes cannot observe the pre-probe count.
