@@ -33,7 +33,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -151,7 +150,7 @@ func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
 		kept = kept[:museCodeUsageLiveMaxAccounts]
 	}
 	file.Readings = kept
-	return writeMuseCodeJSONAtomic(path, file)
+	return writeJSONFileAtomic(path, file)
 }
 
 // loadMuseCodeUsageLive returns the cached reading for that account, if any.
@@ -164,25 +163,6 @@ func loadMuseCodeUsageLive(accountKey string) (museCodeUsageLiveCache, bool) {
 		}
 	}
 	return museCodeUsageLiveCache{}, false
-}
-
-func writeMuseCodeJSONAtomic(path string, value any) bool {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return false
-	}
-	out, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return false
-	}
-	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return false
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	return true
 }
 
 // probeMuseCodeUsageLive runs one bounded quota read for the signed-in Muse
@@ -441,7 +421,7 @@ func saveMuseCodeModelsCache(version, accountKey string, discovery cliAgentModel
 	}
 	museCodeModelsCacheMu.Lock()
 	defer museCodeModelsCacheMu.Unlock()
-	_ = writeMuseCodeJSONAtomic(museCodeModelsCachePath(), museCodeModelsCacheFile{
+	_ = writeJSONFileAtomic(museCodeModelsCachePath(), museCodeModelsCacheFile{
 		Version:      version,
 		AccountKey:   accountKey,
 		FetchedAtMs:  now.UnixMilli(),

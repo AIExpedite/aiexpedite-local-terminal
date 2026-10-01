@@ -500,22 +500,7 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 	if path == "" || entry.AccountFingerprint == "" {
 		return false
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return false
-	}
-	out, err := json.MarshalIndent(entry, "", "  ")
-	if err != nil {
-		return false
-	}
-	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return false
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	return true
+	return writeJSONFileAtomic(path, entry)
 }
 
 // loadGrokBillingLiveSnapshot returns the cached live reading for the account

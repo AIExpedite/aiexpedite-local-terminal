@@ -359,6 +359,7 @@ func TestGrokRunDebt_AgesOutAfterSixHours(t *testing.T) {
 func TestGrokRunDebt_SmokeRefusedBeforeInferenceOwesNothing(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	floor := armGrokUsageRunFloor(h.clock())
+	h.idle()
 	if h.state().RunFloorMs != floor.UnixMilli() {
 		t.Fatalf("arm did not persist its floor: %+v", h.state())
 	}
@@ -464,5 +465,33 @@ func TestGrokRunDebt_DisabledRefreshArmsNothing(t *testing.T) {
 	}
 	if nudgeGrokUsageRefresh(h.clock(), "fp-ada") || h.reads.Load() != 0 {
 		t.Fatal("a disabled refresh must never read")
+	}
+}
+
+// The arm persists off the spawn path (the ACP manager arms under its own
+// mutex). A persist that lands after its run already settled must not leave a
+// floor behind for the next start to adopt as an interrupted run.
+func TestGrokRunDebt_LateArmPersistNeverLeavesAStaleFloor(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	grokFreshnessMu.Lock() // park the arm's persist
+	floor := armGrokUsageRunFloor(h.clock())
+	if !grokRunIsLive(floor.UnixMilli()) {
+		grokFreshnessMu.Unlock()
+		t.Fatal("the floor must be live from the instant it is armed")
+	}
+	disarmed := make(chan struct{})
+	go func() {
+		disarmGrokUsageRunFloor(floor) // releases the run, then waits on the lock
+		close(disarmed)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for grokRunIsLive(floor.UnixMilli()) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	grokFreshnessMu.Unlock()
+	<-disarmed
+	h.idle()
+	if state := h.state(); state.RunFloorMs != 0 {
+		t.Fatalf("state = %+v, a persist landing after the settle left a floor", state)
 	}
 }

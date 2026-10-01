@@ -39,7 +39,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -196,18 +195,8 @@ func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshne
 		return state
 	}
 	state.SchemaVersion = grokUsageFreshnessSchema
-	body, err := json.Marshal(state)
-	if err != nil {
-		return state
-	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
-		return state
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-	}
+	// Best-effort: a read-only data dir costs a refresh, never a run.
+	_ = writeJSONFileAtomic(path, state)
 	return state
 }
 
@@ -258,6 +247,12 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 
 // armGrokUsageRunFloor records that a run which can spend credits is starting
 // and returns its floor; zero when the refresh is disabled.
+//
+// The floor is registered as live on the caller's goroutine, but persisted off
+// it, as armAntigravityUsageRunFloor does: the ACP manager arms while holding
+// its own mutex across the spawn, and a slow disk must not stall that. A
+// persist that lands after the run already settled is skipped, so it can
+// never leave a stale floor for the next start to adopt.
 func armGrokUsageRunFloor(now time.Time) time.Time {
 	if !grokUsageRefreshEnabled.Load() {
 		return time.Time{}
@@ -266,13 +261,44 @@ func armGrokUsageRunFloor(now time.Time) time.Time {
 	grokLiveRunsMu.Lock()
 	grokLiveRuns[floorMs]++
 	grokLiveRunsMu.Unlock()
-	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
-		grokRebaseFutureFreshness(state, now)
-		if floorMs > state.RunFloorMs {
-			state.RunFloorMs = floorMs
-		}
-	})
+	grokFreshnessInFlight.Add(1)
+	go func() {
+		defer grokFreshnessInFlight.Add(-1)
+		updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+			if !grokRunIsLive(floorMs) {
+				return
+			}
+			grokRebaseFutureFreshness(state, now)
+			if floorMs > state.RunFloorMs {
+				state.RunFloorMs = floorMs
+			}
+		})
+	}()
 	return now
+}
+
+func grokRunIsLive(floorMs int64) bool {
+	grokLiveRunsMu.Lock()
+	defer grokLiveRunsMu.Unlock()
+	return grokLiveRuns[floorMs] > 0
+}
+
+// grokOldestLiveFloor is the floor of the earliest run still armed (0 when
+// none). Lock order: freshness -> live runs; never the reverse.
+func grokOldestLiveFloor() int64 {
+	grokLiveRunsMu.Lock()
+	defer grokLiveRunsMu.Unlock()
+	return grokOldestLiveFloorLocked()
+}
+
+func grokOldestLiveFloorLocked() int64 {
+	oldest := int64(0)
+	for f := range grokLiveRuns {
+		if oldest == 0 || f < oldest {
+			oldest = f
+		}
+	}
+	return oldest
 }
 
 // grokReleaseLiveRun forgets an armed floor and returns the oldest one still
@@ -285,13 +311,7 @@ func grokReleaseLiveRun(floorMs int64) int64 {
 	} else {
 		delete(grokLiveRuns, floorMs)
 	}
-	oldest := int64(0)
-	for f := range grokLiveRuns {
-		if oldest == 0 || f < oldest {
-			oldest = f
-		}
-	}
-	return oldest
+	return grokOldestLiveFloorLocked()
 }
 
 // grokDropSettledFloor rolls the restart marker back once its run is
@@ -397,14 +417,7 @@ func settleGrokRunFreshness(observedMs int64, fingerprint string) {
 	if observedMs <= 0 {
 		return
 	}
-	grokLiveRunsMu.Lock()
-	oldest := int64(0)
-	for f := range grokLiveRuns {
-		if oldest == 0 || f < oldest {
-			oldest = f
-		}
-	}
-	grokLiveRunsMu.Unlock()
+	oldest := grokOldestLiveFloor()
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		if state.owed() && state.AccountFingerprint == fingerprint && observedMs >= state.CompletionMs {
 			state.clearDebt()
@@ -469,15 +482,21 @@ func grokStartRunDebtWorker(bypassInterval bool) {
 // grokUsageRefreshWaitFor waits at most d for the worker (and any rung firing)
 // to go idle, and reports whether it did.
 func grokUsageRefreshWaitFor(d time.Duration) bool {
-	for deadline := time.Now().Add(d); ; {
-		if grokFreshnessInFlight.Load() == 0 {
-			return true
-		}
-		if !time.Now().Before(deadline) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return grokUsageRefreshWaitIdle(ctx)
+}
+
+// grokUsageRefreshWaitIdle waits until nothing of this feature is in flight,
+// or ctx ends; it reports whether it went idle.
+func grokUsageRefreshWaitIdle(ctx context.Context) bool {
+	for grokFreshnessInFlight.Load() != 0 {
+		if ctx.Err() != nil {
 			return false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	return true
 }
 
 // grokPendingDebt returns the unpaid debt, rebasing a rolled-back clock and
@@ -696,10 +715,7 @@ func nudgeGrokUsageRefresh(now time.Time, fingerprint string) bool {
 	if !grokUsageRefreshEnabled.Load() || fingerprint == "" || IsShutdownInProgress() || IsOffline() {
 		return false
 	}
-	grokLiveRunsMu.Lock()
-	live := len(grokLiveRuns) > 0
-	grokLiveRunsMu.Unlock()
-	if live {
+	if grokOldestLiveFloor() != 0 {
 		return false
 	}
 	n := &grokRefreshNudge
@@ -785,11 +801,9 @@ var grokSmokeUsageSettleBudget = 10 * time.Second
 // settleOrDisarmGrokSmokeRun settles the smoke's run when a rung reached
 // inference — and then waits, bounded by grokSmokeUsageSettleBudget and ctx,
 // for its first read — or disarms it when no rung did. Returns a closed label
-// for the smoke's log line; the smoke verdict never depends on it.
+// for the smoke's log line; the smoke verdict never depends on it. The caller
+// arms the floor, so a zero floor (refresh disabled) never reaches here.
 func settleOrDisarmGrokSmokeRun(ctx context.Context, floor time.Time, reachedInference bool) string {
-	if floor.IsZero() {
-		return "disabled"
-	}
 	if !reachedInference {
 		disarmGrokUsageRunFloor(floor)
 		return "not_owed"
@@ -800,12 +814,9 @@ func settleOrDisarmGrokSmokeRun(ctx context.Context, floor time.Time, reachedInf
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, grokSmokeUsageSettleBudget)
 	defer cancel()
-	for grokFreshnessInFlight.Load() != 0 {
-		if waitCtx.Err() != nil {
-			// Still a debt on disk: the worker and its ladder keep paying it.
-			return "pending"
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !grokUsageRefreshWaitIdle(waitCtx) {
+		// Still a debt on disk: the worker and its ladder keep paying it.
+		return "pending"
 	}
 	if outcome, _ := grokLastRefreshOutcome.Load().(string); outcome != "" {
 		return outcome
