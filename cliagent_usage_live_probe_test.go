@@ -1297,3 +1297,42 @@ func TestCodexLiveProbeConverse_RefusedReadReportsNotMerged(t *testing.T) {
 		t.Fatalf("retry kind = %v, want codexRetryAfterRead", kind)
 	}
 }
+
+// The click's renewal is not a cached warm-up: with a model list cached minutes
+// ago, an expired login still starts one `agy models`, and the read after it is
+// booked on the spacing clock like the first.
+func TestProbeAntigravityQuotaViaCodeAssist_RenewsDespiteAWarmModelCache(t *testing.T) {
+	helperIsolateAntigravityFreshness(t)
+	helperIsolateLogIndex(t)
+	setExpiry := helperMutableAntigravityKeyring(t, time.Now().Add(-time.Minute))
+	spawned := helperIsolateLoginRenewal(t, func(context.Context) (string, bool) {
+		setExpiry(time.Now().Add(time.Hour))
+		return realAntigravityModels, true
+	})
+	detected, _ := antigravityLoginRenewDetectedFn()
+	if _, ok := cachedCLIAgentModelDiscovery(context.Background(), "antigravity", detected, "", time.Now().Add(-5*time.Minute)); !ok {
+		t.Fatal("could not warm the model cache")
+	}
+	warmed := spawned.Load()
+	// The warm-up child renewed it; the login has expired again since.
+	setExpiry(time.Now().Add(-time.Minute))
+	var reads atomic.Int32
+	helperStubAntigravityCodeAssistOutcome(t, func() string {
+		reads.Add(1)
+		if antigravityStoredLoginUsable(context.Background(), time.Now()) {
+			return liveProbeOutcomeCodeAssistOK
+		}
+		return liveProbeOutcomeCodeAssistTokenExpired
+	})
+
+	clickAt := time.Now()
+	if got := probeAntigravityQuotaViaCodeAssist(context.Background(), detectedCLIAgent{Version: "1.2.3"}); got != liveProbeOutcomeCodeAssistOK {
+		t.Fatalf("outcome=%q, want the read after the renewal to succeed", got)
+	}
+	if spawned.Load()-warmed != 1 || reads.Load() != 2 {
+		t.Errorf("renewal children=%d reads=%d, want one `agy models` between two reads", spawned.Load()-warmed, reads.Load())
+	}
+	if paid := helperFreshnessState(t).LastPaidAtMs; paid < clickAt.UnixMilli() {
+		t.Errorf("lastPaidAtMs=%d, want the post-renewal read on the spacing clock", paid)
+	}
+}

@@ -456,3 +456,42 @@ func TestProbeAntigravityQuotaCodeAssist_RefusalLogsOnlyTheStatus(t *testing.T) 
 		}
 	}
 }
+
+// The skew is 15 s: a token with 16 s left is sent, one with 14 s left is
+// refused locally and its expiry is noted beside the outcome, in memory, so
+// the debt worker can book its retry at that instant.
+func TestProbeAntigravityQuotaCodeAssist_TokenExpirySkewBoundary(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		left time.Duration
+		want string
+	}{
+		{left: 16 * time.Second, want: liveProbeOutcomeCodeAssistOK},
+		{left: 14 * time.Second, want: liveProbeOutcomeCodeAssistTokenExpired},
+	} {
+		t.Run(tc.left.String(), func(t *testing.T) {
+			expiry := now.Add(tc.left)
+			helperStubAntigravityKeyring(t, map[string]any{
+				"access_token": "access-A", "token_type": "Bearer", "id_token": helperIDToken(t, "ada@example.com"),
+				"expiry": expiry.Format(time.RFC3339Nano),
+			})
+			quotaCalls, _ := helperCodeAssistServers(t,
+				func(string) (int, string) { return http.StatusOK, antigravityCodeAssistFixture },
+				func(string) (int, string) { return http.StatusOK, `{"email":"ada@example.com"}` })
+			takeAntigravityCodeAssistAttempt()
+			got := probeAntigravityQuotaCodeAssist(context.Background(), "1.2.3", func() time.Time { return now })
+			note := takeAntigravityCodeAssistAttempt()
+			if got != tc.want {
+				t.Fatalf("outcome=%q, want %q", got, tc.want)
+			}
+			if tc.want == liveProbeOutcomeCodeAssistTokenExpired {
+				if *quotaCalls != 0 || note.tokenExpiryMs != expiry.UnixMilli() {
+					t.Errorf("quotaCalls=%d tokenExpiryMs=%d, want nothing sent and the expiry %d noted",
+						*quotaCalls, note.tokenExpiryMs, expiry.UnixMilli())
+				}
+			} else if note.tokenExpiryMs != 0 {
+				t.Errorf("tokenExpiryMs=%d on a read that was sent, want 0", note.tokenExpiryMs)
+			}
+		})
+	}
+}
