@@ -210,7 +210,7 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 		if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
 			return time.Time{}, err
 		}
-		if err := os.Rename(tmp, path); err != nil {
+		if err := renameClaudeRateLimitCache(tmp, path); err != nil {
 			_ = os.Remove(tmp)
 			return time.Time{}, err
 		}
@@ -759,8 +759,9 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 		// exists to clear. Safe in the crash direction: a crash between the charge
 		// and the refund keeps the charge, which only ever spends the budget
 		// faster.
-		mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1))
-		attempts--
+		if mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, -1)) {
+			attempts--
+		}
 	}
 	logClaudeUsageRefreshOutcome(result.outcome, attempts)
 	claudeScheduleRunDebtRetry(fingerprint, owed, result.kept, now)

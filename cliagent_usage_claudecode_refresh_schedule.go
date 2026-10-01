@@ -146,7 +146,7 @@ func claudeRefreshOutcomeForError(probeErr *cliAgentUsageError) string {
 // a live hold, offline (no budget, may recur), or a deferral (interval or the
 // single flight).
 func claudeRunDebtRetryKindForRefusal(now time.Time) claudeRunDebtRetryKind {
-	if _, held := claudeUsageProbe.heldAt(now); held {
+	if claudeUsageProbe.heldAt(now) {
 		return claudeRetryHeld
 	}
 	if IsOffline() {

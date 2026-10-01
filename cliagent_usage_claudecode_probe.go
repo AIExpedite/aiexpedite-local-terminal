@@ -1637,12 +1637,11 @@ func (g *claudeUsageProbeGate) blockedFromIssuing(now time.Time) bool {
 	return IsOffline()
 }
 
-// heldAt reports whether a server-imposed hold is still in force at `now`, and
-// until when.
-func (g *claudeUsageProbeGate) heldAt(now time.Time) (time.Time, bool) {
+// heldAt reports whether a server-imposed hold is still in force at `now`.
+func (g *claudeUsageProbeGate) heldAt(now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.heldUntil, !g.heldUntil.IsZero() && now.Before(g.heldUntil)
+	return !g.heldUntil.IsZero() && now.Before(g.heldUntil)
 }
 
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
@@ -2489,7 +2488,7 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 				// A Refresh click inside a 429 hold publishes the cached reading:
 				// the service's backpressure outranks the click. Said so in the log,
 				// so a stale card that is really a hold is diagnosable.
-				if _, held := claudeUsageProbe.heldAt(time.Now()); held {
+				if claudeUsageProbe.heldAt(time.Now()) {
 					logClaudeUsageRefreshOutcome(claudeRefreshOutcomeHeld, 0)
 				}
 			}
@@ -2708,7 +2707,7 @@ func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 // reporting false when it never will, when the wait is too long to hold a timer
 // for, when another run already owns the trailing timer, or when the process is
 // shutting down. On false, the kind says what the debt should be scheduled as:
-// a wait too long to sleep through is a `spacing` or `held` rung on the ladder;
+// a wait too long to sleep through is booked on the ladder by claudeRunDebtRetryKindForRefusal;
 // every other refusal books nothing (an owned trailing timer belongs to a holder
 // that pays the same coalesced debt and books its own rung).
 //
@@ -2734,10 +2733,7 @@ func claudeUsageProbeAwaitEligible() (bool, claudeRunDebtRetryKind) {
 		// Retry-After. The ladder's timer takes it from here. Deliberately does
 		// NOT reserve the trailing slot: reserving one without sleeping in it
 		// would leave it held forever.
-		if _, held := claudeUsageProbe.heldAt(now); held {
-			return false, claudeRetryHeld
-		}
-		return false, claudeRetrySpacing
+		return false, claudeRunDebtRetryKindForRefusal(now)
 	}
 	if !claudeUsageProbe.reserveTrailing() {
 		return false, claudeRetryNone // another run already owns the trailing timer
