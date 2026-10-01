@@ -399,6 +399,14 @@ type claudeUsageProbeGate struct {
 	// probe, never to discard it.
 	owedBaseline      time.Time
 	trailingScheduled bool
+	// owedRungFor / owedRungAt are the retry rung the ladder booked (or a claim's
+	// in-flight lease) for the debt recorded at owedRungFor, in the cache's
+	// milliseconds. Until owedRungAt the routine gather does not treat that debt
+	// as `owing`: paying it there would spend the attempt budget ahead of the
+	// persisted backoff. Keyed to the debt instant, so a newer run's debt is never
+	// held back by an older debt's rung. See deferOwedUntil.
+	owedRungFor int64
+	owedRungAt  time.Time
 	// owedSeeded latches the ONE read of the persisted debt this process makes
 	// for the account named by owedSeededFor (see seedOwedFromCache). Scoped to
 	// the fingerprint rather than the process, so a first gather that could not
@@ -657,6 +665,8 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
 	claudeUsageProbe.owedBaseline = time.Time{}
+	claudeUsageProbe.owedRungFor = 0
+	claudeUsageProbe.owedRungAt = time.Time{}
 	claudeUsageProbe.owedSeeded = false
 	claudeUsageProbe.owedSeededFor = ""
 	claudeUsageProbe.owedSeededStampMod = 0
@@ -929,6 +939,43 @@ func (g *claudeUsageProbeGate) recordOwed(baseline time.Time) {
 		g.owedBaseline = baseline
 	}
 	g.mu.Unlock()
+}
+
+// deferOwedUntil records that the debt recorded at `owed` has a retry rung
+// booked for `at` — by this process's ladder, a previous process's (read back by
+// the startup replay or the seed), or a claim's lease — so the routine gather
+// leaves it to that rung instead of paying it early. Forced refreshes ignore it:
+// somebody is looking at the card.
+func (g *claudeUsageProbeGate) deferOwedUntil(owed, at time.Time) {
+	g.mu.Lock()
+	g.owedRungFor, g.owedRungAt = owed.UnixMilli(), at
+	g.mu.Unlock()
+}
+
+// owedRungPending reports whether the debt recorded at `owed` still has a
+// booked rung ahead of `now`.
+func (g *claudeUsageProbeGate) owedRungPending(owed, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !owed.IsZero() && g.owedRungFor == owed.UnixMilli() && now.Before(g.owedRungAt)
+}
+
+// retireOwed drops a debt the durable side has just retired from the gate as
+// well, so a later routine gather's `owing` branch cannot keep spending
+// uncharged requests on it. Compared at the cache's millisecond resolution, so
+// the same debt recorded locally at sub-millisecond precision is recognised as
+// the one retired, while a strictly newer run this process owes survives.
+func (g *claudeUsageProbeGate) retireOwed(retired time.Time) {
+	g.mu.Lock()
+	g.retireOwedLocked(retired)
+	g.mu.Unlock()
+}
+
+func (g *claudeUsageProbeGate) retireOwedLocked(retired time.Time) {
+	if !retired.IsZero() && !g.owedBaseline.IsZero() &&
+		g.owedBaseline.UnixMilli() <= retired.UnixMilli() {
+		g.owedBaseline = time.Time{}
+	}
 }
 
 // reserveTrailing claims the single trailing-timer slot, returning false when
@@ -1253,7 +1300,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		g.mu.Unlock()
 		close(seeding)
 	}()
-	persisted, attempts, held := claudePersistedProbeStateFor(fingerprint)
+	persisted, attempts, held, rung := claudePersistedProbeStateWithRungFor(fingerprint)
 	// A debt the replay would retire without a request is not adopted either:
 	// this read races the replay, and adopting a capped, aged-out or skewed debt
 	// would let the gather spend the uncharged request the cap exists to refuse.
@@ -1261,6 +1308,17 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	retired := time.Time{}
 	if !persisted.IsZero() && claudeRefreshDebtRetired(persisted, attempts, now) {
 		retired, persisted = persisted, time.Time{}
+	}
+	// Nor is a debt whose next attempt the ladder has booked for later — or that
+	// another process's claim is paying right now (its lease). Adopting it would
+	// make this gather's `owing` branch charge and send ahead of the persisted
+	// backoff; the rung itself pays it. Recorded on the gate so a debt this
+	// process already holds waits too, and the latch is left unclaimed — the rung
+	// falling due does not change the snapshot — so the gather after it adopts
+	// the debt should the booking process be gone.
+	if !persisted.IsZero() && claudeRefreshRungPending(rung, now) {
+		g.deferOwedUntil(persisted, rung)
+		persisted, latch = time.Time{}, false
 	}
 	// Before anything can be admitted: holdUntil is monotonic, so a live hold this
 	// process already took outranks a shorter persisted one.
@@ -1358,6 +1416,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 		lockedObserved := time.Time{}
 		lockedHeld := false
 		lockedInFlight := false
+		lockedRung := time.Time{}
 		// Both values are sampled on EVERY path, under the SAME lock the charge
 		// takes and BEFORE the charge decides anything, because the unlocked read
 		// above is necessarily older than this write:
@@ -1406,10 +1465,21 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 					lockedInFlight = true
 					return false
 				}
+				// A rung (or claim lease) booked for this debt in the same gap:
+				// the ladder pays it, not this gather — see the unlocked check.
+				if snap.RefreshOwedAtMs == persisted.UnixMilli() && snap.NextAttemptAtMs != 0 {
+					if next := time.UnixMilli(snap.NextAttemptAtMs); claudeRefreshRungPending(next, now) {
+						lockedRung = next
+						return false
+					}
+				}
 				return charge(snap)
 			})
 		claudeUsageProbeAfterSeedCharge()
-		if lockedHeld || lockedInFlight {
+		if !lockedRung.IsZero() {
+			g.deferOwedUntil(persisted, lockedRung)
+		}
+		if lockedHeld || lockedInFlight || !lockedRung.IsZero() {
 			// Declined for a reason that can change without the snapshot changing,
 			// so the latch is left unclaimed exactly as the pre-check leaves it:
 			// the gather after the hold expires — or after the in-flight probe
@@ -1471,10 +1541,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCache(ctx context.Context, fingerprin
 	// failed). Compared at the cache's millisecond resolution, so the same debt
 	// recorded locally at sub-millisecond precision is recognised as the one
 	// retired, while a strictly newer run this process owes survives.
-	if !retired.IsZero() && !g.owedBaseline.IsZero() &&
-		g.owedBaseline.UnixMilli() <= retired.UnixMilli() {
-		g.owedBaseline = time.Time{}
-	}
+	g.retireOwedLocked(retired)
 	// What a probe of THIS process persisted while we were reading, for THIS
 	// account. Read only when the generation advanced: lastRefreshAt is sampled
 	// RELATIVELY, never as an absolute claim, for the reason
@@ -2418,6 +2485,15 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 	// failed.
 	owed := claudeUsageProbe.owedObservation()
 	owing := !owed.IsZero() && (latest.IsZero() || !latest.After(owed))
+	// A debt with a retry rung booked for later is the ladder's to pay, at that
+	// rung: the override waits for it, and the gather falls back to the ordinary
+	// staleness TTL. A probe already on the wire is the exception — usually the
+	// rung's own claim, whose lease is what is pending — and stays owing so the
+	// refusal below joins it for the covering reading. A forced refresh is never
+	// held back.
+	if owing && !forced && claudeUsageProbe.owedRungPending(owed, now) && !claudeUsageProbe.probeInFlight() {
+		owing = false
+	}
 	if !forced && !owing && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
 		// Fresh by the caller's view — unless the startup replay landed after
 		// the seed returned and settled the debt this gather would otherwise

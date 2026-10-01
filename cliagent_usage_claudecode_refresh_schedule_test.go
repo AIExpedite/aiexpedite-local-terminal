@@ -508,3 +508,96 @@ func TestPayOwedClaudeUsageRefresh_InFlightLeaseSendsNothingElse(t *testing.T) {
 		t.Fatalf("request count=%d, want 1", got)
 	}
 }
+
+// seedClaudeBookedRung records a debt at `owed` with `attempts` spent and a
+// rung booked for `next`, behind a reading taken before the run but inside the
+// staleness TTL — so only the debt's `owing` override could send a request.
+func seedClaudeBookedRung(t *testing.T, cache, fp string, latest, owed time.Time, attempts int, next time.Time) {
+	t.Helper()
+	seedClaudeProbeReading(t, cache, latest)
+	seedClaudeRefreshDebt(t, cache, fp, owed, attempts, time.Time{})
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = next.UnixMilli()
+		return true
+	})
+}
+
+// After a restart that re-armed a future rung, a routine gather does not pay
+// the debt the replay handed the gate ahead of the ladder; once the rung is
+// due it does.
+func TestClaudeGather_WaitsForTheReplayedRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest, owed, next := now.Add(-2*time.Minute), now.Add(-time.Minute), now.Add(2*time.Minute)
+	seedClaudeBookedRung(t, cache, fp, latest, owed, 1, next)
+
+	simulateClaudeAgentRestart(t)
+	payOwedClaudeUsageRefreshAt(now)
+	claudeFreshnessWaitIdle(t)
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the gather paid the debt before its rung", got)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != next.UnixMilli() {
+		t.Fatalf("the gather charged or moved the booked rung: %+v", snap)
+	}
+
+	due := next.Add(time.Second)
+	refreshClaudeUsageIfStale(context.Background(), due, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1 once the rung was due", got)
+	}
+}
+
+// Without the replay — a gather of a fresh process (or of another agent
+// channel) reaching the seed first — a persisted future rung is neither adopted
+// nor charged.
+func TestClaudeGather_SeedDoesNotAdoptADebtWithAFutureRung(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest, owed, next := now.Add(-2*time.Minute), now.Add(-time.Minute), now.Add(2*time.Minute)
+	seedClaudeBookedRung(t, cache, fp, latest, owed, 1, next)
+
+	simulateClaudeAgentRestart(t)
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — the seed paid the debt before its rung", got)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
+		t.Fatalf("attempts=%d, want 1 — the seed charged a debt the ladder owns", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Fatalf("the seed adopted a debt whose rung is not due: %v", got)
+	}
+}
+
+// Retiring a spent debt clears the gate's copy too, so later routine gathers
+// stop sending uncharged requests for it.
+func TestClaudeScheduleRunDebtRetry_RetiringClearsTheGateDebt(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	now := time.Now()
+	latest, owed := now.Add(-2*time.Minute), now.Add(-time.Minute)
+	seedClaudeProbeReading(t, cache, latest)
+	seedClaudeRefreshDebt(t, cache, fp, owed, claudeRefreshDebtMaxAttempts, time.Time{})
+	claudeUsageProbe.recordOwed(owed)
+
+	if claudeScheduleRunDebtRetry(fp, owed, claudeRetryAfterRequest, now) {
+		t.Fatal("a debt that spent its budget must not book another rung")
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Fatalf("gate debt=%v after retirement, want none", got)
+	}
+	refreshClaudeUsageIfStale(context.Background(), now, latest, probeTestToken, fp)
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0 — a gather paid a retired debt", got)
+	}
+}

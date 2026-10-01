@@ -343,17 +343,39 @@ func claudeOweRunRefresh(baseline time.Time) {
 // a reader sees a whole file or the previous whole file, and taking the gate for
 // a read would queue this behind writers on the gather path.
 func claudePersistedProbeStateFor(fingerprint string) (owed time.Time, attempts int, held time.Time) {
+	owed, attempts, held, _ = claudePersistedProbeStateWithRungFor(fingerprint)
+	return owed, attempts, held
+}
+
+// claudePersistedProbeStateWithRungFor is claudePersistedProbeStateFor plus the
+// retry rung booked for the debt (NextAttemptAtMs, zero when none), from the
+// same one unlocked read — so the gather's seed can honour a rung the ladder
+// booked without a second load.
+func claudePersistedProbeStateWithRungFor(fingerprint string) (owed time.Time, attempts int, held, next time.Time) {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	if !ok || snap.AccountFingerprint != fingerprint {
-		return time.Time{}, 0, time.Time{}
+		return time.Time{}, 0, time.Time{}, time.Time{}
 	}
 	if snap.RefreshOwedAtMs != 0 {
 		owed, attempts = time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts
+		if snap.NextAttemptAtMs != 0 {
+			next = time.UnixMilli(snap.NextAttemptAtMs)
+		}
 	}
 	if snap.HeldUntilMs > 0 {
 		held = time.UnixMilli(snap.HeldUntilMs)
 	}
-	return owed, attempts, held
+	return owed, attempts, held, next
+}
+
+// claudeRefreshRungPending reports whether a booked retry rung (or a claim's
+// in-flight lease) is still ahead of `now` and so binds every routine payer of
+// the debt — the startup replay and the gather's `owing` branch alike. A rung
+// further out than the age-out could ever book is a backwards clock step and
+// binds nothing.
+func claudeRefreshRungPending(next, now time.Time) bool {
+	return !next.IsZero() && next.After(now) &&
+		next.Sub(now) <= claudeRefreshOwedMaxAge+claudeRefreshOwedLocalSkew
 }
 
 // claudeRefreshDebtRetired reports whether a persisted debt is past paying:
@@ -706,6 +728,9 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 		// clear would silently discard it and leave that run's card stale —
 		// the very failure this file exists to fix.
 		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
+		// And from the gate, or an earlier adoption keeps the gather's `owing`
+		// branch spending uncharged requests on a debt the cap just retired.
+		claudeUsageProbe.retireOwed(owed)
 		logClaudeUsageRefreshOutcome(claudeRefreshOutcomeRetired, snap.RefreshOwedAttempts)
 		return
 	}
@@ -730,12 +755,16 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 
 	// A rung already booked and not yet due — the previous process's ladder, or
 	// this process's own — is honoured: arm the timer for it instead of
-	// attempting early. A rung further out than the age-out could ever book is a
+	// attempting early, and tell the gate, so a routine gather's `owing` branch
+	// waits for it too rather than paying the debt it was just handed ahead of
+	// the ladder. A rung further out than the age-out could ever book is a
 	// backwards clock step, and is attempted now.
-	if nextMs := snap.NextAttemptAtMs; nextMs > now.UnixMilli() &&
-		time.UnixMilli(nextMs).Sub(now) <= claudeRefreshOwedMaxAge+claudeRefreshOwedLocalSkew {
-		claudeArmRunDebtRetry(time.UnixMilli(nextMs).Sub(now))
-		return
+	if snap.NextAttemptAtMs != 0 {
+		if next := time.UnixMilli(snap.NextAttemptAtMs); claudeRefreshRungPending(next, now) {
+			claudeUsageProbe.deferOwedUntil(owed, next)
+			claudeArmRunDebtRetry(next.Sub(now))
+			return
+		}
 	}
 
 	// Offline, a live hold, or no readable token: return AHEAD of the charge and

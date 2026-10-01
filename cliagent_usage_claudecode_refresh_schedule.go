@@ -256,6 +256,9 @@ func claudeScheduleRunDebtRetry(fingerprint string, owed time.Time, kind claudeR
 		return true
 	})
 	if retired {
+		// The gate's copy goes with it, or a routine gather's `owing` branch keeps
+		// issuing uncharged requests for a debt whose budget is spent.
+		claudeUsageProbe.retireOwed(owed)
 		logClaudeUsageRefreshOutcome(claudeRefreshOutcomeRetired, attempts)
 		return false
 	}
@@ -265,6 +268,9 @@ func claudeScheduleRunDebtRetry(fingerprint string, owed time.Time, kind claudeR
 	if next.IsZero() {
 		return false
 	}
+	// The rung binds this process's routine gathers too: until it is due the
+	// debt is the ladder's to pay — see refreshClaudeUsageIfStaleAs.
+	claudeUsageProbe.deferOwedUntil(owed, next)
 	claudeArmRunDebtRetry(next.Sub(now))
 	logClaudeUsageRefreshOutcome(claudeRefreshOutcomeScheduled, attempts)
 	return true
