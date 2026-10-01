@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,7 +134,9 @@ func TestGracefulShutdown_StopsTheClaudeRunDebtRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse shutdown.go: %v", err)
 	}
-	found := false
+	// Call order matters: the shutdown owe must follow the stop, so a re-owe
+	// rung cannot fire into the exiting process after its debt was persisted.
+	stopAt, persistAt := token.NoPos, token.NoPos
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Name.Name != "gracefulShutdown" {
@@ -140,15 +144,83 @@ func TestGracefulShutdown_StopsTheClaudeRunDebtRetry(t *testing.T) {
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			if call, ok := n.(*ast.CallExpr); ok {
-				if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "stopClaudeRunDebtRetry" {
-					found = true
+				if ident, ok := call.Fun.(*ast.Ident); ok {
+					switch ident.Name {
+					case "stopClaudeRunDebtRetry":
+						stopAt = call.Pos()
+					case "persistClaudeRunDebtForShutdown":
+						persistAt = call.Pos()
+					}
 				}
 			}
 			return true
 		})
 	}
-	if !found {
+	if stopAt == token.NoPos {
 		t.Fatal("gracefulShutdown no longer stops the Claude run-debt retry timer")
+	}
+	if persistAt == token.NoPos || persistAt < stopAt {
+		t.Fatal("gracefulShutdown must persist an in-memory Claude run debt after stopping its retry timer")
+	}
+}
+
+// A run whose debt the cache locks refused lives only in memory behind its
+// re-owe rung. Shutdown cancels that rung, so it must put the debt on disk
+// itself; otherwise the next process publishes the pre-run utilization.
+func TestPersistClaudeRunDebtForShutdown_PersistsARefusedRunDebt(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinClaudeRunDebtLadder(t, claudeRunDebtRetryLadder, time.Hour, time.Hour)
+
+	original := claudeRateLimitBestEffortGateWait
+	claudeRateLimitBestEffortGateWait = 20 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitBestEffortGateWait = original })
+
+	runEnded := time.Now()
+	lockClaudeRateLimitCache()
+	claudeUsageProbeAfterRun(runEnded)
+	unlockClaudeRateLimitCache()
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("RefreshOwedAtMs=%d before shutdown, want the refused owe to leave nothing on disk", snap.RefreshOwedAtMs)
+	}
+	if !claudeRunDebtRetryPending() {
+		t.Fatal("a refused owe must arm its re-owe rung")
+	}
+
+	stopClaudeRunDebtRetry()
+	persistClaudeRunDebtForShutdown()
+
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != runEnded.UnixMilli() {
+		t.Fatalf("RefreshOwedAtMs=%d after shutdown, want the run's debt %d on disk", snap.RefreshOwedAtMs, runEnded.UnixMilli())
+	}
+}
+
+// A debt already on disk is left byte-identical: the shutdown owe never
+// rewrites an unchanged baseline, so its spent budget and rung survive.
+func TestPersistClaudeRunDebtForShutdown_LeavesAPersistedDebtAlone(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	fp := currentClaudeAccountFingerprint()
+	runEnded := time.Now()
+	claudeUsageProbe.recordOwed(runEnded)
+	claudeOweRunRefresh(runEnded)
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAttempts = 2
+		snap.NextAttemptAtMs = runEnded.Add(4 * time.Minute).UnixMilli()
+		return true
+	})
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	persistClaudeRunDebtForShutdown()
+
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("shutdown rewrote a persisted debt:\nbefore %s\nafter  %s", before, after)
 	}
 }
 

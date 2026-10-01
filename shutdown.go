@@ -61,11 +61,14 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	fmt.Println("[shutdown] Starting graceful shutdown sequence")
 	shutdownBrowserIdentityServer()
 	// A pending refresh rung must not fire into a process that is exiting —
-	// including one handing off to an update below. Every schedule is persisted,
-	// so the next process re-arms them.
+	// including one handing off to an update below. Every booked schedule is
+	// persisted, so the next process re-arms them. A Claude run whose debt the
+	// cache locks refused is only in memory, and its re-owe rung was the sole
+	// recovery path, so that debt gets one synchronous owe here.
 	stopAntigravityRunDebtRetry()
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()
+	persistClaudeRunDebtForShutdown()
 	// Antigravity's discovery tick stops, then its in-flight state writes (a
 	// run's settle, an arm persisting its floor) get a bounded drain, so a
 	// write racing an update handoff lands before this process dies and the

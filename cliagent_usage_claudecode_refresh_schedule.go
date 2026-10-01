@@ -366,7 +366,9 @@ func claudeRunDebtRetryFired(gen uint64, run func()) {
 // stopClaudeRunDebtRetry cancels the pending retry, if any. Called from
 // gracefulShutdown so a rung cannot fire into a process that is exiting
 // (including one handing off to an update), and from resetClaudeUsageProbeGate.
-// The rung itself is on disk and the next process re-arms it.
+// A booked rung is on disk and the next process re-arms it; a re-owe rung's
+// debt is not, so gracefulShutdown follows this with
+// persistClaudeRunDebtForShutdown.
 func stopClaudeRunDebtRetry() {
 	t := &claudeRunDebtRetryTimer
 	t.mu.Lock()
@@ -376,6 +378,24 @@ func stopClaudeRunDebtRetry() {
 		t.timer = nil
 	}
 	t.gen++
+}
+
+// persistClaudeRunDebtForShutdown is gracefulShutdown's last chance for a run
+// whose debt never reached disk: the cache locks refused claudeOweRunRefresh,
+// so the only thing that would have recovered it is the in-process re-owe rung
+// stopClaudeRunDebtRetry just cancelled. One synchronous owe of the gate's
+// in-memory debt puts RefreshOwedAtMs on disk for the next process to re-arm.
+// It is a no-op for a debt already on disk (the owe never lowers or rewrites
+// an unchanged baseline), and sends nothing over the network.
+func persistClaudeRunDebtForShutdown() {
+	owed := claudeUsageProbe.owedObservation()
+	if owed.IsZero() || time.Since(owed) >= claudeRefreshOwedMaxAge {
+		return
+	}
+	if _, onDisk := claudeOweRunRefresh(owed); !onDisk {
+		fmt.Printf("%s[claude-usage] run refresh debt not persisted at shutdown (cache busy)%s\n",
+			colorYellow, colorReset)
+	}
 }
 
 // claudeRunDebtRetryPending reports whether a retry timer is armed.
