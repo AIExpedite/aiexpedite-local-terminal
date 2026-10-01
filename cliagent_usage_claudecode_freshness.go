@@ -484,6 +484,28 @@ func adjustClaudeRefreshAttemptsAt(owed time.Time, delta int) func(*claudeRateLi
 	}
 }
 
+// claimClaudeRunDebtRungAt reserves one budget slot for the debt at `owed` AND
+// claims the persisted rung rungMs the caller read, in one locked write, so two
+// processes that both found the same rung due issue ONE request between them.
+// When the debt still stands but its rung is no longer rungMs (another trigger
+// claimed it, or a newer booking replaced it), it writes nothing and sets
+// *claimedElsewhere. Any other refusal is adjustClaudeRefreshAttemptsAt's.
+func claimClaudeRunDebtRungAt(owed time.Time, rungMs int64, claimedElsewhere *bool) func(*claudeRateLimitSnapshot) bool {
+	reserve := adjustClaudeRefreshAttemptsAt(owed, +1)
+	owedMs := owed.UnixMilli()
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs == owedMs && snap.NextAttemptAtMs != rungMs {
+			*claimedElsewhere = true
+			return false
+		}
+		if !reserve(snap) {
+			return false
+		}
+		snap.NextAttemptAtMs = 0
+		return true
+	}
+}
+
 // claudeReserveRunDebtSlot charges one request to the debt at `owed`, durably,
 // for a gather about to probe for it. `onDisk` reports whether that debt was on
 // disk to charge at all, so a refused reservation (the cap, a contended lock)
@@ -789,7 +811,20 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 	// I/O error, a debt replaced while we read, or a count two overlapping
 	// processes both passed the unlocked retirement test on) sends nothing and
 	// books a free rung.
-	if !mutateClaudeRateLimitSnapshot(path, fingerprint, adjustClaudeRefreshAttemptsAt(owed, +1)) {
+	//
+	// The same write CLAIMS the rung this attempt read (clears NextAttemptAtMs),
+	// as codexClaimRunDebtRung does. The gate is process-local, so two agent
+	// processes sharing this cache (overlapping release / dev channels) both
+	// re-arm the same persisted rung and both find it due; without the claim
+	// each would reserve a slot and send, spending the budget in parallel waves
+	// on an account-scoped endpoint. A rung that is no longer the one read was
+	// claimed by another trigger or replaced by a newer booking, whose owner
+	// schedules what follows, so this attempt does nothing.
+	claimedElsewhere := false
+	if !mutateClaudeRateLimitSnapshot(path, fingerprint, claimClaudeRunDebtRungAt(owed, snap.NextAttemptAtMs, &claimedElsewhere)) {
+		if claimedElsewhere {
+			return claudeProbeResult{}
+		}
 		// Usually a lock race with the stream capture of the very turn that owed
 		// this debt, so a fresh debt retries promptly rather than on the free
 		// rung's floor — see claudeUnpersistedRetryDelay.

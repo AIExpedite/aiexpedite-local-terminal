@@ -3406,6 +3406,17 @@ func TestClaudeRunDebt_SharedBudgetAcrossEveryAutomaticPath(t *testing.T) {
 		payOwedClaudeUsageRefreshAt(time.Now())
 		claudeFreshnessWaitIdle(t)
 	}
+	// An attempt that finds its rung already claimed by a concurrent trigger
+	// sends nothing, so under load the loop can end with budget left. Keep
+	// replaying until the debt retires; the cap must still hold exactly.
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if snap, ok := loadClaudeRateLimitSnapshot(cache); ok && snap.RefreshOwedAtMs == 0 {
+			break
+		}
+		payOwedClaudeUsageRefreshAt(time.Now())
+		claudeFreshnessWaitIdle(t)
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got := atomic.LoadInt64(calls); got != claudeRefreshOwedMaxRequests {
 		t.Fatalf("one unpaid debt cost %d requests across the automatic paths, want exactly the budget %d",
 			got, claudeRefreshOwedMaxRequests)
@@ -3598,4 +3609,79 @@ func mustJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// Two agent processes sharing the cache both re-arm the same persisted rung and
+// both find it due. The reservation claims it, so the second process — which
+// read the same rung before the first one's write — is refused and charges
+// nothing, rather than issuing a duplicate request off the same budget.
+func TestClaimClaudeRunDebtRungAt_SecondClaimOfTheSameRungIsRefused(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	owed := now.Add(-time.Minute)
+	claudeOweRunRefresh(owed)
+	fp := currentClaudeAccountFingerprint()
+	rungMs := now.Add(-time.Second).UnixMilli()
+	if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = rungMs
+		return true
+	}) {
+		t.Fatal("precondition: could not book the rung")
+	}
+
+	first := false
+	if !mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &first)) || first {
+		t.Fatalf("the first claim of the rung was refused (claimedElsewhere=%v)", first)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("attempts=%d rung=%d, want one slot charged and the rung claimed", snap.RefreshOwedAttempts, snap.NextAttemptAtMs)
+	}
+
+	second := false
+	if mutateClaudeRateLimitSnapshot(cache, fp, claimClaudeRunDebtRungAt(owed, rungMs, &second)) || !second {
+		t.Fatalf("a second claim of the same rung was granted (claimedElsewhere=%v)", second)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAttempts; got != 1 {
+		t.Errorf("attempts=%d, want the refused claim to charge nothing", got)
+	}
+}
+
+// A probe reading proves the stored token works, so the merge that records it
+// also ends a persisted credential wait. Otherwise a click that bypassed the
+// wait and succeeded would leave the stamp behind, and a restart would keep
+// refusing a working token until Claude Code rewrote the file.
+func TestMergeClaudeRateLimitCache_ProbeReadingClearsTheCredentialWait(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, claudeProbeOKHandler)
+	now := time.Now()
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	setWait := func() {
+		t.Helper()
+		if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 12345, 678
+			return true
+		}) {
+			t.Fatal("precondition: could not record the credential wait")
+		}
+	}
+	reading := func(at time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: at.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: at.UnixMilli(), usageKnown: true,
+		}}
+	}
+
+	// A status-line reading says nothing about the probe's token.
+	setWait()
+	mergeClaudeRateLimitCacheFromSource(cache, reading(now.Add(-30*time.Minute)), now, fp, claudeRateLimitSourceStatusLine)
+	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs == 0 {
+		t.Fatal("a non-probe reading must leave the credential wait alone")
+	}
+
+	mergeClaudeRateLimitCacheFromSource(cache, reading(now), now, fp, claudeRateLimitSourceProbe)
+	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		t.Errorf("stamp=%d size=%d, want the probe reading to clear the credential wait", snap.AuthWaitCredStampNs, snap.AuthWaitCredSize)
+	}
 }

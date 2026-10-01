@@ -914,11 +914,22 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// count: a probe response we could not plot is not an observation. Monotonic
 	// — a probe stamping an older instant than one already on record cannot walk
 	// the evidence backwards.
+	//
+	// A probe reading also proves the stored token works, so it ends any
+	// credential wait an expired token or a 401 recorded, in this same locked
+	// write. A click that bypassed the wait and succeeded with an unchanged
+	// credential would otherwise leave the stamp on disk, and after a restart
+	// the replay would reload it and refuse a working token until Claude Code
+	// happened to rewrite the file.
 	if source == claudeRateLimitSourceProbe {
 		for _, bucket := range updates {
-			if bucket.usageKnown && bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
+			if !bucket.usageKnown {
+				continue
+			}
+			if bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
 				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
 			}
+			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
 		}
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
