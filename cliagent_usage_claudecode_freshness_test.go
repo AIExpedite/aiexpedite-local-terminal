@@ -4075,6 +4075,22 @@ func TestClaudeUsageProbe_RestoreAuthWaitKeepsANewerLocalWait(t *testing.T) {
 	}
 }
 
+// A fresh local 401 on the SAME stamp that was restored from disk makes the
+// wait local: a later seed that reads a peer's earlier on-disk clear must not
+// drop it, or an automatic attempt resends the rejected credential.
+func TestClaudeUsageProbe_SameStampLocalWaitSurvivesAStaleRestoredClear(t *testing.T) {
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+	b := claudeCredStamp{modNs: 200, size: 1}
+
+	claudeUsageProbe.restoreAuthWait(b)
+	claudeUsageProbe.noteAuthWait(b)
+	claudeUsageProbe.restoreAuthWait(claudeCredStamp{})
+	if !claudeUsageProbe.awaitingCredentialChange(b) {
+		t.Fatalf("in-memory wait=%+v, want the local same-stamp wait %+v kept", claudeUsageProbe.authWaitStamp(), b)
+	}
+}
+
 // The click's early refund of the seed's charge is best-effort; when another
 // writer holds the cache then, the refund is retried once the click is over, so
 // a contended cache never turns a click into a spent automatic slot.

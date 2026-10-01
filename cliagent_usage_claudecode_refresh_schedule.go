@@ -428,6 +428,10 @@ func (g *claudeUsageProbeGate) awaitingCredentialChange(stamp claudeCredStamp) b
 
 // noteAuthWait records the credential stamp to wait on. A zero stamp records
 // nothing. A new stamp re-opens the nudge.
+//
+// The wait is this process's own evidence from here on, even when the stamp is
+// the one restored from disk: a 401 seen now is newer than a peer's on-disk
+// clear that a later seed may still read, and that clear must not drop it.
 func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 	if stamp.isZero() {
 		return
@@ -437,6 +441,7 @@ func (g *claudeUsageProbeGate) noteAuthWait(stamp claudeCredStamp) {
 	if g.authWait != stamp {
 		g.authWait, g.authWaitNudged = stamp, claudeCredStamp{}
 	}
+	g.authWaitRestored = claudeCredStamp{}
 }
 
 // restoreAuthWait mirrors the credential wait persisted in the cache. A
