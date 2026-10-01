@@ -16,9 +16,14 @@
 //   - A state-independent nudge from the gather and the discovery tick. When
 //     the log index's newest OWE-READY run (a finished foreign run,
 //     cliagent_usage_antigravity_log_index.go) postdates the cached reading,
-//     nudgeAntigravityUsageRefresh arms the same worker, so a run converges
-//     even when no spawn path classified it (a run the user started in their
-//     own shell).
+//     nudgeAntigravityUsageRefreshFloor arms the same worker, so a run
+//     converges even when no spawn path classified it (a run the user started
+//     in their own shell) — at once when the index proved the run's exit, after
+//     the minute's settle guard otherwise.
+//
+// An expired stored login that is still inside the skew band books its own
+// rung at the token's expiry (antigravityRetryLoginRenew), when the pass can
+// renew it, rather than the age backoff.
 //
 // Cost: at most antigravityRefreshDebtMaxAttempts outbound Code Assist reads per
 // unpaid run, spaced by the ladder and by antigravityRefreshMinInterval; rungs
