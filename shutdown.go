@@ -64,7 +64,8 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// including one handing off to an update below. Every booked schedule is
 	// persisted, so the next process re-arms them. A Claude run whose debt the
 	// cache locks refused is only in memory, and its re-owe rung was the sole
-	// recovery path, so that debt gets one synchronous owe here.
+	// recovery path, so that debt gets one synchronous owe here, as does a
+	// refused durable clear of a proven Claude credential wait.
 	stopAntigravityRunDebtRetry()
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()

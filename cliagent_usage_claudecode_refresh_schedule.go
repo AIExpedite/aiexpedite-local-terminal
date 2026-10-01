@@ -387,7 +387,16 @@ func stopClaudeRunDebtRetry() {
 // in-memory debt puts RefreshOwedAtMs on disk for the next process to re-arm.
 // It is a no-op for a debt already on disk (the owe never lowers or rewrites
 // an unchanged baseline), and sends nothing over the network.
+//
+// A proven credential's durable clear the cache refused is the same kind of
+// in-memory-only state: its background retry stands down at shutdown, and the
+// next process would restore the rejected wait from disk. It gets one
+// synchronous retry here too.
 func persistClaudeRunDebtForShutdown() {
+	if !claudeRetryPendingAuthClear() {
+		fmt.Printf("%s[claude-usage] credential wait clear not persisted at shutdown (cache busy)%s\n",
+			colorYellow, colorReset)
+	}
 	owed := claudeUsageProbe.owedObservation()
 	if owed.IsZero() || time.Since(owed) >= claudeRefreshOwedMaxAge {
 		return

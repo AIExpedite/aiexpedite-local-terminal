@@ -224,6 +224,42 @@ func TestPersistClaudeRunDebtForShutdown_LeavesAPersistedDebtAlone(t *testing.T)
 	}
 }
 
+// A proven credential's durable clear the cache refused lives only in memory
+// behind its background retry, which stands down at shutdown. Shutdown must
+// write it itself; otherwise the next process restores the rejected wait and
+// refuses the proven credential as expired.
+func TestPersistClaudeRunDebtForShutdown_FlushesAPendingCredentialClear(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
+	stamp := claudeCredStamp{modNs: 100, size: 10}
+	fp := currentClaudeAccountFingerprint()
+	mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = stamp.modNs, stamp.size
+		return true
+	})
+	if snap := claudeCacheSnapshot(t, cache); snap.AuthWaitCredStampNs != stamp.modNs {
+		t.Fatalf("seeded wait=%d, want %d", snap.AuthWaitCredStampNs, stamp.modNs)
+	}
+	prevDelays := claudePendingAuthClearRetryDelays
+	t.Cleanup(func() { claudePendingAuthClearRetryDelays = prevDelays })
+	claudePendingAuthClearRetryDelays = nil
+	claudeQueuePendingAuthClear(fp, stamp)
+	if pending, _ := claudeUsageProbe.pendingAuthClear(); pending != stamp {
+		t.Fatalf("pending clear=%+v, want %+v queued", pending, stamp)
+	}
+
+	stopClaudeRunDebtRetry()
+	persistClaudeRunDebtForShutdown()
+
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AuthWaitCredStampNs != 0 || snap.AuthWaitCredSize != 0 {
+		t.Fatalf("persisted wait=%d/%d after shutdown, want the pending clear written",
+			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize)
+	}
+	if pending, _ := claudeUsageProbe.pendingAuthClear(); !pending.isZero() {
+		t.Fatalf("pending clear=%+v after shutdown, want it settled", pending)
+	}
+}
+
 // A rewrite seen while no rung is pending (the previous attempt is still
 // finishing and has not booked its next rung) must not use up the nudge: the
 // first gather after the rung is booked still makes it due.
