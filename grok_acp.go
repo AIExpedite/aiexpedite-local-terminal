@@ -542,8 +542,13 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	// Armed before the spawn: every turn of this session spends credits, and
-	// an ACP child logs no number of its own.
-	usageFloor := armGrokUsageRunFloorFor(time.Now(), isolatedHome)
+	// an ACP child logs no number of its own. Not when the credentials are
+	// contested: the session may bill an API key's account, and a read of the
+	// copied login would neither reach it nor pay for it.
+	var usageFloor time.Time
+	if !producerContested {
+		usageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedHome)
+	}
 	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)

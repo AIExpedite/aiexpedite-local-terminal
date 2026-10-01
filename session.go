@@ -741,6 +741,9 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// in both cases only while nothing else the child carries contests it.
 	var grokLimitScope grokLimitNoticeScope
 	var grokProducerContested bool
+	// grokUsageContested: the child may bill an account the login it carries
+	// does not name, so a live billing read could not pay for this run.
+	var grokUsageContested bool
 	if isGrokCommand(command) && isolatedGrokHome != "" {
 		// From the credential surface the smoke child is SPAWNED with, not the
 		// isolated home alone: sanitizeGrokMaintenanceSmokeEnv strips the env
@@ -753,6 +756,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// The SAME verdict gates the billing merge on exit, resolved once from
 		// the pre-spawn surface rather than re-derived after the run.
 		grokProducerContested = grokManagedRunProducerContested(managedLaunch, isolatedGrokHome)
+		grokUsageContested = grokProducerContested
 	}
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		// The identity is CAPTURED here and re-asserted as-is for the life of the
@@ -805,6 +809,8 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		ensureGrokBillingIdentityNamed(grokBase, directIdentity)
 		// Same single decision, third use: a contested arm caches no notice.
 		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
+		// Fourth use: an override (or unresolved) run owes the login no read.
+		grokUsageContested = strings.EqualFold(directIdentity, grokContestedBillingIdentity)
 	}
 
 	// Pinned BEFORE the spawn, never read from the struct literal below. A
@@ -819,9 +825,10 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// A grok turn (the managed `-p` path or a maintenance smoke) spends
 	// credits and logs no number of its own, so it owes one live billing read
 	// when it ends (cliagent_usage_grok_freshness.go). Subcommand carve-outs
-	// (`grok login`, `grok models`) spend nothing.
+	// (`grok login`, `grok models`) spend nothing, and a run whose credentials
+	// are contested is billed to an account the read cannot reach.
 	var grokUsageFloor time.Time
-	if isGrokCommand(command) && (isolatedGrokHome != "" || isManagedGrokPromptArgv(cliArgs)) {
+	if isGrokCommand(command) && !grokUsageContested && (isolatedGrokHome != "" || isManagedGrokPromptArgv(cliArgs)) {
 		grokUsageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedGrokHome)
 	}
 

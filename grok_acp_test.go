@@ -2201,3 +2201,66 @@ func TestGrokACPLifecycle_ExitOwesOneBillingReadWithoutDelayingEnded(t *testing.
 		t.Fatalf("row after the ACP refresh = %+v, want a numeric reading", usage)
 	}
 }
+
+// An ACP session whose credentials are contested (API-key fallback with an
+// inherited XAI_API_KEY) may bill an account the copied login does not name:
+// it arms no refresh debt, so no billing read (or renewal) is spent on that
+// login. The same session without the override owes and pays one read.
+func TestGrokACPLifecycle_ContestedCredentialsOweNoRefresh(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		key       string
+		wantReads int64
+	}{
+		{name: "copied login only", key: "", wantReads: 1},
+		{name: "api key fallback", key: "xai-contested-sentinel", wantReads: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newGrokDebtHarness(t)
+			orig := grokUsageHomeFingerprint
+			t.Cleanup(func() { grokUsageHomeFingerprint = orig })
+			grokUsageHomeFingerprint = func(string) string { return h.fingerprint() }
+
+			realHome := t.TempDir()
+			seedGrokHomeWithLogin(t, realHome)
+			t.Setenv("GROK_HOME", realHome)
+			t.Setenv("XAI_API_KEY", tc.key)
+			withTempGrokSessionStore(t)
+
+			testExe, err := os.Executable()
+			if err != nil {
+				t.Fatalf("os.Executable: %v", err)
+			}
+			binDir := t.TempDir()
+			mockName := "grok"
+			if runtime.GOOS == "windows" {
+				mockName += ".exe"
+			}
+			if err := copyTestBinary(testExe, filepath.Join(binDir, mockName)); err != nil {
+				t.Fatalf("copy mock binary: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv(mockCLIEnvVar, "grok-acp-billing")
+
+			m := NewGrokACPManager(nil)
+			id := fmt.Sprintf("grok-contested-test-%d", time.Now().UnixNano())
+			opts := GrokStartOptions{AllowAPIKeyFallback: tc.key != ""}
+			if err := m.Start(id, t.TempDir(), nil, "ws", "uid", opts, func(resultMsg) {}); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if !waitUntil(time.Now().Add(10*time.Second), func() bool { return m.ActiveCount() == 0 }) {
+				t.Fatal("managed Grok mock did not exit")
+			}
+			if !waitUntil(time.Now().Add(5*time.Second), func() bool { return h.reads.Load() >= tc.wantReads }) {
+				t.Fatalf("reads = %d, want %d", h.reads.Load(), tc.wantReads)
+			}
+			h.idle()
+			if got := h.reads.Load(); got != tc.wantReads {
+				t.Fatalf("reads = %d, want %d", got, tc.wantReads)
+			}
+			if state := h.state(); tc.wantReads == 0 && (state.owed() || state.RunFloorMs != 0) {
+				t.Fatalf("state = %+v, a contested session must arm nothing", state)
+			}
+		})
+	}
+}

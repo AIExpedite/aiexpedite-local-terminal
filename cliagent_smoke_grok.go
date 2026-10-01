@@ -334,8 +334,13 @@ func runGrokSmoke(ctx context.Context, path, version string) cliSmokeResult {
 
 	spawned, reachedInference := false, false
 	// Armed before the first rung spawns: every rung that reaches inference
-	// spends credits, and none of them logs a number of its own.
-	usageFloor := armGrokUsageRunFloorFor(time.Now(), isolatedHome)
+	// spends credits, and none of them logs a number of its own. A contested
+	// credential surface bills an account the copied login may not name, so
+	// a read of that login could not pay for the run: nothing is armed.
+	var usageFloor time.Time
+	if !producerContested {
+		usageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedHome)
+	}
 	// The billing merge runs after the LAST child exits, whatever the verdict:
 	// a rung that reached inference fetched credits into the isolated log even
 	// when the model then answered the wrong text, and that observation is

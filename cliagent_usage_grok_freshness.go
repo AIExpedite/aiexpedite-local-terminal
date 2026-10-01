@@ -429,7 +429,7 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 	}
 	now := grokUsageFreshnessNow()
 	floorMs := floor.UnixMilli()
-	completionMs := now.UnixMilli()
+	completionMs := grokCompletionMs(now)
 	if completionMs < floorMs {
 		completionMs = floorMs
 	}
@@ -463,6 +463,19 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 	fmt.Printf("%s[cli-usage] grok refresh: owed attempts=%d%s\n", colorCyan, state.Attempts, colorReset)
 	grokStartRunDebtWorker(bypassInterval)
 	return true
+}
+
+// grokCompletionMs is a completion instant rounded UP to the millisecond.
+// Readings are compared at millisecond precision with their start truncated,
+// so a read that began earlier inside the same millisecond as a completion
+// (or between two completions sharing one) must never compare as covering it:
+// observedMs >= grokCompletionMs(t) holds only for a read started at or after t.
+func grokCompletionMs(t time.Time) int64 {
+	ms := t.UnixMilli()
+	if t.Sub(time.UnixMilli(ms)) > 0 {
+		ms++
+	}
+	return ms
 }
 
 // grokOweRead opens a debt for a reading at or after completionMs, or moves
@@ -863,7 +876,7 @@ func nudgeGrokUsageRefresh(now time.Time, fingerprint string) bool {
 				return
 			}
 		}
-		grokOweRead(state, now, now.UnixMilli(), fingerprint)
+		grokOweRead(state, now, grokCompletionMs(now), fingerprint)
 		start = true
 	})
 	if !start {
@@ -906,7 +919,7 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 			state.setRunFloor(0, "")
 			return
 		}
-		grokOweRead(state, now, now.UnixMilli(), fingerprint)
+		grokOweRead(state, now, grokCompletionMs(now), fingerprint)
 	})
 	if !state.owed() {
 		return

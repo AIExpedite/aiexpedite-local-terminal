@@ -967,3 +967,54 @@ func TestGrokRunDebt_FlightSentBeforeCompletionNeverPaysTheDebt(t *testing.T) {
 		t.Fatalf("live reading = %+v ok=%t, want one sent at or after completion", snap, ok)
 	}
 }
+
+// Readings and completions are compared at millisecond precision. A flight
+// sent earlier inside the millisecond a run completes in cannot include that
+// run, so it must not pay the debt: the completion rounds UP.
+func TestGrokRunDebt_FlightSentEarlierInTheCompletionMillisecondNeverPays(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.block = make(chan struct{})
+	floor := armGrokUsageRunFloor(h.clock())
+
+	// A Refresh click sends its request 0.3 ms into the millisecond...
+	h.advance(300 * time.Microsecond)
+	click := make(chan string, 1)
+	go func() { click <- grokBillingReadOnce(context.Background(), "", "fp-ada", h.clock, time.Time{}) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reads.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	// ...and the run completes 0.4 ms later, inside the same millisecond.
+	h.advance(400 * time.Microsecond)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("the run must owe a read")
+	}
+	if got, want := h.state().CompletionMs, h.clock().Truncate(time.Millisecond).Add(time.Millisecond).UnixMilli(); got != want {
+		t.Fatalf("CompletionMs = %d, want the completion rounded up to %d", got, want)
+	}
+	time.Sleep(50 * time.Millisecond)
+	h.advance(time.Second)
+	close(h.block)
+	h.idle()
+
+	if got := <-click; got != grokLiveOutcomeOK {
+		t.Fatalf("click = %q, want ok", got)
+	}
+	if got := h.reads.Load(); got != 2 {
+		t.Fatalf("reads = %d, want the debt to send its own post-completion read", got)
+	}
+	if state := h.state(); state.owed() {
+		t.Fatalf("state = %+v, want the post-completion read to pay the debt", state)
+	}
+}
+
+func TestGrokCompletionMs_RoundsUp(t *testing.T) {
+	at := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	if got := grokCompletionMs(at); got != at.UnixMilli() {
+		t.Fatalf("whole millisecond = %d, want %d", got, at.UnixMilli())
+	}
+	if got := grokCompletionMs(at.Add(time.Nanosecond)); got != at.UnixMilli()+1 {
+		t.Fatalf("sub-millisecond = %d, want %d", got, at.UnixMilli()+1)
+	}
+}
