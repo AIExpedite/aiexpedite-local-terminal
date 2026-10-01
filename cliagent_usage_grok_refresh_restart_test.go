@@ -78,6 +78,23 @@ func TestPayOwedGrokUsageRefresh_InterruptedRunIsOwedOneRead(t *testing.T) {
 	}
 }
 
+func TestPayOwedGrokUsageRefresh_InterruptedRunIsOwedAfterAClockStepBack(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	// The old process armed a floor, then the clock stepped back past the
+	// skew ceiling before the restart: the rebase moves that floor to now.
+	h.write(grokUsageFreshness{
+		RunFloorMs: h.clock().Add(grokBillingMaxClockSkew + time.Hour).UnixMilli(), RunFloorAccount: "fp-ada",
+	})
+	payOwedGrokUsageRefresh()
+	h.idle()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the interrupted run paid once after the rebase", h.reads.Load())
+	}
+	if state := h.state(); state.owed() || state.RunFloorMs != 0 {
+		t.Fatalf("state = %+v, want nothing left after an ok read", state)
+	}
+}
+
 func TestPayOwedGrokUsageRefresh_OfflineSendsNothingAndKeepsTheDebt(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	offlineMutex.Lock()

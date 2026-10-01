@@ -83,9 +83,10 @@ var (
 	// grokRefreshNudgeCooldown bounds how often the gather may arm the worker.
 	grokRefreshNudgeCooldown = time.Minute
 	// grokRunDebtReadTimeout bounds one debt read, renewal included: a token
-	// refused on the first GET waits its turn, renews, and sends a second GET,
-	// so both GETs fit inside it rather than the retry being cut off.
-	grokRunDebtReadTimeout = 2*grokBillingLiveTimeout + grokLoginRenewTimeout + grokLoginRenewGap
+	// refused on the first GET waits its turn (in-process, then the
+	// cross-process renewal lock), renews, and sends a second GET, so both
+	// GETs fit inside it rather than the retry being cut off.
+	grokRunDebtReadTimeout = 2*grokBillingLiveTimeout + grokLoginRenewTimeout + grokLoginRenewGap + grokAuthLockWait
 	// grokRunDebtReadWaitSlack is how much longer a waiter gives the shared
 	// read than the read gives itself, so the read's own deadline — a real
 	// outcome — fires before the waiter gives up with a `timeout`.
@@ -905,8 +906,14 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 	now := grokUsageFreshnessNow()
 	fingerprint := grokUsageCurrentFingerprint()
 	state := updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+		floorBefore := state.RunFloorMs
 		grokRebaseFutureFreshness(state, now)
-		if state.owed() || state.RunFloorMs == 0 || state.RunFloorMs >= startedAt.UnixMilli() {
+		// A floor the rebase moved was armed before a clock step back, so by
+		// the previous process: this one arms at its own now, never past the
+		// skew ceiling. Without this the rebased floor (now) would read as
+		// armed after startedAt and the interrupted run would go unpaid.
+		inherited := state.RunFloorMs != floorBefore || state.RunFloorMs < startedAt.UnixMilli()
+		if state.owed() || state.RunFloorMs == 0 || !inherited {
 			return
 		}
 		// A floor with no debt beside it belongs to a run the previous process
