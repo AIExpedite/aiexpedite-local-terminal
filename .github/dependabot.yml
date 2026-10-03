@@ -19,6 +19,10 @@ updates:
     # Group all action updates into one PR per week — reduces review burden
     # while still giving granular visibility into what changed via the diff.
     groups:
+      github-actions-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: [minor, patch]
       github-actions:
         patterns:
           - "*"
@@ -28,6 +32,8 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+    cooldown:
+      default-days: 3
 
   # Updates for direct Go dependencies in go.mod.
   # `gomod` ecosystem also tracks indirect deps if needed via allow.
@@ -53,3 +59,5 @@ updates:
     labels:
       - "dependencies"
       - "go"
+    cooldown:
+      default-days: 3
