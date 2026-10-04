@@ -30,6 +30,9 @@ func TestParseMuseCodeEventLine(t *testing.T) {
 		{"cancelled", `{"payload_type":"run.terminal.cancelled","payload":{}}`, true,
 			oneShotEvent{Failure: "[Muse Code turn failed: cancelled: the run was cancelled before it completed]"}},
 		{"task activity contributes no text", museFrameTool, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
+		{"a tool result names its tool", museFrameToolResult, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", ToolName: "powershell"}},
+		{"a tool result without a name still reports progress", `{"payload_type":"tool.result","payload":{"call_id":"c1"}}`, true, oneShotEvent{ToolName: "tool"}},
+		{"a tool name is one bounded line", `{"payload_type":"tool.result","payload":{"correlation_facts":{"tool_name":"  read\n file  "}}}`, true, oneShotEvent{ToolName: "read file"}},
 		{"the echoed prompt is internal", museFrameUserInput, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", Internal: true}},
 		{"task scheduling chatter is internal", museFrameScheduled, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", Internal: true}},
 		{"a run stream id is not a session id", `{"payload_type":"run.lifecycle.started","stream":{"kind":"run","id":"14e6347f-3772-4c4b-a46d-a1284380b941"},"payload":{}}`, true, oneShotEvent{Internal: true}},
@@ -552,6 +555,11 @@ func TestReadOutputStream_MuseCodeRendersAssistantText(t *testing.T) {
 	got := render(museFrameDeltaHello, museFrameFailed402)
 	if !strings.Contains(got, "Hello") || !strings.Contains(got, "[Muse Code turn failed: billing_not_configured (status 402):") {
 		t.Fatalf("failed turn rendered %q", got)
+	}
+	// A run that works in tools before its first text must still publish
+	// frames, or the orchestrator's inactivity window declares it dead.
+	if got := render(museFrameToolResult, museFrameToolResult, museFrameCompleted); got != "\n[Using tool: powershell]\n\n[Using tool: powershell]\nHello world" {
+		t.Fatalf("tool progress rendered %q", got)
 	}
 	if got := render("Muse Code: update available"); !strings.Contains(got, "update available") {
 		t.Fatalf("a plain line must pass through, got %q", got)

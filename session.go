@@ -2113,9 +2113,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if isMuseCodeCommand(session.Command) {
 			// `muse exec --json` records render as the assistant's text (deltas
 			// joined as fragments), the terminal text only when nothing
-			// streamed, and a failure in the shared turn-failed wrapper;
-			// bookkeeping and task records render nothing. A non-JSON line
-			// (banner, plain error) falls through and keeps its newline.
+			// streamed, a failure in the shared turn-failed wrapper, and a
+			// finished tool call as a `[Using tool: X]` marker; bookkeeping
+			// and task records render nothing. A non-JSON line (banner, plain
+			// error) falls through and keeps its newline.
 			if ev, ok := parseMuseCodeEventLine(strings.TrimSpace(lineText)); ok {
 				switch {
 				case ev.TextDelta != "":
@@ -2125,6 +2126,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					batch = append(batch, streamBatchEntry{text: ev.FinalText, fragment: true, agentText: true})
 				case ev.Failure != "":
 					batch = append(batch, streamBatchEntry{text: "\n" + ev.Failure + "\n", fragment: true})
+				case ev.ToolName != "":
+					// Muse writes no text between tool calls, often for 10+
+					// minutes. This marker (the one Claude / Grok tool calls
+					// render) is the frame that keeps the session's activity
+					// clock moving, so the orchestrator's inactivity window
+					// does not read a working run as a dead CLI.
+					batch = append(batch, streamBatchEntry{text: fmt.Sprintf("\n[Using tool: %s]\n", ev.ToolName), fragment: true})
 				}
 				return
 			}
