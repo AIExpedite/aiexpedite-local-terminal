@@ -193,6 +193,10 @@ type museCodePayload struct {
 	Status     int    `json:"status"`
 	HTTPStatus int    `json:"http_status"`
 	SessionID  string `json:"session_id"`
+	// CorrelationFacts rides on `tool.result`: the tool the model just ran.
+	CorrelationFacts struct {
+		ToolName string `json:"tool_name"`
+	} `json:"correlation_facts"`
 }
 
 // museCodeInternalEvents are `exec --json` bookkeeping records: command
@@ -237,6 +241,8 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 		ev.Coalesce = true
 	case "run.terminal.completed":
 		ev.FinalText = env.Payload.Text
+	case "tool.result":
+		ev.ToolName = museCodeToolName(env.Payload.CorrelationFacts.ToolName)
 	case "run.terminal.failed":
 		ev.Failure = formatMuseCodeFailure(
 			firstNonEmpty(env.Payload.ErrorKind, "error"),
@@ -248,6 +254,23 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 			firstNonEmpty(env.Payload.Reason, "the run was cancelled before it completed"))
 	}
 	return ev, true
+}
+
+// museCodeToolNameMax bounds the tool name carried into a progress marker.
+const museCodeToolNameMax = 64
+
+// museCodeToolName normalizes the tool a `tool.result` names for the session
+// path's `[Using tool: X]` marker: one line, bounded, never empty — a result
+// with no name still proves the run is making progress.
+func museCodeToolName(name string) string {
+	name = strings.Join(strings.Fields(name), " ")
+	if len(name) > museCodeToolNameMax {
+		name = name[:museCodeToolNameMax]
+	}
+	if name == "" {
+		return "tool"
+	}
+	return name
 }
 
 // museCodeDeltaFrame renders merged deltas as one `run.output.delta` record in

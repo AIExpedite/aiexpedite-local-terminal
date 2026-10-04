@@ -97,6 +97,13 @@ type oneShotEvent struct {
 	// turn result and the diagnostic raw buffer but is not published: every
 	// published line costs a Pub/Sub message and a Firestore chunk write.
 	Internal bool
+	// ToolName names a tool call the CLI reported finished (Muse Code's
+	// `tool.result`). The one-shot core ignores it — the raw record is still
+	// forwarded — but the generic session path renders it as a
+	// `[Using tool: X]` marker: a Muse run can spend many minutes in tool
+	// calls before its first text, and without a frame the orchestrator's
+	// inactivity window reads that silence as a dead CLI.
+	ToolName string
 	// Coalesce marks a pure text-delta line that may be merged with its
 	// neighbours into one published frame (spec.DeltaFrame).
 	Coalesce bool
