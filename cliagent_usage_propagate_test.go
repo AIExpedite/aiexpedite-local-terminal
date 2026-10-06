@@ -469,8 +469,7 @@ func TestCLIUsageHint_StartupRecoveryHintsACommittedClear(t *testing.T) {
 
 // Codex and OpenCode observations are pending side by side — neither
 // overwrites the other — while the spacing stays device-wide and each provider
-// keeps its own two-hint budget. When both are due, the older observation goes
-// first.
+// keeps its own two-hint budget.
 func TestCLIUsageHint_CodexAndOpenCodeObservationsCoexist(t *testing.T) {
 	withCodexGenerationEpoch(t, 517)
 	rec, cfg := propagatorFixture(t)
@@ -504,8 +503,27 @@ func TestCLIUsageHint_CodexAndOpenCodeObservationsCoexist(t *testing.T) {
 	if perProvider[codexUsageProvider] != 2 || perProvider[openCodeUsageProvider] != 2 {
 		t.Fatalf("hints per provider = %v, want 2 each", perProvider)
 	}
-	if hints[0].hint.Provider != codexUsageProvider {
-		t.Fatalf("first hint = %s, want the older (codex) observation", hints[0].hint.Provider)
+}
+
+// When several observations are due together the oldest goes first; a
+// shorter wait beats an older note. Pinned on the picker itself — end to end
+// the order also depends on each provider's rotation gate.
+func TestCLIUsageHint_NextPendingPicksTheShortestWaitThenTheOldest(t *testing.T) {
+	now := time.Now()
+	p := &cliUsagePropagatorState{pending: map[string]*pendingCLIUsageHint{
+		openCodeUsageProvider: {generation: gen(1, 1), notedAt: now.Add(-time.Hour)},
+		codexUsageProvider:    {generation: gen(1, 1), notedAt: now.Add(-2 * time.Hour)},
+	}}
+	if provider, d := p.nextPendingLocked(); provider != codexUsageProvider || d != 0 {
+		t.Fatalf("picked %s after %s, want the older codex observation now", provider, d)
+	}
+	p.pending[codexUsageProvider].notedAt = now // still inside its debounce
+	if provider, d := p.nextPendingLocked(); provider != openCodeUsageProvider || d != 0 {
+		t.Fatalf("picked %s after %s, want the due opencode observation", provider, d)
+	}
+	p.pending = nil
+	if provider, _ := p.nextPendingLocked(); provider != "" {
+		t.Fatalf("picked %q with nothing pending", provider)
 	}
 }
 

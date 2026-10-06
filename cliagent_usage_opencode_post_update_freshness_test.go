@@ -146,3 +146,39 @@ func TestOpenCodeUsage_StartupRecoveryHintsTheRotatedLedger(t *testing.T) {
 		t.Fatalf("recovery hint = %+v, want opencode {1110,1}", h)
 	}
 }
+
+// During an update hand-off the old and new agent processes overlap. A ledger
+// write while the other holds the cross-process lock is refused — never renamed
+// over the holder's — and the run keeps its steps, so the next flush commits
+// them once the lock is free.
+func TestOpenCodeUsage_AContendedLedgerLockRefusesTheWriteAndTheFlushRetries(t *testing.T) {
+	openCodeUsageFixture(t, 1111)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_1", 12, 3, 0, "0", now.UnixMilli()))
+	openCodeUsageInFlight.Wait() // its session-id write holds the lock briefly
+
+	// The other process holds the lock across this run's settle.
+	held, outcome := acquireCrossProcessCacheLockUntil(openCodeUsageCachePath(), time.Now())
+	if outcome != crossProcessLockAcquired {
+		t.Fatalf("could not take the lock as the other process: %v", outcome)
+	}
+	settleOpenCodeUsageRun(run, "")
+	if _, ok, _ := openCodeUsageBucketForDay("fp-a", now); ok {
+		t.Fatal("a write landed while another process held the ledger lock")
+	}
+	_ = unlockFile(held)
+	_ = held.Close()
+
+	flushOpenCodeUsageRun(run) // the session's exit path
+	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 15 {
+		t.Fatalf("bucket = %+v, want the refused steps committed by the flush", b)
+	}
+	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v after the retried commit", debts)
+	}
+}

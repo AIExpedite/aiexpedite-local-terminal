@@ -125,6 +125,11 @@ type openCodeUsageStep struct {
 	Cost       float64
 }
 
+// openCodeUsageLockWait bounds how long a ledger write waits on another agent
+// process holding the cross-process lock (an update hand-off). A var so tests
+// can pin it small.
+var openCodeUsageLockWait = 2 * time.Second
+
 var (
 	// openCodeUsageMu serialises every ledger read-modify-write in this process.
 	openCodeUsageMu sync.Mutex
@@ -163,20 +168,41 @@ func readOpenCodeUsageLedger() openCodeUsageLedger {
 // and the generation after it. The caller decides whether a committed change
 // is worth a hint (noteOpenCodeUsageAdvanced): a startup rotation is hinted
 // only when there is something to publish.
+//
+// The in-process mutex alone is not enough: a self-update hands off between two
+// agent processes that briefly run side by side, and each would rename its own
+// read-modify-write over the other's. The cross-process sibling lock the Codex
+// and Claude caches use serialises them; a contended lock refuses the write
+// rather than overwrite a competitor's, and a filesystem that offers no lock
+// at all degrades to the in-process mutex alone.
 func openCodeUsageTransaction(mutate func(ledger *openCodeUsageLedger) (write, changed bool)) (committed, changed bool, generation cliUsageGeneration) {
 	openCodeUsageMu.Lock()
+	path := openCodeUsageCachePath()
+	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(openCodeUsageLockWait))
+	if outcome == crossProcessLockContended {
+		openCodeUsageMu.Unlock()
+		logOpenCodeUsageCapture("lock_contended")
+		return false, false, cliUsageGeneration{}
+	}
+	release := func() {
+		if lock != nil {
+			_ = unlockFile(lock)
+			_ = lock.Close()
+		}
+		openCodeUsageMu.Unlock()
+	}
 	ledger := readOpenCodeUsageLedger()
 	write, changed := mutate(&ledger)
 	if !write {
-		openCodeUsageMu.Unlock()
+		release()
 		return false, false, ledger.Generation
 	}
 	if changed {
 		openCodeBumpGeneration(&ledger)
 	}
-	committed = writeJSONFileAtomic(openCodeUsageCachePath(), ledger)
+	committed = writeJSONFileAtomic(path, ledger)
 	generation = ledger.Generation
-	openCodeUsageMu.Unlock()
+	release()
 	if !committed {
 		logOpenCodeUsageCapture("write_failed")
 		return false, false, generation
@@ -454,13 +480,26 @@ func (run *openCodeUsageRun) snapshot() ([]openCodeUsageStep, string) {
 }
 
 // takeUncommitted returns the steps not yet handed to the ledger, marking them
-// handed, and the run's session id.
-func (run *openCodeUsageRun) takeUncommitted() ([]openCodeUsageStep, string) {
+// handed, and the run's session id. from is the handed count before the call,
+// for untake.
+func (run *openCodeUsageRun) takeUncommitted() (steps []openCodeUsageStep, sessionID string, from int) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
-	steps := append([]openCodeUsageStep(nil), run.steps[run.committed:]...)
+	from = run.committed
+	steps = append([]openCodeUsageStep(nil), run.steps[run.committed:]...)
 	run.committed = len(run.steps)
-	return steps, run.sessionID
+	return steps, run.sessionID, from
+}
+
+// untake hands steps taken from `from` back, so a write the ledger refused
+// (another agent process holding it, a failed rename) is retried by the run's
+// next flush instead of lost.
+func (run *openCodeUsageRun) untake(from int) {
+	run.mu.Lock()
+	if from < run.committed {
+		run.committed = from
+	}
+	run.mu.Unlock()
 }
 
 // openCodeUsageFrame is the permissive subset of an event the capture reads.

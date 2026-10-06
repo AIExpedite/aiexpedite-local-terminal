@@ -131,7 +131,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	if run == nil || !run.settled.CompareAndSwap(false, true) {
 		return
 	}
-	steps, streamSession := run.takeUncommitted()
+	steps, streamSession, from := run.takeUncommitted()
 	if !isValidOpenCodeSessionID(sessionID) {
 		sessionID = ""
 	}
@@ -140,7 +140,9 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	now := openCodeUsageFreshnessNow()
 
 	if len(steps) > 0 {
-		commitOpenCodeUsageSteps(run, fingerprint, steps)
+		if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
+			run.untake(from)
+		}
 		return
 	}
 	if sessionID == "" {
@@ -178,14 +180,14 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run == nil || !run.settled.Load() {
 		return
 	}
-	if steps, _ := run.takeUncommitted(); len(steps) > 0 {
-		commitOpenCodeUsageSteps(run, run.settleFingerprint(), steps)
+	if steps, _, from := run.takeUncommitted(); len(steps) > 0 && !commitOpenCodeUsageSteps(run, run.settleFingerprint(), steps) {
+		run.untake(from)
 	}
 }
 
 // commitOpenCodeUsageSteps folds steps into the ledger and retires the run's
-// debt in one write.
-func commitOpenCodeUsageSteps(run *openCodeUsageRun, fingerprint string, steps []openCodeUsageStep) {
+// debt in one write, reporting whether it committed.
+func commitOpenCodeUsageSteps(run *openCodeUsageRun, fingerprint string, steps []openCodeUsageStep) bool {
 	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		removeOpenCodeUsageDebt(ledger, run.id)
 		return true, mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
@@ -194,6 +196,7 @@ func commitOpenCodeUsageSteps(run *openCodeUsageRun, fingerprint string, steps [
 	if committed {
 		logOpenCodeUsageCapture("committed")
 	}
+	return committed
 }
 
 // settleFingerprint is the account the run counts toward: the one known at
