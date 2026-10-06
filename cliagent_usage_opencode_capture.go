@@ -132,6 +132,9 @@ var openCodeUsageLockWait = 2 * time.Second
 
 var (
 	// openCodeUsageMu serialises every ledger read-modify-write in this process.
+	// Plain reads never take it: every write is an atomic rename, so a reader
+	// sees one whole ledger, and a writer may hold this while it waits on the
+	// cross-process lock.
 	openCodeUsageMu sync.Mutex
 	// openCodeGenerationRotated reports a committed write carrying this
 	// process's epoch. Until then the ledger may hold a generation an earlier
@@ -345,9 +348,9 @@ func capOpenCodeUsageBuckets(ledger *openCodeUsageLedger) {
 // now), and the ledger's generation.
 func openCodeUsageBucketForDay(fingerprint string, now time.Time) (openCodeUsageBucket, bool, cliUsageGeneration) {
 	today, _ := openCodeLocalDay(now)
-	openCodeUsageMu.Lock()
+	// Lock-free (see openCodeUsageMu): the card's gather must not queue behind a
+	// writer that is waiting on another agent process.
 	ledger := readOpenCodeUsageLedger()
-	openCodeUsageMu.Unlock()
 	for _, b := range ledger.Buckets {
 		if b.AccountFingerprint == fingerprint && b.LocalDate == today {
 			return b, true, ledger.Generation

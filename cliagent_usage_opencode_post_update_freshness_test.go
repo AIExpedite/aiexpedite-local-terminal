@@ -227,8 +227,42 @@ func TestOpenCodeUsage_ArmingNeverWaitsOnAHeldLedgerLock(t *testing.T) {
 	}
 }
 
-// An export that paid while the other process holds the ledger is not lost:
-// the debt keeps a booked attempt (free, no attempt spent) and pays later.
+// While the other process holds the ledger an attempt spawns no export at all:
+// whatever it paid would be refused, and a refused attempt cannot be counted,
+// so exporting anyway would re-run the export on every retry for as long as
+// the lock stays held. No attempt is spent; a free retry is booked.
+func TestOpenCodeUsage_AHeldLedgerDefersTheExportWithoutSpawningIt(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1116)
+	stubOpenCodeExecutable(t)
+	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) { return nil, false })
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	settleOpenCodeUsageRun(run, "ses_held")
+
+	release := holdOpenCodeLedgerLock(t)
+	for i := 0; i < 4; i++ {
+		sched.fireNext()
+	}
+	if *calls != 0 {
+		t.Fatalf("export spawned %d times while the ledger was held", *calls)
+	}
+	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
+		t.Fatalf("debts = %+v, want the debt kept with no attempt spent", d)
+	}
+	for _, d := range sched.delays()[1:] {
+		if d < openCodeUsageFreeFloor {
+			t.Fatalf("deferred retry booked at %s, below the free floor", d)
+		}
+	}
+	release()
+	sched.fireNext()
+	if *calls != 1 {
+		t.Fatalf("export ran %d times after the lock was released, want 1", *calls)
+	}
+}
+
+// An export that paid while the other process took the ledger in the meantime
+// is not lost: the debt keeps a booked attempt (free, none spent) and pays on
+// the retry.
 func TestOpenCodeUsage_ARefusedAttemptWriteIsRetriedNotStranded(t *testing.T) {
 	sched := openCodeUsageFixture(t, 1113)
 	stubOpenCodeExecutable(t)
@@ -238,14 +272,20 @@ func TestOpenCodeUsage_ARefusedAttemptWriteIsRetriedNotStranded(t *testing.T) {
 	run := armOpenCodeUsageRun("opencode", "", "fp-a")
 	created := time.Now()
 	settleOpenCodeUsageRun(run, "ses_refused")
+	var release func()
 	stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
+		if release == nil {
+			release = holdOpenCodeLedgerLock(t) // the other process takes it mid-export
+		}
 		return openCodeExportJSON("msg_r", created.UnixMilli(), 5, 5, 0), true
 	})
 
-	release := holdOpenCodeLedgerLock(t)
 	sched.fireNext()
 	if d := sched.delays(); len(d) != 2 || d[1] < openCodeUsageFreeFloor {
 		t.Fatalf("booked %v, want a free retry after the refused write", d)
+	}
+	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
+		t.Fatalf("debts = %+v, want the debt kept with no attempt spent", d)
 	}
 	release()
 	sched.fireNext()
@@ -255,6 +295,33 @@ func TestOpenCodeUsage_ARefusedAttemptWriteIsRetriedNotStranded(t *testing.T) {
 	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after payment", debts)
 	}
+}
+
+// The card's read never queues behind a writer that is waiting on another
+// process's lock: the gather has a 10 s budget for every provider.
+func TestOpenCodeUsage_ReadsDoNotWaitBehindABlockedWriter(t *testing.T) {
+	openCodeUsageFixture(t, 1117)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 1500 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	release := holdOpenCodeLedgerLock(t)
+
+	writing := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(writing)
+		openCodeUsageTransaction(func(*openCodeUsageLedger) (bool, bool) { return true, false })
+		close(done)
+	}()
+	<-writing
+	time.Sleep(50 * time.Millisecond) // the writer now holds the in-process mutex, waiting
+	start := time.Now()
+	openCodeUsageBucketForDay("fp-a", time.Now())
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Fatalf("the read waited %s behind a blocked writer", took)
+	}
+	release()
+	<-done
 }
 
 // The process this update replaces may still hold the ledger when the new one

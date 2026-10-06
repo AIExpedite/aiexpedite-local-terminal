@@ -333,9 +333,7 @@ func clearOpenCodeUsageTimer(runID string) {
 // attemptOpenCodeUsageDebt makes one export attempt for a debt.
 func attemptOpenCodeUsageDebt(runID string) {
 	now := openCodeUsageFreshnessNow()
-	openCodeUsageMu.Lock()
 	ledger := readOpenCodeUsageLedger()
-	openCodeUsageMu.Unlock()
 	found := openCodeUsageDebtByID(&ledger, runID)
 	if found == nil || !found.owed() {
 		clearOpenCodeUsageTimer(runID)
@@ -354,11 +352,19 @@ func attemptOpenCodeUsageDebt(runID string) {
 		return
 	}
 	executable := resolveOpenCodeExecutable()
-	if IsOffline() || executable == "" {
-		// Spent nothing: no attempt consumed, the delay grows with the debt.
+	ledgerBusy := !openCodeUsageLedgerFree()
+	if IsOffline() || executable == "" || ledgerBusy {
+		// Spent nothing: no attempt consumed, the delay grows with the debt. A
+		// ledger another process holds would refuse whatever the export paid,
+		// and a refused attempt cannot be counted either — so the export is not
+		// spawned at all, rather than re-run on every retry for as long as the
+		// lock stays held.
 		label := "deferred_offline"
-		if executable == "" {
+		switch {
+		case executable == "":
 			label = "deferred_binary_missing"
+		case ledgerBusy:
+			label = "deferred_ledger_busy"
 		}
 		logOpenCodeUsageCapture(label)
 		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
@@ -424,6 +430,19 @@ func attemptOpenCodeUsageDebt(runID string) {
 		return
 	}
 	retireOpenCodeUsageDebt(runID, "exhausted")
+}
+
+// openCodeUsageLedgerFree reports whether no other process holds the ledger's
+// cross-process lock right now — a probe, released at once. A filesystem that
+// offers no lock answers true, as the transaction would proceed there too.
+func openCodeUsageLedgerFree() bool {
+	path := openCodeUsageCachePath()
+	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now())
+	if lock != nil {
+		_ = unlockFile(lock)
+		_ = lock.Close()
+	}
+	return outcome != crossProcessLockContended
 }
 
 func retireOpenCodeUsageDebt(runID, label string) {
