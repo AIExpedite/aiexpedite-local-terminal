@@ -185,6 +185,46 @@ func TestOpenCodeUsage_AContendedLedgerLockRefusesTheWriteAndTheFlushRetries(t *
 	}
 }
 
+// The smoke and runOneShot settle ONCE — nothing streams after, so there is no
+// later flush. A commit the ledger refuses there is booked on the commit ladder
+// and retried, instead of sitting in memory until the process ends.
+func TestOpenCodeUsage_ARefusedCommitWithNoFlushIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1113)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_1", 40, 4, 0, "0", now.UnixMilli()))
+	openCodeUsageInFlight.Wait() // its session-id write holds the lock briefly
+
+	release := holdOpenCodeLedgerLock(t)
+	settleOpenCodeUsageRun(run, "")
+	if _, ok, _ := openCodeUsageBucketForDay("fp-a", now); ok {
+		t.Fatal("a write landed while another process held the ledger lock")
+	}
+	if d := sched.delays(); len(d) != 1 || d[0] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head", d)
+	}
+	sched.fireNext() // still held: the next rung is booked, nothing is lost
+	if d := sched.delays(); len(d) != 2 || d[1] != openCodeUsageCommitLadder[1] {
+		t.Fatalf("booked %v, want the second commit rung", d)
+	}
+
+	release()
+	sched.fireNext()
+	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 44 {
+		t.Fatalf("bucket = %+v, want the retried commit's 44 tokens", b)
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v after the retried commit", debts)
+	}
+	if sched.fireNext() {
+		t.Fatal("a commit that landed booked another retry")
+	}
+}
+
 // holdOpenCodeLedgerLock takes the ledger's cross-process lock as the other
 // agent process would, returning its release.
 func holdOpenCodeLedgerLock(t *testing.T) func() {

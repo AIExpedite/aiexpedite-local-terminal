@@ -205,6 +205,9 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	// Today's spend from the usage ledger. No bucket means no rows: there is no
 	// OpenCode-level limit window, so the "limits exist, values unobservable"
 	// placeholders the other parsers emit would be a lie here.
+	// A turn that spent before any probe named the account banked under the empty
+	// fingerprint: claim it for this one first, or its tokens stay invisible.
+	adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
 	bucket, ok, generation := openCodeUsageBucketForDay(usage.AccountFingerprint, now)
 	usage.Metrics = openCodeUsageMetrics(bucket, ok, now)
 	// Only a generation this process committed: until then the ledger may hold
@@ -424,7 +427,7 @@ func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bo
 	} else {
 		dir = ""
 	}
-	loggedIn, known, _ = openCodeSmokeLoggedInDir(ctx, path, dir)
+	loggedIn, known = openCodeSmokeLoggedInDir(ctx, path, dir)
 	return loggedIn, known
 }
 
@@ -435,12 +438,12 @@ func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bo
 // project pass the pre-check and then fail the turn — and lets a project override
 // report a premature not_logged_in.
 //
-// providers are the names the same probe listed, so the smoke can key its
-// usage to the account the card publishes without a second probe; nil when it
-// could not ask.
-func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool, providers []string) {
+// It answers only the login question: the smoke keys its usage to the account
+// the CARD publishes (openCodeKnownAccountFingerprint), not to the provider set
+// this isolated probe lists, so the two cannot disagree.
+func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool) {
 	if strings.TrimSpace(path) == "" {
-		return false, false, nil
+		return false, false
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -452,12 +455,12 @@ func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, 
 	readiness := probeOpenCodeReadinessUncached(ctx, path, home, dir)
 	switch {
 	case readiness.AuthState == openCodeAuthUnauthenticated && readiness.Conclusive:
-		return false, true, nil
+		return false, true
 	case readiness.AuthState == openCodeAuthReady:
-		return true, true, readiness.Providers
+		return true, true
 	}
 	// Inconclusive (timeout, unrecognized output, non-zero exit): proceed.
-	return false, false, nil
+	return false, false
 }
 
 // parseOpenCodeModelList extracts model identifiers from `opencode models`.

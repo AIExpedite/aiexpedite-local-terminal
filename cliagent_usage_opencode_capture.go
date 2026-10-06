@@ -310,6 +310,21 @@ func openCodeLocalDay(t time.Time) (date string, resetAt time.Time) {
 	return local.Format("2006-01-02"), time.Date(y, m, d+1, 0, 0, 0, 0, loc)
 }
 
+// openCodeUsageStepsCarryUsage reports whether any of steps would contribute to
+// a bucket. A syntactically valid step whose every token and cost is zero spends
+// nothing and publishes nothing, so it is not payment: a turn that reported only
+// those is treated as a turn that reported none, and still owes the export
+// fallback its reading (cliagent_usage_opencode_freshness.go). The condition
+// mirrors the per-step skip in mergeOpenCodeUsageSteps.
+func openCodeUsageStepsCarryUsage(steps []openCodeUsageStep) bool {
+	for _, s := range steps {
+		if s.Input+s.Output+s.Reasoning+s.CacheRead+s.CacheWrite != 0 || s.Cost != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // mergeOpenCodeUsageSteps folds steps into the ledger's buckets for
 // fingerprint, skipping any whose key was already counted. It reports whether a
 // bucket changed.
@@ -374,6 +389,70 @@ func capOpenCodeUsageBuckets(ledger *openCodeUsageLedger) {
 		}
 		ledger.Buckets = append(ledger.Buckets[:oldest], ledger.Buckets[oldest+1:]...)
 	}
+}
+
+// adoptPendingOpenCodeUsageBuckets claims the spend banked before any probe had
+// named the install's account — a bucket under the empty fingerprint — for the
+// account the card publishes.
+//
+// A run arms when its child spawns, which can precede the first readiness probe
+// of the gather: the smoke's own pre-check answers for an isolated directory
+// (openCodeSmokeLoggedInDir), so its provider list is not the account the card
+// keys the install by, and guessing from it would bank the turn under a
+// fingerprint ParseContext never queries. Such a run banks under "" instead, and
+// the first gather that resolves an account adopts it. "" means "we could not
+// ask", never a different account, so this cannot mix two accounts' spend.
+//
+// Nothing to adopt is the usual case and costs one lock-free read. The adopting
+// write does NOT advance the generation and sends no hint: it re-keys spend the
+// commit already counted and hinted, and the gather that calls it publishes the
+// adopted numbers itself.
+func adoptPendingOpenCodeUsageBuckets(fingerprint string) {
+	if fingerprint == "" {
+		return
+	}
+	if !openCodeUsageHasPendingBucket(loadOpenCodeUsageLedger()) {
+		return
+	}
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		var pending []openCodeUsageBucket
+		kept := ledger.Buckets[:0]
+		for _, b := range ledger.Buckets {
+			if b.AccountFingerprint == "" {
+				pending = append(pending, b)
+				continue
+			}
+			kept = append(kept, b)
+		}
+		if len(pending) == 0 {
+			return false, false
+		}
+		ledger.Buckets = kept
+		for _, p := range pending {
+			target := openCodeUsageBucketFor(ledger, fingerprint, p.LocalDate)
+			target.InputTokens += p.InputTokens
+			target.OutputTokens += p.OutputTokens
+			target.ReasoningTokens += p.ReasoningTokens
+			target.CacheReadTokens += p.CacheReadTokens
+			target.CacheWriteTokens += p.CacheWriteTokens
+			target.CostUsd += p.CostUsd
+			if p.ObservedAtMs > target.ObservedAtMs {
+				target.ObservedAtMs = p.ObservedAtMs
+			}
+		}
+		capOpenCodeUsageBuckets(ledger)
+		logOpenCodeUsageCapture("account_adopted")
+		return true, false
+	})
+}
+
+func openCodeUsageHasPendingBucket(ledger openCodeUsageLedger) bool {
+	for _, b := range ledger.Buckets {
+		if b.AccountFingerprint == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // openCodeUsageBucketForDay reads the bucket for (fingerprint, the local date of

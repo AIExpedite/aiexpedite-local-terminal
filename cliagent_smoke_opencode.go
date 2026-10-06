@@ -355,7 +355,7 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	// complete. Anything inconclusive proceeds — that is what a working
 	// local-model or env-credential install looks like (see
 	// cliagent_usage_opencode.go's fail-open design).
-	loggedIn, known, providers := openCodeSmokeLoggedInDir(ctx, path, runDir)
+	loggedIn, known := openCodeSmokeLoggedInDir(ctx, path, runDir)
 	if known && !loggedIn {
 		return finish(cliUsageErrorNotAuthenticated, cliSmokeDiagnosticNotLoggedIn)
 	}
@@ -382,13 +382,14 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	result.ArgvShapeID = shape.ID
 
 	// The turn's spend is owed from here (cliagent_usage_opencode_freshness.go),
-	// keyed to the account the pre-check just listed — no second probe. A
-	// pre-check that could not ask falls back to what the card last published.
-	usageFingerprint := openCodeAccountFingerprintFor(providers)
-	if len(providers) == 0 {
-		usageFingerprint = openCodeKnownAccountFingerprint(path)
-	}
-	usageRun := armOpenCodeUsageRun(path, runDir, usageFingerprint)
+	// keyed to the account the CARD publishes — what the readiness cache last
+	// named for this binary, never a second probe. The pre-check above is not that
+	// answer: it runs in the isolated run directory, so a project-scoped
+	// `opencode.json` there would key the turn to a provider set ParseContext
+	// never queries. An install no probe has named yet banks under the empty
+	// fingerprint, which the first gather to resolve an account adopts
+	// (adoptPendingOpenCodeUsageBuckets).
+	usageRun := armOpenCodeUsageRunForExecutable(path, runDir)
 
 	runCtx, cancel := context.WithTimeout(ctx, openCodeSmokeTimeout)
 	stdout, stderr, runErr := runOpenCodeSmokeCommand(runCtx, openCodeLaunch{

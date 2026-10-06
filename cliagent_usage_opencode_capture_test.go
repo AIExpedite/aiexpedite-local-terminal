@@ -96,6 +96,37 @@ func openCodeStepFinish(session, part string, input, output, reasoning int64, co
 		endMs, session, part, session, cost, input, output, reasoning, endMs)
 }
 
+// openCodeZeroStepFinish is a well-formed step_finish that reports no spend at
+// all — every token and the cost zero.
+func openCodeZeroStepFinish(session, part string, endMs int64) string {
+	return fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"sessionID":%q,"part":{"id":%q,"sessionID":%q,"messageID":"msg_1","type":"step-finish","reason":"stop","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"end":%d}}}`,
+		endMs, session, part, session, endMs)
+}
+
+// A step that contributes nothing to a bucket is not payment: settlement and the
+// export fallback must keep owing a reading for the turn that produced it.
+func TestOpenCodeUsageStepsCarryUsage(t *testing.T) {
+	zero, _, ok := parseOpenCodeUsageFrame(openCodeZeroStepFinish("ses_z", "prt_z", 1_790_000_000_000), time.Now())
+	if !ok {
+		t.Fatal("a zero-only step_finish is still a valid frame")
+	}
+	if openCodeUsageStepsCarryUsage(nil) || openCodeUsageStepsCarryUsage([]openCodeUsageStep{zero, zero}) {
+		t.Fatal("zero-only steps were read as payment")
+	}
+	for name, step := range map[string]openCodeUsageStep{
+		"input":      {Input: 1},
+		"output":     {Output: 1},
+		"reasoning":  {Reasoning: 1},
+		"cacheRead":  {CacheRead: 1},
+		"cacheWrite": {CacheWrite: 1},
+		"cost":       {Cost: 0.0001},
+	} {
+		if !openCodeUsageStepsCarryUsage([]openCodeUsageStep{zero, step}) {
+			t.Fatalf("a step carrying %s was not read as payment", name)
+		}
+	}
+}
+
 func TestParseOpenCodeUsageFrame_EverySpellingAndShape(t *testing.T) {
 	at := time.UnixMilli(1_790_000_000_000)
 	cases := []struct {

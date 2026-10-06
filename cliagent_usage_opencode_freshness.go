@@ -11,11 +11,12 @@
 //     only. The first session id is recorded on the debt, one write per run,
 //     off the stream goroutine.
 //   - Settle, once per run (terminal event or exit, whichever comes first):
-//     captured steps commit and retire the debt in one write. A run with no
-//     captured step but a session id keeps the debt, OWED, written
-//     synchronously before an update hand-off can replace the process. With no
-//     session id nothing can be exported: the debt is dropped
-//     ("unattributable").
+//     captured steps commit and retire the debt in one write; a refused write is
+//     booked on the commit ladder, because the smoke and runOneShot have no later
+//     flush. A run with no step that spent anything but with a session id keeps
+//     the debt, OWED, written synchronously before an update hand-off can replace
+//     the process. With no session id nothing can be exported: the debt is
+//     dropped ("unattributable").
 //   - Ladder: attempts at 15 s, 1 m and 5 m, each one `opencode export <id>`
 //     with a 5 s timeout. A refusal that spent nothing (offline, binary
 //     missing) books refreshFreeRetryDelay without consuming an attempt. A
@@ -43,12 +44,19 @@ import (
 
 // Vars so tests can pin them small.
 var (
-	openCodeUsageDebtLadder   = []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute}
-	openCodeUsageDebtMaxAge   = 6 * time.Hour
-	openCodeExportTimeout     = 5 * time.Second
-	openCodeUsageFreeFloor    = 15 * time.Second
-	openCodeUsageAfterFunc    = time.AfterFunc
-	openCodeUsageFreshnessNow = time.Now
+	openCodeUsageDebtLadder = []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute}
+	openCodeUsageDebtMaxAge = 6 * time.Hour
+	openCodeExportTimeout   = 5 * time.Second
+	openCodeUsageFreeFloor  = 15 * time.Second
+	// openCodeUsageCommitLadder paces the retries of a REFUSED ledger write.
+	// Those spend no outbound read, only a local read-modify-rename, so they
+	// start far shorter than the export ladder.
+	openCodeUsageCommitLadder = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute}
+	// openCodeUsageCommitMaxAttempts bounds those retries: rung 1 is the ladder's
+	// head, so the budget is its length plus the settle's own attempt.
+	openCodeUsageCommitMaxAttempts = len(openCodeUsageCommitLadder) + 1
+	openCodeUsageAfterFunc         = time.AfterFunc
+	openCodeUsageFreshnessNow      = time.Now
 )
 
 const (
@@ -142,12 +150,20 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	fingerprint := run.settleFingerprint()
 	now := openCodeUsageFreshnessNow()
 
-	if len(steps) > 0 {
+	if openCodeUsageStepsCarryUsage(steps) {
 		if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
+			// The steps go back to the run, and the commit is retried: the native
+			// and smoke paths settle once, and an exit-only session has no later
+			// flush, so without a booking these tokens would sit in memory until
+			// the process ended.
 			run.untake(from, len(steps))
+			scheduleOpenCodeUsageCommit(run, fingerprint, 1)
 		}
 		return
 	}
+	// Steps that contribute nothing — a valid step_finish whose every token and
+	// cost is zero — are not payment: the turn still owes a reading, and its
+	// export may carry one.
 	if sessionID == "" {
 		disarmOpenCodeUsageRunID(run.id)
 		logOpenCodeUsageCapture("unattributable")
@@ -183,9 +199,53 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run == nil || !run.settled.Load() {
 		return
 	}
-	if steps, _, from := run.takeUncommitted(); len(steps) > 0 && !commitOpenCodeUsageSteps(run, run.settleFingerprint(), steps) {
-		run.untake(from, len(steps))
+	fingerprint := run.settleFingerprint()
+	steps, _, from := run.takeUncommitted()
+	if !openCodeUsageStepsCarryUsage(steps) {
+		return
 	}
+	if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
+		run.untake(from, len(steps))
+		scheduleOpenCodeUsageCommit(run, fingerprint, 1)
+	}
+}
+
+// scheduleOpenCodeUsageCommit books another attempt at committing a settled
+// run's captured steps, `attempt` having already been booked. A refused write
+// spent nothing durable (another agent process held the ledger across an update
+// hand-off, or the rename failed), so the retries are free and short — and
+// bounded: once they are spent the run's ARMED debt is still in the ledger (the
+// commit that would have retired it never landed), so the next process adopts it
+// and pays it by export instead.
+func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt int) {
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		logOpenCodeUsageCapture("commit_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("commit_retry")
+	openCodeUsageTimersMu.Lock()
+	defer openCodeUsageTimersMu.Unlock()
+	if t := openCodeUsageTimers[run.id]; t != nil {
+		t.Stop()
+	}
+	openCodeUsageTimers[run.id] = openCodeUsageAfterFunc(delay, func() {
+		retryOpenCodeUsageCommit(run, fingerprint, attempt)
+	})
+}
+
+func retryOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt int) {
+	steps, _, from := run.takeUncommitted()
+	if !openCodeUsageStepsCarryUsage(steps) {
+		clearOpenCodeUsageTimer(run.id)
+		return
+	}
+	if commitOpenCodeUsageSteps(run, fingerprint, steps) {
+		clearOpenCodeUsageTimer(run.id)
+		return
+	}
+	run.untake(from, len(steps))
+	scheduleOpenCodeUsageCommit(run, fingerprint, attempt+1)
 }
 
 // commitOpenCodeUsageSteps folds steps into the ledger and retires the run's
@@ -218,7 +278,7 @@ func settleOrDisarmOpenCodeSmokeRun(run *openCodeUsageRun, succeeded bool) {
 	if run == nil {
 		return
 	}
-	if steps, _ := run.snapshot(); !succeeded && len(steps) == 0 {
+	if steps, _ := run.snapshot(); !succeeded && !openCodeUsageStepsCarryUsage(steps) {
 		disarmOpenCodeUsageRun(run)
 		return
 	}
@@ -378,7 +438,7 @@ func attemptOpenCodeUsageDebt(runID string) {
 	// other reason (another process holding the ledger) spent nothing durable,
 	// so it is retried rather than leaving the debt with no attempt booked.
 	gone := false
-	if ok && len(steps) > 0 {
+	if ok && openCodeUsageStepsCarryUsage(steps) {
 		committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 			if openCodeUsageDebtByID(ledger, runID) == nil {
 				gone = true

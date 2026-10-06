@@ -141,6 +141,40 @@ func TestOpenCodeUsage_NoUsageInTheStreamOwesAnExportPaidOnRungTwo(t *testing.T)
 	}
 }
 
+// A turn whose only step_finish reports zeros produces no number, so it has not
+// been paid: the debt stands and the export pays it. Without that, an install
+// that reports its spend late (or in a shape the stream does not carry) would
+// retire its debt against nothing and leave the card numberless.
+func TestOpenCodeUsage_AZeroOnlyStepIsNotPaymentAndTheExportPaysIt(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1009)
+	stubOpenCodeExecutable(t)
+	var now time.Time
+	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
+		return openCodeExportJSON("msg_z", now.UnixMilli(), 500, 60, 0.5), true
+	})
+
+	run := armOpenCodeUsageRun("opencode", t.TempDir(), "fp-z")
+	now = time.Now()
+	captureOpenCodeUsageLine(run, openCodeZeroStepFinish("ses_zero", "prt_z", now.UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRun(run, "")
+
+	ledger := loadOpenCodeUsageLedger()
+	if len(ledger.Debts) != 1 || !ledger.Debts[0].owed() || ledger.Debts[0].SessionID != "ses_zero" {
+		t.Fatalf("debts = %+v, want the zero-only turn still owed", ledger.Debts)
+	}
+	sched.fireNext()
+	if *calls != 1 {
+		t.Fatalf("export ran %d times, want one attempt", *calls)
+	}
+	if b, ok, _ := openCodeUsageBucketForDay("fp-z", now); !ok || b.tokens() != 560 {
+		t.Fatalf("bucket = %+v, want the exported 560 tokens", b)
+	}
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
+		t.Fatalf("debt survived payment: %+v", left)
+	}
+}
+
 func TestOpenCodeUsage_ExportCountsOnlyThisRunsMessages(t *testing.T) {
 	floor := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC).UnixMilli()
 	debt := openCodeUsageDebt{SessionID: "ses_x", RunFloorMs: floor, SettledAtMs: floor + 60_000}

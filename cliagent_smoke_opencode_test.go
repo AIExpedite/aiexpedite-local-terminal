@@ -1019,9 +1019,23 @@ func TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration(t *testing.T) {
 	if result := runOpenCodeSmoke(context.Background(), path, "1.2.0"); result.Status != cliSmokeStatusSuccess {
 		t.Fatalf("smoke = %+v", result)
 	}
-	b, ok, g := openCodeUsageBucketForDay(openCodeAccountFingerprintFor([]string{"anthropic"}), time.Now())
+	// The smoke banks under the account the readiness CACHE names, which its own
+	// isolated pre-check never populates: the pending fingerprint, which the first
+	// gather adopts for the account the card publishes.
+	b, ok, g := openCodeUsageBucketForDay("", time.Now())
 	if !ok || b.tokens() != 88 || g != (cliUsageGeneration{Epoch: 1401, Counter: 1}) {
-		t.Fatalf("bucket = %+v generation = %+v, want 88 tokens at {1401,1}", b, g)
+		t.Fatalf("pending bucket = %+v generation = %+v, want 88 tokens at {1401,1}", b, g)
+	}
+	usage, _ := openCodeUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Path: path}, time.Now())
+	fp := openCodeAccountFingerprintFor([]string{"anthropic"})
+	if usage.AccountFingerprint != fp {
+		t.Fatalf("card account fingerprint = %q, want %q", usage.AccountFingerprint, fp)
+	}
+	if adopted, ok, _ := openCodeUsageBucketForDay(fp, time.Now()); !ok || adopted.tokens() != 88 {
+		t.Fatalf("adopted bucket = %+v, want the smoke's 88 tokens under the card's account", adopted)
+	}
+	if left, ok, _ := openCodeUsageBucketForDay("", time.Now()); ok {
+		t.Fatalf("pending bucket survived adoption: %+v", left)
 	}
 	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after a captured smoke", debts)
@@ -1065,8 +1079,9 @@ func TestRunOpenCodeSmoke_CapturesUsageOrOwesIt(t *testing.T) {
 			if !tc.wantDebt && len(debts) != 0 {
 				t.Fatalf("debts = %+v, want none", debts)
 			}
-			fp := openCodeAccountFingerprintFor([]string{"anthropic"})
-			b, _, _ := openCodeUsageBucketForDay(fp, time.Now())
+			// Banked under the pending fingerprint until a gather adopts it; see
+			// TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration.
+			b, _, _ := openCodeUsageBucketForDay("", time.Now())
 			if b.tokens() != tc.wantToken {
 				t.Fatalf("tokens = %d, want %d", b.tokens(), tc.wantToken)
 			}
