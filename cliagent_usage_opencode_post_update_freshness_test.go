@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -49,7 +51,7 @@ func TestOpenCodeUsage_ADebtSurvivesTheProcessAndIsPaidByTheNext(t *testing.T) {
 	if g.Epoch != 1102 {
 		t.Fatalf("generation %+v was not committed under the new epoch", g)
 	}
-	if left := readOpenCodeUsageLedger().Debts; len(left) != 0 {
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
 		t.Fatalf("debts = %+v after payment", left)
 	}
 }
@@ -73,7 +75,7 @@ func TestOpenCodeUsage_ARunKilledMidTurnIsPaidOnlyWhenItNamedItsSession(t *testi
 		return openCodeExportJSON("msg_k", time.Now().UnixMilli(), 11, 22, 0), true
 	})
 	adoptOwedOpenCodeUsage(time.Now().Add(time.Second))
-	debts := readOpenCodeUsageLedger().Debts
+	debts := loadOpenCodeUsageLedger().Debts
 	if len(debts) != 1 || debts[0].SessionID != "ses_killed" || !debts[0].owed() {
 		t.Fatalf("debts = %+v, want only the named run, now owed", debts)
 	}
@@ -92,7 +94,7 @@ func TestOpenCodeUsage_AdoptionLeavesThisProcesssOwnArmedRunAlone(t *testing.T) 
 	startedAt := time.Now().Add(-time.Second)
 	run := armOpenCodeUsageRun("opencode", "", "fp-a") // a smoke racing startup
 	adoptOwedOpenCodeUsage(startedAt)
-	debts := readOpenCodeUsageLedger().Debts
+	debts := loadOpenCodeUsageLedger().Debts
 	if len(debts) != 1 || debts[0].owed() || debts[0].RunID != run.id {
 		t.Fatalf("debts = %+v, want this process's armed run untouched", debts)
 	}
@@ -178,7 +180,7 @@ func TestOpenCodeUsage_AContendedLedgerLockRefusesTheWriteAndTheFlushRetries(t *
 	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 15 {
 		t.Fatalf("bucket = %+v, want the refused steps committed by the flush", b)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after the retried commit", debts)
 	}
 }
@@ -219,7 +221,7 @@ func TestOpenCodeUsage_ArmingNeverWaitsOnAHeldLedgerLock(t *testing.T) {
 	}
 	release()
 	settleOpenCodeUsageRun(run, "ses_after_refused_arm")
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
 		t.Fatalf("debts = %+v, want the run owed despite its refused arm", debts)
 	}
 	if len(sched.delays()) != 1 {
@@ -245,7 +247,7 @@ func TestOpenCodeUsage_AHeldLedgerDefersTheExportWithoutSpawningIt(t *testing.T)
 	if *calls != 0 {
 		t.Fatalf("export spawned %d times while the ledger was held", *calls)
 	}
-	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
 		t.Fatalf("debts = %+v, want the debt kept with no attempt spent", d)
 	}
 	for _, d := range sched.delays()[1:] {
@@ -284,7 +286,7 @@ func TestOpenCodeUsage_ARefusedAttemptWriteIsRetriedNotStranded(t *testing.T) {
 	if d := sched.delays(); len(d) != 2 || d[1] < openCodeUsageFreeFloor {
 		t.Fatalf("booked %v, want a free retry after the refused write", d)
 	}
-	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
 		t.Fatalf("debts = %+v, want the debt kept with no attempt spent", d)
 	}
 	release()
@@ -292,7 +294,7 @@ func TestOpenCodeUsage_ARefusedAttemptWriteIsRetriedNotStranded(t *testing.T) {
 	if b, ok, _ := openCodeUsageBucketForDay("fp-a", time.Now()); !ok || b.tokens() != 10 {
 		t.Fatalf("bucket = %+v, want the export paid on the retry", b)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after payment", debts)
 	}
 }
@@ -338,12 +340,12 @@ func TestOpenCodeUsage_StartupAdoptionRetriesWhileTheOldProcessHoldsTheLedger(t 
 	simulateOpenCodeProcessRestart(t, 1115)
 	release := holdOpenCodeLedgerLock(t)
 	adoptOwedOpenCodeUsage(time.Now().Add(time.Second))
-	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].owed() {
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].owed() {
 		t.Fatalf("debts = %+v, want the armed debt untouched while locked", d)
 	}
 	release()
 	sched.fireNext() // the adoption retry
-	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || !d[0].owed() {
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || !d[0].owed() {
 		t.Fatalf("debts = %+v, want the debt adopted on the retry", d)
 	}
 	if !sched.fireNext() {
@@ -368,5 +370,65 @@ func TestOpenCodeUsageRun_UntakeNeverReoffersStepsTakenSince(t *testing.T) {
 	solo.untake(from, len(taken))
 	if again, _, _ := solo.takeUncommitted(); len(again) != 1 {
 		t.Fatalf("a refused commit's steps were not handed back: %+v", again)
+	}
+}
+
+// On Windows a rename cannot replace a file another handle has open, so a card
+// read that overlapped a commit used to fail the agent's own write. Reads and
+// commits in this process are serialised on the file; none may fail.
+func TestOpenCodeUsage_ConcurrentReadsNeverFailACommit(t *testing.T) {
+	openCodeUsageFixture(t, 1118)
+	now := time.Now()
+	stop := make(chan struct{})
+	readers := make(chan struct{})
+	go func() {
+		defer close(readers)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				openCodeUsageBucketForDay("fp-a", now)
+			}
+		}
+	}()
+	for i := 0; i < 40; i++ {
+		committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+			return true, mergeOpenCodeUsageSteps(ledger, "fp-a", []openCodeUsageStep{{Key: fmt.Sprint(i), AtMs: now.UnixMilli(), Input: 1}})
+		})
+		if !committed {
+			close(stop)
+			<-readers
+			t.Fatalf("commit %d failed while a reader was active", i)
+		}
+	}
+	close(stop)
+	<-readers
+	if b, _, _ := openCodeUsageBucketForDay("fp-a", now); b.InputTokens != 40 {
+		t.Fatalf("input = %d, want every commit counted", b.InputTokens)
+	}
+}
+
+// Another process holding the ledger open for a moment (its own read) does not
+// fail this process's commit: the rename is retried briefly.
+func TestOpenCodeUsage_ACommitRetriesPastAnotherProcesssBriefRead(t *testing.T) {
+	openCodeUsageFixture(t, 1119)
+	openCodeUsageTransaction(func(*openCodeUsageLedger) (bool, bool) { return true, false }) // the file exists
+	f, err := os.Open(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		time.Sleep(openCodeUsageWriteBackoff / 2)
+		_ = f.Close()
+		close(closed)
+	}()
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		return true, mergeOpenCodeUsageSteps(ledger, "fp-a", []openCodeUsageStep{{Key: "k", AtMs: time.Now().UnixMilli(), Input: 9}})
+	})
+	<-closed
+	if !committed {
+		t.Fatal("the commit failed past a brief foreign read; the rename must be retried")
 	}
 }

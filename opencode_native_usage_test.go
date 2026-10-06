@@ -46,7 +46,7 @@ func TestOpenCodeNativeUsage_AResidentTurnCommitsItsStepsOnce(t *testing.T) {
 	if g.Counter != 1 {
 		t.Fatalf("generation = %+v, want one commit", g)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after a captured turn", debts)
 	}
 }
@@ -79,7 +79,7 @@ func TestOpenCodeNativeUsage_ATerminalSessionCommitsOnceThoughBothSettlesFire(t 
 	if g.Counter != 1 {
 		t.Fatalf("generation = %+v, want exactly one commit", g)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after a captured session", debts)
 	}
 }

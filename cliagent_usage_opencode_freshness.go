@@ -333,7 +333,7 @@ func clearOpenCodeUsageTimer(runID string) {
 // attemptOpenCodeUsageDebt makes one export attempt for a debt.
 func attemptOpenCodeUsageDebt(runID string) {
 	now := openCodeUsageFreshnessNow()
-	ledger := readOpenCodeUsageLedger()
+	ledger := loadOpenCodeUsageLedger()
 	found := openCodeUsageDebtByID(&ledger, runID)
 	if found == nil || !found.owed() {
 		clearOpenCodeUsageTimer(runID)

@@ -1023,7 +1023,7 @@ func TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration(t *testing.T) {
 	if !ok || b.tokens() != 88 || g != (cliUsageGeneration{Epoch: 1401, Counter: 1}) {
 		t.Fatalf("bucket = %+v generation = %+v, want 88 tokens at {1401,1}", b, g)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after a captured smoke", debts)
 	}
 }
@@ -1058,7 +1058,7 @@ func TestRunOpenCodeSmoke_CapturesUsageOrOwesIt(t *testing.T) {
 			if (result.Status == cliSmokeStatusSuccess) == tc.fail {
 				t.Fatalf("smoke status = %s", result.Status)
 			}
-			debts := readOpenCodeUsageLedger().Debts
+			debts := loadOpenCodeUsageLedger().Debts
 			if tc.wantDebt != (len(debts) == 1 && debts[0].owed()) {
 				t.Fatalf("debts = %+v, want owed=%v", debts, tc.wantDebt)
 			}

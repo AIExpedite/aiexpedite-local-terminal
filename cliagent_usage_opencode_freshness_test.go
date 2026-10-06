@@ -117,7 +117,7 @@ func TestOpenCodeUsage_NoUsageInTheStreamOwesAnExportPaidOnRungTwo(t *testing.T)
 	openCodeUsageInFlight.Wait()
 	settleOpenCodeUsageRun(run, "")
 
-	ledger := readOpenCodeUsageLedger()
+	ledger := loadOpenCodeUsageLedger()
 	if len(ledger.Debts) != 1 || !ledger.Debts[0].owed() || ledger.Debts[0].SessionID != "ses_owed" {
 		t.Fatalf("debts = %+v, want one owed debt written at settle", ledger.Debts)
 	}
@@ -133,7 +133,7 @@ func TestOpenCodeUsage_NoUsageInTheStreamOwesAnExportPaidOnRungTwo(t *testing.T)
 	if *calls != 2 {
 		t.Fatalf("export ran %d times, want 2", *calls)
 	}
-	if left := readOpenCodeUsageLedger().Debts; len(left) != 0 {
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
 		t.Fatalf("debt survived payment: %+v", left)
 	}
 	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 340 {
@@ -177,7 +177,7 @@ func TestOpenCodeUsage_OfflineRefusalsSpendNoAttempts(t *testing.T) {
 	if *calls != 0 {
 		t.Fatalf("export ran %d times while offline", *calls)
 	}
-	ledger := readOpenCodeUsageLedger()
+	ledger := loadOpenCodeUsageLedger()
 	if len(ledger.Debts) != 1 || ledger.Debts[0].Attempts != 0 {
 		t.Fatalf("debts = %+v, want the debt kept with no attempt spent", ledger.Debts)
 	}
@@ -203,7 +203,7 @@ func TestOpenCodeUsage_AttemptsAreBoundedAndTheDebtAgesOut(t *testing.T) {
 	if want := []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute}; fmt.Sprint(sched.delays()) != fmt.Sprint(want) {
 		t.Fatalf("ladder = %v, want %v", sched.delays(), want)
 	}
-	if left := readOpenCodeUsageLedger().Debts; len(left) != 0 {
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
 		t.Fatalf("an exhausted debt survived: %+v", left)
 	}
 
@@ -216,7 +216,7 @@ func TestOpenCodeUsage_AttemptsAreBoundedAndTheDebtAgesOut(t *testing.T) {
 	if *calls != before {
 		t.Fatal("an aged-out debt was still exported")
 	}
-	if left := readOpenCodeUsageLedger().Debts; len(left) != 0 {
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
 		t.Fatalf("an aged-out debt survived: %+v", left)
 	}
 }
@@ -248,7 +248,7 @@ func TestOpenCodeUsage_TheExportIsKilledAtItsTimeoutAndNeverBlocksSettle(t *test
 	if took := time.Since(start); took > 2*time.Second {
 		t.Fatalf("attempt ran %s past its %s timeout", took, openCodeExportTimeout)
 	}
-	if d := readOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 1 {
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 1 {
 		t.Fatalf("debts = %+v, want one attempt spent on the killed export", d)
 	}
 }
@@ -267,7 +267,7 @@ func TestOpenCodeUsage_AStepAfterTheTerminalEventStillCommits(t *testing.T) {
 	if b, _, _ := openCodeUsageBucketForDay("fp-a", now); b.InputTokens != 15 {
 		t.Fatalf("input = %d, want 15", b.InputTokens)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("the run's debt was not retired: %+v", debts)
 	}
 }
@@ -287,7 +287,7 @@ func TestOpenCodeUsage_AHostileSessionIDNeverReachesTheExport(t *testing.T) {
 		openCodeUsageInFlight.Wait()
 		settleOpenCodeUsageRun(run, hostile)
 	}
-	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v, want hostile ids dropped as unattributable", debts)
 	}
 	for sched.fireNext() {
@@ -302,7 +302,7 @@ func TestOpenCodeUsage_AHostileSessionIDNeverReachesTheExport(t *testing.T) {
 		return true, false
 	})
 	attemptOpenCodeUsageDebt("r")
-	if *calls != 0 || len(readOpenCodeUsageLedger().Debts) != 0 {
+	if *calls != 0 || len(loadOpenCodeUsageLedger().Debts) != 0 {
 		t.Fatalf("a stored hostile id was exported (%d) or kept", *calls)
 	}
 	if !isValidOpenCodeSessionID("ses_01JXYZabc-9") {

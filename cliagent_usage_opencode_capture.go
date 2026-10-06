@@ -131,11 +131,17 @@ type openCodeUsageStep struct {
 var openCodeUsageLockWait = 2 * time.Second
 
 var (
-	// openCodeUsageMu serialises every ledger read-modify-write in this process.
-	// Plain reads never take it: every write is an atomic rename, so a reader
-	// sees one whole ledger, and a writer may hold this while it waits on the
-	// cross-process lock.
+	// openCodeUsageMu serialises every ledger read-modify-write in this process,
+	// and is held while a writer waits on the cross-process lock — so plain
+	// reads never take it.
 	openCodeUsageMu sync.Mutex
+	// openCodeUsageFileMu guards the file itself: readers share it, and a
+	// writer holds it only across its read-modify-rename, never while waiting
+	// on another process. It is not optional on Windows: Go opens files without
+	// FILE_SHARE_DELETE, so a rename over a ledger another goroutine has open
+	// for reading fails — an unguarded card read would fail this process's own
+	// commit.
+	openCodeUsageFileMu sync.RWMutex
 	// openCodeGenerationRotated reports a committed write carrying this
 	// process's epoch. Until then the ledger may hold a generation an earlier
 	// process published, so ParseContext omits UsageGeneration and the
@@ -155,8 +161,26 @@ func openCodeUsageCachePath() string {
 	return filepath.Join(GetConfigDir(), "opencode_usage.json")
 }
 
+// openCodeUsageWriteAttempts bounds the rename retries of one commit. A
+// rename can still collide with ANOTHER process reading the ledger (Windows,
+// see openCodeUsageFileMu); a read lasts microseconds, so a few short retries
+// clear it without holding anything for long.
+const (
+	openCodeUsageWriteAttempts = 3
+	openCodeUsageWriteBackoff  = 15 * time.Millisecond
+)
+
+// loadOpenCodeUsageLedger is readOpenCodeUsageLedger for callers outside a
+// transaction: it waits only for an in-flight rename, never for a writer that
+// is waiting on another process's lock.
+func loadOpenCodeUsageLedger() openCodeUsageLedger {
+	openCodeUsageFileMu.RLock()
+	defer openCodeUsageFileMu.RUnlock()
+	return readOpenCodeUsageLedger()
+}
+
 // readOpenCodeUsageLedger reads the ledger. A missing, unreadable, oversized
-// or other-schema file reads as empty.
+// or other-schema file reads as empty. Callers hold openCodeUsageFileMu.
 func readOpenCodeUsageLedger() openCodeUsageLedger {
 	var ledger openCodeUsageLedger
 	if !readBoundedJSONFile(openCodeUsageCachePath(), &ledger) || ledger.SchemaVersion != openCodeUsageSchemaVersion {
@@ -202,16 +226,24 @@ func openCodeUsageTransactionWithin(lockWait time.Duration, mutate func(ledger *
 		}
 		openCodeUsageMu.Unlock()
 	}
+	openCodeUsageFileMu.Lock()
 	ledger := readOpenCodeUsageLedger()
 	write, changed := mutate(&ledger)
 	if !write {
+		openCodeUsageFileMu.Unlock()
 		release()
 		return false, false, ledger.Generation
 	}
 	if changed {
 		openCodeBumpGeneration(&ledger)
 	}
-	committed = writeJSONFileAtomic(path, ledger)
+	for attempt := 1; attempt <= openCodeUsageWriteAttempts; attempt++ {
+		if committed = writeJSONFileAtomic(path, ledger); committed || attempt == openCodeUsageWriteAttempts {
+			break
+		}
+		time.Sleep(openCodeUsageWriteBackoff)
+	}
+	openCodeUsageFileMu.Unlock()
 	generation = ledger.Generation
 	release()
 	if !committed {
@@ -348,9 +380,9 @@ func capOpenCodeUsageBuckets(ledger *openCodeUsageLedger) {
 // now), and the ledger's generation.
 func openCodeUsageBucketForDay(fingerprint string, now time.Time) (openCodeUsageBucket, bool, cliUsageGeneration) {
 	today, _ := openCodeLocalDay(now)
-	// Lock-free (see openCodeUsageMu): the card's gather must not queue behind a
+	// Not under openCodeUsageMu: the card's gather must not queue behind a
 	// writer that is waiting on another agent process.
-	ledger := readOpenCodeUsageLedger()
+	ledger := loadOpenCodeUsageLedger()
 	for _, b := range ledger.Buckets {
 		if b.AccountFingerprint == fingerprint && b.LocalDate == today {
 			return b, true, ledger.Generation

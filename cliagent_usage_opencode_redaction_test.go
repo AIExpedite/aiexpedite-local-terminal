@@ -87,7 +87,7 @@ func TestOpenCodeUsageRedaction_NothingButCountsLeavesTheCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertNoOpenCodeCanary(t, "the ledger file", string(raw), true)
-	ledger := readOpenCodeUsageLedger()
+	ledger := loadOpenCodeUsageLedger()
 	for _, d := range ledger.Debts {
 		d.SessionID = ""
 		b, _ := json.Marshal(d)
