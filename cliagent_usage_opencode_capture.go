@@ -45,6 +45,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -387,12 +388,23 @@ func captureOpenCodeUsageLine(run *openCodeUsageRun, line string) {
 		return
 	}
 	line = strings.TrimSpace(line)
-	// Cheap pre-filter: only a frame naming a session or carrying tokens can
-	// matter, and most streamed lines are text deltas.
-	if !strings.HasPrefix(line, "{") || (!strings.Contains(line, "ession") && !strings.Contains(line, "tokens")) {
+	if !strings.HasPrefix(line, "{") {
+		return
+	}
+	// Cheap pre-filter, so the stream does not decode every text delta: once
+	// the session is known only a step frame carrying tokens can matter; until
+	// then, any frame naming a session.
+	run.mu.Lock()
+	knownSession := run.sessionID != ""
+	run.mu.Unlock()
+	isStep := strings.Contains(line, "tokens") && strings.Contains(line, "step")
+	if !isStep && (knownSession || !strings.Contains(line, "ession")) {
 		return
 	}
 	step, sessionID, ok := parseOpenCodeUsageFrame(line, time.Now())
+	if !isValidOpenCodeSessionID(sessionID) {
+		sessionID = ""
+	}
 	run.mu.Lock()
 	newSession := sessionID != "" && run.sessionID == ""
 	if newSession {
@@ -605,6 +617,17 @@ func openCodeUsageMillis(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	return int64(n), true
+}
+
+// openCodeSessionIDPattern is what an OpenCode session id may look like before
+// this file stores it or puts it on the export's argv (`ses_…` today): no
+// leading dash an option parser would read as a flag, and no character cmd.exe
+// treats as syntax when the binary is an npm `.cmd` shim. The id comes from the
+// child's own stdout, so anything else is dropped rather than trusted.
+var openCodeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+func isValidOpenCodeSessionID(id string) bool {
+	return openCodeSessionIDPattern.MatchString(id)
 }
 
 // openCodeUsageStepKey hashes a step's identity: sessionID NUL id, 16 hex chars.

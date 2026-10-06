@@ -132,6 +132,9 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 		return
 	}
 	steps, streamSession := run.takeUncommitted()
+	if !isValidOpenCodeSessionID(sessionID) {
+		sessionID = ""
+	}
 	sessionID = firstNonEmpty(streamSession, sessionID)
 	fingerprint := run.settleFingerprint()
 	now := openCodeUsageFreshnessNow()
@@ -336,6 +339,12 @@ func attemptOpenCodeUsageDebt(runID string) {
 	owedFor := now.Sub(time.UnixMilli(debt.OwedAtMs))
 	if owedFor > openCodeUsageDebtMaxAge {
 		retireOpenCodeUsageDebt(runID, "aged_out")
+		return
+	}
+	if !isValidOpenCodeSessionID(debt.SessionID) {
+		// A ledger edited (or written by a build without the check) never puts
+		// an unvetted id on argv.
+		retireOpenCodeUsageDebt(runID, "unattributable")
 		return
 	}
 	executable := resolveOpenCodeExecutable()

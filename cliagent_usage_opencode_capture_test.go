@@ -1,8 +1,8 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -253,19 +253,10 @@ func TestMergeOpenCodeUsageSteps_SeenStepsAreBounded(t *testing.T) {
 		t.Fatal("the newest key must survive the cap")
 	}
 	for _, k := range ledger.SeenSteps {
-		if len(k) != 16 || !isHexString(k) {
+		if _, err := hex.DecodeString(k); len(k) != 16 || err != nil {
 			t.Fatalf("seen key %q is not a 16-hex hash", k)
 		}
 	}
-}
-
-func isHexString(s string) bool {
-	for _, r := range s {
-		if !strings.ContainsRune("0123456789abcdef", r) {
-			return false
-		}
-	}
-	return true
 }
 
 func TestOpenCodeUsageTransaction_GenerationAdvancesOnlyOnABucketChange(t *testing.T) {

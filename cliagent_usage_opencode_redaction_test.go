@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func TestOpenCodeUsageRedaction_NothingButCountsLeavesTheCapture(t *testing.T) {
 		SeenSteps []string
 	}{ledger.Buckets, ledger.SeenSteps})
 	assertNoOpenCodeCanary(t, "the buckets and step keys", string(without), false)
-	if info, err := os.Stat(openCodeUsageCachePath()); err == nil && info.Mode().Perm()&0o077 != 0 && !isWindowsTest() {
+	if info, err := os.Stat(openCodeUsageCachePath()); err == nil && info.Mode().Perm()&0o077 != 0 && runtime.GOOS != "windows" {
 		t.Fatalf("ledger mode = %v, want owner-only", info.Mode().Perm())
 	}
 
@@ -115,5 +116,3 @@ func TestOpenCodeUsageRedaction_NothingButCountsLeavesTheCapture(t *testing.T) {
 		assertNoOpenCodeCanary(t, "the usage hint", string(body)+h.url, false)
 	}
 }
-
-func isWindowsTest() bool { return os.PathSeparator == '\\' }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -267,5 +269,43 @@ func TestOpenCodeUsage_AStepAfterTheTerminalEventStillCommits(t *testing.T) {
 	}
 	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("the run's debt was not retired: %+v", debts)
+	}
+}
+
+// The session id comes from the child's own stdout and ends up on the export's
+// argv — through cmd.exe when OpenCode is an npm shim. One shaped like a flag or
+// carrying shell syntax is never stored, so nothing is owed for it and nothing
+// is exported.
+func TestOpenCodeUsage_AHostileSessionIDNeverReachesTheExport(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1008)
+	stubOpenCodeExecutable(t)
+	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) { return nil, false })
+	for _, hostile := range []string{"--format", "ses_a&calc", `ses_b" | del`, "ses c", strings.Repeat("a", 200)} {
+		run := armOpenCodeUsageRun("opencode", "", "fp-a")
+		line, _ := json.Marshal(map[string]string{"type": "session.created", "sessionID": hostile})
+		captureOpenCodeUsageLine(run, string(line))
+		openCodeUsageInFlight.Wait()
+		settleOpenCodeUsageRun(run, hostile)
+	}
+	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want hostile ids dropped as unattributable", debts)
+	}
+	for sched.fireNext() {
+	}
+	if *calls != 0 {
+		t.Fatalf("export ran %d times for a hostile id", *calls)
+	}
+	// A ledger that already holds one (hand-edited, an older build) is retired
+	// at its attempt, never exported.
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.Debts = append(ledger.Debts, openCodeUsageDebt{RunID: "r", RunFloorMs: 1, SessionID: "-x", OwedAtMs: time.Now().UnixMilli()})
+		return true, false
+	})
+	attemptOpenCodeUsageDebt("r")
+	if *calls != 0 || len(readOpenCodeUsageLedger().Debts) != 0 {
+		t.Fatalf("a stored hostile id was exported (%d) or kept", *calls)
+	}
+	if !isValidOpenCodeSessionID("ses_01JXYZabc-9") {
+		t.Fatal("a real OpenCode id must stay valid")
 	}
 }
