@@ -15,8 +15,9 @@
 //     booked on the commit ladder, because the smoke and runOneShot have no later
 //     flush. A run with no step that spent anything but with a session id keeps
 //     the debt, OWED, written synchronously before an update hand-off can replace
-//     the process. With no session id nothing can be exported: the debt is
-//     dropped ("unattributable").
+//     the process; that write is booked on the same commit ladder when refused,
+//     because nothing else revisits a settled run. With no session id nothing can
+//     be exported: the debt is dropped ("unattributable").
 //   - Ladder: attempts at 15 s, 1 m and 5 m, each one `opencode export <id>`
 //     with a 5 s timeout. A refusal that spent nothing (offline, binary
 //     missing) books refreshFreeRetryDelay without consuming an attempt. A
@@ -148,7 +149,6 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	}
 	sessionID = firstNonEmpty(streamSession, sessionID)
 	fingerprint := run.settleFingerprint()
-	now := openCodeUsageFreshnessNow()
 
 	if openCodeUsageStepsCarryUsage(steps) {
 		if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
@@ -169,6 +169,19 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 		logOpenCodeUsageCapture("unattributable")
 		return
 	}
+	if !oweOpenCodeUsageRun(run, sessionID, fingerprint) {
+		// Same reason the commit branch books a retry: the run is settled, so no
+		// later path revisits this transition. Without a booking a refused owed
+		// write leaves the export unasked until some future process adopts the
+		// ARMED debt — and if the arm was refused too, there is nothing to adopt.
+		scheduleOpenCodeUsageOwe(run, sessionID, fingerprint, 1)
+	}
+}
+
+// oweOpenCodeUsageRun marks the run's debt OWED and books its first export
+// attempt, reporting whether the write landed.
+func oweOpenCodeUsageRun(run *openCodeUsageRun, sessionID, fingerprint string) bool {
+	now := openCodeUsageFreshnessNow()
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		debt := openCodeUsageDebtByID(ledger, run.id)
 		if debt == nil {
@@ -186,10 +199,41 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 		return true, false
 	})
 	if !committed {
-		return
+		return false
 	}
 	logOpenCodeUsageCapture("owed")
 	scheduleOpenCodeUsageAttempt(run.id, openCodeUsageDebtLadder[0])
+	return true
+}
+
+// scheduleOpenCodeUsageOwe books another attempt at the OWED transition on the
+// commit ladder — a refused local read-modify-rename, same as a refused commit.
+// Once the budget is spent the run is dropped: its ARMED debt (if the arm
+// landed) stays in the ledger for the next process to adopt.
+func scheduleOpenCodeUsageOwe(run *openCodeUsageRun, sessionID, fingerprint string, attempt int) {
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		logOpenCodeUsageCapture("owe_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("owe_retry")
+	openCodeUsageTimersMu.Lock()
+	defer openCodeUsageTimersMu.Unlock()
+	if t := openCodeUsageTimers[run.id]; t != nil {
+		t.Stop()
+	}
+	openCodeUsageTimers[run.id] = openCodeUsageAfterFunc(delay, func() {
+		if steps, _ := run.snapshot(); openCodeUsageStepsCarryUsage(steps) {
+			// A late step landed after settle and paid the turn; flush owns it.
+			clearOpenCodeUsageTimer(run.id)
+			flushOpenCodeUsageRun(run)
+			return
+		}
+		if oweOpenCodeUsageRun(run, sessionID, fingerprint) {
+			return
+		}
+		scheduleOpenCodeUsageOwe(run, sessionID, fingerprint, attempt+1)
+	})
 }
 
 // flushOpenCodeUsageRun commits steps a settled run captured after its settle

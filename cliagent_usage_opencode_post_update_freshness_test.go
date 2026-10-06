@@ -472,3 +472,41 @@ func TestOpenCodeUsage_ACommitRetriesPastAnotherProcesssBriefRead(t *testing.T) 
 		t.Fatal("the commit failed past a brief foreign read; the rename must be retried")
 	}
 }
+
+// The owed transition has no later flush either: a run that spent nothing but
+// named a session must still reach the export ladder. When the ledger refuses
+// that write — and the arm's too, so there is no armed debt for a later process
+// to adopt — the transition is booked on the commit ladder and retried.
+func TestOpenCodeUsage_ARefusedOwedWriteIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1114)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+
+	release := holdOpenCodeLedgerLock(t)
+	run := armOpenCodeUsageRun("opencode", "", "fp-a") // refused: no armed debt
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_owed"}`)
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRun(run, "")
+
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want none while the lock is held", debts)
+	}
+	if d := sched.delays(); len(d) != 1 || d[0] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head", d)
+	}
+	sched.fireNext() // still held
+	if d := sched.delays(); len(d) != 2 || d[1] != openCodeUsageCommitLadder[1] {
+		t.Fatalf("booked %v, want the second commit rung", d)
+	}
+
+	release()
+	sched.fireNext()
+	debts := loadOpenCodeUsageLedger().Debts
+	if len(debts) != 1 || !debts[0].owed() || debts[0].SessionID != "ses_owed" {
+		t.Fatalf("debts = %+v, want one owed debt the retry wrote", debts)
+	}
+	if d := sched.delays(); len(d) != 3 || d[2] != openCodeUsageDebtLadder[0] {
+		t.Fatalf("booked %v, want the export ladder's head once the debt landed", d)
+	}
+}
