@@ -253,3 +253,61 @@ func TestOpenCodeParsePublishesTheModelList(t *testing.T) {
 		t.Fatalf("account %q still carries terminal decoration", usage.Account)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Usage rows (cliagent_usage_opencode_capture.go)
+   -------------------------------------------------------------------------- */
+
+func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
+	prev := openCodeUsageLocation
+	openCodeUsageLocation = time.UTC
+	t.Cleanup(func() { openCodeUsageLocation = prev })
+	now := time.Date(2026, 10, 6, 15, 4, 0, 0, time.UTC)
+	observed := now.Add(-time.Hour)
+	bucket := openCodeUsageBucket{
+		InputTokens: 1000, OutputTokens: 200, ReasoningTokens: 30,
+		CacheReadTokens: 900000, CacheWriteTokens: 5000,
+		CostUsd: 0.4567, ObservedAtMs: observed.UnixMilli(),
+	}
+
+	rows := openCodeUsageMetrics(bucket, true, now)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want tokens and cost", rows)
+	}
+	tokens, cost := rows[0], rows[1]
+	if tokens.Label != "Tokens today (agent runs)" || tokens.Unit != "tokens" || tokens.Kind != limitKindDaily {
+		t.Fatalf("tokens row = %+v", tokens)
+	}
+	// Cache tokens are kept in the ledger, never published in the total.
+	if *tokens.Consumed != 1230 {
+		t.Fatalf("tokens consumed = %v, want input+output+reasoning (1230)", *tokens.Consumed)
+	}
+	if cost.Label != "Cost today" || cost.Unit != "usd" || *cost.Consumed != 0.4567 {
+		t.Fatalf("cost row = %+v", cost)
+	}
+	for _, row := range rows {
+		if row.Total != nil || row.Remaining != nil || row.Unknown {
+			t.Fatalf("row %q carries a total/remaining/unknown: %+v", row.Label, row)
+		}
+		if row.ObservedAt != observed.Format(time.RFC3339) {
+			t.Fatalf("observedAt = %q, want the newest step %q", row.ObservedAt, observed.Format(time.RFC3339))
+		}
+		if row.ResetAt != "2026-10-07T00:00:00Z" {
+			t.Fatalf("resetAt = %q, want the next local midnight", row.ResetAt)
+		}
+	}
+}
+
+func TestOpenCodeUsageMetrics_NoCostRowAtZeroAndNoRowsWithoutABucket(t *testing.T) {
+	now := time.Now()
+	unmetered := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 10, ObservedAtMs: now.UnixMilli()}, true, now)
+	if len(unmetered) != 1 || unmetered[0].Label != "Tokens today (agent runs)" {
+		t.Fatalf("rows = %+v, want tokens only: $0.00 would read as free, not unmetered", unmetered)
+	}
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{}, false, now); rows != nil {
+		t.Fatalf("no bucket produced %+v, want no rows (no placeholders)", rows)
+	}
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, now); rows != nil {
+		t.Fatalf("an empty bucket produced %+v", rows)
+	}
+}

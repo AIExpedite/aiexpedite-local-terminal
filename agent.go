@@ -198,6 +198,12 @@ func StartAgent(cfg *Config) {
 	// isOffline is published above, so the attempt honours offline mode.
 	SetGrokUsageRefreshEnabled(true)
 	payOwedGrokUsageRefresh()
+	// And for OpenCode: a turn whose stream reported no usage — or that a
+	// restart or self-update cut off after it named its session — left a debt
+	// in opencode_usage.json; re-arm its bounded export ladder
+	// (cliagent_usage_opencode_freshness.go). After isOffline is published
+	// above, so the attempts honour offline mode.
+	payOwedOpenCodeUsage()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

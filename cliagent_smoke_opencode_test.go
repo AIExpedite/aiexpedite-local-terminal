@@ -996,3 +996,80 @@ func TestPruneOpenCodeSmokeScratch_NeverFollowsASymlink(t *testing.T) {
 		t.Errorf("the link itself was removed; a reparse point must be left alone: %v", err)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Usage capture
+   -------------------------------------------------------------------------- */
+
+// A smoke turn's step_finish frames are folded into the usage ledger before the
+// stdout is discarded (cliagent_usage_opencode_freshness.go): a success with
+// tokens commits a bucket and advances the generation, a success with none
+// owes an export written before the smoke returns, and a failure with no
+// completed step owes nothing — while a failed turn's completed steps still
+// count, because those tokens were spent.
+func TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration(t *testing.T) {
+	openCodeSmokeEnv(t)
+	openCodeUsageFixture(t, 1401)
+	path := stubOpenCodeBinary(t)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+		frames := string(openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)))
+		return []byte(frames + openCodeStepFinish("ses_probe", "prt_s", 80, 8, 0, "0", time.Now().UnixMilli()) + "\n"), nil, nil
+	})
+	if result := runOpenCodeSmoke(context.Background(), path, "1.2.0"); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v", result)
+	}
+	b, ok, g := openCodeUsageBucketForDay(openCodeAccountFingerprintFor([]string{"anthropic"}), time.Now())
+	if !ok || b.tokens() != 88 || g != (cliUsageGeneration{Epoch: 1401, Counter: 1}) {
+		t.Fatalf("bucket = %+v generation = %+v, want 88 tokens at {1401,1}", b, g)
+	}
+	if debts := readOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v after a captured smoke", debts)
+	}
+}
+
+func TestRunOpenCodeSmoke_CapturesUsageOrOwesIt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stdout    func(marker string) string
+		fail      bool
+		wantDebt  bool
+		wantToken int64
+	}{
+		{"success with no usage frames owes", func(m string) string { return string(openCodeSuccessFrames(m)) }, false, true, 0},
+		{"failure with no step owes nothing", func(string) string { return `{"type":"session.started","sessionID":"ses_probe"}` + "\n" }, true, false, 0},
+		{"failure with a completed step still commits", func(string) string {
+			return openCodeStepFinish("ses_probe", "prt_f", 50, 5, 0, "0", time.Now().UnixMilli()) + "\n"
+		}, true, false, 55},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeSmokeEnv(t)
+			openCodeUsageFixture(t, 1006)
+			path := stubOpenCodeBinary(t)
+			stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+			stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+				out := tc.stdout(openCodeMarkerFromLaunch(t, launch))
+				if tc.fail {
+					return []byte(out), []byte("boom"), openCodeExitError(t)
+				}
+				return []byte(out), nil, nil
+			})
+			result := runOpenCodeSmoke(context.Background(), path, "1.2.0")
+			if (result.Status == cliSmokeStatusSuccess) == tc.fail {
+				t.Fatalf("smoke status = %s", result.Status)
+			}
+			debts := readOpenCodeUsageLedger().Debts
+			if tc.wantDebt != (len(debts) == 1 && debts[0].owed()) {
+				t.Fatalf("debts = %+v, want owed=%v", debts, tc.wantDebt)
+			}
+			if !tc.wantDebt && len(debts) != 0 {
+				t.Fatalf("debts = %+v, want none", debts)
+			}
+			fp := openCodeAccountFingerprintFor([]string{"anthropic"})
+			b, _, _ := openCodeUsageBucketForDay(fp, time.Now())
+			if b.tokens() != tc.wantToken {
+				t.Fatalf("tokens = %d, want %d", b.tokens(), tc.wantToken)
+			}
+		})
+	}
+}

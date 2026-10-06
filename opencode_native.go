@@ -690,11 +690,17 @@ func (m *OpenCodeNativeManager) runOneShot(
 		return openCodeRunResult{err: fmt.Errorf("session ended during turn")}
 	}
 
+	// The turn's spend is owed from the spawn (cliagent_usage_opencode_freshness.go):
+	// its step_finish frames are captured while streaming and committed once
+	// the child is reaped, or an export is owed for a turn that reported none.
+	usageRun := armOpenCodeUsageRunForExecutable(executable, runDir)
+
 	// opencode already leads its own group (Setsid above). Recorded in the
 	// spawn ledger for this turn only (session_ledger.go).
 	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
 		abortSessionSpawn(session.ID)
+		disarmOpenCodeUsageRun(usageRun)
 		return openCodeRunResult{
 			err: fmt.Errorf("failed to start opencode (is OpenCode installed?): %w", err),
 		}
@@ -736,7 +742,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stream = m.streamOpenCodeEvents(session, stdout, publishFn)
+		stream = m.streamOpenCodeEvents(session, stdout, publishFn, usageRun)
 	}()
 	go func() {
 		defer wg.Done()
@@ -744,8 +750,13 @@ func (m *OpenCodeNativeManager) runOneShot(
 	}()
 	wg.Wait()
 
+	waitErr := cmd.Wait()
+	// Settled once the child is reaped, whatever its exit: a failed turn still
+	// spent what its steps reported. A resumed turn's id stands in when no
+	// frame named one.
+	settleOpenCodeUsageRun(usageRun, firstNonEmpty(stream.sessionID, nativeID))
 	exitCode := 0
-	if waitErr := cmd.Wait(); waitErr != nil {
+	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
@@ -797,6 +808,7 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 	session *OpenCodeNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
+	usage *openCodeUsageRun,
 ) openCodeStreamState {
 	var state openCodeStreamState
 	scanner := bufio.NewScanner(r)
@@ -824,6 +836,8 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 				state.sessionID = sid
 			}
 		}
+		// Memory only: the run commits once the child is reaped.
+		captureOpenCodeUsageLine(usage, line)
 		m.publishEventFrame(session, publishFn, line)
 	}
 	if err := scanner.Err(); err != nil {

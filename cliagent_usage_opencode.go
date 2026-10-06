@@ -35,9 +35,21 @@
 // and re-adding the computer". These probes use a short TIME-based TTL instead,
 // and a user-initiated __cli_usage_refresh__ bypasses it by design.
 //
+// # USAGE: THE DEVICE-LOCAL LEDGER
+//
+// OpenCode has no quota window of its own — it delegates quota to whichever
+// provider is underneath — but every turn reports its spend on its step_finish
+// frames. The turns this agent spawns (the smoke, the resident chat, terminal
+// sessions) fold that into opencode_usage.json
+// (cliagent_usage_opencode_capture.go), and the card publishes today's bucket
+// for this install's account: "Tokens today (agent runs)" and, when above zero,
+// "Cost today", each with the newest step as observedAt and the next local
+// midnight as resetAt. An opencode the user runs in their own shell is not
+// counted, so the row is a floor — its label says so.
+//
 // SECRETS: this parser reads provider NAMES and model IDS only. It never reads,
-// logs, or forwards a token value from auth.json. There are no quota metrics —
-// OpenCode delegates quota to whichever provider is underneath.
+// logs, or forwards a token value from auth.json. The ledger holds counts and
+// hashed step keys; nothing it publishes names a session, prompt or account.
 package main
 
 import (
@@ -190,10 +202,18 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	usage.LoginExpirationState = loginExpirationNotReported
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
-	// No metrics: OpenCode delegates quota to the underlying provider and
-	// exposes none of its own. The placeholder rows the other parsers emit
-	// ("limits exist, values unobservable") would be a lie here — there is no
-	// OpenCode-level limit window to observe.
+	// Today's spend from the usage ledger. No bucket means no rows: there is no
+	// OpenCode-level limit window, so the "limits exist, values unobservable"
+	// placeholders the other parsers emit would be a lie here.
+	bucket, ok, generation := openCodeUsageBucketForDay(usage.AccountFingerprint, now)
+	usage.Metrics = openCodeUsageMetrics(bucket, ok, now)
+	// Only a generation this process committed: until then the ledger may hold
+	// one an earlier process published, which the backend may already have
+	// applied (see openCodeGenerationRotated).
+	if openCodeGenerationRotated.Load() && generation.Epoch == codexProcessGenerationEpoch.Load() && generation.Counter > 0 {
+		g := generation
+		usage.UsageGeneration = &g
+	}
 	return usage, true
 }
 
@@ -404,7 +424,8 @@ func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bo
 	} else {
 		dir = ""
 	}
-	return openCodeSmokeLoggedInDir(ctx, path, dir)
+	loggedIn, known, _ = openCodeSmokeLoggedInDir(ctx, path, dir)
+	return loggedIn, known
 }
 
 // openCodeSmokeLoggedInDir is openCodeSmokeLoggedIn with the caller's isolated
@@ -413,9 +434,13 @@ func openCodeSmokeLoggedIn(ctx context.Context, path string) (loggedIn, known bo
 // so probing elsewhere lets a provider that is configured only in the agent's own
 // project pass the pre-check and then fail the turn — and lets a project override
 // report a premature not_logged_in.
-func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool) {
+//
+// providers are the names the same probe listed, so the smoke can key its
+// usage to the account the card publishes without a second probe; nil when it
+// could not ask.
+func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, known bool, providers []string) {
 	if strings.TrimSpace(path) == "" {
-		return false, false
+		return false, false, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -427,12 +452,12 @@ func openCodeSmokeLoggedInDir(ctx context.Context, path, dir string) (loggedIn, 
 	readiness := probeOpenCodeReadinessUncached(ctx, path, home, dir)
 	switch {
 	case readiness.AuthState == openCodeAuthUnauthenticated && readiness.Conclusive:
-		return false, true
+		return false, true, nil
 	case readiness.AuthState == openCodeAuthReady:
-		return true, true
+		return true, true, readiness.Providers
 	}
 	// Inconclusive (timeout, unrecognized output, non-zero exit): proceed.
-	return false, false
+	return false, false, nil
 }
 
 // parseOpenCodeModelList extracts model identifiers from `opencode models`.
@@ -735,6 +760,12 @@ func openCodeProvidersFromModelIDs(ids []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// joinOpenCodeProviders is the snapshot's Account: the provider names, joined.
+// The usage ledger keys its buckets by the same string's fingerprint.
+func joinOpenCodeProviders(providers []string) string {
+	return strings.Join(providers, ", ")
 }
 
 // openCodeSingleModel returns the model id when exactly one is available — the

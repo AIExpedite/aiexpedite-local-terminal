@@ -355,7 +355,8 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	// complete. Anything inconclusive proceeds — that is what a working
 	// local-model or env-credential install looks like (see
 	// cliagent_usage_opencode.go's fail-open design).
-	if loggedIn, known := openCodeSmokeLoggedInDir(ctx, path, runDir); known && !loggedIn {
+	loggedIn, known, providers := openCodeSmokeLoggedInDir(ctx, path, runDir)
+	if known && !loggedIn {
 		return finish(cliUsageErrorNotAuthenticated, cliSmokeDiagnosticNotLoggedIn)
 	}
 
@@ -380,6 +381,15 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	shape := openCodeRunShapeNoSession
 	result.ArgvShapeID = shape.ID
 
+	// The turn's spend is owed from here (cliagent_usage_opencode_freshness.go),
+	// keyed to the account the pre-check just listed — no second probe. A
+	// pre-check that could not ask falls back to what the card last published.
+	usageFingerprint := openCodeAccountFingerprintFor(providers)
+	if len(providers) == 0 {
+		usageFingerprint = openCodeKnownAccountFingerprint(path)
+	}
+	usageRun := armOpenCodeUsageRun(path, runDir, usageFingerprint)
+
 	runCtx, cancel := context.WithTimeout(ctx, openCodeSmokeTimeout)
 	stdout, stderr, runErr := runOpenCodeSmokeCommand(runCtx, openCodeLaunch{
 		Path:       path,
@@ -399,6 +409,11 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	cancel()
 
 	category, diagnostic, matched := classifyOpenCodeSmokeRun(timedOut, stdout, stderr, runErr, marker)
+	// Fold the frames' usage in before the bytes are discarded. A success with
+	// no usage frames owes an export; a failure with no completed step owes
+	// nothing.
+	captureOpenCodeUsageStream(stdout, usageRun)
+	settleOrDisarmOpenCodeSmokeRun(usageRun, category == "")
 	if category == "" {
 		result.Status = cliSmokeStatusSuccess
 		result.MarkerMatched = matched
