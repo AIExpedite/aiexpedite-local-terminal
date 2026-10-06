@@ -84,7 +84,10 @@ func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun 
 		executable:  executable,
 		dir:         dir,
 	}
-	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+	// Tried once, never waited on: a session arms under the session manager's
+	// lock, and the armed debt is only a crash marker — a run whose arm was
+	// refused still settles (and owes) normally.
+	openCodeUsageTransactionWithin(0, func(ledger *openCodeUsageLedger) (bool, bool) {
 		ledger.Debts = append(ledger.Debts, openCodeUsageDebt{
 			RunID:              run.id,
 			RunFloorMs:         run.floorMs,
@@ -141,7 +144,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 
 	if len(steps) > 0 {
 		if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
-			run.untake(from)
+			run.untake(from, len(steps))
 		}
 		return
 	}
@@ -181,7 +184,7 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 		return
 	}
 	if steps, _, from := run.takeUncommitted(); len(steps) > 0 && !commitOpenCodeUsageSteps(run, run.settleFingerprint(), steps) {
-		run.untake(from)
+		run.untake(from, len(steps))
 	}
 }
 
@@ -365,18 +368,28 @@ func attemptOpenCodeUsageDebt(runID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), openCodeExportTimeout)
 	steps, ok := readOpenCodeExportUsage(ctx, executable, debt)
 	cancel()
+	// gone: the debt was paid or retired meanwhile. A write refused for any
+	// other reason (another process holding the ledger) spent nothing durable,
+	// so it is retried rather than leaving the debt with no attempt booked.
+	gone := false
 	if ok && len(steps) > 0 {
 		committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 			if openCodeUsageDebtByID(ledger, runID) == nil {
-				return false, false // paid or retired meanwhile
+				gone = true
+				return false, false
 			}
 			removeOpenCodeUsageDebt(ledger, runID)
 			return true, mergeOpenCodeUsageSteps(ledger, debt.AccountFingerprint, steps)
 		})
 		noteOpenCodeUsageAdvanced(committed, changed, generation)
-		if committed {
+		switch {
+		case committed:
 			clearOpenCodeUsageTimer(runID)
 			logOpenCodeUsageCapture("export_paid")
+		case gone:
+			clearOpenCodeUsageTimer(runID)
+		default:
+			scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
 		}
 		return
 	}
@@ -387,13 +400,19 @@ func attemptOpenCodeUsageDebt(runID string) {
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		d := openCodeUsageDebtByID(ledger, runID)
 		if d == nil {
+			gone = true
 			return false, false
 		}
 		d.Attempts = attempts
 		return true, false
 	})
-	if !committed {
+	if gone {
 		clearOpenCodeUsageTimer(runID)
+		return
+	}
+	if !committed {
+		// The attempt is not on disk, so it is not spent: try again later.
+		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
 		return
 	}
 	// The ladder is indexed by attempts already MADE: the head (15 s) was the
@@ -430,8 +449,9 @@ func adoptOwedOpenCodeUsage(startedAt time.Time) {
 	now := openCodeUsageFreshnessNow()
 	var owed []openCodeUsageDebt
 	var dropped, aged int
-	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-		write := false
+	ran, write := false, false
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ran = true
 		kept := ledger.Debts[:0]
 		for _, d := range ledger.Debts {
 			switch {
@@ -456,6 +476,16 @@ func adoptOwedOpenCodeUsage(startedAt time.Time) {
 		ledger.Debts = kept
 		return write, false
 	})
+	if !ran || (write && !committed) {
+		// Another process held the ledger (the one this update replaces, still
+		// exiting), or the write failed: none of this is on disk, so adopt again
+		// once it is free rather than leave the debts with nothing booked.
+		logOpenCodeUsageCapture("adopt_retry")
+		openCodeUsageTimersMu.Lock()
+		openCodeUsageAfterFunc(openCodeUsageFreeFloor, func() { adoptOwedOpenCodeUsage(startedAt) })
+		openCodeUsageTimersMu.Unlock()
+		return
+	}
 	for range dropped {
 		logOpenCodeUsageCapture("unattributable")
 	}

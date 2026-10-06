@@ -176,9 +176,17 @@ func readOpenCodeUsageLedger() openCodeUsageLedger {
 // rather than overwrite a competitor's, and a filesystem that offers no lock
 // at all degrades to the in-process mutex alone.
 func openCodeUsageTransaction(mutate func(ledger *openCodeUsageLedger) (write, changed bool)) (committed, changed bool, generation cliUsageGeneration) {
+	return openCodeUsageTransactionWithin(openCodeUsageLockWait, mutate)
+}
+
+// openCodeUsageTransactionWithin is openCodeUsageTransaction waiting at most
+// lockWait for the cross-process lock; 0 tries once. For a write made while a
+// caller holds a lock of its own (the session manager's, across a spawn), where
+// waiting on another process would stall every other session.
+func openCodeUsageTransactionWithin(lockWait time.Duration, mutate func(ledger *openCodeUsageLedger) (write, changed bool)) (committed, changed bool, generation cliUsageGeneration) {
 	openCodeUsageMu.Lock()
 	path := openCodeUsageCachePath()
-	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(openCodeUsageLockWait))
+	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(lockWait))
 	if outcome == crossProcessLockContended {
 		openCodeUsageMu.Unlock()
 		logOpenCodeUsageCapture("lock_contended")
@@ -491,12 +499,13 @@ func (run *openCodeUsageRun) takeUncommitted() (steps []openCodeUsageStep, sessi
 	return steps, run.sessionID, from
 }
 
-// untake hands steps taken from `from` back, so a write the ledger refused
-// (another agent process holding it, a failed rename) is retried by the run's
-// next flush instead of lost.
-func (run *openCodeUsageRun) untake(from int) {
+// untake hands back the n steps taken from `from`, so a write the ledger
+// refused (another agent process holding it, a failed rename) is retried by the
+// run's next flush instead of lost. Only when nothing was taken since: steps a
+// later take already handed on must not be offered twice.
+func (run *openCodeUsageRun) untake(from, n int) {
 	run.mu.Lock()
-	if from < run.committed {
+	if run.committed == from+n {
 		run.committed = from
 	}
 	run.mu.Unlock()
