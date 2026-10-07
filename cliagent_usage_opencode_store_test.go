@@ -1212,3 +1212,78 @@ func TestOpenCodeReconcile_KeepsEqualTimestampSessionsBeyondTheCursor(t *testing
 		t.Fatal("a tied session already committed must not be exported again")
 	}
 }
+
+func TestOpenCodeReconcile_ARetryNeverCarriesTheCursorPastUnexportedFreshRows(t *testing.T) {
+	// A remembered over-cap session was rewritten and is now NEWER than three
+	// pending fresh rows. Exporting the retry first would move the cursor to its
+	// stamp, and the two fresh rows that did not fit would fall behind it and
+	// never be planned again — a silent loss, despite `more`.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeRememberSkippedSession(l, "ses_retry", created)
+		return openCodeLedgerEdit{Changed: true}
+	})
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(
+			openCodeSessionRow{"ses_retry", created + 900},
+			openCodeSessionRow{"ses_f1", created + 100},
+			openCodeSessionRow{"ses_f2", created + 200},
+			openCodeSessionRow{"ses_f3", created + 300},
+		),
+		exports: map[string]string{
+			"ses_retry": exportWith("ses_retry", "msg_retry", created, 1, 0, "0"),
+			"ses_f1":    exportWith("ses_f1", "msg_f1", created, 2, 0, "0"),
+			"ses_f2":    exportWith("ses_f2", "msg_f2", created, 4, 0, "0"),
+			"ses_f3":    exportWith("ses_f3", "msg_f3", created, 8, 0, "0"),
+		},
+	}).install(t)
+
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileMore {
+		t.Fatalf("first outcome = %q, want more", first.Outcome)
+	}
+	// Oldest-first across BOTH queues: the retry is the newest candidate, so it
+	// takes no slot this pass and the cursor stops at the last fresh row read.
+	if cursor := readOpenCodeUsageLedger().ReconcileCursorMs; cursor != created+300 {
+		t.Fatalf("cursor = %d, want %d — the newest row this pass exported", cursor, created+300)
+	}
+	if second := reconcileOpenCodeUsageOnce(context.Background(), now); second.Outcome != openCodeReconcileOK {
+		t.Fatalf("second outcome = %q, want ok", second.Outcome)
+	}
+	if tokens, _, rows := todayTotals(t, now); tokens != 15 || rows != 4 {
+		t.Fatalf("tokens=%d rows=%d, want every listed session counted", tokens, rows)
+	}
+	if skipped := readOpenCodeUsageLedger().Skipped; len(skipped) != 0 {
+		t.Fatalf("skipped = %+v, want the retry's entry removed once it exported", skipped)
+	}
+	if got := stub.recorded(); len(got) != 6 {
+		t.Fatalf("calls = %v, want four exports over two passes", got)
+	}
+}
+
+func TestOpenCodeReconcile_ARefusedSuccessStampFailsThePass(t *testing.T) {
+	// For an empty store the success stamp is the ONLY state that makes the
+	// zero row publishable, so a success whose stamp never reached disk must
+	// not pay the debt.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{sessions: sessionList()}).install(t)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(blocker, "opencode_usage.json"))
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome != openCodeReconcileWriteError {
+		t.Fatalf("outcome = %q, want write_error for a refused success stamp", result.Outcome)
+	}
+	if openCodeReconcileSucceeded(result.Outcome) {
+		t.Fatal("write_error must not count as a success")
+	}
+	if stamp := readOpenCodeUsageLedger().LastSuccessfulReconcileAtMs; stamp != 0 {
+		t.Fatalf("success stamp = %d, want none on disk", stamp)
+	}
+}

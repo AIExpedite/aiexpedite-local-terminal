@@ -72,18 +72,33 @@ func stubOpenCodeSmokePath(t *testing.T, path string) {
 
 // stubOpenCodeSmokeExec replaces the exec seam with a scripted responder,
 // records every launch, and returns pointers to the call count and the launches.
+// The scripted child always reached Start; stubOpenCodeSmokeExecUnstarted is
+// the pre-spawn variant.
 func stubOpenCodeSmokeExec(t *testing.T, fn func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, err error)) (*int, *[]openCodeLaunch) {
+	t.Helper()
+	return stubOpenCodeSmokeExecStarted(t, true, fn)
+}
+
+// stubOpenCodeSmokeExecUnstarted scripts a seam that failed BEFORE Start, the
+// way a missing binary or a refused prompt handle does.
+func stubOpenCodeSmokeExecUnstarted(t *testing.T, fn func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, err error)) (*int, *[]openCodeLaunch) {
+	t.Helper()
+	return stubOpenCodeSmokeExecStarted(t, false, fn)
+}
+
+func stubOpenCodeSmokeExecStarted(t *testing.T, started bool, fn func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, err error)) (*int, *[]openCodeLaunch) {
 	t.Helper()
 	var mu sync.Mutex
 	calls := 0
 	var launches []openCodeLaunch
 	original := runOpenCodeSmokeCommand
-	runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+	runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) ([]byte, []byte, bool, error) {
 		mu.Lock()
 		calls++
 		launches = append(launches, launch)
 		mu.Unlock()
-		return fn(ctx, launch)
+		stdout, stderr, err := fn(ctx, launch)
+		return stdout, stderr, started, err
 	}
 	t.Cleanup(func() { runOpenCodeSmokeCommand = original })
 	return &calls, &launches
@@ -994,5 +1009,49 @@ func TestPruneOpenCodeSmokeScratch_NeverFollowsASymlink(t *testing.T) {
 	}
 	if _, err := os.Lstat(link); err != nil {
 		t.Errorf("the link itself was removed; a reparse point must be left alone: %v", err)
+	}
+}
+
+// A pre-spawn failure is not a run: nothing inferred, so there is nothing for a
+// reconcile to find. Settling it as an UNCOVERED run would open a debt that
+// retries OpenCode commands against the launch failure and can end by marking
+// today's totals a lower bound.
+func TestRunOpenCodeSmoke_APreSpawnFailureWithdrawsTheUsageCapture(t *testing.T) {
+	openCodeSmokeEnv(t)
+	openCodeUsageFixture(t, time.Now())
+	path := stubOpenCodeBinary(t)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4", false)
+
+	for _, tc := range []struct {
+		name    string
+		spawned bool
+		wantOwe bool
+	}{
+		{name: "the child never started", spawned: false, wantOwe: false},
+		{name: "the child started and was killed", spawned: true, wantOwe: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetCLISmokeState()
+			resetOpenCodeUsageLedgerForTests()
+			stub := stubOpenCodeSmokeExecStarted
+			calls, _ := stub(t, tc.spawned, func(context.Context, openCodeLaunch) ([]byte, []byte, error) {
+				return nil, nil, errOpenCodeShimUnrenderable
+			})
+			result := runOpenCodeSmoke(context.Background(), path, "0.9.1")
+			if result.Diagnostic != cliSmokeDiagnosticLaunchError {
+				t.Fatalf("diagnostic = %q, want launch_error", result.Diagnostic)
+			}
+			if *calls != 1 {
+				t.Fatalf("seam calls = %d, want 1", *calls)
+			}
+			openCodeUsageRefreshWaitFor(5 * time.Second)
+			state := readOpenCodeUsageFreshness()
+			if got := state.owed(); got != tc.wantOwe {
+				t.Fatalf("owed = %t, want %t (state %+v)", got, tc.wantOwe, state)
+			}
+			if !tc.spawned && state.RunFloorMs != 0 {
+				t.Fatalf("run floor = %d, want the armed floor withdrawn", state.RunFloorMs)
+			}
+		})
 	}
 }

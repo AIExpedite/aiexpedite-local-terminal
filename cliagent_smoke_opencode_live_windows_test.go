@@ -204,6 +204,13 @@ func openCodeLiveFileSink(dir string) openCodeLiveCapture {
 	}
 }
 
+// openCodeLiveDefaultCapture adapts the production seam to the gate's capture
+// shape, dropping the `started` flag the gate does not record.
+func openCodeLiveDefaultCapture(ctx context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+	stdout, stderr, _, err := runOpenCodeSmokeCommand(ctx, launch)
+	return stdout, stderr, err
+}
+
 // runOpenCodeLiveSmokeMode runs the real probe with its exec seam routed
 // through capture, recording what the child produced.
 func runOpenCodeLiveSmokeMode(t *testing.T, mode, bin, version string, capture openCodeLiveCapture) openCodeLiveRow {
@@ -211,9 +218,10 @@ func runOpenCodeLiveSmokeMode(t *testing.T, mode, bin, version string, capture o
 	var stdout, stderr []byte
 	var runErr error
 	original := runOpenCodeSmokeCommand
-	runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+	runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) ([]byte, []byte, bool, error) {
 		stdout, stderr, runErr = capture(ctx, launch)
-		return stdout, stderr, runErr
+		// The gate's captures all spawn the real child, so the run started.
+		return stdout, stderr, true, runErr
 	}
 	defer func() { runOpenCodeSmokeCommand = original }()
 	result := runOpenCodeSmoke(context.Background(), bin, version)
@@ -240,7 +248,7 @@ func runOpenCodeLiveOneShot(t *testing.T, bin string, extraArgs []string, prompt
 	runDir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), openCodeSmokeTimeout)
 	defer cancel()
-	stdout, stderr, runErr = runOpenCodeSmokeCommand(ctx, openCodeLaunch{
+	stdout, stderr, _, runErr = runOpenCodeSmokeCommand(ctx, openCodeLaunch{
 		Path:        bin,
 		Args:        append(buildOpenCodeRunArgs(openCodeRunShapeNoSession, ""), extraArgs...),
 		Env:         env,
@@ -284,7 +292,7 @@ func TestOpenCodeLiveGate_RecordsTheRootCauseOutcomeTable(t *testing.T) {
 	}
 	t.Logf("gate version=%s shim=%t", version, isWindowsShimPath(bin))
 
-	defaultRow := runOpenCodeLiveSmokeMode(t, "default-pipe", bin, version, runOpenCodeSmokeCommand)
+	defaultRow := runOpenCodeLiveSmokeMode(t, "default-pipe", bin, version, openCodeLiveDefaultCapture)
 	pipeRow := runOpenCodeLiveSmokeMode(t, "pipe-1MiB", bin, version, openCodeLiveLargePipe)
 	fileRow := runOpenCodeLiveSmokeMode(t, "file-sink", bin, version, openCodeLiveFileSink(t.TempDir()))
 	for _, row := range []openCodeLiveRow{defaultRow, pipeRow, fileRow} {

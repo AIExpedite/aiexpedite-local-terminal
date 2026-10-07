@@ -81,10 +81,13 @@ const openCodeSmokeWaitDelay = 2 * time.Second
 // (0600) and reaches the child only as its stdin. An expired attempt tears the
 // whole process TREE down, because an OpenCode tool child otherwise holds the
 // captured pipes past the deadline and Wait would never return.
-var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, err error) {
+// `started` reports whether the child actually reached Start. A pre-spawn
+// failure spent no tokens, so the caller withdraws the usage capture instead of
+// settling it as an uncovered run that would owe a reconcile.
+var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (stdout, stderr []byte, started bool, err error) {
 	cmd, closePrompt, err := newOpenCodeSmokeCmd(ctx, launch)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	defer closePrompt()
 	outBuf := &boundedBuffer{limit: cliSmokeMaxStdout}
@@ -92,10 +95,10 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
 	if err = cmd.Start(); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	err = cmd.Wait()
-	return outBuf.Bytes(), errBuf.Bytes(), err
+	return outBuf.Bytes(), errBuf.Bytes(), true, err
 }
 
 // newOpenCodeSmokeCmd builds the probe child with everything but its output
@@ -388,7 +391,7 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	result.ArgvShapeID = shape.ID
 
 	runCtx, cancel := context.WithTimeout(ctx, openCodeSmokeTimeout)
-	stdout, stderr, runErr := runOpenCodeSmokeCommand(runCtx, openCodeLaunch{
+	stdout, stderr, spawned, runErr := runOpenCodeSmokeCommand(runCtx, openCodeLaunch{
 		Path:       path,
 		Args:       buildOpenCodeRunArgs(shape, ""),
 		Env:        sanitizeOpenCodeEnv(os.Environ()),
@@ -410,8 +413,16 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	// the stream's own statement that the turn ran to its end, which is what
 	// decides whether this run is covered or owes a reconcile.
 	category, diagnostic, matched := classifyOpenCodeSmokeRun(timedOut, stdout, stderr, runErr, marker)
-	observeOpenCodeUsageFromStdout(usage, stdout)
-	settleOpenCodeUsageRunAsync(usage, category == "" && !timedOut)
+	if !spawned {
+		// The child never ran: no inference happened, so there is nothing for a
+		// reconcile to find. Settling it as an uncovered run would open a debt
+		// that retries OpenCode commands against the launch failure and could
+		// end by marking today's totals a lower bound.
+		usage.Disarm()
+	} else {
+		observeOpenCodeUsageFromStdout(usage, stdout)
+		settleOpenCodeUsageRunAsync(usage, category == "" && !timedOut)
+	}
 	if category == "" {
 		result.Status = cliSmokeStatusSuccess
 		result.MarkerMatched = matched

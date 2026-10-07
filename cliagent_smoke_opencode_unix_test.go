@@ -36,7 +36,7 @@ func TestRunOpenCodeSmokeCommand_DeadlineKillsToolDescendant(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	_, _, err := runOpenCodeSmokeCommand(ctx, openCodeLaunch{
+	_, _, started, err := runOpenCodeSmokeCommand(ctx, openCodeLaunch{
 		Path:       stub,
 		Args:       []string{"run", "--format", "json"},
 		Env:        append(os.Environ(), "AIX_TOOL_PID_FILE="+pidFile),
@@ -45,6 +45,9 @@ func TestRunOpenCodeSmokeCommand_DeadlineKillsToolDescendant(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected the deadline to end the run with an error")
+	}
+	if !started {
+		t.Fatalf("the child reached Start, so the seam must report it started")
 	}
 
 	raw, readErr := os.ReadFile(pidFile)

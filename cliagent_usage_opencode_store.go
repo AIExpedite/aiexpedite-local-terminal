@@ -314,17 +314,32 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 // openCodeFinishPass records the outcome and, for a pass that reached the end
 // of the candidate list, the success stamp. A timeout, launch failure or
 // unsupported output never sets it, even when nothing moved.
+//
+// A success whose stamp was REFUSED is not a success: the stamp is what pays
+// the debt's purpose — for an empty store it is the only state that makes the
+// zero row publishable — so a refused write becomes write_error, which spends
+// budget and leaves the debt open for its retry instead of clearing it against
+// state that never reached disk.
 func openCodeFinishPass(result openCodeReconcileResult) openCodeReconcileResult {
 	completedAtMs := openCodeUsageNow().UnixMilli()
-	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
-		l.LastPassOutcome = result.Outcome
-		if openCodeReconcileSucceeded(result.Outcome) {
-			l.LastSuccessfulReconcileAtMs = completedAtMs
-			// Committed progress clears the continuation failure run.
-			l.ContinuationFailures, l.ContinuationFirstFailureAtMs = 0, 0
-		}
-		return openCodeLedgerEdit{Changed: true}
-	})
+	record := func(outcome string) bool {
+		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			l.LastPassOutcome = outcome
+			if openCodeReconcileSucceeded(outcome) {
+				l.LastSuccessfulReconcileAtMs = completedAtMs
+				// Committed progress clears the continuation failure run.
+				l.ContinuationFailures, l.ContinuationFirstFailureAtMs = 0, 0
+			}
+			return openCodeLedgerEdit{Changed: true}
+		})
+		return persisted
+	}
+	if !record(result.Outcome) && openCodeReconcileSucceeded(result.Outcome) {
+		result.Outcome = openCodeReconcileWriteError
+		// Best effort: the same disk just refused a write, so this one may be
+		// refused too. The outcome the CALLER sees is what schedules the retry.
+		record(result.Outcome)
+	}
 	return result
 }
 
@@ -354,7 +369,9 @@ type openCodeReconcilePlan struct {
 // already past it would otherwise never look again.
 //
 // While sessions beyond the cursor remain, retries take at most ONE of the
-// export slots, so the cursor always moves.
+// export slots, so the cursor always moves. The two queues are then merged
+// oldest-first, so a retry can never advance the cursor over a fresh row this
+// pass did not reach.
 //
 // Two whole classes of session are never exported at all:
 //
@@ -408,11 +425,26 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 	if len(fresh) > 0 && retrySlots > 1 {
 		retrySlots = 1
 	}
-	for i := 0; i < retrySlots && len(plan.exports) < openCodeReconcileMaxExports; i++ {
-		plan.exports = append(plan.exports, retries[i])
-	}
-	for i := 0; i < len(fresh) && len(plan.exports) < openCodeReconcileMaxExports; i++ {
-		plan.exports = append(plan.exports, fresh[i])
+	// Merge the two queues OLDEST-FIRST, within the retry budget. Taking the
+	// retries first would let a retry newer than the fresh rows carry the cursor
+	// past the fresh rows this pass has no slots left for: they would fall
+	// behind the cursor and never be planned again, even though `remaining`
+	// reported them as a backlog. A retry therefore only takes a slot while it
+	// is the oldest candidate left, so every row the cursor steps over has
+	// already been exported.
+	ri, fi := 0, 0
+	for len(plan.exports) < openCodeReconcileMaxExports {
+		switch {
+		case ri < retrySlots && (fi >= len(fresh) || retries[ri].updatedMs <= fresh[fi].updatedMs):
+			plan.exports = append(plan.exports, retries[ri])
+			ri++
+		case fi < len(fresh):
+			plan.exports = append(plan.exports, fresh[fi])
+			fi++
+		default:
+			plan.remaining = len(fresh) + len(retries) - len(plan.exports)
+			return plan
+		}
 	}
 	plan.remaining = len(fresh) + len(retries) - len(plan.exports)
 	return plan
