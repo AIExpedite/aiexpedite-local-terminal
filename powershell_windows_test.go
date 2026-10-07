@@ -181,3 +181,18 @@ func TestRunLocalCommandWindows_LaunchesCmdShimNotPs1(t *testing.T) {
 		t.Fatalf("expected the .cmd shim to run (not the .ps1); output: %q", out)
 	}
 }
+
+// An Execute that returns before writing the command must say so, because the
+// OpenCode execute capture marks its run started only once the command was
+// dispatched: a host that is unhealthy (or whose mutex never frees) ran nothing.
+// An ExitCodeError, by contrast, is a command that ran.
+func TestPersistentPowerShell_ReportsUndispatchedCommands(t *testing.T) {
+	unhealthy := &PersistentPowerShell{}
+	if _, err := unhealthy.Execute(context.Background(), "opencode run hi", ""); !errors.Is(err, errPSNotDispatched) {
+		t.Fatalf("unhealthy host err = %v, want errPSNotDispatched", err)
+	}
+
+	if errors.Is(&ExitCodeError{Code: 1}, errPSNotDispatched) {
+		t.Fatal("a command that ran and exited non-zero was dispatched")
+	}
+}

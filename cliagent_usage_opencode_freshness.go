@@ -150,6 +150,14 @@ var (
 		completionMs int64
 		attempt      int
 	}
+	// openCodeRecheckBookRetry is the ONE in-memory retry of a re-read booking
+	// whose continuationDue write was refused. Like openCodeSettleRetry it is
+	// not persisted, because the file it would go to is the one that refused.
+	openCodeRecheckBookRetry struct {
+		mu    sync.Mutex
+		timer *time.Timer
+		gen   uint64
+	}
 	openCodeReconcileNudge struct {
 		mu     sync.Mutex
 		lastAt time.Time
@@ -839,7 +847,16 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 // by the chain's pass budget; only a SUCCESSFUL pass books it, so a failing
 // chain that has given up cannot be restarted by a record its failures never
 // consumed.
+//
+// A refused booking is retried in memory (openCodeArmRecheckBookRetry): the
+// pass that left the record has already carried LastPassStartedAtMs past the
+// store's activity, so no later gather would nudge for it, and startup recovery
+// skips it while continuationDue reads clear.
 func openCodeBookRecheckWakeUp(now time.Time) bool {
+	return openCodeBookRecheckWakeUpAttempt(now, 1)
+}
+
+func openCodeBookRecheckWakeUpAttempt(now time.Time, attempt int) bool {
 	if IsShutdownInProgress() {
 		return false
 	}
@@ -859,14 +876,79 @@ func openCodeBookRecheckWakeUp(now time.Time) bool {
 	// that reports success. Say so instead of claiming a booking.
 	if !updateOpenCodeUsageLedgerContinuation(true, 0, 0) {
 		logOpenCodeUsage("recheck book refused")
+		openCodeArmRecheckBookRetry(attempt)
 		return false
 	}
+	stopOpenCodeRecheckBookRetry()
 	// The due time is the base delay, and the pass spacing is the floor — the
 	// same rule every other booking here follows.
 	openCodeArmContinuation(openCodeSpacedDelay(readOpenCodeUsageFreshness(), now,
 		time.UnixMilli(dueAtMs).Sub(now)))
 	logOpenCodeUsage("recheck booked")
 	return true
+}
+
+// openCodeArmRecheckBookRetry re-attempts a refused re-read booking on the
+// debt ladder's delays and for its attempt budget. A debt opened in the
+// meantime owns the one timer, and its passes consume the record, so the retry
+// then stands down.
+func openCodeArmRecheckBookRetry(attempt int) {
+	delay, ok := refreshRetryDelayForAttempt(attempt, openCodeRunDebtMaxAttempts, openCodeRunDebtRetryLadder)
+	if !ok || IsShutdownInProgress() {
+		logOpenCodeUsage("recheck book gave up attempts=%d", attempt)
+		return
+	}
+	r := &openCodeRecheckBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.gen++
+	gen := r.gen
+	r.timer = time.AfterFunc(delay, func() { openCodeRecheckBookRetryFired(gen, attempt) })
+}
+
+func openCodeRecheckBookRetryFired(gen uint64, attempt int) {
+	r := &openCodeRecheckBookRetry
+	r.mu.Lock()
+	stale := gen != r.gen
+	if !stale {
+		r.timer = nil
+	}
+	r.mu.Unlock()
+	if stale || IsShutdownInProgress() {
+		return
+	}
+	openCodeFreshnessInFlight.Add(1)
+	defer openCodeFreshnessInFlight.Add(-1)
+	now := openCodeUsageNow()
+	if _, owed := openCodePendingDebt(now); owed {
+		return
+	}
+	openCodeBookRecheckWakeUpAttempt(now, attempt+1)
+}
+
+// stopOpenCodeRecheckBookRetry withdraws a pending booking retry. Part of
+// teardown, and of any booking that reached disk.
+func stopOpenCodeRecheckBookRetry() {
+	r := &openCodeRecheckBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.gen++
+}
+
+// openCodeRecheckBookRetryPending reports whether a booking retry is armed.
+// Test seam.
+func openCodeRecheckBookRetryPending() bool {
+	r := &openCodeRecheckBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timer != nil
 }
 
 // clearOpenCodeContinuationDue retires the booked continuation and leaves the
@@ -1045,6 +1127,7 @@ func openCodeRunDebtRetryFired(gen uint64, id *openCodeDebtID) {
 // gracefulShutdown; the schedule is on disk and the next process re-arms it.
 func stopOpenCodeRunDebtRetry() {
 	stopOpenCodeSettleRetry()
+	stopOpenCodeRecheckBookRetry()
 	t := &openCodeRunDebtRetryTimer
 	t.mu.Lock()
 	defer t.mu.Unlock()

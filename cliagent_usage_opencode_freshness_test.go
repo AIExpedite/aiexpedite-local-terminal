@@ -1066,19 +1066,46 @@ func TestOpenCodeRecheck_DoesNotClaimAWakeUpItCouldNotPersist(t *testing.T) {
 		return openCodeLedgerEdit{Changed: true}
 	})
 
-	// A read-only PARENT: the record still reads back, so the booking is
-	// reached, and only its own write is refused.
+	// A read-only PARENT (and, for Windows, where a directory's mode does not
+	// stop a rename, a read-only TARGET): the record still reads back, so the
+	// booking is reached, and only its own write is refused.
 	dir := filepath.Dir(openCodeUsageLedgerPath())
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := os.Chmod(openCodeUsageLedgerPath(), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	unblock := func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chmod(openCodeUsageLedgerPath(), 0o600)
+	}
+	t.Cleanup(unblock)
 
 	if openCodeBookRecheckWakeUp(now) {
 		t.Fatal("a booking whose continuationDue write was refused must not report success")
 	}
 	if openCodeRunDebtRetryPending() {
 		t.Fatal("a refused booking must not arm a timer whose pass would read the flag clear and exit")
+	}
+	// Nor may it strand the record: the pass already carried
+	// LastPassStartedAtMs past the store activity, so no gather would nudge
+	// for it again. The booking itself is retried in memory.
+	if !openCodeRecheckBookRetryPending() {
+		t.Fatal("a refused booking must leave an in-memory retry armed")
+	}
+
+	// The filesystem recovers; the retry is what books the pass.
+	unblock()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !readOpenCodeUsageLedger().ContinuationDue {
+		time.Sleep(time.Millisecond)
+	}
+	if !readOpenCodeUsageLedger().ContinuationDue {
+		t.Fatal("want the retried booking persisted once the write is accepted")
+	}
+	if openCodeRecheckBookRetryPending() {
+		t.Fatal("a booking that reached disk must retire its retry")
 	}
 }
 

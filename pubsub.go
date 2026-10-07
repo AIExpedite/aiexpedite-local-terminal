@@ -5345,7 +5345,9 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// its temp .ps1, or PowerShell failing to launch at all, leaves it unset, and
 	// the settle below then disarms instead of opening a debt no inference earns.
 	// Repeated spawn failures would otherwise spend the ladder and mark today's
-	// totals partial.
+	// totals partial. The persistent host is the exception — its PID exists
+	// before this command does — so that path marks the start itself, only once
+	// Execute has written the command (markPersistentDispatch).
 	openCodeUsage := armOpenCodeUsageForCommand("windows execute", cmd, args)
 	var openCodeStarted atomic.Bool
 	onStart := func(wrapperPID int) {
@@ -5455,8 +5457,16 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	onStart(ps.HostPID())
+	// The host's PID is the capture's wrapper from the start, but the OpenCode
+	// run only started if Execute got as far as writing the command.
+	markPersistentDispatch := func(err error) {
+		if !errors.Is(err, errPSNotDispatched) {
+			openCodeStarted.Store(true)
+		}
+	}
+	capture.SetWrapper(ps.HostPID())
 	output, err := ps.Execute(ctx, cmdLine, workDir)
+	markPersistentDispatch(err)
 	if err != nil {
 		// ExitCodeError means the command ran but exited non-zero — the PS
 		// process itself is fine, so don't restart or retry.
@@ -5474,12 +5484,13 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		if err != nil {
 			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
 		}
-		onStart(ps.HostPID())
+		capture.SetWrapper(ps.HostPID())
 
 		// Reuse the original context so the retry does not exceed the
 		// caller-requested timeout.  Creating a fresh full-timeout context here
 		// could allow the command to run for up to 2× the requested duration.
 		output, err = ps.Execute(ctx, cmdLine, workDir)
+		markPersistentDispatch(err)
 		if err != nil {
 			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
 		}

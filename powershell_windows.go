@@ -198,12 +198,12 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// a one-shot PowerShell process instead of blocking indefinitely.
 	if !ps.tryLockWithTimeout(psMutexAcquireTimeout) {
 		ps.healthy.Store(false)
-		return "", fmt.Errorf("PowerShell mutex acquisition timed out (another command may be stuck)")
+		return "", fmt.Errorf("PowerShell mutex acquisition timed out (another command may be stuck): %w", errPSNotDispatched)
 	}
 	defer ps.mutex.Unlock()
 
 	if !ps.healthy.Load() {
-		return "", fmt.Errorf("PowerShell process is not healthy")
+		return "", fmt.Errorf("PowerShell process is not healthy: %w", errPSNotDispatched)
 	}
 
 	ps.lastUsed = time.Now()
@@ -258,7 +258,7 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
 	if err != nil {
 		ps.healthy.Store(false)
-		return "", fmt.Errorf("failed to send command: %w", err)
+		return "", fmt.Errorf("failed to send command: %w (%w)", errPSNotDispatched, err)
 	}
 	if syncedPath != "" {
 		ps.lastPath = syncedPath

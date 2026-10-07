@@ -24,9 +24,17 @@
 package main
 
 import (
+	"errors"
 	"os/exec"
 	"strings"
 )
+
+// errPSNotDispatched marks a persistent-PowerShell Execute failure that
+// returned BEFORE the command reached the host's stdin (mutex timeout, an
+// unhealthy host, a failed write): nothing the caller asked for ran. Callers
+// that account for a started run (the OpenCode execute capture) test for it
+// with errors.Is.
+var errPSNotDispatched = errors.New("command not dispatched to PowerShell")
 
 // psHostPolicyArgs is passed to every powershell.exe / pwsh.exe host the agent
 // starts to run commands. `-ExecutionPolicy Bypass` sets the policy for that
