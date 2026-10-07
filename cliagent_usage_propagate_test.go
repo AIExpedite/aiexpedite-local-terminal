@@ -817,6 +817,50 @@ func TestCLIUsageHint_FallbackHintsAReadingCommittedToThePinnedCache(t *testing.
 	t.Fatalf("the fallback never hinted the imported pinned reading: %+v", rec.all())
 }
 
+// A fresh dual-channel install: the hook is pinned to the other channel and
+// this agent has no own cache at all. The fallback must still import the
+// pinned commit — creating the own cache — and hint the generation it wrote,
+// or this device's backend card stays stale until an unrelated refresh.
+func TestCLIUsageHint_FallbackHintsAPinnedReadingWithNoOwnCache(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	cache, _ := claudeFallbackFixture(t, true)
+	pinned := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	helperWriteJSON(t, filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	if _, err := os.Stat(cache); err == nil {
+		t.Fatal("fixture wrote an own cache; this case is about its absence")
+	}
+
+	startCLIUsagePropagator(cfg) // nothing to recover: there is no own cache
+	// Written as the short-lived hook writes it — another process, so nothing
+	// notifies this propagator in-process and only the fallback can find it.
+	if err := os.MkdirAll(filepath.Dir(pinned), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeVersionedClaudeCache(t, pinned, gen(94, 6), 68)
+
+	hint := waitHints(t, rec, 1, 0)[0].hint
+	if hint.Provider != claudeUsageProvider || hint.GenerationEpoch == 0 || hint.Generation == 0 {
+		t.Fatalf("hint = %+v, want the generation the bootstrap import committed", hint)
+	}
+	if hint.GenerationEpoch == 94 {
+		t.Fatalf("hint = %+v, want this agent's own generation, not the pinned cache's", hint)
+	}
+	own, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || own.Buckets[claudeWindowFiveHour].UsedPercentage != 68 {
+		t.Fatalf("own snapshot = %+v (ok=%v), want the imported pinned reading", own, ok)
+	}
+	if own.GenerationEpoch != hint.GenerationEpoch || own.Generation != hint.Generation {
+		t.Fatalf("own generation = {%d,%d}, want the hinted {%d,%d}",
+			own.GenerationEpoch, own.Generation, hint.GenerationEpoch, hint.Generation)
+	}
+}
+
 // The fallback reads nothing when Claude is not detected, when no cache
 // exists, or while the agent is offline, draining, shutting down or stopped.
 func TestCLIUsageHint_FallbackReadsOnlyWhileEveryGateIsOpen(t *testing.T) {

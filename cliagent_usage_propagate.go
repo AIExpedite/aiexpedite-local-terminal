@@ -636,15 +636,21 @@ func (p *cliUsagePropagatorState) fallback(gen uint64) {
 }
 
 // claudeUsageFallbackGeneration reads the Claude cache's committed generation,
-// or nil without reading while offline, draining, shutting down, Claude is not
-// detected, or no cache exists.
+// or nil without reading while offline, draining, shutting down, or Claude is
+// not detected.
 func claudeUsageFallbackGeneration() *cliUsageGeneration {
 	if IsShutdownInProgress() || isDraining() || IsOffline() || !claudeUsageFallbackDetected() {
 		return nil
 	}
 	path := claudeRateLimitCachePath()
 	if _, err := os.Stat(path); err != nil {
-		return nil
+		// No own cache: on a dual-channel install the hook pinned to the other
+		// channel is still committing readings there, and importing them is
+		// what creates this agent's cache and first generation. Skipping here
+		// would leave its backend card stale indefinitely — the pinned reading
+		// is fresh, so no staleness probe creates the own cache either. A
+		// machine with no pinned cache reads nothing beyond the hook settings.
+		return importPinnedClaudeObservationsIntoAbsentCache()
 	}
 	snap, ok := claudeUsageFallbackLoad(path)
 	if !ok {

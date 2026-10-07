@@ -754,6 +754,101 @@ func TestImportPinnedClaudeObservations_VersionsThePinnedReadingInTheOwnCache(t 
 	}
 }
 
+// A fresh dual-channel install has no own cache and a hook pinned to the other
+// channel, and the fresh pinned reading keeps the staleness probe — the other
+// writer of the own cache — away. The import must create the own cache, so this
+// agent has a generation to version its published rows and to hint.
+func TestImportPinnedClaudeObservations_BootstrapsAnAbsentOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	observed := now.Add(-time.Minute)
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 63, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		},
+	}, now, "acct", claudeRateLimitSourceStatusLine)
+	if _, err := os.Stat(ownCache); err == nil {
+		t.Fatal("fixture wrote an own cache; this case is about its absence")
+	}
+
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil || imported.Epoch == 0 || imported.Counter == 0 {
+		t.Fatalf("imported generation = %+v, want the own cache created and versioned", imported)
+	}
+	view := loadMergedClaudeRateLimitView("acct")
+	if view.generation == nil || *view.generation != *imported {
+		t.Fatalf("view generation = %+v, want %+v", view.generation, imported)
+	}
+	own, ok := loadClaudeRateLimitSnapshot(ownCache)
+	if !ok || own.AccountFingerprint != "acct" {
+		t.Fatalf("own snapshot = %+v (ok=%v), want one scoped to acct", own, ok)
+	}
+	got := own.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 63 || got.ObservedAtMs != observed.UnixMilli() || got.Source != claudeRateLimitSourceStatusLine {
+		t.Fatalf("own five_hour = %+v, want the pinned reading with its time and provenance", got)
+	}
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("a reading already imported advanced the generation again: %+v", g)
+	}
+}
+
+// The fallback read has no credentials, so it may adopt the pinned cache's own
+// account scope ONLY while there is no own cache to disagree with it.
+func TestImportPinnedClaudeObservationsIntoAbsentCache_AdoptsThePinnedScopeOnlyWithoutAnOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(55, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+
+	imported := importPinnedClaudeObservationsIntoAbsentCache()
+	if imported == nil {
+		t.Fatal("the pinned reading was not imported into the absent own cache")
+	}
+	if own, _ := loadClaudeRateLimitSnapshot(ownCache); own.AccountFingerprint != "acct" {
+		t.Fatalf("own snapshot scope = %q, want the adopted pinned scope", own.AccountFingerprint)
+	}
+
+	// An own cache now exists: a newer pinned reading is left to the callers
+	// that know which account this agent is signed into.
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(81, now), now, "acct", claudeRateLimitSourceStatusLine)
+	if g := importPinnedClaudeObservationsIntoAbsentCache(); g != nil {
+		t.Fatalf("imported %+v over an existing own cache without a credential scope", g)
+	}
+	if own, _ := loadClaudeRateLimitSnapshot(ownCache); own.Buckets[claudeWindowFiveHour].UsedPercentage != 55 {
+		t.Fatalf("own five_hour = %+v, want the first import untouched", own.Buckets[claudeWindowFiveHour])
+	}
+}
+
 // A cache pinned by a hook that is NOT ours must not be read: the value would be
 // attributed to this account with no evidence it came from our capture at all.
 func TestClaudeCodeMetricsFromCache_IgnoresForeignStatusLineCommand(t *testing.T) {

@@ -159,12 +159,31 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 // discover it exactly as they discover any other commit.
 //
 // Only between two snapshots of the caller's account: an own cache scoped to
-// another account (or absent) is left to the writers that own that transition,
-// and the merge re-checks the scope under the lock. Each reading keeps its
-// provenance, so imported probe evidence still counts as probe evidence. A
-// single-channel machine, where the hook pins the own cache, reads nothing
-// beyond the hook's settings.
+// another account is left to the writers that own that transition, and the
+// merge re-checks the scope under the lock. An ABSENT own cache is created by
+// the import — a fresh dual-channel install whose hook is pinned elsewhere
+// otherwise has no generation to version or hint at all, and nothing else
+// creates one: the pinned reading is fresh, so the staleness probe (the other
+// writer of this cache) never runs. Each reading keeps its provenance, so
+// imported probe evidence still counts as probe evidence. A single-channel
+// machine, where the hook pins the own cache, reads nothing beyond the hook's
+// settings.
 func importPinnedClaudeObservations(fingerprint string) *cliUsageGeneration {
+	return importPinnedClaudeObservationsAs(&fingerprint)
+}
+
+// importPinnedClaudeObservationsIntoAbsentCache is the import a caller with no
+// credentials of its own (the propagator's fallback read) may perform: it
+// adopts the pinned snapshot's own account scope, and only while this agent
+// holds no own cache to disagree with it.
+func importPinnedClaudeObservationsIntoAbsentCache() *cliUsageGeneration {
+	return importPinnedClaudeObservationsAs(nil)
+}
+
+// importPinnedClaudeObservationsAs is the shared implementation. A nil
+// `fingerprint` means "adopt the pinned cache's scope", which only an absent
+// own cache may ask for.
+func importPinnedClaudeObservationsAs(fingerprint *string) *cliUsageGeneration {
 	home, _ := os.UserHomeDir()
 	own := claudeRateLimitCachePath()
 	pinned := installedClaudeRateLimitCachePath(home)
@@ -172,11 +191,12 @@ func importPinnedClaudeObservations(fingerprint string) *cliUsageGeneration {
 		return nil
 	}
 	pinnedSnap, ok := loadClaudeRateLimitSnapshot(pinned)
-	if !ok || pinnedSnap.AccountFingerprint != fingerprint {
+	if !ok || (fingerprint != nil && pinnedSnap.AccountFingerprint != *fingerprint) {
 		return nil
 	}
-	ownSnap, ok := loadClaudeRateLimitSnapshot(own)
-	if !ok || ownSnap.AccountFingerprint != fingerprint {
+	scope := pinnedSnap.AccountFingerprint
+	ownSnap, haveOwn := loadClaudeRateLimitSnapshot(own)
+	if haveOwn && (fingerprint == nil || ownSnap.AccountFingerprint != scope) {
 		return nil
 	}
 	bySource := map[string]map[string]claudeRateLimitBucket{}
@@ -196,11 +216,19 @@ func importPinnedClaudeObservations(fingerprint string) *cliUsageGeneration {
 	if len(bySource) == 0 {
 		return nil
 	}
+	// Writing a cache this read found absent: "" joins the allowed scopes so a
+	// writer that created it between this read and the lock is an account
+	// transition the merge decides, rather than a rescope error that drops the
+	// import and leaves this agent without a generation.
+	allowed := []string{scope}
+	if !haveOwn {
+		allowed = append(allowed, "")
+	}
 	var committed *cliUsageGeneration
 	_, _ = withClaudeRateLimitCacheLocked(own, time.Time{}, func() (time.Time, error) {
 		now := time.Now()
 		for source, updates := range bySource {
-			_, advanced, err := mergeClaudeRateLimitCacheLocked(own, updates, now, fingerprint, source, []string{fingerprint}, claudeCredStamp{})
+			_, advanced, err := mergeClaudeRateLimitCacheLocked(own, updates, now, scope, source, allowed, claudeCredStamp{})
 			if err != nil {
 				return time.Time{}, err
 			}
