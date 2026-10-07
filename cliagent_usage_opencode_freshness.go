@@ -83,7 +83,8 @@ var (
 
 // armOpenCodeUsageRun starts a run at the moment its child spawns. fingerprint
 // may be "" (resolved again at settle); executable and dir are where the
-// export fallback would run. The armed debt is written before returning.
+// export fallback would run. The armed debt is tried before returning, and
+// retried in the background if that write is refused.
 func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun {
 	now := openCodeUsageFreshnessNow()
 	run := &openCodeUsageRun{
@@ -94,20 +95,63 @@ func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun 
 		dir:         dir,
 	}
 	// Tried once, never waited on: a session arms under the session manager's
-	// lock, and the armed debt is only a crash marker — a run whose arm was
-	// refused still settles (and owes) normally.
-	armed, _, _ := openCodeUsageTransactionWithin(0, func(ledger *openCodeUsageLedger) (bool, bool) {
+	// lock. A refused arm still settles (and owes) normally, but the armed debt
+	// is the crash marker — without it a crash or self-update mid-turn leaves the
+	// next process nothing to export — so the arm is retried off that lock.
+	if !run.writeArmedDebt(0) {
+		run.armRefused.Store(true)
+		scheduleOpenCodeUsageArm(run, 1)
+	}
+	return run
+}
+
+// writeArmedDebt adds the run's ARMED debt, reporting whether the arm needs no
+// further attempt. A run that settled first is declined: its settle already
+// decided the debt.
+func (run *openCodeUsageRun) writeArmedDebt(lockWait time.Duration) bool {
+	// A contended lock never runs mutate, so track the decline, not the intent.
+	declined := false
+	committed, _, _ := openCodeUsageTransactionWithin(lockWait, func(ledger *openCodeUsageLedger) (bool, bool) {
+		if run.settled.Load() || openCodeUsageDebtByID(ledger, run.id) != nil {
+			declined = true
+			return false, false
+		}
 		ledger.Debts = append(ledger.Debts, openCodeUsageDebt{
 			RunID:              run.id,
 			RunFloorMs:         run.floorMs,
-			AccountFingerprint: fingerprint,
-			Dir:                dir,
+			AccountFingerprint: run.fingerprint,
+			Dir:                run.dir,
 		})
 		capOpenCodeUsageDebts(ledger)
 		return true, false
 	})
-	run.armRefused = !armed
-	return run
+	return committed || declined
+}
+
+// scheduleOpenCodeUsageArm books another attempt at a refused arm on the commit
+// ladder, `attempt` having already been booked. Settling stops it: a settle
+// that owes writes the debt itself. Once the arm lands, a session id the stream
+// named meanwhile — skipped for want of a debt — is recorded on it.
+func scheduleOpenCodeUsageArm(run *openCodeUsageRun, attempt int) {
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		logOpenCodeUsageCapture("arm_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("arm_retry")
+	openCodeUsageAfterFunc(delay, func() {
+		if run.settled.Load() {
+			return
+		}
+		if !run.writeArmedDebt(openCodeUsageLockWait) {
+			scheduleOpenCodeUsageArm(run, attempt+1)
+			return
+		}
+		run.armRefused.Store(false)
+		if _, sessionID := run.snapshot(); sessionID != "" {
+			run.persistSessionIDAsync(sessionID)
+		}
+	})
 }
 
 // armOpenCodeUsageRunForExecutable arms with the account the readiness cache
@@ -119,7 +163,7 @@ func armOpenCodeUsageRunForExecutable(executable, dir string) *openCodeUsageRun 
 // persistSessionIDAsync records the run's session id on its armed debt.
 func (run *openCodeUsageRun) persistSessionIDAsync(sessionID string) {
 	// A refused arm left no debt to name: the settle writes the id if it owes.
-	if run == nil || sessionID == "" || run.armRefused || !run.persistedSession.CompareAndSwap(false, true) {
+	if run == nil || sessionID == "" || run.armRefused.Load() ||!run.persistedSession.CompareAndSwap(false, true) {
 		return
 	}
 	openCodeUsageInFlight.Add(1)
@@ -191,8 +235,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	// cost is zero — are not payment: the turn still owes a reading, and its
 	// export may carry one.
 	if sessionID == "" {
-		_ = disarmOpenCodeUsageRunID(run.id)
-		logOpenCodeUsageCapture("unattributable")
+		retireOpenCodeUsageDebt(run.id, "unattributable")
 		return
 	}
 	if !oweOpenCodeUsageRun(run, sessionID, fingerprint) {
@@ -359,10 +402,13 @@ func settleOrDisarmOpenCodeSmokeRun(run *openCodeUsageRun, succeeded bool) {
 	settleOpenCodeUsageRun(run, "")
 }
 
-// disarmOpenCodeUsageRun drops a run whose child never started.
+// disarmOpenCodeUsageRun drops a run whose child never started, or a failed
+// smoke that owes nothing. A refused removal is retried like a retirement:
+// left on disk, the armed debt — named, once a frame reached it — would be
+// adopted and exported by the next process despite owing nothing.
 func disarmOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run != nil && run.settled.CompareAndSwap(false, true) {
-		_ = disarmOpenCodeUsageRunID(run.id)
+		retireOpenCodeUsageDebt(run.id, "disarmed")
 	}
 }
 

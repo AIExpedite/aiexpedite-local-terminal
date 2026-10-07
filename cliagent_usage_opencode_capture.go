@@ -595,8 +595,10 @@ type openCodeUsageRun struct {
 	commitMu  sync.Mutex
 	sessionID string
 	settled   atomic.Bool
-	// armRefused reports that the arm wrote no debt, so there is none to name.
-	armRefused bool
+	// armRefused reports that the arm has written no debt yet, so there is none
+	// to name. A refused arm is retried off the caller's lock; one that lands
+	// clears it.
+	armRefused atomic.Bool
 	// persistedSession is set once the session id reached the armed debt.
 	persistedSession atomic.Bool
 }

@@ -265,8 +265,90 @@ func TestOpenCodeUsage_ArmingNeverWaitsOnAHeldLedgerLock(t *testing.T) {
 	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
 		t.Fatalf("debts = %+v, want the run owed despite its refused arm", debts)
 	}
-	if len(sched.delays()) != 1 {
-		t.Fatalf("booked %v, want the first rung", sched.delays())
+	if d := sched.delays(); len(d) != 2 || d[0] != openCodeUsageCommitLadder[0] || d[1] != openCodeUsageDebtLadder[0] {
+		t.Fatalf("booked %v, want the arm retry then the first export rung", d)
+	}
+	// The settle decided the debt: the late arm retry must not add a second one.
+	sched.fireNext()
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
+		t.Fatalf("debts = %+v, want only the owed debt after the arm retry", debts)
+	}
+}
+
+// The armed debt is the crash marker: a refused arm is retried off the session
+// manager's lock, and a session id the stream named meanwhile is recorded on it,
+// so a crash before settle still leaves the next process a debt to export.
+func TestOpenCodeUsage_ARefusedArmIsRetriedAndNamed(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1134)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+
+	release := holdOpenCodeLedgerLock(t)
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	if !run.armRefused.Load() {
+		t.Fatal("the arm reported success while the ledger was held")
+	}
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_late_arm"}`)
+	openCodeUsageInFlight.Wait()
+	sched.fireNext() // still held: the retry books the next rung
+	if d := sched.delays(); len(d) != 2 || d[0] != openCodeUsageCommitLadder[0] || d[1] != openCodeUsageCommitLadder[1] {
+		t.Fatalf("booked %v, want the commit ladder's first two rungs", d)
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want nothing written while held", debts)
+	}
+
+	release()
+	sched.fireNext()
+	openCodeUsageInFlight.Wait()
+	if run.armRefused.Load() {
+		t.Fatal("a landed arm still reports refused")
+	}
+	debts := loadOpenCodeUsageLedger().Debts
+	if len(debts) != 1 || debts[0].owed() || debts[0].SessionID != "ses_late_arm" {
+		t.Fatalf("debts = %+v, want one armed debt naming the session", debts)
+	}
+	if sched.fireNext() {
+		t.Fatal("a landed arm booked another retry")
+	}
+
+	// The process dies mid-turn: the next one adopts and owes the debt.
+	simulateOpenCodeProcessRestart(t, 1135)
+	adoptOwedOpenCodeUsage(time.Now())
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
+		t.Fatalf("debts = %+v, want the interrupted run adopted as owed", debts)
+	}
+}
+
+// A failed smoke with no completed step owes nothing. A refused disarm is
+// retried, or the next process would adopt the named debt and export it.
+func TestOpenCodeUsage_ARefusedDisarmIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1136)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_failed_smoke"}`)
+	openCodeUsageInFlight.Wait()
+
+	release := holdOpenCodeLedgerLock(t)
+	settleOrDisarmOpenCodeSmokeRun(run, false)
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 {
+		t.Fatalf("debts = %+v, want the debt still on disk while held", debts)
+	}
+	if d := sched.delays(); len(d) != 1 || d[0] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head for the refused disarm", d)
+	}
+
+	release()
+	sched.fireNext()
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want the disarm to have landed", debts)
+	}
+	if sched.fireNext() {
+		t.Fatal("a landed disarm booked another retry")
 	}
 }
 
@@ -493,11 +575,13 @@ func TestOpenCodeUsage_ARefusedOwedWriteIsRetried(t *testing.T) {
 	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v, want none while the lock is held", debts)
 	}
-	if d := sched.delays(); len(d) != 1 || d[0] != openCodeUsageCommitLadder[0] {
-		t.Fatalf("booked %v, want the commit ladder's head", d)
+	// The refused arm's retry, then the refused owed write's.
+	if d := sched.delays(); len(d) != 2 || d[0] != openCodeUsageCommitLadder[0] || d[1] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head twice", d)
 	}
+	sched.fireNext() // the arm retry: the run has settled, so it stops
 	sched.fireNext() // still held
-	if d := sched.delays(); len(d) != 2 || d[1] != openCodeUsageCommitLadder[1] {
+	if d := sched.delays(); len(d) != 3 || d[2] != openCodeUsageCommitLadder[1] {
 		t.Fatalf("booked %v, want the second commit rung", d)
 	}
 
@@ -507,7 +591,7 @@ func TestOpenCodeUsage_ARefusedOwedWriteIsRetried(t *testing.T) {
 	if len(debts) != 1 || !debts[0].owed() || debts[0].SessionID != "ses_owed" {
 		t.Fatalf("debts = %+v, want one owed debt the retry wrote", debts)
 	}
-	if d := sched.delays(); len(d) != 3 || d[2] != openCodeUsageDebtLadder[0] {
+	if d := sched.delays(); len(d) != 4 || d[3] != openCodeUsageDebtLadder[0] {
 		t.Fatalf("booked %v, want the export ladder's head once the debt landed", d)
 	}
 }
@@ -684,7 +768,7 @@ func TestOpenCodeUsage_AZeroWaitArmRefusesABusyInProcessWriter(t *testing.T) {
 	select {
 	case run := <-done:
 		openCodeUsageMu.Unlock()
-		if !run.armRefused {
+		if !run.armRefused.Load() {
 			t.Fatal("the arm reported success without writing")
 		}
 	case <-time.After(2 * time.Second):
