@@ -726,9 +726,18 @@ func cliAgentUsageFallback(detected map[string]detectedCLIAgent, cached *Machine
 		if !ok || !entry.Detected {
 			continue
 		}
-		if u, ok := known[agent.ID]; ok {
+		// Some parsers (opencode, museCode) stamp their built-in id, so an
+		// entry naming one through parserKey was cached under that id.
+		cachedUsage, ok := known[agent.ID]
+		if !ok {
+			if key := cliAgentCatalogParserKey(agent); key != agent.ID {
+				cachedUsage, ok = known[key]
+			}
+		}
+		if ok {
 			// Usage and account are last known; where the CLI is and which
 			// version it is are what this gather just detected.
+			u := cachedUsage
 			if entry.Version != "" {
 				u.Version = entry.Version
 			}

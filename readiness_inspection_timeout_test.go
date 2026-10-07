@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -245,6 +246,34 @@ func TestAwaitCLIAgentUsage_BudgetFallsBackToCachedUsage(t *testing.T) {
 	ch <- want
 	if got := awaitCLIAgentUsage(ch, time.Now(), 0, detected, time.Now()); len(got) != 1 || got[0].Account != "fresh" {
 		t.Fatalf("an unbounded wait must return the pass's own result, got %+v", got)
+	}
+}
+
+func TestCLIAgentUsageFallback_FindsUsageCachedUnderTheParserID(t *testing.T) {
+	// A backend catalog entry with its own id names the opencode parser, which
+	// stamps its built-in id, so the full gather cached the usage as "opencode".
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{
+			ID:           "openBuild",
+			DisplayName:  "Open Build",
+			Command:      "opencode",
+			Capabilities: json.RawMessage(`{"utilization":{"parserKey":"opencode"}}`),
+		},
+	})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+	isolateMachineInfo(t)
+	cached := healthyMachine()
+	cached.CliAgents = []cliAgentUsage{{CliAgentID: "opencode", Provider: "opencode", Version: "1.0.0", Account: "me@example.com"}}
+	cacheMachineInfo(cached)
+
+	got := cliAgentUsageFallback(map[string]detectedCLIAgent{
+		"openBuild": {Detected: true, Version: "1.1.0", Path: "/bin/opencode", Name: "Open Build"},
+	}, cachedMachineInfo(), time.Now())
+	if len(got) != 1 {
+		t.Fatalf("expected one entry, got %+v", got)
+	}
+	if u := got[0]; u.Account != "me@example.com" || u.Version != "1.1.0" || u.Path != "/bin/opencode" {
+		t.Fatalf("the cached usage must be found through the parser id, not replaced by a baseline entry: %+v", u)
 	}
 }
 
