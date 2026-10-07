@@ -79,6 +79,11 @@ const (
 	// openCodeLedgerMaxSkipped caps the over-cap exports remembered for a retry.
 	openCodeLedgerMaxSkipped = 32
 
+	// openCodeRunMaxSessions bounds the session ids ONE run's tap remembers. A
+	// real run names one; the cap is there because the ids come from vendor
+	// output and this map lives for the run's whole life.
+	openCodeRunMaxSessions = 32
+
 	// openCodeUsageValueCeiling clamps every stored integer. A provider that
 	// reports a nonsense figure must not turn into an unreadable card.
 	openCodeUsageValueCeiling = int64(1_000_000_000_000)
@@ -823,7 +828,10 @@ func (h *openCodeRunUsage) Observe(line string) {
 	if h.finished {
 		return
 	}
-	if frame.SessionID != "" {
+	if frame.SessionID != "" && len(h.sessions) < openCodeRunMaxSessions {
+		// Bounded like the message map: these ids come from vendor output, and
+		// a run that named an unbounded number of sessions would otherwise grow
+		// this map for its whole life. A real run names one.
 		h.sessions[frame.SessionID] = struct{}{}
 	}
 	if frame.MessageID != "" {

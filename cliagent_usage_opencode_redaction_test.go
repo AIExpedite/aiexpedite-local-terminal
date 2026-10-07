@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -23,7 +24,8 @@ var (
 		"reconcileCursorMs": true, "lastSuccessfulReconcileAtMs": true,
 		"lastPassOutcome": true, "lastPassStartedAtMs": true,
 		"continuationDue": true, "continuationFailures": true, "continuationFirstFailureAtMs": true,
-		"skipped": true, "session": true, "updatedMs": true,
+		"continuationPasses": true,
+		"skipped":            true, "session": true, "updatedMs": true,
 		"days": true, "messages": true, "streamSessions": true, "partial": true,
 		"in": true, "out": true, "reasoning": true, "cacheRead": true, "cacheWrite": true,
 		"costMicros": true, "observedAtMs": true,
@@ -127,6 +129,84 @@ func TestOpenCodeUsage_StateFilesHoldNothingButIntegersHashesAndClosedCodes(t *t
 			allowed = openCodeFreshnessAllowedKeys
 		}
 		auditOpenCodeJSON(t, label, decoded, allowed, "")
+	}
+}
+
+// The live audit above only checks the fields the paths it drives happen to
+// write: a run that settles covered leaves no `skipped`, a continuation that
+// succeeds clears its own counters, and `omitempty` drops every zero — so a new
+// field could sit outside the allowlist for as long as no test triggers it.
+//
+// This row audits the FULL SURFACE of both files instead: every field set to a
+// value of its real shape. A field added to either struct then appears here the
+// moment it exists, and the author has to state its redaction shape rather than
+// discover it in the field.
+func TestOpenCodeUsage_EveryFieldOfBothStateFilesIsOnTheAllowlist(t *testing.T) {
+	ledger := openCodeUsageLedger{
+		SchemaVersion:                openCodeUsageLedgerSchema,
+		Generation:                   cliUsageGeneration{Epoch: 4503599627370497, Counter: 7},
+		ReconcileCursorMs:            1790500000200,
+		LastSuccessfulReconcileAtMs:  1790500000300,
+		LastPassOutcome:              openCodeReconcileMore,
+		LastPassStartedAtMs:          1790500000100,
+		ContinuationDue:              true,
+		ContinuationFailures:         2,
+		ContinuationFirstFailureAtMs: 1790500000050,
+		ContinuationPasses:           5,
+		Skipped: []openCodeSkippedSession{
+			{Session: "a31580b57ec1119e", UpdatedMs: 1790500000200},
+		},
+		Days: map[string]*openCodeLedgerDay{
+			"2026-09-27": {
+				Messages: map[string]openCodeMessageUsage{
+					"f3bd9bb287b9c0ef": {
+						In: 42, Out: 20, Reasoning: 1, CacheRead: 5, CacheWrite: 2,
+						CostMicros: 5000, ObservedAtMs: 1790500000200,
+					},
+				},
+				StreamSessions: []string{"0123456789abcdef"},
+				Partial:        true,
+			},
+		},
+	}
+	freshness := openCodeUsageFreshness{
+		SchemaVersion:   openCodeUsageFreshnessSchema,
+		RunFloorMs:      1790500000000,
+		CompletionMs:    1790500000400,
+		OwedAtMs:        1790500000400,
+		NextAttemptAtMs: 1790500060000,
+		LastAttemptAtMs: 1790500000500,
+		Attempts:        2,
+		LastOutcome:     openCodeReconcileTimeout,
+	}
+
+	for _, tc := range []struct {
+		label   string
+		value   any
+		allowed map[string]bool
+		// fields counts what the struct declares, so a field the fixture forgot
+		// to set — and which omitempty would therefore hide — fails the row.
+		fields int
+	}{
+		{"ledger", ledger, openCodeLedgerAllowedKeys, reflect.TypeOf(ledger).NumField()},
+		{"freshness", freshness, openCodeFreshnessAllowedKeys, reflect.TypeOf(freshness).NumField()},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			raw, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded) != tc.fields {
+				t.Fatalf("%s rendered %d of %d declared fields — set every field in "+
+					"the fixture, or omitempty hides the one you added:\n%s",
+					tc.label, len(decoded), tc.fields, raw)
+			}
+			auditOpenCodeJSON(t, tc.label, decoded, tc.allowed, "")
+		})
 	}
 }
 
