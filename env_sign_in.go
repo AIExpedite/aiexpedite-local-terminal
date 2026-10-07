@@ -99,6 +99,13 @@ func sanitizeSignInTitle(title, program string) string {
 	return t
 }
 
+// signInNotInstalledSuffix ends the error resolveSignInProgram returns for a
+// CLI that is on neither the refreshed PATH nor its installer's bin dir.
+// terminal-service matches this text (isSignInProgramMissing) to fail the
+// sign-in instead of waiting on a "run <cli> login" the user can't run: keep
+// the wording stable.
+const signInNotInstalledSuffix = "is not installed (not found on PATH)"
+
 // resolveSignInProgram finds argv[0] on the refreshed PATH (or, for the CLIs
 // whose installers write outside PATH, in the installer's bin dir). An absolute
 // argv[0] must exist.
@@ -122,7 +129,7 @@ func resolveSignInProgram(program string) (string, error) {
 	if p := resolveInstallerBinary(program, installerBinDirFor(program)); p != "" {
 		return p, nil
 	}
-	return "", fmt.Errorf("%s is not installed (not found on PATH)", program)
+	return "", fmt.Errorf("%s %s", program, signInNotInstalledSuffix)
 }
 
 // signInLauncher opens the window. Seam for tests; production is the platform
