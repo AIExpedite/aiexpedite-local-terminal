@@ -1287,3 +1287,100 @@ func TestOpenCodeReconcile_ARefusedSuccessStampFailsThePass(t *testing.T) {
 		t.Fatalf("success stamp = %d, want none on disk", stamp)
 	}
 }
+
+func TestOpenCodeReconcile_ReReadsASessionItMayHaveCaughtMidTurn(t *testing.T) {
+	// A pass that overlaps a direct/TUI turn exports the session after its
+	// prompt-time `updated` is set but before the turn's later messages are
+	// persisted. OpenCode does not necessarily advance `updated` for them, so
+	// without the booked re-read the cursor (and a `skipped` retry, keyed the
+	// same way) would reject the session forever and the rest of the turn would
+	// never be counted.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	advance := openCodeUsageFixture(t, now)
+	stamp := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_live", stamp}),
+		exports: map[string]string{
+			"ses_live": exportWith("ses_live", "msg_live", stamp, 10, 1, "0"),
+		},
+	}).install(t)
+
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileOK {
+		t.Fatalf("first outcome = %q, want ok", first.Outcome)
+	}
+	if tokens, _, _ := todayTotals(t, now); tokens != 11 {
+		t.Fatalf("tokens = %d, want 11 from the part of the turn that was written", tokens)
+	}
+	// Before the re-read is due, nothing is exported again.
+	before := stub.exportCount()
+	if again := reconcileOpenCodeUsageOnce(context.Background(), now); again.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("outcome = %q, want no_change before the re-read is due", again.Outcome)
+	}
+	if stub.exportCount() != before {
+		t.Fatal("a re-read must wait for openCodeRecheckDelay, not run on the very next pass")
+	}
+
+	// The turn finished writing: more messages, the SAME `updated`.
+	stub.exports["ses_live"] = `{"messages":[` +
+		strings.TrimPrefix(strings.TrimSuffix(exportWith("ses_live", "msg_live", stamp, 10, 1, "0"), "]}"), `{"messages":[`) +
+		`,` + strings.TrimSuffix(strings.TrimPrefix(exportWith("ses_live", "msg_tail", stamp, 40, 4, "0"), `{"messages":[`), "]}") +
+		`]}`
+	later := now.Add(openCodeRecheckDelay + time.Second)
+	advance(later)
+	if due := reconcileOpenCodeUsageOnce(context.Background(), later); due.Outcome != openCodeReconcileOK {
+		t.Fatalf("due outcome = %q, want ok", due.Outcome)
+	}
+	if got := stub.exportCount(); got != before+1 {
+		t.Fatalf("exports = %d, want one re-read of the session", got)
+	}
+	if tokens, _, rows := todayTotals(t, later); tokens != 55 || rows != 2 {
+		t.Fatalf("tokens=%d rows=%d, want 55/2 once the rest of the turn is counted", tokens, rows)
+	}
+
+	// The re-read that found nothing new retires the record: a quiet session is
+	// never exported again, however many passes run.
+	quiet := later.Add(openCodeRecheckDelay + time.Second)
+	advance(quiet)
+	if settled := reconcileOpenCodeUsageOnce(context.Background(), quiet); settled.Outcome != openCodeReconcileOK {
+		t.Fatalf("settled outcome = %q, want ok for the second re-read", settled.Outcome)
+	}
+	spent := stub.exportCount()
+	final := quiet.Add(openCodeRecheckDelay + time.Second)
+	advance(final)
+	if last := reconcileOpenCodeUsageOnce(context.Background(), final); last.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("last outcome = %q, want no_change", last.Outcome)
+	}
+	if stub.exportCount() != spent {
+		t.Fatal("a re-read that raised nothing must not book another")
+	}
+}
+
+func TestOpenCodeReconcile_BooksNoReReadForASessionAlreadyFinished(t *testing.T) {
+	// A backlog session last written long before the pass cannot have been
+	// mid-turn, so it costs no second export.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	advance := openCodeUsageFixture(t, now)
+	stamp := now.Add(-(openCodeSessionMaybeActiveWindow + time.Minute)).UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_done", stamp}),
+		exports: map[string]string{
+			"ses_done": exportWith("ses_done", "msg_done", stamp, 10, 1, "0"),
+		},
+	}).install(t)
+
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileOK {
+		t.Fatalf("first outcome = %q, want ok", first.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
+		t.Fatalf("rechecks = %d, want none for a session that was already finished", len(ledger.Rechecks))
+	}
+	before := stub.exportCount()
+	later := now.Add(openCodeRecheckDelay + time.Minute)
+	advance(later)
+	if again := reconcileOpenCodeUsageOnce(context.Background(), later); again.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("outcome = %q, want no_change", again.Outcome)
+	}
+	if stub.exportCount() != before {
+		t.Fatal("a finished session must not be exported a second time")
+	}
+}

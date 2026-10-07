@@ -2309,6 +2309,18 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   a session whose `updated` equals the cursor is still a candidate unless it is
   one of them. A pass that runs out of slots inside such a group therefore never
   steps over the rest of it.
+- **A session read mid-turn is re-read once.** OpenCode sets a session's
+  `updated` when the prompt arrives and persists the turn's later parts and
+  messages without necessarily advancing it, so a pass that overlaps a direct or
+  TUI turn can commit the session with most of that turn still unwritten —
+  invisible to both the cursor and an over-cap retry, which are keyed on
+  `updated`. A session exported within `openCodeSessionMaybeActiveWindow` (15
+  min) of the pass is therefore remembered in `rechecks` (at most 8, newest kept)
+  and read again once `openCodeRecheckDelay` (2 min) has passed. The re-read
+  rides the same single revisit slot as an over-cap retry, and is booked again
+  only when it RAISED a figure — the one proof the turn was still running — so a
+  quiet session costs exactly one extra export and the max-merge makes the repeat
+  idempotent.
 
 ### Discover, and survive
 

@@ -19,7 +19,9 @@
 // Cost discipline — this runs on the user's machine while they are working:
 //
 //   - One pass is 1 `session list` + at most openCodeReconcileMaxExports
-//     `export` calls for LISTED sessions, OLDEST changed session first, each
+//     `export` calls for LISTED sessions, OLDEST changed session first (at most
+//     one of which is a revisit: an over-cap retry or a due re-read of a
+//     session that may have been mid-turn when a pass read it), each
 //     export's stdout capped at openCodeExportMaxStdout and decoded as a
 //     stream, plus at most openCodeExportMaxChildren further exports per listed
 //     session for the subagent sessions it delegated to — a child session holds
@@ -74,6 +76,23 @@ const (
 	// openCodeExportMaxChildDepth bounds how deep that descent goes, so a
 	// subagent that itself delegates cannot walk a tree.
 	openCodeExportMaxChildDepth = 3
+)
+
+// A session exported while its turn was still running is read ONCE more later.
+// OpenCode sets a session's `updated` when the prompt arrives and persists the
+// turn's later parts and messages without necessarily advancing it, so a pass
+// that overlaps a direct/TUI turn can commit the session at the cursor with
+// most of the turn still unwritten — and neither the cursor nor a `skipped`
+// retry, both keyed on `updated`, would ever look at it again.
+const (
+	// openCodeRecheckDelay is how long a re-read waits, so the turn has time to
+	// finish writing instead of being chased part by part.
+	openCodeRecheckDelay = 2 * time.Minute
+	// openCodeSessionMaybeActiveWindow bounds which sessions can qualify at
+	// all: one whose `updated` is further behind the pass than this was already
+	// finished when we read it, and re-reading it would be an export for
+	// nothing.
+	openCodeSessionMaybeActiveWindow = 15 * time.Minute
 )
 
 // openCodeReconcileResult is one pass's closed answer.
@@ -261,6 +280,11 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			} else {
 				edit.TotalsChanged = openCodeMergeObservations(l, observations, commitMs)
 				edit.Changed = openCodeForgetSkippedSession(l, candidate.id) || edit.TotalsChanged
+				// A session we may have read mid-turn is booked for ONE later
+				// re-read, so the rest of that turn is still counted.
+				if openCodeScheduleRecheck(l, candidate, plan.recheck[candidate.id], edit.TotalsChanged, commitMs) {
+					edit.Changed = true
+				}
 				// A delegated session this pass could not read is activity the
 				// totals miss, so the card carries the lower-bound notice.
 				if childrenPartial && openCodeMarkTodayPartial(l, openCodeUsageNow()) {
@@ -353,6 +377,10 @@ type openCodeSessionRow struct {
 type openCodeReconcilePlan struct {
 	exports   []openCodeSessionRow
 	remaining int
+	// recheck names, by session id, the exports that are a DUE re-read of a
+	// session a previous pass may have caught mid-turn. The commit path clears
+	// their record, and reschedules only one that raised a figure.
+	recheck map[string]bool
 	// cursorFloorMs is the newest `updated` among sessions this plan will NEVER
 	// export because they fall outside the ledger's retention window. The pass
 	// advances the cursor to it so they are never considered again.
@@ -390,7 +418,11 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 	for _, entry := range ledger.Skipped {
 		stored[entry.SessionHash] = entry.UpdatedMs
 	}
-	plan := openCodeReconcilePlan{}
+	rechecks := map[string]int64{}
+	for _, entry := range ledger.Rechecks {
+		rechecks[entry.SessionHash] = entry.DueAtMs
+	}
+	plan := openCodeReconcilePlan{recheck: map[string]bool{}}
 	retentionFloorMs := openCodeRetentionFloor(now).UnixMilli()
 	var fresh, retries []openCodeSessionRow
 	for _, row := range sessions {
@@ -412,6 +444,14 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 			if row.updatedMs > held {
 				retries = append(retries, row)
 			}
+			continue
+		}
+		if due, ok := rechecks[hash]; ok && due <= now.UnixMilli() {
+			// A re-read is a revisit, so it rides the retry queue's single slot
+			// and its oldest-first merge: it can never cost the pass a fresh
+			// row, nor carry the cursor past one.
+			plan.recheck[row.id] = true
+			retries = append(retries, row)
 			continue
 		}
 		if openCodeBeyondReconcileCursor(ledger, row.updatedMs, hash) {
@@ -512,6 +552,63 @@ func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string)
 		ledger.Skipped = append(ledger.Skipped[:i], ledger.Skipped[i+1:]...)
 		if len(ledger.Skipped) == 0 {
 			ledger.Skipped = nil
+		}
+		return true
+	}
+	return false
+}
+
+// openCodeScheduleRecheck keeps the re-read record for a committed session:
+// the entry it was planned from is cleared, and a new one booked only while the
+// session may still be producing figures. Reports whether anything changed.
+//
+// A first export qualifies on the session's own age: one updated within
+// openCodeSessionMaybeActiveWindow of this pass may have been mid-turn. A
+// re-read qualifies on EVIDENCE instead — it is booked again only when it
+// raised a figure, which is what proves the turn was still running, and is what
+// stops a quiet session being exported forever.
+func openCodeScheduleRecheck(ledger *openCodeUsageLedger, candidate openCodeSessionRow, wasRecheck, raised bool, commitMs int64) bool {
+	changed := openCodeForgetRecheckSession(ledger, candidate.id)
+	switch {
+	case wasRecheck && !raised:
+		// The re-read found nothing new: the turn is over.
+		return changed
+	case wasRecheck:
+	case candidate.updatedMs <= 0 ||
+		commitMs-candidate.updatedMs >= openCodeSessionMaybeActiveWindow.Milliseconds():
+		// Last written long before this pass, so nothing was in flight.
+		return changed
+	}
+	openCodeRememberRecheckSession(ledger, candidate.id, candidate.updatedMs, commitMs+openCodeRecheckDelay.Milliseconds())
+	return true
+}
+
+// openCodeRememberRecheckSession books one later re-read of a session, bounded
+// by openCodeLedgerMaxRechecks (the prune keeps the newest).
+func openCodeRememberRecheckSession(ledger *openCodeUsageLedger, sessionID string, updatedMs, dueAtMs int64) {
+	hash := openCodeUsageHash(sessionID, "")
+	for i := range ledger.Rechecks {
+		if ledger.Rechecks[i].SessionHash == hash {
+			ledger.Rechecks[i].UpdatedMs, ledger.Rechecks[i].DueAtMs = updatedMs, dueAtMs
+			return
+		}
+	}
+	ledger.Rechecks = append(ledger.Rechecks, openCodeRecheckSession{
+		SessionHash: hash, UpdatedMs: updatedMs, DueAtMs: dueAtMs,
+	})
+	openCodePruneRechecks(ledger, openCodeUsageNow())
+}
+
+// openCodeForgetRecheckSession drops a session's re-read record.
+func openCodeForgetRecheckSession(ledger *openCodeUsageLedger, sessionID string) bool {
+	hash := openCodeUsageHash(sessionID, "")
+	for i := range ledger.Rechecks {
+		if ledger.Rechecks[i].SessionHash != hash {
+			continue
+		}
+		ledger.Rechecks = append(ledger.Rechecks[:i], ledger.Rechecks[i+1:]...)
+		if len(ledger.Rechecks) == 0 {
+			ledger.Rechecks = nil
 		}
 		return true
 	}

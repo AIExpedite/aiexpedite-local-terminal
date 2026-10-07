@@ -78,6 +78,11 @@ const (
 	openCodeLedgerMaxStreamSessions = 512
 	// openCodeLedgerMaxSkipped caps the over-cap exports remembered for a retry.
 	openCodeLedgerMaxSkipped = 32
+	// openCodeLedgerMaxRechecks caps the sessions remembered for ONE later
+	// re-read because they may still have been mid-turn when a pass exported
+	// them. Small on purpose: a re-read is a whole export, and only the newest
+	// sessions can ever qualify.
+	openCodeLedgerMaxRechecks = 8
 
 	// openCodeRunMaxSessions bounds the session ids ONE run's tap remembers. A
 	// real run names one; the cap is there because the ids come from vendor
@@ -151,6 +156,22 @@ type openCodeSkippedSession struct {
 	UpdatedMs   int64  `json:"updatedMs"`
 }
 
+// openCodeRecheckSession remembers one session a pass exported while it may
+// still have been running, so a later pass reads it ONCE more. OpenCode writes
+// a turn's later parts without necessarily advancing the session's `updated`,
+// so neither the cursor nor a `skipped` retry (both keyed on `updated`) would
+// ever look at it again. Identified by its 16-hex HASH, like every other
+// session record here.
+type openCodeRecheckSession struct {
+	SessionHash string `json:"sessionHash"`
+	// UpdatedMs is the `updated` the pass exported it at — kept only so the
+	// retention prune can drop the entry with its day.
+	UpdatedMs int64 `json:"updatedMs"`
+	// DueAtMs is the earliest pass clock that may spend an export on the
+	// re-read, so a turn gets time to finish writing.
+	DueAtMs int64 `json:"dueAtMs"`
+}
+
 // openCodeUsageLedger is the persisted state. See the file header for the
 // redaction allowlist.
 type openCodeUsageLedger struct {
@@ -186,8 +207,9 @@ type openCodeUsageLedger struct {
 	// at a time for hours. Reset when a chain ends.
 	ContinuationPasses int `json:"continuationPasses,omitempty"`
 
-	Skipped []openCodeSkippedSession      `json:"skipped,omitempty"`
-	Days    map[string]*openCodeLedgerDay `json:"days,omitempty"`
+	Skipped  []openCodeSkippedSession      `json:"skipped,omitempty"`
+	Rechecks []openCodeRecheckSession      `json:"rechecks,omitempty"`
+	Days     map[string]*openCodeLedgerDay `json:"days,omitempty"`
 }
 
 // openCodeLedgerEdit is what a mutation reports back.
@@ -416,6 +438,7 @@ func openCodePruneLedger(ledger *openCodeUsageLedger) {
 		ledger.Days = nil
 	}
 	openCodePruneSkipped(ledger, now)
+	openCodePruneRechecks(ledger, now)
 }
 
 // openCodePruneSkipped drops over-cap records whose session's `updated` falls
@@ -440,6 +463,30 @@ func openCodePruneSkipped(ledger *openCodeUsageLedger, now time.Time) {
 		return
 	}
 	ledger.Skipped = kept
+}
+
+// openCodePruneRechecks drops re-read records whose session's `updated` falls
+// outside the retention window — nothing such an export could carry would be
+// stored — then bounds the rest to the newest, because an older re-read is the
+// one least likely to still be mid-turn.
+func openCodePruneRechecks(ledger *openCodeUsageLedger, now time.Time) {
+	floor := openCodeRetentionFloor(now).UnixMilli()
+	kept := make([]openCodeRecheckSession, 0, len(ledger.Rechecks))
+	for _, entry := range ledger.Rechecks {
+		if entry.SessionHash == "" || entry.UpdatedMs < floor {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if len(kept) > openCodeLedgerMaxRechecks {
+		sort.SliceStable(kept, func(i, j int) bool { return kept[i].UpdatedMs < kept[j].UpdatedMs })
+		kept = kept[len(kept)-openCodeLedgerMaxRechecks:]
+	}
+	if len(kept) == 0 {
+		ledger.Rechecks = nil
+		return
+	}
+	ledger.Rechecks = kept
 }
 
 /* ──────────────────────────────── merge ─────────────────────────────── */
