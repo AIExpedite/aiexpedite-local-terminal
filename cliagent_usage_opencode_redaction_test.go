@@ -78,6 +78,11 @@ func TestOpenCodeUsageRedaction_NothingButCountsLeavesTheCapture(t *testing.T) {
 
 		startCLIUsagePropagator(cfg)
 		waitHints(t, rec, 1, 0)
+		// The sent hint leaves an armed follow-up. Quiesce the propagator
+		// inside the capture so no later timer callback logs through
+		// os.Stdout while this helper is restoring it.
+		stopCLIUsagePropagator()
+		resetCLIUsagePropagator()
 	})
 	assertNoOpenCodeCanary(t, "the device log", logs, false)
 
