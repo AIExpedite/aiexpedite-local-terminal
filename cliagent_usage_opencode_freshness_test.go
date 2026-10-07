@@ -359,13 +359,14 @@ func TestOpenCodeUsage_TheExportStandsDownWhileTheRunCanStillCommit(t *testing.T
 func TestOpenCodeUsage_AReleasedRunExportsOnTheRebookedRung(t *testing.T) {
 	sched := openCodeUsageFixture(t, 1013)
 	stubOpenCodeExecutable(t)
-	now := time.Now()
+	var now time.Time
 	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
 		return openCodeExportJSON("msg_1", now.UnixMilli(), 300, 40, 0), true
 	})
 
 	session := &CLISession{Command: "opencode"}
 	session.openCodeUsageRun = armOpenCodeUsageRun("opencode", "", "fp-released")
+	now = time.Now() // the run's assistant message: after the floor the arm just took
 	captureOpenCodeUsageLine(session.openCodeUsageRun, `{"type":"session.created","sessionID":"ses_released"}`)
 	session.settleCLIUsageRun(true)
 	openCodeUsageInFlight.Wait()

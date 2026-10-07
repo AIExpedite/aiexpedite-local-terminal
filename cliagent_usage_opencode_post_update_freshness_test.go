@@ -866,9 +866,9 @@ func TestOpenCodeUsage_AnAbandonedLateCommitRestoresTheOwedExport(t *testing.T) 
 	prevWait := openCodeUsageLockWait
 	openCodeUsageLockWait = 20 * time.Millisecond
 	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
-	now := time.Now()
 
 	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	now := time.Now()                       // the late step and the export's message: after the run floor
 	settleOpenCodeUsageRun(run, "ses_late") // no step yet: the turn is owed
 	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || !d[0].owed() {
 		t.Fatalf("debts = %+v, want the owed debt", d)
