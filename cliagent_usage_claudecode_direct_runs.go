@@ -101,15 +101,6 @@ func claudeWatchStampCheck() {
 	}
 }
 
-// claudeCacheFileStamp is a file's (mtime, size), zero when it is unreadable.
-func claudeCacheFileStamp(path string) (int64, int64) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, 0
-	}
-	return info.ModTime().UnixNano(), info.Size()
-}
-
 // claudeDirectRunScanDue reports whether the transcript scan is due, and marks
 // it as run. A skipped scan (offline, draining, unarmed) never reaches here, so
 // it does not move the throttle.

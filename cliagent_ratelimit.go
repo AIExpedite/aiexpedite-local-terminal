@@ -756,9 +756,11 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	defer timer.Stop()
 	select {
 	case res := <-done:
-		if res.err == nil {
+		if res.err == nil && ctx.Err() == nil {
 			// Off the merge lock: the serialized merge released both layers before
 			// it answered.
+			// Skipped once the caller's deadline has passed: the watcher's next
+			// tick stamps the reading instead.
 			claudeStampAfterMerge(fingerprint)
 		}
 		return res.observed, res.err

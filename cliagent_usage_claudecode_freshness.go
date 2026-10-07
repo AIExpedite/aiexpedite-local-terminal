@@ -436,7 +436,14 @@ func claudeRefreshDebtRetired(owed time.Time, attempts int, now time.Time) bool 
 // endpoint already imposed on this device. A stat is cheap enough to do per
 // gather on a path that already reads the same file whole.
 func claudeRateLimitCacheStamp() (modUnixNano, size int64) {
-	info, err := os.Stat(claudeRateLimitCachePath())
+	return claudeCacheFileStamp(claudeRateLimitCachePath())
+}
+
+// claudeCacheFileStamp is claudeRateLimitCacheStamp for any cache path: (mtime,
+// size), zero when the file is unreadable. The usage watcher stamps the
+// installed hook's pinned cache with it too.
+func claudeCacheFileStamp(path string) (modUnixNano, size int64) {
+	info, err := os.Stat(path)
 	if err != nil {
 		return 0, 0
 	}
@@ -1180,10 +1187,21 @@ func claudeStampAfterMerge(fingerprint string) {
 	if !cliUsagePropagatorStarted() {
 		return
 	}
-	if generation, bumped := claudeStampObservedGeneration(fingerprint); bumped &&
-		fingerprint == currentClaudeAccountFingerprint() {
-		noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)
+	generation, bumped := claudeStampObservedGeneration(fingerprint)
+	if !bumped {
+		return
 	}
+	// The stamp itself is synchronous, so the parser that follows a probe
+	// publishes the generation it committed. The signed-in check is not: it
+	// reads the credential store (a `security` spawn on macOS), and this runs
+	// inside the stream-capture stdout scanner. Bumps are rare (a displayed row
+	// advanced), so one short goroutine per bump is cheap.
+	go func() {
+		defer func() { _ = recover() }()
+		if fingerprint == currentClaudeAccountFingerprint() {
+			noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)
+		}
+	}()
 }
 
 // claudeStampObservedGeneration advances this channel's capture generation when
@@ -1210,6 +1228,21 @@ func claudeStampObservedGeneration(fingerprint string) (cliUsageGeneration, bool
 // rotation retries it.
 func claudeStampGeneration(fingerprint string, rotate bool) (generation cliUsageGeneration, bumped, refused bool) {
 	path := claudeRateLimitCachePath()
+	epoch := cliUsageProcessGenerationEpoch.Load()
+	// Unlocked pre-check: every in-process merge reaches here, and most move no
+	// displayed row. Only a possible advance (or a rotation) pays for the cache
+	// gate and file lock; the decision is re-made under them below.
+	if !rotate {
+		if snap, ok := loadClaudeRateLimitSnapshot(path); ok && snap.AccountFingerprint == fingerprint {
+			rows := claudeRowObservationsMs(loadMergedClaudeRateLimitView(fingerprint).buckets, time.Now())
+			if !claudeRowsAdvanced(rows, snap.GenerationRowObservedMs) {
+				if snap.GenerationEpoch == epoch && snap.Generation > 0 {
+					generation = cliUsageGeneration{Epoch: epoch, Counter: snap.Generation}
+				}
+				return generation, false, false
+			}
+		}
+	}
 	// Scoped to the account the stamp is FOR: a stamp is never an account
 	// transition, so a cache another account owns is refused rather than reset.
 	// Creating the file (the pinned cache holds the only readings) is not a
@@ -1218,7 +1251,6 @@ func claudeStampGeneration(fingerprint string, rotate bool) (generation cliUsage
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		allowed = nil
 	}
-	epoch := cliUsageProcessGenerationEpoch.Load()
 	ran, wantWrite := false, false
 	var committed claudeRateLimitSnapshot
 	wrote := mutateClaudeRateLimitSnapshotScoped(path, fingerprint, allowed, func(snap *claudeRateLimitSnapshot) bool {
