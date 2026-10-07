@@ -570,22 +570,12 @@ func cliUsageRecoveryGeneration() *cliUsageGeneration {
 
 // claudeUsageRecoveryGeneration is the committed generation of a Claude cache
 // that holds a numeric reading, versioning a legacy (pre-generation) numeric
-// snapshot first, or nil. A commit whose process exited inside the debounce —
-// an update handoff, a status-line hook — is recovered this way; the backend
-// skips one it already applied.
+// snapshot first, or nil (no cache, no numeric reading, or a versioning write
+// the locks refused — the next numeric commit versions it). A commit whose
+// process exited inside the debounce — an update handoff, a status-line hook —
+// is recovered this way; the backend skips one it already applied.
 func claudeUsageRecoveryGeneration() *cliUsageGeneration {
-	path := claudeRateLimitCachePath()
-	if _, err := os.Stat(path); err != nil {
-		return nil
-	}
-	if g := claudeEnsureCacheGeneration(path); g != nil {
-		return g
-	}
-	snap, ok := loadClaudeRateLimitSnapshot(path)
-	if !ok {
-		return nil
-	}
-	return claudeSnapshotGeneration(snap)
+	return claudeEnsureCacheGeneration(claudeRateLimitCachePath())
 }
 
 // claudeUsageFallbackDetected reports whether the last machine-info gather
