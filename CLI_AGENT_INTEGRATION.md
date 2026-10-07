@@ -2175,7 +2175,12 @@ limit, so any total would be invented.
    releases ACCEPT the flag and exit zero but apply it only after that capped
    query, so a result landing exactly on the 100-row boundary is read as
    TRUNCATED whatever the flag said — the day stays a lower bound instead of a
-   short list passing as a complete one.
+   short list passing as a complete one. Releases 1.2.2–1.2.6 also drop child
+   sessions only AFTER that capped query, so a subagent-heavy store lists a few
+   dozen roots and never reaches the boundary; on those versions (read through
+   the shared `--version` cache) the list counts as truncated unless its oldest
+   root is no newer than the cursor or retention floor — the query is
+   newest-first, so the cap cannot then have dropped a changed root.
 3. **The delegated CHILD sessions a parent export names.** A subagent's tokens
    live in a child session, which `session list` never returns (it asks for
    roots only) and the run stream drops (it keeps only parts whose session is

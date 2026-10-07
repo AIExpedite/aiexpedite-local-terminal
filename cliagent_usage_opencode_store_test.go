@@ -738,7 +738,7 @@ func TestOpenCodeReconcile_ReadsAServiceDefaultSizedListAsTruncated(t *testing.T
 			openCodeUsageFixture(t, now)
 			(&openCodeCLIStub{sessions: sessionList(tc.rows...)}).install(t)
 
-			got, truncated, outcome := listOpenCodeSessionsForUsage(context.Background(), "opencode-stub")
+			got, truncated, outcome := listOpenCodeSessionsForUsage(context.Background(), "opencode-stub", 0)
 			if outcome != "" || len(got) != len(tc.rows) {
 				t.Fatalf("outcome=%q rows=%d, want a clean list of %d", outcome, len(got), len(tc.rows))
 			}
@@ -751,6 +751,67 @@ func TestOpenCodeReconcile_ReadsAServiceDefaultSizedListAsTruncated(t *testing.T
 	// boundary applies when no limit was asked for at all.
 	if !openCodeSessionListHitServiceDefault(openCodeSessionListServiceDefault, 0) {
 		t.Fatal("the unflagged list must read a boundary-sized result as truncated")
+	}
+}
+
+func TestOpenCodeReconcile_ReadsALateRootFilteredListAsTruncatedUnlessItReachesBack(t *testing.T) {
+	// OpenCode 1.2.2–1.2.6 cap the list query at 100 rows BEFORE dropping
+	// child sessions, so a store busy with subagents lists a few dozen roots
+	// and the boundary check never fires. Its query is newest-first, so the
+	// list is trusted only when its oldest root reaches back to what the pass
+	// still needs.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	created := now.UnixMilli()
+	rows := []openCodeSessionRow{{"ses_new", created + 2000}, {"ses_old", created + 1000}}
+	for _, tc := range []struct {
+		name          string
+		version       string
+		coveredFromMs int64
+		rows          []openCodeSessionRow
+		wantTruncated bool
+	}{
+		{"affected, list stops short of the cursor", "1.2.6", created, rows, true},
+		{"affected, first affected release", "1.2.2", created, rows, true},
+		{"affected, list reaches the cursor", "1.2.6", created + 1000, rows, false},
+		{"affected, empty store", "1.2.4", created, nil, false},
+		{"fixed release", "1.2.7", created, rows, false},
+		{"older release", "1.2.1", created, rows, false},
+		{"unreadable version", "", created, rows, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			(&openCodeCLIStub{sessions: sessionList(tc.rows...)}).install(t)
+			openCodeUsageVersion = func(string) string { return tc.version }
+
+			got, truncated, outcome := listOpenCodeSessionsForUsage(context.Background(), "opencode-stub", tc.coveredFromMs)
+			if outcome != "" || len(got) != len(tc.rows) {
+				t.Fatalf("outcome=%q rows=%d, want a clean list of %d", outcome, len(got), len(tc.rows))
+			}
+			if truncated != tc.wantTruncated {
+				t.Fatalf("truncated = %v, want %v", truncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+func TestOpenCodeReconcile_MarksTodayPartialWhenALateRootFilteredListStopsShort(t *testing.T) {
+	// End to end: the pass covers from the retention floor on a fresh ledger,
+	// so an affected release whose oldest listed root is newer than that leaves
+	// today a lower bound instead of a complete-looking total.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.Add(-time.Hour).UnixMilli()
+	(&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_a", created + 1000}),
+		exports: map[string]string{
+			"ses_a": exportWith("ses_a", "msg_a", created, 7, 1, "0"),
+		},
+	}).install(t)
+	openCodeUsageVersion = func(string) string { return "1.2.6" }
+
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	if !openCodeDayPartial(readOpenCodeUsageLedger(), openCodeDayKey(now)) {
+		t.Fatal("today must be partial when an affected list does not reach back to the retention floor")
 	}
 }
 

@@ -49,11 +49,12 @@ func openCodeUsageFixture(t *testing.T, at time.Time) func(time.Time) {
 	prevNow := openCodeUsageNow
 	openCodeUsageNow = func() time.Time { return now }
 
-	prevRun, prevBinary := openCodeRunCommand, openCodeUsageBinary
+	prevRun, prevBinary, prevVersion := openCodeRunCommand, openCodeUsageBinary, openCodeUsageVersion
 	// Nothing resolves a real binary unless a row says so: a developer machine
 	// with OpenCode installed must not have its session store exported by the
 	// unit suite.
 	openCodeUsageBinary = func() string { return "" }
+	openCodeUsageVersion = func(string) string { return "" }
 	openCodeRunCommand = func(context.Context, string, []string, int) ([]byte, bool, error) {
 		t.Fatalf("a test spawned the OpenCode CLI without stubbing openCodeRunCommand")
 		return nil, false, nil
@@ -68,7 +69,7 @@ func openCodeUsageFixture(t *testing.T, at time.Time) func(time.Time) {
 		openCodeUsageRefreshWaitFor(2 * time.Second)
 		openCodeUsageRefreshEnabled.Store(false)
 		openCodeUsageNow = prevNow
-		openCodeRunCommand, openCodeUsageBinary = prevRun, prevBinary
+		openCodeRunCommand, openCodeUsageBinary, openCodeUsageVersion = prevRun, prevBinary, prevVersion
 		openCodeResetRunState()
 		resetOpenCodeUsageLedgerForTests()
 	})

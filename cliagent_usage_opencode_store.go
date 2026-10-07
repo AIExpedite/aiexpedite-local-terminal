@@ -78,6 +78,14 @@ const (
 	// many sessions pays one spurious lower-bound notice; the reverse mistake
 	// loses rows behind the cursor with nothing marking the loss.
 	openCodeSessionListServiceDefault = 100
+	// openCodeSessionListRootFilterFrom and openCodeSessionListRootFilterFixed
+	// bound the releases (1.2.2 up to, not including, 1.2.7) whose list applies
+	// that 100-row limit to ALL sessions and only then drops delegated child
+	// sessions — so a store busy with subagents lists a few dozen roots, well
+	// short of the boundary above, and the short list still looks complete
+	// (anomalyco/opencode#14163, fixed by #14162).
+	openCodeSessionListRootFilterFrom  = "1.2.2"
+	openCodeSessionListRootFilterFixed = "1.2.7"
 	// openCodeExportMaxChildren bounds the delegated child sessions ONE listed
 	// session may pull in. A subagent session is short (one turn's worth of
 	// messages), so the cost of following them is small next to the parent's
@@ -133,6 +141,14 @@ var openCodeReconcileGroup singleflight.Group
 // openCodeUsageBinary resolves the CLI a pass runs. A seam so a test never
 // reaches a real install.
 var openCodeUsageBinary = resolveOpenCodeExecutable
+
+// openCodeUsageVersion is the installed CLI's major.minor.patch, or "" when it
+// cannot be read. It rides the shared (path, mtime, size) version cache, so a
+// pass spawns `--version` at most once per binary. A seam so a test never
+// reaches a real install.
+var openCodeUsageVersion = func(path string) string {
+	return parseOpenCodeVersion(openCodeProbeVersion(path))
+}
 
 // openCodeRunCommand runs one bounded OpenCode command and returns its stdout
 // and whether the capture buffer FILLED (i.e. there was more to say than we
@@ -207,7 +223,11 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 		return openCodeFinishPass(openCodeReconcileResult{Outcome: openCodeReconcileLaunchError})
 	}
 
-	sessions, truncated, listOutcome := listOpenCodeSessionsForUsage(ctx, path)
+	coveredFromMs := openCodeRetentionFloor(now).UnixMilli()
+	if cursor := readOpenCodeUsageLedger().ReconcileCursorMs; cursor > coveredFromMs {
+		coveredFromMs = cursor
+	}
+	sessions, truncated, listOutcome := listOpenCodeSessionsForUsage(ctx, path, coveredFromMs)
 	if listOutcome != "" {
 		return openCodeFinishPass(openCodeReconcileResult{Outcome: listOutcome})
 	}
@@ -736,7 +756,12 @@ func openCodeForgetRecheckHash(ledger *openCodeUsageLedger, hash string) bool {
 // recently active are considered — the day is then a lower bound, because a
 // changed session the cut dropped is never exported. The last return is "" on
 // success, or the closed outcome the pass must report.
-func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []openCodeSessionRow, truncated bool, outcome string) {
+//
+// coveredFromMs is the oldest `updated` the pass still needs to see — the
+// cursor, or the retention floor when that is later. A release that filters
+// child sessions after its capped query is trusted only when its list reaches
+// back that far.
+func listOpenCodeSessionsForUsage(ctx context.Context, path string, coveredFromMs int64) (rows []openCodeSessionRow, truncated bool, outcome string) {
 	// OpenCode's list service defaults an unspecified limit to 100 rows, so the
 	// unflagged command silently hides everything older than the newest 100 —
 	// and those rows fall behind the cursor once the ones it DID return are
@@ -754,7 +779,41 @@ func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []open
 	if outcome == "" && openCodeSessionListHitServiceDefault(len(rows), asked) {
 		truncated = true
 	}
+	if outcome == "" && !truncated &&
+		openCodeSessionListFiltersRootsLate(openCodeUsageVersion(path)) &&
+		!openCodeSessionListReachesBack(rows, coveredFromMs) {
+		truncated = true
+	}
 	return rows, truncated, outcome
+}
+
+// openCodeSessionListFiltersRootsLate reports a release whose list caps the
+// query at the service default BEFORE dropping child sessions, so the number of
+// roots it returns says nothing about whether the cap was hit. An unreadable
+// version is not one of them: the boundary check above still applies.
+func openCodeSessionListFiltersRootsLate(version string) bool {
+	return version != "" &&
+		compareSemver(version, openCodeSessionListRootFilterFrom) >= 0 &&
+		compareSemver(version, openCodeSessionListRootFilterFixed) < 0
+}
+
+// openCodeSessionListReachesBack reports whether a late-filtering list still
+// covers every root updated after coveredFromMs. Its query is ordered newest
+// `updated` first, so the cap cut at or below the oldest root it returned: when
+// that root is no newer than coveredFromMs, no changed root can be missing.
+// Otherwise the list is a lower bound — an install that simply has no older
+// session pays one spurious notice on these releases, the reverse mistake
+// advances the cursor past roots that were never listed. An empty list has no
+// cut to place and is read as an empty store, as the clean silent exit is; an
+// undatable row places no cut either.
+func openCodeSessionListReachesBack(rows []openCodeSessionRow, coveredFromMs int64) bool {
+	oldest := int64(0)
+	for _, row := range rows {
+		if row.updatedMs > 0 && (oldest == 0 || row.updatedMs < oldest) {
+			oldest = row.updatedMs
+		}
+	}
+	return oldest == 0 || oldest <= coveredFromMs
 }
 
 // openCodeSessionListHitServiceDefault reports a row count that stopped exactly

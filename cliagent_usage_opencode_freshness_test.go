@@ -711,6 +711,30 @@ func TestOpenCodeRestart_AnUnsettledFloorOwesOneReconcile(t *testing.T) {
 	}
 }
 
+func TestOpenCodeRestart_AnAgedOutFloorMarksItsDayALowerBound(t *testing.T) {
+	// A restart more than six hours after the interruption owes nothing, as an
+	// aged-out debt does — but the floor is the only evidence the run went
+	// unreconciled, so its day must carry the notice before it is dropped.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	(&openCodeCLIStub{launchError: true}).install(t)
+
+	floor := now.Add(-openCodeRunDebtMaxAge - time.Minute)
+	if !writeJSONFileAtomic(openCodeUsageFreshnessPath(), openCodeUsageFreshness{
+		SchemaVersion: openCodeUsageFreshnessSchema,
+		RunFloorMs:    floor.UnixMilli(),
+	}) {
+		t.Fatal("could not seed the previous process's state")
+	}
+	adoptAndPayOwedOpenCodeRunDebt(now)
+	if state := readOpenCodeFreshness(t); state.owed() || state.RunFloorMs != 0 {
+		t.Fatalf("state = %+v, want the aged floor dropped without a debt", state)
+	}
+	if !openCodeDayPartial(readOpenCodeUsageLedger(), openCodeDayKey(floor)) {
+		t.Fatal("the abandoned run's day must be marked a lower bound")
+	}
+}
+
 func TestOpenCodeRestart_ReArmsABookedRung(t *testing.T) {
 	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
 	openCodeDebtFixture(t, now)
@@ -1175,6 +1199,22 @@ func TestOpenCodeRecheck_DoesNotClaimAWakeUpItCouldNotPersist(t *testing.T) {
 	}
 	if openCodeRecheckBookRetryPending() {
 		t.Fatal("a booking that reached disk must retire its retry")
+	}
+}
+
+func TestOpenCodeRecheck_AnExhaustedBookingRetryMarksTodayALowerBound(t *testing.T) {
+	// Past the retry budget nothing will ever wake for the durable record:
+	// continuationDue is still clear, so startup recovery skips it, and the
+	// pass that left it carried LastPassStartedAtMs past the store activity.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+
+	openCodeArmRecheckBookRetry(openCodeRunDebtMaxAttempts + 1)
+	if openCodeRecheckBookRetryPending() {
+		t.Fatal("an exhausted retry budget must not arm another retry")
+	}
+	if !openCodeDayPartial(readOpenCodeUsageLedger(), openCodeDayKey(now)) {
+		t.Fatal("giving up on the booking must leave today a lower bound")
 	}
 }
 

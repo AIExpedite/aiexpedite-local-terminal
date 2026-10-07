@@ -1005,6 +1005,15 @@ func openCodeArmRecheckBookRetry(attempt int) {
 	delay, ok := refreshRetryDelayForAttempt(attempt, openCodeRunDebtMaxAttempts, openCodeRunDebtRetryLadder)
 	if !ok || IsShutdownInProgress() {
 		logOpenCodeUsage("recheck book gave up attempts=%d", attempt)
+		// The record is durable but nothing will ever wake for it: the pass
+		// that left it carried LastPassStartedAtMs past the store activity, and
+		// startup recovery skips it while continuationDue reads clear. Whatever
+		// the turn wrote after that export is uncounted, so today is a lower
+		// bound — best effort, on the same filesystem that just refused. A
+		// shutdown is not giving up: the record waits for the next process.
+		if !IsShutdownInProgress() {
+			openCodeMarkTodayPartialNow()
+		}
 		return
 	}
 	r := &openCodeRecheckBookRetry
@@ -1337,6 +1346,7 @@ func payOwedOpenCodeUsageRefresh() {
 
 func adoptAndPayOwedOpenCodeRunDebt(startedAt time.Time) {
 	now := openCodeUsageNow()
+	abandonedFloorMs := int64(0)
 	state := updateOpenCodeUsageFreshness(func(state *openCodeUsageFreshness) {
 		floorBefore := state.RunFloorMs
 		openCodeRebaseFutureFreshness(state, now)
@@ -1350,11 +1360,20 @@ func adoptAndPayOwedOpenCodeRunDebt(startedAt time.Time) {
 		// A floor with no debt beside it belongs to a run the previous process
 		// was cut off in — a self-update, a crash. It owes one reconcile.
 		if now.Sub(time.UnixMilli(state.RunFloorMs)) > openCodeRunDebtMaxAge {
+			// Too old to owe, as an aged-out debt is — but the floor is the
+			// only evidence the run went unreconciled, so its day becomes a
+			// lower bound before the floor is dropped.
+			abandonedFloorMs = state.RunFloorMs
 			state.RunFloorMs = 0
 			return
 		}
 		openCodeOweReconcile(state, now, openCodeCompletionMs(now))
 	})
+	if abandonedFloorMs > 0 {
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			return openCodeLedgerEdit{Changed: openCodeMarkDayPartial(l, openCodeDayKey(time.UnixMilli(abandonedFloorMs)))}
+		})
+	}
 	if state.owed() {
 		if state.NextAttemptAtMs > now.UnixMilli() {
 			openCodeArmRunDebtRetry(state.debtID(), time.UnixMilli(state.NextAttemptAtMs).Sub(now))
