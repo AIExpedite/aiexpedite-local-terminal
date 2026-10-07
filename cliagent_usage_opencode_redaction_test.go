@@ -21,7 +21,7 @@ import (
 var (
 	openCodeLedgerAllowedKeys = map[string]bool{
 		"schemaVersion": true, "generation": true, "epoch": true, "counter": true,
-		"reconcileCursorMs": true, "lastSuccessfulReconcileAtMs": true,
+		"reconcileCursorMs": true, "reconcileCursorTies": true, "lastSuccessfulReconcileAtMs": true,
 		"lastPassOutcome": true, "lastPassStartedAtMs": true,
 		"continuationDue": true, "continuationFailures": true, "continuationFirstFailureAtMs": true,
 		"continuationPasses": true,
@@ -42,6 +42,7 @@ var (
 		openCodeReconcileOK: true, openCodeReconcileNoChange: true, openCodeReconcileMore: true,
 		openCodeReconcileUnsupported: true, openCodeReconcileTimeout: true,
 		openCodeReconcileLaunchError: true, openCodeReconcileOffline: true,
+		openCodeReconcileWriteError: true,
 	}
 )
 
@@ -146,6 +147,7 @@ func TestOpenCodeUsage_EveryFieldOfBothStateFilesIsOnTheAllowlist(t *testing.T) 
 		SchemaVersion:                openCodeUsageLedgerSchema,
 		Generation:                   cliUsageGeneration{Epoch: 4503599627370497, Counter: 7},
 		ReconcileCursorMs:            1790500000200,
+		ReconcileCursorTies:          []string{"a31580b57ec1119e"},
 		LastSuccessfulReconcileAtMs:  1790500000300,
 		LastPassOutcome:              openCodeReconcileMore,
 		LastPassStartedAtMs:          1790500000100,

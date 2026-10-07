@@ -174,7 +174,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			// Step the cursor past everything older than the retention window
 			// in ONE write, so months of history cost no exports at all.
 			if plan.cursorFloorMs > l.ReconcileCursorMs {
-				l.ReconcileCursorMs, edit.Changed = plan.cursorFloorMs, true
+				l.ReconcileCursorMs, l.ReconcileCursorTies, edit.Changed = plan.cursorFloorMs, nil, true
 			}
 			if plan.undatable > 0 && openCodeMarkTodayPartial(l, openCodeUsageNow()) {
 				edit.Changed = true
@@ -225,8 +225,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			}
 			// The cursor advances past EVERY attempted session, over-cap
 			// included, so no outcome can ever stall on one.
-			if candidate.updatedMs > l.ReconcileCursorMs {
-				l.ReconcileCursorMs = candidate.updatedMs
+			if openCodeAdvanceReconcileCursor(l, candidate) {
 				edit.Changed = true
 			}
 			if edit.Changed || edit.TotalsChanged {
@@ -234,10 +233,16 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			}
 			return edit
 		})
-		// `committed` means it reached DISK: a refused write leaves the cursor
-		// where it was, so the session is still a candidate and the pass must
-		// not report ok.
-		if landed && persisted {
+		if !persisted {
+			// A refused write leaves the cursor where it was, so the session is
+			// still a candidate. Settling it anyway could end the pass as
+			// no_change — a success that pays the debt for figures that never
+			// reached disk — so the pass stops as a failure instead.
+			result.Outcome, result.Remaining = openCodeReconcileWriteError, remaining()
+			return openCodeFinishPass(result)
+		}
+		// `committed` means it reached DISK.
+		if landed {
 			committed = true
 		}
 		settled++
@@ -348,7 +353,7 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 			}
 			continue
 		}
-		if row.updatedMs > ledger.ReconcileCursorMs {
+		if openCodeBeyondReconcileCursor(ledger, row.updatedMs, hash) {
 			fresh = append(fresh, row)
 		}
 	}
@@ -367,6 +372,42 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 	}
 	plan.remaining = len(fresh) + len(retries) - len(plan.exports)
 	return plan
+}
+
+// openCodeBeyondReconcileCursor reports whether a listed session is past the
+// cursor. A session whose `updated` EQUALS the cursor is past it unless it is
+// one of the ties already committed there: a pass that ran out of export slots
+// inside a group of sessions sharing one stamp must not step over the rest.
+func openCodeBeyondReconcileCursor(ledger openCodeUsageLedger, updatedMs int64, hash string) bool {
+	if updatedMs != ledger.ReconcileCursorMs {
+		return updatedMs > ledger.ReconcileCursorMs
+	}
+	for _, tie := range ledger.ReconcileCursorTies {
+		if tie == hash {
+			return false
+		}
+	}
+	return true
+}
+
+// openCodeAdvanceReconcileCursor moves the cursor to a committed session's
+// `updated` and records it among the ties at that stamp. A retried session
+// older than the cursor leaves it alone. The ties are bounded by the session
+// list's own cap, so a pathological list cannot grow the ledger.
+func openCodeAdvanceReconcileCursor(ledger *openCodeUsageLedger, candidate openCodeSessionRow) bool {
+	hash := openCodeUsageHash(candidate.id, "")
+	switch {
+	case candidate.updatedMs > ledger.ReconcileCursorMs:
+		ledger.ReconcileCursorMs = candidate.updatedMs
+		ledger.ReconcileCursorTies = []string{hash}
+		return true
+	case candidate.updatedMs == ledger.ReconcileCursorMs &&
+		openCodeBeyondReconcileCursor(*ledger, candidate.updatedMs, hash) &&
+		len(ledger.ReconcileCursorTies) < openCodeSessionListMaxSessions:
+		ledger.ReconcileCursorTies = append(ledger.ReconcileCursorTies, hash)
+		return true
+	}
+	return false
 }
 
 // openCodeRememberSkippedSession records an over-cap session for a retry,
@@ -523,6 +564,15 @@ type openCodeExportMessageJSON struct {
 		Tokens openCodeTokensJSON `json:"tokens"`
 		Cost   json.RawMessage    `json:"cost"`
 	} `json:"info"`
+	// Parts holds each step's own figures. OpenCode OVERWRITES info.tokens on
+	// every step (it ends as the last step's), while each step-finish part
+	// keeps that step's usage — so a multi-step turn is only whole when its
+	// parts are summed, exactly as the stream tap sums step_finish events.
+	Parts []struct {
+		Type   string             `json:"type"`
+		Tokens openCodeTokensJSON `json:"tokens"`
+		Cost   json.RawMessage    `json:"cost"`
+	} `json:"parts"`
 }
 
 // parseOpenCodeExport folds an export's assistant messages into observations.
@@ -554,20 +604,22 @@ func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMes
 		if role := strings.ToLower(strings.TrimSpace(info.Role)); role != "" && role != "assistant" {
 			continue
 		}
-		observation := openCodeObservedMessage{
+		var steps openCodeMessageUsage
+		for _, part := range message.Parts {
+			if isOpenCodeStepFinishType(part.Type) {
+				openCodeAddStepUsage(&steps, openCodeUsageFromJSON(part.Tokens, part.Cost))
+			}
+		}
+		// The per-field max of the summed steps and info: info alone is the
+		// last step's tokens, but it is all an export without parts carries
+		// (and its cost is already cumulative).
+		usage, _ := openCodeMergeMessageUsage(steps, openCodeUsageFromJSON(info.Tokens, info.Cost))
+		out = append(out, openCodeObservedMessage{
 			SessionID: firstNonEmpty(info.SessionID, sessionID),
 			MessageID: info.ID,
 			EventAt:   openCodeFrameEventTime(info.Time.Created),
-			Usage: openCodeMessageUsage{
-				In:         openCodeJSONInt(info.Tokens.Input),
-				Out:        openCodeJSONInt(info.Tokens.Output),
-				Reasoning:  openCodeJSONInt(info.Tokens.Reasoning),
-				CacheRead:  openCodeJSONInt(info.Tokens.Cache.Read),
-				CacheWrite: openCodeJSONInt(info.Tokens.Cache.Write),
-				CostMicros: openCodeJSONMicros(info.Cost),
-			},
-		}
-		out = append(out, observation)
+			Usage:     usage,
+		})
 	}
 	// An export with no assistant message is a real, recognised answer.
 	return out, true

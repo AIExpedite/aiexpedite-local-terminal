@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -509,5 +510,35 @@ func TestOpenCodeSession_APromptlessSessionOwesNothing(t *testing.T) {
 	}
 	if _, _, rows := todayTotals(t, now); rows != 0 {
 		t.Fatalf("rows = %d, want none", rows)
+	}
+}
+
+// A shell-wrapped launch carries its prompt in the script and runs at once, so
+// no stdin delivery is ever recorded for it. It must still settle as a run —
+// here an uncovered one, since its stream is not tapped — rather than being
+// withdrawn as a promptless session that ran no turn.
+func TestOpenCodeSession_AShellWrappedRunOwesAReconcile(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh on PATH")
+	}
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	// A reconcile that answers "nothing changed", so the owed pass is
+	// observable rather than reaching a real install.
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+
+	run := runOpenCodeSessionStart(t, commandMsg{
+		Type: "session_start", Command: "sh",
+		Args: []string{"-c", "opencode run 'implement the feature' </dev/null"},
+	}, openCodePipeUsageFrames(now.UnixMilli()))
+	if run.err != nil || !run.spawned {
+		t.Fatalf("the session did not run: err=%v spawned=%v", run.err, run.spawned)
+	}
+	if !openCodeUsageRefreshWaitFor(5 * time.Second) {
+		t.Fatal("the usage settle never went idle")
+	}
+
+	if ledger := readOpenCodeUsageLedger(); ledger.LastPassOutcome == "" {
+		t.Fatal("the wrapped run was withdrawn: its owed reconcile never ran")
 	}
 }

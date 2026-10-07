@@ -793,14 +793,85 @@ func TestOpenCodeReconcile_ARefusedCommitIsNotReportedAsOk(t *testing.T) {
 	}).install(t)
 
 	result := reconcileOpenCodeUsageOnce(context.Background(), now)
-	if result.Outcome == openCodeReconcileOK {
-		t.Fatal("a pass whose every write was refused must not report ok")
+	// Not no_change either: that is a success too, and it would PAY the run
+	// debt for figures that never reached disk, losing the automatic retry.
+	if openCodeReconcileSucceeded(result.Outcome) {
+		t.Fatalf("outcome = %q: a pass whose every write was refused must not succeed", result.Outcome)
 	}
-	if result.Outcome != openCodeReconcileNoChange {
-		t.Fatalf("outcome = %q, want no_change", result.Outcome)
+	if result.Outcome != openCodeReconcileWriteError {
+		t.Fatalf("outcome = %q, want write_error", result.Outcome)
+	}
+	// The refused session is still a candidate, not settled.
+	if result.Remaining != 1 {
+		t.Fatalf("remaining = %d, want the refused session still counted", result.Remaining)
 	}
 	// And nothing is on record to license a zero row.
 	if metrics, _, _ := openCodeLedgerMetrics(now); len(metrics) != 0 {
 		t.Fatalf("metrics = %+v, want none", metrics)
+	}
+}
+
+func TestOpenCodeReconcile_SumsEveryExportedStepOfOneMessage(t *testing.T) {
+	// OpenCode overwrites info.tokens on each step, so a tool-calling turn's
+	// info carries only its LAST step (20+4). The step-finish parts keep each
+	// step's own figures; reading info alone would drop the first step's 10+2.
+	now := time.UnixMilli(1790400000600)
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_steps", now.UnixMilli()}),
+		exports:  map[string]string{"ses_steps": openCodeFixture(t, "export_two_steps.json")},
+	}).install(t)
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok", result.Outcome)
+	}
+	tokens, cost, rows := todayTotals(t, now)
+	if rows != 1 || tokens != 36 || cost != 2000 {
+		t.Fatalf("rows=%d tokens=%d cost=%d, want 1/36/2000 (both steps)", rows, tokens, cost)
+	}
+}
+
+func TestOpenCodeReconcile_KeepsEqualTimestampSessionsBeyondTheCursor(t *testing.T) {
+	// Four sessions share one `updated` stamp. The first pass exports three and
+	// moves the cursor to that stamp; the fourth must still be a candidate,
+	// not stepped over by a strict `>` against the cursor.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	stamp := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(
+			openCodeSessionRow{"ses_a", stamp},
+			openCodeSessionRow{"ses_b", stamp},
+			openCodeSessionRow{"ses_c", stamp},
+			openCodeSessionRow{"ses_d", stamp},
+		),
+		exports: map[string]string{
+			"ses_a": exportWith("ses_a", "msg_a", stamp, 1, 0, "0"),
+			"ses_b": exportWith("ses_b", "msg_b", stamp, 2, 0, "0"),
+			"ses_c": exportWith("ses_c", "msg_c", stamp, 3, 0, "0"),
+			"ses_d": exportWith("ses_d", "msg_d", stamp, 4, 0, "0"),
+		},
+	}).install(t)
+
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileMore {
+		t.Fatalf("first outcome = %q, want more with one tied session left", first.Outcome)
+	}
+	if second := reconcileOpenCodeUsageOnce(context.Background(), now); second.Outcome != openCodeReconcileOK {
+		t.Fatalf("second outcome = %q, want ok", second.Outcome)
+	}
+	if got := stub.recorded(); len(got) != 6 || got[5] != "export ses_d" {
+		t.Fatalf("calls = %v, want the fourth tied session exported, and only it", got)
+	}
+	if tokens, _, rows := todayTotals(t, now); tokens != 10 || rows != 4 {
+		t.Fatalf("tokens=%d rows=%d, want all four tied sessions", tokens, rows)
+	}
+
+	// The whole group is now behind the cursor: nothing is exported again.
+	before := stub.exportCount()
+	if third := reconcileOpenCodeUsageOnce(context.Background(), now); third.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("third outcome = %q, want no_change", third.Outcome)
+	}
+	if stub.exportCount() != before {
+		t.Fatal("a tied session already committed must not be exported again")
 	}
 }

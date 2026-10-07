@@ -2750,10 +2750,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// still spent tokens we could not read, so it owes one bounded reconcile.
 	// Asynchronous — never delays session_ended.
 	if session.openCodeUsage != nil && session.openCodeUsageSettled.CompareAndSwap(false, true) {
-		if !session.openCodePromptDelivered.Load() {
-			// No prompt ever reached the child, so there was no turn to
-			// account for: withdraw the run rather than owing a reconcile for
-			// it (openCodePromptDelivered).
+		if isOpenCodeCommand(session.Command) && !session.openCodePromptDelivered.Load() {
+			// No prompt ever reached the stdin-fed child, so there was no turn
+			// to account for: withdraw the run rather than owing a reconcile
+			// for it (openCodePromptDelivered). Only a DIRECT opencode session
+			// waits on stdin this way — a shell-wrapped launch (`bash -c
+			// 'opencode run …'`) carries its prompt in the script and runs at
+			// once, so it settles like any other run.
 			session.openCodeUsage.Disarm()
 		} else {
 			settleOpenCodeUsageRunAsync(session.openCodeUsage, err == nil && session.openCodeTerminalSeen.Load())

@@ -2161,7 +2161,11 @@ limit, so any total would be invented.
    `session list --format json` + `export <id>`. It covers the runs whose stream
    we never see — a direct `opencode` in the user's own shell or TUI, every
    `execute` and Unix PTY run (both terminal-managed, never tapped), and a stream
-   cut off by a timeout, a kill or an agent self-update.
+   cut off by a timeout, a kill or an agent self-update. An export is summed the
+   same way: OpenCode OVERWRITES a message's `info.tokens` on every step (it
+   ends as the last step's), while each `step-finish` part keeps that step's own
+   figures — so the reconcile sums the parts and keeps the field-wise max of
+   that sum and `info`, which is all an export without parts carries.
 
 The ledger then keeps, **field by field, the MAX** of the stream's summed figure
 and any other observation of the same message, so a stream and an export of the
@@ -2210,7 +2214,7 @@ bounded pass, a missed one costs the reading.
 | --- | --- | --- | --- |
 | native chat | [opencode_native.go](opencode_native.go) `runOneShot` | `native chat` | yes |
 | pipe session | [session.go](session.go) `StartSession` → `waitForExit` | `pipe session` | yes |
-| | …armed at spawn so the tap exists before any output, but WITHDRAWN at exit when no prompt ever reached the child (`openCodePromptDelivered`, set at the same three delivery sites as `codexUsageFloorMs`). A one-shot `opencode run` opened without a prompt — the chat-direct flow opens on model selection — has run no turn and may never, and owing a reconcile for each abandoned chat would spend a bounded pass on a run that never happened. | | |
+| | …armed at spawn so the tap exists before any output, but WITHDRAWN at exit when a DIRECT `opencode` session (`isOpenCodeCommand`) never got a prompt on stdin (`openCodePromptDelivered`, set at the same three delivery sites as `codexUsageFloorMs`). A one-shot `opencode run` opened without a prompt — the chat-direct flow opens on model selection — has run no turn and may never, and owing a reconcile for each abandoned chat would spend a bounded pass on a run that never happened. A shell-wrapped launch (`bash -c 'opencode run …'`) carries its prompt in the script, so it is never withdrawn: it settles like any untapped run and owes a reconcile. | | |
 | maintenance smoke | [cliagent_smoke_opencode.go](cliagent_smoke_opencode.go) | `smoke` | yes (before the bytes are discarded) |
 | execute, no tty | [pubsub.go](pubsub.go) `runLocalCommandUnix` | `local execute` | no — always owes |
 | execute, Windows chain | [pubsub.go](pubsub.go) `runLocalCommandWindows`, armed at function ENTRY (no single post-Start hook) | `windows execute` | no — always owes |
@@ -2279,7 +2283,11 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   no outcome can stall on one. An over-cap session the stream already counted is
   simply stepped over; any other is remembered and retried when its `updated`
   rises, taking at most 1 of the 3 export slots while sessions beyond the cursor
-  remain.
+  remain. Several sessions can share one `updated` stamp, so the cursor also
+  keeps `reconcileCursorTies` — the hashes of the sessions committed AT it — and
+  a session whose `updated` equals the cursor is still a candidate unless it is
+  one of them. A pass that runs out of slots inside such a group therefore never
+  steps over the rest of it.
 
 ### Discover, and survive
 
@@ -2331,9 +2339,10 @@ reading, never a run — but "best-effort" is not the same answer everywhere:
   the reconcile that can read them back from OpenCode's own store.
 - On a **reconcile commit**, `committed` means it reached disk. A refused write
   leaves the cursor where it was, so the session is still a candidate and the
-  pass reports `no_change` rather than `ok` — `ok` is what licenses the zero row
-  and stamps `lastSuccessfulReconcileAtMs`, and neither may claim a complete
-  reading of a day nothing was written for.
+  pass stops as `write_error` — a failure that spends budget like `timeout`.
+  Neither success outcome may stand in for it: `ok` licenses the zero row and
+  stamps `lastSuccessfulReconcileAtMs`, and `no_change` would PAY the run debt
+  for figures that never reached disk, losing the automatic retry.
 - Everywhere else (a pass stamp, the continuation flags) a refused write costs
   one reading and the next pass re-establishes it.
 

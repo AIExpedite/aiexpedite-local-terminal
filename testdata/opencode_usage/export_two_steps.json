@@ -1,0 +1,25 @@
+{
+  "info": {"id": "ses_steps", "title": "synthetic"},
+  "messages": [
+    {
+      "info": {
+        "id": "msg_steps",
+        "sessionID": "ses_steps",
+        "role": "assistant",
+        "time": {"created": 1790400000600},
+        "cost": 0.002,
+        "tokens": {"input": 20, "output": 4, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+      },
+      "parts": [
+        {"type": "step-start"},
+        {"type": "tool", "tool": "read"},
+        {"type": "step-finish", "reason": "tool-calls", "cost": 0.001,
+         "tokens": {"input": 10, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}}},
+        {"type": "step-start"},
+        {"type": "text", "text": "synthetic"},
+        {"type": "step-finish", "reason": "stop", "cost": 0.001,
+         "tokens": {"input": 20, "output": 4, "reasoning": 0, "cache": {"read": 0, "write": 0}}}
+      ]
+    }
+  ]
+}

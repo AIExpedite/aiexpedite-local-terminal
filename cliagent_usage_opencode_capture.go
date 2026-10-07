@@ -99,6 +99,11 @@ const (
 	openCodeReconcileTimeout     = "timeout"
 	openCodeReconcileLaunchError = "launch_error"
 	openCodeReconcileOffline     = "offline"
+	// openCodeReconcileWriteError is a commit the ledger refused to persist (a
+	// read-only or full data dir). The session is still a candidate, so the
+	// pass fails and spends budget like a timeout — it never reports a success
+	// that would pay a debt for figures that never reached disk.
+	openCodeReconcileWriteError = "write_error"
 )
 
 // openCodeReconcileSucceeded reports the two outcomes that reached the end of
@@ -154,6 +159,10 @@ type openCodeUsageLedger struct {
 	// ReconcileCursorMs is the `updated` time of the newest session a reconcile
 	// has committed.
 	ReconcileCursorMs int64 `json:"reconcileCursorMs,omitempty"`
+	// ReconcileCursorTies holds the hashes of the sessions committed AT
+	// ReconcileCursorMs. Several sessions can share one `updated` stamp, and a
+	// pass that stops inside such a group must not step over the rest of it.
+	ReconcileCursorTies []string `json:"reconcileCursorTies,omitempty"`
 	// LastSuccessfulReconcileAtMs is set only by a pass that reached the end of
 	// the changed-session list (ok / no_change) — never by `more`.
 	LastSuccessfulReconcileAtMs int64 `json:"lastSuccessfulReconcileAtMs,omitempty"`
@@ -856,12 +865,7 @@ func (h *openCodeRunUsage) Observe(line string) {
 		}
 		// Each step_finish carries only ITS step's figures, so they SUM within
 		// the message.
-		entry.Usage.In += openCodeClampUsageValue(frame.Usage.In)
-		entry.Usage.Out += openCodeClampUsageValue(frame.Usage.Out)
-		entry.Usage.Reasoning += openCodeClampUsageValue(frame.Usage.Reasoning)
-		entry.Usage.CacheRead += openCodeClampUsageValue(frame.Usage.CacheRead)
-		entry.Usage.CacheWrite += openCodeClampUsageValue(frame.Usage.CacheWrite)
-		entry.Usage.CostMicros += openCodeClampUsageValue(frame.Usage.CostMicros)
+		openCodeAddStepUsage(&entry.Usage, frame.Usage)
 		if entry.Usage.In+entry.Usage.Out+entry.Usage.Reasoning > 0 {
 			h.sawTokens = true
 		}
@@ -1020,15 +1024,30 @@ func parseOpenCodeUsageFrame(line string) (openCodeUsageFrame, bool) {
 		StepFinish: isOpenCodeStepFinishType(raw.Type) || isOpenCodeStepFinishType(raw.Part.Type),
 		EventAt:    openCodeFrameEventTime(raw.Timestamp),
 	}
-	frame.Usage = openCodeMessageUsage{
-		In:         openCodeJSONInt(raw.Part.Tokens.Input),
-		Out:        openCodeJSONInt(raw.Part.Tokens.Output),
-		Reasoning:  openCodeJSONInt(raw.Part.Tokens.Reasoning),
-		CacheRead:  openCodeJSONInt(raw.Part.Tokens.Cache.Read),
-		CacheWrite: openCodeJSONInt(raw.Part.Tokens.Cache.Write),
-		CostMicros: openCodeJSONMicros(raw.Part.Cost),
-	}
+	frame.Usage = openCodeUsageFromJSON(raw.Part.Tokens, raw.Part.Cost)
 	return frame, true
+}
+
+// openCodeUsageFromJSON reads one token block and its cost.
+func openCodeUsageFromJSON(tokens openCodeTokensJSON, cost json.RawMessage) openCodeMessageUsage {
+	return openCodeMessageUsage{
+		In:         openCodeJSONInt(tokens.Input),
+		Out:        openCodeJSONInt(tokens.Output),
+		Reasoning:  openCodeJSONInt(tokens.Reasoning),
+		CacheRead:  openCodeJSONInt(tokens.Cache.Read),
+		CacheWrite: openCodeJSONInt(tokens.Cache.Write),
+		CostMicros: openCodeJSONMicros(cost),
+	}
+}
+
+// openCodeAddStepUsage adds one step's figures to a message's running sum.
+func openCodeAddStepUsage(into *openCodeMessageUsage, step openCodeMessageUsage) {
+	into.In += openCodeClampUsageValue(step.In)
+	into.Out += openCodeClampUsageValue(step.Out)
+	into.Reasoning += openCodeClampUsageValue(step.Reasoning)
+	into.CacheRead += openCodeClampUsageValue(step.CacheRead)
+	into.CacheWrite += openCodeClampUsageValue(step.CacheWrite)
+	into.CostMicros += openCodeClampUsageValue(step.CostMicros)
 }
 
 // isOpenCodeStepFinishType matches the step-completion event by SHAPE rather
