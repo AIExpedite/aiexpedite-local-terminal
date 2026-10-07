@@ -3,7 +3,7 @@
 //
 // Classifying a Windows execute now DECODES the command's payload, which is a
 // user's prompt and may carry credentials, tokens and file contents. The only
-// thing that may leave cliagent_usage_antigravity_command.go is a bool: no log
+// thing that may leave cliagent_usage_wrapped_command.go is a bool: no log
 // line, no cache field, no published usage entry, whether the payload matched
 // or not. A leak here would be worse than the staleness this feature fixes —
 // the agent log is uploaded with diagnostics and the cache is read by the

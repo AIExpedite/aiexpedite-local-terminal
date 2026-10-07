@@ -1,19 +1,23 @@
-// cliagent_usage_antigravity_command.go — "will spawning this start `agy`?"
+// cliagent_usage_wrapped_command.go — "will spawning this start <CLI>?"
 //
 // Two questions about a command, two predicates, neither derived from the other:
 //
-//   - isAntigravityCommand(command) — is this PROGRAM the Antigravity CLI? It
-//     drives argv shaping, resident-agent classification and the direct-exec
-//     route on Windows, and lives with its siblings in session.go.
-//   - commandRunsAntigravity(command, args) — will SPAWNING this start an `agy`
-//     process, and therefore a readable language server? It drives quota-capture
-//     arming only (cliagent_usage_antigravity_capture.go), and must therefore see
-//     through every wrapper transport terminal-service puts on the wire.
+//   - isAntigravityCommand / isOpenCodeCommand (command) — is this PROGRAM that
+//     CLI? They drive argv shaping, resident-agent classification and the
+//     direct-exec route on Windows, and live with their siblings in session.go.
+//   - commandRunsAntigravity / commandRunsOpenCode (command, args) — will
+//     SPAWNING this start that CLI's process? They drive run-scoped usage
+//     capture arming only (cliagent_usage_antigravity_capture.go,
+//     cliagent_usage_opencode_capture.go), and must therefore see through every
+//     wrapper transport terminal-service puts on the wire.
 //
-// The second is why this file exists. The classifier used to unwrap POSIX
+// The second kind is why this file exists. The classifier used to unwrap POSIX
 // `bash -c` only, so a Windows device — where terminal-service ships everything
 // as `powershell -EncodedCommand <base64>` — never armed capture at all, and a
 // green CLI-maintenance smoke was still followed by a day-old observedAt.
+//
+// The scan is CLI-agnostic: the only per-CLI part is the program predicate, so
+// a second agent cannot inherit half the wrapper transports.
 //
 // REDACTION: the decoded script is a classification input and nothing else. It
 // is a user's prompt, and may carry credentials, tokens and file contents. It is
@@ -27,27 +31,27 @@ import (
 	"strings"
 )
 
-// antigravityClassifyMaxPayloadBytes caps the script this file will read. A
+// wrappedCommandClassifyMaxPayloadBytes caps the script this file will read. A
 // payload larger than this classifies as "not antigravity" rather than growing
 // the decode budget: the cost of being wrong is one unarmed capture (stale
 // freshness), while the cost of an unbounded decode on a device the user is
 // working on is real. terminal-service's own -EncodedCommand argument path caps
 // out at encodedCommandFallbackThreshold (30000 chars), so a real agy
 // invocation is orders of magnitude below this.
-const antigravityClassifyMaxPayloadBytes = 256 * 1024
+const wrappedCommandClassifyMaxPayloadBytes = 256 * 1024
 
-// antigravityFileModeBase64 matches the ONE nested base64 literal
+// wrappedFileModeBase64 matches the ONE nested base64 literal
 // terminal-service's `scriptMode: "file"` launcher carries
 // (commandNormalize.util.js → buildFileModeInvocation): the outer
 // -EncodedCommand decodes to a launcher that writes the REAL script to a temp
 // file from this literal and runs it with `-File`. Without peeling it, every
 // file-mode run — which is what a long prompt becomes — classifies as the
 // launcher rather than as agy.
-var antigravityFileModeBase64 = regexp.MustCompile(`FromBase64String\('([A-Za-z0-9+/=]*)'\)`)
+var wrappedFileModeBase64 = regexp.MustCompile(`FromBase64String\('([A-Za-z0-9+/=]*)'\)`)
 
-// antigravityPosixFileModeBase64 is the same launcher's POSIX half: the script
+// wrappedPosixFileModeBase64 is the same launcher's POSIX half: the script
 // is base64 in a `printf '%s' '<b64>' | base64 -d` pipeline feeding a temp file.
-var antigravityPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-9+/=]*)'`)
+var wrappedPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-9+/=]*)'`)
 
 // commandRunsAntigravity reports whether SPAWNING command+args starts the
 // Antigravity CLI — i.e. whether an `agy` language server will exist for the
@@ -69,27 +73,49 @@ var antigravityPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-
 // strict about it being a program rather than a mention — `git log --grep agy`
 // must not match.
 func commandRunsAntigravity(command string, args []string) bool {
-	if script, ok := wrapperScriptPayload(command, args); ok {
-		return scriptSpawnsAntigravity(script, true)
-	}
-	return isAntigravityCommand(command)
+	return commandRunsCLI(command, args, isAntigravityCommand)
 }
 
-// scriptSpawnsAntigravity reports whether any statement in an interpreter script
-// launches `agy`. allowNested permits exactly ONE descent into the file-mode
-// launcher's inner base64 literal — never a general recursive unwrap, which an
-// adversarial payload could use to make classification unbounded.
-func scriptSpawnsAntigravity(script string, allowNested bool) bool {
-	if script == "" || len(script) > antigravityClassifyMaxPayloadBytes {
+// commandRunsOpenCode is the same question for `opencode`, and the reason the
+// scan is parameterised: the execute and PTY paths arm OpenCode's usage ledger,
+// and terminal-service ships an operator-joined command there as
+// `bash -c "opencode …"` or `powershell -EncodedCommand <base64>`. Matching
+// only the base program armed nothing for exactly the two paths whose figures
+// can come from NOWHERE but a reconcile, because their output is never tapped.
+//
+// A wrapped payload also loses the spend-free carve-out
+// isOpenCodeDiagnosticInvocation applies to a direct argv: the wrapper's args
+// are the shell's, not the CLI's. Arming is the safe side — a spurious debt
+// costs one bounded reconcile pass, a missed one costs the reading.
+func commandRunsOpenCode(command string, args []string) bool {
+	return commandRunsCLI(command, args, isOpenCodeCommand)
+}
+
+// commandRunsCLI reports whether SPAWNING command+args starts the program
+// isProgram names, seeing through every wrapper transport.
+func commandRunsCLI(command string, args []string, isProgram func(string) bool) bool {
+	if script, ok := wrapperScriptPayload(command, args); ok {
+		return scriptSpawnsCLI(script, isProgram, true)
+	}
+	return isProgram(command)
+}
+
+// scriptSpawnsCLI reports whether any statement in an interpreter script
+// launches the program isProgram names. allowNested permits exactly ONE descent
+// into the file-mode launcher's inner base64 literal — never a general
+// recursive unwrap, which an adversarial payload could use to make
+// classification unbounded.
+func scriptSpawnsCLI(script string, isProgram func(string) bool, allowNested bool) bool {
+	if script == "" || len(script) > wrappedCommandClassifyMaxPayloadBytes {
 		return false
 	}
 	if allowNested {
 		if inner, ok := fileModeLauncherScript(script); ok {
-			return scriptSpawnsAntigravity(inner, false)
+			return scriptSpawnsCLI(inner, isProgram, false)
 		}
 	}
 	for _, statement := range splitScriptStatements(script) {
-		if isAntigravityCommand(leadingProgram(statement)) {
+		if isProgram(leadingProgram(statement)) {
 			return true
 		}
 	}
@@ -103,7 +129,7 @@ func scriptSpawnsAntigravity(script string, allowNested bool) bool {
 // FromBase64String is left to the normal statement scan.
 func fileModeLauncherScript(script string) (string, bool) {
 	if strings.Contains(script, "-File") {
-		if m := antigravityFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
+		if m := wrappedFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
 			// PowerShell writes its launcher literal as UTF-16LE, matching
 			// encodeForPowerShell.
 			decoded, err := decodeBase64PowerShellStrict(m[1])
@@ -114,7 +140,7 @@ func fileModeLauncherScript(script string) (string, bool) {
 		}
 	}
 	if strings.Contains(script, "base64 -d") && strings.Contains(script, "mktemp") {
-		if m := antigravityPosixFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
+		if m := wrappedPosixFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
 			decoded, err := base64.StdEncoding.DecodeString(m[1])
 			if err != nil {
 				return "", false

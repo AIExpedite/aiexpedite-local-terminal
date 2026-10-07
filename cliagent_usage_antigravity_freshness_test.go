@@ -566,7 +566,7 @@ func TestCommandRunsAntigravity(t *testing.T) {
 			[]string{"-EncodedCommand", helperFileModeLauncher("npm run build")}, false},
 		{"undecodable base64", "powershell", []string{"-EncodedCommand", "!!!not base64!!!"}, false},
 		{"payload over the classify cap", "powershell",
-			[]string{"-Command", strings.Repeat("x", antigravityClassifyMaxPayloadBytes+1) + "; agy -p hi"}, false},
+			[]string{"-Command", strings.Repeat("x", wrappedCommandClassifyMaxPayloadBytes+1) + "; agy -p hi"}, false},
 		{"empty powershell payload", "powershell", []string{"-Command"}, false},
 		{"cmd with a quoted agy mention", "cmd", []string{"/c", `echo "run agy later"`}, false},
 	}

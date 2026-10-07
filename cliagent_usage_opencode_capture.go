@@ -766,8 +766,26 @@ func armOpenCodeUsageRun(label string) *openCodeRunUsage {
 // isOpenCodeCommand check with the spend-free carve-out: a site that
 // re-implements the pair is a site that can drift (which is how the Windows
 // execute path ended up arming nothing for Antigravity).
+//
+// `commandRunsOpenCode`, not `isOpenCodeCommand`: terminal-service ships an
+// operator-joined command to the execute and PTY paths as `bash -c "opencode
+// …"` or `powershell -EncodedCommand <base64>`, where the base program is the
+// shell. Those are exactly the paths whose figures can come from NOWHERE but a
+// reconcile, because their output is never tapped
+// (cliagent_usage_wrapped_command.go).
+//
+// The spend-free carve-out only applies to a DIRECT argv: a wrapper's args are
+// the shell's, so there is nothing to read it from. A wrapped run therefore
+// arms, which is the safe side — a spurious debt costs one bounded reconcile
+// pass, a missed one costs the reading.
 func armOpenCodeUsageForCommand(label, cmd string, args []string) *openCodeRunUsage {
-	if !isOpenCodeCommand(cmd) || isOpenCodeDiagnosticInvocation(args) {
+	if isOpenCodeCommand(cmd) {
+		if isOpenCodeDiagnosticInvocation(args) {
+			return nil
+		}
+		return armOpenCodeUsageRun(label)
+	}
+	if !commandRunsOpenCode(cmd, args) {
 		return nil
 	}
 	return armOpenCodeUsageRun(label)

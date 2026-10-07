@@ -1049,7 +1049,7 @@ closes that gap by reading the server **while it exists**:
   out of step with the classifier. Windows has no PTY path, so capture there
   comes from native chat, the pipe path and `execute`.
   `commandRunsAntigravity`
-  ([`cliagent_usage_antigravity_command.go`](cliagent_usage_antigravity_command.go))
+  ([`cliagent_usage_wrapped_command.go`](cliagent_usage_wrapped_command.go))
   sees through every wrapper transport terminal-service emits
   (`wrapperScriptPayload` in [`headless_env.go`](headless_env.go)): the POSIX
   shells' `-c` / `-lc`, `cmd /c` and `/k`, PowerShell's `-Command` / `-c`, and
@@ -2189,11 +2189,22 @@ the merge that last raised the row, so a row is never older than the run it cove
 
 Every managed spawn of `opencode` arms a run handle BEFORE `Start`, and the
 handle persists a floor. A spawn that fails disarms it. A nil handle is a no-op
-everywhere, so a site needs no branch. `armOpenCodeUsageForCommand` pairs
-`isOpenCodeCommand` with the spend-free carve-out
+everywhere, so a site needs no branch. `armOpenCodeUsageForCommand` pairs the classifier with the spend-free carve-out
 (`isOpenCodeDiagnosticInvocation` — `models`, `auth`, `--version`, `session`,
 `export`, …), so no site re-implements the pair and a reconcile's own commands
 can never create the debt they exist to pay.
+
+The classifier is `commandRunsOpenCode`, NOT `isOpenCodeCommand`: terminal-service
+ships an operator-joined command to the execute and PTY paths as
+`bash -c "opencode …"` or `powershell -EncodedCommand <base64>`, where the base
+program is the shell — and those are exactly the paths whose figures can come
+from nowhere but a reconcile, because their output is never tapped. The wrapper
+scan is shared with Antigravity's
+([cliagent_usage_wrapped_command.go](cliagent_usage_wrapped_command.go), one
+scan parameterised by the program predicate), so a CLI cannot inherit half the
+wrapper transports. A wrapped payload loses the spend-free carve-out — the args
+are the shell's — and arms, which is the safe side: a spurious debt costs one
+bounded pass, a missed one costs the reading.
 
 | site | file | label | tapped? |
 | --- | --- | --- | --- |

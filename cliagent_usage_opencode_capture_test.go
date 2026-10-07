@@ -711,3 +711,80 @@ func TestOpenCodeLedgerMetrics_UnitsAreTheOnesTheCardFormatsOn(t *testing.T) {
 		t.Fatalf("metrics = %+v, want the tokens then USD units", metrics)
 	}
 }
+
+func TestOpenCodeArmForCommand_SeesThroughWrapperTransports(t *testing.T) {
+	// terminal-service ships an operator-joined command to the execute and PTY
+	// paths as a shell wrapper, so matching only the base program armed nothing
+	// for exactly the two paths whose figures can come from NOWHERE but a
+	// reconcile — their output is never tapped.
+	openCodeUsageFixture(t, time.Now())
+
+	armed := func(cmd string, args ...string) bool {
+		handle := armOpenCodeUsageForCommand("local execute", cmd, args)
+		if handle != nil {
+			handle.Disarm()
+		}
+		return handle != nil
+	}
+
+	for _, tc := range []struct {
+		name string
+		cmd  string
+		args []string
+	}{
+		{"posix bash -c", "bash", []string{"-c", `cd /repo && opencode run --format json`}},
+		{"a login shell", "/bin/sh", []string{"-lc", `opencode run -m x`}},
+		{"powershell -Command", "powershell", []string{"-Command", `cd C:\repo; opencode run`}},
+		{"cmd /c", "cmd", []string{"/c", `opencode run --format json`}},
+		{"an env prefix before the CLI", "bash", []string{"-c", `FOO=bar opencode run`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !armed(tc.cmd, tc.args...) {
+				t.Fatalf("a wrapped OpenCode run armed nothing: %s %v", tc.cmd, tc.args)
+			}
+		})
+	}
+
+	// A wrapper that runs something else, and a MENTION rather than a program,
+	// must not arm: a spurious debt is cheap but not free.
+	for _, tc := range []struct {
+		name string
+		cmd  string
+		args []string
+	}{
+		{"another CLI", "bash", []string{"-c", "codex exec hello"}},
+		{"a mention in an argument", "bash", []string{"-c", `git log --grep opencode`}},
+		{"no script at all", "bash", []string{"-c", ""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if armed(tc.cmd, tc.args...) {
+				t.Fatalf("armed a usage run for %s %v", tc.cmd, tc.args)
+			}
+		})
+	}
+}
+
+func TestCommandRunsCLI_KeepsEachCLIsAnswerSeparate(t *testing.T) {
+	// One scan, two predicates: a second agent must not inherit the first's
+	// answer just because they share the wrapper machinery.
+	wrapped := []string{"-c", "opencode run --format json"}
+	if !commandRunsOpenCode("bash", wrapped) {
+		t.Fatal("commandRunsOpenCode missed a wrapped opencode")
+	}
+	if commandRunsAntigravity("bash", wrapped) {
+		t.Fatal("commandRunsAntigravity matched a wrapped opencode")
+	}
+	agy := []string{"-c", "agy -p hi"}
+	if !commandRunsAntigravity("bash", agy) {
+		t.Fatal("commandRunsAntigravity missed a wrapped agy")
+	}
+	if commandRunsOpenCode("bash", agy) {
+		t.Fatal("commandRunsOpenCode matched a wrapped agy")
+	}
+	// An oversized payload classifies as "not this CLI" rather than growing the
+	// decode budget — the bound is shared, so prove it still holds.
+	huge := []string{"-c", strings.Repeat("x", wrappedCommandClassifyMaxPayloadBytes+1) + "; opencode run"}
+	if commandRunsOpenCode("bash", huge) {
+		t.Fatal("an oversized payload must classify as not-this-CLI")
+	}
+}

@@ -335,7 +335,7 @@ func effectiveCommandLine(cmd string, args []string) string {
 // ahead of -EncodedCommand.
 //
 // Redaction: the returned script is a classification input only. Callers must
-// never log, persist or forward it — see cliagent_usage_antigravity_command.go.
+// never log, persist or forward it — see cliagent_usage_wrapped_command.go.
 func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 	if payload, ok := shellDashCPayloadRaw(cmd, args); ok {
 		return payload, true
@@ -376,9 +376,9 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 }
 
 // encodedCommandFitsClassifyBudget reports whether a -EncodedCommand argument
-// can possibly decode to a script within antigravityClassifyMaxPayloadBytes,
+// can possibly decode to a script within wrappedCommandClassifyMaxPayloadBytes,
 // the budget the sole production caller (commandRunsAntigravity in
-// cliagent_usage_antigravity_command.go) applies to the DECODED script. The
+// cliagent_usage_wrapped_command.go) applies to the DECODED script. The
 // payload is base64 of UTF-16LE, so the decoded script is at most half the
 // decoded byte count; an argument whose base64 already exceeds that bound
 // cannot come in under the cap, and checking the ENCODED length costs one
@@ -388,7 +388,7 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 // encodedCommandPaddingSlack, so that slack is added back: a script sitting
 // exactly ON the cap encodes with a `=` and must not be refused here. The
 // decoded script is still measured against the cap itself in
-// scriptSpawnsAntigravity, so the slack widens what is decoded, not what
+// scriptSpawnsCLI, so the slack widens what is decoded, not what
 // classifies.
 //
 // Cross-file on purpose: one number, one name. The nested file-mode literal
@@ -396,7 +396,7 @@ func wrapperScriptPayload(cmd string, args []string) (string, bool) {
 // already passed the cap, so its inner base64 is bounded by the outer payload.
 func encodedCommandFitsClassifyBudget(encoded string) bool {
 	return base64.StdEncoding.DecodedLen(len(encoded)) <=
-		2*antigravityClassifyMaxPayloadBytes+encodedCommandPaddingSlack
+		2*wrappedCommandClassifyMaxPayloadBytes+encodedCommandPaddingSlack
 }
 
 // encodedCommandPaddingSlack is how far base64.StdEncoding.DecodedLen can
