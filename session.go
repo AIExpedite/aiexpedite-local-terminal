@@ -193,6 +193,17 @@ type CLISession struct {
 	grokUsageFloorMs atomic.Int64
 	grokUsageSettled atomic.Bool
 
+	// openCodeUsageRun accumulates an OpenCode session's step usage, armed when
+	// its child spawned (nil for every other command). openCodeUsageSettled
+	// makes the earlier of its terminal event and its exit settle it exactly
+	// once (cliagent_usage_opencode_freshness.go).
+	openCodeUsageRun     *openCodeUsageRun
+	openCodeUsageSettled atomic.Bool
+	// openCodeResumeSessionID is the session a resumed OpenCode turn was
+	// launched into (`--session`), so a turn that ends before its stream names
+	// the session can still be exported. "" for a fresh turn.
+	openCodeResumeSessionID string
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -832,12 +843,27 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokUsageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedGrokHome)
 	}
 
+	// An OpenCode turn's spend is owed from its spawn; its step_finish frames
+	// pay it (cliagent_usage_opencode_freshness.go).
+	var openCodeUsage *openCodeUsageRun
+	var openCodeResumeSessionID string
+	if isOpenCodeCommand(command) {
+		openCodeUsage = armOpenCodeUsageRunForExecutable(executable, proc.Dir)
+		// A resumed turn's session is known before any frame: record it on the
+		// armed debt now, so a crash before the stream names it stays payable.
+		if isValidOpenCodeSessionID(resumeConversationID) {
+			openCodeResumeSessionID = resumeConversationID
+			openCodeUsage.persistSessionIDAsync(openCodeResumeSessionID)
+		}
+	}
+
 	// Start the process. It is owned (its own process group on Unix, a
 	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
 	// a later boot can prove it gone (session_ledger.go).
 	beginSessionSpawn(id, proc)
 	if err := proc.Start(); err != nil {
 		abortSessionSpawn(id)
+		disarmOpenCodeUsageRun(openCodeUsage)
 		if finishGrokAttribution != nil {
 			// No child will ever write a record for this arm; release now so a
 			// failed spawn cannot leave the shared keeper running forever.
@@ -889,6 +915,8 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokProducerContested:        grokProducerContested,
 		antigravityManagedStream:     antigravityManagedStream,
 		quotaCapture:                 quotaCapture,
+		openCodeUsageRun:             openCodeUsage,
+		openCodeResumeSessionID:      openCodeResumeSessionID,
 		finishGrokBillingAttribution: finishGrokAttribution,
 		// The child is running now, so the pin can be confirmed against the
 		// binary still on disk: a replacement that landed in the pin→Start
@@ -1089,7 +1117,8 @@ func (s *CLISession) finishLateStdinWrite(writeDone <-chan error) {
 	s.mu.Lock()
 	s.closeDeferredStdinLocked()
 	s.mu.Unlock()
-	// Usage accounting is codex's alone; the close above is not.
+	// A codex run is armed by its delivered prompt; an OpenCode run was armed
+	// at spawn and needs nothing here.
 	if !isCodexCommand(s.Command) {
 		return
 	}
@@ -1137,6 +1166,52 @@ func (s *CLISession) settleCodexUsageRun() {
 		return
 	}
 	codexUsageRunSettled(time.UnixMilli(floor))
+}
+
+// settleOpenCodeUsageRun hands the session's OpenCode run to the usage ledger
+// exactly once: on its terminal event or, failing that, on exit. A step that
+// arrives after the terminal event is still committed by the later call.
+// onStream is the terminal-event call, made on the stream consumer: its ledger
+// write runs off that goroutine. The exit path writes synchronously, so a debt
+// is on disk before an update hand-off can replace the process.
+func (s *CLISession) settleOpenCodeUsageRun(onStream bool) {
+	run := s.openCodeUsageRun
+	if run == nil {
+		return
+	}
+	settle := func(onStream bool) {
+		if !s.openCodeUsageSettled.CompareAndSwap(false, true) {
+			flushOpenCodeUsageRun(run)
+			return
+		}
+		if onStream {
+			// The child may stream another step after this: the run stays live
+			// so its export fallback cannot pay a turn this stream still owns.
+			settleOpenCodeUsageRunOnStream(run, s.openCodeResumeSessionID)
+			return
+		}
+		settleOpenCodeUsageRun(run, s.openCodeResumeSessionID)
+	}
+	if !onStream {
+		settle(false)
+		// The exit path is the run's last word: a step that arrived after the
+		// terminal event is committed (or booked on the commit ladder) by the
+		// settle above, so releasing the export cannot double-pay the turn.
+		finishOpenCodeUsageRun(run)
+		return
+	}
+	openCodeUsageInFlight.Add(1)
+	go func() {
+		defer openCodeUsageInFlight.Done()
+		settle(true)
+	}()
+}
+
+// settleCLIUsageRun settles whichever provider's usage run this session armed.
+// Each settle is a no-op for any other command and runs at most once.
+func (s *CLISession) settleCLIUsageRun(onStream bool) {
+	s.settleCodexUsageRun()
+	s.settleOpenCodeUsageRun(onStream)
 }
 
 // newestOpenCodexUsageFloor reports the newest codex utilization floor still
@@ -2242,6 +2317,11 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			if isCodexCommand(session.Command) {
 				captureCodexRateLimitLineFromProducer(line.text, time.Now(), currentCodexAccountFingerprint(), session.codexCaptureVersion)
 			}
+			// OpenCode step usage: memory only here; the run commits when it
+			// settles, so the stream never waits on the ledger.
+			if line.source == "stdout" {
+				captureOpenCodeUsageLine(session.openCodeUsageRun, line.text)
+			}
 
 			// Grok notice telemetry: live stdout is deliberately notice-only.
 			// Numeric and confirmed-unmetered usage comes from the account-bound
@@ -2406,10 +2486,11 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				if isClaudeCommand(session.Command) {
 					claudeBlocks.recordTurnBoundary()
 				}
-				// A finished codex turn owes the CLI Agents card a reading taken
-				// after it started (cliagent_usage_codex_freshness.go). Once per
-				// run: thread.completed follows turn.completed.
-				session.settleCodexUsageRun()
+				// A finished codex or OpenCode turn owes the CLI Agents card a
+				// reading taken after it started (cliagent_usage_codex_freshness.go,
+				// cliagent_usage_opencode_freshness.go). Once per run:
+				// thread.completed follows turn.completed.
+				session.settleCLIUsageRun(true)
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
@@ -2729,9 +2810,9 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
 	}
-	// Same for a codex run that never reached a terminal event. A session that
-	// never received its prompt has no run to settle.
-	session.settleCodexUsageRun()
+	// Same for a codex or OpenCode run that never reached a terminal event. A
+	// codex session that never received its prompt has no run to settle.
+	session.settleCLIUsageRun(false)
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 

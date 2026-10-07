@@ -146,3 +146,89 @@ func TestOpenCodeNamesProvidersBeyondTheModelCap(t *testing.T) {
 		t.Fatalf("published models = %d, want the cap %d", got, cliUsageMaxModelsPerProvider)
 	}
 }
+
+// The usage ledger keys its buckets by the same fingerprint the card publishes,
+// so a provider-set change (a new `/connect`) starts a new bucket, while a probe
+// that could not ask keeps the old name — and with it the day's numbers.
+func TestOpenCodeUsageBucketsFollowTheAccountFingerprint(t *testing.T) {
+	openCodeUsageFixture(t, 1501)
+	path := "opencode-identity-bin"
+	now := time.Now()
+	parse := func() *cliAgentUsage {
+		t.Helper()
+		SetOpenCodeReadinessForceProbe(true)
+		usage, _ := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Path: path}, now)
+		return usage
+	}
+	spend := func(part string, input int64) {
+		t.Helper()
+		run := armOpenCodeUsageRunForExecutable(path, "")
+		captureOpenCodeUsageLine(run, openCodeStepFinish("ses_i", part, input, 0, 0, "0", now.UnixMilli()))
+		settleOpenCodeUsageRun(run, "")
+	}
+
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	first := parse()
+	spend("prt_1", 50)
+	if got := parse(); got.AccountFingerprint != first.AccountFingerprint || len(got.Metrics) == 0 || *got.Metrics[0].Consumed != 50 {
+		t.Fatalf("the install's own runs are not on its card: %+v", got.Metrics)
+	}
+
+	// A probe that could not ask: same name, same bucket.
+	stubOpenCodeReadiness(t, "", false)
+	if kept := parse(); kept.AccountFingerprint != first.AccountFingerprint || len(kept.Metrics) == 0 {
+		t.Fatalf("an inconclusive probe dropped the bucket: fp %s→%s metrics %+v",
+			first.AccountFingerprint, kept.AccountFingerprint, kept.Metrics)
+	}
+
+	// A new provider renames the install: a fresh bucket, the old one untouched.
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\nopenai/gpt-5\n", true)
+	renamed := parse()
+	if renamed.AccountFingerprint == first.AccountFingerprint || len(renamed.Metrics) != 0 {
+		t.Fatalf("a provider-set change kept the old bucket: %+v", renamed.Metrics)
+	}
+	spend("prt_2", 7)
+	if got := parse(); len(got.Metrics) == 0 || *got.Metrics[0].Consumed != 7 {
+		t.Fatalf("the renamed install's bucket = %+v, want 7", got.Metrics)
+	}
+	if old, _, _ := openCodeUsageBucketForDay(first.AccountFingerprint, now); old.tokens() != 50 {
+		t.Fatalf("the old bucket moved to %d", old.tokens())
+	}
+}
+
+// Spend banked before any probe named the account stays unpublished while the
+// card still has no account: the gather would file it under a device fallback
+// fingerprint no later probe names, and the backend would record its
+// generation as applied. The first gather with a real account publishes it.
+func TestOpenCodeUsageWithholdsPendingSpendUntilAnAccountResolves(t *testing.T) {
+	openCodeUsageFixture(t, 1502)
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+	path := "opencode-pending-bin"
+	now := time.Now()
+	parse := func() *cliAgentUsage {
+		t.Helper()
+		SetOpenCodeReadinessForceProbe(true)
+		usage, _ := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Path: path}, now)
+		return usage
+	}
+
+	stubOpenCodeReadiness(t, "", false)
+	run := armOpenCodeUsageRunForExecutable(path, "")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_p", "prt_p", 40, 0, 0, "0", now.UnixMilli()))
+	settleOpenCodeUsageRun(run, "")
+
+	if unresolved := parse(); unresolved.AccountFingerprint != "" || len(unresolved.Metrics) != 0 || unresolved.UsageGeneration != nil {
+		t.Fatalf("an unresolved account published pending spend: fp %q metrics %+v generation %+v",
+			unresolved.AccountFingerprint, unresolved.Metrics, unresolved.UsageGeneration)
+	}
+
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	resolved := parse()
+	if resolved.AccountFingerprint == "" || len(resolved.Metrics) == 0 || *resolved.Metrics[0].Consumed != 40 {
+		t.Fatalf("the resolved account did not adopt the pending spend: %+v", resolved.Metrics)
+	}
+	if resolved.UsageGeneration == nil {
+		t.Fatal("the resolved account withheld the generation of the spend it published")
+	}
+}

@@ -123,6 +123,20 @@ func TestMain(m *testing.M) {
 	startMuseCodeMSPFn = func(context.Context, string, func(string, json.RawMessage)) (*museCodeMSPClient, error) {
 		return nil, fmt.Errorf("muse serve is disabled in tests")
 	}
+	// Same rule for OpenCode: a turn whose stream reported no usage owes an
+	// `opencode export`, which would start the developer's real install.
+	// Default to an export that could not be read; the tests that exercise
+	// the fallback stub it explicitly.
+	runOpenCodeExport = func(context.Context, string, string, string) ([]byte, bool) { return nil, false }
+	// …and its ladder never fires on its own: an OpenCode stub turn in an
+	// unrelated test owes a debt whose 15 s rung would otherwise run in the
+	// middle of a later test. Cases that exercise the ladder drive it through
+	// openCodeUsageFixture's scheduler.
+	openCodeUsageAfterFunc = func(time.Duration, func()) *time.Timer {
+		t := time.NewTimer(time.Hour)
+		t.Stop()
+		return t
+	}
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through

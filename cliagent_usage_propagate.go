@@ -15,13 +15,21 @@
 // When a provider's usage cache commits a new capture generation — Codex on an
 // ADVANCED observation for the active account (mergeCodexRateLimitCacheObserved),
 // Claude Code on a numeric row winning its newer-wins merge
-// (mergeClaudeRateLimitCacheLocked) — the propagator sends one signed hint,
+// (mergeClaudeRateLimitCacheLocked), OpenCode on an advanced observation in its
+// usage ledger (cliagent_usage_opencode_capture.go) — the propagator sends one
+// signed hint,
 // `POST /device/:agentId/cli-usage/observed`, naming the provider and the
 // committed generation. terminal-service answers it with one ordinary refresh —
 // at most one per agent per 4 minutes, none when it already applied that
 // provider's generation, and without moving an Idle device to Active. The hint
 // carries no metric values: numbers travel only inside the signed refresh
 // receipt.
+//
+// The providers that send hints mirror terminal-service's
+// CLI_USAGE_HINT_PROVIDERS (src/config/terminal.config.js) by hand — the device
+// cannot import it: codexUsageProvider, claudeUsageProvider and
+// openCodeUsageProvider. A hint from any other provider is accepted and ignored
+// there.
 //
 // Device-side bounds:
 //   - one pending slot PER PROVIDER, carrying that provider's newest
@@ -41,8 +49,9 @@
 //     cooldown); a failed signing or publish releases it into the normal
 //     initial-plus-follow-up lifecycle;
 //   - nothing is sent while offline, draining, shutting down, unregistered, or
-//     (Codex only) before this process's Codex generation epoch is on disk; the
-//     generation is kept and re-checked at the next boundary.
+//     (Codex and OpenCode) before this process's generation epoch for that
+//     provider is on disk; the generation is kept and re-checked at the next
+//     boundary, and a provider awaiting its rotation never holds another back.
 //
 // Discovering commits made elsewhere. The Claude status-line hook commits from
 // short-lived processes of its own, so the resident agent learns of those
@@ -58,7 +67,9 @@
 // numeric metric — or holds a committed clear — is scheduled through the same
 // gates; Claude's generation is persisted with its cache, so startup re-reads it
 // once (versioning a legacy numeric snapshot first) and schedules it the same
-// way. The backend skips a generation it already applied.
+// way. An OpenCode ledger with numbers for today is rotated and scheduled the
+// same way (recoverOpenCodeUsageGeneration). The backend skips a generation it
+// already applied.
 //
 // Logs are fixed labels only (`[cli-usage] usage hint: <label>`) — never a
 // path, account, fingerprint, id or response body.
@@ -180,6 +191,9 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
+	// firing serializes timer callbacks with resetCLIUsagePropagator (tests),
+	// so a callback in flight finishes before the state is reset under it.
+	firing sync.Mutex
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -210,6 +224,7 @@ func startCLIUsagePropagator(cfg *Config) {
 	go func() {
 		defer p.rotating.Done()
 		p.rotate(cliUsageRotationFirstRetry)
+		recoverOpenCodeUsageGeneration(1)
 	}()
 }
 
@@ -476,9 +491,17 @@ func (p *cliUsagePropagatorState) sendDelayLocked(h *cliUsagePendingHint) time.D
 }
 
 // providerBlockedLocked: a Codex generation waits for this process's Codex
-// epoch rotation (codexPublishableGeneration publishes nothing before it).
+// epoch rotation (codexPublishableGeneration publishes nothing before it), and
+// an OpenCode generation for its own ledger rotation (openCodeGenerationRotated)
+// — never Codex's: a device that never ran Codex has no Codex rotation to wait on.
 func (p *cliUsagePropagatorState) providerBlockedLocked(provider string) bool {
-	return provider == codexUsageProvider && !p.rotated
+	switch provider {
+	case codexUsageProvider:
+		return !p.rotated
+	case openCodeUsageProvider:
+		return !openCodeGenerationRotated.Load()
+	}
+	return false
 }
 
 // nextHintLocked picks the pending provider whose hint fell due first (provider
@@ -544,6 +567,8 @@ func (p *cliUsagePropagatorState) armLocked(d time.Duration) {
 // fire is the timer callback: a due rotation retry, the startup recovery
 // checks, then the next due hint.
 func (p *cliUsagePropagatorState) fire(gen uint64) {
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.timerGen {
 		p.mu.Unlock()
@@ -791,6 +816,8 @@ func logCLIUsageHint(label string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.timer != nil {

@@ -901,14 +901,14 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 	if verified && budgetDeadline.Before(lockDeadline) {
 		lockDeadline = budgetDeadline
 	}
-	lockFile, lockOutcome := acquireClaudeRateLimitCacheLock(path, lockDeadline)
+	lockFile, lockOutcome := acquireCrossProcessCacheLockUntil(path, lockDeadline)
 	switch lockOutcome {
-	case claudeRateLimitLockAcquired:
+	case crossProcessLockAcquired:
 		defer func() {
 			_ = unlockFile(lockFile)
 			_ = lockFile.Close()
 		}()
-	case claudeRateLimitLockContended:
+	case crossProcessLockContended:
 		// Confirmed contention refuses in BOTH modes. See the contract note on
 		// mergeClaudeRateLimitCacheInto: an unlocked read-modify-rename here is
 		// not "one lost window update", it is a stale snapshot renamed over a
@@ -1232,46 +1232,46 @@ var claudeRateLimitBestEffortGateWait = claudeRateLimitVerifiedPersistBudget
 // filesystem can be made to reproduce on demand.
 var claudeRateLimitCacheWriteFile = os.WriteFile
 
-// claudeRateLimitLockOutcome distinguishes the two ways the cross-process lock
+// crossProcessLockOutcome distinguishes the two ways the cross-process lock
 // can end up not held, because they are not the same fact. "Another writer has
 // it" says a competing read-modify-rename is in flight and ours may be undone by
 // it; "we could not open the lock file at all" says only that this filesystem
 // will not give us one, with no evidence of a competitor. Every merge refuses
 // the first and tolerates the second.
-type claudeRateLimitLockOutcome int
+type crossProcessLockOutcome int
 
 const (
-	claudeRateLimitLockAcquired claudeRateLimitLockOutcome = iota
-	claudeRateLimitLockUnavailable
-	claudeRateLimitLockContended
+	crossProcessLockAcquired crossProcessLockOutcome = iota
+	crossProcessLockUnavailable
+	crossProcessLockContended
 )
 
-// acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting until
+// acquireCrossProcessCacheLockUntil takes the sibling `.lock` file, waiting until
 // `deadline` for a contending holder to release it.
 //
-// Only claudeRateLimitLockUnavailable takes the degraded unlocked path, and only
-// because it carries no evidence of a competitor. claudeRateLimitLockContended
+// Only crossProcessLockUnavailable takes the degraded unlocked path, and only
+// because it carries no evidence of a competitor. crossProcessLockContended
 // does, so every caller refuses it: proceeding would rename a snapshot read
 // while the holder was mid-write over whatever the holder went on to commit.
-// Callers MUST unlock + close on claudeRateLimitLockAcquired, and skip otherwise.
-func acquireClaudeRateLimitCacheLock(cachePath string, deadline time.Time) (*os.File, claudeRateLimitLockOutcome) {
+// Callers MUST unlock + close on crossProcessLockAcquired, and skip otherwise.
+func acquireCrossProcessCacheLockUntil(cachePath string, deadline time.Time) (*os.File, crossProcessLockOutcome) {
 	lockPath := cachePath + ".lock"
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, claudeRateLimitLockUnavailable
+		return nil, crossProcessLockUnavailable
 	}
 	for {
 		locked, err := tryLockFileExclusive(f)
 		if err != nil {
 			_ = f.Close()
-			return nil, claudeRateLimitLockUnavailable
+			return nil, crossProcessLockUnavailable
 		}
 		if locked {
-			return f, claudeRateLimitLockAcquired
+			return f, crossProcessLockAcquired
 		}
 		if !time.Now().Before(deadline) {
 			_ = f.Close()
-			return nil, claudeRateLimitLockContended
+			return nil, crossProcessLockContended
 		}
 		time.Sleep(claudeRateLimitCacheLockPoll)
 	}

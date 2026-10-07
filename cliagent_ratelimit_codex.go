@@ -1905,12 +1905,12 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 		// mid-write would clobber whatever that writer went on to commit. Only
 		// Unavailable — which carries no evidence of a competitor — takes the
 		// degraded unlocked path, matching the previous behaviour on lock error.
-		var outcome claudeRateLimitLockOutcome
-		lockFile, outcome = acquireClaudeRateLimitCacheLock(path, lockDeadline)
+		var outcome crossProcessLockOutcome
+		lockFile, outcome = acquireCrossProcessCacheLockUntil(path, lockDeadline)
 		switch outcome {
-		case claudeRateLimitLockAcquired:
+		case crossProcessLockAcquired:
 			locked = true
-		case claudeRateLimitLockContended:
+		case crossProcessLockContended:
 			return false
 		}
 	} else {
