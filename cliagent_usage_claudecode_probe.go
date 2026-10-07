@@ -77,6 +77,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -488,11 +489,14 @@ type claudeUsageProbeGate struct {
 	lastRefreshAt          time.Time
 	lastRefreshFingerprint string
 	lastRefreshShared      bool
-	// immediateDoneMs is the newest run baseline whose immediate attempt
-	// (claudeUsageProbePayRecordedRun) has finished, and coverWaitCh is closed
-	// (and replaced) whenever that, a settle, or a settling attempt ending may
-	// have changed what waitCovered is waiting for.
-	immediateDoneMs int64
+	// immediateDoneMs holds the run baselines (epoch ms) whose immediate attempt
+	// (claudeUsageProbePayRecordedRun) has finished, newest last, capped at
+	// claudeImmediateDoneKeep. Tracked per baseline, not as a high-water mark: a
+	// newer run's attempt finishing says nothing about one still in flight for
+	// an older baseline. coverWaitCh is closed (and replaced) whenever that, a
+	// settle, or a settling attempt ending may have changed what waitCovered is
+	// waiting for.
+	immediateDoneMs []int64
 	coverWaitCh     chan struct{}
 }
 
@@ -692,7 +696,7 @@ func resetClaudeUsageProbeGate() {
 	// reference here only stops it from marking the NEXT generation as seeded.
 	claudeUsageProbe.seedingCh = nil
 	claudeUsageProbe.settling = 0
-	claudeUsageProbe.immediateDoneMs = 0
+	claudeUsageProbe.immediateDoneMs = nil
 	claudeUsageProbe.signalCoverWaitersLocked()
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
@@ -3067,11 +3071,24 @@ func (g *claudeUsageProbeGate) signalCoverWaitersLocked() {
 // `baseline` has finished, whatever it returned.
 func (g *claudeUsageProbeGate) markImmediateDone(baseline time.Time) {
 	g.mu.Lock()
-	if ms := baseline.UnixMilli(); ms > g.immediateDoneMs {
-		g.immediateDoneMs = ms
+	g.immediateDoneMs = append(g.immediateDoneMs, baseline.UnixMilli())
+	if over := len(g.immediateDoneMs) - claudeImmediateDoneKeep; over > 0 {
+		g.immediateDoneMs = append(g.immediateDoneMs[:0], g.immediateDoneMs[over:]...)
 	}
 	g.signalCoverWaitersLocked()
 	g.mu.Unlock()
+}
+
+// claudeImmediateDoneKeep bounds the finished-baseline record. A waiter checks
+// its baseline within seconds of owing it, so only a burst of more runs than
+// this finishing in between could push it out — and then it waits out its
+// bounded context instead of returning early.
+const claudeImmediateDoneKeep = 16
+
+// immediateDoneLocked reports whether the immediate attempt for exactly this
+// baseline has finished. Callers hold g.mu.
+func (g *claudeUsageProbeGate) immediateDoneLocked(baseline time.Time) bool {
+	return slices.Contains(g.immediateDoneMs, baseline.UnixMilli())
 }
 
 // waitCovered waits, at most until ctx ends, for a reading covering a run that
@@ -3093,7 +3110,9 @@ func (g *claudeUsageProbeGate) waitCovered(ctx context.Context, baseline time.Ti
 			g.coverWaitCh = make(chan struct{})
 		}
 		ch := g.coverWaitCh
-		finished := g.immediateDoneMs >= baseline.UnixMilli()
+		// This baseline's OWN attempt: another run's attempt finishing while the
+		// one this wait joined is still in flight is not a refusal.
+		finished := g.immediateDoneLocked(baseline)
 		g.mu.Unlock()
 
 		if claudeUsageObservationCovers(claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), time.Now()), baseline) {

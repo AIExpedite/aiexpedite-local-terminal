@@ -94,9 +94,12 @@ func claudeWatchStampCheck() {
 		return
 	}
 	// Resolved only when a file moved: on macOS a credential read can spawn
-	// `security`, which a once-a-minute tick must not pay for nothing.
+	// `security`, which a once-a-minute tick must not pay for nothing. The scope
+	// is sampled BEFORE it, so only the account our cache held then may be
+	// moved off (claudeStampWatchedGeneration).
+	scopeBefore := claudeRateLimitCacheScope()
 	fingerprint := currentClaudeAccountFingerprint()
-	if generation, bumped := claudeStampObservedGeneration(fingerprint); bumped {
+	if generation, bumped := claudeStampWatchedGeneration(fingerprint, scopeBefore); bumped {
 		noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)
 	}
 }
@@ -142,7 +145,9 @@ func claudeScanDirectRuns(now time.Time) {
 	}
 	// A standing debt only defers the evidence: its probe may cover just its
 	// own baseline, so the newer run is reconsidered once that debt settles.
-	if outcome != claudeDirectRunStanding {
+	// Future-dated evidence (a clock correction, synced metadata) is likewise
+	// reconsidered once the clock catches up to it.
+	if outcome != claudeDirectRunStanding && outcome != claudeDirectRunFuture {
 		s.mu.Lock()
 		if newestMs > s.lastEvidenceMs {
 			s.lastEvidenceMs = newestMs

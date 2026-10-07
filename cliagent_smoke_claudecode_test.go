@@ -1435,3 +1435,32 @@ func TestRunClaudeCodeSmoke_NoInferenceMeansNoWait(t *testing.T) {
 		t.Fatalf("a smoke without a spent turn waited %s", took)
 	}
 }
+
+// Another run's immediate attempt finishing — even one with a NEWER baseline —
+// is not the smoke's own attempt finishing: the wait keeps going until its own
+// baseline is marked done, and only then reports a refusal.
+func TestClaudeUsageProbeWaitCovered_AnotherRunsAttemptIsNotARefusal(t *testing.T) {
+	smokeEnv(t)
+	smokeUsageEndpoint(t, -1)
+	baseline := time.Now()
+	claudeUsageProbe.markImmediateDone(baseline.Add(time.Second))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if got := claudeUsageProbe.waitCovered(ctx, baseline); got != claudeSmokeWaitTimeout {
+		t.Fatalf("waitCovered = %v after a newer run finished, want timeout (still waiting on its own attempt)", got)
+	}
+
+	done := make(chan claudeSmokeWaitOutcome, 1)
+	go func() { done <- claudeUsageProbe.waitCovered(context.Background(), baseline) }()
+	time.Sleep(50 * time.Millisecond)
+	claudeUsageProbe.markImmediateDone(baseline)
+	select {
+	case got := <-done:
+		if got != claudeSmokeWaitRefused {
+			t.Fatalf("waitCovered = %v once its own attempt finished uncovered, want refused", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("waitCovered did not wake when its own attempt finished")
+	}
+}

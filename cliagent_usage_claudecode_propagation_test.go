@@ -120,6 +120,61 @@ func TestClaudeGeneration_TheWatcherStampsAnOutOfProcessWrite(t *testing.T) {
 	}
 }
 
+// A dual-channel install: our cache is still scoped to the previous account,
+// while the installed hook's pinned cache already holds a reading for the
+// account signed in now. The watcher moves our cache off the scope it sampled
+// before the credential read and stamps; a stamp from any other scope (the
+// cache moved again in between) is still refused.
+func TestClaudeGeneration_TheWatcherStampsAPinnedReadingAfterAnAccountTransition(t *testing.T) {
+	rec, cache := claudeGenerationFixture(t, 9108)
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	pinned := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/tmp/prev.json'" +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	now := time.Now()
+	claudeReading(t, cache, "previous-account", now.Add(-time.Hour), map[string]time.Time{claudeWindowFiveHour: now.Add(-time.Hour)})
+	before := claudeGenerationOf(t, cache)
+
+	writeClaudeAccountCredential(t, configDir, "ada@example.com")
+	fp := currentClaudeAccountFingerprint()
+	if fp == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	cliUsagePropagatorRunning.Store(false) // the hook's process does not stamp
+	claudeReading(t, pinned, fp, now, map[string]time.Time{claudeWindowFiveHour: now})
+	cliUsagePropagatorRunning.Store(true)
+
+	if _, bumped := claudeStampWatchedGeneration(fp, "some-third-account"); bumped {
+		t.Fatal("a stamp moved a cache off a scope it never sampled")
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.AccountFingerprint != "previous-account" {
+		t.Fatalf("a refused stamp re-scoped the cache to %q", snap.AccountFingerprint)
+	}
+
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+	claudeWatchStampCheck()
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != fp || snap.GenerationEpoch != 9108 || snap.Generation <= before.Counter {
+		t.Fatalf("after the watcher: scope=%q generation={%d,%d}, want %q above %+v",
+			snap.AccountFingerprint, snap.GenerationEpoch, snap.Generation, fp, before)
+	}
+	waitHints(t, rec, 1, 0)
+	found := false
+	for _, h := range rec.all() {
+		found = found || (h.hint.Provider == claudeUsageProvider && h.hint.Generation == snap.Generation)
+	}
+	if !found {
+		t.Fatalf("the pinned reading's generation %d was not hinted: %+v", snap.Generation, rec.all())
+	}
+}
+
 // An account flip drops the row set with the rest of the account's state, but
 // the counter keeps rising within the epoch, so the new account's first
 // reading is never `already_applied` on the server. Only the signed-in

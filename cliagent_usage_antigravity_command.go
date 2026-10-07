@@ -176,12 +176,13 @@ func splitScriptStatements(script string) []string {
 
 // leadingProgram returns the program a statement runs, or "" when it runs none.
 // Env-var prefixes (`FOO=bar agy …`), the POSIX launch builtins `exec`, `env`
-// (with its option flags) and `nohup`, and PowerShell's Start-Process / its
+// (with its option flags), `nohup` and `command` (its -p form too; -v/-V run
+// nothing), and PowerShell's Start-Process / its
 // -FilePath flag are stepped over, and one pair of outer quotes is stripped so
 // `& "C:\Program Files\agy.cmd"` names agy rather than a quoted path.
 func leadingProgram(statement string) string {
 	rest := statement
-	afterEnv := false
+	afterEnv, afterCommand := false, false
 	for range 8 { // bounded: a few launch prefixes, env flags, Start-Process and -FilePath
 		token, tail := nextScriptToken(rest)
 		if token == "" {
@@ -193,6 +194,16 @@ func leadingProgram(statement string) string {
 		case strings.EqualFold(token, "-filepath"):
 			rest = tail
 		case token == "exec", token == "nohup":
+			rest = tail
+		case token == "command":
+			afterCommand = true
+			rest = tail
+		// command's -p (default PATH) still runs the program; -v/-V only print
+		// where it is, so the statement runs nothing.
+		case afterCommand && strings.HasPrefix(token, "-"):
+			if strings.ContainsAny(token, "vV") {
+				return ""
+			}
 			rest = tail
 		case token == "env":
 			afterEnv = true

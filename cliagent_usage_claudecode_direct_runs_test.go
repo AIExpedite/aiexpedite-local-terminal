@@ -140,7 +140,7 @@ func TestClaudeOweDirectRun_TheOweRule(t *testing.T) {
 		if got := claudeOweDirectRunRefresh(now.Add(-claudeRefreshOwedMaxAge-time.Minute), now); got != claudeDirectRunStale {
 			t.Fatalf("past the age-out: %s", got)
 		}
-		if got := claudeOweDirectRunRefresh(now.Add(claudeRefreshOwedLocalSkew+time.Minute), now); got != claudeDirectRunStale {
+		if got := claudeOweDirectRunRefresh(now.Add(claudeRefreshOwedLocalSkew+time.Minute), now); got != claudeDirectRunFuture {
 			t.Fatalf("stamped in the future: %s", got)
 		}
 		SetClaudeUsageProbeDisabled(true)
@@ -251,6 +251,33 @@ func TestClaudeDirectRunScan_StandingEvidenceIsReconsideredAfterTheDebtSettles(t
 	claudeFreshnessWaitIdle(t)
 	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
 		t.Fatalf("debt=%d, want the newer run owed after the standing debt settled", snap.RefreshOwedAtMs)
+	}
+}
+
+// A transcript stamped beyond the skew ceiling owes nothing now, but is not
+// marked as handled: once the clock catches up it is owed like any other run.
+func TestClaudeDirectRunScan_FutureEvidenceIsReconsideredOnceTheClockCatchesUp(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-2*time.Hour))
+	evidence := now.Add(claudeRefreshOwedLocalSkew + 5*time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", evidence)
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("future evidence was owed: %+v", snap)
+	}
+
+	claudeScanDirectRuns(evidence.Add(time.Minute))
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
+		t.Fatalf("debt=%d, want the run owed once the clock caught up", snap.RefreshOwedAtMs)
 	}
 }
 

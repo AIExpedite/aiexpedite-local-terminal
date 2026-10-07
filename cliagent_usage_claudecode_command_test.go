@@ -36,6 +36,8 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"bash -c env flags", "bash", []string{"-c", "env -i -u HOME FOO=bar /usr/local/bin/claude -p hi"}, true},
 		{"sh -c nohup", "sh", []string{"-c", "cd /repo && nohup claude -p hi"}, true},
 		{"bash -c exec env", "bash", []string{"-c", "exec env FOO=1 claude -p hi"}, true},
+		{"bash -c command", "bash", []string{"-c", `command claude -p "hi"`}, true},
+		{"bash -c command -p", "bash", []string{"-c", "command -p claude -p hi"}, true},
 
 		// A mention is not a spawn; a direct launch is isClaudeCommand's case.
 		{"git log --grep claude", "bash", []string{"-c", "git log --grep claude"}, false},
@@ -49,6 +51,8 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"direct launch is not a wrapper", "claude", []string{"-p", "hi"}, false},
 		{"agy wrapper", "bash", []string{"-c", "agy --print hi"}, false},
 		{"exec another program", "bash", []string{"-c", "exec env FOO=1 git log --grep claude"}, false},
+		{"command -v only locates", "bash", []string{"-c", "command -v claude"}, false},
+		{"command -V only describes", "bash", []string{"-c", "command -V claude"}, false},
 		{"bare env", "bash", []string{"-c", "env"}, false},
 	}
 	for _, tc := range cases {

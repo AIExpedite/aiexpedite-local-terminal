@@ -1216,7 +1216,20 @@ func claudeStampAfterMerge(fingerprint string) {
 // A heartbeat-only bucket never moves a displayed row's observation, so it
 // never bumps.
 func claudeStampObservedGeneration(fingerprint string) (cliUsageGeneration, bool) {
-	generation, bumped, _ := claudeStampGeneration(fingerprint, false)
+	generation, bumped, _ := claudeStampGeneration(fingerprint, nil, false)
+	return generation, bumped
+}
+
+// claudeStampWatchedGeneration is the watcher's stamp. Unlike a merge, which
+// re-scopes our cache itself, the watcher may find our cache still scoped to
+// the previous account while the installed hook's pinned cache already holds a
+// reading for the account signed in now (a dual-channel install, or probing
+// off). It may therefore move our cache off `scopeBefore` — sampled BEFORE the
+// credential read, the same guard claudeOweRunRefresh uses — and only when a
+// displayed row for `fingerprint` advanced, so the reset is never written for
+// nothing. A cache that moved to any third scope in between is refused.
+func claudeStampWatchedGeneration(fingerprint, scopeBefore string) (cliUsageGeneration, bool) {
+	generation, bumped, _ := claudeStampGeneration(fingerprint, []string{scopeBefore}, false)
 	return generation, bumped
 }
 
@@ -1228,7 +1241,7 @@ func claudeStampObservedGeneration(fingerprint string) (cliUsageGeneration, bool
 //
 // refused reports a write the bounded locks or the filesystem turned down; the
 // rotation retries it.
-func claudeStampGeneration(fingerprint string, rotate bool) (generation cliUsageGeneration, bumped, refused bool) {
+func claudeStampGeneration(fingerprint string, transitionFrom []string, rotate bool) (generation cliUsageGeneration, bumped, refused bool) {
 	path := claudeRateLimitCachePath()
 	epoch := cliUsageProcessGenerationEpoch.Load()
 	// Unlocked pre-check: every in-process merge reaches here, and most move no
@@ -1245,11 +1258,11 @@ func claudeStampGeneration(fingerprint string, rotate bool) (generation cliUsage
 			}
 		}
 	}
-	// Scoped to the account the stamp is FOR: a stamp is never an account
-	// transition, so a cache another account owns is refused rather than reset.
-	// Creating the file (the pinned cache holds the only readings) is not a
-	// transition either.
-	allowed := []string{fingerprint}
+	// Scoped to the account the stamp is FOR: a stamp is an account transition
+	// only off `transitionFrom` (claudeStampWatchedGeneration), so a cache any
+	// other account owns is refused rather than reset. Creating the file (the
+	// pinned cache holds the only readings) is not a transition either.
+	allowed := append([]string{fingerprint}, transitionFrom...)
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		allowed = nil
 	}
@@ -1338,7 +1351,7 @@ func claudeRotateGenerationEpoch(time.Time) (rotated, refused bool) {
 	if snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath()); ok && snap.AccountFingerprint != fingerprint {
 		return false, false
 	}
-	_, _, refused = claudeStampGeneration(fingerprint, true)
+	_, _, refused = claudeStampGeneration(fingerprint, nil, true)
 	if claudeGenerationRotated.Load() {
 		return true, false
 	}
@@ -1375,6 +1388,7 @@ const (
 	claudeDirectRunQuiet    = "quiet"
 	claudeDirectRunStanding = "standing"
 	claudeDirectRunStale    = "stale"
+	claudeDirectRunFuture   = "future"
 	claudeDirectRunBusy     = "busy"
 	claudeDirectRunDisarmed = "disarmed"
 )
@@ -1387,7 +1401,8 @@ const (
 //   - the evidence is inside the debt's age window and not stamped beyond the
 //     local skew ceiling — a future mtime (a clock step, a synced folder) would
 //     be retired at once by claudeRefreshDebtRetired and owed again by the next
-//     scan;
+//     scan. It is reported as "future" so the scan reconsiders it once the
+//     clock catches up;
 //   - the reading does not already cover it (claudeSnapshotFreshness, the same
 //     row-aware rule a debt is settled by), with the 30 s margin;
 //   - no debt is standing, and the quiet window has passed — both judged under
@@ -1405,7 +1420,10 @@ func claudeOweDirectRunRefresh(evidence, now time.Time) string {
 	if !claudeUsageProbe.armedForProbe() {
 		return claudeDirectRunDisarmed
 	}
-	if evidence.After(now.Add(claudeRefreshOwedLocalSkew)) || now.Sub(evidence) >= claudeRefreshOwedMaxAge {
+	if evidence.After(now.Add(claudeRefreshOwedLocalSkew)) {
+		return claudeDirectRunFuture
+	}
+	if now.Sub(evidence) >= claudeRefreshOwedMaxAge {
 		return claudeDirectRunStale
 	}
 	scopeBefore := claudeRateLimitCacheScope()
