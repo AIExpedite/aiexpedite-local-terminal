@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -153,6 +154,41 @@ func TestClaudeOweDirectRun_TheOweRule(t *testing.T) {
 			t.Fatal("a refused owe still wrote a debt or sent a request")
 		}
 	})
+}
+
+// A debt write that fails after the owe rule held reports busy, not owed: no
+// debt reached disk and no request is made, and the scan leaves the evidence
+// pending so the next scan owes it once the cache is writable again.
+func TestClaudeDirectRunScan_AFailedDebtWriteKeepsTheEvidencePending(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	evidence := now.Add(-5 * time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-proj", "s.jsonl", evidence)
+
+	prevWrite := claudeRateLimitCacheWriteFile
+	t.Cleanup(func() { claudeRateLimitCacheWriteFile = prevWrite })
+	claudeRateLimitCacheWriteFile = func(string, []byte, os.FileMode) error { return errors.New("disk full") }
+	if got := claudeOweDirectRunRefresh(evidence, now); got != claudeDirectRunBusy {
+		t.Fatalf("outcome = %s, want busy when the debt write fails", got)
+	}
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if atomic.LoadInt64(calls) != 0 || claudeCacheSnapshot(t, cache).RefreshOwedAtMs != 0 {
+		t.Fatal("a failed debt write still sent a request or left a debt")
+	}
+
+	claudeRateLimitCacheWriteFile = prevWrite
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() || atomic.LoadInt64(calls) != 1 {
+		t.Fatalf("debt=%d calls=%d, want the pending evidence owed once the cache is writable", snap.RefreshOwedAtMs, atomic.LoadInt64(calls))
+	}
 }
 
 // Five advancing transcript mtimes across restarts against a failing endpoint
@@ -457,5 +493,28 @@ func TestClaudeNewestTranscript_ABigDirectoryIsBatchedAndStillBounded(t *testing
 	}
 	if _, _, complete := claudeNewestTranscriptMs("", -time.Second, math.MaxInt64); complete {
 		t.Fatal("a scan past its budget reported complete on a big directory")
+	}
+}
+
+// The deadline is checked between entries, not only between batch reads: a
+// slow per-entry stat that runs past the budget stops the walk inside the
+// batch and reports it incomplete.
+func TestClaudeWalkTranscriptDir_StopsInsideABatchAtTheDeadline(t *testing.T) {
+	configDir := t.TempDir()
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 10; i++ {
+		writeClaudeTranscript(t, configDir, "-slow", fmt.Sprintf("s%02d.jsonl", i), base)
+	}
+	budget := 20 * time.Millisecond
+	visited := 0
+	done, err := claudeWalkTranscriptDir(filepath.Join(configDir, "projects", "-slow"), time.Now().Add(budget), func(os.DirEntry) {
+		visited++
+		time.Sleep(2 * budget) // the first stat outlasts the budget
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if done || visited != 1 {
+		t.Fatalf("done=%v visited=%d, want the walk stopped after the entry that overran the budget", done, visited)
 	}
 }

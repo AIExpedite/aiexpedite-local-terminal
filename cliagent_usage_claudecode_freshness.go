@@ -1450,12 +1450,13 @@ func claudeOweDirectRunRefresh(evidence, now time.Time) string {
 		return claudeDirectRunCovered
 	}
 	outcome := claudeDirectRunBusy
+	needsWrite := false
 	evidenceMs, nowMs := evidence.UnixMilli(), now.UnixMilli()
-	mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), fingerprint, []string{scopeBefore},
+	wrote := mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), fingerprint, []string{scopeBefore},
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs != 0 {
 				if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
-					outcome = claudeDirectRunQuiet
+					outcome, needsWrite = claudeDirectRunQuiet, true
 					clearClaudeRefreshDebt(snap)
 					claudeStartDirectRunQuiet(snap, now)
 					return true
@@ -1468,9 +1469,16 @@ func claudeOweDirectRunRefresh(evidence, now time.Time) string {
 				return false
 			}
 			snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = evidenceMs, 0, 0
-			outcome = claudeDirectRunOwed
+			outcome, needsWrite = claudeDirectRunOwed, true
 			return true
 		})
+	// The callback only decides. An outcome that needs a write (the debt, an
+	// unpaid retirement) holds only if that write committed: a failed temp
+	// write or rename leaves nothing on disk, so the evidence stays pending
+	// and the next scan retries it instead of marking it acted on.
+	if needsWrite && !wrote {
+		outcome = claudeDirectRunBusy
+	}
 	if outcome == claudeDirectRunOwed {
 		claudeUsageProbe.beginSettling()
 		defer claudeUsageProbe.endSettling()

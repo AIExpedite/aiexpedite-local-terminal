@@ -269,7 +269,8 @@ func claudeNewestTranscriptMs(home string, budget time.Duration, ceilingMs int64
 const claudeTranscriptScanBatch = 128
 
 // claudeWalkTranscriptDir calls visit for every entry in dir, reading the
-// directory in bounded batches and checking the deadline between reads: a
+// directory in bounded batches and checking the deadline between reads and
+// between entries: a
 // single read of a whole directory would allocate every entry before the next
 // check, so one project with tens of thousands of transcripts, or a slow
 // filesystem, could block the watcher goroutine well past the scan budget.
@@ -290,6 +291,11 @@ func claudeWalkTranscriptDir(dir string, deadline time.Time, visit func(os.DirEn
 		}
 		entries, err := f.ReadDir(claudeTranscriptScanBatch)
 		for _, entry := range entries {
+			// visit stats each transcript, which is slow on a slow filesystem:
+			// check between entries too, so a batch cannot overrun the budget.
+			if time.Now().After(deadline) {
+				return false, nil
+			}
 			visit(entry)
 		}
 		// io.EOF ends the walk; any other read error is treated the same way,
