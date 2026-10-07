@@ -435,11 +435,16 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 		handoff   sync.Mutex
 		abandoned bool
 	)
+	// Read the seams here, on the caller's goroutine: both goroutines below can
+	// outlive this call (a timed-out inspection returns without waiting for
+	// them), so reading the package vars from inside them would race a test
+	// restoring the seams after the call returned.
+	gather, setupToolPass := inspectionGather, inspectionSetupToolPass
 	done := make(chan *MachineInfo, 1)
 	release := trackMachineInfoGather()
 	go func() {
 		defer release()
-		info := inspectionGather()
+		info := gather()
 		handoff.Lock()
 		if !abandoned {
 			done <- info
@@ -463,7 +468,7 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	// difference.
 	toolsDone := make(chan map[string]string, 1)
 	go func() {
-		toolsDone <- inspectionSetupToolPass(ctx)
+		toolsDone <- setupToolPass(ctx)
 	}()
 
 	var info *MachineInfo
