@@ -822,3 +822,19 @@ func TestCLIUsageHint_FallbackReadsOnlyWhileEveryGateIsOpen(t *testing.T) {
 		})
 	}
 }
+
+// A receipt that signed an older generation than the one reserved for it (or
+// none for that provider) did not deliver the reservation: it is released.
+func TestCLIUsageHint_AReceiptThatDidNotCarryTheReservationReleasesIt(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+
+	reserved, older := gen(99, 3), gen(99, 2)
+	ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+	observeCLIUsageGeneration(ctx, claudeUsageProvider, &reserved)
+	settleCLIUsageReceipt(reservation, true, []cliAgentUsage{{Provider: claudeUsageProvider, UsageGeneration: &older}})
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	if len(hints) != 2 || hints[0].hint.Generation != 3 {
+		t.Fatalf("hints = %+v, want the reserved {99,3} hinted and followed up", hints)
+	}
+}

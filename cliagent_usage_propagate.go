@@ -365,7 +365,7 @@ func settleCLIUsageReceipt(r *cliUsageReceiptReservation, published bool, agents
 		}
 		return
 	}
-	carried := map[string]bool{}
+	carried := map[string]cliUsageGeneration{}
 	p := cliUsagePropagator
 	p.mu.Lock()
 	confirmed := false
@@ -376,7 +376,7 @@ func settleCLIUsageReceipt(r *cliUsageReceiptReservation, published bool, agents
 				continue
 			}
 			provider, generation := agent.Provider, *agent.UsageGeneration
-			carried[provider] = true
+			carried[provider] = generation
 			h := p.pending[provider]
 			if h != nil && !generation.covers(h.generation) {
 				continue // a newer generation is pending: it keeps its own lifecycle
@@ -398,10 +398,10 @@ func settleCLIUsageReceipt(r *cliUsageReceiptReservation, published bool, agents
 	if confirmed {
 		logCLIUsageHint("confirmation_pending")
 	}
-	// A reservation the receipt did not carry (its provider failed to parse
-	// after reading) was never delivered.
+	// A reservation the receipt did not carry — its provider failed after
+	// reading, or the receipt signed an older generation — was never delivered.
 	for provider, generation := range reserved {
-		if !carried[provider] {
+		if c, ok := carried[provider]; !ok || !c.covers(generation) {
 			noteCLIUsageObservationAdvanced(provider, generation)
 		}
 	}
