@@ -46,7 +46,7 @@ type claudeCodeUsageParser struct{}
 // its full timeout after that budget is gone.
 var _ cliAgentUsageContextParser = (*claudeCodeUsageParser)(nil)
 
-func (claudeCodeUsageParser) Provider() string { return "claudeCode" }
+func (claudeCodeUsageParser) Provider() string { return claudeUsageProvider }
 
 // SerialProbeCount is how many bounded children ParseContext may run one after
 // another during a gather, so cliAgentUsageGatherReserve can hold back Claude's
@@ -546,6 +546,14 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// above already claimed this stamp's nudge.
 	nudgeClaudeCredentialChanged(credStamp)
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
+	// The generation these rows were read from, signed in the receipt so the
+	// backend records which Claude commit it applied. A generation this read is
+	// the first to see — a status-line hook commit from another process — is
+	// reserved for the receipt inside a signed refresh, and hinted otherwise
+	// (cliagent_usage_propagate.go). Reading it changes no value, observation
+	// time or probe decision above.
+	usage.UsageGeneration = view.generation
+	observeCLIUsageGeneration(ctx, p.Provider(), view.generation)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the

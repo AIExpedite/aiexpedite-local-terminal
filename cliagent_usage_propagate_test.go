@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -40,7 +41,19 @@ func (r *cliUsageHintRecorder) all() []recordedCLIUsageHint {
 // the Codex fixture's environment is undone.
 func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	t.Helper()
-	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod}
+	// Claude cache commits in earlier tests record generations on the
+	// process-global propagator, which never started there: forget them. Codex
+	// state a test set up before calling this (a rotation) is kept.
+	p := cliUsagePropagator
+	p.mu.Lock()
+	delete(p.pending, claudeUsageProvider)
+	delete(p.seen, claudeUsageProvider)
+	p.mu.Unlock()
+	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod}
+	prevFallback, prevDetected := cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected
+	// The Claude fallback read is opt-in per test (claudeFallbackFixture).
+	cliUsageClaudeFallbackEnabled = false
+	claudeUsageFallbackDetected = func() bool { return false }
 	cliUsageHintDebounce = 20 * time.Millisecond
 	cliUsageHintSpacing = 150 * time.Millisecond
 	cliUsageRotationFirstRetry = 40 * time.Millisecond
@@ -50,6 +63,10 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	if os.Getenv("AIEXPEDITE_CODEX_RL_CACHE") == "" {
 		t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", t.TempDir()+"/codex_rate_limits.json")
 		t.Setenv("CODEX_HOME", t.TempDir())
+	}
+	// The startup recovery reads the Claude cache: never the machine's own.
+	if os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE") == "" {
+		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", t.TempDir()+"/claude_rate_limits.json")
 	}
 	rec := &cliUsageHintRecorder{}
 	prevSend := sendCLIUsageObservedHint
@@ -66,7 +83,8 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		stopCLIUsagePropagator()
 		resetCLIUsagePropagator()
 		sendCLIUsageObservedHint = prevSend
-		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod = prev[0], prev[1], prev[2], prev[3]
+		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod = prev[0], prev[1], prev[2], prev[3], prev[4]
+		cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected = prevFallback, prevDetected
 	})
 	return rec, &Config{AgentID: "agent-1", CommandSecret: "secret"}
 }
@@ -464,5 +482,343 @@ func TestCLIUsageHint_StartupRecoveryHintsACommittedClear(t *testing.T) {
 	snap := f.snapshot(t)
 	if h.GenerationEpoch != 616 || snap.GenerationEpoch != 616 || h.Generation != snap.Generation {
 		t.Fatalf("recovery hint = %+v, want the rotated cleared generation {%d,%d}", h, snap.GenerationEpoch, snap.Generation)
+	}
+}
+
+/* ------------------------------- Claude Code ------------------------------- */
+
+// The Go provider id is the one terminal-service's CLI_AGENT_IDS.CLAUDE_CODE
+// names, pinned by the shared vector both repos sign.
+func TestCLIUsageHint_ClaudeProviderIDMatchesTheSharedVector(t *testing.T) {
+	if claudeUsageProvider != "claudeCode" || (claudeCodeUsageParser{}).Provider() != claudeUsageProvider {
+		t.Fatalf("claude provider id = %q", claudeUsageProvider)
+	}
+	data, err := os.ReadFile("testdata/cli_usage_observed_hint_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Vectors []struct{ Provider string } `json:"vectors"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, v := range vectors.Vectors {
+		found[v.Provider] = true
+	}
+	if !found[claudeUsageProvider] || !found[codexUsageProvider] {
+		t.Fatalf("shared vectors cover %v, want both %q and %q", found, codexUsageProvider, claudeUsageProvider)
+	}
+}
+
+// requireSpaced fails when two consecutive hints went out closer than the
+// device-wide spacing (minus scheduler slack).
+func requireSpaced(t *testing.T, hints []recordedCLIUsageHint) {
+	t.Helper()
+	for i := 1; i < len(hints); i++ {
+		gap := time.UnixMilli(hints[i].hint.Timestamp).Sub(time.UnixMilli(hints[i-1].hint.Timestamp))
+		if gap < cliUsageHintSpacing-5*time.Millisecond {
+			t.Fatalf("hints %d and %d went out %s apart, want >= %s", i-1, i, gap, cliUsageHintSpacing)
+		}
+	}
+}
+
+// Claude and Codex bursts each keep their newest generation, share ONE spacing,
+// and each get exactly their hint and one follow-up.
+func TestCLIUsageHint_ClaudeAndCodexBurstsShareTheSpacing(t *testing.T) {
+	withCodexGenerationEpoch(t, 601)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	for c := int64(1); c <= 3; c++ {
+		noteCLIUsageObservationAdvanced(codexUsageProvider, gen(601, c))
+		noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(77, c))
+	}
+	hints := waitHints(t, rec, 4, 3*cliUsageHintSpacing)
+	if len(hints) != 4 {
+		t.Fatalf("got %d hints, want two per provider: %+v", len(hints), hints)
+	}
+	per := map[string]int{}
+	for _, h := range hints {
+		per[h.hint.Provider]++
+		if h.hint.Generation != 3 {
+			t.Fatalf("hint = %+v, want each provider's newest generation", h.hint)
+		}
+	}
+	if per[codexUsageProvider] != 2 || per[claudeUsageProvider] != 2 {
+		t.Fatalf("per provider = %v", per)
+	}
+	requireSpaced(t, hints)
+}
+
+// A provider whose generations keep advancing resets only its OWN debounce:
+// a pending Claude generation still goes at the next boundary.
+func TestCLIUsageHint_ContinuousCodexActivityCannotStarveClaude(t *testing.T) {
+	withCodexGenerationEpoch(t, 602)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(88, 1))
+	stop := time.Now().Add(2 * cliUsageHintSpacing)
+	for c := int64(1); time.Now().Before(stop); c++ {
+		noteCLIUsageObservationAdvanced(codexUsageProvider, gen(602, c))
+		time.Sleep(cliUsageHintDebounce / 4)
+	}
+	for _, h := range rec.all() {
+		if h.hint.Provider == claudeUsageProvider {
+			return
+		}
+	}
+	t.Fatalf("no Claude hint while Codex kept advancing: %+v", rec.all())
+}
+
+// The newer generation of one provider resets only that provider's two-hint
+// budget: the other's follow-up still goes, and is still its last.
+func TestCLIUsageHint_ANewerGenerationResetsOnlyItsOwnBudget(t *testing.T) {
+	withCodexGenerationEpoch(t, 603)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(91, 1))
+	waitHints(t, rec, 1, 0)
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(603, 1))
+	noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(91, 2)) // replaces Claude's follow-up
+	hints := waitHints(t, rec, 5, 3*cliUsageHintSpacing)
+	var claude []int64
+	codex := 0
+	for _, h := range hints {
+		switch h.hint.Provider {
+		case claudeUsageProvider:
+			claude = append(claude, h.hint.Generation)
+		case codexUsageProvider:
+			codex++
+		}
+	}
+	if len(hints) != 5 || codex != 2 || len(claude) != 3 || claude[0] != 1 || claude[1] != 2 || claude[2] != 2 {
+		t.Fatalf("hints = %+v; want Claude 1, 2, 2 (a fresh budget) and Codex twice", hints)
+	}
+	requireSpaced(t, hints)
+}
+
+// A generation discovered by an ordinary (non-refresh) read is hinted at once;
+// reading the same commit again stays quiet.
+func TestCLIUsageHint_AClaudeCacheReadNotesANewGenerationOnce(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+
+	g := gen(93, 4)
+	for i := 0; i < 5; i++ {
+		observeCLIUsageGeneration(context.Background(), claudeUsageProvider, &g)
+	}
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	for i := 0; i < 5; i++ {
+		observeCLIUsageGeneration(context.Background(), claudeUsageProvider, &g)
+	}
+	time.Sleep(2 * cliUsageHintSpacing)
+	if n := len(rec.all()); len(hints) != 2 || n != 2 {
+		t.Fatalf("hints = %d then %d, want the hint and its follow-up only", len(hints), n)
+	}
+	if h := hints[0].hint; h.Provider != claudeUsageProvider || h.GenerationEpoch != 93 || h.Generation != 4 {
+		t.Fatalf("hint = %+v", h)
+	}
+}
+
+// A generation a signed refresh discovered rides in that receipt: no immediate
+// or debounced hint, then exactly ONE confirmation no sooner than the spacing
+// after the publish — which the backend, having applied the receipt, answers
+// without dispatching another refresh.
+func TestCLIUsageHint_AReceiptCarriedGenerationLeavesOneConfirmation(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	var appliedMu sync.Mutex
+	applied := map[string]cliUsageGeneration{}
+	dispatched := 0
+	rec.status = func(h cliUsageObservedHint) int {
+		appliedMu.Lock()
+		defer appliedMu.Unlock()
+		if a, ok := applied[h.Provider]; !ok || !a.covers(gen(h.GenerationEpoch, h.Generation)) {
+			dispatched++
+		}
+		return 202
+	}
+	startCLIUsagePropagator(cfg)
+
+	g := gen(94, 2)
+	ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+	observeCLIUsageGeneration(ctx, claudeUsageProvider, &g)
+	time.Sleep(3 * cliUsageHintDebounce)
+	if n := len(rec.all()); n != 0 {
+		t.Fatalf("a receipt-reserved generation was hinted %d times before publication", n)
+	}
+	publishedAt := time.Now()
+	appliedMu.Lock()
+	applied[claudeUsageProvider] = g // the backend applies the receipt
+	appliedMu.Unlock()
+	settleCLIUsageReceipt(reservation, true, []cliAgentUsage{{Provider: claudeUsageProvider, UsageGeneration: &g}})
+
+	hints := waitHints(t, rec, 1, 3*cliUsageHintSpacing)
+	if len(hints) != 1 {
+		t.Fatalf("got %d hints, want exactly one confirmation: %+v", len(hints), hints)
+	}
+	if sentAt := time.UnixMilli(hints[0].hint.Timestamp); sentAt.Before(publishedAt.Add(cliUsageHintSpacing - 5*time.Millisecond)) {
+		t.Fatalf("confirmation went %s after publication, want >= %s", sentAt.Sub(publishedAt), cliUsageHintSpacing)
+	}
+	appliedMu.Lock()
+	defer appliedMu.Unlock()
+	if dispatched != 0 {
+		t.Fatalf("the confirmation of an applied receipt dispatched %d refreshes", dispatched)
+	}
+}
+
+// Signing or publishing the receipt failed: the reservation is released into
+// the ordinary lifecycle — its hint and one follow-up, never lost.
+func TestCLIUsageHint_AFailedReceiptReleasesTheReservation(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+
+	g := gen(95, 1)
+	ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+	observeCLIUsageGeneration(ctx, claudeUsageProvider, &g)
+	settleCLIUsageReceipt(reservation, false, nil)
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	if len(hints) != 2 || hints[0].hint.Generation != 1 || hints[0].hint.Provider != claudeUsageProvider {
+		t.Fatalf("hints = %+v, want the released generation's hint and follow-up", hints)
+	}
+}
+
+// A refresh that carried an already-propagated generation leaves nothing
+// behind: confirmations are only for generations that were undelivered.
+func TestCLIUsageHint_AReceiptOfADeliveredGenerationAddsNoHint(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	g := gen(96, 1)
+	observeCLIUsageGeneration(context.Background(), claudeUsageProvider, &g)
+	waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+
+	ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+	observeCLIUsageGeneration(ctx, claudeUsageProvider, &g)
+	settleCLIUsageReceipt(reservation, true, []cliAgentUsage{{Provider: claudeUsageProvider, UsageGeneration: &g}})
+	time.Sleep(2 * cliUsageHintSpacing)
+	if n := len(rec.all()); n != 2 {
+		t.Fatalf("got %d hints, want no confirmation for a delivered generation", n)
+	}
+}
+
+// claudeFallbackFixture enables the gated fallback read on a small period and
+// counts its reads.
+func claudeFallbackFixture(t *testing.T, detected bool) (cache string, reads *int64) {
+	t.Helper()
+	cache = t.TempDir() + "/claude_rate_limits.json"
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	cliUsageClaudeFallbackEnabled = true
+	cliUsageClaudeFallbackPeriod = 30 * time.Millisecond
+	claudeUsageFallbackDetected = func() bool { return detected }
+	var n int64
+	prevLoad := claudeUsageFallbackLoad
+	claudeUsageFallbackLoad = func(path string) (claudeRateLimitSnapshot, bool) {
+		atomic.AddInt64(&n, 1)
+		return prevLoad(path)
+	}
+	t.Cleanup(func() { claudeUsageFallbackLoad = prevLoad })
+	return cache, &n
+}
+
+func writeVersionedClaudeCache(t *testing.T, cache string, g cliUsageGeneration, pct float64) {
+	t.Helper()
+	observed := time.Now().Add(-time.Minute).UnixMilli()
+	body, _ := json.Marshal(claudeRateLimitSnapshot{
+		UpdatedAt:       "2026-10-06T09:00:04Z",
+		Buckets:         map[string]claudeRateLimitBucket{claudeWindowFiveHour: {UsedPercentage: pct, ResetsAtMs: observed + 3600000, ObservedAtMs: observed}},
+		GenerationEpoch: g.Epoch, Generation: g.Counter,
+	})
+	if err := os.WriteFile(cache, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The status-line hook commits from another process: the fallback read finds
+// it, even when the replacement has the same size and timestamp as the file it
+// replaced.
+func TestCLIUsageHint_FallbackDiscoversAnExternalClaudeCommit(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	cache, _ := claudeFallbackFixture(t, true)
+	writeVersionedClaudeCache(t, cache, gen(97, 1), 41)
+	info, _ := os.Stat(cache)
+
+	startCLIUsagePropagator(cfg) // the startup recovery hints {97,1}
+	first := waitHints(t, rec, 1, 0)[0].hint
+	if first.Provider != claudeUsageProvider || first.Generation != 1 {
+		t.Fatalf("recovery hint = %+v", first)
+	}
+
+	writeVersionedClaudeCache(t, cache, gen(97, 2), 42) // same size
+	if err := os.Chtimes(cache, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if now, _ := os.Stat(cache); now.Size() != info.Size() || !now.ModTime().Equal(info.ModTime()) {
+		t.Fatal("fixture did not reproduce a same-size, same-stamp replacement")
+	}
+	deadline := time.Now().Add(5 * cliUsageHintSpacing)
+	for time.Now().Before(deadline) {
+		for _, h := range rec.all() {
+			if h.hint.Generation == 2 {
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the fallback never discovered {97,2}: %+v", rec.all())
+}
+
+// The fallback reads nothing when Claude is not detected, when no cache
+// exists, or while the agent is offline, draining, shutting down or stopped.
+func TestCLIUsageHint_FallbackReadsOnlyWhileEveryGateIsOpen(t *testing.T) {
+	gates := []struct {
+		name     string
+		detected bool
+		noCache  bool
+		block    func(t *testing.T)
+		stop     bool
+	}{
+		{name: "not detected", detected: false},
+		{name: "no cache", detected: true, noCache: true},
+		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "draining", detected: true, block: func(t *testing.T) {
+			drain.mu.Lock()
+			drain.draining = true
+			drain.mu.Unlock()
+			t.Cleanup(func() { drain.mu.Lock(); drain.draining = false; drain.mu.Unlock() })
+		}},
+		{name: "shutting down", detected: true, block: func(t *testing.T) {
+			shutdownInProgress.Store(true)
+			t.Cleanup(func() { shutdownInProgress.Store(false) })
+		}},
+		{name: "stopped", detected: true, stop: true},
+	}
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			rec, cfg := propagatorFixture(t)
+			cache, reads := claudeFallbackFixture(t, g.detected)
+			if !g.noCache {
+				writeVersionedClaudeCache(t, cache, gen(98, 1), 41)
+			}
+			if g.block != nil {
+				g.block(t)
+			}
+			startCLIUsagePropagator(cfg)
+			if g.stop {
+				stopCLIUsagePropagator()
+			}
+			time.Sleep(10 * cliUsageClaudeFallbackPeriod)
+			if n := atomic.LoadInt64(reads); n != 0 {
+				t.Fatalf("the fallback read the cache %d times", n)
+			}
+			if g.stop && len(rec.all()) != 0 {
+				t.Fatalf("a stopped propagator sent %+v", rec.all())
+			}
+		})
 	}
 }

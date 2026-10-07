@@ -1033,6 +1033,10 @@ func StartPubSubLoop(cfg *Config) {
 	}
 }
 
+// gatherCLIUsageForRefresh is the refresh's gather; a var so tests can stand
+// in for the providers.
+var gatherCLIUsageForRefresh = GatherCLIAgentUsageOnly
+
 // handleCLIUsageRefreshCommand handles the demand-driven
 // __cli_usage_refresh__ command from the backend's Active/Idle state
 // machine. It always publishes a __cli_usage_refresh_result__ message
@@ -1109,8 +1113,18 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// Codex gets the equivalent: its parser runs a forced rollout reconcile that
 	// bypasses the per-account interval (never the single flight), so a run that
 	// just finished is reflected in the reading this receipt signs.
-	usageCtx := WithCodexUsageForceRefresh(WithClaudeUsageForceProbe(ctx, claudeUsageRefreshForceReason(cmd)))
-	usage, errs := GatherCLIAgentUsageOnly(usageCtx)
+	//
+	// The gather also produces a signed receipt, so a capture generation a
+	// parser discovers while reading (a Claude status-line commit made by another
+	// process) is reserved for THIS receipt instead of queueing its own usage
+	// hint. Once the result is published it leaves one confirmation hint, due
+	// after the backend's cooldown; if signing or publishing fails it is
+	// released into the ordinary hint lifecycle (cliagent_usage_propagate.go).
+	usageCtx, reservation := withCLIUsageReceiptReservation(WithCodexUsageForceRefresh(WithClaudeUsageForceProbe(ctx, claudeUsageRefreshForceReason(cmd))))
+	published := false
+	var publishedUsage []cliAgentUsage
+	defer func() { settleCLIUsageReceipt(reservation, published, publishedUsage) }()
+	usage, errs := gatherCLIUsageForRefresh(usageCtx)
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that
 	// matched our parsers) is a legitimate empty poll — the backend
@@ -1147,6 +1161,7 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		fmt.Printf("%s[pubsub] Failed to publish refresh result: %v%s\n", colorRed, err, colorReset)
 		return err
 	}
+	published, publishedUsage = true, normalizedUsage
 	return nil
 }
 

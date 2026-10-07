@@ -204,7 +204,93 @@ type claudeRateLimitSnapshot struct {
 	// debt that is simply due. Released by its owner when the attempt ends; a
 	// crashed owner's lease expires on its own.
 	AttemptClaimedUntilMs int64 `json:"attemptClaimedUntilMs,omitempty"`
+	// GenerationEpoch / Generation version the snapshot's NUMERIC readings
+	// (claudeBumpGeneration): Generation advances in the same locked write as a
+	// numeric row that wins the newer-wins merge, and never otherwise — a
+	// heartbeat, a refused older reading, a debt or hold marker and a read leave
+	// it alone. The epoch is drawn when the first numeric generation of an
+	// account is committed and is dropped with that account's state, so a new
+	// account's first generation is never covered by the previous account's
+	// applied watermark. Unlike Codex's per-process epoch it is PERSISTED: the
+	// status-line hook commits from short-lived processes of its own, and the
+	// resident agent recovers an unpropagated generation after an update.
+	// Integers only; omitted while the snapshot is unversioned.
+	GenerationEpoch int64 `json:"generationEpoch,omitempty"`
+	Generation      int64 `json:"generation,omitempty"`
 }
+
+// claudeDrawGenerationEpoch is the epoch draw; a var so a test can force one.
+var claudeDrawGenerationEpoch = drawCLIUsageGenerationEpoch
+
+// claudeBumpGeneration advances the snapshot's capture generation for a write
+// that committed a winning numeric reading. An unversioned snapshot (a new
+// account, a legacy cache, a counter that would leave the JS-safe range) starts
+// a fresh epoch at counter 1; otherwise the counter only moves forward.
+func claudeBumpGeneration(snap *claudeRateLimitSnapshot) {
+	if snap.GenerationEpoch <= 0 || snap.Generation < 0 || snap.Generation >= cliUsageMaxSafeInteger {
+		snap.GenerationEpoch, snap.Generation = claudeDrawGenerationEpoch(), 1
+		return
+	}
+	snap.Generation++
+}
+
+// claudeSnapshotHasNumericReading reports whether any bucket carries an
+// observed utilization — the only state a capture generation describes.
+func claudeSnapshotHasNumericReading(snap claudeRateLimitSnapshot) bool {
+	for _, b := range snap.Buckets {
+		if b.hasObservedUsage() {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeSnapshotGeneration is the publishable capture generation of a snapshot:
+// nil when it is unversioned or holds no numeric reading.
+func claudeSnapshotGeneration(snap claudeRateLimitSnapshot) *cliUsageGeneration {
+	if snap.GenerationEpoch <= 0 || snap.Generation <= 0 || !claudeSnapshotHasNumericReading(snap) {
+		return nil
+	}
+	return &cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
+}
+
+// claudeEnsureCacheGeneration returns the committed generation of the cache at
+// path, first versioning a legacy numeric snapshot (one written before
+// generations existed) under the cache locks without touching its values,
+// observation times or scope. nil when the snapshot holds no numeric reading,
+// or when the versioning write was refused (the caller re-reads; the next
+// numeric commit versions it anyway).
+func claudeEnsureCacheGeneration(path string) *cliUsageGeneration {
+	snap, ok := loadClaudeRateLimitSnapshot(path)
+	if !ok || !claudeSnapshotHasNumericReading(snap) {
+		return nil
+	}
+	if g := claudeSnapshotGeneration(snap); g != nil {
+		return g
+	}
+	// Scoped to the account the snapshot was read under, so a rescope racing
+	// this write refuses it instead of being treated as an account boundary.
+	scope := snap.AccountFingerprint
+	var generation *cliUsageGeneration
+	bumped := false
+	wrote := mutateClaudeRateLimitSnapshotScoped(path, scope, []string{scope}, func(locked *claudeRateLimitSnapshot) bool {
+		generation = claudeSnapshotGeneration(*locked)
+		if generation != nil || !claudeSnapshotHasNumericReading(*locked) {
+			return false
+		}
+		claudeBumpGeneration(locked)
+		generation, bumped = claudeSnapshotGeneration(*locked), true
+		return true
+	})
+	if bumped && !wrote {
+		return nil
+	}
+	return generation
+}
+
+// claudeUsageProvider is the provider id Claude Code usage is published under
+// (CLI_AGENT_IDS.CLAUDE_CODE; pinned by the shared observed-hint vector).
+const claudeUsageProvider = "claudeCode"
 
 // resetClaudeProbeAccountState drops everything on the snapshot that describes
 // ONE account's probe state — buckets, probe evidence, debt, hold, rung and
@@ -216,6 +302,9 @@ func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
 	snap.AttemptClaimedUntilMs = 0
+	// The generation versions the dropped buckets: the next account's first
+	// numeric commit draws a new epoch (claudeBumpGeneration).
+	snap.GenerationEpoch, snap.Generation = 0, 0
 }
 
 // clearClaudeRefreshDebt drops the owed-refresh marker, its attempt counter and
@@ -744,10 +833,25 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // then drop the merge); a non-zero one selects the verified contract, clamping
 // both waits to what is left of the caller's budget and reporting the failure
 // rather than dropping it. Neither contract writes behind a confirmed holder.
+//
+// A write that advanced the capture generation tells the usage-hint propagator
+// (cliagent_usage_propagate.go) once both locks are released, so stream
+// captures and probes in the resident agent hint without waiting for a read.
+// The status-line hook runs in a process whose propagator never starts: the
+// note only records there, and the resident agent discovers that commit on its
+// next cache read instead.
 func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
-	return withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
-		return mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes, probedCred)
+	var advanced *cliUsageGeneration
+	observed, err := withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
+		var observed time.Time
+		var err error
+		observed, advanced, err = mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes, probedCred)
+		return observed, err
 	})
+	if err == nil && advanced != nil {
+		noteCLIUsageGenerationObserved(claudeUsageProvider, *advanced)
+	}
+	return observed, err
 }
 
 // withClaudeRateLimitCacheLocked runs fn holding BOTH serialization layers this
@@ -815,8 +919,10 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 }
 
 // mergeClaudeRateLimitCacheLocked is the read-merge-rename itself. Callers MUST
-// already hold the ladder withClaudeRateLimitCacheLocked takes.
-func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
+// already hold the ladder withClaudeRateLimitCacheLocked takes. advanced is the
+// capture generation this write committed when at least one numeric row won the
+// merge (claudeBumpGeneration), and nil otherwise.
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (observed time.Time, advanced *cliUsageGeneration, err error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -835,7 +941,7 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// account the cache has since moved off must refuse rather than take the new
 	// login's fresh buckets down as a transition.
 	if claudeCacheScopeRejects(snap.AccountFingerprint, fingerprint, allowedScopes) {
-		return time.Time{}, errClaudeRateLimitCacheRescoped
+		return time.Time{}, nil, errClaudeRateLimitCacheRescoped
 	}
 	if snap.AccountFingerprint != fingerprint {
 		// Probe evidence is an observation about ONE account's quota, so it
@@ -847,6 +953,9 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		resetClaudeProbeAccountState(&snap)
 	}
 	nowMs := now.UnixMilli()
+	// numericWon: a usage-bearing reading replaced what the cache held for a
+	// window — the one change that moves the capture generation.
+	numericWon := false
 	for window, bucket := range updates {
 		// An "allowed" heartbeat refreshes status / reset time but carries no
 		// usage reading. Don't let its zero default clobber a previously
@@ -918,13 +1027,23 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		// Strictly-newer, so a same-instant rewrite still lands: equal timestamps
 		// carry no ordering, and refusing them would make a re-merge of the same
 		// observation depend on which writer got there first.
-		if prev, ok := snap.Buckets[window]; ok &&
-			prev.hasObservedUsage() && prev.ObservedAtMs > bucket.ObservedAtMs {
+		prev, hadPrev := snap.Buckets[window]
+		if hadPrev && prev.hasObservedUsage() && prev.ObservedAtMs > bucket.ObservedAtMs {
 			continue
+		}
+		// An equal-instant re-merge of the same reading lands but changes
+		// nothing a reader renders, so it is not a new generation.
+		if !hadPrev || !prev.hasObservedUsage() || prev.ObservedAtMs != bucket.ObservedAtMs ||
+			prev.UsedPercentage != bucket.UsedPercentage || prev.ResetsAtMs != bucket.ResetsAtMs ||
+			prev.Status != bucket.Status {
+			numericWon = true
 		}
 		bucket.UsageObserved = usageObservedPtr(true)
 		bucket.Source = source
 		snap.Buckets[window] = bucket
+	}
+	if numericWon {
+		claudeBumpGeneration(&snap)
 	}
 	// Record that the probe sampled this account, independently of which writer
 	// ends up owning each window (see LastProbeObservedAtMs). Only readings
@@ -972,7 +1091,6 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// Aggregated as a MINIMUM: the caller asks whether the cache now holds a
 	// recent enough reading for every window this write covers, and one window
 	// left behind is the whole answer. See mergeClaudeRateLimitCacheChecked.
-	observed := time.Time{}
 	for window := range updates {
 		b, ok := snap.Buckets[window]
 		if !ok || !b.hasObservedUsage() {
@@ -1014,7 +1132,7 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
 	// observes a half-written file. The PID + nanosecond suffix keeps two
@@ -1022,13 +1140,16 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
-	return observed, nil
+	if numericWon {
+		advanced = claudeSnapshotGeneration(snap)
+	}
+	return observed, advanced, nil
 }
 
 // acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of

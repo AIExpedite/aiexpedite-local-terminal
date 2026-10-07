@@ -32,11 +32,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1783,16 +1781,9 @@ const codexUsageProvider = "codex"
 // be suppressed by an old, higher applied counter.
 var codexProcessGenerationEpoch atomic.Int64
 
-// codexDrawGenerationEpoch is the draw; a var so a test can force a value or a
-// collision.
-var codexDrawGenerationEpoch = func() int64 {
-	const maxSafe = int64(1)<<53 - 1
-	if n, err := rand.Int(rand.Reader, big.NewInt(maxSafe)); err == nil {
-		return n.Int64() + 1
-	}
-	// crypto/rand does not fail on supported platforms; never publish epoch 0.
-	return time.Now().UnixNano()&maxSafe | 1
-}
+// codexDrawGenerationEpoch is the draw (drawCLIUsageGenerationEpoch); a var so
+// a test can force a value or a collision.
+var codexDrawGenerationEpoch = drawCLIUsageGenerationEpoch
 
 // codexGenerationRotated reports whether a write carrying this process's epoch
 // has committed. Until it has, the cache may still hold a snapshot published by

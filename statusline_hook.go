@@ -76,6 +76,12 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 	if claudeEnvAuthActive() {
 		return
 	}
+	// The shared merge versions a winning numeric reading in the same atomic
+	// write (claudeBumpGeneration), stamped with this render's capture instant,
+	// so an older render landing after a newer probe changes neither values,
+	// timestamps nor the generation. This short-lived process does no network
+	// work: the resident agent discovers the committed generation on its next
+	// cache read and owns the credentials, debounce and retries of the hint.
 	mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
 		currentClaudeAccountFingerprint(), claudeRateLimitSourceStatusLine)
 }

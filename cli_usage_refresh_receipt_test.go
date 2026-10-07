@@ -73,8 +73,8 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 6 {
-		t.Fatal("expected six shared vectors")
+	if len(vectors.Vectors) != 7 {
+		t.Fatal("expected seven shared vectors")
 	}
 	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
@@ -181,8 +181,8 @@ func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 6 {
-		t.Fatal("expected six shared vectors")
+	if len(vectors.Vectors) != 7 {
+		t.Fatal("expected seven shared vectors")
 	}
 	if text != vectors.Vectors[2].Canonical {
 		t.Fatalf("unexpected protocol canonical bytes: %s", text)
@@ -197,53 +197,76 @@ func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
 // usageGeneration is signed: canonical bytes with it match the golden vector
 // terminal-service asserts too, and a receipt without it is byte-identical to
 // one from an agent that predates the field.
+// Both providers that version their captures sign the generation the same way,
+// pinned by the vectors shared byte-for-byte with terminal-service.
 func TestCLIUsageRefreshReceiptSignsUsageGeneration(t *testing.T) {
 	data, err := os.ReadFile("testdata/cli_usage_refresh_receipt_vectors.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var vectors struct {
-		Vectors []struct{ Name, Canonical, Signature string } `json:"vectors"`
+		Vectors []struct {
+			Name, RefreshID, Canonical, Signature string
+			ChallengeTs                           int64
+		} `json:"vectors"`
 	}
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	var canonicalWant, signatureWant string
-	for _, v := range vectors.Vectors {
-		if v.Name == "codex-usage-generation" {
-			canonicalWant, signatureWant = v.Canonical, v.Signature
-		}
+	byName := map[string]int{}
+	for i, v := range vectors.Vectors {
+		byName[v.Name] = i
 	}
-	if canonicalWant == "" {
-		t.Fatal("missing codex-usage-generation vector")
-	}
-	total, remaining, consumed := 100.0, 73.0, 27.0
-	agent := cliAgentUsage{
-		Provider: "codex", CollectedAt: "now",
-		Metrics: []cliAgentUsageMetric{{
-			Kind: "weekly", Label: "Weekly quota", Unit: "%", Total: &total, Remaining: &remaining, Consumed: &consumed,
-			ResetAt: "2026-10-06T19:39:00Z", ObservedAt: "2026-09-30T11:56:11Z",
+	pct := func(v float64) *float64 { return &v }
+	cases := []struct {
+		vector string
+		agent  cliAgentUsage
+	}{
+		{"codex-usage-generation", cliAgentUsage{
+			Provider: codexUsageProvider, CollectedAt: "now",
+			Metrics: []cliAgentUsageMetric{{
+				Kind: "weekly", Label: "Weekly quota", Unit: "%", Total: pct(100), Remaining: pct(73), Consumed: pct(27),
+				ResetAt: "2026-10-06T19:39:00Z", ObservedAt: "2026-09-30T11:56:11Z",
+			}},
+			UsageGeneration: &cliUsageGeneration{Epoch: 4503599627370497, Counter: 7},
 		}},
-		UsageGeneration: &cliUsageGeneration{Epoch: 4503599627370497, Counter: 7},
+		{"claude-usage-generation", cliAgentUsage{
+			Provider: claudeUsageProvider, CollectedAt: "now",
+			Metrics: []cliAgentUsageMetric{
+				{Kind: "session", Label: "5-hour session window", Unit: "%", Total: pct(100), Remaining: pct(59), Consumed: pct(41),
+					ResetAt: "2026-10-06T12:00:00Z", ObservedAt: "2026-10-06T09:05:00Z"},
+				{Kind: "weekly", Label: "Weekly quota", Unit: "%", Total: pct(100), Remaining: pct(83), Consumed: pct(17),
+					ResetAt: "2026-10-10T00:00:00Z", ObservedAt: "2026-10-06T09:05:00Z"},
+			},
+			UsageGeneration: &cliUsageGeneration{Epoch: 4503599627370501, Counter: 3},
+		}},
 	}
-	canonical, _, _, err := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil)
-	if err != nil || string(canonical) != canonicalWant {
-		t.Fatalf("canonical = %s (%v), want %s", canonical, err, canonicalWant)
-	}
-	if signature, _, _, err := signCLIUsageRefreshReceipt("secret", "r6", 6, true, []cliAgentUsage{agent}, nil); err != nil || signature != signatureWant {
-		t.Fatalf("signature = %s (%v), want %s", signature, err, signatureWant)
-	}
+	for _, tc := range cases {
+		i, ok := byName[tc.vector]
+		if !ok {
+			t.Fatalf("missing %s vector", tc.vector)
+		}
+		v := vectors.Vectors[i]
+		agent := tc.agent
+		canonical, _, _, err := canonicalCLIUsageRefreshReceipt(v.RefreshID, v.ChallengeTs, true, []cliAgentUsage{agent}, nil)
+		if err != nil || string(canonical) != v.Canonical {
+			t.Fatalf("%s: canonical = %s (%v), want %s", tc.vector, canonical, err, v.Canonical)
+		}
+		if signature, _, _, err := signCLIUsageRefreshReceipt("secret", v.RefreshID, v.ChallengeTs, true, []cliAgentUsage{agent}, nil); err != nil || signature != v.Signature {
+			t.Fatalf("%s: signature = %s (%v), want %s", tc.vector, signature, err, v.Signature)
+		}
 
-	agent.UsageGeneration = nil
-	without, _, _, _ := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil)
-	if strings.Contains(string(without), "usageGeneration") {
-		t.Fatalf("an absent generation must stay absent: %s", without)
-	}
+		agent.UsageGeneration = nil
+		without, _, _, _ := canonicalCLIUsageRefreshReceipt(v.RefreshID, v.ChallengeTs, true, []cliAgentUsage{agent}, nil)
+		if strings.Contains(string(without), "usageGeneration") {
+			t.Fatalf("%s: an absent generation must stay absent: %s", tc.vector, without)
+		}
 
-	for _, bad := range []cliUsageGeneration{{Epoch: -1, Counter: 1}, {Epoch: 1, Counter: cliUsageMaxSafeInteger + 1}} {
-		agent.UsageGeneration = &bad
-		if _, _, _, err := canonicalCLIUsageRefreshReceipt("r6", 6, true, []cliAgentUsage{agent}, nil); err == nil {
-			t.Fatalf("generation %+v must be refused", bad)
+		for _, bad := range []cliUsageGeneration{{Epoch: -1, Counter: 1}, {Epoch: 1, Counter: cliUsageMaxSafeInteger + 1}} {
+			agent.UsageGeneration = &bad
+			if _, _, _, err := canonicalCLIUsageRefreshReceipt(v.RefreshID, v.ChallengeTs, true, []cliAgentUsage{agent}, nil); err == nil {
+				t.Fatalf("%s: generation %+v must be refused", tc.vector, bad)
+			}
 		}
 	}
 }

@@ -487,3 +487,139 @@ func TestClaudeOwedRefresh_OfflineStartIsPaidAfterReconnect(t *testing.T) {
 		t.Errorf("request count=%d, want 1", got)
 	}
 }
+
+/* ------------------ an unpropagated generation survives ------------------- */
+
+// restartCLIUsagePropagator replaces the resident process's propagator: what
+// was pending in memory is gone, the cache on disk is all the next one has.
+func restartCLIUsagePropagator(cfg *Config) {
+	stopCLIUsagePropagator()
+	resetCLIUsagePropagator()
+	startCLIUsagePropagator(cfg)
+}
+
+// The process is replaced after a covering numeric commit but before its
+// debounce fired: the next process's startup recovery hints the committed
+// generation and the stale mirror is refreshed from it.
+func TestClaudeUpdateSurvival_ACommitInsideTheDebounceIsRecoveredAfterRestart(t *testing.T) {
+	cache, svc, preRun := claudeStaleMirrorFixture(t)
+	waitForClaudeCondition(t, 5*time.Second, "no startup recovery hint", func() bool {
+		hints, _, _ := svc.snapshot()
+		return len(hints) >= 1
+	})
+	cliUsageHintDebounce = time.Hour // the commit's own hint never fires in this process
+
+	observed := time.Now()
+	mergeClaudeRateLimitCacheProbeScoped(context.Background(), cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 61, ResetsAtMs: observed.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 27, ResetsAtMs: observed.Add(90 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
+	}, observed, "", nil, claudeCredStamp{})
+	snap := claudeCacheSnapshot(t, cache)
+	covering := gen(snap.GenerationEpoch, snap.Generation)
+	if covering.Epoch != preRun.Epoch || covering.Counter != preRun.Counter+1 {
+		t.Fatalf("covering commit generation = %+v after %+v", covering, preRun)
+	}
+
+	cliUsageHintDebounce = 20 * time.Millisecond
+	restartCLIUsagePropagator(svc.cfg)
+	waitForClaudeCondition(t, 5*time.Second, "the restarted process never refreshed the stale mirror", func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		a, ok := svc.applied[claudeUsageProvider]
+		return ok && a.covers(covering)
+	})
+	_, _, published := svc.snapshot()
+	session, weekly, _ := claudeRowsOf(t, published[len(published)-1])
+	requireRowCovers(t, "five-hour", session, observed)
+	requireRowCovers(t, "weekly", weekly, observed)
+}
+
+// A status-line hook process committed and exited; the agent restarted before
+// any read saw it. Startup recovery finds it; repeated restarts after it was
+// applied cost one hint each and no refresh.
+func TestClaudeUpdateSurvival_AStatusLineCommitAndRepeatedRestartsStayBounded(t *testing.T) {
+	clearClaudeEnvAuth(t) // env-auth would make the hook skip the write
+	cache, svc, preRun := claudeStaleMirrorFixture(t)
+	stopCLIUsagePropagator()
+	reset := time.Now().Add(2 * time.Hour).Unix()
+	captureClaudeRateLimitsFromStatusline([]byte(`{"rate_limits":{"five_hour":{"used_percentage":48,"resets_at":`+
+		fmt.Sprint(reset)+`},"seven_day":{"used_percentage":12,"resets_at":`+fmt.Sprint(reset+86400)+`}}}`), time.Now())
+	snap := claudeCacheSnapshot(t, cache)
+	committed := gen(snap.GenerationEpoch, snap.Generation)
+	if preRun.covers(committed) {
+		t.Fatalf("the status-line commit did not advance the generation: %+v", committed)
+	}
+
+	for i := 0; i < 3; i++ {
+		resetCLIUsagePropagator()
+		startCLIUsagePropagator(svc.cfg)
+		time.Sleep(3 * cliUsageHintSpacing)
+		stopCLIUsagePropagator()
+	}
+	all, dispatches, _ := svc.snapshot()
+	hints := hintsAfter(all, preRun)
+	if dispatches != 1 {
+		t.Fatalf("dispatches = %d, want exactly one refresh for the status-line commit", dispatches)
+	}
+	// Each process may hint the generation and follow it up once: never more.
+	if len(hints) < 1 || len(hints) > 6 {
+		t.Fatalf("hints for the commit = %d across three processes, want 1..6", len(hints))
+	}
+	for _, h := range hints {
+		if gen(h.GenerationEpoch, h.Generation) != committed {
+			t.Fatalf("hint %+v, want the committed %+v", h, committed)
+		}
+	}
+}
+
+// Offline at start: the recovered generation is kept, not sent, and goes out
+// once the agent is back online.
+func TestClaudeUpdateSurvival_AnOfflineStartIsPropagatedAfterReconnect(t *testing.T) {
+	cache, svc, preRun := claudeStaleMirrorFixture(t)
+	stopCLIUsagePropagator()
+	observed := time.Now()
+	mergeClaudeRateLimitCacheProbeScoped(context.Background(), cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 70, ResetsAtMs: observed.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
+	}, observed, "", nil, claudeCredStamp{})
+
+	setCodexTestOffline(t, true)
+	resetCLIUsagePropagator()
+	startCLIUsagePropagator(svc.cfg)
+	time.Sleep(3 * cliUsageHintSpacing)
+	if hints, _, _ := svc.snapshot(); len(hintsAfter(hints, preRun)) != 0 {
+		t.Fatalf("hinted while offline: %+v", hints)
+	}
+	setCodexTestOffline(t, false)
+	waitForClaudeCondition(t, 5*time.Second, "the recovered generation was never sent after reconnect", func() bool {
+		_, dispatches, _ := svc.snapshot()
+		return dispatches == 1
+	})
+}
+
+// A /login to another account between processes: the new account's first
+// numeric commit is a new epoch, so the backend's watermark for the old
+// account does not cover it and the restarted process's hint dispatches.
+func TestClaudeUpdateSurvival_AnAccountRescopeIsNotCoveredByTheOldWatermark(t *testing.T) {
+	cache, svc, preRun := claudeStaleMirrorFixture(t)
+	stopCLIUsagePropagator()
+	observed := time.Now()
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 9, ResetsAtMs: observed.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
+	}, observed, "other-account", claudeRateLimitSourceStream)
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.GenerationEpoch == preRun.Epoch || snap.Generation != 1 {
+		t.Fatalf("rescoped generation = %d/%d, want a new epoch at 1 (old %+v)", snap.GenerationEpoch, snap.Generation, preRun)
+	}
+
+	resetCLIUsagePropagator()
+	startCLIUsagePropagator(svc.cfg)
+	waitForClaudeCondition(t, 5*time.Second, "the new account's generation was suppressed by the old watermark", func() bool {
+		hints, dispatches, _ := svc.snapshot()
+		for _, h := range hints {
+			if h.GenerationEpoch == snap.GenerationEpoch {
+				return dispatches >= 1
+			}
+		}
+		return false
+	})
+}

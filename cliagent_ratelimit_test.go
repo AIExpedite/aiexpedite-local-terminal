@@ -1722,3 +1722,168 @@ func TestMergeClaudeRateLimitCacheCheckedScoped_AdmitsTheSampledAndOwnScopes(t *
 		t.Errorf("an unguarded merge was refused: %v", err)
 	}
 }
+
+/* ---------------------------- capture generation --------------------------- */
+
+func claudeGenerationOf(t *testing.T, cache string) cliUsageGeneration {
+	t.Helper()
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("cache missing")
+	}
+	return cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
+}
+
+func claudeNumericUpdate(window string, pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+	return map[string]claudeRateLimitBucket{window: {
+		UsedPercentage: pct, ResetsAtMs: observed.Add(3 * time.Hour).Truncate(time.Hour).UnixMilli(),
+		ObservedAtMs: observed.UnixMilli(), Status: "allowed", usageKnown: true,
+	}}
+}
+
+// Only a numeric row that wins the newer-wins merge moves the generation: a
+// heartbeat, an older reading, an identical re-merge, a debt marker and a read
+// leave it exactly where it was.
+func TestClaudeCacheGeneration_AdvancesOnlyOnAWinningNumericCommit(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	now := time.Now()
+
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 10, now), now, "", claudeRateLimitSourceStream)
+	first := claudeGenerationOf(t, cache)
+	if first.Epoch <= 0 || first.Counter != 1 {
+		t.Fatalf("first numeric commit = %+v, want a fresh epoch at counter 1", first)
+	}
+
+	newer := now.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 12, newer), newer, "", claudeRateLimitSourceStream)
+	if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{Epoch: first.Epoch, Counter: 2}) {
+		t.Fatalf("winning commit = %+v, want {%d,2}", g, first.Epoch)
+	}
+
+	unchanged := []struct {
+		name  string
+		write func()
+	}{
+		{"older reading refused", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 90, now.Add(-time.Minute)), now, "", claudeRateLimitSourceStatusLine)
+		}},
+		{"identical re-merge", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 12, newer), newer, "", claudeRateLimitSourceStream)
+		}},
+		{"heartbeat only", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+				ResetsAtMs: newer.Add(3 * time.Hour).Truncate(time.Hour).UnixMilli(), ObservedAtMs: newer.Add(time.Minute).UnixMilli(), Status: "allowed",
+			}}, newer.Add(time.Minute), "", claudeRateLimitSourceStream)
+		}},
+		{"debt marker", func() {
+			mutateClaudeRateLimitSnapshot(cache, "", func(s *claudeRateLimitSnapshot) bool {
+				s.RefreshOwedAtMs = newer.UnixMilli()
+				return true
+			})
+		}},
+		{"failed write", func() {
+			prev := claudeRateLimitCacheWriteFile
+			claudeRateLimitCacheWriteFile = func(string, []byte, os.FileMode) error { return errors.New("disk full") }
+			defer func() { claudeRateLimitCacheWriteFile = prev }()
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 50, newer.Add(time.Hour)), newer, "", claudeRateLimitSourceStream)
+		}},
+		{"read", func() {
+			_ = loadMergedClaudeRateLimitView("")
+			_ = claudeEnsureCacheGeneration(cache)
+		}},
+	}
+	for _, step := range unchanged {
+		step.write()
+		if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{Epoch: first.Epoch, Counter: 2}) {
+			t.Fatalf("%s moved the generation to %+v", step.name, g)
+		}
+	}
+}
+
+// An account boundary drops the old account's generation with its buckets;
+// the new account's first numeric commit starts a new nonzero epoch that the
+// old account's applied watermark cannot cover.
+func TestClaudeCacheGeneration_AccountSwitchRotatesTheEpoch(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	draws := []int64{111, 222}
+	prevDraw := claudeDrawGenerationEpoch
+	claudeDrawGenerationEpoch = func() int64 { d := draws[0]; draws = draws[1:]; return d }
+	t.Cleanup(func() { claudeDrawGenerationEpoch = prevDraw })
+
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, float64(10+i), at), at, "acct-a", claudeRateLimitSourceStream)
+	}
+	applied := claudeGenerationOf(t, cache)
+	if applied != (cliUsageGeneration{Epoch: 111, Counter: 3}) {
+		t.Fatalf("account A generation = %+v", applied)
+	}
+
+	// A marker written under account B crosses the boundary without a reading:
+	// the snapshot is unversioned until B's first numeric commit.
+	mutateClaudeRateLimitSnapshot(cache, "acct-b", func(s *claudeRateLimitSnapshot) bool {
+		s.RefreshOwedAtMs = now.UnixMilli()
+		return true
+	})
+	if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{}) {
+		t.Fatalf("account boundary kept A's generation: %+v", g)
+	}
+	at := now.Add(time.Minute)
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 5, at), at, "acct-b", claudeRateLimitSourceStream)
+	b := claudeGenerationOf(t, cache)
+	if b.Epoch != 222 || b.Counter != 1 {
+		t.Fatalf("account B generation = %+v, want a new epoch at counter 1", b)
+	}
+	if applied.covers(b) {
+		t.Fatal("account A's applied watermark covers account B's first generation")
+	}
+}
+
+// A numeric snapshot written before generations existed is versioned in place
+// — values, observation times and scope untouched — while an empty or
+// usage-less snapshot stays unversioned.
+func TestClaudeCacheGeneration_LegacyNumericSnapshotIsVersionedInPlace(t *testing.T) {
+	dir := t.TempDir()
+	observed := time.Now().Add(-2 * time.Hour).UnixMilli()
+	legacy := filepath.Join(dir, "legacy.json")
+	body := `{"updatedAt":"2026-10-06T09:00:04Z","accountFingerprint":"acct","buckets":{"five_hour":` +
+		`{"usedPercentage":41,"resetsAtMs":` + itoa(observed+3600000) + `,"status":"allowed","observedAtMs":` + itoa(observed) + `}}}`
+	if err := os.WriteFile(legacy, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := loadClaudeRateLimitSnapshot(legacy)
+
+	g := claudeEnsureCacheGeneration(legacy)
+	if g == nil || g.Epoch <= 0 || g.Counter != 1 {
+		t.Fatalf("legacy numeric snapshot generation = %+v", g)
+	}
+	after, _ := loadClaudeRateLimitSnapshot(legacy)
+	if after.AccountFingerprint != before.AccountFingerprint || after.UpdatedAt != before.UpdatedAt ||
+		after.Buckets[claudeWindowFiveHour] != before.Buckets[claudeWindowFiveHour] {
+		t.Fatalf("versioning changed the reading:\nbefore %+v\nafter  %+v", before, after)
+	}
+	if again := claudeEnsureCacheGeneration(legacy); again == nil || *again != *g {
+		t.Fatalf("a second open re-versioned the snapshot: %+v, want %+v", again, g)
+	}
+
+	for name, content := range map[string]string{
+		"empty":      `{"updatedAt":"x","buckets":{}}`,
+		"usage-less": `{"updatedAt":"x","buckets":{"five_hour":{"usedPercentage":0,"resetsAtMs":1,"observedAtMs":1,"usageObserved":false}}}`,
+	} {
+		path := filepath.Join(dir, name+".json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if g := claudeEnsureCacheGeneration(path); g != nil {
+			t.Fatalf("%s snapshot was versioned: %+v", name, g)
+		}
+		if snap, _ := loadClaudeRateLimitSnapshot(path); snap.GenerationEpoch != 0 || snap.Generation != 0 {
+			t.Fatalf("%s snapshot gained a generation on disk: %+v", name, snap)
+		}
+	}
+}

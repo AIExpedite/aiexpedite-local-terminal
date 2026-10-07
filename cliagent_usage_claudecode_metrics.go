@@ -91,6 +91,12 @@ type claudeRateLimitView struct {
 	// probedAtMs is the newest instant the utilization probe persisted a reading
 	// at, carried across from claudeRateLimitSnapshot.LastProbeObservedAtMs.
 	probedAtMs int64
+	// generation is the committed capture generation (claudeBumpGeneration) of
+	// this agent's OWN cache, read in the same pass as its buckets, or nil when
+	// that snapshot is unversioned, holds no numeric reading, or belongs to
+	// another account. A hook pinned to another channel's cache versions that
+	// file under its own epoch, which this agent neither publishes nor hints.
+	generation *cliUsageGeneration
 }
 
 // probeObservedAtMs is the newest instant a PROBE reading is on record for this
@@ -116,10 +122,13 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 	}
 
 	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}
-	for _, path := range paths {
+	for i, path := range paths {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok || snap.AccountFingerprint != currentFingerprint {
 			continue
+		}
+		if i == 0 {
+			view.generation = claudeSnapshotGeneration(snap)
 		}
 		if snap.LastProbeObservedAtMs > view.probedAtMs {
 			view.probedAtMs = snap.LastProbeObservedAtMs

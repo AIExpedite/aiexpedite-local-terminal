@@ -24,8 +24,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,10 +117,11 @@ type cliAgentUsage struct {
 	NoticeSeverity string `json:"noticeSeverity,omitempty"`
 	NoticeURL      string `json:"noticeUrl,omitempty"`
 	// UsageGeneration identifies the device-side capture state these metrics
-	// were read from (codexMetricsAndGenerationFromCache). Signed in the refresh
-	// receipt, so the backend can record which generation it applied and skip a
+	// were read from (codexMetricsAndGenerationFromCache, and Claude's
+	// claudeRateLimitView.generation). Signed in the refresh receipt, so the
+	// backend can record which generation it applied, per provider, and skip a
 	// usage hint for one it already has (cliagent_usage_propagate.go). Only
-	// Codex sets it; integers only.
+	// Codex and Claude Code set it; integers only.
 	UsageGeneration *cliUsageGeneration `json:"usageGeneration,omitempty"`
 }
 
@@ -127,6 +130,27 @@ type cliAgentUsage struct {
 type cliUsageGeneration struct {
 	Epoch   int64 `json:"epoch"`
 	Counter int64 `json:"counter"`
+}
+
+// covers reports whether g already accounts for other: the same epoch and a
+// counter at least as high. A different epoch is always new — counters are
+// never compared across epochs.
+func (g cliUsageGeneration) covers(other cliUsageGeneration) bool {
+	return g.Epoch == other.Epoch && g.Counter >= other.Counter
+}
+
+// drawCLIUsageGenerationEpoch draws a capture-generation epoch uniform in
+// [1, 2^53-1], so it stays a JavaScript-safe integer on the wire and in
+// Firestore. It is NOT derived from the clock, so two draws in the same
+// millisecond (or under a frozen test clock) still differ; a collision is
+// ~2^-53 per draw.
+func drawCLIUsageGenerationEpoch() int64 {
+	const maxSafe = int64(1)<<53 - 1
+	if n, err := rand.Int(rand.Reader, big.NewInt(maxSafe)); err == nil {
+		return n.Int64() + 1
+	}
+	// crypto/rand does not fail on supported platforms; never publish epoch 0.
+	return time.Now().UnixNano()&maxSafe | 1
 }
 
 // These are the signed-refresh contract's collection caps. The demand-driven
