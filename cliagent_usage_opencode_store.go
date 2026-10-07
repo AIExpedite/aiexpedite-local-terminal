@@ -164,10 +164,15 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	if truncated {
 		// More sessions than one pass will ever consider: whatever the cut
 		// dropped is uncounted, so say so rather than letting the totals read
-		// as complete.
-		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		// as complete. The marker must reach disk: a pass that went on to end
+		// no_change would pay the debt for sessions it never counted, with no
+		// notice on the card.
+		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			return openCodeLedgerEdit{Changed: openCodeMarkTodayPartial(l, openCodeUsageNow())}
 		})
+		if !persisted {
+			return openCodeFinishPass(openCodeReconcileResult{Outcome: openCodeReconcileWriteError})
+		}
 	}
 
 	ledger := readOpenCodeUsageLedger()

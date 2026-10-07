@@ -419,6 +419,28 @@ func TestOpenCodeGeneration_MovesOnlyWhenADayTotalChanges(t *testing.T) {
 	}
 }
 
+func TestOpenCodeGeneration_MovesWhenTodayTurnsPartial(t *testing.T) {
+	// The lower-bound notice is published, so a pass that marks the day partial
+	// after the gather returned must advance the generation (and so hint the
+	// backend) even though no total moved — and only on the first marking.
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	before := readOpenCodeUsageLedger().Generation
+	markPartial := func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		return openCodeLedgerEdit{Changed: openCodeMarkTodayPartial(l, openCodeUsageNow())}
+	}
+	updateOpenCodeUsageLedger(markPartial)
+	after := readOpenCodeUsageLedger().Generation
+	if after == before || after.Epoch != openCodeProcessGenerationEpoch.Load() {
+		t.Fatalf("generation = %+v -> %+v, want it advanced when today turned partial", before, after)
+	}
+	updateOpenCodeUsageLedger(markPartial)
+	if again := readOpenCodeUsageLedger().Generation; again != after {
+		t.Fatalf("generation moved on an already-partial day: %+v -> %+v", after, again)
+	}
+}
+
 func TestOpenCodeGeneration_EpochStaysJavaScriptSafe(t *testing.T) {
 	// terminal-service bounds the field by Number.MAX_SAFE_INTEGER, so an
 	// epoch above it would be rejected at the route and the reading never

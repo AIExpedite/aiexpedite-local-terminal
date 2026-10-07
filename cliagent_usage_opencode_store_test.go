@@ -654,6 +654,29 @@ func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testin
 	}
 }
 
+func TestOpenCodeReconcile_ARefusedPartialMarkerFailsThePass(t *testing.T) {
+	// A truncated list whose lower-bound marker never reached disk must not end
+	// as a success: no_change would pay the debt for the sessions the cut
+	// dropped, with no notice on the card.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(blocker, "opencode_usage.json"))
+	// Cut before any row arrived intact, so the plan has nothing to export.
+	stub := (&openCodeCLIStub{sessions: `[{"id":"ses_`, sessionsFilled: true}).install(t)
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome != openCodeReconcileWriteError {
+		t.Fatalf("outcome = %q, want write_error", result.Outcome)
+	}
+	if got := stub.exportCount(); got != 0 {
+		t.Fatalf("exports = %d, want none", got)
+	}
+}
+
 func TestOpenCodeReconcile_ASessionListOverItsStdoutCapIsABacklogNotUnsupported(t *testing.T) {
 	// A list past openCodeSessionListMaxStdout is cut mid-document, so it never
 	// parses whole. Reading it as `unsupported` would retire the debt with no

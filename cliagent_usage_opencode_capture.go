@@ -196,6 +196,8 @@ type openCodeLedgerEdit struct {
 	Changed bool
 	// TotalsChanged: a day's PUBLISHED totals moved. The only thing that
 	// advances the generation, and so the only thing that hints the backend.
+	// updateOpenCodeUsageLedger also sets it when today first turns partial:
+	// the lower-bound notice is part of the published view too.
 	TotalsChanged bool
 }
 
@@ -245,7 +247,15 @@ func readOpenCodeUsageLedger() openCodeUsageLedger {
 func updateOpenCodeUsageLedger(mutate func(*openCodeUsageLedger) openCodeLedgerEdit) (openCodeUsageLedger, bool) {
 	openCodeLedgerMu.Lock()
 	ledger := readOpenCodeUsageLedger()
+	today := openCodeDayKey(openCodeUsageNow())
+	wasPartial := openCodeDayPartial(ledger, today)
 	edit := mutate(&ledger)
+	if !wasPartial && openCodeDayPartial(ledger, today) {
+		// The parser turns a partial day into the card's lower-bound notice, so
+		// a pass that marks it after the gather returned must hint the backend
+		// exactly as a moved total does, whichever helper set the flag.
+		edit.TotalsChanged = true
+	}
 	if edit.TotalsChanged {
 		openCodeBumpGeneration(&ledger)
 	}
@@ -580,6 +590,12 @@ func openCodeEnsureDay(ledger *openCodeUsageLedger, dayKey string) *openCodeLedg
 		day.Messages = map[string]openCodeMessageUsage{}
 	}
 	return day
+}
+
+// openCodeDayPartial reports whether a day's totals are marked a lower bound.
+func openCodeDayPartial(ledger openCodeUsageLedger, dayKey string) bool {
+	day := ledger.Days[dayKey]
+	return day != nil && day.Partial
 }
 
 // openCodeMarkTodayPartial marks today's totals as a lower bound.
