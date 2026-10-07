@@ -57,8 +57,9 @@ const (
 	// backlog of more than this takes several passes.
 	openCodeReconcileMaxExports = 3
 	// openCodeExportMaxStdout caps one export's stdout. Past it the export
-	// merges nothing: the session is remembered for a retry (or, when the
-	// stream already counted it, simply stepped over).
+	// merges nothing and the day is a lower bound: the session is remembered
+	// for a retry (or, when the stream already counted it, stepped over — its
+	// delegated children are still unread).
 	openCodeExportMaxStdout = 8 << 20
 	// openCodeSessionListMaxStdout caps the session list. Generous relative to
 	// a list of ids and timestamps, and small enough that a runaway cannot be
@@ -299,9 +300,13 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			edit := openCodeLedgerEdit{}
 			if filled {
 				// The export was over the cap, so it merged nothing. A session
-				// the stream already counted is simply stepped over; any other
-				// is remembered for a retry and makes the day a lower bound.
+				// the stream already counted is stepped over; any other is
+				// remembered for a retry. Either way the day is a lower bound:
+				// the run stream carries only the parent's own steps, and the
+				// delegated child sessions are discovered by parsing this very
+				// export, so a truncated one leaves them uncounted.
 				if openCodeSessionStreamCaptured(*l, openCodeUsageHash(candidate.id, "")) {
+					openCodeMarkTodayPartial(l, openCodeUsageNow())
 					edit.Changed = true
 				} else {
 					openCodeRememberSkippedSession(l, candidate.id, candidate.updatedMs)

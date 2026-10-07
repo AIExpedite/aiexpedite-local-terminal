@@ -265,7 +265,7 @@ func TestOpenCodeReconcile_StreamAndExportOfOneRunNeverDoubleCount(t *testing.T)
 
 /* ────────────────────────── the over-cap export ────────────────────────── */
 
-func TestOpenCodeReconcile_OverCapExportOfAStreamCapturedSessionJustAdvancesTheCursor(t *testing.T) {
+func TestOpenCodeReconcile_OverCapExportOfAStreamCapturedSessionAdvancesAndMarksPartial(t *testing.T) {
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
@@ -288,8 +288,10 @@ func TestOpenCodeReconcile_OverCapExportOfAStreamCapturedSessionJustAdvancesTheC
 	if ledger.ReconcileCursorMs != now.UnixMilli() {
 		t.Fatalf("cursor = %d, want it past the session", ledger.ReconcileCursorMs)
 	}
-	if day := ledger.Days[openCodeDayKey(now)]; day.Partial {
-		t.Fatal("a session the stream counted must not make the day a lower bound")
+	// The stream counted the parent's own steps, but any delegated child is
+	// only discoverable from the export that was too large to read.
+	if day := ledger.Days[openCodeDayKey(now)]; !day.Partial {
+		t.Fatal("an unreadable export hides its child sessions, so the day must be a lower bound")
 	}
 }
 

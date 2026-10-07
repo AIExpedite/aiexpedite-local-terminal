@@ -2306,7 +2306,8 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   card carries the lower-bound notice rather than a silently low number.
 - **The cursor always advances** past an attempted session, over-cap included, so
   no outcome can stall on one. An over-cap session the stream already counted is
-  simply stepped over; any other is remembered and retried when its `updated`
+  stepped over but still makes the day `partial`, because its delegated child
+  sessions are found only by parsing that export; any other is remembered and retried when its `updated`
   rises, taking at most 1 of the 3 export slots while sessions beyond the cursor
   remain. Several sessions can share one `updated` stamp, so the cursor also
   keeps `reconcileCursorTies` — the hashes of the sessions committed AT it — and
