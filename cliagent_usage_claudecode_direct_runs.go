@@ -24,7 +24,7 @@
 //     it neither owes nor counts as covered, and the next due scan tries again.
 //
 // Cost: the transcript scan is stat-only, one directory level of projects and
-// every *.jsonl in each, and never opens a file. Stat cost is linear in the
+// every *.jsonl in each, and never opens a transcript. Stat cost is linear in the
 // file count, so on a device with tens of thousands of transcripts on a slow
 // disk the budget bites and those runs stay uncovered until the user prunes
 // old transcripts. A run launched with `--no-session-persistence` writes no
@@ -65,6 +65,10 @@ var claudeUsageWatchState struct {
 	stampRetries   int
 	lastScanAt     time.Time
 	lastEvidenceMs int64
+	// lastEvidenceAtMs is the wall clock read when lastEvidenceMs was recorded.
+	// Both are wall-clock readings, so a backward clock step is detectable:
+	// without it the mark would suppress every later run (claudeScanDirectRuns).
+	lastEvidenceAtMs int64
 }
 
 // claudeUsageWatchTick is the watcher's per-tick Claude work (see the header).
@@ -164,7 +168,16 @@ func claudeScanDirectRuns(now time.Time) {
 		return
 	}
 	s := &claudeUsageWatchState
+	nowMs := now.UnixMilli()
 	s.mu.Lock()
+	// A backward clock step (an NTP correction, a resumed suspend) leaves the
+	// mark ahead of the clock that stamps new transcripts, so every later run
+	// would read as already seen for the life of the process. Forget the mark
+	// instead: the owe rule still gates what the next scan does (coverage, a
+	// standing debt, the quiet window, the age-out), so no budget is refilled.
+	if s.lastEvidenceMs > 0 && nowMs < s.lastEvidenceAtMs-claudeRefreshOwedLocalSkew.Milliseconds() {
+		s.lastEvidenceMs, s.lastEvidenceAtMs = 0, 0
+	}
 	seen := newestMs <= s.lastEvidenceMs
 	s.mu.Unlock()
 	if seen {
@@ -183,7 +196,7 @@ func claudeScanDirectRuns(now time.Time) {
 	if outcome != claudeDirectRunStanding && outcome != claudeDirectRunFuture && outcome != claudeDirectRunQuiet {
 		s.mu.Lock()
 		if newestMs > s.lastEvidenceMs {
-			s.lastEvidenceMs = newestMs
+			s.lastEvidenceMs, s.lastEvidenceAtMs = newestMs, nowMs
 		}
 		s.mu.Unlock()
 	}
@@ -195,10 +208,12 @@ func claudeScanDirectRuns(now time.Time) {
 // (epoch ms) not beyond ceilingMs as it goes, so directory order does not
 // matter and a future-dated file never hides the rest. Mtime is read per
 // FILE because on Windows an append updates the file's mtime but not its
-// directory's. It never opens a file and never returns a path.
+// directory's. It never opens a transcript and never returns a path.
 //
 // complete is false when the budget ran out: what was seen so far is not
 // evidence, because the newest transcript may be in a directory not reached.
+// Both levels are read in batches (claudeWalkTranscriptDir), so the budget
+// bounds a single very full project directory too.
 // A missing projects directory is a complete scan with nothing in it.
 func claudeNewestTranscriptMs(home string, budget time.Duration, ceilingMs int64) (newestMs int64, files int, complete bool) {
 	base := claudeConfigDir(home)
@@ -206,41 +221,78 @@ func claudeNewestTranscriptMs(home string, budget time.Duration, ceilingMs int64
 		return 0, 0, true
 	}
 	root := filepath.Join(base, "projects")
-	projects, err := os.ReadDir(root)
-	if err != nil {
-		return 0, 0, true
-	}
 	deadline := time.Now().Add(budget)
+	var projects []string
+	rootDone, err := claudeWalkTranscriptDir(root, deadline, func(entry os.DirEntry) {
+		if entry.IsDir() {
+			projects = append(projects, entry.Name())
+		}
+	})
+	if err != nil {
+		return 0, 0, true // no projects directory: a complete scan with nothing in it
+	}
+	if !rootDone {
+		return newestMs, files, false
+	}
 	for _, project := range projects {
-		if time.Now().After(deadline) {
-			return newestMs, files, false
-		}
-		if !project.IsDir() {
-			continue
-		}
-		dir := filepath.Join(root, project.Name())
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if time.Now().After(deadline) {
-				return newestMs, files, false
-			}
+		dirDone, err := claudeWalkTranscriptDir(filepath.Join(root, project), deadline, func(entry os.DirEntry) {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-				continue
+				return
 			}
 			info, err := entry.Info()
 			if err != nil {
-				continue
+				return
 			}
 			files++
 			if ms := info.ModTime().UnixMilli(); ms > newestMs && ms <= ceilingMs {
 				newestMs = ms
 			}
+		})
+		if err != nil {
+			continue
+		}
+		if !dirDone {
+			return newestMs, files, false
 		}
 	}
 	return newestMs, files, true
+}
+
+// claudeTranscriptScanBatch is how many directory entries one read takes. Small
+// enough that the deadline is checked often on a slow or very full directory,
+// large enough to keep the syscall count down on an ordinary one.
+const claudeTranscriptScanBatch = 128
+
+// claudeWalkTranscriptDir calls visit for every entry in dir, reading the
+// directory in bounded batches and checking the deadline between reads: a
+// single read of a whole directory would allocate every entry before the next
+// check, so one project with tens of thousands of transcripts, or a slow
+// filesystem, could block the watcher goroutine well past the scan budget.
+//
+// It reports whether the directory was walked to its end — false means the
+// deadline passed, which makes the scan incomplete and therefore not evidence.
+// The error is the open failure only (a missing directory), never a path leak
+// beyond what the caller already holds.
+func claudeWalkTranscriptDir(dir string, deadline time.Time, visit func(os.DirEntry)) (bool, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	for {
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		entries, err := f.ReadDir(claudeTranscriptScanBatch)
+		for _, entry := range entries {
+			visit(entry)
+		}
+		// io.EOF ends the walk; any other read error is treated the same way,
+		// because a partial directory is all this scan can see of it.
+		if err != nil || len(entries) == 0 {
+			return true, nil
+		}
+	}
 }
 
 // logClaudeDirectRun is the scan's one log line: a fixed label and counters.
@@ -255,7 +307,8 @@ func resetClaudeUsageWatchState() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.primed = false
+	s.stampRetries = 0
 	s.ownMod, s.ownSize, s.pinnedMod, s.pinnedSize = 0, 0, 0, 0
 	s.lastScanAt = time.Time{}
-	s.lastEvidenceMs = 0
+	s.lastEvidenceMs, s.lastEvidenceAtMs = 0, 0
 }

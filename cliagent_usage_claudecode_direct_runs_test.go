@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -374,5 +375,64 @@ func TestClaudeDirectRunScan_LogsNoPath(t *testing.T) {
 		if strings.Contains(logged, leak) {
 			t.Fatalf("scan log leaks %q: %q", leak, logged)
 		}
+	}
+}
+
+// A backward clock step must not suppress later direct runs: the process-local
+// high-water mark is a wall-clock reading, so it is forgotten once the clock
+// reads earlier than when it was recorded.
+func TestClaudeDirectRunScan_ABackwardClockStepReconsidersLaterRuns(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-2*time.Hour))
+	first := now.Add(-time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", first)
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != first.UnixMilli() {
+		t.Fatalf("debt=%d, want the first run owed", snap.RefreshOwedAtMs)
+	}
+
+	// The clock steps an hour back, and the next run's transcript is stamped
+	// below the mark the first scan recorded.
+	stepped := now.Add(-time.Hour)
+	second := stepped.Add(-time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", second)
+	seedClaudeProbeReading(t, cache, stepped.Add(-2*time.Hour))
+	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(), func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 0, 0, 0
+		return true
+	})
+
+	claudeScanDirectRuns(stepped)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != second.UnixMilli() {
+		t.Fatalf("debt=%d, want the run after the clock step owed", snap.RefreshOwedAtMs)
+	}
+}
+
+// A project directory larger than one read batch is walked to its end, and the
+// budget still bounds it: the entries are read in batches with the deadline
+// checked between them, so one very full directory cannot overrun it.
+func TestClaudeNewestTranscript_ABigDirectoryIsBatchedAndStillBounded(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	count := claudeTranscriptScanBatch*2 + 5
+	for i := 0; i < count; i++ {
+		writeClaudeTranscript(t, configDir, "-big", fmt.Sprintf("s%03d.jsonl", i), base.Add(time.Duration(i)*time.Second))
+	}
+	newest, files, complete := claudeNewestTranscriptMs("", time.Minute, math.MaxInt64)
+	if !complete || files != count || newest != base.Add(time.Duration(count-1)*time.Second).UnixMilli() {
+		t.Fatalf("newest=%d files=%d complete=%v, want all %d transcripts walked", newest, files, complete, count)
+	}
+	if _, _, complete := claudeNewestTranscriptMs("", -time.Second, math.MaxInt64); complete {
+		t.Fatal("a scan past its budget reported complete on a big directory")
 	}
 }
