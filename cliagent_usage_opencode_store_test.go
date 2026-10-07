@@ -654,6 +654,221 @@ func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testin
 	}
 }
 
+func TestOpenCodeReconcile_ARefusedUndatableMarkerFailsThePass(t *testing.T) {
+	// A listed session whose `updated` cannot be read is never exported, so the
+	// partial marker is the ONLY record that the day is a lower bound. Ending
+	// no_change would pay the debt and present the day as complete, with no
+	// automatic retry — exactly as for the truncated list above.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(blocker, "opencode_usage.json"))
+	stub := (&openCodeCLIStub{sessions: `[{"id":"ses_undatable"}]`}).install(t)
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if openCodeReconcileSucceeded(result.Outcome) {
+		t.Fatalf("outcome = %q: a refused lower-bound marker must not succeed", result.Outcome)
+	}
+	if result.Outcome != openCodeReconcileWriteError {
+		t.Fatalf("outcome = %q, want write_error", result.Outcome)
+	}
+	if got := stub.exportCount(); got != 0 {
+		t.Fatalf("exports = %d, want none for an undatable session", got)
+	}
+}
+
+/* ─────────────────────── the session list's own bound ──────────────────── */
+
+func TestOpenCodeReconcile_AsksForMoreRowsThanItConsiders(t *testing.T) {
+	// OpenCode's list service defaults an unspecified limit to 100 rows, so the
+	// unflagged command hides everything older than the newest 100 — and those
+	// rows fall behind the cursor once the returned ones commit, with nothing
+	// marking the loss. One more than the local cap is asked for, so a longer
+	// list still reads as truncated.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	stub := (&openCodeCLIStub{sessions: sessionList()}).install(t)
+
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	want := "session list --format json --max-count " + strconv.Itoa(openCodeSessionListMaxSessions+1)
+	if got := stub.recorded(); len(got) != 1 || got[0] != want {
+		t.Fatalf("calls = %v, want %q", got, want)
+	}
+}
+
+func TestOpenCodeReconcile_FallsBackToTheUnflaggedListWhenMaxCountIsRejected(t *testing.T) {
+	// A build that predates `--max-count` rejects the whole command, and
+	// `unsupported` RETIRES the debt — so the older spelling is worth one retry
+	// before standing the feature down.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_a", created + 1000}),
+		exports: map[string]string{
+			"ses_a": exportWith("ses_a", "msg_a", created, 7, 1, "0"),
+		},
+	}).install(t)
+	modern := openCodeRunCommand
+	openCodeRunCommand = func(ctx context.Context, path string, args []string, limit int) ([]byte, bool, error) {
+		for _, arg := range args {
+			if arg == "--max-count" {
+				stub.record(args)
+				return nil, false, &exec.ExitError{}
+			}
+		}
+		return modern(ctx, path, args, limit)
+	}
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok through the unflagged list", result.Outcome)
+	}
+	if got := stub.recorded(); len(got) != 3 || !strings.Contains(got[0], "--max-count") ||
+		got[1] != "session list --format json" || got[2] != "export ses_a" {
+		t.Fatalf("calls = %v, want the flagged list, the unflagged retry, then the export", got)
+	}
+	if tokens, _, _ := todayTotals(t, now); tokens != 8 {
+		t.Fatalf("tokens = %d, want the fallback list's export counted", tokens)
+	}
+}
+
+/* ──────────────────────── delegated child sessions ─────────────────────── */
+
+// exportWithChildren renders an export carrying one assistant message plus a
+// `task` tool part per delegated child, the way OpenCode records a subagent.
+func exportWithChildren(sessionID, messageID string, createdMs, in, out int64, children ...string) string {
+	parts := make([]string, 0, len(children))
+	for _, child := range children {
+		parts = append(parts,
+			fmt.Sprintf(`{"type":"tool","tool":"task","state":{"status":"completed",`+
+				`"metadata":{"parentSessionId":%q,"sessionId":%q}}}`, sessionID, child))
+	}
+	return fmt.Sprintf(`{"messages":[{"info":{"id":%q,"sessionID":%q,"role":"assistant",`+
+		`"time":{"created":%d},"cost":0,"tokens":{"input":%d,"output":%d,"reasoning":0,`+
+		`"cache":{"read":0,"write":0}}},"parts":[%s]}]}`,
+		messageID, sessionID, createdMs, in, out, strings.Join(parts, ","))
+}
+
+func TestOpenCodeReconcile_CountsDelegatedChildSessions(t *testing.T) {
+	// A subagent's tokens live in a CHILD session, which `session list` never
+	// returns (it asks for roots only) and the run stream drops (it keeps only
+	// the root's parts). The parent export's task part is the only place a
+	// reconcile can learn the id, so it is followed — one level, then the next.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_root", created + 1000}),
+		exports: map[string]string{
+			"ses_root":     exportWithChildren("ses_root", "msg_root", created, 10, 1, "ses_kid"),
+			"ses_kid":      exportWithChildren("ses_kid", "msg_kid", created, 20, 2, "ses_grandkid"),
+			"ses_grandkid": exportWith("ses_grandkid", "msg_grandkid", created, 30, 3, "0"),
+		},
+	}).install(t)
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok", result.Outcome)
+	}
+	if got := stub.recorded(); len(got) != 4 || got[1] != "export ses_root" ||
+		got[2] != "export ses_kid" || got[3] != "export ses_grandkid" {
+		t.Fatalf("calls = %v, want the root then its descendants", got)
+	}
+	if tokens, _, rows := todayTotals(t, now); tokens != 66 || rows != 3 {
+		t.Fatalf("tokens=%d rows=%d, want 66/3 — the root and both subagents", tokens, rows)
+	}
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || day.Partial {
+		t.Fatalf("day = %+v, want a complete day: every child was read", day)
+	}
+	// The descent does not consume the pass's export slots, which are the
+	// LISTED sessions' budget.
+	if result.Exported != 1 {
+		t.Fatalf("exported = %d, want the one listed session", result.Exported)
+	}
+}
+
+func TestOpenCodeReconcile_BoundsTheDescentAndSaysTheDayIsALowerBound(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	created := now.UnixMilli()
+
+	t.Run("too many children", func(t *testing.T) {
+		openCodeUsageFixture(t, now)
+		children := make([]string, 0, openCodeExportMaxChildren+2)
+		exports := map[string]string{}
+		for i := 0; i < openCodeExportMaxChildren+2; i++ {
+			id := fmt.Sprintf("ses_kid_%d", i)
+			children = append(children, id)
+			exports[id] = exportWith(id, "msg_"+id, created, 1, 0, "0")
+		}
+		exports["ses_root"] = exportWithChildren("ses_root", "msg_root", created, 5, 0, children...)
+		stub := (&openCodeCLIStub{
+			sessions: sessionList(openCodeSessionRow{"ses_root", created + 1000}),
+			exports:  exports,
+		}).install(t)
+
+		reconcileOpenCodeUsageOnce(context.Background(), now)
+		if got := stub.exportCount(); got != 1+openCodeExportMaxChildren {
+			t.Fatalf("exports = %d, want the root plus %d children", got, openCodeExportMaxChildren)
+		}
+		if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+			t.Fatalf("day = %+v, want the lower-bound notice for the children left unread", day)
+		}
+	})
+
+	t.Run("too deep", func(t *testing.T) {
+		openCodeUsageFixture(t, now)
+		exports := map[string]string{}
+		for level := 0; level <= openCodeExportMaxChildDepth; level++ {
+			id := fmt.Sprintf("ses_%d", level)
+			exports[id] = exportWithChildren(id, "msg_"+id, created, 1, 0, fmt.Sprintf("ses_%d", level+1))
+		}
+		stub := (&openCodeCLIStub{
+			sessions: sessionList(openCodeSessionRow{"ses_0", created + 1000}),
+			exports:  exports,
+		}).install(t)
+
+		reconcileOpenCodeUsageOnce(context.Background(), now)
+		if got := stub.exportCount(); got != 1+openCodeExportMaxChildDepth {
+			t.Fatalf("exports = %d, want the root plus %d levels", got, openCodeExportMaxChildDepth)
+		}
+		if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+			t.Fatalf("day = %+v, want the lower-bound notice past the depth bound", day)
+		}
+	})
+
+	t.Run("an unreadable child does not retire the debt", func(t *testing.T) {
+		// `unsupported` stands the whole feature down, so a child the CLI
+		// cannot export — the parent read fine — is a lower bound, not a
+		// verdict on the install.
+		openCodeUsageFixture(t, now)
+		stub := (&openCodeCLIStub{
+			sessions: sessionList(openCodeSessionRow{"ses_root", created + 1000}),
+			exports: map[string]string{
+				"ses_root": exportWithChildren("ses_root", "msg_root", created, 9, 1, "ses_gone"),
+				"ses_gone": "not json at all",
+			},
+		}).install(t)
+
+		result := reconcileOpenCodeUsageOnce(context.Background(), now)
+		if result.Outcome != openCodeReconcileOK {
+			t.Fatalf("outcome = %q, want ok: the listed session was read", result.Outcome)
+		}
+		if got := stub.exportCount(); got != 2 {
+			t.Fatalf("exports = %d, want the root and the one attempt at the child", got)
+		}
+		if tokens, _, _ := todayTotals(t, now); tokens != 10 {
+			t.Fatalf("tokens = %d, want the root's own figures kept", tokens)
+		}
+		if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+			t.Fatalf("day = %+v, want the lower-bound notice for the unread child", day)
+		}
+	})
+}
+
 func TestOpenCodeReconcile_ARefusedPartialMarkerFailsThePass(t *testing.T) {
 	// A truncated list whose lower-bound marker never reached disk must not end
 	// as a success: no_change would pay the debt for the sessions the cut

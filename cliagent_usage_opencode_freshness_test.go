@@ -781,6 +781,14 @@ func TestOpenCodeContinuation_BoundsOneChainsTotalPasses(t *testing.T) {
 		if !readOpenCodeUsageLedger().ContinuationDue {
 			break
 		}
+		// The chain books its next pass on the fixture's 2 ms free-retry floor,
+		// so the WORKER would otherwise run passes of its own alongside this
+		// loop: one of them leads the single flight, the loop's call joins it,
+		// and the pass budget is then charged for passes this loop never
+		// counted. Cancel the booked rung and wait out anything in flight, so
+		// each iteration is exactly one pass.
+		stopOpenCodeRunDebtRetry()
+		openCodeUsageRefreshWaitFor(5 * time.Second)
 		openCodePayReconcile(context.Background(), false)
 	}
 

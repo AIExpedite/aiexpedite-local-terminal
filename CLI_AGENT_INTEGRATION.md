@@ -2165,7 +2165,24 @@ limit, so any total would be invented.
    same way: OpenCode OVERWRITES a message's `info.tokens` on every step (it
    ends as the last step's), while each `step-finish` part keeps that step's own
    figures — so the reconcile sums the parts and keeps the field-wise max of
-   that sum and `info`, which is all an export without parts carries.
+   that sum and `info`, which is all an export without parts carries. The list
+   is asked for one more row than a pass considers
+   (`--max-count openCodeSessionListMaxSessions+1`), because OpenCode's list
+   service defaults an unspecified limit to 100 rows and the omitted older ones
+   would fall behind the cursor unmarked; a build that rejects the flag is
+   retried once with the older unflagged spelling rather than read as
+   `unsupported`, which would retire the debt.
+3. **The delegated CHILD sessions a parent export names.** A subagent's tokens
+   live in a child session, which `session list` never returns (it asks for
+   roots only) and the run stream drops (it keeps only parts whose session is
+   the root), so the `task` tool part's `metadata.sessionId` in the parent's
+   export is the ONLY place a reconcile can learn the id. The descent is
+   breadth-first and bounded by `openCodeExportMaxChildren` exports and
+   `openCodeExportMaxChildDepth` levels, merges in the parent's single commit,
+   and marks the day `partial` for anything it had to leave — and a child that
+   cannot be read is a lower bound, never `unsupported`: the LISTED session read
+   fine, and retiring the debt over a session learned from a tool part would
+   stand the whole feature down.
 
 The ledger then keeps, **field by field, the MAX** of the stream's summed figure
 and any other observation of the same message, so a stream and an export of the
@@ -2263,9 +2280,13 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   archive to learn nothing; the cursor is stepped past them in one write), and
   one whose `updated` we could not read (there is no way to tell whether it
   changed, so exporting it every pass would repeat forever; the day is marked
-  `partial` instead).
-- **Cost of a pass.** 1 `session list` + at most 3 `export` calls, OLDEST changed
-  session first, each export's stdout capped at 8 MiB. Passes run only on a debt
+  `partial` instead — and a REFUSED marker fails the pass as `write_error`,
+  because ending `no_change` would pay the debt and present the day as
+  complete).
+- **Cost of a pass.** 1 `session list` + at most 3 `export` calls for LISTED
+  sessions, OLDEST first, each export's stdout capped at 8 MiB, plus at most
+  `openCodeExportMaxChildren` further exports per listed session for the
+  subagent sessions it delegated to (short, one turn's worth each). Passes run only on a debt
   rung, a gather nudge (2-minute cooldown) or a Refresh click — never on an idle
   gather — and share one single flight, so the click and the worker never spawn
   two children. `openCodeReconcileMinInterval` spaces any two passes, a

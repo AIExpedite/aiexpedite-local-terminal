@@ -19,8 +19,11 @@
 // Cost discipline — this runs on the user's machine while they are working:
 //
 //   - One pass is 1 `session list` + at most openCodeReconcileMaxExports
-//     `export` calls, OLDEST changed session first, each export's stdout capped
-//     at openCodeExportMaxStdout and decoded as a stream.
+//     `export` calls for LISTED sessions, OLDEST changed session first, each
+//     export's stdout capped at openCodeExportMaxStdout and decoded as a
+//     stream, plus at most openCodeExportMaxChildren further exports per listed
+//     session for the subagent sessions it delegated to — a child session holds
+//     one turn's messages, and `session list` cannot name it at all.
 //   - A pass runs only on a debt rung, a gather nudge (on its cooldown) or a
 //     Refresh click — never on an idle gather.
 //   - Passes are single-flight: the click's live probe joins the worker's
@@ -40,6 +43,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +65,15 @@ const (
 	// openCodeSessionListMaxSessions bounds how many listed sessions one pass
 	// considers, newest-activity first.
 	openCodeSessionListMaxSessions = 512
+	// openCodeExportMaxChildren bounds the delegated child sessions ONE listed
+	// session may pull in. A subagent session is short (one turn's worth of
+	// messages), so the cost of following them is small next to the parent's
+	// own export — but it must still be bounded, and past the bound the day is
+	// a lower bound rather than a silently low number.
+	openCodeExportMaxChildren = 8
+	// openCodeExportMaxChildDepth bounds how deep that descent goes, so a
+	// subagent that itself delegates cannot walk a tree.
+	openCodeExportMaxChildDepth = 3
 )
 
 // openCodeReconcileResult is one pass's closed answer.
@@ -187,7 +200,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	remaining := func() int { return plan.remaining + len(plan.exports) - settled }
 
 	if plan.cursorFloorMs > ledger.ReconcileCursorMs || plan.undatable > 0 {
-		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			edit := openCodeLedgerEdit{}
 			// Step the cursor past everything older than the retention window
 			// in ONE write, so months of history cost no exports at all.
@@ -199,6 +212,14 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			}
 			return edit
 		})
+		// An undatable session exports nothing, so the partial marker is the
+		// ONLY record that the day is a lower bound. A refused write must fail
+		// the pass for the same reason the truncated list does: ending
+		// no_change would pay the debt and present the day as complete.
+		if !persisted && plan.undatable > 0 {
+			result.Outcome, result.Remaining = openCodeReconcileWriteError, remaining()
+			return openCodeFinishPass(result)
+		}
 	}
 
 	for _, candidate := range plan.exports {
@@ -214,7 +235,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			// backlog for the next pass, not a failure.
 			break
 		}
-		observations, filled, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
+		observations, filled, childrenPartial, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
 		result.Exported++
 		landed := false
 		if outcome != "" {
@@ -240,6 +261,11 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			} else {
 				edit.TotalsChanged = openCodeMergeObservations(l, observations, commitMs)
 				edit.Changed = openCodeForgetSkippedSession(l, candidate.id) || edit.TotalsChanged
+				// A delegated session this pass could not read is activity the
+				// totals miss, so the card carries the lower-bound notice.
+				if childrenPartial && openCodeMarkTodayPartial(l, openCodeUsageNow()) {
+					edit.Changed = true
+				}
 			}
 			// The cursor advances past EVERY attempted session, over-cap
 			// included, so no outcome can ever stall on one.
@@ -468,8 +494,33 @@ func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string)
 // changed session the cut dropped is never exported. The last return is "" on
 // success, or the closed outcome the pass must report.
 func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []openCodeSessionRow, truncated bool, outcome string) {
-	stdout, filled, err := openCodeRunCommand(ctx, path,
-		[]string{"session", "list", "--format", "json"}, openCodeSessionListMaxStdout)
+	// OpenCode's list service defaults an unspecified limit to 100 rows, so the
+	// unflagged command silently hides everything older than the newest 100 —
+	// and those rows fall behind the cursor once the ones it DID return are
+	// committed, with nothing marking the loss. Ask for one more than a pass
+	// will consider, so a longer list still shows up as truncated below.
+	rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(openCodeSessionListMaxSessions+1))
+	if outcome == openCodeReconcileUnsupported && ctx.Err() == nil {
+		// A build that predates `--max-count` rejects the whole command, and
+		// `unsupported` RETIRES the debt — so the older spelling is worth one
+		// retry before standing the feature down.
+		rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(0))
+	}
+	return rows, truncated, outcome
+}
+
+// openCodeSessionListArgs is the list command. A non-positive maxCount is the
+// older spelling, without the flag.
+func openCodeSessionListArgs(maxCount int) []string {
+	args := []string{"session", "list", "--format", "json"}
+	if maxCount > 0 {
+		args = append(args, "--max-count", strconv.Itoa(maxCount))
+	}
+	return args
+}
+
+func listOpenCodeSessionsWith(ctx context.Context, path string, args []string) (rows []openCodeSessionRow, truncated bool, outcome string) {
+	stdout, filled, err := openCodeRunCommand(ctx, path, args, openCodeSessionListMaxStdout)
 	if ctx.Err() != nil {
 		return nil, false, openCodeReconcileTimeout
 	}
@@ -508,22 +559,94 @@ func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []open
 }
 
 // exportOpenCodeSessionUsage exports one session and folds its assistant
-// messages. `filled` reports an export over the stdout cap (which merges
-// nothing); the third return is "" on success or the pass's closed outcome.
-func exportOpenCodeSessionUsage(ctx context.Context, path, sessionID string) ([]openCodeObservedMessage, bool, string) {
+// messages, following the CHILD sessions its tool calls delegated to (a
+// subagent's tokens live there, and nothing else in this feature can see them).
+// `filled` reports the session's own export over the stdout cap (which merges
+// nothing); `partial` reports a child left uncounted, which makes the day a
+// lower bound; the last return is "" on success or the pass's closed outcome.
+func exportOpenCodeSessionUsage(ctx context.Context, path, sessionID string) (
+	observed []openCodeObservedMessage, filled, partial bool, outcome string) {
+	observed, children, filled, outcome := exportOpenCodeOneSession(ctx, path, sessionID)
+	if filled || outcome != "" {
+		return observed, filled, false, outcome
+	}
+	childObserved, partial := exportOpenCodeChildSessions(ctx, path, sessionID, children)
+	return append(observed, childObserved...), false, partial, ""
+}
+
+// exportOpenCodeOneSession is one `export` call, with no descent.
+func exportOpenCodeOneSession(ctx context.Context, path, sessionID string) (
+	observed []openCodeObservedMessage, children []string, filled bool, outcome string) {
 	stdout, filled, err := openCodeRunCommand(ctx, path,
 		[]string{"export", sessionID}, openCodeExportMaxStdout)
 	if ctx.Err() != nil {
-		return nil, filled, openCodeReconcileTimeout
+		return nil, nil, filled, openCodeReconcileTimeout
 	}
 	if filled {
-		return nil, true, ""
+		return nil, nil, true, ""
 	}
-	observations, ok := parseOpenCodeExport(stdout, sessionID)
+	observations, children, ok := parseOpenCodeExport(stdout, sessionID)
 	if !ok {
-		return nil, false, openCodeCommandOutcome(err)
+		return nil, nil, false, openCodeCommandOutcome(err)
 	}
-	return observations, false, ""
+	return observations, children, false, ""
+}
+
+// exportOpenCodeChildSessions exports the subagent sessions a parent export
+// named, breadth-first and bounded by openCodeExportMaxChildren exports and
+// openCodeExportMaxChildDepth levels. Figures merge with the parent's, in the
+// parent's single commit, so a child is never half-counted.
+//
+// A child that cannot be read does NOT fail the pass: its parent exported
+// fine, and classifying it `unsupported` would retire the debt over a session
+// the feature only learned about from a tool part. It makes the day a lower
+// bound instead, which is what `partial` reports.
+func exportOpenCodeChildSessions(ctx context.Context, path, parentID string, seeds []string) (
+	observed []openCodeObservedMessage, partial bool) {
+	queue := make([]string, 0, len(seeds))
+	depth := map[string]int{}
+	seen := map[string]bool{strings.TrimSpace(parentID): true}
+	for _, seed := range seeds {
+		if seen[seed] {
+			continue
+		}
+		seen[seed], depth[seed] = true, 1
+		queue = append(queue, seed)
+	}
+	exported := 0
+	for len(queue) > 0 {
+		id, level := queue[0], depth[queue[0]]
+		queue = queue[1:]
+		if exported >= openCodeExportMaxChildren {
+			return observed, true
+		}
+		if ctx.Err() != nil || IsShutdownInProgress() {
+			// The parent's own figures still commit; the rest of the tree is
+			// uncounted, and the day says so.
+			return observed, true
+		}
+		childObserved, grandchildren, filled, outcome := exportOpenCodeOneSession(ctx, path, id)
+		exported++
+		if filled || outcome != "" {
+			partial = true
+			continue
+		}
+		observed = append(observed, childObserved...)
+		if level >= openCodeExportMaxChildDepth {
+			if len(grandchildren) > 0 {
+				partial = true
+			}
+			continue
+		}
+		for _, next := range grandchildren {
+			if seen[next] {
+				continue
+			}
+			seen[next], depth[next] = true, level+1
+			queue = append(queue, next)
+		}
+	}
+	return observed, partial
 }
 
 // openCodeCommandOutcome classifies a command whose OUTPUT we could not read: a
@@ -660,22 +783,46 @@ type openCodeExportMessageJSON struct {
 		Type   string             `json:"type"`
 		Tokens openCodeTokensJSON `json:"tokens"`
 		Cost   json.RawMessage    `json:"cost"`
+		// State.Metadata is where the `task` tool records the CHILD session it
+		// delegated to (`sessionId`, beside `parentSessionId`). A subagent's
+		// tokens live in that child session, which `session list` never returns
+		// (it asks for roots only) and the run stream drops (it keeps only
+		// parts whose session is the root) — so this is the only place a
+		// reconcile can learn the id. Both nestings are read, because older
+		// builds put the metadata on the part itself.
+		State struct {
+			Metadata openCodePartMetadataJSON `json:"metadata"`
+		} `json:"state"`
+		Metadata openCodePartMetadataJSON `json:"metadata"`
 	} `json:"parts"`
 }
 
-// parseOpenCodeExport folds an export's assistant messages into observations.
-// ok=false means the output is not a shape we recognise.
-func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMessage, bool) {
+// openCodePartMetadataJSON is the part metadata a delegating tool call carries.
+// Both spellings of the key have shipped.
+type openCodePartMetadataJSON struct {
+	SessionID    string `json:"sessionId"`
+	SessionIDAlt string `json:"sessionID"`
+}
+
+func (m openCodePartMetadataJSON) sessionID() string {
+	return firstNonEmpty(strings.TrimSpace(m.SessionID), strings.TrimSpace(m.SessionIDAlt))
+}
+
+// parseOpenCodeExport folds an export's assistant messages into observations,
+// and names the CHILD sessions its tool calls delegated to, whose own usage
+// this export does not carry. ok=false means the output is not a shape we
+// recognise.
+func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMessage, []string, bool) {
 	body := openCodeJSONBody(stdout)
 	if len(body) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	var export openCodeExportJSON
 	if json.NewDecoder(bytes.NewReader(body)).Decode(&export) != nil {
 		// Some releases print the messages as a bare array.
 		var bare []openCodeExportMessageJSON
 		if json.Unmarshal(body, &bare) != nil {
-			return nil, false
+			return nil, nil, false
 		}
 		export.Messages = bare
 	}
@@ -684,8 +831,24 @@ func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMes
 	// stand down the whole feature) on a session that simply holds no
 	// assistant turn.
 	out := make([]openCodeObservedMessage, 0, len(export.Messages))
+	var children []string
+	seen := map[string]bool{strings.TrimSpace(sessionID): true}
 	for _, message := range export.Messages {
 		info := message.Info
+		// A delegated child is named on a tool part, whatever the message's
+		// role, so it is collected before the assistant-only filter below.
+		for _, part := range message.Parts {
+			child := firstNonEmpty(part.State.Metadata.sessionID(), part.Metadata.sessionID())
+			// One MORE than the descent will export, so a fan-out past the
+			// bound is still detectable as a lower bound rather than silently
+			// trimmed here — and a pathological export cannot grow this list
+			// without limit either.
+			if child == "" || seen[child] || len(children) > openCodeExportMaxChildren {
+				continue
+			}
+			seen[child] = true
+			children = append(children, child)
+		}
 		if info.ID == "" {
 			continue
 		}
@@ -710,7 +873,7 @@ func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMes
 		})
 	}
 	// An export with no assistant message is a real, recognised answer.
-	return out, true
+	return out, children, true
 }
 
 // openCodeJSONBody trims a banner or an updater notice from the front of a
