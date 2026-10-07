@@ -755,10 +755,10 @@ func TestOpenCodeDiscovery_BoundsWhatOneDirectoryContributes(t *testing.T) {
 	// And the walk still completes inside its stat budget rather than hanging
 	// or panicking on the breadth.
 	stats := 0
-	if dirs := openCodeProjectSessionDirs(&stats); stats > openCodeDiscoveryMaxStats ||
-		len(dirs) > openCodeDiscoveryDirsPerSlug*openCodeDiscoveryMaxSlugs {
-		t.Fatalf("stats=%d dirs=%d, want <= %d / %d", stats, len(dirs),
-			openCodeDiscoveryMaxStats, openCodeDiscoveryDirsPerSlug*openCodeDiscoveryMaxSlugs)
+	if ranked := openCodeProjectSessionNewest(&stats); stats > openCodeDiscoveryMaxStats ||
+		len(ranked) > openCodeDiscoveryMaxSlugs {
+		t.Fatalf("stats=%d slugs=%d, want <= %d / %d", stats, len(ranked),
+			openCodeDiscoveryMaxStats, openCodeDiscoveryMaxSlugs)
 	}
 	// A missing root is the normal case and reads as nothing.
 	if got := openCodeReadDirBounded(filepath.Join(data, "absent"), 8); got != nil {
@@ -1194,4 +1194,40 @@ func TestOpenCodeSettle_RetriesADebtWhoseWriteWasRefused(t *testing.T) {
 		t.Fatalf("freshness = %+v, want the debt retried onto disk", state)
 	}
 	openCodeUsageRefreshWaitFor(2 * time.Second)
+}
+
+func TestOpenCodeDiscovery_SeesAProjectWriteWhenRankingFillsTheStatBudget(t *testing.T) {
+	// Ranking stats every slug's store directories, so a store with enough
+	// slugs spends the whole budget there. The walk must still report the
+	// change it already measured — handing the caller paths to stat a SECOND
+	// time left nothing in the budget, and a direct TUI run went unnoticed.
+	data := t.TempDir()
+	t.Setenv("OPENCODE_DATA", data)
+	t.Setenv("XDG_DATA_HOME", "")
+
+	before := time.Now().Add(-time.Hour)
+	slugs := openCodeDiscoveryMaxStats/openCodeDiscoveryDirsPerSlug + 2
+	for i := 0; i < slugs; i++ {
+		storage := filepath.Join(data, "project", fmt.Sprintf("slug-%04d", i), "storage")
+		for _, dir := range []string{
+			filepath.Join(storage, "session", "info"),
+			filepath.Join(storage, "message"),
+			filepath.Join(storage, "part"),
+		} {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stamp := before
+			if i == 0 {
+				// The first slug ranked, holding the only fresh write.
+				stamp = time.Now()
+			}
+			if err := os.Chtimes(dir, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if !openCodeSessionStoreChangedSince(before) {
+		t.Fatal("a project write must be seen even when ranking spends the stat budget")
+	}
 }

@@ -2168,10 +2168,14 @@ limit, so any total would be invented.
    that sum and `info`, which is all an export without parts carries. The list
    is asked for one more row than a pass considers
    (`--max-count openCodeSessionListMaxSessions+1`), because OpenCode's list
-   service defaults an unspecified limit to 100 rows and the omitted older ones
-   would fall behind the cursor unmarked; a build that rejects the flag is
-   retried once with the older unflagged spelling rather than read as
-   `unsupported`, which would retire the debt.
+   service defaults an unspecified limit to `openCodeSessionListServiceDefault`
+   (100) rows and the omitted older ones would fall behind the cursor unmarked;
+   a build that rejects the flag is retried once with the older unflagged
+   spelling rather than read as `unsupported`, which would retire the debt. Some
+   releases ACCEPT the flag and exit zero but apply it only after that capped
+   query, so a result landing exactly on the 100-row boundary is read as
+   TRUNCATED whatever the flag said — the day stays a lower bound instead of a
+   short list passing as a complete one.
 3. **The delegated CHILD sessions a parent export names.** A subagent's tokens
    live in a child session, which `session list` never returns (it asks for
    roots only) and the run stream drops (it keeps only parts whose session is
@@ -2342,9 +2346,13 @@ nothing to fence a debt to, which is also why a generic engine was left out.
 `ParseContext` reads only NAMES AND MTIMES (never contents) over the global roots
 `openCodeSessionDirs("")` knows plus their immediate children, and every
 `<storage>/project/<slug>/storage/session[/info]` — the project-scoped layout
-native capture and the TUI write today. At most 64 slugs, ranked by the newer of
-those two directories' mtimes (not the slug directory's own, which does not move
-when a file inside it is rewritten), inside a 256-stat total. A newest mtime later
+native capture and the TUI write today. At most 64 slugs, ranked by the newest of
+that store's directories' mtimes (not the slug directory's own, which does not
+move when a file inside it is rewritten), inside a 512-stat total. The ranking's
+own timestamps are what the walk folds in — handing the caller paths to stat a
+second time doubled the cost and, on a store with enough slugs to fill the budget
+while ranking, left nothing for that second pass, so a direct TUI run went
+unnoticed until an explicit refresh. A newest mtime later
 than `lastPassStartedAtMs` nudges the worker, on its cooldown. A layout outside
 this walk is recovered only by a Refresh click or a managed run's debt. One
 directory contributes at most `openCodeDiscoveryMaxDirEntries` entries

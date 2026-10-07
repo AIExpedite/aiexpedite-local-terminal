@@ -699,6 +699,47 @@ func TestOpenCodeReconcile_AsksForMoreRowsThanItConsiders(t *testing.T) {
 	}
 }
 
+func TestOpenCodeReconcile_ReadsAServiceDefaultSizedListAsTruncated(t *testing.T) {
+	// Some releases ACCEPT `--max-count` and exit zero but apply it only AFTER
+	// their own capped query, so the flag never lifts the 100-row limit and the
+	// short list looks complete. Trusting it would advance the cursor past
+	// sessions that were never listed and present the day as a full total, with
+	// nothing marking the loss — so a result landing exactly on that boundary is
+	// read as truncated, which keeps the day a lower bound.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	created := now.UnixMilli()
+	rows := make([]openCodeSessionRow, 0, openCodeSessionListServiceDefault)
+	for i := 0; i < openCodeSessionListServiceDefault; i++ {
+		rows = append(rows, openCodeSessionRow{fmt.Sprintf("ses_%03d", i), created + int64(i)})
+	}
+	for _, tc := range []struct {
+		name          string
+		rows          []openCodeSessionRow
+		wantTruncated bool
+	}{
+		{"exactly the service default", rows, true},
+		{"one row short of it", rows[:len(rows)-1], false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			(&openCodeCLIStub{sessions: sessionList(tc.rows...)}).install(t)
+
+			got, truncated, outcome := listOpenCodeSessionsForUsage(context.Background(), "opencode-stub")
+			if outcome != "" || len(got) != len(tc.rows) {
+				t.Fatalf("outcome=%q rows=%d, want a clean list of %d", outcome, len(got), len(tc.rows))
+			}
+			if truncated != tc.wantTruncated {
+				t.Fatalf("truncated = %v, want %v", truncated, tc.wantTruncated)
+			}
+		})
+	}
+	// The unflagged fallback is capped by the service default too, so the same
+	// boundary applies when no limit was asked for at all.
+	if !openCodeSessionListHitServiceDefault(openCodeSessionListServiceDefault, 0) {
+		t.Fatal("the unflagged list must read a boundary-sized result as truncated")
+	}
+}
+
 func TestOpenCodeReconcile_FallsBackToTheUnflaggedListWhenMaxCountIsRejected(t *testing.T) {
 	// A build that predates `--max-count` rejects the whole command, and
 	// `unsupported` RETIRES the debt — so the older spelling is worth one retry

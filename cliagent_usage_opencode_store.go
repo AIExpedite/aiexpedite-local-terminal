@@ -67,6 +67,16 @@ const (
 	// openCodeSessionListMaxSessions bounds how many listed sessions one pass
 	// considers, newest-activity first.
 	openCodeSessionListMaxSessions = 512
+	// openCodeSessionListServiceDefault is the row limit OpenCode's own list
+	// service applies when none is asked for. Some releases ACCEPT
+	// `--max-count` and exit zero but apply it only after that capped query, so
+	// the flag never lifts the limit and the short list looks complete. A
+	// result landing exactly on the boundary is therefore read as truncated,
+	// which marks the day a lower bound instead of presenting an incomplete
+	// total as a complete one. An install that genuinely holds exactly this
+	// many sessions pays one spurious lower-bound notice; the reverse mistake
+	// loses rows behind the cursor with nothing marking the loss.
+	openCodeSessionListServiceDefault = 100
 	// openCodeExportMaxChildren bounds the delegated child sessions ONE listed
 	// session may pull in. A subagent session is short (one turn's worth of
 	// messages), so the cost of following them is small next to the parent's
@@ -704,14 +714,29 @@ func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []open
 	// and those rows fall behind the cursor once the ones it DID return are
 	// committed, with nothing marking the loss. Ask for one more than a pass
 	// will consider, so a longer list still shows up as truncated below.
-	rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(openCodeSessionListMaxSessions+1))
+	asked := openCodeSessionListMaxSessions + 1
+	rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(asked))
 	if outcome == openCodeReconcileUnsupported && ctx.Err() == nil {
 		// A build that predates `--max-count` rejects the whole command, and
 		// `unsupported` RETIRES the debt — so the older spelling is worth one
 		// retry before standing the feature down.
-		rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(0))
+		asked = 0
+		rows, truncated, outcome = listOpenCodeSessionsWith(ctx, path, openCodeSessionListArgs(asked))
+	}
+	if outcome == "" && openCodeSessionListHitServiceDefault(len(rows), asked) {
+		truncated = true
 	}
 	return rows, truncated, outcome
+}
+
+// openCodeSessionListHitServiceDefault reports a row count that stopped exactly
+// on OpenCode's own unasked-for limit while we asked for more (or asked for
+// nothing at all) — the signature of a release whose `--max-count` is applied
+// after the capped query, and of the unflagged fallback. Either way rows older
+// than the boundary were never listed, so the list is truncated.
+func openCodeSessionListHitServiceDefault(got, asked int) bool {
+	return got == openCodeSessionListServiceDefault &&
+		(asked <= 0 || asked > openCodeSessionListServiceDefault)
 }
 
 // openCodeSessionListArgs is the list command. A non-positive maxCount is the
@@ -1126,7 +1151,9 @@ const (
 	openCodeDiscoveryMaxSlugs = 64
 	// openCodeDiscoveryMaxStats bounds the whole walk's stat calls, so a data
 	// directory with thousands of projects cannot turn a gather into a scan.
-	// Room for every ranked slug's directories twice over, roots included.
+	// A slug's directories are stat-ed ONCE — the ranking's own timestamps are
+	// what the walk folds in, rather than paths the caller stats again — so this
+	// leaves room for twice the ranked slugs, the roots included.
 	openCodeDiscoveryMaxStats = 2 * openCodeDiscoveryDirsPerSlug * openCodeDiscoveryMaxSlugs
 	// openCodeDiscoveryDirsPerSlug is how many directories one project-scoped
 	// store contributes: session, session/info, message and part.
@@ -1205,16 +1232,24 @@ func openCodeSessionStoreChangedSince(since time.Time) bool {
 			note(dir)
 		}
 	}
-	for _, slug := range openCodeProjectSessionDirs(&stats) {
-		note(slug)
+	for _, at := range openCodeProjectSessionNewest(&stats) {
+		if at.After(newest) {
+			newest = at
+		}
 	}
 	return !newest.IsZero() && newest.After(since)
 }
 
-// openCodeProjectSessionDirs returns the session directories of the most
-// recently active project slugs, bounded by openCodeDiscoveryMaxSlugs. The
+// openCodeProjectSessionNewest returns the newest store mtime of each of the
+// most recently active project slugs, bounded by openCodeDiscoveryMaxSlugs. The
 // ranking stats count toward the caller's budget.
-func openCodeProjectSessionDirs(stats *int) []string {
+//
+// It returns the TIMESTAMPS it already computed rather than the paths: having
+// the caller stat the same directories a second time doubled the walk's cost,
+// and on a store with enough slugs to fill the budget while ranking, the second
+// pass found nothing left to spend — so a direct TUI run went unnoticed until
+// an explicit refresh.
+func openCodeProjectSessionNewest(stats *int) []time.Time {
 	base := openCodeStorageDir()
 	if base == "" {
 		return nil
@@ -1223,11 +1258,7 @@ func openCodeProjectSessionDirs(stats *int) []string {
 	if len(entries) == 0 {
 		return nil
 	}
-	type ranked struct {
-		dirs []string
-		at   time.Time
-	}
-	candidates := make([]ranked, 0, len(entries))
+	candidates := make([]time.Time, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.IsDir() || *stats >= openCodeDiscoveryMaxStats {
 			continue
@@ -1248,17 +1279,13 @@ func openCodeProjectSessionDirs(stats *int) []string {
 		if newest.IsZero() {
 			continue
 		}
-		candidates = append(candidates, ranked{dirs: dirs, at: newest})
+		candidates = append(candidates, newest)
 	}
-	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].at.After(candidates[j].at) })
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].After(candidates[j]) })
 	if len(candidates) > openCodeDiscoveryMaxSlugs {
 		candidates = candidates[:openCodeDiscoveryMaxSlugs]
 	}
-	out := make([]string, 0, len(candidates)*openCodeDiscoveryDirsPerSlug)
-	for _, candidate := range candidates {
-		out = append(out, candidate.dirs...)
-	}
-	return out
+	return candidates
 }
 
 // openCodeTurnStoreDirs are the directories under one `storage` root whose own
