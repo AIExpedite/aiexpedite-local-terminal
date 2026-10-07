@@ -374,6 +374,13 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	_ = promptFile.Close()
 	defer func() { _ = os.Remove(promptPath) }()
 
+	// The turn below spends tokens against whatever provider sits behind
+	// OpenCode, and its `step_finish` events are the only record of how many —
+	// so arm the usage capture before the spawn and settle it below. Every
+	// pre-check refusal above returns before this point and arms nothing.
+	// See cliagent_usage_opencode_capture.go.
+	usage := armOpenCodeUsageRun("smoke")
+
 	// Bound BEFORE the spawn: the shape this run resolves is a fact about THESE
 	// bytes, not about whatever is at `path` when it finishes.
 	shapeBinding := bindCLISmokeShapeWithIdentity(path, openCodeBinaryIdentity)
@@ -398,7 +405,13 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	timedOut := runCtx.Err() != nil || ctx.Err() != nil
 	cancel()
 
+	// Fold the child's figures out of the capture before the bytes go: only
+	// integers, two hashed ids and the event time survive. A clean verdict is
+	// the stream's own statement that the turn ran to its end, which is what
+	// decides whether this run is covered or owes a reconcile.
 	category, diagnostic, matched := classifyOpenCodeSmokeRun(timedOut, stdout, stderr, runErr, marker)
+	observeOpenCodeUsageFromStdout(usage, stdout)
+	settleOpenCodeUsageRunAsync(usage, category == "" && !timedOut)
 	if category == "" {
 		result.Status = cliSmokeStatusSuccess
 		result.MarkerMatched = matched

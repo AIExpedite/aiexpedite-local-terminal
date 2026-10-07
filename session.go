@@ -123,6 +123,10 @@ type CLISession struct {
 	cliConversationID        string
 	cliConversationPublished bool
 
+	// openCodeUsage is the run-scoped OpenCode usage capture armed at spawn
+	// (nil for every other command and for OpenCode's spend-free subcommands).
+	// waitForExit settles it exactly once.
+	openCodeUsage *openCodeRunUsage
 	// quotaCapture is the run-scoped Antigravity capture armed at spawn
 	// (cliagent_usage_antigravity_capture.go), holding the child's PID. For a
 	// command that is not agy it is nil, whose methods are no-ops, so this
@@ -192,6 +196,9 @@ type CLISession struct {
 	// exit settle it exactly once.
 	grokUsageFloorMs atomic.Int64
 	grokUsageSettled atomic.Bool
+	// openCodeTerminalSeen records that an OpenCode turn announced its own end.
+	openCodeTerminalSeen atomic.Bool
+	openCodeUsageSettled atomic.Bool
 
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
@@ -832,6 +839,14 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokUsageFloor = armGrokUsageRunFloorFor(time.Now(), isolatedGrokHome)
 	}
 
+	// An `opencode run` turn spends tokens against whatever provider sits
+	// behind it, and only its own `step_finish` events say how many — so arm
+	// the run's usage capture before the spawn, tap the event stream in
+	// readOutputStream, and settle in waitForExit. Nil for every other command
+	// and for OpenCode's spend-free subcommands
+	// (cliagent_usage_opencode_capture.go).
+	openCodeUsage := armOpenCodeUsageForCommand("pipe session", command, cliArgs)
+
 	// Start the process. It is owned (its own process group on Unix, a
 	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
 	// a later boot can prove it gone (session_ledger.go).
@@ -844,6 +859,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 			finishGrokAttribution()
 		}
 		disarmGrokUsageRunFloor(grokUsageFloor)
+		openCodeUsage.Disarm()
 		stdin.Close()
 		stdoutR.Close()
 		stdoutW.Close()
@@ -889,6 +905,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		grokProducerContested:        grokProducerContested,
 		antigravityManagedStream:     antigravityManagedStream,
 		quotaCapture:                 quotaCapture,
+		openCodeUsage:                openCodeUsage,
 		finishGrokBillingAttribution: finishGrokAttribution,
 		// The child is running now, so the pin can be confirmed against the
 		// binary still on disk: a replacement that landed in the pin→Start
@@ -2255,6 +2272,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				captureGrokUsageLimitLine(line.text, time.Now(), session.grokLimitNoticeScope)
 			}
 
+			// OpenCode usage telemetry: the per-step token counts the card
+			// renders live only in this stream (`step_finish`). A nil handle —
+			// any other command, a spend-free subcommand, the refresh disabled
+			// — makes this a no-op (cliagent_usage_opencode_capture.go).
+			if isOpenCodeCommand(session.Command) {
+				session.openCodeUsage.Observe(line.text)
+			}
+
 			if isClaudeCommand(session.Command) {
 				if rejected := captureClaudeRateLimitLine(line.text, time.Now()); rejected != nil {
 					flushBatch()
@@ -2410,6 +2435,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// after it started (cliagent_usage_codex_freshness.go). Once per
 				// run: thread.completed follows turn.completed.
 				session.settleCodexUsageRun()
+				// An OpenCode turn that announced its own end is the only kind
+				// whose stream can be trusted as complete; waitForExit reads
+				// this to decide covered vs. owes a reconcile.
+				if isOpenCodeCommand(session.Command) {
+					session.openCodeTerminalSeen.Store(true)
+				}
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
@@ -2691,6 +2722,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// session_ended.
 	if floor := session.grokUsageFloorMs.Load(); floor > 0 && session.grokUsageSettled.CompareAndSwap(false, true) {
 		grokUsageRunSettledAsync(time.UnixMilli(floor))
+	}
+
+	// An OpenCode turn's usage: covered when the stream announced the turn's
+	// end AND the process exited cleanly; a killed, timed-out or crashed turn
+	// still spent tokens we could not read, so it owes one bounded reconcile.
+	// Asynchronous — never delays session_ended.
+	if session.openCodeUsage != nil && session.openCodeUsageSettled.CompareAndSwap(false, true) {
+		settleOpenCodeUsageRunAsync(session.openCodeUsage, err == nil && session.openCodeTerminalSeen.Load())
 	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish

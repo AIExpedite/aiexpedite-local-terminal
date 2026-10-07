@@ -690,6 +690,20 @@ func (m *OpenCodeNativeManager) runOneShot(
 		return openCodeRunResult{err: fmt.Errorf("session ended during turn")}
 	}
 
+	// This turn spends tokens against whatever provider sits behind OpenCode,
+	// and the only record of how many is the JSON stream below — so arm the
+	// run's usage capture BEFORE the child exists, and settle it on every exit
+	// route. A drain (shutdown, update hand-off) deliberately leaves the floor
+	// unsettled on disk: the next process adopts it and owes one reconcile.
+	// See cliagent_usage_opencode_capture.go.
+	usage := armOpenCodeUsageRun("native chat")
+	settled := false
+	defer func() {
+		if !settled {
+			usage.Disarm()
+		}
+	}()
+
 	// opencode already leads its own group (Setsid above). Recorded in the
 	// spawn ledger for this turn only (session_ledger.go).
 	beginSessionSpawn(session.ID, cmd)
@@ -736,7 +750,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stream = m.streamOpenCodeEvents(session, stdout, publishFn)
+		stream = m.streamOpenCodeEvents(session, stdout, publishFn, usage)
 	}()
 	go func() {
 		defer wg.Done()
@@ -760,6 +774,11 @@ func (m *OpenCodeNativeManager) runOneShot(
 	if stderrBuf != nil {
 		errOut = strings.TrimSpace(stderrBuf.b.String())
 	}
+	// Covered only when the stream ran to its own end: a cut-off, killed or
+	// timed-out turn still spent tokens we could not read, so it owes one
+	// bounded reconcile through OpenCode's CLI.
+	settled = true
+	settleOpenCodeUsageRunAsync(usage, !stream.overflow && !timedOutFlag.Load() && stream.terminal)
 	return openCodeRunResult{
 		text:          strings.TrimSpace(stream.text.String()),
 		rawStdout:     strings.TrimSpace(stream.raw.String()),
@@ -781,6 +800,11 @@ type openCodeStreamState struct {
 	raw       strings.Builder
 	sessionID string
 	overflow  bool
+	// terminal records that the turn announced its own end. Together with
+	// `overflow` and the timeout flag it is what decides whether the run's
+	// usage is COVERED by its stream or owes a reconcile
+	// (cliagent_usage_opencode_freshness.go).
+	terminal bool
 	// bytes counts raw stdout consumed so a pathological run cannot buffer
 	// unbounded assistant text into memory.
 	bytes int
@@ -797,6 +821,7 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 	session *OpenCodeNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
+	usage *openCodeRunUsage,
 ) openCodeStreamState {
 	var state openCodeStreamState
 	scanner := bufio.NewScanner(r)
@@ -815,6 +840,12 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		if state.raw.Len() < openCodeNativeMaxRawStdout {
 			state.raw.WriteString(line)
 			state.raw.WriteString("\n")
+		}
+		// The run's own token counts live in its `step_finish` events; a nil
+		// handle (refresh disabled) makes this a no-op.
+		usage.Observe(line)
+		if isOpenCodeTerminalEventLine(line) {
+			state.terminal = true
 		}
 		if text, sid, ok := parseOpenCodeEventLine(line); ok {
 			if text != "" {

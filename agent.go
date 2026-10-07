@@ -198,6 +198,15 @@ func StartAgent(cfg *Config) {
 	// isOffline is published above, so the attempt honours offline mode.
 	SetGrokUsageRefreshEnabled(true)
 	payOwedGrokUsageRefresh()
+	// And for OpenCode: it has no quota of its own, but every run records exact
+	// token counts, and the runs this process never taps (execute, PTY, and an
+	// `opencode` in the user's own shell) are reconciled through OpenCode's own
+	// CLI. Re-arm a schedule — a debt rung or a continuation — the previous
+	// process booked, and pay for a run whose floor it never settled (a
+	// self-update, a crash). After isOffline is published above, so the attempt
+	// honours offline mode (cliagent_usage_opencode_freshness.go).
+	SetOpenCodeUsageRefreshEnabled(true)
+	payOwedOpenCodeUsageRefresh()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

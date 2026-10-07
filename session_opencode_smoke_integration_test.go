@@ -81,7 +81,10 @@ func openCodeSessionEndedSignal() (<-chan struct{}, PublishFunc) {
 	}
 }
 
-func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
+// runOpenCodeSessionStart starts one session against the compiled stub.
+// `stdout`, when given, replaces the stub's default terminal-only frame — the
+// usage rows need real `step_finish` events in the stream.
+func runOpenCodeSessionStart(t *testing.T, cmd commandMsg, stdout ...string) openCodeSessionRun {
 	t.Helper()
 	installOpenCodeStub(t)
 
@@ -99,7 +102,11 @@ func runOpenCodeSessionStart(t *testing.T, cmd commandMsg) openCodeSessionRun {
 	}
 	// A terminal frame so the session completes promptly rather than waiting out
 	// its timeout.
-	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"session.completed"}`)
+	frames := `{"type":"session.completed"}`
+	if len(stdout) > 0 {
+		frames = stdout[0]
+	}
+	t.Setenv("OPENCODE_STUB_STDOUT", frames)
 
 	sm := NewSessionManager(nil)
 	id := fmt.Sprintf("opencode-legacy-smoke-%d", time.Now().UnixNano())
@@ -386,5 +393,83 @@ func TestOpenCodeSession_PromptlessStartClosesStdinOnTheFirstSendInput(t *testin
 	session.mu.Unlock()
 	if stillDeferred {
 		t.Error("deferredStdinClose was not cleared, so a second SendInput would double-close")
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Pipe-session usage capture
+   -------------------------------------------------------------------------- */
+
+// openCodePipeUsageFrames is a two-step turn's worth of `step_finish` events
+// plus the terminal frame, spelled for the stub's "\n"-escaped stdout env.
+func openCodePipeUsageFrames(nowMs int64) string {
+	step := func(reason string, in, out int) string {
+		return fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"sessionID":"ses_pipe",`+
+			`"part":{"messageID":"msg_pipe","type":"step-finish","reason":%q,"cost":0.001,`+
+			`"tokens":{"input":%d,"output":%d,"reasoning":0,"cache":{"read":0,"write":0}}}}`,
+			nowMs, reason, in, out)
+	}
+	return strings.Join([]string{
+		step("tool-calls", 10, 2),
+		step("stop", 20, 4),
+		`{"type":"session.completed","timestamp":` + fmt.Sprintf("%d", nowMs) + `}`,
+	}, "\\n") + "\\n"
+}
+
+// A clean pipe turn is COVERED by its own stream: the card gets a number and
+// nothing owes a reconcile.
+func TestOpenCodeSession_ACleanPipeTurnIsCoveredByItsStream(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	// The settle must not reach a CLI: a covered run owes nothing, and a stub
+	// that fatals proves it.
+	run := runOpenCodeSessionStart(t, commandMsg{
+		Type: "session_start", Command: "opencode", Args: []string{"implement the feature"},
+	}, openCodePipeUsageFrames(now.UnixMilli()))
+	if run.err != nil || !run.spawned {
+		t.Fatalf("the session did not run: err=%v spawned=%v", run.err, run.spawned)
+	}
+	if !openCodeUsageRefreshWaitFor(5 * time.Second) {
+		t.Fatal("the usage settle never went idle")
+	}
+
+	// 10+2 then 20+4, one messageID.
+	tokens, cost, rows := todayTotals(t, now)
+	if tokens != 36 || rows != 1 || cost != 2000 {
+		t.Fatalf("tokens=%d cost=%d rows=%d, want 36/2000/1", tokens, cost, rows)
+	}
+	var freshness openCodeUsageFreshness
+	readJSONFile(openCodeUsageFreshnessPath(), &freshness)
+	if freshness.owed() {
+		t.Fatalf("freshness = %+v, want nothing owed for a covered turn", freshness)
+	}
+}
+
+// A pipe turn whose stream never announced the turn's end still spent tokens we
+// could not read, so it owes one bounded reconcile.
+func TestOpenCodeSession_APipeTurnWithNoTerminalFrameOwesAReconcile(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	// A reconcile that answers "nothing changed", so the debt is observable
+	// before it is paid rather than the pass reaching a real install.
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+	// Drop the terminal frame: the turn's output stops mid-stream.
+	frames := strings.Split(openCodePipeUsageFrames(now.UnixMilli()), "\\n")[0] + "\\n"
+
+	run := runOpenCodeSessionStart(t, commandMsg{
+		Type: "session_start", Command: "opencode", Args: []string{"implement the feature"},
+	}, frames)
+	if run.err != nil || !run.spawned {
+		t.Fatalf("the session did not run: err=%v spawned=%v", run.err, run.spawned)
+	}
+	openCodeUsageRefreshWaitFor(5 * time.Second)
+
+	// What the stream DID report still counts — the reconcile is for the rest.
+	if tokens, _, _ := todayTotals(t, now); tokens != 12 {
+		t.Fatalf("tokens = %d, want the 12 the stream reported", tokens)
+	}
+	ledger := readOpenCodeUsageLedger()
+	if ledger.LastPassOutcome == "" {
+		t.Fatal("the owed reconcile never ran")
 	}
 }

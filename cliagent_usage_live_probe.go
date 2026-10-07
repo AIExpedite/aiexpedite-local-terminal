@@ -134,6 +134,7 @@ var (
 	probeAntigravityQuotaLiveFn  = probeAntigravityQuotaLive
 	probeGrokBillingLiveFn       = probeGrokBillingLiveShared
 	probeMuseCodeUsageLiveFn     = probeMuseCodeUsageLive
+	probeOpenCodeUsageLiveFn     = probeOpenCodeUsageLive
 	warmCLIAgentModelDiscoveryFn = warmCLIAgentModelDiscovery
 	liveProbeDetectedAgents      = gatherCLIAgents
 )
@@ -171,6 +172,27 @@ func runCLIUsageLiveProbes(ctx context.Context) map[string]string {
 	})
 	outcomes, _ := v.(map[string]string)
 	return outcomes
+}
+
+// probeOpenCodeUsageLive is the Refresh click's OpenCode reading: one forced,
+// bounded reconcile pass. The outcome is already a closed code, so it is
+// reported as-is; `ok` and `no_change` map onto the shared success label so the
+// click log reads the same as every other provider's.
+func probeOpenCodeUsageLive(ctx context.Context) string {
+	if !openCodeUsageRefreshEnabled.Load() {
+		// Only StartAgent arms this feature, so a process that never did (a
+		// test, a diagnostic run) must not spawn the CLI.
+		return liveProbeOutcomeNoReading
+	}
+	outcome := openCodePayReconcile(ctx, true)
+	switch {
+	case outcome == "":
+		return liveProbeOutcomeNoReading
+	case openCodeReconcileSucceeded(outcome):
+		return liveProbeOutcomeOK
+	default:
+		return outcome
+	}
 }
 
 func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
@@ -232,6 +254,16 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 			warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
 			return outcome
 		})
+	}
+	if agent, ok := detected["opencode"]; ok && agent.Detected {
+		// OpenCode has no quota endpoint to ask: a click instead runs ONE
+		// bounded reconciliation of its session store through its own CLI
+		// (cliagent_usage_opencode_store.go), which is how a run the user made
+		// in their own shell or TUI reaches the card without waiting for the
+		// next managed run's debt. It joins the debt worker's single flight,
+		// so the two never spawn two children, and `opencode models` (the model
+		// list below) is a different subcommand that spends no turn.
+		run("opencode", func() string { return probeOpenCodeUsageLiveFn(ctx) })
 	}
 	if agent, ok := detected["museCode"]; ok && agent.Detected {
 		// The probe's own host refreshes the model list first

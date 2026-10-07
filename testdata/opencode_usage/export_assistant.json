@@ -1,0 +1,6 @@
+{
+  "messages": [
+    { "info": { "id": "msg_user", "sessionID": "ses_old", "role": "user", "time": { "created": 1790400000500 } } },
+    { "info": { "id": "msg_1", "sessionID": "ses_old", "role": "assistant", "time": { "created": 1790400000600 }, "cost": 0.004, "tokens": { "input": 42, "output": 20, "reasoning": 1, "cache": { "read": 5, "write": 0 } } } }
+  ]
+}

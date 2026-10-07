@@ -24,6 +24,17 @@
 // matches none of getCodingAgentStatus's failure branches and falls through to
 // available. The red chip requires positive evidence of *no usable provider*.
 //
+// # WHERE THE NUMBERS COME FROM
+//
+// OpenCode has no quota of its own, so there is no limit window to plot — but
+// every run reports exact token counts, and a cost when the provider bills per
+// token. Those are kept in a small redacted ledger on the device
+// (cliagent_usage_opencode_capture.go), filled from each run's own JSON stream
+// and from a bounded reconciliation through OpenCode's CLI
+// (cliagent_usage_opencode_store.go), and published here as "used today"
+// counters. A run-completion debt (cliagent_usage_opencode_freshness.go) makes
+// sure a fresh reading exists after every run.
+//
 // # WHY THESE PROBES ARE NOT ON THE BINARY-KEYED VERSION CACHE
 //
 // `--version` is a pure function of the binary, so systemInfo.go caches it on
@@ -36,8 +47,9 @@
 // and a user-initiated __cli_usage_refresh__ bypasses it by design.
 //
 // SECRETS: this parser reads provider NAMES and model IDS only. It never reads,
-// logs, or forwards a token value from auth.json. There are no quota metrics —
-// OpenCode delegates quota to whichever provider is underneath.
+// logs, or forwards a token value from auth.json, and the published metrics are
+// integers read from the device's own ledger — never a session id, a message
+// id, a prompt or a path.
 package main
 
 import (
@@ -190,11 +202,41 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	usage.LoginExpirationState = loginExpirationNotReported
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
-	// No metrics: OpenCode delegates quota to the underlying provider and
-	// exposes none of its own. The placeholder rows the other parsers emit
-	// ("limits exist, values unobservable") would be a lie here — there is no
-	// OpenCode-level limit window to observe.
+	// OpenCode has no LIMIT to plot — it delegates quota to the underlying
+	// provider — so the rows are "used today" counters read from the device's
+	// own ledger (cliagent_usage_opencode_capture.go): tokens always, cost when
+	// the provider bills per token. A placeholder "limits exist, values
+	// unobservable" row would still be a lie here; an absent row is the honest
+	// answer when the ledger has nothing it can stand behind.
+	metrics, generation, partial := openCodeLedgerMetrics(now)
+	usage.Metrics = metrics
+	usage.UsageGeneration = generation
+	if partial {
+		usage.Notice = openCodeUsagePartialNotice
+		usage.NoticeSeverity = "warning"
+	}
+
+	// Stat-only (names and mtimes, never contents): a session directory written
+	// after the last reconcile pass started is an `opencode` run this process
+	// never saw — the user's own shell or TUI. Nudging is bounded by its own
+	// cooldown and never blocks the gather. The enabled check comes FIRST so a
+	// process that never armed the feature (a test, a diagnostic run) pays
+	// nothing for the walk.
+	if openCodeUsageRefreshEnabled.Load() && openCodeSessionStoreChangedSince(openCodeLastPassStartedAt()) {
+		nudgeOpenCodeUsageRefresh(now)
+	}
 	return usage, true
+}
+
+// openCodeLastPassStartedAt is when the last reconcile pass began (zero when
+// none has). Persisted, and deliberately distinct from the success stamp: a
+// pass that ended `more` still saw everything older than its start.
+func openCodeLastPassStartedAt() time.Time {
+	ms := readOpenCodeUsageLedger().LastPassStartedAtMs
+	if ms <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
 }
 
 // probeOpenCodeReadiness returns the cached readiness for this binary, or runs

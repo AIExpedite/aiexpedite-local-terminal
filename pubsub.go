@@ -2626,6 +2626,12 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 		capture.SetStarted(cmd, c.Process.Pid)
 	}
 	defer capture.Finish()
+	// An `opencode` run on the execute path is never tapped — its stdout is the
+	// caller's output, not an event stream this process parses — so it ALWAYS
+	// owes one bounded reconcile through OpenCode's CLI
+	// (cliagent_usage_opencode_freshness.go).
+	openCodeUsage := armOpenCodeUsageForCommand("local execute", cmd, args)
+	defer settleOpenCodeUsageRunAsync(openCodeUsage, false)
 	err := c.Wait()
 	return combined.String(), err
 }
@@ -5328,6 +5334,13 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	capture := armAntigravityCaptureForCommand("windows execute", cmd, args)
 	defer capture.Finish()
 	onStart := capture.SetWrapper
+
+	// Armed at function ENTRY, beside the capture above, because the Windows
+	// transport chain has no single post-Start hook. Execute runs are never
+	// tapped, so this one always owes a reconcile
+	// (cliagent_usage_opencode_freshness.go).
+	openCodeUsage := armOpenCodeUsageForCommand("windows execute", cmd, args)
+	defer settleOpenCodeUsageRunAsync(openCodeUsage, false)
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
 	isEncodedPowerShell := strings.ToLower(cmd) == "powershell" &&

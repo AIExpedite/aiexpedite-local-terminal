@@ -1,0 +1,5 @@
+{"type":"step_start","timestamp":1790500000000,"sessionID":"ses_fixture","part":{"id":"prt_1","sessionID":"ses_fixture","messageID":"msg_1","type":"step-start"}}
+{"type":"text","timestamp":1790500000100,"sessionID":"ses_fixture","part":{"id":"prt_2","sessionID":"ses_fixture","messageID":"msg_1","type":"text","text":"working"}}
+{"type":"step_finish","timestamp":1790500000200,"sessionID":"ses_fixture","part":{"id":"prt_3","sessionID":"ses_fixture","messageID":"msg_1","type":"step-finish","reason":"tool-calls","cost":0.002,"tokens":{"input":12,"output":9,"reasoning":1,"cache":{"read":4,"write":2}}}}
+{"type":"step_finish","timestamp":1790500000400,"sessionID":"ses_fixture","part":{"id":"prt_4","sessionID":"ses_fixture","messageID":"msg_1","type":"step-finish","reason":"stop","cost":0.003,"tokens":{"input":30,"output":11,"reasoning":0,"cache":{"read":1,"write":0}}}}
+{"type":"session.completed","timestamp":1790500000500,"sessionID":"ses_fixture"}

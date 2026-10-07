@@ -70,6 +70,7 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()
 	stopGrokRunDebtRetry()
+	stopOpenCodeRunDebtRetry()
 	persistClaudeRunDebtForShutdown()
 	// Antigravity's discovery tick stops, then its in-flight state writes (a
 	// run's settle, an arm persisting its floor) get a bounded drain, so a
@@ -81,6 +82,10 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// writing its debt must land before an update hand-off, or the next process
 	// has nothing to adopt.
 	drainGrokUsageWrites(ctx)
+	// And for OpenCode's ledger and debt: a floor armed just before an update
+	// hand-off must be on disk for the next process to adopt, which is what
+	// carries a reading taken moments before the upgrade across it.
+	drainOpenCodeUsageWrites(ctx)
 	// No usage hint goes out after this; a pending one is recovered by the next
 	// process from the cache it rotates.
 	stopCLIUsagePropagator()

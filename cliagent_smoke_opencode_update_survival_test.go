@@ -157,6 +157,14 @@ func TestOpenCodeSmoke_PreUpdateSmokeDoesNotUpdateAndPostUpdateSmokeTestsTheNewI
 	t.Setenv("OPENCODE_STUB_ECHO_STDIN", "1")
 	t.Setenv("OPENCODE_STUB_RUN_LOG", runLog)
 	t.Setenv("OPENCODE_STUB_ENV_LOG", envLog)
+	// The smoke's own `step_finish` frames are the only record of what the turn
+	// spent, and they are what must still reach the card after the upgrade.
+	t.Setenv("OPENCODE_STUB_USAGE", "40,10")
+	// The stub stamps its frames with the real clock, and the ledger attributes
+	// a message to the local day of its own event time — so the pinned clock
+	// has to be today's.
+	usageNow := time.Now()
+	openCodeUsageFixture(t, usageNow)
 
 	pristine := install.snapshot(t)
 	pre, replayed := runCLISmoke(context.Background(), "opencode")
@@ -169,6 +177,12 @@ func TestOpenCodeSmoke_PreUpdateSmokeDoesNotUpdateAndPostUpdateSmokeTestsTheNewI
 	if logged, _ := os.ReadFile(envLog); !strings.Contains(string(logged), "autoupdate=true title=true") {
 		t.Fatalf("the maintenance pins did not reach the child: %q", logged)
 	}
+	// The pre-update smoke left a numeric reading behind.
+	openCodeUsageRefreshWaitFor(5 * time.Second)
+	if tokens, _, rows := todayTotals(t, usageNow); tokens != 50 || rows != 1 {
+		t.Fatalf("after the pre-update smoke: tokens=%d rows=%d, want 50/1", tokens, rows)
+	}
+	preUpdateGeneration := readOpenCodeUsageLedger().Generation
 
 	install.harnessUpgrade(t, v2)
 	runsBefore := openCodeStubRunCount(t, runLog)
@@ -182,6 +196,21 @@ func TestOpenCodeSmoke_PreUpdateSmokeDoesNotUpdateAndPostUpdateSmokeTestsTheNewI
 	}
 	if got := openCodeStubRunCount(t, runLog) - runsBefore; got != 1 {
 		t.Fatalf("the post-update smoke spawned %d runs, want exactly 1", got)
+	}
+
+	// The ledger is not keyed by the binary, so the pre-update reading carries
+	// across the upgrade and the post-update smoke ADDS to the same day row.
+	// Both smokes report the same session and message id, so the per-field max
+	// keeps one row rather than doubling it.
+	openCodeUsageRefreshWaitFor(5 * time.Second)
+	if tokens, _, rows := todayTotals(t, usageNow); tokens != 50 || rows != 1 {
+		t.Fatalf("after the post-update smoke: tokens=%d rows=%d, want the carried 50/1", tokens, rows)
+	}
+	if metrics, generation, _ := openCodeLedgerMetrics(usageNow); len(metrics) == 0 || generation == nil {
+		t.Fatalf("metrics=%+v generation=%+v, want a numeric row after the upgrade", metrics, generation)
+	} else if generation.Counter < preUpdateGeneration.Counter {
+		t.Fatalf("generation went backwards across the upgrade: %+v -> %+v",
+			preUpdateGeneration, generation)
 	}
 
 	// The resolved shape is filed under the NEW install's key and no other.

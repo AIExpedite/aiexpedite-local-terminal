@@ -50,6 +50,10 @@ import (
 //	OPENCODE_STUB_ENV_LOG    append one line per run recording whether the
 //	                         maintenance pins reached the child:
 //	                         "autoupdate=<value|unset> title=<value|unset>"
+//	OPENCODE_STUB_USAGE  when set to "<input>,<output>", the echo mode emits TWO
+//	                         step_finish frames under one messageID carrying those
+//	                         token counts (and a cost), which is the shape the
+//	                         usage ledger reads
 //	OPENCODE_STUB_SELF_UPDATE when set to a version-file path and
 //	                         OPENCODE_DISABLE_AUTOUPDATE is NOT set, the run
 //	                         updates itself the way an npm upgrade does on
@@ -152,6 +156,26 @@ func main() {
 			echo = fields[len(fields)-1]
 		}
 		fmt.Printf("{\"type\":\"text\",\"text\":\"%s\"}\n", echo)
+		// A real turn closes every model step with step_finish, and the token
+		// counts live only there. Opt-in so the frame/line counts other suites
+		// assert on are unchanged by default.
+		if usage := os.Getenv("OPENCODE_STUB_USAGE"); usage != "" {
+			in, out := 0, 0
+			if parts := strings.SplitN(usage, ",", 2); len(parts) == 2 {
+				in, _ = strconv.Atoi(parts[0])
+				out, _ = strconv.Atoi(parts[1])
+			}
+			step := func(reason string, i, o int) {
+				fmt.Printf("{\"type\":\"step_finish\",\"timestamp\":%d,\"sessionID\":\"ses_stub\","+
+					"\"part\":{\"messageID\":\"msg_stub\",\"type\":\"step-finish\",\"reason\":\"%s\","+
+					"\"cost\":0.001,\"tokens\":{\"input\":%d,\"output\":%d,\"reasoning\":0,"+
+					"\"cache\":{\"read\":0,\"write\":0}}}}"+newline,
+					time.Now().UnixMilli(), reason, i, o)
+			}
+			// Two steps under ONE messageID: the sum is what the ledger keeps.
+			step("tool-calls", in/2, out/2)
+			step("stop", in-in/2, out-out/2)
+		}
 		fmt.Println("{\"type\":\"session.completed\"}")
 		os.Exit(0)
 	}

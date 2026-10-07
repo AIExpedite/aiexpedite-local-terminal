@@ -255,7 +255,10 @@ func runOpenCodeLiveOneShot(t *testing.T, bin string, extraArgs []string, prompt
    The gate
    -------------------------------------------------------------------------- */
 
-func TestOpenCodeLiveGate_RecordsTheRootCauseOutcomeTable(t *testing.T) {
+// openCodeLiveGateBinary resolves the opt-in gate's binary, skipping the row
+// when the gate is off. Shared so every live row opts in the same way.
+func openCodeLiveGateBinary(t *testing.T) string {
+	t.Helper()
 	if os.Getenv("AIX_OPENCODE_LIVE") != "1" {
 		t.Skip("opt-in live gate: set AIX_OPENCODE_LIVE=1 and AIX_OPENCODE_LIVE_BIN")
 	}
@@ -266,6 +269,11 @@ func TestOpenCodeLiveGate_RecordsTheRootCauseOutcomeTable(t *testing.T) {
 	if _, err := os.Stat(bin); err != nil {
 		t.Fatalf("AIX_OPENCODE_LIVE_BIN is not stattable: %v", err)
 	}
+	return bin
+}
+
+func TestOpenCodeLiveGate_RecordsTheRootCauseOutcomeTable(t *testing.T) {
+	bin := openCodeLiveGateBinary(t)
 	resetCLISmokeState()
 	resetVersionProbeCache()
 	resetOpenCodeVersionNegatives()
@@ -407,5 +415,54 @@ func TestOpenCodeLiveEventTypes_NeverSpellsAnUnknownType(t *testing.T) {
 	}
 	if len(openCodeLiveStdinPrompt) != 64 {
 		t.Fatalf("the stdin control prompt is %d bytes, want 64", len(openCodeLiveStdinPrompt))
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Usage reconciliation against the real install
+   -------------------------------------------------------------------------- */
+
+// TestOpenCodeLiveGate_UsageReconcileAnswersFromTheRealInstall proves the two
+// commands the usage ledger depends on — `session list --format json` and
+// `export <id>` — exist and print the shapes the reconcile decodes.
+//
+// CI has no real OpenCode, so no unit test can: the store tests stub the
+// command seam and assert the BOUNDS, while this opt-in gate is the only place
+// the SHAPES are checked against a shipped build. An `unsupported` outcome here
+// means the installed version does not answer those commands and the feature
+// degrades to stream-only figures.
+//
+// It spends no inference turn of its own: both commands only read the session
+// store. Run it after the live smoke above, so there is a session to export.
+func TestOpenCodeLiveGate_UsageReconcileAnswersFromTheRealInstall(t *testing.T) {
+	bin := openCodeLiveGateBinary(t)
+
+	dir := t.TempDir()
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(dir, "opencode_usage.json"))
+	t.Setenv(openCodeUsageFreshnessEnv, filepath.Join(dir, "opencode_usage_freshness.json"))
+	prevBinary := openCodeUsageBinary
+	openCodeUsageBinary = func() string { return bin }
+	t.Cleanup(func() { openCodeUsageBinary = prevBinary })
+
+	now := time.Now()
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	// Closed values only — no session id, no export body, no CLI text.
+	t.Logf("[opencode-live] reconcile outcome=%s exported=%d remaining=%d",
+		result.Outcome, result.Exported, result.Remaining)
+	if result.Outcome == openCodeReconcileUnsupported {
+		t.Fatalf("the installed build does not answer `session list --format json` / `export` " +
+			"in a shape the reconcile decodes — OpenCode usage would be stream-only here")
+	}
+	if !openCodeReconcileSucceeded(result.Outcome) && result.Outcome != openCodeReconcileMore {
+		t.Fatalf("outcome = %s, want ok / no_change / more", result.Outcome)
+	}
+	metrics, generation, partial := openCodeLedgerMetrics(now)
+	t.Logf("[opencode-live] rows=%d generation=%v partial=%t", len(metrics), generation != nil, partial)
+	if len(metrics) == 0 {
+		t.Fatal("the reconcile committed no numeric row — run the live smoke above first " +
+			"so there is a session to export")
+	}
+	if metrics[0].Consumed == nil || *metrics[0].Consumed <= 0 {
+		t.Fatalf("tokens today = %v, want a nonzero reading", metrics[0].Consumed)
 	}
 }

@@ -1,0 +1,2 @@
+{"type":"step_finish","timestamp":"2026-09-30T12:00:00Z","sessionID":"ses_strings","part":{"messageID":"msg_s","type":"step-finish","reason":"stop","cost":"0.01","tokens":{"input":"7","output":null,"reasoning":5,"cache":{"read":null,"write":"x"}}}}
+{"type":"session.completed","timestamp":"2026-09-30T12:00:01Z","sessionID":"ses_strings"}

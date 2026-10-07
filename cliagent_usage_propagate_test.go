@@ -46,7 +46,10 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	cliUsageRotationFirstRetry = 40 * time.Millisecond
 	cliUsageRotationRetryPeriod = 60 * time.Millisecond
 	t.Setenv("TERMINAL_SERVICE_URL", "https://terminal.example.test")
-	// The startup rotation writes the Codex cache: never the machine's own.
+	// The startup rotation writes each provider's capture state: never the
+	// machine's own.
+	t.Setenv(openCodeUsageLedgerEnv, t.TempDir()+"/opencode_usage.json")
+	t.Setenv(openCodeUsageFreshnessEnv, t.TempDir()+"/opencode_usage_freshness.json")
 	if os.Getenv("AIEXPEDITE_CODEX_RL_CACHE") == "" {
 		t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", t.TempDir()+"/codex_rate_limits.json")
 		t.Setenv("CODEX_HOME", t.TempDir())
@@ -94,7 +97,7 @@ func gen(epoch, counter int64) cliUsageGeneration {
 func markRotated(t *testing.T) {
 	t.Helper()
 	codexGenerationRotated.Store(true)
-	noteCLIUsageGenerationRotated()
+	noteCLIUsageGenerationRotated(codexUsageProvider)
 }
 
 func TestCLIUsageHint_GoldenSignatureVector(t *testing.T) {
@@ -390,7 +393,10 @@ func TestCLIUsageHint_ARotationCompletedByAMergeCancelsTheRetry(t *testing.T) {
 		t.Fatalf("hint = %+v", h)
 	}
 	cliUsagePropagator.mu.Lock()
-	retryAt := cliUsagePropagator.rotationRetryAt
+	retryAt := time.Time{}
+	if state := cliUsagePropagator.providers[codexUsageProvider]; state != nil {
+		retryAt = state.rotationRetryAt
+	}
 	cliUsagePropagator.mu.Unlock()
 	if !retryAt.IsZero() {
 		t.Fatal("the rotation retry is still booked after the merge completed it")
@@ -464,5 +470,161 @@ func TestCLIUsageHint_StartupRecoveryHintsACommittedClear(t *testing.T) {
 	snap := f.snapshot(t)
 	if h.GenerationEpoch != 616 || snap.GenerationEpoch != 616 || h.Generation != snap.Generation {
 		t.Fatalf("recovery hint = %+v, want the rotated cleared generation {%d,%d}", h, snap.GenerationEpoch, snap.Generation)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Per-provider pending slots (OpenCode joins Codex)
+   -------------------------------------------------------------------------- */
+
+// markOpenCodeRotated stands in for a committed OpenCode ledger write carrying
+// this process's epoch.
+func markOpenCodeRotated(t *testing.T) {
+	t.Helper()
+	openCodeGenerationRotated.Store(true)
+	noteCLIUsageGenerationRotated(openCodeUsageProvider)
+}
+
+// An OpenCode observation must not evict a Codex one that has not been sent
+// yet: with one shared pending slot, whichever provider committed last won and
+// the other's reading waited for the six-hourly gather.
+func TestCLIUsageHint_EachProviderKeepsItsOwnPendingObservation(t *testing.T) {
+	withCodexGenerationEpoch(t, 601)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+	markOpenCodeRotated(t)
+
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(601, 3))
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(777, 2))
+
+	// Four hints in total: one plus one follow-up PER PROVIDER, spaced
+	// globally.
+	hints := waitHints(t, rec, 4, 2*cliUsageHintSpacing)
+	byProvider := map[string][]int64{}
+	for _, h := range hints {
+		byProvider[h.hint.Provider] = append(byProvider[h.hint.Provider], h.hint.Generation)
+	}
+	if len(byProvider["codex"]) != 2 || len(byProvider["opencode"]) != 2 {
+		t.Fatalf("hints per provider = %v, want two each (a hint and its follow-up)", byProvider)
+	}
+	for _, h := range hints {
+		switch h.hint.Provider {
+		case "codex":
+			if h.hint.GenerationEpoch != 601 || h.hint.Generation != 3 {
+				t.Fatalf("codex hint = %+v, want {601,3}", h.hint)
+			}
+		case "opencode":
+			if h.hint.GenerationEpoch != 777 || h.hint.Generation != 2 {
+				t.Fatalf("opencode hint = %+v, want {777,2}", h.hint)
+			}
+		default:
+			t.Fatalf("unexpected provider %q", h.hint.Provider)
+		}
+		// The signed message covers the provider, so the two cannot be
+		// confused in transit.
+		msg := buildCLIUsageObservedSignedMessage("agent-1", h.hint.Timestamp, h.hint.Provider,
+			gen(h.hint.GenerationEpoch, h.hint.Generation))
+		if h.hint.Signature != generateHMAC(msg, "secret") {
+			t.Fatalf("hint signature does not cover the provider: %+v", h.hint)
+		}
+	}
+	// The 5-minute spacing stays GLOBAL: at most one hint leaves the device in
+	// that window, whoever it is for.
+	for i := 1; i < len(hints); i++ {
+		gap := time.UnixMilli(hints[i].hint.Timestamp).Sub(time.UnixMilli(hints[i-1].hint.Timestamp))
+		if gap < cliUsageHintSpacing-10*time.Millisecond {
+			t.Fatalf("hints %d and %d are %s apart, want >= %s", i-1, i, gap, cliUsageHintSpacing)
+		}
+	}
+}
+
+// OpenCode waits for its OWN rotation: Codex's does not license an OpenCode
+// hint, because the backend compares each provider's generation separately.
+func TestCLIUsageHint_OpenCodeWaitsForItsOwnRotation(t *testing.T) {
+	withCodexGenerationEpoch(t, 602)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t) // Codex only
+
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(778, 1))
+	time.Sleep(3 * cliUsageHintDebounce)
+	if hints := rec.all(); len(hints) != 0 {
+		t.Fatalf("hints = %+v, want none before OpenCode's own rotation", hints)
+	}
+
+	markOpenCodeRotated(t)
+	hints := waitHints(t, rec, 1, 0)
+	if hints[0].hint.Provider != "opencode" || hints[0].hint.GenerationEpoch != 778 {
+		t.Fatalf("hint = %+v, want the OpenCode observation", hints[0].hint)
+	}
+}
+
+// A provider the backend does not track gets no slot at all: recording one
+// would spend the global spacing on a hint the route answers with
+// `accepted: false`.
+func TestCLIUsageHint_IgnoresAProviderWithNoGenerationSource(t *testing.T) {
+	withCodexGenerationEpoch(t, 603)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced("grok", gen(999, 1))
+	time.Sleep(3 * cliUsageHintDebounce)
+	if hints := rec.all(); len(hints) != 0 {
+		t.Fatalf("hints = %+v, want none for an untracked provider", hints)
+	}
+}
+
+// The startup recovery hints an OpenCode ledger the PREVIOUS process committed
+// but never announced (a shutdown inside the debounce).
+func TestCLIUsageHint_StartupRecoveryHintsANumericOpenCodeLedger(t *testing.T) {
+	withCodexGenerationEpoch(t, 604)
+	rec, cfg := propagatorFixture(t)
+
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	prevNow := openCodeUsageNow
+	openCodeUsageNow = func() time.Time { return now }
+	t.Cleanup(func() { openCodeUsageNow = prevNow })
+	openCodeGenerationRotated.Store(false)
+	t.Cleanup(func() { openCodeGenerationRotated.Store(false) })
+
+	// A reading on disk under ANOTHER process's epoch.
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeEnsureDay(l, openCodeDayKey(now)).Messages["0123456789abcdef"] =
+			openCodeMessageUsage{In: 11, Out: 4, ObservedAtMs: now.UnixMilli()}
+		l.Generation = cliUsageGeneration{Epoch: 4242, Counter: 9}
+		return openCodeLedgerEdit{Changed: true}
+	})
+
+	startCLIUsagePropagator(cfg)
+	hints := waitHints(t, rec, 1, 0)
+	found := false
+	for _, h := range hints {
+		if h.hint.Provider != "opencode" {
+			continue
+		}
+		found = true
+		if h.hint.GenerationEpoch == 4242 {
+			t.Fatalf("the recovery hint still names the previous process's epoch: %+v", h.hint)
+		}
+		if h.hint.GenerationEpoch != openCodeProcessGenerationEpoch.Load() {
+			t.Fatalf("hint epoch = %d, want this process's %d",
+				h.hint.GenerationEpoch, openCodeProcessGenerationEpoch.Load())
+		}
+	}
+	if !found {
+		t.Fatalf("hints = %+v, want an OpenCode recovery hint", hints)
+	}
+}
+
+// The epoch draw is shared with Codex, so neither can drift off the route's
+// Number.MAX_SAFE_INTEGER bound.
+func TestCLIUsageHint_OpenCodeEpochStaysJavaScriptSafe(t *testing.T) {
+	const maxSafe = int64(1)<<53 - 1
+	for i := 0; i < 500; i++ {
+		if epoch := openCodeDrawGenerationEpoch(); epoch < 1 || epoch > maxSafe {
+			t.Fatalf("epoch %d outside [1, 2^53-1]", epoch)
+		}
 	}
 }

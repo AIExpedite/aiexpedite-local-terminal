@@ -36,6 +36,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -205,6 +206,11 @@ var openCodeDiagnosticTokens = map[string]bool{
 	"--help": true, "-help": true, "-h": true,
 	"auth": true, "models": true, "upgrade": true, "serve": true,
 	"github": true, "mcp": true, "agent": true, "stats": true,
+	// `session` (list / delete) and `export` read the session store. They spend
+	// nothing, so reshaping either into a `run` would burn a turn — and the
+	// usage reconciliation (cliagent_usage_opencode_store.go) runs both, so
+	// they must also never arm a usage run floor.
+	"session": true, "export": true,
 }
 
 // isOpenCodeDiagnosticInvocation reports an invocation OpenCode answers with
@@ -571,6 +577,23 @@ func openCodeEventFinishReason(event map[string]interface{}) string {
 	}
 	reason, _ := event["reason"].(string)
 	return reason
+}
+
+// isOpenCodeTerminalEventLine reports whether one `run --format json` stdout
+// line is the turn's natural end. Shared by the native stream tap and the
+// maintenance probe so the two transports cannot disagree about what "the turn
+// finished" looks like.
+func isOpenCodeTerminalEventLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "{") {
+		return false
+	}
+	var event map[string]interface{}
+	if json.Unmarshal([]byte(line), &event) != nil {
+		return false
+	}
+	eventType, _ := event["type"].(string)
+	return isOpenCodeTerminalEventType(eventType, openCodeEventFinishReason(event))
 }
 
 // openCodeOptionRejectionText reports whether already-lowercased CLI text is an

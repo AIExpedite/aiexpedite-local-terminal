@@ -5,6 +5,9 @@
 //
 //	"\x1b[0m\n┌  Credentials \x1b[90m~/.local/share/opencode/auth.json\n│\n└  0 credentials\n\n"
 //
+// It also covers the usage rows the parser publishes from the device's own
+// ledger (cliagent_usage_opencode_capture.go).
+//
 // Every one of those lines used to yield a "provider": the bare escape became
 // its own row, and the box glyph was the first whitespace-delimited token on the
 // others. The card's Account read "[0m, ␍, |, ᴸ" — on a machine with ZERO
@@ -251,5 +254,107 @@ func TestOpenCodeParsePublishesTheModelList(t *testing.T) {
 	}
 	if strings.Contains(usage.Account, "\x1b") || strings.Contains(usage.Account, "┌") {
 		t.Fatalf("account %q still carries terminal decoration", usage.Account)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Published usage rows
+   -------------------------------------------------------------------------- */
+
+// The parser used to emit no metric at all, on purpose: OpenCode has no quota
+// of its own. It now publishes the device's own "used today" counters, which is
+// what the card had nothing numeric to show before.
+func TestOpenCodeParse_PublishesTodaysLedgerRows(t *testing.T) {
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	handle := armOpenCodeUsageRun("unit")
+	handle.Observe(fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"sessionID":"ses_1",`+
+		`"part":{"messageID":"msg_1","type":"step-finish","reason":"stop","cost":0.37,`+
+		`"tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":9000,"write":900}}}}`,
+		now.UnixMilli()))
+	handle.Finish(true)
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+
+	t.Setenv(mockCLIEnvVar, "opencode")
+	usage, ok := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Name: "OpenCode", Version: "1.18.15", Path: os.Args[0],
+	}, now)
+	if !ok {
+		t.Fatal("parser refused a detected install")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("metrics = %+v, want Tokens today and Cost today", usage.Metrics)
+	}
+	tokens := usage.Metrics[0]
+	// Cache reads and writes are left OUT: counting them would make a cached
+	// turn look many times larger than it was.
+	if tokens.Consumed == nil || *tokens.Consumed != 150 {
+		t.Fatalf("tokens = %v, want 150 (input+output+reasoning, no cache)", tokens.Consumed)
+	}
+	if tokens.Total != nil || tokens.Unknown {
+		t.Fatalf("a limitless counter must carry no total and never read as unknown: %+v", tokens)
+	}
+	if usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 0.37 {
+		t.Fatalf("cost = %v, want 0.37", usage.Metrics[1].Consumed)
+	}
+	if usage.UsageGeneration == nil || usage.UsageGeneration.Counter <= 0 {
+		t.Fatalf("usageGeneration = %+v, want the committed capture generation", usage.UsageGeneration)
+	}
+	// Readiness is unchanged by any of this.
+	if len(usage.Models) == 0 || usage.Account == "" || usage.AuthState == "" {
+		t.Fatalf("readiness regressed: models=%v account=%q authState=%q",
+			usage.Models, usage.Account, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationNotReported {
+		t.Fatalf("loginExpirationState = %q, want %q", usage.LoginExpirationState, loginExpirationNotReported)
+	}
+}
+
+// With nothing it can stand behind, the parser emits NO row — never an
+// "unknown" placeholder, which would read as "a limit exists and we cannot see
+// it" when there is no OpenCode-level limit at all.
+func TestOpenCodeParse_EmitsNoRowWithoutAReading(t *testing.T) {
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	t.Setenv(mockCLIEnvVar, "opencode")
+	usage, _ := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Name: "OpenCode", Version: "1.18.15", Path: os.Args[0],
+	}, now)
+	if len(usage.Metrics) != 0 {
+		t.Fatalf("metrics = %+v, want none", usage.Metrics)
+	}
+	if usage.Notice != "" {
+		t.Fatalf("notice = %q, want none", usage.Notice)
+	}
+}
+
+// A partial day carries the existing card-level notice rather than a new wire
+// field, so a low number is never presented as a complete one.
+func TestOpenCodeParse_PartialDayCarriesTheLowerBoundNotice(t *testing.T) {
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeMergeObservations(l, []openCodeObservedMessage{{
+			SessionID: "s", MessageID: "m", EventAt: now, Usage: openCodeMessageUsage{In: 3},
+		}}, now.UnixMilli())
+		openCodeMarkTodayPartial(l, now)
+		return openCodeLedgerEdit{Changed: true, TotalsChanged: true}
+	})
+
+	t.Setenv(mockCLIEnvVar, "opencode")
+	usage, _ := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Name: "OpenCode", Version: "1.18.15", Path: os.Args[0],
+	}, now)
+	if usage.Notice != openCodeUsagePartialNotice || usage.NoticeSeverity != "warning" {
+		t.Fatalf("notice = %q/%q, want the lower-bound warning", usage.Notice, usage.NoticeSeverity)
 	}
 }

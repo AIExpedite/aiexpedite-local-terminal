@@ -1824,7 +1824,7 @@ func codexNoteCommittedGeneration(snap *codexRateLimitSnapshot) {
 		return
 	}
 	if codexGenerationRotated.CompareAndSwap(false, true) {
-		noteCLIUsageGenerationRotated()
+		noteCLIUsageGenerationRotated(codexUsageProvider)
 	}
 }
 

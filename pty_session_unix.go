@@ -80,6 +80,15 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 	}
 	defer capture.Finish()
 
+	// A PTY `opencode` run's output is terminal bytes, not a JSON event stream
+	// this process parses, so its usage is never tapped and the run always owes
+	// one bounded reconcile (cliagent_usage_opencode_freshness.go). The defer
+	// settles it on EVERY exit route — normal exit, overall timeout and
+	// prompt-abort. Windows has no PTY spawn (pty_session_windows.go is a stub),
+	// so it arms nothing there.
+	openCodeUsage := armOpenCodeUsageForCommand("PTY session", cmd, args)
+	defer settleOpenCodeUsageRunAsync(openCodeUsage, false)
+
 	norm := NewPTYNormalizer(DefaultRedrawInterval)
 	var sb strings.Builder
 	emitLine := func(s string) {

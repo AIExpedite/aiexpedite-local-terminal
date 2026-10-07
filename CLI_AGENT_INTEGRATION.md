@@ -1995,9 +1995,10 @@ Every outcome maps to **exactly one** closed diagnostic. `launch_error`
 - `binary_missing`, `not_logged_in`, `auth_error`, `launch_error` and `internal`
   are **not cached**. A shape is remembered only while the binary stamp is
   unchanged (`bindCLISmokeShape`).
-- Cost: OpenCode has **no quota of its own** (`cliagent_usage_opencode.go` reports
-  models, not limits), so the turn is spent against whichever provider sits behind
-  it. The shared 15-minute cooldown + singleflight bound that to one turn per
+- Cost: OpenCode has **no quota of its own** — there is no OpenCode-level limit
+  window to plot — so the turn is spent against whichever provider sits behind it.
+  It does report exact TOKEN COUNTS, which the device keeps and publishes as
+  "used today" counters (see "OpenCode usage capture" below). The shared 15-minute cooldown + singleflight bound that to one turn per
   binary per window, and the free `opencode models` readiness pre-check
   short-circuits an unusable install before anything is spent. That pre-check runs
   in the **same** fresh cwd the turn does (`openCodeSmokeLoggedInDir`, and
@@ -2115,12 +2116,181 @@ the transport change the evidence selects ships separately.
 - The published `cliSmokeResult` carries `markerMatched`, a shape id and counts.
   It never carries child stdout, stderr, the prompt, the marker nonce, argv, the
   resolved path, credentials or config.
-- `openCodeSmokeFailureLogLine(shapeID, category, diagnostic, stderrBytes,
-  stdoutBytes int)` takes **lengths only** — a function that cannot receive vendor
-  text cannot leak it, however a future caller wires it up.
+- `openCodeSmokeFailureLogLine(shapeID, category, diagnostic, counts)` takes
+  **counts only** — a function that cannot receive vendor text cannot leak it,
+  however a future caller wires it up.
+- The usage ledger and its freshness state hold only integers, 16-hex hashes and
+  `YYYY-MM-DD` day keys, plus three exceptions: the closed `lastPassOutcome`
+  code, the `continuationDue` bool and each day's `partial` bool. See "OpenCode
+  usage capture" for the allowlist and the test that enforces it.
 - Fixed refusal errors never echo the offending token, and the approval dialog
   stopped rendering prompt text because the gated argv no longer carries it
   (`gateSessionEntryCommand` strips the control token first, then shapes).
+
+## OpenCode usage capture
+
+OpenCode was the one CLI agent whose card showed nothing numeric: the parser
+deliberately published no metric, because OpenCode brokers whatever provider the
+user configured and has no quota of its own. Every run still reports exact token
+counts (and a cost when the provider bills per token) in the `step_finish` events
+of `opencode run --format json`, and in OpenCode's own session store — so the
+numbers existed; nothing was keeping them.
+
+The device now keeps a small, redacted, persisted ledger
+([cliagent_usage_opencode_capture.go](cliagent_usage_opencode_capture.go)) and
+publishes today's rows as `kind: daily`, `consumed`-only counters with
+`resetAt` at the next LOCAL midnight. There is no `total`: OpenCode has no
+limit, so any total would be invented.
+
+- `Tokens today` = input + output + reasoning. **Cache reads and writes are left
+  out**, because they would make a cached turn look many times larger than it was.
+- `Cost today` (unit `USD`) is emitted only when some counted message reported a
+  cost above 0. Subscription providers report 0, and "$0.00 used" would mislead.
+- A `partial` day sets the card's existing `Notice` ("…totals are a lower bound",
+  severity `warning`) rather than adding a wire field.
+
+### Two sources, and sum-then-max
+
+1. **The run's own stream.** Native chat, pipe sessions and the maintenance smoke
+   feed `openCodeRunUsage.Observe(line)` from the JSON stream they already parse.
+   A tool turn emits several `step_finish` events under ONE `messageID`, each
+   carrying only its own step's figures, so the tap **sums** every step of a
+   message within the run.
+2. **A bounded reconciliation through OpenCode's CLI**
+   ([cliagent_usage_opencode_store.go](cliagent_usage_opencode_store.go)):
+   `session list --format json` + `export <id>`. It covers the runs whose stream
+   we never see — a direct `opencode` in the user's own shell or TUI, every
+   `execute` and Unix PTY run (both terminal-managed, never tapped), and a stream
+   cut off by a timeout, a kill or an agent self-update.
+
+The ledger then keeps, **field by field, the MAX** of the stream's summed figure
+and any other observation of the same message, so a stream and an export of the
+same run never double-count. Trade-off: if a later source reports less than an
+earlier one the higher figure stands, which can over-count that ONE message —
+preferred over dropping steps.
+
+**Why the CLI and not the files.** OpenCode has moved its storage layout between
+releases (`openCodeSessionDirs` probes five roots for that reason), so reading
+`storage/**` would break on an upgrade. The only file access anywhere in this
+feature is the stat-only discovery walk below. Output neither command spells the
+way we read is the closed outcome `unsupported`: the debt retires and the stream
+figures stand.
+
+### Day attribution
+
+A message belongs to the local day of its **source event time** — the first
+stream event carrying that `messageID`, or the export's `time.created`. Never
+the settle or pass clock. A merge looks the message hash up in BOTH retained days
+and keeps an existing entry where it is, so one message has one day key even when
+the stream and the export straddle midnight. `observedAtMs` is the COMMIT time of
+the merge that last raised the row, so a row is never older than the run it covers.
+
+### Arm sites
+
+Every managed spawn of `opencode` arms a run handle BEFORE `Start`, and the
+handle persists a floor. A spawn that fails disarms it. A nil handle is a no-op
+everywhere, so a site needs no branch. `armOpenCodeUsageForCommand` pairs
+`isOpenCodeCommand` with the spend-free carve-out
+(`isOpenCodeDiagnosticInvocation` — `models`, `auth`, `--version`, `session`,
+`export`, …), so no site re-implements the pair and a reconcile's own commands
+can never create the debt they exist to pay.
+
+| site | file | label | tapped? |
+| --- | --- | --- | --- |
+| native chat | [opencode_native.go](opencode_native.go) `runOneShot` | `native chat` | yes |
+| pipe session | [session.go](session.go) `StartSession` → `waitForExit` | `pipe session` | yes |
+| maintenance smoke | [cliagent_smoke_opencode.go](cliagent_smoke_opencode.go) | `smoke` | yes (before the bytes are discarded) |
+| execute, no tty | [pubsub.go](pubsub.go) `runLocalCommandUnix` | `local execute` | no — always owes |
+| execute, Windows chain | [pubsub.go](pubsub.go) `runLocalCommandWindows`, armed at function ENTRY (no single post-Start hook) | `windows execute` | no — always owes |
+| Unix PTY | [pty_session_unix.go](pty_session_unix.go) | `PTY session` | no — always owes |
+
+`TestOpenCodeUsage_EveryArmSiteStillArms` pins this table: a site that stops
+arming is a run whose tokens vanish from the card, which is exactly what the
+Antigravity Windows execute path shipped with when nothing pinned its sites.
+
+### The run-completion debt
+
+Modelled on Grok's
+([cliagent_usage_opencode_freshness.go](cliagent_usage_opencode_freshness.go)),
+minus Grok's account fencing — OpenCode has no login of its own, so there is
+nothing to fence a debt to, which is also why a generic engine was left out.
+
+- **Settle.** A run is COVERED when the stream ended cleanly (a terminal event,
+  no overflow, no timeout, no kill) and some `step_finish` carried tokens for a
+  message we could name. Otherwise it OWES one reconcile. A covered settle never
+  touches an existing debt, so a clean smoke after an owed execute or direct run
+  leaves that debt in place.
+- **Pay.** One pending debt at a time (a newer owing run moves the completion
+  forward and keeps the attempt count), 4 passes on the shared ladder
+  ([cliagent_usage_refresh_ladder.go](cliagent_usage_refresh_ladder.go)), a
+  6-hour maximum age, and free retries (offline, draining, `more`) backed off by
+  the debt's age.
+- **ONE retry timer per failure, never two.** With a debt open the ladder is the
+  timer and every outcome clears `continuationDue`. With no debt open the
+  continuation chain is the only timer: a failure keeps `continuationDue`, counts
+  it, and books one pass off the age of the current run of consecutive failures;
+  after 4 the chain stops and today is marked `partial` if candidates were still
+  queued.
+- **Cost of a pass.** 1 `session list` + at most 3 `export` calls, OLDEST changed
+  session first, each export's stdout capped at 8 MiB. Passes run only on a debt
+  rung, a gather nudge (2-minute cooldown) or a Refresh click — never on an idle
+  gather — and share one single flight, so the click and the worker never spawn
+  two children. One export of a long session can take seconds of CPU on the
+  user's machine.
+- **Bounds.** 5,000 message rows per day for 2 days (about 1 MB at the cap), 512
+  stream-captured sessions per day, 32 remembered over-cap exports. Past the row
+  cap, or when an over-cap export has to be skipped, the day is `partial` and the
+  card carries the lower-bound notice rather than a silently low number.
+- **The cursor always advances** past an attempted session, over-cap included, so
+  no outcome can stall on one. An over-cap session the stream already counted is
+  simply stepped over; any other is remembered and retried when its `updated`
+  rises, taking at most 1 of the 3 export slots while sessions beyond the cursor
+  remain.
+
+### Discover, and survive
+
+`ParseContext` reads only NAMES AND MTIMES (never contents) over the global roots
+`openCodeSessionDirs("")` knows plus their immediate children, and every
+`<storage>/project/<slug>/storage/session[/info]` — the project-scoped layout
+native capture and the TUI write today. At most 64 slugs, ranked by the newer of
+those two directories' mtimes (not the slug directory's own, which does not move
+when a file inside it is rewritten), inside a 256-stat total. A newest mtime later
+than `lastPassStartedAtMs` nudges the worker, on its cooldown. A layout outside
+this walk is recovered only by a Refresh click or a managed run's debt.
+
+`StartAgent` calls `SetOpenCodeUsageRefreshEnabled(true)` and
+`payOwedOpenCodeUsageRefresh()`; `gracefulShutdown` calls
+`stopOpenCodeRunDebtRetry()` and `drainOpenCodeUsageWrites(ctx)`. A booked rung
+is re-armed, a set `continuationDue` with no debt open books the continuation, and
+a floor the previous process armed but never settled (the self-update case) owes
+one reconcile. Neither file is keyed by the binary, so an OpenCode upgrade carries
+the totals across it.
+
+### Telling the backend
+
+`generation.counter` moves ONLY when a merge changes a day total, and
+`cliUsagePropagator` ([cliagent_usage_propagate.go](cliagent_usage_propagate.go))
+sends one signed hint naming it. Each provider in `cliUsageGenerationSources`
+keeps its OWN pending slot, rotation and two-hint budget — an OpenCode
+observation can never evict a pending Codex one — while the 5-minute spacing
+stays global. terminal-service answers for the providers in
+`CLI_USAGE_GENERATION_PROVIDERS`, with a per-provider applied generation
+(`cliUsageAppliedGenerations.opencode`) and cooldown
+(`cliUsageObservedDispatchedAtByProvider.opencode`), so an OpenCode hint can
+never burn Codex's.
+
+### Redaction allowlist
+
+The two state files (`opencode_usage.json`, `opencode_usage_freshness.json`,
+relocatable with `AIEXPEDITE_OPENCODE_USAGE_LEDGER` /
+`AIEXPEDITE_OPENCODE_USAGE_FRESHNESS`) hold integers, 16-hex hashes of
+`sessionID\0messageID`, day keys, the closed outcome codes, `continuationDue`
+and each day's `partial`. **No session or message id, model, provider, prompt,
+text, path or account is ever written.** Tokens and `costMicros` are clamped to
+`[0, 1e12]`; NaN, negative and non-numeric values are dropped field by field.
+Nothing the CLI prints is logged: stderr is only classified, never retained, and
+`logOpenCodeUsage` takes a fixed label plus counters.
+`cliagent_usage_opencode_redaction_test.go` enforces all of it.
 
 ## Coverage gap
 
@@ -2131,3 +2301,11 @@ seam, and the Windows execution regression is covered by a functional test
 compiled stub — proof that cmd.exe starts a shim, that stdin reaches its child and
 that the marker classifies, without a vendor binary. **The first proof against the
 real CLI is still the post-update smoke on a Windows device.**
+
+The same gap applies to the usage reconciliation: no unit test can prove
+`session list --format json` and `export <id>` exist and print the shapes the
+pass decodes. The store tests stub the command seam and assert the BOUNDS; the
+opt-in Windows gate
+([cliagent_smoke_opencode_live_windows_test.go](cliagent_smoke_opencode_live_windows_test.go),
+`TestOpenCodeLiveGate_UsageReconcileAnswersFromTheRealInstall`) is the only place
+the SHAPES are checked against a shipped build.
