@@ -563,9 +563,16 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 	}
 
 	id := state.debtID()
-	result := reconcileOpenCodeUsageOnce(parent, now)
+	result, led := reconcileOpenCodeUsageLeading(parent, now)
 	completedAt := openCodeUsageNow()
 	outcome := result.Outcome
+	if !led {
+		// Joined a pass another caller is running (a Refresh click overlapping
+		// the debt worker): that caller books it. Booking it here too would
+		// charge one shared failure twice against the debt's attempts.
+		logOpenCodeUsage("joined %s", outcome)
+		return outcome
+	}
 
 	booked := updateOpenCodeUsageFreshness(func(s *openCodeUsageFreshness) {
 		s.LastAttemptAtMs = completedAt.UnixMilli()

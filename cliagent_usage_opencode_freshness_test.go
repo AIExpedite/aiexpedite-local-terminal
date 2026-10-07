@@ -204,6 +204,46 @@ func TestOpenCodeDebt_SpendsAtMostItsBudgetOfPasses(t *testing.T) {
 	}
 }
 
+func TestOpenCodeDebt_ASharedFailedPassSpendsOneAttempt(t *testing.T) {
+	// A Refresh click that overlaps the debt worker joins its flight. Both get
+	// the one failure back, but only the caller that ran the pass books it —
+	// otherwise one timeout would spend two of the debt's four attempts.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	t.Cleanup(openCodeReconcileBudgetForTests(300 * time.Millisecond))
+	created := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_a", created + 1000}),
+		hang:     map[string]bool{"ses_a": true},
+	}).install(t)
+	updateOpenCodeUsageFreshness(func(s *openCodeUsageFreshness) {
+		openCodeOweReconcile(s, now, openCodeCompletionMs(now))
+	})
+
+	leader := make(chan string, 1)
+	go func() { leader <- openCodePayReconcile(context.Background(), false) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for stub.exportCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if stub.exportCount() == 0 {
+		t.Fatal("the leader's pass never reached its export")
+	}
+	joined := openCodePayReconcile(context.Background(), true)
+	led := <-leader
+	stopOpenCodeRunDebtRetry()
+
+	if joined != openCodeReconcileTimeout || led != openCodeReconcileTimeout {
+		t.Fatalf("outcomes = %q / %q, want both callers to see the shared timeout", led, joined)
+	}
+	if got := stub.exportCount(); got != 1 {
+		t.Fatalf("exports = %d, want the click to join rather than run a second pass", got)
+	}
+	if attempts := readOpenCodeFreshness(t).Attempts; attempts != 1 {
+		t.Fatalf("attempts = %d, want one shared failure charged once", attempts)
+	}
+}
+
 func TestOpenCodeDebt_FreeRetriesBackOffWithTheDebtsAge(t *testing.T) {
 	// A device that stays offline must not re-check at the floor for the
 	// debt's whole six-hour window.
@@ -461,6 +501,52 @@ func TestOpenCodeDiscovery_SeesAGlobalRootWrite(t *testing.T) {
 	}
 }
 
+func TestOpenCodeDiscovery_SeesANewTurnInAnExistingSession(t *testing.T) {
+	// A turn in an existing session rewrites that session's metadata file in
+	// place — no session directory's mtime moves — but it always adds a
+	// per-message directory under `part`. Both layouts must see it.
+	for _, layout := range []string{"global", "project"} {
+		t.Run(layout, func(t *testing.T) {
+			data := t.TempDir()
+			t.Setenv("OPENCODE_DATA", data)
+			t.Setenv("XDG_DATA_HOME", "")
+			storage := filepath.Join(data, "storage")
+			if layout == "project" {
+				storage = filepath.Join(data, "project", "slug-a", "storage")
+			}
+			before := time.Now().Add(-time.Hour)
+			for _, dir := range []string{
+				filepath.Join(storage, "session", "info"),
+				filepath.Join(storage, "message", "ses_1"),
+				filepath.Join(storage, "part"),
+			} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, dir := range []string{
+				filepath.Join(storage, "session", "info"), filepath.Join(storage, "session"),
+				filepath.Join(storage, "message", "ses_1"), filepath.Join(storage, "message"),
+				filepath.Join(storage, "part"), storage, filepath.Dir(storage),
+			} {
+				if err := os.Chtimes(dir, before, before); err != nil {
+					t.Fatal(err)
+				}
+			}
+			since := time.Now().Add(-time.Minute)
+			if openCodeSessionStoreChangedSince(since) {
+				t.Fatal("an hour-old store is not a change since a minute ago")
+			}
+			if err := os.Mkdir(filepath.Join(storage, "part", "msg_2"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if !openCodeSessionStoreChangedSince(since) {
+				t.Fatal("a new message's part directory must be seen")
+			}
+		})
+	}
+}
+
 /* ──────────────────────────── clock and restart ────────────────────────── */
 
 func TestOpenCodeFreshness_RebasesAClockStepBack(t *testing.T) {
@@ -618,9 +704,10 @@ func TestOpenCodeDiscovery_BoundsWhatOneDirectoryContributes(t *testing.T) {
 	// And the walk still completes inside its stat budget rather than hanging
 	// or panicking on the breadth.
 	stats := 0
-	if dirs := openCodeProjectSessionDirs(&stats); stats > openCodeDiscoveryMaxStats || len(dirs) > 2*openCodeDiscoveryMaxSlugs {
+	if dirs := openCodeProjectSessionDirs(&stats); stats > openCodeDiscoveryMaxStats ||
+		len(dirs) > openCodeDiscoveryDirsPerSlug*openCodeDiscoveryMaxSlugs {
 		t.Fatalf("stats=%d dirs=%d, want <= %d / %d", stats, len(dirs),
-			openCodeDiscoveryMaxStats, 2*openCodeDiscoveryMaxSlugs)
+			openCodeDiscoveryMaxStats, openCodeDiscoveryDirsPerSlug*openCodeDiscoveryMaxSlugs)
 	}
 	// A missing root is the normal case and reads as nothing.
 	if got := openCodeReadDirBounded(filepath.Join(data, "absent"), 8); got != nil {

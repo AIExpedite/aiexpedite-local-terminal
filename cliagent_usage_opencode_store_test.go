@@ -43,6 +43,9 @@ type openCodeCLIStub struct {
 	// exitError makes every invocation exit non-zero (a build without the
 	// subcommand).
 	exitError bool
+	// sessionsFilled answers `session list` as an overflow of its stdout cap:
+	// `sessions` is the cut-off prefix that fit.
+	sessionsFilled bool
 
 	calls []string
 	// exportsRun counts `export` invocations, which is where the cost bound is.
@@ -89,7 +92,7 @@ func (s *openCodeCLIStub) install(t *testing.T) *openCodeCLIStub {
 			if s.sessions == "" {
 				return []byte(openCodeFixture(t, "session_list_unsupported.txt")), false, nil
 			}
-			return []byte(s.sessions), false, nil
+			return []byte(s.sessions), s.sessionsFilled, nil
 		}
 		id := args[1]
 		if s.hang[id] {
@@ -615,6 +618,69 @@ func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testin
 	reconcileOpenCodeUsageOnce(context.Background(), now)
 	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day != nil && day.Partial {
 		t.Fatal("a list inside the bound must not mark the day partial")
+	}
+}
+
+func TestOpenCodeReconcile_ASessionListOverItsStdoutCapIsABacklogNotUnsupported(t *testing.T) {
+	// A list past openCodeSessionListMaxStdout is cut mid-document, so it never
+	// parses whole. Reading it as `unsupported` would retire the debt with no
+	// notice on exactly the installs with the most history; instead the rows
+	// that arrived intact are reconciled and the day is a lower bound.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	created := now.UnixMilli()
+	whole := sessionList(
+		openCodeSessionRow{"ses_a", created + 1000},
+		openCodeSessionRow{"ses_b", created + 2000},
+		openCodeSessionRow{"ses_c", created + 3000},
+	)
+	cut := whole[:strings.Index(whole, `"ses_c"`)+3]
+	for _, spelling := range []struct{ name, list string }{
+		{"bare array", cut},
+		{"wrapped", `{"total":3,"sessions":` + cut},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			stub := (&openCodeCLIStub{
+				sessions:       spelling.list,
+				sessionsFilled: true,
+				exports: map[string]string{
+					"ses_a": exportWith("ses_a", "msg_a", created, 10, 1, "0"),
+					"ses_b": exportWith("ses_b", "msg_b", created, 20, 2, "0"),
+				},
+			}).install(t)
+
+			result := reconcileOpenCodeUsageOnce(context.Background(), now)
+			if result.Outcome != openCodeReconcileOK {
+				t.Fatalf("outcome = %q, want ok over the intact rows", result.Outcome)
+			}
+			if got := stub.exportCount(); got != 2 {
+				t.Fatalf("exports = %d, want the two intact rows", got)
+			}
+			if tokens, _, _ := todayTotals(t, now); tokens != 33 {
+				t.Fatalf("tokens = %d, want 33", tokens)
+			}
+			if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+				t.Fatalf("day = %+v, want the lower-bound notice", day)
+			}
+		})
+	}
+}
+
+func TestOpenCodeSessionListSalvage_KeepsOnlyIntactRows(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"nothing intact", `[{"id":"ses_a","time":{"upd`, 0},
+		{"one intact", `[{"id":"ses_a","time":{"updated":1}},{"id":"ses_b"`, 1},
+		{"banner then wrapped", "notice\n" + `{"sessions":[{"id":"ses_a","updated":1},{"id":`, 1},
+		{"no sessions key", `{"other":[1,2,3],"more":"x`, 0},
+		{"not json", `table output`, 0},
+	} {
+		if got := len(salvageOpenCodeSessionList([]byte(tc.body))); got != tc.want {
+			t.Fatalf("%s: salvaged %d rows, want %d", tc.name, got, tc.want)
+		}
 	}
 }
 

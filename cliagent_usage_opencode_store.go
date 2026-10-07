@@ -120,11 +120,24 @@ func openCodeUsageLaunch(path string, args []string) openCodeLaunch {
 // pass already running. Every pass stamps lastPassStartedAtMs and records its
 // outcome, so the gather's nudge and the zero-row rule read the same facts.
 func reconcileOpenCodeUsageOnce(parent context.Context, now time.Time) openCodeReconcileResult {
+	result, _ := reconcileOpenCodeUsageLeading(parent, now)
+	return result
+}
+
+// reconcileOpenCodeUsageLeading is reconcileOpenCodeUsageOnce that also reports
+// whether THIS caller ran the pass. A caller that joined someone else's flight
+// gets the same result but must not book it: the leader already does, and two
+// callers charging one shared failure would spend two of the debt's attempts.
+// (singleflight's own `shared` flag cannot say this — it is true for the leader
+// too once anyone has joined.)
+func reconcileOpenCodeUsageLeading(parent context.Context, now time.Time) (openCodeReconcileResult, bool) {
+	led := false
 	v, _, _ := openCodeReconcileGroup.Do("reconcile", func() (any, error) {
+		led = true
 		return runOpenCodeReconcilePass(parent, now), nil
 	})
 	result, _ := v.(openCodeReconcileResult)
-	return result
+	return result, led
 }
 
 func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeReconcileResult {
@@ -450,18 +463,29 @@ func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string)
 // changed session the cut dropped is never exported. The last return is "" on
 // success, or the closed outcome the pass must report.
 func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []openCodeSessionRow, truncated bool, outcome string) {
-	stdout, _, err := openCodeRunCommand(ctx, path,
+	stdout, filled, err := openCodeRunCommand(ctx, path,
 		[]string{"session", "list", "--format", "json"}, openCodeSessionListMaxStdout)
 	if ctx.Err() != nil {
 		return nil, false, openCodeReconcileTimeout
 	}
-	// The ANSWER decides, not the exit status: a build that prints a usable
-	// list and then exits non-zero (an update notice on stderr, a warning) must
-	// not be read as one that cannot answer at all — `unsupported` RETIRES the
-	// debt, so a transient non-zero exit would permanently drop the reading.
-	parsed, ok := parseOpenCodeSessionList(stdout)
-	if !ok {
-		return nil, false, openCodeCommandOutcome(err)
+	var parsed []openCodeSessionRow
+	if filled {
+		// A list over the cap is cut mid-document, so it never parses whole —
+		// and reading that as `unsupported` would RETIRE the debt on exactly
+		// the installs with the most history, with no lower-bound notice. It
+		// is a bounded backlog instead: keep every row that arrived intact and
+		// report the list truncated, which marks the day partial.
+		parsed, truncated = salvageOpenCodeSessionList(stdout), true
+	} else {
+		// The ANSWER decides, not the exit status: a build that prints a
+		// usable list and then exits non-zero (an update notice on stderr, a
+		// warning) must not be read as one that cannot answer at all —
+		// `unsupported` RETIRES the debt, so a transient non-zero exit would
+		// permanently drop the reading.
+		var ok bool
+		if parsed, ok = parseOpenCodeSessionList(stdout); !ok {
+			return nil, false, openCodeCommandOutcome(err)
+		}
 	}
 	if len(parsed) > openCodeSessionListMaxSessions {
 		sort.SliceStable(parsed, func(i, j int) bool { return parsed[i].updatedMs > parsed[j].updatedMs })
@@ -540,13 +564,64 @@ func parseOpenCodeSessionList(stdout []byte) ([]openCodeSessionRow, bool) {
 	}
 	out := make([]openCodeSessionRow, 0, len(rows))
 	for _, row := range rows {
-		if strings.TrimSpace(row.ID) == "" {
-			continue
-		}
-		updated := openCodeFirstEpochMs(row.Time.Updated, row.Updated, row.Time.Created, row.Created)
-		out = append(out, openCodeSessionRow{id: row.ID, updatedMs: updated})
+		out = appendOpenCodeSessionRow(out, row)
 	}
 	return out, true
+}
+
+func appendOpenCodeSessionRow(out []openCodeSessionRow, row openCodeSessionListJSON) []openCodeSessionRow {
+	if strings.TrimSpace(row.ID) == "" {
+		return out
+	}
+	updated := openCodeFirstEpochMs(row.Time.Updated, row.Updated, row.Time.Created, row.Created)
+	return append(out, openCodeSessionRow{id: row.ID, updatedMs: updated})
+}
+
+// salvageOpenCodeSessionList decodes the COMPLETE rows at the front of a
+// session list the capture buffer cut short, in either spelling (a bare array
+// or `{"sessions":[…]}`), stopping at the first row the cut broke. Nil when
+// nothing intact arrived; the caller still reports the list truncated.
+func salvageOpenCodeSessionList(stdout []byte) []openCodeSessionRow {
+	body := openCodeJSONBody(stdout)
+	if len(body) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	open, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	if open == json.Delim('{') {
+		// Walk to the `sessions` key, stepping over any other value.
+		for {
+			key, keyErr := dec.Token()
+			if keyErr != nil || key == json.Delim('}') {
+				return nil
+			}
+			if key == "sessions" {
+				break
+			}
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return nil
+			}
+		}
+		if open, err = dec.Token(); err != nil {
+			return nil
+		}
+	}
+	if open != json.Delim('[') {
+		return nil
+	}
+	var out []openCodeSessionRow
+	for dec.More() {
+		var row openCodeSessionListJSON
+		if dec.Decode(&row) != nil {
+			break
+		}
+		out = appendOpenCodeSessionRow(out, row)
+	}
+	return out
 }
 
 type openCodeExportJSON struct {
@@ -670,7 +745,11 @@ const (
 	openCodeDiscoveryMaxSlugs = 64
 	// openCodeDiscoveryMaxStats bounds the whole walk's stat calls, so a data
 	// directory with thousands of projects cannot turn a gather into a scan.
-	openCodeDiscoveryMaxStats = 256
+	// Room for every ranked slug's directories twice over, roots included.
+	openCodeDiscoveryMaxStats = 2 * openCodeDiscoveryDirsPerSlug * openCodeDiscoveryMaxSlugs
+	// openCodeDiscoveryDirsPerSlug is how many directories one project-scoped
+	// store contributes: session, session/info, message and part.
+	openCodeDiscoveryDirsPerSlug = 4
 	// openCodeDiscoveryMaxDirEntries bounds how many entries ONE directory
 	// contributes. os.ReadDir materialises and sorts every entry, so a project
 	// root with tens of thousands of slugs — or a flat session directory with a
@@ -703,9 +782,15 @@ func openCodeReadDirBounded(path string, limit int) []os.DirEntry {
 // roots openCodeSessionDirs("") already knows plus their immediate children,
 // and every `<storage>/project/<slug>` entry's `storage/session` and
 // `storage/session/info` — which is the project-scoped layout both native
-// capture and the TUI write today. Slugs are ranked by the NEWER of those two
-// directories' mtimes, not the slug directory's own, because a slug directory's
-// mtime does not move when a session file inside it is rewritten.
+// capture and the TUI write today. Slugs are ranked by the NEWEST of their
+// store directories' mtimes, not the slug directory's own, because a slug
+// directory's mtime does not move when a session file inside it is rewritten.
+//
+// A new turn in an EXISTING session creates no session entry: OpenCode rewrites
+// that session's metadata file in place, which moves no directory mtime. What a
+// turn always does create is a new message file and a new per-message part
+// directory, so each store's `message` and `part` directories are stat-ed too
+// (openCodeTurnStoreDirs) — one stat each, never a per-file walk.
 func openCodeSessionStoreChangedSince(since time.Time) bool {
 	stats := 0
 	newest := time.Time{}
@@ -732,6 +817,11 @@ func openCodeSessionStoreChangedSince(since time.Time) bool {
 				continue
 			}
 			note(filepath.Join(dir, entry.Name()))
+		}
+	}
+	if base := openCodeStorageDir(); base != "" {
+		for _, dir := range openCodeTurnStoreDirs(filepath.Join(base, "storage")) {
+			note(dir)
 		}
 	}
 	for _, slug := range openCodeProjectSessionDirs(&stats) {
@@ -761,8 +851,9 @@ func openCodeProjectSessionDirs(stats *int) []string {
 		if !entry.IsDir() || *stats >= openCodeDiscoveryMaxStats {
 			continue
 		}
-		root := filepath.Join(base, "project", entry.Name(), "storage", "session")
-		dirs := []string{root, filepath.Join(root, "info")}
+		storage := filepath.Join(base, "project", entry.Name(), "storage")
+		session := filepath.Join(storage, "session")
+		dirs := append([]string{session, filepath.Join(session, "info")}, openCodeTurnStoreDirs(storage)...)
 		newest := time.Time{}
 		for _, dir := range dirs {
 			if *stats >= openCodeDiscoveryMaxStats {
@@ -782,11 +873,18 @@ func openCodeProjectSessionDirs(stats *int) []string {
 	if len(candidates) > openCodeDiscoveryMaxSlugs {
 		candidates = candidates[:openCodeDiscoveryMaxSlugs]
 	}
-	out := make([]string, 0, len(candidates)*2)
+	out := make([]string, 0, len(candidates)*openCodeDiscoveryDirsPerSlug)
 	for _, candidate := range candidates {
 		out = append(out, candidate.dirs...)
 	}
 	return out
+}
+
+// openCodeTurnStoreDirs are the directories under one `storage` root whose own
+// mtime a turn moves: `part` gains a directory for every new message — which is
+// what catches a turn in an EXISTING session — and `message` one per session.
+func openCodeTurnStoreDirs(storage string) []string {
+	return []string{filepath.Join(storage, "message"), filepath.Join(storage, "part")}
 }
 
 // openCodeReconcileBudgetForTests shortens a pass's budget and returns the
