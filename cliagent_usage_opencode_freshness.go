@@ -47,8 +47,15 @@ const (
 	openCodeRunDebtMaxAttempts = 4
 	// openCodeRunDebtMaxAge retires a debt nothing could pay.
 	openCodeRunDebtMaxAge = 6 * time.Hour
-	// openCodeContinuationMaxFailures bounds a no-debt continuation chain.
+	// openCodeContinuationMaxFailures bounds a no-debt continuation chain's
+	// consecutive failures.
 	openCodeContinuationMaxFailures = 4
+	// openCodeContinuationMaxPasses bounds ONE chain's total passes, successful
+	// ones included: `more` requires progress, so a chain always terminates,
+	// but nothing otherwise bounds HOW LONG it spawns `opencode` for. At three
+	// exports a pass this covers 96 sessions; past it the day is a lower bound
+	// and a new run's debt, a click or a fresh nudge starts a new chain.
+	openCodeContinuationMaxPasses = 32
 
 	openCodeUsageFreshnessSchema = 1
 	// openCodeUsageFreshnessEnv relocates the state file (tests isolate from
@@ -126,10 +133,6 @@ var (
 	openCodeLiveRunsMu sync.Mutex
 	// openCodeLiveRuns holds the armed floors of this process's runs.
 	openCodeLiveRuns = map[int64]int{}
-
-	// openCodeLastReconcileOutcome is the newest pass's closed outcome, for a
-	// caller's log line.
-	openCodeLastReconcileOutcome atomic.Value
 
 	openCodeRunDebtRetryTimer struct {
 		mu    sync.Mutex
@@ -305,7 +308,7 @@ func disarmOpenCodeUsageRunFloor(floor time.Time) {
 // A COVERED settle never touches an existing debt: only a pass that completes
 // after the debt's completion time pays it. A clean smoke after an owed execute
 // or direct run therefore leaves that debt in place.
-func settleOpenCodeUsageRun(floor time.Time, covered bool) bool {
+func settleOpenCodeUsageRun(floor time.Time, covered bool, label string) bool {
 	if floor.IsZero() {
 		return false
 	}
@@ -331,7 +334,7 @@ func settleOpenCodeUsageRun(floor time.Time, covered bool) bool {
 	if !state.owed() {
 		return false
 	}
-	logOpenCodeUsage("owed attempts=%d", state.Attempts)
+	logOpenCodeUsage("owed by=%s attempts=%d", label, state.Attempts)
 	startOpenCodeReconcileWorker()
 	return true
 }
@@ -448,10 +451,6 @@ func startOpenCodeReconcileWorker() {
 func openCodeUsageRefreshWaitFor(d time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
-	return openCodeUsageRefreshWaitIdle(ctx)
-}
-
-func openCodeUsageRefreshWaitIdle(ctx context.Context) bool {
 	for openCodeFreshnessInFlight.Load() != 0 {
 		if ctx.Err() != nil {
 			return false
@@ -509,12 +508,15 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 	}
 	if hasDebt && !forced {
 		if openCodeDebtExhausted(state, now) || state.Attempts >= openCodeRunDebtMaxAttempts {
-			openCodeLastReconcileOutcome.Store("exhausted")
+			// Logged, not just recorded: "why has it not reconciled?" is the
+			// question a stale card raises, and these two are the only
+			// outcomes that answer it without a pass having run.
+			logOpenCodeUsage("exhausted attempts=%d", state.Attempts)
 			openCodeMarkPartialIfBacklogged()
 			return ""
 		}
 		if !state.passSpacingElapsed(now) {
-			openCodeLastReconcileOutcome.Store("deferred")
+			logOpenCodeUsage("deferred attempts=%d", state.Attempts)
 			openCodeScheduleRunDebtRetry(state, now, openCodeRetryFree)
 			return ""
 		}
@@ -523,9 +525,21 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 		return ""
 	}
 	if IsOffline() {
-		openCodeLastReconcileOutcome.Store(openCodeReconcileOffline)
+		logOpenCodeUsage("%s", openCodeReconcileOffline)
 		openCodeBookAfterOutcome(hasDebt, openCodeReconcileOffline, now)
 		return openCodeReconcileOffline
+	}
+
+	if !hasDebt {
+		// Charged before the pass, so a chain cannot outlive its budget by
+		// crashing between the spawn and the bookkeeping.
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			if !l.ContinuationDue {
+				return openCodeLedgerEdit{}
+			}
+			l.ContinuationPasses++
+			return openCodeLedgerEdit{Changed: true}
+		})
 	}
 
 	id := state.debtID()
@@ -554,7 +568,6 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 			}
 		}
 	})
-	openCodeLastReconcileOutcome.Store(outcome)
 	logOpenCodeUsage("%s attempts=%d exported=%d remaining=%d", outcome, booked.Attempts,
 		result.Exported, result.Remaining)
 	openCodeBookAfterOutcome(hasDebt, outcome, completedAt)
@@ -602,7 +615,14 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 		updateOpenCodeUsageLedgerContinuation(false, 0, 0)
 
 	case outcome == openCodeReconcileMore:
-		// Progress with candidates remaining: keep draining, free of charge.
+		// Progress with candidates remaining: keep draining, free of charge —
+		// up to the chain's pass budget, which is the only thing bounding a
+		// backlog that keeps making progress.
+		if readOpenCodeUsageLedger().ContinuationPasses >= openCodeContinuationMaxPasses {
+			updateOpenCodeUsageLedgerContinuation(false, 0, 0)
+			openCodeMarkPartialIfBacklogged()
+			return
+		}
 		updateOpenCodeUsageLedgerContinuation(true, 0, 0)
 		openCodeArmContinuation(openCodeRunDebtFreeRetryDelay)
 	default:
@@ -646,12 +666,19 @@ func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureA
 		if failures == 0 {
 			firstFailureAtMs = 0
 		}
+		// A chain that has ended forgets its pass budget, so the next one
+		// starts fresh.
+		passes := l.ContinuationPasses
+		if !due {
+			passes = 0
+		}
 		if l.ContinuationDue == due && l.ContinuationFailures == failures &&
-			l.ContinuationFirstFailureAtMs == firstFailureAtMs {
+			l.ContinuationFirstFailureAtMs == firstFailureAtMs && l.ContinuationPasses == passes {
 			return openCodeLedgerEdit{}
 		}
 		l.ContinuationDue, l.ContinuationFailures, l.ContinuationFirstFailureAtMs =
 			due, failures, firstFailureAtMs
+		l.ContinuationPasses = passes
 		return openCodeLedgerEdit{Changed: true}
 	})
 }

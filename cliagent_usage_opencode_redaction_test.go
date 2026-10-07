@@ -228,3 +228,48 @@ func TestOpenCodeUsage_LogLinesCarryFixedLabelsOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenCodeUsage_ARunLabelCanOnlyBeAFixedInternalString(t *testing.T) {
+	// The label is the one free-form argument an arm site passes, and it
+	// reaches a log line. A new site passing `cmd` or an argv by mistake must
+	// cost a vague label, not a leaked command line.
+	openCodeDebtFixture(t, time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local))
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+
+	for _, label := range []string{"native chat", "pipe session", "smoke",
+		"local execute", "windows execute", "PTY session"} {
+		if openCodeUsageRunLabel(label) != label {
+			t.Fatalf("the shipped arm-site label %q was rewritten", label)
+		}
+	}
+	for _, leaked := range []string{
+		`opencode run --format json`,
+		`/Users/someone/project`,
+		"implement the feature for ACME Corp",
+	} {
+		if got := openCodeUsageRunLabel(leaked); got != openCodeUsageRunLabelOther {
+			t.Fatalf("label %q survived as %q, want %q", leaked, got, openCodeUsageRunLabelOther)
+		}
+	}
+	// And the handle stores the sanitised label, so the settle's log line
+	// cannot carry the original.
+	handle := armOpenCodeUsageRun("opencode run --format json /Users/someone/project")
+	if handle == nil {
+		t.Fatal("the arm returned nil")
+	}
+	if handle.label != openCodeUsageRunLabelOther {
+		t.Fatalf("handle label = %q, want %q", handle.label, openCodeUsageRunLabelOther)
+	}
+	handle.Disarm()
+}
+
+func TestOpenCodeUsage_EveryArmSitePassesAnAllowlistedLabel(t *testing.T) {
+	// Pairs with TestOpenCodeUsage_EveryArmSiteStillArms: that one proves each
+	// site still arms, this one proves the name it arms with is in the closed
+	// set rather than silently collapsing to "other".
+	for _, kind := range openCodeRunKinds {
+		if !openCodeUsageRunLabels[kind.label] {
+			t.Fatalf("arm site label %q is not on the allowlist", kind.label)
+		}
+	}
+}

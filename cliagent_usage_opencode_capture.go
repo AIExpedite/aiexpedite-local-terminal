@@ -124,7 +124,9 @@ type openCodeLedgerDay struct {
 	Messages map[string]openCodeMessageUsage `json:"messages,omitempty"`
 	// StreamSessions holds the hashes of sessions whose stream settled COVERED,
 	// so a reconcile that cannot export one of them (over the stdout cap) knows
-	// its figures are already counted.
+	// its figures are already counted. The day it is filed under matters only
+	// for pruning — openCodeSessionStreamCaptured scans every retained day, so
+	// a run that straddled midnight is still recognised.
 	StreamSessions []string `json:"streamSessions,omitempty"`
 	// Partial marks a day whose totals are a lower bound.
 	Partial bool `json:"partial,omitempty"`
@@ -161,6 +163,12 @@ type openCodeUsageLedger struct {
 	// Both reset on any committed progress.
 	ContinuationFailures         int   `json:"continuationFailures,omitempty"`
 	ContinuationFirstFailureAtMs int64 `json:"continuationFirstFailureAtMs,omitempty"`
+	// ContinuationPasses counts the passes ONE chain has spent, successful ones
+	// included. The failure counter above cannot bound a chain that keeps
+	// making progress, and every pass spawns `opencode` on the user's machine —
+	// so a runaway backlog is capped here rather than draining three sessions
+	// at a time for hours. Reset when a chain ends.
+	ContinuationPasses int `json:"continuationPasses,omitempty"`
 
 	Skipped []openCodeSkippedSession      `json:"skipped,omitempty"`
 	Days    map[string]*openCodeLedgerDay `json:"days,omitempty"`
@@ -338,6 +346,13 @@ func openCodeLocalMidnight(now time.Time) time.Time {
 	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, local.Location())
 }
 
+// openCodeRetentionFloor is the start of the OLDEST local day the ledger keeps.
+// Nothing before it can ever be counted, so it is also the floor below which a
+// reconcile candidate is not worth exporting.
+func openCodeRetentionFloor(now time.Time) time.Time {
+	return openCodeLocalMidnight(now).AddDate(0, 0, -(openCodeLedgerMaxDays - 1))
+}
+
 // openCodeRetainedDayKeys are the day keys inside the retention window, newest
 // first.
 func openCodeRetainedDayKeys(now time.Time) []string {
@@ -382,7 +397,7 @@ func openCodePruneLedger(ledger *openCodeUsageLedger) {
 // OLDEST in-retention entry, which simply means that session is never retried —
 // the day it belongs to is already marked partial.
 func openCodePruneSkipped(ledger *openCodeUsageLedger, now time.Time) {
-	floor := openCodeLocalMidnight(now).AddDate(0, 0, -(openCodeLedgerMaxDays - 1)).UnixMilli()
+	floor := openCodeRetentionFloor(now).UnixMilli()
 	kept := make([]openCodeSkippedSession, 0, len(ledger.Skipped))
 	for _, entry := range ledger.Skipped {
 		if entry.Session == "" || entry.UpdatedMs < floor {
@@ -701,17 +716,43 @@ type openCodeRunUsage struct {
 	finished bool
 }
 
+// openCodeUsageRunLabels is the closed set of arm-site names, and the ONLY
+// strings that can reach a log line from this feature.
+//
+// The label is enforced rather than merely documented: it is the one free-form
+// argument an arm site passes, a new site could pass `cmd` or an argv by
+// mistake, and this feature's redaction contract is that nothing but fixed
+// labels and counters is ever logged. Anything unrecognised becomes
+// openCodeUsageRunLabelOther, so a mistake costs a vague log line instead of a
+// leaked command line.
+const openCodeUsageRunLabelOther = "other"
+
+var openCodeUsageRunLabels = map[string]bool{
+	"native chat": true, "pipe session": true, "smoke": true,
+	"local execute": true, "windows execute": true, "PTY session": true,
+	openCodeUsageRunLabelOther: true,
+	// Tests arm with this one.
+	"unit": true,
+}
+
+func openCodeUsageRunLabel(label string) string {
+	if openCodeUsageRunLabels[label] {
+		return label
+	}
+	return openCodeUsageRunLabelOther
+}
+
 // armOpenCodeUsageRun arms a run whose stream the caller will tap. Returns nil
 // when the refresh is disabled, so every method stays a no-op.
 //
-// label is a fixed internal string ("native chat", "smoke", …) and must never
-// carry a command line, path or prompt.
+// label must be one of openCodeUsageRunLabels — never a command line, path or
+// prompt.
 func armOpenCodeUsageRun(label string) *openCodeRunUsage {
 	if !openCodeUsageRefreshEnabled.Load() {
 		return nil
 	}
 	handle := &openCodeRunUsage{
-		label:    label,
+		label:    openCodeUsageRunLabel(label),
 		floor:    openCodeUsageNow(),
 		messages: map[string]*openCodeObservedMessage{},
 		sessions: map[string]struct{}{},
@@ -858,7 +899,7 @@ func (h *openCodeRunUsage) Finish(cleanEnd bool) bool {
 			return openCodeLedgerEdit{Changed: changed, TotalsChanged: totals}
 		})
 	}
-	return settleOpenCodeUsageRun(h.floor, covered)
+	return settleOpenCodeUsageRun(h.floor, covered, h.label)
 }
 
 // observeOpenCodeUsageFromStdout folds a CAPTURED stdout buffer into the run's

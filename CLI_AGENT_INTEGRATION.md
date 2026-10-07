@@ -2208,6 +2208,11 @@ can never create the debt they exist to pay.
 arming is a run whose tokens vanish from the card, which is exactly what the
 Antigravity Windows execute path shipped with when nothing pinned its sites.
 
+The label is the one free-form argument a site passes, and it reaches a log
+line — so it is ENFORCED, not merely documented: anything outside
+`openCodeUsageRunLabels` becomes `other`, and a site that passes `cmd` or an
+argv by mistake costs a vague log line rather than a leaked command line.
+
 ### The run-completion debt
 
 Modelled on Grok's
@@ -2230,7 +2235,17 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   continuation chain is the only timer: a failure keeps `continuationDue`, counts
   it, and books one pass off the age of the current run of consecutive failures;
   after 4 the chain stops and today is marked `partial` if candidates were still
-  queued.
+  queued. A chain that keeps making PROGRESS is bounded too
+  (`openCodeContinuationMaxPasses`): `more` always terminates, but nothing else
+  would bound how long it keeps spawning `opencode` on the user's machine.
+- **What is never exported.** A session whose `updated` falls outside the
+  ledger's RETENTION window (its `updated` is at least as new as every message
+  in it, so every figure it could carry would be dropped on the way in — a first
+  install on a machine with months of history would otherwise export the whole
+  archive to learn nothing; the cursor is stepped past them in one write), and
+  one whose `updated` we could not read (there is no way to tell whether it
+  changed, so exporting it every pass would repeat forever; the day is marked
+  `partial` instead).
 - **Cost of a pass.** 1 `session list` + at most 3 `export` calls, OLDEST changed
   session first, each export's stdout capped at 8 MiB. Passes run only on a debt
   rung, a gather nudge (2-minute cooldown) or a Refresh click — never on an idle

@@ -158,9 +158,24 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	}
 
 	ledger := readOpenCodeUsageLedger()
-	plan := planOpenCodeReconcile(ledger, sessions)
+	plan := planOpenCodeReconcile(ledger, sessions, now)
 	result := openCodeReconcileResult{Remaining: plan.remaining}
 	committed, skippedChanged := false, false
+
+	if plan.cursorFloorMs > ledger.ReconcileCursorMs || plan.undatable > 0 {
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			edit := openCodeLedgerEdit{}
+			// Step the cursor past everything older than the retention window
+			// in ONE write, so months of history cost no exports at all.
+			if plan.cursorFloorMs > l.ReconcileCursorMs {
+				l.ReconcileCursorMs, edit.Changed = plan.cursorFloorMs, true
+			}
+			if plan.undatable > 0 && openCodeMarkTodayPartial(l, openCodeUsageNow()) {
+				edit.Changed = true
+			}
+			return edit
+		})
+	}
 
 	for _, candidate := range plan.exports {
 		if ctx.Err() != nil {
@@ -261,6 +276,14 @@ type openCodeSessionRow struct {
 type openCodeReconcilePlan struct {
 	exports   []openCodeSessionRow
 	remaining int
+	// cursorFloorMs is the newest `updated` among sessions this plan will NEVER
+	// export because they fall outside the ledger's retention window. The pass
+	// advances the cursor to it so they are never considered again.
+	cursorFloorMs int64
+	// undatable counts listed sessions whose `updated` we could not read: we
+	// cannot tell whether they changed, so they are skipped and the day is a
+	// lower bound.
+	undatable int
 }
 
 // planOpenCodeReconcile picks this pass's exports: changed sessions
@@ -270,14 +293,39 @@ type openCodeReconcilePlan struct {
 //
 // While sessions beyond the cursor remain, retries take at most ONE of the
 // export slots, so the cursor always moves.
-func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessionRow) openCodeReconcilePlan {
+//
+// Two whole classes of session are never exported at all:
+//
+//   - One whose `updated` falls outside the ledger's RETENTION window. A
+//     session's `updated` is at least as new as every message in it, so every
+//     figure such an export could carry would be dropped by the day check on
+//     the way in — and the export is the expensive part (seconds of CPU, up to
+//     openCodeExportMaxStdout of stdout). Without this, a first install on a
+//     machine with months of OpenCode history would export the whole archive to
+//     learn nothing. The cursor is advanced past them instead.
+//   - One whose `updated` we could not read. There is no way to tell whether it
+//     changed, so exporting it on every pass would be an unbounded repeat; it
+//     is skipped and counted, and the caller marks the day a lower bound.
+func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessionRow, now time.Time) openCodeReconcilePlan {
 	stored := map[string]int64{}
 	for _, entry := range ledger.Skipped {
 		stored[entry.Session] = entry.UpdatedMs
 	}
+	plan := openCodeReconcilePlan{}
+	retentionFloorMs := openCodeRetentionFloor(now).UnixMilli()
 	var fresh, retries []openCodeSessionRow
 	for _, row := range sessions {
 		if row.id == "" {
+			continue
+		}
+		if row.updatedMs <= 0 {
+			plan.undatable++
+			continue
+		}
+		if row.updatedMs < retentionFloorMs {
+			if row.updatedMs > plan.cursorFloorMs {
+				plan.cursorFloorMs = row.updatedMs
+			}
 			continue
 		}
 		hash := openCodeUsageHash(row.id, "")
@@ -298,7 +346,6 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 	if len(fresh) > 0 && retrySlots > 1 {
 		retrySlots = 1
 	}
-	plan := openCodeReconcilePlan{}
 	for i := 0; i < retrySlots && len(plan.exports) < openCodeReconcileMaxExports; i++ {
 		plan.exports = append(plan.exports, retries[i])
 	}

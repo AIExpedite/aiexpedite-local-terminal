@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -193,7 +194,9 @@ func TestOpenCodeReconcile_TakesChangedSessionsOldestFirstAndStopsAtThreeExports
 }
 
 func TestOpenCodeReconcile_ReadsTheWrappedSessionListShape(t *testing.T) {
-	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	// Pinned to the fixture's own `updated`: a session older than the ledger's
+	// retention window is deliberately never exported.
+	now := time.UnixMilli(1790400009000)
 	openCodeUsageFixture(t, now)
 	(&openCodeCLIStub{
 		sessions: openCodeFixture(t, "session_list_wrapped.json"),
@@ -612,5 +615,81 @@ func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testin
 	reconcileOpenCodeUsageOnce(context.Background(), now)
 	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day != nil && day.Partial {
 		t.Fatal("a list inside the bound must not mark the day partial")
+	}
+}
+
+/* ───────────────── candidates that are not worth exporting ─────────────── */
+
+func TestOpenCodeReconcile_NeverExportsASessionOlderThanTheRetentionWindow(t *testing.T) {
+	// A session's `updated` is at least as new as every message in it, so every
+	// figure such an export could carry would be dropped by the day check on
+	// the way in — and the export is the expensive part. A first install on a
+	// machine with months of history would otherwise export the whole archive
+	// to learn nothing.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	oldest := openCodeRetentionFloor(now).Add(-30 * 24 * time.Hour).UnixMilli()
+	newestOld := openCodeRetentionFloor(now).Add(-time.Minute).UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(
+			openCodeSessionRow{"ses_ancient", oldest},
+			openCodeSessionRow{"ses_last_month", newestOld},
+			openCodeSessionRow{"ses_today", now.UnixMilli()},
+		),
+		exports: map[string]string{
+			"ses_today": exportWith("ses_today", "msg_today", now.UnixMilli(), 6, 1, "0"),
+		},
+	}).install(t)
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok", result.Outcome)
+	}
+	calls := stub.recorded()
+	if len(calls) != 2 || calls[1] != "export ses_today" {
+		t.Fatalf("calls = %v, want one list and only today's export", calls)
+	}
+	// The cursor is stepped past the archive in one write, so later passes do
+	// not reconsider it either.
+	if cursor := readOpenCodeUsageLedger().ReconcileCursorMs; cursor < newestOld {
+		t.Fatalf("cursor = %d, want it past the newest out-of-retention session (%d)", cursor, newestOld)
+	}
+	if tokens, _, rows := todayTotals(t, now); tokens != 7 || rows != 1 {
+		t.Fatalf("tokens=%d rows=%d, want only today's 7/1", tokens, rows)
+	}
+	// Nothing counted was dropped, so the day is NOT a lower bound.
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day.Partial {
+		t.Fatal("skipping an out-of-retention session must not mark the day partial")
+	}
+}
+
+func TestOpenCodeReconcile_SkipsASessionWithNoReadableTimestamp(t *testing.T) {
+	// There is no way to tell whether it changed, so exporting it on every pass
+	// would repeat forever. It is skipped and the day says so.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	stub := (&openCodeCLIStub{
+		sessions: `[{"id":"ses_undated"},{"id":"ses_today","time":{"updated":` +
+			strconv.FormatInt(now.UnixMilli(), 10) + `}}]`,
+		exports: map[string]string{
+			"ses_today": exportWith("ses_today", "msg_today", now.UnixMilli(), 4, 1, "0"),
+		},
+	}).install(t)
+
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	for _, call := range stub.recorded() {
+		if call == "export ses_undated" {
+			t.Fatal("a session with no readable timestamp must not be exported")
+		}
+	}
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+		t.Fatalf("day = %+v, want the lower-bound notice", day)
+	}
+
+	// And a second pass does not export it either — the repeat is what the skip
+	// exists to prevent.
+	before := stub.exportCount()
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	if stub.exportCount() != before {
+		t.Fatalf("a second pass ran %d more exports, want none", stub.exportCount()-before)
 	}
 }

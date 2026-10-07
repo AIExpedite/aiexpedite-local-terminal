@@ -627,3 +627,50 @@ func TestOpenCodeDiscovery_BoundsWhatOneDirectoryContributes(t *testing.T) {
 		t.Fatalf("a missing directory read as %v, want nil", got)
 	}
 }
+
+func TestOpenCodeContinuation_BoundsOneChainsTotalPasses(t *testing.T) {
+	// `more` requires progress, so a chain always terminates — but nothing else
+	// bounds how long it spawns `opencode` for, and a large backlog would drain
+	// three sessions at a time for hours.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	created := now.UnixMilli()
+	exports := map[string]string{}
+	rows := make([]openCodeSessionRow, 0, 4*openCodeContinuationMaxPasses)
+	for i := 0; i < 4*openCodeContinuationMaxPasses; i++ {
+		id := fmt.Sprintf("ses_%04d", i)
+		rows = append(rows, openCodeSessionRow{id, created + int64(i+1)})
+		exports[id] = exportWith(id, fmt.Sprintf("msg_%04d", i), created, 1, 0, "0")
+	}
+	stub := (&openCodeCLIStub{sessions: sessionList(rows...), exports: exports}).install(t)
+
+	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	for i := 0; i < openCodeContinuationMaxPasses+5; i++ {
+		if !readOpenCodeUsageLedger().ContinuationDue {
+			break
+		}
+		openCodePayReconcile(context.Background(), false)
+	}
+
+	ledger := readOpenCodeUsageLedger()
+	if ledger.ContinuationDue {
+		t.Fatalf("the chain is still booked after %d passes", openCodeContinuationMaxPasses)
+	}
+	if ledger.ContinuationPasses != 0 {
+		t.Fatalf("continuationPasses = %d, want a chain that ended to forget its budget", ledger.ContinuationPasses)
+	}
+	// Bounded spawns: at most the budget's worth of exports.
+	if got := stub.exportCount(); got > openCodeContinuationMaxPasses*openCodeReconcileMaxExports {
+		t.Fatalf("exports = %d, want at most %d", got,
+			openCodeContinuationMaxPasses*openCodeReconcileMaxExports)
+	}
+	// And it stopped with work queued, so the day is a lower bound.
+	if day := ledger.Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+		t.Fatalf("day = %+v, want the lower-bound notice", day)
+	}
+	// A fresh chain starts with a fresh budget.
+	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	if readOpenCodeUsageLedger().ContinuationPasses != 0 {
+		t.Fatal("a new chain must start at zero passes")
+	}
+}
