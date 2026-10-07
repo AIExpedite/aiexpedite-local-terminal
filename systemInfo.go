@@ -244,6 +244,12 @@ type MachineInfo struct {
 	// sequence still tells them apart (storeMachineInfoIfNotOlder). 0 = not
 	// from a gather (fixtures). Not serialized.
 	gatherSeq uint64
+
+	// cliUsageFromCache marks CliAgents as cliAgentUsageFallback's snapshot of
+	// the cache (the usage pass missed its budget), so the store re-reads the
+	// usage the cache holds THEN rather than rolling back a usage refresh that
+	// landed in between (storeMachineInfoIfNotOlder). Not serialized.
+	cliUsageFromCache bool
 }
 
 // machineInfoGatherSeq is the last sequence handed to a gather.
@@ -405,10 +411,43 @@ func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 		machineInfoMu.Unlock()
 		return false
 	}
+	if info.cliUsageFromCache && machineInfoCache != nil {
+		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents)
+		info.cliUsageFromCache = false
+	}
 	machineInfoCache = info
 	machineInfoMu.Unlock()
 	machineInfoStored(info)
 	return true
+}
+
+// withCurrentCLIUsage refreshes a cliAgentUsageFallback snapshot from the
+// usage the cache holds now: a CLI the cache has an entry for takes that entry
+// (a usage refresh may have landed since the snapshot), keeping the version
+// and path the gather detected; any other entry stays as it was.
+func withCurrentCLIUsage(snapshot, current []cliAgentUsage) []cliAgentUsage {
+	byID := make(map[string]cliAgentUsage, len(current))
+	for _, u := range current {
+		if u.CliAgentID != "" {
+			byID[u.CliAgentID] = u
+		}
+	}
+	out := make([]cliAgentUsage, 0, len(snapshot))
+	for _, u := range snapshot {
+		cur, ok := byID[u.CliAgentID]
+		if !ok {
+			out = append(out, u)
+			continue
+		}
+		if u.Version != "" {
+			cur.Version = u.Version
+		}
+		if u.Path != "" {
+			cur.Path = u.Path
+		}
+		out = append(out, cur)
+	}
+	return out
 }
 
 // drainMachineInfoGathers waits until no background gather is running, or
@@ -647,7 +686,7 @@ func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 	// signal we'd actually act on).
 	info.Live = gatherLiveLoad()
 
-	info.CliAgents = awaitCLIAgentUsage(usageCh, usageStarted, usageBudget, info.DetectedCliAgents, usageNow)
+	info.CliAgents, info.cliUsageFromCache = awaitCLIAgentUsage(usageCh, usageStarted, usageBudget, info.DetectedCliAgents, usageNow)
 
 	// Join the parallel setup probes (normally long finished by now), then
 	// record the gather's own tools before folding in the last setupToolCatalog
@@ -668,16 +707,17 @@ func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 // waits for it. With one, a pass still running at usageStarted+budget is left
 // to finish on its own (still counted in machineInfoGathersInFlight; its
 // result is dropped, since the usage refresh paths keep usage current) and
-// the gather reports the last known usage instead (cliAgentUsageFallback).
-func awaitCLIAgentUsage(usageCh <-chan []cliAgentUsage, usageStarted time.Time, budget time.Duration, detected map[string]detectedCLIAgent, now time.Time) []cliAgentUsage {
+// the gather reports the last known usage instead (cliAgentUsageFallback),
+// and fromCache says so.
+func awaitCLIAgentUsage(usageCh <-chan []cliAgentUsage, usageStarted time.Time, budget time.Duration, detected map[string]detectedCLIAgent, now time.Time) (usage []cliAgentUsage, fromCache bool) {
 	if budget <= 0 {
-		return <-usageCh
+		return <-usageCh, false
 	}
 	remaining := budget - time.Since(usageStarted)
 	if remaining <= 0 {
 		select {
 		case usage := <-usageCh:
-			return usage
+			return usage, false
 		default:
 		}
 	} else {
@@ -685,12 +725,12 @@ func awaitCLIAgentUsage(usageCh <-chan []cliAgentUsage, usageStarted time.Time, 
 		defer timer.Stop()
 		select {
 		case usage := <-usageCh:
-			return usage
+			return usage, false
 		case <-timer.C:
 		}
 	}
 	envInspectLogf(colorYellow, "CLI usage pass still running after %s; reporting the last known usage per CLI", budget)
-	return cliAgentUsageFallback(detected, GetMachineInfo(), now)
+	return cliAgentUsageFallback(detected, GetMachineInfo(), now), true
 }
 
 // cliAgentUsageFallback is the CliAgents slice for a gather whose usage pass

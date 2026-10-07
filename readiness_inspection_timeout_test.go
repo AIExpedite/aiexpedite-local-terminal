@@ -222,7 +222,10 @@ func TestAwaitCLIAgentUsage_BudgetFallsBackToCachedUsage(t *testing.T) {
 	}
 	never := make(chan []cliAgentUsage) // a usage pass that never finishes in time
 	started := time.Now()
-	got := awaitCLIAgentUsage(never, started, 20*time.Millisecond, detected, time.Now())
+	got, fromCache := awaitCLIAgentUsage(never, started, 20*time.Millisecond, detected, time.Now())
+	if !fromCache {
+		t.Fatal("a pass that missed its budget must report the cached fallback")
+	}
 	if waited := time.Since(started); waited > 2*time.Second {
 		t.Fatalf("the budget was not honoured: waited %s", waited)
 	}
@@ -244,8 +247,47 @@ func TestAwaitCLIAgentUsage_BudgetFallsBackToCachedUsage(t *testing.T) {
 	ch := make(chan []cliAgentUsage, 1)
 	want := []cliAgentUsage{{CliAgentID: "codex", Provider: "codex", Account: "fresh"}}
 	ch <- want
-	if got := awaitCLIAgentUsage(ch, time.Now(), 0, detected, time.Now()); len(got) != 1 || got[0].Account != "fresh" {
-		t.Fatalf("an unbounded wait must return the pass's own result, got %+v", got)
+	if got, fromCache := awaitCLIAgentUsage(ch, time.Now(), 0, detected, time.Now()); fromCache || len(got) != 1 || got[0].Account != "fresh" {
+		t.Fatalf("an unbounded wait must return the pass's own result, got %+v (fromCache=%v)", got, fromCache)
+	}
+}
+
+func TestStoreMachineInfoIfNotOlder_FallbackUsageKeepsARefreshThatLandedSince(t *testing.T) {
+	isolateMachineInfo(t)
+	old := sequencedMachine(time.Now())
+	old.CliAgents = []cliAgentUsage{{CliAgentID: "codex", Provider: "codex", Version: "0.1.0", Account: "stale"}}
+	cacheMachineInfo(old)
+
+	// An inspection's usage pass missed its budget: it snapshots the cache.
+	inspected := sequencedMachine(time.Now())
+	inspected.CliAgents = []cliAgentUsage{
+		{CliAgentID: "codex", Provider: "codex", Version: "0.2.0", Path: "/bin/codex", Account: "stale"},
+		{CliAgentID: "claudeCode", Provider: "claude", Version: "2.0.0"},
+	}
+	inspected.cliUsageFromCache = true
+
+	// A usage refresh lands before the inspection stores.
+	SetCachedCLIAgents([]cliAgentUsage{{CliAgentID: "codex", Provider: "codex", Version: "0.1.0", Account: "fresh"}})
+
+	if !storeMachineInfoIfNotOlder(inspected) {
+		t.Fatal("the newer gather must be stored")
+	}
+	byID := map[string]cliAgentUsage{}
+	for _, u := range cachedMachineInfo().CliAgents {
+		byID[u.CliAgentID] = u
+	}
+	if u := byID["codex"]; u.Account != "fresh" || u.Version != "0.2.0" || u.Path != "/bin/codex" {
+		t.Fatalf("the refresh must survive the store, with the detected version/path: %+v", u)
+	}
+	if u := byID["claudeCode"]; u.Version != "2.0.0" {
+		t.Fatalf("an entry the cache has no usage for stays as gathered: %+v", u)
+	}
+
+	// A gather whose own usage pass finished is stored as gathered.
+	own := sequencedMachine(time.Now())
+	own.CliAgents = []cliAgentUsage{{CliAgentID: "codex", Provider: "codex", Account: "own"}}
+	if !storeMachineInfoIfNotOlder(own) || cachedMachineInfo().CliAgents[0].Account != "own" {
+		t.Fatalf("a full usage pass replaces the cached usage: %+v", cachedMachineInfo().CliAgents)
 	}
 }
 
