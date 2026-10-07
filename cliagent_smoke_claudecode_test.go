@@ -1464,3 +1464,26 @@ func TestClaudeUsageProbeWaitCovered_AnotherRunsAttemptIsNotARefusal(t *testing.
 		t.Fatal("waitCovered did not wake when its own attempt finished")
 	}
 }
+
+// Two runs finishing in the same millisecond are distinct attempts: the other
+// one returning early does not end the smoke's wait.
+func TestClaudeUsageProbeWaitCovered_ASameMillisecondRunIsNotARefusal(t *testing.T) {
+	smokeEnv(t)
+	smokeUsageEndpoint(t, -1)
+	baseline := time.Now().Truncate(time.Millisecond).Add(100 * time.Microsecond)
+	other := baseline.Add(500 * time.Microsecond)
+	if other.UnixMilli() != baseline.UnixMilli() {
+		t.Fatal("fixture: the two baselines must share a millisecond")
+	}
+	claudeUsageProbe.markImmediateDone(other)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if got := claudeUsageProbe.waitCovered(ctx, baseline); got != claudeSmokeWaitTimeout {
+		t.Fatalf("waitCovered = %v after a same-millisecond run finished, want timeout (still waiting on its own attempt)", got)
+	}
+	claudeUsageProbe.markImmediateDone(baseline)
+	if got := claudeUsageProbe.waitCovered(context.Background(), baseline); got != claudeSmokeWaitRefused {
+		t.Fatalf("waitCovered = %v once its own attempt finished uncovered, want refused", got)
+	}
+}

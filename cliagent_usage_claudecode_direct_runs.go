@@ -59,8 +59,12 @@ var claudeUsageWatchState struct {
 	primed                bool
 	ownMod, ownSize       int64
 	pinnedMod, pinnedSize int64
-	lastScanAt            time.Time
-	lastEvidenceMs        int64
+	// stampRetries counts ticks that re-attempt a refused stamp (an empty
+	// fingerprint from a transient credential-read failure, or busy cache
+	// locks) for files whose stamps did not move since.
+	stampRetries   int
+	lastScanAt     time.Time
+	lastEvidenceMs int64
 }
 
 // claudeUsageWatchTick is the watcher's per-tick Claude work (see the header).
@@ -86,7 +90,11 @@ func claudeWatchStampCheck() {
 	}
 	s := &claudeUsageWatchState
 	s.mu.Lock()
-	changed := !s.primed || ownMod != s.ownMod || ownSize != s.ownSize || pinnedMod != s.pinnedMod || pinnedSize != s.pinnedSize
+	moved := !s.primed || ownMod != s.ownMod || ownSize != s.ownSize || pinnedMod != s.pinnedMod || pinnedSize != s.pinnedSize
+	if moved {
+		s.stampRetries = 0
+	}
+	changed := moved || s.stampRetries > 0
 	s.primed = true
 	s.ownMod, s.ownSize, s.pinnedMod, s.pinnedSize = ownMod, ownSize, pinnedMod, pinnedSize
 	s.mu.Unlock()
@@ -99,10 +107,28 @@ func claudeWatchStampCheck() {
 	// moved off (claudeStampWatchedGeneration).
 	scopeBefore := claudeRateLimitCacheScope()
 	fingerprint := currentClaudeAccountFingerprint()
-	if generation, bumped := claudeStampWatchedGeneration(fingerprint, scopeBefore); bumped {
+	generation, bumped, refused := claudeStampWatchedGeneration(fingerprint, scopeBefore)
+	// A refused stamp stays pending: the file stamps above already describe
+	// this write, so an unchanged file would otherwise never be looked at
+	// again. A write racing the attempt moves the stamps, which resets the
+	// count and is retried as a change anyway. Bounded, so a refusal that
+	// persists (a cache another account owns) stops paying a credential read
+	// every tick.
+	s.mu.Lock()
+	if refused && s.stampRetries < claudeWatchStampMaxRetries {
+		s.stampRetries++
+	} else {
+		s.stampRetries = 0
+	}
+	s.mu.Unlock()
+	if bumped {
 		noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)
 	}
 }
+
+// claudeWatchStampMaxRetries bounds how many later ticks re-attempt a refused
+// watcher stamp for cache files that have not moved since.
+const claudeWatchStampMaxRetries = 5
 
 // claudeDirectRunScanDue reports whether the transcript scan is due, and marks
 // it as run. A skipped scan (offline, draining, unarmed) never reaches here, so

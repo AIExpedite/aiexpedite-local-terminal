@@ -150,7 +150,7 @@ func TestClaudeGeneration_TheWatcherStampsAPinnedReadingAfterAnAccountTransition
 	claudeReading(t, pinned, fp, now, map[string]time.Time{claudeWindowFiveHour: now})
 	cliUsagePropagatorRunning.Store(true)
 
-	if _, bumped := claudeStampWatchedGeneration(fp, "some-third-account"); bumped {
+	if _, bumped, _ := claudeStampWatchedGeneration(fp, "some-third-account"); bumped {
 		t.Fatal("a stamp moved a cache off a scope it never sampled")
 	}
 	if snap := claudeCacheSnapshot(t, cache); snap.AccountFingerprint != "previous-account" {
@@ -172,6 +172,74 @@ func TestClaudeGeneration_TheWatcherStampsAPinnedReadingAfterAnAccountTransition
 	}
 	if !found {
 		t.Fatalf("the pinned reading's generation %d was not hinted: %+v", snap.Generation, rec.all())
+	}
+}
+
+// A stamp refused because the credential read transiently failed (an empty
+// fingerprint against a scoped cache) stays pending: a later tick retries it
+// although neither cache file moved. The retries are bounded, so a refusal
+// that persists stops costing a credential read every tick.
+func TestClaudeGeneration_TheWatcherRetriesAStampRefusedByACredentialReadFailure(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9109)
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	pinned := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/tmp/prev.json'" +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	now := time.Now()
+	claudeReading(t, cache, "previous-account", now.Add(-time.Hour), map[string]time.Time{claudeWindowFiveHour: now.Add(-time.Hour)})
+	before := claudeGenerationOf(t, cache)
+
+	writeClaudeAccountCredential(t, configDir, "ada@example.com")
+	fp := currentClaudeAccountFingerprint()
+	if fp == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	cliUsagePropagatorRunning.Store(false) // the hook's process does not stamp
+	claudeReading(t, pinned, fp, now, map[string]time.Time{claudeWindowFiveHour: now})
+	cliUsagePropagatorRunning.Store(true)
+
+	credential := filepath.Join(configDir, ".credentials.json")
+	if err := os.Remove(credential); err != nil {
+		t.Fatal(err)
+	}
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+	claudeWatchStampCheck()
+	if snap := claudeCacheSnapshot(t, cache); snap.AccountFingerprint != "previous-account" || snap.Generation != before.Counter {
+		t.Fatalf("a stamp under an empty fingerprint wrote: scope=%q generation=%d", snap.AccountFingerprint, snap.Generation)
+	}
+
+	writeClaudeAccountCredential(t, configDir, "ada@example.com")
+	claudeWatchStampCheck() // neither file moved since the refused tick
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != fp || snap.Generation <= before.Counter {
+		t.Fatalf("the refused stamp was not retried: scope=%q generation=%d, want %q above %d",
+			snap.AccountFingerprint, snap.Generation, fp, before.Counter)
+	}
+
+	// Bounded: once the retries are spent on a refusal that persists, an
+	// unchanged file is left alone until it moves again.
+	resetClaudeUsageWatchState()
+	if err := os.Remove(credential); err != nil {
+		t.Fatal(err)
+	}
+	cliUsagePropagatorRunning.Store(false)
+	claudeReading(t, cache, "previous-account", now.Add(-time.Hour), map[string]time.Time{claudeWindowFiveHour: now.Add(-time.Hour)})
+	cliUsagePropagatorRunning.Store(true)
+	for range claudeWatchStampMaxRetries + 1 {
+		claudeWatchStampCheck()
+	}
+	claudeUsageWatchState.mu.Lock()
+	retries := claudeUsageWatchState.stampRetries
+	claudeUsageWatchState.mu.Unlock()
+	if retries != 0 {
+		t.Fatalf("stampRetries = %d after %d refused ticks, want the retries spent", retries, claudeWatchStampMaxRetries+1)
 	}
 }
 

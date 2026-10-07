@@ -1227,10 +1227,11 @@ func claudeStampObservedGeneration(fingerprint string) (cliUsageGeneration, bool
 // off). It may therefore move our cache off `scopeBefore` — sampled BEFORE the
 // credential read, the same guard claudeOweRunRefresh uses — and only when a
 // displayed row for `fingerprint` advanced, so the reset is never written for
-// nothing. A cache that moved to any third scope in between is refused.
-func claudeStampWatchedGeneration(fingerprint, scopeBefore string) (cliUsageGeneration, bool) {
-	generation, bumped, _ := claudeStampGeneration(fingerprint, []string{scopeBefore}, false)
-	return generation, bumped
+// nothing. A cache that moved to any third scope in between is refused, and so
+// is an empty fingerprint against a scoped cache; refused lets the watcher
+// retry instead of treating the write as handled.
+func claudeStampWatchedGeneration(fingerprint, scopeBefore string) (generation cliUsageGeneration, bumped, refused bool) {
+	return claudeStampGeneration(fingerprint, []string{scopeBefore}, false)
 }
 
 // claudeStampGeneration is the stamp, and with rotate also the startup

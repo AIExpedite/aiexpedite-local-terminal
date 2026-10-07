@@ -489,15 +489,17 @@ type claudeUsageProbeGate struct {
 	lastRefreshAt          time.Time
 	lastRefreshFingerprint string
 	lastRefreshShared      bool
-	// immediateDoneMs holds the run baselines (epoch ms) whose immediate attempt
+	// immediateDone holds the run baselines whose immediate attempt
 	// (claudeUsageProbePayRecordedRun) has finished, newest last, capped at
 	// claudeImmediateDoneKeep. Tracked per baseline, not as a high-water mark: a
 	// newer run's attempt finishing says nothing about one still in flight for
-	// an older baseline. coverWaitCh is closed (and replaced) whenever that, a
-	// settle, or a settling attempt ending may have changed what waitCovered is
-	// waiting for.
-	immediateDoneMs []int64
-	coverWaitCh     chan struct{}
+	// an older baseline. The full time.Time is kept, not the persisted epoch ms:
+	// two runs finishing in the same millisecond are distinct attempts, and one
+	// returning early must not end the other's wait. coverWaitCh is closed (and
+	// replaced) whenever that, a settle, or a settling attempt ending may have
+	// changed what waitCovered is waiting for.
+	immediateDone []time.Time
+	coverWaitCh   chan struct{}
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -696,7 +698,7 @@ func resetClaudeUsageProbeGate() {
 	// reference here only stops it from marking the NEXT generation as seeded.
 	claudeUsageProbe.seedingCh = nil
 	claudeUsageProbe.settling = 0
-	claudeUsageProbe.immediateDoneMs = nil
+	claudeUsageProbe.immediateDone = nil
 	claudeUsageProbe.signalCoverWaitersLocked()
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
@@ -3071,9 +3073,9 @@ func (g *claudeUsageProbeGate) signalCoverWaitersLocked() {
 // `baseline` has finished, whatever it returned.
 func (g *claudeUsageProbeGate) markImmediateDone(baseline time.Time) {
 	g.mu.Lock()
-	g.immediateDoneMs = append(g.immediateDoneMs, baseline.UnixMilli())
-	if over := len(g.immediateDoneMs) - claudeImmediateDoneKeep; over > 0 {
-		g.immediateDoneMs = append(g.immediateDoneMs[:0], g.immediateDoneMs[over:]...)
+	g.immediateDone = append(g.immediateDone, baseline)
+	if over := len(g.immediateDone) - claudeImmediateDoneKeep; over > 0 {
+		g.immediateDone = append(g.immediateDone[:0], g.immediateDone[over:]...)
 	}
 	g.signalCoverWaitersLocked()
 	g.mu.Unlock()
@@ -3088,7 +3090,7 @@ const claudeImmediateDoneKeep = 16
 // immediateDoneLocked reports whether the immediate attempt for exactly this
 // baseline has finished. Callers hold g.mu.
 func (g *claudeUsageProbeGate) immediateDoneLocked(baseline time.Time) bool {
-	return slices.Contains(g.immediateDoneMs, baseline.UnixMilli())
+	return slices.ContainsFunc(g.immediateDone, baseline.Equal)
 }
 
 // waitCovered waits, at most until ctx ends, for a reading covering a run that
