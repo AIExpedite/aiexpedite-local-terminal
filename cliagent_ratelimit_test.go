@@ -1430,7 +1430,7 @@ func TestMergeClaudeRateLimitCache_StillWritesWhenTheLockFileCannotBeOpened(t *t
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	// A DIRECTORY where the sibling .lock file belongs: os.OpenFile can neither
 	// create nor open it for writing on any OS, which is exactly the
-	// claudeRateLimitLockUnavailable fact.
+	// crossProcessLockUnavailable fact.
 	if err := os.MkdirAll(cache+".lock", 0o755); err != nil {
 		t.Fatal(err)
 	}

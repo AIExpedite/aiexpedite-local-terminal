@@ -312,6 +312,10 @@ type openCodeLaunch struct {
 	// openCodeMaintenanceEnvPins to it. Ordinary runs never set it: pinning
 	// self-update off for them would change the user's update behaviour.
 	Maintenance bool
+	// Usage, when set, receives the step-finish usage of the smoke's stdout
+	// past its retention cap (see openCodeSmokeStdout). Only the smoke seam
+	// reads it; every other launch streams its usage itself.
+	Usage *openCodeUsageRun
 }
 
 // openCodeMaintenanceEnvPins are the env values every maintenance smoke child

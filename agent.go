@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.6"
+var Version = "v1.1.7"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -198,6 +198,12 @@ func StartAgent(cfg *Config) {
 	// isOffline is published above, so the attempt honours offline mode.
 	SetGrokUsageRefreshEnabled(true)
 	payOwedGrokUsageRefresh()
+	// And for OpenCode: a turn whose stream reported no usage — or that a
+	// restart or self-update cut off after it named its session — left a debt
+	// in opencode_usage.json; re-arm its bounded export ladder
+	// (cliagent_usage_opencode_freshness.go). After isOffline is published
+	// above, so the attempts honour offline mode.
+	payOwedOpenCodeUsage()
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

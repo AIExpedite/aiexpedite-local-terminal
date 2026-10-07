@@ -996,3 +996,159 @@ func TestPruneOpenCodeSmokeScratch_NeverFollowsASymlink(t *testing.T) {
 		t.Errorf("the link itself was removed; a reparse point must be left alone: %v", err)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Usage capture
+   -------------------------------------------------------------------------- */
+
+// A smoke turn's step_finish frames are folded into the usage ledger before the
+// stdout is discarded (cliagent_usage_opencode_freshness.go): a success with
+// tokens commits a bucket and advances the generation, a success with none
+// owes an export written before the smoke returns, and a failure with no
+// completed step owes nothing — while a failed turn's completed steps still
+// count, because those tokens were spent.
+func TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration(t *testing.T) {
+	openCodeSmokeEnv(t)
+	openCodeUsageFixture(t, 1401)
+	path := stubOpenCodeBinary(t)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+		frames := string(openCodeSuccessFrames(openCodeMarkerFromLaunch(t, launch)))
+		return []byte(frames + openCodeStepFinish("ses_probe", "prt_s", 80, 8, 0, "0", time.Now().UnixMilli()) + "\n"), nil, nil
+	})
+	if result := runOpenCodeSmoke(context.Background(), path, "1.2.0"); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v", result)
+	}
+	// The smoke banks under the account the readiness CACHE names, which its own
+	// isolated pre-check never populates: the pending fingerprint, which the first
+	// gather adopts for the account the card publishes.
+	b, ok, g := openCodeUsageBucketForDay("", time.Now())
+	if !ok || b.tokens() != 88 || g != (cliUsageGeneration{Epoch: 1401, Counter: 1}) {
+		t.Fatalf("pending bucket = %+v generation = %+v, want 88 tokens at {1401,1}", b, g)
+	}
+	usage, _ := openCodeUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Path: path}, time.Now())
+	fp := openCodeAccountFingerprintFor([]string{"anthropic"})
+	if usage.AccountFingerprint != fp {
+		t.Fatalf("card account fingerprint = %q, want %q", usage.AccountFingerprint, fp)
+	}
+	if adopted, ok, _ := openCodeUsageBucketForDay(fp, time.Now()); !ok || adopted.tokens() != 88 {
+		t.Fatalf("adopted bucket = %+v, want the smoke's 88 tokens under the card's account", adopted)
+	}
+	if left, ok, _ := openCodeUsageBucketForDay("", time.Now()); ok {
+		t.Fatalf("pending bucket survived adoption: %+v", left)
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v after a captured smoke", debts)
+	}
+}
+
+func TestRunOpenCodeSmoke_CapturesUsageOrOwesIt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stdout    func(marker string) string
+		fail      bool
+		wantDebt  bool
+		wantToken int64
+	}{
+		{"success with no usage frames owes", func(m string) string { return string(openCodeSuccessFrames(m)) }, false, true, 0},
+		{"failure with no step owes nothing", func(string) string { return `{"type":"session.started","sessionID":"ses_probe"}` + "\n" }, true, false, 0},
+		{"failure with a completed step still commits", func(string) string {
+			return openCodeStepFinish("ses_probe", "prt_f", 50, 5, 0, "0", time.Now().UnixMilli()) + "\n"
+		}, true, false, 55},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeSmokeEnv(t)
+			openCodeUsageFixture(t, 1006)
+			path := stubOpenCodeBinary(t)
+			stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+			stubOpenCodeSmokeExec(t, func(_ context.Context, launch openCodeLaunch) ([]byte, []byte, error) {
+				out := tc.stdout(openCodeMarkerFromLaunch(t, launch))
+				if tc.fail {
+					return []byte(out), []byte("boom"), openCodeExitError(t)
+				}
+				return []byte(out), nil, nil
+			})
+			result := runOpenCodeSmoke(context.Background(), path, "1.2.0")
+			if (result.Status == cliSmokeStatusSuccess) == tc.fail {
+				t.Fatalf("smoke status = %s", result.Status)
+			}
+			debts := loadOpenCodeUsageLedger().Debts
+			if tc.wantDebt != (len(debts) == 1 && debts[0].owed()) {
+				t.Fatalf("debts = %+v, want owed=%v", debts, tc.wantDebt)
+			}
+			if !tc.wantDebt && len(debts) != 0 {
+				t.Fatalf("debts = %+v, want none", debts)
+			}
+			// Banked under the pending fingerprint until a gather adopts it; see
+			// TestRunOpenCodeSmoke_CommitsUsageAndAdvancesTheGeneration.
+			b, _, _ := openCodeUsageBucketForDay("", time.Now())
+			if b.tokens() != tc.wantToken {
+				t.Fatalf("tokens = %d, want %d", b.tokens(), tc.wantToken)
+			}
+		})
+	}
+}
+
+// A smoke whose stdout passes the retention cap still counts every step: the
+// one before the cap from the retained bytes, and the one straddling it, the
+// final model step after it, and an unterminated last frame as the pipe
+// drains. Each is counted exactly once.
+func TestOpenCodeSmokeStdout_UsagePastTheRetentionCapIsCounted(t *testing.T) {
+	openCodeUsageFixture(t, 1305)
+	now := time.Now().UnixMilli()
+	first := openCodeStepFinish("ses_smoke_cap", "prt_tool", 100, 0, 0, "0", now)
+	straddling := openCodeStepFinish("ses_smoke_cap", "prt_cross", 7, 0, 0, "0", now)
+	var out strings.Builder
+	out.WriteString(first + "\n")
+	out.WriteString(strings.Repeat("x", cliSmokeMaxStdout-len(first)-1-len(straddling)/2-1) + "\n")
+	out.WriteString(straddling + "\n")
+	out.WriteString(strings.Repeat("y", openCodeNativeMaxFrameBytes+1) + "\n")
+	out.WriteString(openCodeStepFinish("ses_smoke_cap", "prt_final", 20, 0, 0, "0", now) + "\n")
+	out.WriteString(openCodeStepFinish("ses_smoke_cap", "prt_last", 3, 0, 0, "0", now))
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-smoke-cap")
+	w := &openCodeSmokeStdout{boundedBuffer: boundedBuffer{limit: cliSmokeMaxStdout}, usage: run}
+	stream := out.String()
+	for len(stream) > 0 {
+		k := min(4093, len(stream))
+		if n, err := w.Write([]byte(stream[:k])); n != k || err != nil {
+			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, k)
+		}
+		stream = stream[k:]
+	}
+	w.finish()
+	if got := len(w.Bytes()); got != cliSmokeMaxStdout {
+		t.Fatalf("retained %d bytes, want the %d-byte cap", got, cliSmokeMaxStdout)
+	}
+	captureOpenCodeUsageStream(openCodeSmokeRetainedLines(w.Bytes()), run)
+
+	steps, _ := run.snapshot()
+	var input int64
+	for _, s := range steps {
+		input += s.Input
+	}
+	if len(steps) != 4 || input != 130 {
+		t.Fatalf("captured %d steps with %d input tokens, want all 4 (130)", len(steps), input)
+	}
+}
+
+// Under the cap the retained bytes are the whole stream, and the writer reads
+// nothing itself.
+func TestOpenCodeSmokeStdout_UnderTheCapLeavesUsageToTheRetainedBytes(t *testing.T) {
+	openCodeUsageFixture(t, 1306)
+	line := openCodeStepFinish("ses_smoke_small", "prt_stop", 9, 0, 0, "0", time.Now().UnixMilli())
+	run := armOpenCodeUsageRun("opencode", "", "fp-smoke-small")
+	w := &openCodeSmokeStdout{boundedBuffer: boundedBuffer{limit: cliSmokeMaxStdout}, usage: run}
+	_, _ = w.Write([]byte(line))
+	w.finish()
+	if steps, _ := run.snapshot(); len(steps) != 0 {
+		t.Fatalf("the writer captured %d steps under the cap", len(steps))
+	}
+	if got := string(openCodeSmokeRetainedLines(w.Bytes())); got != line {
+		t.Fatal("the retained lines dropped the unterminated frame under the cap")
+	}
+	captureOpenCodeUsageStream(openCodeSmokeRetainedLines(w.Bytes()), run)
+	if steps, _ := run.snapshot(); len(steps) != 1 {
+		t.Fatalf("captured %d steps, want 1", len(steps))
+	}
+}

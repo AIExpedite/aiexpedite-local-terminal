@@ -11,32 +11,42 @@
 //	reading the backend never asks for — the card keeps a stale observation, or
 //	none, until the six-hourly machine-info gather.
 //
-// When the Codex cache commits an ADVANCED observation for the active account
-// (mergeCodexRateLimitCacheObserved), the propagator sends one signed hint,
+// When a provider's capture commits an ADVANCED observation — the Codex cache
+// for the active account (mergeCodexRateLimitCacheObserved), or OpenCode's
+// usage ledger (cliagent_usage_opencode_capture.go) — the propagator sends one
+// signed hint,
 // `POST /device/:agentId/cli-usage/observed`, naming the committed capture
 // generation. terminal-service answers it with one ordinary refresh — at most
 // one per agent per 4 minutes, none when it already applied that generation,
 // and without moving an Idle device to Active. The hint carries no metric
 // values: numbers travel only inside the signed refresh receipt.
 //
+// The providers that send hints mirror terminal-service's
+// CLI_USAGE_HINT_PROVIDERS (src/config/terminal.config.js) by hand — the device
+// cannot import it: codexUsageProvider and openCodeUsageProvider. A hint from
+// any other provider is accepted and ignored there.
+//
 // Device-side bounds:
 //   - a 15 s trailing debounce collapses bursts;
-//   - hints are at least 5 minutes apart; one throttled by that spacing is
-//     deferred (one pending at most, carrying the newest generation), never
-//     dropped;
+//   - hints are at least 5 minutes apart, DEVICE-wide: every hint earns the
+//     same all-provider refresh. One throttled by that spacing is deferred
+//     (one pending per provider, carrying its newest generation), never
+//     dropped; when several are due, the oldest observation goes first;
 //   - after a hint is sent the observation stays pending for exactly ONE
 //     follow-up at the next spacing boundary (the backend makes it a no-op once
 //     the generation is applied), then it is dropped — at most two hints per
-//     observation;
+//     observation, per provider;
 //   - nothing is sent while offline, draining, shutting down, unregistered or
-//     before this process's generation epoch is on disk; the observation is
-//     kept and re-checked at the next boundary.
+//     before this process's generation epoch is on disk for that provider; the
+//     observation is kept and re-checked at the next boundary.
 //
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its epoch rotation commits
 // (codexRotateGenerationEpoch), a cache that still renders a numeric Codex
 // metric — or holds a committed clear (no contributors, a generation) — is
-// scheduled as a pending observation through the same gates.
+// scheduled as a pending observation through the same gates. An OpenCode
+// ledger with numbers for today is rotated and scheduled the same way
+// (openCodeRecoveryGeneration).
 //
 // Logs are fixed labels only (`[cli-usage] usage hint: <label>`) — never a
 // path, account, fingerprint, id or response body.
@@ -113,12 +123,9 @@ type cliUsagePropagatorState struct {
 	// timerGen invalidates a callback whose timer was replaced after it fired.
 	timerGen uint64
 
-	pendingProvider string
-	pending         *cliUsageGeneration
-	// followUp: the pending observation's first hint went out; the next send is
-	// its one follow-up.
-	followUp   bool
-	lastNoteAt time.Time
+	// pending holds at most one observation per provider, so one provider's
+	// observation never overwrites another's.
+	pending    map[string]*pendingCLIUsageHint
 	lastSentAt time.Time
 
 	rotated         bool
@@ -127,6 +134,19 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
+	// firing is held across a timer callback, so a test reset can wait out
+	// one already past its timerGen check (it would otherwise log into the
+	// next test's captured stdout).
+	firing sync.Mutex
+}
+
+// pendingCLIUsageHint is one provider's newest unsent (or once-sent)
+// observation.
+type pendingCLIUsageHint struct {
+	generation cliUsageGeneration
+	// followUp: the first hint went out; the next send is its one follow-up.
+	followUp bool
+	notedAt  time.Time
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -148,7 +168,7 @@ func startCLIUsagePropagator(cfg *Config) {
 		// A capture committed during boot already rotated the epoch.
 		p.recoveryDue = true
 		p.armLocked(0)
-	} else if p.pending != nil {
+	} else if len(p.pending) > 0 {
 		p.armLocked(p.nextSendDelayLocked())
 	}
 	p.rotating.Add(1)
@@ -156,6 +176,9 @@ func startCLIUsagePropagator(cfg *Config) {
 	go func() {
 		defer p.rotating.Done()
 		p.rotate(cliUsageRotationFirstRetry)
+		// OpenCode's ledger rotates on its own: a device that never ran Codex
+		// has no Codex rotation to wait on.
+		recoverOpenCodeUsageGeneration(1)
 	}()
 }
 
@@ -175,7 +198,7 @@ func stopCLIUsagePropagator() {
 	if p.cancel != nil {
 		p.cancel()
 	}
-	if p.pending != nil {
+	if len(p.pending) > 0 {
 		logCLIUsageHint("dropped")
 		p.pending = nil
 	}
@@ -194,17 +217,19 @@ func noteCLIUsageObservationAdvanced(provider string, generation cliUsageGenerat
 	if p.stopped {
 		return
 	}
-	if p.pending != nil && p.pendingProvider == provider && p.pending.Epoch == generation.Epoch &&
-		p.pending.Counter >= generation.Counter {
+	prior := p.pending[provider]
+	if prior != nil && prior.generation.Epoch == generation.Epoch && prior.generation.Counter >= generation.Counter {
 		return // not newer than what is already pending
 	}
-	idle := p.pending == nil || p.followUp
-	g := generation
-	p.pending, p.pendingProvider, p.followUp = &g, provider, false
-	p.lastNoteAt = time.Now()
+	idle := prior == nil || prior.followUp
+	if p.pending == nil {
+		p.pending = map[string]*pendingCLIUsageHint{}
+	}
+	entry := &pendingCLIUsageHint{generation: generation, notedAt: time.Now()}
+	p.pending[provider] = entry
 	if p.cfg != nil {
 		d := p.nextSendDelayLocked()
-		if idle && d > cliUsageHintDebounce {
+		if idle && p.entrySendDelayLocked(entry) > cliUsageHintDebounce {
 			// Throttled by the spacing: kept, carrying the newest generation.
 			logCLIUsageHint("deferred")
 		}
@@ -244,12 +269,31 @@ func (p *cliUsagePropagatorState) rotate(retry time.Duration) {
 	p.armLocked(retry)
 }
 
-// nextSendDelayLocked is how long the pending observation must wait: the
-// trailing debounce, and the spacing since the last hint.
+// nextSendDelayLocked is how long until the first pending observation is due.
 func (p *cliUsagePropagatorState) nextSendDelayLocked() time.Duration {
+	_, d := p.nextPendingLocked()
+	return d
+}
+
+// nextPendingLocked picks the provider to send next: the shortest wait, and
+// among those due together the oldest observation. "" when nothing is pending.
+func (p *cliUsagePropagatorState) nextPendingLocked() (string, time.Duration) {
+	provider, best := "", time.Duration(0)
+	for name, entry := range p.pending {
+		d := p.entrySendDelayLocked(entry)
+		if provider == "" || d < best || (d == best && entry.notedAt.Before(p.pending[provider].notedAt)) {
+			provider, best = name, d
+		}
+	}
+	return provider, best
+}
+
+// entrySendDelayLocked is how long one observation must wait: its trailing
+// debounce, and the device-wide spacing since the last hint.
+func (p *cliUsagePropagatorState) entrySendDelayLocked(entry *pendingCLIUsageHint) time.Duration {
 	now := time.Now()
-	due := p.lastNoteAt.Add(cliUsageHintDebounce)
-	if p.followUp {
+	due := entry.notedAt.Add(cliUsageHintDebounce)
+	if entry.followUp {
 		due = now
 	}
 	if !p.lastSentAt.IsZero() {
@@ -288,6 +332,8 @@ func (p *cliUsagePropagatorState) armLocked(d time.Duration) {
 // fire is the timer callback: a due rotation retry, the startup recovery check,
 // then the pending hint.
 func (p *cliUsagePropagatorState) fire(gen uint64) {
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.timerGen {
 		p.mu.Unlock()
@@ -337,26 +383,45 @@ func cliUsageRecoveryGeneration() *cliUsageGeneration {
 	return nil
 }
 
-// sendDue sends the pending hint when it is due and every gate is open;
-// otherwise it re-arms the timer for the next boundary.
+// sendDue sends the next due hint when every gate is open; otherwise it
+// re-arms the timer for the next boundary.
 func (p *cliUsagePropagatorState) sendDue() {
 	p.mu.Lock()
-	if p.stopped || p.pending == nil || p.cfg == nil {
+	if p.stopped || len(p.pending) == 0 || p.cfg == nil {
 		p.mu.Unlock()
 		return
 	}
-	if d := p.nextSendDelayLocked(); d > 0 {
+	provider, d := p.nextPendingLocked()
+	if d > 0 {
 		p.armLocked(d)
 		p.mu.Unlock()
 		return
 	}
-	if blocked := cliUsageHintBlocked(p.rotated); blocked != "" {
+	blocked := cliUsageHintBlocked(p.rotatedForLocked(provider))
+	if blocked == "awaiting_rotation" {
+		// The rotation gate is per provider: one still waiting on its epoch must
+		// not hold back another's due hint.
+		if other := p.nextDueRotatedLocked(); other != "" {
+			provider, blocked = other, ""
+		}
+	}
+	if blocked != "" {
 		logCLIUsageHint(blocked)
-		p.armLocked(cliUsageHintSpacing)
+		retry := cliUsageHintSpacing
+		if blocked == "awaiting_rotation" {
+			// …nor delay it to the next boundary: wake when it falls due.
+			for name, entry := range p.pending {
+				if d := p.entrySendDelayLocked(entry); p.rotatedForLocked(name) && d < retry {
+					retry = d
+				}
+			}
+		}
+		p.armLocked(retry)
 		p.mu.Unlock()
 		return
 	}
-	cfg, provider, generation, followUp, ctx := p.cfg, p.pendingProvider, *p.pending, p.followUp, p.ctx
+	entry := p.pending[provider]
+	cfg, generation, followUp, ctx := p.cfg, entry.generation, entry.followUp, p.ctx
 	p.mu.Unlock()
 
 	// Read outside mu: configPersistenceMu is held across config file writes.
@@ -390,21 +455,46 @@ func (p *cliUsagePropagatorState) sendDue() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.lastSentAt = time.Now()
-	if p.stopped || p.pending == nil || *p.pending != generation || p.pendingProvider != provider {
-		// A newer observation arrived during the send: it keeps its own
-		// two-hint budget and waits for the spacing.
-		if !p.stopped && p.pending != nil {
-			p.armLocked(p.nextSendDelayLocked())
+	if p.stopped {
+		return
+	}
+	// A newer observation of this provider that arrived during the send keeps
+	// its own two-hint budget and waits for the spacing.
+	if current := p.pending[provider]; current != nil && current.generation == generation {
+		if followUp {
+			delete(p.pending, provider)
+		} else {
+			// Sent or failed, the observation keeps exactly one follow-up.
+			current.followUp = true
 		}
-		return
 	}
-	if followUp {
-		p.pending, p.followUp = nil, false
-		return
+	if len(p.pending) > 0 {
+		p.armLocked(p.nextSendDelayLocked())
 	}
-	// Sent or failed, the observation keeps exactly one follow-up.
-	p.followUp = true
-	p.armLocked(p.nextSendDelayLocked())
+}
+
+// nextDueRotatedLocked is the oldest due observation whose provider's epoch is
+// on disk, or "".
+func (p *cliUsagePropagatorState) nextDueRotatedLocked() string {
+	provider := ""
+	for name, entry := range p.pending {
+		if p.entrySendDelayLocked(entry) > 0 || !p.rotatedForLocked(name) {
+			continue
+		}
+		if provider == "" || entry.notedAt.Before(p.pending[provider].notedAt) {
+			provider = name
+		}
+	}
+	return provider
+}
+
+// rotatedForLocked reports whether provider's capture generation is on this
+// process's epoch: Codex's cache rotation, or a committed OpenCode ledger write.
+func (p *cliUsagePropagatorState) rotatedForLocked(provider string) bool {
+	if provider == openCodeUsageProvider {
+		return openCodeGenerationRotated.Load()
+	}
+	return p.rotated
 }
 
 // cliUsageHintBlocked names the gate holding a hint back, or "".
@@ -425,10 +515,13 @@ func logCLIUsageHint(label string) {
 }
 
 // resetCLIUsagePropagator restores the zero propagator in place (tests): a
-// timer callback already running sees the bumped timerGen and does nothing.
+// timer callback that has not reached its timerGen check sees the bump and does
+// nothing; one already past it is waited out.
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.timer != nil {
@@ -439,7 +532,6 @@ func resetCLIUsagePropagator() {
 	}
 	p.timerGen++
 	p.cfg, p.ctx, p.cancel, p.stopped, p.timer = nil, nil, nil, false, nil
-	p.pendingProvider, p.pending, p.followUp = "", nil, false
-	p.lastNoteAt, p.lastSentAt = time.Time{}, time.Time{}
+	p.pending, p.lastSentAt = nil, time.Time{}
 	p.rotated, p.rotationRetryAt, p.recoveryDue = false, time.Time{}, false
 }

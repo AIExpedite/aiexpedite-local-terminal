@@ -466,3 +466,111 @@ func TestCLIUsageHint_StartupRecoveryHintsACommittedClear(t *testing.T) {
 		t.Fatalf("recovery hint = %+v, want the rotated cleared generation {%d,%d}", h, snap.GenerationEpoch, snap.Generation)
 	}
 }
+
+// Codex and OpenCode observations are pending side by side — neither
+// overwrites the other — while the spacing stays device-wide and each provider
+// keeps its own two-hint budget.
+func TestCLIUsageHint_CodexAndOpenCodeObservationsCoexist(t *testing.T) {
+	withCodexGenerationEpoch(t, 517)
+	rec, cfg := propagatorFixture(t)
+	t.Setenv("AIEXPEDITE_OPENCODE_USAGE_CACHE", t.TempDir()+"/opencode_usage.json")
+	prevRotated := openCodeGenerationRotated.Load()
+	openCodeGenerationRotated.Store(true)
+	t.Cleanup(func() { openCodeGenerationRotated.Store(prevRotated) })
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(517, 1))
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(517, 4))
+	hints := waitHints(t, rec, 4, 2*cliUsageHintSpacing)
+	if len(hints) != 4 {
+		t.Fatalf("got %d hints, want two per provider: %+v", len(hints), hints)
+	}
+	perProvider := map[string]int{}
+	for i, h := range hints {
+		perProvider[h.hint.Provider]++
+		if h.hint.Provider == openCodeUsageProvider && h.hint.Generation != 4 {
+			t.Fatalf("opencode hint = %+v, want its own generation", h.hint)
+		}
+		if i == 0 {
+			continue
+		}
+		gap := time.UnixMilli(h.hint.Timestamp).Sub(time.UnixMilli(hints[i-1].hint.Timestamp))
+		if gap < cliUsageHintSpacing-10*time.Millisecond {
+			t.Fatalf("hints %d and %d were %s apart, want the device-wide spacing %s", i-1, i, gap, cliUsageHintSpacing)
+		}
+	}
+	if perProvider[codexUsageProvider] != 2 || perProvider[openCodeUsageProvider] != 2 {
+		t.Fatalf("hints per provider = %v, want 2 each", perProvider)
+	}
+}
+
+// When several observations are due together the oldest goes first; a
+// shorter wait beats an older note. Pinned on the picker itself — end to end
+// the order also depends on each provider's rotation gate.
+func TestCLIUsageHint_NextPendingPicksTheShortestWaitThenTheOldest(t *testing.T) {
+	now := time.Now()
+	p := &cliUsagePropagatorState{pending: map[string]*pendingCLIUsageHint{
+		openCodeUsageProvider: {generation: gen(1, 1), notedAt: now.Add(-time.Hour)},
+		codexUsageProvider:    {generation: gen(1, 1), notedAt: now.Add(-2 * time.Hour)},
+	}}
+	if provider, d := p.nextPendingLocked(); provider != codexUsageProvider || d != 0 {
+		t.Fatalf("picked %s after %s, want the older codex observation now", provider, d)
+	}
+	p.pending[codexUsageProvider].notedAt = now // still inside its debounce
+	if provider, d := p.nextPendingLocked(); provider != openCodeUsageProvider || d != 0 {
+		t.Fatalf("picked %s after %s, want the due opencode observation", provider, d)
+	}
+	p.pending = nil
+	if provider, _ := p.nextPendingLocked(); provider != "" {
+		t.Fatalf("picked %q with nothing pending", provider)
+	}
+}
+
+// An OpenCode hint waits for its own rotation, never Codex's: a device that
+// never ran Codex has no Codex rotation to wait on.
+func TestCLIUsageHint_OpenCodeIsGatedOnItsOwnRotation(t *testing.T) {
+	withCodexGenerationEpoch(t, 518)
+	rec, cfg := propagatorFixture(t)
+	t.Setenv("AIEXPEDITE_OPENCODE_USAGE_CACHE", t.TempDir()+"/opencode_usage.json")
+	prevRotated := openCodeGenerationRotated.Load()
+	t.Cleanup(func() { openCodeGenerationRotated.Store(prevRotated) })
+	openCodeGenerationRotated.Store(false)
+	startCLIUsagePropagator(cfg) // the Codex cache is empty: it never rotates
+
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(518, 1))
+	time.Sleep(2 * cliUsageHintSpacing)
+	if n := len(rec.all()); n != 0 {
+		t.Fatalf("sent %d hints before the OpenCode ledger rotated", n)
+	}
+	openCodeGenerationRotated.Store(true)
+	if h := waitHints(t, rec, 1, 0)[0].hint; h.Provider != openCodeUsageProvider {
+		t.Fatalf("hint = %+v", h)
+	}
+}
+
+// A provider still awaiting its rotation does not hold another's hint back,
+// even when its observation is the older one.
+func TestCLIUsageHint_AnUnrotatedProviderDoesNotBlockAnother(t *testing.T) {
+	withCodexGenerationEpoch(t, 519)
+	rec, cfg := propagatorFixture(t)
+	t.Setenv("AIEXPEDITE_OPENCODE_USAGE_CACHE", t.TempDir()+"/opencode_usage.json")
+	prevRotated := openCodeGenerationRotated.Load()
+	t.Cleanup(func() { openCodeGenerationRotated.Store(prevRotated) })
+	openCodeGenerationRotated.Store(false)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(519, 1))
+	time.Sleep(cliUsageHintDebounce / 2)
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(519, 2))
+	h := waitHints(t, rec, 1, cliUsageHintSpacing/2)[0].hint
+	if h.Provider != codexUsageProvider {
+		t.Fatalf("hint = %+v, want codex while opencode awaits its rotation", h)
+	}
+	for _, r := range rec.all() {
+		if r.hint.Provider == openCodeUsageProvider {
+			t.Fatalf("sent an opencode hint before its rotation: %+v", r.hint)
+		}
+	}
+}

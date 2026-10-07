@@ -690,11 +690,22 @@ func (m *OpenCodeNativeManager) runOneShot(
 		return openCodeRunResult{err: fmt.Errorf("session ended during turn")}
 	}
 
+	// The turn's spend is owed from the spawn (cliagent_usage_opencode_freshness.go):
+	// its step_finish frames are captured while streaming and committed once
+	// the child is reaped, or an export is owed for a turn that reported none.
+	usageRun := armOpenCodeUsageRunForExecutable(executable, runDir)
+	// A resumed turn's session is known before any frame: record it on the
+	// armed debt now, so a crash before the stream names it stays payable.
+	if isValidOpenCodeSessionID(nativeID) {
+		usageRun.persistSessionIDAsync(nativeID)
+	}
+
 	// opencode already leads its own group (Setsid above). Recorded in the
 	// spawn ledger for this turn only (session_ledger.go).
 	beginSessionSpawn(session.ID, cmd)
 	if err := cmd.Start(); err != nil {
 		abortSessionSpawn(session.ID)
+		disarmOpenCodeUsageRun(usageRun)
 		return openCodeRunResult{
 			err: fmt.Errorf("failed to start opencode (is OpenCode installed?): %w", err),
 		}
@@ -736,7 +747,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stream = m.streamOpenCodeEvents(session, stdout, publishFn)
+		stream = m.streamOpenCodeEvents(session, stdout, publishFn, usageRun)
 	}()
 	go func() {
 		defer wg.Done()
@@ -744,8 +755,13 @@ func (m *OpenCodeNativeManager) runOneShot(
 	}()
 	wg.Wait()
 
+	waitErr := cmd.Wait()
+	// Settled once the child is reaped, whatever its exit: a failed turn still
+	// spent what its steps reported. A resumed turn's id stands in when no
+	// frame named one.
+	settleOpenCodeUsageRun(usageRun, firstNonEmpty(stream.sessionID, nativeID))
 	exitCode := 0
-	if waitErr := cmd.Wait(); waitErr != nil {
+	if waitErr != nil {
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
@@ -797,6 +813,7 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 	session *OpenCodeNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
+	usage *openCodeUsageRun,
 ) openCodeStreamState {
 	var state openCodeStreamState
 	scanner := bufio.NewScanner(r)
@@ -807,10 +824,21 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		if line == "" {
 			continue
 		}
+		if state.overflow {
+			// Past the cap the turn is already failed, but its usage is still
+			// owed: later step-finish frames (the final model step among them)
+			// would otherwise go uncounted while an earlier one settles the run
+			// as paid, leaving the export nothing to reconcile. Nothing else is
+			// kept or published.
+			captureOpenCodeUsageLine(usage, line)
+			continue
+		}
 		state.bytes += len(line)
 		if state.bytes > openCodeNativeMaxStdout {
+			// The line that crosses the cap is still usage like any after it.
 			state.overflow = true
-			break
+			captureOpenCodeUsageLine(usage, line)
+			continue
 		}
 		if state.raw.Len() < openCodeNativeMaxRawStdout {
 			state.raw.WriteString(line)
@@ -824,6 +852,8 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 				state.sessionID = sid
 			}
 		}
+		// Memory only: the run commits once the child is reaped.
+		captureOpenCodeUsageLine(usage, line)
 		m.publishEventFrame(session, publishFn, line)
 	}
 	if err := scanner.Err(); err != nil {
@@ -834,11 +864,35 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		state.overflow = true
 	}
 	// Drain anything left so the child never blocks on a full pipe (which would
-	// deadlock cmd.Wait) after we stopped scanning.
+	// deadlock cmd.Wait) after we stopped scanning. The drain still reads usage,
+	// for the same reason the over-cap scan above does.
 	if state.overflow {
-		_, _ = drainRemaining(r)
+		drainOpenCodeUsage(r, usage)
 	}
 	return state
+}
+
+// drainOpenCodeUsage reads r to the end, folding any step-finish usage into
+// usage and discarding everything else. A line past the frame cap is skipped
+// rather than ending the scan: a scanner that hit bufio.ErrTooLong buffered
+// only that line's prefix, so a fresh one resumes inside it and loses nothing
+// after it.
+func drainOpenCodeUsage(r interface{ Read([]byte) (int, error) }, usage *openCodeUsageRun) {
+	if usage == nil {
+		_, _ = drainRemaining(r)
+		return
+	}
+	for {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), openCodeNativeMaxFrameBytes)
+		for scanner.Scan() {
+			captureOpenCodeUsageLine(usage, scanner.Text())
+		}
+		if !errors.Is(scanner.Err(), bufio.ErrTooLong) {
+			_, _ = drainRemaining(r)
+			return
+		}
+	}
 }
 
 // publishEventFrame emits one streamed OpenCode JSON event. Oversize envelopes
