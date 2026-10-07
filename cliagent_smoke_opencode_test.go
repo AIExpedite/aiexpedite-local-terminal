@@ -1088,3 +1088,67 @@ func TestRunOpenCodeSmoke_CapturesUsageOrOwesIt(t *testing.T) {
 		})
 	}
 }
+
+// A smoke whose stdout passes the retention cap still counts every step: the
+// one before the cap from the retained bytes, and the one straddling it, the
+// final model step after it, and an unterminated last frame as the pipe
+// drains. Each is counted exactly once.
+func TestOpenCodeSmokeStdout_UsagePastTheRetentionCapIsCounted(t *testing.T) {
+	openCodeUsageFixture(t, 1305)
+	now := time.Now().UnixMilli()
+	first := openCodeStepFinish("ses_smoke_cap", "prt_tool", 100, 0, 0, "0", now)
+	straddling := openCodeStepFinish("ses_smoke_cap", "prt_cross", 7, 0, 0, "0", now)
+	var out strings.Builder
+	out.WriteString(first + "\n")
+	out.WriteString(strings.Repeat("x", cliSmokeMaxStdout-len(first)-1-len(straddling)/2-1) + "\n")
+	out.WriteString(straddling + "\n")
+	out.WriteString(strings.Repeat("y", openCodeNativeMaxFrameBytes+1) + "\n")
+	out.WriteString(openCodeStepFinish("ses_smoke_cap", "prt_final", 20, 0, 0, "0", now) + "\n")
+	out.WriteString(openCodeStepFinish("ses_smoke_cap", "prt_last", 3, 0, 0, "0", now))
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-smoke-cap")
+	w := &openCodeSmokeStdout{boundedBuffer: boundedBuffer{limit: cliSmokeMaxStdout}, usage: run}
+	stream := out.String()
+	for len(stream) > 0 {
+		k := min(4093, len(stream))
+		if n, err := w.Write([]byte(stream[:k])); n != k || err != nil {
+			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, k)
+		}
+		stream = stream[k:]
+	}
+	w.finish()
+	if got := len(w.Bytes()); got != cliSmokeMaxStdout {
+		t.Fatalf("retained %d bytes, want the %d-byte cap", got, cliSmokeMaxStdout)
+	}
+	captureOpenCodeUsageStream(openCodeSmokeRetainedLines(w.Bytes()), run)
+
+	steps, _ := run.snapshot()
+	var input int64
+	for _, s := range steps {
+		input += s.Input
+	}
+	if len(steps) != 4 || input != 130 {
+		t.Fatalf("captured %d steps with %d input tokens, want all 4 (130)", len(steps), input)
+	}
+}
+
+// Under the cap the retained bytes are the whole stream, and the writer reads
+// nothing itself.
+func TestOpenCodeSmokeStdout_UnderTheCapLeavesUsageToTheRetainedBytes(t *testing.T) {
+	openCodeUsageFixture(t, 1306)
+	line := openCodeStepFinish("ses_smoke_small", "prt_stop", 9, 0, 0, "0", time.Now().UnixMilli())
+	run := armOpenCodeUsageRun("opencode", "", "fp-smoke-small")
+	w := &openCodeSmokeStdout{boundedBuffer: boundedBuffer{limit: cliSmokeMaxStdout}, usage: run}
+	_, _ = w.Write([]byte(line))
+	w.finish()
+	if steps, _ := run.snapshot(); len(steps) != 0 {
+		t.Fatalf("the writer captured %d steps under the cap", len(steps))
+	}
+	if got := string(openCodeSmokeRetainedLines(w.Bytes())); got != line {
+		t.Fatal("the retained lines dropped the unterminated frame under the cap")
+	}
+	captureOpenCodeUsageStream(openCodeSmokeRetainedLines(w.Bytes()), run)
+	if steps, _ := run.snapshot(); len(steps) != 1 {
+		t.Fatalf("captured %d steps, want 1", len(steps))
+	}
+}

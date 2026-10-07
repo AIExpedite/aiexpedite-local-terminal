@@ -87,7 +87,7 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 		return nil, nil, err
 	}
 	defer closePrompt()
-	outBuf := &boundedBuffer{limit: cliSmokeMaxStdout}
+	outBuf := &openCodeSmokeStdout{boundedBuffer: boundedBuffer{limit: cliSmokeMaxStdout}, usage: launch.Usage}
 	errBuf := &boundedBuffer{limit: cliSmokeMaxStderr}
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
@@ -95,7 +95,93 @@ var runOpenCodeSmokeCommand = func(ctx context.Context, launch openCodeLaunch) (
 		return nil, nil, err
 	}
 	err = cmd.Wait()
+	outBuf.finish()
 	return outBuf.Bytes(), errBuf.Bytes(), err
+}
+
+// openCodeSmokeStdout retains the smoke's stdout exactly as boundedBuffer does,
+// and folds the usage of every line the cap would otherwise drop into the run.
+// A retained prefix with one early step-finish would settle the turn as paid
+// while its later steps (the final model step among them) were discarded, so
+// the turn's spend is read from the WHOLE stream even though only its first
+// MiB is kept for the classifier.
+//
+// Once the buffer is full, the line it ends inside — the one that straddles
+// the cap — belongs to this side: openCodeSmokeRetainedLines drops it from the
+// retained capture, so each line is counted by exactly one of the two.
+type openCodeSmokeStdout struct {
+	boundedBuffer
+	usage   *openCodeUsageRun
+	full    bool
+	line    []byte
+	tooLong bool
+}
+
+func (w *openCodeSmokeStdout) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := w.limit - w.buf.Len(); room > 0 {
+		k := min(room, len(p))
+		w.buf.Write(p[:k])
+		p = p[k:]
+	}
+	if w.usage == nil || w.buf.Len() < w.limit {
+		return n, nil
+	}
+	if !w.full {
+		w.full = true
+		retained := w.buf.Bytes()
+		w.appendLine(retained[bytes.LastIndexByte(retained, '\n')+1:])
+	}
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			w.appendLine(p)
+			break
+		}
+		w.appendLine(p[:i])
+		w.flushLine()
+		p = p[i+1:]
+	}
+	return n, nil
+}
+
+// appendLine grows the line in progress, dropping one past the frame cap — the
+// same bound every other OpenCode usage reader applies.
+func (w *openCodeSmokeStdout) appendLine(p []byte) {
+	if w.tooLong {
+		return
+	}
+	if len(w.line)+len(p) > openCodeNativeMaxFrameBytes {
+		w.tooLong = true
+		w.line = nil
+		return
+	}
+	w.line = append(w.line, p...)
+}
+
+func (w *openCodeSmokeStdout) flushLine() {
+	if !w.tooLong && len(w.line) > 0 {
+		captureOpenCodeUsageLine(w.usage, string(w.line))
+	}
+	w.line = w.line[:0]
+	w.tooLong = false
+}
+
+// finish reads the final unterminated line once the child has been reaped.
+func (w *openCodeSmokeStdout) finish() {
+	if w.full {
+		w.flushLine()
+	}
+}
+
+// openCodeSmokeRetainedLines is the part of a retained stdout whose usage the
+// caller reads: all of it, unless the cap was reached, in which case the line
+// the buffer ends inside is openCodeSmokeStdout's to count.
+func openCodeSmokeRetainedLines(stdout []byte) []byte {
+	if len(stdout) < cliSmokeMaxStdout {
+		return stdout
+	}
+	return stdout[:bytes.LastIndexByte(stdout, '\n')+1]
 }
 
 // newOpenCodeSmokeCmd builds the probe child with everything but its output
@@ -402,6 +488,8 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 		// only: a pre-update smoke must not BE the update, and a title escape on
 		// stdout is noise in the frame stream. See openCodeMaintenanceEnvPins.
 		Maintenance: true,
+		// Usage past the stdout retention cap is read while the pipe drains.
+		Usage: usageRun,
 	})
 	// Read the PER-ATTEMPT context before cancelling it: a deadline kill reports
 	// an *exec.ExitError, not a wrapped context error, so judging by the parent
@@ -410,10 +498,11 @@ func runOpenCodeSmoke(ctx context.Context, path, version string) cliSmokeResult 
 	cancel()
 
 	category, diagnostic, matched := classifyOpenCodeSmokeRun(timedOut, stdout, stderr, runErr, marker)
-	// Fold the frames' usage in before the bytes are discarded. A success with
-	// no usage frames owes an export; a failure with no completed step owes
+	// Fold the frames' usage in before the bytes are discarded (anything past
+	// the retention cap was already read as it drained). A success with no
+	// usage frames owes an export; a failure with no completed step owes
 	// nothing.
-	captureOpenCodeUsageStream(stdout, usageRun)
+	captureOpenCodeUsageStream(openCodeSmokeRetainedLines(stdout), usageRun)
 	settleOrDisarmOpenCodeSmokeRun(usageRun, category == "")
 	if category == "" {
 		result.Status = cliSmokeStatusSuccess
