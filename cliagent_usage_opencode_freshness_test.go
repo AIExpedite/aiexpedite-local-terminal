@@ -244,6 +244,51 @@ func TestOpenCodeDebt_ASharedFailedPassSpendsOneAttempt(t *testing.T) {
 	}
 }
 
+func TestOpenCodeDebt_ADebtOpenedDuringAForcedPassIsStillBooked(t *testing.T) {
+	// A Refresh click starts a pass with no debt open; a managed run finishes
+	// mid-pass and its worker joins the click's flight. The click books
+	// nothing for a debt it never saw, so the joiner must leave a rung booked.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	t.Cleanup(openCodeReconcileBudgetForTests(300 * time.Millisecond))
+	created := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_a", created + 1000}),
+		hang:     map[string]bool{"ses_a": true},
+	}).install(t)
+
+	click := make(chan string, 1)
+	go func() { click <- openCodePayReconcile(context.Background(), true) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for stub.exportCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if stub.exportCount() == 0 {
+		t.Fatal("the click's pass never reached its export")
+	}
+	updateOpenCodeUsageFreshness(func(s *openCodeUsageFreshness) {
+		openCodeOweReconcile(s, now, openCodeCompletionMs(now))
+	})
+	joined := openCodePayReconcile(context.Background(), false)
+	<-click
+	pending := openCodeRunDebtRetryPending()
+	stopOpenCodeRunDebtRetry()
+
+	if joined != openCodeReconcileTimeout {
+		t.Fatalf("joined outcome = %q, want the shared timeout", joined)
+	}
+	if got := stub.exportCount(); got != 1 {
+		t.Fatalf("exports = %d, want the worker to join rather than run a second pass", got)
+	}
+	state := readOpenCodeFreshness(t)
+	if !state.owed() || state.NextAttemptAtMs == 0 || !pending {
+		t.Fatalf("state = %+v pending=%v, want the new debt open with a rung booked", state, pending)
+	}
+	if state.Attempts != 0 {
+		t.Fatalf("attempts = %d, want a pass that never saw the debt to spend none of it", state.Attempts)
+	}
+}
+
 func TestOpenCodeDebt_FreeRetriesBackOffWithTheDebtsAge(t *testing.T) {
 	// A device that stays offline must not re-check at the floor for the
 	// debt's whole six-hour window.

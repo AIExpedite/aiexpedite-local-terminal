@@ -571,6 +571,7 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 		// the debt worker): that caller books it. Booking it here too would
 		// charge one shared failure twice against the debt's attempts.
 		logOpenCodeUsage("joined %s", outcome)
+		openCodeBookDebtOpenedMidPass(completedAt)
 		return outcome
 	}
 
@@ -599,6 +600,16 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 		result.Exported, result.Remaining)
 	openCodeBookAfterOutcome(hasDebt, outcome, completedAt)
 	return outcome
+}
+
+// openCodeBookDebtOpenedMidPass books a free rung for an open debt that has
+// none. A run that finishes while a forced, debt-free pass is in flight opens a
+// debt whose worker then joins that pass; the leader snapshotted "no debt" and
+// books nothing, so without this the debt would sit unscheduled until a restart.
+func openCodeBookDebtOpenedMidPass(now time.Time) {
+	if state, owed := openCodePendingDebt(now); owed && state.NextAttemptAtMs == 0 {
+		openCodeScheduleRunDebtRetry(state, now, openCodeRetryFree)
+	}
 }
 
 // passSpacingElapsed reports whether openCodeReconcileMinInterval has passed
