@@ -1196,7 +1196,9 @@ func claudeStampAfterMerge(fingerprint string) {
 	// reads the credential store (a `security` spawn on macOS), and this runs
 	// inside the stream-capture stdout scanner. Bumps are rare (a displayed row
 	// advanced), so one short goroutine per bump is cheap.
+	cliUsagePropagator.noting.Add(1)
 	go func() {
+		defer cliUsagePropagator.noting.Done()
 		defer func() { _ = recover() }()
 		if fingerprint == currentClaudeAccountFingerprint() {
 			noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)

@@ -286,6 +286,9 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
+	// noting tracks the goroutines that note a stamped Claude generation after
+	// a merge (claudeStampAfterMerge), for the same reason.
+	noting sync.WaitGroup
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -758,6 +761,7 @@ func logCLIUsageHint(label, provider string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	p.noting.Wait()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.timer != nil {
