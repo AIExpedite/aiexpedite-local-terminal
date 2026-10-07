@@ -703,6 +703,201 @@ func TestClaudeCodeMetricsFromCache_ReadsCachePinnedByTheInstalledHook(t *testin
 	}
 }
 
+// The merged view publishes the OWN cache's generation, so a fresher reading the
+// hook pinned to the other channel's cache must be imported into the own cache
+// — advancing that generation — rather than displayed under a stale one.
+func TestImportPinnedClaudeObservations_VersionsThePinnedReadingInTheOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(ownCache, bucket(10, now.Add(-time.Hour)), now, "acct", claudeRateLimitSourceStream)
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "other", claudeRateLimitSourceStatusLine)
+	before := loadMergedClaudeRateLimitView("acct").generation
+
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("imported %+v from another account's pinned cache", g)
+	}
+
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil || before == nil || imported.Epoch != before.Epoch || imported.Counter != before.Counter+1 {
+		t.Fatalf("imported generation = %+v, want the own generation after %+v advanced once", imported, before)
+	}
+	view := loadMergedClaudeRateLimitView("acct")
+	if view.generation == nil || *view.generation != *imported {
+		t.Fatalf("view generation = %+v, want %+v", view.generation, imported)
+	}
+	own, _ := loadClaudeRateLimitSnapshot(ownCache)
+	got := own.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 91 || got.ObservedAtMs != now.Add(-time.Minute).UnixMilli() || got.Source != claudeRateLimitSourceStatusLine {
+		t.Fatalf("own five_hour = %+v, want the pinned reading with its time and provenance", got)
+	}
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("a reading already imported advanced the generation again: %+v", g)
+	}
+}
+
+// An import whose lock or write failed leaves the own cache without the newer
+// pinned reading, yet the merged view still displays it. The own generation
+// does not version that row, so the view must carry none until an import
+// lands it — otherwise a receipt would sign the pinned row under it.
+func TestLoadMergedClaudeRateLimitView_WithholdsTheGenerationForAnUnimportedPinnedReading(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(ownCache, bucket(10, now.Add(-time.Hour)), now, "acct", claudeRateLimitSourceStream)
+	if g := loadMergedClaudeRateLimitView("acct").generation; g == nil {
+		t.Fatal("fixture: the own cache carries no generation")
+	}
+
+	// The hook commits a newer reading to the pinned cache and no import lands it.
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+	view := loadMergedClaudeRateLimitView("acct")
+	if got := view.buckets[claudeWindowFiveHour].UsedPercentage; got != 91 {
+		t.Fatalf("view five_hour = %v, want the fresher pinned reading displayed", got)
+	}
+	if view.generation != nil {
+		t.Fatalf("view generation = %+v, want none while the own cache lacks the displayed pinned row", view.generation)
+	}
+
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil {
+		t.Fatal("the pinned reading was not imported")
+	}
+	if g := loadMergedClaudeRateLimitView("acct").generation; g == nil || *g != *imported {
+		t.Fatalf("view generation after import = %+v, want %+v", g, imported)
+	}
+}
+
+// A fresh dual-channel install has no own cache and a hook pinned to the other
+// channel, and the fresh pinned reading keeps the staleness probe — the other
+// writer of the own cache — away. The import must create the own cache, so this
+// agent has a generation to version its published rows and to hint.
+func TestImportPinnedClaudeObservations_BootstrapsAnAbsentOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	observed := now.Add(-time.Minute)
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 63, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		},
+	}, now, "acct", claudeRateLimitSourceStatusLine)
+	if _, err := os.Stat(ownCache); err == nil {
+		t.Fatal("fixture wrote an own cache; this case is about its absence")
+	}
+
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil || imported.Epoch == 0 || imported.Counter == 0 {
+		t.Fatalf("imported generation = %+v, want the own cache created and versioned", imported)
+	}
+	view := loadMergedClaudeRateLimitView("acct")
+	if view.generation == nil || *view.generation != *imported {
+		t.Fatalf("view generation = %+v, want %+v", view.generation, imported)
+	}
+	own, ok := loadClaudeRateLimitSnapshot(ownCache)
+	if !ok || own.AccountFingerprint != "acct" {
+		t.Fatalf("own snapshot = %+v (ok=%v), want one scoped to acct", own, ok)
+	}
+	got := own.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 63 || got.ObservedAtMs != observed.UnixMilli() || got.Source != claudeRateLimitSourceStatusLine {
+		t.Fatalf("own five_hour = %+v, want the pinned reading with its time and provenance", got)
+	}
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("a reading already imported advanced the generation again: %+v", g)
+	}
+}
+
+// The fallback read has no credentials, so it may adopt the pinned cache's own
+// account scope ONLY while there is no own cache to disagree with it.
+func TestImportPinnedClaudeObservationsIntoAbsentCache_AdoptsThePinnedScopeOnlyWithoutAnOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(55, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+
+	imported := importPinnedClaudeObservationsIntoAbsentCache()
+	if imported == nil {
+		t.Fatal("the pinned reading was not imported into the absent own cache")
+	}
+	if own, _ := loadClaudeRateLimitSnapshot(ownCache); own.AccountFingerprint != "acct" {
+		t.Fatalf("own snapshot scope = %q, want the adopted pinned scope", own.AccountFingerprint)
+	}
+
+	// An own cache now exists: a newer pinned reading is left to the callers
+	// that know which account this agent is signed into.
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(81, now), now, "acct", claudeRateLimitSourceStatusLine)
+	if g := importPinnedClaudeObservationsIntoAbsentCache(); g != nil {
+		t.Fatalf("imported %+v over an existing own cache without a credential scope", g)
+	}
+	if own, _ := loadClaudeRateLimitSnapshot(ownCache); own.Buckets[claudeWindowFiveHour].UsedPercentage != 55 {
+		t.Fatalf("own five_hour = %+v, want the first import untouched", own.Buckets[claudeWindowFiveHour])
+	}
+}
+
 // A cache pinned by a hook that is NOT ours must not be read: the value would be
 // attributed to this account with no evidence it came from our capture at all.
 func TestClaudeCodeMetricsFromCache_IgnoresForeignStatusLineCommand(t *testing.T) {
@@ -1720,5 +1915,170 @@ func TestMergeClaudeRateLimitCacheCheckedScoped_AdmitsTheSampledAndOwnScopes(t *
 	// resolves its identity immediately before writing.
 	if err := write(t, "account-b", "account-a", nil); err != nil {
 		t.Errorf("an unguarded merge was refused: %v", err)
+	}
+}
+
+/* ---------------------------- capture generation --------------------------- */
+
+func claudeGenerationOf(t *testing.T, cache string) cliUsageGeneration {
+	t.Helper()
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("cache missing")
+	}
+	return cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
+}
+
+func claudeNumericUpdate(window string, pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+	return map[string]claudeRateLimitBucket{window: {
+		UsedPercentage: pct, ResetsAtMs: observed.Add(3 * time.Hour).Truncate(time.Hour).UnixMilli(),
+		ObservedAtMs: observed.UnixMilli(), Status: "allowed", usageKnown: true,
+	}}
+}
+
+// Only a numeric row that wins the newer-wins merge moves the generation: a
+// heartbeat, an older reading, an identical re-merge, a debt marker and a read
+// leave it exactly where it was.
+func TestClaudeCacheGeneration_AdvancesOnlyOnAWinningNumericCommit(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	now := time.Now()
+
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 10, now), now, "", claudeRateLimitSourceStream)
+	first := claudeGenerationOf(t, cache)
+	if first.Epoch <= 0 || first.Counter != 1 {
+		t.Fatalf("first numeric commit = %+v, want a fresh epoch at counter 1", first)
+	}
+
+	newer := now.Add(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 12, newer), newer, "", claudeRateLimitSourceStream)
+	if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{Epoch: first.Epoch, Counter: 2}) {
+		t.Fatalf("winning commit = %+v, want {%d,2}", g, first.Epoch)
+	}
+
+	unchanged := []struct {
+		name  string
+		write func()
+	}{
+		{"older reading refused", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 90, now.Add(-time.Minute)), now, "", claudeRateLimitSourceStatusLine)
+		}},
+		{"identical re-merge", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 12, newer), newer, "", claudeRateLimitSourceStream)
+		}},
+		{"heartbeat only", func() {
+			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+				ResetsAtMs: newer.Add(3 * time.Hour).Truncate(time.Hour).UnixMilli(), ObservedAtMs: newer.Add(time.Minute).UnixMilli(), Status: "allowed",
+			}}, newer.Add(time.Minute), "", claudeRateLimitSourceStream)
+		}},
+		{"debt marker", func() {
+			mutateClaudeRateLimitSnapshot(cache, "", func(s *claudeRateLimitSnapshot) bool {
+				s.RefreshOwedAtMs = newer.UnixMilli()
+				return true
+			})
+		}},
+		{"failed write", func() {
+			prev := claudeRateLimitCacheWriteFile
+			claudeRateLimitCacheWriteFile = func(string, []byte, os.FileMode) error { return errors.New("disk full") }
+			defer func() { claudeRateLimitCacheWriteFile = prev }()
+			mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 50, newer.Add(time.Hour)), newer, "", claudeRateLimitSourceStream)
+		}},
+		{"read", func() {
+			_ = loadMergedClaudeRateLimitView("")
+			_ = claudeEnsureCacheGeneration(cache)
+		}},
+	}
+	for _, step := range unchanged {
+		step.write()
+		if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{Epoch: first.Epoch, Counter: 2}) {
+			t.Fatalf("%s moved the generation to %+v", step.name, g)
+		}
+	}
+}
+
+// An account boundary drops the old account's generation with its buckets;
+// the new account's first numeric commit starts a new nonzero epoch that the
+// old account's applied watermark cannot cover.
+func TestClaudeCacheGeneration_AccountSwitchRotatesTheEpoch(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	draws := []int64{111, 222}
+	prevDraw := claudeDrawGenerationEpoch
+	claudeDrawGenerationEpoch = func() int64 { d := draws[0]; draws = draws[1:]; return d }
+	t.Cleanup(func() { claudeDrawGenerationEpoch = prevDraw })
+
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, float64(10+i), at), at, "acct-a", claudeRateLimitSourceStream)
+	}
+	applied := claudeGenerationOf(t, cache)
+	if applied != (cliUsageGeneration{Epoch: 111, Counter: 3}) {
+		t.Fatalf("account A generation = %+v", applied)
+	}
+
+	// A marker written under account B crosses the boundary without a reading:
+	// the snapshot is unversioned until B's first numeric commit.
+	mutateClaudeRateLimitSnapshot(cache, "acct-b", func(s *claudeRateLimitSnapshot) bool {
+		s.RefreshOwedAtMs = now.UnixMilli()
+		return true
+	})
+	if g := claudeGenerationOf(t, cache); g != (cliUsageGeneration{}) {
+		t.Fatalf("account boundary kept A's generation: %+v", g)
+	}
+	at := now.Add(time.Minute)
+	mergeClaudeRateLimitCacheFromSource(cache, claudeNumericUpdate(claudeWindowFiveHour, 5, at), at, "acct-b", claudeRateLimitSourceStream)
+	b := claudeGenerationOf(t, cache)
+	if b.Epoch != 222 || b.Counter != 1 {
+		t.Fatalf("account B generation = %+v, want a new epoch at counter 1", b)
+	}
+	if applied.covers(b) {
+		t.Fatal("account A's applied watermark covers account B's first generation")
+	}
+}
+
+// A numeric snapshot written before generations existed is versioned in place
+// — values, observation times and scope untouched — while an empty or
+// usage-less snapshot stays unversioned.
+func TestClaudeCacheGeneration_LegacyNumericSnapshotIsVersionedInPlace(t *testing.T) {
+	dir := t.TempDir()
+	observed := time.Now().Add(-2 * time.Hour).UnixMilli()
+	legacy := filepath.Join(dir, "legacy.json")
+	body := `{"updatedAt":"2026-10-06T09:00:04Z","accountFingerprint":"acct","buckets":{"five_hour":` +
+		`{"usedPercentage":41,"resetsAtMs":` + itoa(observed+3600000) + `,"status":"allowed","observedAtMs":` + itoa(observed) + `}}}`
+	if err := os.WriteFile(legacy, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := loadClaudeRateLimitSnapshot(legacy)
+
+	g := claudeEnsureCacheGeneration(legacy)
+	if g == nil || g.Epoch <= 0 || g.Counter != 1 {
+		t.Fatalf("legacy numeric snapshot generation = %+v", g)
+	}
+	after, _ := loadClaudeRateLimitSnapshot(legacy)
+	if after.AccountFingerprint != before.AccountFingerprint || after.UpdatedAt != before.UpdatedAt ||
+		after.Buckets[claudeWindowFiveHour] != before.Buckets[claudeWindowFiveHour] {
+		t.Fatalf("versioning changed the reading:\nbefore %+v\nafter  %+v", before, after)
+	}
+	if again := claudeEnsureCacheGeneration(legacy); again == nil || *again != *g {
+		t.Fatalf("a second open re-versioned the snapshot: %+v, want %+v", again, g)
+	}
+
+	for name, content := range map[string]string{
+		"empty":      `{"updatedAt":"x","buckets":{}}`,
+		"usage-less": `{"updatedAt":"x","buckets":{"five_hour":{"usedPercentage":0,"resetsAtMs":1,"observedAtMs":1,"usageObserved":false}}}`,
+	} {
+		path := filepath.Join(dir, name+".json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if g := claudeEnsureCacheGeneration(path); g != nil {
+			t.Fatalf("%s snapshot was versioned: %+v", name, g)
+		}
+		if snap, _ := loadClaudeRateLimitSnapshot(path); snap.GenerationEpoch != 0 || snap.Generation != 0 {
+			t.Fatalf("%s snapshot gained a generation on disk: %+v", name, snap)
+		}
 	}
 }

@@ -48,6 +48,14 @@
       "challengeTs": 6,
       "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r6\",\"challengeTs\":6,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"metrics\":[{\"kind\":\"weekly\",\"label\":\"Weekly quota\",\"unit\":\"%\",\"total\":\"100\",\"remaining\":\"73\",\"consumed\":\"27\",\"resetAt\":\"2026-10-06T19:39:00Z\",\"observedAt\":\"2026-09-30T11:56:11Z\"}],\"collectedAt\":\"now\",\"usageGeneration\":{\"epoch\":4503599627370497,\"counter\":7}}],\"errors\":[]}",
       "signature": "7438f700fac112c2ce439bd3b02e3dfeb9d318436c503df0047870ddff9a2e3f"
+    },
+    {
+      "name": "claude-usage-generation",
+      "secret": "secret",
+      "refreshId": "r7",
+      "challengeTs": 7,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r7\",\"challengeTs\":7,\"success\":true,\"cliAgents\":[{\"provider\":\"claudeCode\",\"metrics\":[{\"kind\":\"session\",\"label\":\"5-hour session window\",\"unit\":\"%\",\"total\":\"100\",\"remaining\":\"59\",\"consumed\":\"41\",\"resetAt\":\"2026-10-06T12:00:00Z\",\"observedAt\":\"2026-10-06T09:05:00Z\"},{\"kind\":\"weekly\",\"label\":\"Weekly quota\",\"unit\":\"%\",\"total\":\"100\",\"remaining\":\"83\",\"consumed\":\"17\",\"resetAt\":\"2026-10-10T00:00:00Z\",\"observedAt\":\"2026-10-06T09:05:00Z\"}],\"collectedAt\":\"now\",\"usageGeneration\":{\"epoch\":4503599627370501,\"counter\":3}}],\"errors\":[]}",
+      "signature": "b9fd7c1373164866a82b6b099be7013f3fcfed0e986cf594f8e111746da2a401"
     }
   ]
 }

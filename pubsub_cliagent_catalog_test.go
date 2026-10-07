@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/pubsub/v2"
 )
 
 func TestHandleCLIUsageRefreshCommand_PersistsAndRefreshesChangedCatalog(t *testing.T) {
@@ -172,5 +176,105 @@ func TestClaudeUsageRefreshForceReason(t *testing.T) {
 	click := commandMsg{Command: "__cli_usage_refresh__", Args: []string{cliUsageLiveProbeArg}}
 	if got := claudeUsageRefreshForceReason(click); got != claudeForceClick {
 		t.Errorf("click: reason=%v, want click (debt owed or not)", got)
+	}
+}
+
+// refreshWithDiscoveredClaudeGeneration stands in for a gather whose Claude
+// read discovers an external (status-line) commit, and returns the usage the
+// receipt signs.
+func refreshWithDiscoveredClaudeGeneration(t *testing.T, g cliUsageGeneration) {
+	t.Helper()
+	prev := gatherCLIUsageForRefresh
+	gatherCLIUsageForRefresh = func(ctx context.Context) ([]cliAgentUsage, []cliAgentUsageError) {
+		observeCLIUsageGeneration(ctx, claudeUsageProvider, &g)
+		return []cliAgentUsage{{Provider: claudeUsageProvider, CollectedAt: "now", UsageGeneration: &g}}, nil
+	}
+	t.Cleanup(func() { gatherCLIUsageForRefresh = prev })
+}
+
+func stubRefreshPublish(t *testing.T, fail func(resultMsg) bool) *[]resultMsg {
+	t.Helper()
+	var mu sync.Mutex
+	var published []resultMsg
+	prev := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail != nil && fail(res) {
+			return errors.New("publish unavailable")
+		}
+		published = append(published, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prev })
+	return &published
+}
+
+// A published receipt that carried a discovered generation suppresses the
+// immediate hint and leaves exactly one confirmation beyond the backend
+// cooldown — and the refresh result itself is unchanged.
+func TestHandleCLIUsageRefreshCommand_PublishedReceiptLeavesOneConfirmation(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	refreshWithDiscoveredClaudeGeneration(t, gen(301, 4))
+	published := stubRefreshPublish(t, nil)
+
+	start := time.Now()
+	if err := handleCLIUsageRefreshCommand(context.Background(), nil, commandMsg{ID: "c1", RefreshID: "r1", Ts: 1}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*published) != 1 || (*published)[0].Receipt == "" || len((*published)[0].CliAgents) != 1 {
+		t.Fatalf("published = %+v, want one signed result", *published)
+	}
+	hints := waitHints(t, rec, 1, 3*cliUsageHintSpacing)
+	if len(hints) != 1 || hints[0].hint.Provider != claudeUsageProvider || hints[0].hint.Generation != 4 {
+		t.Fatalf("hints = %+v, want exactly one confirmation", hints)
+	}
+	if at := time.UnixMilli(hints[0].hint.Timestamp); at.Sub(start) < cliUsageHintSpacing-5*time.Millisecond {
+		t.Fatalf("confirmation went %s after the refresh, want >= %s", at.Sub(start), cliUsageHintSpacing)
+	}
+}
+
+// A refresh whose result could not be published releases the generation to
+// the ordinary lifecycle: the backend never saw it, so it is hinted (and
+// followed up) as usual.
+func TestHandleCLIUsageRefreshCommand_FailedPublishReleasesTheReservation(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	refreshWithDiscoveredClaudeGeneration(t, gen(302, 1))
+	stubRefreshPublish(t, func(resultMsg) bool { return true })
+
+	if err := handleCLIUsageRefreshCommand(context.Background(), nil, commandMsg{ID: "c1", RefreshID: "r1", Ts: 1}, cfg); err == nil {
+		t.Fatal("a failed publish must be reported so the command is redelivered")
+	}
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	if len(hints) != 2 || hints[0].hint.GenerationEpoch != 302 {
+		t.Fatalf("hints = %+v, want the released generation's hint and follow-up", hints)
+	}
+}
+
+// A receipt that cannot be signed publishes the redacted failure result and
+// releases the reservation.
+func TestHandleCLIUsageRefreshCommand_UnsignableReceiptReleasesTheReservation(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	g := gen(303, 1)
+	prev := gatherCLIUsageForRefresh
+	gatherCLIUsageForRefresh = func(ctx context.Context) ([]cliAgentUsage, []cliAgentUsageError) {
+		observeCLIUsageGeneration(ctx, claudeUsageProvider, &g)
+		bad := cliUsageGeneration{Epoch: -1, Counter: 1}
+		return []cliAgentUsage{{Provider: claudeUsageProvider, CollectedAt: "now", UsageGeneration: &bad}}, nil
+	}
+	t.Cleanup(func() { gatherCLIUsageForRefresh = prev })
+	published := stubRefreshPublish(t, nil)
+
+	if err := handleCLIUsageRefreshCommand(context.Background(), nil, commandMsg{ID: "c1", RefreshID: "r1", Ts: 1}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*published) != 1 || (*published)[0].Success == nil || *(*published)[0].Success || len((*published)[0].CliAgents) != 0 {
+		t.Fatalf("published = %+v, want the failure result", *published)
+	}
+	if hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing); len(hints) != 2 || hints[0].hint.GenerationEpoch != 303 {
+		t.Fatalf("hints = %+v, want the released generation's hint and follow-up", hints)
 	}
 }

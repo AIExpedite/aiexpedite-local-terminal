@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -504,5 +507,69 @@ func TestClaudeCodeUsageParser_ErrorNoticeBlanksFableRowKeepingLabel(t *testing.
 	}
 	if !fable.Unknown || fable.Consumed != nil || fable.Remaining != nil || fable.Total != nil {
 		t.Errorf("fable row=%+v, want unobservable for an unusable login", fable)
+	}
+}
+
+// The published entry carries the generation of the commit its rows were read
+// from; reading it changes no value, observation time or generation.
+func TestClaudeCodeParser_PublishesTheCommittedGenerationWithoutTouchingTheReading(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	observed := time.Now().Add(-time.Minute).Truncate(time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 37, ResetsAtMs: observed.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
+	}, observed, currentClaudeAccountFingerprint(), claudeRateLimitSourceStatusLine)
+	before, _ := os.ReadFile(cache)
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+
+	usage, ok := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if !ok || usage.UsageGeneration == nil {
+		t.Fatalf("published no generation: %+v", usage)
+	}
+	if *usage.UsageGeneration != (cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}) {
+		t.Fatalf("published generation %+v, cache holds %d/%d", usage.UsageGeneration, snap.GenerationEpoch, snap.Generation)
+	}
+	row := usage.Metrics[0]
+	if row.Consumed == nil || *row.Consumed != 37 || row.ObservedAt != observed.UTC().Format(time.RFC3339) {
+		t.Fatalf("five-hour row = %+v, want 37%% observed at %s", row, observed.UTC().Format(time.RFC3339))
+	}
+	if after, _ := os.ReadFile(cache); string(after) != string(before) {
+		t.Fatalf("the read rewrote the cache:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// Repeated debt-forced gathers while a persisted 429 hold stands join the
+// existing schedule: zero provider requests, the booked rung untouched.
+func TestClaudeCodeParser_DebtForcedGathersDuringAHoldIssueNoRequests(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	pinClaudeRunDebtLadder(t, []time.Duration{time.Hour}, time.Hour, 20*time.Millisecond)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-3*time.Hour))
+	claudeHoldUsageProbe("", time.Now().Add(time.Hour))
+	claudeOweRunRefreshNow(time.Now())
+	claudeFreshnessWaitIdle(t)
+	booked := claudeCacheSnapshot(t, cache)
+	if booked.RefreshOwedAtMs == 0 || booked.HeldUntilMs == 0 {
+		t.Fatalf("fixture: want a debt behind a hold, got %+v", booked)
+	}
+	baseline := atomic.LoadInt64(calls)
+
+	for i := 0; i < 5; i++ {
+		claudeCodeUsageParser{}.ParseContext(WithClaudeUsageForceProbe(context.Background(), claudeForceDebt), "", detectedCLIAgent{}, time.Now())
+	}
+	claudeFreshnessWaitIdle(t)
+	if n := atomic.LoadInt64(calls) - baseline; n != 0 {
+		t.Fatalf("debt-forced gathers during the hold sent %d requests", n)
+	}
+	after := claudeCacheSnapshot(t, cache)
+	if after.RefreshOwedAtMs != booked.RefreshOwedAtMs || after.RefreshOwedAttempts != booked.RefreshOwedAttempts ||
+		after.HeldUntilMs != booked.HeldUntilMs || after.NextAttemptAtMs != booked.NextAttemptAtMs {
+		t.Fatalf("the gathers moved the schedule:\nbooked %+v\nafter  %+v", booked, after)
 	}
 }

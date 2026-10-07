@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -640,4 +641,55 @@ func readStatusLine(t *testing.T, path string) claudeStatusLine {
 	var sl claudeStatusLine
 	_ = json.Unmarshal(settings["statusLine"], &sl)
 	return sl
+}
+
+// A status-line render captured BEFORE a probe but landing AFTER it (the hook
+// is a separate process, scheduled whenever Claude renders) must not regress
+// the probe's values, observation times or capture generation. The hook does
+// no network work and leaves nothing of its payload in the cache.
+func TestCaptureClaudeRateLimitsFromStatusline_OlderRenderCannotRegressANewerProbe(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	clearClaudeEnvAuth(t)
+	resetCLIUsagePropagator()
+	t.Cleanup(resetCLIUsagePropagator)
+	prevSend := sendCLIUsageObservedHint
+	sendCLIUsageObservedHint = func(_ context.Context, _ string, _ cliUsageObservedHint) int {
+		t.Error("the status-line hook must never reach the network")
+		return 0
+	}
+	t.Cleanup(func() { sendCLIUsageObservedHint = prevSend })
+
+	renderedAt := time.Now().Add(-30 * time.Second)
+	probedAt := time.Now()
+	reset := probedAt.Add(2 * time.Hour).Truncate(time.Second)
+	if _, err := mergeClaudeRateLimitCacheProbeScoped(context.Background(), cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 44, ResetsAtMs: reset.UnixMilli(), ObservedAtMs: probedAt.UnixMilli(), usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 19, ResetsAtMs: reset.Add(96 * time.Hour).UnixMilli(), ObservedAtMs: probedAt.UnixMilli(), usageKnown: true},
+	}, probedAt, "", nil, claudeCredStamp{}); err != nil {
+		t.Fatal(err)
+	}
+	won, _ := loadClaudeRateLimitSnapshot(cache)
+
+	payload := `{"workspace":{"current_dir":"/secret/repo"},"session_id":"sess-private",` +
+		`"rate_limits":{"five_hour":{"used_percentage":12,"resets_at":` + strconv.FormatInt(reset.Unix(), 10) +
+		`},"seven_day":{"used_percentage":3,"resets_at":` + strconv.FormatInt(reset.Add(96*time.Hour).Unix(), 10) + `}}}`
+	captureClaudeRateLimitsFromStatusline([]byte(payload), renderedAt)
+
+	after, _ := loadClaudeRateLimitSnapshot(cache)
+	for _, w := range []string{claudeWindowFiveHour, claudeWindowSevenDay} {
+		if after.Buckets[w].UsedPercentage != won.Buckets[w].UsedPercentage || after.Buckets[w].ObservedAtMs != won.Buckets[w].ObservedAtMs {
+			t.Fatalf("%s regressed to the older render: %+v, want %+v", w, after.Buckets[w], won.Buckets[w])
+		}
+	}
+	if after.GenerationEpoch != won.GenerationEpoch || after.Generation != won.Generation || won.Generation != 1 {
+		t.Fatalf("generation moved on a refused render: %d/%d, want %d/%d", after.GenerationEpoch, after.Generation, won.GenerationEpoch, won.Generation)
+	}
+	raw, _ := os.ReadFile(cache)
+	for _, leaked := range []string{"secret", "sess-private", "current_dir", "/repo"} {
+		if strings.Contains(string(raw), leaked) {
+			t.Fatalf("the cache carries status-line payload %q: %s", leaked, raw)
+		}
+	}
 }
