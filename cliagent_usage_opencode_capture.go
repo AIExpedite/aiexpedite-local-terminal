@@ -90,7 +90,7 @@ type openCodeUsageBucket struct {
 
 // tokens is what "Tokens today" publishes.
 func (b openCodeUsageBucket) tokens() int64 {
-	return b.InputTokens + b.OutputTokens + b.ReasoningTokens
+	return addOpenCodeUsageCount(addOpenCodeUsageCount(b.InputTokens, b.OutputTokens), b.ReasoningTokens)
 }
 
 // openCodeUsageDebt is a run whose usage is not in a bucket yet. Armed
@@ -123,6 +123,12 @@ type openCodeUsageStep struct {
 	CacheRead  int64
 	CacheWrite int64
 	Cost       float64
+}
+
+// isZero reports whether the step spends nothing. Field by field, so counts
+// near the int64 bound cannot sum to a wrapped zero.
+func (s openCodeUsageStep) isZero() bool {
+	return s.Input == 0 && s.Output == 0 && s.Reasoning == 0 && s.CacheRead == 0 && s.CacheWrite == 0 && s.Cost == 0
 }
 
 // openCodeUsageLockWait bounds how long a ledger write waits on another agent
@@ -357,7 +363,7 @@ func openCodeLocalDay(t time.Time) (date string, resetAt time.Time) {
 // mirrors the per-step skip in mergeOpenCodeUsageSteps.
 func openCodeUsageStepsCarryUsage(steps []openCodeUsageStep) bool {
 	for _, s := range steps {
-		if s.Input+s.Output+s.Reasoning+s.CacheRead+s.CacheWrite != 0 || s.Cost != 0 {
+		if !s.isZero() {
 			return true
 		}
 	}
@@ -381,17 +387,17 @@ func mergeOpenCodeUsageSteps(ledger *openCodeUsageLedger, fingerprint string, st
 			seen[step.Key] = true
 			ledger.SeenSteps = append(ledger.SeenSteps, step.Key)
 		}
-		if step.Input+step.Output+step.Reasoning+step.CacheRead+step.CacheWrite == 0 && step.Cost == 0 {
+		if step.isZero() {
 			continue
 		}
 		date, _ := openCodeLocalDay(time.UnixMilli(step.AtMs))
 		bucket := openCodeUsageBucketFor(ledger, fingerprint, date)
-		bucket.InputTokens += step.Input
-		bucket.OutputTokens += step.Output
-		bucket.ReasoningTokens += step.Reasoning
-		bucket.CacheReadTokens += step.CacheRead
-		bucket.CacheWriteTokens += step.CacheWrite
-		bucket.CostUsd += step.Cost
+		bucket.InputTokens = addOpenCodeUsageCount(bucket.InputTokens, step.Input)
+		bucket.OutputTokens = addOpenCodeUsageCount(bucket.OutputTokens, step.Output)
+		bucket.ReasoningTokens = addOpenCodeUsageCount(bucket.ReasoningTokens, step.Reasoning)
+		bucket.CacheReadTokens = addOpenCodeUsageCount(bucket.CacheReadTokens, step.CacheRead)
+		bucket.CacheWriteTokens = addOpenCodeUsageCount(bucket.CacheWriteTokens, step.CacheWrite)
+		bucket.CostUsd = addOpenCodeUsageCost(bucket.CostUsd, step.Cost)
 		if step.AtMs > bucket.ObservedAtMs {
 			bucket.ObservedAtMs = step.AtMs
 		}
@@ -474,12 +480,12 @@ func adoptPendingOpenCodeUsageBuckets(fingerprint string) bool {
 		ledger.Buckets = kept
 		for _, p := range pending {
 			target := openCodeUsageBucketFor(ledger, fingerprint, p.LocalDate)
-			target.InputTokens += p.InputTokens
-			target.OutputTokens += p.OutputTokens
-			target.ReasoningTokens += p.ReasoningTokens
-			target.CacheReadTokens += p.CacheReadTokens
-			target.CacheWriteTokens += p.CacheWriteTokens
-			target.CostUsd += p.CostUsd
+			target.InputTokens = addOpenCodeUsageCount(target.InputTokens, p.InputTokens)
+			target.OutputTokens = addOpenCodeUsageCount(target.OutputTokens, p.OutputTokens)
+			target.ReasoningTokens = addOpenCodeUsageCount(target.ReasoningTokens, p.ReasoningTokens)
+			target.CacheReadTokens = addOpenCodeUsageCount(target.CacheReadTokens, p.CacheReadTokens)
+			target.CacheWriteTokens = addOpenCodeUsageCount(target.CacheWriteTokens, p.CacheWriteTokens)
+			target.CostUsd = addOpenCodeUsageCost(target.CostUsd, p.CostUsd)
 			if p.ObservedAtMs > target.ObservedAtMs {
 				target.ObservedAtMs = p.ObservedAtMs
 			}
@@ -618,12 +624,12 @@ func captureOpenCodeUsageLine(run *openCodeUsageRun, line string) {
 		default:
 			last := &run.steps[len(run.steps)-1]
 			last.Key = ""
-			last.Input += step.Input
-			last.Output += step.Output
-			last.Reasoning += step.Reasoning
-			last.CacheRead += step.CacheRead
-			last.CacheWrite += step.CacheWrite
-			last.Cost += step.Cost
+			last.Input = addOpenCodeUsageCount(last.Input, step.Input)
+			last.Output = addOpenCodeUsageCount(last.Output, step.Output)
+			last.Reasoning = addOpenCodeUsageCount(last.Reasoning, step.Reasoning)
+			last.CacheRead = addOpenCodeUsageCount(last.CacheRead, step.CacheRead)
+			last.CacheWrite = addOpenCodeUsageCount(last.CacheWrite, step.CacheWrite)
+			last.Cost = addOpenCodeUsageCost(last.Cost, step.Cost)
 			last.AtMs = max(last.AtMs, step.AtMs)
 		}
 	}
@@ -813,9 +819,30 @@ func openCodeUsageFromTokens(tokensRaw, costRaw json.RawMessage) (openCodeUsageS
 
 // openCodeUsageMaxInt bounds a token count or timestamp before its int64
 // conversion: the largest integer a float64 holds exactly. Past the int64 range
-// that conversion is implementation-defined (it can go negative), and the
-// headroom keeps a day's bucket sums from overflowing.
+// that conversion is implementation-defined (it can go negative). Sums of
+// bounded steps can still pass int64, so they saturate (addOpenCodeUsageCount).
 const openCodeUsageMaxInt = 1 << 53
+
+// addOpenCodeUsageCount sums two non-negative counts, saturating at
+// math.MaxInt64: each step is bounded by openCodeUsageMaxInt, but a day's
+// bucket accumulates across any number of runs, so a corrupt provider repeating
+// huge counts must pin the total rather than wrap it negative.
+func addOpenCodeUsageCount(a, b int64) int64 {
+	if b > math.MaxInt64-a {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// addOpenCodeUsageCost sums two non-negative costs, saturating at the largest
+// finite float64: +Inf cannot be encoded to JSON, so it would refuse every
+// later ledger write.
+func addOpenCodeUsageCost(a, b float64) float64 {
+	if s := a + b; !math.IsInf(s, 0) {
+		return s
+	}
+	return math.MaxFloat64
+}
 
 // openCodeUsageNumber reads a JSON number. A string, NaN or ±Inf is invalid.
 func openCodeUsageNumber(raw json.RawMessage) (float64, bool) {

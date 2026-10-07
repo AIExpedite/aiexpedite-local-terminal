@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -269,6 +271,36 @@ func TestMergeOpenCodeUsageSteps_BucketCapEvictsTheOldest(t *testing.T) {
 		if b.LocalDate < "2026-01-04" {
 			t.Fatalf("bucket %s survived the cap; the oldest must go first", b.LocalDate)
 		}
+	}
+}
+
+func TestMergeOpenCodeUsageSteps_SumsSaturateInsteadOfWrapping(t *testing.T) {
+	ledger := openCodeUsageLedger{SchemaVersion: openCodeUsageSchemaVersion}
+	at := time.Now().UnixMilli()
+	// 1,024 steps at the per-frame bound sum to exactly 2^63: one past int64.
+	steps := make([]openCodeUsageStep, 1024)
+	for i := range steps {
+		steps[i] = openCodeUsageStep{Key: fmt.Sprint(i), AtMs: at, Input: openCodeUsageMaxInt, Output: openCodeUsageMaxInt, Cost: math.MaxFloat64}
+	}
+	mergeOpenCodeUsageSteps(&ledger, "fp", steps)
+	if len(ledger.Buckets) != 1 {
+		t.Fatalf("buckets = %d, want 1", len(ledger.Buckets))
+	}
+	b := ledger.Buckets[0]
+	if b.InputTokens != math.MaxInt64 || b.OutputTokens != math.MaxInt64 {
+		t.Fatalf("input/output = %d/%d, want both saturated at MaxInt64", b.InputTokens, b.OutputTokens)
+	}
+	if b.tokens() != math.MaxInt64 {
+		t.Fatalf("tokens() = %d, want saturated at MaxInt64", b.tokens())
+	}
+	if math.IsInf(b.CostUsd, 0) || b.CostUsd != math.MaxFloat64 {
+		t.Fatalf("cost = %v, want saturated at MaxFloat64", b.CostUsd)
+	}
+	if _, err := json.Marshal(ledger); err != nil {
+		t.Fatalf("a saturated ledger must still encode: %v", err)
+	}
+	if (openCodeUsageStep{Input: math.MaxInt64, Output: 1}).isZero() {
+		t.Fatal("a step whose counts wrap to zero must still carry usage")
 	}
 }
 
