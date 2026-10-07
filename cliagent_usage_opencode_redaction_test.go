@@ -26,7 +26,7 @@ var (
 		"continuationDue": true, "continuationFailures": true, "continuationFirstFailureAtMs": true,
 		"continuationPasses": true,
 		"skipped":            true, "sessionHash": true, "updatedMs": true,
-		"rechecks": true, "dueAtMs": true,
+		"rechecks": true, "dueAtMs": true, "expiresAtMs": true,
 		"days": true, "messages": true, "streamSessions": true, "partial": true,
 		"in": true, "out": true, "reasoning": true, "cacheRead": true, "cacheWrite": true,
 		"costMicros": true, "observedAtMs": true,

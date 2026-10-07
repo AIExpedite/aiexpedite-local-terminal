@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -5333,14 +5334,33 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	// run's settle can read agy's own log block.
 	capture := armAntigravityCaptureForCommand("windows execute", cmd, args)
 	defer capture.Finish()
-	onStart := capture.SetWrapper
 
 	// Armed at function ENTRY, beside the capture above, because the Windows
 	// transport chain has no single post-Start hook. Execute runs are never
-	// tapped, so this one always owes a reconcile
+	// tapped, so a run that DID start always owes a reconcile
 	// (cliagent_usage_opencode_freshness.go).
+	//
+	// A run that never started owes nothing, and onStart is the one signal every
+	// transport here already reports: the oversized-script path failing to write
+	// its temp .ps1, or PowerShell failing to launch at all, leaves it unset, and
+	// the settle below then disarms instead of opening a debt no inference earns.
+	// Repeated spawn failures would otherwise spend the ladder and mark today's
+	// totals partial.
 	openCodeUsage := armOpenCodeUsageForCommand("windows execute", cmd, args)
-	defer settleOpenCodeUsageRunAsync(openCodeUsage, false)
+	var openCodeStarted atomic.Bool
+	onStart := func(wrapperPID int) {
+		if wrapperPID > 0 {
+			openCodeStarted.Store(true)
+		}
+		capture.SetWrapper(wrapperPID)
+	}
+	defer func() {
+		if !openCodeStarted.Load() {
+			openCodeUsage.Disarm()
+			return
+		}
+		settleOpenCodeUsageRunAsync(openCodeUsage, false)
+	}()
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
 	isEncodedPowerShell := strings.ToLower(cmd) == "powershell" &&
@@ -5435,7 +5455,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	capture.SetWrapper(ps.HostPID())
+	onStart(ps.HostPID())
 	output, err := ps.Execute(ctx, cmdLine, workDir)
 	if err != nil {
 		// ExitCodeError means the command ran but exited non-zero — the PS
@@ -5454,7 +5474,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		if err != nil {
 			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
 		}
-		capture.SetWrapper(ps.HostPID())
+		onStart(ps.HostPID())
 
 		// Reuse the original context so the retry does not exceed the
 		// caller-requested timeout.  Creating a fresh full-timeout context here

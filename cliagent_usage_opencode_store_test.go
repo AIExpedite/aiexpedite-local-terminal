@@ -1337,21 +1337,46 @@ func TestOpenCodeReconcile_ReReadsASessionItMayHaveCaughtMidTurn(t *testing.T) {
 		t.Fatalf("tokens=%d rows=%d, want 55/2 once the rest of the turn is counted", tokens, rows)
 	}
 
-	// The re-read that found nothing new retires the record: a quiet session is
-	// never exported again, however many passes run.
+	// A re-read that found nothing new does NOT prove the turn ended: a model or
+	// tool step can spend longer than the delay without writing anything, and
+	// the rest of the turn would then be omitted for good. The record is kept.
 	quiet := later.Add(openCodeRecheckDelay + time.Second)
 	advance(quiet)
 	if settled := reconcileOpenCodeUsageOnce(context.Background(), quiet); settled.Outcome != openCodeReconcileOK {
 		t.Fatalf("settled outcome = %q, want ok for the second re-read", settled.Outcome)
 	}
 	spent := stub.exportCount()
-	final := quiet.Add(openCodeRecheckDelay + time.Second)
+	ledger := readOpenCodeUsageLedger()
+	if len(ledger.Rechecks) != 1 || ledger.Rechecks[0].DueAtMs <= quiet.UnixMilli() {
+		t.Fatalf("rechecks = %+v, want one quiet re-read to book another", ledger.Rechecks)
+	}
+	again := quiet.Add(openCodeRecheckDelay + time.Second)
+	advance(again)
+	if next := reconcileOpenCodeUsageOnce(context.Background(), again); next.Outcome != openCodeReconcileOK {
+		t.Fatalf("next outcome = %q, want ok for the third re-read", next.Outcome)
+	}
+	if stub.exportCount() != spent+1 {
+		t.Fatalf("exports = %d, want the quiet session read once more", stub.exportCount())
+	}
+
+	// The chain is bounded by openCodeRecheckMaxSpan from the last raised
+	// figure instead, after which a quiet session is never exported again.
+	final := later.Add(openCodeRecheckMaxSpan + time.Minute)
 	advance(final)
-	if last := reconcileOpenCodeUsageOnce(context.Background(), final); last.Outcome != openCodeReconcileNoChange {
+	if expiring := reconcileOpenCodeUsageOnce(context.Background(), final); expiring.Outcome != openCodeReconcileOK {
+		t.Fatalf("expiring outcome = %q, want ok", expiring.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
+		t.Fatalf("rechecks = %+v, want the chain to stand down once its span ran out", ledger.Rechecks)
+	}
+	spent = stub.exportCount()
+	beyond := final.Add(openCodeRecheckDelay + time.Second)
+	advance(beyond)
+	if last := reconcileOpenCodeUsageOnce(context.Background(), beyond); last.Outcome != openCodeReconcileNoChange {
 		t.Fatalf("last outcome = %q, want no_change", last.Outcome)
 	}
 	if stub.exportCount() != spent {
-		t.Fatal("a re-read that raised nothing must not book another")
+		t.Fatal("an expired re-read chain must not book another")
 	}
 }
 

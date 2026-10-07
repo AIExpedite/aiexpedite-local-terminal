@@ -170,6 +170,12 @@ type openCodeRecheckSession struct {
 	// DueAtMs is the earliest pass clock that may spend an export on the
 	// re-read, so a turn gets time to finish writing.
 	DueAtMs int64 `json:"dueAtMs"`
+	// ExpiresAtMs bounds the whole chain of re-reads for this session: a quiet
+	// re-read is NOT proof the turn ended (one model or tool step can easily
+	// outlast openCodeRecheckDelay without writing anything), so a quiet
+	// re-read books another until this clock passes. It is set from the FIRST
+	// booking and only extended by evidence the turn is still running.
+	ExpiresAtMs int64 `json:"expiresAtMs"`
 }
 
 // openCodeUsageLedger is the persisted state. See the file header for the

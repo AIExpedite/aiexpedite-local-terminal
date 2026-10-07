@@ -853,7 +853,14 @@ func openCodeBookRecheckWakeUp(now time.Time) bool {
 		openCodeMarkPartialIfBacklogged()
 		return false
 	}
-	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	// The flag has to reach DISK before the timer is worth arming: the fired
+	// timer and the startup recovery both re-read it and do nothing when it is
+	// clear, so a refused write would leave the re-read stranded behind a timer
+	// that reports success. Say so instead of claiming a booking.
+	if !updateOpenCodeUsageLedgerContinuation(true, 0, 0) {
+		logOpenCodeUsage("recheck book refused")
+		return false
+	}
 	// The due time is the base delay, and the pass spacing is the floor — the
 	// same rule every other booking here follows.
 	openCodeArmContinuation(openCodeSpacedDelay(readOpenCodeUsageFreshness(), now,
@@ -874,10 +881,13 @@ func clearOpenCodeContinuationDue() {
 	})
 }
 
-// updateOpenCodeUsageLedgerContinuation records the continuation chain's state.
+// updateOpenCodeUsageLedgerContinuation records the continuation chain's state,
+// reporting whether the new state reached DISK — the schedule is read back from
+// the file by the fired timer and by startup recovery, so a caller that only
+// matters once it is persisted (openCodeBookRecheckWakeUp) can check.
 // Zero failures clear the first-failure stamp with them.
-func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureAtMs int64) {
-	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureAtMs int64) bool {
+	_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 		// firstFailureAtMs is NOT coupled to `failures`: an offline tick keeps
 		// the chain without counting a failure, and its age is what
 		// refreshFreeRetryDelay grows the backoff from. Zeroing it whenever the
@@ -900,6 +910,7 @@ func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureA
 		l.ContinuationPasses = passes
 		return openCodeLedgerEdit{Changed: true}
 	})
+	return persisted
 }
 
 // openCodeMarkPartialIfBacklogged marks today a lower bound when a debt or a

@@ -1023,16 +1023,106 @@ func TestOpenCodeRecheck_BooksItsOwnPassAndRunsIt(t *testing.T) {
 	if tokens, _, rows := todayTotals(t, later); tokens != 55 || rows != 2 {
 		t.Fatalf("tokens=%d rows=%d, want 55/2 once the rest of the turn is counted", tokens, rows)
 	}
-	// The re-read that raised nothing retires the record, and with it the
-	// chain: a quiet session costs no further pass.
+	// A re-read that raised nothing is NOT proof the turn ended — one model or
+	// tool step can outlast the delay — so the record is kept and read again.
 	quiet := later.Add(openCodeRecheckDelay + time.Second)
 	advance(quiet)
 	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileOK {
 		t.Fatalf("quiet outcome = %q, want ok", outcome)
 	}
+	held := readOpenCodeUsageLedger()
+	if len(held.Rechecks) != 1 || !held.ContinuationDue {
+		t.Fatalf("ledger = continuationDue %v rechecks %+v, want one quiet re-read to keep the chain",
+			held.ContinuationDue, held.Rechecks)
+	}
+	if held.Rechecks[0].DueAtMs <= quiet.UnixMilli() {
+		t.Fatalf("dueAtMs = %d, want a later re-read booked after %d",
+			held.Rechecks[0].DueAtMs, quiet.UnixMilli())
+	}
+
+	// The chain is age-bounded instead: once openCodeRecheckMaxSpan from the
+	// last raised figure has run out, a quiet session costs no further pass.
+	expired := later.Add(openCodeRecheckMaxSpan + time.Minute)
+	advance(expired)
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileOK {
+		t.Fatalf("expired outcome = %q, want ok", outcome)
+	}
 	if ledger := readOpenCodeUsageLedger(); ledger.ContinuationDue || len(ledger.Rechecks) != 0 {
 		t.Fatalf("ledger = continuationDue %v rechecks %+v, want the chain finished",
 			ledger.ContinuationDue, ledger.Rechecks)
+	}
+}
+
+func TestOpenCodeRecheck_DoesNotClaimAWakeUpItCouldNotPersist(t *testing.T) {
+	// The booking is only real once continuationDue reaches DISK: the fired
+	// timer and the startup recovery both re-read the flag and do nothing when
+	// it is clear. A refused write that still armed a timer and reported
+	// success stranded the re-read behind a pass that exits immediately.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeRememberRecheckSession(l, "ses_live", now.UnixMilli(),
+			now.Add(openCodeRecheckDelay).UnixMilli(), now.Add(openCodeRecheckMaxSpan).UnixMilli())
+		return openCodeLedgerEdit{Changed: true}
+	})
+
+	// A read-only PARENT: the record still reads back, so the booking is
+	// reached, and only its own write is refused.
+	dir := filepath.Dir(openCodeUsageLedgerPath())
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if openCodeBookRecheckWakeUp(now) {
+		t.Fatal("a booking whose continuationDue write was refused must not report success")
+	}
+	if openCodeRunDebtRetryPending() {
+		t.Fatal("a refused booking must not arm a timer whose pass would read the flag clear and exit")
+	}
+}
+
+// A Windows execute arms at function entry, because that transport chain has no
+// single post-Start hook — so a chain that never spawns anything must disarm
+// rather than open a debt no OpenCode inference earns. Repeated spawn failures
+// would otherwise spend the ladder and mark today's totals partial.
+func TestOpenCodeUsage_WindowsExecuteDisarmsWhenNothingSpawns(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	// A pass that cannot pay, so neither a debt opened by mistake nor the real
+	// one below is retired out from under the assertions.
+	(&openCodeCLIStub{sessions: "[]", launchError: true}).install(t)
+
+	restore := runEncodedPowerShellViaArgFn
+	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
+	// The oversized-script temp file that cannot be written, or PowerShell
+	// failing to launch: the transport returns without ever reporting a start.
+	runEncodedPowerShellViaArgFn = func(string, string, time.Duration, func(int)) (string, error) {
+		return "", fmt.Errorf("powershell failed to start")
+	}
+	encoded := encodeForPowerShell(`opencode run "hello"`)
+	if _, err := runLocalCommandWindows("powershell",
+		[]string{"-EncodedCommand", encoded}, t.TempDir(), 5*time.Second); err == nil {
+		t.Fatal("want the stubbed pre-spawn failure")
+	}
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+	if state := readOpenCodeFreshness(t); state.owed() {
+		t.Fatalf("state = %+v, want no debt for a run that never started", state)
+	}
+
+	// And the same chain, once a transport DOES report its start, still owes the
+	// one reconcile an untapped execute always owes.
+	runEncodedPowerShellViaArgFn = func(_, _ string, _ time.Duration, onStart func(int)) (string, error) {
+		onStart(4242)
+		return "ok", nil
+	}
+	if _, err := runLocalCommandWindows("powershell",
+		[]string{"-EncodedCommand", encoded}, t.TempDir(), 5*time.Second); err != nil {
+		t.Fatalf("windows execute failed: %v", err)
+	}
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+	if state := readOpenCodeFreshness(t); !state.owed() {
+		t.Fatalf("state = %+v, want the untapped execute's debt", state)
 	}
 }
 

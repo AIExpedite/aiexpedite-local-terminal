@@ -93,6 +93,13 @@ const (
 	// finished when we read it, and re-reading it would be an export for
 	// nothing.
 	openCodeSessionMaybeActiveWindow = 15 * time.Minute
+	// openCodeRecheckMaxSpan bounds a session's whole chain of re-reads from
+	// the first booking. A quiet re-read is not completion evidence — a single
+	// step can outlast openCodeRecheckDelay — so the chain stands down on this
+	// clock rather than on the first unchanged export. It is the same span as
+	// the active window above: a turn that has written nothing for that long is
+	// treated as finished everywhere in this file.
+	openCodeRecheckMaxSpan = openCodeSessionMaybeActiveWindow
 )
 
 // openCodeReconcileResult is one pass's closed answer.
@@ -598,37 +605,67 @@ func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string)
 //
 // A first export qualifies on the session's own age: one updated within
 // openCodeSessionMaybeActiveWindow of this pass may have been mid-turn. A
-// re-read qualifies on EVIDENCE instead — it is booked again only when it
-// raised a figure, which is what proves the turn was still running, and is what
-// stops a quiet session being exported forever.
+// re-read that RAISED a figure proves the turn was still running and starts the
+// expiry span again. A QUIET re-read is not completion evidence — one model or
+// tool step can easily outlast openCodeRecheckDelay, and OpenCode can then write
+// the rest of the turn without advancing the session's `updated`, so standing
+// down on it would omit that remainder for good. The chain is age-bounded by
+// openCodeRecheckMaxSpan instead, which is what stops a quiet session being
+// exported forever.
 func openCodeScheduleRecheck(ledger *openCodeUsageLedger, candidate openCodeSessionRow, wasRecheck, raised bool, commitMs int64) bool {
+	expiresAtMs, hadExpiry := openCodeRecheckExpiry(*ledger, candidate.id)
 	changed := openCodeForgetRecheckSession(ledger, candidate.id)
 	switch {
-	case wasRecheck && !raised:
-		// The re-read found nothing new: the turn is over.
-		return changed
+	case wasRecheck && raised:
+		// Fresh figures: the turn is still running, so the span starts over.
+		expiresAtMs = commitMs + openCodeRecheckMaxSpan.Milliseconds()
 	case wasRecheck:
+		// Quiet. Keep re-reading until the span this chain started with runs
+		// out. A record written before this field existed has no expiry, so it
+		// gets one span from here rather than becoming immortal.
+		if !hadExpiry {
+			expiresAtMs = commitMs + openCodeRecheckMaxSpan.Milliseconds()
+		}
+		if commitMs+openCodeRecheckDelay.Milliseconds() > expiresAtMs {
+			return changed
+		}
 	case candidate.updatedMs <= 0 ||
 		commitMs-candidate.updatedMs >= openCodeSessionMaybeActiveWindow.Milliseconds():
 		// Last written long before this pass, so nothing was in flight.
 		return changed
+	default:
+		expiresAtMs = commitMs + openCodeRecheckMaxSpan.Milliseconds()
 	}
-	openCodeRememberRecheckSession(ledger, candidate.id, candidate.updatedMs, commitMs+openCodeRecheckDelay.Milliseconds())
+	openCodeRememberRecheckSession(ledger, candidate.id, candidate.updatedMs,
+		commitMs+openCodeRecheckDelay.Milliseconds(), expiresAtMs)
 	return true
+}
+
+// openCodeRecheckExpiry reads a session's remembered chain expiry, and whether
+// it had one at all.
+func openCodeRecheckExpiry(ledger openCodeUsageLedger, sessionID string) (int64, bool) {
+	hash := openCodeUsageHash(sessionID, "")
+	for _, entry := range ledger.Rechecks {
+		if entry.SessionHash == hash {
+			return entry.ExpiresAtMs, entry.ExpiresAtMs > 0
+		}
+	}
+	return 0, false
 }
 
 // openCodeRememberRecheckSession books one later re-read of a session, bounded
 // by openCodeLedgerMaxRechecks (the prune keeps the newest).
-func openCodeRememberRecheckSession(ledger *openCodeUsageLedger, sessionID string, updatedMs, dueAtMs int64) {
+func openCodeRememberRecheckSession(ledger *openCodeUsageLedger, sessionID string, updatedMs, dueAtMs, expiresAtMs int64) {
 	hash := openCodeUsageHash(sessionID, "")
 	for i := range ledger.Rechecks {
 		if ledger.Rechecks[i].SessionHash == hash {
 			ledger.Rechecks[i].UpdatedMs, ledger.Rechecks[i].DueAtMs = updatedMs, dueAtMs
+			ledger.Rechecks[i].ExpiresAtMs = expiresAtMs
 			return
 		}
 	}
 	ledger.Rechecks = append(ledger.Rechecks, openCodeRecheckSession{
-		SessionHash: hash, UpdatedMs: updatedMs, DueAtMs: dueAtMs,
+		SessionHash: hash, UpdatedMs: updatedMs, DueAtMs: dueAtMs, ExpiresAtMs: expiresAtMs,
 	})
 	openCodePruneRechecks(ledger, openCodeUsageNow())
 }
