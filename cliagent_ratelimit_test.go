@@ -754,6 +754,55 @@ func TestImportPinnedClaudeObservations_VersionsThePinnedReadingInTheOwnCache(t 
 	}
 }
 
+// An import whose lock or write failed leaves the own cache without the newer
+// pinned reading, yet the merged view still displays it. The own generation
+// does not version that row, so the view must carry none until an import
+// lands it — otherwise a receipt would sign the pinned row under it.
+func TestLoadMergedClaudeRateLimitView_WithholdsTheGenerationForAnUnimportedPinnedReading(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(ownCache, bucket(10, now.Add(-time.Hour)), now, "acct", claudeRateLimitSourceStream)
+	if g := loadMergedClaudeRateLimitView("acct").generation; g == nil {
+		t.Fatal("fixture: the own cache carries no generation")
+	}
+
+	// The hook commits a newer reading to the pinned cache and no import lands it.
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+	view := loadMergedClaudeRateLimitView("acct")
+	if got := view.buckets[claudeWindowFiveHour].UsedPercentage; got != 91 {
+		t.Fatalf("view five_hour = %v, want the fresher pinned reading displayed", got)
+	}
+	if view.generation != nil {
+		t.Fatalf("view generation = %+v, want none while the own cache lacks the displayed pinned row", view.generation)
+	}
+
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil {
+		t.Fatal("the pinned reading was not imported")
+	}
+	if g := loadMergedClaudeRateLimitView("acct").generation; g == nil || *g != *imported {
+		t.Fatalf("view generation after import = %+v, want %+v", g, imported)
+	}
+}
+
 // A fresh dual-channel install has no own cache and a hook pinned to the other
 // channel, and the fresh pinned reading keeps the staleness probe — the other
 // writer of the own cache — away. The import must create the own cache, so this

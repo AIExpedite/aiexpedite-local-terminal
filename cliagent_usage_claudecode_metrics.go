@@ -98,6 +98,10 @@ type claudeRateLimitView struct {
 	// file under its own epoch, which this agent neither publishes nor hints:
 	// its newer readings are folded into the own cache first
 	// (importPinnedClaudeObservations), so the own generation versions them.
+	// Also nil while the view still selects a pinned numeric reading the own
+	// cache lacks — an import whose lock or write failed, or a hook commit
+	// that landed after it — because the own generation does not version that
+	// row and a receipt must never sign it under one.
 	generation *cliUsageGeneration
 }
 
@@ -124,6 +128,7 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 	}
 
 	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}
+	selectsUnimportedPinned := false
 	for i, path := range paths {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok || snap.AccountFingerprint != currentFingerprint {
@@ -139,8 +144,14 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 			prev, seen := view.buckets[window]
 			if !seen || bucket.ObservedAtMs > prev.ObservedAtMs {
 				view.buckets[window] = bucket
+				if i > 0 && bucket.hasObservedUsage() {
+					selectsUnimportedPinned = true
+				}
 			}
 		}
+	}
+	if selectsUnimportedPinned {
+		view.generation = nil
 	}
 	return view
 }
