@@ -159,8 +159,14 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 
 	ledger := readOpenCodeUsageLedger()
 	plan := planOpenCodeReconcile(ledger, sessions, now)
-	result := openCodeReconcileResult{Remaining: plan.remaining}
+	result := openCodeReconcileResult{}
 	committed, skippedChanged := false, false
+	// settled counts exports that reached a commit decision — merged, or
+	// recorded as over-cap. Everything else in the plan is still a candidate
+	// next pass, which is what `remaining` has to say: counting a FAILED export
+	// as done under-reported the backlog in the pass log.
+	settled := 0
+	remaining := func() int { return plan.remaining + len(plan.exports) - settled }
 
 	if plan.cursorFloorMs > ledger.ReconcileCursorMs || plan.undatable > 0 {
 		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
@@ -178,28 +184,24 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	}
 
 	for _, candidate := range plan.exports {
-		if ctx.Err() != nil {
-			if result.Exported == 0 && !committed {
-				return openCodeFinishPass(openCodeReconcileResult{
-					Outcome: openCodeReconcileTimeout, Remaining: plan.remaining,
-				})
+		// The budget, and a shutdown: a pass that started just before teardown
+		// must not keep spawning children through it. The schedule is on disk,
+		// so the next process picks the backlog up.
+		if ctx.Err() != nil || IsShutdownInProgress() {
+			if settled == 0 {
+				result.Outcome, result.Remaining = openCodeReconcileTimeout, remaining()
+				return openCodeFinishPass(result)
 			}
-			// Some sessions were committed before the budget ran out; what is
-			// left is a backlog for the next pass, not a failure.
-			result.Remaining += len(plan.exports) - result.Exported
+			// Some sessions were committed before it ran out; what is left is a
+			// backlog for the next pass, not a failure.
 			break
 		}
 		observations, filled, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
 		result.Exported++
-		switch {
-		case outcome == openCodeReconcileTimeout && !committed:
-			return openCodeFinishPass(openCodeReconcileResult{
-				Outcome: openCodeReconcileTimeout, Exported: result.Exported, Remaining: plan.remaining,
-			})
-		case outcome != "":
-			// A launch or decode failure mid-pass: stop, keeping what landed.
-			result.Outcome = outcome
-			result.Remaining += len(plan.exports) - result.Exported
+		if outcome != "" {
+			// A timeout, a launch failure or unrecognised output mid-pass: stop,
+			// keeping whatever landed before it.
+			result.Outcome, result.Remaining = outcome, remaining()
 			return openCodeFinishPass(result)
 		}
 		commitMs := openCodeUsageNow().UnixMilli()
@@ -213,8 +215,8 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 					edit.Changed = true
 				} else {
 					openCodeRememberSkippedSession(l, candidate.id, candidate.updatedMs)
-					edit.Changed = openCodeMarkTodayPartial(l, openCodeUsageNow()) || true
-					skippedChanged = true
+					openCodeMarkTodayPartial(l, openCodeUsageNow())
+					edit.Changed, skippedChanged = true, true
 				}
 			} else {
 				edit.TotalsChanged = openCodeMergeObservations(l, observations, commitMs)
@@ -231,15 +233,19 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			}
 			return edit
 		})
+		settled++
 	}
 
+	result.Remaining = remaining()
 	switch {
 	case result.Remaining > 0 && (committed || skippedChanged):
 		result.Outcome = openCodeReconcileMore
 	case result.Remaining > 0:
-		// Cannot happen: every attempted export ends in a merge or a skipped
-		// record. Treated as `more` only if something moved, so an
-		// unreachable no-progress pass reports no_change rather than looping.
+		// Unreachable: every export that reaches the commit block either merges
+		// or records a skip, and one that does not returns above — so a pass
+		// cannot leave candidates behind without having moved something. Kept
+		// as no_change rather than `more` so an impossible state cannot book an
+		// endless continuation.
 		result.Outcome = openCodeReconcileNoChange
 	case committed:
 		result.Outcome = openCodeReconcileOK

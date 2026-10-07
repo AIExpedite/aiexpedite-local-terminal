@@ -905,9 +905,14 @@ func (h *openCodeRunUsage) Finish(cleanEnd bool) bool {
 	covered := cleanEnd && h.sawTokens && !h.gaps
 	h.mu.Unlock()
 
-	// Deterministic merge order so two runs committing the same message cannot
-	// produce a different file byte-for-byte.
+	// A TOTAL order, so which messages get in when the day's row cap is reached
+	// is deterministic rather than map-iteration order. (The committed file is
+	// byte-stable either way: the rows live in a map, and encoding/json sorts
+	// map keys.)
 	sort.Slice(observations, func(i, j int) bool {
+		if observations[i].SessionID != observations[j].SessionID {
+			return observations[i].SessionID < observations[j].SessionID
+		}
 		return observations[i].MessageID < observations[j].MessageID
 	})
 	sort.Strings(sessions)

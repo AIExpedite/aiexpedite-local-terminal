@@ -693,3 +693,81 @@ func TestOpenCodeReconcile_SkipsASessionWithNoReadableTimestamp(t *testing.T) {
 		t.Fatalf("a second pass ran %d more exports, want none", stub.exportCount()-before)
 	}
 }
+
+func TestOpenCodeReconcile_ReportsAFailedExportAsStillRemaining(t *testing.T) {
+	// `remaining` is the backlog the next pass has to do, and the pass log's
+	// only measure of it. An export that FAILED did not commit and its session
+	// is still a candidate, so counting it as done under-reported the backlog.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+	rows := []openCodeSessionRow{
+		{"ses_a", created + 1}, {"ses_b", created + 2}, {"ses_c", created + 3}, {"ses_d", created + 4},
+	}
+	calls := 0
+	openCodeUsageBinary = func() string { return "opencode-stub" }
+	openCodeRunCommand = func(_ context.Context, _ string, args []string, _ int) ([]byte, bool, error) {
+		if args[0] == "session" {
+			return []byte(sessionList(rows...)), false, nil
+		}
+		calls++
+		if calls == 1 {
+			return []byte(exportWith("ses_a", "msg_a", created, 5, 0, "0")), false, nil
+		}
+		// The second export cannot be launched at all.
+		return nil, false, errors.New("exec: not found")
+	}
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome != openCodeReconcileLaunchError {
+		t.Fatalf("outcome = %q, want launch_error", result.Outcome)
+	}
+	// One of four settled: the failed one and the two never attempted are all
+	// still the next pass's work.
+	if result.Remaining != 3 {
+		t.Fatalf("remaining = %d, want 3 (the failed export plus the two unattempted)", result.Remaining)
+	}
+	// And what DID land is kept, with the cursor only past the committed one.
+	if tokens, _, _ := todayTotals(t, now); tokens != 5 {
+		t.Fatalf("tokens = %d, want the committed export's 5", tokens)
+	}
+	if cursor := readOpenCodeUsageLedger().ReconcileCursorMs; cursor != created+1 {
+		t.Fatalf("cursor = %d, want it only past the committed session (%d)", cursor, created+1)
+	}
+}
+
+func TestOpenCodeReconcile_StopsSpawningChildrenDuringShutdown(t *testing.T) {
+	// A pass that started just before teardown must not keep spawning
+	// `opencode` through it; the schedule is on disk for the next process.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+	exports := map[string]string{}
+	rows := make([]openCodeSessionRow, 0, 3)
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("ses_%d", i)
+		rows = append(rows, openCodeSessionRow{id, created + int64(i+1)})
+		exports[id] = exportWith(id, fmt.Sprintf("msg_%d", i), created, 4, 0, "0")
+	}
+	stub := (&openCodeCLIStub{sessions: sessionList(rows...), exports: exports}).install(t)
+
+	// Shutdown begins after the first export.
+	t.Cleanup(func() { shutdownInProgress.Store(false) })
+	prev := openCodeRunCommand
+	openCodeRunCommand = func(ctx context.Context, path string, args []string, limit int) ([]byte, bool, error) {
+		out, filled, err := prev(ctx, path, args, limit)
+		if args[0] == "export" {
+			shutdownInProgress.Store(true)
+		}
+		return out, filled, err
+	}
+
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	if got := stub.exportCount(); got != 1 {
+		t.Fatalf("exports = %d, want the pass to stop after the first once shutdown began", got)
+	}
+	// The one that committed is kept, so the restart resumes rather than redoes.
+	if tokens, _, _ := todayTotals(t, now); tokens != 4 {
+		t.Fatalf("tokens = %d, want the committed export's 4", tokens)
+	}
+}

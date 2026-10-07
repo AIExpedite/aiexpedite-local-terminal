@@ -2265,7 +2265,9 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   continuation's included (`openCodeSpacedDelay`): the chain is armed on the
   30-second free-retry floor, so without that it would spawn `opencode` twice a
   minute for its whole budget. One export of a long session can take seconds of
-  CPU on the user's machine.
+  CPU on the user's machine. A pass also stops the moment shutdown begins
+  rather than spawning the rest of its exports through teardown — the schedule
+  is on disk, so the next process picks the backlog up.
 - **Bounds.** 5,000 message rows per day for 2 days (about 1 MB at the cap), 512
   stream-captured sessions per day, 32 remembered over-cap exports. Past the row
   cap, or when an over-cap export has to be skipped, the day is `partial` and the
