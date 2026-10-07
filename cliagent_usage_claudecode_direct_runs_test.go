@@ -215,6 +215,45 @@ func TestClaudeOweDirectRun_OnlyAnUnpaidRetirementStartsTheQuietWindow(t *testin
 	}
 }
 
+// Evidence met by a standing debt is not marked as handled: once the older
+// debt settles with a reading that covers only its own baseline, the next scan
+// owes the newer run.
+func TestClaudeDirectRunScan_StandingEvidenceIsReconsideredAfterTheDebtSettles(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-2*time.Hour))
+	owed := now.Add(-20 * time.Minute).UnixMilli()
+	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(), func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts = owed, 1
+		return true
+	})
+	evidence := now.Add(-time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", evidence)
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != owed {
+		t.Fatalf("the standing debt moved: %+v", snap)
+	}
+
+	// The older debt is paid by a reading that covers its baseline only.
+	seedClaudeProbeReading(t, cache, now.Add(-10*time.Minute))
+	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(), func(snap *claudeRateLimitSnapshot) bool {
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = 0, 0, 0
+		return true
+	})
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
+		t.Fatalf("debt=%d, want the newer run owed after the standing debt settled", snap.RefreshOwedAtMs)
+	}
+}
+
 func TestClaudeDirectRunScan_IsThrottled(t *testing.T) {
 	resetClaudeUsageWatchState()
 	t.Cleanup(resetClaudeUsageWatchState)

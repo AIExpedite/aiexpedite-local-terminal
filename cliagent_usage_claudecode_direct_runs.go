@@ -140,11 +140,15 @@ func claudeScanDirectRuns(now time.Time) {
 	if outcome == claudeDirectRunBusy {
 		return // the cache refused the write: retried at the next scan
 	}
-	s.mu.Lock()
-	if newestMs > s.lastEvidenceMs {
-		s.lastEvidenceMs = newestMs
+	// A standing debt only defers the evidence: its probe may cover just its
+	// own baseline, so the newer run is reconsidered once that debt settles.
+	if outcome != claudeDirectRunStanding {
+		s.mu.Lock()
+		if newestMs > s.lastEvidenceMs {
+			s.lastEvidenceMs = newestMs
+		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
 	logClaudeDirectRun(outcome, files, took)
 }
 
