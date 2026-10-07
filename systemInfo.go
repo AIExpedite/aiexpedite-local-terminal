@@ -406,13 +406,18 @@ func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 	if info == nil {
 		return false
 	}
+	// Read before taking machineInfoMu: the catalog has its own lock.
+	var parserKeys map[string]string
+	if info.cliUsageFromCache {
+		parserKeys = cliAgentParserKeys()
+	}
 	machineInfoMu.Lock()
 	if !machineInfoStartedAfter(info, machineInfoCache) {
 		machineInfoMu.Unlock()
 		return false
 	}
 	if info.cliUsageFromCache && machineInfoCache != nil {
-		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents)
+		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents, parserKeys)
 		info.cliUsageFromCache = false
 	}
 	machineInfoCache = info
@@ -424,17 +429,13 @@ func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 // withCurrentCLIUsage refreshes a cliAgentUsageFallback snapshot from the
 // usage the cache holds now: a CLI the cache has an entry for takes that entry
 // (a usage refresh may have landed since the snapshot), keeping the version
-// and path the gather detected; any other entry stays as it was.
-func withCurrentCLIUsage(snapshot, current []cliAgentUsage) []cliAgentUsage {
-	byID := make(map[string]cliAgentUsage, len(current))
-	for _, u := range current {
-		if u.CliAgentID != "" {
-			byID[u.CliAgentID] = u
-		}
-	}
+// and path the gather detected; any other entry stays as it was. parserKeys
+// maps a catalog id to its parser key (cliAgentParserKeys).
+func withCurrentCLIUsage(snapshot, current []cliAgentUsage, parserKeys map[string]string) []cliAgentUsage {
+	byID := cliUsageByID(current)
 	out := make([]cliAgentUsage, 0, len(snapshot))
 	for _, u := range snapshot {
-		cur, ok := byID[u.CliAgentID]
+		cur, ok := lookupCLIUsage(byID, u.CliAgentID, parserKeys[u.CliAgentID])
 		if !ok {
 			out = append(out, u)
 			continue
@@ -733,6 +734,41 @@ func awaitCLIAgentUsage(usageCh <-chan []cliAgentUsage, usageStarted time.Time, 
 	return cliAgentUsageFallback(detected, GetMachineInfo(), now), true
 }
 
+// cliUsageByID indexes usage entries by CliAgentID.
+func cliUsageByID(usage []cliAgentUsage) map[string]cliAgentUsage {
+	byID := make(map[string]cliAgentUsage, len(usage))
+	for _, u := range usage {
+		if u.CliAgentID != "" {
+			byID[u.CliAgentID] = u
+		}
+	}
+	return byID
+}
+
+// lookupCLIUsage finds a CLI's usage by its catalog id, else by its parser
+// key: some parsers (opencode, museCode) stamp their built-in id, so a catalog
+// entry naming one through capabilities.utilization.parserKey has its usage
+// recorded under that id.
+func lookupCLIUsage(byID map[string]cliAgentUsage, agentID, parserKey string) (cliAgentUsage, bool) {
+	if u, ok := byID[agentID]; ok {
+		return u, true
+	}
+	if parserKey != "" && parserKey != agentID {
+		u, ok := byID[parserKey]
+		return u, ok
+	}
+	return cliAgentUsage{}, false
+}
+
+// cliAgentParserKeys maps each active catalog id to its parser key.
+func cliAgentParserKeys() map[string]string {
+	keys := map[string]string{}
+	for _, agent := range activeCLIAgentCatalog() {
+		keys[agent.ID] = cliAgentCatalogParserKey(agent)
+	}
+	return keys
+}
+
 // cliAgentUsageFallback is the CliAgents slice for a gather whose usage pass
 // missed its budget: for each detected CLI, the entry the cache already holds
 // (the last full gather, kept current by the usage refresh paths), or else the
@@ -743,14 +779,10 @@ func cliAgentUsageFallback(detected map[string]detectedCLIAgent, cached *Machine
 	if len(detected) == 0 {
 		return out
 	}
-	known := map[string]cliAgentUsage{}
+	var known map[string]cliAgentUsage
 	if cached != nil {
 		machineInfoMu.RLock()
-		for _, u := range cached.CliAgents {
-			if u.CliAgentID != "" {
-				known[u.CliAgentID] = u
-			}
-		}
+		known = cliUsageByID(cached.CliAgents)
 		machineInfoMu.RUnlock()
 	}
 	host, err := os.Hostname()
@@ -766,18 +798,9 @@ func cliAgentUsageFallback(detected map[string]detectedCLIAgent, cached *Machine
 		if !ok || !entry.Detected {
 			continue
 		}
-		// Some parsers (opencode, museCode) stamp their built-in id, so an
-		// entry naming one through parserKey was cached under that id.
-		cachedUsage, ok := known[agent.ID]
-		if !ok {
-			if key := cliAgentCatalogParserKey(agent); key != agent.ID {
-				cachedUsage, ok = known[key]
-			}
-		}
-		if ok {
+		if u, ok := lookupCLIUsage(known, agent.ID, cliAgentCatalogParserKey(agent)); ok {
 			// Usage and account are last known; where the CLI is and which
 			// version it is are what this gather just detected.
-			u := cachedUsage
 			if entry.Version != "" {
 				u.Version = entry.Version
 			}

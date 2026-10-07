@@ -319,6 +319,17 @@ func TestCLIAgentUsageFallback_FindsUsageCachedUnderTheParserID(t *testing.T) {
 	}
 }
 
+func TestWithCurrentCLIUsage_FindsARefreshRecordedUnderTheParserID(t *testing.T) {
+	// The snapshot had no cached usage for the aliased CLI, so it carries the
+	// catalog id; the refresh that landed since recorded the parser's id.
+	snapshot := []cliAgentUsage{{CliAgentID: "openBuild", Provider: "opencode", Version: "1.1.0", Path: "/bin/opencode"}}
+	current := []cliAgentUsage{{CliAgentID: "opencode", Provider: "opencode", Version: "1.0.0", Account: "fresh"}}
+	got := withCurrentCLIUsage(snapshot, current, map[string]string{"openBuild": "opencode"})
+	if len(got) != 1 || got[0].Account != "fresh" || got[0].Version != "1.1.0" || got[0].Path != "/bin/opencode" {
+		t.Fatalf("the refresh must be found through the parser id: %+v", got)
+	}
+}
+
 // sequencedMachine is a gather result as gatherMachineInfoBounded makes it:
 // stamped at second resolution, ordered by its start sequence.
 func sequencedMachine(at time.Time) *MachineInfo {
