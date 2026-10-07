@@ -163,7 +163,7 @@ func armOpenCodeUsageRunForExecutable(executable, dir string) *openCodeUsageRun 
 // persistSessionIDAsync records the run's session id on its armed debt.
 func (run *openCodeUsageRun) persistSessionIDAsync(sessionID string) {
 	// A refused arm left no debt to name: the settle writes the id if it owes.
-	if run == nil || sessionID == "" || run.armRefused.Load() ||!run.persistedSession.CompareAndSwap(false, true) {
+	if run == nil || sessionID == "" || run.armRefused.Load() || !run.persistedSession.CompareAndSwap(false, true) {
 		return
 	}
 	openCodeUsageInFlight.Add(1)
