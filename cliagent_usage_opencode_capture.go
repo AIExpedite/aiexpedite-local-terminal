@@ -601,6 +601,14 @@ type openCodeUsageRun struct {
 	armRefused atomic.Bool
 	// persistedSession is set once the session id reached the armed debt.
 	persistedSession atomic.Bool
+	// streamClosed is set by finishOpenCodeUsageRun: the run's stream is over,
+	// so no further step can join it and the export fallback is free to pay
+	// whatever the stream left owed.
+	streamClosed atomic.Bool
+	// exportDeferred records that an export attempt stood down because this run
+	// could still commit the same spend, so the attempt is re-booked the moment
+	// the run goes quiet.
+	exportDeferred atomic.Bool
 }
 
 // captureOpenCodeUsageLine reads one streamed line: a step-finish frame's
@@ -698,6 +706,16 @@ func (run *openCodeUsageRun) untake(from, n int) {
 		run.committed = from
 	}
 	run.mu.Unlock()
+}
+
+// pendingCommit reports whether the run still holds steps no ledger write has
+// accepted — either never taken, or taken and handed back by untake while a
+// commit retry is booked. Those steps carry their own streamed keys, so the
+// export fallback must not pay the same turn while any of them is outstanding.
+func (run *openCodeUsageRun) pendingCommit() bool {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	return run.committed < len(run.steps)
 }
 
 // openCodeUsageFrame is the permissive subset of an event the capture reads.

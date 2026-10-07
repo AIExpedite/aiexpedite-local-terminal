@@ -18,6 +18,11 @@
 //     the process; that write is booked on the same commit ladder when refused,
 //     because nothing else revisits a settled run. With no session id nothing can
 //     be exported: the debt is dropped ("unattributable").
+//   - Coordinate: a run settled on its terminal event (a terminal session whose
+//     child still runs) stays LIVE until its exit path finishes it. Its export
+//     stands down while it is live, spending no attempt: a streamed step is
+//     keyed by its part id and an exported message by its message id, so paying
+//     both would count the turn twice.
 //   - Ladder: attempts at 15 s, 1 m and 5 m, each one `opencode export <id>`
 //     with a 5 s timeout. A refusal that spent nothing (offline, binary
 //     missing) books refreshFreeRetryDelay without consuming an attempt. A
@@ -75,7 +80,69 @@ var (
 	// openCodeUsageTimers holds each debt's booked attempt, by run id.
 	openCodeUsageTimersMu sync.Mutex
 	openCodeUsageTimers   = map[string]*time.Timer{}
+	// openCodeUsageLiveRuns holds the runs THIS process could still commit
+	// from after their settle, by run id: one settled on its terminal event
+	// whose stream has not closed, or whose steps a refused write still owes
+	// the ledger. A streamed step is keyed by its
+	// part id and an exported message by its message id, so the two paths
+	// cannot dedup against each other — the export stands down instead for as
+	// long as the run might still pay the same turn. A debt adopted from an
+	// earlier process has no entry here, so it exports at once.
+	openCodeUsageLiveMu   sync.Mutex
+	openCodeUsageLiveRuns = map[string]*openCodeUsageRun{}
 )
+
+// settleOpenCodeUsageRunOnStream settles a run whose stream may outlive its
+// settle: a terminal session's turn, settled on its terminal event while the
+// child still runs. The run is registered as live first, so an export booked by
+// that settle stands down until finishOpenCodeUsageRun says the stream is over.
+func settleOpenCodeUsageRunOnStream(run *openCodeUsageRun, sessionID string) {
+	if run == nil {
+		return
+	}
+	openCodeUsageLiveMu.Lock()
+	openCodeUsageLiveRuns[run.id] = run
+	openCodeUsageLiveMu.Unlock()
+	settleOpenCodeUsageRun(run, sessionID)
+}
+
+// releaseOpenCodeUsageLiveRun drops the run once it can commit nothing more:
+// its stream is closed and no step is waiting on a write. Called from every
+// path that ends a run or finishes a ledger write, so the map holds only runs
+// that are genuinely still open.
+func releaseOpenCodeUsageLiveRun(run *openCodeUsageRun) {
+	if run == nil || !run.streamClosed.Load() || run.pendingCommit() {
+		return
+	}
+	openCodeUsageLiveMu.Lock()
+	delete(openCodeUsageLiveRuns, run.id)
+	openCodeUsageLiveMu.Unlock()
+}
+
+// openCodeUsageLiveRun returns the run a debt belongs to, if this process still
+// holds it open.
+func openCodeUsageLiveRun(runID string) *openCodeUsageRun {
+	openCodeUsageLiveMu.Lock()
+	defer openCodeUsageLiveMu.Unlock()
+	return openCodeUsageLiveRuns[runID]
+}
+
+// finishOpenCodeUsageRun closes a run: its stream is over, so nothing else can
+// join or re-offer its steps. Callers settle (or flush) FIRST and finish last,
+// so a late step is already committed — or booked on the commit ladder, which
+// keeps the run live — before the export fallback is released. An export that
+// stood down while the run was open is re-booked at the ladder's head rather
+// than left on its grown free delay.
+func finishOpenCodeUsageRun(run *openCodeUsageRun) {
+	if run == nil {
+		return
+	}
+	run.streamClosed.Store(true)
+	releaseOpenCodeUsageLiveRun(run)
+	if run.exportDeferred.CompareAndSwap(true, false) {
+		scheduleOpenCodeUsageAttempt(run.id, openCodeUsageDebtLadder[0])
+	}
+}
 
 /* --------------------------------------------------------------------------
    Arm / settle
@@ -322,7 +389,9 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 	if !commitOpenCodeUsageSteps(run, fingerprint, steps) {
 		run.untake(from, len(steps))
 		scheduleOpenCodeUsageCommit(run, fingerprint, 1)
+		return
 	}
+	releaseOpenCodeUsageLiveRun(run)
 }
 
 // scheduleOpenCodeUsageCommit books another attempt at committing a settled
@@ -336,6 +405,10 @@ func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, atte
 	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
 	if !more {
 		logOpenCodeUsageCapture("commit_abandoned")
+		// The steps stay in memory, but no write will offer them again: the
+		// run's debt is what pays this turn now, so the export is released.
+		run.takeUncommitted()
+		releaseOpenCodeUsageLiveRun(run)
 		return
 	}
 	logOpenCodeUsageCapture("commit_retry")
@@ -355,10 +428,12 @@ func retryOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt
 	steps, _, from := run.takeUncommitted()
 	if !openCodeUsageStepsCarryUsage(steps) {
 		clearOpenCodeUsageTimer(run.id)
+		releaseOpenCodeUsageLiveRun(run)
 		return
 	}
 	if commitOpenCodeUsageSteps(run, fingerprint, steps) {
 		clearOpenCodeUsageTimer(run.id)
+		releaseOpenCodeUsageLiveRun(run)
 		return
 	}
 	run.untake(from, len(steps))
@@ -539,6 +614,16 @@ func attemptOpenCodeUsageDebt(runID string) {
 		// A ledger edited (or written by a build without the check) never puts
 		// an unvetted id on argv.
 		retireOpenCodeUsageDebt(runID, "unattributable")
+		return
+	}
+	if live := openCodeUsageLiveRun(runID); live != nil {
+		// The run is still open here: a step that lands (or a refused write that
+		// retries) would commit this same turn under its streamed part key,
+		// which no exported message key can dedup against. Spend nothing, and
+		// let finishOpenCodeUsageRun re-book the attempt when the run is quiet.
+		live.exportDeferred.Store(true)
+		logOpenCodeUsageCapture("deferred_run_live")
+		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
 		return
 	}
 	executable := resolveOpenCodeExecutable()
@@ -866,5 +951,8 @@ func resetOpenCodeUsageFreshness() {
 		delete(openCodeUsageTimers, id)
 	}
 	openCodeUsageTimersMu.Unlock()
+	openCodeUsageLiveMu.Lock()
+	openCodeUsageLiveRuns = map[string]*openCodeUsageRun{}
+	openCodeUsageLiveMu.Unlock()
 	openCodeUsageInFlight.Wait()
 }

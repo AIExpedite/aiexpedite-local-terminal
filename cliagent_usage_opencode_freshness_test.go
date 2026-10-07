@@ -306,6 +306,83 @@ func TestOpenCodeUsage_AStepAfterTheTerminalEventStillCommits(t *testing.T) {
 	}
 }
 
+// A terminal session settled on its terminal event can stream another step
+// before it exits: the streamed step is keyed by its part id and an exported
+// message by its message id, so an export that paid the debt meanwhile would
+// count the same turn twice. The export stands down while the run is live
+// (spending no attempt) and is released by the exit path.
+func TestOpenCodeUsage_TheExportStandsDownWhileTheRunCanStillCommit(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1012)
+	stubOpenCodeExecutable(t)
+	now := time.Now()
+	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
+		return openCodeExportJSON("msg_1", now.UnixMilli(), 300, 40, 0.5), true
+	})
+
+	session := &CLISession{Command: "opencode"}
+	session.openCodeUsageRun = armOpenCodeUsageRun("opencode", "", "fp-live")
+	run := session.openCodeUsageRun
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_live"}`)
+	session.settleCLIUsageRun(true) // terminal event: nothing captured yet, so the turn owes
+	openCodeUsageInFlight.Wait()
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || !d[0].owed() {
+		t.Fatalf("debts = %+v, want one owed debt", d)
+	}
+
+	sched.fireNext() // the export's first rung, with the run still streaming
+	if *calls != 0 {
+		t.Fatalf("export ran %d times while the run was live", *calls)
+	}
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].Attempts != 0 {
+		t.Fatalf("debts = %+v, want the deferral to spend no attempt", d)
+	}
+
+	// The step the terminal event raced lands, and the exit path commits it.
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_live", "prt_late", 300, 40, 0, "0.5", now.UnixMilli()))
+	session.settleCLIUsageRun(false)
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 0 {
+		t.Fatalf("debts = %+v, want the stream's commit to retire the debt", d)
+	}
+	// The deferred attempt is re-booked at the ladder head and finds nothing owed.
+	for sched.fireNext() {
+	}
+	if *calls != 0 {
+		t.Fatalf("export ran %d times for a turn the stream already paid", *calls)
+	}
+	if b, ok, _ := openCodeUsageBucketForDay("fp-live", now); !ok || b.tokens() != 340 || b.CostUsd != 0.5 {
+		t.Fatalf("bucket = %+v, want the turn counted exactly once", b)
+	}
+}
+
+// Once the run is over, the same debt is exported: the deferral is a wait on
+// the live stream, never a refusal to pay.
+func TestOpenCodeUsage_AReleasedRunExportsOnTheRebookedRung(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1013)
+	stubOpenCodeExecutable(t)
+	now := time.Now()
+	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
+		return openCodeExportJSON("msg_1", now.UnixMilli(), 300, 40, 0), true
+	})
+
+	session := &CLISession{Command: "opencode"}
+	session.openCodeUsageRun = armOpenCodeUsageRun("opencode", "", "fp-released")
+	captureOpenCodeUsageLine(session.openCodeUsageRun, `{"type":"session.created","sessionID":"ses_released"}`)
+	session.settleCLIUsageRun(true)
+	openCodeUsageInFlight.Wait()
+	sched.fireNext() // deferred: the run is live
+	session.settleCLIUsageRun(false)
+	sched.fireNext() // released: the export pays the debt
+	if *calls != 1 {
+		t.Fatalf("export ran %d times, want 1 once the run was released", *calls)
+	}
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 0 {
+		t.Fatalf("debts = %+v, want the export to have paid it", d)
+	}
+	if b, ok, _ := openCodeUsageBucketForDay("fp-released", now); !ok || b.tokens() != 340 {
+		t.Fatalf("bucket = %+v, want the exported 340 tokens", b)
+	}
+}
+
 // The session id comes from the child's own stdout and ends up on the export's
 // argv — through cmd.exe when OpenCode is an npm shim. One shaped like a flag or
 // carrying shell syntax is never stored, so nothing is owed for it and nothing

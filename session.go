@@ -1167,21 +1167,31 @@ func (s *CLISession) settleOpenCodeUsageRun(onStream bool) {
 	if run == nil {
 		return
 	}
-	settle := func() {
+	settle := func(onStream bool) {
 		if !s.openCodeUsageSettled.CompareAndSwap(false, true) {
 			flushOpenCodeUsageRun(run)
+			return
+		}
+		if onStream {
+			// The child may stream another step after this: the run stays live
+			// so its export fallback cannot pay a turn this stream still owns.
+			settleOpenCodeUsageRunOnStream(run, "")
 			return
 		}
 		settleOpenCodeUsageRun(run, "")
 	}
 	if !onStream {
-		settle()
+		settle(false)
+		// The exit path is the run's last word: a step that arrived after the
+		// terminal event is committed (or booked on the commit ladder) by the
+		// settle above, so releasing the export cannot double-pay the turn.
+		finishOpenCodeUsageRun(run)
 		return
 	}
 	openCodeUsageInFlight.Add(1)
 	go func() {
 		defer openCodeUsageInFlight.Done()
-		settle()
+		settle(true)
 	}()
 }
 
