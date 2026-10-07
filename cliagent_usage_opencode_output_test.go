@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -309,5 +310,35 @@ func TestOpenCodeUsageMetrics_NoCostRowAtZeroAndNoRowsWithoutABucket(t *testing.
 	}
 	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, now); rows != nil {
 		t.Fatalf("an empty bucket produced %+v", rows)
+	}
+}
+
+// A saturated or corrupt cost must still publish a finite number:
+// canonicalFloat rejects a non-finite metric and the whole signed refresh
+// would fail instead of carrying the reading.
+func TestOpenCodeUsageMetrics_ASaturatedCostStaysFinite(t *testing.T) {
+	now := time.Now()
+	for _, cost := range []float64{math.MaxFloat64, openCodeUsageMaxInt, 1e300} {
+		rows := openCodeUsageMetrics(openCodeUsageBucket{
+			InputTokens: 10, CostUsd: cost, ObservedAtMs: now.UnixMilli(),
+		}, true, now)
+		if len(rows) != 2 {
+			t.Fatalf("cost %v produced rows %+v, want tokens and cost", cost, rows)
+		}
+		published := *rows[1].Consumed
+		if math.IsInf(published, 0) || math.IsNaN(published) {
+			t.Fatalf("cost %v published %v, want a finite clamp", cost, published)
+		}
+		if published != openCodeUsageMaxInt {
+			t.Fatalf("cost %v published %v, want the clamp %v", cost, published, float64(openCodeUsageMaxInt))
+		}
+		if _, err := canonicalFloat(&published); err != nil {
+			t.Fatalf("cost %v is not signable: %v", cost, err)
+		}
+	}
+	// Ordinary spend still rounds to four decimals.
+	rows := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.123456, ObservedAtMs: now.UnixMilli()}, true, now)
+	if *rows[1].Consumed != 0.1235 {
+		t.Fatalf("cost = %v, want 0.1235", *rows[1].Consumed)
 	}
 }

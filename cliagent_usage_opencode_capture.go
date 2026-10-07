@@ -542,7 +542,7 @@ func openCodeUsageMetrics(bucket openCodeUsageBucket, ok bool, now time.Time) []
 		ObservedAt: observedAt,
 	}}
 	if bucket.CostUsd > 0 {
-		cost := math.Round(bucket.CostUsd*10000) / 10000
+		cost := openCodeUsagePublishedCost(bucket.CostUsd)
 		metrics = append(metrics, cliAgentUsageMetric{
 			Kind:       limitKindDaily,
 			Label:      "Cost today",
@@ -553,6 +553,22 @@ func openCodeUsageMetrics(bucket openCodeUsageBucket, ok bool, now time.Time) []
 		})
 	}
 	return metrics
+}
+
+// openCodeUsagePublishedCost rounds a day's cost to four decimals without an
+// overflowing multiplication: a saturated sum (math.MaxFloat64) or a corrupt
+// frame times 10,000 is +Inf, canonicalFloat rejects a non-finite metric, and
+// the whole signed refresh would fail rather than publish the reading. A cost
+// at or above openCodeUsageMaxInt is already far past any real daily spend, so
+// it is clamped there and published as-is.
+func openCodeUsagePublishedCost(cost float64) float64 {
+	if math.IsNaN(cost) {
+		return 0
+	}
+	if cost >= openCodeUsageMaxInt {
+		return openCodeUsageMaxInt
+	}
+	return math.Round(cost*10000) / 10000
 }
 
 /* --------------------------------------------------------------------------
