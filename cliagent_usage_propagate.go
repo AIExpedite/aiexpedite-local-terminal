@@ -52,6 +52,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -185,6 +186,17 @@ type cliUsagePropagatorState struct {
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
+
+// cliUsageHintInFlight counts timer callbacks that are running. A callback
+// releases p.mu around the outbound send and then re-reads the schedule, so
+// `stopped` alone does not tell a waiter the callback is done — and the pinned
+// durations and the send seam are package vars a test cleanup restores while
+// one could still be reading them (a -race failure in propagatorFixture).
+//
+// Same shape as grokFreshnessInFlight / openCodeFreshnessInFlight: an atomic
+// counter a bounded poll waits out, rather than a WaitGroup, because a timer
+// that is Stopped before firing would leave an Add with no Done.
+var cliUsageHintInFlight atomic.Int64
 
 // providerLocked returns (creating if needed) one provider's slot. Only
 // providers in cliUsageGenerationSources get one, so an unknown provider can
@@ -406,6 +418,8 @@ func (p *cliUsagePropagatorState) rearmLocked(now time.Time) {
 // fire is the timer callback: due rotation retries, the startup recovery checks,
 // then the single most overdue pending hint.
 func (p *cliUsagePropagatorState) fire(gen uint64) {
+	cliUsageHintInFlight.Add(1)
+	defer cliUsageHintInFlight.Add(-1)
 	p.mu.Lock()
 	if p.stopped || gen != p.timerGen {
 		p.mu.Unlock()
@@ -575,6 +589,20 @@ func cliUsageHintBlocked(rotated bool) string {
 	return ""
 }
 
+// cliUsageHintWaitIdle waits, bounded, for every timer callback to return, so a
+// caller may then restore a package var one of them reads. Reports whether it
+// went idle.
+func cliUsageHintWaitIdle(budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for cliUsageHintInFlight.Load() != 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
 func logCLIUsageHint(label string) {
 	fmt.Printf("%s[cli-usage] usage hint: %s%s\n", colorCyan, label, colorReset)
 }
@@ -584,6 +612,7 @@ func logCLIUsageHint(label string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	cliUsageHintWaitIdle(time.Second)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.timer != nil {

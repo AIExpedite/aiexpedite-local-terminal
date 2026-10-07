@@ -66,6 +66,10 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		return 202
 	}
 	t.Cleanup(func() {
+		// resetCLIUsagePropagator waits every timer callback out, which is what
+		// makes the two restores below safe: a callback releases p.mu around
+		// its send and then re-reads the schedule, so it could otherwise be
+		// reading the send seam or a pinned duration as this line replaces it.
 		stopCLIUsagePropagator()
 		resetCLIUsagePropagator()
 		sendCLIUsageObservedHint = prevSend
@@ -626,5 +630,104 @@ func TestCLIUsageHint_OpenCodeEpochStaysJavaScriptSafe(t *testing.T) {
 		if epoch := openCodeDrawGenerationEpoch(); epoch < 1 || epoch > maxSafe {
 			t.Fatalf("epoch %d outside [1, 2^53-1]", epoch)
 		}
+	}
+}
+
+// A provider held back by its OWN gate must not starve the other. The two share
+// one timer and one spacing window, and sendDue picks a single provider per
+// pass — so a Codex observation waiting on its epoch rotation could have parked
+// the whole schedule while OpenCode's reading sat ready.
+func TestCLIUsageHint_ABlockedProviderDoesNotStarveTheOther(t *testing.T) {
+	withCodexGenerationEpoch(t, 701)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	// OpenCode rotated; Codex deliberately NOT — its hint is gated on
+	// `awaiting_rotation`.
+	markOpenCodeRotated(t)
+
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(701, 4))
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(888, 1))
+
+	hints := waitHints(t, rec, 1, 2*cliUsageHintDebounce)
+	for _, h := range hints {
+		if h.hint.Provider != "opencode" {
+			t.Fatalf("hint = %+v, want only the rotated provider's", h.hint)
+		}
+	}
+	if len(hints) == 0 {
+		t.Fatal("the rotated provider's reading was starved by the blocked one")
+	}
+
+	// And once Codex rotates, its own held observation goes out — it was
+	// deferred, not dropped.
+	markRotated(t)
+	all := waitHints(t, rec, len(hints)+1, 2*cliUsageHintSpacing)
+	sawCodex := false
+	for _, h := range all {
+		if h.hint.Provider == "codex" {
+			sawCodex = true
+			if h.hint.GenerationEpoch != 701 || h.hint.Generation != 4 {
+				t.Fatalf("codex hint = %+v, want the observation it held {701,4}", h.hint)
+			}
+		}
+	}
+	if !sawCodex {
+		t.Fatal("the held Codex observation was dropped rather than deferred")
+	}
+}
+
+// A provider that keeps advancing must not starve the other either. The
+// invariant that makes starvation impossible is that sendDue picks the EARLIEST
+// due, and a slot's due is anchored to when its observation was noted — so the
+// quieter provider's older note always outranks the busy one's fresh one, no
+// matter how often the busy one re-notes.
+//
+// Asserted on nextDueLocked rather than by racing the live scheduler: the
+// debounce, the global spacing and the one timer interact, so a wall-clock race
+// against them is flaky — and a flaky test here would train people to ignore a
+// real starvation regression.
+func TestCLIUsageHint_TheEarliestNoteIsAlwaysDueFirst(t *testing.T) {
+	_, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+
+	p := cliUsagePropagator
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	quiet := p.providerLocked(codexUsageProvider)
+	busy := p.providerLocked(openCodeUsageProvider)
+	if quiet == nil || busy == nil {
+		t.Fatal("both providers must have a slot")
+	}
+
+	// The quiet provider noted once, a while ago.
+	quiet.pending = &cliUsagePendingHint{generation: gen(1, 1), noteAt: now.Add(-time.Minute)}
+	// The busy one has re-noted six times since, each reset moving its noteAt
+	// forward — which is what could have starved the other.
+	for c := int64(1); c <= 6; c++ {
+		busy.pending = &cliUsagePendingHint{generation: gen(2, c), noteAt: now.Add(time.Duration(c) * time.Millisecond)}
+	}
+
+	quietDue, okQuiet := p.nextDueLocked(quiet, now)
+	busyDue, okBusy := p.nextDueLocked(busy, now)
+	if !okQuiet || !okBusy {
+		t.Fatalf("both slots must report a due instant (%v/%v)", okQuiet, okBusy)
+	}
+	if !quietDue.Before(busyDue) {
+		t.Fatalf("quiet due %s is not before busy due %s — a busy provider would starve the other",
+			quietDue, busyDue)
+	}
+	// And the busy slot still carries only its NEWEST generation: the ones it
+	// superseded are never queued behind it.
+	if busy.pending.generation != gen(2, 6) {
+		t.Fatalf("busy pending = %+v, want only the newest generation", busy.pending.generation)
+	}
+
+	// A follow-up is due immediately, which is how the two-hint budget is spent
+	// at the next spacing boundary rather than after another debounce.
+	busy.pending.followUp = true
+	if due, _ := p.nextDueLocked(busy, now); due.After(now) {
+		t.Fatalf("a follow-up due %s is later than now — it waits only on the spacing", due)
 	}
 }
