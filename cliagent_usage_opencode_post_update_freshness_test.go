@@ -696,3 +696,78 @@ func TestOpenCodeUsage_AZeroWaitArmRefusesABusyInProcessWriter(t *testing.T) {
 		t.Fatalf("debts = %+v, want the refused arm unwritten", debts)
 	}
 }
+
+// Retirement is the run's terminal path: nothing else revisits the debt. A
+// refused removal must therefore keep its timer and retry, or the debt sits in
+// the ledger for the rest of the process and evicts newer recoverable runs.
+func TestOpenCodeUsage_ARefusedDebtRetirementIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1123)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	settleOpenCodeUsageRun(run, "ses_retire") // owed: the export ladder's head
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 {
+		t.Fatalf("debts = %+v, want the owed debt", debts)
+	}
+	// Past the age limit, so the attempt retires the debt without an export.
+	openCodeUsageFreshnessNow = func() time.Time { return time.Now().Add(openCodeUsageDebtMaxAge + time.Minute) }
+
+	release := holdOpenCodeLedgerLock(t)
+	sched.fireNext() // the retirement write is refused
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 {
+		t.Fatalf("debts = %+v, want the debt still on disk while the lock is held", debts)
+	}
+	if d := sched.delays(); len(d) != 2 || d[1] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head for the refused retirement", d)
+	}
+	sched.fireNext() // still held
+	if d := sched.delays(); len(d) != 3 || d[2] != openCodeUsageCommitLadder[1] {
+		t.Fatalf("booked %v, want the second commit rung", d)
+	}
+
+	release()
+	sched.fireNext()
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want the retirement to have landed", debts)
+	}
+	if d := sched.delays(); len(d) != 3 {
+		t.Fatalf("booked %v, want nothing more once the debt is gone", d)
+	}
+	openCodeUsageTimersMu.Lock()
+	left := len(openCodeUsageTimers)
+	openCodeUsageTimersMu.Unlock()
+	if left != 0 {
+		t.Fatalf("timers left = %d, want the retired run's timer cleared", left)
+	}
+}
+
+// A retirement the ledger never accepts gives up its timer once the ladder is
+// spent: the debt is still owed on disk, so the next process adopts it.
+func TestOpenCodeUsage_APermanentlyRefusedRetirementStopsRetrying(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1124)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 10 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	settleOpenCodeUsageRun(run, "ses_stuck")
+	openCodeUsageFreshnessNow = func() time.Time { return time.Now().Add(openCodeUsageDebtMaxAge + time.Minute) }
+
+	holdOpenCodeLedgerLock(t)
+	for sched.fireNext() {
+	}
+	if d := sched.delays(); len(d) != 1+len(openCodeUsageCommitLadder) {
+		t.Fatalf("booked %v, want the export head plus one booking per commit rung", d)
+	}
+	openCodeUsageTimersMu.Lock()
+	left := len(openCodeUsageTimers)
+	openCodeUsageTimersMu.Unlock()
+	if left != 0 {
+		t.Fatalf("timers left = %d, want the spent ladder to drop the timer", left)
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 1 || !debts[0].owed() {
+		t.Fatalf("debts = %+v, want the debt left owed for the next process", debts)
+	}
+}

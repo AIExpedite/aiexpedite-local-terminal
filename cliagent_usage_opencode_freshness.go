@@ -191,7 +191,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	// cost is zero — are not payment: the turn still owes a reading, and its
 	// export may carry one.
 	if sessionID == "" {
-		disarmOpenCodeUsageRunID(run.id)
+		_ = disarmOpenCodeUsageRunID(run.id)
 		logOpenCodeUsageCapture("unattributable")
 		return
 	}
@@ -362,14 +362,24 @@ func settleOrDisarmOpenCodeSmokeRun(run *openCodeUsageRun, succeeded bool) {
 // disarmOpenCodeUsageRun drops a run whose child never started.
 func disarmOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run != nil && run.settled.CompareAndSwap(false, true) {
-		disarmOpenCodeUsageRunID(run.id)
+		_ = disarmOpenCodeUsageRunID(run.id)
 	}
 }
 
-func disarmOpenCodeUsageRunID(runID string) {
-	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-		return removeOpenCodeUsageDebt(ledger, runID), false
+// disarmOpenCodeUsageRunID removes the run's debt, reporting whether the ledger
+// on disk no longer holds it: a debt that was already absent counts as gone, a
+// refused write (another process holding the ledger, or a failed rename) does
+// not.
+func disarmOpenCodeUsageRunID(runID string) bool {
+	absent := false
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		if !removeOpenCodeUsageDebt(ledger, runID) {
+			absent = true
+			return false, false
+		}
+		return true, false
 	})
+	return committed || absent
 }
 
 func openCodeUsageDebtByID(ledger *openCodeUsageLedger, runID string) *openCodeUsageDebt {
@@ -579,8 +589,47 @@ func openCodeUsageLedgerFree() bool {
 	return outcome != crossProcessLockContended
 }
 
+// retireOpenCodeUsageDebt drops a debt no attempt can pay. The timer is cleared
+// only once the removal is on disk: this is the run's terminal path, so a
+// refused write with the timer already gone would leave the debt holding one of
+// the ledger's slots for the rest of the process, evicting newer recoverable
+// runs — hence the same bounded commit ladder a refused owed write books.
 func retireOpenCodeUsageDebt(runID, label string) {
-	disarmOpenCodeUsageRunID(runID)
+	if !disarmOpenCodeUsageRunID(runID) {
+		scheduleOpenCodeUsageRetire(runID, label, 1)
+		return
+	}
+	clearOpenCodeUsageTimer(runID)
+	logOpenCodeUsageCapture(label)
+}
+
+// scheduleOpenCodeUsageRetire books another attempt at removing a retired
+// debt, `attempt` having already been booked. Once the budget is spent the
+// timer goes anyway: the debt is still owed on disk, so the next process adopts
+// it and either pays it by export or ages it out.
+func scheduleOpenCodeUsageRetire(runID, label string, attempt int) {
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		clearOpenCodeUsageTimer(runID)
+		logOpenCodeUsageCapture("retire_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("retire_retry")
+	openCodeUsageTimersMu.Lock()
+	defer openCodeUsageTimersMu.Unlock()
+	if t := openCodeUsageTimers[runID]; t != nil {
+		t.Stop()
+	}
+	openCodeUsageTimers[runID] = openCodeUsageAfterFunc(delay, func() {
+		retireOpenCodeUsageDebtAttempt(runID, label, attempt)
+	})
+}
+
+func retireOpenCodeUsageDebtAttempt(runID, label string, attempt int) {
+	if !disarmOpenCodeUsageRunID(runID) {
+		scheduleOpenCodeUsageRetire(runID, label, attempt+1)
+		return
+	}
 	clearOpenCodeUsageTimer(runID)
 	logOpenCodeUsageCapture(label)
 }
