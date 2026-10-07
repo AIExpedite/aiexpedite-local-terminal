@@ -209,9 +209,18 @@ func openCodeUsageTransaction(mutate func(ledger *openCodeUsageLedger) (write, c
 // openCodeUsageTransactionWithin is openCodeUsageTransaction waiting at most
 // lockWait for the cross-process lock; 0 tries once. For a write made while a
 // caller holds a lock of its own (the session manager's, across a spawn), where
-// waiting on another process would stall every other session.
+// waiting on another process would stall every other session. A zero wait also
+// refuses rather than queue behind an in-process writer, which may itself be
+// waiting on the cross-process lock or a stalled write.
 func openCodeUsageTransactionWithin(lockWait time.Duration, mutate func(ledger *openCodeUsageLedger) (write, changed bool)) (committed, changed bool, generation cliUsageGeneration) {
-	openCodeUsageMu.Lock()
+	if lockWait <= 0 {
+		if !openCodeUsageMu.TryLock() {
+			logOpenCodeUsageCapture("lock_busy")
+			return false, false, cliUsageGeneration{}
+		}
+	} else {
+		openCodeUsageMu.Lock()
+	}
 	path := openCodeUsageCachePath()
 	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(lockWait))
 	if outcome == crossProcessLockContended {

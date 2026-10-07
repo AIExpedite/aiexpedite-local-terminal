@@ -617,6 +617,11 @@ func adoptOwedOpenCodeUsage(startedAt time.Time) {
 				continue
 			case !d.owed():
 				d.OwedAtMs = now.UnixMilli()
+				// The run died before this process started: a turn resumed on
+				// the same session after startedAt streams and pays its own way.
+				if d.SettledAtMs == 0 {
+					d.SettledAtMs = startedAt.UnixMilli()
+				}
 				write = true
 			case now.Sub(time.UnixMilli(d.OwedAtMs)) > openCodeUsageDebtMaxAge:
 				aged++

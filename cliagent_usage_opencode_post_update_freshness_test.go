@@ -66,13 +66,14 @@ func TestOpenCodeUsage_ARunKilledMidTurnIsPaidOnlyWhenItNamedItsSession(t *testi
 	captureOpenCodeUsageLine(named, openCodeStepFinish("ses_killed", "prt_lost", 9, 9, 0, "0", time.Now().UnixMilli()))
 	openCodeUsageInFlight.Wait()
 	armOpenCodeUsageRun("opencode", "", "fp-a") // never named a session
+	killedAt := time.Now()
 
 	simulateOpenCodeProcessRestart(t, 1104)
 	exported := ""
 	stubOpenCodeExport(t, func(_ context.Context, sessionID string) ([]byte, bool) {
 		exported = sessionID
-		// Created after the run's floor; an adopted run has no settle bound.
-		return openCodeExportJSON("msg_k", time.Now().UnixMilli(), 11, 22, 0), true
+		// Created after the run's floor and before the restart boundary.
+		return openCodeExportJSON("msg_k", killedAt.UnixMilli(), 11, 22, 0), true
 	})
 	adoptOwedOpenCodeUsage(time.Now().Add(time.Second))
 	debts := loadOpenCodeUsageLedger().Debts
@@ -641,5 +642,57 @@ func TestOpenCodeUsage_ARefusedPrefixSurvivesAnOverlappingFlush(t *testing.T) {
 	}
 	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
 		t.Fatalf("debts = %+v after the turn committed", debts)
+	}
+}
+
+func TestOpenCodeUsage_AnAdoptedRunIsCappedAtTheRestartBoundary(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1131)
+	stubOpenCodeExecutable(t)
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_resumed"}`)
+	openCodeUsageInFlight.Wait()
+	killedAt := time.Now()
+
+	simulateOpenCodeProcessRestart(t, 1132)
+	startedAt := killedAt.Add(time.Second)
+	adoptOwedOpenCodeUsage(startedAt)
+	debts := loadOpenCodeUsageLedger().Debts
+	if len(debts) != 1 || debts[0].SettledAtMs != startedAt.UnixMilli() {
+		t.Fatalf("debts = %+v, want the adopted run bounded at the restart", debts)
+	}
+	// The same conversation is resumed in the new process before the export
+	// fires: its turn streams its own steps and must not be paid again here.
+	resumed := startedAt.Add(time.Second).UnixMilli()
+	stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) {
+		return []byte(fmt.Sprintf(`{"messages":[`+
+			`{"info":{"id":"msg_old","role":"assistant","cost":0,"tokens":{"input":11,"output":22},"time":{"created":%d}}},`+
+			`{"info":{"id":"msg_new","role":"assistant","cost":0,"tokens":{"input":500,"output":500},"time":{"created":%d}}}]}`,
+			killedAt.UnixMilli(), resumed)), true
+	})
+	for sched.fireNext() {
+	}
+	if b, _, _ := openCodeUsageBucketForDay("fp-a", time.Now()); b.tokens() != 33 {
+		t.Fatalf("tokens = %d, want only the interrupted run's 33", b.tokens())
+	}
+}
+
+func TestOpenCodeUsage_AZeroWaitArmRefusesABusyInProcessWriter(t *testing.T) {
+	openCodeUsageFixture(t, 1133)
+	openCodeUsageMu.Lock() // a settle stuck on the cross-process lock or a write
+	done := make(chan *openCodeUsageRun, 1)
+	go func() { done <- armOpenCodeUsageRun("opencode", "", "fp-a") }()
+	select {
+	case run := <-done:
+		openCodeUsageMu.Unlock()
+		if !run.armRefused {
+			t.Fatal("the arm reported success without writing")
+		}
+	case <-time.After(2 * time.Second):
+		openCodeUsageMu.Unlock()
+		<-done
+		t.Fatal("the zero-wait arm queued behind the in-process writer")
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v, want the refused arm unwritten", debts)
 	}
 }
