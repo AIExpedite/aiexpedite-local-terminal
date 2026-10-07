@@ -167,6 +167,8 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	if run == nil || !run.settled.CompareAndSwap(false, true) {
 		return
 	}
+	run.commitMu.Lock()
+	defer run.commitMu.Unlock()
 	steps, streamSession, from := run.takeUncommitted()
 	if !isValidOpenCodeSessionID(sessionID) {
 		sessionID = ""
@@ -268,6 +270,8 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 		return
 	}
 	fingerprint := run.settleFingerprint()
+	run.commitMu.Lock()
+	defer run.commitMu.Unlock()
 	steps, _, from := run.takeUncommitted()
 	if !openCodeUsageStepsCarryUsage(steps) {
 		return
@@ -303,6 +307,8 @@ func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, atte
 }
 
 func retryOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt int) {
+	run.commitMu.Lock()
+	defer run.commitMu.Unlock()
 	steps, _, from := run.takeUncommitted()
 	if !openCodeUsageStepsCarryUsage(steps) {
 		clearOpenCodeUsageTimer(run.id)

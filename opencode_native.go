@@ -830,7 +830,9 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		}
 		state.bytes += len(line)
 		if state.bytes > openCodeNativeMaxStdout {
+			// The line that crosses the cap is still usage like any after it.
 			state.overflow = true
+			captureOpenCodeUsageLine(usage, line)
 			continue
 		}
 		if state.raw.Len() < openCodeNativeMaxRawStdout {

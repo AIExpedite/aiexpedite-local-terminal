@@ -182,7 +182,7 @@ func TestCaptureOpenCodeUsage_DedupsByPartIDThenMessageAndEnd(t *testing.T) {
 	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
 	frame := openCodeStepFinish("ses_a", "prt_1", 10, 20, 0, "0", now.UnixMilli())
 	noPart := fmt.Sprintf(`{"type":"step_finish","sessionID":"ses_a","part":{"messageID":"msg_9","type":"step-finish","tokens":{"input":5},"time":{"end":%d}}}`, now.UnixMilli())
-	noKey := `{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":1}}}`
+	noKey := fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"part":{"type":"step-finish","tokens":{"input":1}}}`, now.UnixMilli())
 
 	run := armOpenCodeUsageRun("opencode", "", "fp-a")
 	for _, line := range []string{frame, frame, noPart, noPart, noKey} {

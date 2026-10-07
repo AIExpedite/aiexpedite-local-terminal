@@ -278,24 +278,54 @@ func openCodeBumpGeneration(ledger *openCodeUsageLedger) {
 // today still has numbers to publish (nil otherwise). Called once at startup
 // by the propagator, so a reading captured just before an update handoff —
 // whose hint died with that process — is hinted again. A ledger that never
-// published anything is left for its first real write to rotate.
-func openCodeRecoveryGeneration(now time.Time) *cliUsageGeneration {
+// published anything is left for its first real write to rotate. refused
+// reports a rotation the ledger did not commit (a contended lock, a failed
+// rename): the generation it would carry exists only in memory, so the caller
+// retries rather than hint it (recoverOpenCodeUsageGeneration).
+func openCodeRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
 	today, _ := openCodeLocalDay(now)
-	hasToday := false
-	_, _, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+	ran, hasToday, rotate := false, false, false
+	committed, _, g := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ran = true
 		for _, b := range ledger.Buckets {
 			if b.LocalDate == today && (b.tokens() > 0 || b.CostUsd > 0) {
 				hasToday = true
 			}
 		}
-		rotate := len(ledger.Buckets) > 0 && ledger.Generation.Epoch != codexProcessGenerationEpoch.Load()
+		rotate = len(ledger.Buckets) > 0 && ledger.Generation.Epoch != codexProcessGenerationEpoch.Load()
 		return rotate, rotate
 	})
-	if !hasToday || generation.Counter <= 0 || generation.Epoch != codexProcessGenerationEpoch.Load() {
-		return nil
+	// A contended lock never runs mutate, so it cannot say whether a rotation
+	// was due: that is a refusal too.
+	if !ran || (rotate && !committed) {
+		return nil, true
+	}
+	if !hasToday || g.Counter <= 0 || g.Epoch != codexProcessGenerationEpoch.Load() {
+		return nil, false
 	}
 	openCodeGenerationRotated.Store(true)
-	return &generation
+	return &g, false
+}
+
+// recoverOpenCodeUsageGeneration runs startup recovery, hinting a recovered
+// generation and retrying a refused rotation on the commit ladder — startup
+// asks only once, so an unretried refusal would leave the pre-update reading
+// stale until an unrelated capture or the periodic gather.
+func recoverOpenCodeUsageGeneration(attempt int) {
+	g, refused := openCodeRecoveryGeneration(time.Now())
+	if g != nil {
+		noteCLIUsageObservationAdvanced(openCodeUsageProvider, *g)
+	}
+	if !refused {
+		return
+	}
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		logOpenCodeUsageCapture("recovery_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("recovery_retry")
+	openCodeUsageAfterFunc(delay, func() { recoverOpenCodeUsageGeneration(attempt + 1) })
 }
 
 // openCodeLocalDay is t's local calendar date and the next local midnight — 23
@@ -528,6 +558,10 @@ type openCodeUsageRun struct {
 	steps []openCodeUsageStep
 	// committed counts the leading steps already handed to the ledger.
 	committed int
+	// commitMu serialises take→commit→untake: a terminal-event settle and an
+	// exit flush overlapping would otherwise let a refused prefix see a later
+	// take, stay marked handed, and be lost while the suffix retires the debt.
+	commitMu  sync.Mutex
 	sessionID string
 	settled   atomic.Bool
 	// armRefused reports that the arm wrote no debt, so there is none to name.

@@ -116,11 +116,11 @@ func TestOpenCodeUsage_TheLedgerSurvivesARestartAndRecoveryNotesItOnce(t *testin
 		t.Fatalf("published %+v before the rotation", usage.UsageGeneration)
 	}
 
-	g := openCodeRecoveryGeneration(now)
+	g, _ := openCodeRecoveryGeneration(now)
 	if g == nil || g.Epoch != 1107 || g.Counter != 1 {
 		t.Fatalf("recovery generation = %+v, want the rotated {1107,1}", g)
 	}
-	if again := openCodeRecoveryGeneration(now); again == nil || *again != *g {
+	if again, _ := openCodeRecoveryGeneration(now); again == nil || *again != *g {
 		t.Fatalf("a second recovery moved the generation to %+v", again)
 	}
 	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 42 {
@@ -128,7 +128,7 @@ func TestOpenCodeUsage_TheLedgerSurvivesARestartAndRecoveryNotesItOnce(t *testin
 	}
 	// Tomorrow there is nothing to publish, so nothing is recovered.
 	simulateOpenCodeProcessRestart(t, 1108)
-	if g := openCodeRecoveryGeneration(now.Add(48 * time.Hour)); g != nil {
+	if g, _ := openCodeRecoveryGeneration(now.Add(48 * time.Hour)); g != nil {
 		t.Fatalf("recovered %+v for a day with no numbers", g)
 	}
 }
@@ -564,5 +564,82 @@ func TestOpenCodeUsage_ARefusedAdoptionReportsPendingSpend(t *testing.T) {
 	}
 	if !adoptPendingOpenCodeUsageBuckets("fp-a") || !adoptPendingOpenCodeUsageBuckets("") {
 		t.Fatal("nothing to adopt must report adopted")
+	}
+}
+
+// A rotation the ledger refuses leaves the file on the old epoch: startup
+// recovery must not mark OpenCode rotated or hint an in-memory generation, and
+// it retries on the commit ladder until the rotation commits.
+func TestOpenCodeUsage_ARefusedRecoveryRotationIsRetriedNotHinted(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1121)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_1", 5, 6, 0, "0", now.UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRun(run, "")
+
+	simulateOpenCodeProcessRestart(t, 1122)
+	release := holdOpenCodeLedgerLock(t)
+	if g, refused := openCodeRecoveryGeneration(now); g != nil || !refused {
+		t.Fatalf("recovery under a held lock = %+v refused=%v, want a refusal", g, refused)
+	}
+	recoverOpenCodeUsageGeneration(1)
+	if openCodeGenerationRotated.Load() {
+		t.Fatal("a refused rotation marked OpenCode rotated")
+	}
+	if d := sched.delays(); len(d) != 1 || d[0] != openCodeUsageCommitLadder[0] {
+		t.Fatalf("booked %v, want the commit ladder's head", d)
+	}
+	if g := loadOpenCodeUsageLedger().Generation; g.Epoch == 1122 {
+		t.Fatalf("the ledger moved to the new epoch while the lock was held: %+v", g)
+	}
+
+	release()
+	sched.fireNext()
+	if !openCodeGenerationRotated.Load() {
+		t.Fatal("the retried rotation did not mark OpenCode rotated")
+	}
+	if g := loadOpenCodeUsageLedger().Generation; g.Epoch != 1122 || g.Counter != 1 {
+		t.Fatalf("generation %+v, want the retried rotation's {1122,1}", g)
+	}
+	if sched.fireNext() {
+		t.Fatal("a recovery that committed booked another retry")
+	}
+}
+
+// A terminal-event settle whose prefix commit is refused while an exit flush
+// waits behind it must not lose that prefix: commits are serialised per run,
+// so the flush takes the handed-back prefix together with its own suffix.
+func TestOpenCodeUsage_ARefusedPrefixSurvivesAnOverlappingFlush(t *testing.T) {
+	openCodeUsageFixture(t, 1123)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 300 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_1", 10, 0, 0, "0", now.UnixMilli()))
+	openCodeUsageInFlight.Wait()
+
+	start := time.Now()
+	release := holdOpenCodeLedgerLock(t)
+	done := make(chan struct{}, 2)
+	go func() { settleOpenCodeUsageRun(run, ""); done <- struct{}{} }() // refused at ~300ms
+	time.Sleep(100 * time.Millisecond)
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_2", 5, 0, 0, "0", now.UnixMilli()))
+	go func() { flushOpenCodeUsageRun(run); done <- struct{}{} }()
+	time.Sleep(time.Until(start.Add(400 * time.Millisecond)))
+	release() // after the settle gave up, while the flush still waits
+	<-done
+	<-done
+
+	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 15 {
+		t.Fatalf("bucket = %+v, want both steps' 15 tokens", b)
+	}
+	if debts := loadOpenCodeUsageLedger().Debts; len(debts) != 0 {
+		t.Fatalf("debts = %+v after the turn committed", debts)
 	}
 }

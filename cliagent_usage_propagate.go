@@ -134,6 +134,10 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
+	// firing is held across a timer callback, so a test reset can wait out
+	// one already past its timerGen check (it would otherwise log into the
+	// next test's captured stdout).
+	firing sync.Mutex
 }
 
 // pendingCLIUsageHint is one provider's newest unsent (or once-sent)
@@ -174,9 +178,7 @@ func startCLIUsagePropagator(cfg *Config) {
 		p.rotate(cliUsageRotationFirstRetry)
 		// OpenCode's ledger rotates on its own: a device that never ran Codex
 		// has no Codex rotation to wait on.
-		if g := openCodeRecoveryGeneration(time.Now()); g != nil {
-			noteCLIUsageObservationAdvanced(openCodeUsageProvider, *g)
-		}
+		recoverOpenCodeUsageGeneration(1)
 	}()
 }
 
@@ -330,6 +332,8 @@ func (p *cliUsagePropagatorState) armLocked(d time.Duration) {
 // fire is the timer callback: a due rotation retry, the startup recovery check,
 // then the pending hint.
 func (p *cliUsagePropagatorState) fire(gen uint64) {
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.timerGen {
 		p.mu.Unlock()
@@ -511,10 +515,13 @@ func logCLIUsageHint(label string) {
 }
 
 // resetCLIUsagePropagator restores the zero propagator in place (tests): a
-// timer callback already running sees the bumped timerGen and does nothing.
+// timer callback that has not reached its timerGen check sees the bump and does
+// nothing; one already past it is waited out.
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.timer != nil {

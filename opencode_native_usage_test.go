@@ -118,3 +118,37 @@ func TestOpenCodeNativeUsage_StepsAfterAStdoutOverflowAreStillCounted(t *testing
 		t.Fatalf("captured %d steps with %d input tokens, want all 3 (123)", n, input)
 	}
 }
+
+// The step-finish frame that itself pushes stdout past the cap is counted too:
+// an earlier step would otherwise settle the run as paid with this one lost.
+func TestOpenCodeNativeUsage_TheStepThatCrossesTheStdoutCapIsCounted(t *testing.T) {
+	openCodeUsageFixture(t, 1304)
+	now := time.Now().UnixMilli()
+	first := openCodeStepFinish("ses_cross", "prt_tool", 100, 0, 0, "0", now)
+	crossing := openCodeStepFinish("ses_cross", "prt_cross", 7, 0, 0, "0", now)
+	chunk := 3 * 1024 * 1024
+	rest := openCodeNativeMaxStdout - len(first) - 2*chunk - len(crossing) + 1
+	var out strings.Builder
+	out.WriteString(first + "\n")
+	out.WriteString(strings.Repeat("x", chunk) + "\n")
+	out.WriteString(strings.Repeat("x", chunk) + "\n")
+	out.WriteString(strings.Repeat("x", rest) + "\n")
+	out.WriteString(crossing + "\n")
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-cross")
+	m := NewOpenCodeNativeManager()
+	state := m.streamOpenCodeEvents(&OpenCodeNativeSession{}, strings.NewReader(out.String()), nil, run)
+	if !state.overflow {
+		t.Fatal("the crossing frame did not overflow the stream")
+	}
+	run.mu.Lock()
+	var input int64
+	for _, s := range run.steps {
+		input += s.Input
+	}
+	n := len(run.steps)
+	run.mu.Unlock()
+	if n != 2 || input != 107 {
+		t.Fatalf("captured %d steps with %d input tokens, want both (107)", n, input)
+	}
+}
