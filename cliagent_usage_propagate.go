@@ -289,6 +289,9 @@ type cliUsagePropagatorState struct {
 	// noting tracks the goroutines that note a stamped Claude generation after
 	// a merge (claudeStampAfterMerge), for the same reason.
 	noting sync.WaitGroup
+	// watching tracks a watcher tick in flight, for the same reason: its stamp
+	// writes the cache.
+	watching sync.WaitGroup
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -732,7 +735,9 @@ func (p *cliUsagePropagatorState) watch(gen uint64) {
 		p.mu.Unlock()
 		return
 	}
+	p.watching.Add(1)
 	p.mu.Unlock()
+	defer p.watching.Done()
 
 	if !IsShutdownInProgress() {
 		func() {
@@ -760,6 +765,15 @@ func logCLIUsageHint(label, provider string) {
 // timer callback already running sees the bumped generations and does nothing.
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
+	// Invalidate the watcher first, so no new tick passes its gate, then wait
+	// out one already past it.
+	p.mu.Lock()
+	if p.watchTimer != nil {
+		p.watchTimer.Stop()
+	}
+	p.watchGen++
+	p.mu.Unlock()
+	p.watching.Wait()
 	p.rotating.Wait()
 	p.noting.Wait()
 	p.mu.Lock()
