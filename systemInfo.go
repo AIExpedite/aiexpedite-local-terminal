@@ -29,8 +29,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -235,6 +237,27 @@ type MachineInfo struct {
 	// recompute Tools without keeping a stale or removed catalog id
 	// (setup_tool_catalog.go withSetupToolResults). Not serialized.
 	baseTools map[string]string
+
+	// gatherSeq orders gathers by when they STARTED (nextMachineInfoGatherSeq,
+	// assigned before any probe runs). CollectedAt has one-second resolution,
+	// so two gathers started in the same second carry the same stamp; the
+	// sequence still tells them apart (storeMachineInfoIfNotOlder). 0 = not
+	// from a gather (fixtures). Not serialized.
+	gatherSeq uint64
+
+	// cliUsageFromCache marks CliAgents as cliAgentUsageFallback's snapshot of
+	// the cache (the usage pass missed its budget), so the store re-reads the
+	// usage the cache holds THEN rather than rolling back a usage refresh that
+	// landed in between (storeMachineInfoIfNotOlder). Not serialized.
+	cliUsageFromCache bool
+}
+
+// machineInfoGatherSeq is the last sequence handed to a gather.
+var machineInfoGatherSeq atomic.Uint64
+
+// nextMachineInfoGatherSeq returns the sequence for a gather starting now.
+func nextMachineInfoGatherSeq() uint64 {
+	return machineInfoGatherSeq.Add(1)
 }
 
 /* --------------------------------------------------------------------------
@@ -287,7 +310,7 @@ func SetCachedCLIAgents(usage []cliAgentUsage) {
 // The 6h periodic gather started by StartMachineInfoGathering remains
 // the source of truth for the full MachineInfo cache.
 func RefreshMachineInfoNow() {
-	storeMachineInfo(gatherMachineInfo())
+	storeMachineInfoIfNotOlder(gatherMachineInfo())
 }
 
 // storeMachineInfo replaces the cached MachineInfo. Every writer goes through
@@ -297,6 +320,11 @@ func storeMachineInfo(info *MachineInfo) {
 	machineInfoMu.Lock()
 	machineInfoCache = info
 	machineInfoMu.Unlock()
+	machineInfoStored(info)
+}
+
+// machineInfoStored runs the post-store hook for a gather that landed.
+func machineInfoStored(info *MachineInfo) {
 	if info != nil && onMachineInfoStored != nil {
 		onMachineInfoStored()
 	}
@@ -319,18 +347,108 @@ var (
 	machineInfoGathersInFlight int
 )
 
-// gatherMachineInfoTracked is gatherMachineInfo counted in
-// machineInfoGathersInFlight for its whole duration.
-func gatherMachineInfoTracked() *MachineInfo {
+// trackMachineInfoGather counts one background gather (or the part of one that
+// outlives its caller, such as an inspection's CLI usage pass) in
+// machineInfoGathersInFlight until the returned release runs.
+func trackMachineInfoGather() (release func()) {
 	machineInfoGathersMu.Lock()
 	machineInfoGathersInFlight++
 	machineInfoGathersMu.Unlock()
-	defer func() {
-		machineInfoGathersMu.Lock()
-		machineInfoGathersInFlight--
-		machineInfoGathersMu.Unlock()
-	}()
-	return gatherMachineInfo()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			machineInfoGathersMu.Lock()
+			machineInfoGathersInFlight--
+			machineInfoGathersMu.Unlock()
+		})
+	}
+}
+
+// machineInfoCollectedAt parses MachineInfo.CollectedAt (stamped when the
+// gather STARTED). ok is false for nil info or an unparseable stamp.
+func machineInfoCollectedAt(info *MachineInfo) (time.Time, bool) {
+	if info == nil {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339, info.CollectedAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// machineInfoStartedAfter reports whether gather info started after the one
+// in current, i.e. may replace it. Gathers are ordered by gatherSeq; the
+// second-resolution CollectedAt is only the fallback for info not made by a
+// gather (gatherSeq 0), and a tie there keeps current.
+func machineInfoStartedAfter(info, current *MachineInfo) bool {
+	if current == nil || info == current {
+		return true
+	}
+	if info.gatherSeq != 0 && current.gatherSeq != 0 {
+		return info.gatherSeq > current.gatherSeq
+	}
+	curAt, ok := machineInfoCollectedAt(current)
+	if !ok {
+		return true // nothing to order against
+	}
+	newAt, ok := machineInfoCollectedAt(info)
+	return ok && newAt.After(curAt)
+}
+
+// storeMachineInfoIfNotOlder stores info unless the cache already holds a
+// gather that started later (machineInfoStartedAfter). A gather can finish
+// after a newer one was cached — an inspection's gather left running past its
+// deadline, or a periodic gather overlapping a refresh; the late one must not
+// roll the cache back or fire the post-store hook with older details. The
+// check and the swap happen under one lock. Reports whether it stored.
+func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
+	if info == nil {
+		return false
+	}
+	// Read before taking machineInfoMu: the catalog has its own lock.
+	var parserKeys map[string]string
+	if info.cliUsageFromCache {
+		parserKeys = cliAgentParserKeys()
+	}
+	machineInfoMu.Lock()
+	if !machineInfoStartedAfter(info, machineInfoCache) {
+		machineInfoMu.Unlock()
+		return false
+	}
+	if info.cliUsageFromCache && machineInfoCache != nil {
+		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents, parserKeys)
+		info.cliUsageFromCache = false
+	}
+	machineInfoCache = info
+	machineInfoMu.Unlock()
+	machineInfoStored(info)
+	return true
+}
+
+// withCurrentCLIUsage refreshes a cliAgentUsageFallback snapshot from the
+// usage the cache holds now: a CLI the cache has an entry for takes that entry
+// (a usage refresh may have landed since the snapshot), keeping the version
+// and path the gather detected; any other entry stays as it was. parserKeys
+// maps a catalog id to its parser key (cliAgentParserKeys).
+func withCurrentCLIUsage(snapshot, current []cliAgentUsage, parserKeys map[string]string) []cliAgentUsage {
+	byID := cliUsageByID(current)
+	out := make([]cliAgentUsage, 0, len(snapshot))
+	for _, u := range snapshot {
+		cur, ok := lookupCLIUsage(byID, u.CliAgentID, parserKeys[u.CliAgentID])
+		if !ok {
+			out = append(out, u)
+			continue
+		}
+		if u.Version != "" {
+			cur.Version = u.Version
+		}
+		if u.Path != "" {
+			cur.Path = u.Path
+		}
+		out = append(out, cur)
+	}
+	return out
 }
 
 // drainMachineInfoGathers waits until no background gather is running, or
@@ -363,7 +481,7 @@ func drainMachineInfoGathers(timeout time.Duration) bool {
 func StartMachineInfoGathering() {
 	go func() {
 		for {
-			storeMachineInfo(gatherMachineInfo())
+			storeMachineInfoIfNotOlder(gatherMachineInfo())
 			// The setupToolCatalog pass runs AFTER the gather is stored, never
 			// inside it, so it cannot delay the data the first /auth/token
 			// request is waiting for (setup_tool_catalog.go).
@@ -378,6 +496,23 @@ func StartMachineInfoGathering() {
    -------------------------------------------------------------------------- */
 
 func gatherMachineInfo() *MachineInfo {
+	return gatherMachineInfoBounded(0)
+}
+
+// inspectionCLIUsageBudget bounds the CLI usage pass inside an inspection's
+// gather (__env_inspect__). That pass is the slow part of a gather: every
+// detected CLI's usage parser runs one after another, several with network
+// reads (Claude usage probe, Grok billing + login renew, Antigravity Code
+// Assist) and model discovery, so with six CLIs it alone can outlast the 20 s
+// inspection budget. Readiness reads none of it (evaluateReadiness looks only
+// at hardware, tools and which CLIs are detected), so an inspection waits this
+// long for it and otherwise reports the last known usage per CLI.
+const inspectionCLIUsageBudget = 8 * time.Second
+
+// gatherMachineInfoBounded is the full gather. usageBudget > 0 bounds how long
+// it waits for the CLI usage pass (see inspectionCLIUsageBudget); 0 waits for
+// it, which the periodic gather does.
+func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 	// A tool installed since the last gather (a setup step, or the user) must be
 	// visible to the probes below without an agent restart (path_refresh.go).
 	refreshCommandPath()
@@ -388,6 +523,7 @@ func gatherMachineInfo() *MachineInfo {
 		PackageManagers: map[string]string{},
 		Tools:           map[string]string{},
 		CollectedAt:     time.Now().UTC().Format(time.RFC3339),
+		gatherSeq:       nextMachineInfoGatherSeq(),
 	}
 
 	// The setup-checklist probes (gh / firebase / terraform, the OS package
@@ -518,8 +654,17 @@ func gatherMachineInfo() *MachineInfo {
 	info.DetectedCliAgents = gatherCLIAgents()
 	// Richer per-provider utilization snapshot — feeds the CLI Agents tab.
 	// Stable order so byte-equal Firestore payloads produce a delta-skip on
-	// the terminal-service side rather than a write per gather cycle.
-	info.CliAgents = gatherCLIAgentUsage(info.DetectedCliAgents, time.Now())
+	// the terminal-service side rather than a write per gather cycle. It runs
+	// beside the GPU / battery / live-load probes below and is joined after
+	// them (bounded by usageBudget when one is set).
+	usageNow := time.Now()
+	usageStarted := usageNow
+	usageCh := make(chan []cliAgentUsage, 1)
+	releaseUsage := trackMachineInfoGather()
+	go func(detected map[string]detectedCLIAgent) {
+		defer releaseUsage()
+		usageCh <- gatherCLIAgentUsage(detected, usageNow)
+	}(info.DetectedCliAgents)
 
 	// GPU — multi-adapter support; per-platform shell-out (system_profiler
 	// on macOS, WMI on Windows, nvidia-smi/lspci on Linux). Best-effort:
@@ -542,6 +687,8 @@ func gatherMachineInfo() *MachineInfo {
 	// signal we'd actually act on).
 	info.Live = gatherLiveLoad()
 
+	info.CliAgents, info.cliUsageFromCache = awaitCLIAgentUsage(usageCh, usageStarted, usageBudget, info.DetectedCliAgents, usageNow)
+
 	// Join the parallel setup probes (normally long finished by now), then
 	// record the gather's own tools before folding in the last setupToolCatalog
 	// pass (no spawn here — see setup_tool_catalog.go).
@@ -555,6 +702,131 @@ func gatherMachineInfo() *MachineInfo {
 	applyConcurrencyHints(info.Capabilities, info.CPU, info.Memory)
 
 	return info
+}
+
+// awaitCLIAgentUsage joins the gather's CLI usage pass. With no budget it
+// waits for it. With one, a pass still running at usageStarted+budget is left
+// to finish on its own (still counted in machineInfoGathersInFlight; its
+// result is dropped, since the usage refresh paths keep usage current) and
+// the gather reports the last known usage instead (cliAgentUsageFallback),
+// and fromCache says so.
+func awaitCLIAgentUsage(usageCh <-chan []cliAgentUsage, usageStarted time.Time, budget time.Duration, detected map[string]detectedCLIAgent, now time.Time) (usage []cliAgentUsage, fromCache bool) {
+	if budget <= 0 {
+		return <-usageCh, false
+	}
+	remaining := budget - time.Since(usageStarted)
+	if remaining <= 0 {
+		select {
+		case usage := <-usageCh:
+			return usage, false
+		default:
+		}
+	} else {
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		select {
+		case usage := <-usageCh:
+			return usage, false
+		case <-timer.C:
+		}
+	}
+	envInspectLogf(colorYellow, "CLI usage pass still running after %s; reporting the last known usage per CLI", budget)
+	return cliAgentUsageFallback(detected, GetMachineInfo(), now), true
+}
+
+// cliUsageByID indexes usage entries by CliAgentID.
+func cliUsageByID(usage []cliAgentUsage) map[string]cliAgentUsage {
+	byID := make(map[string]cliAgentUsage, len(usage))
+	for _, u := range usage {
+		if u.CliAgentID != "" {
+			byID[u.CliAgentID] = u
+		}
+	}
+	return byID
+}
+
+// lookupCLIUsage finds a CLI's usage by its catalog id, else by its parser
+// key: some parsers (opencode, museCode) stamp their built-in id, so a catalog
+// entry naming one through capabilities.utilization.parserKey has its usage
+// recorded under that id.
+func lookupCLIUsage(byID map[string]cliAgentUsage, agentID, parserKey string) (cliAgentUsage, bool) {
+	if u, ok := byID[agentID]; ok {
+		return u, true
+	}
+	if parserKey != "" && parserKey != agentID {
+		u, ok := byID[parserKey]
+		return u, ok
+	}
+	return cliAgentUsage{}, false
+}
+
+// cliAgentParserKeys maps each active catalog id to its parser key.
+func cliAgentParserKeys() map[string]string {
+	keys := map[string]string{}
+	for _, agent := range activeCLIAgentCatalog() {
+		keys[agent.ID] = cliAgentCatalogParserKey(agent)
+	}
+	return keys
+}
+
+// cliAgentUsageFallback is the CliAgents slice for a gather whose usage pass
+// missed its budget: for each detected CLI, the entry the cache already holds
+// (the last full gather, kept current by the usage refresh paths), or else the
+// same baseline entry gatherCLIAgentUsage emits for a CLI its parser could not
+// read. Same order as gatherCLIAgentUsage.
+func cliAgentUsageFallback(detected map[string]detectedCLIAgent, cached *MachineInfo, now time.Time) []cliAgentUsage {
+	out := []cliAgentUsage{}
+	if len(detected) == 0 {
+		return out
+	}
+	var known map[string]cliAgentUsage
+	if cached != nil {
+		machineInfoMu.RLock()
+		known = cliUsageByID(cached.CliAgents)
+		machineInfoMu.RUnlock()
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
+	parsers := cliAgentUsageParserIndex()
+	for _, agent := range activeCLIAgentCatalog() {
+		if !cliAgentCatalogSupportsUtilization(agent) {
+			continue
+		}
+		entry, ok := detected[agent.ID]
+		if !ok || !entry.Detected {
+			continue
+		}
+		if u, ok := lookupCLIUsage(known, agent.ID, cliAgentCatalogParserKey(agent)); ok {
+			// Usage and account are last known; where the CLI is and which
+			// version it is are what this gather just detected.
+			if entry.Version != "" {
+				u.Version = entry.Version
+			}
+			if entry.Path != "" {
+				u.Path = entry.Path
+			}
+			out = append(out, u)
+			continue
+		}
+		provider := agent.ID
+		if parser := parsers[cliAgentCatalogParserKey(agent)]; parser != nil {
+			provider = parser.Provider()
+		}
+		u := cliAgentUsage{
+			CliAgentID:  agent.ID,
+			Provider:    provider,
+			Name:        entry.Name,
+			Version:     entry.Version,
+			Path:        entry.Path,
+			CollectedAt: now.UTC().Format(time.RFC3339),
+		}
+		u.AccountFingerprint = fallbackUnknownAccountFingerprint(u.Provider, host, entry)
+		out = append(out, u)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out
 }
 
 /* --------------------------------------------------------------------------

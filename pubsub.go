@@ -1279,6 +1279,9 @@ func handleEnvInspectCommand(ctx context.Context, topic *pubsub.Publisher, cmd c
 	}()
 
 	// Bound the gather so a hung probe can't stall the inspection round trip.
+	// terminal-service stops waiting 25 s after it creates the inspection, so
+	// this stays at 20 s; a gather that misses it reports recent cached details
+	// instead (GatherReadinessOnly).
 	gatherCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
