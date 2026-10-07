@@ -780,7 +780,7 @@ func openCodeUsageFromTokens(tokensRaw, costRaw json.RawMessage) (openCodeUsageS
 				continue
 			}
 			n, ok := openCodeUsageNumber(raw)
-			if !ok || n < 0 {
+			if !ok || n < 0 || math.Round(n) > openCodeUsageMaxInt {
 				valid = false
 				return 0
 			}
@@ -811,6 +811,12 @@ func openCodeUsageFromTokens(tokensRaw, costRaw json.RawMessage) (openCodeUsageS
 	return step, valid
 }
 
+// openCodeUsageMaxInt bounds a token count or timestamp before its int64
+// conversion: the largest integer a float64 holds exactly. Past the int64 range
+// that conversion is implementation-defined (it can go negative), and the
+// headroom keeps a day's bucket sums from overflowing.
+const openCodeUsageMaxInt = 1 << 53
+
 // openCodeUsageNumber reads a JSON number. A string, NaN or ±Inf is invalid.
 func openCodeUsageNumber(raw json.RawMessage) (float64, bool) {
 	var n float64
@@ -826,7 +832,7 @@ func openCodeUsageMillis(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	n, ok := openCodeUsageNumber(raw)
-	if !ok || n <= 0 {
+	if !ok || n <= 0 || n > openCodeUsageMaxInt {
 		return 0, false
 	}
 	return int64(n), true

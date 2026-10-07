@@ -165,6 +165,8 @@ func TestParseOpenCodeUsageFrame_RejectsAndIgnores(t *testing.T) {
 		`{"type":"step_finish","part":{"id":"p","tokens":{"input":-1,"output":5}}}`,
 		`{"type":"step_finish","part":{"id":"p","tokens":{"input":1},"cost":-0.2}}`,
 		`{"type":"step_finish","part":{"id":"p","tokens":{"input":"12"}}}`,
+		`{"type":"step_finish","part":{"id":"p","tokens":{"input":1e19,"output":5}}}`,          // past int64
+		`{"type":"step_finish","part":{"id":"p","tokens":{"input":1,"cache":{"read":1e300}}}}`, // past int64, nested
 		`{"type":"step_finish","part":{"id":"p","tokens":{"input":1},"cost":"free"}}`,
 		`{"type":"step_finish","part":{"id":"p"}}`,               // no tokens
 		`{"type":"text","part":{"id":"p","tokens":{"input":1}}}`, // not a step
