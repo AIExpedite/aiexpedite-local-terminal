@@ -914,3 +914,45 @@ func TestOpenCodeTap_ARefusedLedgerWriteMakesACoveredRunOweAReconcile(t *testing
 		t.Fatalf("rows = %d, want none — the write was refused", rows)
 	}
 }
+
+// The re-read cap evicts the OLDEST record when a pass remembers a ninth
+// session. That record is lost for good — the cursor already counts its session
+// as committed, and OpenCode need not move a session's `updated` when it writes
+// a turn's later parts — so the day it belongs to must read as a lower bound
+// instead of presenting a possibly short total as complete.
+func TestOpenCodeRechecks_CapEvictionMarksTheDayPartial(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	for i := 0; i <= openCodeLedgerMaxRechecks; i++ {
+		updated := now.Add(time.Duration(i) * time.Minute)
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			openCodeRememberRecheckSession(l, "ses_"+strconv.Itoa(i), updated.UnixMilli(),
+				updated.Add(openCodeRecheckDelay).UnixMilli(),
+				updated.Add(openCodeRecheckMaxSpan).UnixMilli())
+			return openCodeLedgerEdit{Changed: true}
+		})
+	}
+
+	ledger := readOpenCodeUsageLedger()
+	if len(ledger.Rechecks) != openCodeLedgerMaxRechecks {
+		t.Fatalf("rechecks = %d, want the cap %d", len(ledger.Rechecks), openCodeLedgerMaxRechecks)
+	}
+	day := ledger.Days[openCodeDayKey(now)]
+	if day == nil || !day.Partial {
+		t.Fatal("an evicted re-read must mark its day a lower bound")
+	}
+	// The card's notice is part of the published view, so the eviction has to
+	// move the generation exactly as a changed total does.
+	if ledger.Generation.Counter == 0 {
+		t.Fatal("want the generation advanced so the backend fetches the notice")
+	}
+	// A record whose day fell out of retention is not resurrected by the mark.
+	stale := now.AddDate(0, 0, -9)
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		return openCodeLedgerEdit{Changed: openCodeMarkDayPartial(l, openCodeDayKey(stale))}
+	})
+	if _, ok := readOpenCodeUsageLedger().Days[openCodeDayKey(stale)]; ok {
+		t.Fatal("a day outside retention must not be created by the partial mark")
+	}
+}

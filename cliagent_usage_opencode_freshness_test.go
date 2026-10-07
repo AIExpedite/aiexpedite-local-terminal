@@ -1231,3 +1231,57 @@ func TestOpenCodeDiscovery_SeesAProjectWriteWhenRankingFillsTheStatBudget(t *tes
 		t.Fatal("a project write must be seen even when ranking spends the stat budget")
 	}
 }
+
+// A continuation is only booked once continuationDue reaches DISK: the fired
+// timer and the startup recovery both re-read the flag and do nothing when it is
+// clear. A debt-free `more` whose write is refused would otherwise leave the
+// remaining sessions uncounted behind a timer that exits immediately, and
+// without a partial warning, because the pass made progress.
+func TestOpenCodeContinuation_RetriesABookingItCouldNotPersist(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	// Seed the file so the booking is REACHED and only its own write is refused.
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeEnsureDay(l, openCodeDayKey(now)).Messages["0123456789abcdef"] =
+			openCodeMessageUsage{In: 5, ObservedAtMs: now.UnixMilli()}
+		return openCodeLedgerEdit{Changed: true, TotalsChanged: true}
+	})
+
+	dir := filepath.Dir(openCodeUsageLedgerPath())
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(openCodeUsageLedgerPath(), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	unblock := func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chmod(openCodeUsageLedgerPath(), 0o600)
+	}
+	t.Cleanup(unblock)
+
+	openCodeBookAfterOutcome(false, openCodeReconcileMore, now)
+
+	if readOpenCodeUsageLedger().ContinuationDue {
+		t.Fatal("the refused write must not read back as a booked continuation")
+	}
+	if openCodeRunDebtRetryPending() {
+		t.Fatal("a refused booking must not arm a pass that would read the flag clear and exit")
+	}
+	if !openCodeContinuationBookRetryPending() {
+		t.Fatal("a refused booking must leave an in-memory retry armed")
+	}
+
+	// The filesystem recovers; the retry is what books the pass.
+	unblock()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !readOpenCodeUsageLedger().ContinuationDue {
+		time.Sleep(time.Millisecond)
+	}
+	if !readOpenCodeUsageLedger().ContinuationDue {
+		t.Fatal("want the retried booking persisted once the write is accepted")
+	}
+	if openCodeContinuationBookRetryPending() {
+		t.Fatal("a booking that reached disk must retire its retry")
+	}
+}

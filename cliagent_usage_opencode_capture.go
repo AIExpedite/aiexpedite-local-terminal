@@ -486,6 +486,14 @@ func openCodePruneRechecks(ledger *openCodeUsageLedger, now time.Time) {
 	}
 	if len(kept) > openCodeLedgerMaxRechecks {
 		sort.SliceStable(kept, func(i, j int) bool { return kept[i].UpdatedMs < kept[j].UpdatedMs })
+		// An evicted record is lost for good: the pass that made it already
+		// advanced the cursor past its session, and OpenCode need not move a
+		// session's `updated` when it writes a turn's later parts, so nothing
+		// selects it again. Say the day is a lower bound rather than present a
+		// possibly short total as complete.
+		for _, dropped := range kept[:len(kept)-openCodeLedgerMaxRechecks] {
+			openCodeMarkDayPartial(ledger, openCodeDayKey(time.UnixMilli(dropped.UpdatedMs)))
+		}
 		kept = kept[len(kept)-openCodeLedgerMaxRechecks:]
 	}
 	if len(kept) == 0 {
@@ -653,7 +661,16 @@ func openCodeDayPartial(ledger openCodeUsageLedger, dayKey string) bool {
 
 // openCodeMarkTodayPartial marks today's totals as a lower bound.
 func openCodeMarkTodayPartial(ledger *openCodeUsageLedger, now time.Time) bool {
-	day := openCodeEnsureDay(ledger, openCodeDayKey(now))
+	return openCodeMarkDayPartial(ledger, openCodeDayKey(now))
+}
+
+// openCodeMarkDayPartial marks ONE retained day's totals as a lower bound. A
+// day outside the window is not resurrected: the prune would drop it again.
+func openCodeMarkDayPartial(ledger *openCodeUsageLedger, dayKey string) bool {
+	if !openCodeDayRetained(openCodeRetainedDayKeys(openCodeUsageNow()), dayKey) {
+		return false
+	}
+	day := openCodeEnsureDay(ledger, dayKey)
 	if day.Partial {
 		return false
 	}

@@ -158,6 +158,20 @@ var (
 		timer *time.Timer
 		gen   uint64
 	}
+	// openCodeContinuationBookRetry is the ONE in-memory retry of a
+	// continuation booking whose continuationDue write was refused. Same reason
+	// it cannot be persisted as the two above: the file is the one that
+	// refused. It carries the booking the refused write was making, so the
+	// retry books exactly what the outcome decided.
+	openCodeContinuationBookRetry struct {
+		mu               sync.Mutex
+		timer            *time.Timer
+		gen              uint64
+		failures         int
+		firstFailureAtMs int64
+		delay            time.Duration
+		attempt          int
+	}
 	openCodeReconcileNudge struct {
 		mu     sync.Mutex
 		lastAt time.Time
@@ -762,6 +776,10 @@ func (state openCodeUsageFreshness) passSpacingElapsed(now time.Time) bool {
 
 // openCodeBookAfterOutcome applies the one-timer rule above.
 func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
+	// This outcome decides the schedule, so a booking retry left over from the
+	// previous one is superseded — the branches below arm a fresh one if their
+	// own write is refused.
+	stopOpenCodeContinuationBookRetry()
 	if hadDebt {
 		// The ladder owns the retry; a debt-open pass never leaves a
 		// continuation booked — and never touches the chain's failure count,
@@ -810,8 +828,7 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			openCodeMarkPartialIfBacklogged()
 			return
 		}
-		updateOpenCodeUsageLedgerContinuation(true, 0, 0)
-		openCodeArmContinuation(openCodeSpacedDelay(freshness, now, openCodeRunDebtFreeRetryDelay))
+		openCodeBookContinuation(0, 0, openCodeSpacedDelay(freshness, now, openCodeRunDebtFreeRetryDelay))
 	default:
 		ledger := readOpenCodeUsageLedger()
 		failures := ledger.ContinuationFailures
@@ -827,11 +844,98 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			openCodeMarkPartialIfBacklogged()
 			return
 		}
-		updateOpenCodeUsageLedgerContinuation(true, failures, firstFailureAtMs)
-		openCodeArmContinuation(openCodeSpacedDelay(freshness, now, refreshFreeRetryDelay(
-			now.Sub(time.UnixMilli(firstFailureAtMs)),
-			openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)))
+		openCodeBookContinuation(failures, firstFailureAtMs,
+			openCodeSpacedDelay(freshness, now, refreshFreeRetryDelay(
+				now.Sub(time.UnixMilli(firstFailureAtMs)),
+				openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)))
 	}
+}
+
+// openCodeBookContinuation persists the continuation chain's state and books
+// its pass. The flag has to reach DISK before the timer is worth arming: the
+// fired timer (openCodeRunDebtRetryFired) and startup recovery both re-read it
+// and do nothing when it reads clear, so a refused write would leave the
+// remaining sessions uncounted behind a timer that reported success — and with
+// no partial warning, because the pass made progress. A refusal is retried in
+// memory, exactly as a refused re-read booking is.
+func openCodeBookContinuation(failures int, firstFailureAtMs int64, delay time.Duration) bool {
+	return openCodeBookContinuationAttempt(failures, firstFailureAtMs, delay, 1)
+}
+
+func openCodeBookContinuationAttempt(failures int, firstFailureAtMs int64, delay time.Duration, attempt int) bool {
+	if !updateOpenCodeUsageLedgerContinuation(true, failures, firstFailureAtMs) {
+		logOpenCodeUsage("continuation book refused")
+		openCodeArmContinuationBookRetry(failures, firstFailureAtMs, delay, attempt)
+		return false
+	}
+	stopOpenCodeContinuationBookRetry()
+	openCodeArmContinuation(delay)
+	return true
+}
+
+// openCodeArmContinuationBookRetry re-attempts a refused continuation booking
+// on the debt ladder's delays and for its attempt budget. Giving up marks today
+// a lower bound, so a backlog this process can no longer schedule is at least
+// visible on the card.
+func openCodeArmContinuationBookRetry(failures int, firstFailureAtMs int64, delay time.Duration, attempt int) {
+	retryIn, ok := refreshRetryDelayForAttempt(attempt, openCodeRunDebtMaxAttempts, openCodeRunDebtRetryLadder)
+	if !ok || IsShutdownInProgress() {
+		logOpenCodeUsage("continuation book gave up attempts=%d", attempt)
+		openCodeMarkPartialIfBacklogged()
+		return
+	}
+	r := &openCodeContinuationBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.gen++
+	gen := r.gen
+	r.failures, r.firstFailureAtMs, r.delay, r.attempt = failures, firstFailureAtMs, delay, attempt
+	r.timer = time.AfterFunc(retryIn, func() { openCodeContinuationBookRetryFired(gen) })
+}
+
+func openCodeContinuationBookRetryFired(gen uint64) {
+	r := &openCodeContinuationBookRetry
+	r.mu.Lock()
+	stale := gen != r.gen
+	failures, firstFailureAtMs, delay, attempt := r.failures, r.firstFailureAtMs, r.delay, r.attempt
+	if !stale {
+		r.timer = nil
+	}
+	r.mu.Unlock()
+	if stale || IsShutdownInProgress() {
+		return
+	}
+	// A debt opened in the meantime owns the one timer, and its passes drain the
+	// same backlog, so the retry stands down.
+	if _, owed := openCodePendingDebt(openCodeUsageNow()); owed {
+		return
+	}
+	openCodeBookContinuationAttempt(failures, firstFailureAtMs, delay, attempt+1)
+}
+
+// stopOpenCodeContinuationBookRetry withdraws a pending booking retry. Part of
+// teardown, of any booking that reached disk, and of any later outcome.
+func stopOpenCodeContinuationBookRetry() {
+	r := &openCodeContinuationBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.gen++
+}
+
+// openCodeContinuationBookRetryPending reports whether a booking retry is
+// armed. Test seam.
+func openCodeContinuationBookRetryPending() bool {
+	r := &openCodeContinuationBookRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timer != nil
 }
 
 // openCodeBookRecheckWakeUp books one pass for the earliest re-read a
@@ -1128,6 +1232,7 @@ func openCodeRunDebtRetryFired(gen uint64, id *openCodeDebtID) {
 func stopOpenCodeRunDebtRetry() {
 	stopOpenCodeSettleRetry()
 	stopOpenCodeRecheckBookRetry()
+	stopOpenCodeContinuationBookRetry()
 	t := &openCodeRunDebtRetryTimer
 	t.mu.Lock()
 	defer t.mu.Unlock()

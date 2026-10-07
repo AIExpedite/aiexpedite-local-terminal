@@ -2321,7 +2321,11 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   invisible to both the cursor and an over-cap retry, which are keyed on
   `updated`. A session exported within `openCodeSessionMaybeActiveWindow` (15
   min) of the pass is therefore remembered in `rechecks` (at most 8, newest kept)
-  and read again once `openCodeRecheckDelay` (2 min) has passed. The re-read
+  and read again once `openCodeRecheckDelay` (2 min) has passed. A ninth record
+  evicts the oldest, and that record is gone for good — the cursor already counts
+  its session as committed and nothing is keyed on anything that would select it
+  again — so the eviction marks the evicted record's day `partial`, and the
+  card carries the lower-bound notice rather than a total that may be short. The re-read
   rides the same single revisit slot as an over-cap retry, and is booked again
   only when it RAISED a figure — the one proof the turn was still running — so a
   quiet session costs exactly one extra export and the max-merge makes the repeat
@@ -2408,8 +2412,17 @@ reading, never a run — but "best-effort" is not the same answer everywhere:
   completion) until the filesystem recovers. This is exactly the case a refused
   ledger write lands in, since the same read-only or full config dir causes
   both.
-- Everywhere else (a pass stamp, the continuation flags) a refused write costs
-  one reading and the next pass re-establishes it.
+- A **continuation booking** (`openCodeBookContinuation`, the `more` and the
+  failure branches of `openCodeBookAfterOutcome`) is the only durable record of a
+  backlog no debt covers, and both the fired timer and startup recovery re-read
+  `continuationDue` from DISK. A refused write is therefore retried in memory
+  too (`openCodeArmContinuationBookRetry`, the debt ladder's delays and attempt
+  budget, standing down if a debt opens and takes over the backlog); giving up
+  marks today `partial`. Without it a refused write armed a timer whose pass read
+  the flag clear and exited, leaving the remaining sessions uncounted and
+  unflagged.
+- Everywhere else (a pass stamp, the cleared continuation flags) a refused write
+  costs one reading and the next pass re-establishes it.
 
 ### Redaction allowlist
 
