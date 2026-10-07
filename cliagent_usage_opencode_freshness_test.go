@@ -674,3 +674,75 @@ func TestOpenCodeContinuation_BoundsOneChainsTotalPasses(t *testing.T) {
 		t.Fatal("a new chain must start at zero passes")
 	}
 }
+
+func TestOpenCodeContinuation_HonoursThePassSpacing(t *testing.T) {
+	// The spacing is the only thing bounding how often a BACKLOG spawns
+	// `opencode`: a continuation is armed on the 30-second free-retry floor, so
+	// without it a chain would run twice a minute for its whole budget on the
+	// machine the user is working on.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	setNow := openCodeDebtFixture(t, now)
+	openCodeReconcileMinInterval = time.Minute
+	created := now.UnixMilli()
+	exports := map[string]string{}
+	rows := make([]openCodeSessionRow, 0, 9)
+	for i := 0; i < 9; i++ {
+		id := fmt.Sprintf("ses_%d", i)
+		rows = append(rows, openCodeSessionRow{id, created + int64(i+1)})
+		exports[id] = exportWith(id, fmt.Sprintf("msg_%d", i), created, 2, 0, "0")
+	}
+	stub := (&openCodeCLIStub{sessions: sessionList(rows...), exports: exports}).install(t)
+
+	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileMore {
+		t.Fatalf("first pass = %q, want more", outcome)
+	}
+	after := stub.exportCount()
+
+	// Inside the spacing: deferred, with the chain still booked and no child
+	// spawned.
+	setNow(now.Add(30 * time.Second))
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != "" {
+		t.Fatalf("a pass inside the spacing returned %q, want no pass at all", outcome)
+	}
+	if stub.exportCount() != after {
+		t.Fatalf("exports = %d, want the deferred pass to spawn nothing", stub.exportCount())
+	}
+	if !readOpenCodeUsageLedger().ContinuationDue {
+		t.Fatal("a deferral must keep the chain booked, not drop the backlog")
+	}
+	if !openCodeRunDebtRetryPending() {
+		t.Fatal("a deferred continuation must re-arm its own timer")
+	}
+
+	// Past the spacing: the chain resumes.
+	setNow(now.Add(2 * time.Minute))
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileMore {
+		t.Fatalf("a pass past the spacing = %q, want more", outcome)
+	}
+	if stub.exportCount() <= after {
+		t.Fatal("the resumed pass exported nothing")
+	}
+}
+
+func TestOpenCodeSpacedDelay_PushesABaseOutToTheSpacing(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	openCodeReconcileMinInterval = time.Minute
+	base := 30 * time.Second
+
+	// No pass yet: the base stands.
+	if got := openCodeSpacedDelay(openCodeUsageFreshness{}, now, base); got != base {
+		t.Fatalf("delay = %v, want the base %v", got, base)
+	}
+	// A pass 10s ago: 50s of spacing is left, which outranks the base.
+	state := openCodeUsageFreshness{LastAttemptAtMs: now.Add(-10 * time.Second).UnixMilli()}
+	if got := openCodeSpacedDelay(state, now, base); got != 50*time.Second {
+		t.Fatalf("delay = %v, want 50s", got)
+	}
+	// A pass long ago: the base stands again.
+	state.LastAttemptAtMs = now.Add(-time.Hour).UnixMilli()
+	if got := openCodeSpacedDelay(state, now, base); got != base {
+		t.Fatalf("delay = %v, want the base %v", got, base)
+	}
+}

@@ -301,7 +301,7 @@ func TestOpenCodeReconcile_OverCapExportElsewhereIsRememberedAndMakesTheDayParti
 
 	reconcileOpenCodeUsageOnce(context.Background(), now)
 	ledger := readOpenCodeUsageLedger()
-	if len(ledger.Skipped) != 1 || ledger.Skipped[0].Session != openCodeUsageHash("ses_big", "") {
+	if len(ledger.Skipped) != 1 || ledger.Skipped[0].SessionHash != openCodeUsageHash("ses_big", "") {
 		t.Fatalf("skipped = %+v, want the hashed session", ledger.Skipped)
 	}
 	if ledger.Skipped[0].UpdatedMs != created {
@@ -402,7 +402,7 @@ func TestOpenCodeReconcile_AFullSkippedSetEvictsItsOldestEntry(t *testing.T) {
 	oldest := openCodeUsageHash("ses_old0", "")
 	held := map[string]bool{}
 	for _, entry := range ledger.Skipped {
-		held[entry.Session] = true
+		held[entry.SessionHash] = true
 	}
 	if !held[head] {
 		t.Fatal("the new over-cap session was not recorded")

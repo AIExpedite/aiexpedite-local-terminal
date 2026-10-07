@@ -309,7 +309,7 @@ type openCodeReconcilePlan struct {
 func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessionRow, now time.Time) openCodeReconcilePlan {
 	stored := map[string]int64{}
 	for _, entry := range ledger.Skipped {
-		stored[entry.Session] = entry.UpdatedMs
+		stored[entry.SessionHash] = entry.UpdatedMs
 	}
 	plan := openCodeReconcilePlan{}
 	retentionFloorMs := openCodeRetentionFloor(now).UnixMilli()
@@ -362,12 +362,12 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 func openCodeRememberSkippedSession(ledger *openCodeUsageLedger, sessionID string, updatedMs int64) {
 	hash := openCodeUsageHash(sessionID, "")
 	for i := range ledger.Skipped {
-		if ledger.Skipped[i].Session == hash {
+		if ledger.Skipped[i].SessionHash == hash {
 			ledger.Skipped[i].UpdatedMs = updatedMs
 			return
 		}
 	}
-	ledger.Skipped = append(ledger.Skipped, openCodeSkippedSession{Session: hash, UpdatedMs: updatedMs})
+	ledger.Skipped = append(ledger.Skipped, openCodeSkippedSession{SessionHash: hash, UpdatedMs: updatedMs})
 	openCodePruneSkipped(ledger, openCodeUsageNow())
 }
 
@@ -376,7 +376,7 @@ func openCodeRememberSkippedSession(ledger *openCodeUsageLedger, sessionID strin
 func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string) bool {
 	hash := openCodeUsageHash(sessionID, "")
 	for i := range ledger.Skipped {
-		if ledger.Skipped[i].Session != hash {
+		if ledger.Skipped[i].SessionHash != hash {
 			continue
 		}
 		ledger.Skipped = append(ledger.Skipped[:i], ledger.Skipped[i+1:]...)

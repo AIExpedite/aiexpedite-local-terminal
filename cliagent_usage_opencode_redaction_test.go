@@ -25,7 +25,7 @@ var (
 		"lastPassOutcome": true, "lastPassStartedAtMs": true,
 		"continuationDue": true, "continuationFailures": true, "continuationFirstFailureAtMs": true,
 		"continuationPasses": true,
-		"skipped":            true, "session": true, "updatedMs": true,
+		"skipped":            true, "sessionHash": true, "updatedMs": true,
 		"days": true, "messages": true, "streamSessions": true, "partial": true,
 		"in": true, "out": true, "reasoning": true, "cacheRead": true, "cacheWrite": true,
 		"costMicros": true, "observedAtMs": true,
@@ -154,7 +154,7 @@ func TestOpenCodeUsage_EveryFieldOfBothStateFilesIsOnTheAllowlist(t *testing.T) 
 		ContinuationFirstFailureAtMs: 1790500000050,
 		ContinuationPasses:           5,
 		Skipped: []openCodeSkippedSession{
-			{Session: "a31580b57ec1119e", UpdatedMs: 1790500000200},
+			{SessionHash: "a31580b57ec1119e", UpdatedMs: 1790500000200},
 		},
 		Days: map[string]*openCodeLedgerDay{
 			"2026-09-27": {

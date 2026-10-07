@@ -156,6 +156,18 @@ func openCodeUsageFreshnessPath() string {
 	return filepath.Join(GetConfigDir(), "opencode_usage_freshness.json")
 }
 
+// readOpenCodeUsageFreshness loads the state without mutating it. A missing or
+// corrupt file reads as "nothing owed".
+func readOpenCodeUsageFreshness() openCodeUsageFreshness {
+	openCodeFreshnessMu.Lock()
+	defer openCodeFreshnessMu.Unlock()
+	var state openCodeUsageFreshness
+	if !readJSONFile(openCodeUsageFreshnessPath(), &state) {
+		return openCodeUsageFreshness{}
+	}
+	return state
+}
+
 // updateOpenCodeUsageFreshness applies mutate under the freshness lock and
 // persists the result when it changed (temp file + rename, removed once empty).
 // A missing or corrupt file reads as "nothing owed". Nothing under this lock
@@ -506,8 +518,8 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 	if !forced && !hasDebt && !continuationDue {
 		return ""
 	}
-	if hasDebt && !forced {
-		if openCodeDebtExhausted(state, now) || state.Attempts >= openCodeRunDebtMaxAttempts {
+	if !forced {
+		if hasDebt && (openCodeDebtExhausted(state, now) || state.Attempts >= openCodeRunDebtMaxAttempts) {
 			// Logged, not just recorded: "why has it not reconciled?" is the
 			// question a stale card raises, and these two are the only
 			// outcomes that answer it without a pass having run.
@@ -515,9 +527,17 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 			openCodeMarkPartialIfBacklogged()
 			return ""
 		}
+		// The spacing bounds EVERY pass, not just a debt's. A continuation
+		// chain is armed on the free-retry floor, so without this a backlog
+		// would spawn `opencode` twice a minute for the chain's whole budget —
+		// on the machine the user is working on.
 		if !state.passSpacingElapsed(now) {
 			logOpenCodeUsage("deferred attempts=%d", state.Attempts)
-			openCodeScheduleRunDebtRetry(state, now, openCodeRetryFree)
+			if hasDebt {
+				openCodeScheduleRunDebtRetry(state, now, openCodeRetryFree)
+			} else {
+				openCodeArmContinuation(openCodeSpacedDelay(state, now, openCodeRunDebtFreeRetryDelay))
+			}
 			return ""
 		}
 	}
@@ -609,7 +629,9 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 		}
 		return
 	}
-	// No debt: the continuation chain is the only timer.
+	// No debt: the continuation chain is the only timer. It reads the spacing
+	// clock from the freshness state, which every pass stamps.
+	freshness := readOpenCodeUsageFreshness()
 	switch {
 	case openCodeReconcileSucceeded(outcome), outcome == openCodeReconcileUnsupported:
 		updateOpenCodeUsageLedgerContinuation(false, 0, 0)
@@ -624,7 +646,7 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			return
 		}
 		updateOpenCodeUsageLedgerContinuation(true, 0, 0)
-		openCodeArmContinuation(openCodeRunDebtFreeRetryDelay)
+		openCodeArmContinuation(openCodeSpacedDelay(freshness, now, openCodeRunDebtFreeRetryDelay))
 	default:
 		ledger := readOpenCodeUsageLedger()
 		failures := ledger.ContinuationFailures
@@ -641,9 +663,9 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			return
 		}
 		updateOpenCodeUsageLedgerContinuation(true, failures, firstFailureAtMs)
-		openCodeArmContinuation(refreshFreeRetryDelay(
+		openCodeArmContinuation(openCodeSpacedDelay(freshness, now, refreshFreeRetryDelay(
 			now.Sub(time.UnixMilli(firstFailureAtMs)),
-			openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder))
+			openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)))
 	}
 }
 
@@ -755,6 +777,21 @@ func openCodeArmRunDebtRetry(id openCodeDebtID, delay time.Duration) {
 	t.timer = time.AfterFunc(delay, func() { openCodeRunDebtRetryFired(gen, &id) })
 }
 
+// openCodeSpacedDelay is `base`, pushed out to whatever is left of
+// openCodeReconcileMinInterval since the last pass. The debt ladder gets this
+// from openCodeScheduleRunDebtRetry; the continuation chain has no ladder, so
+// it asks here — otherwise its 30-second floor would fire only to be deferred,
+// churning the timer for nothing.
+func openCodeSpacedDelay(state openCodeUsageFreshness, now time.Time, base time.Duration) time.Duration {
+	if state.LastAttemptAtMs <= 0 {
+		return base
+	}
+	if spaced := time.UnixMilli(state.LastAttemptAtMs).Add(openCodeReconcileMinInterval).Sub(now); spaced > base {
+		return spaced
+	}
+	return base
+}
+
 // openCodeArmContinuation books the one continuation pass. It carries no debt
 // id: the chain's state lives in the ledger, which the pass re-reads.
 func openCodeArmContinuation(delay time.Duration) {
@@ -854,11 +891,9 @@ func nudgeOpenCodeUsageRefresh(now time.Time) bool {
 		updateOpenCodeUsageLedgerContinuation(true, 0, 0)
 	}
 	n.lastAt = now
-	openCodeFreshnessInFlight.Add(1)
-	go func() {
-		defer openCodeFreshnessInFlight.Add(-1)
-		startOpenCodeReconcileWorker()
-	}()
+	// Non-blocking, and it accounts for itself in openCodeFreshnessInFlight —
+	// so the gather never waits on the pass.
+	startOpenCodeReconcileWorker()
 	return true
 }
 
@@ -913,7 +948,7 @@ func adoptAndPayOwedOpenCodeRunDebt(startedAt time.Time) {
 	// With no debt open, a continuation the previous process booked is the only
 	// thing left to resume.
 	if readOpenCodeUsageLedger().ContinuationDue {
-		openCodeArmContinuation(openCodeRunDebtFreeRetryDelay)
+		openCodeArmContinuation(openCodeSpacedDelay(state, now, openCodeRunDebtFreeRetryDelay))
 		logOpenCodeUsage("resumed continuation")
 	}
 }

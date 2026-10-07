@@ -138,10 +138,12 @@ type openCodeLedgerDay struct {
 }
 
 // openCodeSkippedSession remembers one session whose export was over the stdout
-// cap, so a later pass can retry it when it changes.
+// cap, so a later pass can retry it when it changes. The session is identified
+// by its 16-hex HASH, never its id — the field name says so, because this file
+// is the feature's redaction contract made visible.
 type openCodeSkippedSession struct {
-	Session   string `json:"session"`
-	UpdatedMs int64  `json:"updatedMs"`
+	SessionHash string `json:"sessionHash"`
+	UpdatedMs   int64  `json:"updatedMs"`
 }
 
 // openCodeUsageLedger is the persisted state. See the file header for the
@@ -405,7 +407,7 @@ func openCodePruneSkipped(ledger *openCodeUsageLedger, now time.Time) {
 	floor := openCodeRetentionFloor(now).UnixMilli()
 	kept := make([]openCodeSkippedSession, 0, len(ledger.Skipped))
 	for _, entry := range ledger.Skipped {
-		if entry.Session == "" || entry.UpdatedMs < floor {
+		if entry.SessionHash == "" || entry.UpdatedMs < floor {
 			continue
 		}
 		kept = append(kept, entry)

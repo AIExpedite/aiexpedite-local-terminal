@@ -2261,8 +2261,11 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   session first, each export's stdout capped at 8 MiB. Passes run only on a debt
   rung, a gather nudge (2-minute cooldown) or a Refresh click — never on an idle
   gather — and share one single flight, so the click and the worker never spawn
-  two children. One export of a long session can take seconds of CPU on the
-  user's machine.
+  two children. `openCodeReconcileMinInterval` spaces any two passes, a
+  continuation's included (`openCodeSpacedDelay`): the chain is armed on the
+  30-second free-retry floor, so without that it would spawn `opencode` twice a
+  minute for its whole budget. One export of a long session can take seconds of
+  CPU on the user's machine.
 - **Bounds.** 5,000 message rows per day for 2 days (about 1 MB at the cap), 512
   stream-captured sessions per day, 32 remembered over-cap exports. Past the row
   cap, or when an over-cap export has to be skipped, the day is `partial` and the
