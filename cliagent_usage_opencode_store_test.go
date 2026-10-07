@@ -595,6 +595,39 @@ func TestOpenCodeReconcile_AnUnreadableAnswerKeepsItsFailureClass(t *testing.T) 
 	}
 }
 
+func TestOpenCodeReconcile_ACleanSilentSessionListIsAnEmptyStore(t *testing.T) {
+	// OpenCode's `session list` returns before printing when there are no
+	// sessions. Reading that as `unsupported` would retire the debt and never
+	// record the successful pass the zero row waits for.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	for _, tc := range []struct {
+		name    string
+		err     error
+		want    string
+		success bool
+	}{
+		{"a clean exit printing nothing is an empty list", nil, openCodeReconcileNoChange, true},
+		{"a non-zero exit printing nothing stays unsupported", &exec.ExitError{}, openCodeReconcileUnsupported, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			openCodeUsageBinary = func() string { return "opencode-stub" }
+			openCodeRunCommand = func(_ context.Context, _ string, args []string, _ int) ([]byte, bool, error) {
+				if args[0] != "session" {
+					t.Fatalf("an empty store must export nothing, ran %v", args)
+				}
+				return []byte(" \n"), false, tc.err
+			}
+			if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != tc.want {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, tc.want)
+			}
+			if gotSuccess := readOpenCodeUsageLedger().LastSuccessfulReconcileAtMs != 0; gotSuccess != tc.success {
+				t.Fatalf("successful reconcile recorded = %v, want %v", gotSuccess, tc.success)
+			}
+		})
+	}
+}
+
 func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testing.T) {
 	// Past openCodeSessionListMaxSessions only the most recently active are
 	// considered, so a changed session the cut dropped is never exported. The

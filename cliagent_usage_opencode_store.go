@@ -482,8 +482,16 @@ func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []open
 		// warning) must not be read as one that cannot answer at all —
 		// `unsupported` RETIRES the debt, so a transient non-zero exit would
 		// permanently drop the reading.
+		//
+		// A clean exit that printed nothing is an EMPTY store: OpenCode's
+		// handler returns before printing when there are no sessions. Reading
+		// it as `unsupported` would retire the debt and never record the
+		// successful pass the zero row waits for. A non-zero silent exit is
+		// still classified below.
 		var ok bool
-		if parsed, ok = parseOpenCodeSessionList(stdout); !ok {
+		if err == nil && len(bytes.TrimSpace(stdout)) == 0 {
+			parsed = nil
+		} else if parsed, ok = parseOpenCodeSessionList(stdout); !ok {
 			return nil, false, openCodeCommandOutcome(err)
 		}
 	}
