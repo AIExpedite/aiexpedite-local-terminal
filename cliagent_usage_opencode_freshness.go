@@ -744,13 +744,8 @@ func openCodeScheduleRunDebtRetry(state openCodeUsageFreshness, now time.Time, k
 			delay = refreshFreeRetryDelay(now.Sub(time.UnixMilli(s.OwedAtMs)),
 				openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)
 		}
-		next = now.Add(delay)
-		if s.LastAttemptAtMs > 0 {
-			if spaced := time.UnixMilli(s.LastAttemptAtMs).Add(openCodeReconcileMinInterval); spaced.After(next) &&
-				spaced.Sub(now) <= openCodeReconcileMinInterval {
-				next = spaced
-			}
-		}
+		// Same spacing rule the continuation uses, so the two cannot drift.
+		next = now.Add(openCodeSpacedDelay(*s, now, delay))
 		s.NextAttemptAtMs = next.UnixMilli()
 	})
 	if next.IsZero() {
@@ -763,18 +758,7 @@ func openCodeScheduleRunDebtRetry(state openCodeUsageFreshness, now time.Time, k
 
 // openCodeArmRunDebtRetry replaces the pending timer with one for generation id.
 func openCodeArmRunDebtRetry(id openCodeDebtID, delay time.Duration) {
-	if delay < 0 {
-		delay = 0
-	}
-	t := &openCodeRunDebtRetryTimer
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.timer != nil {
-		t.timer.Stop()
-	}
-	t.gen++
-	gen := t.gen
-	t.timer = time.AfterFunc(delay, func() { openCodeRunDebtRetryFired(gen, &id) })
+	openCodeArmPass(&id, delay)
 }
 
 // openCodeSpacedDelay is `base`, pushed out to whatever is left of
@@ -786,7 +770,10 @@ func openCodeSpacedDelay(state openCodeUsageFreshness, now time.Time, base time.
 	if state.LastAttemptAtMs <= 0 {
 		return base
 	}
-	if spaced := time.UnixMilli(state.LastAttemptAtMs).Add(openCodeReconcileMinInterval).Sub(now); spaced > base {
+	spaced := time.UnixMilli(state.LastAttemptAtMs).Add(openCodeReconcileMinInterval).Sub(now)
+	// A stamp the clock left in the future must not park the next pass
+	// arbitrarily far out: the spacing can only ever add up to one interval.
+	if spaced > base && spaced <= openCodeReconcileMinInterval {
 		return spaced
 	}
 	return base
@@ -795,6 +782,16 @@ func openCodeSpacedDelay(state openCodeUsageFreshness, now time.Time, base time.
 // openCodeArmContinuation books the one continuation pass. It carries no debt
 // id: the chain's state lives in the ledger, which the pass re-reads.
 func openCodeArmContinuation(delay time.Duration) {
+	openCodeArmPass(nil, delay)
+}
+
+// openCodeArmPass replaces the ONE process-wide timer. `id` names the debt
+// generation the rung belongs to, or nil for a continuation, whose state lives
+// in the ledger. There is one timer because there is one worker: a booked debt
+// rung and a booked continuation are never both outstanding
+// (openCodeBookAfterOutcome picks exactly one), so a single slot cannot lose a
+// schedule the other owns.
+func openCodeArmPass(id *openCodeDebtID, delay time.Duration) {
 	if delay < 0 {
 		delay = 0
 	}
@@ -806,7 +803,7 @@ func openCodeArmContinuation(delay time.Duration) {
 	}
 	t.gen++
 	gen := t.gen
-	t.timer = time.AfterFunc(delay, func() { openCodeRunDebtRetryFired(gen, nil) })
+	t.timer = time.AfterFunc(delay, func() { openCodeRunDebtRetryFired(gen, id) })
 }
 
 // openCodeRunDebtRetryFired re-reads the state before doing anything, so a rung

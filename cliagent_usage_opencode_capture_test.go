@@ -37,6 +37,13 @@ func openCodeUsageFixture(t *testing.T, at time.Time) func(time.Time) {
 	dir := t.TempDir()
 	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(dir, "opencode_usage.json"))
 	t.Setenv(openCodeUsageFreshnessEnv, filepath.Join(dir, "opencode_usage_freshness.json"))
+	// And the session store the discovery walk stats: without this, a row that
+	// drives the parser reads the REAL machine's ~/.local/share/opencode, and a
+	// developer who has used OpenCode today gets a nudge — which starts a
+	// background pass that writes this test's ledger while it is asserting on
+	// it. A row that wants a populated store sets OPENCODE_DATA itself.
+	t.Setenv("OPENCODE_DATA", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", "")
 
 	now := at
 	prevNow := openCodeUsageNow

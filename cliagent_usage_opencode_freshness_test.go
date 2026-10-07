@@ -746,3 +746,31 @@ func TestOpenCodeSpacedDelay_PushesABaseOutToTheSpacing(t *testing.T) {
 		t.Fatalf("delay = %v, want the base %v", got, base)
 	}
 }
+
+func TestOpenCodeSpacedDelay_IgnoresAStampTheClockLeftInTheFuture(t *testing.T) {
+	// The spacing can only ever add up to one interval: a LastAttemptAtMs a
+	// backwards clock step left hours ahead must not park the next pass there,
+	// which would stall the chain (and the debt ladder) indefinitely.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	openCodeReconcileMinInterval = time.Minute
+	base := 30 * time.Second
+
+	state := openCodeUsageFreshness{LastAttemptAtMs: now.Add(6 * time.Hour).UnixMilli()}
+	if got := openCodeSpacedDelay(state, now, base); got != base {
+		t.Fatalf("delay = %v, want the base %v rather than the future stamp", got, base)
+	}
+	// And the ladder books off the same rule, so the two cannot drift.
+	updateOpenCodeUsageFreshness(func(s *openCodeUsageFreshness) {
+		openCodeOweReconcile(s, now, openCodeCompletionMs(now))
+		s.LastAttemptAtMs = now.Add(6 * time.Hour).UnixMilli()
+	})
+	booked, _ := openCodePendingDebt(now)
+	if !openCodeScheduleRunDebtRetry(booked, now, openCodeRetryAfterPass) {
+		t.Fatal("the ladder booked nothing")
+	}
+	next := readOpenCodeUsageFreshness().NextAttemptAtMs
+	if ceiling := now.Add(openCodeReconcileMinInterval + time.Second).UnixMilli(); next > ceiling {
+		t.Fatalf("next attempt = %d, want it within one spacing interval of now (%d)", next, ceiling)
+	}
+}
