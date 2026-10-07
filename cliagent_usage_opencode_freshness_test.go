@@ -175,6 +175,32 @@ func TestOpenCodeDebt_RetiresPastItsMaximumAge(t *testing.T) {
 	}
 }
 
+func TestOpenCodeDebt_AnAgedOutDebtIsALowerBoundEvenAfterAnEarlierSuccess(t *testing.T) {
+	// The debt's own loss is NOT visible in the ledger: an uncovered run can
+	// open a debt after an unrelated successful pass, and an offline device can
+	// then age it out without a single pass of its own running. Inferring
+	// "nothing left behind" from that stale success would present the day as
+	// complete with the run's usage missing.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	setNow := openCodeDebtFixture(t, now)
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		l.LastPassOutcome = openCodeReconcileOK
+		l.LastSuccessfulReconcileAtMs = now.UnixMilli()
+		return openCodeLedgerEdit{Changed: true}
+	})
+	updateOpenCodeUsageFreshness(func(s *openCodeUsageFreshness) {
+		openCodeOweReconcile(s, now, openCodeCompletionMs(now))
+	})
+
+	setNow(now.Add(openCodeRunDebtMaxAge + time.Minute))
+	if _, owed := openCodePendingDebt(openCodeUsageNow()); owed {
+		t.Fatal("a debt nothing could pay must retire")
+	}
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(openCodeUsageNow())]; day == nil || !day.Partial {
+		t.Fatalf("day = %+v, want the lower-bound notice despite the earlier ok", day)
+	}
+}
+
 func TestOpenCodeDebt_SpendsAtMostItsBudgetOfPasses(t *testing.T) {
 	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
 	openCodeDebtFixture(t, now)

@@ -236,13 +236,23 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	settled := 0
 	remaining := func() int { return plan.remaining + len(plan.exports) - settled }
 
-	if !truncated && len(plan.staleRechecks) > 0 {
+	if !truncated && (len(plan.staleRechecks) > 0 || len(plan.lostRechecks) > 0) {
 		// Best effort: a record that fails to clear only costs a later pass,
-		// never a figure.
+		// never a figure. A LOST session's day is marked a lower bound in the
+		// same write, because dropping that record is the moment its unread
+		// writes become unrecoverable.
 		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			edit := openCodeLedgerEdit{}
 			for _, hash := range plan.staleRechecks {
 				if openCodeForgetRecheckHash(l, hash) {
+					edit.Changed = true
+				}
+			}
+			for _, entry := range plan.lostRechecks {
+				if openCodeForgetRecheckHash(l, entry.SessionHash) {
+					edit.Changed = true
+				}
+				if openCodeMarkDayPartial(l, openCodeDayKey(time.UnixMilli(entry.UpdatedMs))) {
 					edit.Changed = true
 				}
 			}
@@ -425,13 +435,22 @@ type openCodeReconcilePlan struct {
 	// cannot tell whether they changed, so they are skipped and the day is a
 	// lower bound.
 	undatable int
-	// staleRechecks holds the hashes of DUE re-read records whose session the
-	// list no longer names at all — one OpenCode deleted, or moved out of the
-	// layout we can read. Nothing will ever export them, so nothing would ever
-	// clear them: a pass would end ok, book a wake-up for the record, and the
+	// staleRechecks holds the hashes of DUE re-read records the `skipped`
+	// retry has taken over: the session is remembered as over-cap, so that
+	// retry — not this record — owns the second read, and the over-cap record
+	// already marked the day a lower bound. Nothing would ever clear the
+	// record otherwise: a pass would end ok, book a wake-up for it, and the
 	// two would chase each other until the retention prune. They are dropped
 	// instead, and only from a list that was NOT truncated.
 	staleRechecks []string
+	// lostRechecks holds the DUE re-read records whose session the list no
+	// longer names at all — one OpenCode deleted, or moved out of the layout we
+	// can read. Unlike the above these are a LOSS: the cursor already counts
+	// the session committed, and the export that booked the re-read may have
+	// preceded the turn's later `step-finish` writes, which nothing can read
+	// now. Dropping the record must therefore mark its day a lower bound, as
+	// the recheck cap's eviction does.
+	lostRechecks []openCodeRecheckSession
 }
 
 // planOpenCodeReconcile picks this pass's exports: changed sessions
@@ -507,11 +526,14 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 		if entry.DueAtMs > now.UnixMilli() {
 			continue
 		}
-		// Not listed at all, or now remembered as over-cap: either way no
-		// export will ever reach the re-read's commit path to clear it, and the
-		// `skipped` retry owns the second case.
-		if _, held := stored[entry.SessionHash]; !listed[entry.SessionHash] || held {
+		// Either way no export will ever reach the re-read's commit path to
+		// clear it, but the two differ in what is lost: the `skipped` retry
+		// owns an over-cap session and will read it again, while a session the
+		// list does not name is gone with whatever it had still to write.
+		if _, held := stored[entry.SessionHash]; held {
 			plan.staleRechecks = append(plan.staleRechecks, entry.SessionHash)
+		} else if !listed[entry.SessionHash] {
+			plan.lostRechecks = append(plan.lostRechecks, entry)
 		}
 	}
 	sort.SliceStable(fresh, func(i, j int) bool { return fresh[i].updatedMs < fresh[j].updatedMs })

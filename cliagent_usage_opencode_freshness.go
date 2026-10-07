@@ -638,8 +638,11 @@ func openCodePendingDebt(now time.Time) (openCodeUsageFreshness, bool) {
 	})
 	if agedOut {
 		// A debt nothing could pay in six hours leaves whatever it never
-		// reconciled uncounted, so today is a lower bound.
-		openCodeMarkPartialIfBacklogged()
+		// reconciled uncounted, so today is a lower bound. Unconditionally: the
+		// debt may have opened after an unrelated successful pass and never
+		// have had a pass of its own, in which case the ledger shows no backlog
+		// at all while the run's usage is missing.
+		openCodeMarkTodayPartialNow()
 	}
 	return state, state.owed()
 }
@@ -675,7 +678,7 @@ func openCodePayReconcile(parent context.Context, forced bool) string {
 			// question a stale card raises, and these two are the only
 			// outcomes that answer it without a pass having run.
 			logOpenCodeUsage("exhausted attempts=%d", state.Attempts)
-			openCodeMarkPartialIfBacklogged()
+			openCodeMarkTodayPartialNow()
 			return ""
 		}
 		// The spacing bounds EVERY pass, not just a debt's. A continuation
@@ -804,8 +807,10 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			return
 		}
 		if !openCodeScheduleRunDebtRetry(fresh, now, kind) {
-			// The ladder has nothing left to book while candidates remain.
-			openCodeMarkPartialIfBacklogged()
+			// The ladder has nothing left to book, and this debt's run was
+			// never reconciled — the same unconditional mark the aged-out debt
+			// takes, and for the same reason.
+			openCodeMarkTodayPartialNow()
 		}
 		return
 	}
@@ -1099,16 +1104,30 @@ func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureA
 	return persisted
 }
 
-// openCodeMarkPartialIfBacklogged marks today a lower bound when a debt or a
-// continuation chain gave up with work still queued, so the card carries the
-// notice rather than a silently low number. A chain that ended on a pass which
-// reached the end of the candidate list, with nothing remembered as over-cap,
-// left nothing behind.
+// openCodeMarkPartialIfBacklogged marks today a lower bound when a CONTINUATION
+// chain gave up, so the card carries the notice rather than a silently low
+// number. A chain that ended on a pass which reached the end of the candidate
+// list, with nothing remembered as over-cap and no re-read still owed, left
+// nothing behind.
+//
+// This inference is only sound for a chain, whose own last pass is the
+// evidence. A debt that was ABANDONED — aged out, or out of attempts — may have
+// opened after an unrelated successful pass and never have been reconciled at
+// all, so its loss is not visible in the ledger: those callers use
+// openCodeMarkTodayPartialNow instead.
 func openCodeMarkPartialIfBacklogged() {
 	ledger := readOpenCodeUsageLedger()
-	if openCodeReconcileSucceeded(ledger.LastPassOutcome) && len(ledger.Skipped) == 0 {
+	if openCodeReconcileSucceeded(ledger.LastPassOutcome) &&
+		len(ledger.Skipped) == 0 && len(ledger.Rechecks) == 0 {
 		return
 	}
+	openCodeMarkTodayPartialNow()
+}
+
+// openCodeMarkTodayPartialNow marks today a lower bound unconditionally — for
+// the callers that hold the evidence themselves, where the ledger's last pass
+// says nothing about what was abandoned.
+func openCodeMarkTodayPartialNow() {
 	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 		return openCodeLedgerEdit{Changed: openCodeMarkTodayPartial(l, openCodeUsageNow())}
 	})

@@ -1483,8 +1483,15 @@ func TestOpenCodeReconcile_ForgetsAReReadNoSessionCanEverClear(t *testing.T) {
 	if due := reconcileOpenCodeUsageOnce(context.Background(), later); due.Outcome != openCodeReconcileNoChange {
 		t.Fatalf("due outcome = %q, want no_change", due.Outcome)
 	}
-	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
+	ledger := readOpenCodeUsageLedger()
+	if len(ledger.Rechecks) != 0 {
 		t.Fatalf("rechecks = %+v, want the unclearable record dropped", ledger.Rechecks)
+	}
+	// The cursor already counts that session committed, and the export that
+	// booked the re-read may have preceded the turn's later writes, which
+	// nothing can read now. Dropping the record is where that becomes a loss.
+	if day := ledger.Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+		t.Fatalf("day = %+v, want the lower-bound notice for the lost session", day)
 	}
 }
 
