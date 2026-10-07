@@ -175,12 +175,14 @@ func splitScriptStatements(script string) []string {
 }
 
 // leadingProgram returns the program a statement runs, or "" when it runs none.
-// Env-var prefixes (`FOO=bar agy …`) and PowerShell's Start-Process / its
+// Env-var prefixes (`FOO=bar agy …`), the POSIX launch builtins `exec`, `env`
+// (with its option flags) and `nohup`, and PowerShell's Start-Process / its
 // -FilePath flag are stepped over, and one pair of outer quotes is stripped so
 // `& "C:\Program Files\agy.cmd"` names agy rather than a quoted path.
 func leadingProgram(statement string) string {
 	rest := statement
-	for range 4 { // bounded: at most an env prefix, Start-Process and -FilePath
+	afterEnv := false
+	for range 8 { // bounded: a few launch prefixes, env flags, Start-Process and -FilePath
 		token, tail := nextScriptToken(rest)
 		if token == "" {
 			return ""
@@ -190,6 +192,18 @@ func leadingProgram(statement string) string {
 			rest = tail
 		case strings.EqualFold(token, "-filepath"):
 			rest = tail
+		case token == "exec", token == "nohup":
+			rest = tail
+		case token == "env":
+			afterEnv = true
+			rest = tail
+		// env's own options: -u NAME and -C DIR take a value; the rest (-i, -0,
+		// --, --ignore-environment, --unset=NAME) do not.
+		case afterEnv && strings.HasPrefix(token, "-"):
+			rest = tail
+			if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+				_, rest = nextScriptToken(tail)
+			}
 		// A POSIX env assignment prefix is not the program. `$env:X=1` is a
 		// whole PowerShell statement of its own, so it needs no case here.
 		case isEnvAssignmentToken(token):

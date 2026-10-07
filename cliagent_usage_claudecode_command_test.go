@@ -31,6 +31,11 @@ func TestCommandRunsClaude(t *testing.T) {
 			[]string{"-NoProfile", "-EncodedCommand", helperFileModeLauncher(`claude.exe -p "a long prompt"`)}, true},
 		{"posix file-mode launcher", "bash",
 			[]string{"-c", helperPosixFileModeLauncher("claude -p hi")}, true},
+		{"bash -c exec", "bash", []string{"-c", `exec claude -p "hi"`}, true},
+		{"bash -c env assignment", "bash", []string{"-c", `env FOO=bar claude -p "hi"`}, true},
+		{"bash -c env flags", "bash", []string{"-c", "env -i -u HOME FOO=bar /usr/local/bin/claude -p hi"}, true},
+		{"sh -c nohup", "sh", []string{"-c", "cd /repo && nohup claude -p hi"}, true},
+		{"bash -c exec env", "bash", []string{"-c", "exec env FOO=1 claude -p hi"}, true},
 
 		// A mention is not a spawn; a direct launch is isClaudeCommand's case.
 		{"git log --grep claude", "bash", []string{"-c", "git log --grep claude"}, false},
@@ -43,6 +48,8 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"undecodable base64", "powershell", []string{"-EncodedCommand", "!!!not base64!!!"}, false},
 		{"direct launch is not a wrapper", "claude", []string{"-p", "hi"}, false},
 		{"agy wrapper", "bash", []string{"-c", "agy --print hi"}, false},
+		{"exec another program", "bash", []string{"-c", "exec env FOO=1 git log --grep claude"}, false},
+		{"bare env", "bash", []string{"-c", "env"}, false},
 	}
 	for _, tc := range cases {
 		if got := commandRunsClaude(tc.command, tc.args); got != tc.want {
