@@ -38,6 +38,10 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"bash -c exec env", "bash", []string{"-c", "exec env FOO=1 claude -p hi"}, true},
 		{"bash -c command", "bash", []string{"-c", `command claude -p "hi"`}, true},
 		{"bash -c command -p", "bash", []string{"-c", "command -p claude -p hi"}, true},
+		{"bash -c exec -c", "bash", []string{"-c", `exec -c claude -p "hi"`}, true},
+		{"bash -c exec -cl", "bash", []string{"-c", "exec -cl claude -p hi"}, true},
+		{"bash -c exec -a name", "bash", []string{"-c", "exec -a claudish claude -p hi"}, true},
+		{"bash -c exec -ca name", "bash", []string{"-c", "exec -ca claudish claude -p hi"}, true},
 
 		// A mention is not a spawn; a direct launch is isClaudeCommand's case.
 		{"git log --grep claude", "bash", []string{"-c", "git log --grep claude"}, false},
@@ -51,6 +55,7 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"direct launch is not a wrapper", "claude", []string{"-p", "hi"}, false},
 		{"agy wrapper", "bash", []string{"-c", "agy --print hi"}, false},
 		{"exec another program", "bash", []string{"-c", "exec env FOO=1 git log --grep claude"}, false},
+		{"exec -a renames another program", "bash", []string{"-c", "exec -a claude git log"}, false},
 		{"command -v only locates", "bash", []string{"-c", "command -v claude"}, false},
 		{"command -V only describes", "bash", []string{"-c", "command -V claude"}, false},
 		{"bare env", "bash", []string{"-c", "env"}, false},

@@ -175,15 +175,15 @@ func splitScriptStatements(script string) []string {
 }
 
 // leadingProgram returns the program a statement runs, or "" when it runs none.
-// Env-var prefixes (`FOO=bar agy …`), the POSIX launch builtins `exec`, `env`
-// (with its option flags), `nohup` and `command` (its -p form too; -v/-V run
-// nothing), and PowerShell's Start-Process / its
+// Env-var prefixes (`FOO=bar agy …`), the POSIX launch builtins `exec` and
+// `env` (both with their option flags), `nohup` and `command` (its -p form too;
+// -v/-V run nothing), and PowerShell's Start-Process / its
 // -FilePath flag are stepped over, and one pair of outer quotes is stripped so
 // `& "C:\Program Files\agy.cmd"` names agy rather than a quoted path.
 func leadingProgram(statement string) string {
 	rest := statement
-	afterEnv, afterCommand := false, false
-	for range 8 { // bounded: a few launch prefixes, env flags, Start-Process and -FilePath
+	afterEnv, afterCommand, afterExec := false, false, false
+	for range 10 { // bounded: a few launch prefixes, their flags, Start-Process and -FilePath
 		token, tail := nextScriptToken(rest)
 		if token == "" {
 			return ""
@@ -193,10 +193,20 @@ func leadingProgram(statement string) string {
 			rest = tail
 		case strings.EqualFold(token, "-filepath"):
 			rest = tail
-		case token == "exec", token == "nohup":
+		case token == "exec":
+			afterExec = true
 			rest = tail
+		case token == "nohup":
+			rest = tail
+		// exec's own options (`exec [-cl] [-a name] [command …]`): the flags may
+		// be bundled, and an `a` anywhere in the bundle takes the name value.
+		case afterExec && strings.HasPrefix(token, "-") && token != "-":
+			rest = tail
+			if strings.Contains(token, "a") {
+				_, rest = nextScriptToken(tail)
+			}
 		case token == "command":
-			afterCommand = true
+			afterCommand, afterExec = true, false
 			rest = tail
 		// command's -p (default PATH) still runs the program; -v/-V only print
 		// where it is, so the statement runs nothing.
@@ -206,7 +216,7 @@ func leadingProgram(statement string) string {
 			}
 			rest = tail
 		case token == "env":
-			afterEnv = true
+			afterEnv, afterExec = true, false
 			rest = tail
 		// env's own options: -u NAME and -C DIR take a value; the rest (-i, -0,
 		// --, --ignore-environment, --unset=NAME) do not.
