@@ -358,7 +358,7 @@ func settleCLIUsageReceipt(r *cliUsageReceiptReservation, published bool, agents
 
 	if !published {
 		for provider, generation := range reserved {
-			noteCLIUsageObservationAdvanced(provider, generation)
+			releaseCLIUsageReservation(provider, generation)
 		}
 		if len(reserved) > 0 {
 			logCLIUsageHint("receipt_released")
@@ -402,9 +402,26 @@ func settleCLIUsageReceipt(r *cliUsageReceiptReservation, published bool, agents
 	// reading, or the receipt signed an older generation — was never delivered.
 	for provider, generation := range reserved {
 		if c, ok := carried[provider]; !ok || !c.covers(generation) {
-			noteCLIUsageObservationAdvanced(provider, generation)
+			releaseCLIUsageReservation(provider, generation)
 		}
 	}
+}
+
+// releaseCLIUsageReservation hands an undelivered reservation back to the
+// ordinary lifecycle — unless a generation noted for the provider after it was
+// reserved is pending (a newer counter, or another epoch after an account
+// switch). That one supersedes it and keeps its own debounce and budget;
+// releasing over it would hint the stale generation in its place.
+func releaseCLIUsageReservation(provider string, generation cliUsageGeneration) {
+	p := cliUsagePropagator
+	p.mu.Lock()
+	h := p.pending[provider]
+	superseded := h != nil && !generation.covers(h.generation)
+	p.mu.Unlock()
+	if superseded {
+		return
+	}
+	noteCLIUsageObservationAdvanced(provider, generation)
 }
 
 // noteCLIUsageGenerationRotated is called (once per process) by the cache write

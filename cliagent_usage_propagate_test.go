@@ -838,3 +838,51 @@ func TestCLIUsageHint_AReceiptThatDidNotCarryTheReservationReleasesIt(t *testing
 		t.Fatalf("hints = %+v, want the reserved {99,3} hinted and followed up", hints)
 	}
 }
+
+// A generation noted for the provider while its reservation was out — the same
+// epoch's next counter, or a new epoch after an account switch — supersedes the
+// reservation however the receipt settles: it alone is hinted, with its own
+// hint and follow-up.
+func TestCLIUsageHint_ANewerPendingGenerationSurvivesTheReceiptSettlement(t *testing.T) {
+	reserved := gen(100, 3)
+	older := gen(100, 2)
+	cases := []struct {
+		name      string
+		newer     cliUsageGeneration
+		published bool
+		carried   *cliUsageGeneration
+	}{
+		{"receipt carried the reservation", gen(100, 4), true, &reserved},
+		{"receipt carried an older generation", gen(100, 4), true, &older},
+		{"receipt not published", gen(100, 4), false, nil},
+		{"new epoch, receipt carried the reservation", gen(200, 1), true, &reserved},
+		{"new epoch, receipt carried an older generation", gen(200, 1), true, &older},
+		{"new epoch, receipt not published", gen(200, 1), false, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, cfg := propagatorFixture(t)
+			startCLIUsagePropagator(cfg)
+
+			ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+			r := reserved
+			observeCLIUsageGeneration(ctx, claudeUsageProvider, &r)
+			noteCLIUsageObservationAdvanced(claudeUsageProvider, tc.newer)
+			var agents []cliAgentUsage
+			if tc.carried != nil {
+				agents = []cliAgentUsage{{Provider: claudeUsageProvider, UsageGeneration: tc.carried}}
+			}
+			settleCLIUsageReceipt(reservation, tc.published, agents)
+
+			hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+			if len(hints) != 2 {
+				t.Fatalf("got %d hints, want the newer generation's hint and follow-up: %+v", len(hints), hints)
+			}
+			for _, h := range hints {
+				if gen(h.hint.GenerationEpoch, h.hint.Generation) != tc.newer {
+					t.Fatalf("hint %+v, want only the newer %+v", h.hint, tc.newer)
+				}
+			}
+		})
+	}
+}
