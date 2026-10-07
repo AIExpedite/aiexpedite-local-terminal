@@ -204,6 +204,36 @@ type claudeRateLimitSnapshot struct {
 	// debt that is simply due. Released by its owner when the attempt ends; a
 	// crashed owner's lease expires on its own.
 	AttemptClaimedUntilMs int64 `json:"attemptClaimedUntilMs,omitempty"`
+
+	// GenerationEpoch / Generation identify the reading the card would show
+	// (claudeStampObservedGeneration): Generation increments when any DISPLAYED
+	// row's observation advances, and GenerationEpoch is the stamping agent
+	// process's random epoch (cliUsageProcessGenerationEpoch). The backend
+	// applies a generation from a signed refresh receipt and skips usage hints
+	// for one it already has (cliagent_usage_propagate.go). Integers only.
+	//
+	// Written ONLY by the agent process, and only on claudeRateLimitCachePath()
+	// — this channel's own cache, never another channel's pinned one. The
+	// status-line hook runs as its own short-lived process and may write the
+	// other channel's cache; if it bumped too, two writers would race one
+	// counter. The agent's watcher stamps what the hook wrote instead.
+	GenerationEpoch int64 `json:"generationEpoch,omitempty"`
+	Generation      int64 `json:"generation,omitempty"`
+	// GenerationRowObservedMs is the per-row observation set
+	// (claudeRowObservationsMs) the current generation describes. A bump is due
+	// when ANY displayed row's observation is newer than its entry here — never a
+	// newest-across-rows comparison, which a frequently refreshed five_hour row
+	// would win forever while the weekly or Fable row moved unnoticed. Cleared on
+	// an account flip; the epoch and counter are not (the counter must stay
+	// monotonic within an epoch the server already applied).
+	GenerationRowObservedMs []int64 `json:"generationRowObservedMs,omitempty"`
+	// DirectRunQuietUntilMs applies to DIRECT-RUN evidence only (a `claude` run
+	// the agent did not start, seen from its transcript): until then such
+	// evidence opens no new debt. Set when a debt retires unpaid (the request cap
+	// or the age-out), so a failing endpoint costs at most
+	// claudeRefreshOwedMaxRequests requests per claudeRefreshOwedMaxAge from
+	// direct runs, across restarts. Managed runs and smokes ignore it.
+	DirectRunQuietUntilMs int64 `json:"directRunQuietUntilMs,omitempty"`
 }
 
 // resetClaudeProbeAccountState drops everything on the snapshot that describes
@@ -216,6 +246,7 @@ func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
 	snap.AttemptClaimedUntilMs = 0
+	snap.GenerationRowObservedMs, snap.DirectRunQuietUntilMs = nil, 0
 }
 
 // clearClaudeRefreshDebt drops the owed-refresh marker, its attempt counter and
@@ -677,7 +708,11 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	if !verified {
-		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes, probedCred)
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes, probedCred)
+		if err == nil {
+			claudeStampAfterMerge(fingerprint)
+		}
+		return observed, err
 	}
 	// A verified merge is bounded END TO END, not merely across its two lock
 	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
@@ -721,6 +756,11 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	defer timer.Stop()
 	select {
 	case res := <-done:
+		if res.err == nil {
+			// Off the merge lock: the serialized merge released both layers before
+			// it answered.
+			claudeStampAfterMerge(fingerprint)
+		}
 		return res.observed, res.err
 	case <-ctx.Done():
 		// The caller's own deadline is the tighter one. A verified merge is

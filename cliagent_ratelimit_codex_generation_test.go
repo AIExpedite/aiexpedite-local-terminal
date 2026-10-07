@@ -20,14 +20,16 @@ import (
 // committed yet, and resets the propagator, restoring both afterwards.
 func withCodexGenerationEpoch(t *testing.T, epoch int64) {
 	t.Helper()
-	prevEpoch, prevRotated := codexProcessGenerationEpoch.Load(), codexGenerationRotated.Load()
-	codexProcessGenerationEpoch.Store(epoch)
+	prevEpoch, prevRotated := cliUsageProcessGenerationEpoch.Load(), codexGenerationRotated.Load()
+	cliUsageProcessGenerationEpoch.Store(epoch)
 	codexGenerationRotated.Store(false)
+	resetClaudeGenerationProcessState()
 	resetCLIUsagePropagator()
 	t.Cleanup(func() {
 		resetCLIUsagePropagator()
-		codexProcessGenerationEpoch.Store(prevEpoch)
+		cliUsageProcessGenerationEpoch.Store(prevEpoch)
 		codexGenerationRotated.Store(prevRotated)
+		resetClaudeGenerationProcessState()
 	})
 }
 
@@ -35,8 +37,9 @@ func withCodexGenerationEpoch(t *testing.T, epoch int64) {
 // file: a new epoch, nothing rotated, the propagator's memory gone.
 func simulateCodexProcessRestart(t *testing.T, epoch int64) {
 	t.Helper()
-	codexProcessGenerationEpoch.Store(epoch)
+	cliUsageProcessGenerationEpoch.Store(epoch)
 	codexGenerationRotated.Store(false)
+	resetClaudeGenerationProcessState()
 	resetCLIUsagePropagator()
 	simulateCodexAgentRestart(t)
 }
@@ -209,7 +212,7 @@ func backendAlreadyApplied(stored, hint cliUsageGeneration) bool {
 func TestCodexGeneration_EpochsAreRandomNotClockDerived(t *testing.T) {
 	seen := map[int64]bool{}
 	for i := 0; i < 64; i++ {
-		e := codexDrawGenerationEpoch()
+		e := cliUsageDrawGenerationEpoch()
 		if e < 1 || e > cliUsageMaxSafeInteger {
 			t.Fatalf("epoch %d outside [1, 2^53-1]", e)
 		}
@@ -226,13 +229,13 @@ func TestCodexGeneration_EpochsAreRandomNotClockDerived(t *testing.T) {
 	t.Cleanup(func() { codexUsageFreshnessNow = prevNow })
 	f := newCodexFreshnessFixture(t, frozen.Add(-time.Hour))
 
-	firstEpoch := codexDrawGenerationEpoch()
+	firstEpoch := cliUsageDrawGenerationEpoch()
 	simulateCodexProcessRestart(t, firstEpoch)
 	codexLiveReadAt(t, f, 10, 20, frozen)
 	codexLiveReadAt(t, f, 11, 20, frozen.Add(time.Second))
 	applied := cliUsageGeneration{Epoch: firstEpoch, Counter: 50} // backend ahead
 
-	secondEpoch := codexDrawGenerationEpoch()
+	secondEpoch := cliUsageDrawGenerationEpoch()
 	simulateCodexProcessRestart(t, secondEpoch)
 	codexRotateGenerationEpoch(frozen)
 	_, g := codexMetricsAndGenerationFromCache(frozen, f.fp)
@@ -310,4 +313,13 @@ func TestCodexGeneration_ParseContextPairsMetricsWithTheirOwnGeneration(t *testi
 	if published == 0 {
 		t.Fatal("no parse published a generation")
 	}
+}
+
+// resetClaudeGenerationProcessState is the Claude half of a fresh "process":
+// nothing rotated, nothing committed under this epoch, the watcher's memory
+// gone.
+func resetClaudeGenerationProcessState() {
+	claudeGenerationRotated.Store(false)
+	claudeLastCommittedGeneration.Store(0)
+	resetClaudeUsageWatchState()
 }

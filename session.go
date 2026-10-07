@@ -165,6 +165,14 @@ type CLISession struct {
 	// stream reader writes it and waitForExit reads it.
 	turnSettled atomic.Bool
 
+	// runsClaude is fixed at spawn: the child is the Claude CLI, launched
+	// directly (isClaudeCommand) or through a shell wrapper (commandRunsClaude —
+	// `cmd /c claude …`, `bash -c "claude …"`, PowerShell -EncodedCommand and the
+	// file-mode launcher). It gates only the exit-time utilization owe: a wrapped
+	// run gets no stream-json `result` detection, so it owes when the agent sees
+	// it exit. Routing, stream parsing and billing keep isClaudeCommand.
+	runsClaude bool
+
 	// codexUsageFloorMs is the floor a codex session's utilization run is
 	// measured against — the moment its prompt was DELIVERED to the child
 	// (armCodexUsageRun). Zero until then: a stdin-fed session started without
@@ -899,6 +907,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
+		runsClaude:         isClaudeCommand(command) || commandRunsClaude(command, cliArgs),
 		firstRealFrame:     make(chan struct{}),
 		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
@@ -2726,7 +2735,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// records a baseline strictly NEWER than the one the result probe is already
 	// sampling, so that probe's settleOwed cannot clear it and a second OAuth
 	// request gets scheduled for a turn that was already reported.
-	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
+	if session.runsClaude && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
 	}
 	// Same for a codex run that never reached a terminal event. A session that

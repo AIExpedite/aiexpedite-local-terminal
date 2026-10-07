@@ -488,6 +488,12 @@ type claudeUsageProbeGate struct {
 	lastRefreshAt          time.Time
 	lastRefreshFingerprint string
 	lastRefreshShared      bool
+	// immediateDoneMs is the newest run baseline whose immediate attempt
+	// (claudeUsageProbePayRecordedRun) has finished, and coverWaitCh is closed
+	// (and replaced) whenever that, a settle, or a settling attempt ending may
+	// have changed what waitCovered is waiting for.
+	immediateDoneMs int64
+	coverWaitCh     chan struct{}
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -686,6 +692,8 @@ func resetClaudeUsageProbeGate() {
 	// reference here only stops it from marking the NEXT generation as seeded.
 	claudeUsageProbe.seedingCh = nil
 	claudeUsageProbe.settling = 0
+	claudeUsageProbe.immediateDoneMs = 0
+	claudeUsageProbe.signalCoverWaitersLocked()
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
@@ -948,6 +956,7 @@ func (g *claudeUsageProbeGate) endSettling() {
 	if g.settling > 0 {
 		g.settling--
 	}
+	g.signalCoverWaitersLocked()
 	g.mu.Unlock()
 }
 
@@ -962,6 +971,7 @@ func (g *claudeUsageProbeGate) settleOwed(baseline time.Time) {
 	if !g.owedBaseline.IsZero() && baseline.UnixMilli() >= g.owedBaseline.UnixMilli() {
 		g.owedBaseline = time.Time{}
 	}
+	g.signalCoverWaitersLocked()
 	g.mu.Unlock()
 }
 
@@ -2684,8 +2694,10 @@ func refreshClaudeUsageIfStaleAs(ctx context.Context, generation uint64, now, la
 }
 
 // triggerClaudeUsageProbeAfterRun fires the probe off the hot path once a Claude
-// run has finished — a direct chat run (claude_native.go), a terminal-managed
-// run (session.go) or a `__cli_smoke__` turn. Asynchronous so it can never
+// run the agent started has finished — a native chat session (claude_native.go),
+// a terminal-managed run (session.go, including a shell-wrapped launch) or a
+// `__cli_smoke__` turn. Runs started outside the agent are owed from their
+// transcripts instead (claudeOweDirectRunRefresh). Asynchronous so it can never
 // delay frame ordering, waitForExit, or the session_ended publish; bounded by
 // the probe's own timeout and collapsed by its single-flight, so a burst of
 // finishing sessions issues one request.
@@ -2745,6 +2757,9 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 func claudeUsageProbePayRecordedRun(completedAt time.Time) {
 	claudeUsageProbe.beginSettling()
 	defer claudeUsageProbe.endSettling()
+	// Runs before endSettling (LIFO), so a smoke waiting on this baseline sees
+	// "finished" no later than the settle signal.
+	defer claudeUsageProbe.markImmediateDone(completedAt)
 	fingerprint, onDisk := claudeOweRunRefresh(completedAt)
 	if !onDisk {
 		if owedFor := time.Since(completedAt); claudeUsageProbe.armedForProbe() && owedFor < claudeRefreshOwedMaxAge {
@@ -3022,4 +3037,75 @@ func (r claudeProbeResult) loggable() bool {
 		return false
 	}
 	return true
+}
+
+// claudeSmokeWaitOutcome is how a smoke's wait for its own reading ended. None
+// of them is published, and none changes the smoke's verdict.
+type claudeSmokeWaitOutcome int
+
+const (
+	// claudeSmokeWaitCovered: the merged view covers the smoke's turn.
+	claudeSmokeWaitCovered claudeSmokeWaitOutcome = iota
+	// claudeSmokeWaitRefused: the immediate attempt finished without a covering
+	// reading (the 60 s floor, a hold, no credential, a failed request) — nothing
+	// is coming, and a refusal is never treated as a landed reading.
+	claudeSmokeWaitRefused
+	// claudeSmokeWaitTimeout: the context ended first.
+	claudeSmokeWaitTimeout
+)
+
+// signalCoverWaitersLocked wakes every waitCovered caller to re-check. Callers
+// hold g.mu.
+func (g *claudeUsageProbeGate) signalCoverWaitersLocked() {
+	if g.coverWaitCh != nil {
+		close(g.coverWaitCh)
+		g.coverWaitCh = nil
+	}
+}
+
+// markImmediateDone records that the immediate attempt for a run completed at
+// `baseline` has finished, whatever it returned.
+func (g *claudeUsageProbeGate) markImmediateDone(baseline time.Time) {
+	g.mu.Lock()
+	if ms := baseline.UnixMilli(); ms > g.immediateDoneMs {
+		g.immediateDoneMs = ms
+	}
+	g.signalCoverWaitersLocked()
+	g.mu.Unlock()
+}
+
+// waitCovered waits, at most until ctx ends, for a reading covering a run that
+// completed at `baseline` — including one an in-flight probe the immediate
+// attempt joined persisted — and returns early with claudeSmokeWaitRefused once
+// that attempt has finished without one. It reads the cache and leaves the
+// debt and its rung exactly as the attempt left them.
+//
+// Used by the smoke so a post-update signed refresh, issued right after it,
+// signs the smoke's own reading rather than the pre-run one; the retries
+// belong to the debt ladder, not to this wait.
+func (g *claudeUsageProbeGate) waitCovered(ctx context.Context, baseline time.Time) claudeSmokeWaitOutcome {
+	fingerprint := currentClaudeAccountFingerprint()
+	for {
+		// Sampled BEFORE the coverage check, so a signal landing between the two
+		// is not missed.
+		g.mu.Lock()
+		if g.coverWaitCh == nil {
+			g.coverWaitCh = make(chan struct{})
+		}
+		ch := g.coverWaitCh
+		finished := g.immediateDoneMs >= baseline.UnixMilli()
+		g.mu.Unlock()
+
+		if claudeUsageObservationCovers(claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), time.Now()), baseline) {
+			return claudeSmokeWaitCovered
+		}
+		if finished {
+			return claudeSmokeWaitRefused
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return claudeSmokeWaitTimeout
+		}
+	}
 }

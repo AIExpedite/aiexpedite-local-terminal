@@ -115,10 +115,11 @@ type cliAgentUsage struct {
 	NoticeSeverity string `json:"noticeSeverity,omitempty"`
 	NoticeURL      string `json:"noticeUrl,omitempty"`
 	// UsageGeneration identifies the device-side capture state these metrics
-	// were read from (codexMetricsAndGenerationFromCache). Signed in the refresh
-	// receipt, so the backend can record which generation it applied and skip a
-	// usage hint for one it already has (cliagent_usage_propagate.go). Only
-	// Codex sets it; integers only.
+	// were read from (codexMetricsAndGenerationFromCache, and Claude Code's
+	// claudeStampObservedGeneration). Signed in the refresh receipt, so the
+	// backend can record which generation it applied and skip a usage hint for
+	// one it already has (cliagent_usage_propagate.go). Set by Codex and Claude
+	// Code; integers only.
 	UsageGeneration *cliUsageGeneration `json:"usageGeneration,omitempty"`
 }
 

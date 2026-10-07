@@ -546,6 +546,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// above already claimed this stamp's nudge.
 	nudgeClaudeCredentialChanged(credStamp)
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
+	// The capture generation those rows were stamped under, from the view already
+	// loaded. Only this process's epoch: a generation an earlier process (or a
+	// restored cache) left is republished by the rotation, never as-is.
+	if g := view.generation; g != nil && g.Epoch == cliUsageProcessGenerationEpoch.Load() {
+		usage.UsageGeneration = g
+	}
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the

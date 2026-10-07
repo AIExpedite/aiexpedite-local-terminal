@@ -303,7 +303,7 @@ func TestCLIUsageHint_LogsCarryFixedLabelsOnly(t *testing.T) {
 		stopCLIUsagePropagator()
 	})
 
-	label := regexp.MustCompile(`^\[cli-usage\] usage hint: (sent|followup_sent|deferred|skipped_offline|skipped_unregistered|awaiting_rotation|rotation_retry|dropped|failed_\d+)$`)
+	label := regexp.MustCompile(`^\[cli-usage\] usage hint: (sent|followup_sent|deferred|skipped_offline|skipped_unregistered|awaiting_rotation|rotation_retry|dropped|dropped_applied|dropped_rejected|dropped_retryable|refused_retryable|refused|failed_\d+)( provider=(codex|claudeCode))?$`)
 	ansi := regexp.MustCompile("\x1b\\[[0-9;]*m")
 	hintLines := 0
 	for _, line := range strings.Split(ansi.ReplaceAllString(logged, ""), "\n") {

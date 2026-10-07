@@ -1,0 +1,215 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+/* --------------------------------------------------------------------------
+   cliagent_usage_claudecode_propagation_test.go — Claude Code's capture
+   generation: stamped by the agent process when a DISPLAYED row's observation
+   advances, noted to the provider-neutral hint sender, and published by the
+   parser so the signed receipt names it.
+   ------------------------------------------------------------------------ */
+
+// claudeGenerationFixture pins this "process" to epoch, isolates the Claude
+// cache and config dir, and starts the propagator with a hint recorder — the
+// agent-process state in which merges stamp.
+func claudeGenerationFixture(t *testing.T, epoch int64) (*cliUsageHintRecorder, string) {
+	t.Helper()
+	withCodexGenerationEpoch(t, epoch)
+	cache := filepath.Join(t.TempDir(), "claude_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	return rec, cache
+}
+
+// claudeReading merges one observed reading per window, as the probe would.
+func claudeReading(t *testing.T, cache, fingerprint string, at time.Time, observed map[string]time.Time) {
+	t.Helper()
+	updates := map[string]claudeRateLimitBucket{}
+	for window, obs := range observed {
+		updates[window] = claudeRateLimitBucket{
+			UsedPercentage: 30, ResetsAtMs: at.Add(48 * time.Hour).UnixMilli(),
+			ObservedAtMs: obs.UnixMilli(), usageKnown: true,
+		}
+	}
+	if _, err := mergeClaudeRateLimitCacheInto(context.Background(), cache, updates, at, fingerprint,
+		claudeRateLimitSourceProbe, false, nil, claudeCredStamp{}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+}
+
+func claudeGenerationOf(t *testing.T, cache string) cliUsageGeneration {
+	t.Helper()
+	snap := claudeCacheSnapshot(t, cache)
+	return cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
+}
+
+func TestClaudeGeneration_AProbeMergeBumpsOnceAndARepeatDoesNot(t *testing.T) {
+	rec, cache := claudeGenerationFixture(t, 9101)
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now, claudeWindowSevenDay: now})
+	if g := claudeGenerationOf(t, cache); g != gen(9101, 1) {
+		t.Fatalf("generation = %+v, want {9101,1}", g)
+	}
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now, claudeWindowSevenDay: now})
+	if g := claudeGenerationOf(t, cache); g != gen(9101, 1) {
+		t.Fatalf("a repeat merge of the same observation bumped: %+v", g)
+	}
+	h := waitHints(t, rec, 1, 0)[0].hint
+	if h.Provider != claudeUsageProvider || h.GenerationEpoch != 9101 || h.Generation != 1 {
+		t.Fatalf("hint = %+v, want claudeCode {9101,1}", h)
+	}
+}
+
+func TestClaudeGeneration_AHeartbeatOnlyBucketNeverBumps(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9102)
+	now := time.Now()
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), Status: "allowed"},
+	}, now, "", claudeRateLimitSourceStream)
+	if snap := claudeCacheSnapshot(t, cache); snap.Generation != 0 {
+		t.Fatalf("a heartbeat-only bucket bumped the generation: %+v", snap)
+	}
+}
+
+// five_hour stays the NEWEST observation while the constraining weekly bucket
+// advances: a newest-across-rows rule would never notice; the per-row rule does.
+func TestClaudeGeneration_AWeeklyAdvanceBelowTheNewestRowStillBumps(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9103)
+	base := time.Now().Add(-time.Hour)
+	claudeReading(t, cache, "", base, map[string]time.Time{
+		claudeWindowFiveHour: base.Add(10 * time.Minute),
+		claudeWindowSevenDay: base,
+	})
+	first := claudeGenerationOf(t, cache)
+	claudeReading(t, cache, "", base, map[string]time.Time{claudeWindowSevenDay: base.Add(5 * time.Minute)})
+	if next := claudeGenerationOf(t, cache); next.Counter != first.Counter+1 {
+		t.Fatalf("the weekly advance did not bump: %+v -> %+v", first, next)
+	}
+}
+
+// A write made outside the agent process (the status-line hook) is stamped by
+// the watcher on a later tick — after the startup hint and its follow-up have
+// gone idle.
+func TestClaudeGeneration_TheWatcherStampsAnOutOfProcessWrite(t *testing.T) {
+	rec, cache := claudeGenerationFixture(t, 9104)
+	now := time.Now()
+	cliUsagePropagatorRunning.Store(false) // the hook's process does not stamp
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	cliUsagePropagatorRunning.Store(true)
+	if snap := claudeCacheSnapshot(t, cache); snap.Generation != 0 {
+		t.Fatalf("a non-agent merge stamped: %+v", snap)
+	}
+
+	cliUsagePropagator.mu.Lock()
+	cliUsageWatchPeriod = 30 * time.Millisecond
+	cliUsagePropagator.armWatchLocked()
+	cliUsagePropagator.mu.Unlock()
+
+	h := waitHints(t, rec, 1, 0)[0].hint
+	if h.Provider != claudeUsageProvider || h.Generation != 1 || claudeGenerationOf(t, cache) != gen(9104, 1) {
+		t.Fatalf("hint = %+v, cache generation = %+v", h, claudeGenerationOf(t, cache))
+	}
+}
+
+// An account flip drops the row set with the rest of the account's state, but
+// the counter keeps rising within the epoch, so the new account's first
+// reading is never `already_applied` on the server. Only the signed-in
+// fingerprint is noted.
+func TestClaudeGeneration_AnAccountFlipKeepsTheCounterMonotonic(t *testing.T) {
+	rec, cache := claudeGenerationFixture(t, 9105)
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	waitHints(t, rec, 1, 0)
+	claudeReading(t, cache, "other-account", now, map[string]time.Time{claudeWindowFiveHour: now})
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.GenerationEpoch != 9105 || snap.Generation != 2 {
+		t.Fatalf("after the flip generation = {%d,%d}, want {9105,2}", snap.GenerationEpoch, snap.Generation)
+	}
+	time.Sleep(3 * cliUsageHintDebounce)
+	for _, h := range rec.all() {
+		if h.hint.Generation == 2 {
+			t.Fatalf("a reading for an account not signed in was hinted: %+v", h.hint)
+		}
+	}
+}
+
+// A writer from an older binary re-serializes the snapshot without the
+// generation fields; the next bump still goes above what this process
+// committed.
+func TestClaudeGeneration_AnOlderBinaryRewriteNeverRestartsTheCounter(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9106)
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now.Add(time.Second)})
+	snap := claudeCacheSnapshot(t, cache)
+	snap.GenerationEpoch, snap.Generation, snap.GenerationRowObservedMs = 0, 0, nil
+	raw, _ := json.Marshal(snap)
+	if err := os.WriteFile(cache, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now.Add(2 * time.Second)})
+	if g := claudeGenerationOf(t, cache); g != gen(9106, 3) {
+		t.Fatalf("generation = %+v, want {9106,3}", g)
+	}
+}
+
+// The statusline-hook subcommand runs in its own process, where the
+// propagator never starts: its merges must never stamp.
+func TestClaudeGeneration_AMergeOutsideTheAgentProcessNeverStamps(t *testing.T) {
+	withCodexGenerationEpoch(t, 9107)
+	cache := filepath.Join(t.TempDir(), "claude_rate_limits.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	if snap := claudeCacheSnapshot(t, cache); snap.Generation != 0 || snap.GenerationEpoch != 0 {
+		t.Fatalf("a merge outside the agent stamped: %+v", snap)
+	}
+}
+
+func TestClaudeGeneration_TheParserPublishesOnlyThisProcessEpoch(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9108)
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	usage, _ := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(9108, 1) {
+		t.Fatalf("UsageGeneration = %+v, want {9108,1}", usage.UsageGeneration)
+	}
+	cliUsageProcessGenerationEpoch.Store(9109) // a new process before its rotation
+	usage, _ = claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.UsageGeneration != nil {
+		t.Fatalf("published another epoch's generation: %+v", usage.UsageGeneration)
+	}
+}
+
+// The new snapshot fields are integers only.
+func TestClaudeGeneration_SnapshotFieldsAreIntegersOnly(t *testing.T) {
+	_, cache := claudeGenerationFixture(t, 9110)
+	now := time.Now()
+	claudeReading(t, cache, "", now, map[string]time.Time{claudeWindowFiveHour: now})
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &fields)
+	for _, key := range []string{"generationEpoch", "generation"} {
+		var n int64
+		if json.Unmarshal(fields[key], &n) != nil || n <= 0 {
+			t.Fatalf("%s = %s, want a positive integer", key, fields[key])
+		}
+	}
+	var rows []int64
+	if err := json.Unmarshal(fields["generationRowObservedMs"], &rows); err != nil || len(rows) == 0 {
+		t.Fatalf("generationRowObservedMs = %s, want integers", fields["generationRowObservedMs"])
+	}
+}

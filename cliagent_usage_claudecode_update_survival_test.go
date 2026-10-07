@@ -487,3 +487,83 @@ func TestClaudeOwedRefresh_OfflineStartIsPaidAfterReconnect(t *testing.T) {
 		t.Errorf("request count=%d, want 1", got)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   The usage HINT survives the hand-off too: a reading the old process captured
+   but never hinted is rotated onto the new epoch, recovered and hinted once
+   (plus its follow-up), and the receipt names that generation.
+   ------------------------------------------------------------------------ */
+
+func numericClaudeEndpoint(w http.ResponseWriter, _ *http.Request) {
+	reset := time.Now().Add(3 * time.Hour).Unix()
+	fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":41,"resets_at":%d},`+
+		`{"kind":"weekly_all","percent":17,"resets_at":%d}]}`, reset, reset+86400)
+}
+
+func TestClaudeUpdateSurvival_APendingHintIsRecoveredByTheNextProcess(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, numericClaudeEndpoint)
+	withCodexGenerationEpoch(t, 7301)
+	rec, cfg := propagatorFixture(t)
+	cliUsageHintDebounce = time.Hour // the hand-off wins the race
+	startCLIUsagePropagator(cfg)
+
+	// The old process: a probe reading commits and its hint is pending.
+	payOwedClaudeUsageRefreshAt(time.Now()) // nothing owed: a no-op
+	claudeUsageProbeAfterRun(time.Now())
+	claudeFreshnessWaitIdle(t)
+	if g := claudeGenerationOf(t, cache); g.Epoch != 7301 || g.Counter < 1 {
+		t.Fatalf("the old process did not stamp its reading: %+v", g)
+	}
+	stopCLIUsagePropagator()
+	if n := len(rec.all()); n != 0 {
+		t.Fatalf("the old process sent %d hints; the scenario needs the hand-off to win", n)
+	}
+
+	// The new process: a new epoch, the same cache, no new reading.
+	cliUsageHintDebounce = 20 * time.Millisecond
+	simulateCodexProcessRestart(t, 7302)
+	simulateClaudeAgentRestart(t)
+	startCLIUsagePropagator(cfg)
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	if len(hints) != 2 {
+		t.Fatalf("got %d hints, want the recovery hint and its one follow-up", len(hints))
+	}
+	h := hints[0].hint
+	if h.Provider != claudeUsageProvider || h.GenerationEpoch != 7302 {
+		t.Fatalf("hint = %+v, want claudeCode under the new epoch", h)
+	}
+	usage, _ := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(h.GenerationEpoch, h.Generation) {
+		t.Fatalf("receipt generation %+v does not match the hint %+v", usage.UsageGeneration, h)
+	}
+}
+
+func TestClaudeUpdateSurvival_ASmokeDebtIsPaidAndHintedByTheNextProcess(t *testing.T) {
+	cache, healthy := armPostUpdateEndpoint(t)
+	seedStaleClaudeObservation(t, cache)
+	withCodexGenerationEpoch(t, 7303)
+	rec, cfg := propagatorFixture(t)
+
+	// The old process owes the smoke's turn and is replaced before paying it.
+	claudeOweRunRefreshNow(time.Now())
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs == 0 {
+		t.Fatal("the smoke's debt is not on disk")
+	}
+
+	healthy.Store(true)
+	simulateCodexProcessRestart(t, 7304)
+	simulateClaudeAgentRestart(t)
+	startCLIUsagePropagator(cfg)
+	payOwedClaudeUsageRefreshAt(claudeAfterFirstRung())
+	waitForClaudeCondition(t, 10*time.Second, "the new process did not pay the smoke's debt", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0
+	})
+	claudeFreshnessWaitIdle(t)
+	h := waitHints(t, rec, 1, 0)[0].hint
+	if h.Provider != claudeUsageProvider || h.GenerationEpoch != 7304 {
+		t.Fatalf("hint = %+v, want the paid reading under the new epoch", h)
+	}
+	requireNumericClaudeRows(t)
+}

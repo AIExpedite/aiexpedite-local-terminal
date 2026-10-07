@@ -183,7 +183,15 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	// attempt's evidence; a rejected rung that continues the walk is not an
 	// outcome. See settleOrDisarmClaudeSmokeRun.
 	spentTurn := false
-	defer func() { settleOrDisarmClaudeSmokeRun(spentTurn) }()
+	defer func() {
+		// The wait lives HERE, after the owe: code in the body would run before
+		// it. Bounded, never published, and the verdict does not depend on it.
+		if baseline := settleOrDisarmClaudeSmokeRun(spentTurn); !baseline.IsZero() {
+			waitCtx, cancel := context.WithTimeout(context.Background(), claudeSmokeUsageWait())
+			claudeUsageProbe.waitCovered(waitCtx, baseline)
+			cancel()
+		}
+	}()
 
 	var lastCategory, lastDiagnostic string
 	for _, shape := range claudeSmokeShapeLadder(path) {
@@ -279,14 +287,26 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 // debt left to a goroutine can be outrun by it. triggerClaudeUsageProbeAfterRunAt
 // then makes the run's immediate attempt off the hot path, exactly as a direct
 // or terminal-managed run does; its repeat owe of the same instant is a no-op.
-func settleOrDisarmClaudeSmokeRun(spentTurn bool) {
-	if !spentTurn {
-		return
+//
+// Returns the owed baseline (zero when disarmed, or when the probe is not
+// armed and nothing was owed), which the caller's bounded wait is measured
+// against.
+func settleOrDisarmClaudeSmokeRun(spentTurn bool) time.Time {
+	if !spentTurn || !claudeUsageProbe.armedForProbe() {
+		return time.Time{}
 	}
 	completedAt := time.Now()
 	claudeOweRunRefreshNow(completedAt)
 	triggerClaudeUsageProbeAfterRunAt(completedAt)
+	return completedAt
 }
+
+// claudeSmokeUsageWait bounds how long a smoke that spent a turn waits for its
+// own immediate probe to land: one whole probe plus slack. Shorter than Grok's
+// whole-pass settle (grokSmokeUsageSettleBudget) on purpose — the debt ladder
+// owns retries, so the smoke only needs its first attempt to finish before the
+// post-update signed refresh.
+func claudeSmokeUsageWait() time.Duration { return claudeUsageProbeWholeTimeout + 2*time.Second }
 
 // claudeSmokeReachedInference reports whether the child returned the CLI's
 // documented terminal envelope for a COMPLETED turn — the single "a turn was

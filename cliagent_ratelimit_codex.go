@@ -32,11 +32,9 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -303,7 +301,7 @@ type codexRateLimitSnapshot struct {
 	// GenerationEpoch / Generation identify the committed contributor state
 	// (codexBumpGeneration): Generation increments on every write that changes
 	// contributors, clears or rescopes, and GenerationEpoch is the writing agent
-	// process's random epoch (codexProcessGenerationEpoch). The backend applies a
+	// process's random epoch (cliUsageProcessGenerationEpoch). The backend applies a
 	// generation from a signed refresh receipt and skips hints for one it already
 	// has (cliagent_usage_propagate.go). Integers only.
 	GenerationEpoch int64 `json:"generationEpoch,omitempty"`
@@ -1773,34 +1771,11 @@ func mergeCodexRateLimitCacheObserved(
 // codexUsageProvider is the provider id Codex usage is published under.
 const codexUsageProvider = "codex"
 
-// codexProcessGenerationEpoch is this agent process's generation epoch: drawn
-// once at start, uniform in [1, 2^53-1] so it stays a JavaScript-safe integer on
-// the wire and in Firestore. It is NOT derived from the clock, so two restarts
-// in the same millisecond (or under a frozen test clock) still get distinct
-// epochs; a collision is ~2^-53 per restart. The backend replaces an applied
-// generation from a different epoch instead of comparing counters across
-// epochs, so a restored, rolled-back or copied cache — or a restart — can never
-// be suppressed by an old, higher applied counter.
-var codexProcessGenerationEpoch atomic.Int64
-
-// codexDrawGenerationEpoch is the draw; a var so a test can force a value or a
-// collision.
-var codexDrawGenerationEpoch = func() int64 {
-	const maxSafe = int64(1)<<53 - 1
-	if n, err := rand.Int(rand.Reader, big.NewInt(maxSafe)); err == nil {
-		return n.Int64() + 1
-	}
-	// crypto/rand does not fail on supported platforms; never publish epoch 0.
-	return time.Now().UnixNano()&maxSafe | 1
-}
-
 // codexGenerationRotated reports whether a write carrying this process's epoch
 // has committed. Until it has, the cache may still hold a snapshot published by
 // an earlier process (or restored from a backup) under ITS epoch, so ParseContext
 // omits UsageGeneration and the propagator sends no hint.
 var codexGenerationRotated atomic.Bool
-
-func init() { codexProcessGenerationEpoch.Store(codexDrawGenerationEpoch()) }
 
 // codexBumpGeneration advances the snapshot's generation for a write that
 // changed what the card renders — at most once per transaction. A snapshot from
@@ -1810,7 +1785,7 @@ func codexBumpGeneration(snap *codexRateLimitSnapshot) {
 		return
 	}
 	snap.generationBumped = true
-	if epoch := codexProcessGenerationEpoch.Load(); snap.GenerationEpoch != epoch {
+	if epoch := cliUsageProcessGenerationEpoch.Load(); snap.GenerationEpoch != epoch {
 		snap.GenerationEpoch, snap.Generation = epoch, 1
 		return
 	}
@@ -1820,11 +1795,11 @@ func codexBumpGeneration(snap *codexRateLimitSnapshot) {
 // codexNoteCommittedGeneration runs after every committed cache write: the
 // first one carrying this process's epoch completes the rotation.
 func codexNoteCommittedGeneration(snap *codexRateLimitSnapshot) {
-	if snap.GenerationEpoch == 0 || snap.GenerationEpoch != codexProcessGenerationEpoch.Load() {
+	if snap.GenerationEpoch == 0 || snap.GenerationEpoch != cliUsageProcessGenerationEpoch.Load() {
 		return
 	}
 	if codexGenerationRotated.CompareAndSwap(false, true) {
-		noteCLIUsageGenerationRotated()
+		noteCLIUsageGenerationRotated(codexUsageProvider)
 	}
 }
 
@@ -1850,7 +1825,7 @@ func codexRotateGenerationEpoch(now time.Time) (rotated, refused bool) {
 			empty = true
 			return false
 		}
-		if snap.GenerationEpoch == codexProcessGenerationEpoch.Load() {
+		if snap.GenerationEpoch == cliUsageProcessGenerationEpoch.Load() {
 			// Already this epoch (a forced collision, or a write that raced this
 			// one): nothing to write.
 			return false
@@ -2530,7 +2505,7 @@ func codexMetricsAndGenerationFromCache(now time.Time, currentFingerprint string
 
 func codexPublishableGeneration(view codexCacheView) *cliUsageGeneration {
 	if !codexGenerationRotated.Load() || view.generation <= 0 ||
-		view.generationEpoch != codexProcessGenerationEpoch.Load() {
+		view.generationEpoch != cliUsageProcessGenerationEpoch.Load() {
 		return nil
 	}
 	return &cliUsageGeneration{Epoch: view.generationEpoch, Counter: view.generation}
@@ -2651,4 +2626,27 @@ func codexMetricFromBucket(b codexRateLimitBucket, ok bool, kind, defaultLabel s
 		Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
 		ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
 	}
+}
+
+// codexRecoveryGeneration is the rotated generation of a cache whose active
+// account still renders at least one numeric Codex metric, or whose contributors
+// a committed clear retired (the out-of-quota shape, a rescope), or nil. A clear
+// the previous process committed but never hinted (shutdown inside the debounce)
+// would otherwise leave the backend publishing the old numbers. Registered in
+// cliUsageGenerationSources.
+func codexRecoveryGeneration() *cliUsageGeneration {
+	view := codexCacheViewForAccount(currentCodexAccountFingerprint())
+	generation := codexPublishableGeneration(view)
+	if generation == nil {
+		return nil
+	}
+	if len(view.contributors) == 0 {
+		return generation
+	}
+	for _, m := range codexMetricsFromView(view, time.Now()) {
+		if !m.Unknown && m.Consumed != nil {
+			return generation
+		}
+	}
+	return nil
 }

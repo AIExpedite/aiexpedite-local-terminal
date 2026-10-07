@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -1318,4 +1319,119 @@ func TestRunCLISmoke_ReplaysAndFollowersOweNoRefresh(t *testing.T) {
 			t.Fatalf("debt %v is not from this run", debt)
 		}
 	})
+}
+
+/* --------------------------------------------------------------------------
+   Bounded wait for the smoke's own reading (claudeUsageProbe.waitCovered)
+   --------------------------------------------------------------------------
+   A smoke that spent a turn waits — inside its defer, after the owe — for its
+   immediate probe to land, so the post-update signed refresh right after it
+   signs the smoke's reading. The wait ends early on a refusal, is bounded by
+   claudeSmokeUsageWait, and never changes the verdict.
+   ------------------------------------------------------------------------ */
+
+// smokeUsageEndpoint answers numeric five-hour and weekly windows after delay;
+// a negative delay hangs until the request is cancelled.
+func smokeUsageEndpoint(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if delay < 0 {
+			<-r.Context().Done()
+			return
+		}
+		time.Sleep(delay)
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":41,"resets_at":%d},`+
+			`{"kind":"weekly_all","percent":17,"resets_at":%d}]}`, reset, reset+86400)
+	})
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	return cache
+}
+
+func runPassingClaudeSmoke(t *testing.T) (cliSmokeResult, time.Duration) {
+	t.Helper()
+	path := stubClaudeBinary(t)
+	stubAuthProbe(t, true, true)
+	stubSmokeExec(t, func(_ context.Context, _ []string, prompt string) ([]byte, []byte, error) {
+		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+	})
+	started := time.Now()
+	result := runClaudeCodeSmoke(context.Background(), path, "2.1.251")
+	return result, time.Since(started)
+}
+
+// A slow probe still lands inside the wait: the cache covers the smoke's turn
+// the moment the smoke returns, with no idle-wait in between.
+func TestRunClaudeCodeSmoke_WaitsForItsOwnReading(t *testing.T) {
+	smokeEnv(t)
+	cache := smokeUsageEndpoint(t, 1500*time.Millisecond)
+	result, _ := runPassingClaudeSmoke(t)
+	if result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v", result)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("the smoke returned before its reading landed: debt=%d", snap.RefreshOwedAtMs)
+	}
+	if observed := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(currentClaudeAccountFingerprint()), time.Now()); time.Since(observed) > 30*time.Second {
+		t.Fatalf("the card reading is %s old when the smoke returned", time.Since(observed))
+	}
+}
+
+// The 60 s floor refuses the immediate attempt: the wait returns at once, the
+// cache is not treated as fresh, and the debt and its rung stay on disk.
+func TestRunClaudeCodeSmoke_ARefusedAttemptEndsTheWaitAtOnce(t *testing.T) {
+	smokeEnv(t)
+	cache := smokeUsageEndpoint(t, 0)
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.lastAttempt = time.Now()
+	claudeUsageProbe.mu.Unlock()
+
+	result, took := runPassingClaudeSmoke(t)
+	if result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v", result)
+	}
+	if took > 3*time.Second {
+		t.Fatalf("the smoke waited %s on a refused attempt", took)
+	}
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs == 0 || snap.NextAttemptAtMs == 0 {
+		t.Fatalf("debt=%d rung=%d, want both still on disk", snap.RefreshOwedAtMs, snap.NextAttemptAtMs)
+	}
+}
+
+// A probe that hangs: the smoke returns within claudeSmokeUsageWait plus a
+// margin, with the verdict unchanged.
+func TestRunClaudeCodeSmoke_AHangingProbeIsBoundedByTheWait(t *testing.T) {
+	smokeEnv(t)
+	smokeUsageEndpoint(t, -1)
+	prev := claudeUsageProbeWholeTimeout
+	claudeUsageProbeWholeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { claudeUsageProbeWholeTimeout = prev })
+
+	result, took := runPassingClaudeSmoke(t)
+	if result.Status != cliSmokeStatusSuccess || !result.MarkerMatched {
+		t.Fatalf("smoke = %+v, want the verdict unchanged", result)
+	}
+	if limit := claudeSmokeUsageWait() + 2*time.Second; took > limit {
+		t.Fatalf("the smoke took %s, want at most %s", took, limit)
+	}
+	claudeFreshnessWaitIdle(t)
+}
+
+// A smoke that did not reach inference owes nothing and so waits for nothing.
+func TestRunClaudeCodeSmoke_NoInferenceMeansNoWait(t *testing.T) {
+	smokeEnv(t)
+	smokeUsageEndpoint(t, -1)
+	path := stubClaudeBinary(t)
+	stubAuthProbe(t, true, true)
+	stubSmokeExec(t, func(_ context.Context, _ []string, _ string) ([]byte, []byte, error) {
+		return nil, []byte("error: unknown option '--input-format'"), errors.New("exit status 1")
+	})
+	started := time.Now()
+	runClaudeCodeSmoke(context.Background(), path, "2.1.251")
+	if took := time.Since(started); took > time.Second {
+		t.Fatalf("a smoke without a spent turn waited %s", took)
+	}
 }

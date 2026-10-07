@@ -22,9 +22,16 @@
 //
 // Lifecycle:
 //
-//   - Owe — a terminal run, an abnormal session end, or a smoke that reached
-//     inference records RefreshOwedAtMs (claudeOweRunRefresh). Only ever raises
-//     the instant, so a burst of runs coalesces into one debt.
+//   - Owe — a terminal run, an abnormal session end (including a shell-wrapped
+//     launch, commandRunsClaude), or a smoke that reached inference records
+//     RefreshOwedAtMs (claudeOweRunRefresh). Only ever raises the instant, so a
+//     burst of runs coalesces into one debt.
+//   - Owe — direct-run evidence. A `claude` run the agent did not start is seen
+//     from its transcript's mtime (cliagent_usage_claudecode_direct_runs.go) and
+//     owes through claudeOweDirectRunRefresh, which opens a debt only when none
+//     is standing and never moves a standing one forward — so a transcript that
+//     keeps growing cannot refill the request budget — and opens none inside the
+//     DirectRunQuietUntilMs window a debt that retired unpaid leaves behind.
 //   - Count — RefreshOwedAttempts resets only when the instant actually
 //     advances. A repeat owe for the same baseline and the startup replay's
 //     re-seeding both leave it alone, or the cap would be reset out of
@@ -44,7 +51,15 @@
 //   - Hold — a 429 Retry-After is mirrored to HeldUntilMs so a restart inside
 //     the window does not re-storm an account-scoped endpoint.
 //   - Retire — aged out, at the request cap, stamped implausibly far ahead, or
-//     opted out: cleared without spending a request.
+//     opted out: cleared without spending a request. A debt retired unpaid (not
+//     an opt-out) also starts the direct-run quiet window in the same write.
+//   - Propagate — the agent process stamps a capture generation on this
+//     channel's cache when a DISPLAYED row's observation advances
+//     (claudeStampObservedGeneration), after its own merges and from the
+//     watcher's tick for writes made outside the process, and notes it to the
+//     provider-neutral hint sender (cliagent_usage_propagate.go). The parser
+//     publishes it as UsageGeneration, so the signed refresh receipt tells
+//     terminal-service which reading it applied.
 //
 // Accepted gap: there is no persisted active-run FLOOR (Codex's RunFloorMs). A
 // debt is recorded when the turn RETURNS, so a process killed mid-turn leaves
@@ -61,8 +76,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -474,6 +491,31 @@ func retireClaudeRefreshDebtAt(owed time.Time) func(*claudeRateLimitSnapshot) bo
 	}
 }
 
+// retireUnpaidClaudeRefreshDebtAt is retireClaudeRefreshDebtAt for a debt
+// retired WITHOUT a covering reading — at the request cap or the age-out — and
+// starts the direct-run quiet window in the same locked write. A failing
+// endpoint (401, 5xx, timeouts) therefore costs direct-run evidence at most
+// claudeRefreshOwedMaxRequests requests per claudeRefreshOwedMaxAge, even for a
+// crash-looping agent: the counter, the window and the age-out are all on disk.
+func retireUnpaidClaudeRefreshDebtAt(owed, now time.Time) func(*claudeRateLimitSnapshot) bool {
+	retire := retireClaudeRefreshDebtAt(owed)
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if !retire(snap) {
+			return false
+		}
+		claudeStartDirectRunQuiet(snap, now)
+		return true
+	}
+}
+
+// claudeStartDirectRunQuiet raises DirectRunQuietUntilMs to now +
+// claudeRefreshOwedMaxAge; never lowers it.
+func claudeStartDirectRunQuiet(snap *claudeRateLimitSnapshot, now time.Time) {
+	if until := now.Add(claudeRefreshOwedMaxAge).UnixMilli(); until > snap.DirectRunQuietUntilMs {
+		snap.DirectRunQuietUntilMs = until
+	}
+}
+
 // adjustClaudeRefreshAttemptsAt moves the attempt counter by delta, ONLY while
 // the debt is still the instant the caller judged — the same guard
 // retireClaudeRefreshDebtAt applies, for the same reason: every decision in
@@ -850,7 +892,7 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		// payable debt between the unlocked read above and here; a blanket
 		// clear would silently discard it and leave that run's card stale —
 		// the very failure this file exists to fix.
-		mutateClaudeRateLimitSnapshot(path, fingerprint, retireClaudeRefreshDebtAt(owed))
+		mutateClaudeRateLimitSnapshot(path, fingerprint, retireUnpaidClaudeRefreshDebtAt(owed, now))
 		claudeUsageProbe.dropOwedThrough(owed)
 		return claudeProbeResult{}
 	}
@@ -1110,4 +1152,260 @@ func claudeRetryPendingAuthClear() bool {
 		return true
 	}
 	return false
+}
+
+/* ─────────────────────────────── generation ──────────────────────────────── */
+
+// claudeUsageProvider is the provider id Claude Code usage is published under.
+const claudeUsageProvider = "claudeCode"
+
+// claudeGenerationRotated reports whether a stamp carrying this process's epoch
+// has committed on this channel's cache — the first one completes the rotation
+// and schedules the propagator's recovery check.
+var claudeGenerationRotated atomic.Bool
+
+// claudeLastCommittedGeneration is the newest counter this process committed
+// under its epoch. A writer from an older binary (another channel's hook or
+// agent that predates the generation fields) re-serializes the snapshot without
+// them, and a bump restarting at 1 would then be swallowed as `already_applied`
+// by a server holding a higher counter for this epoch — so a bump is always
+// max(on disk, this) + 1.
+var claudeLastCommittedGeneration atomic.Int64
+
+// claudeStampAfterMerge runs after an in-process merge committed, off the merge
+// lock. Only the agent process stamps: the epoch is drawn in every process,
+// including `statusline-hook`, so the propagator having started is the one
+// signal that this is the agent.
+func claudeStampAfterMerge(fingerprint string) {
+	if !cliUsagePropagatorStarted() {
+		return
+	}
+	if generation, bumped := claudeStampObservedGeneration(fingerprint); bumped &&
+		fingerprint == currentClaudeAccountFingerprint() {
+		noteCLIUsageObservationAdvanced(claudeUsageProvider, generation)
+	}
+}
+
+// claudeStampObservedGeneration advances this channel's capture generation when
+// the merged view's DISPLAYED rows moved since the generation last stamped —
+// any row, compared one by one (see GenerationRowObservedMs) — and reports the
+// committed generation and whether this call bumped it. The caller notes the
+// propagator, after the lock is released and only for the account signed in
+// now.
+//
+// A heartbeat-only bucket never moves a displayed row's observation, so it
+// never bumps.
+func claudeStampObservedGeneration(fingerprint string) (cliUsageGeneration, bool) {
+	generation, bumped, _ := claudeStampGeneration(fingerprint, false)
+	return generation, bumped
+}
+
+// claudeStampGeneration is the stamp, and with rotate also the startup
+// rotation: a cache that published under another epoch — or that renders a
+// reading but never published (written by a binary that predates these
+// fields) — moves onto this process's epoch even though no row advanced. A
+// cache with neither is left for its first real reading.
+//
+// refused reports a write the bounded locks or the filesystem turned down; the
+// rotation retries it.
+func claudeStampGeneration(fingerprint string, rotate bool) (generation cliUsageGeneration, bumped, refused bool) {
+	path := claudeRateLimitCachePath()
+	// Scoped to the account the stamp is FOR: a stamp is never an account
+	// transition, so a cache another account owns is refused rather than reset.
+	// Creating the file (the pinned cache holds the only readings) is not a
+	// transition either.
+	allowed := []string{fingerprint}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		allowed = nil
+	}
+	epoch := cliUsageProcessGenerationEpoch.Load()
+	ran, wantWrite := false, false
+	var committed claudeRateLimitSnapshot
+	wrote := mutateClaudeRateLimitSnapshotScoped(path, fingerprint, allowed, func(snap *claudeRateLimitSnapshot) bool {
+		ran = true
+		committed = *snap
+		// Read under the cache lock, so no writer of OUR path interleaves; the
+		// pinned path contributes buckets only, never a generation.
+		rows := claudeRowObservationsMs(loadMergedClaudeRateLimitView(fingerprint).buckets, time.Now())
+		if rotate {
+			if snap.GenerationEpoch == epoch && snap.Generation > 0 {
+				return false // already on this epoch
+			}
+			if snap.Generation <= 0 && !claudeAnyRowObserved(rows) {
+				return false // never published, nothing to publish
+			}
+		} else if !claudeRowsAdvanced(rows, snap.GenerationRowObservedMs) {
+			return false
+		}
+		next := int64(0)
+		if snap.GenerationEpoch == epoch {
+			next = snap.Generation
+		}
+		if last := claudeLastCommittedGeneration.Load(); last > next {
+			next = last
+		}
+		snap.GenerationEpoch, snap.Generation = epoch, next+1
+		snap.GenerationRowObservedMs = rows
+		committed, wantWrite = *snap, true
+		return true
+	})
+	if wrote {
+		for {
+			last := claudeLastCommittedGeneration.Load()
+			if committed.Generation <= last || claudeLastCommittedGeneration.CompareAndSwap(last, committed.Generation) {
+				break
+			}
+		}
+	}
+	if (wrote || (ran && !wantWrite)) && committed.GenerationEpoch == epoch && committed.Generation > 0 {
+		if claudeGenerationRotated.CompareAndSwap(false, true) {
+			noteCLIUsageGenerationRotated(claudeUsageProvider)
+		}
+		generation = cliUsageGeneration{Epoch: epoch, Counter: committed.Generation}
+	}
+	return generation, wrote, !ran || (wantWrite && !wrote)
+}
+
+// claudeRowsAdvanced reports whether any displayed row's observation is newer
+// than the one the stored generation describes for that row.
+func claudeRowsAdvanced(rows, stored []int64) bool {
+	for i, ms := range rows {
+		if ms <= 0 {
+			continue
+		}
+		if i >= len(stored) || ms > stored[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeAnyRowObserved(rows []int64) bool {
+	for _, ms := range rows {
+		if ms > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeRotateGenerationEpoch moves this channel's cache onto this process's
+// epoch in one bounded write at start, so a reading captured by the previous
+// process (a smoke or a debt payment just before an update handoff) is
+// republished under an epoch the backend has never applied. Registered in
+// cliUsageGenerationSources. A cache another account owns, or one that has
+// never published and renders nothing, is left alone (neither rotated nor
+// refused).
+func claudeRotateGenerationEpoch(time.Time) (rotated, refused bool) {
+	if claudeGenerationRotated.Load() {
+		return true, false
+	}
+	fingerprint := currentClaudeAccountFingerprint()
+	if snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath()); ok && snap.AccountFingerprint != fingerprint {
+		return false, false
+	}
+	_, _, refused = claudeStampGeneration(fingerprint, true)
+	if claudeGenerationRotated.Load() {
+		return true, false
+	}
+	return false, refused
+}
+
+// claudeRecoveryGeneration is the rotated generation of this channel's cache
+// for the account signed in now, or nil. Rotation only ever commits a
+// generation for a cache that renders a numeric row or already published one,
+// so a generation on this epoch is exactly "a reading, or a committed clear (a
+// logout, an all-unknown snapshot), that may never have been hinted" — the
+// reading a previous process captured before an update handoff. A cache that
+// has never published carries no generation and is not recovered.
+func claudeRecoveryGeneration() *cliUsageGeneration {
+	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentClaudeAccountFingerprint() ||
+		snap.Generation <= 0 || snap.GenerationEpoch != cliUsageProcessGenerationEpoch.Load() {
+		return nil
+	}
+	return &cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
+}
+
+/* ────────────────────────── owe — direct-run evidence ────────────────────── */
+
+// claudeDirectRunEvidenceMargin keeps a managed run's own transcript write
+// (about its completedAt) from reading as new evidence once that run's debt is
+// paid: the covering reading only has to be newer than evidence minus this.
+const claudeDirectRunEvidenceMargin = 30 * time.Second
+
+// Direct-run owe outcomes, also the scan's fixed log labels.
+const (
+	claudeDirectRunOwed     = "owed"
+	claudeDirectRunCovered  = "covered"
+	claudeDirectRunQuiet    = "quiet"
+	claudeDirectRunStanding = "standing"
+	claudeDirectRunStale    = "stale"
+	claudeDirectRunBusy     = "busy"
+	claudeDirectRunDisarmed = "disarmed"
+)
+
+// claudeOweDirectRunRefresh owes a refresh for a `claude` run the agent never
+// saw, evidenced at `evidence` (its transcript's mtime), and makes the run's
+// attempt through the ordinary debt schedule. It owes ONLY when:
+//
+//   - the probe is armed (opted out: nothing could ever pay it);
+//   - the evidence is inside the debt's age window and not stamped beyond the
+//     local skew ceiling — a future mtime (a clock step, a synced folder) would
+//     be retired at once by claudeRefreshDebtRetired and owed again by the next
+//     scan;
+//   - the reading does not already cover it (claudeSnapshotFreshness, the same
+//     row-aware rule a debt is settled by), with the 30 s margin;
+//   - no debt is standing, and the quiet window has passed — both judged under
+//     the cache lock, in the write that records the debt.
+//
+// A standing debt is never moved forward: that would reset RefreshOwedAttempts
+// and restart the age-out, so a transcript that keeps growing would refill the
+// budget every scan. A standing debt that is already past paying (the cap, the
+// age-out) is retired here as unpaid, starting the quiet window, so a debt no
+// rung will revisit cannot block direct-run evidence forever.
+//
+// Transcripts are not tied to an account, so the debt is charged to the
+// account signed in now. Returns the fixed outcome label.
+func claudeOweDirectRunRefresh(evidence, now time.Time) string {
+	if !claudeUsageProbe.armedForProbe() {
+		return claudeDirectRunDisarmed
+	}
+	if evidence.After(now.Add(claudeRefreshOwedLocalSkew)) || now.Sub(evidence) >= claudeRefreshOwedMaxAge {
+		return claudeDirectRunStale
+	}
+	scopeBefore := claudeRateLimitCacheScope()
+	fingerprint := currentClaudeAccountFingerprint()
+	if claudeUsageObservationCovers(claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now),
+		evidence.Add(-claudeDirectRunEvidenceMargin)) {
+		return claudeDirectRunCovered
+	}
+	outcome := claudeDirectRunBusy
+	evidenceMs, nowMs := evidence.UnixMilli(), now.UnixMilli()
+	mutateClaudeRateLimitSnapshotScoped(claudeRateLimitCachePath(), fingerprint, []string{scopeBefore},
+		func(snap *claudeRateLimitSnapshot) bool {
+			if snap.RefreshOwedAtMs != 0 {
+				if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
+					outcome = claudeDirectRunQuiet
+					clearClaudeRefreshDebt(snap)
+					claudeStartDirectRunQuiet(snap, now)
+					return true
+				}
+				outcome = claudeDirectRunStanding
+				return false
+			}
+			if nowMs < snap.DirectRunQuietUntilMs {
+				outcome = claudeDirectRunQuiet
+				return false
+			}
+			snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = evidenceMs, 0, 0
+			outcome = claudeDirectRunOwed
+			return true
+		})
+	if outcome == claudeDirectRunOwed {
+		claudeUsageProbe.beginSettling()
+		defer claudeUsageProbe.endSettling()
+		claudeRunDebtAttemptAt(now, claudeDebtTriggerRun)
+	}
+	return outcome
 }

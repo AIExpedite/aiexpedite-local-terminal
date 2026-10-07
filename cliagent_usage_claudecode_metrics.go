@@ -91,6 +91,10 @@ type claudeRateLimitView struct {
 	// probedAtMs is the newest instant the utilization probe persisted a reading
 	// at, carried across from claudeRateLimitSnapshot.LastProbeObservedAtMs.
 	probedAtMs int64
+	// generation is the capture generation THIS channel's cache carries, nil when
+	// none. Read from our path only: the pinned path contributes buckets, never
+	// a generation (only the agent stamps, and only its own cache).
+	generation *cliUsageGeneration
 }
 
 // probeObservedAtMs is the newest instant a PROBE reading is on record for this
@@ -106,8 +110,8 @@ func (v claudeRateLimitView) probeObservedAtMs() int64 {
 }
 
 // loadMergedClaudeRateLimitView is loadMergedClaudeRateLimitBuckets plus the
-// snapshot-level probe evidence, read in the SAME pass so the two cannot
-// describe different reads of the cache.
+// snapshot-level probe evidence and this channel's capture generation, read in
+// the SAME pass so they cannot describe different reads of the cache.
 func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitView {
 	home, _ := os.UserHomeDir()
 	paths := []string{claudeRateLimitCachePath()}
@@ -120,6 +124,9 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok || snap.AccountFingerprint != currentFingerprint {
 			continue
+		}
+		if path == paths[0] && snap.Generation > 0 && snap.GenerationEpoch > 0 {
+			view.generation = &cliUsageGeneration{Epoch: snap.GenerationEpoch, Counter: snap.Generation}
 		}
 		if snap.LastProbeObservedAtMs > view.probedAtMs {
 			view.probedAtMs = snap.LastProbeObservedAtMs

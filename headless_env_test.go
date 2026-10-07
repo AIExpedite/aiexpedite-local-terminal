@@ -334,10 +334,10 @@ func TestWrapperScriptPayload_CoversEveryEmittedWrapper(t *testing.T) {
 }
 
 // oversizedEncodedCommandArg builds a -EncodedCommand argument whose base64
-// alone exceeds what antigravityClassifyMaxPayloadBytes of UTF-16LE script can
+// alone exceeds what wrapperClassifyMaxPayloadBytes of UTF-16LE script can
 // encode to, so wrapperScriptPayload must refuse it without decoding.
 func oversizedEncodedCommandArg() string {
-	return strings.Repeat("A", base64.StdEncoding.EncodedLen(2*antigravityClassifyMaxPayloadBytes)+4)
+	return strings.Repeat("A", base64.StdEncoding.EncodedLen(2*wrapperClassifyMaxPayloadBytes)+4)
 }
 
 // TestWrapperScriptPayload_RefusesOversizedEncodedBeforeDecoding pins the
@@ -348,7 +348,7 @@ func TestWrapperScriptPayload_RefusesOversizedEncodedBeforeDecoding(t *testing.T
 	// A payload that WOULD classify as agy, padded past the budget. Padding is
 	// appended to the encoded form so the decode, if it ran, still succeeds.
 	realScript := encodeForPowerShell("agy -p hi")
-	oversized := realScript + strings.Repeat("A", base64.StdEncoding.EncodedLen(2*antigravityClassifyMaxPayloadBytes))
+	oversized := realScript + strings.Repeat("A", base64.StdEncoding.EncodedLen(2*wrapperClassifyMaxPayloadBytes))
 	args := []string{"-NoProfile", "-EncodedCommand", oversized}
 
 	got, ok := wrapperScriptPayload("powershell.exe", args)
@@ -371,13 +371,13 @@ func TestWrapperScriptPayload_RefusesOversizedEncodedBeforeDecoding(t *testing.T
 
 // TestWrapperScriptPayload_DecodesAPayloadExactlyOnTheBudget guards the
 // padding edge of encodedCommandFitsClassifyBudget: a script whose UTF-16LE
-// form is exactly 2*antigravityClassifyMaxPayloadBytes encodes with a `=`, so
+// form is exactly 2*wrapperClassifyMaxPayloadBytes encodes with a `=`, so
 // DecodedLen reports one byte more than the payload really carries. That
 // payload is inside the classifier's contract and must still be decoded.
 func TestWrapperScriptPayload_DecodesAPayloadExactlyOnTheBudget(t *testing.T) {
 	// "agy -p hi" plus filler, so the script is exactly on the cap and would
 	// classify if it is decoded at all.
-	script := "agy -p hi" + strings.Repeat("x", antigravityClassifyMaxPayloadBytes-len("agy -p hi"))
+	script := "agy -p hi" + strings.Repeat("x", wrapperClassifyMaxPayloadBytes-len("agy -p hi"))
 	encoded := encodeForPowerShell(script)
 	if !strings.HasSuffix(encoded, "=") {
 		t.Fatalf("the edge this test pins needs a padded payload; got a suffix of %q", encoded[len(encoded)-4:])
@@ -388,9 +388,9 @@ func TestWrapperScriptPayload_DecodesAPayloadExactlyOnTheBudget(t *testing.T) {
 	if !ok {
 		t.Fatal("an -EncodedCommand wrapper is a wrapper; want ok=true")
 	}
-	if len(got) != antigravityClassifyMaxPayloadBytes {
+	if len(got) != wrapperClassifyMaxPayloadBytes {
 		t.Fatalf("payload on the cap was not decoded: got %d chars, want %d",
-			len(got), antigravityClassifyMaxPayloadBytes)
+			len(got), wrapperClassifyMaxPayloadBytes)
 	}
 	if !commandRunsAntigravity("powershell.exe", args) {
 		t.Error("commandRunsAntigravity = false for an agy payload exactly on the cap, want true")

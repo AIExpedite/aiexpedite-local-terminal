@@ -206,6 +206,59 @@ contributes `cliSmokeBinaryStamp` (path, mtime, size, version), which keys its
 own cooldown so a verdict cached before an upgrade is never served for the
 post-upgrade binary.
 
+## Fresh usage after every Claude run, and how it reaches the card
+
+A passing smoke used to leave the card stale: the run-completion debt
+([cliagent_usage_claudecode_freshness.go](cliagent_usage_claudecode_freshness.go))
+paid a fresh reading into `claude_rate_limits.json`, but nothing told
+terminal-service it was there.
+
+- **Every run owes.** Managed stream-json sessions owe on `result`; a
+  terminal-managed launch through a shell wrapper (`cmd /c claude …`,
+  `bash -c "claude …"`, `powershell -EncodedCommand`, the file-mode launcher)
+  owes when the agent sees it exit — `session.runsClaude`, set at spawn from
+  `isClaudeCommand || commandRunsClaude`
+  ([cliagent_usage_claudecode_command.go](cliagent_usage_claudecode_command.go),
+  sharing `scriptSpawnsProgram` with `commandRunsAntigravity`).
+  `isClaudeCommand` itself is unchanged: it still drives routing, stream
+  parsing and billing. The smoke owes synchronously, then waits in its defer up
+  to `claudeSmokeUsageWait` (`claudeUsageProbeWholeTimeout` + 2 s) for its own
+  probe — ending early when a reading covers the turn or the attempt was
+  refused. The verdict never depends on the wait.
+- **Runs the agent did not start.** Every 5 minutes the usage watcher stats
+  `<claudeConfigDir>/projects/*/*.jsonl` (never opened) under a 2 s budget; an
+  incomplete scan is unknown. The newest mtime owes a debt only when none is
+  standing, the reading does not cover it (30 s margin), it is inside the 6 h
+  age window and not in the future, and `DirectRunQuietUntilMs` has passed. A
+  standing debt is never moved forward. A debt retired unpaid (cap or age-out)
+  sets the 6 h quiet window, so a failing endpoint costs direct runs at most 4
+  requests per 6 h, across restarts. `--no-session-persistence` runs are never
+  seen; transcripts are not tied to an account, so the current one is charged.
+- **Capture generation.** Only the agent process stamps `GenerationEpoch` /
+  `Generation` on ITS OWN cache when any displayed row's observation advances
+  (`GenerationRowObservedMs`, compared row by row — a newest-across-rows test
+  misses the weekly and Fable rows). It stamps after its own merges, and the
+  watcher's 60 s tick stamps writes made outside the process (the status-line
+  hook). The counter is `max(on disk, last committed) + 1`, so an older binary
+  rewriting the file without these fields cannot restart it; an account flip
+  clears the row set but not the counter. The parser publishes it as
+  `usageGeneration` for this process's epoch only.
+- **Propagation.** The hint sender
+  ([cliagent_usage_propagate.go](cliagent_usage_propagate.go)) is
+  provider-neutral: one shared process epoch, one pending observation per
+  provider (each with its two-hint budget), device-wide 5 min spacing, oldest
+  first. Startup rotates each provider's cache onto the new epoch and recovers a
+  reading or committed clear the previous process never hinted. The 202
+  `reason` sorts outcomes: `already_applied` and rejections drop at once; a
+  cooldown, `in_flight`, `publish_failed`, a reason-less false or an unknown
+  code is retried without spending the follow-up, at most 3 times.
+  terminal-service stores `cliUsageAppliedGenerations.<provider>`.
+- **Redaction.** New snapshot fields are integers. Log lines are fixed labels
+  plus counters — `[cli-usage] usage hint: <label> provider=<id>` and
+  `[claude-usage] direct-run evidence: <label> files=<n> took_ms=<n>`. No path,
+  project directory, decoded script, fingerprint, token, session id or server
+  reason is logged, hinted or persisted.
+
 ## Environment policy
 
 `sanitizeClaudeChildEnv` ([session.go](session.go)) splits the strip set

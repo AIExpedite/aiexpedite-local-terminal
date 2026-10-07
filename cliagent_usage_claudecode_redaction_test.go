@@ -246,3 +246,36 @@ func TestClaudeRunDebtSchedule_FailureTouchesOnlyScheduleFields(t *testing.T) {
 		}
 	})
 }
+
+// The propagation this feature adds — the stamp, the watcher, the Claude hint
+// lines — logs fixed labels only, and the persisted generation fields are
+// integers: no path, project directory, fingerprint, token or session id.
+func TestClaudeUsageRedaction_PropagationLogsAndFieldsAreValueFree(t *testing.T) {
+	const account = "redaction.person@example.com"
+	logged := captureStdout(t, func() {
+		cache, _, rec := freshAfterRunFixture(t, 8201)
+		writeClaudeTranscript(t, os.Getenv("CLAUDE_CONFIG_DIR"), "-Users-redaction-person-repo", "abc123-session.jsonl", time.Now())
+		claudeUsageWatchTick(time.Now(), true)
+		claudeFreshnessWaitIdle(t)
+		waitHints(t, rec, 1, cliUsageHintSpacing/2)
+		stopCLIUsagePropagator()
+		snap := claudeCacheSnapshot(t, cache)
+		for _, ms := range snap.GenerationRowObservedMs {
+			if ms < 0 {
+				t.Fatalf("row observation %d is not an epoch ms", ms)
+			}
+		}
+	})
+	label := regexp.MustCompile(`^\[cli-usage\] usage hint: [a-z_0-9]+( provider=(codex|claudeCode))?$`)
+	ansi := regexp.MustCompile("\x1b\\[[0-9;]*m")
+	for _, line := range strings.Split(ansi.ReplaceAllString(logged, ""), "\n") {
+		if strings.Contains(line, "usage hint") && !label.MatchString(strings.TrimSpace(line)) {
+			t.Errorf("hint log line is not a fixed label: %q", line)
+		}
+	}
+	for _, leak := range []string{account, "redaction-person", "abc123-session", probeTestToken, os.Getenv("CLAUDE_CONFIG_DIR")} {
+		if leak != "" && strings.Contains(logged, leak) {
+			t.Errorf("propagation log leaks %q", leak)
+		}
+	}
+}

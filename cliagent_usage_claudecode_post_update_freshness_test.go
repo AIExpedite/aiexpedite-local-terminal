@@ -152,3 +152,45 @@ func TestClaudePostUpdateFreshness_HeldThenPassingSmokeConverges(t *testing.T) {
 	claudeFreshnessWaitIdle(t)
 	requireNumericClaudeRows(t)
 }
+
+// The post-update smoke itself: with a fast endpoint, the cache is fresh AND the
+// generation has moved before runClaudeCodeSmoke returns, so the signed refresh
+// the update hand-off sends next signs the smoke's reading.
+func TestClaudePostUpdateFreshness_TheSmokeReadingIsStampedBeforeItReturns(t *testing.T) {
+	cache, healthy := armPostUpdateEndpoint(t)
+	healthy.Store(true)
+	seedStaleClaudeObservation(t, cache)
+	withCodexGenerationEpoch(t, 7401)
+	_, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	waitForClaudeCondition(t, 5*time.Second, "the startup rotation did not stamp the seeded reading", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.GenerationEpoch == 7401
+	})
+	before := claudeGenerationOf(t, cache)
+
+	resetCLISmokeState()
+	t.Cleanup(resetCLISmokeState)
+	stubSmokePath(t, stubClaudeBinary(t))
+	stubAuthProbe(t, true, true)
+	stubSmokeExec(t, func(_ context.Context, _ []string, prompt string) ([]byte, []byte, error) {
+		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+	})
+	smokeAt := time.Now()
+	if result := runClaudeCodeSmoke(context.Background(), resolveClaudeSmokePath(), "2.1.251 (Claude Code)"); result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v", result)
+	}
+	// No idle-wait: this is the state the post-update signed refresh sees.
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 || snap.Generation <= before.Counter {
+		t.Fatalf("debt=%d generation %d -> %d, want the smoke paid and stamped before it returned",
+			snap.RefreshOwedAtMs, before.Counter, snap.Generation)
+	}
+	if observed := claudeObservedAt(t, time.Now()); observed.Before(smokeAt.Truncate(time.Millisecond)) {
+		t.Fatalf("observedAt %s predates the smoke %s", observed, smokeAt)
+	}
+	usage, _ := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, time.Now())
+	if usage.UsageGeneration == nil || usage.UsageGeneration.Counter != snap.Generation {
+		t.Fatalf("the receipt would sign %+v, want the smoke's generation %d", usage.UsageGeneration, snap.Generation)
+	}
+}

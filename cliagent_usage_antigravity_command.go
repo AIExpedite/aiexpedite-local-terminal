@@ -15,10 +15,15 @@
 // as `powershell -EncodedCommand <base64>` — never armed capture at all, and a
 // green CLI-maintenance smoke was still followed by a day-old observedAt.
 //
-// REDACTION: the decoded script is a classification input and nothing else. It
-// is a user's prompt, and may carry credentials, tokens and file contents. It is
-// never logged, never persisted, never attached to a result, and never returned
-// to a caller — the only thing that leaves this file is a bool.
+// The wrapper scan itself (scriptSpawnsProgram) is shared with commandRunsClaude
+// (cliagent_usage_claudecode_command.go), which asks the same question about
+// `claude` so a wrapped run still owes its post-run utilization refresh.
+//
+// REDACTION: the decoded script is a classification input and nothing else, for
+// both callers. It is a user's prompt, and may carry credentials, tokens and
+// file contents. It is never logged, never persisted, never attached to a
+// result, and never returned to a caller — the only thing that leaves this file
+// is a bool.
 package main
 
 import (
@@ -27,27 +32,27 @@ import (
 	"strings"
 )
 
-// antigravityClassifyMaxPayloadBytes caps the script this file will read. A
-// payload larger than this classifies as "not antigravity" rather than growing
+// wrapperClassifyMaxPayloadBytes caps the script this file will read. A
+// payload larger than this classifies as "not the program" rather than growing
 // the decode budget: the cost of being wrong is one unarmed capture (stale
 // freshness), while the cost of an unbounded decode on a device the user is
 // working on is real. terminal-service's own -EncodedCommand argument path caps
 // out at encodedCommandFallbackThreshold (30000 chars), so a real agy
 // invocation is orders of magnitude below this.
-const antigravityClassifyMaxPayloadBytes = 256 * 1024
+const wrapperClassifyMaxPayloadBytes = 256 * 1024
 
-// antigravityFileModeBase64 matches the ONE nested base64 literal
+// wrapperFileModeBase64 matches the ONE nested base64 literal
 // terminal-service's `scriptMode: "file"` launcher carries
 // (commandNormalize.util.js → buildFileModeInvocation): the outer
 // -EncodedCommand decodes to a launcher that writes the REAL script to a temp
 // file from this literal and runs it with `-File`. Without peeling it, every
 // file-mode run — which is what a long prompt becomes — classifies as the
 // launcher rather than as agy.
-var antigravityFileModeBase64 = regexp.MustCompile(`FromBase64String\('([A-Za-z0-9+/=]*)'\)`)
+var wrapperFileModeBase64 = regexp.MustCompile(`FromBase64String\('([A-Za-z0-9+/=]*)'\)`)
 
-// antigravityPosixFileModeBase64 is the same launcher's POSIX half: the script
+// wrapperPosixFileModeBase64 is the same launcher's POSIX half: the script
 // is base64 in a `printf '%s' '<b64>' | base64 -d` pipeline feeding a temp file.
-var antigravityPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-9+/=]*)'`)
+var wrapperPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-9+/=]*)'`)
 
 // commandRunsAntigravity reports whether SPAWNING command+args starts the
 // Antigravity CLI — i.e. whether an `agy` language server will exist for the
@@ -70,26 +75,32 @@ var antigravityPosixFileModeBase64 = regexp.MustCompile(`printf '%s' '([A-Za-z0-
 // must not match.
 func commandRunsAntigravity(command string, args []string) bool {
 	if script, ok := wrapperScriptPayload(command, args); ok {
-		return scriptSpawnsAntigravity(script, true)
+		return scriptSpawnsProgram(script, isAntigravityCommand, true)
 	}
 	return isAntigravityCommand(command)
 }
 
-// scriptSpawnsAntigravity reports whether any statement in an interpreter script
-// launches `agy`. allowNested permits exactly ONE descent into the file-mode
-// launcher's inner base64 literal — never a general recursive unwrap, which an
-// adversarial payload could use to make classification unbounded.
-func scriptSpawnsAntigravity(script string, allowNested bool) bool {
-	if script == "" || len(script) > antigravityClassifyMaxPayloadBytes {
+// scriptSpawnsProgram reports whether any statement in an interpreter script
+// launches a program isProgram accepts. Classification is by the caller's own
+// basename predicate (isAntigravityCommand, isClaudeCommand) applied to the
+// statement's leading program: leadingProgram already strips quoting and
+// PowerShell's `&` call operator, and commandBaseName inside the predicate
+// drops the directory and the .exe/.cmd/.bat/.ps1 suffix, so a wrapped launch
+// classifies exactly as the same program launched directly. allowNested permits
+// exactly ONE descent into the file-mode launcher's inner base64 literal — never
+// a general recursive unwrap, which an adversarial payload could use to make
+// classification unbounded.
+func scriptSpawnsProgram(script string, isProgram func(string) bool, allowNested bool) bool {
+	if script == "" || len(script) > wrapperClassifyMaxPayloadBytes {
 		return false
 	}
 	if allowNested {
 		if inner, ok := fileModeLauncherScript(script); ok {
-			return scriptSpawnsAntigravity(inner, false)
+			return scriptSpawnsProgram(inner, isProgram, false)
 		}
 	}
 	for _, statement := range splitScriptStatements(script) {
-		if isAntigravityCommand(leadingProgram(statement)) {
+		if isProgram(leadingProgram(statement)) {
 			return true
 		}
 	}
@@ -103,7 +114,7 @@ func scriptSpawnsAntigravity(script string, allowNested bool) bool {
 // FromBase64String is left to the normal statement scan.
 func fileModeLauncherScript(script string) (string, bool) {
 	if strings.Contains(script, "-File") {
-		if m := antigravityFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
+		if m := wrapperFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
 			// PowerShell writes its launcher literal as UTF-16LE, matching
 			// encodeForPowerShell.
 			decoded, err := decodeBase64PowerShellStrict(m[1])
@@ -114,7 +125,7 @@ func fileModeLauncherScript(script string) (string, bool) {
 		}
 	}
 	if strings.Contains(script, "base64 -d") && strings.Contains(script, "mktemp") {
-		if m := antigravityPosixFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
+		if m := wrapperPosixFileModeBase64.FindStringSubmatch(script); len(m) == 2 {
 			decoded, err := base64.StdEncoding.DecodeString(m[1])
 			if err != nil {
 				return "", false

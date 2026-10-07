@@ -238,8 +238,12 @@ func claudeBookRunDebtRung(fp string, owed, now time.Time, kind claudeRunDebtRun
 			if !ok {
 				// Budget spent: retire through the same clear the startup replay
 				// uses. Only the debt fields go — the buckets and the hold stay.
+				// Retired unpaid, so direct-run evidence goes quiet in the same
+				// write (DirectRunQuietUntilMs).
 				retired = true
-				return clearClaudeRefreshDebt(snap)
+				clearClaudeRefreshDebt(snap)
+				claudeStartDirectRunQuiet(snap, now)
+				return true
 			}
 			delay = rung
 			// The rung has to CLEAR the failure backoff the request that just
