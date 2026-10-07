@@ -349,3 +349,38 @@ func TestOpenCodeUsageTransaction_GenerationAdvancesOnlyOnABucketChange(t *testi
 		t.Fatalf("generation moved to %+v on a no-op", g)
 	}
 }
+
+// A run that has hit the step cap with every step committed recycles those
+// slots instead of dropping each new step, so a long session keeps counting.
+// While a commit is in flight its untake still needs the slots, so the step
+// goes one past the cap instead.
+func TestOpenCodeUsageRun_AFullyCommittedCapRecyclesItsSlots(t *testing.T) {
+	now := time.Now().UnixMilli()
+	full := func() *openCodeUsageRun {
+		run := &openCodeUsageRun{sessionID: "ses_a"}
+		run.steps = make([]openCodeUsageStep, openCodeUsageMaxRunSteps)
+		run.committed = openCodeUsageMaxRunSteps
+		return run
+	}
+
+	run := full()
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_a", "prt_late", 30, 5, 0, "0", now))
+	if len(run.steps) != 1 || run.committed != 0 || run.steps[0].Input != 30 || run.steps[0].Output != 5 {
+		t.Fatalf("steps = %d (committed %d), want the late step alone in a recycled run", len(run.steps), run.committed)
+	}
+	if taken, _, _ := run.takeUncommitted(); len(taken) != 1 {
+		t.Fatalf("took %+v, want the late step offered to the ledger", taken)
+	}
+
+	busy := full()
+	busy.commitMu.Lock()
+	captureOpenCodeUsageLine(busy, openCodeStepFinish("ses_a", "prt_late", 30, 5, 0, "0", now))
+	busy.commitMu.Unlock()
+	if len(busy.steps) != openCodeUsageMaxRunSteps+1 || busy.committed != openCodeUsageMaxRunSteps {
+		t.Fatalf("steps = %d (committed %d), want the step kept past the cap while a commit is in flight", len(busy.steps), busy.committed)
+	}
+	captureOpenCodeUsageLine(busy, openCodeStepFinish("ses_a", "prt_later", 1, 1, 0, "0", now))
+	if len(busy.steps) != openCodeUsageMaxRunSteps+1 || busy.steps[len(busy.steps)-1].Input != 31 {
+		t.Fatalf("a later step did not fold into the uncommitted one: %+v", busy.steps[len(busy.steps)-1])
+	}
+}

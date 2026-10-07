@@ -413,6 +413,11 @@ func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, atte
 		// — "Tokens today" is a floor, never a guess.
 		run.takeUncommitted()
 		releaseOpenCodeUsageLiveRun(run)
+		// This ladder took over the run's timer. A debt the settle already
+		// marked OWED (no commit landed, or it would have retired the debt)
+		// had its export attempt there, so that attempt is booked again. The
+		// attempt does nothing when no owed debt remains.
+		scheduleOpenCodeUsageAttempt(run.id, openCodeUsageDebtLadder[0])
 		return
 	}
 	logOpenCodeUsageCapture("commit_retry")

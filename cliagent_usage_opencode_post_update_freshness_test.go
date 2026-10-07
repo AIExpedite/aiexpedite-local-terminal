@@ -855,3 +855,52 @@ func TestOpenCodeUsage_APermanentlyRefusedRetirementStopsRetrying(t *testing.T) 
 		t.Fatalf("debts = %+v, want the debt left owed for the next process", debts)
 	}
 }
+
+// A settle that owed the turn booked its export, then a late step's commit
+// ladder took over the run's timer. When every commit is refused, abandoning
+// the ladder books the export again, so the owed debt is still paid in this
+// process rather than stranded until a restart.
+func TestOpenCodeUsage_AnAbandonedLateCommitRestoresTheOwedExport(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1141)
+	stubOpenCodeExecutable(t)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	settleOpenCodeUsageRun(run, "ses_late") // no step yet: the turn is owed
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || !d[0].owed() {
+		t.Fatalf("debts = %+v, want the owed debt", d)
+	}
+	sched.mu.Lock()
+	sched.pending = nil // the export timer the commit ladder replaces
+	sched.mu.Unlock()
+
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_late", "prt_1", 30, 5, 0, "0", now.UnixMilli()))
+	release := holdOpenCodeLedgerLock(t)
+	flushOpenCodeUsageRun(run)
+	for i := 0; i < openCodeUsageCommitMaxAttempts+2; i++ {
+		if d := sched.delays(); d[len(d)-1] == openCodeUsageDebtLadder[0] {
+			break
+		}
+		if !sched.fireNext() {
+			t.Fatalf("nothing booked after %v", sched.delays())
+		}
+	}
+	if d := sched.delays(); d[len(d)-1] != openCodeUsageDebtLadder[0] {
+		t.Fatalf("booked %v, want the owed export re-booked once the commit was abandoned", d)
+	}
+	release()
+
+	stubOpenCodeExport(t, func(_ context.Context, _ string) ([]byte, bool) {
+		return openCodeExportJSON("msg_late", now.UnixMilli(), 30, 5, 0), true
+	})
+	sched.fireNext()
+	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.tokens() != 35 {
+		t.Fatalf("bucket = %+v, want the export to pay the abandoned turn", b)
+	}
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 0 {
+		t.Fatalf("debts = %+v after the export paid", d)
+	}
+}

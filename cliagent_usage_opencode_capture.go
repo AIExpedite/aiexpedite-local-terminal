@@ -60,8 +60,8 @@ const (
 	openCodeUsageMaxSeenSteps  = 1024
 	openCodeUsageMaxDebts      = 8
 	// openCodeUsageMaxRunSteps bounds one run's in-memory accumulator. Steps past
-	// it fold into the last one without a dedup key: still counted, never
-	// unbounded.
+	// it fold into the last uncommitted one without a dedup key, or recycle the
+	// slots of steps already committed: still counted, never unbounded.
 	openCodeUsageMaxRunSteps = 4096
 )
 
@@ -646,6 +646,19 @@ func captureOpenCodeUsageLine(run *openCodeUsageRun, line string) {
 		case len(run.steps) < openCodeUsageMaxRunSteps:
 			run.steps = append(run.steps, step)
 		case run.committed >= len(run.steps):
+			// Every held step is already handed to the ledger, so there is
+			// nothing to fold into. With no commit in flight those steps are
+			// settled for good and their slots are recycled (TryLock: the commit
+			// path takes commitMu before run.mu). A commit in flight may still
+			// untake them, so the step goes one past the cap instead and the
+			// next recycle reclaims it.
+			if run.commitMu.TryLock() {
+				run.steps = append(run.steps[:0], step)
+				run.committed = 0
+				run.commitMu.Unlock()
+			} else {
+				run.steps = append(run.steps, step)
+			}
 			logOpenCodeUsageCapture("run_step_cap")
 		default:
 			last := &run.steps[len(run.steps)-1]
