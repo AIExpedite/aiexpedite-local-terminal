@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,7 +43,7 @@ func TestClaudeNewestTranscript_TheMaximumWinsRegardlessOfOrder(t *testing.T) {
 	writeClaudeTranscript(t, configDir, "-z-project", "s3.jsonl", base.Add(10*time.Minute)) // walked last
 	writeClaudeTranscript(t, configDir, "-z-project", "notes.txt", base.Add(time.Hour))     // not a transcript
 
-	newest, files, complete := claudeNewestTranscriptMs("", time.Minute)
+	newest, files, complete := claudeNewestTranscriptMs("", time.Minute, math.MaxInt64)
 	if !complete || files != 3 || newest != base.Add(10*time.Minute).UnixMilli() {
 		t.Fatalf("newest=%d files=%d complete=%v, want the last directory's transcript", newest, files, complete)
 	}
@@ -50,7 +51,7 @@ func TestClaudeNewestTranscript_TheMaximumWinsRegardlessOfOrder(t *testing.T) {
 
 func TestClaudeNewestTranscript_AMissingProjectsDirIsACompleteEmptyScan(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
-	if newest, files, complete := claudeNewestTranscriptMs("", time.Minute); newest != 0 || files != 0 || !complete {
+	if newest, files, complete := claudeNewestTranscriptMs("", time.Minute, math.MaxInt64); newest != 0 || files != 0 || !complete {
 		t.Fatalf("newest=%d files=%d complete=%v", newest, files, complete)
 	}
 }
@@ -65,7 +66,7 @@ func TestClaudeNewestTranscript_AnExhaustedBudgetIsIncompleteAndOwesNothing(t *t
 	seedClaudeProbeReading(t, cache, time.Now().Add(-2*time.Hour))
 	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", time.Now().Add(-time.Minute))
 
-	if _, _, complete := claudeNewestTranscriptMs("", -time.Second); complete {
+	if _, _, complete := claudeNewestTranscriptMs("", -time.Second, math.MaxInt64); complete {
 		t.Fatal("a scan past its budget reported complete")
 	}
 	resetClaudeUsageWatchState()
@@ -278,6 +279,28 @@ func TestClaudeDirectRunScan_FutureEvidenceIsReconsideredOnceTheClockCatchesUp(t
 	claudeFreshnessWaitIdle(t)
 	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
 		t.Fatalf("debt=%d, want the run owed once the clock caught up", snap.RefreshOwedAtMs)
+	}
+}
+
+// A future-dated transcript does not mask a real run behind it: the scan owes
+// the newest transcript inside the skew ceiling.
+func TestClaudeDirectRunScan_AFutureTranscriptDoesNotMaskARealRun(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-2*time.Hour))
+	writeClaudeTranscript(t, configDir, "-synced", "f.jsonl", now.Add(24*time.Hour))
+	evidence := now.Add(-time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", evidence)
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
+		t.Fatalf("debt=%d, want the real run owed despite the future transcript", snap.RefreshOwedAtMs)
 	}
 }
 

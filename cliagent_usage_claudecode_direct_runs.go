@@ -149,7 +149,12 @@ func claudeDirectRunScanDue(now time.Time) bool {
 func claudeScanDirectRuns(now time.Time) {
 	home, _ := os.UserHomeDir()
 	started := time.Now()
-	newestMs, files, complete := claudeNewestTranscriptMs(home, claudeDirectRunScanBudget)
+	// Transcripts stamped past the skew ceiling are skipped, not selected: one
+	// future-dated file (a clock step, synced metadata) must not mask every real
+	// run behind it. Each scan restats, so it is reconsidered once the clock
+	// catches up to it.
+	ceilingMs := now.Add(claudeRefreshOwedLocalSkew).UnixMilli()
+	newestMs, files, complete := claudeNewestTranscriptMs(home, claudeDirectRunScanBudget, ceilingMs)
 	took := time.Since(started)
 	if !complete {
 		logClaudeDirectRun("incomplete", files, took)
@@ -185,14 +190,15 @@ func claudeScanDirectRuns(now time.Time) {
 
 // claudeNewestTranscriptMs walks <claudeConfigDir>/projects one directory
 // level deep and stats every *.jsonl in each project, keeping the newest mtime
-// (epoch ms) as it goes so directory order does not matter. Mtime is read per
+// (epoch ms) not beyond ceilingMs as it goes, so directory order does not
+// matter and a future-dated file never hides the rest. Mtime is read per
 // FILE because on Windows an append updates the file's mtime but not its
 // directory's. It never opens a file and never returns a path.
 //
 // complete is false when the budget ran out: what was seen so far is not
 // evidence, because the newest transcript may be in a directory not reached.
 // A missing projects directory is a complete scan with nothing in it.
-func claudeNewestTranscriptMs(home string, budget time.Duration) (newestMs int64, files int, complete bool) {
+func claudeNewestTranscriptMs(home string, budget time.Duration, ceilingMs int64) (newestMs int64, files int, complete bool) {
 	base := claudeConfigDir(home)
 	if base == "" {
 		return 0, 0, true
@@ -227,7 +233,7 @@ func claudeNewestTranscriptMs(home string, budget time.Duration) (newestMs int64
 				continue
 			}
 			files++
-			if ms := info.ModTime().UnixMilli(); ms > newestMs {
+			if ms := info.ModTime().UnixMilli(); ms > newestMs && ms <= ceilingMs {
 				newestMs = ms
 			}
 		}

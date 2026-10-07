@@ -80,6 +80,30 @@ func TestClaudeGeneration_AHeartbeatOnlyBucketNeverBumps(t *testing.T) {
 	}
 }
 
+// A row the generation described as numeric that now shows none (an expired
+// bucket replaced by a heartbeat) changes the card, so it bumps like an advance.
+func TestClaudeRowsAdvanced(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		rows, stored []int64
+		want         bool
+	}{
+		{"unchanged", []int64{10, 20}, []int64{10, 20}, false},
+		{"a row advanced", []int64{10, 25}, []int64{10, 20}, true},
+		{"a row went backwards", []int64{10, 15}, []int64{10, 20}, false},
+		{"a numeric row cleared", []int64{10, 0}, []int64{10, 20}, true},
+		{"an unknown row stays unknown", []int64{10, 0}, []int64{10, 0}, false},
+		{"a new row appeared", []int64{10, 20, 5}, []int64{10, 20}, true},
+		{"a described row is no longer shown", []int64{10}, []int64{10, 20}, true},
+		{"an unknown row is no longer shown", []int64{10}, []int64{10, 0}, false},
+		{"never stamped, nothing shown", []int64{0, 0}, nil, false},
+	} {
+		if got := claudeRowsAdvanced(tc.rows, tc.stored); got != tc.want {
+			t.Errorf("%s: claudeRowsAdvanced(%v, %v) = %v, want %v", tc.name, tc.rows, tc.stored, got, tc.want)
+		}
+	}
+}
+
 // five_hour stays the NEWEST observation while the constraining weekly bucket
 // advances: a newest-across-rows rule would never notice; the per-row rule does.
 func TestClaudeGeneration_AWeeklyAdvanceBelowTheNewestRowStillBumps(t *testing.T) {
