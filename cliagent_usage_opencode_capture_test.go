@@ -124,7 +124,7 @@ func TestOpenCodeTap_SumsEveryStepOfOneMessage(t *testing.T) {
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	if handle == nil {
 		t.Fatal("arm returned nil with the refresh enabled")
 	}
@@ -153,7 +153,7 @@ func TestOpenCodeTap_ReadsStringAndNullSpellings(t *testing.T) {
 	now := openCodeFixtureStringRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_string_shapes.jsonl")
 	handle.Finish(true)
 	openCodeUsageRefreshWaitFor(2 * time.Second)
@@ -170,7 +170,7 @@ func TestOpenCodeTap_AnUnattributedStepIsNotCountedAndOwesAReconcile(t *testing.
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_unattributed_step.jsonl")
 	if owed := handle.Finish(true); !owed {
 		t.Fatal("a step with no messageID must leave the run owing a reconcile")
@@ -186,7 +186,7 @@ func TestOpenCodeTap_ACutOffStreamOwesAReconcileAndKeepsWhatItSaw(t *testing.T) 
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	// cleanEnd=false is a timeout, a kill or an overflow: the figures we DID
 	// see still count, and the run owes one reconcile for what we did not.
@@ -203,7 +203,7 @@ func TestOpenCodeTap_AnErrorOnlyStreamCountsNothing(t *testing.T) {
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_error.jsonl")
 	if owed := handle.Finish(true); !owed {
 		t.Fatal("a stream with no step_finish must owe a reconcile")
@@ -230,19 +230,19 @@ func TestOpenCodeArmForCommand_SkipsSpendFreeSubcommands(t *testing.T) {
 		{"models"}, {"auth", "list"}, {"--version"}, {"session", "list", "--format", "json"},
 		{"export", "ses_1"}, {"--help"},
 	} {
-		if handle := armOpenCodeUsageForCommand("unit", "opencode", args); handle != nil {
+		if handle := armOpenCodeUsageForCommand("native chat", "opencode", args); handle != nil {
 			handle.Disarm()
 			t.Fatalf("armed a usage run for the spend-free invocation %v", args)
 		}
 	}
 	// A reconcile's own two commands are in that list, so a pass can never
 	// create the debt it exists to pay.
-	if handle := armOpenCodeUsageForCommand("unit", "opencode", []string{"run", "--format", "json"}); handle == nil {
+	if handle := armOpenCodeUsageForCommand("native chat", "opencode", []string{"run", "--format", "json"}); handle == nil {
 		t.Fatal("a real run must arm")
 	} else {
 		handle.Disarm()
 	}
-	if handle := armOpenCodeUsageForCommand("unit", "codex", []string{"exec"}); handle != nil {
+	if handle := armOpenCodeUsageForCommand("native chat", "codex", []string{"exec"}); handle != nil {
 		t.Fatal("armed a usage run for another CLI")
 	}
 }
@@ -250,7 +250,7 @@ func TestOpenCodeArmForCommand_SkipsSpendFreeSubcommands(t *testing.T) {
 func TestOpenCodeArm_DisabledRefreshArmsNothing(t *testing.T) {
 	openCodeUsageFixture(t, time.Now())
 	openCodeUsageRefreshEnabled.Store(false)
-	if handle := armOpenCodeUsageRun("unit"); handle != nil {
+	if handle := armOpenCodeUsageRun("native chat"); handle != nil {
 		t.Fatal("armed a run with the refresh disabled — a test must never spawn the CLI")
 	}
 }
@@ -469,7 +469,7 @@ func TestOpenCodeLedgerMetrics_PublishesTokensAndCostAsDailyCounters(t *testing.
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(true)
 	openCodeUsageRefreshWaitFor(2 * time.Second)
@@ -660,7 +660,7 @@ func TestOpenCodeMerge_AMessageWithNoFiguresAddsNoRow(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	handle.Observe(`{"type":"step_start","timestamp":` + strconv.FormatInt(now.UnixMilli(), 10) +
 		`,"sessionID":"ses_1","part":{"messageID":"msg_1","type":"step-start"}}`)
 	handle.Observe(`{"type":"text","timestamp":` + strconv.FormatInt(now.UnixMilli(), 10) +
@@ -708,7 +708,7 @@ func TestOpenCodeLedgerMetrics_UnitsAreTheOnesTheCardFormatsOn(t *testing.T) {
 	}
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(true)
 	openCodeUsageRefreshWaitFor(2 * time.Second)

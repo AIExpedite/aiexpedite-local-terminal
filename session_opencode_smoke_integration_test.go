@@ -473,3 +473,41 @@ func TestOpenCodeSession_APipeTurnWithNoTerminalFrameOwesAReconcile(t *testing.T
 		t.Fatal("the owed reconcile never ran")
 	}
 }
+
+// A session opened and closed WITHOUT a prompt ran no turn, so it must owe
+// nothing: the chat-direct flow opens an opencode session on model selection,
+// and settling every abandoned one as an owed reconcile would spend a bounded
+// pass — a `session list` plus up to three `export` calls — on a run that never
+// happened, once per abandoned chat.
+func TestOpenCodeSession_APromptlessSessionOwesNothing(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	// Any reconcile would be a bug: the fixture's stub fatals if one spawns.
+
+	run := runOpenCodeSessionStart(t, commandMsg{
+		// No prompt token, so buildOpenCodeInteractiveArgs yields a nil
+		// stdinPrompt and the child holds stdin open for a first message that
+		// never comes.
+		Type: "session_start", Command: "opencode", Args: []string{"--model", "anthropic/claude-sonnet-4-5"},
+	})
+	if run.err != nil || !run.spawned {
+		t.Fatalf("the session did not run: err=%v spawned=%v", run.err, run.spawned)
+	}
+	if !openCodeUsageRefreshWaitFor(5 * time.Second) {
+		t.Fatal("the usage settle never went idle")
+	}
+
+	var freshness openCodeUsageFreshness
+	readJSONFile(openCodeUsageFreshnessPath(), &freshness)
+	if freshness.owed() {
+		t.Fatalf("freshness = %+v, want nothing owed for a session that ran no turn", freshness)
+	}
+	// And no floor is left behind for the next process to adopt as an
+	// interrupted run.
+	if freshness.RunFloorMs != 0 {
+		t.Fatalf("runFloorMs = %d, want the withdrawn run to leave none", freshness.RunFloorMs)
+	}
+	if _, _, rows := todayTotals(t, now); rows != 0 {
+		t.Fatalf("rows = %d, want none", rows)
+	}
+}

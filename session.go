@@ -199,6 +199,14 @@ type CLISession struct {
 	// openCodeTerminalSeen records that an OpenCode turn announced its own end.
 	openCodeTerminalSeen atomic.Bool
 	openCodeUsageSettled atomic.Bool
+	// openCodePromptDelivered records that a prompt actually REACHED the child.
+	// A one-shot, stdin-fed `opencode run` started without one (the
+	// chat-direct flow opens the session on model selection) has not run a
+	// turn, and may never: settling its exit as an owed reconcile would spend a
+	// bounded pass — a `session list` plus up to three `export` calls — on a
+	// run that never happened, once per abandoned chat. Same reasoning, and the
+	// same three delivery sites, as codexUsageFloorMs.
+	openCodePromptDelivered atomic.Bool
 
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
@@ -1041,6 +1049,9 @@ func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string,
 	if isCodexCommand(session.Command) {
 		session.armCodexUsageRun(session.StartedAt)
 	}
+	if isOpenCodeCommand(session.Command) {
+		session.openCodePromptDelivered.Store(true)
+	}
 	// Prompt delivered — arm the claude no-output watchdog now.
 	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 }
@@ -1106,7 +1117,12 @@ func (s *CLISession) finishLateStdinWrite(writeDone <-chan error) {
 	s.mu.Lock()
 	s.closeDeferredStdinLocked()
 	s.mu.Unlock()
-	// Usage accounting is codex's alone; the close above is not.
+	// This late write is a delivery too, so an opencode run that got its prompt
+	// only here still counts (marked before the codex-only return below).
+	if isOpenCodeCommand(s.Command) {
+		s.openCodePromptDelivered.Store(true)
+	}
+	// The run-floor accounting below is codex's alone; the close above is not.
 	if !isCodexCommand(s.Command) {
 		return
 	}
@@ -1284,6 +1300,11 @@ func (sm *SessionManager) SendInputAccepting(id, text string, accept func() erro
 	// deferred flow above all, whose session has been idle since StartSession.
 	if isCodexCommand(session.Command) {
 		session.armCodexUsageRun(time.Now())
+	}
+	// The same fact for opencode, whose handle was armed at spawn: its run only
+	// counts once a prompt has reached the child.
+	if isOpenCodeCommand(session.Command) {
+		session.openCodePromptDelivered.Store(true)
 	}
 
 	// One-shot, stdin-fed CLIs (codex, opencode) started without a prompt held
@@ -2729,7 +2750,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// still spent tokens we could not read, so it owes one bounded reconcile.
 	// Asynchronous — never delays session_ended.
 	if session.openCodeUsage != nil && session.openCodeUsageSettled.CompareAndSwap(false, true) {
-		settleOpenCodeUsageRunAsync(session.openCodeUsage, err == nil && session.openCodeTerminalSeen.Load())
+		if !session.openCodePromptDelivered.Load() {
+			// No prompt ever reached the child, so there was no turn to
+			// account for: withdraw the run rather than owing a reconcile for
+			// it (openCodePromptDelivered).
+			session.openCodeUsage.Disarm()
+		} else {
+			settleOpenCodeUsageRunAsync(session.openCodeUsage, err == nil && session.openCodeTerminalSeen.Load())
+		}
 	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish

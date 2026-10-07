@@ -270,7 +270,7 @@ func TestOpenCodeParse_PublishesTodaysLedgerRows(t *testing.T) {
 	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	handle.Observe(fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"sessionID":"ses_1",`+
 		`"part":{"messageID":"msg_1","type":"step-finish","reason":"stop","cost":0.37,`+
 		`"tokens":{"input":100,"output":40,"reasoning":10,"cache":{"read":9000,"write":900}}}}`,

@@ -738,8 +738,6 @@ var openCodeUsageRunLabels = map[string]bool{
 	"native chat": true, "pipe session": true, "smoke": true,
 	"local execute": true, "windows execute": true, "PTY session": true,
 	openCodeUsageRunLabelOther: true,
-	// Tests arm with this one.
-	"unit": true,
 }
 
 func openCodeUsageRunLabel(label string) string {

@@ -215,7 +215,7 @@ func TestOpenCodeUsage_LedgerHoldsTheHashedSessionNotTheId(t *testing.T) {
 	openCodeDebtFixture(t, now)
 	const sessionID = "ses_a_project_the_user_would_recognise"
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	handle.Observe(fmt.Sprintf(`{"type":"step_finish","timestamp":%d,"sessionID":%q,`+
 		`"part":{"messageID":"msg_1","type":"step-finish","tokens":{"input":5}}}`,
 		now.UnixMilli(), sessionID))
@@ -237,7 +237,7 @@ func TestOpenCodeUsage_SnapshotCarriesNoIdsOrPaths(t *testing.T) {
 	now := openCodeFixtureRunAt
 	openCodeDebtFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(true)
 	openCodeUsageRefreshWaitFor(2 * time.Second)

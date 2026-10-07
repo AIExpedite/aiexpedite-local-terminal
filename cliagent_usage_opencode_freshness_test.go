@@ -93,7 +93,7 @@ func TestOpenCodeDebt_ACoveredRunOwesNothingAndAnUncoveredOneOwesOne(t *testing.
 		{"a stream that reported no tokens", true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handle := armOpenCodeUsageRun("unit")
+			handle := armOpenCodeUsageRun("native chat")
 			if tc.tokens {
 				handle.Observe(`{"type":"step_finish","sessionID":"s2","part":{"messageID":"m2","type":"step-finish","tokens":{"input":5}}}`)
 			}
@@ -179,7 +179,7 @@ func TestOpenCodeDebt_SpendsAtMostItsBudgetOfPasses(t *testing.T) {
 	openCodeDebtFixture(t, now)
 	stub := (&openCodeCLIStub{launchError: true}).install(t)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	handle.Finish(false)
 
 	// The settle's own pass plus every rung, and no more.
@@ -358,7 +358,7 @@ func TestOpenCodeDebt_UnsupportedRetiresTheDebtSoStreamFiguresStand(t *testing.T
 	openCodeDebtFixture(t, now)
 	(&openCodeCLIStub{}).install(t)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(false) // a cut-off stream: it owes
 	openCodeUsageRefreshWaitFor(2 * time.Second)
@@ -393,7 +393,7 @@ func TestOpenCodeNudge_HonoursItsCooldownAndLiveRuns(t *testing.T) {
 
 	// A run of this process is live: it settles itself, so the nudge stands
 	// down rather than racing it.
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	t.Cleanup(func() { handle.Disarm() })
 	if nudgeOpenCodeUsageRefresh(now.Add(time.Hour)) {
 		t.Fatal("a nudge must not fire while one of this process's runs is live")

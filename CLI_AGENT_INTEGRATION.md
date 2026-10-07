@@ -2210,6 +2210,7 @@ bounded pass, a missed one costs the reading.
 | --- | --- | --- | --- |
 | native chat | [opencode_native.go](opencode_native.go) `runOneShot` | `native chat` | yes |
 | pipe session | [session.go](session.go) `StartSession` → `waitForExit` | `pipe session` | yes |
+| | …armed at spawn so the tap exists before any output, but WITHDRAWN at exit when no prompt ever reached the child (`openCodePromptDelivered`, set at the same three delivery sites as `codexUsageFloorMs`). A one-shot `opencode run` opened without a prompt — the chat-direct flow opens on model selection — has run no turn and may never, and owing a reconcile for each abandoned chat would spend a bounded pass on a run that never happened. | | |
 | maintenance smoke | [cliagent_smoke_opencode.go](cliagent_smoke_opencode.go) | `smoke` | yes (before the bytes are discarded) |
 | execute, no tty | [pubsub.go](pubsub.go) `runLocalCommandUnix` | `local execute` | no — always owes |
 | execute, Windows chain | [pubsub.go](pubsub.go) `runLocalCommandWindows`, armed at function ENTRY (no single post-Start hook) | `windows execute` | no — always owes |

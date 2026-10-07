@@ -236,7 +236,7 @@ func TestOpenCodeReconcile_StreamAndExportOfOneRunNeverDoubleCount(t *testing.T)
 	openCodeUsageFixture(t, now)
 
 	// The run's own stream first (12+9+1 then 30+11 = 63 for msg_1).
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(true)
 	openCodeUsageRefreshWaitFor(2 * time.Second)
@@ -266,7 +266,7 @@ func TestOpenCodeReconcile_OverCapExportOfAStreamCapturedSessionJustAdvancesTheC
 	now := openCodeFixtureRunAt
 	openCodeUsageFixture(t, now)
 
-	handle := armOpenCodeUsageRun("unit")
+	handle := armOpenCodeUsageRun("native chat")
 	observeFixture(t, handle, "run_two_steps.jsonl")
 	handle.Finish(true) // settles COVERED, recording ses_fixture
 	openCodeUsageRefreshWaitFor(2 * time.Second)
