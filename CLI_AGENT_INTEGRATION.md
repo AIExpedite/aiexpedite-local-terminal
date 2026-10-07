@@ -2416,7 +2416,9 @@ reading, never a run — but "best-effort" is not the same answer everywhere:
   attempt budget, one pending retry that folds the oldest floor with the newest
   completion) until the filesystem recovers. This is exactly the case a refused
   ledger write lands in, since the same read-only or full config dir causes
-  both.
+  both. Giving up (other than for a shutdown) marks the run's start and end
+  days `partial`, since nothing durable is left to reconcile it; the ledger
+  may still be writable when only the freshness file is not.
 - A **continuation booking** (`openCodeBookContinuation`, the `more` and the
   failure branches of `openCodeBookAfterOutcome`) is the only durable record of a
   backlog no debt covers, and both the fired timer and startup recovery re-read

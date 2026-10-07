@@ -379,20 +379,17 @@ func openCodeRotateGenerationEpoch(now time.Time) (rotated, refused bool) {
 	return false, !empty
 }
 
-// openCodeUsageRecoveryGeneration is the rotated generation of a ledger whose
-// today rows are numeric — a reading the previous process committed but whose
-// hint it never sent (a shutdown inside the debounce). Nil otherwise.
+// openCodeUsageRecoveryGeneration is the rotated generation of a ledger the
+// previous process committed but may never have hinted (a shutdown inside the
+// debounce), or nil. Any rotated generation qualifies, not only one with
+// numeric today rows: a commit that CLEARED the published view (the zero row
+// withdrawn by a later `more`, today reduced to the lower-bound notice) is a
+// change the backend must fetch too, or it keeps showing the old complete
+// reading. A ledger that never published anything is never rotated, so it
+// stays nil.
 func openCodeUsageRecoveryGeneration() *cliUsageGeneration {
-	metrics, generation, _ := openCodeLedgerMetrics(openCodeUsageNow())
-	if generation == nil {
-		return nil
-	}
-	for _, m := range metrics {
-		if !m.Unknown && m.Consumed != nil {
-			return generation
-		}
-	}
-	return nil
+	_, generation, _ := openCodeLedgerMetrics(openCodeUsageNow())
+	return generation
 }
 
 /* ────────────────────────── day keys & pruning ─────────────────────── */

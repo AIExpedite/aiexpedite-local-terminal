@@ -1305,6 +1305,27 @@ func TestOpenCodeSettle_RetriesADebtWhoseWriteWasRefused(t *testing.T) {
 	openCodeUsageRefreshWaitFor(2 * time.Second)
 }
 
+func TestOpenCodeSettle_AnExhaustedDebtWriteRetryMarksTheRunDaysALowerBound(t *testing.T) {
+	// Past the retry budget the run is out of the live set and no debt or
+	// floor ever reached disk, so nothing can reconcile it. The ledger may
+	// still be writable when only the freshness file is not: both of the run's
+	// days carry the notice.
+	now := time.Date(2026, 9, 30, 0, 30, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+
+	floor := now.Add(-time.Hour) // started yesterday, ended today
+	openCodeArmSettleRetry(floor.UnixMilli(), now.UnixMilli(), "execute", openCodeRunDebtMaxAttempts+1)
+	if openCodeSettleRetryPending() {
+		t.Fatal("an exhausted retry budget must not arm another retry")
+	}
+	ledger := readOpenCodeUsageLedger()
+	for _, day := range []time.Time{floor, now} {
+		if !openCodeDayPartial(ledger, openCodeDayKey(day)) {
+			t.Fatalf("day %s must be marked a lower bound", openCodeDayKey(day))
+		}
+	}
+}
+
 func TestOpenCodeDiscovery_SeesAProjectWriteWhenRankingFillsTheStatBudget(t *testing.T) {
 	// Ranking stats every slug's store directories, so a store with enough
 	// slugs spends the whole budget there. The walk must still report the

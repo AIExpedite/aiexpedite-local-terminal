@@ -429,6 +429,13 @@ func openCodeArmSettleRetry(floorMs, completionMs int64, label string, attempt i
 	delay, ok := refreshRetryDelayForAttempt(attempt, openCodeRunDebtMaxAttempts, openCodeRunDebtRetryLadder)
 	if !ok || IsShutdownInProgress() {
 		logOpenCodeUsage("debt write gave up attempts=%d", attempt)
+		// The run has already left the live set and no debt or floor reached
+		// disk, so nothing can ever reconcile it. Its days become a lower bound
+		// instead — the ledger may still be writable when only the freshness
+		// file is not. A shutdown is not giving up (see above).
+		if !IsShutdownInProgress() {
+			openCodeMarkRunDaysPartial(floorMs, completionMs)
+		}
 		return
 	}
 	r := &openCodeSettleRetry
@@ -1139,6 +1146,17 @@ func openCodeMarkPartialIfBacklogged() {
 func openCodeMarkTodayPartialNow() {
 	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 		return openCodeLedgerEdit{Changed: openCodeMarkTodayPartial(l, openCodeUsageNow())}
+	})
+}
+
+// openCodeMarkRunDaysPartial marks the day a run started and the day it ended
+// a lower bound — a run abandoned unreconciled may have spent on either side of
+// midnight.
+func openCodeMarkRunDaysPartial(floorMs, completionMs int64) {
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		started := openCodeMarkDayPartial(l, openCodeDayKey(time.UnixMilli(floorMs)))
+		ended := openCodeMarkDayPartial(l, openCodeDayKey(time.UnixMilli(completionMs)))
+		return openCodeLedgerEdit{Changed: started || ended}
 	})
 }
 

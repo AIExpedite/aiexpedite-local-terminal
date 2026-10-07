@@ -489,6 +489,31 @@ func TestOpenCodeRotateGenerationEpoch_RepublishesAPreviousProcessReading(t *tes
 	}
 }
 
+func TestOpenCodeRecoveryGeneration_HintsACommittedClear(t *testing.T) {
+	// A commit that leaves today with no rows — the zero row withdrawn, only
+	// the lower-bound notice left — is a published-view change too. If the
+	// previous process exited inside the debounce, the next one must still ask
+	// the backend to fetch it, or the old complete reading stays on the card.
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeEnsureDay(l, openCodeDayKey(now)).Partial = true
+		l.Generation = cliUsageGeneration{Epoch: 4242, Counter: 9}
+		return openCodeLedgerEdit{Changed: true}
+	})
+	openCodeGenerationRotated.Store(false)
+	if rotated, refused := openCodeRotateGenerationEpoch(now); !rotated || refused {
+		t.Fatalf("rotated=%v refused=%v, want true/false", rotated, refused)
+	}
+	if metrics, _, partial := openCodeLedgerMetrics(now); len(metrics) != 0 || !partial {
+		t.Fatalf("metrics=%+v partial=%v, want no rows and the notice", metrics, partial)
+	}
+	if openCodeUsageRecoveryGeneration() == nil {
+		t.Fatal("a rotated ledger whose view was cleared must still produce a recovery hint")
+	}
+}
+
 /* ───────────────────────────── published rows ──────────────────────────── */
 
 func TestOpenCodeLedgerMetrics_PublishesTokensAndCostAsDailyCounters(t *testing.T) {
