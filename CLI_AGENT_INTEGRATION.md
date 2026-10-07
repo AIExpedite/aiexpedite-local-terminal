@@ -2234,7 +2234,7 @@ bounded pass, a missed one costs the reading.
 | | …armed at spawn so the tap exists before any output, but WITHDRAWN at exit when a DIRECT `opencode` session (`isOpenCodeCommand`) never got a prompt on stdin (`openCodePromptDelivered`, set at the same three delivery sites as `codexUsageFloorMs`). A one-shot `opencode run` opened without a prompt — the chat-direct flow opens on model selection — has run no turn and may never, and owing a reconcile for each abandoned chat would spend a bounded pass on a run that never happened. A shell-wrapped launch (`bash -c 'opencode run …'`) carries its prompt in the script, so it is never withdrawn: it settles like any untapped run and owes a reconcile. | | |
 | maintenance smoke | [cliagent_smoke_opencode.go](cliagent_smoke_opencode.go) | `smoke` | yes (before the bytes are discarded) |
 | execute, no tty | [pubsub.go](pubsub.go) `runLocalCommandUnix` | `local execute` | no — always owes |
-| execute, Windows chain | [pubsub.go](pubsub.go) `runLocalCommandWindows`, armed at function ENTRY (no single post-Start hook) | `windows execute` | no — always owes |
+| execute, Windows chain | [pubsub.go](pubsub.go) `runLocalCommandWindows`, armed at function ENTRY (no single post-Start hook); disarmed when no transport started anything — the persistent host counts as started only once `Execute` wrote the command (`errPSNotDispatched`), since its PID predates the command | `windows execute` | no — always owes once started |
 | Unix PTY | [pty_session_unix.go](pty_session_unix.go) | `PTY session` | no — always owes |
 
 `TestOpenCodeUsage_EveryArmSiteStillArms` pins this table: a site that stops
@@ -2331,7 +2331,11 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   restarted by a record its failures never consumed; and a record no export can
   ever clear — its session is no longer listed, or is now held as over-cap and
   belongs to the `skipped` retry — is dropped by the pass rather than booking a
-  wake-up for itself until the retention prune.
+  wake-up for itself until the retention prune. A booking whose
+  `continuationDue` write is refused is retried in memory on the debt ladder's
+  delays (`openCodeArmRecheckBookRetry`), because that pass already carried
+  `lastPassStartedAtMs` past the store activity and startup recovery skips a
+  clear flag — nothing else would come back for the record.
 
 ### Discover, and survive
 
