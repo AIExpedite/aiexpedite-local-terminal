@@ -685,9 +685,13 @@ func clearOpenCodeContinuationDue() {
 // Zero failures clear the first-failure stamp with them.
 func updateOpenCodeUsageLedgerContinuation(due bool, failures int, firstFailureAtMs int64) {
 	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
-		if failures == 0 {
-			firstFailureAtMs = 0
-		}
+		// firstFailureAtMs is NOT coupled to `failures`: an offline tick keeps
+		// the chain without counting a failure, and its age is what
+		// refreshFreeRetryDelay grows the backoff from. Zeroing it whenever the
+		// count was zero pinned an offline device to the floor for the whole
+		// outage — a timer, two reads and a write every minute, for hours. The
+		// callers that mean "forget the run of failures" pass 0 explicitly.
+		//
 		// A chain that has ended forgets its pass budget, so the next one
 		// starts fresh.
 		passes := l.ContinuationPasses

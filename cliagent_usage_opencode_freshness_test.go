@@ -774,3 +774,60 @@ func TestOpenCodeSpacedDelay_IgnoresAStampTheClockLeftInTheFuture(t *testing.T) 
 		t.Fatalf("next attempt = %d, want it within one spacing interval of now (%d)", next, ceiling)
 	}
 }
+
+func TestOpenCodeContinuation_OfflineKeepsTheChainAndBacksOffWithTheOutage(t *testing.T) {
+	// Offline is not a failure — it spends no budget and the chain stays
+	// booked — but it must still age the backoff, or a device offline for hours
+	// re-checks at the floor the whole time: a timer, two reads and a file
+	// write every minute, for nothing.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	setNow := openCodeDebtFixture(t, now)
+	openCodeRunDebtRetryLadder = []time.Duration{
+		time.Minute, 2 * time.Minute, 8 * time.Minute, 30 * time.Minute,
+	}
+	openCodeRunDebtFreeRetryDelay = 30 * time.Second
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+	restore := forceOpenCodeOffline(t)
+	defer restore()
+
+	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileOffline {
+		t.Fatalf("outcome = %q, want offline", outcome)
+	}
+	first := readOpenCodeUsageLedger()
+	if !first.ContinuationDue {
+		t.Fatal("offline must keep the chain booked")
+	}
+	if first.ContinuationFailures != 0 {
+		t.Fatalf("continuationFailures = %d, want offline to count none", first.ContinuationFailures)
+	}
+	if first.ContinuationFirstFailureAtMs != now.UnixMilli() {
+		t.Fatalf("firstFailureAtMs = %d, want the outage's start %d — the backoff ages from it",
+			first.ContinuationFirstFailureAtMs, now.UnixMilli())
+	}
+
+	// Five minutes into the outage the stamp still names its start, so
+	// refreshFreeRetryDelay has a real age to grow from rather than the floor.
+	setNow(now.Add(5 * time.Minute))
+	openCodePayReconcile(context.Background(), false)
+	later := readOpenCodeUsageLedger()
+	if later.ContinuationFirstFailureAtMs != now.UnixMilli() {
+		t.Fatalf("firstFailureAtMs moved to %d; the outage's age was forgotten",
+			later.ContinuationFirstFailureAtMs)
+	}
+	if later.ContinuationFailures != 0 {
+		t.Fatalf("continuationFailures = %d, want offline to still count none", later.ContinuationFailures)
+	}
+	aged := refreshFreeRetryDelay(5*time.Minute, openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)
+	if aged <= openCodeRunDebtFreeRetryDelay {
+		t.Fatalf("the aged delay %v did not grow past the floor %v", aged, openCodeRunDebtFreeRetryDelay)
+	}
+
+	// Coming back online, committed progress forgets the outage entirely.
+	restore()
+	openCodePayReconcile(context.Background(), false)
+	done := readOpenCodeUsageLedger()
+	if done.ContinuationDue || done.ContinuationFirstFailureAtMs != 0 || done.ContinuationFailures != 0 {
+		t.Fatalf("ledger = %+v, want a finished chain to forget the outage", done)
+	}
+}

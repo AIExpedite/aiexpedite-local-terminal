@@ -2246,7 +2246,9 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   continuation chain is the only timer: a failure keeps `continuationDue`, counts
   it, and books one pass off the age of the current run of consecutive failures;
   after 4 the chain stops and today is marked `partial` if candidates were still
-  queued. A chain that keeps making PROGRESS is bounded too
+  queued. Offline is not a failure — it spends no budget and keeps the chain —
+  but it still AGES the backoff, so a device offline for hours does not
+  re-check at the floor the whole time. A chain that keeps making PROGRESS is bounded too
   (`openCodeContinuationMaxPasses`): `more` always terminates, but nothing else
   would bound how long it keeps spawning `opencode` on the user's machine.
 - **What is never exported.** A session whose `updated` falls outside the
