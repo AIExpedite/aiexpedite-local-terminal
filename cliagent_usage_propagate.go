@@ -136,6 +136,9 @@ type cliUsagePendingHint struct {
 	// publish) rather than after the debounce.
 	followUp  bool
 	notBefore time.Time
+	// inFlight: a send holds this hint and mu is released for the HTTP call,
+	// so the hint is not picked again until that send settles.
+	inFlight bool
 }
 
 // due is when h may go, before the device-wide spacing.
@@ -483,7 +486,7 @@ func (p *cliUsagePropagatorState) providerBlockedLocked(provider string) bool {
 // when nothing is eligible.
 func (p *cliUsagePropagatorState) nextHintLocked() (provider string, h *cliUsagePendingHint, ok bool) {
 	for candidate, pending := range p.pending {
-		if p.providerBlockedLocked(candidate) {
+		if pending.inFlight || p.providerBlockedLocked(candidate) {
 			continue
 		}
 		if !ok || pending.due().Before(h.due()) || (pending.due().Equal(h.due()) && candidate < provider) {
@@ -491,6 +494,16 @@ func (p *cliUsagePropagatorState) nextHintLocked() (provider string, h *cliUsage
 		}
 	}
 	return provider, h, ok
+}
+
+// anyInFlightLocked reports whether a send holds a pending hint.
+func (p *cliUsagePropagatorState) anyInFlightLocked() bool {
+	for _, h := range p.pending {
+		if h.inFlight {
+			return true
+		}
+	}
+	return false
 }
 
 // armNextLocked arms the timer for the next eligible hint, or for the next
@@ -677,6 +690,11 @@ func (p *cliUsagePropagatorState) sendDue() {
 		return
 	}
 	provider, h, ok := p.nextHintLocked()
+	if !ok && p.anyInFlightLocked() {
+		// The send in flight re-arms the timer when it settles.
+		p.mu.Unlock()
+		return
+	}
 	if !ok {
 		logCLIUsageHint("awaiting_rotation")
 		p.armLocked(cliUsageHintSpacing)
@@ -694,6 +712,12 @@ func (p *cliUsagePropagatorState) sendDue() {
 		p.mu.Unlock()
 		return
 	}
+	// Reserve the hint and the device-wide spacing boundary before mu is
+	// released for the HTTP call: a note recorded meanwhile re-arms the timer,
+	// which would otherwise see this hint still pending with an unadvanced
+	// lastSentAt, fire at once and send it a second time, unspaced.
+	h.inFlight = true
+	p.lastSentAt = time.Now()
 	cfg, generation, followUp, ctx := p.cfg, h.generation, h.followUp, p.ctx
 	p.mu.Unlock()
 
@@ -703,6 +727,7 @@ func (p *cliUsagePropagatorState) sendDue() {
 	if agentID == "" || secret == "" || baseURL == "" {
 		logCLIUsageHint("skipped_unregistered")
 		p.mu.Lock()
+		h.inFlight = false
 		p.armLocked(cliUsageHintSpacing)
 		p.mu.Unlock()
 		return
@@ -727,6 +752,7 @@ func (p *cliUsagePropagatorState) sendDue() {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	h.inFlight = false
 	now := time.Now()
 	p.lastSentAt = now
 	if p.stopped {

@@ -974,3 +974,55 @@ func TestCLIUsageHint_ANewerPendingGenerationSurvivesTheReceiptSettlement(t *tes
 		})
 	}
 }
+
+// A note recorded while a hint's send is in flight re-arms the timer; the hint
+// being sent must not be picked again (and sent a second time, unspaced)
+// before that send settles.
+func TestCLIUsageHint_ANoteDuringASendDoesNotResendTheHintInFlight(t *testing.T) {
+	withCodexGenerationEpoch(t, 603)
+	rec, cfg := propagatorFixture(t)
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	var mu sync.Mutex
+	claudeStarts := 0
+	started := make(chan struct{}, 8)
+	record := sendCLIUsageObservedHint
+	sendCLIUsageObservedHint = func(ctx context.Context, url string, hint cliUsageObservedHint) int {
+		if hint.Provider == claudeUsageProvider && hint.Generation == 1 {
+			mu.Lock()
+			claudeStarts++
+			mu.Unlock()
+			started <- struct{}{}
+			<-release
+		}
+		return record(ctx, url, hint)
+	}
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(78, 1))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Claude hint was never sent")
+	}
+	// Another provider's note re-arms the timer while the Claude send is held.
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(603, 1))
+	time.Sleep(3 * cliUsageHintDebounce)
+	mu.Lock()
+	starts := claudeStarts
+	mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("the in-flight Claude hint was started %d times, want once", starts)
+	}
+	close(release)
+	if hints := waitHints(t, rec, 1, cliUsageHintDebounce); len(hints) == 0 {
+		t.Fatal("no hint was recorded after the send settled")
+	}
+}

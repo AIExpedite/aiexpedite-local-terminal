@@ -444,10 +444,9 @@ func TestClaudeStaleMirror_ARejectedReceiptIsRecoveredByItsConfirmation(t *testi
 
 	publishedAt := time.Now()
 	svc.refresh()
-	time.Sleep(3 * cliUsageHintDebounce)
-	if hints, _, _ := svc.snapshot(); len(hintsAfter(hints, preRun)) != 0 {
-		t.Fatalf("a receipt-carried generation was hinted at once: %+v", hints)
-	}
+	// "Not hinted at once" is asserted by timestamp below (the confirmation
+	// went at least one spacing after the publish); sampling after a fixed
+	// sleep failed on slow runners once the confirmation itself was due.
 	waitForClaudeCondition(t, 10*time.Second, "the confirmation never recovered the rejected receipt", func() bool {
 		svc.mu.Lock()
 		defer svc.mu.Unlock()
