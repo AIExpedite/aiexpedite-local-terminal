@@ -694,6 +694,11 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// its step_finish frames are captured while streaming and committed once
 	// the child is reaped, or an export is owed for a turn that reported none.
 	usageRun := armOpenCodeUsageRunForExecutable(executable, runDir)
+	// A resumed turn's session is known before any frame: record it on the
+	// armed debt now, so a crash before the stream names it stays payable.
+	if isValidOpenCodeSessionID(nativeID) {
+		usageRun.persistSessionIDAsync(nativeID)
+	}
 
 	// opencode already leads its own group (Setsid above). Recorded in the
 	// spawn ledger for this turn only (session_ledger.go).

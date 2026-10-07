@@ -112,6 +112,45 @@ func TestOpenCodeNativeUsage_AResumedSessionOwesUnderItsResumeID(t *testing.T) {
 	}
 }
 
+// A resumed resident turn records its resume id on the armed debt at spawn,
+// before any frame names the session: a crash or self-update mid-turn then
+// leaves a debt the next process can export, not an unattributable one.
+func TestOpenCodeNativeUsage_AResumedResidentTurnPersistsItsResumeIDAtSpawn(t *testing.T) {
+	openCodeUsageFixture(t, 1307)
+	installOpenCodeStub(t)
+	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"text","text":"done"}\n`)
+	t.Setenv("OPENCODE_STUB_SLEEP_MS", "3000")
+
+	m := NewOpenCodeNativeManager()
+	sess := injectOpenCodeSession(t, m, "sess-usage-resume", t.TempDir())
+	sess.NativeSessionID = "ses_known"
+	sess.Transcript = []openCodeTurn{{Role: "user", Content: "earlier"}}
+
+	sent := make(chan error, 1)
+	go func() { sent <- m.Send("sess-usage-resume", "follow up", func(resultMsg) {}, 60*time.Second) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		debts := loadOpenCodeUsageLedger().Debts
+		if len(debts) == 1 && !debts[0].owed() && debts[0].SessionID == "ses_known" {
+			break
+		}
+		select {
+		case err := <-sent:
+			t.Fatalf("turn ended (err=%v) before its armed debt carried the resume id; debts = %+v", err, debts)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("debts = %+v, want one armed debt under the resume id mid-turn", debts)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := <-sent; err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	openCodeUsageInFlight.Wait()
+}
+
 // A turn whose stdout passes the cumulative cap still counts every step: the
 // drain keeps reading usage, so the final model step after the overflow (and
 // one past an oversize frame) is not lost while the earlier tool step settles
