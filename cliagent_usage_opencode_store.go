@@ -218,6 +218,20 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 	settled := 0
 	remaining := func() int { return plan.remaining + len(plan.exports) - settled }
 
+	if !truncated && len(plan.staleRechecks) > 0 {
+		// Best effort: a record that fails to clear only costs a later pass,
+		// never a figure.
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			edit := openCodeLedgerEdit{}
+			for _, hash := range plan.staleRechecks {
+				if openCodeForgetRecheckHash(l, hash) {
+					edit.Changed = true
+				}
+			}
+			return edit
+		})
+	}
+
 	if plan.cursorFloorMs > ledger.ReconcileCursorMs || plan.undatable > 0 {
 		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			edit := openCodeLedgerEdit{}
@@ -389,6 +403,13 @@ type openCodeReconcilePlan struct {
 	// cannot tell whether they changed, so they are skipped and the day is a
 	// lower bound.
 	undatable int
+	// staleRechecks holds the hashes of DUE re-read records whose session the
+	// list no longer names at all — one OpenCode deleted, or moved out of the
+	// layout we can read. Nothing will ever export them, so nothing would ever
+	// clear them: a pass would end ok, book a wake-up for the record, and the
+	// two would chase each other until the retention prune. They are dropped
+	// instead, and only from a list that was NOT truncated.
+	staleRechecks []string
 }
 
 // planOpenCodeReconcile picks this pass's exports: changed sessions
@@ -424,11 +445,13 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 	}
 	plan := openCodeReconcilePlan{recheck: map[string]bool{}}
 	retentionFloorMs := openCodeRetentionFloor(now).UnixMilli()
+	listed := map[string]bool{}
 	var fresh, retries []openCodeSessionRow
 	for _, row := range sessions {
 		if row.id == "" {
 			continue
 		}
+		listed[openCodeUsageHash(row.id, "")] = true
 		if row.updatedMs <= 0 {
 			plan.undatable++
 			continue
@@ -456,6 +479,17 @@ func planOpenCodeReconcile(ledger openCodeUsageLedger, sessions []openCodeSessio
 		}
 		if openCodeBeyondReconcileCursor(ledger, row.updatedMs, hash) {
 			fresh = append(fresh, row)
+		}
+	}
+	for _, entry := range ledger.Rechecks {
+		if entry.DueAtMs > now.UnixMilli() {
+			continue
+		}
+		// Not listed at all, or now remembered as over-cap: either way no
+		// export will ever reach the re-read's commit path to clear it, and the
+		// `skipped` retry owns the second case.
+		if _, held := stored[entry.SessionHash]; !listed[entry.SessionHash] || held {
+			plan.staleRechecks = append(plan.staleRechecks, entry.SessionHash)
 		}
 	}
 	sort.SliceStable(fresh, func(i, j int) bool { return fresh[i].updatedMs < fresh[j].updatedMs })
@@ -601,7 +635,12 @@ func openCodeRememberRecheckSession(ledger *openCodeUsageLedger, sessionID strin
 
 // openCodeForgetRecheckSession drops a session's re-read record.
 func openCodeForgetRecheckSession(ledger *openCodeUsageLedger, sessionID string) bool {
-	hash := openCodeUsageHash(sessionID, "")
+	return openCodeForgetRecheckHash(ledger, openCodeUsageHash(sessionID, ""))
+}
+
+// openCodeForgetRecheckHash drops a re-read record by hash — what the plan
+// carries for a record whose session the list no longer names.
+func openCodeForgetRecheckHash(ledger *openCodeUsageLedger, hash string) bool {
 	for i := range ledger.Rechecks {
 		if ledger.Rechecks[i].SessionHash != hash {
 			continue

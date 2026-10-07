@@ -87,6 +87,9 @@ func openCodeResetRunState() {
 	openCodeWorkerMu.Lock()
 	openCodeWorkerRunning, openCodeWorkerRearm = false, false
 	openCodeWorkerMu.Unlock()
+	// Stops the debt rung AND the settle retry, so a timer one row armed cannot
+	// fire into the next row's ledger.
+	stopOpenCodeRunDebtRetry()
 }
 
 // observeFixture feeds a testdata stream into a handle, line by line, exactly

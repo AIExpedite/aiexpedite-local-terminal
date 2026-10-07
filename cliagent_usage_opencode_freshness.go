@@ -139,6 +139,17 @@ var (
 		timer *time.Timer
 		gen   uint64
 	}
+	// openCodeSettleRetry is the ONE in-memory retry of a settle whose debt
+	// write was refused. It is not persisted: the file it would be persisted to
+	// is the one that could not be written.
+	openCodeSettleRetry struct {
+		mu           sync.Mutex
+		timer        *time.Timer
+		gen          uint64
+		floorMs      int64
+		completionMs int64
+		attempt      int
+	}
 	openCodeReconcileNudge struct {
 		mu     sync.Mutex
 		lastAt time.Time
@@ -173,6 +184,16 @@ func readOpenCodeUsageFreshness() openCodeUsageFreshness {
 // A missing or corrupt file reads as "nothing owed". Nothing under this lock
 // may take the ledger lock.
 func updateOpenCodeUsageFreshness(mutate func(*openCodeUsageFreshness)) openCodeUsageFreshness {
+	state, _ := updateOpenCodeUsageFreshnessChecked(mutate)
+	return state
+}
+
+// updateOpenCodeUsageFreshnessChecked is the same mutation, and also reports
+// whether the new state reached DISK — the mirror of updateOpenCodeUsageLedger.
+// Only the settle needs it: every other write here is best-effort scheduling
+// state, while the settle's debt is the one record that the run happened at all.
+// A mutation that changed nothing, or had nothing to write, counts as persisted.
+func updateOpenCodeUsageFreshnessChecked(mutate func(*openCodeUsageFreshness)) (openCodeUsageFreshness, bool) {
 	openCodeFreshnessMu.Lock()
 	defer openCodeFreshnessMu.Unlock()
 	path := openCodeUsageFreshnessPath()
@@ -182,16 +203,18 @@ func updateOpenCodeUsageFreshness(mutate func(*openCodeUsageFreshness)) openCode
 	}
 	before := state
 	mutate(&state)
-	if state == before || path == "" {
-		return state
+	if state == before {
+		return state, true
+	}
+	if path == "" {
+		return state, false
 	}
 	if state.RunFloorMs == 0 && !state.owed() && state.LastAttemptAtMs == 0 {
 		_ = os.Remove(path)
-		return state
+		return state, true
 	}
 	state.SchemaVersion = openCodeUsageFreshnessSchema
-	_ = writeJSONFileAtomic(path, state)
-	return state
+	return state, writeJSONFileAtomic(path, state)
 }
 
 // openCodeRebaseFutureFreshness pulls back timestamps a backwards clock step
@@ -337,18 +360,124 @@ func settleOpenCodeUsageRun(floor time.Time, covered bool, label string) bool {
 		})
 		return false
 	}
-	state := updateOpenCodeUsageFreshness(func(state *openCodeUsageFreshness) {
-		openCodeOweReconcile(state, now, completionMs)
-		if state.RunFloorMs < floorMs {
-			state.RunFloorMs = floorMs
-		}
-	})
+	state, persisted := openCodeWriteOwedDebt(floorMs, completionMs, now)
+	if !persisted {
+		// The debt is the ONLY record that this run's figures are missing, and
+		// the worker reads it back from disk — so a refused write (a read-only
+		// or full config dir, which is also what makes a covered run's ledger
+		// write fail and land it here) would lose the run silently. The debt is
+		// retried in memory until the filesystem recovers.
+		logOpenCodeUsage("debt write refused by=%s", label)
+		openCodeArmSettleRetry(floorMs, completionMs, label, 1)
+		return false
+	}
 	if !state.owed() {
 		return false
 	}
 	logOpenCodeUsage("owed by=%s attempts=%d", label, state.Attempts)
 	startOpenCodeReconcileWorker()
 	return true
+}
+
+// openCodeWriteOwedDebt opens (or moves forward) the pending debt for a run
+// that ended uncovered, and reports whether it reached disk.
+func openCodeWriteOwedDebt(floorMs, completionMs int64, now time.Time) (openCodeUsageFreshness, bool) {
+	return updateOpenCodeUsageFreshnessChecked(func(state *openCodeUsageFreshness) {
+		openCodeOweReconcile(state, now, completionMs)
+		if state.RunFloorMs < floorMs {
+			state.RunFloorMs = floorMs
+		}
+	})
+}
+
+// openCodeArmSettleRetry re-attempts a settle whose freshness write was
+// refused, on the debt ladder's own delays and for its own attempt budget.
+//
+// There is ONE pending retry, because there is one pending debt: a second
+// refused settle folds into it, keeping the OLDEST floor (the earliest run
+// still unaccounted for) and the NEWEST completion (the pass that pays it must
+// finish after the last of them) — exactly what openCodeOweReconcile would have
+// merged on disk.
+//
+// A shutdown stops it: the state it would write is the state the next process
+// adopts, and that process re-reads the same unsettled floor from the ledger
+// arm — which is itself a write that failed on a filesystem this broken, so
+// there is nothing left to hand over.
+func openCodeArmSettleRetry(floorMs, completionMs int64, label string, attempt int) {
+	delay, ok := refreshRetryDelayForAttempt(attempt, openCodeRunDebtMaxAttempts, openCodeRunDebtRetryLadder)
+	if !ok || IsShutdownInProgress() {
+		logOpenCodeUsage("debt write gave up attempts=%d", attempt)
+		return
+	}
+	r := &openCodeSettleRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+		// Fold into the pending retry rather than racing it.
+		if r.floorMs > 0 && r.floorMs < floorMs {
+			floorMs = r.floorMs
+		}
+		if r.completionMs > completionMs {
+			completionMs = r.completionMs
+		}
+		if r.attempt > attempt {
+			attempt = r.attempt
+		}
+	}
+	r.gen++
+	gen, label := r.gen, openCodeUsageRunLabel(label)
+	r.floorMs, r.completionMs, r.attempt = floorMs, completionMs, attempt
+	r.timer = time.AfterFunc(delay, func() {
+		openCodeRetrySettleFired(gen, floorMs, completionMs, label, attempt)
+	})
+}
+
+func openCodeRetrySettleFired(gen uint64, floorMs, completionMs int64, label string, attempt int) {
+	r := &openCodeSettleRetry
+	r.mu.Lock()
+	stale := gen != r.gen
+	if !stale {
+		r.timer = nil
+	}
+	r.mu.Unlock()
+	if stale || IsShutdownInProgress() {
+		return
+	}
+	openCodeFreshnessInFlight.Add(1)
+	defer openCodeFreshnessInFlight.Add(-1)
+	state, persisted := openCodeWriteOwedDebt(floorMs, completionMs, openCodeUsageNow())
+	if !persisted {
+		openCodeArmSettleRetry(floorMs, completionMs, label, attempt+1)
+		return
+	}
+	if !state.owed() {
+		return
+	}
+	logOpenCodeUsage("owed by=%s attempts=%d", label, state.Attempts)
+	startOpenCodeReconcileWorker()
+}
+
+// stopOpenCodeSettleRetry withdraws a pending settle retry. Part of teardown.
+func stopOpenCodeSettleRetry() {
+	r := &openCodeSettleRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.gen++
+	r.floorMs, r.completionMs, r.attempt = 0, 0, 0
+}
+
+// openCodeSettleRetryPending reports whether a settle retry is armed. Test seam.
+func openCodeSettleRetryPending() bool {
+	r := &openCodeSettleRetry
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timer != nil
 }
 
 // settleOpenCodeUsageRunAsync settles off the caller's goroutine — an exit path
@@ -630,7 +759,14 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 		// continuation booked — and never touches the chain's failure count,
 		// which belongs to the no-debt path below.
 		clearOpenCodeContinuationDue()
-		if openCodeReconcileSucceeded(outcome) || outcome == openCodeReconcileUnsupported {
+		if openCodeReconcileSucceeded(outcome) {
+			// The debt is paid, so the ladder is done: a re-read the pass
+			// booked for a session it may have caught mid-turn is now the only
+			// thing left to run, and needs the timer the ladder gave back.
+			openCodeBookRecheckWakeUp(now)
+			return
+		}
+		if outcome == openCodeReconcileUnsupported {
 			return
 		}
 		kind := openCodeRetryAfterPass
@@ -653,6 +789,9 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 	switch {
 	case openCodeReconcileSucceeded(outcome), outcome == openCodeReconcileUnsupported:
 		updateOpenCodeUsageLedgerContinuation(false, 0, 0)
+		if openCodeReconcileSucceeded(outcome) {
+			openCodeBookRecheckWakeUp(now)
+		}
 
 	case outcome == openCodeReconcileMore:
 		// Progress with candidates remaining: keep draining, free of charge —
@@ -685,6 +824,42 @@ func openCodeBookAfterOutcome(hadDebt bool, outcome string, now time.Time) {
 			now.Sub(time.UnixMilli(firstFailureAtMs)),
 			openCodeRunDebtFreeRetryDelay, openCodeRunDebtRetryLadder)))
 	}
+}
+
+// openCodeBookRecheckWakeUp books one pass for the earliest re-read a
+// successful pass left behind. A re-read record is consumed only by a pass that
+// runs after it comes due, and a not-yet-due record is deliberately left out of
+// `remaining` — so without a timer of its own a re-read would wait for whatever
+// happens to trigger the next pass. A gather that nudges before the record is
+// due is exactly the case that strands it: that pass ends no_change and carries
+// LastPassStartedAtMs past the turn's final directory mtime, after which no
+// later gather sees a store change at all.
+//
+// It rides the continuation, which is the no-debt timer and is already bounded
+// by the chain's pass budget; only a SUCCESSFUL pass books it, so a failing
+// chain that has given up cannot be restarted by a record its failures never
+// consumed.
+func openCodeBookRecheckWakeUp(now time.Time) bool {
+	if IsShutdownInProgress() {
+		return false
+	}
+	ledger := readOpenCodeUsageLedger()
+	dueAtMs, ok := openCodeEarliestRecheckDueMs(ledger)
+	if !ok {
+		return false
+	}
+	if ledger.ContinuationPasses >= openCodeContinuationMaxPasses {
+		updateOpenCodeUsageLedgerContinuation(false, 0, 0)
+		openCodeMarkPartialIfBacklogged()
+		return false
+	}
+	updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+	// The due time is the base delay, and the pass spacing is the floor — the
+	// same rule every other booking here follows.
+	openCodeArmContinuation(openCodeSpacedDelay(readOpenCodeUsageFreshness(), now,
+		time.UnixMilli(dueAtMs).Sub(now)))
+	logOpenCodeUsage("recheck booked")
+	return true
 }
 
 // clearOpenCodeContinuationDue retires the booked continuation and leaves the
@@ -858,6 +1033,7 @@ func openCodeRunDebtRetryFired(gen uint64, id *openCodeDebtID) {
 // stopOpenCodeRunDebtRetry cancels the pending rung. Called from
 // gracefulShutdown; the schedule is on disk and the next process re-arms it.
 func stopOpenCodeRunDebtRetry() {
+	stopOpenCodeSettleRetry()
 	t := &openCodeRunDebtRetryTimer
 	t.mu.Lock()
 	defer t.mu.Unlock()

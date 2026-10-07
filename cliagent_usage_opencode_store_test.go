@@ -1384,3 +1384,76 @@ func TestOpenCodeReconcile_BooksNoReReadForASessionAlreadyFinished(t *testing.T)
 		t.Fatal("a finished session must not be exported a second time")
 	}
 }
+
+func TestOpenCodeReconcile_ForgetsAReReadNoSessionCanEverClear(t *testing.T) {
+	// A re-read record is cleared by the export that commits it. A session the
+	// list no longer names — deleted, or moved out of a layout we can read —
+	// will never reach that commit, and a record that cannot be cleared would
+	// book a wake-up for itself on every successful pass until the retention
+	// prune dropped it two days later. The pass drops it instead.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	advance := openCodeUsageFixture(t, now)
+	stamp := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_live", stamp}),
+		exports: map[string]string{
+			"ses_live": exportWith("ses_live", "msg_live", stamp, 10, 1, "0"),
+		},
+	}).install(t)
+
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileOK {
+		t.Fatalf("first outcome = %q, want ok", first.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 1 {
+		t.Fatalf("rechecks = %d, want the one booked for a session that may still be running", len(ledger.Rechecks))
+	}
+
+	// OpenCode no longer lists it, and the re-read is due.
+	stub.sessions = "[]"
+	later := now.Add(openCodeRecheckDelay + time.Second)
+	advance(later)
+	if due := reconcileOpenCodeUsageOnce(context.Background(), later); due.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("due outcome = %q, want no_change", due.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
+		t.Fatalf("rechecks = %+v, want the unclearable record dropped", ledger.Rechecks)
+	}
+}
+
+func TestOpenCodeReconcile_ForgetsAReReadTheSkippedRetryNowOwns(t *testing.T) {
+	// The same, for a session that has since gone over the stdout cap: the
+	// `skipped` queue owns it from then on, keyed on `updated`, and the
+	// over-cap commit path never reaches the re-read's commit.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	advance := openCodeUsageFixture(t, now)
+	stamp := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_live", stamp}),
+		exports: map[string]string{
+			"ses_live": exportWith("ses_live", "msg_live", stamp, 10, 1, "0"),
+		},
+	}).install(t)
+	if first := reconcileOpenCodeUsageOnce(context.Background(), now); first.Outcome != openCodeReconcileOK {
+		t.Fatalf("first outcome = %q, want ok", first.Outcome)
+	}
+
+	// It grew past the cap and was written again, so it is a `skipped` retry.
+	stub.oversize = map[string]bool{"ses_live": true}
+	grown := now.Add(time.Minute)
+	advance(grown)
+	stub.sessions = sessionList(openCodeSessionRow{"ses_live", grown.UnixMilli()})
+	if over := reconcileOpenCodeUsageOnce(context.Background(), grown); !openCodeReconcileSucceeded(over.Outcome) {
+		t.Fatalf("over-cap outcome = %q, want a success", over.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Skipped) != 1 {
+		t.Fatalf("skipped = %+v, want the over-cap session remembered", ledger.Skipped)
+	}
+	due := grown.Add(openCodeRecheckDelay + time.Second)
+	advance(due)
+	if pass := reconcileOpenCodeUsageOnce(context.Background(), due); !openCodeReconcileSucceeded(pass.Outcome) {
+		t.Fatalf("outcome = %q, want a success", pass.Outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
+		t.Fatalf("rechecks = %+v, want the record left to the skipped retry dropped", ledger.Rechecks)
+	}
+}

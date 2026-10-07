@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -335,11 +336,16 @@ func TestOpenCodeContinuation_DrainsABacklogWithNoDebtOpen(t *testing.T) {
 	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
 	openCodeDebtFixture(t, now)
 	created := now.UnixMilli()
+	// The sessions were last written well before the pass, so none of them can
+	// have been mid-turn and none books a re-read: this row is about the
+	// BACKLOG draining, and a booked re-read would keep the chain open for a
+	// reason of its own.
+	settledMs := now.Add(-(openCodeSessionMaybeActiveWindow + time.Minute)).UnixMilli()
 	exports := map[string]string{}
 	rows := make([]openCodeSessionRow, 0, 5)
 	for i := 0; i < 5; i++ {
 		id := fmt.Sprintf("ses_%d", i)
-		rows = append(rows, openCodeSessionRow{id, created + int64(i+1)*1000})
+		rows = append(rows, openCodeSessionRow{id, settledMs + int64(i+1)*1000})
 		exports[id] = exportWith(id, fmt.Sprintf("msg_%d", i), created, 10, 0, "0")
 	}
 	(&openCodeCLIStub{sessions: sessionList(rows...), exports: exports}).install(t)
@@ -970,4 +976,105 @@ func TestOpenCodeContinuation_OfflineKeepsTheChainAndBacksOffWithTheOutage(t *te
 	if done.ContinuationDue || done.ContinuationFirstFailureAtMs != 0 || done.ContinuationFailures != 0 {
 		t.Fatalf("ledger = %+v, want a finished chain to forget the outage", done)
 	}
+}
+
+func TestOpenCodeRecheck_BooksItsOwnPassAndRunsIt(t *testing.T) {
+	// A pass that may have caught a session mid-turn books ONE re-read, due
+	// two minutes later — and a not-yet-due record is deliberately left out of
+	// `remaining`, so the pass that books it ends ok and books no continuation
+	// of its own. Without a wake-up the record would then wait for whatever
+	// happened to trigger the next pass: a gather that nudges before it is due
+	// ends no_change and carries lastPassStartedAtMs past the turn's final
+	// directory mtime, after which no later gather sees a store change at all.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	advance := openCodeDebtFixture(t, now)
+	stamp := now.UnixMilli()
+	stub := (&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_live", stamp}),
+		exports: map[string]string{
+			"ses_live": exportWith("ses_live", "msg_live", stamp, 10, 1, "0"),
+		},
+	}).install(t)
+
+	// A Refresh click: no debt, no continuation.
+	if outcome := openCodePayReconcile(context.Background(), true); outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok", outcome)
+	}
+	ledger := readOpenCodeUsageLedger()
+	if len(ledger.Rechecks) != 1 {
+		t.Fatalf("rechecks = %+v, want the one booked for a session that may still be running", ledger.Rechecks)
+	}
+	if !ledger.ContinuationDue || !openCodeRunDebtRetryPending() {
+		t.Fatalf("continuationDue = %v pending = %v, want a pass booked for the re-read",
+			ledger.ContinuationDue, openCodeRunDebtRetryPending())
+	}
+
+	// And that booked pass is what reads the rest of the turn back — with no
+	// nudge, no debt and no new store write to notice.
+	stub.exports["ses_live"] = `{"messages":[` +
+		strings.TrimPrefix(strings.TrimSuffix(exportWith("ses_live", "msg_live", stamp, 10, 1, "0"), "]}"), `{"messages":[`) +
+		`,` + strings.TrimSuffix(strings.TrimPrefix(exportWith("ses_live", "msg_tail", stamp, 40, 4, "0"), `{"messages":[`), "]}") +
+		`]}`
+	later := now.Add(openCodeRecheckDelay + time.Second)
+	advance(later)
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileOK {
+		t.Fatalf("booked outcome = %q, want ok", outcome)
+	}
+	if tokens, _, rows := todayTotals(t, later); tokens != 55 || rows != 2 {
+		t.Fatalf("tokens=%d rows=%d, want 55/2 once the rest of the turn is counted", tokens, rows)
+	}
+	// The re-read that raised nothing retires the record, and with it the
+	// chain: a quiet session costs no further pass.
+	quiet := later.Add(openCodeRecheckDelay + time.Second)
+	advance(quiet)
+	if outcome := openCodePayReconcile(context.Background(), false); outcome != openCodeReconcileOK {
+		t.Fatalf("quiet outcome = %q, want ok", outcome)
+	}
+	if ledger := readOpenCodeUsageLedger(); ledger.ContinuationDue || len(ledger.Rechecks) != 0 {
+		t.Fatalf("ledger = continuationDue %v rechecks %+v, want the chain finished",
+			ledger.ContinuationDue, ledger.Rechecks)
+	}
+}
+
+func TestOpenCodeSettle_RetriesADebtWhoseWriteWasRefused(t *testing.T) {
+	// The debt is the ONLY record that an uncovered run's figures are missing,
+	// and the worker reads it back from DISK. A refused write — the read-only
+	// or full config dir that also makes a covered run's ledger write fail and
+	// land it here — would otherwise lose the run: the worker would reread the
+	// old file, see no debt and exit, leaving neither a debt nor a retry.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	// An export that cannot launch, so the worker the retry starts can never
+	// PAY the debt out from under the assertion below.
+	(&openCodeCLIStub{sessions: sessionList(openCodeSessionRow{"ses_a", now.UnixMilli()}),
+		launchError: true}).install(t)
+
+	good := os.Getenv(openCodeUsageFreshnessEnv)
+	// A parent that is a FILE: every atomic write under it is refused.
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageFreshnessEnv, filepath.Join(blocked, "opencode_usage_freshness.json"))
+
+	if owed := settleOpenCodeUsageRun(now, false, "execute"); owed {
+		t.Fatal("a refused write must not report a debt that never reached disk")
+	}
+	if !openCodeSettleRetryPending() {
+		t.Fatal("a refused debt write must leave a retry armed")
+	}
+
+	// The filesystem recovers; the armed retry is what puts the debt on disk.
+	t.Setenv(openCodeUsageFreshnessEnv, good)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if readOpenCodeFreshness(t).owed() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if state := readOpenCodeFreshness(t); !state.owed() {
+		t.Fatalf("freshness = %+v, want the debt retried onto disk", state)
+	}
+	openCodeUsageRefreshWaitFor(2 * time.Second)
 }

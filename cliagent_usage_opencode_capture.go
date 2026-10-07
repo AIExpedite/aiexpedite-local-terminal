@@ -1203,3 +1203,21 @@ func resetOpenCodeUsageLedgerForTests() {
 	openCodeGenerationRotated.Store(false)
 	openCodeProcessGenerationEpoch.Store(openCodeDrawGenerationEpoch())
 }
+
+// openCodeEarliestRecheckDueMs is the soonest clock at which a remembered
+// re-read may spend an export, and whether any is remembered at all. The
+// freshness worker books a pass for it: a record is consumed only by a pass
+// that happens to run after it comes due, so without a wake-up of its own a
+// re-read booked for a session nothing else disturbs again would be stranded.
+func openCodeEarliestRecheckDueMs(ledger openCodeUsageLedger) (int64, bool) {
+	earliest, found := int64(0), false
+	for _, entry := range ledger.Rechecks {
+		if entry.SessionHash == "" {
+			continue
+		}
+		if !found || entry.DueAtMs < earliest {
+			earliest, found = entry.DueAtMs, true
+		}
+	}
+	return earliest, found
+}

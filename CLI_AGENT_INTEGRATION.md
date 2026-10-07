@@ -2320,7 +2320,18 @@ nothing to fence a debt to, which is also why a generic engine was left out.
   rides the same single revisit slot as an over-cap retry, and is booked again
   only when it RAISED a figure — the one proof the turn was still running — so a
   quiet session costs exactly one extra export and the max-merge makes the repeat
-  idempotent.
+  idempotent. A record is only ever consumed by a pass that runs after it comes
+  due, and a not-yet-due record is deliberately NOT part of `remaining` — so a
+  SUCCESSFUL pass that leaves one behind books a continuation for its due time
+  (`openCodeBookRecheckWakeUp`). Without that the record would wait for whatever
+  happened to trigger the next pass: a gather nudging before the due time ends
+  `no_change` and carries `lastPassStartedAtMs` past the turn's final directory
+  mtime, after which no later gather sees a store change at all. Only a
+  successful pass books it, so a failing chain that has given up cannot be
+  restarted by a record its failures never consumed; and a record no export can
+  ever clear — its session is no longer listed, or is now held as over-cap and
+  belongs to the `skipped` retry — is dropped by the pass rather than booking a
+  wake-up for itself until the retention prune.
 
 ### Discover, and survive
 
@@ -2376,6 +2387,14 @@ reading, never a run — but "best-effort" is not the same answer everywhere:
   Neither success outcome may stand in for it: `ok` licenses the zero row and
   stamps `lastSuccessfulReconcileAtMs`, and `no_change` would PAY the run debt
   for figures that never reached disk, losing the automatic retry.
+- The **debt** the settle then writes (`opencode_usage_freshness.json`) is the
+  only record that the run's figures are missing, and the worker reads it back
+  from DISK — so a refused write there is not best-effort either: the debt is
+  retried IN MEMORY (`openCodeArmSettleRetry`, the debt ladder's own delays and
+  attempt budget, one pending retry that folds the oldest floor with the newest
+  completion) until the filesystem recovers. This is exactly the case a refused
+  ledger write lands in, since the same read-only or full config dir causes
+  both.
 - Everywhere else (a pass stamp, the continuation flags) a refused write costs
   one reading and the next pass re-establishes it.
 
