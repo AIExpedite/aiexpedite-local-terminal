@@ -295,6 +295,12 @@ func claudeStaleMirrorFixture(t *testing.T) (cache string, svc *fakeObservedHint
 	var healthy *atomic.Bool
 	cache, healthy = armPostUpdateEndpoint(t)
 	healthy.Store(true)
+	// A run whose own attempt lost a race books a real retry rung: never let
+	// it fire inside a later test.
+	t.Cleanup(func() {
+		stopClaudeRunDebtRetry()
+		claudeFreshnessWaitIdle(t)
+	})
 	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Minute))
 	snap := claudeCacheSnapshot(t, cache)
 	preRun = gen(snap.GenerationEpoch, snap.Generation)
