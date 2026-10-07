@@ -851,3 +851,41 @@ func TestOpenCodeTap_AStartedRunIsSettledOnEveryExitRoute(t *testing.T) {
 		})
 	}
 }
+
+// A ledger write is best-effort everywhere else in this feature — a pass stamp
+// or a continuation flag that does not land costs a reading — but on the settle
+// it is the ONLY copy of the run's figures: the handle is consumed, so a
+// refused write (a read-only or full data dir) loses them for good unless the
+// run owes the reconcile that can read them back.
+func TestOpenCodeTap_ARefusedLedgerWriteMakesACoveredRunOweAReconcile(t *testing.T) {
+	now := openCodeFixtureRunAt
+	openCodeUsageFixture(t, now)
+
+	// A regular file where a directory would have to be: MkdirAll refuses, so
+	// writeJSONFileAtomic fails exactly as it would on a read-only data dir.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(blocker, "opencode_usage.json"))
+
+	handle := armOpenCodeUsageRun("native chat")
+	observeFixture(t, handle, "run_two_steps.jsonl")
+	// A CLEAN end: without the fix this reports covered and the figures are
+	// silently gone.
+	if owed := handle.Finish(true); !owed {
+		t.Fatal("a covered run whose ledger write was refused must owe a reconcile")
+	}
+	openCodeUsageRefreshWaitFor(5 * time.Second)
+
+	var freshness openCodeUsageFreshness
+	readJSONFile(openCodeUsageFreshnessPath(), &freshness)
+	if !freshness.owed() {
+		t.Fatalf("freshness = %+v, want the debt that recovers the lost figures", freshness)
+	}
+	// Nothing was persisted, which is the premise: the reconcile is the only
+	// path back to the numbers.
+	if _, _, rows := todayTotals(t, now); rows != 0 {
+		t.Fatalf("rows = %d, want none — the write was refused", rows)
+	}
+}

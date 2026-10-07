@@ -917,7 +917,7 @@ func (h *openCodeRunUsage) Finish(cleanEnd bool) bool {
 
 	commitMs := openCodeUsageNow().UnixMilli()
 	if len(observations) > 0 || covered {
-		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			totals := openCodeMergeObservations(l, observations, commitMs)
 			changed := totals
 			if covered {
@@ -929,6 +929,17 @@ func (h *openCodeRunUsage) Finish(cleanEnd bool) bool {
 			}
 			return openCodeLedgerEdit{Changed: changed, TotalsChanged: totals}
 		})
+		// A ledger write is best-effort everywhere ELSE in this feature — a
+		// pass stamp or a continuation flag that does not land costs a reading.
+		// Here it is the ONLY copy of this run's figures: the handle is
+		// consumed, so a refused write (a read-only or full data dir) loses
+		// them for good. A covered run whose merge did not land is therefore
+		// not covered: it owes the reconcile that can read them back from
+		// OpenCode's own store.
+		if !persisted {
+			covered = false
+			logOpenCodeUsage("ledger write refused by=%s", h.label)
+		}
 	}
 	return settleOpenCodeUsageRun(h.floor, covered, h.label)
 }

@@ -198,6 +198,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 		}
 		observations, filled, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
 		result.Exported++
+		landed := false
 		if outcome != "" {
 			// A timeout, a launch failure or unrecognised output mid-pass: stop,
 			// keeping whatever landed before it.
@@ -205,7 +206,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			return openCodeFinishPass(result)
 		}
 		commitMs := openCodeUsageNow().UnixMilli()
-		_, _ = updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			edit := openCodeLedgerEdit{}
 			if filled {
 				// The export was over the cap, so it merged nothing. A session
@@ -229,10 +230,16 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 				edit.Changed = true
 			}
 			if edit.Changed || edit.TotalsChanged {
-				committed = true
+				landed = true
 			}
 			return edit
 		})
+		// `committed` means it reached DISK: a refused write leaves the cursor
+		// where it was, so the session is still a candidate and the pass must
+		// not report ok.
+		if landed && persisted {
+			committed = true
+		}
 		settled++
 	}
 

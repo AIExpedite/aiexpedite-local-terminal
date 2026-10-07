@@ -2321,6 +2321,22 @@ stays global. terminal-service answers for the providers in
 (`cliUsageObservedDispatchedAtByProvider.opencode`), so an OpenCode hint can
 never burn Codex's.
 
+### When a ledger write is refused
+
+Every ledger write is best-effort — a read-only or full data dir costs a
+reading, never a run — but "best-effort" is not the same answer everywhere:
+
+- On a **settle** the write is the ONLY copy of the run's figures (the handle is
+  consumed), so a covered run whose merge did not land is NOT covered: it owes
+  the reconcile that can read them back from OpenCode's own store.
+- On a **reconcile commit**, `committed` means it reached disk. A refused write
+  leaves the cursor where it was, so the session is still a candidate and the
+  pass reports `no_change` rather than `ok` — `ok` is what licenses the zero row
+  and stamps `lastSuccessfulReconcileAtMs`, and neither may claim a complete
+  reading of a day nothing was written for.
+- Everywhere else (a pass stamp, the continuation flags) a refused write costs
+  one reading and the next pass re-establishes it.
+
 ### Redaction allowlist
 
 The two state files (`opencode_usage.json`, `opencode_usage_freshness.json`,

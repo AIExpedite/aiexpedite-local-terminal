@@ -771,3 +771,36 @@ func TestOpenCodeReconcile_StopsSpawningChildrenDuringShutdown(t *testing.T) {
 		t.Fatalf("tokens = %d, want the committed export's 4", tokens)
 	}
 }
+
+func TestOpenCodeReconcile_ARefusedCommitIsNotReportedAsOk(t *testing.T) {
+	// `committed` decides the pass outcome, and `ok` is what licenses the zero
+	// row and stamps lastSuccessfulReconcileAtMs. A refused write leaves the
+	// cursor where it was, so the session is still a candidate: reporting ok
+	// would claim a complete reading of a day nothing was written for.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(openCodeUsageLedgerEnv, filepath.Join(blocker, "opencode_usage.json"))
+
+	(&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_a", now.UnixMilli()}),
+		exports: map[string]string{
+			"ses_a": exportWith("ses_a", "msg_a", now.UnixMilli(), 9, 1, "0"),
+		},
+	}).install(t)
+
+	result := reconcileOpenCodeUsageOnce(context.Background(), now)
+	if result.Outcome == openCodeReconcileOK {
+		t.Fatal("a pass whose every write was refused must not report ok")
+	}
+	if result.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("outcome = %q, want no_change", result.Outcome)
+	}
+	// And nothing is on record to license a zero row.
+	if metrics, _, _ := openCodeLedgerMetrics(now); len(metrics) != 0 {
+		t.Fatalf("metrics = %+v, want none", metrics)
+	}
+}
