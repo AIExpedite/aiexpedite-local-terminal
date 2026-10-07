@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -236,6 +237,21 @@ type MachineInfo struct {
 	// recompute Tools without keeping a stale or removed catalog id
 	// (setup_tool_catalog.go withSetupToolResults). Not serialized.
 	baseTools map[string]string
+
+	// gatherSeq orders gathers by when they STARTED (nextMachineInfoGatherSeq,
+	// assigned before any probe runs). CollectedAt has one-second resolution,
+	// so two gathers started in the same second carry the same stamp; the
+	// sequence still tells them apart (storeMachineInfoIfNotOlder). 0 = not
+	// from a gather (fixtures). Not serialized.
+	gatherSeq uint64
+}
+
+// machineInfoGatherSeq is the last sequence handed to a gather.
+var machineInfoGatherSeq atomic.Uint64
+
+// nextMachineInfoGatherSeq returns the sequence for a gather starting now.
+func nextMachineInfoGatherSeq() uint64 {
+	return machineInfoGatherSeq.Add(1)
 }
 
 /* --------------------------------------------------------------------------
@@ -288,7 +304,7 @@ func SetCachedCLIAgents(usage []cliAgentUsage) {
 // The 6h periodic gather started by StartMachineInfoGathering remains
 // the source of truth for the full MachineInfo cache.
 func RefreshMachineInfoNow() {
-	storeMachineInfo(gatherMachineInfo())
+	storeMachineInfoIfNotOlder(gatherMachineInfo())
 }
 
 // storeMachineInfo replaces the cached MachineInfo. Every writer goes through
@@ -355,21 +371,39 @@ func machineInfoCollectedAt(info *MachineInfo) (time.Time, bool) {
 	return at, true
 }
 
+// machineInfoStartedAfter reports whether gather info started after the one
+// in current, i.e. may replace it. Gathers are ordered by gatherSeq; the
+// second-resolution CollectedAt is only the fallback for info not made by a
+// gather (gatherSeq 0), and a tie there keeps current.
+func machineInfoStartedAfter(info, current *MachineInfo) bool {
+	if current == nil || info == current {
+		return true
+	}
+	if info.gatherSeq != 0 && current.gatherSeq != 0 {
+		return info.gatherSeq > current.gatherSeq
+	}
+	curAt, ok := machineInfoCollectedAt(current)
+	if !ok {
+		return true // nothing to order against
+	}
+	newAt, ok := machineInfoCollectedAt(info)
+	return ok && newAt.After(curAt)
+}
+
 // storeMachineInfoIfNotOlder stores info unless the cache already holds a
-// gather that started later. An inspection's gather can finish after its
-// inspection gave up on it, by which time a newer gather may be cached; the
-// late one must not roll the cache back. The check and the swap happen under
-// one lock. Reports whether it stored.
+// gather that started later (machineInfoStartedAfter). A gather can finish
+// after a newer one was cached — an inspection's gather left running past its
+// deadline, or a periodic gather overlapping a refresh; the late one must not
+// roll the cache back or fire the post-store hook with older details. The
+// check and the swap happen under one lock. Reports whether it stored.
 func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 	if info == nil {
 		return false
 	}
 	machineInfoMu.Lock()
-	if curAt, ok := machineInfoCollectedAt(machineInfoCache); ok {
-		if newAt, ok := machineInfoCollectedAt(info); ok && curAt.After(newAt) {
-			machineInfoMu.Unlock()
-			return false
-		}
+	if !machineInfoStartedAfter(info, machineInfoCache) {
+		machineInfoMu.Unlock()
+		return false
 	}
 	machineInfoCache = info
 	machineInfoMu.Unlock()
@@ -407,7 +441,7 @@ func drainMachineInfoGathers(timeout time.Duration) bool {
 func StartMachineInfoGathering() {
 	go func() {
 		for {
-			storeMachineInfo(gatherMachineInfo())
+			storeMachineInfoIfNotOlder(gatherMachineInfo())
 			// The setupToolCatalog pass runs AFTER the gather is stored, never
 			// inside it, so it cannot delay the data the first /auth/token
 			// request is waiting for (setup_tool_catalog.go).
@@ -449,6 +483,7 @@ func gatherMachineInfoBounded(usageBudget time.Duration) *MachineInfo {
 		PackageManagers: map[string]string{},
 		Tools:           map[string]string{},
 		CollectedAt:     time.Now().UTC().Format(time.RFC3339),
+		gatherSeq:       nextMachineInfoGatherSeq(),
 	}
 
 	// The setup-checklist probes (gh / firebase / terraform, the OS package

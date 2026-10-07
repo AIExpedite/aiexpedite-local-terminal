@@ -247,3 +247,54 @@ func TestAwaitCLIAgentUsage_BudgetFallsBackToCachedUsage(t *testing.T) {
 		t.Fatalf("an unbounded wait must return the pass's own result, got %+v", got)
 	}
 }
+
+// sequencedMachine is a gather result as gatherMachineInfoBounded makes it:
+// stamped at second resolution, ordered by its start sequence.
+func sequencedMachine(at time.Time) *MachineInfo {
+	info := stampedMachine(healthyMachine(), at)
+	info.gatherSeq = nextMachineInfoGatherSeq()
+	return info
+}
+
+func TestStoreMachineInfoIfNotOlder_SameSecondOrdersByStartSequence(t *testing.T) {
+	isolateMachineInfo(t)
+	second := time.Now().Truncate(time.Second)
+	earlier := sequencedMachine(second) // started first ...
+	later := sequencedMachine(second)   // ... in the same second
+	if earlier.CollectedAt != later.CollectedAt {
+		t.Fatalf("fixture: both gathers must carry the same second-resolution stamp")
+	}
+
+	cacheMachineInfo(later)
+	if storeMachineInfoIfNotOlder(earlier) {
+		t.Fatal("a gather that started earlier in the same second must not replace the newer cache")
+	}
+	if cachedMachineInfo() != later {
+		t.Fatal("the cache was rolled back to the earlier gather")
+	}
+
+	// The other order still stores.
+	cacheMachineInfo(earlier)
+	if !storeMachineInfoIfNotOlder(later) || cachedMachineInfo() != later {
+		t.Fatal("a gather that started later must replace the cache")
+	}
+}
+
+func TestGatherReadinessOnly_LateGatherSameSecondDoesNotRollBackNewerCache(t *testing.T) {
+	isolateMachineInfo(t)
+	second := time.Now().Truncate(time.Second)
+	release := make(chan struct{})
+	late := sequencedMachine(second) // the inspection's gather starts first
+	withInspectionSeams(t, blockingGather(release, late), noSetupToolPass)
+
+	_ = inspectWithin(30 * time.Millisecond)
+	newer := sequencedMachine(second) // a refresh starts later in the same second and lands first
+	cacheMachineInfo(newer)
+	close(release)
+	if !drainMachineInfoGathers(5 * time.Second) {
+		t.Fatal("the abandoned gather did not finish")
+	}
+	if cachedMachineInfo() != newer {
+		t.Fatal("a late gather started earlier in the same second must not replace the newer cache")
+	}
+}
