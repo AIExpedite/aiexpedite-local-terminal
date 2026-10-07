@@ -90,7 +90,7 @@ func TestClaudeRowsAdvanced(t *testing.T) {
 	}{
 		{"unchanged", []int64{10, 20}, []int64{10, 20}, false},
 		{"a row advanced", []int64{10, 25}, []int64{10, 20}, true},
-		{"a row went backwards", []int64{10, 15}, []int64{10, 20}, false},
+		{"a row fell back to an older observation", []int64{10, 15}, []int64{10, 20}, true},
 		{"a numeric row cleared", []int64{10, 0}, []int64{10, 20}, true},
 		{"an unknown row stays unknown", []int64{10, 0}, []int64{10, 0}, false},
 		{"a new row appeared", []int64{10, 20, 5}, []int64{10, 20}, true},

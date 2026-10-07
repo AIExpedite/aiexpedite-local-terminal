@@ -282,6 +282,38 @@ func TestClaudeDirectRunScan_FutureEvidenceIsReconsideredOnceTheClockCatchesUp(t
 	}
 }
 
+// Evidence deferred by the quiet window is not marked as handled: once the
+// window ends, while the run is still inside the age limit, it is owed.
+func TestClaudeDirectRunScan_QuietEvidenceIsReconsideredAfterTheWindow(t *testing.T) {
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-2*time.Hour))
+	quietUntil := now.Add(time.Hour)
+	mutateClaudeRateLimitSnapshot(cache, currentClaudeAccountFingerprint(), func(snap *claudeRateLimitSnapshot) bool {
+		snap.DirectRunQuietUntilMs = quietUntil.UnixMilli()
+		return true
+	})
+	evidence := now.Add(-time.Minute).Truncate(time.Second)
+	writeClaudeTranscript(t, configDir, "-p", "s.jsonl", evidence)
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+
+	claudeScanDirectRuns(now)
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("evidence was owed inside the quiet window: %+v", snap)
+	}
+
+	claudeScanDirectRuns(quietUntil.Add(time.Minute))
+	claudeFreshnessWaitIdle(t)
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != evidence.UnixMilli() {
+		t.Fatalf("debt=%d, want the run owed once the quiet window ended", snap.RefreshOwedAtMs)
+	}
+}
+
 // A future-dated transcript does not mask a real run behind it: the scan owes
 // the newest transcript inside the skew ceiling.
 func TestClaudeDirectRunScan_AFutureTranscriptDoesNotMaskARealRun(t *testing.T) {

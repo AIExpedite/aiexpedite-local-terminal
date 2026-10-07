@@ -177,8 +177,10 @@ func claudeScanDirectRuns(now time.Time) {
 	// A standing debt only defers the evidence: its probe may cover just its
 	// own baseline, so the newer run is reconsidered once that debt settles.
 	// Future-dated evidence (a clock correction, synced metadata) is likewise
-	// reconsidered once the clock catches up to it.
-	if outcome != claudeDirectRunStanding && outcome != claudeDirectRunFuture {
+	// reconsidered once the clock catches up to it, and evidence the quiet
+	// window deferred once that window ends while it is still inside the age
+	// limit (the age-out still bounds it, so no budget is refilled).
+	if outcome != claudeDirectRunStanding && outcome != claudeDirectRunFuture && outcome != claudeDirectRunQuiet {
 		s.mu.Lock()
 		if newestMs > s.lastEvidenceMs {
 			s.lastEvidenceMs = newestMs

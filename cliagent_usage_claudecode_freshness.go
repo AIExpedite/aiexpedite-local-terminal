@@ -1315,9 +1315,11 @@ func claudeStampGeneration(fingerprint string, transitionFrom []string, rotate b
 }
 
 // claudeRowsAdvanced reports whether the displayed rows moved since the stored
-// generation: a row's observation is newer than the one stored for it, or a row
-// the generation described as numeric now shows none (an expired bucket
-// replaced by a heartbeat), which changes the card just as much.
+// generation: a row's observation differs from the one stored for it. That is a
+// newer reading, a row the generation described as numeric now showing none
+// (an expired bucket replaced by a heartbeat), or a row falling back to an
+// OLDER observation (an expired newer bucket giving way to an older live one,
+// as aggregateWeeklyMetric does) — each changes the card just as much.
 func claudeRowsAdvanced(rows, stored []int64) bool {
 	for i := range max(len(rows), len(stored)) {
 		ms, prev := int64(0), int64(0)
@@ -1327,7 +1329,7 @@ func claudeRowsAdvanced(rows, stored []int64) bool {
 		if i < len(stored) {
 			prev = stored[i]
 		}
-		if ms > prev || (ms <= 0 && prev > 0) {
+		if ms != prev && (ms > 0 || prev > 0) {
 			return true
 		}
 	}
