@@ -199,6 +199,10 @@ type CLISession struct {
 	// once (cliagent_usage_opencode_freshness.go).
 	openCodeUsageRun     *openCodeUsageRun
 	openCodeUsageSettled atomic.Bool
+	// openCodeResumeSessionID is the session a resumed OpenCode turn was
+	// launched into (`--session`), so a turn that ends before its stream names
+	// the session can still be exported. "" for a fresh turn.
+	openCodeResumeSessionID string
 
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
@@ -842,8 +846,15 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// An OpenCode turn's spend is owed from its spawn; its step_finish frames
 	// pay it (cliagent_usage_opencode_freshness.go).
 	var openCodeUsage *openCodeUsageRun
+	var openCodeResumeSessionID string
 	if isOpenCodeCommand(command) {
 		openCodeUsage = armOpenCodeUsageRunForExecutable(executable, proc.Dir)
+		// A resumed turn's session is known before any frame: record it on the
+		// armed debt now, so a crash before the stream names it stays payable.
+		if isValidOpenCodeSessionID(resumeConversationID) {
+			openCodeResumeSessionID = resumeConversationID
+			openCodeUsage.persistSessionIDAsync(openCodeResumeSessionID)
+		}
 	}
 
 	// Start the process. It is owned (its own process group on Unix, a
@@ -905,6 +916,7 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		antigravityManagedStream:     antigravityManagedStream,
 		quotaCapture:                 quotaCapture,
 		openCodeUsageRun:             openCodeUsage,
+		openCodeResumeSessionID:      openCodeResumeSessionID,
 		finishGrokBillingAttribution: finishGrokAttribution,
 		// The child is running now, so the pin can be confirmed against the
 		// binary still on disk: a replacement that landed in the pin→Start
@@ -1175,10 +1187,10 @@ func (s *CLISession) settleOpenCodeUsageRun(onStream bool) {
 		if onStream {
 			// The child may stream another step after this: the run stays live
 			// so its export fallback cannot pay a turn this stream still owns.
-			settleOpenCodeUsageRunOnStream(run, "")
+			settleOpenCodeUsageRunOnStream(run, s.openCodeResumeSessionID)
 			return
 		}
-		settleOpenCodeUsageRun(run, "")
+		settleOpenCodeUsageRun(run, s.openCodeResumeSessionID)
 	}
 	if !onStream {
 		settle(false)

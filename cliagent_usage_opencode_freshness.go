@@ -405,8 +405,12 @@ func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, atte
 	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
 	if !more {
 		logOpenCodeUsageCapture("commit_abandoned")
-		// The steps stay in memory, but no write will offer them again: the
-		// run's debt is what pays this turn now, so the export is released.
+		// The steps stay in memory, but no write will offer them again. A run
+		// that never committed still has its ARMED debt, which the next process
+		// adopts and exports. A run whose earlier commit retired that debt gets
+		// no new one: an export pays whole messages, so it would count the
+		// steps already committed a second time. Those late steps go uncounted
+		// — "Tokens today" is a floor, never a guess.
 		run.takeUncommitted()
 		releaseOpenCodeUsageLiveRun(run)
 		return

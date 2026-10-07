@@ -84,6 +84,34 @@ func TestOpenCodeNativeUsage_ATerminalSessionCommitsOnceThoughBothSettlesFire(t 
 	}
 }
 
+// A resumed terminal turn whose stream never names its session (it ended before
+// any frame did) still owes its export: the resume id it was launched with is
+// the session, so the debt is not dropped as unattributable.
+func TestOpenCodeNativeUsage_AResumedSessionOwesUnderItsResumeID(t *testing.T) {
+	openCodeUsageFixture(t, 1305)
+	installOpenCodeStub(t)
+	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"text","text":"done"}\n`)
+
+	sm := NewSessionManager(nil)
+	ended, publishFn := openCodeSessionEndedSignal()
+	id := fmt.Sprintf("opencode-usage-resume-%d", time.Now().UnixNano())
+	if err := sm.StartSessionResuming(id, "opencode", []string{"run", "--format", "json", "hello"},
+		t.TempDir(), "ws", "uid", 15000, false, "ses_resumed", publishFn); err != nil {
+		t.Fatalf("StartSessionResuming: %v", err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(20 * time.Second):
+		t.Fatal("session never ended")
+	}
+	openCodeUsageInFlight.Wait()
+
+	debts := loadOpenCodeUsageLedger().Debts
+	if len(debts) != 1 || !debts[0].owed() || debts[0].SessionID != "ses_resumed" {
+		t.Fatalf("debts = %+v, want one owed debt under the resume id", debts)
+	}
+}
+
 // A turn whose stdout passes the cumulative cap still counts every step: the
 // drain keeps reading usage, so the final model step after the overflow (and
 // one past an oversize frame) is not lost while the earlier tool step settles
