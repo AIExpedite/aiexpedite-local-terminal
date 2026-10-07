@@ -696,12 +696,37 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// route. A drain (shutdown, update hand-off) deliberately leaves the floor
 	// unsettled on disk: the next process adopts it and owes one reconcile.
 	// See cliagent_usage_opencode_capture.go.
+	// Declared above the arm so the single settle defer below can read them on
+	// every exit route. The stdout scan assigns `stream` from its own
+	// goroutine, which wg.Wait() publishes before any post-Start return.
+	var (
+		stream       openCodeStreamState
+		timedOutFlag atomic.Bool
+	)
+
 	usage := armOpenCodeUsageRun("native chat")
-	settled := false
+	// Settled from a defer, not at the single success return: a child that
+	// STARTED has spent tokens, and every post-Start exit — including the
+	// non-ExitError Wait failure below (an I/O error on the pipes, or
+	// exec.ErrWaitDelay, which the smoke path documents as "the child RAN") —
+	// must account for them. A flag set only on the happy path withdrew those
+	// runs instead, dropping both the figures the stream DID report and the
+	// reconcile that would have recovered the rest.
+	//
+	// Every post-Start return happens after wg.Wait(), so `stream` is safely
+	// published to this closure.
+	started := false
 	defer func() {
-		if !settled {
+		if !started {
+			// Never reached inference: a refused flag, a pipe failure, a failed
+			// spawn. It spent nothing and owes nothing.
 			usage.Disarm()
+			return
 		}
+		// Covered only when the stream ran to its own end: a cut-off, killed or
+		// timed-out turn still spent tokens we could not read, so it owes one
+		// bounded reconcile through OpenCode's CLI.
+		settleOpenCodeUsageRunAsync(usage, !stream.overflow && !timedOutFlag.Load() && stream.terminal)
 	}()
 
 	// opencode already leads its own group (Setsid above). Recorded in the
@@ -713,6 +738,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 			err: fmt.Errorf("failed to start opencode (is OpenCode installed?): %w", err),
 		}
 	}
+	started = true
 	trackSessionProcess(session.ID, cmd)
 	defer untrackSessionProcess(session.ID, cmd.Process.Pid)
 	if cmd.Process != nil {
@@ -720,7 +746,6 @@ func (m *OpenCodeNativeManager) runOneShot(
 		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
 	}
 
-	var timedOutFlag atomic.Bool
 	timer := time.AfterFunc(turnTimeout, func() {
 		timedOutFlag.Store(true)
 		_ = interruptProcess(cmd)
@@ -743,7 +768,6 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// Drain both pipes concurrently — sequential reads deadlock when the child
 	// fills the unread pipe buffer (Go exec docs).
 	var (
-		stream    openCodeStreamState
 		stderrBuf *limitedBuffer
 		wg        sync.WaitGroup
 	)
@@ -774,11 +798,6 @@ func (m *OpenCodeNativeManager) runOneShot(
 	if stderrBuf != nil {
 		errOut = strings.TrimSpace(stderrBuf.b.String())
 	}
-	// Covered only when the stream ran to its own end: a cut-off, killed or
-	// timed-out turn still spent tokens we could not read, so it owes one
-	// bounded reconcile through OpenCode's CLI.
-	settled = true
-	settleOpenCodeUsageRunAsync(usage, !stream.overflow && !timedOutFlag.Load() && stream.terminal)
 	return openCodeRunResult{
 		text:          strings.TrimSpace(stream.text.String()),
 		rawStdout:     strings.TrimSpace(stream.raw.String()),

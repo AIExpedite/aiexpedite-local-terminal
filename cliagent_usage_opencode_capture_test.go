@@ -795,3 +795,59 @@ func TestCommandRunsCLI_KeepsEachCLIsAnswerSeparate(t *testing.T) {
 		t.Fatal("an oversized payload must classify as not-this-CLI")
 	}
 }
+
+// A native turn whose child STARTED must account for its tokens on every exit
+// route, not only the success return: the run spent them, and withdrawing it
+// drops both the figures the stream did report and the reconcile that would
+// recover the rest. Driven through the handle, which is the contract every
+// post-Start path of runOneShot shares.
+func TestOpenCodeTap_AStartedRunIsSettledOnEveryExitRoute(t *testing.T) {
+	now := openCodeFixtureRunAt
+	for _, tc := range []struct {
+		name string
+		// started mirrors runOneShot's flag: false only before cmd.Start
+		// succeeded.
+		started bool
+		// cleanEnd is the covered predicate the defer computes.
+		cleanEnd   bool
+		wantOwed   bool
+		wantTokens int64
+	}{
+		{"a clean turn is covered and owes nothing", true, true, false, 63},
+		// The non-ExitError Wait failure (an I/O error on the pipes,
+		// exec.ErrWaitDelay): the child ran, so what the stream saw is kept and
+		// the rest is owed.
+		{"a started turn that failed to reap keeps its figures and owes", true, false, true, 63},
+		// Before Start: a failed spawn spent nothing.
+		{"an unstarted run is withdrawn", false, false, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			handle := armOpenCodeUsageRun("native chat")
+			observeFixture(t, handle, "run_two_steps.jsonl")
+
+			var owed bool
+			if tc.started {
+				owed = handle.Finish(tc.cleanEnd)
+			} else {
+				handle.Disarm()
+			}
+			if !openCodeUsageRefreshWaitFor(5 * time.Second) {
+				t.Fatal("the settle never went idle")
+			}
+			if owed != tc.wantOwed {
+				t.Fatalf("owed = %v, want %v", owed, tc.wantOwed)
+			}
+			if tokens, _, _ := todayTotals(t, now); tokens != tc.wantTokens {
+				t.Fatalf("tokens = %d, want %d", tokens, tc.wantTokens)
+			}
+			// A withdrawn run leaves no floor for the next process to adopt as
+			// an interrupted one.
+			var freshness openCodeUsageFreshness
+			readJSONFile(openCodeUsageFreshnessPath(), &freshness)
+			if !tc.started && (freshness.owed() || freshness.RunFloorMs != 0) {
+				t.Fatalf("freshness = %+v, want nothing left behind", freshness)
+			}
+		})
+	}
+}
