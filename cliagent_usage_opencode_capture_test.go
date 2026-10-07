@@ -956,3 +956,40 @@ func TestOpenCodeRechecks_CapEvictionMarksTheDayPartial(t *testing.T) {
 		t.Fatal("a day outside retention must not be created by the partial mark")
 	}
 }
+
+// Pruning runs BEFORE the published-view comparison, so an eviction that only
+// turns today partial advances the generation whichever mutation overflowed the
+// re-read set — not just the helpers that prune for themselves.
+func TestOpenCodeLedger_APartialMadeByPruningAdvancesTheGeneration(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	before, _ := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		for i := 0; i < openCodeLedgerMaxRechecks; i++ {
+			l.Rechecks = append(l.Rechecks, openCodeRecheckSession{
+				SessionHash: openCodeUsageHash("ses_"+strconv.Itoa(i), ""),
+				UpdatedMs:   now.Add(time.Duration(i) * time.Minute).UnixMilli(),
+			})
+		}
+		return openCodeLedgerEdit{Changed: true}
+	})
+	if openCodeDayPartial(before, openCodeDayKey(now)) {
+		t.Fatal("a full but not overflowing re-read set must not mark the day partial")
+	}
+
+	// A raw append: the overflow is resolved only by updateOpenCodeUsageLedger's
+	// own prune, and no total moves.
+	after, _ := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		l.Rechecks = append(l.Rechecks, openCodeRecheckSession{
+			SessionHash: openCodeUsageHash("ses_ninth", ""),
+			UpdatedMs:   now.Add(time.Hour).UnixMilli(),
+		})
+		return openCodeLedgerEdit{Changed: true}
+	})
+	if !openCodeDayPartial(after, openCodeDayKey(now)) {
+		t.Fatal("the eviction must mark today partial")
+	}
+	if got := readOpenCodeUsageLedger().Generation; got == before.Generation {
+		t.Fatalf("generation = %+v, unchanged — the lower-bound notice would never reach the backend", got)
+	}
+}

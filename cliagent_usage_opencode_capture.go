@@ -280,6 +280,10 @@ func updateOpenCodeUsageLedger(mutate func(*openCodeUsageLedger) openCodeLedgerE
 	wasPartial := openCodeDayPartial(ledger, today)
 	wasZeroRow := openCodeZeroRowPublished(ledger, now)
 	edit := mutate(&ledger)
+	// Prune BEFORE comparing the published view: evicting a re-read marks its
+	// day partial, and a write whose only visible change is that notice must
+	// hint the backend like any other.
+	openCodePruneLedger(&ledger)
 	if !wasPartial && openCodeDayPartial(ledger, today) {
 		// The parser turns a partial day into the card's lower-bound notice, so
 		// a pass that marks it after the gather returned must hint the backend
@@ -301,7 +305,6 @@ func updateOpenCodeUsageLedger(mutate func(*openCodeUsageLedger) openCodeLedgerE
 		openCodeLedgerMu.Unlock()
 		return ledger, true
 	}
-	openCodePruneLedger(&ledger)
 	ledger.SchemaVersion = openCodeUsageLedgerSchema
 	path := openCodeUsageLedgerPath()
 	// Best-effort: a read-only data dir costs a reading, never a run.

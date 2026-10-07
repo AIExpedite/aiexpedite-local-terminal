@@ -485,15 +485,12 @@ func cliUsageRecoveryGeneration() *cliUsageGeneration {
 	return nil
 }
 
-// sendDue sends the single most overdue pending hint when every gate is open —
-// one hint per global spacing window — and re-arms the timer for the rest.
-func (p *cliUsagePropagatorState) sendDue() {
-	now := time.Now()
-	p.mu.Lock()
-	if p.stopped || p.cfg == nil {
-		p.mu.Unlock()
-		return
-	}
+// pickDueLocked returns the provider whose pending hint is most overdue, or nil
+// when none is due yet. Ties go to the OLDER observation: after a send, every
+// pending due clamps to the same `lastSentAt + spacing` boundary, so a
+// table-order tie-break would let a provider that keeps re-noting win every
+// boundary while the other's older reading never left.
+func (p *cliUsagePropagatorState) pickDueLocked(now time.Time) (string, *cliUsageProviderHintState) {
 	provider, chosen := "", (*cliUsageProviderHintState)(nil)
 	chosenDue := time.Time{}
 	for _, source := range cliUsageGenerationSources {
@@ -505,10 +502,24 @@ func (p *cliUsagePropagatorState) sendDue() {
 		if !ok || due.After(now) {
 			continue
 		}
-		if chosen == nil || due.Before(chosenDue) {
+		if chosen == nil || due.Before(chosenDue) ||
+			(due.Equal(chosenDue) && state.pending.noteAt.Before(chosen.pending.noteAt)) {
 			provider, chosen, chosenDue = source.Provider, state, due
 		}
 	}
+	return provider, chosen
+}
+
+// sendDue sends the single most overdue pending hint when every gate is open —
+// one hint per global spacing window — and re-arms the timer for the rest.
+func (p *cliUsagePropagatorState) sendDue() {
+	now := time.Now()
+	p.mu.Lock()
+	if p.stopped || p.cfg == nil {
+		p.mu.Unlock()
+		return
+	}
+	provider, chosen := p.pickDueLocked(now)
 	if chosen == nil {
 		p.rearmLocked(now)
 		p.mu.Unlock()

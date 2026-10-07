@@ -1300,8 +1300,14 @@ func nudgeOpenCodeUsageRefresh(now time.Time) bool {
 		}
 	} else {
 		// Nothing owed: the nudge itself books the continuation, so a direct
-		// run is reconciled without owing a debt.
-		updateOpenCodeUsageLedgerContinuation(true, 0, 0)
+		// run is reconciled without owing a debt. A refused write leaves the
+		// nudge UNCLAIMED: the worker would reread continuationDue == false and
+		// exit, and claiming the cooldown would then hold the reading back
+		// until it expired. The next gather retries instead.
+		if !updateOpenCodeUsageLedgerContinuation(true, 0, 0) {
+			logOpenCodeUsage("nudge book refused")
+			return false
+		}
 	}
 	n.lastAt = now
 	// Non-blocking, and it accounts for itself in openCodeFreshnessInFlight —

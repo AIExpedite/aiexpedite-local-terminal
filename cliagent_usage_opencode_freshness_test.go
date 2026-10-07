@@ -517,6 +517,49 @@ func TestOpenCodeNudge_HonoursItsCooldownAndLiveRuns(t *testing.T) {
 	}
 }
 
+// A nudge whose continuationDue write is refused must not claim its cooldown:
+// the worker would reread the flag clear and exit, and the claimed cooldown
+// would then hold back the direct run's reading until it expired.
+func TestOpenCodeNudge_ARefusedBookingDoesNotClaimTheCooldown(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeDebtFixture(t, now)
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+	// Seed the file so the booking is REACHED and only its own write is refused.
+	updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+		openCodeEnsureDay(l, openCodeDayKey(now)).Messages["0123456789abcdef"] =
+			openCodeMessageUsage{In: 5, ObservedAtMs: now.UnixMilli()}
+		return openCodeLedgerEdit{Changed: true, TotalsChanged: true}
+	})
+
+	dir := filepath.Dir(openCodeUsageLedgerPath())
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(openCodeUsageLedgerPath(), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	unblock := func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chmod(openCodeUsageLedgerPath(), 0o600)
+	}
+	t.Cleanup(unblock)
+
+	if nudgeOpenCodeUsageRefresh(now) {
+		t.Fatal("a nudge whose continuation write was refused must not report success")
+	}
+	if readOpenCodeUsageLedger().ContinuationDue {
+		t.Fatal("the refused write must not read back as a booked continuation")
+	}
+
+	// The filesystem recovers; the very next gather, still inside what would
+	// have been the cooldown, gets its nudge.
+	unblock()
+	if !nudgeOpenCodeUsageRefresh(now.Add(time.Millisecond)) {
+		t.Fatal("a refused nudge claimed the cooldown — the next gather could not retry it")
+	}
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+}
+
 func TestOpenCodeDiscovery_SeesAWriteUnderTheProjectScopedLayout(t *testing.T) {
 	// The TUI and native capture write `<storage>/project/<slug>/storage/
 	// session[/info]`, whose SLUG directory mtime does not move when a session

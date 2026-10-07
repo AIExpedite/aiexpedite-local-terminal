@@ -731,3 +731,41 @@ func TestCLIUsageHint_TheEarliestNoteIsAlwaysDueFirst(t *testing.T) {
 		t.Fatalf("a follow-up due %s is later than now — it waits only on the spacing", due)
 	}
 }
+
+// After a send, every pending due clamps to the same `lastSentAt + spacing`
+// boundary. The tie must go to the OLDER observation: a table-order tie-break
+// let Codex, re-noted before each boundary, win every one while an older
+// OpenCode reading never left. Asserted on pickDueLocked for the same reason as
+// TestCLIUsageHint_TheEarliestNoteIsAlwaysDueFirst.
+func TestCLIUsageHint_ASpacingTieGoesToTheOlderObservation(t *testing.T) {
+	_, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+
+	p := cliUsagePropagator
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	p.lastSentAt = now.Add(-cliUsageHintSpacing) // the boundary is now
+	codex := p.providerLocked(codexUsageProvider)
+	openCode := p.providerLocked(openCodeUsageProvider)
+	// Both past their debounce, so both clamp to the same boundary; OpenCode's
+	// observation is the older one.
+	openCode.pending = &cliUsagePendingHint{generation: gen(2, 1), noteAt: now.Add(-cliUsageHintDebounce - time.Minute)}
+	codex.pending = &cliUsagePendingHint{generation: gen(1, 7), noteAt: now.Add(-cliUsageHintDebounce - time.Second)}
+
+	codexDue, _ := p.nextDueLocked(codex, now)
+	openCodeDue, _ := p.nextDueLocked(openCode, now)
+	if !codexDue.Equal(openCodeDue) {
+		t.Fatalf("dues %s / %s are not tied — the fixture no longer exercises the tie", codexDue, openCodeDue)
+	}
+	if provider, _ := p.pickDueLocked(now); provider != openCodeUsageProvider {
+		t.Fatalf("tie went to %q, want the older observation (opencode)", provider)
+	}
+
+	// And the other way round: the order of the table is not what decides.
+	codex.pending.noteAt = now.Add(-cliUsageHintDebounce - 2*time.Minute)
+	if provider, _ := p.pickDueLocked(now); provider != codexUsageProvider {
+		t.Fatalf("tie went to %q, want the older observation (codex)", provider)
+	}
+}
