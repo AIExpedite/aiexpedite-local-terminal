@@ -95,7 +95,9 @@ type claudeRateLimitView struct {
 	// this agent's OWN cache, read in the same pass as its buckets, or nil when
 	// that snapshot is unversioned, holds no numeric reading, or belongs to
 	// another account. A hook pinned to another channel's cache versions that
-	// file under its own epoch, which this agent neither publishes nor hints.
+	// file under its own epoch, which this agent neither publishes nor hints:
+	// its newer readings are folded into the own cache first
+	// (importPinnedClaudeObservations), so the own generation versions them.
 	generation *cliUsageGeneration
 }
 
@@ -141,6 +143,74 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 		}
 	}
 	return view
+}
+
+// importPinnedClaudeObservations folds the numeric readings the installed hook
+// committed to ANOTHER channel's cache, where they are newer than this agent's
+// own, into the own cache through the shared newer-wins merge, and returns the
+// own generation that write committed (nil when nothing was imported).
+//
+// On a dual-channel machine the merged view otherwise displays the pinned
+// cache's readings under the own cache's generation, which never moves for
+// them: the signed receipt would version those rows with an unrelated
+// generation, and a status-line commit to the pinned file would never produce
+// a hint for this agent's backend card. Importing makes the own generation
+// describe what is published, and the parser and the fallback read then
+// discover it exactly as they discover any other commit.
+//
+// Only between two snapshots of the caller's account: an own cache scoped to
+// another account (or absent) is left to the writers that own that transition,
+// and the merge re-checks the scope under the lock. Each reading keeps its
+// provenance, so imported probe evidence still counts as probe evidence. A
+// single-channel machine, where the hook pins the own cache, reads nothing
+// beyond the hook's settings.
+func importPinnedClaudeObservations(fingerprint string) *cliUsageGeneration {
+	home, _ := os.UserHomeDir()
+	own := claudeRateLimitCachePath()
+	pinned := installedClaudeRateLimitCachePath(home)
+	if pinned == "" || pinned == own {
+		return nil
+	}
+	pinnedSnap, ok := loadClaudeRateLimitSnapshot(pinned)
+	if !ok || pinnedSnap.AccountFingerprint != fingerprint {
+		return nil
+	}
+	ownSnap, ok := loadClaudeRateLimitSnapshot(own)
+	if !ok || ownSnap.AccountFingerprint != fingerprint {
+		return nil
+	}
+	bySource := map[string]map[string]claudeRateLimitBucket{}
+	for window, bucket := range pinnedSnap.Buckets {
+		if !bucket.hasObservedUsage() {
+			continue
+		}
+		if prev, seen := ownSnap.Buckets[window]; seen && prev.hasObservedUsage() && prev.ObservedAtMs >= bucket.ObservedAtMs {
+			continue
+		}
+		bucket.usageKnown = true
+		if bySource[bucket.Source] == nil {
+			bySource[bucket.Source] = map[string]claudeRateLimitBucket{}
+		}
+		bySource[bucket.Source][window] = bucket
+	}
+	if len(bySource) == 0 {
+		return nil
+	}
+	var committed *cliUsageGeneration
+	_, _ = withClaudeRateLimitCacheLocked(own, time.Time{}, func() (time.Time, error) {
+		now := time.Now()
+		for source, updates := range bySource {
+			_, advanced, err := mergeClaudeRateLimitCacheLocked(own, updates, now, fingerprint, source, []string{fingerprint}, claudeCredStamp{})
+			if err != nil {
+				return time.Time{}, err
+			}
+			if advanced != nil {
+				committed = advanced
+			}
+		}
+		return time.Time{}, nil
+	})
+	return committed
 }
 
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,

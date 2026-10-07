@@ -525,6 +525,10 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// would report that the view below is superseded, and this gather would publish
 	// the pre-replay reading for the whole staleness TTL.
 	generation := claudeUsageProbe.refreshGeneration()
+	// A dual-channel hook's newer readings join the own cache first, so the
+	// generation published below versions the rows this view selects; the
+	// commit is discovered by observeCLIUsageGeneration like any other.
+	importPinnedClaudeObservations(usage.AccountFingerprint)
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	// A credential rewrite the run-debt schedule is waiting on (an expired token
 	// or a 401) makes its pending rung due now rather than at the age backoff.

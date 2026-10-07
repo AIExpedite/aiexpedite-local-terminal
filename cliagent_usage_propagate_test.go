@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -713,6 +714,9 @@ func claudeFallbackFixture(t *testing.T, detected bool) (cache string, reads *in
 	t.Helper()
 	cache = t.TempDir() + "/claude_rate_limits.json"
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	// No installed hook unless a test writes one: the fallback must not follow
+	// the real machine's settings to a pinned cache.
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	cliUsageClaudeFallbackEnabled = true
 	cliUsageClaudeFallbackPeriod = 30 * time.Millisecond
 	claudeUsageFallbackDetected = func() bool { return detected }
@@ -771,6 +775,46 @@ func TestCLIUsageHint_FallbackDiscoversAnExternalClaudeCommit(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("the fallback never discovered {97,2}: %+v", rec.all())
+}
+
+// On a dual-channel machine the hook commits to the OTHER channel's cache: the
+// fallback imports that newer reading and hints the own generation it advanced.
+func TestCLIUsageHint_FallbackHintsAReadingCommittedToThePinnedCache(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	cache, _ := claudeFallbackFixture(t, true)
+	pinned := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	helperWriteJSON(t, filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	writeVersionedClaudeCache(t, cache, gen(96, 1), 41)
+
+	startCLIUsagePropagator(cfg) // the startup recovery hints {96,1}
+	if first := waitHints(t, rec, 1, 0)[0].hint; first.Generation != 1 {
+		t.Fatalf("recovery hint = %+v", first)
+	}
+
+	now := time.Now()
+	mergeClaudeRateLimitCacheFromSource(pinned, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 77, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true},
+	}, now, "", claudeRateLimitSourceStatusLine)
+	deadline := time.Now().Add(5 * cliUsageHintSpacing)
+	for time.Now().Before(deadline) {
+		for _, h := range rec.all() {
+			if h.hint.GenerationEpoch == 96 && h.hint.Generation == 2 {
+				own, _ := loadClaudeRateLimitSnapshot(cache)
+				if b := own.Buckets[claudeWindowFiveHour]; b.UsedPercentage != 77 || b.Source != claudeRateLimitSourceStatusLine {
+					t.Fatalf("own cache five_hour = %+v, want the imported status-line reading", b)
+				}
+				return
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("the fallback never hinted the imported pinned reading: %+v", rec.all())
 }
 
 // The fallback reads nothing when Claude is not detected, when no cache

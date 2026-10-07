@@ -650,6 +650,11 @@ func claudeUsageFallbackGeneration() *cliUsageGeneration {
 	if !ok {
 		return nil
 	}
+	// A hook pinned to another channel's cache commits there; its newer
+	// readings advance this agent's own generation once imported.
+	if imported := importPinnedClaudeObservations(snap.AccountFingerprint); imported != nil {
+		return imported
+	}
 	return claudeSnapshotGeneration(snap)
 }
 

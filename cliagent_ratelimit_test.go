@@ -703,6 +703,57 @@ func TestClaudeCodeMetricsFromCache_ReadsCachePinnedByTheInstalledHook(t *testin
 	}
 }
 
+// The merged view publishes the OWN cache's generation, so a fresher reading the
+// hook pinned to the other channel's cache must be imported into the own cache
+// — advancing that generation — rather than displayed under a stale one.
+func TestImportPinnedClaudeObservations_VersionsThePinnedReadingInTheOwnCache(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Now()
+	bucket := func(pct float64, observed time.Time) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			UsedPercentage: pct, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(ownCache, bucket(10, now.Add(-time.Hour)), now, "acct", claudeRateLimitSourceStream)
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "other", claudeRateLimitSourceStatusLine)
+	before := loadMergedClaudeRateLimitView("acct").generation
+
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("imported %+v from another account's pinned cache", g)
+	}
+
+	mergeClaudeRateLimitCacheFromSource(pinnedCache, bucket(91, now.Add(-time.Minute)), now, "acct", claudeRateLimitSourceStatusLine)
+	imported := importPinnedClaudeObservations("acct")
+	if imported == nil || before == nil || imported.Epoch != before.Epoch || imported.Counter != before.Counter+1 {
+		t.Fatalf("imported generation = %+v, want the own generation after %+v advanced once", imported, before)
+	}
+	view := loadMergedClaudeRateLimitView("acct")
+	if view.generation == nil || *view.generation != *imported {
+		t.Fatalf("view generation = %+v, want %+v", view.generation, imported)
+	}
+	own, _ := loadClaudeRateLimitSnapshot(ownCache)
+	got := own.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 91 || got.ObservedAtMs != now.Add(-time.Minute).UnixMilli() || got.Source != claudeRateLimitSourceStatusLine {
+		t.Fatalf("own five_hour = %+v, want the pinned reading with its time and provenance", got)
+	}
+	if g := importPinnedClaudeObservations("acct"); g != nil {
+		t.Fatalf("a reading already imported advanced the generation again: %+v", g)
+	}
+}
+
 // A cache pinned by a hook that is NOT ours must not be read: the value would be
 // attributed to this account with no evidence it came from our capture at all.
 func TestClaudeCodeMetricsFromCache_IgnoresForeignStatusLineCommand(t *testing.T) {
