@@ -228,6 +228,15 @@ func openCodeUsageTransactionWithin(lockWait time.Duration, mutate func(ledger *
 		openCodeUsageMu.Lock()
 	}
 	path := openCodeUsageCachePath()
+	// The lock file is the ledger's sibling: with the directory missing (a fresh
+	// or custom cache path) it cannot be opened, reads as "no lock offered", and
+	// two processes would both write unlocked. Create it first, as the Codex
+	// cache does; a directory that cannot be made cannot take the write either.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		openCodeUsageMu.Unlock()
+		logOpenCodeUsageCapture("write_failed")
+		return false, false, cliUsageGeneration{}
+	}
 	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(lockWait))
 	if outcome == crossProcessLockContended {
 		openCodeUsageMu.Unlock()

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -347,6 +349,28 @@ func TestOpenCodeUsageTransaction_GenerationAdvancesOnlyOnABucketChange(t *testi
 	settleOpenCodeUsageRun(again, "")
 	if _, _, g := openCodeUsageBucketForDay("fp-a", now); g != first {
 		t.Fatalf("generation moved to %+v on a no-op", g)
+	}
+}
+
+// A ledger whose directory does not exist yet still writes under the
+// cross-process lock: the directory is made before the sibling lock is opened,
+// so a missing one cannot read as "no lock offered" and let two processes
+// write unlocked.
+func TestOpenCodeUsageTransaction_MissingDirectoryStillTakesTheLock(t *testing.T) {
+	openCodeUsageFixture(t, 904)
+	path := filepath.Join(t.TempDir(), "fresh", "nested", "opencode_usage.json")
+	t.Setenv("AIEXPEDITE_OPENCODE_USAGE_CACHE", path)
+	sawLock := false
+	committed, _, _ := openCodeUsageTransaction(func(*openCodeUsageLedger) (bool, bool) {
+		_, err := os.Stat(path + ".lock")
+		sawLock = err == nil
+		return true, false
+	})
+	if !committed {
+		t.Fatal("the write into a missing directory did not commit")
+	}
+	if !sawLock {
+		t.Fatal("the transaction ran without the cross-process lock file")
 	}
 }
 
