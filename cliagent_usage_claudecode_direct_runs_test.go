@@ -352,6 +352,29 @@ func TestClaudeDirectRunScan_IsThrottled(t *testing.T) {
 	}
 }
 
+// A backward clock step must not suppress the scan until the clock catches up
+// to the old throttle: the scan is due at once and the throttle re-bases, so
+// the scan's own rollback recovery gets to run.
+func TestClaudeDirectRunScan_IsDueAfterAClockRollback(t *testing.T) {
+	resetClaudeUsageWatchState()
+	t.Cleanup(resetClaudeUsageWatchState)
+	now := time.Now()
+	if !claudeDirectRunScanDue(now) {
+		t.Fatal("the first scan is not due")
+	}
+	rolled := now.Add(-2 * time.Hour)
+	if !claudeDirectRunScanDue(rolled) {
+		t.Fatal("a scan after a backward clock step is not due")
+	}
+	// The throttle re-based onto the corrected clock, so it still throttles.
+	if claudeDirectRunScanDue(rolled.Add(claudeDirectRunScanPeriod - time.Second)) {
+		t.Fatal("the throttle did not re-base onto the corrected clock")
+	}
+	if !claudeDirectRunScanDue(rolled.Add(claudeDirectRunScanPeriod)) {
+		t.Fatal("a scan after the period is not due")
+	}
+}
+
 // The scan logs a fixed label and counters: never a path or project name.
 func TestClaudeDirectRunScan_LogsNoPath(t *testing.T) {
 	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {

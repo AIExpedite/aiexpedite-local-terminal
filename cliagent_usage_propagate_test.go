@@ -541,6 +541,42 @@ func TestCLIUsageHint_ProvidersKeepTheirOwnBudgets(t *testing.T) {
 	}
 }
 
+// A note recorded for another provider while a hint is in flight must not let
+// a second send select that same in-flight observation: both sends would skip
+// the device-wide spacing, and both would be processed as an initial send,
+// leaving a third follow-up for one observation.
+func TestCLIUsageHint_ANoteDuringAnInFlightSendDoesNotResendIt(t *testing.T) {
+	withCodexGenerationEpoch(t, 540)
+	rec, cfg := propagatorFixture(t)
+	noted, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	rec.outcome = func(cliUsageObservedHint) cliUsageHintOutcome {
+		// The recorder holds its own lock here, so a concurrent send blocks
+		// until release and is recorded after it: an extra hint either way.
+		once.Do(func() {
+			noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(540, 7))
+			close(noted)
+			<-release
+		})
+		return cliUsageHintOutcome{status: 202, accepted: true}
+	}
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+	markClaudeRotated(t)
+
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(540, 1))
+	<-noted
+	time.Sleep(2 * cliUsageHintSpacing) // a second sendDue would fire in here
+	close(release)
+
+	hints := waitHints(t, rec, 4, 2*cliUsageHintSpacing)
+	codex, claude := hintsFor(hints, codexUsageProvider), hintsFor(hints, claudeUsageProvider)
+	if len(codex) != 2 || len(claude) != 2 || len(hints) != 4 {
+		t.Fatalf("got %d hints (codex=%d claude=%d), want one hint and one follow-up each: %+v",
+			len(hints), len(codex), len(claude), hints)
+	}
+}
+
 // Every retryable refusal keeps the hint pending with its follow-up unspent,
 // retried at the next spacing; three of them, of any mix, drop it.
 func TestCLIUsageHint_RetryableRefusalsAreRetriedThenCapped(t *testing.T) {

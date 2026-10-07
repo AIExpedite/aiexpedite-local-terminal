@@ -252,7 +252,10 @@ type cliUsagePendingObservation struct {
 	followUp bool
 	// retrying: a retryable refusal came back; the next send waits only for the
 	// spacing, not for the debounce.
-	retrying          bool
+	retrying bool
+	// inFlight: a send holds this observation and mu is released for the HTTP
+	// call. It is not selectable until that send records its outcome.
+	inFlight          bool
 	retryableRefusals int
 }
 
@@ -485,6 +488,9 @@ func (p *cliUsagePropagatorState) nextSendDelayLocked() time.Duration {
 	now := time.Now()
 	var due time.Time
 	for _, obs := range p.pending {
+		if obs.inFlight {
+			continue
+		}
 		d := obs.dueAt(now)
 		if due.IsZero() || d.Before(due) {
 			due = d
@@ -518,7 +524,7 @@ func (o *cliUsagePendingObservation) dueAt(now time.Time) time.Time {
 func (p *cliUsagePropagatorState) pickDueLocked(now time.Time) (provider string, awaitingRotation bool) {
 	var best *cliUsagePendingObservation
 	for name, obs := range p.pending {
-		if obs.dueAt(now).After(now) {
+		if obs.inFlight || obs.dueAt(now).After(now) {
 			continue
 		}
 		if !p.rotated[name] {
@@ -620,6 +626,14 @@ func (p *cliUsagePropagatorState) sendDue() {
 		return
 	}
 	obs := p.pending[provider]
+	// Reserve both the observation and the device-wide spacing boundary before
+	// mu is released for the HTTP call. A note recorded for another provider
+	// meanwhile re-arms the timer from nextSendDelayLocked, which would
+	// otherwise see an unadvanced lastSentAt and a still-pending observation,
+	// fire at once, and send a second hint concurrently: unspaced, and counted
+	// as another initial send, which would leave a third follow-up scheduled.
+	obs.inFlight = true
+	p.lastSentAt = time.Now()
 	cfg, generation, followUp, ctx := p.cfg, obs.generation, obs.followUp, p.ctx
 	p.mu.Unlock()
 
@@ -629,6 +643,7 @@ func (p *cliUsagePropagatorState) sendDue() {
 	if agentID == "" || secret == "" || baseURL == "" {
 		logCLIUsageHint("skipped_unregistered", provider)
 		p.mu.Lock()
+		obs.inFlight = false
 		p.armLocked(cliUsageHintSpacing)
 		p.mu.Unlock()
 		return
@@ -646,6 +661,7 @@ func (p *cliUsagePropagatorState) sendDue() {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	obs.inFlight = false
 	p.lastSentAt = time.Now()
 	current := p.pending[provider]
 	if p.stopped || current == nil || current.generation != generation {

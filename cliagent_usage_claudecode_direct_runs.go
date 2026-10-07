@@ -141,7 +141,12 @@ func claudeDirectRunScanDue(now time.Time) bool {
 	s := &claudeUsageWatchState
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.lastScanAt.IsZero() && now.Sub(s.lastScanAt) < claudeDirectRunScanPeriod {
+	// A backward clock step (an NTP correction, a resumed suspend) leaves the
+	// last scan ahead of the clock, and the elapsed check would then reject
+	// every tick until the clock caught up to it plus the period. The scan is
+	// due instead, which also re-bases the throttle onto the corrected clock
+	// and lets the scan run its own rollback recovery.
+	if !s.lastScanAt.IsZero() && !now.Before(s.lastScanAt) && now.Sub(s.lastScanAt) < claudeDirectRunScanPeriod {
 		return false
 	}
 	s.lastScanAt = now
