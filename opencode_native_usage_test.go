@@ -83,3 +83,38 @@ func TestOpenCodeNativeUsage_ATerminalSessionCommitsOnceThoughBothSettlesFire(t 
 		t.Fatalf("debts = %+v after a captured session", debts)
 	}
 }
+
+// A turn whose stdout passes the cumulative cap still counts every step: the
+// drain keeps reading usage, so the final model step after the overflow (and
+// one past an oversize frame) is not lost while the earlier tool step settles
+// the run as paid.
+func TestOpenCodeNativeUsage_StepsAfterAStdoutOverflowAreStillCounted(t *testing.T) {
+	openCodeUsageFixture(t, 1303)
+	now := time.Now().UnixMilli()
+	padding := strings.Repeat("x", 3*1024*1024)
+	var out strings.Builder
+	out.WriteString(openCodeStepFinish("ses_overflow", "prt_tool", 100, 0, 0, "0", now) + "\n")
+	for i := 0; i < 3; i++ {
+		out.WriteString(padding + "\n")
+	}
+	out.WriteString(openCodeStepFinish("ses_overflow", "prt_final", 20, 0, 0, "0", now) + "\n")
+	out.WriteString(strings.Repeat("y", openCodeNativeMaxFrameBytes+1) + "\n")
+	out.WriteString(openCodeStepFinish("ses_overflow", "prt_late", 3, 0, 0, "0", now) + "\n")
+
+	run := armOpenCodeUsageRun("opencode", "", "fp-overflow")
+	m := NewOpenCodeNativeManager()
+	state := m.streamOpenCodeEvents(&OpenCodeNativeSession{}, strings.NewReader(out.String()), nil, run)
+	if !state.overflow {
+		t.Fatal("the stream did not report its overflow")
+	}
+	run.mu.Lock()
+	var input int64
+	for _, s := range run.steps {
+		input += s.Input
+	}
+	n := len(run.steps)
+	run.mu.Unlock()
+	if n != 3 || input != 123 {
+		t.Fatalf("captured %d steps with %d input tokens, want all 3 (123)", n, input)
+	}
+}

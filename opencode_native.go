@@ -819,10 +819,19 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		if line == "" {
 			continue
 		}
+		if state.overflow {
+			// Past the cap the turn is already failed, but its usage is still
+			// owed: later step-finish frames (the final model step among them)
+			// would otherwise go uncounted while an earlier one settles the run
+			// as paid, leaving the export nothing to reconcile. Nothing else is
+			// kept or published.
+			captureOpenCodeUsageLine(usage, line)
+			continue
+		}
 		state.bytes += len(line)
 		if state.bytes > openCodeNativeMaxStdout {
 			state.overflow = true
-			break
+			continue
 		}
 		if state.raw.Len() < openCodeNativeMaxRawStdout {
 			state.raw.WriteString(line)
@@ -848,11 +857,35 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		state.overflow = true
 	}
 	// Drain anything left so the child never blocks on a full pipe (which would
-	// deadlock cmd.Wait) after we stopped scanning.
+	// deadlock cmd.Wait) after we stopped scanning. The drain still reads usage,
+	// for the same reason the over-cap scan above does.
 	if state.overflow {
-		_, _ = drainRemaining(r)
+		drainOpenCodeUsage(r, usage)
 	}
 	return state
+}
+
+// drainOpenCodeUsage reads r to the end, folding any step-finish usage into
+// usage and discarding everything else. A line past the frame cap is skipped
+// rather than ending the scan: a scanner that hit bufio.ErrTooLong buffered
+// only that line's prefix, so a fresh one resumes inside it and loses nothing
+// after it.
+func drainOpenCodeUsage(r interface{ Read([]byte) (int, error) }, usage *openCodeUsageRun) {
+	if usage == nil {
+		_, _ = drainRemaining(r)
+		return
+	}
+	for {
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), openCodeNativeMaxFrameBytes)
+		for scanner.Scan() {
+			captureOpenCodeUsageLine(usage, scanner.Text())
+		}
+		if !errors.Is(scanner.Err(), bufio.ErrTooLong) {
+			_, _ = drainRemaining(r)
+			return
+		}
+	}
 }
 
 // publishEventFrame emits one streamed OpenCode JSON event. Oversize envelopes

@@ -207,6 +207,13 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	// placeholders the other parsers emit would be a lie here.
 	// A turn that spent before any probe named the account banked under the empty
 	// fingerprint: claim it for this one first, or its tokens stay invisible.
+	// With no account resolved there is nothing to publish under: the gather
+	// files this snapshot under a device fallback fingerprint, so the pending
+	// bucket and its generation would land against an account no later probe
+	// names, and the backend would record that generation as applied.
+	if usage.AccountFingerprint == "" {
+		return usage, true
+	}
 	adopted := adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
 	bucket, ok, generation := openCodeUsageBucketForDay(usage.AccountFingerprint, now)
 	usage.Metrics = openCodeUsageMetrics(bucket, ok, now)

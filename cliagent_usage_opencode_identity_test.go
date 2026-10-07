@@ -195,3 +195,40 @@ func TestOpenCodeUsageBucketsFollowTheAccountFingerprint(t *testing.T) {
 		t.Fatalf("the old bucket moved to %d", old.tokens())
 	}
 }
+
+// Spend banked before any probe named the account stays unpublished while the
+// card still has no account: the gather would file it under a device fallback
+// fingerprint no later probe names, and the backend would record its
+// generation as applied. The first gather with a real account publishes it.
+func TestOpenCodeUsageWithholdsPendingSpendUntilAnAccountResolves(t *testing.T) {
+	openCodeUsageFixture(t, 1502)
+	resetOpenCodeReadinessCache()
+	t.Cleanup(resetOpenCodeReadinessCache)
+	path := "opencode-pending-bin"
+	now := time.Now()
+	parse := func() *cliAgentUsage {
+		t.Helper()
+		SetOpenCodeReadinessForceProbe(true)
+		usage, _ := openCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Path: path}, now)
+		return usage
+	}
+
+	stubOpenCodeReadiness(t, "", false)
+	run := armOpenCodeUsageRunForExecutable(path, "")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_p", "prt_p", 40, 0, 0, "0", now.UnixMilli()))
+	settleOpenCodeUsageRun(run, "")
+
+	if unresolved := parse(); unresolved.AccountFingerprint != "" || len(unresolved.Metrics) != 0 || unresolved.UsageGeneration != nil {
+		t.Fatalf("an unresolved account published pending spend: fp %q metrics %+v generation %+v",
+			unresolved.AccountFingerprint, unresolved.Metrics, unresolved.UsageGeneration)
+	}
+
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	resolved := parse()
+	if resolved.AccountFingerprint == "" || len(resolved.Metrics) == 0 || *resolved.Metrics[0].Consumed != 40 {
+		t.Fatalf("the resolved account did not adopt the pending spend: %+v", resolved.Metrics)
+	}
+	if resolved.UsageGeneration == nil {
+		t.Fatal("the resolved account withheld the generation of the spend it published")
+	}
+}
