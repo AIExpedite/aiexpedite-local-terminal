@@ -182,7 +182,13 @@ func splitScriptStatements(script string) []string {
 // `& "C:\Program Files\agy.cmd"` names agy rather than a quoted path.
 func leadingProgram(statement string) string {
 	rest := statement
-	afterEnv, afterCommand, afterExec := false, false, false
+	// Which launch builtin's options we are reading, if any. One value rather
+	// than a flag per builtin: the builtins nest (`command env -u HOME …`,
+	// `exec env -i …`), and each one's options belong to whichever was entered
+	// last. Three independent flags would instead let an outer builtin's
+	// option branch claim an inner one's flags, and `-u`/`-C`/`-a` would lose
+	// the operand they consume.
+	var optionsOf string
 	for range 10 { // bounded: a few launch prefixes, their flags, Start-Process and -FilePath
 		token, tail := nextScriptToken(rest)
 		if token == "" {
@@ -193,37 +199,33 @@ func leadingProgram(statement string) string {
 			rest = tail
 		case strings.EqualFold(token, "-filepath"):
 			rest = tail
-		case token == "exec":
-			afterExec = true
+		case token == "exec", token == "command", token == "env":
+			optionsOf = token
 			rest = tail
 		case token == "nohup":
 			rest = tail
-		// exec's own options (`exec [-cl] [-a name] [command …]`): the flags may
-		// be bundled, and an `a` anywhere in the bundle takes the name value.
-		case afterExec && strings.HasPrefix(token, "-") && token != "-":
+		case optionsOf != "" && strings.HasPrefix(token, "-") && token != "-":
 			rest = tail
-			if strings.Contains(token, "a") {
-				_, rest = nextScriptToken(tail)
-			}
-		case token == "command":
-			afterCommand, afterExec = true, false
-			rest = tail
-		// command's -p (default PATH) still runs the program; -v/-V only print
-		// where it is, so the statement runs nothing.
-		case afterCommand && strings.HasPrefix(token, "-"):
-			if strings.ContainsAny(token, "vV") {
-				return ""
-			}
-			rest = tail
-		case token == "env":
-			afterEnv, afterExec = true, false
-			rest = tail
-		// env's own options: -u NAME and -C DIR take a value; the rest (-i, -0,
-		// --, --ignore-environment, --unset=NAME) do not.
-		case afterEnv && strings.HasPrefix(token, "-"):
-			rest = tail
-			if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
-				_, rest = nextScriptToken(tail)
+			switch optionsOf {
+			// exec's own options (`exec [-cl] [-a name] [command …]`): the
+			// flags may be bundled, and an `a` anywhere in the bundle takes
+			// the name value.
+			case "exec":
+				if strings.Contains(token, "a") {
+					_, rest = nextScriptToken(tail)
+				}
+			// command's -p (default PATH) still runs the program; -v/-V only
+			// print where it is, so the statement runs nothing.
+			case "command":
+				if strings.ContainsAny(token, "vV") {
+					return ""
+				}
+			// env's own options: -u NAME and -C DIR take a value; the rest
+			// (-i, -0, --, --ignore-environment, --unset=NAME) do not.
+			case "env":
+				if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+					_, rest = nextScriptToken(tail)
+				}
 			}
 		// A POSIX env assignment prefix is not the program. `$env:X=1` is a
 		// whole PowerShell statement of its own, so it needs no case here.

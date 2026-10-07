@@ -42,6 +42,14 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"bash -c exec -cl", "bash", []string{"-c", "exec -cl claude -p hi"}, true},
 		{"bash -c exec -a name", "bash", []string{"-c", "exec -a claudish claude -p hi"}, true},
 		{"bash -c exec -ca name", "bash", []string{"-c", "exec -ca claudish claude -p hi"}, true},
+		// Nested builtins: the options belong to whichever builtin was entered
+		// last, so the inner `env`'s -u/-C still consume their operand even
+		// when an outer `exec`/`command` was parsing options of its own.
+		{"bash -c exec env -u", "bash", []string{"-c", "exec env -u HOME claude -p hi"}, true},
+		{"bash -c command env -u", "bash", []string{"-c", "command env -u HOME claude -p hi"}, true},
+		{"bash -c command -p env -C", "bash", []string{"-c", "command -p env -C /repo claude -p hi"}, true},
+		{"bash -c exec -a name env -u", "bash", []string{"-c", "exec -a claudish env -u HOME claude -p hi"}, true},
+		{"bash -c env -C dir", "bash", []string{"-c", "env -C /repo claude -p hi"}, true},
 
 		// A mention is not a spawn; a direct launch is isClaudeCommand's case.
 		{"git log --grep claude", "bash", []string{"-c", "git log --grep claude"}, false},
@@ -59,6 +67,9 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"command -v only locates", "bash", []string{"-c", "command -v claude"}, false},
 		{"command -V only describes", "bash", []string{"-c", "command -V claude"}, false},
 		{"bare env", "bash", []string{"-c", "env"}, false},
+		// The operand -u consumes is not the program, even when nested.
+		{"command env -u wrapping another program", "bash",
+			[]string{"-c", "command env -u HOME git log --grep claude"}, false},
 	}
 	for _, tc := range cases {
 		if got := commandRunsClaude(tc.command, tc.args); got != tc.want {
