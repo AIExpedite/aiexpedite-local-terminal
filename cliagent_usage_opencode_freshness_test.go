@@ -72,7 +72,7 @@ func TestOpenCodeUsage_SuccessfulSmokeThenGatherShowsTokensToday(t *testing.T) {
 	if err != nil || observed.Before(smokeStart.Truncate(time.Second)) {
 		t.Fatalf("observedAt %q is not at or after the smoke (%s)", tokens.ObservedAt, smokeStart)
 	}
-	if cost := openCodeMetricByLabel(t, usage.Metrics, "Cost today"); cost.Unit != "usd" || *cost.Consumed != 0.0123 {
+	if cost := openCodeMetricByLabel(t, usage.Metrics, "Cost today"); cost.Unit != usageUnitUSD || *cost.Consumed != 0.0123 {
 		t.Fatalf("cost row = %+v", cost)
 	}
 	if usage.UsageGeneration == nil || usage.UsageGeneration.Epoch != 1001 || usage.UsageGeneration.Counter != 1 {
@@ -194,6 +194,36 @@ func TestOpenCodeUsage_ExportCountsOnlyThisRunsMessages(t *testing.T) {
 	}
 	if steps := parseOpenCodeExportUsage([]byte(`{"unexpected":"shape"}`), debt); len(steps) != 0 {
 		t.Fatalf("an unknown shape yielded %+v, want nothing", steps)
+	}
+}
+
+func TestOpenCodeUsage_ExportSumsAMultiStepMessagesParts(t *testing.T) {
+	floor := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC).UnixMilli()
+	debt := openCodeUsageDebt{SessionID: "ses_x", RunFloorMs: floor, SettledAtMs: floor + 60_000}
+	// info.tokens is the LAST step's (OpenCode overwrites it per step); the
+	// step-finish parts carry each step's own figures; info.cost is cumulative.
+	out := []byte(fmt.Sprintf(`{"messages":[`+
+		`{"info":{"id":"m_multi","role":"assistant","tokens":{"input":30,"output":3},"cost":0.06,"time":{"created":%d}},`+
+		`"parts":[{"type":"text"},`+
+		`{"type":"step-finish","tokens":{"input":10,"output":1},"cost":0.02},`+
+		`{"type":"tool"},`+
+		`{"type":"step-finish","tokens":{"input":20,"output":2},"cost":0.01},`+
+		`{"type":"step-finish","tokens":{"input":30,"output":3},"cost":0.03}]},`+
+		`{"info":{"id":"m_info_only","role":"assistant","tokens":{"input":7},"time":{"created":%d}}}]}`,
+		floor+1, floor+2))
+	steps := parseOpenCodeExportUsage(out, debt)
+	if len(steps) != 2 {
+		t.Fatalf("got %d steps, want 2: %+v", len(steps), steps)
+	}
+	multi := steps[0]
+	if multi.Input != 60 || multi.Output != 6 {
+		t.Fatalf("multi-step message = %d in / %d out, want the summed parts 60 / 6", multi.Input, multi.Output)
+	}
+	if multi.Cost < 0.0599 || multi.Cost > 0.0601 {
+		t.Fatalf("multi-step cost = %v, want 0.06", multi.Cost)
+	}
+	if steps[1].Input != 7 {
+		t.Fatalf("a message without parts = %d in, want its info figure 7", steps[1].Input)
 	}
 }
 

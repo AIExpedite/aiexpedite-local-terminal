@@ -283,7 +283,7 @@ func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
 	if *tokens.Consumed != 1230 {
 		t.Fatalf("tokens consumed = %v, want input+output+reasoning (1230)", *tokens.Consumed)
 	}
-	if cost.Label != "Cost today" || cost.Unit != "usd" || *cost.Consumed != 0.4567 {
+	if cost.Label != "Cost today" || cost.Unit != "USD" /* wire contract: the CLI Agents card formats exactly "USD" as money */ || *cost.Consumed != 0.4567 {
 		t.Fatalf("cost row = %+v", cost)
 	}
 	for _, row := range rows {

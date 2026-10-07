@@ -902,6 +902,15 @@ func readOpenCodeExportUsage(ctx context.Context, executable string, debt openCo
 type openCodeExportMessage struct {
 	Info *openCodeExportMessageInfo `json:"info"`
 	openCodeExportMessageInfo
+	// Parts holds each step's own figures. OpenCode overwrites info.tokens on
+	// every step (it ends as the last step's), while each step-finish part
+	// keeps that step's usage, so a multi-step turn is only whole when its
+	// parts are summed, as the stream tap sums step_finish events.
+	Parts []struct {
+		Type   string          `json:"type"`
+		Tokens json.RawMessage `json:"tokens"`
+		Cost   json.RawMessage `json:"cost"`
+	} `json:"parts"`
 }
 
 type openCodeExportMessageInfo struct {
@@ -938,7 +947,7 @@ func parseOpenCodeExportUsage(out []byte, debt openCodeUsageDebt) []openCodeUsag
 		if debt.SettledAtMs > 0 && created > debt.SettledAtMs {
 			continue // a later turn on the same session pays its own debt
 		}
-		step, valid := openCodeUsageFromTokens(info.Tokens, info.Cost)
+		step, valid := openCodeExportMessageUsage(m, info)
 		if !valid {
 			continue
 		}
@@ -950,6 +959,48 @@ func parseOpenCodeExportUsage(out []byte, debt openCodeUsageDebt) []openCodeUsag
 		steps = append(steps, step)
 	}
 	return steps
+}
+
+// openCodeExportMessageUsage is one exported assistant message's usage: the
+// per-field max of its summed step-finish parts and its info. info.tokens alone
+// is the last step's, but it is all an export without parts carries, and
+// info.cost is already cumulative. valid is false when neither carries a
+// readable figure.
+func openCodeExportMessageUsage(m openCodeExportMessage, info openCodeExportMessageInfo) (openCodeUsageStep, bool) {
+	var summed openCodeUsageStep
+	stepsValid := false
+	for _, part := range m.Parts {
+		if !isOpenCodeStepFinishType(part.Type) {
+			continue
+		}
+		s, ok := openCodeUsageFromTokens(part.Tokens, part.Cost)
+		if !ok {
+			continue
+		}
+		stepsValid = true
+		summed.Input = addOpenCodeUsageCount(summed.Input, s.Input)
+		summed.Output = addOpenCodeUsageCount(summed.Output, s.Output)
+		summed.Reasoning = addOpenCodeUsageCount(summed.Reasoning, s.Reasoning)
+		summed.CacheRead = addOpenCodeUsageCount(summed.CacheRead, s.CacheRead)
+		summed.CacheWrite = addOpenCodeUsageCount(summed.CacheWrite, s.CacheWrite)
+		summed.Cost = addOpenCodeUsageCost(summed.Cost, s.Cost)
+	}
+	fromInfo, infoValid := openCodeUsageFromTokens(info.Tokens, info.Cost)
+	switch {
+	case stepsValid && infoValid:
+		return openCodeUsageStep{
+			Input:      max(summed.Input, fromInfo.Input),
+			Output:     max(summed.Output, fromInfo.Output),
+			Reasoning:  max(summed.Reasoning, fromInfo.Reasoning),
+			CacheRead:  max(summed.CacheRead, fromInfo.CacheRead),
+			CacheWrite: max(summed.CacheWrite, fromInfo.CacheWrite),
+			Cost:       max(summed.Cost, fromInfo.Cost),
+		}, true
+	case stepsValid:
+		return summed, true
+	default:
+		return fromInfo, infoValid
+	}
 }
 
 // resetOpenCodeUsageFreshness stops every booked attempt (tests).

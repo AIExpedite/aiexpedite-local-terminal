@@ -555,7 +555,7 @@ func openCodeUsageMetrics(bucket openCodeUsageBucket, ok bool, now time.Time) []
 		metrics = append(metrics, cliAgentUsageMetric{
 			Kind:       limitKindDaily,
 			Label:      "Cost today",
-			Unit:       "usd",
+			Unit:       usageUnitUSD,
 			Consumed:   &cost,
 			ResetAt:    reset,
 			ObservedAt: observedAt,
@@ -874,6 +874,11 @@ func openCodeUsageFromTokens(tokensRaw, costRaw json.RawMessage) (openCodeUsageS
 	}
 	return step, valid
 }
+
+// usageUnitUSD is the unit of a money metric. The CLI Agents card formats a
+// reading in exactly this unit as currency (two decimals), so it must not be
+// lower-cased.
+const usageUnitUSD = "USD"
 
 // openCodeUsageMaxInt bounds a token count or timestamp before its int64
 // conversion: the largest integer a float64 holds exactly. Past the int64 range
