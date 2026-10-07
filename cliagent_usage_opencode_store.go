@@ -144,9 +144,17 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 		return openCodeFinishPass(openCodeReconcileResult{Outcome: openCodeReconcileLaunchError})
 	}
 
-	sessions, listOutcome := listOpenCodeSessionsForUsage(ctx, path)
+	sessions, truncated, listOutcome := listOpenCodeSessionsForUsage(ctx, path)
 	if listOutcome != "" {
 		return openCodeFinishPass(openCodeReconcileResult{Outcome: listOutcome})
+	}
+	if truncated {
+		// More sessions than one pass will ever consider: whatever the cut
+		// dropped is uncounted, so say so rather than letting the totals read
+		// as complete.
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			return openCodeLedgerEdit{Changed: openCodeMarkTodayPartial(l, openCodeUsageNow())}
+		})
 	}
 
 	ledger := readOpenCodeUsageLedger()
@@ -335,25 +343,30 @@ func openCodeForgetSkippedSession(ledger *openCodeUsageLedger, sessionID string)
 
 /* ─────────────────────────────── commands ───────────────────────────── */
 
-// listOpenCodeSessionsForUsage asks OpenCode what changed. The second return is
-// "" on success, or the closed outcome the pass must report.
-func listOpenCodeSessionsForUsage(ctx context.Context, path string) ([]openCodeSessionRow, string) {
+// listOpenCodeSessionsForUsage asks OpenCode what changed. `truncated` reports a
+// list longer than openCodeSessionListMaxSessions, of which only the most
+// recently active are considered — the day is then a lower bound, because a
+// changed session the cut dropped is never exported. The last return is "" on
+// success, or the closed outcome the pass must report.
+func listOpenCodeSessionsForUsage(ctx context.Context, path string) (rows []openCodeSessionRow, truncated bool, outcome string) {
 	stdout, _, err := openCodeRunCommand(ctx, path,
 		[]string{"session", "list", "--format", "json"}, openCodeSessionListMaxStdout)
-	if outcome := openCodeCommandOutcome(ctx, err); outcome != "" {
-		return nil, outcome
+	if ctx.Err() != nil {
+		return nil, false, openCodeReconcileTimeout
 	}
-	rows, ok := parseOpenCodeSessionList(stdout)
+	// The ANSWER decides, not the exit status: a build that prints a usable
+	// list and then exits non-zero (an update notice on stderr, a warning) must
+	// not be read as one that cannot answer at all — `unsupported` RETIRES the
+	// debt, so a transient non-zero exit would permanently drop the reading.
+	parsed, ok := parseOpenCodeSessionList(stdout)
 	if !ok {
-		// A build that prints a human table rather than JSON: nothing a retry
-		// can fix.
-		return nil, openCodeReconcileUnsupported
+		return nil, false, openCodeCommandOutcome(err)
 	}
-	if len(rows) > openCodeSessionListMaxSessions {
-		sort.SliceStable(rows, func(i, j int) bool { return rows[i].updatedMs > rows[j].updatedMs })
-		rows = rows[:openCodeSessionListMaxSessions]
+	if len(parsed) > openCodeSessionListMaxSessions {
+		sort.SliceStable(parsed, func(i, j int) bool { return parsed[i].updatedMs > parsed[j].updatedMs })
+		parsed, truncated = parsed[:openCodeSessionListMaxSessions], true
 	}
-	return rows, ""
+	return parsed, truncated, ""
 }
 
 // exportOpenCodeSessionUsage exports one session and folds its assistant
@@ -362,32 +375,31 @@ func listOpenCodeSessionsForUsage(ctx context.Context, path string) ([]openCodeS
 func exportOpenCodeSessionUsage(ctx context.Context, path, sessionID string) ([]openCodeObservedMessage, bool, string) {
 	stdout, filled, err := openCodeRunCommand(ctx, path,
 		[]string{"export", sessionID}, openCodeExportMaxStdout)
-	if outcome := openCodeCommandOutcome(ctx, err); outcome != "" {
-		return nil, filled, outcome
+	if ctx.Err() != nil {
+		return nil, filled, openCodeReconcileTimeout
 	}
 	if filled {
 		return nil, true, ""
 	}
 	observations, ok := parseOpenCodeExport(stdout, sessionID)
 	if !ok {
-		return nil, false, openCodeReconcileUnsupported
+		return nil, false, openCodeCommandOutcome(err)
 	}
 	return observations, false, ""
 }
 
-// openCodeCommandOutcome classifies a command's failure: the budget (or a hung
-// child the deadline killed) is a timeout, anything else a launch error. "" for
-// a clean exit.
-func openCodeCommandOutcome(ctx context.Context, err error) string {
-	if ctx.Err() != nil {
-		return openCodeReconcileTimeout
-	}
+// openCodeCommandOutcome classifies a command whose OUTPUT we could not read: a
+// non-zero exit is a build without the subcommand (`unsupported`, which retires
+// the debt because no retry can fix it), anything else — a missing binary, an
+// unrenderable Windows shim, a pipe failure — is `launch_error`, which the
+// ladder retries. A clean exit that printed nothing we recognise is
+// `unsupported` for the same reason as a non-zero one.
+func openCodeCommandOutcome(err error) string {
 	if err == nil {
-		return ""
+		return openCodeReconcileUnsupported
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		// A non-zero exit from a command this build does not have.
 		return openCodeReconcileUnsupported
 	}
 	return openCodeReconcileLaunchError
@@ -461,14 +473,18 @@ func parseOpenCodeExport(stdout []byte, sessionID string) ([]openCodeObservedMes
 		return nil, false
 	}
 	var export openCodeExportJSON
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if decoder.Decode(&export) != nil || export.Messages == nil {
+	if json.NewDecoder(bytes.NewReader(body)).Decode(&export) != nil {
+		// Some releases print the messages as a bare array.
 		var bare []openCodeExportMessageJSON
 		if json.Unmarshal(body, &bare) != nil {
 			return nil, false
 		}
 		export.Messages = bare
 	}
+	// A recognised object with no `messages` key is an EMPTY session — a real,
+	// readable answer. Treating it as unsupported would retire the debt (and
+	// stand down the whole feature) on a session that simply holds no
+	// assistant turn.
 	out := make([]openCodeObservedMessage, 0, len(export.Messages))
 	for _, message := range export.Messages {
 		info := message.Info
@@ -543,7 +559,29 @@ const (
 	// openCodeDiscoveryMaxStats bounds the whole walk's stat calls, so a data
 	// directory with thousands of projects cannot turn a gather into a scan.
 	openCodeDiscoveryMaxStats = 256
+	// openCodeDiscoveryMaxDirEntries bounds how many entries ONE directory
+	// contributes. os.ReadDir materialises and sorts every entry, so a project
+	// root with tens of thousands of slugs — or a flat session directory with a
+	// file per session — would be a large unbounded read on the gather path
+	// even though the stat budget above caps what we then look at.
+	openCodeDiscoveryMaxDirEntries = 4 * openCodeDiscoveryMaxSlugs
 )
+
+// openCodeReadDirBounded lists at most `limit` entries of a directory, in the
+// order the filesystem returns them (no sort, unlike os.ReadDir). Nil on any
+// error — discovery is best-effort and a missing root is the normal case.
+func openCodeReadDirBounded(path string, limit int) []os.DirEntry {
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = dir.Close() }()
+	entries, err := dir.ReadDir(limit)
+	if err != nil && len(entries) == 0 {
+		return nil
+	}
+	return entries
+}
 
 // openCodeSessionStoreChangedSince reports whether any session directory
 // OpenCode might write changed after `since` — the only evidence this feature
@@ -577,11 +615,7 @@ func openCodeSessionStoreChangedSince(since time.Time) bool {
 	}
 	for _, dir := range openCodeSessionDirs("") {
 		note(dir)
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
+		for _, entry := range openCodeReadDirBounded(dir, openCodeDiscoveryMaxDirEntries) {
 			if !entry.IsDir() {
 				continue
 			}
@@ -602,8 +636,8 @@ func openCodeProjectSessionDirs(stats *int) []string {
 	if base == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(filepath.Join(base, "project"))
-	if err != nil {
+	entries := openCodeReadDirBounded(filepath.Join(base, "project"), openCodeDiscoveryMaxDirEntries)
+	if len(entries) == 0 {
 		return nil
 	}
 	type ranked struct {

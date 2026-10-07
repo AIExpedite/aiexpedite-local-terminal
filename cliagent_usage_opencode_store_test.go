@@ -43,8 +43,9 @@ type openCodeCLIStub struct {
 	// subcommand).
 	exitError bool
 
-	calls    []string
-	exports2 int
+	calls []string
+	// exportsRun counts `export` invocations, which is where the cost bound is.
+	exportsRun int
 }
 
 func (s *openCodeCLIStub) record(args []string) {
@@ -52,7 +53,7 @@ func (s *openCodeCLIStub) record(args []string) {
 	defer s.mu.Unlock()
 	s.calls = append(s.calls, strings.Join(args, " "))
 	if args[0] == "export" {
-		s.exports2++
+		s.exportsRun++
 	}
 }
 
@@ -65,7 +66,7 @@ func (s *openCodeCLIStub) recorded() []string {
 func (s *openCodeCLIStub) exportCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.exports2
+	return s.exportsRun
 }
 
 // install wires the stub into the pass and returns it.
@@ -517,5 +518,99 @@ func TestOpenCodeJSONBody_SkipsABannerBeforeTheJSON(t *testing.T) {
 	}
 	if _, ok := parseOpenCodeSessionList([]byte("  ID   TITLE\n  a    b\n")); ok {
 		t.Fatal("a human table must read as unsupported")
+	}
+}
+
+/* ───────────────────── a usable answer outranks the exit ───────────────── */
+
+func TestOpenCodeReconcile_AUsableAnswerOutranksANonZeroExit(t *testing.T) {
+	// `unsupported` RETIRES the debt, so reading a transient non-zero exit (an
+	// update notice, a warning) as "this build cannot answer" would drop the
+	// reading permanently. The ANSWER decides.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+
+	openCodeUsageBinary = func() string { return "opencode-stub" }
+	openCodeRunCommand = func(_ context.Context, _ string, args []string, _ int) ([]byte, bool, error) {
+		if args[0] == "session" {
+			return []byte(sessionList(openCodeSessionRow{"ses_a", created})), false, &exec.ExitError{}
+		}
+		return []byte(exportWith("ses_a", "msg_a", created, 8, 2, "0")), false, &exec.ExitError{}
+	}
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok — the output was readable", result.Outcome)
+	}
+	if tokens, _, _ := todayTotals(t, now); tokens != 10 {
+		t.Fatalf("tokens = %d, want the readable answer's 10", tokens)
+	}
+}
+
+func TestOpenCodeReconcile_AnEmptyExportObjectIsNotUnsupported(t *testing.T) {
+	// `{}` is a session with no assistant turn — a real answer. Reading it as
+	// unsupported would retire the debt and stand the whole feature down.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{
+		sessions: sessionList(openCodeSessionRow{"ses_empty", now.UnixMilli()}),
+		exports:  map[string]string{"ses_empty": "{}"},
+	}).install(t)
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok", result.Outcome)
+	}
+	if readOpenCodeUsageLedger().ReconcileCursorMs != now.UnixMilli() {
+		t.Fatal("the cursor must still advance past an empty session")
+	}
+}
+
+func TestOpenCodeReconcile_AnUnreadableAnswerKeepsItsFailureClass(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"a non-zero exit with no readable output is unsupported", &exec.ExitError{}, openCodeReconcileUnsupported},
+		{"a clean exit printing nothing we recognise is unsupported", nil, openCodeReconcileUnsupported},
+		{"a missing binary is launch_error", errors.New("exec: not found"), openCodeReconcileLaunchError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openCodeUsageFixture(t, now)
+			openCodeUsageBinary = func() string { return "opencode-stub" }
+			openCodeRunCommand = func(context.Context, string, []string, int) ([]byte, bool, error) {
+				return []byte("  ID  TITLE\n"), false, tc.err
+			}
+			if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != tc.want {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenCodeReconcile_ATruncatedSessionListMakesTheDayALowerBound(t *testing.T) {
+	// Past openCodeSessionListMaxSessions only the most recently active are
+	// considered, so a changed session the cut dropped is never exported. The
+	// totals must not read as complete.
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	created := now.UnixMilli()
+	rows := make([]openCodeSessionRow, 0, openCodeSessionListMaxSessions+5)
+	for i := 0; i < openCodeSessionListMaxSessions+5; i++ {
+		rows = append(rows, openCodeSessionRow{fmt.Sprintf("ses_%d", i), created + int64(i)})
+	}
+	(&openCodeCLIStub{sessions: sessionList(rows...)}).install(t)
+
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day == nil || !day.Partial {
+		t.Fatalf("day = %+v, want the lower-bound notice", day)
+	}
+	// A list inside the bound says nothing of the kind.
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{sessions: sessionList(rows[:3]...)}).install(t)
+	reconcileOpenCodeUsageOnce(context.Background(), now)
+	if day := readOpenCodeUsageLedger().Days[openCodeDayKey(now)]; day != nil && day.Partial {
+		t.Fatal("a list inside the bound must not mark the day partial")
 	}
 }

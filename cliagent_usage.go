@@ -46,6 +46,17 @@ const (
 	limitKindTokens   = "tokens"
 )
 
+// Metric UNITS are free-form display strings (the frontend renders whatever a
+// parser sends), with one exception: `usageUnitUSD` is load-bearing, because
+// CapacityBar formats a money reading to two decimals rather than rounding it
+// to a whole number. Keep it in lockstep with USD_UNIT in
+// frontend/src/app/[workspaceID]/settings/CapacityBar.jsx — a rename on either
+// side silently reverts "0.37 USD used" to "0 USD used".
+const (
+	usageUnitUSD    = "USD"
+	usageUnitTokens = "tokens"
+)
+
 // cliAgentUsageMetric is one row of the capacity table the UI renders.
 // `Unknown=true` means the limit exists but the current value is unobservable;
 // the UI renders a dashed gauge. Total/Remaining/Consumed are intentionally

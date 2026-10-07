@@ -283,8 +283,11 @@ func noteCLIUsageObservationAdvanced(provider string, generation cliUsageGenerat
 	}
 	now := time.Now()
 	idle := state.pending == nil || state.pending.followUp
+	// retryAt is deliberately KEPT: it is the boundary a closed gate (offline,
+	// draining, unregistered) booked, and clearing it would let a device that
+	// keeps committing observations re-check that gate every debounce instead
+	// of once per spacing window.
 	state.pending = &cliUsagePendingHint{generation: generation, noteAt: now}
-	state.retryAt = time.Time{}
 	if p.cfg != nil {
 		if due, ok := p.nextDueLocked(state, now); ok && idle && due.Sub(now) > cliUsageHintDebounce {
 			// Throttled by the global spacing: kept, carrying the newest

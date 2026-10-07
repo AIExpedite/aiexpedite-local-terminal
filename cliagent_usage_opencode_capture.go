@@ -463,7 +463,13 @@ func openCodeMergeObservations(ledger *openCodeUsageLedger, observations []openC
 			continue
 		}
 		merged, raised := openCodeMergeMessageUsage(current, obs.Usage)
-		if !raised && held {
+		if !raised {
+			// Nothing rose: either a replayed observation of a row we already
+			// hold, or a message that reported no figures at all (a turn whose
+			// only event was a step_start). Neither changes what the card
+			// renders, so neither may add a row or move the generation — a row
+			// of zeros would inflate the day's row count against its cap and
+			// earn the backend a hint with nothing new to fetch.
 			continue
 		}
 		merged.ObservedAtMs = commitMs
@@ -612,10 +618,6 @@ const openCodeUsagePartialNotice = "Some OpenCode activity today could not be co
 // are still queued. Otherwise no row at all, never an "unknown" placeholder.
 func openCodeLedgerMetrics(now time.Time) ([]cliAgentUsageMetric, *cliUsageGeneration, bool) {
 	ledger := readOpenCodeUsageLedger()
-	return openCodeMetricsFromLedger(ledger, now)
-}
-
-func openCodeMetricsFromLedger(ledger openCodeUsageLedger, now time.Time) ([]cliAgentUsageMetric, *cliUsageGeneration, bool) {
 	var generation *cliUsageGeneration
 	if ledger.Generation.Counter > 0 && ledger.Generation.Epoch == openCodeProcessGenerationEpoch.Load() {
 		g := ledger.Generation
@@ -626,18 +628,19 @@ func openCodeMetricsFromLedger(ledger openCodeUsageLedger, now time.Time) ([]cli
 	resetAt := openCodeNextLocalMidnight(now).UTC().Format(time.RFC3339)
 
 	var tokens, costMicros, observedAtMs int64
-	for _, usage := range dayMessages(day) {
-		tokens += usage.In + usage.Out + usage.Reasoning
-		costMicros += usage.CostMicros
-		if usage.ObservedAtMs > observedAtMs {
-			observedAtMs = usage.ObservedAtMs
-		}
-	}
 	if day == nil || len(day.Messages) == 0 {
 		if !openCodeZeroRowPublishable(ledger, now) {
 			return nil, generation, partial
 		}
 		observedAtMs = ledger.LastSuccessfulReconcileAtMs
+	} else {
+		for _, usage := range day.Messages {
+			tokens += usage.In + usage.Out + usage.Reasoning
+			costMicros += usage.CostMicros
+			if usage.ObservedAtMs > observedAtMs {
+				observedAtMs = usage.ObservedAtMs
+			}
+		}
 	}
 
 	observedAt := ""
@@ -647,7 +650,7 @@ func openCodeMetricsFromLedger(ledger openCodeUsageLedger, now time.Time) ([]cli
 	metrics := []cliAgentUsageMetric{{
 		Kind:       limitKindDaily,
 		Label:      "Tokens today",
-		Unit:       "tokens",
+		Unit:       usageUnitTokens,
 		Consumed:   usageFloatPtr(float64(tokens)),
 		ResetAt:    resetAt,
 		ObservedAt: observedAt,
@@ -656,20 +659,13 @@ func openCodeMetricsFromLedger(ledger openCodeUsageLedger, now time.Time) ([]cli
 		metrics = append(metrics, cliAgentUsageMetric{
 			Kind:       limitKindDaily,
 			Label:      "Cost today",
-			Unit:       "USD",
+			Unit:       usageUnitUSD,
 			Consumed:   usageFloatPtr(float64(costMicros) / 1e6),
 			ResetAt:    resetAt,
 			ObservedAt: observedAt,
 		})
 	}
 	return metrics, generation, partial
-}
-
-func dayMessages(day *openCodeLedgerDay) map[string]openCodeMessageUsage {
-	if day == nil {
-		return nil
-	}
-	return day.Messages
 }
 
 // openCodeZeroRowPublishable reports whether "0 tokens today" is a statement we

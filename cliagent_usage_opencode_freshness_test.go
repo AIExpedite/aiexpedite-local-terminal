@@ -595,3 +595,35 @@ func TestOpenCodeLedger_SurvivesAnOpenCodeUpgrade(t *testing.T) {
 		t.Fatalf("generation %+v did not advance past %+v", after, generationBefore)
 	}
 }
+
+func TestOpenCodeDiscovery_BoundsWhatOneDirectoryContributes(t *testing.T) {
+	// os.ReadDir materialises AND sorts every entry, so a project root with
+	// tens of thousands of slugs would be a large unbounded read on the gather
+	// path even though the stat budget caps what we then look at.
+	data := t.TempDir()
+	t.Setenv("OPENCODE_DATA", data)
+	t.Setenv("XDG_DATA_HOME", "")
+	root := filepath.Join(data, "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < openCodeDiscoveryMaxDirEntries+50; i++ {
+		if err := os.Mkdir(filepath.Join(root, fmt.Sprintf("slug-%05d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(openCodeReadDirBounded(root, openCodeDiscoveryMaxDirEntries)); got != openCodeDiscoveryMaxDirEntries {
+		t.Fatalf("read %d entries, want the bound %d", got, openCodeDiscoveryMaxDirEntries)
+	}
+	// And the walk still completes inside its stat budget rather than hanging
+	// or panicking on the breadth.
+	stats := 0
+	if dirs := openCodeProjectSessionDirs(&stats); stats > openCodeDiscoveryMaxStats || len(dirs) > 2*openCodeDiscoveryMaxSlugs {
+		t.Fatalf("stats=%d dirs=%d, want <= %d / %d", stats, len(dirs),
+			openCodeDiscoveryMaxStats, 2*openCodeDiscoveryMaxSlugs)
+	}
+	// A missing root is the normal case and reads as nothing.
+	if got := openCodeReadDirBounded(filepath.Join(data, "absent"), 8); got != nil {
+		t.Fatalf("a missing directory read as %v, want nil", got)
+	}
+}

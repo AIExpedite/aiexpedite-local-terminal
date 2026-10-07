@@ -645,3 +645,69 @@ func TestOpenCodeLedger_CorruptFileReadsAsEmpty(t *testing.T) {
 		t.Fatalf("ledger on disk = %s", raw)
 	}
 }
+
+func TestOpenCodeMerge_AMessageWithNoFiguresAddsNoRow(t *testing.T) {
+	// A turn whose only event named a messageID (a step_start, a text delta)
+	// reports nothing. A row of zeros would count against the day's row cap and
+	// move the generation, earning the backend a hint with nothing to fetch.
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+
+	handle := armOpenCodeUsageRun("unit")
+	handle.Observe(`{"type":"step_start","timestamp":` + strconv.FormatInt(now.UnixMilli(), 10) +
+		`,"sessionID":"ses_1","part":{"messageID":"msg_1","type":"step-start"}}`)
+	handle.Observe(`{"type":"text","timestamp":` + strconv.FormatInt(now.UnixMilli(), 10) +
+		`,"sessionID":"ses_1","part":{"messageID":"msg_1","type":"text","text":"hi"}}`)
+	// No step_finish at all, so the run also owes a reconcile.
+	if !handle.Finish(true) {
+		t.Fatal("a run that reported no tokens must owe a reconcile")
+	}
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+
+	if _, _, rows := todayTotals(t, now); rows != 0 {
+		t.Fatalf("rows = %d, want none", rows)
+	}
+	if generation := readOpenCodeUsageLedger().Generation; generation.Counter != 0 {
+		t.Fatalf("generation = %+v, want it untouched", generation)
+	}
+}
+
+func TestOpenCodeMerge_AReplayedObservationMovesNothing(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	merge := func() {
+		updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
+			return openCodeLedgerEdit{TotalsChanged: openCodeMergeObservations(l, []openCodeObservedMessage{{
+				SessionID: "s", MessageID: "m", EventAt: now,
+				Usage: openCodeMessageUsage{In: 9, Out: 2},
+			}}, now.UnixMilli())}
+		})
+	}
+	merge()
+	first := readOpenCodeUsageLedger().Generation
+	merge()
+	if again := readOpenCodeUsageLedger().Generation; again != first {
+		t.Fatalf("generation moved on a replay: %+v -> %+v", first, again)
+	}
+}
+
+func TestOpenCodeLedgerMetrics_UnitsAreTheOnesTheCardFormatsOn(t *testing.T) {
+	// CapacityBar BRANCHES on the USD unit (two decimals rather than a whole
+	// number), so this is a cross-service contract, not display text: a rename
+	// here silently reverts "0.37 USD used" to "0 USD used".
+	if usageUnitUSD != "USD" || usageUnitTokens != "tokens" {
+		t.Fatalf("units = %q/%q, want USD/tokens — see CapacityBar.jsx USD_UNIT",
+			usageUnitUSD, usageUnitTokens)
+	}
+	now := openCodeFixtureRunAt
+	openCodeUsageFixture(t, now)
+	handle := armOpenCodeUsageRun("unit")
+	observeFixture(t, handle, "run_two_steps.jsonl")
+	handle.Finish(true)
+	openCodeUsageRefreshWaitFor(2 * time.Second)
+
+	metrics, _, _ := openCodeLedgerMetrics(now)
+	if len(metrics) != 2 || metrics[0].Unit != usageUnitTokens || metrics[1].Unit != usageUnitUSD {
+		t.Fatalf("metrics = %+v, want the tokens then USD units", metrics)
+	}
+}

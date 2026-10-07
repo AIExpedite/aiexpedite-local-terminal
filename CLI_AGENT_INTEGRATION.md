@@ -2256,7 +2256,15 @@ native capture and the TUI write today. At most 64 slugs, ranked by the newer of
 those two directories' mtimes (not the slug directory's own, which does not move
 when a file inside it is rewritten), inside a 256-stat total. A newest mtime later
 than `lastPassStartedAtMs` nudges the worker, on its cooldown. A layout outside
-this walk is recovered only by a Refresh click or a managed run's debt.
+this walk is recovered only by a Refresh click or a managed run's debt. One
+directory contributes at most `openCodeDiscoveryMaxDirEntries` entries
+(`openCodeReadDirBounded`, not `os.ReadDir`, which materialises and sorts
+everything), so a project root with tens of thousands of slugs cannot turn a
+gather into a large read.
+
+A session list longer than `openCodeSessionListMaxSessions` is cut to the most
+recently active, and the day is marked `partial`: whatever the cut dropped is
+never exported, so the totals must not read as complete.
 
 `StartAgent` calls `SetOpenCodeUsageRefreshEnabled(true)` and
 `payOwedOpenCodeUsageRefresh()`; `gracefulShutdown` calls
@@ -2304,7 +2312,10 @@ real CLI is still the post-update smoke on a Windows device.**
 
 The same gap applies to the usage reconciliation: no unit test can prove
 `session list --format json` and `export <id>` exist and print the shapes the
-pass decodes. The store tests stub the command seam and assert the BOUNDS; the
+pass decodes. The ANSWER decides, not the exit status: a build that prints a
+usable list and then exits non-zero is still read, because `unsupported`
+retires the debt and a transient non-zero exit would otherwise drop the reading
+permanently. The store tests stub the command seam and assert the BOUNDS; the
 opt-in Windows gate
 ([cliagent_smoke_opencode_live_windows_test.go](cliagent_smoke_opencode_live_windows_test.go),
 `TestOpenCodeLiveGate_UsageReconcileAnswersFromTheRealInstall`) is the only place
