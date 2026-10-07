@@ -50,6 +50,15 @@ func TestCommandRunsClaude(t *testing.T) {
 		{"bash -c command -p env -C", "bash", []string{"-c", "command -p env -C /repo claude -p hi"}, true},
 		{"bash -c exec -a name env -u", "bash", []string{"-c", "exec -a claudish env -u HOME claude -p hi"}, true},
 		{"bash -c env -C dir", "bash", []string{"-c", "env -C /repo claude -p hi"}, true},
+		// env's -S/--split-string operand IS the command, so the program is
+		// inside it, however the option is written.
+		{"bash -c env -S", "bash", []string{"-c", `env -S 'claude -p hi'`}, true},
+		{"bash -c env -S attached", "bash", []string{"-c", `env -S'claude -p hi'`}, true},
+		{"bash -c env --split-string", "bash", []string{"-c", `env --split-string='claude -p hi'`}, true},
+		{"bash -c env -iS bundle", "bash", []string{"-c", `env -iS'claude -p hi'`}, true},
+		{"bash -c env -S assignment then claude", "bash", []string{"-c", `env -S 'FOO=1 claude -p hi'`}, true},
+		{"bash -c exec env -S", "bash", []string{"-c", `exec env -S 'claude -p hi'`}, true},
+		{"bash -c env -u HOME -S", "bash", []string{"-c", `env -u HOME -S 'claude -p hi'`}, true},
 
 		// A mention is not a spawn; a direct launch is isClaudeCommand's case.
 		{"git log --grep claude", "bash", []string{"-c", "git log --grep claude"}, false},
@@ -70,6 +79,10 @@ func TestCommandRunsClaude(t *testing.T) {
 		// The operand -u consumes is not the program, even when nested.
 		{"command env -u wrapping another program", "bash",
 			[]string{"-c", "command env -u HOME git log --grep claude"}, false},
+		// -S holds a command, so a mention inside it is still only a mention.
+		{"env -S wrapping another program", "bash",
+			[]string{"-c", `env -S 'git log --grep claude'`}, false},
+		{"env -S with no operand", "bash", []string{"-c", "env -S"}, false},
 	}
 	for _, tc := range cases {
 		if got := commandRunsClaude(tc.command, tc.args); got != tc.want {

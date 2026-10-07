@@ -1352,13 +1352,21 @@ func claudeAnyRowObserved(rows []int64) bool {
 // cliUsageGenerationSources. A cache another account owns, or one that has
 // never published and renders nothing, is left alone (neither rotated nor
 // refused).
+//
+// An UNRESOLVED account (the credential read transiently failed, so the
+// fingerprint is empty) against a scoped cache is refused instead, so the
+// rotation is retried: the ordinary stamp only bumps on a row advance, so a
+// reading the previous process captured would otherwise keep the old epoch —
+// unhinted and absent from refresh receipts — until some later reading moved a
+// row. Retrying costs one credential read and one stat per minute, the same
+// local work the watcher already does, and no request.
 func claudeRotateGenerationEpoch(time.Time) (rotated, refused bool) {
 	if claudeGenerationRotated.Load() {
 		return true, false
 	}
 	fingerprint := currentClaudeAccountFingerprint()
 	if snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath()); ok && snap.AccountFingerprint != fingerprint {
-		return false, false
+		return false, fingerprint == "" && snap.AccountFingerprint != ""
 	}
 	_, _, refused = claudeStampGeneration(fingerprint, nil, true)
 	if claudeGenerationRotated.Load() {

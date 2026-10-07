@@ -176,7 +176,8 @@ func splitScriptStatements(script string) []string {
 
 // leadingProgram returns the program a statement runs, or "" when it runs none.
 // Env-var prefixes (`FOO=bar agy …`), the POSIX launch builtins `exec` and
-// `env` (both with their option flags), `nohup` and `command` (its -p form too;
+// `env` (both with their option flags; env's -S operand is scanned, since it
+// holds the command), `nohup` and `command` (its -p form too;
 // -v/-V run nothing), and PowerShell's Start-Process / its
 // -FilePath flag are stepped over, and one pair of outer quotes is stripped so
 // `& "C:\Program Files\agy.cmd"` names agy rather than a quoted path.
@@ -223,8 +224,19 @@ func leadingProgram(statement string) string {
 			// env's own options: -u NAME and -C DIR take a value; the rest
 			// (-i, -0, --, --ignore-environment, --unset=NAME) do not.
 			case "env":
-				if token == "-u" || token == "--unset" || token == "-C" || token == "--chdir" {
+				switch {
+				case token == "-u" || token == "--unset" || token == "-C" || token == "--chdir":
 					_, rest = nextScriptToken(tail)
+				// -S/--split-string=S holds the command itself
+				// (`env -S 'claude -p hi'`), written attached or detached, so
+				// the program is INSIDE the operand: scan it in place of the
+				// operand rather than past it. Its own trailing args stay
+				// after it, exactly as env appends them.
+				case splitStringOperand(token) != "":
+					rest = splitStringOperand(token) + " " + tail
+				case token == "-S" || token == "--split-string":
+					operand, after := nextScriptToken(tail)
+					rest = operand + " " + after
 				}
 			}
 		// A POSIX env assignment prefix is not the program. `$env:X=1` is a
@@ -236,6 +248,33 @@ func leadingProgram(statement string) string {
 		}
 	}
 	return ""
+}
+
+// splitStringOperand returns the operand attached to env's -S/--split-string
+// option (`-S'claude -p hi'`, `-iS'…'`, `--split-string=…`), or "" when the
+// token carries none. Short options bundle, so an `S` anywhere in a bundle
+// takes the rest of the token as its operand.
+func splitStringOperand(token string) string {
+	if operand, ok := strings.CutPrefix(token, "--split-string="); ok {
+		return trimScriptQuotes(operand)
+	}
+	if strings.HasPrefix(token, "--") {
+		return ""
+	}
+	if i := strings.IndexByte(token, 'S'); i > 0 {
+		return trimScriptQuotes(token[i+1:])
+	}
+	return ""
+}
+
+// trimScriptQuotes removes one pair of outer quotes, the same unquoting
+// nextScriptToken applies. An attached operand keeps its quotes, because they
+// sit inside the token rather than at its edges.
+func trimScriptQuotes(s string) string {
+	if len(s) >= 2 && (s[0] == '\'' || s[0] == '"') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // isEnvAssignmentToken reports whether a token is a POSIX `NAME=value` env

@@ -360,3 +360,52 @@ func TestClaudeGeneration_SnapshotFieldsAreIntegersOnly(t *testing.T) {
 		t.Fatalf("generationRowObservedMs = %s, want integers", fields["generationRowObservedMs"])
 	}
 }
+
+// The startup rotation leaves another ACCOUNT's cache alone, but an account it
+// could not RESOLVE (a transient credential-read failure, so the fingerprint is
+// empty) is a refusal the propagator retries. Reported as "left alone", the
+// reading the previous process captured would keep the old epoch — never
+// hinted, never in a refresh receipt — because the ordinary stamp only bumps
+// when a displayed row moves.
+func TestClaudeRotateGenerationEpoch_UnresolvedAccountIsRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		email       string
+		wantRefused bool
+	}{
+		{"unresolved account over a scoped cache", "", true},
+		{"another account that did resolve", "ada@example.com", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withCodexGenerationEpoch(t, 9301)
+			cache := filepath.Join(t.TempDir(), "claude_rate_limits.json")
+			t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+			configDir := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+			if tc.email != "" {
+				helperWriteJSON(t, filepath.Join(configDir, ".credentials.json"),
+					map[string]any{"email": tc.email})
+			}
+			now := time.Now()
+			// A reading the previous process captured, scoped to an account
+			// that is not the one resolved here.
+			mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {
+					UsedPercentage: 30, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+					ObservedAtMs: now.UnixMilli(), usageKnown: true,
+				},
+			}, now, "someone-elses-fingerprint")
+
+			rotated, refused := claudeRotateGenerationEpoch(now)
+			if rotated {
+				t.Fatalf("rotated another account's cache")
+			}
+			if refused != tc.wantRefused {
+				t.Fatalf("refused = %v, want %v", refused, tc.wantRefused)
+			}
+			if snap := claudeCacheSnapshot(t, cache); snap.GenerationEpoch == 9301 {
+				t.Fatalf("stamped another account's cache: %+v", snap)
+			}
+		})
+	}
+}
