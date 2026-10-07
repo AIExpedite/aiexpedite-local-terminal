@@ -692,7 +692,11 @@ func claudeUsageFallbackGeneration() *cliUsageGeneration {
 	}
 	snap, ok := claudeUsageFallbackLoad(path)
 	if !ok {
-		return nil
+		// An own cache that exists but does not parse (a partial or manual
+		// write) holds no account scope or generation to protect, so it is
+		// treated like an absent one: the pinned import's merge replaces it.
+		// Returning nil here would stop every fallback before the pinned cache.
+		return importPinnedClaudeObservationsIntoAbsentCache()
 	}
 	// A hook pinned to another channel's cache commits there; its newer
 	// readings advance this agent's own generation once imported.

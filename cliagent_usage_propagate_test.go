@@ -861,6 +861,47 @@ func TestCLIUsageHint_FallbackHintsAPinnedReadingWithNoOwnCache(t *testing.T) {
 	}
 }
 
+// An own cache that exists but does not parse is no reason to stop: the
+// fallback imports the pinned reading exactly as it would for an absent cache,
+// and that merge replaces the malformed file.
+func TestCLIUsageHint_FallbackHintsAPinnedReadingOverAnUnreadableOwnCache(t *testing.T) {
+	rec, cfg := propagatorFixture(t)
+	cache, _ := claudeFallbackFixture(t, true)
+	pinned := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	helperWriteJSON(t, filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, []byte(`{"buckets":{"five_hour":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	startCLIUsagePropagator(cfg)
+	if err := os.MkdirAll(filepath.Dir(pinned), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeVersionedClaudeCache(t, pinned, gen(94, 6), 68)
+
+	hint := waitHints(t, rec, 1, 0)[0].hint
+	if hint.Provider != claudeUsageProvider || hint.GenerationEpoch == 0 || hint.Generation == 0 || hint.GenerationEpoch == 94 {
+		t.Fatalf("hint = %+v, want the own generation the import committed", hint)
+	}
+	own, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || own.Buckets[claudeWindowFiveHour].UsedPercentage != 68 {
+		t.Fatalf("own snapshot = %+v (ok=%v), want the malformed file replaced by the pinned reading", own, ok)
+	}
+	if own.GenerationEpoch != hint.GenerationEpoch || own.Generation != hint.Generation {
+		t.Fatalf("own generation = {%d,%d}, want the hinted {%d,%d}",
+			own.GenerationEpoch, own.Generation, hint.GenerationEpoch, hint.Generation)
+	}
+}
+
 // The fallback reads nothing when Claude is not detected, when no cache
 // exists, or while the agent is offline, draining, shutting down or stopped.
 func TestCLIUsageHint_FallbackReadsOnlyWhileEveryGateIsOpen(t *testing.T) {
