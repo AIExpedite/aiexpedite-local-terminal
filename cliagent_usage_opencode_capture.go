@@ -275,13 +275,23 @@ func readOpenCodeUsageLedger() openCodeUsageLedger {
 func updateOpenCodeUsageLedger(mutate func(*openCodeUsageLedger) openCodeLedgerEdit) (openCodeUsageLedger, bool) {
 	openCodeLedgerMu.Lock()
 	ledger := readOpenCodeUsageLedger()
-	today := openCodeDayKey(openCodeUsageNow())
+	now := openCodeUsageNow()
+	today := openCodeDayKey(now)
 	wasPartial := openCodeDayPartial(ledger, today)
+	wasZeroRow := openCodeZeroRowPublished(ledger, now)
 	edit := mutate(&ledger)
 	if !wasPartial && openCodeDayPartial(ledger, today) {
 		// The parser turns a partial day into the card's lower-bound notice, so
 		// a pass that marks it after the gather returned must hint the backend
 		// exactly as a moved total does, whichever helper set the flag.
+		edit.TotalsChanged = true
+	}
+	if openCodeZeroRowPublished(ledger, now) != wasZeroRow {
+		// The "0 tokens today" row appearing or disappearing is a published
+		// view change too, and for an empty store it is the ONLY one: nothing
+		// about a fresh store moves a total, so without this the success stamp
+		// that makes the row publishable would never hint the backend and the
+		// row would wait for an unrelated refresh.
 		edit.TotalsChanged = true
 	}
 	if edit.TotalsChanged {
@@ -792,6 +802,17 @@ func openCodeZeroRowPublishable(ledger openCodeUsageLedger, now time.Time) bool 
 	return openCodeReconcileSucceeded(ledger.LastPassOutcome) &&
 		!ledger.ContinuationDue &&
 		ledger.LastSuccessfulReconcileAtMs >= openCodeLocalMidnight(now).UnixMilli()
+}
+
+// openCodeZeroRowPublished reports whether the card is currently showing that
+// zero row: today holds no counted message AND the row is publishable. A flip
+// either way is what updateOpenCodeUsageLedger treats as a view change; once a
+// day has messages the totals themselves carry it.
+func openCodeZeroRowPublished(ledger openCodeUsageLedger, now time.Time) bool {
+	if day := ledger.Days[openCodeDayKey(now)]; day != nil && len(day.Messages) > 0 {
+		return false
+	}
+	return openCodeZeroRowPublishable(ledger, now)
 }
 
 func usageFloatPtr(v float64) *float64 { return &v }

@@ -296,7 +296,7 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 			// backlog for the next pass, not a failure.
 			break
 		}
-		observations, filled, childrenPartial, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
+		observations, unread, childrenPartial, outcome := exportOpenCodeSessionUsage(ctx, path, candidate.id)
 		result.Exported++
 		landed := false
 		if outcome != "" {
@@ -308,13 +308,14 @@ func runOpenCodeReconcilePass(parent context.Context, now time.Time) openCodeRec
 		commitMs := openCodeUsageNow().UnixMilli()
 		_, persisted := updateOpenCodeUsageLedger(func(l *openCodeUsageLedger) openCodeLedgerEdit {
 			edit := openCodeLedgerEdit{}
-			if filled {
-				// The export was over the cap, so it merged nothing. A session
-				// the stream already counted is stepped over; any other is
-				// remembered for a retry. Either way the day is a lower bound:
-				// the run stream carries only the parent's own steps, and the
-				// delegated child sessions are discovered by parsing this very
-				// export, so a truncated one leaves them uncounted.
+			if unread {
+				// The export merged nothing — over the cap, or a failure that
+				// was about this one session. A session the stream already
+				// counted is stepped over; any other is remembered for a
+				// retry. Either way the day is a lower bound: the run stream
+				// carries only the parent's own steps, and the delegated child
+				// sessions are discovered by parsing this very export, so one
+				// that never arrived leaves them uncounted.
 				if openCodeSessionStreamCaptured(*l, openCodeUsageHash(candidate.id, "")) {
 					openCodeMarkTodayPartial(l, openCodeUsageNow())
 					edit.Changed = true
@@ -818,35 +819,49 @@ func listOpenCodeSessionsWith(ctx context.Context, path string, args []string) (
 // exportOpenCodeSessionUsage exports one session and folds its assistant
 // messages, following the CHILD sessions its tool calls delegated to (a
 // subagent's tokens live there, and nothing else in this feature can see them).
-// `filled` reports the session's own export over the stdout cap (which merges
-// nothing); `partial` reports a child left uncounted, which makes the day a
-// lower bound; the last return is "" on success or the pass's closed outcome.
+// `unread` reports that the session's own export merged nothing — over the
+// stdout cap, or a per-session failure; `partial` reports a child left
+// uncounted, which makes the day a lower bound; the last return is "" on
+// success or the pass's closed outcome.
 func exportOpenCodeSessionUsage(ctx context.Context, path, sessionID string) (
-	observed []openCodeObservedMessage, filled, partial bool, outcome string) {
-	observed, children, filled, outcome := exportOpenCodeOneSession(ctx, path, sessionID)
-	if filled || outcome != "" {
-		return observed, filled, false, outcome
+	observed []openCodeObservedMessage, unread, partial bool, outcome string) {
+	observed, children, filled, lost, outcome := exportOpenCodeOneSession(ctx, path, sessionID)
+	if filled || lost || outcome != "" {
+		return observed, filled || lost, false, outcome
 	}
 	childObserved, partial := exportOpenCodeChildSessions(ctx, path, sessionID, children)
 	return append(observed, childObserved...), false, partial, ""
 }
 
-// exportOpenCodeOneSession is one `export` call, with no descent.
+// exportOpenCodeOneSession is one `export` call, with no descent. `lost` means
+// this ONE session could not be read, which is not the pass's failure.
 func exportOpenCodeOneSession(ctx context.Context, path, sessionID string) (
-	observed []openCodeObservedMessage, children []string, filled bool, outcome string) {
+	observed []openCodeObservedMessage, children []string, filled, lost bool, outcome string) {
 	stdout, filled, err := openCodeRunCommand(ctx, path,
 		[]string{"export", sessionID}, openCodeExportMaxStdout)
 	if ctx.Err() != nil {
-		return nil, nil, filled, openCodeReconcileTimeout
+		return nil, nil, filled, false, openCodeReconcileTimeout
 	}
 	if filled {
-		return nil, nil, true, ""
+		return nil, nil, true, false, ""
 	}
 	observations, children, ok := parseOpenCodeExport(stdout, sessionID)
 	if !ok {
-		return nil, nil, false, openCodeCommandOutcome(err)
+		// `session list` already answered in the shape we read, so this build
+		// DOES speak our language. A NON-ZERO `export` is therefore about this
+		// one session — deleted between the list and the export, or a
+		// transient failure — not evidence the whole feature is unsupported,
+		// which would retire the debt and present the day as complete. It is
+		// reported lost: the pass carries on, the day becomes a lower bound and
+		// the session is booked for a retry, exactly as an over-cap export is.
+		// Only an export that exits CLEANLY with output we cannot read is
+		// `unsupported`, and a launch failure keeps its own class.
+		if outcome := openCodeCommandOutcome(err); err != nil && outcome == openCodeReconcileUnsupported {
+			return nil, nil, false, true, ""
+		}
+		return nil, nil, false, false, openCodeCommandOutcome(err)
 	}
-	return observations, children, false, ""
+	return observations, children, false, false, ""
 }
 
 // exportOpenCodeChildSessions exports the subagent sessions a parent export
@@ -882,9 +897,9 @@ func exportOpenCodeChildSessions(ctx context.Context, path, parentID string, see
 			// uncounted, and the day says so.
 			return observed, true
 		}
-		childObserved, grandchildren, filled, outcome := exportOpenCodeOneSession(ctx, path, id)
+		childObserved, grandchildren, filled, lost, outcome := exportOpenCodeOneSession(ctx, path, id)
 		exported++
-		if filled || outcome != "" {
+		if filled || lost || outcome != "" {
 			partial = true
 			continue
 		}

@@ -38,6 +38,12 @@ type openCodeCLIStub struct {
 	oversize map[string]bool
 	// hang names sessions whose export never returns before the deadline.
 	hang map[string]bool
+	// exportExits names sessions whose export exits non-zero printing nothing
+	// — a session deleted between the list and the export.
+	exportExits map[string]bool
+	// exportGarbage names sessions whose export exits CLEANLY printing a shape
+	// we cannot read, which is the build-level `unsupported` signal.
+	exportGarbage map[string]bool
 	// launchError makes every invocation fail the way a missing binary does.
 	launchError bool
 	// exitError makes every invocation exit non-zero (a build without the
@@ -98,6 +104,12 @@ func (s *openCodeCLIStub) install(t *testing.T) *openCodeCLIStub {
 		if s.hang[id] {
 			<-ctx.Done()
 			return nil, false, ctx.Err()
+		}
+		if s.exportExits[id] {
+			return nil, false, &exec.ExitError{}
+		}
+		if s.exportGarbage[id] {
+			return []byte("  ID  TITLE\n"), false, nil
 		}
 		if s.oversize[id] {
 			// boundedBuffer stops writing AT its limit, so a filled buffer is
@@ -1530,5 +1542,80 @@ func TestOpenCodeReconcile_ForgetsAReReadTheSkippedRetryNowOwns(t *testing.T) {
 	}
 	if ledger := readOpenCodeUsageLedger(); len(ledger.Rechecks) != 0 {
 		t.Fatalf("rechecks = %+v, want the record left to the skipped retry dropped", ledger.Rechecks)
+	}
+}
+
+// A root session that `session list` named but `export` cannot read is lost
+// work, not evidence the CLI is unsupported: `unsupported` retires the debt and
+// would present the day as complete while an external run's tokens are missing.
+func TestOpenCodeReconcile_AFailedSessionExportIsLostWorkNotUnsupported(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	gone, kept := now.Add(-2*time.Minute).UnixMilli(), now.UnixMilli()
+	(&openCodeCLIStub{
+		sessions: sessionList(
+			openCodeSessionRow{"ses_gone", gone},
+			openCodeSessionRow{"ses_kept", kept},
+		),
+		exports:     map[string]string{"ses_kept": exportWith("ses_kept", "msg_kept", kept, 10, 5, "0")},
+		exportExits: map[string]bool{"ses_gone": true},
+	}).install(t)
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileOK {
+		t.Fatalf("outcome = %q, want ok — one unreadable session is not a build without the subcommand", result.Outcome)
+	}
+	ledger := readOpenCodeUsageLedger()
+	day := ledger.Days[openCodeDayKey(now)]
+	if day == nil || !day.Partial {
+		t.Fatal("a session nothing could read must make the day a lower bound")
+	}
+	// The pass carried on past it, so the session it COULD read still counted.
+	if len(day.Messages) != 1 {
+		t.Fatalf("messages = %d, want the readable session's one", len(day.Messages))
+	}
+	if len(ledger.Skipped) != 1 || ledger.Skipped[0].SessionHash != openCodeUsageHash("ses_gone", "") {
+		t.Fatalf("skipped = %+v, want the unreadable session booked for a retry", ledger.Skipped)
+	}
+	if ledger.ReconcileCursorMs != kept {
+		t.Fatalf("cursor = %d, want it past both sessions", ledger.ReconcileCursorMs)
+	}
+}
+
+// The build-level signal is unchanged: an export that exits CLEANLY printing a
+// shape we cannot read says this OpenCode speaks a different language.
+func TestOpenCodeReconcile_ACleanExportWeCannotReadStaysUnsupported(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{
+		sessions:      sessionList(openCodeSessionRow{"ses_table", now.UnixMilli()}),
+		exportGarbage: map[string]bool{"ses_table": true},
+	}).install(t)
+
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileUnsupported {
+		t.Fatalf("outcome = %q, want unsupported", result.Outcome)
+	}
+}
+
+// The success stamp of a pass over an EMPTY store is the only state change
+// behind the zero row, so it must advance the generation and hint the backend —
+// otherwise the row waits for an unrelated refresh.
+func TestOpenCodeReconcile_PublishingTheZeroRowAdvancesTheGeneration(t *testing.T) {
+	now := time.Date(2026, 9, 30, 14, 0, 0, 0, time.Local)
+	openCodeUsageFixture(t, now)
+	(&openCodeCLIStub{sessions: "[]"}).install(t)
+
+	before := readOpenCodeUsageLedger().Generation
+	if result := reconcileOpenCodeUsageOnce(context.Background(), now); result.Outcome != openCodeReconcileNoChange {
+		t.Fatalf("outcome = %q, want no_change", result.Outcome)
+	}
+	metrics, generation, _ := openCodeLedgerMetrics(now)
+	if len(metrics) != 1 || metrics[0].Consumed == nil || *metrics[0].Consumed != 0 {
+		t.Fatalf("metrics = %+v, want one zero-token row", metrics)
+	}
+	if generation == nil {
+		t.Fatal("the published zero row must carry a generation")
+	}
+	if generation.Counter <= before.Counter {
+		t.Fatalf("generation counter = %d, want it past %d", generation.Counter, before.Counter)
 	}
 }
