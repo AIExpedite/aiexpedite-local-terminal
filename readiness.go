@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -158,7 +159,7 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		report.Findings = append(report.Findings, ReadinessFinding{
 			Code:     "inspection_failed",
 			Severity: FindingBlocker,
-			Message:  "We couldn't read this computer's details. Try reconnecting the Terminal agent and inspecting again.",
+			Message:  inspectionFailedMessage,
 		})
 		return report
 	}
@@ -288,7 +289,10 @@ func deriveReadinessState(findings []ReadinessFinding) string {
 		case f.Severity == FindingWarning:
 			_, capacity := capacityAdvisoryCodes[f.Code]
 			_, informational := informationalSoftwareCodes[f.Code]
-			if capacity || informational {
+			// A report from cached details says nothing new about the
+			// machine; it only caps a ready verdict at ready_with_warnings.
+			cachedDetails := f.Code == inspectionCachedFindingCode
+			if capacity || informational || cachedDetails {
 				// Advisory only — do not demote past ready_with_warnings, and
 				// never override needs_setup / underpowered / blocked.
 				if state == ReadinessReady {
@@ -307,13 +311,110 @@ func deriveReadinessState(findings []ReadinessFinding) string {
 	return state
 }
 
+// inspection_failed messages. The code stays inspectionFailedFindingCode (the
+// server and shared-constants key on it); the advice depends on why it failed.
+const (
+	inspectionFailedFindingCode = "inspection_failed"
+	inspectionFailedMessage     = "We couldn't read this computer's details. Inspect again, and if it keeps failing, restart the Terminal agent."
+	inspectionTimedOutMessage   = "Checking this computer's details took too long, so the inspection couldn't finish. Inspect again in a moment."
+)
+
+// inspection_cached: the advisory warning on a report built from the cached
+// MachineInfo because the fresh gather missed its deadline (cachedReadiness).
+const (
+	inspectionCachedFindingCode    = "inspection_cached"
+	inspectionCachedFindingMessage = "These details are from %s (%s ago) because the fresh check took too long. Inspect again for current details."
+)
+
+// inspectionCacheMaxAge is how old the cached MachineInfo may be for an
+// inspection whose fresh gather missed its deadline to report it instead of
+// inspection_failed. Hardware and installed tools rarely change within it; an
+// older cache (or none) keeps the inspection_failed report.
+const inspectionCacheMaxAge = 30 * time.Minute
+
+// inspectionCacheFutureSkew is how far in the future a cached gather's stamp
+// may be (clock adjusted since) and still count as recent.
+const inspectionCacheFutureSkew = time.Minute
+
+// Test seams for GatherReadinessOnly: the inspection's machine gather (with
+// its CLI usage pass bounded, see inspectionCLIUsageBudget) and its fresh
+// setupToolCatalog pass.
+var (
+	inspectionGather = func() *MachineInfo {
+		return gatherMachineInfoBounded(inspectionCLIUsageBudget)
+	}
+	inspectionSetupToolPass = runSetupToolProbePass
+)
+
+// envInspectLogf writes one [env-inspect] line in the agent's log style.
+func envInspectLogf(color, format string, args ...any) {
+	fmt.Printf("%s[env-inspect] %s%s\n", color, fmt.Sprintf(format, args...), colorReset)
+}
+
+// timedOutReadiness is the inspection_failed report for an inspection whose
+// gather missed its deadline with no recent cache to fall back on.
+func timedOutReadiness() ReadinessReport {
+	report := evaluateReadiness(nil)
+	for i := range report.Findings {
+		if report.Findings[i].Code == inspectionFailedFindingCode {
+			report.Findings[i].Message = inspectionTimedOutMessage
+		}
+	}
+	return report
+}
+
+// cachedReadiness evaluates the cached MachineInfo for an inspection whose
+// fresh gather missed its deadline. ok is false when there is no cache or it
+// is older than inspectionCacheMaxAge; collectedAt is the cache's stamp when
+// it has one. The verdict is the cached data's own plus an advisory warning
+// that it is not fresh, so it is never more permissive than the cached data:
+// a ready machine reads ready_with_warnings, anything worse keeps its state.
+func cachedReadiness(now time.Time) (report ReadinessReport, collectedAt time.Time, ok bool) {
+	machineInfoMu.RLock()
+	cached := machineInfoCache
+	var snapshot MachineInfo
+	if cached != nil {
+		snapshot = *cached
+	}
+	machineInfoMu.RUnlock()
+	if cached == nil {
+		return ReadinessReport{}, time.Time{}, false
+	}
+	at, parsed := machineInfoCollectedAt(&snapshot)
+	if !parsed {
+		return ReadinessReport{}, time.Time{}, false
+	}
+	age := now.Sub(at)
+	if age > inspectionCacheMaxAge || age < -inspectionCacheFutureSkew {
+		return ReadinessReport{}, at, false
+	}
+	if age < 0 {
+		age = 0
+	}
+	report = evaluateReadiness(&snapshot)
+	report.Findings = append(report.Findings, ReadinessFinding{
+		Code:     inspectionCachedFindingCode,
+		Severity: FindingWarning,
+		Message:  fmt.Sprintf(inspectionCachedFindingMessage, at.UTC().Format("2006-01-02 15:04 UTC"), minutesAgo(age)),
+	})
+	report.State = deriveReadinessState(report.Findings)
+	// The report is as old as the data in it, so the server's report-staleness
+	// checks (setup plans) see its real age.
+	report.CollectedAt = snapshot.CollectedAt
+	return report, at, true
+}
+
 // GatherReadinessOnly performs a full machine gather and returns the derived
 // readiness report. Read-only; safe to run without user consent. Runs under a
-// bounded context so a hung probe can't stall the inspection round trip.
+// bounded context so a hung probe can't stall the inspection round trip. When
+// the gather misses ctx, a recent cached MachineInfo is reported instead
+// (cachedReadiness), and the gather, left to finish, refreshes the cache.
+// Logs one [env-inspect] line with the duration and outcome.
 func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	started := time.Now()
 	// A gather is heavyweight and, once started, runs to completion on its own
 	// goroutine whatever happens to ctx below. An inspection that is already
 	// over must not spend one: the gather would outlive the request, detect
@@ -321,11 +422,44 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	// parser — the Claude probe included — against the process-global state of
 	// that later moment (the Windows CI flake in the settled-turn session tests).
 	if ctx.Err() != nil {
-		return evaluateReadiness(nil)
+		envInspectLogf(colorYellow, "inspection skipped: its deadline had already passed; reporting inspection_failed")
+		return timedOutReadiness()
 	}
+
+	// Exactly one side owns the gathered info: the waiter below (the gather
+	// finished in time) or the gather goroutine (the waiter gave up, so the
+	// goroutine stores the late result in the cache). handoff makes that
+	// decision atomic. The goroutine stays counted in
+	// machineInfoGathersInFlight until the late store is done.
+	var (
+		handoff   sync.Mutex
+		abandoned bool
+	)
+	// Read the seams here, on the caller's goroutine: both goroutines below can
+	// outlive this call (a timed-out inspection returns without waiting for
+	// them), so reading the package vars from inside them would race a test
+	// restoring the seams after the call returned.
+	gather, setupToolPass := inspectionGather, inspectionSetupToolPass
 	done := make(chan *MachineInfo, 1)
+	release := trackMachineInfoGather()
 	go func() {
-		done <- gatherMachineInfoTracked()
+		defer release()
+		info := gather()
+		handoff.Lock()
+		if !abandoned {
+			done <- info
+			handoff.Unlock()
+			return
+		}
+		handoff.Unlock()
+		elapsed := time.Since(started).Round(10 * time.Millisecond)
+		switch {
+		case info == nil:
+		case storeMachineInfoIfNotOlder(info):
+			envInspectLogf(colorYellow, "late gather finished after %s; cached details refreshed", elapsed)
+		default:
+			envInspectLogf(colorYellow, "late gather finished after %s; a newer gather is already cached", elapsed)
+		}
 	}()
 	// A fresh setupToolCatalog pass runs beside the gather: the setup flow
 	// re-inspects right after installing, and the cached pass may predate the
@@ -334,13 +468,27 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	// difference.
 	toolsDone := make(chan map[string]string, 1)
 	go func() {
-		toolsDone <- runSetupToolProbePass(ctx)
+		toolsDone <- setupToolPass(ctx)
 	}()
 
 	var info *MachineInfo
 	select {
 	case info = <-done:
 	case <-ctx.Done():
+		handoff.Lock()
+		select {
+		case info = <-done:
+			// It finished as the deadline passed: use it.
+		default:
+			abandoned = true
+		}
+		handoff.Unlock()
+		if abandoned {
+			return timedOutInspection(started)
+		}
+	}
+	if info == nil {
+		envInspectLogf(colorRed, "inspection gathered no details in %s; reporting inspection_failed", time.Since(started).Round(10*time.Millisecond))
 		return evaluateReadiness(nil)
 	}
 	select {
@@ -351,6 +499,38 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	}
 	// Keep the shared cache fresh so the next /auth/token POST reflects
 	// what the user just saw in the readiness card.
-	storeMachineInfo(info)
-	return evaluateReadiness(info)
+	storeMachineInfoIfNotOlder(info)
+	report := evaluateReadiness(info)
+	envInspectLogf(colorGreen, "inspection ok in %s (state %s)", time.Since(started).Round(10*time.Millisecond), report.State)
+	return report
+}
+
+// timedOutInspection is GatherReadinessOnly's report when the gather missed
+// the deadline: the recent cache's verdict, or inspection_failed.
+func timedOutInspection(started time.Time) ReadinessReport {
+	elapsed := time.Since(started).Round(10 * time.Millisecond)
+	report, at, ok := cachedReadiness(time.Now())
+	switch {
+	case ok:
+		envInspectLogf(colorYellow, "inspection timed out after %s; reporting cached details from %s (state %s)", elapsed, at.UTC().Format(time.RFC3339), report.State)
+		return report
+	case !at.IsZero():
+		envInspectLogf(colorRed, "inspection timed out after %s; cached details from %s are not recent; reporting inspection_failed", elapsed, at.UTC().Format(time.RFC3339))
+	default:
+		envInspectLogf(colorRed, "inspection timed out after %s; no cached details; reporting inspection_failed", elapsed)
+	}
+	return timedOutReadiness()
+}
+
+// minutesAgo renders a cache age for the inspection_cached message.
+func minutesAgo(age time.Duration) string {
+	minutes := int(age / time.Minute)
+	switch {
+	case minutes < 1:
+		return "less than a minute"
+	case minutes == 1:
+		return "1 minute"
+	default:
+		return fmt.Sprintf("%d minutes", minutes)
+	}
 }
