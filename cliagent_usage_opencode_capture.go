@@ -407,14 +407,19 @@ func capOpenCodeUsageBuckets(ledger *openCodeUsageLedger) {
 // write does NOT advance the generation and sends no hint: it re-keys spend the
 // commit already counted and hinted, and the gather that calls it publishes the
 // adopted numbers itself.
-func adoptPendingOpenCodeUsageBuckets(fingerprint string) {
+//
+// It reports false while pending spend stays un-adopted (a refused write), so
+// that gather withholds its generation: published without the adopted numbers,
+// the backend would record it as applied and the next adopting gather would
+// look covered.
+func adoptPendingOpenCodeUsageBuckets(fingerprint string) bool {
 	if fingerprint == "" {
-		return
+		return true
 	}
 	if !openCodeUsageHasPendingBucket(loadOpenCodeUsageLedger()) {
-		return
+		return true
 	}
-	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		var pending []openCodeUsageBucket
 		kept := ledger.Buckets[:0]
 		for _, b := range ledger.Buckets {
@@ -444,6 +449,7 @@ func adoptPendingOpenCodeUsageBuckets(fingerprint string) {
 		logOpenCodeUsageCapture("account_adopted")
 		return true, false
 	})
+	return committed || !openCodeUsageHasPendingBucket(loadOpenCodeUsageLedger())
 }
 
 func openCodeUsageHasPendingBucket(ledger openCodeUsageLedger) bool {
@@ -524,6 +530,8 @@ type openCodeUsageRun struct {
 	committed int
 	sessionID string
 	settled   atomic.Bool
+	// armRefused reports that the arm wrote no debt, so there is none to name.
+	armRefused bool
 	// persistedSession is set once the session id reached the armed debt.
 	persistedSession atomic.Bool
 }

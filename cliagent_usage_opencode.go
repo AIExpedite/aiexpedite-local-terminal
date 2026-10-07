@@ -207,13 +207,14 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 	// placeholders the other parsers emit would be a lie here.
 	// A turn that spent before any probe named the account banked under the empty
 	// fingerprint: claim it for this one first, or its tokens stay invisible.
-	adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
+	adopted := adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
 	bucket, ok, generation := openCodeUsageBucketForDay(usage.AccountFingerprint, now)
 	usage.Metrics = openCodeUsageMetrics(bucket, ok, now)
 	// Only a generation this process committed: until then the ledger may hold
 	// one an earlier process published, which the backend may already have
-	// applied (see openCodeGenerationRotated).
-	if openCodeGenerationRotated.Load() && generation.Epoch == codexProcessGenerationEpoch.Load() && generation.Counter > 0 {
+	// applied (see openCodeGenerationRotated). Nor one a refused adoption left
+	// pending spend out of (adoptPendingOpenCodeUsageBuckets).
+	if adopted && openCodeGenerationRotated.Load() && generation.Epoch == codexProcessGenerationEpoch.Load() && generation.Counter > 0 {
 		g := generation
 		usage.UsageGeneration = &g
 	}

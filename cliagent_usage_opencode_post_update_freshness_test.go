@@ -510,3 +510,59 @@ func TestOpenCodeUsage_ARefusedOwedWriteIsRetried(t *testing.T) {
 		t.Fatalf("booked %v, want the export ladder's head once the debt landed", d)
 	}
 }
+
+// The session-id write is asked for once per run, so a refused one is retried:
+// otherwise a crash before settle leaves an id-less armed debt that the next
+// process drops as unattributable.
+func TestOpenCodeUsage_ARefusedSessionIDWriteIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1119)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+
+	release := holdOpenCodeLedgerLock(t)
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_refused"}`)
+	openCodeUsageInFlight.Wait()
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].SessionID != "" {
+		t.Fatalf("debts = %+v, want the id unwritten while locked", d)
+	}
+	release()
+	if !sched.fireNext() {
+		t.Fatal("the refused session-id write booked no retry")
+	}
+	if d := loadOpenCodeUsageLedger().Debts; len(d) != 1 || d[0].SessionID != "ses_refused" {
+		t.Fatalf("debts = %+v, want the id written on the retry", d)
+	}
+	if sched.fireNext() {
+		t.Fatal("a committed session-id write booked another retry")
+	}
+}
+
+// A refused adoption leaves pending spend out of the gather's rows, so that
+// gather must not publish a generation the backend would record as applied.
+func TestOpenCodeUsage_ARefusedAdoptionReportsPendingSpend(t *testing.T) {
+	openCodeUsageFixture(t, 1120)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	now := time.Now()
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		return true, mergeOpenCodeUsageSteps(ledger, "", []openCodeUsageStep{{Key: "k", AtMs: now.UnixMilli(), Input: 5}})
+	})
+
+	release := holdOpenCodeLedgerLock(t)
+	if adoptPendingOpenCodeUsageBuckets("fp-a") {
+		t.Fatal("a refused adoption reported the pending spend adopted")
+	}
+	release()
+	if !adoptPendingOpenCodeUsageBuckets("fp-a") {
+		t.Fatal("an unrefused adoption reported spend still pending")
+	}
+	if b, ok, _ := openCodeUsageBucketForDay("fp-a", now); !ok || b.InputTokens != 5 {
+		t.Fatalf("bucket = %+v ok=%v, want the pending spend adopted", b, ok)
+	}
+	if !adoptPendingOpenCodeUsageBuckets("fp-a") || !adoptPendingOpenCodeUsageBuckets("") {
+		t.Fatal("nothing to adopt must report adopted")
+	}
+}

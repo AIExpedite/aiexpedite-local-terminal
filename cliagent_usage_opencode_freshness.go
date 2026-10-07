@@ -96,7 +96,7 @@ func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun 
 	// Tried once, never waited on: a session arms under the session manager's
 	// lock, and the armed debt is only a crash marker — a run whose arm was
 	// refused still settles (and owes) normally.
-	openCodeUsageTransactionWithin(0, func(ledger *openCodeUsageLedger) (bool, bool) {
+	armed, _, _ := openCodeUsageTransactionWithin(0, func(ledger *openCodeUsageLedger) (bool, bool) {
 		ledger.Debts = append(ledger.Debts, openCodeUsageDebt{
 			RunID:              run.id,
 			RunFloorMs:         run.floorMs,
@@ -106,6 +106,7 @@ func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun 
 		capOpenCodeUsageDebts(ledger)
 		return true, false
 	})
+	run.armRefused = !armed
 	return run
 }
 
@@ -117,24 +118,47 @@ func armOpenCodeUsageRunForExecutable(executable, dir string) *openCodeUsageRun 
 
 // persistSessionIDAsync records the run's session id on its armed debt.
 func (run *openCodeUsageRun) persistSessionIDAsync(sessionID string) {
-	if run == nil || sessionID == "" || !run.persistedSession.CompareAndSwap(false, true) {
+	// A refused arm left no debt to name: the settle writes the id if it owes.
+	if run == nil || sessionID == "" || run.armRefused || !run.persistedSession.CompareAndSwap(false, true) {
 		return
 	}
 	openCodeUsageInFlight.Add(1)
 	go func() {
 		defer openCodeUsageInFlight.Done()
-		if run.settled.Load() {
-			return
-		}
-		openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-			debt := openCodeUsageDebtByID(ledger, run.id)
-			if debt == nil || debt.SessionID != "" || debt.owed() {
-				return false, false
-			}
-			debt.SessionID = sessionID
-			return true, false
-		})
+		run.persistSessionID(sessionID, 1)
 	}()
+}
+
+// persistSessionID writes the session id onto the armed debt, retrying a
+// REFUSED write on the commit ladder: only the first frame naming the session
+// asks, so an unretried refusal would leave the debt id-less, and a crash
+// before settle would then drop it as unattributable. Settling stops the
+// retries — a settle that owes writes the id itself.
+func (run *openCodeUsageRun) persistSessionID(sessionID string, attempt int) {
+	if run.settled.Load() {
+		return
+	}
+	// A contended lock never runs mutate, so track the decline, not the intent.
+	declined := false
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		debt := openCodeUsageDebtByID(ledger, run.id)
+		if debt == nil || debt.SessionID != "" || debt.owed() {
+			declined = true
+			return false, false
+		}
+		debt.SessionID = sessionID
+		return true, false
+	})
+	if committed || declined {
+		return
+	}
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		logOpenCodeUsageCapture("session_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("session_retry")
+	openCodeUsageAfterFunc(delay, func() { run.persistSessionID(sessionID, attempt+1) })
 }
 
 // settleOpenCodeUsageRun settles the run exactly once. sessionID is any id the
