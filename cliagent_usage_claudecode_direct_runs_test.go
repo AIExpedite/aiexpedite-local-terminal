@@ -713,3 +713,42 @@ func TestClaudePinnedCacheCandidates_SkipTheOwnCacheInAnySpelling(t *testing.T) 
 		t.Fatalf("candidates=%q, want the own cache (%q) excluded in every spelling", got, own)
 	}
 }
+
+// An alias the spelling cannot show — a hard link or a symlink to the own
+// cache — is still the own cache, so it must not be listed as another
+// channel's either.
+func TestClaudePinnedCacheCandidates_SkipTheOwnCacheThroughAnAlias(t *testing.T) {
+	armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	own := claudeRateLimitCachePath()
+	if err := os.MkdirAll(filepath.Dir(own), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(own, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	aliases := []string{}
+	hard := filepath.Join(dir, "hard.json")
+	if err := os.Link(own, hard); err == nil {
+		aliases = append(aliases, hard)
+	}
+	sym := filepath.Join(dir, "sym.json")
+	if err := os.Symlink(own, sym); err == nil {
+		aliases = append(aliases, sym)
+	}
+	if len(aliases) == 0 {
+		t.Skip("this filesystem allows neither hard links nor symlinks")
+	}
+	other := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(other, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rememberClaudeHookPinnedCaches("")
+	claudeDisplacedPinnedCaches.mu.Lock()
+	claudeDisplacedPinnedCaches.paths = append(append(claudeDisplacedPinnedCaches.paths, aliases...), other)
+	claudeDisplacedPinnedCaches.mu.Unlock()
+	home, _ := os.UserHomeDir()
+	if got := claudePinnedCacheCandidates(home); len(got) != 1 || got[0] != other {
+		t.Fatalf("candidates=%q, want only %q (the own cache's aliases excluded)", got, other)
+	}
+}

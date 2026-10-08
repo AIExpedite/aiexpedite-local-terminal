@@ -625,13 +625,19 @@ func claudePinnedCacheCandidates(home string) []string {
 // The installed hooks carry the path in the shell form they run under — the
 // Git Bash form on Windows writes C:/Users/... — while the own path is native,
 // so a plain string compare would list the own cache as another channel's,
-// and the transfer would then clear the own debt as if it had moved.
+// and the transfer would then clear the own debt as if it had moved. The same
+// goes for an alias the spelling cannot show (a symlink, junction, hard link,
+// or other casing on a case-insensitive volume), so two existing files are
+// compared by identity; the lexical compare only decides for a missing file,
+// which holds no debt to lose.
 func sameClaudeCachePath(a, b string) bool {
 	a, b = filepath.Clean(filepath.FromSlash(a)), filepath.Clean(filepath.FromSlash(b))
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(a, b)
+	if a == b || (runtime.GOOS == "windows" && strings.EqualFold(a, b)) {
+		return true
 	}
-	return a == b
+	ai, aErr := os.Stat(a)
+	bi, bErr := os.Stat(b)
+	return aErr == nil && bErr == nil && os.SameFile(ai, bi)
 }
 
 // claimClaudePinnedObservedDebt puts a claim lease on the pinned cache's debt
