@@ -558,6 +558,33 @@ func TestOpenCodeUsage_ARefusedWindowCloseIsRetried(t *testing.T) {
 	}
 }
 
+// A close retried later still closes the window when the stream ended: a direct
+// resume of the session made between the refusal and the retry is not owned.
+func TestOpenCodeUsage_ARetriedWindowCloseKeepsTheStreamEnd(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1406)
+	prevWait, prevNow := openCodeUsageLockWait, openCodeUsageFreshnessNow
+	openCodeUsageLockWait = 20 * time.Millisecond
+	now := time.Now()
+	openCodeUsageFreshnessNow = func() time.Time { return now }
+	t.Cleanup(func() { openCodeUsageLockWait, openCodeUsageFreshnessNow = prevWait, prevNow })
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_e", "prt_1", 10, 1, 0, "0.01", now.UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRunOnStream(run, "")
+
+	endMs := now.UnixMilli()
+	release := holdOpenCodeLedgerLock(t)
+	finishOpenCodeUsageRun(run)
+	release()
+	now = now.Add(time.Minute)
+	if !sched.fireNext() {
+		t.Fatal("the refused close booked no retry")
+	}
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || w.ToMs != endMs {
+		t.Fatalf("window after the retry = %+v, want closed at the stream end %d", w, endMs)
+	}
+}
+
 // Adoption closes the windows an earlier process left open, at its own start.
 func TestOpenCodeUsage_AdoptionClosesWindowsAnEarlierProcessLeftOpen(t *testing.T) {
 	openCodeUsageFixture(t, 1405)

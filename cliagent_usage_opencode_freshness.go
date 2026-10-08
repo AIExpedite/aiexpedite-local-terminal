@@ -177,6 +177,7 @@ func finishOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run == nil {
 		return
 	}
+	run.markStreamEnd()
 	run.streamClosed.Store(true)
 	releaseOpenCodeUsageLiveRun(run)
 	run.closeOwnedWindow(1)
@@ -195,9 +196,17 @@ func (run *openCodeUsageRun) streamOver() bool {
 	return run.streamClosed.Load() || run.closingSettle.Load()
 }
 
+// markStreamEnd records when the run's stream ended, once: the earlier of a
+// closing settle and the finish wins.
+func (run *openCodeUsageRun) markStreamEnd() {
+	run.streamEndMs.CompareAndSwap(0, openCodeUsageFreshnessNow().UnixMilli())
+}
+
 // syncOwnedWindow records the run's ownership window on ledger, inside the
-// caller's transaction: opened at the run floor for sessionID, closed at nowMs
-// once the stream is over. It reports whether the window is closed. No session
+// caller's transaction: opened at the run floor for sessionID, closed once the
+// stream is over at the time it ended (nowMs if none was recorded). A retry
+// committed later must not stretch the window over a direct resume of the same
+// session made meanwhile. It reports whether the window is closed. No session
 // id, no window — the run owns nothing the reader could tell apart.
 func (run *openCodeUsageRun) syncOwnedWindow(ledger *openCodeUsageLedger, sessionID string, nowMs int64) (closed bool) {
 	if sessionID == "" {
@@ -213,7 +222,11 @@ func (run *openCodeUsageRun) syncOwnedWindow(ledger *openCodeUsageLedger, sessio
 		w = &ledger.OwnedRuns[len(ledger.OwnedRuns)-1]
 	}
 	if w.open() && run.streamOver() {
-		w.ToMs = max(nowMs, w.FromMs)
+		endMs := run.streamEndMs.Load()
+		if endMs == 0 {
+			endMs = nowMs
+		}
+		w.ToMs = max(endMs, w.FromMs)
 	}
 	closed = !w.open()
 	pruneOpenCodeOwnedRuns(ledger, nowMs)
@@ -468,6 +481,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	if run == nil {
 		return
 	}
+	run.markStreamEnd()
 	run.closingSettle.Store(true)
 	settleOpenCodeUsageRunOnce(run, sessionID)
 }

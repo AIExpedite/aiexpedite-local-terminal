@@ -413,7 +413,10 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		MaxRecordBytes: openCodeDirectMaxRecordBytes,
 		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
 	}
-	if c := saved.DirectCursor; c != nil && c.Continue {
+	if c := saved.DirectCursor; c != nil && c.Continue && c.Layout == layout {
+		// A continuation's skip and floors index the adapter that cut it; after
+		// a layout switch the other adapter orders tied records differently, so
+		// it re-reads from the cut and seenSteps absorbs the repeats.
 		limits.ExactSessions = c.AtSession
 		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
 		if c.AtSession {

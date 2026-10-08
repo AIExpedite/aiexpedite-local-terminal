@@ -762,6 +762,9 @@ type openCodeUsageRun struct {
 	closingSettle atomic.Bool
 	// windowClosed: the run's ownership window is closed on disk.
 	windowClosed atomic.Bool
+	// streamEndMs is when the stream ended (0 until it has), recorded once so
+	// every close or commit retry closes the window there, not at its own time.
+	streamEndMs atomic.Int64
 }
 
 // session returns the run's session id, "" until one is known.

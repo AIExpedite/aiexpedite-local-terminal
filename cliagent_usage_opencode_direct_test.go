@@ -607,6 +607,35 @@ func TestOpenCodeDirect_ARecordContinuationKeepsTheSessionFloor(t *testing.T) {
 	}
 }
 
+// A continuation cut by one adapter is not replayed against another: after the
+// store switches layout, its skip would index records the new adapter orders
+// differently at the cut, and could skip an unread one. The scan re-reads from
+// the cut instead, and the record at it is counted once.
+func TestOpenCodeDirect_ALayoutSwitchDropsTheContinuationState(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2053)
+	cut := clock.ms(-5 * time.Minute)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: cut - 1000, completedMs: cut, steps: [][3]int64{{10, 0, 0}}})
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: cut, Continue: true, Skip: 1, SessionSinceMs: cut}
+		return true, false
+	})
+	var got []openCodeDirectLimits
+	prev := openCodeDirectReaders[openCodeStoreLayoutJSON]
+	openCodeDirectReaders[openCodeStoreLayoutJSON] = func(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error) {
+		got = append(got, limits)
+		return prev(ctx, root, floorMs, limits)
+	}
+	t.Cleanup(func() { openCodeDirectReaders[openCodeStoreLayoutJSON] = prev })
+
+	scanOpenCodeDirect(t)
+	if len(got) != 1 || got[0].Skip.N != 0 || got[0].ExactSessions || got[0].SessionSinceMs != 0 {
+		t.Fatalf("limits after a layout switch = %+v, want no continuation state", got)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 10 {
+		t.Fatalf("bucket = %+v, want the record at the cut counted", b)
+	}
+}
+
 // When the session cap cuts first and the record cap cuts later in the same
 // read, the cursor resumes the way the earliest cut stopped — by session, with
 // the record floor — so the unread sessions' earlier messages are still
