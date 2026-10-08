@@ -619,7 +619,7 @@ var claudeDisplacedPinnedCaches struct {
 
 const claudeDisplacedPinnedCachesMax = 4
 
-// rememberClaudeHookPinnedCaches records the caches the installed status-line
+// rememberClaudeHookPinnedCaches records every cache the installed status-line
 // and run-end hooks pin, other than the own one, then moves a debt already
 // waiting there onto the own cache. Call it BEFORE rewriting settings.json: the
 // rewrite pins both hooks to the own cache and erases the only record of where
@@ -638,7 +638,7 @@ const claudeDisplacedPinnedCachesMax = 4
 // when it scans, so an alias is skipped only while it still is one.
 func rememberClaudeHookPinnedCaches(home string) {
 	own := claudeRateLimitCachePath()
-	pinned := []string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)}
+	pinned := append([]string{installedClaudeRateLimitCachePath(home)}, installedClaudeRunEndCachePaths(home)...)
 	claudeDisplacedPinnedCaches.mu.Lock()
 	for _, p := range pinned {
 		if p == "" || sameClaudeCachePathSpelling(p, own) || slices.ContainsFunc(claudeDisplacedPinnedCaches.paths, func(q string) bool { return sameClaudeCachePathSpelling(p, q) }) {
@@ -667,13 +667,14 @@ func resetClaudeDisplacedPinnedCaches() {
 
 // claudePinnedCacheCandidates lists every cache other than the own one that a
 // hook may have written a debt to: the one the installed status line pins, the
-// one the installed run-end hook pins (the two diverge after a partial
-// settings.json rewrite), and those a re-point displaced.
+// every one the installed run-end hooks pin (they diverge from the status
+// line after a partial settings.json rewrite, and duplicate copies can each
+// pin a different channel), and those a re-point displaced.
 func claudePinnedCacheCandidates(home string) []string {
 	own := claudeRateLimitCachePath()
 	claudeDisplacedPinnedCaches.mu.Lock()
-	all := append([]string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)},
-		claudeDisplacedPinnedCaches.paths...)
+	all := append([]string{installedClaudeRateLimitCachePath(home)}, installedClaudeRunEndCachePaths(home)...)
+	all = append(all, claudeDisplacedPinnedCaches.paths...)
 	claudeDisplacedPinnedCaches.mu.Unlock()
 	out := make([]string, 0, len(all))
 	for _, p := range all {

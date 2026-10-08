@@ -321,3 +321,33 @@ func TestClaudeRunEndHook_EitherOptOutRemovesIt(t *testing.T) {
 		}
 	})
 }
+
+// Duplicate recognized run-end hooks pinned to DIFFERENT caches: every one is
+// reported, because Claude runs every matched handler and each copy can owe a
+// debt to its own cache. ensureClaudeRunEndHook then collapses them to one, so
+// a caller that memoizes first (rememberClaudeHookPinnedCaches) would lose the
+// later caches if only the first were reported.
+func TestInstalledClaudeRunEndCachePaths_ReportsEveryDuplicatePin(t *testing.T) {
+	settingsPath := armClaudeRunEndInstallTest(t, "/opt/aiexpedite/aiexpedite-terminal")
+	first, second := "/tmp/chan-a/rl.json", "/tmp/chan-b/rl.json"
+	pin := func(exe, cache string) map[string]any {
+		return map[string]any{"hooks": []any{map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(cache) +
+				" " + posixSingleQuote(exe) + " " + claudeRunEndHookArg,
+			"timeout": claudeRunEndHookTimeoutSeconds,
+		}}}
+	}
+	helperWriteJSON(t, settingsPath, map[string]any{"hooks": map[string]any{"SessionEnd": []any{
+		pin("/opt/other/aiexpedite-terminal", first),
+		pin("/opt/third/aiexpedite-terminal", second),
+		// A duplicate spelling of the first is reported once.
+		pin("/opt/fourth/aiexpedite-terminal", first),
+		// Another tool's hook is not ours and contributes nothing.
+		map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "~/bin/log-session.sh"}}},
+	}}})
+	got := installedClaudeRunEndCachePaths("")
+	if len(got) != 2 || got[0] != first || got[1] != second {
+		t.Fatalf("installedClaudeRunEndCachePaths = %q, want [%q %q]", got, first, second)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -375,7 +376,7 @@ func TestClaudeDirectRun_APinnedDebtSurvivesTheReconcileThatRePointsTheHooks(t *
 	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
 		t.Fatalf("reconcile changed=%v err=%v, want the hooks re-pointed", changed, err)
 	}
-	if got := installedClaudeRunEndCachePath(home); got == pinned {
+	if got := installedClaudeRunEndCachePaths(home); slices.Contains(got, pinned) {
 		t.Fatal("the reconcile left the run-end hook on the other channel's cache")
 	}
 	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)

@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 )
 
 // claudeRunEndHookEvent is the Claude Code hook event we register on: it fires
@@ -327,24 +328,32 @@ func applyClaudeRunEndHook(home string, wanted bool) (bool, error) {
 	return removeClaudeRunEndHook(home)
 }
 
-// installedClaudeRunEndCachePath returns the cache path our INSTALLED SessionEnd
-// hook pins, or "" when settings.json holds no run-end hook of ours. It is read
-// from the hook itself, not inferred from the status line: a partial
-// settings.json rewrite can drop `statusLine` and leave this hook pinned to
+// installedClaudeRunEndCachePaths returns the cache paths our INSTALLED
+// SessionEnd hooks pin, in settings.json order, deduplicated by spelling —
+// empty when settings.json holds no run-end hook of ours. They are read from
+// the hooks themselves, not inferred from the status line: a partial
+// settings.json rewrite can drop `statusLine` and leave a hook pinned to
 // another channel's cache, which is then where its debts land.
-func installedClaudeRunEndCachePath(home string) string {
+//
+// Every recognized copy is reported, not just the first: Claude runs every
+// matched handler, so duplicates pinned to different caches can each owe a
+// debt. ensureClaudeRunEndHook collapses them to one, so a caller that
+// memoizes before the rewrite (rememberClaudeHookPinnedCaches) must see all of
+// them or a debt is left in a cache nothing references any more.
+func installedClaudeRunEndCachePaths(home string) []string {
 	settingsPath := claudeSettingsPathIfPresent(home)
 	if settingsPath == "" {
-		return ""
+		return nil
 	}
 	settings, exists, err := readClaudeSettings(settingsPath)
 	if err != nil || !exists {
-		return ""
+		return nil
 	}
 	_, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
 	if err != nil {
-		return ""
+		return nil
 	}
+	var out []string
 	for _, g := range groups {
 		var group struct {
 			Hooks []json.RawMessage `json:"hooks"`
@@ -353,12 +362,16 @@ func installedClaudeRunEndCachePath(home string) string {
 			continue
 		}
 		for _, e := range group.Hooks {
-			if h, mine := ourRunEndHookEntry(e); mine {
-				if pinned := extractInstalledPinnedPath(h.Command, "RL_CACHE"); pinned != "" {
-					return pinned
-				}
+			h, mine := ourRunEndHookEntry(e)
+			if !mine {
+				continue
 			}
+			pinned := extractInstalledPinnedPath(h.Command, "RL_CACHE")
+			if pinned == "" || slices.ContainsFunc(out, func(q string) bool { return sameClaudeCachePathSpelling(pinned, q) }) {
+				continue
+			}
+			out = append(out, pinned)
 		}
 	}
-	return ""
+	return out
 }
