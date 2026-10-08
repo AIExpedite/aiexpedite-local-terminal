@@ -862,6 +862,55 @@ func TestClaudeDirectRun_APinnedDebtJustPastItsRungIsNotTakenOver(t *testing.T) 
 	}
 }
 
+// The owner charged a request, its rung write was refused (it retries in
+// memory only), and its lease release still landed. The rung claim's release
+// keeps the instant the lease ended, so once the owner is gone past the slack
+// the debt reads as abandoned instead of sitting with no timestamp forever. A
+// release on a debt with a rung on disk, or one never charged, clears to zero.
+func TestClaudeDirectRun_AReleasedDebtWhoseRungFailedToPersistCanBeAbandoned(t *testing.T) {
+	cache, _ := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	end := time.Now().Add(-10 * time.Minute)
+	release := func(attempts int, rungMs int64) claudeRateLimitSnapshot {
+		t.Helper()
+		seedClaudeRefreshDebt(t, cache, fp, end, attempts, time.Time{})
+		var lease int64
+		if !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+			snap.NextAttemptAtMs = rungMs
+			lease = claudePublishRunDebtClaim(snap, time.Now())
+			return true
+		}) {
+			t.Fatal("seeding the owner's lease did not write the cache")
+		}
+		if !mutateClaudeRateLimitSnapshot(cache, fp, releaseClaudeRunDebtRungClaim(lease)) {
+			t.Fatal("the owner's release did not land")
+		}
+		return claudeCacheSnapshot(t, cache)
+	}
+
+	before := time.Now()
+	snap := release(1, 0)
+	if snap.AttemptClaimedUntilMs == 0 || snap.AttemptClaimedUntilMs < before.UnixMilli() || snap.AttemptClaimedUntilMs > time.Now().UnixMilli() {
+		t.Fatalf("released lease=%d, want the release instant kept", snap.AttemptClaimedUntilMs)
+	}
+	if _, live := claudeRunDebtLeaseLive(&snap, time.Now()); live {
+		t.Fatal("the kept release instant reads as a live lease")
+	}
+	if claudePinnedDebtAbandoned(&snap, time.Now()) {
+		t.Fatal("judged abandoned straight after its owner released it")
+	}
+	if !claudePinnedDebtAbandoned(&snap, time.Now().Add(claudePinnedDebtAbandonedAfter+time.Second)) {
+		t.Fatal("never judged abandoned once its owner was gone past the slack")
+	}
+
+	if snap := release(1, time.Now().Add(time.Minute).UnixMilli()); snap.AttemptClaimedUntilMs != 0 {
+		t.Fatalf("released lease=%d with a rung on disk, want 0", snap.AttemptClaimedUntilMs)
+	}
+	if snap := release(0, 0); snap.AttemptClaimedUntilMs != 0 {
+		t.Fatalf("released lease=%d on an uncharged debt, want 0", snap.AttemptClaimedUntilMs)
+	}
+}
+
 // The hooks were pinned to an alias of the own cache when they were
 // re-pointed. A hook still running on the old settings commits through that
 // alias afterwards, and the commit's rename turns it into a file of its own:

@@ -682,9 +682,12 @@ var claudePinnedDebtAbandonedAfter = 2 * time.Minute
 // bound to reopen its cache, so the run would wait for an unrelated gather or
 // the age-out.
 //
-// A charged debt with neither a rung nor a lease on record is the moment
-// between an owner's release and its next booking, or a booking the owner is
-// retrying in memory, and is never judged abandoned.
+// A charged debt whose rung write was refused still has its released lease's
+// end on record (releaseClaudeRunDebtRungClaim), so it lapses here like a lease.
+// The takeover carries the requests already spent, so an owner still retrying
+// in memory only loses the race to pay it, never budget. A charged debt with
+// neither on record (left by a build before that rule) is never judged
+// abandoned.
 func claudePinnedDebtAbandoned(snap *claudeRateLimitSnapshot, now time.Time) bool {
 	if _, live := claudeRunDebtLeaseLive(snap, now); live {
 		return false
@@ -990,6 +993,26 @@ func releaseClaudeRunDebtClaim(leaseMs int64) func(*claudeRateLimitSnapshot) boo
 			return false
 		}
 		snap.AttemptClaimedUntilMs = 0
+		return true
+	}
+}
+
+// releaseClaudeRunDebtRungClaim is releaseClaudeRunDebtClaim for a scheduled
+// debt attempt, the one path that books the next rung before it releases. When
+// that booking's write was refused (the owner retries in memory only), the
+// debt is left charged with no rung on disk, so the release keeps the instant
+// the lease ended rather than zero. That is no longer a live lease, but it is
+// the only record of when the owner last touched the debt, which
+// claudePinnedDebtAbandoned needs if the owner exits before its retry lands.
+func releaseClaudeRunDebtRungClaim(leaseMs int64) func(*claudeRateLimitSnapshot) bool {
+	release := releaseClaudeRunDebtClaim(leaseMs)
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if !release(snap) {
+			return false
+		}
+		if snap.RefreshOwedAtMs != 0 && snap.RefreshOwedAttempts > 0 && snap.NextAttemptAtMs == 0 {
+			snap.AttemptClaimedUntilMs = min(time.Now().UnixMilli(), leaseMs)
+		}
 		return true
 	}
 }
@@ -1390,7 +1413,7 @@ func claudeRunDebtAttemptScopedAt(now time.Time, trigger claudeRunDebtTrigger, s
 		return result
 	}
 
-	defer mutateClaudeRateLimitSnapshot(path, fingerprint, releaseClaudeRunDebtClaim(leaseMs))
+	defer mutateClaudeRateLimitSnapshot(path, fingerprint, releaseClaudeRunDebtRungClaim(leaseMs))
 
 	// ONE bounded attempt, through the ordinary single-flight probe, issued with
 	// the identity this attempt reserved under — never a freshly resolved one.
