@@ -39,7 +39,7 @@ func utilizationMetricsUnknown(metrics []cliAgentUsageMetric) []cliAgentUsageMet
 // installedClaudeRateLimitCachePath returns the cache path the CURRENTLY
 // INSTALLED status-line hook writes to, or "" when Claude has no hook of ours.
 //
-// `ourStatusLineCommand` pins the path to the installing binary's
+// `ourClaudeHookCommand` pins the path to the installing binary's
 // `GetConfigDir()`, but Claude's settings.json is a single machine-wide file:
 // with two channels installed (release + dev), whichever agent booted last owns
 // the hook, and the other one keeps reading a cache nothing writes to any more.
@@ -59,7 +59,7 @@ func installedClaudeRateLimitCachePath(home string) string {
 		return ""
 	}
 	var sl claudeStatusLine
-	if json.Unmarshal(raw, &sl) != nil || !isOurStatusLineCommand(sl.Command) {
+	if json.Unmarshal(raw, &sl) != nil || !isOurClaudeHookCommand(sl.Command, statusLineHookArg) {
 		return ""
 	}
 	return extractInstalledPinnedPath(sl.Command, "RL_CACHE")

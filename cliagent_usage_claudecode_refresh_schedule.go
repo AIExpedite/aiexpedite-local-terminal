@@ -1,8 +1,9 @@
 // cliagent_usage_claudecode_refresh_schedule.go — the clock behind the Claude
 // Code run-completion refresh debt.
 //
-// After an under-quota headless run (direct chat, terminal-managed, or a
-// `__cli_smoke__` turn) the OAuth usage probe is the ONLY numeric source, so a
+// After an under-quota headless run (direct chat, terminal-managed, a
+// `__cli_smoke__` turn, or any run the `SessionEnd` hook observed —
+// claude_run_end_hook.go) the OAuth usage probe is the ONLY numeric source, so a
 // run's debt has to reach that endpoint. It used to get one immediate attempt,
 // a trailing wait of at most five minutes held in a goroutine, and one startup
 // replay — and a pre-update 429 hold, an expired stored token, or a probe that
@@ -58,9 +59,13 @@ var (
 	claudeRunDebtRungSlack = time.Second
 )
 
-// claudeRunDebtTrigger names what started an attempt. Only the timer and the
-// startup replay honour a rung booked in the future; a finished run and a
-// credential nudge are reasons to try NOW (the gate still spaces them).
+// claudeRunDebtTrigger names what started an attempt. The timer, the startup
+// replay and an observed run (a debt the SessionEnd hook wrote, adopted by the
+// usage tick) honour a rung booked in the future; a finished run and a
+// credential nudge are reasons to try NOW (the gate still spaces them). An
+// observed debt is written due, so honouring the rung only matters when the
+// tick adopts a debt whose rung was already booked — spending it early there
+// would collapse the ladder.
 type claudeRunDebtTrigger int
 
 const (
@@ -68,10 +73,11 @@ const (
 	claudeDebtTriggerTimer
 	claudeDebtTriggerStartup
 	claudeDebtTriggerNudge
+	claudeDebtTriggerObserved
 )
 
 func (t claudeRunDebtTrigger) honoursRung() bool {
-	return t == claudeDebtTriggerTimer || t == claudeDebtTriggerStartup
+	return t == claudeDebtTriggerTimer || t == claudeDebtTriggerStartup || t == claudeDebtTriggerObserved
 }
 
 // claudeRunDebtRungKind says how the next rung's delay is derived.

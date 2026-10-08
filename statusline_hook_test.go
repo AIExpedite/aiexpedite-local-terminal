@@ -273,7 +273,7 @@ func TestEnsureClaudeStatusLineHook_SkipsWhenNoClaude(t *testing.T) {
 }
 
 func TestOurStatusLineCommand_NoBackslashesAndQuoted(t *testing.T) {
-	cmd, ok := ourStatusLineCommand()
+	cmd, ok := ourClaudeHookCommand(statusLineHookArg)
 	if !ok {
 		t.Fatal("expected a command")
 	}
@@ -309,7 +309,7 @@ func TestOurStatusLineCommand_PinsCacheAndStashPaths(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", prev)
 
-	cmd, ok := ourStatusLineCommand()
+	cmd, ok := ourClaudeHookCommand(statusLineHookArg)
 	if !ok {
 		t.Fatal("expected a command")
 	}
@@ -328,7 +328,7 @@ func TestOurStatusLineCommand_PinsCacheAndStashPaths(t *testing.T) {
 	}
 	// Round-trip: the command must still be recognized as ours so the next
 	// install doesn't stash it as a third-party command.
-	if !isOurStatusLineCommand(cmd) {
+	if !isOurClaudeHookCommand(cmd, statusLineHookArg) {
 		t.Errorf("env-pinned command not recognized as ours: %q", cmd)
 	}
 }
@@ -545,7 +545,7 @@ func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
 		`$env:AIEXPEDITE_CLAUDE_RL_CACHE="C:/x/cache.json"; $env:AIEXPEDITE_CLAUDE_STATUSLINE_PREV="C:/x/prev.json"; & "C:/x/aiexpedite.exe" statusline-hook`,
 	}
 	for _, c := range ours {
-		if !isOurStatusLineCommand(c) {
+		if !isOurClaudeHookCommand(c, statusLineHookArg) {
 			t.Errorf("expected to be recognized as ours: %q", c)
 		}
 	}
@@ -562,7 +562,7 @@ func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
 		``,
 	}
 	for _, c := range notOurs {
-		if isOurStatusLineCommand(c) {
+		if isOurClaudeHookCommand(c, statusLineHookArg) {
 			t.Errorf("must NOT be recognized as ours: %q", c)
 		}
 	}

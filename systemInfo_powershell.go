@@ -14,6 +14,12 @@
 // The two hosts keep SEPARATE CurrentUser stores (5.1: the registry; 7.x:
 // Documents\PowerShell\powershell.config.json), so each is probed on its own.
 //
+// When the per-user write is refused, setup can ask Windows for administrator
+// approval (UAC) to set LocalMachine instead. Each host reports whether that
+// would lift its block (fixableByElevation): only when no CurrentUser value
+// would beat the LocalMachine one, and only for a host installed where an
+// administrator can write its LocalMachine setting (machineInstalled).
+//
 // This file is the ONE place the precedence rule lives. terminal-service and
 // the frontend only read the flags reported here (shared-constants
 // readPowerShellPolicy); they never re-derive which scope wins.
@@ -24,6 +30,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	pathpkg "path"
 	"strings"
 	"sync"
 )
@@ -87,6 +95,13 @@ type powerShellHostPolicy struct {
 	BlockedBy            string `json:"blockedBy"`
 	BlocksLocalScripts   bool   `json:"blocksLocalScripts"`
 	FixableByCurrentUser bool   `json:"fixableByCurrentUser"`
+	// FixableByElevation: a LocalMachine RemoteSigned value (set through the
+	// Windows administrator prompt) would decide the policy and lift the block.
+	FixableByElevation bool `json:"fixableByElevation"`
+	// MachineInstalled: the host lives where an administrator can write its
+	// LocalMachine setting — always true for Windows PowerShell; for pwsh, a
+	// Program Files install (a Store or per-user pwsh is never elevatable).
+	MachineInstalled bool `json:"machineInstalled"`
 }
 
 // powerShellPolicyInfo is report.specs.powerShell (Windows only).
@@ -98,6 +113,10 @@ type powerShellPolicyInfo struct {
 	// RemoteSigned lifts the block in EVERY blocking host. A mixed report (one
 	// host fixable, another locked by policy) is not fixable.
 	FixableByCurrentUser bool `json:"fixableByCurrentUser"`
+	// FixableByElevation: at least one blocking host is FixableByElevation;
+	// HostsToElevate names those hosts (the only ones the elevated step sets).
+	FixableByElevation bool     `json:"fixableByElevation"`
+	HostsToElevate     []string `json:"hostsToElevate"`
 	// pwshDetected: pwsh is on PATH, even when its probe failed and Hosts has
 	// no powershell7 entry. The manual command must still name the host.
 	pwshDetected bool
@@ -140,13 +159,22 @@ func policyBlocksLocalScripts(effective string) bool {
 }
 
 // classifyPowerShellPolicy fills BlockedBy / BlocksLocalScripts /
-// FixableByCurrentUser for one host. Pure and OS-independent.
+// FixableByCurrentUser / FixableByElevation for one host. Pure and
+// OS-independent; reads MachineInstalled as given (always true for Windows
+// PowerShell).
 //
 // A CurrentUser value overrides LocalMachine and the OS default, so the change
 // is offered only when one of those decides the policy. Group Policy
 // (MachinePolicy / UserPolicy) and the Process scope cannot be overridden from
 // CurrentUser, and AllSigned is a deliberate choice this never changes.
+//
+// LocalMachine is overridden by any defined CurrentUser value, so elevation is
+// offered only when LocalMachine or the OS default decides the policy — and
+// only for a host whose LocalMachine setting an administrator can write.
 func classifyPowerShellPolicy(h powerShellHostPolicy) powerShellHostPolicy {
+	if h.Host == powerShellHostWindows {
+		h.MachineInstalled = true
+	}
 	h.BlockedBy = psScopeDefault
 	for _, scope := range psScopePrecedence {
 		if isPolicyDefined(h.Scopes[scope]) {
@@ -161,7 +189,50 @@ func classifyPowerShellPolicy(h powerShellHostPolicy) powerShellHostPolicy {
 	default:
 		h.FixableByCurrentUser = false
 	}
+	switch h.BlockedBy {
+	case psScopeLocalMachine, psScopeDefault:
+		h.FixableByElevation = h.MachineInstalled && h.BlocksLocalScripts && !strings.EqualFold(h.Effective, psPolicyAllSigned)
+	default:
+		h.FixableByElevation = false
+	}
 	return h
+}
+
+// powerShellProgramFilesDirs are the administrator-owned install roots the
+// elevated step searches for pwsh.exe (%ProgramFiles% and
+// %ProgramFiles(x86)%). Seam for tests.
+var powerShellProgramFilesDirs = func() []string {
+	return []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")}
+}
+
+// isMachineInstalledPwsh reports whether the pwsh found on PATH lives under
+// <Program Files>\PowerShell\ — the same folders the elevated step resolves
+// pwsh.exe from (never PATH). A Store alias (%LOCALAPPDATA%\Microsoft\
+// WindowsApps) or a per-user install keeps its LocalMachine setting where an
+// administrator cannot (WindowsApps) or need not (user-owned) write it.
+func isMachineInstalledPwsh(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	clean := windowsPathKey(path)
+	for _, dir := range powerShellProgramFilesDirs() {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		if strings.HasPrefix(clean, windowsPathKey(dir)+"/powershell/") {
+			return true
+		}
+	}
+	return false
+}
+
+// windowsPathKey puts a Windows path in a comparable form on every OS (these
+// tests also run on the Linux CI leg, where filepath does not treat `\` as a
+// separator): forward slashes, `.` / `..` resolved — so a PATH entry such as
+// `C:\Program Files\PowerShell\..\..\Users\me` cannot pass for a Program
+// Files install — and lowercased (NTFS paths are case-insensitive).
+func windowsPathKey(p string) string {
+	return strings.ToLower(pathpkg.Clean(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/")))
 }
 
 // parsePowerShellPolicyJSON reads powerShellPolicyScript's output for host and
@@ -198,7 +269,7 @@ func summarizePowerShellPolicy(hosts []powerShellHostPolicy) *powerShellPolicyIn
 	if len(hosts) == 0 {
 		return nil
 	}
-	info := &powerShellPolicyInfo{Hosts: hosts}
+	info := &powerShellPolicyInfo{Hosts: hosts, HostsToElevate: []string{}}
 	allBlockingFixable := true
 	for _, h := range hosts {
 		if !h.BlocksLocalScripts {
@@ -208,8 +279,12 @@ func summarizePowerShellPolicy(hosts []powerShellHostPolicy) *powerShellPolicyIn
 		if !h.FixableByCurrentUser {
 			allBlockingFixable = false
 		}
+		if h.FixableByElevation {
+			info.HostsToElevate = append(info.HostsToElevate, h.Host)
+		}
 	}
 	info.FixableByCurrentUser = info.BlocksLocalScripts && allBlockingFixable
+	info.FixableByElevation = len(info.HostsToElevate) > 0
 	return info
 }
 
@@ -218,7 +293,7 @@ func summarizePowerShellPolicy(hosts []powerShellHostPolicy) *powerShellPolicyIn
 func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *powerShellPolicyInfo {
 	type probe struct{ host, cmd string }
 	probes := []probe{{powerShellHostWindows, "powershell"}}
-	_, lookErr := setupProbeLookPath("pwsh")
+	pwshPath, lookErr := setupProbeLookPath("pwsh")
 	pwshDetected := lookErr == nil
 	if pwshDetected {
 		probes = append(probes, probe{powerShellHost7, "pwsh"})
@@ -232,6 +307,10 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 			out, ok := run(ctx, p.cmd, []string{"-NoProfile", "-NonInteractive", "-Command", powerShellPolicyScript}, nil, setupProbeTimeout)
 			if ok {
 				results[i] = parsePowerShellPolicyJSON(p.host, out)
+			}
+			if r := results[i]; r != nil && p.host == powerShellHost7 {
+				r.MachineInstalled = isMachineInstalledPwsh(pwshPath)
+				*r = classifyPowerShellPolicy(*r)
 			}
 		}(i, p)
 	}
@@ -250,6 +329,8 @@ func gatherPowerShellPolicyWindows(ctx context.Context, run setupProbeRunner) *p
 		if results[0] == nil {
 			info.windowsUnclassified = true
 			info.FixableByCurrentUser = false
+			info.FixableByElevation = false
+			info.HostsToElevate = []string{}
 		}
 	}
 	return info
@@ -312,9 +393,22 @@ func (p *powerShellPolicyInfo) manualCommandWhere(keep func(*powerShellHostPolic
 // which no CurrentUser setting can override.
 const powerShellProcessOverrideHint = "remove that override (for example, unset PSExecutionPolicyPreference and restart the AIExpedite agent)"
 
+// powerShellElevationNote follows a not-fixable message when another blocking
+// host could still be fixed through Windows administrator approval.
+const powerShellElevationNote = " For the other PowerShell host, AIExpedite can ask Windows for administrator approval to allow local scripts for all users of this computer (RemoteSigned)."
+
 // powerShellPolicyFinding is the readiness message for a blocking policy, and
-// whether setup can offer the per-user fix.
+// whether setup can offer the per-user fix. When it can't, but a blocking host
+// can be fixed with administrator approval, the message says so.
 func powerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable bool) {
+	message, fixable = basePowerShellPolicyFinding(p)
+	if message != "" && !fixable && p.FixableByElevation {
+		message += powerShellElevationNote
+	}
+	return message, fixable
+}
+
+func basePowerShellPolicyFinding(p *powerShellPolicyInfo) (message string, fixable bool) {
 	h := p.primaryBlockingHost()
 	if h == nil {
 		return "", false

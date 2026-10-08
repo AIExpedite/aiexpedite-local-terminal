@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -324,4 +325,114 @@ func TestClaudeUsageHint_LogsFixedLabelsAndSendsNoIdentity(t *testing.T) {
 	if raw, _ := os.ReadFile(cache); !strings.Contains(string(raw), fingerprint) || strings.Contains(string(raw), account) {
 		t.Fatalf("the cache must scope by the one-way fingerprint and never hold the raw account: %s", raw)
 	}
+}
+
+// The SessionEnd hook sits next to the ending session's id, transcript path,
+// cwd and whatever the user's prompt was. With hostile stdin it prints nothing,
+// and its only change to the cache is the integer debt fields; the resident
+// adoption logs fixed labels only.
+func TestClaudeRunEndHook_WritesNumbersOnlyAndPrintsNothing(t *testing.T) {
+	const (
+		tokenSentinel  = "sk-ant-oat-RUNEND-never-persist-51d3"
+		emailSentinel  = "runend.person@example.com"
+		promptSentinel = "PROMPT_RUNEND_never_persist_0c4e"
+	)
+	cache, _ := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	before := claudeSnapshotMap(t, cache)
+
+	transcript := filepath.Join(t.TempDir(), "TRANSCRIPT_SENTINEL", "session.jsonl")
+	stdin := fmt.Sprintf(`{"session_id":"sess-SENTINEL-1","transcript_path":%q,"cwd":%q,"hook_event_name":"SessionEnd","reason":"other","prompt":%q,"token":%q,"email":%q}`,
+		transcript, filepath.Dir(transcript), promptSentinel, tokenSentinel, emailSentinel)
+	stdout, stderr := runClaudeRunEndHookWithStdio(t, stdin)
+	if stdout != "" || stderr != "" {
+		t.Fatalf("the hook printed stdout=%q stderr=%q, want nothing", stdout, stderr)
+	}
+
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{tokenSentinel, emailSentinel, promptSentinel, "SENTINEL", transcript} {
+		if strings.Contains(string(raw), s) {
+			t.Errorf("the cache leaks %q", s)
+		}
+	}
+	after := claudeSnapshotMap(t, cache)
+	debtFields := map[string]bool{"refreshOwedAtMs": true, "refreshOwedAttempts": true, "nextAttemptAtMs": true}
+	for k, v := range after {
+		if fmt.Sprint(before[k]) == fmt.Sprint(v) {
+			continue
+		}
+		if !debtFields[k] {
+			t.Errorf("the hook changed %s", k)
+		}
+		if _, isNumber := v.(float64); !isNumber {
+			t.Errorf("%s=%v (%T), want a number", k, v, v)
+		}
+	}
+	if _, owed := after["refreshOwedAtMs"]; !owed {
+		t.Fatal("the hook wrote no debt")
+	}
+
+	logged := captureStdout(t, func() {
+		if !adoptObservedClaudeRunDebt(time.Now()) {
+			t.Error("the debt was not adopted")
+		}
+		claudeFreshnessWaitIdle(t)
+	})
+	if !strings.Contains(logged, "[claude-usage] observed run refresh adopted") {
+		t.Errorf("adoption log %q lacks its fixed label", logged)
+	}
+	for _, s := range []string{probeTestToken, os.Getenv("CLAUDE_CONFIG_DIR"), cache} {
+		if strings.Contains(logged, s) {
+			t.Errorf("adoption log leaks %q", s)
+		}
+	}
+}
+
+// runClaudeRunEndHookWithStdio runs the subcommand body with stdin fed from a
+// file and stdout / stderr captured.
+func runClaudeRunEndHookWithStdio(t *testing.T, stdin string) (stdout, stderr string) {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "stdin")
+	if err := os.WriteFile(in, []byte(stdin), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inFile, err := os.Open(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inFile.Close()
+	outFile, err := os.Create(filepath.Join(dir, "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	errFile, err := os.Create(filepath.Join(dir, "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	origIn, origOut, origErr := os.Stdin, os.Stdout, os.Stderr
+	os.Stdin, os.Stdout, os.Stderr = inFile, outFile, errFile
+	runClaudeRunEndHook()
+	os.Stdin, os.Stdout, os.Stderr = origIn, origOut, origErr
+	_ = outFile.Close()
+	_ = errFile.Close()
+	o, _ := os.ReadFile(outFile.Name())
+	e, _ := os.ReadFile(errFile.Name())
+	return string(o), string(e)
+}
+
+func claudeSnapshotMap(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	return m
 }

@@ -204,6 +204,9 @@ func StartAgent(cfg *Config) {
 	// (cliagent_usage_opencode_freshness.go). After isOffline is published
 	// above, so the attempts honour offline mode.
 	payOwedOpenCodeUsage()
+	// Before the hooks are re-pointed at this channel's cache: a debt a run
+	// left on the cache they pinned until now stays adoptable.
+	rememberClaudeHookPinnedCaches(hookHome)
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",
@@ -219,6 +222,21 @@ func StartAgent(cfg *Config) {
 		} else if changed {
 			fmt.Printf("%s[statusline] Installed Claude status-line hook for live rate-limit metrics%s\n",
 				colorGreen, colorReset)
+		}
+		// The SessionEnd hook books a refresh for Claude runs this agent did not
+		// spawn (a `claude -p` from another shell, the maintenance controller's
+		// smoke). It needs the probe to pay that debt, so it follows BOTH
+		// opt-outs: the status-line one above removed it already, the probe one
+		// removes it here.
+		switch changed, err := applyClaudeRunEndHook(hookHome, !cfg.DisableClaudeUsageProbe); {
+		case err != nil && cfg.DisableClaudeUsageProbe:
+			fmt.Printf("%s[claude-run-end] could not remove%s\n", colorYellow, colorReset)
+		case err != nil:
+			fmt.Printf("%s[claude-run-end] could not install%s\n", colorYellow, colorReset)
+		case changed && cfg.DisableClaudeUsageProbe:
+			fmt.Printf("%s[claude-run-end] removed%s\n", colorGreen, colorReset)
+		case changed:
+			fmt.Printf("%s[claude-run-end] installed%s\n", colorGreen, colorReset)
 		}
 	}
 

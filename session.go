@@ -3003,10 +3003,26 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 //
 // Non-claude commands (codex / shells) get only the sanitise step;
 // no entrypoint is injected.
+//
+// A claude child is also marked AIEXPEDITE_CLAUDE_RUN_OWNER=agent so the
+// SessionEnd hook (claude_run_end_hook.go) leaves its refresh to the agent,
+// which books it itself: owing it a second time, at a later instant, would
+// reset the debt's request budget on every agent-run turn. An inherited marker
+// is dropped for every command first, so a `claude` started inside an
+// agent-managed PowerShell / bash session is not marked and the hook captures
+// it.
 func prepareClaudeChildEnv(command string, env []string) ([]string, []string) {
 	filtered, stripped := sanitizeClaudeChildEnv(command, env)
+	marker := claudeRunOwnerEnv + "="
+	kept := filtered[:0]
+	for _, e := range filtered {
+		if !strings.HasPrefix(strings.ToUpper(e), marker) {
+			kept = append(kept, e)
+		}
+	}
+	filtered = kept
 	if isClaudeCommand(command) {
-		filtered = append(filtered, "CLAUDE_CODE_ENTRYPOINT=cli")
+		filtered = append(filtered, "CLAUDE_CODE_ENTRYPOINT=cli", marker+claudeRunOwnerAgent)
 	}
 	return filtered, stripped
 }
