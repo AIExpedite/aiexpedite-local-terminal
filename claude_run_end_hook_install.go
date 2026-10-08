@@ -248,11 +248,13 @@ func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event str
 
 // claudeRunEndHookReconciled reports whether settings.json's SessionEnd hook is
 // in the desired state for periodic reconciliation:
-//   - If the usage probe is armed: a live hook (ours or a peer channel's) sits in
-//     a group without a matcher, so it fires on every session end, and no dead,
-//     matcher-restricted or mistimed copy needs cleanup.
+//   - If the usage probe is armed: exactly one live hook (ours or a peer
+//     channel's) sits in a group without a matcher, so it fires on every
+//     session end, and no dead, matcher-restricted, mistimed or duplicate copy
+//     needs cleanup. Two live copies would each owe a debt per session end.
 //   - If the usage probe is disabled: our own hook is not present (or was removed),
-//     a peer channel's live hook is preserved, and no dead hook needs cleanup.
+//     whatever its timeout, a peer channel's live hook is preserved, and no
+//     dead hook needs cleanup.
 func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 	probeArmed := claudeUsageProbe.armedForProbe()
 	ours, haveOurs := ourClaudeHookCommand(claudeRunEndHookArg)
@@ -261,7 +263,8 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 		return true // malformed hooks object: do not clobber
 	}
 	var (
-		hasOurs       bool // ours, in any group
+		hasOurs       bool // ours, in any group, whatever its timeout
+		liveCopies    int  // ours or a live peer's, in any group
 		hasUnfiltered bool // ours or a live peer's, in a group without a matcher
 		hasDeadHook   bool
 		hasRestricted bool // ours or a live peer's, behind a matcher
@@ -282,12 +285,15 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 			if !mine {
 				continue
 			}
-			if haveOurs && cur.Command == ours && cur.Timeout == claudeRunEndHookTimeoutSeconds {
+			// Ownership does not depend on the timeout: a mistimed copy of ours
+			// is still ours, and the opted-out state must remove it.
+			if haveOurs && cur.Command == ours {
 				hasOurs = true
 			} else if !isClaudeHookExecutableLive(extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)) {
 				hasDeadHook = true
 				continue
 			}
+			liveCopies++
 			// A shorter timeout can kill the hook inside the owe's lock wait and
 			// drop the debt, so a copy whose timeout drifted needs a re-point.
 			if cur.Timeout != claudeRunEndHookTimeoutSeconds {
@@ -305,7 +311,7 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 	}
 
 	if probeArmed {
-		return hasUnfiltered && !hasDeadHook && !hasRestricted && !hasMistimed
+		return liveCopies == 1 && hasUnfiltered && !hasDeadHook && !hasRestricted && !hasMistimed
 	}
 	return !hasOurs && !hasDeadHook
 }

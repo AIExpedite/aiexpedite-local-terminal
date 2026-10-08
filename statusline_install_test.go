@@ -1583,3 +1583,93 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsAMistimedRunEndHook(t *testing
 		t.Fatalf("SessionEnd = %+v, want exactly one run-end hook", groups)
 	}
 }
+
+// runEndHookSettings builds settings.json whose SessionEnd holds one un-matched
+// group per command, each at the given timeout.
+func runEndHookSettings(t *testing.T, timeout int, commands ...string) map[string]json.RawMessage {
+	t.Helper()
+	groups := make([]any, 0, len(commands))
+	for _, c := range commands {
+		groups = append(groups, map[string]any{"hooks": []any{map[string]any{
+			"type": "command", "command": c, "timeout": timeout,
+		}}})
+	}
+	raw, err := json.Marshal(map[string]any{"hooks": map[string]any{claudeRunEndHookEvent: groups}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	return settings
+}
+
+// With the probe disabled, our own run-end hook is ours whatever its timeout:
+// a settings rewrite that changes the timeout must not make the opted-out
+// reconcile accept it and keep launching a hook whose debts nobody pays.
+func TestClaudeRunEndHookReconciled_ProbeDisabledFlagsOurMistimedHook(t *testing.T) {
+	armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(true)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	ours, ok := ourClaudeHookCommand(claudeRunEndHookArg)
+	if !ok {
+		t.Skip("no executable path for our hook command")
+	}
+	if claudeRunEndHookReconciled(runEndHookSettings(t, 1, ours)) {
+		t.Fatal("opted-out reconcile accepted our mistimed run-end hook, want it removed")
+	}
+	if claudeRunEndHookReconciled(runEndHookSettings(t, claudeRunEndHookTimeoutSeconds, ours)) {
+		t.Fatal("opted-out reconcile accepted our run-end hook, want it removed")
+	}
+}
+
+// Two live, correctly timed, un-matched run-end hooks would each owe a debt on
+// every session end, so the armed reconcile requires exactly one and the
+// repair collapses the duplicate.
+func TestEnsureClaudeStatusLineHookIfStale_CollapsesDuplicateLiveRunEndHooks(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	peerCmd := claudeHookPosixCommand(peerExe, claudeRunEndHookArg, claudeHookPin{"RL_CACHE", filepath.Join(t.TempDir(), "peer-rl.json")})
+	ours, ok := ourClaudeHookCommand(claudeRunEndHookArg)
+	if !ok {
+		t.Skip("no executable path for our hook command")
+	}
+	if !claudeRunEndHookReconciled(runEndHookSettings(t, claudeRunEndHookTimeoutSeconds, peerCmd)) {
+		t.Fatal("armed reconcile rejected a single live peer run-end hook")
+	}
+	dup := runEndHookSettings(t, claudeRunEndHookTimeoutSeconds, peerCmd, ours)
+	if claudeRunEndHookReconciled(dup) {
+		t.Fatal("armed reconcile accepted two live run-end hooks, want exactly one")
+	}
+
+	raw, err := json.Marshal(dup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureClaudeStatusLineHookIfStale(home); err != nil {
+		t.Fatal(err)
+	}
+	groups := readSettingsMap(t, settingsPath)["hooks"].(map[string]any)[claudeRunEndHookEvent].([]any)
+	var commands []string
+	for _, g := range groups {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			commands = append(commands, h.(map[string]any)["command"].(string))
+		}
+	}
+	if n := countOurRunEndHooks(commands); n != 1 {
+		t.Fatalf("SessionEnd = %+v, want exactly one run-end hook after the repair", groups)
+	}
+}
