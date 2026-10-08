@@ -409,6 +409,94 @@ func TestClaudeDirectRun_APinnedDebtSurvivesARestartAfterTheRePoint(t *testing.T
 	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
 }
 
+// seedClaudeOwnCacheUnderPreviousAccount signs this device in to a scoped
+// account and leaves the own cache scoped to the login it was on before that
+// switch, with a reading and a debt of that account's own.
+func seedClaudeOwnCacheUnderPreviousAccount(t *testing.T, cache string, owedAt time.Time) {
+	t.Helper()
+	writeClaudeAccountCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "ada@example.com")
+	if currentClaudeAccountFingerprint() == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	const previous = "fp-previous-account"
+	observedAt := time.Now().Add(-time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 33, ResetsAtMs: observedAt.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: observedAt.UnixMilli(), usageKnown: true,
+		},
+	}, observedAt, previous, claudeRateLimitSourceStatusLine)
+	seedClaudeRefreshDebt(t, cache, previous, owedAt, 0, time.Time{})
+}
+
+// Dual channel, account switched: the hook re-scoped the pinned cache to the
+// login signed in now, while the own cache is still on the previous one — with
+// a newer debt of its own. The pinned run belongs to the current account, so it
+// is transferred (re-scoping the own cache) and paid.
+func TestClaudeDirectRun_APinnedDebtAfterAnAccountSwitchIsTransferred(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeOwnCacheUnderPreviousAccount(t, cache, end.Add(time.Second))
+	seedClaudeRefreshDebt(t, pinned, currentClaudeAccountFingerprint(), end, 0, time.Time{})
+
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
+	if got := claudeCacheSnapshot(t, cache).AccountFingerprint; got != currentClaudeAccountFingerprint() {
+		t.Fatal("the own cache was not moved onto the current account")
+	}
+}
+
+// The same switch through the re-point, then a restart: the reconcile moves the
+// current account's pinned debt onto the own cache before it rewrites
+// settings.json, so the next process pays it without the in-memory memo.
+func TestClaudeDirectRun_APinnedDebtAfterAnAccountSwitchSurvivesARestartAfterTheRePoint(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+	pinned := pinRunEndHookOnly(t)
+	end := time.Now()
+	seedClaudeOwnCacheUnderPreviousAccount(t, cache, end.Add(-time.Minute))
+	seedClaudeRefreshDebt(t, pinned, currentClaudeAccountFingerprint(), end, 0, time.Time{})
+
+	home, _ := os.UserHomeDir()
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("reconcile changed=%v err=%v, want the hooks re-pointed", changed, err)
+	}
+	own := claudeCacheSnapshot(t, cache)
+	if own.RefreshOwedAtMs != end.UnixMilli() || own.AccountFingerprint != currentClaudeAccountFingerprint() {
+		t.Fatal("the re-point did not move the current account's debt onto the own cache")
+	}
+	resetClaudeDisplacedPinnedCaches()
+	resetClaudeObservedDebtAdoption()
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
+}
+
+// A pinned debt scoped to neither the own cache's account nor the one signed in
+// now belongs to a login this device is not on: it is left where it is.
+func TestClaudeDirectRun_APinnedDebtOfAnotherAccountIsNotTransferred(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeOwnCacheUnderPreviousAccount(t, cache, end.Add(-time.Minute))
+	seedClaudeRefreshDebt(t, pinned, "fp-unrelated-account", end, 0, time.Time{})
+
+	if _, _, owedMs := claudePinnedObservedDebt(claudeCacheSnapshot(t, cache), true, end); owedMs != 0 {
+		t.Fatalf("pinned debt %d offered for transfer, want none", owedMs)
+	}
+	adoptObservedClaudeRunDebt(end)
+	claudeFreshnessWaitIdle(t)
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() {
+		t.Fatal("the other account's debt was taken off its cache")
+	}
+	if own := claudeCacheSnapshot(t, cache); own.RefreshOwedAtMs == end.UnixMilli() {
+		t.Fatal("the other account's debt was owed onto the own cache")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d, want none for another account's run", got)
+	}
+}
+
 // Dual channel, owner first: the channel that owns the pinned cache has
 // already started paying the hook's debt there (a charged request with its
 // claim lease, or a booked rung). This channel must not copy it into its own

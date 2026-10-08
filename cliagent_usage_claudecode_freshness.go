@@ -278,9 +278,27 @@ func claudeOweObservedRunRefresh(end time.Time) bool {
 	return onDisk
 }
 
+// claudeOweTransferredRunRefresh is the owe step of a pinned-debt transfer
+// (transferClaudePinnedObservedDebt): claudeOweRunRefresh, refused unless the
+// account signed in now is `fingerprint`, the scope the pinned debt was owed
+// under. After an account switch that owe is what moves the own cache onto the
+// new login; a second switch between the pinned read and this write must not
+// carry the debt onto a login whose run it was not. Reports whether a debt at
+// or after `baseline` is on disk under that account.
+func claudeOweTransferredRunRefresh(baseline time.Time, fingerprint string) bool {
+	_, onDisk := claudeOweRunRefreshFor(baseline, true, fingerprint)
+	return onDisk
+}
+
 // claudeOweRunRefreshScoped is the shared owe. `requireArmed` refuses when the
 // probe is not armed in this process.
 func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool) (fingerprint string, onDisk bool) {
+	return claudeOweRunRefreshFor(baseline, requireArmed, "")
+}
+
+// claudeOweRunRefreshFor is claudeOweRunRefreshScoped that, when `want` is not
+// empty, refuses unless the resolved account is `want`.
+func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
 		return "", false
 	}
@@ -301,6 +319,9 @@ func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool) (fingerpri
 	// same lock the write takes.
 	scopeBefore := claudeRateLimitCacheScope()
 	fingerprint = currentClaudeAccountFingerprint()
+	if want != "" && fingerprint != want {
+		return fingerprint, false
+	}
 	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
 	// dir not yet readable) resolves to exactly the same "" a genuine accountless
 	// claude.ai login does, and mutateClaudeRateLimitSnapshot cannot tell the two
@@ -474,11 +495,14 @@ func claudeObservedDebtFloor() int64 {
 func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, floor int64, now time.Time) int64 {
 	pinned, pinnedFp, pinnedMs := claudePinnedObservedDebt(own, haveOwn, now)
 	leaseMs := int64(0)
-	if pinnedMs <= floor || pinnedMs < own.RefreshOwedAtMs ||
+	// The own debt only outranks a pinned one owed under the same account: after
+	// a switch the own cache's debt belongs to the login this device left.
+	sameScope := !haveOwn || pinnedFp == own.AccountFingerprint
+	if pinnedMs <= floor || (sameScope && pinnedMs < own.RefreshOwedAtMs) ||
 		!mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &leaseMs)) {
 		return 0
 	}
-	_, onDisk := claudeOweRunRefresh(time.UnixMilli(pinnedMs))
+	onDisk := claudeOweTransferredRunRefresh(time.UnixMilli(pinnedMs), pinnedFp)
 	// Refused, the own cache never took the debt, and releasing the lease
 	// hands it straight back to the channel that owns the pinned cache. A
 	// finish that loses its lock race only leaves the lease to lapse.
@@ -492,16 +516,33 @@ func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool,
 // claudePinnedObservedDebt is the newest payable debt instant on a cache the
 // hooks pin (claudePinnedCacheCandidates), with that cache's path and account
 // scope, when it belongs to the same account scope as the own one (any scope
-// when there is no own cache yet). The instant is zero otherwise.
+// when there is no own cache yet) or to the account signed in now. The instant
+// is zero otherwise.
+//
+// The second scope is the account switch: the hook re-scopes the pinned cache
+// to the new login at the run's end, while the own cache stays on the old one
+// until something here writes it. Matching only the own scope would leave that
+// run's debt unpaid until an unrelated gather re-scopes the own cache. The
+// current account is resolved only for a payable debt whose scope differs from
+// the own one, so a tick with nothing owed still reads no credential.
 func claudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) (path, fingerprint string, owedMs int64) {
 	home, _ := os.UserHomeDir()
+	current, resolved := "", false
 	for _, pinned := range claudePinnedCacheCandidates(home) {
 		snap, ok := loadClaudeRateLimitSnapshot(pinned)
-		if !ok || snap.RefreshOwedAtMs <= owedMs || (haveOwn && snap.AccountFingerprint != own.AccountFingerprint) {
+		if !ok || snap.RefreshOwedAtMs <= owedMs {
 			continue
 		}
 		if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
 			continue
+		}
+		if haveOwn && snap.AccountFingerprint != own.AccountFingerprint {
+			if !resolved {
+				current, resolved = currentClaudeAccountFingerprint(), true
+			}
+			if current == "" || snap.AccountFingerprint != current {
+				continue
+			}
 		}
 		path, fingerprint, owedMs = pinned, snap.AccountFingerprint, snap.RefreshOwedAtMs
 	}
