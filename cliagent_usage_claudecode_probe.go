@@ -650,6 +650,16 @@ func resetClaudeUsageProbeGate() {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	// Stop the rung AGAIN, now that nothing is running. The stop above cancels
+	// what was already sleeping; an attempt that had passed armedForProbe before
+	// the unarm lands books its rung DURING the drain, after that cancellation,
+	// and the process holds exactly one retry slot. Left standing, that rung is
+	// a previous test's — it fires inside the next one and REPLACES the rung
+	// that test's own run-debt booked, so the debt is never retried and the
+	// trailing probe looks discarded. Cheap here, and unreachable once the drain
+	// has reported quiet.
+	stopClaudeRunDebtRetry()
+
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = false
 	// Release any joiner the drain gave up on, so it cannot outlive the reset
