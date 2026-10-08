@@ -278,6 +278,100 @@ func TestClaudeDirectRun_AdoptsADebtOnThePinnedCache(t *testing.T) {
 		t.Fatalf("own snap=%+v, want the adopted debt paid", snap)
 	}
 	requireNumericClaudeWindow(t, snap, claudeWindowFiveHour, end)
+	if pinnedSnap := claudeCacheSnapshot(t, pinned); pinnedSnap.RefreshOwedAtMs != 0 {
+		t.Fatalf("pinned snap=%+v, want the debt transferred off it, not copied", pinnedSnap)
+	}
+}
+
+// pinOtherChannelCache installs a status line pinned to another channel's
+// cache and returns that cache's path.
+func pinOtherChannelCache(t *testing.T) string {
+	t.Helper()
+	pinned := filepath.Join(t.TempDir(), "other-channel", "rl.json")
+	helperWriteJSON(t, filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+				" '/opt/other/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+	if err := os.MkdirAll(filepath.Dir(pinned), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return pinned
+}
+
+// Dual channel, owner first: the channel that owns the pinned cache has
+// already started paying the hook's debt there (a charged request with its
+// claim lease, or a booked rung). This channel must not copy it into its own
+// separately budgeted cache and send a second request for the same run.
+func TestClaudeDirectRun_APinnedDebtTheOwnerIsPayingIsNotCopied(t *testing.T) {
+	cases := map[string]func(*claudeRateLimitSnapshot, time.Time){
+		"claimed": func(snap *claudeRateLimitSnapshot, now time.Time) {
+			snap.RefreshOwedAttempts = 1
+			claudePublishRunDebtClaim(snap, now)
+		},
+		"rung booked": func(snap *claudeRateLimitSnapshot, now time.Time) {
+			snap.NextAttemptAtMs = now.Add(time.Minute).UnixMilli()
+		},
+	}
+	for name, ownerTouch := range cases {
+		t.Run(name, func(t *testing.T) {
+			cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+			fp := currentClaudeAccountFingerprint()
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			pinned := pinOtherChannelCache(t)
+			end := time.Now()
+			seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+			if !mutateClaudeRateLimitSnapshot(pinned, fp, func(snap *claudeRateLimitSnapshot) bool {
+				ownerTouch(snap, end)
+				return true
+			}) {
+				t.Fatal("seeding the owner's attempt did not write the pinned cache")
+			}
+
+			if adoptObservedClaudeRunDebt(end) {
+				t.Fatal("adopted a pinned debt its owner is already paying")
+			}
+			claudeFreshnessWaitIdle(t)
+			if got := atomic.LoadInt64(calls); got != 0 {
+				t.Fatalf("requests=%d, want none", got)
+			}
+			if own := claudeCacheSnapshot(t, cache); own.RefreshOwedAtMs != 0 {
+				t.Fatalf("own snap=%+v, want no copy of the owner's debt", own)
+			}
+			if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() {
+				t.Fatalf("pinned snap=%+v, want the owner's debt left standing", p)
+			}
+		})
+	}
+}
+
+// Dual channel, peer first: once this channel has taken the pinned debt, the
+// owning channel's own adoption finds nothing to pay.
+func TestClaudeDirectRun_ATransferredPinnedDebtIsNotPaidTwice(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+
+	if !adoptObservedClaudeRunDebt(end) {
+		t.Fatal("the pinned cache's debt was not adopted")
+	}
+	claudeFreshnessWaitIdle(t)
+
+	// The owning channel now ticks on its own cache — the pinned one.
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", pinned)
+	resetClaudeObservedDebtAdoption()
+	if adoptObservedClaudeRunDebt(end.Add(time.Second)) {
+		t.Fatal("the owning channel adopted a debt already transferred away")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d, want exactly one across both channels", got)
+	}
 }
 
 // A credential that is transiently unreadable when the tick adopts resolves no

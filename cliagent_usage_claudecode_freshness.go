@@ -388,6 +388,13 @@ func resetClaudeObservedDebtAdoption() {
 // first owed onto the own cache — the monotonic owe, under this process's armed
 // gate — because the attempt only ever reads and charges the own cache.
 //
+// That copy is a TRANSFER, not a duplicate: the debt is first taken off the
+// pinned cache under its lock (takeClaudePinnedObservedDebt), and only while
+// no attempt there has touched it. The budget, rung and claim lease live in
+// each cache file separately, so two channels each paying their own copy of
+// one run would send two requests for it. Whichever channel acts on the pinned
+// debt first owns it; the other sees it gone (or claimed) and stands down.
+//
 // A retired debt (aged out, at the cap, stamped in the future) is not adopted:
 // it costs nothing, and the startup replay clears it.
 //
@@ -411,9 +418,14 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 		!claudeRefreshDebtRetired(time.UnixMilli(own.RefreshOwedAtMs), own.RefreshOwedAttempts, now) {
 		adopt = own.RefreshOwedAtMs
 	}
-	if pinnedMs := claudePinnedObservedDebtMs(own, haveOwn, now); pinnedMs > floor && pinnedMs > own.RefreshOwedAtMs {
+	if pinned, pinnedFp, pinnedMs := claudePinnedObservedDebt(own, haveOwn, now); pinnedMs > floor && pinnedMs > own.RefreshOwedAtMs &&
+		mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, takeClaudePinnedObservedDebt(pinnedMs)) {
 		if _, onDisk := claudeOweRunRefresh(time.UnixMilli(pinnedMs)); onDisk {
 			adopt = pinnedMs
+		} else {
+			// The own cache refused the copy: hand the debt back, so the channel
+			// that owns the pinned cache (or its next start) still pays it.
+			mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, restoreClaudePinnedObservedDebt(pinnedMs))
 		}
 	}
 	if adopt == 0 {
@@ -439,24 +451,52 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 	return true
 }
 
-// claudePinnedObservedDebtMs is the payable debt instant on the cache the
-// installed hooks pin, when that is not the own cache and belongs to the same
-// account scope as the own one (any scope when there is no own cache yet), or
-// zero.
-func claudePinnedObservedDebtMs(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) int64 {
+// claudePinnedObservedDebt is the payable debt instant on the cache the
+// installed hooks pin, with that cache's path and account scope, when it is not
+// the own cache and belongs to the same account scope as the own one (any scope
+// when there is no own cache yet). The instant is zero otherwise.
+func claudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) (path, fingerprint string, owedMs int64) {
 	home, _ := os.UserHomeDir()
 	pinned := installedClaudeRateLimitCachePath(home)
 	if pinned == "" || pinned == claudeRateLimitCachePath() {
-		return 0
+		return "", "", 0
 	}
 	snap, ok := loadClaudeRateLimitSnapshot(pinned)
 	if !ok || snap.RefreshOwedAtMs == 0 || (haveOwn && snap.AccountFingerprint != own.AccountFingerprint) {
-		return 0
+		return "", "", 0
 	}
 	if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
-		return 0
+		return "", "", 0
 	}
-	return snap.RefreshOwedAtMs
+	return pinned, snap.AccountFingerprint, snap.RefreshOwedAtMs
+}
+
+// takeClaudePinnedObservedDebt clears the pinned cache's debt at owedMs so
+// this channel can carry it, ONLY while it is still exactly as the hook wrote
+// it: no request charged, no rung booked, no claim lease in flight. Any of
+// those means the channel that owns the pinned cache is already paying it.
+func takeClaudePinnedObservedDebt(owedMs int64) func(*claudeRateLimitSnapshot) bool {
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs != 0 {
+			return false
+		}
+		if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
+			return false
+		}
+		return clearClaudeRefreshDebt(snap)
+	}
+}
+
+// restoreClaudePinnedObservedDebt puts back a debt takeClaudePinnedObservedDebt
+// took, unless a newer one has been owed there since.
+func restoreClaudePinnedObservedDebt(owedMs int64) func(*claudeRateLimitSnapshot) bool {
+	return func(snap *claudeRateLimitSnapshot) bool {
+		if snap.RefreshOwedAtMs >= owedMs {
+			return false
+		}
+		snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.NextAttemptAtMs = owedMs, 0, 0
+		return true
+	}
 }
 
 // claudePersistedProbeStateFor reports what a previous process left on the

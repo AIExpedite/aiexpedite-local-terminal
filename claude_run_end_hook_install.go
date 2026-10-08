@@ -1,19 +1,23 @@
 // claude_run_end_hook_install.go — merges our `SessionEnd` hook into Claude's
 // settings.json (CLAUDE_CONFIG_DIR or ~/.claude) and removes it again.
 //
-// The entry we own is exactly one matcher group holding one command hook whose
-// command is ours (isOurClaudeHookCommand with claudeRunEndHookArg):
+// The entry we own is one command hook whose command is ours
+// (isOurClaudeHookCommand with claudeRunEndHookArg), installed as its own
+// matcher group:
 //
 //	"hooks": { "SessionEnd": [ { "hooks": [ { "type": "command",
 //	  "command": "<ours> claude-run-end-hook", "timeout": 10 } ] } ] }
 //
-// Every other hook group, event and settings key is preserved: each
-// round-trips as json.RawMessage, re-encoded compactly as the status-line
-// installer does. Install re-points a stale binary path in place and never
-// adds a second group; remove deletes only our group, then an emptied
-// SessionEnd array, then an emptied hooks object. A settings.json
-// that does not parse is never written — the same rule the status-line
-// installer follows.
+// Ownership is judged per command hook, not per group: a user or another tool
+// may add a sibling command to the group holding ours, and that group is
+// still where our hook lives. Every other command hook, group, event and
+// settings key is preserved: each round-trips as json.RawMessage, re-encoded
+// compactly as the status-line installer does. Install re-points a stale
+// binary path in place (one copy, in a group without a matcher, so it fires on
+// every session end) and never adds a second copy; remove deletes only our
+// command hook, then a group it leaves empty, then an emptied SessionEnd
+// array, then an emptied hooks object. A settings.json that does not parse is
+// never written — the same rule the status-line installer follows.
 package main
 
 import (
@@ -43,15 +47,72 @@ type claudeHookMatcherGroup struct {
 	Hooks   []claudeHookCommandEntry `json:"hooks"`
 }
 
-// isOurRunEndHookGroup reports whether a raw matcher group is the one we own:
-// a single command hook whose command is our run-end hook.
-func isOurRunEndHookGroup(raw json.RawMessage) bool {
-	var g claudeHookMatcherGroup
-	if json.Unmarshal(raw, &g) != nil || len(g.Hooks) != 1 {
-		return false
+// ourRunEndHookEntry decodes one command hook and reports whether it is ours.
+func ourRunEndHookEntry(raw json.RawMessage) (claudeHookCommandEntry, bool) {
+	var h claudeHookCommandEntry
+	if json.Unmarshal(raw, &h) != nil {
+		return h, false
 	}
-	h := g.Hooks[0]
-	return h.Type == "command" && isOurClaudeHookCommand(h.Command, claudeRunEndHookArg)
+	return h, h.Type == "command" && isOurClaudeHookCommand(h.Command, claudeRunEndHookArg)
+}
+
+// rewriteOurRunEndHooks walks every command hook of every SessionEnd group.
+// With want == nil it drops each of ours. Otherwise it keeps the FIRST of ours
+// that sits in a group without a matcher — re-pointed to want unless it
+// already matches `ours` and the timeout — and drops every other copy.
+// Sibling hooks keep their place, a group left with no hooks is dropped, and a
+// group whose shape we do not understand is passed through untouched. Reports
+// whether a copy was kept and whether anything changed.
+func rewriteOurRunEndHooks(groups []json.RawMessage, want json.RawMessage, ours string) (out []json.RawMessage, kept, changed bool, err error) {
+	out = make([]json.RawMessage, 0, len(groups)+1)
+	for _, g := range groups {
+		var group map[string]json.RawMessage
+		var entries []json.RawMessage
+		if json.Unmarshal(g, &group) != nil || json.Unmarshal(group["hooks"], &entries) != nil {
+			out = append(out, g)
+			continue
+		}
+		var matcher string
+		if raw, ok := group["matcher"]; ok {
+			_ = json.Unmarshal(raw, &matcher)
+		}
+		next := make([]json.RawMessage, 0, len(entries))
+		groupChanged := false
+		for _, e := range entries {
+			cur, mine := ourRunEndHookEntry(e)
+			switch {
+			case !mine:
+				next = append(next, e)
+			case want == nil || kept || matcher != "":
+				groupChanged = true
+			default:
+				kept = true
+				if cur.Command == ours && cur.Timeout == claudeRunEndHookTimeoutSeconds {
+					next = append(next, e)
+				} else {
+					next = append(next, want)
+					groupChanged = true
+				}
+			}
+		}
+		if !groupChanged {
+			out = append(out, g)
+			continue
+		}
+		changed = true
+		if len(next) == 0 {
+			continue
+		}
+		if group["hooks"], err = json.Marshal(next); err != nil {
+			return nil, false, false, err
+		}
+		raw, err := json.Marshal(group)
+		if err != nil {
+			return nil, false, false, err
+		}
+		out = append(out, raw)
+	}
+	return out, kept, changed, nil
 }
 
 // ensureClaudeRunEndHook installs or re-points our SessionEnd hook. Returns
@@ -73,37 +134,23 @@ func ensureClaudeRunEndHook(home string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	want, err := json.Marshal(claudeHookMatcherGroup{Hooks: []claudeHookCommandEntry{{
-		Type: "command", Command: ours, Timeout: claudeRunEndHookTimeoutSeconds,
-	}}})
+	entry := claudeHookCommandEntry{Type: "command", Command: ours, Timeout: claudeRunEndHookTimeoutSeconds}
+	wantEntry, err := json.Marshal(entry)
 	if err != nil {
 		return false, err
 	}
 
-	// Keep the first group of ours (re-pointed), drop any duplicate, and leave
-	// every other group where it was.
-	out := make([]json.RawMessage, 0, len(groups)+1)
-	found, changed := false, false
-	for _, g := range groups {
-		if !isOurRunEndHookGroup(g) {
-			out = append(out, g)
-			continue
-		}
-		if found {
-			changed = true
-			continue
-		}
-		found = true
-		var cur claudeHookMatcherGroup
-		_ = json.Unmarshal(g, &cur)
-		if cur.Matcher == "" && cur.Hooks[0].Command == ours && cur.Hooks[0].Timeout == claudeRunEndHookTimeoutSeconds {
-			out = append(out, g)
-			continue
-		}
-		out = append(out, want)
-		changed = true
+	// Keep the first copy of ours (re-pointed), drop any duplicate, and leave
+	// every other hook where it was.
+	out, kept, changed, err := rewriteOurRunEndHooks(groups, wantEntry, ours)
+	if err != nil {
+		return false, err
 	}
-	if !found {
+	if !kept {
+		want, err := json.Marshal(claudeHookMatcherGroup{Hooks: []claudeHookCommandEntry{entry}})
+		if err != nil {
+			return false, err
+		}
 		out = append(out, want)
 		changed = true
 	}
@@ -116,8 +163,8 @@ func ensureClaudeRunEndHook(home string) (bool, error) {
 	return writeClaudeSettings(settingsPath, settings)
 }
 
-// removeClaudeRunEndHook deletes our SessionEnd group, pruning containers it
-// leaves empty. Returns true when it wrote a change.
+// removeClaudeRunEndHook deletes our SessionEnd command hook, pruning containers
+// it leaves empty. Returns true when it wrote a change.
 func removeClaudeRunEndHook(home string) (bool, error) {
 	settingsPath := claudeSettingsPathIfPresent(home)
 	if settingsPath == "" {
@@ -131,14 +178,9 @@ func removeClaudeRunEndHook(home string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	out := make([]json.RawMessage, 0, len(groups))
-	for _, g := range groups {
-		if !isOurRunEndHookGroup(g) {
-			out = append(out, g)
-		}
-	}
-	if len(out) == len(groups) {
-		return false, nil
+	out, _, changed, err := rewriteOurRunEndHooks(groups, nil, "")
+	if err != nil || !changed {
+		return false, err
 	}
 	if err := encodeClaudeHookEvent(settings, hooks, claudeRunEndHookEvent, out); err != nil {
 		return false, err

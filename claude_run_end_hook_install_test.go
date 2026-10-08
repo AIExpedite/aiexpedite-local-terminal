@@ -146,6 +146,73 @@ func TestEnsureClaudeRunEndHook_CollapsesDuplicates(t *testing.T) {
 	}
 }
 
+// A user (or another tool) adds a sibling command to the group holding ours.
+// Ours is still recognised there: a move re-points it in place without adding
+// a second copy, and removal takes only ours, leaving the sibling's group.
+func TestClaudeRunEndHook_OwnsItsCommandInsideAMultiHookGroup(t *testing.T) {
+	settingsPath := armClaudeRunEndInstallTest(t, "/opt/old/aiexpedite-terminal")
+	oldOurs, _ := ourClaudeHookCommand(claudeRunEndHookArg)
+	helperWriteJSON(t, settingsPath, map[string]any{"hooks": map[string]any{"SessionEnd": []any{
+		map[string]any{"hooks": []any{
+			map[string]any{"type": "command", "command": oldOurs, "timeout": claudeRunEndHookTimeoutSeconds},
+			map[string]any{"type": "command", "command": "~/bin/log-session.sh", "timeout": 5},
+		}},
+	}}})
+
+	setClaudeHookExecutable(t, "/opt/new/aiexpedite-terminal")
+	if changed, err := ensureClaudeRunEndHook(""); err != nil || !changed {
+		t.Fatalf("ensure after a move: changed=%v err=%v", changed, err)
+	}
+	settings := readSettingsMap(t, settingsPath)
+	groups := settings["hooks"].(map[string]any)[claudeRunEndHookEvent].([]any)
+	cmds := sessionEndCommands(t, settings)
+	if len(groups) != 1 || len(cmds) != 2 || !strings.Contains(cmds[0], "/opt/new/") || cmds[1] != "~/bin/log-session.sh" {
+		t.Fatalf("SessionEnd = %+v, want ours re-pointed in place beside the sibling, in one group", groups)
+	}
+	sibling := groups[0].(map[string]any)["hooks"].([]any)[1].(map[string]any)
+	if sibling["timeout"] != float64(5) {
+		t.Fatalf("sibling = %+v, want its fields preserved", sibling)
+	}
+	if changed, err := ensureClaudeRunEndHook(""); err != nil || changed {
+		t.Fatalf("re-run: changed=%v err=%v, want a no-op", changed, err)
+	}
+
+	if changed, err := removeClaudeRunEndHook(""); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	if cmds := sessionEndCommands(t, readSettingsMap(t, settingsPath)); len(cmds) != 1 || cmds[0] != "~/bin/log-session.sh" {
+		t.Fatalf("SessionEnd commands = %q, want only the sibling", cmds)
+	}
+}
+
+// Ours inside a group with a matcher would fire only on that end reason: it is
+// moved to a group of its own, and the matcher group keeps its sibling.
+func TestEnsureClaudeRunEndHook_MovesOursOutOfAMatcherGroup(t *testing.T) {
+	settingsPath := armClaudeRunEndInstallTest(t, "/opt/aiexpedite/aiexpedite-terminal")
+	ours, _ := ourClaudeHookCommand(claudeRunEndHookArg)
+	helperWriteJSON(t, settingsPath, map[string]any{"hooks": map[string]any{"SessionEnd": []any{
+		map[string]any{"matcher": "logout", "hooks": []any{
+			map[string]any{"type": "command", "command": "~/bin/on-logout.sh"},
+			map[string]any{"type": "command", "command": ours, "timeout": claudeRunEndHookTimeoutSeconds},
+		}},
+	}}})
+	if changed, err := ensureClaudeRunEndHook(""); err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	groups := readSettingsMap(t, settingsPath)["hooks"].(map[string]any)[claudeRunEndHookEvent].([]any)
+	if len(groups) != 2 {
+		t.Fatalf("SessionEnd = %+v, want the matcher group and our own group", groups)
+	}
+	first := groups[0].(map[string]any)
+	if first["matcher"] != "logout" || len(first["hooks"].([]any)) != 1 {
+		t.Fatalf("matcher group = %+v, want only its sibling left", first)
+	}
+	second := groups[1].(map[string]any)
+	if _, ok := second["matcher"]; ok || second["hooks"].([]any)[0].(map[string]any)["command"] != ours {
+		t.Fatalf("our group = %+v, want ours without a matcher", second)
+	}
+}
+
 func TestRemoveClaudeRunEndHook_DeletesOnlyOursAndPrunes(t *testing.T) {
 	settingsPath := armClaudeRunEndInstallTest(t, "/opt/aiexpedite/aiexpedite-terminal")
 	helperWriteJSON(t, settingsPath, map[string]any{
