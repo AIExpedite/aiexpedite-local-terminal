@@ -248,8 +248,9 @@ func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event str
 
 // claudeRunEndHookReconciled reports whether settings.json's SessionEnd hook is
 // in the desired state for periodic reconciliation:
-//   - If the usage probe is armed: a live hook is present (ours or a peer channel's),
-//     and no dead hook needs cleanup.
+//   - If the usage probe is armed: a live hook (ours or a peer channel's) sits in
+//     a group without a matcher, so it fires on every session end, and no dead
+//     or matcher-restricted copy needs cleanup.
 //   - If the usage probe is disabled: our own hook is not present (or was removed),
 //     a peer channel's live hook is preserved, and no dead hook needs cleanup.
 func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
@@ -260,15 +261,20 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 		return true // malformed hooks object: do not clobber
 	}
 	var (
-		hasOurs     bool
-		hasLivePeer bool
-		hasDeadHook bool
+		hasOurs       bool // ours, in any group
+		hasUnfiltered bool // ours or a live peer's, in a group without a matcher
+		hasDeadHook   bool
+		hasRestricted bool // ours or a live peer's, behind a matcher
 	)
 	for _, g := range groups {
 		var group map[string]json.RawMessage
 		var entries []json.RawMessage
 		if json.Unmarshal(g, &group) != nil || json.Unmarshal(group["hooks"], &entries) != nil {
 			continue
+		}
+		var matcher string
+		if raw, ok := group["matcher"]; ok {
+			_ = json.Unmarshal(raw, &matcher)
 		}
 		for _, e := range entries {
 			cur, mine := ourRunEndHookEntry(e)
@@ -277,19 +283,23 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 			}
 			if haveOurs && cur.Command == ours && cur.Timeout == claudeRunEndHookTimeoutSeconds {
 				hasOurs = true
+			} else if !isClaudeHookExecutableLive(extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)) {
+				hasDeadHook = true
+				continue
+			}
+			// A copy behind a matcher fires only on that end reason, so it never
+			// satisfies the armed state: ensureClaudeRunEndHook moves it into a
+			// group of its own.
+			if matcher == "" {
+				hasUnfiltered = true
 			} else {
-				exe := extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)
-				if isClaudeHookExecutableLive(exe) {
-					hasLivePeer = true
-				} else {
-					hasDeadHook = true
-				}
+				hasRestricted = true
 			}
 		}
 	}
 
 	if probeArmed {
-		return (hasOurs || hasLivePeer) && !hasDeadHook
+		return hasUnfiltered && !hasDeadHook && !hasRestricted
 	}
 	return !hasOurs && !hasDeadHook
 }

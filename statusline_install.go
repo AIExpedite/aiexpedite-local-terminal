@@ -370,7 +370,9 @@ func sameClaudeExecutableSpelling(a, b string) bool {
 // hook command exists and is executable. If it matches the current process's
 // executable seam (claudeHookExecutable), it is treated as live unconditionally
 // (covering tests and active execution). Otherwise, it checks whether the file
-// exists on disk.
+// exists on disk and, where mode bits apply, carries an execute bit: Claude
+// cannot run a file whose execute bits were removed, so a hook pointing at it
+// is dead and must be repaired or removed, not preserved.
 func isClaudeHookExecutableLive(exe string) bool {
 	if exe == "" {
 		return false
@@ -381,7 +383,10 @@ func isClaudeHookExecutableLive(exe string) bool {
 		}
 	}
 	st, err := os.Stat(filepath.FromSlash(exe))
-	return err == nil && !st.IsDir()
+	if err != nil || st.IsDir() {
+		return false
+	}
+	return runtime.GOOS == "windows" || st.Mode().Perm()&0o111 != 0
 }
 
 // claudeStatusLineHookReconciled reports whether Claude's settings.json currently

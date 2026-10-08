@@ -1461,3 +1461,86 @@ func TestEnsureClaudeStatusLineHookIfStale_InstallsRunEndWhenPeerOnlyHasStatusLi
 		t.Error("run-end hook was not added")
 	}
 }
+
+// writePeerHookSettings writes a settings.json holding a peer channel's status
+// line and its run-end hook, the latter in a group with `matcher` (none when "").
+func writePeerHookSettings(t *testing.T, settingsPath, peerExe, matcher string) (statusLineCmd, runEndCmd string) {
+	t.Helper()
+	peerCache := filepath.Join(t.TempDir(), "peer-rl.json")
+	statusLineCmd = claudeHookPosixCommand(peerExe, statusLineHookArg, claudeHookPin{"RL_CACHE", peerCache})
+	runEndCmd = claudeHookPosixCommand(peerExe, claudeRunEndHookArg, claudeHookPin{"RL_CACHE", peerCache})
+	group := map[string]any{"hooks": []any{map[string]any{
+		"type": "command", "command": runEndCmd, "timeout": claudeRunEndHookTimeoutSeconds,
+	}}}
+	if matcher != "" {
+		group["matcher"] = matcher
+	}
+	helperWriteJSON(t, settingsPath, map[string]any{
+		"statusLine": map[string]any{"type": "command", "command": statusLineCmd},
+		"hooks":      map[string]any{claudeRunEndHookEvent: []any{group}},
+	})
+	return statusLineCmd, runEndCmd
+}
+
+// A live peer run-end hook behind a matcher fires only on that end reason, so
+// with the probe armed the reconcile does not accept it: it installs an
+// un-matched copy, which fires on every session end.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsAMatcherRestrictedRunEndHook(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writePeerHookSettings(t, settingsPath, peerExe, "logout")
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil || !changed {
+		t.Fatalf("reconcile: changed=%v err=%v, want a repair", changed, err)
+	}
+	groups := readSettingsMap(t, settingsPath)["hooks"].(map[string]any)[claudeRunEndHookEvent].([]any)
+	unfiltered := 0
+	for _, g := range groups {
+		group := g.(map[string]any)
+		if _, ok := group["matcher"]; ok {
+			t.Errorf("SessionEnd group %+v: a run-end hook is still behind a matcher", group)
+			continue
+		}
+		unfiltered += countOurRunEndHooks([]string{group["hooks"].([]any)[0].(map[string]any)["command"].(string)})
+	}
+	if unfiltered != 1 {
+		t.Fatalf("SessionEnd = %+v, want exactly one un-matched run-end hook", groups)
+	}
+}
+
+// On POSIX a peer binary whose execute bits were removed cannot be run by
+// Claude: the reconcile treats its hooks as dead and repairs them.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsANonExecutablePeerBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("execute bits do not apply on Windows")
+	}
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if isClaudeHookExecutableLive(peerExe) {
+		t.Fatal("a file without execute bits must not count as a live hook binary")
+	}
+	writePeerHookSettings(t, settingsPath, peerExe, "")
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil || !changed {
+		t.Fatalf("reconcile: changed=%v err=%v, want a repair", changed, err)
+	}
+	if sl, re := claudeHookEntries(t, settingsPath); !sl || !re {
+		t.Fatalf("after repair: statusLine=%v runEnd=%v, want both ours", sl, re)
+	}
+}
