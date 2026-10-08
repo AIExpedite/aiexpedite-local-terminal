@@ -497,6 +497,33 @@ func TestClaudeDirectRun_APinnedDebtOfAnotherAccountIsNotTransferred(t *testing.
 	}
 }
 
+// A pinned debt owed under the accountless claude.ai login has the empty scope.
+// That is a real account scope, not "no requirement": once a fingerprinted
+// account is signed in, the transfer's owe must refuse it rather than write the
+// accountless login's run under the new account and probe it there.
+func TestClaudeDirectRun_AnAccountlessPinnedDebtIsNotOwedUnderAScopedAccount(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	writeClaudeAccountCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), "ada@example.com")
+	current := currentClaudeAccountFingerprint()
+	if current == "" {
+		t.Fatal("the credential fixture resolved to an unscoped account; this case needs a scoped one")
+	}
+	end := time.Now()
+
+	if claudeOweTransferredRunRefresh(end, "", 0) {
+		t.Fatal("an accountless debt was owed under a scoped account")
+	}
+	if own, ok := loadClaudeRateLimitSnapshot(cache); ok && own.RefreshOwedAtMs == end.UnixMilli() {
+		t.Fatal("the accountless debt reached the own cache")
+	}
+	if !claudeOweTransferredRunRefresh(end, current, 0) {
+		t.Fatal("a debt owed under the signed-in account was refused")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d, want none from the owe alone", got)
+	}
+}
+
 // Dual channel, owner first: the channel that owns the pinned cache has
 // already started paying the hook's debt there (a charged request with its
 // claim lease, or a booked rung). This channel must not copy it into its own

@@ -291,20 +291,23 @@ func claudeOweObservedRunRefresh(end time.Time) bool {
 // claudePinnedDebtAbandoned). The own copy starts from that count, so moving a
 // debt between caches never refills its budget.
 func claudeOweTransferredRunRefresh(baseline time.Time, fingerprint string, spent int) bool {
-	_, onDisk := claudeOweRunRefreshFor(baseline, true, fingerprint, spent)
+	_, onDisk := claudeOweRunRefreshFor(baseline, true, &fingerprint, spent)
 	return onDisk
 }
 
 // claudeOweRunRefreshScoped is the shared owe. `requireArmed` refuses when the
 // probe is not armed in this process.
 func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool) (fingerprint string, onDisk bool) {
-	return claudeOweRunRefreshFor(baseline, requireArmed, "", 0)
+	return claudeOweRunRefreshFor(baseline, requireArmed, nil, 0)
 }
 
 // claudeOweRunRefreshFor is claudeOweRunRefreshScoped that, when `want` is not
-// empty, refuses unless the resolved account is `want`. A debt it owes starts
-// with `spent` requests already charged (claudeOweTransferredRunRefresh).
-func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string, spent int) (fingerprint string, onDisk bool) {
+// nil, refuses unless the resolved account is exactly *want. The requirement is
+// a pointer, not a sentinel string: "" is the accountless claude.ai login's
+// genuine scope, so a pinned debt owed under it must still refuse a fingerprinted
+// account. A debt it owes starts with `spent` requests already charged
+// (claudeOweTransferredRunRefresh).
+func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string, spent int) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
 		return "", false
 	}
@@ -325,7 +328,7 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string, 
 	// same lock the write takes.
 	scopeBefore := claudeRateLimitCacheScope()
 	fingerprint = currentClaudeAccountFingerprint()
-	if want != "" && fingerprint != want {
+	if want != nil && fingerprint != *want {
 		return fingerprint, false
 	}
 	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
