@@ -104,6 +104,10 @@ type openCodeDirectLimits struct {
 	// SessionFloorMs, when set below the read's floor, lists sessions last
 	// written since then (openCodeDirectSessionFloor); 0 lists from the floor.
 	SessionFloorMs int64
+	// ExactSessions resumes a scan the session cap stopped: the listing starts
+	// at the first unread session, without the slack, or it would re-list the
+	// same capped sessions forever.
+	ExactSessions bool
 }
 
 // sessionsSinceMs is the oldest session last write a read from floorMs lists,
@@ -111,6 +115,9 @@ type openCodeDirectLimits struct {
 func (l openCodeDirectLimits) sessionsSinceMs(floorMs int64) int64 {
 	if l.SessionFloorMs > 0 {
 		floorMs = min(floorMs, l.SessionFloorMs)
+	}
+	if l.ExactSessions {
+		return floorMs
 	}
 	return floorMs - openCodeDirectSessionSlack.Milliseconds()
 }
@@ -133,6 +140,10 @@ type openCodeDirectRead struct {
 	// written before ThroughMs was read.
 	Truncated bool
 	ThroughMs int64
+	// AtSession: only the session listing stopped the read, so every session
+	// last written before ThroughMs was read whole.
+	AtSession bool
+	recordCut bool
 	// Skipped counts oversized or unparseable records passed over for good.
 	Skipped int
 }
@@ -144,10 +155,21 @@ type openCodeDirectReader func(ctx context.Context, root string, floorMs int64, 
 
 // truncateAt marks the read stopped before a record last written at ms.
 func (r *openCodeDirectRead) truncateAt(ms int64) {
+	r.recordCut = true
+	r.truncate(ms)
+}
+
+// truncateSessionsAt marks the read stopped before a session last written at ms.
+func (r *openCodeDirectRead) truncateSessionsAt(ms int64) {
+	r.truncate(ms)
+}
+
+func (r *openCodeDirectRead) truncate(ms int64) {
 	if !r.Truncated || ms < r.ThroughMs {
 		r.ThroughMs = ms
 	}
 	r.Truncated = true
+	r.AtSession = !r.recordCut
 }
 
 var (
@@ -297,6 +319,7 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 		MaxRecords:     openCodeDirectMaxRecords,
 		MaxRecordBytes: openCodeDirectMaxRecordBytes,
 		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
+		ExactSessions:  saved.DirectCursor != nil && saved.DirectCursor.Continue && saved.DirectCursor.AtSession,
 	})
 	switch {
 	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
@@ -322,7 +345,8 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 			return false, false
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
-		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated,
+			AtSession: result.AtSession && throughMs == result.ThroughMs}
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
 	})

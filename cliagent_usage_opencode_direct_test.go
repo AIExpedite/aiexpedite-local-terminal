@@ -487,6 +487,31 @@ func TestOpenCodeDirect_ACappedBacklogInsideTheOverlapDrains(t *testing.T) {
 	}
 }
 
+// More sessions than the cap inside the session slack still drain: a scan the
+// session cap stopped resumes at the first unread session, not a minute before
+// it, where the same capped sessions would fill the cap again.
+func TestOpenCodeDirect_ASessionCappedBacklogInsideTheSlackDrains(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2046)
+	for i := 0; i < 5; i++ {
+		session, at := fmt.Sprintf("ses_%d", i), clock.ms(time.Duration(i*5-30)*time.Second)
+		store.write(openCodeTestMessage{session: session, id: "msg_" + session, createdMs: at - 1000, completedMs: at, steps: [][3]int64{{1, 0, 0}}})
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", session), time.UnixMilli(at), time.UnixMilli(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxSessions = 2
+	scanOpenCodeDirect(t)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || !c.Continue || !c.AtSession {
+		t.Fatalf("session-capped cursor = %+v", c)
+	}
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 5 {
+		t.Fatalf("bucket = %+v, want every session drained under the same cap", b)
+	}
+}
+
 // A JSON turn begun before midnight and finished after it is counted, though
 // rewriting its record in place did not move its session directory.
 func TestOpenCodeDirect_ATurnAcrossMidnightIsCounted(t *testing.T) {

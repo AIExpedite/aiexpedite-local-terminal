@@ -100,6 +100,33 @@ func TestOpenCodeDirectSQLite_ReadsAssistantMessagesSince(t *testing.T) {
 	}
 }
 
+// A row whose tokens are not an object is an invalid message, not a failed
+// query: the rows after it are still read.
+func TestOpenCodeDirectSQLite_AMalformedTokensValueDoesNotFailTheRead(t *testing.T) {
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	insertOpenCodeSQLiteMessage(t, db, "ses_a", "msg_ok", base, base+10, base+10, [][3]int64{{7, 0, 0}}, 0)
+	if _, err := db.Exec(`INSERT INTO message VALUES ('msg_bad', 'ses_a', ?, ?, ?)`, base, base+5,
+		fmt.Sprintf(`{"role":"assistant","tokens":"lots","cost":0,"time":{"created":%d,"completed":%d}}`, base, base+5)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO part VALUES ('prt_bad', 'msg_ok', 'ses_a', ?, ?, '{"type":"step-finish","tokens":"lots","cost":0}')`, base, base+10); err != nil {
+		t.Fatal(err)
+	}
+
+	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.Messages) != 2 || read.Messages[0].ID != "msg_bad" || read.Messages[0].Valid {
+		t.Fatalf("messages = %+v, want the malformed row read as invalid", read.Messages)
+	}
+	if m := read.Messages[1]; m.ID != "msg_ok" || !m.Valid || m.Usage.Input != 7 {
+		t.Fatalf("valid row after the malformed one = %+v", m)
+	}
+}
+
 // The adapter opens read-only: a write through its DSN fails.
 func TestOpenCodeDirectSQLite_OpensReadOnly(t *testing.T) {
 	root := t.TempDir()

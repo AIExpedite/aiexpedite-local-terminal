@@ -120,10 +120,14 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // written at or after ThroughMs (less an overlap) are read again. Continue
 // marks a cursor a capped scan saved: the next scan resumes AT ThroughMs, since
 // re-reading the overlap could spend the whole cap on records already counted.
+// AtSession marks one the session cap alone stopped: the next scan lists
+// sessions from ThroughMs without the slack, or the same capped sessions would
+// fill the cap again.
 type openCodeDirectCursor struct {
 	Layout    string `json:"layout"`
 	ThroughMs int64  `json:"throughMs"`
 	Continue  bool   `json:"continue,omitempty"`
+	AtSession bool   `json:"atSession,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the

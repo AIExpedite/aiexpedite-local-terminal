@@ -81,14 +81,14 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 		return sessions[i].name < sessions[j].name
 	})
 	if len(sessions) > limits.MaxSessions {
-		read.truncateAt(sessions[limits.MaxSessions].at)
+		read.truncateSessionsAt(sessions[limits.MaxSessions].at)
 		sessions = sessions[:limits.MaxSessions]
 	}
 
 	var files []openCodeDirectJSONFile
 	for _, s := range sessions {
 		if ctx.Err() != nil {
-			read.truncateAt(s.at)
+			read.truncateSessionsAt(s.at)
 			break
 		}
 		dir := filepath.Join(messageRoot, s.name)

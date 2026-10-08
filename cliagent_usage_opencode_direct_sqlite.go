@@ -59,18 +59,20 @@ func openCodeSQLiteReadOnlyDSN(path string) string {
 // openCodeSQLiteMessageQuery selects the assistant messages of the given
 // sessions (%s: their placeholders), oversized rows flagged rather than parsed.
 // info is a narrow JSON object the row's data is reduced to; steps is the array
-// of its step-finish parts' figures.
+// of its step-finish parts' figures. tokens is read with -> (always JSON text,
+// even for a string), so a malformed value reaches Go as an invalid message
+// rather than failing json() and the whole query.
 const openCodeSQLiteMessageQuery = `
 SELECT m.id, m.session_id, m.time_created, m.time_updated,
        length(m.data) > ? AS oversized,
        CASE WHEN length(m.data) <= ? AND json_valid(m.data) THEN json_object(
-         'tokens', json(json_extract(m.data, '$.tokens')),
+         'tokens', json(m.data -> '$.tokens'),
          'cost', json_extract(m.data, '$.cost'),
          'completed', json_extract(m.data, '$.time.completed')) END AS info,
        CASE WHEN length(m.data) <= ? AND json_valid(m.data) THEN (
          SELECT json_group_array(json_object(
            'type', 'step-finish',
-           'tokens', json(json_extract(p.data, '$.tokens')),
+           'tokens', json(p.data -> '$.tokens'),
            'cost', json_extract(p.data, '$.cost')))
          FROM part p
          WHERE p.message_id = m.id
@@ -122,7 +124,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 			return read, err
 		}
 		if len(sessions) == limits.MaxSessions {
-			read.truncateAt(at)
+			read.truncateSessionsAt(at)
 			break
 		}
 		sessions = append(sessions, id)
