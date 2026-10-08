@@ -1,0 +1,377 @@
+// claude_run_end_hook_install.go — merges our `SessionEnd` hook into Claude's
+// settings.json (CLAUDE_CONFIG_DIR or ~/.claude) and removes it again.
+//
+// The entry we own is one command hook whose command is ours
+// (isOurClaudeHookCommand with claudeRunEndHookArg), installed as its own
+// matcher group:
+//
+//	"hooks": { "SessionEnd": [ { "hooks": [ { "type": "command",
+//	  "command": "<ours> claude-run-end-hook", "timeout": 10 } ] } ] }
+//
+// Ownership is judged per command hook, not per group: a user or another tool
+// may add a sibling command to the group holding ours, and that group is
+// still where our hook lives. Every other command hook, group, event and
+// settings key is preserved: each round-trips as json.RawMessage, re-encoded
+// compactly as the status-line installer does. Install re-points a stale
+// binary path in place (one copy, in a group without a matcher, so it fires on
+// every session end) and never adds a second copy; remove deletes only our
+// command hook, then a group it leaves empty, then an emptied SessionEnd
+// array, then an emptied hooks object. A settings.json that does not parse is
+// never written — the same rule the status-line installer follows.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"slices"
+)
+
+// claudeRunEndHookEvent is the Claude Code hook event we register on: it fires
+// once per session in both `--print` and interactive mode (Stop would fire
+// after every interactive turn).
+const claudeRunEndHookEvent = "SessionEnd"
+
+// claudeRunEndHookTimeoutSeconds bounds how long Claude waits on our hook. The
+// owe is one bounded cache write; the cap only matters on a wedged filesystem.
+const claudeRunEndHookTimeoutSeconds = 10
+
+// claudeHookCommandEntry mirrors one command hook inside a matcher group.
+type claudeHookCommandEntry struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// claudeHookMatcherGroup mirrors one matcher group of a hook event.
+type claudeHookMatcherGroup struct {
+	Matcher string                   `json:"matcher,omitempty"`
+	Hooks   []claudeHookCommandEntry `json:"hooks"`
+}
+
+// ourRunEndHookEntry decodes one command hook and reports whether it is ours.
+func ourRunEndHookEntry(raw json.RawMessage) (claudeHookCommandEntry, bool) {
+	var h claudeHookCommandEntry
+	if json.Unmarshal(raw, &h) != nil {
+		return h, false
+	}
+	return h, h.Type == "command" && isOurClaudeHookCommand(h.Command, claudeRunEndHookArg)
+}
+
+// rewriteOurRunEndHooks walks every command hook of every SessionEnd group.
+// With want == nil it drops each of ours. Otherwise it keeps the FIRST of ours
+// that sits in a group without a matcher — re-pointed to want unless it
+// already matches `ours` and the timeout — and drops every other copy.
+// Sibling hooks keep their place, a group left with no hooks is dropped, and a
+// group whose shape we do not understand is passed through untouched. Reports
+// whether a copy was kept and whether anything changed.
+func rewriteOurRunEndHooks(groups []json.RawMessage, want json.RawMessage, ours string) (out []json.RawMessage, kept, changed bool, err error) {
+	out = make([]json.RawMessage, 0, len(groups)+1)
+	for _, g := range groups {
+		var group map[string]json.RawMessage
+		var entries []json.RawMessage
+		if json.Unmarshal(g, &group) != nil || json.Unmarshal(group["hooks"], &entries) != nil {
+			out = append(out, g)
+			continue
+		}
+		var matcher string
+		if raw, ok := group["matcher"]; ok {
+			_ = json.Unmarshal(raw, &matcher)
+		}
+		next := make([]json.RawMessage, 0, len(entries))
+		groupChanged := false
+		for _, e := range entries {
+			cur, mine := ourRunEndHookEntry(e)
+			switch {
+			case !mine:
+				next = append(next, e)
+			case want == nil:
+				// When removing, only drop our own hook or dead hooks.
+				// Preserve an active peer channel's live hook!
+				exe := extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)
+				if cur.Command != ours && isClaudeHookExecutableLive(exe) {
+					next = append(next, e)
+					kept = true
+				} else {
+					groupChanged = true
+				}
+			case kept || matcher != "":
+				groupChanged = true
+			default:
+				kept = true
+				if cur.Command == ours && cur.Timeout == claudeRunEndHookTimeoutSeconds {
+					next = append(next, e)
+				} else {
+					next = append(next, want)
+					groupChanged = true
+				}
+			}
+		}
+		if !groupChanged {
+			out = append(out, g)
+			continue
+		}
+		changed = true
+		if len(next) == 0 {
+			continue
+		}
+		if group["hooks"], err = json.Marshal(next); err != nil {
+			return nil, false, false, err
+		}
+		raw, err := json.Marshal(group)
+		if err != nil {
+			return nil, false, false, err
+		}
+		out = append(out, raw)
+	}
+	return out, kept, changed, nil
+}
+
+// ensureClaudeRunEndHook installs or re-points our SessionEnd hook. Returns
+// true when it wrote a change.
+func ensureClaudeRunEndHook(home string) (bool, error) {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
+		return false, nil
+	}
+	ours, ok := ourClaudeHookCommand(claudeRunEndHookArg)
+	if !ok {
+		return false, nil
+	}
+	settings, _, err := readClaudeSettings(settingsPath)
+	if err != nil {
+		return false, err
+	}
+	hooks, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return false, err
+	}
+	entry := claudeHookCommandEntry{Type: "command", Command: ours, Timeout: claudeRunEndHookTimeoutSeconds}
+	wantEntry, err := json.Marshal(entry)
+	if err != nil {
+		return false, err
+	}
+
+	// Keep the first copy of ours (re-pointed), drop any duplicate, and leave
+	// every other hook where it was.
+	out, kept, changed, err := rewriteOurRunEndHooks(groups, wantEntry, ours)
+	if err != nil {
+		return false, err
+	}
+	if !kept {
+		want, err := json.Marshal(claudeHookMatcherGroup{Hooks: []claudeHookCommandEntry{entry}})
+		if err != nil {
+			return false, err
+		}
+		out = append(out, want)
+		changed = true
+	}
+	if !changed {
+		return false, nil
+	}
+	if err := encodeClaudeHookEvent(settings, hooks, claudeRunEndHookEvent, out); err != nil {
+		return false, err
+	}
+	return writeClaudeSettings(settingsPath, settings)
+}
+
+// removeClaudeRunEndHook deletes our SessionEnd command hook, pruning containers
+// it leaves empty. Returns true when it wrote a change.
+func removeClaudeRunEndHook(home string) (bool, error) {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
+		return false, nil
+	}
+	settings, exists, err := readClaudeSettings(settingsPath)
+	if err != nil || !exists {
+		return false, err
+	}
+	hooks, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return false, err
+	}
+	ours, _ := ourClaudeHookCommand(claudeRunEndHookArg)
+	out, _, changed, err := rewriteOurRunEndHooks(groups, nil, ours)
+	if err != nil || !changed {
+		return false, err
+	}
+	if err := encodeClaudeHookEvent(settings, hooks, claudeRunEndHookEvent, out); err != nil {
+		return false, err
+	}
+	return writeClaudeSettings(settingsPath, settings)
+}
+
+// decodeClaudeHookEvent returns settings' `hooks` object (empty when absent)
+// and the matcher groups of `event` (nil when absent). A `hooks` or event value
+// of the wrong JSON type is an error, so a hand-edited shape we do not
+// understand is left untouched.
+func decodeClaudeHookEvent(settings map[string]json.RawMessage, event string) (map[string]json.RawMessage, []json.RawMessage, error) {
+	hooks := map[string]json.RawMessage{}
+	if raw, ok := settings["hooks"]; ok && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &hooks); err != nil {
+			return nil, nil, fmt.Errorf("claude settings: hooks is not an object: %w", err)
+		}
+		if hooks == nil {
+			hooks = map[string]json.RawMessage{}
+		}
+	}
+	var groups []json.RawMessage
+	if raw, ok := hooks[event]; ok && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &groups); err != nil {
+			return nil, nil, fmt.Errorf("claude settings: hooks.%s is not an array: %w", event, err)
+		}
+	}
+	return hooks, groups, nil
+}
+
+// encodeClaudeHookEvent writes `groups` back as hooks[event], deleting the
+// event when it is empty and the hooks object when that leaves it empty.
+func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event string, groups []json.RawMessage) error {
+	if len(groups) == 0 {
+		delete(hooks, event)
+	} else {
+		raw, err := json.Marshal(groups)
+		if err != nil {
+			return err
+		}
+		hooks[event] = raw
+	}
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+		return nil
+	}
+	raw, err := json.Marshal(hooks)
+	if err != nil {
+		return err
+	}
+	settings["hooks"] = raw
+	return nil
+}
+
+// claudeRunEndHookReconciled reports whether settings.json's SessionEnd hook is
+// in the desired state for periodic reconciliation:
+//   - If the usage probe is armed: exactly one live hook (ours or a peer
+//     channel's) sits in a group without a matcher, so it fires on every
+//     session end, and no dead, matcher-restricted, mistimed or duplicate copy
+//     needs cleanup. Two live copies would each owe a debt per session end.
+//   - If the usage probe is disabled: our own hook is not present (or was removed),
+//     whatever its timeout, a peer channel's live hook is preserved, and no
+//     dead hook needs cleanup.
+func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
+	probeArmed := claudeUsageProbe.armedForProbe()
+	ours, haveOurs := ourClaudeHookCommand(claudeRunEndHookArg)
+	_, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return true // malformed hooks object: do not clobber
+	}
+	var (
+		hasOurs       bool // ours, in any group, whatever its timeout
+		liveCopies    int  // ours or a live peer's, in any group
+		hasUnfiltered bool // ours or a live peer's, in a group without a matcher
+		hasDeadHook   bool
+		hasRestricted bool // ours or a live peer's, behind a matcher
+		hasMistimed   bool // ours or a live peer's, with a timeout other than ours
+	)
+	for _, g := range groups {
+		var group map[string]json.RawMessage
+		var entries []json.RawMessage
+		if json.Unmarshal(g, &group) != nil || json.Unmarshal(group["hooks"], &entries) != nil {
+			continue
+		}
+		var matcher string
+		if raw, ok := group["matcher"]; ok {
+			_ = json.Unmarshal(raw, &matcher)
+		}
+		for _, e := range entries {
+			cur, mine := ourRunEndHookEntry(e)
+			if !mine {
+				continue
+			}
+			// Ownership does not depend on the timeout: a mistimed copy of ours
+			// is still ours, and the opted-out state must remove it.
+			if haveOurs && cur.Command == ours {
+				hasOurs = true
+			} else if !isClaudeHookExecutableLive(extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)) {
+				hasDeadHook = true
+				continue
+			}
+			liveCopies++
+			// A shorter timeout can kill the hook inside the owe's lock wait and
+			// drop the debt, so a copy whose timeout drifted needs a re-point.
+			if cur.Timeout != claudeRunEndHookTimeoutSeconds {
+				hasMistimed = true
+			}
+			// A copy behind a matcher fires only on that end reason, so it never
+			// satisfies the armed state: ensureClaudeRunEndHook moves it into a
+			// group of its own.
+			if matcher == "" {
+				hasUnfiltered = true
+			} else {
+				hasRestricted = true
+			}
+		}
+	}
+
+	if probeArmed {
+		return liveCopies == 1 && hasUnfiltered && !hasDeadHook && !hasRestricted && !hasMistimed
+	}
+	return !hasOurs && !hasDeadHook
+}
+
+// applyClaudeRunEndHook installs the run-end hook when `wanted`, removes it
+// otherwise. `wanted` is "neither opt-out is on": a debt the probe can never
+// pay would be pure noise, and "don't touch my Claude settings" must not be
+// half honoured.
+func applyClaudeRunEndHook(home string, wanted bool) (bool, error) {
+	if wanted {
+		return ensureClaudeRunEndHook(home)
+	}
+	return removeClaudeRunEndHook(home)
+}
+
+// installedClaudeRunEndCachePaths returns the cache paths our INSTALLED
+// SessionEnd hooks pin, in settings.json order, deduplicated by spelling —
+// empty when settings.json holds no run-end hook of ours. They are read from
+// the hooks themselves, not inferred from the status line: a partial
+// settings.json rewrite can drop `statusLine` and leave a hook pinned to
+// another channel's cache, which is then where its debts land.
+//
+// Every recognized copy is reported, not just the first: Claude runs every
+// matched handler, so duplicates pinned to different caches can each owe a
+// debt. ensureClaudeRunEndHook collapses them to one, so a caller that
+// memoizes before the rewrite (rememberClaudeHookPinnedCaches) must see all of
+// them or a debt is left in a cache nothing references any more.
+func installedClaudeRunEndCachePaths(home string) []string {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
+		return nil
+	}
+	settings, exists, err := readClaudeSettings(settingsPath)
+	if err != nil || !exists {
+		return nil
+	}
+	_, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, g := range groups {
+		var group struct {
+			Hooks []json.RawMessage `json:"hooks"`
+		}
+		if json.Unmarshal(g, &group) != nil {
+			continue
+		}
+		for _, e := range group.Hooks {
+			h, mine := ourRunEndHookEntry(e)
+			if !mine {
+				continue
+			}
+			pinned := extractInstalledPinnedPath(h.Command, "RL_CACHE")
+			if pinned == "" || slices.ContainsFunc(out, func(q string) bool { return sameClaudeCachePathSpelling(pinned, q) }) {
+				continue
+			}
+			out = append(out, pinned)
+		}
+	}
+	return out
+}

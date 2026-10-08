@@ -382,3 +382,68 @@ func TestNudgeClaudeCredentialChanged_RestartAfterARewritePaysTheRung(t *testing
 		t.Errorf("request count=%d, want one attempt for the rewrite", got)
 	}
 }
+
+// An observed run's debt (the SessionEnd hook) is adopted by the usage tick
+// through claudeDebtTriggerObserved, which honours a booked rung exactly like
+// the timer and the startup replay: a future rung or a live 429 hold is
+// re-armed, never spent; a due one is paid with exactly one request.
+func TestClaudeDebtTriggerObserved_HonoursTheRung(t *testing.T) {
+	if !claudeDebtTriggerObserved.honoursRung() {
+		t.Fatal("the observed trigger must honour a booked rung")
+	}
+
+	t.Run("future rung", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+		pinClaudeRunDebtLadder(t, []time.Duration{time.Hour}, time.Hour, time.Millisecond)
+		now := time.Now()
+		owed := now.Add(-time.Second)
+		claudeOweRunRefresh(owed)
+		claudeBookRunDebtRung(currentClaudeAccountFingerprint(), owed, now, claudeRungAfter, 10*time.Minute)
+
+		claudeRunDebtAttemptAt(now, claudeDebtTriggerObserved)
+		claudeFreshnessWaitIdle(t)
+		if got := atomic.LoadInt64(calls); got != 0 {
+			t.Fatalf("requests=%d, want the future rung re-armed, not spent", got)
+		}
+		if !claudeRunDebtRetryPending() {
+			t.Fatal("the future rung was not re-armed on the timer")
+		}
+		if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != owed.UnixMilli() || snap.RefreshOwedAttempts != 0 {
+			t.Fatalf("snap=%+v, want the debt standing with its budget untouched", snap)
+		}
+	})
+
+	t.Run("live 429 hold", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+		pinClaudeRunDebtLadder(t, []time.Duration{time.Hour}, time.Hour, time.Millisecond)
+		now := time.Now()
+		owed := now.Add(-time.Second)
+		seedClaudeRefreshDebt(t, cache, currentClaudeAccountFingerprint(), owed, 0, now.Add(5*time.Minute))
+
+		claudeRunDebtAttemptAt(now, claudeDebtTriggerObserved)
+		claudeFreshnessWaitIdle(t)
+		if got := atomic.LoadInt64(calls); got != 0 {
+			t.Fatalf("requests=%d, want nothing sent inside the hold", got)
+		}
+		snap := claudeCacheSnapshot(t, cache)
+		if snap.RefreshOwedAtMs != owed.UnixMilli() || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs < now.Add(5*time.Minute-time.Second).UnixMilli() {
+			t.Fatalf("snap=%+v, want the debt kept and its rung booked at the hold's end", snap)
+		}
+	})
+
+	t.Run("due rung", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, claudeProbeOKHandler)
+		now := time.Now()
+		owed := now.Add(-time.Second)
+		claudeOweRunRefresh(owed)
+
+		claudeRunDebtAttemptAt(now, claudeDebtTriggerObserved)
+		claudeFreshnessWaitIdle(t)
+		if got := atomic.LoadInt64(calls); got != 1 {
+			t.Fatalf("requests=%d, want exactly one attempt", got)
+		}
+		if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != 0 {
+			t.Fatalf("snap=%+v, want the debt paid", snap)
+		}
+	})
+}

@@ -1465,8 +1465,11 @@ func TestClaudeUsageProbeAttemptAs_IssuesWithThePinnedIdentity(t *testing.T) {
 // it. The durable write is skipped instead; the in-memory debt still stands.
 func TestClaudeOweRunRefresh_UnresolvedFingerprintLeavesAScopedCacheAlone(t *testing.T) {
 	cache, _ := armClaudeUsageProbe(t, unreachableProbeHandler)
-	if fp := currentClaudeAccountFingerprint(); fp != "" {
-		t.Fatalf("the fixture credential resolved to %q, want the unscoped fixture this case needs", fp)
+	if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want an unreadable credential", fp, resolved)
 	}
 
 	observedAt := time.Now().Add(-time.Hour)

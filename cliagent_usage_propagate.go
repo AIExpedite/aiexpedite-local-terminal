@@ -56,10 +56,13 @@
 // Discovering commits made elsewhere. The Claude status-line hook commits from
 // short-lived processes of its own, so the resident agent learns of those
 // commits by reading the cache: every Claude usage read outside a signed refresh
-// notes a generation newer than the last one this process saw, and a fallback
-// timer reads the small cache at most once a minute — only while Claude is
-// detected, the cache exists, and the agent is online and not draining,
-// shutting down or stopped.
+// notes a generation newer than the last one this process saw, and a Claude
+// tick stats the small cache every 10 s and reads it when the stat changed or
+// a minute has passed — only while Claude is detected, the cache exists, and
+// the agent is online and not draining, shutting down or stopped. The same
+// tick adopts a refresh debt the SessionEnd hook (claude_run_end_hook.go)
+// wrote for a Claude run this agent did not spawn, and re-checks that both
+// hooks are still in Claude's settings.json after a Claude upgrade rewrote it.
 //
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its Codex epoch rotation
@@ -94,6 +97,7 @@ var (
 	cliUsageRotationRetryPeriod   = 60 * time.Second
 	cliUsageHintHTTPTimeout       = 2 * time.Second
 	cliUsageClaudeFallbackPeriod  = 60 * time.Second
+	cliUsageClaudeFallbackPoll    = 10 * time.Second
 	cliUsageClaudeFallbackEnabled = true
 )
 
@@ -188,6 +192,12 @@ type cliUsagePropagatorState struct {
 	fallbackTimer     *time.Timer
 	// fallbackGen invalidates a fallback callback whose timer was replaced.
 	fallbackGen uint64
+	// claudeTick* is the stat the Claude tick last did work at, and when: an
+	// unchanged stamp inside cliUsageClaudeFallbackPeriod skips the load.
+	claudeTickSeen     bool
+	claudeTickMod      int64
+	claudeTickSize     int64
+	claudeTickWorkedAt time.Time
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
@@ -640,7 +650,7 @@ var claudeUsageFallbackDetected = func() bool {
 	return info != nil && info.DetectedCliAgents[claudeUsageProvider].Detected
 }
 
-// armFallbackLocked (re)arms the Claude fallback read.
+// armFallbackLocked (re)arms the Claude tick.
 func (p *cliUsagePropagatorState) armFallbackLocked() {
 	if p.stopped || !cliUsageClaudeFallbackEnabled {
 		return
@@ -650,21 +660,38 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 	}
 	p.fallbackGen++
 	gen := p.fallbackGen
-	p.fallbackTimer = time.AfterFunc(cliUsageClaudeFallbackPeriod, func() { p.fallback(gen) })
+	p.fallbackTimer = time.AfterFunc(cliUsageClaudeFallbackPoll, func() { p.fallback(gen) })
 }
 
-// fallback discovers a Claude generation another process committed (the
-// status-line hook) when no ordinary read has: one small cache read, only
-// while every gate is open.
+// fallback is the Claude tick. It discovers a generation another process
+// committed (the status-line hook) when no ordinary read has, and adopts a
+// refresh debt the SessionEnd hook recorded — one stat per tick, and one small
+// cache read only when that stat moved or cliUsageClaudeFallbackPeriod passed,
+// all only while every gate is open. It also re-runs the settings.json
+// reconcile, which is latched on that file's own stamp and throttled, so a
+// Claude upgrade that dropped our hooks is repaired without waiting for an
+// agent-run session — a direct run never triggers one.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
+	// Serialized with resetCLIUsagePropagator exactly as fire is, so a tick in
+	// flight finishes before a test reset restores the vars it reads
+	// (claudeUsageFallbackDetected, the cache path) under it.
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.fallbackGen {
 		p.mu.Unlock()
 		return
 	}
 	p.mu.Unlock()
-	if g := claudeUsageFallbackGeneration(); g != nil {
-		noteCLIUsageGenerationObserved(claudeUsageProvider, *g)
+	if claudeUsageTickGatesOpen() {
+		reconcileClaudeStatusLineHookBounded("usage-tick")
+		now := time.Now()
+		if p.claudeTickDue(now) {
+			if g := claudeUsageFallbackGeneration(); g != nil {
+				noteCLIUsageGenerationObserved(claudeUsageProvider, *g)
+			}
+			adoptObservedClaudeRunDebt(now)
+		}
 	}
 	p.mu.Lock()
 	if gen == p.fallbackGen {
@@ -673,11 +700,33 @@ func (p *cliUsagePropagatorState) fallback(gen uint64) {
 	p.mu.Unlock()
 }
 
+// claudeTickDue reports whether this tick must load the cache: the first
+// tick, a changed stamp, or a period without work. The stamp is recorded
+// BEFORE the work, so a write the work itself makes is re-read once on the next
+// tick rather than a hook write landing during the work being missed.
+func (p *cliUsagePropagatorState) claudeTickDue(now time.Time) bool {
+	mod, size := claudeRateLimitCacheStamp()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.claudeTickSeen && mod == p.claudeTickMod && size == p.claudeTickSize &&
+		now.Sub(p.claudeTickWorkedAt) < cliUsageClaudeFallbackPeriod {
+		return false
+	}
+	p.claudeTickSeen, p.claudeTickMod, p.claudeTickSize, p.claudeTickWorkedAt = true, mod, size, now
+	return true
+}
+
+// claudeUsageTickGatesOpen reports whether the Claude tick may do anything:
+// online, not draining or shutting down, and Claude Code detected.
+func claudeUsageTickGatesOpen() bool {
+	return !IsShutdownInProgress() && !isDraining() && !IsOffline() && claudeUsageFallbackDetected()
+}
+
 // claudeUsageFallbackGeneration reads the Claude cache's committed generation,
 // or nil without reading while offline, draining, shutting down, or Claude is
 // not detected.
 func claudeUsageFallbackGeneration() *cliUsageGeneration {
-	if IsShutdownInProgress() || isDraining() || IsOffline() || !claudeUsageFallbackDetected() {
+	if !claudeUsageTickGatesOpen() {
 		return nil
 	}
 	path := claudeRateLimitCachePath()
@@ -838,4 +887,5 @@ func resetCLIUsagePropagator() {
 	p.cfg, p.ctx, p.cancel, p.stopped, p.timer, p.fallbackTimer = nil, nil, nil, false, nil, nil
 	p.pending, p.seen, p.lastSentAt = nil, nil, time.Time{}
 	p.rotated, p.rotationRetryAt, p.recoveryDue, p.claudeRecoveryDue = false, time.Time{}, false, false
+	p.claudeTickSeen, p.claudeTickMod, p.claudeTickSize, p.claudeTickWorkedAt = false, 0, 0, time.Time{}
 }

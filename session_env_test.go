@@ -411,3 +411,36 @@ func TestResolveExecutable_MuseCodeInstallerBinFallback(t *testing.T) {
 		t.Errorf("resolveMuseCodeExecutable() = %q, want %q (installer-bin fallback)", got, stub)
 	}
 }
+
+// Every claude child the agent spawns carries the run-owner marker, so the
+// SessionEnd hook leaves its refresh to the agent; nothing else does, so a
+// `claude` started inside an agent-managed shell is captured by the hook. An
+// inherited marker never leaks through a non-claude session.
+func TestPrepareClaudeChildEnv_MarksOnlyClaudeChildren(t *testing.T) {
+	marker := claudeRunOwnerEnv + "=" + claudeRunOwnerAgent
+	inherited := []string{"PATH=/usr/bin", strings.ToLower(claudeRunOwnerEnv) + "=agent", claudeRunOwnerEnv + "=agent"}
+	countMarker := func(env []string) int {
+		n := 0
+		for _, e := range env {
+			if strings.HasPrefix(strings.ToUpper(e), claudeRunOwnerEnv+"=") {
+				n++
+			}
+		}
+		return n
+	}
+	for _, cmd := range []string{"claude", "claude.cmd", `C:\Users\u\AppData\Roaming\npm\claude.cmd`, "/usr/local/bin/claude"} {
+		out, _ := prepareClaudeChildEnv(cmd, inherited)
+		if countMarker(out) != 1 || !envHas(out, claudeRunOwnerEnv) || out[len(out)-1] != marker {
+			t.Errorf("%s: env=%v, want exactly one %s", cmd, out, marker)
+		}
+	}
+	for _, cmd := range []string{"powershell", "pwsh.exe", "bash", "codex", "grok", "opencode"} {
+		out, _ := prepareClaudeChildEnv(cmd, inherited)
+		if n := countMarker(out); n != 0 {
+			t.Errorf("%s: env=%v carries the run-owner marker %d time(s), want none", cmd, out, n)
+		}
+		if !envHas(out, "PATH") {
+			t.Errorf("%s: unrelated vars must be preserved, got %v", cmd, out)
+		}
+	}
+}
