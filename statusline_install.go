@@ -553,6 +553,61 @@ func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error
 	return oldPrev, nil
 }
 
+// claudeSettingsPathIfPresent is settings.json's path when Claude's config dir
+// exists, or "" — only act for users who actually have Claude Code, and never
+// materialise a ~/.claude dir for someone who does not use it.
+func claudeSettingsPathIfPresent(home string) string {
+	base := claudeConfigDir(home)
+	if base == "" {
+		return ""
+	}
+	if st, err := os.Stat(base); err != nil || !st.IsDir() {
+		return ""
+	}
+	return filepath.Join(base, "settings.json")
+}
+
+// readClaudeSettings loads settings.json as raw top-level keys, reporting
+// whether the file exists. Shared by every installer that edits it.
+//
+// A missing file is an empty map. Any other read error (permission, a
+// transient share/lock, …) is NOT "absent" and is returned: treating it as
+// empty would let the caller's atomic write replace settings.json with only
+// our key, silently dropping every other Claude setting the user has. A file
+// that does not parse is returned as an error too — the user may have a
+// comment-laden or hand-edited file, and we refuse to clobber it.
+func readClaudeSettings(settingsPath string) (map[string]json.RawMessage, bool, error) {
+	settings := map[string]json.RawMessage{}
+	b, err := os.ReadFile(settingsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return settings, false, nil
+		}
+		return nil, false, err
+	}
+	if err := json.Unmarshal(b, &settings); err != nil {
+		return nil, true, err
+	}
+	if settings == nil {
+		// A literal `null` file.
+		settings = map[string]json.RawMessage{}
+	}
+	return settings, true, nil
+}
+
+// writeClaudeSettings marshals settings and writes them through
+// writeSettingsAtomic. Reports true (a change was written) on success.
+func writeClaudeSettings(settingsPath string, settings map[string]json.RawMessage) (bool, error) {
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return false, err
+	}
+	if err := writeSettingsAtomic(settingsPath, out); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
 // Claude's settings.json. It is best-effort and idempotent:
 //   - Skips entirely when Claude isn't present (no config dir).
@@ -563,13 +618,8 @@ func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error
 // Returns true when it wrote a change, false when it was already in place or
 // skipped. Errors are returned for logging but are non-fatal to startup.
 func ensureClaudeStatusLineHook(home string) (bool, error) {
-	base := claudeConfigDir(home)
-	if base == "" {
-		return false, nil
-	}
-	// Only act for users who actually have Claude Code — don't materialise a
-	// ~/.claude dir for someone who doesn't use it.
-	if st, err := os.Stat(base); err != nil || !st.IsDir() {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
 		return false, nil
 	}
 
@@ -578,22 +628,9 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	settingsPath := filepath.Join(base, "settings.json")
-	settings := map[string]json.RawMessage{}
-	b, err := os.ReadFile(settingsPath)
-	if err != nil && !os.IsNotExist(err) {
-		// A non-`IsNotExist` read error (permission, transient share/lock, …)
-		// is NOT the same as "file is absent": treating it as empty would let
-		// the later atomic write replace settings.json with only our statusLine
-		// key, silently dropping every other Claude setting the user has.
+	settings, _, err := readClaudeSettings(settingsPath)
+	if err != nil {
 		return false, err
-	}
-	if err == nil {
-		if err := json.Unmarshal(b, &settings); err != nil {
-			// Refuse to clobber an unparseable settings.json — the user may have
-			// a comment-laden or hand-edited file; surface the error instead.
-			return false, err
-		}
 	}
 
 	var existing claudeStatusLine
@@ -674,11 +711,7 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	}
 	settings["statusLine"] = merged
 
-	out, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	if err := writeSettingsAtomic(settingsPath, out); err != nil {
+	if _, err := writeClaudeSettings(settingsPath, settings); err != nil {
 		return false, err
 	}
 	// The refreshed command is committed and names newPrev, so the pre-migration
@@ -905,25 +938,13 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 
 // removeClaudeStatusLineEntry is the statusLine half of removeClaudeStatusLineHook.
 func removeClaudeStatusLineEntry(home string) (bool, error) {
-	base := claudeConfigDir(home)
-	if base == "" {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
 		return false, nil
 	}
-	if st, err := os.Stat(base); err != nil || !st.IsDir() {
-		return false, nil
-	}
-
-	settingsPath := filepath.Join(base, "settings.json")
-	b, err := os.ReadFile(settingsPath)
-	if err != nil {
-		// No settings file means nothing to revert.
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	settings := map[string]json.RawMessage{}
-	if err := json.Unmarshal(b, &settings); err != nil {
+	// No settings file means nothing to revert.
+	settings, exists, err := readClaudeSettings(settingsPath)
+	if err != nil || !exists {
 		return false, err
 	}
 
@@ -983,11 +1004,7 @@ func removeClaudeStatusLineEntry(home string) (bool, error) {
 		delete(settings, "statusLine")
 	}
 
-	out, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	if err := writeSettingsAtomic(settingsPath, out); err != nil {
+	if _, err := writeClaudeSettings(settingsPath, settings); err != nil {
 		return false, err
 	}
 	// Stash is consumed (or never existed) — drop it so a later re-enable

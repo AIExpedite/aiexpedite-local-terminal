@@ -216,8 +216,9 @@ func TestClaudeDirectRun_OneDebtNeverCostsMoreThanTheCap(t *testing.T) {
 		claudeRunDebtAttemptAt(end.Add(time.Duration(i)*20*time.Minute), claudeDebtTriggerObserved)
 		claudeFreshnessWaitIdle(t)
 	}
-	if got := atomic.LoadInt64(calls); got > claudeRefreshOwedMaxRequests {
-		t.Fatalf("requests=%d for one debt, want at most %d", got, claudeRefreshOwedMaxRequests)
+	// Exactly the cap: the ladder does retry a failing endpoint, and stops there.
+	if got := atomic.LoadInt64(calls); got != claudeRefreshOwedMaxRequests {
+		t.Fatalf("requests=%d for one failing debt, want exactly the cap %d", got, claudeRefreshOwedMaxRequests)
 	}
 }
 

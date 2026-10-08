@@ -18,8 +18,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
 // claudeRunEndHookEvent is the Claude Code hook event we register on: it fires
@@ -53,42 +51,6 @@ func isOurRunEndHookGroup(raw json.RawMessage) bool {
 	}
 	h := g.Hooks[0]
 	return h.Type == "command" && isOurClaudeHookCommand(h.Command, claudeRunEndHookArg)
-}
-
-// readClaudeSettings loads settings.json as raw top-level keys. A missing file
-// is an empty map; any other read or parse error is returned so the caller
-// writes nothing.
-func readClaudeSettings(settingsPath string) (map[string]json.RawMessage, bool, error) {
-	settings := map[string]json.RawMessage{}
-	b, err := os.ReadFile(settingsPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return settings, false, nil
-		}
-		return nil, false, err
-	}
-	if err := json.Unmarshal(b, &settings); err != nil {
-		return nil, true, err
-	}
-	if settings == nil {
-		// A literal `null` file.
-		settings = map[string]json.RawMessage{}
-	}
-	return settings, true, nil
-}
-
-// claudeSettingsPathIfPresent is settings.json's path when Claude's config dir
-// exists, or "" — we never materialise a config dir for someone who does not
-// use Claude Code.
-func claudeSettingsPathIfPresent(home string) string {
-	base := claudeConfigDir(home)
-	if base == "" {
-		return ""
-	}
-	if st, err := os.Stat(base); err != nil || !st.IsDir() {
-		return ""
-	}
-	return filepath.Join(base, "settings.json")
 }
 
 // ensureClaudeRunEndHook installs or re-points our SessionEnd hook. Returns
@@ -228,18 +190,6 @@ func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event str
 	}
 	settings["hooks"] = raw
 	return nil
-}
-
-// writeClaudeSettings marshals and atomically writes settings.json.
-func writeClaudeSettings(settingsPath string, settings map[string]json.RawMessage) (bool, error) {
-	out, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	if err := writeSettingsAtomic(settingsPath, out); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // applyClaudeRunEndHook installs the run-end hook when `wanted`, removes it
