@@ -578,6 +578,69 @@ func TestOpenCodeDirect_ASessionContinuationKeepsTheRecordFloor(t *testing.T) {
 	}
 }
 
+// When the session cap cuts first and the record cap cuts later in the same
+// read, the cursor resumes the way the earliest cut stopped — by session, with
+// the record floor — so the unread sessions' earlier messages are still
+// counted. The record left past the later cut, rewritten in place in a session
+// already listed, is the accepted under-count.
+func TestOpenCodeDirect_AMixedCapResumesByTheEarliestCut(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2050)
+	sessionCut := clock.ms(-time.Minute)
+	store.write(openCodeTestMessage{session: "ses_0", id: "msg_a", createdMs: clock.ms(-31 * time.Minute), completedMs: clock.ms(-30 * time.Minute), steps: [][3]int64{{1, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_0", id: "msg_b", createdMs: clock.ms(-21 * time.Minute), completedMs: clock.ms(-20 * time.Minute), writtenMs: clock.ms(-10 * time.Second), steps: [][3]int64{{100, 0, 0}}})
+	for i := 1; i < 3; i++ {
+		session, at := fmt.Sprintf("ses_%d", i), clock.ms(time.Duration(i-30)*time.Minute)
+		store.write(openCodeTestMessage{session: session, id: "msg_" + session, createdMs: at - 1000, completedMs: at, steps: [][3]int64{{1, 0, 0}}})
+	}
+	dirTimes := map[string]int64{"ses_0": clock.ms(-2 * time.Minute), "ses_1": sessionCut, "ses_2": sessionCut}
+	for session, at := range dirTimes {
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", session), time.UnixMilli(at), time.UnixMilli(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxSessions, openCodeDirectMaxRecords = 1, 1
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || !c.Continue || !c.AtSession || c.ThroughMs != sessionCut || c.Skip != 0 || c.RecordFloorMs >= clock.ms(-30*time.Minute) {
+		t.Fatalf("mixed-cap cursor = %+v, want a session continuation at the session cut", c)
+	}
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 3 {
+		t.Fatalf("bucket = %+v, want msg_a and both unread sessions' messages", b)
+	}
+}
+
+// truncate keeps the earliest cut and resumes the way it stopped; at one
+// millisecond a session cut wins, and a skip only counts entries of its kind.
+func TestOpenCodeDirectRead_TruncateKeepsTheEarliestCutsKind(t *testing.T) {
+	var r openCodeDirectRead
+	r.truncateSessionsAt(100, 2)
+	r.truncateAt(200, 5)
+	if !r.Truncated || !r.AtSession || r.ThroughMs != 100 || r.ThroughSkip != 2 {
+		t.Fatalf("session then later record cut = %+v", r)
+	}
+	r = openCodeDirectRead{}
+	r.truncateAt(100, 5)
+	r.truncateSessionsAt(200, 2)
+	if r.AtSession || r.ThroughMs != 100 || r.ThroughSkip != 5 {
+		t.Fatalf("record then later session cut = %+v", r)
+	}
+	r.truncateSessionsAt(100, 9)
+	if !r.AtSession || r.ThroughMs != 100 || r.ThroughSkip != 9 {
+		t.Fatalf("a session cut at the record cut's millisecond = %+v", r)
+	}
+	r.truncateAt(100, 0)
+	if !r.AtSession || r.ThroughSkip != 9 {
+		t.Fatalf("a record cut at the session cut's millisecond = %+v", r)
+	}
+	r.truncateSessionsAt(100, 3)
+	if !r.AtSession || r.ThroughSkip != 3 {
+		t.Fatalf("an earlier session at the same millisecond = %+v", r)
+	}
+}
+
 // After a capped backlog drains, the overlap does not rewind into it: seenSteps
 // holds no more keys than one scan reads, so the drained records' keys may have
 // rolled over and a re-read would count them again.

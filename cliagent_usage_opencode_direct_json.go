@@ -33,8 +33,9 @@ const (
 	openCodeDirectMaxPartBytes = 64 << 10
 	// openCodeDirectMaxPartsPerMessage bounds the part listing of one message.
 	openCodeDirectMaxPartsPerMessage = 1024
-	// openCodeDirectPartBatch is how many part entries one listing call reads.
-	openCodeDirectPartBatch = 64
+	// openCodeDirectListBatch is how many entries one directory listing call
+	// reads, between deadline checks.
+	openCodeDirectListBatch = 64
 )
 
 // openCodeDirectJSONMessage is the narrow view of a stored message.
@@ -94,26 +95,26 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 
 	var files []openCodeDirectJSONFile
 	for _, s := range sessions {
-		if ctx.Err() != nil {
-			read.truncateSessionsAt(s.at, s.before)
-			break
-		}
 		dir := filepath.Join(messageRoot, s.name)
-		names, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, n := range names {
+		listed := len(files)
+		ok := eachOpenCodeDirectEntry(ctx, dir, 0, func(n os.DirEntry) {
 			if n.IsDir() || !strings.HasSuffix(n.Name(), ".json") {
-				continue
+				return
 			}
 			info, err := n.Info()
 			if err != nil {
-				continue
+				return
 			}
 			if at := info.ModTime().UnixMilli(); at >= floorMs {
 				files = append(files, openCodeDirectJSONFile{path: filepath.Join(dir, n.Name()), session: s.name, at: at, size: info.Size()})
 			}
+		})
+		if !ok {
+			// The budget ran out before this session was listed whole: none of
+			// it is read, and the next scan resumes at it.
+			files = files[:listed]
+			read.truncateSessionsAt(s.at, s.before)
+			break
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -201,41 +202,59 @@ func dropOpenCodeDirectRead[T any](list []T, skip openCodeDirectSkip, at func(T)
 }
 
 // readOpenCodeDirectJSONParts reads a message's step-finish parts. A part that
-// is too large to be one is skipped unopened. The directory is listed in
-// batches and the scan's deadline checked before each batch and each part, so
-// a large part directory cannot run the scan past its budget; ok is false when
-// the deadline stopped the read.
+// is too large to be one is skipped unopened. The directory is listed through
+// eachOpenCodeDirectEntry, so a large part directory cannot run the scan past
+// its budget; ok is false when the deadline stopped the read.
 func readOpenCodeDirectJSONParts(ctx context.Context, dir string) (parts []openCodeExportPart, ok bool) {
+	ok = eachOpenCodeDirectEntry(ctx, dir, openCodeDirectMaxPartsPerMessage, func(e os.DirEntry) {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			return
+		}
+		if info, err := e.Info(); err != nil || info.Size() > openCodeDirectMaxPartBytes {
+			return
+		}
+		var part openCodeExportPart
+		if readJSONFileWithin(filepath.Join(dir, e.Name()), openCodeDirectMaxPartBytes, &part) && isOpenCodeStepFinishType(part.Type) {
+			parts = append(parts, part)
+		}
+	})
+	if !ok {
+		return nil, false
+	}
+	return parts, true
+}
+
+// eachOpenCodeDirectEntry lists dir in batches and calls fn for each entry, up
+// to limit entries (0 for no limit). The scan's deadline is checked before each
+// batch and each entry, so a directory of any size cannot run the scan past its
+// budget — os.ReadDir would materialise it whole first. ok is false when the
+// deadline stopped the listing; a directory that cannot be read lists nothing.
+func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func(os.DirEntry)) (ok bool) {
 	d, err := os.Open(dir)
 	if err != nil {
-		return nil, true
+		return true
 	}
 	defer d.Close()
 	listed := 0
-	for listed < openCodeDirectMaxPartsPerMessage {
+	for limit == 0 || listed < limit {
 		if ctx.Err() != nil {
-			return nil, false
+			return false
 		}
-		entries, err := d.ReadDir(min(openCodeDirectPartBatch, openCodeDirectMaxPartsPerMessage-listed))
+		n := openCodeDirectListBatch
+		if limit > 0 {
+			n = min(n, limit-listed)
+		}
+		entries, err := d.ReadDir(n)
 		for _, e := range entries {
 			if ctx.Err() != nil {
-				return nil, false
+				return false
 			}
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-				continue
-			}
-			if info, err := e.Info(); err != nil || info.Size() > openCodeDirectMaxPartBytes {
-				continue
-			}
-			var part openCodeExportPart
-			if readJSONFileWithin(filepath.Join(dir, e.Name()), openCodeDirectMaxPartBytes, &part) && isOpenCodeStepFinishType(part.Type) {
-				parts = append(parts, part)
-			}
+			fn(e)
 		}
 		listed += len(entries)
 		if err != nil || len(entries) == 0 {
 			break
 		}
 	}
-	return parts, true
+	return true
 }

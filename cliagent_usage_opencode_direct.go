@@ -202,12 +202,12 @@ type openCodeDirectRead struct {
 	Truncated   bool
 	ThroughMs   int64
 	ThroughSkip int
-	// AtSession: only the session listing stopped the read, so every session
-	// last written before ThroughMs was read whole.
+	// AtSession: the earliest cut was the session listing's, so every session
+	// last written before ThroughMs was listed whole and ThroughSkip counts
+	// sessions. A later record cut in the same read does not change how the
+	// next scan resumes; the records it left in listed sessions are an
+	// under-count, never a double count.
 	AtSession bool
-	recordCut bool
-	// skipRecords: ThroughSkip counts records, not sessions.
-	skipRecords bool
 	// Skipped counts oversized or unparseable records passed over for good.
 	Skipped int
 }
@@ -220,7 +220,6 @@ type openCodeDirectReader func(ctx context.Context, root string, floorMs int64, 
 // truncateAt marks the read stopped before a record last written at ms, after
 // reading read records at that time.
 func (r *openCodeDirectRead) truncateAt(ms int64, read int) {
-	r.recordCut = true
 	r.truncate(ms, read, true)
 }
 
@@ -230,17 +229,17 @@ func (r *openCodeDirectRead) truncateSessionsAt(ms int64, read int) {
 	r.truncate(ms, read, false)
 }
 
+// truncate keeps the earliest cut, and the next scan resumes the way that cut
+// stopped: by session (AtSession) or by record, with ThroughSkip counting
+// entries of that kind. At one millisecond a session cut wins over a record
+// cut, since the sessions it left unlisted are read whole from the scan's floor.
 func (r *openCodeDirectRead) truncate(ms int64, read int, records bool) {
-	if !r.Truncated || ms < r.ThroughMs || (ms == r.ThroughMs && read < r.ThroughSkip) {
-		r.ThroughMs, r.ThroughSkip, r.skipRecords = ms, read, records
+	sameKind := r.AtSession == !records
+	if !r.Truncated || ms < r.ThroughMs ||
+		(ms == r.ThroughMs && (sameKind && read < r.ThroughSkip || !sameKind && !records)) {
+		r.ThroughMs, r.ThroughSkip, r.AtSession = ms, read, !records
 	}
 	r.Truncated = true
-	r.AtSession = !r.recordCut
-	if r.skipRecords != r.recordCut {
-		// The earliest cut was a session one, but the next scan resumes by
-		// record: its count does not apply.
-		r.ThroughSkip = 0
-	}
 }
 
 var (

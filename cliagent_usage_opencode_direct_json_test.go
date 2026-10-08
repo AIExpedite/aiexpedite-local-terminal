@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,6 +82,48 @@ func TestOpenCodeDirectJSON_TheDeadlineStopsAPartRead(t *testing.T) {
 	cancel()
 	if parts, ok := readOpenCodeDirectJSONParts(ctx, dir); ok || parts != nil {
 		t.Fatalf("a cancelled part read = %+v, %v", parts, ok)
+	}
+}
+
+// openCodeDirectCountdownCtx expires after a fixed number of deadline checks.
+type openCodeDirectCountdownCtx struct {
+	context.Context
+	left int
+}
+
+func (c *openCodeDirectCountdownCtx) Err() error {
+	if c.left <= 0 {
+		return context.DeadlineExceeded
+	}
+	c.left--
+	return nil
+}
+
+// A session's message directory is listed in batches under the scan's
+// deadline: a large directory is listed whole within budget, and a deadline
+// that lands mid-listing reads none of that session and cuts before it.
+func TestOpenCodeDirectJSON_TheDeadlineStopsAMessageListing(t *testing.T) {
+	root := t.TempDir()
+	store := &openCodeTestStore{t: t, root: root}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	const n = 3*openCodeDirectListBatch + 5
+	for i := 0; i < n; i++ {
+		at := base + int64(i)*1000
+		store.write(openCodeTestMessage{session: "ses_a", id: fmt.Sprintf("msg_%03d", i), createdMs: at, completedMs: at + 500})
+	}
+	read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+	if err != nil || len(read.Messages) != n || read.Truncated {
+		t.Fatalf("read = %d messages, truncated %v, %v", len(read.Messages), read.Truncated, err)
+	}
+	info, err := os.Stat(filepath.Join(root, "storage", "message", "ses_a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirAt := info.ModTime().UnixMilli()
+	ctx := &openCodeDirectCountdownCtx{Context: context.Background(), left: openCodeDirectListBatch + 3}
+	read, err = readOpenCodeDirectJSON(ctx, root, base, openCodeDirectTestLimits())
+	if err != nil || len(read.Messages) != 0 || !read.Truncated || !read.AtSession || read.ThroughMs != dirAt {
+		t.Fatalf("a listing the deadline stopped = %+v, %v", read, err)
 	}
 }
 
