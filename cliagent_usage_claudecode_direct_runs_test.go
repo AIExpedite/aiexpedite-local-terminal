@@ -381,6 +381,34 @@ func TestClaudeDirectRun_APinnedDebtSurvivesTheReconcileThatRePointsTheHooks(t *
 	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
 }
 
+// Dual channel, re-pointed then restarted: the agent exits after the reconcile
+// rewrote settings.json but before its adoption tick, so the next process
+// neither sees the other channel's cache in settings.json nor inherits the
+// in-memory memo. The re-point itself moved the debt onto the own cache, so
+// the next process still pays it.
+func TestClaudeDirectRun_APinnedDebtSurvivesARestartAfterTheRePoint(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinRunEndHookOnly(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, currentClaudeAccountFingerprint(), end, 0, time.Time{})
+
+	home, _ := os.UserHomeDir()
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("reconcile changed=%v err=%v, want the hooks re-pointed", changed, err)
+	}
+	if got := claudeCacheSnapshot(t, cache).RefreshOwedAtMs; got != end.UnixMilli() {
+		t.Fatalf("own debt=%d, want the re-point to have moved the debt at %d onto the own cache", got, end.UnixMilli())
+	}
+	// The restart: the memo and the adoption latch are gone.
+	resetClaudeDisplacedPinnedCaches()
+	resetClaudeObservedDebtAdoption()
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
+}
+
 // Dual channel, owner first: the channel that owns the pinned cache has
 // already started paying the hook's debt there (a charged request with its
 // claim lease, or a booked rung). This channel must not copy it into its own
@@ -578,5 +606,22 @@ func TestClaudeDirectRun_AnAgentOwnedDebtIsNotAdoptedAgain(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(calls); got != 0 {
 		t.Fatalf("requests=%d, want none from the tick", got)
+	}
+}
+
+// The installed hooks carry the cache path in their shell's spelling (the Git
+// Bash form on Windows writes forward slashes). Once they are pinned to the own
+// cache, that spelling must not list it as another channel's: the transfer
+// would then "move" the own debt onto itself and clear it unpaid.
+func TestClaudePinnedCacheCandidates_SkipTheOwnCacheInAnySpelling(t *testing.T) {
+	armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	own := claudeRateLimitCachePath()
+	rememberClaudeHookPinnedCaches("")
+	claudeDisplacedPinnedCaches.mu.Lock()
+	claudeDisplacedPinnedCaches.paths = append(claudeDisplacedPinnedCaches.paths, filepath.ToSlash(own), own+string(filepath.Separator)+".")
+	claudeDisplacedPinnedCaches.mu.Unlock()
+	home, _ := os.UserHomeDir()
+	if got := claudePinnedCacheCandidates(home); len(got) != 0 {
+		t.Fatalf("candidates=%q, want the own cache (%q) excluded in every spelling", got, own)
 	}
 }

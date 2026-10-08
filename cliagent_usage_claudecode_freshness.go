@@ -63,7 +63,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -419,30 +422,15 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 	if !claudeUsageProbe.armedForProbe() {
 		return false
 	}
-	floor := claudeUsageProbe.owedObservation().UnixMilli()
-	claudeObservedDebtAdoption.mu.Lock()
-	if claudeObservedDebtAdoption.lastMs > floor {
-		floor = claudeObservedDebtAdoption.lastMs
-	}
-	claudeObservedDebtAdoption.mu.Unlock()
-
+	floor := claudeObservedDebtFloor()
 	own, haveOwn := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	adopt := int64(0)
 	if haveOwn && own.RefreshOwedAtMs > floor &&
 		!claudeRefreshDebtRetired(time.UnixMilli(own.RefreshOwedAtMs), own.RefreshOwedAttempts, now) {
 		adopt = own.RefreshOwedAtMs
 	}
-	leaseMs := int64(0)
-	if pinned, pinnedFp, pinnedMs := claudePinnedObservedDebt(own, haveOwn, now); pinnedMs > floor && pinnedMs >= own.RefreshOwedAtMs &&
-		mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &leaseMs)) {
-		_, onDisk := claudeOweRunRefresh(time.UnixMilli(pinnedMs))
-		if onDisk {
-			adopt = pinnedMs
-		}
-		// Refused, the own cache never took the debt, and releasing the lease
-		// hands it straight back to the channel that owns the pinned cache. A
-		// finish that loses its lock race only leaves the lease to lapse.
-		mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, finishClaudePinnedObservedDebt(pinnedMs, leaseMs, onDisk))
+	if pinnedMs := transferClaudePinnedObservedDebt(own, haveOwn, floor, now); pinnedMs != 0 {
+		adopt = pinnedMs
 	}
 	if adopt == 0 {
 		return false
@@ -465,6 +453,40 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 	claudeObservedDebtAdoption.mu.Unlock()
 	fmt.Printf("%s[claude-usage] observed run refresh adopted%s\n", colorCyan, colorReset)
 	return true
+}
+
+// claudeObservedDebtFloor is the newest debt instant this process already owes
+// or has adopted; only a debt after it is adopted.
+func claudeObservedDebtFloor() int64 {
+	floor := claudeUsageProbe.owedObservation().UnixMilli()
+	claudeObservedDebtAdoption.mu.Lock()
+	defer claudeObservedDebtAdoption.mu.Unlock()
+	if claudeObservedDebtAdoption.lastMs > floor {
+		floor = claudeObservedDebtAdoption.lastMs
+	}
+	return floor
+}
+
+// transferClaudePinnedObservedDebt moves the newest payable debt on a pinned
+// cache (claudePinnedObservedDebt) after `floor` onto the own cache, through
+// the claim / owe / finish steps adoptObservedClaudeRunDebt describes. It
+// returns the instant the own cache now holds, or zero when nothing moved.
+func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, floor int64, now time.Time) int64 {
+	pinned, pinnedFp, pinnedMs := claudePinnedObservedDebt(own, haveOwn, now)
+	leaseMs := int64(0)
+	if pinnedMs <= floor || pinnedMs < own.RefreshOwedAtMs ||
+		!mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &leaseMs)) {
+		return 0
+	}
+	_, onDisk := claudeOweRunRefresh(time.UnixMilli(pinnedMs))
+	// Refused, the own cache never took the debt, and releasing the lease
+	// hands it straight back to the channel that owns the pinned cache. A
+	// finish that loses its lock race only leaves the lease to lapse.
+	mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, finishClaudePinnedObservedDebt(pinnedMs, leaseMs, onDisk))
+	if !onDisk {
+		return 0
+	}
+	return pinnedMs
 }
 
 // claudePinnedObservedDebt is the newest payable debt instant on a cache the
@@ -500,22 +522,35 @@ var claudeDisplacedPinnedCaches struct {
 const claudeDisplacedPinnedCachesMax = 4
 
 // rememberClaudeHookPinnedCaches records the caches the installed status-line
-// and run-end hooks pin, other than the own one. Call it BEFORE rewriting
-// settings.json: the rewrite pins both hooks to the own cache and erases the
-// only record of where an earlier run's debt went.
+// and run-end hooks pin, other than the own one, then moves a debt already
+// waiting there onto the own cache. Call it BEFORE rewriting settings.json: the
+// rewrite pins both hooks to the own cache and erases the only record of where
+// an earlier run's debt went.
+//
+// The memo lives only as long as this process, so the transfer is what makes
+// the re-point durable: an agent that exits between the rewrite and its next
+// adoption tick leaves the debt on its own cache, where the next process's
+// startup replay or adoption pays it. The memo still covers a hook that was
+// already running on the old settings and writes after the transfer.
 func rememberClaudeHookPinnedCaches(home string) {
 	own := claudeRateLimitCachePath()
 	pinned := []string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)}
 	claudeDisplacedPinnedCaches.mu.Lock()
-	defer claudeDisplacedPinnedCaches.mu.Unlock()
 	for _, p := range pinned {
-		if p == "" || p == own || slices.Contains(claudeDisplacedPinnedCaches.paths, p) {
+		if p == "" || sameClaudeCachePath(p, own) || slices.ContainsFunc(claudeDisplacedPinnedCaches.paths, func(q string) bool { return sameClaudeCachePath(p, q) }) {
 			continue
 		}
 		claudeDisplacedPinnedCaches.paths = append(claudeDisplacedPinnedCaches.paths, p)
 		if n := len(claudeDisplacedPinnedCaches.paths); n > claudeDisplacedPinnedCachesMax {
 			claudeDisplacedPinnedCaches.paths = claudeDisplacedPinnedCaches.paths[n-claudeDisplacedPinnedCachesMax:]
 		}
+	}
+	claudeDisplacedPinnedCaches.mu.Unlock()
+	// Under the armed gate only: with the probe off nothing would pay the debt,
+	// and the owe refuses anyway.
+	if claudeUsageProbe.armedForProbe() {
+		ownSnap, haveOwn := loadClaudeRateLimitSnapshot(own)
+		transferClaudePinnedObservedDebt(ownSnap, haveOwn, claudeObservedDebtFloor(), time.Now())
 	}
 }
 
@@ -538,11 +573,24 @@ func claudePinnedCacheCandidates(home string) []string {
 	claudeDisplacedPinnedCaches.mu.Unlock()
 	out := make([]string, 0, len(all))
 	for _, p := range all {
-		if p != "" && p != own && !slices.Contains(out, p) {
+		if p != "" && !sameClaudeCachePath(p, own) && !slices.ContainsFunc(out, func(q string) bool { return sameClaudeCachePath(p, q) }) {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// sameClaudeCachePath reports whether two spellings name the same cache file.
+// The installed hooks carry the path in the shell form they run under — the
+// Git Bash form on Windows writes C:/Users/... — while the own path is native,
+// so a plain string compare would list the own cache as another channel's,
+// and the transfer would then clear the own debt as if it had moved.
+func sameClaudeCachePath(a, b string) bool {
+	a, b = filepath.Clean(filepath.FromSlash(a)), filepath.Clean(filepath.FromSlash(b))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }
 
 // claimClaudePinnedObservedDebt puts a claim lease on the pinned cache's debt
