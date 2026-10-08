@@ -32,9 +32,11 @@ func armClaudeDirectRunTest(t *testing.T, handler http.HandlerFunc) (string, *in
 	cache, calls := armClaudeRunEndHookTest(t, handler)
 	SetClaudeUsageProbeDisabled(false)
 	resetClaudeObservedDebtAdoption()
+	resetClaudeDisplacedPinnedCaches()
 	t.Cleanup(func() {
 		stopClaudeRunDebtRetry()
 		resetClaudeObservedDebtAdoption()
+		resetClaudeDisplacedPinnedCaches()
 	})
 	return cache, calls
 }
@@ -299,6 +301,84 @@ func pinOtherChannelCache(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return pinned
+}
+
+// pinRunEndHookOnly installs ONLY our SessionEnd hook, pinned to another
+// channel's cache — a partial settings.json rewrite dropped the status line —
+// and returns that cache's path.
+func pinRunEndHookOnly(t *testing.T) string {
+	t.Helper()
+	pinned := filepath.Join(t.TempDir(), "other-channel", "rl.json")
+	helperWriteJSON(t, filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json"), map[string]any{
+		"hooks": map[string]any{
+			claudeRunEndHookEvent: []any{map[string]any{"hooks": []any{map[string]any{
+				"type": "command",
+				"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinned) +
+					" '/opt/other/aiexpedite-terminal' " + claudeRunEndHookArg,
+			}}}},
+		},
+	})
+	if err := os.MkdirAll(filepath.Dir(pinned), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return pinned
+}
+
+// requirePinnedDebtTransferredAndPaid adopts, then asserts one request paid
+// the debt on the own cache and the pinned copy is gone.
+func requirePinnedDebtTransferredAndPaid(t *testing.T, cache, pinned string, calls *int64, end time.Time) {
+	t.Helper()
+	if !adoptObservedClaudeRunDebt(end) {
+		t.Fatal("the pinned cache's debt was not adopted")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d, want one", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("own snap=%+v, want the adopted debt paid", snap)
+	}
+	requireNumericClaudeWindow(t, snap, claudeWindowFiveHour, end)
+	if pinnedSnap := claudeCacheSnapshot(t, pinned); pinnedSnap.RefreshOwedAtMs != 0 {
+		t.Fatalf("pinned snap=%+v, want the debt transferred off it", pinnedSnap)
+	}
+}
+
+// Dual channel, status line gone: the run-end hook alone still pins the other
+// channel's cache, so the debt it wrote there is found from the hook itself.
+func TestClaudeDirectRun_AdoptsADebtTheRunEndHookAlonePins(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinRunEndHookOnly(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, currentClaudeAccountFingerprint(), end, 0, time.Time{})
+
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
+}
+
+// Dual channel, repaired first: the tick's reconcile re-points both hooks at
+// this channel's cache BEFORE adoption runs. The debt the old run-end hook
+// wrote to the other channel's cache must still be adopted, though
+// settings.json no longer names that cache.
+func TestClaudeDirectRun_APinnedDebtSurvivesTheReconcileThatRePointsTheHooks(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinRunEndHookOnly(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, currentClaudeAccountFingerprint(), end, 0, time.Time{})
+
+	home, _ := os.UserHomeDir()
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("reconcile changed=%v err=%v, want the hooks re-pointed", changed, err)
+	}
+	if got := installedClaudeRunEndCachePath(home); got == pinned {
+		t.Fatal("the reconcile left the run-end hook on the other channel's cache")
+	}
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
 }
 
 // Dual channel, owner first: the channel that owns the pinned cache has

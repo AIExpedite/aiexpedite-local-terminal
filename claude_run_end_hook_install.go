@@ -245,3 +245,39 @@ func applyClaudeRunEndHook(home string, wanted bool) (bool, error) {
 	}
 	return removeClaudeRunEndHook(home)
 }
+
+// installedClaudeRunEndCachePath returns the cache path our INSTALLED SessionEnd
+// hook pins, or "" when settings.json holds no run-end hook of ours. It is read
+// from the hook itself, not inferred from the status line: a partial
+// settings.json rewrite can drop `statusLine` and leave this hook pinned to
+// another channel's cache, which is then where its debts land.
+func installedClaudeRunEndCachePath(home string) string {
+	settingsPath := claudeSettingsPathIfPresent(home)
+	if settingsPath == "" {
+		return ""
+	}
+	settings, exists, err := readClaudeSettings(settingsPath)
+	if err != nil || !exists {
+		return ""
+	}
+	_, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return ""
+	}
+	for _, g := range groups {
+		var group struct {
+			Hooks []json.RawMessage `json:"hooks"`
+		}
+		if json.Unmarshal(g, &group) != nil {
+			continue
+		}
+		for _, e := range group.Hooks {
+			if h, mine := ourRunEndHookEntry(e); mine {
+				if pinned := extractInstalledPinnedPath(h.Command, "RL_CACHE"); pinned != "" {
+					return pinned
+				}
+			}
+		}
+	}
+	return ""
+}

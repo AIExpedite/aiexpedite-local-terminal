@@ -63,6 +63,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"time"
 )
@@ -384,7 +385,7 @@ func resetClaudeObservedDebtAdoption() {
 //
 // Two caches can hold the debt. The own one is where a hook pinned to this
 // channel writes. On a dual-channel machine the hook may be pinned to the OTHER
-// channel's cache (installedClaudeRateLimitCachePath); a newer debt there is
+// channel's cache (claudePinnedCacheCandidates); a newer debt there is
 // first owed onto the own cache — the monotonic owe, under this process's armed
 // gate — because the attempt only ever reads and charges the own cache.
 //
@@ -466,24 +467,82 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 	return true
 }
 
-// claudePinnedObservedDebt is the payable debt instant on the cache the
-// installed hooks pin, with that cache's path and account scope, when it is not
-// the own cache and belongs to the same account scope as the own one (any scope
+// claudePinnedObservedDebt is the newest payable debt instant on a cache the
+// hooks pin (claudePinnedCacheCandidates), with that cache's path and account
+// scope, when it belongs to the same account scope as the own one (any scope
 // when there is no own cache yet). The instant is zero otherwise.
 func claudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) (path, fingerprint string, owedMs int64) {
 	home, _ := os.UserHomeDir()
-	pinned := installedClaudeRateLimitCachePath(home)
-	if pinned == "" || pinned == claudeRateLimitCachePath() {
-		return "", "", 0
+	for _, pinned := range claudePinnedCacheCandidates(home) {
+		snap, ok := loadClaudeRateLimitSnapshot(pinned)
+		if !ok || snap.RefreshOwedAtMs <= owedMs || (haveOwn && snap.AccountFingerprint != own.AccountFingerprint) {
+			continue
+		}
+		if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
+			continue
+		}
+		path, fingerprint, owedMs = pinned, snap.AccountFingerprint, snap.RefreshOwedAtMs
 	}
-	snap, ok := loadClaudeRateLimitSnapshot(pinned)
-	if !ok || snap.RefreshOwedAtMs == 0 || (haveOwn && snap.AccountFingerprint != own.AccountFingerprint) {
-		return "", "", 0
+	return path, fingerprint, owedMs
+}
+
+// claudeDisplacedPinnedCaches remembers the other-channel caches our hooks were
+// pinned to just before this process re-pointed them
+// (rememberClaudeHookPinnedCaches). A run that ended before the re-point wrote
+// its debt there, and once settings.json names only the own cache nothing else
+// leads back to it. Bounded: a machine has a handful of channels at most, and a
+// debt left there retires after claudeRefreshOwedMaxAge anyway.
+var claudeDisplacedPinnedCaches struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+const claudeDisplacedPinnedCachesMax = 4
+
+// rememberClaudeHookPinnedCaches records the caches the installed status-line
+// and run-end hooks pin, other than the own one. Call it BEFORE rewriting
+// settings.json: the rewrite pins both hooks to the own cache and erases the
+// only record of where an earlier run's debt went.
+func rememberClaudeHookPinnedCaches(home string) {
+	own := claudeRateLimitCachePath()
+	pinned := []string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)}
+	claudeDisplacedPinnedCaches.mu.Lock()
+	defer claudeDisplacedPinnedCaches.mu.Unlock()
+	for _, p := range pinned {
+		if p == "" || p == own || slices.Contains(claudeDisplacedPinnedCaches.paths, p) {
+			continue
+		}
+		claudeDisplacedPinnedCaches.paths = append(claudeDisplacedPinnedCaches.paths, p)
+		if n := len(claudeDisplacedPinnedCaches.paths); n > claudeDisplacedPinnedCachesMax {
+			claudeDisplacedPinnedCaches.paths = claudeDisplacedPinnedCaches.paths[n-claudeDisplacedPinnedCachesMax:]
+		}
 	}
-	if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
-		return "", "", 0
+}
+
+// resetClaudeDisplacedPinnedCaches clears the memo (tests).
+func resetClaudeDisplacedPinnedCaches() {
+	claudeDisplacedPinnedCaches.mu.Lock()
+	claudeDisplacedPinnedCaches.paths = nil
+	claudeDisplacedPinnedCaches.mu.Unlock()
+}
+
+// claudePinnedCacheCandidates lists every cache other than the own one that a
+// hook may have written a debt to: the one the installed status line pins, the
+// one the installed run-end hook pins (the two diverge after a partial
+// settings.json rewrite), and those a re-point displaced.
+func claudePinnedCacheCandidates(home string) []string {
+	own := claudeRateLimitCachePath()
+	claudeDisplacedPinnedCaches.mu.Lock()
+	all := append([]string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)},
+		claudeDisplacedPinnedCaches.paths...)
+	claudeDisplacedPinnedCaches.mu.Unlock()
+	out := make([]string, 0, len(all))
+	for _, p := range all {
+		if p != "" && p != own && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
 	}
-	return pinned, snap.AccountFingerprint, snap.RefreshOwedAtMs
+	return out
 }
 
 // claimClaudePinnedObservedDebt puts a claim lease on the pinned cache's debt

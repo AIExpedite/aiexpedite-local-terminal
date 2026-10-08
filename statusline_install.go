@@ -840,6 +840,10 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 		return false, nil
 	}
 
+	// The rewrite below pins both hooks to the own cache; remember where they
+	// pointed first, so a debt a run left on another channel's cache is still
+	// adopted (adoptObservedClaudeRunDebt).
+	rememberClaudeHookPinnedCaches(home)
 	changed, err := ensureClaudeStatusLineHook(home)
 	if err == nil {
 		// The run-end hook lives in the same file and is lost to the same Claude

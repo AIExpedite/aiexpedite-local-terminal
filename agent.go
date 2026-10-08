@@ -204,6 +204,9 @@ func StartAgent(cfg *Config) {
 	// (cliagent_usage_opencode_freshness.go). After isOffline is published
 	// above, so the attempts honour offline mode.
 	payOwedOpenCodeUsage()
+	// Before the hooks are re-pointed at this channel's cache: a debt a run
+	// left on the cache they pinned until now stays adoptable.
+	rememberClaudeHookPinnedCaches(hookHome)
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",
