@@ -339,27 +339,26 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string,
 	if want != nil && fingerprint != *want {
 		return fingerprint, false
 	}
-	// An empty required scope is the accountless login only when the credential
-	// actually read: a failed read also yields "", and with no own cache (or an
-	// unscoped one) the mutation's unscoping guard has nothing to refuse, so the
-	// transfer would clear the pinned source and leave a debt the recovered
-	// fingerprint never pays.
-	if want != nil && *want == "" && !resolved {
+	// An empty fingerprint is the accountless login only when the credential
+	// actually READ: a failed read (a macOS Keychain timeout, a config dir not
+	// yet readable) yields the same "". The mutation's unscoping guard refuses
+	// that downgrade only when a SCOPED cache is there to protect, so with no
+	// own cache — or an already unscoped one — the debt would land under "",
+	// where claudeRunDebtAttemptScopedAt (whose `snap.AccountFingerprint !=
+	// fingerprint` check is the adoption latch) can never pay it once the
+	// fingerprinted credential reads again, and the next account-scoped write
+	// drops it as an unscoped -> scoped transition. Refused here, for a required
+	// scope and an ordinary owe alike: a debt nothing can adopt is worse than no
+	// debt, which the next gather's staleness TTL still covers. The pinned
+	// transfer refuses for the same reason, and additionally must not clear its
+	// source for a debt the own cache never took.
+	if fingerprint == "" && !resolved {
 		return fingerprint, false
 	}
-	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
-	// dir not yet readable) resolves to exactly the same "" a genuine accountless
-	// claude.ai login does, and mutateClaudeRateLimitSnapshot cannot tell the two
-	// apart: it would read the downgrade as an account boundary, drop the scoped
-	// buckets, and write this debt under "" — where the next start, resolving the
-	// recovered fingerprint, ignores it. So the completed turn would cost a wiped
-	// cache AND an unpayable marker.
-	//
-	// mutateClaudeRateLimitSnapshot refuses that downgrade under the cache lock,
-	// so the durable write is simply skipped. The in-memory debt still stands for
-	// this process, so this degrades to the behaviour this file replaces — never
-	// to something worse, which is the rule every other best-effort path here
-	// follows.
+	// The guard above drops the durable write when the identity is unresolved.
+	// The in-memory debt still stands for this process, so that degrades to the
+	// behaviour this file replaces — never to something worse, which is the rule
+	// every other best-effort path here follows.
 	//
 	// A genuine logout also resolves to "", and there the live writers (stream
 	// capture, status-line hook, probe) reset the scope on their next reading,

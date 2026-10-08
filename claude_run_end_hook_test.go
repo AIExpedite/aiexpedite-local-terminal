@@ -171,6 +171,48 @@ func TestClaudeRunEndHook_EmptyFingerprintNeverWipesAScopedCache(t *testing.T) {
 	}
 }
 
+// A credential read that FAILS with no cache to protect — or an already
+// unscoped one — must still refuse: the mutation's unscoping guard has nothing
+// to refuse there, so the debt would land under "", where the attempt's
+// fingerprint check can never pay it once the real account reads again and the
+// next account-scoped write drops it as a transition.
+func TestClaudeRunEndHook_EmptyFingerprintNeverOwesWithoutAScopedCache(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, cache string, now time.Time)
+	}{
+		{"no cache at all", func(*testing.T, string, time.Time) {}},
+		{"an already unscoped cache", func(t *testing.T, cache string, now time.Time) {
+			mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true},
+			}, now.Add(-time.Hour), "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, calls := armClaudeRunEndHookTest(t, claudeProbeOKHandler)
+			now := time.Now()
+			tc.seed(t, cache, now)
+			before, _ := os.ReadFile(cache)
+			if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || resolved {
+				t.Fatalf("fixture fingerprint=%q resolved=%v, want an unreadable credential", fp, resolved)
+			}
+
+			if claudeRunEndHookAt(now) {
+				t.Fatal("the hook owed a debt under an unresolved identity")
+			}
+			if after, _ := os.ReadFile(cache); string(after) != string(before) {
+				t.Fatalf("the refused owe wrote the cache: %s", string(after))
+			}
+			if *calls != 0 {
+				t.Fatalf("the hook made %d requests, want none", *calls)
+			}
+		})
+	}
+}
+
 // A credential that READS and names no account is the accountless claude.ai
 // login signed in now, not a failed read: after a switch onto it, the hook's
 // owe moves the cache off the previous account and records the run, instead of
