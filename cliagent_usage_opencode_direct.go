@@ -108,6 +108,63 @@ type openCodeDirectLimits struct {
 	// at the first unread session, without the slack, or it would re-list the
 	// same capped sessions forever.
 	ExactSessions bool
+	// Skip is a continuation's tie-breaker: the entries the capped scan read at
+	// its cut time — sessions when ExactSessions, records otherwise.
+	Skip openCodeDirectSkip
+}
+
+// skipFor is the tie-breaker for the session listing (sessions) or the records.
+func (l openCodeDirectLimits) skipFor(sessions bool) openCodeDirectSkip {
+	if sessions != l.ExactSessions {
+		return openCodeDirectSkip{}
+	}
+	return l.Skip
+}
+
+// openCodeDirectSkip drops the first N entries last written at AtMs, in the
+// adapter's (time, id) order: a capped scan read them already. Without it, more
+// entries sharing one millisecond than the cap would refill the cap on every
+// resume and the rest would never be read. An entry rewritten since moves
+// later, so a count can then drop one unread entry — an under-count, never a
+// double count.
+type openCodeDirectSkip struct {
+	AtMs  int64
+	N     int
+	taken int
+}
+
+// take reports whether the entry last written at ms is one to drop.
+func (s *openCodeDirectSkip) take(ms int64) bool {
+	if ms != s.AtMs || s.taken >= s.N {
+		return false
+	}
+	s.taken++
+	return true
+}
+
+// openCodeDirectTies counts the entries already seen at one last-write time,
+// in read order, for the tie-breaker a cut saves.
+type openCodeDirectTies struct {
+	at int64
+	n  int
+}
+
+// see records an entry last written at ms and returns how many came before it
+// at that time.
+func (t *openCodeDirectTies) see(ms int64) int {
+	if ms != t.at || t.n == 0 {
+		t.at, t.n = ms, 0
+	}
+	t.n++
+	return t.n - 1
+}
+
+// through is how many entries were seen at ms.
+func (t openCodeDirectTies) through(ms int64) int {
+	if ms != t.at {
+		return 0
+	}
+	return t.n
 }
 
 // sessionsSinceMs is the oldest session last write a read from floorMs lists,
@@ -137,13 +194,16 @@ type openCodeDirectMessage struct {
 type openCodeDirectRead struct {
 	Messages []openCodeDirectMessage
 	// Truncated: a cap or the time budget stopped the read; every record last
-	// written before ThroughMs was read.
-	Truncated bool
-	ThroughMs int64
+	// written before ThroughMs was read, and the first ThroughSkip at it.
+	Truncated   bool
+	ThroughMs   int64
+	ThroughSkip int
 	// AtSession: only the session listing stopped the read, so every session
 	// last written before ThroughMs was read whole.
 	AtSession bool
 	recordCut bool
+	// skipRecords: ThroughSkip counts records, not sessions.
+	skipRecords bool
 	// Skipped counts oversized or unparseable records passed over for good.
 	Skipped int
 }
@@ -153,23 +213,30 @@ type openCodeDirectRead struct {
 // is a store that could not be read this time.
 type openCodeDirectReader func(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error)
 
-// truncateAt marks the read stopped before a record last written at ms.
-func (r *openCodeDirectRead) truncateAt(ms int64) {
+// truncateAt marks the read stopped before a record last written at ms, after
+// reading read records at that time.
+func (r *openCodeDirectRead) truncateAt(ms int64, read int) {
 	r.recordCut = true
-	r.truncate(ms)
+	r.truncate(ms, read, true)
 }
 
-// truncateSessionsAt marks the read stopped before a session last written at ms.
-func (r *openCodeDirectRead) truncateSessionsAt(ms int64) {
-	r.truncate(ms)
+// truncateSessionsAt marks the read stopped before a session last written at
+// ms, after listing read sessions at that time.
+func (r *openCodeDirectRead) truncateSessionsAt(ms int64, read int) {
+	r.truncate(ms, read, false)
 }
 
-func (r *openCodeDirectRead) truncate(ms int64) {
-	if !r.Truncated || ms < r.ThroughMs {
-		r.ThroughMs = ms
+func (r *openCodeDirectRead) truncate(ms int64, read int, records bool) {
+	if !r.Truncated || ms < r.ThroughMs || (ms == r.ThroughMs && read < r.ThroughSkip) {
+		r.ThroughMs, r.ThroughSkip, r.skipRecords = ms, read, records
 	}
 	r.Truncated = true
 	r.AtSession = !r.recordCut
+	if r.skipRecords != r.recordCut {
+		// The earliest cut was a session one, but the next scan resumes by
+		// record: its count does not apply.
+		r.ThroughSkip = 0
+	}
 }
 
 var (
@@ -314,13 +381,17 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 	floorMs := openCodeDirectScanFloor(saved, now)
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	result, err := read(ctx, root, floorMs, openCodeDirectLimits{
+	limits := openCodeDirectLimits{
 		MaxSessions:    openCodeDirectMaxSessions,
 		MaxRecords:     openCodeDirectMaxRecords,
 		MaxRecordBytes: openCodeDirectMaxRecordBytes,
 		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
-		ExactSessions:  saved.DirectCursor != nil && saved.DirectCursor.Continue && saved.DirectCursor.AtSession,
-	})
+	}
+	if c := saved.DirectCursor; c != nil && c.Continue {
+		limits.ExactSessions = c.AtSession
+		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
+	}
+	result, err := read(ctx, root, floorMs, limits)
 	switch {
 	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
 		return "direct_layout_unknown", false
@@ -345,8 +416,11 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 			return false, false
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
-		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated,
-			AtSession: result.AtSession && throughMs == result.ThroughMs}
+		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
+		if result.Truncated && throughMs == result.ThroughMs {
+			cursor.AtSession, cursor.Skip = result.AtSession, result.ThroughSkip
+		}
+		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
 	})
@@ -400,7 +474,7 @@ func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, h
 			continue
 		}
 		sessionKey := openCodeUsageSessionKey(m.SessionID)
-		if openCodeOwnedByRun(ledger, sessionKey, m.CreatedMs) {
+		if m.CreatedMs <= ledger.OwnedEvictedMs || openCodeOwnedByRun(ledger, sessionKey, m.CreatedMs) {
 			continue
 		}
 		step := m.Usage

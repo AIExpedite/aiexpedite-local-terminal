@@ -66,6 +66,24 @@ func TestOpenCodeDirectJSON_FiltersByLastWrite(t *testing.T) {
 	}
 }
 
+// The scan's deadline reaches into a message's parts: a read the budget stops
+// there is truncated before that message, never counted from a partial sum.
+func TestOpenCodeDirectJSON_TheDeadlineStopsAPartRead(t *testing.T) {
+	root := t.TempDir()
+	store := &openCodeTestStore{t: t, root: root}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: base, completedMs: base + 10_000, steps: [][3]int64{{3, 0, 0}, {4, 0, 0}}})
+	dir := filepath.Join(root, "storage", "part", "msg_a")
+	if parts, ok := readOpenCodeDirectJSONParts(context.Background(), dir); !ok || len(parts) != 2 {
+		t.Fatalf("parts = %+v, %v", parts, ok)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if parts, ok := readOpenCodeDirectJSONParts(ctx, dir); ok || parts != nil {
+		t.Fatalf("a cancelled part read = %+v, %v", parts, ok)
+	}
+}
+
 // Records, but none in a shape the adapter knows: unknown, never a 0.
 func TestOpenCodeDirectJSON_AnUnknownShapeIsUnknown(t *testing.T) {
 	root := t.TempDir()

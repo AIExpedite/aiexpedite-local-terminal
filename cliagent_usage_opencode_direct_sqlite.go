@@ -109,13 +109,16 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 	// Sessions written since the session floor (less the slack: a session row can
 	// be touched just before its last message), oldest first. A session past the
 	// cap stops the cursor at its own last write.
+	// A continuation's tie-breaker drops the sessions it listed already.
+	skip := limits.skipFor(true)
 	rows, err := db.QueryContext(ctx,
 		`SELECT id, time_updated FROM session WHERE time_updated >= ? ORDER BY time_updated, id LIMIT ?`,
-		limits.sessionsSinceMs(floorMs), limits.MaxSessions+1)
+		limits.sessionsSinceMs(floorMs), limits.MaxSessions+1+skip.N)
 	if err != nil {
 		return read, err
 	}
 	var sessions []any
+	var ties openCodeDirectTies
 	for rows.Next() {
 		var id string
 		var at int64
@@ -123,8 +126,12 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 			rows.Close()
 			return read, err
 		}
+		before := ties.see(at)
+		if skip.take(at) {
+			continue
+		}
 		if len(sessions) == limits.MaxSessions {
-			read.truncateSessionsAt(at)
+			read.truncateSessionsAt(at, before)
 			break
 		}
 		sessions = append(sessions, id)
@@ -141,7 +148,8 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 	query := fmt.Sprintf(openCodeSQLiteMessageQuery, strings.TrimSuffix(strings.Repeat("?,", len(sessions)), ","))
 	args := []any{maxBytes, maxBytes, maxBytes, openCodeDirectMaxPartBytes}
 	args = append(args, sessions...)
-	args = append(args, floorMs, maxBytes, limits.MaxRecords+1)
+	skip = limits.skipFor(false)
+	args = append(args, floorMs, maxBytes, limits.MaxRecords+1+skip.N)
 	rows, err = db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return read, err
@@ -149,6 +157,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 	defer rows.Close()
 	lastMs := floorMs
 	n := 0
+	ties = openCodeDirectTies{}
 	for rows.Next() {
 		var (
 			id, sessionID        string
@@ -159,8 +168,13 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 		if err := rows.Scan(&id, &sessionID, &createdMs, &writtenMs, &oversized, &infoText, &stepsText); err != nil {
 			return read, err
 		}
+		before := ties.see(writtenMs)
+		if skip.take(writtenMs) {
+			lastMs = writtenMs
+			continue
+		}
 		if n == limits.MaxRecords || ctx.Err() != nil {
-			read.truncateAt(writtenMs)
+			read.truncateAt(writtenMs, before)
 			return read, nil
 		}
 		n++
@@ -185,7 +199,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 		if ctx.Err() != nil {
 			// The budget interrupted the query: everything up to the last row
 			// was read whole.
-			read.truncateAt(lastMs)
+			read.truncateAt(lastMs, ties.through(lastMs))
 			return read, nil
 		}
 		return read, err

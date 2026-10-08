@@ -92,7 +92,11 @@ type openCodeUsageLedger struct {
 	// The fields below are additive under schemaVersion 1: an older build that
 	// rewrites the ledger drops them and keeps the buckets
 	// (openCodeDirectScanFloor reads that downgrade signature).
-	OwnedRuns      []openCodeOwnedRun      `json:"ownedRuns,omitempty"`
+	OwnedRuns []openCodeOwnedRun `json:"ownedRuns,omitempty"`
+	// OwnedEvictedMs is the newest end of a closed window evicted before the
+	// reader's cursor passed it (pruneOpenCodeOwnedRuns): the reader skips every
+	// message created by then, since it can no longer tell which were managed.
+	OwnedEvictedMs int64                   `json:"ownedEvictedMs,omitempty"`
 	DirectCursor   *openCodeDirectCursor   `json:"directCursor,omitempty"`
 	DirectCoverage *openCodeDirectCoverage `json:"directCoverage,omitempty"`
 }
@@ -122,12 +126,15 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // re-reading the overlap could spend the whole cap on records already counted.
 // AtSession marks one the session cap alone stopped: the next scan lists
 // sessions from ThroughMs without the slack, or the same capped sessions would
-// fill the cap again.
+// fill the cap again. Skip is the continuation's tie-breaker: how many
+// sessions (AtSession) or records last written at ThroughMs the capped scan
+// read, so entries sharing that millisecond cannot refill the cap forever.
 type openCodeDirectCursor struct {
 	Layout    string `json:"layout"`
 	ThroughMs int64  `json:"throughMs"`
 	Continue  bool   `json:"continue,omitempty"`
 	AtSession bool   `json:"atSession,omitempty"`
+	Skip      int    `json:"skip,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the

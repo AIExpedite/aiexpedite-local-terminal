@@ -385,6 +385,44 @@ func TestOpenCodeDirect_OpenWindowsSurviveMidnight(t *testing.T) {
 	}
 }
 
+// Evicting a closed window the cursor has not passed would let the reader count
+// that managed turn's stored message as direct use. The eviction raises a floor
+// instead, and the turn is never counted; a window the cursor passed goes
+// without one.
+func TestOpenCodeDirect_AnEvictedUnpassedWindowStillGuardsItsMessages(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2034)
+	managed := openCodeTestMessage{session: "ses_m", id: "msg_m", createdMs: clock.ms(-30 * time.Minute), completedMs: clock.ms(-29 * time.Minute), steps: [][3]int64{{500, 0, 0}}}
+	store.write(managed)
+	direct := openCodeTestMessage{session: "ses_d", id: "msg_d", createdMs: clock.ms(-time.Minute), completedMs: clock.ms(-50 * time.Second), steps: [][3]int64{{7, 0, 0}}}
+	store.write(direct)
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.OwnedRuns = append(ledger.OwnedRuns, openCodeOwnedRun{RunID: "managed", SessionKey: openCodeUsageSessionKey("ses_m"), FromMs: clock.ms(-31 * time.Minute), ToMs: clock.ms(-28 * time.Minute)})
+		for i := 0; i < openCodeUsageMaxOwnedRuns; i++ {
+			ledger.OwnedRuns = append(ledger.OwnedRuns, openCodeOwnedRun{RunID: fmt.Sprint(i), SessionKey: openCodeUsageSessionKey(fmt.Sprint("ses_", i)), FromMs: clock.ms(-20 * time.Minute), ToMs: clock.ms(-10 * time.Minute)})
+		}
+		pruneOpenCodeOwnedRuns(ledger, clock.ms(0))
+		return true, false
+	})
+	ledger := loadOpenCodeUsageLedger()
+	if openCodeOwnedRunByID(&ledger, "managed") != nil || ledger.OwnedEvictedMs != clock.ms(-28*time.Minute) {
+		t.Fatalf("eviction = %+v, floor %d", ledger.OwnedRuns, ledger.OwnedEvictedMs)
+	}
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 7 {
+		t.Fatalf("bucket = %+v, want the direct message only", b)
+	}
+
+	// Once the cursor has passed a window, evicting it raises no floor.
+	passed := openCodeUsageLedger{DirectCursor: &openCodeDirectCursor{ThroughMs: clock.ms(0)}}
+	for i := 0; i <= openCodeUsageMaxOwnedRuns; i++ {
+		passed.OwnedRuns = append(passed.OwnedRuns, openCodeOwnedRun{RunID: fmt.Sprint(i), FromMs: clock.ms(-time.Hour), ToMs: clock.ms(-30*time.Minute + time.Duration(i)*time.Second)})
+	}
+	pruneOpenCodeOwnedRuns(&passed, clock.ms(0))
+	if len(passed.OwnedRuns) != openCodeUsageMaxOwnedRuns || passed.OwnedEvictedMs != 0 {
+		t.Fatalf("passed eviction = %d windows, floor %d", len(passed.OwnedRuns), passed.OwnedEvictedMs)
+	}
+}
+
 // A missing cursor with today's bucket present — an older build rewrote the
 // ledger — starts at that bucket's observation, never re-counting from midnight.
 func TestOpenCodeDirect_ADowngradedLedgerDoesNotReCount(t *testing.T) {
@@ -509,6 +547,42 @@ func TestOpenCodeDirect_ASessionCappedBacklogInsideTheSlackDrains(t *testing.T) 
 	}
 	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 5 {
 		t.Fatalf("bucket = %+v, want every session drained under the same cap", b)
+	}
+}
+
+// More records, or more sessions, than the cap sharing one millisecond still
+// drain: the continuation saves how many it read at its cut time, so a resume
+// does not select the same capped prefix again.
+func TestOpenCodeDirect_ACappedBacklogInOneMillisecondDrains(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2047)
+	at := clock.ms(-time.Minute)
+	for i := 0; i < 5; i++ {
+		store.write(openCodeTestMessage{session: "ses_a", id: fmt.Sprintf("msg_%d", i), createdMs: at - 1000, completedMs: at - 500, writtenMs: at, steps: [][3]int64{{1, 0, 0}}})
+	}
+	openCodeDirectMaxRecords = 2
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 5 {
+		t.Fatalf("records: bucket = %+v, want every record drained under the same cap", b)
+	}
+
+	openCodeDirectMaxRecords = 8192
+	clock.now = clock.now.Add(time.Hour)
+	at = clock.ms(-time.Minute)
+	for i := 0; i < 5; i++ {
+		session := fmt.Sprintf("ses_t%d", i)
+		store.write(openCodeTestMessage{session: session, id: "msg_" + session, createdMs: at - 1000, completedMs: at - 500, writtenMs: at, steps: [][3]int64{{10, 0, 0}}})
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", session), time.UnixMilli(at), time.UnixMilli(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxSessions = 2
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 55 {
+		t.Fatalf("sessions: bucket = %+v, want every session drained under the same cap", b)
 	}
 }
 

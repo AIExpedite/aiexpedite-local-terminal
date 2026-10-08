@@ -287,9 +287,14 @@ func closeOpenCodeOwnedRunByID(ledger *openCodeUsageLedger, runID string, nowMs 
 // pruneOpenCodeOwnedRuns drops closed windows that ended before local midnight —
 // the reader never scans before it — then the oldest closed windows past the
 // cap. An open window is never dropped: its run may still commit, and the reader
-// would count its session again.
+// would count its session again. A closed window the cursor has not yet passed
+// still guards messages the reader will read, so evicting one raises
+// OwnedEvictedMs past it: the reader then skips every message created by then —
+// an under-count over a double count.
 func pruneOpenCodeOwnedRuns(ledger *openCodeUsageLedger, nowMs int64) {
-	midnight := openCodeLocalMidnight(time.UnixMilli(nowMs)).UnixMilli()
+	now := time.UnixMilli(nowMs)
+	midnight := openCodeLocalMidnight(now).UnixMilli()
+	passedMs := openCodeDirectScanFloor(*ledger, now) - openCodeDirectSessionSlack.Milliseconds()
 	kept := ledger.OwnedRuns[:0]
 	for _, w := range ledger.OwnedRuns {
 		if !w.open() && w.ToMs < midnight {
@@ -307,6 +312,9 @@ func pruneOpenCodeOwnedRuns(ledger *openCodeUsageLedger, nowMs int64) {
 		}
 		if oldest < 0 {
 			return
+		}
+		if w := ledger.OwnedRuns[oldest]; w.ToMs >= passedMs {
+			ledger.OwnedEvictedMs = max(ledger.OwnedEvictedMs, w.ToMs)
 		}
 		ledger.OwnedRuns = append(ledger.OwnedRuns[:oldest], ledger.OwnedRuns[oldest+1:]...)
 	}

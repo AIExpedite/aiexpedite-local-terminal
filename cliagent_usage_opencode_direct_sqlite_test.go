@@ -213,6 +213,41 @@ func TestOpenCodeDirectSQLite_CapsTruncate(t *testing.T) {
 	}
 }
 
+// A continuation's tie-breaker drops the rows the capped read took at its cut
+// time, so rows sharing one millisecond past the cap are reached.
+func TestOpenCodeDirectSQLite_TheTieBreakerResumesInsideOneMillisecond(t *testing.T) {
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	for i := 0; i < 5; i++ {
+		insertOpenCodeSQLiteMessage(t, db, "ses_a", fmt.Sprintf("msg_%d", i), base, base+1, base+1, [][3]int64{{1, 0, 0}}, 0)
+	}
+	limits := openCodeDirectTestLimits()
+	limits.MaxRecords = 2
+	seen := map[string]bool{}
+	floor := base
+	for i := 0; i < 3; i++ {
+		read, err := readOpenCodeDirectSQLite(context.Background(), root, floor, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range read.Messages {
+			if seen[m.ID] {
+				t.Fatalf("pass %d re-read %s", i, m.ID)
+			}
+			seen[m.ID] = true
+		}
+		if !read.Truncated {
+			break
+		}
+		floor = read.ThroughMs
+		limits.Skip = openCodeDirectSkip{AtMs: read.ThroughMs, N: read.ThroughSkip}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("read %d of 5 rows sharing one millisecond", len(seen))
+	}
+}
+
 // The reader end to end over SQLite: the layout is detected and today's spend
 // lands in the ledger.
 func TestOpenCodeDirectSQLite_ScanCommitsToTheLedger(t *testing.T) {
