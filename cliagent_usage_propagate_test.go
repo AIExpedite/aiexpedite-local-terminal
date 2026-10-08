@@ -106,6 +106,33 @@ func waitHints(t *testing.T, rec *cliUsageHintRecorder, n int, quiet time.Durati
 	return rec.all()
 }
 
+// waitHintFor waits until a hint naming `want` was recorded, and returns it.
+//
+// Identify a generation's hint by its CONTENTS, never by its position in the
+// recording. Every generation gets exactly one follow-up send
+// (cliUsagePendingHint.followUp), so the next hint to arrive after a reading's
+// first one is that reading's follow-up at least as often as it is the next
+// generation's — whichever of the two clears the device-wide spacing first.
+// Asserting on "one more hint than before" therefore reads the PREVIOUS
+// generation back whenever the follow-up wins that race, which is how
+// test/windows-latest failed on an unrelated change.
+func waitHintFor(t *testing.T, rec *cliUsageHintRecorder, want cliUsageGeneration) recordedCLIUsageHint {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		recorded := rec.all()
+		for _, r := range recorded {
+			if r.hint.GenerationEpoch == want.Epoch && r.hint.Generation == want.Counter {
+				return r
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no hint named generation {%d,%d}: %+v", want.Epoch, want.Counter, recorded)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func gen(epoch, counter int64) cliUsageGeneration {
 	return cliUsageGeneration{Epoch: epoch, Counter: counter}
 }
@@ -445,19 +472,18 @@ func TestCLIUsageHint_AnAuthoritativeClearIsHinted(t *testing.T) {
 	rec, cfg := propagatorFixture(t)
 	codexLiveReadAt(t, f, 31, 41, now) // rotates the epoch and hints the reading
 	startCLIUsagePropagator(cfg)
-	before := len(waitHints(t, rec, 1, 0))
+	waitHints(t, rec, 1, 0) // the reading's own hint
 
 	if !captureCodexRateLimitLineForAccount(`{"jsonrpc":"2.0","id":2,"result":{"rateLimits":{}}}`, now.Add(time.Second), f.fp) {
 		t.Fatal("the authoritative clear did not land")
 	}
-	hints := waitHints(t, rec, before+1, 0)
-	cleared, snap := hints[len(hints)-1].hint, f.snapshot(t)
+	// The clear is committed, so the snapshot already carries the generation its
+	// hint has to name.
+	snap := f.snapshot(t)
 	if len(codexContributorsFromSnapshot(snap)) != 0 {
 		t.Fatalf("the clear left contributors behind: %+v", snap.Contributors)
 	}
-	if cleared.GenerationEpoch != snap.GenerationEpoch || cleared.Generation != snap.Generation {
-		t.Fatalf("hint = %+v, want the cleared generation {%d,%d}", cleared, snap.GenerationEpoch, snap.Generation)
-	}
+	waitHintFor(t, rec, gen(snap.GenerationEpoch, snap.Generation))
 }
 
 // A clear committed by the previous process whose hint died in the debounce (an
