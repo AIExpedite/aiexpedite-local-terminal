@@ -144,15 +144,20 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // of the last drained backlog: a later scan's overlap does not reach before
 // it, because a backlog larger than a scan's cap can roll seenSteps over, and
 // the keys of the records it read are then no longer there to absorb a re-read.
+// PinnedKeys are the keys of the messages a scan read at or after ThroughMs —
+// ones counted past a cursor an incomplete message or a hold pinned behind
+// them: the next scan reads them again, and seenSteps may have rolled their
+// keys over by then, so the cursor keeps them itself until it passes them.
 type openCodeDirectCursor struct {
-	Layout         string `json:"layout"`
-	ThroughMs      int64  `json:"throughMs"`
-	Continue       bool   `json:"continue,omitempty"`
-	AtSession      bool   `json:"atSession,omitempty"`
-	Skip           int    `json:"skip,omitempty"`
-	RecordFloorMs  int64  `json:"recordFloorMs,omitempty"`
-	SessionSinceMs int64  `json:"sessionSinceMs,omitempty"`
-	RewindFloorMs  int64  `json:"rewindFloorMs,omitempty"`
+	Layout         string   `json:"layout"`
+	ThroughMs      int64    `json:"throughMs"`
+	Continue       bool     `json:"continue,omitempty"`
+	AtSession      bool     `json:"atSession,omitempty"`
+	Skip           int      `json:"skip,omitempty"`
+	RecordFloorMs  int64    `json:"recordFloorMs,omitempty"`
+	SessionSinceMs int64    `json:"sessionSinceMs,omitempty"`
+	RewindFloorMs  int64    `json:"rewindFloorMs,omitempty"`
+	PinnedKeys     []string `json:"pinnedKeys,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the
@@ -506,6 +511,11 @@ func mergeOpenCodeUsageSteps(ledger *openCodeUsageLedger, fingerprint string, st
 	seen := make(map[string]bool, len(ledger.SeenSteps))
 	for _, k := range ledger.SeenSteps {
 		seen[k] = true
+	}
+	if c := ledger.DirectCursor; c != nil {
+		for _, k := range c.PinnedKeys {
+			seen[k] = true
+		}
 	}
 	changed := false
 	for _, step := range steps {

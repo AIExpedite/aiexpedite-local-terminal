@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -439,7 +440,7 @@ func TestOpenCodeUsageRun_AFullyCommittedCapRecyclesItsSlots(t *testing.T) {
 func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T) {
 	openCodeUsageFixture(t, 1301)
 	owned := []openCodeOwnedRun{{RunID: "run1", SessionKey: openCodeUsageSessionKey("ses_x"), FromMs: 10, ToMs: 20}, {RunID: "run2", SessionKey: "k", FromMs: 30}}
-	cursor := &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: 40}
+	cursor := &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: 40, PinnedKeys: []string{"k1", "k2"}}
 	coverage := &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, ObservedAtMs: 50, LastOkLocalDate: "2026-10-08"}
 	if committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		ledger.OwnedRuns, ledger.DirectCursor, ledger.DirectCoverage = owned, cursor, coverage
@@ -456,7 +457,7 @@ func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T)
 		t.Fatalf("schemaVersion = %s, want 1", onDisk["schemaVersion"])
 	}
 	got := loadOpenCodeUsageLedger()
-	if len(got.OwnedRuns) != 2 || got.OwnedRuns[0] != owned[0] || got.OwnedRuns[1] != owned[1] || *got.DirectCursor != *cursor || *got.DirectCoverage != *coverage {
+	if len(got.OwnedRuns) != 2 || got.OwnedRuns[0] != owned[0] || got.OwnedRuns[1] != owned[1] || !reflect.DeepEqual(got.DirectCursor, cursor) || *got.DirectCoverage != *coverage {
 		t.Fatalf("round trip = %+v", got)
 	}
 

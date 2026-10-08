@@ -1097,3 +1097,48 @@ func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinu
 	}
 }
 
+
+// A message counted past a cursor an incomplete message pinned behind it keeps
+// its key in the cursor: a managed capture that rolls seenSteps over raises the
+// rewind floor only to the pinned cursor, so the next scan reads the message
+// again and must not count it twice.
+func TestOpenCodeDirect_KeysPastAPinnedCursorSurviveASeenStepsRollover(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2052)
+	running := openCodeTestMessage{session: "ses_a", id: "msg_run", createdMs: clock.ms(-30 * time.Minute), writtenMs: clock.ms(-30 * time.Minute), steps: [][3]int64{{60, 0, 0}}}
+	store.write(running)
+	store.write(openCodeTestMessage{session: "ses_b", id: "msg_after", createdMs: clock.ms(-10 * time.Minute), completedMs: clock.ms(-9 * time.Minute), steps: [][3]int64{{10, 0, 0}}})
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 10 {
+		t.Fatalf("bucket = %+v, want 10 tokens", b)
+	}
+	cursor := loadOpenCodeUsageLedger().DirectCursor
+	if cursor == nil || cursor.ThroughMs > running.createdMs || len(cursor.PinnedKeys) != 1 {
+		t.Fatalf("cursor = %+v, want it pinned at the running message with msg_after's key", cursor)
+	}
+
+	managedSteps := make([]openCodeUsageStep, openCodeUsageMaxSeenSteps+10)
+	for i := range managedSteps {
+		managedSteps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("ses_managed", fmt.Sprint(i)), AtMs: clock.ms(0), Input: 1}
+	}
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		return true, mergeOpenCodeUsageSteps(ledger, "managed_fp", managedSteps)
+	})
+
+	clock.now = clock.now.Add(time.Minute)
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 10 {
+		t.Fatalf("bucket = %+v, want 10 tokens (msg_after not counted twice)", b)
+	}
+
+	running.completedMs = clock.ms(-time.Second)
+	running.writtenMs = 0
+	store.write(running)
+	clock.now = clock.now.Add(time.Minute)
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 70 {
+		t.Fatalf("bucket = %+v, want 70 tokens once the running message completes", b)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || len(c.PinnedKeys) != 0 {
+		t.Fatalf("cursor = %+v, want no pinned keys once the cursor passes them", c)
+	}
+}

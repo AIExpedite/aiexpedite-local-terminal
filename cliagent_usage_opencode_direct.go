@@ -438,10 +438,10 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	today, _ := openCodeLocalDay(now)
 	held, pending, unchanged := false, false, false
 	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-		steps, throughMs, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), now)
+		steps, throughMs, pinned, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), now)
 		held, pending = h, p
 		changed := mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
-		if !changed && !ledger.seenEvicted && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs) {
+		if !changed && !ledger.seenEvicted && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs, pinned) {
 			// Nothing new, coverage already today and the cursor within the
 			// overlap: the next scan re-reads the same few records, so the
 			// whole-ledger rewrite is skipped. A capped scan always saves its
@@ -464,6 +464,7 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 			cursor.SessionSinceMs = limits.sessionsSinceMs(floorMs)
 		}
 		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, ledger.seenEvicted, result.Truncated, throughMs)
+		cursor.PinnedKeys = openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated, pinned)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -483,11 +484,51 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 
 // openCodeDirectWriteCanWait reports that a scan which found nothing new need
 // not rewrite the ledger: today's coverage is already recorded and the saved
-// cursor trails throughMs by less than the overlap every scan re-reads anyway.
-func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today string, throughMs int64) bool {
+// cursor trails throughMs by less than the overlap every scan re-reads anyway,
+// and already keeps every key this scan pinned.
+func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today string, throughMs int64, pinned []string) bool {
 	c, cov := ledger.DirectCursor, ledger.DirectCoverage
-	return c != nil && cov != nil && !c.Continue && c.Layout == layout && cov.Layout == layout && cov.LastOkLocalDate == today &&
-		throughMs >= c.ThroughMs && throughMs-c.ThroughMs < openCodeDirectOverlap.Milliseconds()
+	if c == nil || cov == nil || c.Continue || c.Layout != layout || cov.Layout != layout || cov.LastOkLocalDate != today ||
+		throughMs < c.ThroughMs || throughMs-c.ThroughMs >= openCodeDirectOverlap.Milliseconds() {
+		return false
+	}
+	kept := make(map[string]bool, len(c.PinnedKeys))
+	for _, k := range c.PinnedKeys {
+		kept[k] = true
+	}
+	for _, k := range pinned {
+		if !kept[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// openCodeDirectPinnedKeys is the new cursor's PinnedKeys: the keys this scan
+// read at or after its cursor. A capped scan may not have reached every message
+// the previous scan pinned, so it keeps those too until a full scan reads them
+// again; past the seenSteps cap the newest are kept.
+func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned []string) []string {
+	var keys []string
+	if truncated && prev != nil {
+		keys = append(keys, prev.PinnedKeys...)
+	}
+	keys = append(keys, pinned...)
+	seen := make(map[string]bool, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	if n := len(out); n > openCodeUsageMaxSeenSteps {
+		out = out[n-openCodeUsageMaxSeenSteps:]
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // openCodeDirectRewindFloor is the new cursor's RewindFloorMs. A scan that
@@ -512,14 +553,16 @@ func openCodeDirectRewindFloor(prev *openCodeDirectCursor, evicted, truncated bo
 }
 
 // openCodeDirectSteps turns a read into ledger steps against ledger's ownership
-// windows, and the cursor the scan may save. holdMs (0 for none) is the floor of
-// the oldest managed run with no window yet.
-func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, holdMs int64, now time.Time) (steps []openCodeUsageStep, throughMs int64, held, pending bool) {
+// windows, the cursor the scan may save, and the keys of the steps read at or
+// after that cursor (PinnedKeys). holdMs (0 for none) is the floor of the
+// oldest managed run with no window yet.
+func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, holdMs int64, now time.Time) (steps []openCodeUsageStep, throughMs int64, pinned []string, held, pending bool) {
 	throughMs = now.UnixMilli()
 	if read.Truncated {
 		throughMs = read.ThroughMs
 	}
 	staleMs := now.Add(-openCodeUsageDebtMaxAge).UnixMilli()
+	var written []int64
 	for _, m := range read.Messages {
 		if m.CompletedMs == 0 {
 			// Still running: counted once complete, and the cursor waits for it
@@ -546,11 +589,17 @@ func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, h
 		step.AtMs = m.CompletedMs
 		step.Key = openCodeUsageStepKey(m.SessionID, "message:"+m.ID)
 		steps = append(steps, step)
+		written = append(written, m.WrittenMs)
 	}
 	if holdMs > 0 {
 		throughMs = min(throughMs, holdMs)
 	}
-	return steps, throughMs, held, pending
+	for i, step := range steps {
+		if written[i] >= throughMs {
+			pinned = append(pinned, step.Key)
+		}
+	}
+	return steps, throughMs, pinned, held, pending
 }
 
 // openCodeOwnedByRun reports whether a managed run's window covers the message.
