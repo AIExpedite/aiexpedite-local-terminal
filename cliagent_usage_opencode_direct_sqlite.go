@@ -61,7 +61,9 @@ func openCodeSQLiteReadOnlyDSN(path string) string {
 // info is a narrow JSON object the row's data is reduced to; steps is the array
 // of its step-finish parts' figures. tokens is read with -> (always JSON text,
 // even for a string), so a malformed value reaches Go as an invalid message
-// rather than failing json() and the whole query.
+// rather than failing json() and the whole query. A message's step parts are
+// capped before they are aggregated, as the JSON adapter caps its part listing,
+// so one long agentic turn cannot build an unbounded steps value.
 const openCodeSQLiteMessageQuery = `
 SELECT m.id, m.session_id, m.time_created, m.time_updated,
        length(m.data) > ? AS oversized,
@@ -74,10 +76,13 @@ SELECT m.id, m.session_id, m.time_created, m.time_updated,
            'type', 'step-finish',
            'tokens', json(p.data -> '$.tokens'),
            'cost', json_extract(p.data, '$.cost')))
-         FROM part p
-         WHERE p.message_id = m.id
-           AND length(p.data) <= ?
-           AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.type') END = 'step-finish'
+         FROM (
+           SELECT p.data FROM part p
+           WHERE p.message_id = m.id
+             AND length(p.data) <= ?
+             AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.type') END = 'step-finish'
+           LIMIT ?
+         ) p
        ) END AS steps
 FROM message m
 WHERE m.session_id IN (%s)
@@ -146,7 +151,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 
 	maxBytes := limits.MaxRecordBytes
 	query := fmt.Sprintf(openCodeSQLiteMessageQuery, strings.TrimSuffix(strings.Repeat("?,", len(sessions)), ","))
-	args := []any{maxBytes, maxBytes, maxBytes, openCodeDirectMaxPartBytes}
+	args := []any{maxBytes, maxBytes, maxBytes, openCodeDirectMaxPartBytes, openCodeDirectMaxPartsPerMessage}
 	args = append(args, sessions...)
 	skip = limits.skipFor(false)
 	args = append(args, floorMs, maxBytes, limits.MaxRecords+1+skip.N)

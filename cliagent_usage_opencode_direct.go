@@ -105,8 +105,9 @@ type openCodeDirectLimits struct {
 	// written since then (openCodeDirectSessionFloor); 0 lists from the floor.
 	SessionFloorMs int64
 	// ExactSessions resumes a scan the session cap stopped: the listing starts
-	// at the first unread session, without the slack, or it would re-list the
-	// same capped sessions forever.
+	// at the first unread session (SessionFloorMs), without the slack, or it
+	// would re-list the same capped sessions forever; their records are still
+	// read from the capped scan's own floor.
 	ExactSessions bool
 	// Skip is a continuation's tie-breaker: the entries the capped scan read at
 	// its cut time — sessions when ExactSessions, records otherwise.
@@ -170,11 +171,14 @@ func (t openCodeDirectTies) through(ms int64) int {
 // sessionsSinceMs is the oldest session last write a read from floorMs lists,
 // less the slack: a session's last write can precede its last message's.
 func (l openCodeDirectLimits) sessionsSinceMs(floorMs int64) int64 {
+	if l.ExactSessions {
+		if l.SessionFloorMs > 0 {
+			return l.SessionFloorMs
+		}
+		return floorMs
+	}
 	if l.SessionFloorMs > 0 {
 		floorMs = min(floorMs, l.SessionFloorMs)
-	}
-	if l.ExactSessions {
-		return floorMs
 	}
 	return floorMs - openCodeDirectSessionSlack.Milliseconds()
 }
@@ -390,6 +394,9 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 	if c := saved.DirectCursor; c != nil && c.Continue {
 		limits.ExactSessions = c.AtSession
 		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
+		if c.AtSession {
+			limits.SessionFloorMs = c.ThroughMs
+		}
 	}
 	result, err := read(ctx, root, floorMs, limits)
 	switch {
@@ -419,7 +426,11 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
 		if result.Truncated && throughMs == result.ThroughMs {
 			cursor.AtSession, cursor.Skip = result.AtSession, result.ThroughSkip
+			if result.AtSession {
+				cursor.RecordFloorMs = floorMs
+			}
 		}
+		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, result.Truncated, throughMs)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -444,6 +455,23 @@ func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today strin
 	c, cov := ledger.DirectCursor, ledger.DirectCoverage
 	return c != nil && cov != nil && !c.Continue && c.Layout == layout && cov.Layout == layout && cov.LastOkLocalDate == today &&
 		throughMs >= c.ThroughMs && throughMs-c.ThroughMs < openCodeDirectOverlap.Milliseconds()
+}
+
+// openCodeDirectRewindFloor is the new cursor's RewindFloorMs. A scan that
+// finishes a continuation has drained a backlog larger than one scan's cap —
+// the number of keys seenSteps holds — so the keys of the records it read may
+// have rolled over: the overlap must not re-read them, and the floor is this
+// scan's end. Otherwise the previous floor stays while the overlap can reach it.
+func openCodeDirectRewindFloor(prev *openCodeDirectCursor, truncated bool, throughMs int64) int64 {
+	switch {
+	case prev == nil:
+		return 0
+	case prev.Continue && !truncated:
+		return throughMs
+	case prev.RewindFloorMs > throughMs-openCodeDirectOverlap.Milliseconds():
+		return prev.RewindFloorMs
+	}
+	return 0
 }
 
 // openCodeDirectSteps turns a read into ledger steps against ledger's ownership
@@ -499,12 +527,17 @@ func openCodeOwnedByRun(ledger *openCodeUsageLedger, sessionKey string, createdM
 }
 
 // resumeMs is where the scan after c reads from, before the midnight clamp: the
-// cursor less the overlap, or the cursor itself after a capped scan.
+// cursor less the overlap, but not before the end of a drained backlog; the
+// cursor itself after a capped scan; or, after one the session cap stopped, the
+// floor that scan read records from.
 func (c openCodeDirectCursor) resumeMs() int64 {
 	if c.Continue {
+		if c.AtSession && c.RecordFloorMs > 0 {
+			return c.RecordFloorMs
+		}
 		return c.ThroughMs
 	}
-	return c.ThroughMs - openCodeDirectOverlap.Milliseconds()
+	return max(c.ThroughMs-openCodeDirectOverlap.Milliseconds(), min(c.RewindFloorMs, c.ThroughMs))
 }
 
 // openCodeDirectScanFloor is where a scan starts: the cursor's resume point,

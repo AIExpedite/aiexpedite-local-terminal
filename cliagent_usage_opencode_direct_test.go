@@ -496,6 +496,7 @@ func TestOpenCodeDirect_CapsTruncateIntoAnUnderCountThatResumes(t *testing.T) {
 
 	// The session cap.
 	store.write(openCodeTestMessage{session: "ses_b", id: "msg_b", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{10, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_c", id: "msg_c", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{10, 0, 0}}})
 	openCodeDirectMaxSessions = 1
 	clock.now = clock.now.Add(time.Second)
 	if label := scanOpenCodeDirect(t); label != "direct_truncated" {
@@ -547,6 +548,76 @@ func TestOpenCodeDirect_ASessionCappedBacklogInsideTheSlackDrains(t *testing.T) 
 	}
 	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 5 {
 		t.Fatalf("bucket = %+v, want every session drained under the same cap", b)
+	}
+}
+
+// A session-capped continuation reads the sessions it has not listed yet from
+// the capped scan's record floor, not from their own last write: messages
+// written before something touched every session directory are still counted.
+func TestOpenCodeDirect_ASessionContinuationKeepsTheRecordFloor(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2048)
+	touched := clock.ms(-time.Minute)
+	for i := 0; i < 3; i++ {
+		session, at := fmt.Sprintf("ses_%d", i), clock.ms(time.Duration(i-30)*time.Minute)
+		store.write(openCodeTestMessage{session: session, id: "msg_" + session, createdMs: at - 1000, completedMs: at, steps: [][3]int64{{1, 0, 0}}})
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", session), time.UnixMilli(touched), time.UnixMilli(touched)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxSessions = 1
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || !c.Continue || !c.AtSession || c.ThroughMs != touched || c.RecordFloorMs >= clock.ms(-30*time.Minute) {
+		t.Fatalf("session-capped cursor = %+v, want the record floor kept apart from the session cut", c)
+	}
+	for i := 0; i < 2; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 3 {
+		t.Fatalf("bucket = %+v, want every session's earlier message counted", b)
+	}
+}
+
+// After a capped backlog drains, the overlap does not rewind into it: seenSteps
+// holds no more keys than one scan reads, so the drained records' keys may have
+// rolled over and a re-read would count them again.
+func TestOpenCodeDirect_ADrainedBacklogIsNotRewoundInto(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2049)
+	for i := 0; i < 3; i++ {
+		store.write(openCodeTestMessage{session: "ses_a", id: fmt.Sprintf("msg_%d", i), createdMs: clock.ms(time.Duration(i-5) * time.Minute), completedMs: clock.ms(time.Duration(i-5)*time.Minute + time.Second), steps: [][3]int64{{1, 0, 0}}})
+	}
+	var floors []int64
+	prev := openCodeDirectReaders[openCodeStoreLayoutJSON]
+	openCodeDirectReaders[openCodeStoreLayoutJSON] = func(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error) {
+		floors = append(floors, floorMs)
+		return prev(ctx, root, floorMs, limits)
+	}
+	t.Cleanup(func() { openCodeDirectReaders[openCodeStoreLayoutJSON] = prev })
+
+	openCodeDirectMaxRecords = 2
+	scanOpenCodeDirect(t)
+	scanOpenCodeDirect(t)
+	drained := loadOpenCodeUsageLedger().DirectCursor
+	if drained == nil || drained.Continue || drained.RewindFloorMs != clock.ms(0) {
+		t.Fatalf("cursor after the backlog drained = %+v, want a rewind floor at its end", drained)
+	}
+
+	clock.now = clock.now.Add(time.Minute)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_new", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{10, 0, 0}}})
+	scanOpenCodeDirect(t)
+	if got := floors[len(floors)-1]; got != drained.ThroughMs {
+		t.Fatalf("scan after the drain read from %d, want the drain's end %d", got, drained.ThroughMs)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 13 {
+		t.Fatalf("bucket = %+v, want each message once", b)
+	}
+
+	// Once the overlap no longer reaches it, the floor is dropped.
+	clock.now = clock.now.Add(2 * openCodeDirectOverlap)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_later", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{1, 0, 0}}})
+	scanOpenCodeDirect(t)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.RewindFloorMs != 0 {
+		t.Fatalf("cursor = %+v, want the passed rewind floor dropped", c)
 	}
 }
 

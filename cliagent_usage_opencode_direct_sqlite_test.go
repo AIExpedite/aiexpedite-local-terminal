@@ -41,7 +41,9 @@ func openCodeSQLiteTestStore(t *testing.T, root, schema string) *sql.DB {
 	return db
 }
 
-func insertOpenCodeSQLiteMessage(t *testing.T, db *sql.DB, session, id string, createdMs, completedMs, updatedMs int64, steps [][3]int64, cost float64) {
+func insertOpenCodeSQLiteMessage(t *testing.T, db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, session, id string, createdMs, completedMs, updatedMs int64, steps [][3]int64, cost float64) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT OR IGNORE INTO session VALUES (?, 'p', 's', '/w', 'secret title', '1', ?, ?)`, session, createdMs, updatedMs); err != nil {
 		t.Fatal(err)
@@ -210,6 +212,56 @@ func TestOpenCodeDirectSQLite_CapsTruncate(t *testing.T) {
 	read, err = readOpenCodeDirectSQLite(context.Background(), root, base, limits)
 	if err != nil || read.Skipped != 4 || len(read.Messages) != 0 {
 		t.Fatalf("byte-capped read = %+v, %v", read, err)
+	}
+}
+
+// A message's step parts are capped before SQLite aggregates them, as the JSON
+// adapter caps its part listing: a turn with more parts reads as an under-count.
+func TestOpenCodeDirectSQLite_CapsTheStepPartsOfOneMessage(t *testing.T) {
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	steps := make([][3]int64, openCodeDirectMaxPartsPerMessage+5)
+	for i := range steps {
+		steps[i] = [3]int64{1, 0, 0}
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertOpenCodeSQLiteMessage(t, tx, "ses_a", "msg_long", base, base+10, base+10, steps, 0)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
+	if err != nil || len(read.Messages) != 1 {
+		t.Fatalf("read = %+v, %v", read, err)
+	}
+	if m := read.Messages[0]; !m.Valid || m.Usage.Input != int64(openCodeDirectMaxPartsPerMessage) {
+		t.Fatalf("usage = %+v, want the first %d step parts summed", m.Usage, openCodeDirectMaxPartsPerMessage)
+	}
+}
+
+// A session-capped continuation over SQLite reads the sessions it has not
+// listed yet from the capped scan's record floor: rows OpenCode touched without
+// touching their messages keep those messages countable.
+func TestOpenCodeDirectSQLite_ASessionContinuationKeepsTheRecordFloor(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2102)
+	db := openCodeSQLiteTestStore(t, store.root, openCodeSQLiteTestSchema)
+	for i := 0; i < 3; i++ {
+		at := clock.ms(time.Duration(i-30) * time.Minute)
+		insertOpenCodeSQLiteMessage(t, db, fmt.Sprintf("ses_%d", i), fmt.Sprintf("msg_%d", i), at-1000, at, at, [][3]int64{{1, 0, 0}}, 0)
+	}
+	if _, err := db.Exec(`UPDATE session SET time_updated = ?`, clock.ms(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	openCodeDirectMaxSessions = 1
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 3 {
+		t.Fatalf("bucket = %+v, want every session's earlier message counted", b)
 	}
 }
 

@@ -129,12 +129,20 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // fill the cap again. Skip is the continuation's tie-breaker: how many
 // sessions (AtSession) or records last written at ThroughMs the capped scan
 // read, so entries sharing that millisecond cannot refill the cap forever.
+// RecordFloorMs is an AtSession continuation's record floor: the sessions it
+// has not listed yet are read from the floor the capped scan used, since their
+// messages can predate their session's own last write. RewindFloorMs is the end
+// of the last drained backlog: a later scan's overlap does not reach before
+// it, because a backlog larger than a scan's cap can roll seenSteps over, and
+// the keys of the records it read are then no longer there to absorb a re-read.
 type openCodeDirectCursor struct {
-	Layout    string `json:"layout"`
-	ThroughMs int64  `json:"throughMs"`
-	Continue  bool   `json:"continue,omitempty"`
-	AtSession bool   `json:"atSession,omitempty"`
-	Skip      int    `json:"skip,omitempty"`
+	Layout        string `json:"layout"`
+	ThroughMs     int64  `json:"throughMs"`
+	Continue      bool   `json:"continue,omitempty"`
+	AtSession     bool   `json:"atSession,omitempty"`
+	Skip          int    `json:"skip,omitempty"`
+	RecordFloorMs int64  `json:"recordFloorMs,omitempty"`
+	RewindFloorMs int64  `json:"rewindFloorMs,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the
