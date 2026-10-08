@@ -357,3 +357,142 @@ func TestPowerShellPolicyFindingAllSignedWithProcessHost(t *testing.T) {
 		}
 	}
 }
+
+func TestClassifyPowerShellPolicy_FixableByElevation(t *testing.T) {
+	cases := []struct {
+		name     string
+		host     string
+		machine  bool
+		effect   string
+		scopes   map[string]string
+		elevates bool
+	}{
+		{"Default (no scope defined)", powerShellHostWindows, false, "Restricted", allUndefined(nil), true},
+		{"LocalMachine Restricted", powerShellHostWindows, false, "Restricted", allUndefined(map[string]string{"LocalMachine": "Restricted"}), true},
+		{"CurrentUser-defined Restricted beats LocalMachine", powerShellHostWindows, false, "Restricted", allUndefined(map[string]string{"CurrentUser": "Restricted"}), false},
+		{"MachinePolicy", powerShellHostWindows, false, "Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"}), false},
+		{"UserPolicy", powerShellHostWindows, false, "Restricted", allUndefined(map[string]string{"UserPolicy": "Restricted"}), false},
+		{"Process", powerShellHostWindows, false, "Restricted", allUndefined(map[string]string{"Process": "Restricted"}), false},
+		{"AllSigned is never changed", powerShellHostWindows, false, "AllSigned", allUndefined(map[string]string{"LocalMachine": "AllSigned"}), false},
+		{"already allowed", powerShellHostWindows, false, "RemoteSigned", allUndefined(map[string]string{"LocalMachine": "RemoteSigned"}), false},
+		{"Program Files pwsh", powerShellHost7, true, "Restricted", allUndefined(nil), true},
+		{"Store / per-user pwsh", powerShellHost7, false, "Restricted", allUndefined(nil), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := classifyPowerShellPolicy(powerShellHostPolicy{Host: c.host, Effective: c.effect, Scopes: c.scopes, MachineInstalled: c.machine})
+			if h.FixableByElevation != c.elevates {
+				t.Fatalf("fixableByElevation = %v, want %v (%+v)", h.FixableByElevation, c.elevates, h)
+			}
+			// Windows PowerShell is always installed by Windows itself.
+			if c.host == powerShellHostWindows && !h.MachineInstalled {
+				t.Fatalf("Windows PowerShell must report machineInstalled")
+			}
+		})
+	}
+}
+
+func TestSummarizePowerShellPolicy_HostsToElevate(t *testing.T) {
+	win := psHost("Restricted", allUndefined(nil))
+	storePwsh := classifyPowerShellPolicy(powerShellHostPolicy{Host: powerShellHost7, Effective: "Restricted", Scopes: allUndefined(nil)})
+	s := summarizePowerShellPolicy([]powerShellHostPolicy{win, storePwsh})
+	if !s.FixableByElevation || len(s.HostsToElevate) != 1 || s.HostsToElevate[0] != powerShellHostWindows {
+		t.Fatalf("mixed hosts: only the elevatable blocking host is listed, got %+v", s)
+	}
+
+	locked := psHost("Restricted", allUndefined(map[string]string{"CurrentUser": "Restricted"}))
+	s = summarizePowerShellPolicy([]powerShellHostPolicy{locked})
+	if s.FixableByElevation || len(s.HostsToElevate) != 0 {
+		t.Fatalf("a CurrentUser lock is not fixable by elevation, got %+v", s)
+	}
+
+	allowed := psHost("RemoteSigned", allUndefined(map[string]string{"LocalMachine": "RemoteSigned"}))
+	s = summarizePowerShellPolicy([]powerShellHostPolicy{allowed})
+	if s.FixableByElevation || s.HostsToElevate == nil {
+		t.Fatalf("nothing blocks: no elevation, but hostsToElevate is an empty list (not null), got %+v", s)
+	}
+}
+
+func TestGatherPowerShellPolicyWindows_PwshMachineInstalled(t *testing.T) {
+	prevDirs := powerShellProgramFilesDirs
+	powerShellProgramFilesDirs = func() []string { return []string{`C:\Program Files`, `C:\Program Files (x86)`} }
+	t.Cleanup(func() { powerShellProgramFilesDirs = prevDirs })
+	prevLook := setupProbeLookPath
+	t.Cleanup(func() { setupProbeLookPath = prevLook })
+
+	cases := []struct {
+		name    string
+		path    string
+		machine bool
+	}{
+		{"Program Files", `C:\Program Files\PowerShell\7\pwsh.exe`, true},
+		{"Program Files (x86)", `C:\Program Files (x86)\PowerShell\7\pwsh.exe`, true},
+		{"Store alias", `C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe`, false},
+		{"per-user install", `C:\Users\me\.dotnet\tools\pwsh.exe`, false},
+		{"a look-alike folder", `C:\Program Files Evil\PowerShell\7\pwsh.exe`, false},
+		{"a .. escape out of Program Files", `C:\Program Files\PowerShell\..\..\Users\me\pwsh.exe`, false},
+		{"case and slashes differ", `c:/PROGRAM FILES/powershell/7/pwsh.exe`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isMachineInstalledPwsh(c.path); got != c.machine {
+				t.Fatalf("isMachineInstalledPwsh(%q) = %v, want %v", c.path, got, c.machine)
+			}
+			path := c.path
+			setupProbeLookPath = func(file string) (string, error) {
+				if file == "pwsh" {
+					return path, nil
+				}
+				return "", nil
+			}
+			f := &policyProbeRunner{answers: map[string]string{"powershell": restrictedJSON, "pwsh": restrictedJSON}}
+			p := gatherPowerShellPolicyWindows(context.Background(), f.run)
+			if p == nil || len(p.Hosts) != 2 {
+				t.Fatalf("got %+v", p)
+			}
+			pwsh := p.Hosts[1]
+			if pwsh.MachineInstalled != c.machine || pwsh.FixableByElevation != c.machine {
+				t.Fatalf("pwsh machineInstalled=%v fixableByElevation=%v, want %v", pwsh.MachineInstalled, pwsh.FixableByElevation, c.machine)
+			}
+			if !p.Hosts[0].MachineInstalled || !p.Hosts[0].FixableByElevation {
+				t.Fatalf("Windows PowerShell is always elevatable here, got %+v", p.Hosts[0])
+			}
+			want := []string{powerShellHostWindows}
+			if c.machine {
+				want = append(want, powerShellHost7)
+			}
+			if strings.Join(p.HostsToElevate, ",") != strings.Join(want, ",") {
+				t.Fatalf("hostsToElevate = %v, want %v", p.HostsToElevate, want)
+			}
+		})
+	}
+}
+
+func TestGatherPowerShellPolicyWindows_FailedWindowsProbeWithholdsElevation(t *testing.T) {
+	stubSetupLookPath(t, "pwsh")
+	prevDirs := powerShellProgramFilesDirs
+	powerShellProgramFilesDirs = func() []string { return []string{"/fake"} }
+	t.Cleanup(func() { powerShellProgramFilesDirs = prevDirs })
+	f := &policyProbeRunner{answers: map[string]string{"pwsh": restrictedJSON}}
+	p := gatherPowerShellPolicyWindows(context.Background(), f.run)
+	if p == nil || p.FixableByElevation || len(p.HostsToElevate) != 0 {
+		t.Fatalf("an unread Windows PowerShell withholds elevation too, got %+v", p)
+	}
+}
+
+func TestPowerShellPolicyFinding_MentionsAdministratorApproval(t *testing.T) {
+	win := psHost("Restricted", allUndefined(nil))
+	lockedPwsh := classifyPowerShellPolicy(powerShellHostPolicy{Host: powerShellHost7, Effective: "Restricted", Scopes: allUndefined(map[string]string{"MachinePolicy": "Restricted"})})
+	msg, fixable := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win, lockedPwsh}))
+	if fixable || !strings.Contains(msg, "administrator approval") || !strings.Contains(msg, "IT administrator") {
+		t.Fatalf("got fixable=%v msg=%q", fixable, msg)
+	}
+	// A fixable report keeps its per-user copy; Group Policy alone never offers elevation.
+	if msg, _ := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{win})); strings.Contains(msg, "administrator approval") {
+		t.Fatalf("fixable copy must not mention elevation: %q", msg)
+	}
+	gp := psHost("Restricted", allUndefined(map[string]string{"MachinePolicy": "Restricted"}))
+	if msg, _ := powerShellPolicyFinding(summarizePowerShellPolicy([]powerShellHostPolicy{gp})); strings.Contains(msg, "administrator approval") {
+		t.Fatalf("Group Policy copy must not offer elevation: %q", msg)
+	}
+}
