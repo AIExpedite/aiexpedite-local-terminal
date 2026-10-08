@@ -162,6 +162,7 @@ var builtinSignInArgvs = [][]string{
 	{"grok", "login", "--oauth"},                                // cliAgents/grok
 	{"opencode", "auth", "login"},                               // cliAgents/opencode
 	{"agy"},                                                     // cliAgents/antigravity
+	{"muse", "login"},                                           // cliAgents/museCode
 }
 
 // isBuiltinSignInArgv reports whether argv is exactly one of builtinSignInArgvs.
