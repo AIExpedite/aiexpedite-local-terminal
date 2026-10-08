@@ -160,6 +160,14 @@ func mutateClaudeRateLimitSnapshotStamped(path, fingerprint string, fn func(*cla
 // the optional under-lock scope guard mutateClaudeRateLimitSnapshotScoped
 // documents.
 func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowedScopes []string, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
+	return mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint, allowedScopes, false, fn)
+}
+
+// mutateClaudeRateLimitSnapshotStampedScopedUnscope is the implementation.
+// `confirmedUnscoped` lifts the scoped -> unscoped refusal for a caller that
+// has CONFIRMED the empty fingerprint is the accountless login, not a failed
+// credential read (claudeOweTransferredRunRefresh).
+func mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint string, allowedScopes []string, confirmedUnscoped bool, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
 	if path == "" || fn == nil {
 		return false, 0, 0
 	}
@@ -182,7 +190,7 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 		// still signed in to. Only the live writers (stream capture, status-line hook, probe
 		// merge) may reset a scope to unscoped — they carry a reading, and a debt
 		// or hold marker does not.
-		if fingerprint == "" && snap.AccountFingerprint != "" {
+		if fingerprint == "" && snap.AccountFingerprint != "" && !confirmedUnscoped {
 			return time.Time{}, nil
 		}
 		// A marker earned under an account the cache has since moved off is
@@ -327,7 +335,7 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string,
 	// allowed. See mutateClaudeRateLimitSnapshotScoped, which judges it under the
 	// same lock the write takes.
 	scopeBefore := claudeRateLimitCacheScope()
-	fingerprint = currentClaudeAccountFingerprint()
+	fingerprint, resolved := currentClaudeAccountFingerprintResolved()
 	if want != nil && fingerprint != *want {
 		return fingerprint, false
 	}
@@ -351,8 +359,16 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string,
 	// still proceeds when the cache is where this debt left it (onDisk is the
 	// sampled scope or the resolved fingerprint); a flip that overtook the sample
 	// is refused by the allow-list above.
+	//
+	// The one exception is a transfer whose pinned debt was owed under "" while
+	// the credential READ and names no account: two independent confirmations
+	// that the accountless login is the one signed in now. The own cache, still
+	// scoped to the previous account, would otherwise refuse it on every tick,
+	// and once the hooks are re-pointed a restart forgets the pinned cache, so
+	// that run would go unpaid.
+	confirmedUnscoped := want != nil && *want == "" && resolved
 	baselineMs := baseline.UnixMilli()
-	wrote := mutateClaudeRateLimitSnapshotScoped(path, fingerprint, []string{scopeBefore},
+	wrote, _, _ := mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint, []string{scopeBefore}, confirmedUnscoped,
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
 				onDisk = true
@@ -557,7 +573,7 @@ func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool,
 // the own one, so a tick with nothing owed still reads no credential.
 func claudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) (path, fingerprint string, owedMs int64) {
 	home, _ := os.UserHomeDir()
-	current, resolved := "", false
+	current, resolved, looked := "", false, false
 	for _, pinned := range claudePinnedCacheCandidates(home) {
 		snap, ok := loadClaudeRateLimitSnapshot(pinned)
 		if !ok || snap.RefreshOwedAtMs <= owedMs {
@@ -567,10 +583,13 @@ func claudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, now tim
 			continue
 		}
 		if haveOwn && snap.AccountFingerprint != own.AccountFingerprint {
-			if !resolved {
-				current, resolved = currentClaudeAccountFingerprint(), true
+			if !looked {
+				current, resolved = currentClaudeAccountFingerprintResolved()
+				looked = true
 			}
-			if current == "" || snap.AccountFingerprint != current {
+			// "" is a real scope (the accountless login) once the credential
+			// actually read; only an unreadable one is an identity failure.
+			if !resolved || snap.AccountFingerprint != current {
 				continue
 			}
 		}

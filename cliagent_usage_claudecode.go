@@ -749,17 +749,26 @@ func claudeApiKeyApproved(home, key string) bool {
 // login. The cache is then unscoped, matching the behavior before this feature;
 // Parse reads it with the same "" so the windows still display.
 func currentClaudeAccountFingerprint() string {
+	fingerprint, _ := currentClaudeAccountFingerprintResolved()
+	return fingerprint
+}
+
+// currentClaudeAccountFingerprintResolved is currentClaudeAccountFingerprint
+// plus whether the credential was actually read and parsed. Only then is an
+// empty fingerprint the accountless claude.ai login rather than a credential
+// read that transiently failed; both otherwise resolve to the same "".
+func currentClaudeAccountFingerprintResolved() (fingerprint string, resolved bool) {
 	home, _ := os.UserHomeDir()
 	base := claudeConfigDir(home)
 	if base == "" {
-		return ""
+		return "", false
 	}
 	account := ""
 	if raw, ok := readClaudeCredentialsRaw(context.Background(), base); ok {
 		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
-			account = creds.claudeCredentialAccount()
+			account, resolved = creds.claudeCredentialAccount(), true
 		}
 	}
-	return fingerprintAccount("claudeCode", account)
+	return fingerprintAccount("claudeCode", account), resolved
 }

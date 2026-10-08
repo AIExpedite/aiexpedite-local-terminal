@@ -497,6 +497,61 @@ func TestClaudeDirectRun_APinnedDebtOfAnotherAccountIsNotTransferred(t *testing.
 	}
 }
 
+// Account switch onto the accountless claude.ai login: the pinned debt and the
+// signed-in login both have the empty scope, which is a real scope once the
+// credential reads. The debt is transferred (re-scoping the own cache off the
+// previous account) and paid, not rejected as an identity failure.
+func TestClaudeDirectRun_APinnedDebtAfterASwitchToTheAccountlessLoginIsTransferred(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeOwnCacheUnderPreviousAccount(t, cache, end.Add(-time.Minute))
+	writeClaudeExpiringCredential(t, end.Add(time.Hour), probeTestToken) // the switch: no account in it
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || !resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want the readable accountless login", fp, resolved)
+	}
+	seedClaudeRefreshDebt(t, pinned, "", end, 0, time.Time{})
+
+	requirePinnedDebtTransferredAndPaid(t, cache, pinned, calls, end)
+	if got := claudeCacheSnapshot(t, cache).AccountFingerprint; got != "" {
+		t.Fatal("the own cache was not moved onto the accountless login")
+	}
+}
+
+// The same empty scope with an UNREADABLE credential is an identity failure,
+// not the accountless login: the debt stays on the pinned cache and the own
+// cache keeps the previous account's readings.
+func TestClaudeDirectRun_APinnedAccountlessDebtIsNotTransferredOnAnUnreadableCredential(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeOwnCacheUnderPreviousAccount(t, cache, end.Add(-time.Minute))
+	if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil {
+		t.Fatal(err)
+	}
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want an unreadable credential", fp, resolved)
+	}
+	seedClaudeRefreshDebt(t, pinned, "", end, 0, time.Time{})
+
+	if _, _, owedMs := claudePinnedObservedDebt(claudeCacheSnapshot(t, cache), true, end); owedMs != 0 {
+		t.Fatalf("pinned debt %d offered for transfer, want none", owedMs)
+	}
+	if claudeOweTransferredRunRefresh(end, "", 0) {
+		t.Fatal("an unconfirmed empty scope was owed over the previous account's cache")
+	}
+	own := claudeCacheSnapshot(t, cache)
+	if own.AccountFingerprint == "" || len(own.Buckets) == 0 {
+		t.Fatal("the previous account's cache was wiped on an unreadable credential")
+	}
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() {
+		t.Fatal("the debt was taken off the pinned cache")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d, want none", got)
+	}
+}
+
 // A pinned debt owed under the accountless claude.ai login has the empty scope.
 // That is a real account scope, not "no requirement": once a fingerprinted
 // account is signed in, the transfer's owe must refuse it rather than write the
