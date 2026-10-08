@@ -313,11 +313,15 @@ func TestMergeOpenCodeUsageSteps_SeenStepsAreBounded(t *testing.T) {
 		steps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("s", fmt.Sprint(i)), AtMs: time.Now().UnixMilli(), Input: 1}
 	}
 	mergeOpenCodeUsageSteps(&ledger, "fp", steps)
-	if len(ledger.SeenSteps) != openCodeUsageMaxSeenSteps {
-		t.Fatalf("seenSteps = %d, want the cap %d", len(ledger.SeenSteps), openCodeUsageMaxSeenSteps)
+	// A day of the direct reader's message keys fits: 8,192, pruned oldest first.
+	if openCodeUsageMaxSeenSteps != 8192 || len(ledger.SeenSteps) != openCodeUsageMaxSeenSteps {
+		t.Fatalf("seenSteps = %d, want the cap 8192", len(ledger.SeenSteps))
 	}
 	if ledger.SeenSteps[len(ledger.SeenSteps)-1] != steps[len(steps)-1].Key {
 		t.Fatal("the newest key must survive the cap")
+	}
+	if ledger.SeenSteps[0] != steps[50].Key {
+		t.Fatal("the cap must drop the oldest keys first")
 	}
 	for _, k := range ledger.SeenSteps {
 		if _, err := hex.DecodeString(k); len(k) != 16 || err != nil {
@@ -406,5 +410,42 @@ func TestOpenCodeUsageRun_AFullyCommittedCapRecyclesItsSlots(t *testing.T) {
 	captureOpenCodeUsageLine(busy, openCodeStepFinish("ses_a", "prt_later", 1, 1, 0, "0", now))
 	if len(busy.steps) != openCodeUsageMaxRunSteps+1 || busy.steps[len(busy.steps)-1].Input != 31 {
 		t.Fatalf("a later step did not fold into the uncommitted one: %+v", busy.steps[len(busy.steps)-1])
+	}
+}
+
+// The direct reader's fields are additive under schemaVersion 1: they
+// round-trip, and a ledger written before them still loads its buckets.
+func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T) {
+	openCodeUsageFixture(t, 1301)
+	owned := []openCodeOwnedRun{{RunID: "run1", SessionKey: openCodeUsageSessionKey("ses_x"), FromMs: 10, ToMs: 20}, {RunID: "run2", SessionKey: "k", FromMs: 30}}
+	cursor := &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: 40}
+	coverage := &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, ObservedAtMs: 50, LastOkLocalDate: "2026-10-08"}
+	if committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.OwnedRuns, ledger.DirectCursor, ledger.DirectCoverage = owned, cursor, coverage
+		return true, false
+	}); !committed {
+		t.Fatal("write refused")
+	}
+	raw, err := os.ReadFile(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk map[string]json.RawMessage
+	if json.Unmarshal(raw, &onDisk) != nil || string(onDisk["schemaVersion"]) != "1" {
+		t.Fatalf("schemaVersion = %s, want 1", onDisk["schemaVersion"])
+	}
+	got := loadOpenCodeUsageLedger()
+	if len(got.OwnedRuns) != 2 || got.OwnedRuns[0] != owned[0] || got.OwnedRuns[1] != owned[1] || *got.DirectCursor != *cursor || *got.DirectCoverage != *coverage {
+		t.Fatalf("round trip = %+v", got)
+	}
+
+	// The shape an older build writes: no direct fields at all.
+	older := `{"schemaVersion":1,"generation":{"epoch":7,"counter":3},"buckets":[{"accountFingerprint":"fp","localDate":"2026-10-08","inputTokens":5,"outputTokens":1,"reasoningTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0,"costUsd":0.5,"observedAtMs":99}],"seenSteps":["00112233aabbccdd"]}`
+	if err := os.WriteFile(openCodeUsageCachePath(), []byte(older), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = loadOpenCodeUsageLedger()
+	if len(got.Buckets) != 1 || got.Buckets[0].tokens() != 6 || got.OwnedRuns != nil || got.DirectCursor != nil || got.DirectCoverage != nil {
+		t.Fatalf("older ledger = %+v", got)
 	}
 }

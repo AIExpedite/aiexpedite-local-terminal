@@ -1553,6 +1553,32 @@ func openCodeStorageDir() string {
 	return filepath.Join(home, ".local", "share", "opencode")
 }
 
+// OpenCode store layouts the direct-run reader (cliagent_usage_opencode_direct.go)
+// understands. OpenCode moved from one JSON file per record (storage/) to a
+// single SQLite database (opencode.db); anything else is unknown and is never
+// guessed at.
+const (
+	openCodeStoreLayoutUnknown = ""
+	openCodeStoreLayoutSQLite  = "sqlite"
+	openCodeStoreLayoutJSON    = "json"
+)
+
+// openCodeStoreLayout detects the layout under openCodeStorageDir(), newest
+// first: a migrated install can keep its old storage/ tree beside the database.
+func openCodeStoreLayout() (layout, root string) {
+	root = openCodeStorageDir()
+	if root == "" {
+		return openCodeStoreLayoutUnknown, ""
+	}
+	if info, err := os.Stat(filepath.Join(root, "opencode.db")); err == nil && info.Mode().IsRegular() {
+		return openCodeStoreLayoutSQLite, root
+	}
+	if info, err := os.Stat(filepath.Join(root, "storage", "message")); err == nil && info.IsDir() {
+		return openCodeStoreLayoutJSON, root
+	}
+	return openCodeStoreLayoutUnknown, root
+}
+
 // listOpenCodeSessionIDs snapshots the session ids currently persisted for a
 // project directory. Used as a before/after window so a session id created by
 // OUR run can be told apart from one the user's own TUI created concurrently.

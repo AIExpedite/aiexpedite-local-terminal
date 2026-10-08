@@ -61,6 +61,13 @@
 // detected, the cache exists, and the agent is online and not draining,
 // shutting down or stopped.
 //
+// The same 60 s timer runs the OpenCode direct-run reader's gated scan
+// (openCodeDirectScanIfChanged, cliagent_usage_opencode_direct.go): OpenCode
+// spend from the user's own shell, IDE or PTY TUI lands in its own store, which
+// only a read can discover. The scan runs only while OpenCode is detected, the
+// agent is online and not draining or shutting down, and the store changed; a
+// committed change goes through noteOpenCodeUsageAdvanced like any other.
+//
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its Codex epoch rotation
 // commits (codexRotateGenerationEpoch), a Codex cache that still renders a
@@ -88,11 +95,13 @@ import (
 
 // Vars so tests can pin them small.
 var (
-	cliUsageHintDebounce          = 15 * time.Second
-	cliUsageHintSpacing           = 5 * time.Minute
-	cliUsageRotationFirstRetry    = 15 * time.Second
-	cliUsageRotationRetryPeriod   = 60 * time.Second
-	cliUsageHintHTTPTimeout       = 2 * time.Second
+	cliUsageHintDebounce        = 15 * time.Second
+	cliUsageHintSpacing         = 5 * time.Minute
+	cliUsageRotationFirstRetry  = 15 * time.Second
+	cliUsageRotationRetryPeriod = 60 * time.Second
+	cliUsageHintHTTPTimeout     = 2 * time.Second
+	// cliUsageClaudeFallbackPeriod paces the fallback timer, which also runs the
+	// OpenCode direct-run reader's gated scan.
 	cliUsageClaudeFallbackPeriod  = 60 * time.Second
 	cliUsageClaudeFallbackEnabled = true
 )
@@ -191,8 +200,9 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
-	// firing serializes timer callbacks with resetCLIUsagePropagator (tests),
-	// so a callback in flight finishes before the state is reset under it.
+	// firing serializes timer callbacks (fire, fallback) with
+	// resetCLIUsagePropagator (tests), so a callback in flight finishes before
+	// the state is reset under it.
 	firing sync.Mutex
 }
 
@@ -225,6 +235,8 @@ func startCLIUsagePropagator(cfg *Config) {
 		defer p.rotating.Done()
 		p.rotate(cliUsageRotationFirstRetry)
 		recoverOpenCodeUsageGeneration(1)
+		// Runs made while the agent was down or mid-update.
+		openCodeDirectScanAtStartup()
 	}()
 }
 
@@ -640,9 +652,10 @@ var claudeUsageFallbackDetected = func() bool {
 	return info != nil && info.DetectedCliAgents[claudeUsageProvider].Detected
 }
 
-// armFallbackLocked (re)arms the Claude fallback read.
+// armFallbackLocked (re)arms the fallback timer: the Claude cache read and the
+// OpenCode direct scan.
 func (p *cliUsagePropagatorState) armFallbackLocked() {
-	if p.stopped || !cliUsageClaudeFallbackEnabled {
+	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled) {
 		return
 	}
 	if p.fallbackTimer != nil {
@@ -654,18 +667,23 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 }
 
 // fallback discovers a Claude generation another process committed (the
-// status-line hook) when no ordinary read has: one small cache read, only
-// while every gate is open.
+// status-line hook) when no ordinary read has — one small cache read — and runs
+// the OpenCode direct scan, each only while its gates are open.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.fallbackGen {
 		p.mu.Unlock()
 		return
 	}
 	p.mu.Unlock()
-	if g := claudeUsageFallbackGeneration(); g != nil {
-		noteCLIUsageGenerationObserved(claudeUsageProvider, *g)
+	if cliUsageClaudeFallbackEnabled {
+		if g := claudeUsageFallbackGeneration(); g != nil {
+			noteCLIUsageGenerationObserved(claudeUsageProvider, *g)
+		}
 	}
+	openCodeDirectScanIfChanged()
 	p.mu.Lock()
 	if gen == p.fallbackGen {
 		p.armFallbackLocked()

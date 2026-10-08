@@ -30,6 +30,14 @@
 //   - Survive: StartAgent calls payOwedOpenCodeUsage, which re-arms the ladder
 //     for the previous process's debts — including armed ones it never
 //     settled.
+//   - Own: once a run names its session, the write that records the id also
+//     opens the run's ownership window (openCodeOwnedRun) at the run floor; the
+//     direct-run reader (cliagent_usage_opencode_direct.go) skips every message
+//     of that session inside it. The window closes when the run's stream is
+//     over — a closing settle (native, smoke, a session's exit), finish,
+//     disarm or retire — never on a terminal-event settle, whose flush can
+//     still commit late steps. Until a run has a window on disk it is an
+//     ARMED run the reader holds back for (openCodeUsageArmedHoldMs).
 //
 // It is a module of its own rather than a fork of the Codex or Grok freshness
 // paths: those are bound to their own caches and generation types. Only the
@@ -90,7 +98,39 @@ var (
 	// earlier process has no entry here, so it exports at once.
 	openCodeUsageLiveMu   sync.Mutex
 	openCodeUsageLiveRuns = map[string]*openCodeUsageRun{}
+	// openCodeUsageArmedRuns holds this process's runs that have no ownership
+	// window on disk yet, by run id — the in-memory half of the direct reader's
+	// hold, which also covers a run whose armed-debt write was refused. Guarded
+	// by openCodeUsageLiveMu.
+	openCodeUsageArmedRuns = map[string]*openCodeUsageRun{}
 )
+
+// releaseOpenCodeUsageArmedRun drops the run from the reader's hold: its window
+// is on disk, or it can never record one.
+func releaseOpenCodeUsageArmedRun(run *openCodeUsageRun) {
+	if run == nil {
+		return
+	}
+	openCodeUsageLiveMu.Lock()
+	delete(openCodeUsageArmedRuns, run.id)
+	openCodeUsageLiveMu.Unlock()
+}
+
+// openCodeUsageArmedHoldMs is the floor of the oldest run this process armed
+// that has no ownership window yet, or 0. A run older than the debt age-out no
+// longer holds: a stuck run must not freeze direct capture.
+func openCodeUsageArmedHoldMs(now time.Time) int64 {
+	cutoff := now.Add(-openCodeUsageDebtMaxAge).UnixMilli()
+	openCodeUsageLiveMu.Lock()
+	defer openCodeUsageLiveMu.Unlock()
+	hold := int64(0)
+	for _, run := range openCodeUsageArmedRuns {
+		if run.floorMs >= cutoff && (hold == 0 || run.floorMs < hold) {
+			hold = run.floorMs
+		}
+	}
+	return hold
+}
 
 // settleOpenCodeUsageRunOnStream settles a run whose stream may outlive its
 // settle: a terminal session's turn, settled on its terminal event while the
@@ -103,7 +143,7 @@ func settleOpenCodeUsageRunOnStream(run *openCodeUsageRun, sessionID string) {
 	openCodeUsageLiveMu.Lock()
 	openCodeUsageLiveRuns[run.id] = run
 	openCodeUsageLiveMu.Unlock()
-	settleOpenCodeUsageRun(run, sessionID)
+	settleOpenCodeUsageRunOnce(run, sessionID)
 }
 
 // releaseOpenCodeUsageLiveRun drops the run once it can commit nothing more:
@@ -139,8 +179,136 @@ func finishOpenCodeUsageRun(run *openCodeUsageRun) {
 	}
 	run.streamClosed.Store(true)
 	releaseOpenCodeUsageLiveRun(run)
+	run.closeOwnedWindow(1)
 	if run.exportDeferred.CompareAndSwap(true, false) {
 		scheduleOpenCodeUsageAttempt(run.id, openCodeUsageDebtLadder[0])
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Ownership windows
+   -------------------------------------------------------------------------- */
+
+// streamOver reports that no further step can join the run: a closing settle
+// or finish said so.
+func (run *openCodeUsageRun) streamOver() bool {
+	return run.streamClosed.Load() || run.closingSettle.Load()
+}
+
+// syncOwnedWindow records the run's ownership window on ledger, inside the
+// caller's transaction: opened at the run floor for sessionID, closed at nowMs
+// once the stream is over. It reports whether the window is closed. No session
+// id, no window — the run owns nothing the reader could tell apart.
+func (run *openCodeUsageRun) syncOwnedWindow(ledger *openCodeUsageLedger, sessionID string, nowMs int64) (closed bool) {
+	if sessionID == "" {
+		return false
+	}
+	w := openCodeOwnedRunByID(ledger, run.id)
+	if w == nil {
+		ledger.OwnedRuns = append(ledger.OwnedRuns, openCodeOwnedRun{
+			RunID:      run.id,
+			SessionKey: openCodeUsageSessionKey(sessionID),
+			FromMs:     run.floorMs,
+		})
+		w = &ledger.OwnedRuns[len(ledger.OwnedRuns)-1]
+	}
+	if w.open() && run.streamOver() {
+		w.ToMs = max(nowMs, w.FromMs)
+	}
+	closed = !w.open()
+	pruneOpenCodeOwnedRuns(ledger, nowMs)
+	return closed
+}
+
+// noteOwnedWindow records what a committed syncOwnedWindow left on disk.
+func (run *openCodeUsageRun) noteOwnedWindow(sessionID string, closed bool) {
+	if sessionID == "" {
+		return
+	}
+	releaseOpenCodeUsageArmedRun(run)
+	if closed {
+		run.windowClosed.Store(true)
+	}
+}
+
+// closeOwnedWindow closes the run's window once its stream is over, retrying a
+// refused write on the commit ladder. A run with no session id has none.
+func (run *openCodeUsageRun) closeOwnedWindow(attempt int) {
+	sessionID := run.session()
+	if sessionID == "" {
+		releaseOpenCodeUsageArmedRun(run)
+		return
+	}
+	if run.windowClosed.Load() {
+		return
+	}
+	nowMs := openCodeUsageFreshnessNow().UnixMilli()
+	closed := false
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		closed = run.syncOwnedWindow(ledger, sessionID, nowMs)
+		return true, false
+	})
+	if committed {
+		run.noteOwnedWindow(sessionID, closed)
+		return
+	}
+	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
+	if !more {
+		// The window stays open on disk until the next process's adoption
+		// closes it: the reader under-counts that session meanwhile, never
+		// double counts it.
+		releaseOpenCodeUsageArmedRun(run)
+		logOpenCodeUsageCapture("window_abandoned")
+		return
+	}
+	logOpenCodeUsageCapture("window_retry")
+	openCodeUsageAfterFunc(delay, func() { run.closeOwnedWindow(attempt + 1) })
+}
+
+func openCodeOwnedRunByID(ledger *openCodeUsageLedger, runID string) *openCodeOwnedRun {
+	for i := range ledger.OwnedRuns {
+		if ledger.OwnedRuns[i].RunID == runID {
+			return &ledger.OwnedRuns[i]
+		}
+	}
+	return nil
+}
+
+// closeOpenCodeOwnedRunByID closes the run's window, if it has an open one.
+func closeOpenCodeOwnedRunByID(ledger *openCodeUsageLedger, runID string, nowMs int64) bool {
+	w := openCodeOwnedRunByID(ledger, runID)
+	if w == nil || !w.open() {
+		return false
+	}
+	w.ToMs = max(nowMs, w.FromMs)
+	return true
+}
+
+// pruneOpenCodeOwnedRuns drops closed windows that ended before local midnight —
+// the reader never scans before it — then the oldest closed windows past the
+// cap. An open window is never dropped: its run may still commit, and the reader
+// would count its session again.
+func pruneOpenCodeOwnedRuns(ledger *openCodeUsageLedger, nowMs int64) {
+	midnight := openCodeLocalMidnight(time.UnixMilli(nowMs)).UnixMilli()
+	kept := ledger.OwnedRuns[:0]
+	for _, w := range ledger.OwnedRuns {
+		if !w.open() && w.ToMs < midnight {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	ledger.OwnedRuns = kept
+	for len(ledger.OwnedRuns) > openCodeUsageMaxOwnedRuns {
+		oldest := -1
+		for i, w := range ledger.OwnedRuns {
+			if !w.open() && (oldest < 0 || w.ToMs < ledger.OwnedRuns[oldest].ToMs) {
+				oldest = i
+			}
+		}
+		if oldest < 0 {
+			return
+		}
+		ledger.OwnedRuns = append(ledger.OwnedRuns[:oldest], ledger.OwnedRuns[oldest+1:]...)
 	}
 }
 
@@ -161,6 +329,11 @@ func armOpenCodeUsageRun(executable, dir, fingerprint string) *openCodeUsageRun 
 		executable:  executable,
 		dir:         dir,
 	}
+	// Held by the direct reader until its window is on disk: from here the
+	// child may write messages the stream will pay.
+	openCodeUsageLiveMu.Lock()
+	openCodeUsageArmedRuns[run.id] = run
+	openCodeUsageLiveMu.Unlock()
 	// Tried once, never waited on: a session arms under the session manager's
 	// lock. A refused arm still settles (and owes) normally, but the armed debt
 	// is the crash marker — without it a crash or self-update mid-turn leaves the
@@ -250,7 +423,8 @@ func (run *openCodeUsageRun) persistSessionID(sessionID string, attempt int) {
 		return
 	}
 	// A contended lock never runs mutate, so track the decline, not the intent.
-	declined := false
+	declined, closed := false, false
+	nowMs := openCodeUsageFreshnessNow().UnixMilli()
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		debt := openCodeUsageDebtByID(ledger, run.id)
 		if debt == nil || debt.SessionID != "" || debt.owed() {
@@ -258,8 +432,14 @@ func (run *openCodeUsageRun) persistSessionID(sessionID string, attempt int) {
 			return false, false
 		}
 		debt.SessionID = sessionID
+		// The same write opens the run's ownership window, so the direct reader
+		// never sees the session named but unowned.
+		closed = run.syncOwnedWindow(ledger, sessionID, nowMs)
 		return true, false
 	})
+	if committed {
+		run.noteOwnedWindow(sessionID, closed)
+	}
 	if committed || declined {
 		return
 	}
@@ -272,19 +452,31 @@ func (run *openCodeUsageRun) persistSessionID(sessionID string, attempt int) {
 	openCodeUsageAfterFunc(delay, func() { run.persistSessionID(sessionID, attempt+1) })
 }
 
-// settleOpenCodeUsageRun settles the run exactly once. sessionID is any id the
-// caller learned outside the stream (a resume id); the stream's own wins.
+// settleOpenCodeUsageRun settles the run exactly once, after its stream is over
+// (the native and smoke turns, a session's exit): the settle's write also
+// closes the run's ownership window. sessionID is any id the caller learned
+// outside the stream (a resume id); the stream's own wins.
 func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
-	if run == nil || !run.settled.CompareAndSwap(false, true) {
+	if run == nil {
+		return
+	}
+	run.closingSettle.Store(true)
+	settleOpenCodeUsageRunOnce(run, sessionID)
+}
+
+func settleOpenCodeUsageRunOnce(run *openCodeUsageRun, sessionID string) {
+	if !run.settled.CompareAndSwap(false, true) {
 		return
 	}
 	run.commitMu.Lock()
 	defer run.commitMu.Unlock()
-	steps, streamSession, from := run.takeUncommitted()
 	if !isValidOpenCodeSessionID(sessionID) {
 		sessionID = ""
 	}
-	sessionID = firstNonEmpty(streamSession, sessionID)
+	// A resume id stands in for a stream that named none, for every later write
+	// of this run (its window, its commit retries).
+	run.adoptSession(sessionID)
+	steps, sessionID, from := run.takeUncommitted()
 	fingerprint := run.settleFingerprint()
 
 	if openCodeUsageStepsCarryUsage(steps) {
@@ -302,6 +494,7 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 	// cost is zero — are not payment: the turn still owes a reading, and its
 	// export may carry one.
 	if sessionID == "" {
+		releaseOpenCodeUsageArmedRun(run)
 		retireOpenCodeUsageDebt(run.id, "unattributable")
 		return
 	}
@@ -318,7 +511,9 @@ func settleOpenCodeUsageRun(run *openCodeUsageRun, sessionID string) {
 // attempt, reporting whether the write landed.
 func oweOpenCodeUsageRun(run *openCodeUsageRun, sessionID, fingerprint string) bool {
 	now := openCodeUsageFreshnessNow()
+	closed := false
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		closed = run.syncOwnedWindow(ledger, sessionID, now.UnixMilli())
 		debt := openCodeUsageDebtByID(ledger, run.id)
 		if debt == nil {
 			ledger.Debts = append(ledger.Debts, openCodeUsageDebt{RunID: run.id, RunFloorMs: run.floorMs, Dir: run.dir})
@@ -337,6 +532,7 @@ func oweOpenCodeUsageRun(run *openCodeUsageRun, sessionID, fingerprint string) b
 	if !committed {
 		return false
 	}
+	run.noteOwnedWindow(sessionID, closed)
 	logOpenCodeUsageCapture("owed")
 	scheduleOpenCodeUsageAttempt(run.id, openCodeUsageDebtLadder[0])
 	return true
@@ -349,6 +545,7 @@ func oweOpenCodeUsageRun(run *openCodeUsageRun, sessionID, fingerprint string) b
 func scheduleOpenCodeUsageOwe(run *openCodeUsageRun, sessionID, fingerprint string, attempt int) {
 	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
 	if !more {
+		releaseOpenCodeUsageArmedRun(run)
 		logOpenCodeUsageCapture("owe_abandoned")
 		return
 	}
@@ -404,6 +601,7 @@ func flushOpenCodeUsageRun(run *openCodeUsageRun) {
 func scheduleOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt int) {
 	delay, more := refreshRetryDelayForAttempt(attempt, openCodeUsageCommitMaxAttempts, openCodeUsageCommitLadder)
 	if !more {
+		releaseOpenCodeUsageArmedRun(run)
 		logOpenCodeUsageCapture("commit_abandoned")
 		// The steps stay in memory, but no write will offer them again. A run
 		// that never committed still has its ARMED debt, which the next process
@@ -452,12 +650,17 @@ func retryOpenCodeUsageCommit(run *openCodeUsageRun, fingerprint string, attempt
 // commitOpenCodeUsageSteps folds steps into the ledger and retires the run's
 // debt in one write, reporting whether it committed.
 func commitOpenCodeUsageSteps(run *openCodeUsageRun, fingerprint string, steps []openCodeUsageStep) bool {
+	sessionID := run.session()
+	nowMs := openCodeUsageFreshnessNow().UnixMilli()
+	closed := false
 	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		removeOpenCodeUsageDebt(ledger, run.id)
+		closed = run.syncOwnedWindow(ledger, sessionID, nowMs)
 		return true, mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
 	})
 	noteOpenCodeUsageAdvanced(committed, changed, generation)
 	if committed {
+		run.noteOwnedWindow(sessionID, closed)
 		logOpenCodeUsageCapture("committed")
 	}
 	return committed
@@ -492,18 +695,23 @@ func settleOrDisarmOpenCodeSmokeRun(run *openCodeUsageRun, succeeded bool) {
 // adopted and exported by the next process despite owing nothing.
 func disarmOpenCodeUsageRun(run *openCodeUsageRun) {
 	if run != nil && run.settled.CompareAndSwap(false, true) {
+		releaseOpenCodeUsageArmedRun(run)
 		retireOpenCodeUsageDebt(run.id, "disarmed")
 	}
 }
 
-// disarmOpenCodeUsageRunID removes the run's debt, reporting whether the ledger
-// on disk no longer holds it: a debt that was already absent counts as gone, a
-// refused write (another process holding the ledger, or a failed rename) does
-// not.
+// disarmOpenCodeUsageRunID removes the run's debt and closes its ownership
+// window, reporting whether the ledger on disk no longer holds either: a debt
+// that was already absent counts as gone, a refused write (another process
+// holding the ledger, or a failed rename) does not. Every caller is past the
+// run's stream — a disarmed spawn, a retired debt.
 func disarmOpenCodeUsageRunID(runID string) bool {
 	absent := false
+	nowMs := openCodeUsageFreshnessNow().UnixMilli()
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-		if !removeOpenCodeUsageDebt(ledger, runID) {
+		removed := removeOpenCodeUsageDebt(ledger, runID)
+		closed := closeOpenCodeOwnedRunByID(ledger, runID, nowMs)
+		if !removed && !closed {
 			absent = true
 			return false, false
 		}
@@ -794,6 +1002,15 @@ func adoptOwedOpenCodeUsage(startedAt time.Time) {
 	ran, write := false, false
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		ran = true
+		// A window an earlier process left open belongs to a stream that died
+		// with it: it closes at this process's start, and a resume after that
+		// is direct use (or a new managed run with its own window).
+		for i := range ledger.OwnedRuns {
+			if w := &ledger.OwnedRuns[i]; w.open() && w.FromMs < startedAt.UnixMilli() {
+				w.ToMs = startedAt.UnixMilli()
+				write = true
+			}
+		}
 		kept := ledger.Debts[:0]
 		for _, d := range ledger.Debts {
 			switch {
@@ -906,11 +1123,16 @@ type openCodeExportMessage struct {
 	// every step (it ends as the last step's), while each step-finish part
 	// keeps that step's usage, so a multi-step turn is only whole when its
 	// parts are summed, as the stream tap sums step_finish events.
-	Parts []struct {
-		Type   string          `json:"type"`
-		Tokens json.RawMessage `json:"tokens"`
-		Cost   json.RawMessage `json:"cost"`
-	} `json:"parts"`
+	Parts []openCodeExportPart `json:"parts"`
+}
+
+// openCodeExportPart is the narrow view of a message part: only a step-finish
+// part's figures are read, never its text or tool output. The direct-run
+// reader decodes OpenCode's stored parts into the same shape.
+type openCodeExportPart struct {
+	Type   string          `json:"type"`
+	Tokens json.RawMessage `json:"tokens"`
+	Cost   json.RawMessage `json:"cost"`
 }
 
 type openCodeExportMessageInfo struct {
@@ -1013,6 +1235,7 @@ func resetOpenCodeUsageFreshness() {
 	openCodeUsageTimersMu.Unlock()
 	openCodeUsageLiveMu.Lock()
 	openCodeUsageLiveRuns = map[string]*openCodeUsageRun{}
+	openCodeUsageArmedRuns = map[string]*openCodeUsageRun{}
 	openCodeUsageLiveMu.Unlock()
 	openCodeUsageInFlight.Wait()
 }

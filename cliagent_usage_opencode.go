@@ -38,14 +38,18 @@
 // # USAGE: THE DEVICE-LOCAL LEDGER
 //
 // OpenCode has no quota window of its own — it delegates quota to whichever
-// provider is underneath — but every turn reports its spend on its step_finish
-// frames. The turns this agent spawns (the smoke, the resident chat, terminal
-// sessions) fold that into opencode_usage.json
-// (cliagent_usage_opencode_capture.go), and the card publishes today's bucket
-// for this install's account: "Tokens today (agent runs)" and, when above zero,
-// "Cost today", each with the newest step as observedAt and the next local
-// midnight as resetAt. An opencode the user runs in their own shell is not
-// counted, so the row is a floor — its label says so.
+// provider is underneath — but every turn reports its spend. The turns this
+// agent spawns (the smoke, the resident chat, terminal sessions) fold their
+// step_finish frames into opencode_usage.json
+// (cliagent_usage_opencode_capture.go), and the direct-run reader
+// (cliagent_usage_opencode_direct.go) folds in every other run from OpenCode's
+// own store. The card publishes today's bucket for this install's account:
+// "Tokens today" and, when above zero, "Cost today", each with the newest step
+// as observedAt and the next local midnight as resetAt. ParseContext only reads
+// the ledger; the reader never runs inside the gather. While no scan has read
+// the store today (an unrecognised layout, or one the agent cannot see), only
+// the agent's own runs are counted and the row says so: "Tokens today (agent
+// runs)".
 //
 // SECRETS: this parser reads provider NAMES and model IDS only. It never reads,
 // logs, or forwards a token value from auth.json. The ledger holds counts and
@@ -215,8 +219,12 @@ func (p openCodeUsageParser) ParseContext(ctx context.Context, home string, dete
 		return usage, true
 	}
 	adopted := adoptPendingOpenCodeUsageBuckets(usage.AccountFingerprint)
-	bucket, ok, generation := openCodeUsageBucketForDay(usage.AccountFingerprint, now)
-	usage.Metrics = openCodeUsageMetrics(bucket, ok, now)
+	day := openCodeUsageDayFor(usage.AccountFingerprint, now)
+	usage.Metrics = openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, now)
+	if day.Direct {
+		usage.DataSource = "opencode store"
+	}
+	generation := day.Generation
 	// Only a generation this process committed: until then the ledger may hold
 	// one an earlier process published, which the backend may already have
 	// applied (see openCodeGenerationRotated). Nor one a refused adoption left

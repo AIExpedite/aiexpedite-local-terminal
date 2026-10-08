@@ -1747,6 +1747,9 @@ provider for its current figures before the gather runs
     for the probe instead of sharing that log file. On a build that refuses
     the RPC (≥ 1.2.2, see the CSRF gate above) the probe stops at the first
     refusal and later clicks skip the spawn.
+  - OpenCode — reads OpenCode's own store for runs the agent did not spawn
+    (see "Usage ledger: two producers" below), under the reader's 2 s cap. No
+    turn is spent and nothing is started.
   - Grok's token is the freshest one for the account across the real home AND
     every live isolated copy (`grokFreshestPresentedToken`). A renewal takes
     its turn for at most `grokLoginRenewGap` (2 s) when the login keeper is
@@ -2109,6 +2112,89 @@ the transport change the evidence selects ships separately.
   the shim's child, so the prompt transport is identical on both routes.
 - Off Windows, `openCodeShimCommand` returns `(nil, false)` and callers spawn the
   native binary directly.
+
+## Usage ledger: two producers
+
+OpenCode has no quota of its own; the card publishes today's spend from
+`opencode_usage.json` (`GetConfigDir()`, mode 0600, `schemaVersion: 1`). Two
+producers fill it:
+
+- **Stream capture** ([cliagent_usage_opencode_capture.go](cliagent_usage_opencode_capture.go),
+  [cliagent_usage_opencode_freshness.go](cliagent_usage_opencode_freshness.go)) —
+  every `--format json` turn the agent spawns (the `__cli_smoke__` probe, the
+  resident chat, terminal `session_start`). Each `step_finish` frame is keyed by
+  its part id; a turn that streamed no usage owes a bounded `opencode export`,
+  keyed by message id.
+- **The direct-run reader** ([cliagent_usage_opencode_direct.go](cliagent_usage_opencode_direct.go)) —
+  every other run: the user's shell or IDE, and the OpenCode TUI in a
+  terminal-managed PTY. It reads the assistant messages OpenCode persists in
+  its own store, read-only, keyed `sha256(session, "message:"+id)` — the export's
+  key. `opencode session list` is not used: it only lists the project of the
+  folder it runs in.
+
+**Layouts.** `openCodeStoreLayout()` (next to `openCodeStorageDir()` in
+[opencode_native.go](opencode_native.go), which honours `$OPENCODE_DATA` and
+`$XDG_DATA_HOME` and defaults to `~/.local/share/opencode`, `%USERPROFILE%\.local\share\opencode`
+on Windows) picks an adapter: `opencode.db` → SQLite
+([…_direct_sqlite.go](cliagent_usage_opencode_direct_sqlite.go), pure-Go
+`modernc.org/sqlite`, `mode=ro` + `query_only`, busy timeout, schema checked
+with `pragma_table_info`); otherwise `storage/message/` → JSON files
+([…_direct_json.go](cliagent_usage_opencode_direct_json.go), opened and closed
+one record at a time). Anything else — or a schema or record shape the adapter
+does not know — **fails closed**: nothing merged, coverage not renewed.
+
+**Ownership windows (dedup).** A stream step and a stored message can never
+share a key, so each managed run records `{runId, sha256(session), fromMs, toMs}`
+in `ownedRuns` and the reader skips every message of that session created
+inside it.
+
+| Event | Window |
+|---|---|
+| Session id first written (`persistSessionID`, owed write, commit, resume id) | opened at the run floor |
+| Terminal-event settle (`settleOpenCodeUsageRunOnStream`) | stays open — a late step can still commit |
+| Closing settle (native, smoke, session exit), `finishOpenCodeUsageRun`, disarm, retire | closed at now |
+| Next process's `adoptOwedOpenCodeUsage` | windows a dead process left open close at its start |
+
+A managed run that has not named its session yet **holds** the reader: no
+message created after its floor is counted and the cursor does not pass it.
+The hold comes from armed debts with no session id and from this process's
+in-memory armed runs (so a refused debt write still holds); one older than the
+6 h debt age-out is ignored. Closed windows that ended before local midnight are
+pruned; at most 32 are kept, oldest closed first, never an open one.
+
+**Bounds.** One scan reads records last written since
+`max(local midnight, cursor − 10 min)`: at most 256 sessions, 8,192 records,
+1 MiB per record, 750 ms (2 s on a click). A capped scan saves its cursor at
+the first record it did not read; a message with no `completed` time is not
+counted and holds the cursor. `seenSteps` holds 8,192 keys. Above the caps the
+card under-counts, never over-counts.
+
+**Triggers.** One scan at startup (after `recoverOpenCodeUsageGeneration`);
+the propagator's 60 s fallback tick, only while OpenCode is detected, the agent
+is online and not draining or shutting down, and the store's change marker
+moved (SQLite: size + mtime of `opencode.db` and `-wal`; JSON: newest mtime of
+the session directories under `storage/message`) or the last scan left work;
+and a Refresh click. All three share one single flight. `ParseContext` never
+scans. A committed change advances the generation and the propagator sends at
+most one bounded hint; terminal-service already accepts `provider: "opencode"`.
+
+**Card label.** `directCoverage.lastOkLocalDate == today` → "Tokens today"
+(and `dataSource: "opencode store"`); otherwise "Tokens today (agent runs)".
+"Cost today" appears only above zero.
+
+**Surviving updates.** The cursor, coverage and windows are additive
+`omitempty` fields under `schemaVersion: 1` — a bump would make an older build
+read the whole ledger as empty. An older build that rewrites the ledger drops
+them; the reader then starts at today's newest bucket observation instead of
+local midnight (under-count over double count).
+
+**Redaction.** Adapters decode only ids, role, timestamps, `tokens` and
+`cost` into narrow structs; the SQLite adapter reduces JSON inside SQLite, so
+message text and tool output never reach the agent. The ledger gains counts,
+hashed keys and hashed session ids; logs are fixed labels (`direct_scanned`,
+`direct_truncated`, `direct_layout_unknown`, `direct_read_failed`,
+`direct_lock_busy`). The reader never writes, locks, migrates or vacuums
+OpenCode's store and never reads `auth.json`.
 
 ## Redaction
 
