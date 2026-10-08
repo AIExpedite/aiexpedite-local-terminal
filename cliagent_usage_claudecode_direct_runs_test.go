@@ -374,6 +374,72 @@ func TestClaudeDirectRun_ATransferredPinnedDebtIsNotPaidTwice(t *testing.T) {
 	}
 }
 
+// Dual channel, interrupted after the claim: the peer leased the pinned debt
+// and died before owing it on its own cache. The debt must still be on the
+// pinned cache, so once the lease lapses the run is paid, not lost.
+func TestClaudeDirectRun_APinnedDebtSurvivesATransferInterruptedAfterItsClaim(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+
+	leaseMs := int64(0)
+	if !mutateClaudeRateLimitSnapshotScoped(pinned, fp, []string{fp}, claimClaudePinnedObservedDebt(end.UnixMilli(), &leaseMs)) {
+		t.Fatal("precondition: the claim did not write the pinned cache")
+	}
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() {
+		t.Fatalf("pinned snap=%+v, want the claimed debt still on the pinned cache", p)
+	}
+	if adoptObservedClaudeRunDebt(end) {
+		t.Fatal("adopted a pinned debt under another claim's live lease")
+	}
+
+	// The claimant is gone; its lease lapses.
+	if !mutateClaudeRateLimitSnapshot(pinned, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.AttemptClaimedUntilMs = time.Now().Add(-time.Second).UnixMilli()
+		return true
+	}) {
+		t.Fatal("expiring the lease did not write the pinned cache")
+	}
+	if !adoptObservedClaudeRunDebt(time.Now()) {
+		t.Fatal("the pinned debt was not adopted once the dead claim lapsed")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d, want one", got)
+	}
+	requireNumericClaudeWindow(t, claudeCacheSnapshot(t, cache), claudeWindowFiveHour, end)
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != 0 || p.AttemptClaimedUntilMs != 0 {
+		t.Fatalf("pinned snap=%+v, want the transfer finished", p)
+	}
+}
+
+// Dual channel, interrupted after the owe: both caches hold the same instant.
+// The next adoption finishes the transfer — the own copy is paid once and the
+// pinned copy is cleared rather than left for the owner to pay again.
+func TestClaudeDirectRun_ATransferInterruptedAfterItsOweIsFinished(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinOtherChannelCache(t)
+	end := time.Now()
+	seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+	seedClaudeRefreshDebt(t, cache, fp, end, 0, time.Time{})
+
+	if !adoptObservedClaudeRunDebt(end) {
+		t.Fatal("the half-transferred debt was not adopted")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d, want one", got)
+	}
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != 0 || p.AttemptClaimedUntilMs != 0 {
+		t.Fatalf("pinned snap=%+v, want the interrupted transfer finished", p)
+	}
+}
+
 // A credential that is transiently unreadable when the tick adopts resolves no
 // account, so the attempt cannot scope the debt and books nothing. The debt
 // must stay adoptable: once the credential reads again, the next tick pays it.
