@@ -441,7 +441,7 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		steps, throughMs, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), now)
 		held, pending = h, p
 		changed := mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
-		if !changed && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs) {
+		if !changed && !ledger.seenEvicted && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs) {
 			// Nothing new, coverage already today and the cursor within the
 			// overlap: the next scan re-reads the same few records, so the
 			// whole-ledger rewrite is skipped. A capped scan always saves its
@@ -463,7 +463,7 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 			// session whose unread records were rewritten after the cut.
 			cursor.SessionSinceMs = limits.sessionsSinceMs(floorMs)
 		}
-		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, result.Truncated, throughMs)
+		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, ledger.seenEvicted, result.Truncated, throughMs)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -492,14 +492,18 @@ func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today strin
 
 // openCodeDirectRewindFloor is the new cursor's RewindFloorMs. A scan that
 // finishes a continuation has drained a backlog larger than one scan's cap —
-// the number of keys seenSteps holds — so the keys of the records it read may
-// have rolled over: the overlap must not re-read them, and the floor is this
-// scan's end. Otherwise the previous floor stays while the overlap can reach it.
-func openCodeDirectRewindFloor(prev *openCodeDirectCursor, truncated bool, throughMs int64) int64 {
+// the number of keys seenSteps holds — or whose commit evicted keys from
+// seenSteps: the overlap must not re-read records whose dedup keys rolled over,
+// and the floor is this scan's end. Otherwise the previous floor stays while
+// the overlap can reach it.
+func openCodeDirectRewindFloor(prev *openCodeDirectCursor, evicted, truncated bool, throughMs int64) int64 {
 	switch {
 	case prev == nil:
+		if evicted && !truncated {
+			return throughMs
+		}
 		return 0
-	case prev.Continue && !truncated:
+	case (evicted || prev.Continue) && !truncated:
 		return throughMs
 	case prev.RewindFloorMs > throughMs-openCodeDirectOverlap.Milliseconds():
 		return prev.RewindFloorMs

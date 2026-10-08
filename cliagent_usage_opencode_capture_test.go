@@ -331,6 +331,26 @@ func TestMergeOpenCodeUsageSteps_SeenStepsAreBounded(t *testing.T) {
 	}
 }
 
+func TestMergeOpenCodeUsageSteps_EvictingSeenStepsRaisesDirectRewindFloor(t *testing.T) {
+	ledger := openCodeUsageLedger{
+		SchemaVersion: openCodeUsageSchemaVersion,
+		DirectCursor: &openCodeDirectCursor{
+			ThroughMs: 123456,
+		},
+	}
+	steps := make([]openCodeUsageStep, openCodeUsageMaxSeenSteps+10)
+	for i := range steps {
+		steps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("s", fmt.Sprint(i)), AtMs: time.Now().UnixMilli(), Input: 1}
+	}
+	mergeOpenCodeUsageSteps(&ledger, "fp", steps)
+	if !ledger.seenEvicted {
+		t.Fatal("seenEvicted = false, want true when seenSteps rolls over")
+	}
+	if ledger.DirectCursor.RewindFloorMs != 123456 {
+		t.Fatalf("rewindFloorMs = %d, want 123456", ledger.DirectCursor.RewindFloorMs)
+	}
+}
+
 func TestOpenCodeUsageTransaction_GenerationAdvancesOnlyOnABucketChange(t *testing.T) {
 	openCodeUsageFixture(t, 903)
 	now := time.Now()

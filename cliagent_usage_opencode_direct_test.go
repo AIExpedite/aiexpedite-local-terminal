@@ -742,6 +742,86 @@ func TestOpenCodeDirect_ADrainedBacklogIsNotRewoundInto(t *testing.T) {
 	}
 }
 
+// When managed captures (or an export) roll seenSteps over after a completed
+// direct scan, the direct messages previously counted lose their dedup keys.
+// The next direct scan must not rewind into them, and keeps the floor while the
+// overlap can reach them.
+func TestOpenCodeDirect_ManagedRunsRollingSeenStepsOverDoNotCauseDirectRewindDoubleCount(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2050)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_direct_0", createdMs: clock.ms(-5 * time.Minute), completedMs: clock.ms(-5*time.Minute + time.Second), steps: [][3]int64{{10, 0, 0}}})
+
+	var floors []int64
+	prev := openCodeDirectReaders[openCodeStoreLayoutJSON]
+	openCodeDirectReaders[openCodeStoreLayoutJSON] = func(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error) {
+		floors = append(floors, floorMs)
+		return prev(ctx, root, floorMs, limits)
+	}
+	t.Cleanup(func() { openCodeDirectReaders[openCodeStoreLayoutJSON] = prev })
+
+	// First direct scan: counts msg_direct_0.
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 10 {
+		t.Fatalf("bucket = %+v, want 10 tokens", b)
+	}
+	cursor0 := loadOpenCodeUsageLedger().DirectCursor
+	if cursor0 == nil || cursor0.ThroughMs == 0 {
+		t.Fatalf("cursor0 = %+v", cursor0)
+	}
+
+	// Managed capture appends enough stream keys to roll seenSteps over and evict msg_direct_0's key.
+	managedSteps := make([]openCodeUsageStep, openCodeUsageMaxSeenSteps+10)
+	for i := range managedSteps {
+		managedSteps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("ses_managed", fmt.Sprint(i)), AtMs: clock.ms(0), Input: 1}
+	}
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		return true, mergeOpenCodeUsageSteps(ledger, "managed_fp", managedSteps)
+	})
+
+	afterManaged := loadOpenCodeUsageLedger()
+	if afterManaged.DirectCursor.RewindFloorMs != cursor0.ThroughMs {
+		t.Fatalf("rewindFloorMs = %d, want cursor0.ThroughMs %d", afterManaged.DirectCursor.RewindFloorMs, cursor0.ThroughMs)
+	}
+
+	// Next store change: 1 minute later, user runs OpenCode directly again.
+	clock.now = clock.now.Add(time.Minute)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_direct_1", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{5, 0, 0}}})
+	scanOpenCodeDirect(t)
+
+	if got := floors[len(floors)-1]; got != cursor0.ThroughMs {
+		t.Fatalf("scan after managed capture read from %d, want cursor0.ThroughMs %d", got, cursor0.ThroughMs)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 15 {
+		t.Fatalf("bucket = %+v, want 15 tokens (10 + 5, no double count of msg_direct_0)", b)
+	}
+
+	cursor1 := loadOpenCodeUsageLedger().DirectCursor
+	if cursor1.RewindFloorMs != cursor1.ThroughMs {
+		t.Fatalf("cursor1.RewindFloorMs = %d, want cursor1.ThroughMs %d", cursor1.RewindFloorMs, cursor1.ThroughMs)
+	}
+}
+
+// When a single direct scan rolls seenSteps over, the new cursor sets its
+// RewindFloorMs to throughMs so a subsequent scan within the overlap does not
+// rewind before records whose keys rolled over.
+func TestOpenCodeDirect_DirectScanRollingSeenStepsOverSetsRewindFloor(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2051)
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		for i := 0; i < openCodeUsageMaxSeenSteps-2; i++ {
+			ledger.SeenSteps = append(ledger.SeenSteps, openCodeUsageStepKey("s", fmt.Sprint(i)))
+		}
+		return true, false
+	})
+
+	for i := 0; i < 5; i++ {
+		store.write(openCodeTestMessage{session: "ses_a", id: fmt.Sprintf("msg_%d", i), createdMs: clock.ms(time.Duration(i-5) * time.Minute), completedMs: clock.ms(time.Duration(i-5)*time.Minute + time.Second), steps: [][3]int64{{1, 0, 0}}})
+	}
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || c.RewindFloorMs != clock.ms(0) {
+		t.Fatalf("cursor = %+v, want RewindFloorMs = %d", c, clock.ms(0))
+	}
+}
+
 // More records, or more sessions, than the cap sharing one millisecond still
 // drain: the continuation saves how many it read at its cut time, so a resume
 // does not select the same capped prefix again.

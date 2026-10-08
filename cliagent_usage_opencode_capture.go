@@ -99,6 +99,11 @@ type openCodeUsageLedger struct {
 	OwnedEvictedMs int64                   `json:"ownedEvictedMs,omitempty"`
 	DirectCursor   *openCodeDirectCursor   `json:"directCursor,omitempty"`
 	DirectCoverage *openCodeDirectCoverage `json:"directCoverage,omitempty"`
+
+	// seenEvicted records that mergeOpenCodeUsageSteps evicted keys from
+	// seenSteps: the direct reader must not rewind before records whose dedup keys
+	// rolled over.
+	seenEvicted bool
 }
 
 // openCodeOwnedRun is one managed run's ownership window: the direct reader
@@ -528,6 +533,10 @@ func mergeOpenCodeUsageSteps(ledger *openCodeUsageLedger, fingerprint string, st
 	}
 	if n := len(ledger.SeenSteps); n > openCodeUsageMaxSeenSteps {
 		ledger.SeenSteps = append([]string(nil), ledger.SeenSteps[n-openCodeUsageMaxSeenSteps:]...)
+		ledger.seenEvicted = true
+		if c := ledger.DirectCursor; c != nil && c.ThroughMs > 0 {
+			c.RewindFloorMs = max(c.RewindFloorMs, c.ThroughMs)
+		}
 	}
 	capOpenCodeUsageBuckets(ledger)
 	return changed
