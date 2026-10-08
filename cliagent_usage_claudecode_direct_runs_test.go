@@ -280,6 +280,52 @@ func TestClaudeDirectRun_AdoptsADebtOnThePinnedCache(t *testing.T) {
 	requireNumericClaudeWindow(t, snap, claudeWindowFiveHour, end)
 }
 
+// A credential that is transiently unreadable when the tick adopts resolves no
+// account, so the attempt cannot scope the debt and books nothing. The debt
+// must stay adoptable: once the credential reads again, the next tick pays it.
+func TestClaudeDirectRun_ATransientIdentityFailureIsAdoptedAgain(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	credential := filepath.Join(configDir, ".credentials.json")
+	good := []byte(fmt.Sprintf(`{"account":"acct-A","claudeAiOauth":{"accessToken":%q,"refreshToken":"rt","subscriptionType":"max"}}`, probeTestToken))
+	if err := os.WriteFile(credential, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if currentClaudeAccountFingerprint() == "" {
+		t.Fatal("precondition: the fixture credential resolves no account")
+	}
+	end := time.Now()
+	if !claudeRunEndHookAt(end) {
+		t.Fatal("the hook did not owe the run")
+	}
+
+	if err := os.WriteFile(credential, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !adoptObservedClaudeRunDebt(end) {
+		t.Fatal("the tick did not attempt the hook's debt")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d with no readable credential, want none", got)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != end.UnixMilli() || snap.NextAttemptAtMs != 0 {
+		t.Fatalf("precondition: snap=%+v, want the debt standing with nothing booked", snap)
+	}
+
+	if err := os.WriteFile(credential, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !adoptObservedClaudeRunDebt(time.Now()) {
+		t.Fatal("the debt was latched by an attempt that could not scope it")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d after the credential recovered, want one", got)
+	}
+	requireNumericClaudeWindow(t, claudeCacheSnapshot(t, cache), claudeWindowFiveHour, end)
+}
+
 // An agent-owned debt the gate already knows about is not adopted a second
 // time: the run's own trigger pays it.
 func TestClaudeDirectRun_AnAgentOwnedDebtIsNotAdoptedAgain(t *testing.T) {

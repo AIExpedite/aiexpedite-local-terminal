@@ -227,9 +227,10 @@ renders the status line. So next to `statusLine` the agent registers a
 - **Skip rules:** an env credential is active (the run billed an account this
   card is not); `AIEXPEDITE_CLAUDE_RUN_OWNER=agent` is set
   (`prepareClaudeChildEnv` marks every `claude` child the agent spawns, which
-  books its own debt — a second owe would reset the request budget); or a
-  status-line reading for this account is at most 30 s old (an interactive exit
-  that just rendered fresh numbers).
+  books its own debt — a second owe would reset the request budget). A recent
+  status-line reading is not a skip rule: the cache is shared, so it may be
+  another session's and predate this run. A reading observed after the run's
+  end still settles the debt without a request (the attempt's coverage check).
 - **Cost bound:** at most one debt per instant, 4 requests per debt, 6 h
   age-out, the probe's 60 s floor, and a burst of runs coalesces into one debt:
   a loop of `claude -p` calls costs at most one OAuth usage request a minute per

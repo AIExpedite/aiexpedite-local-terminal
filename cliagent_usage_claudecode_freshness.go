@@ -254,33 +254,29 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 // A kill between the run's end and this write loses the debt. That is the same
 // accepted gap as a turn killed mid-flight, not a new one.
 func claudeOweRunRefresh(baseline time.Time) (fingerprint string, onDisk bool) {
-	return claudeOweRunRefreshScoped(baseline, true, nil)
+	return claudeOweRunRefreshScoped(baseline, true)
 }
 
 // claudeOweObservedRunRefresh is the owe for a run the agent did NOT spawn,
 // written from the short-lived SessionEnd hook process (claude_run_end_hook.go).
 //
-// It differs from claudeOweRunRefresh in two ways only — both go through
+// It differs from claudeOweRunRefresh in one way only — both go through
 // claudeOweRunRefreshScoped, so the scope guards and the monotonic,
-// budget-resetting rule cannot drift:
-//   - no armedForProbe check: that gate is armed only inside the resident agent,
-//     and the installer already keeps this hook out of settings.json whenever
-//     either opt-out is on;
-//   - a status-line reading at most claudeRunEndStatusLineCover before the run
-//     ended stands in for the refresh, judged under the same lock as the write.
+// budget-resetting rule cannot drift: there is no armedForProbe check, because
+// that gate is armed only inside the resident agent, and the installer already
+// keeps this hook out of settings.json whenever either opt-out is on.
 //
 // The write takes the ordinary best-effort cache locks; on contention it is
 // dropped silently, because the run is still reached by the next gather's
 // staleness TTL. Reports whether a debt at or after `end` is on disk.
 func claudeOweObservedRunRefresh(end time.Time) bool {
-	_, onDisk := claudeOweRunRefreshScoped(end, false, claudeStatusLineCoversRunEnd(end))
+	_, onDisk := claudeOweRunRefreshScoped(end, false)
 	return onDisk
 }
 
 // claudeOweRunRefreshScoped is the shared owe. `requireArmed` refuses when the
-// probe is not armed in this process; `covered`, when non-nil, is consulted on
-// the locked snapshot and skips the owe when it reports true.
-func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool, covered func(*claudeRateLimitSnapshot) bool) (fingerprint string, onDisk bool) {
+// probe is not armed in this process.
+func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
 		return "", false
 	}
@@ -326,9 +322,6 @@ func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool, covered fu
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
 				onDisk = true
-				return false
-			}
-			if covered != nil && covered(snap) {
 				return false
 			}
 			snap.RefreshOwedAtMs = baselineMs
@@ -426,13 +419,23 @@ func adoptObservedClaudeRunDebt(now time.Time) bool {
 	if adopt == 0 {
 		return false
 	}
+	// The latch advances only once the attempt has matched the cache's account
+	// scope, i.e. it settled, retired, re-armed or refused the debt (each of
+	// which books what follows). An attempt that could not name the account — a
+	// transiently unreadable credential file or Keychain resolving an empty
+	// fingerprint — books nothing, so the debt stays adoptable and the next tick
+	// retries it once the credential reads again.
+	scoped := false
+	claudeRunDebtAttemptScopedAt(now, claudeDebtTriggerObserved, &scoped)
+	if !scoped {
+		return true
+	}
 	claudeObservedDebtAdoption.mu.Lock()
 	if adopt > claudeObservedDebtAdoption.lastMs {
 		claudeObservedDebtAdoption.lastMs = adopt
 	}
 	claudeObservedDebtAdoption.mu.Unlock()
 	fmt.Printf("%s[claude-usage] observed run refresh adopted%s\n", colorCyan, colorReset)
-	claudeRunDebtAttemptAt(now, claudeDebtTriggerObserved)
 	return true
 }
 
@@ -871,6 +874,14 @@ func payOwedClaudeUsageRefreshAt(now time.Time) {
 // reserve one budget slot DURABLY; attempt; refund the slot if nothing was sent;
 // book the rung the result calls for.
 func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeProbeResult {
+	return claudeRunDebtAttemptScopedAt(now, trigger, nil)
+}
+
+// claudeRunDebtAttemptScopedAt is claudeRunDebtAttemptAt that also sets
+// *scoped (when non-nil) once the resolved identity matched the cache's account
+// scope — past that point every exit settles, retires, re-arms or books a rung
+// for the debt. adoptObservedClaudeRunDebt keys its latch on it.
+func claudeRunDebtAttemptScopedAt(now time.Time, trigger claudeRunDebtTrigger, scoped *bool) claudeProbeResult {
 	path := claudeRateLimitCachePath()
 
 	// ONE credential read, resolved ONCE, for both halves of this replay: the
@@ -933,6 +944,9 @@ func claudeRunDebtAttemptAt(now time.Time, trigger claudeRunDebtTrigger) claudeP
 		// No cache, or one belonging to an account this device is no longer
 		// signed in to. Either way there is nothing this process may pay.
 		return claudeProbeResult{}
+	}
+	if scoped != nil {
+		*scoped = true
 	}
 
 	// A hold stamped further ahead than a Retry-After could legitimately reach is

@@ -22,9 +22,14 @@
 //   - an env credential is active: the run billed an account this card is not;
 //   - AIEXPEDITE_CLAUDE_RUN_OWNER=agent: the agent spawned this run and books
 //     its debt itself — owing again at a later instant would reset the debt's
-//     request budget on every agent-run turn;
-//   - a status-line reading at most claudeRunEndStatusLineCover old: an
-//     interactive session that just rendered fresh numbers needs no request.
+//     request budget on every agent-run turn.
+//
+// A recent status-line reading is deliberately NOT a skip rule: the cache is
+// shared by every Claude process on the machine, so the reading may come from
+// another interactive session and predate this run's own usage (a controller's
+// `claude -p` ending seconds after an open session re-rendered). The debt is
+// owed regardless; the attempt's coverage pre-check still settles it without a
+// request once a reading observed after the run's end lands.
 //
 // Redaction: the hook payload on stdin (session id, transcript path, cwd,
 // reason) is drained and discarded unparsed; nothing is printed or logged, and
@@ -45,9 +50,6 @@ const (
 	// (prepareClaudeChildEnv); claudeRunOwnerAgent is its one value.
 	claudeRunOwnerEnv   = "AIEXPEDITE_CLAUDE_RUN_OWNER"
 	claudeRunOwnerAgent = "agent"
-	// claudeRunEndStatusLineCover is how recent a status-line reading must be to
-	// stand in for the refresh this run would otherwise owe.
-	claudeRunEndStatusLineCover = 30 * time.Second
 	// maxRunEndHookStdin caps the drain: the SessionEnd payload is a few hundred
 	// bytes, and reading it only keeps Claude's write from hitting a closed pipe.
 	maxRunEndHookStdin = 64 << 10
@@ -66,22 +68,4 @@ func claudeRunEndHookAt(now time.Time) bool {
 		return false
 	}
 	return claudeOweObservedRunRefresh(now)
-}
-
-// claudeStatusLineCoversRunEnd reports whether snap already holds a
-// status-line reading observed at most claudeRunEndStatusLineCover before
-// `end`. Evaluated on the snapshot the owe is about to write, under the cache
-// lock, so the answer and the write describe the same file — and only after the
-// mutation has applied its account-scope rules, so the reading is this
-// account's.
-func claudeStatusLineCoversRunEnd(end time.Time) func(*claudeRateLimitSnapshot) bool {
-	floorMs := end.Add(-claudeRunEndStatusLineCover).UnixMilli()
-	return func(snap *claudeRateLimitSnapshot) bool {
-		for _, b := range snap.Buckets {
-			if b.Source == claudeRateLimitSourceStatusLine && b.hasObservedUsage() && b.ObservedAtMs >= floorMs {
-				return true
-			}
-		}
-		return false
-	}
 }

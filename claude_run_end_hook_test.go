@@ -68,12 +68,6 @@ func TestClaudeRunEndHook_SkipRules(t *testing.T) {
 		{"agent-owned run", func(t *testing.T, _ string, _ time.Time) {
 			t.Setenv(claudeRunOwnerEnv, claudeRunOwnerAgent)
 		}},
-		{"status-line reading 30 s old", func(t *testing.T, cache string, end time.Time) {
-			seedClaudeStatusLineReading(t, cache, end.Add(-claudeRunEndStatusLineCover))
-		}},
-		{"status-line reading just now", func(t *testing.T, cache string, end time.Time) {
-			seedClaudeStatusLineReading(t, cache, end)
-		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -90,13 +84,18 @@ func TestClaudeRunEndHook_SkipRules(t *testing.T) {
 	}
 }
 
-func TestClaudeRunEndHook_OwesPastTheStatusLineCover(t *testing.T) {
+// The cache is shared by every Claude process, so no existing reading — not
+// even a status-line row rendered at the very instant this run ended — proves
+// it covers THIS run's usage: it may be another session's. The hook owes
+// regardless; the attempt's coverage pre-check settles it for free once a
+// reading observed after the run's end lands.
+func TestClaudeRunEndHook_OwesDespiteAnExistingReading(t *testing.T) {
 	cases := []struct {
 		name string
 		seed func(t *testing.T, cache string, end time.Time)
 	}{
-		{"status-line reading 31 s old", func(t *testing.T, cache string, end time.Time) {
-			seedClaudeStatusLineReading(t, cache, end.Add(-claudeRunEndStatusLineCover-time.Second))
+		{"another session's status-line reading just now", func(t *testing.T, cache string, end time.Time) {
+			seedClaudeStatusLineReading(t, cache, end)
 		}},
 		{"only a probe reading", func(t *testing.T, cache string, end time.Time) {
 			mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
@@ -115,7 +114,7 @@ func TestClaudeRunEndHook_OwesPastTheStatusLineCover(t *testing.T) {
 			end := time.Now()
 			tc.seed(t, cache, end)
 			if !claudeRunEndHookAt(end) {
-				t.Fatal("the hook skipped a run no fresh status-line reading covers")
+				t.Fatal("the hook let an existing reading stand in for this run's refresh")
 			}
 			if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs != end.UnixMilli() {
 				t.Fatalf("snap=%+v, want a debt at the run's end", snap)
