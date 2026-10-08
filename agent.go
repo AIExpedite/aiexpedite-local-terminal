@@ -226,6 +226,8 @@ func StartAgent(cfg *Config) {
 		// opt-outs: the status-line one above removed it already, the probe one
 		// removes it here.
 		switch changed, err := applyClaudeRunEndHook(hookHome, !cfg.DisableClaudeUsageProbe); {
+		case err != nil && cfg.DisableClaudeUsageProbe:
+			fmt.Printf("%s[claude-run-end] could not remove%s\n", colorYellow, colorReset)
 		case err != nil:
 			fmt.Printf("%s[claude-run-end] could not install%s\n", colorYellow, colorReset)
 		case changed && cfg.DisableClaudeUsageProbe:

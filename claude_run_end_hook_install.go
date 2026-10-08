@@ -7,10 +7,11 @@
 //	"hooks": { "SessionEnd": [ { "hooks": [ { "type": "command",
 //	  "command": "<ours> claude-run-end-hook", "timeout": 10 } ] } ] }
 //
-// Every other hook group, event and settings key is preserved (each round-trips
-// as json.RawMessage, re-encoded compactly as the status-line installer does). Install re-points a stale binary path
-// in place and never adds a second group; remove deletes only our group, then
-// an emptied SessionEnd array, then an emptied hooks object. A settings.json
+// Every other hook group, event and settings key is preserved: each
+// round-trips as json.RawMessage, re-encoded compactly as the status-line
+// installer does. Install re-points a stale binary path in place and never
+// adds a second group; remove deletes only our group, then an emptied
+// SessionEnd array, then an emptied hooks object. A settings.json
 // that does not parse is never written — the same rule the status-line
 // installer follows.
 package main
