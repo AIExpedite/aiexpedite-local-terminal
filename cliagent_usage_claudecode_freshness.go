@@ -339,6 +339,14 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string,
 	if want != nil && fingerprint != *want {
 		return fingerprint, false
 	}
+	// An empty required scope is the accountless login only when the credential
+	// actually read: a failed read also yields "", and with no own cache (or an
+	// unscoped one) the mutation's unscoping guard has nothing to refuse, so the
+	// transfer would clear the pinned source and leave a debt the recovered
+	// fingerprint never pays.
+	if want != nil && *want == "" && !resolved {
+		return fingerprint, false
+	}
 	// A credential read that transiently FAILS (a macOS Keychain timeout, a config
 	// dir not yet readable) resolves to exactly the same "" a genuine accountless
 	// claude.ai login does, and mutateClaudeRateLimitSnapshot cannot tell the two

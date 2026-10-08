@@ -552,6 +552,32 @@ func TestClaudeDirectRun_APinnedAccountlessDebtIsNotTransferredOnAnUnreadableCre
 	}
 }
 
+// The same unreadable credential with NO own cache: the unscoping guard has no
+// scope to protect, so only the owe's own resolution check stands between a
+// failed read and a debt written under "" that the recovered fingerprint never
+// pays.
+func TestClaudeDirectRun_AnAccountlessDebtIsNotOwedIntoAnAbsentCacheOnAnUnreadableCredential(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	_ = os.Remove(cache)
+	if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want an unreadable credential", fp, resolved)
+	}
+	end := time.Now()
+
+	if claudeOweTransferredRunRefresh(end, "", 0) {
+		t.Fatal("an unconfirmed empty scope was owed into the own cache")
+	}
+	if own, ok := loadClaudeRateLimitSnapshot(cache); ok && own.RefreshOwedAtMs == end.UnixMilli() {
+		t.Fatal("the debt reached the own cache on an unreadable credential")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d, want none", got)
+	}
+}
+
 // A pinned debt owed under the accountless claude.ai login has the empty scope.
 // That is a real account scope, not "no requirement": once a fingerprinted
 // account is signed in, the transfer's owe must refuse it rather than write the
