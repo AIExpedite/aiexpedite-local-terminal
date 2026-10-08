@@ -131,18 +131,23 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // read, so entries sharing that millisecond cannot refill the cap forever.
 // RecordFloorMs is an AtSession continuation's record floor: the sessions it
 // has not listed yet are read from the floor the capped scan used, since their
-// messages can predate their session's own last write. RewindFloorMs is the end
+// messages can predate their session's own last write. SessionSinceMs is a
+// record continuation's session listing floor: the one the capped scan listed
+// sessions from, kept while it drains, since a session listed then can still
+// hold unread records rewritten after the cut while its own last write sits
+// before the cut's slack. RewindFloorMs is the end
 // of the last drained backlog: a later scan's overlap does not reach before
 // it, because a backlog larger than a scan's cap can roll seenSteps over, and
 // the keys of the records it read are then no longer there to absorb a re-read.
 type openCodeDirectCursor struct {
-	Layout        string `json:"layout"`
-	ThroughMs     int64  `json:"throughMs"`
-	Continue      bool   `json:"continue,omitempty"`
-	AtSession     bool   `json:"atSession,omitempty"`
-	Skip          int    `json:"skip,omitempty"`
-	RecordFloorMs int64  `json:"recordFloorMs,omitempty"`
-	RewindFloorMs int64  `json:"rewindFloorMs,omitempty"`
+	Layout         string `json:"layout"`
+	ThroughMs      int64  `json:"throughMs"`
+	Continue       bool   `json:"continue,omitempty"`
+	AtSession      bool   `json:"atSession,omitempty"`
+	Skip           int    `json:"skip,omitempty"`
+	RecordFloorMs  int64  `json:"recordFloorMs,omitempty"`
+	SessionSinceMs int64  `json:"sessionSinceMs,omitempty"`
+	RewindFloorMs  int64  `json:"rewindFloorMs,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the

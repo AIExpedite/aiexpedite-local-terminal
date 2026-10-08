@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,7 +186,7 @@ func TestOpenCodeDirectJSON_AListingErrorIsNotAnEmptyDirectory(t *testing.T) {
 		}
 	}
 
-	if err := eachOpenCodeDirectEntry(context.Background(), filepath.Join(root, "missing"), 0, func(os.DirEntry) {}); err != nil {
+	if err := eachOpenCodeDirectEntry(context.Background(), filepath.Join(root, "missing"), 0, func(os.DirEntry) error { return nil }); err != nil {
 		t.Fatalf("a missing directory = %v", err)
 	}
 
@@ -211,6 +212,68 @@ func TestOpenCodeDirectJSON_AListingErrorIsNotAnEmptyDirectory(t *testing.T) {
 		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
 		if err != nil || len(read.Messages) != 0 || !read.Truncated || read.AtSession {
 			t.Fatalf("a part listing that failed = %+v, %v", read, err)
+		}
+	})
+}
+
+// An entry whose metadata cannot be read fails its listing like an unreadable
+// directory, rather than dropping the entry and letting the cursor pass it; an
+// entry removed since the listing is simply gone.
+func TestOpenCodeDirectJSON_AnEntryMetadataErrorFailsTheListing(t *testing.T) {
+	root := t.TempDir()
+	store := &openCodeTestStore{t: t, root: root}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: base, completedMs: base + 500, steps: [][3]int64{{3, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_b", id: "msg_b", createdMs: base + 1000, completedMs: base + 1500, steps: [][3]int64{{4, 0, 0}}})
+	for session, atMs := range map[string]int64{"ses_a": base + 500, "ses_b": base + 1500} {
+		at := time.UnixMilli(atMs)
+		if err := os.Chtimes(filepath.Join(root, "storage", "message", session), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	failInfo := func(t *testing.T, name string, err error) {
+		prev := openCodeDirectEntryInfo
+		openCodeDirectEntryInfo = func(e os.DirEntry) (fs.FileInfo, error) {
+			if e.Name() == name {
+				if errors.Is(err, fs.ErrNotExist) {
+					return nil, nil
+				}
+				return nil, err
+			}
+			return prev(e)
+		}
+		t.Cleanup(func() { openCodeDirectEntryInfo = prev })
+	}
+
+	t.Run("session root", func(t *testing.T) {
+		failInfo(t, "ses_a", os.ErrPermission)
+		if _, _, ok := openCodeStoreMarker(context.Background(), openCodeStoreLayoutJSON, root); ok {
+			t.Fatal("a marker missing a session's metadata reports complete")
+		}
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if !errors.Is(err, os.ErrPermission) || len(read.Messages) != 0 {
+			t.Fatalf("a root listing missing a session's metadata = %+v, %v", read, err)
+		}
+	})
+	t.Run("session", func(t *testing.T) {
+		failInfo(t, "msg_b.json", os.ErrPermission)
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if err != nil || len(read.Messages) != 1 || read.Messages[0].ID != "msg_a" || !read.Truncated || !read.AtSession || read.ThroughMs != base+1500 {
+			t.Fatalf("a session listing missing a record's metadata = %+v, %v", read, err)
+		}
+	})
+	t.Run("parts", func(t *testing.T) {
+		failInfo(t, "prt_msg_a_0.json", os.ErrPermission)
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if err != nil || len(read.Messages) != 0 || !read.Truncated || read.AtSession {
+			t.Fatalf("a part listing missing a part's metadata = %+v, %v", read, err)
+		}
+	})
+	t.Run("removed", func(t *testing.T) {
+		failInfo(t, "ses_a", fs.ErrNotExist)
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if err != nil || read.Truncated || len(read.Messages) != 1 || read.Messages[0].ID != "msg_b" {
+			t.Fatalf("a session removed since the listing = %+v, %v", read, err)
 		}
 	})
 }

@@ -578,6 +578,35 @@ func TestOpenCodeDirect_ASessionContinuationKeepsTheRecordFloor(t *testing.T) {
 	}
 }
 
+// A record continuation keeps listing sessions from the capped scan's session
+// floor: a session listed then, whose directory was last written well before
+// the cut, still holds a message rewritten in place after it, and recomputing
+// the floor from the cut would drop that session and its unread message.
+func TestOpenCodeDirect_ARecordContinuationKeepsTheSessionFloor(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2052)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_0", createdMs: clock.ms(-16 * time.Minute), completedMs: clock.ms(-15 * time.Minute), steps: [][3]int64{{1, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_1", createdMs: clock.ms(-16 * time.Minute), completedMs: clock.ms(-5 * time.Minute), steps: [][3]int64{{100, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_b", id: "msg_b", createdMs: clock.ms(-15 * time.Minute), completedMs: clock.ms(-14 * time.Minute), steps: [][3]int64{{10, 0, 0}}})
+	dirTimes := map[string]int64{"ses_a": clock.ms(-20 * time.Minute), "ses_b": clock.ms(-14 * time.Minute)}
+	for session, at := range dirTimes {
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", session), time.UnixMilli(at), time.UnixMilli(at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxRecords = 1
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || !c.Continue || c.AtSession || c.ThroughMs != clock.ms(-14*time.Minute) || c.SessionSinceMs > dirTimes["ses_a"] {
+		t.Fatalf("record-capped cursor = %+v, want the capped scan's session floor kept", c)
+	}
+	for i := 0; i < 3; i++ {
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 111 {
+		t.Fatalf("bucket = %+v, want the message rewritten in an older session counted", b)
+	}
+}
+
 // When the session cap cuts first and the record cap cuts later in the same
 // read, the cursor resumes the way the earliest cut stopped — by session, with
 // the record floor — so the unread sessions' earlier messages are still

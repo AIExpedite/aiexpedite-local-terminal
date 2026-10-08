@@ -72,17 +72,18 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 	// Sessions are read in last-write order, so the root must be listed whole
 	// before any is read: a root the budget or a listing error cannot list
 	// reads nothing, and the scan fails without moving the cursor.
-	rootErr := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
+	rootErr := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) error {
 		if !e.IsDir() || !isValidOpenCodeSessionID(e.Name()) {
-			return
+			return nil
 		}
-		info, err := e.Info()
-		if err != nil {
-			return
+		info, err := openCodeDirectEntryInfo(e)
+		if info == nil {
+			return err
 		}
 		if at := info.ModTime().UnixMilli(); at >= sinceMs {
 			sessions = append(sessions, sessionDir{name: e.Name(), at: at})
 		}
+		return nil
 	})
 	if rootErr != nil {
 		return read, rootErr
@@ -105,17 +106,18 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 	for _, s := range sessions {
 		dir := filepath.Join(messageRoot, s.name)
 		listed := len(files)
-		err := eachOpenCodeDirectEntry(ctx, dir, 0, func(n os.DirEntry) {
+		err := eachOpenCodeDirectEntry(ctx, dir, 0, func(n os.DirEntry) error {
 			if n.IsDir() || !strings.HasSuffix(n.Name(), ".json") {
-				return
+				return nil
 			}
-			info, err := n.Info()
-			if err != nil {
-				return
+			info, err := openCodeDirectEntryInfo(n)
+			if info == nil {
+				return err
 			}
 			if at := info.ModTime().UnixMilli(); at >= floorMs {
 				files = append(files, openCodeDirectJSONFile{path: filepath.Join(dir, n.Name()), session: s.name, at: at, size: info.Size()})
 			}
+			return nil
 		})
 		if err != nil {
 			// The budget ran out, or a listing error struck, before this
@@ -217,17 +219,18 @@ func dropOpenCodeDirectRead[T any](list []T, skip openCodeDirectSkip, at func(T)
 // its budget; ok is false when the deadline or a listing error stopped the
 // read, never a subtotal of the parts that happened to list.
 func readOpenCodeDirectJSONParts(ctx context.Context, dir string) (parts []openCodeExportPart, ok bool) {
-	err := eachOpenCodeDirectEntry(ctx, dir, openCodeDirectMaxPartsPerMessage, func(e os.DirEntry) {
+	err := eachOpenCodeDirectEntry(ctx, dir, openCodeDirectMaxPartsPerMessage, func(e os.DirEntry) error {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			return
+			return nil
 		}
-		if info, err := e.Info(); err != nil || info.Size() > openCodeDirectMaxPartBytes {
-			return
+		if info, err := openCodeDirectEntryInfo(e); info == nil || info.Size() > openCodeDirectMaxPartBytes {
+			return err
 		}
 		var part openCodeExportPart
 		if readJSONFileWithin(filepath.Join(dir, e.Name()), openCodeDirectMaxPartBytes, &part) && isOpenCodeStepFinishType(part.Type) {
 			parts = append(parts, part)
 		}
+		return nil
 	})
 	if err != nil {
 		return nil, false
@@ -238,6 +241,18 @@ func readOpenCodeDirectJSONParts(ctx context.Context, dir string) (parts []openC
 // openCodeDirectOpenDir opens a directory for listing; a seam for tests.
 var openCodeDirectOpenDir = os.Open
 
+// openCodeDirectEntryInfo is a listed entry's metadata, or nil. An entry removed
+// since the listing is simply gone (nil, nil); any other failure is returned,
+// so the listing fails like an unreadable directory instead of silently
+// dropping an entry the cursor would then move past.
+var openCodeDirectEntryInfo = func(e os.DirEntry) (fs.FileInfo, error) {
+	info, err := e.Info()
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return info, err
+}
+
 // eachOpenCodeDirectEntry lists dir in batches and calls fn for each entry, up
 // to limit entries (0 for no limit). The scan's deadline is checked before each
 // batch and each entry, so a directory of any size cannot run the scan past its
@@ -245,8 +260,9 @@ var openCodeDirectOpenDir = os.Open
 // not exist lists nothing. err is the deadline's when it stopped the listing,
 // or the open or read error when the directory exists but could not be listed
 // whole: a permission, sharing or I/O failure is never read as an empty
-// directory, which would move the cursor past records it never saw.
-func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func(os.DirEntry)) error {
+// directory, which would move the cursor past records it never saw. An error fn
+// returns stops the listing the same way.
+func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func(os.DirEntry) error) error {
 	d, err := openCodeDirectOpenDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -272,7 +288,9 @@ func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			fn(e)
+			if err := fn(e); err != nil {
+				return err
+			}
 		}
 		listed += len(entries)
 		if err != nil || len(entries) == 0 {

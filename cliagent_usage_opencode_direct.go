@@ -109,6 +109,9 @@ type openCodeDirectLimits struct {
 	// would re-list the same capped sessions forever; their records are still
 	// read from the capped scan's own floor.
 	ExactSessions bool
+	// SessionSinceMs, when set, is the exact session listing floor of a record
+	// continuation: the one the capped scan it drains listed sessions from.
+	SessionSinceMs int64
 	// Skip is a continuation's tie-breaker: the entries the capped scan read at
 	// its cut time — sessions when ExactSessions, records otherwise.
 	Skip openCodeDirectSkip
@@ -171,6 +174,9 @@ func (t openCodeDirectTies) through(ms int64) int {
 // sessionsSinceMs is the oldest session last write a read from floorMs lists,
 // less the slack: a session's last write can precede its last message's.
 func (l openCodeDirectLimits) sessionsSinceMs(floorMs int64) int64 {
+	if l.SessionSinceMs > 0 {
+		return l.SessionSinceMs
+	}
 	if l.ExactSessions {
 		if l.SessionFloorMs > 0 {
 			return l.SessionFloorMs
@@ -370,14 +376,16 @@ func openCodeStoreMarker(ctx context.Context, layout, root string) (marker strin
 			return layout + "|-", changedAt, true
 		}
 		dirs := 0
-		err := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
+		err := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) error {
 			if !e.IsDir() {
-				return
+				return nil
 			}
 			dirs++
-			if info, err := e.Info(); err == nil && info.ModTime().After(changedAt) {
+			info, err := openCodeDirectEntryInfo(e)
+			if info != nil && info.ModTime().After(changedAt) {
 				changedAt = info.ModTime()
 			}
+			return err
 		})
 		return fmt.Sprintf("%s|%d|%d", layout, dirs, changedAt.UnixNano()), changedAt, err == nil
 	}
@@ -410,6 +418,8 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
 		if c.AtSession {
 			limits.SessionFloorMs = c.ThroughMs
+		} else {
+			limits.SessionSinceMs = c.SessionSinceMs
 		}
 	}
 	result, err := read(ctx, root, floorMs, limits)
@@ -443,6 +453,12 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 			if result.AtSession {
 				cursor.RecordFloorMs = floorMs
 			}
+		}
+		if cursor.Continue && !cursor.AtSession {
+			// A record continuation keeps listing sessions from where the capped
+			// scan did: recomputed from the cut, the floor would drop a listed
+			// session whose unread records were rewritten after the cut.
+			cursor.SessionSinceMs = limits.sessionsSinceMs(floorMs)
 		}
 		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, result.Truncated, throughMs)
 		ledger.DirectCursor = cursor
