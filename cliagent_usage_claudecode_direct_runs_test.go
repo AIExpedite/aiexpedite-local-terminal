@@ -581,8 +581,8 @@ func TestClaudeDirectRun_APinnedDebtSurvivesATransferInterruptedAfterItsClaim(t 
 	end := time.Now()
 	seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
 
-	leaseMs := int64(0)
-	if !mutateClaudeRateLimitSnapshotScoped(pinned, fp, []string{fp}, claimClaudePinnedObservedDebt(end.UnixMilli(), &leaseMs)) {
+	var claim claudePinnedDebtClaim
+	if !mutateClaudeRateLimitSnapshotScoped(pinned, fp, []string{fp}, claimClaudePinnedObservedDebt(end.UnixMilli(), &claim)) {
 		t.Fatal("precondition: the claim did not write the pinned cache")
 	}
 	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() {
@@ -751,4 +751,155 @@ func TestClaudePinnedCacheCandidates_SkipTheOwnCacheThroughAnAlias(t *testing.T)
 	if got := claudePinnedCacheCandidates(home); len(got) != 1 || got[0] != other {
 		t.Fatalf("candidates=%q, want only %q (the own cache's aliases excluded)", got, other)
 	}
+}
+
+// Dual channel, owner gone mid-payment: the channel that owns the pinned cache
+// charged an attempt or booked a rung, then exited. Once its rung (or the
+// lease of its last attempt) is past the abandonment slack, this channel takes
+// the debt over, with the requests it already cost, and pays it.
+func TestClaudeDirectRun_APinnedDebtItsOwnerAbandonedIsTakenOver(t *testing.T) {
+	cases := map[string]func(*claudeRateLimitSnapshot, time.Time){
+		"rung lapsed": func(snap *claudeRateLimitSnapshot, now time.Time) {
+			snap.RefreshOwedAttempts = 2
+			snap.NextAttemptAtMs = now.Add(-claudePinnedDebtAbandonedAfter - time.Second).UnixMilli()
+		},
+		"lease lapsed": func(snap *claudeRateLimitSnapshot, now time.Time) {
+			snap.RefreshOwedAttempts = 2
+			snap.AttemptClaimedUntilMs = now.Add(-claudePinnedDebtAbandonedAfter - time.Second).UnixMilli()
+		},
+	}
+	for name, ownerTouch := range cases {
+		t.Run(name, func(t *testing.T) {
+			cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+			fp := currentClaudeAccountFingerprint()
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			pinned := pinOtherChannelCache(t)
+			now := time.Now()
+			end := now.Add(-10 * time.Minute)
+			seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+			if !mutateClaudeRateLimitSnapshot(pinned, fp, func(snap *claudeRateLimitSnapshot) bool {
+				ownerTouch(snap, now)
+				return true
+			}) {
+				t.Fatal("seeding the owner's attempt did not write the pinned cache")
+			}
+
+			own, haveOwn := loadClaudeRateLimitSnapshot(cache)
+			if got := transferClaudePinnedObservedDebt(own, haveOwn, 0, now); got != end.UnixMilli() {
+				t.Fatalf("transferred=%d, want the abandoned debt at %d taken over", got, end.UnixMilli())
+			}
+			if o := claudeCacheSnapshot(t, cache); o.RefreshOwedAtMs != end.UnixMilli() || o.RefreshOwedAttempts != 2 || o.NextAttemptAtMs != 0 {
+				t.Fatalf("own snap=%+v, want the debt due with its 2 spent requests kept", o)
+			}
+			if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != 0 || p.AttemptClaimedUntilMs != 0 {
+				t.Fatalf("pinned snap=%+v, want the debt moved off it", p)
+			}
+			if !adoptObservedClaudeRunDebt(now) {
+				t.Fatal("the taken-over debt was not attempted")
+			}
+			claudeFreshnessWaitIdle(t)
+			if got := atomic.LoadInt64(calls); got != 1 {
+				t.Fatalf("requests=%d, want one", got)
+			}
+			requireNumericClaudeWindow(t, claudeCacheSnapshot(t, cache), claudeWindowFiveHour, end)
+		})
+	}
+}
+
+// A takeover never refills the budget: a debt that already cost all but its
+// last request has exactly that one left on the own cache.
+func TestClaudeDirectRun_ATakenOverDebtKeepsItsSpentBudget(t *testing.T) {
+	cache, _ := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinOtherChannelCache(t)
+	now := time.Now()
+	end := now.Add(-10 * time.Minute)
+	// Interrupted after the owe: the own copy already holds the instant with a
+	// smaller count than the pinned one.
+	seedClaudeRefreshDebt(t, cache, fp, end, 0, time.Time{})
+	seedClaudeRefreshDebt(t, pinned, fp, end, claudeRefreshOwedMaxRequests-1, time.Time{})
+	if !mutateClaudeRateLimitSnapshot(pinned, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = now.Add(-claudePinnedDebtAbandonedAfter - time.Second).UnixMilli()
+		return true
+	}) {
+		t.Fatal("seeding the owner's rung did not write the pinned cache")
+	}
+	own, haveOwn := loadClaudeRateLimitSnapshot(cache)
+	if got := transferClaudePinnedObservedDebt(own, haveOwn, 0, now); got != end.UnixMilli() {
+		t.Fatalf("transferred=%d, want %d", got, end.UnixMilli())
+	}
+	if o := claudeCacheSnapshot(t, cache); o.RefreshOwedAttempts != claudeRefreshOwedMaxRequests-1 {
+		t.Fatalf("own attempts=%d, want %d carried over", o.RefreshOwedAttempts, claudeRefreshOwedMaxRequests-1)
+	}
+}
+
+// A rung only just overdue is a live owner's timer about to fire, not an
+// abandoned debt: it stays with its owner.
+func TestClaudeDirectRun_APinnedDebtJustPastItsRungIsNotTakenOver(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	pinned := pinOtherChannelCache(t)
+	now := time.Now()
+	end := now.Add(-10 * time.Minute)
+	seedClaudeRefreshDebt(t, pinned, fp, end, 1, time.Time{})
+	if !mutateClaudeRateLimitSnapshot(pinned, fp, func(snap *claudeRateLimitSnapshot) bool {
+		snap.NextAttemptAtMs = now.Add(-claudePinnedDebtAbandonedAfter / 2).UnixMilli()
+		return true
+	}) {
+		t.Fatal("seeding the owner's rung did not write the pinned cache")
+	}
+	if adoptObservedClaudeRunDebt(now) {
+		t.Fatal("took over a debt whose owner may still be paying it")
+	}
+	claudeFreshnessWaitIdle(t)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d, want none", got)
+	}
+	if p := claudeCacheSnapshot(t, pinned); p.RefreshOwedAtMs != end.UnixMilli() || p.RefreshOwedAttempts != 1 {
+		t.Fatalf("pinned snap=%+v, want the owner's debt left standing", p)
+	}
+}
+
+// The hooks were pinned to an alias of the own cache when they were
+// re-pointed. A hook still running on the old settings commits through that
+// alias afterwards, and the commit's rename turns it into a file of its own:
+// the re-point must still have remembered it, so that debt is found and paid.
+func TestClaudeDirectRun_AnAliasRePointedAwayIsStillFoundOnceALateWriteSplitsIt(t *testing.T) {
+	cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+	fp := currentClaudeAccountFingerprint()
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	dir := t.TempDir()
+	alias := filepath.Join(dir, "sym.json")
+	if err := os.Symlink(cache, alias); err != nil {
+		alias = filepath.Join(dir, "hard.json")
+		if err := os.Link(cache, alias); err != nil {
+			t.Skip("this filesystem allows neither hard links nor symlinks")
+		}
+	}
+	settings := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json")
+	helperWriteJSON(t, settings, map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(alias) +
+				" '/opt/other/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	// The re-point: remembered, then settings.json names only the own cache.
+	rememberClaudeHookPinnedCaches("")
+	helperWriteJSON(t, settings, map[string]any{})
+	home, _ := os.UserHomeDir()
+	if got := claudePinnedCacheCandidates(home); len(got) != 0 {
+		t.Fatalf("candidates=%q, want the alias skipped while it is still the own cache", got)
+	}
+
+	// The late hook commits through the alias, splitting it off.
+	end := time.Now()
+	seedClaudeRefreshDebt(t, alias, fp, end, 0, time.Time{})
+	if sameClaudeCachePath(alias, cache) {
+		t.Fatal("precondition: the late write did not split the alias from the own cache")
+	}
+	requirePinnedDebtTransferredAndPaid(t, cache, alias, calls, end)
 }

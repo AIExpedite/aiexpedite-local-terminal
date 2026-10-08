@@ -285,20 +285,26 @@ func claudeOweObservedRunRefresh(end time.Time) bool {
 // new login; a second switch between the pinned read and this write must not
 // carry the debt onto a login whose run it was not. Reports whether a debt at
 // or after `baseline` is on disk under that account.
-func claudeOweTransferredRunRefresh(baseline time.Time, fingerprint string) bool {
-	_, onDisk := claudeOweRunRefreshFor(baseline, true, fingerprint)
+//
+// `spent` is the requests the debt already cost on the pinned cache (non-zero
+// only for a debt taken over from a channel that abandoned it,
+// claudePinnedDebtAbandoned). The own copy starts from that count, so moving a
+// debt between caches never refills its budget.
+func claudeOweTransferredRunRefresh(baseline time.Time, fingerprint string, spent int) bool {
+	_, onDisk := claudeOweRunRefreshFor(baseline, true, fingerprint, spent)
 	return onDisk
 }
 
 // claudeOweRunRefreshScoped is the shared owe. `requireArmed` refuses when the
 // probe is not armed in this process.
 func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool) (fingerprint string, onDisk bool) {
-	return claudeOweRunRefreshFor(baseline, requireArmed, "")
+	return claudeOweRunRefreshFor(baseline, requireArmed, "", 0)
 }
 
 // claudeOweRunRefreshFor is claudeOweRunRefreshScoped that, when `want` is not
-// empty, refuses unless the resolved account is `want`.
-func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string) (fingerprint string, onDisk bool) {
+// empty, refuses unless the resolved account is `want`. A debt it owes starts
+// with `spent` requests already charged (claudeOweTransferredRunRefresh).
+func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string, spent int) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
 		return "", false
 	}
@@ -347,13 +353,19 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want string) 
 		func(snap *claudeRateLimitSnapshot) bool {
 			if snap.RefreshOwedAtMs >= baselineMs {
 				onDisk = true
+				// The same run, already here from an interrupted transfer: it
+				// keeps the larger of the two counts, never a refilled budget.
+				if snap.RefreshOwedAtMs == baselineMs && snap.RefreshOwedAttempts < spent {
+					snap.RefreshOwedAttempts = spent
+					return true
+				}
 				return false
 			}
 			snap.RefreshOwedAtMs = baselineMs
 			// The instant genuinely advanced: a newer run is owed, so this debt
 			// gets its own budget, and is due at once rather than on the rung an
 			// older debt booked.
-			snap.RefreshOwedAttempts = 0
+			snap.RefreshOwedAttempts = spent
 			snap.NextAttemptAtMs = 0
 			return true
 		})
@@ -421,9 +433,11 @@ func resetClaudeObservedDebtAdoption() {
 // crash or refused write between them leaves the run owed nowhere:
 //
 //  1. claim: a claim lease on the pinned debt (claimClaudePinnedObservedDebt),
-//     only while no attempt there has touched it. The debt itself stays, so
-//     the owner's attempts stand down for the lease and nothing more.
-//  2. owe the same instant on the own cache.
+//     only while no attempt there has touched it, or the owner abandoned it
+//     part-paid (claudePinnedDebtAbandoned). The debt itself stays, so the
+//     owner's attempts stand down for the lease and nothing more.
+//  2. owe the same instant on the own cache, with the requests it already
+//     cost, so a takeover never refills its budget.
 //  3. finish: clear the pinned debt (finishClaudePinnedObservedDebt), or, when
 //     the own cache refused it, only release the lease.
 //
@@ -494,19 +508,19 @@ func claudeObservedDebtFloor() int64 {
 // returns the instant the own cache now holds, or zero when nothing moved.
 func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool, floor int64, now time.Time) int64 {
 	pinned, pinnedFp, pinnedMs := claudePinnedObservedDebt(own, haveOwn, now)
-	leaseMs := int64(0)
+	var claim claudePinnedDebtClaim
 	// The own debt only outranks a pinned one owed under the same account: after
 	// a switch the own cache's debt belongs to the login this device left.
 	sameScope := !haveOwn || pinnedFp == own.AccountFingerprint
 	if pinnedMs <= floor || (sameScope && pinnedMs < own.RefreshOwedAtMs) ||
-		!mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &leaseMs)) {
+		!mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &claim)) {
 		return 0
 	}
-	onDisk := claudeOweTransferredRunRefresh(time.UnixMilli(pinnedMs), pinnedFp)
+	onDisk := claudeOweTransferredRunRefresh(time.UnixMilli(pinnedMs), pinnedFp, claim.attempts)
 	// Refused, the own cache never took the debt, and releasing the lease
 	// hands it straight back to the channel that owns the pinned cache. A
 	// finish that loses its lock race only leaves the lease to lapse.
-	mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, finishClaudePinnedObservedDebt(pinnedMs, leaseMs, onDisk))
+	mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, finishClaudePinnedObservedDebt(pinnedMs, claim, onDisk))
 	if !onDisk {
 		return 0
 	}
@@ -573,12 +587,18 @@ const claudeDisplacedPinnedCachesMax = 4
 // adoption tick leaves the debt on its own cache, where the next process's
 // startup replay or adoption pays it. The memo still covers a hook that was
 // already running on the old settings and writes after the transfer.
+//
+// The memo compares spellings only, never file identity: a path that is a
+// symlink or hard link to the own cache today stops being one the moment a
+// late hook commits through it, because the commit renames a new file over
+// that directory entry. claudePinnedCacheCandidates applies the identity check
+// when it scans, so an alias is skipped only while it still is one.
 func rememberClaudeHookPinnedCaches(home string) {
 	own := claudeRateLimitCachePath()
 	pinned := []string{installedClaudeRateLimitCachePath(home), installedClaudeRunEndCachePath(home)}
 	claudeDisplacedPinnedCaches.mu.Lock()
 	for _, p := range pinned {
-		if p == "" || sameClaudeCachePath(p, own) || slices.ContainsFunc(claudeDisplacedPinnedCaches.paths, func(q string) bool { return sameClaudeCachePath(p, q) }) {
+		if p == "" || sameClaudeCachePathSpelling(p, own) || slices.ContainsFunc(claudeDisplacedPinnedCaches.paths, func(q string) bool { return sameClaudeCachePathSpelling(p, q) }) {
 			continue
 		}
 		claudeDisplacedPinnedCaches.paths = append(claudeDisplacedPinnedCaches.paths, p)
@@ -631,46 +651,94 @@ func claudePinnedCacheCandidates(home string) []string {
 // compared by identity; the lexical compare only decides for a missing file,
 // which holds no debt to lose.
 func sameClaudeCachePath(a, b string) bool {
-	a, b = filepath.Clean(filepath.FromSlash(a)), filepath.Clean(filepath.FromSlash(b))
-	if a == b || (runtime.GOOS == "windows" && strings.EqualFold(a, b)) {
+	if sameClaudeCachePathSpelling(a, b) {
 		return true
 	}
-	ai, aErr := os.Stat(a)
-	bi, bErr := os.Stat(b)
+	ai, aErr := os.Stat(filepath.FromSlash(a))
+	bi, bErr := os.Stat(filepath.FromSlash(b))
 	return aErr == nil && bErr == nil && os.SameFile(ai, bi)
+}
+
+// sameClaudeCachePathSpelling is the lexical half of sameClaudeCachePath:
+// separators, and case on Windows. Unlike file identity it cannot change when
+// a write replaces an alias with a file of its own.
+func sameClaudeCachePathSpelling(a, b string) bool {
+	a, b = filepath.Clean(filepath.FromSlash(a)), filepath.Clean(filepath.FromSlash(b))
+	return a == b || (runtime.GOOS == "windows" && strings.EqualFold(a, b))
+}
+
+// claudePinnedDebtAbandonedAfter is how long past its due point a pinned debt
+// the owning channel had started paying must sit untouched before another
+// channel takes it over (claudePinnedDebtAbandoned). A live owner's timer fires
+// at the rung and claims or re-books it within seconds, so this is pure slack.
+// A var so tests can pin it.
+var claudePinnedDebtAbandonedAfter = 2 * time.Minute
+
+// claudePinnedDebtAbandoned reports whether the channel that owns a pinned
+// cache started paying its debt and then went away: no claim lease is live,
+// and the rung it booked, or else the lease its last attempt took, lapsed more
+// than claudePinnedDebtAbandonedAfter ago. That owner was the only process
+// holding the debt's timer, and once the hooks are re-pointed nothing else is
+// bound to reopen its cache, so the run would wait for an unrelated gather or
+// the age-out.
+//
+// A charged debt with neither a rung nor a lease on record is the moment
+// between an owner's release and its next booking, or a booking the owner is
+// retrying in memory, and is never judged abandoned.
+func claudePinnedDebtAbandoned(snap *claudeRateLimitSnapshot, now time.Time) bool {
+	if _, live := claudeRunDebtLeaseLive(snap, now); live {
+		return false
+	}
+	due := snap.NextAttemptAtMs
+	if due == 0 && snap.RefreshOwedAttempts > 0 {
+		due = snap.AttemptClaimedUntilMs
+	}
+	return due != 0 && due <= now.Add(-claudePinnedDebtAbandonedAfter).UnixMilli()
+}
+
+// claudePinnedDebtClaim is what claimClaudePinnedObservedDebt took: the lease
+// it wrote, and the requests and rung the debt carried, which the owe keeps
+// and the finish matches.
+type claudePinnedDebtClaim struct {
+	leaseMs  int64
+	attempts int
+	rungMs   int64
 }
 
 // claimClaudePinnedObservedDebt puts a claim lease on the pinned cache's debt
 // at owedMs so this channel can carry it, ONLY while it is still exactly as the
-// hook wrote it: no request charged, no rung booked, no claim lease in flight.
-// Any of those means the channel that owns the pinned cache is already paying
-// it. The debt itself stays until finishClaudePinnedObservedDebt, so it is
-// never off both caches at once; the lease is what makes the owner's attempts
-// stand down meanwhile. On success *leaseMs is the lease written.
-func claimClaudePinnedObservedDebt(owedMs int64, leaseMs *int64) func(*claudeRateLimitSnapshot) bool {
+// hook wrote it (no request charged, no rung booked, no claim lease in flight)
+// or its owner abandoned it (claudePinnedDebtAbandoned). Anything else means
+// the channel that owns the pinned cache is paying it. The debt itself stays
+// until finishClaudePinnedObservedDebt, so it is never off both caches at
+// once; the lease is what makes the owner's attempts stand down meanwhile. On
+// success *claim is what was taken.
+func claimClaudePinnedObservedDebt(owedMs int64, claim *claudePinnedDebtClaim) func(*claudeRateLimitSnapshot) bool {
 	return func(snap *claudeRateLimitSnapshot) bool {
-		if snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs != 0 {
+		if snap.RefreshOwedAtMs != owedMs {
 			return false
 		}
 		now := time.Now()
-		if _, live := claudeRunDebtLeaseLive(snap, now); live {
+		untouched := snap.RefreshOwedAttempts == 0 && snap.NextAttemptAtMs == 0
+		if _, live := claudeRunDebtLeaseLive(snap, now); live || (!untouched && !claudePinnedDebtAbandoned(snap, now)) {
 			return false
 		}
-		*leaseMs = claudePublishRunDebtClaim(snap, now)
+		claim.attempts, claim.rungMs = snap.RefreshOwedAttempts, snap.NextAttemptAtMs
+		claim.leaseMs = claudePublishRunDebtClaim(snap, now)
 		return true
 	}
 }
 
 // finishClaudePinnedObservedDebt ends a transfer claimClaudePinnedObservedDebt
-// started: it releases the lease leaseMs and, once `transferred` (the own cache
-// holds the debt), clears the pinned debt, but only while that debt is still
-// untouched at owedMs and no other claim is live. A newer debt owed there
-// since, or one the owner began paying after the lease lapsed, is left alone.
-func finishClaudePinnedObservedDebt(owedMs, leaseMs int64, transferred bool) func(*claudeRateLimitSnapshot) bool {
-	release := releaseClaudeRunDebtClaim(leaseMs)
+// started: it releases the claim's lease and, once `transferred` (the own cache
+// holds the debt), clears the pinned debt, but only while that debt is still at
+// owedMs exactly as claimed and no other claim is live. A newer debt owed there
+// since, or one the owner went on paying after the lease lapsed, is left alone.
+func finishClaudePinnedObservedDebt(owedMs int64, claim claudePinnedDebtClaim, transferred bool) func(*claudeRateLimitSnapshot) bool {
+	release := releaseClaudeRunDebtClaim(claim.leaseMs)
 	return func(snap *claudeRateLimitSnapshot) bool {
 		changed := release(snap)
-		if !transferred || snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts != 0 || snap.NextAttemptAtMs != 0 {
+		if !transferred || snap.RefreshOwedAtMs != owedMs || snap.RefreshOwedAttempts != claim.attempts || snap.NextAttemptAtMs != claim.rungMs {
 			return changed
 		}
 		if _, live := claudeRunDebtLeaseLive(snap, time.Now()); live {
