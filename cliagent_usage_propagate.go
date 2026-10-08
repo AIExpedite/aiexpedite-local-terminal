@@ -843,7 +843,7 @@ func resetCLIUsagePropagator() {
 	p.rotating.Wait()
 	// A fallback that passed its stopped check before the stop finishes first.
 	p.fallbackRunning.Lock()
-	p.fallbackRunning.Unlock()
+	defer p.fallbackRunning.Unlock()
 	p.firing.Lock()
 	defer p.firing.Unlock()
 	p.mu.Lock()

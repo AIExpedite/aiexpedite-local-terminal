@@ -451,7 +451,7 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
 		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
-		if result.Truncated && throughMs == result.ThroughMs {
+		if result.Truncated && throughMs == result.ThroughMs && !pending && !held {
 			cursor.AtSession, cursor.Skip = result.AtSession, result.ThroughSkip
 			if result.AtSession {
 				cursor.RecordFloorMs = floorMs

@@ -1268,3 +1268,45 @@ func TestCLIUsageHint_OpenCodeTickPicksUpANewMessageAndHintsOnce(t *testing.T) {
 		t.Fatalf("hints = %+v, want exactly one OpenCode hint inside the spacing", hints)
 	}
 }
+
+// A queued fallback callback blocked on fallbackRunning does not run with the old
+// generation after resetCLIUsagePropagator returns.
+func TestCLIUsageHint_ResetHoldsFallbackBarrier(t *testing.T) {
+	resetCLIUsagePropagator()
+	p := cliUsagePropagator
+	p.fallbackGen = 42
+	oldGen := p.fallbackGen
+
+	started := make(chan struct{})
+	var ran atomic.Bool
+
+	p.fallbackRunning.Lock()
+	go func() {
+		close(started)
+		p.fallback(oldGen)
+		ran.Store(true)
+	}()
+
+	<-started
+	time.Sleep(10 * time.Millisecond)
+
+	resetDone := make(chan struct{})
+	go func() {
+		resetCLIUsagePropagator()
+		close(resetDone)
+	}()
+
+	select {
+	case <-resetDone:
+		t.Fatal("resetCLIUsagePropagator returned while fallbackRunning was held")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	p.fallbackRunning.Unlock()
+	<-resetDone
+
+	if p.fallbackGen <= oldGen {
+		t.Fatalf("fallbackGen = %d, want > %d", p.fallbackGen, oldGen)
+	}
+}
+

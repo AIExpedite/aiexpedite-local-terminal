@@ -1038,3 +1038,55 @@ func TestOpenCodeDirect_AnIdleScanSkipsTheLedgerRewrite(t *testing.T) {
 		t.Fatalf("bucket = %+v", b)
 	}
 }
+
+// A session cut whose selected session contains an incomplete message at the
+// cut timestamp is treated as a record continuation, so the next scan does not
+// skip the session and revisits the message once complete.
+func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinuation(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2062)
+	cut := clock.ms(-10 * time.Minute)
+	store.write(openCodeTestMessage{
+		session:     "ses_a",
+		id:          "msg_a_incomplete",
+		createdMs:   cut,
+		completedMs: 0,
+		steps:       [][3]int64{{42, 0, 0}},
+	})
+	store.write(openCodeTestMessage{
+		session:     "ses_b",
+		id:          "msg_b",
+		createdMs:   cut - 1000,
+		completedMs: cut,
+		steps:       [][3]int64{{10, 0, 0}},
+	})
+	for _, s := range []string{"ses_a", "ses_b"} {
+		if err := os.Chtimes(filepath.Join(store.root, "storage", "message", s), time.UnixMilli(cut), time.UnixMilli(cut)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	openCodeDirectMaxSessions = 1
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || !c.Continue {
+		t.Fatalf("cursor = %+v, want continuation", c)
+	}
+	if c.AtSession {
+		t.Fatalf("cursor.AtSession = true, want record continuation to revisit ses_a")
+	}
+	store.write(openCodeTestMessage{
+		session:     "ses_a",
+		id:          "msg_a_incomplete",
+		createdMs:   cut,
+		completedMs: cut + 500,
+		steps:       [][3]int64{{42, 0, 0}},
+	})
+	if err := os.Chtimes(filepath.Join(store.root, "storage", "message", "ses_a"), time.UnixMilli(cut), time.UnixMilli(cut)); err != nil {
+		t.Fatal(err)
+	}
+	openCodeDirectMaxSessions = 8192
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 52 {
+		t.Fatalf("bucket tokens = %d, want 52 (42 + 10)", b.tokens())
+	}
+}
+
