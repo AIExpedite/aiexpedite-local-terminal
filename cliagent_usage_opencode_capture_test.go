@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -447,5 +448,40 @@ func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T)
 	got = loadOpenCodeUsageLedger()
 	if len(got.Buckets) != 1 || got.Buckets[0].tokens() != 6 || got.OwnedRuns != nil || got.DirectCursor != nil || got.DirectCoverage != nil {
 		t.Fatalf("older ledger = %+v", got)
+	}
+}
+
+// A ledger filled to every cap still loads: one past the read bound would read
+// as EMPTY and drop today's buckets. The ledger has its own bound, not the
+// small-config one shared with other readers.
+func TestOpenCodeUsageLedger_AFullLedgerStillLoads(t *testing.T) {
+	openCodeUsageFixture(t, 1302)
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		for i := 0; i < openCodeUsageMaxSeenSteps; i++ {
+			ledger.SeenSteps = append(ledger.SeenSteps, openCodeUsageStepKey("s", fmt.Sprint(i)))
+		}
+		for i := 0; i < openCodeUsageMaxBuckets; i++ {
+			ledger.Buckets = append(ledger.Buckets, openCodeUsageBucket{AccountFingerprint: "0123456789abcdef01234567", LocalDate: fmt.Sprintf("2026-10-%02d", i+1), InputTokens: math.MaxInt64, CostUsd: math.MaxFloat64, ObservedAtMs: int64(i + 1)})
+		}
+		for i := 0; i < openCodeUsageMaxDebts; i++ {
+			ledger.Debts = append(ledger.Debts, openCodeUsageDebt{RunID: fmt.Sprintf("%016d", i), RunFloorMs: 1, SessionID: "ses_" + strings.Repeat("x", 120), Dir: strings.Repeat("d", 1024)})
+		}
+		for i := 0; i < openCodeUsageMaxOwnedRuns; i++ {
+			ledger.OwnedRuns = append(ledger.OwnedRuns, openCodeOwnedRun{RunID: fmt.Sprintf("%016d", i), SessionKey: openCodeUsageSessionKey(fmt.Sprint(i)), FromMs: math.MaxInt32, ToMs: math.MaxInt32})
+		}
+		return true, false
+	})
+	if !committed {
+		t.Fatal("write refused")
+	}
+	info, err := os.Stat(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > openCodeUsageMaxLedgerBytes/2 {
+		t.Fatalf("a full ledger is %d bytes: keep at least 2x headroom under %d", info.Size(), openCodeUsageMaxLedgerBytes)
+	}
+	if got := loadOpenCodeUsageLedger(); len(got.Buckets) != openCodeUsageMaxBuckets || len(got.SeenSteps) != openCodeUsageMaxSeenSteps {
+		t.Fatalf("a full ledger (%d bytes) did not load: %d buckets, %d keys", info.Size(), len(got.Buckets), len(got.SeenSteps))
 	}
 }

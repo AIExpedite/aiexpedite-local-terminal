@@ -34,9 +34,7 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -244,16 +242,7 @@ func readMuseCodeDefaultModel(home string, getenv func(string) string) string {
 // readBoundedJSONFile decodes a small JSON file, refusing anything larger than
 // museCodeConfigFileMaxBytes. Any failure reads as "absent".
 func readBoundedJSONFile(path string, into any) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	b, err := io.ReadAll(io.LimitReader(f, museCodeConfigFileMaxBytes+1))
-	if err != nil || len(b) == 0 || len(b) > museCodeConfigFileMaxBytes {
-		return false
-	}
-	return json.Unmarshal(b, into) == nil
+	return readJSONFileWithin(path, museCodeConfigFileMaxBytes, into)
 }
 
 // museCodeUsageMetrics turns the last live reading into the card's two rows.

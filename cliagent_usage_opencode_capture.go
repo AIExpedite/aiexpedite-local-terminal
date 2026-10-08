@@ -71,6 +71,11 @@ const (
 	// openCodeUsageMaxOwnedRuns caps the ownership windows. Open windows are
 	// bounded by the live runs; past the cap the oldest CLOSED window goes.
 	openCodeUsageMaxOwnedRuns = 32
+	// openCodeUsageMaxLedgerBytes bounds the ledger read. A full ledger (8,192
+	// keys, 16 buckets, 8 debts, 32 windows, indented) is about 230 KB; one that
+	// does not fit reads as EMPTY, dropping today's buckets, so the bound keeps
+	// several times that headroom.
+	openCodeUsageMaxLedgerBytes = 1 << 20
 	// openCodeUsageMaxRunSteps bounds one run's in-memory accumulator. Steps past
 	// it fold into the last uncommitted one without a dedup key, or recycle the
 	// slots of steps already committed: still counted, never unbounded.
@@ -260,7 +265,7 @@ func loadOpenCodeUsageLedger() openCodeUsageLedger {
 // or other-schema file reads as empty. Callers hold openCodeUsageFileMu.
 func readOpenCodeUsageLedger() openCodeUsageLedger {
 	var ledger openCodeUsageLedger
-	if !readBoundedJSONFile(openCodeUsageCachePath(), &ledger) || ledger.SchemaVersion != openCodeUsageSchemaVersion {
+	if !readJSONFileWithin(openCodeUsageCachePath(), openCodeUsageMaxLedgerBytes, &ledger) || ledger.SchemaVersion != openCodeUsageSchemaVersion {
 		return openCodeUsageLedger{SchemaVersion: openCodeUsageSchemaVersion}
 	}
 	return ledger
@@ -426,10 +431,7 @@ func recoverOpenCodeUsageGeneration(attempt int) {
 // openCodeLocalDay is t's local calendar date and the next local midnight — 23
 // or 25 hours away on a DST day.
 func openCodeLocalDay(t time.Time) (date string, resetAt time.Time) {
-	loc := openCodeUsageLocation
-	if loc == nil {
-		loc = time.Local
-	}
+	loc := openCodeUsageZone()
 	local := t.In(loc)
 	y, m, d := local.Date()
 	return local.Format("2006-01-02"), time.Date(y, m, d+1, 0, 0, 0, 0, loc)
@@ -437,12 +439,17 @@ func openCodeLocalDay(t time.Time) (date string, resetAt time.Time) {
 
 // openCodeLocalMidnight is the start of t's local calendar day.
 func openCodeLocalMidnight(t time.Time) time.Time {
-	loc := openCodeUsageLocation
-	if loc == nil {
-		loc = time.Local
-	}
+	loc := openCodeUsageZone()
 	y, m, d := t.In(loc).Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, loc)
+}
+
+// openCodeUsageZone is the zone local days are cut in.
+func openCodeUsageZone() *time.Location {
+	if openCodeUsageLocation != nil {
+		return openCodeUsageLocation
+	}
+	return time.Local
 }
 
 // openCodeUsageStepsCarryUsage reports whether any of steps would contribute to
