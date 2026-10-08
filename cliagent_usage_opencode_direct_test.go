@@ -1252,3 +1252,17 @@ func TestOpenCodeDirect_APinnedBacklogPastThePinnedKeyCapCountsOnce(t *testing.T
 		t.Fatalf("bucket = %+v, want 1311 tokens once the running message completes", b)
 	}
 }
+
+// A pinned message rewritten during a capped backlog is read again with a later
+// write time: the merge keeps the newer time, so the cap does not drop it as
+// older than it is while the dropped floor stays below its actual write.
+func TestOpenCodeDirectPinnedKeys_ADuplicateKeyKeepsItsNewestWriteTime(t *testing.T) {
+	prevCap := openCodeDirectMaxPinnedKeys
+	t.Cleanup(func() { openCodeDirectMaxPinnedKeys = prevCap })
+	openCodeDirectMaxPinnedKeys = 2
+	prev := &openCodeDirectCursor{ThroughMs: 100, PinnedKeys: []string{"a", "b"}, PinnedWrittenMs: []int64{110, 120}}
+	keys, writtenMs, droppedMs := openCodeDirectPinnedKeys(prev, true, []openCodeDirectPinnedKey{{Key: "c", WrittenMs: 130}, {Key: "a", WrittenMs: 140}}, 0)
+	if fmt.Sprint(keys) != "[c a]" || fmt.Sprint(writtenMs) != "[130 140]" || droppedMs != 120 {
+		t.Fatalf("keys = %v, writtenMs = %v, droppedMs = %d; want [c a], [130 140], 120", keys, writtenMs, droppedMs)
+	}
+}

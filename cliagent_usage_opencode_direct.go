@@ -556,13 +556,17 @@ func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned
 		}
 	}
 	all = append(all, pinned...)
-	seen := make(map[string]bool, len(all))
+	// A message rewritten during the backlog is read again with a later write
+	// time: keep its newest, so the cap never drops it as older than it is.
+	index := make(map[string]int, len(all))
 	out := make([]openCodeDirectPinnedKey, 0, len(all))
 	for _, p := range all {
-		if !seen[p.Key] {
-			seen[p.Key] = true
-			out = append(out, p)
+		if i, ok := index[p.Key]; ok {
+			out[i].WrittenMs = max(out[i].WrittenMs, p.WrittenMs)
+			continue
 		}
+		index[p.Key] = len(out)
+		out = append(out, p)
 	}
 	if n := len(out); n > openCodeDirectMaxPinnedKeys {
 		sort.SliceStable(out, func(i, j int) bool { return out[i].WrittenMs < out[j].WrittenMs })
