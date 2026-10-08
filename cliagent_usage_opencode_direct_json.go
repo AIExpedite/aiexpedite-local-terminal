@@ -15,6 +15,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,9 +70,9 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 	var sessions []sessionDir
 	sinceMs := limits.sessionsSinceMs(floorMs)
 	// Sessions are read in last-write order, so the root must be listed whole
-	// before any is read: a root the budget cannot list reads nothing, and the
-	// scan fails without moving the cursor.
-	rootListed := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
+	// before any is read: a root the budget or a listing error cannot list
+	// reads nothing, and the scan fails without moving the cursor.
+	rootErr := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
 		if !e.IsDir() || !isValidOpenCodeSessionID(e.Name()) {
 			return
 		}
@@ -81,8 +84,8 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 			sessions = append(sessions, sessionDir{name: e.Name(), at: at})
 		}
 	})
-	if !rootListed {
-		return read, ctx.Err()
+	if rootErr != nil {
+		return read, rootErr
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		if sessions[i].at != sessions[j].at {
@@ -102,7 +105,7 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 	for _, s := range sessions {
 		dir := filepath.Join(messageRoot, s.name)
 		listed := len(files)
-		ok := eachOpenCodeDirectEntry(ctx, dir, 0, func(n os.DirEntry) {
+		err := eachOpenCodeDirectEntry(ctx, dir, 0, func(n os.DirEntry) {
 			if n.IsDir() || !strings.HasSuffix(n.Name(), ".json") {
 				return
 			}
@@ -114,9 +117,10 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 				files = append(files, openCodeDirectJSONFile{path: filepath.Join(dir, n.Name()), session: s.name, at: at, size: info.Size()})
 			}
 		})
-		if !ok {
-			// The budget ran out before this session was listed whole: none of
-			// it is read, and the next scan resumes at it.
+		if err != nil {
+			// The budget ran out, or a listing error struck, before this
+			// session was listed whole: none of it is read, and the next scan
+			// resumes at it.
 			files = files[:listed]
 			read.truncateSessionsAt(s.at, s.before)
 			break
@@ -171,8 +175,9 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 			m.CompletedMs = completed
 			parts, ok := readOpenCodeDirectJSONParts(ctx, filepath.Join(root, "storage", "part", msg.ID))
 			if !ok {
-				// The budget ran out inside this message's parts: it was not
-				// read whole, so the cursor stops before it.
+				// The budget ran out, or a listing error struck, inside this
+				// message's parts: it was not read whole, so the cursor stops
+				// before it.
 				read.truncateAt(f.at, f.before)
 				break
 			}
@@ -209,9 +214,10 @@ func dropOpenCodeDirectRead[T any](list []T, skip openCodeDirectSkip, at func(T)
 // readOpenCodeDirectJSONParts reads a message's step-finish parts. A part that
 // is too large to be one is skipped unopened. The directory is listed through
 // eachOpenCodeDirectEntry, so a large part directory cannot run the scan past
-// its budget; ok is false when the deadline stopped the read.
+// its budget; ok is false when the deadline or a listing error stopped the
+// read, never a subtotal of the parts that happened to list.
 func readOpenCodeDirectJSONParts(ctx context.Context, dir string) (parts []openCodeExportPart, ok bool) {
-	ok = eachOpenCodeDirectEntry(ctx, dir, openCodeDirectMaxPartsPerMessage, func(e os.DirEntry) {
+	err := eachOpenCodeDirectEntry(ctx, dir, openCodeDirectMaxPartsPerMessage, func(e os.DirEntry) {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			return
 		}
@@ -223,36 +229,48 @@ func readOpenCodeDirectJSONParts(ctx context.Context, dir string) (parts []openC
 			parts = append(parts, part)
 		}
 	})
-	if !ok {
+	if err != nil {
 		return nil, false
 	}
 	return parts, true
 }
 
+// openCodeDirectOpenDir opens a directory for listing; a seam for tests.
+var openCodeDirectOpenDir = os.Open
+
 // eachOpenCodeDirectEntry lists dir in batches and calls fn for each entry, up
 // to limit entries (0 for no limit). The scan's deadline is checked before each
 // batch and each entry, so a directory of any size cannot run the scan past its
-// budget — os.ReadDir would materialise it whole first. ok is false when the
-// deadline stopped the listing; a directory that cannot be read lists nothing.
-func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func(os.DirEntry)) (ok bool) {
-	d, err := os.Open(dir)
+// budget — os.ReadDir would materialise it whole first. A directory that does
+// not exist lists nothing. err is the deadline's when it stopped the listing,
+// or the open or read error when the directory exists but could not be listed
+// whole: a permission, sharing or I/O failure is never read as an empty
+// directory, which would move the cursor past records it never saw.
+func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func(os.DirEntry)) error {
+	d, err := openCodeDirectOpenDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
-		return true
+		return err
 	}
 	defer d.Close()
 	listed := 0
 	for limit == 0 || listed < limit {
-		if ctx.Err() != nil {
-			return false
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		n := openCodeDirectListBatch
 		if limit > 0 {
 			n = min(n, limit-listed)
 		}
 		entries, err := d.ReadDir(n)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
 		for _, e := range entries {
-			if ctx.Err() != nil {
-				return false
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 			fn(e)
 		}
@@ -261,5 +279,5 @@ func eachOpenCodeDirectEntry(ctx context.Context, dir string, limit int, fn func
 			break
 		}
 	}
-	return true
+	return nil
 }

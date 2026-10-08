@@ -347,7 +347,7 @@ func openCodeDirectScanShared(budget time.Duration) string {
 // when a NEW session directory is made, not when a message lands in an
 // existing one. That listing is batched under ctx's deadline, so a large
 // session root cannot stall the tick or a Refresh; ok is false when the
-// deadline stopped it and the marker is incomplete.
+// deadline or a listing error stopped it and the marker is incomplete.
 func openCodeStoreMarker(ctx context.Context, layout, root string) (marker string, changedAt time.Time, ok bool) {
 	switch layout {
 	case openCodeStoreLayoutSQLite:
@@ -370,7 +370,7 @@ func openCodeStoreMarker(ctx context.Context, layout, root string) (marker strin
 			return layout + "|-", changedAt, true
 		}
 		dirs := 0
-		ok = eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
+		err := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
 			if !e.IsDir() {
 				return
 			}
@@ -379,7 +379,7 @@ func openCodeStoreMarker(ctx context.Context, layout, root string) (marker strin
 				changedAt = info.ModTime()
 			}
 		})
-		return fmt.Sprintf("%s|%d|%d", layout, dirs, changedAt.UnixNano()), changedAt, ok
+		return fmt.Sprintf("%s|%d|%d", layout, dirs, changedAt.UnixNano()), changedAt, err == nil
 	}
 	return layout, changedAt, true
 }

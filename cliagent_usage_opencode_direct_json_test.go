@@ -154,6 +154,67 @@ func TestOpenCodeDirectJSON_TheDeadlineStopsTheSessionRootListing(t *testing.T) 
 	}
 }
 
+// failOpenCodeDirectListing makes opening dir fail the way a transient
+// permission, sharing or I/O error does.
+func failOpenCodeDirectListing(t *testing.T, dir string) {
+	t.Helper()
+	open := openCodeDirectOpenDir
+	openCodeDirectOpenDir = func(name string) (*os.File, error) {
+		if filepath.Clean(name) == filepath.Clean(dir) {
+			return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrPermission}
+		}
+		return open(name)
+	}
+	t.Cleanup(func() { openCodeDirectOpenDir = open })
+}
+
+// A directory that exists but cannot be listed is never read as an empty one:
+// at the session root it fails the scan and the marker, at a session it cuts
+// before that session, and at a message's parts it cuts before that message
+// rather than commit a subtotal. A missing directory still lists nothing.
+func TestOpenCodeDirectJSON_AListingErrorIsNotAnEmptyDirectory(t *testing.T) {
+	root := t.TempDir()
+	store := &openCodeTestStore{t: t, root: root}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: base, completedMs: base + 500, steps: [][3]int64{{3, 0, 0}}})
+	store.write(openCodeTestMessage{session: "ses_b", id: "msg_b", createdMs: base + 1000, completedMs: base + 1500, steps: [][3]int64{{4, 0, 0}}})
+	for session, atMs := range map[string]int64{"ses_a": base + 500, "ses_b": base + 1500} {
+		at := time.UnixMilli(atMs)
+		if err := os.Chtimes(filepath.Join(root, "storage", "message", session), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := eachOpenCodeDirectEntry(context.Background(), filepath.Join(root, "missing"), 0, func(os.DirEntry) {}); err != nil {
+		t.Fatalf("a missing directory = %v", err)
+	}
+
+	t.Run("root", func(t *testing.T) {
+		failOpenCodeDirectListing(t, filepath.Join(root, "storage", "message"))
+		if _, _, ok := openCodeStoreMarker(context.Background(), openCodeStoreLayoutJSON, root); ok {
+			t.Fatal("a marker whose listing failed reports complete")
+		}
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if !errors.Is(err, os.ErrPermission) || len(read.Messages) != 0 {
+			t.Fatalf("a root listing that failed = %+v, %v", read, err)
+		}
+	})
+	t.Run("session", func(t *testing.T) {
+		failOpenCodeDirectListing(t, filepath.Join(root, "storage", "message", "ses_b"))
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if err != nil || len(read.Messages) != 1 || read.Messages[0].ID != "msg_a" || !read.Truncated || !read.AtSession || read.ThroughMs != base+1500 {
+			t.Fatalf("a session listing that failed = %+v, %v", read, err)
+		}
+	})
+	t.Run("parts", func(t *testing.T) {
+		failOpenCodeDirectListing(t, filepath.Join(root, "storage", "part", "msg_a"))
+		read, err := readOpenCodeDirectJSON(context.Background(), root, base, openCodeDirectTestLimits())
+		if err != nil || len(read.Messages) != 0 || !read.Truncated || read.AtSession {
+			t.Fatalf("a part listing that failed = %+v, %v", read, err)
+		}
+	})
+}
+
 // Records, but none in a shape the adapter knows: unknown, never a 0.
 func TestOpenCodeDirectJSON_AnUnknownShapeIsUnknown(t *testing.T) {
 	root := t.TempDir()
