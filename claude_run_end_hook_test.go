@@ -147,12 +147,15 @@ func TestClaudeRunEndHook_IsMonotonic(t *testing.T) {
 	}
 }
 
-// A credential read that resolves no account over a SCOPED cache is not a
-// logout the hook may act on: it must not wipe that account's buckets.
+// A credential read that FAILS over a SCOPED cache is not a logout the hook
+// may act on: it must not wipe that account's buckets.
 func TestClaudeRunEndHook_EmptyFingerprintNeverWipesAScopedCache(t *testing.T) {
 	cache, _ := armClaudeRunEndHookTest(t, claudeProbeOKHandler)
-	if fp := currentClaudeAccountFingerprint(); fp != "" {
-		t.Skipf("fixture credential resolves an account (%d chars); this case needs none", len(fp))
+	if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want an unreadable credential", fp, resolved)
 	}
 	now := time.Now()
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
@@ -165,6 +168,35 @@ func TestClaudeRunEndHook_EmptyFingerprintNeverWipesAScopedCache(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(cache); string(after) != string(before) {
 		t.Fatal("the refused owe rewrote the scoped cache")
+	}
+}
+
+// A credential that READS and names no account is the accountless claude.ai
+// login signed in now, not a failed read: after a switch onto it, the hook's
+// owe moves the cache off the previous account and records the run, instead of
+// refusing until an unrelated reading re-scopes the cache.
+func TestClaudeRunEndHook_OwesAfterASwitchToTheAccountlessLogin(t *testing.T) {
+	cache, calls := armClaudeRunEndHookTest(t, claudeProbeOKHandler)
+	if fp, resolved := currentClaudeAccountFingerprintResolved(); fp != "" || !resolved {
+		t.Fatalf("fixture fingerprint=%q resolved=%v, want the readable accountless login", fp, resolved)
+	}
+	now := time.Now()
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 44, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true},
+	}, now.Add(-time.Hour), "fp-A")
+
+	if !claudeRunEndHookAt(now) {
+		t.Fatal("the hook refused the run of the accountless login signed in now")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.AccountFingerprint != "" || snap.RefreshOwedAtMs != now.UnixMilli() {
+		t.Fatalf("scope=%q owed=%d, want the debt at %d under the accountless login", snap.AccountFingerprint, snap.RefreshOwedAtMs, now.UnixMilli())
+	}
+	if _, ok := snap.Buckets[claudeWindowFiveHour]; ok {
+		t.Fatal("the previous account's reading survived the move onto the accountless login")
+	}
+	if *calls != 0 {
+		t.Fatalf("the hook made %d requests, want none", *calls)
 	}
 }
 

@@ -166,7 +166,7 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 // mutateClaudeRateLimitSnapshotStampedScopedUnscope is the implementation.
 // `confirmedUnscoped` lifts the scoped -> unscoped refusal for a caller that
 // has CONFIRMED the empty fingerprint is the accountless login, not a failed
-// credential read (claudeOweTransferredRunRefresh).
+// credential read (claudeOweRunRefreshFor).
 func mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint string, allowedScopes []string, confirmedUnscoped bool, fn func(*claudeRateLimitSnapshot) bool) (bool, int64, int64) {
 	if path == "" || fn == nil {
 		return false, 0, 0
@@ -368,13 +368,14 @@ func claudeOweRunRefreshFor(baseline time.Time, requireArmed bool, want *string,
 	// sampled scope or the resolved fingerprint); a flip that overtook the sample
 	// is refused by the allow-list above.
 	//
-	// The one exception is a transfer whose pinned debt was owed under "" while
-	// the credential READ and names no account: two independent confirmations
-	// that the accountless login is the one signed in now. The own cache, still
-	// scoped to the previous account, would otherwise refuse it on every tick,
-	// and once the hooks are re-pointed a restart forgets the pinned cache, so
-	// that run would go unpaid.
-	confirmedUnscoped := want != nil && *want == "" && resolved
+	// The one exception is a credential that READ and names no account: that is
+	// the accountless claude.ai login genuinely signed in now, not a failed read.
+	// The cache, still scoped to the previous account, would otherwise refuse
+	// every owe after the switch — the hook's, an agent run's, and a pinned
+	// debt's transfer (which a restart forgets once the hooks are re-pointed) —
+	// so the first headless run on the new login would go unpaid until an
+	// unrelated reading re-scoped the cache.
+	confirmedUnscoped := fingerprint == "" && resolved
 	baselineMs := baseline.UnixMilli()
 	wrote, _, _ := mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint, []string{scopeBefore}, confirmedUnscoped,
 		func(snap *claudeRateLimitSnapshot) bool {
