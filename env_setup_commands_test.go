@@ -255,6 +255,7 @@ func TestBuiltinSignInAllowlist(t *testing.T) {
 		{"grok", "login", "--oauth"},
 		{"opencode", "auth", "login"},
 		{"agy"},
+		{"muse", "login"},
 	}
 	cfg := &Config{EnableAllowList: true}
 	for _, argv := range catalog {
@@ -297,6 +298,8 @@ func TestBuiltinSignInAllowlist(t *testing.T) {
 		{"grok", "login", "--OAUTH"},
 		{"opencode", "auth", "login", "extra"},
 		{"agy", "--version"},
+		{"muse", "login", "--extra"},
+		{"muse"},
 		{"npm", "uninstall", "-g", "codex"},
 	}
 	for _, argv := range nearMisses {
@@ -308,6 +311,15 @@ func TestBuiltinSignInAllowlist(t *testing.T) {
 		if _, err := parseEnvSignInRequest(cmd.Args); err == nil && !g.Needed {
 			t.Errorf("%q must take the dialog", argv)
 		}
+	}
+	// Muse Code's catalog sign-in skips the dialog; anything extra does not.
+	museLogin := commandMsg{Command: envSignInCommand, Args: signInArgs(t, []string{"muse", "login"}, "Sign in to Muse Code"), RiskLevel: riskExternalWrite}
+	if envSetupCommandNeedsApproval(museLogin) {
+		t.Error("muse login must open without approval")
+	}
+	museExtra := commandMsg{Command: envSignInCommand, Args: signInArgs(t, []string{"muse", "login", "--extra"}, "t"), RiskLevel: riskExternalWrite}
+	if !envSetupCommandNeedsApproval(museExtra) {
+		t.Error("muse login --extra must need approval")
 	}
 	// Allow All Commands changes nothing for a non-built-in sign-in.
 	allowAll := &Config{}
