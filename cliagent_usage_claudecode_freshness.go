@@ -444,8 +444,9 @@ func resetClaudeObservedDebtAdoption() {
 // A crash after 1 leaves the pinned debt to whoever acts once the lease
 // lapses; a crash after 2 leaves it in both caches, which costs at most one
 // extra request and never a lost run. The next adoption here finishes that
-// transfer, because a pinned debt at the instant the own cache already holds
-// is still claimed.
+// transfer, as does one after a finish that lost its lock race: a pinned debt
+// at or before the floor is still claimed, without a second owe, while the own
+// cache holds that instant or a probe reading there covers it.
 //
 // A retired debt (aged out, at the cap, stamped in the future) is not adopted:
 // it costs nothing, and the startup replay clears it.
@@ -512,8 +513,20 @@ func transferClaudePinnedObservedDebt(own claudeRateLimitSnapshot, haveOwn bool,
 	// The own debt only outranks a pinned one owed under the same account: after
 	// a switch the own cache's debt belongs to the login this device left.
 	sameScope := !haveOwn || pinnedFp == own.AccountFingerprint
-	if pinnedMs <= floor || (sameScope && pinnedMs < own.RefreshOwedAtMs) ||
+	// A debt at or before the floor was carried here already, but its finish may
+	// have lost its lock race and left it on the pinned cache. While the own
+	// cache still holds that instant, or a probe reading there already covers
+	// it, only the finish is left to do: owing it again could re-open a debt the
+	// own cache has since settled and pay the run twice.
+	leftover := pinnedMs != 0 && pinnedMs <= floor && haveOwn && pinnedFp == own.AccountFingerprint &&
+		(own.RefreshOwedAtMs == pinnedMs ||
+			(own.LastProbeObservedAtMs > 0 && claudeUsageObservationCovers(time.UnixMilli(own.LastProbeObservedAtMs), time.UnixMilli(pinnedMs))))
+	if (pinnedMs <= floor && !leftover) || (sameScope && pinnedMs < own.RefreshOwedAtMs) ||
 		!mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, claimClaudePinnedObservedDebt(pinnedMs, &claim)) {
+		return 0
+	}
+	if leftover {
+		mutateClaudeRateLimitSnapshotScoped(pinned, pinnedFp, []string{pinnedFp}, finishClaudePinnedObservedDebt(pinnedMs, claim, true))
 		return 0
 	}
 	onDisk := claudeOweTransferredRunRefresh(time.UnixMilli(pinnedMs), pinnedFp, claim.attempts)

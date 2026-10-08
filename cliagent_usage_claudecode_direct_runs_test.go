@@ -834,6 +834,61 @@ func TestClaudeDirectRun_ATakenOverDebtKeepsItsSpentBudget(t *testing.T) {
 	}
 }
 
+// A transfer whose finish lost its lock race leaves the debt on the pinned
+// cache at an instant the adoption latch already passed. The next transfer
+// still clears it, without owing it again, while the own cache holds that
+// instant or a probe reading there covers it; otherwise it stays put.
+func TestClaudeDirectRun_ALeftoverPinnedDebtIsFinishedWithoutReowing(t *testing.T) {
+	cases := map[string]struct {
+		ownDebt    bool
+		probeAfter bool
+		cleared    bool
+	}{
+		"own still owes it":    {ownDebt: true, cleared: true},
+		"own settled it":       {probeAfter: true, cleared: true},
+		"own neither holds it": {cleared: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cache, calls := armClaudeDirectRunTest(t, claudeBothWindowsHandler)
+			fp := currentClaudeAccountFingerprint()
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			pinned := pinOtherChannelCache(t)
+			now := time.Now()
+			end := now.Add(-10 * time.Minute)
+			seedClaudeRefreshDebt(t, pinned, fp, end, 0, time.Time{})
+			if tc.ownDebt {
+				seedClaudeRefreshDebt(t, cache, fp, end, 1, time.Time{})
+			}
+			if tc.probeAfter && !mutateClaudeRateLimitSnapshot(cache, fp, func(snap *claudeRateLimitSnapshot) bool {
+				snap.LastProbeObservedAtMs = end.Add(time.Second).UnixMilli()
+				return true
+			}) {
+				t.Fatal("seeding the probe reading did not write the own cache")
+			}
+			before := claudeCacheSnapshot(t, cache)
+
+			own, haveOwn := loadClaudeRateLimitSnapshot(cache)
+			if got := transferClaudePinnedObservedDebt(own, haveOwn, end.UnixMilli(), now); got != 0 {
+				t.Fatalf("transferred=%d, want nothing newly moved", got)
+			}
+			p := claudeCacheSnapshot(t, pinned)
+			if tc.cleared && (p.RefreshOwedAtMs != 0 || p.AttemptClaimedUntilMs != 0) {
+				t.Fatalf("pinned snap=%+v, want the leftover debt cleared", p)
+			}
+			if !tc.cleared && (p.RefreshOwedAtMs != end.UnixMilli() || p.AttemptClaimedUntilMs != 0) {
+				t.Fatalf("pinned snap=%+v, want the debt left with its owner, unclaimed", p)
+			}
+			if o := claudeCacheSnapshot(t, cache); o.RefreshOwedAtMs != before.RefreshOwedAtMs || o.RefreshOwedAttempts != before.RefreshOwedAttempts {
+				t.Fatalf("own snap=%+v, want its debt untouched (was at=%d attempts=%d)", o, before.RefreshOwedAtMs, before.RefreshOwedAttempts)
+			}
+			if got := atomic.LoadInt64(calls); got != 0 {
+				t.Fatalf("requests=%d, want none", got)
+			}
+		})
+	}
+}
+
 // A rung only just overdue is a live owner's timer about to fire, not an
 // abandoned debt: it stays with its owner.
 func TestClaudeDirectRun_APinnedDebtJustPastItsRungIsNotTakenOver(t *testing.T) {
