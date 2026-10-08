@@ -329,6 +329,84 @@ func isOurClaudeHookCommand(command, subcommand string) bool {
 		(strings.HasPrefix(prefix, `'`) && strings.HasSuffix(prefix, `'`))
 }
 
+// extractInstalledClaudeHookExecutable parses the executable path embedded in
+// an installed hook command (POSIX single-quoted or PowerShell double-quoted),
+// with shell escapes unwound. Returns "" when the command does not match
+// isOurClaudeHookCommand.
+func extractInstalledClaudeHookExecutable(command, subcommand string) string {
+	s := strings.TrimSpace(command)
+	s = statusLineEnvPreambleRe.ReplaceAllString(s, "")
+	suffix := " " + subcommand
+	if !strings.HasSuffix(s, suffix) {
+		return ""
+	}
+	prefix := strings.TrimSpace(strings.TrimSuffix(s, suffix))
+	prefix = strings.TrimSpace(strings.TrimPrefix(prefix, "&"))
+	if len(prefix) < 2 {
+		return ""
+	}
+	if strings.HasPrefix(prefix, `'`) && strings.HasSuffix(prefix, `'`) {
+		inner := prefix[1 : len(prefix)-1]
+		return strings.ReplaceAll(inner, `'\''`, `'`)
+	}
+	if strings.HasPrefix(prefix, `"`) && strings.HasSuffix(prefix, `"`) {
+		inner := prefix[1 : len(prefix)-1]
+		inner = strings.ReplaceAll(inner, `""`, `"`)
+		inner = strings.ReplaceAll(inner, "`$", "$")
+		inner = strings.ReplaceAll(inner, "``", "`")
+		return inner
+	}
+	return ""
+}
+
+// sameClaudeExecutableSpelling compares two executable paths for lexical equality
+// (normalizing path separators, and casing on Windows).
+func sameClaudeExecutableSpelling(a, b string) bool {
+	a, b = filepath.Clean(filepath.FromSlash(a)), filepath.Clean(filepath.FromSlash(b))
+	return a == b || (runtime.GOOS == "windows" && strings.EqualFold(a, b))
+}
+
+// isClaudeHookExecutableLive reports whether the binary pointed to by an installed
+// hook command exists and is executable. If it matches the current process's
+// executable seam (claudeHookExecutable), it is treated as live unconditionally
+// (covering tests and active execution). Otherwise, it checks whether the file
+// exists on disk.
+func isClaudeHookExecutableLive(exe string) bool {
+	if exe == "" {
+		return false
+	}
+	if ownExe, err := claudeHookExecutable(); err == nil && ownExe != "" {
+		if sameClaudeExecutableSpelling(exe, ownExe) {
+			return true
+		}
+	}
+	st, err := os.Stat(filepath.FromSlash(exe))
+	return err == nil && !st.IsDir()
+}
+
+// claudeStatusLineHookReconciled reports whether Claude's settings.json currently
+// holds a valid statusLine hook entry — either pointing to our own command or to
+// an active peer channel's live binary.
+func claudeStatusLineHookReconciled(settings map[string]json.RawMessage) bool {
+	rawSL, present := settings["statusLine"]
+	if !present {
+		return false
+	}
+	var existing claudeStatusLine
+	if json.Unmarshal(rawSL, &existing) != nil || existing.Type != "command" {
+		return false
+	}
+	if !isOurClaudeHookCommand(existing.Command, statusLineHookArg) {
+		return false
+	}
+	ours, ok := ourClaudeHookCommand(statusLineHookArg)
+	if ok && existing.Command == ours {
+		return true
+	}
+	exe := extractInstalledClaudeHookExecutable(existing.Command, statusLineHookArg)
+	return isClaudeHookExecutableLive(exe)
+}
+
 // loadPrevStatusLine returns the full original statusLine object we stashed at
 // the path THIS boot resolves.
 func loadPrevStatusLine() (json.RawMessage, bool) {
@@ -840,6 +918,51 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 		return false, nil
 	}
 
+	// If settings.json exists and both hooks are already in a reconciled state
+	// (either ours or a live peer channel's), preserve the peer installation
+	// rather than continually rewriting settings.json toward this process's local
+	// binary and probe setting.
+	if statErr == nil {
+		if settings, exists, err := readClaudeSettings(settingsPath); err == nil && exists {
+			slOK := claudeStatusLineHookReconciled(settings)
+			reOK := claudeRunEndHookReconciled(settings)
+			if slOK && reOK {
+				claudeStatusLineReconcile.mu.Lock()
+				claudeStatusLineReconcile.seen = true
+				claudeStatusLineReconcile.mtime = st.ModTime()
+				claudeStatusLineReconcile.size = st.Size()
+				claudeStatusLineReconcile.mu.Unlock()
+				return false, nil
+			}
+
+			// Only repair the hooks that are actually missing, foreign or stale.
+			rememberClaudeHookPinnedCaches(home)
+			var changed bool
+			if !slOK {
+				c, err := ensureClaudeStatusLineHook(home)
+				if err != nil {
+					return false, err
+				}
+				changed = changed || c
+			}
+			if !reOK {
+				c, err := applyClaudeRunEndHook(home, claudeUsageProbe.armedForProbe())
+				if err != nil {
+					return false, err
+				}
+				changed = changed || c
+			}
+			if st, err := os.Stat(settingsPath); err == nil {
+				claudeStatusLineReconcile.mu.Lock()
+				claudeStatusLineReconcile.seen = true
+				claudeStatusLineReconcile.mtime = st.ModTime()
+				claudeStatusLineReconcile.size = st.Size()
+				claudeStatusLineReconcile.mu.Unlock()
+			}
+			return changed, nil
+		}
+	}
+
 	// The rewrite below pins both hooks to the own cache; remember where they
 	// pointed first, so a debt a run left on another channel's cache is still
 	// adopted (adoptObservedClaudeRunDebt).
@@ -961,6 +1084,14 @@ func removeClaudeStatusLineEntry(home string) (bool, error) {
 	if !isOurClaudeHookCommand(existing.Command, statusLineHookArg) {
 		// User has switched to a different command on their own — leave it be.
 		return false, nil
+	}
+	ours, ok := ourClaudeHookCommand(statusLineHookArg)
+	if ok && existing.Command != ours {
+		exe := extractInstalledClaudeHookExecutable(existing.Command, statusLineHookArg)
+		if isClaudeHookExecutableLive(exe) {
+			// Owned by an active peer channel — preserve it.
+			return false, nil
+		}
 	}
 
 	// The stash the INSTALLED command pins is the AUTHORITY whenever it differs

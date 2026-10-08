@@ -83,7 +83,17 @@ func rewriteOurRunEndHooks(groups []json.RawMessage, want json.RawMessage, ours 
 			switch {
 			case !mine:
 				next = append(next, e)
-			case want == nil || kept || matcher != "":
+			case want == nil:
+				// When removing, only drop our own hook or dead hooks.
+				// Preserve an active peer channel's live hook!
+				exe := extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)
+				if cur.Command != ours && isClaudeHookExecutableLive(exe) {
+					next = append(next, e)
+					kept = true
+				} else {
+					groupChanged = true
+				}
+			case kept || matcher != "":
 				groupChanged = true
 			default:
 				kept = true
@@ -178,7 +188,8 @@ func removeClaudeRunEndHook(home string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	out, _, changed, err := rewriteOurRunEndHooks(groups, nil, "")
+	ours, _ := ourClaudeHookCommand(claudeRunEndHookArg)
+	out, _, changed, err := rewriteOurRunEndHooks(groups, nil, ours)
 	if err != nil || !changed {
 		return false, err
 	}
@@ -233,6 +244,54 @@ func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event str
 	}
 	settings["hooks"] = raw
 	return nil
+}
+
+// claudeRunEndHookReconciled reports whether settings.json's SessionEnd hook is
+// in the desired state for periodic reconciliation:
+//   - If the usage probe is armed: a live hook is present (ours or a peer channel's),
+//     and no dead hook needs cleanup.
+//   - If the usage probe is disabled: our own hook is not present (or was removed),
+//     a peer channel's live hook is preserved, and no dead hook needs cleanup.
+func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
+	probeArmed := claudeUsageProbe.armedForProbe()
+	ours, haveOurs := ourClaudeHookCommand(claudeRunEndHookArg)
+	_, groups, err := decodeClaudeHookEvent(settings, claudeRunEndHookEvent)
+	if err != nil {
+		return true // malformed hooks object: do not clobber
+	}
+	var (
+		hasOurs     bool
+		hasLivePeer bool
+		hasDeadHook bool
+	)
+	for _, g := range groups {
+		var group map[string]json.RawMessage
+		var entries []json.RawMessage
+		if json.Unmarshal(g, &group) != nil || json.Unmarshal(group["hooks"], &entries) != nil {
+			continue
+		}
+		for _, e := range entries {
+			cur, mine := ourRunEndHookEntry(e)
+			if !mine {
+				continue
+			}
+			if haveOurs && cur.Command == ours && cur.Timeout == claudeRunEndHookTimeoutSeconds {
+				hasOurs = true
+			} else {
+				exe := extractInstalledClaudeHookExecutable(cur.Command, claudeRunEndHookArg)
+				if isClaudeHookExecutableLive(exe) {
+					hasLivePeer = true
+				} else {
+					hasDeadHook = true
+				}
+			}
+		}
+	}
+
+	if probeArmed {
+		return (hasOurs || hasLivePeer) && !hasDeadHook
+	}
+	return !hasOurs && !hasDeadHook
 }
 
 // applyClaudeRunEndHook installs the run-end hook when `wanted`, removes it

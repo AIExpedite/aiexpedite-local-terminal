@@ -1287,3 +1287,177 @@ func mustReadFile(t *testing.T, path string) []byte {
 	}
 	return b
 }
+
+// On a dual-channel installation where a peer channel has installed valid hooks
+// and its binary exists on disk, the reconcile preserves the peer installation:
+// it does not rewrite settings.json toward this process's binary, and it does
+// not remove the peer's run-end hook even when this process has
+// disable_claude_usage_probe enabled.
+func TestEnsureClaudeStatusLineHookIfStale_PreservesActivePeerHooks(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(true) // local process opts out of probing
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	// Create a dummy peer executable that exists on disk.
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	peerCache := filepath.Join(t.TempDir(), "peer-rl.json")
+	peerStatusLineCmd := claudeHookPosixCommand(peerExe, statusLineHookArg, claudeHookPin{"RL_CACHE", peerCache})
+	peerRunEndCmd := claudeHookPosixCommand(peerExe, claudeRunEndHookArg, claudeHookPin{"RL_CACHE", peerCache})
+
+	initialSettings := map[string]any{
+		"theme": "dark",
+		"statusLine": map[string]any{
+			"type":    "command",
+			"command": peerStatusLineCmd,
+		},
+		"hooks": map[string]any{
+			claudeRunEndHookEvent: []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{
+							"type":    "command",
+							"command": peerRunEndCmd,
+							"timeout": claudeRunEndHookTimeoutSeconds,
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(initialSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if changed {
+		t.Fatal("reconcile must not rewrite a settings.json holding active peer hooks")
+	}
+
+	// Verify settings.json was not mutated.
+	settings := readSettingsMap(t, settingsPath)
+	sl, _ := settings["statusLine"].(map[string]any)
+	if sl["command"] != peerStatusLineCmd {
+		t.Errorf("statusLine command = %v, want peer command %v preserved", sl["command"], peerStatusLineCmd)
+	}
+	cmds := sessionEndCommands(t, settings)
+	if len(cmds) != 1 || cmds[0] != peerRunEndCmd {
+		t.Errorf("run-end commands = %v, want peer command %v preserved despite probe opt-out", cmds, peerRunEndCmd)
+	}
+}
+
+// When a peer hook points to a binary that has been deleted (no longer live on
+// disk), the reconcile treats it as stale and repairs settings.json toward our own
+// binary.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsWhenPeerBinaryDeleted(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	// Peer executable path that does NOT exist on disk.
+	deadExe := filepath.Join(t.TempDir(), "deleted-agent")
+	deadCache := filepath.Join(t.TempDir(), "dead-rl.json")
+	deadStatusLineCmd := claudeHookPosixCommand(deadExe, statusLineHookArg, claudeHookPin{"RL_CACHE", deadCache})
+	deadRunEndCmd := claudeHookPosixCommand(deadExe, claudeRunEndHookArg, claudeHookPin{"RL_CACHE", deadCache})
+
+	initialSettings := map[string]any{
+		"theme": "dark",
+		"statusLine": map[string]any{
+			"type":    "command",
+			"command": deadStatusLineCmd,
+		},
+		"hooks": map[string]any{
+			claudeRunEndHookEvent: []any{
+				map[string]any{
+					"hooks": []any{
+						map[string]any{
+							"type":    "command",
+							"command": deadRunEndCmd,
+							"timeout": claudeRunEndHookTimeoutSeconds,
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(initialSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !changed {
+		t.Fatal("reconcile must repair settings.json when peer binary is deleted")
+	}
+
+	// Verify our own commands replaced the dead ones.
+	sl, re := claudeHookEntries(t, settingsPath)
+	if !sl || !re {
+		t.Fatalf("after repair: statusLine=%v runEnd=%v, want both restored", sl, re)
+	}
+}
+
+// When a peer channel has only installed statusLine (e.g. older agent version),
+// reconcile installs our run-end hook while preserving the peer's status line.
+func TestEnsureClaudeStatusLineHookIfStale_InstallsRunEndWhenPeerOnlyHasStatusLine(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	peerCache := filepath.Join(t.TempDir(), "peer-rl.json")
+	peerStatusLineCmd := claudeHookPosixCommand(peerExe, statusLineHookArg, claudeHookPin{"RL_CACHE", peerCache})
+
+	initialSettings := map[string]any{
+		"theme": "dark",
+		"statusLine": map[string]any{
+			"type":    "command",
+			"command": peerStatusLineCmd,
+		},
+	}
+	raw, err := json.Marshal(initialSettings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !changed {
+		t.Fatal("reconcile must install missing run-end hook")
+	}
+
+	settings := readSettingsMap(t, settingsPath)
+	sl, _ := settings["statusLine"].(map[string]any)
+	if sl["command"] != peerStatusLineCmd {
+		t.Errorf("statusLine command = %v, want peer command %v preserved", sl["command"], peerStatusLineCmd)
+	}
+	if countOurRunEndHooks(sessionEndCommands(t, settings)) != 1 {
+		t.Error("run-end hook was not added")
+	}
+}
