@@ -436,10 +436,16 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	memHold := openCodeUsageArmedHoldMs(now)
 	fingerprint := openCodeKnownAccountFingerprint(resolveOpenCodeExecutable())
 	today, _ := openCodeLocalDay(now)
-	held, pending, unchanged := false, false, false
+	held, pending, unchanged, revisited := false, false, false, false
 	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-		steps, throughMs, pinned, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), now)
-		held, pending = h, p
+		// A continuation carries the revisit floor of the capped scans before
+		// it, whatever layout cut them: the cursor returns there once it drains.
+		var revisitMs int64
+		if c := ledger.DirectCursor; c != nil && c.Continue {
+			revisitMs = c.RevisitFloorMs
+		}
+		steps, throughMs, pinned, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), revisitMs, now)
+		held, pending, revisited = h, p, revisitMs > 0 && !result.Truncated
 		changed := mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
 		if !changed && !ledger.seenEvicted && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs, pinned) {
 			// Nothing new, coverage already today and the cursor within the
@@ -450,21 +456,28 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 			return false, false
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
-		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
-		if result.Truncated && result.AtSession {
-			cursor.RecordFloorMs = floorMs
-		}
-		if result.Truncated && throughMs == result.ThroughMs && !pending && !held {
+		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs}
+		if result.Truncated {
+			// The continuation resumes at the cap's cut even when an incomplete
+			// message or a hold pinned throughMs behind it: resumed at the pin,
+			// the next scan would refill the cap with the same prefix and never
+			// reach the rest. The pin is kept as the revisit floor instead.
+			cursor.ThroughMs, cursor.Continue = result.ThroughMs, true
 			cursor.AtSession, cursor.Skip = result.AtSession, result.ThroughSkip
+			if pending || held || throughMs < result.ThroughMs {
+				cursor.RevisitFloorMs = throughMs
+			}
+			if result.AtSession {
+				cursor.RecordFloorMs = floorMs
+			} else {
+				// A record continuation keeps listing sessions from where the
+				// capped scan did: recomputed from the cut, the floor would drop
+				// a listed session whose unread records were rewritten after it.
+				cursor.SessionSinceMs = limits.sessionsSinceMs(floorMs)
+			}
 		}
-		if cursor.Continue && !cursor.AtSession {
-			// A record continuation keeps listing sessions from where the capped
-			// scan did: recomputed from the cut, the floor would drop a listed
-			// session whose unread records were rewritten after the cut.
-			cursor.SessionSinceMs = limits.sessionsSinceMs(floorMs)
-		}
-		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, ledger.seenEvicted, result.Truncated, throughMs)
-		cursor.PinnedKeys = openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated, pinned)
+		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, ledger.seenEvicted, result.Truncated, cursor.ThroughMs)
+		cursor.PinnedKeys = openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated || revisitMs > 0, pinned)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -479,7 +492,9 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	case unchanged:
 		return "direct_unchanged", held || pending
 	}
-	return "direct_scanned", held || pending
+	// A drained continuation that returned to its revisit floor reads it again
+	// on the next tick, whether or not the store moved.
+	return "direct_scanned", held || pending || revisited
 }
 
 // openCodeDirectWriteCanWait reports that a scan which found nothing new need
@@ -555,11 +570,15 @@ func openCodeDirectRewindFloor(prev *openCodeDirectCursor, evicted, truncated bo
 // openCodeDirectSteps turns a read into ledger steps against ledger's ownership
 // windows, the cursor the scan may save, and the keys of the steps read at or
 // after that cursor (PinnedKeys). holdMs (0 for none) is the floor of the
-// oldest managed run with no window yet.
-func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, holdMs int64, now time.Time) (steps []openCodeUsageStep, throughMs int64, pinned []string, held, pending bool) {
+// oldest managed run with no window yet; revisitMs (0 for none) is the revisit
+// floor a continuation carries from the capped scans before it.
+func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, holdMs, revisitMs int64, now time.Time) (steps []openCodeUsageStep, throughMs int64, pinned []string, held, pending bool) {
 	throughMs = now.UnixMilli()
 	if read.Truncated {
 		throughMs = read.ThroughMs
+	}
+	if revisitMs > 0 {
+		throughMs = min(throughMs, revisitMs)
 	}
 	staleMs := now.Add(-openCodeUsageDebtMaxAge).UnixMilli()
 	var written []int64

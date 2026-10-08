@@ -144,6 +144,9 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // of the last drained backlog: a later scan's overlap does not reach before
 // it, because a backlog larger than a scan's cap can roll seenSteps over, and
 // the keys of the records it read are then no longer there to absorb a re-read.
+// RevisitFloorMs is where a continuation returns once it drains: the earliest
+// point an incomplete message or a hold pinned a capped scan behind its cut,
+// while ThroughMs and Skip keep the cap's own position.
 // PinnedKeys are the keys of the messages a scan read at or after ThroughMs —
 // ones counted past a cursor an incomplete message or a hold pinned behind
 // them: the next scan reads them again, and seenSteps may have rolled their
@@ -157,6 +160,7 @@ type openCodeDirectCursor struct {
 	RecordFloorMs  int64    `json:"recordFloorMs,omitempty"`
 	SessionSinceMs int64    `json:"sessionSinceMs,omitempty"`
 	RewindFloorMs  int64    `json:"rewindFloorMs,omitempty"`
+	RevisitFloorMs int64    `json:"revisitFloorMs,omitempty"`
 	PinnedKeys     []string `json:"pinnedKeys,omitempty"`
 }
 

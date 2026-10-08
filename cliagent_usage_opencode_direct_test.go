@@ -1040,9 +1040,10 @@ func TestOpenCodeDirect_AnIdleScanSkipsTheLedgerRewrite(t *testing.T) {
 }
 
 // A session cut whose selected session contains an incomplete message at the
-// cut timestamp is treated as a record continuation, so the next scan does not
-// skip the session and revisits the message once complete.
-func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinuation(t *testing.T) {
+// cut timestamp keeps its session continuation, and the message pins the
+// revisit floor: once the continuation drains, the cursor returns to it and the
+// message is counted once complete.
+func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutRevisitsIt(t *testing.T) {
 	_, store, clock := openCodeDirectFixture(t, 2062)
 	cut := clock.ms(-10 * time.Minute)
 	store.write(openCodeTestMessage{
@@ -1074,8 +1075,8 @@ func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinu
 	if c == nil || !c.Continue {
 		t.Fatalf("cursor = %+v, want continuation", c)
 	}
-	if c.AtSession {
-		t.Fatalf("cursor.AtSession = true, want record continuation to revisit ses_a")
+	if !c.AtSession || c.RevisitFloorMs == 0 || c.RevisitFloorMs > cut {
+		t.Fatalf("cursor = %+v, want the session cut kept and a revisit floor at or before %d", c, cut)
 	}
 	if c.RecordFloorMs == 0 || c.RecordFloorMs >= cut {
 		t.Fatalf("cursor.RecordFloorMs = %d, want preserved record floor < %d", c.RecordFloorMs, cut)
@@ -1092,11 +1093,64 @@ func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinu
 	}
 	openCodeDirectMaxSessions = 8192
 	scanOpenCodeDirect(t)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Continue || c.ThroughMs > cut {
+		t.Fatalf("cursor = %+v, want the drained continuation back at its revisit floor", c)
+	}
+	scanOpenCodeDirect(t)
 	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 52 {
 		t.Fatalf("bucket tokens = %d, want 52 (42 + 10)", b.tokens())
 	}
 }
 
+// A record cap that stops a scan whose cursor an incomplete message pins
+// behind the cut keeps the cap's position: the next scan resumes at the cut,
+// not the pin, or it would re-read the same capped prefix and never reach the
+// records after it while the message runs. Once the continuation drains, the
+// cursor returns to the message, and nothing is counted twice.
+func TestOpenCodeDirect_ARecordCapPastAPinnedCursorStillDrains(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2063)
+	running := openCodeTestMessage{session: "ses_run", id: "msg_run", createdMs: clock.ms(-30 * time.Minute), writtenMs: clock.ms(-30 * time.Minute), steps: [][3]int64{{1000, 0, 0}}}
+	store.write(running)
+	for i, tokens := range []int64{1, 10, 100, 200} {
+		at := clock.ms(time.Duration(i-20) * time.Minute)
+		store.write(openCodeTestMessage{session: fmt.Sprintf("ses_%d", i), id: fmt.Sprintf("msg_%d", i), createdMs: at - 1000, completedMs: at, steps: [][3]int64{{tokens, 0, 0}}})
+	}
+	openCodeDirectMaxRecords = 2
+	scanOpenCodeDirect(t)
+	c := loadOpenCodeUsageLedger().DirectCursor
+	if c == nil || !c.Continue || c.ThroughMs <= running.createdMs || c.RevisitFloorMs == 0 || c.RevisitFloorMs > running.createdMs {
+		t.Fatalf("cursor = %+v, want the cap's cut with a revisit floor at the running message", c)
+	}
+	// The backlog behind the running message stays above the cap, so the
+	// cursor drains, returns to the message and drains again — counting nothing
+	// twice — until the message completes.
+	returned := false
+	for i := 0; i < 4; i++ {
+		clock.now = clock.now.Add(time.Second)
+		scanOpenCodeDirect(t)
+		if c := loadOpenCodeUsageLedger().DirectCursor; c != nil && !c.Continue && c.ThroughMs <= running.createdMs {
+			returned = true
+		}
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 311 {
+		t.Fatalf("bucket = %+v, want 311 tokens: every record past the cap, each once", b)
+	}
+	if !returned {
+		t.Fatalf("cursor never returned to the running message once drained")
+	}
+
+	running.completedMs = clock.ms(-time.Second)
+	running.writtenMs = 0
+	store.write(running)
+	openCodeDirectMaxRecords = 8192
+	for i := 0; i < 2; i++ {
+		clock.now = clock.now.Add(time.Minute)
+		scanOpenCodeDirect(t)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 1311 {
+		t.Fatalf("bucket = %+v, want 1311 tokens once the running message completes", b)
+	}
+}
 
 // A message counted past a cursor an incomplete message pinned behind it keeps
 // its key in the cursor: a managed capture that rolls seenSteps over raises the

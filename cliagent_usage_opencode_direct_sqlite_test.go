@@ -318,9 +318,9 @@ func TestOpenCodeDirectSQLite_ScanCommitsToTheLedger(t *testing.T) {
 }
 
 // When a session cut coincides with an incomplete message in SQLite, the
-// continuation becomes a record continuation to revisit the incomplete
-// message, but preserves RecordFloorMs so earlier messages in unread sessions
-// are still read.
+// session continuation is kept with RecordFloorMs, so earlier messages in
+// unread sessions are still read, and the message pins the revisit floor the
+// drained continuation returns to.
 func TestOpenCodeDirectSQLite_SessionCutWithIncompleteMessagePreservesRecordFloor(t *testing.T) {
 	_, store, clock := openCodeDirectFixture(t, 2103)
 	db := openCodeSQLiteTestStore(t, store.root, openCodeSQLiteTestSchema)
@@ -340,8 +340,8 @@ func TestOpenCodeDirectSQLite_SessionCutWithIncompleteMessagePreservesRecordFloo
 	if c == nil || !c.Continue {
 		t.Fatalf("cursor = %+v, want continuation", c)
 	}
-	if c.AtSession {
-		t.Fatalf("cursor.AtSession = true, want record continuation to revisit ses_a")
+	if !c.AtSession || c.RevisitFloorMs == 0 || c.RevisitFloorMs > cut {
+		t.Fatalf("cursor = %+v, want the session cut kept and a revisit floor at or before %d", c, cut)
 	}
 	if c.RecordFloorMs == 0 || c.RecordFloorMs >= cut {
 		t.Fatalf("cursor.RecordFloorMs = %d, want preserved record floor < %d", c.RecordFloorMs, cut)
@@ -353,6 +353,10 @@ func TestOpenCodeDirectSQLite_SessionCutWithIncompleteMessagePreservesRecordFloo
 	}
 
 	openCodeDirectMaxSessions = 8192
+	scanOpenCodeDirect(t)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Continue || c.ThroughMs > cut {
+		t.Fatalf("cursor = %+v, want the drained continuation back at its revisit floor", c)
+	}
 	scanOpenCodeDirect(t)
 	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 52 {
 		t.Fatalf("bucket tokens = %d, want 52 (42 + 10)", b.tokens())
