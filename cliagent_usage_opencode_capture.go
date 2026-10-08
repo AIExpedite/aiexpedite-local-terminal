@@ -151,17 +151,25 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // ones counted past a cursor an incomplete message or a hold pinned behind
 // them: the next scan reads them again, and seenSteps may have rolled their
 // keys over by then, so the cursor keeps them itself until it passes them.
+// PinnedWrittenMs is each pinned key's record last-write time, in step.
+// PinnedDroppedMs is the newest last-write time of a pinned key the cap
+// dropped: a backlog drained behind a pin can outgrow both the pinned keys and
+// seenSteps, so no message last written at or before it is counted again — an
+// incomplete one is rewritten past it once it finishes, and a held one is an
+// under-count, never a double count.
 type openCodeDirectCursor struct {
-	Layout         string   `json:"layout"`
-	ThroughMs      int64    `json:"throughMs"`
-	Continue       bool     `json:"continue,omitempty"`
-	AtSession      bool     `json:"atSession,omitempty"`
-	Skip           int      `json:"skip,omitempty"`
-	RecordFloorMs  int64    `json:"recordFloorMs,omitempty"`
-	SessionSinceMs int64    `json:"sessionSinceMs,omitempty"`
-	RewindFloorMs  int64    `json:"rewindFloorMs,omitempty"`
-	RevisitFloorMs int64    `json:"revisitFloorMs,omitempty"`
-	PinnedKeys     []string `json:"pinnedKeys,omitempty"`
+	Layout          string   `json:"layout"`
+	ThroughMs       int64    `json:"throughMs"`
+	Continue        bool     `json:"continue,omitempty"`
+	AtSession       bool     `json:"atSession,omitempty"`
+	Skip            int      `json:"skip,omitempty"`
+	RecordFloorMs   int64    `json:"recordFloorMs,omitempty"`
+	SessionSinceMs  int64    `json:"sessionSinceMs,omitempty"`
+	RewindFloorMs   int64    `json:"rewindFloorMs,omitempty"`
+	RevisitFloorMs  int64    `json:"revisitFloorMs,omitempty"`
+	PinnedKeys      []string `json:"pinnedKeys,omitempty"`
+	PinnedWrittenMs []int64  `json:"pinnedWrittenMs,omitempty"`
+	PinnedDroppedMs int64    `json:"pinnedDroppedMs,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the

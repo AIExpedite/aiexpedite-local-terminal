@@ -38,7 +38,7 @@ func openCodeDirectFixture(t *testing.T, epoch int64) (*openCodeUsageTestSchedul
 	clock := &openCodeDirectTestClock{now: openCodeDirectTestNoon}
 	prevNow, prevFreshNow := openCodeDirectNow, openCodeUsageFreshnessNow
 	prevEnabled := openCodeDirectScanEnabled
-	prevCaps := []int{openCodeDirectMaxSessions, openCodeDirectMaxRecords}
+	prevCaps := []int{openCodeDirectMaxSessions, openCodeDirectMaxRecords, openCodeDirectMaxPinnedKeys}
 	prevBytes, prevBudget := openCodeDirectMaxRecordBytes, openCodeDirectTickBudget
 	openCodeDirectNow = func() time.Time { return clock.now }
 	openCodeUsageFreshnessNow = func() time.Time { return clock.now }
@@ -47,7 +47,7 @@ func openCodeDirectFixture(t *testing.T, epoch int64) (*openCodeUsageTestSchedul
 	t.Cleanup(func() {
 		openCodeDirectNow, openCodeUsageFreshnessNow = prevNow, prevFreshNow
 		openCodeDirectScanEnabled = prevEnabled
-		openCodeDirectMaxSessions, openCodeDirectMaxRecords = prevCaps[0], prevCaps[1]
+		openCodeDirectMaxSessions, openCodeDirectMaxRecords, openCodeDirectMaxPinnedKeys = prevCaps[0], prevCaps[1], prevCaps[2]
 		openCodeDirectMaxRecordBytes, openCodeDirectTickBudget = prevBytes, prevBudget
 		resetOpenCodeDirectScan()
 	})
@@ -1194,5 +1194,61 @@ func TestOpenCodeDirect_KeysPastAPinnedCursorSurviveASeenStepsRollover(t *testin
 	}
 	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || len(c.PinnedKeys) != 0 {
 		t.Fatalf("cursor = %+v, want no pinned keys once the cursor passes them", c)
+	}
+}
+
+// A pinned backlog drained over capped scans can outgrow the pinned-key cap
+// while seenSteps rolls the same keys over: the cursor then returns to its
+// revisit floor and reads the dropped messages again without either key, so
+// the dropped floor keeps them from being counted twice.
+func TestOpenCodeDirect_APinnedBacklogPastThePinnedKeyCapCountsOnce(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2064)
+	running := openCodeTestMessage{session: "ses_run", id: "msg_run", createdMs: clock.ms(-30 * time.Minute), writtenMs: clock.ms(-30 * time.Minute), steps: [][3]int64{{1000, 0, 0}}}
+	store.write(running)
+	for i, tokens := range []int64{1, 10, 100, 200} {
+		at := clock.ms(time.Duration(i-20) * time.Minute)
+		store.write(openCodeTestMessage{session: fmt.Sprintf("ses_%d", i), id: fmt.Sprintf("msg_%d", i), createdMs: at - 1000, completedMs: at, steps: [][3]int64{{tokens, 0, 0}}})
+	}
+	openCodeDirectMaxRecords = 2
+	openCodeDirectMaxPinnedKeys = 2
+	for i := 0; i < 2; i++ {
+		clock.now = clock.now.Add(time.Second)
+		scanOpenCodeDirect(t)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || !c.Continue || c.PinnedDroppedMs == 0 || len(c.PinnedKeys) != 2 || len(c.PinnedWrittenMs) != 2 {
+		t.Fatalf("cursor = %+v, want a continuation whose pinned keys hit the cap and raised the dropped floor", c)
+	}
+
+	managedSteps := make([]openCodeUsageStep, openCodeUsageMaxSeenSteps+10)
+	for i := range managedSteps {
+		managedSteps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("ses_managed", fmt.Sprint(i)), AtMs: clock.ms(0), Input: 1}
+	}
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		return true, mergeOpenCodeUsageSteps(ledger, "managed_fp", managedSteps)
+	})
+
+	returned := false
+	for i := 0; i < 4; i++ {
+		clock.now = clock.now.Add(time.Second)
+		scanOpenCodeDirect(t)
+		if c := loadOpenCodeUsageLedger().DirectCursor; c != nil && !c.Continue && c.ThroughMs <= running.createdMs {
+			returned = true
+		}
+	}
+	if !returned {
+		t.Fatalf("cursor never returned to the running message once drained")
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 311 {
+		t.Fatalf("bucket = %+v, want 311 tokens: every record past the pin, each once", b)
+	}
+
+	running.completedMs = clock.ms(-time.Second)
+	running.writtenMs = 0
+	store.write(running)
+	openCodeDirectMaxRecords = 8192
+	clock.now = clock.now.Add(time.Minute)
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 1311 {
+		t.Fatalf("bucket = %+v, want 1311 tokens once the running message completes", b)
 	}
 }
