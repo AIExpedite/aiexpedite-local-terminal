@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -215,6 +216,52 @@ func TestOpenCodeDirectSQLite_CapsTruncate(t *testing.T) {
 	}
 }
 
+// SQLite's length() counts characters over TEXT, so every byte cap casts the
+// record to a blob first: a record whose multibyte text fits the character
+// count is still skipped, exactly as the JSON adapter skips it by file size.
+func TestOpenCodeDirectSQLite_ByteCapsCountBytesNotCharacters(t *testing.T) {
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	data := fmt.Sprintf(`{"role":"assistant","title":%q,"cost":0,"tokens":{"input":5,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":%d,"completed":%d}}`,
+		strings.Repeat("\u20ac", 300), base, base+10)
+	if _, err := db.Exec(`INSERT INTO session VALUES ('ses_a','p','s','/w','secret title','1',?,?)`, base, base+10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO message VALUES ('msg_a','ses_a',?,?,?)`, base, base+10, data); err != nil {
+		t.Fatal(err)
+	}
+
+	limits := openCodeDirectTestLimits()
+	// Over the cap in bytes, under it in characters.
+	limits.MaxRecordBytes = int64(len([]rune(data))) + 1
+	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, limits)
+	if err != nil || read.Skipped != 1 || len(read.Messages) != 0 {
+		t.Fatalf("multibyte oversized read = %+v, %v", read, err)
+	}
+
+	// The same holds for a step part: one past the byte cap is not aggregated.
+	insertOpenCodeSQLiteMessage(t, db, "ses_b", "msg_b", base, base+10, base+10, [][3]int64{{1, 0, 0}}, 0)
+	part := fmt.Sprintf(`{"type":"step-finish","reason":"stop","note":%q,"cost":0,"tokens":{"input":7,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}`,
+		strings.Repeat("\u20ac", openCodeDirectMaxPartBytes/3))
+	if _, err := db.Exec(`INSERT INTO part VALUES ('prt_big','msg_b','ses_b',?,?,?)`, base, base+10, part); err != nil {
+		t.Fatal(err)
+	}
+	read, err = readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var big *openCodeDirectMessage
+	for i := range read.Messages {
+		if read.Messages[i].ID == "msg_b" {
+			big = &read.Messages[i]
+		}
+	}
+	if big == nil || !big.Valid || big.Usage.Input != 1 {
+		t.Fatalf("msg_b = %+v, want only the step part inside the byte cap", big)
+	}
+}
+
 // A message's step parts are capped before SQLite aggregates them, as the JSON
 // adapter caps its part listing: a turn with more parts reads as an under-count.
 func TestOpenCodeDirectSQLite_CapsTheStepPartsOfOneMessage(t *testing.T) {
@@ -362,4 +409,3 @@ func TestOpenCodeDirectSQLite_SessionCutWithIncompleteMessagePreservesRecordFloo
 		t.Fatalf("bucket tokens = %d, want 52 (42 + 10)", b.tokens())
 	}
 }
-

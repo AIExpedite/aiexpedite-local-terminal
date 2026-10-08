@@ -63,15 +63,18 @@ func openCodeSQLiteReadOnlyDSN(path string) string {
 // even for a string), so a malformed value reaches Go as an invalid message
 // rather than failing json() and the whole query. A message's step parts are
 // capped before they are aggregated, as the JSON adapter caps its part listing,
-// so one long agentic turn cannot build an unbounded steps value.
+// so one long agentic turn cannot build an unbounded steps value. Every size
+// check casts data to a blob first: length() over TEXT counts characters, so a
+// record holding multibyte text would otherwise pass a byte cap up to four
+// times its limit.
 const openCodeSQLiteMessageQuery = `
 SELECT m.id, m.session_id, m.time_created, m.time_updated,
-       length(m.data) > ? AS oversized,
-       CASE WHEN length(m.data) <= ? AND json_valid(m.data) THEN json_object(
+       length(CAST(m.data AS BLOB)) > ? AS oversized,
+       CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data) THEN json_object(
          'tokens', json(m.data -> '$.tokens'),
          'cost', json_extract(m.data, '$.cost'),
          'completed', json_extract(m.data, '$.time.completed')) END AS info,
-       CASE WHEN length(m.data) <= ? AND json_valid(m.data) THEN (
+       CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data) THEN (
          SELECT json_group_array(json_object(
            'type', 'step-finish',
            'tokens', json(p.data -> '$.tokens'),
@@ -79,7 +82,7 @@ SELECT m.id, m.session_id, m.time_created, m.time_updated,
          FROM (
            SELECT p.data FROM part p
            WHERE p.message_id = m.id
-             AND length(p.data) <= ?
+             AND length(CAST(p.data AS BLOB)) <= ?
              AND CASE WHEN json_valid(p.data) THEN json_extract(p.data, '$.type') END = 'step-finish'
            LIMIT ?
          ) p
@@ -87,7 +90,7 @@ SELECT m.id, m.session_id, m.time_created, m.time_updated,
 FROM message m
 WHERE m.session_id IN (%s)
   AND m.time_updated >= ?
-  AND (length(m.data) > ? OR CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END = 'assistant')
+  AND (length(CAST(m.data AS BLOB)) > ? OR CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END = 'assistant')
 ORDER BY m.time_updated, m.id
 LIMIT ?`
 
