@@ -430,6 +430,8 @@ func TestGatherPowerShellPolicyWindows_PwshMachineInstalled(t *testing.T) {
 		{"Store alias", `C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe`, false},
 		{"per-user install", `C:\Users\me\.dotnet\tools\pwsh.exe`, false},
 		{"a look-alike folder", `C:\Program Files Evil\PowerShell\7\pwsh.exe`, false},
+		{"a .. escape out of Program Files", `C:\Program Files\PowerShell\..\..\Users\me\pwsh.exe`, false},
+		{"case and slashes differ", `c:/PROGRAM FILES/powershell/7/pwsh.exe`, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

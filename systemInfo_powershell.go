@@ -31,7 +31,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"path/filepath"
+	pathpkg "path"
 	"strings"
 	"sync"
 )
@@ -207,23 +207,32 @@ var powerShellProgramFilesDirs = func() []string {
 
 // isMachineInstalledPwsh reports whether the pwsh found on PATH lives under
 // <Program Files>\PowerShell\ — the same folders the elevated step resolves
-// pwsh.exe from (never PATH). A Store alias (%LOCALAPPDATA%\Microsoft// WindowsApps) or a per-user install keeps its LocalMachine setting where an
+// pwsh.exe from (never PATH). A Store alias (%LOCALAPPDATA%\Microsoft\
+// WindowsApps) or a per-user install keeps its LocalMachine setting where an
 // administrator cannot (WindowsApps) or need not (user-owned) write it.
 func isMachineInstalledPwsh(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	clean := strings.ToLower(filepath.Clean(path))
+	clean := windowsPathKey(path)
 	for _, dir := range powerShellProgramFilesDirs() {
 		if strings.TrimSpace(dir) == "" {
 			continue
 		}
-		root := strings.ToLower(filepath.Join(filepath.Clean(dir), "PowerShell")) + string(filepath.Separator)
-		if strings.HasPrefix(clean, root) {
+		if strings.HasPrefix(clean, windowsPathKey(dir)+"/powershell/") {
 			return true
 		}
 	}
 	return false
+}
+
+// windowsPathKey puts a Windows path in a comparable form on every OS (these
+// tests also run on the Linux CI leg, where filepath does not treat `\` as a
+// separator): forward slashes, `.` / `..` resolved — so a PATH entry such as
+// `C:\Program Files\PowerShell\..\..\Users\me` cannot pass for a Program
+// Files install — and lowercased (NTFS paths are case-insensitive).
+func windowsPathKey(p string) string {
+	return strings.ToLower(pathpkg.Clean(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/")))
 }
 
 // parsePowerShellPolicyJSON reads powerShellPolicyScript's output for host and
