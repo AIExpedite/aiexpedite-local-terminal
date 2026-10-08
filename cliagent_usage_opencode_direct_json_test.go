@@ -120,10 +120,37 @@ func TestOpenCodeDirectJSON_TheDeadlineStopsAMessageListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	dirAt := info.ModTime().UnixMilli()
-	ctx := &openCodeDirectCountdownCtx{Context: context.Background(), left: openCodeDirectListBatch + 3}
+	ctx := &openCodeDirectCountdownCtx{Context: context.Background(), left: openCodeDirectListBatch + 6} // 3 checks list the root
 	read, err = readOpenCodeDirectJSON(ctx, root, base, openCodeDirectTestLimits())
 	if err != nil || len(read.Messages) != 0 || !read.Truncated || !read.AtSession || read.ThroughMs != dirAt {
 		t.Fatalf("a listing the deadline stopped = %+v, %v", read, err)
+	}
+}
+
+// The session root is listed in batches under the deadline too, by the reader
+// and the store marker: a deadline that lands mid-listing reads nothing and
+// fails the scan, and reports the marker incomplete, instead of materialising
+// the whole root first.
+func TestOpenCodeDirectJSON_TheDeadlineStopsTheSessionRootListing(t *testing.T) {
+	root := t.TempDir()
+	store := &openCodeTestStore{t: t, root: root}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	const n = 2*openCodeDirectListBatch + 5
+	for i := 0; i < n; i++ {
+		at := base + int64(i)*1000
+		store.write(openCodeTestMessage{session: fmt.Sprintf("ses_%03d", i), id: fmt.Sprintf("msg_%03d", i), createdMs: at, completedMs: at + 500})
+	}
+	if _, _, ok := openCodeStoreMarker(context.Background(), openCodeStoreLayoutJSON, root); !ok {
+		t.Fatal("a marker inside its budget is incomplete")
+	}
+	ctx := &openCodeDirectCountdownCtx{Context: context.Background(), left: openCodeDirectListBatch + 3}
+	if _, _, ok := openCodeStoreMarker(ctx, openCodeStoreLayoutJSON, root); ok {
+		t.Fatal("a marker the deadline stopped reports complete")
+	}
+	ctx = &openCodeDirectCountdownCtx{Context: context.Background(), left: openCodeDirectListBatch + 3}
+	read, err := readOpenCodeDirectJSON(ctx, root, base, openCodeDirectTestLimits())
+	if err == nil || len(read.Messages) != 0 || read.Truncated {
+		t.Fatalf("a root listing the deadline stopped = %+v, %v", read, err)
 	}
 }
 
@@ -163,7 +190,7 @@ func TestOpenCodeDirectJSON_TheMarkerSeesAMessageInAnExistingSession(t *testing.
 	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: base.UnixMilli(), completedMs: base.UnixMilli() + 1, steps: [][3]int64{{1, 0, 0}}})
 	top := filepath.Join(root, "storage", "message")
 	store.touchDir(top, base.UnixMilli())
-	before, _ := openCodeStoreMarker(openCodeStoreLayoutJSON, root)
+	before, _, _ := openCodeStoreMarker(context.Background(), openCodeStoreLayoutJSON, root)
 	topInfo, err := os.Stat(top)
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +213,7 @@ func TestOpenCodeDirectJSON_TheMarkerSeesAMessageInAnExistingSession(t *testing.
 	if err := os.Chtimes(top, topInfo.ModTime(), topInfo.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	if after, _ := openCodeStoreMarker(openCodeStoreLayoutJSON, root); after == before {
+	if after, _, _ := openCodeStoreMarker(context.Background(), openCodeStoreLayoutJSON, root); after == before {
 		t.Fatalf("marker %q did not move", after)
 	}
 }

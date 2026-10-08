@@ -1255,7 +1255,7 @@ func TestCLIUsageHint_OpenCodeTickPicksUpANewMessageAndHintsOnce(t *testing.T) {
 	for openCodeDirectBucket(t, "", clock.now).tokens() != 7 {
 		if time.Now().After(deadline) {
 			layout, root := openCodeStoreLayout()
-			marker, _ := openCodeStoreMarker(layout, root)
+			marker, _, _ := openCodeStoreMarker(context.Background(), layout, root)
 			openCodeDirectGateMu.Lock()
 			last, again := openCodeDirectLastMarker, openCodeDirectAgain
 			openCodeDirectGateMu.Unlock()

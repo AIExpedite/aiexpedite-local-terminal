@@ -277,7 +277,15 @@ func openCodeDirectScanIfChanged() {
 	if layout == openCodeStoreLayoutUnknown {
 		return
 	}
-	marker, _ := openCodeStoreMarker(layout, root)
+	ctx, cancel := context.WithTimeout(context.Background(), openCodeDirectTickBudget)
+	marker, _, ok := openCodeStoreMarker(ctx, layout, root)
+	cancel()
+	if !ok {
+		// A session root too large to list inside the tick's budget: the
+		// reader's own listing would stop at the same deadline, so the tick
+		// leaves it to the Refresh click's larger budget.
+		return
+	}
 	openCodeDirectGateMu.Lock()
 	unchanged := marker == openCodeDirectLastMarker && !openCodeDirectAgain
 	openCodeDirectGateMu.Unlock()
@@ -309,10 +317,16 @@ func openCodeDirectScanOnRefresh(ctx context.Context) string {
 func openCodeDirectScanShared(budget time.Duration) string {
 	v, _, _ := openCodeDirectGroup.Do("scan", func() (any, error) {
 		layout, root := openCodeStoreLayout()
+		// One budget covers the marker and the read.
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
 		// The marker is taken BEFORE the read, so a write that lands during it
 		// moves the marker again for the next tick.
-		marker, changedAt := openCodeStoreMarker(layout, root)
-		label, again := openCodeDirectScan(layout, root, budget)
+		marker, changedAt, ok := openCodeStoreMarker(ctx, layout, root)
+		label, again := "direct_truncated", true
+		if ok {
+			label, again = openCodeDirectScan(ctx, layout, root)
+		}
 		if time.Since(changedAt) < openCodeDirectSettleWindow {
 			again = true
 		}
@@ -331,8 +345,10 @@ func openCodeDirectScanShared(budget time.Duration) string {
 // write-ahead log. JSON: the newest mtime among the session directories under
 // storage/message, from one listing — the top directory's own mtime moves only
 // when a NEW session directory is made, not when a message lands in an
-// existing one.
-func openCodeStoreMarker(layout, root string) (marker string, changedAt time.Time) {
+// existing one. That listing is batched under ctx's deadline, so a large
+// session root cannot stall the tick or a Refresh; ok is false when the
+// deadline stopped it and the marker is incomplete.
+func openCodeStoreMarker(ctx context.Context, layout, root string) (marker string, changedAt time.Time, ok bool) {
 	switch layout {
 	case openCodeStoreLayoutSQLite:
 		marker = layout
@@ -347,34 +363,35 @@ func openCodeStoreMarker(layout, root string) (marker string, changedAt time.Tim
 				changedAt = info.ModTime()
 			}
 		}
-		return marker, changedAt
+		return marker, changedAt, true
 	case openCodeStoreLayoutJSON:
-		entries, err := os.ReadDir(filepath.Join(root, "storage", "message"))
-		if err != nil {
-			return layout + "|-", changedAt
+		messageRoot := filepath.Join(root, "storage", "message")
+		if _, err := os.Stat(messageRoot); err != nil {
+			return layout + "|-", changedAt, true
 		}
 		dirs := 0
-		for _, e := range entries {
+		ok = eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
 			if !e.IsDir() {
-				continue
+				return
 			}
 			dirs++
 			if info, err := e.Info(); err == nil && info.ModTime().After(changedAt) {
 				changedAt = info.ModTime()
 			}
-		}
-		return fmt.Sprintf("%s|%d|%d", layout, dirs, changedAt.UnixNano()), changedAt
+		})
+		return fmt.Sprintf("%s|%d|%d", layout, dirs, changedAt.UnixNano()), changedAt, ok
 	}
-	return layout, changedAt
+	return layout, changedAt, true
 }
 
 /* --------------------------------------------------------------------------
    Scan
    -------------------------------------------------------------------------- */
 
-// openCodeDirectScan reads the store once and commits what it found. label is
-// the fixed log label; again reports work a later scan must finish.
-func openCodeDirectScan(layout, root string, budget time.Duration) (label string, again bool) {
+// openCodeDirectScan reads the store once, inside ctx's budget, and commits
+// what it found. label is the fixed log label; again reports work a later scan
+// must finish.
+func openCodeDirectScan(ctx context.Context, layout, root string) (label string, again bool) {
 	read := openCodeDirectReaders[layout]
 	if layout == openCodeStoreLayoutUnknown || read == nil {
 		return "direct_layout_unknown", false
@@ -382,8 +399,6 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 	now := openCodeDirectNow()
 	saved := loadOpenCodeUsageLedger()
 	floorMs := openCodeDirectScanFloor(saved, now)
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
 	limits := openCodeDirectLimits{
 		MaxSessions:    openCodeDirectMaxSessions,
 		MaxRecords:     openCodeDirectMaxRecords,

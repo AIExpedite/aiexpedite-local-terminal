@@ -55,8 +55,7 @@ type openCodeDirectJSONFile struct {
 func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error) {
 	var read openCodeDirectRead
 	messageRoot := filepath.Join(root, "storage", "message")
-	entries, err := os.ReadDir(messageRoot)
-	if err != nil {
+	if _, err := os.Stat(messageRoot); err != nil {
 		return read, err
 	}
 
@@ -67,17 +66,23 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 	}
 	var sessions []sessionDir
 	sinceMs := limits.sessionsSinceMs(floorMs)
-	for _, e := range entries {
+	// Sessions are read in last-write order, so the root must be listed whole
+	// before any is read: a root the budget cannot list reads nothing, and the
+	// scan fails without moving the cursor.
+	rootListed := eachOpenCodeDirectEntry(ctx, messageRoot, 0, func(e os.DirEntry) {
 		if !e.IsDir() || !isValidOpenCodeSessionID(e.Name()) {
-			continue
+			return
 		}
 		info, err := e.Info()
 		if err != nil {
-			continue
+			return
 		}
 		if at := info.ModTime().UnixMilli(); at >= sinceMs {
 			sessions = append(sessions, sessionDir{name: e.Name(), at: at})
 		}
+	})
+	if !rootListed {
+		return read, ctx.Err()
 	}
 	sort.Slice(sessions, func(i, j int) bool {
 		if sessions[i].at != sessions[j].at {
