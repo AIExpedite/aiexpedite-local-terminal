@@ -249,8 +249,8 @@ func encodeClaudeHookEvent(settings, hooks map[string]json.RawMessage, event str
 // claudeRunEndHookReconciled reports whether settings.json's SessionEnd hook is
 // in the desired state for periodic reconciliation:
 //   - If the usage probe is armed: a live hook (ours or a peer channel's) sits in
-//     a group without a matcher, so it fires on every session end, and no dead
-//     or matcher-restricted copy needs cleanup.
+//     a group without a matcher, so it fires on every session end, and no dead,
+//     matcher-restricted or mistimed copy needs cleanup.
 //   - If the usage probe is disabled: our own hook is not present (or was removed),
 //     a peer channel's live hook is preserved, and no dead hook needs cleanup.
 func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
@@ -265,6 +265,7 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 		hasUnfiltered bool // ours or a live peer's, in a group without a matcher
 		hasDeadHook   bool
 		hasRestricted bool // ours or a live peer's, behind a matcher
+		hasMistimed   bool // ours or a live peer's, with a timeout other than ours
 	)
 	for _, g := range groups {
 		var group map[string]json.RawMessage
@@ -287,6 +288,11 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 				hasDeadHook = true
 				continue
 			}
+			// A shorter timeout can kill the hook inside the owe's lock wait and
+			// drop the debt, so a copy whose timeout drifted needs a re-point.
+			if cur.Timeout != claudeRunEndHookTimeoutSeconds {
+				hasMistimed = true
+			}
 			// A copy behind a matcher fires only on that end reason, so it never
 			// satisfies the armed state: ensureClaudeRunEndHook moves it into a
 			// group of its own.
@@ -299,7 +305,7 @@ func claudeRunEndHookReconciled(settings map[string]json.RawMessage) bool {
 	}
 
 	if probeArmed {
-		return hasUnfiltered && !hasDeadHook && !hasRestricted
+		return hasUnfiltered && !hasDeadHook && !hasRestricted && !hasMistimed
 	}
 	return !hasOurs && !hasDeadHook
 }

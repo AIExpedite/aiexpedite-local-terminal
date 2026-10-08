@@ -1463,14 +1463,15 @@ func TestEnsureClaudeStatusLineHookIfStale_InstallsRunEndWhenPeerOnlyHasStatusLi
 }
 
 // writePeerHookSettings writes a settings.json holding a peer channel's status
-// line and its run-end hook, the latter in a group with `matcher` (none when "").
-func writePeerHookSettings(t *testing.T, settingsPath, peerExe, matcher string) (statusLineCmd, runEndCmd string) {
+// line and its run-end hook, the latter in a group with `matcher` (none when "")
+// and the given hook `timeout`.
+func writePeerHookSettings(t *testing.T, settingsPath, peerExe, matcher string, timeout int) (statusLineCmd, runEndCmd string) {
 	t.Helper()
 	peerCache := filepath.Join(t.TempDir(), "peer-rl.json")
 	statusLineCmd = claudeHookPosixCommand(peerExe, statusLineHookArg, claudeHookPin{"RL_CACHE", peerCache})
 	runEndCmd = claudeHookPosixCommand(peerExe, claudeRunEndHookArg, claudeHookPin{"RL_CACHE", peerCache})
 	group := map[string]any{"hooks": []any{map[string]any{
-		"type": "command", "command": runEndCmd, "timeout": claudeRunEndHookTimeoutSeconds,
+		"type": "command", "command": runEndCmd, "timeout": timeout,
 	}}}
 	if matcher != "" {
 		group["matcher"] = matcher
@@ -1495,7 +1496,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsAMatcherRestrictedRunEndHook(t
 	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writePeerHookSettings(t, settingsPath, peerExe, "logout")
+	writePeerHookSettings(t, settingsPath, peerExe, "logout", claudeRunEndHookTimeoutSeconds)
 
 	changed, err := ensureClaudeStatusLineHookIfStale(home)
 	if err != nil || !changed {
@@ -1534,7 +1535,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsANonExecutablePeerBinary(t *te
 	if isClaudeHookExecutableLive(peerExe) {
 		t.Fatal("a file without execute bits must not count as a live hook binary")
 	}
-	writePeerHookSettings(t, settingsPath, peerExe, "")
+	writePeerHookSettings(t, settingsPath, peerExe, "", claudeRunEndHookTimeoutSeconds)
 
 	changed, err := ensureClaudeStatusLineHookIfStale(home)
 	if err != nil || !changed {
@@ -1542,5 +1543,43 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsANonExecutablePeerBinary(t *te
 	}
 	if sl, re := claudeHookEntries(t, settingsPath); !sl || !re {
 		t.Fatalf("after repair: statusLine=%v runEnd=%v, want both ours", sl, re)
+	}
+}
+
+// A live peer run-end hook whose timeout drifted below ours can be killed
+// inside the owe's lock wait, so with the probe armed the reconcile does not
+// accept it: it re-points the hook with our timeout.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsAMistimedRunEndHook(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	peerExe := filepath.Join(t.TempDir(), "peer-agent")
+	if err := os.WriteFile(peerExe, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writePeerHookSettings(t, settingsPath, peerExe, "", 1)
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil || !changed {
+		t.Fatalf("reconcile: changed=%v err=%v, want a repair", changed, err)
+	}
+	groups := readSettingsMap(t, settingsPath)["hooks"].(map[string]any)[claudeRunEndHookEvent].([]any)
+	found := 0
+	for _, g := range groups {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			entry := h.(map[string]any)
+			if countOurRunEndHooks([]string{entry["command"].(string)}) == 0 {
+				continue
+			}
+			found++
+			if timeout, _ := entry["timeout"].(float64); int(timeout) != claudeRunEndHookTimeoutSeconds {
+				t.Errorf("run-end hook timeout = %v, want %d", entry["timeout"], claudeRunEndHookTimeoutSeconds)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("SessionEnd = %+v, want exactly one run-end hook", groups)
 	}
 }
