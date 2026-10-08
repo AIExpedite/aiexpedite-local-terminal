@@ -672,6 +672,11 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 // Claude upgrade that dropped our hooks is repaired without waiting for an
 // agent-run session — a direct run never triggers one.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
+	// Serialized with resetCLIUsagePropagator exactly as fire is, so a tick in
+	// flight finishes before a test reset restores the vars it reads
+	// (claudeUsageFallbackDetected, the cache path) under it.
+	p.firing.Lock()
+	defer p.firing.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.fallbackGen {
 		p.mu.Unlock()
