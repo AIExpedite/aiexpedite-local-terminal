@@ -14,8 +14,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -88,7 +86,7 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 
 	var files []openCodeDirectJSONFile
 	for _, s := range sessions {
-		if openCodeDirectOutOfTime(ctx, limits) {
+		if ctx.Err() != nil {
 			read.truncateAt(s.at)
 			break
 		}
@@ -121,9 +119,9 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 		files = files[:limits.MaxRecords]
 	}
 
-	recognised := 0
+	recognised, misshapen := 0, 0
 	for _, f := range files {
-		if openCodeDirectOutOfTime(ctx, limits) {
+		if ctx.Err() != nil {
 			read.truncateAt(f.at)
 			break
 		}
@@ -132,13 +130,14 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 			continue
 		}
 		var msg openCodeDirectJSONMessage
-		if !readOpenCodeDirectRecord(f.path, limits.MaxRecordBytes, &msg) || msg.ID == "" || msg.Role == "" {
+		if !readJSONFileWithin(f.path, limits.MaxRecordBytes, &msg) {
 			read.Skipped++
 			continue
 		}
 		created, ok := openCodeUsageMillis(msg.Time.Created)
-		if !ok || !isValidOpenCodeSessionID(msg.ID) {
+		if !ok || msg.Role == "" || !isValidOpenCodeSessionID(msg.ID) {
 			read.Skipped++
+			misshapen++
 			continue
 		}
 		recognised++
@@ -158,9 +157,10 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 		}
 		read.Messages = append(read.Messages, m)
 	}
-	if recognised == 0 && read.Skipped > 0 {
-		// Records, but none in a shape this adapter knows: a layout change, not
-		// a few corrupt files. Fail closed rather than publish a 0.
+	if recognised == 0 && misshapen > 0 {
+		// Records that decode, but none in a shape this adapter knows: a layout
+		// change, not a few corrupt or oversized files. Fail closed rather than
+		// publish a 0.
 		return openCodeDirectRead{}, errOpenCodeDirectLayoutUnknown
 	}
 	return read, nil
@@ -185,29 +185,9 @@ func readOpenCodeDirectJSONParts(dir string) []openCodeExportPart {
 			continue
 		}
 		var part openCodeExportPart
-		if readOpenCodeDirectRecord(filepath.Join(dir, e.Name()), openCodeDirectMaxPartBytes, &part) && isOpenCodeStepFinishType(part.Type) {
+		if readJSONFileWithin(filepath.Join(dir, e.Name()), openCodeDirectMaxPartBytes, &part) && isOpenCodeStepFinishType(part.Type) {
 			parts = append(parts, part)
 		}
 	}
 	return parts
-}
-
-// readOpenCodeDirectRecord decodes one record of at most maxBytes into the
-// narrow struct into, closing the file before it returns.
-func readOpenCodeDirectRecord(path string, maxBytes int64, into any) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
-	_ = f.Close()
-	if err != nil || len(b) == 0 || int64(len(b)) > maxBytes {
-		return false
-	}
-	return json.Unmarshal(b, into) == nil
-}
-
-// openCodeDirectOutOfTime reports a spent budget.
-func openCodeDirectOutOfTime(ctx context.Context, limits openCodeDirectLimits) bool {
-	return ctx.Err() != nil || (!limits.Deadline.IsZero() && time.Now().After(limits.Deadline))
 }

@@ -19,8 +19,9 @@ import (
    their bounds. Every case reads a temporary store under a pinned clock.
    ------------------------------------------------------------------------ */
 
-// openCodeDirectClock is the pinned instant both the reader and the run
-// lifecycle read. Noon UTC on a fixed day keeps every case clear of midnight.
+// openCodeDirectTestNoon is where each case's clock starts: noon UTC on a fixed
+// day keeps every case clear of midnight. The clock is what both the reader and
+// the run lifecycle read.
 var openCodeDirectTestNoon = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 
 type openCodeDirectTestClock struct{ now time.Time }
@@ -581,5 +582,33 @@ func TestOpenCodeDirect_AnUnknownLayoutFailsClosed(t *testing.T) {
 	raw, _ := json.Marshal(openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, ObservedAtMs: clock.ms(0)}, true, openCodeUsageDayFor("", clock.now).Direct, clock.now))
 	if !json.Valid(raw) || !strings.Contains(string(raw), "Tokens today (agent runs)") {
 		t.Fatalf("label = %s", raw)
+	}
+}
+
+// A scan that finds nothing new skips the whole-ledger rewrite while its cursor
+// stays inside the overlap, and writes again once it would fall behind.
+func TestOpenCodeDirect_AnIdleScanSkipsTheLedgerRewrite(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2061)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-time.Hour), completedMs: clock.ms(-time.Hour + time.Second), steps: [][3]int64{{2, 0, 0}}})
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("first scan = %q", label)
+	}
+	first := loadOpenCodeUsageLedger().DirectCursor.ThroughMs
+	clock.now = clock.now.Add(time.Minute)
+	if label := scanOpenCodeDirect(t); label != "direct_unchanged" {
+		t.Fatalf("idle scan = %q", label)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c.ThroughMs != first {
+		t.Fatalf("an idle scan rewrote the cursor: %+v", c)
+	}
+	clock.now = clock.now.Add(openCodeDirectOverlap)
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan past the overlap = %q", label)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c.ThroughMs != clock.ms(0) {
+		t.Fatalf("cursor = %+v, want advanced to the scan", c)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 2 {
+		t.Fatalf("bucket = %+v", b)
 	}
 }

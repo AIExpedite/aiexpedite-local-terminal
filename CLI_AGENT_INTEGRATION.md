@@ -2192,8 +2192,11 @@ local midnight (under-count over double count).
 `cost` into narrow structs; the SQLite adapter reduces JSON inside SQLite, so
 message text and tool output never reach the agent. The ledger gains counts,
 hashed keys and hashed session ids; logs are fixed labels (`direct_scanned`,
-`direct_truncated`, `direct_layout_unknown`, `direct_read_failed`,
-`direct_lock_busy`). The reader never writes, locks, migrates or vacuums
+`direct_unchanged`, `direct_truncated`, `direct_layout_unknown`,
+`direct_read_failed`, `direct_lock_busy`). A scan that finds nothing new skips
+the ledger rewrite while its cursor is still inside the 10-minute overlap. The
+ledger is read with its own 1 MiB bound (a full ledger is about 220 KB): a file
+past the bound reads as empty. The reader never writes, locks, migrates or vacuums
 OpenCode's store and never reads `auth.json`.
 
 ## Redaction

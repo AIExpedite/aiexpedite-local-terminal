@@ -200,10 +200,13 @@ type cliUsagePropagatorState struct {
 	// rotating tracks the startup rotation goroutine so a test reset can wait
 	// for it instead of letting it write into the next test's cache.
 	rotating sync.WaitGroup
-	// firing serializes timer callbacks (fire, fallback) with
-	// resetCLIUsagePropagator (tests), so a callback in flight finishes before
-	// the state is reset under it.
+	// firing serializes timer callbacks with resetCLIUsagePropagator (tests),
+	// so a callback in flight finishes before the state is reset under it.
 	firing sync.Mutex
+	// fallbackRunning does the same for a fallback read in flight (an OpenCode
+	// store scan can take its whole budget). It is separate from firing so the
+	// fallback never waits behind a hint send, or a hint behind a scan.
+	fallbackRunning sync.Mutex
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -670,8 +673,8 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 // status-line hook) when no ordinary read has — one small cache read — and runs
 // the OpenCode direct scan, each only while its gates are open.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
-	p.firing.Lock()
-	defer p.firing.Unlock()
+	p.fallbackRunning.Lock()
+	defer p.fallbackRunning.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.fallbackGen {
 		p.mu.Unlock()
@@ -838,6 +841,9 @@ func logCLIUsageHint(label string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	// A fallback that passed its stopped check before the stop finishes first.
+	p.fallbackRunning.Lock()
+	p.fallbackRunning.Unlock()
 	p.firing.Lock()
 	defer p.firing.Unlock()
 	p.mu.Lock()

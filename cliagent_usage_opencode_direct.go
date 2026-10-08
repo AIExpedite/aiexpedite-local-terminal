@@ -93,12 +93,12 @@ var (
 // errOpenCodeDirectLayoutUnknown: the store is not a shape an adapter knows.
 var errOpenCodeDirectLayoutUnknown = errors.New("opencode store layout unknown")
 
-// openCodeDirectLimits bounds one adapter read.
+// openCodeDirectLimits bounds one adapter read; the time budget is the read's
+// context deadline.
 type openCodeDirectLimits struct {
 	MaxSessions    int
 	MaxRecords     int
 	MaxRecordBytes int64
-	Deadline       time.Time
 }
 
 // openCodeDirectMessage is one stored assistant message.
@@ -190,7 +190,9 @@ func openCodeDirectScanOnRefresh(ctx context.Context) string {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < openCodeDirectClickBudget {
 		return liveProbeOutcomeNotMerged
 	}
-	if openCodeDirectScanShared(openCodeDirectClickBudget) != "direct_scanned" {
+	switch openCodeDirectScanShared(openCodeDirectClickBudget) {
+	case "direct_scanned", "direct_unchanged":
+	default:
 		return liveProbeOutcomeNotMerged
 	}
 	return liveProbeOutcomeOK
@@ -275,12 +277,10 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 	floorMs := openCodeDirectScanFloor(loadOpenCodeUsageLedger(), now)
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	deadline, _ := ctx.Deadline()
 	result, err := read(ctx, root, floorMs, openCodeDirectLimits{
 		MaxSessions:    openCodeDirectMaxSessions,
 		MaxRecords:     openCodeDirectMaxRecords,
 		MaxRecordBytes: openCodeDirectMaxRecordBytes,
-		Deadline:       deadline,
 	})
 	switch {
 	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
@@ -291,26 +291,45 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 
 	memHold := openCodeUsageArmedHoldMs(now)
 	fingerprint := openCodeKnownAccountFingerprint(resolveOpenCodeExecutable())
-	held, pending := false, false
+	today, _ := openCodeLocalDay(now)
+	held, pending, unchanged := false, false, false
 	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		steps, throughMs, h, p := openCodeDirectSteps(ledger, result, minNonZero(memHold, openCodeLedgerHoldMs(ledger, now)), now)
 		held, pending = h, p
 		changed := mergeOpenCodeUsageSteps(ledger, fingerprint, steps)
+		if !changed && !result.Truncated && openCodeDirectWriteCanWait(ledger, layout, today, throughMs) {
+			// Nothing new, coverage already today and the cursor within the
+			// overlap: the next scan re-reads the same few records, so the
+			// whole-ledger rewrite is skipped. A capped scan always saves its
+			// cursor, or it would stop at the same record forever.
+			unchanged = true
+			return false, false
+		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
-		today, _ := openCodeLocalDay(now)
 		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs}
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
 	})
 	noteOpenCodeUsageAdvanced(committed, changed, generation)
 	switch {
-	case !committed:
+	case !committed && !unchanged:
 		// Nothing moved: the cursor and coverage stay, and the next tick retries.
 		return "direct_lock_busy", true
 	case result.Truncated || result.Skipped > 0:
 		return "direct_truncated", result.Truncated || held || pending
+	case unchanged:
+		return "direct_unchanged", held || pending
 	}
 	return "direct_scanned", held || pending
+}
+
+// openCodeDirectWriteCanWait reports that a scan which found nothing new need
+// not rewrite the ledger: today's coverage is already recorded and the saved
+// cursor trails throughMs by less than the overlap every scan re-reads anyway.
+func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today string, throughMs int64) bool {
+	c, cov := ledger.DirectCursor, ledger.DirectCoverage
+	return c != nil && cov != nil && c.Layout == layout && cov.Layout == layout && cov.LastOkLocalDate == today &&
+		throughMs >= c.ThroughMs && throughMs-c.ThroughMs < openCodeDirectOverlap.Milliseconds()
 }
 
 // openCodeDirectSteps turns a read into ledger steps against ledger's ownership

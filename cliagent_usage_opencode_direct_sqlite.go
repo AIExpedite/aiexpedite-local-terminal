@@ -157,7 +157,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 		if err := rows.Scan(&id, &sessionID, &createdMs, &writtenMs, &oversized, &infoText, &stepsText); err != nil {
 			return read, err
 		}
-		if n == limits.MaxRecords || openCodeDirectOutOfTime(ctx, limits) {
+		if n == limits.MaxRecords || ctx.Err() != nil {
 			read.truncateAt(writtenMs)
 			return read, nil
 		}

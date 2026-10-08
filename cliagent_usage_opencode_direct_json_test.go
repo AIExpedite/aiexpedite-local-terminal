@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,7 +17,7 @@ import (
    ------------------------------------------------------------------------ */
 
 func openCodeDirectTestLimits() openCodeDirectLimits {
-	return openCodeDirectLimits{MaxSessions: 256, MaxRecords: 8192, MaxRecordBytes: 1 << 20, Deadline: time.Now().Add(5 * time.Second)}
+	return openCodeDirectLimits{MaxSessions: 256, MaxRecords: 8192, MaxRecordBytes: 1 << 20}
 }
 
 // Golden records in the shape OpenCode's JSON store holds them: the message
@@ -74,6 +75,14 @@ func TestOpenCodeDirectJSON_AnUnknownShapeIsUnknown(t *testing.T) {
 	if _, err := readOpenCodeDirectJSON(context.Background(), root, 0, openCodeDirectTestLimits()); !errors.Is(err, errOpenCodeDirectLayoutUnknown) {
 		t.Fatalf("err = %v, want layout unknown", err)
 	}
+	// Oversized records are skipped, not read as a layout change.
+	big := t.TempDir()
+	(&openCodeTestStore{t: t, root: big}).writeFile(filepath.Join(big, "storage", "message", "ses_a", "msg_a.json"), `{"id":"msg_a","pad":"`+strings.Repeat("x", 512)+`"}`, at)
+	limits := openCodeDirectTestLimits()
+	limits.MaxRecordBytes = 64
+	if read, err := readOpenCodeDirectJSON(context.Background(), big, 0, limits); err != nil || read.Skipped != 1 {
+		t.Fatalf("oversized-only store = %+v, %v", read, err)
+	}
 	// An empty store is known and empty.
 	empty := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(empty, "storage", "message"), 0o755); err != nil {
@@ -101,8 +110,18 @@ func TestOpenCodeDirectJSON_TheMarkerSeesAMessageInAnExistingSession(t *testing.
 
 	later := base.Add(time.Minute).UnixMilli()
 	store.write(openCodeTestMessage{session: "ses_a", id: "msg_b", createdMs: later, completedMs: later + 1, steps: [][3]int64{{1, 0, 0}}})
-	// Creating msg_b's part directory may touch storage/part, never
-	// storage/message; pin it anyway so only the session directory moved.
+	// Linux stamps directories at a coarse kernel tick, so two writes this close
+	// can share an mtime (the reader's settle window covers that in
+	// production): move the session directory past the first write, and pin
+	// storage/message so only the session directory moved.
+	sessionDir := filepath.Join(top, "ses_a")
+	moved := topInfo.ModTime().Add(time.Minute)
+	if info, err := os.Stat(sessionDir); err == nil && info.ModTime().After(moved) {
+		moved = info.ModTime().Add(time.Second)
+	}
+	if err := os.Chtimes(sessionDir, moved, moved); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chtimes(top, topInfo.ModTime(), topInfo.ModTime()); err != nil {
 		t.Fatal(err)
 	}
