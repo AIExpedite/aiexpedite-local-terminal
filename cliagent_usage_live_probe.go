@@ -29,6 +29,10 @@
 //	    (cliagent_usage_antigravity_gate.go): the probe then stops at the first
 //	    refusal, records the build, and later clicks skip the spawn entirely.
 //
+//	  - OpenCode: reads its local store (cliagent_usage_opencode_direct.go) for
+//	    runs the agent did not spawn, under the reader's own 2 s cap. No turn
+//	    is spent and nothing is started.
+//
 //	  - Muse Code: a private `muse serve` gets one trivial turn and is killed
 //	    as soon as its first `usage/changed` lands — Muse learns its quota only
 //	    from a model response (cliagent_usage_musecode_live.go). Spends a
@@ -134,6 +138,7 @@ var (
 	probeAntigravityQuotaLiveFn  = probeAntigravityQuotaLive
 	probeGrokBillingLiveFn       = probeGrokBillingLiveShared
 	probeMuseCodeUsageLiveFn     = probeMuseCodeUsageLive
+	probeOpenCodeDirectLiveFn    = openCodeDirectScanOnRefresh
 	warmCLIAgentModelDiscoveryFn = warmCLIAgentModelDiscovery
 	liveProbeDetectedAgents      = gatherCLIAgents
 )
@@ -232,6 +237,9 @@ func runCLIUsageLiveProbesOnce(parent context.Context) map[string]string {
 			warmCLIAgentModelDiscoveryFn(ctx, "antigravity", agent, home)
 			return outcome
 		})
+	}
+	if agent, ok := detected[openCodeUsageProvider]; ok && agent.Detected {
+		run(openCodeUsageProvider, func() string { return probeOpenCodeDirectLiveFn(ctx) })
 	}
 	if agent, ok := detected["museCode"]; ok && agent.Detected {
 		// The probe's own host refreshes the model list first

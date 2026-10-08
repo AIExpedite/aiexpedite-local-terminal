@@ -271,7 +271,7 @@ func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
 		CostUsd: 0.4567, ObservedAtMs: observed.UnixMilli(),
 	}
 
-	rows := openCodeUsageMetrics(bucket, true, now)
+	rows := openCodeUsageMetrics(bucket, true, false, now)
 	if len(rows) != 2 {
 		t.Fatalf("rows = %+v, want tokens and cost", rows)
 	}
@@ -301,14 +301,14 @@ func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
 
 func TestOpenCodeUsageMetrics_NoCostRowAtZeroAndNoRowsWithoutABucket(t *testing.T) {
 	now := time.Now()
-	unmetered := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 10, ObservedAtMs: now.UnixMilli()}, true, now)
+	unmetered := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 10, ObservedAtMs: now.UnixMilli()}, true, false, now)
 	if len(unmetered) != 1 || unmetered[0].Label != "Tokens today (agent runs)" {
 		t.Fatalf("rows = %+v, want tokens only: $0.00 would read as free, not unmetered", unmetered)
 	}
-	if rows := openCodeUsageMetrics(openCodeUsageBucket{}, false, now); rows != nil {
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{}, false, false, now); rows != nil {
 		t.Fatalf("no bucket produced %+v, want no rows (no placeholders)", rows)
 	}
-	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, now); rows != nil {
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, false, now); rows != nil {
 		t.Fatalf("an empty bucket produced %+v", rows)
 	}
 }
@@ -321,7 +321,7 @@ func TestOpenCodeUsageMetrics_ASaturatedCostStaysFinite(t *testing.T) {
 	for _, cost := range []float64{math.MaxFloat64, openCodeUsageMaxInt, 1e300} {
 		rows := openCodeUsageMetrics(openCodeUsageBucket{
 			InputTokens: 10, CostUsd: cost, ObservedAtMs: now.UnixMilli(),
-		}, true, now)
+		}, true, false, now)
 		if len(rows) != 2 {
 			t.Fatalf("cost %v produced rows %+v, want tokens and cost", cost, rows)
 		}
@@ -337,8 +337,43 @@ func TestOpenCodeUsageMetrics_ASaturatedCostStaysFinite(t *testing.T) {
 		}
 	}
 	// Ordinary spend still rounds to four decimals.
-	rows := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.123456, ObservedAtMs: now.UnixMilli()}, true, now)
+	rows := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.123456, ObservedAtMs: now.UnixMilli()}, true, false, now)
 	if *rows[1].Consumed != 0.1235 {
 		t.Fatalf("cost = %v, want 0.1235", *rows[1].Consumed)
+	}
+}
+
+// The tokens row says "Tokens today" only while a direct scan read the store
+// today; otherwise (unknown layout, no scan yet, or a scan only yesterday) it
+// stays "(agent runs)". The cost row appears only above zero either way.
+func TestOpenCodeUsageMetrics_LabelFollowsDirectCoverage(t *testing.T) {
+	openCodeUsageFixture(t, 1501)
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	bucket := openCodeUsageBucket{AccountFingerprint: "fp", LocalDate: "2026-10-08", InputTokens: 10, ObservedAtMs: now.UnixMilli()}
+	for _, c := range []struct {
+		name     string
+		coverage *openCodeDirectCoverage
+		want     string
+	}{
+		{"no scan", nil, "Tokens today (agent runs)"},
+		{"scanned yesterday", &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, LastOkLocalDate: "2026-10-07"}, "Tokens today (agent runs)"},
+		{"unknown layout never covers", &openCodeDirectCoverage{Layout: openCodeStoreLayoutUnknown}, "Tokens today (agent runs)"},
+		{"scanned today", &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, LastOkLocalDate: "2026-10-08"}, "Tokens today"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+				ledger.Buckets, ledger.DirectCoverage = []openCodeUsageBucket{bucket}, c.coverage
+				return true, false
+			})
+			day := openCodeUsageDayFor("fp", now)
+			rows := openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, now)
+			if len(rows) != 1 || rows[0].Label != c.want {
+				t.Fatalf("rows = %+v, want one %q row and no zero-cost row", rows, c.want)
+			}
+		})
+	}
+	withCost := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.5, ObservedAtMs: now.UnixMilli()}, true, true, now)
+	if len(withCost) != 2 || withCost[0].Label != "Tokens today" || withCost[1].Label != "Cost today" {
+		t.Fatalf("rows = %+v", withCost)
 	}
 }

@@ -1,13 +1,20 @@
 // cliagent_usage_opencode_capture.go — OpenCode's device-local usage ledger.
 //
-// OpenCode has no quota of its own and no usage command, but every
-// `opencode run --format json` turn reports what it spent: each step closes
-// with a `step_finish` frame whose part carries `tokens` and `cost`. This file
-// reads those frames from every OpenCode turn this agent spawns — the
-// `__cli_smoke__` probe, the resident chat (opencode_native.go) and terminal
-// sessions (session.go) — and folds them into opencode_usage.json, which
-// cliagent_usage_opencode.go publishes as "Tokens today (agent runs)" and
-// "Cost today".
+// OpenCode has no quota of its own and no usage command, but every turn
+// reports what it spent. The ledger, opencode_usage.json, has two producers:
+//
+//   - stream capture (this file): every `opencode run --format json` turn this
+//     agent spawns — the `__cli_smoke__` probe, the resident chat
+//     (opencode_native.go) and terminal sessions (session.go) — closes each
+//     step with a `step_finish` frame whose part carries `tokens` and `cost`.
+//   - the direct-run reader (cliagent_usage_opencode_direct.go): the assistant
+//     messages OpenCode persists in its own store, for the runs the agent did
+//     not spawn — the user's shell or IDE, and the TUI in a terminal-managed
+//     PTY. It skips every message inside a managed run's ownership window
+//     (OwnedRuns), so no turn is counted by both.
+//
+// cliagent_usage_opencode.go publishes the result as "Tokens today" (or
+// "Tokens today (agent runs)" while the store cannot be read) and "Cost today".
 //
 // Shape and invariants:
 //
@@ -57,8 +64,18 @@ const (
 	openCodeUsageProvider      = "opencode"
 	openCodeUsageSchemaVersion = 1
 	openCodeUsageMaxBuckets    = 16
-	openCodeUsageMaxSeenSteps  = 1024
-	openCodeUsageMaxDebts      = 8
+	// openCodeUsageMaxSeenSteps holds a day of hashed keys for a heavy user
+	// (about 150 KB on disk): the direct reader keys every assistant message.
+	openCodeUsageMaxSeenSteps = 8192
+	openCodeUsageMaxDebts     = 8
+	// openCodeUsageMaxOwnedRuns caps the ownership windows. Open windows are
+	// bounded by the live runs; past the cap the oldest CLOSED window goes.
+	openCodeUsageMaxOwnedRuns = 32
+	// openCodeUsageMaxLedgerBytes bounds the ledger read. A full ledger (8,192
+	// keys, 16 buckets, 8 debts, 32 windows, indented) is about 230 KB; one that
+	// does not fit reads as EMPTY, dropping today's buckets, so the bound keeps
+	// several times that headroom.
+	openCodeUsageMaxLedgerBytes = 1 << 20
 	// openCodeUsageMaxRunSteps bounds one run's in-memory accumulator. Steps past
 	// it fold into the last uncommitted one without a dedup key, or recycle the
 	// slots of steps already committed: still counted, never unbounded.
@@ -72,6 +89,108 @@ type openCodeUsageLedger struct {
 	Buckets       []openCodeUsageBucket `json:"buckets,omitempty"`
 	Debts         []openCodeUsageDebt   `json:"debts,omitempty"`
 	SeenSteps     []string              `json:"seenSteps,omitempty"`
+	// The fields below are additive under schemaVersion 1: an older build that
+	// rewrites the ledger drops them and keeps the buckets
+	// (openCodeDirectScanFloor reads that downgrade signature).
+	OwnedRuns []openCodeOwnedRun `json:"ownedRuns,omitempty"`
+	// OwnedEvictedMs is the newest end of a closed window evicted before the
+	// reader's cursor passed it (pruneOpenCodeOwnedRuns): the reader skips every
+	// message created by then, since it can no longer tell which were managed.
+	OwnedEvictedMs int64                   `json:"ownedEvictedMs,omitempty"`
+	DirectCursor   *openCodeDirectCursor   `json:"directCursor,omitempty"`
+	DirectCoverage *openCodeDirectCoverage `json:"directCoverage,omitempty"`
+
+	// seenEvicted records that mergeOpenCodeUsageSteps evicted keys from
+	// seenSteps: the direct reader must not rewind before records whose dedup keys
+	// rolled over.
+	seenEvicted bool
+}
+
+// openCodeOwnedRun is one managed run's ownership window: the direct reader
+// skips every message of the session created in [FromMs, ToMs], because the
+// run's stream (or its export debt) pays those. ToMs 0 is open — the run's
+// stream may still commit. The session id is stored hashed.
+type openCodeOwnedRun struct {
+	RunID      string `json:"runId"`
+	SessionKey string `json:"sessionKey"`
+	FromMs     int64  `json:"fromMs"`
+	ToMs       int64  `json:"toMs,omitempty"`
+}
+
+func (w openCodeOwnedRun) open() bool { return w.ToMs == 0 }
+
+// covers reports whether a message of the hashed session created at createdMs
+// belongs to the run.
+func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
+	return w.SessionKey == sessionKey && createdMs >= w.FromMs && (w.open() || createdMs <= w.ToMs)
+}
+
+// openCodeDirectCursor is where the direct reader resumes: records last
+// written at or after ThroughMs (less an overlap) are read again. Continue
+// marks a cursor a capped scan saved: the next scan resumes AT ThroughMs, since
+// re-reading the overlap could spend the whole cap on records already counted.
+// AtSession marks one the session cap alone stopped: the next scan lists
+// sessions from ThroughMs without the slack, or the same capped sessions would
+// fill the cap again. Skip is the continuation's tie-breaker: how many
+// sessions (AtSession) or records last written at ThroughMs the capped scan
+// read, so entries sharing that millisecond cannot refill the cap forever.
+// RecordFloorMs is a session cut's record floor: the sessions it
+// has not listed yet are read from the floor the capped scan used, since their
+// messages can predate their session's own last write. SessionSinceMs is a
+// record continuation's session listing floor: the one the capped scan listed
+// sessions from, kept while it drains, since a session listed then can still
+// hold unread records rewritten after the cut while its own last write sits
+// before the cut's slack. RewindFloorMs is the end
+// of the last drained backlog: a later scan's overlap does not reach before
+// it, because a backlog larger than a scan's cap can roll seenSteps over, and
+// the keys of the records it read are then no longer there to absorb a re-read.
+// RevisitFloorMs is where a continuation returns once it drains: the earliest
+// point an incomplete message or a hold pinned a capped scan behind its cut,
+// while ThroughMs and Skip keep the cap's own position.
+// PinnedKeys are the keys of the messages a scan read at or after ThroughMs —
+// ones counted past a cursor an incomplete message or a hold pinned behind
+// them: the next scan reads them again, and seenSteps may have rolled their
+// keys over by then, so the cursor keeps them itself until it passes them.
+// PinnedWrittenMs is each pinned key's record last-write time, in step, and
+// PinnedCompletedMs its message's completed time.
+// PinnedDroppedMs is the newest last-write time of a pinned key the cap
+// dropped: a backlog drained behind a pin can outgrow both the pinned keys and
+// seenSteps, so no message last written at or before it is counted again — an
+// incomplete one is rewritten past it once it finishes, and a held one is an
+// under-count, never a double count. PinnedDroppedDoneMs is the newest
+// completed time among those dropped keys, and no message completed at or
+// before it is counted again either: a rewrite of an already-counted message
+// moves its record past the write floor, and its key is by then in neither the
+// pinned keys nor seenSteps, but its completed time does not move.
+type openCodeDirectCursor struct {
+	Layout              string   `json:"layout"`
+	ThroughMs           int64    `json:"throughMs"`
+	Continue            bool     `json:"continue,omitempty"`
+	AtSession           bool     `json:"atSession,omitempty"`
+	Skip                int      `json:"skip,omitempty"`
+	RecordFloorMs       int64    `json:"recordFloorMs,omitempty"`
+	SessionSinceMs      int64    `json:"sessionSinceMs,omitempty"`
+	RewindFloorMs       int64    `json:"rewindFloorMs,omitempty"`
+	RevisitFloorMs      int64    `json:"revisitFloorMs,omitempty"`
+	PinnedKeys          []string `json:"pinnedKeys,omitempty"`
+	PinnedWrittenMs     []int64  `json:"pinnedWrittenMs,omitempty"`
+	PinnedCompletedMs   []int64  `json:"pinnedCompletedMs,omitempty"`
+	PinnedDroppedMs     int64    `json:"pinnedDroppedMs,omitempty"`
+	PinnedDroppedDoneMs int64    `json:"pinnedDroppedDoneMs,omitempty"`
+}
+
+// openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the
+// local date of the newest scan that read the store: today's bucket then holds
+// direct spend, and the card drops "(agent runs)".
+type openCodeDirectCoverage struct {
+	Layout          string `json:"layout"`
+	ObservedAtMs    int64  `json:"observedAtMs"`
+	LastOkLocalDate string `json:"lastOkLocalDate,omitempty"`
+}
+
+// openCodeUsageSessionKey hashes a session id for an ownership window.
+func openCodeUsageSessionKey(sessionID string) string {
+	return openCodeUsageStepKey(sessionID, "session")
 }
 
 // openCodeUsageBucket is one account's spend on one local calendar day.
@@ -86,6 +205,19 @@ type openCodeUsageBucket struct {
 	CostUsd            float64 `json:"costUsd"`
 	// ObservedAtMs is the newest contributing step's end time.
 	ObservedAtMs int64 `json:"observedAtMs"`
+}
+
+// add folds other's counts into b, saturating, keeping the newer observation.
+func (b *openCodeUsageBucket) add(other openCodeUsageBucket) {
+	b.InputTokens = addOpenCodeUsageCount(b.InputTokens, other.InputTokens)
+	b.OutputTokens = addOpenCodeUsageCount(b.OutputTokens, other.OutputTokens)
+	b.ReasoningTokens = addOpenCodeUsageCount(b.ReasoningTokens, other.ReasoningTokens)
+	b.CacheReadTokens = addOpenCodeUsageCount(b.CacheReadTokens, other.CacheReadTokens)
+	b.CacheWriteTokens = addOpenCodeUsageCount(b.CacheWriteTokens, other.CacheWriteTokens)
+	b.CostUsd = addOpenCodeUsageCost(b.CostUsd, other.CostUsd)
+	if other.ObservedAtMs > b.ObservedAtMs {
+		b.ObservedAtMs = other.ObservedAtMs
+	}
 }
 
 // tokens is what "Tokens today" publishes.
@@ -189,7 +321,7 @@ func loadOpenCodeUsageLedger() openCodeUsageLedger {
 // or other-schema file reads as empty. Callers hold openCodeUsageFileMu.
 func readOpenCodeUsageLedger() openCodeUsageLedger {
 	var ledger openCodeUsageLedger
-	if !readBoundedJSONFile(openCodeUsageCachePath(), &ledger) || ledger.SchemaVersion != openCodeUsageSchemaVersion {
+	if !readJSONFileWithin(openCodeUsageCachePath(), openCodeUsageMaxLedgerBytes, &ledger) || ledger.SchemaVersion != openCodeUsageSchemaVersion {
 		return openCodeUsageLedger{SchemaVersion: openCodeUsageSchemaVersion}
 	}
 	return ledger
@@ -355,13 +487,25 @@ func recoverOpenCodeUsageGeneration(attempt int) {
 // openCodeLocalDay is t's local calendar date and the next local midnight — 23
 // or 25 hours away on a DST day.
 func openCodeLocalDay(t time.Time) (date string, resetAt time.Time) {
-	loc := openCodeUsageLocation
-	if loc == nil {
-		loc = time.Local
-	}
+	loc := openCodeUsageZone()
 	local := t.In(loc)
 	y, m, d := local.Date()
 	return local.Format("2006-01-02"), time.Date(y, m, d+1, 0, 0, 0, 0, loc)
+}
+
+// openCodeLocalMidnight is the start of t's local calendar day.
+func openCodeLocalMidnight(t time.Time) time.Time {
+	loc := openCodeUsageZone()
+	y, m, d := t.In(loc).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, loc)
+}
+
+// openCodeUsageZone is the zone local days are cut in.
+func openCodeUsageZone() *time.Location {
+	if openCodeUsageLocation != nil {
+		return openCodeUsageLocation
+	}
+	return time.Local
 }
 
 // openCodeUsageStepsCarryUsage reports whether any of steps would contribute to
@@ -387,6 +531,11 @@ func mergeOpenCodeUsageSteps(ledger *openCodeUsageLedger, fingerprint string, st
 	for _, k := range ledger.SeenSteps {
 		seen[k] = true
 	}
+	if c := ledger.DirectCursor; c != nil {
+		for _, k := range c.PinnedKeys {
+			seen[k] = true
+		}
+	}
 	changed := false
 	for _, step := range steps {
 		if step.Key != "" {
@@ -400,20 +549,23 @@ func mergeOpenCodeUsageSteps(ledger *openCodeUsageLedger, fingerprint string, st
 			continue
 		}
 		date, _ := openCodeLocalDay(time.UnixMilli(step.AtMs))
-		bucket := openCodeUsageBucketFor(ledger, fingerprint, date)
-		bucket.InputTokens = addOpenCodeUsageCount(bucket.InputTokens, step.Input)
-		bucket.OutputTokens = addOpenCodeUsageCount(bucket.OutputTokens, step.Output)
-		bucket.ReasoningTokens = addOpenCodeUsageCount(bucket.ReasoningTokens, step.Reasoning)
-		bucket.CacheReadTokens = addOpenCodeUsageCount(bucket.CacheReadTokens, step.CacheRead)
-		bucket.CacheWriteTokens = addOpenCodeUsageCount(bucket.CacheWriteTokens, step.CacheWrite)
-		bucket.CostUsd = addOpenCodeUsageCost(bucket.CostUsd, step.Cost)
-		if step.AtMs > bucket.ObservedAtMs {
-			bucket.ObservedAtMs = step.AtMs
-		}
+		openCodeUsageBucketFor(ledger, fingerprint, date).add(openCodeUsageBucket{
+			InputTokens:      step.Input,
+			OutputTokens:     step.Output,
+			ReasoningTokens:  step.Reasoning,
+			CacheReadTokens:  step.CacheRead,
+			CacheWriteTokens: step.CacheWrite,
+			CostUsd:          step.Cost,
+			ObservedAtMs:     step.AtMs,
+		})
 		changed = true
 	}
 	if n := len(ledger.SeenSteps); n > openCodeUsageMaxSeenSteps {
 		ledger.SeenSteps = append([]string(nil), ledger.SeenSteps[n-openCodeUsageMaxSeenSteps:]...)
+		ledger.seenEvicted = true
+		if c := ledger.DirectCursor; c != nil && c.ThroughMs > 0 {
+			c.RewindFloorMs = max(c.RewindFloorMs, c.ThroughMs)
+		}
 	}
 	capOpenCodeUsageBuckets(ledger)
 	return changed
@@ -488,16 +640,7 @@ func adoptPendingOpenCodeUsageBuckets(fingerprint string) bool {
 		}
 		ledger.Buckets = kept
 		for _, p := range pending {
-			target := openCodeUsageBucketFor(ledger, fingerprint, p.LocalDate)
-			target.InputTokens = addOpenCodeUsageCount(target.InputTokens, p.InputTokens)
-			target.OutputTokens = addOpenCodeUsageCount(target.OutputTokens, p.OutputTokens)
-			target.ReasoningTokens = addOpenCodeUsageCount(target.ReasoningTokens, p.ReasoningTokens)
-			target.CacheReadTokens = addOpenCodeUsageCount(target.CacheReadTokens, p.CacheReadTokens)
-			target.CacheWriteTokens = addOpenCodeUsageCount(target.CacheWriteTokens, p.CacheWriteTokens)
-			target.CostUsd = addOpenCodeUsageCost(target.CostUsd, p.CostUsd)
-			if p.ObservedAtMs > target.ObservedAtMs {
-				target.ObservedAtMs = p.ObservedAtMs
-			}
+			openCodeUsageBucketFor(ledger, fingerprint, p.LocalDate).add(p)
 		}
 		capOpenCodeUsageBuckets(ledger)
 		logOpenCodeUsageCapture("account_adopted")
@@ -515,26 +658,56 @@ func openCodeUsageHasPendingBucket(ledger openCodeUsageLedger) bool {
 	return false
 }
 
-// openCodeUsageBucketForDay reads the bucket for (fingerprint, the local date of
-// now), and the ledger's generation.
-func openCodeUsageBucketForDay(fingerprint string, now time.Time) (openCodeUsageBucket, bool, cliUsageGeneration) {
+// openCodeUsageDay is what the card reads from the ledger for one day.
+type openCodeUsageDay struct {
+	Bucket     openCodeUsageBucket
+	OK         bool
+	Generation cliUsageGeneration
+	// Direct reports that a direct-run scan read the store on this local date,
+	// so the bucket counts every OpenCode run on the computer, not only the
+	// agent's own.
+	Direct bool
+}
+
+// openCodeUsageDayFor reads the bucket for (fingerprint, the local date of now),
+// the ledger's generation and the direct reader's coverage.
+func openCodeUsageDayFor(fingerprint string, now time.Time) openCodeUsageDay {
 	today, _ := openCodeLocalDay(now)
 	// Not under openCodeUsageMu: the card's gather must not queue behind a
 	// writer that is waiting on another agent process.
 	ledger := loadOpenCodeUsageLedger()
+	day := openCodeUsageDay{
+		Generation: ledger.Generation,
+		Direct:     ledger.DirectCoverage != nil && ledger.DirectCoverage.LastOkLocalDate == today,
+	}
 	for _, b := range ledger.Buckets {
 		if b.AccountFingerprint == fingerprint && b.LocalDate == today {
-			return b, true, ledger.Generation
+			day.Bucket, day.OK = b, true
+			break
 		}
 	}
-	return openCodeUsageBucket{}, false, ledger.Generation
+	return day
 }
+
+// openCodeUsageBucketForDay reads the bucket for (fingerprint, the local date of
+// now), and the ledger's generation.
+func openCodeUsageBucketForDay(fingerprint string, now time.Time) (openCodeUsageBucket, bool, cliUsageGeneration) {
+	day := openCodeUsageDayFor(fingerprint, now)
+	return day.Bucket, day.OK, day.Generation
+}
+
+// Card labels: "Tokens today" once the direct reader covers the day, and the
+// floor's own label while only the agent's runs are counted.
+const (
+	openCodeTokensTodayLabel          = "Tokens today"
+	openCodeTokensTodayAgentRunsLabel = "Tokens today (agent runs)"
+)
 
 // openCodeUsageMetrics turns today's bucket into the card's rows: tokens
 // always, cost only when above zero — a local model or a subscription
 // provider reports 0, and "$0.00" would read as free rather than unmetered. No
-// bucket, no rows.
-func openCodeUsageMetrics(bucket openCodeUsageBucket, ok bool, now time.Time) []cliAgentUsageMetric {
+// bucket, no rows. direct labels the tokens row by coverage.
+func openCodeUsageMetrics(bucket openCodeUsageBucket, ok, direct bool, now time.Time) []cliAgentUsageMetric {
 	if !ok || (bucket.tokens() <= 0 && bucket.CostUsd <= 0) {
 		return nil
 	}
@@ -542,9 +715,13 @@ func openCodeUsageMetrics(bucket openCodeUsageBucket, ok bool, now time.Time) []
 	observedAt := time.UnixMilli(bucket.ObservedAtMs).UTC().Format(time.RFC3339)
 	reset := resetAt.Format(time.RFC3339)
 	tokens := float64(bucket.tokens())
+	label := openCodeTokensTodayAgentRunsLabel
+	if direct {
+		label = openCodeTokensTodayLabel
+	}
 	metrics := []cliAgentUsageMetric{{
 		Kind:       limitKindDaily,
-		Label:      "Tokens today (agent runs)",
+		Label:      label,
 		Unit:       "tokens",
 		Consumed:   &tokens,
 		ResetAt:    reset,
@@ -618,6 +795,33 @@ type openCodeUsageRun struct {
 	// could still commit the same spend, so the attempt is re-booked the moment
 	// the run goes quiet.
 	exportDeferred atomic.Bool
+	// closingSettle is set by a settle made after the stream is over, so its
+	// write closes the run's ownership window (cliagent_usage_opencode_freshness.go).
+	closingSettle atomic.Bool
+	// windowClosed: the run's ownership window is closed on disk.
+	windowClosed atomic.Bool
+	// streamEndMs is when the stream ended (0 until it has), recorded once so
+	// every close or commit retry closes the window there, not at its own time.
+	streamEndMs atomic.Int64
+}
+
+// session returns the run's session id, "" until one is known.
+func (run *openCodeUsageRun) session() string {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	return run.sessionID
+}
+
+// adoptSession records sessionID when the stream named none.
+func (run *openCodeUsageRun) adoptSession(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	run.mu.Lock()
+	if run.sessionID == "" {
+		run.sessionID = sessionID
+	}
+	run.mu.Unlock()
 }
 
 // captureOpenCodeUsageLine reads one streamed line: a step-finish frame's

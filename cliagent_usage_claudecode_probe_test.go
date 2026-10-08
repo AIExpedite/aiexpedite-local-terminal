@@ -2225,14 +2225,27 @@ func TestClaudeUsageProbe_ThrottledPostRunProbeStillLands(t *testing.T) {
 			base.Add(time.Hour).Unix())
 	})
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "400")
+	pinTrailingProbeRungLadder(t)
 
 	// A routine gather probes successfully just before the run.
 	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
 		t.Fatal("precondition: the pre-run gather should probe")
 	}
-	if latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")).IsZero() {
+	preRun := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(""))
+	if preRun.IsZero() {
 		t.Fatal("precondition: expected a pre-run observation")
 	}
+	// "Just before" has to mean an earlier MILLISECOND, which is the only
+	// resolution the cache keeps: claudeUsageObservationCovers deliberately
+	// treats a same-millisecond reading as covering the run, so that a probe
+	// fired microseconds after a run is not refused for reading back a fraction
+	// of a millisecond before it. The defect under test is a gather SECONDS
+	// earlier swallowing the run's refresh, so park the run in a later
+	// millisecond than the pre-run reading rather than weaken that tolerance.
+	// Without this the gather, its cache write and the trigger can all land
+	// inside one millisecond on a fast machine — a debt covered by construction,
+	// which no probe can then settle and no amount of waiting can fix.
+	waitPastObservationMillisecond(t, preRun)
 
 	// The run completes INSIDE the throttle window.
 	runCompleted := time.Now()
@@ -2254,6 +2267,7 @@ func TestClaudeUsageProbe_TrailingProbesCoalesceAcrossRuns(t *testing.T) {
 			base.Add(time.Hour).Unix())
 	})
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "600")
+	pinTrailingProbeRungLadder(t)
 
 	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
 		t.Fatal("precondition: the first probe should run")
@@ -2341,6 +2355,30 @@ func TestClaudeUsageProbe_DebtSettledByAnotherWriterSkipsTheTrailingProbe(t *tes
 	}
 }
 
+// pinTrailingProbeRungLadder puts every retry rung inside the window a test
+// that waits for a TRAILING probe can afford.
+//
+// These tests assert that a post-run debt is eventually PAID, not how long
+// production waits before paying it — and in production an attempt that spent
+// budget and failed books the first budgeted rung, 15 s out, which is nearly
+// twice the 8 s they wait. One transient local failure is enough to reach it:
+// a cache write the merge could not complete answers `persist_failed`, which
+// deliberately grows the streak exactly as a 5xx does, so the rung lands past
+// the deadline and the test reads it as a DISCARDED probe. Reproduced here with
+// the debt intact on disk and its rung booked 16.5 s after the run — nothing
+// was dropped, the deadline was simply the wrong one to measure against.
+//
+// Pinned small the retry is a few hundred milliseconds, so a transient failure
+// costs one extra attempt instead of the whole test. The floor still spaces
+// what actually goes out, so the request counts these tests bound stay
+// meaningful.
+func pinTrailingProbeRungLadder(t *testing.T) {
+	t.Helper()
+	pinClaudeRunDebtLadder(t,
+		[]time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second},
+		250*time.Millisecond, claudeRunDebtRungSlack)
+}
+
 // waitForObservationAfter polls the merged cache until an observation newer than
 // `baseline` appears. The trailing probe is asynchronous by design, so polling
 // is the only honest way to assert it ran.
@@ -2356,9 +2394,56 @@ func waitForObservationAfter(t *testing.T, baseline time.Time, within time.Durat
 	t.Fatalf("%s (baseline %s)", msg, baseline.UTC().Format(time.RFC3339Nano))
 }
 
+// waitPastObservationMillisecond blocks until the clock has left the
+// millisecond `observed` was stamped in, so a run recorded after it owes a debt
+// that reading cannot cover. Bounded and loud: an observation the clock never
+// passes is a future stamp, which is a real fault, not something to hang on.
+func waitPastObservationMillisecond(t *testing.T, observed time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !time.Now().Truncate(time.Millisecond).After(observed) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the clock never left the millisecond of the pre-run reading %s",
+				observed.UTC().Format(time.RFC3339Nano))
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
 /* -------------------------------------------------------------------------- */
 /* Debt survives failure; timer slot is never leaked; one credential read      */
 /* -------------------------------------------------------------------------- */
+
+// A rung booked while resetClaudeUsageProbeGate is DRAINING must not outlive
+// the reset. The process holds exactly one retry slot, so a rung left in it is
+// not merely stale: the next test's own run-debt arms over nothing, and the
+// stale rung fires inside that test, replaces its booking and leaves its debt
+// with no retry at all — the trailing probe then looks discarded 8 s later.
+// The drain is the window: an attempt that passed armedForProbe just before the
+// unarm books its rung after the reset's first stopClaudeRunDebtRetry.
+func TestResetClaudeUsageProbeGate_DropsARungBookedDuringTheDrain(t *testing.T) {
+	armClaudeUsageProbe(t, unreachableProbeHandler)
+
+	var fired atomic.Int64
+	// One settling unit holds the drain open, exactly as a fired rung's attempt
+	// does, and books a rung from inside it before letting the drain finish.
+	claudeUsageProbe.beginSettling()
+	go func() {
+		defer claudeUsageProbe.endSettling()
+		time.Sleep(50 * time.Millisecond)
+		claudeArmRunDebtRetryFn(300*time.Millisecond, func() { fired.Add(1) })
+	}()
+
+	resetClaudeUsageProbeGate()
+	// Re-armed as armClaudeUsageProbe does for the next test, so the rung's own
+	// armedForProbe check cannot be what stops it.
+	SetClaudeUsageProbeDisabled(false)
+
+	time.Sleep(time.Second)
+	if got := fired.Load(); got != 0 {
+		t.Errorf("a rung booked during the drain fired %d time(s) after the reset; it must be cancelled", got)
+	}
+}
 
 // countClaudeCredentialReads forces the Keychain path and counts reads of the
 // credential store, returning the counter. On a default macOS config each read

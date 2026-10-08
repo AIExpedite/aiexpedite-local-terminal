@@ -451,3 +451,156 @@ func TestOpenCodeUsage_AHostileSessionIDNeverReachesTheExport(t *testing.T) {
 		t.Fatal("a real OpenCode id must stay valid")
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Ownership windows: what the direct-run reader skips
+   -------------------------------------------------------------------------- */
+
+func openCodeOwnedWindowOf(t *testing.T, runID string) *openCodeOwnedRun {
+	t.Helper()
+	ledger := loadOpenCodeUsageLedger()
+	return openCodeOwnedRunByID(&ledger, runID)
+}
+
+// A window opens when the run names its session, stays open across a
+// terminal-event settle (a late step can still commit), and closes when the
+// stream is over.
+func TestOpenCodeUsage_AnOwnershipWindowOpensOnTheSessionAndClosesWithTheStream(t *testing.T) {
+	openCodeUsageFixture(t, 1401)
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	if hold := openCodeUsageArmedHoldMs(time.Now()); hold != run.floorMs {
+		t.Fatalf("an armed run with no session holds at %d, want its floor %d", hold, run.floorMs)
+	}
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_w", "prt_1", 10, 1, 0, "0.01", time.Now().UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	w := openCodeOwnedWindowOf(t, run.id)
+	if w == nil || !w.open() || w.SessionKey != openCodeUsageSessionKey("ses_w") || w.FromMs != run.floorMs {
+		t.Fatalf("window after the session was named = %+v", w)
+	}
+	if hold := openCodeUsageArmedHoldMs(time.Now()); hold != 0 {
+		t.Fatalf("a run with its window on disk still holds at %d", hold)
+	}
+
+	settleOpenCodeUsageRunOnStream(run, "")
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || !w.open() {
+		t.Fatalf("a terminal-event settle closed the window: %+v", w)
+	}
+	finishOpenCodeUsageRun(run)
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || w.open() || w.ToMs < w.FromMs {
+		t.Fatalf("window after finish = %+v, want closed", w)
+	}
+}
+
+// A closing settle (native, smoke) opens and closes the window in its own
+// write, from a resume id when the stream named none.
+func TestOpenCodeUsage_AClosingSettleRecordsAClosedWindowFromAResumeID(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1402)
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	settleOpenCodeUsageRun(run, "ses_resumed") // no usage: owed under the resume id
+	w := openCodeOwnedWindowOf(t, run.id)
+	if w == nil || w.open() || w.SessionKey != openCodeUsageSessionKey("ses_resumed") {
+		t.Fatalf("window = %+v", w)
+	}
+	if len(sched.delays()) != 1 {
+		t.Fatalf("bookings = %v, want only the export attempt", sched.delays())
+	}
+}
+
+// Disarm and retire close the window: both are past the run's stream.
+func TestOpenCodeUsage_DisarmAndRetireCloseTheWindow(t *testing.T) {
+	openCodeUsageFixture(t, 1403)
+	failed := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(failed, `{"type":"session.created","sessionID":"ses_failed"}`)
+	openCodeUsageInFlight.Wait()
+	if w := openCodeOwnedWindowOf(t, failed.id); w == nil || !w.open() {
+		t.Fatalf("window before disarm = %+v", w)
+	}
+	settleOrDisarmOpenCodeSmokeRun(failed, false)
+	if w := openCodeOwnedWindowOf(t, failed.id); w == nil || w.open() {
+		t.Fatalf("window after disarm = %+v, want closed", w)
+	}
+
+	owing := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(owing, `{"type":"session.created","sessionID":"ses_owing"}`)
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRunOnStream(owing, "") // owes, stream still open
+	if w := openCodeOwnedWindowOf(t, owing.id); w == nil || !w.open() {
+		t.Fatalf("window of a live owing run = %+v", w)
+	}
+	retireOpenCodeUsageDebt(owing.id, "aged_out")
+	if w := openCodeOwnedWindowOf(t, owing.id); w == nil || w.open() {
+		t.Fatalf("window after retire = %+v, want closed", w)
+	}
+}
+
+// A refused close leaves the window open, and the booked retry closes it.
+func TestOpenCodeUsage_ARefusedWindowCloseIsRetried(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1404)
+	prevWait := openCodeUsageLockWait
+	openCodeUsageLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { openCodeUsageLockWait = prevWait })
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_r", "prt_1", 10, 1, 0, "0.01", time.Now().UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRunOnStream(run, "")
+
+	release := holdOpenCodeLedgerLock(t)
+	finishOpenCodeUsageRun(run)
+	release()
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || !w.open() {
+		t.Fatalf("a refused close changed the window: %+v", w)
+	}
+	if !sched.fireNext() {
+		t.Fatal("the refused close booked no retry")
+	}
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || w.open() {
+		t.Fatalf("window after the retry = %+v, want closed", w)
+	}
+}
+
+// A close retried later still closes the window when the stream ended: a direct
+// resume of the session made between the refusal and the retry is not owned.
+func TestOpenCodeUsage_ARetriedWindowCloseKeepsTheStreamEnd(t *testing.T) {
+	sched := openCodeUsageFixture(t, 1406)
+	prevWait, prevNow := openCodeUsageLockWait, openCodeUsageFreshnessNow
+	openCodeUsageLockWait = 20 * time.Millisecond
+	now := time.Now()
+	openCodeUsageFreshnessNow = func() time.Time { return now }
+	t.Cleanup(func() { openCodeUsageLockWait, openCodeUsageFreshnessNow = prevWait, prevNow })
+	run := armOpenCodeUsageRun("opencode", "", "fp-a")
+	captureOpenCodeUsageLine(run, openCodeStepFinish("ses_e", "prt_1", 10, 1, 0, "0.01", now.UnixMilli()))
+	openCodeUsageInFlight.Wait()
+	settleOpenCodeUsageRunOnStream(run, "")
+
+	endMs := now.UnixMilli()
+	release := holdOpenCodeLedgerLock(t)
+	finishOpenCodeUsageRun(run)
+	release()
+	now = now.Add(time.Minute)
+	if !sched.fireNext() {
+		t.Fatal("the refused close booked no retry")
+	}
+	if w := openCodeOwnedWindowOf(t, run.id); w == nil || w.ToMs != endMs {
+		t.Fatalf("window after the retry = %+v, want closed at the stream end %d", w, endMs)
+	}
+}
+
+// Adoption closes the windows an earlier process left open, at its own start.
+func TestOpenCodeUsage_AdoptionClosesWindowsAnEarlierProcessLeftOpen(t *testing.T) {
+	openCodeUsageFixture(t, 1405)
+	startedAt := time.Now()
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.OwnedRuns = []openCodeOwnedRun{
+			{RunID: "dead", SessionKey: "k1", FromMs: startedAt.Add(-time.Hour).UnixMilli()},
+			{RunID: "mine", SessionKey: "k2", FromMs: startedAt.Add(time.Second).UnixMilli()},
+		}
+		return true, false
+	})
+	adoptOwedOpenCodeUsage(startedAt)
+	if w := openCodeOwnedWindowOf(t, "dead"); w == nil || w.ToMs != startedAt.UnixMilli() {
+		t.Fatalf("dead window = %+v, want closed at the start", w)
+	}
+	if w := openCodeOwnedWindowOf(t, "mine"); w == nil || !w.open() {
+		t.Fatalf("this process's window = %+v, want left open", w)
+	}
+}

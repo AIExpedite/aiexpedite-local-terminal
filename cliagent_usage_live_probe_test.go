@@ -1566,3 +1566,22 @@ func TestProbeAntigravityQuotaViaCodeAssist_RenewsOnlyWhenTheBudgetCoversTheChil
 		})
 	}
 }
+
+// A Refresh click reads OpenCode's store, so direct runs reach the receipt the
+// click's gather signs — and nothing is started.
+func TestRunCLIUsageLiveProbes_OpenCodeReadsItsStore(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 3101)
+	stubLiveProbes(t)
+	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
+		return map[string]detectedCLIAgent{openCodeUsageProvider: {Detected: true, Path: "opencode"}}
+	}
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-time.Hour), completedMs: clock.ms(-time.Hour + time.Second), steps: [][3]int64{{21, 0, 0}}})
+
+	outcomes := runCLIUsageLiveProbes(context.Background())
+	if outcomes[openCodeUsageProvider] != liveProbeOutcomeOK {
+		t.Fatalf("opencode outcome = %q (all=%v)", outcomes[openCodeUsageProvider], outcomes)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 21 {
+		t.Fatalf("bucket = %+v after the click", b)
+	}
+}

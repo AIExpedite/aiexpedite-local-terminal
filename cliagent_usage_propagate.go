@@ -64,6 +64,13 @@
 // wrote for a Claude run this agent did not spawn, and re-checks that both
 // hooks are still in Claude's settings.json after a Claude upgrade rewrote it.
 //
+// The same 60 s timer runs the OpenCode direct-run reader's gated scan
+// (openCodeDirectScanIfChanged, cliagent_usage_opencode_direct.go): OpenCode
+// spend from the user's own shell, IDE or PTY TUI lands in its own store, which
+// only a read can discover. The scan runs only while OpenCode is detected, the
+// agent is online and not draining or shutting down, and the store changed; a
+// committed change goes through noteOpenCodeUsageAdvanced like any other.
+//
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its Codex epoch rotation
 // commits (codexRotateGenerationEpoch), a Codex cache that still renders a
@@ -91,11 +98,13 @@ import (
 
 // Vars so tests can pin them small.
 var (
-	cliUsageHintDebounce          = 15 * time.Second
-	cliUsageHintSpacing           = 5 * time.Minute
-	cliUsageRotationFirstRetry    = 15 * time.Second
-	cliUsageRotationRetryPeriod   = 60 * time.Second
-	cliUsageHintHTTPTimeout       = 2 * time.Second
+	cliUsageHintDebounce        = 15 * time.Second
+	cliUsageHintSpacing         = 5 * time.Minute
+	cliUsageRotationFirstRetry  = 15 * time.Second
+	cliUsageRotationRetryPeriod = 60 * time.Second
+	cliUsageHintHTTPTimeout     = 2 * time.Second
+	// cliUsageClaudeFallbackPeriod paces the fallback timer, which also runs the
+	// OpenCode direct-run reader's gated scan.
 	cliUsageClaudeFallbackPeriod  = 60 * time.Second
 	cliUsageClaudeFallbackPoll    = 10 * time.Second
 	cliUsageClaudeFallbackEnabled = true
@@ -204,6 +213,10 @@ type cliUsagePropagatorState struct {
 	// firing serializes timer callbacks with resetCLIUsagePropagator (tests),
 	// so a callback in flight finishes before the state is reset under it.
 	firing sync.Mutex
+	// fallbackRunning does the same for a fallback read in flight (an OpenCode
+	// store scan can take its whole budget). It is separate from firing so the
+	// fallback never waits behind a hint send, or a hint behind a scan.
+	fallbackRunning sync.Mutex
 }
 
 var cliUsagePropagator = &cliUsagePropagatorState{}
@@ -235,6 +248,8 @@ func startCLIUsagePropagator(cfg *Config) {
 		defer p.rotating.Done()
 		p.rotate(cliUsageRotationFirstRetry)
 		recoverOpenCodeUsageGeneration(1)
+		// Runs made while the agent was down or mid-update.
+		openCodeDirectScanAtStartup()
 	}()
 }
 
@@ -650,9 +665,10 @@ var claudeUsageFallbackDetected = func() bool {
 	return info != nil && info.DetectedCliAgents[claudeUsageProvider].Detected
 }
 
-// armFallbackLocked (re)arms the Claude tick.
+// armFallbackLocked (re)arms the fallback timer: the Claude tick and the
+// OpenCode direct scan.
 func (p *cliUsagePropagatorState) armFallbackLocked() {
-	if p.stopped || !cliUsageClaudeFallbackEnabled {
+	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled) {
 		return
 	}
 	if p.fallbackTimer != nil {
@@ -663,27 +679,33 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 	p.fallbackTimer = time.AfterFunc(cliUsageClaudeFallbackPoll, func() { p.fallback(gen) })
 }
 
-// fallback is the Claude tick. It discovers a generation another process
-// committed (the status-line hook) when no ordinary read has, and adopts a
-// refresh debt the SessionEnd hook recorded — one stat per tick, and one small
-// cache read only when that stat moved or cliUsageClaudeFallbackPeriod passed,
-// all only while every gate is open. It also re-runs the settings.json
+// fallback is the Claude tick and the OpenCode direct scan. It discovers a
+// Claude generation another process committed (the status-line hook) when no
+// ordinary read has, and adopts a refresh debt the SessionEnd hook recorded —
+// one stat per tick, and one small cache read only when that stat moved or
+// cliUsageClaudeFallbackPeriod passed. It also re-runs the settings.json
 // reconcile, which is latched on that file's own stamp and throttled, so a
 // Claude upgrade that dropped our hooks is repaired without waiting for an
-// agent-run session — a direct run never triggers one.
+// agent-run session — a direct run never triggers one. Then it runs the
+// OpenCode direct scan. Each half only while its own gates are open.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
 	// Serialized with resetCLIUsagePropagator exactly as fire is, so a tick in
 	// flight finishes before a test reset restores the vars it reads
-	// (claudeUsageFallbackDetected, the cache path) under it.
-	p.firing.Lock()
-	defer p.firing.Unlock()
+	// (claudeUsageFallbackDetected, the cache path) under it — on its OWN lock
+	// rather than firing, because the OpenCode scan can take its whole budget
+	// and the tick now stats, reconciles and may load on every poll: neither
+	// half may wait behind a hint send, nor a hint behind them.
+	p.fallbackRunning.Lock()
+	defer p.fallbackRunning.Unlock()
 	p.mu.Lock()
 	if p.stopped || gen != p.fallbackGen {
 		p.mu.Unlock()
 		return
 	}
 	p.mu.Unlock()
-	if claudeUsageTickGatesOpen() {
+	// This timer serves the OpenCode scan too, so the Claude half tests its own
+	// flag here: the arming guard passes on either feature alone.
+	if cliUsageClaudeFallbackEnabled && claudeUsageTickGatesOpen() {
 		reconcileClaudeStatusLineHookBounded("usage-tick")
 		now := time.Now()
 		if p.claudeTickDue(now) {
@@ -693,6 +715,7 @@ func (p *cliUsagePropagatorState) fallback(gen uint64) {
 			adoptObservedClaudeRunDebt(now)
 		}
 	}
+	openCodeDirectScanIfChanged()
 	p.mu.Lock()
 	if gen == p.fallbackGen {
 		p.armFallbackLocked()
@@ -869,6 +892,9 @@ func logCLIUsageHint(label string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	// A fallback that passed its stopped check before the stop finishes first.
+	p.fallbackRunning.Lock()
+	defer p.fallbackRunning.Unlock()
 	p.firing.Lock()
 	defer p.firing.Unlock()
 	p.mu.Lock()

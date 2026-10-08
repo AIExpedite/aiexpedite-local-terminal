@@ -904,3 +904,37 @@ func TestOpenCodeUsage_AnAbandonedLateCommitRestoresTheOwedExport(t *testing.T) 
 		t.Fatalf("debts = %+v after the export paid", d)
 	}
 }
+
+// Direct spend survives the update hand-off: process A scans and commits, then
+// exits inside the debounce, so its hint dies with it. Process B's startup
+// recovery hints the rotated generation, and B's own startup scan — which
+// re-reads A's messages through the cursor's overlap — counts none of them twice.
+func TestOpenCodeUsage_DirectSpendSurvivesTheHandOff(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 1601)
+	// A minute back: a run some earlier test armed in this process holds the
+	// reader from its own (real-clock) floor, which must not cover these messages.
+	clock.now = time.Now().Add(-time.Minute).Truncate(time.Second)
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-time.Second), completedMs: clock.ms(-500 * time.Millisecond), steps: [][3]int64{{45, 5, 0}}, cost: 0.1})
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("process A's scan = %q", label)
+	}
+
+	simulateOpenCodeProcessRestart(t, 1602)
+	reads := countOpenCodeDirectReads(t, openCodeStoreLayoutJSON)
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg) // recovery, then B's own startup scan
+	hint := waitHints(t, rec, 1, 0)[0].hint
+	if hint.Provider != openCodeUsageProvider || hint.GenerationEpoch != 1602 {
+		t.Fatalf("recovered hint = %+v, want OpenCode under B's epoch", hint)
+	}
+	cliUsagePropagator.rotating.Wait()
+	if n := reads.Load(); n != 1 {
+		t.Fatalf("B's startup read the store %d times, want once", n)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 50 || b.CostUsd != 0.1 {
+		t.Fatalf("bucket = %+v, want A's 50 once", b)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCoverage; c == nil || c.LastOkLocalDate == "" {
+		t.Fatalf("coverage = %+v after B's scan", c)
+	}
+}

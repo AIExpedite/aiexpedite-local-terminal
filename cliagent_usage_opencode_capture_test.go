@@ -7,6 +7,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -313,16 +315,40 @@ func TestMergeOpenCodeUsageSteps_SeenStepsAreBounded(t *testing.T) {
 		steps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("s", fmt.Sprint(i)), AtMs: time.Now().UnixMilli(), Input: 1}
 	}
 	mergeOpenCodeUsageSteps(&ledger, "fp", steps)
-	if len(ledger.SeenSteps) != openCodeUsageMaxSeenSteps {
-		t.Fatalf("seenSteps = %d, want the cap %d", len(ledger.SeenSteps), openCodeUsageMaxSeenSteps)
+	// A day of the direct reader's message keys fits: 8,192, pruned oldest first.
+	if openCodeUsageMaxSeenSteps != 8192 || len(ledger.SeenSteps) != openCodeUsageMaxSeenSteps {
+		t.Fatalf("seenSteps = %d, want the cap 8192", len(ledger.SeenSteps))
 	}
 	if ledger.SeenSteps[len(ledger.SeenSteps)-1] != steps[len(steps)-1].Key {
 		t.Fatal("the newest key must survive the cap")
+	}
+	if ledger.SeenSteps[0] != steps[50].Key {
+		t.Fatal("the cap must drop the oldest keys first")
 	}
 	for _, k := range ledger.SeenSteps {
 		if _, err := hex.DecodeString(k); len(k) != 16 || err != nil {
 			t.Fatalf("seen key %q is not a 16-hex hash", k)
 		}
+	}
+}
+
+func TestMergeOpenCodeUsageSteps_EvictingSeenStepsRaisesDirectRewindFloor(t *testing.T) {
+	ledger := openCodeUsageLedger{
+		SchemaVersion: openCodeUsageSchemaVersion,
+		DirectCursor: &openCodeDirectCursor{
+			ThroughMs: 123456,
+		},
+	}
+	steps := make([]openCodeUsageStep, openCodeUsageMaxSeenSteps+10)
+	for i := range steps {
+		steps[i] = openCodeUsageStep{Key: openCodeUsageStepKey("s", fmt.Sprint(i)), AtMs: time.Now().UnixMilli(), Input: 1}
+	}
+	mergeOpenCodeUsageSteps(&ledger, "fp", steps)
+	if !ledger.seenEvicted {
+		t.Fatal("seenEvicted = false, want true when seenSteps rolls over")
+	}
+	if ledger.DirectCursor.RewindFloorMs != 123456 {
+		t.Fatalf("rewindFloorMs = %d, want 123456", ledger.DirectCursor.RewindFloorMs)
 	}
 }
 
@@ -406,5 +432,81 @@ func TestOpenCodeUsageRun_AFullyCommittedCapRecyclesItsSlots(t *testing.T) {
 	captureOpenCodeUsageLine(busy, openCodeStepFinish("ses_a", "prt_later", 1, 1, 0, "0", now))
 	if len(busy.steps) != openCodeUsageMaxRunSteps+1 || busy.steps[len(busy.steps)-1].Input != 31 {
 		t.Fatalf("a later step did not fold into the uncommitted one: %+v", busy.steps[len(busy.steps)-1])
+	}
+}
+
+// The direct reader's fields are additive under schemaVersion 1: they
+// round-trip, and a ledger written before them still loads its buckets.
+func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T) {
+	openCodeUsageFixture(t, 1301)
+	owned := []openCodeOwnedRun{{RunID: "run1", SessionKey: openCodeUsageSessionKey("ses_x"), FromMs: 10, ToMs: 20}, {RunID: "run2", SessionKey: "k", FromMs: 30}}
+	cursor := &openCodeDirectCursor{
+		Layout: openCodeStoreLayoutSQLite, ThroughMs: 40,
+		PinnedKeys: []string{"k1", "k2"}, PinnedWrittenMs: []int64{41, 42}, PinnedCompletedMs: []int64{39, 40},
+		PinnedDroppedMs: 30, PinnedDroppedDoneMs: 29,
+	}
+	coverage := &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, ObservedAtMs: 50, LastOkLocalDate: "2026-10-08"}
+	if committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.OwnedRuns, ledger.DirectCursor, ledger.DirectCoverage = owned, cursor, coverage
+		return true, false
+	}); !committed {
+		t.Fatal("write refused")
+	}
+	raw, err := os.ReadFile(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var onDisk map[string]json.RawMessage
+	if json.Unmarshal(raw, &onDisk) != nil || string(onDisk["schemaVersion"]) != "1" {
+		t.Fatalf("schemaVersion = %s, want 1", onDisk["schemaVersion"])
+	}
+	got := loadOpenCodeUsageLedger()
+	if len(got.OwnedRuns) != 2 || got.OwnedRuns[0] != owned[0] || got.OwnedRuns[1] != owned[1] || !reflect.DeepEqual(got.DirectCursor, cursor) || *got.DirectCoverage != *coverage {
+		t.Fatalf("round trip = %+v", got)
+	}
+
+	// The shape an older build writes: no direct fields at all.
+	older := `{"schemaVersion":1,"generation":{"epoch":7,"counter":3},"buckets":[{"accountFingerprint":"fp","localDate":"2026-10-08","inputTokens":5,"outputTokens":1,"reasoningTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0,"costUsd":0.5,"observedAtMs":99}],"seenSteps":["00112233aabbccdd"]}`
+	if err := os.WriteFile(openCodeUsageCachePath(), []byte(older), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got = loadOpenCodeUsageLedger()
+	if len(got.Buckets) != 1 || got.Buckets[0].tokens() != 6 || got.OwnedRuns != nil || got.DirectCursor != nil || got.DirectCoverage != nil {
+		t.Fatalf("older ledger = %+v", got)
+	}
+}
+
+// A ledger filled to every cap still loads: one past the read bound would read
+// as EMPTY and drop today's buckets. The ledger has its own bound, not the
+// small-config one shared with other readers.
+func TestOpenCodeUsageLedger_AFullLedgerStillLoads(t *testing.T) {
+	openCodeUsageFixture(t, 1302)
+	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		for i := 0; i < openCodeUsageMaxSeenSteps; i++ {
+			ledger.SeenSteps = append(ledger.SeenSteps, openCodeUsageStepKey("s", fmt.Sprint(i)))
+		}
+		for i := 0; i < openCodeUsageMaxBuckets; i++ {
+			ledger.Buckets = append(ledger.Buckets, openCodeUsageBucket{AccountFingerprint: "0123456789abcdef01234567", LocalDate: fmt.Sprintf("2026-10-%02d", i+1), InputTokens: math.MaxInt64, CostUsd: math.MaxFloat64, ObservedAtMs: int64(i + 1)})
+		}
+		for i := 0; i < openCodeUsageMaxDebts; i++ {
+			ledger.Debts = append(ledger.Debts, openCodeUsageDebt{RunID: fmt.Sprintf("%016d", i), RunFloorMs: 1, SessionID: "ses_" + strings.Repeat("x", 120), Dir: strings.Repeat("d", 1024)})
+		}
+		for i := 0; i < openCodeUsageMaxOwnedRuns; i++ {
+			ledger.OwnedRuns = append(ledger.OwnedRuns, openCodeOwnedRun{RunID: fmt.Sprintf("%016d", i), SessionKey: openCodeUsageSessionKey(fmt.Sprint(i)), FromMs: math.MaxInt32, ToMs: math.MaxInt32})
+		}
+		return true, false
+	})
+	if !committed {
+		t.Fatal("write refused")
+	}
+	info, err := os.Stat(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > openCodeUsageMaxLedgerBytes/2 {
+		t.Fatalf("a full ledger is %d bytes: keep at least 2x headroom under %d", info.Size(), openCodeUsageMaxLedgerBytes)
+	}
+	if got := loadOpenCodeUsageLedger(); len(got.Buckets) != openCodeUsageMaxBuckets || len(got.SeenSteps) != openCodeUsageMaxSeenSteps {
+		t.Fatalf("a full ledger (%d bytes) did not load: %d buckets, %d keys", info.Size(), len(got.Buckets), len(got.SeenSteps))
 	}
 }

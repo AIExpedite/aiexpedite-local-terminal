@@ -27,6 +27,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -279,6 +280,23 @@ func readJSONFile(path string, into any) bool {
 		return false
 	}
 	return unmarshalJSON(b, into)
+}
+
+// readJSONFileWithin is readJSONFile refusing a file larger than maxBytes —
+// read through a limit, so an oversized file is never loaded whole. An empty or
+// oversized file reads as absent. The file is closed before it returns, so a
+// caller never holds a handle that blocks another process's rename (Windows).
+func readJSONFileWithin(path string, maxBytes int64, into any) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil || len(b) == 0 || int64(len(b)) > maxBytes {
+		return false
+	}
+	return json.Unmarshal(b, into) == nil
 }
 
 // writeJSONFileAtomic is readJSONFile's writer: it replaces path with value's

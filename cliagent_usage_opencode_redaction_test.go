@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -119,5 +120,45 @@ func TestOpenCodeUsageRedaction_NothingButCountsLeavesTheCapture(t *testing.T) {
 	for _, h := range rec.all() {
 		body, _ := json.Marshal(h.hint)
 		assertNoOpenCodeCanary(t, "the usage hint", string(body)+h.url, false)
+	}
+}
+
+// The direct-run reader reads store records that carry prompt text, tool
+// output, file paths and an auth.json-shaped token beside the counts. The ledger,
+// the device log and the published usage carry none of them — and, with no debt
+// owed, not even the raw session id.
+func TestOpenCodeUsageRedaction_TheDirectReaderKeepsNothingButCounts(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 1202)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	const canaryPath = "/home/canary/CANARY-PROMPT-project"
+	extra := fmt.Sprintf(`,"path":{"cwd":%q,"root":%q},"system":[%q],"auth":{"type":"api","key":%q},"account":%q`,
+		canaryPath, canaryPath, openCodeRedactionPrompt, openCodeRedactionAPIKey, openCodeRedactionAccount)
+	store.write(openCodeTestMessage{session: openCodeRedactionSession, id: "msg_canary", createdMs: clock.ms(-time.Hour), completedMs: clock.ms(-time.Hour + time.Second),
+		steps: [][3]int64{{500, 20, 0}}, cost: 0.25, extra: extra})
+	partDir := filepath.Join(store.root, "storage", "part", "msg_canary")
+	store.writeFile(filepath.Join(partDir, "prt_text.json"), fmt.Sprintf(`{"id":"prt_text","type":"text","text":%q}`, openCodeRedactionPrompt), clock.ms(-time.Hour))
+	store.writeFile(filepath.Join(partDir, "prt_tool.json"), fmt.Sprintf(`{"id":"prt_tool","type":"tool","state":{"input":{"filePath":%q},"output":%q}}`, canaryPath, openCodeRedactionAPIKey), clock.ms(-time.Hour))
+	store.writeFile(filepath.Join(store.root, "auth.json"), fmt.Sprintf(`{"anthropic":{"type":"api","key":%q}}`, openCodeRedactionAPIKey), clock.ms(-time.Hour))
+
+	logs := captureStdout(t, func() { scanOpenCodeDirect(t) })
+	assertNoOpenCodeCanary(t, "the device log", logs, false)
+
+	raw, err := os.ReadFile(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoOpenCodeCanary(t, "the ledger file", string(raw), false)
+	if strings.Contains(string(raw), canaryPath) || strings.Contains(logs, canaryPath) {
+		t.Fatal("a store path leaked")
+	}
+
+	usage, _ := openCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Path: "opencode"}, clock.now)
+	published, _ := json.Marshal(usage)
+	assertNoOpenCodeCanary(t, "the published cliAgentUsage", string(published), false)
+	if strings.Contains(string(published), canaryPath) {
+		t.Fatal("the published usage carries a store path")
+	}
+	if len(usage.Metrics) == 0 || openCodeMetricByLabel(t, usage.Metrics, "Tokens today").Consumed == nil {
+		t.Fatal("the reader published no numbers; the redaction proof would be vacuous")
 	}
 }

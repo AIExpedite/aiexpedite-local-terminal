@@ -128,6 +128,10 @@ func TestMain(m *testing.M) {
 	// Default to an export that could not be read; the tests that exercise
 	// the fallback stub it explicitly.
 	runOpenCodeExport = func(context.Context, string, string, string) ([]byte, bool) { return nil, false }
+	// …and the direct-run reader never reads the developer's own OpenCode store
+	// or writes its machine ledger: the cases that exercise it enable it against
+	// a temporary store (openCodeDirectFixture).
+	openCodeDirectScanEnabled = false
 	// …and its ladder never fires on its own: an OpenCode stub turn in an
 	// unrelated test owes a debt whose 15 s rung would otherwise run in the
 	// middle of a later test. Cases that exercise the ladder drive it through
@@ -147,6 +151,31 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	restoreSandbox()
 	os.Exit(code)
+}
+
+// drainStdinPromptBeforeExit holds a stdin-fed mock open until the agent has
+// finished writing the prompt and closed stdin.
+//
+// `codex exec … -` takes its prompt on stdin, and SendInput writes it and then
+// closes the pipe. A mock that streamed its events and exited FIRST made that
+// write fail — `Failed to send initial prompt: write |1: broken pipe` — and a
+// prompt that never reached the child arms no utilization run, so nothing can
+// settle it and the settle-hook tests wait out their whole 10 s deadline. The
+// write normally wins the race, which is why this only bites a loaded runner
+// (test/macos-latest here; test/windows-latest on main, same family). Waiting
+// for EOF is also the faithful shape: the real CLI reads stdin to EOF before
+// running the turn, as settleCodexUsageRun's own callers note.
+//
+// Gated on the `-` argument, because the same modes are reused for a `shim`
+// command that is NOT stdin-fed: nothing closes its stdin, so blocking there
+// would hang the mock instead of exiting.
+func drainStdinPromptBeforeExit() {
+	for _, a := range os.Args[1:] {
+		if a == "-" {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			return
+		}
+	}
 }
 
 // runMockCLI simulates the streaming JSON output of a CLI agent so the
@@ -219,6 +248,7 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"hello from codex"}}`)
 		fmt.Println(`{"type":"turn.completed"}`)
 		fmt.Println(`{"type":"thread.completed"}`)
+		drainStdinPromptBeforeExit()
 		os.Exit(0)
 
 	case "codex-no-terminal-event":
@@ -226,6 +256,7 @@ func runMockCLI(mode string) {
 		// emitting turn.completed / thread.completed.
 		fmt.Println(`{"type":"thread.started","thread_id":"t-1"}`)
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}`)
+		drainStdinPromptBeforeExit()
 		os.Exit(1)
 
 	case "codex-reads-stdin":

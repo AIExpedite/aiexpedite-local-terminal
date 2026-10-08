@@ -1314,3 +1314,160 @@ func TestCLIUsageHint_ClaudeTickRepairsTheHooksAfterASettingsRewrite(t *testing.
 	clearStatusLineReconcileThrottle()
 	waitForClaudeCondition(t, 5*time.Second, "the tick never repaired the rewritten settings.json", bothInstalled)
 }
+
+// openCodeTickFixture runs the propagator over a temporary OpenCode store with
+// the fallback timer on a short period. It returns the hint recorder, the store
+// and clock, and the count of adapter reads (the startup scan included).
+func openCodeTickFixture(t *testing.T, epoch int64, detected bool) (*cliUsageHintRecorder, *Config, *openCodeTestStore, *openCodeDirectTestClock, *atomic.Int64) {
+	t.Helper()
+	_, store, clock := openCodeDirectFixture(t, epoch)
+	// A minute back: a run some earlier test armed in this process holds the
+	// reader from its own (real-clock) floor, which must not cover these messages.
+	clock.now = time.Now().Add(-time.Minute).Truncate(time.Second)
+	rec, cfg := propagatorFixture(t)
+	// Poll is what arms the timer; Period only forces a Claude load the stat gate
+	// would otherwise skip. Both, as claudeFallbackFixture pins them.
+	cliUsageClaudeFallbackPeriod = 30 * time.Millisecond
+	cliUsageClaudeFallbackPoll = 10 * time.Millisecond
+	prevDetected := openCodeDirectDetected
+	openCodeDirectDetected = func() bool { return detected }
+	t.Cleanup(func() { openCodeDirectDetected = prevDetected })
+	reads := countOpenCodeDirectReads(t, openCodeStoreLayoutJSON)
+	// Runs first: no tick may read a seam while the cleanups above restore it.
+	t.Cleanup(func() {
+		stopCLIUsagePropagator()
+		resetCLIUsagePropagator()
+	})
+	return rec, cfg, store, clock, reads
+}
+
+// The tick reads the store only while OpenCode is detected, the agent is
+// online, not draining or shutting down, and the store changed.
+func TestCLIUsageHint_OpenCodeTickScansOnlyWhileEveryGateIsOpen(t *testing.T) {
+	gates := []struct {
+		name     string
+		detected bool
+		block    func(t *testing.T)
+	}{
+		{name: "not detected", detected: false},
+		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "draining", detected: true, block: func(t *testing.T) {
+			drain.mu.Lock()
+			drain.draining = true
+			drain.mu.Unlock()
+			t.Cleanup(func() { drain.mu.Lock(); drain.draining = false; drain.mu.Unlock() })
+		}},
+		{name: "shutting down", detected: true, block: func(t *testing.T) {
+			shutdownInProgress.Store(true)
+			t.Cleanup(func() { shutdownInProgress.Store(false) })
+		}},
+		{name: "store unchanged", detected: true},
+	}
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			_, cfg, store, clock, reads := openCodeTickFixture(t, 3001, g.detected)
+			store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-2 * time.Second), completedMs: clock.ms(-time.Second), steps: [][3]int64{{1, 0, 0}}})
+			// Settled: a store changed within the settle window is scanned again
+			// whatever its marker says.
+			settled := clock.now.Add(-time.Second)
+			if err := os.Chtimes(filepath.Join(store.root, "storage", "message", "ses_a"), settled, settled); err != nil {
+				t.Fatal(err)
+			}
+			startCLIUsagePropagator(cfg)
+			cliUsagePropagator.rotating.Wait()
+			if g.block != nil {
+				g.block(t)
+			}
+			after := reads.Load()
+			if after != 1 {
+				t.Fatalf("startup read the store %d times, want once", after)
+			}
+			if g.name != "store unchanged" {
+				// The store moves; a gate must still hold the tick.
+				store.write(openCodeTestMessage{session: "ses_a", id: "msg_b", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{1, 0, 0}}})
+			}
+			time.Sleep(10 * cliUsageClaudeFallbackPeriod)
+			if n := reads.Load(); n != after {
+				t.Fatalf("the tick read the store %d times past startup", n-after)
+			}
+		})
+	}
+}
+
+// A new message in an existing session directory moves the JSON marker — the
+// mtime of storage/message itself does not change — and the tick picks it up.
+// A commit sends exactly one hint inside the spacing window.
+func TestCLIUsageHint_OpenCodeTickPicksUpANewMessageAndHintsOnce(t *testing.T) {
+	rec, cfg, store, clock, reads := openCodeTickFixture(t, 3002, true)
+	cliUsageHintSpacing = 2 * time.Second
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-2 * time.Second), completedMs: clock.ms(-time.Second), steps: [][3]int64{{3, 0, 0}}})
+	top := filepath.Join(store.root, "storage", "message")
+	topInfo, err := os.Stat(top)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startCLIUsagePropagator(cfg)
+	cliUsagePropagator.rotating.Wait()
+
+	store.write(openCodeTestMessage{session: "ses_a", id: "msg_b", createdMs: clock.ms(-time.Second), completedMs: clock.ms(0), steps: [][3]int64{{4, 0, 0}}})
+	if err := os.Chtimes(top, topInfo.ModTime(), topInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for openCodeDirectBucket(t, "", clock.now).tokens() != 7 {
+		if time.Now().After(deadline) {
+			layout, root := openCodeStoreLayout()
+			marker, _, _ := openCodeStoreMarker(context.Background(), layout, root)
+			openCodeDirectGateMu.Lock()
+			last, again := openCodeDirectLastMarker, openCodeDirectAgain
+			openCodeDirectGateMu.Unlock()
+			t.Fatalf("the tick never counted the new message (reads %d, offline %v, draining %v, shutdown %v, marker %q last %q again %v)", reads.Load(), IsOffline(), isDraining(), IsShutdownInProgress(), marker, last, again)
+		}
+		time.Sleep(cliUsageClaudeFallbackPeriod)
+	}
+	hints := waitHints(t, rec, 1, 500*time.Millisecond)
+	if len(hints) != 1 || hints[0].hint.Provider != openCodeUsageProvider || hints[0].hint.GenerationEpoch != 3002 {
+		t.Fatalf("hints = %+v, want exactly one OpenCode hint inside the spacing", hints)
+	}
+}
+
+// A queued fallback callback blocked on fallbackRunning does not run with the old
+// generation after resetCLIUsagePropagator returns.
+func TestCLIUsageHint_ResetHoldsFallbackBarrier(t *testing.T) {
+	resetCLIUsagePropagator()
+	p := cliUsagePropagator
+	p.fallbackGen = 42
+	oldGen := p.fallbackGen
+
+	started := make(chan struct{})
+	var ran atomic.Bool
+
+	p.fallbackRunning.Lock()
+	go func() {
+		close(started)
+		p.fallback(oldGen)
+		ran.Store(true)
+	}()
+
+	<-started
+	time.Sleep(10 * time.Millisecond)
+
+	resetDone := make(chan struct{})
+	go func() {
+		resetCLIUsagePropagator()
+		close(resetDone)
+	}()
+
+	select {
+	case <-resetDone:
+		t.Fatal("resetCLIUsagePropagator returned while fallbackRunning was held")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	p.fallbackRunning.Unlock()
+	<-resetDone
+
+	if p.fallbackGen <= oldGen {
+		t.Fatalf("fallbackGen = %d, want > %d", p.fallbackGen, oldGen)
+	}
+}
