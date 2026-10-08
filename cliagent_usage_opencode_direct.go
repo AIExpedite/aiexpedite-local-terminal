@@ -479,7 +479,9 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 			}
 		}
 		cursor.RewindFloorMs = openCodeDirectRewindFloor(ledger.DirectCursor, ledger.seenEvicted, result.Truncated, cursor.ThroughMs)
-		cursor.PinnedKeys, cursor.PinnedWrittenMs, cursor.PinnedDroppedMs = openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated || revisitMs > 0, pinned, openCodeLocalMidnight(now).UnixMilli())
+		pin := openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated || revisitMs > 0, pinned, openCodeLocalMidnight(now).UnixMilli())
+		cursor.PinnedKeys, cursor.PinnedWrittenMs, cursor.PinnedCompletedMs = pin.Keys, pin.WrittenMs, pin.CompletedMs
+		cursor.PinnedDroppedMs, cursor.PinnedDroppedDoneMs = pin.DroppedMs, pin.DroppedDoneMs
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -522,36 +524,58 @@ func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today strin
 }
 
 // openCodeDirectPinnedKey is a key counted past a pinned cursor, with its
-// record's last-write time.
+// record's last-write time and the message's completed time — the one stamp a
+// rewrite of an already-counted message does not move.
 type openCodeDirectPinnedKey struct {
-	Key       string
-	WrittenMs int64
+	Key         string
+	WrittenMs   int64
+	CompletedMs int64
 }
 
-// openCodeDirectPinnedKeys is the new cursor's PinnedKeys, PinnedWrittenMs and
-// PinnedDroppedMs: the keys this scan read at or after its cursor. A capped
-// scan may not have reached every message the previous scan pinned, so it
-// keeps those too until a full scan reads them again. Past the cap the newest
-// are kept, and the dropped floor rises to the newest one dropped: a pinned
-// backlog drained over many capped scans outgrows the cap, and its first
-// records are read again once the cursor returns to the revisit floor. A
-// dropped floor from before local midnight is let go — no scan reads that far
+// openCodeDirectPinned is the pinned-key state one scan hands the cursor.
+type openCodeDirectPinned struct {
+	Keys          []string
+	WrittenMs     []int64
+	CompletedMs   []int64
+	DroppedMs     int64
+	DroppedDoneMs int64
+}
+
+// openCodeDirectPinnedKeys is the new cursor's pinned-key state: the keys this
+// scan read at or after its cursor. A capped scan may not have reached every
+// message the previous scan pinned, so it keeps those too until a full scan
+// reads them again. Past the cap the newest are kept, and the dropped floors
+// rise to the newest one dropped: a pinned backlog drained over many capped
+// scans outgrows the cap, and its first records are read again once the cursor
+// returns to the revisit floor. Two floors are kept, because a dropped
+// message's record can be rewritten past the write floor and its key is then
+// in neither the pinned keys nor seenSteps: DroppedDoneMs is the newest
+// completed time dropped, the one stamp a rewrite of a finished message leaves
+// alone. Floors from before local midnight are let go — no scan reads that far
 // back.
-func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned []openCodeDirectPinnedKey, midnightMs int64) (keys []string, writtenMs []int64, droppedMs int64) {
+func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned []openCodeDirectPinnedKey, midnightMs int64) openCodeDirectPinned {
+	var state openCodeDirectPinned
 	var all []openCodeDirectPinnedKey
 	if prev != nil {
 		if prev.PinnedDroppedMs >= midnightMs {
-			droppedMs = prev.PinnedDroppedMs
+			state.DroppedMs = prev.PinnedDroppedMs
+		}
+		if prev.PinnedDroppedDoneMs >= midnightMs {
+			state.DroppedDoneMs = prev.PinnedDroppedDoneMs
 		}
 		if truncated {
 			for i, k := range prev.PinnedKeys {
 				// A cursor saved before the times were kept read its keys
-				// no later than its own cut.
-				ms := prev.ThroughMs
+				// no later than its own cut, and says nothing about when they
+				// completed: an unknown completed time raises no floor.
+				ms, done := prev.ThroughMs, int64(0)
 				if len(prev.PinnedWrittenMs) == len(prev.PinnedKeys) {
 					ms = prev.PinnedWrittenMs[i]
 				}
-				all = append(all, openCodeDirectPinnedKey{Key: k, WrittenMs: ms})
+				if len(prev.PinnedCompletedMs) == len(prev.PinnedKeys) {
+					done = prev.PinnedCompletedMs[i]
+				}
+				all = append(all, openCodeDirectPinnedKey{Key: k, WrittenMs: ms, CompletedMs: done})
 			}
 		}
 	}
@@ -563,6 +587,7 @@ func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned
 	for _, p := range all {
 		if i, ok := index[p.Key]; ok {
 			out[i].WrittenMs = max(out[i].WrittenMs, p.WrittenMs)
+			out[i].CompletedMs = max(out[i].CompletedMs, p.CompletedMs)
 			continue
 		}
 		index[p.Key] = len(out)
@@ -570,14 +595,18 @@ func openCodeDirectPinnedKeys(prev *openCodeDirectCursor, truncated bool, pinned
 	}
 	if n := len(out); n > openCodeDirectMaxPinnedKeys {
 		sort.SliceStable(out, func(i, j int) bool { return out[i].WrittenMs < out[j].WrittenMs })
-		droppedMs = max(droppedMs, out[n-openCodeDirectMaxPinnedKeys-1].WrittenMs)
+		for _, p := range out[:n-openCodeDirectMaxPinnedKeys] {
+			state.DroppedMs = max(state.DroppedMs, p.WrittenMs)
+			state.DroppedDoneMs = max(state.DroppedDoneMs, p.CompletedMs)
+		}
 		out = out[n-openCodeDirectMaxPinnedKeys:]
 	}
 	for _, p := range out {
-		keys = append(keys, p.Key)
-		writtenMs = append(writtenMs, p.WrittenMs)
+		state.Keys = append(state.Keys, p.Key)
+		state.WrittenMs = append(state.WrittenMs, p.WrittenMs)
+		state.CompletedMs = append(state.CompletedMs, p.CompletedMs)
 	}
-	return keys, writtenMs, droppedMs
+	return state
 }
 
 // openCodeDirectRewindFloor is the new cursor's RewindFloorMs. A scan that
@@ -607,9 +636,9 @@ func openCodeDirectRewindFloor(prev *openCodeDirectCursor, evicted, truncated bo
 // oldest managed run with no window yet; revisitMs (0 for none) is the revisit
 // floor a continuation carries from the capped scans before it.
 func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, holdMs, revisitMs int64, now time.Time) (steps []openCodeUsageStep, throughMs int64, pinned []openCodeDirectPinnedKey, held, pending bool) {
-	var droppedMs int64
+	var droppedMs, droppedDoneMs int64
 	if c := ledger.DirectCursor; c != nil {
-		droppedMs = c.PinnedDroppedMs
+		droppedMs, droppedDoneMs = c.PinnedDroppedMs, c.PinnedDroppedDoneMs
 	}
 	throughMs = now.UnixMilli()
 	if read.Truncated {
@@ -634,9 +663,11 @@ func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, h
 		if !m.Valid {
 			continue
 		}
-		if m.WrittenMs <= droppedMs {
+		if m.WrittenMs <= droppedMs || (droppedDoneMs > 0 && m.CompletedMs <= droppedDoneMs) {
 			// Read before, and its key may be gone from both the pinned keys
-			// and seenSteps (PinnedDroppedMs).
+			// and seenSteps (PinnedDroppedMs). A rewrite moves the record's
+			// write time past the write floor but not the message's completed
+			// time, so the completed floor still recognises it.
 			continue
 		}
 		if holdMs > 0 && m.CreatedMs >= holdMs {
@@ -658,7 +689,7 @@ func openCodeDirectSteps(ledger *openCodeUsageLedger, read openCodeDirectRead, h
 	}
 	for i, step := range steps {
 		if written[i] >= throughMs {
-			pinned = append(pinned, openCodeDirectPinnedKey{Key: step.Key, WrittenMs: written[i]})
+			pinned = append(pinned, openCodeDirectPinnedKey{Key: step.Key, WrittenMs: written[i], CompletedMs: step.AtMs})
 		}
 	}
 	return steps, throughMs, pinned, held, pending

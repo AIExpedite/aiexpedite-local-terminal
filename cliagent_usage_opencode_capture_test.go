@@ -440,7 +440,11 @@ func TestOpenCodeUsageRun_AFullyCommittedCapRecyclesItsSlots(t *testing.T) {
 func TestOpenCodeUsageLedger_AdditiveFieldsRoundTripUnderSchemaOne(t *testing.T) {
 	openCodeUsageFixture(t, 1301)
 	owned := []openCodeOwnedRun{{RunID: "run1", SessionKey: openCodeUsageSessionKey("ses_x"), FromMs: 10, ToMs: 20}, {RunID: "run2", SessionKey: "k", FromMs: 30}}
-	cursor := &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: 40, PinnedKeys: []string{"k1", "k2"}}
+	cursor := &openCodeDirectCursor{
+		Layout: openCodeStoreLayoutSQLite, ThroughMs: 40,
+		PinnedKeys: []string{"k1", "k2"}, PinnedWrittenMs: []int64{41, 42}, PinnedCompletedMs: []int64{39, 40},
+		PinnedDroppedMs: 30, PinnedDroppedDoneMs: 29,
+	}
 	coverage := &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, ObservedAtMs: 50, LastOkLocalDate: "2026-10-08"}
 	if committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		ledger.OwnedRuns, ledger.DirectCursor, ledger.DirectCoverage = owned, cursor, coverage

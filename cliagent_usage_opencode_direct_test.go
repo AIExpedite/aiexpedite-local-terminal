@@ -1260,9 +1260,46 @@ func TestOpenCodeDirectPinnedKeys_ADuplicateKeyKeepsItsNewestWriteTime(t *testin
 	prevCap := openCodeDirectMaxPinnedKeys
 	t.Cleanup(func() { openCodeDirectMaxPinnedKeys = prevCap })
 	openCodeDirectMaxPinnedKeys = 2
-	prev := &openCodeDirectCursor{ThroughMs: 100, PinnedKeys: []string{"a", "b"}, PinnedWrittenMs: []int64{110, 120}}
-	keys, writtenMs, droppedMs := openCodeDirectPinnedKeys(prev, true, []openCodeDirectPinnedKey{{Key: "c", WrittenMs: 130}, {Key: "a", WrittenMs: 140}}, 0)
-	if fmt.Sprint(keys) != "[c a]" || fmt.Sprint(writtenMs) != "[130 140]" || droppedMs != 120 {
-		t.Fatalf("keys = %v, writtenMs = %v, droppedMs = %d; want [c a], [130 140], 120", keys, writtenMs, droppedMs)
+	prev := &openCodeDirectCursor{ThroughMs: 100, PinnedKeys: []string{"a", "b"}, PinnedWrittenMs: []int64{110, 120}, PinnedCompletedMs: []int64{105, 115}}
+	pin := openCodeDirectPinnedKeys(prev, true, []openCodeDirectPinnedKey{{Key: "c", WrittenMs: 130, CompletedMs: 125}, {Key: "a", WrittenMs: 140, CompletedMs: 105}}, 0)
+	if fmt.Sprint(pin.Keys) != "[c a]" || fmt.Sprint(pin.WrittenMs) != "[130 140]" || pin.DroppedMs != 120 || pin.DroppedDoneMs != 115 {
+		t.Fatalf("pin = %+v; want keys [c a], writtenMs [130 140], droppedMs 120, droppedDoneMs 115", pin)
+	}
+}
+
+// A pinned key the cap drops leaves its completed time behind as the floor, so
+// a rewrite of that already-counted message — which moves its record past the
+// write floor while its key is gone from both the pinned keys and seenSteps —
+// is still recognised and not counted twice.
+func TestOpenCodeDirectPinnedKeys_ADroppedKeyLeavesItsCompletedFloor(t *testing.T) {
+	prevCap := openCodeDirectMaxPinnedKeys
+	t.Cleanup(func() { openCodeDirectMaxPinnedKeys = prevCap })
+	openCodeDirectMaxPinnedKeys = 1
+	pin := openCodeDirectPinnedKeys(nil, true, []openCodeDirectPinnedKey{
+		{Key: "a", WrittenMs: 110, CompletedMs: 100},
+		{Key: "b", WrittenMs: 120, CompletedMs: 118},
+	}, 0)
+	if fmt.Sprint(pin.Keys) != "[b]" || pin.DroppedMs != 110 || pin.DroppedDoneMs != 100 {
+		t.Fatalf("pin = %+v; want keys [b], droppedMs 110, droppedDoneMs 100", pin)
+	}
+	// A later scan carries both floors, and the rewritten record (written 200,
+	// still completed 100) stays below the completed floor.
+	ledger := &openCodeUsageLedger{DirectCursor: &openCodeDirectCursor{
+		ThroughMs: 120, PinnedKeys: pin.Keys, PinnedWrittenMs: pin.WrittenMs, PinnedCompletedMs: pin.CompletedMs,
+		PinnedDroppedMs: pin.DroppedMs, PinnedDroppedDoneMs: pin.DroppedDoneMs,
+	}}
+	now := time.UnixMilli(300)
+	read := openCodeDirectRead{Messages: []openCodeDirectMessage{
+		{ID: "a", SessionID: "ses", CreatedMs: 90, CompletedMs: 100, WrittenMs: 200, Valid: true, Usage: openCodeUsageStep{Input: 7}},
+	}}
+	steps, _, _, _, _ := openCodeDirectSteps(ledger, read, 0, 0, now)
+	if len(steps) != 0 {
+		t.Fatalf("steps = %+v, want none: a rewritten dropped message is already counted", steps)
+	}
+	// A message that completed after the floor is new work and is counted.
+	read.Messages[0].CompletedMs = 150
+	steps, _, _, _, _ = openCodeDirectSteps(ledger, read, 0, 0, now)
+	if len(steps) != 1 {
+		t.Fatalf("steps = %+v, want one: a message completed past the floor is new", steps)
 	}
 }
