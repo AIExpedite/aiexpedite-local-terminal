@@ -1064,6 +1064,10 @@ func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinu
 			t.Fatal(err)
 		}
 	}
+	msgBPath := filepath.Join(store.root, "storage", "message", "ses_b", "msg_b.json")
+	if err := os.Chtimes(msgBPath, time.UnixMilli(cut-1000), time.UnixMilli(cut-1000)); err != nil {
+		t.Fatal(err)
+	}
 	openCodeDirectMaxSessions = 1
 	scanOpenCodeDirect(t)
 	c := loadOpenCodeUsageLedger().DirectCursor
@@ -1072,6 +1076,9 @@ func TestOpenCodeDirect_SessionCutWithIncompleteMessageAtCutBecomesRecordContinu
 	}
 	if c.AtSession {
 		t.Fatalf("cursor.AtSession = true, want record continuation to revisit ses_a")
+	}
+	if c.RecordFloorMs == 0 || c.RecordFloorMs >= cut {
+		t.Fatalf("cursor.RecordFloorMs = %d, want preserved record floor < %d", c.RecordFloorMs, cut)
 	}
 	store.write(openCodeTestMessage{
 		session:     "ses_a",

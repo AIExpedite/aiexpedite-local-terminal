@@ -134,7 +134,7 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // fill the cap again. Skip is the continuation's tie-breaker: how many
 // sessions (AtSession) or records last written at ThroughMs the capped scan
 // read, so entries sharing that millisecond cannot refill the cap forever.
-// RecordFloorMs is an AtSession continuation's record floor: the sessions it
+// RecordFloorMs is a session cut's record floor: the sessions it
 // has not listed yet are read from the floor the capped scan used, since their
 // messages can predate their session's own last write. SessionSinceMs is a
 // record continuation's session listing floor: the one the capped scan listed

@@ -451,11 +451,11 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
 		cursor := &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
+		if result.Truncated && result.AtSession {
+			cursor.RecordFloorMs = floorMs
+		}
 		if result.Truncated && throughMs == result.ThroughMs && !pending && !held {
 			cursor.AtSession, cursor.Skip = result.AtSession, result.ThroughSkip
-			if result.AtSession {
-				cursor.RecordFloorMs = floorMs
-			}
 		}
 		if cursor.Continue && !cursor.AtSession {
 			// A record continuation keeps listing sessions from where the capped
@@ -569,7 +569,7 @@ func openCodeOwnedByRun(ledger *openCodeUsageLedger, sessionKey string, createdM
 // floor that scan read records from.
 func (c openCodeDirectCursor) resumeMs() int64 {
 	if c.Continue {
-		if c.AtSession && c.RecordFloorMs > 0 {
+		if c.RecordFloorMs > 0 {
 			return c.RecordFloorMs
 		}
 		return c.ThroughMs
