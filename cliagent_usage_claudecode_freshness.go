@@ -63,6 +63,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -253,12 +254,39 @@ func mutateClaudeRateLimitSnapshotStampedScoped(path, fingerprint string, allowe
 // A kill between the run's end and this write loses the debt. That is the same
 // accepted gap as a turn killed mid-flight, not a new one.
 func claudeOweRunRefresh(baseline time.Time) (fingerprint string, onDisk bool) {
+	return claudeOweRunRefreshScoped(baseline, true, nil)
+}
+
+// claudeOweObservedRunRefresh is the owe for a run the agent did NOT spawn,
+// written from the short-lived SessionEnd hook process (claude_run_end_hook.go).
+//
+// It differs from claudeOweRunRefresh in two ways only — both go through
+// claudeOweRunRefreshScoped, so the scope guards and the monotonic,
+// budget-resetting rule cannot drift:
+//   - no armedForProbe check: that gate is armed only inside the resident agent,
+//     and the installer already keeps this hook out of settings.json whenever
+//     either opt-out is on;
+//   - a status-line reading at most claudeRunEndStatusLineCover before the run
+//     ended stands in for the refresh, judged under the same lock as the write.
+//
+// The write takes the ordinary best-effort cache locks; on contention it is
+// dropped silently, because the run is still reached by the next gather's
+// staleness TTL. Reports whether a debt at or after `end` is on disk.
+func claudeOweObservedRunRefresh(end time.Time) bool {
+	_, onDisk := claudeOweRunRefreshScoped(end, false, claudeStatusLineCoversRunEnd(end))
+	return onDisk
+}
+
+// claudeOweRunRefreshScoped is the shared owe. `requireArmed` refuses when the
+// probe is not armed in this process; `covered`, when non-nil, is consulted on
+// the locked snapshot and skips the owe when it reports true.
+func claudeOweRunRefreshScoped(baseline time.Time, requireArmed bool, covered func(*claudeRateLimitSnapshot) bool) (fingerprint string, onDisk bool) {
 	if baseline.IsZero() {
 		return "", false
 	}
 	// When the user has opted out, nothing in this process (or the next) can ever
 	// pay a debt, so recording one would leave a permanent unpayable marker.
-	if !claudeUsageProbe.armedForProbe() {
+	if requireArmed && !claudeUsageProbe.armedForProbe() {
 		return "", false
 	}
 	path := claudeRateLimitCachePath()
@@ -300,6 +328,9 @@ func claudeOweRunRefresh(baseline time.Time) (fingerprint string, onDisk bool) {
 				onDisk = true
 				return false
 			}
+			if covered != nil && covered(snap) {
+				return false
+			}
 			snap.RefreshOwedAtMs = baselineMs
 			// The instant genuinely advanced: a newer run is owed, so this debt
 			// gets its own budget, and is due at once rather than on the rung an
@@ -331,6 +362,98 @@ func claudeOweRunRefreshNow(baseline time.Time) {
 	// finishes leaves this one for the next process to re-arm.
 	now := time.Now()
 	claudeBookRunDebtRung(fingerprint, baseline, now, claudeRungAfter, claudeRunDebtRetryLadder[0])
+}
+
+/* ───────────────────────────── observed runs ─────────────────────────────── */
+
+// claudeObservedDebtAdoption is the newest persisted debt instant the usage
+// tick has already handed to the ladder, so a debt waiting on a future rung or
+// a refusal is adopted once, not on every tick. In memory only: the startup
+// replay pays whatever a previous process left.
+var claudeObservedDebtAdoption struct {
+	mu     sync.Mutex
+	lastMs int64
+}
+
+// resetClaudeObservedDebtAdoption clears the latch (tests).
+func resetClaudeObservedDebtAdoption() {
+	claudeObservedDebtAdoption.mu.Lock()
+	claudeObservedDebtAdoption.lastMs = 0
+	claudeObservedDebtAdoption.mu.Unlock()
+}
+
+// adoptObservedClaudeRunDebt is the resident half of the SessionEnd hook: when
+// the cache holds a debt newer than anything this process owes or has adopted,
+// it runs the ONE shared attempt (claudeRunDebtAttemptAt), so the budget,
+// refusals, credential nudge and rung booking are identical to every other
+// path. Called from the propagator's Claude tick (cliagent_usage_propagate.go)
+// behind its offline / draining / detected gates. Reports whether it attempted.
+//
+// Two caches can hold the debt. The own one is where a hook pinned to this
+// channel writes. On a dual-channel machine the hook may be pinned to the OTHER
+// channel's cache (installedClaudeRateLimitCachePath); a newer debt there is
+// first owed onto the own cache — the monotonic owe, under this process's armed
+// gate — because the attempt only ever reads and charges the own cache.
+//
+// A retired debt (aged out, at the cap, stamped in the future) is not adopted:
+// it costs nothing, and the startup replay clears it.
+//
+// Cost when nothing is owed: two unlocked reads of small files and no
+// credential read — the attempt resolves the identity only once there is
+// something to pay.
+func adoptObservedClaudeRunDebt(now time.Time) bool {
+	if !claudeUsageProbe.armedForProbe() {
+		return false
+	}
+	floor := claudeUsageProbe.owedObservation().UnixMilli()
+	claudeObservedDebtAdoption.mu.Lock()
+	if claudeObservedDebtAdoption.lastMs > floor {
+		floor = claudeObservedDebtAdoption.lastMs
+	}
+	claudeObservedDebtAdoption.mu.Unlock()
+
+	own, haveOwn := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
+	adopt := int64(0)
+	if haveOwn && own.RefreshOwedAtMs > floor &&
+		!claudeRefreshDebtRetired(time.UnixMilli(own.RefreshOwedAtMs), own.RefreshOwedAttempts, now) {
+		adopt = own.RefreshOwedAtMs
+	}
+	if pinnedMs := claudePinnedObservedDebtMs(own, haveOwn, now); pinnedMs > floor && pinnedMs > own.RefreshOwedAtMs {
+		if _, onDisk := claudeOweRunRefresh(time.UnixMilli(pinnedMs)); onDisk {
+			adopt = pinnedMs
+		}
+	}
+	if adopt == 0 {
+		return false
+	}
+	claudeObservedDebtAdoption.mu.Lock()
+	if adopt > claudeObservedDebtAdoption.lastMs {
+		claudeObservedDebtAdoption.lastMs = adopt
+	}
+	claudeObservedDebtAdoption.mu.Unlock()
+	fmt.Printf("%s[claude-usage] observed run refresh adopted%s\n", colorCyan, colorReset)
+	claudeRunDebtAttemptAt(now, claudeDebtTriggerObserved)
+	return true
+}
+
+// claudePinnedObservedDebtMs is the payable debt instant on the cache the
+// installed hooks pin, when that is not the own cache and belongs to the same
+// account scope as the own one (any scope when there is no own cache yet), or
+// zero.
+func claudePinnedObservedDebtMs(own claudeRateLimitSnapshot, haveOwn bool, now time.Time) int64 {
+	home, _ := os.UserHomeDir()
+	pinned := installedClaudeRateLimitCachePath(home)
+	if pinned == "" || pinned == claudeRateLimitCachePath() {
+		return 0
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(pinned)
+	if !ok || snap.RefreshOwedAtMs == 0 || (haveOwn && snap.AccountFingerprint != own.AccountFingerprint) {
+		return 0
+	}
+	if claudeRefreshDebtRetired(time.UnixMilli(snap.RefreshOwedAtMs), snap.RefreshOwedAttempts, now) {
+		return 0
+	}
+	return snap.RefreshOwedAtMs
 }
 
 // claudePersistedProbeStateFor reports what a previous process left on the

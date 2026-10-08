@@ -206,6 +206,47 @@ contributes `cliSmokeBinaryStamp` (path, mtime, size, version), which keys its
 own cooldown so a verdict cached before an upgrade is never served for the
 post-upgrade binary.
 
+### Runs the agent did not spawn (`SessionEnd` hook)
+
+The agent books a post-run refresh only for the Claude runs it spawns (direct
+chat, a `claude` session, `__cli_smoke__`). A `claude -p` from the maintenance
+controller's own shell, a user's shell, or a `claude` started inside an
+agent-managed PowerShell / bash session books nothing, and `--print` mode never
+renders the status line. So next to `statusLine` the agent registers a
+`SessionEnd` command hook, `<agent binary> claude-run-end-hook`
+([claude_run_end_hook.go](claude_run_end_hook.go),
+[claude_run_end_hook_install.go](claude_run_end_hook_install.go)):
+
+- **What it does:** drains and discards stdin, then records a refresh debt in
+  `claude_rate_limits.json` (the scoped, monotonic owe every run uses; numbers
+  only, no network, no output, exit 0). The resident agent's 10 s Claude tick
+  (stat-gated, `cliagent_usage_propagate.go`) adopts the debt and pays it
+  through the ordinary bounded ladder; the generation hint then carries the
+  reading to terminal-service. Within about 90 s of any Claude run ending the
+  card shows fresh numbers.
+- **Skip rules:** an env credential is active (the run billed an account this
+  card is not); `AIEXPEDITE_CLAUDE_RUN_OWNER=agent` is set
+  (`prepareClaudeChildEnv` marks every `claude` child the agent spawns, which
+  books its own debt — a second owe would reset the request budget); or a
+  status-line reading for this account is at most 30 s old (an interactive exit
+  that just rendered fresh numbers).
+- **Cost bound:** at most one debt per instant, 4 requests per debt, 6 h
+  age-out, the probe's 60 s floor, and a burst of runs coalesces into one debt:
+  a loop of `claude -p` calls costs at most one OAuth usage request a minute per
+  device.
+- **Survives updates:** the debt is persisted, so the startup replay pays one a
+  hook wrote while the agent was down; the command is re-pointed at the current
+  binary on every startup and run start; and the tick re-runs the settings.json
+  reconcile, so a Claude upgrade that drops the hook is repaired without
+  waiting for an agent-run session.
+- **Opt-out:** installed only while `disable_claude_status_line_hook` and
+  `disable_claude_usage_probe` are both false; either one removes it (only our
+  matcher group — every other hook, event and key is preserved).
+- **Not captured:** a session that ends while the agent binary is being
+  replaced, and a run whose user hooks are off (`disableAllHooks`, managed
+  `allowManagedHooksOnly`, or `--setting-sources` without `user`). Those are
+  left to the next run or gather.
+
 ## Environment policy
 
 `sanitizeClaudeChildEnv` ([session.go](session.go)) splits the strip set

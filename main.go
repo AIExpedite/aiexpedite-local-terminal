@@ -31,6 +31,13 @@ func main() {
 		runStatusLineHook()
 		return
 	}
+	// Claude Code SessionEnd hook: `<binary> claude-run-end-hook`, once per
+	// ended Claude session on this machine. Same rules as the status line:
+	// first, fast, silent, and nothing but one bounded cache write.
+	if len(os.Args) > 1 && os.Args[1] == claudeRunEndHookArg {
+		runClaudeRunEndHook()
+		return
+	}
 
 	// Print version and exit. Used by CI smoke tests (and humans) to verify
 	// the binary loads and the build embedded the expected version string.

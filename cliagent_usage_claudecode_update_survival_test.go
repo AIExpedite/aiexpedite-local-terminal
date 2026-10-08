@@ -623,3 +623,39 @@ func TestClaudeUpdateSurvival_AnAccountRescopeIsNotCoveredByTheOldWatermark(t *t
 		return false
 	})
 }
+
+// A direct run that ended while NO agent was running (the window between an
+// old binary exiting and the new one starting) leaves its debt from the
+// SessionEnd hook; the new process's startup replay pays it with one request,
+// lands a numeric reading newer than the debt, and advances the generation.
+func TestClaudeObservedRunDebt_SurvivesTheUpdateHandOff(t *testing.T) {
+	cache, calls := armClaudeRunEndHookTest(t, claudeBothWindowsHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	genBefore := claudeCacheSnapshot(t, cache).Generation
+
+	// No agent: the gate is disarmed, exactly as in the short-lived hook.
+	end := time.Now()
+	if !claudeRunEndHookAt(end) {
+		t.Fatal("the hook did not owe the run")
+	}
+
+	simulateClaudeAgentRestart(t)
+	t.Cleanup(stopClaudeRunDebtRetry)
+	payOwedClaudeUsageRefreshAt(time.Now())
+	claudeFreshnessWaitIdle(t)
+
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("requests=%d, want exactly one", got)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAtMs != 0 {
+		t.Fatalf("snap=%+v, want the debt paid", snap)
+	}
+	five := snap.Buckets[claudeWindowFiveHour]
+	if !five.hasObservedUsage() || five.UsedPercentage <= 0 || five.ObservedAtMs < end.UnixMilli() {
+		t.Fatalf("five_hour=%+v, want a numeric reading newer than the debt", five)
+	}
+	if snap.Generation <= genBefore {
+		t.Fatalf("generation %d did not advance past %d", snap.Generation, genBefore)
+	}
+}

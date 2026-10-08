@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.8"
+var Version = "v1.1.9"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -219,6 +219,19 @@ func StartAgent(cfg *Config) {
 		} else if changed {
 			fmt.Printf("%s[statusline] Installed Claude status-line hook for live rate-limit metrics%s\n",
 				colorGreen, colorReset)
+		}
+		// The SessionEnd hook books a refresh for Claude runs this agent did not
+		// spawn (a `claude -p` from another shell, the maintenance controller's
+		// smoke). It needs the probe to pay that debt, so it follows BOTH
+		// opt-outs: the status-line one above removed it already, the probe one
+		// removes it here.
+		switch changed, err := applyClaudeRunEndHook(hookHome, !cfg.DisableClaudeUsageProbe); {
+		case err != nil:
+			fmt.Printf("%s[claude-run-end] could not install%s\n", colorYellow, colorReset)
+		case changed && cfg.DisableClaudeUsageProbe:
+			fmt.Printf("%s[claude-run-end] removed%s\n", colorGreen, colorReset)
+		case changed:
+			fmt.Printf("%s[claude-run-end] installed%s\n", colorGreen, colorReset)
 		}
 	}
 

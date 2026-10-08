@@ -19,25 +19,21 @@ import (
 //	'\''
 //
 // The env-preamble regex used
-// by isOurStatusLineCommand has to accept that sequence — otherwise a config
+// by isOurClaudeHookCommand has to accept that sequence — otherwise a config
 // dir containing an apostrophe (e.g. `/Users/bob's/...`) breaks recognition of
 // our OWN installed command, and:
 //   - opt-out / uninstall stops cleaning Claude's settings.json
 //   - a later install refresh stashes our own command as the chained "previous"
 //     status line, leaving the user with a hook -> hook chain
 func TestIsOurStatusLineCommand_AcceptsApostropheEscapedPaths(t *testing.T) {
-	cmd := statusLinePosixCommand(
-		"/Users/bob's mac/aiexpedite",
-		"/Users/bob's mac/.aiexpedite/claude_rate_limits.json",
-		"/Users/bob's mac/.aiexpedite/claude_statusline_prev.json",
-	)
+	cmd := claudeHookPosixCommand("/Users/bob's mac/aiexpedite", statusLineHookArg, statusLineHookPins("/Users/bob's mac/.aiexpedite/claude_rate_limits.json", "/Users/bob's mac/.aiexpedite/claude_statusline_prev.json")...)
 	// Sanity-check that posixSingleQuote actually emits the `'\''` escape — if a
 	// future refactor flips the quoting strategy this test should still cover
-	// whatever shape `statusLinePosixCommand` produces.
+	// whatever shape `claudeHookPosixCommand` produces.
 	if !strings.Contains(cmd, `'\''`) {
 		t.Fatalf("expected posix command to carry the `'\\''` apostrophe-escape, got %q", cmd)
 	}
-	if !isOurStatusLineCommand(cmd) {
+	if !isOurClaudeHookCommand(cmd, statusLineHookArg) {
 		t.Errorf("posix command with apostrophe-escaped env values must be recognized as ours: %q", cmd)
 	}
 }
@@ -46,53 +42,41 @@ func TestIsOurStatusLineCommand_AcceptsApostropheEscapedPaths(t *testing.T) {
 // still round-trip — the new regex alternative shouldn't accidentally change
 // the simple body's match behavior.
 func TestIsOurStatusLineCommand_PlainPosixStillRoundTrips(t *testing.T) {
-	cmd := statusLinePosixCommand(
-		"/usr/local/bin/aiexpedite",
-		"/home/dan/.aiexpedite/claude_rate_limits.json",
-		"/home/dan/.aiexpedite/claude_statusline_prev.json",
-	)
-	if !isOurStatusLineCommand(cmd) {
+	cmd := claudeHookPosixCommand("/usr/local/bin/aiexpedite", statusLineHookArg, statusLineHookPins("/home/dan/.aiexpedite/claude_rate_limits.json", "/home/dan/.aiexpedite/claude_statusline_prev.json")...)
+	if !isOurClaudeHookCommand(cmd, statusLineHookArg) {
 		t.Errorf("plain posix command should still be recognized: %q", cmd)
 	}
 }
 
-// statusLinePosixCommand must wrap the exe path in POSIX single quotes too
+// claudeHookPosixCommand must wrap the exe path in POSIX single quotes too
 // (not raw double quotes), otherwise an install path containing shell
 // metacharacters like `$`, backticks, or `"` — all legal in macOS/Linux/Git
 // Bash directory names — gets expanded by sh before exec. In that case the
 // hook either resolves to the wrong binary or runs a command substitution on
 // every render and the side-channel never updates the rate-limit cache.
 func TestStatusLinePosixCommand_QuotesExeForShellSafety(t *testing.T) {
-	cmd := statusLinePosixCommand(
-		`/Users/dan/$WORK/aiexpedite`,
-		"/cache.json",
-		"/prev.json",
-	)
+	cmd := claudeHookPosixCommand(`/Users/dan/$WORK/aiexpedite`, statusLineHookArg, statusLineHookPins("/cache.json", "/prev.json")...)
 	// The literal `$WORK` must survive verbatim — sh expands `$WORK` inside
 	// double quotes but treats it as literal inside single quotes.
 	if !strings.Contains(cmd, `'/Users/dan/$WORK/aiexpedite'`) {
 		t.Errorf("exe path should be single-quoted to suppress `$` expansion: %q", cmd)
 	}
-	if !isOurStatusLineCommand(cmd) {
+	if !isOurClaudeHookCommand(cmd, statusLineHookArg) {
 		t.Errorf("single-quoted-exe command must still be recognized as ours: %q", cmd)
 	}
 }
 
-// statusLinePowerShellCommand must escape the exe path through
+// claudeHookPowerShellCommand must escape the exe path through
 // powerShellDoubleQuote — Windows permits `$`/`$(...)` in directory names, and
 // a raw `"..."` PowerShell literal would expand a variable or evaluate a
 // subexpression before invoking the binary, leaving the hook silently broken.
 func TestStatusLinePowerShellCommand_EscapesExe(t *testing.T) {
-	cmd := statusLinePowerShellCommand(
-		`C:/Users/A$B/aiexpedite.exe`,
-		"C:/cache.json",
-		"C:/prev.json",
-	)
+	cmd := claudeHookPowerShellCommand(`C:/Users/A$B/aiexpedite.exe`, statusLineHookArg, statusLineHookPins("C:/cache.json", "C:/prev.json")...)
 	// The `$` must be backtick-escaped so PowerShell doesn't substitute `$B`.
 	if !strings.Contains(cmd, "& \"C:/Users/A`$B/aiexpedite.exe\" "+statusLineHookArg) {
 		t.Errorf("exe path should be backtick-escaped for PowerShell: %q", cmd)
 	}
-	if !isOurStatusLineCommand(cmd) {
+	if !isOurClaudeHookCommand(cmd, statusLineHookArg) {
 		t.Errorf("PowerShell-escaped exe command must still be recognized as ours: %q", cmd)
 	}
 }
@@ -147,12 +131,12 @@ func TestEnsureClaudeStatusLineHook_ClearsStaleStashOnEmptyInstall(t *testing.T)
 // migrate the existing stash file instead of orphaning it.
 func TestExtractInstalledPinnedPath_RoundTripsPosixAndPowerShell(t *testing.T) {
 	const apostrophePath = "/Users/bob's mac/.aiexpedite/claude_statusline_prev.json"
-	posix := statusLinePosixCommand("/Users/bob's mac/aiexpedite", "/cache.json", apostrophePath)
+	posix := claudeHookPosixCommand("/Users/bob's mac/aiexpedite", statusLineHookArg, statusLineHookPins("/cache.json", apostrophePath)...)
 	if got := extractInstalledPinnedPath(posix, "STATUSLINE_PREV"); got != apostrophePath {
 		t.Errorf("POSIX extract: got %q want %q", got, apostrophePath)
 	}
 	const dollarPath = `C:/Users/A$B/prev.json`
-	ps := statusLinePowerShellCommand(`C:/Users/A$B/aiexpedite.exe`, "C:/cache.json", dollarPath)
+	ps := claudeHookPowerShellCommand(`C:/Users/A$B/aiexpedite.exe`, statusLineHookArg, statusLineHookPins("C:/cache.json", dollarPath)...)
 	if got := extractInstalledPinnedPath(ps, "STATUSLINE_PREV"); got != dollarPath {
 		t.Errorf("PowerShell extract: got %q want %q", got, dollarPath)
 	}
@@ -179,7 +163,7 @@ func TestEnsureClaudeStatusLineHook_MigratesStashOnPinnedPathChange(t *testing.T
 	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+	oldCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", oldPrev)...)
 
 	// …this boot resolves a different pinned stash path.
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
@@ -324,7 +308,7 @@ func TestRemoveClaudeStatusLineHook_RestoresFromPinnedPathWhenCurrentMissing(t *
 	if err := os.WriteFile(pinnedPrev, stashBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	installedCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", pinnedPrev)...)
 
 	// Current boot resolves to a different, NON-EXISTENT stash path — the move.
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
@@ -369,7 +353,7 @@ func TestRemoveClaudeStatusLineHook_PrefersPinnedStashOverStaleCurrent(t *testin
 	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":{"type":"command","command":"live.sh","padding":2}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	installedCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", pinnedPrev)...)
 
 	// This boot resolves elsewhere, and that path already holds a stale stash.
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
@@ -419,7 +403,7 @@ func TestRemoveClaudeStatusLineHook_PinnedMissDoesNotFallBackToCurrent(t *testin
 
 	// The command pins a stash path that does not exist (already consumed).
 	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
-	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	installedCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", pinnedPrev)...)
 
 	// This boot resolves elsewhere, and that path holds a stale leftover.
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
@@ -467,7 +451,7 @@ func TestRemoveClaudeStatusLineHook_MalformedPinnedStashDoesNotFallBack(t *testi
 	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	installedCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", pinnedPrev)...)
 
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
 	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
@@ -523,7 +507,7 @@ func TestRemoveClaudeStatusLineHook_UnreadablePinnedStashAborts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(lockedDir, 0o755) })
 
-	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	installedCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", pinnedPrev)...)
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
 	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -668,7 +652,7 @@ func TestEnsureClaudeStatusLineHookIfStale_RepairsAfterClaudeUpdate(t *testing.T
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+	if !isOurClaudeHookCommand(settings.StatusLine.Command, statusLineHookArg) {
 		t.Errorf("statusLine=%q, want our hook restored", settings.StatusLine.Command)
 	}
 	if settings.Theme != "dark" {
@@ -845,7 +829,7 @@ func TestEnsureClaudeStatusLineHookIfStale_ConcurrentStartsReconcileOnce(t *test
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatalf("settings.json is not valid JSON after concurrent reconciles: %v\n%s", err, raw)
 	}
-	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+	if !isOurClaudeHookCommand(settings.StatusLine.Command, statusLineHookArg) {
 		t.Errorf("statusLine=%q, want our hook", settings.StatusLine.Command)
 	}
 	if settings.Theme != "dark" {
@@ -857,7 +841,7 @@ func TestEnsureClaudeStatusLineHookIfStale_ConcurrentStartsReconcileOnce(t *test
 	if prev != "/opt/claude/vendor-line.sh" {
 		t.Errorf("stashed command=%q, want the foreign one exactly once", prev)
 	}
-	if isOurStatusLineCommand(prev) {
+	if isOurClaudeHookCommand(prev, statusLineHookArg) {
 		t.Errorf("our own hook was stashed as the previous command: %q", prev)
 	}
 }
@@ -926,7 +910,7 @@ func TestEnsureClaudeStatusLineHook_AbortsWhenPinnedStashCannotMigrate(t *testin
 	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+	oldCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", oldPrev)...)
 
 	// Resolve the new pinned stash underneath a REGULAR FILE, so both the
 	// MkdirAll and any rename/copy fallback are guaranteed to fail on every OS.
@@ -1099,7 +1083,7 @@ func TestEnsureClaudeStatusLineHook_KeepsOldStashWhenSettingsWriteFails(t *testi
 	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+	oldCmd := claudeHookPosixCommand("/old/path/aiexpedite", statusLineHookArg, statusLineHookPins("/old/cache.json", oldPrev)...)
 
 	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
@@ -1189,4 +1173,117 @@ func TestMigratePrevStatusLine_TightensAnIdenticalPermissiveDestination(t *testi
 	if stale != oldPrev {
 		t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
 	}
+}
+
+// The rename to ourClaudeHookCommand must not change a single byte of the
+// status-line command every installed device already carries: a different
+// string reads as "not ours" to an older binary's matcher and as a stale path
+// to the reconcile, so every device would rewrite settings.json on update.
+func TestClaudeHookCommand_PinsTheInstalledStrings(t *testing.T) {
+	cases := []struct{ name, got, want string }{
+		{"status line, POSIX / Git Bash",
+			claudeHookPosixCommand("/usr/bin/aix", statusLineHookArg, statusLineHookPins("/d/rl.json", "/d/prev.json")...),
+			`AIEXPEDITE_CLAUDE_RL_CACHE='/d/rl.json' AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/d/prev.json' '/usr/bin/aix' statusline-hook`},
+		{"status line, PowerShell",
+			claudeHookPowerShellCommand("C:/aix/aix.exe", statusLineHookArg, statusLineHookPins("C:/d/rl.json", "C:/d/prev.json")...),
+			`$env:AIEXPEDITE_CLAUDE_RL_CACHE="C:/d/rl.json"; $env:AIEXPEDITE_CLAUDE_STATUSLINE_PREV="C:/d/prev.json"; & "C:/aix/aix.exe" statusline-hook`},
+		{"run end, POSIX / Git Bash",
+			claudeHookPosixCommand("/usr/bin/aix", claudeRunEndHookArg, claudeHookPin{"RL_CACHE", "/d/rl.json"}),
+			`AIEXPEDITE_CLAUDE_RL_CACHE='/d/rl.json' '/usr/bin/aix' claude-run-end-hook`},
+		{"run end, PowerShell",
+			claudeHookPowerShellCommand("C:/aix/aix.exe", claudeRunEndHookArg, claudeHookPin{"RL_CACHE", "C:/d/rl.json"}),
+			`$env:AIEXPEDITE_CLAUDE_RL_CACHE="C:/d/rl.json"; & "C:/aix/aix.exe" claude-run-end-hook`},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s:\n got  %s\n want %s", tc.name, tc.got, tc.want)
+		}
+	}
+	// Each hook recognises only its own subcommand.
+	sl, re := cases[0].got, cases[2].got
+	if !isOurClaudeHookCommand(sl, statusLineHookArg) || isOurClaudeHookCommand(sl, claudeRunEndHookArg) {
+		t.Errorf("status-line command recognised wrongly: %q", sl)
+	}
+	if !isOurClaudeHookCommand(re, claudeRunEndHookArg) || isOurClaudeHookCommand(re, statusLineHookArg) {
+		t.Errorf("run-end command recognised wrongly: %q", re)
+	}
+	if got := extractInstalledPinnedPath(re, "RL_CACHE"); got != "/d/rl.json" {
+		t.Errorf("run-end cache pin = %q", got)
+	}
+}
+
+// claudeHookEntries reports whether settings.json holds our status line and
+// our run-end hook.
+func claudeHookEntries(t *testing.T, settingsPath string) (statusLine, runEnd bool) {
+	t.Helper()
+	settings := readSettingsMap(t, settingsPath)
+	if sl, ok := settings["statusLine"].(map[string]any); ok {
+		cmd, _ := sl["command"].(string)
+		statusLine = isOurClaudeHookCommand(cmd, statusLineHookArg)
+	}
+	return statusLine, countOurRunEndHooks(sessionEndCommands(t, settings)) == 1
+}
+
+// A Claude upgrade that rewrites settings.json drops BOTH entries; the next
+// reconcile restores both — so a direct run after the upgrade is captured.
+func TestEnsureClaudeStatusLineHookIfStale_RestoresBothHooksAfterARewrite(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+	if sl, re := claudeHookEntries(t, settingsPath); !sl || !re {
+		t.Fatalf("after install: statusLine=%v runEnd=%v, want both", sl, re)
+	}
+
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","hooks":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStatusLineReconcileThrottle()
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("reconcile after the rewrite: changed=%v err=%v", changed, err)
+	}
+	if sl, re := claudeHookEntries(t, settingsPath); !sl || !re {
+		t.Fatalf("after the rewrite: statusLine=%v runEnd=%v, want both restored", sl, re)
+	}
+	if readSettingsMap(t, settingsPath)["theme"] != "dark" {
+		t.Error("the user's other settings were not preserved")
+	}
+}
+
+// With `disable_claude_usage_probe` on, the reconcile keeps the status line
+// but removes the run-end hook instead of restoring it.
+func TestEnsureClaudeStatusLineHookIfStale_ProbeOptOutRemovesTheRunEndHook(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Cleanup(resetClaudeUsageProbeGate)
+	if _, err := ensureClaudeStatusLineHookIfStale(home); err != nil {
+		t.Fatal(err)
+	}
+	SetClaudeUsageProbeDisabled(true)
+	if err := os.WriteFile(settingsPath, append(mustReadFile(t, settingsPath), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStatusLineReconcileThrottle()
+	if _, err := ensureClaudeStatusLineHookIfStale(home); err != nil {
+		t.Fatal(err)
+	}
+	if sl, re := claudeHookEntries(t, settingsPath); !sl || re {
+		t.Fatalf("statusLine=%v runEnd=%v, want the status line kept and the run-end hook removed", sl, re)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

@@ -107,10 +107,24 @@ func prevStatusLinePath() string {
 	return filepath.Join(GetConfigDir(), "claude_statusline_prev.json")
 }
 
-// ourStatusLineCommand is the command string we install into Claude's settings:
-// the agent binary re-invoked with the hook subcommand.
+// claudeHookPin is one per-invocation env assignment baked into a hook command:
+// AIEXPEDITE_CLAUDE_<suffix>=<value>.
+type claudeHookPin struct {
+	suffix, value string
+}
+
+// statusLineHookPins is the status line's pin set: the cache it writes and the
+// stash it chains to.
+func statusLineHookPins(cachePath, prevPath string) []claudeHookPin {
+	return []claudeHookPin{{"RL_CACHE", cachePath}, {"STATUSLINE_PREV", prevPath}}
+}
+
+// ourClaudeHookCommand is the command string we install into Claude's settings
+// for one of our hook subcommands: the agent binary re-invoked with
+// `subcommand`. The status line (statusLineHookArg) pins the cache and its
+// stash; the run-end hook (claudeRunEndHookArg) pins only the cache.
 //
-// We PIN the cache + stash paths via `AIEXPEDITE_CLAUDE_RL_CACHE` /
+// We PIN those paths via `AIEXPEDITE_CLAUDE_RL_CACHE` /
 // `AIEXPEDITE_CLAUDE_STATUSLINE_PREV` in the command itself so the hook resolves
 // them from the same `GetConfigDir()` the installer used — otherwise a Linux
 // box where the agent starts at login without the user's shell
@@ -133,8 +147,8 @@ func prevStatusLinePath() string {
 // the env values go through shell-safe quoting (`posixSingleQuote` /
 // `powerShellDoubleQuote`) so install paths with `$`, backticks, or `$(...)`
 // in any segment don't get expanded into the wrong path or a subshell.
-func ourStatusLineCommand() (string, bool) {
-	exe, err := os.Executable()
+func ourClaudeHookCommand(subcommand string) (string, bool) {
+	exe, err := claudeHookExecutable()
 	if err != nil || exe == "" {
 		return "", false
 	}
@@ -142,24 +156,32 @@ func ourStatusLineCommand() (string, bool) {
 		exe = abs
 	}
 	cachePath := claudeRateLimitCachePath()
-	prevPath := prevStatusLinePath()
+	pins := []claudeHookPin{{"RL_CACHE", cachePath}}
+	if subcommand == statusLineHookArg {
+		pins = statusLineHookPins(cachePath, prevStatusLinePath())
+	}
 	if runtime.GOOS == "windows" {
 		// Forward-slash everything we embed: the exe path lives inside double
 		// quotes where Git Bash treats `\` as an escape, and the env values —
 		// even though we single-quote them — are simpler to reason about when
 		// the whole command is slash-uniform.
 		exe = strings.ReplaceAll(exe, `\`, "/")
-		cachePath = strings.ReplaceAll(cachePath, `\`, "/")
-		prevPath = strings.ReplaceAll(prevPath, `\`, "/")
-		if findGitBash() != "" {
-			return statusLinePosixCommand(exe, cachePath, prevPath), true
+		for i := range pins {
+			pins[i].value = strings.ReplaceAll(pins[i].value, `\`, "/")
 		}
-		return statusLinePowerShellCommand(exe, cachePath, prevPath), true
+		if findGitBash() != "" {
+			return claudeHookPosixCommand(exe, subcommand, pins...), true
+		}
+		return claudeHookPowerShellCommand(exe, subcommand, pins...), true
 	}
-	return statusLinePosixCommand(exe, cachePath, prevPath), true
+	return claudeHookPosixCommand(exe, subcommand, pins...), true
 }
 
-// statusLinePosixCommand emits the sh/bash form Claude uses on POSIX and on
+// claudeHookExecutable is os.Executable behind a seam, so a test can move the
+// binary and watch the installed hooks follow it.
+var claudeHookExecutable = os.Executable
+
+// claudeHookPosixCommand emits the sh/bash form Claude uses on POSIX and on
 // Windows when Git Bash is installed: per-invocation env assignments followed
 // by the quoted exe + hook arg.
 //
@@ -168,23 +190,29 @@ func ourStatusLineCommand() (string, bool) {
 // directory containing `$`, backticks, or `"` (all valid in macOS/Linux/Windows
 // directory names) would resolve to the wrong path or execute a command
 // substitution and the hook would silently never capture metrics.
-func statusLinePosixCommand(exe, cachePath, prevPath string) string {
-	return "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(cachePath) +
-		" AIEXPEDITE_CLAUDE_STATUSLINE_PREV=" + posixSingleQuote(prevPath) +
-		" " + posixSingleQuote(exe) + " " + statusLineHookArg
+func claudeHookPosixCommand(exe, subcommand string, pins ...claudeHookPin) string {
+	var b strings.Builder
+	for _, p := range pins {
+		b.WriteString("AIEXPEDITE_CLAUDE_" + p.suffix + "=" + posixSingleQuote(p.value) + " ")
+	}
+	b.WriteString(posixSingleQuote(exe) + " " + subcommand)
+	return b.String()
 }
 
-// statusLinePowerShellCommand emits the PowerShell form Claude uses on Windows
+// claudeHookPowerShellCommand emits the PowerShell form Claude uses on Windows
 // when Git Bash is absent: `$env:` assignments separated by `;`, then the `&`
 // call operator on the quoted exe + hook arg.
 //
 // The exe path also goes through powerShellDoubleQuote so an install directory
 // containing `$` or `$(...)` (legal Windows path characters) doesn't get
 // expanded by PowerShell as a variable / subexpression before invocation.
-func statusLinePowerShellCommand(exe, cachePath, prevPath string) string {
-	return "$env:AIEXPEDITE_CLAUDE_RL_CACHE=" + powerShellDoubleQuote(cachePath) +
-		"; $env:AIEXPEDITE_CLAUDE_STATUSLINE_PREV=" + powerShellDoubleQuote(prevPath) +
-		"; & " + powerShellDoubleQuote(exe) + " " + statusLineHookArg
+func claudeHookPowerShellCommand(exe, subcommand string, pins ...claudeHookPin) string {
+	var b strings.Builder
+	for _, p := range pins {
+		b.WriteString("$env:AIEXPEDITE_CLAUDE_" + p.suffix + "=" + powerShellDoubleQuote(p.value) + "; ")
+	}
+	b.WriteString("& " + powerShellDoubleQuote(exe) + " " + subcommand)
+	return b.String()
 }
 
 // posixSingleQuote wraps s in single quotes for sh/bash. A single quote inside
@@ -210,7 +238,7 @@ func powerShellDoubleQuote(s string) string {
 
 // statusLineEnvPreambleRe captures the per-invocation env preamble we install
 // before the hook in either the POSIX (`KEY='val' …`) or PowerShell
-// (`$env:KEY="val"; …`) form so isOurStatusLineCommand can strip it before
+// (`$env:KEY="val"; …`) form so isOurClaudeHookCommand can strip it before
 // matching the inner exe+hook shape.
 //
 // The POSIX body must also accept `posixSingleQuote`'s embedded-apostrophe
@@ -246,7 +274,7 @@ var (
 // shell-specific escapes unwound. Returns "" when the command doesn't pin it.
 //
 // Used on a refresh where the existing command is already one of ours but the
-// new `ourStatusLineCommand` resolves to a different `prevStatusLinePath()`
+// new `ourClaudeHookCommand` resolves to a different `prevStatusLinePath()`
 // (e.g. `GetConfigDir()` moved because XDG_CONFIG_HOME changed between the
 // previous install and this boot). Without it, the stash file would remain at
 // the OLD pinned path while both the hook and opt-out look at the NEW one,
@@ -270,13 +298,13 @@ func extractInstalledPinnedPath(command, suffix string) string {
 	return ""
 }
 
-// isOurStatusLineCommand reports whether a configured command is our hook (any
-// binary path, with or without our pinned env preamble) — used to stay
-// idempotent across binary-path / config-dir refreshes, and to avoid stashing
-// our own command as the "previous" one.
+// isOurClaudeHookCommand reports whether a configured command is our
+// `subcommand` hook (any binary path, with or without our pinned env
+// preamble) — used to stay idempotent across binary-path / config-dir
+// refreshes, and to avoid stashing our own command as the "previous" one.
 //
-// Matches the shape `ourStatusLineCommand` emits — an optional env-var
-// preamble, then a quoted executable path followed by ` statusline-hook`, with
+// Matches the shape `ourClaudeHookCommand` emits — an optional env-var
+// preamble, then a quoted executable path followed by ` <subcommand>`, with
 // an optional leading `&` call op for the PowerShell form. Both `'...'`
 // (POSIX single-quoted, the current safe form) and `"..."` (legacy POSIX +
 // PowerShell) are accepted so a previously installed double-quoted entry is
@@ -284,10 +312,10 @@ func extractInstalledPinnedPath(command, suffix string) string {
 // substring match would falsely claim a user's own command (e.g.
 // `~/.claude/statusline-hook.sh`) as ours and silently overwrite it without
 // stashing, leaving opt-out unable to restore it.
-func isOurStatusLineCommand(command string) bool {
+func isOurClaudeHookCommand(command, subcommand string) bool {
 	s := strings.TrimSpace(command)
 	s = statusLineEnvPreambleRe.ReplaceAllString(s, "")
-	suffix := " " + statusLineHookArg
+	suffix := " " + subcommand
 	if !strings.HasSuffix(s, suffix) {
 		return false
 	}
@@ -545,7 +573,7 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	ours, ok := ourStatusLineCommand()
+	ours, ok := ourClaudeHookCommand(statusLineHookArg)
 	if !ok {
 		return false, nil
 	}
@@ -587,7 +615,7 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	// status line — stash the FULL object so the hook can chain to its command
 	// AND opt-out can restore its other options. (A command that IS ours but
 	// with a stale binary path just gets its path refreshed; don't re-stash.)
-	if existing.Command != "" && !isOurStatusLineCommand(existing.Command) {
+	if existing.Command != "" && !isOurClaudeHookCommand(existing.Command, statusLineHookArg) {
 		if err := savePrevStatusLine(existingRaw); err != nil {
 			// Abort: if we can't persist the original command, installing the
 			// hook would silently lose the user's third-party status line and
@@ -780,6 +808,15 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 	}
 
 	changed, err := ensureClaudeStatusLineHook(home)
+	if err == nil {
+		// The run-end hook lives in the same file and is lost to the same Claude
+		// rewrite, so it is reconciled inside the same latch. It is wanted only
+		// while the probe that pays its debts is armed: with
+		// `disable_claude_usage_probe` on, the reconcile removes it instead.
+		var runEndChanged bool
+		runEndChanged, err = applyClaudeRunEndHook(home, claudeUsageProbe.armedForProbe())
+		changed = changed || runEndChanged
+	}
 	if err != nil {
 		// Don't record a stamp for a file we failed to reconcile: the next start
 		// (after the throttle) must try again rather than treat the bad state as
@@ -835,7 +872,7 @@ func reconcileClaudeStatusLineHookBounded(label string) {
 			fmt.Printf("%s[%s] Could not reconcile Claude status-line hook: %v%s\n",
 				colorYellow, label, err, colorReset)
 		case changed:
-			fmt.Printf("%s[%s] Repaired Claude status-line hook after a settings.json change%s\n",
+			fmt.Printf("%s[%s] Repaired Claude status-line / run-end hooks after a settings.json change%s\n",
 				colorGreen, label, colorReset)
 		}
 	}()
@@ -852,7 +889,22 @@ func reconcileClaudeStatusLineHookBounded(label string) {
 // was installed on a prior run. If we previously stashed a third-party command
 // it is restored; otherwise the `statusLine` key is removed entirely. Other
 // keys in settings.json are preserved. Returns true when it wrote a change.
+//
+// The run-end hook (claude_run_end_hook_install.go) goes with it: one opt-out
+// covers both entries we add to Claude's settings. It is removed even when the
+// statusLine is no longer ours, and a failure to remove it is reported only
+// after the statusLine half has had its chance.
 func removeClaudeStatusLineHook(home string) (bool, error) {
+	changed, err := removeClaudeStatusLineEntry(home)
+	runEndChanged, runEndErr := removeClaudeRunEndHook(home)
+	if err == nil {
+		err = runEndErr
+	}
+	return changed || runEndChanged, err
+}
+
+// removeClaudeStatusLineEntry is the statusLine half of removeClaudeStatusLineHook.
+func removeClaudeStatusLineEntry(home string) (bool, error) {
 	base := claudeConfigDir(home)
 	if base == "" {
 		return false, nil
@@ -881,7 +933,7 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 	}
 	var existing claudeStatusLine
 	_ = json.Unmarshal(rawSL, &existing)
-	if !isOurStatusLineCommand(existing.Command) {
+	if !isOurClaudeHookCommand(existing.Command, statusLineHookArg) {
 		// User has switched to a different command on their own — leave it be.
 		return false, nil
 	}

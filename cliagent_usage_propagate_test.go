@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +51,7 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	delete(p.pending, claudeUsageProvider)
 	delete(p.seen, claudeUsageProvider)
 	p.mu.Unlock()
-	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod}
+	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll}
 	prevFallback, prevDetected := cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected
 	// The Claude fallback read is opt-in per test (claudeFallbackFixture).
 	cliUsageClaudeFallbackEnabled = false
@@ -84,7 +85,7 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		stopCLIUsagePropagator()
 		resetCLIUsagePropagator()
 		sendCLIUsageObservedHint = prevSend
-		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod = prev[0], prev[1], prev[2], prev[3], prev[4]
+		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll = prev[0], prev[1], prev[2], prev[3], prev[4], prev[5]
 		cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected = prevFallback, prevDetected
 	})
 	return rec, &Config{AgentID: "agent-1", CommandSecret: "secret"}
@@ -719,6 +720,7 @@ func claudeFallbackFixture(t *testing.T, detected bool) (cache string, reads *in
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	cliUsageClaudeFallbackEnabled = true
 	cliUsageClaudeFallbackPeriod = 30 * time.Millisecond
+	cliUsageClaudeFallbackPoll = 10 * time.Millisecond
 	claudeUsageFallbackDetected = func() bool { return detected }
 	var n int64
 	prevLoad := claudeUsageFallbackLoad
@@ -1154,4 +1156,135 @@ func TestCLIUsageHint_AnUnrotatedProviderDoesNotBlockAnother(t *testing.T) {
 			t.Fatalf("sent an opencode hint before its rotation: %+v", r.hint)
 		}
 	}
+}
+
+// claudeTickFixture runs the Claude tick against armClaudeUsageProbe's private
+// cache, Claude config dir and fake usage endpoint, with the resident probe
+// armed, and counts the tick's cache loads.
+func claudeTickFixture(t *testing.T, handler http.HandlerFunc) (cache string, calls, loads *int64, rec *cliUsageHintRecorder, cfg *Config) {
+	t.Helper()
+	cache, calls = armClaudeUsageProbe(t, handler)
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", claudeRunOwnerEnv} {
+		t.Setenv(name, "")
+	}
+	resetClaudeObservedDebtAdoption()
+	t.Cleanup(func() {
+		stopClaudeRunDebtRetry()
+		resetClaudeObservedDebtAdoption()
+	})
+	rec, cfg = propagatorFixture(t)
+	cliUsageClaudeFallbackEnabled = true
+	cliUsageClaudeFallbackPeriod = time.Hour
+	cliUsageClaudeFallbackPoll = 10 * time.Millisecond
+	claudeUsageFallbackDetected = func() bool { return true }
+	var n int64
+	prevLoad := claudeUsageFallbackLoad
+	claudeUsageFallbackLoad = func(path string) (claudeRateLimitSnapshot, bool) {
+		atomic.AddInt64(&n, 1)
+		return prevLoad(path)
+	}
+	t.Cleanup(func() { claudeUsageFallbackLoad = prevLoad })
+	return cache, calls, &n, rec, cfg
+}
+
+// The tick costs one stat while nothing changes: an unchanged stamp inside the
+// period does no load. A hook write changes the stamp, so the next poll loads
+// the cache and adopts the debt — paid with one request.
+func TestCLIUsageHint_ClaudeTickIsStatGatedAndAdoptsTheHookDebt(t *testing.T) {
+	cache, calls, loads, _, cfg := claudeTickFixture(t, claudeProbeOKHandler)
+	seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+	startCLIUsagePropagator(cfg)
+	waitForClaudeCondition(t, 5*time.Second, "the first tick never loaded the cache", func() bool { return atomic.LoadInt64(loads) >= 1 })
+	claudeFreshnessWaitIdle(t)
+	settled := atomic.LoadInt64(loads)
+	time.Sleep(20 * cliUsageClaudeFallbackPoll)
+	if got := atomic.LoadInt64(loads); got != settled {
+		t.Fatalf("an unchanged cache was loaded %d more time(s) inside the period", got-settled)
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("requests=%d before any run ended", got)
+	}
+
+	end := time.Now()
+	if !claudeRunEndHookAt(end) {
+		t.Fatal("the hook did not owe the run")
+	}
+	waitForClaudeCondition(t, 5*time.Second, "the tick never adopted the hook's debt", func() bool {
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		return ok && snap.RefreshOwedAtMs == 0 && atomic.LoadInt64(calls) == 1
+	})
+	if atomic.LoadInt64(loads) <= settled {
+		t.Fatal("the changed stamp did not trigger a load")
+	}
+}
+
+// Offline, draining or Claude not detected: the tick neither loads nor adopts.
+func TestCLIUsageHint_ClaudeTickAdoptsNothingWhileAGateIsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		close func(t *testing.T)
+	}{
+		{"offline", func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{"draining", func(t *testing.T) {
+			drain.mu.Lock()
+			drain.draining = true
+			drain.mu.Unlock()
+			t.Cleanup(func() { drain.mu.Lock(); drain.draining = false; drain.mu.Unlock() })
+		}},
+		{"not detected", func(t *testing.T) { claudeUsageFallbackDetected = func() bool { return false } }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, calls, loads, _, cfg := claudeTickFixture(t, claudeProbeOKHandler)
+			seedClaudeProbeReading(t, cache, time.Now().Add(-time.Hour))
+			tc.close(t)
+			claudeRunEndHookAt(time.Now())
+			startCLIUsagePropagator(cfg)
+			time.Sleep(20 * cliUsageClaudeFallbackPoll)
+			claudeFreshnessWaitIdle(t)
+			if got := atomic.LoadInt64(loads); got != 0 {
+				t.Fatalf("the tick loaded the cache %d time(s)", got)
+			}
+			if got := atomic.LoadInt64(calls); got != 0 {
+				t.Fatalf("requests=%d, want none", got)
+			}
+			if snap := claudeCacheSnapshot(t, cache); snap.RefreshOwedAtMs == 0 {
+				t.Fatal("the debt was paid behind a closed gate")
+			}
+		})
+	}
+}
+
+// A Claude upgrade that rewrites settings.json and drops our hooks is repaired
+// by the tick itself — no agent-run session in between, because a direct run
+// never triggers one.
+func TestCLIUsageHint_ClaudeTickRepairsTheHooksAfterASettingsRewrite(t *testing.T) {
+	_, _, _, _, cfg := claudeTickFixture(t, claudeProbeOKHandler)
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+	settingsPath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startCLIUsagePropagator(cfg)
+	bothInstalled := func() bool {
+		b, err := os.ReadFile(settingsPath)
+		if err != nil {
+			return false
+		}
+		var m map[string]any
+		if json.Unmarshal(b, &m) != nil {
+			return false
+		}
+		sl, _ := m["statusLine"].(map[string]any)
+		cmd, _ := sl["command"].(string)
+		return isOurClaudeHookCommand(cmd, statusLineHookArg) && countOurRunEndHooks(sessionEndCommands(t, m)) == 1
+	}
+	waitForClaudeCondition(t, 5*time.Second, "the tick never installed both hooks", bothInstalled)
+
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark","hooks":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStatusLineReconcileThrottle()
+	waitForClaudeCondition(t, 5*time.Second, "the tick never repaired the rewritten settings.json", bothInstalled)
 }
