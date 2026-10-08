@@ -5,7 +5,8 @@
 //	storage/part/<messageID>/<partID>.json         one part of a message
 //
 // A message is read when its file was last written at or after the scan floor,
-// from a session directory written since then. Its usage is summed from its
+// from a session directory written since the session floor — which reaches
+// further back, since a message rewritten in place does not move its directory. Its usage is summed from its
 // step-finish parts and max'd with its own info, exactly as the export fallback
 // does (openCodeExportMessageUsage). Files are opened and closed one record at a
 // time, so the reader never holds a handle that would block OpenCode's own
@@ -60,7 +61,7 @@ func readOpenCodeDirectJSON(ctx context.Context, root string, floorMs int64, lim
 		at   int64
 	}
 	var sessions []sessionDir
-	sinceMs := floorMs - openCodeDirectSessionSlack.Milliseconds()
+	sinceMs := limits.sessionsSinceMs(floorMs)
 	for _, e := range entries {
 		if !e.IsDir() || !isValidOpenCodeSessionID(e.Name()) {
 			continue

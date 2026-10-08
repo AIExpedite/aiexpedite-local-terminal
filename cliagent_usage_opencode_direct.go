@@ -25,9 +25,11 @@
 //   - Bounds: one scan reads records last written since
 //     max(local midnight, cursor − 10 min), capped in sessions, records, bytes
 //     per record and wall-clock time. A capped scan saves a partial cursor at the
-//     first record it did not read: a heavy user is under-counted, never
+//     first record it did not read, and the next scan resumes there without the
+//     overlap, so a backlog drains: a heavy user is under-counted, never
 //     over-counted. A message with no completed time is not counted yet, and the
-//     cursor waits for it.
+//     cursor waits for it. Sessions are listed from the cursor even across
+//     midnight, so a turn begun before midnight is found once it finishes.
 //   - Triggers: once at startup (runs made while the agent was down or
 //     mid-update), on the propagator's 60 s tick only while the store's change
 //     marker moved or the last scan left work, and on a Refresh click. One
@@ -99,6 +101,18 @@ type openCodeDirectLimits struct {
 	MaxSessions    int
 	MaxRecords     int
 	MaxRecordBytes int64
+	// SessionFloorMs, when set below the read's floor, lists sessions last
+	// written since then (openCodeDirectSessionFloor); 0 lists from the floor.
+	SessionFloorMs int64
+}
+
+// sessionsSinceMs is the oldest session last write a read from floorMs lists,
+// less the slack: a session's last write can precede its last message's.
+func (l openCodeDirectLimits) sessionsSinceMs(floorMs int64) int64 {
+	if l.SessionFloorMs > 0 {
+		floorMs = min(floorMs, l.SessionFloorMs)
+	}
+	return floorMs - openCodeDirectSessionSlack.Milliseconds()
 }
 
 // openCodeDirectMessage is one stored assistant message.
@@ -274,13 +288,15 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 		return "direct_layout_unknown", false
 	}
 	now := openCodeDirectNow()
-	floorMs := openCodeDirectScanFloor(loadOpenCodeUsageLedger(), now)
+	saved := loadOpenCodeUsageLedger()
+	floorMs := openCodeDirectScanFloor(saved, now)
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	result, err := read(ctx, root, floorMs, openCodeDirectLimits{
 		MaxSessions:    openCodeDirectMaxSessions,
 		MaxRecords:     openCodeDirectMaxRecords,
 		MaxRecordBytes: openCodeDirectMaxRecordBytes,
+		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
 	})
 	switch {
 	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
@@ -306,7 +322,7 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 			return false, false
 		}
 		pruneOpenCodeOwnedRuns(ledger, now.UnixMilli())
-		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs}
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: layout, ThroughMs: throughMs, Continue: result.Truncated}
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
 	})
@@ -328,7 +344,7 @@ func openCodeDirectScan(layout, root string, budget time.Duration) (label string
 // cursor trails throughMs by less than the overlap every scan re-reads anyway.
 func openCodeDirectWriteCanWait(ledger *openCodeUsageLedger, layout, today string, throughMs int64) bool {
 	c, cov := ledger.DirectCursor, ledger.DirectCoverage
-	return c != nil && cov != nil && c.Layout == layout && cov.Layout == layout && cov.LastOkLocalDate == today &&
+	return c != nil && cov != nil && !c.Continue && c.Layout == layout && cov.Layout == layout && cov.LastOkLocalDate == today &&
 		throughMs >= c.ThroughMs && throughMs-c.ThroughMs < openCodeDirectOverlap.Milliseconds()
 }
 
@@ -384,7 +400,16 @@ func openCodeOwnedByRun(ledger *openCodeUsageLedger, sessionKey string, createdM
 	return false
 }
 
-// openCodeDirectScanFloor is where a scan starts: the cursor less the overlap,
+// resumeMs is where the scan after c reads from, before the midnight clamp: the
+// cursor less the overlap, or the cursor itself after a capped scan.
+func (c openCodeDirectCursor) resumeMs() int64 {
+	if c.Continue {
+		return c.ThroughMs
+	}
+	return c.ThroughMs - openCodeDirectOverlap.Milliseconds()
+}
+
+// openCodeDirectScanFloor is where a scan starts: the cursor's resume point,
 // never before local midnight. With no cursor but a bucket for today — an older
 // build rewrote the ledger and dropped the cursor, or this is the first scan
 // after the update that added it — it starts at that bucket's newest
@@ -392,13 +417,27 @@ func openCodeOwnedByRun(ledger *openCodeUsageLedger, sessionKey string, createdM
 func openCodeDirectScanFloor(ledger openCodeUsageLedger, now time.Time) int64 {
 	floor := openCodeLocalMidnight(now).UnixMilli()
 	if c := ledger.DirectCursor; c != nil && c.ThroughMs > 0 {
-		return max(floor, c.ThroughMs-openCodeDirectOverlap.Milliseconds())
+		return max(floor, c.resumeMs())
 	}
 	today, _ := openCodeLocalDay(now)
 	for _, b := range ledger.Buckets {
 		if b.LocalDate == today && b.ObservedAtMs > floor {
 			floor = b.ObservedAtMs
 		}
+	}
+	return floor
+}
+
+// openCodeDirectSessionFloor is how far back a scan lists sessions. A message
+// can finish long after its session was last touched — in the JSON store a
+// record rewritten in place moves no directory mtime — so the listing is not
+// clamped to midnight: it reaches back to the cursor's resume point (where a
+// still-running turn holds it), or with no cursor to the debt age-out before
+// midnight, the oldest running turn the cursor would wait for.
+func openCodeDirectSessionFloor(ledger openCodeUsageLedger, now time.Time) int64 {
+	floor := openCodeLocalMidnight(now).Add(-openCodeUsageDebtMaxAge).UnixMilli()
+	if c := ledger.DirectCursor; c != nil && c.ThroughMs > 0 {
+		floor = max(floor, c.resumeMs())
 	}
 	return floor
 }

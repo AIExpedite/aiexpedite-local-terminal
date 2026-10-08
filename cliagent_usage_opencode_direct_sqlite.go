@@ -104,12 +104,12 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 		return read, err
 	}
 
-	// Sessions written since the floor (less the slack: a session row can be
-	// touched just before its last message), oldest first. A session past the cap
-	// stops the cursor at its own last write.
+	// Sessions written since the session floor (less the slack: a session row can
+	// be touched just before its last message), oldest first. A session past the
+	// cap stops the cursor at its own last write.
 	rows, err := db.QueryContext(ctx,
 		`SELECT id, time_updated FROM session WHERE time_updated >= ? ORDER BY time_updated, id LIMIT ?`,
-		floorMs-openCodeDirectSessionSlack.Milliseconds(), limits.MaxSessions+1)
+		limits.sessionsSinceMs(floorMs), limits.MaxSessions+1)
 	if err != nil {
 		return read, err
 	}

@@ -465,6 +465,61 @@ func TestOpenCodeDirect_CapsTruncateIntoAnUnderCountThatResumes(t *testing.T) {
 	}
 }
 
+// A capped scan whose backlog sits inside the overlap still drains it: the next
+// scan resumes at the cursor rather than re-reading the records it counted.
+func TestOpenCodeDirect_ACappedBacklogInsideTheOverlapDrains(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2044)
+	for i := 0; i < 3; i++ {
+		store.write(openCodeTestMessage{session: "ses_a", id: fmt.Sprintf("msg_%d", i), createdMs: clock.ms(time.Duration(i-5) * time.Minute), completedMs: clock.ms(time.Duration(i-5)*time.Minute + time.Second), steps: [][3]int64{{1, 0, 0}}})
+	}
+	openCodeDirectMaxRecords = 2
+	scanOpenCodeDirect(t)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || !c.Continue {
+		t.Fatalf("capped cursor = %+v, want a continuation", c)
+	}
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 3 {
+		t.Fatalf("bucket = %+v, want the backlog drained under the same cap", b)
+	}
+	// A full scan goes back to re-reading the overlap.
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Continue {
+		t.Fatalf("cursor after a full scan = %+v", c)
+	}
+}
+
+// A JSON turn begun before midnight and finished after it is counted, though
+// rewriting its record in place did not move its session directory.
+func TestOpenCodeDirect_ATurnAcrossMidnightIsCounted(t *testing.T) {
+	_, store, clock := openCodeDirectFixture(t, 2045)
+	midnight := openCodeLocalMidnight(clock.now)
+	for _, withCursor := range []bool{false, true} {
+		session := fmt.Sprintf("ses_%v", withCursor)
+		clock.now = midnight.Add(30 * time.Minute)
+		created, completed := midnight.Add(-20*time.Minute).UnixMilli(), midnight.Add(5*time.Minute).UnixMilli()
+		openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+			ledger.DirectCursor = nil
+			if withCursor {
+				// Yesterday's last scan, held by the running turn.
+				ledger.DirectCursor = &openCodeDirectCursor{Layout: openCodeStoreLayoutJSON, ThroughMs: created}
+			}
+			return true, false
+		})
+		store.write(openCodeTestMessage{session: session, id: "msg_" + session, createdMs: created, completedMs: completed, steps: [][3]int64{{5, 0, 0}}})
+		dir := filepath.Join(store.root, "storage", "message", session)
+		if err := os.Chtimes(dir, time.UnixMilli(created), time.UnixMilli(created)); err != nil {
+			t.Fatal(err)
+		}
+		scanOpenCodeDirect(t)
+		want := int64(5)
+		if withCursor {
+			want = 10
+		}
+		if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != want {
+			t.Fatalf("cursor %v: bucket = %+v, want %d", withCursor, b, want)
+		}
+	}
+}
+
 func TestOpenCodeDirect_ASpentBudgetCountsNothingItDidNotRead(t *testing.T) {
 	_, store, clock := openCodeDirectFixture(t, 2042)
 	store.write(openCodeTestMessage{session: "ses_a", id: "msg_a", createdMs: clock.ms(-time.Hour), completedMs: clock.ms(-time.Hour + time.Second), steps: [][3]int64{{8, 0, 0}}})

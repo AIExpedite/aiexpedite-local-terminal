@@ -117,10 +117,13 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 }
 
 // openCodeDirectCursor is where the direct reader resumes: records last
-// written at or after ThroughMs (less an overlap) are read again.
+// written at or after ThroughMs (less an overlap) are read again. Continue
+// marks a cursor a capped scan saved: the next scan resumes AT ThroughMs, since
+// re-reading the overlap could spend the whole cap on records already counted.
 type openCodeDirectCursor struct {
 	Layout    string `json:"layout"`
 	ThroughMs int64  `json:"throughMs"`
+	Continue  bool   `json:"continue,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the
