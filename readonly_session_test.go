@@ -961,6 +961,7 @@ type readOnlyRecord struct {
 	Exe          string   `json:"exe"`
 	Args         []string `json:"args"`
 	NoDefaultCwd string   `json:"noDefaultCwd"`
+	Path         string   `json:"path"`
 	Stdin        string   `json:"stdin"`
 }
 
@@ -975,7 +976,11 @@ func runReadOnlyRecordMock() {
 	if !claudeStream && !codexExec {
 		os.Exit(0)
 	}
-	rec := readOnlyRecord{Args: args, NoDefaultCwd: os.Getenv("NoDefaultCurrentDirectoryInExePath")}
+	rec := readOnlyRecord{
+		Args:         args,
+		NoDefaultCwd: os.Getenv("NoDefaultCurrentDirectoryInExePath"),
+		Path:         os.Getenv("PATH"),
+	}
 	rec.Exe, _ = os.Executable()
 	if claudeStream {
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -1106,7 +1111,9 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			real := installReadOnlyMock(t, pathDir, tc.command)
 			decoy := installReadOnlyMock(t, cwd, tc.command) // the repository's own `claude` / `codex`
 			record := filepath.Join(t.TempDir(), "record.jsonl")
-			readOnlyMockEnv(t, record, pathDir)
+			// The real binary resolves first; the entries after it all lead
+			// into the repository and must not reach the child.
+			readOnlyMockEnv(t, record, pathDir, ".", "bin", cwd, filepath.Join(cwd, "node_modules", ".bin"), "")
 
 			sm := NewSessionManager(nil)
 			id := fmt.Sprintf("ro-%s-%d", tc.command, time.Now().UnixNano())
@@ -1146,6 +1153,19 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			}
 			if rec.NoDefaultCwd != "1" {
 				t.Fatalf("NoDefaultCurrentDirectoryInExePath = %q in the child, want 1", rec.NoDefaultCwd)
+			}
+			// The agent adds its well-known install directories; whatever the
+			// child gets, nothing on it leads into the repository.
+			childPath := filepath.SplitList(rec.Path)
+			keptReal := false
+			for _, entry := range childPath {
+				if entry == "" || !filepath.IsAbs(entry) || readOnlyPathEntryInside(entry, cwd) {
+					t.Fatalf("the child's PATH %q holds %q, which leads into the repository", rec.Path, entry)
+				}
+				keptReal = keptReal || entry == pathDir
+			}
+			if !keptReal {
+				t.Fatalf("the child's PATH %q lost the real entry %q", rec.Path, pathDir)
 			}
 			if !strings.Contains(rec.Stdin, tc.wantStdin) {
 				t.Fatalf("stdin %q does not carry the prompt %q", rec.Stdin, tc.wantStdin)
@@ -1209,5 +1229,56 @@ func TestStartSessionReadOnly_RefusesAPATHThatLeadsIntoCwd(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// PATH for a read-only child keeps only absolute entries outside the working
+// directory: `#!/usr/bin/env node` in an npm launcher must never find the
+// repository's own `node`.
+func TestReadOnlySessionPath_DropsEntriesThatLeadIntoTheRepository(t *testing.T) {
+	workDir := t.TempDir()
+	safeA := t.TempDir()
+	safeB := t.TempDir()
+	sub := filepath.Join(workDir, "node_modules", ".bin")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "repo-link")
+	hasLink := os.Symlink(workDir, link) == nil
+
+	entries := []string{safeA, "", ".", "bin", workDir, sub, safeB}
+	if hasLink {
+		entries = append(entries, link)
+	}
+	sep := string(os.PathListSeparator)
+	got := readOnlySessionPath(strings.Join(entries, sep), workDir)
+	if want := strings.Join([]string{safeA, safeB}, sep); got != want {
+		t.Fatalf("readOnlySessionPath = %q, want %q", got, want)
+	}
+
+	// Nothing left is never an empty PATH (execvp reads that as ".").
+	if got := readOnlySessionPath(strings.Join([]string{".", workDir}, sep), workDir); got != readOnlyFallbackPath() || got == "" {
+		t.Fatalf("an all-unsafe PATH became %q, want the system fallback %q", got, readOnlyFallbackPath())
+	}
+}
+
+func TestReadOnlyChildEnv_SetsTheGuardAndCleansPath(t *testing.T) {
+	workDir := t.TempDir()
+	safe := t.TempDir()
+	sep := string(os.PathListSeparator)
+	env := []string{"HOME=/home/u", "PATH=" + strings.Join([]string{".", safe, workDir}, sep)}
+	got := readOnlyChildEnv(env, workDir)
+	if v, _ := envVarValue(got, "PATH"); v != safe {
+		t.Fatalf("PATH = %q, want %q", v, safe)
+	}
+	if v, ok := envVarValue(got, "NoDefaultCurrentDirectoryInExePath"); !ok || v != "1" {
+		t.Fatalf("NoDefaultCurrentDirectoryInExePath = %q (set %v), want 1", v, ok)
+	}
+	if v, _ := envVarValue(got, "HOME"); v != "/home/u" {
+		t.Fatalf("HOME = %q, other variables must pass through", v)
+	}
+	// No PATH at all stays absent (the child keeps its platform default).
+	if _, ok := envVarValue(readOnlyChildEnv([]string{"HOME=/h"}, workDir), "PATH"); ok {
+		t.Fatal("readOnlyChildEnv invented a PATH")
 	}
 }

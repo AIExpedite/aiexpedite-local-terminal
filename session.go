@@ -650,7 +650,10 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		}
 	}
 	if readOnly {
-		filtered = readOnlyChildEnv(filtered)
+		// checkReadOnlyExecutable already resolved this directory (and refused
+		// the start if it could not); an error here can only drop more of PATH.
+		workDir, _ := readOnlySessionWorkDir(proc.Dir)
+		filtered = readOnlyChildEnv(filtered, workDir)
 	}
 	proc.Env = filtered
 	if grokMaintenanceSmoke {

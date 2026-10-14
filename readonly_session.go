@@ -538,11 +538,83 @@ func pathWithinDir(target, dir string) bool {
 	}
 }
 
-// readOnlyChildEnv pins NoDefaultCurrentDirectoryInExePath for a read-only CLI
-// and everything it starts. On Windows, cmd.exe — which runs an npm-installed
-// `claude.cmd` shim, whose bare `node` it must then find — and the process
-// search behind it otherwise try the CURRENT directory first, which here is
-// the untrusted repository. Other platforms ignore the variable.
-func readOnlyChildEnv(env []string) []string {
-	return setEnvVar(env, "NoDefaultCurrentDirectoryInExePath", "1")
+// readOnlyChildEnv keeps a read-only CLI, and everything it starts, from
+// resolving a program out of the untrusted repository it runs in:
+//
+//   - NoDefaultCurrentDirectoryInExePath: on Windows, cmd.exe — which runs an
+//     npm-installed `claude.cmd` shim, whose bare `node` it must then find —
+//     and the process search behind it otherwise try the CURRENT directory
+//     first. Other platforms ignore the variable.
+//   - PATH keeps only absolute entries outside workDir (readOnlySessionPath):
+//     an empty or relative entry ("", ".", "bin") resolves against the
+//     repository, and so does any entry inside it, so a launcher's
+//     `#!/usr/bin/env node` could otherwise run a repository-supplied
+//     interpreter before the CLI's tool restrictions apply.
+func readOnlyChildEnv(env []string, workDir string) []string {
+	env = setEnvVar(env, "NoDefaultCurrentDirectoryInExePath", "1")
+	if path, ok := envVarValue(env, "PATH"); ok {
+		env = setEnvVar(env, "PATH", readOnlySessionPath(path, workDir))
+	}
+	return env
+}
+
+// readOnlySessionPath is PATH without the entries a read-only session must
+// never search: empty and relative ones, and any that is — or, through a
+// symlink, resolves to — workDir or a directory inside it. Order is kept.
+func readOnlySessionPath(path, workDir string) string {
+	kept := make([]string, 0, 16)
+	for _, entry := range filepath.SplitList(path) {
+		if entry == "" || !filepath.IsAbs(entry) {
+			continue
+		}
+		if workDir != "" && readOnlyPathEntryInside(entry, workDir) {
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if len(kept) == 0 {
+		// An empty PATH is no safer: execvp reads it as one empty entry, the
+		// current directory. Fall back to the system's own directories.
+		return readOnlyFallbackPath()
+	}
+	return strings.Join(kept, string(os.PathListSeparator))
+}
+
+func readOnlyFallbackPath() string {
+	if runtime.GOOS == "windows" {
+		root := os.Getenv("SystemRoot")
+		if root == "" || !filepath.IsAbs(root) {
+			root = `C:\Windows`
+		}
+		return strings.Join([]string{filepath.Join(root, "System32"), root}, ";")
+	}
+	return "/usr/bin:/bin"
+}
+
+func readOnlyPathEntryInside(entry, workDir string) bool {
+	if pathWithinDir(entry, workDir) {
+		return true
+	}
+	if real, err := filepath.EvalSymlinks(entry); err == nil && pathWithinDir(real, workDir) {
+		return true
+	}
+	entryInfo, err1 := os.Stat(entry)
+	dirInfo, err2 := os.Stat(workDir)
+	return err1 == nil && err2 == nil && os.SameFile(entryInfo, dirInfo)
+}
+
+// envVarValue is key's value in env (case-insensitively on Windows, where
+// the environment is), and whether it is set.
+func envVarValue(env []string, key string) (string, bool) {
+	for i := len(env) - 1; i >= 0; i-- {
+		separator := strings.IndexByte(env[i], '=')
+		if separator < 0 {
+			continue
+		}
+		name := env[i][:separator]
+		if name == key || (runtime.GOOS == "windows" && strings.EqualFold(name, key)) {
+			return env[i][separator+1:], true
+		}
+	}
+	return "", false
 }
