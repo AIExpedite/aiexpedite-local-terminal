@@ -362,7 +362,7 @@ func TestNormalizeSetupToolCatalog_RefusesNonVersionCommands(t *testing.T) {
 // Every detect entry the db-content catalog ships today (dev/setupTools/*.json
 // `detect`, plus the cliAgents' commands with the default --version, as
 // terminal-service sends them) is accepted unchanged. Transcribed from
-// db-content origin/main on 2026-09-26; a new versionArgs form there needs an
+// db-content origin/main on 2026-09-26 (gitleaks / osv-scanner 2026-10-14); a new versionArgs form there needs an
 // agent release adding it to setupToolProbeAllowlist first. Every allowlisted
 // command is exercised, so the allowlist cannot hold a pair nothing uses.
 func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
@@ -373,6 +373,8 @@ func TestNormalizeSetupToolCatalog_AcceptsRealCatalog(t *testing.T) {
 		{ID: "flutter", Command: "flutter", VersionArgs: []string{"--version"}, VersionPattern: `Flutter (\d+\.\d+(?:\.\d+)?)`},
 		{ID: "gh", Command: "gh", VersionArgs: []string{"--version"}, VersionPattern: `gh version (\d+\.\d+(?:\.\d+)?)`},
 		{ID: "git", Command: "git", VersionArgs: []string{"--version"}, VersionPattern: `git version (\d+\.\d+(?:\.\d+)?)`},
+		{ID: "gitleaks", Command: "gitleaks", VersionArgs: []string{"version"}, VersionPattern: `v?(\d+\.\d+(?:\.\d+)?)`},
+		{ID: "osv-scanner", Command: "osv-scanner", VersionArgs: []string{"--version"}, VersionPattern: `osv-scanner version: v?(\d+\.\d+(?:\.\d+)?)`},
 		{ID: "go", Command: "go", VersionArgs: []string{"version"}, VersionPattern: `go(\d+\.\d+(?:\.\d+)?)`},
 		{ID: "godot", Command: "godot", VersionArgs: []string{"--version"}, VersionPattern: `(\d+\.\d+(?:\.\d+)?)`},
 		{ID: "java", Command: "java", VersionArgs: []string{"--version"}, VersionPattern: `(?:openjdk|java) (\d+\.\d+(?:\.\d+)?)`},

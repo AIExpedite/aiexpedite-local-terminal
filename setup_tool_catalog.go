@@ -78,23 +78,25 @@ var (
 // "unknown" and the server plans the install anyway (plan §10 Phase 0).
 var setupToolProbeAllowlist = map[string][][]string{
 	// setupTools
-	"code":       {{"--version"}}, // vscode
-	"docker":     {{"--version"}}, // docker-desktop
-	"firebase":   {{"--version"}}, // firebase-tools
-	"flutter":    {{"--version"}},
-	"gh":         {{"--version"}},
-	"git":        {{"--version"}},
-	"go":         {{"version"}},
-	"godot":      {{"--version"}},
-	"java":       {{"--version"}},
-	"node":       {{"--version"}},
-	"nvcc":       {{"--version"}}, // cuda-toolkit
-	"playwright": {{"--version"}},
-	"python":     {{"--version"}}, // python, commandByOs.windows
-	"python3":    {{"--version"}}, // python
-	"terraform":  {{"--version"}},
-	"uv":         {{"--version"}},
-	"xcodebuild": {{"-version"}}, // xcode
+	"code":        {{"--version"}}, // vscode
+	"docker":      {{"--version"}}, // docker-desktop
+	"firebase":    {{"--version"}}, // firebase-tools
+	"flutter":     {{"--version"}},
+	"gh":          {{"--version"}},
+	"git":         {{"--version"}},
+	"gitleaks":    {{"version"}},   // Security review's optional scanner
+	"osv-scanner": {{"--version"}}, // Security review's optional scanner
+	"go":          {{"version"}},
+	"godot":       {{"--version"}},
+	"java":        {{"--version"}},
+	"node":        {{"--version"}},
+	"nvcc":        {{"--version"}}, // cuda-toolkit
+	"playwright":  {{"--version"}},
+	"python":      {{"--version"}}, // python, commandByOs.windows
+	"python3":     {{"--version"}}, // python
+	"terraform":   {{"--version"}},
+	"uv":          {{"--version"}},
+	"xcodebuild":  {{"-version"}}, // xcode
 	// cliAgents
 	"agy":      {{"--version"}}, // antigravity
 	"claude":   {{"--version"}}, // claudeCode
