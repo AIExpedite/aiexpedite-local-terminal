@@ -434,7 +434,8 @@ func isSigFailRateLimited() bool {
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
-// refreshId, riskLevel, cwd, conversationId, ackedTurnIds, cliAgentCatalog
+// refreshId, riskLevel, cwd, conversationId, ackedTurnIds, cliAgentCatalog,
+// readOnly
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -499,6 +500,15 @@ type signaturePayload struct {
 	// older agent would compute a canonical without it and reject the command.
 	AckedTurnIds    []string        `json:"ackedTurnIds,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
+	// readOnly asks for an ENFORCED read-only session (readonly_session.go).
+	// Signed so it can be neither stripped (a read-only review would run
+	// writable) nor injected. Node's signCommand appends `canonical.readOnly =
+	// true` LAST, and only when true; omitempty drops false here, so every
+	// other command keeps its byte-identical canonical. terminal-service sends
+	// the field only to a device reporting capabilities.readOnlySessions — an
+	// older agent computes a canonical without it and rejects the command as a
+	// bad signature instead of running it writable. MUST stay the last field.
+	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -544,6 +554,7 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		ConversationID:  cmd.ConversationID,
 		AckedTurnIds:    cmd.AckedTurnIds,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
+		ReadOnly:        cmd.ReadOnly,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -693,6 +704,13 @@ type commandMsg struct {
 	// onto pipes regardless, and Windows rejects tty outright. See
 	// EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
 	Tty bool `json:"tty,omitempty"`
+
+	// ReadOnly asks for an ENFORCED read-only coding-agent session
+	// (readonly_session.go): only a generic session_start of the bare `claude`
+	// or `codex` honours it; every other command carrying it is refused
+	// (TERMINAL_READ_ONLY_UNSUPPORTED) and never runs writable. SIGNED (see
+	// signaturePayload.ReadOnly).
+	ReadOnly bool `json:"readOnly,omitempty"`
 
 	rawCliAgentCatalog json.RawMessage
 }
@@ -1831,6 +1849,19 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			applyRelayAckWatermark(globalRelayTurnInbox, cmd, cfg.CommandSecret != "")
+		}
+		// ─────────────────────────────────────────────────────────────────
+
+		// ─── Read-Only Gate ──────────────────────────────────────────────
+		// A command that asks to run read-only and cannot — any type but a
+		// generic session_start, a TTY, a resume, anything but the bare
+		// `claude` / `codex`, Codex on Windows — is refused HERE, before work
+		// admission, the internal demand commands, the approval dialog and
+		// every dispatcher, so no route runs it writable. A __ping__ is
+		// answered above and runs nothing. Applied in unsigned mode too:
+		// refusing an unauthenticated readOnly can only make the agent safer.
+		if refuseReadOnlyCommand(ctx, topic, m, cmd, cfg) {
+			return
 		}
 		// ─────────────────────────────────────────────────────────────────
 
@@ -6260,6 +6291,15 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			persistOnAlways = false
 		}
 		dialogArgs = allowArgs
+		// A read-only start never execs the caller's argv but the fixed
+		// read-only shape (readonly_session.go): SHOW that. The allowlist still
+		// matches the caller's request — the read-only shape only ever narrows
+		// it, so a request already allowed stays allowed without a dialog.
+		if cmd.ReadOnly {
+			if roArgs, _, _, err := buildReadOnlySessionArgs(cmd.Command, cmd.Args); err == nil {
+				dialogArgs = roArgs
+			}
+		}
 		denyOutput = "Command denied by user: not in allow list"
 	case "codex_appserver_start":
 		// Gate against the synthesised `codex app-server …` argv the manager
@@ -6495,6 +6535,20 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 
 // dispatchSessionCommand is the per-kind router behind handleSessionCommand.
 func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	// Defense in depth: the receive loop already refused these
+	// (refuseReadOnlyCommand). Re-checked here, ahead of every per-family
+	// manager, so no route into this router can run a read-only request
+	// writable.
+	if reason := readOnlyCommandRefusal(cmd); reason != "" {
+		agentID := ""
+		if cfg != nil {
+			agentID = cfg.AgentID
+		}
+		if err := publishMsg(ctx, topic, readOnlyRefusalResult(cmd, agentID, reason)); err != nil {
+			logSession(cmd.SessionID, "%s[session] Failed to publish read-only refusal: %v%s\n", colorRed, err, colorReset)
+		}
+		return
+	}
 	if isCodexAppServerCommand(cmd.Type) {
 		handleCodexAppServerCommand(ctx, topic, cmd)
 		return
@@ -6547,22 +6601,44 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		logSession(cmd.SessionID, "%s[session] Starting session %s for command: %s%s\n",
 			colorCyan, cmd.SessionID, cmd.Command, colorReset)
 
-		// cmd.ConversationID is the SIGNED exact-resume seed (empty on an
-		// ordinary start) — see cli_conversation_resume.go.
-		err := globalSessionManager.StartSessionResuming(
-			cmd.SessionID,
-			cmd.Command,
-			sessionStartArgsForCommand(cmd),
-			cmd.Cwd,
-			cmd.WorkspaceID,
-			cmd.UID,
-			cmd.TimeoutMs,
-			cmd.Tty,
-			cmd.ConversationID,
-			publishFn,
-		)
+		var err error
+		if cmd.ReadOnly {
+			// The ENFORCED read-only shape (readonly_session.go): fixed argv,
+			// PATH-resolved executable outside cwd. The raw caller args go in —
+			// no maintenance-control promotion applies to claude / codex, and
+			// the read-only builder keeps only their model / effort flags.
+			err = globalSessionManager.StartSessionReadOnly(
+				cmd.SessionID,
+				cmd.Command,
+				cmd.Args,
+				cmd.Cwd,
+				cmd.WorkspaceID,
+				cmd.UID,
+				cmd.TimeoutMs,
+				publishFn,
+			)
+		} else {
+			// cmd.ConversationID is the SIGNED exact-resume seed (empty on an
+			// ordinary start) — see cli_conversation_resume.go.
+			err = globalSessionManager.StartSessionResuming(
+				cmd.SessionID,
+				cmd.Command,
+				sessionStartArgsForCommand(cmd),
+				cmd.Cwd,
+				cmd.WorkspaceID,
+				cmd.UID,
+				cmd.TimeoutMs,
+				cmd.Tty,
+				cmd.ConversationID,
+				publishFn,
+			)
+		}
 		if err != nil {
 			msg := fmt.Sprintf("failed to start session: %v", err)
+			if readOnlySessionErrorFrom(err) != nil {
+				publishSessionErrorWithCode(ctx, topic, cmd, msg, readOnlyUnsupportedErrorCode)
+				return
+			}
 			if typed := grokAuthErrorFrom(err); typed != nil {
 				publishSessionErrorWithCode(ctx, topic, cmd, msg, typed.Code)
 				return
