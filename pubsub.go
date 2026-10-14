@@ -467,12 +467,14 @@ type signaturePayload struct {
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
 	RiskLevel string `json:"riskLevel,omitempty"`
-	// cwd is signed ONLY for env-setup dispatches (riskLevel-bearing commands),
-	// mirroring the Node signer's riskLevel-gated branch in hmac.util.js. An
-	// env-setup clone/destructive step whose target is a relative path resolves
-	// against cwd on this device, so an unsigned cwd would let a tampered or
-	// replayed command keep a valid signature while redirecting an approved,
-	// disk-gated step onto a different directory than the user approved.
+	// cwd is signed ONLY for env-setup dispatches (riskLevel-bearing commands)
+	// and read-only session starts, mirroring the Node signer's gated branch in
+	// hmac.util.js. An env-setup clone/destructive step whose target is a
+	// relative path resolves against cwd on this device, and a read-only review
+	// session reads whatever directory it starts in, so an unsigned cwd would
+	// let a tampered or replayed command keep a valid signature while
+	// redirecting an approved, disk-gated step onto a different directory than
+	// the user approved, or pointing a review at files it was never given.
 	//
 	// THIS FIELD WAS MISSING and that absence was a live outage, not a latent
 	// one: terminal-service has signed {riskLevel, cwd} since env-setup shipped
@@ -481,10 +483,10 @@ type signaturePayload struct {
 	// sides and was rejected here as a bad signature. Steps without a cwd
 	// matched by accident of omitempty.
 	//
-	// Populate it ONLY when RiskLevel is set (see verifySignature): ordinary
-	// execute/session commands carry a cwd too, and the Node signer does not
-	// sign cwd for those — including it unconditionally would break every
-	// signed command that has a working directory.
+	// Populate it ONLY when RiskLevel is set or ReadOnly is true (signatureCwd):
+	// ordinary execute/session commands carry a cwd too, and the Node signer
+	// does not sign cwd for those — including it unconditionally would break
+	// every signed command that has a working directory.
 	Cwd string `json:"cwd,omitempty"`
 	// conversationId selects durable local chat context for Antigravity starts.
 	// It affects execution just like signed Args, so it must be authenticated.
@@ -549,8 +551,8 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		Signal:    cmd.Signal,
 		RefreshID: cmd.RefreshID,
 		RiskLevel: cmd.RiskLevel,
-		// riskLevel-gated to match the Node signer — see the field comment.
-		Cwd:             riskGatedSignatureCwd(cmd),
+		// Gated to match the Node signer — see the field comment.
+		Cwd:             signatureCwd(cmd),
 		ConversationID:  cmd.ConversationID,
 		AckedTurnIds:    cmd.AckedTurnIds,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
@@ -570,12 +572,15 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
 
-// riskGatedSignatureCwd returns the cwd to include in the signature canonical:
-// the command's cwd for env-setup (riskLevel-bearing) commands, empty for
-// everything else. Node's signCommand adds `canonical.cwd` only inside its
-// riskLevel branch, so the gate must be identical on both sides.
-func riskGatedSignatureCwd(cmd commandMsg) string {
-	if cmd.RiskLevel == "" {
+// signatureCwd returns the cwd to include in the signature canonical: the
+// command's cwd for env-setup (riskLevel-bearing) commands and read-only
+// session starts, empty for everything else. Node's signCommand adds
+// `canonical.cwd` only when riskLevel is set or readOnly is true, so the gate
+// must be identical on both sides. terminal-service sends readOnly only to an
+// agent reporting capabilities.readOnlySessions (this build or later), so no
+// older agent ever sees a read-only start with a signed cwd.
+func signatureCwd(cmd commandMsg) string {
+	if cmd.RiskLevel == "" && !cmd.ReadOnly {
 		return ""
 	}
 	return cmd.Cwd

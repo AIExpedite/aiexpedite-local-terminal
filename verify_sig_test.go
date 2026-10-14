@@ -394,10 +394,11 @@ func TestVerifySignatureAcceptsEnvSetupCwd(t *testing.T) {
 	}
 }
 
-// The gate must stay riskLevel-scoped: ordinary execute/session commands carry
-// a cwd the Node signer does NOT sign, so including it unconditionally would
-// break every signed command that has a working directory. This is the test
-// that fails if riskGatedSignatureCwd is ever inlined away.
+// The gate must stay scoped (riskLevel, or a read-only start): ordinary
+// execute/session commands carry a cwd the Node signer does NOT sign, so
+// including it unconditionally would break every signed command that has a
+// working directory. This is the test that fails if signatureCwd is ever
+// inlined away.
 func TestVerifySignatureIgnoresCwdWithoutRiskLevel(t *testing.T) {
 	secret := "test-secret-for-unit-test"
 	// Node canonical for an ordinary command: no riskLevel, no cwd.

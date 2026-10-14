@@ -166,13 +166,67 @@ func TestReadOnlySignature_NodeVectors(t *testing.T) {
 	}
 }
 
+// A read-only session reads the directory it starts in, so its cwd is signed
+// (signatureCwd), in Cwd's slot after riskLevel and before readOnly — the
+// Node vector from terminal-service's hmac.readOnly.test.js. A swapped,
+// stripped or injected cwd must not verify.
+func TestReadOnlySignature_NodeVectorWithCwd(t *testing.T) {
+	const secret = "test-secret"
+	const wantCanonical = `{"id":"cmd-ro-2","command":"claude","args":["--model","opus"],"ts":1760400000000,"type":"session_start","sessionID":"sess-ro-2","input":"","signal":"","cwd":"/Users/dev/run/repo","readOnly":true}`
+	const sig = "5c3f2145d29435557e5ea93d22bf26748b00b6271bacdafca7a4bddf4b4568a8"
+	// The same start signed WITHOUT its cwd (what a signer that skipped it would send).
+	const sigWithoutCwd = "7a7c03e811040d4df67fc6c8510882bbc943f2f63c126b06d6df03005773d220"
+
+	cmd := commandMsg{
+		ID:        "cmd-ro-2",
+		Command:   "claude",
+		Args:      []string{"--model", "opus"},
+		Ts:        1760400000000,
+		Type:      "session_start",
+		SessionID: "sess-ro-2",
+		Cwd:       "/Users/dev/run/repo",
+		ReadOnly:  true,
+		Signature: sig,
+	}
+	gotCanonical, err := signatureCanonical(cmd)
+	if err != nil {
+		t.Fatalf("signatureCanonical: %v", err)
+	}
+	if string(gotCanonical) != wantCanonical {
+		t.Fatalf("read-only canonical with cwd\nwant: %s\n got: %s", wantCanonical, gotCanonical)
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatal("the read-only start must verify against its Node signature")
+	}
+
+	swapped := cmd
+	swapped.Cwd = "/Users/dev"
+	if verifySignature(swapped, secret) {
+		t.Fatal("a swapped cwd must invalidate a read-only start's signature")
+	}
+	stripped := cmd
+	stripped.Cwd = ""
+	if verifySignature(stripped, secret) {
+		t.Fatal("a stripped cwd must invalidate a read-only start's signature")
+	}
+	unsignedCwd := cmd
+	unsignedCwd.Signature = sigWithoutCwd
+	if verifySignature(unsignedCwd, secret) {
+		t.Fatal("a read-only start whose cwd was not signed must be refused")
+	}
+	unsignedCwd.Cwd = ""
+	if !verifySignature(unsignedCwd, secret) {
+		t.Fatal("a read-only start with no cwd at all verifies over the canonical without one")
+	}
+}
+
 // The Pub/Sub payload decodes through commandMsg's custom UnmarshalJSON; the
 // field must survive it (or every read-only start would verify as writable
 // and fail its signature).
 func TestReadOnlySignature_WireMessageKeepsTheField(t *testing.T) {
-	msg := `{"id":"cmd-ro-1","command":"claude","args":["--model","opus"],"ts":1760400000000,` +
-		`"type":"session_start","sessionID":"sess-ro-1","readOnly":true,"cwd":"/tmp/snapshot",` +
-		`"workspaceID":"ws-1","uid":"u-1","signature":"6f1b4295009f7157c1bba376440391b1b9741da6ad033c136ae21af2ab01e3eb"}`
+	msg := `{"id":"cmd-ro-2","command":"claude","args":["--model","opus"],"ts":1760400000000,` +
+		`"type":"session_start","sessionID":"sess-ro-2","readOnly":true,"cwd":"/Users/dev/run/repo",` +
+		`"workspaceID":"ws-1","uid":"u-1","signature":"5c3f2145d29435557e5ea93d22bf26748b00b6271bacdafca7a4bddf4b4568a8"}`
 	var cmd commandMsg
 	if err := json.Unmarshal([]byte(msg), &cmd); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
@@ -180,9 +234,18 @@ func TestReadOnlySignature_WireMessageKeepsTheField(t *testing.T) {
 	if !cmd.ReadOnly {
 		t.Fatal("readOnly was lost decoding the wire message")
 	}
-	// cwd rides on the wire but, without a riskLevel, is not signed.
+	// A read-only start's cwd is signed.
 	if !verifySignature(cmd, "test-secret") {
 		t.Fatal("the decoded read-only command must verify")
+	}
+	// The same message re-pointed at another directory is refused.
+	moved := strings.Replace(msg, `"cwd":"/Users/dev/run/repo"`, `"cwd":"/Users/dev"`, 1)
+	var movedCmd commandMsg
+	if err := json.Unmarshal([]byte(moved), &movedCmd); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if verifySignature(movedCmd, "test-secret") {
+		t.Fatal("a read-only start re-pointed at another directory must be refused")
 	}
 
 	var absent commandMsg
