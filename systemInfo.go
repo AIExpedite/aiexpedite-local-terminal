@@ -129,15 +129,23 @@ type capabilitiesInfo struct {
 	// relay must not start Claude at all: an older agent would add the
 	// auto-approve flag regardless.
 	RelayPermissionPrompts bool `json:"relayPermissionPrompts"`
+	// ReadOnlySessions (shared-constants DEVICE_SESSION_CAPABILITIES.READ_ONLY):
+	// the agent verifies a SIGNED `readOnly` on a session_start and starts the
+	// bare `claude` / `codex` in its enforced read-only mode, or refuses with
+	// TERMINAL_READ_ONLY_UNSUPPORTED (readonly_session.go). terminal-service
+	// sends `readOnly` only when this is true — an older agent would reject
+	// the unknown signed field as a bad signature.
+	ReadOnlySessions bool `json:"readOnlySessions"`
 }
 
 // newMachineCapabilities returns the capabilities every build of this agent
-// reports regardless of hardware probes: the relay protocol flags.
+// reports regardless of hardware probes: the protocol flags.
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
 		RelayTurnInbox:         true,
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
+		ReadOnlySessions:       true,
 	}
 }
 

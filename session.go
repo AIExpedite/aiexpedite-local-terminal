@@ -298,6 +298,36 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 // a one-shot CLI start reattach to that conversation instead of opening a new
 // one. Empty is an ordinary start. See cli_conversation_resume.go.
 func (sm *SessionManager) StartSessionResuming(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, resumeConversationID string, publishFn PublishFunc) error {
+	return sm.startSession(id, command, args, cwd, workspaceID, uid, timeoutMs, tty, resumeConversationID, false, publishFn)
+}
+
+// StartSessionReadOnly starts `claude` or `codex` in its ENFORCED read-only
+// mode (readonly_session.go): the fixed read-only argv (the caller keeps only
+// its model / effort), an executable resolved through this agent's PATH that
+// must lie outside cwd, and NoDefaultCurrentDirectoryInExePath in the child's
+// environment. Never under a TTY and never a resume. A refusal is a
+// *readOnlySessionError (TERMINAL_READ_ONLY_UNSUPPORTED on the wire).
+func (sm *SessionManager) StartSessionReadOnly(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, publishFn PublishFunc) error {
+	return sm.startSession(id, command, args, cwd, workspaceID, uid, timeoutMs, false, "", true, publishFn)
+}
+
+// startSession is the one spawn path behind StartSessionResuming and
+// StartSessionReadOnly. readOnly changes exactly three things — the argv
+// builder, the executable check, and one child environment variable — and
+// re-applies the read-only policy first, so a caller that bypassed the wire
+// gate still cannot start a CLI read-only that has no enforced read-only mode.
+// reconcileSessionStatusLineHook is the status-line repair a Claude session
+// start runs (a package variable so a test can observe that a read-only start
+// never does).
+var reconcileSessionStatusLineHook = reconcileClaudeStatusLineHookBounded
+
+func (sm *SessionManager) startSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, resumeConversationID string, readOnly bool, publishFn PublishFunc) error {
+	if readOnly {
+		if reason := readOnlySessionStartRefusal(command, tty, resumeConversationID); reason != "" {
+			return &readOnlySessionError{reason: reason}
+		}
+	}
+
 	// Re-verify Claude's status-line hook before launching a claude session. A
 	// Claude Code update rewrites settings.json and can drop our `statusLine`,
 	// silently stopping the only writer that carries numeric utilization on
@@ -309,8 +339,14 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// slow or unreachable filesystem, and a best-effort repair that stalls while
 	// holding the manager lock would block every unrelated session operation
 	// with it, not just this launch. Same placement as ClaudeNativeManager.Start.
-	if isClaudeCommand(command) {
-		reconcileClaudeStatusLineHookBounded("session")
+	//
+	// Never for a read-only start: the repair WRITES Claude's settings.json and
+	// run-end hook in the agent's own config directory, which a read-only
+	// review must not touch (it may even sit inside the checkout under review,
+	// and the child never sees CLAUDE_CONFIG_DIR to be checked). The review has
+	// no use for the status line.
+	if isClaudeCommand(command) && !readOnly {
+		reconcileSessionStatusLineHook("session")
 	}
 
 	sm.mu.Lock()
@@ -373,7 +409,23 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	// ordinary Grok approval preference. This also prevents the builder from
 	// injecting --always-approve before the strict child-argv validation below.
 	enableGrokAlwaysApprove := !grokMaintenanceSmoke && sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
-	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+	var cliArgs []string
+	var stdinPrompt *string
+	if readOnly {
+		// The fixed read-only shape; the caller keeps only its model / effort.
+		var dropped []string
+		var buildErr error
+		cliArgs, stdinPrompt, dropped, buildErr = buildReadOnlySessionArgs(command, args)
+		if buildErr != nil {
+			return buildErr
+		}
+		if len(dropped) > 0 {
+			logSession(id, "%s[session] Read-only %s session %s: dropped caller flags: %s%s\n",
+				colorYellow, command, id, strings.Join(dropped, ", "), colorReset)
+		}
+	} else {
+		cliArgs, stdinPrompt = buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+	}
 	if openCodeMaintenanceSmoke {
 		// The child argv is the LADDER's, never the wire's — the same split
 		// that keeps Grok's empty `--tools` operand off its child's command
@@ -547,6 +599,14 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 	if executable == "" {
 		executable = resolveExecutable(command)
 	}
+	// A read-only session runs only an absolute, PATH-resolved binary that
+	// lives outside its working directory — never one the repository under
+	// review supplies.
+	if readOnly {
+		if err := checkReadOnlyExecutable(command, executable, cwd); err != nil {
+			return err
+		}
+	}
 
 	// A synthesized Muse prompt moves to an owner-only `--prompt-file` on every
 	// platform: argv is readable through the process list, and a prompt can hold
@@ -598,6 +658,17 @@ func (sm *SessionManager) StartSessionResuming(id, command string, args []string
 		// marker and the billing reader use; see grokDirectChildHomeOverride.
 		if resolved := grokDirectChildHomeOverride(os.Getenv("GROK_HOME")); resolved != "" {
 			filtered = setEnvVar(filtered, "GROK_HOME", resolved)
+		}
+	}
+	if readOnly {
+		// checkReadOnlyExecutable already resolved this directory (and refused
+		// the start if it could not); an error here can only drop more of PATH.
+		workDir, _ := readOnlySessionWorkDir(proc.Dir)
+		filtered = readOnlyChildEnv(filtered, workDir)
+		// The CLI itself writes its sessions and logs: never into the
+		// repository under review.
+		if err := checkReadOnlyStateDir(command, filtered, workDir); err != nil {
+			return err
 		}
 	}
 	proc.Env = filtered

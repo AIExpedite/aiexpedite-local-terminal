@@ -25,35 +25,43 @@ func TestStartSession_AttributesGrokBillingBeforeSpawn(t *testing.T) {
 		t.Fatalf("parse session.go: %v", err)
 	}
 
-	// The spawn body lives in StartSessionResuming; StartSession is the
-	// seed-less entry point that delegates to it (cli_conversation_resume.go).
-	// The invariant follows the BODY — and the delegation is pinned too, so a
-	// future StartSession that grew its own spawn path would not slip past this
-	// positional check unexamined.
+	// The spawn body lives in startSession. StartSession is the seed-less entry
+	// point that delegates to StartSessionResuming (cli_conversation_resume.go),
+	// which — like StartSessionReadOnly (readonly_session.go) — delegates to
+	// it. The invariant follows the BODY — and every delegation is pinned too,
+	// so a future entry point that grew its own spawn path would not slip past
+	// this positional check unexamined.
 	var body *ast.BlockStmt
-	delegates := false
+	delegatesTo := map[string]string{} // entry point → the method it delegates to
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Recv == nil {
 			continue
 		}
-		switch fn.Name.Name {
-		case "StartSessionResuming":
+		switch name := fn.Name.Name; name {
+		case "startSession":
 			body = fn.Body
-		case "StartSession":
+		case "StartSession", "StartSessionResuming", "StartSessionReadOnly":
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "StartSessionResuming" {
-					delegates = true
+				if sel, ok := n.(*ast.SelectorExpr); ok &&
+					(sel.Sel.Name == "StartSessionResuming" || sel.Sel.Name == "startSession") {
+					delegatesTo[name] = sel.Sel.Name
 				}
 				return true
 			})
 		}
 	}
 	if body == nil {
-		t.Fatal("StartSessionResuming (the session spawn body) not found in session.go")
+		t.Fatal("startSession (the session spawn body) not found in session.go")
 	}
-	if !delegates {
-		t.Fatal("StartSession no longer delegates to StartSessionResuming — it has its own spawn path, which this ordering check does not cover")
+	for entry, want := range map[string]string{
+		"StartSession":         "StartSessionResuming",
+		"StartSessionResuming": "startSession",
+		"StartSessionReadOnly": "startSession",
+	} {
+		if delegatesTo[entry] != want {
+			t.Fatalf("%s no longer delegates to %s — it has its own spawn path, which this ordering check does not cover", entry, want)
+		}
 	}
 
 	attribution, start := token.NoPos, token.NoPos

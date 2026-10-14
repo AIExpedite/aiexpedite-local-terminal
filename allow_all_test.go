@@ -301,3 +301,67 @@ func TestGateSessionEntryCommand_OpenCodeAlwaysDoesNotPersistBlanketPattern(t *t
 		t.Errorf("session_start Always did not persist `mytool *`; persistence path is dead, so the opencode assertion proves nothing")
 	}
 }
+
+func TestGateSessionEntryCommand_ReadOnlyAlwaysDoesNotPersistBlanketPattern(t *testing.T) {
+	// The dialog shows the fixed read-only argv, so a person who clicks
+	// "Always" approved a visibly read-only review. GeneratePatternFromCommand
+	// would store `claude *`, pre-approving every later WRITABLE Claude run:
+	// "Always" must degrade to a one-time approval for a read-only start.
+	prevList := defaultAllowList
+	al := writableRestrictiveAllowList(t)
+	defaultAllowList = al
+	t.Cleanup(func() { defaultAllowList = prevList })
+
+	var shown []string
+	prevDialog := commandApprovalDialogFn
+	commandApprovalDialogFn = func(_ string, args []string, _ int) ApprovalResult {
+		shown = append([]string(nil), args...)
+		return ApprovalAlways
+	}
+	t.Cleanup(func() { commandApprovalDialogFn = prevDialog })
+
+	cfg := &Config{EnableAllowList: true}
+	cfg.SetAllowAllCommands(false)
+
+	readOnly := commandMsg{
+		ID:       "ro",
+		Type:     "session_start",
+		Command:  "claude",
+		Args:     []string{"--model", "opus", "Review the diff"},
+		ReadOnly: true,
+	}
+	if !gateSessionEntryCommand(context.Background(), nil, nil, readOnly, cfg) {
+		t.Fatalf("a read-only start with Always approval should pass through")
+	}
+	if !containsArg(shown, "--disallowedTools") {
+		t.Fatalf("the dialog showed %v, want the fixed read-only argv", shown)
+	}
+	for _, p := range al.patterns {
+		if p == "claude *" {
+			t.Fatalf("allow list gained %q after a read-only Always", p)
+		}
+	}
+	if al.IsAllowed("claude", []string{"--dangerously-skip-permissions"}) {
+		t.Errorf("a writable claude run became pre-approved after a read-only Always")
+	}
+
+	// Control: the same start WITHOUT readOnly persists, so the branch above
+	// is genuinely reached.
+	writable := readOnly
+	writable.ID, writable.ReadOnly = "rw", false
+	if !gateSessionEntryCommand(context.Background(), nil, nil, writable, cfg) {
+		t.Fatalf("a writable start with Always approval should pass through")
+	}
+	if !al.IsAllowed("claude", []string{"--dangerously-skip-permissions"}) {
+		t.Errorf("a writable Always did not persist `claude *`; the read-only assertion proves nothing")
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}

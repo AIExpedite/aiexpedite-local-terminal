@@ -53,6 +53,19 @@ func claudePrintFlagPrompt(arg string) (isPrintFlag bool, inlinePrompt string) {
 	return false, ""
 }
 
+// claudeInteractiveValuedFlags are the Claude Code options the interactive
+// builder knows consume the NEXT argument as their value. Shared with the
+// read-only builder (readonly_session.go), which must recognise the same values
+// to drop them with their flags rather than read them as prompt words.
+var claudeInteractiveValuedFlags = map[string]bool{
+	"--model": true, "--system-prompt": true, "--append-system-prompt": true,
+	"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
+	"--agent": true, "--agents": true, "--session-id": true,
+	"--permission-prompt-tool": true,
+	"--mcp-config":             true, "--settings": true, "--json-schema": true,
+	"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
+}
+
 // buildClaudeInteractiveArgs builds Claude Code CLI args for bidirectional
 // stream-json mode.  The prompt is NOT passed as a CLI arg — it is returned
 // separately so the caller can send it as an NDJSON message on stdin.
@@ -76,14 +89,7 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 
 	// Claude flags that consume the next argument as their value.
 	// Without this, "--model sonnet" would treat "sonnet" as a prompt word.
-	valuedFlags := map[string]bool{
-		"--model": true, "--system-prompt": true, "--append-system-prompt": true,
-		"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
-		"--agent": true, "--agents": true, "--session-id": true,
-		"--permission-prompt-tool": true,
-		"--mcp-config":             true, "--settings": true, "--json-schema": true,
-		"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
-	}
+	valuedFlags := claudeInteractiveValuedFlags
 
 	// Separate user-provided flags from prompt words.
 	// -p / --print (and the equals-form variants -p=... / --print=...) are

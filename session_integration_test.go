@@ -841,6 +841,12 @@ func runMockCLI(mode string) {
 		// Block until killed.
 		select {}
 
+	case readOnlyRecordMockMode:
+		// A `claude` / `codex` that records the argv, executable, stdin and
+		// child environment a read-only session spawned it with
+		// (readonly_session_test.go).
+		runReadOnlyRecordMock()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)
