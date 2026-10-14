@@ -316,6 +316,11 @@ func (sm *SessionManager) StartSessionReadOnly(id, command string, args []string
 // builder, the executable check, and one child environment variable — and
 // re-applies the read-only policy first, so a caller that bypassed the wire
 // gate still cannot start a CLI read-only that has no enforced read-only mode.
+// reconcileSessionStatusLineHook is the status-line repair a Claude session
+// start runs (a package variable so a test can observe that a read-only start
+// never does).
+var reconcileSessionStatusLineHook = reconcileClaudeStatusLineHookBounded
+
 func (sm *SessionManager) startSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, resumeConversationID string, readOnly bool, publishFn PublishFunc) error {
 	if readOnly {
 		if reason := readOnlySessionStartRefusal(command, tty, resumeConversationID); reason != "" {
@@ -334,8 +339,14 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	// slow or unreachable filesystem, and a best-effort repair that stalls while
 	// holding the manager lock would block every unrelated session operation
 	// with it, not just this launch. Same placement as ClaudeNativeManager.Start.
-	if isClaudeCommand(command) {
-		reconcileClaudeStatusLineHookBounded("session")
+	//
+	// Never for a read-only start: the repair WRITES Claude's settings.json and
+	// run-end hook in the agent's own config directory, which a read-only
+	// review must not touch (it may even sit inside the checkout under review,
+	// and the child never sees CLAUDE_CONFIG_DIR to be checked). The review has
+	// no use for the status line.
+	if isClaudeCommand(command) && !readOnly {
+		reconcileSessionStatusLineHook("session")
 	}
 
 	sm.mu.Lock()

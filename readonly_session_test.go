@@ -1125,6 +1125,12 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			t.Setenv("BASH_ENV", "./.bashrc")
 			t.Setenv("PYTHONPATH", ".")
 
+			// A read-only start never repairs (writes) Claude's settings.
+			repaired := 0
+			prevRepair := reconcileSessionStatusLineHook
+			reconcileSessionStatusLineHook = func(string) { repaired++ }
+			t.Cleanup(func() { reconcileSessionStatusLineHook = prevRepair })
+
 			sm := NewSessionManager(nil)
 			id := fmt.Sprintf("ro-%s-%d", tc.command, time.Now().UnixNano())
 			var err error
@@ -1179,6 +1185,9 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			}
 			if len(rec.Loaders) > 0 {
 				t.Fatalf("the read-only child inherited runtime loader variables %v", rec.Loaders)
+			}
+			if repaired != 0 {
+				t.Fatalf("a read-only start ran the status-line repair %d times", repaired)
 			}
 			if !strings.Contains(rec.Stdin, tc.wantStdin) {
 				t.Fatalf("stdin %q does not carry the prompt %q", rec.Stdin, tc.wantStdin)
