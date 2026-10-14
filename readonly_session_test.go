@@ -962,6 +962,7 @@ type readOnlyRecord struct {
 	Args         []string `json:"args"`
 	NoDefaultCwd string   `json:"noDefaultCwd"`
 	Path         string   `json:"path"`
+	Loaders      []string `json:"loaders"`
 	Stdin        string   `json:"stdin"`
 }
 
@@ -980,6 +981,11 @@ func runReadOnlyRecordMock() {
 		Args:         args,
 		NoDefaultCwd: os.Getenv("NoDefaultCurrentDirectoryInExePath"),
 		Path:         os.Getenv("PATH"),
+	}
+	for _, name := range []string{"NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "PYTHONPATH"} {
+		if v, ok := os.LookupEnv(name); ok {
+			rec.Loaders = append(rec.Loaders, name+"="+v)
+		}
 	}
 	rec.Exe, _ = os.Executable()
 	if claudeStream {
@@ -1114,6 +1120,10 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			// The real binary resolves first; the entries after it all lead
 			// into the repository and must not reach the child.
 			readOnlyMockEnv(t, record, pathDir, ".", "bin", cwd, filepath.Join(cwd, "node_modules", ".bin"), "")
+			// Preload variables the agent itself might carry: none reaches the child.
+			t.Setenv("NODE_OPTIONS", "--require=./bootstrap.js")
+			t.Setenv("BASH_ENV", "./.bashrc")
+			t.Setenv("PYTHONPATH", ".")
 
 			sm := NewSessionManager(nil)
 			id := fmt.Sprintf("ro-%s-%d", tc.command, time.Now().UnixNano())
@@ -1166,6 +1176,9 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			}
 			if !keptReal {
 				t.Fatalf("the child's PATH %q lost the real entry %q", rec.Path, pathDir)
+			}
+			if len(rec.Loaders) > 0 {
+				t.Fatalf("the read-only child inherited runtime loader variables %v", rec.Loaders)
 			}
 			if !strings.Contains(rec.Stdin, tc.wantStdin) {
 				t.Fatalf("stdin %q does not carry the prompt %q", rec.Stdin, tc.wantStdin)
@@ -1280,5 +1293,42 @@ func TestReadOnlyChildEnv_SetsTheGuardAndCleansPath(t *testing.T) {
 	// No PATH at all stays absent (the child keeps its platform default).
 	if _, ok := envVarValue(readOnlyChildEnv([]string{"HOME=/h"}, workDir), "PATH"); ok {
 		t.Fatal("readOnlyChildEnv invented a PATH")
+	}
+}
+
+func TestReadOnlyChildEnv_DropsRuntimeLoaderVariables(t *testing.T) {
+	env := []string{
+		"HOME=/home/u",
+		"ANTHROPIC_MODEL=opus",
+		"NODE_OPTIONS=--require=./bootstrap.js",
+		"NODE_PATH=.",
+		"LD_PRELOAD=./evil.so",
+		"LD_LIBRARY_PATH=.",
+		"DYLD_INSERT_LIBRARIES=./evil.dylib",
+		"BASH_ENV=./.bashrc",
+		"ZDOTDIR=.",
+		"PYTHONPATH=.",
+		"RUBYOPT=-r./x",
+		"PERL5OPT=-Mx",
+		"JAVA_TOOL_OPTIONS=-javaagent:x.jar",
+		"GIT_EXEC_PATH=.",
+		"PATH=/usr/bin",
+	}
+	got := readOnlyChildEnv(env, t.TempDir())
+	for _, entry := range got {
+		name := entry[:strings.IndexByte(entry, '=')]
+		if isRuntimeLoaderVar(name) {
+			t.Fatalf("readOnlyChildEnv kept %q", entry)
+		}
+	}
+	for _, keep := range []string{"HOME", "ANTHROPIC_MODEL", "PATH"} {
+		if _, ok := envVarValue(got, keep); !ok {
+			t.Fatalf("readOnlyChildEnv dropped %s, which loads nothing", keep)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if isRuntimeLoaderVar("node_options") != true {
+			t.Fatal("Windows names are case-insensitive")
+		}
 	}
 }

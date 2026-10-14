@@ -6300,10 +6300,17 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// read-only shape (readonly_session.go): SHOW that. The allowlist still
 		// matches the caller's request — the read-only shape only ever narrows
 		// it, so a request already allowed stays allowed without a dialog.
+		//
+		// "Always" never persists for a read-only start: the person approved
+		// the visibly read-only invocation, but GeneratePatternFromCommand
+		// stores a blanket `<cmd> *`, which would pre-approve every later
+		// WRITABLE run of the same CLI. One-time, like the synthesised entry
+		// points above.
 		if cmd.ReadOnly {
 			if roArgs, _, _, err := buildReadOnlySessionArgs(cmd.Command, cmd.Args); err == nil {
 				dialogArgs = roArgs
 			}
+			persistOnAlways = false
 		}
 		denyOutput = "Command denied by user: not in allow list"
 	case "codex_appserver_start":

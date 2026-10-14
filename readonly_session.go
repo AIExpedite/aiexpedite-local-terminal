@@ -545,17 +545,69 @@ func pathWithinDir(target, dir string) bool {
 //     npm-installed `claude.cmd` shim, whose bare `node` it must then find —
 //     and the process search behind it otherwise try the CURRENT directory
 //     first. Other platforms ignore the variable.
+//   - the runtime loader and preload variables are dropped
+//     (withoutRuntimeLoaderVars): `NODE_OPTIONS=--require=./x.js` makes an
+//     npm launcher run a repository module before the CLI reads a single
+//     read-only flag, and LD_PRELOAD / DYLD_INSERT_LIBRARIES, a shell's
+//     BASH_ENV, PYTHONPATH and their kin do the same for everything the CLI
+//     starts. A review needs none of them.
 //   - PATH keeps only absolute entries outside workDir (readOnlySessionPath):
 //     an empty or relative entry ("", ".", "bin") resolves against the
 //     repository, and so does any entry inside it, so a launcher's
 //     `#!/usr/bin/env node` could otherwise run a repository-supplied
 //     interpreter before the CLI's tool restrictions apply.
 func readOnlyChildEnv(env []string, workDir string) []string {
+	env = withoutRuntimeLoaderVars(env)
 	env = setEnvVar(env, "NoDefaultCurrentDirectoryInExePath", "1")
 	if path, ok := envVarValue(env, "PATH"); ok {
 		env = setEnvVar(env, "PATH", readOnlySessionPath(path, workDir))
 	}
 	return env
+}
+
+// runtimeLoaderVars are dropped from a read-only child's environment: each
+// makes a runtime (or the dynamic linker, or a shell) load code it names
+// before or around the program it starts. Every LD_* and DYLD_* name goes too.
+var runtimeLoaderVars = []string{
+	"NODE_OPTIONS", "NODE_PATH",
+	"BASH_ENV", "ENV", "ZDOTDIR",
+	"PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+	"RUBYOPT", "RUBYLIB",
+	"PERL5OPT", "PERL5LIB", "PERLLIB",
+	"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+	"GIT_EXEC_PATH",
+}
+
+func withoutRuntimeLoaderVars(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		separator := strings.IndexByte(entry, '=')
+		if separator <= 0 {
+			out = append(out, entry)
+			continue
+		}
+		if isRuntimeLoaderVar(entry[:separator]) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func isRuntimeLoaderVar(name string) bool {
+	upper := name
+	if runtime.GOOS == "windows" {
+		upper = strings.ToUpper(name)
+	}
+	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") {
+		return true
+	}
+	for _, v := range runtimeLoaderVars {
+		if upper == v {
+			return true
+		}
+	}
+	return false
 }
 
 // readOnlySessionPath is PATH without the entries a read-only session must
