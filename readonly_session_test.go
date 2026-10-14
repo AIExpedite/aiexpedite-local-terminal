@@ -1332,3 +1332,98 @@ func TestReadOnlyChildEnv_DropsRuntimeLoaderVariables(t *testing.T) {
 		}
 	}
 }
+
+// The CLI process persists its own state (Codex rollouts, Claude transcripts)
+// whatever the sandbox allows the model: never into the reviewed checkout.
+func TestCheckReadOnlyStateDir_KeepsCLIStateOutsideTheCheckout(t *testing.T) {
+	workDir := t.TempDir()
+	home := t.TempDir()
+	homeVar := "HOME"
+	if runtime.GOOS == "windows" {
+		homeVar = "USERPROFILE"
+	}
+	env := func(extra ...string) []string { return append([]string{homeVar + "=" + home}, extra...) }
+
+	ok := []struct {
+		command string
+		env     []string
+	}{
+		{"codex", env()},
+		{"claude", env()},
+		{"codex", env("CODEX_HOME=" + t.TempDir())},
+		{"claude", env("CLAUDE_CONFIG_DIR=" + t.TempDir())},
+		// Another CLI's variable is not this one's.
+		{"codex", env("CLAUDE_CONFIG_DIR=.claude")},
+	}
+	for _, tc := range ok {
+		if err := checkReadOnlyStateDir(tc.command, tc.env, workDir); err != nil {
+			t.Fatalf("%s %v refused: %v", tc.command, tc.env, err)
+		}
+	}
+
+	refused := []struct {
+		command string
+		env     []string
+	}{
+		{"codex", env("CODEX_HOME=.codex")},
+		{"codex", env("CODEX_HOME=" + filepath.Join(workDir, ".codex"))},
+		{"claude", env("CLAUDE_CONFIG_DIR=" + filepath.Join(workDir, "cfg"))},
+		{"claude", env("CLAUDE_CONFIG_DIR=cfg")},
+		// The home directory itself inside the checkout (or relative, or unset).
+		{"codex", []string{homeVar + "=" + filepath.Join(workDir, "home")}},
+		{"claude", []string{homeVar + "=home"}},
+		{"claude", nil},
+	}
+	for _, tc := range refused {
+		if readOnlySessionErrorFrom(checkReadOnlyStateDir(tc.command, tc.env, workDir)) == nil {
+			t.Fatalf("%s %v was not refused", tc.command, tc.env)
+		}
+	}
+}
+
+// The state-directory check is on the real start path: a CLI whose state
+// directory lies inside the checkout is refused before anything spawns —
+// Codex through CODEX_HOME, Claude through the home directory (a Claude child
+// never receives CLAUDE_CONFIG_DIR: prepareClaudeChildEnv strips it, so its
+// state is always the home directory's .claude).
+func TestStartSessionReadOnly_RefusesCLIStateInsideCwd(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	homeVar := "HOME"
+	if runtime.GOOS == "windows" {
+		homeVar = "USERPROFILE"
+	}
+	cases := []struct{ command, stateVar, sub string }{{"claude", homeVar, "home"}}
+	if runtime.GOOS != "windows" {
+		cases = append(cases, struct{ command, stateVar, sub string }{"codex", "CODEX_HOME", ".codex"})
+	}
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			withReadOnlyHostOS(t, runtime.GOOS)
+			pathDir := newMockClaudeDir(t)
+			cwd := newMockClaudeDir(t)
+			installReadOnlyMock(t, pathDir, tc.command)
+			record := filepath.Join(t.TempDir(), "record.jsonl")
+			readOnlyMockEnv(t, record, pathDir)
+			t.Setenv(tc.stateVar, filepath.Join(cwd, tc.sub))
+
+			sm := NewSessionManager(nil)
+			published := captureReadOnlyPublishes(t)
+			prevManager := globalSessionManager
+			globalSessionManager = sm
+			t.Cleanup(func() { globalSessionManager = prevManager })
+
+			cmd := readOnlyStart(tc.command, "--model", "opus", "Review")
+			cmd.Cwd = cwd
+			dispatchSessionCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-ro"})
+
+			frames := published()
+			if len(frames) != 1 || frames[0].Type != "session_error" || frames[0].ErrorCode != readOnlyUnsupportedErrorCode {
+				t.Fatalf("published %+v, want one session_error with %s", frames, readOnlyUnsupportedErrorCode)
+			}
+			time.Sleep(200 * time.Millisecond)
+			if recs := readReadOnlyRecords(t, record); len(recs) != 0 {
+				t.Fatalf("the CLI spawned %d times despite its state directory inside the checkout", len(recs))
+			}
+		})
+	}
+}

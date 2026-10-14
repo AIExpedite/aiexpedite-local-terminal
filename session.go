@@ -654,6 +654,11 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		// the start if it could not); an error here can only drop more of PATH.
 		workDir, _ := readOnlySessionWorkDir(proc.Dir)
 		filtered = readOnlyChildEnv(filtered, workDir)
+		// The CLI itself writes its sessions and logs: never into the
+		// repository under review.
+		if err := checkReadOnlyStateDir(command, filtered, workDir); err != nil {
+			return err
+		}
 	}
 	proc.Env = filtered
 	if grokMaintenanceSmoke {

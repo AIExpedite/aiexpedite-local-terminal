@@ -578,6 +578,51 @@ func readOnlyChildEnv(env []string, workDir string) []string {
 	return env
 }
 
+// checkReadOnlyStateDir refuses a read-only start whose CLI would write its
+// own state — Codex's session rollouts under CODEX_HOME, Claude Code's
+// transcripts under CLAUDE_CONFIG_DIR and ~/.claude.json — inside the
+// directory under review: the sandbox and the tool limits govern what the
+// MODEL may do, not what the CLI process persists. The state directory is
+// the CLI's variable when set, else its default under the home directory;
+// it, and the home directory, must be absolute and outside workDir. A state
+// directory that cannot be worked out is refused too.
+func checkReadOnlyStateDir(command string, env []string, workDir string) error {
+	homeVar := "HOME"
+	if runtime.GOOS == "windows" {
+		homeVar = "USERPROFILE"
+	}
+	home, _ := envVarValue(env, homeVar)
+	stateVar, stateDefault := "", ""
+	switch {
+	case isCodexCommand(command):
+		stateVar, stateDefault = "CODEX_HOME", ".codex"
+	case isClaudeCommand(command):
+		stateVar, stateDefault = "CLAUDE_CONFIG_DIR", ".claude"
+	default:
+		return nil
+	}
+	refuse := func(what, dir string) error {
+		return &readOnlySessionError{reason: fmt.Sprintf(
+			"`%s` would write its own state into %s (%q), which must be an absolute directory outside the reviewed checkout", command, what, dir)}
+	}
+	unsafe := func(dir string) bool {
+		return dir == "" || !filepath.IsAbs(dir) || (workDir != "" && readOnlyPathEntryInside(dir, workDir))
+	}
+	if unsafe(home) {
+		return refuse(homeVar, home)
+	}
+	if dir, ok := envVarValue(env, stateVar); ok && dir != "" {
+		if unsafe(dir) {
+			return refuse(stateVar, dir)
+		}
+		return nil
+	}
+	if dir := filepath.Join(home, stateDefault); unsafe(dir) {
+		return refuse("the default "+stateDefault, dir)
+	}
+	return nil
+}
+
 // runtimeLoaderVars are dropped from a read-only child's environment: each
 // makes a runtime (or the dynamic linker, or a shell) load code it names
 // before or around the program it starts. Every LD_* and DYLD_* name goes too.
