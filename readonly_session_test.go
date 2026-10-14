@@ -532,7 +532,7 @@ var wantReadOnlyClaudeBase = []string{
 	"--dangerously-skip-permissions",
 	"--safe-mode",
 	"--strict-mcp-config",
-	"--setting-sources", "user",
+	"--setting-sources", "",
 	"--tools", "Read,Grep,Glob",
 	"--disallowedTools", "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent",
 }

@@ -177,13 +177,18 @@ func refuseReadOnlyCommand(ctx context.Context, topic *pubsub.Publisher, m *pubs
 //   - --safe-mode: no hooks, plugins, skills, custom agents/commands or
 //     CLAUDE.md — none of the repository's extensions load.
 //   - --strict-mcp-config with no --mcp-config: no MCP server at all.
-//   - --setting-sources user: only the device owner's own settings (plus
-//     managed policy). In a non-interactive (piped) session Claude Code skips
-//     the workspace-trust dialog, so WITHOUT this the repository's own
-//     .claude/settings.json / settings.local.json load — and an `apiKeyHelper`
-//     there is a shell command Claude runs at startup. --safe-mode does not
-//     cover it: verified on Claude Code 2.1.260, a repository apiKeyHelper ran
-//     under every other flag here, and did not run with this one.
+//   - --setting-sources "": no settings FILE at all (managed policy still
+//     applies). In a non-interactive (piped) session Claude Code skips the
+//     workspace-trust dialog, so the repository's own .claude/settings.json /
+//     settings.local.json would load — and an `apiKeyHelper` there is a shell
+//     command Claude runs at startup, which --safe-mode does not cover. The
+//     device owner's user settings are dropped too: a helper (or any command
+//     setting) there that names a relative path, `node ./get-key.js`, resolves
+//     in the repository. Verified on Claude Code 2.1.260: a user apiKeyHelper
+//     runs with `--setting-sources user` and not with "", and the stored
+//     sign-in (OAuth / keychain) still works with "". An owner who signs in
+//     ONLY through an apiKeyHelper cannot run a read-only review (the pass
+//     fails "Not logged in"); ANTHROPIC_API_KEY in the environment still works.
 //   - --tools Read,Grep,Glob: the only built-in tools.
 //   - --disallowedTools: the write, shell, web and sub-agent tools, denied
 //     even if a later --tools named them (the deny list wins).
@@ -198,7 +203,7 @@ var readOnlyClaudeBaseArgs = []string{
 	"--dangerously-skip-permissions",
 	"--safe-mode",
 	"--strict-mcp-config",
-	"--setting-sources", "user",
+	"--setting-sources", "",
 	"--tools", "Read,Grep,Glob",
 	"--disallowedTools", "Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task,Agent",
 }
@@ -474,6 +479,14 @@ func checkReadOnlyExecutable(command, executable, cwd string) error {
 	if !filepath.IsAbs(executable) {
 		return &readOnlySessionError{reason: fmt.Sprintf(
 			"`%s` did not resolve to an absolute path through this computer's PATH", command)}
+	}
+	// An npm `.cmd` / `.bat` launcher cannot be started by CreateProcess
+	// directly, and routing a read-only argv through cmd.exe would add a
+	// second, differently-quoted parser in front of the CLI. A read-only
+	// session needs the native executable (Claude Code's own installer).
+	if isWindowsShimPath(executable) {
+		return &readOnlySessionError{reason: fmt.Sprintf(
+			"`%s` is installed as a Windows batch launcher (%s); a read-only session needs the native executable", command, filepath.Base(executable))}
 	}
 	workDir, err := readOnlySessionWorkDir(cwd)
 	if err != nil {
