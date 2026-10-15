@@ -31,6 +31,7 @@ func TestClaudeLiveFollowUpCertification(t *testing.T) {
 		t.Fatalf("certification attempt was fenced: %+v", row)
 	}
 	l.Finish(row.AttemptID, nil, followUpProcessedInCurrent)
+	l.release()
 	reloaded := newRelayFollowUpLedger(func() string { return path })
 	if got := reloaded.Query("cert-1", reloaded.LedgerID()); got.State != followUpRowWritten {
 		t.Fatalf("written attempt not durable: %+v", got)

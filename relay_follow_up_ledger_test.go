@@ -19,7 +19,19 @@ import (
 func newTestFollowUpLedger(t *testing.T) (*relayFollowUpLedger, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), relayFollowUpLedgerFileName)
-	return newRelayFollowUpLedger(func() string { return path }), path
+	l := newRelayFollowUpLedger(func() string { return path })
+	t.Cleanup(l.release)
+	return l, path
+}
+
+// reopenFollowUpLedger simulates a restart over the same file: the old
+// process lets go of the lock, the new one takes it and reloads.
+func reopenFollowUpLedger(t *testing.T, old *relayFollowUpLedger, path string) *relayFollowUpLedger {
+	t.Helper()
+	old.release()
+	l := newRelayFollowUpLedger(func() string { return path })
+	t.Cleanup(l.release)
+	return l
 }
 
 func okCheck(now time.Time) followUpAttemptCheck {
@@ -93,7 +105,7 @@ func TestAnExpiredOrFencedAttemptIsNeverWrittenAndRefusedForever(t *testing.T) {
 		t.Fatalf("fenced attempt: write=%v row=%+v", write, row)
 	}
 	// Even once the approval is answered, the same id stays refused — also after a restart.
-	reloaded := newRelayFollowUpLedger(func() string { return path })
+	reloaded := reopenFollowUpLedger(t, l, path)
 	row, write = reloaded.Begin("a1", "m1", "s1", okCheck(time.Now()))
 	if write || row.State != followUpRowRefused {
 		t.Fatalf("a refused id was accepted later: write=%v row=%+v", write, row)
@@ -124,7 +136,7 @@ func TestACrashBetweenAcceptedAndWrittenIsUnknownAfterRestart(t *testing.T) {
 		t.Fatalf("expected an accepted row")
 	}
 	// The process dies here, before Finish.
-	reloaded := newRelayFollowUpLedger(func() string { return path })
+	reloaded := reopenFollowUpLedger(t, l, path)
 	if got := reloaded.Query("a4", reloaded.LedgerID()); got.State != followUpRowUnknown {
 		t.Fatalf("an interrupted write must be unknown after restart, got %+v", got)
 	}
@@ -147,8 +159,76 @@ func TestRowsStayUntilTheWatermarkAndTheCapRefuses(t *testing.T) {
 	for i := 0; i < relayFollowUpLedgerMaxRows; i++ {
 		l.rows[string(rune(0x4e00+i))] = &relayFollowUpRow{State: followUpRowWritten}
 	}
-	if row, write := l.Begin("a6", "m6", "s1", okCheck(time.Now())); write || row.Reason != followUpReasonLedgerFull {
+	// Not recorded, so not fenced: answered unknown, never notWritten — the
+	// broker must not resend under a new attempt while this id could still land.
+	row, write := l.Begin("a6", "m6", "s1", okCheck(time.Now()))
+	if write || row.Reason != followUpReasonLedgerFull || outcomeOf(&row) != followUpOutcomeUnknown {
 		t.Fatalf("at the cap: write=%v row=%+v", write, row)
+	}
+	if _, kept := l.rows["a6"]; kept {
+		t.Fatalf("an over-cap attempt was recorded")
+	}
+}
+
+func TestOnlyOneProcessOwnsTheLedger(t *testing.T) {
+	owner, path := newTestFollowUpLedger(t)
+	if _, write := owner.Begin("a1", "m1", "s1", okCheck(time.Now())); !write {
+		t.Fatalf("the owner could not accept an attempt")
+	}
+	// A second agent process over the same file never reads or writes it.
+	other := newRelayFollowUpLedger(func() string { return path })
+	t.Cleanup(other.release)
+	if other.Own() || other.LedgerID() != "" {
+		t.Fatalf("a second process took the ledger")
+	}
+	if row, write := other.Begin("a2", "m2", "s1", okCheck(time.Now())); write || outcomeOf(&row) != followUpOutcomeUnknown {
+		t.Fatalf("a non-owner decided an attempt: write=%v row=%+v", write, row)
+	}
+	if got := other.Query("a1", owner.LedgerID()); outcomeOf(&got) != followUpOutcomeUnknown {
+		t.Fatalf("a non-owner answered a query: %+v", got)
+	}
+	if _, err := other.ConfirmAcked([]string{"a1"}); err == nil {
+		t.Fatalf("a non-owner confirmed rows")
+	}
+	// The owner's row survived: the non-owner wrote nothing over it.
+	reloaded := reopenFollowUpLedger(t, owner, path)
+	if got := reloaded.Query("a1", reloaded.LedgerID()); got.State != followUpRowUnknown {
+		t.Fatalf("the owner's accepted row was lost: %+v", got)
+	}
+	if _, kept := reloaded.rows["a2"]; kept {
+		t.Fatalf("the non-owner's attempt reached the file")
+	}
+}
+
+func TestANonOwnerHandsTheFollowUpBack(t *testing.T) {
+	owner, path := newTestFollowUpLedger(t)
+	owner.Own()
+	other := newRelayFollowUpLedger(func() string { return path })
+	t.Cleanup(other.release)
+	prevLedger := globalRelayFollowUpLedger
+	globalRelayFollowUpLedger = other
+	t.Cleanup(func() { globalRelayFollowUpLedger = prevLedger })
+	var answers []resultMsg
+	prevPublish := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		answers = append(answers, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prevPublish })
+
+	now := time.Now()
+	cmd := commandMsg{
+		ID:                       relayFollowUpEnvelopePrefix + "att-1",
+		Type:                     relayFollowUpCommandType,
+		SessionID:                "s1",
+		Ts:                       now.UnixMilli(),
+		FollowUpAttemptExpiresAt: now.Add(time.Minute).UnixMilli(),
+	}
+	if handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"}) {
+		t.Fatalf("a non-owner must hand the delivery back (Nack)")
+	}
+	if len(answers) != 0 {
+		t.Fatalf("a non-owner answered: %+v", answers)
 	}
 }
 
@@ -266,6 +346,9 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	l := newRelayFollowUpLedger(func() string { return filepath.Join(blocker, relayFollowUpLedgerFileName) })
+	lockPath := filepath.Join(t.TempDir(), relayFollowUpLedgerFileName+".lock")
+	l.acquireOwnership = func() *os.File { return tryAcquireRelayTurnInboxLock(lockPath) }
+	t.Cleanup(l.release)
 	c := okCheck(time.Now())
 	c.ApprovalPending = true
 	row, write := l.Begin("a1", "m1", "s1", c)
@@ -281,6 +364,12 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 	}
 	if _, again := l.Begin("never", "m", "s1", okCheck(time.Now())); again {
 		t.Fatalf("a fenced unseen id was written")
+	}
+	// An accepted row that could not be persisted is never written, and is
+	// answered unknown too: only this process remembers the fence.
+	row, write = l.Begin("a2", "m2", "s1", okCheck(time.Now()))
+	if write || row.State != followUpRowUnknown {
+		t.Fatalf("an acceptance that is not durable must answer unknown, got write=%v row=%+v", write, row)
 	}
 }
 
@@ -314,5 +403,23 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 	// would otherwise pass every check, is refused too.
 	if row, write := l.Begin("att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowRefused {
 		t.Fatalf("a refused attempt was written later: write=%v row=%+v", write, row)
+	}
+}
+
+func TestOnlyTheInboxOwnerDecidesAnExpiredFollowUpTurn(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	acceptTestRow(t, inbox, "s1", "fu_a1")
+	if owner, accepted := relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted {
+		t.Fatalf("owner: owner=%v accepted=%v", owner, accepted)
+	}
+	if owner, accepted := relayTurnAcceptance(inbox, "s1", "fu_a2"); !owner || accepted {
+		t.Fatalf("owner, unseen turn: owner=%v accepted=%v", owner, accepted)
+	}
+	// Another process owns the inbox: it cannot tell an accepted turn from a
+	// new one, so it must hand the delivery back rather than refuse it.
+	other := newRelayTurnInbox(func() string { return "unused" })
+	other.acquireOwnership = func() *os.File { return nil }
+	if owner, accepted := relayTurnAcceptance(other, "s1", "fu_a1"); owner || accepted {
+		t.Fatalf("non-owner: owner=%v accepted=%v", owner, accepted)
 	}
 }

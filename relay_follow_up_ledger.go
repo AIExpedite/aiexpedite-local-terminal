@@ -35,6 +35,15 @@
 // the ledger never saw is FENCED now (refused) when the broker names this
 // ledger's id — rows are kept until confirmed, so absence proves it was never
 // seen; a different ledger id (file lost, reinstall) is answered unknown.
+// An attempt that cannot be durably fenced (cap reached, write failed) is
+// answered unknown, never notWritten: a later delivery of it could still be
+// written, so the broker must not resend it under a new attempt.
+//
+// Exactly ONE agent process owns the ledger, through an exclusive lock on
+// `relay-follow-up-ledger.json.lock` held for that process's life (the turn
+// inbox's pattern): overlapping processes would otherwise each load their own
+// snapshot and overwrite the other's rows. A non-owner never reads or writes
+// the ledger; it hands the delivery back (Nack) so the owner answers it.
 //
 // Follow-up text is never logged.
 // -----------------------------------------------------------------------------
@@ -130,10 +139,55 @@ type relayFollowUpLedger struct {
 	loaded   bool
 	ledgerID string
 	rows     map[string]*relayFollowUpRow
+	// acquireOwnership takes the ledger's cross-process lock without waiting
+	// (nil while another process holds it); lockFile stays held for the life
+	// of the process once taken.
+	acquireOwnership func() *os.File
+	lockFile         *os.File
 }
 
 func newRelayFollowUpLedger(path func() string) *relayFollowUpLedger {
-	return &relayFollowUpLedger{path: path, now: time.Now, rows: map[string]*relayFollowUpRow{}}
+	l := &relayFollowUpLedger{path: path, now: time.Now, rows: map[string]*relayFollowUpRow{}}
+	l.acquireOwnership = func() *os.File {
+		return tryAcquireRelayTurnInboxLock(l.path() + ".lock")
+	}
+	return l
+}
+
+// ownLocked makes this process the ledger's exclusive owner (the first call
+// that wins the lock), then loads the file fresh under that lock. It reports
+// whether this process owns the ledger; a non-owner never reads or writes it.
+func (l *relayFollowUpLedger) ownLocked() bool {
+	if l.lockFile != nil {
+		return true
+	}
+	f := l.acquireOwnership()
+	if f == nil {
+		return false
+	}
+	l.lockFile = f
+	l.loaded = false
+	l.rows = map[string]*relayFollowUpRow{}
+	l.loadLocked()
+	return true
+}
+
+// Own reports whether this process owns the ledger, taking it when free.
+func (l *relayFollowUpLedger) Own() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ownLocked()
+}
+
+// release gives up ownership (tests simulating a restart over the same file).
+func (l *relayFollowUpLedger) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lockFile != nil {
+		_ = unlockFile(l.lockFile)
+		_ = l.lockFile.Close()
+		l.lockFile = nil
+	}
 }
 
 var globalRelayFollowUpLedger = newRelayFollowUpLedger(func() string {
@@ -192,11 +246,14 @@ func (l *relayFollowUpLedger) persistLocked() error {
 	return writeRelayTurnInboxAtomic(l.path(), data)
 }
 
-// LedgerID is reported in the relayFollowUps capability.
+// LedgerID is reported in the relayFollowUps capability; "" from a non-owner,
+// so a query naming it is answered unknown rather than fenced.
 func (l *relayFollowUpLedger) LedgerID() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loadLocked()
+	if !l.ownLocked() {
+		return ""
+	}
 	return l.ledgerID
 }
 
@@ -259,15 +316,19 @@ func (c followUpAttemptCheck) fenceReason() string {
 func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loadLocked()
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}, false
+	}
 	if r := l.rows[attemptID]; r != nil {
 		return *r, false
 	}
 	now := l.now().UnixMilli()
 	r := &relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID, UpdatedAt: now}
 	if len(l.rows) >= relayFollowUpLedgerMaxRows {
-		// Not recorded: there is no room, and nothing was fenced.
-		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowRefused, Reason: followUpReasonLedgerFull}, false
+		// Not recorded: there is no room, so nothing is fenced and a later
+		// delivery of this id could still be written — unknown, not notWritten.
+		fmt.Printf("%s[follow-up] ledger full: attempt %s answered unknown%s\n", colorYellow, attemptID, colorReset)
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown, Reason: followUpReasonLedgerFull}, false
 	}
 	if reason := check.fenceReason(); reason != "" {
 		r.State = followUpRowRefused
@@ -282,10 +343,10 @@ func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, che
 	r.State = followUpRowAccepted
 	l.rows[attemptID] = r
 	if err := l.persistLocked(); err != nil {
-		// Not durable → never written: refuse instead (fenced in memory too).
+		// Not durable → never written, and fenced in memory only: unknown.
 		r.State = followUpRowRefused
 		r.Reason = followUpReasonLedgerFull
-		return *r, false
+		return notDurableFence(*r), false
 	}
 	return *r, true
 }
@@ -295,7 +356,9 @@ func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, che
 func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processedIn string) relayFollowUpRow {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loadLocked()
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
 	r := l.rows[attemptID]
 	if r == nil {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
@@ -316,7 +379,9 @@ func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processed
 func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string) relayFollowUpRow {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loadLocked()
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
 	if r := l.rows[attemptID]; r != nil {
 		return *r
 	}
@@ -354,7 +419,9 @@ func (l *relayFollowUpLedger) ConfirmAcked(attemptIDs []string) (int, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.loadLocked()
+	if !l.ownLocked() {
+		return 0, fmt.Errorf("another agent process owns the follow-up ledger")
+	}
 	n := 0
 	for _, id := range attemptIDs {
 		if r := l.rows[id]; r != nil && r.State != followUpRowAccepted {
@@ -426,13 +493,18 @@ func liveFollowUpKind(cliAgentID string) bool {
 
 // handleRelayFollowUpCommand answers a live attempt or a reconciliation query.
 // It always publishes an answer per attempt; it never interrupts, ends or
-// restarts the running turn.
-func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+// restarts the running turn. It returns false only when another agent process
+// owns the ledger: the caller must Nack so Pub/Sub hands it to the owner.
+func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) bool {
+	ledger := globalRelayFollowUpLedger
+	if !ledger.Own() {
+		fmt.Printf("%s[follow-up] Another agent process owns the follow-up ledger — handing %s back%s\n", colorYellow, cmd.ID, colorReset)
+		return false
+	}
 	agentID := cmd.AgentID
 	if agentID == "" && cfg != nil {
 		agentID = cfg.AgentID
 	}
-	ledger := globalRelayFollowUpLedger
 	publish := func(r relayFollowUpRow) {
 		pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -445,7 +517,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		var q relayFollowUpQuery
 		if err := json.Unmarshal([]byte(cmd.Input), &q); err != nil || len(q.AttemptIDs) > followUpQueryMax {
 			fmt.Printf("%s[follow-up] malformed or over-cap query refused%s\n", colorYellow, colorReset)
-			return
+			return true
 		}
 		if _, err := ledger.ConfirmAcked(q.AckedAttemptIDs); err != nil {
 			fmt.Printf("%s[follow-up] %v%s\n", colorYellow, err, colorReset)
@@ -453,12 +525,12 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		for _, id := range q.AttemptIDs {
 			publish(ledger.Query(id, q.LedgerID))
 		}
-		return
+		return true
 	}
 
 	attemptID, ok := relayFollowUpAttemptIDFromEnvelope(cmd.ID)
 	if !ok {
-		return
+		return true
 	}
 	p := relayFollowUpPayload{
 		AttemptID:  cmd.FollowUpAttemptID,
@@ -489,7 +561,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 	row, write := ledger.Begin(attemptID, p.FollowUpID, cmd.SessionID, check)
 	if !write {
 		publish(row)
-		return
+		return true
 	}
 	// Read before the write: a `result` already read means the running turn
 	// ended, so the agent takes this message as a new turn.
@@ -499,6 +571,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 	}
 	err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, nil)
 	publish(ledger.Finish(attemptID, err, processedIn))
+	return true
 }
 
 // followUpTurnExpired reports whether a queued follow-up turn (`fu_…`) must be

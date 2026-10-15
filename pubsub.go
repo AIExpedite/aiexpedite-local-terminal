@@ -6556,8 +6556,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	// A live follow-up attempt or a reconciliation query: answered from the
 	// durable follow-up ledger, never routed to a kind's SEND.
 	if cmd.Type == relayFollowUpCommandType || cmd.Type == relayFollowUpQueryCommandType {
-		handleRelayFollowUpCommand(ctx, topic, cmd, cfg)
-		return true
+		return handleRelayFollowUpCommand(ctx, topic, cmd, cfg)
 	}
 	if turnID, ok := relayTurnIDFromEnvelope(cmd.ID); ok && cmd.SessionID != "" {
 		agentID := cmd.AgentID
@@ -6565,14 +6564,22 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			agentID = cfg.AgentID
 		}
 		// A queued follow-up turn past its expiry never starts (unless it was
-		// accepted earlier: then the inbox re-acks it below as usual).
-		if followUpTurnExpired(cmd, turnID, time.Now()) && !relayTurnAlreadyAccepted(globalRelayTurnInbox, cmd.SessionID, turnID) {
-			pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID)); err != nil {
-				logSession(cmd.SessionID, "%s[follow-up] Failed to publish an expired turn's refusal: %v%s\n", colorRed, err, colorReset)
+		// accepted earlier: then the inbox re-acks it below as usual). Only the
+		// inbox owner knows which; a non-owner hands the delivery back.
+		if followUpTurnExpired(cmd, turnID, time.Now()) {
+			owner, accepted := relayTurnAcceptance(globalRelayTurnInbox, cmd.SessionID, turnID)
+			if !owner {
+				logSession(cmd.SessionID, "%s[follow-up] Another agent process owns the relay turn inbox — handing expired turn %s back%s\n", colorYellow, turnID, colorReset)
+				return false
 			}
-			return true
+			if !accepted {
+				pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID)); err != nil {
+					logSession(cmd.SessionID, "%s[follow-up] Failed to publish an expired turn's refusal: %v%s\n", colorRed, err, colorReset)
+				}
+				return true
+			}
 		}
 		return runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
 			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
