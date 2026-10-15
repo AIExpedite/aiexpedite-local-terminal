@@ -312,7 +312,7 @@ func TestAQueuedFollowUpTurnPastItsExpiryIsRefused(t *testing.T) {
 	if followUpTurnExpired(ordinary, "t1", now) {
 		t.Fatalf("an ordinary relay turn is never refused for a follow-up expiry")
 	}
-	frame := refusedFollowUpTurnAck(cmd, "fu_a8", "agent-1")
+	frame := refusedFollowUpTurnAck(cmd, "fu_a8", "agent-1", followUpReasonExpired)
 	if frame.Type != relayTurnAckResultType || frame.RelayTurnID != "fu_a8" || frame.FollowUpOutcome != followUpOutcomeNotWritten || frame.FollowUpReason != followUpReasonExpired {
 		t.Fatalf("refusal frame: %+v", frame)
 	}
@@ -455,49 +455,117 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 	}
 }
 
-func TestOnlyTheInboxOwnerDecidesAnExpiredFollowUpTurn(t *testing.T) {
-	inbox := newTestRelayInbox(t)
-	acceptTestRow(t, inbox, "s1", "fu_a1")
-	if owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || inFlight {
-		t.Fatalf("owner: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
-	}
-	if owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a2"); !owner || accepted || inFlight {
-		t.Fatalf("owner, unseen turn: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
-	}
+// runFencedTestTurn delivers one queued follow-up turn through the fenced
+// claim, recording the refusal and the dispatch it led to.
+func runFencedTestTurn(inbox *relayTurnInbox, cmd commandMsg, turnID string, dispatch func(context.Context)) (handled bool, refusal string, dispatched bool) {
+	handled = runFencedRelayTurn(context.Background(), inbox, cmd, turnID, "agent-1",
+		func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) },
+		func(reason string) { refusal = reason },
+		func(relayTurnRow) {},
+		func(ctx context.Context) {
+			dispatched = true
+			if dispatch != nil {
+				dispatch(ctx)
+			}
+		})
+	return handled, refusal, dispatched
+}
+
+func TestOnlyTheInboxOwnerDecidesARefusedFollowUpTurn(t *testing.T) {
+	now := time.Now()
+	expired := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: now.Add(-5 * time.Minute).UnixMilli()}
 	// Another process owns the inbox: it cannot tell an accepted turn from a
 	// new one, so it must hand the delivery back rather than refuse it.
 	other := newRelayTurnInbox(func() string { return "unused" })
 	other.acquireOwnership = func() *os.File { return nil }
-	if owner, accepted, inFlight := relayTurnAcceptance(other, "s1", "fu_a1"); owner || accepted || inFlight {
-		t.Fatalf("non-owner: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	if handled, refusal, dispatched := runFencedTestTurn(other, expired, "fu_a1", nil); handled || refusal != "" || dispatched {
+		t.Fatalf("non-owner: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	inbox := newTestRelayInbox(t)
+	// Accepted earlier: re-acked, never refused late.
+	acceptTestRow(t, inbox, "s1", "fu_a1")
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, expired, "fu_a1", nil); !handled || refusal != "" || dispatched {
+		t.Fatalf("accepted: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	// Never seen: refused without a claim, so it can never run afterwards.
+	unseen := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a2", SessionID: "s1", Ts: expired.Ts}
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, unseen, "fu_a2", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("unseen: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if _, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a2"}]; ok {
+		t.Fatalf("a refused turn was claimed")
 	}
 }
 
-// A first delivery that has claimed the turn but not yet accepted it can still
-// accept and write. An expired duplicate must therefore be handed back, not
-// answered `notWritten` — otherwise the broker queues a replacement and the
-// user's message is delivered twice.
+// The fence is decided under the claim's lock, at the claim. A delivery that
+// claimed before the deadline can still accept and write, so a duplicate past
+// the deadline is handed back — not answered `notWritten`, which would make
+// the broker queue a replacement for a turn that then runs. Once the first
+// delivery settles without accepting, a redelivery is refused.
 func TestAClaimedInFlightFollowUpTurnIsNotRefusedAsExpired(t *testing.T) {
 	inbox := newTestRelayInbox(t)
-	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", WorkspaceID: "ws-1", UID: "u-1"}
-	if decision, _ := inbox.Begin(cmd, "fu_a1", "agent-1"); decision != relayTurnRun {
-		t.Fatalf("Begin = %v, want run", decision)
+	start := time.Now()
+	clock := start
+	inbox.now = func() time.Time { return clock }
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", WorkspaceID: "ws-1", UID: "u-1", Ts: start.UnixMilli()}
+
+	var dupHandled bool
+	var dupRefusal string
+	var dupDispatched bool
+	handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", func(context.Context) {
+		// Paused after the claim, until past the deadline.
+		clock = start.Add(followUpAttemptWindow + followUpSkewMargin + time.Minute)
+		dupHandled, dupRefusal, dupDispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil)
+	})
+	if !handled || refusal != "" || !dispatched {
+		t.Fatalf("first delivery: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
-	// Claimed and in flight, not accepted.
-	owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a1")
-	if !owner || accepted || !inFlight {
-		t.Fatalf("claimed in flight: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	if dupHandled || dupRefusal != "" || dupDispatched {
+		t.Fatalf("expired duplicate of an in-flight turn: handled=%v refusal=%q dispatched=%v", dupHandled, dupRefusal, dupDispatched)
 	}
-	// Once it accepts, the duplicate is re-acked instead.
-	if _, ok, err := inbox.Accept("s1", "fu_a1"); !ok || err != nil {
-		t.Fatalf("Accept did not transition: %v", err)
+	// The first delivery returned without accepting: now it is decided.
+	if handled, refusal, dispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("redelivery after an unaccepted dispatch: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
-	if owner, accepted, inFlight = relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || !inFlight {
-		t.Fatalf("accepted in flight: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+}
+
+// A queued follow-up turn for a session fenced off this computer never starts
+// and is answered with an outcome, unless it was accepted already.
+func TestAQueuedFollowUpTurnForAFencedSessionIsRefused(t *testing.T) {
+	resetFencedSessions(t)
+	markSessionsFenced([]string{"s-moved"})
+	now := time.Now()
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s-moved", Ts: now.UnixMilli()}
+	if got := followUpTurnRefusal(cmd, "fu_a1", now); got != followUpReasonSessionNotRunning {
+		t.Fatalf("fenced refusal = %q", got)
 	}
-	inbox.Finish("s1", "fu_a1")
-	if owner, accepted, inFlight = relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || inFlight {
-		t.Fatalf("after finish: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	if got := followUpTurnRefusal(commandMsg{ID: relayTurnEnvelopePrefix + "t1", SessionID: "s-moved"}, "t1", now); got != "" {
+		t.Fatalf("an ordinary relay turn is left to the generic fence, got %q", got)
+	}
+	inbox := newTestRelayInbox(t)
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonSessionNotRunning || dispatched {
+		t.Fatalf("fenced: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	frame := refusedFollowUpTurnAck(cmd, "fu_a1", "agent-1", followUpReasonSessionNotRunning)
+	if frame.FollowUpOutcome != followUpOutcomeNotWritten || frame.FollowUpReason != followUpReasonSessionNotRunning {
+		t.Fatalf("refusal frame: %+v", frame)
+	}
+}
+
+// The generic fence gate leaves follow-up protocol commands to their own
+// handlers (which answer with an outcome); everything else but END is still
+// refused there.
+func TestTheFenceGateLeavesFollowUpProtocolCommandsToTheirHandlers(t *testing.T) {
+	resetFencedSessions(t)
+	markSessionsFenced([]string{"s-moved"})
+	for _, cmd := range []commandMsg{
+		{Type: relayFollowUpCommandType, ID: relayFollowUpEnvelopePrefix + "att-1", SessionID: "s-moved"},
+		{Type: relayFollowUpQueryCommandType, ID: "q-1", SessionID: "s-moved"},
+		{Type: "claude_native_send", ID: relayTurnEnvelopePrefix + "fu_att-1", SessionID: "s-moved"},
+	} {
+		if refuseFencedSessionCommand(context.Background(), nil, nil, cmd, &Config{AgentID: "agent-1"}) {
+			t.Fatalf("follow-up protocol command %s/%s was refused generically", cmd.Type, cmd.ID)
+		}
 	}
 }
 

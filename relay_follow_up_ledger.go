@@ -549,11 +549,13 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		session = globalClaudeNativeManager.Get(cmd.SessionID)
 	}
 	check := followUpAttemptCheck{
-		Now:            time.Now(),
-		ExpiresAtMs:    p.ExpiresAt,
-		SignedTsMs:     cmd.Ts,
-		LiveKind:       session != nil && liveFollowUpKind(claudeCodeCliAgentID),
-		SessionRunning: session != nil && session.Status() == "running",
+		Now:         time.Now(),
+		ExpiresAtMs: p.ExpiresAt,
+		SignedTsMs:  cmd.Ts,
+		LiveKind:    session != nil && liveFollowUpKind(claudeCodeCliAgentID),
+		// A fenced session (moved or max-parked off this computer) takes
+		// nothing but its END, so it is not running for a follow-up.
+		SessionRunning: session != nil && session.Status() == "running" && !isSessionFenced(cmd.SessionID),
 		// A relay session id is bound to one CLI conversation (a resume is a
 		// new session id), so the session being this one is the match.
 		ConversationOK:  session != nil && metadataMatches,
@@ -599,6 +601,24 @@ func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
 		SessionRunning: true, ConversationOK: true}.fenceReason() == followUpReasonExpired
 }
 
+// followUpTurnRefusal is why a queued follow-up turn (`fu_…`) that is neither
+// accepted nor in flight must not start, or "" to run it: its expiry passed
+// (followUpTurnExpired), or its session was fenced off this computer (moved
+// or max-parked), whose CLI must take nothing more but its END. The inbox
+// evaluates it under the claim's lock (BeginFenced).
+func followUpTurnRefusal(cmd commandMsg, turnID string, now time.Time) string {
+	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
+		return ""
+	}
+	if followUpTurnExpired(cmd, turnID, now) {
+		return followUpReasonExpired
+	}
+	if isSessionFenced(cmd.SessionID) {
+		return followUpReasonSessionNotRunning
+	}
+	return ""
+}
+
 // isFollowUpProtocolCommand reports whether a command belongs to the follow-up
 // protocol: a live attempt, a reconciliation query, or a queued follow-up turn
 // (`relayturn_fu_…`). These carry the 120 s attempt window rather than the
@@ -611,8 +631,9 @@ func isFollowUpProtocolCommand(cmd commandMsg) bool {
 	return ok && strings.HasPrefix(turnID, relayFollowUpTurnPrefix)
 }
 
-// refusedFollowUpTurnAck answers an expired queued follow-up turn: it never ran.
-func refusedFollowUpTurnAck(cmd commandMsg, turnID, agentID string) resultMsg {
+// refusedFollowUpTurnAck answers a refused queued follow-up turn (expired, or
+// its session fenced): it never ran.
+func refusedFollowUpTurnAck(cmd commandMsg, turnID, agentID, reason string) resultMsg {
 	frame := relayTurnAckFrame(relayTurnRow{
 		SessionID:   cmd.SessionID,
 		TurnID:      turnID,
@@ -622,6 +643,6 @@ func refusedFollowUpTurnAck(cmd commandMsg, turnID, agentID string) resultMsg {
 		UID:         cmd.UID,
 	})
 	frame.FollowUpOutcome = followUpOutcomeNotWritten
-	frame.FollowUpReason = followUpReasonExpired
+	frame.FollowUpReason = reason
 	return frame
 }

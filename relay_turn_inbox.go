@@ -172,6 +172,9 @@ const (
 	// relayTurnNotOwner: another agent process owns the inbox — hand the
 	// delivery back (Nack) untouched so the owner runs it.
 	relayTurnNotOwner
+	// relayTurnRefused: the turn's fence (BeginFenced) refused a turn that was
+	// neither accepted nor in flight; it was not claimed and must never run.
+	relayTurnRefused
 )
 
 type relayTurnInbox struct {
@@ -376,10 +379,22 @@ func (b *relayTurnInbox) evictForCapLocked() {
 // Begin records a delivery of a relay turn and says what to do with it. On
 // relayTurnRun the caller MUST call Finish once dispatch returns.
 func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTurnDecision, relayTurnRow) {
+	decision, row, _ := b.BeginFenced(cmd, turnID, agentID, nil)
+	return decision, row
+}
+
+// BeginFenced is Begin with a fence decided under the same lock as the claim.
+// refuse (nil for none) returns why a turn that is neither accepted nor in
+// flight must not start, or "" to claim it. Deciding it here, not before
+// Begin, closes the window where a delivery that passed the fence is still
+// about to claim while a later duplicate, past the deadline, sees nothing
+// claimed and reports the turn refused: whichever claims first wins, and the
+// other sees its claim. The reason is returned with relayTurnRefused.
+func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, refuse func(time.Time) string) (relayTurnDecision, relayTurnRow, string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.ownLocked() {
-		return relayTurnNotOwner, relayTurnRow{}
+		return relayTurnNotOwner, relayTurnRow{}, ""
 	}
 	changed := b.pruneExpiredLocked()
 	key := relayTurnKey{cmd.SessionID, turnID}
@@ -395,16 +410,24 @@ func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTur
 			row = *r
 		}
 		if row.State == relayTurnStateAccepted {
-			return relayTurnReack, row
+			return relayTurnReack, row, ""
 		}
-		return relayTurnInFlight, row
+		return relayTurnInFlight, row, ""
 	}
 	if r := b.rows[key]; r != nil {
 		if r.State == relayTurnStateAccepted {
 			if changed {
 				_ = b.persistLocked()
 			}
-			return relayTurnReack, *r
+			return relayTurnReack, *r, ""
+		}
+	}
+	if refuse != nil {
+		if reason := refuse(b.now()); reason != "" {
+			if changed {
+				_ = b.persistLocked()
+			}
+			return relayTurnRefused, relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID}, reason
 		}
 	}
 	now := b.now().UnixMilli()
@@ -422,7 +445,7 @@ func (b *relayTurnInbox) Begin(cmd commandMsg, turnID, agentID string) (relayTur
 	r.UpdatedAt = now
 	b.inFlight[key] = true
 	_ = b.persistLocked()
-	return relayTurnRun, *r
+	return relayTurnRun, *r, ""
 }
 
 // Accept moves a claimed row to accepted and persists it BEFORE the caller
@@ -589,27 +612,6 @@ func acceptRelayDelivery(accept func() error) error {
 	return accept()
 }
 
-// relayTurnAcceptance reports whether this process owns the inbox and, when
-// it does, whether the turn was accepted earlier (this boot or a previous
-// one): such a turn is re-acked, never refused late. It also reports whether a
-// delivery of the turn is in flight here: that delivery can still accept and
-// write, so its outcome is not yet decided and an unaccepted in-flight turn
-// must NOT be refused either. A non-owner cannot know any of this, so its
-// caller must hand the delivery back instead of deciding.
-func relayTurnAcceptance(b *relayTurnInbox, sessionID, turnID string) (owner, accepted, inFlight bool) {
-	if b == nil {
-		return false, false, false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.ownLocked() {
-		return false, false, false
-	}
-	key := relayTurnKey{sessionID, turnID}
-	r := b.rows[key]
-	return true, r != nil && r.State == relayTurnStateAccepted, b.inFlight[key]
-}
-
 // relayTurnAckFrame is the result frame the broker's results subscriber reads:
 // `{ type: "relay_turn_ack", sessionID, relayTurnId, workspaceID, agentId }`.
 func relayTurnAckFrame(r relayTurnRow) resultMsg {
@@ -645,8 +647,27 @@ func relayTurnAckFrame(r relayTurnRow) resultMsg {
 // owns the inbox: the caller must Nack so Pub/Sub hands the turn to the owner.
 func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
 	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
-	decision, row := inbox.Begin(cmd, turnID, agentID)
+	return runFencedRelayTurn(ctx, inbox, cmd, turnID, agentID, nil, nil, publishAck, dispatch)
+}
+
+// runFencedRelayTurn is runRelayTurn with a fence decided atomically with the
+// claim (BeginFenced). A refused turn is answered through publishRefusal and
+// never dispatched. While the fence would refuse, a delivery still in flight
+// here has not decided the turn yet (it may still accept and write), so a
+// duplicate is handed back (false) rather than dropped: a later redelivery
+// sees the settled state — accepted and re-acked, or gone and refused.
+func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
+	refuse func(time.Time) string, publishRefusal func(reason string),
+	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
+	decision, row, reason := inbox.BeginFenced(cmd, turnID, agentID, refuse)
 	switch decision {
+	case relayTurnRefused:
+		fmt.Printf("%s[relay-inbox] Turn %s on %s refused (%s) — never started%s\n",
+			colorYellow, turnID, cmd.SessionID, reason, colorReset)
+		if publishRefusal != nil {
+			publishRefusal(reason)
+		}
+		return true
 	case relayTurnNotOwner:
 		fmt.Printf("%s[relay-inbox] Another agent process owns the relay turn inbox — handing turn %s on %s back%s\n",
 			colorYellow, turnID, cmd.SessionID, colorReset)
@@ -659,6 +680,11 @@ func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, tu
 		publishAck(row)
 		return true
 	case relayTurnInFlight:
+		if refuse != nil && refuse(inbox.now()) != "" {
+			fmt.Printf("%s[relay-inbox] Turn %s on %s is still in flight past its fence — handing the duplicate back%s\n",
+				colorYellow, turnID, cmd.SessionID, colorReset)
+			return false
+		}
 		// A concurrent redelivery of a turn this process is dispatching
 		// right now; that dispatch acks when it accepts.
 		fmt.Printf("%s[relay-inbox] Turn %s on %s is already being dispatched — dropping the duplicate delivery%s\n",

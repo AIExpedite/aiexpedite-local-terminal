@@ -1773,7 +1773,14 @@ func runPubSubConnection(cfg *Config) error {
 		// Exempt server-internal demand commands for the same reason as the
 		// staleness check above — a "rate_limited" rejection would not carry
 		// refreshId and would orphan the backend's in-flight / pending marker.
-		if !isInternalDemandCommand(cmd.Command) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		//
+		// Follow-up protocol commands are exempt as well: the broker needs a
+		// protocol answer (relay_follow_up_ack / an outcome-bearing
+		// relay_turn_ack) for each of them, and a generic rejection carries
+		// none, so a limiter exhausted by other traffic could leave an attempt
+		// unsettled until it expires. They are bounded at the source (at most
+		// a handful pending per session) and still face the signature check.
+		if !isInternalDemandCommand(cmd.Command) && !isFollowUpProtocolCommand(cmd) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
@@ -6592,33 +6599,24 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		if agentID == "" && cfg != nil {
 			agentID = cfg.AgentID
 		}
-		// A queued follow-up turn past its expiry never starts (unless it was
-		// accepted earlier: then the inbox re-acks it below as usual). Only the
-		// inbox owner knows which; a non-owner hands the delivery back.
-		if followUpTurnExpired(cmd, turnID, time.Now()) {
-			owner, accepted, inFlight := relayTurnAcceptance(globalRelayTurnInbox, cmd.SessionID, turnID)
-			if !owner {
-				logSession(cmd.SessionID, "%s[follow-up] Another agent process owns the relay turn inbox — handing expired turn %s back%s\n", colorYellow, turnID, colorReset)
-				return false
-			}
-			// A delivery of this turn is in flight here and has not accepted
-			// yet: it may still accept and write, so this redelivery cannot
-			// call the turn refused. Hand it back; a later redelivery sees the
-			// settled state (accepted → re-acked below, or gone → refused).
-			if inFlight && !accepted {
-				logSession(cmd.SessionID, "%s[follow-up] A delivery of turn %s is still in flight — handing the expired duplicate back%s\n", colorYellow, turnID, colorReset)
-				return false
-			}
-			if !accepted {
+		// A queued follow-up turn (`fu_…`) past its expiry, or addressed to a
+		// session fenced off this computer, never starts — unless it was
+		// accepted earlier (re-acked as usual) or a delivery of it is still in
+		// flight here (handed back until it settles). The inbox decides this
+		// under the same lock as the claim, so a delivery that passed the
+		// fence and a later duplicate past the deadline can never both act.
+		var refuse func(time.Time) string
+		if strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
+			refuse = func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) }
+		}
+		return runFencedRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID, refuse,
+			func(reason string) {
 				pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
-				if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID)); err != nil {
-					logSession(cmd.SessionID, "%s[follow-up] Failed to publish an expired turn's refusal: %v%s\n", colorRed, err, colorReset)
+				if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID, reason)); err != nil {
+					logSession(cmd.SessionID, "%s[follow-up] Failed to publish a refused turn's answer: %v%s\n", colorRed, err, colorReset)
 				}
-				return true
-			}
-		}
-		return runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
+			},
 			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
 			func(dctx context.Context) { dispatchSessionCommand(dctx, topic, cmd, cfg) })
 	}
