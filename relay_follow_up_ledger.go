@@ -274,8 +274,8 @@ func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, che
 		r.Reason = reason
 		l.rows[attemptID] = r
 		if err := l.persistLocked(); err != nil {
-			// A refusal that is not durable is still a refusal: nothing is written.
 			fmt.Printf("%s[follow-up] ledger write failed for a refusal: %v%s\n", colorYellow, err, colorReset)
+			return notDurableFence(*r), false
 		}
 		return *r, false
 	}
@@ -328,8 +328,22 @@ func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string) relayFollo
 	}
 	r := &relayFollowUpRow{AttemptID: attemptID, State: followUpRowRefused, Reason: followUpReasonUnseen, UpdatedAt: l.now().UnixMilli()}
 	l.rows[attemptID] = r
-	_ = l.persistLocked()
+	if err := l.persistLocked(); err != nil {
+		return notDurableFence(*r)
+	}
 	return *r
+}
+
+// notDurableFence is the answer for a fence that did not reach disk. This
+// process still refuses the id (the row stays in memory), but after a restart
+// the fence is gone and a redelivered envelope could be written. A
+// `notWritten` answer would let the broker resend under a new attempt, and
+// the person would get the message twice. So the answer is `unknown`: the
+// person decides.
+func notDurableFence(r relayFollowUpRow) relayFollowUpRow {
+	r.State = followUpRowUnknown
+	r.Reason = ""
+	return r
 }
 
 // ConfirmAcked deletes exactly the rows the broker confirmed. An accepted

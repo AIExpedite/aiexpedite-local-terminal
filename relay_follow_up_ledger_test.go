@@ -255,3 +255,28 @@ func TestAnsweringAnApprovalNeverDrivesTheCountBelowZero(t *testing.T) {
 		t.Fatalf("an approval after a raced reset reads %d open, want 1", got)
 	}
 }
+
+func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
+	// A ledger path inside a regular file: every write fails.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l := newRelayFollowUpLedger(func() string { return filepath.Join(blocker, relayFollowUpLedgerFileName) })
+	c := okCheck(time.Now())
+	c.ApprovalPending = true
+	row, write := l.Begin("a1", "m1", "s1", c)
+	if write || row.State != followUpRowUnknown {
+		t.Fatalf("a refusal that is not durable must answer unknown, got write=%v row=%+v", write, row)
+	}
+	if got := l.Query("never", l.LedgerID()); got.State != followUpRowUnknown {
+		t.Fatalf("an unseen-id fence that is not durable must answer unknown, got %+v", got)
+	}
+	// This process still never writes either id.
+	if _, again := l.Begin("a1", "m1", "s1", okCheck(time.Now())); again {
+		t.Fatalf("a fenced id was written")
+	}
+	if _, again := l.Begin("never", "m", "s1", okCheck(time.Now())); again {
+		t.Fatalf("a fenced unseen id was written")
+	}
+}
