@@ -235,3 +235,23 @@ func TestTheCapabilityListsNoLiveAgentButReportsTheLedger(t *testing.T) {
 		t.Fatalf("capability does not marshal")
 	}
 }
+
+func TestAnsweringAnApprovalNeverDrivesTheCountBelowZero(t *testing.T) {
+	var s ClaudeNativeSession
+	s.answerPendingApproval()
+	if got := s.pendingApprovals.Load(); got != 0 {
+		t.Fatalf("an answer with nothing open left %d", got)
+	}
+	s.pendingApprovals.Add(2)
+	s.answerPendingApproval()
+	if got := s.pendingApprovals.Load(); got != 1 {
+		t.Fatalf("one answer of two open left %d", got)
+	}
+	// The reader's reset at a turn's result racing an answer.
+	s.pendingApprovals.Store(0)
+	s.answerPendingApproval()
+	s.pendingApprovals.Add(1)
+	if got := s.pendingApprovals.Load(); got != 1 {
+		t.Fatalf("an approval after a raced reset reads %d open, want 1", got)
+	}
+}

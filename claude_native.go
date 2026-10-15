@@ -447,6 +447,19 @@ func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSessio
 	return nil
 }
 
+// answerPendingApproval counts one open approval as answered, never below
+// zero. A compare-and-swap, not Load-then-Add: the reader resets the count to
+// zero at a turn's result, and a decrement racing that reset must not leave
+// -1 behind (the next approval would then read as none open).
+func (s *ClaudeNativeSession) answerPendingApproval() {
+	for {
+		n := s.pendingApprovals.Load()
+		if n <= 0 || s.pendingApprovals.CompareAndSwap(n, n-1) {
+			return
+		}
+	}
+}
+
 // SendControl writes a stream-json control_response to the child's stdin —
 // a human's answer to a can_use_tool control_request (the voice relay
 // launches Claude with --permission-prompt-tool stdio). Only a well-formed
@@ -478,9 +491,7 @@ func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
 			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
 		}
 		// The person answered one open approval.
-		if session.pendingApprovals.Load() > 0 {
-			session.pendingApprovals.Add(-1)
-		}
+		session.answerPendingApproval()
 		return nil
 	case <-time.After(claudeNativeStdinWriteBudget):
 		// Same teardown as a stalled user turn: releasing stdinMu with the
