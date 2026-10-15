@@ -700,10 +700,32 @@ func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, tu
 // must not be accepted, because the broker may already have queued its
 // replacement. Only checks that take no session lock belong here — the
 // manager calls the acceptor while holding its own.
+//
+// refuse may take session-manager locks, so it is never called under the
+// inbox lock: a manager's removeSessionIfSame holds its own lock while it
+// releases the session's inbox rows, and the reverse order would deadlock
+// both. The full fence is read just before the claim, and only that snapshot
+// plus refuseAtAccept (lock-free, so the expiry is still decided atomically
+// with the claim) are consulted under the lock. A session that exits after
+// the snapshot never reaches the acceptance boundary, and the fence decided
+// again after dispatch answers it.
 func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
 	refuse, refuseAtAccept func(time.Time) string, publishRefusal func(reason string),
 	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
-	decision, row, reason := inbox.BeginFenced(cmd, turnID, agentID, refuse)
+	var refuseAtClaim func(time.Time) string
+	if refuse != nil {
+		before := refuse(inbox.now())
+		refuseAtClaim = func(now time.Time) string {
+			if before != "" {
+				return before
+			}
+			if refuseAtAccept != nil {
+				return refuseAtAccept(now)
+			}
+			return ""
+		}
+	}
+	decision, row, reason := inbox.BeginFenced(cmd, turnID, agentID, refuseAtClaim)
 	switch decision {
 	case relayTurnRefused:
 		fmt.Printf("%s[relay-inbox] Turn %s on %s refused (%s) — never started%s\n",

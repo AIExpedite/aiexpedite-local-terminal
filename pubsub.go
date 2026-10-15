@@ -6623,9 +6623,10 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		// A queued follow-up turn (`fu_…`) past its expiry, or addressed to a
 		// session fenced off this computer, never starts — unless it was
 		// accepted earlier (re-acked as usual) or a delivery of it is still in
-		// flight here (handed back until it settles). The inbox decides this
+		// flight here (handed back until it settles). The expiry is decided
 		// under the same lock as the claim, so a delivery that passed the
-		// fence and a later duplicate past the deadline can never both act.
+		// fence and a later duplicate past the deadline can never both act;
+		// the session's state is read just before the claim, outside that lock.
 		// The expiry is checked again at acceptance: the manager can wait on
 		// the session's locks after the claim, past the deadline.
 		var refuse, refuseAtAccept func(time.Time) string

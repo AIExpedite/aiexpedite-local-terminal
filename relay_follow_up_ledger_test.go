@@ -444,6 +444,7 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 		Ts:                       now.UnixMilli(),
 		FollowUpAttemptID:        "someone-else",
 		FollowUpAttemptExpiresAt: now.Add(time.Minute).UnixMilli(),
+		FollowUpLedgerID:         l.LedgerID(),
 	}
 	handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
 	if len(answers) != 1 || answers[0].FollowUpOutcome != followUpOutcomeNotWritten {
@@ -453,6 +454,78 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 	// would otherwise pass every check, is refused too.
 	if row, write := l.Begin("att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowRefused {
 		t.Fatalf("a refused attempt was written later: write=%v row=%+v", write, row)
+	}
+}
+
+// A live attempt minted under a ledger that has since been lost or replaced
+// may already have been written: it is answered unknown, and neither recorded
+// nor written into this ledger.
+func TestALiveAttemptForAReplacedLedgerIsAnsweredUnknown(t *testing.T) {
+	l, _ := newTestFollowUpLedger(t)
+	now := time.Now()
+	for _, ledgerID := range []string{"the-lost-ledger", ""} {
+		row, write := l.BeginForLedger(ledgerID, "att-1", "m1", "s1", okCheck(now))
+		if write || row.State != followUpRowUnknown {
+			t.Fatalf("ledger %q: write=%v row=%+v, want unknown and no write", ledgerID, write, row)
+		}
+		if _, ok := l.rows["att-1"]; ok {
+			t.Fatalf("ledger %q: the mismatched attempt was recorded", ledgerID)
+		}
+	}
+	if _, write := l.BeginForLedger(l.LedgerID(), "att-1", "m1", "s1", okCheck(now)); !write {
+		t.Fatalf("an attempt naming this ledger must be written")
+	}
+	// Recorded here, so a repeat answers from the row whatever ledger it names.
+	if row, write := l.BeginForLedger("the-lost-ledger", "att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowAccepted {
+		t.Fatalf("a recorded attempt: write=%v row=%+v", write, row)
+	}
+}
+
+// The fence of a queued follow-up turn takes session-manager locks, while a
+// manager's removeSessionIfSame holds its own lock as it releases the
+// session's inbox rows. Calling the fence under the inbox lock could deadlock
+// the two, so it must run outside it.
+func TestTheFollowUpTurnFenceNeverRunsUnderTheInboxLock(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: time.Now().UnixMilli()}
+	calls := 0
+	runFencedRelayTurn(context.Background(), inbox, cmd, "fu_a1", "agent-1",
+		func(time.Time) string {
+			calls++
+			if !inbox.mu.TryLock() {
+				t.Errorf("the fence ran under the inbox lock")
+				return ""
+			}
+			inbox.mu.Unlock()
+			return ""
+		},
+		nil,
+		func(string) {},
+		func(relayTurnRow) {},
+		func(context.Context) {})
+	if calls == 0 {
+		t.Fatalf("the fence was never consulted")
+	}
+}
+
+// A session that is gone when the fence is read before the claim is refused
+// at the claim, exactly as when the fence ran under the lock.
+func TestAQueuedFollowUpTurnReadAsGoneBeforeTheClaimIsRefused(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: time.Now().UnixMilli()}
+	var refusal string
+	dispatched := false
+	runFencedRelayTurn(context.Background(), inbox, cmd, "fu_a1", "agent-1",
+		func(time.Time) string { return followUpReasonSessionNotRunning },
+		func(time.Time) string { return "" },
+		func(reason string) { refusal = reason },
+		func(relayTurnRow) {},
+		func(context.Context) { dispatched = true })
+	if refusal != followUpReasonSessionNotRunning || dispatched {
+		t.Fatalf("refusal=%q dispatched=%v", refusal, dispatched)
+	}
+	if _, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; ok {
+		t.Fatalf("a refused turn was claimed")
 	}
 }
 

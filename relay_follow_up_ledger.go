@@ -316,6 +316,27 @@ func (c followUpAttemptCheck) fenceReason() string {
 func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.beginLocked(attemptID, followUpID, sessionID, check)
+}
+
+// BeginForLedger is Begin for a delivery that names the ledger its broker
+// last saw. An attempt this ledger never recorded, addressed to another
+// ledger (the file was lost, corrupted or replaced since), may already have
+// been written under the old one, so it is answered unknown — like Query —
+// and neither recorded nor written.
+func (l *relayFollowUpLedger) BeginForLedger(brokerLedgerID, attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}, false
+	}
+	if r := l.rows[attemptID]; r == nil && (brokerLedgerID == "" || brokerLedgerID != l.ledgerID) {
+		return relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID, State: followUpRowUnknown}, false
+	}
+	return l.beginLocked(attemptID, followUpID, sessionID, check)
+}
+
+func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
 	if !l.ownLocked() {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}, false
 	}
@@ -561,7 +582,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		ConversationOK:  session != nil && metadataMatches,
 		ApprovalPending: session != nil && session.pendingApprovals.Load() > 0,
 	}
-	row, write := ledger.Begin(attemptID, p.FollowUpID, cmd.SessionID, check)
+	row, write := ledger.BeginForLedger(p.LedgerID, attemptID, p.FollowUpID, cmd.SessionID, check)
 	if !write {
 		publish(row)
 		return true
@@ -605,8 +626,8 @@ func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
 // accepted nor in flight must not start, or "" to run it: its expiry passed
 // (followUpTurnExpired), its session was fenced off this computer (moved or
 // max-parked), whose CLI must take nothing more but its END, or the session
-// is gone from this device altogether. The inbox evaluates it under the
-// claim's lock (BeginFenced).
+// is gone from this device altogether. It takes session-manager locks, so
+// runFencedRelayTurn reads it before the claim, never under the inbox lock.
 func followUpTurnRefusal(cmd commandMsg, turnID string, now time.Time) string {
 	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
 		return ""
