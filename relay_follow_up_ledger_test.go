@@ -336,6 +336,9 @@ func TestAQueuedFollowUpTurnPastItsExpiryIsRefused(t *testing.T) {
 
 func TestTheCapabilityListsNoLiveAgentButReportsTheLedger(t *testing.T) {
 	cap := newRelayFollowUpsCapability()
+	if cap == nil {
+		t.Skipf("this process cannot own both the real follow-up ledger and the turn inbox")
+	}
 	if cap.LiveAgents == nil || len(cap.LiveAgents) != 0 || !cap.AttemptExpiry || cap.LedgerID == "" {
 		t.Fatalf("capability: %+v", cap)
 	}
@@ -1239,18 +1242,46 @@ func TestAClaimWithNoDurableSlotIsHandedBack(t *testing.T) {
 func TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheLedger(t *testing.T) {
 	// Resolve the temp dir before registering release: cleanups run LIFO, and
 	// Windows cannot remove the dir while the ledger lock is still held.
-	path := filepath.Join(t.TempDir(), relayFollowUpLedgerFileName)
+	dir := t.TempDir()
+	path := filepath.Join(dir, relayFollowUpLedgerFileName)
 	ledger := newRelayFollowUpLedger(func() string { return path })
 	t.Cleanup(ledger.release)
+	inbox := newRelayTurnInbox(func() string { return filepath.Join(dir, relayTurnInboxFileName) })
+	t.Cleanup(inbox.release)
 	owned := ledger.acquireOwnership
 	ledger.acquireOwnership = func() *os.File { return nil }
-	if cap := newRelayFollowUpsCapabilityFor(ledger); cap != nil {
+	if cap := newRelayFollowUpsCapabilityFor(ledger, inbox); cap != nil {
 		t.Fatalf("a non-owner advertised the capability: %+v", cap)
 	}
 	ledger.acquireOwnership = owned
-	cap := newRelayFollowUpsCapabilityFor(ledger)
+	cap := newRelayFollowUpsCapabilityFor(ledger, inbox)
 	if cap == nil || cap.LedgerID == "" || !cap.AttemptExpiry || cap.LiveAgents == nil {
 		t.Fatalf("the owner's capability: %+v", cap)
+	}
+}
+
+// TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheTurnInbox pins the
+// automatic-update overlap: the ledger file is new in this change, so this
+// process can own it while a pre-change process still owns the turn inbox and
+// still pulls the shared subscription. Advertising follow-ups then would let
+// that older binary run a queued `fu_…` SEND with no expiry check, so the
+// capability must stay omitted until BOTH are owned here.
+func TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheTurnInbox(t *testing.T) {
+	dir := t.TempDir()
+	ledger := newRelayFollowUpLedger(func() string {
+		return filepath.Join(dir, relayFollowUpLedgerFileName)
+	})
+	t.Cleanup(ledger.release)
+	inbox := newRelayTurnInbox(func() string { return filepath.Join(dir, relayTurnInboxFileName) })
+	t.Cleanup(inbox.release)
+	owned := inbox.acquireOwnership
+	inbox.acquireOwnership = func() *os.File { return nil }
+	if cap := newRelayFollowUpsCapabilityFor(ledger, inbox); cap != nil {
+		t.Fatalf("a turn-inbox non-owner advertised the capability: %+v", cap)
+	}
+	inbox.acquireOwnership = owned
+	if cap := newRelayFollowUpsCapabilityFor(ledger, inbox); cap == nil || cap.LedgerID == "" {
+		t.Fatalf("the owner of both advertised: %+v", cap)
 	}
 }
 

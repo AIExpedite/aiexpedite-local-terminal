@@ -151,9 +151,10 @@ type relayFollowUpsCapability struct {
 }
 
 // newRelayFollowUpsCapability reports the ledger and the certified live
-// agents, or nil when this process does not own the ledger.
+// agents, or nil when this process does not own BOTH the follow-up ledger and
+// the relay-turn inbox.
 func newRelayFollowUpsCapability() *relayFollowUpsCapability {
-	return newRelayFollowUpsCapabilityFor(globalRelayFollowUpLedger)
+	return newRelayFollowUpsCapabilityFor(globalRelayFollowUpLedger, globalRelayTurnInbox)
 }
 
 // newRelayFollowUpsCapabilityFor is newRelayFollowUpsCapability against a
@@ -168,9 +169,22 @@ func newRelayFollowUpsCapability() *relayFollowUpsCapability {
 // the broker reads this device as one without follow-up support and queues
 // every message, which is the documented legacy-device fallback. The empty
 // live list (never null) means every follow-up is queued.
-func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger) *relayFollowUpsCapability {
+func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger, inbox *relayTurnInbox) *relayFollowUpsCapability {
 	ledgerID := l.LedgerID()
 	if ledgerID == "" {
+		return nil
+	}
+	// Owning the ledger is not enough. The ledger file is new in this change,
+	// so during a Linux automatic-update overlap THIS process can take it
+	// while the pre-change process still owns relay-turn-inbox.json and still
+	// pulls from the shared Pub/Sub subscription. Advertising follow-ups then
+	// lets the broker send a queued `fu_…` SEND the old binary may run with no
+	// expiry check and no follow-up outcome in its ack, or Ack a
+	// `relay_follow_up_query` it does not understand — leaving the attempt
+	// unsettled and allowing a replacement delivery after the original ran.
+	// Owning the turn inbox is what proves the follow-up-aware process is the
+	// one that will execute those turns.
+	if !inbox.Own() {
 		return nil
 	}
 	live := make([]string, 0, len(liveFollowUpCertified))
@@ -186,7 +200,8 @@ func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger) *relayFollowUpsCapab
 
 // republishRelayFollowUpCapability fills the follow-up capability into the
 // cached MachineInfo and reruns the post-store hook, so a gather that ran
-// while another process still owned the ledger does not leave this device
+// while another process still owned the ledger or the turn inbox does not
+// leave this device
 // advertised as follow-up-less until the next 6h gather. It reports whether
 // the capability is now advertised (true also when it already was).
 func republishRelayFollowUpCapability() bool {
@@ -218,8 +233,9 @@ func republishRelayFollowUpCapability() bool {
 }
 
 // watchRelayFollowUpLedgerOwnership waits, on one background goroutine, for
-// the ledger to become ownable and republishes the capability as soon as it
-// does. It only runs after a gather found the ledger owned elsewhere — the
+// the ledger AND the relay-turn inbox to become ownable and republishes the
+// capability as soon as both are. It only runs after a gather found one of
+// them owned elsewhere — the
 // overlapping process is transitional (an automatic update handing over), so
 // a short poll closes the window the 6h refresh cadence would otherwise
 // leave. Each poll is one non-blocking flock attempt. Giving up after the
@@ -613,8 +629,9 @@ func StartMachineInfoGathering() {
 			// request is waiting for (setup_tool_catalog.go).
 			refreshSetupToolProbesInCache()
 			// A gather that ran while another agent process still owned the
-			// follow-up ledger advertised no `relayFollowUps`; republish it
-			// as soon as ownership lands instead of after the next 6h gather.
+			// follow-up ledger or the relay-turn inbox advertised no
+			// `relayFollowUps`; republish it as soon as ownership of both
+			// lands instead of after the next 6h gather.
 			watchRelayFollowUpLedgerOwnership()
 			time.Sleep(machineInfoRefreshInterval)
 		}

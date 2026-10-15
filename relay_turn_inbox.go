@@ -277,6 +277,18 @@ func (b *relayTurnInbox) ownLocked() bool {
 	return true
 }
 
+// Own reports whether this process owns the inbox, taking it when free. The
+// follow-up capability needs it: a process that owns only the (newly added)
+// follow-up ledger while a pre-change process still owns the turn inbox must
+// not advertise follow-up support, because that older process shares the
+// Pub/Sub subscription and would run a queued `fu_…` SEND without the expiry
+// and outcome rules (systemInfo.go newRelayFollowUpsCapabilityFor).
+func (b *relayTurnInbox) Own() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ownLocked()
+}
+
 // release gives up ownership (tests simulating a restart over the same file).
 func (b *relayTurnInbox) release() {
 	b.mu.Lock()
