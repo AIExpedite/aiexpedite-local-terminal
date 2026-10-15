@@ -524,8 +524,8 @@ func TestAQueuedFollowUpTurnReadAsGoneBeforeTheClaimIsRefused(t *testing.T) {
 	if refusal != followUpReasonSessionNotRunning || dispatched {
 		t.Fatalf("refusal=%q dispatched=%v", refusal, dispatched)
 	}
-	if _, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; ok {
-		t.Fatalf("a refused turn was claimed")
+	if r, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; !ok || r.State != relayTurnStateRefused {
+		t.Fatalf("a refused turn was claimed or not fenced: %+v", r)
 	}
 }
 
@@ -572,8 +572,8 @@ func TestOnlyTheInboxOwnerDecidesARefusedFollowUpTurn(t *testing.T) {
 	if handled, refusal, dispatched := runFencedTestTurn(inbox, unseen, "fu_a2", nil); !handled || refusal != followUpReasonExpired || dispatched {
 		t.Fatalf("unseen: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
-	if _, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a2"}]; ok {
-		t.Fatalf("a refused turn was claimed")
+	if r, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a2"}]; !ok || r.State != relayTurnStateRefused {
+		t.Fatalf("a refused turn was claimed or not fenced: %+v", r)
 	}
 }
 
@@ -639,6 +639,73 @@ func TestAQueuedFollowUpTurnPastItsExpiryAtAcceptanceIsRefused(t *testing.T) {
 	}
 	if handled, refusal, dispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
 		t.Fatalf("redelivery after a refused acceptance: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+}
+
+// `followUpExpiresAt` rides outside the signature. A copy of a queued
+// follow-up turn with a shortened expiry is refused as expired, and the
+// broker may then queue a replacement — so the refusal is recorded, and the
+// original copy, still inside its signed bound, gets the same answer instead
+// of running the message a second time. The fence survives a restart and a
+// watermark naming the turn, and lapses only once the signed deadline passed.
+func TestARefusedFollowUpTurnStaysRefusedForEveryLaterCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), relayTurnInboxFileName)
+	inbox := newRelayTurnInbox(func() string { return path })
+	start := time.Now()
+	clock := start
+	inbox.now = func() time.Time { return clock }
+	original := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", WorkspaceID: "ws-1", UID: "u-1",
+		Ts: start.UnixMilli(), FollowUpExpiresAt: start.Add(followUpAttemptWindow).UnixMilli()}
+	shortened := original
+	shortened.FollowUpExpiresAt = start.Add(-time.Minute).UnixMilli()
+
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, shortened, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("shortened copy: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, original, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("original copy after the refusal: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if n := inbox.ConfirmAcked("s1", []string{"fu_a1"}); n != 0 {
+		t.Fatalf("a watermark deleted the refusal fence")
+	}
+	inbox.ReleaseSession("s1")
+	inbox.release()
+
+	restarted := newRelayTurnInbox(func() string { return path })
+	t.Cleanup(restarted.release)
+	restarted.now = func() time.Time { return clock }
+	if handled, refusal, dispatched := runFencedTestTurn(restarted, original, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("original copy after a restart: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+
+	// Past the signed deadline every copy is expired on its own, so the row goes.
+	clock = start.Add(followUpAttemptWindow + followUpSkewMargin + time.Second)
+	if handled, refusal, dispatched := runFencedTestTurn(restarted, original, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("copy past the signed deadline: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if r := restarted.snapshot()[relayTurnKey{"s1", "fu_a1"}]; r.State == relayTurnStateClaimed || r.State == relayTurnStateAccepted {
+		t.Fatalf("an expired turn was claimed: %+v", r)
+	}
+}
+
+// A refusal that cannot be written to disk would be gone after a restart, so
+// it is never answered notWritten (the broker would resend while the original
+// could still run): the turn is fenced in this process and left unanswered.
+func TestAnUnrecordedFollowUpTurnRefusalIsNotAnswered(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	inbox.writeFile = func(string, []byte) error { return errors.New("disk full") }
+	start := time.Now()
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: start.UnixMilli(),
+		FollowUpExpiresAt: start.Add(-time.Minute).UnixMilli()}
+	for i := 0; i < 2; i++ {
+		if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != "" || dispatched {
+			t.Fatalf("delivery %d: handled=%v refusal=%q dispatched=%v", i, handled, refusal, dispatched)
+		}
+	}
+	original := cmd
+	original.FollowUpExpiresAt = start.Add(followUpAttemptWindow).UnixMilli()
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, original, "fu_a1", nil); !handled || refusal != "" || dispatched {
+		t.Fatalf("original copy: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
 }
 

@@ -33,6 +33,12 @@
 //     ack and never re-runs. Recording before delivery means a crash in the
 //     gap between the two can DROP that turn; it can never run it twice, and
 //     the voice side then settles it failed, never succeeded.
+//   - refused  — a queued follow-up turn (`fu_…`) refused before it started
+//     (expired, session gone or fenced). Recorded before notWritten is
+//     answered and kept until the turn's signed deadline passes, so a later
+//     copy carrying a different unsigned expiry can never run it after the
+//     broker queued a replacement. A refusal that cannot be recorded is
+//     never answered.
 //
 // An accepted row is deliberately NOT deleted when its ack is published. The
 // ack can be lost between this device and the broker (publish failed, broker
@@ -116,6 +122,11 @@ const (
 
 	relayTurnStateClaimed  = "claimed"
 	relayTurnStateAccepted = "accepted"
+	// relayTurnStateRefused: a queued follow-up turn (`fu_…`) this device
+	// refused before it started. The refusal is the fence: every later
+	// delivery of the turn gets the recorded answer and never runs, whatever
+	// its unsigned `followUpExpiresAt` says (see recordRefusalLocked).
+	relayTurnStateRefused = "refused"
 
 	// relayAcceptanceNotRecorded prefixes the error a manager returns when it
 	// refused a relay turn because its acceptance could not be made durable.
@@ -151,6 +162,13 @@ type relayTurnRow struct {
 	ClaimedAt   int64  `json:"claimedAt"`
 	AcceptedAt  int64  `json:"acceptedAt,omitempty"`
 	UpdatedAt   int64  `json:"updatedAt"`
+	// Reason is a refused row's answer; "" marks a refusal that never reached
+	// the disk, which still fences the turn but is never answered notWritten.
+	Reason string `json:"reason,omitempty"`
+	// FenceUntil (ms) is when the turn's SIGNED deadline has passed, so every
+	// copy of it is refused as expired without a row; a refused row is kept
+	// until then. 0 keeps it until relayTurnInboxTTL.
+	FenceUntil int64 `json:"fenceUntil,omitempty"`
 }
 
 type relayTurnInboxFile struct {
@@ -298,7 +316,7 @@ func (b *relayTurnInbox) loadLocked() {
 		if r == nil || r.SessionID == "" || r.TurnID == "" {
 			continue
 		}
-		if r.State != relayTurnStateClaimed && r.State != relayTurnStateAccepted {
+		if r.State != relayTurnStateClaimed && r.State != relayTurnStateAccepted && r.State != relayTurnStateRefused {
 			continue
 		}
 		b.rows[relayTurnKey{r.SessionID, r.TurnID}] = r
@@ -341,10 +359,12 @@ func (b *relayTurnInbox) persistLocked() error {
 // pruneExpiredLocked drops rows past the TTL (never one in flight) and
 // reports whether anything changed.
 func (b *relayTurnInbox) pruneExpiredLocked() bool {
+	now := b.now().UnixMilli()
 	cutoff := b.now().Add(-relayTurnInboxTTL).UnixMilli()
 	changed := false
 	for k, r := range b.rows {
-		if r.UpdatedAt < cutoff && !b.inFlight[k] {
+		fenceOver := r.State == relayTurnStateRefused && r.FenceUntil > 0 && now > r.FenceUntil
+		if (r.UpdatedAt < cutoff || fenceOver) && !b.inFlight[k] {
 			delete(b.rows, k)
 			changed = true
 		}
@@ -423,13 +443,20 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 			}
 			return relayTurnReack, *r, ""
 		}
-	}
-	if refuse != nil {
-		if reason := refuse(b.now()); reason != "" {
+		if r.State == relayTurnStateRefused {
 			if changed {
 				_ = b.persistLocked()
 			}
-			return relayTurnRefused, relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID}, reason
+			return relayTurnRefused, *r, r.Reason
+		}
+	}
+	if refuse != nil {
+		if reason := refuse(b.now()); reason != "" {
+			row := b.recordRefusalLocked(relayTurnRow{
+				SessionID: cmd.SessionID, TurnID: turnID, EnvelopeID: cmd.ID, WorkspaceID: cmd.WorkspaceID,
+				AgentID: agentID, UID: cmd.UID, FenceUntil: relayTurnFenceUntil(cmd),
+			}, reason)
+			return relayTurnRefused, row, row.Reason
 		}
 	}
 	now := b.now().UnixMilli()
@@ -440,6 +467,7 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 		b.rows[key] = r
 	}
 	r.State = relayTurnStateClaimed
+	r.FenceUntil = relayTurnFenceUntil(cmd)
 	r.EnvelopeID = cmd.ID
 	r.WorkspaceID = cmd.WorkspaceID
 	r.AgentID = agentID
@@ -448,6 +476,68 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 	b.inFlight[key] = true
 	_ = b.persistLocked()
 	return relayTurnRun, *r, ""
+}
+
+// relayTurnFenceUntil is when a turn's signed deadline has passed for every
+// copy of it: its signed ts plus the follow-up attempt window and the skew
+// margin (followUpTurnExpired bounds the unsigned expiry by the same ts). 0
+// when the command carries no ts, so a refused row then lasts the full TTL.
+func relayTurnFenceUntil(cmd commandMsg) int64 {
+	if cmd.Ts <= 0 {
+		return 0
+	}
+	return cmd.Ts + (followUpAttemptWindow + followUpSkewMargin).Milliseconds()
+}
+
+// recordRefusalLocked turns a turn that must never start into a durable
+// `refused` row and returns it. A notWritten answer lets the broker deliver
+// the message by a new attempt, so the refusal must outlive every later copy
+// of this turn: `followUpExpiresAt` rides outside the signature, and a copy
+// with a shortened expiry is refused while the original, still inside its
+// signed bound, would otherwise find nothing recorded and write the message
+// the broker already replaced. A refusal that cannot be persisted keeps the
+// row (this process still never runs the turn) with no reason, and is never
+// answered notWritten: after a restart the fence would be gone, so the broker
+// must treat the attempt as uncertain at its deadline.
+func (b *relayTurnInbox) recordRefusalLocked(base relayTurnRow, reason string) relayTurnRow {
+	key := relayTurnKey{base.SessionID, base.TurnID}
+	r := b.rows[key]
+	if r == nil {
+		b.evictForCapLocked()
+		r = &base
+		b.rows[key] = r
+	}
+	now := b.now().UnixMilli()
+	if r.ClaimedAt == 0 {
+		r.ClaimedAt = now
+	}
+	r.State = relayTurnStateRefused
+	r.Reason = reason
+	r.UpdatedAt = now
+	if err := b.persistLocked(); err != nil {
+		r.Reason = ""
+	}
+	return *r
+}
+
+// RecordRefusal is recordRefusalLocked for a claimed turn whose dispatch
+// returned without reaching the acceptance boundary (runFencedRelayTurn). It
+// returns the recorded reason: "" when the refusal is not durable or the turn
+// was accepted after all, and then nothing may be answered.
+func (b *relayTurnInbox) RecordRefusal(sessionID, turnID, reason string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.ownLocked() {
+		return ""
+	}
+	r := b.rows[relayTurnKey{sessionID, turnID}]
+	if reason == "" || r == nil || r.State == relayTurnStateAccepted {
+		return ""
+	}
+	if r.State == relayTurnStateRefused {
+		return r.Reason
+	}
+	return b.recordRefusalLocked(*r, reason).Reason
 }
 
 // Accept moves a claimed row to accepted and persists it BEFORE the caller
@@ -480,7 +570,8 @@ func (b *relayTurnInbox) AcceptFenced(sessionID, turnID string, refuse func(time
 	}
 	if refuse != nil {
 		if reason := refuse(b.now()); reason != "" {
-			return relayTurnRow{}, false, reason, fmt.Errorf("%s for turn %s: refused at acceptance (%s)", relayAcceptanceNotRecorded, turnID, reason)
+			row := b.recordRefusalLocked(*r, reason)
+			return relayTurnRow{}, false, row.Reason, fmt.Errorf("%s for turn %s: refused at acceptance (%s)", relayAcceptanceNotRecorded, turnID, reason)
 		}
 	}
 	prev := *r
@@ -537,6 +628,12 @@ func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 		if r == nil {
 			continue
 		}
+		if r.State == relayTurnStateRefused {
+			// The broker recording the refusal does not stop a later copy of
+			// the turn arriving: the row stays the fence until its signed
+			// deadline passes (pruneExpiredLocked).
+			continue
+		}
 		if b.inFlight[key] {
 			// This delivery is still being dispatched (a one-shot kind blocks
 			// for the whole agent turn). Deleting the row now would let a
@@ -576,7 +673,7 @@ func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 	changed := false
 	for k, r := range b.rows {
 		if k.SessionID == sessionID && !b.inFlight[k] {
-			if r.State == relayTurnStateAccepted && strings.HasPrefix(k.TurnID, relayFollowUpTurnPrefix) {
+			if (r.State == relayTurnStateAccepted || r.State == relayTurnStateRefused) && strings.HasPrefix(k.TurnID, relayFollowUpTurnPrefix) {
 				continue
 			}
 			delete(b.rows, k)
@@ -728,6 +825,14 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 	decision, row, reason := inbox.BeginFenced(cmd, turnID, agentID, refuseAtClaim)
 	switch decision {
 	case relayTurnRefused:
+		if reason == "" {
+			// Refused, but the refusal never reached the disk: a notWritten
+			// answer would let the broker resend while a restart could still
+			// run this turn. Say nothing; the broker's deadline decides.
+			fmt.Printf("%s[relay-inbox] Turn %s on %s refused, refusal not recorded: not answered%s\n",
+				colorYellow, turnID, cmd.SessionID, colorReset)
+			return true
+		}
 		fmt.Printf("%s[relay-inbox] Turn %s on %s refused (%s) — never started%s\n",
 			colorYellow, turnID, cmd.SessionID, reason, colorReset)
 		if publishRefusal != nil {
@@ -781,7 +886,7 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 	dispatch(withRelayTurnAcceptance(ctx, accept))
 	if acceptRefusal != "" {
 		// Refused at the acceptance boundary: the manager wrote nothing, and
-		// the row stays claimed, so a redelivery is refused at its claim.
+		// the row is now refused, so a redelivery gets the same answer.
 		fmt.Printf("%s[relay-inbox] Turn %s on %s refused at acceptance (%s) — never started%s\n",
 			colorYellow, turnID, cmd.SessionID, acceptRefusal, colorReset)
 		if publishRefusal != nil {
@@ -790,7 +895,7 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 		return true
 	}
 	if !acceptReached && refuse != nil && publishRefusal != nil {
-		if reason := refuse(inbox.now()); reason != "" {
+		if reason := inbox.RecordRefusal(cmd.SessionID, turnID, refuse(inbox.now())); reason != "" {
 			fmt.Printf("%s[relay-inbox] Turn %s on %s refused at dispatch (%s) — never started%s\n",
 				colorYellow, turnID, cmd.SessionID, reason, colorReset)
 			publishRefusal(reason)
