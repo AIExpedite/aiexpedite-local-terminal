@@ -294,9 +294,19 @@ func TestAQueuedFollowUpTurnPastItsExpiryIsRefused(t *testing.T) {
 	if followUpTurnExpired(fresh, "fu_a9", now) {
 		t.Fatalf("a fresh follow-up turn was refused")
 	}
-	legacy := commandMsg{ID: "relayturn_fu_a10", SessionID: "s1", Ts: now.Add(-time.Hour).UnixMilli()}
-	if followUpTurnExpired(legacy, "fu_a10", now) {
-		t.Fatalf("a dispatch without an expiry (legacy) never expires")
+	// `followUpExpiresAt` is unsigned: stripping it must not lift the deadline,
+	// which then comes from the signed ts plus the attempt window.
+	stripped := commandMsg{ID: "relayturn_fu_a10", SessionID: "s1", Ts: now.Add(-3 * time.Minute).UnixMilli()}
+	if !followUpTurnExpired(stripped, "fu_a10", now) {
+		t.Fatalf("a stripped expiry must fall back to the signed ts deadline")
+	}
+	strippedFresh := commandMsg{ID: "relayturn_fu_a11", SessionID: "s1", Ts: now.UnixMilli()}
+	if followUpTurnExpired(strippedFresh, "fu_a11", now) {
+		t.Fatalf("a freshly signed follow-up turn was refused")
+	}
+	unsigned := commandMsg{ID: "relayturn_fu_a12", SessionID: "s1"}
+	if followUpTurnExpired(unsigned, "fu_a12", now) {
+		t.Fatalf("a dispatch with no timestamp at all has no deadline to apply")
 	}
 	ordinary := commandMsg{ID: "relayturn_t1", SessionID: "s1", Ts: now.Add(-time.Hour).UnixMilli(), FollowUpExpiresAt: 1}
 	if followUpTurnExpired(ordinary, "t1", now) {

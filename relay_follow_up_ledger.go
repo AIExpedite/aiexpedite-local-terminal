@@ -576,9 +576,22 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 
 // followUpTurnExpired reports whether a queued follow-up turn (`fu_…`) must be
 // refused before it starts: its expiry (bounded by the signed ts) has passed.
-// A SEND without `followUpExpiresAt` (a legacy-device dispatch) never expires.
+//
+// `followUpExpiresAt` rides OUTSIDE the signature, so a missing or stripped
+// value must not lift the deadline — a `fu_…` SEND is admitted for the whole
+// attempt window plus the skew margin (commandMaxAgeSec), which outlives the
+// broker's own expiry, so an unfenced delivery could run a message the broker
+// has already expired and replaced. When the field is absent the deadline
+// therefore comes from the SIGNED ts plus the attempt window, the same bound
+// fenceReason applies. Only a command with no timestamp at all (the
+// backwards-compatible case isCommandStaleAfter also admits) has no deadline
+// to apply; a `fu_…` turn id is only ever minted by a follow-up-aware broker,
+// which always signs a ts.
 func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
-	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) || cmd.FollowUpExpiresAt <= 0 {
+	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
+		return false
+	}
+	if cmd.FollowUpExpiresAt <= 0 && cmd.Ts <= 0 {
 		return false
 	}
 	return followUpAttemptCheck{Now: now, ExpiresAtMs: cmd.FollowUpExpiresAt, SignedTsMs: cmd.Ts, LiveKind: true,
