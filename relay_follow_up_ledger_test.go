@@ -1237,7 +1237,10 @@ func TestAClaimWithNoDurableSlotIsHandedBack(t *testing.T) {
 // attempts the real owner answers `unknown`; omitting the capability makes it
 // queue instead, and the capability is republished once ownership lands.
 func TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheLedger(t *testing.T) {
-	ledger := newRelayFollowUpLedger(func() string { return filepath.Join(t.TempDir(), relayFollowUpLedgerFileName) })
+	// Resolve the temp dir before registering release: cleanups run LIFO, and
+	// Windows cannot remove the dir while the ledger lock is still held.
+	path := filepath.Join(t.TempDir(), relayFollowUpLedgerFileName)
+	ledger := newRelayFollowUpLedger(func() string { return path })
 	t.Cleanup(ledger.release)
 	owned := ledger.acquireOwnership
 	ledger.acquireOwnership = func() *os.File { return nil }
@@ -1256,9 +1259,9 @@ func TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheLedger(t *testing.T) {
 // device advertised as follow-up-less until the next 6h gather.
 func TestOwnershipArrivingLaterRepublishesTheCapability(t *testing.T) {
 	published := 0
-	prevHook := onMachineInfoStored
-	onMachineInfoStored = func() { published++ }
-	t.Cleanup(func() { onMachineInfoStored = prevHook })
+	prevHook := onMachineCapabilityAdded
+	onMachineCapabilityAdded = func() { published++ }
+	t.Cleanup(func() { onMachineCapabilityAdded = prevHook })
 
 	machineInfoMu.Lock()
 	prevCache := machineInfoCache
@@ -1280,7 +1283,7 @@ func TestOwnershipArrivingLaterRepublishesTheCapability(t *testing.T) {
 		t.Fatalf("the capability was not republished: %+v", caps)
 	}
 	if published != 1 {
-		t.Fatalf("the post-store hook ran %d times, want 1", published)
+		t.Fatalf("the capability-added hook ran %d times, want 1", published)
 	}
 	// Idempotent: an already-advertised capability republishes nothing.
 	if !republishRelayFollowUpCapability() || published != 1 {

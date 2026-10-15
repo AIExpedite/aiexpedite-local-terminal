@@ -107,8 +107,35 @@ func resendTokenRequestWithMachineInfo() {
 	}()
 }
 
+// lastTokenSource is the token source that most recently sent an /auth/token
+// request, or nil before the first one.
+var lastTokenSource atomic.Pointer[WIFTokenSource]
+
+// resendTokenRequestWithCapabilityChange repeats the /auth/token request now,
+// even when the last one already carried machine info, so a capability added
+// to the cached MachineInfo after that request (the follow-up ledger becoming
+// owned once an overlapping process exits) reaches the backend instead of
+// waiting for an unrelated token refresh. It also consumes a pending bare-
+// request re-send, which this request supersedes. Before any request has gone
+// out there is nothing to repeat: the first one reads the updated cache.
+func resendTokenRequestWithCapabilityChange() {
+	ts := tokenSourceAwaitingMachineInfo.Swap(nil)
+	if ts == nil {
+		ts = lastTokenSource.Load()
+	}
+	if ts == nil {
+		return
+	}
+	go func() {
+		if _, err := ts.getOIDCToken(); err != nil {
+			fmt.Printf("[auth] Re-sending the token request with updated capabilities failed: %v\n", err)
+		}
+	}()
+}
+
 func init() {
 	onMachineInfoStored = resendTokenRequestWithMachineInfo
+	onMachineCapabilityAdded = resendTokenRequestWithCapabilityChange
 }
 
 // NewWIFTokenSource creates a new token source for Workload Identity Federation.
@@ -246,6 +273,7 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	// resendTokenRequestWithMachineInfo); at worst both, which is one spare
 	// request.
 	tokenSourceAwaitingMachineInfo.Store(ts)
+	lastTokenSource.Store(ts)
 	mi := GetMachineInfo()
 	if testHookAfterMachineInfoRead != nil {
 		testHookAfterMachineInfoRead()

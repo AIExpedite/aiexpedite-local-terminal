@@ -69,11 +69,13 @@ func isolateMachineInfo(t *testing.T) {
 	machineInfoCache = nil
 	machineInfoMu.Unlock()
 	tokenSourceAwaitingMachineInfo.Store(nil)
+	savedLast := lastTokenSource.Swap(nil)
 	t.Cleanup(func() {
 		machineInfoMu.Lock()
 		machineInfoCache = saved
 		machineInfoMu.Unlock()
 		tokenSourceAwaitingMachineInfo.Store(nil)
+		lastTokenSource.Store(savedLast)
 	})
 }
 
@@ -168,5 +170,56 @@ func TestGatherLandingRightAfterBareRead_StillResends(t *testing.T) {
 	}
 	if !carried {
 		t.Fatalf("no token request carried machine info after the gather landed: %v", rec.snapshot())
+	}
+}
+
+// Codex P2 on #219: a token request that already carried machine info clears
+// the bare-request arm, so a capability added to the cache afterwards (the
+// follow-up ledger becoming owned once an overlapping process exits) was never
+// re-sent. The capability-added path repeats the request unconditionally.
+func TestCapabilityAddedAfterAFullRequest_IsResent(t *testing.T) {
+	isolateMachineInfo(t)
+	rec, srv := newTokenRequestRecorder(t)
+	ts := NewWIFTokenSource(&Config{AgentID: "agent-1", CommandSecret: "secret", TokenEndpoint: srv.URL})
+
+	info := baselineMachineInfo()
+	info.Capabilities = &capabilitiesInfo{RelayTurnInbox: true}
+	machineInfoMu.Lock()
+	machineInfoCache = info
+	machineInfoMu.Unlock()
+	if _, err := ts.getOIDCToken(); err != nil {
+		t.Fatalf("getOIDCToken failed: %v", err)
+	}
+	if tokenSourceAwaitingMachineInfo.Load() != nil {
+		t.Fatal("a request that carried machine info left a re-send pending")
+	}
+
+	updated := *info
+	updated.Capabilities = &capabilitiesInfo{
+		RelayTurnInbox: true,
+		RelayFollowUps: &relayFollowUpsCapability{AttemptExpiry: true, LedgerID: "ledger-1"},
+	}
+	machineInfoMu.Lock()
+	machineInfoCache = &updated
+	machineInfoMu.Unlock()
+	onMachineCapabilityAdded()
+
+	rec.waitFor(t, 2)
+	caps, _ := rec.snapshot()[1]["capabilities"].(map[string]any)
+	followUps, _ := caps["relayFollowUps"].(map[string]any)
+	if followUps["ledgerId"] != "ledger-1" {
+		t.Fatalf("re-sent request lacks the added capability: %v", rec.snapshot()[1])
+	}
+}
+
+// Before any token request there is nothing to repeat: the first request reads
+// the updated cache itself.
+func TestCapabilityAddedBeforeAnyRequest_SendsNothing(t *testing.T) {
+	isolateMachineInfo(t)
+	rec, _ := newTokenRequestRecorder(t)
+	onMachineCapabilityAdded()
+	time.Sleep(200 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("token requests=%d, want 0", got)
 	}
 }

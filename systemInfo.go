@@ -209,8 +209,10 @@ func republishRelayFollowUpCapability() bool {
 	updated.Capabilities = &updatedCaps
 	machineInfoCache = &updated
 	machineInfoMu.Unlock()
-	if onMachineInfoStored != nil {
-		onMachineInfoStored()
+	// onMachineInfoStored only repeats a request that went out bare; one that
+	// already carried the capability-less MachineInfo must be re-sent too.
+	if onMachineCapabilityAdded != nil {
+		onMachineCapabilityAdded()
 	}
 	return true
 }
@@ -452,6 +454,12 @@ func machineInfoStored(info *MachineInfo) {
 // auth.go's init() rather than called directly: a direct call would close a
 // package-initialization cycle through refreshMachineInfoAfterCatalogUpdate.
 var onMachineInfoStored func()
+
+// onMachineCapabilityAdded runs after a capability is folded into an already
+// cached MachineInfo and must reach the backend now, whether or not the last
+// token request carried machine info. Wired in auth.go's init() for the same
+// reason as onMachineInfoStored.
+var onMachineCapabilityAdded func()
 
 // machineInfoGathersInFlight counts full machine gathers running on a
 // background goroutine. A gather is not cancellable once started —
