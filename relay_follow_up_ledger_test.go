@@ -602,9 +602,41 @@ func TestAQueuedFollowUpTurnForAMissingSessionIsRefused(t *testing.T) {
 	if got := followUpTurnRefusal(generic, "fu_a1", now); got != followUpReasonSessionNotRunning {
 		t.Fatalf("missing generic session refusal = %q", got)
 	}
-	globalSessionManager.sessions["s-gone"] = &CLISession{}
+	globalSessionManager.sessions["s-gone"] = &CLISession{Status: "running"}
 	if got := followUpTurnRefusal(generic, "fu_a1", now); got != "" {
 		t.Fatalf("a held generic session must not be refused, got %q", got)
+	}
+	// A retained tombstone whose child exited is gone.
+	globalSessionManager.sessions["s-gone"] = &CLISession{Status: "ended"}
+	if got := followUpTurnRefusal(generic, "fu_a1", now); got != followUpReasonSessionNotRunning {
+		t.Fatalf("ended generic session refusal = %q", got)
+	}
+}
+
+// A kind session the manager still retains after its child exited (status
+// "ended", before the manager removes it) is gone: its SEND would refuse it
+// without ever invoking the acceptance callback. A retained session in any
+// other state is never raced.
+func TestAQueuedFollowUpTurnForARetainedEndedSessionIsRefused(t *testing.T) {
+	resetFencedSessions(t)
+	now := time.Now()
+	prev := globalClaudeNativeManager
+	t.Cleanup(func() { globalClaudeNativeManager = prev })
+	globalClaudeNativeManager = NewClaudeNativeManager(nil)
+
+	cmd := commandMsg{Type: "claude_native_send", ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s-ended", Ts: now.UnixMilli()}
+	session := &ClaudeNativeSession{status: "running"}
+	globalClaudeNativeManager.sessions["s-ended"] = session
+	if got := followUpTurnRefusal(cmd, "fu_a1", now); got != "" {
+		t.Fatalf("a running session must not be refused, got %q", got)
+	}
+	session.status = "ended"
+	if got := followUpTurnRefusal(cmd, "fu_a1", now); got != followUpReasonSessionNotRunning {
+		t.Fatalf("retained ended session refusal = %q", got)
+	}
+	inbox := newTestRelayInbox(t)
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonSessionNotRunning || dispatched {
+		t.Fatalf("retained ended session: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
 }
 

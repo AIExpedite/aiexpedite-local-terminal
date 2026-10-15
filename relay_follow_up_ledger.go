@@ -629,32 +629,58 @@ func followUpTurnRefusal(cmd commandMsg, turnID string, now time.Time) string {
 // person's message until its own deadline. Refusing here answers
 // notWritten/sessionNotRunning instead, and the broker requeues at once.
 //
+// A session the manager still retains after its child exited (status "ended":
+// waitForExit flips it before artifact collection and the terminal frame, and
+// a generic session can linger as a tombstone) is gone too, because every
+// kind's SEND refuses an ended session before invoking the callback.
+//
 // It only ever reports a session the owning manager is live and certain about.
 // An unrecognised command type, an uninitialised manager, or a session the
-// manager still holds (including one that is merely starting) reads as
-// present, so a session that can still accept the turn is never raced.
+// manager still holds in any other state (including one that is merely
+// starting or idle) reads as present, so a session that can still accept the
+// turn is never raced.
 func followUpTurnTargetGone(cmd commandMsg) bool {
 	if cmd.SessionID == "" {
 		return false
 	}
 	switch {
 	case isClaudeNativeCommand(cmd.Type):
-		return globalClaudeNativeManager != nil && globalClaudeNativeManager.Get(cmd.SessionID) == nil
+		return globalClaudeNativeManager != nil && managedSessionGone(globalClaudeNativeManager.Get(cmd.SessionID))
 	case isCodexAppServerCommand(cmd.Type):
-		return globalCodexAppServerManager != nil && globalCodexAppServerManager.Get(cmd.SessionID) == nil
+		return globalCodexAppServerManager != nil && managedSessionGone(globalCodexAppServerManager.Get(cmd.SessionID))
 	case isGrokACPCommand(cmd.Type):
-		return globalGrokACPManager != nil && globalGrokACPManager.Get(cmd.SessionID) == nil
+		return globalGrokACPManager != nil && managedSessionGone(globalGrokACPManager.Get(cmd.SessionID))
 	case isAntigravityNativeCommand(cmd.Type):
-		return globalAntigravityNativeManager != nil && globalAntigravityNativeManager.Get(cmd.SessionID) == nil
+		return globalAntigravityNativeManager != nil && managedSessionGone(globalAntigravityNativeManager.Get(cmd.SessionID))
 	case isOpenCodeNativeCommand(cmd.Type):
-		return globalOpenCodeNativeManager != nil && globalOpenCodeNativeManager.Get(cmd.SessionID) == nil
+		return globalOpenCodeNativeManager != nil && managedSessionGone(globalOpenCodeNativeManager.Get(cmd.SessionID))
 	case isMuseCodeNativeCommand(cmd.Type):
-		return globalMuseCodeNativeManager != nil && globalMuseCodeNativeManager.Get(cmd.SessionID) == nil
+		return globalMuseCodeNativeManager != nil && managedSessionGone(globalMuseCodeNativeManager.Get(cmd.SessionID))
 	case cmd.Type == "session_input":
-		return globalSessionManager != nil && globalSessionManager.GetSession(cmd.SessionID) == nil
+		return globalSessionManager != nil && cliSessionGone(globalSessionManager.GetSession(cmd.SessionID))
 	default:
 		return false
 	}
+}
+
+// managedSessionGone reports that a kind manager's Get found no session, or a
+// retained one whose child has exited.
+func managedSessionGone[T any, S interface {
+	*T
+	Status() string
+}](session S) bool {
+	return session == nil || session.Status() == "ended"
+}
+
+// cliSessionGone is managedSessionGone for a generic managed session, whose
+// status is guarded by its own mutex.
+func cliSessionGone(session *CLISession) bool {
+	if session == nil {
+		return true
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	return session.Status == "ended"
 }
 
 // isFollowUpProtocolCommand reports whether a command belongs to the follow-up
