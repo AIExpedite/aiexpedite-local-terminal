@@ -33,7 +33,7 @@ func TestClaudeLiveFollowUpCertification(t *testing.T) {
 	l.Finish(row.AttemptID, nil, followUpProcessedInCurrent)
 	l.release()
 	reloaded := newRelayFollowUpLedger(func() string { return path })
-	if got := reloaded.Query("cert-1", reloaded.LedgerID()); got.State != followUpRowWritten {
+	if got := reloaded.Query("cert-1", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowWritten {
 		t.Fatalf("written attempt not durable: %+v", got)
 	}
 	// The CLI half — a stdin user message written mid-turn is handled in the

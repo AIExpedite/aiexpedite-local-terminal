@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,7 +139,7 @@ func TestACrashBetweenAcceptedAndWrittenIsUnknownAfterRestart(t *testing.T) {
 	}
 	// The process dies here, before Finish.
 	reloaded := reopenFollowUpLedger(t, l, path)
-	if got := reloaded.Query("a4", reloaded.LedgerID()); got.State != followUpRowUnknown {
+	if got := reloaded.Query("a4", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("an interrupted write must be unknown after restart, got %+v", got)
 	}
 }
@@ -147,7 +148,7 @@ func TestRowsStayUntilTheWatermarkAndTheCapRefuses(t *testing.T) {
 	l, _ := newTestFollowUpLedger(t)
 	row, _ := l.Begin("a5", "m5", "s1", okCheck(time.Now()))
 	l.Finish(row.AttemptID, nil, followUpProcessedInCurrent)
-	if got := l.Query("a5", l.LedgerID()); got.State != followUpRowWritten {
+	if got := l.Query("a5", l.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowWritten {
 		t.Fatalf("row gone before confirmation: %+v", got)
 	}
 	if n, err := l.ConfirmAcked([]string{"a5"}); err != nil || n != 1 {
@@ -185,7 +186,7 @@ func TestOnlyOneProcessOwnsTheLedger(t *testing.T) {
 	if row, write := other.Begin("a2", "m2", "s1", okCheck(time.Now())); write || outcomeOf(&row) != followUpOutcomeUnknown {
 		t.Fatalf("a non-owner decided an attempt: write=%v row=%+v", write, row)
 	}
-	if got := other.Query("a1", owner.LedgerID()); outcomeOf(&got) != followUpOutcomeUnknown {
+	if got := other.Query("a1", owner.LedgerID(), time.Now().UnixMilli()); outcomeOf(&got) != followUpOutcomeUnknown {
 		t.Fatalf("a non-owner answered a query: %+v", got)
 	}
 	if _, err := other.ConfirmAcked([]string{"a1"}); err == nil {
@@ -193,7 +194,7 @@ func TestOnlyOneProcessOwnsTheLedger(t *testing.T) {
 	}
 	// The owner's row survived: the non-owner wrote nothing over it.
 	reloaded := reopenFollowUpLedger(t, owner, path)
-	if got := reloaded.Query("a1", reloaded.LedgerID()); got.State != followUpRowUnknown {
+	if got := reloaded.Query("a1", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("the owner's accepted row was lost: %+v", got)
 	}
 	if _, kept := reloaded.rows["a2"]; kept {
@@ -235,10 +236,10 @@ func TestANonOwnerHandsTheFollowUpBack(t *testing.T) {
 
 func TestAnUnseenIdIsFencedOnlyForThisLedger(t *testing.T) {
 	l, _ := newTestFollowUpLedger(t)
-	if got := l.Query("never", "someone-elses-ledger"); got.State != followUpRowUnknown {
+	if got := l.Query("never", "someone-elses-ledger", time.Now().UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("a different ledger must answer unknown, got %+v", got)
 	}
-	got := l.Query("never", l.LedgerID())
+	got := l.Query("never", l.LedgerID(), time.Now().UnixMilli())
 	if got.State != followUpRowRefused || got.Reason != followUpReasonUnseen {
 		t.Fatalf("an unseen id must be fenced now, got %+v", got)
 	}
@@ -366,7 +367,7 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 	if write || row.State != followUpRowUnknown {
 		t.Fatalf("a refusal that is not durable must answer unknown, got write=%v row=%+v", write, row)
 	}
-	if got := l.Query("never", l.LedgerID()); got.State != followUpRowUnknown {
+	if got := l.Query("never", l.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("an unseen-id fence that is not durable must answer unknown, got %+v", got)
 	}
 	// This process still never writes either id.
@@ -394,7 +395,7 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 		if again.State != followUpRowUnknown || outcomeOf(&again) != followUpOutcomeUnknown {
 			t.Fatalf("%s: a redelivered non-durable fence answers %+v, want unknown", id, again)
 		}
-		if q := l.Query(id, l.LedgerID()); q.State != followUpRowUnknown {
+		if q := l.Query(id, l.LedgerID(), time.Now().UnixMilli()); q.State != followUpRowUnknown {
 			t.Fatalf("%s: a reconciliation of a non-durable fence answers %+v, want unknown", id, q)
 		}
 	}
@@ -464,7 +465,7 @@ func TestALiveAttemptForAReplacedLedgerIsAnsweredUnknown(t *testing.T) {
 	l, _ := newTestFollowUpLedger(t)
 	now := time.Now()
 	for _, ledgerID := range []string{"the-lost-ledger", ""} {
-		row, write := l.BeginForLedger(ledgerID, "att-1", "m1", "s1", okCheck(now))
+		row, write := l.BeginForLedger(ledgerID, now.UnixMilli(), "att-1", "m1", "s1", okCheck(now))
 		if write || row.State != followUpRowUnknown {
 			t.Fatalf("ledger %q: write=%v row=%+v, want unknown and no write", ledgerID, write, row)
 		}
@@ -472,11 +473,11 @@ func TestALiveAttemptForAReplacedLedgerIsAnsweredUnknown(t *testing.T) {
 			t.Fatalf("ledger %q: the mismatched attempt was recorded", ledgerID)
 		}
 	}
-	if _, write := l.BeginForLedger(l.LedgerID(), "att-1", "m1", "s1", okCheck(now)); !write {
+	if _, write := l.BeginForLedger(l.LedgerID(), now.UnixMilli(), "att-1", "m1", "s1", okCheck(now)); !write {
 		t.Fatalf("an attempt naming this ledger must be written")
 	}
 	// Recorded here, so a repeat answers from the row whatever ledger it names.
-	if row, write := l.BeginForLedger("the-lost-ledger", "att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowAccepted {
+	if row, write := l.BeginForLedger("the-lost-ledger", now.UnixMilli(), "att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowAccepted {
 		t.Fatalf("a recorded attempt: write=%v row=%+v", write, row)
 	}
 }
@@ -970,5 +971,144 @@ func TestFollowUpCommandsKeepTheirAttemptStalenessWindow(t *testing.T) {
 	}
 	if isCommandStaleAfter(now.Add(time.Duration(skew/2)*time.Second).UnixMilli(), int(window), skew) {
 		t.Fatalf("a follow-up inside the skew margin must be admitted")
+	}
+}
+
+// `ledgerId` rides OUTSIDE the command signature, so naming the advertised
+// ledger must not be enough on its own to decide an attempt this ledger never
+// recorded: an attacker able to edit a captured, validly signed delivery could
+// otherwise rewrite a replaced ledger's id to the current one and have the
+// attempt written (live) or fenced notWritten (a query) even though the old
+// ledger may already have delivered it. The SIGNED ts decides: only an attempt
+// minted after this ledger identity was can be vouched for.
+func TestAnAttemptMintedBeforeThisLedgerIsNeverVouchedFor(t *testing.T) {
+	l, _ := newTestFollowUpLedger(t)
+	now := time.Now()
+	if !l.Own() {
+		t.Fatalf("the test ledger was not taken")
+	}
+	// The ledger identity was minted after this delivery was signed.
+	minted := now.Add(10 * time.Minute)
+	l.mu.Lock()
+	l.createdAtMs = minted.UnixMilli()
+	l.mu.Unlock()
+
+	row, write := l.BeginForLedger(l.LedgerID(), now.UnixMilli(), "att-old", "m1", "s1", okCheck(now))
+	if write || row.State != followUpRowUnknown {
+		t.Fatalf("a pre-ledger attempt naming this ledger: write=%v row=%+v, want unknown and no write", write, row)
+	}
+	if _, ok := l.rows["att-old"]; ok {
+		t.Fatalf("a pre-ledger attempt was recorded")
+	}
+	if got := l.Query("att-old", l.LedgerID(), now.UnixMilli()); got.State != followUpRowUnknown {
+		t.Fatalf("a pre-ledger id must not be fenced notWritten, got %+v", got)
+	}
+	// A delivery with no ts cannot be placed against the ledger's lifetime.
+	if row, write := l.BeginForLedger(l.LedgerID(), 0, "att-nots", "m1", "s1", okCheck(now)); write || row.State != followUpRowUnknown {
+		t.Fatalf("an attempt with no signed ts: write=%v row=%+v", write, row)
+	}
+	// Minted after this ledger (and inside the clock-skew margin either way).
+	if _, write := l.BeginForLedger(l.LedgerID(), minted.UnixMilli(), "att-new", "m1", "s1", okCheck(minted)); !write {
+		t.Fatalf("an attempt minted under this ledger must be written")
+	}
+	if _, write := l.BeginForLedger(l.LedgerID(), minted.Add(-followUpSkewMargin).UnixMilli(), "att-skew", "m1", "s1", okCheck(minted)); !write {
+		t.Fatalf("an attempt inside the clock-skew margin must be written")
+	}
+	if row, write := l.BeginForLedger(l.LedgerID(), minted.Add(-followUpSkewMargin-time.Second).UnixMilli(), "att-past", "m1", "s1", okCheck(minted)); write || row.State != followUpRowUnknown {
+		t.Fatalf("an attempt past the skew margin: write=%v row=%+v", write, row)
+	}
+}
+
+// A ledger file written before the identity carried its minting time cannot
+// vouch for anything older than the load: the stamp goes on at load, in the
+// conservative direction.
+func TestALedgerFileWithoutAMintingTimeStampsItAtLoad(t *testing.T) {
+	l, path := newTestFollowUpLedger(t)
+	before := time.Now().Add(-time.Hour)
+	row, _ := l.Begin("a1", "m1", "s1", okCheck(time.Now()))
+	l.Finish(row.AttemptID, nil, followUpProcessedInCurrent)
+	// Rewrite the file in the pre-createdAt shape, keeping the identity.
+	l.mu.Lock()
+	old := relayFollowUpLedgerFile{Version: relayFollowUpLedgerVersion, LedgerID: l.ledgerID, Rows: []relayFollowUpRow{*l.rows["a1"]}}
+	l.mu.Unlock()
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := reopenFollowUpLedger(t, l, path)
+	if got := reloaded.Query("a1", reloaded.LedgerID(), before.UnixMilli()); got.State != followUpRowWritten {
+		t.Fatalf("a recorded row is answered whatever the ts: %+v", got)
+	}
+	if got := reloaded.Query("never", reloaded.LedgerID(), before.UnixMilli()); got.State != followUpRowUnknown {
+		t.Fatalf("an unseen id older than the load must be unknown, got %+v", got)
+	}
+	if got := reloaded.Query("never", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowRefused {
+		t.Fatalf("an unseen id minted after the load must be fenced, got %+v", got)
+	}
+}
+
+// A refused `fu_…` row IS the fence that stops a later copy of the turn — one
+// carrying a shortened unsigned `followUpExpiresAt` is refused while the
+// original, still inside its signed bound, would otherwise find nothing
+// recorded and run a turn the broker has already replaced. The row cap must
+// therefore never evict it, and a refusal with nowhere durable to go is never
+// answered notWritten.
+func TestTheCapNeverEvictsALiveFollowUpRefusalFence(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	now := time.Now()
+	// A copy whose unsigned expiry was shortened: refused and recorded.
+	shortened := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: now.UnixMilli(),
+		FollowUpExpiresAt: now.Add(-time.Minute).UnixMilli()}
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, shortened, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("shortened copy: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	// Fill the inbox to its cap with accepted rows the cap may evict.
+	inbox.mu.Lock()
+	for i := 0; i < relayTurnInboxMaxRows; i++ {
+		key := relayTurnKey{"s-fill", fmt.Sprintf("t%d", i)}
+		inbox.rows[key] = &relayTurnRow{SessionID: key.SessionID, TurnID: key.TurnID,
+			State: relayTurnStateAccepted, UpdatedAt: now.UnixMilli()}
+	}
+	inbox.mu.Unlock()
+	// Claiming a new turn evicts to make room, but never the live fence.
+	fresh := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a2", SessionID: "s1", Ts: now.UnixMilli()}
+	if _, _, dispatched := runFencedTestTurn(inbox, fresh, "fu_a2", nil); !dispatched {
+		t.Fatalf("a fresh turn was not dispatched at the cap")
+	}
+	if r, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; !ok || r.State != relayTurnStateRefused {
+		t.Fatalf("the refusal fence was evicted at the cap: %+v", r)
+	}
+	// The original copy, inside its signed bound, still gets the recorded
+	// answer and never runs.
+	original := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: now.UnixMilli(),
+		FollowUpExpiresAt: now.Add(time.Minute).UnixMilli()}
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, original, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("original copy: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+
+	// Now the inbox holds nothing but live fences: a further refusal cannot be
+	// recorded, so it is not answered at all (the broker's deadline decides).
+	full := newTestRelayInbox(t)
+	// Take ownership before seeding: the first owning call reloads the file
+	// and would replace rows planted beforehand.
+	if full.snapshot() == nil {
+		t.Fatalf("the test inbox was not taken")
+	}
+	full.mu.Lock()
+	for i := 0; i < relayTurnInboxMaxRows; i++ {
+		key := relayTurnKey{"s-fenced", fmt.Sprintf("fu_t%d", i)}
+		full.rows[key] = &relayTurnRow{SessionID: key.SessionID, TurnID: key.TurnID,
+			State: relayTurnStateRefused, Reason: followUpReasonExpired, UpdatedAt: now.UnixMilli(),
+			FenceUntil: now.Add(time.Hour).UnixMilli()}
+	}
+	full.mu.Unlock()
+	if handled, refusal, dispatched := runFencedTestTurn(full, shortened, "fu_a1", nil); !handled || refusal != "" || dispatched {
+		t.Fatalf("no durable slot: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if _, ok := full.snapshot()[relayTurnKey{"s1", "fu_a1"}]; ok {
+		t.Fatalf("a refusal with no durable slot was recorded anyway")
 	}
 }

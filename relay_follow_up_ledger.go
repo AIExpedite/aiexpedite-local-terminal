@@ -127,9 +127,20 @@ type relayFollowUpRow struct {
 }
 
 type relayFollowUpLedgerFile struct {
-	Version  int                `json:"version"`
-	LedgerID string             `json:"ledgerId"`
-	Rows     []relayFollowUpRow `json:"rows"`
+	Version  int    `json:"version"`
+	LedgerID string `json:"ledgerId"`
+	// CreatedAt (ms) is when THIS ledger identity was minted. It authenticates
+	// the identity that BeginForLedger / Query use as an execution fence: the
+	// `ledgerId` a delivery names rides OUTSIDE the command signature, so an
+	// attacker able to alter a captured, validly signed delivery could rewrite
+	// an old ledger's id to the currently advertised one and turn an answer of
+	// `unknown` (never written) into a write — a message the previous ledger
+	// may already have delivered. The signed `ts` cannot be rewritten, so an
+	// attempt this ledger never recorded may only execute (or be fenced
+	// `notWritten`) when it was minted after this ledger was, which no
+	// earlier ledger can have recorded.
+	CreatedAt int64              `json:"createdAt,omitempty"`
+	Rows      []relayFollowUpRow `json:"rows"`
 }
 
 type relayFollowUpLedger struct {
@@ -138,7 +149,9 @@ type relayFollowUpLedger struct {
 	now      func() time.Time
 	loaded   bool
 	ledgerID string
-	rows     map[string]*relayFollowUpRow
+	// createdAtMs mirrors relayFollowUpLedgerFile.CreatedAt for the live ledger.
+	createdAtMs int64
+	rows        map[string]*relayFollowUpRow
 	// acquireOwnership takes the ledger's cross-process lock without waiting
 	// (nil while another process holds it); lockFile stays held for the life
 	// of the process once taken.
@@ -215,7 +228,17 @@ func (l *relayFollowUpLedger) loadLocked() {
 		var f relayFollowUpLedgerFile
 		if json.Unmarshal(data, &f) == nil && f.LedgerID != "" {
 			l.ledgerID = f.LedgerID
+			l.createdAtMs = f.CreatedAt
 			changed := false
+			if l.createdAtMs <= 0 {
+				// A file written before the identity carried its minting
+				// time. Stamp it NOW: that is the conservative direction —
+				// every attempt minted before this load is answered unknown
+				// instead of being written or fenced on an identity this
+				// ledger cannot vouch for.
+				l.createdAtMs = l.now().UnixMilli()
+				changed = true
+			}
 			for i := range f.Rows {
 				r := f.Rows[i]
 				if r.State == followUpRowAccepted {
@@ -231,11 +254,12 @@ func (l *relayFollowUpLedger) loadLocked() {
 		}
 	}
 	l.ledgerID = newLedgerID()
+	l.createdAtMs = l.now().UnixMilli()
 	_ = l.persistLocked()
 }
 
 func (l *relayFollowUpLedger) persistLocked() error {
-	f := relayFollowUpLedgerFile{Version: relayFollowUpLedgerVersion, LedgerID: l.ledgerID}
+	f := relayFollowUpLedgerFile{Version: relayFollowUpLedgerVersion, LedgerID: l.ledgerID, CreatedAt: l.createdAtMs}
 	for _, r := range l.rows {
 		f.Rows = append(f.Rows, *r)
 	}
@@ -320,20 +344,48 @@ func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, che
 }
 
 // BeginForLedger is Begin for a delivery that names the ledger its broker
-// last saw. An attempt this ledger never recorded, addressed to another
-// ledger (the file was lost, corrupted or replaced since), may already have
-// been written under the old one, so it is answered unknown — like Query —
-// and neither recorded nor written.
-func (l *relayFollowUpLedger) BeginForLedger(brokerLedgerID, attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
+// last saw, with the delivery's SIGNED ts. An attempt this ledger never
+// recorded, addressed to another ledger (the file was lost, corrupted or
+// replaced since) or minted before this ledger existed, may already have been
+// written under the old one, so it is answered unknown — like Query — and
+// neither recorded nor written.
+func (l *relayFollowUpLedger) BeginForLedger(brokerLedgerID string, signedTsMs int64, attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.ownLocked() {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}, false
 	}
-	if r := l.rows[attemptID]; r == nil && (brokerLedgerID == "" || brokerLedgerID != l.ledgerID) {
+	if r := l.rows[attemptID]; r == nil && !l.vouchesForLocked(brokerLedgerID, signedTsMs) {
 		return relayFollowUpRow{AttemptID: attemptID, FollowUpID: followUpID, SessionID: sessionID, State: followUpRowUnknown}, false
 	}
 	return l.beginLocked(attemptID, followUpID, sessionID, check)
+}
+
+// vouchesForLocked reports whether THIS ledger can speak for an attempt it has
+// no row for: whether its absence proves the attempt never executed.
+//
+// Two conditions, and the second is the authenticated one:
+//   - the delivery names this ledger. `ledgerId` is UNSIGNED, so this alone
+//     is only a fail-safe narrowing: rewriting it to the advertised id would
+//     otherwise promote an attempt from `unknown` to written (live) or to a
+//     `notWritten` fence (a query), either of which can deliver the person's
+//     message twice when the previous ledger had already written it.
+//   - the delivery was minted after this ledger identity was. `ts` is SIGNED
+//     (signaturePayload), so it cannot be rewritten without invalidating the
+//     HMAC, and no earlier ledger can have recorded an attempt that did not
+//     exist while it was live. The skew margin is the one the follow-up
+//     fences already tolerate between the broker's clock and this device's.
+//
+// A delivery with no ts at all cannot be placed against the ledger's lifetime
+// and is never vouched for; every `fu_…`/`relayfollowup_` producer signs one.
+func (l *relayFollowUpLedger) vouchesForLocked(brokerLedgerID string, signedTsMs int64) bool {
+	if brokerLedgerID == "" || brokerLedgerID != l.ledgerID {
+		return false
+	}
+	if signedTsMs <= 0 || l.createdAtMs <= 0 {
+		return false
+	}
+	return signedTsMs >= l.createdAtMs-followUpSkewMargin.Milliseconds()
 }
 
 func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {
@@ -396,8 +448,9 @@ func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processed
 }
 
 // Query answers one attempt id: its recorded outcome; an id never seen is
-// fenced now when the broker names THIS ledger, else it is unknown.
-func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string) relayFollowUpRow {
+// fenced now when this ledger can vouch for its absence (vouchesForLocked),
+// else it is unknown.
+func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string, signedTsMs int64) relayFollowUpRow {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !l.ownLocked() {
@@ -406,7 +459,7 @@ func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string) relayFollo
 	if r := l.rows[attemptID]; r != nil {
 		return *r
 	}
-	if brokerLedgerID == "" || brokerLedgerID != l.ledgerID {
+	if !l.vouchesForLocked(brokerLedgerID, signedTsMs) {
 		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
 	}
 	if len(l.rows) >= relayFollowUpLedgerMaxRows {
@@ -545,7 +598,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 			fmt.Printf("%s[follow-up] %v%s\n", colorYellow, err, colorReset)
 		}
 		for _, id := range q.AttemptIDs {
-			publish(ledger.Query(id, q.LedgerID))
+			publish(ledger.Query(id, q.LedgerID, cmd.Ts))
 		}
 		return true
 	}
@@ -582,7 +635,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		ConversationOK:  session != nil && metadataMatches,
 		ApprovalPending: session != nil && session.pendingApprovals.Load() > 0,
 	}
-	row, write := ledger.BeginForLedger(p.LedgerID, attemptID, p.FollowUpID, cmd.SessionID, check)
+	row, write := ledger.BeginForLedger(p.LedgerID, cmd.Ts, attemptID, p.FollowUpID, cmd.SessionID, check)
 	if !write {
 		publish(row)
 		return true

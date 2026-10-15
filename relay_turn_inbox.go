@@ -375,12 +375,14 @@ func (b *relayTurnInbox) pruneExpiredLocked() bool {
 // evictForCapLocked makes room for one more row: claimed rows first (a
 // claimed row that is not in flight holds a turn that never started, so
 // losing it can at worst let a redelivery run it — once), then the oldest
-// accepted rows.
+// accepted rows. A refusal still inside its fence is never a victim
+// (fencingLocked), so the cap can leave no room at all.
 func (b *relayTurnInbox) evictForCapLocked() {
+	now := b.now().UnixMilli()
 	for len(b.rows) >= relayTurnInboxMaxRows {
 		var victim *relayTurnRow
 		for k, r := range b.rows {
-			if b.inFlight[k] {
+			if b.inFlight[k] || fencingLocked(r, now) {
 				continue
 			}
 			if victim == nil ||
@@ -396,6 +398,19 @@ func (b *relayTurnInbox) evictForCapLocked() {
 			colorYellow, victim.State, victim.SessionID, victim.TurnID, colorReset)
 		delete(b.rows, relayTurnKey{victim.SessionID, victim.TurnID})
 	}
+}
+
+// fencingLocked reports whether a row is a refusal that still answers later
+// copies of its turn. Evicting one would drop the only record that stops a
+// copy carrying a shortened unsigned `followUpExpiresAt` from running a turn
+// the broker has already answered notWritten and replaced — the very
+// duplicate recordRefusalLocked exists to prevent — so the cap never takes
+// it. It lapses with its signed deadline (pruneExpiredLocked) or the TTL.
+func fencingLocked(r *relayTurnRow, nowMs int64) bool {
+	if r.State != relayTurnStateRefused {
+		return false
+	}
+	return r.FenceUntil <= 0 || nowMs <= r.FenceUntil
 }
 
 // Begin records a delivery of a relay turn and says what to do with it. On
@@ -504,6 +519,18 @@ func (b *relayTurnInbox) recordRefusalLocked(base relayTurnRow, reason string) r
 	r := b.rows[key]
 	if r == nil {
 		b.evictForCapLocked()
+		if len(b.rows) >= relayTurnInboxMaxRows {
+			// No durable slot: every row is in flight or a live fence of its
+			// own, and none may be dropped to make room. Answer nothing (as
+			// for a failed write): notWritten without a recorded refusal
+			// would let the broker resend while a later copy of this turn
+			// could still run.
+			fmt.Printf("%s[relay-inbox] Inbox full of live fences — refusal of %s/%s not recorded%s\n",
+				colorYellow, base.SessionID, base.TurnID, colorReset)
+			base.State = relayTurnStateRefused
+			base.Reason = ""
+			return base
+		}
 		r = &base
 		b.rows[key] = r
 	}

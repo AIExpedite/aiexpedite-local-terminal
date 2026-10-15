@@ -749,10 +749,19 @@ type commandMsg struct {
 	AckedTurnIds []string `json:"ackedTurnIds,omitempty"`
 
 	// Follow-ups (relay_follow_up_ledger.go). UNSIGNED metadata: a queued
-	// follow-up turn's expiry on a relay SEND, and a live attempt's ids and
-	// expiry. Both expiries are bounded by the signed `ts`, so editing them
-	// cannot extend an attempt; the text rides in the signed `input` and the
-	// attempt id in the signed envelope id.
+	// follow-up turn's expiry on a relay SEND, and a live attempt's ids,
+	// expiry and the ledger identity its broker last saw. Both expiries are
+	// bounded by the signed `ts`, so editing them cannot extend an attempt;
+	// the text rides in the signed `input` and the attempt id in the signed
+	// envelope id.
+	//
+	// `ledgerId` decides whether an attempt the ledger has no row for may
+	// execute, so it is never trusted on its own: relayFollowUpLedger
+	// .vouchesForLocked requires the SIGNED `ts` to be later than the ledger
+	// identity's own minting time as well. Rewriting `ledgerId` to the
+	// currently advertised id therefore cannot promote an attempt minted
+	// under a replaced ledger from `unknown` to a write or to a `notWritten`
+	// fence.
 	FollowUpExpiresAt        int64  `json:"followUpExpiresAt,omitempty"`
 	FollowUpAttemptID        string `json:"attemptId,omitempty"`
 	FollowUpID               string `json:"followUpId,omitempty"`
