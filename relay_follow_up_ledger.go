@@ -585,6 +585,18 @@ func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
 		SessionRunning: true, ConversationOK: true}.fenceReason() == followUpReasonExpired
 }
 
+// isFollowUpProtocolCommand reports whether a command belongs to the follow-up
+// protocol: a live attempt, a reconciliation query, or a queued follow-up turn
+// (`relayturn_fu_…`). These carry the 120 s attempt window rather than the
+// generic 60 s command-staleness window.
+func isFollowUpProtocolCommand(cmd commandMsg) bool {
+	if cmd.Type == relayFollowUpCommandType || cmd.Type == relayFollowUpQueryCommandType {
+		return true
+	}
+	turnID, ok := relayTurnIDFromEnvelope(cmd.ID)
+	return ok && strings.HasPrefix(turnID, relayFollowUpTurnPrefix)
+}
+
 // refusedFollowUpTurnAck answers an expired queued follow-up turn: it never ran.
 func refusedFollowUpTurnAck(cmd commandMsg, turnID, agentID string) resultMsg {
 	frame := relayTurnAckFrame(relayTurnRow{

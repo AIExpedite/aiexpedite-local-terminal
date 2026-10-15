@@ -409,17 +409,82 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 func TestOnlyTheInboxOwnerDecidesAnExpiredFollowUpTurn(t *testing.T) {
 	inbox := newTestRelayInbox(t)
 	acceptTestRow(t, inbox, "s1", "fu_a1")
-	if owner, accepted := relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted {
-		t.Fatalf("owner: owner=%v accepted=%v", owner, accepted)
+	if owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || inFlight {
+		t.Fatalf("owner: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
 	}
-	if owner, accepted := relayTurnAcceptance(inbox, "s1", "fu_a2"); !owner || accepted {
-		t.Fatalf("owner, unseen turn: owner=%v accepted=%v", owner, accepted)
+	if owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a2"); !owner || accepted || inFlight {
+		t.Fatalf("owner, unseen turn: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
 	}
 	// Another process owns the inbox: it cannot tell an accepted turn from a
 	// new one, so it must hand the delivery back rather than refuse it.
 	other := newRelayTurnInbox(func() string { return "unused" })
 	other.acquireOwnership = func() *os.File { return nil }
-	if owner, accepted := relayTurnAcceptance(other, "s1", "fu_a1"); owner || accepted {
-		t.Fatalf("non-owner: owner=%v accepted=%v", owner, accepted)
+	if owner, accepted, inFlight := relayTurnAcceptance(other, "s1", "fu_a1"); owner || accepted || inFlight {
+		t.Fatalf("non-owner: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	}
+}
+
+// A first delivery that has claimed the turn but not yet accepted it can still
+// accept and write. An expired duplicate must therefore be handed back, not
+// answered `notWritten` — otherwise the broker queues a replacement and the
+// user's message is delivered twice.
+func TestAClaimedInFlightFollowUpTurnIsNotRefusedAsExpired(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", WorkspaceID: "ws-1", UID: "u-1"}
+	if decision, _ := inbox.Begin(cmd, "fu_a1", "agent-1"); decision != relayTurnRun {
+		t.Fatalf("Begin = %v, want run", decision)
+	}
+	// Claimed and in flight, not accepted.
+	owner, accepted, inFlight := relayTurnAcceptance(inbox, "s1", "fu_a1")
+	if !owner || accepted || !inFlight {
+		t.Fatalf("claimed in flight: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	}
+	// Once it accepts, the duplicate is re-acked instead.
+	if _, ok, err := inbox.Accept("s1", "fu_a1"); !ok || err != nil {
+		t.Fatalf("Accept did not transition: %v", err)
+	}
+	if owner, accepted, inFlight = relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || !inFlight {
+		t.Fatalf("accepted in flight: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	}
+	inbox.Finish("s1", "fu_a1")
+	if owner, accepted, inFlight = relayTurnAcceptance(inbox, "s1", "fu_a1"); !owner || !accepted || inFlight {
+		t.Fatalf("after finish: owner=%v accepted=%v inFlight=%v", owner, accepted, inFlight)
+	}
+}
+
+// A follow-up delivery delayed past the generic 60 s command-staleness window
+// must still reach its handler, which emits the ack the broker waits on. Past
+// its own attempt window plus the skew margin it is stale like anything else.
+func TestFollowUpCommandsKeepTheirAttemptStalenessWindow(t *testing.T) {
+	now := time.Now()
+	window := int64((followUpAttemptWindow + followUpSkewMargin).Seconds())
+	for _, tc := range []struct {
+		name string
+		cmd  commandMsg
+		want int
+	}{
+		{"live attempt", commandMsg{Type: relayFollowUpCommandType, ID: relayFollowUpEnvelopePrefix + "att-1"}, int(window)},
+		{"reconciliation query", commandMsg{Type: relayFollowUpQueryCommandType}, int(window)},
+		{"queued follow-up turn", commandMsg{ID: relayTurnEnvelopePrefix + "fu_att-1"}, int(window)},
+		{"ordinary relay turn", commandMsg{ID: relayTurnEnvelopePrefix + "t-1"}, maxCommandAgeSec},
+		{"ordinary command", commandMsg{Command: "ls"}, maxCommandAgeSec},
+	} {
+		if got := commandMaxAgeSec(tc.cmd); got != tc.want {
+			t.Fatalf("%s: commandMaxAgeSec = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	// 90 s old: stale generically, still inside the follow-up window.
+	ts := now.Add(-90 * time.Second).UnixMilli()
+	if !isCommandStale(ts) {
+		t.Fatalf("a 90 s old command must be generically stale")
+	}
+	if isCommandStaleAfter(ts, int(window)) {
+		t.Fatalf("a 90 s old follow-up must not be stale inside its attempt window")
+	}
+	// Past the attempt window plus the margin, the broker has expired the
+	// attempt itself, so the generic rejection applies again.
+	expired := now.Add(-(time.Duration(window) + 1) * time.Second).UnixMilli()
+	if !isCommandStaleAfter(expired, int(window)) {
+		t.Fatalf("a follow-up past its window must be stale")
 	}
 }

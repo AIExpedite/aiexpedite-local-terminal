@@ -243,13 +243,38 @@ const maxCommandAgeSec = 60 // 1 minute
 // Also rejects commands with future-dated timestamps (clock skew > 60 s) to
 // prevent an attacker from bypassing the staleness check with a far-future ts.
 func isCommandStale(cmdTs int64) bool {
+	return isCommandStaleAfter(cmdTs, maxCommandAgeSec)
+}
+
+// isCommandStaleAfter is isCommandStale with the window the command's own
+// protocol defines. Follow-up deliveries carry a 120 s attempt window, so the
+// generic 60 s gate would Ack them as "stale" before the handler could emit
+// the `relay_turn_ack` / `relay_follow_up_ack` the broker waits on, leaving the
+// message stuck until the broker's own deadline. They keep a bounded window
+// (commandMaxAgeSec) rather than no window at all.
+func isCommandStaleAfter(cmdTs int64, maxAgeSec int) bool {
 	if cmdTs == 0 {
 		return false // No timestamp - allow for backwards compatibility
 	}
 	now := time.Now().UnixMilli()
 	ageMs := now - cmdTs
-	// Reject if too old OR if more than 60 s in the future (abnormal clock skew)
-	return ageMs > int64(maxCommandAgeSec*1000) || ageMs < -int64(maxCommandAgeSec*1000)
+	maxMs := int64(maxAgeSec) * 1000
+	// Reject if too old OR if too far in the future (abnormal clock skew)
+	return ageMs > maxMs || ageMs < -maxMs
+}
+
+// commandMaxAgeSec is the staleness window for one command. A follow-up
+// attempt (a live `relay_follow_up`, a reconciliation query, or a queued
+// `relayturn_fu_…` SEND) must still reach its handler inside its own attempt
+// window plus the clock-skew margin; the handler then fences it on the SIGNED
+// expiry (fenceReason / followUpTurnExpired), so nothing is replayable beyond
+// what that fence already allows. Past this window the broker has expired the
+// attempt itself, so the generic rejection is harmless again.
+func commandMaxAgeSec(cmd commandMsg) int {
+	if isFollowUpProtocolCommand(cmd) {
+		return int((followUpAttemptWindow + followUpSkewMargin).Seconds())
+	}
+	return maxCommandAgeSec
 }
 
 /* --------------------------------------------------------------------------
@@ -1712,10 +1737,14 @@ func runPubSubConnection(cfg *Config) error {
 		// carrying refreshId so the backend can clear its in-flight / pending
 		// marker. A generic "stale" rejection here would orphan that marker and
 		// block the loop until its timeout. See isInternalDemandCommand.
-		if !isInternalDemandCommand(cmd.Command) && isCommandStale(cmd.Ts) {
+		//
+		// Follow-up protocol messages keep their own (longer) window for the
+		// reason commandMaxAgeSec documents.
+		maxAgeSec := commandMaxAgeSec(cmd)
+		if !isInternalDemandCommand(cmd.Command) && isCommandStaleAfter(cmd.Ts, maxAgeSec) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
-				colorYellow, ageSec, maxCommandAgeSec, colorReset)
+				colorYellow, ageSec, maxAgeSec, colorReset)
 
 			// Send stale response back to user
 			res := makeRejectionResult(
@@ -6567,9 +6596,17 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		// accepted earlier: then the inbox re-acks it below as usual). Only the
 		// inbox owner knows which; a non-owner hands the delivery back.
 		if followUpTurnExpired(cmd, turnID, time.Now()) {
-			owner, accepted := relayTurnAcceptance(globalRelayTurnInbox, cmd.SessionID, turnID)
+			owner, accepted, inFlight := relayTurnAcceptance(globalRelayTurnInbox, cmd.SessionID, turnID)
 			if !owner {
 				logSession(cmd.SessionID, "%s[follow-up] Another agent process owns the relay turn inbox — handing expired turn %s back%s\n", colorYellow, turnID, colorReset)
+				return false
+			}
+			// A delivery of this turn is in flight here and has not accepted
+			// yet: it may still accept and write, so this redelivery cannot
+			// call the turn refused. Hand it back; a later redelivery sees the
+			// settled state (accepted → re-acked below, or gone → refused).
+			if inFlight && !accepted {
+				logSession(cmd.SessionID, "%s[follow-up] A delivery of turn %s is still in flight — handing the expired duplicate back%s\n", colorYellow, turnID, colorReset)
 				return false
 			}
 			if !accepted {

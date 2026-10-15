@@ -591,15 +591,23 @@ func acceptRelayDelivery(accept func() error) error {
 
 // relayTurnAcceptance reports whether this process owns the inbox and, when
 // it does, whether the turn was accepted earlier (this boot or a previous
-// one): such a turn is re-acked, never refused late. A non-owner cannot know,
-// so its caller must hand the delivery back instead of deciding.
-func relayTurnAcceptance(b *relayTurnInbox, sessionID, turnID string) (owner, accepted bool) {
-	rows := b.snapshot()
-	if rows == nil {
-		return false, false
+// one): such a turn is re-acked, never refused late. It also reports whether a
+// delivery of the turn is in flight here: that delivery can still accept and
+// write, so its outcome is not yet decided and an unaccepted in-flight turn
+// must NOT be refused either. A non-owner cannot know any of this, so its
+// caller must hand the delivery back instead of deciding.
+func relayTurnAcceptance(b *relayTurnInbox, sessionID, turnID string) (owner, accepted, inFlight bool) {
+	if b == nil {
+		return false, false, false
 	}
-	r, ok := rows[relayTurnKey{sessionID, turnID}]
-	return true, ok && r.State == relayTurnStateAccepted
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.ownLocked() {
+		return false, false, false
+	}
+	key := relayTurnKey{sessionID, turnID}
+	r := b.rows[key]
+	return true, r != nil && r.State == relayTurnStateAccepted, b.inFlight[key]
 }
 
 // relayTurnAckFrame is the result frame the broker's results subscriber reads:
