@@ -517,7 +517,9 @@ func TestAClaimedInFlightFollowUpTurnIsNotRefusedAsExpired(t *testing.T) {
 		clock = start.Add(followUpAttemptWindow + followUpSkewMargin + time.Minute)
 		dupHandled, dupRefusal, dupDispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil)
 	})
-	if !handled || refusal != "" || !dispatched {
+	// It returned past the deadline without accepting: it never wrote and now
+	// never can, so it is answered at once instead of waiting for a retry.
+	if !handled || refusal != followUpReasonExpired || !dispatched {
 		t.Fatalf("first delivery: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
 	if dupHandled || dupRefusal != "" || dupDispatched {
@@ -526,6 +528,45 @@ func TestAClaimedInFlightFollowUpTurnIsNotRefusedAsExpired(t *testing.T) {
 	// The first delivery returned without accepting: now it is decided.
 	if handled, refusal, dispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
 		t.Fatalf("redelivery after an unaccepted dispatch: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+}
+
+// A queued follow-up turn whose session exits after the claim but before the
+// manager's acceptance boundary only gets the kind's error frame from SEND; it
+// is answered notWritten/sessionNotRunning so the broker requeues at once. A
+// dispatch that accepted, or that failed while its session is still there,
+// is never answered that way.
+func TestAQueuedFollowUpTurnWhoseSessionExitsBeforeAcceptanceIsRefused(t *testing.T) {
+	resetFencedSessions(t)
+	inbox := newTestRelayInbox(t)
+	now := time.Now()
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s-exit", Ts: now.UnixMilli()}
+	handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", func(context.Context) {
+		// The session leaves between the claim and the manager's status check,
+		// which refuses before invoking the acceptor.
+		markSessionsFenced([]string{"s-exit"})
+	})
+	if !handled || refusal != followUpReasonSessionNotRunning || !dispatched {
+		t.Fatalf("exited session: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+
+	// Accepted, then the session went away: the turn ran, so no refusal.
+	accepted := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a2", SessionID: "s-late", Ts: now.UnixMilli()}
+	handled, refusal, _ = runFencedTestTurn(inbox, accepted, "fu_a2", func(ctx context.Context) {
+		if err := relayTurnAcceptor(ctx)(); err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+		markSessionsFenced([]string{"s-late"})
+	})
+	if !handled || refusal != "" {
+		t.Fatalf("accepted turn: handled=%v refusal=%q", handled, refusal)
+	}
+
+	// Failed without accepting while the session is still here: left to the
+	// broker's retry, as before.
+	alive := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a3", SessionID: "s-alive", Ts: now.UnixMilli()}
+	if handled, refusal, _ = runFencedTestTurn(inbox, alive, "fu_a3", func(context.Context) {}); !handled || refusal != "" {
+		t.Fatalf("live session: handled=%v refusal=%q", handled, refusal)
 	}
 }
 

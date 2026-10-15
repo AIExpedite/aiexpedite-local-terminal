@@ -668,6 +668,14 @@ func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, tu
 // here has not decided the turn yet (it may still accept and write), so a
 // duplicate is handed back (false) rather than dropped: a later redelivery
 // sees the settled state — accepted and re-acked, or gone and refused.
+//
+// The fence is decided again once a dispatch returns without ever reaching the
+// acceptance boundary. Every manager calls the acceptor synchronously, before
+// any write, so such a turn never ran and never can; when its session exited
+// between the claim and the manager's own status check (or its expiry passed
+// meanwhile), the kind's SEND only published its error frame, and the broker
+// would otherwise get no outcome-bearing answer until its outbox retried. The
+// refusal is answered here instead, so the broker requeues at once.
 func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
 	refuse func(time.Time) string, publishRefusal func(reason string),
 	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
@@ -707,8 +715,10 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 
 	var once sync.Once
 	var acceptErr error
+	acceptReached := false
 	accept := func() error {
 		once.Do(func() {
+			acceptReached = true
 			r, ok, err := inbox.Accept(cmd.SessionID, turnID)
 			if err != nil {
 				acceptErr = err
@@ -721,6 +731,13 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 		return acceptErr
 	}
 	dispatch(withRelayTurnAcceptance(ctx, accept))
+	if !acceptReached && refuse != nil && publishRefusal != nil {
+		if reason := refuse(inbox.now()); reason != "" {
+			fmt.Printf("%s[relay-inbox] Turn %s on %s refused at dispatch (%s) — never started%s\n",
+				colorYellow, turnID, cmd.SessionID, reason, colorReset)
+			publishRefusal(reason)
+		}
+	}
 	return true
 }
 
