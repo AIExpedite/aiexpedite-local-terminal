@@ -1400,7 +1400,7 @@ func installLiveFollowUpSession(t *testing.T) (*relayFollowUpLedger, *ClaudeNati
 	globalClaudeNativeManager = NewClaudeNativeManager(nil)
 	t.Cleanup(func() { globalClaudeNativeManager = prevManager })
 	stdin := &followUpStdinRecorder{}
-	session := &ClaudeNativeSession{ID: "s1", Stdin: stdin, status: "running"}
+	session := &ClaudeNativeSession{ID: "s1", Stdin: stdin, status: "running", launchedVersion: "1.2.3"}
 	globalClaudeNativeManager.sessions["s1"] = session
 	var (
 		mu      sync.Mutex
@@ -1482,6 +1482,65 @@ func TestALiveFollowUpWithinItsExpiryIsWrittenAtTheStdinBoundary(t *testing.T) {
 	}
 	if len(*answers) != 1 || (*answers)[0].FollowUpOutcome != followUpOutcomeWritten {
 		t.Fatalf("want one written answer, got %+v", *answers)
+	}
+}
+
+// Codex P2 on #219: a session launched from an older, uncertified build stays
+// queued-only after Claude is upgraded in place — the gate reads the version
+// the running child was launched from, not the one installed now.
+func TestALiveFollowUpIsGatedOnTheSessionsLaunchedVersion(t *testing.T) {
+	for _, launched := range []string{"1.2.2", ""} {
+		t.Run("launched="+launched, func(t *testing.T) {
+			l, session, stdin, answers := installLiveFollowUpSession(t)
+			// The installed binary is certified (pinned at 1.2.3); the running
+			// child is not.
+			session.launchedVersion = launched
+			now := time.Now()
+			cmd := commandMsg{
+				ID:                       relayFollowUpEnvelopePrefix + "att-3",
+				Type:                     relayFollowUpCommandType,
+				SessionID:                "s1",
+				Input:                    "are you almost done?",
+				Ts:                       now.UnixMilli(),
+				FollowUpID:               "m3",
+				FollowUpAttemptID:        "att-3",
+				FollowUpAttemptExpiresAt: now.Add(time.Minute).UnixMilli(),
+				FollowUpLedgerID:         l.LedgerID(),
+			}
+			handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
+			if n := stdin.written(); n != 0 {
+				t.Fatalf("a session launched at %q was written %d bytes", launched, n)
+			}
+			if len(*answers) != 1 || (*answers)[0].FollowUpOutcome != followUpOutcomeNotWritten || (*answers)[0].FollowUpReason != followUpReasonNotLiveKind {
+				t.Fatalf("want one notWritten/notLiveKind answer, got %+v", *answers)
+			}
+		})
+	}
+}
+
+// The launch version is kept only while the binary on disk is the one it was
+// read from; a replacement between the probe and the spawn fails closed.
+func TestConfirmClaudeLaunchVersionRequiresTheProbedBinary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(path, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
+	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "1.2.3" {
+		t.Fatalf("unchanged binary: got %q", got)
+	}
+	if got := confirmClaudeLaunchVersion(path, "", key); got != "" {
+		t.Fatalf("an unknown version must stay unknown, got %q", got)
+	}
+	if err := os.WriteFile(path, []byte("v2-upgraded"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := confirmClaudeLaunchVersion(path, "1.2.3", key); got != "" {
+		t.Fatalf("a binary replaced before the spawn must fail closed, got %q", got)
 	}
 }
 

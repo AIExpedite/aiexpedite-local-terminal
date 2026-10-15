@@ -127,6 +127,11 @@ type ClaudeNativeSession struct {
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
+	// launchedVersion is the major.minor.patch of the Claude binary this child
+	// was spawned from ("" when it could not be established). Live follow-ups
+	// are gated on it rather than on the installed version, which an in-place
+	// upgrade can change under a running session. Set once at construction.
+	launchedVersion string
 	// terminalPublishState reserves this session's ID while its claude_native_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
@@ -249,6 +254,7 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	}
 
 	executable := resolveExecutable("claude")
+	launchedVersion, launchedKey := claudeLaunchVersion(executable)
 	args, extractedPrompt := buildClaudeInteractiveArgs(extraArgs)
 	prompt := initialPrompt
 	if prompt == "" {
@@ -292,6 +298,7 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		return fmt.Errorf("failed to start claude (is `claude` on PATH?): %w", err)
 	}
 	trackSessionProcess(id, proc)
+	launchedVersion = confirmClaudeLaunchVersion(executable, launchedVersion, launchedKey)
 
 	session := &ClaudeNativeSession{
 		ID:            id,
@@ -301,8 +308,9 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		Stderr:        stderr,
 		StartedAt:     time.Now(),
 		WorkspaceID:   workspaceID,
-		UID:           uid,
-		status:        "running",
+		UID:             uid,
+		launchedVersion: launchedVersion,
+		status:          "running",
 		done:          make(chan struct{}),
 		processExited: make(chan struct{}),
 		streamDone:    make(chan struct{}),

@@ -629,12 +629,51 @@ func relayFollowUpAckFrame(cmd commandMsg, agentID string, r relayFollowUpRow, l
 // an unreadable or unparseable installed version — fails closed to queued
 // delivery (Codex P2 on #219).
 func liveFollowUpKind(cliAgentID string) bool {
+	return liveFollowUpVersionCertified(cliAgentID, liveFollowUpInstalledVersion(cliAgentID))
+}
+
+// liveFollowUpVersionCertified reports whether version (major.minor.patch)
+// meets the certified minimum for cliAgentID. An empty version, or an
+// unparseable minimum, fails closed.
+func liveFollowUpVersionCertified(cliAgentID, version string) bool {
 	minVersion, ok := liveFollowUpCertified[cliAgentID]
 	if !ok || semverRe.FindStringSubmatch(minVersion) == nil {
 		return false
 	}
-	installed := liveFollowUpInstalledVersion(cliAgentID)
-	return installed != "" && compareSemver(installed, minVersion) >= 0
+	return version != "" && compareSemver(version, minVersion) >= 0
+}
+
+// claudeLaunchVersion reads the version of the Claude binary a session is
+// about to spawn, plus the (path, mtime, size) identity it was read from, so
+// confirmClaudeLaunchVersion can check that exact binary is what started. It
+// probes only while Claude Code is certified for live follow-ups at all, so an
+// uncertified build never pays a `--version` spawn per session start.
+func claudeLaunchVersion(executable string) (string, versionProbeKey) {
+	if _, ok := liveFollowUpCertified[claudeCodeCliAgentID]; !ok || executable == "" {
+		return "", versionProbeKey{}
+	}
+	cachedProbeVersion(executable)
+	v, key, ok := peekCachedProbeVersionIdentity(executable)
+	m := semverRe.FindStringSubmatch(v)
+	if !ok || m == nil {
+		return "", versionProbeKey{}
+	}
+	return m[0], key
+}
+
+// confirmClaudeLaunchVersion keeps the version claudeLaunchVersion read only
+// when the binary on disk still has the identity it was read from once the
+// child has started. An upgrade landing between the probe and the spawn makes
+// the launched build unknown, which fails closed to queued delivery.
+func confirmClaudeLaunchVersion(executable, version string, key versionProbeKey) string {
+	if version == "" {
+		return ""
+	}
+	info, err := os.Stat(executable)
+	if err != nil || key != (versionProbeKey{Path: executable, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}) {
+		return ""
+	}
+	return version
 }
 
 // liveFollowUpInstalledVersion is the installed major.minor.patch of a
@@ -717,7 +756,11 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		Now:         time.Now(),
 		ExpiresAtMs: p.ExpiresAt,
 		SignedTsMs:  cmd.Ts,
-		LiveKind:    session != nil && liveFollowUpKind(claudeCodeCliAgentID),
+		// Gated on the version the running child was LAUNCHED from, not the
+		// one installed now: an in-place upgrade must not make a session
+		// started from an older, uncertified build live-eligible (Codex P2
+		// on #219).
+		LiveKind:    session != nil && liveFollowUpVersionCertified(claudeCodeCliAgentID, session.launchedVersion),
 		// A fenced session (moved or max-parked off this computer) takes
 		// nothing but its END, so it is not running for a follow-up.
 		SessionRunning: session != nil && session.Status() == "running" && !isSessionFenced(cmd.SessionID),
