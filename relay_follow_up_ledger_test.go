@@ -588,6 +588,55 @@ func TestAQueuedFollowUpTurnForAMissingSessionIsRefused(t *testing.T) {
 	if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonSessionNotRunning || dispatched {
 		t.Fatalf("missing session: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
+
+	// A generic managed session (`session_input`) is judged by the
+	// SessionManager the same way.
+	prevSM := globalSessionManager
+	t.Cleanup(func() { globalSessionManager = prevSM })
+	generic := commandMsg{Type: "session_input", ID: cmd.ID, SessionID: "s-gone", Ts: cmd.Ts}
+	globalSessionManager = nil
+	if got := followUpTurnRefusal(generic, "fu_a1", now); got != "" {
+		t.Fatalf("with no session manager the turn must not be refused, got %q", got)
+	}
+	globalSessionManager = NewSessionManager(&Config{})
+	if got := followUpTurnRefusal(generic, "fu_a1", now); got != followUpReasonSessionNotRunning {
+		t.Fatalf("missing generic session refusal = %q", got)
+	}
+	globalSessionManager.sessions["s-gone"] = &CLISession{}
+	if got := followUpTurnRefusal(generic, "fu_a1", now); got != "" {
+		t.Fatalf("a held generic session must not be refused, got %q", got)
+	}
+}
+
+// Tearing a session down keeps an accepted follow-up turn whose ack is not yet
+// confirmed: its redelivery, finding no session, must re-ack rather than be
+// refused as sessionNotRunning for a message that was already written.
+func TestReleasingASessionKeepsAnAcceptedFollowUpTurn(t *testing.T) {
+	resetFencedSessions(t)
+	now := time.Now()
+	prev := globalClaudeNativeManager
+	t.Cleanup(func() { globalClaudeNativeManager = prev })
+	globalClaudeNativeManager = NewClaudeNativeManager(nil)
+
+	inbox := newTestRelayInbox(t)
+	acceptTestRow(t, inbox, "s-gone", "fu_a1")
+	acceptTestRow(t, inbox, "s-gone", "t1")
+	inbox.ReleaseSession("s-gone")
+	rows := inbox.snapshot()
+	if _, ok := rows[relayTurnKey{"s-gone", "fu_a1"}]; !ok {
+		t.Fatalf("the accepted follow-up turn was released")
+	}
+	if _, ok := rows[relayTurnKey{"s-gone", "t1"}]; ok {
+		t.Fatalf("an ordinary accepted turn must still be released")
+	}
+
+	cmd := commandMsg{Type: "claude_native_send", ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s-gone", Ts: now.UnixMilli()}
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != "" || dispatched {
+		t.Fatalf("redelivery after teardown: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if n := inbox.ConfirmAcked("s-gone", []string{"fu_a1"}); n != 1 {
+		t.Fatalf("the watermark must still delete the retained row, deleted %d", n)
+	}
 }
 
 // The generic fence gate leaves follow-up protocol commands to their own

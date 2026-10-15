@@ -650,6 +650,8 @@ func followUpTurnTargetGone(cmd commandMsg) bool {
 		return globalOpenCodeNativeManager != nil && globalOpenCodeNativeManager.Get(cmd.SessionID) == nil
 	case isMuseCodeNativeCommand(cmd.Type):
 		return globalMuseCodeNativeManager != nil && globalMuseCodeNativeManager.Get(cmd.SessionID) == nil
+	case cmd.Type == "session_input":
+		return globalSessionManager != nil && globalSessionManager.GetSession(cmd.SessionID) == nil
 	default:
 		return false
 	}

@@ -47,7 +47,9 @@
 //     nothing;
 //   - its session is torn down on this device (releaseLedgerSession — the one
 //     point every manager passes when it removes a session): a turn for a
-//     session that no longer exists cannot run again anyway;
+//     session that no longer exists cannot run again anyway. An accepted
+//     follow-up turn (`fu_…`) is the exception: it stays so a redelivery
+//     re-acks it instead of being refused as sessionNotRunning;
 //   - it outlives relayTurnInboxTTL — far longer than any outbox republish
 //     window, so expiry can only drop a row nothing will redeliver.
 //
@@ -537,7 +539,14 @@ func (b *relayTurnInbox) ConfirmAcked(sessionID string, turnIDs []string) int {
 	return deleted
 }
 
-// ReleaseSession deletes every row of a session torn down on this device.
+// ReleaseSession deletes every row of a session torn down on this device,
+// except an ACCEPTED follow-up turn (`fu_…`) whose ack the broker has not yet
+// confirmed. A redelivery of that turn finds no session, and without the row
+// followUpTurnRefusal would answer notWritten/sessionNotRunning for a message
+// that was already written, letting the broker queue a replacement and
+// deliver it twice. The retained row re-acks instead; it still goes away by
+// watermark, the cap, or relayTurnInboxTTL. An ordinary turn needs no such
+// row: a redelivery to a gone session can never run, and nothing requeues it.
 func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 	if sessionID == "" {
 		return
@@ -548,8 +557,11 @@ func (b *relayTurnInbox) ReleaseSession(sessionID string) {
 		return
 	}
 	changed := false
-	for k := range b.rows {
+	for k, r := range b.rows {
 		if k.SessionID == sessionID && !b.inFlight[k] {
+			if r.State == relayTurnStateAccepted && strings.HasPrefix(k.TurnID, relayFollowUpTurnPrefix) {
+				continue
+			}
 			delete(b.rows, k)
 			delete(b.confirmed, k)
 			changed = true
