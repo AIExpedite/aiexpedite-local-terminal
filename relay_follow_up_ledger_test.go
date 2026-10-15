@@ -381,6 +381,45 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 	if write || row.State != followUpRowUnknown {
 		t.Fatalf("an acceptance that is not durable must answer unknown, got write=%v row=%+v", write, row)
 	}
+	// A redelivery in this same process reads the STORED row, so that row must
+	// be unknown too. A stored `refused` would answer notWritten and let the
+	// broker resend under a new attempt, while the lost-on-restart fence could
+	// still let the original be written: the person would get it twice.
+	for _, id := range []string{"a1", "never", "a2"} {
+		again, write := l.Begin(id, "m", "s1", okCheck(time.Now()))
+		if write {
+			t.Fatalf("%s: a non-durable fence was written on redelivery", id)
+		}
+		if again.State != followUpRowUnknown || outcomeOf(&again) != followUpOutcomeUnknown {
+			t.Fatalf("%s: a redelivered non-durable fence answers %+v, want unknown", id, again)
+		}
+		if q := l.Query(id, l.LedgerID()); q.State != followUpRowUnknown {
+			t.Fatalf("%s: a reconciliation of a non-durable fence answers %+v, want unknown", id, q)
+		}
+	}
+}
+
+// A drain must not swallow the follow-up protocol: both commands correlate to
+// work accepted before it began, and refusing them withholds the ack the
+// broker settles or reconciles the attempt on.
+func TestFollowUpProtocolCommandsPassThroughADrain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  commandMsg
+		want bool
+	}{
+		{"live attempt", commandMsg{Type: relayFollowUpCommandType, ID: relayFollowUpEnvelopePrefix + "att-1"}, true},
+		{"reconciliation query", commandMsg{Type: relayFollowUpQueryCommandType}, true},
+		{"queued follow-up turn", commandMsg{Type: "session_input", ID: relayTurnEnvelopePrefix + "fu_att-1"}, true},
+		{"a new one-shot execute", commandMsg{Command: "ls"}, false},
+	} {
+		if got := isDrainPassThrough(tc.cmd); got != tc.want {
+			t.Fatalf("%s: isDrainPassThrough = %v, want %v", tc.name, got, tc.want)
+		}
+		if got := isWorkStartCommand(tc.cmd); got == tc.want {
+			t.Fatalf("%s: isWorkStartCommand = %v, want %v", tc.name, got, !tc.want)
+		}
+	}
 }
 
 func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {

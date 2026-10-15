@@ -336,17 +336,17 @@ func (l *relayFollowUpLedger) Begin(attemptID, followUpID, sessionID string, che
 		l.rows[attemptID] = r
 		if err := l.persistLocked(); err != nil {
 			fmt.Printf("%s[follow-up] ledger write failed for a refusal: %v%s\n", colorYellow, err, colorReset)
-			return notDurableFence(*r), false
+			return l.markNotDurableLocked(r), false
 		}
 		return *r, false
 	}
 	r.State = followUpRowAccepted
 	l.rows[attemptID] = r
 	if err := l.persistLocked(); err != nil {
-		// Not durable → never written, and fenced in memory only: unknown.
-		r.State = followUpRowRefused
-		r.Reason = followUpReasonLedgerFull
-		return notDurableFence(*r), false
+		// Not durable → never written, and the fence would live in memory
+		// only: keep the stored row unknown too, so a redelivery in this
+		// process is answered uncertain rather than notWritten.
+		return l.markNotDurableLocked(r), false
 	}
 	return *r, true
 }
@@ -394,21 +394,22 @@ func (l *relayFollowUpLedger) Query(attemptID, brokerLedgerID string) relayFollo
 	r := &relayFollowUpRow{AttemptID: attemptID, State: followUpRowRefused, Reason: followUpReasonUnseen, UpdatedAt: l.now().UnixMilli()}
 	l.rows[attemptID] = r
 	if err := l.persistLocked(); err != nil {
-		return notDurableFence(*r)
+		return l.markNotDurableLocked(r)
 	}
 	return *r
 }
 
-// notDurableFence is the answer for a fence that did not reach disk. This
-// process still refuses the id (the row stays in memory), but after a restart
-// the fence is gone and a redelivered envelope could be written. A
-// `notWritten` answer would let the broker resend under a new attempt, and
-// the person would get the message twice. So the answer is `unknown`: the
-// person decides.
-func notDurableFence(r relayFollowUpRow) relayFollowUpRow {
+// markNotDurableLocked downgrades a fence that did not reach disk, in the
+// stored row as well as in the answer. The fence would otherwise live in
+// memory only: after a restart it is gone and a redelivered envelope could be
+// written. A `notWritten` answer would let the broker resend under a new
+// attempt, and the person would get the message twice — so every answer for
+// this id, now and after a redelivery, is `unknown`: the person decides.
+func (l *relayFollowUpLedger) markNotDurableLocked(r *relayFollowUpRow) relayFollowUpRow {
 	r.State = followUpRowUnknown
 	r.Reason = ""
-	return r
+	r.UpdatedAt = l.now().UnixMilli()
+	return *r
 }
 
 // ConfirmAcked deletes exactly the rows the broker confirmed. An accepted
