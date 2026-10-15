@@ -8,9 +8,13 @@
 //   - The wire field `readOnly` is SIGNED (signaturePayload.ReadOnly), so it
 //     can be neither stripped nor injected in transit.
 //   - Only the generic session_start honours it, and only for the BARE
-//     commands `claude` / `codex`. Every other command carrying it is refused
+//     command `claude`. Every other command carrying it is refused
 //     (TERMINAL_READ_ONLY_UNSUPPORTED) before it can run, so a read-only
-//     request never runs writable.
+//     request never runs writable. Read-only also confines READS to the
+//     working directory (SECURITY_REVIEW_PLAN.md B13): Claude Code's
+//     `--restricted` does; Codex has no way to, so a read-only `codex` is
+//     refused on every platform until an OS read jail exists for it, and a
+//     read-only `claude` on Windows until the jail is verified there.
 //   - The CLI's argv is built HERE from a fixed shape. The caller may choose a
 //     model (and Claude's effort level) and nothing else; every other caller
 //     flag is dropped.
@@ -29,10 +33,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/pubsub/v2"
 )
@@ -107,11 +113,20 @@ func readOnlySessionStartRefusal(command string, tty bool, conversationID string
 		return "a read-only session cannot run under a TTY/PTY"
 	case conversationID != "":
 		return "a read-only session cannot resume a conversation; it must start fresh"
-	case command != readOnlyClaudeCommand && command != readOnlyCodexCommand:
-		return "only the bare commands `claude` and `codex` have an enforced read-only mode " +
+	case command == readOnlyCodexCommand:
+		// Its read-only sandbox stops writes and the network, not reads: a
+		// prompt-injected repository could pull any file the computer's user
+		// can read (~/.ssh, a cloud credential) into the transcript.
+		return "read-only Codex sessions are refused: Codex cannot confine its reads to the " +
+			"working directory (no read jail for it yet)"
+	case command != readOnlyClaudeCommand:
+		return "only the bare command `claude` has an enforced read-only mode " +
 			"(no path, launcher suffix, shell wrapper or inline arguments)"
-	case command == readOnlyCodexCommand && readOnlyHostOS == "windows":
-		return "read-only Codex sessions are not supported on Windows (its sandbox is not verified there)"
+	case readOnlyHostOS == "windows":
+		// --restricted's confinement is verified on macOS; Windows paths
+		// (case folding, 8.3 short names, junctions) are not verified yet.
+		return "read-only Claude Code sessions are not supported on Windows yet " +
+			"(its read jail is not verified there)"
 	}
 	return ""
 }
@@ -171,9 +186,17 @@ func refuseReadOnlyCommand(ctx context.Context, topic *pubsub.Publisher, m *pubs
 // writable session (buildClaudeInteractiveArgs), so the prompt still travels
 // on stdin as NDJSON, and:
 //
-//   - --dangerously-skip-permissions stays: the session must never block on a
-//     permission prompt nobody will answer. The tool set below is the
-//     enforcement, not the permission mode.
+//   - --restricted (the READ jail, SECURITY_REVIEW_PLAN.md B13): confines the
+//     file tools to the working directory — the snapshot under review — with
+//     symlinks resolved, so a prompt-injected repository cannot have Read /
+//     Grep / Glob pull ~/.ssh or a cloud credential into the transcript. It
+//     also refuses bypassPermissions, so --dangerously-skip-permissions is
+//     GONE: the default permission mode reads inside the working directory
+//     without asking.
+//   - --permission-prompts none: anything that would still ask (a read
+//     outside the jail) is DENIED at once — the session never blocks on a
+//     prompt nobody will answer. Requires a Claude Code that knows both flags;
+//     checkReadOnlyClaudeJail refuses the start on one that does not.
 //   - --safe-mode: no hooks, plugins, skills, custom agents/commands or
 //     CLAUDE.md — none of the repository's extensions load.
 //   - --strict-mcp-config with no --mcp-config: no MCP server at all.
@@ -194,13 +217,15 @@ func refuseReadOnlyCommand(ctx context.Context, topic *pubsub.Publisher, m *pubs
 //     even if a later --tools named them (the deny list wins).
 //
 // Verified live on Claude Code 2.1.260 with exactly this argv: the init event
-// lists only Glob, Grep and Read, no MCP server, and the turn completes.
+// lists only Glob, Grep and Read, no MCP server, permission mode "default",
+// and a turn reading a file in the working directory completes.
 var readOnlyClaudeBaseArgs = []string{
 	"--output-format", "stream-json",
 	"--input-format", "stream-json",
 	"--verbose",
 	"--include-partial-messages",
-	"--dangerously-skip-permissions",
+	"--restricted",
+	"--permission-prompts", "none",
 	"--safe-mode",
 	"--strict-mcp-config",
 	"--setting-sources", "",
@@ -209,8 +234,12 @@ var readOnlyClaudeBaseArgs = []string{
 }
 
 // readOnlyCodexBaseArgs is Codex's read-only launch shape, ahead of the
-// caller's model and the `-` stdin placeholder (the prompt still travels on
-// stdin, exactly as buildCodexInteractiveArgs sends it):
+// caller's model. UNUSED while the policy refuses read-only Codex (it cannot
+// confine reads); kept, with its tests, for when an OS read jail exists.
+//
+// The shape, ahead of the caller's model and the `-` stdin placeholder (the
+// prompt still travels on stdin, exactly as buildCodexInteractiveArgs sends
+// it):
 //
 //   - --sandbox read-only: the OS sandbox blocks every write and the network;
 //     reads work. Verified live on codex-cli 0.154.0 (macOS).
@@ -501,6 +530,70 @@ func checkReadOnlyExecutable(command, executable, cwd string) error {
 			return &readOnlySessionError{reason: fmt.Sprintf(
 				"`%s` resolved to a file inside the session's working directory; a read-only session never runs a binary from there", command)}
 		}
+	}
+	return nil
+}
+
+/* --------------------------------------------------------------------------
+   The read jail: only a Claude Code that has one
+   -------------------------------------------------------------------------- */
+
+// readOnlyClaudeJailFlags are the flags the read jail rests on
+// (readOnlyClaudeBaseArgs). A Claude Code that does not list both in its
+// --help predates the jail.
+var readOnlyClaudeJailFlags = []string{"--restricted", "--permission-prompts"}
+
+// readOnlyClaudeHelpProbe runs `<executable> --help` and returns its output;
+// ok=false is inconclusive (spawn failure, timeout, non-zero exit). A variable
+// so tests can answer for a CLI without spawning one.
+var readOnlyClaudeHelpProbe = func(executable string, env []string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), cliAgentModelProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "--help")
+	hideWindow(cmd)
+	cmd.Env = env
+	// Never the repository: the executable's own directory is outside it
+	// (checkReadOnlyExecutable).
+	cmd.Dir = filepath.Dir(executable)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// readOnlyClaudeJailCache remembers a verdict per installed binary (path, size
+// and modification time), so the probe runs once per Claude Code install, not
+// once per review — and again after an upgrade replaces the file.
+var readOnlyClaudeJailCache sync.Map // string → bool
+
+// checkReadOnlyClaudeJail refuses a read-only Claude start unless the
+// installed Claude Code has the read jail. Without the check, a Claude Code
+// that predates `--restricted` would exit on an unknown option — still never
+// unjailed, but as an opaque start failure instead of the refusal the job
+// reads (TERMINAL_READ_ONLY_UNSUPPORTED). An inconclusive probe refuses too.
+func checkReadOnlyClaudeJail(executable string, env []string) error {
+	key := ""
+	if info, err := os.Stat(executable); err == nil {
+		key = fmt.Sprintf("%s\x00%d\x00%d", executable, info.Size(), info.ModTime().UnixNano())
+		if ok, cached := readOnlyClaudeJailCache.Load(key); cached && ok.(bool) {
+			return nil
+		}
+	}
+	help, ok := readOnlyClaudeHelpProbe(executable, env)
+	if !ok {
+		return &readOnlySessionError{reason: "could not confirm that this computer's Claude Code confines reads " +
+			"(`claude --help` did not answer)"}
+	}
+	for _, flag := range readOnlyClaudeJailFlags {
+		if !strings.Contains(help, flag) {
+			return &readOnlySessionError{reason: fmt.Sprintf(
+				"this computer's Claude Code has no %s option, so it cannot confine reads to the "+
+					"working directory; update Claude Code", flag)}
+		}
+	}
+	if key != "" {
+		readOnlyClaudeJailCache.Store(key, true)
 	}
 	return nil
 }

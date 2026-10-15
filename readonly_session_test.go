@@ -364,10 +364,15 @@ func TestReadOnlyGate_RefusesWhatHasNoEnforcedMode(t *testing.T) {
 	cases := []refusal{
 		{name: "tty", cmd: ttyStart, reason: "TTY"},
 		{name: "resume", cmd: resume, reason: "resume"},
-		{name: "codex on windows", goos: "windows", cmd: readOnlyStart("codex"), reason: "Windows"},
+		// The read jail is not verified on Windows yet.
+		{name: "claude on windows", goos: "windows", cmd: readOnlyStart("claude", "--model", "opus"), reason: "Windows"},
+	}
+	// Codex cannot confine its reads (B13): refused on every platform.
+	for _, goos := range []string{"darwin", "linux", "windows"} {
+		cases = append(cases, refusal{name: "codex on " + goos, goos: goos, cmd: readOnlyStart("codex", "-m", "gpt-5"), reason: "cannot confine its reads"})
 	}
 	// Every other CLI, shell wrapper, path, launcher suffix, casing,
-	// whitespace or inline argument: only the BARE claude / codex qualify.
+	// whitespace or inline argument: only the BARE claude qualifies.
 	for _, command := range []string{
 		"grok", "opencode", "muse", "agy", "antigravity", "gemini", "claude-edge", "codex-nightly",
 		"bash", "sh", "zsh", "cmd", "cmd.exe", "powershell", "pwsh", "node",
@@ -379,13 +384,13 @@ func TestReadOnlyGate_RefusesWhatHasNoEnforcedMode(t *testing.T) {
 		"claude --model opus", "codex exec",
 		"",
 	} {
-		cases = append(cases, refusal{name: fmt.Sprintf("command %q", command), cmd: readOnlyStart(command), reason: "bare commands"})
+		cases = append(cases, refusal{name: fmt.Sprintf("command %q", command), cmd: readOnlyStart(command), reason: "bare command"})
 	}
 	// Shell-wrapped starts carry the CLI in their args: still refused.
 	cases = append(cases,
-		refusal{name: "bash -c claude", cmd: readOnlyStart("bash", "-c", "claude --model opus"), reason: "bare commands"},
-		refusal{name: "cmd /c claude", cmd: readOnlyStart("cmd", "/c", "claude"), reason: "bare commands"},
-		refusal{name: "powershell codex", cmd: readOnlyStart("powershell", "-Command", "codex exec -"), reason: "bare commands"},
+		refusal{name: "bash -c claude", cmd: readOnlyStart("bash", "-c", "claude --model opus"), reason: "bare command"},
+		refusal{name: "cmd /c claude", cmd: readOnlyStart("cmd", "/c", "claude"), reason: "bare command"},
+		refusal{name: "powershell codex", cmd: readOnlyStart("powershell", "-Command", "codex exec -"), reason: "bare command"},
 	)
 	// Any other command type carrying readOnly — never run writable.
 	for _, typ := range []string{
@@ -451,9 +456,9 @@ func TestReadOnlyGate_LetsSupportedStartsAndWritableCommandsThrough(t *testing.T
 	published := captureReadOnlyPublishes(t)
 	for _, goos := range []string{"linux", "darwin", "windows"} {
 		withReadOnlyHostOS(t, goos)
-		pass := []commandMsg{readOnlyStart("claude", "--model", "opus")}
+		var pass []commandMsg
 		if goos != "windows" {
-			pass = append(pass, readOnlyStart("codex", "-m", "gpt-5"))
+			pass = append(pass, readOnlyStart("claude", "--model", "opus"))
 		}
 		// Without readOnly nothing here is the gate's business.
 		for _, typ := range []string{"", "execute", "session_start", "codex_appserver_start", "session_input"} {
@@ -496,7 +501,7 @@ func TestStartSessionReadOnly_ManagerRefusesWhatHasNoEnforcedMode(t *testing.T) 
 	withReadOnlyHostOS(t, "linux")
 	sm := NewSessionManager(nil)
 	cwd := t.TempDir()
-	for _, command := range []string{"bash", "./codex", "/usr/local/bin/claude", "claude.exe", "Claude", "claude ", "grok", ""} {
+	for _, command := range []string{"codex", "bash", "./codex", "/usr/local/bin/claude", "claude.exe", "Claude", "claude ", "grok", ""} {
 		err := sm.StartSessionReadOnly("ro-refused", command, []string{"--model", "opus"}, cwd, "ws", "uid", 1000, func(resultMsg) {})
 		if readOnlySessionErrorFrom(err) == nil {
 			t.Fatalf("StartSessionReadOnly(%q) = %v, want a read-only refusal", command, err)
@@ -515,8 +520,8 @@ func TestStartSessionReadOnly_ManagerRefusesWhatHasNoEnforcedMode(t *testing.T) 
 	}
 
 	withReadOnlyHostOS(t, "windows")
-	if err := sm.StartSessionReadOnly("ro-codex-win", "codex", nil, cwd, "ws", "uid", 1000, func(resultMsg) {}); readOnlySessionErrorFrom(err) == nil {
-		t.Fatalf("read-only codex on windows = %v, want a refusal", err)
+	if err := sm.StartSessionReadOnly("ro-claude-win", "claude", nil, cwd, "ws", "uid", 1000, func(resultMsg) {}); readOnlySessionErrorFrom(err) == nil {
+		t.Fatalf("read-only claude on windows = %v, want a refusal", err)
 	}
 }
 
@@ -529,7 +534,8 @@ var wantReadOnlyClaudeBase = []string{
 	"--input-format", "stream-json",
 	"--verbose",
 	"--include-partial-messages",
-	"--dangerously-skip-permissions",
+	"--restricted",
+	"--permission-prompts", "none",
 	"--safe-mode",
 	"--strict-mcp-config",
 	"--setting-sources", "",
@@ -954,6 +960,8 @@ func TestCheckReadOnlyExecutable_SeesThroughSymlinksAndCase(t *testing.T) {
 const (
 	readOnlyRecordMockMode = "readonly-record"
 	readOnlyRecordEnv      = "TEST_READONLY_RECORD"
+	// Set: the mock's --help lists no read jail (a Claude Code predating it).
+	readOnlyMockNoJailEnv = "TEST_READONLY_NO_JAIL"
 )
 
 // readOnlyRecord is what the recording mock saw.
@@ -972,6 +980,15 @@ type readOnlyRecord struct {
 // background `auth status` / `--version` probe — exits quietly unrecorded.
 func runReadOnlyRecordMock() {
 	args := os.Args[1:]
+	if len(args) == 1 && args[0] == "--help" {
+		// checkReadOnlyClaudeJail's probe: a Claude Code with the read jail,
+		// unless the test asks for one that predates it.
+		if os.Getenv(readOnlyMockNoJailEnv) == "" {
+			fmt.Println("  --permission-prompts <target>  Who answers permission prompts")
+			fmt.Println("  --restricted                   Restricted mode")
+		}
+		os.Exit(0)
+	}
 	claudeStream := mockHasArg(args, "--output-format")
 	codexExec := len(args) > 0 && args[0] == "exec"
 	if !claudeStream && !codexExec {
@@ -1088,7 +1105,6 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 		args      []string
 		wantArgs  []string
 		wantStdin string
-		skipOnWin bool
 	}{
 		{
 			command:   "claude",
@@ -1096,20 +1112,11 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 			wantArgs:  concatArgs(wantReadOnlyClaudeBase, []string{"--model", "opus"}),
 			wantStdin: `"content":"Review the diff"`,
 		},
-		{
-			command:   "codex",
-			args:      []string{"--dangerously-bypass-approvals-and-sandbox", "-c", "sandbox_mode=x", "-m", "gpt-5", "Review the diff"},
-			wantArgs:  concatArgs(wantReadOnlyCodexBase, []string{"-m", "gpt-5", "-"}),
-			wantStdin: "Review the diff",
-			skipOnWin: true,
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.command, func(t *testing.T) {
-			if tc.skipOnWin && runtime.GOOS == "windows" {
-				t.Skip("read-only Codex is refused on Windows")
-			}
-			withReadOnlyHostOS(t, runtime.GOOS)
+			// The jail's verified platform: the mechanics below run on every host.
+			withReadOnlyHostOS(t, "darwin")
 			// newMockClaudeDir, not t.TempDir: a background `auth status`
 			// probe can still hold a mock .exe open on Windows at cleanup.
 			pathDir := newMockClaudeDir(t)
@@ -1202,14 +1209,13 @@ func TestStartSessionReadOnly_SpawnsTheFixedShapeFromPATHNotCwd(t *testing.T) {
 // anything spawns.
 func TestStartSessionReadOnly_RefusesAPATHThatLeadsIntoCwd(t *testing.T) {
 	skipIfUnsupportedOS(t)
-	commands := []string{"claude"}
-	if runtime.GOOS != "windows" {
-		commands = append(commands, "codex")
-	}
-	for _, command := range commands {
+	// Only Claude reaches the executable check: read-only Codex is refused
+	// by policy first.
+	for _, command := range []string{"claude"} {
 		for _, layout := range []string{"absolute entry is cwd", "absolute entry inside cwd", "relative entry dot"} {
 			t.Run(command+"/"+layout, func(t *testing.T) {
-				withReadOnlyHostOS(t, runtime.GOOS)
+				// The jail's verified platform: the mechanics below run on every host.
+				withReadOnlyHostOS(t, "darwin")
 				root := resolvedTempDir(t)
 				cwd := filepath.Join(root, "snapshot")
 				record := filepath.Join(root, "record.jsonl")
@@ -1401,13 +1407,13 @@ func TestStartSessionReadOnly_RefusesCLIStateInsideCwd(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		homeVar = "USERPROFILE"
 	}
+	// Codex's CODEX_HOME rule is covered by the unit test above; a read-only
+	// Codex start is refused by policy before it gets here.
 	cases := []struct{ command, stateVar, sub string }{{"claude", homeVar, "home"}}
-	if runtime.GOOS != "windows" {
-		cases = append(cases, struct{ command, stateVar, sub string }{"codex", "CODEX_HOME", ".codex"})
-	}
 	for _, tc := range cases {
 		t.Run(tc.command, func(t *testing.T) {
-			withReadOnlyHostOS(t, runtime.GOOS)
+			// The jail's verified platform: the mechanics below run on every host.
+			withReadOnlyHostOS(t, "darwin")
 			pathDir := newMockClaudeDir(t)
 			cwd := newMockClaudeDir(t)
 			installReadOnlyMock(t, pathDir, tc.command)
@@ -1434,5 +1440,116 @@ func TestStartSessionReadOnly_RefusesCLIStateInsideCwd(t *testing.T) {
 				t.Fatalf("the CLI spawned %d times despite its state directory inside the checkout", len(recs))
 			}
 		})
+	}
+}
+
+/* --------------------------------------------------------------------------
+   8. The read jail: only a Claude Code that has one (B13)
+   -------------------------------------------------------------------------- */
+
+func clearReadOnlyClaudeJailCache(t *testing.T) {
+	t.Helper()
+	clear := func() {
+		readOnlyClaudeJailCache.Range(func(k, _ any) bool {
+			readOnlyClaudeJailCache.Delete(k)
+			return true
+		})
+	}
+	clear()
+	t.Cleanup(clear)
+}
+
+func withReadOnlyClaudeHelp(t *testing.T, help string, ok bool) *int {
+	t.Helper()
+	calls := 0
+	prev := readOnlyClaudeHelpProbe
+	readOnlyClaudeHelpProbe = func(string, []string) (string, bool) {
+		calls++
+		return help, ok
+	}
+	t.Cleanup(func() { readOnlyClaudeHelpProbe = prev })
+	return &calls
+}
+
+func TestCheckReadOnlyClaudeJail(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(exe, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jailed := "  --permission-prompts <target>  Who answers\n  --restricted  Restricted mode\n"
+
+	t.Run("a Claude Code with both flags is accepted, once per install", func(t *testing.T) {
+		clearReadOnlyClaudeJailCache(t)
+		calls := withReadOnlyClaudeHelp(t, jailed, true)
+		for i := 0; i < 3; i++ {
+			if err := checkReadOnlyClaudeJail(exe, nil); err != nil {
+				t.Fatalf("checkReadOnlyClaudeJail = %v, want nil", err)
+			}
+		}
+		if *calls != 1 {
+			t.Fatalf("probed %d times, want once (cached per install)", *calls)
+		}
+		// An upgrade replaces the file: probed again.
+		later := time.Now().Add(time.Minute)
+		if err := os.WriteFile(exe, []byte("v2-longer"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Chtimes(exe, later, later)
+		if err := checkReadOnlyClaudeJail(exe, nil); err != nil || *calls != 2 {
+			t.Fatalf("after an upgrade: err=%v probes=%d, want nil / 2", err, *calls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name, help, want string
+		ok               bool
+	}{
+		{"no --restricted", "  --permission-prompts <target>\n", "--restricted", true},
+		{"no --permission-prompts", "  --restricted  Restricted mode\n", "--permission-prompts", true},
+		{"an older Claude Code", "  --dangerously-skip-permissions\n", "--restricted", true},
+		{"the probe failed", "", "did not answer", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearReadOnlyClaudeJailCache(t)
+			calls := withReadOnlyClaudeHelp(t, tc.help, tc.ok)
+			for i := 0; i < 2; i++ {
+				err := checkReadOnlyClaudeJail(exe, nil)
+				roErr := readOnlySessionErrorFrom(err)
+				if roErr == nil || !strings.Contains(roErr.reason, tc.want) {
+					t.Fatalf("checkReadOnlyClaudeJail = %v, want a read-only refusal naming %q", err, tc.want)
+				}
+			}
+			// A refusal is never cached: an install fixed in place is seen next time.
+			if *calls != 2 {
+				t.Fatalf("probed %d times, want 2 (refusals are not cached)", *calls)
+			}
+		})
+	}
+}
+
+// End to end: a Claude Code whose --help lists no read jail is refused before
+// the session spawns — never run without it.
+func TestStartSessionReadOnly_RefusesAClaudeWithoutTheReadJail(t *testing.T) {
+	withReadOnlyHostOS(t, "darwin")
+	skipIfUnsupportedOS(t)
+	clearReadOnlyClaudeJailCache(t)
+	pathDir := newMockClaudeDir(t)
+	cwd := newMockClaudeDir(t)
+	installReadOnlyMock(t, pathDir, "claude")
+	record := filepath.Join(t.TempDir(), "record.jsonl")
+	readOnlyMockEnv(t, record, pathDir)
+	t.Setenv(readOnlyMockNoJailEnv, "1")
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSessionReadOnly("ro-nojail", "claude", []string{"Review"}, cwd, "ws", "uid", 30000, func(resultMsg) {})
+	roErr := readOnlySessionErrorFrom(err)
+	if roErr == nil || !strings.Contains(roErr.reason, "--restricted") {
+		t.Fatalf("StartSessionReadOnly = %v, want a refusal naming --restricted", err)
+	}
+	if sm.GetSession("ro-nojail") != nil {
+		t.Fatal("a refused start registered a session")
+	}
+	if recs := readReadOnlyRecords(t, record); len(recs) != 0 {
+		t.Fatalf("the CLI spawned %d times, want none", len(recs))
 	}
 }

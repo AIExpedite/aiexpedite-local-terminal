@@ -670,6 +670,13 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		if err := checkReadOnlyStateDir(command, filtered, workDir); err != nil {
 			return err
 		}
+		// Reads are jailed to the working directory: only by a Claude Code
+		// that has the jail.
+		if command == readOnlyClaudeCommand {
+			if err := checkReadOnlyClaudeJail(executable, filtered); err != nil {
+				return err
+			}
+		}
 	}
 	proc.Env = filtered
 	if grokMaintenanceSmoke {
