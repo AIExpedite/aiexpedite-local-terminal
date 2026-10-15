@@ -1138,3 +1138,152 @@ func TestTheCapNeverEvictsALiveFollowUpRefusalFence(t *testing.T) {
 		t.Fatalf("a refusal with no durable slot was recorded anyway")
 	}
 }
+
+// TestTheCapNeverEvictsAnUnconfirmedAcceptedFollowUpTurn pins the other row
+// the follow-up contract needs: an accepted `fu_…` turn inside its signed
+// deadline. Its ack can still be in flight, and without the row a redelivery
+// either re-runs the message or is answered notWritten once the session is
+// gone, so the broker queues a replacement for a message the CLI already has.
+func TestTheCapNeverEvictsAnUnconfirmedAcceptedFollowUpTurn(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	now := time.Now()
+	inbox.now = func() time.Time { return now }
+	// Accept a queued follow-up turn, then fill the inbox to its cap with
+	// ordinary accepted rows the cap may take.
+	fu := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: now.UnixMilli()}
+	if handled, _, dispatched := runFencedTestTurn(inbox, fu, "fu_a1", func(ctx context.Context) {
+		if err := acceptRelayDelivery(relayTurnAcceptor(ctx)); err != nil {
+			t.Fatalf("accept: %v", err)
+		}
+	}); !handled || !dispatched {
+		t.Fatalf("the follow-up turn was not dispatched: handled=%v dispatched=%v", handled, dispatched)
+	}
+	inbox.mu.Lock()
+	for i := 0; i < relayTurnInboxMaxRows; i++ {
+		key := relayTurnKey{"s-fill", fmt.Sprintf("t%d", i)}
+		inbox.rows[key] = &relayTurnRow{SessionID: key.SessionID, TurnID: key.TurnID,
+			State: relayTurnStateAccepted, UpdatedAt: now.UnixMilli()}
+	}
+	inbox.mu.Unlock()
+	ordinary := commandMsg{ID: relayTurnEnvelopePrefix + "t-new", SessionID: "s1", Ts: now.UnixMilli()}
+	if _, _, dispatched := runFencedTestTurn(inbox, ordinary, "t-new", nil); !dispatched {
+		t.Fatalf("a fresh turn was not dispatched at the cap")
+	}
+	r, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]
+	if !ok || r.State != relayTurnStateAccepted {
+		t.Fatalf("the unconfirmed accepted follow-up row was evicted at the cap: %+v", r)
+	}
+	// A redelivery still re-acks instead of running the message again.
+	if handled, _, dispatched := runFencedTestTurn(inbox, fu, "fu_a1", nil); !handled || dispatched {
+		t.Fatalf("redelivery: handled=%v dispatched=%v", handled, dispatched)
+	}
+	// Past its signed deadline the row is no longer protected: the broker has
+	// long since settled the attempt, so the cap may reclaim the slot.
+	if capProtectedLocked(&r, now.Add(followUpAttemptWindow+followUpSkewMargin+time.Minute).UnixMilli()) {
+		t.Fatalf("an accepted follow-up row stayed protected past its deadline")
+	}
+	// An ordinary accepted turn is never protected.
+	plain := relayTurnRow{SessionID: "s1", TurnID: "t1", State: relayTurnStateAccepted}
+	if capProtectedLocked(&plain, now.UnixMilli()) {
+		t.Fatalf("an ordinary accepted turn was protected from the cap")
+	}
+}
+
+// TestAClaimWithNoDurableSlotIsHandedBack pins the cap on the claim path. With
+// every row in flight or protected, a new delivery cannot be recorded; it is
+// handed back to Pub/Sub (as for a non-owner) rather than claimed in a file
+// that would then grow past its cap and lose the claim across a restart.
+func TestAClaimWithNoDurableSlotIsHandedBack(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	now := time.Now()
+	inbox.now = func() time.Time { return now }
+	if inbox.snapshot() == nil {
+		t.Fatalf("the test inbox was not taken")
+	}
+	inbox.mu.Lock()
+	for i := 0; i < relayTurnInboxMaxRows; i++ {
+		key := relayTurnKey{"s-fenced", fmt.Sprintf("fu_t%d", i)}
+		inbox.rows[key] = &relayTurnRow{SessionID: key.SessionID, TurnID: key.TurnID,
+			State: relayTurnStateRefused, Reason: followUpReasonExpired, UpdatedAt: now.UnixMilli(),
+			FenceUntil: now.Add(time.Hour).UnixMilli()}
+	}
+	inbox.mu.Unlock()
+	fresh := commandMsg{ID: relayTurnEnvelopePrefix + "t-new", SessionID: "s1", Ts: now.UnixMilli()}
+	decision, _, _ := inbox.BeginFenced(fresh, "t-new", "agent-1", nil)
+	if decision != relayTurnNoSlot {
+		t.Fatalf("decision at a full inbox: %v, want relayTurnNoSlot", decision)
+	}
+	if _, ok := inbox.snapshot()[relayTurnKey{"s1", "t-new"}]; ok {
+		t.Fatalf("a claim with no durable slot was recorded anyway")
+	}
+	if got := len(inbox.snapshot()); got > relayTurnInboxMaxRows {
+		t.Fatalf("the inbox grew past its cap: %d rows", got)
+	}
+	// The dispatcher hands the delivery back and never runs or answers it.
+	handled, refusal, dispatched := runFencedTestTurn(inbox, fresh, "t-new", nil)
+	if handled || refusal != "" || dispatched {
+		t.Fatalf("no slot: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	// Once a fence lapses, the same delivery claims normally.
+	inbox.now = func() time.Time { return now.Add(2 * time.Hour) }
+	if d, _, _ := inbox.BeginFenced(fresh, "t-new", "agent-1", nil); d != relayTurnRun {
+		t.Fatalf("decision after the fences lapsed: %v, want relayTurnRun", d)
+	}
+	inbox.Finish("s1", "t-new")
+}
+
+// TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheLedger pins the
+// non-owner's report. An empty `ledgerId` would make the broker send live
+// attempts the real owner answers `unknown`; omitting the capability makes it
+// queue instead, and the capability is republished once ownership lands.
+func TestTheCapabilityIsOmittedWhenAnotherProcessOwnsTheLedger(t *testing.T) {
+	ledger := newRelayFollowUpLedger(func() string { return filepath.Join(t.TempDir(), relayFollowUpLedgerFileName) })
+	t.Cleanup(ledger.release)
+	owned := ledger.acquireOwnership
+	ledger.acquireOwnership = func() *os.File { return nil }
+	if cap := newRelayFollowUpsCapabilityFor(ledger); cap != nil {
+		t.Fatalf("a non-owner advertised the capability: %+v", cap)
+	}
+	ledger.acquireOwnership = owned
+	cap := newRelayFollowUpsCapabilityFor(ledger)
+	if cap == nil || cap.LedgerID == "" || !cap.AttemptExpiry || cap.LiveAgents == nil {
+		t.Fatalf("the owner's capability: %+v", cap)
+	}
+}
+
+// TestOwnershipArrivingLaterRepublishesTheCapability pins the republish: a
+// gather that ran while another process owned the ledger must not leave the
+// device advertised as follow-up-less until the next 6h gather.
+func TestOwnershipArrivingLaterRepublishesTheCapability(t *testing.T) {
+	published := 0
+	prevHook := onMachineInfoStored
+	onMachineInfoStored = func() { published++ }
+	t.Cleanup(func() { onMachineInfoStored = prevHook })
+
+	machineInfoMu.Lock()
+	prevCache := machineInfoCache
+	machineInfoCache = &MachineInfo{Capabilities: &capabilitiesInfo{RelayTurnInbox: true}}
+	machineInfoMu.Unlock()
+	t.Cleanup(func() {
+		machineInfoMu.Lock()
+		machineInfoCache = prevCache
+		machineInfoMu.Unlock()
+	})
+
+	if !republishRelayFollowUpCapability() {
+		t.Skipf("this process cannot own the real follow-up ledger")
+	}
+	machineInfoMu.RLock()
+	caps := machineInfoCache.Capabilities.RelayFollowUps
+	machineInfoMu.RUnlock()
+	if caps == nil || caps.LedgerID == "" {
+		t.Fatalf("the capability was not republished: %+v", caps)
+	}
+	if published != 1 {
+		t.Fatalf("the post-store hook ran %d times, want 1", published)
+	}
+	// Idempotent: an already-advertised capability republishes nothing.
+	if !republishRelayFollowUpCapability() || published != 1 {
+		t.Fatalf("a second republish fired the hook again (%d)", published)
+	}
+}

@@ -195,6 +195,14 @@ const (
 	// relayTurnRefused: the turn's fence (BeginFenced) refused a turn that was
 	// neither accepted nor in flight; it was not claimed and must never run.
 	relayTurnRefused
+	// relayTurnNoSlot: the inbox is at its cap and every row in it must be
+	// kept (in flight, a live refusal fence, or an unconfirmed accepted
+	// follow-up), so this delivery cannot be claimed durably — hand it back
+	// (Nack) untouched, exactly as for a claim whose write fails. A
+	// redelivery lands once a watermark, a fence lapsing or the TTL frees a
+	// slot. Claiming without a durable row would let the file grow past the
+	// cap and lose the claim across a restart.
+	relayTurnNoSlot
 )
 
 type relayTurnInbox struct {
@@ -375,14 +383,16 @@ func (b *relayTurnInbox) pruneExpiredLocked() bool {
 // evictForCapLocked makes room for one more row: claimed rows first (a
 // claimed row that is not in flight holds a turn that never started, so
 // losing it can at worst let a redelivery run it — once), then the oldest
-// accepted rows. A refusal still inside its fence is never a victim
-// (fencingLocked), so the cap can leave no room at all.
+// accepted rows. A row the follow-up contract still needs is never a victim
+// (capProtectedLocked), so the cap can leave no room at all; every caller
+// must handle that (BeginFenced hands the delivery back, recordRefusalLocked
+// answers nothing).
 func (b *relayTurnInbox) evictForCapLocked() {
 	now := b.now().UnixMilli()
 	for len(b.rows) >= relayTurnInboxMaxRows {
 		var victim *relayTurnRow
 		for k, r := range b.rows {
-			if b.inFlight[k] || fencingLocked(r, now) {
+			if b.inFlight[k] || capProtectedLocked(r, now) {
 				continue
 			}
 			if victim == nil ||
@@ -408,6 +418,33 @@ func (b *relayTurnInbox) evictForCapLocked() {
 // it. It lapses with its signed deadline (pruneExpiredLocked) or the TTL.
 func fencingLocked(r *relayTurnRow, nowMs int64) bool {
 	if r.State != relayTurnStateRefused {
+		return false
+	}
+	return r.FenceUntil <= 0 || nowMs <= r.FenceUntil
+}
+
+// capProtectedLocked reports whether the cap must leave a row alone. Two
+// kinds of row answer a later copy of their turn, so dropping one to make
+// space would let that copy be run or refused a second time:
+//
+//   - a refusal still inside its fence (fencingLocked);
+//   - an ACCEPTED follow-up turn (`fu_…`) whose signed deadline has not
+//     passed. Its ack can still be in flight (the broker only deletes a row
+//     through the watermark, and ReleaseSession keeps this row for the same
+//     reason): without it, a redelivery either re-runs a message the CLI
+//     already has, or — once the session is gone — is answered
+//     notWritten/sessionNotRunning, and the broker queues a replacement for a
+//     message that was in fact written.
+//
+// Both lapse on their own: by the signed deadline (pruneExpiredLocked, which
+// also makes the row evictable here) or by relayTurnInboxTTL. An ordinary
+// relay turn is never protected — a redelivery of one is never requeued as a
+// different message.
+func capProtectedLocked(r *relayTurnRow, nowMs int64) bool {
+	if fencingLocked(r, nowMs) {
+		return true
+	}
+	if r.State != relayTurnStateAccepted || !strings.HasPrefix(r.TurnID, relayFollowUpTurnPrefix) {
 		return false
 	}
 	return r.FenceUntil <= 0 || nowMs <= r.FenceUntil
@@ -478,6 +515,18 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 	r := b.rows[key]
 	if r == nil {
 		b.evictForCapLocked()
+		if len(b.rows) >= relayTurnInboxMaxRows {
+			// No durable slot: every row is in flight or one the follow-up
+			// contract still needs (capProtectedLocked). Claiming anyway
+			// would push the file past its cap, so hand the delivery back
+			// instead; nothing is claimed, acked or run.
+			fmt.Printf("%s[relay-inbox] Inbox full of rows that must be kept — handing turn %s on %s back%s\n",
+				colorYellow, turnID, cmd.SessionID, colorReset)
+			if changed {
+				_ = b.persistLocked()
+			}
+			return relayTurnNoSlot, relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID}, ""
+		}
 		r = &relayTurnRow{SessionID: cmd.SessionID, TurnID: turnID, ClaimedAt: now}
 		b.rows[key] = r
 	}
@@ -868,6 +917,13 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 		return true
 	case relayTurnNotOwner:
 		fmt.Printf("%s[relay-inbox] Another agent process owns the relay turn inbox — handing turn %s on %s back%s\n",
+			colorYellow, turnID, cmd.SessionID, colorReset)
+		return false
+	case relayTurnNoSlot:
+		// The inbox could not record this claim durably (every row must be
+		// kept). Same answer as a non-owner: back to Pub/Sub, which retries
+		// once a watermark, a lapsing fence or the TTL frees a slot.
+		fmt.Printf("%s[relay-inbox] No durable inbox slot for turn %s on %s — handing it back%s\n",
 			colorYellow, turnID, cmd.SessionID, colorReset)
 		return false
 	case relayTurnReack:
