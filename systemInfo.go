@@ -136,6 +136,32 @@ type capabilitiesInfo struct {
 	// sends `readOnly` only when this is true — an older agent would reject
 	// the unknown signed field as a bad signature.
 	ReadOnlySessions bool `json:"readOnlySessions"`
+	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
+	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,
+	// a fenced attempt id is refused forever, and `relay_follow_up_query`
+	// answers from the ledger. `liveAgents` lists only CLIs certified for live
+	// follow-ups (empty until a certification run passes).
+	RelayFollowUps *relayFollowUpsCapability `json:"relayFollowUps,omitempty"`
+}
+
+type relayFollowUpsCapability struct {
+	LiveAgents    []string `json:"liveAgents"`
+	AttemptExpiry bool     `json:"attemptExpiry"`
+	LedgerID      string   `json:"ledgerId"`
+}
+
+// newRelayFollowUpsCapability reports the ledger and the certified live
+// agents. An empty list (never null) means every follow-up is queued.
+func newRelayFollowUpsCapability() *relayFollowUpsCapability {
+	live := make([]string, 0, len(liveFollowUpCertified))
+	for id := range liveFollowUpCertified {
+		live = append(live, id)
+	}
+	return &relayFollowUpsCapability{
+		LiveAgents:    live,
+		AttemptExpiry: true,
+		LedgerID:      globalRelayFollowUpLedger.LedgerID(),
+	}
 }
 
 // newMachineCapabilities returns the capabilities every build of this agent
@@ -143,6 +169,7 @@ type capabilitiesInfo struct {
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
 		RelayTurnInbox:         true,
+		RelayFollowUps:         newRelayFollowUpsCapability(),
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
 		ReadOnlySessions:       true,

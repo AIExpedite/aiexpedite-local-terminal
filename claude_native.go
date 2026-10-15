@@ -118,6 +118,10 @@ type ClaudeNativeSession struct {
 	// "the child died mid-turn" (nothing has probed for the quota it just spent).
 	// Atomic because the stdout scanner writes it and waitForExit reads it.
 	turnSettled atomic.Bool
+	// pendingApprovals counts can_use_tool control_requests read and not yet
+	// answered: a live follow-up is never written while one is open (it would
+	// sit beside an approval a person must answer first).
+	pendingApprovals atomic.Int32
 	// killUnconfirmed marks a session whose End escalated to Kill and then
 	// timed out waiting for the exit watcher. The session is RETAINED as a
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
@@ -472,6 +476,10 @@ func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
 	case err := <-writeDone:
 		if err != nil {
 			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
+		}
+		// The person answered one open approval.
+		if session.pendingApprovals.Load() > 0 {
+			session.pendingApprovals.Add(-1)
 		}
 		return nil
 	case <-time.After(claudeNativeStdinWriteBudget):
@@ -885,8 +893,13 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			// detectResultEvent is the same terminal-frame decision session.go
 			// makes for the managed path — one definition, so the two execution
 			// paths can never disagree about what "the run finished" means.
+			if strings.Contains(trimmed, `"control_request"`) && strings.Contains(trimmed, `"can_use_tool"`) {
+				session.pendingApprovals.Add(1)
+			}
 			if detectResultEvent("claude", trimmed) {
 				session.turnSettled.Store(true)
+				// A finished turn has no approval left open.
+				session.pendingApprovals.Store(0)
 				triggerClaudeUsageProbeAfterRun()
 			}
 		}

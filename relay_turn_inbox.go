@@ -589,6 +589,13 @@ func acceptRelayDelivery(accept func() error) error {
 	return accept()
 }
 
+// relayTurnAlreadyAccepted reports whether a turn was accepted earlier (this
+// boot or a previous one): such a turn is re-acked, never refused late.
+func relayTurnAlreadyAccepted(b *relayTurnInbox, sessionID, turnID string) bool {
+	r, ok := b.snapshot()[relayTurnKey{sessionID, turnID}]
+	return ok && r.State == relayTurnStateAccepted
+}
+
 // relayTurnAckFrame is the result frame the broker's results subscriber reads:
 // `{ type: "relay_turn_ack", sessionID, relayTurnId, workspaceID, agentId }`.
 func relayTurnAckFrame(r relayTurnRow) resultMsg {

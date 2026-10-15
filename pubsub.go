@@ -702,6 +702,17 @@ type commandMsg struct {
 	// relayAckWatermarkMax entries refuses the whole command.
 	AckedTurnIds []string `json:"ackedTurnIds,omitempty"`
 
+	// Follow-ups (relay_follow_up_ledger.go). UNSIGNED metadata: a queued
+	// follow-up turn's expiry on a relay SEND, and a live attempt's ids and
+	// expiry. Both expiries are bounded by the signed `ts`, so editing them
+	// cannot extend an attempt; the text rides in the signed `input` and the
+	// attempt id in the signed envelope id.
+	FollowUpExpiresAt        int64  `json:"followUpExpiresAt,omitempty"`
+	FollowUpAttemptID        string `json:"attemptId,omitempty"`
+	FollowUpID               string `json:"followUpId,omitempty"`
+	FollowUpAttemptExpiresAt int64  `json:"expiresAt,omitempty"`
+	FollowUpLedgerID         string `json:"ledgerId,omitempty"`
+
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
 	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
 	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
@@ -859,6 +870,16 @@ type resultMsg struct {
 	// RelayTurnID is the relay turn a `relay_turn_ack` frame acknowledges
 	// (relay_turn_inbox.go). Set on that frame type only.
 	RelayTurnID string `json:"relayTurnId,omitempty"`
+
+	// Follow-up answers (relay_follow_up_ledger.go): one attempt's durable
+	// outcome on `relay_follow_up_ack`, and a refused queued follow-up turn's
+	// outcome on `relay_turn_ack`. Never the follow-up text.
+	FollowUpAttemptID   string `json:"attemptId,omitempty"`
+	FollowUpID          string `json:"followUpId,omitempty"`
+	FollowUpOutcome     string `json:"outcome,omitempty"`
+	FollowUpReason      string `json:"reason,omitempty"`
+	FollowUpProcessedIn string `json:"processedIn,omitempty"`
+	FollowUpLedgerID    string `json:"ledgerId,omitempty"`
 }
 
 /*
@@ -6532,10 +6553,26 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 // agent process owns the turn inbox, so the caller Nacks and Pub/Sub
 // redelivers to the owner.
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) bool {
+	// A live follow-up attempt or a reconciliation query: answered from the
+	// durable follow-up ledger, never routed to a kind's SEND.
+	if cmd.Type == relayFollowUpCommandType || cmd.Type == relayFollowUpQueryCommandType {
+		handleRelayFollowUpCommand(ctx, topic, cmd, cfg)
+		return true
+	}
 	if turnID, ok := relayTurnIDFromEnvelope(cmd.ID); ok && cmd.SessionID != "" {
 		agentID := cmd.AgentID
 		if agentID == "" && cfg != nil {
 			agentID = cfg.AgentID
+		}
+		// A queued follow-up turn past its expiry never starts (unless it was
+		// accepted earlier: then the inbox re-acks it below as usual).
+		if followUpTurnExpired(cmd, turnID, time.Now()) && !relayTurnAlreadyAccepted(globalRelayTurnInbox, cmd.SessionID, turnID) {
+			pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID)); err != nil {
+				logSession(cmd.SessionID, "%s[follow-up] Failed to publish an expired turn's refusal: %v%s\n", colorRed, err, colorReset)
+			}
+			return true
 		}
 		return runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
 			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
