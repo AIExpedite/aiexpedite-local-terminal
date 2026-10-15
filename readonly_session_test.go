@@ -980,10 +980,16 @@ type readOnlyRecord struct {
 // background `auth status` / `--version` probe — exits quietly unrecorded.
 func runReadOnlyRecordMock() {
 	args := os.Args[1:]
-	if len(args) == 1 && args[0] == "--help" {
-		// checkReadOnlyClaudeJail's probe: a Claude Code with the read jail,
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "--version") {
+		// checkReadOnlyClaudeJail's probes: a Claude Code with the read jail,
 		// unless the test asks for one that predates it.
-		if os.Getenv(readOnlyMockNoJailEnv) == "" {
+		noJail := os.Getenv(readOnlyMockNoJailEnv) != ""
+		switch {
+		case args[0] == "--version" && noJail:
+			fmt.Println("2.1.200 (Claude Code)")
+		case args[0] == "--version":
+			fmt.Println("2.1.301 (Claude Code)")
+		case !noJail:
 			fmt.Println("  --permission-prompts <target>  Who answers permission prompts")
 			fmt.Println("  --restricted                   Restricted mode")
 		}
@@ -1459,16 +1465,43 @@ func clearReadOnlyClaudeJailCache(t *testing.T) {
 	t.Cleanup(clear)
 }
 
-func withReadOnlyClaudeHelp(t *testing.T, help string, ok bool) *int {
+// withReadOnlyClaudeProbe answers the jail probes: `--version` with version,
+// `--help` with help (ok for both). Returns the number of probes run.
+func withReadOnlyClaudeProbe(t *testing.T, version, help string, ok bool) *int {
 	t.Helper()
 	calls := 0
-	prev := readOnlyClaudeHelpProbe
-	readOnlyClaudeHelpProbe = func(string, []string) (string, bool) {
+	prev := readOnlyClaudeProbe
+	readOnlyClaudeProbe = func(_ string, _ []string, arg string) (string, bool) {
 		calls++
+		if arg == "--version" {
+			return version, ok
+		}
 		return help, ok
 	}
-	t.Cleanup(func() { readOnlyClaudeHelpProbe = prev })
+	t.Cleanup(func() { readOnlyClaudeProbe = prev })
 	return &calls
+}
+
+const jailedClaudeHelp = "  --permission-prompts <target>  Who answers\n  --restricted  Restricted mode\n"
+
+func TestReadOnlyClaudeVersionOK(t *testing.T) {
+	for out, want := range map[string]bool{
+		"2.1.295 (Claude Code)\n": true,
+		"2.1.301 (Claude Code)":   true,
+		"2.2.0":                   true,
+		"3.0.0 (Claude Code)":     true,
+		"2.1.294 (Claude Code)":   false,
+		"2.1.290 (Claude Code)":   false,
+		"2.1.260 (Claude Code)":   false,
+		"1.9.999":                 false,
+		"Claude Code 2.1.300":     false, // not the shape --version prints
+		"":                        false,
+		"2.1":                     false,
+	} {
+		if got := readOnlyClaudeVersionOK(out); got != want {
+			t.Errorf("readOnlyClaudeVersionOK(%q) = %v, want %v", out, got, want)
+		}
+	}
 }
 
 func TestCheckReadOnlyClaudeJail(t *testing.T) {
@@ -1476,42 +1509,49 @@ func TestCheckReadOnlyClaudeJail(t *testing.T) {
 	if err := os.WriteFile(exe, []byte("v1"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	jailed := "  --permission-prompts <target>  Who answers\n  --restricted  Restricted mode\n"
 
-	t.Run("a Claude Code with both flags is accepted, once per install", func(t *testing.T) {
+	t.Run("a release with the jail is accepted, probed once per install", func(t *testing.T) {
 		clearReadOnlyClaudeJailCache(t)
-		calls := withReadOnlyClaudeHelp(t, jailed, true)
+		calls := withReadOnlyClaudeProbe(t, "2.1.301 (Claude Code)", jailedClaudeHelp, true)
 		for i := 0; i < 3; i++ {
 			if err := checkReadOnlyClaudeJail(exe, nil); err != nil {
 				t.Fatalf("checkReadOnlyClaudeJail = %v, want nil", err)
 			}
 		}
-		if *calls != 1 {
-			t.Fatalf("probed %d times, want once (cached per install)", *calls)
+		if *calls != 2 {
+			t.Fatalf("probed %d times, want 2 (--version and --help, then cached)", *calls)
 		}
-		// An upgrade replaces the file: probed again.
+		if err := checkReadOnlyClaudeJailCached(exe); err != nil {
+			t.Fatalf("the cached verdict = %v, want nil", err)
+		}
+		// An upgrade replaces the file: no verdict until it is probed again.
 		later := time.Now().Add(time.Minute)
 		if err := os.WriteFile(exe, []byte("v2-longer"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		_ = os.Chtimes(exe, later, later)
-		if err := checkReadOnlyClaudeJail(exe, nil); err != nil || *calls != 2 {
-			t.Fatalf("after an upgrade: err=%v probes=%d, want nil / 2", err, *calls)
+		if readOnlySessionErrorFrom(checkReadOnlyClaudeJailCached(exe)) == nil {
+			t.Fatal("a replaced binary kept the old verdict")
+		}
+		if err := checkReadOnlyClaudeJail(exe, nil); err != nil || *calls != 4 {
+			t.Fatalf("after an upgrade: err=%v probes=%d, want nil / 4", err, *calls)
 		}
 	})
 
 	for _, tc := range []struct {
-		name, help, want string
-		ok               bool
+		name, version, help, want string
+		ok                        bool
 	}{
-		{"no --restricted", "  --permission-prompts <target>\n", "--restricted", true},
-		{"no --permission-prompts", "  --restricted  Restricted mode\n", "--permission-prompts", true},
-		{"an older Claude Code", "  --dangerously-skip-permissions\n", "--restricted", true},
-		{"the probe failed", "", "did not answer", false},
+		{"a release before the escapes were fixed", "2.1.290 (Claude Code)", jailedClaudeHelp, "older than 2.1.295", true},
+		{"a release before the jail", "2.1.200 (Claude Code)", "  --dangerously-skip-permissions\n", "older than 2.1.295", true},
+		{"an unreadable version", "claude", jailedClaudeHelp, "older than 2.1.295", true},
+		{"no --restricted", "2.1.301 (Claude Code)", "  --permission-prompts <target>\n", "--restricted", true},
+		{"no --permission-prompts", "2.1.301 (Claude Code)", "  --restricted  Restricted mode\n", "--permission-prompts", true},
+		{"the probe failed", "", "", "did not answer", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clearReadOnlyClaudeJailCache(t)
-			calls := withReadOnlyClaudeHelp(t, tc.help, tc.ok)
+			withReadOnlyClaudeProbe(t, tc.version, tc.help, tc.ok)
 			for i := 0; i < 2; i++ {
 				err := checkReadOnlyClaudeJail(exe, nil)
 				roErr := readOnlySessionErrorFrom(err)
@@ -1519,16 +1559,69 @@ func TestCheckReadOnlyClaudeJail(t *testing.T) {
 					t.Fatalf("checkReadOnlyClaudeJail = %v, want a read-only refusal naming %q", err, tc.want)
 				}
 			}
-			// A refusal is never cached: an install fixed in place is seen next time.
-			if *calls != 2 {
-				t.Fatalf("probed %d times, want 2 (refusals are not cached)", *calls)
+			// A refusal is never cached.
+			if readOnlySessionErrorFrom(checkReadOnlyClaudeJailCached(exe)) == nil {
+				t.Fatal("a refused install has a cached verdict")
 			}
 		})
 	}
 }
 
-// End to end: a Claude Code whose --help lists no read jail is refused before
-// the session spawns — never run without it.
+// The probe never runs under the session manager's lock: a stalled
+// `claude --version` must not block other sessions' operations.
+func TestStartSessionReadOnly_ProbesOutsideTheManagerLock(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	withReadOnlyHostOS(t, "darwin")
+	clearReadOnlyClaudeJailCache(t)
+	pathDir := newMockClaudeDir(t)
+	cwd := newMockClaudeDir(t)
+	installReadOnlyMock(t, pathDir, "claude")
+	readOnlyMockEnv(t, filepath.Join(t.TempDir(), "record.jsonl"), pathDir)
+
+	sm := NewSessionManager(nil)
+	release := make(chan struct{})
+	probing := make(chan struct{}, 1)
+	prev := readOnlyClaudeProbe
+	readOnlyClaudeProbe = func(string, []string, string) (string, bool) {
+		select {
+		case probing <- struct{}{}:
+		default:
+		}
+		<-release
+		return "", false
+	}
+	t.Cleanup(func() { readOnlyClaudeProbe = prev })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sm.StartSessionReadOnly("ro-slow", "claude", []string{"Review"}, cwd, "ws", "uid", 30000, func(resultMsg) {})
+	}()
+	select {
+	case <-probing:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the probe never ran")
+	}
+	locked := make(chan struct{})
+	go func() {
+		sm.mu.Lock()
+		sm.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("the session manager lock is held while the CLI is probed")
+	}
+	close(release)
+	if err := <-done; readOnlySessionErrorFrom(err) == nil {
+		t.Fatalf("a failed probe = %v, want a read-only refusal", err)
+	}
+}
+
+// End to end: a Claude Code older than the jail's minimum (one whose --help
+// lists no jail, too) is refused before the session spawns — never run
+// without it.
 func TestStartSessionReadOnly_RefusesAClaudeWithoutTheReadJail(t *testing.T) {
 	withReadOnlyHostOS(t, "darwin")
 	skipIfUnsupportedOS(t)
@@ -1543,8 +1636,8 @@ func TestStartSessionReadOnly_RefusesAClaudeWithoutTheReadJail(t *testing.T) {
 	sm := NewSessionManager(nil)
 	err := sm.StartSessionReadOnly("ro-nojail", "claude", []string{"Review"}, cwd, "ws", "uid", 30000, func(resultMsg) {})
 	roErr := readOnlySessionErrorFrom(err)
-	if roErr == nil || !strings.Contains(roErr.reason, "--restricted") {
-		t.Fatalf("StartSessionReadOnly = %v, want a refusal naming --restricted", err)
+	if roErr == nil || !strings.Contains(roErr.reason, "older than") {
+		t.Fatalf("StartSessionReadOnly = %v, want a refusal naming the minimum version", err)
 	}
 	if sm.GetSession("ro-nojail") != nil {
 		t.Fatal("a refused start registered a session")

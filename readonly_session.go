@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -195,8 +196,9 @@ func refuseReadOnlyCommand(ctx context.Context, topic *pubsub.Publisher, m *pubs
 //     without asking.
 //   - --permission-prompts none: anything that would still ask (a read
 //     outside the jail) is DENIED at once — the session never blocks on a
-//     prompt nobody will answer. Requires a Claude Code that knows both flags;
-//     checkReadOnlyClaudeJail refuses the start on one that does not.
+//     prompt nobody will answer. Requires Claude Code readOnlyClaudeMinVersion
+//     or later (earlier releases have known escapes from the jail) listing
+//     both flags; checkReadOnlyClaudeJail refuses the start otherwise.
 //   - --safe-mode: no hooks, plugins, skills, custom agents/commands or
 //     CLAUDE.md — none of the repository's extensions load.
 //   - --strict-mcp-config with no --mcp-config: no MCP server at all.
@@ -216,9 +218,9 @@ func refuseReadOnlyCommand(ctx context.Context, topic *pubsub.Publisher, m *pubs
 //   - --disallowedTools: the write, shell, web and sub-agent tools, denied
 //     even if a later --tools named them (the deny list wins).
 //
-// Verified live on Claude Code 2.1.260 with exactly this argv: the init event
-// lists only Glob, Grep and Read, no MCP server, permission mode "default",
-// and a turn reading a file in the working directory completes.
+// Verified live on Claude Code 2.1.260 and 2.1.301 with exactly this argv: the
+// init event lists only Glob, Grep and Read, no MCP server, permission mode
+// "default", and a turn reading a file in the working directory completes.
 var readOnlyClaudeBaseArgs = []string{
 	"--output-format", "stream-json",
 	"--input-format", "stream-json",
@@ -543,17 +545,28 @@ func checkReadOnlyExecutable(command, executable, cwd string) error {
 // --help predates the jail.
 var readOnlyClaudeJailFlags = []string{"--restricted", "--permission-prompts"}
 
-// readOnlyClaudeHelpProbe runs `<executable> --help` and returns its output;
+// readOnlyClaudeMinVersion is the oldest Claude Code whose jail holds. Having
+// the flags is not enough: 2.1.290 fixed an @-mention under --restricted
+// reading a file outside the working directories through a link changed
+// mid-read (a checkout under review can race one), and 2.1.295 fixed --tools
+// and --restricted not applying to built-in tools that register after launch.
+// Raise it when a later release fixes another escape.
+var readOnlyClaudeMinVersion = [3]int{2, 1, 295}
+
+// readOnlyClaudeVersionPattern reads `claude --version` ("2.1.301 (Claude Code)").
+var readOnlyClaudeVersionPattern = regexp.MustCompile(`^\s*(\d+)\.(\d+)\.(\d+)`)
+
+// readOnlyClaudeProbe runs `<executable> <arg>` and returns its output;
 // ok=false is inconclusive (spawn failure, timeout, non-zero exit). A variable
 // so tests can answer for a CLI without spawning one.
-var readOnlyClaudeHelpProbe = func(executable string, env []string) (string, bool) {
+var readOnlyClaudeProbe = func(executable string, env []string, arg string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), cliAgentModelProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, "--help")
+	cmd := exec.CommandContext(ctx, executable, arg)
 	hideWindow(cmd)
 	cmd.Env = env
 	// Never the repository: the executable's own directory is outside it
-	// (checkReadOnlyExecutable).
+	// (checkReadOnlyExecutable runs first).
 	cmd.Dir = filepath.Dir(executable)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -562,25 +575,68 @@ var readOnlyClaudeHelpProbe = func(executable string, env []string) (string, boo
 	return string(out), true
 }
 
-// readOnlyClaudeJailCache remembers a verdict per installed binary (path, size
-// and modification time), so the probe runs once per Claude Code install, not
-// once per review — and again after an upgrade replaces the file.
+// readOnlyClaudeJailCache remembers a PASS per installed binary (path, size
+// and modification time), so the probes run once per Claude Code install, not
+// once per review — and again after an upgrade replaces the file. A refusal
+// is never cached: an install fixed in place is seen on the next start.
 var readOnlyClaudeJailCache sync.Map // string → bool
 
+func readOnlyClaudeJailKey(executable string) string {
+	info, err := os.Stat(executable)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s\x00%d\x00%d", executable, info.Size(), info.ModTime().UnixNano())
+}
+
+// readOnlyClaudeVersionOK reports whether `claude --version` output names a
+// release at or past readOnlyClaudeMinVersion.
+func readOnlyClaudeVersionOK(output string) bool {
+	m := readOnlyClaudeVersionPattern.FindStringSubmatch(output)
+	if m == nil {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		n, err := strconv.Atoi(m[i+1])
+		if err != nil {
+			return false
+		}
+		if n != readOnlyClaudeMinVersion[i] {
+			return n > readOnlyClaudeMinVersion[i]
+		}
+	}
+	return true
+}
+
+func readOnlyClaudeMinVersionString() string {
+	v := readOnlyClaudeMinVersion
+	return fmt.Sprintf("%d.%d.%d", v[0], v[1], v[2])
+}
+
 // checkReadOnlyClaudeJail refuses a read-only Claude start unless the
-// installed Claude Code has the read jail. Without the check, a Claude Code
-// that predates `--restricted` would exit on an unknown option — still never
-// unjailed, but as an opaque start failure instead of the refusal the job
-// reads (TERMINAL_READ_ONLY_UNSUPPORTED). An inconclusive probe refuses too.
+// installed Claude Code has a read jail that holds: a release at or past
+// readOnlyClaudeMinVersion whose --help lists both jail flags. It RUNS the
+// CLI (twice, on a cold cache), so the session manager calls it before taking
+// its lock (preflightReadOnlyClaude), and only after checkReadOnlyExecutable
+// accepted the binary. An inconclusive probe refuses too.
 func checkReadOnlyClaudeJail(executable string, env []string) error {
-	key := ""
-	if info, err := os.Stat(executable); err == nil {
-		key = fmt.Sprintf("%s\x00%d\x00%d", executable, info.Size(), info.ModTime().UnixNano())
+	key := readOnlyClaudeJailKey(executable)
+	if key != "" {
 		if ok, cached := readOnlyClaudeJailCache.Load(key); cached && ok.(bool) {
 			return nil
 		}
 	}
-	help, ok := readOnlyClaudeHelpProbe(executable, env)
+	version, ok := readOnlyClaudeProbe(executable, env, "--version")
+	if !ok {
+		return &readOnlySessionError{reason: "could not confirm that this computer's Claude Code confines reads " +
+			"(`claude --version` did not answer)"}
+	}
+	if !readOnlyClaudeVersionOK(version) {
+		return &readOnlySessionError{reason: fmt.Sprintf(
+			"this computer's Claude Code is older than %s, whose read jail closes known escapes; update Claude Code",
+			readOnlyClaudeMinVersionString())}
+	}
+	help, ok := readOnlyClaudeProbe(executable, env, "--help")
 	if !ok {
 		return &readOnlySessionError{reason: "could not confirm that this computer's Claude Code confines reads " +
 			"(`claude --help` did not answer)"}
@@ -596,6 +652,37 @@ func checkReadOnlyClaudeJail(executable string, env []string) error {
 		readOnlyClaudeJailCache.Store(key, true)
 	}
 	return nil
+}
+
+// checkReadOnlyClaudeJailCached is the check under the session manager's
+// lock: the verdict preflightReadOnlyClaude cached for this exact file, and
+// never a probe. A binary replaced between the two (an upgrade mid-start) has
+// no verdict yet and is refused; the next start probes it.
+func checkReadOnlyClaudeJailCached(executable string) error {
+	if key := readOnlyClaudeJailKey(executable); key != "" {
+		if ok, cached := readOnlyClaudeJailCache.Load(key); cached && ok.(bool) {
+			return nil
+		}
+	}
+	return &readOnlySessionError{reason: "this computer's Claude Code changed while the session was starting; try again"}
+}
+
+// preflightReadOnlyClaude runs, OUTSIDE the session manager's lock, the checks
+// that execute the CLI: the binary must pass checkReadOnlyExecutable first
+// (so a probe never runs a repository-supplied `claude`), then its read jail is
+// probed with the environment the session would get. A stalled probe (up to
+// its timeout) then never blocks every other session operation.
+func preflightReadOnlyClaude(command, cwd string) error {
+	executable := resolveExecutable(command)
+	if err := checkReadOnlyExecutable(command, executable, cwd); err != nil {
+		return err
+	}
+	workDir, err := readOnlySessionWorkDir(cwd)
+	if err != nil {
+		return &readOnlySessionError{reason: "the session's working directory could not be resolved"}
+	}
+	env, _ := prepareClaudeChildEnv(command, os.Environ())
+	return checkReadOnlyClaudeJail(executable, readOnlyChildEnv(env, workDir))
 }
 
 // readOnlySessionWorkDir is the directory the child will run in: cwd made

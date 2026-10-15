@@ -349,6 +349,15 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		reconcileSessionStatusLineHook("session")
 	}
 
+	// A read-only Claude start probes the installed CLI for its read jail —
+	// running it, with a timeout — so that happens here, before the manager
+	// lock; under the lock only the cached verdict is read.
+	if readOnly && command == readOnlyClaudeCommand {
+		if err := preflightReadOnlyClaude(command, cwd); err != nil {
+			return err
+		}
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -671,9 +680,10 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 			return err
 		}
 		// Reads are jailed to the working directory: only by a Claude Code
-		// that has the jail.
+		// that has the jail (probed by preflightReadOnlyClaude, outside the
+		// lock; this reads its verdict for this exact file).
 		if command == readOnlyClaudeCommand {
-			if err := checkReadOnlyClaudeJail(executable, filtered); err != nil {
+			if err := checkReadOnlyClaudeJailCached(executable); err != nil {
 				return err
 			}
 		}
