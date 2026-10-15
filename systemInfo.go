@@ -170,10 +170,6 @@ func newRelayFollowUpsCapability() *relayFollowUpsCapability {
 // every message, which is the documented legacy-device fallback. The empty
 // live list (never null) means every follow-up is queued.
 func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger, inbox *relayTurnInbox) *relayFollowUpsCapability {
-	ledgerID := l.LedgerID()
-	if ledgerID == "" {
-		return nil
-	}
 	// Owning the ledger is not enough. The ledger file is new in this change,
 	// so during a Linux automatic-update overlap THIS process can take it
 	// while the pre-change process still owns relay-turn-inbox.json and still
@@ -184,7 +180,17 @@ func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger, inbox *relayTurnInbo
 	// unsettled and allowing a replacement delivery after the original ran.
 	// Owning the turn inbox is what proves the follow-up-aware process is the
 	// one that will execute those turns.
+	//
+	// The inbox is checked FIRST, so this never takes the ledger while the
+	// inbox is owned elsewhere: both locks are held for the life of the
+	// process, and a ledger taken here before a failed inbox check would leave
+	// the two split between overlapping processes, so neither could ever
+	// advertise until one exits (Codex P2 on #219).
 	if !inbox.Own() {
+		return nil
+	}
+	ledgerID := l.LedgerID()
+	if ledgerID == "" {
 		return nil
 	}
 	live := make([]string, 0, len(liveFollowUpCertified))

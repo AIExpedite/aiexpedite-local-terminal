@@ -55,6 +55,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -204,9 +205,31 @@ func (l *relayFollowUpLedger) release() {
 	}
 }
 
+// globalRelayFollowUpLedger is taken only by a process that also owns the
+// relay-turn inbox (gateOwnershipOn), so the two process-lifetime locks are
+// never split between overlapping agent processes.
 var globalRelayFollowUpLedger = newRelayFollowUpLedger(func() string {
 	return filepath.Join(GetConfigDir(), relayFollowUpLedgerFileName)
-})
+}).gateOwnershipOn(func() bool { return globalRelayTurnInbox.Own() })
+
+// gateOwnershipOn makes the ledger takeable only while owns() reports this
+// process owns its companion lock (the relay-turn inbox). Both are held for
+// the life of the process once taken, so acquiring the ledger first and then
+// failing on the inbox would split them between two overlapping processes
+// (Linux has no single-instance guard across an automatic update): neither
+// could advertise relayFollowUps, and the ownership watcher would never see
+// one process holding both. Lock order is ledger.mu -> inbox.mu; the inbox
+// never calls into the ledger.
+func (l *relayFollowUpLedger) gateOwnershipOn(owns func() bool) *relayFollowUpLedger {
+	acquire := l.acquireOwnership
+	l.acquireOwnership = func() *os.File {
+		if !owns() {
+			return nil
+		}
+		return acquire()
+	}
+	return l
+}
 
 func newLedgerID() string {
 	b := make([]byte, 12)
@@ -433,6 +456,34 @@ func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID strin
 	return *r, true
 }
 
+// RefuseAccepted fences an `accepted` attempt that the stdin boundary refused
+// before writing a byte (refuseAtStdin): the row becomes `refused` — answered
+// notWritten, and refused for good like any fence. A row in any other state is
+// returned unchanged. A fence that does not reach disk is downgraded to
+// unknown (markNotDurableLocked).
+func (l *relayFollowUpLedger) RefuseAccepted(attemptID, reason string) relayFollowUpRow {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.ownLocked() {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	r := l.rows[attemptID]
+	if r == nil {
+		return relayFollowUpRow{AttemptID: attemptID, State: followUpRowUnknown}
+	}
+	if r.State != followUpRowAccepted {
+		return *r
+	}
+	r.State = followUpRowRefused
+	r.Reason = reason
+	r.UpdatedAt = l.now().UnixMilli()
+	if err := l.persistLocked(); err != nil {
+		fmt.Printf("%s[follow-up] ledger write failed for a refusal: %v%s\n", colorYellow, err, colorReset)
+		return l.markNotDurableLocked(r)
+	}
+	return *r
+}
+
 // Finish records the write's outcome: written, or unknown on any write error
 // (bytes may have reached the CLI).
 func (l *relayFollowUpLedger) Finish(attemptID string, writeErr error, processedIn string) relayFollowUpRow {
@@ -649,16 +700,41 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		publish(row)
 		return true
 	}
-	// Read before the write: a `result` already read means the running turn
-	// ended, so the agent takes this message as a new turn.
+	// The fence is decided again at the stdin boundary, under stdinMu right
+	// before the write: SendAccepting can wait there behind another stdin
+	// write (up to its write timeout), and the check above may pass up to the
+	// skew margin before the broker's expiry, so without this the message
+	// could be written after the broker expired the attempt and queued a
+	// replacement. processedIn is read there too: a `result` already read
+	// means the running turn ended, so the agent takes this message as a new
+	// turn.
 	processedIn := followUpProcessedInCurrent
-	if session.turnSettled.Load() {
-		processedIn = followUpProcessedInNext
+	var refusedAtStdin *relayFollowUpRow
+	err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, func() error {
+		recheck := check
+		recheck.Now = time.Now()
+		recheck.ApprovalPending = session.pendingApprovals.Load() > 0
+		if reason := recheck.fenceReason(); reason != "" {
+			row := ledger.RefuseAccepted(attemptID, reason)
+			refusedAtStdin = &row
+			return errFollowUpRefusedAtStdin
+		}
+		if session.turnSettled.Load() {
+			processedIn = followUpProcessedInNext
+		}
+		return nil
+	})
+	if refusedAtStdin != nil {
+		publish(*refusedAtStdin)
+		return true
 	}
-	err := globalClaudeNativeManager.SendAccepting(cmd.SessionID, cmd.Input, nil)
 	publish(ledger.Finish(attemptID, err, processedIn))
 	return true
 }
+
+// errFollowUpRefusedAtStdin aborts a live write whose fence failed at the
+// stdin boundary; nothing was written, and the ledger already holds the fence.
+var errFollowUpRefusedAtStdin = errors.New("follow-up attempt refused at the stdin boundary")
 
 // followUpTurnExpired reports whether a queued follow-up turn (`fu_…`) must be
 // refused before it starts: its expiry (bounded by the signed ts) has passed.

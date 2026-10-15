@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1366,5 +1367,176 @@ func TestOlderGatherKeepsTheRepublishedCapability(t *testing.T) {
 	machineInfoMu.RUnlock()
 	if got != own {
 		t.Fatalf("a gather's own capability was replaced: %+v", got)
+	}
+}
+
+// followUpStdinRecorder is a session stdin that records what reached it.
+type followUpStdinRecorder struct {
+	mu    sync.Mutex
+	bytes int
+}
+
+func (r *followUpStdinRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.bytes += len(p)
+	return len(p), nil
+}
+
+func (r *followUpStdinRecorder) Close() error { return nil }
+
+func (r *followUpStdinRecorder) written() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.bytes
+}
+
+// installLiveFollowUpSession wires a certified, running Claude session, the
+// ledger and a capturing publisher for handleRelayFollowUpCommand.
+func installLiveFollowUpSession(t *testing.T) (*relayFollowUpLedger, *ClaudeNativeSession, *followUpStdinRecorder, *[]resultMsg) {
+	t.Helper()
+	resetFencedSessions(t)
+	l, _ := newEstablishedTestFollowUpLedger(t)
+	prevLedger := globalRelayFollowUpLedger
+	globalRelayFollowUpLedger = l
+	t.Cleanup(func() { globalRelayFollowUpLedger = prevLedger })
+	prevCertified := liveFollowUpCertified
+	liveFollowUpCertified = map[string]string{claudeCodeCliAgentID: "test"}
+	t.Cleanup(func() { liveFollowUpCertified = prevCertified })
+	prevManager := globalClaudeNativeManager
+	globalClaudeNativeManager = NewClaudeNativeManager(nil)
+	t.Cleanup(func() { globalClaudeNativeManager = prevManager })
+	stdin := &followUpStdinRecorder{}
+	session := &ClaudeNativeSession{ID: "s1", Stdin: stdin, status: "running"}
+	globalClaudeNativeManager.sessions["s1"] = session
+	var (
+		mu      sync.Mutex
+		answers []resultMsg
+	)
+	prevPublish := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		mu.Lock()
+		defer mu.Unlock()
+		answers = append(answers, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prevPublish })
+	return l, session, stdin, &answers
+}
+
+// Codex P1 on #219: a live attempt that passed the fence and then waited on
+// stdinMu behind another write must be fenced again at the stdin boundary —
+// never written after its expiry, and answered notWritten (refused for good)
+// because no byte reached the CLI.
+func TestALiveFollowUpThatExpiresWhileWaitingForStdinIsNeverWritten(t *testing.T) {
+	l, session, stdin, answers := installLiveFollowUpSession(t)
+	now := time.Now()
+	cmd := commandMsg{
+		ID:                       relayFollowUpEnvelopePrefix + "att-1",
+		Type:                     relayFollowUpCommandType,
+		SessionID:                "s1",
+		Input:                    "are you almost done?",
+		Ts:                       now.UnixMilli(),
+		FollowUpID:               "m1",
+		FollowUpAttemptID:        "att-1",
+		FollowUpAttemptExpiresAt: now.Add(followUpSkewMargin + 300*time.Millisecond).UnixMilli(),
+		FollowUpLedgerID:         l.LedgerID(),
+	}
+	// Another stdin write holds the lock past the attempt's fence.
+	session.stdinMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
+	}()
+	time.Sleep(700 * time.Millisecond)
+	session.stdinMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the live attempt never finished")
+	}
+	if n := stdin.written(); n != 0 {
+		t.Fatalf("an expired live attempt wrote %d bytes to stdin", n)
+	}
+	if len(*answers) != 1 || (*answers)[0].FollowUpOutcome != followUpOutcomeNotWritten || (*answers)[0].FollowUpReason != followUpReasonExpired {
+		t.Fatalf("want one notWritten/expired answer, got %+v", *answers)
+	}
+	if row, write := l.Begin("att-1", "m1", "s1", okCheck(time.Now())); write || row.State != followUpRowRefused {
+		t.Fatalf("the stdin-boundary refusal is not a lasting fence: write=%v row=%+v", write, row)
+	}
+}
+
+// The stdin-boundary recheck leaves an in-time attempt alone: it is written
+// and answered written.
+func TestALiveFollowUpWithinItsExpiryIsWrittenAtTheStdinBoundary(t *testing.T) {
+	l, _, stdin, answers := installLiveFollowUpSession(t)
+	now := time.Now()
+	cmd := commandMsg{
+		ID:                       relayFollowUpEnvelopePrefix + "att-2",
+		Type:                     relayFollowUpCommandType,
+		SessionID:                "s1",
+		Input:                    "are you almost done?",
+		Ts:                       now.UnixMilli(),
+		FollowUpID:               "m2",
+		FollowUpAttemptID:        "att-2",
+		FollowUpAttemptExpiresAt: now.Add(time.Minute).UnixMilli(),
+		FollowUpLedgerID:         l.LedgerID(),
+	}
+	handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
+	if stdin.written() == 0 {
+		t.Fatal("an in-time live attempt was not written")
+	}
+	if len(*answers) != 1 || (*answers)[0].FollowUpOutcome != followUpOutcomeWritten {
+		t.Fatalf("want one written answer, got %+v", *answers)
+	}
+}
+
+// Codex P2 on #219: the capability check never takes the ledger while another
+// process owns the turn inbox, so the two process-lifetime locks are never
+// split — the process that owns the inbox can still take the ledger.
+func TestTheCapabilityNeverTakesTheLedgerWhileAnotherProcessOwnsTheTurnInbox(t *testing.T) {
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, relayFollowUpLedgerFileName)
+	inboxPath := filepath.Join(dir, relayTurnInboxFileName)
+	ledger := newRelayFollowUpLedger(func() string { return ledgerPath })
+	t.Cleanup(ledger.release)
+	inbox := newRelayTurnInbox(func() string { return inboxPath })
+	t.Cleanup(inbox.release)
+	otherInbox := newRelayTurnInbox(func() string { return inboxPath })
+	t.Cleanup(otherInbox.release)
+	if !otherInbox.Own() {
+		t.Fatal("the other process could not take the turn inbox")
+	}
+	if cap := newRelayFollowUpsCapabilityFor(ledger, inbox); cap != nil {
+		t.Fatalf("a turn-inbox non-owner advertised the capability: %+v", cap)
+	}
+	otherLedger := newRelayFollowUpLedger(func() string { return ledgerPath })
+	t.Cleanup(otherLedger.release)
+	if !otherLedger.Own() {
+		t.Fatal("the capability check took the ledger while the inbox was owned elsewhere: the locks are split")
+	}
+}
+
+// A ledger gated on the turn inbox is never taken while the inbox is owned
+// elsewhere, by any path (command handling included), and is taken once it
+// is not.
+func TestAGatedLedgerIsTakenOnlyAlongsideTheTurnInbox(t *testing.T) {
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, relayFollowUpLedgerFileName)
+	ownsInbox := false
+	ledger := newRelayFollowUpLedger(func() string { return ledgerPath }).gateOwnershipOn(func() bool { return ownsInbox })
+	t.Cleanup(ledger.release)
+	if ledger.Own() || ledger.LedgerID() != "" {
+		t.Fatal("the gated ledger was taken without the turn inbox")
+	}
+	probe := newRelayFollowUpLedger(func() string { return ledgerPath })
+	if !probe.Own() {
+		t.Fatal("a refused gated acquisition still holds the ledger lock")
+	}
+	probe.release()
+	ownsInbox = true
+	if !ledger.Own() || ledger.LedgerID() == "" {
+		t.Fatal("the gated ledger was not taken alongside the turn inbox")
 	}
 }
