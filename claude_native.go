@@ -301,19 +301,19 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	launchedVersion = confirmClaudeLaunchVersion(executable, launchedVersion, launchedKey)
 
 	session := &ClaudeNativeSession{
-		ID:            id,
-		Process:       proc,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		StartedAt:     time.Now(),
-		WorkspaceID:   workspaceID,
+		ID:              id,
+		Process:         proc,
+		Stdin:           stdin,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		StartedAt:       time.Now(),
+		WorkspaceID:     workspaceID,
 		UID:             uid,
 		launchedVersion: launchedVersion,
 		status:          "running",
-		done:          make(chan struct{}),
-		processExited: make(chan struct{}),
-		streamDone:    make(chan struct{}),
+		done:            make(chan struct{}),
+		processExited:   make(chan struct{}),
+		streamDone:      make(chan struct{}),
 	}
 
 	m.sessions[id] = session

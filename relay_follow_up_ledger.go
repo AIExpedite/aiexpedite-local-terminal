@@ -760,7 +760,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		// one installed now: an in-place upgrade must not make a session
 		// started from an older, uncertified build live-eligible (Codex P2
 		// on #219).
-		LiveKind:    session != nil && liveFollowUpVersionCertified(claudeCodeCliAgentID, session.launchedVersion),
+		LiveKind: session != nil && liveFollowUpVersionCertified(claudeCodeCliAgentID, session.launchedVersion),
 		// A fenced session (moved or max-parked off this computer) takes
 		// nothing but its END, so it is not running for a follow-up.
 		SessionRunning: session != nil && session.Status() == "running" && !isSessionFenced(cmd.SessionID),
