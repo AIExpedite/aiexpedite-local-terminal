@@ -603,9 +603,10 @@ func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
 
 // followUpTurnRefusal is why a queued follow-up turn (`fu_…`) that is neither
 // accepted nor in flight must not start, or "" to run it: its expiry passed
-// (followUpTurnExpired), or its session was fenced off this computer (moved
-// or max-parked), whose CLI must take nothing more but its END. The inbox
-// evaluates it under the claim's lock (BeginFenced).
+// (followUpTurnExpired), its session was fenced off this computer (moved or
+// max-parked), whose CLI must take nothing more but its END, or the session
+// is gone from this device altogether. The inbox evaluates it under the
+// claim's lock (BeginFenced).
 func followUpTurnRefusal(cmd commandMsg, turnID string, now time.Time) string {
 	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
 		return ""
@@ -613,10 +614,45 @@ func followUpTurnRefusal(cmd commandMsg, turnID string, now time.Time) string {
 	if followUpTurnExpired(cmd, turnID, now) {
 		return followUpReasonExpired
 	}
-	if isSessionFenced(cmd.SessionID) {
+	if isSessionFenced(cmd.SessionID) || followUpTurnTargetGone(cmd) {
 		return followUpReasonSessionNotRunning
 	}
 	return ""
+}
+
+// followUpTurnTargetGone reports that this device DEFINITELY no longer holds
+// the session a queued follow-up turn names — it ended normally rather than
+// being fenced. Dispatching it anyway would fail inside the kind's SEND, which
+// publishes a kind-specific error frame without ever invoking the acceptance
+// callback, so the broker would get neither an acceptance nor an
+// outcome-bearing `relay_turn_ack` and could not settle or requeue the
+// person's message until its own deadline. Refusing here answers
+// notWritten/sessionNotRunning instead, and the broker requeues at once.
+//
+// It only ever reports a session the owning manager is live and certain about.
+// An unrecognised command type, an uninitialised manager, or a session the
+// manager still holds (including one that is merely starting) reads as
+// present, so a session that can still accept the turn is never raced.
+func followUpTurnTargetGone(cmd commandMsg) bool {
+	if cmd.SessionID == "" {
+		return false
+	}
+	switch {
+	case isClaudeNativeCommand(cmd.Type):
+		return globalClaudeNativeManager != nil && globalClaudeNativeManager.Get(cmd.SessionID) == nil
+	case isCodexAppServerCommand(cmd.Type):
+		return globalCodexAppServerManager != nil && globalCodexAppServerManager.Get(cmd.SessionID) == nil
+	case isGrokACPCommand(cmd.Type):
+		return globalGrokACPManager != nil && globalGrokACPManager.Get(cmd.SessionID) == nil
+	case isAntigravityNativeCommand(cmd.Type):
+		return globalAntigravityNativeManager != nil && globalAntigravityNativeManager.Get(cmd.SessionID) == nil
+	case isOpenCodeNativeCommand(cmd.Type):
+		return globalOpenCodeNativeManager != nil && globalOpenCodeNativeManager.Get(cmd.SessionID) == nil
+	case isMuseCodeNativeCommand(cmd.Type):
+		return globalMuseCodeNativeManager != nil && globalMuseCodeNativeManager.Get(cmd.SessionID) == nil
+	default:
+		return false
+	}
 }
 
 // isFollowUpProtocolCommand reports whether a command belongs to the follow-up

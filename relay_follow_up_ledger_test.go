@@ -552,6 +552,44 @@ func TestAQueuedFollowUpTurnForAFencedSessionIsRefused(t *testing.T) {
 	}
 }
 
+// A queued follow-up turn whose session is gone from this device (ended
+// normally, never fenced) is refused with an outcome rather than dispatched
+// into a SEND that would fail without acking the broker. A session the
+// manager still holds, or a manager that is not running, is never raced.
+func TestAQueuedFollowUpTurnForAMissingSessionIsRefused(t *testing.T) {
+	resetFencedSessions(t)
+	now := time.Now()
+	prev := globalClaudeNativeManager
+	t.Cleanup(func() { globalClaudeNativeManager = prev })
+
+	cmd := commandMsg{Type: "claude_native_send", ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s-gone", Ts: now.UnixMilli()}
+
+	// No manager at all: nothing is known, so nothing is refused here.
+	globalClaudeNativeManager = nil
+	if got := followUpTurnRefusal(cmd, "fu_a1", now); got != "" {
+		t.Fatalf("with no manager the turn must not be refused, got %q", got)
+	}
+
+	// A live manager that does not hold the session: definitely gone.
+	globalClaudeNativeManager = NewClaudeNativeManager(nil)
+	if got := followUpTurnRefusal(cmd, "fu_a1", now); got != followUpReasonSessionNotRunning {
+		t.Fatalf("missing session refusal = %q", got)
+	}
+	// An unrecognised command type stays unjudged.
+	if got := followUpTurnRefusal(commandMsg{Type: "some_future_send", ID: cmd.ID, SessionID: "s-gone", Ts: cmd.Ts}, "fu_a1", now); got != "" {
+		t.Fatalf("an unknown kind must not be refused, got %q", got)
+	}
+	// An ordinary relay turn is left to the generic paths.
+	if got := followUpTurnRefusal(commandMsg{Type: "claude_native_send", ID: relayTurnEnvelopePrefix + "t1", SessionID: "s-gone"}, "t1", now); got != "" {
+		t.Fatalf("an ordinary relay turn must not be refused, got %q", got)
+	}
+
+	inbox := newTestRelayInbox(t)
+	if handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonSessionNotRunning || dispatched {
+		t.Fatalf("missing session: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+}
+
 // The generic fence gate leaves follow-up protocol commands to their own
 // handlers (which answer with an outcome); everything else but END is still
 // refused there.
@@ -590,18 +628,47 @@ func TestFollowUpCommandsKeepTheirAttemptStalenessWindow(t *testing.T) {
 			t.Fatalf("%s: commandMaxAgeSec = %d, want %d", tc.name, got, tc.want)
 		}
 	}
+	// The future-skew bound stays at the margin the follow-up fences
+	// themselves tolerate, however long the age window is.
+	skew := int(followUpSkewMargin.Seconds())
+	for _, tc := range []struct {
+		name string
+		cmd  commandMsg
+		want int
+	}{
+		{"live attempt", commandMsg{Type: relayFollowUpCommandType, ID: relayFollowUpEnvelopePrefix + "att-1"}, skew},
+		{"reconciliation query", commandMsg{Type: relayFollowUpQueryCommandType}, skew},
+		{"queued follow-up turn", commandMsg{ID: relayTurnEnvelopePrefix + "fu_att-1"}, skew},
+		{"ordinary relay turn", commandMsg{ID: relayTurnEnvelopePrefix + "t-1"}, maxCommandAgeSec},
+		{"ordinary command", commandMsg{Command: "ls"}, maxCommandAgeSec},
+	} {
+		if got := commandMaxFutureSkewSec(tc.cmd); got != tc.want {
+			t.Fatalf("%s: commandMaxFutureSkewSec = %d, want %d", tc.name, got, tc.want)
+		}
+	}
 	// 90 s old: stale generically, still inside the follow-up window.
 	ts := now.Add(-90 * time.Second).UnixMilli()
 	if !isCommandStale(ts) {
 		t.Fatalf("a 90 s old command must be generically stale")
 	}
-	if isCommandStaleAfter(ts, int(window)) {
+	if isCommandStaleAfter(ts, int(window), skew) {
 		t.Fatalf("a 90 s old follow-up must not be stale inside its attempt window")
 	}
 	// Past the attempt window plus the margin, the broker has expired the
 	// attempt itself, so the generic rejection applies again.
 	expired := now.Add(-(time.Duration(window) + 1) * time.Second).UnixMilli()
-	if !isCommandStaleAfter(expired, int(window)) {
+	if !isCommandStaleAfter(expired, int(window), skew) {
 		t.Fatalf("a follow-up past its window must be stale")
+	}
+	// A device clock far behind the broker must NOT admit a ts that far in
+	// the device's future: fenceReason reads that ts plus the attempt window,
+	// so the original delivery would outlive the broker's real window and
+	// could run after a replacement was queued.
+	future := now.Add(time.Duration(skew+30) * time.Second).UnixMilli()
+	if !isCommandStaleAfter(future, int(window), skew) {
+		t.Fatalf("a follow-up dated past the skew margin in the future must be stale")
+	}
+	if isCommandStaleAfter(now.Add(time.Duration(skew/2)*time.Second).UnixMilli(), int(window), skew) {
+		t.Fatalf("a follow-up inside the skew margin must be admitted")
 	}
 }

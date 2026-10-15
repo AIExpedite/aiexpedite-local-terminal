@@ -243,24 +243,34 @@ const maxCommandAgeSec = 60 // 1 minute
 // Also rejects commands with future-dated timestamps (clock skew > 60 s) to
 // prevent an attacker from bypassing the staleness check with a far-future ts.
 func isCommandStale(cmdTs int64) bool {
-	return isCommandStaleAfter(cmdTs, maxCommandAgeSec)
+	return isCommandStaleAfter(cmdTs, maxCommandAgeSec, maxCommandAgeSec)
 }
 
-// isCommandStaleAfter is isCommandStale with the window the command's own
-// protocol defines. Follow-up deliveries carry a 120 s attempt window, so the
-// generic 60 s gate would Ack them as "stale" before the handler could emit
-// the `relay_turn_ack` / `relay_follow_up_ack` the broker waits on, leaving the
+// isCommandStaleAfter is isCommandStale with the windows the command's own
+// protocol defines, bounding age and future skew INDEPENDENTLY.
+//
+// Follow-up deliveries carry a 120 s attempt window, so the generic 60 s age
+// gate would Ack them as "stale" before the handler could emit the
+// `relay_turn_ack` / `relay_follow_up_ack` the broker waits on, leaving the
 // message stuck until the broker's own deadline. They keep a bounded window
 // (commandMaxAgeSec) rather than no window at all.
-func isCommandStaleAfter(cmdTs int64, maxAgeSec int) bool {
+//
+// Widening the age allowance must NOT widen the future-skew allowance with
+// it. The follow-up fences (fenceReason / followUpTurnExpired) read the
+// device clock against the signed ts plus the attempt window, so admitting a
+// ts up to 135 s in the device's future would let the original delivery run
+// that much past the broker's real attempt window — after the broker had
+// expired it and queued a replacement, delivering the person's message twice.
+// The future bound therefore stays at the clock skew each protocol tolerates
+// (commandMaxFutureSkewSec), never the age window.
+func isCommandStaleAfter(cmdTs int64, maxAgeSec, maxFutureSkewSec int) bool {
 	if cmdTs == 0 {
 		return false // No timestamp - allow for backwards compatibility
 	}
 	now := time.Now().UnixMilli()
 	ageMs := now - cmdTs
-	maxMs := int64(maxAgeSec) * 1000
 	// Reject if too old OR if too far in the future (abnormal clock skew)
-	return ageMs > maxMs || ageMs < -maxMs
+	return ageMs > int64(maxAgeSec)*1000 || ageMs < -int64(maxFutureSkewSec)*1000
 }
 
 // commandMaxAgeSec is the staleness window for one command. A follow-up
@@ -273,6 +283,17 @@ func isCommandStaleAfter(cmdTs int64, maxAgeSec int) bool {
 func commandMaxAgeSec(cmd commandMsg) int {
 	if isFollowUpProtocolCommand(cmd) {
 		return int((followUpAttemptWindow + followUpSkewMargin).Seconds())
+	}
+	return maxCommandAgeSec
+}
+
+// commandMaxFutureSkewSec is how far into this device's future one command's
+// timestamp may sit. A follow-up's own fences are decided against that signed
+// ts, so it tolerates only the clock skew those fences already allow
+// (followUpSkewMargin) — independently of the longer age window above.
+func commandMaxFutureSkewSec(cmd commandMsg) int {
+	if isFollowUpProtocolCommand(cmd) {
+		return int(followUpSkewMargin.Seconds())
 	}
 	return maxCommandAgeSec
 }
@@ -1741,7 +1762,7 @@ func runPubSubConnection(cfg *Config) error {
 		// Follow-up protocol messages keep their own (longer) window for the
 		// reason commandMaxAgeSec documents.
 		maxAgeSec := commandMaxAgeSec(cmd)
-		if !isInternalDemandCommand(cmd.Command) && isCommandStaleAfter(cmd.Ts, maxAgeSec) {
+		if !isInternalDemandCommand(cmd.Command) && isCommandStaleAfter(cmd.Ts, maxAgeSec, commandMaxFutureSkewSec(cmd)) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
 				colorYellow, ageSec, maxAgeSec, colorReset)
