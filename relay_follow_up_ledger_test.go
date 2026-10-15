@@ -553,12 +553,7 @@ func TestAQueuedFollowUpTurnReadAsGoneBeforeTheClaimIsRefused(t *testing.T) {
 func runFencedTestTurn(inbox *relayTurnInbox, cmd commandMsg, turnID string, dispatch func(context.Context)) (handled bool, refusal string, dispatched bool) {
 	handled = runFencedRelayTurn(context.Background(), inbox, cmd, turnID, "agent-1",
 		func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) },
-		func(now time.Time) string {
-			if followUpTurnExpired(cmd, turnID, now) {
-				return followUpReasonExpired
-			}
-			return ""
-		},
+		func(now time.Time) string { return followUpTurnAcceptRefusal(cmd, turnID, now) },
 		func(reason string) { refusal = reason },
 		func(relayTurnRow) {},
 		func(ctx context.Context) {
@@ -1400,9 +1395,7 @@ func installLiveFollowUpSession(t *testing.T) (*relayFollowUpLedger, *ClaudeNati
 	prevLedger := globalRelayFollowUpLedger
 	globalRelayFollowUpLedger = l
 	t.Cleanup(func() { globalRelayFollowUpLedger = prevLedger })
-	prevCertified := liveFollowUpCertified
-	liveFollowUpCertified = map[string]string{claudeCodeCliAgentID: "test"}
-	t.Cleanup(func() { liveFollowUpCertified = prevCertified })
+	pinLiveFollowUpCertified(t, "1.2.3", "1.2.3")
 	prevManager := globalClaudeNativeManager
 	globalClaudeNativeManager = NewClaudeNativeManager(nil)
 	t.Cleanup(func() { globalClaudeNativeManager = prevManager })
@@ -1538,5 +1531,144 @@ func TestAGatedLedgerIsTakenOnlyAlongsideTheTurnInbox(t *testing.T) {
 	ownsInbox = true
 	if !ledger.Own() || ledger.LedgerID() == "" {
 		t.Fatal("the gated ledger was not taken alongside the turn inbox")
+	}
+}
+
+// pinLiveFollowUpCertified certifies Claude Code at minVersion and pins the
+// installed version the predicate reads, so no test spawns a real CLI.
+func pinLiveFollowUpCertified(t *testing.T, minVersion, installed string) {
+	t.Helper()
+	prevCertified := liveFollowUpCertified
+	liveFollowUpCertified = map[string]string{claudeCodeCliAgentID: minVersion}
+	prevInstalled := liveFollowUpInstalledVersion
+	liveFollowUpInstalledVersion = func(string) string { return installed }
+	t.Cleanup(func() {
+		liveFollowUpCertified = prevCertified
+		liveFollowUpInstalledVersion = prevInstalled
+	})
+}
+
+// Codex P2 on #219: membership in liveFollowUpCertified is not certification.
+// Only an installed version at or above the minimum the run passed at admits
+// a live write; everything unestablished falls back to queued delivery.
+func TestLiveFollowUpKindEnforcesTheCertifiedMinimumVersion(t *testing.T) {
+	cases := []struct {
+		name      string
+		min       string
+		installed string
+		want      bool
+	}{
+		{"at the minimum", "1.2.3", "1.2.3", true},
+		{"above the minimum", "1.2.3", "1.10.0", true},
+		{"below the minimum", "1.2.3", "1.2.2", false},
+		{"below on minor", "1.2.3", "1.1.9", false},
+		{"installed unreadable", "1.2.3", "", false},
+		{"minimum unparseable", "test", "1.2.3", false},
+		{"minimum empty", "", "1.2.3", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pinLiveFollowUpCertified(t, c.min, c.installed)
+			if got := liveFollowUpKind(claudeCodeCliAgentID); got != c.want {
+				t.Fatalf("liveFollowUpKind(min=%q, installed=%q) = %v, want %v", c.min, c.installed, got, c.want)
+			}
+			if liveFollowUpKind("grok") {
+				t.Fatal("an uncertified kind is never live")
+			}
+		})
+	}
+}
+
+// Codex P2 on #219: the advertised capability must not name a kind whose
+// installed build is below the certified minimum — the broker would then pick
+// live delivery for it.
+func TestTheCapabilityAdvertisesOnlyCertifiedVersions(t *testing.T) {
+	dir := t.TempDir()
+	ledger := newRelayFollowUpLedger(func() string { return filepath.Join(dir, relayFollowUpLedgerFileName) })
+	t.Cleanup(ledger.release)
+	inbox := newRelayTurnInbox(func() string { return filepath.Join(dir, relayTurnInboxFileName) })
+	t.Cleanup(inbox.release)
+	pinLiveFollowUpCertified(t, "1.2.3", "1.2.2")
+	caps := newRelayFollowUpsCapabilityFor(ledger, inbox)
+	if caps == nil {
+		t.Fatal("an owned ledger and inbox must still advertise queued follow-ups")
+	}
+	if len(caps.LiveAgents) != 0 {
+		t.Fatalf("an uncertified build was advertised live: %v", caps.LiveAgents)
+	}
+	pinLiveFollowUpCertified(t, "1.2.3", "1.2.3")
+	caps = newRelayFollowUpsCapabilityFor(ledger, inbox)
+	if caps == nil || len(caps.LiveAgents) != 1 || caps.LiveAgents[0] != claudeCodeCliAgentID {
+		t.Fatalf("a certified build must be advertised live, got %+v", caps)
+	}
+}
+
+// Codex P2 on #219: a session fenced off this computer while a live attempt
+// waited on stdinMu must be refused at the stdin boundary, not written to.
+func TestALiveFollowUpIsRefusedWhenItsSessionIsFencedWhileWaitingForStdin(t *testing.T) {
+	l, session, stdin, answers := installLiveFollowUpSession(t)
+	now := time.Now()
+	cmd := commandMsg{
+		ID:                       relayFollowUpEnvelopePrefix + "att-f",
+		Type:                     relayFollowUpCommandType,
+		SessionID:                "s1",
+		Input:                    "are you almost done?",
+		Ts:                       now.UnixMilli(),
+		FollowUpID:               "m-f",
+		FollowUpAttemptID:        "att-f",
+		FollowUpAttemptExpiresAt: now.Add(followUpSkewMargin + 30*time.Second).UnixMilli(),
+		FollowUpLedgerID:         l.LedgerID(),
+	}
+	session.stdinMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
+	}()
+	// The fence lands while the attempt waits for stdin, as /online does:
+	// the id is recorded before the session is ended asynchronously.
+	time.Sleep(200 * time.Millisecond)
+	markSessionsFenced([]string{"s1"})
+	session.stdinMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the live attempt never finished")
+	}
+	if n := stdin.written(); n != 0 {
+		t.Fatalf("a fenced session was written to: %d bytes", n)
+	}
+	if len(*answers) != 1 || (*answers)[0].FollowUpOutcome != followUpOutcomeNotWritten ||
+		(*answers)[0].FollowUpReason != followUpReasonSessionNotRunning {
+		t.Fatalf("want one notWritten/sessionNotRunning answer, got %+v", *answers)
+	}
+}
+
+// Codex P2 on #219: a session fenced between the claim and the acceptance
+// boundary must refuse the queued follow-up turn there — a dispatch that has
+// already won the session's lock would otherwise write into a CLI that has
+// moved off this computer.
+func TestAQueuedFollowUpTurnFencedAfterTheClaimIsRefusedAtAcceptance(t *testing.T) {
+	resetFencedSessions(t)
+	inbox := newTestRelayInbox(t)
+	now := time.Now()
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", Ts: now.UnixMilli(),
+		FollowUpExpiresAt: now.Add(followUpAttemptWindow).UnixMilli()}
+	handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", func(ctx context.Context) {
+		// The fence lands after the claim, as /online does, and the manager
+		// then reaches its acceptance callback.
+		markSessionsFenced([]string{"s1"})
+		if err := acceptRelayDelivery(relayTurnAcceptor(ctx)); err == nil {
+			t.Error("the acceptance boundary admitted a fenced session")
+		}
+	})
+	if !handled || dispatched != true {
+		t.Fatalf("handled=%v dispatched=%v", handled, dispatched)
+	}
+	if refusal != followUpReasonSessionNotRunning {
+		t.Fatalf("refusal=%q, want %q", refusal, followUpReasonSessionNotRunning)
+	}
+	if r, ok := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; !ok || r.State != relayTurnStateRefused {
+		t.Fatalf("the fenced turn was not refused: %+v", r)
 	}
 }

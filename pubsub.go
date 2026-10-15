@@ -6636,17 +6636,13 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		// under the same lock as the claim, so a delivery that passed the
 		// fence and a later duplicate past the deadline can never both act;
 		// the session's state is read just before the claim, outside that lock.
-		// The expiry is checked again at acceptance: the manager can wait on
-		// the session's locks after the claim, past the deadline.
+		// The expiry and the session's fence are checked again at acceptance
+		// (followUpTurnAcceptRefusal): the manager can wait on the session's
+		// locks after the claim, past the deadline or past a fencing.
 		var refuse, refuseAtAccept func(time.Time) string
 		if strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
 			refuse = func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) }
-			refuseAtAccept = func(now time.Time) string {
-				if followUpTurnExpired(cmd, turnID, now) {
-					return followUpReasonExpired
-				}
-				return ""
-			}
+			refuseAtAccept = func(now time.Time) string { return followUpTurnAcceptRefusal(cmd, turnID, now) }
 		}
 		return runFencedRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID, refuse, refuseAtAccept,
 			func(reason string) {

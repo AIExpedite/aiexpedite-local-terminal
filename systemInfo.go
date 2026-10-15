@@ -193,9 +193,14 @@ func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger, inbox *relayTurnInbo
 	if ledgerID == "" {
 		return nil
 	}
+	// Only the kinds whose INSTALLED version meets the certified minimum are
+	// advertised: an older build never passed the run, and advertising it
+	// would have the broker choose live delivery for it (Codex P2 on #219).
 	live := make([]string, 0, len(liveFollowUpCertified))
 	for id := range liveFollowUpCertified {
-		live = append(live, id)
+		if liveFollowUpKind(id) {
+			live = append(live, id)
+		}
 	}
 	return &relayFollowUpsCapability{
 		LiveAgents:    live,

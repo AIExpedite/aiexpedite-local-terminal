@@ -621,9 +621,40 @@ func relayFollowUpAckFrame(cmd commandMsg, agentID string, r relayFollowUpRow, l
 // liveFollowUpKind reports whether this session's kind is certified for live
 // follow-ups at its installed version. Only Claude Code can ever be: its
 // stdin stays open between turns.
+//
+// Membership in liveFollowUpCertified is not on its own certification: the
+// run passes against ONE version, and an older build of the same CLI was
+// never exercised. So the installed version is compared against the recorded
+// minimum, and anything that cannot be established — an unparseable minimum,
+// an unreadable or unparseable installed version — fails closed to queued
+// delivery (Codex P2 on #219).
 func liveFollowUpKind(cliAgentID string) bool {
-	_, ok := liveFollowUpCertified[cliAgentID]
-	return ok
+	minVersion, ok := liveFollowUpCertified[cliAgentID]
+	if !ok || semverRe.FindStringSubmatch(minVersion) == nil {
+		return false
+	}
+	installed := liveFollowUpInstalledVersion(cliAgentID)
+	return installed != "" && compareSemver(installed, minVersion) >= 0
+}
+
+// liveFollowUpInstalledVersion is the installed major.minor.patch of a
+// certified CLI, or "" when it cannot be read. A var so the ledger tests and
+// the certification run can pin a version instead of spawning the real CLI.
+// The probe is the shared (path, mtime, size) cache, so an accepted attempt
+// spawns `--version` only after the binary actually changed.
+var liveFollowUpInstalledVersion = func(cliAgentID string) string {
+	if cliAgentID != claudeCodeCliAgentID {
+		return ""
+	}
+	path := resolveClaudePath()
+	if path == "" {
+		return ""
+	}
+	m := semverRe.FindStringSubmatch(cachedProbeVersion(path))
+	if m == nil {
+		return ""
+	}
+	return m[0]
 }
 
 // handleRelayFollowUpCommand answers a live attempt or a reconciliation query.
@@ -714,6 +745,15 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		recheck := check
 		recheck.Now = time.Now()
 		recheck.ApprovalPending = session.pendingApprovals.Load() > 0
+		// The session's own state is re-read here too, not carried over from
+		// the pre-lock snapshot: /online records a fenced id BEFORE it ends
+		// the session asynchronously, so a session fenced (moved or
+		// max-parked) off this computer while this write waited on stdinMu
+		// would otherwise still be written to (Codex P2 on #219). Both reads
+		// are leaf locks — the session's own mutex, already taken under
+		// stdinMu by the writer, and the fenced-id set — so neither can
+		// deadlock against the manager here.
+		recheck.SessionRunning = session.Status() == "running" && !isSessionFenced(cmd.SessionID)
 		if reason := recheck.fenceReason(); reason != "" {
 			row := ledger.RefuseAccepted(attemptID, reason)
 			refusedAtStdin = &row
@@ -758,6 +798,31 @@ func followUpTurnExpired(cmd commandMsg, turnID string, now time.Time) bool {
 	}
 	return followUpAttemptCheck{Now: now, ExpiresAtMs: cmd.FollowUpExpiresAt, SignedTsMs: cmd.Ts, LiveKind: true,
 		SessionRunning: true, ConversationOK: true}.fenceReason() == followUpReasonExpired
+}
+
+// followUpTurnAcceptRefusal is the part of followUpTurnRefusal decided AGAIN
+// at the acceptance boundary, or "" to accept. A manager can wait on a
+// session lock between the claim and acceptance, so both of these can land in
+// between: the attempt's expiry passes (the broker may already have queued a
+// replacement), or the session is fenced off this computer — /online records a
+// fenced id BEFORE it ends the session asynchronously, so a dispatch can
+// otherwise win the session lock and write into a CLI that has already moved
+// (Codex P2 on #219).
+//
+// Only checks that take NO session-manager lock belong here, because the
+// manager calls the acceptor while holding its own: the expiry is pure, and
+// isSessionFenced takes only the fenced-id set's own leaf lock.
+func followUpTurnAcceptRefusal(cmd commandMsg, turnID string, now time.Time) string {
+	if !strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
+		return ""
+	}
+	if followUpTurnExpired(cmd, turnID, now) {
+		return followUpReasonExpired
+	}
+	if isSessionFenced(cmd.SessionID) {
+		return followUpReasonSessionNotRunning
+	}
+	return ""
 }
 
 // followUpTurnRefusal is why a queued follow-up turn (`fu_…`) that is neither
