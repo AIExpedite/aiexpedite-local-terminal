@@ -562,10 +562,34 @@ func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents, parserKeys)
 		info.cliUsageFromCache = false
 	}
+	info = withCachedRelayFollowUps(info, machineInfoCache)
 	machineInfoCache = info
 	machineInfoMu.Unlock()
 	machineInfoStored(info)
 	return true
+}
+
+// withCachedRelayFollowUps keeps a `relayFollowUps` capability the cache
+// already advertises when info, a gather that snapshotted
+// newMachineCapabilities() before this process owned the ledger and the turn
+// inbox, lacks it. Ownership is never given up once taken, so the cached
+// capability is still true; without this, a gather that started before the
+// ownership watcher republished (and then exited) would roll the capability
+// back, and the next token refresh would tell the backend this device has no
+// follow-up support until the following 6h gather. Called under
+// machineInfoMu; info is copied, never mutated.
+func withCachedRelayFollowUps(info, current *MachineInfo) *MachineInfo {
+	if info == nil || info.Capabilities == nil || info.Capabilities.RelayFollowUps != nil {
+		return info
+	}
+	if current == nil || current.Capabilities == nil || current.Capabilities.RelayFollowUps == nil {
+		return info
+	}
+	kept := *info
+	caps := *info.Capabilities
+	caps.RelayFollowUps = current.Capabilities.RelayFollowUps
+	kept.Capabilities = &caps
+	return &kept
 }
 
 // withCurrentCLIUsage refreshes a cliAgentUsageFallback snapshot from the

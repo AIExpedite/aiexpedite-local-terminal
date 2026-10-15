@@ -1321,3 +1321,50 @@ func TestOwnershipArrivingLaterRepublishesTheCapability(t *testing.T) {
 		t.Fatalf("a second republish fired the hook again (%d)", published)
 	}
 }
+
+// TestOlderGatherKeepsTheRepublishedCapability pins the carry-over: a gather
+// that snapshotted its capabilities before ownership landed, and is stored
+// after the watcher republished `relayFollowUps` and exited, must not roll the
+// capability back out of the cache.
+func TestOlderGatherKeepsTheRepublishedCapability(t *testing.T) {
+	prevHook := onMachineInfoStored
+	onMachineInfoStored = nil
+	t.Cleanup(func() { onMachineInfoStored = prevHook })
+
+	advertised := &relayFollowUpsCapability{LiveAgents: []string{}, AttemptExpiry: true, LedgerID: "ledger-1"}
+	machineInfoMu.Lock()
+	prevCache := machineInfoCache
+	machineInfoCache = &MachineInfo{gatherSeq: 1, Capabilities: &capabilitiesInfo{RelayTurnInbox: true, RelayFollowUps: advertised}}
+	machineInfoMu.Unlock()
+	t.Cleanup(func() {
+		machineInfoMu.Lock()
+		machineInfoCache = prevCache
+		machineInfoMu.Unlock()
+	})
+
+	gathered := &MachineInfo{gatherSeq: 2, Capabilities: &capabilitiesInfo{RelayTurnInbox: true}}
+	if !storeMachineInfoIfNotOlder(gathered) {
+		t.Fatalf("the newer gather was not stored")
+	}
+	machineInfoMu.RLock()
+	caps := machineInfoCache.Capabilities
+	machineInfoMu.RUnlock()
+	if caps.RelayFollowUps != advertised {
+		t.Fatalf("the stored gather dropped the republished capability: %+v", caps.RelayFollowUps)
+	}
+	if gathered.Capabilities.RelayFollowUps != nil {
+		t.Fatalf("the gather's own MachineInfo was mutated")
+	}
+
+	// A gather that carries its own capability keeps it.
+	own := &relayFollowUpsCapability{LiveAgents: []string{}, AttemptExpiry: true, LedgerID: "ledger-2"}
+	if !storeMachineInfoIfNotOlder(&MachineInfo{gatherSeq: 3, Capabilities: &capabilitiesInfo{RelayFollowUps: own}}) {
+		t.Fatalf("the newest gather was not stored")
+	}
+	machineInfoMu.RLock()
+	got := machineInfoCache.Capabilities.RelayFollowUps
+	machineInfoMu.RUnlock()
+	if got != own {
+		t.Fatalf("a gather's own capability was replaced: %+v", got)
+	}
+}
