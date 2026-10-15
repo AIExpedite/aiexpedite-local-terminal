@@ -137,8 +137,9 @@ type relayFollowUpLedgerFile struct {
 	// `unknown` (never written) into a write — a message the previous ledger
 	// may already have delivered. The signed `ts` cannot be rewritten, so an
 	// attempt this ledger never recorded may only execute (or be fenced
-	// `notWritten`) when it was minted after this ledger was, which no
-	// earlier ledger can have recorded.
+	// `notWritten`) when it was minted after this ledger was, by more than
+	// the clock-skew margin (vouchesForLocked), which no earlier ledger can
+	// have recorded.
 	CreatedAt int64              `json:"createdAt,omitempty"`
 	Rows      []relayFollowUpRow `json:"rows"`
 }
@@ -370,11 +371,19 @@ func (l *relayFollowUpLedger) BeginForLedger(brokerLedgerID string, signedTsMs i
 //     otherwise promote an attempt from `unknown` to written (live) or to a
 //     `notWritten` fence (a query), either of which can deliver the person's
 //     message twice when the previous ledger had already written it.
-//   - the delivery was minted after this ledger identity was. `ts` is SIGNED
-//     (signaturePayload), so it cannot be rewritten without invalidating the
-//     HMAC, and no earlier ledger can have recorded an attempt that did not
-//     exist while it was live. The skew margin is the one the follow-up
-//     fences already tolerate between the broker's clock and this device's.
+//   - the delivery was minted after this ledger identity was, by MORE than
+//     the clock-skew margin. `ts` is SIGNED (signaturePayload), so it cannot
+//     be rewritten without invalidating the HMAC. The broker's clock and this
+//     device's differ, so the margin is applied in the conservative
+//     direction: an attempt an earlier ledger wrote at device time w was
+//     minted no later than w + followUpSkewMargin on the broker's clock (the
+//     same bound every follow-up expiry fence already relies on, and the one
+//     isCommandStaleAfter enforces on a future-dated ts), and w precedes this
+//     ledger's minting, so its ts is below createdAt + margin. Only a ts at
+//     or after that point proves no earlier ledger can have seen the attempt.
+//     The cost is that attempts minted within the margin of a fresh ledger
+//     are answered unknown — rare (a lost or replaced ledger file) and on the
+//     safe side.
 //
 // A delivery with no ts at all cannot be placed against the ledger's lifetime
 // and is never vouched for; every `fu_…`/`relayfollowup_` producer signs one.
@@ -385,7 +394,7 @@ func (l *relayFollowUpLedger) vouchesForLocked(brokerLedgerID string, signedTsMs
 	if signedTsMs <= 0 || l.createdAtMs <= 0 {
 		return false
 	}
-	return signedTsMs >= l.createdAtMs-followUpSkewMargin.Milliseconds()
+	return signedTsMs >= l.createdAtMs+followUpSkewMargin.Milliseconds()
 }
 
 func (l *relayFollowUpLedger) beginLocked(attemptID, followUpID, sessionID string, check followUpAttemptCheck) (relayFollowUpRow, bool) {

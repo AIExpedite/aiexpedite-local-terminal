@@ -26,6 +26,20 @@ func newTestFollowUpLedger(t *testing.T) (*relayFollowUpLedger, string) {
 	return l, path
 }
 
+// newEstablishedTestFollowUpLedger is a ledger whose identity was minted an
+// hour ago, so it vouches for attempts signed now (vouchesForLocked refuses
+// to within the clock-skew margin of a fresh identity).
+func newEstablishedTestFollowUpLedger(t *testing.T) (*relayFollowUpLedger, string) {
+	t.Helper()
+	l, path := newTestFollowUpLedger(t)
+	l.now = func() time.Time { return time.Now().Add(-time.Hour) }
+	if l.LedgerID() == "" {
+		t.Fatalf("the test ledger was not taken")
+	}
+	l.now = time.Now
+	return l, path
+}
+
 // reopenFollowUpLedger simulates a restart over the same file: the old
 // process lets go of the lock, the new one takes it and reloads.
 func reopenFollowUpLedger(t *testing.T, old *relayFollowUpLedger, path string) *relayFollowUpLedger {
@@ -235,7 +249,7 @@ func TestANonOwnerHandsTheFollowUpBack(t *testing.T) {
 }
 
 func TestAnUnseenIdIsFencedOnlyForThisLedger(t *testing.T) {
-	l, _ := newTestFollowUpLedger(t)
+	l, _ := newEstablishedTestFollowUpLedger(t)
 	if got := l.Query("never", "someone-elses-ledger", time.Now().UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("a different ledger must answer unknown, got %+v", got)
 	}
@@ -425,7 +439,7 @@ func TestFollowUpProtocolCommandsPassThroughADrain(t *testing.T) {
 }
 
 func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
-	l, _ := newTestFollowUpLedger(t)
+	l, _ := newEstablishedTestFollowUpLedger(t)
 	prevLedger := globalRelayFollowUpLedger
 	globalRelayFollowUpLedger = l
 	t.Cleanup(func() { globalRelayFollowUpLedger = prevLedger })
@@ -462,7 +476,7 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 // may already have been written: it is answered unknown, and neither recorded
 // nor written into this ledger.
 func TestALiveAttemptForAReplacedLedgerIsAnsweredUnknown(t *testing.T) {
-	l, _ := newTestFollowUpLedger(t)
+	l, _ := newEstablishedTestFollowUpLedger(t)
 	now := time.Now()
 	for _, ledgerID := range []string{"the-lost-ledger", ""} {
 		row, write := l.BeginForLedger(ledgerID, now.UnixMilli(), "att-1", "m1", "s1", okCheck(now))
@@ -980,7 +994,8 @@ func TestFollowUpCommandsKeepTheirAttemptStalenessWindow(t *testing.T) {
 // otherwise rewrite a replaced ledger's id to the current one and have the
 // attempt written (live) or fenced notWritten (a query) even though the old
 // ledger may already have delivered it. The SIGNED ts decides: only an attempt
-// minted after this ledger identity was can be vouched for.
+// minted after this ledger identity was, by more than the clock-skew margin,
+// can be vouched for.
 func TestAnAttemptMintedBeforeThisLedgerIsNeverVouchedFor(t *testing.T) {
 	l, _ := newTestFollowUpLedger(t)
 	now := time.Now()
@@ -1007,15 +1022,26 @@ func TestAnAttemptMintedBeforeThisLedgerIsNeverVouchedFor(t *testing.T) {
 	if row, write := l.BeginForLedger(l.LedgerID(), 0, "att-nots", "m1", "s1", okCheck(now)); write || row.State != followUpRowUnknown {
 		t.Fatalf("an attempt with no signed ts: write=%v row=%+v", write, row)
 	}
-	// Minted after this ledger (and inside the clock-skew margin either way).
-	if _, write := l.BeginForLedger(l.LedgerID(), minted.UnixMilli(), "att-new", "m1", "s1", okCheck(minted)); !write {
-		t.Fatalf("an attempt minted under this ledger must be written")
+	// Minted after this ledger by at least the clock-skew margin: no earlier
+	// ledger can have written it, whichever way the clocks differ.
+	vouched := minted.Add(followUpSkewMargin)
+	if _, write := l.BeginForLedger(l.LedgerID(), vouched.UnixMilli(), "att-new", "m1", "s1", okCheck(vouched)); !write {
+		t.Fatalf("an attempt minted a skew margin after this ledger must be written")
 	}
-	if _, write := l.BeginForLedger(l.LedgerID(), minted.Add(-followUpSkewMargin).UnixMilli(), "att-skew", "m1", "s1", okCheck(minted)); !write {
-		t.Fatalf("an attempt inside the clock-skew margin must be written")
-	}
-	if row, write := l.BeginForLedger(l.LedgerID(), minted.Add(-followUpSkewMargin-time.Second).UnixMilli(), "att-past", "m1", "s1", okCheck(minted)); write || row.State != followUpRowUnknown {
-		t.Fatalf("an attempt past the skew margin: write=%v row=%+v", write, row)
+	// Inside the margin either side of the minting time, a broker clock ahead
+	// of the device could date an attempt the previous ledger already wrote
+	// at or after this ledger's minting: never vouched for.
+	for name, ts := range map[string]time.Time{
+		"at the minting time":         minted,
+		"just inside the margin":      vouched.Add(-time.Millisecond),
+		"inside the margin before it": minted.Add(-followUpSkewMargin),
+	} {
+		if row, write := l.BeginForLedger(l.LedgerID(), ts.UnixMilli(), "att-skew-"+name, "m1", "s1", okCheck(vouched)); write || row.State != followUpRowUnknown {
+			t.Fatalf("an attempt %s: write=%v row=%+v, want unknown and no write", name, write, row)
+		}
+		if got := l.Query("att-q-"+name, l.LedgerID(), ts.UnixMilli()); got.State != followUpRowUnknown {
+			t.Fatalf("an unseen id %s must not be fenced notWritten, got %+v", name, got)
+		}
 	}
 }
 
@@ -1045,8 +1071,8 @@ func TestALedgerFileWithoutAMintingTimeStampsItAtLoad(t *testing.T) {
 	if got := reloaded.Query("never", reloaded.LedgerID(), before.UnixMilli()); got.State != followUpRowUnknown {
 		t.Fatalf("an unseen id older than the load must be unknown, got %+v", got)
 	}
-	if got := reloaded.Query("never", reloaded.LedgerID(), time.Now().UnixMilli()); got.State != followUpRowRefused {
-		t.Fatalf("an unseen id minted after the load must be fenced, got %+v", got)
+	if got := reloaded.Query("never", reloaded.LedgerID(), time.Now().Add(followUpSkewMargin+time.Second).UnixMilli()); got.State != followUpRowRefused {
+		t.Fatalf("an unseen id minted a skew margin after the load must be fenced, got %+v", got)
 	}
 }
 

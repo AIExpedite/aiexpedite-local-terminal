@@ -758,7 +758,7 @@ type commandMsg struct {
 	// `ledgerId` decides whether an attempt the ledger has no row for may
 	// execute, so it is never trusted on its own: relayFollowUpLedger
 	// .vouchesForLocked requires the SIGNED `ts` to be later than the ledger
-	// identity's own minting time as well. Rewriting `ledgerId` to the
+	// identity's own minting time plus the clock-skew margin as well. Rewriting `ledgerId` to the
 	// currently advertised id therefore cannot promote an attempt minted
 	// under a replaced ledger from `unknown` to a write or to a `notWritten`
 	// fence.
