@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/pubsub/v2"
 )
 
 // The follow-up attempt ledger (relay_follow_up_ledger.go): an attempt is
@@ -278,5 +281,38 @@ func TestAFenceThatDidNotReachDiskIsAnsweredUnknown(t *testing.T) {
 	}
 	if _, again := l.Begin("never", "m", "s1", okCheck(time.Now())); again {
 		t.Fatalf("a fenced unseen id was written")
+	}
+}
+
+func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
+	l, _ := newTestFollowUpLedger(t)
+	prevLedger := globalRelayFollowUpLedger
+	globalRelayFollowUpLedger = l
+	t.Cleanup(func() { globalRelayFollowUpLedger = prevLedger })
+	var answers []resultMsg
+	prevPublish := publishMsg
+	publishMsg = func(_ context.Context, _ *pubsub.Publisher, res resultMsg) error {
+		answers = append(answers, res)
+		return nil
+	}
+	t.Cleanup(func() { publishMsg = prevPublish })
+
+	now := time.Now()
+	cmd := commandMsg{
+		ID:                       relayFollowUpEnvelopePrefix + "att-1",
+		Type:                     relayFollowUpCommandType,
+		SessionID:                "s1",
+		Ts:                       now.UnixMilli(),
+		FollowUpAttemptID:        "someone-else",
+		FollowUpAttemptExpiresAt: now.Add(time.Minute).UnixMilli(),
+	}
+	handleRelayFollowUpCommand(context.Background(), nil, cmd, &Config{AgentID: "agent-1"})
+	if len(answers) != 1 || answers[0].FollowUpOutcome != followUpOutcomeNotWritten {
+		t.Fatalf("an edited delivery must be refused, got %+v", answers)
+	}
+	// Recorded in the ledger: the genuine delivery of the same attempt, which
+	// would otherwise pass every check, is refused too.
+	if row, write := l.Begin("att-1", "m1", "s1", okCheck(now)); write || row.State != followUpRowRefused {
+		t.Fatalf("a refused attempt was written later: write=%v row=%+v", write, row)
 	}
 }

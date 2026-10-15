@@ -466,11 +466,11 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		ExpiresAt:  cmd.FollowUpAttemptExpiresAt,
 		LedgerID:   cmd.FollowUpLedgerID,
 	}
-	if p.AttemptID != "" && p.AttemptID != attemptID {
-		// The unsigned metadata must name the signed attempt; anything else is refused.
-		publish(relayFollowUpRow{AttemptID: attemptID, State: followUpRowRefused, Reason: followUpReasonConversationMismatch})
-		return
-	}
+	// The unsigned metadata must name the signed attempt. A mismatch is
+	// refused through the ledger like any fence, so the attempt id stays
+	// refused: a later, genuine delivery of it is never written after the
+	// broker was told it was not.
+	metadataMatches := p.AttemptID == "" || p.AttemptID == attemptID
 	session := (*ClaudeNativeSession)(nil)
 	if globalClaudeNativeManager != nil {
 		session = globalClaudeNativeManager.Get(cmd.SessionID)
@@ -483,7 +483,7 @@ func handleRelayFollowUpCommand(ctx context.Context, topic *pubsub.Publisher, cm
 		SessionRunning: session != nil && session.Status() == "running",
 		// A relay session id is bound to one CLI conversation (a resume is a
 		// new session id), so the session being this one is the match.
-		ConversationOK:  session != nil,
+		ConversationOK:  session != nil && metadataMatches,
 		ApprovalPending: session != nil && session.pendingApprovals.Load() > 0,
 	}
 	row, write := ledger.Begin(attemptID, p.FollowUpID, cmd.SessionID, check)
