@@ -71,6 +71,15 @@ type WIFTokenSource struct {
 	// singleflight collapses them into a single HTTP round-trip and shares
 	// the result, preventing a thundering herd of WIF refresh calls.
 	sfg singleflight.Group
+
+	// requestMu serializes /auth/token requests, from the machine-info read
+	// through the response. The backend records each request's machine info as
+	// it lands, so a re-send carrying a newly added capability must not race an
+	// older in-flight request that snapshotted the capability-less cache: if the
+	// older one completed last it would overwrite the update until the next
+	// refresh. Serialized, the re-send reads the cache only after the older
+	// request has finished.
+	requestMu sync.Mutex
 }
 
 // tokenSourceAwaitingMachineInfo is the token source whose last /auth/token
@@ -230,6 +239,9 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	if ts.cfg.AgentID == "" || ts.cfg.CommandSecret == "" {
 		return "", fmt.Errorf("agent credentials not configured")
 	}
+
+	ts.requestMu.Lock()
+	defer ts.requestMu.Unlock()
 
 	// Generate timestamp and signature
 	timestamp := time.Now().UnixMilli()
