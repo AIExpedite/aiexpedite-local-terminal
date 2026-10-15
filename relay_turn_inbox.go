@@ -457,14 +457,31 @@ func (b *relayTurnInbox) BeginFenced(cmd commandMsg, turnID, agentID string, ref
 // memory as well: the acceptance is not durable, so the caller must refuse
 // the turn — neither run it nor ack it.
 func (b *relayTurnInbox) Accept(sessionID, turnID string) (relayTurnRow, bool, error) {
+	r, ok, _, err := b.AcceptFenced(sessionID, turnID, nil)
+	return r, ok, err
+}
+
+// AcceptFenced is Accept with the fence decided again, under the same lock as
+// the transition. A manager can block between the claim and this boundary
+// (waiting for a session's stdin or state lock), so a fence that passed at the
+// claim may have closed since. When refuse (nil for none) names a reason for
+// a row that is not yet accepted, the row stays claimed, nothing is persisted,
+// and the reason is returned with an error carrying relayAcceptanceNotRecorded
+// so the manager refuses the turn without writing it.
+func (b *relayTurnInbox) AcceptFenced(sessionID, turnID string, refuse func(time.Time) string) (relayTurnRow, bool, string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if !b.ownLocked() {
-		return relayTurnRow{}, false, fmt.Errorf("%s for turn %s: another agent process owns the inbox", relayAcceptanceNotRecorded, turnID)
+		return relayTurnRow{}, false, "", fmt.Errorf("%s for turn %s: another agent process owns the inbox", relayAcceptanceNotRecorded, turnID)
 	}
 	r := b.rows[relayTurnKey{sessionID, turnID}]
 	if r == nil || r.State == relayTurnStateAccepted {
-		return relayTurnRow{}, false, nil
+		return relayTurnRow{}, false, "", nil
+	}
+	if refuse != nil {
+		if reason := refuse(b.now()); reason != "" {
+			return relayTurnRow{}, false, reason, fmt.Errorf("%s for turn %s: refused at acceptance (%s)", relayAcceptanceNotRecorded, turnID, reason)
+		}
 	}
 	prev := *r
 	now := b.now().UnixMilli()
@@ -473,9 +490,9 @@ func (b *relayTurnInbox) Accept(sessionID, turnID string) (relayTurnRow, bool, e
 	r.UpdatedAt = now
 	if err := b.persistLocked(); err != nil {
 		*r = prev
-		return relayTurnRow{}, false, fmt.Errorf("%s for turn %s: %w", relayAcceptanceNotRecorded, turnID, err)
+		return relayTurnRow{}, false, "", fmt.Errorf("%s for turn %s: %w", relayAcceptanceNotRecorded, turnID, err)
 	}
-	return *r, true, nil
+	return *r, true, "", nil
 }
 
 // Finish ends this process's dispatch of a turn. The row itself stays
@@ -659,7 +676,7 @@ func relayTurnAckFrame(r relayTurnRow) resultMsg {
 // owns the inbox: the caller must Nack so Pub/Sub hands the turn to the owner.
 func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
 	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
-	return runFencedRelayTurn(ctx, inbox, cmd, turnID, agentID, nil, nil, publishAck, dispatch)
+	return runFencedRelayTurn(ctx, inbox, cmd, turnID, agentID, nil, nil, nil, publishAck, dispatch)
 }
 
 // runFencedRelayTurn is runRelayTurn with a fence decided atomically with the
@@ -676,8 +693,15 @@ func runRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, tu
 // meanwhile), the kind's SEND only published its error frame, and the broker
 // would otherwise get no outcome-bearing answer until its outbox retried. The
 // refusal is answered here instead, so the broker requeues at once.
+//
+// refuseAtAccept (nil for none) is the part of the fence decided again at the
+// acceptance boundary (AcceptFenced): a manager can wait on a session lock
+// between the claim and acceptance, and a turn whose expiry passed meanwhile
+// must not be accepted, because the broker may already have queued its
+// replacement. Only checks that take no session lock belong here — the
+// manager calls the acceptor while holding its own.
 func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandMsg, turnID, agentID string,
-	refuse func(time.Time) string, publishRefusal func(reason string),
+	refuse, refuseAtAccept func(time.Time) string, publishRefusal func(reason string),
 	publishAck func(relayTurnRow), dispatch func(context.Context)) bool {
 	decision, row, reason := inbox.BeginFenced(cmd, turnID, agentID, refuse)
 	switch decision {
@@ -716,11 +740,13 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 	var once sync.Once
 	var acceptErr error
 	acceptReached := false
+	acceptRefusal := ""
 	accept := func() error {
 		once.Do(func() {
 			acceptReached = true
-			r, ok, err := inbox.Accept(cmd.SessionID, turnID)
+			r, ok, reason, err := inbox.AcceptFenced(cmd.SessionID, turnID, refuseAtAccept)
 			if err != nil {
+				acceptRefusal = reason
 				acceptErr = err
 				return
 			}
@@ -731,6 +757,16 @@ func runFencedRelayTurn(ctx context.Context, inbox *relayTurnInbox, cmd commandM
 		return acceptErr
 	}
 	dispatch(withRelayTurnAcceptance(ctx, accept))
+	if acceptRefusal != "" {
+		// Refused at the acceptance boundary: the manager wrote nothing, and
+		// the row stays claimed, so a redelivery is refused at its claim.
+		fmt.Printf("%s[relay-inbox] Turn %s on %s refused at acceptance (%s) — never started%s\n",
+			colorYellow, turnID, cmd.SessionID, acceptRefusal, colorReset)
+		if publishRefusal != nil {
+			publishRefusal(acceptRefusal)
+		}
+		return true
+	}
 	if !acceptReached && refuse != nil && publishRefusal != nil {
 		if reason := refuse(inbox.now()); reason != "" {
 			fmt.Printf("%s[relay-inbox] Turn %s on %s refused at dispatch (%s) — never started%s\n",

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -460,6 +461,12 @@ func TestEditedAttemptMetadataFencesTheSignedAttemptForGood(t *testing.T) {
 func runFencedTestTurn(inbox *relayTurnInbox, cmd commandMsg, turnID string, dispatch func(context.Context)) (handled bool, refusal string, dispatched bool) {
 	handled = runFencedRelayTurn(context.Background(), inbox, cmd, turnID, "agent-1",
 		func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) },
+		func(now time.Time) string {
+			if followUpTurnExpired(cmd, turnID, now) {
+				return followUpReasonExpired
+			}
+			return ""
+		},
 		func(reason string) { refusal = reason },
 		func(relayTurnRow) {},
 		func(ctx context.Context) {
@@ -528,6 +535,37 @@ func TestAClaimedInFlightFollowUpTurnIsNotRefusedAsExpired(t *testing.T) {
 	// The first delivery returned without accepting: now it is decided.
 	if handled, refusal, dispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
 		t.Fatalf("redelivery after an unaccepted dispatch: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+}
+
+// A manager can wait on a session lock between the claim and the acceptance
+// boundary. A turn whose expiry passed meanwhile is refused at acceptance —
+// the manager writes nothing and the broker may requeue — and a redelivery is
+// refused at its claim, so the turn can never run after its replacement.
+func TestAQueuedFollowUpTurnPastItsExpiryAtAcceptanceIsRefused(t *testing.T) {
+	inbox := newTestRelayInbox(t)
+	start := time.Now()
+	clock := start
+	inbox.now = func() time.Time { return clock }
+	cmd := commandMsg{ID: relayTurnEnvelopePrefix + "fu_a1", SessionID: "s1", WorkspaceID: "ws-1", UID: "u-1", Ts: start.UnixMilli()}
+
+	var acceptErr error
+	handled, refusal, dispatched := runFencedTestTurn(inbox, cmd, "fu_a1", func(ctx context.Context) {
+		// Blocked on the session's stdin lock until past the deadline.
+		clock = start.Add(followUpAttemptWindow + followUpSkewMargin + time.Minute)
+		acceptErr = relayTurnAcceptor(ctx)()
+	})
+	if acceptErr == nil || !strings.Contains(acceptErr.Error(), relayAcceptanceNotRecorded) {
+		t.Fatalf("an expired turn was accepted: %v", acceptErr)
+	}
+	if !handled || refusal != followUpReasonExpired || !dispatched {
+		t.Fatalf("expired at acceptance: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
+	}
+	if row := inbox.snapshot()[relayTurnKey{"s1", "fu_a1"}]; row.State == relayTurnStateAccepted {
+		t.Fatalf("an expired turn was recorded accepted: %+v", row)
+	}
+	if handled, refusal, dispatched = runFencedTestTurn(inbox, cmd, "fu_a1", nil); !handled || refusal != followUpReasonExpired || dispatched {
+		t.Fatalf("redelivery after a refused acceptance: handled=%v refusal=%q dispatched=%v", handled, refusal, dispatched)
 	}
 }
 
