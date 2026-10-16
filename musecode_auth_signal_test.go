@@ -141,3 +141,40 @@ func TestMuseCodeChatTurn_RecordsAndClearsTheSignedOutMark(t *testing.T) {
 		t.Fatalf("a completed turn must clear the mark (stat err=%v)", err)
 	}
 }
+
+// A stale-session recovery's replay is a turn of its own: its completed run
+// clears the mark (a keychain re-login leaves no stamp to change).
+func TestMuseCodeChatTurn_ReplayRecoveryClearsTheMark(t *testing.T) {
+	isolateMuseCode(t)
+	m := installMuseCodeStub(t)
+	recordMuseCodeSignedOut(time.Now(), t.TempDir(), func(string) string { return "" })
+	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
+	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", `Error: session not found\n`)
+	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "1")
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameCompleted))
+	startMuse(t, m, "s", "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11")
+	if err := m.Send("s", "follow up", (&frameSink{}).publish, time.Minute); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if _, err := os.Stat(museCodeAuthStatePath()); !os.IsNotExist(err) {
+		t.Fatalf("the replay's completed run must clear the mark (stat err=%v)", err)
+	}
+}
+
+// A scan never erases a refusal recorded after the mark it compared: the
+// stamp check and the removal are one step under the lock.
+func TestMuseCodeSignedOutNotice_RemovesOnlyTheMarkItCompared(t *testing.T) {
+	home := isolateMuseCode(t)
+	getenv := func(string) string { return "" }
+	recordMuseCodeSignedOut(time.Now(), home, getenv)
+	// Credentials changed since: the scan clears the old mark…
+	writeMuseConfig(t, home, "auth.json", `{"t":"x"}`)
+	if _, out := museCodeSignedOutNotice(home, getenv); out {
+		t.Fatal("a changed credential must clear the old mark")
+	}
+	// …and a refusal of the NEW credential is kept by the next scan.
+	recordMuseCodeSignedOut(time.Now(), home, getenv)
+	if _, out := museCodeSignedOutNotice(home, getenv); !out {
+		t.Fatal("a refusal recorded with the current stamp must stand")
+	}
+}

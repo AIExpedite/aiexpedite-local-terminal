@@ -187,14 +187,17 @@ func observeMuseCodeAuthOutput(text string, now time.Time) {
 // source that changed since the refusal clears the mark (a new sign-in may
 // have fixed it; the next run will tell).
 func museCodeSignedOutNotice(home string, getenv func(string) string) (string, bool) {
+	// One lock across the read, the comparison and the removal: a refusal
+	// recorded meanwhile (with the CURRENT stamp) must never be erased by a
+	// scan that read the older mark.
 	museCodeAuthStateMu.Lock()
+	defer museCodeAuthStateMu.Unlock()
 	state, ok := readMuseCodeAuthStateLocked()
-	museCodeAuthStateMu.Unlock()
 	if !ok {
 		return "", false
 	}
 	if state.CredentialStamp != museCodeCredentialStamp(home, getenv) {
-		recordMuseCodeSignedIn()
+		_ = os.Remove(museCodeAuthStatePath())
 		return "", false
 	}
 	return "Muse Code is not signed in on this computer (it reported missing credentials), so no work is " +

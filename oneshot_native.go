@@ -535,6 +535,11 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 			m.rotateUnconfirmedID(session)
 			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", result2.err))
 		}
+		// The replay is a turn of its own (its completed run is the evidence
+		// a stale-session recovery produces).
+		if m.spec.ObserveTurn != nil {
+			m.spec.ObserveTurn(result2.rawStdout, result2.stderr)
+		}
 		m.publishStderrIfAny(session, publishFn, result2.stderr)
 		if session.Status() == "ended" {
 			return fmt.Errorf("session ended during turn")
