@@ -186,3 +186,25 @@ func TestMuseCodeSignedOutNotice_RemovesOnlyTheMarkItCompared(t *testing.T) {
 		t.Fatal("a refusal recorded with the current stamp must stand")
 	}
 }
+
+// Replacing one API key with another invalidates a refusal of the old key.
+func TestMuseCodeCredentialStamp_FingerprintsTheKey(t *testing.T) {
+	home := t.TempDir()
+	stamp := func(key string) string {
+		return museCodeCredentialStamp(home, func(name string) string {
+			if name == "META_API_KEY" {
+				return key
+			}
+			return ""
+		})
+	}
+	if stamp("old-key") == stamp("new-key") {
+		t.Fatal("a different key must change the stamp")
+	}
+	if stamp("old-key") != stamp("old-key") || stamp("") == stamp("old-key") {
+		t.Fatal("the stamp must be stable for one key and differ from no key")
+	}
+	if strings.Contains(stamp("secret-key-value"), "secret-key-value") {
+		t.Fatal("the stamp must never carry the key itself")
+	}
+}

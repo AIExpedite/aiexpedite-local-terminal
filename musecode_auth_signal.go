@@ -69,12 +69,13 @@ func museCodeAuthStatePath() string {
 }
 
 // museCodeCredentialStamp describes the credential sources Muse Code reads
-// without reading any of them: the API key's presence, and each candidate
-// file's size and modification time ("-" when absent).
+// without keeping any of them: a one-way fingerprint of the API key (so
+// replacing one key with another changes it), and each candidate file's size
+// and modification time ("-" when absent).
 func museCodeCredentialStamp(home string, getenv func(string) string) string {
 	parts := []string{}
-	if strings.TrimSpace(getenv("META_API_KEY")) != "" {
-		parts = append(parts, "key:set")
+	if key := strings.TrimSpace(getenv("META_API_KEY")); key != "" {
+		parts = append(parts, "key:"+museCodeAPIKeyFingerprint(key))
 	} else {
 		parts = append(parts, "key:-")
 	}
