@@ -138,6 +138,7 @@ func isolateMuseCode(t *testing.T) (home string) {
 	t.Setenv("MUSE_AUTH_PATH", "")
 	t.Setenv("AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE", filepath.Join(t.TempDir(), "musecode_usage_live.json"))
 	t.Setenv("AIEXPEDITE_MUSECODE_MODELS_CACHE", filepath.Join(t.TempDir(), "musecode_models.json"))
+	t.Setenv("AIEXPEDITE_MUSECODE_AUTH_STATE", filepath.Join(t.TempDir(), "musecode_auth_state.json"))
 	orig := startMuseCodeMSPFn
 	t.Cleanup(func() { startMuseCodeMSPFn = orig })
 	return home
@@ -278,9 +279,15 @@ func TestProbeMuseCodeUsageLive_TurnThenFirstUsageChanged(t *testing.T) {
 	}
 	startMuseCodeMSPFn = fake.start
 
+	// A signed-out mark from an earlier refusal: a reading clears it (how a
+	// keychain login, which leaves no file to stamp, comes back).
+	recordMuseCodeSignedOut(time.Now(), t.TempDir(), func(string) string { return "" })
 	outcome := probeMuseCodeUsageLive(context.Background(), detectedCLIAgent{Detected: true, Version: "1.4.0", Path: "/x/muse"}, time.Now)
 	if outcome != liveProbeOutcomeOK {
 		t.Fatalf("outcome=%q, calls=%v", outcome, fake.seen())
+	}
+	if _, err := os.Stat(museCodeAuthStatePath()); !os.IsNotExist(err) {
+		t.Fatalf("a probe reading must clear the signed-out mark (stat err=%v)", err)
 	}
 	want := []string{"initialize", "initialized", "model/list", "usage/read", "session/start", "turn/start"}
 	if got := fake.seen(); strings.Join(got, ",") != strings.Join(want, ",") {

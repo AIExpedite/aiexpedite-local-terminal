@@ -162,6 +162,9 @@ type oneShotNativeSpec struct {
 	ValidSeed func(id string) bool
 	// LooksLikeMissingSession recognizes a stale-resume failure.
 	LooksLikeMissingSession func(stdout, stderr string) bool
+	// ObserveTurn, when set, sees every finished turn's raw stdout and stderr
+	// (Muse Code reads its own sign-in refusal from them).
+	ObserveTurn func(stdout, stderr string)
 	// StripEnvPrefixes are upper-cased env prefixes removed from the child.
 	StripEnvPrefixes []string
 	// ReplayPreamble opens a transcript-replay prompt.
@@ -496,6 +499,9 @@ func (m *oneShotNativeManager) SendTurn(id, text string, publishFn PublishFunc, 
 	if result.err != nil {
 		m.rotateUnconfirmedID(session)
 		return m.publishTurnError(session, publishFn, result.err.Error())
+	}
+	if m.spec.ObserveTurn != nil {
+		m.spec.ObserveTurn(result.rawStdout, result.stderr)
 	}
 	m.publishStderrIfAny(session, publishFn, result.stderr)
 	if result.frameOverflow {

@@ -299,6 +299,9 @@ func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, r
 		if !saveMuseCodeUsageLive(reading) {
 			return liveProbeOutcomeNoReading
 		}
+		// Meta answered a turn: signed in (a keychain login clears its
+		// signed-out mark this way — musecode_auth_signal.go).
+		recordMuseCodeSignedIn()
 		return liveProbeOutcomeOK
 	}
 
