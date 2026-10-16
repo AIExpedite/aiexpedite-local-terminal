@@ -642,7 +642,9 @@ func TestRunCLIUsageLiveProbes_MuseCodeRefusalSinceTheRunSkipsTheCooldown(t *tes
 	}
 
 	// Muse Code refuses (a Ship session) after that run: the next click probes.
-	recordMuseCodeSignedOut(time.Now().Add(time.Millisecond), t.TempDir(), func(string) string { return "" })
+	// Observed at the real time: a stamp in the future could also be newer than
+	// the start of the run that click begins, and let a second click through.
+	recordMuseCodeSignedOut(time.Now(), t.TempDir(), func(string) string { return "" })
 	if got := runCLIUsageLiveProbes(context.Background()); got["museCode"] != liveProbeOutcomeOK || atomic.LoadInt32(&museCalls) != 2 {
 		t.Fatalf("a refusal since the run must let the click probe (calls=%d, outcomes=%v)", atomic.LoadInt32(&museCalls), got)
 	}
