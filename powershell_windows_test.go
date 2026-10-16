@@ -11,12 +11,18 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // newTestPersistentPS starts a dedicated persistent host (not the global one)
@@ -120,34 +126,404 @@ func TestPersistentPS_HandledErrorsNotPromoted(t *testing.T) {
 // permissive and a Group-Policy pin cannot be simulated, so a test-only
 // `powershell.exe -ExecutionPolicy Restricted` host runs the same reset / status
 // / exit-capture statements the persistent host wraps around a command.
+//
+// The refusal's message changes with the UI language and with the policy that
+// blocked it (a MachinePolicy / UserPolicy pin outranks the process scope, and
+// AllSigned reports "not digitally signed"), so the test checks the error id
+// production promotes on, not the wording, via AIX_PS_EVIDENCE lines. When a
+// pin allows local scripts there is no refusal to test and it skips.
 func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping powershell.exe integration test in -short mode")
 	}
 	dir := t.TempDir()
+	redact := func(s string) string {
+		return redactPSDiagnostics(s, dir, os.Getenv("USERPROFILE"), os.Getenv("USERNAME"))
+	}
 	blocked := filepath.Join(dir, "aixblocked.ps1")
 	if err := os.WriteFile(blocked, []byte("Write-Output 'PS1 RAN'\nexit 9\n"), 0o644); err != nil {
-		t.Fatal(err)
+		t.Fatal(redact(err.Error()))
 	}
 
-	script := psResetScript +
+	// One field per line: -OutputFormat Text wraps long lines when stdout is
+	// redirected. The policy line comes first and reads the effective policy;
+	// the rest run after psExitCaptureScript while $Error[0] is still the
+	// command's error (Write-Output changes neither $LASTEXITCODE nor $Error).
+	script := "Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))\n" +
+		psResetScript +
 		"& { & '" + blocked + "'; " + psStatusCaptureStatement + " }\n" +
 		psExitCaptureScript + "\n" +
+		"$__e = if ($Error.Count -gt 0) { $Error[0] } else { $null }\n" +
+		"Write-Output ('AIX_PS_EVIDENCE promoted=' + $__aix_promoted)\n" +
+		"Write-Output ('AIX_PS_EVIDENCE id=' + $(if ($__e) { $__e.FullyQualifiedErrorId }))\n" +
+		"Write-Output ('AIX_PS_EVIDENCE category=' + $(if ($__e) { $__e.CategoryInfo.Category }))\n" +
+		"Write-Output ('AIX_PS_EVIDENCE type=' + $(if ($__e) { $__e.Exception.GetType().FullName }))\n" +
 		"exit $__aix_exit"
 	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Restricted",
 		"-OutputFormat", "Text", "-EncodedCommand", encodeForPowerShell(script))
-	out, err := c.CombinedOutput()
+	raw, err := c.CombinedOutput()
+	out := string(raw)
+
+	ev, evErr := blockedScriptEvidence(out)
+	if evErr != nil {
+		t.Fatalf("%s\noutput: %s", redact(evErr.Error()), redact(out))
+	}
+	policy := ev["policy"]
+	run, skip := blockedScriptPolicyAction(policy)
+	if skip {
+		t.Skip(redact(fmt.Sprintf("effective execution policy %q: a higher-precedence pin allows local scripts, "+
+			"so the blocked-script scenario is not covered on this machine", policy)))
+	}
+	if !run {
+		t.Fatalf("unrecognised effective execution policy %q\noutput: %s", redact(policy), redact(out))
+	}
 
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-		t.Fatalf("expected exit 1 for a blocked script, got %v\noutput: %s", err, out)
+		t.Fatalf("expected exit 1 for a blocked script, got %s\noutput: %s", redact(fmt.Sprint(err)), redact(out))
 	}
-	if strings.Contains(string(out), "PS1 RAN") {
-		t.Fatalf("blocked .ps1 must not run under Restricted; output: %s", out)
+	if strings.Contains(out, "PS1 RAN") {
+		t.Fatalf("blocked .ps1 must not run under %s; output: %s", redact(policy), redact(out))
 	}
-	if !strings.Contains(string(out), "running scripts is disabled") {
-		t.Errorf("expected the execution-policy error in the output, got: %s", out)
+	for _, want := range []struct{ key, value string }{
+		{"promoted", "True"},
+		{"id", "UnauthorizedAccess"},
+	} {
+		if got := ev[want.key]; got != want.value {
+			t.Errorf("evidence %s: want %q, got %q\noutput: %s", want.key, want.value, redact(got), redact(out))
+		}
 	}
+}
+
+// psEvidenceMarker prefixes each structured line
+// TestExitCapture_BlockedScriptExitsOne prints from inside powershell.exe.
+const psEvidenceMarker = "AIX_PS_EVIDENCE "
+
+// blockedScriptEvidence parses the `AIX_PS_EVIDENCE <key>=<value>` lines. The
+// marker may follow other text on a line: CombinedOutput mixes in stderr's
+// CLIXML, which need not end with a newline. policy, promoted and id are
+// required (blank values are allowed); a repeated key is an error.
+func blockedScriptEvidence(out string) (map[string]string, error) {
+	ev := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		i := strings.Index(line, psEvidenceMarker)
+		if i < 0 {
+			continue
+		}
+		key, value, ok := strings.Cut(line[i+len(psEvidenceMarker):], "=")
+		if !ok {
+			return nil, fmt.Errorf("malformed evidence line %q", line)
+		}
+		key = strings.TrimSpace(key)
+		if _, dup := ev[key]; dup {
+			return nil, fmt.Errorf("evidence key %q repeated", key)
+		}
+		ev[key] = strings.TrimSpace(value)
+	}
+	for _, key := range []string{"policy", "promoted", "id"} {
+		if _, ok := ev[key]; !ok {
+			return nil, fmt.Errorf("evidence key %q missing", key)
+		}
+	}
+	return ev, nil
+}
+
+// psPermissivePolicies let an unsigned local .ps1 run.
+var psPermissivePolicies = []string{"RemoteSigned", "Unrestricted", "Bypass"}
+
+// blockedScriptPolicyAction decides from the effective policy whether the
+// blocked-script scenario runs or skips. policyBlocksLocalScripts is also false
+// for blank and unknown values, so skip is only the explicit permissive set;
+// neither run nor skip means the probe is broken and the test fails.
+func blockedScriptPolicyAction(policy string) (run, skip bool) {
+	if policyBlocksLocalScripts(policy) {
+		return true, false
+	}
+	for _, p := range psPermissivePolicies {
+		if strings.EqualFold(policy, p) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// redactPSDiagnostics masks the temp dir, home folder, user name and
+// credential-shaped text in output a failing test prints. The temp dir lives
+// inside home, so it is replaced first. Empty values are skipped.
+//
+// powershell.exe -EncodedCommand writes stderr as CLIXML, where each line ends
+// in `_x000D__x000A_`. `_` counts as a name rune, so a path or user name at the
+// end of a line would escape the boundary check. CLIXML is also XML, so a user
+// or folder name with `&` (allowed on Windows) arrives as `&amp;` and would not
+// match. Both layers are decoded first, outer XML entities then `_xHHHH_`
+// (filterCLIXML would drop the error text the failure message needs).
+func redactPSDiagnostics(out, tempDir, home, user string) string {
+	out = html.UnescapeString(out)
+	out = psCLIXMLEscapePattern.ReplaceAllStringFunc(out, func(m string) string {
+		r, _ := strconv.ParseUint(m[2:6], 16, 32)
+		return string(rune(r))
+	})
+	out = redactPSWord(out, tempDir, "<tempdir>")
+	out = redactPSWord(out, home, "<home>")
+	out = redactPSWord(out, user, "<user>")
+	return redactAgentSecrets(out)
+}
+
+// psCLIXMLEscapePattern matches CLIXML's `_xHHHH_` character escapes.
+var psCLIXMLEscapePattern = regexp.MustCompile(`_x[0-9A-Fa-f]{4}_`)
+
+// psPlaceholders are the words redactPSDiagnostics writes; a value that
+// matches one of them in place (a user named "home") is left alone.
+var psPlaceholders = []string{"<tempdir>", "<home>", "<user>"}
+
+// redactPSWord replaces each case-insensitive match of value that no Unicode
+// letter, digit or `_` touches (Go's \b is ASCII-only and would miss "José"),
+// so home C:\Users\dk never turns C:\Users\dkupi into "<home>upi". The sides are
+// checked rather than consumed, so two names sharing one delimiter are both
+// caught in a single pass.
+func redactPSWord(out, value, placeholder string) string {
+	if value == "" {
+		return out
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range regexp.MustCompile(`(?i)`+regexp.QuoteMeta(value)).FindAllStringIndex(out, -1) {
+		before, _ := utf8.DecodeLastRuneInString(out[:m[0]])
+		after, _ := utf8.DecodeRuneInString(out[m[1]:])
+		if isPSNameRune(before) || isPSNameRune(after) || isPSPlaceholderAt(out, m[0], m[1]) {
+			continue
+		}
+		b.WriteString(out[last:m[0]])
+		b.WriteString(placeholder)
+		last = m[1]
+	}
+	b.WriteString(out[last:])
+	return b.String()
+}
+
+// isPSPlaceholderAt reports whether out[start:end] is the inside of one of
+// psPlaceholders, e.g. "home" in "<home>".
+func isPSPlaceholderAt(out string, start, end int) bool {
+	if start == 0 || end >= len(out) {
+		return false
+	}
+	for _, p := range psPlaceholders {
+		if strings.EqualFold(out[start-1:end+1], p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPSNameRune reports whether r would join a user name into a longer word.
+// utf8.RuneError (start or end of text) is not a name rune.
+func isPSNameRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
+}
+
+func TestRedactPSDiagnostics(t *testing.T) {
+	const (
+		temp = `C:\Users\X\AppData\Local\Temp\TestExit123\001`
+		home = `C:\Users\X`
+	)
+	cases := []struct {
+		name, in, home, user string
+		want, absent         []string
+	}{
+		{
+			name: "temp dir in mixed case",
+			in:   `at C:\USERS\X\AppData\Local\Temp\TestExit123\001\aixblocked.ps1:1`,
+			home: home, user: "X",
+			want:   []string{`<tempdir>\aixblocked.ps1`},
+			absent: []string{`TestExit123`, `AppData`},
+		},
+		{
+			name: "home outside temp dir",
+			in:   `profile c:\users\x\Documents\WindowsPowerShell`,
+			home: home, user: "X",
+			want:   []string{`<home>\Documents`},
+			absent: []string{`users\x`},
+		},
+		{
+			name: "user as path segment",
+			in:   `D:\Users\X\work`,
+			home: home, user: "X",
+			want:   []string{`D:\Users\<user>\work`},
+			absent: []string{`\X\`},
+		},
+		{
+			name:   "short user name is whole word only",
+			in:     `owner dk ran dkupi-tools`,
+			user:   "dk",
+			want:   []string{`owner <user> ran`, `dkupi-tools`},
+			absent: []string{` dk `},
+		},
+		{
+			name: "unicode user name",
+			in:   `C:\Users\José\x DOMAIN\José josé@host Josée ends José`,
+			user: "José",
+			want: []string{`C:\Users\<user>\x`, `DOMAIN\<user> `, ` <user>@host`, ` Josée `,
+				`ends <user>`},
+			absent: []string{`\José`, `josé@`, `ends José`},
+		},
+		{
+			name: "two names sharing one delimiter",
+			in:   `José José`,
+			user: "José",
+			want: []string{`<user> <user>`},
+		},
+		{
+			name: "empty home and user",
+			in:   `plain text C:\Users\X\y`,
+			want: []string{`plain text C:\Users\X\y`},
+		},
+		{
+			name: "home is not a prefix of a longer folder name",
+			in:   `C:\Users\Xavier\y and C:\Users\X\z`,
+			home: home, user: "X",
+			want:   []string{`C:\Users\Xavier\y`, `<home>\z`},
+			absent: []string{`<home>avier`},
+		},
+		{
+			name: "CLIXML line-end escapes do not shield a path or name",
+			in: `<S S="Error">at C:\Users\X\AppData\Local\Temp\TestExit123\001_x000D__x000A_</S>` +
+				`<S S="Error">owner dk_x000D__x000A_</S>`,
+			home: home, user: "dk",
+			want:   []string{"at <tempdir>\r\n</S>", "owner <user>\r\n</S>"},
+			absent: []string{`TestExit123`, `_x000D_`},
+		},
+		{
+			name:   "XML-escaped ampersand in a user name and path",
+			in:     `<S S="Error">C:\Users\A&amp;B\x and A&amp;B_x000D__x000A_</S>`,
+			home:   `C:\Users\A&B`,
+			user:   "A&B",
+			want:   []string{`<home>\x and <user>`},
+			absent: []string{`A&amp;B`, `A&B`},
+		},
+		{
+			name:   "user name inside angle brackets is still redacted",
+			in:     `owner <dk> and <user>`,
+			user:   "dk",
+			want:   []string{`owner <<user>> and <user>`},
+			absent: []string{`<dk>`},
+		},
+		{
+			name: "user named like a placeholder terminates and keeps placeholders",
+			in:   `C:\Users\X\Documents user`,
+			home: home, user: "user",
+			want: []string{`<home>\Documents <user>`},
+		},
+		{
+			name: "user named home keeps the home placeholder",
+			in:   `C:\Users\X\a home`,
+			home: home, user: "home",
+			want: []string{`<home>\a <user>`},
+		},
+		{
+			name:   "credentials",
+			in:     "token=abcdefghijklmnopqrst\nAuthorization: Bearer abc.def.ghi",
+			want:   []string{"token=[REDACTED]", "Authorization: Bearer [REDACTED]"},
+			absent: []string{"abcdefghijklmnopqrst", "abc.def.ghi"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactPSDiagnostics(tc.in, temp, tc.home, tc.user)
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("want %q in %q", w, got)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("%q must be redacted from %q", a, got)
+				}
+			}
+		})
+	}
+}
+
+func TestBlockedScriptPolicyAction(t *testing.T) {
+	cases := []struct {
+		policy    string
+		run, skip bool
+	}{
+		{"Restricted", true, false},
+		{"restricted", true, false},
+		{"AllSigned", true, false},
+		{"ALLSIGNED", true, false},
+		{"RemoteSigned", false, true},
+		{"remotesigned", false, true},
+		{"Unrestricted", false, true},
+		{"UNRESTRICTED", false, true},
+		{"Bypass", false, true},
+		{"bypass", false, true},
+		{"", false, false},
+		{"   ", false, false},
+		{"Undefinedx", false, false},
+		{"SomeFuturePolicy", false, false},
+	}
+	for _, tc := range cases {
+		run, skip := blockedScriptPolicyAction(tc.policy)
+		if run != tc.run || skip != tc.skip {
+			t.Errorf("%q: got run=%v skip=%v, want run=%v skip=%v", tc.policy, run, skip, tc.run, tc.skip)
+		}
+	}
+}
+
+func TestBlockedScriptEvidence(t *testing.T) {
+	t.Run("own lines with CRLF", func(t *testing.T) {
+		out := "AIX_PS_EVIDENCE policy=Restricted\r\nnoise\r\nAIX_PS_EVIDENCE promoted=True\r\n" +
+			"AIX_PS_EVIDENCE id=UnauthorizedAccess\r\nAIX_PS_EVIDENCE category=SecurityError\r\n" +
+			"AIX_PS_EVIDENCE type=System.Management.Automation.PSSecurityException\r\n"
+		ev, err := blockedScriptEvidence(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{
+			"policy": "Restricted", "promoted": "True", "id": "UnauthorizedAccess",
+			"category": "SecurityError", "type": "System.Management.Automation.PSSecurityException",
+		}
+		for k, v := range want {
+			if ev[k] != v {
+				t.Errorf("%s: got %q, want %q", k, ev[k], v)
+			}
+		}
+	})
+	t.Run("marker after CLIXML on the same line", func(t *testing.T) {
+		out := "AIX_PS_EVIDENCE policy=AllSigned\n#< CLIXML\n<Objs Version=\"1.1.0.1\"></Objs>" +
+			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n"
+		ev, err := blockedScriptEvidence(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev["policy"] != "AllSigned" || ev["promoted"] != "True" || ev["id"] != "UnauthorizedAccess" {
+			t.Errorf("got %v", ev)
+		}
+	})
+	t.Run("blank values", func(t *testing.T) {
+		ev, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE promoted=False\n" +
+			"AIX_PS_EVIDENCE id=\nAIX_PS_EVIDENCE type=\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, ok := ev["id"]; !ok || v != "" {
+			t.Errorf("id: got %q (present %v), want blank", v, ok)
+		}
+	})
+	t.Run("missing id", func(t *testing.T) {
+		if _, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE promoted=True\n"); err == nil {
+			t.Error("expected an error for a missing id")
+		}
+	})
+	t.Run("duplicated key", func(t *testing.T) {
+		out := "AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE policy=Bypass\n" +
+			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n"
+		if _, err := blockedScriptEvidence(out); err == nil {
+			t.Error("expected an error for a repeated key")
+		}
+	})
 }
 
 // End to end on the real Windows path: a directory first on PATH (picked up by
