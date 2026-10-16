@@ -148,13 +148,21 @@ func TestMuseCodeChatTurn_ReplayRecoveryClearsTheMark(t *testing.T) {
 	isolateMuseCode(t)
 	m := installMuseCodeStub(t)
 	recordMuseCodeSignedOut(time.Now(), t.TempDir(), func(string) string { return "" })
+	runLog := filepath.Join(t.TempDir(), "runs.log")
+	t.Setenv("OPENCODE_STUB_RUN_LOG", runLog) // the stub counts invocations for FAIL_FIRST here
 	t.Setenv("OPENCODE_STUB_FAIL_FIRST", "1")
 	t.Setenv("OPENCODE_STUB_FIRST_STDOUT", `Error: session not found\n`)
 	t.Setenv("OPENCODE_STUB_FIRST_EXIT", "1")
 	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameCompleted))
 	startMuse(t, m, "s", "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11")
+	s := m.Get("s")
+	s.Transcript = appendOneShotTranscript(nil, "user", "earlier question")
+	s.Transcript = appendOneShotTranscript(s.Transcript, "assistant", "earlier answer")
 	if err := m.Send("s", "follow up", (&frameSink{}).publish, time.Minute); err != nil {
 		t.Fatalf("send: %v", err)
+	}
+	if runs, _ := os.ReadFile(runLog); strings.Count(string(runs), "\n") != 2 {
+		t.Fatalf("the turn must have gone through the replay (2 runs), runs=%q", runs)
 	}
 	if _, err := os.Stat(museCodeAuthStatePath()); !os.IsNotExist(err) {
 		t.Fatalf("the replay's completed run must clear the mark (stat err=%v)", err)
