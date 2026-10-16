@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,9 +254,12 @@ func blockedScriptPolicyAction(policy string) (run, skip bool) {
 //
 // powershell.exe -EncodedCommand writes stderr as CLIXML, where each line ends
 // in `_x000D__x000A_`. `_` counts as a name rune, so a path or user name at the
-// end of a line would escape the boundary check; the escapes are decoded first
+// end of a line would escape the boundary check. CLIXML is also XML, so a user
+// or folder name with `&` (allowed on Windows) arrives as `&amp;` and would not
+// match. Both layers are decoded first, outer XML entities then `_xHHHH_`
 // (filterCLIXML would drop the error text the failure message needs).
 func redactPSDiagnostics(out, tempDir, home, user string) string {
+	out = html.UnescapeString(out)
 	out = psCLIXMLEscapePattern.ReplaceAllStringFunc(out, func(m string) string {
 		r, _ := strconv.ParseUint(m[2:6], 16, 32)
 		return string(rune(r))
@@ -388,6 +392,14 @@ func TestRedactPSDiagnostics(t *testing.T) {
 			home: home, user: "dk",
 			want:   []string{"at <tempdir>\r\n</S>", "owner <user>\r\n</S>"},
 			absent: []string{`TestExit123`, `_x000D_`},
+		},
+		{
+			name:   "XML-escaped ampersand in a user name and path",
+			in:     `<S S="Error">C:\Users\A&amp;B\x and A&amp;B_x000D__x000A_</S>`,
+			home:   `C:\Users\A&B`,
+			user:   "A&B",
+			want:   []string{`<home>\x and <user>`},
+			absent: []string{`A&amp;B`, `A&B`},
 		},
 		{
 			name:   "user name inside angle brackets is still redacted",
