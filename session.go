@@ -2422,6 +2422,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			if isGrokCommand(session.Command) {
 				captureGrokUsageLimitLine(line.text, time.Now(), session.grokLimitNoticeScope)
 			}
+			// Muse Code's own "missing credentials" refusal (or a completed
+			// run) decides whether work may be routed to it here
+			// (musecode_auth_signal.go).
+			if isMuseCodeCommand(session.Command) {
+				observeMuseCodeAuthOutput(line.text, time.Now())
+			}
 
 			if isClaudeCommand(session.Command) {
 				if rejected := captureClaudeRateLimitLine(line.text, time.Now()); rejected != nil {
