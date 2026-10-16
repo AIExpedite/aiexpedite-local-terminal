@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -249,12 +250,24 @@ func blockedScriptPolicyAction(policy string) (run, skip bool) {
 // redactPSDiagnostics masks the temp dir, home folder, user name and
 // credential-shaped text in output a failing test prints. The temp dir lives
 // inside home, so it is replaced first. Empty values are skipped.
+//
+// powershell.exe -EncodedCommand writes stderr as CLIXML, where each line ends
+// in `_x000D__x000A_`. `_` counts as a name rune, so a path or user name at the
+// end of a line would escape the boundary check; the escapes are decoded first
+// (filterCLIXML would drop the error text the failure message needs).
 func redactPSDiagnostics(out, tempDir, home, user string) string {
+	out = psCLIXMLEscapePattern.ReplaceAllStringFunc(out, func(m string) string {
+		r, _ := strconv.ParseUint(m[2:6], 16, 32)
+		return string(rune(r))
+	})
 	out = redactPSWord(out, tempDir, "<tempdir>")
 	out = redactPSWord(out, home, "<home>")
 	out = redactPSWord(out, user, "<user>")
 	return redactAgentSecrets(out)
 }
+
+// psCLIXMLEscapePattern matches CLIXML's `_xHHHH_` character escapes.
+var psCLIXMLEscapePattern = regexp.MustCompile(`_x[0-9A-Fa-f]{4}_`)
 
 // psPlaceholders are the words redactPSDiagnostics writes; a value that
 // matches one of them in place (a user named "home") is left alone.
@@ -367,6 +380,14 @@ func TestRedactPSDiagnostics(t *testing.T) {
 			home: home, user: "X",
 			want:   []string{`C:\Users\Xavier\y`, `<home>\z`},
 			absent: []string{`<home>avier`},
+		},
+		{
+			name: "CLIXML line-end escapes do not shield a path or name",
+			in: `<S S="Error">at C:\Users\X\AppData\Local\Temp\TestExit123\001_x000D__x000A_</S>` +
+				`<S S="Error">owner dk_x000D__x000A_</S>`,
+			home: home, user: "dk",
+			want:   []string{"at <tempdir>\r\n</S>", "owner <user>\r\n</S>"},
+			absent: []string{`TestExit123`, `_x000D_`},
 		},
 		{
 			name:   "user name inside angle brackets is still redacted",
