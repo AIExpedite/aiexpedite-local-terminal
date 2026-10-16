@@ -19,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // newTestPersistentPS starts a dedicated persistent host (not the global one)
@@ -248,8 +250,10 @@ func blockedScriptPolicyAction(policy string) (run, skip bool) {
 // credential-shaped text in output a failing test prints. The temp dir lives
 // inside home, so it is replaced first. The user name is matched only where no
 // Unicode letter, digit or `_` touches it (Go's \b is ASCII-only and would miss
-// "José"); the delimiters are consumed, so it repeats until stable to catch two
-// names sharing one delimiter. Empty values are skipped.
+// "José"), checked around each match rather than consumed, so two names sharing
+// one delimiter are both caught in a single pass. A match that is a whole
+// placeholder word (a user named "home") is left alone. Empty values are
+// skipped.
 func redactPSDiagnostics(out, tempDir, home, user string) string {
 	for _, r := range []struct{ value, placeholder string }{
 		{tempDir, "<tempdir>"},
@@ -261,16 +265,28 @@ func redactPSDiagnostics(out, tempDir, home, user string) string {
 		out = regexp.MustCompile(`(?i)`+regexp.QuoteMeta(r.value)).ReplaceAllLiteralString(out, r.placeholder)
 	}
 	if user != "" {
-		re := regexp.MustCompile(`(?i)(^|[^\p{L}\p{N}_])` + regexp.QuoteMeta(user) + `($|[^\p{L}\p{N}_])`)
-		for {
-			next := re.ReplaceAllString(out, "${1}<user>${2}")
-			if next == out {
-				break
+		var b strings.Builder
+		last := 0
+		for _, m := range regexp.MustCompile(`(?i)`+regexp.QuoteMeta(user)).FindAllStringIndex(out, -1) {
+			before, _ := utf8.DecodeLastRuneInString(out[:m[0]])
+			after, _ := utf8.DecodeRuneInString(out[m[1]:])
+			if isPSNameRune(before) || isPSNameRune(after) || (before == '<' && after == '>') {
+				continue
 			}
-			out = next
+			b.WriteString(out[last:m[0]])
+			b.WriteString("<user>")
+			last = m[1]
 		}
+		b.WriteString(out[last:])
+		out = b.String()
 	}
 	return redactAgentSecrets(out)
+}
+
+// isPSNameRune reports whether r would join a user name into a longer word.
+// utf8.RuneError (start or end of text) is not a name rune.
+func isPSNameRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsNumber(r)
 }
 
 func TestRedactPSDiagnostics(t *testing.T) {
@@ -328,6 +344,18 @@ func TestRedactPSDiagnostics(t *testing.T) {
 			name: "empty home and user",
 			in:   `plain text C:\Users\X\y`,
 			want: []string{`plain text C:\Users\X\y`},
+		},
+		{
+			name: "user named like a placeholder terminates and keeps placeholders",
+			in:   `C:\Users\X\Documents user`,
+			home: home, user: "user",
+			want: []string{`<home>\Documents <user>`},
+		},
+		{
+			name: "user named home keeps the home placeholder",
+			in:   `C:\Users\X\a home`,
+			home: home, user: "home",
+			want: []string{`<home>\a <user>`},
 		},
 		{
 			name:   "credentials",
