@@ -147,16 +147,21 @@ var (
 	cliUsageLiveProbeGroup    singleflight.Group
 	cliUsageLiveProbeMu       sync.Mutex
 	cliUsageLiveProbeLastDone time.Time
-	cliUsageLiveProbeLast     map[string]string
+	// cliUsageLiveProbeLastStart: when the run that set LastDone began.
+	cliUsageLiveProbeLastStart time.Time
+	cliUsageLiveProbeLast      map[string]string
 )
 
 // runCLIUsageLiveProbes runs every applicable probe in parallel and returns a
 // provider → outcome map. A caller that arrives while a probe is running shares
-// it; one that arrives within the cooldown of a finished probe gets its result.
+// it; one that arrives within the cooldown of a finished probe gets its result
+// — unless Muse Code refused for missing credentials after that run began,
+// which only a new probe reading can clear (a keychain `muse login`).
 func runCLIUsageLiveProbes(ctx context.Context) map[string]string {
 	v, _, _ := cliUsageLiveProbeGroup.Do("live", func() (any, error) {
 		cliUsageLiveProbeMu.Lock()
-		if !cliUsageLiveProbeLastDone.IsZero() && time.Since(cliUsageLiveProbeLastDone) < cliUsageLiveProbeCooldown {
+		if !cliUsageLiveProbeLastDone.IsZero() && time.Since(cliUsageLiveProbeLastDone) < cliUsageLiveProbeCooldown &&
+			!museCodeRefusedSince(cliUsageLiveProbeLastStart) {
 			replay := map[string]string{}
 			for provider := range cliUsageLiveProbeLast {
 				replay[provider] = liveProbeOutcomeCooldown
@@ -166,9 +171,11 @@ func runCLIUsageLiveProbes(ctx context.Context) map[string]string {
 		}
 		cliUsageLiveProbeMu.Unlock()
 
+		started := time.Now()
 		outcomes := runCLIUsageLiveProbesOnce(ctx)
 
 		cliUsageLiveProbeMu.Lock()
+		cliUsageLiveProbeLastStart = started
 		cliUsageLiveProbeLastDone = time.Now()
 		cliUsageLiveProbeLast = outcomes
 		cliUsageLiveProbeMu.Unlock()

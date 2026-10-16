@@ -564,7 +564,7 @@ func stubLiveProbes(t *testing.T) *int32 {
 		warmCLIAgentModelDiscoveryFn, liveProbeDetectedAgents = origWarm, origDetect
 		probeAntigravityQuotaCodeAssistFn = origCodeAssist
 		cliUsageLiveProbeMu.Lock()
-		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
+		cliUsageLiveProbeLastDone, cliUsageLiveProbeLastStart, cliUsageLiveProbeLast = time.Time{}, time.Time{}, nil
 		cliUsageLiveProbeMu.Unlock()
 		resetCodexLiveRateLimitRead()
 	})
@@ -614,6 +614,43 @@ func TestRunCLIUsageLiveProbes_ParallelOutcomesAndCooldown(t *testing.T) {
 	}
 	if again["codex"] != liveProbeOutcomeCooldown {
 		t.Errorf("cooldown outcome=%v", again)
+	}
+}
+
+// A Muse Code refusal recorded after the last run began lets ONE click through
+// the cooldown: only a new probe reading can clear a keychain login's mark.
+func TestRunCLIUsageLiveProbes_MuseCodeRefusalSinceTheRunSkipsTheCooldown(t *testing.T) {
+	stubLiveProbes(t)
+	isolateMuseCode(t)
+	detect := liveProbeDetectedAgents
+	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
+		agents := detect()
+		agents["museCode"] = detectedCLIAgent{Detected: true, Path: "muse"}
+		return agents
+	}
+	origMuse := probeMuseCodeUsageLiveFn
+	t.Cleanup(func() { probeMuseCodeUsageLiveFn = origMuse })
+	var museCalls int32
+	probeMuseCodeUsageLiveFn = func(context.Context, detectedCLIAgent, func() time.Time) string {
+		atomic.AddInt32(&museCalls, 1)
+		return liveProbeOutcomeOK
+	}
+
+	runCLIUsageLiveProbes(context.Background())
+	if got := runCLIUsageLiveProbes(context.Background()); got["museCode"] != liveProbeOutcomeCooldown || atomic.LoadInt32(&museCalls) != 1 {
+		t.Fatalf("a click within the cooldown re-probed (calls=%d, outcomes=%v)", atomic.LoadInt32(&museCalls), got)
+	}
+
+	// Muse Code refuses (a Ship session) after that run: the next click probes.
+	// Observed at the real time: a stamp in the future could also be newer than
+	// the start of the run that click begins, and let a second click through.
+	recordMuseCodeSignedOut(time.Now(), t.TempDir(), func(string) string { return "" })
+	if got := runCLIUsageLiveProbes(context.Background()); got["museCode"] != liveProbeOutcomeOK || atomic.LoadInt32(&museCalls) != 2 {
+		t.Fatalf("a refusal since the run must let the click probe (calls=%d, outcomes=%v)", atomic.LoadInt32(&museCalls), got)
+	}
+	// That run has seen the refusal: the cooldown holds again.
+	if got := runCLIUsageLiveProbes(context.Background()); got["museCode"] != liveProbeOutcomeCooldown || atomic.LoadInt32(&museCalls) != 2 {
+		t.Fatalf("one refusal lets one click through (calls=%d, outcomes=%v)", atomic.LoadInt32(&museCalls), got)
 	}
 }
 

@@ -167,6 +167,16 @@ func museCodeSignedOutMarked() bool {
 	return readMuseCodeAuthStateLocked().signedOut()
 }
 
+// museCodeRefusedSince reports whether Muse Code is signed out on a refusal
+// observed after `t`. The usage Refresh's click cooldown lets that click
+// through: no probe has had the chance to clear that refusal yet.
+func museCodeRefusedSince(t time.Time) bool {
+	museCodeAuthStateMu.Lock()
+	defer museCodeAuthStateMu.Unlock()
+	state := readMuseCodeAuthStateLocked()
+	return state.signedOut() && state.FailureObservedAtMs > t.UnixMilli()
+}
+
 // museCodeAuthEvidence classifies one line of Muse Code output: -1 the CLI
 // refused for missing credentials, +1 a run completed (signed in), 0 neither.
 //
