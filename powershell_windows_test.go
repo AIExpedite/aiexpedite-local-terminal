@@ -248,39 +248,55 @@ func blockedScriptPolicyAction(policy string) (run, skip bool) {
 
 // redactPSDiagnostics masks the temp dir, home folder, user name and
 // credential-shaped text in output a failing test prints. The temp dir lives
-// inside home, so it is replaced first. The user name is matched only where no
-// Unicode letter, digit or `_` touches it (Go's \b is ASCII-only and would miss
-// "José"), checked around each match rather than consumed, so two names sharing
-// one delimiter are both caught in a single pass. A match that is a whole
-// placeholder word (a user named "home") is left alone. Empty values are
-// skipped.
+// inside home, so it is replaced first. Empty values are skipped.
 func redactPSDiagnostics(out, tempDir, home, user string) string {
-	for _, r := range []struct{ value, placeholder string }{
-		{tempDir, "<tempdir>"},
-		{home, "<home>"},
-	} {
-		if r.value == "" {
+	out = redactPSWord(out, tempDir, "<tempdir>")
+	out = redactPSWord(out, home, "<home>")
+	out = redactPSWord(out, user, "<user>")
+	return redactAgentSecrets(out)
+}
+
+// psPlaceholders are the words redactPSDiagnostics writes; a value that
+// matches one of them in place (a user named "home") is left alone.
+var psPlaceholders = []string{"<tempdir>", "<home>", "<user>"}
+
+// redactPSWord replaces each case-insensitive match of value that no Unicode
+// letter, digit or `_` touches (Go's \b is ASCII-only and would miss "José"),
+// so home C:\Users\dk never turns C:\Users\dkupi into "<home>upi". The sides are
+// checked rather than consumed, so two names sharing one delimiter are both
+// caught in a single pass.
+func redactPSWord(out, value, placeholder string) string {
+	if value == "" {
+		return out
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range regexp.MustCompile(`(?i)`+regexp.QuoteMeta(value)).FindAllStringIndex(out, -1) {
+		before, _ := utf8.DecodeLastRuneInString(out[:m[0]])
+		after, _ := utf8.DecodeRuneInString(out[m[1]:])
+		if isPSNameRune(before) || isPSNameRune(after) || isPSPlaceholderAt(out, m[0], m[1]) {
 			continue
 		}
-		out = regexp.MustCompile(`(?i)`+regexp.QuoteMeta(r.value)).ReplaceAllLiteralString(out, r.placeholder)
+		b.WriteString(out[last:m[0]])
+		b.WriteString(placeholder)
+		last = m[1]
 	}
-	if user != "" {
-		var b strings.Builder
-		last := 0
-		for _, m := range regexp.MustCompile(`(?i)`+regexp.QuoteMeta(user)).FindAllStringIndex(out, -1) {
-			before, _ := utf8.DecodeLastRuneInString(out[:m[0]])
-			after, _ := utf8.DecodeRuneInString(out[m[1]:])
-			if isPSNameRune(before) || isPSNameRune(after) || (before == '<' && after == '>') {
-				continue
-			}
-			b.WriteString(out[last:m[0]])
-			b.WriteString("<user>")
-			last = m[1]
+	b.WriteString(out[last:])
+	return b.String()
+}
+
+// isPSPlaceholderAt reports whether out[start:end] is the inside of one of
+// psPlaceholders, e.g. "home" in "<home>".
+func isPSPlaceholderAt(out string, start, end int) bool {
+	if start == 0 || end >= len(out) {
+		return false
+	}
+	for _, p := range psPlaceholders {
+		if strings.EqualFold(out[start-1:end+1], p) {
+			return true
 		}
-		b.WriteString(out[last:])
-		out = b.String()
 	}
-	return redactAgentSecrets(out)
+	return false
 }
 
 // isPSNameRune reports whether r would join a user name into a longer word.
@@ -344,6 +360,20 @@ func TestRedactPSDiagnostics(t *testing.T) {
 			name: "empty home and user",
 			in:   `plain text C:\Users\X\y`,
 			want: []string{`plain text C:\Users\X\y`},
+		},
+		{
+			name: "home is not a prefix of a longer folder name",
+			in:   `C:\Users\Xavier\y and C:\Users\X\z`,
+			home: home, user: "X",
+			want:   []string{`C:\Users\Xavier\y`, `<home>\z`},
+			absent: []string{`<home>avier`},
+		},
+		{
+			name:   "user name inside angle brackets is still redacted",
+			in:     `owner <dk> and <user>`,
+			user:   "dk",
+			want:   []string{`owner <<user>> and <user>`},
+			absent: []string{`<dk>`},
 		},
 		{
 			name: "user named like a placeholder terminates and keeps placeholders",
