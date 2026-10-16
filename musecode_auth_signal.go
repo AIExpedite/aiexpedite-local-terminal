@@ -15,19 +15,23 @@
 //
 // The CLI's own refusal is POSITIVE evidence, which is what the parser waits
 // for. Whenever a Muse Code run prints it (a Ship session or a Chat turn), it
-// is recorded together with a stamp of every credential source the CLI reads —
-// META_API_KEY present or not, and the size and mtime of each auth.json
-// candidate (never their contents). While the stamp is unchanged and nothing
-// has proved a sign-in since, the usage scan reports Muse Code signed out with
-// an error notice; terminal-service turns an error notice into `blocked`
-// (annotateBlockedCliAgents), and routing skips a blocked CLI.
+// is recorded with the time it was observed and a description of every
+// credential source the CLI reads — a one-way fingerprint of META_API_KEY, and
+// the size and mtime of each auth.json candidate (never their contents). While
+// the refusal is the newest evidence, the usage scan reports Muse Code signed
+// out with an error notice; terminal-service turns an error notice into
+// `blocked` (annotateBlockedCliAgents), and routing skips a blocked CLI.
 //
-// The mark clears on positive evidence only:
-//   - a credential source changed (`muse login` wrote auth.json, or the key was
-//     set) — the next scan sees a different stamp;
+// Newer positive evidence ends it:
+//   - a credential source ADDED or REPLACED since (`muse login` wrote auth.json,
+//     the key was set or changed) — a source that was only removed is not a
+//     fix;
 //   - a Muse Code run completed (`run.terminal.completed`);
-//   - a live usage probe got a reading (the card's Refresh), which is how a
-//     keychain login — no file to stamp — clears it.
+//   - a live usage probe got a reading (the card's Refresh, which skips its
+//     quota cooldown while signed out) — how a keychain login, which leaves no
+//     file to see, clears it.
+//
+// Evidence is ordered by when it was observed, never by when it was written.
 package main
 
 import (
@@ -48,14 +52,23 @@ var museCodeAuthFailureMarkers = []string{
 	"run `muse login`",
 }
 
-const museCodeAuthStateSchemaVersion = 1
+const museCodeAuthStateSchemaVersion = 2
 
-// museCodeAuthState is the persisted mark: when the refusal was seen and the
-// credential sources as they were then.
+// museCodeAuthState is the persisted evidence: the newest refusal, with the
+// credential sources as they were then, and the newest proof of a sign-in.
+// Muse Code is signed out while the refusal is the NEWER of the two and no
+// credential source has been added or replaced since it. Times are when the
+// evidence was OBSERVED, so evidence recorded late (a slow stat, a scheduler)
+// can never overwrite newer evidence.
 type museCodeAuthState struct {
-	SchemaVersion       int    `json:"schemaVersion"`
-	FailureObservedAtMs int64  `json:"failureObservedAtMs"`
-	CredentialStamp     string `json:"credentialStamp"`
+	SchemaVersion        int               `json:"schemaVersion"`
+	FailureObservedAtMs  int64             `json:"failureObservedAtMs,omitempty"`
+	CredentialSources    map[string]string `json:"credentialSources,omitempty"`
+	SignedInObservedAtMs int64             `json:"signedInObservedAtMs,omitempty"`
+}
+
+func (s museCodeAuthState) signedOut() bool {
+	return s.FailureObservedAtMs > 0 && s.FailureObservedAtMs > s.SignedInObservedAtMs
 }
 
 var museCodeAuthStateMu sync.Mutex
@@ -68,53 +81,90 @@ func museCodeAuthStatePath() string {
 	return filepath.Join(GetConfigDir(), "musecode_auth_state.json")
 }
 
-// museCodeCredentialStamp describes the credential sources Muse Code reads
+// museCodeCredentialAbsent is a source's value when it holds nothing.
+const museCodeCredentialAbsent = "-"
+
+// museCodeCredentialSources describes each credential source Muse Code reads
 // without keeping any of them: a one-way fingerprint of the API key (so
 // replacing one key with another changes it), and each candidate file's size
-// and modification time ("-" when absent).
-func museCodeCredentialStamp(home string, getenv func(string) string) string {
-	parts := []string{}
+// and modification time.
+func museCodeCredentialSources(home string, getenv func(string) string) map[string]string {
+	sources := map[string]string{"META_API_KEY": museCodeCredentialAbsent}
 	if key := strings.TrimSpace(getenv("META_API_KEY")); key != "" {
-		parts = append(parts, "key:"+museCodeAPIKeyFingerprint(key))
-	} else {
-		parts = append(parts, "key:-")
+		sources["META_API_KEY"] = "fp:" + museCodeAPIKeyFingerprint(key)
 	}
 	for _, path := range museCodeCredentialPaths(home, getenv) {
+		sources[path] = museCodeCredentialAbsent
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			parts = append(parts, fmt.Sprintf("%s:%d:%d", path, info.Size(), info.ModTime().UnixNano()))
-		} else {
-			parts = append(parts, path+":-")
+			sources[path] = fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
 		}
 	}
-	return strings.Join(parts, "|")
+	return sources
 }
 
-func readMuseCodeAuthStateLocked() (museCodeAuthState, bool) {
+// museCodeCredentialAddedOrReplaced: a source holds something now that it did
+// not hold at the refusal (a new or rewritten auth.json, a set or replaced
+// key). Only that may be a fix. A source that was REMOVED is not one — the
+// rejected credential is gone and nothing replaced it.
+func museCodeCredentialAddedOrReplaced(atRefusal, now map[string]string) bool {
+	for source, value := range now {
+		if value != museCodeCredentialAbsent && atRefusal[source] != value {
+			return true
+		}
+	}
+	return false
+}
+
+func readMuseCodeAuthStateLocked() museCodeAuthState {
 	var state museCodeAuthState
-	if !readBoundedJSONFile(museCodeAuthStatePath(), &state) ||
-		state.SchemaVersion != museCodeAuthStateSchemaVersion || state.FailureObservedAtMs <= 0 {
-		return museCodeAuthState{}, false
+	if !readBoundedJSONFile(museCodeAuthStatePath(), &state) || state.SchemaVersion != museCodeAuthStateSchemaVersion {
+		return museCodeAuthState{SchemaVersion: museCodeAuthStateSchemaVersion}
 	}
-	return state, true
+	return state
 }
 
-// recordMuseCodeSignedOut marks Muse Code as not signed in on this computer.
+// recordMuseCodeSignedOut records a refusal observed at `now`, unless newer
+// evidence (a sign-in, or a later refusal) is already recorded.
 func recordMuseCodeSignedOut(now time.Time, home string, getenv func(string) string) {
-	state := museCodeAuthState{
-		SchemaVersion:       museCodeAuthStateSchemaVersion,
-		FailureObservedAtMs: now.UnixMilli(),
-		CredentialStamp:     museCodeCredentialStamp(home, getenv),
-	}
+	// Read before the lock (stats can be slow); the decision below compares
+	// observation times, so a late write can never displace newer evidence.
+	sources := museCodeCredentialSources(home, getenv)
+	at := now.UnixMilli()
 	museCodeAuthStateMu.Lock()
 	defer museCodeAuthStateMu.Unlock()
+	state := readMuseCodeAuthStateLocked()
+	if state.SignedInObservedAtMs >= at || state.FailureObservedAtMs >= at {
+		return
+	}
+	state.FailureObservedAtMs = at
+	state.CredentialSources = sources
 	_ = writeJSONFileAtomic(museCodeAuthStatePath(), state)
 }
 
-// recordMuseCodeSignedIn clears the mark (positive evidence of a sign-in).
-func recordMuseCodeSignedIn() {
+// recordMuseCodeSignedIn records positive evidence of a sign-in observed at
+// `now` (a completed run, a probe reading): it outranks every older refusal.
+func recordMuseCodeSignedIn(now time.Time) {
+	at := now.UnixMilli()
 	museCodeAuthStateMu.Lock()
 	defer museCodeAuthStateMu.Unlock()
-	_ = os.Remove(museCodeAuthStatePath())
+	state := readMuseCodeAuthStateLocked()
+	if at <= state.SignedInObservedAtMs {
+		return
+	}
+	if state.FailureObservedAtMs == 0 && state.SignedInObservedAtMs == 0 {
+		return // nothing to outrank: no file for a CLI that never refused
+	}
+	state.SignedInObservedAtMs = at
+	_ = writeJSONFileAtomic(museCodeAuthStatePath(), state)
+}
+
+// museCodeSignedOutMarked reports whether the newest evidence is a refusal
+// (the live probe skips its quota cooldown then: Refresh must be able to
+// clear it).
+func museCodeSignedOutMarked() bool {
+	museCodeAuthStateMu.Lock()
+	defer museCodeAuthStateMu.Unlock()
+	return readMuseCodeAuthStateLocked().signedOut()
 }
 
 // museCodeAuthEvidence classifies one line of Muse Code output: -1 the CLI
@@ -176,7 +226,7 @@ func observeMuseCodeAuthOutput(text string, now time.Time) {
 	}
 	switch {
 	case completed:
-		recordMuseCodeSignedIn()
+		recordMuseCodeSignedIn(now)
 	case refused:
 		home, _ := os.UserHomeDir()
 		recordMuseCodeSignedOut(now, home, os.Getenv)
@@ -185,20 +235,23 @@ func observeMuseCodeAuthOutput(text string, now time.Time) {
 
 // museCodeSignedOutNotice reports whether Muse Code is known to be signed out
 // on this computer, with the notice the card and routing show. A credential
-// source that changed since the refusal clears the mark (a new sign-in may
-// have fixed it; the next run will tell).
+// source added or replaced since the refusal ends it (a new sign-in may have
+// fixed it; the next run will tell), recorded as of now so an older refusal
+// cannot bring it back.
 func museCodeSignedOutNotice(home string, getenv func(string) string) (string, bool) {
-	// One lock across the read, the comparison and the removal: a refusal
-	// recorded meanwhile (with the CURRENT stamp) must never be erased by a
-	// scan that read the older mark.
+	sources := museCodeCredentialSources(home, getenv)
+	now := time.Now().UnixMilli()
 	museCodeAuthStateMu.Lock()
 	defer museCodeAuthStateMu.Unlock()
-	state, ok := readMuseCodeAuthStateLocked()
-	if !ok {
+	state := readMuseCodeAuthStateLocked()
+	if !state.signedOut() {
 		return "", false
 	}
-	if state.CredentialStamp != museCodeCredentialStamp(home, getenv) {
-		_ = os.Remove(museCodeAuthStatePath())
+	if museCodeCredentialAddedOrReplaced(state.CredentialSources, sources) {
+		// Never earlier than the refusal it ends (a wall clock stepped back
+		// would otherwise leave the mark standing).
+		state.SignedInObservedAtMs = max(now, state.FailureObservedAtMs)
+		_ = writeJSONFileAtomic(museCodeAuthStatePath(), state)
 		return "", false
 	}
 	return "Muse Code is not signed in on this computer (it reported missing credentials), so no work is " +
