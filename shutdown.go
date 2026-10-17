@@ -15,10 +15,14 @@
 //     offlineSince is persisted and lastSeen reset.
 //     Retries within the supplied context budget.
 //  3. Sub-process teardown    — only after the backend is informed do we
-//     kill ttyd, tmux, and the persistent
-//     PowerShell helper. This avoids a race where
-//     killing children stops the goroutine before
-//     the HTTP round-trip completes.
+//     kill the CLI sessions, ttyd, tmux, and the
+//     persistent PowerShell helper. This avoids a
+//     race where killing children stops the
+//     goroutine before the HTTP round-trip
+//     completes. It runs inside whatever is LEFT
+//     of the caller's deadline, because the OS is
+//     about to kill us and a graceful wait we do
+//     not survive leaves the children behind.
 package main
 
 import (
@@ -51,7 +55,9 @@ const gracefulShutdownBudget = 5 * time.Second
 // The provided ctx is the caller's overall deadline (e.g. systray.Quit
 // might give us no time at all, in which case we still try with a default
 // budget). When ctx is nil we use a fresh background context with the
-// gracefulShutdownBudget deadline.
+// gracefulShutdownBudget deadline. Every step below spends from that one
+// window — the drains, notifyOffline, and the sub-process teardown, which gets
+// whatever is left rather than a budget of its own.
 func gracefulShutdown(ctx context.Context, cfg *Config) {
 	if !shutdownInProgress.CompareAndSwap(false, true) {
 		fmt.Println("[shutdown] gracefulShutdown already in progress, skipping duplicate call")
@@ -135,18 +141,24 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 
 	// Step 2: Notify the backend synchronously. We want this to complete
 	// before we kill the sub-processes that the connection relies on.
-	if cfg != nil && cfg.AgentID != "" && cfg.CommandSecret != "" {
-		shutdownCtx := ctx
-		var cancel context.CancelFunc
-		if shutdownCtx == nil {
-			shutdownCtx, cancel = context.WithTimeout(context.Background(), gracefulShutdownBudget)
-		} else {
-			// Always layer our budget on top so a pre-cancelled parent
-			// doesn't leave us with literally no time to talk to the API.
-			shutdownCtx, cancel = context.WithTimeout(shutdownCtx, gracefulShutdownBudget)
-		}
-		defer cancel()
+	//
+	// shutdownCtx is function-scoped on purpose: Step 3 needs the caller's
+	// REMAINING deadline, not a fresh window of its own. notifyOffline and the
+	// drains above spend from the same window, and the Windows console handler
+	// hands the whole sequence 2s (CTRL_LOGOFF/CTRL_SHUTDOWN) or 4s
+	// (CTRL_CLOSE_EVENT) — so a teardown that started its own independent
+	// budget could run past the point where Windows kills us, leaving behind
+	// the very children it was there to end.
+	shutdownCtx := ctx
+	if shutdownCtx == nil {
+		shutdownCtx = context.Background()
+	}
+	// Always layer our budget on top so a pre-cancelled parent doesn't leave
+	// us with literally no time to talk to the API.
+	shutdownCtx, cancel := context.WithTimeout(shutdownCtx, gracefulShutdownBudget)
+	defer cancel()
 
+	if cfg != nil && cfg.AgentID != "" && cfg.CommandSecret != "" {
 		if err := notifyOffline(shutdownCtx, cfg); err != nil {
 			fmt.Printf("%s[shutdown] notifyOffline failed: %v%s\n", colorYellow, err, colorReset)
 			// Fall through — best-effort. The backend's heartbeat staleness
@@ -158,9 +170,10 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 		fmt.Println("[shutdown] No registration credentials, skipping backend notify")
 	}
 
-	// Step 3: Tear down sub-processes. Errors here are best-effort — the
-	// app is exiting anyway and the OS will reap anything we miss.
-	tearDownSubprocesses()
+	// Step 3: Tear down sub-processes, within whatever is left of the caller's
+	// deadline. Errors here are best-effort — the app is exiting anyway and the
+	// OS will reap anything we miss.
+	tearDownSubprocesses(shutdownCtx)
 
 	fmt.Println("[shutdown] Graceful shutdown sequence complete")
 }
@@ -169,7 +182,11 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 // sessions (generic session_start children and every resident manager's),
 // ttyd, the tmux session, and (on Windows) the persistent PowerShell helper.
 // Idempotent and safe to call multiple times.
-func tearDownSubprocesses() {
+//
+// ctx carries the CALLER's remaining deadline — the one the OS actually gives
+// us — and bounds the session teardown below. A nil ctx (or one without a
+// deadline) means there is no deadline to respect and leaves the full budget.
+func tearDownSubprocesses(ctx context.Context) {
 	if runtime.GOOS == "windows" {
 		// Cleanup persistent PowerShell process.
 		ShutdownPowerShell()
@@ -180,10 +197,14 @@ func tearDownSubprocesses() {
 	// own children down here, but a pipe/PTY CLI session had no teardown at
 	// all, so a tray Quit left it running — until the next boot's ledger reap
 	// on macOS and Linux, where no Job Object contains it. Unlike the managers
-	// below this call is BOUNDED (sessionShutdownBudget), because the Windows
-	// console handlers give the whole shutdown 4s (close) or 2s (logoff).
+	// below this call is BOUNDED, and bounded by what is LEFT of the caller's
+	// deadline rather than by a fresh window of its own: notifyOffline and the
+	// drains above already spent from it, and the Windows console handlers give
+	// the whole shutdown 4s (close) or 2s (logoff). An expired deadline skips
+	// the graceful window and kills the children at once — being killed by
+	// Windows mid-wait is what leaves the orphan behind.
 	if globalSessionManager != nil {
-		globalSessionManager.ShutdownAllSessions()
+		globalSessionManager.ShutdownAllSessionsWithin(sessionShutdownBudgetFor(ctx, time.Now()))
 	}
 
 	// Gracefully end any in-flight Codex app-server sessions before we tear

@@ -270,7 +270,22 @@ type SessionManager struct {
 	sessions map[string]*CLISession
 	mu       sync.RWMutex
 	Config   *Config // Config for file upload settings
+	// closed is set by ShutdownAllSessionsWithin in the SAME hold of mu that
+	// takes the teardown snapshot, and is never cleared — this process is
+	// exiting. startSession refuses while it is set, so no child can be
+	// spawned after the snapshot that decides which children get ended: such a
+	// child appears in no snapshot and, on macOS and Linux, in no containment
+	// either (process_ownership_unix.go has no kill-on-close Job Object), so it
+	// would outlive the agent as exactly the orphan teardown exists to remove.
+	closed bool
 }
+
+// errSessionManagerClosed is what every StartSession variant returns once the
+// shutdown snapshot has closed the manager to new starts. A session_start that
+// lost the race with a tray Quit gets a clean refusal — it never panics, never
+// hangs, and never leaves a child behind — and the caller reports it like any
+// other start failure on a device that is going offline.
+var errSessionManagerClosed = errors.New("session manager is shutting down")
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager(cfg *Config) *SessionManager {
@@ -359,7 +374,34 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	}
 
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
+	// The manager lock is released EXPLICITLY once this session is registered
+	// (unlockManager below, just before the initial prompt is written), so the
+	// child's stdin write never happens under it. A child that does not read a
+	// prompt larger than its pipe buffer blocks that write, and blocking it
+	// under mu starved every other session operation — the shutdown snapshot
+	// included, so a tray Quit waited on the wedged child instead of ending it
+	// inside sessionShutdownBudget. Every early return between here and there
+	// still unlocks through this defer, and the second call is a no-op.
+	managerLocked := true
+	unlockManager := func() {
+		if managerLocked {
+			managerLocked = false
+			sm.mu.Unlock()
+		}
+	}
+	defer unlockManager()
+
+	// A tray Quit / SIGINT / SIGTERM may already have taken the snapshot that
+	// decides which children get ended (ShutdownAllSessionsWithin). Anything
+	// starting after it would be in no snapshot and, off Windows, in no
+	// containment either, so it is refused rather than spawned. The check is
+	// under the SAME mutex as the snapshot, so a session_start racing the Quit
+	// either registers before the snapshot — and is ended by it — or lands
+	// here. A Pub/Sub callback that passed the offline guard before shutdown
+	// and spent time in approval or preflight work is the real case.
+	if sm.closed {
+		return fmt.Errorf("session %s not started: %w", id, errSessionManagerClosed)
+	}
 
 	if _, exists := sm.sessions[id]; exists {
 		return fmt.Errorf("session %s already exists", id)
@@ -1067,6 +1109,24 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	// exits — disarm the early-return cleanup defer above.
 	sessionOwnsPromptFile = true
 	isolationOwnedBySession = true
+
+	// The session is registered and its watchers are running, so nothing below
+	// touches sm.sessions — and what IS below writes the initial prompt to the
+	// child, which blocks indefinitely on a child that never reads it. Give the
+	// manager lock up here: held across that write, one wedged child stalled
+	// every other session operation, the shutdown snapshot among them. A
+	// shutdown that overtakes us from here finds this session in its snapshot
+	// and ends it; the abandoned write then fails and is logged, which is the
+	// right outcome for a process that is exiting.
+	//
+	// The other writer of this session's stdin is SendInput, and it cannot be
+	// reached before this function returns: pubsub publishes `session_started`
+	// only after StartSession succeeds, and a `session_input` for an
+	// unregistered ID is refused. So the write below stays the sole writer
+	// without the manager lock standing in for a stdin lock — and session.mu is
+	// deliberately NOT taken for it either, because readOutputStream takes that
+	// lock per event and a long write would stall the session's own output.
+	unlockManager()
 
 	logSession(id, "%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
@@ -4933,63 +4993,125 @@ func interruptProcess(cmd *exec.Cmd) error {
 // A var so tests can shorten it.
 var sessionShutdownBudget = 2 * time.Second
 
-// ShutdownAllSessions ends every active session. Called from
-// tearDownSubprocesses (shutdown.go) for the same reason the resident CLI
-// managers are: nothing else ends a session_start child. Before it was wired
-// in, a tray Quit left every pipe/PTY CLI running — on Windows the session's
-// kill-on-close Job Object closes with the agent, but on macOS and Linux
-// there is no such containment (process_ownership_unix.go), so the CLI kept
-// drawing on the account's allowance until a later boot's ledger reap found
-// it (session_ledger.go).
+// sessionShutdownBudgetFor is sessionShutdownBudget capped at HALF of what is
+// left of the caller's shutdown deadline, so the resident CLI managers, ttyd
+// and tmux that follow it in tearDownSubprocesses keep the other half. It
+// mirrors antigravityShutdownDrainBudget, which splits the same deadline with
+// notifyOffline for the same reason.
+//
+// This matters because the budget above is NOT the deadline: notifyOffline and
+// the usage drains run before teardown and spend from the same window, and the
+// Windows console handler hands the whole sequence 2s on CTRL_LOGOFF /
+// CTRL_SHUTDOWN and 4s on CTRL_CLOSE_EVENT. A fresh, context-independent
+// graceful window could therefore run past the OS deadline, Windows would kill
+// the agent before the force path ever executed, and the orphan would survive —
+// precisely the outcome this teardown exists to prevent. An expired or
+// cancelled deadline leaves no graceful window at all and goes straight to the
+// force path. No deadline (and a nil ctx) leaves the full bound.
+func sessionShutdownBudgetFor(ctx context.Context, now time.Time) time.Duration {
+	budget := sessionShutdownBudget
+	if ctx == nil {
+		return budget
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, max(deadline.Sub(now)/2, 0))
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	return budget
+}
+
+// ShutdownAllSessions ends every active session within the full
+// sessionShutdownBudget. Callers on a deadline use ShutdownAllSessionsWithin.
+func (sm *SessionManager) ShutdownAllSessions() {
+	sm.ShutdownAllSessionsWithin(sessionShutdownBudget)
+}
+
+// ShutdownAllSessionsWithin ends every active session, spending at most window
+// on the graceful half. Called from tearDownSubprocesses (shutdown.go) for the
+// same reason the resident CLI managers are: nothing else ends a session_start
+// child. Before it was wired in, a tray Quit left every pipe/PTY CLI running —
+// on Windows the session's kill-on-close Job Object closes with the agent, but
+// on macOS and Linux there is no such containment (process_ownership_unix.go),
+// so the CLI kept drawing on the account's allowance until a later boot's
+// ledger reap found it (session_ledger.go).
+//
+// A window of zero or less skips the graceful half entirely: the caller's
+// deadline is already gone, so the children are killed now rather than after a
+// wait this process will not survive.
 //
 // Ownership is the sessions THIS process started and still holds: the entries
 // of sm.sessions, each ended through its own os.Process handle. Nothing is
-// matched by name, by port, or by scanning the process table.
-func (sm *SessionManager) ShutdownAllSessions() {
-	sm.mu.RLock()
+// matched by name, by port, or by scanning the process table. Ending a session
+// ends its process TREE (killSessionProcess → KillProcessTree, and EndSession's
+// `taskkill /PID … /T`), because a helper a CLI we started launched is
+// something we started transitively — dropping that is how the orphans come
+// back. What the platform did NOT start is never touched (plan §5.5).
+func (sm *SessionManager) ShutdownAllSessionsWithin(window time.Duration) {
+	// The clock starts HERE, before the manager lock is acquired, so window
+	// bounds the WHOLE operation rather than only the part after the snapshot.
+	// (startSession no longer holds mu across the child's initial stdin write,
+	// so a wedged child can no longer starve this acquisition either.)
+	deadline := time.Now().Add(window)
+
+	// Closing the manager to new starts and taking the snapshot happen in ONE
+	// hold of the write lock, which is what makes the snapshot final: after
+	// this, startSession can only refuse, so no child exists that this call
+	// does not know about.
+	sm.mu.Lock()
+	sm.closed = true
 	sessions := make(map[string]*CLISession, len(sm.sessions))
 	for id, session := range sm.sessions {
 		sessions[id] = session
 	}
-	sm.mu.RUnlock()
+	sm.mu.Unlock()
 
 	if len(sessions) == 0 {
 		return
 	}
-	logSession("", "%s[session] Shutting down %d active session(s)...%s\n",
-		colorYellow, len(sessions), colorReset)
 
-	var wg sync.WaitGroup
-	for id := range sessions {
-		wg.Add(1)
-		go func(id string) {
-			defer wg.Done()
-			_ = sm.EndSession(id)
-		}(id)
-	}
-	ended := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(ended)
-	}()
-	select {
-	case <-ended:
-		return
-	case <-time.After(sessionShutdownBudget):
+	graceful := time.Until(deadline)
+	if graceful <= 0 {
+		logSession("", "%s[session] Shutting down %d active session(s): no graceful window left, killing now%s\n",
+			colorRed, len(sessions), colorReset)
+	} else {
+		logSession("", "%s[session] Shutting down %d active session(s) (graceful window %s)...%s\n",
+			colorYellow, len(sessions), graceful.Round(time.Millisecond), colorReset)
+
+		var wg sync.WaitGroup
+		for id := range sessions {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				_ = sm.EndSession(id)
+			}(id)
+		}
+		ended := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(ended)
+		}()
+		select {
+		case <-ended:
+			return
+		case <-time.After(graceful):
+		}
 	}
 
-	// Budget spent. Force whatever is still running. The in-flight EndSession
-	// goroutines are abandoned rather than awaited — an unconfirmed kill is
-	// the next boot's reap to resolve, and blocking here is exactly what
-	// wedges a Quit.
+	// Window spent (or never granted). Force whatever is still running. The
+	// in-flight EndSession goroutines are abandoned rather than awaited — an
+	// unconfirmed kill is the next boot's reap to resolve, and blocking here is
+	// exactly what wedges a Quit. killSessionProcess takes the process TREE, so
+	// a helper the CLI launched goes with it.
 	for id, session := range sessions {
 		select {
 		case <-processExitSignal(session.processExited, session.done):
 			continue
 		default:
 		}
-		logSession(id, "%s[session] Force killing session %s: shutdown budget (%s) spent%s\n",
-			colorRed, id, sessionShutdownBudget, colorReset)
+		logSession(id, "%s[session] Force killing session %s: shutdown window (%s) spent%s\n",
+			colorRed, id, max(graceful, 0).Round(time.Millisecond), colorReset)
 		if err := killSessionProcess(session); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			logSession(id, "%s[session] Shutdown kill failed for %s: %v%s\n",
 				colorRed, id, err, colorReset)
