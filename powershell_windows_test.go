@@ -132,6 +132,10 @@ func TestPersistentPS_HandledErrorsNotPromoted(t *testing.T) {
 // AllSigned reports "not digitally signed"), so the test checks the error id
 // production promotes on, not the wording, via AIX_PS_EVIDENCE lines. When a
 // pin allows local scripts there is no refusal to test and it skips.
+//
+// The effective policy comes from psEffectivePolicyProbe rather than
+// Get-ExecutionPolicy; that constant records why the cmdlet is not available
+// inside this host.
 func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping powershell.exe integration test in -short mode")
@@ -146,10 +150,10 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	}
 
 	// One field per line: -OutputFormat Text wraps long lines when stdout is
-	// redirected. The policy line comes first and reads the effective policy;
+	// redirected. The policy probe comes first and reads the effective policy;
 	// the rest run after psExitCaptureScript while $Error[0] is still the
 	// command's error (Write-Output changes neither $LASTEXITCODE nor $Error).
-	script := "Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))\n" +
+	script := psEffectivePolicyProbe +
 		psResetScript +
 		"& { & '" + blocked + "'; " + psStatusCaptureStatement + " }\n" +
 		psExitCaptureScript + "\n" +
@@ -194,6 +198,32 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 		}
 	}
 }
+
+// psEffectivePolicyProbe prints the effective execution policy as an
+// AIX_PS_EVIDENCE line without touching the Microsoft.PowerShell.Security
+// module: `Get-ExecutionPolicy` is unavailable inside a `powershell.exe` that
+// inherited a pwsh 7 PSModulePath, as on the CI runner, because pwsh 7 ships
+// its own Microsoft.PowerShell.Security that Windows PowerShell 5.1 cannot
+// load. Autoload then fails with CommandNotFoundException /
+// CouldNotAutoloadMatchingModule, and the echoed source line is what reaches
+// the evidence as the policy value.
+//
+// A MachinePolicy or UserPolicy Group-Policy pin outranks the process scope, so
+// both are read first, straight from the registry through .NET (no module, and
+// no .ps1 for the policy under test to block); `EnableScripts = 0` is the
+// Restricted form of that pin. Without a pin the process scope stands, which
+// the host's own -ExecutionPolicy flag left in PSExecutionPolicyPreference.
+const psEffectivePolicyProbe = "$__pol = ''\n" +
+	"foreach ($__k in 'HKEY_LOCAL_MACHINE', 'HKEY_CURRENT_USER') {\n" +
+	"  if ($__pol) { continue }\n" +
+	"  $__b = $__k + '\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell'\n" +
+	"  $__en = [Microsoft.Win32.Registry]::GetValue($__b, 'EnableScripts', $null)\n" +
+	"  if ($null -ne $__en -and 0 -eq [int]$__en) { $__pol = 'Restricted'; continue }\n" +
+	"  $__v = [string][Microsoft.Win32.Registry]::GetValue($__b, 'ExecutionPolicy', $null)\n" +
+	"  if ($__v) { $__pol = $__v }\n" +
+	"}\n" +
+	"if (-not $__pol) { $__pol = [string]" + processPolicyProbe + " }\n" +
+	"Write-Output ('" + psEvidenceMarker + "policy=' + $__pol)\n"
 
 // psEvidenceMarker prefixes each structured line
 // TestExitCapture_BlockedScriptExitsOne prints from inside powershell.exe.
