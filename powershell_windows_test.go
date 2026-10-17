@@ -205,12 +205,6 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 // TestExitCapture_BlockedScriptExitsOne prints from inside powershell.exe.
 const psEvidenceMarker = "AIX_PS_EVIDENCE "
 
-// psSecurityModuleImport avoids Windows PowerShell 5.1's inability to autoload
-// the Security module under an inherited pwsh 7 PSModulePath. processPolicyProbe
-// works around the same CI issue via an environment variable, but that only
-// reports Process scope; this test needs the effective policy.
-const psSecurityModuleImport = `Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop`
-
 // blockedScriptEvidence parses stdout's `AIX_PS_EVIDENCE <key>=<value>` lines.
 // The marker must start a line so an error record's echo of the script source
 // cannot supply evidence. policy, promoted and id are required (blank values
@@ -475,6 +469,7 @@ func TestBlockedScriptPolicyAction(t *testing.T) {
 		{"   ", false, false},
 		{"Undefinedx", false, false},
 		{"SomeFuturePolicy", false, false},
+		// Exact malformed policy observed in CI when CLIXML echoed the probe source.
 		{"' + (Get-ExecutionPolicy))\r\n</S><S S=\"Error\">+ ...", false, false},
 	}
 	for _, tc := range cases {
