@@ -318,26 +318,174 @@ var (
    Tracked Working Directory
    Persists the last known cwd across commands so that cd changes
    are remembered even when the server sends the same default cwd.
+
+   Keyed by sender, not process-wide. One package variable meant one cwd per
+   agent process, so a `cd` from any command moved the cwd for every later
+   one-off command whoever sent it — already wrong before parallel runs,
+   because the chat and voice sessions are unbounded and coexist with a Ship
+   run. The cwd is therefore held against the most specific identity the
+   command carries (its execution, else its session), and the old process-wide
+   value survives as the last fallback for a command that carries neither.
+   That fallback is not a leftover: it is still every one-off `execute` the
+   current server publishes, which keeps today's behaviour unchanged.
+
+   Deliberately NOT keyed by command id (that would reset the cwd on every
+   command and defeat the `cd` persistence this cache exists for) and not by
+   workspace+uid (two runs in the same workspace would still collide).
    -------------------------------------------------------------------------- */
 
-var (
-	trackedCwd     string
-	trackedCwdLock sync.RWMutex
-)
-
-func getTrackedCwd() string {
-	trackedCwdLock.RLock()
-	defer trackedCwdLock.RUnlock()
-	return trackedCwd
+// cwdScope is the identity a tracked cwd belongs to. Its zero value is the
+// process-wide default.
+type cwdScope struct {
+	executionID string
+	sessionID   string
 }
 
-func setTrackedCwd(cwd string) {
+// cwdScopeFor derives the scope from one inbound command.
+func cwdScopeFor(cmd commandMsg) cwdScope {
+	return cwdScope{executionID: cmd.ExecutionID, sessionID: cmd.SessionID}
+}
+
+// keys returns the scope's lookup keys, most specific first, always ending in
+// the process-wide default (""). The prefixes keep an execution id from
+// colliding with a session id that happens to share its text.
+func (s cwdScope) keys() []string {
+	keys := make([]string, 0, 3)
+	if s.executionID != "" {
+		keys = append(keys, "exec:"+s.executionID)
+	}
+	if s.sessionID != "" {
+		keys = append(keys, "session:"+s.sessionID)
+	}
+	return append(keys, "")
+}
+
+type trackedCwdEntry struct {
+	cwd        string
+	lastAccess time.Time
+}
+
+const (
+	// trackedCwdTTL is how long an idle scope keeps its cwd. It matches the
+	// per-UID rate limiters above, and a run that is still sending commands
+	// refreshes its entry on every read and write.
+	trackedCwdTTL = 1 * time.Hour
+	// trackedCwdMaxEntries bounds the map between sweeps. One run at a time
+	// plus a handful of chat/voice sessions is the real concurrency, so 512
+	// scopes is far past it; at the cap an insert evicts the least recently
+	// used entry rather than growing.
+	trackedCwdMaxEntries = 512
+)
+
+var (
+	// trackedCwds holds one entry per scope key. The "" key is the
+	// process-wide default the single variable used to be.
+	trackedCwds         = make(map[string]*trackedCwdEntry)
+	trackedCwdLock      sync.Mutex
+	trackedCwdCleanupOn sync.Once
+)
+
+// getTrackedCwd returns the cwd tracked for scope, falling back to its session
+// and then to the process-wide default. A plain mutex rather than an RWMutex:
+// every read refreshes lastAccess, so there is no read-only path to optimize.
+func getTrackedCwd(scope cwdScope) string {
+	now := time.Now()
+	trackedCwdLock.Lock()
+	defer trackedCwdLock.Unlock()
+	for _, key := range scope.keys() {
+		if entry, ok := trackedCwds[key]; ok && entry.cwd != "" {
+			entry.lastAccess = now
+			return entry.cwd
+		}
+	}
+	return ""
+}
+
+// setTrackedCwd records cwd against the most specific key scope carries, so a
+// `cd` only ever moves its own sender's later commands.
+func setTrackedCwd(scope cwdScope, cwd string) {
 	if cwd == "" {
 		return
 	}
+	startTrackedCwdCleanup()
+
+	key := scope.keys()[0]
+	now := time.Now()
+
 	trackedCwdLock.Lock()
-	trackedCwd = cwd
-	trackedCwdLock.Unlock()
+	defer trackedCwdLock.Unlock()
+	if entry, ok := trackedCwds[key]; ok {
+		entry.cwd = cwd
+		entry.lastAccess = now
+		return
+	}
+	if len(trackedCwds) >= trackedCwdMaxEntries {
+		evictOldestTrackedCwdLocked()
+	}
+	trackedCwds[key] = &trackedCwdEntry{cwd: cwd, lastAccess: now}
+}
+
+// evictOldestTrackedCwdLocked drops the least recently used entry; callers hold
+// trackedCwdLock. The process-wide default is evictable like any other key —
+// this is a cache, and the next command that carries no identity repopulates it.
+func evictOldestTrackedCwdLocked() {
+	oldestKey := ""
+	var oldest time.Time
+	found := false
+	for key, entry := range trackedCwds {
+		if !found || entry.lastAccess.Before(oldest) {
+			oldestKey, oldest, found = key, entry.lastAccess, true
+		}
+	}
+	if found {
+		delete(trackedCwds, oldestKey)
+	}
+}
+
+// resetTrackedCwds forgets every scope. Tests only: nothing in the agent needs
+// to drop every sender's cwd at once.
+func resetTrackedCwds() {
+	trackedCwdLock.Lock()
+	defer trackedCwdLock.Unlock()
+	trackedCwds = make(map[string]*trackedCwdEntry)
+}
+
+// sweepTrackedCwdsBefore drops every scope whose last read or write predates
+// cutoff, and reports how many it dropped.
+func sweepTrackedCwdsBefore(cutoff time.Time) int {
+	trackedCwdLock.Lock()
+	defer trackedCwdLock.Unlock()
+	removed := 0
+	for key, entry := range trackedCwds {
+		if entry.lastAccess.Before(cutoff) {
+			delete(trackedCwds, key)
+			removed++
+		}
+	}
+	return removed
+}
+
+// startTrackedCwdCleanup evicts scopes idle for trackedCwdTTL every minute —
+// the same shape as startRateLimiterCleanup, started from the same kind of
+// place (the only call that can grow the map). The lifetime is a TTL rather
+// than an event because nothing signals the end: there are seven session
+// managers, each deleting from its own map, and an execution never announces
+// its end at all.
+func startTrackedCwdCleanup() {
+	trackedCwdCleanupOn.Do(func() {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					sweepTrackedCwdsBefore(time.Now().Add(-trackedCwdTTL))
+				case <-shutdownChan:
+					return
+				}
+			}
+		}()
+	})
 }
 
 // startRateLimiterCleanup launches a background goroutine that removes stale entries every minute.
@@ -717,6 +865,13 @@ type commandMsg struct {
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
+
+	// ExecutionID scopes a one-off command's tracked cwd to the run that sent
+	// it (see the Tracked Working Directory block). UNSIGNED and OPTIONAL
+	// correlation metadata, like WorkspaceID/UID: a server that does not send
+	// it falls through to SessionID and then to the process-wide default, so
+	// its absence never refuses or changes a command.
+	ExecutionID string `json:"executionId,omitempty"`
 
 	// Environment Setup plan attribution + risk. RiskLevel is SIGNED (see
 	// signaturePayload) so an attacker who can alter a signed command cannot
@@ -2241,7 +2396,7 @@ func runPubSubConnection(cfg *Config) error {
 			Status:      "success",
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
-			Cwd:         getTrackedCwd(),
+			Cwd:         getTrackedCwd(cwdScopeFor(cmd)),
 		}
 		if execErr != nil {
 			res.Status = "error"
@@ -2261,7 +2416,7 @@ func runPubSubConnection(cfg *Config) error {
 			// are NOT scanned together — walking the default home tree on
 			// top of the real exec dir would sweep up unrelated fresh media
 			// and make detection expensive.
-			effectiveDir := getTrackedCwd()
+			effectiveDir := getTrackedCwd(cwdScopeFor(cmd))
 			if effectiveDir == "" {
 				effectiveDir = cmd.Cwd
 			}
@@ -2795,15 +2950,18 @@ func resolveExecTimeout(timeoutMs int64) time.Duration {
 //  1. explicit cwd that differs from the config default → use it (user changed settings)
 //  2. cwd equals the config default → prefer tracked cwd (user may have cd'd)
 //  3. no cwd → tracked cwd or config default
-func resolveWorkDir(cfg *Config, cwd string) string {
+//
+// scope is whose tracked cwd steps 2 and 3 may read — the sender's own, so
+// another run's `cd` cannot answer here.
+func resolveWorkDir(cfg *Config, cwd string, scope cwdScope) string {
 	workDir := cwd
 	if workDir != "" && cfg != nil && strings.EqualFold(workDir, cfg.WorkingDirectory) {
-		if tc := getTrackedCwd(); tc != "" {
+		if tc := getTrackedCwd(scope); tc != "" {
 			workDir = tc
 		}
 	}
 	if workDir == "" {
-		if tc := getTrackedCwd(); tc != "" {
+		if tc := getTrackedCwd(scope); tc != "" {
 			workDir = tc
 		} else if cfg != nil {
 			workDir = cfg.WorkingDirectory
@@ -2829,7 +2987,7 @@ func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
 	if cmd.Tty && isPTYEligibleCommand(cmd.Command, cmd.Args) {
 		return runTTYCommand(cfg, cmd)
 	}
-	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs, cwdScopeFor(cmd))
 }
 
 // runTTYCommand runs an eligible command under a pseudo-terminal and returns its
@@ -2837,7 +2995,7 @@ func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
 // captured error (ConPTY deferred).
 func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 	timeout := resolveExecTimeout(cmd.TimeoutMs)
-	workDir := resolveWorkDir(cfg, cmd.Cwd)
+	workDir := resolveWorkDir(cfg, cmd.Cwd, cwdScopeFor(cmd))
 	// Apply the same one-shot argv shaping StartSession uses for an eligible PTY
 	// agent so a tty=true `execute` request returns a result instead of dropping
 	// into the interactive TUI and hanging until the prompt timeout. agy/
@@ -5409,9 +5567,11 @@ func replaceDashCPayload(args []string, payload string) []string {
 	return out
 }
 
-func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
+// scope names the sender whose tracked cwd this command reads and writes; the
+// zero value is the process-wide default (see cwdScope).
+func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64, scope cwdScope) (string, error) {
 	timeout := resolveExecTimeout(timeoutMs)
-	workDir := resolveWorkDir(cfg, cwd)
+	workDir := resolveWorkDir(cfg, cwd, scope)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
@@ -5432,7 +5592,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	if runtime.GOOS != "windows" || isAntigravityCommand(cmd) {
 		return runLocalCommandUnix(cmd, args, workDir, timeout)
 	}
-	return runLocalCommandWindows(cmd, args, workDir, timeout)
+	return runLocalCommandWindows(cmd, args, workDir, timeout, scope)
 }
 
 // runLocalCommandWindows runs one execute through the Windows transport chain:
@@ -5447,7 +5607,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 // payload), and there was no single place to arm the quota capture around them.
 // It carries no build tag, so a test can drive the whole chain on any OS through
 // the runEncodedPowerShellViaArgFn / runPowerShellCommandViaTempFileFn seams.
-func runLocalCommandWindows(cmd string, args []string, workDir string, timeout time.Duration) (string, error) {
+func runLocalCommandWindows(cmd string, args []string, workDir string, timeout time.Duration, scope cwdScope) (string, error) {
 	// One arm covers the whole chain below: every transport runs synchronously
 	// inside this window, and the fallbacks are sequential rather than
 	// concurrent, so a failover cannot double-arm. Unlike the Unix path there is
@@ -5516,7 +5676,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 				agentLine = claudePath + agentLine[6:] // 6 = len("claude")
 			}
 		}
-		return runLocalCommandFallbackFn(agentLine, workDir, timeout, onStart)
+		return runLocalCommandFallbackFn(agentLine, workDir, timeout, onStart, scope)
 	}
 
 	// cmdLine is what every remaining transport runs. It differs from
@@ -5541,7 +5701,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	if isTestRunnerCommand(classifyLine) {
 		fmt.Printf("%s[aiexpedite] Using one-shot hardened process for test runner: %s%s\n",
 			colorCyan, cmd, colorReset)
-		return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
+		return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 	}
 
 	// Route bash-style commands (containing && or ||) through a one-shot
@@ -5557,7 +5717,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	ps, err := GetPowerShell()
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Persistent PowerShell unavailable, using fallback%s\n", colorYellow, colorReset)
-		return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
+		return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -5575,12 +5735,12 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// Process-level failure: try restarting PS once then retry.
 		if restartErr := RestartPowerShell(); restartErr != nil {
 			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
-			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 		}
 
 		ps, err = GetPowerShell()
 		if err != nil {
-			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 		}
 		capture.SetWrapper(ps.HostPID())
 
@@ -5589,13 +5749,16 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// could allow the command to run for up to 2× the requested duration.
 		output, err = ps.Execute(ctx, cmdLine, workDir)
 		if err != nil {
-			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart)
+			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 		}
 	}
 
-	// Sync tracked cwd from persistent PowerShell's last known location
+	// Sync tracked cwd from persistent PowerShell's last known location.
+	// The persistent host is shared by every sender, so its cwd is recorded
+	// against THIS command's scope only — the next command re-sets the host's
+	// location from its own resolved workDir.
 	if newCwd := GetTrackedCwd(); newCwd != "" {
-		setTrackedCwd(newCwd)
+		setTrackedCwd(scope, newCwd)
 	}
 
 	return output, nil
@@ -5709,7 +5872,7 @@ func buildFallbackProbeCommand(cmdLine, sentinel string) string {
 // Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
 // After the command runs, it queries the final working directory so that cd
 // commands are tracked even through the fallback path.
-func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
+func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration, onStart func(pid int), scope cwdScope) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -5753,7 +5916,7 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 		if len(lines) >= 1 {
 			cwd := strings.TrimRight(lines[0], "\r\n ")
 			if cwd != "" {
-				setTrackedCwd(cwd)
+				setTrackedCwd(scope, cwd)
 			}
 		}
 		out = out[:idx]

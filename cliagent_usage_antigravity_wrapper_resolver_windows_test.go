@@ -47,7 +47,7 @@ func TestAntigravityWrapperResolver_EncodedPowerShellResolves(t *testing.T) {
 	helperShortResolverTick(t)
 	script := fmt.Sprintf(`& '%s' --print hello`, executable)
 	if out, err := runLocalCommandWindows("powershell",
-		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), time.Minute); err != nil {
+		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), time.Minute, cwdScope{}); err != nil {
 		t.Fatalf("wrapped run failed: %v (%s)", err, out)
 	}
 	antigravityUsageRefreshWaitIdle()
@@ -63,7 +63,7 @@ func TestAntigravityWrapperResolver_ShortRunResolvedByRamp(t *testing.T) {
 	executable := helperWrappedAgyFixture(t, "2s")
 	script := fmt.Sprintf(`& '%s' --print hello`, executable)
 	if out, err := runLocalCommandWindows("powershell",
-		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), time.Minute); err != nil {
+		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), time.Minute, cwdScope{}); err != nil {
 		t.Fatalf("wrapped run failed: %v (%s)", err, out)
 	}
 	antigravityUsageRefreshWaitIdle()

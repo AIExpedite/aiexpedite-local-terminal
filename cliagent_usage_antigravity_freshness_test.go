@@ -676,7 +676,7 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 	script := fmt.Sprintf(`Set-Location %q; & %q --print "hello"`, t.TempDir(), executable)
 	out, execErr := runLocalCommandWindows("powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell(script)},
-		t.TempDir(), 30*time.Second)
+		t.TempDir(), 30*time.Second, cwdScope{})
 	if execErr != nil {
 		t.Fatalf("windows execute failed: %v (output=%q)", execErr, out)
 	}
@@ -717,7 +717,7 @@ func TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing(t *testing.T) {
 
 	if _, err := runLocalCommandWindows("powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell("git log --grep agy")},
-		t.TempDir(), 30*time.Second); err != nil {
+		t.TempDir(), 30*time.Second, cwdScope{}); err != nil {
 		t.Fatalf("windows execute failed: %v", err)
 	}
 	if got := antigravityCaptureArms.Load(); got != 0 {

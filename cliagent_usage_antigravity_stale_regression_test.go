@@ -115,7 +115,7 @@ func helperRunEncodedPowerShellAgy(t *testing.T, f helperStaleRegression) {
 	}
 	script := fmt.Sprintf(`Set-Location %q; & %q --print "hello"`, t.TempDir(), f.executable)
 	out, err := runLocalCommandWindows("powershell",
-		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), 30*time.Second)
+		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), 30*time.Second, cwdScope{})
 	if err != nil {
 		t.Fatalf("encoded-PowerShell execute failed: %v (output=%q)", err, out)
 	}
