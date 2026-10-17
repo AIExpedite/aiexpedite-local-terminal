@@ -369,14 +369,31 @@ func cwdScopeFor(cmd commandMsg) cwdScope {
 // the write path derive their keys, so the bound cannot be sidestepped by a
 // scope built elsewhere (session_artifacts.go builds one from a session id).
 func (s cwdScope) keys() []string {
-	keys := make([]string, 0, 3)
+	keys := make([]string, 0, 2)
 	if s.executionID != "" {
 		keys = append(keys, "exec:"+boundedScopeID(s.executionID))
 	}
 	if s.sessionID != "" {
 		keys = append(keys, "session:"+boundedScopeID(s.sessionID))
 	}
-	return append(keys, "")
+	// The "" key belongs to frames carrying NO identity, and it is the ONLY
+	// key they have. An identified sender must never read it.
+	//
+	// setTrackedCwd writes keys()[0] alone, so an identified scope can never
+	// have WRITTEN "" — which makes a fallback to it pure cross-contamination:
+	// the "" entry holds whatever the last unidentified command did, i.e. some
+	// other sender's directory. Falling through to it is how a run ends up
+	// executing in another feature's worktree with a clean exit code, and it
+	// is reachable whenever a sender's own entry is absent: never set, expired,
+	// evicted, or declined because the map was full.
+	//
+	// Losing the lookup instead costs only memory of an earlier `cd`: the
+	// caller then uses the cwd the server sent, which is the pre-cache
+	// behaviour. Forgetful is recoverable; wrong directory is not.
+	if len(keys) == 0 {
+		keys = append(keys, "")
+	}
+	return keys
 }
 
 // boundedScopeID keeps one scope key short.
@@ -442,10 +459,15 @@ var (
 // and then to the process-wide default. A plain mutex rather than an RWMutex:
 // every read refreshes lastAccess, so there is no read-only path to optimize.
 func getTrackedCwd(scope cwdScope) string {
+	// keys() hashes an over-long id (boundedScopeID), and the ids are
+	// attacker-sized: unsigned, with no inbound length guard, on a transport
+	// that allows megabytes. Derive the keys BEFORE taking the lock, or every
+	// command's lookup holds the global mutex across that hash.
+	keys := scope.keys()
 	now := time.Now()
 	trackedCwdLock.Lock()
 	defer trackedCwdLock.Unlock()
-	for _, key := range scope.keys() {
+	for _, key := range keys {
 		if entry, ok := trackedCwds[key]; ok && entry.cwd != "" {
 			entry.lastAccess = now
 			return entry.cwd
@@ -463,10 +485,11 @@ func getTrackedCwd(scope cwdScope) string {
 // directory, and resolveWorkDir has already considered that chain before the
 // command ran. Only commandUploadScanRoot asks it.
 func getTrackedCwdExact(scope cwdScope) string {
+	key := scope.keys()[0] // hashed outside the lock; see getTrackedCwd
 	now := time.Now()
 	trackedCwdLock.Lock()
 	defer trackedCwdLock.Unlock()
-	if entry, ok := trackedCwds[scope.keys()[0]]; ok && entry.cwd != "" {
+	if entry, ok := trackedCwds[key]; ok && entry.cwd != "" {
 		entry.lastAccess = now
 		return entry.cwd
 	}
@@ -484,6 +507,15 @@ func setTrackedCwd(scope cwdScope, cwd string) {
 	key := scope.keys()[0]
 	now := time.Now()
 
+	// Printed after trackedCwdLock is released, never under it. This defer is
+	// registered BEFORE the unlock defer so it runs after it.
+	var declined string
+	defer func() {
+		if declined != "" {
+			fmt.Print(declined)
+		}
+	}()
+
 	trackedCwdLock.Lock()
 	defer trackedCwdLock.Unlock()
 	if entry, ok := trackedCwds[key]; ok {
@@ -492,7 +524,7 @@ func setTrackedCwd(scope cwdScope, cwd string) {
 		return
 	}
 	if len(trackedCwds) >= trackedCwdMaxEntries && !evictExpiredTrackedCwdLocked(now.Add(-trackedCwdTTL)) {
-		noteDeclinedTrackedCwdLocked(now)
+		declined = noteDeclinedTrackedCwdLocked(now)
 		return
 	}
 	trackedCwds[key] = &trackedCwdEntry{cwd: cwd, lastAccess: now}
@@ -543,16 +575,22 @@ func evictExpiredTrackedCwdLocked(cutoff time.Time) bool {
 // needs to read. Guarded by trackedCwdLock, like the map itself.
 var trackedCwdDeclineLoggedAt time.Time
 
-// noteDeclinedTrackedCwdLocked reports, at most once a minute, that the cache
+// noteDeclinedTrackedCwdLocked decides whether this decline is worth logging
+// and RETURNS the line, or "" to stay quiet. The caller prints it after
+// releasing the lock: trackedCwdLock serializes every tracked-cwd read and
+// write, so doing stdout I/O under it blocks every command's cwd lookup behind
+// whatever is consuming stdout.
+//
+// Reports, at most once a minute, that the cache
 // is full of live scopes. Declining is safe but it is not normal — the real
 // concurrency is one run plus a handful of sessions — so it has to be visible
 // rather than silent.
-func noteDeclinedTrackedCwdLocked(now time.Time) {
+func noteDeclinedTrackedCwdLocked(now time.Time) string {
 	if !trackedCwdDeclineLoggedAt.IsZero() && now.Sub(trackedCwdDeclineLoggedAt) < time.Minute {
-		return
+		return ""
 	}
 	trackedCwdDeclineLoggedAt = now
-	fmt.Printf("%s[aiexpedite] tracked cwd cache full of active scopes (%d); new senders keep the cwd they were sent until one expires%s\n",
+	return fmt.Sprintf("%s[aiexpedite] tracked cwd cache full of active scopes (%d); new senders keep the cwd they were sent until one expires%s\n",
 		colorYellow, len(trackedCwds), colorReset)
 }
 

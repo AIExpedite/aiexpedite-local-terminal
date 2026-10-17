@@ -48,7 +48,12 @@ func TestTrackedCwd_ResolutionOrder(t *testing.T) {
 	}{
 		{"execution wins", cwdScope{executionID: "exec-1", sessionID: "sess-1"}, `C:\execution`},
 		{"session next", cwdScope{sessionID: "sess-1"}, `C:\session`},
-		{"unknown session falls through", cwdScope{sessionID: "sess-9"}, `C:\default`},
+		// An unknown session does NOT fall through to the unidentified pool.
+		// setTrackedCwd writes only the most specific key, so this sender can
+		// never have written "" — inheriting it would mean running in whatever
+		// directory the last identity-less command happened to leave there.
+		// Empty makes the caller use the cwd the server sent instead.
+		{"unknown session does not inherit the unidentified cwd", cwdScope{sessionID: "sess-9"}, ""},
 		{"unknown execution falls through to its session", cwdScope{executionID: "exec-9", sessionID: "sess-1"}, `C:\session`},
 		{"no identity reads the default", cwdScope{}, `C:\default`},
 	}

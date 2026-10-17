@@ -246,17 +246,61 @@ func TestTrackedCwd_ADeclinedSenderRunsWhereItWasSent(t *testing.T) {
 	t.Cleanup(resetTrackedCwds)
 
 	cfg := &Config{WorkingDirectory: "C:/work"}
+
+	// The "" entry is the one that matters, and the earlier version of this
+	// test never created it — so resolveWorkDir returned at step 1 and the
+	// assertion passed against plain LRU and against no cache at all. Every
+	// one-off execute from a server that sends no identity writes this key, so
+	// in production it is normally populated with SOME other sender's cwd.
+	setTrackedCwd(cwdScope{}, "C:/someone/elses/worktree")
+
 	for i := 0; i < trackedCwdMaxEntries; i++ {
 		setTrackedCwd(cwdScope{executionID: fmt.Sprintf("exec-%d", i)}, fmt.Sprintf("C:/d%d", i))
 	}
 
 	declined := cwdScope{executionID: "exec-declined"}
 	setTrackedCwd(declined, "C:/work/aixwt/mine/repo")
-
 	if got := getTrackedCwd(declined); got != "" {
 		t.Fatalf("precondition: the insert should have been declined, read %q", got)
 	}
-	if got := resolveWorkDir(cfg, "C:/work/aixwt/mine/repo", declined); got != "C:/work/aixwt/mine/repo" {
-		t.Errorf("a declined sender ran in %q, want the cwd it was sent", got)
+
+	// And the frame must carry the DEFAULT cwd, which is what the server
+	// re-sends every time and the only value that reaches the map lookup.
+	if got := resolveWorkDir(cfg, cfg.WorkingDirectory, declined); got != cfg.WorkingDirectory {
+		t.Errorf("a declined sender ran in %q, want the cwd it was sent (%q)", got, cfg.WorkingDirectory)
+	}
+}
+
+// An identified sender must never read the unidentified pool's cwd.
+//
+// setTrackedCwd writes keys()[0] alone, so an identified scope can never have
+// WRITTEN the "" key — a fallback to it could only ever return another sender's
+// directory. This is the route by which a run executes in another feature's
+// worktree with a clean exit code, and it is reachable whenever the sender's own
+// entry is absent: never set, expired, evicted, or declined.
+func TestTrackedCwd_AnIdentifiedSenderNeverInheritsTheUnidentifiedCwd(t *testing.T) {
+	resetTrackedCwds()
+	t.Cleanup(resetTrackedCwds)
+
+	cfg := &Config{WorkingDirectory: "C:/work"}
+	setTrackedCwd(cwdScope{}, "C:/someone/elses/worktree")
+
+	for name, scope := range map[string]cwdScope{
+		"execution only":        {executionID: "exec-a"},
+		"session only":          {sessionID: "sess-a"},
+		"execution and session": {executionID: "exec-b", sessionID: "sess-b"},
+	} {
+		if got := getTrackedCwd(scope); got != "" {
+			t.Errorf("%s: read the unidentified cwd %q", name, got)
+		}
+		if got := resolveWorkDir(cfg, cfg.WorkingDirectory, scope); got != cfg.WorkingDirectory {
+			t.Errorf("%s: resolved to %q, want the sent cwd %q", name, got, cfg.WorkingDirectory)
+		}
+	}
+
+	// A frame with NO identity still gets its own entry: that key is theirs,
+	// and removing the fallback must not remove the feature.
+	if got := getTrackedCwd(cwdScope{}); got != "C:/someone/elses/worktree" {
+		t.Errorf("an unidentified sender lost its own cwd, got %q", got)
 	}
 }
