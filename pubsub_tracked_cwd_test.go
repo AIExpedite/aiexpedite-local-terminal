@@ -171,3 +171,62 @@ func TestTrackedCwd_EvictionDropsTheLeastRecentlyUsed(t *testing.T) {
 		t.Fatalf("the new scope was not recorded: %q", got)
 	}
 }
+
+// A SIGNED cwd must win over any tracked one.
+//
+// `executionID` arrives unsigned, so an attacker with topic-write but no HMAC
+// key can append one to a REPLAYED signed frame without disturbing its
+// signature. If the signed cwd happened to equal the configured default, the
+// `cd`-persistence substitution would then redirect the command to whatever
+// that scope had remembered. Env-setup (RiskLevel) and read-only frames are the
+// two that sign `cwd` — exactly signatureCwd's condition.
+func TestResolveWorkDir_TrackedCwdNeverOverridesASignedCwd(t *testing.T) {
+	resetTrackedCwds()
+	t.Cleanup(resetTrackedCwds)
+
+	cfg := &Config{WorkingDirectory: "C:/work"}
+
+	// The scope has a remembered cwd, as if an earlier `cd` had run under it.
+	poisoned := commandMsg{ID: "c1", ExecutionID: "exec-victim"}
+	setTrackedCwd(cwdScopeFor(poisoned), "C:/attacker")
+	if got := getTrackedCwd(cwdScopeFor(poisoned)); got != "C:/attacker" {
+		t.Fatalf("precondition: tracked cwd not recorded, got %q", got)
+	}
+
+	// Each frame signs its cwd, and each names the configured default — the one
+	// value that triggers the substitution.
+	for _, signed := range []commandMsg{
+		{ID: "c2", ExecutionID: "exec-victim", Cwd: "C:/work", RiskLevel: "high"},
+		{ID: "c3", ExecutionID: "exec-victim", Cwd: "C:/work", ReadOnly: true},
+	} {
+		scope := cwdScopeFor(signed)
+		if !scope.cwdSigned {
+			t.Fatalf("frame %s should be treated as signing its cwd", signed.ID)
+		}
+		if got := resolveWorkDir(cfg, signed.Cwd, scope); got != "C:/work" {
+			t.Errorf("frame %s: signed cwd was overridden, got %q want %q", signed.ID, got, "C:/work")
+		}
+	}
+
+	// The same scope on an ORDINARY frame still gets `cd` persistence: the
+	// hardening must not remove the feature it is protecting.
+	ordinary := commandMsg{ID: "c4", ExecutionID: "exec-victim", Cwd: "C:/work"}
+	if got := resolveWorkDir(cfg, ordinary.Cwd, cwdScopeFor(ordinary)); got != "C:/attacker" {
+		t.Errorf("unsigned frame lost cd persistence, got %q want %q", got, "C:/attacker")
+	}
+}
+
+// A signed frame with no cwd at all falls back to the configured directory,
+// never to a tracked one.
+func TestResolveWorkDir_SignedFrameWithoutCwdUsesTheConfiguredDirectory(t *testing.T) {
+	resetTrackedCwds()
+	t.Cleanup(resetTrackedCwds)
+
+	cfg := &Config{WorkingDirectory: "C:/work"}
+	signed := commandMsg{ID: "d1", ExecutionID: "exec-d", ReadOnly: true}
+	setTrackedCwd(cwdScopeFor(signed), "C:/attacker")
+
+	if got := resolveWorkDir(cfg, "", cwdScopeFor(signed)); got != "C:/work" {
+		t.Errorf("got %q want %q", got, "C:/work")
+	}
+}

@@ -339,11 +339,27 @@ var (
 type cwdScope struct {
 	executionID string
 	sessionID   string
+	// cwdSigned marks a frame whose `cwd` is covered by the HMAC (an env-setup
+	// step or a read-only session — exactly signatureCwd's condition). A tracked
+	// cwd must never override such a frame: `executionID` arrives UNSIGNED, so
+	// an attacker with topic-write but no key could append one to a REPLAYED
+	// signed frame without disturbing its signature, and if the signed cwd
+	// happened to equal the configured default, the substitution below would
+	// silently redirect the command to that scope's remembered directory. The
+	// signed cwd is the authority; nothing unsigned may move it.
+	cwdSigned bool
 }
 
 // cwdScopeFor derives the scope from one inbound command.
 func cwdScopeFor(cmd commandMsg) cwdScope {
-	return cwdScope{executionID: cmd.ExecutionID, sessionID: cmd.SessionID}
+	return cwdScope{
+		executionID: cmd.ExecutionID,
+		sessionID:   cmd.SessionID,
+		// cwdIsSigned, not `signatureCwd(cmd) != ""`: a read-only start with no
+		// cwd signs an EMPTY cwd, and testing the string would read that as
+		// unsigned and allow the substitution this flag exists to prevent.
+		cwdSigned: cwdIsSigned(cmd),
+	}
 }
 
 // keys returns the scope's lookup keys, most specific first, always ending in
@@ -774,10 +790,19 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 // agent reporting capabilities.readOnlySessions (this build or later), so no
 // older agent ever sees a read-only start with a signed cwd.
 func signatureCwd(cmd commandMsg) string {
-	if cmd.RiskLevel == "" && !cmd.ReadOnly {
+	if !cwdIsSigned(cmd) {
 		return ""
 	}
 	return cmd.Cwd
+}
+
+// cwdIsSigned is the GATE signatureCwd applies, named so it can be asked
+// without inspecting the resulting string. `signatureCwd(cmd) != ""` is NOT the
+// same question: a read-only start carrying no cwd signs an empty one, which
+// would read as unsigned and let a tracked cwd be substituted for it
+// (cwdScope.cwdSigned). One definition, two callers.
+func cwdIsSigned(cmd commandMsg) bool {
+	return cmd.RiskLevel != "" || cmd.ReadOnly
 }
 
 func cliAgentCatalogSignatureJSON(cmd commandMsg) json.RawMessage {
@@ -2955,6 +2980,15 @@ func resolveExecTimeout(timeoutMs int64) time.Duration {
 // another run's `cd` cannot answer here.
 func resolveWorkDir(cfg *Config, cwd string, scope cwdScope) string {
 	workDir := cwd
+	// A signed cwd is authoritative: never substitute a tracked one for it.
+	// Ordinary execute frames do not sign `cwd`, so `cd` persistence below is
+	// unaffected — there is nothing to protect on those.
+	if scope.cwdSigned {
+		if workDir == "" && cfg != nil {
+			workDir = cfg.WorkingDirectory
+		}
+		return workDir
+	}
 	if workDir != "" && cfg != nil && strings.EqualFold(workDir, cfg.WorkingDirectory) {
 		if tc := getTrackedCwd(scope); tc != "" {
 			workDir = tc
