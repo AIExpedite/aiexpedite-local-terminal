@@ -118,11 +118,20 @@ type ClaudeNativeSession struct {
 	// "the child died mid-turn" (nothing has probed for the quota it just spent).
 	// Atomic because the stdout scanner writes it and waitForExit reads it.
 	turnSettled atomic.Bool
+	// pendingApprovals counts can_use_tool control_requests read and not yet
+	// answered: a live follow-up is never written while one is open (it would
+	// sit beside an approval a person must answer first).
+	pendingApprovals atomic.Int32
 	// killUnconfirmed marks a session whose End escalated to Kill and then
 	// timed out waiting for the exit watcher. The session is RETAINED as a
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
+	// launchedVersion is the major.minor.patch of the Claude binary this child
+	// was spawned from ("" when it could not be established). Live follow-ups
+	// are gated on it rather than on the installed version, which an in-place
+	// upgrade can change under a running session. Set once at construction.
+	launchedVersion string
 	// terminalPublishState reserves this session's ID while its claude_native_ended
 	// frame is in flight — see end_confirm.go.
 	terminalPublishState
@@ -245,6 +254,7 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	}
 
 	executable := resolveExecutable("claude")
+	launchedVersion, launchedKey := claudeLaunchVersion(executable)
 	args, extractedPrompt := buildClaudeInteractiveArgs(extraArgs)
 	prompt := initialPrompt
 	if prompt == "" {
@@ -288,20 +298,22 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		return fmt.Errorf("failed to start claude (is `claude` on PATH?): %w", err)
 	}
 	trackSessionProcess(id, proc)
+	launchedVersion = confirmClaudeLaunchVersion(executable, launchedVersion, launchedKey)
 
 	session := &ClaudeNativeSession{
-		ID:            id,
-		Process:       proc,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		StartedAt:     time.Now(),
-		WorkspaceID:   workspaceID,
-		UID:           uid,
-		status:        "running",
-		done:          make(chan struct{}),
-		processExited: make(chan struct{}),
-		streamDone:    make(chan struct{}),
+		ID:              id,
+		Process:         proc,
+		Stdin:           stdin,
+		Stdout:          stdout,
+		Stderr:          stderr,
+		StartedAt:       time.Now(),
+		WorkspaceID:     workspaceID,
+		UID:             uid,
+		launchedVersion: launchedVersion,
+		status:          "running",
+		done:            make(chan struct{}),
+		processExited:   make(chan struct{}),
+		streamDone:      make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -443,6 +455,19 @@ func (m *ClaudeNativeManager) writeUserTurnAccepting(session *ClaudeNativeSessio
 	return nil
 }
 
+// answerPendingApproval counts one open approval as answered, never below
+// zero. A compare-and-swap, not Load-then-Add: the reader resets the count to
+// zero at a turn's result, and a decrement racing that reset must not leave
+// -1 behind (the next approval would then read as none open).
+func (s *ClaudeNativeSession) answerPendingApproval() {
+	for {
+		n := s.pendingApprovals.Load()
+		if n <= 0 || s.pendingApprovals.CompareAndSwap(n, n-1) {
+			return
+		}
+	}
+}
+
 // SendControl writes a stream-json control_response to the child's stdin —
 // a human's answer to a can_use_tool control_request (the voice relay
 // launches Claude with --permission-prompt-tool stdio). Only a well-formed
@@ -473,6 +498,8 @@ func (m *ClaudeNativeManager) SendControl(id string, raw string) error {
 		if err != nil {
 			return fmt.Errorf("failed to write control to claude native session %s: %w", session.ID, err)
 		}
+		// The person answered one open approval.
+		session.answerPendingApproval()
 		return nil
 	case <-time.After(claudeNativeStdinWriteBudget):
 		// Same teardown as a stalled user turn: releasing stdinMu with the
@@ -885,8 +912,13 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			// detectResultEvent is the same terminal-frame decision session.go
 			// makes for the managed path — one definition, so the two execution
 			// paths can never disagree about what "the run finished" means.
+			if strings.Contains(trimmed, `"control_request"`) && strings.Contains(trimmed, `"can_use_tool"`) {
+				session.pendingApprovals.Add(1)
+			}
 			if detectResultEvent("claude", trimmed) {
 				session.turnSettled.Store(true)
+				// A finished turn has no approval left open.
+				session.pendingApprovals.Store(0)
 				triggerClaudeUsageProbeAfterRun()
 			}
 		}

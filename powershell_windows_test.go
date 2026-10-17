@@ -149,7 +149,7 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	}
 
 	// One field per line: -OutputFormat Text wraps long lines when stdout is
-	// redirected. The policy line comes first and reads the effective policy;
+	// redirected. The policy probe comes first and reads the effective policy;
 	// the rest run after psExitCaptureScript while $Error[0] is still the
 	// command's error (Write-Output changes neither $LASTEXITCODE nor $Error).
 	script := psSecurityModuleImport + "\n" +

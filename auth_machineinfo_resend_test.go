@@ -69,11 +69,13 @@ func isolateMachineInfo(t *testing.T) {
 	machineInfoCache = nil
 	machineInfoMu.Unlock()
 	tokenSourceAwaitingMachineInfo.Store(nil)
+	savedLast := lastTokenSource.Swap(nil)
 	t.Cleanup(func() {
 		machineInfoMu.Lock()
 		machineInfoCache = saved
 		machineInfoMu.Unlock()
 		tokenSourceAwaitingMachineInfo.Store(nil)
+		lastTokenSource.Store(savedLast)
 	})
 }
 
@@ -168,5 +170,233 @@ func TestGatherLandingRightAfterBareRead_StillResends(t *testing.T) {
 	}
 	if !carried {
 		t.Fatalf("no token request carried machine info after the gather landed: %v", rec.snapshot())
+	}
+}
+
+// Codex P2 on #219: a token request that already carried machine info clears
+// the bare-request arm, so a capability added to the cache afterwards (the
+// follow-up ledger becoming owned once an overlapping process exits) was never
+// re-sent. The capability-added path repeats the request unconditionally.
+func TestCapabilityAddedAfterAFullRequest_IsResent(t *testing.T) {
+	isolateMachineInfo(t)
+	rec, srv := newTokenRequestRecorder(t)
+	ts := NewWIFTokenSource(&Config{AgentID: "agent-1", CommandSecret: "secret", TokenEndpoint: srv.URL})
+
+	info := baselineMachineInfo()
+	info.Capabilities = &capabilitiesInfo{RelayTurnInbox: true}
+	machineInfoMu.Lock()
+	machineInfoCache = info
+	machineInfoMu.Unlock()
+	if _, err := ts.getOIDCToken(); err != nil {
+		t.Fatalf("getOIDCToken failed: %v", err)
+	}
+	if tokenSourceAwaitingMachineInfo.Load() != nil {
+		t.Fatal("a request that carried machine info left a re-send pending")
+	}
+
+	updated := *info
+	updated.Capabilities = &capabilitiesInfo{
+		RelayTurnInbox: true,
+		RelayFollowUps: &relayFollowUpsCapability{AttemptExpiry: true, LedgerID: "ledger-1"},
+	}
+	machineInfoMu.Lock()
+	machineInfoCache = &updated
+	machineInfoMu.Unlock()
+	onMachineCapabilityAdded()
+
+	rec.waitFor(t, 2)
+	caps, _ := rec.snapshot()[1]["capabilities"].(map[string]any)
+	followUps, _ := caps["relayFollowUps"].(map[string]any)
+	if followUps["ledgerId"] != "ledger-1" {
+		t.Fatalf("re-sent request lacks the added capability: %v", rec.snapshot()[1])
+	}
+}
+
+// Before any token request there is nothing to repeat: the first request reads
+// the updated cache itself.
+func TestCapabilityAddedBeforeAnyRequest_SendsNothing(t *testing.T) {
+	isolateMachineInfo(t)
+	rec, _ := newTokenRequestRecorder(t)
+	onMachineCapabilityAdded()
+	time.Sleep(200 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("token requests=%d, want 0", got)
+	}
+}
+
+// Codex P2 on #219: the capability re-send ran concurrently with an older
+// in-flight request that had snapshotted the capability-less cache, so the
+// older one could land last and overwrite the update. Requests on a token
+// source are serialized now: the re-send goes out only after the older request
+// completes, and it reads the updated cache.
+func TestCapabilityResend_WaitsForTheInFlightOlderRequest(t *testing.T) {
+	isolateMachineInfo(t)
+	var (
+		mu       sync.Mutex
+		payloads []map[string]any
+	)
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	completed := make(chan struct{}, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		payloads = append(payloads, payload)
+		n := len(payloads)
+		mu.Unlock()
+		if n == 1 {
+			close(firstArrived)
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id_token": "oidc-token", "expires_in": 3600, "token_type": "Bearer"})
+		completed <- struct{}{}
+	}))
+	t.Cleanup(srv.Close)
+	ts := NewWIFTokenSource(&Config{AgentID: "agent-1", CommandSecret: "secret", TokenEndpoint: srv.URL})
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payloads)
+	}
+
+	info := baselineMachineInfo()
+	info.Capabilities = &capabilitiesInfo{RelayTurnInbox: true}
+	machineInfoMu.Lock()
+	machineInfoCache = info
+	machineInfoMu.Unlock()
+	go func() {
+		if _, err := ts.getOIDCToken(); err != nil {
+			t.Errorf("getOIDCToken failed: %v", err)
+		}
+	}()
+	select {
+	case <-firstArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first token request never arrived")
+	}
+
+	updated := *info
+	updated.Capabilities = &capabilitiesInfo{
+		RelayTurnInbox: true,
+		RelayFollowUps: &relayFollowUpsCapability{AttemptExpiry: true, LedgerID: "ledger-1"},
+	}
+	machineInfoMu.Lock()
+	machineInfoCache = &updated
+	machineInfoMu.Unlock()
+	onMachineCapabilityAdded()
+
+	time.Sleep(200 * time.Millisecond)
+	if got := count(); got != 1 {
+		t.Fatalf("token requests=%d while the older request was in flight, want 1 (re-send must wait)", got)
+	}
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-completed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d token requests completed, want 2", i)
+		}
+	}
+	mu.Lock()
+	last := payloads[len(payloads)-1]
+	mu.Unlock()
+	caps, _ := last["capabilities"].(map[string]any)
+	followUps, _ := caps["relayFollowUps"].(map[string]any)
+	if followUps["ledgerId"] != "ledger-1" {
+		t.Fatalf("the request that completed last lacks the added capability: %v", last)
+	}
+}
+
+// Codex P2 on #219: production runs independent token sources (Pub/Sub and
+// GCS), and the capability re-send goes through only the last one. The
+// request ordering is process-wide, so a re-send on one source still waits
+// for an older capability-less request in flight on ANOTHER source.
+func TestCapabilityResend_WaitsForAnOlderRequestOnAnotherTokenSource(t *testing.T) {
+	isolateMachineInfo(t)
+	var (
+		mu       sync.Mutex
+		payloads []map[string]any
+	)
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	completed := make(chan struct{}, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		mu.Lock()
+		payloads = append(payloads, payload)
+		n := len(payloads)
+		mu.Unlock()
+		if n == 1 {
+			close(firstArrived)
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id_token": "oidc-token", "expires_in": 3600, "token_type": "Bearer"})
+		completed <- struct{}{}
+	}))
+	t.Cleanup(srv.Close)
+	cfg := &Config{AgentID: "agent-1", CommandSecret: "secret", TokenEndpoint: srv.URL}
+	pubsubSource := NewWIFTokenSource(cfg)
+	storageSource := NewWIFTokenSource(cfg)
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payloads)
+	}
+
+	info := baselineMachineInfo()
+	info.Capabilities = &capabilitiesInfo{RelayTurnInbox: true}
+	machineInfoMu.Lock()
+	machineInfoCache = info
+	machineInfoMu.Unlock()
+	go func() {
+		if _, err := pubsubSource.getOIDCToken(); err != nil {
+			t.Errorf("getOIDCToken failed: %v", err)
+		}
+	}()
+	select {
+	case <-firstArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first token request never arrived")
+	}
+	// The re-send goes through the OTHER source.
+	lastTokenSource.Store(storageSource)
+
+	updated := *info
+	updated.Capabilities = &capabilitiesInfo{
+		RelayTurnInbox: true,
+		RelayFollowUps: &relayFollowUpsCapability{AttemptExpiry: true, LedgerID: "ledger-1"},
+	}
+	machineInfoMu.Lock()
+	machineInfoCache = &updated
+	machineInfoMu.Unlock()
+	onMachineCapabilityAdded()
+
+	time.Sleep(200 * time.Millisecond)
+	if got := count(); got != 1 {
+		t.Fatalf("token requests=%d while another source's request was in flight, want 1 (re-send must wait)", got)
+	}
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-completed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d token requests completed, want 2", i)
+		}
+	}
+	mu.Lock()
+	last := payloads[len(payloads)-1]
+	mu.Unlock()
+	caps, _ := last["capabilities"].(map[string]any)
+	followUps, _ := caps["relayFollowUps"].(map[string]any)
+	if followUps["ledgerId"] != "ledger-1" {
+		t.Fatalf("the request that completed last lacks the added capability: %v", last)
 	}
 }
