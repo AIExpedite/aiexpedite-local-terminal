@@ -52,6 +52,10 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			if caps.RecommendedConcurrentTests != 0 || caps.RecommendedConcurrentBuilds != 0 {
 				t.Fatalf("caps = %+v, want no concurrency hints without both probes", *caps)
 			}
+			if caps.RelayFollowUps == nil || !caps.RelayFollowUps.AttemptExpiry {
+				t.Fatalf("caps = %+v, want the follow-up ledger reported", *caps)
+			}
+			caps.RelayFollowUps = nil // its ledgerId is per machine
 			raw, _ := json.Marshal(caps)
 			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true}` {
 				t.Fatalf("capabilities JSON = %s", raw)

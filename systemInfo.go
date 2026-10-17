@@ -136,13 +136,152 @@ type capabilitiesInfo struct {
 	// sends `readOnly` only when this is true — an older agent would reject
 	// the unknown signed field as a bad signature.
 	ReadOnlySessions bool `json:"readOnlySessions"`
+	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
+	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,
+	// a fenced attempt id is refused forever, and `relay_follow_up_query`
+	// answers from the ledger. `liveAgents` lists only CLIs certified for live
+	// follow-ups (empty until a certification run passes).
+	RelayFollowUps *relayFollowUpsCapability `json:"relayFollowUps,omitempty"`
 }
+
+type relayFollowUpsCapability struct {
+	LiveAgents    []string `json:"liveAgents"`
+	AttemptExpiry bool     `json:"attemptExpiry"`
+	LedgerID      string   `json:"ledgerId"`
+}
+
+// newRelayFollowUpsCapability reports the ledger and the certified live
+// agents, or nil when this process does not own BOTH the follow-up ledger and
+// the relay-turn inbox.
+func newRelayFollowUpsCapability() *relayFollowUpsCapability {
+	return newRelayFollowUpsCapabilityFor(globalRelayFollowUpLedger, globalRelayTurnInbox)
+}
+
+// newRelayFollowUpsCapabilityFor is newRelayFollowUpsCapability against a
+// given ledger (tests). nil — the capability is OMITTED — whenever the ledger
+// has no identity to advertise, which means another agent process on this
+// config dir owns it (Linux has no single-instance guard, so two agents
+// overlap across an automatic update). Advertising `relayFollowUps` with an
+// empty `ledgerId` would be worse than advertising nothing: the broker would
+// send live attempts and queries naming "", the real owner cannot vouch for
+// that identity (vouchesForLocked) and answers every one `unknown`, and each
+// message the user spoke would end up uncertain. With the capability omitted
+// the broker reads this device as one without follow-up support and queues
+// every message, which is the documented legacy-device fallback. The empty
+// live list (never null) means every follow-up is queued.
+func newRelayFollowUpsCapabilityFor(l *relayFollowUpLedger, inbox *relayTurnInbox) *relayFollowUpsCapability {
+	// Owning the ledger is not enough. The ledger file is new in this change,
+	// so during a Linux automatic-update overlap THIS process can take it
+	// while the pre-change process still owns relay-turn-inbox.json and still
+	// pulls from the shared Pub/Sub subscription. Advertising follow-ups then
+	// lets the broker send a queued `fu_…` SEND the old binary may run with no
+	// expiry check and no follow-up outcome in its ack, or Ack a
+	// `relay_follow_up_query` it does not understand — leaving the attempt
+	// unsettled and allowing a replacement delivery after the original ran.
+	// Owning the turn inbox is what proves the follow-up-aware process is the
+	// one that will execute those turns.
+	//
+	// The inbox is checked FIRST, so this never takes the ledger while the
+	// inbox is owned elsewhere: both locks are held for the life of the
+	// process, and a ledger taken here before a failed inbox check would leave
+	// the two split between overlapping processes, so neither could ever
+	// advertise until one exits (Codex P2 on #219).
+	if !inbox.Own() {
+		return nil
+	}
+	ledgerID := l.LedgerID()
+	if ledgerID == "" {
+		return nil
+	}
+	// Only the kinds whose INSTALLED version meets the certified minimum are
+	// advertised: an older build never passed the run, and advertising it
+	// would have the broker choose live delivery for it (Codex P2 on #219).
+	live := make([]string, 0, len(liveFollowUpCertified))
+	for id := range liveFollowUpCertified {
+		if liveFollowUpKind(id) {
+			live = append(live, id)
+		}
+	}
+	return &relayFollowUpsCapability{
+		LiveAgents:    live,
+		AttemptExpiry: true,
+		LedgerID:      ledgerID,
+	}
+}
+
+// republishRelayFollowUpCapability fills the follow-up capability into the
+// cached MachineInfo and reruns the post-store hook, so a gather that ran
+// while another process still owned the ledger or the turn inbox does not
+// leave this device
+// advertised as follow-up-less until the next 6h gather. It reports whether
+// the capability is now advertised (true also when it already was).
+func republishRelayFollowUpCapability() bool {
+	caps := newRelayFollowUpsCapability()
+	if caps == nil {
+		return false
+	}
+	machineInfoMu.Lock()
+	if machineInfoCache == nil || machineInfoCache.Capabilities == nil {
+		machineInfoMu.Unlock()
+		return false
+	}
+	if machineInfoCache.Capabilities.RelayFollowUps != nil {
+		machineInfoMu.Unlock()
+		return true
+	}
+	updated := *machineInfoCache
+	updatedCaps := *updated.Capabilities
+	updatedCaps.RelayFollowUps = caps
+	updated.Capabilities = &updatedCaps
+	machineInfoCache = &updated
+	machineInfoMu.Unlock()
+	// onMachineInfoStored only repeats a request that went out bare; one that
+	// already carried the capability-less MachineInfo must be re-sent too.
+	if onMachineCapabilityAdded != nil {
+		onMachineCapabilityAdded()
+	}
+	return true
+}
+
+// watchRelayFollowUpLedgerOwnership waits, on one background goroutine, for
+// the ledger AND the relay-turn inbox to become ownable and republishes the
+// capability as soon as both are. It only runs after a gather found one of
+// them owned elsewhere — the
+// overlapping process is transitional (an automatic update handing over), so
+// a short poll closes the window the 6h refresh cadence would otherwise
+// leave. Each poll is one non-blocking flock attempt. Giving up after the
+// window is safe: queued delivery keeps working, and the next gather retries.
+func watchRelayFollowUpLedgerOwnership() {
+	if republishRelayFollowUpCapability() {
+		return
+	}
+	if !relayFollowUpOwnershipWatching.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer relayFollowUpOwnershipWatching.Store(false)
+		for waited := time.Duration(0); waited < relayFollowUpOwnershipWatchWindow; waited += relayFollowUpOwnershipPollInterval {
+			time.Sleep(relayFollowUpOwnershipPollInterval)
+			if republishRelayFollowUpCapability() {
+				return
+			}
+		}
+	}()
+}
+
+var relayFollowUpOwnershipWatching atomic.Bool
+
+const (
+	relayFollowUpOwnershipPollInterval = 30 * time.Second
+	relayFollowUpOwnershipWatchWindow  = 15 * time.Minute
+)
 
 // newMachineCapabilities returns the capabilities every build of this agent
 // reports regardless of hardware probes: the protocol flags.
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
 		RelayTurnInbox:         true,
+		RelayFollowUps:         newRelayFollowUpsCapability(),
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
 		ReadOnlySessions:       true,
@@ -343,6 +482,12 @@ func machineInfoStored(info *MachineInfo) {
 // package-initialization cycle through refreshMachineInfoAfterCatalogUpdate.
 var onMachineInfoStored func()
 
+// onMachineCapabilityAdded runs after a capability is folded into an already
+// cached MachineInfo and must reach the backend now, whether or not the last
+// token request carried machine info. Wired in auth.go's init() for the same
+// reason as onMachineInfoStored.
+var onMachineCapabilityAdded func()
+
 // machineInfoGathersInFlight counts full machine gathers running on a
 // background goroutine. A gather is not cancellable once started —
 // GatherReadinessOnly returns on its context while the gather it launched runs
@@ -428,10 +573,34 @@ func storeMachineInfoIfNotOlder(info *MachineInfo) bool {
 		info.CliAgents = withCurrentCLIUsage(info.CliAgents, machineInfoCache.CliAgents, parserKeys)
 		info.cliUsageFromCache = false
 	}
+	info = withCachedRelayFollowUps(info, machineInfoCache)
 	machineInfoCache = info
 	machineInfoMu.Unlock()
 	machineInfoStored(info)
 	return true
+}
+
+// withCachedRelayFollowUps keeps a `relayFollowUps` capability the cache
+// already advertises when info, a gather that snapshotted
+// newMachineCapabilities() before this process owned the ledger and the turn
+// inbox, lacks it. Ownership is never given up once taken, so the cached
+// capability is still true; without this, a gather that started before the
+// ownership watcher republished (and then exited) would roll the capability
+// back, and the next token refresh would tell the backend this device has no
+// follow-up support until the following 6h gather. Called under
+// machineInfoMu; info is copied, never mutated.
+func withCachedRelayFollowUps(info, current *MachineInfo) *MachineInfo {
+	if info == nil || info.Capabilities == nil || info.Capabilities.RelayFollowUps != nil {
+		return info
+	}
+	if current == nil || current.Capabilities == nil || current.Capabilities.RelayFollowUps == nil {
+		return info
+	}
+	kept := *info
+	caps := *info.Capabilities
+	caps.RelayFollowUps = current.Capabilities.RelayFollowUps
+	kept.Capabilities = &caps
+	return &kept
 }
 
 // withCurrentCLIUsage refreshes a cliAgentUsageFallback snapshot from the
@@ -494,6 +663,11 @@ func StartMachineInfoGathering() {
 			// inside it, so it cannot delay the data the first /auth/token
 			// request is waiting for (setup_tool_catalog.go).
 			refreshSetupToolProbesInCache()
+			// A gather that ran while another agent process still owned the
+			// follow-up ledger or the relay-turn inbox advertised no
+			// `relayFollowUps`; republish it as soon as ownership of both
+			// lands instead of after the next 6h gather.
+			watchRelayFollowUpLedgerOwnership()
 			time.Sleep(machineInfoRefreshInterval)
 		}
 	}()

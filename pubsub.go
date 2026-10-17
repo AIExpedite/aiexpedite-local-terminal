@@ -243,13 +243,59 @@ const maxCommandAgeSec = 60 // 1 minute
 // Also rejects commands with future-dated timestamps (clock skew > 60 s) to
 // prevent an attacker from bypassing the staleness check with a far-future ts.
 func isCommandStale(cmdTs int64) bool {
+	return isCommandStaleAfter(cmdTs, maxCommandAgeSec, maxCommandAgeSec)
+}
+
+// isCommandStaleAfter is isCommandStale with the windows the command's own
+// protocol defines, bounding age and future skew INDEPENDENTLY.
+//
+// Follow-up deliveries carry a 120 s attempt window, so the generic 60 s age
+// gate would Ack them as "stale" before the handler could emit the
+// `relay_turn_ack` / `relay_follow_up_ack` the broker waits on, leaving the
+// message stuck until the broker's own deadline. They keep a bounded window
+// (commandMaxAgeSec) rather than no window at all.
+//
+// Widening the age allowance must NOT widen the future-skew allowance with
+// it. The follow-up fences (fenceReason / followUpTurnExpired) read the
+// device clock against the signed ts plus the attempt window, so admitting a
+// ts up to 135 s in the device's future would let the original delivery run
+// that much past the broker's real attempt window — after the broker had
+// expired it and queued a replacement, delivering the person's message twice.
+// The future bound therefore stays at the clock skew each protocol tolerates
+// (commandMaxFutureSkewSec), never the age window.
+func isCommandStaleAfter(cmdTs int64, maxAgeSec, maxFutureSkewSec int) bool {
 	if cmdTs == 0 {
 		return false // No timestamp - allow for backwards compatibility
 	}
 	now := time.Now().UnixMilli()
 	ageMs := now - cmdTs
-	// Reject if too old OR if more than 60 s in the future (abnormal clock skew)
-	return ageMs > int64(maxCommandAgeSec*1000) || ageMs < -int64(maxCommandAgeSec*1000)
+	// Reject if too old OR if too far in the future (abnormal clock skew)
+	return ageMs > int64(maxAgeSec)*1000 || ageMs < -int64(maxFutureSkewSec)*1000
+}
+
+// commandMaxAgeSec is the staleness window for one command. A follow-up
+// attempt (a live `relay_follow_up`, a reconciliation query, or a queued
+// `relayturn_fu_…` SEND) must still reach its handler inside its own attempt
+// window plus the clock-skew margin; the handler then fences it on the SIGNED
+// expiry (fenceReason / followUpTurnExpired), so nothing is replayable beyond
+// what that fence already allows. Past this window the broker has expired the
+// attempt itself, so the generic rejection is harmless again.
+func commandMaxAgeSec(cmd commandMsg) int {
+	if isFollowUpProtocolCommand(cmd) {
+		return int((followUpAttemptWindow + followUpSkewMargin).Seconds())
+	}
+	return maxCommandAgeSec
+}
+
+// commandMaxFutureSkewSec is how far into this device's future one command's
+// timestamp may sit. A follow-up's own fences are decided against that signed
+// ts, so it tolerates only the clock skew those fences already allow
+// (followUpSkewMargin) — independently of the longer age window above.
+func commandMaxFutureSkewSec(cmd commandMsg) int {
+	if isFollowUpProtocolCommand(cmd) {
+		return int(followUpSkewMargin.Seconds())
+	}
+	return maxCommandAgeSec
 }
 
 /* --------------------------------------------------------------------------
@@ -702,6 +748,26 @@ type commandMsg struct {
 	// relayAckWatermarkMax entries refuses the whole command.
 	AckedTurnIds []string `json:"ackedTurnIds,omitempty"`
 
+	// Follow-ups (relay_follow_up_ledger.go). UNSIGNED metadata: a queued
+	// follow-up turn's expiry on a relay SEND, and a live attempt's ids,
+	// expiry and the ledger identity its broker last saw. Both expiries are
+	// bounded by the signed `ts`, so editing them cannot extend an attempt;
+	// the text rides in the signed `input` and the attempt id in the signed
+	// envelope id.
+	//
+	// `ledgerId` decides whether an attempt the ledger has no row for may
+	// execute, so it is never trusted on its own: relayFollowUpLedger
+	// .vouchesForLocked requires the SIGNED `ts` to be later than the ledger
+	// identity's own minting time plus the clock-skew margin as well. Rewriting `ledgerId` to the
+	// currently advertised id therefore cannot promote an attempt minted
+	// under a replaced ledger from `unknown` to a write or to a `notWritten`
+	// fence.
+	FollowUpExpiresAt        int64  `json:"followUpExpiresAt,omitempty"`
+	FollowUpAttemptID        string `json:"attemptId,omitempty"`
+	FollowUpID               string `json:"followUpId,omitempty"`
+	FollowUpAttemptExpiresAt int64  `json:"expiresAt,omitempty"`
+	FollowUpLedgerID         string `json:"ledgerId,omitempty"`
+
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
 	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
 	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
@@ -859,6 +925,16 @@ type resultMsg struct {
 	// RelayTurnID is the relay turn a `relay_turn_ack` frame acknowledges
 	// (relay_turn_inbox.go). Set on that frame type only.
 	RelayTurnID string `json:"relayTurnId,omitempty"`
+
+	// Follow-up answers (relay_follow_up_ledger.go): one attempt's durable
+	// outcome on `relay_follow_up_ack`, and a refused queued follow-up turn's
+	// outcome on `relay_turn_ack`. Never the follow-up text.
+	FollowUpAttemptID   string `json:"attemptId,omitempty"`
+	FollowUpID          string `json:"followUpId,omitempty"`
+	FollowUpOutcome     string `json:"outcome,omitempty"`
+	FollowUpReason      string `json:"reason,omitempty"`
+	FollowUpProcessedIn string `json:"processedIn,omitempty"`
+	FollowUpLedgerID    string `json:"ledgerId,omitempty"`
 }
 
 /*
@@ -1691,10 +1767,14 @@ func runPubSubConnection(cfg *Config) error {
 		// carrying refreshId so the backend can clear its in-flight / pending
 		// marker. A generic "stale" rejection here would orphan that marker and
 		// block the loop until its timeout. See isInternalDemandCommand.
-		if !isInternalDemandCommand(cmd.Command) && isCommandStale(cmd.Ts) {
+		//
+		// Follow-up protocol messages keep their own (longer) window for the
+		// reason commandMaxAgeSec documents.
+		maxAgeSec := commandMaxAgeSec(cmd)
+		if !isInternalDemandCommand(cmd.Command) && isCommandStaleAfter(cmd.Ts, maxAgeSec, commandMaxFutureSkewSec(cmd)) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
-				colorYellow, ageSec, maxCommandAgeSec, colorReset)
+				colorYellow, ageSec, maxAgeSec, colorReset)
 
 			// Send stale response back to user
 			res := makeRejectionResult(
@@ -1723,7 +1803,14 @@ func runPubSubConnection(cfg *Config) error {
 		// Exempt server-internal demand commands for the same reason as the
 		// staleness check above — a "rate_limited" rejection would not carry
 		// refreshId and would orphan the backend's in-flight / pending marker.
-		if !isInternalDemandCommand(cmd.Command) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		//
+		// Follow-up protocol commands are exempt as well: the broker needs a
+		// protocol answer (relay_follow_up_ack / an outcome-bearing
+		// relay_turn_ack) for each of them, and a generic rejection carries
+		// none, so a limiter exhausted by other traffic could leave an attempt
+		// unsettled until it expires. They are bounded at the source (at most
+		// a handful pending per session) and still face the signature check.
+		if !isInternalDemandCommand(cmd.Command) && !isFollowUpProtocolCommand(cmd) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
@@ -6532,12 +6619,39 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 // agent process owns the turn inbox, so the caller Nacks and Pub/Sub
 // redelivers to the owner.
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) bool {
+	// A live follow-up attempt or a reconciliation query: answered from the
+	// durable follow-up ledger, never routed to a kind's SEND.
+	if cmd.Type == relayFollowUpCommandType || cmd.Type == relayFollowUpQueryCommandType {
+		return handleRelayFollowUpCommand(ctx, topic, cmd, cfg)
+	}
 	if turnID, ok := relayTurnIDFromEnvelope(cmd.ID); ok && cmd.SessionID != "" {
 		agentID := cmd.AgentID
 		if agentID == "" && cfg != nil {
 			agentID = cfg.AgentID
 		}
-		return runRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID,
+		// A queued follow-up turn (`fu_…`) past its expiry, or addressed to a
+		// session fenced off this computer, never starts — unless it was
+		// accepted earlier (re-acked as usual) or a delivery of it is still in
+		// flight here (handed back until it settles). The expiry is decided
+		// under the same lock as the claim, so a delivery that passed the
+		// fence and a later duplicate past the deadline can never both act;
+		// the session's state is read just before the claim, outside that lock.
+		// The expiry and the session's fence are checked again at acceptance
+		// (followUpTurnAcceptRefusal): the manager can wait on the session's
+		// locks after the claim, past the deadline or past a fencing.
+		var refuse, refuseAtAccept func(time.Time) string
+		if strings.HasPrefix(turnID, relayFollowUpTurnPrefix) {
+			refuse = func(now time.Time) string { return followUpTurnRefusal(cmd, turnID, now) }
+			refuseAtAccept = func(now time.Time) string { return followUpTurnAcceptRefusal(cmd, turnID, now) }
+		}
+		return runFencedRelayTurn(ctx, globalRelayTurnInbox, cmd, turnID, agentID, refuse, refuseAtAccept,
+			func(reason string) {
+				pubCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				if err := publishMsg(pubCtx, topic, refusedFollowUpTurnAck(cmd, turnID, agentID, reason)); err != nil {
+					logSession(cmd.SessionID, "%s[follow-up] Failed to publish a refused turn's answer: %v%s\n", colorRed, err, colorReset)
+				}
+			},
 			func(r relayTurnRow) { publishRelayTurnAck(topic, r) },
 			func(dctx context.Context) { dispatchSessionCommand(dctx, topic, cmd, cfg) })
 	}

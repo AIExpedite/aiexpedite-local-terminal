@@ -405,9 +405,20 @@ func isSessionEndCommandType(t string) bool {
 const fencedSessionRejectionCode = "SESSION_FENCED"
 
 // refuseFencedSessionCommand refuses any command for a fenced session except
-// its END. Returns true when it handled (refused and settled) the message.
+// its END (and the follow-up protocol, which answers for itself). Returns true
+// when it handled (refused and settled) the message.
 func refuseFencedSessionCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
 	if cmd.SessionID == "" || isSessionEndCommandType(cmd.Type) || !isSessionFenced(cmd.SessionID) {
+		return false
+	}
+	// Follow-up protocol commands get their own protocol answer instead: the
+	// broker settles an attempt only from a relay_follow_up_ack or an
+	// outcome-bearing relay_turn_ack, never from a generic session_error. Their
+	// handlers treat a fenced session as not running — a live attempt is
+	// refused durably in the ledger, a queued `fu_…` turn is refused unless it
+	// was already accepted, and a query only reads the ledger — so nothing
+	// drives the old CLI.
+	if isFollowUpProtocolCommand(cmd) {
 		return false
 	}
 	fmt.Printf("%s[fence] Refused %s for fenced session %s%s\n", colorYellow, cmd.Type, cmd.SessionID, colorReset)

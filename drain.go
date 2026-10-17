@@ -482,9 +482,16 @@ func isDrainPassThrough(cmd commandMsg) bool {
 // isWorkContinuationCommand reports traffic correlated to work accepted before
 // a drain. These callbacks remain deliverable while draining, but are tracked
 // until they return and are no longer admitted after the install seal.
+//
+// Follow-up protocol commands belong here: a live `relay_follow_up` targets a
+// turn accepted before the drain, and `relay_follow_up_query` only reads or
+// fences the durable ledger. Refusing either with a generic session error
+// would withhold the `relay_follow_up_ack` the broker needs to settle or
+// reconcile the attempt, leaving the message uncertain for no reason.
 func isWorkContinuationCommand(cmd commandMsg) bool {
 	switch cmd.Type {
-	case "session_input", "session_signal", "session_end",
+	case relayFollowUpCommandType, relayFollowUpQueryCommandType,
+		"session_input", "session_signal", "session_end",
 		"codex_appserver_send", "codex_appserver_end",
 		"claude_native_send", "claude_native_end", "claude_native_control",
 		"grok_acp_send", "grok_acp_end",
