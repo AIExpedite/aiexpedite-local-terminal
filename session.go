@@ -4921,23 +4921,79 @@ func interruptProcess(cmd *exec.Cmd) error {
    Shutdown helper
    -------------------------------------------------------------------------- */
 
-// ShutdownAllSessions gracefully ends all active sessions.
-// Called during application shutdown.
+// sessionShutdownBudget bounds the graceful half of ShutdownAllSessions.
+// EndSession waits gracefulShutdownTimeout (5s) for an interrupted child and
+// then killConfirmTimeout (30s) for the exit watcher, so taking the sessions
+// one after another would cost minutes — while gracefulShutdown's tightest
+// caller gives the WHOLE sequence 2s (the Windows CTRL_LOGOFF/CTRL_SHUTDOWN
+// handler) or 4s (CTRL_CLOSE_EVENT). A Quit that hangs is worse than an
+// orphan, so the interrupts go out together, share one budget, and whatever
+// has not exited when it runs out is force-killed with no further wait: this
+// process is about to die and the point is that its children die with it.
+// A var so tests can shorten it.
+var sessionShutdownBudget = 2 * time.Second
+
+// ShutdownAllSessions ends every active session. Called from
+// tearDownSubprocesses (shutdown.go) for the same reason the resident CLI
+// managers are: nothing else ends a session_start child. Before it was wired
+// in, a tray Quit left every pipe/PTY CLI running — on Windows the session's
+// kill-on-close Job Object closes with the agent, but on macOS and Linux
+// there is no such containment (process_ownership_unix.go), so the CLI kept
+// drawing on the account's allowance until a later boot's ledger reap found
+// it (session_ledger.go).
+//
+// Ownership is the sessions THIS process started and still holds: the entries
+// of sm.sessions, each ended through its own os.Process handle. Nothing is
+// matched by name, by port, or by scanning the process table.
 func (sm *SessionManager) ShutdownAllSessions() {
 	sm.mu.RLock()
-	ids := make([]string, 0, len(sm.sessions))
-	for id := range sm.sessions {
-		ids = append(ids, id)
+	sessions := make(map[string]*CLISession, len(sm.sessions))
+	for id, session := range sm.sessions {
+		sessions[id] = session
 	}
 	sm.mu.RUnlock()
 
-	if len(ids) > 0 {
-		logSession("", "%s[session] Shutting down %d active session(s)...%s\n",
-			colorYellow, len(ids), colorReset)
+	if len(sessions) == 0 {
+		return
+	}
+	logSession("", "%s[session] Shutting down %d active session(s)...%s\n",
+		colorYellow, len(sessions), colorReset)
+
+	var wg sync.WaitGroup
+	for id := range sessions {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			_ = sm.EndSession(id)
+		}(id)
+	}
+	ended := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(ended)
+	}()
+	select {
+	case <-ended:
+		return
+	case <-time.After(sessionShutdownBudget):
 	}
 
-	for _, id := range ids {
-		_ = sm.EndSession(id)
+	// Budget spent. Force whatever is still running. The in-flight EndSession
+	// goroutines are abandoned rather than awaited — an unconfirmed kill is
+	// the next boot's reap to resolve, and blocking here is exactly what
+	// wedges a Quit.
+	for id, session := range sessions {
+		select {
+		case <-processExitSignal(session.processExited, session.done):
+			continue
+		default:
+		}
+		logSession(id, "%s[session] Force killing session %s: shutdown budget (%s) spent%s\n",
+			colorRed, id, sessionShutdownBudget, colorReset)
+		if err := killSessionProcess(session); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			logSession(id, "%s[session] Shutdown kill failed for %s: %v%s\n",
+				colorRed, id, err, colorReset)
+		}
 	}
 }
 

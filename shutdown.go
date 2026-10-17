@@ -165,13 +165,25 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	fmt.Println("[shutdown] Graceful shutdown sequence complete")
 }
 
-// tearDownSubprocesses kills the children spawned by the agent: ttyd,
-// the tmux session, and (on Windows) the persistent PowerShell helper.
+// tearDownSubprocesses kills the children spawned by the agent: the CLI
+// sessions (generic session_start children and every resident manager's),
+// ttyd, the tmux session, and (on Windows) the persistent PowerShell helper.
 // Idempotent and safe to call multiple times.
 func tearDownSubprocesses() {
 	if runtime.GOOS == "windows" {
 		// Cleanup persistent PowerShell process.
 		ShutdownPowerShell()
+	}
+
+	// The generic session_start children (session.go) go first: they are the
+	// ones nothing else ends. Every resident manager below already tears its
+	// own children down here, but a pipe/PTY CLI session had no teardown at
+	// all, so a tray Quit left it running — until the next boot's ledger reap
+	// on macOS and Linux, where no Job Object contains it. Unlike the managers
+	// below this call is BOUNDED (sessionShutdownBudget), because the Windows
+	// console handlers give the whole shutdown 4s (close) or 2s (logoff).
+	if globalSessionManager != nil {
+		globalSessionManager.ShutdownAllSessions()
 	}
 
 	// Gracefully end any in-flight Codex app-server sessions before we tear
