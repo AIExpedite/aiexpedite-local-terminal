@@ -84,7 +84,7 @@ func helperUserinfoAda(string) (int, string) {
 // helperRunDirectAgy is the direct transport: a tty=false execute of `agy`.
 func helperRunDirectAgy(t *testing.T, f helperStaleRegression) {
 	t.Helper()
-	out, err := executeTerminalCommand(nil, commandMsg{
+	out, _, err := executeTerminalCommand(nil, commandMsg{
 		Command: f.executable, Args: []string{"--print", "hello"},
 		Cwd: t.TempDir(), TimeoutMs: 30000, Tty: false,
 	})

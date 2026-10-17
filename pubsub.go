@@ -364,16 +364,45 @@ func cwdScopeFor(cmd commandMsg) cwdScope {
 
 // keys returns the scope's lookup keys, most specific first, always ending in
 // the process-wide default (""). The prefixes keep an execution id from
-// colliding with a session id that happens to share its text.
+// colliding with a session id that happens to share its text, and each
+// identifier is length-bounded here: this is the one place BOTH the read and
+// the write path derive their keys, so the bound cannot be sidestepped by a
+// scope built elsewhere (session_artifacts.go builds one from a session id).
 func (s cwdScope) keys() []string {
 	keys := make([]string, 0, 3)
 	if s.executionID != "" {
-		keys = append(keys, "exec:"+s.executionID)
+		keys = append(keys, "exec:"+boundedScopeID(s.executionID))
 	}
 	if s.sessionID != "" {
-		keys = append(keys, "session:"+s.sessionID)
+		keys = append(keys, "session:"+boundedScopeID(s.sessionID))
 	}
 	return append(keys, "")
+}
+
+// boundedScopeID keeps one scope key short.
+//
+// trackedCwdMaxEntries bounds the NUMBER of entries, never their bytes, and
+// both identifiers a scope is built from arrive UNSIGNED and unvalidated:
+// `executionID` is excluded from the signature canonical entirely (see
+// commandMsg) and `sessionID` is no better, so a topic writer with no HMAC key
+// can append a distinct near-megabyte id to each REPLAYED signed command and
+// reach setTrackedCwd with it. 512 such keys is ~512 MB plus overhead — enough
+// to exhaust a desktop agent. The sibling terminal-service PR adds a
+// `maxLength` to its route schema, but that only bounds LEGITIMATE traffic: an
+// attacker with topic-write never passes through our server, so this is the
+// bound that has to hold.
+//
+// An overlong id is replaced by a digest of itself rather than truncated:
+// truncation maps two different senders onto ONE key, and sharing a tracked cwd
+// between senders is precisely the bug the per-sender keying exists to prevent.
+// The digest is 71 characters, well inside the bound, and is stable, so the
+// read and write paths keep agreeing on the key.
+func boundedScopeID(id string) string {
+	if len(id) <= trackedCwdMaxScopeIDLen {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 type trackedCwdEntry struct {
@@ -388,9 +417,17 @@ const (
 	trackedCwdTTL = 1 * time.Hour
 	// trackedCwdMaxEntries bounds the map between sweeps. One run at a time
 	// plus a handful of chat/voice sessions is the real concurrency, so 512
-	// scopes is far past it; at the cap an insert evicts the least recently
-	// used entry rather than growing.
+	// scopes is far past it; at the cap an insert drops an entry that has
+	// already outlived the TTL, and is declined when there is none to drop
+	// (see evictExpiredTrackedCwdLocked), rather than growing the map.
 	trackedCwdMaxEntries = 512
+	// trackedCwdMaxScopeIDLen bounds the LENGTH of a retained scope identifier,
+	// which trackedCwdMaxEntries does not (boundedScopeID has the attack it
+	// closes). A real execution id is a 20-character Firestore auto id and a
+	// session id is of the same order, so 128 characters is already several
+	// times anything legitimate, while keeping every key — and therefore the
+	// whole map — bounded in bytes as well as in count.
+	trackedCwdMaxScopeIDLen = 128
 )
 
 var (
@@ -417,6 +454,25 @@ func getTrackedCwd(scope cwdScope) string {
 	return ""
 }
 
+// getTrackedCwdExact returns only the cwd recorded against scope's OWN most
+// specific key — the same key setTrackedCwd writes — with no fallback to its
+// session or to the process-wide default.
+//
+// This is the "did THIS sender's command `cd` somewhere?" question, which the
+// fallback chain cannot answer: a hit on a fallback key is some other sender's
+// directory, and resolveWorkDir has already considered that chain before the
+// command ran. Only commandUploadScanRoot asks it.
+func getTrackedCwdExact(scope cwdScope) string {
+	now := time.Now()
+	trackedCwdLock.Lock()
+	defer trackedCwdLock.Unlock()
+	if entry, ok := trackedCwds[scope.keys()[0]]; ok && entry.cwd != "" {
+		entry.lastAccess = now
+		return entry.cwd
+	}
+	return ""
+}
+
 // setTrackedCwd records cwd against the most specific key scope carries, so a
 // `cd` only ever moves its own sender's later commands.
 func setTrackedCwd(scope cwdScope, cwd string) {
@@ -435,16 +491,38 @@ func setTrackedCwd(scope cwdScope, cwd string) {
 		entry.lastAccess = now
 		return
 	}
-	if len(trackedCwds) >= trackedCwdMaxEntries {
-		evictOldestTrackedCwdLocked()
+	if len(trackedCwds) >= trackedCwdMaxEntries && !evictExpiredTrackedCwdLocked(now.Add(-trackedCwdTTL)) {
+		noteDeclinedTrackedCwdLocked(now)
+		return
 	}
 	trackedCwds[key] = &trackedCwdEntry{cwd: cwd, lastAccess: now}
 }
 
-// evictOldestTrackedCwdLocked drops the least recently used entry; callers hold
-// trackedCwdLock. The process-wide default is evictable like any other key —
-// this is a cache, and the next command that carries no identity repopulates it.
-func evictOldestTrackedCwdLocked() {
+// evictExpiredTrackedCwdLocked drops the least recently used entry IF that
+// entry has already outlived the TTL, and reports whether it made room.
+// Callers hold trackedCwdLock. The process-wide default is evictable like any
+// other key — it is a cache, and the next command that carries no identity
+// repopulates it.
+//
+// It deliberately refuses to evict a LIVE entry, which plain LRU did not. A
+// live run's tracked cwd is not recomputable cache data: 512 distinct inserts
+// after that run's latest command made it the LRU victim well inside the
+// 1-hour TTL, and the run's next command then fell through to its session, to
+// the process-wide cwd or to the configured default and SILENTLY RAN IN THE
+// WRONG DIRECTORY — a `git commit`, an `npm test` or a `rm` against another
+// feature's worktree, with a successful exit code and nothing in the log
+// saying why. Because the scope identifier is unsigned (see boundedScopeID) an
+// attacker with topic-write can manufacture those inserts, and a busy
+// workspace can reach the cap with no attacker at all.
+//
+// Declining the new entry instead is the safe failure. The newcomer only loses
+// `cd` persistence: its commands still run in the directory the server sent,
+// which is what every one-off command did before this cache existed, so a
+// declined insert can never put a command somewhere it was not asked to run.
+// The cost therefore falls on the scope arriving into a full map rather than on
+// the run already working, and one lifetime rule (the TTL) decides everything
+// that may be dropped — the cap only stops growth.
+func evictExpiredTrackedCwdLocked(cutoff time.Time) bool {
 	oldestKey := ""
 	var oldest time.Time
 	found := false
@@ -453,9 +531,29 @@ func evictOldestTrackedCwdLocked() {
 			oldestKey, oldest, found = key, entry.lastAccess, true
 		}
 	}
-	if found {
-		delete(trackedCwds, oldestKey)
+	if !found || !oldest.Before(cutoff) {
+		return false
 	}
+	delete(trackedCwds, oldestKey)
+	return true
+}
+
+// trackedCwdDeclineLoggedAt throttles the notice below: under a manufactured
+// burst every insert declines, and one line each would bury the log an operator
+// needs to read. Guarded by trackedCwdLock, like the map itself.
+var trackedCwdDeclineLoggedAt time.Time
+
+// noteDeclinedTrackedCwdLocked reports, at most once a minute, that the cache
+// is full of live scopes. Declining is safe but it is not normal — the real
+// concurrency is one run plus a handful of sessions — so it has to be visible
+// rather than silent.
+func noteDeclinedTrackedCwdLocked(now time.Time) {
+	if !trackedCwdDeclineLoggedAt.IsZero() && now.Sub(trackedCwdDeclineLoggedAt) < time.Minute {
+		return
+	}
+	trackedCwdDeclineLoggedAt = now
+	fmt.Printf("%s[aiexpedite] tracked cwd cache full of active scopes (%d); new senders keep the cwd they were sent until one expires%s\n",
+		colorYellow, len(trackedCwds), colorReset)
 }
 
 // resetTrackedCwds forgets every scope. Tests only: nothing in the agent needs
@@ -464,6 +562,7 @@ func resetTrackedCwds() {
 	trackedCwdLock.Lock()
 	defer trackedCwdLock.Unlock()
 	trackedCwds = make(map[string]*trackedCwdEntry)
+	trackedCwdDeclineLoggedAt = time.Time{}
 }
 
 // sweepTrackedCwdsBefore drops every scope whose last read or write predates
@@ -2376,12 +2475,17 @@ func runPubSubConnection(cfg *Config) error {
 		// checklist's device commands are intercepted here and never exec'd.
 		var out string
 		var execErr error
+		// ranIn is the working directory the command actually ran in, as
+		// resolveWorkDir decided it — the authoritative value the result and
+		// the upload scan below are both derived from, never a second lookup.
+		// A device command never execs, so it has none.
+		var ranIn string
 		if setupDeviceCmd {
 			devCtx, devCancel := context.WithTimeout(context.Background(), resolveExecTimeout(cmd.TimeoutMs))
 			out, execErr = runEnvSetupDeviceCommand(devCtx, cfg, cmd)
 			devCancel()
 		} else {
-			out, execErr = executeTerminalCommand(cfg, cmd)
+			out, ranIn, execErr = executeTerminalCommand(cfg, cmd)
 		}
 
 		// Debug mode: show raw output details (redacted)
@@ -2421,7 +2525,7 @@ func runPubSubConnection(cfg *Config) error {
 			Status:      "success",
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
-			Cwd:         getTrackedCwd(cwdScopeFor(cmd)),
+			Cwd:         reportedCommandCwd(cwdScopeFor(cmd), ranIn),
 		}
 		if execErr != nil {
 			res.Status = "error"
@@ -2435,19 +2539,15 @@ func runPubSubConnection(cfg *Config) error {
 		// successful exit code was the previous behavior, and it dropped
 		// screenshots from the crashes we most needed to debug.
 		if cfg.EnableFileUpload && !setupDeviceCmd {
-			// Resolve a single, correctly-scoped scan dir (unchanged
-			// precedence): the post-`cd` tracked cwd, else the command's
-			// own cwd, else the home WorkingDirectory as last resort. These
-			// are NOT scanned together — walking the default home tree on
-			// top of the real exec dir would sweep up unrelated fresh media
-			// and make detection expensive.
-			effectiveDir := getTrackedCwd(cwdScopeFor(cmd))
-			if effectiveDir == "" {
-				effectiveDir = cmd.Cwd
-			}
-			if effectiveDir == "" && cfg != nil {
-				effectiveDir = cfg.WorkingDirectory
-			}
+			// Resolve a single scan dir from the AUTHORITATIVE directory the
+			// command ran in (commandUploadScanRoot): the sender's own
+			// post-`cd` cwd when it has one, else `ranIn` itself. A signed
+			// cwd is answered from `ranIn` alone, because the scope its
+			// tracked entry hangs off is chosen by an UNSIGNED `executionID`.
+			// Roots are never scanned together — walking the default home
+			// tree on top of the real exec dir would sweep up unrelated fresh
+			// media and make detection expensive.
+			effectiveDir := commandUploadScanRoot(cfg, cwdScopeFor(cmd), ranIn)
 			files := detectOutputFilesSince(effectiveDir, cmdStartedAt)
 			// Always log the scan outcome so a zero-file result is
 			// diagnosable rather than silent (mirrors the session path).
@@ -3008,28 +3108,83 @@ func resolveWorkDir(cfg *Config, cwd string, scope cwdScope) string {
 // It routes an opt-in tty=true request to the PTY path (macOS/Linux, eligible
 // agent commands only) and everything else to the hardened pipe path. Git and
 // test runners are forced onto pipes even when tty=true (design guardrail).
-func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
+//
+// It returns the working directory the command actually ran in alongside its
+// output. The resolution happens exactly ONCE here, and the caller is handed
+// the answer rather than looking the tracked cwd up a second time: the
+// post-command upload scan used to re-query that map, and re-deriving a
+// security-relevant value is how the two diverged (commandUploadScanRoot).
+func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, string, error) {
 	// Re-read PATH first so a tool the previous setup step installed resolves
 	// here without an agent restart (path_refresh.go). Every transport below —
 	// PTY, one-shot shells, the persistent PowerShell (re-synced in Execute) —
 	// spawns from this process's PATH.
 	refreshCommandPath()
+	scope := cwdScopeFor(cmd)
+	workDir := resolveWorkDir(cfg, cmd.Cwd, scope)
 	// PTY is an allowlist: only a recognized resident TUI agent may run under a
 	// PTY. Everything else (git, test runners, bash/sh/PowerShell, ssh, …) stays
 	// on the hardened pipe path even with tty=true, so unsigned tty can't flip a
 	// utility off the headless hardening.
 	if cmd.Tty && isPTYEligibleCommand(cmd.Command, cmd.Args) {
-		return runTTYCommand(cfg, cmd)
+		out, err := runTTYCommandIn(cmd, workDir)
+		return out, workDir, err
 	}
-	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs, cwdScopeFor(cmd))
+	out, err := runLocalCommandIn(cmd.Command, cmd.Args, workDir, cmd.TimeoutMs, scope)
+	return out, workDir, err
 }
 
-// runTTYCommand runs an eligible command under a pseudo-terminal and returns its
-// normalized, model-safe output. On Windows this fails fast with a clear
-// captured error (ConPTY deferred).
-func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
+// commandUploadScanRoot picks the single directory the post-command upload scan
+// walks for media this command produced.
+//
+// resolved is the authoritative working directory executeTerminalCommand ran
+// the command in. A SIGNED cwd (env-setup step, read-only start) is answered
+// from it alone: `executionID` is excluded from the HMAC, so a topic writer
+// with no key can append or alter one on a REPLAYED signed frame, and reading
+// the tracked map here would let that choice decide the scan root — making the
+// scan miss the command's real artifacts, or walk and upload fresh media out of
+// an unrelated directory, on the Unix, TTY and encoded-PowerShell routes that
+// never refresh the tracked entry.
+//
+// For an ordinary frame the precedence is unchanged in effect — a `cd` the
+// command performed still wins — but it is read from the sender's OWN key
+// (getTrackedCwdExact), which is the only key setTrackedCwd writes. A hit on a
+// fallback key is another sender's directory, and resolveWorkDir already
+// weighed that chain before the command ran, so `resolved` is the better
+// answer: it is also where an explicit cwd that differs from the configured
+// default actually took the command.
+func commandUploadScanRoot(cfg *Config, scope cwdScope, resolved string) string {
+	if !scope.cwdSigned {
+		if tracked := getTrackedCwdExact(scope); tracked != "" {
+			return tracked
+		}
+	}
+	if resolved != "" {
+		return resolved
+	}
+	if cfg != nil {
+		return cfg.WorkingDirectory
+	}
+	return ""
+}
+
+// reportedCommandCwd is the cwd echoed back on the result for diagnostics: the
+// tracked value for an ordinary frame, so the server sees where a `cd` left the
+// sender, and the authoritative resolved directory for a signed one, whose
+// tracked entry is selectable by an unsigned `executionID` and must therefore
+// never describe the run (see commandUploadScanRoot).
+func reportedCommandCwd(scope cwdScope, resolved string) string {
+	if scope.cwdSigned {
+		return resolved
+	}
+	return getTrackedCwd(scope)
+}
+
+// runTTYCommandIn runs an eligible command under a pseudo-terminal in the
+// already-resolved workDir and returns its normalized, model-safe output. On
+// Windows this fails fast with a clear captured error (ConPTY deferred).
+func runTTYCommandIn(cmd commandMsg, workDir string) (string, error) {
 	timeout := resolveExecTimeout(cmd.TimeoutMs)
-	workDir := resolveWorkDir(cfg, cmd.Cwd, cwdScopeFor(cmd))
 	// Apply the same one-shot argv shaping StartSession uses for an eligible PTY
 	// agent so a tty=true `execute` request returns a result instead of dropping
 	// into the interactive TUI and hanging until the prompt timeout. agy/
@@ -5603,9 +5758,18 @@ func replaceDashCPayload(args []string, payload string) []string {
 
 // scope names the sender whose tracked cwd this command reads and writes; the
 // zero value is the process-wide default (see cwdScope).
+//
+// It resolves the working directory and hands off to runLocalCommandIn.
+// executeTerminalCommand calls that directly, with the cwd it already resolved,
+// so a command's directory is derived exactly once (see
+// commandUploadScanRoot).
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64, scope cwdScope) (string, error) {
+	return runLocalCommandIn(cmd, args, resolveWorkDir(cfg, cwd, scope), timeoutMs, scope)
+}
+
+// runLocalCommandIn runs one execute in an already-resolved working directory.
+func runLocalCommandIn(cmd string, args []string, workDir string, timeoutMs int64, scope cwdScope) (string, error) {
 	timeout := resolveExecTimeout(timeoutMs)
-	workDir := resolveWorkDir(cfg, cwd, scope)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in

@@ -176,7 +176,7 @@ func TestAntigravityFreshness_NonTTYExecuteAdvancesObservedAt(t *testing.T) {
 		t.Fatalf("parse seed: %v", err)
 	}
 
-	out, execErr := executeTerminalCommand(nil, commandMsg{
+	out, _, execErr := executeTerminalCommand(nil, commandMsg{
 		Command:   executable,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),
@@ -322,7 +322,7 @@ func TestAntigravityFreshness_GatedTerminalManagedSessionAdvancesObservedAt(t *t
 func TestAntigravityFreshness_GatedNonTTYExecuteAdvancesObservedAt(t *testing.T) {
 	home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
 
-	out, execErr := executeTerminalCommand(nil, commandMsg{
+	out, _, execErr := executeTerminalCommand(nil, commandMsg{
 		Command:   executable,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),
@@ -354,7 +354,7 @@ func TestAntigravityFreshness_NonTTYExecuteOfOtherCommandArmsNothing(t *testing.
 		t.Fatalf("copy mock: %v", err)
 	}
 
-	if _, err := executeTerminalCommand(nil, commandMsg{
+	if _, _, err := executeTerminalCommand(nil, commandMsg{
 		Command:   other,
 		Args:      []string{"--version"},
 		Cwd:       t.TempDir(),
@@ -377,7 +377,7 @@ func TestAntigravityFreshness_NonTTYExecuteStartFailureArmsNothing(t *testing.T)
 		missing += ".exe"
 	}
 
-	if _, err := executeTerminalCommand(nil, commandMsg{
+	if _, _, err := executeTerminalCommand(nil, commandMsg{
 		Command:   missing,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),

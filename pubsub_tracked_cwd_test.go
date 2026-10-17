@@ -139,33 +139,51 @@ func TestTrackedCwd_InsertsAreBoundedByMaxEntries(t *testing.T) {
 	if size > trackedCwdMaxEntries {
 		t.Fatalf("tracked cwd map grew past its bound: %d > %d", size, trackedCwdMaxEntries)
 	}
-	// The sender that just wrote must be one of the survivors.
-	last := fmt.Sprintf("exec-%d", trackedCwdMaxEntries+49)
-	if got := getTrackedCwd(cwdScope{executionID: last}); got == "" {
-		t.Fatalf("the most recent scope was evicted instead of an older one")
+	// The senders already recorded keep their cwd: an insert into a map full of
+	// LIVE scopes is declined, never traded for one of them (see
+	// evictExpiredTrackedCwdLocked and
+	// TestTrackedCwd_ALiveRunKeepsItsCwdThroughAFloodOfNewScopes).
+	if got := getTrackedCwd(cwdScope{executionID: "exec-0"}); got != `C:\d0` {
+		t.Fatalf("the first scope lost its cwd to the burst: %q", got)
 	}
 }
 
-// At the bound it is the least recently used scope that goes, so a run that is
-// still sending commands never loses its cwd to a burst of new senders.
-func TestTrackedCwd_EvictionDropsTheLeastRecentlyUsed(t *testing.T) {
+// At the bound it is an EXPIRED scope that goes, and a live one is kept even
+// when it is the least recently used — a run that is still working must never
+// lose its cwd to a burst of new senders, because its next command would then
+// silently run somewhere else.
+func TestTrackedCwd_EvictionDropsAnExpiredScopeAndSparesALiveOne(t *testing.T) {
 	resetTrackedCwds()
 	t.Cleanup(resetTrackedCwds)
 
 	for i := 0; i < trackedCwdMaxEntries; i++ {
 		setTrackedCwd(cwdScope{executionID: fmt.Sprintf("exec-%d", i)}, fmt.Sprintf(`C:\d%d`, i))
 	}
-	// Make one entry unambiguously the oldest rather than relying on the clock
-	// resolution across a tight insert loop. Well inside the TTL, so the
-	// background cleanup goroutine is not what removes it.
+	// Make one entry unambiguously the least recently used rather than relying
+	// on the clock resolution across a tight insert loop. Well inside the TTL,
+	// so it is still a live scope.
 	trackedCwdLock.Lock()
 	trackedCwds["exec:exec-7"].lastAccess = time.Now().Add(-2 * time.Minute)
 	trackedCwdLock.Unlock()
 
 	setTrackedCwd(cwdScope{executionID: "newcomer"}, `C:\new`)
 
+	if got := getTrackedCwd(cwdScope{executionID: "exec-7"}); got != `C:\d7` {
+		t.Fatalf("a live least-recently-used scope was evicted: %q", got)
+	}
+	if got := getTrackedCwd(cwdScope{executionID: "newcomer"}); got != "" {
+		t.Fatalf("the newcomer should have been declined while every scope is live: %q", got)
+	}
+
+	// Age it past the TTL and the next insert reclaims it.
+	trackedCwdLock.Lock()
+	trackedCwds["exec:exec-7"].lastAccess = time.Now().Add(-2 * trackedCwdTTL)
+	trackedCwdLock.Unlock()
+
+	setTrackedCwd(cwdScope{executionID: "newcomer"}, `C:\new`)
+
 	if got := getTrackedCwd(cwdScope{executionID: "exec-7"}); got != "" {
-		t.Fatalf("the least recently used scope survived eviction: %q", got)
+		t.Fatalf("the expired scope survived eviction: %q", got)
 	}
 	if got := getTrackedCwd(cwdScope{executionID: "newcomer"}); got != `C:\new` {
 		t.Fatalf("the new scope was not recorded: %q", got)
