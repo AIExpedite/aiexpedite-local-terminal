@@ -79,7 +79,7 @@ func withSpiedFallback(t *testing.T) *[]string {
 	orig := runLocalCommandFallbackFn
 	t.Cleanup(func() { runLocalCommandFallbackFn = orig })
 	var lines []string
-	runLocalCommandFallbackFn = func(cmdLine, workDir string, timeout time.Duration, onStart func(pid int)) (string, error) {
+	runLocalCommandFallbackFn = func(cmdLine, workDir string, timeout time.Duration, onStart func(pid int), scope cwdScope) (string, error) {
 		lines = append(lines, cmdLine)
 		return "fallback-stub", nil
 	}
@@ -90,7 +90,7 @@ func TestRunLocalCommandWindows_TestRunnerClassifiesOnOriginalLaunchesShim(t *te
 	stubLookPath(t, map[string]string{"npm": `C:\Program Files\nodejs\npm.cmd`})
 	lines := withSpiedFallback(t)
 
-	out, err := runLocalCommandWindows("npm", []string{"test", "--", "--watch=false"}, "", 5*time.Second)
+	out, err := runLocalCommandWindows("npm", []string{"test", "--", "--watch=false"}, "", 5*time.Second, cwdScope{})
 	if err != nil || out != "fallback-stub" {
 		t.Fatalf("expected the test-runner branch (fallback stub), got out=%q err=%v", out, err)
 	}
@@ -119,10 +119,10 @@ func TestRunLocalCommandWindows_CLIAgentNeverRewritten(t *testing.T) {
 	resetCachedClaudePath()
 	t.Cleanup(resetCachedClaudePath)
 
-	if _, err := runLocalCommandWindows("claude", []string{"--version"}, "", 5*time.Second); err != nil {
+	if _, err := runLocalCommandWindows("claude", []string{"--version"}, "", 5*time.Second, cwdScope{}); err != nil {
 		t.Fatalf("claude: unexpected error %v", err)
 	}
-	if _, err := runLocalCommandWindows("codex", []string{"--version"}, "", 5*time.Second); err != nil {
+	if _, err := runLocalCommandWindows("codex", []string{"--version"}, "", 5*time.Second, cwdScope{}); err != nil {
 		t.Fatalf("codex: unexpected error %v", err)
 	}
 	if len(*lines) != 2 {

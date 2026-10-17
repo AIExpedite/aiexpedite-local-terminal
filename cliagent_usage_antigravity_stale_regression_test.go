@@ -84,7 +84,7 @@ func helperUserinfoAda(string) (int, string) {
 // helperRunDirectAgy is the direct transport: a tty=false execute of `agy`.
 func helperRunDirectAgy(t *testing.T, f helperStaleRegression) {
 	t.Helper()
-	out, err := executeTerminalCommand(nil, commandMsg{
+	out, _, err := executeTerminalCommand(nil, commandMsg{
 		Command: f.executable, Args: []string{"--print", "hello"},
 		Cwd: t.TempDir(), TimeoutMs: 30000, Tty: false,
 	})
@@ -115,7 +115,7 @@ func helperRunEncodedPowerShellAgy(t *testing.T, f helperStaleRegression) {
 	}
 	script := fmt.Sprintf(`Set-Location %q; & %q --print "hello"`, t.TempDir(), f.executable)
 	out, err := runLocalCommandWindows("powershell",
-		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), 30*time.Second)
+		[]string{"-EncodedCommand", encodeForPowerShell(script)}, t.TempDir(), 30*time.Second, cwdScope{})
 	if err != nil {
 		t.Fatalf("encoded-PowerShell execute failed: %v (output=%q)", err, out)
 	}

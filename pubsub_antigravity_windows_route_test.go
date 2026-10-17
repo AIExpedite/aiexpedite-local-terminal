@@ -50,7 +50,7 @@ func TestWindowsRoute_WrappedAgyKeepsPowerShellAndArmsCapture(t *testing.T) {
 
 	out, err := runLocalCommand(nil, "powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell(`& 'C:\t\agy.cmd' -p "hi"`)},
-		t.TempDir(), 30000)
+		t.TempDir(), 30000, cwdScope{})
 	if err != nil {
 		t.Fatalf("execute failed: %v (output=%q)", err, out)
 	}
@@ -75,7 +75,7 @@ func TestWindowsRoute_DirectAgyStillTakesBareExec(t *testing.T) {
 	// A path that cannot exist: the bare route reports a spawn failure, which is
 	// the proof it was taken. The PowerShell route would have returned "stub".
 	out, err := runLocalCommand(nil, `C:\definitely\missing\agy.exe`,
-		[]string{"--version"}, t.TempDir(), 30000)
+		[]string{"--version"}, t.TempDir(), 30000, cwdScope{})
 	if err == nil {
 		t.Fatalf("expected a spawn failure from the bare exec route, got output=%q", out)
 	}
@@ -94,7 +94,7 @@ func TestWindowsRoute_NonAgyPayloadArmsNothing(t *testing.T) {
 
 	if _, err := runLocalCommand(nil, "powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell("git log --grep agy")},
-		t.TempDir(), 30000); err != nil {
+		t.TempDir(), 30000, cwdScope{}); err != nil {
 		t.Fatalf("execute failed: %v", err)
 	}
 	if got := antigravityCaptureArms.Load(); got != 0 {
@@ -128,7 +128,7 @@ func TestWindowsRoute_FailoverDoesNotDoubleArm(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if _, err := runLocalCommand(nil, "powershell",
 			[]string{"-EncodedCommand", encodeForPowerShell(`& 'C:\t\agy.cmd' -p "hi"`)},
-			t.TempDir(), 30000); err != nil {
+			t.TempDir(), 30000, cwdScope{}); err != nil {
 			t.Fatalf("execute %d failed: %v", i, err)
 		}
 	}

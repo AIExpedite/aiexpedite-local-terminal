@@ -141,9 +141,11 @@ func boundedArtifactCollectWithProgress(collect func(context.Context, artifactPr
 //
 // @param workDir  the session's own spawn directory. Callers pass
 //
-//	Process.Dir; getTrackedCwd() is a last-resort fallback only, never an
+//	Process.Dir; the tracked cwd is a last-resort fallback only, never an
 //	additional root — scanning it while another workspace's command wrote
-//	fresh media there would upload those files under THIS session's id.
+//	fresh media there would upload those files under THIS session's id. It is
+//	read under this session's own scope, so a one-off command the session sent
+//	answers before the process-wide default does.
 func collectSessionArtifacts(
 	ctx context.Context,
 	cfg *Config,
@@ -170,7 +172,7 @@ func collectSessionArtifactsWithProgress(
 
 	effectiveDir := workDir
 	if effectiveDir == "" {
-		effectiveDir = getTrackedCwd()
+		effectiveDir = getTrackedCwd(cwdScope{sessionID: sessionID})
 	}
 	if effectiveDir == "" {
 		// Without a workdir we cannot scope the scan, so we skip it entirely.
