@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -132,6 +133,8 @@ func TestPersistentPS_HandledErrorsNotPromoted(t *testing.T) {
 // AllSigned reports "not digitally signed"), so the test checks the error id
 // production promotes on, not the wording, via AIX_PS_EVIDENCE lines. When a
 // pin allows local scripts there is no refusal to test and it skips.
+// Import the Security module from $PSHOME to avoid inherited module paths;
+// parse evidence only from stdout so stderr's source echoes cannot supply it.
 func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping powershell.exe integration test in -short mode")
@@ -149,7 +152,8 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	// redirected. The policy line comes first and reads the effective policy;
 	// the rest run after psExitCaptureScript while $Error[0] is still the
 	// command's error (Write-Output changes neither $LASTEXITCODE nor $Error).
-	script := "Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))\n" +
+	script := psSecurityModuleImport + "\n" +
+		"Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))\n" +
 		psResetScript +
 		"& { & '" + blocked + "'; " + psStatusCaptureStatement + " }\n" +
 		psExitCaptureScript + "\n" +
@@ -161,12 +165,14 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 		"exit $__aix_exit"
 	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Restricted",
 		"-OutputFormat", "Text", "-EncodedCommand", encodeForPowerShell(script))
-	raw, err := c.CombinedOutput()
-	out := string(raw)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	c.Stdout, c.Stderr = &stdoutBuf, &stderrBuf
+	err := c.Run()
+	stdout, stderr := stdoutBuf.String(), stderrBuf.String()
 
-	ev, evErr := blockedScriptEvidence(out)
+	ev, evErr := blockedScriptEvidence(stdout)
 	if evErr != nil {
-		t.Fatalf("%s\noutput: %s", redact(evErr.Error()), redact(out))
+		t.Fatalf("%s\nstdout: %s\nstderr: %s", redact(evErr.Error()), redact(stdout), redact(stderr))
 	}
 	policy := ev["policy"]
 	run, skip := blockedScriptPolicyAction(policy)
@@ -175,22 +181,22 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 			"so the blocked-script scenario is not covered on this machine", policy)))
 	}
 	if !run {
-		t.Fatalf("unrecognised effective execution policy %q\noutput: %s", redact(policy), redact(out))
+		t.Fatalf("unrecognised effective execution policy %q\nstdout: %s\nstderr: %s", redact(policy), redact(stdout), redact(stderr))
 	}
 
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-		t.Fatalf("expected exit 1 for a blocked script, got %s\noutput: %s", redact(fmt.Sprint(err)), redact(out))
+		t.Fatalf("expected exit 1 for a blocked script, got %s\nstdout: %s\nstderr: %s", redact(fmt.Sprint(err)), redact(stdout), redact(stderr))
 	}
-	if strings.Contains(out, "PS1 RAN") {
-		t.Fatalf("blocked .ps1 must not run under %s; output: %s", redact(policy), redact(out))
+	if strings.Contains(stdout+stderr, "PS1 RAN") {
+		t.Fatalf("blocked .ps1 must not run under %s\nstdout: %s\nstderr: %s", redact(policy), redact(stdout), redact(stderr))
 	}
 	for _, want := range []struct{ key, value string }{
 		{"promoted", "True"},
 		{"id", "UnauthorizedAccess"},
 	} {
 		if got := ev[want.key]; got != want.value {
-			t.Errorf("evidence %s: want %q, got %q\noutput: %s", want.key, want.value, redact(got), redact(out))
+			t.Errorf("evidence %s: want %q, got %q\nstdout: %s\nstderr: %s", want.key, want.value, redact(got), redact(stdout), redact(stderr))
 		}
 	}
 }
@@ -199,19 +205,25 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 // TestExitCapture_BlockedScriptExitsOne prints from inside powershell.exe.
 const psEvidenceMarker = "AIX_PS_EVIDENCE "
 
-// blockedScriptEvidence parses the `AIX_PS_EVIDENCE <key>=<value>` lines. The
-// marker may follow other text on a line: CombinedOutput mixes in stderr's
-// CLIXML, which need not end with a newline. policy, promoted and id are
-// required (blank values are allowed); a repeated key is an error.
+// psSecurityModuleImport avoids Windows PowerShell 5.1's inability to autoload
+// the Security module under an inherited pwsh 7 PSModulePath. processPolicyProbe
+// works around the same CI issue via an environment variable, but that only
+// reports Process scope; this test needs the effective policy.
+const psSecurityModuleImport = `Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop`
+
+// blockedScriptEvidence parses stdout's `AIX_PS_EVIDENCE <key>=<value>` lines.
+// The marker must start a line so an error record's echo of the script source
+// cannot supply evidence. policy, promoted and id are required (blank values
+// are allowed); a repeated key is an error.
 func blockedScriptEvidence(out string) (map[string]string, error) {
 	ev := map[string]string{}
+	out = strings.TrimPrefix(out, "\ufeff")
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimRight(line, "\r")
-		i := strings.Index(line, psEvidenceMarker)
-		if i < 0 {
+		if !strings.HasPrefix(line, psEvidenceMarker) {
 			continue
 		}
-		key, value, ok := strings.Cut(line[i+len(psEvidenceMarker):], "=")
+		key, value, ok := strings.Cut(line[len(psEvidenceMarker):], "=")
 		if !ok {
 			return nil, fmt.Errorf("malformed evidence line %q", line)
 		}
@@ -463,6 +475,7 @@ func TestBlockedScriptPolicyAction(t *testing.T) {
 		{"   ", false, false},
 		{"Undefinedx", false, false},
 		{"SomeFuturePolicy", false, false},
+		{"' + (Get-ExecutionPolicy))\r\n</S><S S=\"Error\">+ ...", false, false},
 	}
 	for _, tc := range cases {
 		run, skip := blockedScriptPolicyAction(tc.policy)
@@ -491,8 +504,9 @@ func TestBlockedScriptEvidence(t *testing.T) {
 			}
 		}
 	})
-	t.Run("marker after CLIXML on the same line", func(t *testing.T) {
-		out := "AIX_PS_EVIDENCE policy=AllSigned\n#< CLIXML\n<Objs Version=\"1.1.0.1\"></Objs>" +
+	t.Run("marker inside other text is not evidence", func(t *testing.T) {
+		out := "#< CLIXML\n<Objs Version=\"1.1.0.1\"></Objs>AIX_PS_EVIDENCE policy=Bypass\n" +
+			"AIX_PS_EVIDENCE policy=AllSigned\n" +
 			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n"
 		ev, err := blockedScriptEvidence(out)
 		if err != nil {
@@ -500,6 +514,29 @@ func TestBlockedScriptEvidence(t *testing.T) {
 		}
 		if ev["policy"] != "AllSigned" || ev["promoted"] != "True" || ev["id"] != "UnauthorizedAccess" {
 			t.Errorf("got %v", ev)
+		}
+	})
+	t.Run("CI regression: autoload failure echo", func(t *testing.T) {
+		out := "AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n" +
+			"AIX_PS_EVIDENCE category=SecurityError\n" +
+			"AIX_PS_EVIDENCE type=System.Management.Automation.PSSecurityException\n" +
+			`<S S="Error">+ Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))_x000D__x000A_</S>`
+		ev, err := blockedScriptEvidence(out)
+		if err == nil || !strings.Contains(err.Error(), `evidence key "policy" missing`) {
+			t.Fatalf("expected missing policy error, got %v (evidence %v)", err, ev)
+		}
+		if ev != nil {
+			t.Errorf("broken probe must not return evidence, got %v", ev)
+		}
+	})
+	t.Run("BOM before first marker", func(t *testing.T) {
+		ev, err := blockedScriptEvidence("\ufeffAIX_PS_EVIDENCE policy=Restricted\n" +
+			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev["policy"] != "Restricted" {
+			t.Errorf("policy: got %q, want Restricted", ev["policy"])
 		}
 	})
 	t.Run("blank values", func(t *testing.T) {
