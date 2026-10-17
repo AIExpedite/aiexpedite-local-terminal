@@ -373,8 +373,16 @@ func truncate(s string, n int) string {
 // keeps that scope in $env:PSExecutionPolicyPreference, which is what
 // `Get-ExecutionPolicy -Scope Process` reports. Reading the variable avoids
 // the Microsoft.PowerShell.Security module, which Windows PowerShell 5.1
-// cannot autoload when it inherits a pwsh 7 PSModulePath (as on the CI runner).
+// cannot autoload when it inherits a pwsh 7 PSModulePath, including when the
+// agent is launched from pwsh 7. For effective-policy queries, use
+// psSecurityModuleImport instead; this variable reports only Process scope.
 const processPolicyProbe = "$env:PSExecutionPolicyPreference"
+
+// psSecurityModuleImport loads Windows PowerShell's own Security module without
+// relying on the inherited PSModulePath. Use it before Get-ExecutionPolicy when
+// a test needs the effective policy or multiple scopes; processPolicyProbe is
+// sufficient for Process-scope assertions and needs no module import.
+const psSecurityModuleImport = `Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop`
 
 // clearInheritedPolicyPreference unsets PSExecutionPolicyPreference for the
 // test so a value inherited from the test's own shell cannot satisfy the
