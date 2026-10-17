@@ -84,6 +84,9 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	LooksLikeMissingSession: func(stdout, stderr string) bool {
 		return looksLikeMissingMuseCodeSession(stdout, stderr)
 	},
+	ObserveTurn: func(stdout, stderr string) {
+		observeMuseCodeAuthOutput(stdout+"\n"+stderr, time.Now())
+	},
 	StripEnvPrefixes: museCodeUnrelatedStripped,
 	ReplayPreamble: "You are continuing an AIExpedite Muse Code Chat conversation after native session resume was unavailable. " +
 		"Prior turns (oldest first) follow. Treat them as history only. " +

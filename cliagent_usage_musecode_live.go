@@ -175,7 +175,10 @@ func probeMuseCodeUsageLive(parent context.Context, agent detectedCLIAgent, now 
 	}
 	fingerprint := currentMuseCodeAccountFingerprint()
 	accountKey := museCodeUsageAccountKey(fingerprint)
-	if last, ok := loadMuseCodeUsageLive(accountKey); ok {
+	// The quota cooldown does not apply while Muse Code is marked signed out:
+	// Refresh is how a keychain re-login proves itself, and a refused probe
+	// fails before any model call, so it spends nothing (musecode_auth_signal.go).
+	if last, ok := loadMuseCodeUsageLive(accountKey); ok && !museCodeSignedOutMarked() {
 		if since := now().Sub(time.UnixMilli(last.ObservedAtMs)); since >= 0 && since < museCodeLiveProbeMinInterval {
 			return liveProbeOutcomeCooldown
 		}
@@ -299,6 +302,9 @@ func museCodeLiveProbeConverse(ctx context.Context, client *museCodeMSPClient, r
 		if !saveMuseCodeUsageLive(reading) {
 			return liveProbeOutcomeNoReading
 		}
+		// Meta answered a turn: signed in (a keychain login clears its
+		// signed-out mark this way — musecode_auth_signal.go).
+		recordMuseCodeSignedIn(time.Now())
 		return liveProbeOutcomeOK
 	}
 

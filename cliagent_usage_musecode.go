@@ -44,6 +44,8 @@ import (
 const (
 	museCodeAuthReady   = "ready"
 	museCodeAuthUnknown = "unknown"
+	// museCodeAuthSignedOut: only on the CLI's own refusal (musecode_auth_signal.go).
+	museCodeAuthSignedOut = "unauthenticated"
 )
 
 // museCodeConfigFileMaxBytes bounds a read of auth.json / settings.json; both
@@ -73,7 +75,16 @@ func (p museCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 		// Muse Code reports no login deadline of its own.
 		LoginExpirationState: loginExpirationNotReported,
 	}
-	if museCodeHasCredential(home, os.Getenv) {
+	if notice, signedOut := museCodeSignedOutNotice(home, os.Getenv); signedOut {
+		// The CLI itself refused with missing credentials and nothing has
+		// changed since (musecode_auth_signal.go): POSITIVE evidence, so this
+		// is the one case reported as signed out. The error notice makes
+		// terminal-service mark it blocked, and routing skips it.
+		usage.AuthState = museCodeAuthSignedOut
+		usage.Authenticated = authBoolPtr(false)
+		usage.Notice = notice
+		usage.NoticeSeverity = "error"
+	} else if museCodeHasCredential(home, os.Getenv) {
 		usage.AuthState = museCodeAuthReady
 		usage.Authenticated = authBoolPtr(true)
 	} else {
