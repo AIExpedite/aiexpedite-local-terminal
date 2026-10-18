@@ -136,6 +136,16 @@ type capabilitiesInfo struct {
 	// sends `readOnly` only when this is true — an older agent would reject
 	// the unknown signed field as a bad signature.
 	ReadOnlySessions bool `json:"readOnlySessions"`
+	// WorktreeBuiltIns (shared-constants DEVICE_WORKTREE_CAPABILITIES.BUILT_INS):
+	// this build intercepts the worktree built-ins before exec, enforces the
+	// path policy and deletes only through the link-safe walk
+	// (worktree_commands.go). terminal-service sends one only when this is true,
+	// because an older agent recognises none of the names: the dispatch falls
+	// through to the ordinary execute path and `__worktree_ensure__` gets looked
+	// up on PATH. Never omitempty — a future build reporting `false` must not
+	// read as "field absent", which means the same thing here but for a
+	// different reason, and a reader should not have to know which.
+	WorktreeBuiltIns bool `json:"worktreeBuiltIns"`
 	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
 	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,
 	// a fenced attempt id is refused forever, and `relay_follow_up_query`
@@ -285,6 +295,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
 		ReadOnlySessions:       true,
+		WorktreeBuiltIns:       true,
 	}
 }
 

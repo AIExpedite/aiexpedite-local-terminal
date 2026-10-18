@@ -57,7 +57,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			}
 			caps.RelayFollowUps = nil // its ledgerId is per machine
 			raw, _ := json.Marshal(caps)
-			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true}` {
+			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
