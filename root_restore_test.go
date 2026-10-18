@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func (fx wtFixture) restoreReq(branches ...string) rootRestoreRequest {
@@ -15,6 +16,10 @@ func (fx wtFixture) restoreReq(branches ...string) rootRestoreRequest {
 		Remote:           "origin",
 		RecordedBranches: branches,
 		Presence:         "idle",
+		// Taken now, because a reading has a shelf life: the restore refuses one
+		// older than presenceReadingMaxAge, so a fixture that hard-coded a date
+		// would start failing on its own.
+		PresenceAt: time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
