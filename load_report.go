@@ -495,6 +495,12 @@ func logLoadReport(label string) {
 
 // startLoadReporter begins sampling. Safe to call once; later calls are no-ops.
 func startLoadReporter(cfg *Config) {
+	// Restore the owner's presence switch BEFORE the first sample. Unknown
+	// withholds presence (see presenceAllowedByOwner), so without this an
+	// opted-out computer would withhold for one interval after every restart
+	// instead of none — and an opted-IN one would too.
+	loadPresenceOwnerState()
+
 	r := globalLoadReporter
 	r.mu.Lock()
 	if r.cfg != nil || r.stopped {

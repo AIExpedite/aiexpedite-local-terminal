@@ -84,7 +84,9 @@ func withOwnerSwitch(t *testing.T, allowed bool) {
 	t.Helper()
 	previous := presenceAllowedByOwner.Load()
 	setPresenceAllowedByOwner(allowed)
-	t.Cleanup(func() { setPresenceAllowedByOwner(previous) })
+	// Restored as a tri-state, so a test that ran with UNKNOWN is put back to
+	// UNKNOWN rather than being silently promoted to allowed.
+	t.Cleanup(func() { presenceAllowedByOwner.Store(previous) })
 }
 
 func TestPresenceVocabularyMatchesTheSharedContract(t *testing.T) {
@@ -333,5 +335,140 @@ func TestPresenceDisabledLocally(t *testing.T) {
 	withPresenceEnv(t, "", true)
 	if presenceDisabledLocally() {
 		t.Fatal("an empty value must not disable presence")
+	}
+}
+
+// ─── an opt-out survives a restart ──────────────────────────────────────────
+
+// The defect this pins: the owner's switch arrives only in a load-report
+// RESPONSE, so a process-local flag defaulting to "allowed" meant a computer
+// whose owner had turned presence OFF probed and transmitted it on the first
+// report after every start — and on every retry if that response was lost. An
+// opt-out a restart undoes is not an opt-out.
+func TestPresenceWithheldUntilTheOwnerSwitchIsKnown(t *testing.T) {
+	isolateMachineInfo(t)
+	previous := presenceAllowedByOwner.Load()
+	t.Cleanup(func() { presenceAllowedByOwner.Store(previous) })
+
+	// A fresh process, nothing persisted: UNKNOWN, and unknown WITHHOLDS.
+	presenceAllowedByOwner.Store(presenceOwnerUnknown)
+	_ = os.Remove(presenceOwnerStatePath())
+	if presenceSamplingEnabled() {
+		t.Fatal("presence was sampled before the owner's switch was known")
+	}
+
+	// The server says off. That has to survive the next start.
+	setPresenceAllowedByOwner(false)
+	if presenceSamplingEnabled() {
+		t.Fatal("an explicit off did not stop sampling")
+	}
+	presenceAllowedByOwner.Store(presenceOwnerUnknown) // the restart
+	loadPresenceOwnerState()
+	if presenceAllowedByOwner.Load() != presenceOwnerDenied {
+		t.Fatal("the owner's off switch did not survive a restart")
+	}
+	if presenceSamplingEnabled() {
+		t.Fatal("a restart undid the owner's opt-out")
+	}
+
+	// And an explicit ON survives too, so the withholding costs one interval on
+	// a new install rather than one after every restart.
+	setPresenceAllowedByOwner(true)
+	presenceAllowedByOwner.Store(presenceOwnerUnknown)
+	loadPresenceOwnerState()
+	if presenceAllowedByOwner.Load() != presenceOwnerAllowed {
+		t.Fatal("an explicit on did not survive a restart")
+	}
+	if !presenceSamplingEnabled() {
+		t.Fatal("presence stayed withheld after the owner allowed it")
+	}
+}
+
+// A corrupt or truncated state file must not read as permission.
+func TestPresenceOwnerStateFailsSafeOnGarbage(t *testing.T) {
+	isolateMachineInfo(t)
+	previous := presenceAllowedByOwner.Load()
+	t.Cleanup(func() { presenceAllowedByOwner.Store(previous) })
+
+	for _, garbage := range []string{"", "yes", "true", "1", "ALLOWED-ish", "\x00\x01"} {
+		presenceAllowedByOwner.Store(presenceOwnerUnknown)
+		if err := os.MkdirAll(GetConfigDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(presenceOwnerStatePath(), []byte(garbage), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		loadPresenceOwnerState()
+		if presenceAllowedByOwner.Load() != presenceOwnerUnknown {
+			t.Fatalf("%q was read as a decision", garbage)
+		}
+		if presenceSamplingEnabled() {
+			t.Fatalf("%q opened the presence probe", garbage)
+		}
+	}
+}
+
+// Two consecutive samples can both classify `idle` while the person was active
+// in between — easily, once the server sets a sample interval longer than the
+// five-minute idle threshold. The state does not change, so a tracker keyed only
+// on state keeps the old `since` and the reported age SPANS that activity.
+func TestPresenceAgeDoesNotSpanAnUnobservedTransition(t *testing.T) {
+	withOwnerSwitch(t, true)
+	tracker := &presenceTracker{}
+	base := time.Unix(1_700_000_000, 0)
+
+	// First sample: idle for 15 minutes — past the 5 min idle threshold but
+	// short of the 20 min away threshold — so the idle period began 10 minutes
+	// ago (15 min idle − the 5 min threshold).
+	first := tracker.observe(base, presenceSignals{IdleOK: true, Idle: 15 * time.Minute})
+	if first.State != presenceStateIdle {
+		t.Fatalf("state = %q, want idle", first.State)
+	}
+	if got := time.Duration(first.AgeMs) * time.Millisecond; got != 10*time.Minute {
+		t.Fatalf("age = %v, want 10m", got)
+	}
+
+	// An hour later, idle for only 6 minutes: the person clearly came back and
+	// left again. The state is still `idle`, and the honest age is 1 minute —
+	// not the 70 minutes a state-only tracker would report.
+	second := tracker.observe(base.Add(time.Hour), presenceSignals{IdleOK: true, Idle: 6 * time.Minute})
+	if second.State != presenceStateIdle {
+		t.Fatalf("state = %q, want idle", second.State)
+	}
+	if got := time.Duration(second.AgeMs) * time.Millisecond; got != time.Minute {
+		t.Fatalf("age = %v, want 1m — the age spanned the intervening activity", got)
+	}
+}
+
+// `since` only ever moves FORWARD. A longer idle reading within the same
+// uninterrupted period must not drag the start backwards.
+func TestPresenceAgeNeverMovesBackwards(t *testing.T) {
+	withOwnerSwitch(t, true)
+	tracker := &presenceTracker{}
+	base := time.Unix(1_700_000_000, 0)
+
+	tracker.observe(base, presenceSignals{IdleOK: true, Idle: 6 * time.Minute})
+	// Ten minutes later the same period has simply continued: idle is now 16
+	// minutes, whose derived start is EARLIER than the one on record.
+	later := tracker.observe(base.Add(10*time.Minute), presenceSignals{IdleOK: true, Idle: 16 * time.Minute})
+	if got := time.Duration(later.AgeMs) * time.Millisecond; got != 11*time.Minute {
+		t.Fatalf("age = %v, want 11m (1m at first sample + 10m elapsed)", got)
+	}
+}
+
+// An `active` observation must not advance on its derived start, which is just
+// `now` — that would peg the age at zero on every sample.
+func TestPresenceActiveAgeAccumulates(t *testing.T) {
+	withOwnerSwitch(t, true)
+	tracker := &presenceTracker{}
+	base := time.Unix(1_700_000_000, 0)
+
+	tracker.observe(base, presenceSignals{IdleOK: true, Idle: time.Second})
+	later := tracker.observe(base.Add(3*time.Minute), presenceSignals{IdleOK: true, Idle: 2 * time.Second})
+	if later.State != presenceStateActive {
+		t.Fatalf("state = %q, want active", later.State)
+	}
+	if got := time.Duration(later.AgeMs) * time.Millisecond; got != 3*time.Minute {
+		t.Fatalf("age = %v, want 3m — an active age must accumulate", got)
 	}
 }

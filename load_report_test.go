@@ -384,11 +384,14 @@ func TestApplyAnswerAdoptsOnlyWhatTheServerSaid(t *testing.T) {
 		changePercent:  loadReportChangePercent,
 	}
 
-	// An older server that answers none of these leaves everything alone —
-	// and in particular does not read an absent `presenceEnabled` as off.
+	// An older server that answers none of these leaves everything alone — and
+	// in particular does not read an absent `presenceEnabled` as a decision
+	// either way. Seeded as ALLOWED first, so "left alone" is observable: the
+	// state is tri-state now and its zero value is UNKNOWN, which withholds.
+	setPresenceAllowedByOwner(true)
 	reporter.applyAnswer(deviceLoadReportResponse{})
-	if !presenceAllowedByOwner.Load() {
-		t.Fatal("an absent presenceEnabled turned presence off")
+	if presenceAllowedByOwner.Load() != presenceOwnerAllowed {
+		t.Fatal("an absent presenceEnabled changed the owner's switch")
 	}
 	if reporter.sampleInterval != loadSampleInterval || reporter.maxInterval != loadReportMaxInterval {
 		t.Fatalf("an empty answer changed the cadence: %v/%v", reporter.sampleInterval, reporter.maxInterval)
@@ -404,7 +407,7 @@ func TestApplyAnswerAdoptsOnlyWhatTheServerSaid(t *testing.T) {
 		MaxIntervalMs:    &max,
 		ChangePercent:    &percent,
 	})
-	if presenceAllowedByOwner.Load() {
+	if presenceAllowedByOwner.Load() != presenceOwnerDenied {
 		t.Fatal("the owner's off switch was not adopted")
 	}
 	if reporter.sampleInterval != 45*time.Second || reporter.maxInterval != 10*time.Minute {

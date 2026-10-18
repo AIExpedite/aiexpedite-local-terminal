@@ -41,6 +41,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,17 +90,62 @@ type presenceSignals struct {
 var probePresenceSignals = platformPresenceSignals
 
 // presenceAllowedByOwner mirrors the owner's switch as the server last
-// answered it. Starts true because D12 ships presence ON by default; an older
-// terminal-service that answers nothing therefore leaves it on, and a build
-// that cannot reach the server at all never reports anything anyway.
-var presenceAllowedByOwner = func() *atomic.Bool {
-	b := &atomic.Bool{}
-	b.Store(true)
-	return b
-}()
+// answered it, as a TRI-STATE: unknown, allowed, or denied.
+//
+// It used to start `true`, reasoning that D12 ships presence ON by default. That
+// was the wrong read of D12: the default governs the SERVER's stored setting,
+// not what an agent may assume before it has been told. The switch only arrives
+// in a load-report RESPONSE, so a process-local flag defaulting to allowed
+// meant a computer whose owner had turned presence OFF probed and transmitted
+// it on the first report after every start or restart — and on every retry if
+// that response was lost. An opt-out that a restart silently undoes is not an
+// opt-out. (Codex, PR #231.)
+//
+// So: UNKNOWN WITHHOLDS. The answer is also persisted, so the withholding costs
+// one interval on a brand-new install rather than one after every restart.
+const (
+	presenceOwnerUnknown int32 = 0
+	presenceOwnerAllowed int32 = 1
+	presenceOwnerDenied  int32 = 2
+)
 
-// setPresenceAllowedByOwner records the switch from a load-report response.
-func setPresenceAllowedByOwner(allowed bool) { presenceAllowedByOwner.Store(allowed) }
+var presenceAllowedByOwner = &atomic.Int32{} // zero value is UNKNOWN, deliberately
+
+// presenceOwnerStatePath is where the last known answer is remembered. A small
+// dedicated file rather than config.json: that file holds the registration, and
+// a stray write to it has unregistered a device before (see paths.go).
+func presenceOwnerStatePath() string {
+	return filepath.Join(GetConfigDir(), "presence-reporting.state")
+}
+
+// loadPresenceOwnerState restores the last known answer. Anything unreadable or
+// unrecognised stays UNKNOWN, which withholds — a corrupt file must not be a
+// licence to report.
+func loadPresenceOwnerState() {
+	raw, err := os.ReadFile(presenceOwnerStatePath())
+	if err != nil {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case "allowed":
+		presenceAllowedByOwner.Store(presenceOwnerAllowed)
+	case "denied":
+		presenceAllowedByOwner.Store(presenceOwnerDenied)
+	}
+}
+
+// setPresenceAllowedByOwner records the switch from a load-report response and
+// remembers it across restarts. A failed write only costs one withheld interval
+// after the next restart, so it is not worth failing the report over.
+func setPresenceAllowedByOwner(allowed bool) {
+	state, text := presenceOwnerDenied, "denied"
+	if allowed {
+		state, text = presenceOwnerAllowed, "allowed"
+	}
+	presenceAllowedByOwner.Store(state)
+	_ = os.MkdirAll(GetConfigDir(), 0o700)
+	_ = os.WriteFile(presenceOwnerStatePath(), []byte(text), 0o600)
+}
 
 // presenceEnvLookup is os.LookupEnv, replaced in tests.
 var presenceEnvLookup = os.LookupEnv
@@ -122,7 +168,9 @@ func presenceDisabledLocally() bool {
 // all. Both layers gate the probe itself, not just the report, so "off" means
 // the idle timer is never consulted.
 func presenceSamplingEnabled() bool {
-	return !presenceDisabledLocally() && presenceAllowedByOwner.Load()
+	// UNKNOWN withholds: only an explicit `allowed` from the server opens the
+	// probe. See presenceAllowedByOwner for why the default is not `allowed`.
+	return !presenceDisabledLocally() && presenceAllowedByOwner.Load() == presenceOwnerAllowed
 }
 
 // classifyPresence turns one probe into one state (§8.2):
@@ -180,6 +228,14 @@ func presenceStateStart(now time.Time, state string, s presenceSignals) time.Tim
 	return now
 }
 
+// isTimerDerivedPresence reports whether this state's start is computed from
+// the idle timer rather than from the moment of observation. Only those carry
+// evidence of WHEN the state began, which is what lets an unobserved
+// transition be detected without keeping any history of what the person did.
+func isTimerDerivedPresence(state string) bool {
+	return state == presenceStateIdle || state == presenceStateAway
+}
+
 // presenceTracker holds the current state and when it began, so `since` does
 // not need any history of what the person did.
 type presenceTracker struct {
@@ -209,11 +265,27 @@ func notReportedPresence() presenceSample {
 // observe folds one probe into the tracker and returns the state with its age.
 func (t *presenceTracker) observe(now time.Time, s presenceSignals) presenceSample {
 	state := classifyPresence(s)
+	start := presenceStateStart(now, state, s)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.state != state || t.since.IsZero() {
-		t.state = state
-		t.since = presenceStateStart(now, state, s)
+	switch {
+	case t.state != state || t.since.IsZero():
+		t.state, t.since = state, start
+	case start.After(t.since) && isTimerDerivedPresence(state) && s.IdleOK:
+		// AN UNOBSERVED TRANSITION. Two consecutive samples can both classify
+		// `idle` while the person was active in between — easily, once the
+		// server configures a sample interval longer than the five-minute idle
+		// threshold. The state did not change, so the old branch kept the old
+		// `since` and the reported age then SPANNED that activity.
+		//
+		// The idle timer is evidence the state alone is not: a later derived
+		// start means the current idle period began after the one on record,
+		// which can only be because it was interrupted. Only ever moved
+		// FORWARD, and only for the states whose start the timer actually
+		// derives — for `active` the derived start is simply `now`, so
+		// advancing on it would peg the age at zero every sample.
+		// (Codex, PR #231.)
+		t.since = start
 	}
 	age := now.Sub(t.since)
 	if age < 0 {
