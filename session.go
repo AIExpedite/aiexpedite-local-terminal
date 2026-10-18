@@ -61,10 +61,26 @@ const (
 // CLISession represents a single interactive CLI agent process with
 // bidirectional I/O pipes and streaming output.
 type CLISession struct {
-	ID        string
-	Command   string // "claude", "codex"
-	Process   *exec.Cmd
-	Stdin     io.WriteCloser
+	ID      string
+	Command string // "claude", "codex"
+	Process *exec.Cmd
+	Stdin   io.WriteCloser
+	// stdinMu serializes writes to Stdin, and the closes that retire it.
+	//
+	// A CLI's stdin is one pipe with several writers: the initial prompt
+	// (deliverInitialPrompt) and every follow-up turn (SendInputAccepting).
+	// A prompt larger than PIPE_BUF — 4 KiB on Linux, and claude kickoff
+	// briefs run to hundreds of KB — is delivered as MULTIPLE non-atomic
+	// writes, so an interleaved turn splices its NDJSON envelope inside
+	// another line and the child receives two corrupt JSON objects instead
+	// of two valid turns.
+	//
+	// This cannot be `mu`: readOutputStream takes that several times per
+	// output event, so holding it across a large stdin write would stall
+	// output processing for the duration. stdinMu is therefore always the
+	// INNERMOST lock — taken after `mu` where both are needed, and never
+	// held while acquiring `mu` or sm.mu.
+	stdinMu   sync.Mutex
 	Stdout    io.ReadCloser
 	Stderr    io.ReadCloser
 	StartedAt time.Time
@@ -1169,7 +1185,11 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	// Close stdin for one-shot sessions. Codex exec appends piped stdin to the
 	// prompt, so leaving the pipe open makes it wait indefinitely for EOF.
 	if shouldCloseStdinAfterStart(command, stdinPrompt) {
+		// Under stdinMu: an in-flight write must not have the pipe closed
+		// from under it.
+		session.stdinMu.Lock()
 		session.Stdin.Close()
+		session.stdinMu.Unlock()
 		logSession(id, "%s[session] Closed stdin for one-shot session %s (%s)%s\n",
 			colorYellow, id, command, colorReset)
 	} else if utilitySession {
@@ -1178,7 +1198,9 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		// (The /dev/tty prompt vector is already closed by the TTY detachment in
 		// hardenNonAgentCommand.) Mutually exclusive with the one-shot close
 		// above, which only fires for resident stdin-fed agents.
+		session.stdinMu.Lock()
 		session.Stdin.Close()
+		session.stdinMu.Unlock()
 	}
 
 	return nil
@@ -1190,7 +1212,17 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 // first thing the child read, so its run began there. A failed write is
 // logged and starts nothing, exactly as a failed deferred SendInput does.
 func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string, promptLen int, format string) {
-	if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
+	// Serialized against SendInputAccepting: since the manager lock is now
+	// released before this runs, a session_input delivered on a sibling
+	// Pub/Sub goroutine can reach the same pipe while this write is still
+	// in flight.
+	session.stdinMu.Lock()
+	writeErr := func() error {
+		defer session.stdinMu.Unlock()
+		_, err := fmt.Fprintln(session.Stdin, line)
+		return err
+	}()
+	if err := writeErr; err != nil {
 		logSession(session.ID, "%s[session] Failed to send initial prompt to %s: %v%s\n",
 			colorRed, session.ID, err, colorReset)
 		return
@@ -1457,6 +1489,14 @@ func (sm *SessionManager) SendInputAccepting(id, text string, accept func() erro
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).
 	writeDone := make(chan error, 1)
 	go func() {
+		// stdinMu, not session.mu: this goroutine outlives the select below
+		// when the budget is spent, and an abandoned write must still finish
+		// before any other writer touches the pipe. Taking it here rather
+		// than around the select is deliberate — the caller already holds
+		// session.mu, and holding stdinMu across a timeout would let a
+		// wedged pipe block the initial prompt of an unrelated start.
+		session.stdinMu.Lock()
+		defer session.stdinMu.Unlock()
 		_, err := fmt.Fprintln(session.Stdin, payload)
 		writeDone <- err
 	}()
