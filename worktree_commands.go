@@ -211,16 +211,21 @@ var safeRefNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$
 // safeRefComponent reports whether one `/`-separated piece of a ref is one git
 // will accept: git refuses a component that begins with a dot, and one that
 // ends with a dot is the same class of trap as a trailing `.lock`.
+//
+// A LEADING DASH IS FINE HERE and refusing it was an over-correction. Git
+// documents that a dash may begin a ref component, and every ref this
+// validator sees starts with `aix/` — the argument reaching git is
+// `HEAD:refs/heads/aix/rescue/<feature>/<repo>`, so a dash deeper in it can
+// never be read as an option. Refusing it instead blocked every removal of a
+// worktree whose folder legitimately begins with `-` (which the path policy
+// explicitly permits), rescue push or not. The guard against an
+// option-looking ARGUMENT belongs where an argument is built, not here.
+// (Codex, PR #230.)
 func safeRefComponent(part string) bool {
 	if part == "" {
 		return false
 	}
-	if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".") {
-		return false
-	}
-	// A leading `-` makes the ref look like a flag wherever it is spliced into
-	// an argument list.
-	return !strings.HasPrefix(part, "-")
+	return !strings.HasPrefix(part, ".") && !strings.HasSuffix(part, ".")
 }
 
 // refComponentFromFolder turns a repository FOLDER name into something usable
@@ -349,6 +354,12 @@ type worktreeCompanionResult struct {
 	// default branch" and "advanced to the newest one we could see".
 	FetchFailed bool   `json:"fetchFailed,omitempty"`
 	FetchError  string `json:"fetchError,omitempty"`
+	// FetchSkipped says the REQUEST opted out of fetching, so no network call
+	// was attempted. Distinct from FetchFailed on purpose: "we chose not to
+	// look" and "we looked and could not see" imply different things about how
+	// stale Target may be, and collapsing them would make an offline run look
+	// like a broken one.
+	FetchSkipped bool `json:"fetchSkipped,omitempty"`
 }
 
 type worktreeEnsureResult struct {
@@ -456,7 +467,11 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 
 	// Step 4: companions.
 	for _, c := range req.Companions {
-		res.Companions = append(res.Companions, ensureCompanion(ctx, req.Root, c))
+		// The same switch the top-level fetch above honours.
+		res.Companions = append(
+			res.Companions,
+			ensureCompanion(ctx, req.Root, c, req.Fetch == nil || *req.Fetch),
+		)
 	}
 
 	// Step 4: reconcile (and optionally record) dependency provenance.
@@ -549,7 +564,12 @@ func createWorktree(ctx context.Context, mainRepo string, wt resolvedWorktreePat
 // local modifications, is left EXACTLY as it is and reported — nothing in the
 // platform should ever have committed in a companion, so this is a signal, not
 // a case to resolve silently.
-func ensureCompanion(ctx context.Context, root string, c worktreeCompanionSpec) worktreeCompanionResult {
+func ensureCompanion(
+	ctx context.Context,
+	root string,
+	c worktreeCompanionSpec,
+	fetchRemotes bool,
+) worktreeCompanionResult {
 	out := worktreeCompanionResult{Path: c.Path}
 	wt, err := resolveWorktreePath(root, c.Path)
 	if err != nil {
@@ -583,13 +603,28 @@ func ensureCompanion(ctx context.Context, root string, c worktreeCompanionSpec) 
 	// companion is the only way to know, because the object store is per
 	// checkout. (Codex, PR #229.)
 	//
-	// A failed fetch is NOT fatal: the ref may still be good enough, and
-	// refusing a whole refresh because one companion's network call failed is
-	// worse than proceeding and reporting. The staleness is then bounded by
-	// whatever the last successful fetch left, and `fetchFailed` says so.
-	if _, ferr := wtGit(ctx, mainRepo, "fetch", remote, "--prune"); ferr != nil {
-		out.FetchFailed = true
-		out.FetchError = redactSensitiveData(ferr.Error())
+	// wtGitNetwork, NOT wtGit: this is a network call, and the ordinary local
+	// timeout would cancel a slow fetch and let the code proceed against the
+	// very stale ref the fetch exists to refresh — a silent version of the bug
+	// rather than a fix for it. The top-level fetch already uses this wrapper.
+	//
+	// Skipped when the request opts out of fetching. `fetch` is the one network
+	// switch an ensure has, so a caller using it for an offline or
+	// deterministic run must not be made to reach every companion's remote.
+	// `fetchSkipped` keeps that distinguishable from a fetch that was tried and
+	// failed, because the two mean different things about how stale the target
+	// below may be. (Both: Codex, PR #230.)
+	if fetchRemotes {
+		// A failed fetch is NOT fatal: the ref may still be good enough, and
+		// refusing a whole refresh because one companion's network call failed
+		// is worse than proceeding and reporting. The staleness is then bounded
+		// by whatever the last successful fetch left, and `fetchFailed` says so.
+		if _, ferr := wtGitNetwork(ctx, mainRepo, "fetch", remote, "--prune"); ferr != nil {
+			out.FetchFailed = true
+			out.FetchError = redactSensitiveData(ferr.Error())
+		}
+	} else {
+		out.FetchSkipped = true
 	}
 	target, err := wtRevParse(ctx, mainRepo, "refs/remotes/"+remote+"/"+defaultBranch)
 	if err != nil || target == "" {
