@@ -159,29 +159,59 @@ func TestPresenceStateStartDatesIdleAndAwayFromTheTimer(t *testing.T) {
 
 	// Idle for 7 minutes: the state began 2 minutes ago, when the timer
 	// crossed the 5-minute threshold.
-	start := presenceStateStart(now, presenceStateIdle, presenceSignals{Idle: 7 * time.Minute, IdleOK: true})
-	if want := now.Add(-2 * time.Minute); !start.Equal(want) {
-		t.Fatalf("idle start = %v, want %v", start, want)
+	start, derived := presenceStateStart(now, presenceStateIdle, presenceSignals{Idle: 7 * time.Minute, IdleOK: true})
+	if want := now.Add(-2 * time.Minute); !start.Equal(want) || !derived {
+		t.Fatalf("idle start = %v (derived %v), want %v derived", start, derived, want)
 	}
 
 	// Idle for 25 minutes: away began 5 minutes ago.
-	start = presenceStateStart(now, presenceStateAway, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
-	if want := now.Add(-5 * time.Minute); !start.Equal(want) {
-		t.Fatalf("away start = %v, want %v", start, want)
+	start, derived = presenceStateStart(now, presenceStateAway, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
+	if want := now.Add(-5 * time.Minute); !start.Equal(want) || !derived {
+		t.Fatalf("away start = %v (derived %v), want %v derived", start, derived, want)
 	}
 
-	// Active, or a state known only from the lock signal, is dated now: the
-	// real start needs a history of the person's activity, which §8.3 forbids.
+	// Active, or a state known only from the lock signal, is dated now AND
+	// reported as not timer-derived: the real start needs a history of the
+	// person's activity, which §8.3 forbids. The second return is what keeps
+	// the tracker from re-dating these on every sample.
 	for _, c := range []struct {
 		state   string
 		signals presenceSignals
 	}{
 		{presenceStateActive, presenceSignals{Idle: time.Second, IdleOK: true}},
 		{presenceStateAway, presenceSignals{Locked: true, LockedOK: true}},
+		{presenceStateAway, presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 3 * time.Minute, IdleOK: true}},
 		{presenceStateIdle, presenceSignals{}},
 	} {
-		if start := presenceStateStart(now, c.state, c.signals); !start.Equal(now) {
-			t.Fatalf("%s start = %v, want %v", c.state, start, now)
+		start, derived := presenceStateStart(now, c.state, c.signals)
+		if !start.Equal(now) || derived {
+			t.Fatalf("%s start = %v (derived %v), want %v not derived", c.state, start, derived, now)
+		}
+	}
+}
+
+// A sleeping display or a locked session classifies `away` while the idle timer
+// is still under 20 minutes. The unobserved-transition fix first tested the
+// STATE NAME for timer-derivation, so every one of those samples re-dated the
+// state to `now` and the reported age never grew past one interval — a display
+// asleep for an hour read as away for seconds. (Codex, PR #231.)
+func TestPresenceAwayFromASignalKeepsItsAge(t *testing.T) {
+	tracker := &presenceTracker{}
+	start := time.Unix(1790000000, 0)
+	// Idle stays well under the 20-minute threshold throughout, so every
+	// `away` here comes from the display signal alone.
+	signals := presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 2 * time.Minute, IdleOK: true}
+
+	if first := tracker.observe(start, signals); first.State != presenceStateAway || first.AgeMs != 0 {
+		t.Fatalf("first observation = %+v", first)
+	}
+	for _, elapsed := range []time.Duration{3 * time.Minute, 10 * time.Minute, time.Hour} {
+		got := tracker.observe(start.Add(elapsed), signals)
+		if got.State != presenceStateAway {
+			t.Fatalf("state after %v = %q", elapsed, got.State)
+		}
+		if want := elapsed.Milliseconds(); got.AgeMs != want {
+			t.Fatalf("away age after %v = %dms, want %dms", elapsed, got.AgeMs, want)
 		}
 	}
 }
@@ -371,16 +401,41 @@ func TestPresenceWithheldUntilTheOwnerSwitchIsKnown(t *testing.T) {
 		t.Fatal("a restart undid the owner's opt-out")
 	}
 
-	// And an explicit ON survives too, so the withholding costs one interval on
-	// a new install rather than one after every restart.
+	// An explicit ON opens the probe now...
+	setPresenceAllowedByOwner(true)
+	if !presenceSamplingEnabled() {
+		t.Fatal("presence stayed withheld after the owner allowed it")
+	}
+
+	// ...and is deliberately NOT remembered. Remembering it would authorise the
+	// first probe after a restart, and an owner who turned presence off while
+	// this agent was stopped would be sampled anyway — the very hole the
+	// tri-state closes. One withheld interval per restart is the price.
+	// (Codex, PR #231.)
+	//
+	// The WRITER is pinned separately from the reader below: the reader ignores
+	// the word `allowed` outright, so asserting only the restored state leaves a
+	// regression in the writer invisible. Both layers have to fail loudly.
+	if raw, err := os.ReadFile(presenceOwnerStatePath()); err == nil {
+		t.Fatalf("an opt-in wrote %q to disk; only a denial may be persisted", raw)
+	}
+	presenceAllowedByOwner.Store(presenceOwnerUnknown) // the restart
+	loadPresenceOwnerState()
+	if presenceAllowedByOwner.Load() != presenceOwnerUnknown {
+		t.Fatal("an opt-in was remembered across a restart")
+	}
+	if presenceSamplingEnabled() {
+		t.Fatal("a remembered opt-in authorised the first probe after a restart")
+	}
+
+	// Turning it on also CLEARS a remembered denial, so an opt-out followed by
+	// an opt-in does not withhold for an interval after every later restart.
+	setPresenceAllowedByOwner(false)
 	setPresenceAllowedByOwner(true)
 	presenceAllowedByOwner.Store(presenceOwnerUnknown)
 	loadPresenceOwnerState()
-	if presenceAllowedByOwner.Load() != presenceOwnerAllowed {
-		t.Fatal("an explicit on did not survive a restart")
-	}
-	if !presenceSamplingEnabled() {
-		t.Fatal("presence stayed withheld after the owner allowed it")
+	if presenceAllowedByOwner.Load() == presenceOwnerDenied {
+		t.Fatal("an opt-in left the earlier denial on disk")
 	}
 }
 
@@ -390,7 +445,9 @@ func TestPresenceOwnerStateFailsSafeOnGarbage(t *testing.T) {
 	previous := presenceAllowedByOwner.Load()
 	t.Cleanup(func() { presenceAllowedByOwner.Store(previous) })
 
-	for _, garbage := range []string{"", "yes", "true", "1", "ALLOWED-ish", "\x00\x01"} {
+	// `allowed` is in this list on purpose: an earlier build of this agent wrote
+	// it, and such a file must now read as UNKNOWN rather than as permission.
+	for _, garbage := range []string{"", "yes", "true", "1", "allowed", "ALLOWED-ish", "\x00\x01"} {
 		presenceAllowedByOwner.Store(presenceOwnerUnknown)
 		if err := os.MkdirAll(GetConfigDir(), 0o700); err != nil {
 			t.Fatal(err)

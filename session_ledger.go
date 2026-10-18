@@ -149,9 +149,14 @@ type ledgerEntry struct {
 	PendingSpawns int `json:"pendingSpawns,omitempty"`
 	// Incomplete marks an entry missing a process (no start time could be
 	// read, or the PID cap was hit): never certified.
-	Incomplete bool   `json:"incomplete,omitempty"`
-	State      string `json:"state,omitempty"`
-	UpdatedAt  int64  `json:"updatedAt"`
+	Incomplete bool `json:"incomplete,omitempty"`
+	// Released marks a session that ENDED while its group / job still held
+	// processes, so ReleaseSession kept the entry as reap evidence. The
+	// session is over; what survives is a leftover process tree. The reap
+	// paths want this entry, the load report's session count does not.
+	Released  bool   `json:"released,omitempty"`
+	State     string `json:"state,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
 	// OSBoot is the OS boot identity the entry's agent process ran under
 	// ("<kind>:<value>", os_boot.go) and OSUptimeMs the time since that boot
 	// when it was read. Refreshed on every change of a current-boot entry;
@@ -662,6 +667,7 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 		e.PIDs = kept
 		e.Logical = false
 		e.PendingSpawns = 0
+		e.Released = true
 		l.touch(e)
 	}
 	l.persistLocked()
@@ -921,6 +927,15 @@ func (l *spawnLedger) Report(ctx context.Context) bootReport {
 // processes those sessions still hold, so the caller can total their RSS;
 // a logical session between turns legitimately holds none.
 //
+// A RELEASED ENTRY IS NOT A SESSION, BUT ITS PROCESSES ARE STILL REAL. When a
+// session ends having left something in its group / job, ReleaseSession keeps
+// the entry for the boot reap — with `State` still `live`, because the reap
+// paths need it that way. Counting it as a session told the server a finished
+// session was running for the rest of this process's life, and that is exactly
+// the Phase 0 number parallelism will later be sized on. Its surviving PIDs do
+// still occupy memory on this computer, so they stay in `pids`: the count drops
+// the session, never the resources. (Codex, PR #231.)
+//
 // Read-only — it never loads the file, creates an entry or touches a stamp, so
 // a report can never alter the reap evidence it walks past.
 func (l *spawnLedger) loadCounts() (sessions int, pids []int) {
@@ -930,7 +945,9 @@ func (l *spawnLedger) loadCounts() (sessions int, pids []int) {
 		if e.BootID != l.bootID {
 			continue
 		}
-		sessions++
+		if !e.Released {
+			sessions++
+		}
 		for _, p := range e.PIDs {
 			if p.PID > 0 {
 				pids = append(pids, p.PID)

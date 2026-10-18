@@ -524,6 +524,34 @@ func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
 	}
 }
 
+// ...and the entry it keeps is marked as a session that ENDED, so the load
+// report stops counting it as one. The retained entry keeps `State: live` for
+// the reap, so the count needs its own marker; this test drives the real
+// ReleaseSession rather than setting the field, which is the only way it is
+// ever set. (Codex, PR #231.)
+func TestReleaseMarksTheKeptEntryAsEndedForTheLoadReport(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(p ledgerProcess, _ uintptr) bool { return false }
+	l.BeginSpawn("ends")
+	l.TrackProcess("ends", proc(21), false)
+	l.BeginSpawn("stays")
+	l.TrackProcess("stays", proc(22), false)
+
+	if sessions, pids := l.loadCounts(); sessions != 2 || len(pids) != 2 {
+		t.Fatalf("before the release: sessions %d pids %v, want 2 and 2", sessions, pids)
+	}
+
+	l.ReleaseSession("ends")
+
+	sessions, pids := l.loadCounts()
+	if sessions != 1 {
+		t.Fatalf("sessions = %d after one of two ended, want 1", sessions)
+	}
+	if len(pids) != 2 {
+		t.Fatalf("pids = %v, want both — the leftover process still occupies memory", pids)
+	}
+}
+
 // TestIncompleteGenerationBlocksAReapedOne: a pending / incomplete record is
 // kept as an unknown tombstone, so a reaped entry of the same session id in
 // another generation is never certified.
