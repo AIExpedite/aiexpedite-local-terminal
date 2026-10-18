@@ -45,7 +45,8 @@ func execPS(t *testing.T, ps *PersistentPowerShell, command string) (string, err
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return ps.Execute(ctx, command, "")
+	out, _, err := ps.Execute(ctx, command, "")
+	return out, err
 }
 
 func requireExitCode(t *testing.T, err error, want int) {
@@ -581,7 +582,7 @@ func TestRunLocalCommandWindows_LaunchesCmdShimNotPs1(t *testing.T) {
 		t.Fatalf("preferBatchShim = %q, want aixshim.cmd", got)
 	}
 
-	out, err := runLocalCommandWindows("aixshim", []string{"--version"}, "", 30*time.Second)
+	out, err := runLocalCommandWindows("aixshim", []string{"--version"}, "", 30*time.Second, cwdScope{})
 	if err != nil {
 		t.Fatalf("expected exit 0 from the .cmd shim, got %v\noutput: %s", err, out)
 	}

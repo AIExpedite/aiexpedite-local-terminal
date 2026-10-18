@@ -176,7 +176,7 @@ func TestAntigravityFreshness_NonTTYExecuteAdvancesObservedAt(t *testing.T) {
 		t.Fatalf("parse seed: %v", err)
 	}
 
-	out, execErr := executeTerminalCommand(nil, commandMsg{
+	out, _, execErr := executeTerminalCommand(nil, commandMsg{
 		Command:   executable,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),
@@ -322,7 +322,7 @@ func TestAntigravityFreshness_GatedTerminalManagedSessionAdvancesObservedAt(t *t
 func TestAntigravityFreshness_GatedNonTTYExecuteAdvancesObservedAt(t *testing.T) {
 	home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
 
-	out, execErr := executeTerminalCommand(nil, commandMsg{
+	out, _, execErr := executeTerminalCommand(nil, commandMsg{
 		Command:   executable,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),
@@ -354,7 +354,7 @@ func TestAntigravityFreshness_NonTTYExecuteOfOtherCommandArmsNothing(t *testing.
 		t.Fatalf("copy mock: %v", err)
 	}
 
-	if _, err := executeTerminalCommand(nil, commandMsg{
+	if _, _, err := executeTerminalCommand(nil, commandMsg{
 		Command:   other,
 		Args:      []string{"--version"},
 		Cwd:       t.TempDir(),
@@ -377,7 +377,7 @@ func TestAntigravityFreshness_NonTTYExecuteStartFailureArmsNothing(t *testing.T)
 		missing += ".exe"
 	}
 
-	if _, err := executeTerminalCommand(nil, commandMsg{
+	if _, _, err := executeTerminalCommand(nil, commandMsg{
 		Command:   missing,
 		Args:      []string{"--print", "hello"},
 		Cwd:       t.TempDir(),
@@ -676,7 +676,7 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 	script := fmt.Sprintf(`Set-Location %q; & %q --print "hello"`, t.TempDir(), executable)
 	out, execErr := runLocalCommandWindows("powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell(script)},
-		t.TempDir(), 30*time.Second)
+		t.TempDir(), 30*time.Second, cwdScope{})
 	if execErr != nil {
 		t.Fatalf("windows execute failed: %v (output=%q)", execErr, out)
 	}
@@ -717,7 +717,7 @@ func TestAntigravityFreshness_NonAgyWindowsExecuteArmsNothing(t *testing.T) {
 
 	if _, err := runLocalCommandWindows("powershell",
 		[]string{"-EncodedCommand", encodeForPowerShell("git log --grep agy")},
-		t.TempDir(), 30*time.Second); err != nil {
+		t.TempDir(), 30*time.Second, cwdScope{}); err != nil {
 		t.Fatalf("windows execute failed: %v", err)
 	}
 	if got := antigravityCaptureArms.Load(); got != 0 {

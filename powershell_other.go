@@ -15,9 +15,11 @@ import (
 // PersistentPowerShell is a stub for non-Windows platforms.
 type PersistentPowerShell struct{}
 
-// Execute is a stub (never called on non-Windows).
-func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, error) {
-	return "", fmt.Errorf("PowerShell not supported on this platform")
+// Execute is a stub (never called on non-Windows). The second return is the
+// host's cwd as of this command; see the Windows implementation for why it is
+// returned rather than read back from the shared host.
+func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, string, error) {
+	return "", "", fmt.Errorf("PowerShell not supported on this platform")
 }
 
 // ExitCodeError is a stub for non-Windows platforms.

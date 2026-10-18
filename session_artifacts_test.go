@@ -48,7 +48,7 @@ func TestCollectSessionArtifacts_NoWorkspaceIsANoOp(t *testing.T) {
 // empty too there is nothing to scope a scan to. Scanning "everything" here
 // would upload another workspace's fresh media under this session's id.
 func TestCollectSessionArtifacts_NoWorkdirSkipsScan(t *testing.T) {
-	setTrackedCwd("")
+	resetTrackedCwds()
 	cfg := &Config{EnableFileUpload: true, StorageBucket: "b"}
 	files, errs := collectSessionArtifacts(context.Background(), cfg, "s1", "ws-1", "", time.Now())
 	if files != nil || errs != nil {

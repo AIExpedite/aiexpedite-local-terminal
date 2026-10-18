@@ -192,18 +192,28 @@ func (ps *PersistentPowerShell) tryLockWithTimeout(timeout time.Duration) bool {
 // Execute runs a command and returns the output.
 // Tracks the working directory across calls — only issues Set-Location when
 // the requested cwd differs from where the process already is.
-func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, error) {
+// Execute returns the command's output AND the host's working directory as
+// of this command, captured while ps.mutex is still held.
+//
+// The cwd is returned rather than left for the caller to read back via
+// GetTrackedCwd(): that reads ps.lastCwd under globalPSLock, a DIFFERENT
+// lock, after this method has released ps.mutex. The persistent host is
+// shared by every Pub/Sub callback, so between the release and that read a
+// second command can run (or restart the host) and overwrite lastCwd — and
+// the first command would then record the SECOND command's directory
+// against its own scope, and later execute in the wrong worktree.
+func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, string, error) {
 	// Try to acquire the mutex with a timeout. If another command is stuck
 	// holding the mutex, we return an error so the caller can fall back to
 	// a one-shot PowerShell process instead of blocking indefinitely.
 	if !ps.tryLockWithTimeout(psMutexAcquireTimeout) {
 		ps.healthy.Store(false)
-		return "", fmt.Errorf("PowerShell mutex acquisition timed out (another command may be stuck)")
+		return "", "", fmt.Errorf("PowerShell mutex acquisition timed out (another command may be stuck)")
 	}
 	defer ps.mutex.Unlock()
 
 	if !ps.healthy.Load() {
-		return "", fmt.Errorf("PowerShell process is not healthy")
+		return "", "", fmt.Errorf("PowerShell process is not healthy")
 	}
 
 	ps.lastUsed = time.Now()
@@ -258,7 +268,7 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
 	if err != nil {
 		ps.healthy.Store(false)
-		return "", fmt.Errorf("failed to send command: %w", err)
+		return "", "", fmt.Errorf("failed to send command: %w", err)
 	}
 	if syncedPath != "" {
 		ps.lastPath = syncedPath
@@ -344,13 +354,15 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		if result.newCwd != "" {
 			ps.lastCwd = result.newCwd
 		}
+		// result.newCwd, not ps.lastCwd: this command's own value, so a
+		// concurrent callback cannot substitute its directory for ours.
 		if result.exitCode != 0 {
-			return result.output, &ExitCodeError{Code: result.exitCode, Output: result.output}
+			return result.output, result.newCwd, &ExitCodeError{Code: result.exitCode, Output: result.output}
 		}
-		return result.output, nil
+		return result.output, result.newCwd, nil
 	case err := <-errChan:
 		ps.healthy.Store(false)
-		return "", fmt.Errorf("failed to read output: %w", err)
+		return "", "", fmt.Errorf("failed to read output: %w", err)
 	case <-ctx.Done():
 		ps.healthy.Store(false)
 		// Kill the process so the reader goroutine unblocks on pipe EOF
@@ -358,9 +370,9 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			ps.cmd.Process.Kill()
 		}
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("command timed out")
+			return "", "", fmt.Errorf("command timed out")
 		}
-		return "", fmt.Errorf("command cancelled")
+		return "", "", fmt.Errorf("command cancelled")
 	}
 }
 
@@ -369,7 +381,7 @@ func (ps *PersistentPowerShell) healthCheck() error {
 	ctx, cancel := context.WithTimeout(context.Background(), psHealthTimeout)
 	defer cancel()
 
-	output, err := ps.Execute(ctx, "Write-Host 'OK'", "")
+	output, _, err := ps.Execute(ctx, "Write-Host 'OK'", "")
 	if err != nil {
 		return err
 	}
