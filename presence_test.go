@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -186,6 +187,106 @@ func TestPresenceStateStartDatesIdleAndAwayFromTheTimer(t *testing.T) {
 		start, derived := presenceStateStart(now, c.state, c.signals)
 		if !start.Equal(now) || derived {
 			t.Fatalf("%s start = %v (derived %v), want %v not derived", c.state, start, derived, now)
+		}
+	}
+}
+
+// THE INVARIANT ALL FOUR DEFECTS BROKE, asserted directly rather than as a
+// fifth special case.
+//
+// A state that has not changed must age by exactly the time that passed. Four
+// rounds of review found four ways to break that — a signal-derived `away`
+// re-dated every sample, the 20-minute crossing replacing a signal-derived
+// start, the same crossing again after a lock — and each was fixed in isolation
+// while the next one waited. So this walks a grid instead: every combination of
+// the signals that can assert a state, started either side of both thresholds,
+// sampled across the crossings.
+//
+// The grid has a second dimension because the first version of it MISSED round
+// 4, which is worth keeping in the file. Holding the signals constant and
+// letting the idle timer only climb never models the person coming BACK, and
+// that is precisely what that defect needed: a timer-derived `away`, then
+// input, then a lock holding the state while a fresh idle period climbs to its
+// own crossing. So a sequence may reset the idle timer once mid-way. While a
+// signal holds the state, input does not end it — only the state changing is
+// allowed to reset the age.
+//
+// It deliberately asserts nothing about WHICH state is reported (§8.2 owns
+// that) and nothing about how a start is dated — only that an unchanged state's
+// age tracks the clock.
+//
+// IT COVERS ONE DIRECTION ONLY, and the pair matters. This is the net for
+// re-dating a state that never stopped holding; the opposite error — NOT
+// re-dating when the person was active between two samples that happen to
+// classify alike — cannot be asserted here, because there a reset is the
+// correct answer. Mutation says so: blanking the re-dating branch entirely
+// leaves this test green and fails
+// TestPresenceAgeDoesNotSpanAnUnobservedTransition, which is that direction's
+// net. A change to this state machine should be mutation-checked against both.
+func TestPresenceAgeTracksTheClockWhileNobodyTouchesTheMachine(t *testing.T) {
+	const step = 2 * time.Minute
+	t0 := time.Unix(1790000000, 0)
+
+	// Signal shapes that can hold a state on their own, plus the plain
+	// idle-timer-only case. Each is held CONSTANT across a sequence: the point
+	// is a state nothing is changing.
+	shapes := []struct {
+		name                  string
+		locked, lockedOK      bool
+		displayOff, displayOK bool
+	}{
+		{name: "idle timer only"},
+		{name: "locked", locked: true, lockedOK: true},
+		{name: "display asleep", displayOff: true, displayOK: true},
+		{name: "locked and display asleep", locked: true, lockedOK: true, displayOff: true, displayOK: true},
+	}
+
+	// Start either side of the 5- and 20-minute thresholds so the sequences run
+	// across both crossings, which is where three of the four defects lived.
+	// resetAt 0 means nobody ever touches the machine; otherwise the idle timer
+	// restarts at that sample, as one keypress would restart it.
+	for _, startIdle := range []time.Duration{
+		0, 30 * time.Second, 4 * time.Minute, 6 * time.Minute,
+		18 * time.Minute, 19 * time.Minute, 25 * time.Minute,
+	} {
+		for _, resetAt := range []int{0, 1, 3, 8} {
+			for _, shape := range shapes {
+				name := fmt.Sprintf("%s/idle=%s/reset=%d", shape.name, startIdle, resetAt)
+				t.Run(name, func(t *testing.T) {
+					tracker := &presenceTracker{}
+					var prevState string
+					var prevAge int64
+					var prevAt time.Time
+
+					for i := 0; i < 20; i++ {
+						at := t0.Add(time.Duration(i) * step)
+						idle := startIdle + time.Duration(i)*step
+						if resetAt > 0 && i >= resetAt {
+							// One keypress at `resetAt`, then nothing again.
+							idle = 30*time.Second + time.Duration(i-resetAt)*step
+						}
+						got := tracker.observe(at, presenceSignals{
+							Idle:         idle,
+							IdleOK:       true,
+							Locked:       shape.locked,
+							LockedOK:     shape.lockedOK,
+							DisplayOff:   shape.displayOff,
+							DisplayOffOK: shape.displayOK,
+						})
+						if got.AgeMs < 0 {
+							t.Fatalf("sample %d: negative age %dms", i, got.AgeMs)
+						}
+						if i > 0 && got.State == prevState {
+							elapsed := at.Sub(prevAt).Milliseconds()
+							if want := prevAge + elapsed; got.AgeMs != want {
+								t.Fatalf("sample %d: %q held but aged %dms, want %dms (previous %dms + %dms elapsed) — an unchanged state was re-dated",
+									i, got.State, got.AgeMs, want, prevAge, elapsed)
+							}
+						}
+						prevState, prevAge, prevAt = got.State, got.AgeMs, at
+					}
+				})
+			}
 		}
 	}
 }
