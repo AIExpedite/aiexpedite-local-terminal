@@ -181,23 +181,49 @@ func wtFindWorktree(entries []gitWorktreeEntry, want string) (gitWorktreeEntry, 
 // wtAdminDir resolves the ONE administrative directory that belongs to the
 // worktree at path: `<mainRepo>/.git/worktrees/<name>`.
 //
-// It must be read WHILE the worktree still exists, because the only
-// authoritative pointer is the worktree's own `.git` file. Three things are then
-// verified before the name is trusted, so a tampered or stale pointer can never
-// aim the later delete at an unrelated directory:
+// It must be read WHILE the worktree still exists, because the pointer that
+// names it is the worktree's own `.git` file.
 //
-//  1. the pointer resolves under `<commonDir>/worktrees/`;
-//  2. the admin directory's own `gitdir` file points back at this worktree;
-//  3. git itself still lists the worktree at this path.
+// That pointer is NOT trusted. An agent working inside the worktree can
+// rewrite `.git`, and the admin directory's back-pointer and `git worktree
+// list` both read from the same files, so none of those three is an
+// independent authority. What bounds the damage is the one input that did not
+// come from the worktree: mainRepo, validated by resolveMainRepoPath from the
+// dispatch. Four things are verified:
+//
+//  1. the pointer resolves under the MAIN repository's own
+//     `<commonDir>/worktrees/`, resolved from mainRepo rather than from the
+//     worktree — so a forged `.git` can only ever name a directory inside the
+//     real main repository's bookkeeping, never an arbitrary path;
+//  2. it resolves under the worktree's own commonDir too, and the two agree —
+//     a disagreement means the worktree belongs to a different repository
+//     than the one the dispatch named;
+//  3. the admin directory's own `gitdir` file points back at this worktree;
+//  4. git itself still lists the worktree at this path.
+//
+// (3) and (4) then pick the RIGHT record inside that bookkeeping; (1) is what
+// makes a wrong answer survivable.
 func wtAdminDir(ctx context.Context, mainRepo, path string) (string, error) {
 	gitDir, commonDir, ok := resolveGitDirs(path)
 	if !ok {
 		return "", fmt.Errorf("%s is not a git worktree (no readable .git)", path)
 	}
-	worktreesDir := filepath.Join(commonDir, "worktrees")
-	if !isPathWithin(worktreesDir, gitDir) || pathIdentityKey(gitDir) == pathIdentityKey(worktreesDir) {
+	// Resolved from the VALIDATED main repository, independently of anything the
+	// worktree says about itself.
+	_, mainCommonDir, mainOK := resolveGitDirs(mainRepo)
+	if !mainOK {
+		return "", fmt.Errorf("%s is not a readable git checkout", mainRepo)
+	}
+	mainWorktreesDir := filepath.Join(mainCommonDir, "worktrees")
+	if !isPathWithin(mainWorktreesDir, gitDir) || pathIdentityKey(gitDir) == pathIdentityKey(mainWorktreesDir) {
 		return "", fmt.Errorf("%s points its git dir at %s, which is not one worktree's admin directory under %s",
-			path, gitDir, worktreesDir)
+			path, gitDir, mainWorktreesDir)
+	}
+	// And the worktree's own view must agree, or it belongs to another
+	// repository than the one the dispatch named.
+	worktreesDir := filepath.Join(commonDir, "worktrees")
+	if pathIdentityKey(worktreesDir) != pathIdentityKey(mainWorktreesDir) {
+		return "", fmt.Errorf("%s belongs to %s, not to %s", path, worktreesDir, mainWorktreesDir)
 	}
 	// The back-pointer: the admin directory records the worktree's own `.git`.
 	raw, err := os.ReadFile(filepath.Join(gitDir, "gitdir"))

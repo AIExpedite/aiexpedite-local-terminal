@@ -73,6 +73,7 @@ const (
 	rulePathRepoTooLong       = "repo_segment_too_long"
 	rulePathPatternMismatch   = "pattern_mismatch"
 	rulePathComponentIsLink   = "component_is_link"
+	rulePathPathspecMagic     = "pathspec_magic"
 	rulePathEscapesRootByLink = "escapes_root_by_link"
 	rulePathRootUnreadable    = "root_unreadable"
 )
@@ -334,6 +335,49 @@ func isPathWithin(base, candidate string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../"))
 }
 
+// refuseLinkedComponents walks rel's directory components under base and
+// refuses if any of them is a symlink or junction. Used where a path is READ
+// through rather than resolved by resolveInsideWorktree, which walks only the
+// worktree side.
+//
+// The final component is included: a linked file is as unwelcome as a linked
+// directory above it, and a caller that wants to allow one can lstat it itself.
+func refuseLinkedComponents(base, rel string) error {
+	segments := strings.FieldsFunc(filepath.ToSlash(rel), func(r rune) bool { return r == '/' })
+	cur := filepath.Clean(base)
+	for _, seg := range segments {
+		cur = filepath.Join(cur, seg)
+		info, err := os.Lstat(cur)
+		if err != nil {
+			// Absent is not unsafe. The caller's own lstat reports it, with a
+			// message about the file rather than about links.
+			return nil
+		}
+		if isWorktreeLink(info, cur) {
+			return policyRefusal(rulePathComponentIsLink,
+				fmt.Sprintf("%s is a symlink or junction, so %s is not read through it", cur, rel))
+		}
+	}
+	return nil
+}
+
+// resolvedCandidate is one path inside a worktree, resolved ONCE into the two
+// forms its checks need: Abs for everything that touches the filesystem
+// (lstat, baseline scan, digest, delete) and GitPath for everything asked of
+// git (ls-files, status, check-ignore).
+//
+// They are returned together, and built from the same validated segments,
+// because a proof is only a proof of the thing being deleted if both halves
+// denote the same directory. Taking the git half straight from the server's
+// string instead let the two drift: git reads its argument as a PATHSPEC, so
+// `:(glob)x` or `node_modules/*` asks about a different set of paths than the
+// one the delete targets, and `git ls-files -- <that>` coming back empty would
+// read as "holds no tracked file".
+type resolvedCandidate struct {
+	Abs     string
+	GitPath string
+}
+
 // resolveInsideWorktree validates a path the server named INSIDE a worktree —
 // a dependency or build directory for eviction. Relative, no `..`, no
 // component that is a link, and it must stay under the worktree.
@@ -342,28 +386,42 @@ func isPathWithin(base, candidate string) bool {
 // directory may be nested (`packages/web/node_modules`), so it has no fixed
 // segment count. What it shares is that nothing may traverse upward and nothing
 // may be reached through a link.
-func resolveInsideWorktree(wt resolvedWorktreePath, rel string) (string, error) {
+func resolveInsideWorktree(wt resolvedWorktreePath, rel string) (resolvedCandidate, error) {
 	rel = strings.TrimSpace(rel)
 	if rel == "" {
-		return "", policyRefusal(rulePathMissing, "no directory named inside the worktree")
+		return resolvedCandidate{}, policyRefusal(rulePathMissing, "no directory named inside the worktree")
 	}
 	if filepath.IsAbs(rel) || strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, `\`) {
-		return "", policyRefusal(rulePathNotUnderRoot,
+		return resolvedCandidate{}, policyRefusal(rulePathNotUnderRoot,
 			fmt.Sprintf("%q must be relative to the worktree", rel))
 	}
 	segments := strings.FieldsFunc(filepath.ToSlash(rel), func(r rune) bool { return r == '/' })
 	if len(segments) == 0 {
-		return "", policyRefusal(rulePathMissing, "no directory named inside the worktree")
+		return resolvedCandidate{}, policyRefusal(rulePathMissing, "no directory named inside the worktree")
 	}
 	for _, seg := range segments {
 		if strings.Trim(seg, ".") == "" {
-			return "", policyRefusal(rulePathRepoTraversal,
+			return resolvedCandidate{}, policyRefusal(rulePathRepoTraversal,
 				fmt.Sprintf("%q holds the segment %q, which names a directory above it", rel, seg))
+		}
+		// A segment has to be a plain NAME, because the same segments become a
+		// git pathspec below. A leading `:` opens pathspec magic (`:(glob)`,
+		// `:!`, `:(icase)`), `*?[]` are wildcards, and `\` escapes inside git's
+		// glob matching — each one would make git answer about something other
+		// than the directory being deleted.
+		//
+		// Refusing costs nothing real: Windows forbids `*?:\` in a filename
+		// outright, and no dependency or build directory on any platform is
+		// named this way. A dispatch carrying one is malformed, so it is
+		// refused loudly rather than normalised into something plausible.
+		if strings.HasPrefix(seg, ":") || strings.ContainsAny(seg, "*?[]\\") {
+			return resolvedCandidate{}, policyRefusal(rulePathPathspecMagic,
+				fmt.Sprintf("%q holds the segment %q, which is a git pattern rather than a directory name", rel, seg))
 		}
 	}
 	abs := filepath.Clean(filepath.Join(wt.Abs, filepath.Join(segments...)))
 	if !isPathWithin(wt.Abs, abs) || abs == wt.Abs {
-		return "", policyRefusal(rulePathNotUnderRoot,
+		return resolvedCandidate{}, policyRefusal(rulePathNotUnderRoot,
 			fmt.Sprintf("%q resolves to %q, which is not inside the worktree", rel, abs))
 	}
 	cur := wt.Abs
@@ -374,9 +432,12 @@ func resolveInsideWorktree(wt resolvedWorktreePath, rel string) (string, error) 
 			break
 		}
 		if isWorktreeLink(info, cur) {
-			return "", policyRefusal(rulePathComponentIsLink,
+			return resolvedCandidate{}, policyRefusal(rulePathComponentIsLink,
 				fmt.Sprintf("%q is a symlink or junction; eviction never deletes through one", cur))
 		}
 	}
-	return abs, nil
+	// One list of segments, two forms. GitPath is slash-joined regardless of
+	// platform because a pathspec always uses `/`, while Abs went through
+	// filepath.Join and carries the OS separator.
+	return resolvedCandidate{Abs: abs, GitPath: strings.Join(segments, "/")}, nil
 }

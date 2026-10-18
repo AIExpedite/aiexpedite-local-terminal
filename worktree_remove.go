@@ -352,11 +352,12 @@ func evictWorktreeDeps(ctx context.Context, req worktreeEvictDepsRequest) (workt
 	}
 
 	for _, dir := range req.Dirs {
-		abs, perr := resolveInsideWorktree(wt, dir)
+		cand, perr := resolveInsideWorktree(wt, dir)
 		if perr != nil {
 			return res, perr // a bad dispatch, not a device state: refuse loudly
 		}
-		verdict := evaluateEvictionCandidate(ctx, wt, dir, abs)
+		abs := cand.Abs
+		verdict := evaluateEvictionCandidate(ctx, wt, dir, cand)
 		if verdict.Reason != evictReasonEvictable {
 			kept := worktreeKeptDir{Dir: dir, Reason: verdict.Reason, Detail: verdict.Detail}
 			if verdict.Diff != nil {
@@ -416,7 +417,13 @@ type evictionVerdict struct {
 //     because size and mtime can be identical over changed bytes after a
 //     timestamp-preserving copy or an archive extraction, and this gate deletes
 //     irreversibly.
-func evaluateEvictionCandidate(ctx context.Context, wt resolvedWorktreePath, rel, abs string) evictionVerdict {
+//
+// rel is the server's own spelling and is used ONLY in the reported detail,
+// so an operator reads back what they asked for. Every check — filesystem and
+// git alike — goes through cand, so the proofs and the delete cannot be about
+// different directories.
+func evaluateEvictionCandidate(ctx context.Context, wt resolvedWorktreePath, rel string, cand resolvedCandidate) evictionVerdict {
+	abs := cand.Abs
 	info, serr := os.Lstat(abs)
 	if serr != nil {
 		return evictionVerdict{Reason: evictReasonAbsent, Detail: "nothing at " + rel}
@@ -445,7 +452,7 @@ func evaluateEvictionCandidate(ctx context.Context, wt resolvedWorktreePath, rel
 	// not report a tracked path as ignored, so a directory holding a committed
 	// bundle would otherwise come back as `not_ignored` when the real reason is
 	// that it holds a person's tracked files. Both refuse; only one explains.
-	tracked, terr := wtTrackedFilesUnder(ctx, wt.Abs, rel)
+	tracked, terr := wtTrackedFilesUnder(ctx, wt.Abs, cand.GitPath)
 	if terr != nil {
 		return evictionVerdict{Reason: evictReasonScanFailed, Detail: terr.Error()}
 	}
@@ -453,7 +460,7 @@ func evaluateEvictionCandidate(ctx context.Context, wt resolvedWorktreePath, rel
 		return evictionVerdict{Reason: evictReasonTrackedContent,
 			Detail: fmt.Sprintf("%s holds tracked files (e.g. %s)", rel, strings.Join(tracked, ", "))}
 	}
-	modified, moderr := wtModifiedUnder(ctx, wt.Abs, rel)
+	modified, moderr := wtModifiedUnder(ctx, wt.Abs, cand.GitPath)
 	if moderr != nil {
 		return evictionVerdict{Reason: evictReasonScanFailed, Detail: moderr.Error()}
 	}
@@ -461,7 +468,7 @@ func evaluateEvictionCandidate(ctx context.Context, wt resolvedWorktreePath, rel
 		return evictionVerdict{Reason: evictReasonModifiedTracked,
 			Detail: fmt.Sprintf("%s holds modified tracked content (e.g. %s)", rel, strings.Join(modified, ", "))}
 	}
-	ignored, ierr := wtPathIsIgnored(ctx, wt.Abs, rel)
+	ignored, ierr := wtPathIsIgnored(ctx, wt.Abs, cand.GitPath)
 	if ierr != nil {
 		return evictionVerdict{Reason: evictReasonScanFailed, Detail: ierr.Error()}
 	}

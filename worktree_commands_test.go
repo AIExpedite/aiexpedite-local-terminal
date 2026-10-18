@@ -749,11 +749,11 @@ func markDirForTest(t *testing.T, wtPath, rel string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	abs, err := resolveInsideWorktree(wt, rel)
+	cand, err := resolveInsideWorktree(wt, rel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recordDepsMarker(wt, worktreeDepsSpec{Ecosystem: "npm", Dir: rel}, abs, "lockdigest"); err != nil {
+	if _, err := recordDepsMarker(wt, worktreeDepsSpec{Ecosystem: "npm", Dir: rel}, cand.Abs, "lockdigest"); err != nil {
 		t.Fatal(err)
 	}
 }

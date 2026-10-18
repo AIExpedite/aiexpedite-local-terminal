@@ -7,34 +7,81 @@ import (
 	"testing"
 )
 
-func TestWorktreeCommandsAreInterceptedAndNeverDialogGated(t *testing.T) {
-	commands := []string{
+// worktreeBuiltIns is every command the family owns, so a new one joins these
+// tests by being added here rather than by being remembered.
+func worktreeBuiltIns() []string {
+	return []string{
 		worktreeEnsureCommand, worktreeListCommand, worktreeRemoveCommand,
 		worktreeEvictDepsCommand, rootRestoreCommand,
 	}
-	for _, name := range commands {
+}
+
+func TestWorktreeCommandsSkipTheDialogONLYWhenSigned(t *testing.T) {
+	for _, name := range worktreeBuiltIns() {
 		if !isWorktreeDeviceCommand(name) {
 			t.Fatalf("%s is not recognised as a worktree built-in", name)
 		}
-		if !isInterceptedDeviceCommand(name) {
-			t.Fatalf("%s would be looked up on PATH instead of intercepted", name)
-		}
-		// Intercepted before exec, and never dialog-gated: the sweep that
+
+		// SIGNED: intercepted before exec and not dialog-gated. The sweep that
 		// sends the destructive ones is unattended, so a native dialog would
 		// block it forever. The boundary is the signed dispatch, the path
 		// policy, the device-side proofs and the link-safe walk.
-		gate := executeApprovalGate(nil, nil, commandMsg{Command: name, RiskLevel: riskDestructive})
-		if !gate.DeviceCommand {
+		signed := executeApprovalGate(&Config{CommandSecret: "s3cret"}, nil,
+			commandMsg{Command: name, RiskLevel: riskDestructive})
+		if !signed.DeviceCommand {
 			t.Fatalf("%s is not routed to the device-command path", name)
 		}
-		if gate.Needed {
-			t.Fatalf("%s would show the native approval dialog", name)
+		if signed.Needed {
+			t.Fatalf("%s would show the native approval dialog in signed mode", name)
+		}
+
+		// UNSIGNED: the justification for skipping the dialog is that the
+		// dispatch was signed, and with no command secret nothing verifies a
+		// signature. So the exemption lapses rather than quietly becoming an
+		// unauthenticated bypass.
+		for _, cfg := range []*Config{nil, {CommandSecret: ""}} {
+			unsigned := executeApprovalGate(cfg, nil,
+				commandMsg{Command: name, RiskLevel: riskDestructive})
+			if !unsigned.DeviceCommand {
+				t.Fatalf("%s is not routed to the device-command path when unsigned", name)
+			}
+			if !unsigned.Needed {
+				t.Fatalf("%s skipped the approval dialog with no command secret", name)
+			}
 		}
 	}
 	for _, name := range []string{"git", "rm", "__env_find_repos__"} {
 		if isWorktreeDeviceCommand(name) {
 			t.Fatalf("%s must not be treated as a worktree built-in", name)
 		}
+	}
+}
+
+// The gate is defence in depth; this is the authoritative refusal. A dialog
+// approved by a person would still reach the handler, and the handler is what
+// a signature-less dispatch must not get past.
+func TestWorktreeCommandsRefuseWithoutACommandSecret(t *testing.T) {
+	for _, name := range worktreeBuiltIns() {
+		for _, cfg := range []*Config{nil, {CommandSecret: ""}} {
+			out, err := runInterceptedDeviceCommand(context.Background(), cfg,
+				commandMsg{Command: name, Args: []string{"{}"}})
+			if err == nil {
+				t.Fatalf("%s ran with no command secret (output %q)", name, out)
+			}
+			if !strings.Contains(err.Error(), "signed dispatch") {
+				t.Fatalf("%s refused for the wrong reason: %v", name, err)
+			}
+		}
+	}
+}
+
+// The env-setup family keeps its own gating, which is the native dialog, so it
+// must NOT pick up the worktree refusal.
+func TestEnvSetupCommandsAreNotRefusedByTheWorktreeSecretCheck(t *testing.T) {
+	_, err := runInterceptedDeviceCommand(context.Background(), &Config{},
+		commandMsg{Command: "__env_find_repos__", Args: []string{"{}"}})
+	if err != nil && strings.Contains(err.Error(), "signed dispatch") {
+		t.Fatalf("an env-setup command took the worktree secret refusal: %v", err)
 	}
 }
 

@@ -42,6 +42,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Refusal reasons. Persisted vocabulary: they reach the Computers tab, which
@@ -49,6 +50,7 @@ import (
 const (
 	restoreReasonFenceUnavailable  = "fence_unavailable"
 	restoreReasonPresenceActive    = "presence_active"
+	restoreReasonPresenceStale     = "presence_stale"
 	restoreReasonNotCheckout       = "not_a_checkout"
 	restoreReasonInsideAixwt       = "inside_aixwt"
 	restoreReasonAlreadyOnDefault  = "already_on_default"
@@ -73,6 +75,17 @@ type rootRestoreRequest struct {
 	// checkout (from the worktree registry and the feature's own record). The
 	// current branch must be one of them, exactly. Never a name pattern.
 	RecordedBranches []string `json:"recordedBranches"`
+	// PresenceAt is when the server TOOK the presence reading below, RFC3339.
+	// Required, and refused when older than presenceReadingMaxAge.
+	//
+	// Without it a reading has no shelf life, and this dispatch does not arrive
+	// instantly: Pub/Sub redelivers, and a command that sat in a retry can
+	// reach the device long after "idle" stopped being true. The device has no
+	// presence signal of its own to re-check against (nothing here reads input
+	// idle time), so an age bound is the honest substitute — it cannot make the
+	// reading current, it can only refuse to act on a stale one.
+	PresenceAt string `json:"presenceAt"`
+
 	// Presence is the server's presence reading: "active" | "idle" | "away".
 	// Active refuses. An empty value also refuses, because an unknown presence
 	// is not evidence that the person is away.
@@ -108,6 +121,41 @@ func refuseRestore(res rootRestoreResult, reason, detail string) (rootRestoreRes
 // restoreRootCheckout re-checks every condition on the device, under a
 // root-use fence held across the re-check AND the switch, and aborts on any
 // mismatch.
+// presenceReadingMaxAge is how long a presence reading stays actionable.
+//
+// Two minutes: long enough that an ordinary dispatch never trips it, short
+// enough that a redelivered or retried one does. The restore is never
+// required, so refusing a stale reading costs a tick and nothing else.
+const presenceReadingMaxAge = 2 * time.Minute
+
+// checkPresenceReadingAge refuses a reading that is missing, unparseable, too
+// old, or dated in the future. The future case is not pedantry: a reading
+// stamped ahead of this device's clock would otherwise never expire, so clock
+// skew would silently disable the bound. One minute of tolerance absorbs
+// ordinary skew between the server and the device.
+func checkPresenceReadingAge(presenceAt string, now time.Time) error {
+	raw := strings.TrimSpace(presenceAt)
+	if raw == "" {
+		return fmt.Errorf("the dispatch carried no presenceAt, so the presence reading has no known age")
+	}
+	stamp, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return fmt.Errorf("presenceAt %q is not an RFC3339 timestamp", presenceAt)
+	}
+	if age := now.Sub(stamp); age > presenceReadingMaxAge {
+		return fmt.Errorf("the presence reading is %s old (max %s), so it is no longer evidence the person is away",
+			age.Round(time.Second), presenceReadingMaxAge)
+	}
+	if stamp.Sub(now) > presenceClockSkewTolerance {
+		return fmt.Errorf("presenceAt %s is ahead of this device's clock, so its age cannot be trusted", raw)
+	}
+	return nil
+}
+
+// presenceClockSkewTolerance is how far ahead of the device a server stamp may
+// sit before its age stops meaning anything.
+const presenceClockSkewTolerance = time.Minute
+
 func restoreRootCheckout(ctx context.Context, req rootRestoreRequest) (rootRestoreResult, error) {
 	res := rootRestoreResult{}
 	if len(req.RecordedBranches) > maxRecordedBranches {
@@ -147,8 +195,15 @@ func restoreRootCheckout(ctx context.Context, req rootRestoreRequest) (rootResto
 	// Presence first: it costs nothing and it is the condition that most often
 	// says "not now". An unknown presence refuses, because absence of a reading
 	// is not evidence the person is away.
+	//
+	// This is the SERVER's reading, not a device fact — the device has no
+	// presence signal to re-check it against — so its age is bounded and a
+	// missing or unparseable timestamp refuses.
 	switch strings.ToLower(strings.TrimSpace(req.Presence)) {
 	case "idle", "away":
+		if rerr := checkPresenceReadingAge(req.PresenceAt, time.Now()); rerr != nil {
+			return refuseRestore(res, restoreReasonPresenceStale, rerr.Error())
+		}
 		res.ChecksPassed = append(res.ChecksPassed, "presence_idle_or_away")
 	default:
 		return refuseRestore(res, restoreReasonPresenceActive,

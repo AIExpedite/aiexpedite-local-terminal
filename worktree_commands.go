@@ -90,7 +90,41 @@ func isWorktreeDeviceCommand(command string) bool {
 
 // runWorktreeDeviceCommand runs one worktree built-in and returns its one-line
 // JSON result, redacted value by value like every other device command.
+// worktreeCommandWritesRootBookkeeping reports whether a command mutates the
+// MAIN repository's git bookkeeping — the `.git/worktrees` admin records a
+// root restore's branch switch runs alongside. `__worktree_list__` only reads,
+// and `__worktree_evict_deps__` deletes inside the worktree and never touches
+// the root's `.git`, so neither is fenced: refusing a read would leave the
+// sweep with no inventory for that tick and buy nothing.
+func worktreeCommandWritesRootBookkeeping(command string) bool {
+	switch command {
+	case worktreeEnsureCommand, worktreeRemoveCommand:
+		return true
+	default:
+		return false
+	}
+}
+
 func runWorktreeDeviceCommand(ctx context.Context, cmd commandMsg) (string, error) {
+	// The root-use fence, read side. A root restore holds it across its
+	// re-check AND its switch (§4.8), so a command that would write the same
+	// repository's bookkeeping in that window is refused.
+	//
+	// The main repository is peeked out of the raw args rather than read off
+	// each request type: one decode cannot drift from the five structs, and a
+	// request whose own validation will reject it is refused on its own terms
+	// below. A restore is exempt because it is the fence's HOLDER.
+	if worktreeCommandWritesRootBookkeeping(cmd.Command) {
+		var peek struct {
+			MainRepo string `json:"mainRepo"`
+		}
+		if derr := decodeEnvSetupArgs(cmd.Args, &peek); derr == nil {
+			if repo := strings.TrimSpace(peek.MainRepo); repo != "" && isRootUseFenced(repo) {
+				return "", fmt.Errorf("%s refused: platform work holds the root-use fence for %s", cmd.Command, repo)
+			}
+		}
+	}
+
 	var result any
 	var err error
 	switch cmd.Command {
@@ -548,10 +582,11 @@ func ensureCompanion(ctx context.Context, root string, c worktreeCompanionSpec) 
 // validateSeedFile keeps an allowlisted untracked file to a relative path with
 // no traversal and no link in its way.
 func validateSeedFile(wt resolvedWorktreePath, file string) (src string, dst string, err error) {
-	abs, verr := resolveInsideWorktree(wt, file)
+	cand, verr := resolveInsideWorktree(wt, file)
 	if verr != nil {
 		return "", "", policyRefusal(ruleSeedFileUnsafe, verr.Error())
 	}
+	abs := cand.Abs
 	return filepath.Join(filepath.FromSlash(file)), abs, nil
 }
 
@@ -573,6 +608,17 @@ func seedAllowlistedFiles(mainRepo string, wt resolvedWorktreePath, files []stri
 			continue
 		}
 		src := filepath.Join(mainRepo, rel)
+		// The DESTINATION's components were walked for links by
+		// resolveInsideWorktree. The source's were not, and it is read through:
+		// a linked directory component in the root checkout (`config` ->
+		// `/etc`, say) would let an allowlist entry of `config/<name>` copy a
+		// file from outside the checkout into the worktree, where the feature's
+		// coding agent can read it. Checking the file itself is not enough,
+		// because the link is above it.
+		if lerr := refuseLinkedComponents(mainRepo, rel); lerr != nil {
+			notes = append(notes, "not seeded: "+lerr.Error())
+			continue
+		}
 		info, serr := os.Lstat(src)
 		if serr != nil {
 			notes = append(notes, fmt.Sprintf("not seeded: %s is not in the root checkout", file))
@@ -656,13 +702,14 @@ func reconcileDeps(wt resolvedWorktreePath, specs []worktreeDepsSpec, markDeps b
 	var reports []worktreeDepsReport
 	for _, spec := range specs {
 		rep := worktreeDepsReport{Ecosystem: spec.Ecosystem, Dir: spec.Dir}
-		abs, err := resolveInsideWorktree(wt, spec.Dir)
+		cand, err := resolveInsideWorktree(wt, spec.Dir)
 		if err != nil {
 			rep.State, rep.Error = "unsafe", err.Error()
 			ready = false
 			reports = append(reports, rep)
 			continue
 		}
+		abs := cand.Abs
 		digest, derr := lockfileDigestFor(wt.Abs, spec.Lockfile)
 		if derr != nil {
 			rep.State, rep.Error = "unknown", derr.Error()

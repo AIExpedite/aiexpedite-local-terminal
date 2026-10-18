@@ -79,10 +79,18 @@ func acquireRootUseFence(repoPath string) (release func(), ok bool) {
 
 // isRootUseFenced reports whether platform work currently holds repoPath.
 //
-// Session admission and every platform git operation on a root are meant to
-// honour this (§4.8). Today only __root_restore__ takes the fence; wiring the
-// other platform paths to consult it is recorded as remaining work rather than
-// claimed here.
+// Consulted by the worktree built-ins that WRITE the root checkout's git
+// bookkeeping (worktreeCommandWritesRootBookkeeping): `__worktree_ensure__`
+// runs `git worktree add` in the root and `__worktree_remove__` deletes an
+// admin directory under its `.git/worktrees`, so either overlapping a restore
+// that is switching the root's branch is a platform-internal race on the same
+// repository. Both refuse rather than queue: the sweep runs hourly, so the
+// next tick is a cheaper answer than acting on a root someone else is moving.
+//
+// NOT consulted by CLI session admission, which is where §4.8 ultimately wants
+// it. That remains unbuilt and is recorded as remaining work, not claimed here
+// — and it is the reason the fence closes a narrower set of races than its
+// name suggests.
 func isRootUseFenced(repoPath string) bool {
 	key := pathIdentityKey(filepath.Clean(repoPath))
 	rootUseFences.Lock()
