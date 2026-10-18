@@ -912,6 +912,34 @@ func (l *spawnLedger) Report(ctx context.Context) bootReport {
 	return r
 }
 
+// loadCounts reports what this agent is running on this computer RIGHT NOW,
+// for the load report (PARALLEL_RUNS_AND_COMPUTER_MAINTENANCE_PLAN.md §6.1:
+// "number of AI Expedite CLI processes and active agents").
+//
+// Only THIS boot's entries count: an earlier boot's entry is evidence about a
+// process that is gone or unaccounted for, never a running one. `pids` are the
+// processes those sessions still hold, so the caller can total their RSS;
+// a logical session between turns legitimately holds none.
+//
+// Read-only — it never loads the file, creates an entry or touches a stamp, so
+// a report can never alter the reap evidence it walks past.
+func (l *spawnLedger) loadCounts() (sessions int, pids []int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, e := range l.entries {
+		if e.BootID != l.bootID {
+			continue
+		}
+		sessions++
+		for _, p := range e.PIDs {
+			if p.PID > 0 {
+				pids = append(pids, p.PID)
+			}
+		}
+	}
+	return sessions, pids
+}
+
 // AckReaped drops the reaped entries an accepted /online carried.
 func (l *spawnLedger) AckReaped(sessionIDs []string) {
 	if len(sessionIDs) == 0 {

@@ -469,6 +469,13 @@ func StartAgent(cfg *Config) {
 	// its hints while offline and sends once the device is back.
 	startCLIUsagePropagator(cfg)
 
+	// Computer monitoring (PARALLEL_RUNS_AND_COMPUTER_MAINTENANCE_PLAN.md §6.1,
+	// §8): sample this machine's load and the person's coarse presence and
+	// report them. Observe only — nothing it reports changes what this agent
+	// accepts. Started like the propagator: it holds nothing while offline,
+	// draining or shutting down, and resumes when the device is back.
+	startLoadReporter(cfg)
+
 	// If the user disconnected from cloud in a previous session, skip the
 	// Pub/Sub loop entirely on boot. The tray "Reconnect to cloud" handler
 	// will start it explicitly when the user comes back online.

@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "presence": {
+    "states": ["active", "idle", "away"],
+    "activeWithinMs": 300000,
+    "awayAfterMs": 1200000,
+    "notReported": ""
+  },
+  "memPressureLevels": ["normal", "warn", "critical"],
+  "unreadable": -1,
+  "cadence": {
+    "sampleIntervalMs": 30000,
+    "maxIntervalMs": 300000,
+    "changePercent": 5
+  },
+  "vectors": [
+    {
+      "name": "full-sample-active",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": 65536,
+        "memAvailableMB": 20480,
+        "memPressure": "normal",
+        "swapUsedMB": 2048,
+        "cpuLoadPct": 37,
+        "cliProcesses": 3,
+        "cliRssMB": 1536,
+        "activeSessions": 2,
+        "onBattery": false,
+        "presenceState": "active",
+        "presenceSinceMs": 42000
+      },
+      "message": "agent-1:1790000000000:65536:20480:normal:2048:37:3:1536:2:0:active:42000",
+      "signature": "e2fd6f3d827bb0a2ede315abd094943a45754b90184f44adab3ae1485142899c"
+    },
+    {
+      "name": "pressure-warn-away-on-battery",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": 16384,
+        "memAvailableMB": 2048,
+        "memPressure": "warn",
+        "swapUsedMB": 8192,
+        "cpuLoadPct": 96,
+        "cliProcesses": 1,
+        "cliRssMB": -1,
+        "activeSessions": 1,
+        "onBattery": true,
+        "presenceState": "away",
+        "presenceSinceMs": 1200000
+      },
+      "message": "agent-1:1790000000000:16384:2048:warn:8192:96:1:-1:1:1:away:1200000",
+      "signature": "d9513ccb3190312cdebe4d200ec54b5efe1c61a0bcce010816c7f24ea00a2d48"
+    },
+    {
+      "name": "presence-not-reported",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": 32768,
+        "memAvailableMB": 16384,
+        "memPressure": "normal",
+        "swapUsedMB": 0,
+        "cpuLoadPct": 0,
+        "cliProcesses": 0,
+        "cliRssMB": 0,
+        "activeSessions": 0,
+        "onBattery": false,
+        "presenceState": "",
+        "presenceSinceMs": -1
+      },
+      "message": "agent-1:1790000000000:32768:16384:normal:0:0:0:0:0:0::-1",
+      "signature": "c2b576e84dd0a036df9dbcb0d0f22f3f9e8add9f90826bb193d2fde8778c457b"
+    },
+    {
+      "name": "metrics-unreadable-idle",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": -1,
+        "memAvailableMB": -1,
+        "memPressure": "normal",
+        "swapUsedMB": -1,
+        "cpuLoadPct": -1,
+        "cliProcesses": 0,
+        "cliRssMB": -1,
+        "activeSessions": 0,
+        "onBattery": false,
+        "presenceState": "idle",
+        "presenceSinceMs": 300000
+      },
+      "message": "agent-1:1790000000000:-1:-1:normal:-1:-1:0:-1:0:0:idle:300000",
+      "signature": "59294c924eaf55c88479f541b501a8e50e9c2002f19d0c7b0d6d7eeb8d36deb7"
+    }
+  ]
+}

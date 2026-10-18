@@ -49,6 +49,12 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			if !caps.RelayTurnInbox || !caps.RelayAckWatermark {
 				t.Fatalf("caps = %+v, want both relay flags true", *caps)
 			}
+			// The load / presence sampler is a build fact as well: a machine
+			// whose CPU probe failed still takes load samples, and the server
+			// must not read a missing flag as "this app cannot report load".
+			if !caps.LoadReport {
+				t.Fatalf("caps = %+v, want the load-report flag true", *caps)
+			}
 			if caps.RecommendedConcurrentTests != 0 || caps.RecommendedConcurrentBuilds != 0 {
 				t.Fatalf("caps = %+v, want no concurrency hints without both probes", *caps)
 			}
@@ -57,7 +63,7 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			}
 			caps.RelayFollowUps = nil // its ledgerId is per machine
 			raw, _ := json.Marshal(caps)
-			if string(raw) != `{"relayTurnInbox":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true}` {
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
