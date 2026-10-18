@@ -90,6 +90,9 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// No usage hint goes out after this; a pending one is recovered by the next
 	// process from the cache it rotates.
 	stopCLIUsagePropagator()
+	// No load / presence sample goes out after this; the next process starts
+	// its own sampler and the server's stored sample simply ages.
+	stopLoadReporter()
 
 	// Stop the updater before any teardown can make a draining device appear
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and

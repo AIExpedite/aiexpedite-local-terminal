@@ -116,6 +116,13 @@ type capabilitiesInfo struct {
 	// REQUIRED by the relay. Never omitempty: a future build that reports
 	// `false` must not read as "field absent".
 	RelayTurnInbox bool `json:"relayTurnInbox"`
+	// LoadReport (PARALLEL_RUNS_AND_COMPUTER_MAINTENANCE_PLAN.md §6.1): this
+	// build samples its own load and the person's coarse presence and posts
+	// them to POST /device/:agentId/load (load_report.go). A PROTOCOL flag, so
+	// the server never asks an older app for a sample it cannot take, and
+	// never reads an older app's silence as a computer with no load. Never
+	// omitempty: a future build reporting `false` must not read as absent.
+	LoadReport bool `json:"loadReport"`
 	// RelayAckWatermark (DEVICE_RELAY_CAPABILITIES.ACK_WATERMARK): the agent
 	// verifies a SIGNED `ackedTurnIds` watermark on a session command and
 	// deletes exactly those inbox rows. terminal-service attaches the field
@@ -291,6 +298,7 @@ const (
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
 		RelayTurnInbox:         true,
+		LoadReport:             true,
 		RelayFollowUps:         newRelayFollowUpsCapability(),
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
