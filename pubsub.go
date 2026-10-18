@@ -2198,7 +2198,7 @@ func runPubSubConnection(cfg *Config) error {
 		var execErr error
 		if setupDeviceCmd {
 			devCtx, devCancel := context.WithTimeout(context.Background(), resolveExecTimeout(cmd.TimeoutMs))
-			out, execErr = runEnvSetupDeviceCommand(devCtx, cfg, cmd)
+			out, execErr = runInterceptedDeviceCommand(devCtx, cfg, cmd)
 			devCancel()
 		} else {
 			out, execErr = executeTerminalCommand(cfg, cmd)
@@ -6233,6 +6233,19 @@ type approvalGate struct {
 // a sign-in's dialog shows the argv it will run.
 func executeApprovalGate(cfg *Config, al *AllowList, cmd commandMsg) approvalGate {
 	g := approvalGate{DialogCommand: cmd.Command, DialogArgs: cmd.Args, PolicyCommand: cmd}
+	if isWorktreeDeviceCommand(cmd.Command) {
+		// Intercepted before exec, and never dialog-gated. The worktree
+		// built-ins are sent by the hourly Computer Maintenance sweep
+		// (PARALLEL_RUNS_AND_COMPUTER_MAINTENANCE_PLAN.md §9.2) - unattended,
+		// on a tick - so a native dialog would simply block them forever.
+		// Their safety boundary is the signed dispatch, the path policy, the
+		// device-side proofs and the link-safe delete walk, not a prompt (see
+		// worktree_commands.go).
+		g.DeviceCommand = true
+		g.Needed = false
+		g.DialogArgs = nil
+		return g
+	}
 	if isEnvSetupDeviceCommand(cmd.Command) {
 		g.DeviceCommand = true
 		g.Needed = envSetupCommandNeedsApproval(cmd)
