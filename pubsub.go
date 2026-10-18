@@ -5960,7 +5960,7 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 	defer cancel()
 
 	capture.SetWrapper(ps.HostPID())
-	output, err := ps.Execute(ctx, cmdLine, workDir)
+	output, hostCwd, err := ps.Execute(ctx, cmdLine, workDir)
 	if err != nil {
 		// ExitCodeError means the command ran but exited non-zero — the PS
 		// process itself is fine, so don't restart or retry.
@@ -5983,18 +5983,22 @@ func runLocalCommandWindows(cmd string, args []string, workDir string, timeout t
 		// Reuse the original context so the retry does not exceed the
 		// caller-requested timeout.  Creating a fresh full-timeout context here
 		// could allow the command to run for up to 2× the requested duration.
-		output, err = ps.Execute(ctx, cmdLine, workDir)
+		output, hostCwd, err = ps.Execute(ctx, cmdLine, workDir)
 		if err != nil {
 			return runLocalCommandFallbackFn(cmdLine, workDir, timeout, onStart, scope)
 		}
 	}
 
-	// Sync tracked cwd from persistent PowerShell's last known location.
-	// The persistent host is shared by every sender, so its cwd is recorded
-	// against THIS command's scope only — the next command re-sets the host's
-	// location from its own resolved workDir.
-	if newCwd := GetTrackedCwd(); newCwd != "" {
-		setTrackedCwd(scope, newCwd)
+	// Record THIS command's own resulting cwd against its scope.
+	//
+	// hostCwd comes back from Execute, captured under the host's execution
+	// mutex. Re-reading the shared host here (GetTrackedCwd) would be a race:
+	// the persistent PowerShell is shared by every Pub/Sub callback, so a
+	// second command could run — or restart the host — between Execute
+	// returning and the read, and this command would then record the OTHER
+	// command's directory and later run in the wrong worktree.
+	if hostCwd != "" {
+		setTrackedCwd(scope, hostCwd)
 	}
 
 	return output, nil

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -303,4 +304,28 @@ func TestTrackedCwd_AnIdentifiedSenderNeverInheritsTheUnidentifiedCwd(t *testing
 	if got := getTrackedCwd(cwdScope{}); got != "C:/someone/elses/worktree" {
 		t.Errorf("an unidentified sender lost its own cwd, got %q", got)
 	}
+}
+
+// Execute must hand back ITS OWN resulting cwd, not leave the caller to read
+// the shared host afterwards.
+//
+// ps.lastCwd is written inside ps.mutex, but GetTrackedCwd reads it under
+// globalPSLock — a different lock — after Execute has released its own. The
+// persistent PowerShell host is shared by every Pub/Sub callback, so in that
+// window a second command can run, or restart the host, and overwrite lastCwd.
+// The first command would then record the SECOND command's directory against
+// its scope and later run in the wrong worktree, which is precisely the failure
+// this slice exists to remove.
+//
+// A unit test cannot drive the real Windows host here, so what it pins is the
+// contract that makes the race impossible: the cwd travels out of Execute with
+// the output, so no second read is needed.
+func TestPersistentPowerShell_ExecuteReturnsItsOwnCwd(t *testing.T) {
+	var ps *PersistentPowerShell
+	fn := ps.Execute
+
+	// Three results: output, the host's cwd as of this command, and error.
+	// If this stops compiling because Execute lost its cwd return, the caller
+	// in runLocalCommandIn has gone back to re-reading the shared host.
+	var _ func(context.Context, string, string) (string, string, error) = fn
 }

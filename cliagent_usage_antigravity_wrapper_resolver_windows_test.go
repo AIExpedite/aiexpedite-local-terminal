@@ -126,7 +126,7 @@ func TestAntigravityWrapperResolver_PersistentPowerShell(t *testing.T) {
 	capture.SetWrapper(ps.HostPID())
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if out, err := ps.Execute(ctx, script, t.TempDir()); err != nil {
+	if out, _, err := ps.Execute(ctx, script, t.TempDir()); err != nil {
 		t.Fatalf("persistent-PowerShell run failed: %v (%s)", err, out)
 	}
 	capture.Finish()

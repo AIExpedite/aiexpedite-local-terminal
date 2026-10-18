@@ -45,7 +45,8 @@ func execPS(t *testing.T, ps *PersistentPowerShell, command string) (string, err
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return ps.Execute(ctx, command, "")
+	out, _, err := ps.Execute(ctx, command, "")
+	return out, err
 }
 
 func requireExitCode(t *testing.T, err error, want int) {
