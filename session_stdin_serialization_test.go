@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -189,7 +190,7 @@ func TestStdin_CloseWaitsForAnInFlightWrite(t *testing.T) {
 // delivery would let session_ended arrive before session_started, leaving the
 // server tracking a dead session as live.
 func TestStartAck_TerminalFrameWaitsForTheStartAcknowledgement(t *testing.T) {
-	session := &CLISession{ID: "sess-ack", startAck: make(chan struct{})}
+	session := &CLISession{ID: "sess-ack", startAck: make(chan struct{}), startAckExpected: true}
 
 	waited := make(chan struct{})
 	go func() {
@@ -214,7 +215,7 @@ func TestStartAck_TerminalFrameWaitsForTheStartAcknowledgement(t *testing.T) {
 // Marking is idempotent, because the success and failure paths can both reach
 // it, and a double close would panic.
 func TestStartAck_MarkingIsIdempotent(t *testing.T) {
-	session := &CLISession{ID: "sess-twice", startAck: make(chan struct{})}
+	session := &CLISession{ID: "sess-twice", startAck: make(chan struct{}), startAckExpected: true}
 	session.MarkStartAcknowledged()
 	session.MarkStartAcknowledged()
 	session.awaitStartAck() // returns immediately, no panic
@@ -234,5 +235,89 @@ func TestStartAck_AbsentBarrierDoesNotBlock(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("awaitStartAck blocked without a barrier")
+	}
+}
+
+// The wait happens ONLY when someone undertook to answer the start. Every
+// caller but the Pub/Sub handler publishes no start frame, so there is nothing
+// a terminal frame could overtake — and making those callers wait is what cost
+// 130 seconds of suite time and pushed a timing test over its budget.
+func TestStartAck_NoWaitWhenNobodyWillAnswer(t *testing.T) {
+	session := &CLISession{ID: "sess-unexpected", startAck: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		session.awaitStartAck()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("waited for an acknowledgement nobody undertook to send")
+	}
+}
+
+// The expectation is declared before the session exists, and consumed when it
+// is built — so a later session reusing the id does not inherit a promise
+// nobody made for it.
+func TestStartAck_ExpectationIsConsumedNotReused(t *testing.T) {
+	sm := &SessionManager{sessions: map[string]*CLISession{}}
+	if sm.consumeStartAckExpectation("sess-x") {
+		t.Fatal("an undeclared id reported an expectation")
+	}
+	sm.ExpectStartAck("sess-x")
+	if !sm.consumeStartAckExpectation("sess-x") {
+		t.Fatal("a declared id did not report its expectation")
+	}
+	if sm.consumeStartAckExpectation("sess-x") {
+		t.Fatal("the expectation survived being consumed")
+	}
+	// An empty id is not a session.
+	sm.ExpectStartAck("")
+	if sm.consumeStartAckExpectation("") {
+		t.Fatal("an empty id recorded an expectation")
+	}
+}
+
+// The ordering the barrier exists for, end to end over the two publishes: a
+// terminal frame must never be the first of the pair to go out.
+//
+// This is the test that would have caught closing the barrier on
+// startSession's RETURN rather than after the start publish: returning is not
+// publishing, and the frames are published from different goroutines.
+func TestStartAck_StartFrameIsAlwaysPublishedFirst(t *testing.T) {
+	session := &CLISession{ID: "sess-order", startAck: make(chan struct{}), startAckExpected: true}
+
+	var order []string
+	var mu sync.Mutex
+	record := func(what string) {
+		mu.Lock()
+		order = append(order, what)
+		mu.Unlock()
+	}
+
+	// The terminal publisher, as waitForExit runs it: on its own goroutine,
+	// gated on the barrier.
+	published := make(chan struct{})
+	go func() {
+		session.awaitStartAck()
+		record("session_ended")
+		close(published)
+	}()
+
+	// The handler: publish, THEN mark. Marking before the publish is the bug.
+	time.Sleep(50 * time.Millisecond) // let the terminal publisher reach the gate
+	record("session_started")
+	session.MarkStartAcknowledged()
+
+	select {
+	case <-published:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the terminal frame never published")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 2 || order[0] != "session_started" || order[1] != "session_ended" {
+		t.Fatalf("frames published in the order %v, want [session_started session_ended]", order)
 	}
 }

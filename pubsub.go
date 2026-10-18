@@ -6727,6 +6727,11 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 		logSession(cmd.SessionID, "%s[session] Starting session %s for command: %s%s\n",
 			colorCyan, cmd.SessionID, cmd.Command, colorReset)
 
+		// The terminal frame may wait for the answer this handler publishes
+		// below, and only this handler publishes one. Declared BEFORE the start,
+		// because the session does not exist until StartSession builds it.
+		globalSessionManager.ExpectStartAck(cmd.SessionID)
+
 		var err error
 		if cmd.ReadOnly {
 			// The ENFORCED read-only shape (readonly_session.go): fixed argv,
@@ -6759,28 +6764,31 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 				publishFn,
 			)
 		}
+		// EVERY path out of here marks the start acknowledged, and every one of
+		// them marks it AFTER its publish has returned. The barrier means "the
+		// frame answering this start is out", so marking before a publish would
+		// leave exactly the window it exists to close: waitForExit could send
+		// session_ended during the start publish's own duration.
+		//
+		// A failed start is an answer too. Without marking on these paths the
+		// terminal frame would wait out its whole budget for an acknowledgement
+		// that is never coming.
 		if err != nil {
 			msg := fmt.Sprintf("failed to start session: %v", err)
 			if readOnlySessionErrorFrom(err) != nil {
 				publishSessionErrorWithCode(ctx, topic, cmd, msg, readOnlyUnsupportedErrorCode)
+				globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 				return
 			}
 			if typed := grokAuthErrorFrom(err); typed != nil {
 				publishSessionErrorWithCode(ctx, topic, cmd, msg, typed.Code)
+				globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 				return
 			}
-			// A failed start is still an answer: without this the terminal frame
-			// would wait out its whole budget for an acknowledgement that is
-			// never coming.
-			globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 			publishSessionError(ctx, topic, cmd, msg)
+			globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 			return
 		}
-
-		// The session's terminal frame waits on this, so it is marked BEFORE the
-		// publish: the frame may only follow the start, and marking after would
-		// reopen the window for the publish's own duration.
-		globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 
 		// Publish session_started acknowledgment
 		publishFn(resultMsg{
@@ -6794,6 +6802,8 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 			Type:        "session_started",
 			SessionID:   cmd.SessionID,
 		})
+		// The start frame is OUT. Only now may a terminal frame follow it.
+		globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 
 	case "session_input":
 		if cmd.SessionID == "" {

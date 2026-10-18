@@ -251,6 +251,18 @@ type CLISession struct {
 	// releases its fence on that frame.
 	startAck     chan struct{}
 	startAckOnce sync.Once
+	// startAckExpected is true only when the caller that started this session
+	// undertook to answer the start (SessionManager.ExpectStartAck). The
+	// terminal frame waits for the acknowledgement only then.
+	//
+	// The discriminator is deliberately "will anyone answer" rather than "has
+	// the start returned". Returning is not publishing — that confusion is
+	// what made an earlier `defer MarkStartAcknowledged()` defeat the barrier
+	// it was meant to hold. And the twelve test files that drive a real start
+	// with no Pub/Sub handler never answer at all, so without this they each
+	// paid the whole backstop: 130 seconds of suite time, and one timing test
+	// pushed over its budget under load.
+	startAckExpected bool
 
 	// claudeWatchdogOnce guards the no-output watchdog goroutine so it is armed
 	// at most once per claude session. The arm point is deferred to the moment
@@ -306,7 +318,15 @@ func (s *CLISession) signalFirstRealFrame() {
 type SessionManager struct {
 	sessions map[string]*CLISession
 	mu       sync.RWMutex
-	Config   *Config // Config for file upload settings
+
+	// expectStartAck holds the session ids whose starter undertook to publish
+	// an answer. Its own mutex, NOT sm.mu: startSession holds sm.mu while it
+	// consumes an entry, and the Pub/Sub handler records one just before
+	// calling in, so sharing the manager lock would order these two against
+	// each other for no reason.
+	expectStartAckMu sync.Mutex
+	expectStartAck   map[string]bool
+	Config           *Config // Config for file upload settings
 	// closed is set by ShutdownAllSessionsWithin in the SAME hold of mu that
 	// takes the teardown snapshot, and is never cleared — this process is
 	// exiting. startSession refuses while it is set, so no child can be
@@ -1096,22 +1116,33 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
 		firstRealFrame:     make(chan struct{}),
 		startAck:           make(chan struct{}),
-		processExited:      make(chan struct{}),
-		done:               make(chan struct{}),
-		streamDone:         make(chan struct{}),
-		publishFn:          publishFn,
+		// Consumed, not read: the id is cleared so a later session reusing it
+		// does not inherit a promise nobody made for it.
+		startAckExpected: sm.consumeStartAckExpectation(id),
+		processExited:    make(chan struct{}),
+		done:             make(chan struct{}),
+		streamDone:       make(chan struct{}),
+		publishFn:        publishFn,
 	}
 
-	// Close the start barrier on EVERY return from here, success or failure.
+	// NO defer marking the start acknowledged here. It is tempting — every
+	// return from this function is a start that has been decided, and it would
+	// spare the test files that drive a real start with no Pub/Sub handler from
+	// paying the backstop wait.
 	//
-	// This is the barrier that matters. The reversal it prevents needed
-	// startSession to still be BLOCKED (in the initial stdin write) while the
-	// child died, so that waitForExit's session_ended could overtake the
-	// session_started the Pub/Sub handler publishes only after this returns.
-	// Marking on return closes that window completely, and costs nothing: the
-	// handler's own earlier mark then finds it already closed, and the ten test
-	// files that drive a real start without the handler never wait at all.
-	defer session.MarkStartAcknowledged()
+	// It also defeats the barrier entirely, which is the whole point of it.
+	// `session_started` is published by the Pub/Sub handler only AFTER this
+	// function returns, so "startSession returned" and "the start frame is out"
+	// are different moments, and the reversal happens between them: the child
+	// dies, waitForExit finds the barrier already closed, and session_ended goes
+	// out before the session_started that follows it. The remote side then
+	// treats an already-dead session as live.
+	//
+	// So the barrier is closed by whoever publishes the answer, after that
+	// publish returns (pubsub.go, handleSessionCommand). The only production
+	// caller is that handler, so nothing else can leave it unclosed; a path that
+	// somehow did would pay the bounded backstop rather than publish out of
+	// order, which is the right way round.
 	if !grokUsageFloor.IsZero() {
 		session.grokUsageFloorMs.Store(grokUsageFloor.UnixMilli())
 	}
@@ -2920,11 +2951,48 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 // publishes a terminal frame without the start having returned at all, and the
 // frame must win there, because the server releases its session fence on it.
 //
-// It must stay small for a second reason: ten test files drive a real
-// startSession without the Pub/Sub handler that also marks the ack, so any
-// generous budget is paid once per such test. A 10s value pushed the package
-// past `go test`'s 600s default and turned the suite red on a TIMEOUT.
+// Only a caller that declared ExpectStartAck is ever waited for, so this budget
+// is not paid by the twelve test files that drive a real start with no Pub/Sub
+// handler. That matters: when every teardown paid it, the suite went from 544s
+// to 692s and pushed a wall-clock test over its budget under load. The
+// expectation is the fix for that; this is the backstop for a handler that
+// declared the undertaking and then failed to answer.
 const startAckWaitBudget = 2 * time.Second
+
+// ExpectStartAck declares that the caller will publish an answer to this
+// session's start — `session_started` on success, `session_error` on
+// failure — and that a terminal frame may therefore wait for it.
+//
+// Called BEFORE StartSession, because the session does not exist yet: the id
+// is recorded here and consumed when the session is constructed.
+//
+// A caller that does not call this gets the old behaviour exactly: the
+// terminal frame publishes immediately. That is correct rather than merely
+// convenient — a start nobody answers cannot be overtaken by its own answer.
+func (sm *SessionManager) ExpectStartAck(id string) {
+	if id == "" {
+		return
+	}
+	sm.expectStartAckMu.Lock()
+	defer sm.expectStartAckMu.Unlock()
+	if sm.expectStartAck == nil {
+		sm.expectStartAck = make(map[string]bool)
+	}
+	sm.expectStartAck[id] = true
+}
+
+// consumeStartAckExpectation reports whether this id was declared, and clears
+// it. Cleared on consumption so a later session reusing the id does not
+// inherit a promise nobody made for it.
+func (sm *SessionManager) consumeStartAckExpectation(id string) bool {
+	sm.expectStartAckMu.Lock()
+	defer sm.expectStartAckMu.Unlock()
+	if !sm.expectStartAck[id] {
+		return false
+	}
+	delete(sm.expectStartAck, id)
+	return true
+}
 
 // MarkStartAcknowledged records that this session's start has been answered
 // to the server. Idempotent: the success and failure paths may both reach it.
@@ -2950,8 +3018,13 @@ func (sm *SessionManager) MarkSessionStartAcknowledged(id string) {
 
 // awaitStartAck blocks until this session's start was acknowledged, the
 // budget is spent, or the session has no barrier (a struct built by a test).
+//
+// Returns at once when nobody undertook to answer the start, which is every
+// caller but the Pub/Sub handler. Nothing is being raced in that case: the
+// reversal this barrier prevents is a terminal frame overtaking the start
+// frame, and there is no start frame.
 func (s *CLISession) awaitStartAck() {
-	if s == nil || s.startAck == nil {
+	if s == nil || s.startAck == nil || !s.startAckExpected {
 		return
 	}
 	select {
