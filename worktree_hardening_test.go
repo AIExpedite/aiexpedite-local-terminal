@@ -321,3 +321,63 @@ func TestCapabilityMatchesTheCommandsThisBuildHandles(t *testing.T) {
 		t.Fatal("this build handles the worktree commands but does not advertise them")
 	}
 }
+
+// ─── a rescue ref is a REF, and refs are stricter than directories ──────────
+
+// Allowing a dot-leading repository folder (`.github`, legal and ordinary)
+// made the rescue ref `aix/rescue/<feature>/.github-7b3c91`, and git refuses a
+// ref whose component begins with a dot. The validator missed it because its
+// pattern anchors only the FIRST character of the whole ref — always the `a` of
+// `aix/` — so every later component went unchecked.
+func TestRescueRefRefusesAComponentGitWouldReject(t *testing.T) {
+	for _, bad := range []string{
+		"aix/rescue/feat-aabbccddeeff/.github-7b3c91",
+		"aix/rescue/.feat-aabbccddeeff/repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/repo-7b3c91.",
+		"aix/rescue/feat-aabbccddeeff/-repo-7b3c91",
+	} {
+		if _, err := validateRescueRef(bad); err == nil {
+			t.Fatalf("%q was accepted as a rescue ref", bad)
+		}
+	}
+	// And the ordinary shape still passes.
+	for _, ok := range []string{
+		"aix/rescue/feat-aabbccddeeff/repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/my.repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/github-7b3c91",
+	} {
+		if _, err := validateRescueRef(ok); err != nil {
+			t.Fatalf("%q was refused: %v", ok, err)
+		}
+	}
+}
+
+// The folder a removal rescues from may begin with a dot; the ref it pushes to
+// may not. Stripping leading dots stays unique BECAUSE of the discriminator:
+// `.github` and `github` are different repositories, so their folders carry
+// different 6-hex suffixes and the two rescue branches cannot collide.
+func TestRefComponentFromFolderIsRefSafeAndStillUnique(t *testing.T) {
+	cases := map[string]string{
+		"frontend-7b3c91": "frontend-7b3c91",
+		".github-7b3c91":  "github-7b3c91",
+		"..weird-7b3c91":  "weird-7b3c91",
+		"_repo-7b3c91":    "_repo-7b3c91",
+	}
+	for folder, want := range cases {
+		if got := refComponentFromFolder(folder); got != want {
+			t.Fatalf("refComponentFromFolder(%q) = %q, want %q", folder, got, want)
+		}
+		ref := "aix/rescue/feat-aabbccddeeff/" + refComponentFromFolder(folder)
+		if _, err := validateRescueRef(ref); err != nil {
+			t.Fatalf("%q built an invalid rescue ref %q: %v", folder, ref, err)
+		}
+	}
+	// The collision the discriminator prevents: a repository named `.github`
+	// and one named `github` differ in their discriminator, so stripping the
+	// dot cannot make one rescue branch shadow the other.
+	a := refComponentFromFolder(".github-aaaaaa")
+	b := refComponentFromFolder("github-bbbbbb")
+	if a == b {
+		t.Fatalf("two repositories collapsed onto one rescue component: %q", a)
+	}
+}
