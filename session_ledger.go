@@ -363,15 +363,6 @@ func (l *spawnLedger) removeAtLocked(i int) {
 // evicting the oldest entry when the ledger is full).
 func (l *spawnLedger) currentLocked(sessionID string) *ledgerEntry {
 	if _, e := l.findLocked(sessionID, l.bootID); e != nil {
-		// A REUSED ID IS A LIVE SESSION AGAIN. Session ids are reused within a
-		// boot, and the entry this returns may be one ReleaseSession retained
-		// because the old session left a process behind. Every caller of this
-		// get-or-create is a path where the session is doing something NOW, so
-		// the `ended` marker has to come off here — left on, the replacement
-		// session stayed out of `loadCounts` for the rest of the boot and
-		// under-reported the very number Phase 0 measures. Cleared in this one
-		// place rather than in each of the three callers. (Codex, PR #232.)
-		e.Released = false
 		return e
 	}
 	for len(l.entries) >= spawnLedgerMaxEntries {
@@ -489,6 +480,7 @@ func (l *spawnLedger) OpenLogicalSession(sessionID string) {
 		return
 	}
 	e.Logical = true
+	l.reopenLocked(e)
 	l.touch(e)
 	l.persistLocked()
 }
@@ -569,6 +561,7 @@ func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process, suspended
 		l.jobs[proc.Pid] = job
 	}
 	e := l.currentLocked(sessionID)
+	l.reopenLocked(e)
 	if e == nil {
 		// Unrecorded (ledger full): the job still protects the tree while
 		// the agent lives; UntrackProcess releases it.
@@ -680,6 +673,30 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 		l.touch(e)
 	}
 	l.persistLocked()
+}
+
+// reopenLocked marks a retained entry as a live session again.
+//
+// A REUSED ID IS A LIVE SESSION AGAIN — but only once it PROVES it. Session
+// ids are reused within a boot, and the entry may be one ReleaseSession kept
+// because the old session left a process behind; `Released` has to come off,
+// or the replacement stays out of `loadCounts` for the rest of the boot.
+//
+// The proof is a tracked process or an opened logical session, NEVER a begun
+// spawn. `BeginSpawn` runs before `cmd.Start`, and on a failed start
+// `AbortSpawn` keeps the entry — the old PIDs are still in it — decrements
+// `PendingSpawns` and restores nothing. Clearing on the intention therefore
+// reported a live session that never started, for the whole boot: the same
+// over-reporting this field exists to prevent, moved one path along. Hanging
+// the clear on the proof makes an aborted spawn a no-op by construction,
+// rather than by a matching correction in `AbortSpawn`. (Codex, PR #232.)
+//
+// The cost is that a reused id is uncounted for its spawn window —
+// milliseconds — against over-reporting for the rest of the boot.
+func (l *spawnLedger) reopenLocked(e *ledgerEntry) {
+	if e != nil {
+		e.Released = false
+	}
 }
 
 func (l *spawnLedger) releaseJobLocked(pid int) {

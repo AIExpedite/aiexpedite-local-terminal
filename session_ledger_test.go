@@ -524,6 +524,38 @@ func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
 	}
 }
 
+// A spawn that never starts must not resurrect the ended session. `BeginSpawn`
+// runs before `cmd.Start`; on a failed start `AbortSpawn` keeps the entry,
+// because the old session's leftover PIDs are still in it. Clearing the marker
+// on the begun spawn therefore reported a live session that never existed for
+// the rest of the boot — so the clear hangs on a tracked process instead.
+// (Codex, PR #232.)
+func TestAbortedSpawnOnAReusedIDDoesNotResurrectTheEndedSession(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(ledgerProcess, uintptr) bool { return false }
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(41), false)
+	l.ReleaseSession("reused")
+	if sessions, _ := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after the release, want 0", sessions)
+	}
+
+	// The id is reused, but the process fails to start.
+	l.BeginSpawn("reused")
+	l.AbortSpawn("reused")
+
+	if sessions, pids := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after an aborted spawn, want 0 (pids %v)", sessions, pids)
+	}
+
+	// A spawn that DOES start is a live session again.
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(42), false)
+	if sessions, _ := l.loadCounts(); sessions != 1 {
+		t.Fatalf("sessions = %d once the replacement started, want 1", sessions)
+	}
+}
+
 // A session id reused in the same boot is live again, so the `ended` marker
 // that kept the old generation out of the load report must come off — left on,
 // the replacement session was invisible to `loadCounts` for the rest of the
