@@ -6769,9 +6769,18 @@ func dispatchSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd co
 				publishSessionErrorWithCode(ctx, topic, cmd, msg, typed.Code)
 				return
 			}
+			// A failed start is still an answer: without this the terminal frame
+			// would wait out its whole budget for an acknowledgement that is
+			// never coming.
+			globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 			publishSessionError(ctx, topic, cmd, msg)
 			return
 		}
+
+		// The session's terminal frame waits on this, so it is marked BEFORE the
+		// publish: the frame may only follow the start, and marking after would
+		// reopen the window for the publish's own duration.
+		globalSessionManager.MarkSessionStartAcknowledged(cmd.SessionID)
 
 		// Publish session_started acknowledgment
 		publishFn(resultMsg{

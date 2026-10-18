@@ -231,6 +231,27 @@ type CLISession struct {
 	firstRealFrame     chan struct{}
 	firstRealFrameOnce sync.Once
 
+	// startAck is closed once this session's START has been acknowledged to
+	// the server — after session_started is published, or after the start
+	// failed and session_error went out instead. waitForExit waits on it
+	// before publishing session_ended.
+	//
+	// sm.mu used to provide this ordering as a side effect: the publish of
+	// session_started happens after StartSession RETURNS, so while the
+	// manager lock was held for the whole of StartSession nothing could
+	// publish a terminal frame first. Releasing it early (so a tray Quit's
+	// snapshot cannot be starved by a wedged stdin write) removed that, and a
+	// child which exits during the initial prompt delivery — one rejecting a
+	// large prompt, say — then races: the terminal publish runs on its own
+	// goroutine, so session_ended can arrive FIRST and the later
+	// session_started makes the server treat an already-dead session as live.
+	//
+	// Waiting is bounded (startAckWaitBudget). A start that never
+	// acknowledges must not strand the terminal frame, because the server
+	// releases its fence on that frame.
+	startAck     chan struct{}
+	startAckOnce sync.Once
+
 	// claudeWatchdogOnce guards the no-output watchdog goroutine so it is armed
 	// at most once per claude session. The arm point is deferred to the moment
 	// a prompt is actually delivered to claude (StartSession's initial stdin
@@ -1074,11 +1095,23 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
 		firstRealFrame:     make(chan struct{}),
+		startAck:           make(chan struct{}),
 		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
 	}
+
+	// Close the start barrier on EVERY return from here, success or failure.
+	//
+	// This is the barrier that matters. The reversal it prevents needed
+	// startSession to still be BLOCKED (in the initial stdin write) while the
+	// child died, so that waitForExit's session_ended could overtake the
+	// session_started the Pub/Sub handler publishes only after this returns.
+	// Marking on return closes that window completely, and costs nothing: the
+	// handler's own earlier mark then finds it already closed, and the ten test
+	// files that drive a real start without the handler never wait at all.
+	defer session.MarkStartAcknowledged()
 	if !grokUsageFloor.IsZero() {
 		session.grokUsageFloorMs.Store(grokUsageFloor.UnixMilli())
 	}
@@ -2876,6 +2909,59 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 
 // waitForExit waits for the session's process to exit and publishes a
 // session_ended result.
+// startAckWaitBudget bounds how long a terminal frame waits for the START it
+// belongs to.
+//
+// Short, because it is a BACKSTOP rather than the mechanism. The barrier is
+// closed by a defer in startSession, so by the time any terminal frame can be
+// published the start has returned — which is exactly the state the reversal
+// needed: it required startSession to still be BLOCKED in the initial stdin
+// write while the child died. The budget exists only for a path that somehow
+// publishes a terminal frame without the start having returned at all, and the
+// frame must win there, because the server releases its session fence on it.
+//
+// It must stay small for a second reason: ten test files drive a real
+// startSession without the Pub/Sub handler that also marks the ack, so any
+// generous budget is paid once per such test. A 10s value pushed the package
+// past `go test`'s 600s default and turned the suite red on a TIMEOUT.
+const startAckWaitBudget = 2 * time.Second
+
+// MarkStartAcknowledged records that this session's start has been answered
+// to the server. Idempotent: the success and failure paths may both reach it.
+func (s *CLISession) MarkStartAcknowledged() {
+	if s == nil {
+		return
+	}
+	s.startAckOnce.Do(func() {
+		if s.startAck != nil {
+			close(s.startAck)
+		}
+	})
+}
+
+// MarkSessionStartAcknowledged is the manager-level entry point, so the
+// Pub/Sub handler does not need the session struct.
+func (sm *SessionManager) MarkSessionStartAcknowledged(id string) {
+	sm.mu.RLock()
+	session := sm.sessions[id]
+	sm.mu.RUnlock()
+	session.MarkStartAcknowledged()
+}
+
+// awaitStartAck blocks until this session's start was acknowledged, the
+// budget is spent, or the session has no barrier (a struct built by a test).
+func (s *CLISession) awaitStartAck() {
+	if s == nil || s.startAck == nil {
+		return
+	}
+	select {
+	case <-s.startAck:
+	case <-time.After(startAckWaitBudget):
+		logSession(s.ID, "%s[session] Publishing session_ended for %s without a start acknowledgement (waited %s)%s\n",
+			colorYellow, s.ID, startAckWaitBudget, colorReset)
+	}
+}
+
 func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc) {
 	// Set up per-session timeout — kill the process if it exceeds timeoutMs
 	var timeoutTimer *time.Timer
@@ -3039,6 +3125,11 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's, atomically
 	// re-reserving an already-unclaimed ID against Start's registration.
+	// Never before the START this frame belongs to: the server releases its
+	// fence on this message, and a reversed pair leaves it tracking a dead
+	// session as live.
+	session.awaitStartAck()
+
 	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,

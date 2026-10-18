@@ -178,3 +178,61 @@ func TestStdin_CloseWaitsForAnInFlightWrite(t *testing.T) {
 		t.Error("stdin was never closed")
 	}
 }
+
+// A terminal frame must never overtake the START it belongs to.
+//
+// sm.mu used to give this ordering for free: session_started is published only
+// after StartSession RETURNS, so holding the manager lock for the whole of
+// StartSession meant nothing could publish a terminal frame first. Releasing it
+// early — so a tray Quit's snapshot is not starved by a wedged stdin write —
+// removed that guarantee, and a child exiting during the initial prompt
+// delivery would let session_ended arrive before session_started, leaving the
+// server tracking a dead session as live.
+func TestStartAck_TerminalFrameWaitsForTheStartAcknowledgement(t *testing.T) {
+	session := &CLISession{ID: "sess-ack", startAck: make(chan struct{})}
+
+	waited := make(chan struct{})
+	go func() {
+		session.awaitStartAck()
+		close(waited)
+	}()
+
+	select {
+	case <-waited:
+		t.Fatal("the terminal frame did not wait for the start acknowledgement")
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	session.MarkStartAcknowledged()
+	select {
+	case <-waited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the terminal frame did not proceed after the start was acknowledged")
+	}
+}
+
+// Marking is idempotent, because the success and failure paths can both reach
+// it, and a double close would panic.
+func TestStartAck_MarkingIsIdempotent(t *testing.T) {
+	session := &CLISession{ID: "sess-twice", startAck: make(chan struct{})}
+	session.MarkStartAcknowledged()
+	session.MarkStartAcknowledged()
+	session.awaitStartAck() // returns immediately, no panic
+}
+
+// A session with no barrier (a struct a test built directly) must not block.
+func TestStartAck_AbsentBarrierDoesNotBlock(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		(&CLISession{ID: "sess-nobarrier"}).awaitStartAck()
+		var nilSession *CLISession
+		nilSession.awaitStartAck()
+		nilSession.MarkStartAcknowledged()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("awaitStartAck blocked without a barrier")
+	}
+}
