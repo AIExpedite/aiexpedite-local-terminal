@@ -363,6 +363,15 @@ func (l *spawnLedger) removeAtLocked(i int) {
 // evicting the oldest entry when the ledger is full).
 func (l *spawnLedger) currentLocked(sessionID string) *ledgerEntry {
 	if _, e := l.findLocked(sessionID, l.bootID); e != nil {
+		// A REUSED ID IS A LIVE SESSION AGAIN. Session ids are reused within a
+		// boot, and the entry this returns may be one ReleaseSession retained
+		// because the old session left a process behind. Every caller of this
+		// get-or-create is a path where the session is doing something NOW, so
+		// the `ended` marker has to come off here — left on, the replacement
+		// session stayed out of `loadCounts` for the rest of the boot and
+		// under-reported the very number Phase 0 measures. Cleared in this one
+		// place rather than in each of the three callers. (Codex, PR #232.)
+		e.Released = false
 		return e
 	}
 	for len(l.entries) >= spawnLedgerMaxEntries {

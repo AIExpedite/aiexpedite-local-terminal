@@ -317,6 +317,21 @@ func (t *presenceTracker) observe(now time.Time, s presenceSignals) presenceSamp
 		// collapsed from 23 minutes to 5 at the crossing, with the state
 		// unchanged throughout. (Codex, PR #232.)
 		t.since = start
+	case !timerDerived:
+		// SIGNAL EVIDENCE OUTRANKS A LATER CROSSING, so it also has to
+		// DISQUALIFY the recorded start from being replaced by one.
+		//
+		// The state is unchanged and this sample did not date it, which means
+		// the lock or the sleeping display is still asserting it: we have
+		// continuous evidence of this state from `t.since` onwards. Leaving
+		// `sinceDerived` as it was let a timer-derived start replace it later,
+		// and that is not merely a different estimate — it is the wrong one. A
+		// lock-driven `away` begins AT THE LOCK, while the crossing falls 20
+		// minutes after the keypress that preceded it, so the age collapsed to
+		// roughly zero for someone who had been locked out the whole time.
+		// `t.since` itself never moves here: it stays the earliest evidence we
+		// have, which is the lower bound we want. (Codex, PR #232.)
+		t.sinceDerived = false
 	}
 	age := now.Sub(t.since)
 	if age < 0 {

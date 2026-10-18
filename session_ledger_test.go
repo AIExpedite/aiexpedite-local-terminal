@@ -524,6 +524,30 @@ func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
 	}
 }
 
+// A session id reused in the same boot is live again, so the `ended` marker
+// that kept the old generation out of the load report must come off — left on,
+// the replacement session was invisible to `loadCounts` for the rest of the
+// boot. (Codex, PR #232.)
+func TestReusedSessionIDCountsAgainAfterARetainedRelease(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(ledgerProcess, uintptr) bool { return false }
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(31), false)
+	l.ReleaseSession("reused")
+
+	if sessions, _ := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after the release, want 0", sessions)
+	}
+
+	// The same id opens a new session.
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(32), false)
+
+	if sessions, _ := l.loadCounts(); sessions != 1 {
+		t.Fatalf("sessions = %d after the id was reused, want 1", sessions)
+	}
+}
+
 // ...and the entry it keeps is marked as a session that ENDED, so the load
 // report stops counting it as one. The retained entry keeps `State: live` for
 // the reap, so the count needs its own marker; this test drives the real

@@ -190,6 +190,59 @@ func TestPresenceStateStartDatesIdleAndAwayFromTheTimer(t *testing.T) {
 	}
 }
 
+// The mixed case, and the one two rounds of fixes got wrong in both directions:
+// an `away` dated by the idle timer, then the person returns (resetting the
+// timer) and locks the screen. The lock asserts `away` from the moment it
+// happens, so when the LOCK's own idle timer later crosses 20 minutes that
+// crossing must not re-date the state — it falls 20 minutes after the keypress
+// and would report someone locked out for half an hour as away for seconds.
+// (Codex, PR #232.)
+func TestPresenceLockAfterATimerDerivedAwayIsNotReDatedByTheCrossing(t *testing.T) {
+	tracker := &presenceTracker{}
+	t0 := time.Unix(1790000000, 0)
+
+	// Away because the idle timer passed 20 minutes: dated by the timer, so the
+	// recorded start is five minutes before this observation.
+	sinceStart := t0.Add(-5 * time.Minute)
+	first := tracker.observe(t0, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
+	if first.State != presenceStateAway {
+		t.Fatalf("first observation = %+v", first)
+	}
+
+	// The person comes back and locks the screen, which resets the idle timer.
+	// Still `away` — now because of the lock — so this is not a transition, and
+	// the recorded start stays where it was.
+	locked := presenceSignals{Locked: true, LockedOK: true, Idle: 30 * time.Second, IdleOK: true}
+	if got := tracker.observe(t0.Add(time.Minute), locked); got.State != presenceStateAway {
+		t.Fatalf("after the lock = %+v", got)
+	}
+
+	// The locked session now idles past 20 minutes. The age must keep growing
+	// across that crossing rather than snapping back to it.
+	before := tracker.observe(t0.Add(20*time.Minute), presenceSignals{
+		Locked: true, LockedOK: true, Idle: 19 * time.Minute, IdleOK: true,
+	})
+	after0 := t0.Add(22 * time.Minute)
+	after := tracker.observe(after0, presenceSignals{
+		Locked: true, LockedOK: true, Idle: 21 * time.Minute, IdleOK: true,
+	})
+	if after.AgeMs <= before.AgeMs {
+		t.Fatalf("away age went backwards across the idle threshold: %dms then %dms",
+			before.AgeMs, after.AgeMs)
+	}
+	// The retained start is the FIRST one — the timer-derived t0-5m, from before
+	// the person came back — so the age reads 27 minutes, not the 22 since the
+	// lock. That is the residual of this design and it is the SAFE direction: an
+	// age that reads long only makes the platform more willing to use a computer
+	// whose screen is locked, which is what `away` is for. The collapse is the
+	// unsafe direction and is what this test exists to prevent. Do not "correct"
+	// this figure to the age since the lock without re-reading §8.2 — dating a
+	// lock-driven `away` from the idle crossing is how it collapsed.
+	if want := after0.Sub(sinceStart).Milliseconds(); after.AgeMs != want {
+		t.Fatalf("away age after the crossing = %dms, want %dms", after.AgeMs, want)
+	}
+}
+
 // The same uninterrupted idle counter eventually crosses 20 minutes, at which
 // point presenceStateStart starts dating the state from the threshold — a start
 // LATER than the moment the display slept. Without provenance on the recorded
