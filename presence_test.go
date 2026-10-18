@@ -190,6 +190,41 @@ func TestPresenceStateStartDatesIdleAndAwayFromTheTimer(t *testing.T) {
 	}
 }
 
+// The same uninterrupted idle counter eventually crosses 20 minutes, at which
+// point presenceStateStart starts dating the state from the threshold — a start
+// LATER than the moment the display slept. Without provenance on the recorded
+// start, that later value replaced the observed one and the reported age
+// collapsed (23 minutes to 5) while the state never changed. (Codex, PR #232.)
+func TestPresenceAwayAgeSurvivesTheIdleThresholdCrossing(t *testing.T) {
+	tracker := &presenceTracker{}
+	start := time.Unix(1790000000, 0)
+
+	// The display sleeps with the idle timer at 2 minutes, so this `away` is
+	// dated by observation: the state began now.
+	first := tracker.observe(start, presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 2 * time.Minute, IdleOK: true})
+	if first.State != presenceStateAway || first.AgeMs != 0 {
+		t.Fatalf("first observation = %+v", first)
+	}
+
+	// Nobody has touched the machine since, so the idle timer keeps climbing
+	// past its own 20-minute threshold with the display still asleep. The age
+	// has to keep growing from when the display slept.
+	for _, elapsed := range []time.Duration{10 * time.Minute, 23 * time.Minute, 90 * time.Minute} {
+		got := tracker.observe(start.Add(elapsed), presenceSignals{
+			DisplayOff: true, DisplayOffOK: true,
+			Idle:   2*time.Minute + elapsed,
+			IdleOK: true,
+		})
+		if got.State != presenceStateAway {
+			t.Fatalf("state after %v = %q", elapsed, got.State)
+		}
+		if want := elapsed.Milliseconds(); got.AgeMs != want {
+			t.Fatalf("away age after %v = %dms, want %dms — the threshold crossing re-dated an unchanged state",
+				elapsed, got.AgeMs, want)
+		}
+	}
+}
+
 // A sleeping display or a locked session classifies `away` while the idle timer
 // is still under 20 minutes. The unobserved-transition fix first tested the
 // STATE NAME for timer-derivation, so every one of those samples re-dated the

@@ -258,6 +258,11 @@ type presenceTracker struct {
 	mu    sync.Mutex
 	state string
 	since time.Time
+	// sinceDerived records HOW `since` was dated: by the idle timer, or
+	// merely by observing the state. Without it the two kinds of start are
+	// interchangeable, and a timer-derived start then overwrites an earlier
+	// observed one — see observe. (Codex, PR #232.)
+	sinceDerived bool
 }
 
 var globalPresenceTracker = &presenceTracker{}
@@ -286,8 +291,8 @@ func (t *presenceTracker) observe(now time.Time, s presenceSignals) presenceSamp
 	defer t.mu.Unlock()
 	switch {
 	case t.state != state || t.since.IsZero():
-		t.state, t.since = state, start
-	case timerDerived && start.After(t.since):
+		t.state, t.since, t.sinceDerived = state, start, timerDerived
+	case timerDerived && t.sinceDerived && start.After(t.since):
 		// AN UNOBSERVED TRANSITION. Two consecutive samples can both classify
 		// `idle` while the person was active in between — easily, once the
 		// server configures a sample interval longer than the five-minute idle
@@ -301,6 +306,16 @@ func (t *presenceTracker) observe(now time.Time, s presenceSignals) presenceSamp
 		// that is merely `now` (an `active` sample, or an `away` read off the
 		// lock or a sleeping display) is evidence of nothing, and advancing on
 		// it would peg the age at zero every sample. (Codex, PR #231.)
+		//
+		// A START IS ONLY REPLACED BY A LATER ONE OF THE SAME KIND, which is
+		// what `t.sinceDerived` is for. A signal-derived start is the earliest
+		// evidence of a state that has held continuously since, so it is the
+		// better lower bound and a derived start must not overwrite it: a
+		// display asleep since T0 with idle under 20 minutes records T0, and
+		// when that same uninterrupted idle counter crosses the threshold the
+		// derived start is LATER than T0 — so without provenance the age
+		// collapsed from 23 minutes to 5 at the crossing, with the state
+		// unchanged throughout. (Codex, PR #232.)
 		t.since = start
 	}
 	age := now.Sub(t.since)
@@ -315,7 +330,7 @@ func (t *presenceTracker) observe(now time.Time, s presenceSignals) presenceSamp
 func (t *presenceTracker) reset() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.state, t.since = "", time.Time{}
+	t.state, t.since, t.sinceDerived = "", time.Time{}, false
 }
 
 // samplePresence is the only entry point the reporter uses.
