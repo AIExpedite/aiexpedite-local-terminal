@@ -91,6 +91,12 @@ func (fx wtFixture) seedCommit(t *testing.T, name string) string {
 }
 
 func (fx wtFixture) wtPath(repo string) string {
+	// Fixtures name a repository the way a person does. The server appends the
+	// discriminator, so the helper does too — a name that already carries one
+	// is left alone, so a test can still pin an exact segment.
+	if !hasWorktreeRepoDiscriminator(repo) {
+		repo += wtTestRepoDiscriminator
+	}
 	return filepath.Join("aixwt", wtTestFeatureFolder, repo)
 }
 
@@ -477,7 +483,7 @@ func TestListWorktreesReportsStateAndCountsOthersWithoutNamingThem(t *testing.T)
 		t.Fatalf("otherWorktreeCount = %d, want 1", res.OtherWorktreeCount)
 	}
 	row := res.Worktrees[0]
-	if row.Branch != "feature/listed" || row.Dirty || row.RepoFolder != "demo" {
+	if row.Branch != "feature/listed" || row.Dirty || row.RepoFolder != "demo"+wtTestRepoDiscriminator {
 		t.Fatalf("row = %+v", row)
 	}
 
@@ -653,7 +659,7 @@ func TestRemoveWorktreeRefusesABadPathNamingTheRule(t *testing.T) {
 		"outside the root":      {filepath.Join(fx.Base, "seed"), rulePathNotUnderRoot},
 		"the shared aixwt dir":  {"aixwt/" + wtTestFeatureFolder + "/..", rulePathSegmentCount},
 		"the feature folder":    {"aixwt/" + wtTestFeatureFolder + "/.", rulePathSegmentCount},
-		"a trailing dot":        {"aixwt/" + wtTestFeatureFolder + "/demo.", rulePathRepoTrailingDot},
+		"a trailing dot":        {"aixwt/" + wtTestFeatureFolder + "/demo.", rulePathRepoDiscriminator},
 		"an all-dots segment":   {"aixwt/" + wtTestFeatureFolder + "/...", rulePathRepoTraversal},
 		"nested below the repo": {"aixwt/" + wtTestFeatureFolder + "/demo/src", rulePathSegmentCount},
 	}
@@ -684,7 +690,10 @@ func TestRemoveWorktreeRefusesALinkedPath(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	makeAbsDirLink(t, filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder, "demo"), sibling)
+	// The link has to stand where the POLICY will walk, which is the
+	// discriminated folder name the server derives — not the bare checkout
+	// name. Linking the wrong one made this test pass vacuously.
+	makeAbsDirLink(t, filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder, "demo"+wtTestRepoDiscriminator), sibling)
 
 	_, err := removeWorktree(context.Background(), fx.removeReq(fx.wtPath("demo")))
 	if err == nil {

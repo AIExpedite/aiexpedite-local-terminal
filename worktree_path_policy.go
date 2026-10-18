@@ -19,12 +19,22 @@
 //     component is lstat'd, and the deepest existing ancestor's real path must
 //     still resolve under the root's real path.
 //
-// Why the repository segment is not a plain character class: `[A-Za-z0-9._-]+`
+// Why the repository segment must END in `-<6 hex>`: a plain `[A-Za-z0-9._-]+`
 // admits `.` and `..`, and `aixwt/<folder>/..` would then satisfy the boundary
 // while naming the SHARED `aixwt` directory — one registry row aimed at every
 // worktree on the computer instead of one repository. A trailing dot is the same
 // class, because Windows strips it, so `repo.` and `repo` are one directory
-// under two distinct registry paths.
+// under two distinct registry paths. A segment that must end in `-<6 hex>`
+// cannot be either, so both are closed by construction.
+//
+// The suffix is the repository discriminator (the server appends 6 hex of the
+// repository id, because two checkouts can share a folder name), and its other
+// job is this one. An earlier version instead required the segment to START
+// alphanumeric, which closed the same two holes and silently locked out
+// `.github`, `_repo` and `-repo` — all legal checkout folder names, `.github`
+// being an ordinary repository in many organisations. Since this agent refuses
+// to write a path that does not match, those repositories could not use
+// worktree mode at all and nothing said why.
 // -----------------------------------------------------------------------------
 
 package main
@@ -42,14 +52,15 @@ import (
 const worktreeRootSegment = "aixwt"
 
 // worktreeRepoSegmentMaxLength is the longest repository folder the pattern
-// admits (1 + 62 + 1). A FIXED bound, never derived from anything installed.
+// admits (57 name + 1 hyphen + 6 hex). A FIXED bound, never derived from
+// anything installed.
 const worktreeRepoSegmentMaxLength = 64
 
 // worktreeRelativePathPattern is shared-constants WORKTREE_RELATIVE_PATH_PATTERN
 // verbatim. Keep the two literally identical: the server derives the path from
 // it and this agent refuses to write anywhere that does not match.
 var worktreeRelativePathPattern = regexp.MustCompile(
-	`^aixwt/[a-z0-9-]{1,24}-[0-9a-f]{12}/[A-Za-z0-9]([A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$`)
+	`^aixwt/[a-z0-9-]{1,24}-[0-9a-f]{12}/[A-Za-z0-9._-]{1,57}-[0-9a-f]{6}$`)
 
 // worktreeFeatureFolderPattern is the `<slug>-<key>` half, split out for
 // diagnostics only. The authority is worktreeRelativePathPattern.
@@ -67,8 +78,7 @@ const (
 	rulePathFeatureFolder     = "feature_folder"
 	rulePathRepoEmpty         = "repo_segment_empty"
 	rulePathRepoTraversal     = "repo_segment_traversal"
-	rulePathRepoTrailingDot   = "repo_segment_trailing_dot"
-	rulePathRepoLeadingChar   = "repo_segment_leading_char"
+	rulePathRepoDiscriminator = "repo_segment_discriminator"
 	rulePathRepoCharset       = "repo_segment_charset"
 	rulePathRepoTooLong       = "repo_segment_too_long"
 	rulePathPatternMismatch   = "pattern_mismatch"
@@ -174,20 +184,45 @@ func diagnoseWorktreeRepoSegment(seg string) *worktreePolicyError {
 				fmt.Sprintf("repository segment %q holds a character outside [A-Za-z0-9._-]", seg))
 		}
 	}
-	if !isWorktreeAlnum(seg[0]) {
-		return policyRefusal(rulePathRepoLeadingChar,
-			fmt.Sprintf("repository segment %q must start with a letter or digit", seg))
-	}
-	last := seg[len(seg)-1]
-	if last == '.' {
-		return policyRefusal(rulePathRepoTrailingDot,
-			fmt.Sprintf("repository segment %q ends in a dot; Windows strips it, so two registry paths would name one directory", seg))
-	}
-	if !isWorktreeAlnum(last) && last != '_' && last != '-' {
-		return policyRefusal(rulePathRepoCharset,
-			fmt.Sprintf("repository segment %q must end with [A-Za-z0-9_-]", seg))
+	// NO leading-character rule. The segment may start with a dot, an
+	// underscore or a hyphen, because `.github`, `_repo` and `-repo` are legal
+	// checkout folder names and `.github` is an ordinary repository in many
+	// organisations. The safety an earlier leading-alphanumeric rule provided —
+	// no `.`, no `..`, no trailing dot — now comes from the mandatory
+	// discriminator below, which gives it without excluding anyone.
+	if !hasWorktreeRepoDiscriminator(seg) {
+		return policyRefusal(rulePathRepoDiscriminator,
+			fmt.Sprintf("repository segment %q must end in -<%d hex>: the server appends a discriminator of the repository id, because two checkouts can share a folder name",
+				seg, worktreeRepoDiscriminatorLength))
 	}
 	return nil
+}
+
+// worktreeRepoDiscriminatorLength mirrors the `[0-9a-f]{6}` in
+// worktreeRelativePathPattern. A FIXED value, never derived.
+const worktreeRepoDiscriminatorLength = 6
+
+// hasWorktreeRepoDiscriminator reports whether seg ends in `-` followed by
+// exactly worktreeRepoDiscriminatorLength lowercase hex characters, with at
+// least one character of name before the hyphen.
+//
+// This is also what makes `.`, `..` and a trailing dot impossible, so it is not
+// merely a naming convention: it is the deletion boundary's first half.
+func hasWorktreeRepoDiscriminator(seg string) bool {
+	if len(seg) < worktreeRepoDiscriminatorLength+2 {
+		return false
+	}
+	hyphen := len(seg) - worktreeRepoDiscriminatorLength - 1
+	if seg[hyphen] != '-' {
+		return false
+	}
+	for i := hyphen + 1; i < len(seg); i++ {
+		c := seg[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func isWorktreeAlnum(c byte) bool {

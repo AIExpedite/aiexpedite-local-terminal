@@ -13,6 +13,15 @@ import (
 // after the kebab slug.
 const wtTestFeatureFolder = "demo-feature-aabbccddeeff"
 
+// wtTestRepoDiscriminator is the `-<6 hex>` the server appends to a checkout
+// folder name. Mandatory in the pattern, because two checkouts can share a
+// folder name — and it is also what makes `.`, `..` and a trailing dot
+// impossible, so a fixture path without one is not a legal path.
+const wtTestRepoDiscriminator = "-7b3c91"
+
+// wtTestRepoFolder is a repository segment as the server builds it.
+const wtTestRepoFolder = "frontend" + wtTestRepoDiscriminator
+
 // makeAbsDirLink links `link` to the ABSOLUTE directory `target`: a junction on
 // Windows (which is how npm links workspaces there, and what the 2026-09-17
 // incident followed), a symlink elsewhere. It differs from makeDirLink in
@@ -59,7 +68,20 @@ func tempRootDir(t *testing.T) string {
 func TestWorktreeRelativePathDiagnosticsMatchPattern(t *testing.T) {
 	corpus := []string{
 		// Accepted.
-		"aixwt/" + wtTestFeatureFolder + "/frontend",
+		"aixwt/" + wtTestFeatureFolder + "/" + wtTestRepoFolder,
+		// Leading punctuation, legal now that the discriminator carries the
+		// safety the leading-character rule used to carry.
+		"aixwt/" + wtTestFeatureFolder + "/.github" + wtTestRepoDiscriminator,
+		"aixwt/" + wtTestFeatureFolder + "/_repo" + wtTestRepoDiscriminator,
+		"aixwt/" + wtTestFeatureFolder + "/-repo" + wtTestRepoDiscriminator,
+		// A dot-run NAME is a literal directory once the suffix is mandatory,
+		// not a traversal — which is exactly why the suffix, and not the first
+		// character, is the thing being pinned.
+		"aixwt/" + wtTestFeatureFolder + "/.." + wtTestRepoDiscriminator,
+		"aixwt/" + wtTestFeatureFolder + "/." + wtTestRepoDiscriminator,
+		// The 64-character bound: 57 name + hyphen + 6 hex.
+		"aixwt/" + wtTestFeatureFolder + "/" + strings.Repeat("a", 57) + wtTestRepoDiscriminator,
+		"aixwt/" + wtTestFeatureFolder + "/" + strings.Repeat("a", 58) + wtTestRepoDiscriminator,
 		"aixwt/a-aabbccddeeff/a",
 		"aixwt/a-aabbccddeeff/ab",
 		"aixwt/a-aabbccddeeff/a-",
@@ -77,7 +99,11 @@ func TestWorktreeRelativePathDiagnosticsMatchPattern(t *testing.T) {
 		// Windows strips a trailing dot, so these two name ONE directory.
 		"aixwt/" + wtTestFeatureFolder + "/repo.",
 		"aixwt/" + wtTestFeatureFolder + "/a.",
-		// Must start alphanumeric.
+		// No discriminator. These three used to be refused for STARTING with
+		// punctuation, which also locked out `.github`, `_repo` and `-repo` —
+		// legal checkout folder names, `.github` being an ordinary repository
+		// in many organisations. With a discriminator they are all accepted
+		// (see the acceptance list below); without one, nothing is.
 		"aixwt/" + wtTestFeatureFolder + "/.hidden",
 		"aixwt/" + wtTestFeatureFolder + "/-lead",
 		"aixwt/" + wtTestFeatureFolder + "/_lead",
@@ -126,7 +152,7 @@ func TestWorktreePatternHasNoLookahead(t *testing.T) {
 	// And keep it literally identical to shared-constants
 	// WORKTREE_RELATIVE_PATH_PATTERN. Changing this literal is a cross-repo
 	// contract change, not a local edit.
-	const shared = `^aixwt/[a-z0-9-]{1,24}-[0-9a-f]{12}/[A-Za-z0-9]([A-Za-z0-9._-]{0,62}[A-Za-z0-9_-])?$`
+	const shared = `^aixwt/[a-z0-9-]{1,24}-[0-9a-f]{12}/[A-Za-z0-9._-]{1,57}-[0-9a-f]{6}$`
 	if src != shared {
 		t.Fatalf("pattern drifted from shared-constants:\n got %s\nwant %s", src, shared)
 	}
@@ -134,14 +160,14 @@ func TestWorktreePatternHasNoLookahead(t *testing.T) {
 
 func TestResolveWorktreePathAcceptsAValidPath(t *testing.T) {
 	root := tempRootDir(t)
-	wt, err := resolveWorktreePath(root, filepath.Join("aixwt", wtTestFeatureFolder, "frontend"))
+	wt, err := resolveWorktreePath(root, filepath.Join("aixwt", wtTestFeatureFolder, wtTestRepoFolder))
 	if err != nil {
 		t.Fatalf("unexpected refusal: %v", err)
 	}
-	if wt.Rel != "aixwt/"+wtTestFeatureFolder+"/frontend" {
+	if wt.Rel != "aixwt/"+wtTestFeatureFolder+"/"+wtTestRepoFolder {
 		t.Fatalf("rel = %q", wt.Rel)
 	}
-	if wt.FeatureFolder != wtTestFeatureFolder || wt.RepoFolder != "frontend" {
+	if wt.FeatureFolder != wtTestFeatureFolder || wt.RepoFolder != wtTestRepoFolder {
 		t.Fatalf("segments = %q / %q", wt.FeatureFolder, wt.RepoFolder)
 	}
 	if wt.Exists {
@@ -169,9 +195,16 @@ func TestResolveWorktreePathRefusals(t *testing.T) {
 		{"bare .. as the repository segment", root, "aixwt/" + wtTestFeatureFolder + "/..", rulePathSegmentCount},
 		{"bare . as the repository segment", root, "aixwt/" + wtTestFeatureFolder + "/.", rulePathSegmentCount},
 		{"... as the repository segment", root, "aixwt/" + wtTestFeatureFolder + "/...", rulePathRepoTraversal},
-		{"trailing dot", root, "aixwt/" + wtTestFeatureFolder + "/repo.", rulePathRepoTrailingDot},
-		{"leading dot", root, "aixwt/" + wtTestFeatureFolder + "/.hidden", rulePathRepoLeadingChar},
-		{"leading hyphen", root, "aixwt/" + wtTestFeatureFolder + "/-lead", rulePathRepoLeadingChar},
+		// All three are now ONE rule: the segment must end in the
+		// discriminator. A trailing dot cannot survive it, and a leading dot or
+		// hyphen is no longer refused at all — `.github`, `_repo` and `-repo`
+		// are legal checkout folder names, and refusing them locked those
+		// repositories out of worktree mode silently.
+		{"trailing dot", root, "aixwt/" + wtTestFeatureFolder + "/repo.", rulePathRepoDiscriminator},
+		{"no discriminator", root, "aixwt/" + wtTestFeatureFolder + "/.hidden", rulePathRepoDiscriminator},
+		{"a hex-looking tail that is not one", root, "aixwt/" + wtTestFeatureFolder + "/repo-7b3c9g", rulePathRepoDiscriminator},
+		{"a discriminator of the wrong length", root, "aixwt/" + wtTestFeatureFolder + "/repo-7b3c9", rulePathRepoDiscriminator},
+		{"a bare discriminator with no name", root, "aixwt/" + wtTestFeatureFolder + "/-7b3c91", rulePathRepoDiscriminator},
 		{"65-character repository segment", root, "aixwt/" + wtTestFeatureFolder + "/" + strings.Repeat("a", 65), rulePathRepoTooLong},
 		{"space in the repository segment", root, "aixwt/" + wtTestFeatureFolder + "/rep o", rulePathRepoCharset},
 		{"wrong first segment", root, "elsewhere/" + wtTestFeatureFolder + "/repo", rulePathRootSegment},
@@ -225,12 +258,12 @@ func TestResolveWorktreePathRefusesALinkedComponent(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "aixwt"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(sibling, "frontend"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(sibling, wtTestRepoFolder), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	makeAbsDirLink(t, filepath.Join(root, "aixwt", wtTestFeatureFolder), sibling)
 
-	_, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/frontend")
+	_, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/"+wtTestRepoFolder)
 	if err == nil {
 		t.Fatal("admitted a path whose feature folder is a link into a sibling checkout")
 	}
@@ -245,8 +278,8 @@ func TestResolveWorktreePathRefusesALinkedLeaf(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "aixwt", wtTestFeatureFolder), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	makeAbsDirLink(t, filepath.Join(root, "aixwt", wtTestFeatureFolder, "frontend"), sibling)
-	_, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/frontend")
+	makeAbsDirLink(t, filepath.Join(root, "aixwt", wtTestFeatureFolder, wtTestRepoFolder), sibling)
+	_, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/"+wtTestRepoFolder)
 	if err == nil {
 		t.Fatal("admitted a worktree path that is itself a link")
 	}
@@ -257,7 +290,7 @@ func TestResolveWorktreePathRefusesALinkedLeaf(t *testing.T) {
 
 func TestResolveInsideWorktreeRefusals(t *testing.T) {
 	root := tempRootDir(t)
-	wt, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/frontend")
+	wt, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/"+wtTestRepoFolder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +326,7 @@ func TestResolveInsideWorktreeRefusals(t *testing.T) {
 func TestResolveInsideWorktreeRefusesALink(t *testing.T) {
 	root := tempRootDir(t)
 	sibling := tempRootDir(t)
-	wt, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/frontend")
+	wt, err := resolveWorktreePath(root, "aixwt/"+wtTestFeatureFolder+"/"+wtTestRepoFolder)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +347,7 @@ func TestResolveMainRepoPathRefusals(t *testing.T) {
 	if err := os.MkdirAll(plain, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	inside := filepath.Join(root, "aixwt", wtTestFeatureFolder, "frontend")
+	inside := filepath.Join(root, "aixwt", wtTestFeatureFolder, wtTestRepoFolder)
 	if err := os.MkdirAll(filepath.Join(inside, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}

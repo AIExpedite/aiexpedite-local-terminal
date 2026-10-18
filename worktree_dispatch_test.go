@@ -135,7 +135,10 @@ func TestWorktreeCommandRefusalNamesTheRule(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a refusal")
 	}
-	if !strings.Contains(err.Error(), rulePathRepoTrailingDot) {
+	// A trailing dot is refused by the DISCRIMINATOR rule now: a segment that
+	// must end in `-<6 hex>` cannot end in a dot, so the dedicated trailing-dot
+	// rule became unreachable and went.
+	if !strings.Contains(err.Error(), rulePathRepoDiscriminator) {
 		t.Fatalf("the error should name the rule, got: %v", err)
 	}
 }
