@@ -452,6 +452,15 @@ func runMockCLI(mode string) {
 		// stdinPrompt) → stdin closed at start → claude reads EOF → exits.
 		os.Exit(0)
 
+	case "stdin-deaf-hang":
+		// Never reads stdin and never writes: an initial prompt larger than
+		// the pipe buffer blocks the agent's write for as long as this process
+		// lives. Used by
+		// TestStartSessionReleasesTheManagerLockBeforeTheInitialPromptWrite to
+		// prove the session manager's lock is not held across that write.
+		time.Sleep(10 * time.Minute)
+		os.Exit(0)
+
 	case "stderr-and-exit":
 		// CLI that writes only to stderr (some CLI error paths look like
 		// this). SessionManager should still surface this content.

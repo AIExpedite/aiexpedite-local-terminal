@@ -61,10 +61,26 @@ const (
 // CLISession represents a single interactive CLI agent process with
 // bidirectional I/O pipes and streaming output.
 type CLISession struct {
-	ID        string
-	Command   string // "claude", "codex"
-	Process   *exec.Cmd
-	Stdin     io.WriteCloser
+	ID      string
+	Command string // "claude", "codex"
+	Process *exec.Cmd
+	Stdin   io.WriteCloser
+	// stdinMu serializes writes to Stdin, and the closes that retire it.
+	//
+	// A CLI's stdin is one pipe with several writers: the initial prompt
+	// (deliverInitialPrompt) and every follow-up turn (SendInputAccepting).
+	// A prompt larger than PIPE_BUF — 4 KiB on Linux, and claude kickoff
+	// briefs run to hundreds of KB — is delivered as MULTIPLE non-atomic
+	// writes, so an interleaved turn splices its NDJSON envelope inside
+	// another line and the child receives two corrupt JSON objects instead
+	// of two valid turns.
+	//
+	// This cannot be `mu`: readOutputStream takes that several times per
+	// output event, so holding it across a large stdin write would stall
+	// output processing for the duration. stdinMu is therefore always the
+	// INNERMOST lock — taken after `mu` where both are needed, and never
+	// held while acquiring `mu` or sm.mu.
+	stdinMu   sync.Mutex
 	Stdout    io.ReadCloser
 	Stderr    io.ReadCloser
 	StartedAt time.Time
@@ -215,6 +231,39 @@ type CLISession struct {
 	firstRealFrame     chan struct{}
 	firstRealFrameOnce sync.Once
 
+	// startAck is closed once this session's START has been acknowledged to
+	// the server — after session_started is published, or after the start
+	// failed and session_error went out instead. waitForExit waits on it
+	// before publishing session_ended.
+	//
+	// sm.mu used to provide this ordering as a side effect: the publish of
+	// session_started happens after StartSession RETURNS, so while the
+	// manager lock was held for the whole of StartSession nothing could
+	// publish a terminal frame first. Releasing it early (so a tray Quit's
+	// snapshot cannot be starved by a wedged stdin write) removed that, and a
+	// child which exits during the initial prompt delivery — one rejecting a
+	// large prompt, say — then races: the terminal publish runs on its own
+	// goroutine, so session_ended can arrive FIRST and the later
+	// session_started makes the server treat an already-dead session as live.
+	//
+	// Waiting is bounded (startAckWaitBudget). A start that never
+	// acknowledges must not strand the terminal frame, because the server
+	// releases its fence on that frame.
+	startAck     chan struct{}
+	startAckOnce sync.Once
+	// startAckExpected is true only when the caller that started this session
+	// undertook to answer the start (SessionManager.ExpectStartAck). The
+	// terminal frame waits for the acknowledgement only then.
+	//
+	// The discriminator is deliberately "will anyone answer" rather than "has
+	// the start returned". Returning is not publishing — that confusion is
+	// what made an earlier `defer MarkStartAcknowledged()` defeat the barrier
+	// it was meant to hold. And the twelve test files that drive a real start
+	// with no Pub/Sub handler never answer at all, so without this they each
+	// paid the whole backstop: 130 seconds of suite time, and one timing test
+	// pushed over its budget under load.
+	startAckExpected bool
+
 	// claudeWatchdogOnce guards the no-output watchdog goroutine so it is armed
 	// at most once per claude session. The arm point is deferred to the moment
 	// a prompt is actually delivered to claude (StartSession's initial stdin
@@ -269,8 +318,31 @@ func (s *CLISession) signalFirstRealFrame() {
 type SessionManager struct {
 	sessions map[string]*CLISession
 	mu       sync.RWMutex
-	Config   *Config // Config for file upload settings
+
+	// expectStartAck holds the session ids whose starter undertook to publish
+	// an answer. Its own mutex, NOT sm.mu: startSession holds sm.mu while it
+	// consumes an entry, and the Pub/Sub handler records one just before
+	// calling in, so sharing the manager lock would order these two against
+	// each other for no reason.
+	expectStartAckMu sync.Mutex
+	expectStartAck   map[string]bool
+	Config           *Config // Config for file upload settings
+	// closed is set by ShutdownAllSessionsWithin in the SAME hold of mu that
+	// takes the teardown snapshot, and is never cleared — this process is
+	// exiting. startSession refuses while it is set, so no child can be
+	// spawned after the snapshot that decides which children get ended: such a
+	// child appears in no snapshot and, on macOS and Linux, in no containment
+	// either (process_ownership_unix.go has no kill-on-close Job Object), so it
+	// would outlive the agent as exactly the orphan teardown exists to remove.
+	closed bool
 }
+
+// errSessionManagerClosed is what every StartSession variant returns once the
+// shutdown snapshot has closed the manager to new starts. A session_start that
+// lost the race with a tray Quit gets a clean refusal — it never panics, never
+// hangs, and never leaves a child behind — and the caller reports it like any
+// other start failure on a device that is going offline.
+var errSessionManagerClosed = errors.New("session manager is shutting down")
 
 // NewSessionManager creates a new SessionManager.
 func NewSessionManager(cfg *Config) *SessionManager {
@@ -359,7 +431,34 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	}
 
 	sm.mu.Lock()
-	defer sm.mu.Unlock()
+	// The manager lock is released EXPLICITLY once this session is registered
+	// (unlockManager below, just before the initial prompt is written), so the
+	// child's stdin write never happens under it. A child that does not read a
+	// prompt larger than its pipe buffer blocks that write, and blocking it
+	// under mu starved every other session operation — the shutdown snapshot
+	// included, so a tray Quit waited on the wedged child instead of ending it
+	// inside sessionShutdownBudget. Every early return between here and there
+	// still unlocks through this defer, and the second call is a no-op.
+	managerLocked := true
+	unlockManager := func() {
+		if managerLocked {
+			managerLocked = false
+			sm.mu.Unlock()
+		}
+	}
+	defer unlockManager()
+
+	// A tray Quit / SIGINT / SIGTERM may already have taken the snapshot that
+	// decides which children get ended (ShutdownAllSessionsWithin). Anything
+	// starting after it would be in no snapshot and, off Windows, in no
+	// containment either, so it is refused rather than spawned. The check is
+	// under the SAME mutex as the snapshot, so a session_start racing the Quit
+	// either registers before the snapshot — and is ended by it — or lands
+	// here. A Pub/Sub callback that passed the offline guard before shutdown
+	// and spent time in approval or preflight work is the real case.
+	if sm.closed {
+		return fmt.Errorf("session %s not started: %w", id, errSessionManagerClosed)
+	}
 
 	if _, exists := sm.sessions[id]; exists {
 		return fmt.Errorf("session %s already exists", id)
@@ -1016,11 +1115,34 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
 		firstRealFrame:     make(chan struct{}),
-		processExited:      make(chan struct{}),
-		done:               make(chan struct{}),
-		streamDone:         make(chan struct{}),
-		publishFn:          publishFn,
+		startAck:           make(chan struct{}),
+		// Consumed, not read: the id is cleared so a later session reusing it
+		// does not inherit a promise nobody made for it.
+		startAckExpected: sm.consumeStartAckExpectation(id),
+		processExited:    make(chan struct{}),
+		done:             make(chan struct{}),
+		streamDone:       make(chan struct{}),
+		publishFn:        publishFn,
 	}
+
+	// NO defer marking the start acknowledged here. It is tempting — every
+	// return from this function is a start that has been decided, and it would
+	// spare the test files that drive a real start with no Pub/Sub handler from
+	// paying the backstop wait.
+	//
+	// It also defeats the barrier entirely, which is the whole point of it.
+	// `session_started` is published by the Pub/Sub handler only AFTER this
+	// function returns, so "startSession returned" and "the start frame is out"
+	// are different moments, and the reversal happens between them: the child
+	// dies, waitForExit finds the barrier already closed, and session_ended goes
+	// out before the session_started that follows it. The remote side then
+	// treats an already-dead session as live.
+	//
+	// So the barrier is closed by whoever publishes the answer, after that
+	// publish returns (pubsub.go, handleSessionCommand). The only production
+	// caller is that handler, so nothing else can leave it unclosed; a path that
+	// somehow did would pay the bounded backstop rather than publish out of
+	// order, which is the right way round.
 	if !grokUsageFloor.IsZero() {
 		session.grokUsageFloorMs.Store(grokUsageFloor.UnixMilli())
 	}
@@ -1068,6 +1190,24 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	sessionOwnsPromptFile = true
 	isolationOwnedBySession = true
 
+	// The session is registered and its watchers are running, so nothing below
+	// touches sm.sessions — and what IS below writes the initial prompt to the
+	// child, which blocks indefinitely on a child that never reads it. Give the
+	// manager lock up here: held across that write, one wedged child stalled
+	// every other session operation, the shutdown snapshot among them. A
+	// shutdown that overtakes us from here finds this session in its snapshot
+	// and ends it; the abandoned write then fails and is logged, which is the
+	// right outcome for a process that is exiting.
+	//
+	// The other writer of this session's stdin is SendInput, and it cannot be
+	// reached before this function returns: pubsub publishes `session_started`
+	// only after StartSession succeeds, and a `session_input` for an
+	// unregistered ID is refused. So the write below stays the sole writer
+	// without the manager lock standing in for a stdin lock — and session.mu is
+	// deliberately NOT taken for it either, because readOutputStream takes that
+	// lock per event and a long write would stall the session's own output.
+	unlockManager()
+
 	logSession(id, "%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
 
@@ -1109,7 +1249,11 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 	// Close stdin for one-shot sessions. Codex exec appends piped stdin to the
 	// prompt, so leaving the pipe open makes it wait indefinitely for EOF.
 	if shouldCloseStdinAfterStart(command, stdinPrompt) {
+		// Under stdinMu: an in-flight write must not have the pipe closed
+		// from under it.
+		session.stdinMu.Lock()
 		session.Stdin.Close()
+		session.stdinMu.Unlock()
 		logSession(id, "%s[session] Closed stdin for one-shot session %s (%s)%s\n",
 			colorYellow, id, command, colorReset)
 	} else if utilitySession {
@@ -1118,7 +1262,9 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		// (The /dev/tty prompt vector is already closed by the TTY detachment in
 		// hardenNonAgentCommand.) Mutually exclusive with the one-shot close
 		// above, which only fires for resident stdin-fed agents.
+		session.stdinMu.Lock()
 		session.Stdin.Close()
+		session.stdinMu.Unlock()
 	}
 
 	return nil
@@ -1130,7 +1276,17 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 // first thing the child read, so its run began there. A failed write is
 // logged and starts nothing, exactly as a failed deferred SendInput does.
 func (sm *SessionManager) deliverInitialPrompt(session *CLISession, line string, promptLen int, format string) {
-	if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
+	// Serialized against SendInputAccepting: since the manager lock is now
+	// released before this runs, a session_input delivered on a sibling
+	// Pub/Sub goroutine can reach the same pipe while this write is still
+	// in flight.
+	session.stdinMu.Lock()
+	writeErr := func() error {
+		defer session.stdinMu.Unlock()
+		_, err := fmt.Fprintln(session.Stdin, line)
+		return err
+	}()
+	if err := writeErr; err != nil {
 		logSession(session.ID, "%s[session] Failed to send initial prompt to %s: %v%s\n",
 			colorRed, session.ID, err, colorReset)
 		return
@@ -1397,6 +1553,14 @@ func (sm *SessionManager) SendInputAccepting(id, text string, accept func() erro
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).
 	writeDone := make(chan error, 1)
 	go func() {
+		// stdinMu, not session.mu: this goroutine outlives the select below
+		// when the budget is spent, and an abandoned write must still finish
+		// before any other writer touches the pipe. Taking it here rather
+		// than around the select is deliberate — the caller already holds
+		// session.mu, and holding stdinMu across a timeout would let a
+		// wedged pipe block the initial prompt of an unrelated start.
+		session.stdinMu.Lock()
+		defer session.stdinMu.Unlock()
 		_, err := fmt.Fprintln(session.Stdin, payload)
 		writeDone <- err
 	}()
@@ -2776,6 +2940,101 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 
 // waitForExit waits for the session's process to exit and publishes a
 // session_ended result.
+// startAckWaitBudget bounds how long a terminal frame waits for the START it
+// belongs to.
+//
+// Short, because it is a BACKSTOP rather than the mechanism. The barrier is
+// closed by a defer in startSession, so by the time any terminal frame can be
+// published the start has returned — which is exactly the state the reversal
+// needed: it required startSession to still be BLOCKED in the initial stdin
+// write while the child died. The budget exists only for a path that somehow
+// publishes a terminal frame without the start having returned at all, and the
+// frame must win there, because the server releases its session fence on it.
+//
+// Only a caller that declared ExpectStartAck is ever waited for, so this budget
+// is not paid by the twelve test files that drive a real start with no Pub/Sub
+// handler. That matters: when every teardown paid it, the suite went from 544s
+// to 692s and pushed a wall-clock test over its budget under load. The
+// expectation is the fix for that; this is the backstop for a handler that
+// declared the undertaking and then failed to answer.
+const startAckWaitBudget = 2 * time.Second
+
+// ExpectStartAck declares that the caller will publish an answer to this
+// session's start — `session_started` on success, `session_error` on
+// failure — and that a terminal frame may therefore wait for it.
+//
+// Called BEFORE StartSession, because the session does not exist yet: the id
+// is recorded here and consumed when the session is constructed.
+//
+// A caller that does not call this gets the old behaviour exactly: the
+// terminal frame publishes immediately. That is correct rather than merely
+// convenient — a start nobody answers cannot be overtaken by its own answer.
+func (sm *SessionManager) ExpectStartAck(id string) {
+	if id == "" {
+		return
+	}
+	sm.expectStartAckMu.Lock()
+	defer sm.expectStartAckMu.Unlock()
+	if sm.expectStartAck == nil {
+		sm.expectStartAck = make(map[string]bool)
+	}
+	sm.expectStartAck[id] = true
+}
+
+// consumeStartAckExpectation reports whether this id was declared, and clears
+// it. Cleared on consumption so a later session reusing the id does not
+// inherit a promise nobody made for it.
+func (sm *SessionManager) consumeStartAckExpectation(id string) bool {
+	sm.expectStartAckMu.Lock()
+	defer sm.expectStartAckMu.Unlock()
+	if !sm.expectStartAck[id] {
+		return false
+	}
+	delete(sm.expectStartAck, id)
+	return true
+}
+
+// MarkStartAcknowledged records that this session's start has been answered
+// to the server. Idempotent: the success and failure paths may both reach it.
+func (s *CLISession) MarkStartAcknowledged() {
+	if s == nil {
+		return
+	}
+	s.startAckOnce.Do(func() {
+		if s.startAck != nil {
+			close(s.startAck)
+		}
+	})
+}
+
+// MarkSessionStartAcknowledged is the manager-level entry point, so the
+// Pub/Sub handler does not need the session struct.
+func (sm *SessionManager) MarkSessionStartAcknowledged(id string) {
+	sm.mu.RLock()
+	session := sm.sessions[id]
+	sm.mu.RUnlock()
+	session.MarkStartAcknowledged()
+}
+
+// awaitStartAck blocks until this session's start was acknowledged, the
+// budget is spent, or the session has no barrier (a struct built by a test).
+//
+// Returns at once when nobody undertook to answer the start, which is every
+// caller but the Pub/Sub handler. Nothing is being raced in that case: the
+// reversal this barrier prevents is a terminal frame overtaking the start
+// frame, and there is no start frame.
+func (s *CLISession) awaitStartAck() {
+	if s == nil || s.startAck == nil || !s.startAckExpected {
+		return
+	}
+	select {
+	case <-s.startAck:
+	case <-time.After(startAckWaitBudget):
+		logSession(s.ID, "%s[session] Publishing session_ended for %s without a start acknowledgement (waited %s)%s\n",
+			colorYellow, s.ID, startAckWaitBudget, colorReset)
+	}
+}
+
 func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc) {
 	// Set up per-session timeout — kill the process if it exceeds timeoutMs
 	var timeoutTimer *time.Timer
@@ -2939,6 +3198,11 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's, atomically
 	// re-reserving an already-unclaimed ID against Start's registration.
+	// Never before the START this frame belongs to: the server releases its
+	// fence on this message, and a reversed pair leaves it tracking a dead
+	// session as live.
+	session.awaitStartAck()
+
 	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
@@ -4921,23 +5185,141 @@ func interruptProcess(cmd *exec.Cmd) error {
    Shutdown helper
    -------------------------------------------------------------------------- */
 
-// ShutdownAllSessions gracefully ends all active sessions.
-// Called during application shutdown.
+// sessionShutdownBudget bounds the graceful half of ShutdownAllSessions.
+// EndSession waits gracefulShutdownTimeout (5s) for an interrupted child and
+// then killConfirmTimeout (30s) for the exit watcher, so taking the sessions
+// one after another would cost minutes — while gracefulShutdown's tightest
+// caller gives the WHOLE sequence 2s (the Windows CTRL_LOGOFF/CTRL_SHUTDOWN
+// handler) or 4s (CTRL_CLOSE_EVENT). A Quit that hangs is worse than an
+// orphan, so the interrupts go out together, share one budget, and whatever
+// has not exited when it runs out is force-killed with no further wait: this
+// process is about to die and the point is that its children die with it.
+// A var so tests can shorten it.
+var sessionShutdownBudget = 2 * time.Second
+
+// sessionShutdownBudgetFor is sessionShutdownBudget capped at HALF of what is
+// left of the caller's shutdown deadline, so the resident CLI managers, ttyd
+// and tmux that follow it in tearDownSubprocesses keep the other half. It
+// mirrors antigravityShutdownDrainBudget, which splits the same deadline with
+// notifyOffline for the same reason.
+//
+// This matters because the budget above is NOT the deadline: notifyOffline and
+// the usage drains run before teardown and spend from the same window, and the
+// Windows console handler hands the whole sequence 2s on CTRL_LOGOFF /
+// CTRL_SHUTDOWN and 4s on CTRL_CLOSE_EVENT. A fresh, context-independent
+// graceful window could therefore run past the OS deadline, Windows would kill
+// the agent before the force path ever executed, and the orphan would survive —
+// precisely the outcome this teardown exists to prevent. An expired or
+// cancelled deadline leaves no graceful window at all and goes straight to the
+// force path. No deadline (and a nil ctx) leaves the full bound.
+func sessionShutdownBudgetFor(ctx context.Context, now time.Time) time.Duration {
+	budget := sessionShutdownBudget
+	if ctx == nil {
+		return budget
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, max(deadline.Sub(now)/2, 0))
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	return budget
+}
+
+// ShutdownAllSessions ends every active session within the full
+// sessionShutdownBudget. Callers on a deadline use ShutdownAllSessionsWithin.
 func (sm *SessionManager) ShutdownAllSessions() {
-	sm.mu.RLock()
-	ids := make([]string, 0, len(sm.sessions))
-	for id := range sm.sessions {
-		ids = append(ids, id)
-	}
-	sm.mu.RUnlock()
+	sm.ShutdownAllSessionsWithin(sessionShutdownBudget)
+}
 
-	if len(ids) > 0 {
-		logSession("", "%s[session] Shutting down %d active session(s)...%s\n",
-			colorYellow, len(ids), colorReset)
+// ShutdownAllSessionsWithin ends every active session, spending at most window
+// on the graceful half. Called from tearDownSubprocesses (shutdown.go) for the
+// same reason the resident CLI managers are: nothing else ends a session_start
+// child. Before it was wired in, a tray Quit left every pipe/PTY CLI running —
+// on Windows the session's kill-on-close Job Object closes with the agent, but
+// on macOS and Linux there is no such containment (process_ownership_unix.go),
+// so the CLI kept drawing on the account's allowance until a later boot's
+// ledger reap found it (session_ledger.go).
+//
+// A window of zero or less skips the graceful half entirely: the caller's
+// deadline is already gone, so the children are killed now rather than after a
+// wait this process will not survive.
+//
+// Ownership is the sessions THIS process started and still holds: the entries
+// of sm.sessions, each ended through its own os.Process handle. Nothing is
+// matched by name, by port, or by scanning the process table. Ending a session
+// ends its process TREE (killSessionProcess → KillProcessTree, and EndSession's
+// `taskkill /PID … /T`), because a helper a CLI we started launched is
+// something we started transitively — dropping that is how the orphans come
+// back. What the platform did NOT start is never touched (plan §5.5).
+func (sm *SessionManager) ShutdownAllSessionsWithin(window time.Duration) {
+	// The clock starts HERE, before the manager lock is acquired, so window
+	// bounds the WHOLE operation rather than only the part after the snapshot.
+	// (startSession no longer holds mu across the child's initial stdin write,
+	// so a wedged child can no longer starve this acquisition either.)
+	deadline := time.Now().Add(window)
+
+	// Closing the manager to new starts and taking the snapshot happen in ONE
+	// hold of the write lock, which is what makes the snapshot final: after
+	// this, startSession can only refuse, so no child exists that this call
+	// does not know about.
+	sm.mu.Lock()
+	sm.closed = true
+	sessions := make(map[string]*CLISession, len(sm.sessions))
+	for id, session := range sm.sessions {
+		sessions[id] = session
+	}
+	sm.mu.Unlock()
+
+	if len(sessions) == 0 {
+		return
 	}
 
-	for _, id := range ids {
-		_ = sm.EndSession(id)
+	graceful := time.Until(deadline)
+	if graceful <= 0 {
+		logSession("", "%s[session] Shutting down %d active session(s): no graceful window left, killing now%s\n",
+			colorRed, len(sessions), colorReset)
+	} else {
+		logSession("", "%s[session] Shutting down %d active session(s) (graceful window %s)...%s\n",
+			colorYellow, len(sessions), graceful.Round(time.Millisecond), colorReset)
+
+		var wg sync.WaitGroup
+		for id := range sessions {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				_ = sm.EndSession(id)
+			}(id)
+		}
+		ended := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(ended)
+		}()
+		select {
+		case <-ended:
+			return
+		case <-time.After(graceful):
+		}
+	}
+
+	// Window spent (or never granted). Force whatever is still running. The
+	// in-flight EndSession goroutines are abandoned rather than awaited — an
+	// unconfirmed kill is the next boot's reap to resolve, and blocking here is
+	// exactly what wedges a Quit. killSessionProcess takes the process TREE, so
+	// a helper the CLI launched goes with it.
+	for id, session := range sessions {
+		select {
+		case <-processExitSignal(session.processExited, session.done):
+			continue
+		default:
+		}
+		logSession(id, "%s[session] Force killing session %s: shutdown window (%s) spent%s\n",
+			colorRed, id, max(graceful, 0).Round(time.Millisecond), colorReset)
+		if err := killSessionProcess(session); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			logSession(id, "%s[session] Shutdown kill failed for %s: %v%s\n",
+				colorRed, id, err, colorReset)
+		}
 	}
 }
 
