@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -279,4 +280,44 @@ func TestRefuseLinkedComponents(t *testing.T) {
 // Windows separators that a raw JSON literal would read as escapes.
 func quoteJSON(s string) string {
 	return `"` + strings.ReplaceAll(s, `\`, `\\`) + `"`
+}
+
+// ─── the device advertises the built-ins ────────────────────────────────────
+
+// Contract pin: "worktreeBuiltIns" is the wire key terminal-service reads
+// (shared-constants DEVICE_WORKTREE_CAPABILITIES.BUILT_INS). Renaming it makes
+// every already-released agent read as legacy, so the literal IS the assertion
+// here — the same reason readOnlySessions is pinned this way.
+func TestCapabilities_ReportWorktreeBuiltIns(t *testing.T) {
+	raw, err := json.Marshal(newMachineCapabilities())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["worktreeBuiltIns"] != true {
+		t.Fatalf("capabilities JSON = %s, want worktreeBuiltIns true", raw)
+	}
+	// Never omitempty: the server reads absent as "cannot", and a build that
+	// one day reports false must say so rather than vanish from the map.
+	if _, present := got["worktreeBuiltIns"]; !present {
+		t.Fatal("worktreeBuiltIns was omitted from the capabilities JSON")
+	}
+}
+
+// The flag must be true in exactly the build that HAS the commands, so these
+// two facts are asserted together rather than in separate files where they
+// could drift apart.
+func TestCapabilityMatchesTheCommandsThisBuildHandles(t *testing.T) {
+	caps := newMachineCapabilities()
+	for _, name := range worktreeBuiltIns() {
+		if !isWorktreeDeviceCommand(name) {
+			t.Fatalf("%s is advertised by the capability but not recognised", name)
+		}
+	}
+	if !caps.WorktreeBuiltIns {
+		t.Fatal("this build handles the worktree commands but does not advertise them")
+	}
 }
