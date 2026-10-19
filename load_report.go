@@ -415,6 +415,19 @@ func materialChange(prev, next deviceLoadReport, changePercent int64) bool {
 		prev.CLIProcesses != next.CLIProcesses {
 		return true
 	}
+	// A CHANGE IN COVERAGE IS A CHANGE IN WHAT THE RSS FIGURE MEANS, so it is
+	// material even when every number beside it holds still.
+	//
+	// The case that bites: a transient probe failure clears while the process
+	// count stays put, so the sample goes from partial to COMPLETE — the only
+	// kind the peak dataset may use. Nothing else in this function moved, so
+	// the complete sample would wait up to maxInterval; if the run ends inside
+	// that window the next report carries zero processes, and the run
+	// contributes no usable RSS measurement at all. Precisely the dataset the
+	// qualifier was added to make usable. (Codex, PR #233.)
+	if prev.CLIRssRead != next.CLIRssRead {
+		return true
+	}
 	// A metric that became readable (or stopped being readable) is a change.
 	if (prev.CPULoadPct < 0) != (next.CPULoadPct < 0) ||
 		(prev.MemAvailableMB < 0) != (next.MemAvailableMB < 0) {

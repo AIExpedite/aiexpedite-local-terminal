@@ -374,6 +374,7 @@ func TestMaterialChange(t *testing.T) {
 		CPULoadPct:      40,
 		CLIProcesses:    1,
 		CLIRssMB:        512,
+		CLIRssRead:      1,
 		ActiveSessions:  1,
 		PresenceState:   presenceStateActive,
 		PresenceSinceMs: 1000,
@@ -405,6 +406,12 @@ func TestMaterialChange(t *testing.T) {
 		{"a new session is material", change(func(r *deviceLoadReport) { r.ActiveSessions = 2 }), true},
 		{"a new CLI process is material", change(func(r *deviceLoadReport) { r.CLIProcesses = 2 }), true},
 		{"a metric becoming unreadable is material", change(func(r *deviceLoadReport) { r.CPULoadPct = loadMetricUnreadable }), true},
+		// A change in COVERAGE changes what the RSS figure means, so it is
+		// material even when every number beside it holds still. The partial ->
+		// complete case is the one that bites: nothing else moves, so the only
+		// sample the peak dataset may use would wait out maxInterval and be
+		// lost if the run ended first.
+		{"coverage becoming partial is material", change(func(r *deviceLoadReport) { r.CLIRssRead = 0 }), true},
 		{"memory becoming unreadable is material", change(func(r *deviceLoadReport) { r.MemAvailableMB = loadMetricUnreadable }), true},
 	}
 	for _, c := range cases {
@@ -414,6 +421,20 @@ func TestMaterialChange(t *testing.T) {
 			}
 		})
 	}
+
+	// Isolated deliberately: the process count must NOT move, or the case
+	// proves nothing — a changed cliProcesses is already material on its own,
+	// and an earlier version of this test accidentally asserted that instead.
+	t.Run("coverage becoming complete is material with the process count held still", func(t *testing.T) {
+		partial := base
+		partial.CLIProcesses, partial.CLIRssRead = 3, 1
+		complete := partial
+		complete.CLIRssRead = 3
+
+		if !materialChange(partial, complete, loadReportChangePercent) {
+			t.Fatal("partial -> complete was not material, so the only sample the peak dataset may use waits out maxInterval")
+		}
+	})
 
 	t.Run("the first report is always material", func(t *testing.T) {
 		if !materialChange(deviceLoadReport{}, base, loadReportChangePercent) {
