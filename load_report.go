@@ -82,6 +82,9 @@ const (
 	// derived from anything this build knows, and far above any plausible
 	// number of CLI processes on one computer.
 	loadRSSPidCap = 64
+	// loadReportSignedVersionCoverage is the first canonical that authenticates
+	// the RSS coverage qualifier, and the one this build signs with.
+	loadReportSignedVersionCoverage = 2
 )
 
 // Memory pressure (shared-constants MEM_PRESSURE_LEVELS). Mirrored here for
@@ -134,7 +137,12 @@ type deviceLoadReport struct {
 	// cap, and the figure is an UNDERCOUNT that must not be taken for a
 	// peak. Outside the signed canonical on purpose — see
 	// buildDeviceLoadReportSignedMessage.
-	CLIRssRead     int64 `json:"cliRssRead"`
+	CLIRssRead int64 `json:"cliRssRead"`
+	// SignedVersion is WHICH CANONICAL the signature covers, not the stored
+	// document's version — one says how the bytes were authenticated, the
+	// other what shape the server wrote. See
+	// buildDeviceLoadReportSignedMessage.
+	SignedVersion  int64 `json:"signedVersion"`
 	ActiveSessions int64 `json:"activeSessions"`
 	OnBattery      bool  `json:"onBattery"`
 
@@ -149,22 +157,33 @@ type deviceLoadReport struct {
 // buildDeviceLoadReportSignedMessage mirrors terminal-service's
 // buildDeviceLoadReportSignedMessage (src/utils/hmac.util.js) byte for byte.
 //
-// IT IS CLOSED TO ADDITIONS. Both repositories pin this string in
-// testdata/device_load_report_vectors.json, so a field added here is a flag
-// day: agents update on their own cadence and routinely run ahead of the
-// service, and a new agent's signature would not verify on a server that had
-// not shipped the matching canonical yet — every report from every updated
-// computer refused until the two meet. Measurement metadata such as
-// cliRssRead therefore travels as an additive unsigned field, which is what
-// the tolerant-reader rule asks for and costs nothing: a report cannot be
-// submitted without a valid signature over the fields below, so forging the
-// metadata needs the device secret, and that already forges the measurement.
+// IT IS VERSIONED, NOT CLOSED. Both repositories pin these strings in
+// testdata/device_load_report_vectors.json, so changing one in place is a
+// flag day: agents update on their own cadence, and a signature the server
+// cannot reconstruct refuses every report from every updated computer until
+// the two meet. Adding a VERSION instead keeps v1 byte for byte what the
+// fleet signs today while letting new fields be authenticated.
 //
-// The canonical:
+// v1 — what every agent in the field signs:
 //
 //	agentId:timestamp:memTotalMB:memAvailableMB:memPressure:swapUsedMB:
 //	cpuLoadPct:cliProcesses:cliRssMB:activeSessions:onBattery:presenceState:
 //	presenceSinceMs
+//
+// v2 — appends the RSS coverage and the version itself:
+//
+//	…:presenceSinceMs:cliRssRead:2
+//
+// THE VERSION IS INSIDE THE MATERIAL IT SELECTS. Without it, flipping the
+// body's signedVersion would quietly choose the other canonical; with it the
+// signature stops matching, so a downgrade is a refusal rather than a
+// reinterpretation. (Codex, PR #233.)
+//
+// A canonical the SERVER does not know cannot be verified either, so
+// terminal-service ships before an agent that signs a newer one — the
+// natural order here, since an agent release needs the physical signing
+// token. An unknown version is answered there by name
+// (UNSUPPORTED_REPORT_VERSION) rather than as a signature mismatch.
 //
 // Integers only, base 10, and `onBattery` as 1/0 — no float ever enters the
 // canonical, because Go's and JavaScript's float formatting do not agree and a
@@ -175,7 +194,7 @@ func buildDeviceLoadReportSignedMessage(agentID string, r deviceLoadReport) stri
 	if r.OnBattery {
 		battery = "1"
 	}
-	return fmt.Sprintf("%s:%d:%d:%d:%s:%d:%d:%d:%d:%d:%s:%s:%d",
+	v1 := fmt.Sprintf("%s:%d:%d:%d:%s:%d:%d:%d:%d:%d:%s:%s:%d",
 		agentID,
 		r.Timestamp,
 		r.MemTotalMB,
@@ -190,6 +209,10 @@ func buildDeviceLoadReportSignedMessage(agentID string, r deviceLoadReport) stri
 		r.PresenceState,
 		r.PresenceSinceMs,
 	)
+	if r.SignedVersion < loadReportSignedVersionCoverage {
+		return v1
+	}
+	return fmt.Sprintf("%s:%d:%d", v1, r.CLIRssRead, r.SignedVersion)
 }
 
 // deviceLoadReportResponse is what terminal-service answers.
@@ -299,6 +322,7 @@ func sampleDeviceLoad(now time.Time) deviceLoadReport {
 		CLIProcesses:    loadMetricUnreadable,
 		CLIRssMB:        loadMetricUnreadable,
 		CLIRssRead:      0,
+		SignedVersion:   loadReportSignedVersionCoverage,
 		ActiveSessions:  loadMetricUnreadable,
 		PresenceState:   presenceStateNotReported,
 		PresenceSinceMs: loadMetricUnreadable,
