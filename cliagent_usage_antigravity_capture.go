@@ -283,6 +283,30 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	go c.resolveWrapper(wrapperPID, gen, stop, done)
 }
 
+// antigravityFinishNoteLockWait bounds how long Finish will wait for the
+// ordering lock. Long enough to cover a resolver mid-note or a concurrent
+// SetWrapper, short enough that a turn never notices.
+const antigravityFinishNoteLockWait = 250 * time.Millisecond
+
+// lockNoteFor acquires noteMu within d, reporting whether it got it. A plain
+// Lock would make Finish — and therefore the turn it is deferred from — wait
+// on another goroutine for as long as that goroutine takes.
+func (c *antigravityRunCapture) lockNoteFor(d time.Duration) bool {
+	if c.noteMu.TryLock() {
+		return true
+	}
+	deadline := time.Now().Add(d)
+	for {
+		time.Sleep(time.Millisecond)
+		if c.noteMu.TryLock() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+	}
+}
+
 // releaseAntigravityCapturedPID lets a capture's agy PID go: a process that
 // outlived its wrapper goes to discovery, anything else is marked exited.
 // Never called with c.mu or the index lock held.
@@ -387,12 +411,25 @@ func (c *antigravityRunCapture) Finish() {
 			}
 			grace.Stop()
 		}
-		// Taken only AFTER the grace wait above. A resolver still running past
-		// the grace may be blocked in setPID waiting for this; holding it
-		// across the wait for `done` would deadlock until the grace expired.
-		// Once this is released that resolver proceeds and finds `finished`,
-		// so it notes nothing and the release below stands.
-		c.noteMu.Lock()
+		// Taken only AFTER the grace wait above, and only for a BOUNDED time.
+		//
+		// This runs from `defer quotaCapture.Finish()` on the native turn's
+		// return path, whose call site promises the capture "never fails and
+		// never blocks; a missed capture costs freshness, not the turn". An
+		// unbounded wait here breaks that promise and stalls the turn behind
+		// whoever holds the lock — a shape that only bites under load.
+		//
+		// The ordering is worth a short wait and no more. Uncontended is the
+		// common case: the grace above waited for the resolver to EXIT, and a
+		// closed `done` means no note can still be in flight. When it is
+		// contended the holder is a resolver mid-note or a concurrent
+		// SetWrapper, both brief. And if the bound is reached, proceeding is
+		// exactly what this did before the ordering existed — a late note may
+		// resurrect the PID, which the boot reap settles. Freshness, never the
+		// turn.
+		if c.lockNoteFor(antigravityFinishNoteLockWait) {
+			defer c.noteMu.Unlock()
+		}
 		c.mu.Lock()
 		c.finished = true
 		pid := c.pid
@@ -402,7 +439,6 @@ func (c *antigravityRunCapture) Finish() {
 		// which owes its reading and re-reads its block for evidence when it
 		// really exits.
 		releaseAntigravityCapturedPID(pid, c.floor)
-		c.noteMu.Unlock()
 
 		if c.polled {
 			antigravityCaptureMu.Lock()

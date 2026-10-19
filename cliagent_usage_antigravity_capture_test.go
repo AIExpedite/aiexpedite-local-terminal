@@ -1323,3 +1323,47 @@ func TestAntigravityRunCapture_ReRootReplacesAResolvedPID(t *testing.T) {
 	}
 	helperStopCapture(t, capture.Finish)
 }
+
+// Finish runs from `defer quotaCapture.Finish()` on the native turn's return
+// path, and that call site promises the capture "never fails and never blocks;
+// a missed capture costs freshness, not the turn". #232 gave it an unbounded
+// wait on the ordering lock, which breaks that promise and stalls the turn
+// behind whoever holds it — the shape CI showed as a 30s timeout in
+// TestAntigravityNativeManager_EndWaitsForInFlightTurn.
+func TestAntigravityCaptureFinishDoesNotBlockOnAHeldNoteLock(t *testing.T) {
+	// A bare capture, so nothing else in the package shares its lock.
+	capture := &antigravityRunCapture{floor: time.Now()}
+
+	// A holder that keeps the ordering lock for longer than any turn should
+	// wait, and owns the unlock itself.
+	capture.noteMu.Lock()
+	releaseHolder := make(chan struct{})
+	holderDone := make(chan struct{})
+	go func() {
+		defer close(holderDone)
+		<-releaseHolder
+		capture.noteMu.Unlock()
+	}()
+
+	done := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		capture.Finish()
+		done <- time.Since(start)
+	}()
+
+	select {
+	case took := <-done:
+		// The bound, with generous room for a loaded machine. The point is
+		// that it RETURNS while the lock is still held, not the exact figure.
+		if took > antigravityFinishNoteLockWait+5*time.Second {
+			t.Fatalf("Finish took %s while the note lock was held — the turn waits behind it", took)
+		}
+	case <-time.After(20 * time.Second):
+		close(releaseHolder)
+		<-holderDone
+		t.Fatal("Finish never returned while the note lock was held: the turn is stalled")
+	}
+	close(releaseHolder)
+	<-holderDone
+}
