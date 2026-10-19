@@ -200,7 +200,47 @@ func remoteOrDefault(remote string) string {
 // a ref name reaches `git push` as an argument, and `..`, a trailing `.lock`, a
 // leading or trailing `/` and a leading `-` are all either refused by git or
 // change what the command means.
+//
+// It anchors the first character of the WHOLE ref, which is always the `a` of
+// `aix/`, so on its own it says nothing about the later components. Each one is
+// checked separately by safeRefComponent below — git's rule is per component,
+// and reading this pattern as if it covered them is what let
+// `aix/rescue/<feature>/.github-7b3c91` through.
 var safeRefNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$`)
+
+// safeRefComponent reports whether one `/`-separated piece of a ref is one git
+// will accept: git refuses a component that begins with a dot, and one that
+// ends with a dot is the same class of trap as a trailing `.lock`.
+//
+// A LEADING DASH IS FINE HERE and refusing it was an over-correction. Git
+// documents that a dash may begin a ref component, and every ref this
+// validator sees starts with `aix/` — the argument reaching git is
+// `HEAD:refs/heads/aix/rescue/<feature>/<repo>`, so a dash deeper in it can
+// never be read as an option. Refusing it instead blocked every removal of a
+// worktree whose folder legitimately begins with `-` (which the path policy
+// explicitly permits), rescue push or not. The guard against an
+// option-looking ARGUMENT belongs where an argument is built, not here.
+// (Codex, PR #230.)
+func safeRefComponent(part string) bool {
+	if part == "" {
+		return false
+	}
+	return !strings.HasPrefix(part, ".") && !strings.HasSuffix(part, ".")
+}
+
+// refComponentFromFolder turns a repository FOLDER name into something usable
+// as a ref component. The only case needing work is a leading dot: `.github`
+// is an ordinary repository, its worktree folder is legal, and
+// `aix/rescue/<feature>/.github-7b3c91` is not a ref git will create.
+//
+// Leading dots are stripped rather than escaped, and that stays unique because
+// of the discriminator: `.github` and `github` are different repositories, so
+// their folders carry different 6-hex suffixes and `github-<a>` can never
+// collide with `github-<b>`. Without the discriminator this would have been a
+// silent collision between two repositories' rescue branches.
+func refComponentFromFolder(folder string) string {
+	return strings.TrimLeft(folder, ".")
+}
 
 func validateRescueRef(ref string) (string, error) {
 	ref = strings.TrimSpace(ref)
@@ -217,6 +257,15 @@ func validateRescueRef(ref string) (string, error) {
 	}
 	if !safeRefNamePattern.MatchString(ref) {
 		return "", policyRefusal(ruleRescueRefUnsafe, fmt.Sprintf("rescue branch %q is not a safe ref name", ref))
+	}
+	// Per COMPONENT, because that is how git's rules work and the pattern above
+	// cannot express it: a dot-leading component is refused by `git push`, and a
+	// repository folder may legally begin with a dot (`.github`).
+	for _, part := range strings.Split(ref, "/") {
+		if !safeRefComponent(part) {
+			return "", policyRefusal(ruleRescueRefUnsafe,
+				fmt.Sprintf("rescue branch %q has the component %q, which git will not accept", ref, part))
+		}
 	}
 	return ref, nil
 }
@@ -298,6 +347,19 @@ type worktreeCompanionResult struct {
 	Target   string `json:"target,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// FetchFailed says this companion's own repository could not be fetched, so
+	// Target was resolved against whatever remote ref that checkout already
+	// held. Reported rather than fatal: the ref may be current enough, and the
+	// server needs to know the difference between "advanced to the newest
+	// default branch" and "advanced to the newest one we could see".
+	FetchFailed bool   `json:"fetchFailed,omitempty"`
+	FetchError  string `json:"fetchError,omitempty"`
+	// FetchSkipped says the REQUEST opted out of fetching, so no network call
+	// was attempted. Distinct from FetchFailed on purpose: "we chose not to
+	// look" and "we looked and could not see" imply different things about how
+	// stale Target may be, and collapsing them would make an offline run look
+	// like a broken one.
+	FetchSkipped bool `json:"fetchSkipped,omitempty"`
 }
 
 type worktreeEnsureResult struct {
@@ -405,7 +467,11 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 
 	// Step 4: companions.
 	for _, c := range req.Companions {
-		res.Companions = append(res.Companions, ensureCompanion(ctx, req.Root, c))
+		// The same switch the top-level fetch above honours.
+		res.Companions = append(
+			res.Companions,
+			ensureCompanion(ctx, req.Root, c, req.Fetch == nil || *req.Fetch),
+		)
 	}
 
 	// Step 4: reconcile (and optionally record) dependency provenance.
@@ -498,7 +564,12 @@ func createWorktree(ctx context.Context, mainRepo string, wt resolvedWorktreePat
 // local modifications, is left EXACTLY as it is and reported — nothing in the
 // platform should ever have committed in a companion, so this is a signal, not
 // a case to resolve silently.
-func ensureCompanion(ctx context.Context, root string, c worktreeCompanionSpec) worktreeCompanionResult {
+func ensureCompanion(
+	ctx context.Context,
+	root string,
+	c worktreeCompanionSpec,
+	fetchRemotes bool,
+) worktreeCompanionResult {
 	out := worktreeCompanionResult{Path: c.Path}
 	wt, err := resolveWorktreePath(root, c.Path)
 	if err != nil {
@@ -519,6 +590,41 @@ func ensureCompanion(ctx context.Context, root string, c worktreeCompanionSpec) 
 		out.Error = "companion has no defaultBranch"
 		out.Reason = "no_default_branch"
 		return out
+	}
+	// FETCH THIS COMPANION'S OWN REPOSITORY FIRST. Step 1 of the ensure
+	// sequence fetches the top-level repository, and a companion is usually a
+	// different checkout with its own object store — so without this the target
+	// below resolves against whatever stale
+	// `refs/remotes/<remote>/<defaultBranch>` that checkout happens to hold.
+	//
+	// That is the exact failure §4.4 step 4 exists to prevent: a companion
+	// created weeks ago, or advanced against a stale ref, has the feature
+	// building and testing against default-branch code that moved. Fetching per
+	// companion is the only way to know, because the object store is per
+	// checkout. (Codex, PR #229.)
+	//
+	// wtGitNetwork, NOT wtGit: this is a network call, and the ordinary local
+	// timeout would cancel a slow fetch and let the code proceed against the
+	// very stale ref the fetch exists to refresh — a silent version of the bug
+	// rather than a fix for it. The top-level fetch already uses this wrapper.
+	//
+	// Skipped when the request opts out of fetching. `fetch` is the one network
+	// switch an ensure has, so a caller using it for an offline or
+	// deterministic run must not be made to reach every companion's remote.
+	// `fetchSkipped` keeps that distinguishable from a fetch that was tried and
+	// failed, because the two mean different things about how stale the target
+	// below may be. (Both: Codex, PR #230.)
+	if fetchRemotes {
+		// A failed fetch is NOT fatal: the ref may still be good enough, and
+		// refusing a whole refresh because one companion's network call failed
+		// is worse than proceeding and reporting. The staleness is then bounded
+		// by whatever the last successful fetch left, and `fetchFailed` says so.
+		if _, ferr := wtGitNetwork(ctx, mainRepo, "fetch", remote, "--prune"); ferr != nil {
+			out.FetchFailed = true
+			out.FetchError = redactSensitiveData(ferr.Error())
+		}
+	} else {
+		out.FetchSkipped = true
 	}
 	target, err := wtRevParse(ctx, mainRepo, "refs/remotes/"+remote+"/"+defaultBranch)
 	if err != nil || target == "" {

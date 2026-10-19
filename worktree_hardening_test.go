@@ -321,3 +321,142 @@ func TestCapabilityMatchesTheCommandsThisBuildHandles(t *testing.T) {
 		t.Fatal("this build handles the worktree commands but does not advertise them")
 	}
 }
+
+// ─── a rescue ref is a REF, and refs are stricter than directories ──────────
+
+// Allowing a dot-leading repository folder (`.github`, legal and ordinary)
+// made the rescue ref `aix/rescue/<feature>/.github-7b3c91`, and git refuses a
+// ref whose component begins with a dot. The validator missed it because its
+// pattern anchors only the FIRST character of the whole ref — always the `a` of
+// `aix/` — so every later component went unchecked.
+func TestRescueRefRefusesAComponentGitWouldReject(t *testing.T) {
+	for _, bad := range []string{
+		"aix/rescue/feat-aabbccddeeff/.github-7b3c91",
+		"aix/rescue/.feat-aabbccddeeff/repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/repo-7b3c91.",
+	} {
+		if _, err := validateRescueRef(bad); err == nil {
+			t.Fatalf("%q was accepted as a rescue ref", bad)
+		}
+	}
+	// And the ordinary shape still passes.
+	for _, ok := range []string{
+		"aix/rescue/feat-aabbccddeeff/repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/my.repo-7b3c91",
+		"aix/rescue/feat-aabbccddeeff/github-7b3c91",
+		// A DASH may begin a ref component — git documents it, and the argument
+		// reaching git is `HEAD:refs/heads/aix/rescue/...`, so a dash this deep
+		// can never read as an option. Refusing it blocked every removal of a
+		// worktree whose folder legitimately begins with `-`, which the path
+		// policy explicitly permits.
+		"aix/rescue/feat-aabbccddeeff/-repo-7b3c91",
+	} {
+		if _, err := validateRescueRef(ok); err != nil {
+			t.Fatalf("%q was refused: %v", ok, err)
+		}
+	}
+}
+
+// The folder policy and the ref validator have to agree, or a folder the policy
+// admits cannot be rescued. This asserts the agreement directly rather than
+// restating either rule, so the next change to one of them fails here.
+func TestEveryAdmissiblePolicyFolderBuildsAValidRescueRef(t *testing.T) {
+	for _, folder := range []string{
+		"frontend-7b3c91",
+		".github-7b3c91",
+		"_repo-7b3c91",
+		"-repo-7b3c91",
+		"my.repo.v2-7b3c91",
+		"..-7b3c91",
+	} {
+		rel := "aixwt/" + wtTestFeatureFolder + "/" + folder
+		if !worktreeRelativePathPattern.MatchString(rel) {
+			t.Fatalf("%q is not admitted by the path policy; fix the test, not the rule", rel)
+		}
+		ref := "aix/rescue/" + refComponentFromFolder(wtTestFeatureFolder) +
+			"/" + refComponentFromFolder(folder)
+		if _, err := validateRescueRef(ref); err != nil {
+			t.Fatalf("policy admits folder %q but its rescue ref %q is refused: %v", folder, ref, err)
+		}
+	}
+}
+
+// The folder a removal rescues from may begin with a dot; the ref it pushes to
+// may not. Stripping leading dots stays unique BECAUSE of the discriminator:
+// `.github` and `github` are different repositories, so their folders carry
+// different 6-hex suffixes and the two rescue branches cannot collide.
+func TestRefComponentFromFolderIsRefSafeAndStillUnique(t *testing.T) {
+	cases := map[string]string{
+		"frontend-7b3c91": "frontend-7b3c91",
+		".github-7b3c91":  "github-7b3c91",
+		"..weird-7b3c91":  "weird-7b3c91",
+		"_repo-7b3c91":    "_repo-7b3c91",
+	}
+	for folder, want := range cases {
+		if got := refComponentFromFolder(folder); got != want {
+			t.Fatalf("refComponentFromFolder(%q) = %q, want %q", folder, got, want)
+		}
+		ref := "aix/rescue/feat-aabbccddeeff/" + refComponentFromFolder(folder)
+		if _, err := validateRescueRef(ref); err != nil {
+			t.Fatalf("%q built an invalid rescue ref %q: %v", folder, ref, err)
+		}
+	}
+	// The collision the discriminator prevents: a repository named `.github`
+	// and one named `github` differ in their discriminator, so stripping the
+	// dot cannot make one rescue branch shadow the other.
+	a := refComponentFromFolder(".github-aaaaaa")
+	b := refComponentFromFolder("github-bbbbbb")
+	if a == b {
+		t.Fatalf("two repositories collapsed onto one rescue component: %q", a)
+	}
+}
+
+// ─── the companion fetch honours the request's one network switch ───────────
+
+// `fetch` is the only network switch an ensure has, so a caller using it for an
+// offline or deterministic run must not be made to reach every companion's
+// remote. And "we chose not to look" has to stay distinguishable from "we
+// looked and could not see", because the two mean different things about how
+// stale the companion's target may be.
+func TestEnsureCompanionHonoursTheFetchOptOut(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+
+	companion := func(fetch bool) worktreeCompanionResult {
+		t.Helper()
+		req := fx.ensureReq("feature/companion-fetch-" + map[bool]string{true: "on", false: "off"}[fetch])
+		req.Fetch = &fetch
+		req.Companions = []worktreeCompanionSpec{{
+			MainRepo:      fx.MainRepo,
+			Path:          fx.wtPath("lib-" + map[bool]string{true: "on", false: "off"}[fetch]),
+			DefaultBranch: fx.Default,
+			Remote:        "origin",
+		}}
+		res, err := ensureWorktree(ctx, req)
+		if err != nil {
+			t.Fatalf("ensure: %v", err)
+		}
+		if len(res.Companions) != 1 {
+			t.Fatalf("companions = %+v, want exactly one", res.Companions)
+		}
+		return res.Companions[0]
+	}
+
+	off := companion(false)
+	if !off.FetchSkipped {
+		t.Fatalf("fetch:false still fetched the companion's remote: %+v", off)
+	}
+	if off.FetchFailed {
+		t.Fatalf("an opted-out fetch must not report a FAILURE: %+v", off)
+	}
+
+	on := companion(true)
+	if on.FetchSkipped {
+		t.Fatalf("fetch:true skipped the companion's remote: %+v", on)
+	}
+	// The fixture's remote is local, so the fetch itself must succeed — if this
+	// ever fails it means the fetch is not actually being attempted.
+	if on.FetchFailed {
+		t.Fatalf("the companion fetch failed against a local remote: %+v", on)
+	}
+}

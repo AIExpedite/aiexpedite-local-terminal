@@ -104,7 +104,13 @@ func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRem
 
 	rescueRef := strings.TrimSpace(req.RescueBranch)
 	if rescueRef == "" {
-		rescueRef = "aix/rescue/" + wt.FeatureFolder + "/" + wt.RepoFolder
+		// refComponentFromFolder, not the raw folder: a repository folder may
+		// legally begin with a dot (`.github`) and a ref component may not, so
+		// the raw name would build a branch `git push` refuses — and it would
+		// refuse it at the LAST moment, after the removal decided the work was
+		// rescuable.
+		rescueRef = "aix/rescue/" + refComponentFromFolder(wt.FeatureFolder) +
+			"/" + refComponentFromFolder(wt.RepoFolder)
 	}
 	rescueRef, err = validateRescueRef(rescueRef)
 	if err != nil {
