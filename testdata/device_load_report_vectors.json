@@ -97,6 +97,57 @@
       },
       "message": "agent-1:1790000000000:-1:-1:normal:-1:-1:0:-1:0:0:idle:300000",
       "signature": "59294c924eaf55c88479f541b501a8e50e9c2002f19d0c7b0d6d7eeb8d36deb7"
+    },
+    {
+      "name": "v2-partial-rss-coverage",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": 65536,
+        "memAvailableMB": 20480,
+        "memPressure": "normal",
+        "swapUsedMB": 2048,
+        "cpuLoadPct": 37,
+        "cliProcesses": 3,
+        "cliRssMB": 100,
+        "cliRssRead": 1,
+        "activeSessions": 2,
+        "onBattery": false,
+        "presenceState": "active",
+        "presenceSinceMs": 42000,
+        "signedVersion": 2
+      },
+      "message": "agent-1:1790000000000:65536:20480:normal:2048:37:3:100:2:0:active:42000:1:2",
+      "signature": "39ade91c19d86fd5f9944fc300f224e2a84f765d44aa973a086b195ee9908881"
+    },
+    {
+      "name": "v2-whole-rss-coverage",
+      "secret": "secret",
+      "agentId": "agent-1",
+      "timestamp": 1790000000000,
+      "report": {
+        "memTotalMB": 16384,
+        "memAvailableMB": 8192,
+        "memPressure": "warn",
+        "swapUsedMB": 0,
+        "cpuLoadPct": 12,
+        "cliProcesses": 2,
+        "cliRssMB": 300,
+        "cliRssRead": 2,
+        "activeSessions": 1,
+        "onBattery": true,
+        "presenceState": "idle",
+        "presenceSinceMs": 600000,
+        "signedVersion": 2
+      },
+      "message": "agent-1:1790000000000:16384:8192:warn:0:12:2:300:1:1:idle:600000:2:2",
+      "signature": "69421dd3ec2412d35343588f69795e00faeed480bd46b866f14ef9a8daeb190f"
     }
-  ]
+  ],
+  "signedCanonicalVersions": {
+    "v1": 1,
+    "v2": 2,
+    "max": 2
+  }
 }
