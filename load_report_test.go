@@ -256,6 +256,76 @@ func TestSampleDeviceLoadReportsRSSUnreadableWhenEveryProbeFails(t *testing.T) {
 	if report.CLIRssMB != loadMetricUnreadable {
 		t.Fatalf("rss = %d, want the unreadable sentinel", report.CLIRssMB)
 	}
+	if report.CLIRssRead != 0 {
+		t.Fatalf("covered = %d, want 0 — nothing was read", report.CLIRssRead)
+	}
+}
+
+// THE FIGURE HAS TO SAY HOW MUCH OF THE MACHINE IT COVERS.
+//
+// Found in the fleet rather than in a test: the first Windows computer on
+// v1.1.14 reported `cliProcesses: 1` and no `cliRssMB` at all, while a mac
+// with no CLI running reported `cliRssMB: 0`. The figure went missing exactly
+// when a CLI was running. The all-failed case at least disappears visibly;
+// the PARTIAL case did not — one process read out of three was reported as a
+// whole total, an undercount indistinguishable from the real thing, and peak
+// RSS is the number Phase 0 exists to collect.
+func TestSampleDeviceLoadReportsHowManyProcessesTheRSSCovers(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		tracked  int
+		pids     []int
+		rss      map[int]uint64
+		wantMB   int64
+		wantRead int64
+	}{
+		{
+			name:    "no processes is a measurement of zero",
+			tracked: 0, pids: nil, rss: map[int]uint64{},
+			wantMB: 0, wantRead: 0,
+		},
+		{
+			name:    "every process read is a whole total",
+			tracked: 2, pids: []int{11, 12},
+			rss:    map[int]uint64{11: 100 * bytesPerMB, 12: 200 * bytesPerMB},
+			wantMB: 300, wantRead: 2,
+		},
+		{
+			// The one that was silent: the sum stands, and the count is what
+			// stops a reader taking 100MB for this computer's whole CLI load.
+			name:    "one of three read is a partial total, and says so",
+			tracked: 3, pids: []int{21, 22, 23},
+			rss:    map[int]uint64{22: 100 * bytesPerMB},
+			wantMB: 100, wantRead: 1,
+		},
+		{
+			name:    "none read is no measurement",
+			tracked: 2, pids: []int{31, 32}, rss: map[int]uint64{},
+			wantMB: loadMetricUnreadable, wantRead: 0,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			withOwnerSwitch(t, true)
+			withPresenceEnv(t, "", false)
+			withProbe(t, presenceSignals{})
+			withBatteryProbe(t, false)
+			withLoadProbes(t,
+				&mem.VirtualMemoryStat{Total: 16 * 1024 * bytesPerMB, Available: 8 * 1024 * bytesPerMB},
+				&mem.SwapMemoryStat{}, 0, true,
+				c.tracked, c.pids,
+				c.rss,
+			)
+
+			report := sampleDeviceLoad(time.Unix(1790000000, 0))
+
+			if report.CLIRssMB != c.wantMB {
+				t.Fatalf("rss = %dMB, want %dMB", report.CLIRssMB, c.wantMB)
+			}
+			if report.CLIRssRead != c.wantRead {
+				t.Fatalf("covered = %d of %d, want %d", report.CLIRssRead, report.CLIProcesses, c.wantRead)
+			}
+		})
+	}
 }
 
 func TestSampleDeviceLoadCapsTheRSSWalk(t *testing.T) {

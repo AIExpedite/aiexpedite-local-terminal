@@ -128,8 +128,15 @@ type deviceLoadReport struct {
 	CPULoadPct     int64  `json:"cpuLoadPct"`
 	CLIProcesses   int64  `json:"cliProcesses"`
 	CLIRssMB       int64  `json:"cliRssMB"`
-	ActiveSessions int64  `json:"activeSessions"`
-	OnBattery      bool   `json:"onBattery"`
+	// CLIRssRead is how many of the CLIProcesses actually contributed to
+	// CLIRssMB. Equal to CLIProcesses means the figure is a whole total;
+	// anything less means a process could not be read or the walk hit its
+	// cap, and the figure is an UNDERCOUNT that must not be taken for a
+	// peak. Outside the signed canonical on purpose — see
+	// buildDeviceLoadReportSignedMessage.
+	CLIRssRead     int64 `json:"cliRssRead"`
+	ActiveSessions int64 `json:"activeSessions"`
+	OnBattery      bool  `json:"onBattery"`
 
 	// PresenceState is one of the three PRESENCE_STATE values, or "" when this
 	// computer reports no presence (the owner's switch, the local override, or
@@ -140,7 +147,20 @@ type deviceLoadReport struct {
 }
 
 // buildDeviceLoadReportSignedMessage mirrors terminal-service's
-// buildDeviceLoadReportSignedMessage (src/utils/hmac.util.js) byte for byte:
+// buildDeviceLoadReportSignedMessage (src/utils/hmac.util.js) byte for byte.
+//
+// IT IS CLOSED TO ADDITIONS. Both repositories pin this string in
+// testdata/device_load_report_vectors.json, so a field added here is a flag
+// day: agents update on their own cadence and routinely run ahead of the
+// service, and a new agent's signature would not verify on a server that had
+// not shipped the matching canonical yet — every report from every updated
+// computer refused until the two meet. Measurement metadata such as
+// cliRssRead therefore travels as an additive unsigned field, which is what
+// the tolerant-reader rule asks for and costs nothing: a report cannot be
+// submitted without a valid signature over the fields below, so forging the
+// metadata needs the device secret, and that already forges the measurement.
+//
+// The canonical:
 //
 //	agentId:timestamp:memTotalMB:memAvailableMB:memPressure:swapUsedMB:
 //	cpuLoadPct:cliProcesses:cliRssMB:activeSessions:onBattery:presenceState:
@@ -278,6 +298,7 @@ func sampleDeviceLoad(now time.Time) deviceLoadReport {
 		CPULoadPct:      loadMetricUnreadable,
 		CLIProcesses:    loadMetricUnreadable,
 		CLIRssMB:        loadMetricUnreadable,
+		CLIRssRead:      0,
 		ActiveSessions:  loadMetricUnreadable,
 		PresenceState:   presenceStateNotReported,
 		PresenceSinceMs: loadMetricUnreadable,
@@ -305,16 +326,23 @@ func sampleDeviceLoad(now time.Time) deviceLoadReport {
 		pids = pids[:loadRSSPidCap]
 	}
 	var rss uint64
-	measured := false
+	read := 0
 	for _, pid := range pids {
 		if bytes, ok := loadProbeProcessRSS(pid); ok {
 			rss += bytes
-			measured = true
+			read++
 		}
 	}
-	if measured || len(pids) == 0 {
+	// How many processes the figure covers, counted against the TRUE number
+	// tracked (report.CLIProcesses, set before the cap) rather than against
+	// the capped walk — so a fleet with more than loadRSSPidCap CLIs reports
+	// a partial total honestly instead of a whole-looking one.
+	report.CLIRssRead = int64(read)
+	if read > 0 || len(pids) == 0 {
 		// Zero processes is a measurement of zero; a walk where every probe
-		// failed is not a measurement at all.
+		// failed is not a measurement at all. A walk where SOME probes failed
+		// is a partial one: the figure stands, and CLIRssRead says how much
+		// of the machine it accounts for.
 		report.CLIRssMB = int64(rss / bytesPerMB)
 	}
 
