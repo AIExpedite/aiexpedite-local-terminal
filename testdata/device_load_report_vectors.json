@@ -1,20 +1,12 @@
 {
   "version": 1,
   "presence": {
-    "states": [
-      "active",
-      "idle",
-      "away"
-    ],
+    "states": ["active", "idle", "away"],
     "activeWithinMs": 300000,
     "awayAfterMs": 1200000,
     "notReported": ""
   },
-  "memPressureLevels": [
-    "normal",
-    "warn",
-    "critical"
-  ],
+  "memPressureLevels": ["normal", "warn", "critical"],
   "unreadable": -1,
   "cadence": {
     "sampleIntervalMs": 30000,
