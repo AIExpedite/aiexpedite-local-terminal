@@ -1331,19 +1331,33 @@ func TestAntigravityRunCapture_ReRootReplacesAResolvedPID(t *testing.T) {
 // behind whoever holds it — the shape CI showed as a 30s timeout in
 // TestAntigravityNativeManager_EndWaitsForInFlightTurn.
 func TestAntigravityCaptureFinishDoesNotBlockOnAHeldNoteLock(t *testing.T) {
-	// A bare capture, so nothing else in the package shares its lock.
-	capture := &antigravityRunCapture{floor: time.Now()}
+	helperIsolateAntigravityCapture(t, "1h")
 
-	// A holder that keeps the ordering lock for longer than any turn should
-	// wait, and owns the unlock itself.
+	// A PID the release will actually act on. The first version of this test
+	// used a bare capture whose pid was 0, which made
+	// releaseAntigravityCapturedPID a no-op — so it never exercised the path it
+	// claimed to bound, and passed against code that still stalled. (Codex,
+	// PR #234.)
+	capture := startAntigravityQuotaCapture("finish must not stall the turn")
+	capture.SetPID(4242)
+
+	// BOTH locks held: the ordering lock, and the log index mutex the release
+	// itself needs. That is the real shape — `setPID` holds `noteMu` while its
+	// note waits for the index, so a Finish that bounds only the first wait
+	// still stalls on the second.
+	heldIndex := make(chan struct{})
+	releaseHolders := make(chan struct{})
+	holdersDone := make(chan struct{})
 	capture.noteMu.Lock()
-	releaseHolder := make(chan struct{})
-	holderDone := make(chan struct{})
 	go func() {
-		defer close(holderDone)
-		<-releaseHolder
+		defer close(holdersDone)
+		lockAntigravityLogIndex()
+		close(heldIndex)
+		<-releaseHolders
+		unlockAntigravityLogIndex()
 		capture.noteMu.Unlock()
 	}()
+	<-heldIndex
 
 	done := make(chan time.Duration, 1)
 	go func() {
@@ -1354,16 +1368,21 @@ func TestAntigravityCaptureFinishDoesNotBlockOnAHeldNoteLock(t *testing.T) {
 
 	select {
 	case took := <-done:
-		// The bound, with generous room for a loaded machine. The point is
-		// that it RETURNS while the lock is still held, not the exact figure.
-		if took > antigravityFinishNoteLockWait+5*time.Second {
-			t.Fatalf("Finish took %s while the note lock was held — the turn waits behind it", took)
+		// Generous for a loaded machine. The point is that Finish RETURNS while
+		// both locks are still held, not the exact figure.
+		if took > 5*time.Second {
+			t.Fatalf("Finish took %s while the note lock AND the log index were held", took)
 		}
 	case <-time.After(20 * time.Second):
-		close(releaseHolder)
-		<-holderDone
-		t.Fatal("Finish never returned while the note lock was held: the turn is stalled")
+		close(releaseHolders)
+		<-holdersDone
+		t.Fatal("Finish never returned while the note lock and log index were held: the turn is stalled")
 	}
-	close(releaseHolder)
-	<-holderDone
+
+	// The bookkeeping still happens — it just does not happen on the turn.
+	close(releaseHolders)
+	<-holdersDone
+	if !capture.waitReleased(10 * time.Second) {
+		t.Fatal("the release never completed after the locks were given up")
+	}
 }
