@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -159,29 +160,247 @@ func TestPresenceStateStartDatesIdleAndAwayFromTheTimer(t *testing.T) {
 
 	// Idle for 7 minutes: the state began 2 minutes ago, when the timer
 	// crossed the 5-minute threshold.
-	start := presenceStateStart(now, presenceStateIdle, presenceSignals{Idle: 7 * time.Minute, IdleOK: true})
-	if want := now.Add(-2 * time.Minute); !start.Equal(want) {
-		t.Fatalf("idle start = %v, want %v", start, want)
+	start, derived := presenceStateStart(now, presenceStateIdle, presenceSignals{Idle: 7 * time.Minute, IdleOK: true})
+	if want := now.Add(-2 * time.Minute); !start.Equal(want) || !derived {
+		t.Fatalf("idle start = %v (derived %v), want %v derived", start, derived, want)
 	}
 
 	// Idle for 25 minutes: away began 5 minutes ago.
-	start = presenceStateStart(now, presenceStateAway, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
-	if want := now.Add(-5 * time.Minute); !start.Equal(want) {
-		t.Fatalf("away start = %v, want %v", start, want)
+	start, derived = presenceStateStart(now, presenceStateAway, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
+	if want := now.Add(-5 * time.Minute); !start.Equal(want) || !derived {
+		t.Fatalf("away start = %v (derived %v), want %v derived", start, derived, want)
 	}
 
-	// Active, or a state known only from the lock signal, is dated now: the
-	// real start needs a history of the person's activity, which §8.3 forbids.
+	// Active, or a state known only from the lock signal, is dated now AND
+	// reported as not timer-derived: the real start needs a history of the
+	// person's activity, which §8.3 forbids. The second return is what keeps
+	// the tracker from re-dating these on every sample.
 	for _, c := range []struct {
 		state   string
 		signals presenceSignals
 	}{
 		{presenceStateActive, presenceSignals{Idle: time.Second, IdleOK: true}},
 		{presenceStateAway, presenceSignals{Locked: true, LockedOK: true}},
+		{presenceStateAway, presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 3 * time.Minute, IdleOK: true}},
 		{presenceStateIdle, presenceSignals{}},
 	} {
-		if start := presenceStateStart(now, c.state, c.signals); !start.Equal(now) {
-			t.Fatalf("%s start = %v, want %v", c.state, start, now)
+		start, derived := presenceStateStart(now, c.state, c.signals)
+		if !start.Equal(now) || derived {
+			t.Fatalf("%s start = %v (derived %v), want %v not derived", c.state, start, derived, now)
+		}
+	}
+}
+
+// THE INVARIANT ALL FOUR DEFECTS BROKE, asserted directly rather than as a
+// fifth special case.
+//
+// A state that has not changed must age by exactly the time that passed. Four
+// rounds of review found four ways to break that — a signal-derived `away`
+// re-dated every sample, the 20-minute crossing replacing a signal-derived
+// start, the same crossing again after a lock — and each was fixed in isolation
+// while the next one waited. So this walks a grid instead: every combination of
+// the signals that can assert a state, started either side of both thresholds,
+// sampled across the crossings.
+//
+// The grid has a second dimension because the first version of it MISSED round
+// 4, which is worth keeping in the file. Holding the signals constant and
+// letting the idle timer only climb never models the person coming BACK, and
+// that is precisely what that defect needed: a timer-derived `away`, then
+// input, then a lock holding the state while a fresh idle period climbs to its
+// own crossing. So a sequence may reset the idle timer once mid-way. While a
+// signal holds the state, input does not end it — only the state changing is
+// allowed to reset the age.
+//
+// It deliberately asserts nothing about WHICH state is reported (§8.2 owns
+// that) and nothing about how a start is dated — only that an unchanged state's
+// age tracks the clock.
+//
+// IT COVERS ONE DIRECTION ONLY, and the pair matters. This is the net for
+// re-dating a state that never stopped holding; the opposite error — NOT
+// re-dating when the person was active between two samples that happen to
+// classify alike — cannot be asserted here, because there a reset is the
+// correct answer. Mutation says so: blanking the re-dating branch entirely
+// leaves this test green and fails
+// TestPresenceAgeDoesNotSpanAnUnobservedTransition, which is that direction's
+// net. A change to this state machine should be mutation-checked against both.
+func TestPresenceAgeTracksTheClockWhileNobodyTouchesTheMachine(t *testing.T) {
+	const step = 2 * time.Minute
+	t0 := time.Unix(1790000000, 0)
+
+	// Signal shapes that can hold a state on their own, plus the plain
+	// idle-timer-only case. Each is held CONSTANT across a sequence: the point
+	// is a state nothing is changing.
+	shapes := []struct {
+		name                  string
+		locked, lockedOK      bool
+		displayOff, displayOK bool
+	}{
+		{name: "idle timer only"},
+		{name: "locked", locked: true, lockedOK: true},
+		{name: "display asleep", displayOff: true, displayOK: true},
+		{name: "locked and display asleep", locked: true, lockedOK: true, displayOff: true, displayOK: true},
+	}
+
+	// Start either side of the 5- and 20-minute thresholds so the sequences run
+	// across both crossings, which is where three of the four defects lived.
+	// resetAt 0 means nobody ever touches the machine; otherwise the idle timer
+	// restarts at that sample, as one keypress would restart it.
+	for _, startIdle := range []time.Duration{
+		0, 30 * time.Second, 4 * time.Minute, 6 * time.Minute,
+		18 * time.Minute, 19 * time.Minute, 25 * time.Minute,
+	} {
+		for _, resetAt := range []int{0, 1, 3, 8} {
+			for _, shape := range shapes {
+				name := fmt.Sprintf("%s/idle=%s/reset=%d", shape.name, startIdle, resetAt)
+				t.Run(name, func(t *testing.T) {
+					tracker := &presenceTracker{}
+					var prevState string
+					var prevAge int64
+					var prevAt time.Time
+
+					for i := 0; i < 20; i++ {
+						at := t0.Add(time.Duration(i) * step)
+						idle := startIdle + time.Duration(i)*step
+						if resetAt > 0 && i >= resetAt {
+							// One keypress at `resetAt`, then nothing again.
+							idle = 30*time.Second + time.Duration(i-resetAt)*step
+						}
+						got := tracker.observe(at, presenceSignals{
+							Idle:         idle,
+							IdleOK:       true,
+							Locked:       shape.locked,
+							LockedOK:     shape.lockedOK,
+							DisplayOff:   shape.displayOff,
+							DisplayOffOK: shape.displayOK,
+						})
+						if got.AgeMs < 0 {
+							t.Fatalf("sample %d: negative age %dms", i, got.AgeMs)
+						}
+						if i > 0 && got.State == prevState {
+							elapsed := at.Sub(prevAt).Milliseconds()
+							if want := prevAge + elapsed; got.AgeMs != want {
+								t.Fatalf("sample %d: %q held but aged %dms, want %dms (previous %dms + %dms elapsed) — an unchanged state was re-dated",
+									i, got.State, got.AgeMs, want, prevAge, elapsed)
+							}
+						}
+						prevState, prevAge, prevAt = got.State, got.AgeMs, at
+					}
+				})
+			}
+		}
+	}
+}
+
+// The mixed case, and the one two rounds of fixes got wrong in both directions:
+// an `away` dated by the idle timer, then the person returns (resetting the
+// timer) and locks the screen. The lock asserts `away` from the moment it
+// happens, so when the LOCK's own idle timer later crosses 20 minutes that
+// crossing must not re-date the state — it falls 20 minutes after the keypress
+// and would report someone locked out for half an hour as away for seconds.
+// (Codex, PR #232.)
+func TestPresenceLockAfterATimerDerivedAwayIsNotReDatedByTheCrossing(t *testing.T) {
+	tracker := &presenceTracker{}
+	t0 := time.Unix(1790000000, 0)
+
+	// Away because the idle timer passed 20 minutes: dated by the timer, so the
+	// recorded start is five minutes before this observation.
+	sinceStart := t0.Add(-5 * time.Minute)
+	first := tracker.observe(t0, presenceSignals{Idle: 25 * time.Minute, IdleOK: true})
+	if first.State != presenceStateAway {
+		t.Fatalf("first observation = %+v", first)
+	}
+
+	// The person comes back and locks the screen, which resets the idle timer.
+	// Still `away` — now because of the lock — so this is not a transition, and
+	// the recorded start stays where it was.
+	locked := presenceSignals{Locked: true, LockedOK: true, Idle: 30 * time.Second, IdleOK: true}
+	if got := tracker.observe(t0.Add(time.Minute), locked); got.State != presenceStateAway {
+		t.Fatalf("after the lock = %+v", got)
+	}
+
+	// The locked session now idles past 20 minutes. The age must keep growing
+	// across that crossing rather than snapping back to it.
+	before := tracker.observe(t0.Add(20*time.Minute), presenceSignals{
+		Locked: true, LockedOK: true, Idle: 19 * time.Minute, IdleOK: true,
+	})
+	after0 := t0.Add(22 * time.Minute)
+	after := tracker.observe(after0, presenceSignals{
+		Locked: true, LockedOK: true, Idle: 21 * time.Minute, IdleOK: true,
+	})
+	if after.AgeMs <= before.AgeMs {
+		t.Fatalf("away age went backwards across the idle threshold: %dms then %dms",
+			before.AgeMs, after.AgeMs)
+	}
+	// The retained start is the FIRST one — the timer-derived t0-5m, from before
+	// the person came back — so the age reads 27 minutes, not the 22 since the
+	// lock. That is the residual of this design and it is the SAFE direction: an
+	// age that reads long only makes the platform more willing to use a computer
+	// whose screen is locked, which is what `away` is for. The collapse is the
+	// unsafe direction and is what this test exists to prevent. Do not "correct"
+	// this figure to the age since the lock without re-reading §8.2 — dating a
+	// lock-driven `away` from the idle crossing is how it collapsed.
+	if want := after0.Sub(sinceStart).Milliseconds(); after.AgeMs != want {
+		t.Fatalf("away age after the crossing = %dms, want %dms", after.AgeMs, want)
+	}
+}
+
+// The same uninterrupted idle counter eventually crosses 20 minutes, at which
+// point presenceStateStart starts dating the state from the threshold — a start
+// LATER than the moment the display slept. Without provenance on the recorded
+// start, that later value replaced the observed one and the reported age
+// collapsed (23 minutes to 5) while the state never changed. (Codex, PR #232.)
+func TestPresenceAwayAgeSurvivesTheIdleThresholdCrossing(t *testing.T) {
+	tracker := &presenceTracker{}
+	start := time.Unix(1790000000, 0)
+
+	// The display sleeps with the idle timer at 2 minutes, so this `away` is
+	// dated by observation: the state began now.
+	first := tracker.observe(start, presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 2 * time.Minute, IdleOK: true})
+	if first.State != presenceStateAway || first.AgeMs != 0 {
+		t.Fatalf("first observation = %+v", first)
+	}
+
+	// Nobody has touched the machine since, so the idle timer keeps climbing
+	// past its own 20-minute threshold with the display still asleep. The age
+	// has to keep growing from when the display slept.
+	for _, elapsed := range []time.Duration{10 * time.Minute, 23 * time.Minute, 90 * time.Minute} {
+		got := tracker.observe(start.Add(elapsed), presenceSignals{
+			DisplayOff: true, DisplayOffOK: true,
+			Idle:   2*time.Minute + elapsed,
+			IdleOK: true,
+		})
+		if got.State != presenceStateAway {
+			t.Fatalf("state after %v = %q", elapsed, got.State)
+		}
+		if want := elapsed.Milliseconds(); got.AgeMs != want {
+			t.Fatalf("away age after %v = %dms, want %dms — the threshold crossing re-dated an unchanged state",
+				elapsed, got.AgeMs, want)
+		}
+	}
+}
+
+// A sleeping display or a locked session classifies `away` while the idle timer
+// is still under 20 minutes. The unobserved-transition fix first tested the
+// STATE NAME for timer-derivation, so every one of those samples re-dated the
+// state to `now` and the reported age never grew past one interval — a display
+// asleep for an hour read as away for seconds. (Codex, PR #231.)
+func TestPresenceAwayFromASignalKeepsItsAge(t *testing.T) {
+	tracker := &presenceTracker{}
+	start := time.Unix(1790000000, 0)
+	// Idle stays well under the 20-minute threshold throughout, so every
+	// `away` here comes from the display signal alone.
+	signals := presenceSignals{DisplayOff: true, DisplayOffOK: true, Idle: 2 * time.Minute, IdleOK: true}
+
+	if first := tracker.observe(start, signals); first.State != presenceStateAway || first.AgeMs != 0 {
+		t.Fatalf("first observation = %+v", first)
+	}
+	for _, elapsed := range []time.Duration{3 * time.Minute, 10 * time.Minute, time.Hour} {
+		got := tracker.observe(start.Add(elapsed), signals)
+		if got.State != presenceStateAway {
+			t.Fatalf("state after %v = %q", elapsed, got.State)
+		}
+		if want := elapsed.Milliseconds(); got.AgeMs != want {
+			t.Fatalf("away age after %v = %dms, want %dms", elapsed, got.AgeMs, want)
 		}
 	}
 }
@@ -371,16 +590,41 @@ func TestPresenceWithheldUntilTheOwnerSwitchIsKnown(t *testing.T) {
 		t.Fatal("a restart undid the owner's opt-out")
 	}
 
-	// And an explicit ON survives too, so the withholding costs one interval on
-	// a new install rather than one after every restart.
+	// An explicit ON opens the probe now...
+	setPresenceAllowedByOwner(true)
+	if !presenceSamplingEnabled() {
+		t.Fatal("presence stayed withheld after the owner allowed it")
+	}
+
+	// ...and is deliberately NOT remembered. Remembering it would authorise the
+	// first probe after a restart, and an owner who turned presence off while
+	// this agent was stopped would be sampled anyway — the very hole the
+	// tri-state closes. One withheld interval per restart is the price.
+	// (Codex, PR #231.)
+	//
+	// The WRITER is pinned separately from the reader below: the reader ignores
+	// the word `allowed` outright, so asserting only the restored state leaves a
+	// regression in the writer invisible. Both layers have to fail loudly.
+	if raw, err := os.ReadFile(presenceOwnerStatePath()); err == nil {
+		t.Fatalf("an opt-in wrote %q to disk; only a denial may be persisted", raw)
+	}
+	presenceAllowedByOwner.Store(presenceOwnerUnknown) // the restart
+	loadPresenceOwnerState()
+	if presenceAllowedByOwner.Load() != presenceOwnerUnknown {
+		t.Fatal("an opt-in was remembered across a restart")
+	}
+	if presenceSamplingEnabled() {
+		t.Fatal("a remembered opt-in authorised the first probe after a restart")
+	}
+
+	// Turning it on also CLEARS a remembered denial, so an opt-out followed by
+	// an opt-in does not withhold for an interval after every later restart.
+	setPresenceAllowedByOwner(false)
 	setPresenceAllowedByOwner(true)
 	presenceAllowedByOwner.Store(presenceOwnerUnknown)
 	loadPresenceOwnerState()
-	if presenceAllowedByOwner.Load() != presenceOwnerAllowed {
-		t.Fatal("an explicit on did not survive a restart")
-	}
-	if !presenceSamplingEnabled() {
-		t.Fatal("presence stayed withheld after the owner allowed it")
+	if presenceAllowedByOwner.Load() == presenceOwnerDenied {
+		t.Fatal("an opt-in left the earlier denial on disk")
 	}
 }
 
@@ -390,7 +634,9 @@ func TestPresenceOwnerStateFailsSafeOnGarbage(t *testing.T) {
 	previous := presenceAllowedByOwner.Load()
 	t.Cleanup(func() { presenceAllowedByOwner.Store(previous) })
 
-	for _, garbage := range []string{"", "yes", "true", "1", "ALLOWED-ish", "\x00\x01"} {
+	// `allowed` is in this list on purpose: an earlier build of this agent wrote
+	// it, and such a file must now read as UNKNOWN rather than as permission.
+	for _, garbage := range []string{"", "yes", "true", "1", "allowed", "ALLOWED-ish", "\x00\x01"} {
 		presenceAllowedByOwner.Store(presenceOwnerUnknown)
 		if err := os.MkdirAll(GetConfigDir(), 0o700); err != nil {
 			t.Fatal(err)

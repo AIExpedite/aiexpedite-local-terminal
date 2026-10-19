@@ -1283,12 +1283,32 @@ func TestAntigravityRunCapture_ReRootReplacesAResolvedPID(t *testing.T) {
 		}
 		t.Fatalf("capture never resolved pid %d", want)
 	}
+	// The pid is published under the capture's lock and noted in the index
+	// afterwards, so waiting on the pid alone can read an index that has not
+	// caught up — and the index is what this test asserts on. Wait for the
+	// thing under test.
+	waitManaged := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			lockAntigravityLogIndex()
+			noted := antigravityPIDIn(antigravityLogIndex.managedPIDs, want, "", time.Time{})
+			unlockAntigravityLogIndex()
+			if noted {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("pid %d never reached the managed index", want)
+	}
 
 	capture := startAntigravityQuotaCapture("failover after resolve")
 	capture.SetWrapper(900)
 	waitPID(capture, 901)
+	waitManaged(901)
 	capture.SetWrapper(950) // the host failed; the command is retried
 	waitPID(capture, 951)
+	waitManaged(951)
 
 	at := time.Now().Add(time.Second)
 	lockAntigravityLogIndex()

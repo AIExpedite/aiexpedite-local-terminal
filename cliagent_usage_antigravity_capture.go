@@ -166,6 +166,19 @@ type antigravityRunCapture struct {
 	polled bool
 	once   sync.Once
 
+	// noteMu orders a PID's arrival in the managed index against its
+	// departure. It is ALWAYS taken before mu, never while holding it, and
+	// never by anything holding the index lock.
+	//
+	// Both halves of a PID's life run outside mu — the note because it takes
+	// the index lock, the release because it must not be called with mu held
+	// (see releaseAntigravityCapturedPID). Without this they can interleave:
+	// a resolver that has published its PID and unlocked, but not yet noted
+	// it, re-adds that PID as a LIVE managed run after SetWrapper or Finish
+	// has already settled it. The failed transport's agy then stays
+	// classified as live and is owed usage it never spent.
+	noteMu sync.Mutex
+
 	mu  sync.Mutex
 	pid int
 	// finished is set by Finish once it has stopped waiting for the resolver.
@@ -213,6 +226,12 @@ func (c *antigravityRunCapture) SetPID(pid int) {
 // setPID records pid unless one is already set or the run has finished. A
 // resolver passes its generation, and a superseded one records nothing.
 func (c *antigravityRunCapture) setPID(pid int, fromResolver bool, gen uint64) {
+	// Held across the publish AND the note, so a release can neither land
+	// between them nor be undone by them. A resolver that waits here is
+	// rejected by the checks below once it proceeds: SetWrapper bumped the
+	// generation, or Finish set finished, while this was blocked.
+	c.noteMu.Lock()
+	defer c.noteMu.Unlock()
 	c.mu.Lock()
 	if c.pid != 0 || c.finished || (fromResolver && gen != c.resolverGen) {
 		c.mu.Unlock()
@@ -238,9 +257,15 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	if c == nil || wrapperPID <= 0 {
 		return
 	}
+	// noteMu spans the generation bump and the release, so a superseded
+	// resolver's note cannot land after the PID it published is settled.
+	// SetWrapper never waits for the old resolver to exit, so holding it
+	// here cannot deadlock against one blocked in setPID.
+	c.noteMu.Lock()
 	c.mu.Lock()
 	if c.finished {
 		c.mu.Unlock()
+		c.noteMu.Unlock()
 		return
 	}
 	superseded := c.pid
@@ -254,6 +279,7 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	gen := c.resolverGen
 	c.mu.Unlock()
 	releaseAntigravityCapturedPID(superseded, c.floor)
+	c.noteMu.Unlock()
 	go c.resolveWrapper(wrapperPID, gen, stop, done)
 }
 
@@ -361,6 +387,12 @@ func (c *antigravityRunCapture) Finish() {
 			}
 			grace.Stop()
 		}
+		// Taken only AFTER the grace wait above. A resolver still running past
+		// the grace may be blocked in setPID waiting for this; holding it
+		// across the wait for `done` would deadlock until the grace expired.
+		// Once this is released that resolver proceeds and finds `finished`,
+		// so it notes nothing and the release below stands.
+		c.noteMu.Lock()
 		c.mu.Lock()
 		c.finished = true
 		pid := c.pid
@@ -370,6 +402,7 @@ func (c *antigravityRunCapture) Finish() {
 		// which owes its reading and re-reads its block for evidence when it
 		// really exits.
 		releaseAntigravityCapturedPID(pid, c.floor)
+		c.noteMu.Unlock()
 
 		if c.polled {
 			antigravityCaptureMu.Lock()

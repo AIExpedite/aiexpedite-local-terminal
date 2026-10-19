@@ -149,9 +149,14 @@ type ledgerEntry struct {
 	PendingSpawns int `json:"pendingSpawns,omitempty"`
 	// Incomplete marks an entry missing a process (no start time could be
 	// read, or the PID cap was hit): never certified.
-	Incomplete bool   `json:"incomplete,omitempty"`
-	State      string `json:"state,omitempty"`
-	UpdatedAt  int64  `json:"updatedAt"`
+	Incomplete bool `json:"incomplete,omitempty"`
+	// Released marks a session that ENDED while its group / job still held
+	// processes, so ReleaseSession kept the entry as reap evidence. The
+	// session is over; what survives is a leftover process tree. The reap
+	// paths want this entry, the load report's session count does not.
+	Released  bool   `json:"released,omitempty"`
+	State     string `json:"state,omitempty"`
+	UpdatedAt int64  `json:"updatedAt"`
 	// OSBoot is the OS boot identity the entry's agent process ran under
 	// ("<kind>:<value>", os_boot.go) and OSUptimeMs the time since that boot
 	// when it was read. Refreshed on every change of a current-boot entry;
@@ -475,6 +480,7 @@ func (l *spawnLedger) OpenLogicalSession(sessionID string) {
 		return
 	}
 	e.Logical = true
+	l.reopenLocked(e)
 	l.touch(e)
 	l.persistLocked()
 }
@@ -555,6 +561,7 @@ func (l *spawnLedger) TrackProcess(sessionID string, proc *os.Process, suspended
 		l.jobs[proc.Pid] = job
 	}
 	e := l.currentLocked(sessionID)
+	l.reopenLocked(e)
 	if e == nil {
 		// Unrecorded (ledger full): the job still protects the tree while
 		// the agent lives; UntrackProcess releases it.
@@ -662,9 +669,34 @@ func (l *spawnLedger) ReleaseSession(sessionID string) {
 		e.PIDs = kept
 		e.Logical = false
 		e.PendingSpawns = 0
+		e.Released = true
 		l.touch(e)
 	}
 	l.persistLocked()
+}
+
+// reopenLocked marks a retained entry as a live session again.
+//
+// A REUSED ID IS A LIVE SESSION AGAIN — but only once it PROVES it. Session
+// ids are reused within a boot, and the entry may be one ReleaseSession kept
+// because the old session left a process behind; `Released` has to come off,
+// or the replacement stays out of `loadCounts` for the rest of the boot.
+//
+// The proof is a tracked process or an opened logical session, NEVER a begun
+// spawn. `BeginSpawn` runs before `cmd.Start`, and on a failed start
+// `AbortSpawn` keeps the entry — the old PIDs are still in it — decrements
+// `PendingSpawns` and restores nothing. Clearing on the intention therefore
+// reported a live session that never started, for the whole boot: the same
+// over-reporting this field exists to prevent, moved one path along. Hanging
+// the clear on the proof makes an aborted spawn a no-op by construction,
+// rather than by a matching correction in `AbortSpawn`. (Codex, PR #232.)
+//
+// The cost is that a reused id is uncounted for its spawn window —
+// milliseconds — against over-reporting for the rest of the boot.
+func (l *spawnLedger) reopenLocked(e *ledgerEntry) {
+	if e != nil {
+		e.Released = false
+	}
 }
 
 func (l *spawnLedger) releaseJobLocked(pid int) {
@@ -921,6 +953,15 @@ func (l *spawnLedger) Report(ctx context.Context) bootReport {
 // processes those sessions still hold, so the caller can total their RSS;
 // a logical session between turns legitimately holds none.
 //
+// A RELEASED ENTRY IS NOT A SESSION, BUT ITS PROCESSES ARE STILL REAL. When a
+// session ends having left something in its group / job, ReleaseSession keeps
+// the entry for the boot reap — with `State` still `live`, because the reap
+// paths need it that way. Counting it as a session told the server a finished
+// session was running for the rest of this process's life, and that is exactly
+// the Phase 0 number parallelism will later be sized on. Its surviving PIDs do
+// still occupy memory on this computer, so they stay in `pids`: the count drops
+// the session, never the resources. (Codex, PR #231.)
+//
 // Read-only — it never loads the file, creates an entry or touches a stamp, so
 // a report can never alter the reap evidence it walks past.
 func (l *spawnLedger) loadCounts() (sessions int, pids []int) {
@@ -930,7 +971,9 @@ func (l *spawnLedger) loadCounts() (sessions int, pids []int) {
 		if e.BootID != l.bootID {
 			continue
 		}
-		sessions++
+		if !e.Released {
+			sessions++
+		}
 		for _, p := range e.PIDs {
 			if p.PID > 0 {
 				pids = append(pids, p.PID)

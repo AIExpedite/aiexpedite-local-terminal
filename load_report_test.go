@@ -737,6 +737,51 @@ func TestLoadCountsOnlyCountsThisBoot(t *testing.T) {
 	}
 }
 
+// A session that ended while its group / job still held processes keeps its
+// current-boot entry, with `State` still `live`, because the boot reap needs
+// it. Counting it told the server a finished session was running for the rest
+// of this process's life — and `activeSessions` is the Phase 0 number
+// parallelism will be sized on. Its surviving PIDs are real memory on this
+// computer, so they stay counted. (Codex, PR #231.)
+func TestLoadCountsDropsEndedSessionsButKeepsTheirProcesses(t *testing.T) {
+	ledger := &spawnLedger{bootID: "boot-now"}
+	ledger.entries = []*ledgerEntry{
+		{SessionID: "open", BootID: "boot-now", PIDs: []ledgerProcess{{PID: 11}}},
+		{SessionID: "ended-leftovers", BootID: "boot-now", Released: true, PIDs: []ledgerProcess{{PID: 12}}},
+	}
+
+	sessions, pids := ledger.loadCounts()
+
+	if sessions != 1 {
+		t.Fatalf("sessions = %d, want only the open one", sessions)
+	}
+	if len(pids) != 2 {
+		t.Fatalf("pids = %v, want both — a leftover process still occupies memory", pids)
+	}
+}
+
+// The two intervals are adopted from independent, optional response fields, so
+// a response can raise the sample interval above the maximum. The loop has to
+// tick at the smaller of the two or the maximum stops being a maximum.
+// (Codex, PR #231.)
+func TestReportWaitNeverExceedsTheMaximumInterval(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		sample, promised time.Duration
+		want             time.Duration
+	}{
+		{"the sample interval when it is the smaller", time.Minute, 5 * time.Minute, time.Minute},
+		{"the maximum when the sample interval overruns it", 10 * time.Minute, 5 * time.Minute, 5 * time.Minute},
+		{"the sample interval when no maximum is set", 10 * time.Minute, 0, 10 * time.Minute},
+		{"the default when the sample interval is unset", 0, 30 * time.Minute, loadSampleInterval},
+		{"the maximum when both are unset but it is smaller", 0, time.Second, time.Second},
+	} {
+		if got := reportWait(c.sample, c.promised); got != c.want {
+			t.Fatalf("%s: reportWait(%v, %v) = %v, want %v", c.name, c.sample, c.promised, got, c.want)
+		}
+	}
+}
+
 func TestLoadReporterStartIsIdempotentAndStopIsFinal(t *testing.T) {
 	withQuietMachine(t)
 	withFrozenClock(t, time.Unix(1790000000, 0))

@@ -566,11 +566,8 @@ func (r *loadReporter) loop(ctx context.Context) {
 	for {
 		r.tick(ctx)
 		r.mu.Lock()
-		wait := r.sampleInterval
+		wait := reportWait(r.sampleInterval, r.maxInterval)
 		r.mu.Unlock()
-		if wait <= 0 {
-			wait = loadSampleInterval
-		}
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
@@ -579,6 +576,27 @@ func (r *loadReporter) loop(ctx context.Context) {
 		case <-timer.C:
 		}
 	}
+}
+
+// reportWait is how long the loop sleeps between samples: the SMALLER of the
+// sample interval and the maximum report interval.
+//
+// The server sets the two in independent, optional fields, so a response can
+// raise the sample interval while leaving the maximum alone. Sleeping for the
+// sample interval then meant the loop only NOTICED the report was overdue on
+// the following tick, turning "at least every 5 minutes" into every 10.
+// `maxInterval` is the promise to the server; `sampleInterval` only decides how
+// often a material change can be noticed, so ticking more often than it asks
+// is always safe — `tick` itself still sends nothing that is not due.
+// (Codex, PR #231.)
+func reportWait(sample, promised time.Duration) time.Duration {
+	if sample <= 0 {
+		sample = loadSampleInterval
+	}
+	if promised > 0 && promised < sample {
+		return promised
+	}
+	return sample
 }
 
 // tick takes one sample and sends it when it is due.

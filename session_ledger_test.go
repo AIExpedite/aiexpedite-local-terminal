@@ -524,6 +524,90 @@ func TestReleaseKeepsRecordsWhoseTreeIsNotEmpty(t *testing.T) {
 	}
 }
 
+// A spawn that never starts must not resurrect the ended session. `BeginSpawn`
+// runs before `cmd.Start`; on a failed start `AbortSpawn` keeps the entry,
+// because the old session's leftover PIDs are still in it. Clearing the marker
+// on the begun spawn therefore reported a live session that never existed for
+// the rest of the boot — so the clear hangs on a tracked process instead.
+// (Codex, PR #232.)
+func TestAbortedSpawnOnAReusedIDDoesNotResurrectTheEndedSession(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(ledgerProcess, uintptr) bool { return false }
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(41), false)
+	l.ReleaseSession("reused")
+	if sessions, _ := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after the release, want 0", sessions)
+	}
+
+	// The id is reused, but the process fails to start.
+	l.BeginSpawn("reused")
+	l.AbortSpawn("reused")
+
+	if sessions, pids := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after an aborted spawn, want 0 (pids %v)", sessions, pids)
+	}
+
+	// A spawn that DOES start is a live session again.
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(42), false)
+	if sessions, _ := l.loadCounts(); sessions != 1 {
+		t.Fatalf("sessions = %d once the replacement started, want 1", sessions)
+	}
+}
+
+// A session id reused in the same boot is live again, so the `ended` marker
+// that kept the old generation out of the load report must come off — left on,
+// the replacement session was invisible to `loadCounts` for the rest of the
+// boot. (Codex, PR #232.)
+func TestReusedSessionIDCountsAgainAfterARetainedRelease(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(ledgerProcess, uintptr) bool { return false }
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(31), false)
+	l.ReleaseSession("reused")
+
+	if sessions, _ := l.loadCounts(); sessions != 0 {
+		t.Fatalf("sessions = %d after the release, want 0", sessions)
+	}
+
+	// The same id opens a new session.
+	l.BeginSpawn("reused")
+	l.TrackProcess("reused", proc(32), false)
+
+	if sessions, _ := l.loadCounts(); sessions != 1 {
+		t.Fatalf("sessions = %d after the id was reused, want 1", sessions)
+	}
+}
+
+// ...and the entry it keeps is marked as a session that ENDED, so the load
+// report stops counting it as one. The retained entry keeps `State: live` for
+// the reap, so the count needs its own marker; this test drives the real
+// ReleaseSession rather than setting the field, which is the only way it is
+// ever set. (Codex, PR #231.)
+func TestReleaseMarksTheKeptEntryAsEndedForTheLoadReport(t *testing.T) {
+	l := newTestLedger(t, t.TempDir(), "boot-1")
+	l.treeGone = func(p ledgerProcess, _ uintptr) bool { return false }
+	l.BeginSpawn("ends")
+	l.TrackProcess("ends", proc(21), false)
+	l.BeginSpawn("stays")
+	l.TrackProcess("stays", proc(22), false)
+
+	if sessions, pids := l.loadCounts(); sessions != 2 || len(pids) != 2 {
+		t.Fatalf("before the release: sessions %d pids %v, want 2 and 2", sessions, pids)
+	}
+
+	l.ReleaseSession("ends")
+
+	sessions, pids := l.loadCounts()
+	if sessions != 1 {
+		t.Fatalf("sessions = %d after one of two ended, want 1", sessions)
+	}
+	if len(pids) != 2 {
+		t.Fatalf("pids = %v, want both — the leftover process still occupies memory", pids)
+	}
+}
+
 // TestIncompleteGenerationBlocksAReapedOne: a pending / incomplete record is
 // kept as an unknown tombstone, so a reaped entry of the same session id in
 // another generation is never certified.
