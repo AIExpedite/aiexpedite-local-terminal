@@ -298,6 +298,40 @@ func TestGrokDirectScan_ATurnHandedToTheDebtNeverReopensItsBudget(t *testing.T) 
 	}
 }
 
+// A turn handed to an older debt's due rung moves that debt's completion: a
+// reading taken before the turn (it covers only the older run) must not
+// settle it while the marker is recorded as nudged.
+func TestGrokDirectScan_ADueRungForAnOlderDebtPaysTheTurnToo(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	now := h.clock()
+	h.write(grokUsageFreshness{
+		AccountFingerprint: "fp-ada",
+		OwedAtMs:           now.Add(-10 * time.Minute).UnixMilli(),
+		CompletionMs:       now.Add(-10 * time.Minute).UnixMilli(),
+		LastAttemptAtMs:    now.Add(-5 * time.Minute).UnixMilli(),
+		NextAttemptAtMs:    now.Add(-time.Second).UnixMilli(),
+		Attempts:           1,
+		LastOutcome:        grokLiveOutcomeHTTPError,
+	})
+	// A numeric reading after the older run but before the turn.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: now.Add(-30 * time.Second), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 12, HasUsedPercent: true,
+	}, "fp-ada"))
+	turn := now.Add(-5 * time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the due rung to read for the turn", h.reads.Load())
+	}
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", h.clock())
+	if !ok || !snap.HasUsedPercent || snap.ObservedAt.Before(turn) {
+		t.Fatalf("live = %+v ok=%t, want a numeric reading at or after the turn", snap, ok)
+	}
+	if h.state().owed() {
+		t.Fatalf("state = %+v, want the debt paid", h.state())
+	}
+}
+
 func TestGrokDirectScan_ReadsOnlyThePersistentHomeAndFollowsAMove(t *testing.T) {
 	h := newGrokDirectHarness(t)
 	// An isolated home's log is never the scan's.

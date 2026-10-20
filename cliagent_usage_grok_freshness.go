@@ -896,6 +896,10 @@ func nudgeGrokUsageRefreshFor(now, completion time.Time, fingerprint string) boo
 	if !n.lastAt.IsZero() && !now.Before(n.lastAt) && now.Sub(n.lastAt) < grokRefreshNudgeCooldown {
 		return false
 	}
+	if completion.IsZero() || completion.After(now) {
+		completion = now
+	}
+	completionMs := grokCompletionMs(completion)
 	start := false
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		grokRebaseFutureFreshness(state, now)
@@ -905,16 +909,19 @@ func nudgeGrokUsageRefreshFor(now, completion time.Time, fingerprint string) boo
 				// One debt at a time: only a booked rung that is due. Any other
 				// is owned by its timer or by the worker already on it.
 				start = state.NextAttemptAtMs != 0 && state.NextAttemptAtMs <= now.UnixMilli()
+				if start && completionMs > state.CompletionMs {
+					// The due rung now pays this run too, so a reading taken
+					// before it (one that covers only the older run) no longer
+					// settles the debt.
+					state.CompletionMs = completionMs
+				}
 				return
 			}
 			if grokDebtExhausted(*state, now) {
 				return
 			}
 		}
-		if completion.IsZero() || completion.After(now) {
-			completion = now
-		}
-		grokOweRead(state, now, grokCompletionMs(completion), fingerprint)
+		grokOweRead(state, now, completionMs, fingerprint)
 		start = true
 	})
 	if !start {
