@@ -396,18 +396,31 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 	if !newer.HasUsedPercent && older.HasUsedPercent && older.samePeriod(newer) && now.Before(newer.PeriodEnd) {
 		out.snap, out.source = older, olderSource
 	}
-	// The pools are compared by their own times. The live cache can keep an
-	// older percentage beneath a newer unmetered answer whose on-demand pool
-	// is fresh, so the log can win the credits row while the live answer
-	// still holds the newest on-demand pool for the same period. Carry that
-	// pool onto the log's reading; the published metrics then include the
-	// live commit's newest content, so its generation goes with them.
-	if out.source == grokObservationLog && live.HasOnDemand && live.samePeriod(snap) &&
-		(!snap.HasOnDemand || live.onDemandObservedAt().After(snap.onDemandObservedAt())) {
+	// The pools are compared by their own times, in both directions. The
+	// live cache can keep an older percentage beneath a newer unmetered
+	// answer whose on-demand pool is fresh, so the log can win the credits
+	// row while the live answer still holds the newest on-demand pool for the
+	// same period. Carry that pool onto the log's reading; the published
+	// metrics then include the live commit's newest content, so its
+	// generation goes with them. Symmetrically, a kept live percentage can
+	// win the credits row over a newer percent-less log record whose pool is
+	// fresher; that pool is carried onto the live reading, which still
+	// publishes the live commit's credits row under its generation.
+	switch {
+	case out.source == grokObservationLog && grokOnDemandPoolNewer(live, snap):
 		out.snap = out.snap.withOnDemandFrom(live)
 		out.source = grokObservationLive
+	case out.source == grokObservationLive && grokOnDemandPoolNewer(snap, live):
+		out.snap = out.snap.withOnDemandFrom(snap)
 	}
 	return out
+}
+
+// grokOnDemandPoolNewer reports whether candidate holds an on-demand pool for
+// the same period as current that was observed after current's own pool.
+func grokOnDemandPoolNewer(candidate, current grokBillingSnapshot) bool {
+	return candidate.HasOnDemand && candidate.samePeriod(current) &&
+		(!current.HasOnDemand || candidate.onDemandObservedAt().After(current.onDemandObservedAt()))
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,
