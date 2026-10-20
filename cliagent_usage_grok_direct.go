@@ -75,6 +75,10 @@ type grokDirectCursor struct {
 	seen    bool
 	size    int64
 	modTime time.Time
+	// file identifies the log the offset belongs to (os.SameFile), so a log
+	// rotated at the same path is read from its start even once it has grown
+	// past the old offset.
+	file os.FileInfo
 	// offset is the end of the last complete line read.
 	offset int64
 	// midLine: the read stopped inside one over-long line, so the next read's
@@ -177,13 +181,15 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 		return
 	}
 	size, modTime := info.Size(), info.ModTime()
-	if c.seen && size == c.size && modTime.Equal(c.modTime) {
+	replaced := c.seen && c.file != nil && !os.SameFile(c.file, info)
+	if c.seen && !replaced && size == c.size && modTime.Equal(c.modTime) {
 		return
 	}
 	start, jumped := c.offset, false
-	if !c.seen || size < c.offset || size-c.offset > grokDirectScanMaxBytes {
-		// First scan of this process, a rotation / truncation, or more appended
-		// than one read may take: only the newest window.
+	if !c.seen || replaced || size < c.offset || size-c.offset > grokDirectScanMaxBytes {
+		// First scan of this process, a rotation (another file at this path)
+		// or truncation, or more appended than one read may take: only the
+		// newest window.
 		start = max(size-grokDirectScanMaxBytes, 0)
 		jumped, c.midLine = start > 0, false
 	}
@@ -203,7 +209,7 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 		fragment = chunk[0] != '\n'
 		chunk = chunk[1:]
 	}
-	c.seen, c.size, c.modTime = true, size, modTime
+	c.seen, c.size, c.modTime, c.file = true, size, modTime, info
 	lastNewline := bytes.LastIndexByte(chunk, '\n')
 	if lastNewline < 0 {
 		// No complete line yet. A partial line at a line boundary is read again

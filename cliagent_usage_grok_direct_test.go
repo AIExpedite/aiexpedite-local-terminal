@@ -382,3 +382,23 @@ func TestGrokDirectScan_AWindowStartingOnALineBoundaryKeepsItsFirstLine(t *testi
 		t.Fatalf("reads = %d, want the whole first line of the window read", h.reads.Load())
 	}
 }
+
+// A log rotated at the same path is read from its start, even when the new
+// file already outgrew the old offset.
+func TestGrokDirectScan_ALogReplacedAtTheSamePathIsReadFromItsStart(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.appendRaw(grokFillerLines(8 * 1024))
+	h.scan()
+	replacement := filepath.Join(filepath.Dir(h.logPath()), "unified.jsonl.new")
+	content := grokTurnMarkerLine(h.clock().Add(-time.Second)) + grokFillerLines(32*1024)
+	if err := os.WriteFile(replacement, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, h.logPath()); err != nil {
+		t.Fatal(err)
+	}
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the rotated log's turn found", h.reads.Load())
+	}
+}
