@@ -95,8 +95,9 @@ type grokDirectCursor struct {
 	// nudged is, per fingerprint, the newest marker a nudge handed to the run
 	// debt. From there the debt's own ladder owns it (any read it sends
 	// postdates the turn), so the same turn never re-opens a budget the debt
-	// spent.
-	nudged map[string]int64
+	// spent — until the persisted forget count moves (another process
+	// retired or replaced that debt unpaid).
+	nudged map[string]grokDirectNudged
 	// accounts is the sign-in timeline the polls observed, oldest first, at
 	// most grokDirectAccountSpans long. It is the identity evidence for a
 	// marker: the log line's ctx is never decoded.
@@ -111,6 +112,13 @@ type grokDirectCursor struct {
 	// signed out while the agent was stopped once it is back.
 	preStartMs    int64
 	preStartFiled []string
+}
+
+// grokDirectNudged is a turn handed to the run debt, with the persisted
+// grokUsageFreshness.DirectForgets read before the hand-off.
+type grokDirectNudged struct {
+	ms      int64
+	forgets uint64
 }
 
 // grokDirectAccountSpan is one run of polls that saw the same login
@@ -185,11 +193,27 @@ func grokDirectScan(requireDetected bool) {
 	// Only this login's turns are nudged; the rest stay pending: a turn with
 	// no owner known yet (signed out since the process started) is nudged on
 	// the first poll after login, another account's once it signs back in.
-	markerMs, nudgedMs := grokDirectState.pending[fingerprint], grokDirectState.nudged[fingerprint]
+	markerMs, handed := grokDirectState.pending[fingerprint], grokDirectState.nudged[fingerprint]
 	forgets := grokDirectForgets
 	grokDirectMu.Unlock()
-	if fingerprint == "" || markerMs == 0 || markerMs <= nudgedMs {
+	if fingerprint == "" || markerMs == 0 {
 		return
+	}
+	// Read before any hand-off below, so a forget landing after it shows as a
+	// moved count on the next poll rather than being missed.
+	persistedForgets := grokDirectPersistedForgets()
+	if markerMs <= handed.ms {
+		if persistedForgets == handed.forgets {
+			return
+		}
+		// A debt was retired or replaced unpaid since the hand-off — possibly
+		// by another agent process, whose forget cleared only its own map —
+		// so the turn may no longer be held by any debt: it is owed again.
+		grokDirectMu.Lock()
+		if grokDirectState.nudged[fingerprint] == handed {
+			delete(grokDirectState.nudged, fingerprint)
+		}
+		grokDirectMu.Unlock()
 	}
 	if grokLiveReadingCovers(fingerprint, markerMs, now) {
 		grokDirectMu.Lock()
@@ -207,14 +231,25 @@ func grokDirectScan(requireDetected bool) {
 	grokDirectMu.Lock()
 	// A forget since the read means a debt was retired unpaid, possibly the
 	// one this nudge just started: the turn stays owed for the next poll.
-	if forgets == grokDirectForgets && markerMs > grokDirectState.nudged[fingerprint] {
+	if forgets == grokDirectForgets && markerMs > grokDirectState.nudged[fingerprint].ms {
 		if grokDirectState.nudged == nil {
-			grokDirectState.nudged = map[string]int64{}
+			grokDirectState.nudged = map[string]grokDirectNudged{}
 		}
-		grokDirectState.nudged[fingerprint] = markerMs
+		grokDirectState.nudged[fingerprint] = grokDirectNudged{ms: markerMs, forgets: persistedForgets}
 	}
 	grokDirectMu.Unlock()
 	fmt.Printf("%s[cli-usage] grok direct run: owed%s\n", colorCyan, colorReset)
+}
+
+// grokDirectPersistedForgets is the freshness file's cross-process forget
+// count (grokUsageFreshness.DirectForgets); a missing file reads 0. Read only
+// while a marker is pending, i.e. not yet covered: one small file per poll.
+func grokDirectPersistedForgets() uint64 {
+	var state grokUsageFreshness
+	if !readJSONFile(grokUsageFreshnessPath(), &state) {
+		return 0
+	}
+	return state.DirectForgets
 }
 
 // grokDirectAdvanceLocked reads what was appended to path since the cursor

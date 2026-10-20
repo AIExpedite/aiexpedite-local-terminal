@@ -140,6 +140,12 @@ type grokUsageFreshness struct {
 	AccountFingerprint string `json:"accountFingerprint,omitempty"`
 	// LastOutcome is one of the closed grokLiveOutcome* codes.
 	LastOutcome string `json:"lastOutcome,omitempty"`
+	// DirectForgets counts debts retired or replaced unpaid, in any agent
+	// process sharing this file. A direct scan's handled marker is
+	// process-local, so it compares this count with the one it saw when it
+	// handed the turn over (grokDirectScan): a change means the debt may be
+	// gone and the turn is owed again. Survives clearDebt.
+	DirectForgets uint64 `json:"directForgets,omitempty"`
 }
 
 func (state grokUsageFreshness) owed() bool { return state.OwedAtMs != 0 }
@@ -233,8 +239,16 @@ func grokUsageFreshnessPath() string {
 // past grokUsageFreshnessLockWait refuses the transaction — mutate does not
 // run and the state on disk is returned, so the caller starts nothing; a
 // filesystem that offers no lock takes the unlocked path, as the other caches
-// do.
+// do. A caller whose mutation must land (a settle's debt, a booked rung) uses
+// grokUsageFreshnessTxn and hands a refusal to grokRetryRefusedFreshness.
 func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshness {
+	state, _ := grokUsageFreshnessTxn(mutate)
+	return state
+}
+
+// grokUsageFreshnessTxn is updateGrokUsageFreshness reporting whether mutate
+// ran: false only when another process held the lock past the wait.
+func grokUsageFreshnessTxn(mutate func(*grokUsageFreshness)) (grokUsageFreshness, bool) {
 	grokFreshnessMu.Lock()
 	defer grokFreshnessMu.Unlock()
 	path := grokUsageFreshnessPath()
@@ -245,7 +259,7 @@ func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshne
 			if !readJSONFile(path, &state) {
 				state = grokUsageFreshness{}
 			}
-			return state
+			return state, false
 		}
 		if lock != nil {
 			defer func() {
@@ -260,16 +274,48 @@ func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshne
 	before := state
 	mutate(&state)
 	if state == before || path == "" {
-		return state
+		return state, true
 	}
-	if state.RunFloorMs == 0 && !state.owed() && state.LastAttemptAtMs == 0 {
+	if state.RunFloorMs == 0 && !state.owed() && state.LastAttemptAtMs == 0 && state.DirectForgets == 0 {
 		_ = os.Remove(path)
-		return state
+		return state, true
 	}
 	state.SchemaVersion = grokUsageFreshnessSchema
 	// Best-effort: a read-only data dir costs a refresh, never a run.
 	_ = writeJSONFileAtomic(path, state)
-	return state
+	return state, true
+}
+
+// grokFreshnessRefusedRetryDelay spaces the retries of a required mutation the
+// freshness lock refused; grokFreshnessRefusedRetries bounds them. Vars so
+// tests can pin them.
+var (
+	grokFreshnessRefusedRetryDelay = 5 * time.Second
+	grokFreshnessRefusedRetries    = 6
+)
+
+// grokRetryRefusedFreshness re-runs a required mutation another process's lock
+// refused, off the caller's goroutine, until it lands (committed then runs with
+// the result) or the bounded retries are spent. Without it a settled run whose
+// floor is already released, or a failed read whose rung was never booked,
+// would leave neither a persisted debt nor an armed retry. mutate must be safe
+// to run late: it is applied to the state as it is then.
+func grokRetryRefusedFreshness(mutate func(*grokUsageFreshness), committed func(grokUsageFreshness)) {
+	grokFreshnessInFlight.Add(1)
+	go func() {
+		defer grokFreshnessInFlight.Add(-1)
+		for i := 0; i < grokFreshnessRefusedRetries; i++ {
+			time.Sleep(grokFreshnessRefusedRetryDelay)
+			if IsShutdownInProgress() {
+				return
+			}
+			if state, ok := grokUsageFreshnessTxn(mutate); ok {
+				committed(state)
+				return
+			}
+		}
+		fmt.Printf("%s[cli-usage] grok refresh: lock_busy%s\n", colorYellow, colorReset)
+	}()
 }
 
 // grokRebaseFutureFreshness rebases timestamps a backwards clock step left in
@@ -517,14 +563,24 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 		})
 		return false
 	}
-	state := updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+	owe := func(state *grokUsageFreshness) {
 		grokOweRead(state, now, completionMs, fingerprint)
 		if state.RunFloorMs < floorMs {
 			state.setRunFloor(floorMs, fingerprint)
 		}
-	})
-	fmt.Printf("%s[cli-usage] grok refresh: owed attempts=%d%s\n", colorCyan, state.Attempts, colorReset)
-	grokStartRunDebtWorker(bypassInterval)
+	}
+	owed := func(state grokUsageFreshness) {
+		fmt.Printf("%s[cli-usage] grok refresh: owed attempts=%d%s\n", colorCyan, state.Attempts, colorReset)
+		grokStartRunDebtWorker(bypassInterval)
+	}
+	state, committed := grokUsageFreshnessTxn(owe)
+	if !committed {
+		// Another process holds the lock and this run's floor is already
+		// released: the debt is opened, and its worker started, once it lands.
+		grokRetryRefusedFreshness(owe, owed)
+		return true
+	}
+	owed(state)
 	return true
 }
 
@@ -552,6 +608,7 @@ func grokOweRead(state *grokUsageFreshness, now time.Time, completionMs int64, f
 		// freshness then direct; the scan never holds grokDirectMu across a
 		// freshness update.)
 		state.clearDebt()
+		state.DirectForgets++
 		grokDirectForgetNudged()
 	}
 	if state.owed() && now.Sub(time.UnixMilli(state.OwedAtMs)) > grokRunDebtMaxAge {
@@ -679,15 +736,19 @@ func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
 func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 	oldest := grokOldestLiveFloor()
 	retired := false
+	accountChanged := label == liveProbeOutcomeAccountChanged || label == liveProbeOutcomeAccountChangedAfterRead
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		if !state.owed() || state.debtID() != id {
 			return
 		}
 		state.clearDebt()
 		state.setRunFloor(oldest.floorMs, oldest.fingerprint)
+		if accountChanged {
+			state.DirectForgets++
+		}
 		retired = true
 	})
-	if retired && (label == liveProbeOutcomeAccountChanged || label == liveProbeOutcomeAccountChangedAfterRead) {
+	if retired && accountChanged {
 		// Retired unpaid: a direct turn handed to this debt is owed again
 		// when its account signs back in.
 		grokDirectForgetNudged()
@@ -836,7 +897,8 @@ func grokScheduleRunDebtRetry(state grokUsageFreshness, now time.Time, kind grok
 	}
 	id := state.debtID()
 	var next time.Time
-	booked := updateGrokUsageFreshness(func(s *grokUsageFreshness) {
+	book := func(s *grokUsageFreshness) {
+		next = time.Time{}
 		if !s.owed() || s.debtID() != id {
 			return
 		}
@@ -858,13 +920,23 @@ func grokScheduleRunDebtRetry(state grokUsageFreshness, now time.Time, kind grok
 			}
 		}
 		s.NextAttemptAtMs = next.UnixMilli()
-	})
-	if next.IsZero() {
-		return false
 	}
-	grokArmRunDebtRetry(id, next.Sub(now))
-	fmt.Printf("%s[cli-usage] grok refresh: scheduled attempts=%d%s\n", colorCyan, booked.Attempts, colorReset)
-	return true
+	arm := func(booked grokUsageFreshness) bool {
+		if next.IsZero() {
+			return false
+		}
+		grokArmRunDebtRetry(id, next.Sub(grokUsageFreshnessNow()))
+		fmt.Printf("%s[cli-usage] grok refresh: scheduled attempts=%d%s\n", colorCyan, booked.Attempts, colorReset)
+		return true
+	}
+	booked, committed := grokUsageFreshnessTxn(book)
+	if !committed {
+		// Refused by another process's lock: the rung is booked, and armed,
+		// once it lands, so a failed read is never left with no retry.
+		grokRetryRefusedFreshness(book, func(booked grokUsageFreshness) { arm(booked) })
+		return true
+	}
+	return arm(booked)
 }
 
 // grokArmRunDebtRetry replaces the pending timer with one for generation id.

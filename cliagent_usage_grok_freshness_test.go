@@ -921,3 +921,77 @@ func TestGrokNudge_AnotherProcessHoldingTheFreshnessLockDefersTheNudge(t *testin
 		t.Fatalf("reads = %d state=%+v, want one read that paid the debt", h.reads.Load(), h.state())
 	}
 }
+
+// holdGrokFreshnessLock takes the freshness file's sibling lock as another
+// agent process would, with the transaction's wait and the refused-mutation
+// retry pinned short. The returned func releases it (also run at cleanup).
+func holdGrokFreshnessLock(t *testing.T) func() {
+	t.Helper()
+	prevWait, prevDelay := grokUsageFreshnessLockWait, grokFreshnessRefusedRetryDelay
+	grokUsageFreshnessLockWait, grokFreshnessRefusedRetryDelay = 20*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { grokUsageFreshnessLockWait, grokFreshnessRefusedRetryDelay = prevWait, prevDelay })
+	if err := os.MkdirAll(filepath.Dir(grokUsageFreshnessPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(grokUsageFreshnessPath()+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = unlockFile(held)
+			_ = held.Close()
+		}
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// A settle refused by another process's lock has already released its run's
+// floor, so it retries the debt until it lands and then pays it — never
+// leaving the run with neither a persisted debt nor a worker.
+func TestGrokRunDebt_ASettleRefusedByTheFreshnessLockOpensTheDebtOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	release := holdGrokFreshnessLock(t)
+	floor := armGrokUsageRunFloor(h.clock())
+	h.advance(time.Second)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("want the settled run reported owed")
+	}
+	if h.reads.Load() != 0 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want nothing written while locked", h.reads.Load(), h.state())
+	}
+	release()
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want the retried debt opened and paid once", h.reads.Load(), h.state())
+	}
+}
+
+// A rung booking refused by another process's lock is retried until it lands,
+// then armed, so a failed read is never left with no retry.
+func TestGrokRunDebt_ARungRefusedByTheFreshnessLockIsBookedOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), Attempts: 1,
+		LastAttemptAtMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	release := holdGrokFreshnessLock(t)
+	if !grokScheduleRunDebtRetry(h.state(), now, grokRetryAfterRead) {
+		t.Fatal("want the refused booking handed to the retry")
+	}
+	if h.state().NextAttemptAtMs != 0 || grokRunDebtRetryPending() {
+		t.Fatalf("state=%+v, want no rung booked while locked", h.state())
+	}
+	release()
+	h.idle()
+	if h.state().NextAttemptAtMs == 0 || !grokRunDebtRetryPending() {
+		t.Fatalf("state=%+v pending=%t, want the rung booked and armed once released", h.state(), grokRunDebtRetryPending())
+	}
+}

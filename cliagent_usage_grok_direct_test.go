@@ -492,7 +492,7 @@ func TestGrokDirectScan_AForgetBeforeTheNudgeIsRecordedKeepsTheTurnOwed(t *testi
 		t.Fatalf("reads = %d state=%+v, want one read retired as account_changed", h.reads.Load(), h.state())
 	}
 	grokDirectMu.Lock()
-	nudged := grokDirectState.nudged["fp-ada"]
+	nudged := grokDirectState.nudged["fp-ada"].ms
 	grokDirectMu.Unlock()
 	if nudged != 0 {
 		t.Fatalf("nudged = %d, want the retired turn not recorded as handled", nudged)
@@ -748,5 +748,30 @@ func TestGrokDirectScan_TurnsOnBothSidesOfALoginSwitchAreBothPaid(t *testing.T) 
 	h.scan()
 	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", adaTurn.UnixMilli(), h.clock()) {
 		t.Fatalf("reads = %d, want fp-ada's turn still owed and paid once it is back", h.reads.Load())
+	}
+}
+
+// The handled marker is process-local: when ANOTHER agent process replaces
+// this turn's unpaid debt (its forget clears only its own map), the persisted
+// forget count moves, so this process owes the turn again rather than skipping
+// it forever.
+func TestGrokDirectScan_ATurnWhoseDebtAnotherProcessReplacedIsOwedAgain(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	turn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 || !h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want fp-ada's debt pending after a failed read", h.reads.Load(), h.state())
+	}
+	stopGrokRunDebtRetry()
+	// Another process replaced fp-ada's debt with fp-bob's and paid it; this
+	// process's grokDirectForgetNudged never ran.
+	h.write(grokUsageFreshness{LastAttemptAtMs: h.clock().UnixMilli(), DirectForgets: h.state().DirectForgets + 1})
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want the replaced turn owed again and paid", h.reads.Load())
 	}
 }
