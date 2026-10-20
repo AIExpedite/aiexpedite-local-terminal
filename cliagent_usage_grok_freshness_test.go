@@ -611,6 +611,89 @@ func TestGrokNewestBillingObservation_ANewerLogOnDemandPoolRidesAKeptLivePercent
 	}
 }
 
+// A newer live answer that omitted the on-demand pool dates that removal: an
+// older pool still in the log is never merged back over it.
+func TestGrokNewestBillingObservation_ANewerLiveRemovalIsNotRefilledByAnOlderLogPool(t *testing.T) {
+	withCodexGenerationEpoch(t, 8122)
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
+	logSnap, ok := readGrokBillingSnapshot(home, grokIdentityCandidates(home))
+	if !ok || !logSnap.HasPeriodEnd {
+		t.Fatalf("fixture log record = %+v", logSnap)
+	}
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	liveAt, poolAt, dropAt := logAt.Add(time.Hour), logAt.Add(2*time.Hour), logAt.Add(3*time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: liveAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+		UsedPercent: 36, HasUsedPercent: true,
+		OnDemandCap: 50, OnDemandUsed: 5, HasOnDemand: true, HasOnDemandUsed: true,
+	}, fingerprint))
+	f, err := os.OpenFile(grokBillingLogPath(home), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fmt.Fprintf(f, `{"ts":%q,"msg":"billing: fetched credits config","ctx":{"config":{`+
+		`"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"onDemandCap":{"val":50},"onDemandUsed":{"val":20}},"subscriptionTier":"SuperGrok"}}`+"\n",
+		poolAt.UTC().Format(time.RFC3339Nano), logAt.Add(-time.Hour).UTC().Format(time.RFC3339Nano),
+		logAt.Add(7*24*time.Hour).UTC().Format(time.RFC3339Nano))
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The newest answer is unmetered and carries no pool: the percentage is
+	// kept, the pool's removal is versioned.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: dropAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+	}, fingerprint))
+
+	obs := grokBillingObservationFor(home, fingerprint, dropAt.Add(time.Minute))
+	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8122, 2) {
+		t.Fatalf("source=%d generation=%+v, want the removal's live generation {8122,2}", obs.source, obs.generation)
+	}
+	if snap := obs.snap; !snap.HasUsedPercent || snap.UsedPercent != 36 || snap.HasOnDemand {
+		t.Fatalf("observation = %+v, want the kept percentage with the pool removed", snap)
+	}
+	for _, m := range grokBillingMetrics(obs.snap, dropAt.Add(time.Minute)) {
+		if m.Label == "On-demand credits" {
+			t.Fatalf("a removed pool still renders: %+v", m)
+		}
+	}
+}
+
+// A pool stamped beyond the clock-skew limit (the clock stepped back) is
+// neither rendered under the percentage's older stamp nor counted as covering
+// a run; the trusted percentage still is.
+func TestGrokBillingMetrics_AFutureOnDemandPoolIsSuppressed(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	snap := grokBillingSnapshot{
+		ObservedAt: now.Add(-time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: now.Add(48 * time.Hour), HasPeriodEnd: true,
+		UsedPercent: 36, HasUsedPercent: true,
+		OnDemandCap: 50, OnDemandUsed: 20, HasOnDemand: true, HasOnDemandUsed: true,
+		OnDemandObservedAt: now.Add(time.Hour),
+	}
+	metrics := grokBillingMetrics(snap, now)
+	if len(metrics) != 1 || metrics[0].Unknown {
+		t.Fatalf("metrics = %+v, want the numeric credits row alone", metrics)
+	}
+	if grokSnapshotCovers(snap, now.Add(-time.Minute).UnixMilli(), now) {
+		t.Fatal("a future pool covered a run the trusted percentage predates")
+	}
+	if !grokSnapshotCovers(snap, now.Add(-2*time.Hour).UnixMilli(), now) {
+		t.Fatal("the trusted percentage stopped covering an older run")
+	}
+
+	// The same pool inside the skew limit renders at its own time.
+	snap.OnDemandObservedAt = now.Add(time.Minute)
+	metrics = grokBillingMetrics(snap, now)
+	if len(metrics) != 2 || metrics[1].Unknown || metrics[1].ObservedAt != snap.OnDemandObservedAt.UTC().Format(time.RFC3339) {
+		t.Fatalf("metrics = %+v, want the pool at its own time", metrics)
+	}
+	if !grokSnapshotCovers(snap, now.UnixMilli(), now) {
+		t.Fatal("a trusted pool stopped covering a run")
+	}
+}
+
 /* ------------------- completion-based nudge (direct runs) ------------------- */
 
 // A nudge carries the turn's own completion: a numeric reading taken since

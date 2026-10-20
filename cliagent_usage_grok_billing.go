@@ -234,9 +234,11 @@ type grokBillingSnapshot struct {
 	OnDemandUsed    float64
 	HasOnDemand     bool
 	HasOnDemandUsed bool
-	// OnDemandObservedAt, when set, is the on-demand pool's own observation
-	// time — later than ObservedAt when the live cache kept an older
-	// percentage under a newer unmetered answer that carried the pool.
+	// OnDemandObservedAt, when set, is when the on-demand pool's state was
+	// observed — later than ObservedAt when the live cache kept an older
+	// percentage under a newer unmetered answer. That answer dates the pool
+	// whether it carried one or omitted it, so an absent pool is a
+	// timestamped removal, not a gap an older pool may fill.
 	OnDemandObservedAt time.Time
 	SubscriptionTier   string
 }
@@ -252,12 +254,15 @@ func (s grokBillingSnapshot) onDemandObservedAt() time.Time {
 
 // numericAt is when the snapshot's newest numeric pool was observed — the
 // credits percentage or an on-demand pool with usage, whichever is newer.
-// ok is false when neither pool carries numbers.
-func (s grokBillingSnapshot) numericAt() (at time.Time, ok bool) {
-	if s.HasUsedPercent {
+// A pool observed beyond grokBillingMaxClockSkew past now is untrusted (the
+// card does not render it), so it never counts. ok is false when no trusted
+// pool carries numbers.
+func (s grokBillingSnapshot) numericAt(now time.Time) (at time.Time, ok bool) {
+	trustedThrough := now.Add(grokBillingMaxClockSkew)
+	if s.HasUsedPercent && !s.ObservedAt.After(trustedThrough) {
 		at, ok = s.ObservedAt, true
 	}
-	if s.HasOnDemand && s.HasOnDemandUsed {
+	if s.HasOnDemand && s.HasOnDemandUsed && !s.onDemandObservedAt().After(trustedThrough) {
 		if pool := s.onDemandObservedAt(); !ok || pool.After(at) {
 			at = pool
 		}
@@ -266,8 +271,8 @@ func (s grokBillingSnapshot) numericAt() (at time.Time, ok bool) {
 	return at, ok
 }
 
-// withOnDemandFrom returns s with other's on-demand pool, stamped with that
-// pool's own observation time.
+// withOnDemandFrom returns s with other's on-demand pool state — the pool, or
+// its absence — stamped with that state's own observation time.
 func (s grokBillingSnapshot) withOnDemandFrom(other grokBillingSnapshot) grokBillingSnapshot {
 	s.OnDemandCap, s.OnDemandUsed = other.OnDemandCap, other.OnDemandUsed
 	s.HasOnDemand, s.HasOnDemandUsed = other.HasOnDemand, other.HasOnDemandUsed
@@ -1772,17 +1777,16 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	metrics := []cliAgentUsageMetric{credits}
 
 	// On-demand is a separate pool with its own numbers, so an unmetered — or
-	// unrecognized — credits window must not suppress it.
-	if snap.HasOnDemand {
+	// unrecognized — credits window must not suppress it. A pool carrying its
+	// own future observation time is suppressed like a future record: its
+	// figures are never published under the percentage's older stamp.
+	if snap.HasOnDemand && !snap.onDemandObservedAt().After(now.Add(grokBillingMaxClockSkew)) {
 		onDemand := cliAgentUsageMetric{
 			Kind:       limitKindTokens,
 			Label:      "On-demand credits",
 			Unit:       "credits",
 			Total:      floatPtr(snap.OnDemandCap),
-			ObservedAt: observedAt,
-		}
-		if !snap.OnDemandObservedAt.IsZero() && !snap.OnDemandObservedAt.After(now.Add(grokBillingMaxClockSkew)) {
-			onDemand.ObservedAt = snap.OnDemandObservedAt.UTC().Format(time.RFC3339)
+			ObservedAt: snap.onDemandObservedAt().UTC().Format(time.RFC3339),
 		}
 		if snap.HasOnDemandUsed {
 			onDemand.Consumed = floatPtr(snap.OnDemandUsed)

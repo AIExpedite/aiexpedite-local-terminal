@@ -420,8 +420,9 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 				// card without a number. The reading is stamped with when its
 				// request was sent, so it only covers runs that completed
 				// before xAI could have answered.
-				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint, now()); ok {
-					if at, numeric := snap.numericAt(); numeric {
+				readAt := now()
+				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint, readAt); ok {
+					if at, numeric := snap.numericAt(readAt); numeric {
 						settleGrokRunFreshness(at.UnixMilli(), fingerprint)
 					}
 				}
@@ -860,11 +861,11 @@ func loadGrokBillingLive(fingerprint string, now time.Time) (grokBillingLiveView
 		switch {
 		case err == nil && (!snap.HasPeriodEnd || now.Before(snap.PeriodEnd)):
 			snap.ObservedAt = numericAt
-			// The on-demand pool came with the newest answer, not with the
-			// kept percentage, so it keeps that answer's observation time.
-			if snap.HasOnDemand {
-				snap.OnDemandObservedAt = observed
-			}
+			// The on-demand pool's state came with the newest answer, not
+			// with the kept percentage, so it keeps that answer's
+			// observation time — an answer that omitted the pool dates its
+			// removal, so an older pool elsewhere never fills it back in.
+			snap.OnDemandObservedAt = observed
 		default:
 			// The kept number belongs to a period that is over (or its stamp
 			// is unreadable): publish the newest answer, unmetered.

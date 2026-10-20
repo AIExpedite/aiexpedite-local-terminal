@@ -408,7 +408,9 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 	// generation goes with them. Symmetrically, a kept live percentage can
 	// win the credits row over a newer percent-less log record whose pool is
 	// fresher; that pool is carried onto the live reading, which still
-	// publishes the live commit's credits row under its generation.
+	// publishes the live commit's credits row under its generation. A newer
+	// answer that omitted the pool carries that removal the same way, so an
+	// older pool is never merged back over it.
 	switch {
 	case out.source == grokObservationLog && grokOnDemandPoolNewer(live, snap):
 		out.snap = out.snap.withOnDemandFrom(live)
@@ -419,11 +421,13 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 	return out
 }
 
-// grokOnDemandPoolNewer reports whether candidate holds an on-demand pool for
-// the same period as current that was observed after current's own pool.
+// grokOnDemandPoolNewer reports whether candidate's on-demand pool state for
+// the same period as current — a pool, or its removal — was observed after
+// current's own. Absence is timestamped too (see OnDemandObservedAt), so an
+// older pool never fills a newer snapshot's removal.
 func grokOnDemandPoolNewer(candidate, current grokBillingSnapshot) bool {
-	return candidate.HasOnDemand && candidate.samePeriod(current) &&
-		(!current.HasOnDemand || candidate.onDemandObservedAt().After(current.onDemandObservedAt()))
+	return (candidate.HasOnDemand || current.HasOnDemand) && candidate.samePeriod(current) &&
+		candidate.onDemandObservedAt().After(current.onDemandObservedAt())
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,

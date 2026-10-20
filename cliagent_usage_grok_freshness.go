@@ -287,7 +287,7 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 		return false
 	}
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
-	return ok && grokSnapshotCovers(snap, completionMs)
+	return ok && grokSnapshotCovers(snap, completionMs, grokUsageFreshnessNow())
 }
 
 // grokLiveReadingCovers is grokObservationCovers's live half alone: the
@@ -295,13 +295,13 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 // completionMs. A kept number whose period ended by now covers nothing.
 func grokLiveReadingCovers(fingerprint string, completionMs int64, now time.Time) bool {
 	live, ok := loadGrokBillingLiveSnapshot(fingerprint, now)
-	return ok && grokSnapshotCovers(live, completionMs)
+	return ok && grokSnapshotCovers(live, completionMs, now)
 }
 
 // grokSnapshotCovers reports whether snap's newest numeric pool was observed
 // at or after completionMs.
-func grokSnapshotCovers(snap grokBillingSnapshot, completionMs int64) bool {
-	at, numeric := snap.numericAt()
+func grokSnapshotCovers(snap grokBillingSnapshot, completionMs int64, now time.Time) bool {
+	at, numeric := snap.numericAt(now)
 	return numeric && at.UnixMilli() >= completionMs
 }
 
