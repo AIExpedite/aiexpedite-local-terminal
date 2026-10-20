@@ -407,16 +407,19 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 	// metrics then include the live commit's newest content, so its
 	// generation goes with them. Symmetrically, a kept live percentage can
 	// win the credits row over a newer percent-less log record whose pool is
-	// fresher; that pool is carried onto the live reading, which still
-	// publishes the live commit's credits row under its generation. A newer
-	// answer that omitted the pool carries that removal the same way, so an
-	// older pool is never merged back over it.
+	// fresher; that pool is carried onto the live reading. The merged reading
+	// then holds log content no live commit ever versioned, so it publishes
+	// unversioned: attaching the live generation would let a backend that
+	// already applied it treat the newer pool as covered. A newer answer that
+	// omitted the pool carries that removal the same way, so an older pool is
+	// never merged back over it.
 	switch {
 	case out.source == grokObservationLog && grokOnDemandPoolNewer(live, snap):
 		out.snap = out.snap.withOnDemandFrom(live)
 		out.source = grokObservationLive
 	case out.source == grokObservationLive && grokOnDemandPoolNewer(snap, live):
 		out.snap = out.snap.withOnDemandFrom(snap)
+		out.generation, out.cleared = nil, false
 	}
 	return out
 }

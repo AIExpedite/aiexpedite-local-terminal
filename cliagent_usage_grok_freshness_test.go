@@ -558,7 +558,8 @@ func TestGrokNewestBillingObservation_ANewerLiveOnDemandPoolRidesANewerLogPercen
 
 // The reverse direction: a kept live percentage wins the credits row over a
 // newer percent-less log record, but that record's fresher on-demand pool
-// still publishes, at its own time, beside the live generation.
+// still publishes, at its own time. The merged reading holds log content the
+// live generation never versioned, so it publishes unversioned.
 func TestGrokNewestBillingObservation_ANewerLogOnDemandPoolRidesAKeptLivePercentage(t *testing.T) {
 	withCodexGenerationEpoch(t, 8121)
 	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
@@ -588,8 +589,8 @@ func TestGrokNewestBillingObservation_ANewerLogOnDemandPoolRidesAKeptLivePercent
 	}
 
 	obs := grokBillingObservationFor(home, fingerprint, poolAt.Add(time.Minute))
-	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8121, 1) {
-		t.Fatalf("source=%d generation=%+v, want the live commit's generation {8121,1}", obs.source, obs.generation)
+	if obs.source != grokObservationLive || obs.generation != nil || obs.cleared {
+		t.Fatalf("source=%d generation=%+v cleared=%v, want an unversioned merged reading", obs.source, obs.generation, obs.cleared)
 	}
 	snap := obs.snap
 	if !snap.HasUsedPercent || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(liveAt) {
@@ -608,6 +609,9 @@ func TestGrokNewestBillingObservation_ANewerLogOnDemandPoolRidesAKeptLivePercent
 	obs = grokBillingObservationFor(home, fingerprint, poolAt.Add(2*time.Minute))
 	if obs.source != grokObservationLive || obs.snap.OnDemandUsed != 25 || obs.snap.UsedPercent != 37 {
 		t.Fatalf("observation = %+v source=%d, want the newest live reading whole", obs.snap, obs.source)
+	}
+	if obs.generation == nil || *obs.generation != gen(8121, 2) {
+		t.Fatalf("generation = %+v, want the live commit's own {8121,2}", obs.generation)
 	}
 }
 
