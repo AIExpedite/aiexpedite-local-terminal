@@ -808,3 +808,110 @@ func TestGrokNudge_AnAuthIdledDebtIsNotReopenedByMarkers(t *testing.T) {
 		t.Fatalf("reads = %d, want markers never to re-open an auth-idled debt", h.reads.Load())
 	}
 }
+
+/* ------------------- cross-process claim of a direct turn ------------------- */
+
+// A debt another agent process already opened for the same account (written
+// to the shared freshness file, its worker on it) is claimed: this process's
+// nudge for the same turn sends no read of its own.
+func TestGrokNudge_ADebtAnotherProcessOpenedIsNotReadTwice(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{
+		OwedAtMs: h.clock().UnixMilli(), CompletionMs: h.clock().Add(-time.Second).UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	if nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-time.Second), "fp-ada") {
+		t.Fatal("want the nudge to find the debt claimed")
+	}
+	h.idle()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, want none for a debt another process owns", h.reads.Load())
+	}
+}
+
+// A due rung is claimed by whichever start commits first: the nudge clears it
+// in the same write, so the rung's timer (here or in another process) firing
+// afterwards sends no second read.
+func TestGrokNudge_ADueRungIsClaimedOnce(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	if !nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-time.Second), "fp-ada") {
+		t.Fatal("the nudge must open the debt")
+	}
+	h.idle()
+	if h.reads.Load() != 1 || h.state().NextAttemptAtMs == 0 {
+		t.Fatalf("reads = %d state=%+v, want one read and a booked rung", h.reads.Load(), h.state())
+	}
+	stopGrokRunDebtRetry()
+	id := h.state().debtID()
+	h.advance(10 * time.Minute)
+	h.block = make(chan struct{})
+	if !nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-time.Second), "fp-ada") {
+		t.Fatal("want the nudge to start the due rung")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for h.reads.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := h.state().NextAttemptAtMs; got != 0 {
+		t.Fatalf("NextAttemptAtMs = %d, want the rung claimed by the nudge", got)
+	}
+	grokRunDebtRetryFired(func() uint64 {
+		grokRunDebtRetryTimer.mu.Lock()
+		defer grokRunDebtRetryTimer.mu.Unlock()
+		return grokRunDebtRetryTimer.gen
+	}(), id)
+	grokRefreshWorkerMu.Lock()
+	rearmed := grokRefreshWorkerRearm
+	grokRefreshWorkerMu.Unlock()
+	close(h.block)
+	h.idle()
+	if rearmed || h.reads.Load() != 2 {
+		t.Fatalf("reads = %d rearmed=%t, want the claimed rung paid once", h.reads.Load(), rearmed)
+	}
+}
+
+// Another agent process holding the freshness file's sibling lock refuses the
+// transaction: the nudge opens nothing and sends no read, and the same turn
+// is owed once the holder releases.
+func TestGrokNudge_AnotherProcessHoldingTheFreshnessLockDefersTheNudge(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	prevWait := grokUsageFreshnessLockWait
+	grokUsageFreshnessLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { grokUsageFreshnessLockWait = prevWait })
+	if err := os.MkdirAll(filepath.Dir(grokUsageFreshnessPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(grokUsageFreshnessPath()+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = unlockFile(held)
+			_ = held.Close()
+		}
+	}
+	t.Cleanup(release)
+
+	if nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-time.Second), "fp-ada") {
+		t.Fatal("want the nudge refused while another process holds the lock")
+	}
+	h.idle()
+	if h.reads.Load() != 0 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want nothing opened while locked", h.reads.Load(), h.state())
+	}
+
+	release()
+	if !nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-time.Second), "fp-ada") {
+		t.Fatal("want the nudge to open the debt once released")
+	}
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want one read that paid the debt", h.reads.Load(), h.state())
+	}
+}

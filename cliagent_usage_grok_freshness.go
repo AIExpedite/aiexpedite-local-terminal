@@ -210,6 +210,10 @@ var (
 // this process. Called from StartAgent.
 func SetGrokUsageRefreshEnabled(enabled bool) { grokUsageRefreshEnabled.Store(enabled) }
 
+// grokUsageFreshnessLockWait bounds how long a freshness transaction waits on
+// another agent process holding the sibling lock. A var so tests can pin it.
+var grokUsageFreshnessLockWait = 2 * time.Second
+
 func grokUsageFreshnessPath() string {
 	if p := os.Getenv(grokUsageFreshnessEnv); p != "" {
 		return p
@@ -221,11 +225,35 @@ func grokUsageFreshnessPath() string {
 // persists the result when it changed (temp-file + rename, removed once empty).
 // A missing or corrupt file reads as "nothing owed". Nothing under this lock
 // may take the billing cache lock.
+//
+// The transaction also holds the file's cross-process sibling lock, so two
+// agent processes sharing this data dir (Linux has no single-instance guard)
+// never both open the same debt or both claim the same due rung: whichever
+// commits first owns the read, and the other finds it claimed. A holder kept
+// past grokUsageFreshnessLockWait refuses the transaction — mutate does not
+// run and the state on disk is returned, so the caller starts nothing; a
+// filesystem that offers no lock takes the unlocked path, as the other caches
+// do.
 func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshness {
 	grokFreshnessMu.Lock()
 	defer grokFreshnessMu.Unlock()
 	path := grokUsageFreshnessPath()
 	var state grokUsageFreshness
+	if path != "" && os.MkdirAll(filepath.Dir(path), 0o755) == nil {
+		lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(grokUsageFreshnessLockWait))
+		if outcome == crossProcessLockContended {
+			if !readJSONFile(path, &state) {
+				state = grokUsageFreshness{}
+			}
+			return state
+		}
+		if lock != nil {
+			defer func() {
+				_ = unlockFile(lock)
+				_ = lock.Close()
+			}()
+		}
+	}
 	if !readJSONFile(path, &state) {
 		state = grokUsageFreshness{}
 	}
@@ -853,7 +881,9 @@ func grokArmRunDebtRetry(id grokDebtID, delay time.Duration) {
 }
 
 // grokRunDebtRetryFired re-reads the debt before doing anything, so a rung for
-// a debt that was paid or replaced meanwhile is a no-op.
+// a debt that was paid or replaced meanwhile is a no-op. It claims the rung
+// (clears NextAttemptAtMs) in one locked write, so a rung a nudge — in this or
+// another agent process — already took is not paid twice.
 func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 	t := &grokRunDebtRetryTimer
 	t.mu.Lock()
@@ -869,6 +899,15 @@ func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 		return
 	}
 	if state, owed := grokPendingDebt(grokUsageFreshnessNow()); !owed || state.debtID() != id {
+		return
+	}
+	claimed := false
+	updateGrokUsageFreshness(func(s *grokUsageFreshness) {
+		if s.owed() && s.debtID() == id && s.NextAttemptAtMs != 0 {
+			s.NextAttemptAtMs, claimed = 0, true
+		}
+	})
+	if !claimed {
 		return
 	}
 	grokStartRunDebtWorker(false)
@@ -932,6 +971,11 @@ func nudgeGrokUsageRefreshFor(now, completion time.Time, fingerprint string) boo
 				// One debt at a time: only a booked rung that is due. Any other
 				// is owned by its timer or by the worker already on it.
 				start = state.NextAttemptAtMs != 0 && state.NextAttemptAtMs <= now.UnixMilli()
+				if start {
+					// Claimed in this same locked write, so another process's
+					// nudge, or this rung's own timer, finds it taken.
+					state.NextAttemptAtMs = 0
+				}
 				if start && completionMs > state.CompletionMs {
 					// The due rung now pays this run too, so a reading taken
 					// before it (one that covers only the older run) no longer
