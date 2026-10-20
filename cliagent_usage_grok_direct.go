@@ -126,7 +126,16 @@ const grokDirectNoOwner = "no-owner:"
 var (
 	grokDirectMu    sync.Mutex
 	grokDirectState grokDirectCursor
+	// grokDirectForgets counts grokDirectForgetNudged calls (under
+	// grokDirectMu). A scan records a nudged marker only if no forget ran
+	// since it read the marker: the worker it starts can retire the debt and
+	// forget before the scan gets to record, and recording then would mark an
+	// unpaid turn handled.
+	grokDirectForgets uint64
 )
+
+// grokDirectNudge hands a turn to the run debt (a seam for tests).
+var grokDirectNudge = nudgeGrokUsageRefreshFor
 
 // grokDirectScanAtStartup runs one scan as the propagator starts: a turn that
 // completed while the agent was down or mid-update is found at once rather
@@ -164,6 +173,7 @@ func grokDirectScan(requireDetected bool) {
 	// no owner known yet (signed out since the process started) is nudged on
 	// the first poll after login, another account's once it signs back in.
 	markerMs, nudgedMs := grokDirectState.pending[fingerprint], grokDirectState.nudged[fingerprint]
+	forgets := grokDirectForgets
 	grokDirectMu.Unlock()
 	if fingerprint == "" || markerMs == 0 || markerMs <= nudgedMs {
 		return
@@ -178,11 +188,13 @@ func grokDirectScan(requireDetected bool) {
 	}
 	// A live armed run or the nudge cooldown refuses: the marker is kept and
 	// re-evaluated on the next poll.
-	if !nudgeGrokUsageRefreshFor(now, time.UnixMilli(markerMs), fingerprint) {
+	if !grokDirectNudge(now, time.UnixMilli(markerMs), fingerprint) {
 		return
 	}
 	grokDirectMu.Lock()
-	if markerMs > grokDirectState.nudged[fingerprint] {
+	// A forget since the read means a debt was retired unpaid, possibly the
+	// one this nudge just started: the turn stays owed for the next poll.
+	if forgets == grokDirectForgets && markerMs > grokDirectState.nudged[fingerprint] {
 		if grokDirectState.nudged == nil {
 			grokDirectState.nudged = map[string]int64{}
 		}
@@ -427,6 +439,7 @@ func grokDirectMarkerTimesMs(lines [][]byte, now time.Time) []int64 {
 func grokDirectForgetNudged() {
 	grokDirectMu.Lock()
 	grokDirectState.nudged = nil
+	grokDirectForgets++
 	grokDirectMu.Unlock()
 }
 

@@ -468,6 +468,46 @@ func TestGrokDirectScan_ATurnRetiredAcrossAnAccountChangeIsOwedAgainUnderItsAcco
 	}
 }
 
+// The worker a nudge starts can retire the debt as account_changed (and
+// forget the handled marker) before the scan records the nudge: the scan must
+// not then mark the unpaid turn handled.
+func TestGrokDirectScan_AForgetBeforeTheNudgeIsRecordedKeepsTheTurnOwed(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(liveProbeOutcomeAccountChanged)
+	prevNudge := grokDirectNudge
+	grokDirectNudge = func(now, completion time.Time, fingerprint string) bool {
+		started := prevNudge(now, completion, fingerprint)
+		h.idle() // the worker retires the debt and forgets first
+		return started
+	}
+	t.Cleanup(func() { grokDirectNudge = prevNudge })
+	turn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want one read retired as account_changed", h.reads.Load(), h.state())
+	}
+	grokDirectMu.Lock()
+	nudged := grokDirectState.nudged["fp-ada"]
+	grokDirectMu.Unlock()
+	if nudged != 0 {
+		t.Fatalf("nudged = %d, want the retired turn not recorded as handled", nudged)
+	}
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.signIn("fp-bob")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, want the turn owed again under its own account", h.reads.Load())
+	}
+	if !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatal("want fp-ada's reading to cover the turn")
+	}
+}
+
 // A read with no percentage but a numeric on-demand pool refreshes the card's
 // number, so it pays the turn instead of spending the rest of the ladder.
 func TestGrokDirectScan_ANumericOnDemandReadingPaysTheTurn(t *testing.T) {
