@@ -511,3 +511,73 @@ func TestGrokNewestBillingObservation_NumericLogBeatsNewerUnmeteredLiveInTheSame
 		t.Fatalf("observation after the period = %+v, want the newer live reading", snap)
 	}
 }
+
+/* ------------------- completion-based nudge (direct runs) ------------------- */
+
+// A nudge carries the turn's own completion: a numeric reading taken since
+// pays the debt for free.
+func TestGrokNudge_ACompletionBeforeTheNumericReadingIsCoveredWithNoRequest(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock(), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", UsedPercent: 12, HasUsedPercent: true,
+	}, "fp-ada"))
+	h.advance(5 * time.Second)
+	if !nudgeGrokUsageRefreshFor(h.clock(), h.clock().Add(-10*time.Second), "fp-ada") {
+		t.Fatal("the nudge must open the debt")
+	}
+	h.idle()
+	if h.reads.Load() != 0 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want the debt settled as covered", h.reads.Load(), h.state())
+	}
+	if got, _ := grokLastRefreshOutcome.Load().(string); got != "covered" {
+		t.Fatalf("outcome = %q, want covered", got)
+	}
+}
+
+// Markers arriving inside the cooldown, or while the budget is exhausted and
+// cooling, send no extra read.
+func TestGrokNudge_RepeatedMarkersInsideTheCooldownOrExhaustionSendNothing(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+	h.scan()
+	for i := 0; i < 3; i++ {
+		h.advance(10 * time.Second)
+		h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+		h.scan()
+	}
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want one inside the cooldown", h.reads.Load())
+	}
+	updateGrokUsageFreshness(func(s *grokUsageFreshness) {
+		s.Attempts, s.LastAttemptAtMs, s.NextAttemptAtMs = grokRunDebtMaxAttempts, h.clock().UnixMilli(), 0
+	})
+	for i := 0; i < 3; i++ {
+		h.advance(2 * grokRefreshNudgeCooldown)
+		h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+		h.scan()
+	}
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want none while the exhausted budget cools", h.reads.Load())
+	}
+}
+
+// A debt an auth refusal idled is not re-opened by markers: the auth notice
+// owns it until a run settles or the user clicks Refresh.
+func TestGrokNudge_AnAuthIdledDebtIsNotReopenedByMarkers(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(grokLiveOutcomeUnauthorized)
+	h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+	h.scan()
+	if h.reads.Load() != 1 || h.state().NextAttemptAtMs != 0 {
+		t.Fatalf("reads = %d state=%+v, want one read and an idle debt", h.reads.Load(), h.state())
+	}
+	for i := 0; i < 3; i++ {
+		h.advance(2 * grokRefreshNudgeCooldown)
+		h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+		h.scan()
+	}
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want markers never to re-open an auth-idled debt", h.reads.Load())
+	}
+}

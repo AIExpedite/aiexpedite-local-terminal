@@ -91,7 +91,7 @@ type grokDirectCursor struct {
 }
 
 var (
-	grokDirectMu     sync.Mutex
+	grokDirectMu    sync.Mutex
 	grokDirectState grokDirectCursor
 )
 

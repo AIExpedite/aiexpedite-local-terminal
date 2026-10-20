@@ -189,3 +189,65 @@ func TestGrokRunDebtStateAndLogsCarryOnlyMetrics(t *testing.T) {
 		t.Fatalf("the paid read was not logged as its closed outcome: %q", logged)
 	}
 }
+
+// The direct-run marker scan and the live cache's generation add three
+// surfaces: the marker lines it reads, the hint it sends and the cache it
+// versions. A direct turn whose marker line carries sentinels in `ctx`, read
+// with a sentinel credential against a billing answer carrying a sentinel
+// field, must leave none of them in the live cache, the debt state, the hint
+// body, the signed receipt or the device log.
+func TestGrokDirectRunMarkerHintAndCacheCarryOnlyMetrics(t *testing.T) {
+	a := newGrokAcceptance(t, 7201)
+	email := "ada-sentinel@example.com"
+	writeGrokAuth(t, a.home, "credential-sentinel", email, time.Now().Add(5*time.Hour))
+	grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, strings.Replace(grokFixtureBody(time.Now().Add(72*time.Hour)),
+			`"isUnifiedBillingUser":true`, `"isUnifiedBillingUser":true,"rawConfig":"raw-config-sentinel"`, 1)
+	})
+	logged := captureStdout(t, func() {
+		a.start()
+		turn := time.Now().UTC().Format(time.RFC3339Nano)
+		appendGrokDirectLog(t, grokBillingLogPath(a.home),
+			`{"ts":"`+turn+`","msg":"shell.turn.inference_done","access_token":"credential-sentinel",`+
+				`"ctx":{"prompt":"prompt-sentinel","toolResult":{"text":"tool-result-sentinel"},"email":"`+email+`"}}`+"\n")
+		a.waitGrokHint()
+		grokUsageRefreshWaitFor(10 * time.Second)
+	})
+
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage.UsageGeneration == nil {
+		t.Fatalf("parse = %+v ok=%t, want a versioned numeric reading", usage, ok)
+	}
+	receipt, _, _, err := canonicalCLIUsageRefreshReceipt("refresh-redaction", time.Now().UnixMilli(), true, []cliAgentUsage{*usage}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(receipt), "usageGeneration") {
+		t.Fatalf("the receipt does not carry the grok generation: %s", receipt)
+	}
+	hints, err := json.Marshal(a.grokHints())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, _ := os.ReadFile(grokBillingLiveCachePath())
+	state, _ := os.ReadFile(grokUsageFreshnessPath())
+	if len(cache) == 0 {
+		t.Fatal("no live cache was written")
+	}
+	for what, body := range map[string][]byte{
+		"live cache": cache, "debt state": state, "hint body": hints, "receipt": receipt, "device log": []byte(logged),
+	} {
+		assertNoGrokSentinels(t, what, body)
+		for _, secret := range []string{email, a.home, filepath.ToSlash(a.home), "shell.turn"} {
+			if what == "receipt" && secret == email {
+				continue // the card's account row is published by design
+			}
+			if strings.Contains(string(body), secret) {
+				t.Fatalf("%s leaked %q", what, secret)
+			}
+		}
+	}
+	if !strings.Contains(logged, "grok direct run: owed") {
+		t.Fatalf("the direct run was not logged as its fixed label: %q", logged)
+	}
+}

@@ -816,3 +816,136 @@ func TestGrokBillingMetrics_LiveUnknownPeriodKeepsFreshness(t *testing.T) {
 	}, now),
 		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-19T11:00:00Z","unknown":true}]`)
 }
+
+/* ------------------------- live cache: commits ------------------------- */
+
+// grokLiveCacheFixture isolates the live cache on a pinned process epoch.
+func grokLiveCacheFixture(t *testing.T, epoch int64) {
+	t.Helper()
+	withCodexGenerationEpoch(t, epoch)
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+}
+
+func grokLiveEntry(fingerprint string, at time.Time, percent *float64, periodEnd time.Time) grokBillingLiveCache {
+	snap := grokBillingSnapshot{ObservedAt: at, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", PeriodEnd: periodEnd, HasPeriodEnd: !periodEnd.IsZero()}
+	if percent != nil {
+		snap.UsedPercent, snap.HasUsedPercent = *percent, true
+	}
+	return grokBillingLiveFromSnapshot(snap, fingerprint)
+}
+
+func readGrokLiveCacheFile(t *testing.T) grokBillingLiveCache {
+	t.Helper()
+	var entry grokBillingLiveCache
+	if !readJSONFile(grokBillingLiveCachePath(), &entry) {
+		t.Fatal("no live cache on disk")
+	}
+	return entry
+}
+
+func TestGrokLiveCache_UnmeteredInTheSameOpenPeriodKeepsTheNumber(t *testing.T) {
+	grokLiveCacheFixture(t, 8101)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+	before := readGrokLiveCacheFile(t).Generation
+	if before == nil || *before != gen(8101, 1) {
+		t.Fatalf("generation = %+v, want {8101,1}", before)
+	}
+
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Hour), nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != *before {
+		t.Fatalf("generation = %+v, want an unmetered read never to bump it", entry.Generation)
+	}
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", at.Add(2*time.Hour))
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) {
+		t.Fatalf("snap = %+v ok=%t, want 36%% at its own older observedAt", snap, ok)
+	}
+}
+
+func TestGrokLiveCache_ANewerNumericReadWithTheSamePercentBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8102)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(36), end))
+	if g := readGrokLiveCacheFile(t).Generation; g == nil || *g != gen(8102, 2) {
+		t.Fatalf("generation = %+v, want a newer numeric observedAt to bump to {8102,2}", g)
+	}
+	// The same reading again commits nothing new.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(36), end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8102, 2) {
+		t.Fatalf("generation = %+v, want an identical read to keep {8102,2}", g)
+	}
+	// Another epoch's cache restarts at counter 1 on this one.
+	codexProcessGenerationEpoch.Store(8103)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(2*time.Minute), floatPtr(40), end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8103, 1) {
+		t.Fatalf("generation = %+v, want {8103,1}", g)
+	}
+}
+
+func TestGrokLiveCache_AcrossARolloverTheUnmeteredReadWins(t *testing.T) {
+	grokLiveCacheFixture(t, 8104)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(80), end))
+	// A new period, unmetered: the old figure is not borrowed.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", end.Add(time.Minute), nil, end.Add(7*24*time.Hour)))
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada", end.Add(2*time.Minute)); !ok || snap.HasUsedPercent {
+		t.Fatalf("snap = %+v, want the new period's unmetered answer", snap)
+	}
+}
+
+func TestGrokLiveCache_AKeptNumberPastItsPeriodEndIsNeverLiveCoverage(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8105)
+	at := h.clock()
+	end := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(50), end))
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(30*time.Minute), nil, end))
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada", at.Add(45*time.Minute)); !ok || !snap.HasUsedPercent {
+		t.Fatalf("inside the period: snap = %+v, want the kept number", snap)
+	}
+	h.advance(2 * time.Hour) // past the period end
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", h.clock())
+	if !ok || snap.HasUsedPercent || !snap.ObservedAt.Equal(at.Add(30*time.Minute)) {
+		t.Fatalf("past the end: snap = %+v, want the unmetered answer only", snap)
+	}
+	if grokObservationCovers("fp-ada", at.UnixMilli()) {
+		t.Fatal("a rolled-over kept number must not cover a debt")
+	}
+	if g, refused := grokRecoveryGeneration(h.clock()); g != nil || refused {
+		t.Fatalf("recovery = %+v refused=%t, want nothing recovered past the period end", g, refused)
+	}
+}
+
+func TestGrokRecovery_SkipsAnotherAccountAndAnUnknownReading(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8106)
+	at := h.clock().Add(-time.Minute)
+	end := h.clock().Add(48 * time.Hour)
+
+	saveGrokBillingLive(grokLiveEntry("fp-other", at, floatPtr(20), end))
+	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
+		t.Fatalf("recovered %+v for another account", g)
+	}
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, nil, end))
+	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
+		t.Fatalf("recovered %+v for an unmetered (Unknown) reading", g)
+	}
+
+	// A numeric reading an earlier process committed is moved onto this
+	// epoch in one write.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(20), end))
+	codexProcessGenerationEpoch.Store(8107)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8107, 1) || !grokGenerationRotated.Load() {
+		t.Fatalf("recovery = %+v refused=%t rotated=%t, want {8107,1}", g, refused, grokGenerationRotated.Load())
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8107, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation on disk", on)
+	}
+}
