@@ -134,6 +134,19 @@ func (c grokBillingLiveCache) numericObservedAt() (time.Time, bool) {
 	return t, err == nil
 }
 
+// hasNumericOnDemand reports whether the entry carries an on-demand pool that
+// grokBillingMetrics renders as numbers (a cap with a usage figure inside it):
+// a reading of its own, versioned even while the credits window is unmetered.
+func (c grokBillingLiveCache) hasNumericOnDemand() bool {
+	return grokBillingLiveCacheSnapshot(c, time.Time{}).HasOnDemandUsed
+}
+
+// sameOnDemand reports whether two entries carry the same on-demand figures.
+func (c grokBillingLiveCache) sameOnDemand(other grokBillingLiveCache) bool {
+	eq := func(a, b *float64) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+	return eq(c.OnDemandCap, other.OnDemandCap) && eq(c.OnDemandUsed, other.OnDemandUsed)
+}
+
 var (
 	grokBillingLiveCacheMu sync.Mutex
 	// grokGenerationRotated reports a committed live-cache write carrying this
@@ -625,7 +638,13 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     rollover, or for another account, the unmetered read replaces it.
 //   - A numeric read advances the generation when it commits a newer numeric
 //     observation, a changed percentage, or a new billing period (another
-//     account is all three). An unmetered read never advances it.
+//     account is all three). An unmetered read never advances it on the
+//     percentage's behalf.
+//   - A numeric on-demand pool is versioned on its own terms: a read carrying
+//     one advances the generation when it is newer than the cached pool, its
+//     figures changed, or there was no same-account numeric pool — so fresh
+//     on-demand numbers never ride an older generation under a kept
+//     percentage.
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -664,6 +683,14 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			(entryErr == nil && entryAt.After(prevNumericAt)) ||
 			*prev.UsedPercent != *entry.UsedPercent ||
 			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
+	}
+	if !advanced && entry.hasNumericOnDemand() {
+		// The cached pool is stamped with the entry's ObservedAt (the newest
+		// answer), never with a kept percentage's NumericObservedAt.
+		prevPoolAt, prevPoolErr := time.Parse(time.RFC3339Nano, prev.ObservedAt)
+		advanced = !sameAccount || !prev.hasNumericOnDemand() || prevPoolErr != nil ||
+			(entryErr == nil && entryAt.After(prevPoolAt)) ||
+			!prev.sameOnDemand(entry)
 	}
 	epoch := codexProcessGenerationEpoch.Load()
 	if advanced {
@@ -726,10 +753,7 @@ var (
 func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
 	fingerprint := grokUsageCurrentFingerprint()
 	snap, ok := loadGrokBillingLiveSnapshot(fingerprint, now)
-	if !ok || !snap.HasUsedPercent {
-		return nil, false
-	}
-	if metrics := grokBillingMetrics(snap, now); len(metrics) == 0 || metrics[0].Unknown {
+	if !ok || !grokBillingMetricsNumeric(grokBillingMetrics(snap, now)) {
 		return nil, false
 	}
 	return rotateGrokBillingLiveGeneration(fingerprint)
@@ -794,6 +818,11 @@ func loadGrokBillingLive(fingerprint string, now time.Time) (grokBillingLiveView
 		switch {
 		case err == nil && (!snap.HasPeriodEnd || now.Before(snap.PeriodEnd)):
 			snap.ObservedAt = numericAt
+			// The on-demand pool came with the newest answer, not with the
+			// kept percentage, so it keeps that answer's observation time.
+			if snap.HasOnDemand {
+				snap.OnDemandObservedAt = observed
+			}
 		default:
 			// The kept number belongs to a period that is over (or its stamp
 			// is unreadable): publish the newest answer, unmetered.

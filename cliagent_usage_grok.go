@@ -199,7 +199,7 @@ func (p grokUsageParser) ParseContext(ctx context.Context, home string, detected
 			// process's epoch is versioned: a log-sourced metric has no
 			// generation, and one an earlier process committed may already be
 			// applied (see grokGenerationRotated).
-			if obs.source == grokObservationLive && !metrics[0].Unknown && obs.generation != nil &&
+			if obs.source == grokObservationLive && grokBillingMetricsNumeric(metrics) && obs.generation != nil &&
 				grokGenerationRotated.Load() && obs.generation.Epoch == codexProcessGenerationEpoch.Load() &&
 				obs.generation.Counter > 0 {
 				g := *obs.generation

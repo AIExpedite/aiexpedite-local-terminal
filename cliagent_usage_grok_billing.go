@@ -225,16 +225,20 @@ type grokBillingSnapshot struct {
 	// HasUsedPercent is false when the record named a billing period but no
 	// usage figure — the shape Grok 1.0 emits. UsedPercent is meaningless then
 	// and must never be plotted; the period itself is still authoritative.
-	HasUsedPercent   bool
-	ObservedAt       time.Time
-	PeriodType       string
-	PeriodEnd        time.Time
-	HasPeriodEnd     bool
-	OnDemandCap      float64
-	OnDemandUsed     float64
-	HasOnDemand      bool
-	HasOnDemandUsed  bool
-	SubscriptionTier string
+	HasUsedPercent  bool
+	ObservedAt      time.Time
+	PeriodType      string
+	PeriodEnd       time.Time
+	HasPeriodEnd    bool
+	OnDemandCap     float64
+	OnDemandUsed    float64
+	HasOnDemand     bool
+	HasOnDemandUsed bool
+	// OnDemandObservedAt, when set, is the on-demand pool's own observation
+	// time — later than ObservedAt when the live cache kept an older
+	// percentage under a newer unmetered answer that carried the pool.
+	OnDemandObservedAt time.Time
+	SubscriptionTier   string
 }
 
 // samePeriod reports whether two observations name the same billing period:
@@ -1743,6 +1747,9 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 			Total:      floatPtr(snap.OnDemandCap),
 			ObservedAt: observedAt,
 		}
+		if !snap.OnDemandObservedAt.IsZero() && !snap.OnDemandObservedAt.After(now.Add(grokBillingMaxClockSkew)) {
+			onDemand.ObservedAt = snap.OnDemandObservedAt.UTC().Format(time.RFC3339)
+		}
 		if snap.HasOnDemandUsed {
 			onDemand.Consumed = floatPtr(snap.OnDemandUsed)
 			onDemand.Remaining = floatPtr(snap.OnDemandCap - snap.OnDemandUsed)
@@ -1755,6 +1762,18 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		metrics = append(metrics, onDemand)
 	}
 	return metrics
+}
+
+// grokBillingMetricsNumeric reports whether any rendered pool carries numbers
+// — the credits percentage or the on-demand pool. Either is a reading the card
+// shows, so either is what a capture generation versions.
+func grokBillingMetricsNumeric(metrics []cliAgentUsageMetric) bool {
+	for _, m := range metrics {
+		if !m.Unknown {
+			return true
+		}
+	}
+	return false
 }
 
 // grokUnknownCreditsMetric is the inferred placeholder: a limit exists, but no

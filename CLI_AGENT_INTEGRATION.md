@@ -809,9 +809,12 @@ the session-end wake still reaches the card:
   and sends one `POST /device/:id/cli-usage/observed` hint. An unmetered read
   never bumps it, and inside the same open period it keeps the numeric
   reading (`numericObservedAt`) instead of erasing it; past the period end the
-  kept number is never returned, covers no debt and is never recovered.
+  kept number is never returned, covers no debt and is never recovered. A
+  numeric on-demand pool (cap plus used) is versioned on its own: a newer or
+  changed pool bumps the generation even when the credits window is
+  unmetered, and keeps its own `observedAt` beside a kept percentage.
 - `grokUsageParser.ParseContext` publishes `usageGeneration` only for a
-  numeric metric the live cache won, on this process's epoch, once the cache
+  numeric metric (credits or on-demand) the live cache won, on this process's epoch, once the cache
   has rotated (`grokGenerationRotated`), and reserves it for the signed
   refresh receipt (`observeCLIUsageGeneration`). Hints wait for that rotation.
 - Startup recovery (`recoverGrokUsageGeneration`) moves a cache that still

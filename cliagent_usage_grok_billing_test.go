@@ -898,6 +898,73 @@ func TestGrokLiveCache_AcrossARolloverTheUnmeteredReadWins(t *testing.T) {
 	}
 }
 
+// grokLiveOnDemandEntry is grokLiveEntry carrying an on-demand pool.
+func grokLiveOnDemandEntry(fingerprint string, at time.Time, percent *float64, periodEnd time.Time, cap, used float64) grokBillingLiveCache {
+	entry := grokLiveEntry(fingerprint, at, percent, periodEnd)
+	entry.OnDemandCap, entry.OnDemandUsed = floatPtr(cap), floatPtr(used)
+	return entry
+}
+
+func TestGrokLiveCache_AnUnmeteredReadWithANumericOnDemandPoolBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8108)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, floatPtr(36), end, 50, 5))
+
+	// Credits unmetered, on-demand moved: the pool is a fresh numeric reading.
+	later := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 12))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8108, 2) {
+		t.Fatalf("generation = %+v, want the on-demand pool to bump to {8108,2}", entry.Generation)
+	}
+	now := at.Add(2 * time.Hour)
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", now)
+	if !ok || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) || !snap.OnDemandObservedAt.Equal(later) {
+		t.Fatalf("snap = %+v ok=%t, want 36%% at its own time and the pool at the newer one", snap, ok)
+	}
+	metrics := grokBillingMetrics(snap, now)
+	if len(metrics) != 2 || metrics[1].ObservedAt != later.Format(time.RFC3339) || *metrics[1].Consumed != 12 {
+		t.Fatalf("metrics = %+v, want the on-demand row stamped with its own read", metrics)
+	}
+
+	// The same pool again advances nothing; a changed pool does.
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 12))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8108, 2) {
+		t.Fatalf("generation = %+v, want an identical pool to keep {8108,2}", g)
+	}
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 20))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8108, 3) {
+		t.Fatalf("generation = %+v, want changed figures to bump to {8108,3}", g)
+	}
+}
+
+func TestGrokLiveCache_AnUnmeteredReadWithoutUsageOnTheCapNeverBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8109)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	entry := grokLiveEntry("fp-ada", at, nil, end)
+	entry.OnDemandCap = floatPtr(50) // a cap with no usage renders Unknown
+	saveGrokBillingLive(entry)
+	if g := readGrokLiveCacheFile(t).Generation; g != nil {
+		t.Fatalf("generation = %+v, want an Unknown pool never versioned", g)
+	}
+}
+
+func TestGrokRecovery_RecoversAnOnDemandOnlyReading(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8110)
+	at := h.clock().Add(-time.Minute)
+	end := h.clock().Add(48 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, nil, end, 50, 7))
+	codexProcessGenerationEpoch.Store(8111)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8111, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want the numeric on-demand pool recovered as {8111,1}", g, refused)
+	}
+}
+
 func TestGrokLiveCache_AKeptNumberPastItsPeriodEndIsNeverLiveCoverage(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	withCodexGenerationEpoch(t, 8105)
