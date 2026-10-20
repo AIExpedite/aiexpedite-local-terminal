@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -434,5 +435,65 @@ func TestGrokDirectScan_ALogReplacedAtTheSamePathIsReadFromItsStart(t *testing.T
 	h.scan()
 	if h.reads.Load() != 1 {
 		t.Fatalf("reads = %d, want the rotated log's turn found", h.reads.Load())
+	}
+}
+
+// A turn whose debt was retired because the login moved is no longer handled:
+// it is never paid under the other account, and is owed again once its own
+// account signs back in.
+func TestGrokDirectScan_ATurnRetiredAcrossAnAccountChangeIsOwedAgainUnderItsAccount(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(liveProbeOutcomeAccountChanged)
+	turn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want one read retired as account_changed", h.reads.Load(), h.state())
+	}
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.signIn("fp-bob")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want fp-ada's turn never paid under fp-bob", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, want the turn owed again under its own account", h.reads.Load())
+	}
+	if !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatal("want fp-ada's reading to cover the turn")
+	}
+}
+
+// A read with no percentage but a numeric on-demand pool refreshes the card's
+// number, so it pays the turn instead of spending the rest of the ladder.
+func TestGrokDirectScan_ANumericOnDemandReadingPaysTheTurn(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	grokBillingLiveReadFn = func(_ context.Context, _, _ string, now func() time.Time) string {
+		h.reads.Add(1)
+		saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+			ObservedAt: now(), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+			HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 7,
+		}, h.fingerprint()))
+		return grokLiveOutcomeOK
+	}
+	turn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want the on-demand reading to pay the debt", h.reads.Load(), h.state())
+	}
+	if got := grokLastRefreshOutcome.Load(); got != grokLiveOutcomeOK {
+		t.Fatalf("outcome = %v, want ok (not relabelled unmetered)", got)
+	}
+	for range 4 {
+		h.advance(time.Hour)
+		h.scan()
+	}
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want no further reads for a covered turn", h.reads.Load())
 	}
 }

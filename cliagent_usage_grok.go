@@ -195,11 +195,11 @@ func (p grokUsageParser) ParseContext(ctx context.Context, home string, detected
 		if metrics := grokBillingMetrics(obs.snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
 			usage.Plan = firstNonEmpty(usage.Plan, obs.snap.SubscriptionTier)
-			// Only a numeric reading the live cache committed on this
-			// process's epoch is versioned: a log-sourced metric has no
-			// generation, and one an earlier process committed may already be
-			// applied (see grokGenerationRotated).
-			if obs.source == grokObservationLive && grokBillingMetricsNumeric(metrics) && obs.generation != nil &&
+			// Only a numeric reading — or the clear of one — the live cache
+			// committed on this process's epoch is versioned: a log-sourced
+			// metric has no generation, and one an earlier process committed
+			// may already be applied (see grokGenerationRotated).
+			if obs.source == grokObservationLive && (obs.cleared || grokBillingMetricsNumeric(metrics)) && obs.generation != nil &&
 				grokGenerationRotated.Load() && obs.generation.Epoch == codexProcessGenerationEpoch.Load() &&
 				obs.generation.Counter > 0 {
 				g := *obs.generation
@@ -352,7 +352,10 @@ type grokBillingObservation struct {
 	source grokObservationSource
 	// generation is the live cache's committed generation (nil when the
 	// cache has none or did not answer).
-	generation  *cliUsageGeneration
+	generation *cliUsageGeneration
+	// cleared reports that generation versions the live cache's clear
+	// (grokBillingLiveCache.Cleared).
+	cleared     bool
 	owesRefresh bool
 	// recordAt is the log record's observation time when owesRefresh is set.
 	recordAt time.Time
@@ -362,7 +365,7 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	view, liveOK := loadGrokBillingLive(fingerprint, now)
 	live := view.snap
-	out := grokBillingObservation{generation: view.generation}
+	out := grokBillingObservation{generation: view.generation, cleared: view.cleared}
 	out.owesRefresh = ok && !snap.HasUsedPercent && (!liveOK || snap.ObservedAt.After(view.answeredAt))
 	if out.owesRefresh {
 		out.recordAt = snap.ObservedAt

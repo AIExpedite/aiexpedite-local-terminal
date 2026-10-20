@@ -92,6 +92,10 @@ type grokDirectCursor struct {
 	// there the debt's own ladder owns it (any read it sends postdates the
 	// turn), so the same turn never re-opens a budget the debt spent.
 	nudgedMarkerMs int64
+	// markerAccount is the fingerprint signed in when newestMarkerMs was found
+	// (adopted by the first scan that sees an account): the turn is only ever
+	// paid under that account, never against a login that switched in later.
+	markerAccount string
 }
 
 var (
@@ -136,6 +140,15 @@ func grokDirectScan(requireDetected bool) {
 	fingerprint := grokUsageCurrentFingerprint()
 	if fingerprint == "" {
 		return // kept: the first poll after login nudges it
+	}
+	grokDirectMu.Lock()
+	if grokDirectState.newestMarkerMs == markerMs && grokDirectState.markerAccount == "" {
+		grokDirectState.markerAccount = fingerprint
+	}
+	owner := grokDirectState.markerAccount
+	grokDirectMu.Unlock()
+	if owner != fingerprint {
+		return // kept: another account's turn, nudged once it signs back in
 	}
 	if grokLiveReadingCovers(fingerprint, markerMs, now) {
 		grokDirectMu.Lock()
@@ -228,7 +241,7 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 	}
 	c.offset, c.midLine = start+int64(lastNewline)+1, false
 	if ms := grokNewestDirectMarkerMs(lines, now); ms > c.newestMarkerMs {
-		c.newestMarkerMs = ms
+		c.newestMarkerMs, c.markerAccount = ms, ""
 	}
 }
 
@@ -261,6 +274,15 @@ func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
 		}
 	}
 	return newest
+}
+
+// grokDirectForgetNudged is told when a debt is retired because the login
+// moved off its account: no reading landed for a turn handed to it, so that
+// turn is no longer handled and is nudged again once its account is back.
+func grokDirectForgetNudged() {
+	grokDirectMu.Lock()
+	grokDirectState.nudgedMarkerMs = 0
+	grokDirectMu.Unlock()
 }
 
 // resetGrokDirectScan forgets the cursor (tests, propagator reset).

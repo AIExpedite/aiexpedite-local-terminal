@@ -273,9 +273,11 @@ func grokDebtExhausted(state grokUsageFreshness, now time.Time) bool {
 }
 
 // grokObservationCovers reports whether a NUMERIC reading for fingerprint was
-// taken at or after completionMs — the live read or a log record. A reading
-// without a percentage pays nothing: the card would still have no number, and
-// retiring the debt on it would stop the ladder that can still get one.
+// taken at or after completionMs — the live read or a log record. NUMERIC is
+// the percentage or an on-demand pool with usage, each at its own time
+// (grokBillingSnapshot.numericAt). A reading with neither pays nothing: the
+// card would still have no number, and retiring the debt on it would stop the
+// ladder that can still get one.
 func grokObservationCovers(fingerprint string, completionMs int64) bool {
 	if grokLiveReadingCovers(fingerprint, completionMs, grokUsageFreshnessNow()) {
 		return true
@@ -285,7 +287,7 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 		return false
 	}
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
-	return ok && snap.HasUsedPercent && snap.ObservedAt.UnixMilli() >= completionMs
+	return ok && grokSnapshotCovers(snap, completionMs)
 }
 
 // grokLiveReadingCovers is grokObservationCovers's live half alone: the
@@ -293,7 +295,14 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 // completionMs. A kept number whose period ended by now covers nothing.
 func grokLiveReadingCovers(fingerprint string, completionMs int64, now time.Time) bool {
 	live, ok := loadGrokBillingLiveSnapshot(fingerprint, now)
-	return ok && live.HasUsedPercent && live.ObservedAt.UnixMilli() >= completionMs
+	return ok && grokSnapshotCovers(live, completionMs)
+}
+
+// grokSnapshotCovers reports whether snap's newest numeric pool was observed
+// at or after completionMs.
+func grokSnapshotCovers(snap grokBillingSnapshot, completionMs int64) bool {
+	at, numeric := snap.numericAt()
+	return numeric && at.UnixMilli() >= completionMs
 }
 
 /* ──────────────────────────────── arm ──────────────────────────────── */
@@ -634,13 +643,20 @@ func grokPendingDebt(now time.Time) (grokUsageFreshness, bool) {
 // account), so retiring an old debt never forgets a run in progress.
 func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 	oldest := grokOldestLiveFloor()
+	retired := false
 	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
 		if !state.owed() || state.debtID() != id {
 			return
 		}
 		state.clearDebt()
 		state.setRunFloor(oldest.floorMs, oldest.fingerprint)
+		retired = true
 	})
+	if retired && label == liveProbeOutcomeAccountChanged {
+		// Retired unpaid: a direct turn handed to this debt is owed again
+		// when its account signs back in.
+		grokDirectForgetNudged()
+	}
 	grokLastRefreshOutcome.Store(label)
 	fmt.Printf("%s[cli-usage] grok refresh: retired %s attempts=%d%s\n", colorYellow, label, attempts, colorReset)
 }
@@ -695,7 +711,7 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		return state, grokRetryNone
 	}
 	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {
-		// xAI answered with a period but no percentage: nothing for the card,
+		// xAI answered with a period but no number: nothing for the card,
 		// so the read pays nothing and the ladder tries again.
 		outcome = grokRefreshOutcomeUnmetered
 	}

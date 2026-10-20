@@ -485,3 +485,56 @@ func TestGrokUsage_ManagedSmokeAfterAnUpdateCommitsAGenerationTheReceiptCarries(
 		t.Fatalf("receipt usageGeneration = %+v, want {7304,1}", g)
 	}
 }
+
+// A new period that clears the number is versioned like any reading: the
+// commit advances the generation, hints it, publishes it with the Unknown row,
+// and a process that inherits it unhinted recovers it once.
+func TestGrokUsage_ARolloverClearIsHintedPublishedAndRecovered(t *testing.T) {
+	a := newGrokAcceptance(t, 7310)
+	fingerprint := grokAccountFingerprintFor(a.home)
+	a.start()
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: time.Now().Add(-2 * time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		UsedPercent: 80, HasUsedPercent: true, PeriodEnd: time.Now().Add(-time.Hour), HasPeriodEnd: true,
+	}, fingerprint))
+	unmetered := grokBillingSnapshot{
+		ObservedAt: time.Now().Add(-time.Minute), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: time.Now().Add(72 * time.Hour), HasPeriodEnd: true,
+	}
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(unmetered, fingerprint))
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || entry.Generation == nil || *entry.Generation != gen(7310, 2) {
+		t.Fatalf("cache = %+v, want the clear versioned as {7310,2}", entry)
+	}
+	// A later unmetered answer keeps the clear without advancing again.
+	unmetered.ObservedAt = time.Now()
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(unmetered, fingerprint))
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || *entry.Generation != gen(7310, 2) {
+		t.Fatalf("cache = %+v, want the clear kept at {7310,2}", entry)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hints := a.grokHints()
+		if len(hints) > 0 && hints[len(hints)-1].Generation == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grok hints = %+v, want the clear's generation hinted", hints)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) == 0 || !usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want the new period's Unknown row", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7310, 2) {
+		t.Fatalf("usageGeneration = %+v, want the clear's {7310,2} published", usage.UsageGeneration)
+	}
+
+	codexProcessGenerationEpoch.Store(7311)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(time.Now())
+	if refused || g == nil || *g != gen(7311, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want the clear recovered as {7311,1}", g, refused)
+	}
+}

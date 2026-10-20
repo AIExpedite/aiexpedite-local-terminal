@@ -116,8 +116,14 @@ type grokBillingLiveCache struct {
 	// time, which is what the card and every coverage check must use.
 	NumericObservedAt string `json:"numericObservedAt,omitempty"`
 	// Generation is the capture generation of the newest committed numeric
-	// read (cliUsageGeneration); additive, so schema 1 readers ignore it.
+	// read, or of the clear that replaced it (cliUsageGeneration); additive,
+	// so schema 1 readers ignore it.
 	Generation *cliUsageGeneration `json:"generation,omitempty"`
+	// Cleared reports that Generation versions a clear: this account's
+	// numeric reading was replaced by an answer with no number (a new
+	// period, or one whose kept figure has ended). The parser publishes and
+	// recovery re-hints that generation although the card renders Unknown.
+	Cleared bool `json:"cleared,omitempty"`
 }
 
 // numericObservedAt is when the cached percentage was observed, or zero when
@@ -409,12 +415,15 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 			defer cancel()
 			outcome := grokBillingLiveReadFn(readCtx, grokPath, fingerprint, now)
 			if outcome == grokLiveOutcomeOK {
-				// Only a reading with a percentage pays a run's debt; one that
-				// names a period alone leaves the card without a number. The
-				// reading is stamped with when its request was sent, so it only
-				// covers runs that completed before xAI could have answered.
-				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint, now()); ok && snap.HasUsedPercent {
-					settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
+				// Only a numeric reading (the percentage or the on-demand pool)
+				// pays a run's debt; one that names a period alone leaves the
+				// card without a number. The reading is stamped with when its
+				// request was sent, so it only covers runs that completed
+				// before xAI could have answered.
+				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint, now()); ok {
+					if at, numeric := snap.numericAt(); numeric {
+						settleGrokRunFreshness(at.UnixMilli(), fingerprint)
+					}
 				}
 			}
 			return grokBillingRead{outcome: outcome, startedAt: startedAt}, nil
@@ -639,12 +648,18 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //   - A numeric read advances the generation when it commits a newer numeric
 //     observation, a changed percentage, or a new billing period (another
 //     account is all three). An unmetered read never advances it on the
-//     percentage's behalf.
+//     percentage's behalf, except as a clear (below).
 //   - A numeric on-demand pool is versioned on its own terms: a read carrying
 //     one advances the generation when it is newer than the cached pool, its
 //     figures changed, or there was no same-account numeric pool — so fresh
 //     on-demand numbers never ride an older generation under a kept
 //     percentage.
+//   - A clear is versioned too: when the read brings no number and this
+//     account's cached one (the percentage or the on-demand pool) is not
+//     carried, the commit advances the generation and marks the entry
+//     Cleared, so the card's switch to Unknown reaches terminal-service like
+//     any other change. A later unmetered read for the same account keeps the
+//     mark without advancing again.
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -662,6 +677,7 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 
 	entry.NumericObservedAt = ""
 	entry.Generation = nil
+	entry.Cleared = false
 	if hasPrev && prev.Generation != nil {
 		// Counters only move forward within an epoch, whoever is signed in.
 		g := *prev.Generation
@@ -691,6 +707,14 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		advanced = !sameAccount || !prev.hasNumericOnDemand() || prevPoolErr != nil ||
 			(entryErr == nil && entryAt.After(prevPoolAt)) ||
 			!prev.sameOnDemand(entry)
+	}
+	if !advanced && sameAccount && entry.UsedPercent == nil && !entry.hasNumericOnDemand() {
+		switch {
+		case prevNumeric || prev.hasNumericOnDemand():
+			advanced, entry.Cleared = true, true
+		case prev.Cleared:
+			entry.Cleared = true
+		}
 	}
 	epoch := codexProcessGenerationEpoch.Load()
 	if advanced {
@@ -746,14 +770,15 @@ var (
 
 // grokRecoveryGeneration is the rotated generation of a live cache that still
 // holds a numeric reading for the account signed in now, in a period still
-// open at now (grokBillingMetrics renders it as a number), or nil. A reading
+// open at now (grokBillingMetrics renders it as a number) — or a versioned
+// clear of one (Cleared) — or nil. A reading
 // committed just before an update hand-off — whose hint died with the old
 // process — is hinted again this way; the backend skips a generation it
 // already applied. refused reports a rotation write that did not commit.
 func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
 	fingerprint := grokUsageCurrentFingerprint()
-	snap, ok := loadGrokBillingLiveSnapshot(fingerprint, now)
-	if !ok || !grokBillingMetricsNumeric(grokBillingMetrics(snap, now)) {
+	view, ok := loadGrokBillingLive(fingerprint, now)
+	if !ok || !(view.cleared || grokBillingMetricsNumeric(grokBillingMetrics(view.snap, now))) {
 		return nil, false
 	}
 	return rotateGrokBillingLiveGeneration(fingerprint)
@@ -785,6 +810,8 @@ type grokBillingLiveView struct {
 	snap grokBillingSnapshot
 	// generation is the cache's committed capture generation (nil when none).
 	generation *cliUsageGeneration
+	// cleared reports that generation versions a clear (grokBillingLiveCache.Cleared).
+	cleared bool
 	// answeredAt is when xAI last answered, metered or not: an unmetered
 	// answer still proves billing was read after an older log record.
 	answeredAt time.Time
@@ -829,7 +856,9 @@ func loadGrokBillingLive(fingerprint string, now time.Time) (grokBillingLiveView
 			snap.UsedPercent, snap.HasUsedPercent = 0, false
 		}
 	}
-	return grokBillingLiveView{snap: snap, generation: entry.Generation, answeredAt: observed}, true
+	view := grokBillingLiveView{snap: snap, generation: entry.Generation, answeredAt: observed}
+	view.cleared = entry.Cleared && entry.Generation != nil && !snap.HasUsedPercent && !snap.HasOnDemandUsed
+	return view, true
 }
 
 // grokBillingLiveCacheSnapshot decodes a cache entry stamped at observed.

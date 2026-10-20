@@ -722,8 +722,9 @@ same bounded run-completion refresh Codex and Antigravity have:
 - **Pay.** A process-wide single-flight worker spends at most 4 outbound reads
   per debt on the shared ladder (1 m / 2 m / 8 m / 30 m), at least 60 s apart.
   The read goes through `grokBillingReadOnce`, one `singleflight` flight per
-  account shared with the Refresh click. Only a reading **with a percentage**
-  pays: an `ok` that names a period alone is booked as `unmetered`, spends an
+  account shared with the Refresh click. Only a **numeric** reading — a
+  percentage, or an on-demand pool with usage, each at its own time — pays:
+  an `ok` that names a period alone is booked as `unmetered`, spends an
   attempt and stays on the ladder. `http_error` / `bad_response` spend budget;
   `login_busy` / `write_failed` / offline, and a caller that stopped waiting on
   the shared flight (`timeout` — the flight's own `ok` still pays), book free
@@ -812,13 +813,19 @@ the session-end wake still reaches the card:
   kept number is never returned, covers no debt and is never recovered. A
   numeric on-demand pool (cap plus used) is versioned on its own: a newer or
   changed pool bumps the generation even when the credits window is
-  unmetered, and keeps its own `observedAt` beside a kept percentage.
+  unmetered, and keeps its own `observedAt` beside a kept percentage. A
+  clear is versioned too: an unmetered answer that drops the account's
+  number (a new period, or a kept figure whose period ended) bumps the
+  generation once and marks the entry `cleared`, so the switch to Unknown
+  is hinted like any other change.
 - `grokUsageParser.ParseContext` publishes `usageGeneration` only for a
-  numeric metric (credits or on-demand) the live cache won, on this process's epoch, once the cache
+  numeric metric (credits or on-demand), or a versioned clear, the live
+  cache won, on this process's epoch, once the cache
   has rotated (`grokGenerationRotated`), and reserves it for the signed
   refresh receipt (`observeCLIUsageGeneration`). Hints wait for that rotation.
 - Startup recovery (`recoverGrokUsageGeneration`) moves a cache that still
-  holds a numeric reading for the signed-in account in an open period onto
+  holds a numeric reading (or a versioned clear) for the signed-in account
+  in an open period onto
   this epoch in one write and hints it once, so a reading captured just before
   an update is propagated after the hand-off.
 

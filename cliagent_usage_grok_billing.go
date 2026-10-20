@@ -250,6 +250,22 @@ func (s grokBillingSnapshot) onDemandObservedAt() time.Time {
 	return s.ObservedAt
 }
 
+// numericAt is when the snapshot's newest numeric pool was observed — the
+// credits percentage or an on-demand pool with usage, whichever is newer.
+// ok is false when neither pool carries numbers.
+func (s grokBillingSnapshot) numericAt() (at time.Time, ok bool) {
+	if s.HasUsedPercent {
+		at, ok = s.ObservedAt, true
+	}
+	if s.HasOnDemand && s.HasOnDemandUsed {
+		if pool := s.onDemandObservedAt(); !ok || pool.After(at) {
+			at = pool
+		}
+		ok = true
+	}
+	return at, ok
+}
+
 // withOnDemandFrom returns s with other's on-demand pool, stamped with that
 // pool's own observation time.
 func (s grokBillingSnapshot) withOnDemandFrom(other grokBillingSnapshot) grokBillingSnapshot {
