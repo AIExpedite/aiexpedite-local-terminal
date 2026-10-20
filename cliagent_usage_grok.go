@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -69,9 +70,21 @@ func grokScopeKeysByPrecedence(keys []string) []string {
 	return ordered
 }
 
+// grokUsageProvider is Grok's provider id on the card and in usage hints.
+const grokUsageProvider = "grok"
+
 type grokUsageParser struct{}
 
-func (grokUsageParser) Provider() string { return "grok" }
+// ParseContext lets a signed refresh reserve the live cache's generation for
+// its receipt (observeCLIUsageGeneration); the compile-time proof keeps the
+// gather's type assertion from silently falling back to Parse.
+var _ cliAgentUsageContextParser = grokUsageParser{}
+
+func (grokUsageParser) Provider() string { return grokUsageProvider }
+
+// SerialProbeCount is zero: ParseContext reads only local files, so the gather
+// must not hold back a probe window for it (cliAgentUsageGatherReserve).
+func (grokUsageParser) SerialProbeCount() int { return 0 }
 
 // grokAuthFile mirrors the fields Grok Build CLI writes under
 // $GROK_HOME/auth.json (or the cached_token sibling). Only the identity /
@@ -133,6 +146,15 @@ type grokIDTokenClaims struct {
 }
 
 func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	return p.ParseContext(context.Background(), home, detected, now)
+}
+
+// ParseContext is the gather's entry point. ctx carries a signed refresh's
+// receipt reservation, if any.
+func (p grokUsageParser) ParseContext(ctx context.Context, home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
 	if base == "" {
 		return nil, false
@@ -162,16 +184,28 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// the live billing read (a Refresh click, or the bounded refresh a finished
 	// run owes); the CLI's own log supplies the period, the tier, and the proof
 	// that a run happened since.
-	snap, ok, owesRefresh := grokNewestBillingObservation(base, usage.AccountFingerprint, now)
-	if owesRefresh {
-		// A run nobody read the number for — usually one the user started in
-		// their own shell. Bounded and off this goroutine.
-		nudgeGrokUsageRefresh(now, usage.AccountFingerprint)
+	obs := grokBillingObservationFor(base, usage.AccountFingerprint, now)
+	if obs.owesRefresh {
+		// A billing record nobody read the number for — usually a TUI the user
+		// started in their own shell. Bounded and off this goroutine; the
+		// read must postdate the record.
+		nudgeGrokUsageRefreshFor(now, obs.recordAt, usage.AccountFingerprint)
 	}
-	if ok {
-		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
+	if obs.source != grokObservationNone {
+		if metrics := grokBillingMetrics(obs.snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
-			usage.Plan = firstNonEmpty(usage.Plan, snap.SubscriptionTier)
+			usage.Plan = firstNonEmpty(usage.Plan, obs.snap.SubscriptionTier)
+			// Only a numeric reading the live cache committed on this
+			// process's epoch is versioned: a log-sourced metric has no
+			// generation, and one an earlier process committed may already be
+			// applied (see grokGenerationRotated).
+			if obs.source == grokObservationLive && !metrics[0].Unknown && obs.generation != nil &&
+				grokGenerationRotated.Load() && obs.generation.Epoch == codexProcessGenerationEpoch.Load() &&
+				obs.generation.Counter > 0 {
+				g := *obs.generation
+				usage.UsageGeneration = &g
+				observeCLIUsageGeneration(ctx, grokUsageProvider, usage.UsageGeneration)
+			}
 		}
 	}
 	if len(usage.Metrics) == 0 {
@@ -286,9 +320,11 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 // (older) ObservedAt. Across a rollover the newer record still wins, so an
 // empty new pool never borrows the old figure.
 //
-// owesRefresh reports that the log holds a record newer than every live
-// reading — a run (often one the user started in their own shell) whose number
-// was never read. Parse hands that to nudgeGrokUsageRefresh.
+// owesRefresh reports that the log holds a percent-less record newer than
+// every live answer — a run (often a TUI the user started in their own shell)
+// whose number was never read. Parse hands that to nudgeGrokUsageRefreshFor.
+// Headless direct runs write no billing record at all; those are found by
+// their turn marker instead (cliagent_usage_grok_direct.go).
 //
 // The account gate is upstream of this choice and is never widened by it: a
 // log record whose producer identity does not name the current account is
@@ -296,11 +332,46 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 // fingerprint is refused by loadGrokBillingLiveSnapshot — an older reading is
 // never "aged forward" by a foreign newer one.
 func grokNewestBillingObservation(base, fingerprint string, now time.Time) (snap grokBillingSnapshot, ok bool, owesRefresh bool) {
-	snap, ok = readGrokBillingSnapshot(base, grokIdentityCandidates(base))
-	live, liveOK := loadGrokBillingLiveSnapshot(fingerprint)
-	owesRefresh = ok && !snap.HasUsedPercent && (!liveOK || snap.ObservedAt.After(live.ObservedAt))
+	obs := grokBillingObservationFor(base, fingerprint, now)
+	return obs.snap, obs.source != grokObservationNone, obs.owesRefresh
+}
+
+// grokObservationSource names which local source won the observation, so a
+// generation is only ever attached to the live cache's own reading.
+type grokObservationSource int
+
+const (
+	grokObservationNone grokObservationSource = iota
+	grokObservationLog
+	grokObservationLive
+)
+
+// grokBillingObservation is grokNewestBillingObservation's full answer.
+type grokBillingObservation struct {
+	snap   grokBillingSnapshot
+	source grokObservationSource
+	// generation is the live cache's committed generation (nil when the
+	// cache has none or did not answer).
+	generation  *cliUsageGeneration
+	owesRefresh bool
+	// recordAt is the log record's observation time when owesRefresh is set.
+	recordAt time.Time
+}
+
+func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBillingObservation {
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	view, liveOK := loadGrokBillingLive(fingerprint, now)
+	live := view.snap
+	out := grokBillingObservation{generation: view.generation}
+	out.owesRefresh = ok && !snap.HasUsedPercent && (!liveOK || snap.ObservedAt.After(view.answeredAt))
+	if out.owesRefresh {
+		out.recordAt = snap.ObservedAt
+	}
 	if !liveOK {
-		return snap, ok, owesRefresh
+		if ok {
+			out.snap, out.source = snap, grokObservationLog
+		}
+		return out
 	}
 	// The billing response carries the credit pool, not the plan name — only
 	// the TUI's log line states the tier. Carry the log's tier across so a
@@ -310,18 +381,23 @@ func grokNewestBillingObservation(base, fingerprint string, now time.Time) (snap
 		live.SubscriptionTier = snap.SubscriptionTier
 	}
 	if !ok {
-		return live, true, owesRefresh
+		out.snap, out.source = live, grokObservationLive
+		return out
 	}
 	newer, older := live, snap
+	newerSource, olderSource := grokObservationLive, grokObservationLog
 	if !live.ObservedAt.After(snap.ObservedAt) {
 		newer, older = snap, live
+		newerSource, olderSource = grokObservationLog, grokObservationLive
 	}
 	// Same open period: a number beats a newer percent-less observation in
 	// either direction, and keeps its own (older) ObservedAt.
 	if !newer.HasUsedPercent && older.HasUsedPercent && older.samePeriod(newer) && now.Before(newer.PeriodEnd) {
-		return older, true, owesRefresh
+		out.snap, out.source = older, olderSource
+		return out
 	}
-	return newer, true, owesRefresh
+	out.snap, out.source = newer, newerSource
+	return out
 }
 
 // grokNoticeText renders the card banner copy for a captured limit state,
@@ -834,7 +910,7 @@ func grokAccountFingerprintFor(base string) string {
 		return ""
 	}
 	account, _ := readGrokAccountAndPlan(base)
-	return fingerprintAccount("grok", account)
+	return fingerprintAccount(grokUsageProvider, account)
 }
 
 // readGrokScopedAuthClaims decodes the installer-produced `auth.json`, whose

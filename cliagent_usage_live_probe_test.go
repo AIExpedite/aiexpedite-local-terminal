@@ -486,7 +486,7 @@ func TestLoadGrokBillingLiveSnapshot_OtherAccountNeverReplayed(t *testing.T) {
 	}
 	// The user signs into a different account; A's pool must not show under B.
 	writeGrokAuth(t, home, "access-B", "b@example.com", now.Add(5*time.Hour))
-	if _, ok := loadGrokBillingLiveSnapshot(grokAccountFingerprintFor(home)); ok {
+	if _, ok := loadGrokBillingLiveSnapshot(grokAccountFingerprintFor(home), time.Now()); ok {
 		t.Fatal("a live reading from another account was replayed")
 	}
 }

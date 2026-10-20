@@ -70,6 +70,20 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	if os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE") == "" {
 		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", t.TempDir()+"/claude_rate_limits.json")
 	}
+	// …and the Grok recovery and direct scan read the Grok cache, freshness
+	// state and log: never the machine's own. The scan stays off unless a test
+	// opts in (grokDirectFixture).
+	if os.Getenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE") == "" {
+		t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", t.TempDir()+"/grok_billing_live.json")
+	}
+	if os.Getenv(grokUsageFreshnessEnv) == "" {
+		t.Setenv(grokUsageFreshnessEnv, t.TempDir()+"/grok_usage_freshness.json")
+	}
+	if os.Getenv("GROK_HOME") == "" {
+		t.Setenv("GROK_HOME", t.TempDir())
+	}
+	prevGrokScan := grokDirectScanEnabled
+	grokDirectScanEnabled = false
 	rec := &cliUsageHintRecorder{}
 	prevSend := sendCLIUsageObservedHint
 	sendCLIUsageObservedHint = func(_ context.Context, url string, hint cliUsageObservedHint) int {
@@ -87,6 +101,7 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		sendCLIUsageObservedHint = prevSend
 		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll = prev[0], prev[1], prev[2], prev[3], prev[4], prev[5]
 		cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected = prevFallback, prevDetected
+		grokDirectScanEnabled = prevGrokScan
 	})
 	return rec, &Config{AgentID: "agent-1", CommandSecret: "secret"}
 }

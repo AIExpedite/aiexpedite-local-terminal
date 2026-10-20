@@ -157,7 +157,7 @@ func TestGrokRunDebt_SettledRunPaysOneReadAndClearsTheDebt(t *testing.T) {
 	if state := h.state(); state.owed() || state.RunFloorMs != 0 {
 		t.Fatalf("state after an ok read = %+v, want nothing owed", state)
 	}
-	snap, ok := loadGrokBillingLiveSnapshot("fp-ada")
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", h.clock())
 	if !ok || !snap.HasUsedPercent || snap.ObservedAt.Before(h.clock()) {
 		t.Fatalf("live reading = %+v ok=%t, want a numeric reading at or after completion", snap, ok)
 	}
@@ -317,7 +317,7 @@ func TestGrokRunDebt_AuthOutcomesSpendOneAttemptAndNeverReopenOnAGather(t *testi
 			// also spawns a login renewal).
 			for i := 0; i < 5; i++ {
 				h.advance(10 * time.Minute)
-				nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+				nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada")
 				h.idle()
 			}
 			if h.reads.Load() != 1 {
@@ -576,12 +576,12 @@ func TestGrokRunDebt_ConcurrentSettlesCollapseAndKeepAttempts(t *testing.T) {
 func TestGrokRunDebt_DirectRunNudgeOwesOncePerCooldown(t *testing.T) {
 	h := newGrokDebtHarness(t)
 	h.outcome.Store(grokLiveOutcomeHTTPError)
-	if !nudgeGrokUsageRefresh(h.clock(), "fp-ada") {
+	if !nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada") {
 		t.Fatal("the first nudge must owe a read")
 	}
 	h.idle()
 	h.advance(10 * time.Second)
-	if nudgeGrokUsageRefresh(h.clock(), "fp-ada") {
+	if nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada") {
 		t.Fatal("a nudge inside the cooldown must do nothing")
 	}
 	h.idle()
@@ -591,7 +591,7 @@ func TestGrokRunDebt_DirectRunNudgeOwesOncePerCooldown(t *testing.T) {
 	// Past the cooldown, a booked rung that is due is started; one not yet
 	// due is left to its timer.
 	h.advance(grokRefreshNudgeCooldown)
-	if !nudgeGrokUsageRefresh(h.clock(), "fp-ada") {
+	if !nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada") {
 		t.Fatal("a due rung must be started by the nudge")
 	}
 	h.idle()
@@ -606,7 +606,7 @@ func TestGrokRunDebt_DisabledRefreshArmsNothing(t *testing.T) {
 	if floor := armGrokUsageRunFloor(h.clock()); !floor.IsZero() {
 		t.Fatalf("disabled arm returned %s", floor)
 	}
-	if nudgeGrokUsageRefresh(h.clock(), "fp-ada") || h.reads.Load() != 0 {
+	if nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada") || h.reads.Load() != 0 {
 		t.Fatal("a disabled refresh must never read")
 	}
 }
@@ -758,7 +758,7 @@ func TestGrokRunDebt_AuthRefusalCancelsAnEarlierRung(t *testing.T) {
 	// Past where the old rung would have fallen due: gathers send nothing.
 	for i := 0; i < 3; i++ {
 		h.advance(10 * time.Minute)
-		nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+		nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada")
 		h.idle()
 	}
 	// Nor does an update restart.
@@ -844,7 +844,7 @@ func TestGrokRunDebt_RungFiringDuringAnAuthRefusalIsDropped(t *testing.T) {
 		t.Fatalf("state = %+v pending=%t, want no rung left", h.state(), grokRunDebtRetryPending())
 	}
 	h.advance(10 * time.Minute)
-	nudgeGrokUsageRefresh(h.clock(), "fp-ada")
+	nudgeGrokUsageRefreshFor(h.clock(), time.Time{}, "fp-ada")
 	h.idle()
 	if h.reads.Load() != 2 {
 		t.Fatalf("reads = %d, want no read after the refusal", h.reads.Load())
@@ -994,7 +994,7 @@ func TestGrokRunDebt_FlightSentBeforeCompletionNeverPaysTheDebt(t *testing.T) {
 	if state := h.state(); state.owed() {
 		t.Fatalf("state = %+v, want the post-completion read to pay the debt", state)
 	}
-	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada"); !ok || snap.ObservedAt.Before(h.clock()) {
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada", h.clock()); !ok || snap.ObservedAt.Before(h.clock()) {
 		t.Fatalf("live reading = %+v ok=%t, want one sent at or after completion", snap, ok)
 	}
 }

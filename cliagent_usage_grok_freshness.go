@@ -28,9 +28,13 @@
 //   - Survive. The debt and its next rung are persisted; StartAgent re-arms
 //     them (payOwedGrokUsageRefresh), and a floor whose run the previous
 //     process never settled is owed one read.
-//   - Discover. The gather's parser nudges the same worker when the log holds a
-//     record newer than every reading (a `grok` the user ran in their own
-//     shell), on a cooldown.
+//   - Discover. A run the agent did not spawn — `grok -p` or the TUI in the
+//     user's own shell, an IDE, or an unarmed PTY TUI in the persistent home —
+//     is found by its turn-completion marker in the persistent home's log
+//     (grokDirectRunScanIfChanged, cliagent_usage_grok_direct.go), which
+//     nudges the same worker with the turn's own completion time; the gather's
+//     parser also nudges it when the log holds a billing record newer than
+//     every reading. Both on a cooldown.
 //
 // Redaction: the state file holds epoch-millisecond integers, a counter, the
 // hashed account fingerprint and a closed outcome code. Log lines carry fixed
@@ -273,7 +277,7 @@ func grokDebtExhausted(state grokUsageFreshness, now time.Time) bool {
 // without a percentage pays nothing: the card would still have no number, and
 // retiring the debt on it would stop the ladder that can still get one.
 func grokObservationCovers(fingerprint string, completionMs int64) bool {
-	if live, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && live.HasUsedPercent && live.ObservedAt.UnixMilli() >= completionMs {
+	if grokLiveReadingCovers(fingerprint, completionMs, grokUsageFreshnessNow()) {
 		return true
 	}
 	base := grokPersistentHome()
@@ -282,6 +286,14 @@ func grokObservationCovers(fingerprint string, completionMs int64) bool {
 	}
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	return ok && snap.HasUsedPercent && snap.ObservedAt.UnixMilli() >= completionMs
+}
+
+// grokLiveReadingCovers is grokObservationCovers's live half alone: the
+// account's newest NUMERIC live observation was taken at or after
+// completionMs. A kept number whose period ended by now covers nothing.
+func grokLiveReadingCovers(fingerprint string, completionMs int64, now time.Time) bool {
+	live, ok := loadGrokBillingLiveSnapshot(fingerprint, now)
+	return ok && live.HasUsedPercent && live.ObservedAt.UnixMilli() >= completionMs
 }
 
 /* ──────────────────────────────── arm ──────────────────────────────── */
@@ -862,13 +874,16 @@ func grokRunDebtRetryPending() bool {
 
 /* ─────────────────────────── nudge & restart ────────────────────────── */
 
-// nudgeGrokUsageRefresh is the gather's trigger, called when the log holds a
-// record for this account newer than every reading (a direct run the agent did
-// not spawn). It owes one read — or starts the worker for a pending debt whose
-// rung is due — at most once per grokRefreshNudgeCooldown, and never while a
-// run of this process is live (that run settles itself). Never blocks the
-// gather.
-func nudgeGrokUsageRefresh(now time.Time, fingerprint string) bool {
+// nudgeGrokUsageRefreshFor is the trigger for a run the agent did not spawn:
+// the direct-run scan's turn marker (cliagent_usage_grok_direct.go), or the
+// gather finding a billing record newer than every reading. completion is when
+// that run's turn finished (clamped to now; zero means now): the debt is owed a
+// reading taken at or after it, so a reading already taken since pays it for
+// free. It owes one read — or starts the worker for a pending debt whose rung
+// is due — at most once per grokRefreshNudgeCooldown, and never while a run of
+// this process is live (that run settles itself). Reports whether it started
+// the worker. Never blocks the caller.
+func nudgeGrokUsageRefreshFor(now, completion time.Time, fingerprint string) bool {
 	if !grokUsageRefreshEnabled.Load() || fingerprint == "" || IsShutdownInProgress() || IsOffline() {
 		return false
 	}
@@ -896,7 +911,10 @@ func nudgeGrokUsageRefresh(now time.Time, fingerprint string) bool {
 				return
 			}
 		}
-		grokOweRead(state, now, grokCompletionMs(now), fingerprint)
+		if completion.IsZero() || completion.After(now) {
+			completion = now
+		}
+		grokOweRead(state, now, grokCompletionMs(completion), fingerprint)
 		start = true
 	})
 	if !start {
