@@ -660,6 +660,51 @@ func TestGrokNewestBillingObservation_ANewerLiveRemovalIsNotRefilledByAnOlderLog
 	}
 }
 
+// A live cache keeps a percentage from t1 beneath an unmetered answer at t3
+// that removed the on-demand pool; a numeric log record at t2 with no pool
+// wins the credits row. Neither final snapshot holds a pool, yet the t3
+// removal is still the newest pool state and its generation versioned it, so
+// the reading publishes under that generation.
+func TestGrokNewestBillingObservation_ANewerLiveRemovalRidesANewerLogPercentage(t *testing.T) {
+	withCodexGenerationEpoch(t, 8123)
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
+	logSnap, ok := readGrokBillingSnapshot(home, grokIdentityCandidates(home))
+	if !ok || !logSnap.HasUsedPercent || logSnap.HasOnDemand || !logSnap.HasPeriodEnd {
+		t.Fatalf("fixture log record = %+v", logSnap)
+	}
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	keptAt, dropAt := logAt.Add(-time.Hour), logAt.Add(time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: keptAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+		UsedPercent: 36, HasUsedPercent: true,
+		OnDemandCap: 50, OnDemandUsed: 5, HasOnDemand: true, HasOnDemandUsed: true,
+	}, fingerprint))
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: dropAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+	}, fingerprint))
+
+	obs := grokBillingObservationFor(home, fingerprint, dropAt.Add(time.Minute))
+	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8123, 2) {
+		t.Fatalf("source=%d generation=%+v, want the removal's live generation {8123,2}", obs.source, obs.generation)
+	}
+	snap := obs.snap
+	if !snap.HasUsedPercent || snap.UsedPercent != logSnap.UsedPercent || !snap.ObservedAt.Equal(logAt) {
+		t.Fatalf("credits = %+v, want the newer log percentage at its own time", snap)
+	}
+	if snap.HasOnDemand || !snap.OnDemandObservedAt.Equal(dropAt) {
+		t.Fatalf("on-demand = %+v, want the live removal at its own newer time", snap)
+	}
+
+	// A log record newer than the live removal keeps its own row, with no
+	// generation riding along.
+	appendGrokBillingRecordAt(t, home, dropAt.Add(time.Minute))
+	obs = grokBillingObservationFor(home, fingerprint, dropAt.Add(2*time.Minute))
+	if obs.source != grokObservationLog {
+		t.Fatalf("observation = %+v source=%d, want the newest log record whole", obs.snap, obs.source)
+	}
+}
+
 // A pool stamped beyond the clock-skew limit (the clock stepped back) is
 // neither rendered under the percentage's older stamp nor counted as covering
 // a run; the trusted percentage still is.

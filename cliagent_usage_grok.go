@@ -424,9 +424,11 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 // grokOnDemandPoolNewer reports whether candidate's on-demand pool state for
 // the same period as current — a pool, or its removal — was observed after
 // current's own. Absence is timestamped too (see OnDemandObservedAt), so an
-// older pool never fills a newer snapshot's removal.
+// older pool never fills a newer snapshot's removal, and a newer removal still
+// counts when neither side holds a pool: the live answer that dated it is what
+// the published reading reflects, so its generation must go with it.
 func grokOnDemandPoolNewer(candidate, current grokBillingSnapshot) bool {
-	return (candidate.HasOnDemand || current.HasOnDemand) && candidate.samePeriod(current) &&
+	return candidate.samePeriod(current) &&
 		candidate.onDemandObservedAt().After(current.onDemandObservedAt())
 }
 
