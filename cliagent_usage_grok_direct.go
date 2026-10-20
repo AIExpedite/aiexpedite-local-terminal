@@ -92,11 +92,31 @@ type grokDirectCursor struct {
 	// there the debt's own ladder owns it (any read it sends postdates the
 	// turn), so the same turn never re-opens a budget the debt spent.
 	nudgedMarkerMs int64
-	// markerAccount is the fingerprint signed in when newestMarkerMs was found
-	// (adopted by the first scan that sees an account): the turn is only ever
-	// paid under that account, never against a login that switched in later.
+	// markerAccount is the fingerprint that owned newestMarkerMs when the turn
+	// completed (grokDirectMarkerOwnerLocked): the turn is only ever paid
+	// under that account, never against a login that switched in later.
 	markerAccount string
+	// accounts is the sign-in timeline the polls observed, oldest first, at
+	// most grokDirectAccountSpans long. It is the identity evidence for a
+	// marker: the log line's ctx is never decoded.
+	accounts []grokDirectAccountSpan
 }
+
+// grokDirectAccountSpan is one run of polls that saw the same login
+// (fingerprint "" = signed out), from its first to its last observation.
+// The process's first span has firstMs 0: nothing is known before it.
+type grokDirectAccountSpan struct {
+	fingerprint     string
+	firstMs, lastMs int64
+}
+
+// grokDirectAccountSpans bounds the sign-in timeline; a marker older than its
+// oldest span is never attributed.
+const grokDirectAccountSpans = 4
+
+// grokDirectNoOwner marks a turn no account can be shown to own; it matches no
+// fingerprint, so the turn is never paid.
+const grokDirectNoOwner = "no-owner:"
 
 var (
 	grokDirectMu    sync.Mutex
@@ -130,25 +150,24 @@ func grokDirectScan(requireDetected bool) {
 		return
 	}
 	now := grokUsageFreshnessNow()
+	fingerprint := grokUsageCurrentFingerprint()
 	grokDirectMu.Lock()
 	grokDirectAdvanceLocked(grokBillingLogPath(grokPersistentHome()), now)
+	grokDirectObserveAccountLocked(fingerprint, now.UnixMilli())
 	markerMs, nudgedMs := grokDirectState.newestMarkerMs, grokDirectState.nudgedMarkerMs
+	if markerMs != 0 && grokDirectState.markerAccount == "" {
+		grokDirectState.markerAccount = grokDirectMarkerOwnerLocked(markerMs)
+	}
+	owner := grokDirectState.markerAccount
 	grokDirectMu.Unlock()
 	if markerMs == 0 || markerMs <= nudgedMs {
 		return
 	}
-	fingerprint := grokUsageCurrentFingerprint()
-	if fingerprint == "" {
-		return // kept: the first poll after login nudges it
-	}
-	grokDirectMu.Lock()
-	if grokDirectState.newestMarkerMs == markerMs && grokDirectState.markerAccount == "" {
-		grokDirectState.markerAccount = fingerprint
-	}
-	owner := grokDirectState.markerAccount
-	grokDirectMu.Unlock()
-	if owner != fingerprint {
-		return // kept: another account's turn, nudged once it signs back in
+	if fingerprint == "" || owner != fingerprint {
+		// kept: no owner known yet (signed out since the process started) is
+		// nudged on the first poll after login; another account's turn once
+		// it signs back in.
+		return
 	}
 	if grokLiveReadingCovers(fingerprint, markerMs, now) {
 		grokDirectMu.Lock()
@@ -243,6 +262,72 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 	if ms := grokNewestDirectMarkerMs(lines, now); ms > c.newestMarkerMs {
 		c.newestMarkerMs, c.markerAccount = ms, ""
 	}
+}
+
+// grokDirectObserveAccountLocked records the login a poll saw at nowMs.
+// Caller holds grokDirectMu.
+func grokDirectObserveAccountLocked(fingerprint string, nowMs int64) {
+	c := &grokDirectState
+	if n := len(c.accounts); n > 0 && c.accounts[n-1].fingerprint == fingerprint {
+		c.accounts[n-1].lastMs = nowMs
+		return
+	}
+	first := nowMs
+	if len(c.accounts) == 0 {
+		first = 0
+	}
+	c.accounts = append(c.accounts, grokDirectAccountSpan{fingerprint: fingerprint, firstMs: first, lastMs: nowMs})
+	if len(c.accounts) > grokDirectAccountSpans {
+		c.accounts = slices.Delete(c.accounts, 0, len(c.accounts)-grokDirectAccountSpans)
+	}
+}
+
+// grokDirectMarkerOwnerLocked returns the account signed in when a turn
+// completed at markerMs, from the polls' sign-in timeline:
+//   - inside a signed-in span: that account;
+//   - between two polls that saw different logins: the earlier signed-in one
+//     (a turn closing just before a switch is far likelier than a fresh login
+//     completing one before the next poll), else the later one;
+//   - inside the process's first span while signed out: nothing is known
+//     before the process, so the next login owns it ("" until one appears —
+//     the first poll after login nudges it);
+//   - inside a later signed-out span, or older than the timeline:
+//     grokDirectNoOwner.
+//
+// The process's first signed-in span covers turns from before the process
+// started (an update hand-off): no poll saw an earlier login to prefer.
+// Caller holds grokDirectMu.
+func grokDirectMarkerOwnerLocked(markerMs int64) string {
+	spans := grokDirectState.accounts
+	k := -1
+	for i := len(spans) - 1; i >= 0; i-- {
+		if spans[i].firstMs <= markerMs {
+			k = i
+			break
+		}
+	}
+	if k < 0 {
+		return grokDirectNoOwner
+	}
+	s := spans[k]
+	if markerMs > s.lastMs && k+1 < len(spans) {
+		if s.fingerprint != "" {
+			return s.fingerprint
+		}
+		return spans[k+1].fingerprint
+	}
+	if s.fingerprint != "" {
+		return s.fingerprint
+	}
+	if s.firstMs != 0 {
+		return grokDirectNoOwner
+	}
+	for _, next := range spans[k+1:] {
+		if next.fingerprint != "" {
+			return next.fingerprint
+		}
+	}
+	return ""
 }
 
 // grokNewestDirectMarkerMs returns the newest marker's completion (epoch ms,

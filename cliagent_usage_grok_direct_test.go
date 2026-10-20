@@ -497,3 +497,76 @@ func TestGrokDirectScan_ANumericOnDemandReadingPaysTheTurn(t *testing.T) {
 		t.Fatalf("reads = %d, want no further reads for a covered turn", h.reads.Load())
 	}
 }
+
+// A turn the polls saw under one login, found only after the user switched to
+// another, belongs to the login that ran it: it is never paid (or cleared as
+// covered) under the new account, and is paid once its own account is back.
+func TestGrokDirectScan_ADelayedMarkerIsNeverAssignedToTheNextLogin(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // a poll sees fp-ada signed in
+	h.advance(5 * time.Second)
+	h.appendRaw(grokTurnMarkerLine(h.clock()))
+	h.advance(3 * time.Second)
+	h.signIn("fp-bob")
+	h.advance(2 * time.Second)
+	h.scan()
+	if h.reads.Load() != 0 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want fp-ada's turn never paid under fp-bob", h.reads.Load(), h.state())
+	}
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, want still nothing under fp-bob", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the turn paid once fp-ada is back", h.reads.Load())
+	}
+}
+
+// A turn found while signed out belongs to the account that signed out, not
+// to whoever logs in next.
+func TestGrokDirectScan_AMarkerFoundSignedOutBelongsToTheAccountThatLeft(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // fp-ada signed in
+	h.advance(5 * time.Second)
+	h.appendRaw(grokTurnMarkerLine(h.clock()))
+	h.signIn("")
+	h.advance(5 * time.Second)
+	h.scan()
+	h.signIn("fp-bob")
+	h.advance(10 * time.Second)
+	h.scan()
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, want fp-ada's turn never paid under fp-bob", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.advance(10 * time.Second)
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the turn paid under fp-ada", h.reads.Load())
+	}
+}
+
+// A turn written while the polls saw nobody signed in (after an account was
+// seen) has no owner and is never paid.
+func TestGrokDirectScan_AMarkerInsideASignedOutSpanHasNoOwner(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // fp-ada
+	h.signIn("")
+	h.advance(10 * time.Second)
+	h.scan()
+	h.advance(10 * time.Second)
+	h.appendRaw(grokTurnMarkerLine(h.clock()))
+	h.advance(5 * time.Second)
+	h.scan()
+	for _, fp := range []string{"fp-bob", "fp-ada"} {
+		h.signIn(fp)
+		h.advance(2 * grokRefreshNudgeCooldown)
+		h.scan()
+	}
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, want an unowned turn never paid", h.reads.Load())
+	}
+}

@@ -775,6 +775,13 @@ same bounded run-completion refresh Codex and Antigravity have:
     nudge additionally needs a signed-in account, no live armed run and the
     cooldown: a marker they defer is kept and re-evaluated on every later poll
     (including the first one after login), even with an unchanged log.
+  - **Owner.** Every poll records the login it sees in a short in-memory
+    sign-in timeline (`grokDirectMarkerOwnerLocked`), and a turn is paid only
+    under the account that timeline places at its `ts`: a turn that closed
+    before a switch (or a sign-out) belongs to the earlier account, never to
+    whoever is signed in when the scan finds it. Only a process that has seen
+    no login yet lets the next login adopt the turn; a turn written while the
+    polls saw nobody signed in is never paid.
   - **Cost.** `nudgeGrokUsageRefreshFor(now, turnTime, fp)` opens one debt
     whose completion is the turn's own time, so a reading already taken since
     pays it for free. The debt's budget, 60 s spacing and 30 min exhausted
