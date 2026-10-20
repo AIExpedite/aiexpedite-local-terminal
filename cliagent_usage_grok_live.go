@@ -661,7 +661,8 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     any other change. A later unmetered read for the same account keeps the
 //     mark without advancing again. Dropping only this account's on-demand
 //     pool under a kept percentage advances the generation the same way
-//     (without the mark: the percentage still renders).
+//     (without the mark: the percentage still renders). Replacing another
+//     account's numeric cache with an unmetered read is a clear as well.
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -675,6 +676,9 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 	hasPrev := readJSONFile(path, &prev)
 	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
 	prevNumericAt, prevNumeric := prev.numericObservedAt()
+	// Another account's number is never kept, but replacing it still changes
+	// the card (below).
+	prevOtherNumeric := hasPrev && !sameAccount && (prevNumeric || prev.hasNumericOnDemand())
 	prevNumeric = prevNumeric && sameAccount
 
 	entry.NumericObservedAt = ""
@@ -721,6 +725,11 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			// on-demand row, so that removal is versioned too.
 			advanced = true
 		}
+	}
+	if !advanced && prevOtherNumeric {
+		// Incoming carries no number (a numeric read advanced above): the card
+		// moves from the other account's figure to Unknown, a versioned clear.
+		advanced, entry.Cleared = true, true
 	}
 	epoch := codexProcessGenerationEpoch.Load()
 	if advanced {

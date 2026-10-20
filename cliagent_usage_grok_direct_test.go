@@ -539,29 +539,48 @@ func TestGrokDirectScan_ANumericOnDemandReadingPaysTheTurn(t *testing.T) {
 }
 
 // A turn the polls saw under one login, found only after the user switched to
-// another, belongs to the login that ran it: it is never paid (or cleared as
-// covered) under the new account, and is paid once its own account is back.
+// another, cannot be told from a turn the new login ran before the poll: it is
+// paid under the new login too, but never retired there, so the earlier
+// account's turn stays owed and is paid once that account is back.
 func TestGrokDirectScan_ADelayedMarkerIsNeverAssignedToTheNextLogin(t *testing.T) {
 	h := newGrokDirectHarness(t)
 	h.scan() // a poll sees fp-ada signed in
 	h.advance(5 * time.Second)
-	h.appendRaw(grokTurnMarkerLine(h.clock()))
+	turn := h.clock()
+	h.appendRaw(grokTurnMarkerLine(turn))
 	h.advance(3 * time.Second)
 	h.signIn("fp-bob")
 	h.advance(2 * time.Second)
 	h.scan()
-	if h.reads.Load() != 0 || h.state().owed() {
-		t.Fatalf("reads = %d state=%+v, want fp-ada's turn never paid under fp-bob", h.reads.Load(), h.state())
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want one read under fp-bob for the ambiguous turn", h.reads.Load())
 	}
 	h.advance(2 * grokRefreshNudgeCooldown)
 	h.scan()
-	if h.reads.Load() != 0 {
-		t.Fatalf("reads = %d, want still nothing under fp-bob", h.reads.Load())
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want fp-bob's reading to cover the turn with no further reads", h.reads.Load())
 	}
 	h.signIn("fp-ada")
 	h.scan()
-	if h.reads.Load() != 1 {
-		t.Fatalf("reads = %d, want the turn paid once fp-ada is back", h.reads.Load())
+	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want the turn still paid once fp-ada is back", h.reads.Load())
+	}
+}
+
+// A single turn the new login ran between the poll that saw the old login and
+// the next one is paid under the new login, not filed only under the old one.
+func TestGrokDirectScan_ASingleTurnAfterASwitchIsPaidUnderTheNewLogin(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // a poll sees fp-ada signed in
+	h.advance(2 * time.Second)
+	h.signIn("fp-bob")
+	h.advance(3 * time.Second)
+	bobTurn := h.clock()
+	h.appendRaw(grokTurnMarkerLine(bobTurn))
+	h.advance(2 * time.Second)
+	h.scan()
+	if h.reads.Load() != 1 || !grokLiveReadingCovers("fp-bob", bobTurn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want fp-bob's turn paid under fp-bob", h.reads.Load())
 	}
 }
 

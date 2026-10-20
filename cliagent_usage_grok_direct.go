@@ -298,9 +298,9 @@ func grokDirectObserveAccountLocked(fingerprint string, nowMs int64) {
 // grokDirectMarkerOwnerLocked returns the account signed in when a turn
 // completed at markerMs, from the polls' sign-in timeline:
 //   - inside a signed-in span: that account;
-//   - between two polls that saw different logins: the earlier signed-in one
-//     (a turn closing just before a switch is far likelier than a fresh login
-//     completing one before the next poll), else the later one;
+//   - between two polls that saw different logins: the earlier signed-in one,
+//     else the later one (grokDirectAttributeLocked also files the gap's
+//     newest turn under the later login, since either may have run it);
 //   - inside the process's first span while signed out: nothing is known
 //     before the process, so the next login owns it ("" until one appears —
 //     the first poll after login nudges it);
@@ -346,10 +346,11 @@ func grokDirectMarkerOwnerLocked(markerMs int64) (owner string, gap int) {
 
 // grokDirectAttributeLocked files the markers one read found under their
 // owners (grokDirectMarkerOwnerLocked), keeping each owner's newest, and
-// re-resolves turns no login had been seen for. Two or more turns between two
-// polls that saw different logins may sit on both sides of the switch, so the
-// newest of them is filed under the later login rather than collapsed into
-// the earlier one's: each side is paid, at worst one extra bounded read.
+// re-resolves turns no login had been seen for. A turn between two polls that
+// saw different logins cannot be placed on either side of the switch, so the
+// newest such turn is filed under the later login too, never only under the
+// earlier one: whichever account ran it is paid, at worst one extra bounded
+// read per switch (none when that login's reading already covers it).
 // Caller holds grokDirectMu.
 func grokDirectAttributeLocked(markers []int64) {
 	c := &grokDirectState
@@ -365,28 +366,30 @@ func grokDirectAttributeLocked(markers []int64) {
 			turns = append(turns, turn{ms: unowned, owner: owner, gap: -1})
 		}
 	}
-	gapCount, gapNewest := map[int]int{}, map[int]int64{}
+	gapNewest := map[int]int64{}
 	for _, ms := range markers {
 		owner, gap := grokDirectMarkerOwnerLocked(ms)
 		turns = append(turns, turn{ms: ms, owner: owner, gap: gap})
 		if gap >= 0 {
-			gapCount[gap]++
 			gapNewest[gap] = max(gapNewest[gap], ms)
 		}
 	}
-	for _, t := range turns {
-		if t.gap >= 0 && gapCount[t.gap] > 1 && t.ms == gapNewest[t.gap] {
-			if later := c.accounts[t.gap+1].fingerprint; later != "" {
-				t.owner = later
-			}
-		}
-		if t.owner == grokDirectNoOwner || t.ms <= c.pending[t.owner] {
-			continue
+	file := func(owner string, ms int64) {
+		if owner == grokDirectNoOwner || ms <= c.pending[owner] {
+			return
 		}
 		if c.pending == nil {
 			c.pending = map[string]int64{}
 		}
-		c.pending[t.owner] = t.ms
+		c.pending[owner] = ms
+	}
+	for _, t := range turns {
+		file(t.owner, t.ms)
+		if t.gap >= 0 && t.ms == gapNewest[t.gap] {
+			if later := c.accounts[t.gap+1].fingerprint; later != "" {
+				file(later, t.ms)
+			}
+		}
 	}
 	for len(c.pending) > grokDirectPendingOwners {
 		oldest, oldestMs := "", int64(-1)

@@ -965,6 +965,31 @@ func TestGrokLiveCache_DroppingTheOnDemandPoolUnderAKeptPercentageBumps(t *testi
 	}
 }
 
+// An unmetered read for another account replaces the cached number: the card
+// moves from that figure to Unknown, so the replacement is a versioned clear.
+func TestGrokLiveCache_AnUnmeteredReadReplacingAnotherAccountsNumberClears(t *testing.T) {
+	grokLiveCacheFixture(t, 8112)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+
+	saveGrokBillingLive(grokLiveEntry("fp-bob", at.Add(time.Minute), nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8112, 2) || !entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want the replacement versioned as a clear {8112,2}", entry.Generation, entry.Cleared)
+	}
+	view, ok := loadGrokBillingLive("fp-bob", at.Add(2*time.Minute))
+	if !ok || !view.cleared || view.generation == nil || *view.generation != gen(8112, 2) {
+		t.Fatalf("view = %+v ok=%t, want fp-bob's clear published with its generation", view, ok)
+	}
+
+	// fp-bob's next unmetered answer keeps the mark without advancing again.
+	saveGrokBillingLive(grokLiveEntry("fp-bob", at.Add(time.Hour), nil, end))
+	if entry := readGrokLiveCacheFile(t); *entry.Generation != gen(8112, 2) || !entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want {8112,2} kept with the mark", entry.Generation, entry.Cleared)
+	}
+}
+
 func TestGrokLiveCache_AnUnmeteredReadWithoutUsageOnTheCapNeverBumps(t *testing.T) {
 	grokLiveCacheFixture(t, 8109)
 	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
@@ -1020,13 +1045,14 @@ func TestGrokRecovery_SkipsAnotherAccountAndAnUnknownReading(t *testing.T) {
 	at := h.clock().Add(-time.Minute)
 	end := h.clock().Add(48 * time.Hour)
 
-	saveGrokBillingLive(grokLiveEntry("fp-other", at, floatPtr(20), end))
-	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
-		t.Fatalf("recovered %+v for another account", g)
-	}
+	// Unknown first: over another account's number it would be a clear.
 	saveGrokBillingLive(grokLiveEntry("fp-ada", at, nil, end))
 	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
 		t.Fatalf("recovered %+v for an unmetered (Unknown) reading", g)
+	}
+	saveGrokBillingLive(grokLiveEntry("fp-other", at, floatPtr(20), end))
+	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
+		t.Fatalf("recovered %+v for another account", g)
 	}
 
 	// A numeric reading an earlier process committed is moved onto this
