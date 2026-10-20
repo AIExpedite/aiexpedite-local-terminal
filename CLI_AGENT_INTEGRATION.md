@@ -745,10 +745,47 @@ same bounded run-completion refresh Codex and Antigravity have:
   finished after the last read gets it even when the budget is spent, so an
   earlier transient refusal cannot leave the card stale after a green smoke.
   The verdict never depends on it.
-- **Direct runs.** When `Parse` finds a log record newer than every live
-  reading (a `grok` the user ran in their own shell), it calls
-  `nudgeGrokUsageRefresh`, at most once a minute and never while a run of this
-  process is live.
+- **Direct runs.** A run this agent did not spawn — `grok -p` or the TUI in the
+  user's own shell, an IDE, the maintenance controller's shell, or an unarmed
+  interactive PTY TUI in the persistent home — is found by Grok's own
+  turn-completion line, `shell.turn.inference_done`, in the persistent home's
+  `logs/unified.jsonl` (`grokBillingLogPath(grokPersistentHome())`, so
+  `GROK_HOME` is honoured; isolated homes are never scanned — managed runs
+  settle their own debts). `grokDirectRunScanIfChanged`
+  ([cliagent_usage_grok_direct.go](cliagent_usage_grok_direct.go)) runs on the
+  usage propagator's fallback poll (10 s), and `grokDirectScanAtStartup` once
+  as the propagator starts, so a turn finished while the agent was down or
+  mid-update is found at once:
+  - **Bounds.** One `os.Stat` per poll; a read only when size or mtime moved,
+    of at most 256 KiB of appended bytes from the in-memory offset
+    (Stat-then-`ReadFull`). A rotation, a truncation, a changed log path or the
+    first scan of a process reads only the newest 256 KiB; a partially written
+    last line waits until it completes.
+  - **Match.** A `bytes.Contains` pre-check, then a decode into `{msg, ts}`
+    only (`ctx` is never decoded) and an exact `msg` match against the closed
+    `grokDirectRunMarkers` set. A `ts` more than `grokBillingMaxClockSkew` ahead
+    is ignored; a nearer future one is clamped to now.
+  - **Owed rule (stateless).** The newest marker is owed a read when it is
+    newer than the account's newest **numeric** live observation (an unmetered
+    answer never covers a turn). The rule needs only the log and the cache, so
+    it survives restarts and update hand-offs with no new persisted state.
+  - **Gates.** The cursor advances while Grok is detected, the refresh is
+    enabled and the agent is online and not draining or shutting down. The
+    nudge additionally needs a signed-in account, no live armed run and the
+    cooldown: a marker they defer is kept and re-evaluated on every later poll
+    (including the first one after login), even with an unchanged log.
+  - **Cost.** `nudgeGrokUsageRefreshFor(now, turnTime, fp)` opens one debt
+    whose completion is the turn's own time, so a reading already taken since
+    pays it for free. The debt's budget, 60 s spacing and 30 min exhausted
+    cooling bound continuous direct use to about one read a minute. A marker
+    handed to the debt is never re-nudged: the debt's ladder owns it.
+  - **Drift.** The marker is vendor-internal; a Grok release that renames it
+    makes the detector go quiet, leaving the billing-record nudge below and the
+    maintenance smoke's freshness gate as the alarm.
+
+  The gather also nudges when `Parse` finds a percent-less billing record newer
+  than every live answer (a TUI's own fetch), with that record's time as the
+  completion.
 - **Survive.** `StartAgent` calls `payOwedGrokUsageRefresh`, which re-arms a
   booked rung, pays one attempt for a debt with none, and owes one read for a
   floor the previous process never settled; `gracefulShutdown` stops the timer
@@ -759,9 +796,28 @@ same bounded run-completion refresh Codex and Antigravity have:
   account fingerprint and a closed outcome code; log lines are
   `[cli-usage] grok refresh: <label> attempts=<n>`.
 
-A debt paid after an ACP session ends reaches terminal-service at the next
-wake (session start, command dispatch, the CLI Agents tab) — Grok readings are
-not pushed through `cli-usage/observed`.
+### Propagation to terminal-service
+
+`grok` is a usage-hint provider (`cliagent_usage_propagate.go`, mirrored by
+terminal-service's `CLI_USAGE_HINT_PROVIDERS`), so a reading that lands after
+the session-end wake still reaches the card:
+
+- `grok_billing_live.json` gains an additive `generation {epoch, counter}`
+  (schema stays 1). `saveGrokBillingLive` is a read-merge-write transaction: a
+  numeric read that commits a newer numeric `observedAt`, a changed
+  `usedPercent` or a new period bumps the generation on this process's epoch
+  and sends one `POST /device/:id/cli-usage/observed` hint. An unmetered read
+  never bumps it, and inside the same open period it keeps the numeric
+  reading (`numericObservedAt`) instead of erasing it; past the period end the
+  kept number is never returned, covers no debt and is never recovered.
+- `grokUsageParser.ParseContext` publishes `usageGeneration` only for a
+  numeric metric the live cache won, on this process's epoch, once the cache
+  has rotated (`grokGenerationRotated`), and reserves it for the signed
+  refresh receipt (`observeCLIUsageGeneration`). Hints wait for that rotation.
+- Startup recovery (`recoverGrokUsageGeneration`) moves a cache that still
+  holds a numeric reading for the signed-in account in an open period onto
+  this epoch in one write and hints it once, so a reading captured just before
+  an update is propagated after the hand-off.
 
 Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 (classification, budget, cooldown, redaction, prompt file),
@@ -770,7 +826,11 @@ Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 [cliagent_usage_grok_run_debt_test.go](cliagent_usage_grok_run_debt_test.go)
 (debt bounds),
 [cliagent_usage_grok_refresh_restart_test.go](cliagent_usage_grok_refresh_restart_test.go)
-(restart / self-update) and
+(restart / self-update),
+[cliagent_usage_grok_direct_test.go](cliagent_usage_grok_direct_test.go)
+(direct-run marker scan),
+[cliagent_usage_grok_direct_run_test.go](cliagent_usage_grok_direct_run_test.go)
+(direct and managed runs end to end to a hint) and
 [cliagent_usage_grok_post_update_freshness_test.go](cliagent_usage_grok_post_update_freshness_test.go)
 (the upgrade end to end across the smoke and usage layers). The end-to-end
 "real grok binary echoes the marker" case, and a numeric Grok row whose

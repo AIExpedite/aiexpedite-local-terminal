@@ -50,6 +50,9 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	p.mu.Lock()
 	delete(p.pending, claudeUsageProvider)
 	delete(p.seen, claudeUsageProvider)
+	// …and Grok live-cache commits likewise.
+	delete(p.pending, grokUsageProvider)
+	delete(p.seen, grokUsageProvider)
 	p.mu.Unlock()
 	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll}
 	prevFallback, prevDetected := cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected
