@@ -211,6 +211,14 @@ func TestGrokDirectRunMarkerHintAndCacheCarryOnlyMetrics(t *testing.T) {
 			`{"ts":"`+turn+`","msg":"shell.turn.inference_done","access_token":"credential-sentinel",`+
 				`"ctx":{"prompt":"prompt-sentinel","toolResult":{"text":"tool-result-sentinel"},"email":"`+email+`"}}`+"\n")
 		a.waitGrokHint()
+		// Stop the propagator and wait out any callback in flight before
+		// captureStdout restores os.Stdout under a hint log line. No reset:
+		// it would clear the rotation latch the parse below relies on.
+		stopCLIUsagePropagator()
+		cliUsagePropagator.firing.Lock()
+		cliUsagePropagator.firing.Unlock()
+		cliUsagePropagator.fallbackRunning.Lock()
+		cliUsagePropagator.fallbackRunning.Unlock()
 		grokUsageRefreshWaitFor(10 * time.Second)
 	})
 
