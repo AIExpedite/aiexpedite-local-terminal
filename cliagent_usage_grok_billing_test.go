@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -937,6 +938,37 @@ func TestGrokLiveCache_AnotherProcessHoldingTheLockRefusesCommitAndRotation(t *t
 	}
 	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8111, 2) {
 		t.Fatalf("generation = %+v, want {8111,2}", g)
+	}
+}
+
+// Two processes' requests overlap outside the cache lock: an older same-account
+// answer that finishes last is superseded, never written over the newer cache
+// or its generation — whether its figures, its period or its kind differ.
+func TestGrokLiveCache_AnOlderSameAccountAnswerNeverReplacesANewerOne(t *testing.T) {
+	grokLiveCacheFixture(t, 8113)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end))
+	want := readGrokLiveCacheFile(t)
+
+	for _, older := range []grokBillingLiveCache{
+		grokLiveEntry("fp-ada", at, floatPtr(36), end),
+		grokLiveEntry("fp-ada", at, floatPtr(36), end.Add(-time.Hour)),
+		grokLiveEntry("fp-ada", at, nil, end),
+		grokLiveOnDemandEntry("fp-ada", at, nil, end, 50, 5),
+	} {
+		committed, advanced, _ := commitGrokBillingLive(older)
+		if !committed || advanced {
+			t.Fatalf("committed=%t advanced=%t, want an older answer superseded without an advance", committed, advanced)
+		}
+		if got := readGrokLiveCacheFile(t); !reflect.DeepEqual(got, want) {
+			t.Fatalf("cache = %+v, want the newer answer %+v untouched", got, want)
+		}
+	}
+
+	// Another account's answer is not compared against this one's time.
+	if _, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-bob", at, floatPtr(10), end)); !advanced {
+		t.Fatal("want another account's numeric read to replace and advance")
 	}
 }
 

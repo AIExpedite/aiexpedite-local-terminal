@@ -693,6 +693,9 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     pool under a kept percentage advances the generation the same way
 //     (without the mark: the percentage still renders). Replacing another
 //     account's numeric cache with an unmetered read is a clear as well.
+//   - A same-account read older than the cached answer is superseded: it
+//     reports committed (the cache already holds a newer answer) and writes
+//     nothing.
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -710,6 +713,15 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 	var prev grokBillingLiveCache
 	hasPrev := readJSONFile(path, &prev)
 	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
+	entryAt, entryErr := time.Parse(time.RFC3339Nano, entry.ObservedAt)
+	if sameAccount && entryErr == nil {
+		// Requests from two processes overlap outside the lock, so an older
+		// answer can finish after a newer one committed: it is superseded, never
+		// written over the newer cache and generation.
+		if prevAt, err := time.Parse(time.RFC3339Nano, prev.ObservedAt); err == nil && entryAt.Before(prevAt) {
+			return true, false, cliUsageGeneration{}
+		}
+	}
 	prevNumericAt, prevNumeric := prev.numericObservedAt()
 	// Another account's number is never kept, but replacing it still changes
 	// the card (below).
@@ -724,7 +736,6 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		g := *prev.Generation
 		entry.Generation = &g
 	}
-	entryAt, entryErr := time.Parse(time.RFC3339Nano, entry.ObservedAt)
 	incomingNumeric := entry.UsedPercent != nil && grokFiniteNumber(*entry.UsedPercent)
 	switch {
 	case !incomingNumeric && prevNumeric && entryErr == nil && prevNumericAt.Before(entryAt):
