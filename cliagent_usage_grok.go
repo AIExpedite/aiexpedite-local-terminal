@@ -390,13 +390,23 @@ func grokBillingObservationFor(base, fingerprint string, now time.Time) grokBill
 		newer, older = snap, live
 		newerSource, olderSource = grokObservationLog, grokObservationLive
 	}
+	out.snap, out.source = newer, newerSource
 	// Same open period: a number beats a newer percent-less observation in
 	// either direction, and keeps its own (older) ObservedAt.
 	if !newer.HasUsedPercent && older.HasUsedPercent && older.samePeriod(newer) && now.Before(newer.PeriodEnd) {
 		out.snap, out.source = older, olderSource
-		return out
 	}
-	out.snap, out.source = newer, newerSource
+	// The pools are compared by their own times. The live cache can keep an
+	// older percentage beneath a newer unmetered answer whose on-demand pool
+	// is fresh, so the log can win the credits row while the live answer
+	// still holds the newest on-demand pool for the same period. Carry that
+	// pool onto the log's reading; the published metrics then include the
+	// live commit's newest content, so its generation goes with them.
+	if out.source == grokObservationLog && live.HasOnDemand && live.samePeriod(snap) &&
+		(!snap.HasOnDemand || live.onDemandObservedAt().After(snap.onDemandObservedAt())) {
+		out.snap = out.snap.withOnDemandFrom(live)
+		out.source = grokObservationLive
+	}
 	return out
 }
 

@@ -241,6 +241,24 @@ type grokBillingSnapshot struct {
 	SubscriptionTier   string
 }
 
+// onDemandObservedAt is when the on-demand pool was observed: its own time
+// when it has one, else the snapshot's.
+func (s grokBillingSnapshot) onDemandObservedAt() time.Time {
+	if !s.OnDemandObservedAt.IsZero() {
+		return s.OnDemandObservedAt
+	}
+	return s.ObservedAt
+}
+
+// withOnDemandFrom returns s with other's on-demand pool, stamped with that
+// pool's own observation time.
+func (s grokBillingSnapshot) withOnDemandFrom(other grokBillingSnapshot) grokBillingSnapshot {
+	s.OnDemandCap, s.OnDemandUsed = other.OnDemandCap, other.OnDemandUsed
+	s.HasOnDemand, s.HasOnDemandUsed = other.HasOnDemand, other.HasOnDemandUsed
+	s.OnDemandObservedAt = other.onDemandObservedAt()
+	return s
+}
+
 // samePeriod reports whether two observations name the same billing period:
 // the same period type and the same parsed end. Ends compare truncated to the
 // second — the live cache stores RFC3339 seconds while log records carry

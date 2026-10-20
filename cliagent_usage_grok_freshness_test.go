@@ -512,6 +512,50 @@ func TestGrokNewestBillingObservation_NumericLogBeatsNewerUnmeteredLiveInTheSame
 	}
 }
 
+// The live cache can keep a percentage from t1 beneath an unmetered answer at
+// t3 that carried a fresh on-demand pool. A numeric log record from t2 wins
+// the credits row, but the t3 pool, and the generation it bumped, still
+// publish: the pools are compared by their own times.
+func TestGrokNewestBillingObservation_ANewerLiveOnDemandPoolRidesANewerLogPercentage(t *testing.T) {
+	withCodexGenerationEpoch(t, 8120)
+	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	home, fingerprint := grokFreshnessHome(t, "ada@example.com", logAt)
+	logSnap, ok := readGrokBillingSnapshot(home, grokIdentityCandidates(home))
+	if !ok || !logSnap.HasUsedPercent || !logSnap.HasPeriodEnd {
+		t.Fatalf("fixture log record = %+v", logSnap)
+	}
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+	keptAt, poolAt := logAt.Add(-time.Hour), logAt.Add(time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: keptAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+		UsedPercent: 36, HasUsedPercent: true,
+	}, fingerprint))
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: poolAt, PeriodType: logSnap.PeriodType, PeriodEnd: logSnap.PeriodEnd, HasPeriodEnd: true,
+		OnDemandCap: 50, OnDemandUsed: 12, HasOnDemand: true, HasOnDemandUsed: true,
+	}, fingerprint))
+
+	now := poolAt.Add(time.Minute)
+	obs := grokBillingObservationFor(home, fingerprint, now)
+	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8120, 2) {
+		t.Fatalf("source=%d generation=%+v, want the live commit's generation {8120,2}", obs.source, obs.generation)
+	}
+	snap := obs.snap
+	if !snap.HasUsedPercent || snap.UsedPercent != logSnap.UsedPercent || !snap.ObservedAt.Equal(logAt) {
+		t.Fatalf("credits = %+v, want the newer log percentage at its own time", snap)
+	}
+	if !snap.HasOnDemandUsed || snap.OnDemandUsed != 12 || !snap.OnDemandObservedAt.Equal(poolAt) {
+		t.Fatalf("on-demand = %+v, want the live pool at its own newer time", snap)
+	}
+
+	// A log record newer than the live pool keeps its own pool and no generation.
+	appendGrokBillingRecordAt(t, home, poolAt.Add(time.Minute))
+	obs = grokBillingObservationFor(home, fingerprint, poolAt.Add(2*time.Minute))
+	if obs.source != grokObservationLog || obs.snap.OnDemandUsed == 12 {
+		t.Fatalf("observation = %+v source=%d, want the newest log record whole", obs.snap, obs.source)
+	}
+}
+
 /* ------------------- completion-based nudge (direct runs) ------------------- */
 
 // A nudge carries the turn's own completion: a numeric reading taken since
