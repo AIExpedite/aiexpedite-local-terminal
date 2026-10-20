@@ -514,8 +514,9 @@ func TestGrokNewestBillingObservation_NumericLogBeatsNewerUnmeteredLiveInTheSame
 
 // The live cache can keep a percentage from t1 beneath an unmetered answer at
 // t3 that carried a fresh on-demand pool. A numeric log record from t2 wins
-// the credits row, but the t3 pool, and the generation it bumped, still
-// publish: the pools are compared by their own times.
+// the credits row, but the t3 pool still publishes: the pools are compared by
+// their own times. The log's percentage was never versioned by the live
+// generation, so the merged reading publishes unversioned.
 func TestGrokNewestBillingObservation_ANewerLiveOnDemandPoolRidesANewerLogPercentage(t *testing.T) {
 	withCodexGenerationEpoch(t, 8120)
 	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
@@ -537,8 +538,8 @@ func TestGrokNewestBillingObservation_ANewerLiveOnDemandPoolRidesANewerLogPercen
 
 	now := poolAt.Add(time.Minute)
 	obs := grokBillingObservationFor(home, fingerprint, now)
-	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8120, 2) {
-		t.Fatalf("source=%d generation=%+v, want the live commit's generation {8120,2}", obs.source, obs.generation)
+	if obs.source != grokObservationLog || obs.generation != nil || obs.cleared {
+		t.Fatalf("source=%d generation=%+v cleared=%v, want an unversioned log-led reading", obs.source, obs.generation, obs.cleared)
 	}
 	snap := obs.snap
 	if !snap.HasUsedPercent || snap.UsedPercent != logSnap.UsedPercent || !snap.ObservedAt.Equal(logAt) {
@@ -667,8 +668,9 @@ func TestGrokNewestBillingObservation_ANewerLiveRemovalIsNotRefilledByAnOlderLog
 // A live cache keeps a percentage from t1 beneath an unmetered answer at t3
 // that removed the on-demand pool; a numeric log record at t2 with no pool
 // wins the credits row. Neither final snapshot holds a pool, yet the t3
-// removal is still the newest pool state and its generation versioned it, so
-// the reading publishes under that generation.
+// removal is still the newest pool state, so the reading carries it. The
+// log's percentage was never versioned by that generation, so the reading
+// publishes unversioned.
 func TestGrokNewestBillingObservation_ANewerLiveRemovalRidesANewerLogPercentage(t *testing.T) {
 	withCodexGenerationEpoch(t, 8123)
 	logAt := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
@@ -689,8 +691,8 @@ func TestGrokNewestBillingObservation_ANewerLiveRemovalRidesANewerLogPercentage(
 	}, fingerprint))
 
 	obs := grokBillingObservationFor(home, fingerprint, dropAt.Add(time.Minute))
-	if obs.source != grokObservationLive || obs.generation == nil || *obs.generation != gen(8123, 2) {
-		t.Fatalf("source=%d generation=%+v, want the removal's live generation {8123,2}", obs.source, obs.generation)
+	if obs.source != grokObservationLog || obs.generation != nil || obs.cleared {
+		t.Fatalf("source=%d generation=%+v cleared=%v, want an unversioned log-led reading", obs.source, obs.generation, obs.cleared)
 	}
 	snap := obs.snap
 	if !snap.HasUsedPercent || snap.UsedPercent != logSnap.UsedPercent || !snap.ObservedAt.Equal(logAt) {
