@@ -518,8 +518,15 @@ func grokCompletionMs(t time.Time) int64 {
 // `ok` (which clears the debt) or a cooled-off exhausted budget resets it.
 func grokOweRead(state *grokUsageFreshness, now time.Time, completionMs int64, fingerprint string) {
 	grokRebaseFutureFreshness(state, now)
-	if state.owed() && (state.AccountFingerprint != fingerprint ||
-		now.Sub(time.UnixMilli(state.OwedAtMs)) > grokRunDebtMaxAge) {
+	if state.owed() && state.AccountFingerprint != fingerprint {
+		// Another account's debt is replaced unpaid: a direct turn handed to
+		// it is owed again once that account signs back in. (Lock order is
+		// freshness then direct; the scan never holds grokDirectMu across a
+		// freshness update.)
+		state.clearDebt()
+		grokDirectForgetNudged()
+	}
+	if state.owed() && now.Sub(time.UnixMilli(state.OwedAtMs)) > grokRunDebtMaxAge {
 		state.clearDebt()
 	}
 	if state.owed() && state.Attempts >= grokRunDebtMaxAttempts && !grokDebtExhausted(*state, now) {

@@ -508,6 +508,38 @@ func TestGrokDirectScan_AForgetBeforeTheNudgeIsRecordedKeepsTheTurnOwed(t *testi
 	}
 }
 
+// A turn whose unpaid debt another account's debt replaced is no longer
+// handled: it is owed again once its own account signs back in, never left
+// recorded as nudged.
+func TestGrokDirectScan_ATurnWhoseDebtAnotherAccountReplacedIsOwedAgain(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError) // fp-ada's read fails, a retry pending
+	adaTurn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(adaTurn))
+	h.scan()
+	if h.reads.Load() != 1 || !h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want fp-ada's debt pending after a failed read", h.reads.Load(), h.state())
+	}
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.signIn("fp-bob")
+	h.scan() // a poll sees fp-bob signed in
+	h.advance(2 * time.Second)
+	bobTurn := h.clock()
+	h.appendRaw(grokTurnMarkerLine(bobTurn))
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if !grokLiveReadingCovers("fp-bob", bobTurn.UnixMilli(), h.clock()) {
+		t.Fatalf("state=%+v, want fp-bob's debt to replace fp-ada's and be paid", h.state())
+	}
+	before := h.reads.Load()
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != before+1 || !grokLiveReadingCovers("fp-ada", adaTurn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d (was %d), want fp-ada's replaced turn owed again under its account", h.reads.Load(), before)
+	}
+}
+
 // A read with no percentage but a numeric on-demand pool refreshes the card's
 // number, so it pays the turn instead of spending the rest of the ladder.
 func TestGrokDirectScan_ANumericOnDemandReadingPaysTheTurn(t *testing.T) {

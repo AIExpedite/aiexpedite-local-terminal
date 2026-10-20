@@ -886,6 +886,60 @@ func TestGrokLiveCache_ANewerNumericReadWithTheSamePercentBumps(t *testing.T) {
 	}
 }
 
+// Another agent process holding the cache's sibling lock serializes both the
+// commit and the rotation: neither renames over what the holder may commit,
+// and both go through once it releases.
+func TestGrokLiveCache_AnotherProcessHoldingTheLockRefusesCommitAndRotation(t *testing.T) {
+	grokLiveCacheFixture(t, 8110)
+	prevWait := grokBillingLiveCacheLockWait
+	grokBillingLiveCacheLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { grokBillingLiveCacheLockWait = prevWait })
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	if !saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end)) {
+		t.Fatal("want the unlocked commit to land")
+	}
+
+	held, err := os.OpenFile(grokBillingLiveCachePath()+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = unlockFile(held)
+			_ = held.Close()
+		}
+	}
+	t.Cleanup(release)
+
+	if saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end)) {
+		t.Fatal("want a commit under another holder's lock refused")
+	}
+	if entry := readGrokLiveCacheFile(t); *entry.UsedPercent != 36 || *entry.Generation != gen(8110, 1) {
+		t.Fatalf("entry = %+v, want the cache untouched while locked", entry)
+	}
+	codexProcessGenerationEpoch.Store(8111)
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); g != nil || !refused {
+		t.Fatalf("rotation = %+v refused=%t, want it refused for a retry while locked", g, refused)
+	}
+
+	release()
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); refused || g == nil || *g != gen(8111, 1) {
+		t.Fatalf("rotation = %+v refused=%t, want {8111,1} once released", g, refused)
+	}
+	if !saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end)) {
+		t.Fatal("want the commit to land once released")
+	}
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8111, 2) {
+		t.Fatalf("generation = %+v, want {8111,2}", g)
+	}
+}
+
 func TestGrokLiveCache_AcrossARolloverTheUnmeteredReadWins(t *testing.T) {
 	grokLiveCacheFixture(t, 8104)
 	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)

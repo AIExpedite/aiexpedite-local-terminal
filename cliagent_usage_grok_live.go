@@ -162,6 +162,34 @@ var (
 	grokGenerationRotated atomic.Bool
 )
 
+// grokBillingLiveCacheLockWait bounds how long a cache transaction waits on
+// another agent process holding the sibling lock. A var so tests can pin it.
+var grokBillingLiveCacheLockWait = 2 * time.Second
+
+// lockGrokBillingLiveCache takes the cache's cross-process sibling lock — the
+// one the Codex and OpenCode generation transactions use — so two agent
+// processes (Linux has no single-instance guard) never interleave a
+// read-merge-rename or a rotation and lose a reading or an epoch. Callers hold
+// grokBillingLiveCacheMu. ok is false when the lock file's directory cannot be
+// made or another holder kept the lock past the wait; release must be called
+// otherwise. A filesystem that offers no lock takes the unlocked path, as the
+// other caches do.
+func lockGrokBillingLiveCache(path string) (release func(), ok bool) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, false
+	}
+	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(grokBillingLiveCacheLockWait))
+	if outcome == crossProcessLockContended {
+		return nil, false
+	}
+	return func() {
+		if lock != nil {
+			_ = unlockFile(lock)
+			_ = lock.Close()
+		}
+	}, true
+}
+
 // grokBillingLiveCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_GROK_BILLING_LIVE_CACHE overrides it (tests isolate from the real
 // machine cache).
@@ -639,7 +667,8 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 }
 
 // commitGrokBillingLive is the cache's read-merge-write transaction
-// (write-then-rename under grokBillingLiveCacheMu):
+// (write-then-rename under grokBillingLiveCacheMu and the cross-process
+// sibling lock, lockGrokBillingLiveCache):
 //
 //   - An unmetered read for the same account and the same billing period,
 //     while that period is open, keeps the earlier numeric percentage with its
@@ -673,6 +702,11 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 	if path == "" || entry.AccountFingerprint == "" {
 		return false, false, cliUsageGeneration{}
 	}
+	release, locked := lockGrokBillingLiveCache(path)
+	if !locked {
+		return false, false, cliUsageGeneration{}
+	}
+	defer release()
 	var prev grokBillingLiveCache
 	hasPrev := readJSONFile(path, &prev)
 	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
@@ -761,7 +795,15 @@ func rotateGrokBillingLiveGeneration(fingerprint string) (generation *cliUsageGe
 	defer grokBillingLiveCacheMu.Unlock()
 	path := grokBillingLiveCachePath()
 	var entry grokBillingLiveCache
-	if path == "" || fingerprint == "" || !readJSONFile(path, &entry) || entry.AccountFingerprint != fingerprint {
+	if path == "" || fingerprint == "" {
+		return nil, false
+	}
+	release, locked := lockGrokBillingLiveCache(path)
+	if !locked {
+		return nil, true
+	}
+	defer release()
+	if !readJSONFile(path, &entry) || entry.AccountFingerprint != fingerprint {
 		return nil, false
 	}
 	epoch := codexProcessGenerationEpoch.Load()

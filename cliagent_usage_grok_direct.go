@@ -437,8 +437,9 @@ func grokDirectMarkerTimesMs(lines [][]byte, now time.Time) []int64 {
 }
 
 // grokDirectForgetNudged is told when a debt is retired because the login
-// moved off its account: no reading landed for a turn handed to it, so that
-// turn is no longer handled and is nudged again once its account is back.
+// moved off its account, or replaced by another account's debt (grokOweRead):
+// no reading landed for a turn handed to it, so that turn is no longer handled
+// and is nudged again once its account is back.
 func grokDirectForgetNudged() {
 	grokDirectMu.Lock()
 	grokDirectState.nudged = nil
