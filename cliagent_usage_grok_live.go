@@ -621,8 +621,13 @@ func probeGrokBillingLiveFor(ctx context.Context, grokPath, expected string, now
 		return grokLiveOutcomeBadResponse
 	}
 	// The account could have changed while the request was in flight; a reading
-	// is only cached under the account that is still signed in.
+	// is only cached under the account that is still signed in. A pinned read
+	// says the login moved (after its request reached xAI), so the debt it was
+	// paying is retired as an account change rather than auth-idled.
 	if grokAccountFingerprintFor(base) != fingerprint {
+		if expected != "" {
+			return liveProbeOutcomeAccountChangedAfterRead
+		}
 		return grokLiveOutcomeNoAccount
 	}
 	if !saveGrokBillingLive(grokBillingLiveFromSnapshot(snap, fingerprint)) {

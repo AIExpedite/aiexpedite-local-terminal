@@ -687,7 +687,7 @@ func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 		state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 		retired = true
 	})
-	if retired && label == liveProbeOutcomeAccountChanged {
+	if retired && (label == liveProbeOutcomeAccountChanged || label == liveProbeOutcomeAccountChangedAfterRead) {
 		// Retired unpaid: a direct turn handed to this debt is owed again
 		// when its account signs back in.
 		grokDirectForgetNudged()
@@ -739,10 +739,13 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 	ctx, cancel := context.WithTimeout(context.Background(), grokRunDebtPassWait())
 	outcome := grokBillingReadOnce(ctx, grokUsageRefreshGrokPath(), fingerprint, grokUsageFreshnessNow, time.UnixMilli(state.CompletionMs))
 	cancel()
-	if outcome == liveProbeOutcomeAccountChanged {
-		// The login switched after the check above; the probe stopped before
-		// presenting the new account's credential, so nothing was spent.
-		grokRetireRunDebt(state.debtID(), "account_changed", state.Attempts)
+	if outcome == liveProbeOutcomeAccountChanged || outcome == liveProbeOutcomeAccountChangedAfterRead {
+		// The login switched after the check above: before the probe presented
+		// any credential (nothing spent), or while its request was out (the
+		// answer is dropped). Either way the debt's account is gone, so the
+		// debt is retired — never idled under it — and a direct turn it was
+		// paying is owed again once that account is back.
+		grokRetireRunDebt(state.debtID(), outcome, state.Attempts)
 		return state, grokRetryNone
 	}
 	if outcome == grokLiveOutcomeOK && !grokObservationCovers(fingerprint, state.CompletionMs) {

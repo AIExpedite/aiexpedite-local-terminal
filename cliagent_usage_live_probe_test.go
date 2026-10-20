@@ -427,6 +427,45 @@ func TestProbeGrokBillingLiveFor_SwitchedAccountSendsNothing(t *testing.T) {
 	}
 }
 
+// A login that switches while the request is out caches nothing. A read
+// pinned to an account (the run debt's) says the account changed after the
+// read, so the debt is retired rather than idled under the account that left;
+// an unpinned read (a Refresh click) keeps no_account.
+func TestProbeGrokBillingLiveFor_ASwitchDuringTheRequestIsAnAccountChange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pinned bool
+		want   string
+	}{
+		{"pinned", true, liveProbeOutcomeAccountChangedAfterRead},
+		{"unpinned", false, grokLiveOutcomeNoAccount},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := isolateGrok(t)
+			now := time.Now()
+			writeGrokAuth(t, home, "access-A", "ada@example.com", now.Add(5*time.Hour))
+			ada := grokAccountFingerprintFor(home)
+			expected := ""
+			if tc.pinned {
+				expected = ada
+			}
+			calls := grokBillingServer(t, func(string) (int, string) {
+				writeGrokAuth(t, home, "access-B", "bob@example.com", now.Add(5*time.Hour))
+				return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+			})
+			if got := probeGrokBillingLiveFor(context.Background(), "grok", expected, time.Now); got != tc.want {
+				t.Fatalf("outcome=%q, want %q", got, tc.want)
+			}
+			if atomic.LoadInt32(calls) != 1 {
+				t.Errorf("requests=%d, want the one read that was out", atomic.LoadInt32(calls))
+			}
+			if _, ok := loadGrokBillingLiveSnapshot(ada, time.Now()); ok {
+				t.Error("a reading was cached under the account that switched away")
+			}
+		})
+	}
+}
+
 func TestProbeGrokBillingLive_UnauthorizedRenewsOnceThenGivesUp(t *testing.T) {
 	home := isolateGrok(t)
 	writeGrokAuth(t, home, "revoked", "dan@example.com", time.Now().Add(time.Hour))

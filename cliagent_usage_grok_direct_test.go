@@ -443,6 +443,8 @@ func TestGrokDirectScan_ALogReplacedAtTheSamePathIsReadFromItsStart(t *testing.T
 // account signs back in.
 func TestGrokDirectScan_ATurnRetiredAcrossAnAccountChangeIsOwedAgainUnderItsAccount(t *testing.T) {
 	h := newGrokDirectHarness(t)
+	h.scan() // a poll sees fp-ada signed in, so the turn is hers
+	h.advance(2 * time.Second)
 	h.outcome.Store(liveProbeOutcomeAccountChanged)
 	turn := h.clock().Add(-time.Second)
 	h.appendRaw(grokTurnMarkerLine(turn))
@@ -481,6 +483,8 @@ func TestGrokDirectScan_AForgetBeforeTheNudgeIsRecordedKeepsTheTurnOwed(t *testi
 		return started
 	}
 	t.Cleanup(func() { grokDirectNudge = prevNudge })
+	h.scan() // a poll sees fp-ada signed in, so the turn is hers
+	h.advance(2 * time.Second)
 	turn := h.clock().Add(-time.Second)
 	h.appendRaw(grokTurnMarkerLine(turn))
 	h.scan()
@@ -505,6 +509,65 @@ func TestGrokDirectScan_AForgetBeforeTheNudgeIsRecordedKeepsTheTurnOwed(t *testi
 	}
 	if !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
 		t.Fatal("want fp-ada's reading to cover the turn")
+	}
+}
+
+// A read whose login switched while its request was out (the probe's
+// account_changed_after_read) retires the debt rather than idling it under
+// the account that left: the turn is owed again once that account is back.
+func TestGrokDirectScan_ATurnWhoseLoginSwitchedMidRequestIsOwedAgain(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // a poll sees fp-ada signed in, so the turn is hers
+	h.advance(2 * time.Second)
+	h.outcome.Store(liveProbeOutcomeAccountChangedAfterRead)
+	turn := h.clock().Add(-time.Second)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	h.scan()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want one read retired as an account change", h.reads.Load(), h.state())
+	}
+	h.outcome.Store(grokLiveOutcomeOK)
+	h.signIn("fp-bob")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want fp-ada's turn never paid under fp-bob", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want the turn owed again and paid under fp-ada", h.reads.Load())
+	}
+}
+
+// A turn that completed before the process's first poll has no known owner
+// (the user may have switched logins while the agent was stopped): it is paid
+// under the first login seen and once under each other login, so the account
+// that ran it is paid when it is back — and no login is read for it twice.
+func TestGrokDirectScan_APreStartTurnIsPaidOnceUnderEachLogin(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.signIn("fp-bob")
+	turn := h.clock().Add(-time.Minute)
+	h.appendRaw(grokTurnMarkerLine(turn))
+	grokDirectScanAtStartup()
+	h.idle()
+	if h.reads.Load() != 1 || !grokLiveReadingCovers("fp-bob", turn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want the pre-start turn paid under the first login seen", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", turn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want the pre-start turn paid under fp-ada too", h.reads.Load())
+	}
+	for _, fp := range []string{"fp-bob", "fp-ada", "fp-bob"} {
+		h.signIn(fp)
+		h.advance(2 * grokRefreshNudgeCooldown)
+		h.scan()
+	}
+	if h.reads.Load() != 2 {
+		t.Fatalf("reads = %d, want each login read at most once for the pre-start turn", h.reads.Load())
 	}
 }
 

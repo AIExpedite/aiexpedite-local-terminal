@@ -101,11 +101,20 @@ type grokDirectCursor struct {
 	// most grokDirectAccountSpans long. It is the identity evidence for a
 	// marker: the log line's ctx is never decoded.
 	accounts []grokDirectAccountSpan
+	// startMs is the process's first poll (0 before it). A turn older than it
+	// completed while no poll was watching, so any login may have run it.
+	startMs int64
+	// preStartMs is the newest such turn. With no evidence of its owner it is
+	// filed once under every login the polls see (preStartFiled, at most
+	// grokDirectPendingOwners), so the account that ran it is paid whenever
+	// it is signed in — an update hand-off's first login, or the account that
+	// signed out while the agent was stopped once it is back.
+	preStartMs    int64
+	preStartFiled []string
 }
 
 // grokDirectAccountSpan is one run of polls that saw the same login
 // (fingerprint "" = signed out), from its first to its last observation.
-// The process's first span has firstMs 0: nothing is known before it.
 type grokDirectAccountSpan struct {
 	fingerprint     string
 	firstMs, lastMs int64
@@ -122,6 +131,10 @@ const grokDirectPendingOwners = grokDirectAccountSpans + 1
 // grokDirectNoOwner marks a turn no account can be shown to own; it matches no
 // fingerprint, so the turn is never paid.
 const grokDirectNoOwner = "no-owner:"
+
+// grokDirectPreStart marks a turn that completed before the process's first
+// poll; it is never a pending key (grokDirectCursor.preStartMs holds it).
+const grokDirectPreStart = "pre-start:"
 
 var (
 	grokDirectMu    sync.Mutex
@@ -285,11 +298,10 @@ func grokDirectObserveAccountLocked(fingerprint string, nowMs int64) {
 		c.accounts[n-1].lastMs = nowMs
 		return
 	}
-	first := nowMs
-	if len(c.accounts) == 0 {
-		first = 0
+	if c.startMs == 0 {
+		c.startMs = nowMs
 	}
-	c.accounts = append(c.accounts, grokDirectAccountSpan{fingerprint: fingerprint, firstMs: first, lastMs: nowMs})
+	c.accounts = append(c.accounts, grokDirectAccountSpan{fingerprint: fingerprint, firstMs: nowMs, lastMs: nowMs})
 	if len(c.accounts) > grokDirectAccountSpans {
 		c.accounts = slices.Delete(c.accounts, 0, len(c.accounts)-grokDirectAccountSpans)
 	}
@@ -301,14 +313,13 @@ func grokDirectObserveAccountLocked(fingerprint string, nowMs int64) {
 //   - between two polls that saw different logins: the earlier signed-in one,
 //     else the later one (grokDirectAttributeLocked also files the gap's
 //     newest turn under the later login, since either may have run it);
-//   - inside the process's first span while signed out: nothing is known
-//     before the process, so the next login owns it ("" until one appears —
-//     the first poll after login nudges it);
+//   - inside the process's first span while signed out: the next login owns
+//     it ("" until one appears — the first poll after login nudges it);
+//   - before the process's first poll: grokDirectPreStart, since no poll saw
+//     who was signed in (grokDirectAttributeLocked files it under each login);
 //   - inside a later signed-out span, or older than the timeline:
 //     grokDirectNoOwner.
 //
-// The process's first signed-in span covers turns from before the process
-// started (an update hand-off): no poll saw an earlier login to prefer.
 // gap is the index of the span a between-polls turn follows, else -1.
 // Caller holds grokDirectMu.
 func grokDirectMarkerOwnerLocked(markerMs int64) (owner string, gap int) {
@@ -321,6 +332,9 @@ func grokDirectMarkerOwnerLocked(markerMs int64) (owner string, gap int) {
 		}
 	}
 	if k < 0 {
+		if len(spans) > 0 && spans[0].firstMs == grokDirectState.startMs {
+			return grokDirectPreStart, -1
+		}
 		return grokDirectNoOwner, -1
 	}
 	s := spans[k]
@@ -333,7 +347,7 @@ func grokDirectMarkerOwnerLocked(markerMs int64) (owner string, gap int) {
 	if s.fingerprint != "" {
 		return s.fingerprint, -1
 	}
-	if s.firstMs != 0 {
+	if s.firstMs != grokDirectState.startMs {
 		return grokDirectNoOwner, -1
 	}
 	for _, next := range spans[k+1:] {
@@ -369,13 +383,17 @@ func grokDirectAttributeLocked(markers []int64) {
 	gapNewest := map[int]int64{}
 	for _, ms := range markers {
 		owner, gap := grokDirectMarkerOwnerLocked(ms)
+		if owner == grokDirectPreStart {
+			c.preStartMs = max(c.preStartMs, ms)
+			continue
+		}
 		turns = append(turns, turn{ms: ms, owner: owner, gap: gap})
 		if gap >= 0 {
 			gapNewest[gap] = max(gapNewest[gap], ms)
 		}
 	}
 	file := func(owner string, ms int64) {
-		if owner == grokDirectNoOwner || ms <= c.pending[owner] {
+		if owner == grokDirectNoOwner || owner == grokDirectPreStart || ms <= c.pending[owner] {
 			return
 		}
 		if c.pending == nil {
@@ -388,6 +406,17 @@ func grokDirectAttributeLocked(markers []int64) {
 		if t.gap >= 0 && t.ms == gapNewest[t.gap] {
 			if later := c.accounts[t.gap+1].fingerprint; later != "" {
 				file(later, t.ms)
+			}
+		}
+	}
+	if n := len(c.accounts); c.preStartMs > 0 && n > 0 {
+		// The pre-start turn, once under each login seen: at most one read per
+		// account (none where that account's reading already covers it).
+		if login := c.accounts[n-1].fingerprint; login != "" && !slices.Contains(c.preStartFiled, login) {
+			file(login, c.preStartMs)
+			c.preStartFiled = append(c.preStartFiled, login)
+			if len(c.preStartFiled) > grokDirectPendingOwners {
+				c.preStartFiled = slices.Delete(c.preStartFiled, 0, len(c.preStartFiled)-grokDirectPendingOwners)
 			}
 		}
 	}
