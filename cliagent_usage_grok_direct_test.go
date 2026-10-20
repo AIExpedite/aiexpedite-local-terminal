@@ -570,3 +570,29 @@ func TestGrokDirectScan_AMarkerInsideASignedOutSpanHasNoOwner(t *testing.T) {
 		t.Fatalf("reads = %d, want an unowned turn never paid", h.reads.Load())
 	}
 }
+
+// Turns by two accounts between the same two polls are not collapsed into one
+// marker: the newest is paid under the login that switched in, and the
+// earlier account's turn stays owed until that account is back.
+func TestGrokDirectScan_TurnsOnBothSidesOfALoginSwitchAreBothPaid(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	h.scan() // a poll sees fp-ada signed in
+	h.advance(5 * time.Second)
+	adaTurn := h.clock()
+	h.appendRaw(grokTurnMarkerLine(adaTurn))
+	h.signIn("fp-bob")
+	h.advance(3 * time.Second)
+	bobTurn := h.clock()
+	h.appendRaw(grokTurnMarkerLine(bobTurn))
+	h.advance(2 * time.Second)
+	h.scan()
+	if h.reads.Load() != 1 || !grokLiveReadingCovers("fp-bob", bobTurn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want fp-bob's turn paid under fp-bob", h.reads.Load())
+	}
+	h.signIn("fp-ada")
+	h.advance(2 * grokRefreshNudgeCooldown)
+	h.scan()
+	if h.reads.Load() != 2 || !grokLiveReadingCovers("fp-ada", adaTurn.UnixMilli(), h.clock()) {
+		t.Fatalf("reads = %d, want fp-ada's turn still owed and paid once it is back", h.reads.Load())
+	}
+}

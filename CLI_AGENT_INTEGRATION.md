@@ -781,7 +781,10 @@ same bounded run-completion refresh Codex and Antigravity have:
     before a switch (or a sign-out) belongs to the earlier account, never to
     whoever is signed in when the scan finds it. Only a process that has seen
     no login yet lets the next login adopt the turn; a turn written while the
-    polls saw nobody signed in is never paid.
+    polls saw nobody signed in is never paid. Each account keeps its own
+    pending turn (`grokDirectAttributeLocked`), and when two or more turns
+    land between two polls that saw different logins the newest is paid under
+    the later login, so turns on both sides of a switch are each paid.
   - **Cost.** `nudgeGrokUsageRefreshFor(now, turnTime, fp)` opens one debt
     whose completion is the turn's own time, so a reading already taken since
     pays it for free. The debt's budget, 60 s spacing and 30 min exhausted

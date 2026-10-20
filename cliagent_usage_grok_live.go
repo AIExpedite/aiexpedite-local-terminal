@@ -659,7 +659,9 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     carried, the commit advances the generation and marks the entry
 //     Cleared, so the card's switch to Unknown reaches terminal-service like
 //     any other change. A later unmetered read for the same account keeps the
-//     mark without advancing again.
+//     mark without advancing again. Dropping only this account's on-demand
+//     pool under a kept percentage advances the generation the same way
+//     (without the mark: the percentage still renders).
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -708,12 +710,16 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			(entryErr == nil && entryAt.After(prevPoolAt)) ||
 			!prev.sameOnDemand(entry)
 	}
-	if !advanced && sameAccount && entry.UsedPercent == nil && !entry.hasNumericOnDemand() {
+	if !advanced && sameAccount && !entry.hasNumericOnDemand() {
 		switch {
-		case prevNumeric || prev.hasNumericOnDemand():
+		case entry.UsedPercent == nil && (prevNumeric || prev.hasNumericOnDemand()):
 			advanced, entry.Cleared = true, true
-		case prev.Cleared:
+		case entry.UsedPercent == nil && prev.Cleared:
 			entry.Cleared = true
+		case prev.hasNumericOnDemand():
+			// The pool is gone under a kept percentage: the card drops its
+			// on-demand row, so that removal is versioned too.
+			advanced = true
 		}
 	}
 	epoch := codexProcessGenerationEpoch.Load()

@@ -84,18 +84,19 @@ type grokDirectCursor struct {
 	// midLine: the read stopped inside one over-long line, so the next read's
 	// first segment is its tail and is dropped.
 	midLine bool
-	// newestMarkerMs is the newest turn completion found (epoch ms), kept until
-	// a numeric reading covers it, so a deferred nudge is retried on every poll
-	// even when Grok writes nothing more.
-	newestMarkerMs int64
-	// nudgedMarkerMs is the newest marker a nudge handed to the run debt. From
-	// there the debt's own ladder owns it (any read it sends postdates the
-	// turn), so the same turn never re-opens a budget the debt spent.
-	nudgedMarkerMs int64
-	// markerAccount is the fingerprint that owned newestMarkerMs when the turn
-	// completed (grokDirectMarkerOwnerLocked): the turn is only ever paid
-	// under that account, never against a login that switched in later.
-	markerAccount string
+	// pending is, per owning fingerprint (grokDirectAttributeLocked), the
+	// newest turn completion found (epoch ms), kept until a numeric reading
+	// for that account covers it, so a deferred nudge is retried on every poll
+	// even when Grok writes nothing more. A turn is only ever paid under the
+	// account that ran it, never against a login that switched in later. Key
+	// "" holds turns no login has been seen for yet. At most
+	// grokDirectPendingOwners entries.
+	pending map[string]int64
+	// nudged is, per fingerprint, the newest marker a nudge handed to the run
+	// debt. From there the debt's own ladder owns it (any read it sends
+	// postdates the turn), so the same turn never re-opens a budget the debt
+	// spent.
+	nudged map[string]int64
 	// accounts is the sign-in timeline the polls observed, oldest first, at
 	// most grokDirectAccountSpans long. It is the identity evidence for a
 	// marker: the log line's ctx is never decoded.
@@ -113,6 +114,10 @@ type grokDirectAccountSpan struct {
 // grokDirectAccountSpans bounds the sign-in timeline; a marker older than its
 // oldest span is never attributed.
 const grokDirectAccountSpans = 4
+
+// grokDirectPendingOwners bounds the per-account pending markers: every
+// account the timeline can name, plus turns not yet owned.
+const grokDirectPendingOwners = grokDirectAccountSpans + 1
 
 // grokDirectNoOwner marks a turn no account can be shown to own; it matches no
 // fingerprint, so the turn is never paid.
@@ -152,27 +157,21 @@ func grokDirectScan(requireDetected bool) {
 	now := grokUsageFreshnessNow()
 	fingerprint := grokUsageCurrentFingerprint()
 	grokDirectMu.Lock()
-	grokDirectAdvanceLocked(grokBillingLogPath(grokPersistentHome()), now)
+	markers := grokDirectAdvanceLocked(grokBillingLogPath(grokPersistentHome()), now)
 	grokDirectObserveAccountLocked(fingerprint, now.UnixMilli())
-	markerMs, nudgedMs := grokDirectState.newestMarkerMs, grokDirectState.nudgedMarkerMs
-	if markerMs != 0 && grokDirectState.markerAccount == "" {
-		grokDirectState.markerAccount = grokDirectMarkerOwnerLocked(markerMs)
-	}
-	owner := grokDirectState.markerAccount
+	grokDirectAttributeLocked(markers)
+	// Only this login's turns are nudged; the rest stay pending: a turn with
+	// no owner known yet (signed out since the process started) is nudged on
+	// the first poll after login, another account's once it signs back in.
+	markerMs, nudgedMs := grokDirectState.pending[fingerprint], grokDirectState.nudged[fingerprint]
 	grokDirectMu.Unlock()
-	if markerMs == 0 || markerMs <= nudgedMs {
-		return
-	}
-	if fingerprint == "" || owner != fingerprint {
-		// kept: no owner known yet (signed out since the process started) is
-		// nudged on the first poll after login; another account's turn once
-		// it signs back in.
+	if fingerprint == "" || markerMs == 0 || markerMs <= nudgedMs {
 		return
 	}
 	if grokLiveReadingCovers(fingerprint, markerMs, now) {
 		grokDirectMu.Lock()
-		if grokDirectState.newestMarkerMs == markerMs {
-			grokDirectState.newestMarkerMs = 0
+		if grokDirectState.pending[fingerprint] == markerMs {
+			delete(grokDirectState.pending, fingerprint)
 		}
 		grokDirectMu.Unlock()
 		return
@@ -183,39 +182,43 @@ func grokDirectScan(requireDetected bool) {
 		return
 	}
 	grokDirectMu.Lock()
-	if markerMs > grokDirectState.nudgedMarkerMs {
-		grokDirectState.nudgedMarkerMs = markerMs
+	if markerMs > grokDirectState.nudged[fingerprint] {
+		if grokDirectState.nudged == nil {
+			grokDirectState.nudged = map[string]int64{}
+		}
+		grokDirectState.nudged[fingerprint] = markerMs
 	}
 	grokDirectMu.Unlock()
 	fmt.Printf("%s[cli-usage] grok direct run: owed%s\n", colorCyan, colorReset)
 }
 
 // grokDirectAdvanceLocked reads what was appended to path since the cursor
-// and records the newest marker in it. Caller holds grokDirectMu.
-func grokDirectAdvanceLocked(path string, now time.Time) {
+// and returns the turn completions (epoch ms) found in it. Caller holds
+// grokDirectMu.
+func grokDirectAdvanceLocked(path string, now time.Time) []int64 {
 	c := &grokDirectState
 	if path != c.path {
 		// Another file (GROK_HOME moved): never seek into it at the old offset.
 		*c = grokDirectCursor{path: path}
 	}
 	if path == "" {
-		return
+		return nil
 	}
 	// One handle for the stat and the read, so both see the same file even if
 	// Grok replaces it in between.
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		return nil
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return
+		return nil
 	}
 	size, modTime := info.Size(), info.ModTime()
 	replaced := c.seen && c.file != nil && !os.SameFile(c.file, info)
 	if c.seen && !replaced && size == c.size && modTime.Equal(c.modTime) {
-		return
+		return nil
 	}
 	start, jumped := c.offset, false
 	if !c.seen || replaced || size < c.offset || size-c.offset > grokDirectScanMaxBytes {
@@ -234,7 +237,7 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 	chunk, ok := readFileRangeExact(f, readFrom, size)
 	if !ok {
 		// Truncated between Stat and read: the next poll retries.
-		return
+		return nil
 	}
 	fragment := c.midLine
 	if jumped {
@@ -251,7 +254,7 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 		} else {
 			c.offset = start
 		}
-		return
+		return nil
 	}
 	lines := bytes.Split(chunk[:lastNewline], []byte("\n"))
 	if fragment {
@@ -259,9 +262,7 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 		lines = lines[1:]
 	}
 	c.offset, c.midLine = start+int64(lastNewline)+1, false
-	if ms := grokNewestDirectMarkerMs(lines, now); ms > c.newestMarkerMs {
-		c.newestMarkerMs, c.markerAccount = ms, ""
-	}
+	return grokDirectMarkerTimesMs(lines, now)
 }
 
 // grokDirectObserveAccountLocked records the login a poll saw at nowMs.
@@ -296,8 +297,9 @@ func grokDirectObserveAccountLocked(fingerprint string, nowMs int64) {
 //
 // The process's first signed-in span covers turns from before the process
 // started (an update hand-off): no poll saw an earlier login to prefer.
+// gap is the index of the span a between-polls turn follows, else -1.
 // Caller holds grokDirectMu.
-func grokDirectMarkerOwnerLocked(markerMs int64) string {
+func grokDirectMarkerOwnerLocked(markerMs int64) (owner string, gap int) {
 	spans := grokDirectState.accounts
 	k := -1
 	for i := len(spans) - 1; i >= 0; i-- {
@@ -307,35 +309,95 @@ func grokDirectMarkerOwnerLocked(markerMs int64) string {
 		}
 	}
 	if k < 0 {
-		return grokDirectNoOwner
+		return grokDirectNoOwner, -1
 	}
 	s := spans[k]
 	if markerMs > s.lastMs && k+1 < len(spans) {
 		if s.fingerprint != "" {
-			return s.fingerprint
+			return s.fingerprint, k
 		}
-		return spans[k+1].fingerprint
+		return spans[k+1].fingerprint, k
 	}
 	if s.fingerprint != "" {
-		return s.fingerprint
+		return s.fingerprint, -1
 	}
 	if s.firstMs != 0 {
-		return grokDirectNoOwner
+		return grokDirectNoOwner, -1
 	}
 	for _, next := range spans[k+1:] {
 		if next.fingerprint != "" {
-			return next.fingerprint
+			return next.fingerprint, -1
 		}
 	}
-	return ""
+	return "", -1
 }
 
-// grokNewestDirectMarkerMs returns the newest marker's completion (epoch ms,
-// rounded up as a completion is), or 0. A ts further than
+// grokDirectAttributeLocked files the markers one read found under their
+// owners (grokDirectMarkerOwnerLocked), keeping each owner's newest, and
+// re-resolves turns no login had been seen for. Two or more turns between two
+// polls that saw different logins may sit on both sides of the switch, so the
+// newest of them is filed under the later login rather than collapsed into
+// the earlier one's: each side is paid, at worst one extra bounded read.
+// Caller holds grokDirectMu.
+func grokDirectAttributeLocked(markers []int64) {
+	c := &grokDirectState
+	type turn struct {
+		ms    int64
+		owner string
+		gap   int
+	}
+	turns := make([]turn, 0, len(markers)+1)
+	if unowned, ok := c.pending[""]; ok {
+		if owner, _ := grokDirectMarkerOwnerLocked(unowned); owner != "" {
+			delete(c.pending, "")
+			turns = append(turns, turn{ms: unowned, owner: owner, gap: -1})
+		}
+	}
+	gapCount, gapNewest := map[int]int{}, map[int]int64{}
+	for _, ms := range markers {
+		owner, gap := grokDirectMarkerOwnerLocked(ms)
+		turns = append(turns, turn{ms: ms, owner: owner, gap: gap})
+		if gap >= 0 {
+			gapCount[gap]++
+			gapNewest[gap] = max(gapNewest[gap], ms)
+		}
+	}
+	for _, t := range turns {
+		if t.gap >= 0 && gapCount[t.gap] > 1 && t.ms == gapNewest[t.gap] {
+			if later := c.accounts[t.gap+1].fingerprint; later != "" {
+				t.owner = later
+			}
+		}
+		if t.owner == grokDirectNoOwner || t.ms <= c.pending[t.owner] {
+			continue
+		}
+		if c.pending == nil {
+			c.pending = map[string]int64{}
+		}
+		c.pending[t.owner] = t.ms
+	}
+	for len(c.pending) > grokDirectPendingOwners {
+		oldest, oldestMs := "", int64(-1)
+		for owner, ms := range c.pending {
+			if oldestMs < 0 || ms < oldestMs {
+				oldest, oldestMs = owner, ms
+			}
+		}
+		delete(c.pending, oldest)
+	}
+	for owner := range c.nudged {
+		if _, ok := c.pending[owner]; !ok {
+			delete(c.nudged, owner)
+		}
+	}
+}
+
+// grokDirectMarkerTimesMs returns each marker's completion (epoch ms, rounded
+// up as a completion is), in log order. A ts further than
 // grokBillingMaxClockSkew in the future is ignored; a nearer future one is
 // clamped to now.
-func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
-	newest := int64(0)
+func grokDirectMarkerTimesMs(lines [][]byte, now time.Time) []int64 {
+	var out []int64
 	for _, line := range lines {
 		if !grokLineMentionsAnyMessage(line, grokDirectRunMarkers) {
 			continue
@@ -354,11 +416,9 @@ func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
 		if ts.After(now) {
 			ts = now
 		}
-		if ms := grokCompletionMs(ts); ms > newest {
-			newest = ms
-		}
+		out = append(out, grokCompletionMs(ts))
 	}
-	return newest
+	return out
 }
 
 // grokDirectForgetNudged is told when a debt is retired because the login
@@ -366,7 +426,7 @@ func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
 // turn is no longer handled and is nudged again once its account is back.
 func grokDirectForgetNudged() {
 	grokDirectMu.Lock()
-	grokDirectState.nudgedMarkerMs = 0
+	grokDirectState.nudged = nil
 	grokDirectMu.Unlock()
 }
 

@@ -939,6 +939,32 @@ func TestGrokLiveCache_AnUnmeteredReadWithANumericOnDemandPoolBumps(t *testing.T
 	}
 }
 
+// A newer unmetered answer that drops the on-demand pool under a kept
+// percentage removes the card's on-demand row, so the removal is versioned.
+func TestGrokLiveCache_DroppingTheOnDemandPoolUnderAKeptPercentageBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8110)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, floatPtr(36), end, 50, 5))
+
+	later := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", later, nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8110, 2) || entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want the removal to bump to {8110,2} without a clear mark", entry.Generation, entry.Cleared)
+	}
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", later)
+	if !ok || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) || snap.HasOnDemand {
+		t.Fatalf("snap = %+v ok=%t, want the kept 36%% and no on-demand pool", snap, ok)
+	}
+
+	// Nothing left to remove: the next unmetered answer advances nothing.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", later.Add(time.Hour), nil, end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8110, 2) {
+		t.Fatalf("generation = %+v, want {8110,2} kept", g)
+	}
+}
+
 func TestGrokLiveCache_AnUnmeteredReadWithoutUsageOnTheCapNeverBumps(t *testing.T) {
 	grokLiveCacheFixture(t, 8109)
 	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
