@@ -1836,7 +1836,8 @@ provider for its current figures before the gather runs
   - Grok — GET `cli-chat-proxy.grok.com/v1/billing?format=credits` with the
     token Grok's resolver presents ([`cliagent_usage_grok_live.go`](cliagent_usage_grok_live.go)).
     Headless Grok (`grok -p`, ACP) never fetches credits, so the same read is
-    also owed once by every finished run (see "Run-completion refresh"), and a
+    also owed once by every finished run, managed or direct (see "Run-completion
+    refresh"), and a
     click joins a debt's read already in flight for the account rather than
     sending a second one. The agent never renews the login itself; an expired token or
     a 401 runs `grok models` once against the real home so Grok renews, then the

@@ -43,8 +43,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
+	"slices"
 	"sync"
 	"time"
 )
@@ -165,7 +165,14 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 	if path == "" {
 		return
 	}
-	info, err := os.Stat(path)
+	// One handle for the stat and the read, so both see the same file even if
+	// Grok replaces it in between.
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return
 	}
@@ -174,39 +181,42 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 		return
 	}
 	start, jumped := c.offset, false
-	if !c.seen || size < c.offset {
-		// First scan of this process, or a rotation / truncation: only the
-		// newest window.
-		start, jumped = 0, false
-		if size > grokDirectScanMaxBytes {
-			start, jumped = size-grokDirectScanMaxBytes, true
-		}
-		c.midLine = false
-	} else if size-start > grokDirectScanMaxBytes {
-		start, jumped = size-grokDirectScanMaxBytes, true
-		c.midLine = false
+	if !c.seen || size < c.offset || size-c.offset > grokDirectScanMaxBytes {
+		// First scan of this process, a rotation / truncation, or more appended
+		// than one read may take: only the newest window.
+		start = max(size-grokDirectScanMaxBytes, 0)
+		jumped, c.midLine = start > 0, false
 	}
-	chunk, ok := grokDirectReadRange(path, start, size)
+	// A jumped window also reads the byte before it, to tell a window that
+	// starts on a line boundary from one that starts inside a line.
+	readFrom := start
+	if jumped {
+		readFrom--
+	}
+	chunk, ok := readFileRangeExact(f, readFrom, size)
 	if !ok {
-		// Replaced or truncated between Stat and read: the next poll retries.
+		// Truncated between Stat and read: the next poll retries.
 		return
+	}
+	fragment := c.midLine
+	if jumped {
+		fragment = chunk[0] != '\n'
+		chunk = chunk[1:]
 	}
 	c.seen, c.size, c.modTime = true, size, modTime
 	lastNewline := bytes.LastIndexByte(chunk, '\n')
 	if lastNewline < 0 {
 		// No complete line yet. A partial line at a line boundary is read again
-		// whole next time; one inside a jumped window is the middle of an
-		// over-long line, skipped to its end.
-		if jumped || c.midLine {
+		// whole next time; the middle of an over-long line is skipped to its end.
+		if fragment {
 			c.offset, c.midLine = size, true
 		} else {
 			c.offset = start
 		}
 		return
 	}
-	complete := chunk[:lastNewline]
-	lines := bytes.Split(complete, []byte("\n"))
-	if jumped || c.midLine {
+	lines := bytes.Split(chunk[:lastNewline], []byte("\n"))
+	if fragment {
 		// The first segment is the tail of a line that began before the window.
 		lines = lines[1:]
 	}
@@ -216,26 +226,6 @@ func grokDirectAdvanceLocked(path string, now time.Time) {
 	}
 }
 
-// grokDirectReadRange reads exactly [start, end) of path.
-func grokDirectReadRange(path string, start, end int64) ([]byte, bool) {
-	if end <= start {
-		return nil, true
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return nil, false
-	}
-	buf := make([]byte, end-start)
-	if _, err := io.ReadFull(f, buf); err != nil {
-		return nil, false
-	}
-	return buf, true
-}
-
 // grokNewestDirectMarkerMs returns the newest marker's completion (epoch ms,
 // rounded up as a completion is), or 0. A ts further than
 // grokBillingMaxClockSkew in the future is ignored; a nearer future one is
@@ -243,14 +233,14 @@ func grokDirectReadRange(path string, start, end int64) ([]byte, bool) {
 func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
 	newest := int64(0)
 	for _, line := range lines {
-		if !grokLineMentionsDirectMarker(line) {
+		if !grokLineMentionsAnyMessage(line, grokDirectRunMarkers) {
 			continue
 		}
 		var rec struct {
 			Msg string `json:"msg"`
 			TS  string `json:"ts"`
 		}
-		if json.Unmarshal(line, &rec) != nil || !grokDirectMarkerRecognized(rec.Msg) {
+		if json.Unmarshal(line, &rec) != nil || !slices.Contains(grokDirectRunMarkers, rec.Msg) {
 			continue
 		}
 		ts, err := time.Parse(time.RFC3339Nano, rec.TS)
@@ -265,25 +255,6 @@ func grokNewestDirectMarkerMs(lines [][]byte, now time.Time) int64 {
 		}
 	}
 	return newest
-}
-
-// grokLineMentionsDirectMarker is the cheap pre-filter before the decode.
-func grokLineMentionsDirectMarker(line []byte) bool {
-	for _, marker := range grokDirectRunMarkers {
-		if bytes.Contains(line, []byte(marker)) {
-			return true
-		}
-	}
-	return false
-}
-
-func grokDirectMarkerRecognized(msg string) bool {
-	for _, marker := range grokDirectRunMarkers {
-		if msg == marker {
-			return true
-		}
-	}
-	return false
 }
 
 // resetGrokDirectScan forgets the cursor (tests, propagator reset).

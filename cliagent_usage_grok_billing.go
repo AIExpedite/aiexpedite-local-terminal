@@ -31,6 +31,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -93,23 +94,14 @@ var grokBillingLogMessages = []string{
 	"billing: credits config fetched",
 }
 
-// grokBillingMessageRecognized reports whether msg is one of the allowlisted
-// credits-config messages.
-func grokBillingMessageRecognized(msg string) bool {
-	for _, candidate := range grokBillingLogMessages {
-		if msg == candidate {
-			return true
-		}
-	}
-	return false
-}
-
-// grokLineMentionsBillingMessage is the cheap pre-filter before the JSON
-// decode: the vast majority of lines in this log are chat/tool telemetry, and
-// unmarshalling every one of them would dominate the gather. A hit here is only
-// a candidate — grokBillingMessageRecognized still checks the decoded `msg`.
-func grokLineMentionsBillingMessage(line []byte) bool {
-	for _, candidate := range grokBillingLogMessages {
+// grokLineMentionsAnyMessage is the cheap pre-filter before a JSON decode of a
+// unified.jsonl line: the vast majority of lines in this log are chat/tool
+// telemetry, and unmarshalling every one of them would dominate the read. A hit
+// is only a candidate — the decoded `msg` must still be an EXACT member of the
+// closed set (slices.Contains). Shared by the billing reader
+// (grokBillingLogMessages) and the direct-run scan (grokDirectRunMarkers).
+func grokLineMentionsAnyMessage(line []byte, messages []string) bool {
+	for _, candidate := range messages {
 		if bytes.Contains(line, []byte(candidate)) {
 			return true
 		}
@@ -1181,20 +1173,33 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 	if info.Size() > grokBillingLogTailBytes {
 		offset = info.Size() - grokBillingLogTailBytes
 	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, false
-	}
-	// Read exactly the tail length captured by Stat. An unbounded ReadAll after
-	// seeking can consume more than 1 MiB when Grok appends quickly enough to
-	// keep extending the file, defeating this gather's memory/work bound and
-	// mixing records from different filesystem snapshots.
-	tail := make([]byte, info.Size()-offset)
-	if _, err := io.ReadFull(f, tail); err != nil {
+	tail, ok := readFileRangeExact(f, offset, info.Size())
+	if !ok {
 		// The log was truncated or replaced between Stat and ReadFull. Fail
 		// closed and let the next bounded refresh gather a coherent snapshot.
 		return nil, false
 	}
 	return bytes.Split(tail, []byte("\n")), offset > 0
+}
+
+// readFileRangeExact reads exactly [start, end) of f, the range a prior Stat
+// of the same handle captured. An unbounded ReadAll after seeking can consume
+// more than the bound when Grok appends quickly enough to keep extending the
+// file, defeating the reader's memory/work bound and mixing records from
+// different filesystem snapshots. Shared by the billing tail reader and the
+// direct-run scan (cliagent_usage_grok_direct.go).
+func readFileRangeExact(f *os.File, start, end int64) ([]byte, bool) {
+	if end <= start {
+		return []byte{}, true
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, false
+	}
+	buf := make([]byte, end-start)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, false
+	}
+	return buf, true
 }
 
 // newestTrustedGrokBillingRecordFor returns the newest billing OBSERVATION (the
@@ -1239,13 +1244,13 @@ func newestTrustedGrokBillingRecordFor(base string, identities []string, trusted
 	found := false
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
+		if len(line) == 0 || !grokLineMentionsAnyMessage(line, grokBillingLogMessages) {
 			continue
 		}
 		var envelope struct {
 			Msg string `json:"msg"`
 		}
-		if json.Unmarshal(line, &envelope) != nil || !grokBillingMessageRecognized(envelope.Msg) {
+		if json.Unmarshal(line, &envelope) != nil || !slices.Contains(grokBillingLogMessages, envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
@@ -1342,7 +1347,7 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
+		if len(line) == 0 || !grokLineMentionsAnyMessage(line, grokBillingLogMessages) {
 			continue
 		}
 		// Decode the envelope first so an exact-message record with a malformed
@@ -1362,7 +1367,7 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 			}
 			return grokBillingSnapshot{}, grokUnusableOutcome(lines, i, identities)
 		}
-		if !grokBillingMessageRecognized(envelope.Msg) {
+		if !slices.Contains(grokBillingLogMessages, envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord

@@ -363,3 +363,22 @@ func TestGrokDirectScanAtStartup_NeedsNoDetection(t *testing.T) {
 		t.Fatalf("reads = %d, want the startup scan to find the turn", h.reads.Load())
 	}
 }
+
+// A newest window that starts exactly on a line boundary keeps that line: the
+// byte before the window says it is whole.
+func TestGrokDirectScan_AWindowStartingOnALineBoundaryKeepsItsFirstLine(t *testing.T) {
+	h := newGrokDirectHarness(t)
+	marker := grokTurnMarkerLine(h.clock().Add(-5 * time.Second))
+	h.appendRaw(grokFillerLines(4096))
+	h.appendRaw(marker)
+	after := grokDirectScanMaxBytes - len(marker)
+	h.appendRaw(grokFillerLines(after)[:after-1] + "\n")
+	data, _ := os.ReadFile(h.logPath())
+	if start := len(data) - grokDirectScanMaxBytes; data[start-1] != '\n' || !strings.HasPrefix(string(data[start:]), strings.TrimSuffix(marker, "\n")) {
+		t.Fatal("fixture: the window does not start at the marker line")
+	}
+	h.scan()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the whole first line of the window read", h.reads.Load())
+	}
+}

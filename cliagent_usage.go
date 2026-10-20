@@ -120,7 +120,8 @@ type cliAgentUsage struct {
 	// UsageGeneration identifies the device-side capture state these metrics
 	// were read from: Codex's rate-limit cache
 	// (codexMetricsAndGenerationFromCache), Claude's claudeRateLimitView.generation,
-	// or OpenCode's usage ledger (cliagent_usage_opencode_capture.go). Signed in
+	// OpenCode's usage ledger (cliagent_usage_opencode_capture.go), or Grok's live
+	// billing cache (cliagent_usage_grok_live.go). Signed in
 	// the refresh receipt, so the backend can record, per provider, which
 	// generation it applied and skip a usage hint for one it already has
 	// (cliagent_usage_propagate.go). Integers only.
