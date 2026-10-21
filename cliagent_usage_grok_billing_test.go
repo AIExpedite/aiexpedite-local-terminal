@@ -1261,3 +1261,38 @@ func TestGrokRecovery_WithholdsAHintWhileAPoolIsFutureDated(t *testing.T) {
 		t.Fatalf("recovery = %+v refused=%t, want {8133,1} hinted once the pool renders", g, refused)
 	}
 }
+
+// The same rule must reach a cache whose ONLY figure is the future-dated pool:
+// it renders Unknown on its own, so the metrics gate must not skip it, or
+// nothing is rotated, no retry is armed, and the generation stays unhintable
+// even after the clock catches up.
+func TestGrokRecovery_RetriesAPoolOnlyFutureDatedCache(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8134)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8135)
+	grokGenerationRotated.Store(false)
+
+	g, refused := grokRecoveryGeneration(h.clock())
+	if g != nil || !refused {
+		t.Fatalf("recovery = %+v refused=%t, want the hint withheld and retried for a pool-only future cache", g, refused)
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8135, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation committed anyway", on)
+	}
+	if !grokGenerationRotated.Load() {
+		t.Fatal("grokGenerationRotated = false, want the rotation latched so the next gather can publish")
+	}
+
+	// Once the clock catches up the pool renders, and the recovery hints it.
+	h.advance(2 * time.Hour)
+	g, refused = grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8135, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want {8135,1} hinted once the pool renders", g, refused)
+	}
+}

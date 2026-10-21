@@ -866,14 +866,22 @@ var (
 func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
 	fingerprint := grokUsageCurrentFingerprint()
 	view, ok := loadGrokBillingLive(fingerprint, now)
-	if !ok || !(view.cleared || grokBillingMetricsNumeric(grokBillingMetrics(view.snap, now))) {
+	if !ok {
+		return nil, false
+	}
+	// A withheld figure is a reading, so it is recovered like any other — the
+	// metrics gate below would otherwise skip a cache whose only figure is the
+	// future-dated one (a pool with no percentage renders Unknown on its own),
+	// leaving nothing rotated and no retry armed.
+	withheld := grokBillingValueWithheld(view.snap, now)
+	if !withheld && !(view.cleared || grokBillingMetricsNumeric(grokBillingMetrics(view.snap, now))) {
 		return nil, false
 	}
 	g, refused := rotateGrokBillingLiveGeneration(fingerprint)
 	if refused || g == nil {
 		return g, refused
 	}
-	if grokBillingValueWithheld(view.snap, now) {
+	if withheld {
 		// ParseContext withholds this same generation while one of the
 		// cache's figures is future-dated, so hinting it now would spend the
 		// generation's hint attempts on refreshes whose receipt carries no
