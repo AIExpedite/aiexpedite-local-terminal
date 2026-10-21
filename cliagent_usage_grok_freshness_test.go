@@ -995,3 +995,59 @@ func TestGrokRunDebt_ARungRefusedByTheFreshnessLockIsBookedOnceReleased(t *testi
 		t.Fatalf("state=%+v pending=%t, want the rung booked and armed once released", h.state(), grokRunDebtRetryPending())
 	}
 }
+
+// A settle refused by the lock stands down when another account signed in and
+// opened a newer debt before the retry landed: that debt is kept, not replaced
+// unpaid by one for the stale account that its worker could only retire.
+func TestGrokRunDebt_ARefusedSettleKeepsANewerDebtFromAnotherAccount(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	release := holdGrokFreshnessLock(t)
+	floor := armGrokUsageRunFloor(h.clock())
+	h.advance(time.Second)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("want the settled run reported owed")
+	}
+	// While the lock is held the other process signs in as bob and commits
+	// bob's run debt, newer than ada's settle.
+	h.signIn("fp-bob")
+	h.advance(time.Second)
+	bob := grokUsageFreshness{
+		SchemaVersion: grokUsageFreshnessSchema, OwedAtMs: h.clock().UnixMilli(),
+		CompletionMs: h.clock().UnixMilli(), AccountFingerprint: "fp-bob",
+	}
+	if !writeJSONFileAtomic(grokUsageFreshnessPath(), bob) {
+		t.Fatal("write bob debt")
+	}
+	release()
+	h.idle()
+	got := h.state()
+	if h.reads.Load() != 0 || !got.owed() || got.AccountFingerprint != "fp-bob" || got.OwedAtMs != bob.OwedAtMs {
+		t.Fatalf("reads = %d state=%+v, want bob's debt kept and no read for ada", h.reads.Load(), got)
+	}
+}
+
+// A due rung whose claim the lock refuses is retried until it lands, so the
+// debt is still paid even though this process's timer is already spent.
+func TestGrokRunDebt_ARungClaimRefusedByTheFreshnessLockIsPaidOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), Attempts: 1,
+		LastAttemptAtMs: now.Add(-2 * time.Minute).UnixMilli(), NextAttemptAtMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	id := h.state().debtID()
+	release := holdGrokFreshnessLock(t)
+	grokRunDebtRetryFired(func() uint64 {
+		grokRunDebtRetryTimer.mu.Lock()
+		defer grokRunDebtRetryTimer.mu.Unlock()
+		return grokRunDebtRetryTimer.gen
+	}(), id)
+	if h.reads.Load() != 0 || h.state().NextAttemptAtMs == 0 {
+		t.Fatalf("reads = %d state=%+v, want the rung unclaimed while locked", h.reads.Load(), h.state())
+	}
+	release()
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want the retried claim to pay the debt once", h.reads.Load(), h.state())
+	}
+}

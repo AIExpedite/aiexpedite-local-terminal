@@ -577,7 +577,27 @@ func grokSettleRun(floor time.Time, bypassInterval bool) bool {
 	if !committed {
 		// Another process holds the lock and this run's floor is already
 		// released: the debt is opened, and its worker started, once it lands.
-		grokRetryRefusedFreshness(owe, owed)
+		// The late mutation applies to the state as it is then, so it stands
+		// down when the account changed meanwhile or another account opened a
+		// debt after this settle: owing this run would replace that newer debt
+		// unpaid with one the worker can only retire.
+		superseded := false
+		lateOwe := func(state *grokUsageFreshness) {
+			superseded = grokUsageCurrentFingerprint() != fingerprint ||
+				(state.owed() && state.AccountFingerprint != fingerprint && state.OwedAtMs > now.UnixMilli())
+			if superseded {
+				grokDropSettledFloor(state, floorMs, oldest)
+				return
+			}
+			owe(state)
+		}
+		grokRetryRefusedFreshness(lateOwe, func(state grokUsageFreshness) {
+			if superseded {
+				fmt.Printf("%s[cli-usage] grok refresh: skipped account_changed%s\n", colorYellow, colorReset)
+				return
+			}
+			owed(state)
+		})
 		return true
 	}
 	owed(state)
@@ -977,15 +997,25 @@ func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 		return
 	}
 	claimed := false
-	updateGrokUsageFreshness(func(s *grokUsageFreshness) {
-		if s.owed() && s.debtID() == id && s.NextAttemptAtMs != 0 {
-			s.NextAttemptAtMs, claimed = 0, true
+	claim := func(s *grokUsageFreshness) {
+		claimed = s.owed() && s.debtID() == id && s.NextAttemptAtMs != 0
+		if claimed {
+			s.NextAttemptAtMs = 0
 		}
-	})
-	if !claimed {
+	}
+	pay := func(grokUsageFreshness) {
+		if claimed {
+			grokStartRunDebtWorker(false)
+		}
+	}
+	if _, ok := grokUsageFreshnessTxn(claim); !ok {
+		// Another process holds the lock and this timer is already spent: the
+		// due rung stays on disk with nothing in this process left to serve
+		// it, so the claim is retried until it lands (or is found taken).
+		grokRetryRefusedFreshness(claim, pay)
 		return
 	}
-	grokStartRunDebtWorker(false)
+	pay(grokUsageFreshness{})
 }
 
 // stopGrokRunDebtRetry cancels the pending rung. Called from gracefulShutdown;
