@@ -1140,3 +1140,95 @@ func TestGrokRunDebt_AnAdoptionRefusedByTheFreshnessLockIsPaidOnceReleased(t *te
 		t.Fatalf("reads = %d state=%+v, want the inherited run adopted and paid once", h.reads.Load(), h.state())
 	}
 }
+
+// An arm the lock refused must still persist its floor: a run cut off before
+// it settles would otherwise leave the replacement process nothing to adopt,
+// and the shutdown drain runs before active sessions end, so the exit cannot
+// repair it.
+func TestGrokRunDebt_ARunFloorArmRefusedByTheFreshnessLockPersistsOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	release := holdGrokFreshnessLock(t)
+
+	floor := armGrokUsageRunFloor(h.clock())
+	// The arm persists off the caller's goroutine, so the lock is held for
+	// several of the transaction's waits to be sure its first attempt was
+	// refused rather than merely late.
+	time.Sleep(5 * grokUsageFreshnessLockWait)
+	if got := h.state(); got.RunFloorMs != 0 {
+		t.Fatalf("state = %+v, want no floor written while locked", got)
+	}
+
+	release()
+	h.idle()
+	got := h.state()
+	if got.RunFloorMs != floor.UnixMilli() || got.RunFloorAccount != "fp-ada" {
+		t.Fatalf("state = %+v, want the arm's floor persisted once released", got)
+	}
+}
+
+// A retirement the lock refused must land as well: the read already paid the
+// debt, but the charge that follows an `ok` books no rung, so a debt left
+// owed is one a later direct turn's nudge cannot wake.
+func TestGrokRunDebt_ARefusedRetirementOfAPaidDebtLandsOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), Attempts: 1,
+		LastAttemptAtMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	release := holdGrokFreshnessLock(t)
+
+	settleGrokRunFreshness(now.UnixMilli(), "fp-ada")
+	if !h.state().owed() {
+		t.Fatalf("state = %+v, want the debt untouched while locked", h.state())
+	}
+
+	release()
+	h.idle()
+	if got := h.state(); got.owed() {
+		t.Fatalf("state = %+v, want the reading's retirement to land once released", got)
+	}
+}
+
+// A debt adopted at startup carries no rung to claim, so its claim is
+// persisted: a second agent process sharing the file finds the resumed debt
+// taken and starts no second read for it.
+func TestGrokRunDebt_AResumedDebtIsClaimedAcrossProcesses(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.block = make(chan struct{})
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	state := h.state()
+
+	grokResumeAdoptedDebt(state, now)
+	claim := h.state().WorkerClaimAtMs
+	if claim != now.UnixMilli() {
+		t.Fatalf("state = %+v, want the resumed debt claimed at %d", h.state(), now.UnixMilli())
+	}
+
+	// The other process resumes the same debt a second later.
+	h.advance(time.Second)
+	grokResumeAdoptedDebt(state, h.clock())
+	if got := h.state().WorkerClaimAtMs; got != claim {
+		t.Fatalf("claim = %d, want the first process's claim %d kept", got, claim)
+	}
+
+	// A claim older than one payment pass is free again, so a process that
+	// died mid-pass cannot strand the debt.
+	h.advance(grokResumeClaimTTL)
+	grokResumeAdoptedDebt(state, h.clock())
+	if got, want := h.state().WorkerClaimAtMs, h.clock().UnixMilli(); got != want {
+		t.Fatalf("claim = %d, want the expired claim retaken at %d", got, want)
+	}
+
+	close(h.block)
+	h.idle()
+	if got := h.reads.Load(); got != 1 {
+		t.Fatalf("reads = %d, want one read for one debt", got)
+	}
+	if h.state().owed() {
+		t.Fatalf("state = %+v, want the paid debt cleared", h.state())
+	}
+}

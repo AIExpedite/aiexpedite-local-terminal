@@ -802,7 +802,13 @@ same bounded run-completion refresh Codex and Antigravity have:
   floor the previous process never settled; `gracefulShutdown` stops the timer
   first and then drains in-flight arms and settles (`drainGrokUsageWrites`,
   bounded like Antigravity's), so an update hand-off cannot exit before the
-  debt is on disk. Offline sends nothing and keeps the debt.
+  debt is on disk. Offline sends nothing and keeps the debt. Every mutation
+  that must land — an arm's floor, a settle, a read's charge, a landed
+  reading's retirement, a booked rung and a resumed debt's claim — goes through
+  `grokUsageFreshnessTxn` and is retried (`grokRetryRefusedFreshness`) when
+  another process's lock refuses it. A debt adopted at startup has no rung to
+  claim, so it persists `workerClaimAtMs` (good for one payment pass) before
+  its worker starts: two processes sharing the file never both read for it.
 - **Redaction.** The state file holds epoch-ms integers, a counter, the hashed
   account fingerprint and a closed outcome code; log lines are
   `[cli-usage] grok refresh: <label> attempts=<n>`.
@@ -837,7 +843,11 @@ the session-end wake still reaches the card:
   holds a numeric reading (or a versioned clear) for the signed-in account
   in an open period onto
   this epoch in one write and hints it once, so a reading captured just before
-  an update is propagated after the hand-off.
+  an update is propagated after the hand-off. A recovery that must wait — for a
+  refused write, or for a future-dated figure to become trusted — stays bound
+  to that account: while another login is signed in it neither hints (a receipt
+  under it could not carry the generation) nor ends, and it re-checks until the
+  account is back or another account's read commits over the cache.
 
 Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 (classification, budget, cooldown, redaction, prompt file),

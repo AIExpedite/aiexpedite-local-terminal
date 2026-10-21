@@ -140,6 +140,13 @@ type grokUsageFreshness struct {
 	AccountFingerprint string `json:"accountFingerprint,omitempty"`
 	// LastOutcome is one of the closed grokLiveOutcome* codes.
 	LastOutcome string `json:"lastOutcome,omitempty"`
+	// WorkerClaimAtMs is when a process last took a resumed debt's payment
+	// (0 = free). A rung is claimed by clearing NextAttemptAtMs, but a debt
+	// adopted at startup has no rung, so two processes sharing this file would
+	// otherwise both start a worker on it: one extra billing read, and two
+	// retry attempts charged for one failure. The claim expires after
+	// grokResumeClaimTTL so a process that died mid-pass cannot strand it.
+	WorkerClaimAtMs int64 `json:"workerClaimAtMs,omitempty"`
 	// DirectForgets counts debts retired or replaced unpaid, in any agent
 	// process sharing this file. A direct scan's handled marker is
 	// process-local, so it compares this count with the one it saw when it
@@ -161,6 +168,7 @@ func (state *grokUsageFreshness) setRunFloor(floorMs int64, fingerprint string) 
 func (state *grokUsageFreshness) clearDebt() {
 	state.CompletionMs, state.OwedAtMs, state.NextAttemptAtMs = 0, 0, 0
 	state.Attempts, state.AccountFingerprint, state.LastOutcome = 0, "", ""
+	state.WorkerClaimAtMs = 0
 }
 
 // grokDebtID names one generation of the debt, so a rung booked for a debt
@@ -368,7 +376,7 @@ func grokFreshnessWaitRetry(d time.Duration) bool {
 func grokRebaseFutureFreshness(state *grokUsageFreshness, now time.Time) {
 	nowMs := now.UnixMilli()
 	ceiling := now.Add(grokBillingMaxClockSkew).UnixMilli()
-	for _, ts := range []*int64{&state.RunFloorMs, &state.CompletionMs, &state.OwedAtMs, &state.LastAttemptAtMs} {
+	for _, ts := range []*int64{&state.RunFloorMs, &state.CompletionMs, &state.OwedAtMs, &state.LastAttemptAtMs, &state.WorkerClaimAtMs} {
 		if *ts > ceiling {
 			*ts = nowMs
 		}
@@ -466,7 +474,7 @@ func armGrokUsageRunFloorFor(now time.Time, credentialHome string) time.Time {
 	grokFreshnessInFlight.Add(1)
 	go func() {
 		defer grokFreshnessInFlight.Add(-1)
-		updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+		persist := func(state *grokUsageFreshness) {
 			if !grokRunIsLive(floorMs) {
 				return
 			}
@@ -474,7 +482,15 @@ func armGrokUsageRunFloorFor(now time.Time, credentialHome string) time.Time {
 			if floorMs > state.RunFloorMs {
 				state.setRunFloor(floorMs, fingerprint)
 			}
-		})
+		}
+		if _, committed := grokUsageFreshnessTxn(persist); !committed {
+			// Another process held the lock: dropping the arm would leave a run
+			// cut off before it settles with no floor for the replacement
+			// process to adopt — and the shutdown drain runs before active
+			// sessions end, so the exit cannot repair it. The late mutation is
+			// safe: it stands down once the run is no longer live.
+			grokRetryRefusedFreshness(persist, func(grokUsageFreshness) {})
+		}
 	}()
 	return floor
 }
@@ -696,15 +712,26 @@ func settleGrokRunFreshness(observedMs int64, fingerprint string) {
 	if observedMs <= 0 {
 		return
 	}
-	oldest := grokOldestLiveFloor()
-	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+	// The live floors are read inside the mutation, so a retirement the lock
+	// refused marks the floors as they are when it lands.
+	retire := func(state *grokUsageFreshness) {
 		if state.owed() && state.AccountFingerprint == fingerprint && observedMs >= state.CompletionMs {
 			state.clearDebt()
 		}
 		if !state.owed() && state.RunFloorMs != 0 && observedMs >= state.RunFloorMs {
+			oldest := grokOldestLiveFloor()
 			state.setRunFloor(oldest.floorMs, oldest.fingerprint)
 		}
-	})
+	}
+	if _, committed := grokUsageFreshnessTxn(retire); !committed {
+		// The reading landed; only its retirement was refused. Left undone the
+		// debt stays owed with no rung booked — the charge that follows an `ok`
+		// books none, since it assumes the read cleared the debt — so a later
+		// direct turn finds a debt with NextAttemptAtMs == 0 that its nudge
+		// cannot wake, and the run is stranded until the debt ages out. The
+		// late mutation is safe: it clears only what this reading still covers.
+		grokRetryRefusedFreshness(retire, func(grokUsageFreshness) {})
+	}
 }
 
 /* ───────────────────────────────── pay ──────────────────────────────── */
@@ -1251,6 +1278,11 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 	grokResumeAdoptedDebt(state, now)
 }
 
+// grokResumeClaimTTL bounds a resumed debt's in-flight claim: one payment
+// pass, after which a process that died mid-pass no longer holds it. A var so
+// tests can pin it.
+var grokResumeClaimTTL = grokRunDebtPassWait()
+
 // grokResumeAdoptedDebt re-arms (or starts) what the adopted state owes.
 func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 	if !state.owed() {
@@ -1270,7 +1302,35 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 		// a run settled just before the hand-off.
 		return
 	}
-	grokStartRunDebtWorker(false)
+	// An adopted debt carries no rung to claim, so the claim is persisted:
+	// two processes starting on the same inherited debt would otherwise both
+	// read (the worker mutex and the billing flight are process-local) and
+	// both charge it.
+	id := state.debtID()
+	claimed := false
+	claim := func(s *grokUsageFreshness) {
+		claimed = s.owed() && s.debtID() == id &&
+			(s.WorkerClaimAtMs == 0 || now.UnixMilli() < s.WorkerClaimAtMs ||
+				now.Sub(time.UnixMilli(s.WorkerClaimAtMs)) >= grokResumeClaimTTL)
+		if claimed {
+			s.WorkerClaimAtMs = now.UnixMilli()
+		}
+	}
+	pay := func(grokUsageFreshness) {
+		if claimed {
+			grokStartRunDebtWorker(false)
+			return
+		}
+		fmt.Printf("%s[cli-usage] grok refresh: resume_claimed%s\n", colorYellow, colorReset)
+	}
+	if _, committed := grokUsageFreshnessTxn(claim); !committed {
+		// Refused by another process's lock: the debt is on disk with nothing
+		// in this process serving it, so the claim is retried until it lands
+		// (or is found taken).
+		grokRetryRefusedFreshness(claim, pay)
+		return
+	}
+	pay(grokUsageFreshness{})
 }
 
 // grokAuthOutcome reports the outcomes the auth notice owns: no read can pay
