@@ -10,8 +10,10 @@
 //     the same byte cap the V1 query keeps; text, tool input/output and model
 //     objects never leave SQLite.
 //   - A message is complete once it has a completed time or, where data carries
-//     none, once a later idle row (higher seq) exists in its session. Until then
-//     it pins the cursor as V1's running turns do.
+//     none, once a later idle row (higher seq) exists in its session — and then
+//     it reads as written when that idle row was, since idling leaves the
+//     assistant row untouched. Until then it pins the cursor as V1's running
+//     turns do.
 //   - With no part table, a message's tokens are all it reports. If V2
 //     overwrites them on every step, a multi-step turn is under-counted to its
 //     last step — an under-count, never inflated.
@@ -41,25 +43,34 @@ var openCodeSQLiteV2HeadTables = []string{"session_v2", "session"}
 
 // openCodeSQLiteV2MessageQuery selects the assistant messages of the given
 // sessions (%s: their placeholders), oversized rows flagged rather than parsed.
-// idled is computed only for a row with no completed time, so the correlated
-// lookup costs nothing for finished turns.
+// idled_ms, when the first idle row after it is, is computed only for a row
+// with no completed time, so the correlated lookup costs nothing for finished
+// turns. An idle row finishes a turn without rewriting its assistant row, so a
+// row's write time is the later of its own and its idle row's: the turn is
+// read, ordered and floored by when it actually finished. The inner bound
+// reaches back by the debt age-out (the first ?) so a turn begun before the
+// floor — before midnight, say — and idled after it is still found.
 const openCodeSQLiteV2MessageQuery = `
-SELECT m.id, m.session_id, m.time_created, m.time_updated,
-       length(CAST(m.data AS BLOB)) > ? AS oversized,
-       CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data) THEN json_object(
-         'tokens', json(m.data -> '$.tokens'),
-         'cost', json_extract(m.data, '$.cost'),
-         'completed', json_extract(m.data, '$.time.completed')) END AS info,
-       CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data)
-                 AND json_extract(m.data, '$.time.completed') IS NULL THEN EXISTS (
-         SELECT 1 FROM session_message i
-         WHERE i.session_id = m.session_id AND i.type = 'idle' AND i.seq > m.seq
-       ) ELSE 0 END AS idled
-FROM session_message m
-WHERE m.session_id IN (%s)
-  AND m.time_updated >= ?
-  AND m.type = 'assistant'
-ORDER BY m.time_updated, m.id
+SELECT id, session_id, time_created, max(time_updated, COALESCE(idled_ms, 0)) AS written, oversized, info, idled_ms
+FROM (
+  SELECT m.id, m.session_id, m.time_created, m.time_updated,
+         length(CAST(m.data AS BLOB)) > ? AS oversized,
+         CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data) THEN json_object(
+           'tokens', json(m.data -> '$.tokens'),
+           'cost', json_extract(m.data, '$.cost'),
+           'completed', json_extract(m.data, '$.time.completed')) END AS info,
+         CASE WHEN length(CAST(m.data AS BLOB)) <= ? AND json_valid(m.data)
+                   AND json_extract(m.data, '$.time.completed') IS NULL THEN (
+           SELECT MIN(i.time_created) FROM session_message i
+           WHERE i.session_id = m.session_id AND i.type = 'idle' AND i.seq > m.seq
+         ) END AS idled_ms
+  FROM session_message m
+  WHERE m.session_id IN (%s)
+    AND m.time_updated >= ?
+    AND m.type = 'assistant'
+)
+WHERE written >= ?
+ORDER BY written, id
 LIMIT ?`
 
 // openCodeSQLiteV2Candidate returns the V2 heads table when the store holds the
@@ -95,15 +106,15 @@ func readOpenCodeSQLiteV2Messages(ctx context.Context, db *sql.DB, sessions []an
 	args := []any{maxBytes, maxBytes, maxBytes}
 	args = append(args, sessions...)
 	skip := limits.skipFor(false)
-	args = append(args, floorMs, limits.MaxRecords+1+skip.N)
+	args = append(args, floorMs-openCodeUsageDebtMaxAge.Milliseconds(), floorMs, limits.MaxRecords+1+skip.N)
 	return readOpenCodeSQLiteMessageRows(ctx, db, query, args, floorMs, limits, read, func(rows *sql.Rows) (openCodeDirectMessage, bool, error) {
 		var (
 			m         openCodeDirectMessage
 			oversized bool
-			idled     bool
+			idledMs   sql.NullInt64
 			infoText  sql.NullString
 		)
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.CreatedMs, &m.WrittenMs, &oversized, &infoText, &idled); err != nil {
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.CreatedMs, &m.WrittenMs, &oversized, &infoText, &idledMs); err != nil {
 			return m, false, err
 		}
 		info, ok := parseOpenCodeSQLiteInfo(m, oversized, infoText)
@@ -111,9 +122,10 @@ func readOpenCodeSQLiteV2Messages(ctx context.Context, db *sql.DB, sessions []an
 			return m, false, nil
 		}
 		completed, ok := openCodeUsageMillis(info.Completed)
-		if !ok && idled {
-			// The session went idle after it: the turn is over, and its last
-			// write is when it finished.
+		if !ok && idledMs.Valid {
+			// The session went idle after it: the turn is over, and its write
+			// time — the idle row's, unless the row was rewritten since — is
+			// when it finished.
 			completed, ok = m.WrittenMs, true
 		}
 		if ok {

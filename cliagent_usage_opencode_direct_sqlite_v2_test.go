@@ -124,8 +124,37 @@ func TestOpenCodeDirectSQLiteV2_ALaterIdleRowCompletesAMessage(t *testing.T) {
 	if err != nil || len(read.Messages) != 1 {
 		t.Fatalf("read = %+v, %v", read, err)
 	}
-	if m := read.Messages[0]; m.CompletedMs != base || !m.Valid || m.Usage.Input != 7 {
-		t.Fatalf("idled message = %+v, want complete at its last write", m)
+	if m := read.Messages[0]; m.CompletedMs != base+50 || m.WrittenMs != base+50 || !m.Valid || m.Usage.Input != 7 {
+		t.Fatalf("idled message = %+v, want complete and written when the session went idle", m)
+	}
+}
+
+// A V2 turn begun before midnight and idled after it is counted today: idling
+// leaves the assistant row's pre-midnight write time, so the read floors it by
+// the idle row's instead.
+func TestOpenCodeDirectSQLiteV2_ATurnIdledAcrossMidnightIsCounted(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2202)
+	store := newOpenCodeV2TestStore(t, fixture.root)
+	midnight := openCodeLocalMidnight(clock.now)
+	clock.now = midnight.Add(-10 * time.Minute)
+	running := midnight.Add(-20 * time.Minute).UnixMilli()
+	store.assistant("ses_a", "msg_a", running, 0, 6, 1, 0, 0.01)
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("pre-midnight scan = %q", label)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.ThroughMs > running {
+		t.Fatalf("cursor = %+v, want it pinned at or before %d", c, running)
+	}
+
+	store.idle("ses_a", "idle_a", midnight.Add(5*time.Minute).UnixMilli())
+	clock.now = midnight.Add(30 * time.Minute)
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 7 {
+		t.Fatalf("bucket = %+v, want the turn counted today", b)
+	}
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 7 {
+		t.Fatalf("bucket = %+v after a rescan, want it counted once", b)
 	}
 }
 
