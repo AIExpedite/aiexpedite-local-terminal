@@ -973,6 +973,41 @@ func TestGrokRunDebt_ASettleRefusedByTheFreshnessLockOpensTheDebtOnceReleased(t 
 	}
 }
 
+// A settle the lock refused, interrupted by shutdown while its retry waits,
+// still persists its debt: the update hand-off is exactly what the retry
+// exists to survive, and the run's in-memory floor is already released, so
+// dropping the mutation would leave the next process nothing to adopt. The
+// dying process starts no read for it.
+func TestGrokRunDebt_ASettleRefusedByTheFreshnessLockPersistsAtShutdown(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	release := holdGrokFreshnessLock(t)
+	// Long enough that the retry is still waiting when shutdown begins; the
+	// wait's slices are what notice it.
+	prevDelay := grokFreshnessRefusedRetryDelay
+	grokFreshnessRefusedRetryDelay = 2 * time.Second
+	t.Cleanup(func() { grokFreshnessRefusedRetryDelay = prevDelay })
+
+	floor := armGrokUsageRunFloor(h.clock())
+	h.advance(time.Second)
+	if !grokUsageRunSettled(floor) {
+		t.Fatal("want the settled run reported owed")
+	}
+	if h.state().owed() {
+		t.Fatalf("state=%+v, want nothing written while locked", h.state())
+	}
+
+	shutdownInProgress.Store(true)
+	t.Cleanup(func() { shutdownInProgress.Store(false) })
+	release()
+	h.idle()
+	if !h.state().owed() {
+		t.Fatalf("state=%+v, want the debt persisted for the next process to adopt", h.state())
+	}
+	if h.reads.Load() != 0 {
+		t.Fatalf("reads = %d, want no read started by a process that is exiting", h.reads.Load())
+	}
+}
+
 // A rung booking refused by another process's lock is retried until it lands,
 // then armed, so a failed read is never left with no retry.
 func TestGrokRunDebt_ARungRefusedByTheFreshnessLockIsBookedOnceReleased(t *testing.T) {

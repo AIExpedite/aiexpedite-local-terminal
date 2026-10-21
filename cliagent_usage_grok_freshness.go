@@ -249,12 +249,19 @@ func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshne
 // grokUsageFreshnessTxn is updateGrokUsageFreshness reporting whether mutate
 // ran: false only when another process held the lock past the wait.
 func grokUsageFreshnessTxn(mutate func(*grokUsageFreshness)) (grokUsageFreshness, bool) {
+	return grokUsageFreshnessTxnWait(grokUsageFreshnessLockWait, mutate)
+}
+
+// grokUsageFreshnessTxnWait is grokUsageFreshnessTxn with the sibling-lock
+// wait named by the caller, so a mutation running inside the shutdown drain
+// can take a shorter one than the ordinary 2 s and still fit in the budget.
+func grokUsageFreshnessTxnWait(wait time.Duration, mutate func(*grokUsageFreshness)) (grokUsageFreshness, bool) {
 	grokFreshnessMu.Lock()
 	defer grokFreshnessMu.Unlock()
 	path := grokUsageFreshnessPath()
 	var state grokUsageFreshness
 	if path != "" && os.MkdirAll(filepath.Dir(path), 0o755) == nil {
-		lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(grokUsageFreshnessLockWait))
+		lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(wait))
 		if outcome == crossProcessLockContended {
 			if !readJSONFile(path, &state) {
 				state = grokUsageFreshness{}
@@ -292,21 +299,39 @@ func grokUsageFreshnessTxn(mutate func(*grokUsageFreshness)) (grokUsageFreshness
 var (
 	grokFreshnessRefusedRetryDelay = 5 * time.Second
 	grokFreshnessRefusedRetries    = 6
+	// grokFreshnessRetryWaitSlice is how often that delay notices shutdown.
+	grokFreshnessRetryWaitSlice = 25 * time.Millisecond
+	// grokFreshnessShutdownLockWait bounds the last attempt a shutdown-
+	// interrupted mutation makes, so it fits in drainGrokUsageWrites' share of
+	// the shutdown budget rather than outliving the process.
+	grokFreshnessShutdownLockWait = 750 * time.Millisecond
 )
 
 // grokRetryRefusedFreshness re-runs a required mutation another process's lock
 // refused, off the caller's goroutine, until it lands (committed then runs with
-// the result) or the bounded retries are spent. Without it a settled run whose
-// floor is already released, or a failed read whose rung was never booked,
-// would leave neither a persisted debt nor an armed retry. mutate must be safe
-// to run late: it is applied to the state as it is then.
+// the result), the bounded retries are spent, or shutdown spends its last
+// attempt. Without it a settled run whose floor is already released, or a
+// failed read whose rung was never booked, would leave neither a persisted
+// debt nor an armed retry. mutate must be safe to run late: it is applied to
+// the state as it is then.
 func grokRetryRefusedFreshness(mutate func(*grokUsageFreshness), committed func(grokUsageFreshness)) {
 	grokFreshnessInFlight.Add(1)
 	go func() {
 		defer grokFreshnessInFlight.Add(-1)
 		for i := 0; i < grokFreshnessRefusedRetries; i++ {
-			time.Sleep(grokFreshnessRefusedRetryDelay)
-			if IsShutdownInProgress() {
+			if grokFreshnessWaitRetry(grokFreshnessRefusedRetryDelay) {
+				// Shutdown began while this retry was waiting — the very
+				// hand-off these mutations exist to survive. Abandoning it
+				// here would leave a settled run with neither a floor (its
+				// in-memory one is already released) nor a debt for the next
+				// process to adopt, so the mutation gets one last synchronous
+				// attempt, on a short lock wait so it lands inside the
+				// shutdown drain. No committed follow-up: nothing of this
+				// process serves a worker or a rung after the drain, and the
+				// next one re-arms what the file says is owed.
+				if _, ok := grokUsageFreshnessTxnWait(grokFreshnessShutdownLockWait, mutate); !ok {
+					fmt.Printf("%s[cli-usage] grok refresh: lock_busy shutdown%s\n", colorYellow, colorReset)
+				}
 				return
 			}
 			if state, ok := grokUsageFreshnessTxn(mutate); ok {
@@ -316,6 +341,24 @@ func grokRetryRefusedFreshness(mutate func(*grokUsageFreshness), committed func(
 		}
 		fmt.Printf("%s[cli-usage] grok refresh: lock_busy%s\n", colorYellow, colorReset)
 	}()
+}
+
+// grokFreshnessWaitRetry waits d in slices, and reports whether shutdown began
+// during it. Sleeping d in one go would spend the whole shutdown drain in a
+// sleep and leave the mutation's last attempt until after the process was due
+// to exit.
+func grokFreshnessWaitRetry(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if IsShutdownInProgress() {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		time.Sleep(min(remaining, grokFreshnessRetryWaitSlice))
+	}
 }
 
 // grokRebaseFutureFreshness rebases timestamps a backwards clock step left in
