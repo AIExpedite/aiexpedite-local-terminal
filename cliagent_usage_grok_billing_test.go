@@ -1225,3 +1225,39 @@ func TestGrokUsageParser_WithholdsTheGenerationWhileAPoolIsFutureDated(t *testin
 		t.Fatalf("usageGeneration = %+v, want {8130,2} published with the pool", usage.UsageGeneration)
 	}
 }
+
+// Startup recovery must apply the same withholding rule as ParseContext: a
+// generation that versions a future-dated pool is rotated (so the next gather
+// can publish it) but not hinted, because the hint would be spent on a
+// refresh whose receipt carries no generation and nothing would hint it again
+// once the clock catches up.
+func TestGrokRecovery_WithholdsAHintWhileAPoolIsFutureDated(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8132)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", h.clock().Add(-time.Hour), floatPtr(36), end))
+	// The newest answer's pool is stamped an hour ahead: the percentage is
+	// kept at its own trusted time, the pool is withheld until then.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8133)
+	grokGenerationRotated.Store(false)
+
+	g, refused := grokRecoveryGeneration(h.clock())
+	if g != nil || !refused {
+		t.Fatalf("recovery = %+v refused=%t, want the hint withheld and retried while the pool is future-dated", g, refused)
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8133, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation committed anyway", on)
+	}
+
+	// Once the clock catches up the pool renders, and the recovery hints it.
+	h.advance(2 * time.Hour)
+	g, refused = grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8133, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want {8133,1} hinted once the pool renders", g, refused)
+	}
+}

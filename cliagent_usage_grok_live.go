@@ -860,14 +860,29 @@ var (
 // clear of one (Cleared) — or nil. A reading
 // committed just before an update hand-off — whose hint died with the old
 // process — is hinted again this way; the backend skips a generation it
-// already applied. refused reports a rotation write that did not commit.
+// already applied. refused reports a rotation that did not produce a hintable
+// generation — a write that did not commit, or a figure this generation
+// versions that is still withheld as future-dated — and the caller retries.
 func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
 	fingerprint := grokUsageCurrentFingerprint()
 	view, ok := loadGrokBillingLive(fingerprint, now)
 	if !ok || !(view.cleared || grokBillingMetricsNumeric(grokBillingMetrics(view.snap, now))) {
 		return nil, false
 	}
-	return rotateGrokBillingLiveGeneration(fingerprint)
+	g, refused := rotateGrokBillingLiveGeneration(fingerprint)
+	if refused || g == nil {
+		return g, refused
+	}
+	if grokBillingValueWithheld(view.snap, now) {
+		// ParseContext withholds this same generation while one of the
+		// cache's figures is future-dated, so hinting it now would spend the
+		// generation's hint attempts on refreshes whose receipt carries no
+		// generation, and nothing would hint it again once the clock catches
+		// up and the figure renders. The rotation stands — the next gather
+		// publishes the generation — and only the hint waits on the ladder.
+		return nil, true
+	}
+	return g, false
 }
 
 // recoverGrokUsageGeneration runs startup recovery, hinting a recovered
