@@ -261,6 +261,50 @@ func TestOpenCodeV2_OnlyAWholeEmptyStoreReadSpendsAnAttempt(t *testing.T) {
 	}
 }
 
+// A turn whose first message is complete while a later one is still being
+// written pays the first now and keeps the debt owed: the run's window keeps
+// the direct reader off the rest, so settling would lose it. The read that
+// finds the turn whole pays the rest, and the first message only once.
+func TestOpenCodeV2_APartialStoreReadKeepsTheDebtOwed(t *testing.T) {
+	sched, store, clock, exports := openCodeV2Fixture(t, 4011)
+	run := armOpenCodeUsageRun("opencode", "", "fp-v2")
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_p"}`)
+	openCodeUsageInFlight.Wait()
+	clock.now = clock.now.Add(time.Second)
+	store.assistant("ses_p", "msg_done", clock.ms(-800*time.Millisecond), clock.ms(-600*time.Millisecond), 30, 0, 0, 0)
+	store.assistant("ses_p", "msg_running", clock.ms(-500*time.Millisecond), 0, 70, 0, 0, 0)
+	settleOpenCodeUsageRun(run, "")
+
+	sched.fireNext() // partial: msg_running has not finished
+	if d := openCodeDebtOf(t, run.id); d == nil || !d.owed() || d.Attempts != 0 {
+		t.Fatalf("debt = %+v, want it still owed with no attempt spent", d)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 30 {
+		t.Fatalf("tokens today = %d, want the finished 30 merged", n)
+	}
+	// A click on the same partial read merges nothing twice.
+	payOwedOpenCodeUsageFromStore(context.Background(), openCodeUsageMaxDebts)
+	if n := openCodeTodayTokens(t, clock.now); n != 30 {
+		t.Fatalf("tokens today = %d after a click, want 30", n)
+	}
+
+	// The turn idles: the running message is complete.
+	clock.now = clock.now.Add(time.Second)
+	store.idle("ses_p", "msg_p_idle", clock.ms(0))
+	if !sched.fireNext() {
+		t.Fatal("no attempt booked after the partial read")
+	}
+	if d := openCodeDebtOf(t, run.id); d != nil {
+		t.Fatalf("debt = %+v, want it paid", d)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 100 {
+		t.Fatalf("tokens today = %d, want the whole turn's 100 once", n)
+	}
+	if *exports != 0 {
+		t.Fatalf("the export ran %d times on a V2 store", *exports)
+	}
+}
+
 func TestOpenCodeStoreDebtOutcome_MapsEveryRead(t *testing.T) {
 	v2 := openCodeStoreLayoutSQLiteV2
 	paying := []openCodeUsageStep{{Input: 1}}
@@ -275,7 +319,10 @@ func TestOpenCodeStoreDebtOutcome_MapsEveryRead(t *testing.T) {
 		{openCodeStoreSessionRead{}, errOpenCodeDirectLayoutUnknown, ""},
 		{openCodeStoreSessionRead{}, context.DeadlineExceeded, "store_deferred_truncated"},
 		{openCodeStoreSessionRead{}, fmt.Errorf("database is locked"), "store_deferred_busy"},
-		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Steps: paying, Incomplete: true}, nil, "store_paid"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Steps: paying}, nil, "store_paid"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Steps: paying, Incomplete: true}, nil, "store_deferred_partial"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Steps: paying, Truncated: true}, nil, "store_deferred_partial"},
+		{openCodeStoreSessionRead{Layout: openCodeStoreLayoutSQLite, Steps: paying, Truncated: true}, nil, "store_deferred_partial"},
 		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Unbounded: true}, nil, "store_deferred_unbounded"},
 		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Truncated: true}, nil, "store_deferred_truncated"},
 		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Incomplete: true}, nil, "store_deferred_incomplete"},

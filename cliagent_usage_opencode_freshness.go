@@ -900,6 +900,12 @@ func attemptOpenCodeUsageDebt(runID string) {
 			deferFree("store_retry")
 		}
 		return
+	case "store_deferred_partial":
+		// What the store has read so far is merged now; the debt stays owed for
+		// the rest of its turn, which the direct reader never counts.
+		mergeOpenCodeUsageDebtSteps(runID, debt, store.Steps)
+		deferFree(outcome)
+		return
 	case "store_empty":
 		// The V2 store answered whole and holds nothing for the turn: a V2
 		// session's export pays nothing either, so none is spawned.
@@ -958,7 +964,8 @@ func readOpenCodeStoreDebtUsage(ctx context.Context, ledger *openCodeUsageLedger
 }
 
 // openCodeStoreDebtOutcome is what a store read means for a debt: store_paid;
-// store_empty, a whole V2 read of the debt's session that found nothing; ""
+// store_deferred_partial, a read that paid part of the turn but stopped short
+// of the rest (a truncated read, or a message still being written); store_empty, a whole V2 read of the debt's session that found nothing; ""
 // when the export decides (no SQLite store, an unknown one, a V1 family that
 // paid nothing, or a V2 store without the session); or the
 // label of a read to retry without spending an attempt.
@@ -970,6 +977,10 @@ func openCodeStoreDebtOutcome(store openCodeStoreSessionRead, err error) string 
 		return "store_deferred_truncated"
 	case err != nil:
 		return "store_deferred_busy"
+	case openCodeUsageStepsCarryUsage(store.Steps) && (store.Truncated || store.Incomplete):
+		// Settling now would drop the unread rest of the turn for good: the
+		// run's ownership window keeps the direct reader off it.
+		return "store_deferred_partial"
 	case openCodeUsageStepsCarryUsage(store.Steps):
 		return "store_paid"
 	case store.Layout != openCodeStoreLayoutSQLiteV2 || !store.SessionKnown:
@@ -1011,6 +1022,23 @@ func payOpenCodeUsageDebt(runID string, debt openCodeUsageDebt, steps []openCode
 		logOpenCodeUsageCapture(label)
 	}
 	return committed, true
+}
+
+// mergeOpenCodeUsageDebtSteps folds what a partial store read paid into the
+// ledger and leaves the debt owed for the rest of its turn. The steps carry the
+// export's message keys, so the read that later pays the whole turn merges
+// these once. It reports whether the write merged anything; a debt already
+// gone merges nothing, as payOpenCodeUsageDebt would not.
+func mergeOpenCodeUsageDebtSteps(runID string, debt openCodeUsageDebt, steps []openCodeUsageStep) bool {
+	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		if openCodeUsageDebtByID(ledger, runID) == nil {
+			return false, false
+		}
+		merged := mergeOpenCodeUsageSteps(ledger, debt.AccountFingerprint, steps)
+		return merged, merged
+	})
+	noteOpenCodeUsageAdvanced(committed, changed, generation)
+	return committed && changed
 }
 
 // spendOpenCodeUsageDebtAttempt records an attempt that paid nothing and books
@@ -1063,7 +1091,8 @@ var (
 // budget is left — debts no click has tried yet first, then the oldest. It
 // never spends an attempt or spawns an export, and leaves an unpaid debt's
 // ladder booking alone: only the ladder spends. A live run is skipped, as the
-// ladder skips it. It returns how many debts it paid.
+// ladder skips it. A partial read merges what it read and leaves the debt owed.
+// It returns how many debts it paid, in whole or in part.
 func payOwedOpenCodeUsageFromStore(ctx context.Context, limit int) int {
 	if !openCodeDirectScanEnabled {
 		return 0
@@ -1104,11 +1133,15 @@ func payOwedOpenCodeUsageFromStore(ctx context.Context, limit int) int {
 		openCodeUsageClickTried[debt.RunID] = true
 		openCodeUsageClickMu.Unlock()
 		store, err := readOpenCodeStoreDebtUsage(ctx, &ledger, debt)
-		if openCodeStoreDebtOutcome(store, err) != "store_paid" {
-			continue
-		}
-		if ok, _ := payOpenCodeUsageDebt(debt.RunID, debt, store.Steps, "store_paid"); ok {
-			paid++
+		switch openCodeStoreDebtOutcome(store, err) {
+		case "store_paid":
+			if ok, _ := payOpenCodeUsageDebt(debt.RunID, debt, store.Steps, "store_paid"); ok {
+				paid++
+			}
+		case "store_deferred_partial":
+			if mergeOpenCodeUsageDebtSteps(debt.RunID, debt, store.Steps) {
+				paid++
+			}
 		}
 	}
 	return paid
