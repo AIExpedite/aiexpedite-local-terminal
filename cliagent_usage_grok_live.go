@@ -855,7 +855,59 @@ var (
 	// grokRecoveryWithheldMaxWait caps one wait for a withheld figure, so a
 	// clock corrected again while waiting is re-read rather than slept past.
 	grokRecoveryWithheldMaxWait = 30 * time.Minute
+
+	// grokRecoveryTimer is the pending recovery retry. It is cancelled at
+	// shutdown (stopGrokRunDebtRetry): a retry firing after an update hand-off
+	// would rotate the cache back onto this process's epoch over the
+	// replacement's, and no live process would hint the result.
+	grokRecoveryTimer struct {
+		mu    sync.Mutex
+		timer *time.Timer
+		gen   uint64
+	}
 )
+
+// grokArmRecoveryRetry replaces the pending recovery retry with fn after delay.
+// fn runs only while the retry is still current and shutdown has not begun,
+// and counts as an in-flight write for drainGrokUsageWrites.
+func grokArmRecoveryRetry(delay time.Duration, fn func()) {
+	t := &grokRecoveryTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.gen++
+	gen := t.gen
+	t.timer = grokRecoveryAfterFunc(delay, func() {
+		t.mu.Lock()
+		if gen != t.gen {
+			t.mu.Unlock()
+			return
+		}
+		t.timer = nil
+		grokFreshnessInFlight.Add(1)
+		t.mu.Unlock()
+		defer grokFreshnessInFlight.Add(-1)
+		if IsShutdownInProgress() {
+			return
+		}
+		fn()
+	})
+}
+
+// stopGrokRecoveryRetry cancels the pending recovery retry; the next process
+// runs its own startup recovery.
+func stopGrokRecoveryRetry() {
+	t := &grokRecoveryTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
+	t.gen++
+}
 
 // grokRecoveryGeneration is the rotated generation of a live cache that still
 // holds a numeric reading for the account signed in now, in a period still
@@ -915,7 +967,7 @@ func recoverGrokUsageGenerationFor(attempt int, bound string) {
 	now := grokUsageFreshnessNow()
 	if bound != "" && grokUsageCurrentFingerprint() != bound {
 		if _, ok := loadGrokBillingLive(bound, now); ok {
-			grokRecoveryAfterFunc(grokRecoveryWithheldMaxWait, func() {
+			grokArmRecoveryRetry(grokRecoveryWithheldMaxWait, func() {
 				recoverGrokUsageGenerationFor(attempt, bound)
 			})
 		}
@@ -935,7 +987,7 @@ func recoverGrokUsageGenerationFor(attempt int, bound string) {
 	// rung. Wait for that moment without spending an attempt, so the rotated
 	// generation is still hinted once the figure becomes trusted.
 	if wait := grokRecoveryWithheldWait(now); wait > 0 {
-		grokRecoveryAfterFunc(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() {
+		grokArmRecoveryRetry(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() {
 			recoverGrokUsageGenerationFor(attempt, bound)
 		})
 		return
@@ -945,7 +997,7 @@ func recoverGrokUsageGenerationFor(attempt int, bound string) {
 		fmt.Printf("%s[cli-usage] grok refresh: recovery_abandoned%s\n", colorYellow, colorReset)
 		return
 	}
-	grokRecoveryAfterFunc(delay, func() { recoverGrokUsageGenerationFor(attempt+1, bound) })
+	grokArmRecoveryRetry(delay, func() { recoverGrokUsageGenerationFor(attempt+1, bound) })
 }
 
 // grokRecoveryWithheldWait is how long the signed-in account's live cache

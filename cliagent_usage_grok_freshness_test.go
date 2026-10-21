@@ -1233,6 +1233,38 @@ func TestGrokRunDebt_AResumedDebtIsClaimedAcrossProcesses(t *testing.T) {
 	}
 }
 
+// A resumed debt whose booked rung is already overdue takes that rung in the
+// same write as its claim: another process's direct-run nudge then finds the
+// debt being paid, not a due rung, and starts no second read for it.
+func TestGrokRunDebt_AResumedOverdueRungIsClaimedWithTheDebt(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.block = make(chan struct{})
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.Add(-2 * time.Minute).UnixMilli(), CompletionMs: now.Add(-2 * time.Minute).UnixMilli(),
+		AccountFingerprint: "fp-ada", Attempts: 1, LastAttemptAtMs: now.Add(-2 * time.Minute).UnixMilli(),
+		NextAttemptAtMs: now.Add(-time.Second).UnixMilli(),
+	})
+
+	grokResumeAdoptedDebt(h.state(), now)
+	if s := h.state(); s.WorkerClaimAtMs != now.UnixMilli() || s.NextAttemptAtMs != 0 {
+		t.Fatalf("state = %+v, want the claim and the overdue rung taken together", s)
+	}
+
+	// The other process's startup scan rediscovers the turn.
+	if nudgeGrokUsageRefreshFor(h.clock(), now.Add(-2*time.Minute), "fp-ada") {
+		t.Fatal("the nudge started a worker on a debt already claimed")
+	}
+	grokRefreshWorkerMu.Lock()
+	rearmed := grokRefreshWorkerRearm
+	grokRefreshWorkerMu.Unlock()
+	close(h.block)
+	h.idle()
+	if rearmed || h.reads.Load() != 1 {
+		t.Fatalf("reads = %d rearmed=%t, want one read for the claimed debt", h.reads.Load(), rearmed)
+	}
+}
+
 // A resumed debt whose claim is still held by a process that then dies
 // mid-read has no worker and no rung, and startup resumes only once: the
 // process that found the claim taken re-checks when it expires and pays it.

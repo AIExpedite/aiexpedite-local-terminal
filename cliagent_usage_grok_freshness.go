@@ -1127,7 +1127,8 @@ func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 	pay(grokUsageFreshness{})
 }
 
-// stopGrokRunDebtRetry cancels the pending rung and claim re-check. Called from gracefulShutdown;
+// stopGrokRunDebtRetry cancels the pending rung, claim re-check and generation
+// recovery. Called from gracefulShutdown;
 // the schedule is on disk and the next process re-arms it.
 func stopGrokRunDebtRetry() {
 	t := &grokRunDebtRetryTimer
@@ -1146,6 +1147,7 @@ func stopGrokRunDebtRetry() {
 		c.timer = nil
 	}
 	c.gen++
+	stopGrokRecoveryRetry()
 }
 
 // grokRunDebtRetryPending reports whether a rung is armed. Test seam.
@@ -1323,16 +1325,26 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 	// both charge it.
 	id := state.debtID()
 	claimed := false
-	var heldAtMs int64
+	var heldAtMs, rungAtMs int64
 	claim := func(s *grokUsageFreshness) {
-		claimed, heldAtMs = false, 0
+		claimed, heldAtMs, rungAtMs = false, 0, 0
 		if !s.owed() || s.debtID() != id {
+			return
+		}
+		if s.NextAttemptAtMs > now.UnixMilli() {
+			// A claimant booked a rung since the state was read: that rung's
+			// timer owns the debt now.
+			rungAtMs = s.NextAttemptAtMs
 			return
 		}
 		claimed = s.WorkerClaimAtMs == 0 || now.UnixMilli() < s.WorkerClaimAtMs ||
 			now.Sub(time.UnixMilli(s.WorkerClaimAtMs)) >= grokResumeClaimTTL
 		if claimed {
 			s.WorkerClaimAtMs = now.UnixMilli()
+			// An overdue rung is taken in this same write, so another process's
+			// nudge finds it claimed rather than due and starts no second
+			// worker on it.
+			s.NextAttemptAtMs = 0
 		} else {
 			heldAtMs = s.WorkerClaimAtMs
 		}
@@ -1340,6 +1352,10 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 	pay := func(grokUsageFreshness) {
 		if claimed {
 			grokStartRunDebtWorker(false)
+			return
+		}
+		if rungAtMs != 0 {
+			grokArmRunDebtRetry(id, time.UnixMilli(rungAtMs).Sub(now))
 			return
 		}
 		if heldAtMs == 0 {

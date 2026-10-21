@@ -1327,6 +1327,56 @@ func TestGrokRecovery_WaitsOutAFutureOffsetLongerThanTheLadder(t *testing.T) {
 	}
 }
 
+// A recovery retry still pending at shutdown never fires: after an update
+// hand-off it would rotate the cache back onto the old process's epoch, over
+// the replacement's, and nothing would hint it.
+func TestGrokRecovery_APendingRetryIsCancelledAtShutdown(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8141)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8142)
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		next = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+
+	recoverGrokUsageGeneration(1)
+	if next == nil {
+		t.Fatal("want a recovery retry booked for the withheld pool")
+	}
+	stopGrokRunDebtRetry()
+	// The replacement process rotates the cache onto its own epoch.
+	codexProcessGenerationEpoch.Store(8143)
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); refused || g == nil || *g != gen(8143, 1) {
+		t.Fatalf("replacement rotation = %+v refused=%t", g, refused)
+	}
+	codexProcessGenerationEpoch.Store(8142)
+	h.advance(2 * time.Hour)
+	next()
+	view, ok := loadGrokBillingLive("fp-ada", h.clock())
+	if !ok || view.generation == nil || *view.generation != gen(8143, 1) {
+		t.Fatalf("cache generation = %+v, want the replacement's {8143,1} kept", view.generation)
+	}
+	cliUsagePropagator.mu.Lock()
+	p := cliUsagePropagator.pending[grokUsageProvider]
+	cliUsagePropagator.mu.Unlock()
+	if p != nil {
+		t.Fatalf("pending = %+v, want no hint from a cancelled recovery", p)
+	}
+}
+
 // The same rule must reach a cache whose ONLY figure is the future-dated pool:
 // it renders Unknown on its own, so the metrics gate must not skip it, or
 // nothing is rotated, no retry is armed, and the generation stays unhintable
