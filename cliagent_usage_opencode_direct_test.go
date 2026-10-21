@@ -1303,3 +1303,62 @@ func TestOpenCodeDirectPinnedKeys_ADroppedKeyLeavesItsCompletedFloor(t *testing.
 		t.Fatalf("steps = %+v, want one: a message completed past the floor is new", steps)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   OpenCode 2
+   -------------------------------------------------------------------------- */
+
+// A ledger whose cursor and coverage the frozen V1 tables kept renewing all
+// day, scanned against a V2 store, re-reads from local midnight once: today's
+// V2 spend is counted, and a second scan adds nothing.
+func TestOpenCodeDirect_ASwitchOntoV2RecoversTodayOnce(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2301)
+	store := newOpenCodeV2TestStore(t, fixture.root)
+	today, _ := openCodeLocalDay(clock.now)
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLite, ThroughMs: clock.ms(-time.Minute)}
+		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLite, ObservedAtMs: clock.ms(-time.Minute), LastOkLocalDate: today}
+		return true, false
+	})
+	store.assistant("ses_morning", "msg_morning", clock.ms(-3*time.Hour), clock.ms(-3*time.Hour+time.Second), 120, 8, 0, 0.03)
+	store.assistant("ses_now", "msg_now", clock.ms(-2*time.Minute), clock.ms(-90*time.Second), 10, 2, 0, 0.01)
+
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 140 {
+		t.Fatalf("bucket = %+v, want today's V2 spend since midnight", b)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Layout != openCodeStoreLayoutSQLiteV2 {
+		t.Fatalf("cursor = %+v, want the V2 layout recorded", c)
+	}
+	clock.now = clock.now.Add(time.Minute)
+	scanOpenCodeDirect(t)
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 140 {
+		t.Fatalf("a second scan re-counted: %d", b.tokens())
+	}
+}
+
+// The stale-coverage regression: an OpenCode 2 store keeps the V1 tables,
+// frozen at the migration, beside the V2 tables it writes. Coverage is renewed
+// only by a scan of the V2 family, with its spend merged — never by a scan of
+// the frozen tables that read nothing.
+func TestOpenCodeDirect_FrozenV1TablesDoNotRenewCoverageWithoutV2Spend(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2302)
+	db := openCodeSQLiteTestStore(t, fixture.root, openCodeSQLiteTestSchema+openCodeSQLiteV2TestSchema)
+	yesterday := clock.ms(-24 * time.Hour)
+	insertOpenCodeSQLiteMessage(t, db, "ses_v1", "msg_v1", yesterday, yesterday+1, yesterday+1, [][3]int64{{999, 0, 0}}, 0)
+	v2 := &openCodeV2TestStore{t: t, db: db, heads: "session_v2", seq: map[string]int{}}
+	v2.assistant("ses_v2", "msg_v2", clock.ms(-time.Hour), clock.ms(-time.Hour+time.Second), 77, 3, 0, 0.02)
+
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	ledger := loadOpenCodeUsageLedger()
+	if c := ledger.DirectCoverage; c == nil || c.Layout != openCodeStoreLayoutSQLiteV2 {
+		t.Fatalf("coverage = %+v, want it booked by the V2 family", c)
+	}
+	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 80 || b.CostUsd != 0.02 {
+		t.Fatalf("bucket = %+v, want the V2 spend merged with the coverage", b)
+	}
+}

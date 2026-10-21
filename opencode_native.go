@@ -1561,6 +1561,12 @@ const (
 	openCodeStoreLayoutUnknown = ""
 	openCodeStoreLayoutSQLite  = "sqlite"
 	openCodeStoreLayoutJSON    = "json"
+	// openCodeStoreLayoutSQLiteV2 is the same opencode.db holding OpenCode 2's
+	// schema family. openCodeStoreLayout() never returns it: telling the
+	// families apart needs the database open, so the SQLite adapter elects one
+	// per read and reports it as the read's layout, which the cursor and
+	// coverage record.
+	openCodeStoreLayoutSQLiteV2 = "sqlite_v2"
 )
 
 // openCodeStoreLayout detects the layout under openCodeStorageDir(), newest

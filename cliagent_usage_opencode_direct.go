@@ -13,6 +13,11 @@
 //     (cliagent_usage_opencode_direct_json.go). Each checks the exact shape it
 //     needs; an unrecognised store FAILS CLOSED: nothing is merged, coverage is
 //     not renewed, and the card keeps "Tokens today (agent runs)".
+//   - Source: SQLite V1 or V2 family. The SQLite adapter elects OpenCode 1's
+//     tables or OpenCode 2's per read and reports which as the read's layout
+//     (sqlite / sqlite_v2); the cursor and coverage record it, so a switch is a
+//     layout switch. A switch onto V2 re-reads from local midnight once: the
+//     frozen V1 tables renewed the cursor without reading what V2 wrote.
 //   - Dedup: a message is keyed sha256(session, "message:"+id) — the key the
 //     export fallback writes — so the two cannot count one message twice. A
 //     stream step is keyed by its part id instead, so the reader skips every
@@ -34,6 +39,9 @@
 //     mid-update), on the propagator's 60 s tick only while the store's change
 //     marker moved or the last scan left work, and on a Refresh click. One
 //     single flight is shared by all three; ParseContext never scans.
+//   - Triggers: Refresh also pays owed debts from the store
+//     (payOwedOpenCodeUsageFromStore), inside the click's budget and without
+//     spending a ladder attempt or spawning an export.
 //   - Survive: the cursor, coverage and ownership windows live in the ledger, so
 //     they cross the self-update hand-off. A ledger an older build rewrote has
 //     today's buckets but no cursor; the scan then starts at the newest of them
@@ -218,6 +226,9 @@ type openCodeDirectRead struct {
 	AtSession bool
 	// Skipped counts oversized or unparseable records passed over for good.
 	Skipped int
+	// Layout is the layout the adapter read, when it can tell more than the
+	// store's files do (the SQLite schema family); "" is the scan's own.
+	Layout string
 }
 
 // openCodeDirectReader reads the assistant messages last written at or after
@@ -312,9 +323,14 @@ func openCodeDirectScanOnRefresh(ctx context.Context) string {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < openCodeDirectClickBudget {
 		return liveProbeOutcomeNotMerged
 	}
-	switch openCodeDirectScanShared(openCodeDirectClickBudget) {
-	case "direct_scanned", "direct_unchanged":
-	default:
+	// One click budget, one deadline: the scan gets what is left of it, and the
+	// debts what the scan leaves.
+	ctx, cancel := context.WithTimeout(ctx, openCodeDirectClickBudget)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+	scanned := openCodeDirectScanShared(time.Until(deadline)) == "direct_scanned"
+	paid := payOwedOpenCodeUsageFromStore(ctx, openCodeUsageMaxDebts)
+	if !scanned && paid == 0 {
 		return liveProbeOutcomeNotMerged
 	}
 	return liveProbeOutcomeOK
@@ -408,26 +424,27 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	}
 	now := openCodeDirectNow()
 	saved := loadOpenCodeUsageLedger()
-	floorMs := openCodeDirectScanFloor(saved, now)
-	limits := openCodeDirectLimits{
-		MaxSessions:    openCodeDirectMaxSessions,
-		MaxRecords:     openCodeDirectMaxRecords,
-		MaxRecordBytes: openCodeDirectMaxRecordBytes,
-		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
+	// The SQLite adapter elects its schema family as it reads: the bounds are
+	// built for the family the cursor last read, and rebuilt (and the store read
+	// again) only when the adapter read the other one under different bounds.
+	expect := layout
+	if c := saved.DirectCursor; c != nil && layout == openCodeStoreLayoutSQLite && c.Layout == openCodeStoreLayoutSQLiteV2 {
+		expect = c.Layout
 	}
-	if c := saved.DirectCursor; c != nil && c.Continue && c.Layout == layout {
-		// A continuation's skip and floors index the adapter that cut it; after
-		// a layout switch the other adapter orders tied records differently, so
-		// it re-reads from the cut and seenSteps absorbs the repeats.
-		limits.ExactSessions = c.AtSession
-		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
-		if c.AtSession {
-			limits.SessionFloorMs = c.ThroughMs
-		} else {
-			limits.SessionSinceMs = c.SessionSinceMs
+	floorMs, limits := openCodeDirectReadBounds(saved, expect, now)
+	result, err := read(ctx, root, floorMs, limits)
+	if err == nil && firstNonEmpty(result.Layout, layout) != expect {
+		expect = firstNonEmpty(result.Layout, layout)
+		if f, l := openCodeDirectReadBounds(saved, expect, now); f != floorMs || l != limits {
+			floorMs, limits = f, l
+			result, err = read(ctx, root, floorMs, limits)
+			if err == nil && firstNonEmpty(result.Layout, layout) != expect {
+				// The family changed between the two reads: the next scan elects again.
+				return "direct_read_failed", true
+			}
 		}
 	}
-	result, err := read(ctx, root, floorMs, limits)
+	layout = expect
 	switch {
 	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
 		return "direct_layout_unknown", false
@@ -499,6 +516,40 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	// A drained continuation that returned to its revisit floor reads it again
 	// on the next tick, whether or not the store moved.
 	return "direct_scanned", held || pending || revisited
+}
+
+// openCodeDirectReadBounds is the floor and limits of a read in layout. A
+// continuation's skip and floors index the adapter that cut it; after a layout
+// switch the other adapter orders tied records differently, so it re-reads from
+// the cut and seenSteps absorbs the repeats. A switch onto the SQLite V2 family
+// re-reads from local midnight instead: until then the frozen V1 tables renewed
+// the cursor without reading any of the spend V2 was writing. Earlier days are
+// not backfilled — the card publishes only today's bucket.
+func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits) {
+	floorMs := openCodeDirectScanFloor(saved, now)
+	limits := openCodeDirectLimits{
+		MaxSessions:    openCodeDirectMaxSessions,
+		MaxRecords:     openCodeDirectMaxRecords,
+		MaxRecordBytes: openCodeDirectMaxRecordBytes,
+		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
+	}
+	c := saved.DirectCursor
+	switch {
+	case c == nil:
+	case c.Layout != layout && layout == openCodeStoreLayoutSQLiteV2:
+		midnight := openCodeLocalMidnight(now)
+		floorMs = midnight.UnixMilli()
+		limits.SessionFloorMs = midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli()
+	case c.Continue && c.Layout == layout:
+		limits.ExactSessions = c.AtSession
+		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
+		if c.AtSession {
+			limits.SessionFloorMs = c.ThroughMs
+		} else {
+			limits.SessionSinceMs = c.SessionSinceMs
+		}
+	}
+	return floorMs, limits
 }
 
 // openCodeDirectWriteCanWait reports that a scan which found nothing new need
