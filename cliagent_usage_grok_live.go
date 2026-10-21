@@ -857,9 +857,9 @@ var (
 	grokRecoveryWithheldMaxWait = 30 * time.Minute
 
 	// grokRecoveryTimer is the pending recovery retry. It is cancelled at
-	// shutdown (stopGrokRunDebtRetry): a retry firing after an update hand-off
-	// would rotate the cache back onto this process's epoch over the
-	// replacement's, and no live process would hint the result.
+	// shutdown (stopGrokRecoveryRetry), and only there: a retry firing after an
+	// update hand-off would rotate the cache back onto this process's epoch
+	// over the replacement's, and no live process would hint the result.
 	grokRecoveryTimer struct {
 		mu    sync.Mutex
 		timer *time.Timer

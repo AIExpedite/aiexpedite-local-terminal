@@ -1127,9 +1127,10 @@ func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 	pay(grokUsageFreshness{})
 }
 
-// stopGrokRunDebtRetry cancels the pending rung, claim re-check and generation
-// recovery. Called from gracefulShutdown;
-// the schedule is on disk and the next process re-arms it.
+// stopGrokRunDebtRetry cancels the pending rung and claim re-check. Called from
+// gracefulShutdown, and to idle an auth-refused debt; the schedule is on disk
+// and the next process re-arms it. Generation recovery is not a run debt, so
+// only shutdown cancels it (stopGrokRecoveryRetry).
 func stopGrokRunDebtRetry() {
 	t := &grokRunDebtRetryTimer
 	t.mu.Lock()
@@ -1147,7 +1148,6 @@ func stopGrokRunDebtRetry() {
 		c.timer = nil
 	}
 	c.gen++
-	stopGrokRecoveryRetry()
 }
 
 // grokRunDebtRetryPending reports whether a rung is armed. Test seam.

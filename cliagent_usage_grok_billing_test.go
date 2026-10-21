@@ -1356,7 +1356,7 @@ func TestGrokRecovery_APendingRetryIsCancelledAtShutdown(t *testing.T) {
 	if next == nil {
 		t.Fatal("want a recovery retry booked for the withheld pool")
 	}
-	stopGrokRunDebtRetry()
+	stopGrokRecoveryRetry()
 	// The replacement process rotates the cache onto its own epoch.
 	codexProcessGenerationEpoch.Store(8143)
 	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); refused || g == nil || *g != gen(8143, 1) {
@@ -1374,6 +1374,30 @@ func TestGrokRecovery_APendingRetryIsCancelledAtShutdown(t *testing.T) {
 	cliUsagePropagator.mu.Unlock()
 	if p != nil {
 		t.Fatalf("pending = %+v, want no hint from a cancelled recovery", p)
+	}
+}
+
+// Idling an auth-refused run debt (stopGrokRunDebtRetry) is not shutdown: a
+// recovery retry waiting for a withheld figure must survive it, or the rotated
+// generation is never hinted once the figure becomes trusted.
+func TestGrokRecovery_APendingRetrySurvivesAnIdledRunDebt(t *testing.T) {
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		next = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() {
+		grokRecoveryAfterFunc = prev
+		stopGrokRecoveryRetry()
+	})
+
+	fired := false
+	grokArmRecoveryRetry(time.Minute, func() { fired = true })
+	stopGrokRunDebtRetry()
+	next()
+	if !fired {
+		t.Fatal("idling a run debt cancelled the pending generation recovery")
 	}
 }
 

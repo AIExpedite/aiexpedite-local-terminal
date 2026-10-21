@@ -76,6 +76,7 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()
 	stopGrokRunDebtRetry()
+	stopGrokRecoveryRetry()
 	persistClaudeRunDebtForShutdown()
 	// Antigravity's discovery tick stops, then its in-flight state writes (a
 	// run's settle, an arm persisting its floor) get a bounded drain, so a
