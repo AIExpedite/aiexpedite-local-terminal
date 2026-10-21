@@ -1232,3 +1232,31 @@ func TestGrokRunDebt_AResumedDebtIsClaimedAcrossProcesses(t *testing.T) {
 		t.Fatalf("state = %+v, want the paid debt cleared", h.state())
 	}
 }
+
+// A resumed debt whose claim is still held by a process that then dies
+// mid-read has no worker and no rung, and startup resumes only once: the
+// process that found the claim taken re-checks when it expires and pays it.
+func TestGrokRunDebt_AnUnexpiredResumeClaimIsReArmedForItsExpiry(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	origTTL := grokResumeClaimTTL
+	t.Cleanup(func() { grokResumeClaimTTL = origTTL })
+	grokResumeClaimTTL = 50 * time.Millisecond
+	now := h.clock()
+	// The dead process's claim, taken at now.
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+		WorkerClaimAtMs: now.UnixMilli(),
+	})
+
+	grokResumeAdoptedDebt(h.state(), now)
+	h.idle()
+	if got := h.reads.Load(); got != 0 {
+		t.Fatalf("reads = %d, want none while the other process's claim holds", got)
+	}
+
+	// The claim expires with nobody having paid the debt.
+	h.advance(grokResumeClaimTTL)
+	waitForClaudeCondition(t, 5*time.Second, "the expired claim retaken and paid", func() bool {
+		return h.reads.Load() == 1 && !h.state().owed()
+	})
+}

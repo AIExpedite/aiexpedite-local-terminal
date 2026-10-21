@@ -214,6 +214,13 @@ var (
 		timer *time.Timer
 		gen   uint64
 	}
+	// grokResumeClaimTimer re-checks a resumed debt another process holds
+	// the claim on, once that claim expires (grokResumeAdoptedDebt).
+	grokResumeClaimTimer struct {
+		mu    sync.Mutex
+		timer *time.Timer
+		gen   uint64
+	}
 	grokRefreshNudge struct {
 		mu     sync.Mutex
 		lastAt time.Time
@@ -1120,7 +1127,7 @@ func grokRunDebtRetryFired(gen uint64, id grokDebtID) {
 	pay(grokUsageFreshness{})
 }
 
-// stopGrokRunDebtRetry cancels the pending rung. Called from gracefulShutdown;
+// stopGrokRunDebtRetry cancels the pending rung and claim re-check. Called from gracefulShutdown;
 // the schedule is on disk and the next process re-arms it.
 func stopGrokRunDebtRetry() {
 	t := &grokRunDebtRetryTimer
@@ -1131,6 +1138,14 @@ func stopGrokRunDebtRetry() {
 		t.timer = nil
 	}
 	t.gen++
+	c := &grokResumeClaimTimer
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	c.gen++
 }
 
 // grokRunDebtRetryPending reports whether a rung is armed. Test seam.
@@ -1308,12 +1323,18 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 	// both charge it.
 	id := state.debtID()
 	claimed := false
+	var heldAtMs int64
 	claim := func(s *grokUsageFreshness) {
-		claimed = s.owed() && s.debtID() == id &&
-			(s.WorkerClaimAtMs == 0 || now.UnixMilli() < s.WorkerClaimAtMs ||
-				now.Sub(time.UnixMilli(s.WorkerClaimAtMs)) >= grokResumeClaimTTL)
+		claimed, heldAtMs = false, 0
+		if !s.owed() || s.debtID() != id {
+			return
+		}
+		claimed = s.WorkerClaimAtMs == 0 || now.UnixMilli() < s.WorkerClaimAtMs ||
+			now.Sub(time.UnixMilli(s.WorkerClaimAtMs)) >= grokResumeClaimTTL
 		if claimed {
 			s.WorkerClaimAtMs = now.UnixMilli()
+		} else {
+			heldAtMs = s.WorkerClaimAtMs
 		}
 	}
 	pay := func(grokUsageFreshness) {
@@ -1321,6 +1342,14 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 			grokStartRunDebtWorker(false)
 			return
 		}
+		if heldAtMs == 0 {
+			return
+		}
+		// Another process holds an unexpired claim. Startup resumes only once,
+		// so if that process died mid-pass nothing else would wake the debt:
+		// it is re-checked when the claim expires. A claimant that paid it, or
+		// booked a rung, leaves that re-check a no-op or an ordinary re-arm.
+		grokArmResumeClaimRetry(id, time.UnixMilli(heldAtMs).Add(grokResumeClaimTTL).Sub(now))
 		fmt.Printf("%s[cli-usage] grok refresh: resume_claimed%s\n", colorYellow, colorReset)
 	}
 	if _, committed := grokUsageFreshnessTxn(claim); !committed {
@@ -1331,6 +1360,45 @@ func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 		return
 	}
 	pay(grokUsageFreshness{})
+}
+
+// grokArmResumeClaimRetry replaces the pending claim re-check with one for
+// debt id, due when the other process's claim expires.
+func grokArmResumeClaimRetry(id grokDebtID, delay time.Duration) {
+	if delay < 0 {
+		delay = 0
+	}
+	t := &grokResumeClaimTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.gen++
+	gen := t.gen
+	t.timer = time.AfterFunc(delay, func() { grokResumeClaimExpired(gen, id) })
+}
+
+// grokResumeClaimExpired resumes debt id again if it is still owed: it takes
+// the expired claim, or re-arms whatever the claimant booked meanwhile.
+func grokResumeClaimExpired(gen uint64, id grokDebtID) {
+	t := &grokResumeClaimTimer
+	t.mu.Lock()
+	if gen != t.gen {
+		t.mu.Unlock()
+		return
+	}
+	t.timer = nil
+	grokFreshnessInFlight.Add(1)
+	t.mu.Unlock()
+	defer grokFreshnessInFlight.Add(-1)
+	if IsShutdownInProgress() {
+		return
+	}
+	now := grokUsageFreshnessNow()
+	if state, owed := grokPendingDebt(now); owed && state.debtID() == id {
+		grokResumeAdoptedDebt(state, now)
+	}
 }
 
 // grokAuthOutcome reports the outcomes the auth notice owns: no read can pay
