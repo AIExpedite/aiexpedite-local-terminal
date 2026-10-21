@@ -204,8 +204,8 @@ func readOpenCodeSQLiteV1Messages(ctx context.Context, db *sql.DB, sessions []an
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.CreatedMs, &m.WrittenMs, &oversized, &infoText, &stepsText); err != nil {
 			return m, false, err
 		}
-		var info openCodeSQLiteInfo
-		if oversized || !infoText.Valid || json.Unmarshal([]byte(infoText.String), &info) != nil || m.CreatedMs <= 0 {
+		info, ok := parseOpenCodeSQLiteInfo(m, oversized, infoText)
+		if !ok {
 			return m, false, nil
 		}
 		if completed, ok := openCodeUsageMillis(info.Completed); ok {
@@ -267,6 +267,15 @@ func readOpenCodeSQLiteMessageRows(ctx context.Context, db *sql.DB, query string
 		return err
 	}
 	return nil
+}
+
+// parseOpenCodeSQLiteInfo decodes a row's narrowed info; ok=false is a record
+// to pass over for good: oversized, unparseable, or with no creation time.
+func parseOpenCodeSQLiteInfo(m openCodeDirectMessage, oversized bool, infoText sql.NullString) (info openCodeSQLiteInfo, ok bool) {
+	if oversized || !infoText.Valid || json.Unmarshal([]byte(infoText.String), &info) != nil || m.CreatedMs <= 0 {
+		return info, false
+	}
+	return info, true
 }
 
 // openCodeSQLitePlaceholders is n comma-separated "?".

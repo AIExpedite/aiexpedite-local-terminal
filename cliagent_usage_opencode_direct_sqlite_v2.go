@@ -26,7 +26,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 )
 
@@ -105,8 +104,8 @@ func readOpenCodeSQLiteV2Messages(ctx context.Context, db *sql.DB, sessions []an
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.CreatedMs, &m.WrittenMs, &oversized, &infoText, &idled); err != nil {
 			return m, false, err
 		}
-		var info openCodeSQLiteInfo
-		if oversized || !infoText.Valid || json.Unmarshal([]byte(infoText.String), &info) != nil || m.CreatedMs <= 0 {
+		info, ok := parseOpenCodeSQLiteInfo(m, oversized, infoText)
+		if !ok {
 			return m, false, nil
 		}
 		completed, ok := openCodeUsageMillis(info.Completed)

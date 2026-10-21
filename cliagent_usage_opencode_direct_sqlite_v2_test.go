@@ -315,7 +315,8 @@ func TestOpenCodeDirectSQLiteV2_CapsAndTheTieBreakerResume(t *testing.T) {
 	}
 }
 
-// A spent budget truncates instead of failing: nothing past the cut is counted.
+// A spent budget counts nothing it did not read: the read fails (a retry) or
+// comes back truncated with nothing in it.
 func TestOpenCodeDirectSQLiteV2_ASpentBudgetTruncates(t *testing.T) {
 	root := t.TempDir()
 	store := newOpenCodeV2TestStore(t, root)
@@ -324,8 +325,8 @@ func TestOpenCodeDirectSQLiteV2_ASpentBudgetTruncates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	read, err := readOpenCodeDirectSQLite(ctx, root, base, openCodeDirectTestLimits())
-	if err == nil && len(read.Messages) != 0 {
-		t.Fatalf("read = %+v, want nothing counted after the budget", read)
+	if err == nil && (!read.Truncated || len(read.Messages) != 0) {
+		t.Fatalf("read = %+v, want an error or an empty truncated read", read)
 	}
 }
 
