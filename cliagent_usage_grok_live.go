@@ -700,7 +700,9 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     account's numeric cache with an unmetered read is a clear as well.
 //   - A same-account read older than the cached answer is superseded: it
 //     reports committed (the cache already holds a newer answer) and writes
-//     nothing.
+//     nothing — unless the cached answer is more than grokBillingMaxClockSkew
+//     ahead of it (a clock since corrected), which the read replaces with a
+//     generation advance.
 //
 // advanced reports a committed generation advance, and generation is it.
 func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
@@ -719,12 +721,19 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 	hasPrev := readJSONFile(path, &prev)
 	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
 	entryAt, entryErr := time.Parse(time.RFC3339Nano, entry.ObservedAt)
+	prevFuture := false
 	if sameAccount && entryErr == nil {
 		// Requests from two processes overlap outside the lock, so an older
 		// answer can finish after a newer one committed: it is superseded, never
-		// written over the newer cache and generation.
+		// written over the newer cache and generation. A cached answer further
+		// ahead of this read than grokBillingMaxClockSkew was stamped by a
+		// clock that has since been corrected: it is untrusted (the parser
+		// already renders it Unknown), so this read replaces it.
 		if prevAt, err := time.Parse(time.RFC3339Nano, prev.ObservedAt); err == nil && entryAt.Before(prevAt) {
-			return true, false, cliUsageGeneration{}
+			if !prevAt.After(entryAt.Add(grokBillingMaxClockSkew)) {
+				return true, false, cliUsageGeneration{}
+			}
+			prevFuture = true
 		}
 	}
 	prevNumericAt, prevNumeric := prev.numericObservedAt()
@@ -782,6 +791,9 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 		// moves from the other account's figure to Unknown, a versioned clear.
 		advanced, entry.Cleared = true, true
 	}
+	// Replacing an untrusted future answer always changes the published
+	// reading, even when its figures match.
+	advanced = advanced || prevFuture
 	epoch := codexProcessGenerationEpoch.Load()
 	if advanced {
 		if entry.Generation == nil || entry.Generation.Epoch != epoch {

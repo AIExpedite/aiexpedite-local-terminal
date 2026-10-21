@@ -757,7 +757,8 @@ func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 	oldest := grokOldestLiveFloor()
 	retired := false
 	accountChanged := label == liveProbeOutcomeAccountChanged || label == liveProbeOutcomeAccountChangedAfterRead
-	updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+	retire := func(state *grokUsageFreshness) {
+		retired = false
 		if !state.owed() || state.debtID() != id {
 			return
 		}
@@ -767,14 +768,24 @@ func grokRetireRunDebt(id grokDebtID, label string, attempts int) {
 			state.DirectForgets++
 		}
 		retired = true
-	})
-	if retired && accountChanged {
-		// Retired unpaid: a direct turn handed to this debt is owed again
-		// when its account signs back in.
-		grokDirectForgetNudged()
+	}
+	forget := func(grokUsageFreshness) {
+		if retired && accountChanged {
+			// Retired unpaid: a direct turn handed to this debt is owed again
+			// when its account signs back in.
+			grokDirectForgetNudged()
+		}
 	}
 	grokLastRefreshOutcome.Store(label)
 	fmt.Printf("%s[cli-usage] grok refresh: retired %s attempts=%d%s\n", colorYellow, label, attempts, colorReset)
+	if state, ok := grokUsageFreshnessTxn(retire); ok {
+		forget(state)
+		return
+	}
+	// Refused by another process's lock: the caller books no further pass, so
+	// the retirement (with its DirectForgets advance) is retried until it
+	// lands rather than leaving the forgotten turn treated as handled.
+	grokRetryRefusedFreshness(retire, forget)
 }
 
 // grokPayRunDebtPass spends at most one outbound read on the pending debt and

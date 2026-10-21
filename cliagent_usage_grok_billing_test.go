@@ -972,6 +972,29 @@ func TestGrokLiveCache_AnOlderSameAccountAnswerNeverReplacesANewerOne(t *testing
 	}
 }
 
+// A cached answer a forward clock jump stamped beyond grokBillingMaxClockSkew
+// ahead is untrusted once the clock is corrected: the next read replaces it
+// (with an advance, even with matching figures) instead of being superseded
+// until wall time catches up.
+func TestGrokLiveCache_ACorrectedClockReadReplacesAFutureCacheEntry(t *testing.T) {
+	grokLiveCacheFixture(t, 8114)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(6*time.Hour), floatPtr(40), end))
+
+	// Within the skew an earlier answer is still an overlapping request.
+	if committed, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-ada", at.Add(6*time.Hour-grokBillingMaxClockSkew), floatPtr(40), end)); !committed || advanced {
+		t.Fatalf("committed=%t advanced=%t, want a near-earlier answer superseded", committed, advanced)
+	}
+	committed, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(40), end))
+	if !committed || !advanced {
+		t.Fatalf("committed=%t advanced=%t, want the corrected read to replace and advance", committed, advanced)
+	}
+	if got := readGrokLiveCacheFile(t); got.ObservedAt != at.Format(time.RFC3339Nano) || *got.UsedPercent != 40 {
+		t.Fatalf("cache = %+v, want the corrected read", got)
+	}
+}
+
 func TestGrokLiveCache_AcrossARolloverTheUnmeteredReadWins(t *testing.T) {
 	grokLiveCacheFixture(t, 8104)
 	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)

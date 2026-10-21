@@ -961,6 +961,24 @@ func TestGrokRunDebt_RetireLeavesANewerDebtGeneration(t *testing.T) {
 	}
 }
 
+// An account-change retirement refused by another process's lock is retried
+// until it lands, so the debt is cleared and DirectForgets advanced rather
+// than the forgotten turn left treated as handled.
+func TestGrokRunDebt_ARetirementRefusedByTheFreshnessLockLandsOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{OwedAtMs: h.clock().UnixMilli(), CompletionMs: h.clock().UnixMilli(), AccountFingerprint: "fp-ada"})
+	release := holdGrokFreshnessLock(t)
+	grokRetireRunDebt(h.state().debtID(), liveProbeOutcomeAccountChanged, 1)
+	if state := h.state(); !state.owed() || state.DirectForgets != 0 {
+		t.Fatalf("state = %+v, want nothing written while locked", state)
+	}
+	release()
+	h.idle()
+	if state := h.state(); state.owed() || state.DirectForgets != 1 {
+		t.Fatalf("state = %+v, want the retried retirement to clear the debt and count the forget", state)
+	}
+}
+
 // A run-completion read never joins a flight sent before the run completed:
 // that response cannot include the run, so it must not pay the debt.
 func TestGrokRunDebt_FlightSentBeforeCompletionNeverPaysTheDebt(t *testing.T) {
