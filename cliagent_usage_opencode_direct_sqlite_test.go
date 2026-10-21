@@ -409,3 +409,45 @@ func TestOpenCodeDirectSQLite_SessionCutWithIncompleteMessagePreservesRecordFloo
 		t.Fatalf("bucket tokens = %d, want 52 (42 + 10)", b.tokens())
 	}
 }
+
+// A store holding V1 tables only still reads as the V1 family. One holding both
+// families reads the one whose heads were written most recently, and only it.
+func TestOpenCodeDirectSQLite_AMixedStoreReadsItsNewestFamily(t *testing.T) {
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	read := func(t *testing.T, root string) openCodeDirectRead {
+		t.Helper()
+		read, err := readOpenCodeDirectSQLite(context.Background(), root, base-time.Hour.Milliseconds(), openCodeDirectTestLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
+	insertOpenCodeSQLiteMessage(t, db, "ses_1", "msg_v1", base, base+1, base+1, [][3]int64{{3, 0, 0}}, 0)
+	if r := read(t, root); r.Layout != openCodeStoreLayoutSQLite || len(r.Messages) != 1 || r.Messages[0].ID != "msg_v1" {
+		t.Fatalf("V1-only read = %+v", r)
+	}
+
+	for name, v1Newer := range map[string]bool{"V1 newer": true, "V2 newer": false} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema+openCodeSQLiteV2TestSchema)
+			v2 := &openCodeV2TestStore{t: t, db: db, heads: "session_v2", seq: map[string]int{}}
+			v1At, v2At := base, base+100
+			if v1Newer {
+				v1At, v2At = v2At, v1At
+			}
+			insertOpenCodeSQLiteMessage(t, db, "ses_1", "msg_v1", v1At-1, v1At, v1At, [][3]int64{{3, 0, 0}}, 0)
+			v2.assistant("ses_2", "msg_v2", v2At-1, v2At, 5, 0, 0, 0)
+			want, wantID := openCodeStoreLayoutSQLiteV2, "msg_v2"
+			if v1Newer {
+				want, wantID = openCodeStoreLayoutSQLite, "msg_v1"
+			}
+			if r := read(t, root); r.Layout != want || len(r.Messages) != 1 || r.Messages[0].ID != wantID {
+				t.Fatalf("read = %+v, want %s's message only", r, want)
+			}
+		})
+	}
+}

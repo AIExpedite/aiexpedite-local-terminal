@@ -938,3 +938,41 @@ func TestOpenCodeUsage_DirectSpendSurvivesTheHandOff(t *testing.T) {
 		t.Fatalf("coverage = %+v after B's scan", c)
 	}
 }
+
+// A smoke debt process A owed on OpenCode 2 — cut off by the update hand-off
+// before its first rung — is paid from the V2 store by process B, with the
+// agent offline and no export run, exactly once: the ownership window A left
+// keeps B's direct scan off the same session.
+func TestOpenCodeUsage_AnAdoptedDebtIsPaidFromTheV2Store(t *testing.T) {
+	sched, store, clock, exports := openCodeV2Fixture(t, 1701)
+	run := oweOpenCodeV2Run(t, store, clock, "ses_handoff_v2", "msg_h", 64)
+	if d := openCodeDebtOf(t, run.id); d == nil || !d.owed() {
+		t.Fatalf("debt = %+v, want process A's owed debt", d)
+	}
+
+	simulateOpenCodeProcessRestart(t, 1702)
+	SetOffline(true)
+	t.Cleanup(func() { SetOffline(false) })
+	clock.now = clock.now.Add(time.Minute)
+	adoptOwedOpenCodeUsage(clock.now)
+	for sched.fireNext() {
+	}
+	scanOpenCodeDirect(t)
+
+	b, ok, g := openCodeUsageBucketForDay("fp-v2", clock.now)
+	if !ok || b.tokens() != 64 {
+		t.Fatalf("bucket = %+v, want the stored 64 once", b)
+	}
+	if g.Epoch != 1702 {
+		t.Fatalf("generation %+v was not committed under B's epoch", g)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 64 {
+		t.Fatalf("tokens today = %d, want B's direct scan to skip A's session", n)
+	}
+	if left := loadOpenCodeUsageLedger().Debts; len(left) != 0 {
+		t.Fatalf("debts = %+v after payment", left)
+	}
+	if *exports != 0 {
+		t.Fatalf("the export ran %d times", *exports)
+	}
+}

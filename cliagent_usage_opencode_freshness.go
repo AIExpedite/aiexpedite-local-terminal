@@ -23,10 +23,17 @@
 //     stands down while it is live, spending no attempt: a streamed step is
 //     keyed by its part id and an exported message by its message id, so paying
 //     both would count the turn twice.
-//   - Ladder: attempts at 15 s, 1 m and 5 m, each one `opencode export <id>`
-//     with a 5 s timeout. A refusal that spent nothing (offline, binary
-//     missing) books refreshFreeRetryDelay without consuming an attempt. A
-//     debt is retired when it is paid, its attempts are spent, or it is 6 h old.
+//   - Ladder: attempts at 15 s, 1 m and 5 m — store first, export second. Each
+//     reads the run's turn from OpenCode's own store (read-only and local,
+//     under the export's message keys); only a JSON, unknown or V1 store that
+//     paid nothing goes on to `opencode export <id>` with a 5 s timeout. A V2
+//     session's export pays nothing, so a whole, empty V2 read spends the
+//     attempt itself. A refusal that spent nothing (a busy, truncated,
+//     incomplete or unbounded store read, offline, binary missing) books
+//     refreshFreeRetryDelay without consuming an attempt. A debt is retired
+//     when it is paid, its attempts are spent, or it is 6 h old. A Refresh
+//     click pays owed debts from the store too (payOwedOpenCodeUsageFromStore)
+//     and never spends an attempt.
 //   - Survive: StartAgent calls payOwedOpenCodeUsage, which re-arms the ladder
 //     for the previous process's debts — including armed ones it never
 //     settled.
@@ -51,7 +58,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -834,7 +843,8 @@ func clearOpenCodeUsageTimer(runID string) {
 	openCodeUsageTimersMu.Unlock()
 }
 
-// attemptOpenCodeUsageDebt makes one export attempt for a debt.
+// attemptOpenCodeUsageDebt makes one attempt at a debt: the store first, the
+// export second.
 func attemptOpenCodeUsageDebt(runID string) {
 	now := openCodeUsageFreshnessNow()
 	ledger := loadOpenCodeUsageLedger()
@@ -845,6 +855,12 @@ func attemptOpenCodeUsageDebt(runID string) {
 	}
 	debt := *found
 	owedFor := now.Sub(time.UnixMilli(debt.OwedAtMs))
+	// deferFree books the next attempt without consuming one: the delay grows
+	// with the debt.
+	deferFree := func(label string) {
+		logOpenCodeUsageCapture(label)
+		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
+	}
 	if owedFor > openCodeUsageDebtMaxAge {
 		retireOpenCodeUsageDebt(runID, "aged_out")
 		return
@@ -858,65 +874,147 @@ func attemptOpenCodeUsageDebt(runID string) {
 	if live := openCodeUsageLiveRun(runID); live != nil {
 		// The run is still open here: a step that lands (or a refused write that
 		// retries) would commit this same turn under its streamed part key,
-		// which no exported message key can dedup against. Spend nothing, and
-		// let finishOpenCodeUsageRun re-book the attempt when the run is quiet.
+		// which no stored or exported message key can dedup against. Spend
+		// nothing, and let finishOpenCodeUsageRun re-book the attempt when the
+		// run is quiet.
 		live.exportDeferred.Store(true)
-		logOpenCodeUsageCapture("deferred_run_live")
-		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
+		deferFree("deferred_run_live")
 		return
 	}
-	executable := resolveOpenCodeExecutable()
-	ledgerBusy := !openCodeUsageLedgerFree()
-	if IsOffline() || executable == "" || ledgerBusy {
-		// Spent nothing: no attempt consumed, the delay grows with the debt. A
-		// ledger another process holds would refuse whatever the export paid,
-		// and a refused attempt cannot be counted either — so the export is not
-		// spawned at all, rather than re-run on every retry for as long as the
-		// lock stays held.
-		label := "deferred_offline"
-		switch {
-		case executable == "":
-			label = "deferred_binary_missing"
-		case ledgerBusy:
-			label = "deferred_ledger_busy"
-		}
-		logOpenCodeUsageCapture(label)
-		scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
+	if !openCodeUsageLedgerFree() {
+		// A ledger another process holds would refuse whatever the store or the
+		// export paid, and a refused attempt cannot be counted either — so
+		// neither is read at all, rather than re-run on every retry for as long
+		// as the lock stays held.
+		deferFree("deferred_ledger_busy")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), openCodeExportTimeout)
+	// The store is local and read-only: no binary, no network.
+	ctx, cancel := context.WithTimeout(context.Background(), openCodeDirectTickBudget)
+	store, err := readOpenCodeStoreDebtUsage(ctx, &ledger, debt)
+	cancel()
+	switch outcome := openCodeStoreDebtOutcome(store, err); outcome {
+	case "store_paid":
+		if _, settled := payOpenCodeUsageDebt(runID, debt, store.Steps, outcome); !settled {
+			deferFree("store_retry")
+		}
+		return
+	case "store_empty":
+		// The V2 store answered whole and holds nothing for the turn: a V2
+		// session's export pays nothing either, so none is spawned.
+		logOpenCodeUsageCapture(outcome)
+		spendOpenCodeUsageDebtAttempt(runID, debt, owedFor, "store_retry")
+		return
+	case "":
+		// No SQLite store, an unknown one, or a V1 family that paid nothing:
+		// the export decides, as before OpenCode 2.
+	default:
+		deferFree(outcome)
+		return
+	}
+
+	executable := resolveOpenCodeExecutable()
+	if IsOffline() || executable == "" {
+		label := "deferred_offline"
+		if executable == "" {
+			label = "deferred_binary_missing"
+		}
+		deferFree(label)
+		return
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), openCodeExportTimeout)
 	steps, ok := readOpenCodeExportUsage(ctx, executable, debt)
 	cancel()
-	// gone: the debt was paid or retired meanwhile. A write refused for any
-	// other reason (another process holding the ledger) spent nothing durable,
-	// so it is retried rather than leaving the debt with no attempt booked.
-	gone := false
 	if ok && openCodeUsageStepsCarryUsage(steps) {
-		committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
-			if openCodeUsageDebtByID(ledger, runID) == nil {
-				gone = true
-				return false, false
-			}
-			removeOpenCodeUsageDebt(ledger, runID)
-			return true, mergeOpenCodeUsageSteps(ledger, debt.AccountFingerprint, steps)
-		})
-		noteOpenCodeUsageAdvanced(committed, changed, generation)
-		switch {
-		case committed:
-			clearOpenCodeUsageTimer(runID)
-			logOpenCodeUsageCapture("export_paid")
-		case gone:
-			clearOpenCodeUsageTimer(runID)
-		default:
-			scheduleOpenCodeUsageAttempt(runID, refreshFreeRetryDelay(owedFor, openCodeUsageFreeFloor, openCodeUsageDebtLadder))
+		if _, settled := payOpenCodeUsageDebt(runID, debt, steps, "export_paid"); !settled {
+			deferFree("export_retry")
 		}
 		return
 	}
-
 	// The export ran and paid nothing (unreadable, or the session holds no
 	// assistant message yet): an attempt is spent.
+	spendOpenCodeUsageDebtAttempt(runID, debt, owedFor, "export_retry")
+}
+
+// readOpenCodeStoreDebtUsage reads a debt's turn from OpenCode's store. The turn
+// is bounded by the run's ownership window, so a debt never pays a later turn of
+// a resumed session — that one belongs to its own run or to the direct reader
+// (the shared message key would dedup it anyway). A debt whose window is gone
+// (pruned past the cap, or adopted from an older build) or still open ends at
+// the earlier of its settle and the session's first V2 idle row after its floor.
+func readOpenCodeStoreDebtUsage(ctx context.Context, ledger *openCodeUsageLedger, debt openCodeUsageDebt) (openCodeStoreSessionRead, error) {
+	layout, root := openCodeStoreLayout()
+	if layout != openCodeStoreLayoutSQLite {
+		return openCodeStoreSessionRead{}, nil
+	}
+	q := openCodeStoreSessionQuery{SessionID: debt.SessionID, FromMs: debt.RunFloorMs}
+	if w := openCodeOwnedRunByID(ledger, debt.RunID); w != nil && !w.open() {
+		q.ToMs = w.ToMs
+	} else {
+		q.ToMs, q.UntilIdle = debt.SettledAtMs, true
+	}
+	return readOpenCodeStoreSessionUsage(ctx, root, q)
+}
+
+// openCodeStoreDebtOutcome is what a store read means for a debt: store_paid;
+// store_empty, a whole V2 read that found nothing; "" when the export decides
+// (no SQLite store, an unknown one, or a V1 family that paid nothing); or the
+// label of a read to retry without spending an attempt.
+func openCodeStoreDebtOutcome(store openCodeStoreSessionRead, err error) string {
+	switch {
+	case errors.Is(err, errOpenCodeDirectLayoutUnknown):
+		return ""
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+		return "store_deferred_truncated"
+	case err != nil:
+		return "store_deferred_busy"
+	case openCodeUsageStepsCarryUsage(store.Steps):
+		return "store_paid"
+	case store.Layout != openCodeStoreLayoutSQLiteV2:
+		return ""
+	case store.Unbounded:
+		return "store_deferred_unbounded"
+	case store.Truncated:
+		return "store_deferred_truncated"
+	case store.Incomplete:
+		return "store_deferred_incomplete"
+	}
+	return "store_empty"
+}
+
+// payOpenCodeUsageDebt folds what the store or the export paid into the ledger
+// and retires the debt in one write. paid: this write merged it. settled: the
+// debt is no longer owed — paid now, or already gone (paid or retired
+// meanwhile), so a Refresh click and a ladder timer racing on one debt merge it
+// once. Neither is a refused write (another process holding the ledger):
+// nothing durable was spent, and the debt is still owed.
+func payOpenCodeUsageDebt(runID string, debt openCodeUsageDebt, steps []openCodeUsageStep, label string) (paid, settled bool) {
+	gone := false
+	committed, changed, generation := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		if openCodeUsageDebtByID(ledger, runID) == nil {
+			gone = true
+			return false, false
+		}
+		removeOpenCodeUsageDebt(ledger, runID)
+		return true, mergeOpenCodeUsageSteps(ledger, debt.AccountFingerprint, steps)
+	})
+	noteOpenCodeUsageAdvanced(committed, changed, generation)
+	if !committed && !gone {
+		return false, false
+	}
+	clearOpenCodeUsageTimer(runID)
+	if committed {
+		logOpenCodeUsageCapture(label)
+	}
+	return committed, true
+}
+
+// spendOpenCodeUsageDebtAttempt records an attempt that paid nothing and books
+// the next rung, or retires the debt once its attempts are spent.
+func spendOpenCodeUsageDebtAttempt(runID string, debt openCodeUsageDebt, owedFor time.Duration, retryLabel string) {
 	attempts := debt.Attempts + 1
+	gone := false
 	committed, _, _ := openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
 		d := openCodeUsageDebtByID(ledger, runID)
 		if d == nil {
@@ -939,11 +1037,78 @@ func attemptOpenCodeUsageDebt(runID string) {
 	// settle's booking, so attempt n books ladder[n]. refreshRetryDelayForAttempt
 	// treats rung 0 as the settle's own attempt, hence the +1.
 	if delay, more := refreshRetryDelayForAttempt(attempts+1, openCodeUsageDebtMaxAttempts+1, openCodeUsageDebtLadder); more {
-		logOpenCodeUsageCapture("export_retry")
+		logOpenCodeUsageCapture(retryLabel)
 		scheduleOpenCodeUsageAttempt(runID, delay)
 		return
 	}
 	retireOpenCodeUsageDebt(runID, "exhausted")
+}
+
+var (
+	// openCodeUsageClickReserve is the least of a click's budget a store read
+	// for one more debt starts with.
+	openCodeUsageClickReserve = 250 * time.Millisecond
+	// openCodeUsageClickTried holds the debts a click in this process has read
+	// the store for, so the next click starts with the ones a spent budget left
+	// behind.
+	openCodeUsageClickMu    sync.Mutex
+	openCodeUsageClickTried = map[string]bool{}
+)
+
+// payOwedOpenCodeUsageFromStore is the Refresh click's payment: up to limit
+// owed debts, each read from the store while more than the reserve of ctx's
+// budget is left — debts no click has tried yet first, then the oldest. It
+// never spends an attempt or spawns an export, and leaves an unpaid debt's
+// ladder booking alone: only the ladder spends. A live run is skipped, as the
+// ladder skips it. It returns how many debts it paid.
+func payOwedOpenCodeUsageFromStore(ctx context.Context, limit int) int {
+	if !openCodeDirectScanEnabled {
+		return 0
+	}
+	now := openCodeUsageFreshnessNow()
+	ledger := loadOpenCodeUsageLedger()
+	var owed []openCodeUsageDebt
+	for _, d := range ledger.Debts {
+		if d.owed() && now.Sub(time.UnixMilli(d.OwedAtMs)) <= openCodeUsageDebtMaxAge &&
+			isValidOpenCodeSessionID(d.SessionID) && openCodeUsageLiveRun(d.RunID) == nil {
+			owed = append(owed, d)
+		}
+	}
+	openCodeUsageClickMu.Lock()
+	tried := make(map[string]bool, len(owed))
+	for _, d := range owed {
+		tried[d.RunID] = openCodeUsageClickTried[d.RunID]
+	}
+	// Debts that are gone are forgotten, so the set stays within the ledger's cap.
+	openCodeUsageClickTried = tried
+	openCodeUsageClickMu.Unlock()
+	sort.SliceStable(owed, func(i, j int) bool {
+		if tried[owed[i].RunID] != tried[owed[j].RunID] {
+			return !tried[owed[i].RunID]
+		}
+		return owed[i].RunFloorMs < owed[j].RunFloorMs
+	})
+
+	paid := 0
+	for i, debt := range owed {
+		if i == limit {
+			break
+		}
+		if deadline, ok := ctx.Deadline(); ctx.Err() != nil || ok && time.Until(deadline) <= openCodeUsageClickReserve {
+			break
+		}
+		openCodeUsageClickMu.Lock()
+		openCodeUsageClickTried[debt.RunID] = true
+		openCodeUsageClickMu.Unlock()
+		store, err := readOpenCodeStoreDebtUsage(ctx, &ledger, debt)
+		if openCodeStoreDebtOutcome(store, err) != "store_paid" {
+			continue
+		}
+		if ok, _ := payOpenCodeUsageDebt(debt.RunID, debt, store.Steps, "store_paid"); ok {
+			paid++
+		}
+	}
+	return paid
 }
 
 // openCodeUsageLedgerFree reports whether no other process holds the ledger's

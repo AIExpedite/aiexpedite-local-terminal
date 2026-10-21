@@ -1622,3 +1622,42 @@ func TestRunCLIUsageLiveProbes_OpenCodeReadsItsStore(t *testing.T) {
 		t.Fatalf("bucket = %+v after the click", b)
 	}
 }
+
+// A Refresh click on OpenCode 2 also pays owed debts from the store: it is ok
+// when only a payment merged, not_merged when the scan was unchanged and there
+// was nothing to pay, and it never spawns an export.
+func TestRunCLIUsageLiveProbes_OpenCodePaysOwedDebtsFromTheStore(t *testing.T) {
+	_, store, clock, exports := openCodeV2Fixture(t, 3102)
+	stubLiveProbes(t)
+	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
+		return map[string]detectedCLIAgent{openCodeUsageProvider: {Detected: true, Path: "opencode"}}
+	}
+	probe := func() string {
+		t.Helper()
+		cliUsageLiveProbeMu.Lock()
+		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
+		cliUsageLiveProbeMu.Unlock()
+		return runCLIUsageLiveProbes(context.Background())[openCodeUsageProvider]
+	}
+
+	if got := probe(); got != liveProbeOutcomeOK {
+		t.Fatalf("first click = %q, want ok for the scan that booked coverage", got)
+	}
+	if got := probe(); got != liveProbeOutcomeNotMerged {
+		t.Fatalf("idle click = %q, want not_merged", got)
+	}
+
+	run := oweOpenCodeV2Run(t, store, clock, "ses_click", "msg_click", 33)
+	if got := probe(); got != liveProbeOutcomeOK {
+		t.Fatalf("paying click = %q, want ok", got)
+	}
+	if d := openCodeDebtOf(t, run.id); d != nil {
+		t.Fatalf("debt = %+v after the click paid it", d)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 33 {
+		t.Fatalf("tokens today = %d, want the paid 33", n)
+	}
+	if *exports != 0 {
+		t.Fatalf("a click spawned %d exports", *exports)
+	}
+}

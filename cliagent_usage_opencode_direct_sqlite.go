@@ -6,12 +6,22 @@
 // current toolchain — with a busy timeout, and closed after each scan. The
 // reader never writes to, locks, migrates or vacuums OpenCode's store.
 //
-// Shape check: PRAGMA table_info must list every column the queries use; a
-// mismatch is errOpenCodeDirectLayoutUnknown (fail closed). Only assistant
-// messages last updated at or after the floor are selected, in ascending
-// time_updated order with LIMIT caps. JSON inside a row is narrowed IN SQLite —
-// json_extract of tokens, cost and completed time, and the step-finish parts'
-// tokens and cost — so message text and tool output never reach this process.
+// Schema family: OpenCode 2 keeps opencode.db but writes its sessions and
+// messages to new tables (session_v2 / session_message, no part table) and
+// leaves the V1 session / message / part tables in place, FROZEN. Those still
+// pass the V1 shape check, so a reader that only knew V1 would read nothing new
+// on every scan and still renew today's coverage. Each read therefore elects
+// one family (openCodeSQLiteFamily): the one whose session heads were written
+// most recently, a tie going to V2. The V2 reader lives in
+// cliagent_usage_opencode_direct_sqlite_v2.go; read.Layout names the family read.
+//
+// Shape check: PRAGMA table_info must list every column the family's queries
+// use; a store neither family fits is errOpenCodeDirectLayoutUnknown (fail
+// closed). Only assistant messages last updated at or after the floor are
+// selected, in ascending time_updated order with LIMIT caps. JSON inside a row
+// is narrowed IN SQLite — json_extract of tokens, cost and completed time, and
+// (V1) the step-finish parts' tokens and cost — so message text and tool output
+// never reach this process.
 //
 // This adapter stands alone: dropping it (and the driver) leaves the JSON
 // adapter and the rest of the reader untouched.
@@ -21,20 +31,22 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // openCodeSQLiteBusyTimeout bounds a wait on OpenCode's own writer. In WAL mode
 // a reader rarely waits at all.
 const openCodeSQLiteBusyTimeout = 500 * time.Millisecond
 
-// openCodeSQLiteColumns is every column the queries below read, by table.
+// openCodeSQLiteColumns is every column the V1 queries below read, by table.
 var openCodeSQLiteColumns = map[string][]string{
 	"session": {"id", "time_updated"},
 	"message": {"id", "session_id", "time_created", "time_updated", "data"},
@@ -94,45 +106,72 @@ WHERE m.session_id IN (%s)
 ORDER BY m.time_updated, m.id
 LIMIT ?`
 
-// openCodeSQLiteInfo is a message reduced by openCodeSQLiteMessageQuery.
+// openCodeSQLiteInfo is a message reduced by a family's message query.
 type openCodeSQLiteInfo struct {
 	Tokens    json.RawMessage `json:"tokens"`
 	Cost      json.RawMessage `json:"cost"`
 	Completed json.RawMessage `json:"completed"`
 }
 
+// openCodeSQLiteFamilyRead is one schema family's reader: the session heads
+// table it lists, and how it reads the messages of the listed sessions.
+type openCodeSQLiteFamilyRead struct {
+	Layout   string
+	Heads    string
+	Messages func(ctx context.Context, db *sql.DB, sessions []any, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead) error
+}
+
+// openOpenCodeSQLite opens root's opencode.db read-only.
+func openOpenCodeSQLite(root string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", openCodeSQLiteReadOnlyDSN(filepath.Join(root, "opencode.db")))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
+}
+
 func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, limits openCodeDirectLimits) (openCodeDirectRead, error) {
 	var read openCodeDirectRead
-	db, err := sql.Open("sqlite", openCodeSQLiteReadOnlyDSN(filepath.Join(root, "opencode.db")))
+	db, err := openOpenCodeSQLite(root)
 	if err != nil {
 		return read, err
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
 
-	if err := checkOpenCodeSQLiteSchema(ctx, db); err != nil {
-		return read, err
-	}
-
-	// Sessions written since the session floor (less the slack: a session row can
-	// be touched just before its last message), oldest first. A session past the
-	// cap stops the cursor at its own last write.
-	// A continuation's tie-breaker drops the sessions it listed already.
-	skip := limits.skipFor(true)
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, time_updated FROM session WHERE time_updated >= ? ORDER BY time_updated, id LIMIT ?`,
-		limits.sessionsSinceMs(floorMs), limits.MaxSessions+1+skip.N)
+	family, err := openCodeSQLiteFamily(ctx, db)
 	if err != nil {
 		return read, err
 	}
+	read.Layout = family.Layout
+	sessions, err := listOpenCodeSQLiteSessions(ctx, db, family.Heads, floorMs, limits, &read)
+	if err != nil || len(sessions) == 0 {
+		return read, err
+	}
+	return read, family.Messages(ctx, db, sessions, floorMs, limits, &read)
+}
+
+// listOpenCodeSQLiteSessions lists the sessions written since the session floor
+// (less the slack: a session row can be touched just before its last message),
+// oldest first. A session past the cap stops the cursor at its own last write.
+// A continuation's tie-breaker drops the sessions it listed already. heads is
+// one of the fixed table names a family names, never input.
+func listOpenCodeSQLiteSessions(ctx context.Context, db *sql.DB, heads string, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead) ([]any, error) {
+	skip := limits.skipFor(true)
+	rows, err := db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT id, time_updated FROM %q WHERE time_updated >= ? ORDER BY time_updated, id LIMIT ?`, heads),
+		limits.sessionsSinceMs(floorMs), limits.MaxSessions+1+skip.N)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	var sessions []any
 	var ties openCodeDirectTies
 	for rows.Next() {
 		var id string
 		var at int64
 		if err := rows.Scan(&id, &at); err != nil {
-			rows.Close()
-			return read, err
+			return nil, err
 		}
 		before := ties.see(at)
 		if skip.take(at) {
@@ -144,55 +183,31 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 		}
 		sessions = append(sessions, id)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return read, err
-	}
-	if len(sessions) == 0 {
-		return read, nil
-	}
+	return sessions, rows.Err()
+}
 
+// readOpenCodeSQLiteV1Messages reads the V1 family's assistant messages of the
+// listed sessions, summing each one's step-finish parts.
+func readOpenCodeSQLiteV1Messages(ctx context.Context, db *sql.DB, sessions []any, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead) error {
 	maxBytes := limits.MaxRecordBytes
-	query := fmt.Sprintf(openCodeSQLiteMessageQuery, strings.TrimSuffix(strings.Repeat("?,", len(sessions)), ","))
+	query := fmt.Sprintf(openCodeSQLiteMessageQuery, openCodeSQLitePlaceholders(len(sessions)))
 	args := []any{maxBytes, maxBytes, maxBytes, openCodeDirectMaxPartBytes, openCodeDirectMaxPartsPerMessage}
 	args = append(args, sessions...)
-	skip = limits.skipFor(false)
+	skip := limits.skipFor(false)
 	args = append(args, floorMs, maxBytes, limits.MaxRecords+1+skip.N)
-	rows, err = db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return read, err
-	}
-	defer rows.Close()
-	lastMs := floorMs
-	n := 0
-	ties = openCodeDirectTies{}
-	for rows.Next() {
+	return readOpenCodeSQLiteMessageRows(ctx, db, query, args, floorMs, limits, read, func(rows *sql.Rows) (openCodeDirectMessage, bool, error) {
 		var (
-			id, sessionID        string
-			createdMs, writtenMs int64
-			oversized            bool
-			infoText, stepsText  sql.NullString
+			m                   openCodeDirectMessage
+			oversized           bool
+			infoText, stepsText sql.NullString
 		)
-		if err := rows.Scan(&id, &sessionID, &createdMs, &writtenMs, &oversized, &infoText, &stepsText); err != nil {
-			return read, err
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.CreatedMs, &m.WrittenMs, &oversized, &infoText, &stepsText); err != nil {
+			return m, false, err
 		}
-		before := ties.see(writtenMs)
-		if skip.take(writtenMs) {
-			lastMs = writtenMs
-			continue
-		}
-		if n == limits.MaxRecords || ctx.Err() != nil {
-			read.truncateAt(writtenMs, before)
-			return read, nil
-		}
-		n++
-		lastMs = writtenMs
 		var info openCodeSQLiteInfo
-		if oversized || !infoText.Valid || json.Unmarshal([]byte(infoText.String), &info) != nil || createdMs <= 0 {
-			read.Skipped++
-			continue
+		if oversized || !infoText.Valid || json.Unmarshal([]byte(infoText.String), &info) != nil || m.CreatedMs <= 0 {
+			return m, false, nil
 		}
-		m := openCodeDirectMessage{ID: id, SessionID: sessionID, CreatedMs: createdMs, WrittenMs: writtenMs}
 		if completed, ok := openCodeUsageMillis(info.Completed); ok {
 			m.CompletedMs = completed
 			var parts []openCodeExportPart
@@ -201,6 +216,45 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 			}
 			m.Usage, m.Valid = openCodeExportMessageUsage(openCodeExportMessage{Parts: parts}, openCodeExportMessageInfo{Tokens: info.Tokens, Cost: info.Cost})
 		}
+		return m, true, nil
+	})
+}
+
+// readOpenCodeSQLiteMessageRows runs a family's message query and folds its
+// rows into read under the record cap, the time budget and the continuation's
+// tie-breaker every family shares. decode scans one row; ok=false passes an
+// oversized or unparseable record over for good (read.Skipped).
+func readOpenCodeSQLiteMessageRows(ctx context.Context, db *sql.DB, query string, args []any, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead,
+	decode func(*sql.Rows) (openCodeDirectMessage, bool, error)) error {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	skip := limits.skipFor(false)
+	lastMs := floorMs
+	n := 0
+	var ties openCodeDirectTies
+	for rows.Next() {
+		m, ok, err := decode(rows)
+		if err != nil {
+			return err
+		}
+		before := ties.see(m.WrittenMs)
+		if skip.take(m.WrittenMs) {
+			lastMs = m.WrittenMs
+			continue
+		}
+		if n == limits.MaxRecords || ctx.Err() != nil {
+			read.truncateAt(m.WrittenMs, before)
+			return nil
+		}
+		n++
+		lastMs = m.WrittenMs
+		if !ok {
+			read.Skipped++
+			continue
+		}
 		read.Messages = append(read.Messages, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -208,37 +262,252 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 			// The budget interrupted the query: everything up to the last row
 			// was read whole.
 			read.truncateAt(lastMs, ties.through(lastMs))
-			return read, nil
+			return nil
 		}
-		return read, err
+		return err
 	}
-	return read, nil
+	return nil
 }
 
-// checkOpenCodeSQLiteSchema fails closed unless every table lists every column
-// the reader needs.
+// openCodeSQLitePlaceholders is n comma-separated "?".
+func openCodeSQLitePlaceholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+/* --------------------------------------------------------------------------
+   Schema family
+   -------------------------------------------------------------------------- */
+
+// openCodeSQLiteFamily elects the schema family a read uses. V2 is a candidate
+// when session_message has every column its reader needs and a heads table does
+// (session_v2, else the pre-release layout's session); V1 when the V1 shape
+// check passes. session_message is the disambiguator — no V1 release creates
+// it — so a pre-release store whose heads are V1's own session table reads as
+// V2. With both candidates on distinct heads, the one written most recently
+// wins and a tie (both empty included) goes to V2, the family a fresh write
+// comes from; the scan logs direct_family_suppressed when the other one was
+// written since local midnight too, since its spend goes uncounted. Neither, or
+// a query that fails for any reason but a busy store or the budget, fails closed.
+func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (openCodeSQLiteFamilyRead, error) {
+	v1 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLite, Heads: "session", Messages: readOpenCodeSQLiteV1Messages}
+	v2 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLiteV2, Messages: readOpenCodeSQLiteV2Messages}
+	tables, err := openCodeSQLiteTables(ctx, db)
+	if err != nil {
+		return v1, openCodeSQLiteElectionErr(ctx, err)
+	}
+	hasV2, err := openCodeSQLiteV2Candidate(ctx, db, tables)
+	if err != nil {
+		return v1, openCodeSQLiteElectionErr(ctx, err)
+	}
+	v2.Heads = hasV2
+	hasV1 := false
+	if tables["session"] && tables["message"] && tables["part"] {
+		switch err := checkOpenCodeSQLiteSchema(ctx, db); {
+		case err == nil:
+			hasV1 = true
+		case !errors.Is(err, errOpenCodeDirectLayoutUnknown):
+			return v1, openCodeSQLiteElectionErr(ctx, err)
+		}
+	}
+	switch {
+	case v2.Heads == "" && !hasV1:
+		return v1, errOpenCodeDirectLayoutUnknown
+	case v2.Heads == "":
+		return v1, nil
+	case !hasV1 || v2.Heads == v1.Heads:
+		return v2, nil
+	}
+	v1Ms, err := openCodeSQLiteNewestHead(ctx, db, v1.Heads)
+	if err != nil {
+		return v1, openCodeSQLiteElectionErr(ctx, err)
+	}
+	v2Ms, err := openCodeSQLiteNewestHead(ctx, db, v2.Heads)
+	if err != nil {
+		return v1, openCodeSQLiteElectionErr(ctx, err)
+	}
+	if midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli(); v1Ms >= midnight && v2Ms >= midnight {
+		logOpenCodeUsageCapture("direct_family_suppressed")
+	}
+	if v1Ms > v2Ms {
+		return v1, nil
+	}
+	return v2, nil
+}
+
+// openCodeSQLiteElectionErr is what a failed election query reports: a busy
+// store or a spent budget is a read to retry, anything else an unknown layout.
+func openCodeSQLiteElectionErr(ctx context.Context, err error) error {
+	if ctx.Err() != nil || isOpenCodeSQLiteBusy(err) {
+		return err
+	}
+	return errOpenCodeDirectLayoutUnknown
+}
+
+// isOpenCodeSQLiteBusy reports an error OpenCode's own writer caused by holding
+// a lock past the busy timeout.
+func isOpenCodeSQLiteBusy(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code() & 0xff { // the primary code of an extended one
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	}
+	return false
+}
+
+// openCodeSQLiteTables is the set of the store's table names.
+func openCodeSQLiteTables(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables[name] = true
+	}
+	return tables, rows.Err()
+}
+
+// openCodeSQLiteNewestHead is the newest session head write in table, 0 when
+// it is empty.
+func openCodeSQLiteNewestHead(ctx context.Context, db *sql.DB, table string) (int64, error) {
+	var ms int64
+	err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COALESCE(MAX(time_updated), 0) FROM %q`, table)).Scan(&ms)
+	return ms, err
+}
+
+// openCodeSQLiteHasColumns reports whether table lists every column in want.
+func openCodeSQLiteHasColumns(ctx context.Context, db *sql.DB, table string, want []string) (bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)
+	if err != nil {
+		return false, err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil {
+			have[name] = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, column := range want {
+		if !have[column] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// checkOpenCodeSQLiteSchema fails closed unless every V1 table lists every
+// column the V1 reader needs.
 func checkOpenCodeSQLiteSchema(ctx context.Context, db *sql.DB) error {
 	for table, want := range openCodeSQLiteColumns {
-		rows, err := db.QueryContext(ctx, "SELECT name FROM pragma_table_info(?)", table)
+		ok, err := openCodeSQLiteHasColumns(ctx, db, table, want)
 		if err != nil {
 			return err
 		}
-		have := map[string]bool{}
-		for rows.Next() {
-			var name string
-			if rows.Scan(&name) == nil {
-				have[name] = true
-			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		for _, column := range want {
-			if !have[column] {
-				return errOpenCodeDirectLayoutUnknown
-			}
+		if !ok {
+			return errOpenCodeDirectLayoutUnknown
 		}
 	}
 	return nil
+}
+
+/* --------------------------------------------------------------------------
+   One session's usage, for an owed debt
+   -------------------------------------------------------------------------- */
+
+// openCodeStoreSessionQuery is one owed debt's turn: the session's assistant
+// messages created in [FromMs, ToMs]. ToMs 0 has no fixed end; UntilIdle ends
+// the turn at the session's first V2 idle row created at or after FromMs too.
+// A read with neither bound reads nothing (Unbounded): it would pay later turns
+// of a resumed session.
+type openCodeStoreSessionQuery struct {
+	SessionID string
+	FromMs    int64
+	ToMs      int64
+	UntilIdle bool
+}
+
+// openCodeStoreSessionRead is what the store says about one debt's turn.
+type openCodeStoreSessionRead struct {
+	// Layout is the family read; "" when there is no SQLite store to read.
+	Layout string
+	// Steps are the turn's complete messages, keyed as the export keys them.
+	Steps []openCodeUsageStep
+	// Incomplete: a message in the turn has no completed time yet.
+	Incomplete bool
+	// Truncated: a cap or the budget stopped the read before the turn's end.
+	Truncated bool
+	// Unbounded: the turn has no end to read up to yet.
+	Unbounded bool
+}
+
+// readOpenCodeStoreSessionUsage reads one debt's turn from opencode.db, under
+// the same read-only open, family election and caps as a scan. Each message is
+// keyed sha256(session, "message:"+id) — the export's key — so the store and
+// the export cannot pay one message twice. A JSON or absent store, and every
+// read while the reader is off (tests), answer Layout "".
+func readOpenCodeStoreSessionUsage(ctx context.Context, root string, q openCodeStoreSessionQuery) (openCodeStoreSessionRead, error) {
+	var out openCodeStoreSessionRead
+	if !openCodeDirectScanEnabled || root == "" {
+		return out, nil
+	}
+	db, err := openOpenCodeSQLite(root)
+	if err != nil {
+		return out, err
+	}
+	defer db.Close()
+	family, err := openCodeSQLiteFamily(ctx, db)
+	if err != nil {
+		return out, err
+	}
+	out.Layout = family.Layout
+	toMs := q.ToMs
+	if q.UntilIdle && family.Layout == openCodeStoreLayoutSQLiteV2 {
+		idleMs, err := openCodeSQLiteV2FirstIdle(ctx, db, q.SessionID, q.FromMs)
+		if err != nil {
+			return out, err
+		}
+		toMs = minNonZero(toMs, idleMs)
+	}
+	if toMs == 0 {
+		out.Unbounded = true
+		return out, nil
+	}
+	read := openCodeDirectRead{Layout: family.Layout}
+	limits := openCodeDirectLimits{MaxSessions: 1, MaxRecords: openCodeDirectMaxRecords, MaxRecordBytes: openCodeDirectMaxRecordBytes}
+	// A message is last written no earlier than it was created, so the floor
+	// keeps every message of the turn; later turns are dropped below.
+	if err := family.Messages(ctx, db, []any{q.SessionID}, q.FromMs, limits, &read); err != nil {
+		return out, err
+	}
+	out.Truncated = read.Truncated
+	for _, m := range read.Messages {
+		if m.CreatedMs < q.FromMs || m.CreatedMs > toMs {
+			continue
+		}
+		if m.CompletedMs == 0 {
+			out.Incomplete = true
+			continue
+		}
+		if !m.Valid {
+			continue
+		}
+		step := m.Usage
+		step.AtMs = m.CompletedMs
+		step.Key = openCodeUsageStepKey(q.SessionID, "message:"+m.ID)
+		out.Steps = append(out.Steps, step)
+	}
+	return out, nil
 }
