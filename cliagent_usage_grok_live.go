@@ -899,8 +899,28 @@ func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refu
 // recoverGrokUsageGeneration runs startup recovery, hinting a recovered
 // generation and retrying a refused rotation on grokRecoveryLadder — startup
 // asks only once.
-func recoverGrokUsageGeneration(attempt int) {
+func recoverGrokUsageGeneration(attempt int) { recoverGrokUsageGenerationFor(attempt, "") }
+
+// recoverGrokUsageGenerationFor is recoverGrokUsageGeneration bound to the
+// account the pending recovery belongs to (empty on the first pass). A
+// recovery that waits — for a write the lock refused, or for a future-dated
+// figure to become trusted — can only be hinted while that account is still
+// signed in: a hint sent under another login spends the generation's attempts
+// on refreshes whose receipt cannot carry it. So while the bound account is
+// away the chain neither hints nor ends. It re-checks on the withheld cadence,
+// without spending a ladder attempt, for as long as the cache still holds that
+// account's reading, and ends as soon as another account's read commits over
+// it (that commit hints its own generation).
+func recoverGrokUsageGenerationFor(attempt int, bound string) {
 	now := grokUsageFreshnessNow()
+	if bound != "" && grokUsageCurrentFingerprint() != bound {
+		if _, ok := loadGrokBillingLive(bound, now); ok {
+			grokRecoveryAfterFunc(grokRecoveryWithheldMaxWait, func() {
+				recoverGrokUsageGenerationFor(attempt, bound)
+			})
+		}
+		return
+	}
 	g, refused := grokRecoveryGeneration(now)
 	if g != nil {
 		noteCLIUsageObservationAdvanced(grokUsageProvider, *g)
@@ -908,12 +928,16 @@ func recoverGrokUsageGeneration(attempt int) {
 	if !refused {
 		return
 	}
+	// Whatever this recovery still owes, it owes for the account it just read.
+	bound = grokUsageCurrentFingerprint()
 	// A figure withheld as future-dated is not a failed write: it renders only
 	// once the clock reaches it, which can be long after the ladder's last
 	// rung. Wait for that moment without spending an attempt, so the rotated
 	// generation is still hinted once the figure becomes trusted.
 	if wait := grokRecoveryWithheldWait(now); wait > 0 {
-		grokRecoveryAfterFunc(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() { recoverGrokUsageGeneration(attempt) })
+		grokRecoveryAfterFunc(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() {
+			recoverGrokUsageGenerationFor(attempt, bound)
+		})
 		return
 	}
 	delay, more := refreshRetryDelayForAttempt(attempt, grokRecoveryMaxAttempts, grokRecoveryLadder)
@@ -921,7 +945,7 @@ func recoverGrokUsageGeneration(attempt int) {
 		fmt.Printf("%s[cli-usage] grok refresh: recovery_abandoned%s\n", colorYellow, colorReset)
 		return
 	}
-	grokRecoveryAfterFunc(delay, func() { recoverGrokUsageGeneration(attempt + 1) })
+	grokRecoveryAfterFunc(delay, func() { recoverGrokUsageGenerationFor(attempt+1, bound) })
 }
 
 // grokRecoveryWithheldWait is how long the signed-in account's live cache

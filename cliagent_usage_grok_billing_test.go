@@ -1361,3 +1361,69 @@ func TestGrokRecovery_RetriesAPoolOnlyFutureDatedCache(t *testing.T) {
 		t.Fatalf("recovery = %+v refused=%t, want {8135,1} hinted once the pool renders", g, refused)
 	}
 }
+
+// A recovery still waiting for a future-dated figure survives a temporary
+// account switch: it neither hints under the other login — whose receipt
+// could not carry this generation — nor ends the chain, so the reading is
+// still hinted once its own account is back.
+func TestGrokRecovery_KeepsAWithheldRecoveryAliveAcrossAnAccountSwitch(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8138)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8139)
+	// The old process's commit hinted its own generation; start clean.
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var booked []time.Duration
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		booked, next = append(booked, d), f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+	pending := func() *cliUsagePendingHint {
+		cliUsagePropagator.mu.Lock()
+		defer cliUsagePropagator.mu.Unlock()
+		return cliUsagePropagator.pending[grokUsageProvider]
+	}
+
+	recoverGrokUsageGeneration(1)
+	if len(booked) != 1 || booked[0] != grokRecoveryWithheldMaxWait {
+		t.Fatalf("booked %v, want one capped wait for the withheld pool", booked)
+	}
+
+	// bob signs in before the wait is out: ada's rotated generation is not
+	// hintable under his login, and the clock has not caught up either.
+	h.signIn("fp-bob")
+	h.advance(booked[0])
+	fire := next
+	next = nil
+	fire()
+	if p := pending(); p != nil {
+		t.Fatalf("pending = %+v, want no hint for ada's generation under bob's login", p)
+	}
+	if len(booked) != 2 || booked[1] != grokRecoveryWithheldMaxWait {
+		t.Fatalf("booked %v, want the recovery kept alive while ada is away", booked)
+	}
+
+	// ada is back and the pool's stamp is now in the past.
+	h.signIn("fp-ada")
+	h.advance(2 * time.Hour)
+	fire = next
+	next = nil
+	fire()
+	if p := pending(); p == nil || p.generation != gen(8139, 1) {
+		t.Fatalf("pending = %+v, want {8139,1} hinted once ada is back and the pool renders", p)
+	}
+	if next != nil {
+		t.Fatalf("booked %v, want no retry after the hint", booked)
+	}
+}
