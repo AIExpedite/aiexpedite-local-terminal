@@ -1811,14 +1811,25 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 // the figure once the clock catches up and it renders again, with no commit
 // left to version it.
 func grokBillingValueWithheld(snap grokBillingSnapshot, now time.Time) bool {
+	return grokBillingWithheldFor(snap, now) > 0
+}
+
+// grokBillingWithheldFor is how long grokBillingValueWithheld stays true for
+// snap as the clock runs on from now: the wait until its furthest-ahead figure
+// falls inside grokBillingMaxClockSkew and renders. Zero when nothing is
+// withheld.
+func grokBillingWithheldFor(snap grokBillingSnapshot, now time.Time) time.Duration {
 	if !snap.HasUsedPercent && !snap.HasOnDemand {
-		return false
+		return 0
 	}
-	trustedThrough := now.Add(grokBillingMaxClockSkew)
-	if snap.ObservedAt.After(trustedThrough) {
-		return true
+	newest := snap.ObservedAt
+	if snap.HasOnDemand && snap.onDemandObservedAt().After(newest) {
+		newest = snap.onDemandObservedAt()
 	}
-	return snap.HasOnDemand && snap.onDemandObservedAt().After(trustedThrough)
+	if wait := newest.Sub(now.Add(grokBillingMaxClockSkew)); wait > 0 {
+		return wait
+	}
+	return 0
 }
 
 // grokBillingMetricsNumeric reports whether any rendered pool carries numbers

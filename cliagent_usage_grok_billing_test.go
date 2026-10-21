@@ -1262,6 +1262,71 @@ func TestGrokRecovery_WithholdsAHintWhileAPoolIsFutureDated(t *testing.T) {
 	}
 }
 
+// A figure stamped further ahead than the retry ladder reaches must keep
+// recovery alive until it becomes trusted: the withheld waits follow the
+// figure's own time (capped per wait) and spend no ladder attempt, so the
+// rotated generation is still hinted once the pool renders.
+func TestGrokRecovery_WaitsOutAFutureOffsetLongerThanTheLadder(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8136)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8137)
+	// The old process's commit hinted its own generation; start clean.
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var booked []time.Duration
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		booked, next = append(booked, d), f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+	pending := func() *cliUsagePendingHint {
+		cliUsagePropagator.mu.Lock()
+		defer cliUsagePropagator.mu.Unlock()
+		return cliUsagePropagator.pending[grokUsageProvider]
+	}
+
+	recoverGrokUsageGeneration(1)
+	// The pool is trusted 55 minutes from now: one capped wait, then the rest.
+	want := []time.Duration{grokRecoveryWithheldMaxWait}
+	if len(booked) != 1 || booked[0] != want[0] {
+		t.Fatalf("booked %v, want %v", booked, want)
+	}
+	if pending() != nil {
+		t.Fatal("hinted a generation whose pool is still withheld")
+	}
+	h.advance(booked[0])
+	fire := next
+	next = nil
+	fire()
+	if len(booked) != 2 || booked[1] != 25*time.Minute+time.Second {
+		t.Fatalf("booked %v, want the remaining 25m1s wait", booked)
+	}
+	if pending() != nil {
+		t.Fatal("hinted a generation whose pool is still withheld")
+	}
+
+	h.advance(booked[1])
+	fire = next
+	next = nil
+	fire()
+	if p := pending(); p == nil || p.generation != gen(8137, 1) {
+		t.Fatalf("pending = %+v, want {8137,1} hinted once the pool renders", p)
+	}
+	if next != nil {
+		t.Fatalf("booked %v, want no retry after the hint", booked)
+	}
+}
+
 // The same rule must reach a cache whose ONLY figure is the future-dated pool:
 // it renders Unknown on its own, so the metrics gate must not skip it, or
 // nothing is rotated, no retry is armed, and the generation stays unhintable

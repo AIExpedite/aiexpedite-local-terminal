@@ -852,6 +852,9 @@ var (
 	grokRecoveryLadder      = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute}
 	grokRecoveryMaxAttempts = len(grokRecoveryLadder) + 1
 	grokRecoveryAfterFunc   = time.AfterFunc
+	// grokRecoveryWithheldMaxWait caps one wait for a withheld figure, so a
+	// clock corrected again while waiting is re-read rather than slept past.
+	grokRecoveryWithheldMaxWait = 30 * time.Minute
 )
 
 // grokRecoveryGeneration is the rotated generation of a live cache that still
@@ -897,11 +900,20 @@ func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refu
 // generation and retrying a refused rotation on grokRecoveryLadder — startup
 // asks only once.
 func recoverGrokUsageGeneration(attempt int) {
-	g, refused := grokRecoveryGeneration(grokUsageFreshnessNow())
+	now := grokUsageFreshnessNow()
+	g, refused := grokRecoveryGeneration(now)
 	if g != nil {
 		noteCLIUsageObservationAdvanced(grokUsageProvider, *g)
 	}
 	if !refused {
+		return
+	}
+	// A figure withheld as future-dated is not a failed write: it renders only
+	// once the clock reaches it, which can be long after the ladder's last
+	// rung. Wait for that moment without spending an attempt, so the rotated
+	// generation is still hinted once the figure becomes trusted.
+	if wait := grokRecoveryWithheldWait(now); wait > 0 {
+		grokRecoveryAfterFunc(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() { recoverGrokUsageGeneration(attempt) })
 		return
 	}
 	delay, more := refreshRetryDelayForAttempt(attempt, grokRecoveryMaxAttempts, grokRecoveryLadder)
@@ -910,6 +922,16 @@ func recoverGrokUsageGeneration(attempt int) {
 		return
 	}
 	grokRecoveryAfterFunc(delay, func() { recoverGrokUsageGeneration(attempt + 1) })
+}
+
+// grokRecoveryWithheldWait is how long the signed-in account's live cache
+// keeps a figure withheld as future-dated (grokBillingWithheldFor), or zero.
+func grokRecoveryWithheldWait(now time.Time) time.Duration {
+	view, ok := loadGrokBillingLive(grokUsageCurrentFingerprint(), now)
+	if !ok {
+		return 0
+	}
+	return grokBillingWithheldFor(view.snap, now)
 }
 
 // grokBillingLiveView is one read of the cache for an account.
