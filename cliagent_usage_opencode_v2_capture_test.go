@@ -275,15 +275,45 @@ func TestOpenCodeStoreDebtOutcome_MapsEveryRead(t *testing.T) {
 		{openCodeStoreSessionRead{}, errOpenCodeDirectLayoutUnknown, ""},
 		{openCodeStoreSessionRead{}, context.DeadlineExceeded, "store_deferred_truncated"},
 		{openCodeStoreSessionRead{}, fmt.Errorf("database is locked"), "store_deferred_busy"},
-		{openCodeStoreSessionRead{Layout: v2, Steps: paying, Incomplete: true}, nil, "store_paid"},
-		{openCodeStoreSessionRead{Layout: v2, Unbounded: true}, nil, "store_deferred_unbounded"},
-		{openCodeStoreSessionRead{Layout: v2, Truncated: true}, nil, "store_deferred_truncated"},
-		{openCodeStoreSessionRead{Layout: v2, Incomplete: true}, nil, "store_deferred_incomplete"},
-		{openCodeStoreSessionRead{Layout: v2}, nil, "store_empty"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Steps: paying, Incomplete: true}, nil, "store_paid"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Unbounded: true}, nil, "store_deferred_unbounded"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Truncated: true}, nil, "store_deferred_truncated"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true, Incomplete: true}, nil, "store_deferred_incomplete"},
+		{openCodeStoreSessionRead{Layout: v2, SessionKnown: true}, nil, "store_empty"},
+		{openCodeStoreSessionRead{Layout: v2}, nil, ""}, // a session V2 never wrote
 	} {
 		if got := openCodeStoreDebtOutcome(tc.store, tc.err); got != tc.want {
 			t.Errorf("outcome(%+v, %v) = %q, want %q", tc.store, tc.err, got, tc.want)
 		}
+	}
+}
+
+// A debt owed before the upgrade names a session only the V1 tables hold: the
+// V2 store cannot speak for it, so it spends no attempt and the export pays.
+func TestOpenCodeV2_ADebtFromBeforeTheUpgradeIsLeftToTheExport(t *testing.T) {
+	sched, store, clock, _ := openCodeV2Fixture(t, 4010)
+	stubOpenCodeExecutable(t)
+	var paidAt time.Time
+	exports := stubOpenCodeExport(t, func(_ context.Context, sessionID string) ([]byte, bool) {
+		return openCodeExportJSON("msg_v1era", paidAt.UnixMilli(), 21, 0, 0), true
+	})
+	store.assistant("ses_other", "msg_other", clock.ms(-time.Hour), clock.ms(-time.Hour+time.Second), 1, 0, 0, 0)
+	run := armOpenCodeUsageRun("opencode", "", "fp-v2")
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_v1era"}`)
+	openCodeUsageInFlight.Wait()
+	clock.now = clock.now.Add(time.Second)
+	paidAt = clock.now.Add(-500 * time.Millisecond)
+	settleOpenCodeUsageRun(run, "")
+
+	sched.fireNext()
+	if *exports != 1 {
+		t.Fatalf("the export ran %d times, want once", *exports)
+	}
+	if b, _, _ := openCodeUsageBucketForDay("fp-v2", clock.now); b.tokens() != 21 {
+		t.Fatalf("bucket = %+v, want the exported 21", b)
+	}
+	if d := openCodeDebtOf(t, run.id); d != nil {
+		t.Fatalf("debt = %+v after the export paid", d)
 	}
 }
 

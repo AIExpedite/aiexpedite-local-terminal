@@ -958,8 +958,9 @@ func readOpenCodeStoreDebtUsage(ctx context.Context, ledger *openCodeUsageLedger
 }
 
 // openCodeStoreDebtOutcome is what a store read means for a debt: store_paid;
-// store_empty, a whole V2 read that found nothing; "" when the export decides
-// (no SQLite store, an unknown one, or a V1 family that paid nothing); or the
+// store_empty, a whole V2 read of the debt's session that found nothing; ""
+// when the export decides (no SQLite store, an unknown one, a V1 family that
+// paid nothing, or a V2 store without the session); or the
 // label of a read to retry without spending an attempt.
 func openCodeStoreDebtOutcome(store openCodeStoreSessionRead, err error) string {
 	switch {
@@ -971,7 +972,9 @@ func openCodeStoreDebtOutcome(store openCodeStoreSessionRead, err error) string 
 		return "store_deferred_busy"
 	case openCodeUsageStepsCarryUsage(store.Steps):
 		return "store_paid"
-	case store.Layout != openCodeStoreLayoutSQLiteV2:
+	case store.Layout != openCodeStoreLayoutSQLiteV2 || !store.SessionKnown:
+		// A V2 store that never saw the session (a debt owed before the
+		// upgrade) cannot speak for it: the export decides, as before.
 		return ""
 	case store.Unbounded:
 		return "store_deferred_unbounded"

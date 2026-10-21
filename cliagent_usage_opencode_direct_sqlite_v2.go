@@ -77,10 +77,12 @@ func openCodeSQLiteV2Candidate(ctx context.Context, db *sql.DB, tables map[strin
 			continue
 		}
 		ok, err := openCodeSQLiteHasColumns(ctx, db, heads, openCodeSQLiteV2Columns["heads"])
-		if err != nil || !ok {
+		if err != nil {
 			return "", err
 		}
-		return heads, nil
+		if ok {
+			return heads, nil
+		}
 	}
 	return "", nil
 }

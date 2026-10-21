@@ -168,6 +168,10 @@ CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, seq
 		"heads without time_updated": `
 CREATE TABLE session_v2 (id text PRIMARY KEY, updated integer NOT NULL);
 CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`,
+		// A session_message this reader cannot read is V2 in an unknown shape:
+		// the frozen V1 tables beside it are never elected instead.
+		"unknown V2 beside frozen V1": openCodeSQLiteTestSchema + `
+CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, kind text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`,
 		// A V1 store whose message table was dropped is not V2: it has no
 		// session_message.
 		"v1 without message": `
@@ -204,6 +208,23 @@ func TestOpenCodeDirectSQLiteV2_PreReleaseHeadsInSessionReadAsV2(t *testing.T) {
 	}
 	if read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Messages) != 1 || read.Messages[0].ID != "msg_v2" {
 		t.Fatalf("read = %+v, want the V2 message only", read)
+	}
+}
+
+// A session_v2 this reader cannot read does not hide a usable pre-release
+// session heads table: the next heads table is tried.
+func TestOpenCodeDirectSQLiteV2_AnUnusableHeadsTableFallsBackToTheNext(t *testing.T) {
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, `
+CREATE TABLE session (id text PRIMARY KEY, project_id text NOT NULL, slug text NOT NULL, directory text NOT NULL, title text NOT NULL, version text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL);
+CREATE TABLE session_v2 (id text PRIMARY KEY, updated integer NOT NULL);
+CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL);`)
+	store := &openCodeV2TestStore{t: t, db: db, heads: "session", seq: map[string]int{}}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	store.assistant("ses_a", "msg_a", base, base+10, 6, 0, 0, 0)
+	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
+	if err != nil || read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Messages) != 1 {
+		t.Fatalf("read = %+v, %v, want V2 through the session heads", read, err)
 	}
 }
 

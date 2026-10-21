@@ -323,10 +323,12 @@ func openCodeDirectScanOnRefresh(ctx context.Context) string {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < openCodeDirectClickBudget {
 		return liveProbeOutcomeNotMerged
 	}
-	// The debts share the click's budget with the scan.
+	// One click budget, one deadline: the scan gets what is left of it, and the
+	// debts what the scan leaves.
 	ctx, cancel := context.WithTimeout(ctx, openCodeDirectClickBudget)
 	defer cancel()
-	scanned := openCodeDirectScanShared(openCodeDirectClickBudget) == "direct_scanned"
+	deadline, _ := ctx.Deadline()
+	scanned := openCodeDirectScanShared(time.Until(deadline)) == "direct_scanned"
 	paid := payOwedOpenCodeUsageFromStore(ctx, openCodeUsageMaxDebts)
 	if !scanned && paid == 0 {
 		return liveProbeOutcomeNotMerged

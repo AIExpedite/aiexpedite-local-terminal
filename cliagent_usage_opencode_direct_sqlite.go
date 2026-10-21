@@ -308,6 +308,12 @@ func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (openCodeSQLiteFamily
 	if err != nil {
 		return v1, openCodeSQLiteElectionErr(ctx, err)
 	}
+	if hasV2 == "" && tables["session_message"] {
+		// Only V2 writes session_message: a store holding one this reader cannot
+		// read is V2 in a shape it does not know, and the V1 tables beside it
+		// are frozen. Electing them would renew coverage on stale data.
+		return v1, errOpenCodeDirectLayoutUnknown
+	}
 	v2.Heads = hasV2
 	hasV1 := false
 	if tables["session"] && tables["message"] && tables["part"] {
@@ -460,6 +466,9 @@ type openCodeStoreSessionRead struct {
 	Truncated bool
 	// Unbounded: the turn has no end to read up to yet.
 	Unbounded bool
+	// SessionKnown: the elected family's session heads hold the session. A
+	// debt from before an upgrade names a session only the other family has.
+	SessionKnown bool
 }
 
 // readOpenCodeStoreSessionUsage reads one debt's turn from opencode.db, under
@@ -482,6 +491,11 @@ func readOpenCodeStoreSessionUsage(ctx context.Context, root string, q openCodeS
 		return out, err
 	}
 	out.Layout = family.Layout
+	// One primary-key lookup: a session the family never wrote has nothing to
+	// read, and says nothing about whether the turn paid.
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE id = ?)`, family.Heads), q.SessionID).Scan(&out.SessionKnown); err != nil || !out.SessionKnown {
+		return out, err
+	}
 	toMs := q.ToMs
 	if q.UntilIdle && family.Layout == openCodeStoreLayoutSQLiteV2 {
 		idleMs, err := openCodeSQLiteV2FirstIdle(ctx, db, q.SessionID, q.FromMs)
