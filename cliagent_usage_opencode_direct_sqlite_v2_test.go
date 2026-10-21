@@ -462,3 +462,38 @@ func TestOpenCodeStoreSessionUsage_ReadsOneTurn(t *testing.T) {
 		t.Fatalf("unbounded read = %+v, %v, want nothing read", read, err)
 	}
 }
+
+// A debt's read follows its session, not the store-wide election: a V1 client
+// writing after a managed V2 run wins the election, yet the run's turn is still
+// read from V2; a V1-era session is still found in V1.
+func TestOpenCodeStoreSessionUsage_ReadsTheFamilyThatHoldsTheSession(t *testing.T) {
+	prevEnabled := openCodeDirectScanEnabled
+	openCodeDirectScanEnabled = true
+	t.Cleanup(func() { openCodeDirectScanEnabled = prevEnabled })
+	root := t.TempDir()
+	db := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema+openCodeSQLiteV2TestSchema)
+	v2 := &openCodeV2TestStore{t: t, db: db, heads: "session_v2", seq: map[string]int{}}
+	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
+	v2.assistant("ses_v2", "msg_v2", base+10, base+20, 30, 4, 0, 0.02)
+	v2.idle("ses_v2", "idle_v2", base+30)
+	insertOpenCodeSQLiteMessage(t, db, "ses_v1", "msg_v1", base+100, base+110, base+110, [][3]int64{{7, 0, 0}}, 0)
+
+	if read, err := readOpenCodeDirectSQLite(context.Background(), root, 0, openCodeDirectTestLimits()); err != nil || read.Layout != openCodeStoreLayoutSQLite {
+		t.Fatalf("election = %q, %v, want V1 as the newest writer", read.Layout, err)
+	}
+	read, err := readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_v2", FromMs: base, ToMs: base + 30})
+	if err != nil || !read.SessionKnown || read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Steps) != 1 || read.Steps[0].Input != 30 {
+		t.Fatalf("V2 debt read = %+v, %v, want the V2 turn", read, err)
+	}
+	if got := openCodeStoreDebtOutcome(read, err); got != "store_paid" {
+		t.Fatalf("outcome = %q, want store_paid", got)
+	}
+	read, err = readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_v1", FromMs: base + 100, ToMs: base + 200})
+	if err != nil || !read.SessionKnown || read.Layout != openCodeStoreLayoutSQLite {
+		t.Fatalf("V1 debt read = %+v, %v, want the V1 family", read, err)
+	}
+	read, err = readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_none", FromMs: base, ToMs: base + 200})
+	if err != nil || read.SessionKnown || read.Layout != openCodeStoreLayoutSQLite {
+		t.Fatalf("unknown session read = %+v, %v, want the elected family, session unknown", read, err)
+	}
+}

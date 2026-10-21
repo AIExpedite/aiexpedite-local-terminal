@@ -139,7 +139,7 @@ func readOpenCodeDirectSQLite(ctx context.Context, root string, floorMs int64, l
 	}
 	defer db.Close()
 
-	family, err := openCodeSQLiteFamily(ctx, db)
+	family, _, err := openCodeSQLiteFamily(ctx, db)
 	if err != nil {
 		return read, err
 	}
@@ -297,22 +297,24 @@ func openCodeSQLitePlaceholders(n int) string {
 // comes from; the scan logs direct_family_suppressed when the other one was
 // written since local midnight too, since its spend goes uncounted. Neither, or
 // a query that fails for any reason but a busy store or the budget, fails closed.
-func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (openCodeSQLiteFamilyRead, error) {
+// other is the losing candidate on distinct heads (Layout "" when there is
+// none): a debt's read probes it for a session the elected family lacks.
+func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (elected, other openCodeSQLiteFamilyRead, err error) {
 	v1 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLite, Heads: "session", Messages: readOpenCodeSQLiteV1Messages}
 	v2 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLiteV2, Messages: readOpenCodeSQLiteV2Messages}
 	tables, err := openCodeSQLiteTables(ctx, db)
 	if err != nil {
-		return v1, openCodeSQLiteElectionErr(ctx, err)
+		return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
 	}
 	hasV2, err := openCodeSQLiteV2Candidate(ctx, db, tables)
 	if err != nil {
-		return v1, openCodeSQLiteElectionErr(ctx, err)
+		return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
 	}
 	if hasV2 == "" && tables["session_message"] {
 		// Only V2 writes session_message: a store holding one this reader cannot
 		// read is V2 in a shape it does not know, and the V1 tables beside it
 		// are frozen. Electing them would renew coverage on stale data.
-		return v1, errOpenCodeDirectLayoutUnknown
+		return v1, openCodeSQLiteFamilyRead{}, errOpenCodeDirectLayoutUnknown
 	}
 	v2.Heads = hasV2
 	hasV1 := false
@@ -321,32 +323,32 @@ func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (openCodeSQLiteFamily
 		case err == nil:
 			hasV1 = true
 		case !errors.Is(err, errOpenCodeDirectLayoutUnknown):
-			return v1, openCodeSQLiteElectionErr(ctx, err)
+			return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
 		}
 	}
 	switch {
 	case v2.Heads == "" && !hasV1:
-		return v1, errOpenCodeDirectLayoutUnknown
+		return v1, openCodeSQLiteFamilyRead{}, errOpenCodeDirectLayoutUnknown
 	case v2.Heads == "":
-		return v1, nil
+		return v1, openCodeSQLiteFamilyRead{}, nil
 	case !hasV1 || v2.Heads == v1.Heads:
-		return v2, nil
+		return v2, openCodeSQLiteFamilyRead{}, nil
 	}
 	v1Ms, err := openCodeSQLiteNewestHead(ctx, db, v1.Heads)
 	if err != nil {
-		return v1, openCodeSQLiteElectionErr(ctx, err)
+		return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
 	}
 	v2Ms, err := openCodeSQLiteNewestHead(ctx, db, v2.Heads)
 	if err != nil {
-		return v1, openCodeSQLiteElectionErr(ctx, err)
+		return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
 	}
 	if midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli(); v1Ms >= midnight && v2Ms >= midnight {
 		logOpenCodeUsageCapture("direct_family_suppressed")
 	}
 	if v1Ms > v2Ms {
-		return v1, nil
+		return v1, v2, nil
 	}
-	return v2, nil
+	return v2, v1, nil
 }
 
 // openCodeSQLiteElectionErr is what a failed election query reports: a busy
@@ -466,8 +468,10 @@ type openCodeStoreSessionRead struct {
 	Truncated bool
 	// Unbounded: the turn has no end to read up to yet.
 	Unbounded bool
-	// SessionKnown: the elected family's session heads hold the session. A
-	// debt from before an upgrade names a session only the other family has.
+	// SessionKnown: a family's session heads hold the session — the elected
+	// one, else the other: a V1 client writing after a managed V2 run wins
+	// the election without holding that run's session. A debt from before an
+	// upgrade names a session only V1 has.
 	SessionKnown bool
 }
 
@@ -486,15 +490,30 @@ func readOpenCodeStoreSessionUsage(ctx context.Context, root string, q openCodeS
 		return out, err
 	}
 	defer db.Close()
-	family, err := openCodeSQLiteFamily(ctx, db)
+	family, other, err := openCodeSQLiteFamily(ctx, db)
 	if err != nil {
 		return out, err
 	}
-	out.Layout = family.Layout
-	// One primary-key lookup: a session the family never wrote has nothing to
-	// read, and says nothing about whether the turn paid.
-	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE id = ?)`, family.Heads), q.SessionID).Scan(&out.SessionKnown); err != nil || !out.SessionKnown {
-		return out, err
+	// One primary-key lookup per family: the election follows the newest
+	// write store-wide, but the debt's turn lives in whichever family wrote
+	// its session. A session neither wrote has nothing to read, and says
+	// nothing about whether the turn paid.
+	for _, f := range []openCodeSQLiteFamilyRead{family, other} {
+		if f.Layout == "" {
+			continue
+		}
+		out.Layout = f.Layout
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE id = ?)`, f.Heads), q.SessionID).Scan(&out.SessionKnown); err != nil {
+			return out, err
+		}
+		if out.SessionKnown {
+			family = f
+			break
+		}
+	}
+	if !out.SessionKnown {
+		out.Layout = family.Layout
+		return out, nil
 	}
 	toMs := q.ToMs
 	if q.UntilIdle && family.Layout == openCodeStoreLayoutSQLiteV2 {
