@@ -1051,3 +1051,57 @@ func TestGrokRunDebt_ARungClaimRefusedByTheFreshnessLockIsPaidOnceReleased(t *te
 		t.Fatalf("reads = %d state=%+v, want the retried claim to pay the debt once", h.reads.Load(), h.state())
 	}
 }
+
+// The charge for a finished read must land: when another process's lock
+// refuses it, the attempt (and the rung the ladder owes) is retried until it
+// does, so a failed billing request is never left uncharged — which would let
+// the four-read budget be overspent.
+func TestGrokRunDebt_AReadChargeRefusedByTheFreshnessLockLandsOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	now := h.clock()
+	h.write(grokUsageFreshness{
+		OwedAtMs: now.UnixMilli(), CompletionMs: now.UnixMilli(), AccountFingerprint: "fp-ada",
+	})
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	release := holdGrokFreshnessLock(t)
+
+	if _, retry := grokPayRunDebtPass(false); retry != grokRetryNone {
+		t.Fatalf("retry = %v, want nothing booked against an uncharged state", retry)
+	}
+	if h.reads.Load() != 1 || h.state().Attempts != 0 {
+		t.Fatalf("reads = %d state=%+v, want the read sent and nothing charged while locked", h.reads.Load(), h.state())
+	}
+
+	release()
+	h.idle()
+	got := h.state()
+	if got.Attempts != 1 || got.LastOutcome != grokLiveOutcomeHTTPError {
+		t.Fatalf("state = %+v, want the read charged once released", got)
+	}
+	if got.NextAttemptAtMs == 0 || !grokRunDebtRetryPending() {
+		t.Fatalf("state = %+v pending=%t, want the rung booked and armed with the charge", got, grokRunDebtRetryPending())
+	}
+}
+
+// Startup adoption must land too: a run the previous process was cut off in
+// leaves a floor with no debt, and the state on disk under another process's
+// lock is not that adoption — so it is retried rather than read as "nothing
+// owed", which would leave the run unpaid.
+func TestGrokRunDebt_AnAdoptionRefusedByTheFreshnessLockIsPaidOnceReleased(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.write(grokUsageFreshness{
+		RunFloorMs: h.clock().Add(-time.Minute).UnixMilli(), RunFloorAccount: "fp-ada",
+	})
+	release := holdGrokFreshnessLock(t)
+
+	adoptAndPayOwedGrokRunDebt(h.clock())
+	if h.reads.Load() != 0 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want nothing adopted while locked", h.reads.Load(), h.state())
+	}
+
+	release()
+	h.idle()
+	if h.reads.Load() != 1 || h.state().owed() {
+		t.Fatalf("reads = %d state=%+v, want the inherited run adopted and paid once", h.reads.Load(), h.state())
+	}
+}

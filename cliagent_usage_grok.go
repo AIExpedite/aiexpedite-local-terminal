@@ -198,8 +198,13 @@ func (p grokUsageParser) ParseContext(ctx context.Context, home string, detected
 			// Only a numeric reading — or the clear of one — the live cache
 			// committed on this process's epoch is versioned: a log-sourced
 			// metric has no generation, and one an earlier process committed
-			// may already be applied (see grokGenerationRotated).
-			if obs.source == grokObservationLive && (obs.cleared || grokBillingMetricsNumeric(metrics)) && obs.generation != nil &&
+			// may already be applied (see grokGenerationRotated). A generation
+			// also versions a figure this gather withholds as future-dated
+			// (grokBillingValueWithheld): publishing it would let the backend
+			// apply it and then keep omitting that figure once the clock
+			// catches up and it renders under the same generation.
+			if obs.source == grokObservationLive && (obs.cleared || grokBillingMetricsNumeric(metrics)) &&
+				!grokBillingValueWithheld(obs.snap, now) && obs.generation != nil &&
 				grokGenerationRotated.Load() && obs.generation.Epoch == codexProcessGenerationEpoch.Load() &&
 				obs.generation.Counter > 0 {
 				g := *obs.generation

@@ -1802,6 +1802,25 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	return metrics
 }
 
+// grokBillingValueWithheld reports a snapshot carrying a figure that
+// grokBillingMetrics suppresses because its own observation time is further
+// ahead than grokBillingMaxClockSkew allows — the whole record, or just the
+// on-demand pool under a trusted percentage. A capture generation versions
+// every figure the cache holds, so publishing it while one of them is
+// withheld would let the backend apply that generation and then keep omitting
+// the figure once the clock catches up and it renders again, with no commit
+// left to version it.
+func grokBillingValueWithheld(snap grokBillingSnapshot, now time.Time) bool {
+	if !snap.HasUsedPercent && !snap.HasOnDemand {
+		return false
+	}
+	trustedThrough := now.Add(grokBillingMaxClockSkew)
+	if snap.ObservedAt.After(trustedThrough) {
+		return true
+	}
+	return snap.HasOnDemand && snap.onDemandObservedAt().After(trustedThrough)
+}
+
 // grokBillingMetricsNumeric reports whether any rendered pool carries numbers
 // — the credits percentage or the on-demand pool. Either is a reading the card
 // shows, so either is what a capture generation versions.

@@ -846,7 +846,8 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		outcome = grokRefreshOutcomeUnmetered
 	}
 	id := state.debtID()
-	booked := updateGrokUsageFreshness(func(s *grokUsageFreshness) {
+	grokLastRefreshOutcome.Store(outcome)
+	charge := func(s *grokUsageFreshness) {
 		s.LastAttemptAtMs = grokUsageFreshnessNow().UnixMilli()
 		if s.debtID() != id {
 			// Paid (an ok that landed through the shared flight) or replaced
@@ -862,18 +863,38 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 		if grokOutcomeSpendsBudget(outcome) && s.Attempts < grokRunDebtMaxAttempts {
 			s.Attempts++
 		}
-	})
+	}
+	booked, committed := grokUsageFreshnessTxn(charge)
+	if !committed {
+		// Refused by another process's lock: this read must still be charged,
+		// or the four-read budget is overspent and an auth refusal never
+		// idles the debt. The whole post-read decision moves onto the retry,
+		// so no rung is booked against a state this read is missing from.
+		grokRetryRefusedFreshness(charge, func(booked grokUsageFreshness) {
+			if kind := grokRecordRunDebtRead(booked, id, state.Attempts, outcome); kind != grokRetryNone {
+				grokScheduleRunDebtRetry(booked, grokUsageFreshnessNow(), kind)
+			}
+		})
+		return state, grokRetryNone
+	}
+	return booked, grokRecordRunDebtRead(booked, id, state.Attempts, outcome)
+}
+
+// grokRecordRunDebtRead logs a finished read charged against debt id and says
+// what the schedule should book next. fallbackAttempts is the count to report
+// when the debt moved on while the read was out. Split out so a charge the
+// freshness lock refused can take the same decision once it lands.
+func grokRecordRunDebtRead(booked grokUsageFreshness, id grokDebtID, fallbackAttempts int, outcome string) grokRunDebtRetryKind {
 	attempts := booked.Attempts
 	if booked.debtID() != id {
-		attempts = state.Attempts
+		attempts = fallbackAttempts
 	}
-	grokLastRefreshOutcome.Store(outcome)
 	fmt.Printf("%s[cli-usage] grok refresh: %s attempts=%d%s\n", colorCyan, outcome, attempts, colorReset)
 
 	switch outcome {
 	case grokLiveOutcomeOK:
 		// grokBillingReadOnce already retired the debt through the settle.
-		return booked, grokRetryNone
+		return grokRetryNone
 	case grokLiveOutcomeNoLogin, grokLiveOutcomeNoAccount, grokLiveOutcomeUnauthorized:
 		// The auth notice covers these. Each one spends a single attempt and
 		// books NO rung: the debt stays open but idle, so the gather's nudge
@@ -896,13 +917,13 @@ func grokPayRunDebtPass(bypassInterval bool) (grokUsageFreshness, grokRunDebtRet
 			}
 			grokRefreshWorkerMu.Unlock()
 		}
-		return booked, grokRetryNone
+		return grokRetryNone
 	case grokLiveOutcomeLoginBusy, grokLiveOutcomeWriteFailed, liveProbeOutcomeTimeout:
 		// Local conditions, or this caller stopped waiting while the shared
 		// flight goes on (its own ok still retires the debt): no budget spent.
-		return booked, grokRetryFree
+		return grokRetryFree
 	default:
-		return booked, grokRetryAfterRead
+		return grokRetryAfterRead
 	}
 }
 
@@ -1130,9 +1151,13 @@ func payOwedGrokUsageRefresh() {
 }
 
 func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
-	now := grokUsageFreshnessNow()
-	fingerprint := grokUsageCurrentFingerprint()
-	state := updateGrokUsageFreshness(func(state *grokUsageFreshness) {
+	// now and fingerprint are read inside the mutation, so a run the lock
+	// refused is adopted against the clock and the login of the attempt that
+	// lands, never the one this call started under.
+	var now time.Time
+	adopt := func(state *grokUsageFreshness) {
+		now = grokUsageFreshnessNow()
+		fingerprint := grokUsageCurrentFingerprint()
 		floorBefore := state.RunFloorMs
 		grokRebaseFutureFreshness(state, now)
 		// A floor the rebase moved was armed before a clock step back, so by
@@ -1170,7 +1195,21 @@ func adoptAndPayOwedGrokRunDebt(startedAt time.Time) {
 			return
 		}
 		grokOweRead(state, now, grokCompletionMs(now), fingerprint)
-	})
+	}
+	state, committed := grokUsageFreshnessTxn(adopt)
+	if !committed {
+		// Refused by another process's lock: the state on disk is not this
+		// adoption, so an inherited floor would read as "nothing owed" and
+		// the interrupted run would go unpaid. Adopt — and resume — once the
+		// mutation lands.
+		grokRetryRefusedFreshness(adopt, func(state grokUsageFreshness) { grokResumeAdoptedDebt(state, now) })
+		return
+	}
+	grokResumeAdoptedDebt(state, now)
+}
+
+// grokResumeAdoptedDebt re-arms (or starts) what the adopted state owes.
+func grokResumeAdoptedDebt(state grokUsageFreshness, now time.Time) {
 	if !state.owed() {
 		return
 	}

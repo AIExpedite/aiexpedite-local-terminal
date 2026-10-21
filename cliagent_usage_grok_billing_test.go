@@ -1177,3 +1177,51 @@ func TestGrokRecovery_SkipsAnotherAccountAndAnUnknownReading(t *testing.T) {
 		t.Fatalf("cache generation = %+v, want the rotation on disk", on)
 	}
 }
+
+// A pool grokBillingMetrics suppresses as future-dated must not be published
+// under a generation that versions it: the backend would apply that
+// generation and then keep omitting the pool once the clock catches up and it
+// renders again, with no commit left to version it.
+func TestGrokUsageParser_WithholdsTheGenerationWhileAPoolIsFutureDated(t *testing.T) {
+	grokLiveCacheFixture(t, 8130)
+	home := t.TempDir()
+	base := filepath.Join(home, ".grok")
+	t.Setenv("GROK_HOME", "")
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+		"email": "ada@example.com", "user_id": "acct-1",
+	})
+	fingerprint := grokAccountFingerprintFor(base)
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	end := now.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry(fingerprint, now.Add(-time.Hour), floatPtr(36), end))
+	// The next answer carries an on-demand pool and a clock an hour ahead:
+	// the percentage is kept at its own trusted time, the pool is not.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: now.Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, fingerprint))
+	if g := readGrokLiveCacheFile(t).Generation; g == nil || *g != gen(8130, 2) {
+		t.Fatalf("generation = %+v, want the pool's commit at {8130,2}", g)
+	}
+	grokGenerationRotated.Store(true)
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want the percentage alone while the pool is future-dated", usage)
+	}
+	if usage.UsageGeneration != nil {
+		t.Fatalf("usageGeneration = %+v, want none while the pool it versions is withheld", usage.UsageGeneration)
+	}
+
+	// Once the clock catches up the pool renders, and the generation that
+	// versions it is published with it.
+	later := now.Add(2 * time.Hour)
+	usage, ok = grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, later)
+	if !ok || len(usage.Metrics) != 2 || usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 20 {
+		t.Fatalf("usage = %+v, want the pool rendered once its time has passed", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(8130, 2) {
+		t.Fatalf("usageGeneration = %+v, want {8130,2} published with the pool", usage.UsageGeneration)
+	}
+}
