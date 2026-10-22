@@ -341,12 +341,16 @@ type cwdScope struct {
 	sessionID   string
 	// cwdSigned marks a frame whose `cwd` is covered by the HMAC (an env-setup
 	// step or a read-only session — exactly signatureCwd's condition). A tracked
-	// cwd must never override such a frame: `executionID` arrives UNSIGNED, so
-	// an attacker with topic-write but no key could append one to a REPLAYED
-	// signed frame without disturbing its signature, and if the signed cwd
-	// happened to equal the configured default, the substitution below would
-	// silently redirect the command to that scope's remembered directory. The
-	// signed cwd is the authority; nothing unsigned may move it.
+	// cwd must never override such a frame: the signed cwd is the authority.
+	//
+	// This was written when `executionID` arrived UNSIGNED, so that an attacker
+	// with topic-write but no key could append one to a REPLAYED signed frame
+	// without disturbing its signature. That specific hole is now closed — the
+	// id is part of the canonical, so appending one breaks the signature — but
+	// the flag is KEPT, because its rule is not only an anti-tamper measure: a
+	// legitimate run whose remembered directory differs from the cwd the owner
+	// approved must still not move an approved, disk-gated step. Removing it
+	// would change behaviour for honest commands, not just hostile ones.
 	cwdSigned bool
 }
 
@@ -814,6 +818,29 @@ type signaturePayload struct {
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
 	RiskLevel string `json:"riskLevel,omitempty"`
+	// executionId is signed for the same reason riskLevel is, and it MUST sit
+	// here — between riskLevel and cwd. Go marshals in declaration order and
+	// the Node signer appends in the order
+	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds, readOnly
+	// (hmac.util.js), so moving this line silently invalidates every signature
+	// that carries the field.
+	//
+	// WHY IT IS SIGNED. The device keys its per-execution tracked cwd on this
+	// id (cwdScope). While it arrived unsigned, an attacker with topic-write
+	// but no key could take a REPLAYED signed frame, append a victim run's
+	// execution id, and have the device resolve the command against that run's
+	// remembered directory — the signature still verified, because the field
+	// was not part of it. terminal-service #348 closed that by signing it and
+	// capability-gating the attachment; this is the device half, without which
+	// the field was never sent at all.
+	//
+	// `omitempty` on BOTH sides makes the invariant "present in frame =>
+	// present in canonical", so appending an id to a signed frame now breaks
+	// the signature instead of riding along with it. Commands that carry no
+	// execution id produce the identical canonical they did before this field
+	// existed, which is what preserves verification across the upgrade window
+	// — the same property refreshId and riskLevel rely on.
+	ExecutionID string `json:"executionId,omitempty"`
 	// cwd is signed ONLY for env-setup dispatches (riskLevel-bearing commands)
 	// and read-only session starts, mirroring the Node signer's gated branch in
 	// hmac.util.js. An env-setup clone/destructive step whose target is a
@@ -898,6 +925,9 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		Signal:    cmd.Signal,
 		RefreshID: cmd.RefreshID,
 		RiskLevel: cmd.RiskLevel,
+		// Ungated, unlike Cwd: the Node signer includes executionId whenever the
+		// command carries one, so this must too or the two canonicals diverge.
+		ExecutionID: cmd.ExecutionID,
 		// Gated to match the Node signer — see the field comment.
 		Cwd:             signatureCwd(cmd),
 		ConversationID:  cmd.ConversationID,
@@ -1029,10 +1059,17 @@ type commandMsg struct {
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
 
 	// ExecutionID scopes a one-off command's tracked cwd to the run that sent
-	// it (see the Tracked Working Directory block). UNSIGNED and OPTIONAL
-	// correlation metadata, like WorkspaceID/UID: a server that does not send
-	// it falls through to SessionID and then to the process-wide default, so
-	// its absence never refuses or changes a command.
+	// it (see the Tracked Working Directory block).
+	//
+	// SIGNED, as of this build — it is part of the signature canonical (see
+	// signaturePayload). It was previously unsigned correlation metadata like
+	// WorkspaceID/UID, and that is exactly what made it the first
+	// unauthenticated cwd selector: an attacker with topic-write but no key
+	// could append a victim run's id to a replayed signed frame. Still
+	// OPTIONAL: a server that does not send it falls through to SessionID and
+	// then to the process-wide default, so its absence never refuses or
+	// changes a command, and a command without one signs the same canonical it
+	// always did.
 	ExecutionID string `json:"executionId,omitempty"`
 
 	// Environment Setup plan attribution + risk. RiskLevel is SIGNED (see

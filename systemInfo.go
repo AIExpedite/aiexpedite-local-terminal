@@ -153,6 +153,22 @@ type capabilitiesInfo struct {
 	// read as "field absent", which means the same thing here but for a
 	// different reason, and a reader should not have to know which.
 	WorktreeBuiltIns bool `json:"worktreeBuiltIns"`
+	// SignedExecutionID (shared-constants DEVICE_COMMAND_CAPABILITIES.
+	// SIGNED_EXECUTION_ID): this build includes `executionId` in the signature
+	// canonical (signaturePayload in pubsub.go), so the field is covered by the
+	// HMAC rather than being appendable to a replayed frame.
+	//
+	// terminal-service attaches a signed `executionId` ONLY when this is true
+	// (`deviceVerifiesSignedExecutionId`), because an older agent omits the
+	// field from its canonical and would reject the command as a bad signature.
+	// That gate is fail-closed, which is why terminal-service #348 could merge
+	// the server half ahead of this one — and also why the per-run cwd scoping
+	// it protects was NOT yet protected: no released agent reported this, so
+	// the field was never sent.
+	//
+	// Never omitempty: a future build reporting `false` must not read as
+	// "field absent".
+	SignedExecutionID bool `json:"signedExecutionId"`
 	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
 	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,
 	// a fenced attempt id is refused forever, and `relay_follow_up_query`
@@ -304,6 +320,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayPermissionPrompts: true,
 		ReadOnlySessions:       true,
 		WorktreeBuiltIns:       true,
+		SignedExecutionID:      true,
 	}
 }
 
