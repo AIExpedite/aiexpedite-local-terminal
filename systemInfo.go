@@ -1498,7 +1498,6 @@ func cachedProbeVersionOutcomeFunc(path string, probe func() (string, versionPro
 		return v
 	}
 	versionProbeMu.Lock()
-	defer versionProbeMu.Unlock()
 	// Drop stale entries for the same path first, since an upgrade leaves the
 	// old (mtime,size) key behind and nothing else prunes these maps.
 	for k := range versionProbeCache {
@@ -1513,9 +1512,11 @@ func cachedProbeVersionOutcomeFunc(path string, probe func() (string, versionPro
 	}
 	if outcome == versionProbeTransient {
 		versionProbeTransients[key]++
-		if versionProbeTransients[key] < versionProbeTransientLimit {
+		if attempt := versionProbeTransients[key]; attempt < versionProbeTransientLimit {
+			versionProbeMu.Unlock()
+			// The binary's name only, never its path.
 			fmt.Printf("%s[version-probe] version probe transient for %s (attempt %d of %d); not cached%s\n",
-				colorYellow, filepath.Base(path), versionProbeTransients[key], versionProbeTransientLimit, colorReset)
+				colorYellow, filepath.Base(path), attempt, versionProbeTransientLimit, colorReset)
 			return v
 		}
 	}
@@ -1525,6 +1526,7 @@ func cachedProbeVersionOutcomeFunc(path string, probe func() (string, versionPro
 	// exact cost this cache exists to remove. A reinstall changes mtime and
 	// invalidates the entry.
 	versionProbeCache[key] = v
+	versionProbeMu.Unlock()
 	return v
 }
 
