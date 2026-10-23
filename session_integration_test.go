@@ -132,6 +132,10 @@ func TestMain(m *testing.M) {
 	// or writes its machine ledger: the cases that exercise it enable it against
 	// a temporary store (openCodeDirectFixture).
 	openCodeDirectScanEnabled = false
+	// …and the Grok direct-run scan never reads the developer's own Grok log:
+	// the cases that exercise it enable it against a temporary home
+	// (grokDirectFixture).
+	grokDirectScanEnabled = false
 	// …and its ladder never fires on its own: an OpenCode stub turn in an
 	// unrelated test owes a debt whose 15 s rung would otherwise run in the
 	// middle of a later test. Cases that exercise the ladder drive it through

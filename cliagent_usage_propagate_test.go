@@ -50,6 +50,9 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	p.mu.Lock()
 	delete(p.pending, claudeUsageProvider)
 	delete(p.seen, claudeUsageProvider)
+	// …and Grok live-cache commits likewise.
+	delete(p.pending, grokUsageProvider)
+	delete(p.seen, grokUsageProvider)
 	p.mu.Unlock()
 	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll}
 	prevFallback, prevDetected := cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected
@@ -70,6 +73,20 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	if os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE") == "" {
 		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", t.TempDir()+"/claude_rate_limits.json")
 	}
+	// …and the Grok recovery and direct scan read the Grok cache, freshness
+	// state and log: never the machine's own. The scan stays off unless a test
+	// opts in (grokDirectFixture).
+	if os.Getenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE") == "" {
+		t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", t.TempDir()+"/grok_billing_live.json")
+	}
+	if os.Getenv(grokUsageFreshnessEnv) == "" {
+		t.Setenv(grokUsageFreshnessEnv, t.TempDir()+"/grok_usage_freshness.json")
+	}
+	if os.Getenv("GROK_HOME") == "" {
+		t.Setenv("GROK_HOME", t.TempDir())
+	}
+	prevGrokScan := grokDirectScanEnabled
+	grokDirectScanEnabled = false
 	rec := &cliUsageHintRecorder{}
 	prevSend := sendCLIUsageObservedHint
 	sendCLIUsageObservedHint = func(_ context.Context, url string, hint cliUsageObservedHint) int {
@@ -87,6 +104,7 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 		sendCLIUsageObservedHint = prevSend
 		cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll = prev[0], prev[1], prev[2], prev[3], prev[4], prev[5]
 		cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected = prevFallback, prevDetected
+		grokDirectScanEnabled = prevGrokScan
 	})
 	return rec, &Config{AgentID: "agent-1", CommandSecret: "secret"}
 }
@@ -1469,5 +1487,152 @@ func TestCLIUsageHint_ResetHoldsFallbackBarrier(t *testing.T) {
 
 	if p.fallbackGen <= oldGen {
 		t.Fatalf("fallbackGen = %d, want > %d", p.fallbackGen, oldGen)
+	}
+}
+
+/* ---------------------------------- Grok ---------------------------------- */
+
+// A Grok hint waits for its own live-cache rotation and never holds Codex,
+// Claude or OpenCode back.
+func TestCLIUsageHint_GrokIsGatedOnItsOwnRotationAndBlocksNoOne(t *testing.T) {
+	withCodexGenerationEpoch(t, 9101)
+	rec, cfg := propagatorFixture(t)
+	t.Setenv("AIEXPEDITE_OPENCODE_USAGE_CACHE", t.TempDir()+"/opencode_usage.json")
+	prevOpenCode := openCodeGenerationRotated.Load()
+	openCodeGenerationRotated.Store(true)
+	t.Cleanup(func() { openCodeGenerationRotated.Store(prevOpenCode) })
+	grokGenerationRotated.Store(false)
+	startCLIUsagePropagator(cfg)
+	markRotated(t)
+
+	noteCLIUsageObservationAdvanced(grokUsageProvider, gen(9101, 1))
+	time.Sleep(cliUsageHintDebounce / 2)
+	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(9101, 2))
+	noteCLIUsageObservationAdvanced(claudeUsageProvider, gen(9101, 3))
+	noteCLIUsageObservationAdvanced(openCodeUsageProvider, gen(9101, 4))
+	hints := waitHints(t, rec, 3, cliUsageHintSpacing/2)
+	for _, h := range hints {
+		if h.hint.Provider == grokUsageProvider {
+			t.Fatalf("sent a grok hint before its rotation: %+v", h.hint)
+		}
+	}
+	grokGenerationRotated.Store(true)
+	waitHintFor(t, rec, gen(9101, 1))
+}
+
+// Two providers due at the same boundary go in provider-id order.
+func TestCLIUsageHint_GrokTieBreaksByProviderID(t *testing.T) {
+	withCodexGenerationEpoch(t, 9102)
+	propagatorFixture(t)
+	grokGenerationRotated.Store(true)
+	prevOpenCode := openCodeGenerationRotated.Load()
+	openCodeGenerationRotated.Store(true)
+	t.Cleanup(func() { openCodeGenerationRotated.Store(prevOpenCode) })
+	at := time.Now()
+	p := cliUsagePropagator
+	p.mu.Lock()
+	p.pending = map[string]*cliUsagePendingHint{
+		openCodeUsageProvider: {generation: gen(9102, 1), notedAt: at},
+		grokUsageProvider:     {generation: gen(9102, 2), notedAt: at},
+	}
+	provider, _, ok := p.nextHintLocked()
+	p.pending = nil
+	p.mu.Unlock()
+	if !ok || provider != grokUsageProvider {
+		t.Fatalf("next = %q ok=%t, want grok before opencode on a tie", provider, ok)
+	}
+}
+
+// A signed refresh that carried the Grok generation leaves exactly one
+// confirmation, after the spacing.
+func TestCLIUsageHint_AReceiptCarryingGrokLeavesOneConfirmation(t *testing.T) {
+	withCodexGenerationEpoch(t, 9103)
+	rec, cfg := propagatorFixture(t)
+	grokGenerationRotated.Store(true)
+	startCLIUsagePropagator(cfg)
+
+	g := gen(9103, 1)
+	ctx, reservation := withCLIUsageReceiptReservation(context.Background())
+	observeCLIUsageGeneration(ctx, grokUsageProvider, &g)
+	time.Sleep(3 * cliUsageHintDebounce)
+	if n := len(rec.all()); n != 0 {
+		t.Fatalf("a receipt-reserved grok generation was hinted %d times before publication", n)
+	}
+	settleCLIUsageReceipt(reservation, true, []cliAgentUsage{{Provider: grokUsageProvider, UsageGeneration: &g}})
+	hints := waitHints(t, rec, 1, 3*cliUsageHintSpacing)
+	if len(hints) != 1 || hints[0].hint.Provider != grokUsageProvider || hints[0].hint.Generation != 1 {
+		t.Fatalf("hints = %+v, want exactly one grok confirmation", hints)
+	}
+}
+
+// grokTickFixture runs the propagator's fallback poll over the direct-run
+// harness.
+func grokTickFixture(t *testing.T, detected bool) (*grokDirectHarness, *Config) {
+	t.Helper()
+	h := newGrokDirectHarness(t)
+	_, cfg := propagatorFixture(t)
+	cliUsageClaudeFallbackPoll = 10 * time.Millisecond
+	grokDirectScanEnabled = true
+	grokDirectDetected = func() bool { return detected }
+	// Runs first: no poll may read a seam while the cleanups above restore it.
+	t.Cleanup(func() {
+		stopCLIUsagePropagator()
+		resetCLIUsagePropagator()
+	})
+	return h, cfg
+}
+
+// The fallback poll runs the Grok scan only while Grok is detected and the
+// agent is online and not draining.
+func TestCLIUsageHint_GrokPollScansOnlyWhileEveryGateIsOpen(t *testing.T) {
+	gates := []struct {
+		name     string
+		detected bool
+		block    func(t *testing.T)
+	}{
+		{name: "open", detected: true},
+		{name: "not detected", detected: false},
+		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "draining", detected: true, block: func(t *testing.T) {
+			drain.mu.Lock()
+			drain.draining = true
+			drain.mu.Unlock()
+			t.Cleanup(func() { drain.mu.Lock(); drain.draining = false; drain.mu.Unlock() })
+		}},
+	}
+	for _, g := range gates {
+		t.Run(g.name, func(t *testing.T) {
+			h, cfg := grokTickFixture(t, g.detected)
+			if g.block != nil {
+				g.block(t)
+			}
+			startCLIUsagePropagator(cfg)
+			cliUsagePropagator.rotating.Wait()
+			h.idle()
+			h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Second)))
+			time.Sleep(20 * cliUsageClaudeFallbackPoll)
+			h.idle()
+			want := int64(0)
+			if g.name == "open" {
+				want = 1
+			}
+			if got := h.reads.Load(); got != want {
+				t.Fatalf("reads = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+// A turn finished before the agent started is nudged by the startup scan,
+// with no poll.
+func TestCLIUsageHint_GrokStartupScanNudgesATurnFromBeforeStart(t *testing.T) {
+	h, cfg := grokTickFixture(t, true)
+	cliUsageClaudeFallbackPoll = time.Hour
+	h.appendRaw(grokTurnMarkerLine(h.clock().Add(-time.Minute)))
+	startCLIUsagePropagator(cfg)
+	cliUsagePropagator.rotating.Wait()
+	h.idle()
+	if h.reads.Load() != 1 {
+		t.Fatalf("reads = %d, want the startup scan to owe the turn its read", h.reads.Load())
 	}
 }

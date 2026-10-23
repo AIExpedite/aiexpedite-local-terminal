@@ -31,6 +31,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -93,23 +94,14 @@ var grokBillingLogMessages = []string{
 	"billing: credits config fetched",
 }
 
-// grokBillingMessageRecognized reports whether msg is one of the allowlisted
-// credits-config messages.
-func grokBillingMessageRecognized(msg string) bool {
-	for _, candidate := range grokBillingLogMessages {
-		if msg == candidate {
-			return true
-		}
-	}
-	return false
-}
-
-// grokLineMentionsBillingMessage is the cheap pre-filter before the JSON
-// decode: the vast majority of lines in this log are chat/tool telemetry, and
-// unmarshalling every one of them would dominate the gather. A hit here is only
-// a candidate — grokBillingMessageRecognized still checks the decoded `msg`.
-func grokLineMentionsBillingMessage(line []byte) bool {
-	for _, candidate := range grokBillingLogMessages {
+// grokLineMentionsAnyMessage is the cheap pre-filter before a JSON decode of a
+// unified.jsonl line: the vast majority of lines in this log are chat/tool
+// telemetry, and unmarshalling every one of them would dominate the read. A hit
+// is only a candidate — the decoded `msg` must still be an EXACT member of the
+// closed set (slices.Contains). Shared by the billing reader
+// (grokBillingLogMessages) and the direct-run scan (grokDirectRunMarkers).
+func grokLineMentionsAnyMessage(line []byte, messages []string) bool {
+	for _, candidate := range messages {
 		if bytes.Contains(line, []byte(candidate)) {
 			return true
 		}
@@ -233,16 +225,59 @@ type grokBillingSnapshot struct {
 	// HasUsedPercent is false when the record named a billing period but no
 	// usage figure — the shape Grok 1.0 emits. UsedPercent is meaningless then
 	// and must never be plotted; the period itself is still authoritative.
-	HasUsedPercent   bool
-	ObservedAt       time.Time
-	PeriodType       string
-	PeriodEnd        time.Time
-	HasPeriodEnd     bool
-	OnDemandCap      float64
-	OnDemandUsed     float64
-	HasOnDemand      bool
-	HasOnDemandUsed  bool
-	SubscriptionTier string
+	HasUsedPercent  bool
+	ObservedAt      time.Time
+	PeriodType      string
+	PeriodEnd       time.Time
+	HasPeriodEnd    bool
+	OnDemandCap     float64
+	OnDemandUsed    float64
+	HasOnDemand     bool
+	HasOnDemandUsed bool
+	// OnDemandObservedAt, when set, is when the on-demand pool's state was
+	// observed — later than ObservedAt when the live cache kept an older
+	// percentage under a newer unmetered answer. That answer dates the pool
+	// whether it carried one or omitted it, so an absent pool is a
+	// timestamped removal, not a gap an older pool may fill.
+	OnDemandObservedAt time.Time
+	SubscriptionTier   string
+}
+
+// onDemandObservedAt is when the on-demand pool was observed: its own time
+// when it has one, else the snapshot's.
+func (s grokBillingSnapshot) onDemandObservedAt() time.Time {
+	if !s.OnDemandObservedAt.IsZero() {
+		return s.OnDemandObservedAt
+	}
+	return s.ObservedAt
+}
+
+// numericAt is when the snapshot's newest numeric pool was observed — the
+// credits percentage or an on-demand pool with usage, whichever is newer.
+// A pool observed beyond grokBillingMaxClockSkew past now is untrusted (the
+// card does not render it), so it never counts. ok is false when no trusted
+// pool carries numbers.
+func (s grokBillingSnapshot) numericAt(now time.Time) (at time.Time, ok bool) {
+	trustedThrough := now.Add(grokBillingMaxClockSkew)
+	if s.HasUsedPercent && !s.ObservedAt.After(trustedThrough) {
+		at, ok = s.ObservedAt, true
+	}
+	if s.HasOnDemand && s.HasOnDemandUsed && !s.onDemandObservedAt().After(trustedThrough) {
+		if pool := s.onDemandObservedAt(); !ok || pool.After(at) {
+			at = pool
+		}
+		ok = true
+	}
+	return at, ok
+}
+
+// withOnDemandFrom returns s with other's on-demand pool state — the pool, or
+// its absence — stamped with that state's own observation time.
+func (s grokBillingSnapshot) withOnDemandFrom(other grokBillingSnapshot) grokBillingSnapshot {
+	s.OnDemandCap, s.OnDemandUsed = other.OnDemandCap, other.OnDemandUsed
+	s.HasOnDemand, s.HasOnDemandUsed = other.HasOnDemand, other.HasOnDemandUsed
+	s.OnDemandObservedAt = other.onDemandObservedAt()
+	return s
 }
 
 // samePeriod reports whether two observations name the same billing period:
@@ -1181,20 +1216,33 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 	if info.Size() > grokBillingLogTailBytes {
 		offset = info.Size() - grokBillingLogTailBytes
 	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, false
-	}
-	// Read exactly the tail length captured by Stat. An unbounded ReadAll after
-	// seeking can consume more than 1 MiB when Grok appends quickly enough to
-	// keep extending the file, defeating this gather's memory/work bound and
-	// mixing records from different filesystem snapshots.
-	tail := make([]byte, info.Size()-offset)
-	if _, err := io.ReadFull(f, tail); err != nil {
+	tail, ok := readFileRangeExact(f, offset, info.Size())
+	if !ok {
 		// The log was truncated or replaced between Stat and ReadFull. Fail
 		// closed and let the next bounded refresh gather a coherent snapshot.
 		return nil, false
 	}
 	return bytes.Split(tail, []byte("\n")), offset > 0
+}
+
+// readFileRangeExact reads exactly [start, end) of f, the range a prior Stat
+// of the same handle captured. An unbounded ReadAll after seeking can consume
+// more than the bound when Grok appends quickly enough to keep extending the
+// file, defeating the reader's memory/work bound and mixing records from
+// different filesystem snapshots. Shared by the billing tail reader and the
+// direct-run scan (cliagent_usage_grok_direct.go).
+func readFileRangeExact(f *os.File, start, end int64) ([]byte, bool) {
+	if end <= start {
+		return []byte{}, true
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, false
+	}
+	buf := make([]byte, end-start)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, false
+	}
+	return buf, true
 }
 
 // newestTrustedGrokBillingRecordFor returns the newest billing OBSERVATION (the
@@ -1239,13 +1287,13 @@ func newestTrustedGrokBillingRecordFor(base string, identities []string, trusted
 	found := false
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
+		if len(line) == 0 || !grokLineMentionsAnyMessage(line, grokBillingLogMessages) {
 			continue
 		}
 		var envelope struct {
 			Msg string `json:"msg"`
 		}
-		if json.Unmarshal(line, &envelope) != nil || !grokBillingMessageRecognized(envelope.Msg) {
+		if json.Unmarshal(line, &envelope) != nil || !slices.Contains(grokBillingLogMessages, envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
@@ -1342,7 +1390,7 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
-		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
+		if len(line) == 0 || !grokLineMentionsAnyMessage(line, grokBillingLogMessages) {
 			continue
 		}
 		// Decode the envelope first so an exact-message record with a malformed
@@ -1362,7 +1410,7 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 			}
 			return grokBillingSnapshot{}, grokUnusableOutcome(lines, i, identities)
 		}
-		if !grokBillingMessageRecognized(envelope.Msg) {
+		if !slices.Contains(grokBillingLogMessages, envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
@@ -1729,14 +1777,16 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	metrics := []cliAgentUsageMetric{credits}
 
 	// On-demand is a separate pool with its own numbers, so an unmetered — or
-	// unrecognized — credits window must not suppress it.
-	if snap.HasOnDemand {
+	// unrecognized — credits window must not suppress it. A pool carrying its
+	// own future observation time is suppressed like a future record: its
+	// figures are never published under the percentage's older stamp.
+	if snap.HasOnDemand && !snap.onDemandObservedAt().After(now.Add(grokBillingMaxClockSkew)) {
 		onDemand := cliAgentUsageMetric{
 			Kind:       limitKindTokens,
 			Label:      "On-demand credits",
 			Unit:       "credits",
 			Total:      floatPtr(snap.OnDemandCap),
-			ObservedAt: observedAt,
+			ObservedAt: snap.onDemandObservedAt().UTC().Format(time.RFC3339),
 		}
 		if snap.HasOnDemandUsed {
 			onDemand.Consumed = floatPtr(snap.OnDemandUsed)
@@ -1750,6 +1800,48 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		metrics = append(metrics, onDemand)
 	}
 	return metrics
+}
+
+// grokBillingValueWithheld reports a snapshot carrying a figure that
+// grokBillingMetrics suppresses because its own observation time is further
+// ahead than grokBillingMaxClockSkew allows — the whole record, or just the
+// on-demand pool under a trusted percentage. A capture generation versions
+// every figure the cache holds, so publishing it while one of them is
+// withheld would let the backend apply that generation and then keep omitting
+// the figure once the clock catches up and it renders again, with no commit
+// left to version it.
+func grokBillingValueWithheld(snap grokBillingSnapshot, now time.Time) bool {
+	return grokBillingWithheldFor(snap, now) > 0
+}
+
+// grokBillingWithheldFor is how long grokBillingValueWithheld stays true for
+// snap as the clock runs on from now: the wait until its furthest-ahead figure
+// falls inside grokBillingMaxClockSkew and renders. Zero when nothing is
+// withheld.
+func grokBillingWithheldFor(snap grokBillingSnapshot, now time.Time) time.Duration {
+	if !snap.HasUsedPercent && !snap.HasOnDemand {
+		return 0
+	}
+	newest := snap.ObservedAt
+	if snap.HasOnDemand && snap.onDemandObservedAt().After(newest) {
+		newest = snap.onDemandObservedAt()
+	}
+	if wait := newest.Sub(now.Add(grokBillingMaxClockSkew)); wait > 0 {
+		return wait
+	}
+	return 0
+}
+
+// grokBillingMetricsNumeric reports whether any rendered pool carries numbers
+// — the credits percentage or the on-demand pool. Either is a reading the card
+// shows, so either is what a capture generation versions.
+func grokBillingMetricsNumeric(metrics []cliAgentUsageMetric) bool {
+	for _, m := range metrics {
+		if !m.Unknown {
+			return true
+		}
+	}
+	return false
 }
 
 // grokUnknownCreditsMetric is the inferred placeholder: a limit exists, but no

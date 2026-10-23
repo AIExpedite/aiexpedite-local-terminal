@@ -722,8 +722,9 @@ same bounded run-completion refresh Codex and Antigravity have:
 - **Pay.** A process-wide single-flight worker spends at most 4 outbound reads
   per debt on the shared ladder (1 m / 2 m / 8 m / 30 m), at least 60 s apart.
   The read goes through `grokBillingReadOnce`, one `singleflight` flight per
-  account shared with the Refresh click. Only a reading **with a percentage**
-  pays: an `ok` that names a period alone is booked as `unmetered`, spends an
+  account shared with the Refresh click. Only a **numeric** reading — a
+  percentage, or an on-demand pool with usage, each at its own time — pays:
+  an `ok` that names a period alone is booked as `unmetered`, spends an
   attempt and stays on the ladder. `http_error` / `bad_response` spend budget;
   `login_busy` / `write_failed` / offline, and a caller that stopped waiting on
   the shared flight (`timeout` — the flight's own `ok` still pays), book free
@@ -745,23 +746,108 @@ same bounded run-completion refresh Codex and Antigravity have:
   finished after the last read gets it even when the budget is spent, so an
   earlier transient refusal cannot leave the card stale after a green smoke.
   The verdict never depends on it.
-- **Direct runs.** When `Parse` finds a log record newer than every live
-  reading (a `grok` the user ran in their own shell), it calls
-  `nudgeGrokUsageRefresh`, at most once a minute and never while a run of this
-  process is live.
+- **Direct runs.** A run this agent did not spawn — `grok -p` or the TUI in the
+  user's own shell, an IDE, the maintenance controller's shell, or an unarmed
+  interactive PTY TUI in the persistent home — is found by Grok's own
+  turn-completion line, `shell.turn.inference_done`, in the persistent home's
+  `logs/unified.jsonl` (`grokBillingLogPath(grokPersistentHome())`, so
+  `GROK_HOME` is honoured; isolated homes are never scanned — managed runs
+  settle their own debts). `grokDirectRunScanIfChanged`
+  ([cliagent_usage_grok_direct.go](cliagent_usage_grok_direct.go)) runs on the
+  usage propagator's fallback poll (10 s), and `grokDirectScanAtStartup` once
+  as the propagator starts, so a turn finished while the agent was down or
+  mid-update is found at once:
+  - **Bounds.** One `os.Stat` per poll; a read only when size or mtime moved,
+    of at most 256 KiB of appended bytes from the in-memory offset
+    (Stat-then-`ReadFull`). A rotation, a truncation, a changed log path or the
+    first scan of a process reads only the newest 256 KiB; a partially written
+    last line waits until it completes.
+  - **Match.** A `bytes.Contains` pre-check, then a decode into `{msg, ts}`
+    only (`ctx` is never decoded) and an exact `msg` match against the closed
+    `grokDirectRunMarkers` set. A `ts` more than `grokBillingMaxClockSkew` ahead
+    is ignored; a nearer future one is clamped to now.
+  - **Owed rule (stateless).** The newest marker is owed a read when it is
+    newer than the account's newest **numeric** live observation (an unmetered
+    answer never covers a turn). The rule needs only the log and the cache, so
+    it survives restarts and update hand-offs with no new persisted state.
+  - **Gates.** The cursor advances while Grok is detected, the refresh is
+    enabled and the agent is online and not draining or shutting down. The
+    nudge additionally needs a signed-in account, no live armed run and the
+    cooldown: a marker they defer is kept and re-evaluated on every later poll
+    (including the first one after login), even with an unchanged log.
+  - **Owner.** Every poll records the login it sees in a short in-memory
+    sign-in timeline (`grokDirectMarkerOwnerLocked`), and a turn is paid only
+    under the account that timeline places at its `ts`: a turn that closed
+    before a switch (or a sign-out) belongs to the earlier account, never to
+    whoever is signed in when the scan finds it. Only a process that has seen
+    no login yet lets the next login adopt the turn; a turn written while the
+    polls saw nobody signed in is never paid. Each account keeps its own
+    pending turn (`grokDirectAttributeLocked`), and when two or more turns
+    land between two polls that saw different logins the newest is paid under
+    the later login, so turns on both sides of a switch are each paid.
+  - **Cost.** `nudgeGrokUsageRefreshFor(now, turnTime, fp)` opens one debt
+    whose completion is the turn's own time, so a reading already taken since
+    pays it for free. The debt's budget, 60 s spacing and 30 min exhausted
+    cooling bound continuous direct use to about one read a minute. A marker
+    handed to the debt is never re-nudged: the debt's ladder owns it.
+  - **Drift.** The marker is vendor-internal; a Grok release that renames it
+    makes the detector go quiet, leaving the billing-record nudge below and the
+    maintenance smoke's freshness gate as the alarm.
+
+  The gather also nudges when `Parse` finds a percent-less billing record newer
+  than every live answer (a TUI's own fetch), with that record's time as the
+  completion.
 - **Survive.** `StartAgent` calls `payOwedGrokUsageRefresh`, which re-arms a
   booked rung, pays one attempt for a debt with none, and owes one read for a
   floor the previous process never settled; `gracefulShutdown` stops the timer
   first and then drains in-flight arms and settles (`drainGrokUsageWrites`,
   bounded like Antigravity's), so an update hand-off cannot exit before the
-  debt is on disk. Offline sends nothing and keeps the debt.
+  debt is on disk. Offline sends nothing and keeps the debt. Every mutation
+  that must land — an arm's floor, a settle, a read's charge, a landed
+  reading's retirement, a booked rung and a resumed debt's claim — goes through
+  `grokUsageFreshnessTxn` and is retried (`grokRetryRefusedFreshness`) when
+  another process's lock refuses it. A debt adopted at startup has no rung to
+  claim, so it persists `workerClaimAtMs` (good for one payment pass) before
+  its worker starts: two processes sharing the file never both read for it.
 - **Redaction.** The state file holds epoch-ms integers, a counter, the hashed
   account fingerprint and a closed outcome code; log lines are
   `[cli-usage] grok refresh: <label> attempts=<n>`.
 
-A debt paid after an ACP session ends reaches terminal-service at the next
-wake (session start, command dispatch, the CLI Agents tab) — Grok readings are
-not pushed through `cli-usage/observed`.
+### Propagation to terminal-service
+
+`grok` is a usage-hint provider (`cliagent_usage_propagate.go`, mirrored by
+terminal-service's `CLI_USAGE_HINT_PROVIDERS`), so a reading that lands after
+the session-end wake still reaches the card:
+
+- `grok_billing_live.json` gains an additive `generation {epoch, counter}`
+  (schema stays 1). `saveGrokBillingLive` is a read-merge-write transaction: a
+  numeric read that commits a newer numeric `observedAt`, a changed
+  `usedPercent` or a new period bumps the generation on this process's epoch
+  and sends one `POST /device/:id/cli-usage/observed` hint. An unmetered read
+  never bumps it, and inside the same open period it keeps the numeric
+  reading (`numericObservedAt`) instead of erasing it; past the period end the
+  kept number is never returned, covers no debt and is never recovered. A
+  numeric on-demand pool (cap plus used) is versioned on its own: a newer or
+  changed pool bumps the generation even when the credits window is
+  unmetered, and keeps its own `observedAt` beside a kept percentage. A
+  clear is versioned too: an unmetered answer that drops the account's
+  number (a new period, or a kept figure whose period ended) bumps the
+  generation once and marks the entry `cleared`, so the switch to Unknown
+  is hinted like any other change.
+- `grokUsageParser.ParseContext` publishes `usageGeneration` only for a
+  numeric metric (credits or on-demand), or a versioned clear, the live
+  cache won, on this process's epoch, once the cache
+  has rotated (`grokGenerationRotated`), and reserves it for the signed
+  refresh receipt (`observeCLIUsageGeneration`). Hints wait for that rotation.
+- Startup recovery (`recoverGrokUsageGeneration`) moves a cache that still
+  holds a numeric reading (or a versioned clear) for the signed-in account
+  in an open period onto
+  this epoch in one write and hints it once, so a reading captured just before
+  an update is propagated after the hand-off. A recovery that must wait — for a
+  refused write, or for a future-dated figure to become trusted — stays bound
+  to that account: while another login is signed in it neither hints (a receipt
+  under it could not carry the generation) nor ends, and it re-checks until the
+  account is back or another account's read commits over the cache.
 
 Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 (classification, budget, cooldown, redaction, prompt file),
@@ -770,7 +856,11 @@ Pinned by [cliagent_smoke_grok_test.go](cliagent_smoke_grok_test.go)
 [cliagent_usage_grok_run_debt_test.go](cliagent_usage_grok_run_debt_test.go)
 (debt bounds),
 [cliagent_usage_grok_refresh_restart_test.go](cliagent_usage_grok_refresh_restart_test.go)
-(restart / self-update) and
+(restart / self-update),
+[cliagent_usage_grok_direct_test.go](cliagent_usage_grok_direct_test.go)
+(direct-run marker scan),
+[cliagent_usage_grok_direct_run_test.go](cliagent_usage_grok_direct_run_test.go)
+(direct and managed runs end to end to a hint) and
 [cliagent_usage_grok_post_update_freshness_test.go](cliagent_usage_grok_post_update_freshness_test.go)
 (the upgrade end to end across the smoke and usage layers). The end-to-end
 "real grok binary echoes the marker" case, and a numeric Grok row whose
@@ -1776,7 +1866,8 @@ provider for its current figures before the gather runs
   - Grok — GET `cli-chat-proxy.grok.com/v1/billing?format=credits` with the
     token Grok's resolver presents ([`cliagent_usage_grok_live.go`](cliagent_usage_grok_live.go)).
     Headless Grok (`grok -p`, ACP) never fetches credits, so the same read is
-    also owed once by every finished run (see "Run-completion refresh"), and a
+    also owed once by every finished run, managed or direct (see "Run-completion
+    refresh"), and a
     click joins a debt's read already in flight for the account rather than
     sending a second one. The agent never renews the login itself; an expired token or
     a 401 runs `grok models` once against the real home so Grok renews, then the
