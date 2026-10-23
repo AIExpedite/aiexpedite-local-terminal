@@ -1359,3 +1359,75 @@ func TestWhatsAppSupervisorPartlyStoredFinalHistoryChunkIsNotComplete(t *testing
 		t.Fatalf("a partly stored final chunk reported completion: %v", got)
 	}
 }
+
+// A single history record refused because the queue is at its cap must wait
+// for room like any other chunk. Only a record the EMPTY queue refuses is
+// skipped; skipping one at the cap would drop it, and in the final chunk
+// would let history be marked complete without it.
+func TestWhatsAppSupervisorSingleHistoryRecordAtTheCapWaitsForRoom(t *testing.T) {
+	_, _ = withWhatsAppTestEnv(t)
+	prevMax, prevPoll := whatsAppOutboxMaxRecords, whatsAppHistoryRoomPoll
+	whatsAppOutboxMaxRecords, whatsAppHistoryRoomPoll = 2, 5*time.Millisecond
+	defer func() { whatsAppOutboxMaxRecords, whatsAppHistoryRoomPoll = prevMax, prevPoll }()
+	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
+	sup.ctx, sup.cancel = context.WithCancel(context.Background())
+	defer sup.cancel()
+	sup.transport = &fakeWATransport{}
+	r := sup.newRunner("lnk_one", "ws", 1)
+	ob, _ := openTestOutbox(t, "lnk_one")
+	defer ob.Close()
+	// Live records always land, so they can hold the queue at its cap.
+	if err := ob.Append([]whatsAppRecord{textRecord("chat@s.whatsapp.net", "L1", "x"), textRecord("chat@s.whatsapp.net", "L2", "x")}, false); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan int, 1)
+	go func() {
+		got <- r.appendHistoryChunk(ob, []whatsAppRecord{textRecord("chat@s.whatsapp.net", "H1", "old")})
+	}()
+	select {
+	case n := <-got:
+		t.Fatalf("a single history record at the cap returned %d (depth %d) instead of waiting for room", n, ob.Depth())
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := ob.Ack(2); err != nil { // the uploader makes room
+		t.Fatal(err)
+	}
+	select {
+	case n := <-got:
+		if n != 1 {
+			t.Fatalf("admitted %d of 1 record after room was made", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the history record was never admitted after room was made")
+	}
+	batch, err := ob.Next()
+	if err != nil || batch == nil || len(batch.Records) != 1 || !strings.Contains(string(batch.Records[0]), `"H1"`) {
+		t.Fatalf("the history record is not queued: %+v %v", batch, err)
+	}
+}
+
+// A cloud pause moves the runners to pausedLinks in one step: a persist from
+// a client event that races the pause must never write a links.json that
+// lists the link neither as running nor as paused.
+func TestWhatsAppSupervisorCloudPauseNeverPersistsAnEmptyManifest(t *testing.T) {
+	h, _ := pairedHarness(t)
+	r := h.sup.runner("lnk_1")
+	if r == nil {
+		t.Fatal("no runner")
+	}
+	// Hold the runner's lock so the pause stops where it snapshots the link,
+	// then let a persist run against whatever the pause has exposed so far.
+	r.mu.Lock()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); h.sup.setCloudConnected(false) }()
+	time.Sleep(50 * time.Millisecond)
+	go func() { defer wg.Done(); h.sup.persist() }()
+	time.Sleep(50 * time.Millisecond)
+	r.mu.Unlock()
+	wg.Wait()
+	local, err := loadWhatsAppLocalLinks()
+	if err != nil || len(local) != 1 || local[0].LinkID != "lnk_1" {
+		t.Fatalf("a persist racing the pause forgot the paused link: %+v %v", local, err)
+	}
+}

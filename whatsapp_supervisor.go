@@ -96,6 +96,8 @@ var (
 	// One auth-expiry drain round: the retry loop below re-arms it until
 	// the outbox is empty.
 	whatsAppAuthFlushTimeout = 2 * time.Minute
+	// How often a history chunk held at the outbox caps retries its append.
+	whatsAppHistoryRoomPoll = 2 * time.Second
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -273,17 +275,18 @@ func (s *whatsAppSupervisor) setCloudConnectedLocked(connected bool) {
 	}
 	if !connected {
 		s.paused = true
+		// Move the runners into pausedLinks in this one critical section
+		// (mu before the runner's lock, as in persist): a persist from a
+		// client event racing the pause must see each link as a runner or
+		// as paused, never as neither, or it writes a links.json that
+		// forgets the link.
 		runners := make([]*whatsAppLinkRunner, 0, len(s.links))
+		held := make([]whatsAppLocalLink, 0, len(s.links))
 		for _, r := range s.links {
 			runners = append(runners, r)
-		}
-		s.links = map[string]*whatsAppLinkRunner{}
-		s.mu.Unlock()
-		held := make([]whatsAppLocalLink, 0, len(runners))
-		for _, r := range runners {
 			held = append(held, r.localLink())
 		}
-		s.mu.Lock()
+		s.links = map[string]*whatsAppLinkRunner{}
 		s.pausedLinks = held
 		s.mu.Unlock()
 		for _, r := range runners {
@@ -1416,9 +1419,10 @@ func (r *whatsAppLinkRunner) normalizeContext() whatsAppNormalizeContext {
 // appendHistoryChunk stores records, waiting for the uploader when the
 // outbox is at its caps. A chunk that alone exceeds the absolute caps is
 // split: no drain could ever admit it whole, so retrying it unchanged would
-// spin forever. Returns the admitted prefix length; a short return means the
-// runner stopped (or one unsatisfiable record was skipped) and the caller
-// must not count the rest as synced.
+// spin forever. Returns the admitted prefix length (a single record that
+// even the empty queue refuses is logged, skipped and counted); a short
+// return means the runner stopped or the outbox failed, and the caller must
+// not count the rest as synced.
 func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []whatsAppRecord) int {
 	admitted := 0
 	for admitted < len(records) {
@@ -1431,13 +1435,18 @@ func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []wh
 			r.log("history chunk not stored: " + err.Error())
 			return admitted
 		}
-		if len(rest) == 1 {
-			// A single record the empty queue refuses cannot exist in
-			// practice; wedging history on it would be worse than logging it.
+		empty := ob.Depth() == 0
+		if len(rest) == 1 && empty {
+			// Only an EMPTY queue refusing a single record means the record
+			// alone passes the byte cap: no drain can ever admit it, and
+			// wedging history on it would be worse than logging it. A
+			// singleton refused at the cap waits for room below like any
+			// chunk — skipping it would drop the record and could let the
+			// final chunk mark history complete without it.
 			r.log("history record exceeds the outbox caps; skipped")
 			return admitted + 1
 		}
-		if int64(len(rest)) > whatsAppOutboxMaxRecords || ob.Depth() == 0 {
+		if int64(len(rest)) > whatsAppOutboxMaxRecords || empty {
 			// Unsatisfiable whole: more records than the cap allows, or a
 			// chunk the empty queue still refuses (its sealed bytes alone
 			// pass the byte cap). Halving always terminates — a single
@@ -1457,7 +1466,7 @@ func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []wh
 		select {
 		case <-r.ctx.Done():
 			return admitted
-		case <-time.After(2 * time.Second):
+		case <-time.After(whatsAppHistoryRoomPoll):
 		}
 	}
 	return admitted
