@@ -453,7 +453,14 @@ func TestWhatsAppSupervisorResumesFromLinksJSONAtBoot(t *testing.T) {
 	h.session = true
 	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_boot", WorkspaceID: "ws", Generation: 5, State: waStateConnected}}
 	h.sup.start(h.transport)
-	waitFor(t, "connect", func() bool { c := h.client(0); n, _ := 0, 0; if c != nil { n, _ = c.count() }; return n == 1 })
+	waitFor(t, "connect", func() bool {
+		c := h.client(0)
+		n, _ := 0, 0
+		if c != nil {
+			n, _ = c.count()
+		}
+		return n == 1
+	})
 	h.client(0).emit(&events.Connected{})
 	waitFor(t, "connected (history already done)", func() bool { return lastState(h.transport) == waStateConnected })
 	if h.sup.runner("lnk_boot") == nil {
@@ -472,6 +479,8 @@ func TestWhatsAppSupervisorReconcileWipesAnUnboundLink(t *testing.T) {
 	waitFor(t, "wiped", func() bool { return h.sup.runner("lnk_gone") == nil })
 	dir, _ := whatsAppLinkDir("lnk_gone")
 	waitFor(t, "dir removed", func() bool { _, err := os.Stat(dir); return os.IsNotExist(err) })
+	waitFor(t, "links.json rewritten", func() bool { l, err := loadWhatsAppLocalLinks(); return err == nil && len(l) == 0 })
+	time.Sleep(20 * time.Millisecond) // let the last persist's rename settle before TempDir cleanup
 }
 
 func TestWhatsAppSupervisorRefusesWithoutSecureStorage(t *testing.T) {

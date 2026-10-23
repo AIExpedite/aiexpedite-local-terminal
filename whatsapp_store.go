@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 )
 
 const (
@@ -92,8 +93,15 @@ func wipeWhatsAppLinkDir(linkID string) error {
 	if err != nil {
 		return err
 	}
-	_, err = linkSafeRemoveAll(dir)
-	return err
+	// A file a just-closed SQLite handle released can stay locked for a
+	// moment on Windows; retry briefly rather than leave session keys behind.
+	for attempt := 0; ; attempt++ {
+		_, err = linkSafeRemoveAll(dir)
+		if err == nil || attempt == 4 {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
 }
 
 /* --------------------------------------------------------------------------

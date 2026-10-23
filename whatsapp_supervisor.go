@@ -453,6 +453,7 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	}
 	for _, r := range runners {
 		r.cancel()
+		r.waitLoops()
 		_ = r.closeStores()
 	}
 	s.persist()
@@ -528,6 +529,10 @@ type whatsAppLinkRunner struct {
 	seenChats       map[string]bool
 	stopped         bool
 	loopsStarted    bool
+	// loops tracks the upload and heartbeat goroutines, so stop() can wait
+	// for them before the stores close: on Windows an outbox file still open
+	// in a query cannot be deleted.
+	loops sync.WaitGroup
 }
 
 func (r *whatsAppLinkRunner) log(event string) { logWhatsApp(r.linkID, event) }
@@ -597,9 +602,22 @@ func (r *whatsAppLinkRunner) startLoops() {
 		return
 	}
 	r.loopsStarted = true
+	r.loops.Add(2)
 	r.mu.Unlock()
-	go r.uploadLoop()
-	go r.heartbeatLoop()
+	go func() { defer r.loops.Done(); r.uploadLoop() }()
+	go func() { defer r.loops.Done(); r.heartbeatLoop() }()
+}
+
+// waitLoops waits (bounded) for the upload and heartbeat goroutines to exit
+// after the runner's context was cancelled.
+func (r *whatsAppLinkRunner) waitLoops() {
+	done := make(chan struct{})
+	go func() { r.loops.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		r.log("loops did not stop in time")
+	}
 }
 
 // stop ends the runner's loops and its client.
@@ -613,6 +631,7 @@ func (r *whatsAppLinkRunner) stop(logout bool) {
 	client := r.client
 	r.mu.Unlock()
 	r.cancel()
+	r.waitLoops()
 	if client == nil {
 		return
 	}
