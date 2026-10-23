@@ -261,3 +261,18 @@ func TestPostUpdateColdStart_AntigravityLateStartedRunIsCaptured(t *testing.T) {
 		t.Fatal("no snapshot persisted from the late-started run")
 	}
 }
+
+/* ---------------------------------- Grok ----------------------------------- */
+
+// The Grok gather reads its version through grokProbeVersion (the one Grok
+// route, shared with the maintenance smoke's binary_missing pre-check). A cold
+// first `--version` after an install or update must not pin "" there.
+func TestPostUpdateColdStart_GrokVersionRecovers(t *testing.T) {
+	binary := helperFakeCLIBinary(t, "grok")
+	cold := helperColdVersionProbeOnce(t, "grok", "grok 1.0.4")
+
+	if got := grokProbeVersion(binary); got != "" {
+		t.Fatalf("cold probe = %q, want the timeout's \"\"", got)
+	}
+	helperRequireVersionRecovers(t, cold, func() string { return grokProbeVersion(binary) }, "grok 1.0.4")
+}
