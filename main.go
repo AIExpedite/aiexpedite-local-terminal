@@ -716,6 +716,10 @@ func onTrayReady(cfg *Config) func() {
 						fmt.Println("[tray] Disconnecting from cloud...")
 						SetOffline(true, cfg) // persists cfg.OfflineMode = true
 						// Personal WhatsApp messages stop leaving the computer too.
+						// Eagerly first: a reconcile may hold the supervisor's
+						// lock across its HTTP fetch, and uploads must stop even
+						// then. The async follow-up completes the full stop.
+						globalWhatsAppSupervisor.requestCloudPause()
 						go followWhatsAppCloudConnection()
 						systray.SetTooltip(EnvDisplayName + " – Disconnected")
 						applyDisconnectedTrayIcon()

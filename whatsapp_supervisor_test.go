@@ -88,6 +88,7 @@ type fakeWATransport struct {
 	raw     []string
 	respond func(payload map[string]any) whatsAppSyncResult
 	bound   []whatsAppBoundLink
+	onBound func()
 }
 
 func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResult {
@@ -113,6 +114,9 @@ func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResul
 func (f *fakeWATransport) BoundLinks(context.Context) ([]whatsAppBoundLink, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.onBound != nil {
+		f.onBound()
+	}
 	return f.bound, 200, nil
 }
 
@@ -816,5 +820,148 @@ func TestWhatsAppSupervisorTerminalErrorSurvivesConnectFailingTimer(t *testing.T
 	}
 	if r.terminalError != waErrAccountRestricted {
 		t.Fatalf("terminalError = %q", r.terminalError)
+	}
+}
+
+// Disconnecting while a reconcile holds the lifecycle lock must still stop
+// uploads at once: the tray already reports Disconnected, so no batch,
+// heartbeat or state report may leave afterwards. The eager pause marks the
+// supervisor paused without the lock; the full stop follows once the lock
+// is free.
+func TestWhatsAppSupervisorEagerPauseStopsPostsDuringReconcile(t *testing.T) {
+	h, c := pairedHarness(t)
+	waitFor(t, "drained", func() bool {
+		if r := h.sup.runner("lnk_1"); r != nil {
+			return r.outbox.Depth() == 0
+		}
+		return false
+	})
+	time.Sleep(100 * time.Millisecond)
+	before := len(h.transport.find(func(map[string]any) bool { return true }))
+
+	// A reconcile in flight holds the lifecycle lock across its HTTP fetch.
+	h.sup.lifecycleMu.Lock()
+	h.sup.requestCloudPause()
+	if !h.sup.isPaused() {
+		h.sup.lifecycleMu.Unlock()
+		t.Fatal("requestCloudPause must mark the supervisor paused without the lifecycle lock")
+	}
+	c.emit(liveMsg(waPeer, waPeer, false, "E1", &waE2E.Message{Conversation: proto.String("held")}))
+	// The full stop cannot run yet; uploads must still stay silent.
+	time.Sleep(200 * time.Millisecond)
+	if after := len(h.transport.find(func(map[string]any) bool { return true })); after != before {
+		h.sup.lifecycleMu.Unlock()
+		t.Fatalf("%d posts left the computer after Disconnect while a reconcile held the lock", after-before)
+	}
+	if r := h.sup.runner("lnk_1"); r == nil || r.outbox.Depth() == 0 {
+		h.sup.lifecycleMu.Unlock()
+		t.Fatal("the message must stay queued until the full stop or reconnect")
+	}
+	h.sup.lifecycleMu.Unlock()
+
+	// The queued full transition still completes the stop (the eager flag must
+	// not trip the already-paused early return).
+	h.sup.setCloudConnected(false)
+	if h.sup.runner("lnk_1") != nil {
+		t.Fatal("the full stop left a runner behind")
+	}
+}
+
+// The reconcile fetch is network I/O: it must not hold the lifecycle lock,
+// or a Disconnect waits behind it (up to the HTTP timeout) while uploads
+// keep leaving.
+func TestWhatsAppSupervisorReconcileFetchesWithoutTheLifecycleLock(t *testing.T) {
+	h := newSupervisorHarness(t)
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStateConnected}}
+	h.sup.start(h.transport)
+	freeCh := make(chan bool, 4)
+	h.transport.mu.Lock()
+	h.transport.onBound = func() {
+		// Report whether the lifecycle lock is free without disturbing it:
+		// a successful TryLock is released at once.
+		free := h.sup.lifecycleMu.TryLock()
+		if free {
+			h.sup.lifecycleMu.Unlock()
+		}
+		select {
+		case freeCh <- free:
+		default:
+		}
+	}
+	h.transport.mu.Unlock()
+	done := make(chan bool, 1)
+	go func() { h.sup.reconcileOnce(); done <- true }()
+	select {
+	case got := <-freeCh:
+		if !got {
+			t.Fatal("reconcileOnce held the lifecycle lock across its BoundLinks fetch")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcile did not fetch")
+	}
+	<-done
+}
+
+// A 400 refuses the batch, but only one record is known bad: the uploader
+// must drop the head record and retry the remainder, not the whole range.
+func TestWhatsAppSupervisorInvalidBatchDropsOnlyItsHead(t *testing.T) {
+	_, _ = withWhatsAppTestEnv(t)
+	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
+	sup.ctx, sup.cancel = context.WithCancel(context.Background())
+	defer sup.cancel()
+	tr := &fakeWATransport{}
+	calls := 0
+	tr.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		calls++
+		if calls == 1 {
+			return whatsAppSyncResult{Status: 400, Body: whatsAppSyncResponse{Code: "INVALID"}}
+		}
+		to := int64(p["seqTo"].(float64))
+		return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
+	}
+	sup.transport = tr
+	r := sup.newRunner("lnk_400", "ws", 1)
+	dir, err := ensureWhatsAppLinkDir("lnk_400")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_400")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	r.outbox = ob
+	if err := ob.Append([]whatsAppRecord{
+		textRecord("chat@s.whatsapp.net", "B1", "one"),
+		textRecord("chat@s.whatsapp.net", "B2", "two"),
+		textRecord("chat@s.whatsapp.net", "B3", "three"),
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := r.uploadOnce(context.Background()); outcome != whatsAppUploadRetry {
+		t.Fatalf("a refused batch must be retried, got outcome %d", outcome)
+	}
+	if d := ob.Depth(); d != 2 {
+		t.Fatalf("a 400 must drop only the head record, depth = %d", d)
+	}
+	if _, outcome := r.uploadOnce(context.Background()); outcome != whatsAppUploadSent {
+		t.Fatalf("the remainder must upload, got outcome %d", outcome)
+	}
+	if d := ob.Depth(); d != 0 {
+		t.Fatalf("the remainder was not acked, depth = %d", d)
+	}
+	batches := tr.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch })
+	if len(batches) != 2 {
+		t.Fatalf("expected refused + retried posts, got %d", len(batches))
+	}
+	var last []string
+	for _, rec := range batches[1]["records"].([]any) {
+		last = append(last, rec.(map[string]any)["waMessageId"].(string))
+	}
+	if len(last) != 2 || last[0] != "B2" || last[1] != "B3" {
+		t.Fatalf("the retry must carry B2 and B3, got %v", last)
 	}
 }

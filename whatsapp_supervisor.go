@@ -192,9 +192,29 @@ func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool)
 // lifecycle lock, so toggles racing each other still settle on the last one.
 func followWhatsAppCloudConnection() {
 	s := globalWhatsAppSupervisor
+	if IsOffline() {
+		// The tray already reports Disconnected: stop new uploads,
+		// heartbeats and state reports at once, even if a reconcile holds
+		// the lifecycle lock across its HTTP fetch. The full stop below
+		// follows once the lock is free.
+		s.requestCloudPause()
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	s.setCloudConnectedLocked(!IsOffline())
+}
+
+// requestCloudPause marks the supervisor paused without the lifecycle lock,
+// so posts stop even while a reconcile holds it across its fetch. It moves
+// no runners: setCloudConnectedLocked completes the stop once the lock is
+// free. Safe to call from the tray loop: it never blocks on the network.
+func (s *whatsAppSupervisor) requestCloudPause() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started || s.stopped || s.paused {
+		return
+	}
+	s.paused = true
 }
 
 func (s *whatsAppSupervisor) setCloudConnected(connected bool) {
@@ -208,7 +228,10 @@ func (s *whatsAppSupervisor) setCloudConnected(connected bool) {
 // resumes the paused links and reconciles. Caller holds lifecycleMu.
 func (s *whatsAppSupervisor) setCloudConnectedLocked(connected bool) {
 	s.mu.Lock()
-	if !s.started || s.stopped || s.paused == !connected {
+	// An eagerly paused disconnect (requestCloudPause ran while a reconcile
+	// held this lock) still owes the full stop below: its runners are held,
+	// so paused alone must not trip the early return.
+	if !s.started || s.stopped || (s.paused == !connected && (connected || len(s.links) == 0)) {
 		s.mu.Unlock()
 		return
 	}
@@ -239,6 +262,11 @@ func (s *whatsAppSupervisor) setCloudConnectedLocked(connected bool) {
 	s.mu.Unlock()
 	logWhatsApp("-", "reconnected to cloud; resuming links")
 	for _, l := range local {
+		// An eager pause may still hold this link's runner (its full stop
+		// is queued behind a reconcile): never pair a second client over it.
+		if s.runner(l.LinkID) != nil {
+			continue
+		}
 		s.resume(l)
 	}
 	s.mu.Lock()
@@ -299,12 +327,24 @@ func (s *whatsAppSupervisor) reconcileLoop() {
 }
 
 func (s *whatsAppSupervisor) reconcileOnce() bool {
+	// The fetch is network I/O with a 30 s timeout: never hold the lifecycle
+	// lock across it, or a Disconnect waits behind it while uploads keep
+	// leaving. Only the mutation step below needs the lock.
+	s.lifecycleMu.Lock()
+	if s.isPaused() {
+		s.lifecycleMu.Unlock()
+		return true // the reconnect starts a fresh reconcile
+	}
+	s.mu.Lock()
+	ctx := s.ctx
+	s.mu.Unlock()
+	s.lifecycleMu.Unlock()
+	bound, status, err := s.transport.BoundLinks(ctx)
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if s.isPaused() {
-		return true // the reconnect starts a fresh reconcile
+		return true // disconnected mid-fetch: skip mutations; the reconnect reconciles
 	}
-	bound, status, err := s.transport.BoundLinks(s.ctx)
 	if err != nil {
 		if status == 401 || status == 403 || status == 404 {
 			return true // unregistered / revoked: nothing to reconcile against
@@ -1332,9 +1372,10 @@ const (
 	whatsAppUploadStop
 )
 
-// uploadOnce sends the oldest batch. 2xx acks; 400 drops the batch (one bad
-// record must not wedge the queue); 401/403 pauses uploads; 409 fences; 429,
-// 5xx and transport errors are retried with backoff.
+// uploadOnce sends the oldest batch. 2xx acks; 400 drops only the batch's
+// head record and retries the remainder (one bad record must not wedge the
+// queue, and the rest of the batch may be valid); 401/403 pauses uploads;
+// 409 fences; 429, 5xx and transport errors are retried with backoff.
 func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult, whatsAppUploadOutcome) {
 	r.mu.Lock()
 	ob, gen, paused := r.outbox, r.generation, time.Now().Before(r.uploadPausedTil)
@@ -1374,9 +1415,12 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 		}
 		return res, whatsAppUploadSent
 	case res.Status == 400:
-		r.log("batch refused as invalid (" + res.Body.Code + "); dropped")
-		_ = ob.DropThrough(batch.SeqTo)
-		return res, whatsAppUploadSent
+		// Only the head record is known bad: dropping the whole range
+		// would silently lose up to 199 valid messages the cloud never
+		// ingested. Drop one, retry the rest with backoff.
+		r.log("batch refused as invalid (" + res.Body.Code + "); dropping head record")
+		_ = ob.Ack(batch.SeqFrom)
+		return res, whatsAppUploadRetry
 	case res.Status == 401 || res.Status == 403:
 		r.mu.Lock()
 		r.uploadPausedTil = time.Now().Add(whatsAppAuthPause)

@@ -250,10 +250,6 @@ func (ob *whatsAppOutbox) Ack(seq int64) error {
 	return ob.loadCountersLocked()
 }
 
-// DropThrough deletes a batch the cloud refused as malformed (400), so one bad
-// record cannot wedge the queue. Same as Ack; named for the log.
-func (ob *whatsAppOutbox) DropThrough(seq int64) error { return ob.Ack(seq) }
-
 func (ob *whatsAppOutbox) loadCountersLocked() error {
 	row := ob.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(size), 0) FROM outbox`)
 	return row.Scan(&ob.count, &ob.bytes)
