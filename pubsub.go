@@ -2418,8 +2418,13 @@ func runPubSubConnection(cfg *Config) error {
 			// so nothing is published here. A link start is acked only once
 			// its runner is persisted and pairing has begun (a crash before
 			// that redelivers it); the others once the supervisor has them.
-			handleWhatsAppCommand(cmd)
-			m.Ack()
+			// A link start that lands before a reconnect clears the pause is
+			// nacked so it is redelivered rather than dropped.
+			if handleWhatsAppCommand(cmd) {
+				m.Ack()
+			} else {
+				m.Nack()
+			}
 			return
 		}
 

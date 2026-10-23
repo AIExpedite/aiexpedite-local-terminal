@@ -34,10 +34,13 @@ type whatsAppKeystore interface {
 }
 
 var (
-	whatsAppKeystoreMu     sync.Mutex
-	activeWhatsAppKeystore whatsAppKeystore = platformWhatsAppKeystore{}
-	whatsAppKeystoreProbed bool
-	whatsAppKeystoreUsable bool
+	// whatsAppKeystoreProbeMu serializes the availability probe. It is taken
+	// before whatsAppKeystoreMu and is not held by Get/Put/Delete callers.
+	whatsAppKeystoreProbeMu sync.Mutex
+	whatsAppKeystoreMu      sync.Mutex
+	activeWhatsAppKeystore  whatsAppKeystore = platformWhatsAppKeystore{}
+	whatsAppKeystoreProbed  bool
+	whatsAppKeystoreUsable  bool
 )
 
 func currentWhatsAppKeystore() whatsAppKeystore {
@@ -63,7 +66,14 @@ func setWhatsAppKeystoreForTest(ks whatsAppKeystore) func() {
 // (capabilities.whatsapp.secureStorage). Probed once per process: the answer
 // only changes when the person installs a keyring, and the next agent start
 // picks that up.
+//
+// The probe is single-flight (whatsAppKeystoreProbeMu): every probe writes and
+// deletes the same availability-probe account, so two concurrent probes (the
+// startup capability report racing a link start) could delete each other's
+// entry and cache a false "unavailable" for the rest of the process.
 func whatsAppSecureStorageAvailable() bool {
+	whatsAppKeystoreProbeMu.Lock()
+	defer whatsAppKeystoreProbeMu.Unlock()
 	whatsAppKeystoreMu.Lock()
 	if whatsAppKeystoreProbed {
 		usable := whatsAppKeystoreUsable

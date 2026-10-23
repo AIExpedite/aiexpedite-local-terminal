@@ -52,33 +52,35 @@ func parseWhatsAppCommandParams(cmd commandMsg) (whatsAppLinkStartParams, error)
 // handleWhatsAppCommand dispatches a verified command. A link start runs to its
 // durable accepted state (runner persisted, pairing begun) before returning;
 // the other commands run on the supervisor's goroutines. Either way it returns
-// before the message is acked.
-func handleWhatsAppCommand(cmd commandMsg) {
+// before the message is acked. ack is false only for a link start that arrived
+// while the supervisor is paused: the caller nacks it so Pub/Sub redelivers it
+// after the resume instead of dropping it.
+func handleWhatsAppCommand(cmd commandMsg) (ack bool) {
 	p, err := parseWhatsAppCommandParams(cmd)
 	if err != nil {
 		logWhatsApp("-", "command "+cmd.Command+" refused: "+err.Error())
-		return
+		return true
 	}
 	sup := globalWhatsAppSupervisor
 	switch cmd.Command {
 	case whatsAppLinkStartCommand:
 		if p.Method != waPairQR && p.Method != waPairPhoneCode {
 			logWhatsApp(p.LinkID, "link start refused: unknown method")
-			return
+			return true
 		}
 		if p.Method == waPairPhoneCode && p.PhoneNumber == "" {
 			logWhatsApp(p.LinkID, "link start refused: phone number missing")
-			return
+			return true
 		}
 		if _, err := parseWhatsAppBrowserPub(p.BrowserPub); err != nil {
 			logWhatsApp(p.LinkID, "link start refused: bad browser key")
-			return
+			return true
 		}
 		logWhatsApp(p.LinkID, "link start ("+p.Method+")")
 		// Synchronous: the Pub/Sub message is acked only once the runner
 		// is persisted and pairing has begun, so an exit before that
 		// leaves the command to be redelivered instead of lost.
-		sup.linkStart(p)
+		return !sup.linkStart(p)
 	case whatsAppLinkCancelCommand:
 		go sup.linkCancel(p.LinkID, p.Generation)
 	case whatsAppUnlinkCommand:
@@ -86,4 +88,5 @@ func handleWhatsAppCommand(cmd commandMsg) {
 	case whatsAppResyncStateCommand:
 		go sup.resyncState(p.LinkID, p.Generation)
 	}
+	return true
 }

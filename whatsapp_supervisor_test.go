@@ -1494,3 +1494,84 @@ func TestWhatsAppSupervisorResumeHoldsALinkWhoseStoresCannotOpen(t *testing.T) {
 		return false
 	})
 }
+
+// A link start delivered while the supervisor is still paused (reconnect
+// races the Pub/Sub loop) is not acked, so Pub/Sub redelivers it; the
+// redelivery after the resume is accepted.
+func TestWhatsAppLinkStartWhilePausedIsNotAcked(t *testing.T) {
+	h := newSupervisorHarness(t)
+	h.sup.startWith(h.transport, true)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	defer func() { globalWhatsAppSupervisor = prev }()
+	_, pub := newBrowserKey(t)
+	arg, _ := json.Marshal(whatsAppLinkStartParams{LinkID: "lnk_paused", Generation: 1, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+	cmd := commandMsg{Command: whatsAppLinkStartCommand, Args: []string{string(arg)}}
+	if handleWhatsAppCommand(cmd) {
+		t.Fatal("a link start rejected while paused was acked")
+	}
+	if h.sup.runner("lnk_paused") != nil {
+		t.Fatal("a paused supervisor started a runner")
+	}
+	h.sup.setCloudConnected(true)
+	if !handleWhatsAppCommand(cmd) {
+		t.Fatal("the redelivered link start was not acked after the resume")
+	}
+	if h.sup.runner("lnk_paused") == nil {
+		t.Fatal("the redelivered link start was not accepted")
+	}
+}
+
+// A malformed link start is final: acking it stops a redelivery loop.
+func TestWhatsAppMalformedLinkStartIsAcked(t *testing.T) {
+	if !handleWhatsAppCommand(commandMsg{Command: whatsAppLinkStartCommand, Args: []string{"not json"}}) {
+		t.Fatal("a malformed link start must be acked")
+	}
+}
+
+// slowProbeKeystore counts concurrent Available probes.
+type slowProbeKeystore struct {
+	*memoryWhatsAppKeystore
+	mu           sync.Mutex
+	active, peak int
+	probes       int
+}
+
+func (k *slowProbeKeystore) Available() bool {
+	k.mu.Lock()
+	k.active++
+	k.probes++
+	if k.active > k.peak {
+		k.peak = k.active
+	}
+	k.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+	k.mu.Lock()
+	k.active--
+	k.mu.Unlock()
+	return true
+}
+
+// Concurrent callers share one availability probe: every probe uses the same
+// credential-store account, so overlapping probes could delete each other's
+// entry and cache a false "unavailable".
+func TestWhatsAppSecureStorageProbeIsSingleFlight(t *testing.T) {
+	ks := &slowProbeKeystore{memoryWhatsAppKeystore: newMemoryWhatsAppKeystore()}
+	defer setWhatsAppKeystoreForTest(ks)()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !whatsAppSecureStorageAvailable() {
+				t.Error("probe reported unavailable")
+			}
+		}()
+	}
+	wg.Wait()
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	if ks.peak != 1 || ks.probes != 1 {
+		t.Fatalf("probes ran concurrently or repeatedly: peak=%d probes=%d", ks.peak, ks.probes)
+	}
+}

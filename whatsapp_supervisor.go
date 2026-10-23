@@ -696,17 +696,22 @@ type whatsAppLinkStartParams struct {
 // linkStart begins pairing a (new or re-linked) generation. Any older
 // session of the same link is logged out and wiped first: a re-link always
 // pairs fresh. Serialized with every other lifecycle step (lifecycleMu).
-func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
+//
+// retry is true only when the supervisor is paused. On reconnect the Pub/Sub
+// loop can deliver a queued start before the resume clears the pause; acking
+// it then would lose it, because reconciliation never recreates a pairing
+// this computer holds no runner for. Every other outcome is final.
+func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) (retry bool) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if s.isPaused() {
-		logWhatsApp(p.LinkID, "link start ignored: disconnected from cloud")
-		return
+		logWhatsApp(p.LinkID, "link start deferred: disconnected from cloud")
+		return true
 	}
 	if existing := s.runner(p.LinkID); existing != nil {
 		if existing.generationNow() >= p.Generation {
 			existing.log("duplicate link start ignored")
-			return
+			return false
 		}
 		s.discard(existing, true)
 	}
@@ -730,7 +735,7 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 		r.log("refused: no OS credential store")
 		r.setState(waStateError, waErrSecureStorageUnavailable)
 		r.reportState(nil)
-		return
+		return false
 	}
 	_ = wipeWhatsAppLinkDir(p.LinkID)
 	_ = deleteWhatsAppOutboxKey(p.LinkID)
@@ -743,7 +748,7 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 		r.setState(waStatePairingRequired, "")
 		r.reportState(nil)
 		s.discard(r, false)
-		return
+		return false
 	}
 	s.mu.Lock()
 	s.links[r.linkID] = r
@@ -753,6 +758,7 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 	r.reportState(nil)
 	r.startLoops()
 	go r.pair(p.Method, p.BrowserPub, p.PhoneNumber)
+	return false
 }
 
 // linkCancel abandons a pairing in progress.
