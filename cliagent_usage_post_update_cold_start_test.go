@@ -177,6 +177,9 @@ func TestPostUpdateColdStart_Antigravity(t *testing.T) {
 		t.Run(path, func(t *testing.T) {
 			home, cache, stale, executable := helperGatedRunFreshnessFixture(t)
 			cold := helperColdVersionProbeOnce(t, "agy", "")
+			// Cleanups run last-registered-first: wait out the debt worker (it
+			// probes the build version) BEFORE the seam above is restored.
+			t.Cleanup(antigravityUsageRefreshWaitIdle)
 
 			if path == "direct run" {
 				session := &AntigravityNativeSession{ID: "cold-start-native", status: "idle"}

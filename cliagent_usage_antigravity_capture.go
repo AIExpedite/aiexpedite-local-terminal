@@ -678,12 +678,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 			rampFrom = discoveryAttempts
 			fmt.Printf("%s[antigravity-quota] Capture discovery ramp restarted for %s: the run's process started after the opening ramp (attempts=%d)%s\n",
 				colorCyan, label, discoveryAttempts, colorReset)
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			// Go >= 1.23 timers: Reset discards a pending fire, no drain needed.
 			timer.Reset(initial)
 		case <-timer.C:
 			probe(discoveryEnabled)
