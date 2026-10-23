@@ -56,15 +56,58 @@ func whatsAppLinkDir(linkID string) (string, error) {
 	return filepath.Join(whatsAppRootDir(), linkID), nil
 }
 
-// ensureWhatsAppLinkDir creates the link's directory owner-only and refuses
-// one that is a link (a symlink / junction planted where the directory
-// should be).
-func ensureWhatsAppLinkDir(linkID string) (string, error) {
-	root := whatsAppRootDir()
-	if err := os.MkdirAll(root, 0o700); err != nil {
+// errWhatsAppRootNotPlain refuses a WhatsApp root that is a symlink, a
+// junction or a file: everything below it would otherwise be created in,
+// re-permissioned in, or deleted from the link target.
+var errWhatsAppRootNotPlain = errors.New("WhatsApp directory is not a plain directory")
+
+// checkWhatsAppRootPlain lstats the root itself before any child is reached
+// through it. An absent root is fine (exists reports false).
+func checkWhatsAppRootPlain() (root string, exists bool, err error) {
+	root = whatsAppRootDir()
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return root, false, nil
+	}
+	if err != nil {
+		return root, false, err
+	}
+	if isWorktreeLink(info, root) || !info.IsDir() {
+		return root, true, errWhatsAppRootNotPlain
+	}
+	return root, true, nil
+}
+
+// ensureWhatsAppRootDir creates the root owner-only, refusing one that is a
+// link before MkdirAll or the ACL change could follow it.
+func ensureWhatsAppRootDir() (string, error) {
+	root, exists, err := checkWhatsAppRootPlain()
+	if err != nil {
 		return "", err
 	}
+	if !exists {
+		if err := os.MkdirAll(filepath.Dir(root), 0o700); err != nil {
+			return "", err
+		}
+		if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+		// Re-check: something may have raced into the name.
+		if _, _, err := checkWhatsAppRootPlain(); err != nil {
+			return "", err
+		}
+	}
 	if err := restrictToOwner(root); err != nil {
+		return "", err
+	}
+	return root, nil
+}
+
+// ensureWhatsAppLinkDir creates the link's directory owner-only and refuses
+// one that is a link (a symlink / junction planted where the directory
+// should be), at the root or at the link directory itself.
+func ensureWhatsAppLinkDir(linkID string) (string, error) {
+	if _, err := ensureWhatsAppRootDir(); err != nil {
 		return "", err
 	}
 	dir, err := whatsAppLinkDir(linkID)
@@ -87,10 +130,14 @@ func ensureWhatsAppLinkDir(linkID string) (string, error) {
 }
 
 // wipeWhatsAppLinkDir deletes a link's directory without following links. An
-// absent directory is success.
+// absent directory is success; a root that is itself a link is refused, so
+// the delete never reaches a same-named directory in the link target.
 func wipeWhatsAppLinkDir(linkID string) error {
 	dir, err := whatsAppLinkDir(linkID)
 	if err != nil {
+		return err
+	}
+	if _, exists, err := checkWhatsAppRootPlain(); err != nil || !exists {
 		return err
 	}
 	// A file a just-closed SQLite handle released can stay locked for a
@@ -108,10 +155,11 @@ func wipeWhatsAppLinkDir(linkID string) error {
 // session directories, for when links.json cannot be read. Only plain
 // directories named with a valid link id count; an absent root is no links.
 func listWhatsAppLinkDirs() ([]whatsAppLocalLink, error) {
-	entries, err := os.ReadDir(whatsAppRootDir())
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+	root, exists, err := checkWhatsAppRootPlain()
+	if err != nil || !exists {
+		return nil, err
 	}
+	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +197,11 @@ var whatsAppLinksFileMu sync.Mutex
 func loadWhatsAppLocalLinks() ([]whatsAppLocalLink, error) {
 	whatsAppLinksFileMu.Lock()
 	defer whatsAppLinksFileMu.Unlock()
-	raw, err := os.ReadFile(filepath.Join(whatsAppRootDir(), whatsAppLinksFileName))
+	root, exists, err := checkWhatsAppRootPlain()
+	if err != nil || !exists {
+		return nil, err
+	}
+	raw, err := os.ReadFile(filepath.Join(root, whatsAppLinksFileName))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -175,11 +227,8 @@ func loadWhatsAppLocalLinks() ([]whatsAppLocalLink, error) {
 func saveWhatsAppLocalLinks(links []whatsAppLocalLink) error {
 	whatsAppLinksFileMu.Lock()
 	defer whatsAppLinksFileMu.Unlock()
-	root := whatsAppRootDir()
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
-	if err := restrictToOwner(root); err != nil {
+	root, err := ensureWhatsAppRootDir()
+	if err != nil {
 		return err
 	}
 	if links == nil {

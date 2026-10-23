@@ -636,6 +636,34 @@ func TestWhatsAppSupervisorRefusesWithoutSecureStorage(t *testing.T) {
 	}
 }
 
+// A shutdown that begins while a link start is opening its stores must not
+// miss the new runner, and the start must be nacked rather than acked.
+func TestWhatsAppSupervisorLinkStartRacingShutdownIsDeferred(t *testing.T) {
+	h := newSupervisorHarness(t)
+	h.sup.start(h.transport)
+	factory := newWhatsAppClient
+	newWhatsAppClient = func(dir string) (whatsAppClient, error) {
+		go h.sup.ShutdownAll(context.Background())
+		waitFor(t, "shutdown began", h.sup.stopping)
+		return factory(dir)
+	}
+	_, pub := newBrowserKey(t)
+	retry := h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 1, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+	if !retry {
+		t.Fatal("a link start admitted during shutdown was acked")
+	}
+	if h.sup.runner("lnk_1") != nil {
+		t.Fatal("a runner was admitted after the shutdown snapshot")
+	}
+	if links, _ := loadWhatsAppLocalLinks(); len(links) != 0 {
+		t.Fatalf("pairing persisted during shutdown: %+v", links)
+	}
+	// And a start delivered after shutdown is deferred before any work.
+	if !h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_2", Generation: 1, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub}) {
+		t.Fatal("a link start after shutdown was acked")
+	}
+}
+
 func TestWhatsAppSupervisorDuplicateLinkStartIgnored(t *testing.T) {
 	h, _ := pairedHarness(t)
 	_, pub := newBrowserKey(t)

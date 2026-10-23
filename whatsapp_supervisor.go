@@ -702,12 +702,17 @@ type whatsAppLinkStartParams struct {
 // retry is true only when the supervisor is paused. On reconnect the Pub/Sub
 // loop can deliver a queued start before the resume clears the pause; acking
 // it then would lose it, because reconciliation never recreates a pairing
-// this computer holds no runner for. Every other outcome is final.
+// this computer holds no runner for. It is also true once shutdown began, so
+// the start is redelivered to the next boot. Every other outcome is final.
 func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) (retry bool) {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if s.isPaused() {
 		logWhatsApp(p.LinkID, "link start deferred: disconnected from cloud")
+		return true
+	}
+	if s.stopping() {
+		logWhatsApp(p.LinkID, "link start deferred: agent shutting down")
 		return true
 	}
 	if existing := s.runner(p.LinkID); existing != nil {
@@ -752,7 +757,19 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) (retry bool) {
 		s.discard(r, false)
 		return false
 	}
+	// Admission is checked under the same lock ShutdownAll snapshots the
+	// runners with: a shutdown that began while the credential-store probe or
+	// the store open was blocking would otherwise never stop this runner,
+	// and an ack would lose the start. Nack it instead; the redelivered start
+	// wipes the unpaired session and pairs fresh.
 	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		r.log("link start deferred: agent shutting down")
+		r.stop(false)
+		_ = r.closeStores()
+		return true
+	}
 	s.links[r.linkID] = r
 	s.mu.Unlock()
 	r.setState(waStatePairing, "")

@@ -96,6 +96,42 @@ func TestEnsureWhatsAppLinkDirRefusesAPlantedLink(t *testing.T) {
 	}
 }
 
+func TestWhatsAppStoreRefusesALinkedRoot(t *testing.T) {
+	_, root := withWhatsAppTestEnv(t)
+	if err := os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "lnk_root")
+	if err := os.Mkdir(victim, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	precious := filepath.Join(victim, "precious.txt")
+	if err := os.WriteFile(precious, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plantWhatsAppDirLink(t, root, outside)
+
+	if _, err := ensureWhatsAppLinkDir("lnk_new"); err == nil {
+		t.Fatal("created a link directory through a linked root")
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "lnk_new")); !os.IsNotExist(err) {
+		t.Fatal("a directory was created in the link target")
+	}
+	if err := saveWhatsAppLocalLinks(nil); err == nil {
+		t.Fatal("wrote links.json through a linked root")
+	}
+	if _, err := listWhatsAppLinkDirs(); err == nil {
+		t.Fatal("listed link directories through a linked root")
+	}
+	if err := wipeWhatsAppLinkDir("lnk_root"); err == nil {
+		t.Fatal("wiped through a linked root")
+	}
+	if b, err := os.ReadFile(precious); err != nil || string(b) != "keep" {
+		t.Fatal("the wipe reached the link target")
+	}
+}
+
 func TestWhatsAppLinkDirIsOwnerOnly(t *testing.T) {
 	withWhatsAppTestEnv(t)
 	dir, err := ensureWhatsAppLinkDir("lnk_acl")
