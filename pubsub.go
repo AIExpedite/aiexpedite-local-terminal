@@ -2415,8 +2415,9 @@ func runPubSubConnection(cfg *Config) error {
 		if isWhatsAppCommand(cmd.Command) {
 			// Personal WhatsApp link commands (whatsapp_commands.go). The
 			// device reports back over POST /device/:agentId/whatsapp/sync,
-			// so nothing is published here; the message is acked once the
-			// supervisor has the command.
+			// so nothing is published here. A link start is acked only once
+			// its runner is persisted and pairing has begun (a crash before
+			// that redelivers it); the others once the supervisor has them.
 			handleWhatsAppCommand(cmd)
 			m.Ack()
 			return

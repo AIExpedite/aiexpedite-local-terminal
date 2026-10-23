@@ -476,7 +476,7 @@ func StartAgent(cfg *Config) {
 	// draining or shutting down, and resumes when the device is back.
 	startLoadReporter(cfg)
 
-	// Personal WhatsApp links (WHATSAPP_INTEGRATION.md): resume every link in
+	// Personal WhatsApp links (local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md): resume every link in
 	// whatsapp/links.json and reconcile with the cloud. Registers no drain
 	// work source — a WhatsApp link never holds up an agent update. While the
 	// user is disconnected from cloud it starts paused (nothing connects or

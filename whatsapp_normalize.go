@@ -1,7 +1,7 @@
 // whatsapp_normalize.go — whatsmeow events → ingest records.
 //
 // The ONLY place WhatsApp content is read. It produces whatsAppRecord values
-// (the batch record shapes in WHATSAPP_INTEGRATION.md "Wire contract") and
+// (the batch record shapes in local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md "Wire contract") and
 // nothing else: no log line here or downstream ever carries text, a JID, a
 // name or a media detail — the supervisor logs counts and link ids only.
 //

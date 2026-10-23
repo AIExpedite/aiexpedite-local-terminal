@@ -169,7 +169,7 @@ type capabilitiesInfo struct {
 	// Never omitempty: a future build reporting `false` must not read as
 	// "field absent".
 	SignedExecutionID bool `json:"signedExecutionId"`
-	// WhatsApp (`capabilities.whatsapp`, WHATSAPP_INTEGRATION.md
+	// WhatsApp (`capabilities.whatsapp`, local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md
 	// "Authorization and isolation"): this build embeds the whatsmeow bridge
 	// (whatsapp_supervisor.go). `secureStorage` is whether the OS credential
 	// store works here; a Linux computer without Secret Service reports false

@@ -146,8 +146,9 @@ func whatsAppClientVersion() string {
    -------------------------------------------------------------------------- */
 
 // whatsAppJIDPattern masks WhatsApp addresses (phone numbers, LIDs, groups)
-// in any whatsmeow line that quotes one.
-var whatsAppJIDPattern = regexp.MustCompile(`\+?[0-9]{5,}(?:[.:][0-9]+)*@(?:s\.whatsapp\.net|lid|g\.us|c\.us|broadcast|newsletter)`)
+// in any whatsmeow line that quotes one, including legacy group JIDs
+// ("creator-timestamp@g.us").
+var whatsAppJIDPattern = regexp.MustCompile(`\+?[0-9]{5,}(?:-[0-9]+)?(?:[.:][0-9]+)*@(?:s\.whatsapp\.net|lid|g\.us|c\.us|broadcast|newsletter)`)
 
 // whatsAppPairCodePattern is the 8-character phone pairing code ("ABCD-EFGH").
 var whatsAppPairCodePattern = regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4}\b`)

@@ -215,9 +215,9 @@ func TestNormalizeGroupInfoJoinLeave(t *testing.T) {
 }
 
 func TestRedactWhatsAppLog(t *testing.T) {
-	in := "pair 2@AbCdEfGhIjKl,mnopQRST,uvwx,yz12 code ABCD-EFGH from 15551234567@s.whatsapp.net and 1203630@g.us"
+	in := "pair 2@AbCdEfGhIjKl,mnopQRST,uvwx,yz12 code ABCD-EFGH from 15551234567@s.whatsapp.net and 1203630@g.us and legacy 15557654321-1600000000@g.us"
 	out := redactWhatsAppLog(in)
-	for _, leak := range []string{"2@AbCdEfGhIjKl", "ABCD-EFGH", "15551234567", "1203630@g.us"} {
+	for _, leak := range []string{"2@AbCdEfGhIjKl", "ABCD-EFGH", "15551234567", "1203630@g.us", "15557654321", "1600000000"} {
 		if strings.Contains(out, leak) {
 			t.Fatalf("leaked %q in %q", leak, out)
 		}

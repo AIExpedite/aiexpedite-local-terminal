@@ -118,6 +118,10 @@ type whatsAppLocalLink struct {
 	// HistoryComplete records that the link-time history sync finished, so a
 	// restart reports `connected` instead of `syncingHistory` again.
 	HistoryComplete bool `json:"historyComplete,omitempty"`
+	// PendingWipe marks a link a deregistration could not fully delete (a
+	// locked credential store, a held file). It is never resumed; the next
+	// start retries the cleanup until it succeeds.
+	PendingWipe bool `json:"pendingWipe,omitempty"`
 }
 
 var whatsAppLinksFileMu sync.Mutex

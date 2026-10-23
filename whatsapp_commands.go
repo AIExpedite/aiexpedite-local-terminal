@@ -49,8 +49,10 @@ func parseWhatsAppCommandParams(cmd commandMsg) (whatsAppLinkStartParams, error)
 	return p, nil
 }
 
-// handleWhatsAppCommand dispatches a verified command. Long work runs on the
-// supervisor's goroutines; this returns quickly so the message is acked.
+// handleWhatsAppCommand dispatches a verified command. A link start runs to its
+// durable accepted state (runner persisted, pairing begun) before returning;
+// the other commands run on the supervisor's goroutines. Either way it returns
+// before the message is acked.
 func handleWhatsAppCommand(cmd commandMsg) {
 	p, err := parseWhatsAppCommandParams(cmd)
 	if err != nil {
@@ -73,7 +75,10 @@ func handleWhatsAppCommand(cmd commandMsg) {
 			return
 		}
 		logWhatsApp(p.LinkID, "link start ("+p.Method+")")
-		go sup.linkStart(p)
+		// Synchronous: the Pub/Sub message is acked only once the runner
+		// is persisted and pairing has begun, so an exit before that
+		// leaves the command to be redelivered instead of lost.
+		sup.linkStart(p)
 	case whatsAppLinkCancelCommand:
 		go sup.linkCancel(p.LinkID, p.Generation)
 	case whatsAppUnlinkCommand:

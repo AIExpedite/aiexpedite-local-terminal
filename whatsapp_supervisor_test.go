@@ -1025,7 +1025,8 @@ func TestWhatsAppSupervisorAuthExpiredFlushTimeoutRetainsOutbox(t *testing.T) {
 	c.emit(liveMsg(waPeer, waPeer, false, "A1", &waE2E.Message{Conversation: proto.String("x")}))
 	waitFor(t, "queued", func() bool {
 		if r := h.sup.runner("lnk_1"); r != nil {
-			return r.outboxDepth() > 0
+			depth, _ := r.outboxDepth()
+			return depth > 0
 		}
 		return false
 	})
@@ -1121,5 +1122,124 @@ func TestWhatsAppSupervisorOversizedHistoryChunkSplits(t *testing.T) {
 		if !seen[seq] {
 			t.Fatalf("record with deviceSeq %d was never uploaded", seq)
 		}
+	}
+}
+
+// A cloud pause that closes the stores under an auth-expiry drain must not
+// read as "drained": the outbox and its key survive, and the resume after
+// reconnect drains them before the wipe.
+func TestWhatsAppSupervisorAuthExpiredDrainSurvivesCloudPause(t *testing.T) {
+	h, c := pairedHarness(t)
+	prevFlush := whatsAppAuthFlushTimeout
+	whatsAppAuthFlushTimeout = 50 * time.Millisecond
+	defer func() { whatsAppAuthFlushTimeout = prevFlush }()
+	var mu sync.Mutex
+	healthy := false
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !healthy {
+			return whatsAppSyncResult{Status: 503}
+		}
+		to := int64(p["seqTo"].(float64))
+		return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
+	}
+	h.transport.mu.Unlock()
+	c.emit(liveMsg(waPeer, waPeer, false, "A1", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "queued", func() bool {
+		if r := h.sup.runner("lnk_1"); r != nil {
+			depth, _ := r.outboxDepth()
+			return depth > 0
+		}
+		return false
+	})
+	c.emit(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	time.Sleep(100 * time.Millisecond)
+	h.sup.setCloudConnected(false)
+	time.Sleep(200 * time.Millisecond)
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatal("a pause during the auth-expiry drain deleted the undrained outbox key")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("a pause during the auth-expiry drain wiped the undrained outbox")
+	}
+	mu.Lock()
+	healthy = true
+	mu.Unlock()
+	h.sup.setCloudConnected(true) // the next client has no session: still expired
+	waitFor(t, "drained after resume", func() bool {
+		_, err := h.ks.Get("lnk_1")
+		return err != nil && h.sup.runner("lnk_1") == nil
+	})
+	var delivered bool
+	for _, p := range h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch }) {
+		for _, rec := range p["records"].([]any) {
+			if rec.(map[string]any)["waMessageId"] == "A1" {
+				delivered = true
+			}
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !delivered {
+		t.Fatal("the captured message was never uploaded")
+	}
+}
+
+// A deregistration whose cleanup fails must leave a durable marker, so the
+// next start retries the wipe instead of orphaning the session material.
+func TestWhatsAppSupervisorWipeAllKeepsFailedCleanupForRetry(t *testing.T) {
+	h, _ := pairedHarness(t)
+	h.ks.unavailable = true
+	h.sup.WipeAll()
+	h.ks.unavailable = false
+	local, err := loadWhatsAppLocalLinks()
+	if err != nil || len(local) != 1 || local[0].LinkID != "lnk_1" || !local[0].PendingWipe {
+		t.Fatalf("links.json must keep the failed wipe for a retry: %+v %v", local, err)
+	}
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatal("the outbox key should still be there after the failed cleanup")
+	}
+
+	next := &whatsAppSupervisor{}
+	next.start(h.transport)
+	defer next.ShutdownAll(context.Background())
+	if _, err := h.ks.Get("lnk_1"); err == nil {
+		t.Fatal("the next start did not retry the pending wipe")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("the next start left the session directory")
+	}
+	if next.runner("lnk_1") != nil {
+		t.Fatal("a pending-wipe link must never be resumed")
+	}
+	if local, _ := loadWhatsAppLocalLinks(); len(local) != 0 {
+		t.Fatalf("links.json still lists a completed wipe: %+v", local)
+	}
+}
+
+// A link start is acked only once it is durably accepted: by the time the
+// handler returns the runner exists and links.json lists it.
+func TestWhatsAppLinkStartCommandIsAcceptedBeforeReturning(t *testing.T) {
+	h := newSupervisorHarness(t)
+	h.sup.start(h.transport)
+	prev := globalWhatsAppSupervisor
+	globalWhatsAppSupervisor = h.sup
+	defer func() { globalWhatsAppSupervisor = prev }()
+	_, pub := newBrowserKey(t)
+	arg, _ := json.Marshal(whatsAppLinkStartParams{LinkID: "lnk_ack", Generation: 1, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+	handleWhatsAppCommand(commandMsg{Command: whatsAppLinkStartCommand, Args: []string{string(arg)}})
+	if h.sup.runner("lnk_ack") == nil {
+		t.Fatal("the link start was not accepted before the handler returned")
+	}
+	local, _ := loadWhatsAppLocalLinks()
+	if len(local) != 1 || local[0].LinkID != "lnk_ack" {
+		t.Fatalf("links.json does not list the accepted link: %+v", local)
 	}
 }

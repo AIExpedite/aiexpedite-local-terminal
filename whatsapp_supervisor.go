@@ -7,7 +7,7 @@
 // moved on: the session is logged out and wiped, never retried. That is what
 // keeps an old agent process from resurrecting a disconnected link.
 //
-// State mapping (WHATSAPP_INTEGRATION.md "Link states"):
+// State mapping (local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md "Link states"):
 //
 //	link start accepted             → pairing
 //	PairSuccess                     → connecting
@@ -136,6 +136,9 @@ type whatsAppSupervisor struct {
 	// are the links held at the pause; persist keeps them in links.json.
 	paused      bool
 	pausedLinks []whatsAppLocalLink
+	// pendingWipes are links whose deregistration cleanup failed; persist
+	// keeps them in links.json (PendingWipe) so the next start retries.
+	pendingWipes []whatsAppLocalLink
 	// discardsInFlight counts wipes in flight (under mu), so shutdown never
 	// exits halfway through deleting a session (key gone, directory still
 	// there). A counter, not a WaitGroup: a fenced flush can start a discard
@@ -177,17 +180,47 @@ func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool)
 	if err != nil {
 		logWhatsApp("-", "links.json unreadable: "+err.Error())
 	}
+	local, hadPending := s.retryPendingWipes(local)
 	if paused {
 		s.mu.Lock()
 		s.paused, s.pausedLinks = true, local
 		s.mu.Unlock()
+		if hadPending {
+			s.persist()
+		}
 		logWhatsApp("-", "disconnected from cloud; links paused")
 		return
 	}
 	for _, l := range local {
 		s.resume(l)
 	}
+	if hadPending {
+		s.persist()
+	}
 	go s.reconcileLoop()
+}
+
+// retryPendingWipes finishes deregistration cleanups an earlier run could
+// not complete. It returns the links still to resume; a pending-wipe link
+// never is (its registration is gone). Cleanups that fail again stay in
+// s.pendingWipes for the next start.
+func (s *whatsAppSupervisor) retryPendingWipes(local []whatsAppLocalLink) (live []whatsAppLocalLink, hadPending bool) {
+	var pending []whatsAppLocalLink
+	for _, l := range local {
+		if !l.PendingWipe {
+			live = append(live, l)
+			continue
+		}
+		hadPending = true
+		if err := deleteWhatsAppLinkSecrets(l.LinkID); err != nil {
+			logWhatsApp(l.LinkID, "deregistration cleanup failed again: "+err.Error())
+			pending = append(pending, l)
+		}
+	}
+	s.mu.Lock()
+	s.pendingWipes = pending
+	s.mu.Unlock()
+	return live, hadPending
 }
 
 // followWhatsAppCloudConnection pauses or resumes the supervisor to match the
@@ -316,6 +349,7 @@ func (s *whatsAppSupervisor) persist() {
 			out = append(out, l)
 		}
 	}
+	out = append(out, s.pendingWipes...)
 	s.mu.Unlock()
 	if err := saveWhatsAppLocalLinks(out); err != nil {
 		logWhatsApp("-", "links.json not saved: "+err.Error())
@@ -438,6 +472,15 @@ func (s *whatsAppSupervisor) resume(l whatsAppLocalLink) {
 		next := waStateAuthExpired
 		if l.State == waStatePairing || l.State == waStatePairingRequired {
 			next = waStatePairingRequired
+		}
+		if depth, _ := r.outboxDepth(); next == waStateAuthExpired && depth > 0 {
+			// An auth-expiry drain a pause or shutdown cut short: the
+			// captured rows still upload before the wipe.
+			s.mu.Lock()
+			s.links[r.linkID] = r
+			s.mu.Unlock()
+			r.authExpired()
+			return
 		}
 		r.setState(next, "")
 		r.reportState(nil)
@@ -596,6 +639,16 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 	}
 	_ = wipeWhatsAppLinkDir(p.LinkID)
 	_ = deleteWhatsAppOutboxKey(p.LinkID)
+	// A pending wipe of this id would delete the session paired below.
+	s.mu.Lock()
+	kept := s.pendingWipes[:0]
+	for _, l := range s.pendingWipes {
+		if l.LinkID != p.LinkID {
+			kept = append(kept, l)
+		}
+	}
+	s.pendingWipes = kept
+	s.mu.Unlock()
 	if err := r.open(true); err != nil {
 		r.log("pairing could not start: " + err.Error())
 		r.setState(waStatePairingRequired, "")
@@ -779,30 +832,50 @@ func (s *whatsAppSupervisor) waitDiscards(ctx context.Context) {
 }
 
 // WipeAll logs out and deletes every local link: the computer was
-// deregistered, so nothing it held may outlive the registration.
+// deregistered, so nothing it held may outlive the registration. A link whose
+// cleanup fails stays in links.json marked PendingWipe, so the next start
+// retries it instead of orphaning its session material.
 func (s *whatsAppSupervisor) WipeAll() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	// Read before the discards below rewrite links.json: it also lists the
+	// paused links, earlier pending wipes and links that failed to load.
+	onDisk, _ := loadWhatsAppLocalLinks()
 	s.mu.Lock()
-	s.pausedLinks = nil
+	others := append(onDisk, s.pausedLinks...)
+	s.pausedLinks, s.pendingWipes = nil, nil
 	runners := make([]*whatsAppLinkRunner, 0, len(s.links))
 	for _, r := range s.links {
 		runners = append(runners, r)
 	}
 	s.mu.Unlock()
+	var pending []whatsAppLocalLink
+	done := map[string]bool{}
 	for _, r := range runners {
-		s.discard(r, true)
-	}
-	// Anything on disk the runners did not cover (a link that failed to load).
-	if local, err := loadWhatsAppLocalLinks(); err == nil {
-		for _, l := range local {
-			_ = deleteWhatsAppOutboxKey(l.LinkID)
-			_ = wipeWhatsAppLinkDir(l.LinkID)
+		l := r.localLink()
+		done[l.LinkID] = true
+		if err := s.discard(r, true); err != nil {
+			l.PendingWipe = true
+			pending = append(pending, l)
 		}
 	}
-	whatsAppPersistMu.Lock()
-	_ = saveWhatsAppLocalLinks(nil)
-	whatsAppPersistMu.Unlock()
+	for _, l := range others {
+		if done[l.LinkID] {
+			continue
+		}
+		done[l.LinkID] = true
+		if err := deleteWhatsAppLinkSecrets(l.LinkID); err != nil {
+			l.PendingWipe = true
+			pending = append(pending, l)
+		}
+	}
+	for _, l := range pending {
+		logWhatsApp(l.LinkID, "deregistration cleanup failed; retried on the next start")
+	}
+	s.mu.Lock()
+	s.pendingWipes = pending
+	s.mu.Unlock()
+	s.persist()
 }
 
 // whatsAppCapability is what systemInfo.go reports.
@@ -1213,8 +1286,18 @@ func (r *whatsAppLinkRunner) authExpired() {
 		// The session is dead but the outbox is device-authenticated, so
 		// rows the bounded flush could not deliver stay queued: keep
 		// draining instead of wiping captured messages with their key.
-		// Only an empty outbox is wiped below.
-		for attempt := 0; r.outboxDepth() > 0; attempt++ {
+		// Only an empty outbox is wiped below. A closed one is not empty:
+		// a cloud pause or shutdown closed the stores under this drain, the
+		// rows are still on disk, and the next resume drains them.
+		for attempt := 0; ; attempt++ {
+			depth, open := r.outboxDepth()
+			if !open {
+				r.log("stores closed while draining; the outbox stays for the next start")
+				return
+			}
+			if depth == 0 {
+				break
+			}
 			if r.sup.ctx.Err() != nil || r.sup.stopping() {
 				return // shutdown owns the runner now; files stay for next boot
 			}
@@ -1239,16 +1322,16 @@ func (r *whatsAppLinkRunner) authExpired() {
 	}()
 }
 
-// outboxDepth is the queued rows still needing delivery (0 when the stores
-// are already closed).
-func (r *whatsAppLinkRunner) outboxDepth() int64 {
+// outboxDepth is the queued rows still needing delivery. open is false once
+// the stores are closed: a closed outbox is not a drained one.
+func (r *whatsAppLinkRunner) outboxDepth() (depth int64, open bool) {
 	r.mu.Lock()
 	ob := r.outbox
 	r.mu.Unlock()
 	if ob == nil {
-		return 0
+		return 0, false
 	}
-	return ob.Depth()
+	return ob.Depth(), true
 }
 
 // connectLoop connects a resumed link, backing off on failure. whatsmeow's own
