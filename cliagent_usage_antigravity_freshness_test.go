@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -93,11 +94,14 @@ func helperParsedObservedAt(t *testing.T, home string, now time.Time) (*cliAgent
 // probe — finds nothing here and this test fails.
 func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 	// No interval override: this asserts the SHIPPED capture cadence samples a
-	// turn shorter than antigravityCapturePollInterval.
+	// turn shorter than antigravityCapturePollInterval. The mock serves until
+	// read, so the cadence is pinned by WHEN the first read landed.
 	home, cache := helperIsolateAntigravityCapture(t, "")
 	helperSeedStaleAntigravityCache(t, cache)
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
 	t.Setenv(mockAgyQuotaBaseEnv, base)
+	firstRead := filepath.Join(t.TempDir(), "first-read-ms")
+	t.Setenv(mockAgyQuotaFirstReadEnv, firstRead)
 	_, executable := helperMockAgyOnPath(t, "antigravity-quota-server")
 
 	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
@@ -126,6 +130,14 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 	usage, observed := helperParsedObservedAt(t, home, time.Now())
 	if !observed.After(stale) {
 		t.Fatalf("observedAt=%s did not advance past the stale %s", observed, stale)
+	}
+	raw, err := os.ReadFile(firstRead)
+	if err != nil {
+		t.Fatalf("the turn's server was never read: %v", err)
+	}
+	if ms, err := strconv.ParseInt(string(raw), 10, 64); err != nil || time.Duration(ms)*time.Millisecond > mockAgyQuotaMinLifetime {
+		t.Errorf("first quota read %sms after the child started, want inside the %s turn — the shipped cadence missed a fast turn",
+			raw, mockAgyQuotaMinLifetime)
 	}
 	if usage.Account != "ada@example.com" {
 		t.Errorf("account=%q, want the producing identity", usage.Account)

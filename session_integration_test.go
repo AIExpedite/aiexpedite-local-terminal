@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,9 +79,17 @@ const mockAgyQuotaBaseEnv = "TEST_MOCK_AGY_QUOTA_BASE"
 const mockCLIWarmupMode = "warmup"
 
 // mockAgyQuotaMinLifetime is how long the quota-server mock stays alive after
-// it starts, at least. Kept short so the test proves the SHIPPED capture cadence
-// samples a fast turn, rather than relying on a shrunken test interval.
+// it starts, at least: the length of the fast turn a SHIPPED capture cadence
+// must sample. The mock may serve longer (until read), so a test that pins the
+// cadence asserts the first read landed inside this window instead, through
+// mockAgyQuotaFirstReadEnv.
 const mockAgyQuotaMinLifetime = 1500 * time.Millisecond
+
+// mockAgyQuotaFirstReadEnv names a file the quota-server mock writes, on its
+// first quota read, the milliseconds since the mock process started. Measured
+// from the child's own start, so a cold Start (an AV scan before the process
+// runs) does not count against the capture.
+const mockAgyQuotaFirstReadEnv = "TEST_MOCK_AGY_QUOTA_FIRST_READ_FILE"
 
 // mockAgyQuotaMaxLifetime caps how long the quota-server mock waits for its
 // first quota read past mockAgyQuotaMinLifetime. A fixed lifetime let a child
@@ -362,7 +371,12 @@ func runMockCLI(mode string) {
 		mux.HandleFunc(antigravityQuotaRPC, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(helperQuotaJSON))
-			quotaReadOnce.Do(func() { close(quotaRead) })
+			quotaReadOnce.Do(func() {
+				if marker := os.Getenv(mockAgyQuotaFirstReadEnv); marker != "" {
+					_ = os.WriteFile(marker, []byte(strconv.FormatInt(time.Since(start).Milliseconds(), 10)), 0o600)
+				}
+				close(quotaRead)
+			})
 		})
 		mux.HandleFunc(antigravityStatusRPC, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
