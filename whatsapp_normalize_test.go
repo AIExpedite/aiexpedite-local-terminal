@@ -151,6 +151,47 @@ func TestNormalizeCanonicalIdentity(t *testing.T) {
 	}
 }
 
+// Operation targets and history conversation ids carry no alternate address:
+// the session store's LID mapping resolves them to the same phone-number
+// identity the original messages normalized to.
+func TestNormalizeResolvesLIDTargetsThroughTheStore(t *testing.T) {
+	lid := types.NewJID("999888777", types.HiddenUserServer)
+	nc := whatsAppNormalizeContext{OwnJID: waMe, PNForLID: func(j types.JID) types.JID {
+		if j == lid {
+			return waPeer
+		}
+		return types.EmptyJID
+	}}
+
+	revoke := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("GONE"), Participant: proto.String("999888777:2@lid")}}}
+	if r := one(t, normalizeWhatsAppMessage(liveMsg(waGroup, waMe, true, "X", revoke), waSourceLive, nc)); r.SenderJid != waPeer.String() {
+		t.Fatalf("revoke target = %s", r.SenderJid)
+	}
+	react := &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{Key: &waCommon.MessageKey{ID: proto.String("T"), Participant: proto.String("999888777@lid")}, Text: proto.String("👍")}}
+	if r := one(t, normalizeWhatsAppMessage(liveMsg(waGroup, waMe, true, "R", react), waSourceLive, nc)); r.SenderJid != waPeer.String() {
+		t.Fatalf("reaction target = %s", r.SenderJid)
+	}
+	// An unknown LID stays a LID.
+	other := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("G2"), Participant: proto.String("111@lid")}}}
+	if r := one(t, normalizeWhatsAppMessage(liveMsg(waGroup, waMe, true, "Y", other), waSourceLive, nc)); r.SenderJid != "111@lid" {
+		t.Fatalf("unknown LID = %s", r.SenderJid)
+	}
+
+	// A direct history chat keyed by LID: the conversation and its message
+	// share the phone-number chat id.
+	web := &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(lid.String()), ID: proto.String("H1")}, MessageTimestamp: proto.Uint64(1_800_000_000), Message: &waE2E.Message{Conversation: proto.String("old")}}
+	data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(lid.String()), Messages: []*waHistorySync.HistorySyncMsg{{Message: web}}}}}
+	parse := func(chat types.JID, w *waWeb.WebMessageInfo) (*events.Message, error) {
+		evt := liveMsg(lid, lid, false, w.GetKey().GetID(), w.GetMessage())
+		evt.Info.SenderAlt = waPeer
+		return evt, nil
+	}
+	recs, _ := normalizeWhatsAppHistory(data, parse, nc)
+	if len(recs) != 2 || recs[0].Kind != waRecordConversation || recs[0].ChatJid != waPeer.String() || recs[1].ChatJid != waPeer.String() {
+		t.Fatalf("history records = %+v", recs)
+	}
+}
+
 func TestNormalizeCatchUpAndSkippedChats(t *testing.T) {
 	nc := whatsAppNormalizeContext{ReconnectedAt: waTS.Add(time.Minute)}
 	r := one(t, normalizeWhatsAppMessage(liveMsg(waPeer, waPeer, false, "C", &waE2E.Message{Conversation: proto.String("queued")}), waSourceLive, nc))

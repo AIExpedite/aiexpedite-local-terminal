@@ -13,7 +13,8 @@
 //	PairSuccess                     → connecting
 //	Connected                       → syncingHistory (history pending) / connected
 //	initial history done / 10 min   → connected
-//	LoggedOut / StreamReplaced      → authExpired  (session wiped, no retry)
+//	LoggedOut                       → authExpired  (session wiped, no retry)
+//	StreamReplaced                  → error WHATSAPP_CONNECT_FAILING (session kept, no retry until restart)
 //	TemporaryBan / banned logout    → error WHATSAPP_ACCOUNT_RESTRICTED (no retry)
 //	ClientOutdated / 405            → error WHATSAPP_CLIENT_OUTDATED (no retry)
 //	30 min failing to connect       → error WHATSAPP_CONNECT_FAILING (keeps retrying)
@@ -43,6 +44,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -1349,7 +1351,11 @@ func (r *whatsAppLinkRunner) handleEvent(raw any) {
 		}
 		r.authExpired()
 	case *events.StreamReplaced:
-		r.authExpired()
+		// Another client connected with this same session. The identity is
+		// still valid, so nothing is wiped; reconnecting would only knock the
+		// other client off in turn, so this one stops until the agent
+		// restarts (or the person disconnects / links again).
+		r.terminal(waStateError, waErrConnectFailing)
 	case *events.TemporaryBan:
 		r.terminal(waStateError, waErrAccountRestricted)
 	case *events.ClientOutdated:
@@ -1501,8 +1507,19 @@ func (r *whatsAppLinkRunner) normalizeContext() whatsAppNormalizeContext {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	nc := whatsAppNormalizeContext{ReconnectedAt: r.reconnectedAt}
-	if r.client != nil {
-		nc.OwnJID = r.client.OwnJID()
+	if client := r.client; client != nil {
+		nc.OwnJID = client.OwnJID()
+		// Memoized per event / history chunk: a chunk names the same few
+		// LIDs many times, and each miss is a session-store query.
+		seen := map[types.JID]types.JID{}
+		nc.PNForLID = func(lid types.JID) types.JID {
+			if pn, ok := seen[lid]; ok {
+				return pn
+			}
+			pn := client.PNForLID(lid)
+			seen[lid] = pn
+			return pn
+		}
 	}
 	return nc
 }
@@ -1641,7 +1658,9 @@ func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
 		if !evt.Info.IsGroup && !evt.Info.IsFromMe {
 			name = evt.Info.PushName
 		}
-		records = append([]whatsAppRecord{whatsAppConversationRecord(evt.Info.MessageSource, name)}, records...)
+		conv := whatsAppConversationRecord(evt.Info.MessageSource, name)
+		conv.ChatJid = chat // as normalized, store LID lookup included
+		records = append([]whatsAppRecord{conv}, records...)
 	}
 	r.appendLive(records)
 }

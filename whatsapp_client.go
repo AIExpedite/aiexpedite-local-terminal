@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -37,12 +38,19 @@ type whatsAppClient interface {
 	// HasSession reports a paired device identity in the store.
 	HasSession() bool
 	OwnJID() types.JID
+	// PNForLID is the phone-number JID the session store maps a LID to, or
+	// the empty JID when none is known.
+	PNForLID(lid types.JID) types.JID
 	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	PairPhone(ctx context.Context, phone string) (string, error)
 	ParseWebMessage(chat types.JID, msg *waWeb.WebMessageInfo) (*events.Message, error)
 	// Close releases the session database. The client must be disconnected.
 	Close() error
 }
+
+// whatsAppLIDLookupTimeout bounds one LID → phone-number lookup in the local
+// session store.
+const whatsAppLIDLookupTimeout = 2 * time.Second
 
 // newWhatsAppClient opens (creating) dir/session.db. A var so tests install a
 // fake.
@@ -102,6 +110,18 @@ func (c *whatsmeowClient) OwnJID() types.JID {
 		return types.EmptyJID
 	}
 	return c.cli.Store.ID.ToNonAD()
+}
+func (c *whatsmeowClient) PNForLID(lid types.JID) types.JID {
+	if c.cli.Store == nil || c.cli.Store.LIDs == nil {
+		return types.EmptyJID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), whatsAppLIDLookupTimeout)
+	defer cancel()
+	pn, err := c.cli.Store.LIDs.GetPNForLID(ctx, lid.ToNonAD())
+	if err != nil {
+		return types.EmptyJID
+	}
+	return pn
 }
 func (c *whatsmeowClient) GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return c.cli.GetQRChannel(ctx)

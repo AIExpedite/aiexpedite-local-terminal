@@ -67,9 +67,10 @@ func (c *fakeWAClient) Logout(context.Context) error {
 	c.session = false
 	return nil
 }
-func (c *fakeWAClient) IsConnected() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.connected }
-func (c *fakeWAClient) HasSession() bool  { c.mu.Lock(); defer c.mu.Unlock(); return c.session }
-func (c *fakeWAClient) OwnJID() types.JID { return waMe }
+func (c *fakeWAClient) IsConnected() bool            { c.mu.Lock(); defer c.mu.Unlock(); return c.connected }
+func (c *fakeWAClient) HasSession() bool             { c.mu.Lock(); defer c.mu.Unlock(); return c.session }
+func (c *fakeWAClient) OwnJID() types.JID            { return waMe }
+func (c *fakeWAClient) PNForLID(types.JID) types.JID { return types.EmptyJID }
 func (c *fakeWAClient) GetQRChannel(context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return c.qr, nil
 }
@@ -369,6 +370,35 @@ func TestWhatsAppSupervisorTemporaryBanIsTerminal(t *testing.T) {
 	})
 	if r := h.sup.runner("lnk_1"); r == nil || r.terminalError != waErrAccountRestricted {
 		t.Fatal("restricted link must stay (for a clean disconnect) but never reconnect")
+	}
+}
+
+// A duplicate client on the same session is not a logout: the session and
+// the outbox key stay, and this client stops instead of fighting it.
+func TestWhatsAppSupervisorStreamReplacedKeepsTheSession(t *testing.T) {
+	h, c := pairedHarness(t)
+	connects, _ := c.count()
+	c.emit(&events.StreamReplaced{})
+	waitFor(t, "stopped", func() bool {
+		return len(h.transport.find(func(p map[string]any) bool { return p["errorCode"] == waErrConnectFailing })) == 1
+	})
+	time.Sleep(50 * time.Millisecond)
+	r := h.sup.runner("lnk_1")
+	if r == nil || r.terminalError != waErrConnectFailing {
+		t.Fatal("a replaced stream must keep the link and not reconnect")
+	}
+	if lastState(h.transport) == waStateAuthExpired {
+		t.Fatal("a replaced stream is not an expired session")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("session directory removed: %v", err)
+	}
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatalf("outbox key removed: %v", err)
+	}
+	if after, logouts := c.count(); after != connects || logouts != 0 {
+		t.Fatalf("connects %d→%d logouts %d after StreamReplaced", connects, after, logouts)
 	}
 }
 

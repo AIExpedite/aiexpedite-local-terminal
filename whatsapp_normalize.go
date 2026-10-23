@@ -107,6 +107,30 @@ type whatsAppNormalizeContext struct {
 	// ReconnectedAt marks live messages older than the last reconnect as
 	// catch-up (queued by WhatsApp while this companion was offline).
 	ReconnectedAt time.Time
+	// PNForLID maps a LID to its phone-number JID from the session store
+	// (empty when unknown). Used where the event carries no alternate
+	// address — operation targets, history conversation ids — so they hash
+	// to the same identity as the messages they belong to. Nil: no lookup.
+	PNForLID func(lid types.JID) types.JID
+}
+
+// resolveLID returns the phone-number form of a LID when the store knows it,
+// else the JID unchanged (device part dropped).
+func (nc whatsAppNormalizeContext) resolveLID(j types.JID) types.JID {
+	j = j.ToNonAD()
+	if j.Server != types.HiddenUserServer || nc.PNForLID == nil {
+		return j
+	}
+	if pn := nc.PNForLID(j); pn.Server == types.DefaultUserServer {
+		return pn.ToNonAD()
+	}
+	return j
+}
+
+// canonicalUser is canonicalWhatsAppUser with the store lookup as the
+// fallback when the event carries no phone-number alternate.
+func (nc whatsAppNormalizeContext) canonicalUser(primary, alt types.JID) types.JID {
+	return nc.resolveLID(canonicalWhatsAppUser(primary, alt))
 }
 
 // canonicalWhatsAppUser drops the device part and prefers the phone-number
@@ -176,7 +200,8 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 	if chat.IsEmpty() || whatsAppSkippableChat(chat) {
 		return nil
 	}
-	sender := canonicalWhatsAppUser(evt.Info.Sender, evt.Info.SenderAlt)
+	chat = nc.resolveLID(chat)
+	sender := nc.canonicalUser(evt.Info.Sender, evt.Info.SenderAlt)
 	base := whatsAppRecord{
 		Kind:        waRecordMessage,
 		ChatJid:     chat.String(),
@@ -210,7 +235,7 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 			rec.WaMessageID = clipWhatsAppID(target.GetID())
 			if p := target.GetParticipant(); p != "" {
 				if j, err := types.ParseJID(p); err == nil {
-					rec.SenderJid = canonicalWhatsAppUser(j, types.EmptyJID).String()
+					rec.SenderJid = nc.canonicalUser(j, types.EmptyJID).String()
 				}
 			}
 			return []whatsAppRecord{rec}
@@ -256,7 +281,7 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 func whatsAppReactionTargetSender(participant string, keyFromMe bool, info types.MessageInfo, chat, reactor types.JID, nc whatsAppNormalizeContext) types.JID {
 	if participant != "" {
 		if j, err := types.ParseJID(participant); err == nil {
-			return canonicalWhatsAppUser(j, types.EmptyJID)
+			return nc.canonicalUser(j, types.EmptyJID)
 		}
 	}
 	if keyFromMe {
@@ -371,7 +396,11 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 			skipped++
 			continue
 		}
-		chat = chat.ToNonAD()
+		// A direct chat keyed by LID is announced under the same phone-number
+		// identity its messages normalize to, or the two would land in
+		// different conversations.
+		rawChat := chat.ToNonAD()
+		chat = nc.resolveLID(chat)
 		name := conv.GetName()
 		if name == "" {
 			name = conv.GetDisplayName()
@@ -394,14 +423,15 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 					}
 					records = append(records, whatsAppRecord{
 						Kind: waRecordMessage, Op: waOpNew, ChatJid: chat.String(),
-						SenderJid:   canonicalWhatsAppUser(who, types.EmptyJID).String(),
+						SenderJid:   nc.canonicalUser(who, types.EmptyJID).String(),
 						WaMessageID: clipWhatsAppID(web.GetKey().GetID()),
 						WaTimestamp: ts, Source: waSourceHistory, Type: waTypeSystem, Text: verb,
 					})
 				}
 				continue
 			}
-			evt, err := parse(chat, web)
+			// whatsmeow parses against the chat as WhatsApp keyed it.
+			evt, err := parse(rawChat, web)
 			if err != nil || evt == nil {
 				skipped++
 				continue
