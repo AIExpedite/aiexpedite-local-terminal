@@ -160,8 +160,12 @@ func redactWhatsAppLog(s string) string {
 	return whatsAppJIDPattern.ReplaceAllString(out, "[jid]")
 }
 
+// whatsAppLogSink receives every WhatsApp log line after redaction. A var so
+// tests capture the lines without swapping the process-wide os.Stdout.
+var whatsAppLogSink = func(line string) { fmt.Println(line) }
+
 func logWhatsApp(linkID, event string) {
-	fmt.Println(redactWhatsAppLog(fmt.Sprintf("%s[whatsapp] link=%s %s%s", colorCyan, linkID, event, colorReset)))
+	whatsAppLogSink(redactWhatsAppLog(fmt.Sprintf("%s[whatsapp] link=%s %s%s", colorCyan, linkID, event, colorReset)))
 }
 
 // whatsAppLogger wraps whatsmeow's logger at INFO-and-above (debug lines carry
@@ -171,7 +175,7 @@ type whatsAppLogger struct{ module string }
 func newWhatsAppLogger(module string) waLog.Logger { return whatsAppLogger{module: module} }
 
 func (l whatsAppLogger) emit(level, msg string, args ...any) {
-	fmt.Println(redactWhatsAppLog(fmt.Sprintf("[whatsapp/%s] %s %s", l.module, level, fmt.Sprintf(msg, args...))))
+	whatsAppLogSink(redactWhatsAppLog(fmt.Sprintf("[whatsapp/%s] %s %s", l.module, level, fmt.Sprintf(msg, args...))))
 }
 func (l whatsAppLogger) Warnf(msg string, args ...any)  { l.emit("WARN", msg, args...) }
 func (l whatsAppLogger) Errorf(msg string, args ...any) { l.emit("ERROR", msg, args...) }

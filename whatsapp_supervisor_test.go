@@ -5,7 +5,6 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/json"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -510,12 +509,16 @@ func TestWhatsAppSupervisorDuplicateLinkStartIgnored(t *testing.T) {
 
 // No message content, JID or pairing secret reaches the agent log.
 func TestWhatsAppSupervisorLogsCarryNoContent(t *testing.T) {
-	r, w, _ := os.Pipe()
-	prev := os.Stdout
-	os.Stdout = w
+	var mu sync.Mutex
 	var captured strings.Builder
-	done := make(chan struct{})
-	go func() { _, _ = io.Copy(&captured, r); close(done) }()
+	prevSink := whatsAppLogSink
+	whatsAppLogSink = func(line string) {
+		mu.Lock()
+		captured.WriteString(line)
+		captured.WriteByte('\n')
+		mu.Unlock()
+	}
+	t.Cleanup(func() { whatsAppLogSink = prevSink })
 
 	h, c := pairedHarness(t)
 	c.emit(liveMsg(waPeer, waPeer, false, "LOG1", &waE2E.Message{Conversation: proto.String("TOP SECRET BODY")}))
@@ -523,10 +526,9 @@ func TestWhatsAppSupervisorLogsCarryNoContent(t *testing.T) {
 	c.emit(&events.LoggedOut{})
 	waitFor(t, "wiped", func() bool { return h.sup.runner("lnk_1") == nil })
 
-	os.Stdout = prev
-	w.Close()
-	<-done
+	mu.Lock()
 	out := captured.String()
+	mu.Unlock()
 	for _, leak := range []string{"TOP SECRET BODY", waPeer.User, "15550000001"} {
 		if strings.Contains(out, leak) {
 			t.Fatalf("log leaked %q:\n%s", leak, out)
@@ -534,5 +536,47 @@ func TestWhatsAppSupervisorLogsCarryNoContent(t *testing.T) {
 	}
 	if !strings.Contains(out, "link=lnk_1") {
 		t.Fatalf("expected link-scoped log lines, got:\n%s", out)
+	}
+}
+
+// Shutdown stops the upload loop and then flushes what is pending, once.
+func TestWhatsAppSupervisorShutdownFlushesThePendingOutbox(t *testing.T) {
+	h, c := pairedHarness(t)
+	var mu sync.Mutex
+	healthy := false
+	var acked int
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !healthy {
+			return whatsAppSyncResult{Status: 503}
+		}
+		acked++
+		to := int64(p["seqTo"].(float64))
+		return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
+	}
+	h.transport.mu.Unlock()
+	c.emit(liveMsg(waPeer, waPeer, false, "S1", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "a refused upload", func() bool {
+		return len(h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch })) >= 1
+	})
+	r := h.sup.runner("lnk_1")
+	if r.outbox.Depth() == 0 {
+		t.Fatal("expected a pending outbox")
+	}
+	mu.Lock()
+	healthy = true
+	mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.sup.ShutdownAll(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+	if acked != 1 {
+		t.Fatalf("the pending range must be flushed exactly once, got %d accepted uploads", acked)
 	}
 }

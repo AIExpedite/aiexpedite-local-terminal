@@ -79,14 +79,15 @@ var (
 	whatsAppConnectBackoffMax   = 5 * time.Minute
 	whatsAppUploadBackoffMin    = 2 * time.Second
 	whatsAppUploadBackoffMax    = 5 * time.Minute
-	whatsAppUploadIdlePoll      = 5 * time.Second
-	whatsAppAuthPause           = 60 * time.Second
-	whatsAppPairingPayloadTTL   = 2 * time.Minute
-	whatsAppLogoutTimeout       = 15 * time.Second
-	whatsAppControlAttempts     = 6
-	whatsAppAckAttempts         = 12
-	whatsAppReconcileRetry      = 5 * time.Minute
-	whatsAppUpdateDrainFlush    = 10 * time.Second
+	// A safety net only: every append wakes the uploader directly.
+	whatsAppUploadIdlePoll    = 30 * time.Second
+	whatsAppAuthPause         = 60 * time.Second
+	whatsAppPairingPayloadTTL = 2 * time.Minute
+	whatsAppLogoutTimeout     = 15 * time.Second
+	whatsAppControlAttempts   = 6
+	whatsAppAckAttempts       = 12
+	whatsAppReconcileRetry    = 5 * time.Minute
+	whatsAppUpdateDrainFlush  = 10 * time.Second
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -113,6 +114,9 @@ type whatsAppSupervisor struct {
 	links     map[string]*whatsAppLinkRunner
 	started   bool
 	stopped   bool
+	// discards tracks wipes in flight, so shutdown never exits halfway
+	// through deleting a session (keys gone, directory still there).
+	discards sync.WaitGroup
 }
 
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
@@ -267,6 +271,8 @@ func (s *whatsAppSupervisor) newRunner(linkID, workspaceID string, generation in
 // discard stops a runner and deletes everything it had on this computer.
 // logout=true first removes the companion from the phone's Linked devices.
 func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) {
+	s.discards.Add(1)
+	defer s.discards.Done()
 	r.stop(logout)
 	_ = r.closeStores()
 	if err := deleteWhatsAppOutboxKey(r.linkID); err != nil {
@@ -423,6 +429,7 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		runners = append(runners, r)
 	}
 	s.mu.Unlock()
+	defer s.waitDiscards()
 	if len(runners) == 0 {
 		if s.cancel != nil {
 			s.cancel()
@@ -443,6 +450,10 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		wg.Add(1)
 		go func(r *whatsAppLinkRunner) {
 			defer wg.Done()
+			// Stop the upload loop first, so the flush below is the only
+			// uploader (two would send the same range twice).
+			r.cancel()
+			r.waitLoops()
 			r.stopClientOnly()
 			r.flush(flushCtx)
 		}(r)
@@ -452,11 +463,19 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		s.cancel()
 	}
 	for _, r := range runners {
-		r.cancel()
-		r.waitLoops()
 		_ = r.closeStores()
 	}
 	s.persist()
+}
+
+// waitDiscards waits (bounded) for wipes already in flight.
+func (s *whatsAppSupervisor) waitDiscards() {
+	done := make(chan struct{})
+	go func() { s.discards.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
 }
 
 // WipeAll logs out and deletes every local link: the computer was
@@ -873,10 +892,13 @@ func (r *whatsAppLinkRunner) authExpired() {
 	r.reportState(nil)
 	r.log("authentication expired")
 	go func() {
+		// The flush is the only uploader from here on.
+		r.cancel()
+		r.waitLoops()
 		if client != nil {
 			client.Disconnect()
 		}
-		ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
+		ctx, cancel := context.WithTimeout(r.sup.ctx, 2*time.Minute)
 		r.flush(ctx)
 		cancel()
 		r.sup.discard(r, false)
