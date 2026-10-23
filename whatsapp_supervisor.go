@@ -561,6 +561,7 @@ func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) erro
 	if dirErr != nil {
 		r.log("session directory not deleted: " + dirErr.Error())
 	}
+	err := errors.Join(keyErr, dirErr)
 	s.mu.Lock()
 	if s.links[r.linkID] == r {
 		delete(s.links, r.linkID)
@@ -572,9 +573,41 @@ func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) erro
 		}
 	}
 	s.pausedLinks = kept
+	if err != nil {
+		// The runner is gone, so links.json keeps the link marked
+		// PendingWipe and the next start retries the cleanup: an
+		// asynchronous wipe (fence, pairing failure) has no caller that
+		// would retry it.
+		s.forgetPendingWipeLocked(r.linkID)
+		l := r.localLink()
+		l.PendingWipe = true
+		s.pendingWipes = append(s.pendingWipes, l)
+	}
 	s.mu.Unlock()
 	s.persist()
-	return errors.Join(keyErr, dirErr)
+	return err
+}
+
+// forgetPendingWipeLocked drops a link's pending-wipe entry. The caller
+// holds mu.
+func (s *whatsAppSupervisor) forgetPendingWipeLocked(linkID string) {
+	kept := s.pendingWipes[:0]
+	for _, l := range s.pendingWipes {
+		if l.LinkID != linkID {
+			kept = append(kept, l)
+		}
+	}
+	s.pendingWipes = kept
+}
+
+// dropPendingWipe forgets a pending wipe a replayed cleanup just finished and
+// reports whether there was one.
+func (s *whatsAppSupervisor) dropPendingWipe(linkID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before := len(s.pendingWipes)
+	s.forgetPendingWipeLocked(linkID)
+	return len(s.pendingWipes) != before
 }
 
 // deleteWhatsAppLinkSecrets removes a link's local session material without
@@ -641,13 +674,7 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 	_ = deleteWhatsAppOutboxKey(p.LinkID)
 	// A pending wipe of this id would delete the session paired below.
 	s.mu.Lock()
-	kept := s.pendingWipes[:0]
-	for _, l := range s.pendingWipes {
-		if l.LinkID != p.LinkID {
-			kept = append(kept, l)
-		}
-	}
-	s.pendingWipes = kept
+	s.forgetPendingWipeLocked(p.LinkID)
 	s.mu.Unlock()
 	if err := r.open(true); err != nil {
 		r.log("pairing could not start: " + err.Error())
@@ -717,6 +744,8 @@ func (s *whatsAppSupervisor) unlinkLocked(linkID string, generation int64) {
 	} else if err := deleteWhatsAppLinkSecrets(linkID); err != nil {
 		logWhatsApp(linkID, "unlink not confirmed: local cleanup failed, will retry on replay")
 		return
+	} else if s.dropPendingWipe(linkID) {
+		s.persist()
 	}
 	go s.sendAck(linkID, generation)
 }
@@ -840,7 +869,18 @@ func (s *whatsAppSupervisor) WipeAll() {
 	defer s.lifecycleMu.Unlock()
 	// Read before the discards below rewrite links.json: it also lists the
 	// paused links, earlier pending wipes and links that failed to load.
-	onDisk, _ := loadWhatsAppLocalLinks()
+	onDisk, err := loadWhatsAppLocalLinks()
+	manifestLost := false
+	if err != nil {
+		// An unreadable links.json must not be replaced by a list that
+		// forgets its links: recover their ids from the session
+		// directories, and if even that fails leave the file as it is.
+		logWhatsApp("-", "links.json unreadable during deregistration: "+err.Error())
+		if onDisk, err = listWhatsAppLinkDirs(); err != nil {
+			logWhatsApp("-", "session directories unreadable: "+err.Error())
+			manifestLost = true
+		}
+	}
 	s.mu.Lock()
 	others := append(onDisk, s.pausedLinks...)
 	s.pausedLinks, s.pendingWipes = nil, nil
@@ -875,6 +915,9 @@ func (s *whatsAppSupervisor) WipeAll() {
 	s.mu.Lock()
 	s.pendingWipes = pending
 	s.mu.Unlock()
+	if manifestLost {
+		return
+	}
 	s.persist()
 }
 
@@ -1442,6 +1485,7 @@ func (r *whatsAppLinkRunner) onHistorySync(data *waHistorySync.HistorySync) {
 	}
 	records, skipped := normalizeWhatsAppHistory(data, client.ParseWebMessage, r.normalizeContext())
 	admitted := r.appendHistoryChunk(ob, records)
+	whole := admitted == len(records)
 	records = records[:admitted]
 	r.mu.Lock()
 	r.historySynced += int64(countWhatsAppMessages(records))
@@ -1451,6 +1495,13 @@ func (r *whatsAppLinkRunner) onHistorySync(data *waHistorySync.HistorySync) {
 	}
 	r.kickUploader()
 	if data.GetSyncType() != waHistorySync.HistorySync_FULL && data.GetProgress() >= 100 {
+		if !whole {
+			// A pause, shutdown or outbox failure cut the final chunk
+			// short: its suffix was never queued, so the sync is not
+			// complete and must not be persisted or reported as such.
+			r.log("final history chunk only partly stored; history not marked complete")
+			return
+		}
 		r.completeHistory()
 	}
 }

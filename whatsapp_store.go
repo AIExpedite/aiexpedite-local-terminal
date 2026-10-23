@@ -104,6 +104,26 @@ func wipeWhatsAppLinkDir(linkID string) error {
 	}
 }
 
+// listWhatsAppLinkDirs recovers the links held on this computer from their
+// session directories, for when links.json cannot be read. Only plain
+// directories named with a valid link id count; an absent root is no links.
+func listWhatsAppLinkDirs() ([]whatsAppLocalLink, error) {
+	entries, err := os.ReadDir(whatsAppRootDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []whatsAppLocalLink
+	for _, e := range entries {
+		if e.IsDir() && validWhatsAppLinkID(e.Name()) {
+			out = append(out, whatsAppLocalLink{LinkID: e.Name()})
+		}
+	}
+	return out, nil
+}
+
 /* --------------------------------------------------------------------------
    links.json — which links this agent holds
    -------------------------------------------------------------------------- */

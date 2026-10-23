@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -1241,5 +1242,120 @@ func TestWhatsAppLinkStartCommandIsAcceptedBeforeReturning(t *testing.T) {
 	local, _ := loadWhatsAppLocalLinks()
 	if len(local) != 1 || local[0].LinkID != "lnk_ack" {
 		t.Fatalf("links.json does not list the accepted link: %+v", local)
+	}
+}
+
+// A fenced session wiped on its own goroutine whose cleanup fails has no
+// caller to retry it: links.json must keep it marked PendingWipe, and the
+// next start finishes the wipe.
+func TestWhatsAppSupervisorFailedAsyncWipeIsRetriedOnNextStart(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] == waSyncKindBatch {
+			return whatsAppSyncResult{Status: 409, Body: whatsAppSyncResponse{Code: waErrLinkFenced}}
+		}
+		return whatsAppSyncResult{Status: 200}
+	}
+	h.transport.mu.Unlock()
+	h.ks.unavailable = true
+	c.emit(liveMsg(waPeer, waPeer, false, "F1", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "fenced", func() bool { return h.sup.runner("lnk_1") == nil })
+	h.sup.waitDiscards(context.Background())
+	h.ks.unavailable = false
+	local, err := loadWhatsAppLocalLinks()
+	if err != nil || len(local) != 1 || local[0].LinkID != "lnk_1" || !local[0].PendingWipe {
+		t.Fatalf("links.json must keep the failed wipe for a retry: %+v %v", local, err)
+	}
+	h.sup.ShutdownAll(context.Background())
+
+	next := &whatsAppSupervisor{}
+	next.start(h.transport)
+	defer next.ShutdownAll(context.Background())
+	if _, err := h.ks.Get("lnk_1"); err == nil {
+		t.Fatal("the next start did not retry the failed wipe")
+	}
+	if next.runner("lnk_1") != nil {
+		t.Fatal("a pending-wipe link must never be resumed")
+	}
+}
+
+// A deregistration that cannot read links.json must not replace it with an
+// empty list: the links are recovered from their session directories, and a
+// cleanup that fails stays marked PendingWipe.
+func TestWhatsAppSupervisorWipeAllRecoversLinksFromAnUnreadableManifest(t *testing.T) {
+	h := newSupervisorHarness(t)
+	if _, err := ensureWhatsAppLinkDir("lnk_orphan"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ks.Put("lnk_orphan", []byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	manifest := whatsAppRootDir() + string(os.PathSeparator) + whatsAppLinksFileName
+	if err := os.WriteFile(manifest, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.ks.unavailable = true
+	h.sup.WipeAll()
+	h.ks.unavailable = false
+	local, err := loadWhatsAppLocalLinks()
+	if err != nil || len(local) != 1 || local[0].LinkID != "lnk_orphan" || !local[0].PendingWipe {
+		t.Fatalf("links.json lost the link it could not wipe: %+v %v", local, err)
+	}
+	h.sup.WipeAll()
+	if _, err := h.ks.Get("lnk_orphan"); err == nil {
+		t.Fatal("the retried deregistration left the outbox key")
+	}
+	if local, _ := loadWhatsAppLocalLinks(); len(local) != 0 {
+		t.Fatalf("links.json still lists a completed wipe: %+v", local)
+	}
+}
+
+// A final history chunk cut short (here: the runner stops while the outbox
+// is at its cap) must not mark history complete: its suffix was never queued.
+func TestWhatsAppSupervisorPartlyStoredFinalHistoryChunkIsNotComplete(t *testing.T) {
+	_, _ = withWhatsAppTestEnv(t)
+	prevMax := whatsAppOutboxMaxRecords
+	whatsAppOutboxMaxRecords = 2
+	defer func() { whatsAppOutboxMaxRecords = prevMax }()
+	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
+	sup.ctx, sup.cancel = context.WithCancel(context.Background())
+	defer sup.cancel()
+	sup.transport = &fakeWATransport{}
+	r := sup.newRunner("lnk_hist", "ws", 1)
+	dir, err := ensureWhatsAppLinkDir("lnk_hist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_hist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	if err := ob.Append([]whatsAppRecord{textRecord("chat@s.whatsapp.net", "L1", "x"), textRecord("chat@s.whatsapp.net", "L2", "x")}, false); err != nil {
+		t.Fatal(err)
+	}
+	r.outbox = ob
+	r.client = &fakeWAClient{qr: make(chan whatsmeow.QRChannelItem)}
+	r.state = waStateSyncingHistory
+	web := &waWeb.WebMessageInfo{Key: &waCommon.MessageKey{RemoteJID: proto.String(waPeer.String()), ID: proto.String("H1")}, MessageTimestamp: proto.Uint64(1_800_000_000), Message: &waE2E.Message{Conversation: proto.String("old")}}
+	data := &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_INITIAL_BOOTSTRAP.Enum(), Progress: proto.Uint32(100),
+		Conversations: []*waHistorySync.Conversation{{ID: proto.String(waPeer.String()), Messages: []*waHistorySync.HistorySyncMsg{{Message: web}}}},
+	}
+	done := make(chan struct{})
+	go func() { r.onHistorySync(data); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+	r.cancel() // a pause or shutdown while the chunk waits for room
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the history append did not stop with the runner")
+	}
+	if r.localLink().HistoryComplete {
+		t.Fatal("a partly stored final chunk marked history complete")
+	}
+	if got := sup.transport.(*fakeWATransport).find(func(p map[string]any) bool { return p["historySyncComplete"] == true }); len(got) != 0 {
+		t.Fatalf("a partly stored final chunk reported completion: %v", got)
 	}
 }
