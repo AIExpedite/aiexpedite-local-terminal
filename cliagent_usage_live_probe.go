@@ -733,8 +733,11 @@ func antigravityClickRenewalFits(ctx context.Context, wait time.Duration) bool {
 // On a COLD cache (a fresh process paying a debt before the first gather, or an
 // `agy` update that changed the binary) that probe does start one short-lived
 // `<agy> --version` child, bounded by machineInfoProbeTimeout — and it warms the
-// cache the gather would have filled seconds later anyway. That is the only
-// child any of this starts: never a model turn, and never the `agy models`
+// cache the gather would have filled seconds later anyway. A probe that times
+// out on that cold binary (real-time AV scanning a just-updated `agy`) is
+// transient and is NOT cached: this read falls back to the default build in
+// antigravityCodeAssistUserAgent, and the next call probes again. That is the
+// only child any of this starts: never a model turn, and never the `agy models`
 // warm-up the Refresh click may run.
 func antigravityCodeAssistBuildVersion(version string) string {
 	if v := strings.TrimSpace(version); v != "" {

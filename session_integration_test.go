@@ -1196,10 +1196,7 @@ func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, 
 	if runtime.GOOS == "windows" && !strings.HasSuffix(mockName, ".exe") {
 		mockName += ".exe"
 	}
-	mockPath := filepath.Join(tmpDir, mockName)
-	if err := copyTestBinary(testExe, mockPath); err != nil {
-		t.Fatalf("copy test binary: %v", err)
-	}
+	copyAndWarmTestBinary(t, testExe, filepath.Join(tmpDir, mockName))
 
 	// Prepend tmpDir to PATH so exec.LookPath finds our mock.
 	origPath := os.Getenv("PATH")
