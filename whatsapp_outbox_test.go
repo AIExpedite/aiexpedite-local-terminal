@@ -274,3 +274,24 @@ func TestWhatsAppOutboxRefusalTellsChunkTooLargeFromQueueFull(t *testing.T) {
 		t.Fatalf("a refused chunk stored rows: depth %d", ob.Depth())
 	}
 }
+
+// NextUpTo caps a batch at the given record count (the uploader narrows a
+// refused batch with it); zero or more than a batch allows means a full batch.
+func TestWhatsAppOutboxNextUpToCapsTheBatch(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, _ := openTestOutbox(t, "lnk_upto")
+	defer ob.Close()
+	var recs []whatsAppRecord
+	for i := 0; i < 5; i++ {
+		recs = append(recs, textRecord("1@s.whatsapp.net", fmt.Sprintf("U%d", i), "x"))
+	}
+	if err := ob.Append(recs, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ limit, want int }{{2, 2}, {1, 1}, {0, 5}, {whatsAppBatchMaxRecords + 1, 5}} {
+		b, err := ob.NextUpTo(c.limit)
+		if err != nil || b == nil || len(b.Records) != c.want || b.SeqFrom != 1 || b.SeqTo != int64(c.want) {
+			t.Fatalf("NextUpTo(%d) = %+v, %v; want %d records from seq 1", c.limit, b, err, c.want)
+		}
+	}
+}

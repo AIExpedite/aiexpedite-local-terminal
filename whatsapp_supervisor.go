@@ -1054,9 +1054,15 @@ type whatsAppLinkRunner struct {
 	liveSynced      int64
 	lastAckedSeq    int64
 	uploadPausedTil time.Time
-	seenChats       map[string]bool
-	stopped         bool
-	loopsStarted    bool
+	// narrowLimit and narrowTo track a batch the cloud refused with 400:
+	// some record up to narrowTo is invalid, but not which. Batches are capped
+	// at narrowLimit records, halved on every refusal, until one record alone
+	// is refused; only that one is dropped. 0 = full batches.
+	narrowLimit  int
+	narrowTo     int64
+	seenChats    map[string]bool
+	stopped      bool
+	loopsStarted bool
 	// loops tracks the upload and heartbeat goroutines, so stop() can wait
 	// for them before the stores close: on Windows an outbox file still open
 	// in a query cannot be deleted.
@@ -1723,13 +1729,15 @@ const (
 	whatsAppUploadStop
 )
 
-// uploadOnce sends the oldest batch. 2xx acks; 400 drops only the batch's
-// head record and retries the remainder (one bad record must not wedge the
-// queue, and the rest of the batch may be valid); 401/403 pauses uploads;
-// 409 fences; 429, 5xx and transport errors are retried with backoff.
+// uploadOnce sends the oldest batch. 2xx acks; 400 narrows the refused range
+// down by halves until a single record is refused, and drops only that one
+// (a bad record must neither wedge the queue nor take the valid records
+// around it with it); 401/403 pauses uploads; 409 fences; 429, 5xx and
+// transport errors are retried with backoff.
 func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult, whatsAppUploadOutcome) {
 	r.mu.Lock()
 	ob, gen, paused := r.outbox, r.generation, time.Now().Before(r.uploadPausedTil)
+	limit := r.narrowLimit
 	r.mu.Unlock()
 	if ob == nil {
 		return whatsAppSyncResult{}, whatsAppUploadStop
@@ -1737,7 +1745,7 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	if paused || r.sup.isPaused() {
 		return whatsAppSyncResult{}, whatsAppUploadIdle
 	}
-	batch, err := ob.Next()
+	batch, err := ob.NextUpTo(limit)
 	if err != nil {
 		r.log("outbox read failed: " + err.Error())
 		return whatsAppSyncResult{}, whatsAppUploadRetry
@@ -1760,17 +1768,33 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 		}
 		r.mu.Lock()
 		r.lastAckedSeq = max(r.lastAckedSeq, acked)
+		if r.narrowLimit > 0 && acked >= r.narrowTo {
+			// The whole refused range went through: the refusal did not
+			// reproduce, so nothing is dropped and full batches resume.
+			r.narrowLimit, r.narrowTo = 0, 0
+		}
 		r.mu.Unlock()
 		if acked < batch.SeqFrom {
 			return res, whatsAppUploadRetry
 		}
 		return res, whatsAppUploadSent
 	case res.Status == 400:
-		// Only the head record is known bad: dropping the whole range
-		// would silently lose up to 199 valid messages the cloud never
-		// ingested. Drop one, retry the rest with backoff.
-		r.log("batch refused as invalid (" + res.Body.Code + "); dropping head record")
-		_ = ob.Ack(batch.SeqFrom)
+		// Some record in this range is invalid, but the answer does not
+		// say which. Dropping the range, or even its head, would silently
+		// lose valid messages the cloud never ingested: halve the batch
+		// until one record alone is refused, and drop only that record.
+		if len(batch.Records) == 1 {
+			r.log("record refused as invalid (" + res.Body.Code + "); dropping it")
+			_ = ob.Ack(batch.SeqFrom)
+			r.mu.Lock()
+			r.narrowLimit, r.narrowTo = 0, 0
+			r.mu.Unlock()
+			return res, whatsAppUploadRetry
+		}
+		r.log("batch refused as invalid (" + res.Body.Code + "); narrowing it down")
+		r.mu.Lock()
+		r.narrowLimit, r.narrowTo = len(batch.Records)/2, batch.SeqTo
+		r.mu.Unlock()
 		return res, whatsAppUploadRetry
 	case res.Status == 401 || res.Status == 403:
 		r.mu.Lock()

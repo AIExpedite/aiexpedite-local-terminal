@@ -910,38 +910,114 @@ func TestWhatsAppSupervisorReconcileFetchesWithoutTheLifecycleLock(t *testing.T)
 	<-done
 }
 
-// A 400 refuses the batch, but only one record is known bad: the uploader
-// must drop the head record and retry the remainder, not the whole range.
-func TestWhatsAppSupervisorInvalidBatchDropsOnlyItsHead(t *testing.T) {
+// newRefusalHarness is a runner with an open outbox whose batch posts are
+// answered by respond; every accepted record id is collected.
+func newRefusalHarness(t *testing.T, linkID string, respond func(ids []string, p map[string]any) whatsAppSyncResult) (*whatsAppLinkRunner, *whatsAppOutbox, func() []string) {
+	t.Helper()
 	_, _ = withWhatsAppTestEnv(t)
 	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
 	sup.ctx, sup.cancel = context.WithCancel(context.Background())
-	defer sup.cancel()
+	t.Cleanup(sup.cancel)
+	var mu sync.Mutex
+	var accepted []string
 	tr := &fakeWATransport{}
-	calls := 0
 	tr.respond = func(p map[string]any) whatsAppSyncResult {
 		if p["kind"] != waSyncKindBatch {
 			return whatsAppSyncResult{Status: 200}
 		}
+		var ids []string
+		for _, rec := range p["records"].([]any) {
+			ids = append(ids, rec.(map[string]any)["waMessageId"].(string))
+		}
+		res := respond(ids, p)
+		if res.Status/100 == 2 {
+			mu.Lock()
+			accepted = append(accepted, ids...)
+			mu.Unlock()
+		}
+		return res
+	}
+	sup.transport = tr
+	r := sup.newRunner(linkID, "ws", 1)
+	ob, _ := openTestOutbox(t, linkID)
+	t.Cleanup(func() { ob.Close() })
+	r.outbox = ob
+	return r, ob, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), accepted...)
+	}
+}
+
+func ackedThrough(p map[string]any) whatsAppSyncResult {
+	to := int64(p["seqTo"].(float64))
+	return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
+}
+
+// A 400 says some record in the batch is invalid, not which one. The uploader
+// must narrow the batch down until one record alone is refused and drop only
+// that record: dropping the batch, or its head, loses valid messages the
+// cloud never ingested.
+func TestWhatsAppSupervisorInvalidBatchDropsOnlyTheRefusedRecord(t *testing.T) {
+	r, ob, accepted := newRefusalHarness(t, "lnk_400", func(ids []string, p map[string]any) whatsAppSyncResult {
+		for _, id := range ids {
+			if id == "BAD" {
+				return whatsAppSyncResult{Status: 400, Body: whatsAppSyncResponse{Code: "INVALID"}}
+			}
+		}
+		return ackedThrough(p)
+	})
+	var records []whatsAppRecord
+	var valid []string
+	for i := 1; i <= 10; i++ {
+		id := "B" + strconv.Itoa(i)
+		if i == 7 {
+			id = "BAD"
+		} else {
+			valid = append(valid, id)
+		}
+		records = append(records, textRecord("chat@s.whatsapp.net", id, "x"))
+	}
+	if err := ob.Append(records, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; ob.Depth() > 0; i++ {
+		if i == 60 {
+			t.Fatalf("the refused batch was never narrowed down: depth %d", ob.Depth())
+		}
+		r.uploadOnce(context.Background())
+	}
+	got := map[string]bool{}
+	for _, id := range accepted() {
+		got[id] = true
+	}
+	if got["BAD"] {
+		t.Fatal("the invalid record was reported accepted")
+	}
+	for _, id := range valid {
+		if !got[id] {
+			t.Fatalf("valid record %s was dropped with the invalid one (accepted %v)", id, accepted())
+		}
+	}
+	r.mu.Lock()
+	limit := r.narrowLimit
+	r.mu.Unlock()
+	if limit != 0 {
+		t.Fatalf("full batches did not resume after the invalid record was dropped (limit %d)", limit)
+	}
+}
+
+// A refusal that does not reproduce drops nothing: the narrowed batches all
+// go through and full batches resume.
+func TestWhatsAppSupervisorTransientBatchRefusalDropsNothing(t *testing.T) {
+	calls := 0
+	r, ob, accepted := newRefusalHarness(t, "lnk_400t", func(ids []string, p map[string]any) whatsAppSyncResult {
 		calls++
 		if calls == 1 {
 			return whatsAppSyncResult{Status: 400, Body: whatsAppSyncResponse{Code: "INVALID"}}
 		}
-		to := int64(p["seqTo"].(float64))
-		return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
-	}
-	sup.transport = tr
-	r := sup.newRunner("lnk_400", "ws", 1)
-	dir, err := ensureWhatsAppLinkDir("lnk_400")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ob, _, err := openWhatsAppOutbox(dir, "lnk_400")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ob.Close()
-	r.outbox = ob
+		return ackedThrough(p)
+	})
 	if err := ob.Append([]whatsAppRecord{
 		textRecord("chat@s.whatsapp.net", "B1", "one"),
 		textRecord("chat@s.whatsapp.net", "B2", "two"),
@@ -952,25 +1028,23 @@ func TestWhatsAppSupervisorInvalidBatchDropsOnlyItsHead(t *testing.T) {
 	if _, outcome := r.uploadOnce(context.Background()); outcome != whatsAppUploadRetry {
 		t.Fatalf("a refused batch must be retried, got outcome %d", outcome)
 	}
-	if d := ob.Depth(); d != 2 {
-		t.Fatalf("a 400 must drop only the head record, depth = %d", d)
+	if d := ob.Depth(); d != 3 {
+		t.Fatalf("a refusal of a multi-record batch dropped records: depth %d", d)
 	}
-	if _, outcome := r.uploadOnce(context.Background()); outcome != whatsAppUploadSent {
-		t.Fatalf("the remainder must upload, got outcome %d", outcome)
+	for i := 0; ob.Depth() > 0; i++ {
+		if i == 10 {
+			t.Fatalf("the retried records never went through: depth %d", ob.Depth())
+		}
+		r.uploadOnce(context.Background())
 	}
-	if d := ob.Depth(); d != 0 {
-		t.Fatalf("the remainder was not acked, depth = %d", d)
+	if got := accepted(); len(got) != 3 {
+		t.Fatalf("every record must be delivered after a refusal that does not reproduce, got %v", got)
 	}
-	batches := tr.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch })
-	if len(batches) != 2 {
-		t.Fatalf("expected refused + retried posts, got %d", len(batches))
-	}
-	var last []string
-	for _, rec := range batches[1]["records"].([]any) {
-		last = append(last, rec.(map[string]any)["waMessageId"].(string))
-	}
-	if len(last) != 2 || last[0] != "B2" || last[1] != "B3" {
-		t.Fatalf("the retry must carry B2 and B3, got %v", last)
+	r.mu.Lock()
+	limit := r.narrowLimit
+	r.mu.Unlock()
+	if limit != 0 {
+		t.Fatalf("full batches did not resume (limit %d)", limit)
 	}
 }
 

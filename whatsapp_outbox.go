@@ -219,9 +219,18 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 // Next returns the oldest contiguous range that fits one batch, or a nil
 // batch when the outbox is empty.
 func (ob *whatsAppOutbox) Next() (*whatsAppOutboxBatch, error) {
+	return ob.NextUpTo(whatsAppBatchMaxRecords)
+}
+
+// NextUpTo is Next with at most maxRecords records (never more than one
+// batch allows): the uploader narrows a refused batch down with it.
+func (ob *whatsAppOutbox) NextUpTo(maxRecords int) (*whatsAppOutboxBatch, error) {
+	if maxRecords <= 0 || maxRecords > whatsAppBatchMaxRecords {
+		maxRecords = whatsAppBatchMaxRecords
+	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
-	rows, err := ob.db.Query(`SELECT seq, nonce, payload FROM outbox ORDER BY seq LIMIT ?`, whatsAppBatchMaxRecords)
+	rows, err := ob.db.Query(`SELECT seq, nonce, payload FROM outbox ORDER BY seq LIMIT ?`, maxRecords)
 	if err != nil {
 		return nil, err
 	}
