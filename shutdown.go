@@ -76,6 +76,7 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	stopCodexRunDebtRetry()
 	stopClaudeRunDebtRetry()
 	stopGrokRunDebtRetry()
+	stopGrokRecoveryRetry()
 	persistClaudeRunDebtForShutdown()
 	// Antigravity's discovery tick stops, then its in-flight state writes (a
 	// run's settle, an arm persisting its floor) get a bounded drain, so a
@@ -244,6 +245,10 @@ func tearDownSubprocesses(ctx context.Context) {
 	if globalMuseCodeNativeManager != nil {
 		globalMuseCodeNativeManager.ShutdownAll()
 	}
+
+	// WhatsApp links: disconnect the clients and flush what the remaining
+	// deadline allows; the session and any unflushed outbox stay on disk.
+	globalWhatsAppSupervisor.ShutdownAll(ctx)
 
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()

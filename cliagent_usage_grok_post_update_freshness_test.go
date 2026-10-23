@@ -402,3 +402,139 @@ func TestGrokUsage_SmokeWaitsForALoginRenewalLongerThanTenSeconds(t *testing.T) 
 		t.Fatalf("observedAt %s predates the smoke", observed)
 	}
 }
+
+/* ---------------------- hand-off: propagation survives ---------------------- */
+
+// A direct turn that finished just before the update hand-off is found by the
+// next process's startup scan and paid: the card's latestObservedAt is at or
+// after the turn.
+func TestGrokUsage_ADirectTurnBeforeTheHandOffIsPaidByTheNextProcess(t *testing.T) {
+	a := newGrokAcceptance(t, 7301)
+	cliUsageClaudeFallbackPoll = time.Hour // only the startup scan may find it
+	turn := time.Now()
+	appendGrokDirectLog(t, grokBillingLogPath(a.home), grokTurnMarkerLine(turn))
+	a.start() // the new process
+	a.waitGrokHint()
+	if got := atomic.LoadInt32(a.reads); got != 1 {
+		t.Fatalf("billing reads = %d, want one", got)
+	}
+	if observed := grokObservedAtViaSignedRefresh(t, "refresh-after-handoff"); observed.Before(turn.Truncate(time.Second)) {
+		t.Fatalf("latestObservedAt %s predates the turn (%s)", observed, turn)
+	}
+}
+
+// A numeric reading the old process committed but never hinted (it exited
+// inside the debounce) is rotated onto the new epoch and hinted exactly once,
+// with no new billing read.
+func TestGrokUsage_AnUnhintedReadingIsRotatedAndHintedOnceAfterTheHandOff(t *testing.T) {
+	a := newGrokAcceptance(t, 7302)
+	fingerprint := grokAccountFingerprintFor(a.home)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: time.Now().Add(-time.Minute), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		UsedPercent: 9, HasUsedPercent: true, PeriodEnd: time.Now().Add(72 * time.Hour), HasPeriodEnd: true,
+	}, fingerprint))
+	// The old process dies with its hint still pending; the new one draws a
+	// new epoch.
+	resetCLIUsagePropagator()
+	codexProcessGenerationEpoch.Store(7303)
+
+	a.start()
+	hint := a.waitGrokHint()
+	if hint.GenerationEpoch != 7303 || hint.Generation != 1 {
+		t.Fatalf("hint = %+v, want the rotated {7303,1}", hint)
+	}
+	a.assertOneGrokGeneration()
+	if got := atomic.LoadInt32(a.reads); got != 0 {
+		t.Fatalf("billing reads = %d, want recovery to send none", got)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7303, 1) {
+		t.Fatalf("usage = %+v, want the rotated generation published", usage)
+	}
+}
+
+// After an update the managed smoke's own read commits a generation, and the
+// signed refresh that follows carries it in its receipt.
+func TestGrokUsage_ManagedSmokeAfterAnUpdateCommitsAGenerationTheReceiptCarries(t *testing.T) {
+	withCodexGenerationEpoch(t, 7304)
+	grokSmokeEnv(t)
+	grokEnableRunRefresh(t)
+	grokBillingServer(t, func(string) (int, string) {
+		return http.StatusOK, grokFixtureBody(time.Now().Add(72 * time.Hour))
+	})
+	stubGrokSmokeNoBillingRecord(t)
+
+	res, replayed := runCLISmoke(context.Background(), "grok")
+	if replayed || res.Status != cliSmokeStatusSuccess {
+		t.Fatalf("smoke = %+v replayed=%t", res, replayed)
+	}
+	var entry grokBillingLiveCache
+	if !readJSONFile(grokBillingLiveCachePath(), &entry) || entry.Generation == nil || *entry.Generation != gen(7304, 1) {
+		t.Fatalf("live cache generation = %+v, want {7304,1}", entry.Generation)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true, Path: "grok", Version: "grok"}, time.Now())
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	_, normalized, _, err := prepareCLIUsageRefreshResult(
+		"signed-refresh-secret", "refresh-after-update", time.Now().UnixMilli(), true, []cliAgentUsage{*usage}, nil)
+	if err != nil || len(normalized) != 1 {
+		t.Fatalf("signed refresh: %+v err=%v", normalized, err)
+	}
+	if g := normalized[0].UsageGeneration; g == nil || *g != gen(7304, 1) {
+		t.Fatalf("receipt usageGeneration = %+v, want {7304,1}", g)
+	}
+}
+
+// A new period that clears the number is versioned like any reading: the
+// commit advances the generation, hints it, publishes it with the Unknown row,
+// and a process that inherits it unhinted recovers it once.
+func TestGrokUsage_ARolloverClearIsHintedPublishedAndRecovered(t *testing.T) {
+	a := newGrokAcceptance(t, 7310)
+	fingerprint := grokAccountFingerprintFor(a.home)
+	a.start()
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: time.Now().Add(-2 * time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		UsedPercent: 80, HasUsedPercent: true, PeriodEnd: time.Now().Add(-time.Hour), HasPeriodEnd: true,
+	}, fingerprint))
+	unmetered := grokBillingSnapshot{
+		ObservedAt: time.Now().Add(-time.Minute), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: time.Now().Add(72 * time.Hour), HasPeriodEnd: true,
+	}
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(unmetered, fingerprint))
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || entry.Generation == nil || *entry.Generation != gen(7310, 2) {
+		t.Fatalf("cache = %+v, want the clear versioned as {7310,2}", entry)
+	}
+	// A later unmetered answer keeps the clear without advancing again.
+	unmetered.ObservedAt = time.Now()
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(unmetered, fingerprint))
+	if entry := readGrokLiveCacheFile(t); !entry.Cleared || *entry.Generation != gen(7310, 2) {
+		t.Fatalf("cache = %+v, want the clear kept at {7310,2}", entry)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		hints := a.grokHints()
+		if len(hints) > 0 && hints[len(hints)-1].Generation == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("grok hints = %+v, want the clear's generation hinted", hints)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) == 0 || !usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want the new period's Unknown row", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7310, 2) {
+		t.Fatalf("usageGeneration = %+v, want the clear's {7310,2} published", usage.UsageGeneration)
+	}
+
+	codexProcessGenerationEpoch.Store(7311)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(time.Now())
+	if refused || g == nil || *g != gen(7311, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want the clear recovered as {7311,1}", g, refused)
+	}
+}

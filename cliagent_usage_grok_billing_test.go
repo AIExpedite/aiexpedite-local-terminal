@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -815,4 +816,688 @@ func TestGrokBillingMetrics_LiveUnknownPeriodKeepsFreshness(t *testing.T) {
 		HasPeriodEnd: true,
 	}, now),
 		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-19T11:00:00Z","unknown":true}]`)
+}
+
+/* ------------------------- live cache: commits ------------------------- */
+
+// grokLiveCacheFixture isolates the live cache on a pinned process epoch.
+func grokLiveCacheFixture(t *testing.T, epoch int64) {
+	t.Helper()
+	withCodexGenerationEpoch(t, epoch)
+	t.Setenv("AIEXPEDITE_GROK_BILLING_LIVE_CACHE", filepath.Join(t.TempDir(), "grok_billing_live.json"))
+}
+
+func grokLiveEntry(fingerprint string, at time.Time, percent *float64, periodEnd time.Time) grokBillingLiveCache {
+	snap := grokBillingSnapshot{ObservedAt: at, PeriodType: "USAGE_PERIOD_TYPE_WEEKLY", PeriodEnd: periodEnd, HasPeriodEnd: !periodEnd.IsZero()}
+	if percent != nil {
+		snap.UsedPercent, snap.HasUsedPercent = *percent, true
+	}
+	return grokBillingLiveFromSnapshot(snap, fingerprint)
+}
+
+func readGrokLiveCacheFile(t *testing.T) grokBillingLiveCache {
+	t.Helper()
+	var entry grokBillingLiveCache
+	if !readJSONFile(grokBillingLiveCachePath(), &entry) {
+		t.Fatal("no live cache on disk")
+	}
+	return entry
+}
+
+func TestGrokLiveCache_UnmeteredInTheSameOpenPeriodKeepsTheNumber(t *testing.T) {
+	grokLiveCacheFixture(t, 8101)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+	before := readGrokLiveCacheFile(t).Generation
+	if before == nil || *before != gen(8101, 1) {
+		t.Fatalf("generation = %+v, want {8101,1}", before)
+	}
+
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Hour), nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != *before {
+		t.Fatalf("generation = %+v, want an unmetered read never to bump it", entry.Generation)
+	}
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", at.Add(2*time.Hour))
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) {
+		t.Fatalf("snap = %+v ok=%t, want 36%% at its own older observedAt", snap, ok)
+	}
+}
+
+func TestGrokLiveCache_ANewerNumericReadWithTheSamePercentBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8102)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(36), end))
+	if g := readGrokLiveCacheFile(t).Generation; g == nil || *g != gen(8102, 2) {
+		t.Fatalf("generation = %+v, want a newer numeric observedAt to bump to {8102,2}", g)
+	}
+	// The same reading again commits nothing new.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(36), end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8102, 2) {
+		t.Fatalf("generation = %+v, want an identical read to keep {8102,2}", g)
+	}
+	// Another epoch's cache restarts at counter 1 on this one.
+	codexProcessGenerationEpoch.Store(8103)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(2*time.Minute), floatPtr(40), end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8103, 1) {
+		t.Fatalf("generation = %+v, want {8103,1}", g)
+	}
+}
+
+// Another agent process holding the cache's sibling lock serializes both the
+// commit and the rotation: neither renames over what the holder may commit,
+// and both go through once it releases.
+func TestGrokLiveCache_AnotherProcessHoldingTheLockRefusesCommitAndRotation(t *testing.T) {
+	grokLiveCacheFixture(t, 8110)
+	prevWait := grokBillingLiveCacheLockWait
+	grokBillingLiveCacheLockWait = 20 * time.Millisecond
+	t.Cleanup(func() { grokBillingLiveCacheLockWait = prevWait })
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	if !saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end)) {
+		t.Fatal("want the unlocked commit to land")
+	}
+
+	held, err := os.OpenFile(grokBillingLiveCachePath()+".lock", os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFileExclusive(held); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			_ = unlockFile(held)
+			_ = held.Close()
+		}
+	}
+	t.Cleanup(release)
+
+	if saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end)) {
+		t.Fatal("want a commit under another holder's lock refused")
+	}
+	if entry := readGrokLiveCacheFile(t); *entry.UsedPercent != 36 || *entry.Generation != gen(8110, 1) {
+		t.Fatalf("entry = %+v, want the cache untouched while locked", entry)
+	}
+	codexProcessGenerationEpoch.Store(8111)
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); g != nil || !refused {
+		t.Fatalf("rotation = %+v refused=%t, want it refused for a retry while locked", g, refused)
+	}
+
+	release()
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); refused || g == nil || *g != gen(8111, 1) {
+		t.Fatalf("rotation = %+v refused=%t, want {8111,1} once released", g, refused)
+	}
+	if !saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end)) {
+		t.Fatal("want the commit to land once released")
+	}
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8111, 2) {
+		t.Fatalf("generation = %+v, want {8111,2}", g)
+	}
+}
+
+// Two processes' requests overlap outside the cache lock: an older same-account
+// answer that finishes last is superseded, never written over the newer cache
+// or its generation — whether its figures, its period or its kind differ.
+func TestGrokLiveCache_AnOlderSameAccountAnswerNeverReplacesANewerOne(t *testing.T) {
+	grokLiveCacheFixture(t, 8113)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(time.Minute), floatPtr(40), end))
+	want := readGrokLiveCacheFile(t)
+
+	for _, older := range []grokBillingLiveCache{
+		grokLiveEntry("fp-ada", at, floatPtr(36), end),
+		grokLiveEntry("fp-ada", at, floatPtr(36), end.Add(-time.Hour)),
+		grokLiveEntry("fp-ada", at, nil, end),
+		grokLiveOnDemandEntry("fp-ada", at, nil, end, 50, 5),
+	} {
+		committed, advanced, _ := commitGrokBillingLive(older)
+		if !committed || advanced {
+			t.Fatalf("committed=%t advanced=%t, want an older answer superseded without an advance", committed, advanced)
+		}
+		if got := readGrokLiveCacheFile(t); !reflect.DeepEqual(got, want) {
+			t.Fatalf("cache = %+v, want the newer answer %+v untouched", got, want)
+		}
+	}
+
+	// Another account's answer is not compared against this one's time.
+	if _, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-bob", at, floatPtr(10), end)); !advanced {
+		t.Fatal("want another account's numeric read to replace and advance")
+	}
+}
+
+// A cached answer a forward clock jump stamped beyond grokBillingMaxClockSkew
+// ahead is untrusted once the clock is corrected: the next read replaces it
+// (with an advance, even with matching figures) instead of being superseded
+// until wall time catches up.
+func TestGrokLiveCache_ACorrectedClockReadReplacesAFutureCacheEntry(t *testing.T) {
+	grokLiveCacheFixture(t, 8114)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(6*time.Hour), floatPtr(40), end))
+
+	// Within the skew an earlier answer is still an overlapping request.
+	if committed, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-ada", at.Add(6*time.Hour-grokBillingMaxClockSkew), floatPtr(40), end)); !committed || advanced {
+		t.Fatalf("committed=%t advanced=%t, want a near-earlier answer superseded", committed, advanced)
+	}
+	committed, advanced, _ := commitGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(40), end))
+	if !committed || !advanced {
+		t.Fatalf("committed=%t advanced=%t, want the corrected read to replace and advance", committed, advanced)
+	}
+	if got := readGrokLiveCacheFile(t); got.ObservedAt != at.Format(time.RFC3339Nano) || *got.UsedPercent != 40 {
+		t.Fatalf("cache = %+v, want the corrected read", got)
+	}
+}
+
+func TestGrokLiveCache_AcrossARolloverTheUnmeteredReadWins(t *testing.T) {
+	grokLiveCacheFixture(t, 8104)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(80), end))
+	// A new period, unmetered: the old figure is not borrowed.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", end.Add(time.Minute), nil, end.Add(7*24*time.Hour)))
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada", end.Add(2*time.Minute)); !ok || snap.HasUsedPercent {
+		t.Fatalf("snap = %+v, want the new period's unmetered answer", snap)
+	}
+}
+
+// grokLiveOnDemandEntry is grokLiveEntry carrying an on-demand pool.
+func grokLiveOnDemandEntry(fingerprint string, at time.Time, percent *float64, periodEnd time.Time, cap, used float64) grokBillingLiveCache {
+	entry := grokLiveEntry(fingerprint, at, percent, periodEnd)
+	entry.OnDemandCap, entry.OnDemandUsed = floatPtr(cap), floatPtr(used)
+	return entry
+}
+
+func TestGrokLiveCache_AnUnmeteredReadWithANumericOnDemandPoolBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8108)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, floatPtr(36), end, 50, 5))
+
+	// Credits unmetered, on-demand moved: the pool is a fresh numeric reading.
+	later := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 12))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8108, 2) {
+		t.Fatalf("generation = %+v, want the on-demand pool to bump to {8108,2}", entry.Generation)
+	}
+	now := at.Add(2 * time.Hour)
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", now)
+	if !ok || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) || !snap.OnDemandObservedAt.Equal(later) {
+		t.Fatalf("snap = %+v ok=%t, want 36%% at its own time and the pool at the newer one", snap, ok)
+	}
+	metrics := grokBillingMetrics(snap, now)
+	if len(metrics) != 2 || metrics[1].ObservedAt != later.Format(time.RFC3339) || *metrics[1].Consumed != 12 {
+		t.Fatalf("metrics = %+v, want the on-demand row stamped with its own read", metrics)
+	}
+
+	// The same pool again advances nothing; a changed pool does.
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 12))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8108, 2) {
+		t.Fatalf("generation = %+v, want an identical pool to keep {8108,2}", g)
+	}
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", later, nil, end, 50, 20))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8108, 3) {
+		t.Fatalf("generation = %+v, want changed figures to bump to {8108,3}", g)
+	}
+}
+
+// A newer unmetered answer that drops the on-demand pool under a kept
+// percentage removes the card's on-demand row, so the removal is versioned.
+func TestGrokLiveCache_DroppingTheOnDemandPoolUnderAKeptPercentageBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8110)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, floatPtr(36), end, 50, 5))
+
+	later := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", later, nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8110, 2) || entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want the removal to bump to {8110,2} without a clear mark", entry.Generation, entry.Cleared)
+	}
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", later)
+	if !ok || snap.UsedPercent != 36 || !snap.ObservedAt.Equal(at) || snap.HasOnDemand {
+		t.Fatalf("snap = %+v ok=%t, want the kept 36%% and no on-demand pool", snap, ok)
+	}
+
+	// Nothing left to remove: the next unmetered answer advances nothing.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", later.Add(time.Hour), nil, end))
+	if g := readGrokLiveCacheFile(t).Generation; *g != gen(8110, 2) {
+		t.Fatalf("generation = %+v, want {8110,2} kept", g)
+	}
+}
+
+// An unmetered read for another account replaces the cached number: the card
+// moves from that figure to Unknown, so the replacement is a versioned clear.
+func TestGrokLiveCache_AnUnmeteredReadReplacingAnotherAccountsNumberClears(t *testing.T) {
+	grokLiveCacheFixture(t, 8112)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(36), end))
+
+	saveGrokBillingLive(grokLiveEntry("fp-bob", at.Add(time.Minute), nil, end))
+	entry := readGrokLiveCacheFile(t)
+	if entry.Generation == nil || *entry.Generation != gen(8112, 2) || !entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want the replacement versioned as a clear {8112,2}", entry.Generation, entry.Cleared)
+	}
+	view, ok := loadGrokBillingLive("fp-bob", at.Add(2*time.Minute))
+	if !ok || !view.cleared || view.generation == nil || *view.generation != gen(8112, 2) {
+		t.Fatalf("view = %+v ok=%t, want fp-bob's clear published with its generation", view, ok)
+	}
+
+	// fp-bob's next unmetered answer keeps the mark without advancing again.
+	saveGrokBillingLive(grokLiveEntry("fp-bob", at.Add(time.Hour), nil, end))
+	if entry := readGrokLiveCacheFile(t); *entry.Generation != gen(8112, 2) || !entry.Cleared {
+		t.Fatalf("generation = %+v cleared=%t, want {8112,2} kept with the mark", entry.Generation, entry.Cleared)
+	}
+}
+
+func TestGrokLiveCache_AnUnmeteredReadWithoutUsageOnTheCapNeverBumps(t *testing.T) {
+	grokLiveCacheFixture(t, 8109)
+	at := time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC)
+	end := at.Add(72 * time.Hour)
+	entry := grokLiveEntry("fp-ada", at, nil, end)
+	entry.OnDemandCap = floatPtr(50) // a cap with no usage renders Unknown
+	saveGrokBillingLive(entry)
+	if g := readGrokLiveCacheFile(t).Generation; g != nil {
+		t.Fatalf("generation = %+v, want an Unknown pool never versioned", g)
+	}
+}
+
+func TestGrokRecovery_RecoversAnOnDemandOnlyReading(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8110)
+	at := h.clock().Add(-time.Minute)
+	end := h.clock().Add(48 * time.Hour)
+	saveGrokBillingLive(grokLiveOnDemandEntry("fp-ada", at, nil, end, 50, 7))
+	codexProcessGenerationEpoch.Store(8111)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8111, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want the numeric on-demand pool recovered as {8111,1}", g, refused)
+	}
+}
+
+func TestGrokLiveCache_AKeptNumberPastItsPeriodEndIsNeverLiveCoverage(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8105)
+	at := h.clock()
+	end := at.Add(time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(50), end))
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at.Add(30*time.Minute), nil, end))
+	if snap, ok := loadGrokBillingLiveSnapshot("fp-ada", at.Add(45*time.Minute)); !ok || !snap.HasUsedPercent {
+		t.Fatalf("inside the period: snap = %+v, want the kept number", snap)
+	}
+	h.advance(2 * time.Hour) // past the period end
+	snap, ok := loadGrokBillingLiveSnapshot("fp-ada", h.clock())
+	if !ok || snap.HasUsedPercent || !snap.ObservedAt.Equal(at.Add(30*time.Minute)) {
+		t.Fatalf("past the end: snap = %+v, want the unmetered answer only", snap)
+	}
+	if grokObservationCovers("fp-ada", at.UnixMilli()) {
+		t.Fatal("a rolled-over kept number must not cover a debt")
+	}
+	if g, refused := grokRecoveryGeneration(h.clock()); g != nil || refused {
+		t.Fatalf("recovery = %+v refused=%t, want nothing recovered past the period end", g, refused)
+	}
+}
+
+func TestGrokRecovery_SkipsAnotherAccountAndAnUnknownReading(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8106)
+	at := h.clock().Add(-time.Minute)
+	end := h.clock().Add(48 * time.Hour)
+
+	// Unknown first: over another account's number it would be a clear.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, nil, end))
+	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
+		t.Fatalf("recovered %+v for an unmetered (Unknown) reading", g)
+	}
+	saveGrokBillingLive(grokLiveEntry("fp-other", at, floatPtr(20), end))
+	if g, _ := grokRecoveryGeneration(h.clock()); g != nil {
+		t.Fatalf("recovered %+v for another account", g)
+	}
+
+	// A numeric reading an earlier process committed is moved onto this
+	// epoch in one write.
+	saveGrokBillingLive(grokLiveEntry("fp-ada", at, floatPtr(20), end))
+	codexProcessGenerationEpoch.Store(8107)
+	grokGenerationRotated.Store(false)
+	g, refused := grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8107, 1) || !grokGenerationRotated.Load() {
+		t.Fatalf("recovery = %+v refused=%t rotated=%t, want {8107,1}", g, refused, grokGenerationRotated.Load())
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8107, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation on disk", on)
+	}
+}
+
+// A pool grokBillingMetrics suppresses as future-dated must not be published
+// under a generation that versions it: the backend would apply that
+// generation and then keep omitting the pool once the clock catches up and it
+// renders again, with no commit left to version it.
+func TestGrokUsageParser_WithholdsTheGenerationWhileAPoolIsFutureDated(t *testing.T) {
+	grokLiveCacheFixture(t, 8130)
+	home := t.TempDir()
+	base := filepath.Join(home, ".grok")
+	t.Setenv("GROK_HOME", "")
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+		"email": "ada@example.com", "user_id": "acct-1",
+	})
+	fingerprint := grokAccountFingerprintFor(base)
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	end := now.Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry(fingerprint, now.Add(-time.Hour), floatPtr(36), end))
+	// The next answer carries an on-demand pool and a clock an hour ahead:
+	// the percentage is kept at its own trusted time, the pool is not.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: now.Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, fingerprint))
+	if g := readGrokLiveCacheFile(t).Generation; g == nil || *g != gen(8130, 2) {
+		t.Fatalf("generation = %+v, want the pool's commit at {8130,2}", g)
+	}
+	grokGenerationRotated.Store(true)
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].Unknown {
+		t.Fatalf("usage = %+v, want the percentage alone while the pool is future-dated", usage)
+	}
+	if usage.UsageGeneration != nil {
+		t.Fatalf("usageGeneration = %+v, want none while the pool it versions is withheld", usage.UsageGeneration)
+	}
+
+	// Once the clock catches up the pool renders, and the generation that
+	// versions it is published with it.
+	later := now.Add(2 * time.Hour)
+	usage, ok = grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, later)
+	if !ok || len(usage.Metrics) != 2 || usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 20 {
+		t.Fatalf("usage = %+v, want the pool rendered once its time has passed", usage)
+	}
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(8130, 2) {
+		t.Fatalf("usageGeneration = %+v, want {8130,2} published with the pool", usage.UsageGeneration)
+	}
+}
+
+// Startup recovery must apply the same withholding rule as ParseContext: a
+// generation that versions a future-dated pool is rotated (so the next gather
+// can publish it) but not hinted, because the hint would be spent on a
+// refresh whose receipt carries no generation and nothing would hint it again
+// once the clock catches up.
+func TestGrokRecovery_WithholdsAHintWhileAPoolIsFutureDated(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8132)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokLiveEntry("fp-ada", h.clock().Add(-time.Hour), floatPtr(36), end))
+	// The newest answer's pool is stamped an hour ahead: the percentage is
+	// kept at its own trusted time, the pool is withheld until then.
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8133)
+	grokGenerationRotated.Store(false)
+
+	g, refused := grokRecoveryGeneration(h.clock())
+	if g != nil || !refused {
+		t.Fatalf("recovery = %+v refused=%t, want the hint withheld and retried while the pool is future-dated", g, refused)
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8133, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation committed anyway", on)
+	}
+
+	// Once the clock catches up the pool renders, and the recovery hints it.
+	h.advance(2 * time.Hour)
+	g, refused = grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8133, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want {8133,1} hinted once the pool renders", g, refused)
+	}
+}
+
+// A figure stamped further ahead than the retry ladder reaches must keep
+// recovery alive until it becomes trusted: the withheld waits follow the
+// figure's own time (capped per wait) and spend no ladder attempt, so the
+// rotated generation is still hinted once the pool renders.
+func TestGrokRecovery_WaitsOutAFutureOffsetLongerThanTheLadder(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8136)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8137)
+	// The old process's commit hinted its own generation; start clean.
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var booked []time.Duration
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		booked, next = append(booked, d), f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+	pending := func() *cliUsagePendingHint {
+		cliUsagePropagator.mu.Lock()
+		defer cliUsagePropagator.mu.Unlock()
+		return cliUsagePropagator.pending[grokUsageProvider]
+	}
+
+	recoverGrokUsageGeneration(1)
+	// The pool is trusted 55 minutes from now: one capped wait, then the rest.
+	want := []time.Duration{grokRecoveryWithheldMaxWait}
+	if len(booked) != 1 || booked[0] != want[0] {
+		t.Fatalf("booked %v, want %v", booked, want)
+	}
+	if pending() != nil {
+		t.Fatal("hinted a generation whose pool is still withheld")
+	}
+	h.advance(booked[0])
+	fire := next
+	next = nil
+	fire()
+	if len(booked) != 2 || booked[1] != 25*time.Minute+time.Second {
+		t.Fatalf("booked %v, want the remaining 25m1s wait", booked)
+	}
+	if pending() != nil {
+		t.Fatal("hinted a generation whose pool is still withheld")
+	}
+
+	h.advance(booked[1])
+	fire = next
+	next = nil
+	fire()
+	if p := pending(); p == nil || p.generation != gen(8137, 1) {
+		t.Fatalf("pending = %+v, want {8137,1} hinted once the pool renders", p)
+	}
+	if next != nil {
+		t.Fatalf("booked %v, want no retry after the hint", booked)
+	}
+}
+
+// A recovery retry still pending at shutdown never fires: after an update
+// hand-off it would rotate the cache back onto the old process's epoch, over
+// the replacement's, and nothing would hint it.
+func TestGrokRecovery_APendingRetryIsCancelledAtShutdown(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8141)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8142)
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		next = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+
+	recoverGrokUsageGeneration(1)
+	if next == nil {
+		t.Fatal("want a recovery retry booked for the withheld pool")
+	}
+	stopGrokRecoveryRetry()
+	// The replacement process rotates the cache onto its own epoch.
+	codexProcessGenerationEpoch.Store(8143)
+	if g, refused := rotateGrokBillingLiveGeneration("fp-ada"); refused || g == nil || *g != gen(8143, 1) {
+		t.Fatalf("replacement rotation = %+v refused=%t", g, refused)
+	}
+	codexProcessGenerationEpoch.Store(8142)
+	h.advance(2 * time.Hour)
+	next()
+	view, ok := loadGrokBillingLive("fp-ada", h.clock())
+	if !ok || view.generation == nil || *view.generation != gen(8143, 1) {
+		t.Fatalf("cache generation = %+v, want the replacement's {8143,1} kept", view.generation)
+	}
+	cliUsagePropagator.mu.Lock()
+	p := cliUsagePropagator.pending[grokUsageProvider]
+	cliUsagePropagator.mu.Unlock()
+	if p != nil {
+		t.Fatalf("pending = %+v, want no hint from a cancelled recovery", p)
+	}
+}
+
+// Idling an auth-refused run debt (stopGrokRunDebtRetry) is not shutdown: a
+// recovery retry waiting for a withheld figure must survive it, or the rotated
+// generation is never hinted once the figure becomes trusted.
+func TestGrokRecovery_APendingRetrySurvivesAnIdledRunDebt(t *testing.T) {
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		next = f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() {
+		grokRecoveryAfterFunc = prev
+		stopGrokRecoveryRetry()
+	})
+
+	fired := false
+	grokArmRecoveryRetry(time.Minute, func() { fired = true })
+	stopGrokRunDebtRetry()
+	next()
+	if !fired {
+		t.Fatal("idling a run debt cancelled the pending generation recovery")
+	}
+}
+
+// The same rule must reach a cache whose ONLY figure is the future-dated pool:
+// it renders Unknown on its own, so the metrics gate must not skip it, or
+// nothing is rotated, no retry is armed, and the generation stays unhintable
+// even after the clock catches up.
+func TestGrokRecovery_RetriesAPoolOnlyFutureDatedCache(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8134)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8135)
+	grokGenerationRotated.Store(false)
+
+	g, refused := grokRecoveryGeneration(h.clock())
+	if g != nil || !refused {
+		t.Fatalf("recovery = %+v refused=%t, want the hint withheld and retried for a pool-only future cache", g, refused)
+	}
+	if on := readGrokLiveCacheFile(t).Generation; on == nil || *on != gen(8135, 1) {
+		t.Fatalf("cache generation = %+v, want the rotation committed anyway", on)
+	}
+	if !grokGenerationRotated.Load() {
+		t.Fatal("grokGenerationRotated = false, want the rotation latched so the next gather can publish")
+	}
+
+	// Once the clock catches up the pool renders, and the recovery hints it.
+	h.advance(2 * time.Hour)
+	g, refused = grokRecoveryGeneration(h.clock())
+	if refused || g == nil || *g != gen(8135, 1) {
+		t.Fatalf("recovery = %+v refused=%t, want {8135,1} hinted once the pool renders", g, refused)
+	}
+}
+
+// A recovery still waiting for a future-dated figure survives a temporary
+// account switch: it neither hints under the other login — whose receipt
+// could not carry this generation — nor ends the chain, so the reading is
+// still hinted once its own account is back.
+func TestGrokRecovery_KeepsAWithheldRecoveryAliveAcrossAnAccountSwitch(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	withCodexGenerationEpoch(t, 8138)
+	t.Cleanup(resetCLIUsagePropagator)
+	end := h.clock().Add(72 * time.Hour)
+	saveGrokBillingLive(grokBillingLiveFromSnapshot(grokBillingSnapshot{
+		ObservedAt: h.clock().Add(time.Hour), PeriodType: "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd: end, HasPeriodEnd: true,
+		HasOnDemand: true, OnDemandCap: 50, HasOnDemandUsed: true, OnDemandUsed: 20,
+	}, "fp-ada"))
+	codexProcessGenerationEpoch.Store(8139)
+	// The old process's commit hinted its own generation; start clean.
+	resetCLIUsagePropagator()
+	grokGenerationRotated.Store(false)
+
+	var booked []time.Duration
+	var next func()
+	prev := grokRecoveryAfterFunc
+	grokRecoveryAfterFunc = func(d time.Duration, f func()) *time.Timer {
+		booked, next = append(booked, d), f
+		return time.NewTimer(time.Hour)
+	}
+	t.Cleanup(func() { grokRecoveryAfterFunc = prev })
+	pending := func() *cliUsagePendingHint {
+		cliUsagePropagator.mu.Lock()
+		defer cliUsagePropagator.mu.Unlock()
+		return cliUsagePropagator.pending[grokUsageProvider]
+	}
+
+	recoverGrokUsageGeneration(1)
+	if len(booked) != 1 || booked[0] != grokRecoveryWithheldMaxWait {
+		t.Fatalf("booked %v, want one capped wait for the withheld pool", booked)
+	}
+
+	// bob signs in before the wait is out: ada's rotated generation is not
+	// hintable under his login, and the clock has not caught up either.
+	h.signIn("fp-bob")
+	h.advance(booked[0])
+	fire := next
+	next = nil
+	fire()
+	if p := pending(); p != nil {
+		t.Fatalf("pending = %+v, want no hint for ada's generation under bob's login", p)
+	}
+	if len(booked) != 2 || booked[1] != grokRecoveryWithheldMaxWait {
+		t.Fatalf("booked %v, want the recovery kept alive while ada is away", booked)
+	}
+
+	// ada is back and the pool's stamp is now in the past.
+	h.signIn("fp-ada")
+	h.advance(2 * time.Hour)
+	fire = next
+	next = nil
+	fire()
+	if p := pending(); p == nil || p.generation != gen(8139, 1) {
+		t.Fatalf("pending = %+v, want {8139,1} hinted once ada is back and the pool renders", p)
+	}
+	if next != nil {
+		t.Fatalf("booked %v, want no retry after the hint", booked)
+	}
 }

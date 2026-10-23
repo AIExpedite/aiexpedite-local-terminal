@@ -120,7 +120,8 @@ type cliAgentUsage struct {
 	// UsageGeneration identifies the device-side capture state these metrics
 	// were read from: Codex's rate-limit cache
 	// (codexMetricsAndGenerationFromCache), Claude's claudeRateLimitView.generation,
-	// or OpenCode's usage ledger (cliagent_usage_opencode_capture.go). Signed in
+	// OpenCode's usage ledger (cliagent_usage_opencode_capture.go), or Grok's live
+	// billing cache (cliagent_usage_grok_live.go). Signed in
 	// the refresh receipt, so the backend can record, per provider, which
 	// generation it applied and skip a usage hint for one it already has
 	// (cliagent_usage_propagate.go). Integers only.
@@ -458,7 +459,9 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 // bounded I/O during refresh (it implements cliAgentUsageContextParser —
 // Claude's usage request and auth status, Codex's app-server state, OpenCode's
 // readiness probes, Antigravity's loopback quota request), nothing for one that
-// only reads local files.
+// only reads local files. A context parser that reads only local files (Grok,
+// which takes the context for its receipt reservation) declares
+// SerialProbeCount() == 0 and reserves nothing.
 func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 	if parser == nil {
 		return 0
@@ -472,7 +475,7 @@ func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 	// declare a count.
 	probes := 1
 	if counter, declares := parser.(cliAgentUsageSerialProbeCounter); declares {
-		if n := counter.SerialProbeCount(); n > probes {
+		if n := counter.SerialProbeCount(); n == 0 || n > probes {
 			probes = n
 		}
 	}
@@ -481,7 +484,8 @@ func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 
 // cliAgentUsageSerialProbeCounter is implemented by a bounded parser that runs
 // MORE than one bounded child serially in a single refresh, so the reserve held
-// back for it covers the whole sequence.
+// back for it covers the whole sequence — or by a context parser that runs
+// none (0).
 type cliAgentUsageSerialProbeCounter interface {
 	SerialProbeCount() int
 }

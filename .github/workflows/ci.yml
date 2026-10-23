@@ -105,6 +105,9 @@ jobs:
         if: runner.os == 'Linux'
         run: go test -race -timeout 10m ./...
 
+      # windows-latest runs the root package's serial suite in ~560-600s
+      # (main's own run took 593s), so a 10m budget times out on suite growth
+      # with whatever test happens to be running at the deadline.
       - name: go test (no race)
         if: runner.os != 'Linux'
-        run: go test -timeout 10m ./...
+        run: go test -timeout 20m ./...

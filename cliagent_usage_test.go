@@ -3843,3 +3843,27 @@ func TestCodexUsageParser_ProbeBoundedByParentGather(t *testing.T) {
 		t.Fatalf("probe budget=%v, want <= %v so the sibling reserve survives", probeSlack, 2*time.Second)
 	}
 }
+
+// Grok's parser takes a context (for its receipt reservation) but reads only
+// local files, so it declares zero serial probes and reserves nothing; every
+// other bounded parser keeps its reserve.
+func TestCLIAgentUsageGatherReserve_AZeroCountContextParserReservesNothing(t *testing.T) {
+	if _, bounded := cliAgentUsageParser(grokUsageParser{}).(cliAgentUsageContextParser); !bounded {
+		t.Fatal("the grok parser must be a context parser")
+	}
+	if got := cliAgentUsageGatherReserve(grokUsageParser{}); got != 0 {
+		t.Fatalf("grok reserve = %v, want 0", got)
+	}
+	probe := cliAgentModelDiscoveryGatherReserve
+	parsers := cliAgentUsageParserIndex()
+	for id, want := range map[string]time.Duration{
+		"claudeCode":  time.Duration(claudeCodeUsageParser{}.SerialProbeCount()) * probe,
+		"codex":       probe,
+		"opencode":    probe,
+		"antigravity": probe,
+	} {
+		if got := cliAgentUsageGatherReserve(parsers[id]); got != want {
+			t.Fatalf("%s reserve = %v, want %v", id, got, want)
+		}
+	}
+}

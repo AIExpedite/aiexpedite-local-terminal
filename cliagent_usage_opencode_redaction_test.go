@@ -162,3 +162,65 @@ func TestOpenCodeUsageRedaction_TheDirectReaderKeepsNothingButCounts(t *testing.
 		t.Fatal("the reader published no numbers; the redaction proof would be vacuous")
 	}
 }
+
+// OpenCode 2 rows carry prompt text, tool output, paths and a token inside
+// session_message.data. The adapter's read, the ledger, the device log and the
+// published usage carry counts, hashed keys and fixed labels only — whether the
+// row is read by a scan or pays an owed debt.
+func TestOpenCodeUsageRedaction_V2RowsLeaveNothingButCounts(t *testing.T) {
+	sched, store, clock, _ := openCodeV2Fixture(t, 1203)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	const canaryPath = "/home/canary/CANARY-PROMPT-project"
+	secretRow := func(session, id string, createdMs, completedMs int64) {
+		store.row(session, id, "assistant", createdMs, completedMs, fmt.Sprintf(
+			`{"text":%q,"path":{"cwd":%q},"tool":{"input":{"filePath":%q},"output":%q},"auth":{"key":%q},"account":%q,"cost":0.25,"tokens":{"input":500,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":%d,"completed":%d}}`,
+			openCodeRedactionPrompt, canaryPath, canaryPath, openCodeRedactionAPIKey, openCodeRedactionAPIKey, openCodeRedactionAccount, createdMs, completedMs))
+		store.row(session, id+"_shell", "shell", completedMs, completedMs, fmt.Sprintf(`{"command":"cat %s","output":%q}`, canaryPath, openCodeRedactionAPIKey))
+		store.idle(session, id+"_idle", completedMs)
+	}
+	// A direct run, read by a scan.
+	store.row(openCodeRedactionSession, "msg_user", "user", clock.ms(-time.Hour), clock.ms(-time.Hour), fmt.Sprintf(`{"text":%q}`, openCodeRedactionPrompt))
+	secretRow(openCodeRedactionSession, "msg_canary", clock.ms(-time.Hour), clock.ms(-time.Hour+time.Second))
+
+	read, err := readOpenCodeDirectSQLite(context.Background(), openCodeStorageDir(), 0, openCodeDirectTestLimits())
+	if err != nil || len(read.Messages) != 1 {
+		t.Fatalf("read = %+v, %v", read, err)
+	}
+	dumped, _ := json.Marshal(read)
+	assertNoOpenCodeCanary(t, "the adapter's read", string(dumped), true)
+	if strings.Contains(string(dumped), canaryPath) {
+		t.Fatal("the adapter's read carries a store path")
+	}
+
+	// A managed run whose stream carried no usage, paid from the store.
+	run := armOpenCodeUsageRun("opencode", "", "")
+	captureOpenCodeUsageLine(run, `{"type":"session.created","sessionID":"ses_managed"}`)
+	openCodeUsageInFlight.Wait()
+	clock.now = clock.now.Add(time.Second)
+	secretRow("ses_managed", "msg_managed", clock.ms(-500*time.Millisecond), clock.ms(0))
+	settleOpenCodeUsageRun(run, "")
+
+	logs := captureStdout(t, func() {
+		scanOpenCodeDirect(t)
+		for sched.fireNext() {
+		}
+	})
+	assertNoOpenCodeCanary(t, "the device log", logs, false)
+	if strings.Contains(logs, canaryPath) || strings.Contains(logs, "ses_managed") {
+		t.Fatal("the device log carries a path or a session id")
+	}
+	raw, err := os.ReadFile(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoOpenCodeCanary(t, "the ledger file", string(raw), false)
+	if strings.Contains(string(raw), canaryPath) {
+		t.Fatal("the ledger carries a store path")
+	}
+	usage, _ := openCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Path: "opencode"}, clock.now)
+	published, _ := json.Marshal(usage)
+	assertNoOpenCodeCanary(t, "the published cliAgentUsage", string(published), false)
+	if tokens := openCodeMetricByLabel(t, usage.Metrics, "Tokens today"); tokens.Consumed == nil || *tokens.Consumed != 1040 {
+		t.Fatalf("tokens row = %+v, want both rows' 520; the redaction proof would be vacuous", tokens)
+	}
+}

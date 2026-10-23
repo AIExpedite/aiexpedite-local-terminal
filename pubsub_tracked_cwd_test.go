@@ -197,12 +197,20 @@ func TestTrackedCwd_EvictionDropsAnExpiredScopeAndSparesALiveOne(t *testing.T) {
 
 // A SIGNED cwd must win over any tracked one.
 //
-// `executionID` arrives unsigned, so an attacker with topic-write but no HMAC
-// key can append one to a REPLAYED signed frame without disturbing its
-// signature. If the signed cwd happened to equal the configured default, the
-// `cd`-persistence substitution would then redirect the command to whatever
-// that scope had remembered. Env-setup (RiskLevel) and read-only frames are the
-// two that sign `cwd` — exactly signatureCwd's condition.
+// Written against a tamper path that is now closed: while `executionID` arrived
+// unsigned, an attacker with topic-write but no HMAC key could append one to a
+// REPLAYED signed frame without disturbing its signature, and if the signed cwd
+// happened to equal the configured default, the `cd`-persistence substitution
+// would redirect the command to whatever that scope had remembered. The id is
+// part of the signature canonical now (signaturePayload), so the scope selector
+// is authenticated.
+//
+// The precedence asserted here is kept anyway, because it was never only an
+// anti-tamper measure: a legitimate run whose remembered directory differs from
+// the signed cwd must not move an approved, disk-gated step either. That is why
+// cwdScope.cwdSigned and this case both survive the transition. Env-setup
+// (RiskLevel) and read-only frames are the two that sign `cwd` — exactly
+// signatureCwd's condition.
 func TestResolveWorkDir_TrackedCwdNeverOverridesASignedCwd(t *testing.T) {
 	resetTrackedCwds()
 	t.Cleanup(resetTrackedCwds)

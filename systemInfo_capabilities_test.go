@@ -62,8 +62,19 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 				t.Fatalf("caps = %+v, want the follow-up ledger reported", *caps)
 			}
 			caps.RelayFollowUps = nil // its ledgerId is per machine
+			// WhatsApp is a build fact too, but its secureStorage half depends
+			// on the host's credential store, so only its key set is pinned.
+			if caps.WhatsApp == nil || !caps.WhatsApp.Supported {
+				t.Fatalf("caps = %+v, want the WhatsApp capability reported", *caps)
+			}
+			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage})
 			raw, _ := json.Marshal(caps)
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true}` {
+			// The literal IS the assertion: this pins the exact wire shape, so
+			// adding a capability has to be a deliberate edit here rather than
+			// something that rides along silently. `signedExecutionId` joined it
+			// with the signed-executionId device half, `whatsapp` with the
+			// WhatsApp bridge.
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})

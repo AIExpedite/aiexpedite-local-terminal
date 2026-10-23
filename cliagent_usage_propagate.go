@@ -16,8 +16,9 @@
 // ADVANCED observation for the active account (mergeCodexRateLimitCacheObserved),
 // Claude Code on a numeric row winning its newer-wins merge
 // (mergeClaudeRateLimitCacheLocked), OpenCode on an advanced observation in its
-// usage ledger (cliagent_usage_opencode_capture.go) — the propagator sends one
-// signed hint,
+// usage ledger (cliagent_usage_opencode_capture.go), Grok on a numeric live
+// billing read committing to its cache (commitGrokBillingLive,
+// cliagent_usage_grok_live.go) — the propagator sends one signed hint,
 // `POST /device/:agentId/cli-usage/observed`, naming the provider and the
 // committed generation. terminal-service answers it with one ordinary refresh —
 // at most one per agent per 4 minutes, none when it already applied that
@@ -27,9 +28,10 @@
 //
 // The providers that send hints mirror terminal-service's
 // CLI_USAGE_HINT_PROVIDERS (src/config/terminal.config.js) by hand — the device
-// cannot import it: codexUsageProvider, claudeUsageProvider and
-// openCodeUsageProvider. A hint from any other provider is accepted and ignored
-// there.
+// cannot import it: codexUsageProvider, claudeUsageProvider,
+// openCodeUsageProvider and grokUsageProvider. A hint from any other provider is
+// accepted and ignored there, so a device that ships a new provider first sends
+// hints that do nothing until terminal-service lists it.
 //
 // Device-side bounds:
 //   - one pending slot PER PROVIDER, carrying that provider's newest
@@ -49,7 +51,7 @@
 //     cooldown); a failed signing or publish releases it into the normal
 //     initial-plus-follow-up lifecycle;
 //   - nothing is sent while offline, draining, shutting down, unregistered, or
-//     (Codex and OpenCode) before this process's generation epoch for that
+//     (Codex, OpenCode and Grok) before this process's generation epoch for that
 //     provider is on disk; the generation is kept and re-checked at the next
 //     boundary, and a provider awaiting its rotation never holds another back.
 //
@@ -71,6 +73,15 @@
 // agent is online and not draining or shutting down, and the store changed; a
 // committed change goes through noteOpenCodeUsageAdvanced like any other.
 //
+// The same timer then runs the Grok direct-run scan (grokDirectRunScanIfChanged,
+// cliagent_usage_grok_direct.go): a `grok` turn from the user's own shell, an
+// IDE or an unarmed PTY TUI closes with a marker line in the persistent home's
+// log, which only a read can discover. One stat per poll, a bounded read of the
+// appended bytes only when it moved, and only while Grok is detected and the
+// agent is online and not draining or shutting down; a turn newer than the
+// numeric live reading owes one read through the bounded Grok run debt, whose
+// commit hints like any other.
+//
 // Pending state is in memory only. A reading captured just before an update
 // handoff is recovered by the next process: once its Codex epoch rotation
 // commits (codexRotateGenerationEpoch), a Codex cache that still renders a
@@ -78,8 +89,10 @@
 // gates; Claude's generation is persisted with its cache, so startup re-reads it
 // once (versioning a legacy numeric snapshot first) and schedules it the same
 // way. An OpenCode ledger with numbers for today is rotated and scheduled the
-// same way (recoverOpenCodeUsageGeneration). The backend skips a generation it
-// already applied.
+// same way (recoverOpenCodeUsageGeneration), and so is a Grok live cache whose
+// numeric reading for the signed-in account is still in an open period
+// (recoverGrokUsageGeneration). The backend skips a generation it already
+// applied.
 //
 // Logs are fixed labels only (`[cli-usage] usage hint: <label>`) — never a
 // path, account, fingerprint, id or response body.
@@ -248,8 +261,10 @@ func startCLIUsagePropagator(cfg *Config) {
 		defer p.rotating.Done()
 		p.rotate(cliUsageRotationFirstRetry)
 		recoverOpenCodeUsageGeneration(1)
+		recoverGrokUsageGeneration(1)
 		// Runs made while the agent was down or mid-update.
 		openCodeDirectScanAtStartup()
+		grokDirectScanAtStartup()
 	}()
 }
 
@@ -517,14 +532,17 @@ func (p *cliUsagePropagatorState) sendDelayLocked(h *cliUsagePendingHint) time.D
 
 // providerBlockedLocked: a Codex generation waits for this process's Codex
 // epoch rotation (codexPublishableGeneration publishes nothing before it), and
-// an OpenCode generation for its own ledger rotation (openCodeGenerationRotated)
-// — never Codex's: a device that never ran Codex has no Codex rotation to wait on.
+// an OpenCode generation for its own ledger rotation (openCodeGenerationRotated),
+// and a Grok generation for its live cache's (grokGenerationRotated) — never
+// Codex's: a device that never ran Codex has no Codex rotation to wait on.
 func (p *cliUsagePropagatorState) providerBlockedLocked(provider string) bool {
 	switch provider {
 	case codexUsageProvider:
 		return !p.rotated
 	case openCodeUsageProvider:
 		return !openCodeGenerationRotated.Load()
+	case grokUsageProvider:
+		return !grokGenerationRotated.Load()
 	}
 	return false
 }
@@ -665,10 +683,10 @@ var claudeUsageFallbackDetected = func() bool {
 	return info != nil && info.DetectedCliAgents[claudeUsageProvider].Detected
 }
 
-// armFallbackLocked (re)arms the fallback timer: the Claude tick and the
-// OpenCode direct scan.
+// armFallbackLocked (re)arms the fallback timer: the Claude tick, the OpenCode
+// direct scan and the Grok direct-run scan.
 func (p *cliUsagePropagatorState) armFallbackLocked() {
-	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled) {
+	if p.stopped || (!cliUsageClaudeFallbackEnabled && !openCodeDirectScanEnabled && !grokDirectScanEnabled) {
 		return
 	}
 	if p.fallbackTimer != nil {
@@ -679,7 +697,8 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 	p.fallbackTimer = time.AfterFunc(cliUsageClaudeFallbackPoll, func() { p.fallback(gen) })
 }
 
-// fallback is the Claude tick and the OpenCode direct scan. It discovers a
+// fallback is the Claude tick, the OpenCode direct scan and the Grok direct-run
+// scan. It discovers a
 // Claude generation another process committed (the status-line hook) when no
 // ordinary read has, and adopts a refresh debt the SessionEnd hook recorded —
 // one stat per tick, and one small cache read only when that stat moved or
@@ -687,7 +706,8 @@ func (p *cliUsagePropagatorState) armFallbackLocked() {
 // reconcile, which is latched on that file's own stamp and throttled, so a
 // Claude upgrade that dropped our hooks is repaired without waiting for an
 // agent-run session — a direct run never triggers one. Then it runs the
-// OpenCode direct scan. Each half only while its own gates are open.
+// OpenCode direct scan, then the Grok one. Each only while its own gates are
+// open.
 func (p *cliUsagePropagatorState) fallback(gen uint64) {
 	// Serialized with resetCLIUsagePropagator exactly as fire is, so a tick in
 	// flight finishes before a test reset restores the vars it reads
@@ -716,6 +736,7 @@ func (p *cliUsagePropagatorState) fallback(gen uint64) {
 		}
 	}
 	openCodeDirectScanIfChanged()
+	grokDirectRunScanIfChanged()
 	p.mu.Lock()
 	if gen == p.fallbackGen {
 		p.armFallbackLocked()
@@ -914,4 +935,6 @@ func resetCLIUsagePropagator() {
 	p.pending, p.seen, p.lastSentAt = nil, nil, time.Time{}
 	p.rotated, p.rotationRetryAt, p.recoveryDue, p.claudeRecoveryDue = false, time.Time{}, false, false
 	p.claudeTickSeen, p.claudeTickMod, p.claudeTickSize, p.claudeTickWorkedAt = false, 0, 0, time.Time{}
+	resetGrokDirectScan()
+	grokGenerationRotated.Store(false)
 }

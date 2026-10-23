@@ -32,7 +32,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.1.15"
+var Version = "v1.1.16"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -475,6 +475,13 @@ func StartAgent(cfg *Config) {
 	// accepts. Started like the propagator: it holds nothing while offline,
 	// draining or shutting down, and resumes when the device is back.
 	startLoadReporter(cfg)
+
+	// Personal WhatsApp links (local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md): resume every link in
+	// whatsapp/links.json and reconcile with the cloud. Registers no drain
+	// work source — a WhatsApp link never holds up an agent update. While the
+	// user is disconnected from cloud it starts paused (nothing connects or
+	// uploads); the tray reconnect resumes it.
+	startWhatsAppSupervisor(cfg)
 
 	// If the user disconnected from cloud in a previous session, skip the
 	// Pub/Sub loop entirely on boot. The tray "Reconnect to cloud" handler

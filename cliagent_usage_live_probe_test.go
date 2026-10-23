@@ -427,6 +427,45 @@ func TestProbeGrokBillingLiveFor_SwitchedAccountSendsNothing(t *testing.T) {
 	}
 }
 
+// A login that switches while the request is out caches nothing. A read
+// pinned to an account (the run debt's) says the account changed after the
+// read, so the debt is retired rather than idled under the account that left;
+// an unpinned read (a Refresh click) keeps no_account.
+func TestProbeGrokBillingLiveFor_ASwitchDuringTheRequestIsAnAccountChange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pinned bool
+		want   string
+	}{
+		{"pinned", true, liveProbeOutcomeAccountChangedAfterRead},
+		{"unpinned", false, grokLiveOutcomeNoAccount},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := isolateGrok(t)
+			now := time.Now()
+			writeGrokAuth(t, home, "access-A", "ada@example.com", now.Add(5*time.Hour))
+			ada := grokAccountFingerprintFor(home)
+			expected := ""
+			if tc.pinned {
+				expected = ada
+			}
+			calls := grokBillingServer(t, func(string) (int, string) {
+				writeGrokAuth(t, home, "access-B", "bob@example.com", now.Add(5*time.Hour))
+				return http.StatusOK, grokFixtureBody(now.Add(72 * time.Hour))
+			})
+			if got := probeGrokBillingLiveFor(context.Background(), "grok", expected, time.Now); got != tc.want {
+				t.Fatalf("outcome=%q, want %q", got, tc.want)
+			}
+			if atomic.LoadInt32(calls) != 1 {
+				t.Errorf("requests=%d, want the one read that was out", atomic.LoadInt32(calls))
+			}
+			if _, ok := loadGrokBillingLiveSnapshot(ada, time.Now()); ok {
+				t.Error("a reading was cached under the account that switched away")
+			}
+		})
+	}
+}
+
 func TestProbeGrokBillingLive_UnauthorizedRenewsOnceThenGivesUp(t *testing.T) {
 	home := isolateGrok(t)
 	writeGrokAuth(t, home, "revoked", "dan@example.com", time.Now().Add(time.Hour))
@@ -486,7 +525,7 @@ func TestLoadGrokBillingLiveSnapshot_OtherAccountNeverReplayed(t *testing.T) {
 	}
 	// The user signs into a different account; A's pool must not show under B.
 	writeGrokAuth(t, home, "access-B", "b@example.com", now.Add(5*time.Hour))
-	if _, ok := loadGrokBillingLiveSnapshot(grokAccountFingerprintFor(home)); ok {
+	if _, ok := loadGrokBillingLiveSnapshot(grokAccountFingerprintFor(home), time.Now()); ok {
 		t.Fatal("a live reading from another account was replayed")
 	}
 }
@@ -1620,5 +1659,44 @@ func TestRunCLIUsageLiveProbes_OpenCodeReadsItsStore(t *testing.T) {
 	}
 	if b := openCodeDirectBucket(t, "", clock.now); b.tokens() != 21 {
 		t.Fatalf("bucket = %+v after the click", b)
+	}
+}
+
+// A Refresh click on OpenCode 2 also pays owed debts from the store: it is ok
+// when only a payment merged, not_merged when the scan was unchanged and there
+// was nothing to pay, and it never spawns an export.
+func TestRunCLIUsageLiveProbes_OpenCodePaysOwedDebtsFromTheStore(t *testing.T) {
+	_, store, clock, exports := openCodeV2Fixture(t, 3102)
+	stubLiveProbes(t)
+	liveProbeDetectedAgents = func() map[string]detectedCLIAgent {
+		return map[string]detectedCLIAgent{openCodeUsageProvider: {Detected: true, Path: "opencode"}}
+	}
+	probe := func() string {
+		t.Helper()
+		cliUsageLiveProbeMu.Lock()
+		cliUsageLiveProbeLastDone, cliUsageLiveProbeLast = time.Time{}, nil
+		cliUsageLiveProbeMu.Unlock()
+		return runCLIUsageLiveProbes(context.Background())[openCodeUsageProvider]
+	}
+
+	if got := probe(); got != liveProbeOutcomeOK {
+		t.Fatalf("first click = %q, want ok for the scan that booked coverage", got)
+	}
+	if got := probe(); got != liveProbeOutcomeNotMerged {
+		t.Fatalf("idle click = %q, want not_merged", got)
+	}
+
+	run := oweOpenCodeV2Run(t, store, clock, "ses_click", "msg_click", 33)
+	if got := probe(); got != liveProbeOutcomeOK {
+		t.Fatalf("paying click = %q, want ok", got)
+	}
+	if d := openCodeDebtOf(t, run.id); d != nil {
+		t.Fatalf("debt = %+v after the click paid it", d)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 33 {
+		t.Fatalf("tokens today = %d, want the paid 33", n)
+	}
+	if *exports != 0 {
+		t.Fatalf("a click spawned %d exports", *exports)
 	}
 }

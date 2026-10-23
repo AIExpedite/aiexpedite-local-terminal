@@ -7,6 +7,9 @@
 //     agent spawns — the `__cli_smoke__` probe, the resident chat
 //     (opencode_native.go) and terminal sessions (session.go) — closes each
 //     step with a `step_finish` frame whose part carries `tokens` and `cost`.
+//     A turn whose stream carries no such usage owes a debt; on OpenCode 2 it
+//     is paid from the store (cliagent_usage_opencode_freshness.go) under the
+//     export's message keys, the export being only the fallback.
 //   - the direct-run reader (cliagent_usage_opencode_direct.go): the assistant
 //     messages OpenCode persists in its own store, for the runs the agent did
 //     not spawn — the user's shell or IDE, and the TUI in a terminal-managed
