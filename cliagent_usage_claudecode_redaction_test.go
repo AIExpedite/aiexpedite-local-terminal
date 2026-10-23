@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -435,4 +436,31 @@ func claudeSnapshotMap(t *testing.T, path string) map[string]any {
 		t.Fatal(err)
 	}
 	return m
+}
+
+// The Claude cold start after an update (cliagent_usage_post_update_cold_start_test.go):
+// the transient version-probe notice names the binary only — never the
+// config dir, the install path or the credential sitting next to it.
+func TestClaudeColdStartVersionProbe_LogsNoSecrets(t *testing.T) {
+	const tokenSentinel = "sk-ant-oat-SENTINEL-cold-start-never-log-5b2d"
+	armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	writeClaudeProbeCredential(t, os.Getenv("CLAUDE_CONFIG_DIR"), tokenSentinel)
+	binDir := installMockClaude(t, "claude-heartbeat-result")
+	name := "claude"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	helperColdVersionProbeOnce(t, "claude", claudeColdStartVersion)
+
+	logged := captureStdout(t, func() { cachedProbeVersion(filepath.Join(binDir, name)) })
+	if !strings.Contains(logged, "version probe transient for "+name) {
+		t.Errorf("the transient version probe was not logged by binary name:\n%s", logged)
+	}
+	for _, s := range []string{tokenSentinel, "SENTINEL", os.Getenv("CLAUDE_CONFIG_DIR"), binDir} {
+		if s != "" && strings.Contains(logged, s) {
+			t.Errorf("cold-start log leaks %q:\n%s", s, logged)
+		}
+	}
 }

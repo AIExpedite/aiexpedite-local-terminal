@@ -157,7 +157,7 @@ var resolveGrokSmokePath = func() string {
 func grokProbeVersion(path string) string {
 	env := sanitizeGrokMaintenanceSmokeEnv(os.Environ())
 	if isGrokWindowsShim(path) {
-		return cachedProbeVersionFunc(path, func() string {
+		return cachedProbeVersionOutcomeFunc(path, func() (string, versionProbeOutcome) {
 			return grokShimProbeVersion(path, env)
 		})
 	}
@@ -167,9 +167,10 @@ func grokProbeVersion(path string) string {
 // grokShimProbeVersion runs `<shim> --version` through grokSmokeShimCommand
 // — cmd.exe, explicit command line, shim path carried in the environment —
 // under the same short probe deadline the machine-info probes use. Returns ""
-// on any failure, exactly like probeVersionArgsWithEnv, so the caller's
-// binary_missing pre-check is unchanged for a genuinely dead shim.
-func grokShimProbeVersion(path string, env []string) string {
+// on any failure, exactly like probeVersionArgsWithEnvOutcome, so the caller's
+// binary_missing pre-check is unchanged for a genuinely dead shim; a deadline
+// hit on a cold shim is reported transient so the cache does not keep it.
+func grokShimProbeVersion(path string, env []string) (string, versionProbeOutcome) {
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
 	cmd, ok := grokSmokeShimCommand(ctx, grokSmokeLaunch{
@@ -178,13 +179,10 @@ func grokShimProbeVersion(path string, env []string) string {
 		Env:  env,
 	})
 	if !ok {
-		return ""
+		return "", versionProbeFailed
 	}
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return ""
-	}
-	return firstNonEmptyLine(out)
+	return versionProbeResult(ctx, out, err)
 }
 
 // grokSmokeLoggedIn is the free login re-check the cooldown replay runs. Same

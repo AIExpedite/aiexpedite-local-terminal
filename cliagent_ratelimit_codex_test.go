@@ -3023,7 +3023,24 @@ func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *
 
 	// Cancellation fires when the leaf reader requests its second chunk. The
 	// first complete chunk must remain available for candidate reconciliation.
-	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	// The cancel rides the chunk boundary itself: counting ctx.Err() checks
+	// guessed at where that boundary falls.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	originalHook := codexRolloutReadDirChunkHook
+	defer func() { codexRolloutReadDirChunkHook = originalHook }()
+	codexRolloutReadDirChunkHook = func(hookDir string, chunksRead int) {
+		if hookDir == dir && chunksRead == 1 {
+			cancel()
+		}
+	}
+	// What is asserted is that the chunk is PRESERVED, not how fast it is
+	// stat'ed: 128 os.Stat calls can outlast the production 25 ms grace on a
+	// loaded Windows runner (real-time AV), which cut the pass mid-chunk. The
+	// grace's own cut-off is pinned by BoundsPartialLeafMetadataPass below.
+	originalGrace := codexRolloutPartialLeafGrace
+	defer func() { codexRolloutPartialLeafGrace = originalGrace }()
+	codexRolloutPartialLeafGrace = time.Minute
 	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
 	if complete {
 		t.Fatal("discovery complete=true, want partial leaf enumeration to preserve the high-water")

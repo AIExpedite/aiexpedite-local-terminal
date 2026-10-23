@@ -246,9 +246,7 @@ func installMockClaude(t *testing.T, mode string) string {
 	if runtime.GOOS == "windows" {
 		mockName += ".exe"
 	}
-	if err := copyTestBinary(testExe, filepath.Join(tmpDir, mockName)); err != nil {
-		t.Fatalf("copy mock binary: %v", err)
-	}
+	copyAndWarmTestBinary(t, testExe, filepath.Join(tmpDir, mockName))
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, mode)
 	// resolveExecutable("claude") memoizes via cachedResolveClaudePath, so

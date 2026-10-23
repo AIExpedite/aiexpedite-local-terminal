@@ -24,6 +24,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1071,8 +1072,33 @@ func probeVersionArgs(cmd string, args ...string) string {
 // logging, or extension-discovery overrides. A nil env preserves the ordinary
 // os.Environ inheritance used by machine-info probes.
 func probeVersionArgsWithEnv(cmd string, env []string, args ...string) string {
+	v, _ := probeVersionArgsWithEnvOutcome(cmd, env, args...)
+	return v
+}
+
+// versionProbeOutcome says WHY a version probe answered what it did, so the
+// version cache can tell a reading that is a pure function of the binary (keep
+// it) from one the moment explains (forget it).
+type versionProbeOutcome int
+
+const (
+	// versionProbeOK: the binary ran and printed a version.
+	versionProbeOK versionProbeOutcome = iota
+	// versionProbeFailed: the binary ran and answered badly (non-zero exit,
+	// empty output) or is not there at all. Stable for these bytes on disk.
+	versionProbeFailed
+	// versionProbeTransient: the probe never got a fair answer -- it hit its
+	// deadline, was killed, or could not start while something (real-time AV
+	// scanning a freshly written binary, an installer) held the file. The
+	// same bytes may answer on the next try.
+	versionProbeTransient
+)
+
+// probeVersionArgsWithEnvOutcome is probeVersionArgsWithEnv plus the outcome.
+// The returned string is identical to the wrapper's: "" on every failure.
+func probeVersionArgsWithEnvOutcome(cmd string, env []string, args ...string) (string, versionProbeOutcome) {
 	if _, err := exec.LookPath(cmd); err != nil {
-		return ""
+		return "", versionProbeFailed
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
@@ -1081,14 +1107,52 @@ func probeVersionArgsWithEnv(cmd string, env []string, args ...string) string {
 	if env != nil {
 		c.Env = env
 	}
-	out, err := c.CombinedOutput()
-	if err != nil {
-		return ""
-	}
+	out, err := versionProbeCombinedOutput(c)
 	// Some tools print version on stderr (java) and others print multiple
 	// lines (`go version go1.x` is one line; `bash --version` is many).
 	// First non-empty line is what we want.
-	return firstNonEmptyLine(out)
+	return versionProbeResult(ctx, out, err)
+}
+
+// versionProbeCombinedOutput runs one version-probe child. A test seam: the
+// cold first spawn of a freshly updated binary (real-time AV scanning it on
+// Windows) cannot be reproduced on CI, so a test stands in for that child here
+// and the real classification and caching still run on what it returns.
+var versionProbeCombinedOutput = func(c *exec.Cmd) ([]byte, error) { return c.CombinedOutput() }
+
+// versionProbeResult classifies one finished `--version` child. Shared by every
+// probe that spawns its own command (the plain probe and the Windows shim
+// probes), so they all draw the transient/stable line in the same place.
+func versionProbeResult(ctx context.Context, out []byte, err error) (string, versionProbeOutcome) {
+	if err == nil {
+		if v := firstNonEmptyLine(out); v != "" {
+			return v, versionProbeOK
+		}
+		return "", versionProbeFailed
+	}
+	return "", classifyVersionProbeError(ctx, err)
+}
+
+// classifyVersionProbeError decides whether a failed probe is worth asking
+// again. Only a probe that never got a fair answer is transient: the deadline
+// (a cold binary under an AV scan after an update), a kill by signal, or a
+// start error the platform reports while another process holds the file. A
+// child that ran to a non-zero exit answered, and that answer is stable.
+func classifyVersionProbeError(ctx context.Context, err error) versionProbeOutcome {
+	if (ctx != nil && ctx.Err() != nil) || errors.Is(err, context.DeadlineExceeded) {
+		return versionProbeTransient
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.ProcessState != nil && !exitErr.ProcessState.Exited() {
+			return versionProbeTransient // killed by a signal, never exited
+		}
+		return versionProbeFailed
+	}
+	if isTransientVersionProbeStartError(err) {
+		return versionProbeTransient
+	}
+	return versionProbeFailed
 }
 
 // firstNonEmptyLine returns the first non-blank, trimmed line of a probe's
@@ -1325,6 +1389,9 @@ type versionProbeKey struct {
 var (
 	versionProbeMu    sync.Mutex
 	versionProbeCache = map[versionProbeKey]string{}
+	// versionProbeTransients counts consecutive transient results per binary,
+	// so a transient that never clears is eventually cached as a failure.
+	versionProbeTransients = map[versionProbeKey]int{}
 )
 
 // cachedProbeVersion returns `<path> --version` output, reusing a prior result
@@ -1335,8 +1402,8 @@ func cachedProbeVersion(path string) string {
 }
 
 func cachedProbeVersionWithEnv(path string, env []string) string {
-	return cachedProbeVersionFunc(path, func() string {
-		return probeVersionArgsWithEnv(path, env, "--version")
+	return cachedProbeVersionOutcomeFunc(path, func() (string, versionProbeOutcome) {
+		return probeVersionArgsWithEnvOutcome(path, env, "--version")
 	})
 }
 
@@ -1380,11 +1447,35 @@ func versionProbeIdentityCurrent(key versionProbeKey) bool {
 // binary cannot be spawned by a plain exec.Command -- notably the Grok
 // maintenance smoke on Windows, where an npm `grok.cmd` shim has to go through
 // cmd.exe. The cache key and pruning rule are identical; only how the version
-// is obtained differs.
+// is obtained differs. A string-only probe cannot say why it answered "", so
+// its "" is cached as a stable failure, as it always was; a caller that can
+// tell a timeout apart uses cachedProbeVersionOutcomeFunc.
 func cachedProbeVersionFunc(path string, probe func() string) string {
+	return cachedProbeVersionOutcomeFunc(path, func() (string, versionProbeOutcome) {
+		if v := probe(); v != "" {
+			return v, versionProbeOK
+		}
+		return "", versionProbeFailed
+	})
+}
+
+// versionProbeTransientLimit is how many transient results in a row one exact
+// binary (path, mtime, size) may return before its "" is cached anyway. A cold
+// start clears on the next try; a start error that never clears (a binary the
+// agent is genuinely denied) must not cost a child on every gather forever.
+const versionProbeTransientLimit = 3
+
+// cachedProbeVersionOutcomeFunc caches a probe's reading by (path, mtime,
+// size) unless the probe reports it transient. A transient "" -- a cold binary
+// right after an update timing out under an AV scan -- is returned to this
+// caller and NOT remembered, so the next gather asks again instead of reading
+// "" until the binary changes once more. After versionProbeTransientLimit
+// transients in a row for the same key it is cached like any failure.
+func cachedProbeVersionOutcomeFunc(path string, probe func() (string, versionProbeOutcome)) string {
 	info, err := os.Stat(path)
 	if err != nil {
-		return probe()
+		v, _ := probe()
+		return v
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
 
@@ -1395,7 +1486,7 @@ func cachedProbeVersionFunc(path string, probe func() string) string {
 		return cached
 	}
 
-	v := probe()
+	v, outcome := probe()
 	// Re-stat before touching the map. A probe that raced a binary replacement
 	// answers for a file that is no longer there, so neither its value nor its
 	// pruning may land: storing it would key an installed-binary lookup to a
@@ -1407,17 +1498,33 @@ func cachedProbeVersionFunc(path string, probe func() string) string {
 		return v
 	}
 	versionProbeMu.Lock()
-	// Cache negatives too: a binary that reliably fails --version would
-	// otherwise re-spawn a doomed child on every single gather, which is the
-	// exact cost this cache exists to remove. A reinstall changes mtime and
-	// invalidates the entry. Drop stale entries for the same path first, since
-	// an upgrade leaves the old (mtime,size) key behind and nothing else prunes
-	// this map.
+	// Drop stale entries for the same path first, since an upgrade leaves the
+	// old (mtime,size) key behind and nothing else prunes these maps.
 	for k := range versionProbeCache {
 		if k.Path == path && k != key {
 			delete(versionProbeCache, k)
 		}
 	}
+	for k := range versionProbeTransients {
+		if k.Path == path && k != key {
+			delete(versionProbeTransients, k)
+		}
+	}
+	if outcome == versionProbeTransient {
+		versionProbeTransients[key]++
+		if attempt := versionProbeTransients[key]; attempt < versionProbeTransientLimit {
+			versionProbeMu.Unlock()
+			// The binary's name only, never its path.
+			fmt.Printf("%s[version-probe] version probe transient for %s (attempt %d of %d); not cached%s\n",
+				colorYellow, filepath.Base(path), attempt, versionProbeTransientLimit, colorReset)
+			return v
+		}
+	}
+	delete(versionProbeTransients, key)
+	// Cache negatives too: a binary that reliably fails --version would
+	// otherwise re-spawn a doomed child on every single gather, which is the
+	// exact cost this cache exists to remove. A reinstall changes mtime and
+	// invalidates the entry.
 	versionProbeCache[key] = v
 	versionProbeMu.Unlock()
 	return v
@@ -1457,6 +1564,11 @@ func forgetCachedProbeVersion(path string) {
 			delete(versionProbeCache, k)
 		}
 	}
+	for k := range versionProbeTransients {
+		if k.Path == path {
+			delete(versionProbeTransients, k)
+		}
+	}
 	versionProbeMu.Unlock()
 }
 
@@ -1465,6 +1577,7 @@ func forgetCachedProbeVersion(path string) {
 func resetVersionProbeCache() {
 	versionProbeMu.Lock()
 	versionProbeCache = map[versionProbeKey]string{}
+	versionProbeTransients = map[versionProbeKey]int{}
 	versionProbeMu.Unlock()
 }
 
