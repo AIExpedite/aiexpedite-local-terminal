@@ -215,6 +215,7 @@ func newBrowserKey(t *testing.T) (*ecdh.PrivateKey, string) {
 // pairedHarness drives a QR pairing to `connected`.
 func pairedHarness(t *testing.T) (*supervisorHarness, *fakeWAClient) {
 	h := newSupervisorHarness(t)
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStateConnected}}
 	h.sup.start(h.transport)
 	_, pub := newBrowserKey(t)
 	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 2, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
@@ -234,6 +235,7 @@ func pairedHarness(t *testing.T) (*supervisorHarness, *fakeWAClient) {
 
 func TestWhatsAppSupervisorQRPairingIsSealedForTheBrowser(t *testing.T) {
 	h := newSupervisorHarness(t)
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStatePairing}}
 	h.sup.start(h.transport)
 	browser, pub := newBrowserKey(t)
 	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 2, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
@@ -261,6 +263,7 @@ func TestWhatsAppSupervisorQRPairingIsSealedForTheBrowser(t *testing.T) {
 
 func TestWhatsAppSupervisorPhoneCodePairing(t *testing.T) {
 	h := newSupervisorHarness(t)
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 1, State: waStatePairing}}
 	h.sup.start(h.transport)
 	browser, pub := newBrowserKey(t)
 	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 1, WorkspaceID: "ws", Method: waPairPhoneCode, BrowserPub: pub, PhoneNumber: "15551234567"})
@@ -441,6 +444,106 @@ func TestWhatsAppSupervisorUnlinkLogsOutWipesAndAcks(t *testing.T) {
 	waitFor(t, "second ack", func() bool {
 		return len(h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindAck })) == 2
 	})
+}
+
+// An unlink older than the held generation (delayed or redelivered after a
+// re-link) must not touch the newer session.
+func TestWhatsAppSupervisorStaleUnlinkIsFenced(t *testing.T) {
+	h, c := pairedHarness(t) // generation 2
+	h.sup.unlink("lnk_1", 1)
+	time.Sleep(50 * time.Millisecond)
+	if h.sup.runner("lnk_1") == nil {
+		t.Fatal("a stale unlink discarded the current runner")
+	}
+	if _, logouts := c.count(); logouts != 0 {
+		t.Fatal("a stale unlink logged the current session out")
+	}
+	if acks := h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindAck }); len(acks) != 0 {
+		t.Fatalf("a stale unlink was acked: %v", acks)
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("a stale unlink wiped the session directory")
+	}
+}
+
+// Concurrent deliveries of the same link start pair exactly one client.
+func TestWhatsAppSupervisorConcurrentLinkStartsAreSerialized(t *testing.T) {
+	h := newSupervisorHarness(t)
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStatePairing}}
+	h.sup.start(h.transport)
+	_, pub := newBrowserKey(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 2, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+		}()
+	}
+	wg.Wait()
+	if h.client(0) == nil || h.client(1) != nil {
+		t.Fatal("concurrent link starts must open exactly one client")
+	}
+	if h.sup.runner("lnk_1") == nil {
+		t.Fatal("the link start left no tracked runner")
+	}
+}
+
+// Disconnect from cloud: nothing runs or posts; reconnect resumes the link.
+func TestWhatsAppSupervisorPausesWhileDisconnectedFromCloud(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.session = true
+	h.sup.setCloudConnected(false)
+	if c.IsConnected() {
+		t.Fatal("the client stayed connected after Disconnect from cloud")
+	}
+	if h.sup.runner("lnk_1") != nil {
+		t.Fatal("a runner survived the pause")
+	}
+	if l, err := loadWhatsAppLocalLinks(); err != nil || len(l) != 1 {
+		t.Fatalf("links.json must keep the paused link: %v %v", l, err)
+	}
+	before := len(h.transport.find(func(map[string]any) bool { return true }))
+	h.sup.unlink("lnk_1", 3) // deferred while paused
+	time.Sleep(50 * time.Millisecond)
+	if after := len(h.transport.find(func(map[string]any) bool { return true })); after != before {
+		t.Fatalf("%d posts left the computer while disconnected from cloud", after-before)
+	}
+	if _, logouts := c.count(); logouts != 0 {
+		t.Fatal("an unlink ran while disconnected from cloud")
+	}
+
+	h.sup.setCloudConnected(true)
+	waitFor(t, "resumed client connects", func() bool {
+		c2 := h.client(1)
+		if c2 == nil {
+			return false
+		}
+		n, _ := c2.count()
+		return n == 1
+	})
+	if h.sup.runner("lnk_1") == nil {
+		t.Fatal("reconnect did not resume the link")
+	}
+}
+
+// An agent that boots disconnected from cloud opens nothing until reconnect.
+func TestWhatsAppSupervisorBootsPausedWhenOffline(t *testing.T) {
+	h := newSupervisorHarness(t)
+	if _, err := ensureWhatsAppLinkDir("lnk_boot"); err != nil {
+		t.Fatal(err)
+	}
+	_ = saveWhatsAppLocalLinks([]whatsAppLocalLink{{LinkID: "lnk_boot", WorkspaceID: "ws", Generation: 5, State: waStateConnected, HistoryComplete: true}})
+	h.session = true
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_boot", WorkspaceID: "ws", Generation: 5, State: waStateConnected}}
+	h.sup.startWith(h.transport, true)
+	time.Sleep(50 * time.Millisecond)
+	if h.client(0) != nil || len(h.transport.find(func(map[string]any) bool { return true })) != 0 {
+		t.Fatal("an offline boot resumed a link or posted")
+	}
+	h.sup.setCloudConnected(true)
+	waitFor(t, "resumed", func() bool { return h.sup.runner("lnk_boot") != nil && h.client(0) != nil })
 }
 
 func TestWhatsAppSupervisorResumesFromLinksJSONAtBoot(t *testing.T) {

@@ -23,6 +23,11 @@
 // (wipes a link the cloud no longer binds to this computer, finishes an unlink
 // that was queued while the agent was down).
 //
+// Disconnect from cloud: while the user has the agent disconnected from the
+// cloud (cfg.OfflineMode, the tray toggle) the supervisor is paused — no
+// client runs and nothing is posted; links.json keeps every link so a
+// reconnect resumes them.
+//
 // Drain and shutdown: a WhatsApp link registers NO drain work source — it
 // must never hold up an agent update. Shutdown disconnects the clients,
 // flushes what the deadline allows and leaves the session and the unflushed
@@ -114,6 +119,17 @@ type whatsAppSupervisor struct {
 	links     map[string]*whatsAppLinkRunner
 	started   bool
 	stopped   bool
+	// lifecycleMu serializes the link lifecycle: link start, cancel, unlink,
+	// reconcile, wipe and cloud pause/resume. Each is a check followed by a
+	// wipe/open and a map change; two interleaved could both see no runner,
+	// pair two clients on the same stores and leave one untracked. Commands
+	// arrive on concurrent Pub/Sub callbacks, so this lock is what keeps
+	// "one link per computer" true. Never taken under mu.
+	lifecycleMu sync.Mutex
+	// paused: the user disconnected this agent from the cloud. pausedLinks
+	// are the links held at the pause; persist keeps them in links.json.
+	paused      bool
+	pausedLinks []whatsAppLocalLink
 	// discardsInFlight counts wipes in flight (under mu), so shutdown never
 	// exits halfway through deleting a session (key gone, directory still
 	// there). A counter, not a WaitGroup: a fenced flush can start a discard
@@ -124,12 +140,20 @@ type whatsAppSupervisor struct {
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
 
 // startWhatsAppSupervisor loads every local link and reconciles with the
-// cloud. Safe to call once; later calls are no-ops.
+// cloud. Safe to call once; later calls are no-ops. An agent that boots
+// disconnected from the cloud starts paused: nothing runs until the user
+// reconnects (followWhatsAppCloudConnection).
 func startWhatsAppSupervisor(cfg *Config) {
-	globalWhatsAppSupervisor.start(newHTTPWhatsAppTransport(cfg))
+	globalWhatsAppSupervisor.startWith(newHTTPWhatsAppTransport(cfg), IsOffline())
 }
 
 func (s *whatsAppSupervisor) start(transport whatsAppTransport) {
+	s.startWith(transport, false)
+}
+
+func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
 	if s.started || s.stopped {
 		s.mu.Unlock()
@@ -147,10 +171,83 @@ func (s *whatsAppSupervisor) start(transport whatsAppTransport) {
 	if err != nil {
 		logWhatsApp("-", "links.json unreadable: "+err.Error())
 	}
+	if paused {
+		s.mu.Lock()
+		s.paused, s.pausedLinks = true, local
+		s.mu.Unlock()
+		logWhatsApp("-", "disconnected from cloud; links paused")
+		return
+	}
 	for _, l := range local {
 		s.resume(l)
 	}
 	go s.reconcileLoop()
+}
+
+// followWhatsAppCloudConnection pauses or resumes the supervisor to match the
+// tray's "Disconnect from cloud" state. It reads IsOffline() under the
+// lifecycle lock, so toggles racing each other still settle on the last one.
+func followWhatsAppCloudConnection() {
+	s := globalWhatsAppSupervisor
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.setCloudConnectedLocked(!IsOffline())
+}
+
+func (s *whatsAppSupervisor) setCloudConnected(connected bool) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	s.setCloudConnectedLocked(connected)
+}
+
+// setCloudConnectedLocked: disconnected stops every client and its loops (no
+// logout, no wipe, no flush — nothing may leave the computer); connected
+// resumes the paused links and reconciles. Caller holds lifecycleMu.
+func (s *whatsAppSupervisor) setCloudConnectedLocked(connected bool) {
+	s.mu.Lock()
+	if !s.started || s.stopped || s.paused == !connected {
+		s.mu.Unlock()
+		return
+	}
+	if !connected {
+		s.paused = true
+		runners := make([]*whatsAppLinkRunner, 0, len(s.links))
+		for _, r := range s.links {
+			runners = append(runners, r)
+		}
+		s.links = map[string]*whatsAppLinkRunner{}
+		s.mu.Unlock()
+		held := make([]whatsAppLocalLink, 0, len(runners))
+		for _, r := range runners {
+			held = append(held, r.localLink())
+		}
+		s.mu.Lock()
+		s.pausedLinks = held
+		s.mu.Unlock()
+		for _, r := range runners {
+			r.stop(false)
+			_ = r.closeStores()
+		}
+		logWhatsApp("-", "disconnected from cloud; links paused")
+		return
+	}
+	s.paused = false
+	local := append([]whatsAppLocalLink(nil), s.pausedLinks...)
+	s.mu.Unlock()
+	logWhatsApp("-", "reconnected to cloud; resuming links")
+	for _, l := range local {
+		s.resume(l)
+	}
+	s.mu.Lock()
+	s.pausedLinks = nil
+	s.mu.Unlock()
+	go s.reconcileLoop()
+}
+
+func (s *whatsAppSupervisor) isPaused() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paused
 }
 
 func (s *whatsAppSupervisor) runner(linkID string) *whatsAppLinkRunner {
@@ -168,9 +265,14 @@ func (s *whatsAppSupervisor) persist() {
 	whatsAppPersistMu.Lock()
 	defer whatsAppPersistMu.Unlock()
 	s.mu.Lock()
-	out := make([]whatsAppLocalLink, 0, len(s.links))
+	out := make([]whatsAppLocalLink, 0, len(s.links)+len(s.pausedLinks))
 	for _, r := range s.links {
 		out = append(out, r.localLink())
+	}
+	for _, l := range s.pausedLinks {
+		if _, running := s.links[l.LinkID]; !running {
+			out = append(out, l)
+		}
 	}
 	s.mu.Unlock()
 	if err := saveWhatsAppLocalLinks(out); err != nil {
@@ -182,7 +284,7 @@ func (s *whatsAppSupervisor) persist() {
 // retries until it has an answer.
 func (s *whatsAppSupervisor) reconcileLoop() {
 	for {
-		if s.reconcileOnce() {
+		if s.isPaused() || s.reconcileOnce() {
 			return
 		}
 		select {
@@ -194,6 +296,11 @@ func (s *whatsAppSupervisor) reconcileLoop() {
 }
 
 func (s *whatsAppSupervisor) reconcileOnce() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.isPaused() {
+		return true // the reconnect starts a fresh reconcile
+	}
 	bound, status, err := s.transport.BoundLinks(s.ctx)
 	if err != nil {
 		if status == 401 || status == 403 || status == 404 {
@@ -218,7 +325,7 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 			r.log("not bound to this computer any more; wiping")
 			s.discard(r, true)
 		case b.State == waStateDisconnecting:
-			s.unlink(r.linkID, b.Generation)
+			s.unlinkLocked(r.linkID, b.Generation)
 		case b.Generation > r.generationNow():
 			r.log("superseded by a newer generation; wiping")
 			s.discard(r, true)
@@ -315,6 +422,13 @@ func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) {
 	if s.links[r.linkID] == r {
 		delete(s.links, r.linkID)
 	}
+	kept := s.pausedLinks[:0]
+	for _, l := range s.pausedLinks {
+		if l.LinkID != r.linkID {
+			kept = append(kept, l)
+		}
+	}
+	s.pausedLinks = kept
 	s.mu.Unlock()
 	s.persist()
 }
@@ -334,8 +448,14 @@ type whatsAppLinkStartParams struct {
 
 // linkStart begins pairing a (new or re-linked) generation. Any older
 // session of the same link is logged out and wiped first: a re-link always
-// pairs fresh.
+// pairs fresh. Serialized with every other lifecycle step (lifecycleMu).
 func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.isPaused() {
+		logWhatsApp(p.LinkID, "link start ignored: disconnected from cloud")
+		return
+	}
 	if existing := s.runner(p.LinkID); existing != nil {
 		if existing.generationNow() >= p.Generation {
 			existing.log("duplicate link start ignored")
@@ -386,6 +506,8 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) {
 
 // linkCancel abandons a pairing in progress.
 func (s *whatsAppSupervisor) linkCancel(linkID string, generation int64) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	r := s.runner(linkID)
 	if r == nil || r.generationNow() > generation {
 		return
@@ -399,9 +521,28 @@ func (s *whatsAppSupervisor) linkCancel(linkID string, generation int64) {
 
 // unlink logs the companion out on WhatsApp's side, wipes everything local
 // and confirms with an ack carrying the disconnect's generation. Idempotent:
-// a redelivered unlink for a link already gone just acks again.
+// a redelivered unlink for a link already gone just acks again. Fenced: an
+// unlink older than the generation this computer holds (delayed or
+// redelivered after a re-link) is ignored — it must never wipe the newer
+// session.
 func (s *whatsAppSupervisor) unlink(linkID string, generation int64) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.isPaused() {
+		// Not acked: the cloud keeps the link disconnecting, and the
+		// reconcile after a reconnect replays it.
+		logWhatsApp(linkID, "unlink deferred: disconnected from cloud")
+		return
+	}
+	s.unlinkLocked(linkID, generation)
+}
+
+func (s *whatsAppSupervisor) unlinkLocked(linkID string, generation int64) {
 	if r := s.runner(linkID); r != nil {
+		if r.generationNow() > generation {
+			r.log("stale unlink ignored")
+			return
+		}
 		r.log("unlinking")
 		s.discard(r, true)
 	} else {
@@ -414,6 +555,9 @@ func (s *whatsAppSupervisor) unlink(linkID string, generation int64) {
 func (s *whatsAppSupervisor) sendAck(linkID string, generation int64) {
 	payload := map[string]any{"v": 1, "linkId": linkID, "generation": generation, "kind": waSyncKindAck, "command": waAckUnlink}
 	for attempt := 0; attempt < whatsAppAckAttempts; attempt++ {
+		if s.isPaused() {
+			return // the reconcile after a reconnect confirms it
+		}
 		res := s.transport.Post(s.ctx, payload)
 		if res.Status/100 == 2 {
 			logWhatsApp(linkID, "unlink confirmed")
@@ -521,7 +665,10 @@ func (s *whatsAppSupervisor) waitDiscards(ctx context.Context) {
 // WipeAll logs out and deletes every local link: the computer was
 // deregistered, so nothing it held may outlive the registration.
 func (s *whatsAppSupervisor) WipeAll() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.mu.Lock()
+	s.pausedLinks = nil
 	runners := make([]*whatsAppLinkRunner, 0, len(s.links))
 	for _, r := range s.links {
 		runners = append(runners, r)
@@ -1162,7 +1309,7 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	if ob == nil {
 		return whatsAppSyncResult{}, whatsAppUploadStop
 	}
-	if paused {
+	if paused || r.sup.isPaused() {
 		return whatsAppSyncResult{}, whatsAppUploadIdle
 	}
 	batch, err := ob.Next()
@@ -1292,6 +1439,9 @@ func (r *whatsAppLinkRunner) reportState(extra map[string]any) {
 // postControl sends a non-batch report with a few retries. 409 fences.
 func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
 	for attempt := 0; attempt < whatsAppControlAttempts; attempt++ {
+		if r.sup.isPaused() {
+			return
+		}
 		res := r.sup.transport.Post(r.sup.ctx, payload)
 		switch {
 		case res.Status/100 == 2:
@@ -1316,6 +1466,9 @@ func (r *whatsAppLinkRunner) postControl(payload map[string]any) {
 }
 
 func (r *whatsAppLinkRunner) heartbeat() {
+	if r.sup.isPaused() {
+		return
+	}
 	r.mu.Lock()
 	gen := r.generation
 	r.mu.Unlock()

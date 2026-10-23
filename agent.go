@@ -478,7 +478,9 @@ func StartAgent(cfg *Config) {
 
 	// Personal WhatsApp links (WHATSAPP_INTEGRATION.md): resume every link in
 	// whatsapp/links.json and reconcile with the cloud. Registers no drain
-	// work source — a WhatsApp link never holds up an agent update.
+	// work source — a WhatsApp link never holds up an agent update. While the
+	// user is disconnected from cloud it starts paused (nothing connects or
+	// uploads); the tray reconnect resumes it.
 	startWhatsAppSupervisor(cfg)
 
 	// If the user disconnected from cloud in a previous session, skip the
