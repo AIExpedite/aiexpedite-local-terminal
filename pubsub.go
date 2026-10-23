@@ -341,12 +341,16 @@ type cwdScope struct {
 	sessionID   string
 	// cwdSigned marks a frame whose `cwd` is covered by the HMAC (an env-setup
 	// step or a read-only session — exactly signatureCwd's condition). A tracked
-	// cwd must never override such a frame: `executionID` arrives UNSIGNED, so
-	// an attacker with topic-write but no key could append one to a REPLAYED
-	// signed frame without disturbing its signature, and if the signed cwd
-	// happened to equal the configured default, the substitution below would
-	// silently redirect the command to that scope's remembered directory. The
-	// signed cwd is the authority; nothing unsigned may move it.
+	// cwd must never override such a frame: the signed cwd is the authority.
+	//
+	// This was written when `executionID` arrived UNSIGNED, so that an attacker
+	// with topic-write but no key could append one to a REPLAYED signed frame
+	// without disturbing its signature. That specific hole is now closed — the
+	// id is part of the canonical, so appending one breaks the signature — but
+	// the flag is KEPT, because its rule is not only an anti-tamper measure: a
+	// legitimate run whose remembered directory differs from the cwd the owner
+	// approved must still not move an approved, disk-gated step. Removing it
+	// would change behaviour for honest commands, not just hostile ones.
 	cwdSigned bool
 }
 
@@ -398,16 +402,25 @@ func (s cwdScope) keys() []string {
 
 // boundedScopeID keeps one scope key short.
 //
-// trackedCwdMaxEntries bounds the NUMBER of entries, never their bytes, and
-// both identifiers a scope is built from arrive UNSIGNED and unvalidated:
-// `executionID` is excluded from the signature canonical entirely (see
-// commandMsg) and `sessionID` is no better, so a topic writer with no HMAC key
-// can append a distinct near-megabyte id to each REPLAYED signed command and
-// reach setTrackedCwd with it. 512 such keys is ~512 MB plus overhead — enough
-// to exhaust a desktop agent. The sibling terminal-service PR adds a
-// `maxLength` to its route schema, but that only bounds LEGITIMATE traffic: an
-// attacker with topic-write never passes through our server, so this is the
-// bound that has to hold.
+// trackedCwdMaxEntries bounds the NUMBER of entries, never their bytes, and a
+// scope key is built from identifiers the sender chose, so 512 near-megabyte
+// ids is ~512 MB plus overhead — enough to exhaust a desktop agent.
+//
+// This was written when `executionID` arrived UNSIGNED, which is what made that
+// flood cheap: a topic writer with no HMAC key could append a distinct
+// near-megabyte id to each REPLAYED signed command and reach setTrackedCwd with
+// it. That premise is gone — the id is part of the signature canonical now (see
+// signaturePayload), and `sessionID` has always been in it — so on an agent
+// that verifies, a keyless writer can no longer vary either identifier on a
+// replay without the frame being rejected outright.
+//
+// The bound is KEPT, because signing is not what makes it hold. Verification
+// runs only when a command secret is configured; an agent without one takes
+// every id as given (the strict-mode block in the message handler is skipped
+// whole). And the key holder is not outside the threat model either: the
+// sibling terminal-service PR adds a `maxLength` to its route schema, but that
+// bounds only traffic that passes through OUR server, and a bound the device
+// cannot verify is not a bound the device may rely on.
 //
 // An overlong id is replaced by a digest of itself rather than truncated:
 // truncation maps two different senders onto ONE key, and sharing a tracked cwd
@@ -781,8 +794,17 @@ func isSigFailRateLimited() bool {
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
 // Field order must match: id, command, args, ts, type, sessionID, input, signal,
-// refreshId, riskLevel, cwd, conversationId, ackedTurnIds, cliAgentCatalog,
-// readOnly
+// refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds,
+// cliAgentCatalog, readOnly
+//
+// That list is a contract, not a description. Go marshals struct fields in
+// DECLARATION order, so moving any line below changes the canonical bytes and
+// invalidates every signature carrying the fields involved — a failure that
+// surfaces as an unexplained "invalid command signature" on live traffic, not
+// as a compile error. `executionId` is the newest entry and belongs between
+// riskLevel and cwd (terminal-service #348); that position is pinned by
+// TestSignedExecutionID_SitsBetweenRiskLevelAndCwd so a reorder fails in CI
+// instead.
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -814,6 +836,29 @@ type signaturePayload struct {
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
 	RiskLevel string `json:"riskLevel,omitempty"`
+	// executionId is signed for the same reason riskLevel is, and it MUST sit
+	// here — between riskLevel and cwd. Go marshals in declaration order and
+	// the Node signer appends in the order
+	//   refreshId, riskLevel, executionId, cwd, conversationId, ackedTurnIds, readOnly
+	// (hmac.util.js), so moving this line silently invalidates every signature
+	// that carries the field.
+	//
+	// WHY IT IS SIGNED. The device keys its per-execution tracked cwd on this
+	// id (cwdScope). While it arrived unsigned, an attacker with topic-write
+	// but no key could take a REPLAYED signed frame, append a victim run's
+	// execution id, and have the device resolve the command against that run's
+	// remembered directory — the signature still verified, because the field
+	// was not part of it. terminal-service #348 closed that by signing it and
+	// capability-gating the attachment; this is the device half, without which
+	// the field was never sent at all.
+	//
+	// `omitempty` on BOTH sides makes the invariant "present in frame =>
+	// present in canonical", so appending an id to a signed frame now breaks
+	// the signature instead of riding along with it. Commands that carry no
+	// execution id produce the identical canonical they did before this field
+	// existed, which is what preserves verification across the upgrade window
+	// — the same property refreshId and riskLevel rely on.
+	ExecutionID string `json:"executionId,omitempty"`
 	// cwd is signed ONLY for env-setup dispatches (riskLevel-bearing commands)
 	// and read-only session starts, mirroring the Node signer's gated branch in
 	// hmac.util.js. An env-setup clone/destructive step whose target is a
@@ -898,6 +943,9 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		Signal:    cmd.Signal,
 		RefreshID: cmd.RefreshID,
 		RiskLevel: cmd.RiskLevel,
+		// Ungated, unlike Cwd: the Node signer includes executionId whenever the
+		// command carries one, so this must too or the two canonicals diverge.
+		ExecutionID: cmd.ExecutionID,
 		// Gated to match the Node signer — see the field comment.
 		Cwd:             signatureCwd(cmd),
 		ConversationID:  cmd.ConversationID,
@@ -1029,10 +1077,17 @@ type commandMsg struct {
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
 
 	// ExecutionID scopes a one-off command's tracked cwd to the run that sent
-	// it (see the Tracked Working Directory block). UNSIGNED and OPTIONAL
-	// correlation metadata, like WorkspaceID/UID: a server that does not send
-	// it falls through to SessionID and then to the process-wide default, so
-	// its absence never refuses or changes a command.
+	// it (see the Tracked Working Directory block).
+	//
+	// SIGNED, as of this build — it is part of the signature canonical (see
+	// signaturePayload). It was previously unsigned correlation metadata like
+	// WorkspaceID/UID, and that is exactly what made it the first
+	// unauthenticated cwd selector: an attacker with topic-write but no key
+	// could append a victim run's id to a replayed signed frame. Still
+	// OPTIONAL: a server that does not send it falls through to SessionID and
+	// then to the process-wide default, so its absence never refuses or
+	// changes a command, and a command without one signs the same canonical it
+	// always did.
 	ExecutionID string `json:"executionId,omitempty"`
 
 	// Environment Setup plan attribution + risk. RiskLevel is SIGNED (see
@@ -2580,8 +2635,10 @@ func runPubSubConnection(cfg *Config) error {
 			// Resolve a single scan dir from the AUTHORITATIVE directory the
 			// command ran in (commandUploadScanRoot): the sender's own
 			// post-`cd` cwd when it has one, else `ranIn` itself. A signed
-			// cwd is answered from `ranIn` alone, because the scope its
-			// tracked entry hangs off is chosen by an UNSIGNED `executionID`.
+			// cwd is still answered from `ranIn` alone — no longer because the
+			// scope selector is unauthenticated (`executionID` is signed now),
+			// but because an approved, disk-gated step must be scanned where
+			// its signed cwd put it, whoever chose the scope.
 			// Roots are never scanned together — walking the default home
 			// tree on top of the real exec dir would sweep up unrelated fresh
 			// media and make detection expensive.
@@ -3177,12 +3234,20 @@ func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, string, error)
 //
 // resolved is the authoritative working directory executeTerminalCommand ran
 // the command in. A SIGNED cwd (env-setup step, read-only start) is answered
-// from it alone: `executionID` is excluded from the HMAC, so a topic writer
-// with no key can append or alter one on a REPLAYED signed frame, and reading
-// the tracked map here would let that choice decide the scan root — making the
-// scan miss the command's real artifacts, or walk and upload fresh media out of
-// an unrelated directory, on the Unix, TTY and encoded-PowerShell routes that
-// never refresh the tracked entry.
+// from it alone.
+//
+// The original reason was tamper: `executionID` was excluded from the HMAC, so
+// a topic writer with no key could append or alter one on a REPLAYED signed
+// frame and have that choice decide the scan root. Signing the field closed
+// that path (see signaturePayload), but the rule stands on its own, because an
+// attacker was never the only way a wrong scope got picked: reading the tracked
+// map here lets a directory REMEMBERED from an earlier `cd` under the same
+// honest scope answer for a step whose cwd the owner signed. Either way the
+// scan misses the command's real artifacts, or walks and uploads fresh media
+// out of an unrelated directory, on the Unix, TTY and encoded-PowerShell routes
+// that never refresh the tracked entry. The signed cwd is the authority for
+// where the command ran, so it is also the authority for where its output is
+// looked for (the same reasoning keeps cwdScope.cwdSigned).
 //
 // For an ordinary frame the precedence is unchanged in effect — a `cd` the
 // command performed still wins — but it is read from the sender's OWN key
@@ -3208,9 +3273,12 @@ func commandUploadScanRoot(cfg *Config, scope cwdScope, resolved string) string 
 
 // reportedCommandCwd is the cwd echoed back on the result for diagnostics: the
 // tracked value for an ordinary frame, so the server sees where a `cd` left the
-// sender, and the authoritative resolved directory for a signed one, whose
-// tracked entry is selectable by an unsigned `executionID` and must therefore
-// never describe the run (see commandUploadScanRoot).
+// sender, and the authoritative resolved directory for a signed one.
+//
+// A signed frame's tracked entry is no longer attacker-selectable — `executionID`
+// is part of the signature canonical — but it is still some earlier command's
+// remembered directory, and an approved, disk-gated step must be reported as
+// having run where its signed cwd said it would (see commandUploadScanRoot).
 func reportedCommandCwd(scope cwdScope, resolved string) string {
 	if scope.cwdSigned {
 		return resolved

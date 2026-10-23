@@ -9,10 +9,18 @@ import (
 )
 
 // Hardening around the per-sender tracked cwd (pubsub.go, "Tracked Working
-// Directory"). All three cases below have one root cause: `executionID` rides
-// on the command frame UNSIGNED and is excluded from the HMAC canonical, so a
-// topic writer with no key can append or alter one on a REPLAYED signed frame
-// and choose which scope the device's bookkeeping hangs off.
+// Directory"). All three cases below were written against one root cause:
+// `executionID` rode on the command frame UNSIGNED and outside the HMAC
+// canonical, so a topic writer with no key could append or alter one on a
+// REPLAYED signed frame and choose which scope the device's bookkeeping hung
+// off.
+//
+// That root cause is closed — the id is part of the signature canonical now
+// (signaturePayload; pubsub_signed_execution_id_test.go pins it), so appending
+// or altering one breaks the frame's signature. The cases are kept because each
+// guarantee outlives the threat it was written for: a signed cwd must beat a
+// remembered one even when the scope is perfectly honest (1), and a count is
+// still not a memory bound whoever supplies the ids (2, 3).
 
 /* -------------------------------------------------------------------------
    (1) The upload scan root must come from the AUTHORITATIVE resolved cwd.
@@ -31,8 +39,10 @@ func TestCommandUploadScanRoot_SignedCwdIsNeverChosenByTheTrackedMap(t *testing.
 	cfg := &Config{WorkingDirectory: "C:/work"}
 
 	// An env-setup step and a read-only start are the two frames whose `cwd`
-	// the HMAC covers. `exec-appended` is the id an attacker added to the
-	// replay; the directory it remembers is theirs to pick.
+	// the HMAC covers. `exec-appended` is named for the original attack — an id
+	// appended to a replay — which signing the field has since closed; what the
+	// case still pins is that a scope's remembered directory never answers for
+	// a signed one, however that scope was chosen.
 	for _, signed := range []commandMsg{
 		{ID: "s1", ExecutionID: "exec-appended", Cwd: "C:/work/setup", RiskLevel: "high"},
 		{ID: "s2", ExecutionID: "exec-appended", Cwd: "C:/work/setup", ReadOnly: true},
@@ -119,9 +129,13 @@ func TestCommandUploadScanRoot_FallsBackToTheConfiguredDirectory(t *testing.T) {
 
 /* -------------------------------------------------------------------------
    (2) 512 entries is a count, not a memory bound. Neither identifier a scope
-   is built from is length-checked on the device, and neither is signed, so a
-   near-megabyte `executionId` on each replayed command turned 512 keys into
-   ~512 MB.
+   is built from is length-checked on the device, so a near-megabyte
+   `executionId` on each command turns 512 keys into ~512 MB. Signing the id
+   took away the cheap delivery — a keyless topic writer can no longer vary it
+   on a replay — but not the need for the bound: an agent with no command
+   secret never verifies at all, the key holder's own ids are unbounded here,
+   and `maxLength` on the server's route schema bounds only what passes through
+   our server (boundedScopeID).
    ------------------------------------------------------------------------- */
 
 func TestTrackedCwd_OverlongScopeIDIsBoundedBeforeItIsRetained(t *testing.T) {

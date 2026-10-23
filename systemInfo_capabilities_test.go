@@ -63,7 +63,11 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			}
 			caps.RelayFollowUps = nil // its ledgerId is per machine
 			raw, _ := json.Marshal(caps)
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true}` {
+			// The literal IS the assertion: this pins the exact wire shape, so
+			// adding a capability has to be a deliberate edit here rather than
+			// something that rides along silently. `signedExecutionId` joined it
+			// with the signed-executionId device half.
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true,"signedExecutionId":true}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
