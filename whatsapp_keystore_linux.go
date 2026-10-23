@@ -52,14 +52,9 @@ func (platformWhatsAppKeystore) Get(account string) ([]byte, error) {
 	return readSecretToolKey(runWhatsAppKeystoreCLI, account)
 }
 
+// Delete reports an absent key as errWhatsAppKeyNotFound (clearSecretToolKey),
+// so deleteWhatsAppOutboxKey stays idempotent: `secret-tool clear` alone
+// exits 1 for nothing-to-clear and for a failed service alike.
 func (platformWhatsAppKeystore) Delete(account string) error {
-	_, code, err := runWhatsAppKeystoreCLI("", "secret-tool", "clear",
-		"service", whatsAppKeystoreService, "account", account)
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("secret service delete failed (exit %d)", code)
-	}
-	return nil
+	return clearSecretToolKey(runWhatsAppKeystoreCLI, account)
 }
