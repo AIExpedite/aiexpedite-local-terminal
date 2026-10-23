@@ -169,6 +169,13 @@ type capabilitiesInfo struct {
 	// Never omitempty: a future build reporting `false` must not read as
 	// "field absent".
 	SignedExecutionID bool `json:"signedExecutionId"`
+	// WhatsApp (`capabilities.whatsapp`, local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md
+	// "Authorization and isolation"): this build embeds the whatsmeow bridge
+	// (whatsapp_supervisor.go). `secureStorage` is whether the OS credential
+	// store works here; a Linux computer without Secret Service reports false
+	// and terminal-service refuses to link it. An agent without the block is
+	// too old, and is never sent a WhatsApp command.
+	WhatsApp *whatsAppCapability `json:"whatsapp,omitempty"`
 	// RelayFollowUps (DEVICE_RELAY_CAPABILITIES.FOLLOW_UPS): the durable
 	// follow-up attempt ledger (relay_follow_up_ledger.go) — attempts expire,
 	// a fenced attempt id is refused forever, and `relay_follow_up_query`
@@ -321,6 +328,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		ReadOnlySessions:       true,
 		WorktreeBuiltIns:       true,
 		SignedExecutionID:      true,
+		WhatsApp:               currentWhatsAppCapability(),
 	}
 }
 

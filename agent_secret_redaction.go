@@ -28,6 +28,12 @@ var agentSecretPatterns = []*regexp.Regexp{
 	// frequently quotes surrounding file content on the same line, and the
 	// user's home/profile layout is not something a published frame needs.
 	regexp.MustCompile(`(?i)\S*\.credentials\.json\S*`),
+	// A whatsmeow pairing QR ref ("2@" + comma-separated base64 parts,
+	// whatsapp_pairing_crypto.go). It should never reach any text, but if a
+	// line ever quotes one it is masked wherever this redactor runs. The
+	// 8-character phone pairing code is masked only in WhatsApp log lines
+	// (redactWhatsAppLog): its shape is too generic for every CLI frame.
+	regexp.MustCompile(`\b[0-9]@[A-Za-z0-9+/=_-]{8,}(?:,[A-Za-z0-9+/=_-]+){2,}`),
 }
 
 // agentOpaqueBlobPattern matches very long opaque blobs (likely tokens/JWTs),

@@ -246,6 +246,10 @@ func tearDownSubprocesses(ctx context.Context) {
 		globalMuseCodeNativeManager.ShutdownAll()
 	}
 
+	// WhatsApp links: disconnect the clients and flush what the remaining
+	// deadline allows; the session and any unflushed outbox stay on disk.
+	globalWhatsAppSupervisor.ShutdownAll(ctx)
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 
