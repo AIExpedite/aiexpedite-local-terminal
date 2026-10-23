@@ -875,7 +875,13 @@ func TestWhatsAppSupervisorEagerPauseStopsPostsDuringReconcile(t *testing.T) {
 func TestWhatsAppSupervisorReconcileFetchesWithoutTheLifecycleLock(t *testing.T) {
 	h := newSupervisorHarness(t)
 	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStateConnected}}
-	h.sup.start(h.transport)
+	// Start without the background reconcile loop, so the reconcile below is
+	// the only one: a second, concurrent reconcile takes the lock for its own
+	// snapshot or mutation and would fail the probe spuriously.
+	h.sup.startWith(h.transport, true)
+	h.sup.mu.Lock()
+	h.sup.paused = false
+	h.sup.mu.Unlock()
 	freeCh := make(chan bool, 4)
 	h.transport.mu.Lock()
 	h.transport.onBound = func() {
@@ -1573,5 +1579,63 @@ func TestWhatsAppSecureStorageProbeIsSingleFlight(t *testing.T) {
 	defer ks.mu.Unlock()
 	if ks.peak != 1 || ks.probes != 1 {
 		t.Fatalf("probes ran concurrently or repeatedly: peak=%d probes=%d", ks.peak, ks.probes)
+	}
+}
+
+// ctxBlockingTransport holds a history-complete state report until the
+// context it was posted with ends, like a request to an unresponsive
+// terminal-service. Everything else goes to the fake.
+type ctxBlockingTransport struct {
+	*fakeWATransport
+	blocked chan struct{}
+}
+
+func (b *ctxBlockingTransport) Post(ctx context.Context, payload any) whatsAppSyncResult {
+	if m, ok := payload.(map[string]any); ok && m["kind"] == waSyncKindState && m["historySyncComplete"] == true {
+		select {
+		case b.blocked <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return whatsAppSyncResult{}
+	}
+	return b.fakeWATransport.Post(ctx, payload)
+}
+
+// A state report in flight on the heartbeat loop (here: the quiet-history
+// completion, hanging on an unresponsive server) must not hold shutdown past
+// the caller's deadline: Windows gives the whole shutdown 2-4 s, and the
+// teardown steps after WhatsApp still have to run.
+func TestWhatsAppSupervisorShutdownHonoursTheCallerDeadline(t *testing.T) {
+	h := newSupervisorHarness(t)
+	prevHB, prevQuiet := whatsAppHeartbeatInterval, whatsAppHistoryQuiet
+	whatsAppHeartbeatInterval, whatsAppHistoryQuiet = 10*time.Millisecond, time.Millisecond
+	defer func() { whatsAppHeartbeatInterval, whatsAppHistoryQuiet = prevHB, prevQuiet }()
+	tr := &ctxBlockingTransport{fakeWATransport: h.transport, blocked: make(chan struct{}, 1)}
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStateConnected}}
+	h.sup.start(tr)
+	_, pub := newBrowserKey(t)
+	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 2, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+	waitFor(t, "client", func() bool { return h.client(0) != nil })
+	c := h.client(0)
+	c.emit(&events.PairSuccess{ID: types.NewJID("15550000001", types.DefaultUserServer)})
+	c.mu.Lock()
+	c.session = true
+	c.mu.Unlock()
+	c.emit(&events.Connected{}) // syncingHistory; the heartbeat loop completes it after the quiet
+	select {
+	case <-tr.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the heartbeat loop never reported history completion")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	h.sup.ShutdownAll(ctx)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("shutdown took %v with a 300ms deadline", took)
+	}
+	if local, err := loadWhatsAppLocalLinks(); err != nil || len(local) != 1 {
+		t.Fatalf("shutdown must still record the link: %+v %v", local, err)
 	}
 }

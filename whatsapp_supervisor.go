@@ -859,7 +859,9 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 }
 
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
-// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk.
+// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It never
+// outlasts ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
+// teardown steps after this one still have to run).
 func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.mu.Lock()
 	if s.stopped {
@@ -873,10 +875,14 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	}
 	s.mu.Unlock()
 	defer s.waitDiscards(ctx)
+	// Cancel the supervisor context first: state reports, acks and their
+	// retry waits run on it, so one in flight would otherwise hold a
+	// runner's loops (waitLoops allows them 10 s) past the deadline. The
+	// flush below has its own context.
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if len(runners) == 0 {
-		if s.cancel != nil {
-			s.cancel()
-		}
 		return
 	}
 	flushCtx, cancel := context.WithTimeout(context.Background(), whatsAppUpdateDrainFlush)
@@ -901,9 +907,20 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 			r.flush(flushCtx)
 		}(r)
 	}
-	wg.Wait()
-	if s.cancel != nil {
-		s.cancel()
+	stoppedAll := make(chan struct{})
+	go func() { wg.Wait(); close(stoppedAll) }()
+	var deadline <-chan struct{}
+	if ctx != nil {
+		deadline = ctx.Done()
+	}
+	select {
+	case <-stoppedAll:
+	case <-deadline:
+		// Out of time with a runner still stopping: leave its stores to the
+		// process exit (SQLite is crash-safe) and record the links.
+		logWhatsApp("-", "shutdown deadline reached while links were still stopping; their files stay for the next start")
+		s.persist()
+		return
 	}
 	for _, r := range runners {
 		_ = r.closeStores()
