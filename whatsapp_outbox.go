@@ -35,9 +35,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Caps are vars so tests can reach them without 50 000 rows.
+var (
+	whatsAppOutboxMaxRecords int64 = 50000
+	whatsAppOutboxMaxBytes   int64 = 200 * 1024 * 1024
+)
+
 const (
-	whatsAppOutboxMaxRecords   = 50000
-	whatsAppOutboxMaxBytes     = 200 * 1024 * 1024
 	whatsAppBatchMaxRecords    = 200
 	whatsAppBatchMaxBodyBytes  = 512 * 1024
 	whatsAppBatchRecordsBudget = 480 * 1024 // leaves room for the envelope
