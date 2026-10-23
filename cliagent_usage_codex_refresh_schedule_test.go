@@ -1209,6 +1209,13 @@ func (f codexFreshnessFixture) unscopeAccount(t *testing.T) codexFreshnessFixtur
 func TestCodexScheduleRunDebtRetry_BooksForAnUnscopedAccount(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour)).unscopeAccount(t)
+	// The fixture's 10 ms rungs let the armed timer fire, and clear itself,
+	// before a loaded runner reaches the pending assertion below. A rung that
+	// cannot fire during the test pins what is asserted -- a timer was armed --
+	// and the fixture's cleanup (resetCodexUsageRefreshGate) drains it.
+	prev := codexRunDebtRetryLadder
+	codexRunDebtRetryLadder = []time.Duration{time.Hour, time.Hour, time.Hour, time.Hour}
+	t.Cleanup(func() { codexRunDebtRetryLadder = prev })
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	state := f.oweUnpaidDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute), 1, 0)
 

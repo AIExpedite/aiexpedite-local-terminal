@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -57,9 +58,7 @@ func helperMockAgyOnPath(t *testing.T, mode string) (dir, executable string) {
 		name += ".exe"
 	}
 	executable = filepath.Join(dir, name)
-	if err := copyTestBinary(testExe, executable); err != nil {
-		t.Fatalf("copy test binary: %v", err)
-	}
+	copyAndWarmTestBinary(t, testExe, executable)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, mode)
 	return dir, executable
@@ -350,9 +349,7 @@ func TestAntigravityFreshness_NonTTYExecuteOfOtherCommandArmsNothing(t *testing.
 	if runtime.GOOS == "windows" {
 		other += ".exe"
 	}
-	if err := copyTestBinary(executable, other); err != nil {
-		t.Fatalf("copy mock: %v", err)
-	}
+	copyAndWarmTestBinary(t, executable, other)
 
 	if _, _, err := executeTerminalCommand(nil, commandMsg{
 		Command:   other,
@@ -653,7 +650,7 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 	restore := runEncodedPowerShellViaArgFn
 	t.Cleanup(func() { runEncodedPowerShellViaArgFn = restore })
 	var ran atomic.Int64
-	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration, _ func(int)) (string, error) {
+	runEncodedPowerShellViaArgFn = func(encodedScript, workDir string, timeout time.Duration, onStart func(int)) (string, error) {
 		ran.Add(1)
 		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
 		if decodeErr != nil {
@@ -664,8 +661,20 @@ func TestAntigravityFreshness_EncodedPowerShellExecuteAdvancesObservedAt(t *test
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		out, runErr := exec.CommandContext(ctx, executable, "--print", "hello").CombinedOutput()
-		return string(out), runErr
+		child := exec.CommandContext(ctx, executable, "--print", "hello")
+		var out bytes.Buffer
+		child.Stdout, child.Stderr = &out, &out
+		if err := child.Start(); err != nil {
+			return "", err
+		}
+		// Hand the started process to the capture exactly as the real
+		// transport hands its wrapper: the capture is tied to the child's
+		// start, not to the moment the command was armed.
+		if onStart != nil {
+			onStart(child.Process.Pid)
+		}
+		runErr := child.Wait()
+		return out.String(), runErr
 	}
 
 	// The bare `powershell -EncodedCommand <b64>` shape, which is the one

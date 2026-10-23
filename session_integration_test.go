@@ -73,10 +73,25 @@ const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
 // server cannot reproduce.
 const mockAgyQuotaBaseEnv = "TEST_MOCK_AGY_QUOTA_BASE"
 
-// mockAgyQuotaLifetime is how long the quota-server mock stays alive after
-// answering stdin. Kept short so the test proves the SHIPPED capture cadence
+// mockCLIWarmupMode is the no-op mode copyAndWarmTestBinary runs a fresh copy
+// in: it exits 0 at once, so the only cost is the first spawn itself.
+const mockCLIWarmupMode = "warmup"
+
+// mockAgyQuotaMinLifetime is how long the quota-server mock stays alive after
+// it starts, at least. Kept short so the test proves the SHIPPED capture cadence
 // samples a fast turn, rather than relying on a shrunken test interval.
-const mockAgyQuotaLifetime = 1500 * time.Millisecond
+const mockAgyQuotaMinLifetime = 1500 * time.Millisecond
+
+// mockAgyQuotaMaxLifetime caps how long the quota-server mock waits for its
+// first quota read past mockAgyQuotaMinLifetime. A fixed lifetime let a child
+// that started late (a cold binary under AV) exit before the capture's
+// discovery reached it; a capture that never comes still ends the turn.
+const mockAgyQuotaMaxLifetime = 10 * time.Second
+
+// mockAgyQuotaReadTail is how long the quota-server mock keeps serving after
+// its first quota read, so the identity RPC that follows it and the capture's
+// tail probes are answered as by a real language server finishing its turn.
+const mockAgyQuotaReadTail = 300 * time.Millisecond
 
 // mockAgyGatedQuotaLifetime is the same for the CSRF-gated mode. A gated server
 // can never be captured from, so the turn only has to outlive the poller's
@@ -196,6 +211,9 @@ func drainStdinPromptBeforeExit() {
 //     completion ordering under load.
 func runMockCLI(mode string) {
 	switch mode {
+	case mockCLIWarmupMode:
+		os.Exit(0)
+
 	case "opencode":
 		// The OpenCode usage parser probes `opencode models` and
 		// `opencode auth list`. Replay the exact output a real 1.18.15 install
@@ -325,16 +343,26 @@ func runMockCLI(mode string) {
 		// the listening socket with it. Nothing in the parent keeps the server
 		// alive, so a capture that only probed after the child was reaped would
 		// find nothing and the test would fail.
+		if len(os.Args) > 1 && os.Args[1] == "--version" {
+			// Same rule as antigravity-quota-gated: the version probe must not
+			// take the server path, or every probe would pay a turn's lifetime.
+			fmt.Println("agy version 1.2.3")
+			os.Exit(0)
+		}
+		start := time.Now()
 		base := os.Getenv(mockAgyQuotaBaseEnv)
 		ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
 		if lnErr != nil {
 			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"listen failed"}}`)
 			os.Exit(1)
 		}
+		quotaRead := make(chan struct{})
+		var quotaReadOnce sync.Once
 		mux := http.NewServeMux()
 		mux.HandleFunc(antigravityQuotaRPC, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(helperQuotaJSON))
+			quotaReadOnce.Do(func() { close(quotaRead) })
 		})
 		mux.HandleFunc(antigravityStatusRPC, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -359,7 +387,15 @@ func runMockCLI(mode string) {
 		// mode is reused by the `execute` path, which hands the child no NDJSON
 		// prompt at all, and a blocking read there would hang the turn.
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin) }()
-		time.Sleep(mockAgyQuotaLifetime)
+		// Serve for at least the short turn, then until the first quota read
+		// (plus a tail) or the cap -- never a fixed lifetime a late start can
+		// outlast.
+		time.Sleep(mockAgyQuotaMinLifetime)
+		select {
+		case <-quotaRead:
+			time.Sleep(mockAgyQuotaReadTail)
+		case <-time.After(mockAgyQuotaMaxLifetime - time.Since(start)):
+		}
 		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"quota-server turn done"}}`)
 		os.Exit(0)
 
@@ -404,7 +440,7 @@ func runMockCLI(mode string) {
 			os.Exit(1)
 		}
 		go func() { _, _ = io.Copy(io.Discard, os.Stdin) }()
-		// Shorter than mockAgyQuotaLifetime: nothing can be captured from a
+		// Shorter than mockAgyQuotaMinLifetime: nothing can be captured from a
 		// gated server, so the turn only has to be long enough for the poller
 		// to meet the refusal once.
 		time.Sleep(mockAgyGatedQuotaLifetime)
@@ -1250,6 +1286,27 @@ func copyTestBinary(src, dst string) error {
 		return err
 	}
 	return os.WriteFile(dst, data, 0o755)
+}
+
+// copyAndWarmTestBinary is copyTestBinary followed by one untimed run of the
+// copy in the no-op `warmup` mode. Every mock CLI is a ~170 MB copy of the test
+// binary at a NEW path, and on Windows its first spawn is scanned by real-time
+// AV -- up to 17 s on a loaded runner, far past the 3 s version probe and the
+// gather budget. Warming it here moves that one-time cost out of every timed
+// section, the way an installed CLI has been run before the device gathers.
+// The production behaviour for a genuinely cold binary (a CLI update) is
+// pinned separately, through the probe seam, by
+// cliagent_usage_post_update_cold_start_test.go.
+func copyAndWarmTestBinary(t *testing.T, src, dst string) {
+	t.Helper()
+	if err := copyTestBinary(src, dst); err != nil {
+		t.Fatalf("copy test binary: %v", err)
+	}
+	warm := exec.Command(dst)
+	warm.Env = setEnvVar(os.Environ(), mockCLIEnvVar, mockCLIWarmupMode)
+	if out, err := warm.CombinedOutput(); err != nil {
+		t.Fatalf("warm up copied test binary: %v (output=%q)", err, out)
+	}
 }
 
 /* --------------------------------------------------------------------------

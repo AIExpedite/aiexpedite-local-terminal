@@ -126,6 +126,17 @@ var (
 	// antigravityCaptureTailProbes counts probes taken in the post-release tail
 	// window, so a test can prove the tail never rediscovers.
 	antigravityCaptureTailProbes atomic.Int64
+	// antigravityCaptureDiscoveryProbes counts probes allowed to scan the logs,
+	// so a test can tell when the opening ramp is spent.
+	antigravityCaptureDiscoveryProbes atomic.Int64
+	// antigravityCaptureRunStarted is signalled whenever an armed run's process
+	// actually starts (its agy PID, or the wrapper that will launch it). The
+	// poller restarts its opening ramp on it while it has no port: the run is
+	// armed BEFORE Start, and a cold binary -- the first spawn after an agy
+	// update, scanned by real-time AV -- can spend the whole ramp inside Start,
+	// leaving a short turn to fall between the steady ticks. Buffered so a
+	// signal never blocks a spawn path; a stale one costs at most one ramp.
+	antigravityCaptureRunStarted = make(chan struct{}, 1)
 	// antigravityCaptureLastPersistedMs is the observation time of the newest
 	// reading any capture persisted in this process. A finishing run uses it to
 	// answer "did the poller reach a server while I was going?" without reading
@@ -240,6 +251,7 @@ func (c *antigravityRunCapture) setPID(pid int, fromResolver bool, gen uint64) {
 	c.pid = pid
 	c.mu.Unlock()
 	noteAntigravityManagedPID(pid)
+	signalAntigravityCaptureRunStarted()
 }
 
 // SetWrapper starts (or re-roots, for a transport that failed over) the
@@ -280,7 +292,17 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	c.mu.Unlock()
 	releaseAntigravityCapturedPID(superseded, c.floor)
 	c.noteMu.Unlock()
+	signalAntigravityCaptureRunStarted()
 	go c.resolveWrapper(wrapperPID, gen, stop, done)
+}
+
+// signalAntigravityCaptureRunStarted wakes the poller for a run whose process
+// has just started. Never blocks.
+func signalAntigravityCaptureRunStarted() {
+	select {
+	case antigravityCaptureRunStarted <- struct{}{}:
+	default:
+	}
 }
 
 // releaseAntigravityCapturedPID lets a capture's agy PID go: a process that
@@ -559,6 +581,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 		}
 		if allowDiscovery {
 			discoveryAttempts++
+			antigravityCaptureDiscoveryProbes.Add(1)
 		}
 		ok, observedAt, refused := antigravityCaptureAttempt(client, &memoPort, allowDiscovery)
 		if refused {
@@ -633,12 +656,35 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 	defer timer.Stop()
 
 	discoveryEnabled := true
+	// rampFrom is the discovery attempt the current opening ramp started at.
+	// A run process that starts while no port is known restarts the ramp
+	// (antigravityCaptureRunStarted), so the fast probes land while its
+	// language server can actually be up rather than while Start was still
+	// blocked. Bounded: at most antigravityCaptureInitialPolls extra scans per
+	// started process, and never past antigravityCaptureMaxAttempts.
+	rampFrom := 0
 
 	for {
 		select {
 		case <-stop:
 			tailAndReport()
 			return
+		case <-antigravityCaptureRunStarted:
+			if !discoveryEnabled || memoPort > 0 || discoveryAttempts-rampFrom < antigravityCaptureInitialPolls {
+				// Already found, already ramping, or past the discovery bound:
+				// the ordinary schedule covers it.
+				continue
+			}
+			rampFrom = discoveryAttempts
+			fmt.Printf("%s[antigravity-quota] Capture discovery ramp restarted for %s: the run's process started after the opening ramp (attempts=%d)%s\n",
+				colorCyan, label, discoveryAttempts, colorReset)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(initial)
 		case <-timer.C:
 			probe(discoveryEnabled)
 			if gated {
@@ -660,7 +706,7 @@ func runAntigravityQuotaCapture(label string, stop <-chan struct{}, done chan<- 
 					colorYellow, label, discoveryAttempts, colorReset)
 			}
 			next := steady
-			if discoveryEnabled && discoveryAttempts < antigravityCaptureInitialPolls {
+			if discoveryEnabled && discoveryAttempts-rampFrom < antigravityCaptureInitialPolls {
 				next = initial
 			}
 			timer.Reset(next)
