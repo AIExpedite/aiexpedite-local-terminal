@@ -1,6 +1,7 @@
 // cliagent_usage_grok_live.go — reads Grok Build's credit pool straight from
-// xAI when the user clicks Refresh on the CLI Agents card, and after a Grok
-// run finishes (cliagent_usage_grok_freshness.go).
+// xAI when the user clicks Refresh on the CLI Agents card, after a Grok run
+// this agent spawned finishes (cliagent_usage_grok_freshness.go), and after a
+// direct turn the user ran in their own shell (cliagent_usage_grok_direct.go).
 //
 // Why this exists:
 //
@@ -40,6 +41,12 @@
 //     really "the login is busy".
 //   - What persists is the normalized reading only (percent, period, on-demand
 //     pool), scoped to the account fingerprint, in grok_billing_live.json.
+//   - Every committed NUMERIC read advances the cache's capture generation
+//     (on this process's epoch, as OpenCode's ledger does) and hints
+//     terminal-service (cliagent_usage_propagate.go), so a reading that lands
+//     after the session-end wake still reaches the card. An unmetered answer
+//     inside the same open period never erases the numeric reading, and never
+//     advances the generation.
 package main
 
 import (
@@ -52,6 +59,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -102,9 +110,85 @@ type grokBillingLiveCache struct {
 	PeriodEnd          string   `json:"periodEnd,omitempty"`
 	OnDemandCap        *float64 `json:"onDemandCap,omitempty"`
 	OnDemandUsed       *float64 `json:"onDemandUsed,omitempty"`
+	// NumericObservedAt is set only when UsedPercent was kept from an earlier
+	// numeric read under a newer unmetered answer for the same open period
+	// (ObservedAt is then that answer's): the percentage's own observation
+	// time, which is what the card and every coverage check must use.
+	NumericObservedAt string `json:"numericObservedAt,omitempty"`
+	// Generation is the capture generation of the newest committed numeric
+	// read, or of the clear that replaced it (cliUsageGeneration); additive,
+	// so schema 1 readers ignore it.
+	Generation *cliUsageGeneration `json:"generation,omitempty"`
+	// Cleared reports that Generation versions a clear: this account's
+	// numeric reading was replaced by an answer with no number (a new
+	// period, or one whose kept figure has ended). The parser publishes and
+	// recovery re-hints that generation although the card renders Unknown.
+	Cleared bool `json:"cleared,omitempty"`
 }
 
-var grokBillingLiveCacheMu sync.Mutex
+// numericObservedAt is when the cached percentage was observed, or zero when
+// the entry carries none.
+func (c grokBillingLiveCache) numericObservedAt() (time.Time, bool) {
+	if c.UsedPercent == nil || !grokFiniteNumber(*c.UsedPercent) {
+		return time.Time{}, false
+	}
+	stamp := c.ObservedAt
+	if c.NumericObservedAt != "" {
+		stamp = c.NumericObservedAt
+	}
+	t, err := time.Parse(time.RFC3339Nano, stamp)
+	return t, err == nil
+}
+
+// hasNumericOnDemand reports whether the entry carries an on-demand pool that
+// grokBillingMetrics renders as numbers (a cap with a usage figure inside it):
+// a reading of its own, versioned even while the credits window is unmetered.
+func (c grokBillingLiveCache) hasNumericOnDemand() bool {
+	return grokBillingLiveCacheSnapshot(c, time.Time{}).HasOnDemandUsed
+}
+
+// sameOnDemand reports whether two entries carry the same on-demand figures.
+func (c grokBillingLiveCache) sameOnDemand(other grokBillingLiveCache) bool {
+	eq := func(a, b *float64) bool { return (a == nil) == (b == nil) && (a == nil || *a == *b) }
+	return eq(c.OnDemandCap, other.OnDemandCap) && eq(c.OnDemandUsed, other.OnDemandUsed)
+}
+
+var (
+	grokBillingLiveCacheMu sync.Mutex
+	// grokGenerationRotated reports a committed live-cache write carrying this
+	// process's epoch. Until then the cache may hold a generation an earlier
+	// process published, so the parser omits UsageGeneration and the
+	// propagator holds Grok hints (providerBlockedLocked).
+	grokGenerationRotated atomic.Bool
+)
+
+// grokBillingLiveCacheLockWait bounds how long a cache transaction waits on
+// another agent process holding the sibling lock. A var so tests can pin it.
+var grokBillingLiveCacheLockWait = 2 * time.Second
+
+// lockGrokBillingLiveCache takes the cache's cross-process sibling lock — the
+// one the Codex and OpenCode generation transactions use — so two agent
+// processes (Linux has no single-instance guard) never interleave a
+// read-merge-rename or a rotation and lose a reading or an epoch. Callers hold
+// grokBillingLiveCacheMu. ok is false when the lock file's directory cannot be
+// made or another holder kept the lock past the wait; release must be called
+// otherwise. A filesystem that offers no lock takes the unlocked path, as the
+// other caches do.
+func lockGrokBillingLiveCache(path string) (release func(), ok bool) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, false
+	}
+	lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(grokBillingLiveCacheLockWait))
+	if outcome == crossProcessLockContended {
+		return nil, false
+	}
+	return func() {
+		if lock != nil {
+			_ = unlockFile(lock)
+			_ = lock.Close()
+		}
+	}, true
+}
 
 // grokBillingLiveCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_GROK_BILLING_LIVE_CACHE overrides it (tests isolate from the real
@@ -359,12 +443,16 @@ func grokBillingReadOnce(ctx context.Context, grokPath, fingerprint string, now 
 			defer cancel()
 			outcome := grokBillingLiveReadFn(readCtx, grokPath, fingerprint, now)
 			if outcome == grokLiveOutcomeOK {
-				// Only a reading with a percentage pays a run's debt; one that
-				// names a period alone leaves the card without a number. The
-				// reading is stamped with when its request was sent, so it only
-				// covers runs that completed before xAI could have answered.
-				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint); ok && snap.HasUsedPercent {
-					settleGrokRunFreshness(snap.ObservedAt.UnixMilli(), fingerprint)
+				// Only a numeric reading (the percentage or the on-demand pool)
+				// pays a run's debt; one that names a period alone leaves the
+				// card without a number. The reading is stamped with when its
+				// request was sent, so it only covers runs that completed
+				// before xAI could have answered.
+				readAt := now()
+				if snap, ok := loadGrokBillingLiveSnapshot(fingerprint, readAt); ok {
+					if at, numeric := snap.numericAt(readAt); numeric {
+						settleGrokRunFreshness(at.UnixMilli(), fingerprint)
+					}
 				}
 			}
 			return grokBillingRead{outcome: outcome, startedAt: startedAt}, nil
@@ -533,8 +621,13 @@ func probeGrokBillingLiveFor(ctx context.Context, grokPath, expected string, now
 		return grokLiveOutcomeBadResponse
 	}
 	// The account could have changed while the request was in flight; a reading
-	// is only cached under the account that is still signed in.
+	// is only cached under the account that is still signed in. A pinned read
+	// says the login moved (after its request reached xAI), so the debt it was
+	// paying is retired as an account change rather than auth-idled.
 	if grokAccountFingerprintFor(base) != fingerprint {
+		if expected != "" {
+			return liveProbeOutcomeAccountChangedAfterRead
+		}
 		return grokLiveOutcomeNoAccount
 	}
 	if !saveGrokBillingLive(grokBillingLiveFromSnapshot(snap, fingerprint)) {
@@ -565,31 +658,418 @@ func grokBillingLiveFromSnapshot(snap grokBillingSnapshot, fingerprint string) g
 	return out
 }
 
-// saveGrokBillingLive atomically replaces the cache (write-then-rename).
+// saveGrokBillingLive commits one read to the cache and, when the commit
+// advanced the capture generation, hints terminal-service about it. Reports
+// whether the write committed.
 func saveGrokBillingLive(entry grokBillingLiveCache) bool {
+	committed, advanced, generation := commitGrokBillingLive(entry)
+	if advanced {
+		// Outside the cache lock: the propagator never holds its own lock
+		// across a cache transaction, and this keeps the order one-way.
+		noteCLIUsageObservationAdvanced(grokUsageProvider, generation)
+	}
+	return committed
+}
+
+// commitGrokBillingLive is the cache's read-merge-write transaction
+// (write-then-rename under grokBillingLiveCacheMu and the cross-process
+// sibling lock, lockGrokBillingLiveCache):
+//
+//   - An unmetered read for the same account and the same billing period,
+//     while that period is open, keeps the earlier numeric percentage with its
+//     own older observation time (NumericObservedAt) — the rule
+//     grokNewestBillingObservation already applies across sources. Across a
+//     rollover, or for another account, the unmetered read replaces it.
+//   - A numeric read advances the generation when it commits a newer numeric
+//     observation, a changed percentage, or a new billing period (another
+//     account is all three). An unmetered read never advances it on the
+//     percentage's behalf, except as a clear (below).
+//   - A numeric on-demand pool is versioned on its own terms: a read carrying
+//     one advances the generation when it is newer than the cached pool, its
+//     figures changed, or there was no same-account numeric pool — so fresh
+//     on-demand numbers never ride an older generation under a kept
+//     percentage.
+//   - A clear is versioned too: when the read brings no number and this
+//     account's cached one (the percentage or the on-demand pool) is not
+//     carried, the commit advances the generation and marks the entry
+//     Cleared, so the card's switch to Unknown reaches terminal-service like
+//     any other change. A later unmetered read for the same account keeps the
+//     mark without advancing again. Dropping only this account's on-demand
+//     pool under a kept percentage advances the generation the same way
+//     (without the mark: the percentage still renders). Replacing another
+//     account's numeric cache with an unmetered read is a clear as well.
+//   - A same-account read older than the cached answer is superseded: it
+//     reports committed (the cache already holds a newer answer) and writes
+//     nothing — unless the cached answer is more than grokBillingMaxClockSkew
+//     ahead of it (a clock since corrected), which the read replaces with a
+//     generation advance.
+//
+// advanced reports a committed generation advance, and generation is it.
+func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool, generation cliUsageGeneration) {
 	grokBillingLiveCacheMu.Lock()
 	defer grokBillingLiveCacheMu.Unlock()
 	path := grokBillingLiveCachePath()
 	if path == "" || entry.AccountFingerprint == "" {
-		return false
+		return false, false, cliUsageGeneration{}
 	}
-	return writeJSONFileAtomic(path, entry)
+	release, locked := lockGrokBillingLiveCache(path)
+	if !locked {
+		return false, false, cliUsageGeneration{}
+	}
+	defer release()
+	var prev grokBillingLiveCache
+	hasPrev := readJSONFile(path, &prev)
+	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
+	entryAt, entryErr := time.Parse(time.RFC3339Nano, entry.ObservedAt)
+	prevFuture := false
+	if sameAccount && entryErr == nil {
+		// Requests from two processes overlap outside the lock, so an older
+		// answer can finish after a newer one committed: it is superseded, never
+		// written over the newer cache and generation. A cached answer further
+		// ahead of this read than grokBillingMaxClockSkew was stamped by a
+		// clock that has since been corrected: it is untrusted (the parser
+		// already renders it Unknown), so this read replaces it.
+		if prevAt, err := time.Parse(time.RFC3339Nano, prev.ObservedAt); err == nil && entryAt.Before(prevAt) {
+			if !prevAt.After(entryAt.Add(grokBillingMaxClockSkew)) {
+				return true, false, cliUsageGeneration{}
+			}
+			prevFuture = true
+		}
+	}
+	prevNumericAt, prevNumeric := prev.numericObservedAt()
+	// Another account's number is never kept, but replacing it still changes
+	// the card (below).
+	prevOtherNumeric := hasPrev && !sameAccount && (prevNumeric || prev.hasNumericOnDemand())
+	prevNumeric = prevNumeric && sameAccount
+
+	entry.NumericObservedAt = ""
+	entry.Generation = nil
+	entry.Cleared = false
+	if hasPrev && prev.Generation != nil {
+		// Counters only move forward within an epoch, whoever is signed in.
+		g := *prev.Generation
+		entry.Generation = &g
+	}
+	incomingNumeric := entry.UsedPercent != nil && grokFiniteNumber(*entry.UsedPercent)
+	switch {
+	case !incomingNumeric && prevNumeric && entryErr == nil && prevNumericAt.Before(entryAt):
+		kept := grokBillingLiveCacheSnapshot(prev, prevNumericAt)
+		incoming := grokBillingLiveCacheSnapshot(entry, entryAt)
+		if kept.samePeriod(incoming) && entryAt.Before(incoming.PeriodEnd) {
+			percent := *prev.UsedPercent
+			entry.UsedPercent = &percent
+			entry.NumericObservedAt = prevNumericAt.UTC().Format(time.RFC3339Nano)
+		}
+	case incomingNumeric:
+		advanced = !prevNumeric ||
+			(entryErr == nil && entryAt.After(prevNumericAt)) ||
+			*prev.UsedPercent != *entry.UsedPercent ||
+			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
+	}
+	if !advanced && entry.hasNumericOnDemand() {
+		// The cached pool is stamped with the entry's ObservedAt (the newest
+		// answer), never with a kept percentage's NumericObservedAt.
+		prevPoolAt, prevPoolErr := time.Parse(time.RFC3339Nano, prev.ObservedAt)
+		advanced = !sameAccount || !prev.hasNumericOnDemand() || prevPoolErr != nil ||
+			(entryErr == nil && entryAt.After(prevPoolAt)) ||
+			!prev.sameOnDemand(entry)
+	}
+	if !advanced && sameAccount && !entry.hasNumericOnDemand() {
+		switch {
+		case entry.UsedPercent == nil && (prevNumeric || prev.hasNumericOnDemand()):
+			advanced, entry.Cleared = true, true
+		case entry.UsedPercent == nil && prev.Cleared:
+			entry.Cleared = true
+		case prev.hasNumericOnDemand():
+			// The pool is gone under a kept percentage: the card drops its
+			// on-demand row, so that removal is versioned too.
+			advanced = true
+		}
+	}
+	if !advanced && prevOtherNumeric {
+		// Incoming carries no number (a numeric read advanced above): the card
+		// moves from the other account's figure to Unknown, a versioned clear.
+		advanced, entry.Cleared = true, true
+	}
+	// Replacing an untrusted future answer always changes the published
+	// reading, even when its figures match.
+	advanced = advanced || prevFuture
+	epoch := codexProcessGenerationEpoch.Load()
+	if advanced {
+		if entry.Generation == nil || entry.Generation.Epoch != epoch {
+			entry.Generation = &cliUsageGeneration{Epoch: epoch, Counter: 1}
+		} else {
+			entry.Generation.Counter++
+		}
+	}
+	if !writeJSONFileAtomic(path, entry) {
+		return false, false, cliUsageGeneration{}
+	}
+	if entry.Generation != nil && entry.Generation.Epoch == epoch {
+		grokGenerationRotated.Store(true)
+	}
+	if advanced {
+		generation = *entry.Generation
+	}
+	return true, advanced, generation
+}
+
+// rotateGrokBillingLiveGeneration moves a cache an earlier process wrote onto
+// this process's epoch in one write, when it still holds fingerprint's
+// reading. It returns the generation the cache carries afterwards; refused
+// reports a rotation that did not commit (the caller retries).
+func rotateGrokBillingLiveGeneration(fingerprint string) (generation *cliUsageGeneration, refused bool) {
+	grokBillingLiveCacheMu.Lock()
+	defer grokBillingLiveCacheMu.Unlock()
+	path := grokBillingLiveCachePath()
+	var entry grokBillingLiveCache
+	if path == "" || fingerprint == "" {
+		return nil, false
+	}
+	release, locked := lockGrokBillingLiveCache(path)
+	if !locked {
+		return nil, true
+	}
+	defer release()
+	if !readJSONFile(path, &entry) || entry.AccountFingerprint != fingerprint {
+		return nil, false
+	}
+	epoch := codexProcessGenerationEpoch.Load()
+	if entry.Generation == nil || entry.Generation.Epoch != epoch {
+		entry.Generation = &cliUsageGeneration{Epoch: epoch, Counter: 1}
+		if !writeJSONFileAtomic(path, entry) {
+			return nil, true
+		}
+	}
+	grokGenerationRotated.Store(true)
+	g := *entry.Generation
+	return &g, false
+}
+
+// Vars so tests can pin them. A refused rotation is retried on the same short
+// ladder as OpenCode's ledger commit.
+var (
+	grokRecoveryLadder      = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second, 2 * time.Minute}
+	grokRecoveryMaxAttempts = len(grokRecoveryLadder) + 1
+	grokRecoveryAfterFunc   = time.AfterFunc
+	// grokRecoveryWithheldMaxWait caps one wait for a withheld figure, so a
+	// clock corrected again while waiting is re-read rather than slept past.
+	grokRecoveryWithheldMaxWait = 30 * time.Minute
+
+	// grokRecoveryTimer is the pending recovery retry. It is cancelled at
+	// shutdown (stopGrokRecoveryRetry), and only there: a retry firing after an
+	// update hand-off would rotate the cache back onto this process's epoch
+	// over the replacement's, and no live process would hint the result.
+	grokRecoveryTimer struct {
+		mu    sync.Mutex
+		timer *time.Timer
+		gen   uint64
+	}
+)
+
+// grokArmRecoveryRetry replaces the pending recovery retry with fn after delay.
+// fn runs only while the retry is still current and shutdown has not begun,
+// and counts as an in-flight write for drainGrokUsageWrites.
+func grokArmRecoveryRetry(delay time.Duration, fn func()) {
+	t := &grokRecoveryTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	t.gen++
+	gen := t.gen
+	t.timer = grokRecoveryAfterFunc(delay, func() {
+		t.mu.Lock()
+		if gen != t.gen {
+			t.mu.Unlock()
+			return
+		}
+		t.timer = nil
+		grokFreshnessInFlight.Add(1)
+		t.mu.Unlock()
+		defer grokFreshnessInFlight.Add(-1)
+		if IsShutdownInProgress() {
+			return
+		}
+		fn()
+	})
+}
+
+// stopGrokRecoveryRetry cancels the pending recovery retry; the next process
+// runs its own startup recovery.
+func stopGrokRecoveryRetry() {
+	t := &grokRecoveryTimer
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
+	t.gen++
+}
+
+// grokRecoveryGeneration is the rotated generation of a live cache that still
+// holds a numeric reading for the account signed in now, in a period still
+// open at now (grokBillingMetrics renders it as a number) — or a versioned
+// clear of one (Cleared) — or nil. A reading
+// committed just before an update hand-off — whose hint died with the old
+// process — is hinted again this way; the backend skips a generation it
+// already applied. refused reports a rotation that did not produce a hintable
+// generation — a write that did not commit, or a figure this generation
+// versions that is still withheld as future-dated — and the caller retries.
+func grokRecoveryGeneration(now time.Time) (generation *cliUsageGeneration, refused bool) {
+	fingerprint := grokUsageCurrentFingerprint()
+	view, ok := loadGrokBillingLive(fingerprint, now)
+	if !ok {
+		return nil, false
+	}
+	// A withheld figure is a reading, so it is recovered like any other — the
+	// metrics gate below would otherwise skip a cache whose only figure is the
+	// future-dated one (a pool with no percentage renders Unknown on its own),
+	// leaving nothing rotated and no retry armed.
+	withheld := grokBillingValueWithheld(view.snap, now)
+	if !withheld && !(view.cleared || grokBillingMetricsNumeric(grokBillingMetrics(view.snap, now))) {
+		return nil, false
+	}
+	g, refused := rotateGrokBillingLiveGeneration(fingerprint)
+	if refused || g == nil {
+		return g, refused
+	}
+	if withheld {
+		// ParseContext withholds this same generation while one of the
+		// cache's figures is future-dated, so hinting it now would spend the
+		// generation's hint attempts on refreshes whose receipt carries no
+		// generation, and nothing would hint it again once the clock catches
+		// up and the figure renders. The rotation stands — the next gather
+		// publishes the generation — and only the hint waits on the ladder.
+		return nil, true
+	}
+	return g, false
+}
+
+// recoverGrokUsageGeneration runs startup recovery, hinting a recovered
+// generation and retrying a refused rotation on grokRecoveryLadder — startup
+// asks only once.
+func recoverGrokUsageGeneration(attempt int) { recoverGrokUsageGenerationFor(attempt, "") }
+
+// recoverGrokUsageGenerationFor is recoverGrokUsageGeneration bound to the
+// account the pending recovery belongs to (empty on the first pass). A
+// recovery that waits — for a write the lock refused, or for a future-dated
+// figure to become trusted — can only be hinted while that account is still
+// signed in: a hint sent under another login spends the generation's attempts
+// on refreshes whose receipt cannot carry it. So while the bound account is
+// away the chain neither hints nor ends. It re-checks on the withheld cadence,
+// without spending a ladder attempt, for as long as the cache still holds that
+// account's reading, and ends as soon as another account's read commits over
+// it (that commit hints its own generation).
+func recoverGrokUsageGenerationFor(attempt int, bound string) {
+	now := grokUsageFreshnessNow()
+	if bound != "" && grokUsageCurrentFingerprint() != bound {
+		if _, ok := loadGrokBillingLive(bound, now); ok {
+			grokArmRecoveryRetry(grokRecoveryWithheldMaxWait, func() {
+				recoverGrokUsageGenerationFor(attempt, bound)
+			})
+		}
+		return
+	}
+	g, refused := grokRecoveryGeneration(now)
+	if g != nil {
+		noteCLIUsageObservationAdvanced(grokUsageProvider, *g)
+	}
+	if !refused {
+		return
+	}
+	// Whatever this recovery still owes, it owes for the account it just read.
+	bound = grokUsageCurrentFingerprint()
+	// A figure withheld as future-dated is not a failed write: it renders only
+	// once the clock reaches it, which can be long after the ladder's last
+	// rung. Wait for that moment without spending an attempt, so the rotated
+	// generation is still hinted once the figure becomes trusted.
+	if wait := grokRecoveryWithheldWait(now); wait > 0 {
+		grokArmRecoveryRetry(min(wait+time.Second, grokRecoveryWithheldMaxWait), func() {
+			recoverGrokUsageGenerationFor(attempt, bound)
+		})
+		return
+	}
+	delay, more := refreshRetryDelayForAttempt(attempt, grokRecoveryMaxAttempts, grokRecoveryLadder)
+	if !more {
+		fmt.Printf("%s[cli-usage] grok refresh: recovery_abandoned%s\n", colorYellow, colorReset)
+		return
+	}
+	grokArmRecoveryRetry(delay, func() { recoverGrokUsageGenerationFor(attempt+1, bound) })
+}
+
+// grokRecoveryWithheldWait is how long the signed-in account's live cache
+// keeps a figure withheld as future-dated (grokBillingWithheldFor), or zero.
+func grokRecoveryWithheldWait(now time.Time) time.Duration {
+	view, ok := loadGrokBillingLive(grokUsageCurrentFingerprint(), now)
+	if !ok {
+		return 0
+	}
+	return grokBillingWithheldFor(view.snap, now)
+}
+
+// grokBillingLiveView is one read of the cache for an account.
+type grokBillingLiveView struct {
+	// snap is the reading to publish: the kept numeric reading (with its own
+	// ObservedAt) while its period is open, else the newest answer.
+	snap grokBillingSnapshot
+	// generation is the cache's committed capture generation (nil when none).
+	generation *cliUsageGeneration
+	// cleared reports that generation versions a clear (grokBillingLiveCache.Cleared).
+	cleared bool
+	// answeredAt is when xAI last answered, metered or not: an unmetered
+	// answer still proves billing was read after an older log record.
+	answeredAt time.Time
 }
 
 // loadGrokBillingLiveSnapshot returns the cached live reading for the account
-// that is signed in now. A reading from another account is never replayed.
-func loadGrokBillingLiveSnapshot(fingerprint string) (grokBillingSnapshot, bool) {
+// that is signed in now. A reading from another account is never replayed, and
+// a numeric reading kept under a newer unmetered answer is returned only while
+// its period is still open at now — a rolled-over number never covers a run.
+func loadGrokBillingLiveSnapshot(fingerprint string, now time.Time) (grokBillingSnapshot, bool) {
+	view, ok := loadGrokBillingLive(fingerprint, now)
+	return view.snap, ok
+}
+
+// loadGrokBillingLive is loadGrokBillingLiveSnapshot with the generation.
+func loadGrokBillingLive(fingerprint string, now time.Time) (grokBillingLiveView, bool) {
 	if fingerprint == "" {
-		return grokBillingSnapshot{}, false
+		return grokBillingLiveView{}, false
 	}
 	var entry grokBillingLiveCache
 	if !readJSONFile(grokBillingLiveCachePath(), &entry) || entry.AccountFingerprint != fingerprint {
-		return grokBillingSnapshot{}, false
+		return grokBillingLiveView{}, false
 	}
 	observed, err := time.Parse(time.RFC3339Nano, entry.ObservedAt)
 	if err != nil {
-		return grokBillingSnapshot{}, false
+		return grokBillingLiveView{}, false
 	}
+	snap := grokBillingLiveCacheSnapshot(entry, observed)
+	if entry.NumericObservedAt != "" && snap.HasUsedPercent {
+		numericAt, err := time.Parse(time.RFC3339Nano, entry.NumericObservedAt)
+		switch {
+		case err == nil && (!snap.HasPeriodEnd || now.Before(snap.PeriodEnd)):
+			snap.ObservedAt = numericAt
+			// The on-demand pool's state came with the newest answer, not
+			// with the kept percentage, so it keeps that answer's
+			// observation time — an answer that omitted the pool dates its
+			// removal, so an older pool elsewhere never fills it back in.
+			snap.OnDemandObservedAt = observed
+		default:
+			// The kept number belongs to a period that is over (or its stamp
+			// is unreadable): publish the newest answer, unmetered.
+			snap.UsedPercent, snap.HasUsedPercent = 0, false
+		}
+	}
+	view := grokBillingLiveView{snap: snap, generation: entry.Generation, answeredAt: observed}
+	view.cleared = entry.Cleared && entry.Generation != nil && !snap.HasUsedPercent && !snap.HasOnDemandUsed
+	return view, true
+}
+
+// grokBillingLiveCacheSnapshot decodes a cache entry stamped at observed.
+func grokBillingLiveCacheSnapshot(entry grokBillingLiveCache, observed time.Time) grokBillingSnapshot {
 	snap := grokBillingSnapshot{ObservedAt: observed, PeriodType: entry.PeriodType}
 	if entry.UsedPercent != nil && grokFiniteNumber(*entry.UsedPercent) {
 		snap.UsedPercent = clampPercent(*entry.UsedPercent)
@@ -608,5 +1088,5 @@ func loadGrokBillingLiveSnapshot(fingerprint string) (grokBillingSnapshot, bool)
 			snap.OnDemandUsed = *entry.OnDemandUsed
 		}
 	}
-	return snap, true
+	return snap
 }
