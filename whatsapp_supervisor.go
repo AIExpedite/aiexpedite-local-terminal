@@ -537,7 +537,9 @@ func (s *whatsAppSupervisor) WipeAll() {
 			_ = wipeWhatsAppLinkDir(l.LinkID)
 		}
 	}
+	whatsAppPersistMu.Lock()
 	_ = saveWhatsAppLocalLinks(nil)
+	whatsAppPersistMu.Unlock()
 }
 
 // whatsAppCapability is what systemInfo.go reports.
