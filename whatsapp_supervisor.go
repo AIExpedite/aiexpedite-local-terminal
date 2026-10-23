@@ -93,6 +93,9 @@ var (
 	whatsAppAckAttempts       = 12
 	whatsAppReconcileRetry    = 5 * time.Minute
 	whatsAppUpdateDrainFlush  = 10 * time.Second
+	// One auth-expiry drain round: the retry loop below re-arms it until
+	// the outbox is empty.
+	whatsAppAuthFlushTimeout = 2 * time.Minute
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -281,6 +284,14 @@ func (s *whatsAppSupervisor) isPaused() bool {
 	return s.paused
 }
 
+// stopping reports that ShutdownAll started: background retries must hand
+// the runners over instead of racing it.
+func (s *whatsAppSupervisor) stopping() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopped
+}
+
 func (s *whatsAppSupervisor) runner(linkID string) *whatsAppLinkRunner {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,8 +346,16 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 		s.lifecycleMu.Unlock()
 		return true // the reconnect starts a fresh reconcile
 	}
+	// Snapshot which links (and generations) predate the fetch: a link
+	// start that completes while BoundLinks is in flight is absent from
+	// the response through no fault of its own, and the stale response
+	// must not act on it.
 	s.mu.Lock()
 	ctx := s.ctx
+	pre := make(map[string]int64, len(s.links))
+	for id, r := range s.links {
+		pre[id] = r.generationNow()
+	}
 	s.mu.Unlock()
 	s.lifecycleMu.Unlock()
 	bound, status, err := s.transport.BoundLinks(ctx)
@@ -361,7 +380,17 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 		held = append(held, r)
 	}
 	s.mu.Unlock()
+	staleResponse := false
 	for _, r := range held {
+		if gen, ok := pre[r.linkID]; !ok || gen != r.generationNow() {
+			// Created or re-linked while the fetch was in flight: the
+			// response predates it. Leave it alone; the retry below
+			// reconciles it against a fresh response.
+			r.log("reconcile response predates this link; will reconcile again")
+			staleResponse = true
+			delete(byID, r.linkID)
+			continue
+		}
 		b, ok := byID[r.linkID]
 		switch {
 		case !ok:
@@ -375,12 +404,18 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 		}
 		delete(byID, r.linkID)
 	}
+	if staleResponse {
+		return false
+	}
 	// A disconnect queued for a link this agent no longer holds locally: the
-	// local cleanup is already done, so confirm it.
+	// local cleanup is already done, so confirm it — but only once the
+	// cleanup actually succeeded, or the ack strands session material.
 	for _, b := range byID {
 		if b.State == waStateDisconnecting && validWhatsAppLinkID(b.LinkID) {
-			_ = wipeWhatsAppLinkDir(b.LinkID)
-			_ = deleteWhatsAppOutboxKey(b.LinkID)
+			if err := deleteWhatsAppLinkSecrets(b.LinkID); err != nil {
+				logWhatsApp(b.LinkID, "reconcile cleanup failed; unlink replay will retry")
+				continue
+			}
 			go s.sendAck(b.LinkID, b.Generation)
 		}
 	}
@@ -429,11 +464,13 @@ func (s *whatsAppSupervisor) newRunner(linkID, workspaceID string, generation in
 
 // discard stops a runner and deletes everything it had on this computer.
 // logout=true first removes the companion from the phone's Linked devices.
-// The caller holds lifecycleMu.
-func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) {
+// The caller holds lifecycleMu. It reports whether the local session
+// material (outbox key, session directory) is actually gone: callers that
+// confirm to the cloud must withhold their ack until it is.
+func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) error {
 	s.trackDiscard(1)
 	defer s.trackDiscard(-1)
-	s.discardNow(r, logout)
+	return s.discardNow(r, logout)
 }
 
 // discardAsync is discard on its own goroutine. The in-flight count is taken
@@ -463,21 +500,23 @@ func (s *whatsAppSupervisor) trackDiscard(delta int) {
 // s.links already points at the new generation's runner, and the key, the
 // directory and the map entry belong to it: deleting them would wipe the
 // just-paired session, so they are left alone.
-func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) {
+func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) error {
 	r.stop(logout)
 	_ = r.closeStores()
 	s.mu.Lock()
 	if current := s.links[r.linkID]; current != nil && current != r {
 		s.mu.Unlock()
 		r.log("wipe skipped: the link was relinked while this wipe was queued")
-		return
+		return nil
 	}
 	s.mu.Unlock()
-	if err := deleteWhatsAppOutboxKey(r.linkID); err != nil {
-		r.log("outbox key not deleted: " + err.Error())
+	keyErr := deleteWhatsAppOutboxKey(r.linkID)
+	if keyErr != nil {
+		r.log("outbox key not deleted: " + keyErr.Error())
 	}
-	if err := wipeWhatsAppLinkDir(r.linkID); err != nil {
-		r.log("session directory not deleted: " + err.Error())
+	dirErr := wipeWhatsAppLinkDir(r.linkID)
+	if dirErr != nil {
+		r.log("session directory not deleted: " + dirErr.Error())
 	}
 	s.mu.Lock()
 	if s.links[r.linkID] == r {
@@ -492,6 +531,15 @@ func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) {
 	s.pausedLinks = kept
 	s.mu.Unlock()
 	s.persist()
+	return errors.Join(keyErr, dirErr)
+}
+
+// deleteWhatsAppLinkSecrets removes a link's local session material without
+// a runner: the outbox key and the session directory. Absent material is
+// success; anything else fails so the caller can withhold its ack until a
+// replay retries the cleanup.
+func deleteWhatsAppLinkSecrets(linkID string) error {
+	return errors.Join(deleteWhatsAppOutboxKey(linkID), wipeWhatsAppLinkDir(linkID))
 }
 
 /* --------------------------------------------------------------------------
@@ -605,10 +653,17 @@ func (s *whatsAppSupervisor) unlinkLocked(linkID string, generation int64) {
 			return
 		}
 		r.log("unlinking")
-		s.discard(r, true)
-	} else {
-		_ = wipeWhatsAppLinkDir(linkID)
-		_ = deleteWhatsAppOutboxKey(linkID)
+		if err := s.discard(r, true); err != nil {
+			// Not acked: the cloud keeps the link disconnecting, so the
+			// unlink is replayed (command redelivery, reconcile) and the
+			// cleanup retried. Acking now would finish the disconnect
+			// while session material still sits on this computer.
+			r.log("unlink not confirmed: local cleanup failed, will retry on replay")
+			return
+		}
+	} else if err := deleteWhatsAppLinkSecrets(linkID); err != nil {
+		logWhatsApp(linkID, "unlink not confirmed: local cleanup failed, will retry on replay")
+		return
 	}
 	go s.sendAck(linkID, generation)
 }
@@ -1152,15 +1207,48 @@ func (r *whatsAppLinkRunner) authExpired() {
 		if client != nil {
 			client.Disconnect()
 		}
-		ctx, cancel := context.WithTimeout(r.sup.ctx, 2*time.Minute)
+		ctx, cancel := context.WithTimeout(r.sup.ctx, whatsAppAuthFlushTimeout)
 		r.flush(ctx)
 		cancel()
+		// The session is dead but the outbox is device-authenticated, so
+		// rows the bounded flush could not deliver stay queued: keep
+		// draining instead of wiping captured messages with their key.
+		// Only an empty outbox is wiped below.
+		for attempt := 0; r.outboxDepth() > 0; attempt++ {
+			if r.sup.ctx.Err() != nil || r.sup.stopping() {
+				return // shutdown owns the runner now; files stay for next boot
+			}
+			if cur := r.sup.runner(r.linkID); cur != r {
+				r.log("relinked while draining; the new generation owns cleanup")
+				return
+			}
+			select {
+			case <-r.sup.ctx.Done():
+				return
+			case <-time.After(backoffWithJitter(attempt, whatsAppUploadBackoffMin, whatsAppUploadBackoffMax)):
+			}
+			ctx, cancel := context.WithTimeout(r.sup.ctx, whatsAppAuthFlushTimeout)
+			r.flush(ctx)
+			cancel()
+		}
 		// Serialized like discardAsync: "Link again" may have paired the
 		// next generation while the flush ran, and discardNow must spare it.
 		r.sup.lifecycleMu.Lock()
 		defer r.sup.lifecycleMu.Unlock()
 		r.sup.discardNow(r, false)
 	}()
+}
+
+// outboxDepth is the queued rows still needing delivery (0 when the stores
+// are already closed).
+func (r *whatsAppLinkRunner) outboxDepth() int64 {
+	r.mu.Lock()
+	ob := r.outbox
+	r.mu.Unlock()
+	if ob == nil {
+		return 0
+	}
+	return ob.Depth()
 }
 
 // connectLoop connects a resumed link, backing off on failure. whatsmeow's own
@@ -1199,6 +1287,56 @@ func (r *whatsAppLinkRunner) normalizeContext() whatsAppNormalizeContext {
 	return nc
 }
 
+// appendHistoryChunk stores records, waiting for the uploader when the
+// outbox is at its caps. A chunk that alone exceeds the absolute caps is
+// split: no drain could ever admit it whole, so retrying it unchanged would
+// spin forever. Returns the admitted prefix length; a short return means the
+// runner stopped (or one unsatisfiable record was skipped) and the caller
+// must not count the rest as synced.
+func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []whatsAppRecord) int {
+	admitted := 0
+	for admitted < len(records) {
+		rest := records[admitted:]
+		err := ob.Append(rest, true)
+		if err == nil {
+			return len(records)
+		}
+		if !errors.Is(err, errWhatsAppOutboxFull) {
+			r.log("history chunk not stored: " + err.Error())
+			return admitted
+		}
+		if len(rest) == 1 {
+			// A single record the empty queue refuses cannot exist in
+			// practice; wedging history on it would be worse than logging it.
+			r.log("history record exceeds the outbox caps; skipped")
+			return admitted + 1
+		}
+		if int64(len(rest)) > whatsAppOutboxMaxRecords || ob.Depth() == 0 {
+			// Unsatisfiable whole: more records than the cap allows, or a
+			// chunk the empty queue still refuses (its sealed bytes alone
+			// pass the byte cap). Halving always terminates — a single
+			// record fits an empty queue.
+			half := len(rest) / 2
+			if got := r.appendHistoryChunk(ob, rest[:half]); got < half {
+				return admitted + got
+			}
+			admitted += half
+			continue
+		}
+		// At the cap: wait for the uploader to make room, then retry the
+		// same chunk — history consumption pauses, messages are not dropped.
+		// Append refuses a chunk that would overshoot the caps, so the
+		// queue never passes them however large one chunk is.
+		r.kickUploader()
+		select {
+		case <-r.ctx.Done():
+			return admitted
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return admitted
+}
+
 // onHistorySync appends one chunk. When the outbox is at its cap this BLOCKS
 // whatsmeow's event loop until the uploader makes room — pausing history
 // consumption rather than dropping messages.
@@ -1220,26 +1358,8 @@ func (r *whatsAppLinkRunner) onHistorySync(data *waHistorySync.HistorySync) {
 		return
 	}
 	records, skipped := normalizeWhatsAppHistory(data, client.ParseWebMessage, r.normalizeContext())
-	for {
-		err := ob.Append(records, true)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, errWhatsAppOutboxFull) {
-			r.log("history chunk not stored: " + err.Error())
-			return
-		}
-		// At the cap: wait for the uploader to make room, then retry the
-		// same chunk — history consumption pauses, messages are not dropped.
-		// Append refuses a chunk that would overshoot the caps, so the
-		// queue never passes them however large one chunk is.
-		r.kickUploader()
-		select {
-		case <-r.ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
+	admitted := r.appendHistoryChunk(ob, records)
+	records = records[:admitted]
 	r.mu.Lock()
 	r.historySynced += int64(countWhatsAppMessages(records))
 	r.mu.Unlock()

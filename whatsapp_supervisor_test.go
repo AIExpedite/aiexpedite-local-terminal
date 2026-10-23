@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -963,5 +964,162 @@ func TestWhatsAppSupervisorInvalidBatchDropsOnlyItsHead(t *testing.T) {
 	}
 	if len(last) != 2 || last[0] != "B2" || last[1] != "B3" {
 		t.Fatalf("the retry must carry B2 and B3, got %v", last)
+	}
+}
+
+// A link start that completes while BoundLinks is in flight is absent from
+// the response through no fault of its own: the stale response must not
+// wipe it. The reconcile reports failure so the loop retries against a
+// fresh response.
+func TestWhatsAppSupervisorReconcileSkipsLinksCreatedDuringFetch(t *testing.T) {
+	_, _ = withWhatsAppTestEnv(t)
+	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
+	sup.ctx, sup.cancel = context.WithCancel(context.Background())
+	defer sup.cancel()
+	tr := &fakeWATransport{}
+	tr.bound = []whatsAppBoundLink{{LinkID: "lnk_old", WorkspaceID: "ws", Generation: 1, State: waStateConnected}}
+	sup.links["lnk_old"] = sup.newRunner("lnk_old", "ws", 1)
+	tr.onBound = func() {
+		// A link start completing while the fetch is in flight.
+		fresh := sup.newRunner("lnk_new", "ws", 1)
+		sup.mu.Lock()
+		sup.links["lnk_new"] = fresh
+		sup.mu.Unlock()
+	}
+	sup.transport = tr
+	if sup.reconcileOnce() {
+		t.Fatal("a reconcile raced by a link start must retry, not succeed")
+	}
+	if sup.runner("lnk_new") == nil {
+		t.Fatal("the stale response wiped a link paired during the fetch")
+	}
+	if sup.runner("lnk_old") == nil {
+		t.Fatal("a bound link must survive reconcile")
+	}
+}
+
+// An auth expiry during an upload outage must not wipe captured messages:
+// the outbox survives the bounded flush and drains once the cloud is back,
+// and only then is the session wiped.
+func TestWhatsAppSupervisorAuthExpiredFlushTimeoutRetainsOutbox(t *testing.T) {
+	h, c := pairedHarness(t)
+	prevFlush := whatsAppAuthFlushTimeout
+	whatsAppAuthFlushTimeout = 50 * time.Millisecond
+	defer func() { whatsAppAuthFlushTimeout = prevFlush }()
+	var mu sync.Mutex
+	healthy := false
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if !healthy {
+			return whatsAppSyncResult{Status: 503}
+		}
+		to := int64(p["seqTo"].(float64))
+		return whatsAppSyncResult{Status: 200, Body: whatsAppSyncResponse{OK: true, AckedSeq: &to}}
+	}
+	h.transport.mu.Unlock()
+	c.emit(liveMsg(waPeer, waPeer, false, "A1", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "queued", func() bool {
+		if r := h.sup.runner("lnk_1"); r != nil {
+			return r.outboxDepth() > 0
+		}
+		return false
+	})
+	c.emit(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	// The bounded flush cannot drain against 503s: the link and its key
+	// must still be there afterwards.
+	time.Sleep(400 * time.Millisecond)
+	if r := h.sup.runner("lnk_1"); r == nil {
+		t.Fatal("auth expiry wiped a link whose outbox never drained")
+	}
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatal("auth expiry deleted the outbox key with rows still queued")
+	}
+	mu.Lock()
+	healthy = true
+	mu.Unlock()
+	waitFor(t, "drained wipe", func() bool { return h.sup.runner("lnk_1") == nil })
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("the drained session was not wiped")
+	}
+}
+
+// When the credential-store deletion fails, the unlink must not be acked:
+// the cloud keeps the link disconnecting and replays the unlink, which
+// confirms once the cleanup actually succeeds.
+func TestWhatsAppSupervisorUnlinkWithholdsAckWhenCleanupFails(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.ks.unavailable = true
+	h.sup.unlink("lnk_1", 3)
+	if acks := h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindAck }); len(acks) != 0 {
+		t.Fatalf("an unlink with failed cleanup was acked: %v", acks)
+	}
+	if _, logouts := c.count(); logouts != 1 {
+		t.Fatal("the companion must still be logged out before the retry")
+	}
+	h.ks.unavailable = false
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatal("the failed cleanup must leave the outbox key for the replay")
+	}
+	h.sup.unlink("lnk_1", 3) // replayed by the cloud
+	waitFor(t, "replayed ack", func() bool {
+		return len(h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindAck })) == 1
+	})
+	if _, err := h.ks.Get("lnk_1"); err == nil {
+		t.Fatal("the replayed unlink must delete the outbox key")
+	}
+}
+
+// A history chunk bigger than the absolute caps must be split, not retried
+// whole forever: with the uploader draining, every piece is admittable and
+// every record is delivered exactly once.
+func TestWhatsAppSupervisorOversizedHistoryChunkSplits(t *testing.T) {
+	_, _ = withWhatsAppTestEnv(t)
+	prevMax := whatsAppOutboxMaxRecords
+	whatsAppOutboxMaxRecords = 6
+	defer func() { whatsAppOutboxMaxRecords = prevMax }()
+	sup := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
+	sup.ctx, sup.cancel = context.WithCancel(context.Background())
+	defer sup.cancel()
+	tr := &fakeWATransport{}
+	sup.transport = tr
+	r := sup.newRunner("lnk_split", "ws", 1)
+	dir, err := ensureWhatsAppLinkDir("lnk_split")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_split")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	r.outbox = ob
+	r.startLoops()
+	var records []whatsAppRecord
+	for i := 0; i < 10; i++ {
+		records = append(records, textRecord("chat@s.whatsapp.net", "H"+strconv.Itoa(i), "msg"))
+	}
+	if got := r.appendHistoryChunk(ob, records); got != len(records) {
+		t.Fatalf("admitted %d of %d oversized-chunk records", got, len(records))
+	}
+	// onHistorySync kicks the uploader after every chunk; the parked loop
+	// does not poll fast enough to matter here.
+	r.kickUploader()
+	waitFor(t, "drained", func() bool { return ob.Depth() == 0 })
+	seen := map[int64]bool{}
+	for _, p := range tr.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch }) {
+		for seq := int64(p["seqFrom"].(float64)); seq <= int64(p["seqTo"].(float64)); seq++ {
+			seen[seq] = true
+		}
+	}
+	for seq := int64(1); seq <= int64(len(records)); seq++ {
+		if !seen[seq] {
+			t.Fatalf("record with deviceSeq %d was never uploaded", seq)
+		}
 	}
 }

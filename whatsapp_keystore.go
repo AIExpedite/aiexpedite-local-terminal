@@ -159,6 +159,9 @@ func (m *memoryWhatsAppKeystore) Get(account string) ([]byte, error) {
 func (m *memoryWhatsAppKeystore) Delete(account string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.unavailable {
+		return errors.New("keystore unavailable")
+	}
 	delete(m.entries, account)
 	return nil
 }
