@@ -159,7 +159,14 @@ func (s *whatsAppSupervisor) runner(linkID string) *whatsAppLinkRunner {
 	return s.links[linkID]
 }
 
+// persistMu makes "snapshot the map, write links.json" one step: two
+// interleaved persists could otherwise land an older snapshot last and re-list
+// a link a concurrent wipe just removed.
+var whatsAppPersistMu sync.Mutex
+
 func (s *whatsAppSupervisor) persist() {
+	whatsAppPersistMu.Lock()
+	defer whatsAppPersistMu.Unlock()
 	s.mu.Lock()
 	out := make([]whatsAppLocalLink, 0, len(s.links))
 	for _, r := range s.links {
@@ -452,7 +459,7 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		runners = append(runners, r)
 	}
 	s.mu.Unlock()
-	defer s.waitDiscards()
+	defer s.waitDiscards(ctx)
 	if len(runners) == 0 {
 		if s.cancel != nil {
 			s.cancel()
@@ -491,9 +498,15 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.persist()
 }
 
-// waitDiscards waits (bounded) for wipes already in flight.
-func (s *whatsAppSupervisor) waitDiscards() {
+// waitDiscards waits for wipes already in flight, at most 5 s and never past
+// the caller's own deadline (Windows gives the whole shutdown 2–4 s).
+func (s *whatsAppSupervisor) waitDiscards(ctx context.Context) {
 	deadline := time.Now().Add(5 * time.Second)
+	if ctx != nil {
+		if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+			deadline = dl
+		}
+	}
 	for time.Now().Before(deadline) {
 		s.mu.Lock()
 		n := s.discardsInFlight

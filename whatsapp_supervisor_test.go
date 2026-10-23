@@ -615,3 +615,22 @@ func TestWhatsAppSupervisorShutdownWaitsForAFencedFlushWipe(t *testing.T) {
 		t.Fatal("shutdown returned before the fenced session was wiped")
 	}
 }
+
+// A wipe that never finishes cannot hold shutdown past the caller's deadline.
+func TestWhatsAppSupervisorWaitDiscardsHonoursTheDeadline(t *testing.T) {
+	s := &whatsAppSupervisor{}
+	s.trackDiscard(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	s.waitDiscards(ctx)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("waited %v past a 100ms deadline", took)
+	}
+	s.trackDiscard(-1)
+	start = time.Now()
+	s.waitDiscards(context.Background())
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatal("nothing in flight must not wait")
+	}
+}
