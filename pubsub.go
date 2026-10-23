@@ -1037,13 +1037,13 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 }
 
 // isInternalDemandCommand reports whether cmd is a server-internal, read-only
-// demand command (CLI-usage refresh, environment inspection, or a CLI smoke
-// probe). These are exempt from staleness and rate-limiting because they are
+// demand command (CLI-usage refresh, environment inspection, a CLI smoke
+// probe, or a WhatsApp link command — whatsapp_commands.go). These are exempt from staleness and rate-limiting because they are
 // dispatched by the backend's own state machines (not the LLM) and MUST always
 // run so the correlated result clears the backend's in-flight / pending marker.
 func isInternalDemandCommand(command string) bool {
 	return command == "__cli_usage_refresh__" || command == "__env_inspect__" ||
-		command == cliSmokeCommand
+		command == cliSmokeCommand || isWhatsAppCommand(command)
 }
 
 func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
@@ -1365,6 +1365,10 @@ func invalidateRegistration(cfg *Config, reason string) {
 	}
 	fmt.Printf("%s[pubsub] %s%s\n", colorRed, reason, colorReset)
 	fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
+
+	// A deregistered computer keeps no WhatsApp session: log every link out
+	// and wipe it before the credentials go.
+	globalWhatsAppSupervisor.WipeAll()
 
 	if err := cfg.MutateAndSave(ConfigPath(), func() {
 		cfg.AgentID = ""
@@ -2405,6 +2409,16 @@ func runPubSubConnection(cfg *Config) error {
 			} else {
 				m.Ack()
 			}
+			return
+		}
+
+		if isWhatsAppCommand(cmd.Command) {
+			// Personal WhatsApp link commands (whatsapp_commands.go). The
+			// device reports back over POST /device/:agentId/whatsapp/sync,
+			// so nothing is published here; the message is acked once the
+			// supervisor has the command.
+			handleWhatsAppCommand(cmd)
+			m.Ack()
 			return
 		}
 

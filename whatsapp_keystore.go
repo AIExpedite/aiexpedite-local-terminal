@@ -34,10 +34,10 @@ type whatsAppKeystore interface {
 }
 
 var (
-	whatsAppKeystoreMu      sync.Mutex
-	activeWhatsAppKeystore  whatsAppKeystore = platformWhatsAppKeystore{}
-	whatsAppKeystoreProbed  bool
-	whatsAppKeystoreUsable  bool
+	whatsAppKeystoreMu     sync.Mutex
+	activeWhatsAppKeystore whatsAppKeystore = platformWhatsAppKeystore{}
+	whatsAppKeystoreProbed bool
+	whatsAppKeystoreUsable bool
 )
 
 func currentWhatsAppKeystore() whatsAppKeystore {

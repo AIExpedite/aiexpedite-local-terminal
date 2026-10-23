@@ -87,9 +87,11 @@ func openWhatsmeowClient(dir string) (whatsAppClient, error) {
 	return &whatsmeowClient{cli: cli, db: db}, nil
 }
 
-func (c *whatsmeowClient) AddEventHandler(h func(any)) { c.cli.AddEventHandler(func(evt any) { h(evt) }) }
-func (c *whatsmeowClient) Connect() error              { return c.cli.Connect() }
-func (c *whatsmeowClient) Disconnect()                 { c.cli.Disconnect() }
+func (c *whatsmeowClient) AddEventHandler(h func(any)) {
+	c.cli.AddEventHandler(func(evt any) { h(evt) })
+}
+func (c *whatsmeowClient) Connect() error { return c.cli.Connect() }
+func (c *whatsmeowClient) Disconnect()    { c.cli.Disconnect() }
 func (c *whatsmeowClient) Logout(ctx context.Context) error {
 	return c.cli.Logout(ctx)
 }
@@ -147,10 +149,15 @@ func whatsAppClientVersion() string {
 // in any whatsmeow line that quotes one.
 var whatsAppJIDPattern = regexp.MustCompile(`\+?[0-9]{5,}(?:[.:][0-9]+)*@(?:s\.whatsapp\.net|lid|g\.us|c\.us|broadcast|newsletter)`)
 
-// redactWhatsAppLog is redactAgentSecrets (which already masks QR refs and
-// pair codes) plus WhatsApp addresses.
+// whatsAppPairCodePattern is the 8-character phone pairing code ("ABCD-EFGH").
+var whatsAppPairCodePattern = regexp.MustCompile(`\b[A-Z0-9]{4}-[A-Z0-9]{4}\b`)
+
+// redactWhatsAppLog is redactAgentSecrets (which masks QR refs) plus pair codes
+// and WhatsApp addresses.
 func redactWhatsAppLog(s string) string {
-	return whatsAppJIDPattern.ReplaceAllString(redactAgentSecrets(s), "[jid]")
+	out := redactAgentSecrets(s)
+	out = whatsAppPairCodePattern.ReplaceAllString(out, "[pair-code]")
+	return whatsAppJIDPattern.ReplaceAllString(out, "[jid]")
 }
 
 func logWhatsApp(linkID, event string) {

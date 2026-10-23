@@ -10,7 +10,7 @@ type platformWhatsAppKeystore struct{}
 
 var errWhatsAppNoKeystore = errors.New("no OS credential store")
 
-func (platformWhatsAppKeystore) Available() bool                 { return false }
-func (platformWhatsAppKeystore) Put(string, []byte) error        { return errWhatsAppNoKeystore }
-func (platformWhatsAppKeystore) Get(string) ([]byte, error)      { return nil, errWhatsAppNoKeystore }
-func (platformWhatsAppKeystore) Delete(string) error             { return errWhatsAppNoKeystore }
+func (platformWhatsAppKeystore) Available() bool            { return false }
+func (platformWhatsAppKeystore) Put(string, []byte) error   { return errWhatsAppNoKeystore }
+func (platformWhatsAppKeystore) Get(string) ([]byte, error) { return nil, errWhatsAppNoKeystore }
+func (platformWhatsAppKeystore) Delete(string) error        { return errWhatsAppNoKeystore }
