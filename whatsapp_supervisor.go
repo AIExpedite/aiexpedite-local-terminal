@@ -114,9 +114,11 @@ type whatsAppSupervisor struct {
 	links     map[string]*whatsAppLinkRunner
 	started   bool
 	stopped   bool
-	// discards tracks wipes in flight, so shutdown never exits halfway
-	// through deleting a session (keys gone, directory still there).
-	discards sync.WaitGroup
+	// discardsInFlight counts wipes in flight (under mu), so shutdown never
+	// exits halfway through deleting a session (key gone, directory still
+	// there). A counter, not a WaitGroup: a fenced flush can start a discard
+	// while shutdown is already waiting, and WaitGroup forbids Add then.
+	discardsInFlight int
 }
 
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
@@ -271,8 +273,29 @@ func (s *whatsAppSupervisor) newRunner(linkID, workspaceID string, generation in
 // discard stops a runner and deletes everything it had on this computer.
 // logout=true first removes the companion from the phone's Linked devices.
 func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) {
-	s.discards.Add(1)
-	defer s.discards.Done()
+	s.trackDiscard(1)
+	defer s.trackDiscard(-1)
+	s.discardNow(r, logout)
+}
+
+// discardAsync is discard on its own goroutine. The in-flight count is taken
+// BEFORE the goroutine starts, so a shutdown that is already waiting cannot
+// miss it.
+func (s *whatsAppSupervisor) discardAsync(r *whatsAppLinkRunner, logout bool) {
+	s.trackDiscard(1)
+	go func() {
+		defer s.trackDiscard(-1)
+		s.discardNow(r, logout)
+	}()
+}
+
+func (s *whatsAppSupervisor) trackDiscard(delta int) {
+	s.mu.Lock()
+	s.discardsInFlight += delta
+	s.mu.Unlock()
+}
+
+func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) {
 	r.stop(logout)
 	_ = r.closeStores()
 	if err := deleteWhatsAppOutboxKey(r.linkID); err != nil {
@@ -470,11 +493,15 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 
 // waitDiscards waits (bounded) for wipes already in flight.
 func (s *whatsAppSupervisor) waitDiscards() {
-	done := make(chan struct{})
-	go func() { s.discards.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		n := s.discardsInFlight
+		s.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -695,7 +722,7 @@ func (r *whatsAppLinkRunner) closeStores() error {
 // generation. Terminal — logged out, wiped, never retried.
 func (r *whatsAppLinkRunner) fence() {
 	r.log("fenced by the cloud; wiping this session")
-	go r.sup.discard(r, true)
+	r.sup.discardAsync(r, true)
 }
 
 /* -------------------------------- pairing -------------------------------- */
@@ -759,7 +786,7 @@ func (r *whatsAppLinkRunner) pair(method, browserPub, phone string) {
 func (r *whatsAppLinkRunner) pairingFailed() {
 	r.setState(waStatePairingRequired, "")
 	r.reportState(nil)
-	go r.sup.discard(r, false)
+	r.sup.discardAsync(r, false)
 }
 
 func (r *whatsAppLinkRunner) postPairing(browserPub, method, code string, ttl time.Duration) {
@@ -891,7 +918,11 @@ func (r *whatsAppLinkRunner) authExpired() {
 	r.sup.persist()
 	r.reportState(nil)
 	r.log("authentication expired")
+	// Counted as a wipe in flight from now: shutdown cancels the supervisor
+	// context (ending the flush below) and then waits for the wipe.
+	r.sup.trackDiscard(1)
 	go func() {
+		defer r.sup.trackDiscard(-1)
 		// The flush is the only uploader from here on.
 		r.cancel()
 		r.waitLoops()
@@ -901,7 +932,7 @@ func (r *whatsAppLinkRunner) authExpired() {
 		ctx, cancel := context.WithTimeout(r.sup.ctx, 2*time.Minute)
 		r.flush(ctx)
 		cancel()
-		r.sup.discard(r, false)
+		r.sup.discardNow(r, false)
 	}()
 }
 

@@ -580,3 +580,38 @@ func TestWhatsAppSupervisorShutdownFlushesThePendingOutbox(t *testing.T) {
 		t.Fatalf("the pending range must be flushed exactly once, got %d accepted uploads", acked)
 	}
 }
+
+// A flush fenced (409) during shutdown starts a discard while shutdown is
+// already waiting; shutdown must wait for it rather than race it.
+func TestWhatsAppSupervisorShutdownWaitsForAFencedFlushWipe(t *testing.T) {
+	h, c := pairedHarness(t)
+	var mu sync.Mutex
+	fenced := false
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if fenced {
+			return whatsAppSyncResult{Status: 409, Body: whatsAppSyncResponse{Code: waErrLinkFenced}}
+		}
+		return whatsAppSyncResult{Status: 503}
+	}
+	h.transport.mu.Unlock()
+	c.emit(liveMsg(waPeer, waPeer, false, "F2", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "a refused upload", func() bool {
+		return len(h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch })) >= 1
+	})
+	mu.Lock()
+	fenced = true
+	mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.sup.ShutdownAll(ctx)
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatal("shutdown returned before the fenced session was wiped")
+	}
+}
