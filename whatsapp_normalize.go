@@ -344,8 +344,9 @@ func whatsAppContent(msg *waE2E.Message) (string, string, *whatsAppMedia, string
 
 // normalizeWhatsAppGroupInfo turns join / leave notices into system records.
 // The participants are not written into the text — the thread says "joined" /
-// "left" against the participant as sender.
-func normalizeWhatsAppGroupInfo(evt *events.GroupInfo) []whatsAppRecord {
+// "left" against the participant as sender, resolved through the store's LID
+// mapping so it matches the identity that member's messages normalize to.
+func normalizeWhatsAppGroupInfo(evt *events.GroupInfo, nc whatsAppNormalizeContext) []whatsAppRecord {
 	if evt == nil || evt.JID.IsEmpty() {
 		return nil
 	}
@@ -354,7 +355,7 @@ func normalizeWhatsAppGroupInfo(evt *events.GroupInfo) []whatsAppRecord {
 	var out []whatsAppRecord
 	add := func(list []types.JID, verb string) {
 		for _, p := range list {
-			who := canonicalWhatsAppUser(p, types.EmptyJID).String()
+			who := nc.canonicalUser(p, types.EmptyJID).String()
 			out = append(out, whatsAppRecord{
 				Kind: waRecordMessage, Op: waOpNew, ChatJid: chat, SenderJid: who,
 				// No WhatsApp id exists for a notification: one is derived from

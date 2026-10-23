@@ -21,6 +21,10 @@ import (
 
 const whatsAppKeystoreService = "aiexpedite-whatsapp"
 
+// whatsAppKeystoreProbeAccount is the entry the CLI-backed stores (macOS,
+// Linux) write, read back and delete to prove they can hold a key.
+const whatsAppKeystoreProbeAccount = "availability-probe"
+
 var errWhatsAppKeyNotFound = errors.New("whatsapp outbox key not found")
 
 // whatsAppKeystore is the credential-store seam. The platform implementation

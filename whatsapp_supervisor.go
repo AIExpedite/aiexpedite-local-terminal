@@ -1343,7 +1343,7 @@ func (r *whatsAppLinkRunner) handleEvent(raw any) {
 	case *events.Message:
 		r.onLiveMessage(evt)
 	case *events.GroupInfo:
-		r.appendLive(normalizeWhatsAppGroupInfo(evt))
+		r.appendLive(normalizeWhatsAppGroupInfo(evt, r.normalizeContext()))
 	case *events.LoggedOut:
 		if evt.Reason == events.ConnectFailureUnknownLogout {
 			r.terminal(waStateError, waErrAccountRestricted)

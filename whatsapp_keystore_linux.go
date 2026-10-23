@@ -16,8 +16,6 @@ import (
 
 type platformWhatsAppKeystore struct{}
 
-const whatsAppKeystoreProbeAccount = "availability-probe"
-
 // Available proves a full round trip, because `secret-tool` on PATH says
 // nothing about whether a provider answers on the session bus.
 func (ks platformWhatsAppKeystore) Available() bool {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os/exec"
 )
@@ -15,9 +16,20 @@ type platformWhatsAppKeystore struct{}
 
 const securityItemNotFound = 44 // errSecItemNotFound as `security` exits
 
-func (platformWhatsAppKeystore) Available() bool {
-	_, err := exec.LookPath("security")
-	return err == nil
+// Available proves a full round trip, because `security` on PATH says nothing
+// about whether the Keychain accepts a write (a locked or noninteractive
+// session refuses it).
+func (ks platformWhatsAppKeystore) Available() bool {
+	if _, err := exec.LookPath("security"); err != nil {
+		return false
+	}
+	probe := []byte("probe")
+	if err := ks.Put(whatsAppKeystoreProbeAccount, probe); err != nil {
+		return false
+	}
+	defer ks.Delete(whatsAppKeystoreProbeAccount)
+	got, err := ks.Get(whatsAppKeystoreProbeAccount)
+	return err == nil && bytes.Equal(got, probe)
 }
 
 func (platformWhatsAppKeystore) Put(account string, secret []byte) error {

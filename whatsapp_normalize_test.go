@@ -246,12 +246,29 @@ func TestNormalizeHistoryChunk(t *testing.T) {
 }
 
 func TestNormalizeGroupInfoJoinLeave(t *testing.T) {
-	recs := normalizeWhatsAppGroupInfo(&events.GroupInfo{JID: waGroup, Timestamp: waTS, Join: []types.JID{waPeer}, Leave: []types.JID{waMe}})
+	recs := normalizeWhatsAppGroupInfo(&events.GroupInfo{JID: waGroup, Timestamp: waTS, Join: []types.JID{waPeer}, Leave: []types.JID{waMe}}, whatsAppNormalizeContext{})
 	if len(recs) != 2 || recs[0].Text != "joined" || recs[1].Text != "left" || recs[0].Type != waTypeSystem {
 		t.Fatalf("group info = %+v", recs)
 	}
 	if recs[0].WaMessageID == "" || recs[0].SenderJid == recs[1].SenderJid {
 		t.Fatal("system records need distinct identities")
+	}
+}
+
+// A live join by an @lid participant resolves through the store's mapping, to
+// the same identity the member's messages and history notices normalize to.
+func TestNormalizeGroupInfoResolvesLIDParticipants(t *testing.T) {
+	lid := types.NewJID("999888777", types.HiddenUserServer)
+	nc := whatsAppNormalizeContext{PNForLID: func(j types.JID) types.JID {
+		if j == lid {
+			return waPeer
+		}
+		return types.EmptyJID
+	}}
+	joiner := types.JID{User: "999888777", Device: 3, Server: types.HiddenUserServer}
+	recs := normalizeWhatsAppGroupInfo(&events.GroupInfo{JID: waGroup, Timestamp: waTS, Join: []types.JID{joiner}}, nc)
+	if len(recs) != 1 || recs[0].SenderJid != waPeer.String() {
+		t.Fatalf("group info = %+v", recs)
 	}
 }
 
