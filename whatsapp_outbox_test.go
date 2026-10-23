@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -167,6 +168,53 @@ func TestWhatsAppOutboxHistoryPausesAtCapLiveStillAccepted(t *testing.T) {
 	}
 	if ob.Depth() != 3 {
 		t.Fatalf("depth %d", ob.Depth())
+	}
+}
+
+// A history chunk that would push the queue past a cap is refused whole:
+// nothing is stored, so the supervisor's retry replays the same chunk once
+// the uploader makes room.
+func TestWhatsAppOutboxHistoryChunkPastCapRefusedWhole(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	prevRec, prevBytes := whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes
+	whatsAppOutboxMaxRecords = 4
+	defer func() { whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes = prevRec, prevBytes }()
+	ob, _ := openTestOutbox(t, "lnk_overshoot")
+	defer ob.Close()
+	queued := []whatsAppRecord{textRecord("1@s.whatsapp.net", "A", "h1"), textRecord("1@s.whatsapp.net", "B", "h2"), textRecord("1@s.whatsapp.net", "C", "h3")}
+	if err := ob.Append(queued, true); err != nil {
+		t.Fatal(err)
+	}
+	// Three queued and three incoming would make six: the whole chunk is
+	// refused even though three alone is under the cap of four.
+	chunk := []whatsAppRecord{textRecord("1@s.whatsapp.net", "D", "h4"), textRecord("1@s.whatsapp.net", "E", "h5"), textRecord("1@s.whatsapp.net", "F", "h6")}
+	if err := ob.Append(chunk, true); !errors.Is(err, errWhatsAppOutboxFull) {
+		t.Fatalf("overshooting history chunk: %v", err)
+	}
+	if ob.Depth() != 3 {
+		t.Fatalf("a refused chunk stored rows: depth %d", ob.Depth())
+	}
+	// The same chunk lands once the uploader makes room for all of it.
+	if err := ob.Ack(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := ob.Append(chunk, true); err != nil {
+		t.Fatalf("chunk fitting after an ack: %v", err)
+	}
+	if ob.Depth() != 4 {
+		t.Fatalf("depth %d", ob.Depth())
+	}
+	// The byte cap counts the same way: with record room to spare, a chunk
+	// past the byte cap is still refused whole.
+	whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes = 100, 1
+	if err := ob.Append([]whatsAppRecord{textRecord("1@s.whatsapp.net", "G", "h7")}, true); !errors.Is(err, errWhatsAppOutboxFull) {
+		t.Fatalf("history past the byte cap: %v", err)
+	}
+	if ob.Depth() != 4 {
+		t.Fatalf("a refused chunk stored rows: depth %d", ob.Depth())
+	}
+	if err := ob.Append([]whatsAppRecord{textRecord("1@s.whatsapp.net", "H", "live")}, false); err != nil {
+		t.Fatalf("live refused at the byte cap: %v", err)
 	}
 }
 

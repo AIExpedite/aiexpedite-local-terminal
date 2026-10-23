@@ -151,17 +151,18 @@ func (ob *whatsAppOutbox) aad(seq int64) []byte {
 }
 
 // Append assigns each record the next sequence (its deviceSeq), seals it and
-// stores the lot in one transaction. History appends past the caps are
-// refused whole with errWhatsAppOutboxFull; live appends always land.
+// stores the lot in one transaction. A history append is refused whole with
+// errWhatsAppOutboxFull when the queued rows PLUS this chunk would pass the
+// caps — admitting a chunk on its starting depth alone could overshoot them
+// by the whole chunk. The staged rows roll back, so a refused chunk leaves
+// the queue exactly as it was and the caller retries it later. Live appends
+// always land.
 func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	if len(records) == 0 {
 		return nil
 	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
-	if history && (ob.count >= whatsAppOutboxMaxRecords || ob.bytes >= whatsAppOutboxMaxBytes) {
-		return errWhatsAppOutboxFull
-	}
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -187,6 +188,9 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		}
 		addedBytes += int64(len(sealed))
 		seq++
+	}
+	if history && (ob.count+int64(len(records)) > whatsAppOutboxMaxRecords || ob.bytes+addedBytes > whatsAppOutboxMaxBytes) {
+		return errWhatsAppOutboxFull
 	}
 	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES ('next', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
 		strconv.FormatInt(seq, 10)); err != nil {

@@ -737,3 +737,84 @@ func TestWhatsAppSupervisorWaitDiscardsHonoursTheDeadline(t *testing.T) {
 		t.Fatal("nothing in flight must not wait")
 	}
 }
+
+// A wipe queued before a re-link (fenced generation, failed pairing) runs
+// either fully before the link start or fully after it — never through it.
+// In the "after" case the queued wipe must spare the new generation's
+// session entirely.
+func TestWhatsAppSupervisorStaleAsyncWipeSparesTheRelink(t *testing.T) {
+	h, _ := pairedHarness(t) // generation 2
+	old := h.sup.runner("lnk_1")
+	if old == nil {
+		t.Fatal("no runner to wipe")
+	}
+	// The queued wipe serializes behind the lifecycle lock: while the test
+	// holds it, the wipe must not touch the runner.
+	h.sup.lifecycleMu.Lock()
+	h.sup.discardAsync(old, true) // the generation-2 wipe, queued
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for h.sup.runner("lnk_1") == old && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.sup.runner("lnk_1") != old {
+		h.sup.lifecycleMu.Unlock()
+		t.Fatal("an async wipe ran through the held lifecycle lock")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(dir); err != nil {
+		h.sup.lifecycleMu.Unlock()
+		t.Fatal("an async wipe deleted the session while blocked on the lifecycle lock")
+	}
+	h.sup.lifecycleMu.Unlock()
+	// Re-link: whatever order the queued wipe and the link start settle in,
+	// the new generation's session survives.
+	_, pub := newBrowserKey(t)
+	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 3, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub})
+	next := h.sup.runner("lnk_1")
+	if next == nil || next == old {
+		t.Fatal("the re-link left no new runner")
+	}
+	waitFor(t, "stale wipe done", func() bool {
+		h.sup.mu.Lock()
+		defer h.sup.mu.Unlock()
+		return h.sup.discardsInFlight == 0
+	})
+	if h.sup.runner("lnk_1") != next {
+		t.Fatal("a stale queued wipe removed the relinked runner")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("a stale queued wipe deleted the relinked session directory")
+	}
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatal("a stale queued wipe deleted the relinked outbox key")
+	}
+}
+
+// failingSince may predate a terminal error (a transient failure, then an
+// outdated client or a restricted account). The connect-failing timer must
+// not overwrite the terminal code with WHATSAPP_CONNECT_FAILING: recovery
+// needs an upgrade or account action, not a retry.
+func TestWhatsAppSupervisorTerminalErrorSurvivesConnectFailingTimer(t *testing.T) {
+	h, c := pairedHarness(t)
+	c.emit(&events.Disconnected{})
+	time.Sleep(50 * time.Millisecond) // let noteFailing record failingSince
+	c.emit(&events.TemporaryBan{Code: events.TempBanSentToTooManyPeople, Expire: time.Hour})
+	waitFor(t, "restricted", func() bool {
+		return len(h.transport.find(func(p map[string]any) bool { return p["errorCode"] == waErrAccountRestricted })) == 1
+	})
+	r := h.sup.runner("lnk_1")
+	if r == nil {
+		t.Fatal("a restricted link must stay for a clean disconnect")
+	}
+	// The terminal path disconnects asynchronously: only once the client is
+	// down does the timer see the link as not connected.
+	waitFor(t, "client down", func() bool { return !c.IsConnected() })
+	r.checkTimers(time.Now().Add(whatsAppConnectFailingAfter + time.Minute))
+	time.Sleep(100 * time.Millisecond)
+	if got := h.transport.find(func(p map[string]any) bool { return p["errorCode"] == waErrConnectFailing }); len(got) != 0 {
+		t.Fatalf("a terminal code was overwritten: %v", got)
+	}
+	if r.terminalError != waErrAccountRestricted {
+		t.Fatalf("terminalError = %q", r.terminalError)
+	}
+}

@@ -124,7 +124,10 @@ type whatsAppSupervisor struct {
 	// wipe/open and a map change; two interleaved could both see no runner,
 	// pair two clients on the same stores and leave one untracked. Commands
 	// arrive on concurrent Pub/Sub callbacks, so this lock is what keeps
-	// "one link per computer" true. Never taken under mu.
+	// "one link per computer" true. Wipes queued on other goroutines
+	// (fence, pairing failure, authExpired) take it too: an asynchronous
+	// wipe must never interleave with a re-link for the same link.
+	// Never taken under mu.
 	lifecycleMu sync.Mutex
 	// paused: the user disconnected this agent from the cloud. pausedLinks
 	// are the links held at the pause; persist keeps them in links.json.
@@ -386,6 +389,7 @@ func (s *whatsAppSupervisor) newRunner(linkID, workspaceID string, generation in
 
 // discard stops a runner and deletes everything it had on this computer.
 // logout=true first removes the companion from the phone's Linked devices.
+// The caller holds lifecycleMu.
 func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) {
 	s.trackDiscard(1)
 	defer s.trackDiscard(-1)
@@ -394,11 +398,15 @@ func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) {
 
 // discardAsync is discard on its own goroutine. The in-flight count is taken
 // BEFORE the goroutine starts, so a shutdown that is already waiting cannot
-// miss it.
+// miss it. The goroutine takes lifecycleMu: a wipe queued here (fence,
+// pairing failure) must not run while a link start pairs the next
+// generation, and discardNow's ownership check then spares it.
 func (s *whatsAppSupervisor) discardAsync(r *whatsAppLinkRunner, logout bool) {
 	s.trackDiscard(1)
 	go func() {
 		defer s.trackDiscard(-1)
+		s.lifecycleMu.Lock()
+		defer s.lifecycleMu.Unlock()
 		s.discardNow(r, logout)
 	}()
 }
@@ -409,9 +417,22 @@ func (s *whatsAppSupervisor) trackDiscard(delta int) {
 	s.mu.Unlock()
 }
 
+// discardNow is the destructive half of discard. The caller holds
+// lifecycleMu, so a wipe queued before a re-link runs either fully before
+// the link start or fully after it — never through it. In the "after" case
+// s.links already points at the new generation's runner, and the key, the
+// directory and the map entry belong to it: deleting them would wipe the
+// just-paired session, so they are left alone.
 func (s *whatsAppSupervisor) discardNow(r *whatsAppLinkRunner, logout bool) {
 	r.stop(logout)
 	_ = r.closeStores()
+	s.mu.Lock()
+	if current := s.links[r.linkID]; current != nil && current != r {
+		s.mu.Unlock()
+		r.log("wipe skipped: the link was relinked while this wipe was queued")
+		return
+	}
+	s.mu.Unlock()
 	if err := deleteWhatsAppOutboxKey(r.linkID); err != nil {
 		r.log("outbox key not deleted: " + err.Error())
 	}
@@ -1094,6 +1115,10 @@ func (r *whatsAppLinkRunner) authExpired() {
 		ctx, cancel := context.WithTimeout(r.sup.ctx, 2*time.Minute)
 		r.flush(ctx)
 		cancel()
+		// Serialized like discardAsync: "Link again" may have paired the
+		// next generation while the flush ran, and discardNow must spare it.
+		r.sup.lifecycleMu.Lock()
+		defer r.sup.lifecycleMu.Unlock()
 		r.sup.discardNow(r, false)
 	}()
 }
@@ -1155,17 +1180,25 @@ func (r *whatsAppLinkRunner) onHistorySync(data *waHistorySync.HistorySync) {
 		return
 	}
 	records, skipped := normalizeWhatsAppHistory(data, client.ParseWebMessage, r.normalizeContext())
-	for !ob.HasRoomForHistory() {
+	for {
+		err := ob.Append(records, true)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errWhatsAppOutboxFull) {
+			r.log("history chunk not stored: " + err.Error())
+			return
+		}
+		// At the cap: wait for the uploader to make room, then retry the
+		// same chunk — history consumption pauses, messages are not dropped.
+		// Append refuses a chunk that would overshoot the caps, so the
+		// queue never passes them however large one chunk is.
 		r.kickUploader()
 		select {
 		case <-r.ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
 		}
-	}
-	if err := ob.Append(records, true); err != nil {
-		r.log("history chunk not stored: " + err.Error())
-		return
 	}
 	r.mu.Lock()
 	r.historySynced += int64(countWhatsAppMessages(records))
@@ -1505,6 +1538,7 @@ func (r *whatsAppLinkRunner) heartbeatLoop() {
 func (r *whatsAppLinkRunner) checkTimers(now time.Time) {
 	r.mu.Lock()
 	state, failingSince, code := r.state, r.failingSince, r.errorCode
+	terminal := r.terminalError
 	lastHistory := r.lastHistoryAt
 	if lastHistory.IsZero() {
 		lastHistory = r.connectedAt
@@ -1528,7 +1562,10 @@ func (r *whatsAppLinkRunner) checkTimers(now time.Time) {
 		}
 		return
 	}
-	if !failingSince.IsZero() && now.Sub(failingSince) >= whatsAppConnectFailingAfter && code != waErrConnectFailing {
+	// A terminal error (outdated client, restricted account) needs an
+	// upgrade or account action, not a retry: failingSince may predate it
+	// from an earlier transient failure, but the terminal code must stand.
+	if terminal == "" && !failingSince.IsZero() && now.Sub(failingSince) >= whatsAppConnectFailingAfter && code != waErrConnectFailing {
 		r.setState(waStateError, waErrConnectFailing)
 		r.reportState(nil)
 		r.log("still failing to connect; retrying")
