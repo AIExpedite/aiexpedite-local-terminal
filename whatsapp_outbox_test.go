@@ -239,3 +239,38 @@ func TestWhatsAppOutboxBatchRespectsByteBudget(t *testing.T) {
 		t.Fatalf("batch of %d records / %d bytes exceeds the budget", len(batch.Records), total)
 	}
 }
+
+// A refusal names its cause under the outbox lock: a chunk the EMPTY queue
+// refuses passes a cap on its own (no wait can admit it), while a refusal of
+// a non-empty queue at its cap is plain errWhatsAppOutboxFull (wait for room).
+func TestWhatsAppOutboxRefusalTellsChunkTooLargeFromQueueFull(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	prevRec, prevBytes := whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes
+	whatsAppOutboxMaxRecords = 2
+	defer func() { whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes = prevRec, prevBytes }()
+	ob, _ := openTestOutbox(t, "lnk_refusal")
+	defer ob.Close()
+	three := []whatsAppRecord{textRecord("1@s.whatsapp.net", "A", "h1"), textRecord("1@s.whatsapp.net", "B", "h2"), textRecord("1@s.whatsapp.net", "C", "h3")}
+	err := ob.Append(three, true)
+	if !errors.Is(err, errWhatsAppOutboxChunkTooLarge) || !errors.Is(err, errWhatsAppOutboxFull) {
+		t.Fatalf("a chunk over the record cap on an empty queue: %v", err)
+	}
+	if err := ob.Append([]whatsAppRecord{textRecord("1@s.whatsapp.net", "L", "live")}, false); err != nil {
+		t.Fatal(err)
+	}
+	err = ob.Append(three[:2], true)
+	if !errors.Is(err, errWhatsAppOutboxFull) || errors.Is(err, errWhatsAppOutboxChunkTooLarge) {
+		t.Fatalf("a chunk refused only because rows are queued: %v", err)
+	}
+	// The byte cap is judged the same way.
+	whatsAppOutboxMaxRecords, whatsAppOutboxMaxBytes = 100, 1
+	if err := ob.Ack(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ob.Append(three[:1], true); !errors.Is(err, errWhatsAppOutboxChunkTooLarge) {
+		t.Fatalf("a record over the byte cap on an empty queue: %v", err)
+	}
+	if ob.Depth() != 0 {
+		t.Fatalf("a refused chunk stored rows: depth %d", ob.Depth())
+	}
+}

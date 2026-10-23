@@ -128,6 +128,9 @@ type memoryWhatsAppKeystore struct {
 	mu          sync.Mutex
 	entries     map[string][]byte
 	unavailable bool
+	// locked makes reads fail too, as a locked or unresponsive keyring's
+	// would (unavailable alone fails only writes and deletes).
+	locked bool
 }
 
 func newMemoryWhatsAppKeystore() *memoryWhatsAppKeystore {
@@ -149,6 +152,9 @@ func (m *memoryWhatsAppKeystore) Put(account string, secret []byte) error {
 func (m *memoryWhatsAppKeystore) Get(account string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.locked {
+		return nil, errors.New("keystore locked")
+	}
 	v, ok := m.entries[account]
 	if !ok {
 		return nil, errWhatsAppKeyNotFound

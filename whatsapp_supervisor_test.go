@@ -1431,3 +1431,66 @@ func TestWhatsAppSupervisorCloudPauseNeverPersistsAnEmptyManifest(t *testing.T) 
 		t.Fatalf("a persist racing the pause forgot the paused link: %+v %v", local, err)
 	}
 }
+
+// A link whose stores cannot be opened at boot (here: the credential store
+// is locked) must not be wiped: it stays in links.json with its session,
+// key and queued rows, and resumes once the store answers again.
+func TestWhatsAppSupervisorResumeHoldsALinkWhoseStoresCannotOpen(t *testing.T) {
+	h := newSupervisorHarness(t)
+	prevMin, prevMax := whatsAppResumeRetryMin, whatsAppResumeRetryMax
+	whatsAppResumeRetryMin, whatsAppResumeRetryMax = 5*time.Millisecond, 20*time.Millisecond
+	defer func() { whatsAppResumeRetryMin, whatsAppResumeRetryMax = prevMin, prevMax }()
+	ob, dir := openTestOutbox(t, "lnk_held")
+	if err := ob.Append([]whatsAppRecord{textRecord(waPeer.String(), "Q1", "queued before the restart")}, false); err != nil {
+		t.Fatal(err)
+	}
+	ob.Close()
+	_ = saveWhatsAppLocalLinks([]whatsAppLocalLink{{LinkID: "lnk_held", WorkspaceID: "ws", Generation: 5, State: waStateConnected, HistoryComplete: true}})
+	h.session = true
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_held", WorkspaceID: "ws", Generation: 5, State: waStateConnected}}
+	h.ks.mu.Lock()
+	h.ks.locked = true
+	h.ks.mu.Unlock()
+	h.sup.start(h.transport)
+	time.Sleep(100 * time.Millisecond) // several retries fail meanwhile
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("a store that could not open wiped the session directory")
+	}
+	h.ks.mu.Lock()
+	_, kept := h.ks.entries["lnk_held"]
+	h.ks.mu.Unlock()
+	if !kept {
+		t.Fatal("a store that could not open deleted the outbox key")
+	}
+	if local, err := loadWhatsAppLocalLinks(); err != nil || len(local) != 1 || local[0].LinkID != "lnk_held" {
+		t.Fatalf("links.json must keep the held link: %+v %v", local, err)
+	}
+	if h.sup.runner("lnk_held") == nil {
+		t.Fatal("the held link is not reachable by unlink / re-link / reconcile")
+	}
+	if posts := h.transport.find(func(map[string]any) bool { return true }); len(posts) != 0 {
+		t.Fatalf("a held link posted: %v", posts)
+	}
+
+	h.ks.mu.Lock()
+	h.ks.locked = false
+	h.ks.mu.Unlock()
+	waitFor(t, "resumed once the store answers", func() bool {
+		c := h.client(0)
+		if c == nil {
+			return false
+		}
+		n, _ := c.count()
+		return n == 1
+	})
+	waitFor(t, "the queued row uploaded", func() bool {
+		for _, p := range h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch }) {
+			for _, rec := range p["records"].([]any) {
+				if rec.(map[string]any)["waMessageId"] == "Q1" {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}

@@ -49,6 +49,13 @@ const (
 
 var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
 
+// errWhatsAppOutboxChunkTooLarge is the refusal of a history chunk the EMPTY
+// queue cannot take: the chunk alone passes a cap, so no drain will ever
+// admit it whole. It wraps errWhatsAppOutboxFull. Append decides it under
+// the outbox lock, so an ack racing the refusal cannot make a refusal at the
+// cap read as this one.
+var errWhatsAppOutboxChunkTooLarge = fmt.Errorf("%w: the chunk alone passes the caps", errWhatsAppOutboxFull)
+
 // whatsAppOutbox is one link's queue.
 type whatsAppOutbox struct {
 	mu     sync.Mutex
@@ -155,8 +162,9 @@ func (ob *whatsAppOutbox) aad(seq int64) []byte {
 // errWhatsAppOutboxFull when the queued rows PLUS this chunk would pass the
 // caps — admitting a chunk on its starting depth alone could overshoot them
 // by the whole chunk. The staged rows roll back, so a refused chunk leaves
-// the queue exactly as it was and the caller retries it later. Live appends
-// always land.
+// the queue exactly as it was and the caller retries it later; a chunk the
+// empty queue refuses is errWhatsAppOutboxChunkTooLarge instead, which no
+// wait can cure. Live appends always land.
 func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	if len(records) == 0 {
 		return nil
@@ -190,6 +198,9 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		seq++
 	}
 	if history && (ob.count+int64(len(records)) > whatsAppOutboxMaxRecords || ob.bytes+addedBytes > whatsAppOutboxMaxBytes) {
+		if ob.count == 0 {
+			return errWhatsAppOutboxChunkTooLarge
+		}
 		return errWhatsAppOutboxFull
 	}
 	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES ('next', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,

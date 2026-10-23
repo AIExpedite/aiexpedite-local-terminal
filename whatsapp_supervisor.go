@@ -98,6 +98,10 @@ var (
 	whatsAppAuthFlushTimeout = 2 * time.Minute
 	// How often a history chunk held at the outbox caps retries its append.
 	whatsAppHistoryRoomPoll = 2 * time.Second
+	// Backoff for reopening a link whose stores could not be opened at
+	// resume (a locked credential store, a held file).
+	whatsAppResumeRetryMin = 30 * time.Second
+	whatsAppResumeRetryMax = 10 * time.Minute
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -459,16 +463,71 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 	return true
 }
 
-// resume restarts a link from links.json.
+// resume restarts a link from links.json. The caller holds lifecycleMu.
+//
+// A link whose stores cannot be opened now — a locked or unavailable
+// credential store, a file another process holds — is NOT wiped: that would
+// turn a passing condition into a lost session and lost queued messages. It
+// stays held (in s.links, so links.json keeps it and unlink, re-link,
+// reconcile and deregistration still reach it) while retryResume reopens it
+// with backoff.
 func (s *whatsAppSupervisor) resume(l whatsAppLocalLink) {
 	r := s.newRunner(l.LinkID, l.WorkspaceID, l.Generation)
 	r.state = l.State
 	r.historyComplete = l.HistoryComplete
 	if err := r.open(false); err != nil {
-		r.log("resume failed: " + err.Error())
-		s.discard(r, false)
+		r.log("resume failed; keeping the link and retrying: " + err.Error())
+		s.mu.Lock()
+		s.links[r.linkID] = r
+		s.mu.Unlock()
+		go s.retryResume(r, l)
 		return
 	}
+	s.finishResume(r, l)
+}
+
+// retryResume reopens a held link's stores with backoff until they open or
+// the runner is let go (unlinked, re-linked, wiped, paused, shut down).
+func (s *whatsAppSupervisor) retryResume(r *whatsAppLinkRunner, l whatsAppLocalLink) {
+	for attempt := 0; ; attempt++ {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(backoffWithJitter(attempt, whatsAppResumeRetryMin, whatsAppResumeRetryMax)):
+		}
+		s.lifecycleMu.Lock()
+		if r.ctx.Err() != nil || s.stopping() || s.runner(r.linkID) != r {
+			s.lifecycleMu.Unlock()
+			return
+		}
+		if s.isPaused() {
+			// An eager cloud pause: its full stop is queued and cancels this
+			// runner; nothing may connect meanwhile.
+			s.lifecycleMu.Unlock()
+			continue
+		}
+		err := r.open(false)
+		if err == nil {
+			if r.ctx.Err() != nil || s.stopping() {
+				// Shut down while opening: shutdown owns the runner and its
+				// stores now; nothing starts.
+				s.lifecycleMu.Unlock()
+				return
+			}
+			s.finishResume(r, l)
+		}
+		s.lifecycleMu.Unlock()
+		if err == nil {
+			r.log("resumed")
+			return
+		}
+		r.log("resume failed again: " + err.Error())
+	}
+}
+
+// finishResume continues a resume whose stores are open. The caller holds
+// lifecycleMu.
+func (s *whatsAppSupervisor) finishResume(r *whatsAppLinkRunner, l whatsAppLocalLink) {
 	if !r.client.HasSession() {
 		// No paired identity: either the agent stopped mid-pairing (the QR
 		// died with it) or the store was lost. Neither can continue here.
@@ -785,6 +844,9 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 	r := s.runner(linkID)
 	if r == nil || r.generationNow() != generation {
 		return
+	}
+	if _, open := r.outboxDepth(); !open {
+		return // held while its stores cannot be opened: nothing true to report
 	}
 	r.reportState(nil)
 	r.heartbeat()
@@ -1435,8 +1497,11 @@ func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []wh
 			r.log("history chunk not stored: " + err.Error())
 			return admitted
 		}
-		empty := ob.Depth() == 0
-		if len(rest) == 1 && empty {
+		// Decided by Append under the outbox lock: the queue was empty at
+		// the refusal, so the chunk alone passes a cap. A separate depth
+		// read could see an ack that landed after a refusal at the cap.
+		tooLarge := errors.Is(err, errWhatsAppOutboxChunkTooLarge)
+		if len(rest) == 1 && tooLarge {
 			// Only an EMPTY queue refusing a single record means the record
 			// alone passes the byte cap: no drain can ever admit it, and
 			// wedging history on it would be worse than logging it. A
@@ -1446,7 +1511,7 @@ func (r *whatsAppLinkRunner) appendHistoryChunk(ob *whatsAppOutbox, records []wh
 			r.log("history record exceeds the outbox caps; skipped")
 			return admitted + 1
 		}
-		if int64(len(rest)) > whatsAppOutboxMaxRecords || empty {
+		if int64(len(rest)) > whatsAppOutboxMaxRecords || tooLarge {
 			// Unsatisfiable whole: more records than the cap allows, or a
 			// chunk the empty queue still refuses (its sealed bytes alone
 			// pass the byte cap). Halving always terminates — a single

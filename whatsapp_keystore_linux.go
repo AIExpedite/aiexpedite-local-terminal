@@ -45,20 +45,11 @@ func (platformWhatsAppKeystore) Put(account string, secret []byte) error {
 	return nil
 }
 
+// Get reports errWhatsAppKeyNotFound only for an item that is really absent
+// (readSecretToolKey): a failed or locked Secret Service is an error, never a
+// deleted key.
 func (platformWhatsAppKeystore) Get(account string) ([]byte, error) {
-	out, code, err := runWhatsAppKeystoreCLI("", "secret-tool", "lookup",
-		"service", whatsAppKeystoreService, "account", account)
-	if err != nil {
-		return nil, err
-	}
-	// secret-tool exits 1 with no output for a missing item.
-	if out == "" {
-		return nil, errWhatsAppKeyNotFound
-	}
-	if code != 0 {
-		return nil, fmt.Errorf("secret service read failed (exit %d)", code)
-	}
-	return decodeWhatsAppKeystoreSecret(out)
+	return readSecretToolKey(runWhatsAppKeystoreCLI, account)
 }
 
 func (platformWhatsAppKeystore) Delete(account string) error {
