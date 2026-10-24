@@ -86,6 +86,28 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 		currentClaudeAccountFingerprint(), claudeRateLimitSourceStatusLine)
 }
 
+// statusLineChildOut / statusLineChildErr are the descriptors a chained
+// status-line command inherits. Production never reassigns them; they are
+// variables so the test can hand the child files instead of this process's own
+// stdio.
+//
+// The seam exists because the test used to do that by swapping os.Stdout and
+// os.Stderr THEMSELVES, and those two are read by every fmt.Print in the agent
+// — including the EndSession goroutines ShutdownAllSessionsWithin deliberately
+// abandons once its window is spent, which go on logging for
+// gracefulShutdownTimeout (5s) and killConfirmTimeout (30s) after the test that
+// started them returned. Under -race that is a data race between two unrelated
+// tests, and it is reported against whichever one happens to be holding the
+// swap when a straggler prints: the ubuntu job failed on it twice, blaming
+// TestRenderStatusLine_TerminatesChainedChildOnSignal once and
+// TestReconcileClaudeStatusLineHookBoundedReturnsWhileRepairStalls once.
+// Redirecting only what the child inherits keeps the property the test needs
+// without writing a global that other goroutines read.
+var (
+	statusLineChildOut = os.Stdout
+	statusLineChildErr = os.Stderr
+)
+
 // renderStatusLine forwards to the user's previous status-line command when we
 // chained one at install time (feeding it the same stdin), otherwise prints our
 // own compact line built from the payload.
@@ -101,8 +123,8 @@ func renderStatusLine(raw []byte) {
 	if prev := loadPrevStatusLineCommand(); prev != "" {
 		cmd := shellCommand(prev)
 		cmd.Stdin = bytes.NewReader(raw)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = statusLineChildOut
+		cmd.Stderr = statusLineChildErr
 		setStatusLineChildProcessGroup(cmd)
 		if err := cmd.Start(); err == nil {
 			done := make(chan error, 1)
