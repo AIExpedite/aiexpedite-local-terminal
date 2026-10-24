@@ -179,6 +179,11 @@ type antigravityRunCapture struct {
 	// classified as live and is owed usage it never spent.
 	noteMu sync.Mutex
 
+	// released is closed once Finish's bookkeeping goroutine has finished.
+	// Written under mu before that goroutine starts, so a caller that has
+	// seen Finish return can always read it.
+	released chan struct{}
+
 	mu  sync.Mutex
 	pid int
 	// finished is set by Finish once it has stopped waiting for the resolver.
@@ -281,6 +286,27 @@ func (c *antigravityRunCapture) SetWrapper(wrapperPID int) {
 	releaseAntigravityCapturedPID(superseded, c.floor)
 	c.noteMu.Unlock()
 	go c.resolveWrapper(wrapperPID, gen, stop, done)
+}
+
+// waitReleased blocks until Finish's bookkeeping goroutine has finished, or d
+// passes. For TESTS that assert index state after a Finish: production never
+// waits, which is the whole point of doing the release off the turn.
+func (c *antigravityRunCapture) waitReleased(d time.Duration) bool {
+	if c == nil {
+		return true
+	}
+	c.mu.Lock()
+	done := c.released
+	c.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // releaseAntigravityCapturedPID lets a capture's agy PID go: a process that
@@ -387,22 +413,70 @@ func (c *antigravityRunCapture) Finish() {
 			}
 			grace.Stop()
 		}
-		// Taken only AFTER the grace wait above. A resolver still running past
-		// the grace may be blocked in setPID waiting for this; holding it
-		// across the wait for `done` would deadlock until the grace expired.
-		// Once this is released that resolver proceeds and finds `finished`,
-		// so it notes nothing and the release below stands.
-		c.noteMu.Lock()
+		// The handle's OWN lock, held only to read `pid` and publish the
+		// `released` channel. Nothing slow happens under it; the ordering lock
+		// and the release itself moved to the goroutine below.
 		c.mu.Lock()
 		c.finished = true
 		pid := c.pid
+		released := make(chan struct{})
+		c.released = released
 		c.mu.Unlock()
 		// A wrapper can return while the agy it launched keeps running
 		// (`Start-Process agy`, `agy … &`): that process goes to discovery,
 		// which owes its reading and re-reads its block for evidence when it
 		// really exits.
-		releaseAntigravityCapturedPID(pid, c.floor)
-		c.noteMu.Unlock()
+		// THE RELEASE LEAVES THE TURN'S GOROUTINE, because bounding the wait for
+		// the ordering lock did not bound the stall. `setPID` holds `noteMu`
+		// WHILE `noteAntigravityManagedPID` waits for the log index's mutex, so
+		// giving up on `noteMu` after a timeout only reached this call, which
+		// waits for that SAME index mutex through
+		// handOffAntigravityDetachedManagedPID / noteAntigravityManagedPIDExited.
+		// A discovery pass holding the index while it reads logs and probes
+		// processes still decided how long the turn waited. (Codex, PR #234.)
+		//
+		// So the slow half runs on its own goroutine and Finish returns at once
+		// — what the call site promises: "never fails and never blocks; a missed
+		// capture costs freshness, not the turn".
+		//
+		// The wait for `noteMu` is UNBOUNDED, and has to be. A timeout would
+		// drop the ordering lock and release anyway: if the release then reached
+		// the index first, its handoff and exit mark would find no managed
+		// entry, and the note arriving afterwards would add the PID back as
+		// live — an agy that outlived its wrapper would never be handed to
+		// discovery, and every reading after the wrapper exits would be lost
+		// until the next restart. The bound only ever existed because this code
+		// sat on the turn's path; off it, waiting costs nothing a caller can
+		// feel. (Codex, PR #234 round 2.)
+		//
+		// It is safe to hold `noteMu` across that index wait. Every production
+		// acquisition of `noteMu` (setPID, SetWrapper, here) takes it BEFORE the
+		// index lock and nothing under the index lock reaches a capture handle,
+		// so the edge set between the two is exactly {noteMu -> index} and
+		// cannot cycle. `noteMu` is also a FIELD of this handle, not a package
+		// lock, so a wait here can block nobody but this run's own resolver —
+		// which Finish already abandons after its 3 s grace.
+		//
+		// COUNTED, like the settle below it. This goroutine's work reaches
+		// armAntigravityCandidateFloor and a synchronous
+		// updateAntigravityUsageFreshness, so it writes the state file; a write
+		// nobody can wait for lands after the shutdown drain has declared
+		// itself idle. In tests that is worse than a lost write, because
+		// antigravityFreshnessPath() resolves at WRITE time from the
+		// environment: a straggler from one test writes into the next test's
+		// seeded freshness file. Moving the release off the turn widened that
+		// window, which is the `inFlight=` half of the drain's timeout message.
+		//
+		// `released` closes when the bookkeeping is done. Production never waits
+		// on it; tests that assert index state after a Finish do.
+		antigravityFreshnessInFlight.Add(1)
+		go func() {
+			defer antigravityFreshnessInFlight.Add(-1)
+			defer close(released)
+			c.noteMu.Lock()
+			defer c.noteMu.Unlock()
+			releaseAntigravityCapturedPID(pid, c.floor)
+		}()
 
 		if c.polled {
 			antigravityCaptureMu.Lock()
