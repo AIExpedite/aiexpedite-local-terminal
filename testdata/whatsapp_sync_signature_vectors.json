@@ -1,0 +1,23 @@
+{
+  "comment": "Shared with terminal-service testdata/whatsapp_sync_signature_vectors.json — keep identical. signature = hex HMAC-SHA256(secret, agentId:timestamp:sha256hex(rawBody)).",
+  "vectors": [
+    {
+      "name": "batch",
+      "agentId": "agent-1",
+      "secret": "secret",
+      "timestamp": 1800000000000,
+      "body": "{\"v\":1,\"linkId\":\"lnk_1\",\"generation\":3,\"kind\":\"batch\",\"seqFrom\":1,\"seqTo\":1,\"records\":[{\"kind\":\"message\",\"op\":\"new\",\"deviceSeq\":1,\"chatJid\":\"15551234567@s.whatsapp.net\",\"text\":\"héllo & <b>\"}]}",
+      "signedMessage": "agent-1:1800000000000:835bab8115918b6d53be1f874e82d72656715ffd992067227b709ea0b950ca78",
+      "signature": "8f5dbb072a726e0100ff44d8af0c2fbe8d10c5757c1e107647576e7e38cd3bb6"
+    },
+    {
+      "name": "emptyBody",
+      "agentId": "agent-1",
+      "secret": "secret",
+      "timestamp": 1800000000123,
+      "body": "",
+      "signedMessage": "agent-1:1800000000123:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "73aef4dc017f94e28a9b33e872724f4a4bf3d273930e1dfcf8768aecff44334c"
+    }
+  ]
+}

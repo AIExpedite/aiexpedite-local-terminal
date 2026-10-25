@@ -34,24 +34,26 @@ func TestRenderStatusLine_TerminatesChainedChildOnSignal(t *testing.T) {
 		t.Fatalf("savePrevStatusLine: %v", err)
 	}
 
-	// Swallow the default-line stdout the wrapper would normally print after
-	// the signal path — we only care about the lifecycle here.
-	//
-	// os.Stderr is redirected for a second, load-bearing reason: renderStatusLine
-	// hands the chained child `cmd.Stdout = os.Stdout` / `cmd.Stderr = os.Stderr`,
-	// i.e. the *test binary's own* stdio descriptors — this is the only place in
-	// the suite that does. `go test` waits for those descriptors to reach EOF
-	// after the tests exit, so if the `sleep 60` here ever outlives us (the
-	// group kill below is best-effort, and the assertion only probes the group
+	// Point the chained child at files. renderStatusLine would otherwise hand
+	// it this process's own stdio descriptors — the only place in the suite
+	// that passes those to a child. `go test` waits for them to reach EOF after
+	// the tests exit, so if the `sleep 60` here ever outlives us (the group
+	// kill below is best-effort, and the assertion only probes the group
 	// leader), the whole package fails with
 	//
 	//     *** Test I/O incomplete 30s after exiting.
 	//     exec: WaitDelay expired before I/O complete
 	//
-	// long after every test reported PASS. Pointing both at files under
-	// t.TempDir() means a straggler holds a temp file instead of the test
-	// binary's pipes, so the leak can no longer take the package down with it.
-	oldStdout, oldStderr := os.Stdout, os.Stderr
+	// long after every test reported PASS. Under t.TempDir() a straggler holds
+	// a temp file instead of the test binary's pipes, so the leak can no longer
+	// take the package down with it.
+	//
+	// What moves is the seam, never os.Stdout / os.Stderr themselves: those are
+	// read by every fmt.Print in the agent, including the shutdown stragglers
+	// that outlive the test that started them, and swapping them here raced
+	// with those (statusline_hook.go). Nothing else reads the seam, and the
+	// write below happens before the goroutine that reads it is started.
+	oldOut, oldErr := statusLineChildOut, statusLineChildErr
 	childOut, err := os.Create(filepath.Join(dir, "render.out"))
 	if err != nil {
 		t.Fatalf("create render.out: %v", err)
@@ -60,9 +62,9 @@ func TestRenderStatusLine_TerminatesChainedChildOnSignal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create render.err: %v", err)
 	}
-	os.Stdout, os.Stderr = childOut, childErr
+	statusLineChildOut, statusLineChildErr = childOut, childErr
 	t.Cleanup(func() {
-		os.Stdout, os.Stderr = oldStdout, oldStderr
+		statusLineChildOut, statusLineChildErr = oldOut, oldErr
 		_ = childOut.Close()
 		_ = childErr.Close()
 	})
