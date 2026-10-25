@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -42,19 +41,9 @@ func TestOpenCodeDirectRunLive(t *testing.T) {
 	if os.Getenv("AIEXPEDITE_LIVE_OPENCODE") != "1" {
 		t.Skip("set AIEXPEDITE_LIVE_OPENCODE=1 to run the live OpenCode direct-run gate")
 	}
-	// TestMain sandboxes the profile; OpenCode keeps its login, provider config
-	// and store in the real one. The ledger stays isolated below, and the agent
-	// config dir stays in the sandbox.
-	if realHomeAtStartup != "" {
-		t.Setenv("HOME", realHomeAtStartup)
-		t.Setenv("USERPROFILE", realHomeAtStartup)
-		if realAppDataAtStartup != "" {
-			t.Setenv("APPDATA", realAppDataAtStartup)
-		}
-		if strings.HasPrefix(os.Getenv("XDG_CONFIG_HOME"), testSandboxDir) {
-			t.Setenv("XDG_CONFIG_HOME", filepath.Join(realHomeAtStartup, ".config"))
-		}
-	}
+	// OpenCode keeps its login, provider config and store in the real profile.
+	// The ledger stays isolated below.
+	useRealUserProfile(t)
 	openCodePath, err := exec.LookPath("opencode")
 	if err != nil {
 		t.Skip("opencode is not on PATH")

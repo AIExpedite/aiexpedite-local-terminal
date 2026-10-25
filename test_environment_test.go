@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +20,27 @@ func isolateTestUserHome(t *testing.T, home string) {
 	t.Setenv("GROK_BIN_DIR", filepath.Join(home, ".grok", "bin"))
 	// Muse Code's Windows installer dir is under %LOCALAPPDATA%, not HOME.
 	t.Setenv("MUSE_INSTALL_DIR", filepath.Join(home, ".local", "bin"))
+}
+
+// useRealUserProfile undoes the suite sandbox's profile redirect for one
+// opt-in, real-binary test: the CLIs keep their logins, provider config and
+// stores in the real home. The agent's own config dir (baseDir) and temp root
+// stay in the sandbox.
+func useRealUserProfile(t *testing.T) {
+	t.Helper()
+	if realHomeAtStartup == "" {
+		return
+	}
+	t.Setenv("HOME", realHomeAtStartup)
+	t.Setenv("USERPROFILE", realHomeAtStartup)
+	if realAppDataAtStartup != "" {
+		t.Setenv("APPDATA", realAppDataAtStartup)
+	}
+	// OpenCode reads its provider config from XDG_CONFIG_HOME, which the
+	// sandbox also redirects; a sandboxed value hides every local provider.
+	if strings.HasPrefix(os.Getenv("XDG_CONFIG_HOME"), testSandboxDir) {
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(realHomeAtStartup, ".config"))
+	}
 }
 
 // ─────────────────────────── suite-wide sandbox ───────────────────────────

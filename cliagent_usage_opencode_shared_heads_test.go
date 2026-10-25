@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -156,7 +157,7 @@ func TestOpenCode119_ASmokeWithNoUsageInTheStreamIsPaidFromV1(t *testing.T) {
 	if len(ledger.Debts) != 0 {
 		t.Fatalf("debts = %+v after the store paid", ledger.Debts)
 	}
-	if !openCodeLedgerHasStep(ledger, openCodeUsageStepKey("ses_probe", "message:msg_smoke")) {
+	if !slices.Contains(ledger.SeenSteps, openCodeUsageStepKey("ses_probe", "message:msg_smoke")) {
 		t.Fatal("the paid step is not keyed as the export keys a message")
 	}
 	if *exports != 0 {
@@ -342,14 +343,4 @@ func TestOpenCode119_ABusyStoreDefersWithoutRenewingCoverage(t *testing.T) {
 	if n := openCodeTodayTokens(t, clock.now); n != 0 {
 		t.Fatalf("tokens today = %d from a busy store", n)
 	}
-}
-
-// openCodeLedgerHasStep reports whether the ledger remembers the step key.
-func openCodeLedgerHasStep(ledger openCodeUsageLedger, key string) bool {
-	for _, k := range ledger.SeenSteps {
-		if k == key {
-			return true
-		}
-	}
-	return false
 }

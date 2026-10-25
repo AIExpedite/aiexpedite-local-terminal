@@ -420,9 +420,12 @@ func openCodeSQLiteSharedHeadsFamily(ctx context.Context, db *sql.DB, v1, v2 ope
 		}
 	}
 	// The loser's spend goes uncounted: say so when it holds one of the probed
-	// sessions written since local midnight.
+	// sessions written since local midnight. An undecided probe holds none.
 	midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli()
 	for _, s := range sessions[decided+1:] {
+		if decided < 0 {
+			break
+		}
 		if s.UpdatedMs < midnight {
 			break
 		}
@@ -591,10 +594,11 @@ type openCodeStoreSessionRead struct {
 	Truncated bool
 	// Unbounded: the turn has no end to read up to yet.
 	Unbounded bool
-	// SessionKnown: a family's session heads hold the session — the elected
-	// one, else the other: a V1 client writing after a managed V2 run wins
-	// the election without holding that run's session. A debt from before an
-	// upgrade names a session only V1 has.
+	// SessionKnown: a family holds the session — the elected one, else the
+	// other: a V1 client writing after a managed V2 run wins the election
+	// without holding that run's session. A debt from before an upgrade names
+	// a session only V1 has. On distinct heads a family holds a session its
+	// heads list; on shared heads, one its message table holds.
 	SessionKnown bool
 }
 
