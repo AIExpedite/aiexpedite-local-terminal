@@ -10,9 +10,12 @@
 // messages to new tables (session_v2 / session_message, no part table) and
 // leaves the V1 session / message / part tables in place, FROZEN. Those still
 // pass the V1 shape check, so a reader that only knew V1 would read nothing new
-// on every scan and still renew today's coverage. Each read therefore elects
-// one family (openCodeSQLiteFamily): the one whose session heads were written
-// most recently, a tie going to V2. The V2 reader lives in
+// on every scan and still renew today's coverage. OpenCode 1.19 is the mirror
+// case: it stages an EMPTY session_message beside the V1 tables it still writes
+// every turn to, both families sharing the session heads table, so a reader
+// that took that table's presence for V2 reads nothing new either. Each read
+// therefore elects one family (openCodeSQLiteFamily) by where the newest
+// sessions' messages are, never by which tables exist. The V2 reader lives in
 // cliagent_usage_opencode_direct_sqlite_v2.go; read.Layout names the family read.
 //
 // Shape check: PRAGMA table_info must list every column the family's queries
@@ -36,6 +39,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -114,11 +118,13 @@ type openCodeSQLiteInfo struct {
 }
 
 // openCodeSQLiteFamilyRead is one schema family's reader: the session heads
-// table it lists, and how it reads the messages of the listed sessions.
+// table it lists, the table its messages live in, and how it reads the
+// messages of the listed sessions.
 type openCodeSQLiteFamilyRead struct {
-	Layout   string
-	Heads    string
-	Messages func(ctx context.Context, db *sql.DB, sessions []any, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead) error
+	Layout       string
+	Heads        string
+	MessageTable string
+	Messages     func(ctx context.Context, db *sql.DB, sessions []any, floorMs int64, limits openCodeDirectLimits, read *openCodeDirectRead) error
 }
 
 // openOpenCodeSQLite opens root's opencode.db read-only.
@@ -289,19 +295,25 @@ func openCodeSQLitePlaceholders(n int) string {
 
 // openCodeSQLiteFamily elects the schema family a read uses. V2 is a candidate
 // when session_message has every column its reader needs and a heads table does
-// (session_v2, else the pre-release layout's session); V1 when the V1 shape
-// check passes. session_message is the disambiguator — no V1 release creates
-// it — so a pre-release store whose heads are V1's own session table reads as
-// V2. With both candidates on distinct heads, the one written most recently
-// wins and a tie (both empty included) goes to V2, the family a fresh write
-// comes from; the scan logs direct_family_suppressed when the other one was
-// written since local midnight too, since its spend goes uncounted. Neither, or
-// a query that fails for any reason but a busy store or the budget, fails closed.
-// other is the losing candidate on distinct heads (Layout "" when there is
-// none): a debt's read probes it for a session the elected family lacks.
+// (session_v2, else session); V1 when the V1 shape check passes.
+//
+//   - Distinct heads: the family whose heads were written most recently wins,
+//     and a tie (both empty included) goes to V2, the family a fresh write
+//     comes from.
+//   - Shared heads (both on session): the table set decides nothing, since
+//     OpenCode 1.19 creates session_message empty and keeps writing V1, while a
+//     pre-release V2 store writes session_message under V1's session table.
+//     The family holding the newest session's messages wins
+//     (openCodeSQLiteSharedHeadsFamily).
+//
+// The scan logs direct_family_suppressed when the losing family holds a
+// session written since local midnight too, since its spend goes uncounted.
+// Neither candidate, or a query that fails for any reason but a busy store or
+// the budget, fails closed. other is the losing candidate (Layout "" when there
+// is none): a debt's read probes it for a session the elected family lacks.
 func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (elected, other openCodeSQLiteFamilyRead, err error) {
-	v1 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLite, Heads: "session", Messages: readOpenCodeSQLiteV1Messages}
-	v2 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLiteV2, Messages: readOpenCodeSQLiteV2Messages}
+	v1 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLite, Heads: "session", MessageTable: "message", Messages: readOpenCodeSQLiteV1Messages}
+	v2 := openCodeSQLiteFamilyRead{Layout: openCodeStoreLayoutSQLiteV2, MessageTable: "session_message", Messages: readOpenCodeSQLiteV2Messages}
 	tables, err := openCodeSQLiteTables(ctx, db)
 	if err != nil {
 		return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
@@ -331,8 +343,14 @@ func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (elected, other openC
 		return v1, openCodeSQLiteFamilyRead{}, errOpenCodeDirectLayoutUnknown
 	case v2.Heads == "":
 		return v1, openCodeSQLiteFamilyRead{}, nil
-	case !hasV1 || v2.Heads == v1.Heads:
+	case !hasV1:
 		return v2, openCodeSQLiteFamilyRead{}, nil
+	case v2.Heads == v1.Heads:
+		elected, other, err := openCodeSQLiteSharedHeadsFamily(ctx, db, v1, v2)
+		if err != nil {
+			return v1, openCodeSQLiteFamilyRead{}, openCodeSQLiteElectionErr(ctx, err)
+		}
+		return elected, other, nil
 	}
 	v1Ms, err := openCodeSQLiteNewestHead(ctx, db, v1.Heads)
 	if err != nil {
@@ -349,6 +367,111 @@ func openCodeSQLiteFamily(ctx context.Context, db *sql.DB) (elected, other openC
 		return v1, v2, nil
 	}
 	return v2, v1, nil
+}
+
+// openCodeSQLiteSharedHeadsProbe is how many of the most recently updated
+// sessions a shared-heads election probes.
+var openCodeSQLiteSharedHeadsProbe = 8
+
+// openCodeSQLiteSharedHeadsElected is the family the last shared-heads election
+// in this process chose, so direct_family_shared_heads_v1 is logged when the
+// election changes rather than on every tick.
+var openCodeSQLiteSharedHeadsElected atomic.Value
+
+// openCodeSQLiteSharedHeadsFamily elects between two families listing the same
+// session heads table by the newest sessions' messages. The probed sessions are
+// walked newest first: the first one exactly one family holds decides, one both
+// hold goes to V2 as a tie does on distinct heads, and one neither holds (no
+// message yet) is passed over. When none of the probe decides, V2 wins if
+// session_message has any row at all, else V1. Every lookup is one indexed
+// EXISTS by session_id; session ids are bound parameters, never logged or kept.
+func openCodeSQLiteSharedHeadsFamily(ctx context.Context, db *sql.DB, v1, v2 openCodeSQLiteFamilyRead) (elected, other openCodeSQLiteFamilyRead, err error) {
+	sessions, err := openCodeSQLiteNewestSessions(ctx, db, v1.Heads, openCodeSQLiteSharedHeadsProbe)
+	if err != nil {
+		return v1, openCodeSQLiteFamilyRead{}, err
+	}
+	decided := -1
+	for i, s := range sessions {
+		inV2, err := openCodeSQLiteHoldsSession(ctx, db, v2.MessageTable, s.ID)
+		if err != nil {
+			return v1, openCodeSQLiteFamilyRead{}, err
+		}
+		if inV2 {
+			elected, other, decided = v2, v1, i
+			break
+		}
+		inV1, err := openCodeSQLiteHoldsSession(ctx, db, v1.MessageTable, s.ID)
+		if err != nil {
+			return v1, openCodeSQLiteFamilyRead{}, err
+		}
+		if inV1 {
+			elected, other, decided = v1, v2, i
+			break
+		}
+	}
+	if decided < 0 {
+		var anyV2 bool
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q)`, v2.MessageTable)).Scan(&anyV2); err != nil {
+			return v1, openCodeSQLiteFamilyRead{}, err
+		}
+		elected, other = v1, v2
+		if anyV2 {
+			elected, other = v2, v1
+		}
+	}
+	// The loser's spend goes uncounted: say so when it holds one of the probed
+	// sessions written since local midnight.
+	midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli()
+	for _, s := range sessions[decided+1:] {
+		if s.UpdatedMs < midnight {
+			break
+		}
+		held, err := openCodeSQLiteHoldsSession(ctx, db, other.MessageTable, s.ID)
+		if err != nil {
+			return v1, openCodeSQLiteFamilyRead{}, err
+		}
+		if held {
+			logOpenCodeUsageCapture("direct_family_suppressed")
+			break
+		}
+	}
+	if previous := openCodeSQLiteSharedHeadsElected.Swap(elected.Layout); elected.Layout == openCodeStoreLayoutSQLite && previous != elected.Layout {
+		logOpenCodeUsageCapture("direct_family_shared_heads_v1")
+	}
+	return elected, other, nil
+}
+
+// openCodeSQLiteHead is one session head: its id and last write.
+type openCodeSQLiteHead struct {
+	ID        string
+	UpdatedMs int64
+}
+
+// openCodeSQLiteNewestSessions lists table's n most recently updated sessions,
+// newest first.
+func openCodeSQLiteNewestSessions(ctx context.Context, db *sql.DB, table string, n int) ([]openCodeSQLiteHead, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT id, time_updated FROM %q ORDER BY time_updated DESC, id DESC LIMIT ?`, table), n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var heads []openCodeSQLiteHead
+	for rows.Next() {
+		var h openCodeSQLiteHead
+		if err := rows.Scan(&h.ID, &h.UpdatedMs); err != nil {
+			return nil, err
+		}
+		heads = append(heads, h)
+	}
+	return heads, rows.Err()
+}
+
+// openCodeSQLiteHoldsSession reports whether table, a family's message table,
+// holds a message of the session.
+func openCodeSQLiteHoldsSession(ctx context.Context, db *sql.DB, table, sessionID string) (bool, error) {
+	var held bool
+	err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE session_id = ?)`, table), sessionID).Scan(&held)
+	return held, err
 }
 
 // openCodeSQLiteElectionErr is what a failed election query reports: a busy
@@ -494,16 +617,25 @@ func readOpenCodeStoreSessionUsage(ctx context.Context, root string, q openCodeS
 	if err != nil {
 		return out, err
 	}
-	// One primary-key lookup per family: the election follows the newest
-	// write store-wide, but the debt's turn lives in whichever family wrote
-	// its session. A session neither wrote has nothing to read, and says
+	// One indexed lookup per family: the election follows the newest write
+	// store-wide, but the debt's turn lives in whichever family wrote its
+	// session. On distinct heads that is the family whose heads list it; on
+	// shared heads both list every session, so it is the family whose message
+	// table holds it. A session neither wrote has nothing to read, and says
 	// nothing about whether the turn paid.
+	shared := family.Heads == other.Heads
 	for _, f := range []openCodeSQLiteFamilyRead{family, other} {
 		if f.Layout == "" {
 			continue
 		}
 		out.Layout = f.Layout
-		if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE id = ?)`, f.Heads), q.SessionID).Scan(&out.SessionKnown); err != nil {
+		var err error
+		if shared {
+			out.SessionKnown, err = openCodeSQLiteHoldsSession(ctx, db, f.MessageTable, q.SessionID)
+		} else {
+			err = db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM %q WHERE id = ?)`, f.Heads), q.SessionID).Scan(&out.SessionKnown)
+		}
+		if err != nil {
 			return out, err
 		}
 		if out.SessionKnown {

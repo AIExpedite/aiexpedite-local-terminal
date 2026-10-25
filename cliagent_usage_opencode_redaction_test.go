@@ -224,3 +224,70 @@ func TestOpenCodeUsageRedaction_V2RowsLeaveNothingButCounts(t *testing.T) {
 		t.Fatalf("tokens row = %+v, want both rows' 520; the redaction proof would be vacuous", tokens)
 	}
 }
+
+// An OpenCode 1.19 store keeps credentials (account, control_account,
+// credential, session_share) beside the session title and directory and the
+// message / part data the V1 family is read from. A scan, an owed debt's
+// payment and a Refresh leave counts, hashed keys and fixed labels only; a
+// session id appears only inside a debt, as everywhere else.
+func TestOpenCodeUsageRedaction_A119StoreLeavesNothingButCounts(t *testing.T) {
+	sched, store, clock, _ := openCode119Fixture(t, 1204)
+	stubOpenCodeReadiness(t, "anthropic/claude-sonnet-4-5\n", true)
+	const canaryPath = "/home/canary/CANARY-PROMPT-project"
+	const canaryToken = "oc_at_REDACTIONCANARY0access"
+	store.exec(`INSERT INTO account VALUES ('acc_1', ?, 'https://opencode.example', ?, ?, 0, 1, 1)`, openCodeRedactionAccount, canaryToken, openCodeRedactionAPIKey)
+	store.exec(`INSERT INTO control_account VALUES (?, 'https://opencode.example', ?, ?, 0, 1, 1, 1)`, openCodeRedactionAccount, canaryToken, openCodeRedactionAPIKey)
+	store.exec(`INSERT INTO credential (id, label, value, time_created, time_updated) VALUES ('cred_1', 'anthropic', ?, 1, 1)`, openCodeRedactionAPIKey)
+	store.exec(`INSERT INTO session_share VALUES (?, 'shr_1', ?, 'https://opncd.example/s', 1, 1)`, openCodeRedactionSession, canaryToken)
+	secretTurn := func(session, id string, createdMs, completedMs int64) {
+		store.v1Assistant(session, id, createdMs, completedMs, [][3]int64{{500, 20, 0}}, 0.25)
+		store.exec(`UPDATE session SET title = ?, directory = ? WHERE id = ?`, openCodeRedactionPrompt, canaryPath, session)
+		store.exec(`UPDATE message SET data = json_set(data, '$.path.cwd', ?, '$.system', ?, '$.account', ?) WHERE id = ?`, canaryPath, openCodeRedactionPrompt, openCodeRedactionAccount, id)
+		store.exec(`INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)`, id+"_tool", id, session, createdMs, completedMs,
+			fmt.Sprintf(`{"type":"tool","state":{"input":{"filePath":%q},"output":%q}}`, canaryPath, openCodeRedactionAPIKey))
+	}
+	// A direct run, read by a scan.
+	secretTurn(openCodeRedactionSession, "msg_canary", clock.ms(-time.Hour), clock.ms(-time.Hour+time.Second))
+	// A managed run whose stream carried no usage: one debt paid by the ladder,
+	// one by a Refresh.
+	owe := func(session, id string) {
+		run := armOpenCodeUsageRun("opencode", "", "")
+		captureOpenCodeUsageLine(run, fmt.Sprintf(`{"type":"session.created","sessionID":%q}`, session))
+		openCodeUsageInFlight.Wait()
+		clock.now = clock.now.Add(time.Second)
+		secretTurn(session, id, clock.ms(-500*time.Millisecond), clock.ms(0))
+		settleOpenCodeUsageRun(run, "")
+	}
+
+	logs := captureStdout(t, func() {
+		scanOpenCodeDirect(t)
+		owe("ses_managed", "msg_managed")
+		for sched.fireNext() {
+		}
+		owe("ses_clicked", "msg_clicked")
+		openCodeDirectScanOnRefresh(context.Background())
+	})
+	assertNoOpenCodeCanary(t, "the device log", logs, false)
+	for _, leak := range []string{canaryPath, canaryToken, "ses_managed", "ses_clicked"} {
+		if strings.Contains(logs, leak) {
+			t.Fatalf("the device log carries %q", leak)
+		}
+	}
+	raw, err := os.ReadFile(openCodeUsageCachePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoOpenCodeCanary(t, "the ledger file", string(raw), false)
+	if strings.Contains(string(raw), canaryPath) || strings.Contains(string(raw), canaryToken) {
+		t.Fatal("the ledger carries a store path or token")
+	}
+	usage, _ := openCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{Path: "opencode"}, clock.now)
+	published, _ := json.Marshal(usage)
+	assertNoOpenCodeCanary(t, "the published cliAgentUsage", string(published), false)
+	if strings.Contains(string(published), canaryPath) || strings.Contains(string(published), canaryToken) {
+		t.Fatal("the published usage carries a store path or token")
+	}
+	if tokens := openCodeMetricByLabel(t, usage.Metrics, "Tokens today"); tokens.Consumed == nil || *tokens.Consumed != 1560 {
+		t.Fatalf("tokens row = %+v, want three turns' 520; the redaction proof would be vacuous", tokens)
+	}
+}

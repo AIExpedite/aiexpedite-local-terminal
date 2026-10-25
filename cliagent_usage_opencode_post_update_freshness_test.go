@@ -976,3 +976,46 @@ func TestOpenCodeUsage_AnAdoptedDebtIsPaidFromTheV2Store(t *testing.T) {
 		t.Fatalf("the export ran %d times", *exports)
 	}
 }
+
+// The update hand-off out of the build that elected OpenCode 1.19's empty V2
+// table: that build left the cursor and today's coverage on sqlite_v2 near
+// now, with no bucket for today. The next process's startup scan elects V1,
+// re-reads it from local midnight, and commits today's spend under one
+// generation bump; a second scan over the unchanged store bumps nothing.
+func TestOpenCodeUsage_AV2CursorFromAnOlderBuildRecoversV1SpendAfterTheUpdate(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 1801)
+	store := newOpenCode119TestStore(t, fixture.root)
+	today, _ := openCodeLocalDay(clock.now)
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLiteV2, ThroughMs: clock.ms(-time.Minute)}
+		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLiteV2, ObservedAtMs: clock.ms(-time.Minute), LastOkLocalDate: today}
+		return true, false
+	})
+	store.v1Assistant("ses_smoke", "msg_smoke", clock.ms(-2*time.Hour), clock.ms(-2*time.Hour+time.Second), [][3]int64{{300, 12, 0}}, 0.05)
+	store.v1Assistant("ses_shell", "msg_shell", clock.ms(-20*time.Minute), clock.ms(-19*time.Minute), [][3]int64{{80, 8, 0}}, 0.02)
+	before := loadOpenCodeUsageLedger()
+	if _, ok, _ := openCodeUsageBucketForDay("", clock.now); ok || before.DirectCursor == nil {
+		t.Fatalf("fixture ledger = %+v, want the older build's cursor and no bucket for today", before)
+	}
+
+	simulateOpenCodeProcessRestart(t, 1802)
+	clock.now = clock.now.Add(time.Minute)
+	openCodeDirectScanAtStartup()
+	ledger := loadOpenCodeUsageLedger()
+	b, ok, g := openCodeUsageBucketForDay("", clock.now)
+	if !ok || b.tokens() != 400 || b.CostUsd != 0.07 {
+		t.Fatalf("bucket = %+v, want today's V1 400 tokens and $0.07", b)
+	}
+	if g != (cliUsageGeneration{Epoch: 1802, Counter: 1}) || ledger.Generation != g {
+		t.Fatalf("generation = %+v (ledger %+v), want exactly one bump under the new process", g, ledger.Generation)
+	}
+	if c := ledger.DirectCoverage; c == nil || c.Layout != openCodeStoreLayoutSQLite || c.LastOkLocalDate != today {
+		t.Fatalf("coverage = %+v, want today's coverage booked by V1", c)
+	}
+
+	clock.now = clock.now.Add(time.Minute)
+	scanOpenCodeDirect(t)
+	if after := loadOpenCodeUsageLedger(); after.Generation != g || openCodeTodayTokens(t, clock.now) != 400 {
+		t.Fatalf("a second scan moved the ledger: generation %+v, tokens %d", after.Generation, openCodeTodayTokens(t, clock.now))
+	}
+}

@@ -217,31 +217,104 @@ CREATE TABLE part (id text PRIMARY KEY, message_id text NOT NULL, data text NOT 
 	}
 }
 
-// A pre-release store keeps its V2 heads in V1's own session table beside
-// session_message: only V2 can have written session_message, so it reads as
-// V2 even with V1's message and part tables present and newer.
-func TestOpenCodeDirectSQLiteV2_PreReleaseHeadsInSessionReadAsV2(t *testing.T) {
-	root := t.TempDir()
-	v1 := openCodeSQLiteTestStore(t, root, openCodeSQLiteTestSchema)
-	if _, err := v1.Exec(`CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, seq integer NOT NULL, type text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)`); err != nil {
-		t.Fatal(err)
+// Both families on the shared session heads table: the family holding the
+// newest session's messages wins, never the one whose tables merely exist.
+// OpenCode 1.19 stages an empty session_message beside the V1 tables it writes.
+func TestOpenCodeDirectSQLiteV2_SharedSessionHeadsElectTheFamilyHoldingTheNewestSession(t *testing.T) {
+	noon := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	prevNow, prevLoc, prevProbe := openCodeDirectNow, openCodeUsageLocation, openCodeSQLiteSharedHeadsProbe
+	openCodeDirectNow = func() time.Time { return noon }
+	openCodeUsageLocation = time.UTC
+	t.Cleanup(func() {
+		openCodeDirectNow, openCodeUsageLocation, openCodeSQLiteSharedHeadsProbe = prevNow, prevLoc, prevProbe
+	})
+	morning := noon.Add(-2 * time.Hour).UnixMilli()
+	shared := func(t *testing.T) (string, *openCode119TestStore) {
+		openCodeSQLiteSharedHeadsElected.Store("")
+		root := t.TempDir()
+		return root, newOpenCode119TestStore(t, root)
 	}
-	store := &openCodeV2TestStore{t: t, db: v1, heads: "session", seq: map[string]int{}}
-	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
-	store.assistant("ses_v2", "msg_v2", base, base+10, 11, 0, 0, 0)
-	insertOpenCodeSQLiteMessage(t, v1, "ses_v1", "msg_v1", base+100, base+110, base+110, [][3]int64{{99, 0, 0}}, 0)
+	elect := func(t *testing.T, root string) (string, string) {
+		t.Helper()
+		var read openCodeDirectRead
+		var err error
+		out := captureStdout(t, func() {
+			read, err = readOpenCodeDirectSQLite(context.Background(), root, 0, openCodeDirectTestLimits())
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return read.Layout, out
+	}
 
-	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Messages) != 1 || read.Messages[0].ID != "msg_v2" {
-		t.Fatalf("read = %+v, want the V2 message only", read)
-	}
+	t.Run("empty session_message with V1 rows today is V1", func(t *testing.T) {
+		root, store := shared(t)
+		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{99, 0, 0}}, 0)
+		got, out := elect(t, root)
+		if got != openCodeStoreLayoutSQLite {
+			t.Fatalf("layout = %q, want V1", got)
+		}
+		if !strings.Contains(out, "direct_family_shared_heads_v1") || strings.Contains(out, "direct_family_suppressed") {
+			t.Fatalf("log = %q, want the shared-heads election and no suppression", out)
+		}
+		// The election is logged when it changes, not on every tick.
+		if _, out := elect(t, root); strings.Contains(out, "direct_family_shared_heads_v1") {
+			t.Fatalf("a repeated V1 election logged again: %q", out)
+		}
+	})
+	t.Run("V2 holds the newest session", func(t *testing.T) {
+		root, store := shared(t)
+		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{1, 0, 0}}, 0)
+		store.v2Assistant("ses_2", "msg_2", morning+100, morning+110, 11)
+		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLiteV2 {
+			t.Fatalf("layout = %q, want V2", got)
+		}
+	})
+	t.Run("the newest session held by both is V2", func(t *testing.T) {
+		root, store := shared(t)
+		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{1, 0, 0}}, 0)
+		store.v2Assistant("ses_1", "msg_1_v2", morning+20, morning+30, 1)
+		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLiteV2 {
+			t.Fatalf("layout = %q, want V2", got)
+		}
+	})
+	t.Run("a newest session held by neither passes to the next", func(t *testing.T) {
+		root, store := shared(t)
+		store.v2Assistant("ses_old", "msg_old", morning-100, morning-90, 1)
+		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{1, 0, 0}}, 0)
+		store.head("ses_empty", morning+500, morning+500) // opened, no message yet
+		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLite {
+			t.Fatalf("layout = %q, want V1 from the next session", got)
+		}
+	})
+	t.Run("an undecided probe falls back by session_message emptiness", func(t *testing.T) {
+		openCodeSQLiteSharedHeadsProbe = 1
+		t.Cleanup(func() { openCodeSQLiteSharedHeadsProbe = prevProbe })
+		root, store := shared(t)
+		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{1, 0, 0}}, 0)
+		store.head("ses_empty", morning+500, morning+500)
+		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLite {
+			t.Fatalf("layout = %q, want V1 with session_message empty", got)
+		}
+		store.v2Assistant("ses_2", "msg_2", morning-200, morning-190, 1)
+		store.head("ses_empty", morning+600, morning+600)
+		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLiteV2 {
+			t.Fatalf("layout = %q, want V2 with session_message holding rows", got)
+		}
+	})
+	t.Run("V1 elected with V2 written since midnight logs the suppression", func(t *testing.T) {
+		root, store := shared(t)
+		store.v2Assistant("ses_2", "msg_2", morning, morning+10, 1)
+		store.v1Assistant("ses_1", "msg_1", morning+100, morning+110, [][3]int64{{1, 0, 0}}, 0)
+		got, out := elect(t, root)
+		if got != openCodeStoreLayoutSQLite || !strings.Contains(out, "direct_family_suppressed") {
+			t.Fatalf("layout = %q, log = %q", got, out)
+		}
+	})
 }
 
-// A session_v2 this reader cannot read does not hide a usable pre-release
-// session heads table: the next heads table is tried.
+// A session_v2 this reader cannot read does not hide a usable session heads
+// table: the next heads table is tried.
 func TestOpenCodeDirectSQLiteV2_AnUnusableHeadsTableFallsBackToTheNext(t *testing.T) {
 	root := t.TempDir()
 	db := openCodeSQLiteTestStore(t, root, `
@@ -252,7 +325,9 @@ CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, seq
 	base := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC).UnixMilli()
 	store.assistant("ses_a", "msg_a", base, base+10, 6, 0, 0, 0)
 	read, err := readOpenCodeDirectSQLite(context.Background(), root, base, openCodeDirectTestLimits())
-	if err != nil || read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Messages) != 1 {
+	// session is shared with V1 here, so the election decides by messages: the
+	// only ones are in session_message.
+	if err != nil || read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Messages) != 1 || read.Messages[0].ID != "msg_a" {
 		t.Fatalf("read = %+v, %v, want V2 through the session heads", read, err)
 	}
 }
@@ -496,4 +571,38 @@ func TestOpenCodeStoreSessionUsage_ReadsTheFamilyThatHoldsTheSession(t *testing.
 	if err != nil || read.SessionKnown || read.Layout != openCodeStoreLayoutSQLite {
 		t.Fatalf("unknown session read = %+v, %v, want the elected family, session unknown", read, err)
 	}
+
+	// On shared session heads both families list every session, so the debt
+	// follows the family whose message table holds it: a V1-only session is
+	// paid from message even while V2 holds the newest session, and a V2-only
+	// one from session_message while V1 does.
+	t.Run("shared heads", func(t *testing.T) {
+		for _, newest := range []string{openCodeStoreLayoutSQLite, openCodeStoreLayoutSQLiteV2} {
+			root := t.TempDir()
+			store := newOpenCode119TestStore(t, root)
+			store.v1Assistant("ses_v1", "msg_v1", base+10, base+20, [][3]int64{{7, 1, 0}}, 0)
+			store.v2Assistant("ses_v2", "msg_v2", base+30, base+40, 30)
+			if newest == openCodeStoreLayoutSQLite {
+				store.v1Assistant("ses_newest", "msg_newest", base+100, base+110, [][3]int64{{1, 0, 0}}, 0)
+			} else {
+				store.v2Assistant("ses_newest", "msg_newest", base+100, base+110, 1)
+			}
+			if read, err := readOpenCodeDirectSQLite(context.Background(), root, 0, openCodeDirectTestLimits()); err != nil || read.Layout != newest {
+				t.Fatalf("election = %q, %v, want %q", read.Layout, err, newest)
+			}
+			read, err := readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_v1", FromMs: base, ToMs: base + 25})
+			if err != nil || !read.SessionKnown || read.Layout != openCodeStoreLayoutSQLite || len(read.Steps) != 1 || read.Steps[0].Input != 7 ||
+				read.Steps[0].Key != openCodeUsageStepKey("ses_v1", "message:msg_v1") {
+				t.Fatalf("newest %s: V1 debt read = %+v, %v, want it paid from message", newest, read, err)
+			}
+			read, err = readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_v2", FromMs: base + 25, ToMs: base + 45})
+			if err != nil || !read.SessionKnown || read.Layout != openCodeStoreLayoutSQLiteV2 || len(read.Steps) != 1 || read.Steps[0].Input != 30 {
+				t.Fatalf("newest %s: V2 debt read = %+v, %v, want it paid from session_message", newest, read, err)
+			}
+			read, err = readOpenCodeStoreSessionUsage(context.Background(), root, openCodeStoreSessionQuery{SessionID: "ses_none", FromMs: base, ToMs: base + 200})
+			if err != nil || read.SessionKnown {
+				t.Fatalf("newest %s: unknown session read = %+v, %v, want it unknown", newest, read, err)
+			}
+		}
+	})
 }

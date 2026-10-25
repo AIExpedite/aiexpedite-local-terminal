@@ -74,7 +74,10 @@ ORDER BY written, id
 LIMIT ?`
 
 // openCodeSQLiteV2Candidate returns the V2 heads table when the store holds the
-// V2 family whole, or "".
+// V2 family whole, or "". A candidate on session — the heads table V1 lists
+// too — does not make the store V2: OpenCode 1.19 creates session_message empty
+// beside the V1 tables it writes, so the election decides by whose messages
+// the newest sessions hold (openCodeSQLiteSharedHeadsFamily).
 func openCodeSQLiteV2Candidate(ctx context.Context, db *sql.DB, tables map[string]bool) (string, error) {
 	if !tables["session_message"] {
 		return "", nil
