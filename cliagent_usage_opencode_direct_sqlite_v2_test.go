@@ -270,12 +270,23 @@ func TestOpenCodeDirectSQLiteV2_SharedSessionHeadsElectTheFamilyHoldingTheNewest
 			t.Fatalf("layout = %q, want V2", got)
 		}
 	})
-	t.Run("the newest session held by both is V2", func(t *testing.T) {
+	t.Run("the newest session held by both is V2 and logs the suppression", func(t *testing.T) {
 		root, store := shared(t)
 		store.v1Assistant("ses_1", "msg_1", morning, morning+10, [][3]int64{{1, 0, 0}}, 0)
 		store.v2Assistant("ses_1", "msg_1_v2", morning+20, morning+30, 1)
-		if got, _ := elect(t, root); got != openCodeStoreLayoutSQLiteV2 {
-			t.Fatalf("layout = %q, want V2", got)
+		got, out := elect(t, root)
+		// V1's message in the deciding session goes uncounted.
+		if got != openCodeStoreLayoutSQLiteV2 || !strings.Contains(out, "direct_family_suppressed") {
+			t.Fatalf("layout = %q, log = %q, want V2 and the suppression", got, out)
+		}
+	})
+	t.Run("V2 elected alone since midnight logs no suppression", func(t *testing.T) {
+		root, store := shared(t)
+		yesterday := noon.Add(-24 * time.Hour).UnixMilli()
+		store.v1Assistant("ses_1", "msg_1", yesterday, yesterday+10, [][3]int64{{1, 0, 0}}, 0)
+		store.v2Assistant("ses_2", "msg_2", morning, morning+10, 1)
+		if got, out := elect(t, root); got != openCodeStoreLayoutSQLiteV2 || strings.Contains(out, "direct_family_suppressed") {
+			t.Fatalf("layout = %q, log = %q, want V2 and no suppression with V1 idle since yesterday", got, out)
 		}
 	})
 	t.Run("a newest session held by neither passes to the next", func(t *testing.T) {

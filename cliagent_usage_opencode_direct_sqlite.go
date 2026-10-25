@@ -419,29 +419,44 @@ func openCodeSQLiteSharedHeadsFamily(ctx context.Context, db *sql.DB, v1, v2 ope
 			elected, other = v2, v1
 		}
 	}
-	// The loser's spend goes uncounted: say so when it holds one of the probed
-	// sessions written since local midnight. An undecided probe holds none.
-	midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli()
-	for _, s := range sessions[decided+1:] {
-		if decided < 0 {
-			break
+	if decided >= 0 {
+		// The loser's spend goes uncounted: say so when it holds one of the
+		// probed sessions written since local midnight. V1 can hold the
+		// deciding session too, when V2 won it as a tie; an undecided probe
+		// holds nothing in either family.
+		from := decided + 1
+		if elected.Layout == openCodeStoreLayoutSQLiteV2 {
+			from = decided
 		}
-		if s.UpdatedMs < midnight {
-			break
-		}
-		held, err := openCodeSQLiteHoldsSession(ctx, db, other.MessageTable, s.ID)
-		if err != nil {
+		if err := openCodeSQLiteLogSuppressed(ctx, db, other, sessions[from:]); err != nil {
 			return v1, openCodeSQLiteFamilyRead{}, err
-		}
-		if held {
-			logOpenCodeUsageCapture("direct_family_suppressed")
-			break
 		}
 	}
 	if previous := openCodeSQLiteSharedHeadsElected.Swap(elected.Layout); elected.Layout == openCodeStoreLayoutSQLite && previous != elected.Layout {
 		logOpenCodeUsageCapture("direct_family_shared_heads_v1")
 	}
 	return elected, other, nil
+}
+
+// openCodeSQLiteLogSuppressed logs direct_family_suppressed when loser's
+// message table holds one of sessions (newest first) written since local
+// midnight.
+func openCodeSQLiteLogSuppressed(ctx context.Context, db *sql.DB, loser openCodeSQLiteFamilyRead, sessions []openCodeSQLiteHead) error {
+	midnight := openCodeLocalMidnight(openCodeDirectNow()).UnixMilli()
+	for _, s := range sessions {
+		if s.UpdatedMs < midnight {
+			return nil
+		}
+		held, err := openCodeSQLiteHoldsSession(ctx, db, loser.MessageTable, s.ID)
+		if err != nil {
+			return err
+		}
+		if held {
+			logOpenCodeUsageCapture("direct_family_suppressed")
+			return nil
+		}
+	}
+	return nil
 }
 
 // openCodeSQLiteHead is one session head: its id and last write.
