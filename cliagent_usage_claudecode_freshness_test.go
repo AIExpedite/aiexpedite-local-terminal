@@ -3544,9 +3544,15 @@ func TestClaudeRunDebt_RefusedReplaysBookARungAndChargeNothing(t *testing.T) {
 			writeClaudeProbeCredentialExpiring(t, os.Getenv("CLAUDE_CONFIG_DIR"), probeTestToken, time.Now().Add(-time.Hour))
 		}},
 		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T, cache string, owed time.Time) {
+			offlineMutex.Lock()
 			was := isOffline
 			isOffline = true
-			t.Cleanup(func() { isOffline = was })
+			offlineMutex.Unlock()
+			t.Cleanup(func() {
+				offlineMutex.Lock()
+				isOffline = was
+				offlineMutex.Unlock()
+			})
 		}},
 	}
 	for _, tc := range cases {
