@@ -3,8 +3,8 @@ module github.com/AIExpedite/aiexpedite-local-terminal
 go 1.26.0
 
 require (
-	cloud.google.com/go/pubsub/v2 v2.7.0 // direct
-	cloud.google.com/go/storage v1.69.0 // direct
+	cloud.google.com/go/pubsub/v2 v2.8.0 // direct
+	cloud.google.com/go/storage v1.70.0 // direct
 	github.com/BurntSushi/toml v1.6.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
 	golang.org/x/mod v0.42.0 // semver‑compare helper
@@ -18,8 +18,9 @@ require (
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/time v0.16.0
-	google.golang.org/api v0.304.0
-	modernc.org/sqlite v1.60.1
+	google.golang.org/api v0.307.0
+	google.golang.org/protobuf v1.36.12
+	modernc.org/sqlite v1.61.0
 )
 
 require (
@@ -38,7 +39,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/ebitengine/purego v0.11.1 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
@@ -55,7 +56,7 @@ require (
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
-	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/petermattis/goid v0.0.0-20260918085751-abfca077860b // indirect
 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
 	github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 // indirect
@@ -84,10 +85,9 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto v0.0.0-20260715232425-e75dac1f907d // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260715232425-e75dac1f907d // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261019180522-ce908d29299b // indirect
 	google.golang.org/grpc v1.84.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
-	modernc.org/libc v1.77.1 // indirect
+	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
