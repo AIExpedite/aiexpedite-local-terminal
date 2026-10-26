@@ -509,6 +509,7 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		cursor.PinnedKeys, cursor.PinnedWrittenMs, cursor.PinnedCompletedMs = pin.Keys, pin.WrittenMs, pin.CompletedMs
 		cursor.PinnedDroppedMs, cursor.PinnedDroppedDoneMs = pin.DroppedMs, pin.DroppedDoneMs
 		cursor.MidnightRereadDate, cursor.MidnightRereadLayouts = openCodeDirectMidnightRereads(ledger.DirectCursor, fromMidnight, layout, today)
+		cursor.PausedLayout, cursor.PausedResumeMs = openCodeDirectPausedFamily(ledger.DirectCursor, layout)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -537,7 +538,9 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 // cursor was renewed on a family holding none of the spend the other one was
 // writing. That happens once per family per local day (the cursor's
 // MidnightRereadLayouts); a later switch onto the same family re-reads from the
-// cut. Earlier days are not backfilled — the card publishes only today's bucket.
+// cut, or from where that family paused when that is earlier (the cursor's
+// PausedResumeMs), so its writes while the other family won are still read.
+// Earlier days are not backfilled — the card publishes only today's bucket.
 func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits, bool) {
 	floorMs := openCodeDirectScanFloor(saved, now)
 	limits := openCodeDirectLimits{
@@ -555,6 +558,10 @@ func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time
 		floorMs = midnight.UnixMilli()
 		limits.SessionFloorMs = midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli()
 		return floorMs, limits, true
+	case c.Layout != layout && c.PausedLayout == layout && c.PausedResumeMs > 0:
+		midnight := openCodeLocalMidnight(now)
+		floorMs = max(midnight.UnixMilli(), min(floorMs, c.PausedResumeMs))
+		limits.SessionFloorMs = max(midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli(), min(limits.SessionFloorMs, c.PausedResumeMs))
 	case c.Continue && c.Layout == layout:
 		limits.ExactSessions = c.AtSession
 		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
@@ -593,6 +600,22 @@ func openCodeDirectMidnightRereads(prev *openCodeDirectCursor, fromMidnight bool
 		return "", nil
 	}
 	return today, layouts
+}
+
+// openCodeDirectPausedFamily is the paused SQLite family a committed cursor on
+// layout carries: on a switch between the two families, the one switched away
+// from, at its cursor's resume point; otherwise prev's, unchanged. A switch onto
+// the paused family consumes it, and a switch to or from JSON drops it.
+func openCodeDirectPausedFamily(prev *openCodeDirectCursor, layout string) (string, int64) {
+	switch {
+	case prev == nil:
+		return "", 0
+	case prev.Layout == layout:
+		return prev.PausedLayout, prev.PausedResumeMs
+	case isOpenCodeSQLiteLayout(prev.Layout) && isOpenCodeSQLiteLayout(layout):
+		return prev.Layout, prev.resumeMs()
+	}
+	return "", 0
 }
 
 // openCodeDirectWriteCanWait reports that a scan which found nothing new need

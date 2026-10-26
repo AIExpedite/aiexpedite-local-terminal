@@ -170,6 +170,10 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // onto them: a later switch onto one of them that day re-reads from the cut, so
 // an election flip-flopping between two clients' families cannot re-read the
 // whole day on every tick.
+// PausedLayout is the other SQLite family, and PausedResumeMs the resume point
+// its own cursor had when the election switched away from it: its writes since
+// were never read, so a later switch back onto it that skips the midnight
+// re-read still reads from there when that is before the cut.
 type openCodeDirectCursor struct {
 	Layout                string   `json:"layout"`
 	ThroughMs             int64    `json:"throughMs"`
@@ -187,6 +191,8 @@ type openCodeDirectCursor struct {
 	PinnedDroppedDoneMs   int64    `json:"pinnedDroppedDoneMs,omitempty"`
 	MidnightRereadDate    string   `json:"midnightRereadDate,omitempty"`
 	MidnightRereadLayouts []string `json:"midnightRereadLayouts,omitempty"`
+	PausedLayout          string   `json:"pausedLayout,omitempty"`
+	PausedResumeMs        int64    `json:"pausedResumeMs,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the

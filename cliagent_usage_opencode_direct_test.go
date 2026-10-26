@@ -1469,3 +1469,64 @@ func TestOpenCodeDirect_AFlipFloppingElectionRereadsMidnightOncePerFamilyPerDay(
 	store.v2Assistant("ses_f", "msg_f", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 3)
 	scan(t, v2, 3, true, []string{v2})
 }
+
+// A family the election switched away from resumes where it paused: V2 writes
+// made while V1 kept winning are read on the next switch back to V2 even after
+// V2's midnight re-read is spent and V1's cursor has moved past them.
+func TestOpenCodeDirect_ASwitchBackResumesWhereTheFamilyPaused(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2305)
+	store := newOpenCode119TestStore(t, fixture.root)
+	floors := recordOpenCodeDirectFloors(t)
+	scan := func(t *testing.T, wantLayout string, wantTokens int64, wantMidnight bool) {
+		t.Helper()
+		if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+			t.Fatalf("scan = %q", label)
+		}
+		midnight := openCodeLocalMidnight(clock.now).UnixMilli()
+		if got := slices.Contains(floors(), midnight); got != wantMidnight {
+			t.Fatalf("read from midnight = %v, want %v", got, wantMidnight)
+		}
+		if n := openCodeTodayTokens(t, clock.now); n != wantTokens {
+			t.Fatalf("tokens today = %d, want %d", n, wantTokens)
+		}
+		if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Layout != wantLayout {
+			t.Fatalf("cursor = %+v, want %s", c, wantLayout)
+		}
+	}
+	v1, v2 := openCodeStoreLayoutSQLite, openCodeStoreLayoutSQLiteV2
+
+	store.v1Assistant("ses_a", "msg_a", clock.ms(-3*time.Hour), clock.ms(-3*time.Hour+time.Second), [][3]int64{{100, 0, 0}}, 0)
+	scan(t, v1, 100, true)
+	clock.now = clock.now.Add(time.Minute)
+	store.v2Assistant("ses_b", "msg_b", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 10)
+	scan(t, v2, 110, true)
+	clock.now = clock.now.Add(time.Minute)
+	store.v1Assistant("ses_c", "msg_c", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{20, 0, 0}}, 0)
+	scan(t, v1, 130, true)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c.PausedLayout != v2 || c.PausedResumeMs == 0 {
+		t.Fatalf("cursor = %+v, want V2 paused", c)
+	}
+
+	// V2 writes, but V1 holds the newest session, so V1 keeps winning and its
+	// cursor moves well past the V2 write.
+	clock.now = clock.now.Add(30 * time.Minute)
+	store.v2Assistant("ses_x", "msg_x", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 5)
+	store.v1Assistant("ses_c", "msg_e", clock.ms(-15*time.Second), clock.ms(-10*time.Second), [][3]int64{{7, 0, 0}}, 0)
+	scan(t, v1, 137, false)
+	clock.now = clock.now.Add(30 * time.Minute)
+	store.v1Assistant("ses_c", "msg_g", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{3, 0, 0}}, 0)
+	scan(t, v1, 140, false)
+
+	// Back on V2: its midnight re-read is spent, yet msg_x is read from where
+	// V2 paused, and msg_b inside that window is not counted again.
+	clock.now = clock.now.Add(30 * time.Minute)
+	store.v2Assistant("ses_y", "msg_y", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 2)
+	scan(t, v2, 147, false)
+	if c := loadOpenCodeUsageLedger().DirectCursor; c.PausedLayout != v1 {
+		t.Fatalf("cursor = %+v, want V1 paused", c)
+	}
+	scanOpenCodeDirect(t)
+	if n := openCodeTodayTokens(t, clock.now); n != 147 {
+		t.Fatalf("tokens today after a quiet scan = %d, want 147", n)
+	}
+}
