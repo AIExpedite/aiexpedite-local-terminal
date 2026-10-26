@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -21,18 +19,7 @@ func TestB5ModelDiscoveryHarness(t *testing.T) {
 	}
 	// TestMain sandboxes HOME; the harness wants the real one, where the CLIs
 	// keep their logins and caches.
-	if realHomeAtStartup != "" {
-		t.Setenv("HOME", realHomeAtStartup)
-		t.Setenv("USERPROFILE", realHomeAtStartup)
-		if realAppDataAtStartup != "" {
-			t.Setenv("APPDATA", realAppDataAtStartup)
-		}
-		// OpenCode reads its provider config from XDG_CONFIG_HOME, which the
-		// sandbox also redirects; a sandboxed value hides every local provider.
-		if strings.HasPrefix(os.Getenv("XDG_CONFIG_HOME"), testSandboxDir) {
-			t.Setenv("XDG_CONFIG_HOME", filepath.Join(realHomeAtStartup, ".config"))
-		}
-	}
+	useRealUserProfile(t)
 	resetCLIAgentModelProbeCache()
 	detected := gatherCLIAgents()
 	usage := gatherCLIAgentUsage(detected, time.Now())

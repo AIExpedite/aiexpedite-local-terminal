@@ -16,8 +16,12 @@
 //   - Source: SQLite V1 or V2 family. The SQLite adapter elects OpenCode 1's
 //     tables or OpenCode 2's per read and reports which as the read's layout
 //     (sqlite / sqlite_v2); the cursor and coverage record it, so a switch is a
-//     layout switch. A switch onto V2 re-reads from local midnight once: the
-//     frozen V1 tables renewed the cursor without reading what V2 wrote.
+//     layout switch. A switch between the two families, either way, re-reads
+//     from local midnight, at most once per family per local day: until then
+//     the cursor was renewed on a family holding none of the new turns (frozen
+//     V1 tables beside V2, or the empty session_message OpenCode 1.19 stages
+//     beside V1). Where both families share the session heads, the one holding
+//     the newest session's messages is elected, not the one whose tables exist.
 //   - Dedup: a message is keyed sha256(session, "message:"+id) — the key the
 //     export fallback writes — so the two cannot count one message twice. A
 //     stream step is keyed by its part id instead, so the reader skips every
@@ -62,6 +66,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -431,11 +436,15 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	if c := saved.DirectCursor; c != nil && layout == openCodeStoreLayoutSQLite && c.Layout == openCodeStoreLayoutSQLiteV2 {
 		expect = c.Layout
 	}
-	floorMs, limits := openCodeDirectReadBounds(saved, expect, now)
+	floorMs, limits, fromMidnight := openCodeDirectReadBounds(saved, expect, now)
 	result, err := read(ctx, root, floorMs, limits)
 	if err == nil && firstNonEmpty(result.Layout, layout) != expect {
 		expect = firstNonEmpty(result.Layout, layout)
-		if f, l := openCodeDirectReadBounds(saved, expect, now); f != floorMs || l != limits {
+		// Equal bounds read the same records: the first read stands for the
+		// switch's own, midnight re-read included.
+		f, l, m := openCodeDirectReadBounds(saved, expect, now)
+		fromMidnight = m
+		if f != floorMs || l != limits {
 			floorMs, limits = f, l
 			result, err = read(ctx, root, floorMs, limits)
 			if err == nil && firstNonEmpty(result.Layout, layout) != expect {
@@ -499,6 +508,8 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 		pin := openCodeDirectPinnedKeys(ledger.DirectCursor, result.Truncated || revisitMs > 0, pinned, openCodeLocalMidnight(now).UnixMilli())
 		cursor.PinnedKeys, cursor.PinnedWrittenMs, cursor.PinnedCompletedMs = pin.Keys, pin.WrittenMs, pin.CompletedMs
 		cursor.PinnedDroppedMs, cursor.PinnedDroppedDoneMs = pin.DroppedMs, pin.DroppedDoneMs
+		cursor.MidnightRereadDate, cursor.MidnightRereadLayouts = openCodeDirectMidnightRereads(ledger.DirectCursor, fromMidnight, layout, today)
+		cursor.PausedLayout, cursor.PausedResumeMs = openCodeDirectPausedFamily(ledger.DirectCursor, layout)
 		ledger.DirectCursor = cursor
 		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: layout, ObservedAtMs: now.UnixMilli(), LastOkLocalDate: today}
 		return true, changed
@@ -518,14 +529,20 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 	return "direct_scanned", held || pending || revisited
 }
 
-// openCodeDirectReadBounds is the floor and limits of a read in layout. A
+// openCodeDirectReadBounds is the floor and limits of a read in layout, and
+// whether the floor is local midnight because of a family switch. A
 // continuation's skip and floors index the adapter that cut it; after a layout
 // switch the other adapter orders tied records differently, so it re-reads from
-// the cut and seenSteps absorbs the repeats. A switch onto the SQLite V2 family
-// re-reads from local midnight instead: until then the frozen V1 tables renewed
-// the cursor without reading any of the spend V2 was writing. Earlier days are
-// not backfilled — the card publishes only today's bucket.
-func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits) {
+// the cut and seenSteps absorbs the repeats. A switch between the two SQLite
+// families, either way, re-reads from local midnight instead: until then the
+// cursor was renewed on a family holding none of the spend the other one was
+// writing. That happens once per family per local day, and never for a family
+// the cursor already sat on today (the cursor's MidnightRereadLayouts); a later
+// switch onto such a family re-reads from the cut, or from where that family
+// paused when that is earlier (the cursor's PausedResumeMs), so its writes
+// while the other family won are still read and its rewind floor still holds.
+// Earlier days are not backfilled — the card publishes only today's bucket.
+func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits, bool) {
 	floorMs := openCodeDirectScanFloor(saved, now)
 	limits := openCodeDirectLimits{
 		MaxSessions:    openCodeDirectMaxSessions,
@@ -534,12 +551,18 @@ func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time
 		SessionFloorMs: openCodeDirectSessionFloor(saved, now),
 	}
 	c := saved.DirectCursor
+	today, _ := openCodeLocalDay(now)
 	switch {
 	case c == nil:
-	case c.Layout != layout && layout == openCodeStoreLayoutSQLiteV2:
+	case c.Layout != layout && isOpenCodeSQLiteLayout(c.Layout) && isOpenCodeSQLiteLayout(layout) && !c.rereadFromMidnight(layout, today):
 		midnight := openCodeLocalMidnight(now)
 		floorMs = midnight.UnixMilli()
 		limits.SessionFloorMs = midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli()
+		return floorMs, limits, true
+	case c.Layout != layout && c.PausedLayout == layout && c.PausedResumeMs > 0:
+		midnight := openCodeLocalMidnight(now)
+		floorMs = max(midnight.UnixMilli(), min(floorMs, c.PausedResumeMs))
+		limits.SessionFloorMs = max(midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli(), min(limits.SessionFloorMs, c.PausedResumeMs))
 	case c.Continue && c.Layout == layout:
 		limits.ExactSessions = c.AtSession
 		limits.Skip = openCodeDirectSkip{AtMs: c.ThroughMs, N: c.Skip}
@@ -549,7 +572,58 @@ func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time
 			limits.SessionSinceMs = c.SessionSinceMs
 		}
 	}
-	return floorMs, limits
+	return floorMs, limits, false
+}
+
+// isOpenCodeSQLiteLayout reports one of the SQLite adapter's two families.
+func isOpenCodeSQLiteLayout(layout string) bool {
+	return layout == openCodeStoreLayoutSQLite || layout == openCodeStoreLayoutSQLiteV2
+}
+
+// rereadFromMidnight reports that layout was already re-read from local
+// midnight, or read by the cursor, on today's local date.
+func (c openCodeDirectCursor) rereadFromMidnight(layout, today string) bool {
+	return c.MidnightRereadDate == today && slices.Contains(c.MidnightRereadLayouts, layout)
+}
+
+// openCodeDirectMidnightRereads is the midnight re-read stamp a committed
+// cursor carries: prev's for today, plus the family a switch between the two
+// SQLite families left, plus layout when this read went back to midnight. A
+// stamp from an earlier day is dropped. The family left was already read today
+// — the cursor sat on it — so a switch back resumes where it paused rather than
+// at midnight: on a heavy day its keys can have rolled out of seenSteps, and
+// only its rewind floor, which the paused point keeps, stops a second count.
+func openCodeDirectMidnightRereads(prev *openCodeDirectCursor, fromMidnight bool, layout, today string) (string, []string) {
+	var layouts []string
+	if prev != nil && prev.MidnightRereadDate == today {
+		layouts = slices.Clone(prev.MidnightRereadLayouts)
+	}
+	if prev != nil && prev.Layout != layout && isOpenCodeSQLiteLayout(prev.Layout) && isOpenCodeSQLiteLayout(layout) && !slices.Contains(layouts, prev.Layout) {
+		layouts = append(layouts, prev.Layout)
+	}
+	if fromMidnight && !slices.Contains(layouts, layout) {
+		layouts = append(layouts, layout)
+	}
+	if len(layouts) == 0 {
+		return "", nil
+	}
+	return today, layouts
+}
+
+// openCodeDirectPausedFamily is the paused SQLite family a committed cursor on
+// layout carries: on a switch between the two families, the one switched away
+// from, at the point it paused; otherwise prev's, unchanged. A switch onto the
+// paused family consumes it, and a switch to or from JSON drops it.
+func openCodeDirectPausedFamily(prev *openCodeDirectCursor, layout string) (string, int64) {
+	switch {
+	case prev == nil:
+		return "", 0
+	case prev.Layout == layout:
+		return prev.PausedLayout, prev.PausedResumeMs
+	case isOpenCodeSQLiteLayout(prev.Layout) && isOpenCodeSQLiteLayout(layout):
+		return prev.Layout, prev.pausedResumeMs()
+	}
+	return "", 0
 }
 
 // openCodeDirectWriteCanWait reports that a scan which found nothing new need
@@ -768,6 +842,19 @@ func (c openCodeDirectCursor) resumeMs() int64 {
 		return c.ThroughMs
 	}
 	return max(c.ThroughMs-openCodeDirectOverlap.Milliseconds(), min(c.RewindFloorMs, c.ThroughMs))
+}
+
+// pausedResumeMs is where a family the election switched away from paused: its
+// resume point, pulled back to a revisit floor its continuation still owed.
+// The records between the two were read but kept out of the count — a hold on a
+// managed run, or a message that had not finished — and the switch drops the
+// continuation that would have returned there, so without the floor they are
+// never read again.
+func (c openCodeDirectCursor) pausedResumeMs() int64 {
+	if resume := c.resumeMs(); c.Continue && c.RevisitFloorMs > 0 && c.RevisitFloorMs < resume {
+		return c.RevisitFloorMs
+	}
+	return c.resumeMs()
 }
 
 // openCodeDirectScanFloor is where a scan starts: the cursor's resume point,

@@ -165,21 +165,36 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // before it is counted again either: a rewrite of an already-counted message
 // moves its record past the write floor, and its key is by then in neither the
 // pinned keys nor seenSteps, but its completed time does not move.
+// MidnightRereadDate is the local date on which the SQLite families listed in
+// MidnightRereadLayouts were each re-read from local midnight after a switch
+// onto them, or were switched away from — already read today: a later switch
+// onto one of them that day re-reads from the cut, so an election
+// flip-flopping between two clients' families cannot re-read the whole day on
+// every tick, nor re-read records whose keys rolled out of seenSteps.
+// PausedLayout is the other SQLite family, and PausedResumeMs the point its own
+// cursor paused at when the election switched away from it — its resume point,
+// or a revisit floor its continuation still owed: its writes since were never
+// read, so a later switch back onto it that skips the midnight re-read still
+// reads from there when that is before the cut.
 type openCodeDirectCursor struct {
-	Layout              string   `json:"layout"`
-	ThroughMs           int64    `json:"throughMs"`
-	Continue            bool     `json:"continue,omitempty"`
-	AtSession           bool     `json:"atSession,omitempty"`
-	Skip                int      `json:"skip,omitempty"`
-	RecordFloorMs       int64    `json:"recordFloorMs,omitempty"`
-	SessionSinceMs      int64    `json:"sessionSinceMs,omitempty"`
-	RewindFloorMs       int64    `json:"rewindFloorMs,omitempty"`
-	RevisitFloorMs      int64    `json:"revisitFloorMs,omitempty"`
-	PinnedKeys          []string `json:"pinnedKeys,omitempty"`
-	PinnedWrittenMs     []int64  `json:"pinnedWrittenMs,omitempty"`
-	PinnedCompletedMs   []int64  `json:"pinnedCompletedMs,omitempty"`
-	PinnedDroppedMs     int64    `json:"pinnedDroppedMs,omitempty"`
-	PinnedDroppedDoneMs int64    `json:"pinnedDroppedDoneMs,omitempty"`
+	Layout                string   `json:"layout"`
+	ThroughMs             int64    `json:"throughMs"`
+	Continue              bool     `json:"continue,omitempty"`
+	AtSession             bool     `json:"atSession,omitempty"`
+	Skip                  int      `json:"skip,omitempty"`
+	RecordFloorMs         int64    `json:"recordFloorMs,omitempty"`
+	SessionSinceMs        int64    `json:"sessionSinceMs,omitempty"`
+	RewindFloorMs         int64    `json:"rewindFloorMs,omitempty"`
+	RevisitFloorMs        int64    `json:"revisitFloorMs,omitempty"`
+	PinnedKeys            []string `json:"pinnedKeys,omitempty"`
+	PinnedWrittenMs       []int64  `json:"pinnedWrittenMs,omitempty"`
+	PinnedCompletedMs     []int64  `json:"pinnedCompletedMs,omitempty"`
+	PinnedDroppedMs       int64    `json:"pinnedDroppedMs,omitempty"`
+	PinnedDroppedDoneMs   int64    `json:"pinnedDroppedDoneMs,omitempty"`
+	MidnightRereadDate    string   `json:"midnightRereadDate,omitempty"`
+	MidnightRereadLayouts []string `json:"midnightRereadLayouts,omitempty"`
+	PausedLayout          string   `json:"pausedLayout,omitempty"`
+	PausedResumeMs        int64    `json:"pausedResumeMs,omitempty"`
 }
 
 // openCodeDirectCoverage records the reader's last scan. LastOkLocalDate is the
