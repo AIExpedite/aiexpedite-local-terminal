@@ -150,3 +150,20 @@ func setEnvOrDie(key, value string) {
 		os.Exit(1)
 	}
 }
+
+// setTestOffline pins the offline flag under offlineMutex for one test and
+// restores it on cleanup. It writes the flag directly rather than calling
+// SetOffline, which also releases the reconnect drain, signals offlineChan
+// and logs a transition.
+func setTestOffline(t *testing.T, offline bool) {
+	t.Helper()
+	offlineMutex.Lock()
+	was := isOffline
+	isOffline = offline
+	offlineMutex.Unlock()
+	t.Cleanup(func() {
+		offlineMutex.Lock()
+		isOffline = was
+		offlineMutex.Unlock()
+	})
+}

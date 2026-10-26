@@ -67,19 +67,6 @@ func (f codexFreshnessFixture) oweExhaustedDebt(t *testing.T, runStart, complete
 	return state
 }
 
-func setCodexTestOffline(t *testing.T, offline bool) {
-	t.Helper()
-	offlineMutex.Lock()
-	was := isOffline
-	isOffline = offline
-	offlineMutex.Unlock()
-	t.Cleanup(func() {
-		offlineMutex.Lock()
-		isOffline = was
-		offlineMutex.Unlock()
-	})
-}
-
 // Two callers settling onto the SAME debt generation spend one live read, not
 // two: the gate admits one fallback per account, and the loser finds the
 // generation resolved.

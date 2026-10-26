@@ -2268,7 +2268,7 @@ func TestCodexRefreshAfterRun_LiveFallbackDeferredWhileOffline(t *testing.T) {
 	now := time.Now()
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 	calls := stubCodexFallbackRead(t, capturingFallbackRead)
 	f.oweExhaustedDebt(t, now.Add(-2*time.Minute), now.Add(-time.Minute))
 

@@ -582,14 +582,14 @@ func TestClaudeUpdateSurvival_AnOfflineStartIsPropagatedAfterReconnect(t *testin
 		claudeWindowFiveHour: {UsedPercentage: 70, ResetsAtMs: observed.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: observed.UnixMilli(), usageKnown: true},
 	}, observed, "", nil, claudeCredStamp{})
 
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 	resetCLIUsagePropagator()
 	startCLIUsagePropagator(svc.cfg)
 	time.Sleep(3 * cliUsageHintSpacing)
 	if hints, _, _ := svc.snapshot(); len(hintsAfter(hints, preRun)) != 0 {
 		t.Fatalf("hinted while offline: %+v", hints)
 	}
-	setCodexTestOffline(t, false)
+	setTestOffline(t, false)
 	waitForClaudeCondition(t, 5*time.Second, "the recovered generation was never sent after reconnect", func() bool {
 		_, dispatches, _ := svc.snapshot()
 		return dispatches == 1

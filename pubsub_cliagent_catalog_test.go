@@ -20,15 +20,7 @@ func TestHandleCLIUsageRefreshCommand_PersistsAndRefreshesChangedCatalog(t *test
 	SetCLIAgentCatalog(nil)
 	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
 
-	offlineMutex.Lock()
-	originalOffline := isOffline
-	isOffline = true
-	offlineMutex.Unlock()
-	t.Cleanup(func() {
-		offlineMutex.Lock()
-		isOffline = originalOffline
-		offlineMutex.Unlock()
-	})
+	setTestOffline(t, true)
 
 	originalRefresh := refreshMachineInfoAfterCatalogUpdate
 	var refreshes atomic.Int32

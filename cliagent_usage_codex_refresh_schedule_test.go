@@ -241,7 +241,7 @@ func retryTimerGeneration() uint64 {
 func TestCodexRunDebtRetry_OfflineDebtRetiresWithAMarker(t *testing.T) {
 	real := time.Now()
 	f := newCodexFreshnessFixture(t, real.Add(-9*time.Hour))
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 	calls := stubCodexFallbackRead(t, capturingFallbackRead)
 	runStart := real.Add(-2 * time.Minute)
 	state := f.oweUnpaidDebt(t, runStart, real.Add(-time.Minute), codexRefreshAfterRunMaxAttempts, 0)

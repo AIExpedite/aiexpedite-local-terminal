@@ -359,20 +359,7 @@ func TestPayOwedClaudeUsageRefresh_OfflineSpendsNothing(t *testing.T) {
 		return true
 	})
 
-	// Pin the flag directly, as the sibling Antigravity freshness test does,
-	// rather than calling SetOffline: this case is about the replay's gate
-	// decision, and SetOffline additionally releases the reconnect drain,
-	// signals offlineChan and logs a transition — process-global side effects
-	// a freshness assertion has no business emitting into a shared suite.
-	offlineMutex.Lock()
-	wasOffline := isOffline
-	isOffline = true
-	offlineMutex.Unlock()
-	t.Cleanup(func() {
-		offlineMutex.Lock()
-		isOffline = wasOffline
-		offlineMutex.Unlock()
-	})
+	setTestOffline(t, true)
 
 	payOwedClaudeUsageRefreshAt(now)
 
@@ -2379,17 +2366,7 @@ func TestClaudeUsageProbeGate_CacheSeedChargesNothingWhenNothingCanIssue(t *test
 		{
 			name: "offline",
 			arrange: func(t *testing.T) {
-				// Pinned directly rather than through SetOffline, for the reason
-				// TestPayOwedClaudeUsageRefresh_OfflineSpendsNothing documents.
-				offlineMutex.Lock()
-				wasOffline := isOffline
-				isOffline = true
-				offlineMutex.Unlock()
-				t.Cleanup(func() {
-					offlineMutex.Lock()
-					isOffline = wasOffline
-					offlineMutex.Unlock()
-				})
+				setTestOffline(t, true)
 			},
 		},
 		{
@@ -3544,9 +3521,7 @@ func TestClaudeRunDebt_RefusedReplaysBookARungAndChargeNothing(t *testing.T) {
 			writeClaudeProbeCredentialExpiring(t, os.Getenv("CLAUDE_CONFIG_DIR"), probeTestToken, time.Now().Add(-time.Hour))
 		}},
 		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T, cache string, owed time.Time) {
-			was := isOffline
-			isOffline = true
-			t.Cleanup(func() { isOffline = was })
+			setTestOffline(t, true)
 		}},
 	}
 	for _, tc := range cases {

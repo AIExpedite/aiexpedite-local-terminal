@@ -3585,9 +3585,7 @@ func TestClaudeProbeResult_NotAdmittedReasonsSendNothing(t *testing.T) {
 			return context.Background(), stamped, true
 		}},
 		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
-			was := isOffline
-			isOffline = true
-			t.Cleanup(func() { isOffline = was })
+			setTestOffline(t, true)
 			return context.Background(), stamped, false
 		}},
 		{name: "no credential", want: claudeProbeNoCredential, admitted: true, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
