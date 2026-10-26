@@ -648,15 +648,7 @@ func TestAntigravityFreshness_OfflineKeepsTheDebtAndSpendsNothing(t *testing.T) 
 	helperWriteAntigravityCache(t, cache, time.Now().Add(-time.Hour))
 	calls := helperStubAntigravityCodeAssistOutcome(t, func() string { return liveProbeOutcomeCodeAssistOK })
 
-	offlineMutex.Lock()
-	wasOffline := isOffline
-	isOffline = true
-	offlineMutex.Unlock()
-	t.Cleanup(func() {
-		offlineMutex.Lock()
-		isOffline = wasOffline
-		offlineMutex.Unlock()
-	})
+	setTestOffline(t, true)
 
 	antigravityUsageRunSettled(time.Now(), 0, false, true)
 	antigravityUsageRefreshWaitIdle()

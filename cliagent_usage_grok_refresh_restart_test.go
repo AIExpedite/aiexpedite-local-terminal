@@ -97,15 +97,7 @@ func TestPayOwedGrokUsageRefresh_InterruptedRunIsOwedAfterAClockStepBack(t *test
 
 func TestPayOwedGrokUsageRefresh_OfflineSendsNothingAndKeepsTheDebt(t *testing.T) {
 	h := newGrokDebtHarness(t)
-	offlineMutex.Lock()
-	wasOffline := isOffline
-	isOffline = true
-	offlineMutex.Unlock()
-	t.Cleanup(func() {
-		offlineMutex.Lock()
-		isOffline = wasOffline
-		offlineMutex.Unlock()
-	})
+	setTestOffline(t, true)
 	h.write(grokUsageFreshness{
 		CompletionMs: h.clock().Add(-time.Second).UnixMilli(), OwedAtMs: h.clock().Add(-time.Second).UnixMilli(),
 		AccountFingerprint: "fp-ada",

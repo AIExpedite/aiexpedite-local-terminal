@@ -359,11 +359,6 @@ func TestPayOwedClaudeUsageRefresh_OfflineSpendsNothing(t *testing.T) {
 		return true
 	})
 
-	// Pin the flag directly, as the sibling Antigravity freshness test does,
-	// rather than calling SetOffline: this case is about the replay's gate
-	// decision, and SetOffline additionally releases the reconnect drain,
-	// signals offlineChan and logs a transition — process-global side effects
-	// a freshness assertion has no business emitting into a shared suite.
 	setTestOffline(t, true)
 
 	payOwedClaudeUsageRefreshAt(now)
@@ -2371,8 +2366,6 @@ func TestClaudeUsageProbeGate_CacheSeedChargesNothingWhenNothingCanIssue(t *test
 		{
 			name: "offline",
 			arrange: func(t *testing.T) {
-				// Pinned directly rather than through SetOffline, for the reason
-				// TestPayOwedClaudeUsageRefresh_OfflineSpendsNothing documents.
 				setTestOffline(t, true)
 			},
 		},
