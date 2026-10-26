@@ -604,8 +604,8 @@ func openCodeDirectMidnightRereads(prev *openCodeDirectCursor, fromMidnight bool
 
 // openCodeDirectPausedFamily is the paused SQLite family a committed cursor on
 // layout carries: on a switch between the two families, the one switched away
-// from, at its cursor's resume point; otherwise prev's, unchanged. A switch onto
-// the paused family consumes it, and a switch to or from JSON drops it.
+// from, at the point it paused; otherwise prev's, unchanged. A switch onto the
+// paused family consumes it, and a switch to or from JSON drops it.
 func openCodeDirectPausedFamily(prev *openCodeDirectCursor, layout string) (string, int64) {
 	switch {
 	case prev == nil:
@@ -613,7 +613,7 @@ func openCodeDirectPausedFamily(prev *openCodeDirectCursor, layout string) (stri
 	case prev.Layout == layout:
 		return prev.PausedLayout, prev.PausedResumeMs
 	case isOpenCodeSQLiteLayout(prev.Layout) && isOpenCodeSQLiteLayout(layout):
-		return prev.Layout, prev.resumeMs()
+		return prev.Layout, prev.pausedResumeMs()
 	}
 	return "", 0
 }
@@ -834,6 +834,19 @@ func (c openCodeDirectCursor) resumeMs() int64 {
 		return c.ThroughMs
 	}
 	return max(c.ThroughMs-openCodeDirectOverlap.Milliseconds(), min(c.RewindFloorMs, c.ThroughMs))
+}
+
+// pausedResumeMs is where a family the election switched away from paused: its
+// resume point, pulled back to a revisit floor its continuation still owed.
+// The records between the two were read but kept out of the count — a hold on a
+// managed run, or a message that had not finished — and the switch drops the
+// continuation that would have returned there, so without the floor they are
+// never read again.
+func (c openCodeDirectCursor) pausedResumeMs() int64 {
+	if resume := c.resumeMs(); c.Continue && c.RevisitFloorMs > 0 && c.RevisitFloorMs < resume {
+		return c.RevisitFloorMs
+	}
+	return c.resumeMs()
 }
 
 // openCodeDirectScanFloor is where a scan starts: the cursor's resume point,

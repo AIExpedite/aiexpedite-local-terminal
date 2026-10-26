@@ -1530,3 +1530,45 @@ func TestOpenCodeDirect_ASwitchBackResumesWhereTheFamilyPaused(t *testing.T) {
 		t.Fatalf("tokens today after a quiet scan = %d, want 147", n)
 	}
 }
+
+// A family paused mid-continuation keeps the revisit floor its cursor owed, not
+// just the cap's cut. The records between them were read but kept out of the
+// count — a hold on a managed run, or a message that had not finished — and the
+// switch away drops the continuation that would have returned there.
+func TestOpenCodeDirect_APausedFamilyKeepsItsRevisitFloor(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2306)
+	store := newOpenCode119TestStore(t, fixture.root)
+	v1, v2 := openCodeStoreLayoutSQLite, openCodeStoreLayoutSQLiteV2
+	today, _ := openCodeLocalDay(clock.now)
+	cut, pin := clock.ms(-20*time.Minute), clock.ms(-50*time.Minute)
+	// A V2 continuation a hold pinned half an hour behind its cut, with both
+	// families' midnight re-reads already spent today.
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{
+			Layout: v2, ThroughMs: cut, Continue: true, RevisitFloorMs: pin,
+			MidnightRereadDate: today, MidnightRereadLayouts: []string{v1, v2},
+		}
+		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: v2, ObservedAtMs: cut, LastOkLocalDate: today}
+		return true, false
+	})
+	store.v2Assistant("ses_held", "msg_held", pin+1000, pin+2000, 40)
+	store.v1Assistant("ses_v1", "msg_v1", clock.ms(-time.Minute), clock.ms(-30*time.Second), [][3]int64{{7, 0, 0}}, 0)
+
+	// V1 holds the newest session and wins: V2 pauses at the floor it owed.
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Layout != v1 || c.PausedLayout != v2 || c.PausedResumeMs != pin {
+		t.Fatalf("cursor = %+v, want V2 paused at its revisit floor %d", c, pin)
+	}
+	// Back on V2: the held turn is read from that floor, not skipped at a cut
+	// half an hour after it.
+	clock.now = clock.now.Add(time.Minute)
+	store.v2Assistant("ses_now", "msg_now", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 3)
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 50 {
+		t.Fatalf("tokens today = %d, want 50: V1's turn, the held V2 turn and the new one", n)
+	}
+}
