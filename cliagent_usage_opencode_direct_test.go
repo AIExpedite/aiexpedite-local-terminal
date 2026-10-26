@@ -1613,3 +1613,36 @@ func TestOpenCodeDirect_APausedFamilyKeepsItsRevisitFloor(t *testing.T) {
 		t.Fatalf("tokens today = %d, want 50: V1's turn, the held V2 turn and the new one", n)
 	}
 }
+
+// A recovery read never reaches before the rewind floor. Past it a drained
+// backlog rolled the ledger's seen keys over, so re-reading the day from
+// midnight would count those messages a second time and inflate a heavy
+// account's whole bucket. The unread writes behind the floor are the lesser
+// loss.
+func TestOpenCodeDirect_AMidnightRereadStopsAtTheRewindFloor(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2307)
+	store := newOpenCode119TestStore(t, fixture.root)
+	floors := recordOpenCodeDirectFloors(t)
+	today, _ := openCodeLocalDay(clock.now)
+	evicted := clock.ms(-20 * time.Minute)
+	// A V2 cursor whose commit evicted seen keys, and the morning's V1 spend it
+	// counted before they rolled over.
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: openCodeStoreLayoutSQLiteV2, ThroughMs: evicted, RewindFloorMs: evicted}
+		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: openCodeStoreLayoutSQLiteV2, ObservedAtMs: evicted, LastOkLocalDate: today}
+		openCodeUsageBucketFor(ledger, "", today).add(openCodeUsageBucket{InputTokens: 100, ObservedAtMs: clock.ms(-3 * time.Hour)})
+		return true, false
+	})
+	store.v1Assistant("ses_morning", "msg_morning", clock.ms(-3*time.Hour), clock.ms(-3*time.Hour+time.Second), [][3]int64{{100, 0, 0}}, 0)
+	store.v1Assistant("ses_now", "msg_now", clock.ms(-time.Minute), clock.ms(-30*time.Second), [][3]int64{{7, 0, 0}}, 0)
+
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if got := floors(); slices.Contains(got, openCodeLocalMidnight(clock.now).UnixMilli()) || !slices.Contains(got, evicted) {
+		t.Fatalf("read floors = %v, want the rewind floor %d, never midnight", got, evicted)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 107 {
+		t.Fatalf("tokens today = %d, want 107: the new turn only, never the morning's again", n)
+	}
+}

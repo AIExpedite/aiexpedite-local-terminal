@@ -540,7 +540,9 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 // the cursor already sat on today (the cursor's MidnightRereadLayouts); a later
 // switch onto such a family re-reads from the cut, or from where that family
 // paused when that is earlier (the cursor's PausedResumeMs), so its writes
-// while the other family won are still read and its rewind floor still holds.
+// while the other family won are still read. Neither recovery reaches before
+// the rewind floor (openCodeDirectRereadFloor), whenever the keys it guards
+// rolled over after the pause.
 // Earlier days are not backfilled — the card publishes only today's bucket.
 func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits, bool) {
 	floorMs := openCodeDirectScanFloor(saved, now)
@@ -556,12 +558,12 @@ func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time
 	case c == nil:
 	case c.Layout != layout && isOpenCodeSQLiteLayout(c.Layout) && isOpenCodeSQLiteLayout(layout) && !c.rereadFromMidnight(layout, today):
 		midnight := openCodeLocalMidnight(now)
-		floorMs = midnight.UnixMilli()
+		floorMs = openCodeDirectRereadFloor(c, now)
 		limits.SessionFloorMs = midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli()
 		return floorMs, limits, true
 	case c.Layout != layout && c.PausedLayout == layout && c.PausedResumeMs > 0:
 		midnight := openCodeLocalMidnight(now)
-		floorMs = max(midnight.UnixMilli(), min(floorMs, c.PausedResumeMs))
+		floorMs = max(openCodeDirectRereadFloor(c, now), min(floorMs, c.PausedResumeMs))
 		limits.SessionFloorMs = max(midnight.Add(-openCodeUsageDebtMaxAge).UnixMilli(), min(limits.SessionFloorMs, c.PausedResumeMs))
 	case c.Continue && c.Layout == layout:
 		limits.ExactSessions = c.AtSession
@@ -753,6 +755,20 @@ func openCodeDirectRewindFloor(prev *openCodeDirectCursor, evicted, truncated bo
 		return prev.RewindFloorMs
 	}
 	return 0
+}
+
+// openCodeDirectRereadFloor is how far back a recovery read may reach: local
+// midnight, since the card publishes only today's bucket, and never before the
+// cursor's rewind floor — a backlog drained past it rolled the ledger's seen
+// keys over, so the records before it would be counted a second time. An
+// under-count of a family's unread writes is the lesser error: a heavy day
+// re-read from midnight with its keys evicted inflates the whole bucket.
+func openCodeDirectRereadFloor(c *openCodeDirectCursor, now time.Time) int64 {
+	floor := openCodeLocalMidnight(now).UnixMilli()
+	if c == nil {
+		return floor
+	}
+	return max(floor, min(c.RewindFloorMs, c.ThroughMs))
 }
 
 // openCodeDirectSteps turns a read into ledger steps against ledger's ownership
