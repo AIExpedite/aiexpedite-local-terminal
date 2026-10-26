@@ -66,6 +66,16 @@ var (
 	// Compiled regex patterns for sensitive data detection
 	sensitivePatterns     []*regexp.Regexp
 	sensitivePatternsOnce sync.Once
+
+	// urlCredentialPattern matches the whole userinfo of any `scheme://...@`
+	// URL: `user:secret`, a bare token (`https://<PAT>@github.com`), an empty
+	// user (`https://:token@`), and a secret containing `@` (greedy to the last
+	// `@` of the authority). Seen in database connection strings and in git
+	// remotes echoed by a native program's stderr (`fatal: unable to access
+	// 'https://x:tok@...'`). It stops at whitespace and `/`: neither can appear
+	// unencoded in a URL's userinfo, and stopping there keeps a match from
+	// running across lines or into a path. A credential-free URL is unchanged.
+	urlCredentialPattern = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*)://[^\s/]+@`)
 )
 
 // initSensitivePatterns compiles regex patterns once
@@ -82,8 +92,6 @@ func initSensitivePatterns() {
 			// AWS credentials
 			`(?i)(aws_access_key_id|aws_secret_access_key|aws_session_token)\s*[=:]\s*\S+`,
 			`AKIA[0-9A-Z]{16}`, // AWS Access Key ID pattern
-			// Connection strings with credentials
-			`(?i)(mongodb|postgres|mysql|redis|amqp)://[^:]+:[^@]+@`,
 			// Private keys
 			`(?i)-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----`,
 			// GitHub tokens
@@ -105,7 +113,9 @@ func initSensitivePatterns() {
 func redactSensitiveData(s string) string {
 	initSensitivePatterns()
 
-	result := s
+	// Applied on its own, before the generic replacer below, which would cut a
+	// match at its first `:` and lose the scheme.
+	result := urlCredentialPattern.ReplaceAllString(s, "${1}://[REDACTED]@")
 	for _, re := range sensitivePatterns {
 		result = re.ReplaceAllStringFunc(result, func(match string) string {
 			// For patterns like "password=xxx", keep the key visible
@@ -115,13 +125,6 @@ func redactSensitiveData(s string) string {
 			// For patterns like "Bearer xxx", keep the prefix
 			if strings.HasPrefix(strings.ToLower(match), "bearer ") {
 				return "Bearer [REDACTED]"
-			}
-			// For connection strings, redact credentials but keep protocol
-			if strings.Contains(match, "://") {
-				parts := strings.SplitN(match, "://", 2)
-				if len(parts) == 2 {
-					return parts[0] + "://[REDACTED]@"
-				}
 			}
 			return "[REDACTED]"
 		})
@@ -2604,7 +2607,12 @@ func runPubSubConnection(cfg *Config) error {
 		// Debug mode: show raw output details (redacted)
 		if cfg.DebugMode {
 			fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
-			fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
+			// The error embeds the command's output (ExitCodeError), stderr included.
+			errText := "<nil>"
+			if execErr != nil {
+				errText = redactSensitiveData(execErr.Error())
+			}
+			fmt.Printf("%s[DEBUG] Error: %s%s\n", colorMagenta, errText, colorReset)
 			// Show raw output with visible control characters (redacted)
 			fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, redactSensitiveData(out), colorReset)
 		}

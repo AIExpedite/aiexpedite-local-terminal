@@ -204,3 +204,24 @@ func TestIsCmdSafeArg(t *testing.T) {
 		t.Error("isCmdSafeArg(\"100%\") = true, want false")
 	}
 }
+
+func TestPsWrapUserCommand_Contract(t *testing.T) {
+	const cmd = "git clone -- a b"
+	w := psWrapUserCommand(cmd)
+	if strings.ContainsAny(w, "\r\n") {
+		t.Errorf("wrapper must be one line (the persistent host reads -Command - from stdin); got %q", w)
+	}
+	// Continue first, then the command, then the status capture as the very
+	// next statement, all inside the block: $? after `& { }` is always true.
+	want := "& { $ErrorActionPreference = 'Continue'; " + cmd + "; " + psStatusCaptureStatement + " }"
+	if w != want {
+		t.Errorf("wrapper changed:\n got %q\nwant %q", w, want)
+	}
+	// Never redirect the command's error stream inside PowerShell: in 5.1 a
+	// redirected native stderr line under the command's own Stop is
+	// terminating and silently skips the rest of the command. drainStderr
+	// reads the host's stderr instead.
+	if strings.Contains(w, ">&1") {
+		t.Errorf("wrapper must not redirect the error stream; got %q", w)
+	}
+}

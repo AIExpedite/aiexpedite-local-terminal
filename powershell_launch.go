@@ -120,13 +120,37 @@ const psStatusCaptureStatement = "$global:__aix_ok = $?"
 // cmdlet's own error carries a suffix (`CommandNotFoundException,Microsoft.
 // PowerShell.Commands.GetCommandCommand` for a `Get-Command -ErrorAction
 // SilentlyContinue` probe) and does not match; a real non-zero native code is
-// never overridden. $__aix_promoted lets a caller echo the error when the host's
-// stderr is not part of the output.
+// never overridden. The error itself reaches the output through the caller's
+// stderr (drainStderr, or the fallback's combined pipes).
 //
 // One line on purpose: the persistent host reads `-Command -` from stdin, where
 // a statement split across lines (`if (...) {` newline ...) is not run until a
 // blank line follows — the host would hang waiting for it.
-const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; $__aix_promoted = $false; " +
+const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; " +
 	"if (-not $__aix_ok -and ($null -eq $__aix_exit -or $__aix_exit -eq 0) -and $Error.Count -gt 0 -and " +
 	"@('CommandNotFoundException', 'UnauthorizedAccess') -contains $Error[0].FullyQualifiedErrorId) " +
-	"{ $__aix_exit = 1; $__aix_promoted = $true }"
+	"{ $__aix_exit = 1 }"
+
+// psWrapUserCommand wraps one user command for the persistent host.
+//
+//   - The script block keeps && / || inside the command from consuming the
+//     protocol lines that follow it.
+//   - psStatusCaptureStatement sits INSIDE the block, right after the command:
+//     $? after `& { }` itself is always true, so reading it outside would never
+//     see the command fail.
+//   - $ErrorActionPreference is scoped to Continue, so a Stop leaked into the
+//     host by an earlier command does not change how this one behaves (the
+//     one-shot fallback starts every command at Continue). A command that sets
+//     Stop itself still gets it: its assignment runs later in the same scope.
+//
+// The command's stderr is deliberately NOT redirected here (`2>&1`): in
+// Windows PowerShell 5.1 that turns every native stderr line into an
+// ErrorRecord, and under a Stop the command (or a .ps1 it runs) sets itself the
+// first one — git clone progress — becomes terminating, so the rest of the
+// command is silently skipped and reported as success. The host's stderr pipe
+// is drained in Go instead (powershell_windows.go drainStderr).
+//
+// One line on purpose, for the same reason as psExitCaptureScript.
+func psWrapUserCommand(command string) string {
+	return "& { $ErrorActionPreference = 'Continue'; " + command + "; " + psStatusCaptureStatement + " }"
+}
