@@ -3626,10 +3626,7 @@ func TestGatherCLIAgentUsageOnly_GrokMetricSurvivesCLIUpdate(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			name += ".exe"
 		}
-		path := filepath.Join(dir, name)
-		if err := copyTestBinary(testExe, path); err != nil {
-			t.Fatalf("copy %s: %v", mode, err)
-		}
+		copyAndWarmTestBinary(t, testExe, filepath.Join(dir, name))
 		return dir
 	}
 

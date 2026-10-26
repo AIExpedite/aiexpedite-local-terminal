@@ -698,6 +698,13 @@ type codexReadDirResumeState struct {
 // is preserved for the next refresh rather than dropped. Overridden in tests.
 var codexRolloutPartialLeafGrace = 25 * time.Millisecond
 
+// codexRolloutReadDirChunkHook, when set, is called just before
+// codexReadDirContext asks a directory stream for its next chunk, with the
+// number of chunks this invocation has already read. Test-only seam (nil in
+// production) so a case can cancel exactly on a chunk boundary instead of
+// guessing how many ctx.Err() checks precede it.
+var codexRolloutReadDirChunkHook func(dir string, chunksRead int)
+
 const codexReadDirResumeLimit = 16
 
 var (
@@ -782,7 +789,10 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, b
 	// ever-growing replay of duplicate metadata work.
 	firstNew := len(state.entries)
 
-	for {
+	for chunksRead := 0; ; chunksRead++ {
+		if codexRolloutReadDirChunkHook != nil {
+			codexRolloutReadDirChunkHook(dir, chunksRead)
+		}
 		if err := ctx.Err(); err != nil {
 			partial := codexTakePendingReplay(state, append([]os.DirEntry(nil), state.entries[firstNew:]...))
 			return partial, len(partial) - 1, resumed, err

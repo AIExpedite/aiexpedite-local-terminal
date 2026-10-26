@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2478,13 +2479,31 @@ func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.
 	// One run probes immediately; nine more land inside the throttle window and
 	// must coalesce onto a single retry rung. Turns of one session finish one
 	// after another, so the runs are settled in sequence.
-	var last time.Time
-	for i := 0; i < 10; i++ {
+	//
+	// "Inside the throttle window" is the precondition, not the behaviour: each
+	// run makes its durable debt write to the rate-limit cache file, and on a
+	// loaded Windows runner ten of those spanned more than a fixed 500 ms, so
+	// later runs opened windows of their own. The window is therefore derived
+	// from what the first run (the probing one, the most expensive) cost here,
+	// with room for nine more; the throttle is read on every gate decision, so
+	// setting it after the first run governs the other nine and their rung.
+	first := time.Now()
+	claudeUsageProbeAfterRun(first)
+	window := 20*time.Since(first) + 500*time.Millisecond
+	if window > 10*time.Second {
+		window = 10 * time.Second
+	}
+	t.Setenv(claudeUsageProbeMinIntervalEnv, strconv.FormatInt(window.Milliseconds(), 10))
+	last := first
+	for i := 1; i < 10; i++ {
+		time.Sleep(3 * time.Millisecond)
 		last = time.Now()
 		claudeUsageProbeAfterRun(last)
-		time.Sleep(3 * time.Millisecond)
 	}
-	waitForObservationAfter(t, last, 8*time.Second, "the coalesced trailing probe never landed")
+	if span := time.Since(first); span >= window {
+		t.Fatalf("precondition: ten runs took %s, past the %s window derived from the first run", span, window)
+	}
+	waitForObservationAfter(t, last, window+8*time.Second, "the coalesced trailing probe never landed")
 
 	if got := atomic.LoadInt64(calls); got > 2 {
 		t.Errorf("request count=%d, want <= 2 (immediate + one retry rung)", got)

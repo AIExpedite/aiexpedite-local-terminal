@@ -167,20 +167,17 @@ var resolveCodexSmokePath = func() string {
 // smoke's binary_missing pre-check, would read that negative back.
 func codexProbeVersion(path string) string {
 	if isWindowsShimPath(path) {
-		return cachedProbeVersionFunc(path, func() string {
+		return cachedProbeVersionOutcomeFunc(path, func() (string, versionProbeOutcome) {
 			ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 			defer cancel()
 			cmd, ok := codexSmokeShimCommand(ctx, codexSmokeLaunch{
 				Path: path, Args: []string{"--version"}, Env: os.Environ(),
 			})
 			if !ok {
-				return ""
+				return "", versionProbeFailed
 			}
 			out, err := cmd.CombinedOutput()
-			if err != nil {
-				return ""
-			}
-			return firstNonEmptyLine(out)
+			return versionProbeResult(ctx, out, err)
 		})
 	}
 	return cachedProbeVersion(path)

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -377,6 +378,43 @@ func TestAntigravityLoginRenewal_PersistsAndLogsMetricsOnly(t *testing.T) {
 	for _, forbidden := range []string{"54452", "access-renew-secret", "never-read", "@", "/opt/agy", `\`} {
 		if strings.Contains(logged, forbidden) {
 			t.Errorf("the agent log leaked %q:\n%s", forbidden, logged)
+		}
+	}
+}
+
+// The cold-start lines added for update survival: the version probe's transient
+// notice and the capture's discovery-ramp restart. Neither may carry the install
+// path, a token, the account or log text — only the binary's name and a fixed
+// internal label.
+func TestAntigravityColdStartLines_CarryNoSecrets(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), helperSecretScriptToken)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := "agy"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	agy := filepath.Join(dir, name)
+	if err := os.WriteFile(agy, []byte("updated build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	helperColdVersionProbeOnce(t, "agy", "agy version 1.2.3")
+
+	logged := captureStdout(t, func() { cachedProbeVersion(agy) })
+	if !strings.Contains(logged, "version probe transient") {
+		t.Errorf("the transient version probe was not logged:\n%s", logged)
+	}
+	_, rampLogged := helperRunLateStartedCapture(t)
+	if !strings.Contains(rampLogged, "Capture discovery ramp restarted") {
+		t.Errorf("the ramp restart was not logged:\n%s", rampLogged)
+	}
+	logged += rampLogged
+
+	helperAssertNoSecrets(t, "cold-start log", logged)
+	for _, private := range []string{dir, "ada@example.com", "Ada Lovelace", "Language server listening"} {
+		if strings.Contains(logged, private) {
+			t.Errorf("cold-start log leaks %q:\n%s", private, logged)
 		}
 	}
 }
