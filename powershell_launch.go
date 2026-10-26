@@ -121,7 +121,9 @@ const psStatusCaptureStatement = "$global:__aix_ok = $?"
 // PowerShell.Commands.GetCommandCommand` for a `Get-Command -ErrorAction
 // SilentlyContinue` probe) and does not match; a real non-zero native code is
 // never overridden. The error itself reaches the output through the caller's
-// stderr merge (psWrapUserCommand, or the fallback's combined pipes).
+// stderr merge (psWrapUserCommand, or the fallback's combined pipes);
+// $__aix_promoted only records that this branch fired, which
+// TestExitCapture_BlockedScriptExitsOne reads as evidence.
 //
 // One line on purpose: the persistent host reads `-Command -` from stdin, where
 // a statement split across lines (`if (...) {` newline ...) is not run until a
@@ -139,10 +141,12 @@ const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; $__aix_promoted = $fal
 //   - `2>&1` merges stream 2 only, never `*>&1`: Write-Host / warning / verbose
 //     keep going to stdout as plain text instead of becoming records.
 //   - Each ErrorRecord is stringified to its message; other objects pass
-//     through and are formatted as before.
+//     through and are formatted as before. A `process {}` block, not
+//     ForEach-Object: every output line passes through it, and ForEach-Object
+//     costs ~3-4x more per item (200k lines: ~850 ms vs ~200-325 ms).
 //   - psStatusCaptureStatement sits INSIDE the redirected block, right after
-//     the command: after the pipe $? would describe ForEach-Object, which always
-//     succeeds, and a missing program would report exit 0 again.
+//     the command: after the pipe $? would describe the stringifying block,
+//     which always succeeds, and a missing program would report exit 0 again.
 //   - $ErrorActionPreference is scoped to Continue: in Windows PowerShell 5.1 a
 //     redirected native stderr line is an ErrorRecord, which a preference of
 //     Stop leaked by an earlier command would make terminating. A command that
@@ -155,5 +159,5 @@ const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; $__aix_promoted = $fal
 // One line on purpose, for the same reason as psExitCaptureScript.
 func psWrapUserCommand(command string) string {
 	return "& { $ErrorActionPreference = 'Continue'; & { " + command + "; " + psStatusCaptureStatement +
-		" } 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } }"
+		" } 2>&1 | & { process { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } } }"
 }
