@@ -78,7 +78,7 @@ func TestCodexPostUpdate_OfflineAtSettleStillPaysByLiveReadLater(t *testing.T) {
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
 	f.seedPreRunReading(t, now.Add(-time.Hour), now)
 	calls := stubCodexFallbackRead(t, capturingFallbackRead)
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 
 	codexUsageRunStarted(runStart)
 	codexUsageRunSettled(runStart)
@@ -99,7 +99,7 @@ func TestCodexPostUpdate_OfflineAtSettleStillPaysByLiveReadLater(t *testing.T) {
 	}
 
 	// The device comes back and a rung fires.
-	setCodexTestOffline(t, false)
+	setTestOffline(t, false)
 	codexRunDebtWorker(f.home, f.fp)
 	drainCodexRunDebtLadder(t)
 
@@ -1180,7 +1180,7 @@ func TestCodexFencedRollout_NoReadWithoutADurableReservation(t *testing.T) {
 func TestCodexFencedRollout_OfflineReleasesTheReservationForTheNextRung(t *testing.T) {
 	r := newCodexFencedRun(t)
 	calls := stubCodexFallbackRead(t, capturingFallbackRead)
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 
 	codexPayRunRefresh(r.f.home, r.f.fp)
 	if snap := r.f.snapshot(t); *calls != 0 || snap.RefreshLiveReads != 0 || r.earlyReserved(t) {
@@ -1188,7 +1188,7 @@ func TestCodexFencedRollout_OfflineReleasesTheReservationForTheNextRung(t *testi
 			*calls, snap.RefreshLiveReads, r.earlyReserved(t))
 	}
 
-	setCodexTestOffline(t, false)
+	setTestOffline(t, false)
 	nextRung()
 	if state, _ := codexPayRunRefresh(r.f.home, r.f.fp); *calls != 1 || state.owed {
 		t.Fatalf("back online: calls=%d owed=%v, want the early read to pay", *calls, state.owed)
@@ -1201,7 +1201,7 @@ func TestCodexFencedRollout_OfflineReleasesTheReservationForTheNextRung(t *testi
 func TestCodexFencedRollout_ARefusedReleaseLosesOnlyTheOpportunity(t *testing.T) {
 	r := newCodexFencedRun(t)
 	calls := stubCodexFallbackRead(t, noReadingFallback)
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 	reserved := false
 	failCommitsMatching(t, 1, func(out string) bool {
 		if strings.Contains(out, `"earlyReadFloorMs"`) {
@@ -1215,7 +1215,7 @@ func TestCodexFencedRollout_ARefusedReleaseLosesOnlyTheOpportunity(t *testing.T)
 	if !r.earlyReserved(t) {
 		t.Fatal("the refused release must leave the reservation in place")
 	}
-	setCodexTestOffline(t, false)
+	setTestOffline(t, false)
 	nextRung()
 	codexPayRunRefresh(r.f.home, r.f.fp)
 	if snap := r.f.snapshot(t); *calls != 0 || snap.RefreshLiveReads != 0 {

@@ -67,7 +67,11 @@ func (f codexFreshnessFixture) oweExhaustedDebt(t *testing.T, runStart, complete
 	return state
 }
 
-func setCodexTestOffline(t *testing.T, offline bool) {
+// setTestOffline pins the offline flag under offlineMutex for one test and
+// restores it on cleanup. It writes the flag directly rather than calling
+// SetOffline, which also releases the reconnect drain, signals offlineChan
+// and logs a transition.
+func setTestOffline(t *testing.T, offline bool) {
 	t.Helper()
 	offlineMutex.Lock()
 	was := isOffline

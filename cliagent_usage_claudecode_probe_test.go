@@ -3585,15 +3585,7 @@ func TestClaudeProbeResult_NotAdmittedReasonsSendNothing(t *testing.T) {
 			return context.Background(), stamped, true
 		}},
 		{name: "offline", want: claudeProbeOffline, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {
-			offlineMutex.Lock()
-			was := isOffline
-			isOffline = true
-			offlineMutex.Unlock()
-			t.Cleanup(func() {
-				offlineMutex.Lock()
-				isOffline = was
-				offlineMutex.Unlock()
-			})
+			setTestOffline(t, true)
 			return context.Background(), stamped, false
 		}},
 		{name: "no credential", want: claudeProbeNoCredential, admitted: true, setup: func(t *testing.T) (context.Context, claudeUsageProbeIdentity, bool) {

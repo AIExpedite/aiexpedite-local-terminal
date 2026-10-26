@@ -262,7 +262,7 @@ func TestCLIUsageHint_GatesKeepTheObservationPending(t *testing.T) {
 	withCodexGenerationEpoch(t, 504)
 	rec, cfg := propagatorFixture(t)
 	cfg.AgentID, cfg.CommandSecret = "", ""
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 	startCLIUsagePropagator(cfg)
 	markRotated(t)
 	noteCLIUsageObservationAdvanced(codexUsageProvider, gen(504, 1))
@@ -271,7 +271,7 @@ func TestCLIUsageHint_GatesKeepTheObservationPending(t *testing.T) {
 	if n := len(rec.all()); n != 0 {
 		t.Fatalf("sent %d hints while offline", n)
 	}
-	setCodexTestOffline(t, false)
+	setTestOffline(t, false)
 	drain.mu.Lock()
 	drain.draining = true
 	drain.mu.Unlock()
@@ -960,7 +960,7 @@ func TestCLIUsageHint_FallbackReadsOnlyWhileEveryGateIsOpen(t *testing.T) {
 	}{
 		{name: "not detected", detected: false},
 		{name: "no cache", detected: true, noCache: true},
-		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "offline", detected: true, block: func(t *testing.T) { setTestOffline(t, true) }},
 		{name: "draining", detected: true, block: func(t *testing.T) {
 			drain.mu.Lock()
 			drain.draining = true
@@ -1268,7 +1268,7 @@ func TestCLIUsageHint_ClaudeTickAdoptsNothingWhileAGateIsClosed(t *testing.T) {
 		name  string
 		close func(t *testing.T)
 	}{
-		{"offline", func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{"offline", func(t *testing.T) { setTestOffline(t, true) }},
 		{"draining", func(t *testing.T) {
 			drain.mu.Lock()
 			drain.draining = true
@@ -1368,7 +1368,7 @@ func TestCLIUsageHint_OpenCodeTickScansOnlyWhileEveryGateIsOpen(t *testing.T) {
 		block    func(t *testing.T)
 	}{
 		{name: "not detected", detected: false},
-		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "offline", detected: true, block: func(t *testing.T) { setTestOffline(t, true) }},
 		{name: "draining", detected: true, block: func(t *testing.T) {
 			drain.mu.Lock()
 			drain.draining = true
@@ -1592,7 +1592,7 @@ func TestCLIUsageHint_GrokPollScansOnlyWhileEveryGateIsOpen(t *testing.T) {
 	}{
 		{name: "open", detected: true},
 		{name: "not detected", detected: false},
-		{name: "offline", detected: true, block: func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{name: "offline", detected: true, block: func(t *testing.T) { setTestOffline(t, true) }},
 		{name: "draining", detected: true, block: func(t *testing.T) {
 			drain.mu.Lock()
 			drain.draining = true

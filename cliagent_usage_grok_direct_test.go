@@ -361,7 +361,7 @@ func TestGrokDirectScan_GatesHoldThePoll(t *testing.T) {
 	}{
 		{"refresh disabled", func(*testing.T) { SetGrokUsageRefreshEnabled(false) }},
 		{"not detected", func(*testing.T) {}},
-		{"offline", func(t *testing.T) { setCodexTestOffline(t, true) }},
+		{"offline", func(t *testing.T) { setTestOffline(t, true) }},
 		{"draining", func(t *testing.T) {
 			drain.mu.Lock()
 			drain.draining = true

@@ -231,7 +231,7 @@ func TestOpenCodeUsage_OfflineRefusalsSpendNoAttempts(t *testing.T) {
 	sched := openCodeUsageFixture(t, 1003)
 	stubOpenCodeExecutable(t)
 	calls := stubOpenCodeExport(t, func(context.Context, string) ([]byte, bool) { return nil, false })
-	setCodexTestOffline(t, true)
+	setTestOffline(t, true)
 
 	run := armOpenCodeUsageRun("opencode", "", "fp-a")
 	settleOpenCodeUsageRun(run, "ses_resumed")
