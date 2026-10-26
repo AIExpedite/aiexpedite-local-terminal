@@ -1388,7 +1388,7 @@ func TestOpenCodeDirect_ASwitchBackToV1RecoversTodayOnce(t *testing.T) {
 		t.Fatalf("bucket = %+v, want today's V1 spend since midnight", b)
 	}
 	c := loadOpenCodeUsageLedger().DirectCursor
-	if c == nil || c.Layout != openCodeStoreLayoutSQLite || c.MidnightRereadDate != today || !slices.Equal(c.MidnightRereadLayouts, []string{openCodeStoreLayoutSQLite}) {
+	if c == nil || c.Layout != openCodeStoreLayoutSQLite || c.MidnightRereadDate != today || !slices.Equal(c.MidnightRereadLayouts, []string{openCodeStoreLayoutSQLiteV2, openCodeStoreLayoutSQLite}) {
 		t.Fatalf("cursor = %+v, want V1 recorded with today's midnight re-read", c)
 	}
 	clock.now = clock.now.Add(time.Minute)
@@ -1422,8 +1422,9 @@ func recordOpenCodeDirectFloors(t *testing.T) func() []int64 {
 
 // An OpenCode 1.x and a 2.x client writing one store flip the election as the
 // newest session moves between them. Each family is re-read from local
-// midnight at most once per local day — later switches resume from the cut —
-// nothing is counted twice, and the next local day starts afresh.
+// midnight at most once per local day, and not at all once the cursor has sat
+// on it — later switches resume from the cut — nothing is counted twice, and
+// the next local day starts afresh.
 func TestOpenCodeDirect_AFlipFloppingElectionRereadsMidnightOncePerFamilyPerDay(t *testing.T) {
 	_, fixture, clock := openCodeDirectFixture(t, 2304)
 	store := newOpenCode119TestStore(t, fixture.root)
@@ -1452,22 +1453,22 @@ func TestOpenCodeDirect_AFlipFloppingElectionRereadsMidnightOncePerFamilyPerDay(
 	scan(t, v1, 100, true, nil) // no cursor yet: the first scan starts at midnight
 	clock.now = clock.now.Add(time.Minute)
 	store.v2Assistant("ses_b", "msg_b", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 10)
-	scan(t, v2, 110, true, []string{v2})
+	scan(t, v2, 110, true, []string{v1, v2})
 	clock.now = clock.now.Add(time.Minute)
 	store.v1Assistant("ses_c", "msg_c", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{20, 0, 0}}, 0)
-	scan(t, v1, 130, true, []string{v2, v1})
+	scan(t, v1, 130, false, []string{v1, v2})
 	clock.now = clock.now.Add(time.Minute)
 	store.v2Assistant("ses_d", "msg_d", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 5)
-	scan(t, v2, 135, false, []string{v2, v1})
+	scan(t, v2, 135, false, []string{v1, v2})
 	clock.now = clock.now.Add(time.Minute)
 	store.v1Assistant("ses_e", "msg_e", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{7, 0, 0}}, 0)
-	scan(t, v1, 142, false, []string{v2, v1})
+	scan(t, v1, 142, false, []string{v1, v2})
 
 	// The next local day: the stamp is yesterday's, so a switch re-reads from
 	// the new midnight again.
 	clock.now = clock.now.Add(24 * time.Hour)
 	store.v2Assistant("ses_f", "msg_f", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 3)
-	scan(t, v2, 3, true, []string{v2})
+	scan(t, v2, 3, true, []string{v1, v2})
 }
 
 // A family the election switched away from resumes where it paused: V2 writes
@@ -1502,7 +1503,7 @@ func TestOpenCodeDirect_ASwitchBackResumesWhereTheFamilyPaused(t *testing.T) {
 	scan(t, v2, 110, true)
 	clock.now = clock.now.Add(time.Minute)
 	store.v1Assistant("ses_c", "msg_c", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{20, 0, 0}}, 0)
-	scan(t, v1, 130, true)
+	scan(t, v1, 130, false)
 	if c := loadOpenCodeUsageLedger().DirectCursor; c.PausedLayout != v2 || c.PausedResumeMs == 0 {
 		t.Fatalf("cursor = %+v, want V2 paused", c)
 	}
@@ -1528,6 +1529,46 @@ func TestOpenCodeDirect_ASwitchBackResumesWhereTheFamilyPaused(t *testing.T) {
 	scanOpenCodeDirect(t)
 	if n := openCodeTodayTokens(t, clock.now); n != 147 {
 		t.Fatalf("tokens today after a quiet scan = %d, want 147", n)
+	}
+}
+
+// A switch back onto the family the cursor sat on today does not re-read it
+// from midnight: on a heavy day the keys it counted have rolled out of
+// seenSteps, and its rewind floor, which the paused point keeps, is all that
+// stops them being counted again.
+func TestOpenCodeDirect_ASwitchBackKeepsTheFamilysRewindFloor(t *testing.T) {
+	_, fixture, clock := openCodeDirectFixture(t, 2307)
+	store := newOpenCode119TestStore(t, fixture.root)
+	v1, v2 := openCodeStoreLayoutSQLite, openCodeStoreLayoutSQLiteV2
+	today, _ := openCodeLocalDay(clock.now)
+	through := clock.ms(-time.Minute)
+	// V1 counted this morning's turn, then a heavy day evicted its key: only
+	// the rewind floor keeps the overlap from reading it again.
+	openCodeUsageTransaction(func(ledger *openCodeUsageLedger) (bool, bool) {
+		ledger.DirectCursor = &openCodeDirectCursor{Layout: v1, ThroughMs: through, RewindFloorMs: through}
+		ledger.DirectCoverage = &openCodeDirectCoverage{Layout: v1, ObservedAtMs: through, LastOkLocalDate: today}
+		return true, false
+	})
+	store.v1Assistant("ses_a", "msg_a", clock.ms(-3*time.Hour), clock.ms(-3*time.Hour+time.Second), [][3]int64{{100, 0, 0}}, 0)
+
+	// V2 takes the newest session: its first switch re-reads it from midnight.
+	clock.now = clock.now.Add(time.Minute)
+	store.v2Assistant("ses_b", "msg_b", clock.ms(-30*time.Second), clock.ms(-20*time.Second), 10)
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if c := loadOpenCodeUsageLedger().DirectCursor; c == nil || c.Layout != v2 || !slices.Equal(c.MidnightRereadLayouts, []string{v1, v2}) || c.PausedLayout != v1 || c.PausedResumeMs != through {
+		t.Fatalf("cursor = %+v, want V2 with V1 stamped and paused at its rewind floor", c)
+	}
+
+	// Back on V1: read from where it paused, so msg_a is not counted again.
+	clock.now = clock.now.Add(time.Minute)
+	store.v1Assistant("ses_c", "msg_c", clock.ms(-30*time.Second), clock.ms(-20*time.Second), [][3]int64{{20, 0, 0}}, 0)
+	if label := scanOpenCodeDirect(t); label != "direct_scanned" {
+		t.Fatalf("scan = %q", label)
+	}
+	if n := openCodeTodayTokens(t, clock.now); n != 30 {
+		t.Fatalf("tokens today = %d, want 30: msg_b and msg_c, not the evicted msg_a", n)
 	}
 }
 

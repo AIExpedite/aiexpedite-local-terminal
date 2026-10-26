@@ -536,10 +536,11 @@ func openCodeDirectScan(ctx context.Context, layout, root string) (label string,
 // the cut and seenSteps absorbs the repeats. A switch between the two SQLite
 // families, either way, re-reads from local midnight instead: until then the
 // cursor was renewed on a family holding none of the spend the other one was
-// writing. That happens once per family per local day (the cursor's
-// MidnightRereadLayouts); a later switch onto the same family re-reads from the
-// cut, or from where that family paused when that is earlier (the cursor's
-// PausedResumeMs), so its writes while the other family won are still read.
+// writing. That happens once per family per local day, and never for a family
+// the cursor already sat on today (the cursor's MidnightRereadLayouts); a later
+// switch onto such a family re-reads from the cut, or from where that family
+// paused when that is earlier (the cursor's PausedResumeMs), so its writes
+// while the other family won are still read and its rewind floor still holds.
 // Earlier days are not backfilled — the card publishes only today's bucket.
 func openCodeDirectReadBounds(saved openCodeUsageLedger, layout string, now time.Time) (int64, openCodeDirectLimits, bool) {
 	floorMs := openCodeDirectScanFloor(saved, now)
@@ -580,18 +581,25 @@ func isOpenCodeSQLiteLayout(layout string) bool {
 }
 
 // rereadFromMidnight reports that layout was already re-read from local
-// midnight on today's local date.
+// midnight, or read by the cursor, on today's local date.
 func (c openCodeDirectCursor) rereadFromMidnight(layout, today string) bool {
 	return c.MidnightRereadDate == today && slices.Contains(c.MidnightRereadLayouts, layout)
 }
 
 // openCodeDirectMidnightRereads is the midnight re-read stamp a committed
-// cursor carries: prev's for today, plus layout when this read went back to
-// midnight. A stamp from an earlier day is dropped.
+// cursor carries: prev's for today, plus the family a switch between the two
+// SQLite families left, plus layout when this read went back to midnight. A
+// stamp from an earlier day is dropped. The family left was already read today
+// — the cursor sat on it — so a switch back resumes where it paused rather than
+// at midnight: on a heavy day its keys can have rolled out of seenSteps, and
+// only its rewind floor, which the paused point keeps, stops a second count.
 func openCodeDirectMidnightRereads(prev *openCodeDirectCursor, fromMidnight bool, layout, today string) (string, []string) {
 	var layouts []string
 	if prev != nil && prev.MidnightRereadDate == today {
 		layouts = slices.Clone(prev.MidnightRereadLayouts)
+	}
+	if prev != nil && prev.Layout != layout && isOpenCodeSQLiteLayout(prev.Layout) && isOpenCodeSQLiteLayout(layout) && !slices.Contains(layouts, prev.Layout) {
+		layouts = append(layouts, prev.Layout)
 	}
 	if fromMidnight && !slices.Contains(layouts, layout) {
 		layouts = append(layouts, layout)

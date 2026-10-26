@@ -167,9 +167,10 @@ func (w openCodeOwnedRun) covers(sessionKey string, createdMs int64) bool {
 // pinned keys nor seenSteps, but its completed time does not move.
 // MidnightRereadDate is the local date on which the SQLite families listed in
 // MidnightRereadLayouts were each re-read from local midnight after a switch
-// onto them: a later switch onto one of them that day re-reads from the cut, so
-// an election flip-flopping between two clients' families cannot re-read the
-// whole day on every tick.
+// onto them, or were switched away from — already read today: a later switch
+// onto one of them that day re-reads from the cut, so an election
+// flip-flopping between two clients' families cannot re-read the whole day on
+// every tick, nor re-read records whose keys rolled out of seenSteps.
 // PausedLayout is the other SQLite family, and PausedResumeMs the point its own
 // cursor paused at when the election switched away from it — its resume point,
 // or a revisit floor its continuation still owed: its writes since were never
