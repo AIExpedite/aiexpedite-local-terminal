@@ -14,6 +14,15 @@ func TestRedactSensitiveData_URLCredentials(t *testing.T) {
 			"fatal: unable to access 'https://[REDACTED]@github.com/o/r.git/': The requested URL returned error: 403",
 		},
 		{"database scheme still covered", "postgres://u:p@h/db", "postgres://[REDACTED]@h/db"},
+		{
+			"bare token userinfo (no colon)",
+			"fatal: Authentication failed for 'https://ghs_short123@github.com/o/r.git/'",
+			"fatal: Authentication failed for 'https://[REDACTED]@github.com/o/r.git/'",
+		},
+		{"empty user", "https://:tok3n@github.com/o/r.git", "https://[REDACTED]@github.com/o/r.git"},
+		{"secret containing @ is redacted to the last @", "https://u:p@ss@host/x", "https://[REDACTED]@host/x"},
+		{"scp-style remote without scheme unchanged", "git@github.com:o/r.git", "git@github.com:o/r.git"},
+		{"@ in the path is not userinfo", "https://host/users/a@b", "https://host/users/a@b"},
 		{"mixed-case scheme", "MongoDB+SRV://admin:hunter2@cluster/x", "MongoDB+SRV://[REDACTED]@cluster/x"},
 		{
 			"URL without credentials unchanged",

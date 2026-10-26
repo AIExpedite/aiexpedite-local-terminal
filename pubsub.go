@@ -67,12 +67,15 @@ var (
 	sensitivePatterns     []*regexp.Regexp
 	sensitivePatternsOnce sync.Once
 
-	// urlCredentialPattern matches the userinfo of any `scheme://user:secret@`
-	// URL (a database connection string, or a git remote echoed in a native
-	// program's stderr such as `fatal: unable to access 'https://x:tok@...'`).
-	// The character classes stop at whitespace and `/`, so a match cannot run
-	// across lines or swallow a URL without credentials.
-	urlCredentialPattern = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*)://[^\s/:@]+:[^\s/@]+@`)
+	// urlCredentialPattern matches the whole userinfo of any `scheme://...@`
+	// URL: `user:secret`, a bare token (`https://<PAT>@github.com`), an empty
+	// user (`https://:token@`), and a secret containing `@` (greedy to the last
+	// `@` of the authority). Seen in database connection strings and in git
+	// remotes echoed by a native program's stderr (`fatal: unable to access
+	// 'https://x:tok@...'`). It stops at whitespace and `/`: neither can appear
+	// unencoded in a URL's userinfo, and stopping there keeps a match from
+	// running across lines or into a path. A credential-free URL is unchanged.
+	urlCredentialPattern = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*)://[^\s/]+@`)
 )
 
 // initSensitivePatterns compiles regex patterns once
@@ -2604,7 +2607,12 @@ func runPubSubConnection(cfg *Config) error {
 		// Debug mode: show raw output details (redacted)
 		if cfg.DebugMode {
 			fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
-			fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
+			// The error embeds the command's output (ExitCodeError), stderr included.
+			errText := "<nil>"
+			if execErr != nil {
+				errText = redactSensitiveData(execErr.Error())
+			}
+			fmt.Printf("%s[DEBUG] Error: %s%s\n", colorMagenta, errText, colorReset)
 			// Show raw output with visible control characters (redacted)
 			fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, redactSensitiveData(out), colorReset)
 		}
