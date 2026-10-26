@@ -3,8 +3,8 @@
 // File: powershell_ps51_windows_test.go
 // Runs the persistent-host stderr and exit-code cases on Windows PowerShell 5.1
 // (powershell.exe). newTestPersistentPS prefers pwsh.exe, but 5.1 is the host
-// where a redirected native stderr line becomes an ErrorRecord that sets $?
-// false at exit 0 and that a leaked Stop preference would make terminating.
+// where a redirected native stderr line becomes an ErrorRecord that a Stop
+// preference makes terminating, so these pin that the host never redirects it.
 package main
 
 import (
@@ -46,6 +46,10 @@ func TestPersistentPS51_GitCloneIntoNonEmptyDirKeepsExitCode(t *testing.T) {
 
 func TestPersistentPS51_MissingProgramErrorOnce(t *testing.T) {
 	checkMissingProgramErrorOnce(t, newTestPersistentPS51(t))
+}
+
+func TestPersistentPS51_OwnStopPreferenceRunsToCompletion(t *testing.T) {
+	checkOwnStopPreferenceRunsToCompletion(t, newTestPersistentPS51(t))
 }
 
 func TestPersistentPS51_LeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T) {

@@ -72,7 +72,7 @@ func TestPersistentPS_ProcessScopeBypass(t *testing.T) {
 }
 
 // Before the fix a missing program reported success: $LASTEXITCODE stayed at
-// the reset value 0. Its error reaches the output through the wrapper's 2>&1.
+// the reset value 0. Its error reaches the output through the host's stderr.
 func TestPersistentPS_MissingProgramExitsOne(t *testing.T) {
 	checkMissingProgramExitsOne(t, newTestPersistentPS(t))
 }
@@ -128,9 +128,9 @@ func TestPersistentPS_HandledErrorsNotPromoted(t *testing.T) {
 }
 
 // The stderr cases below are helpers so powershell_ps51_windows_test.go runs
-// the same bodies on Windows PowerShell 5.1, where a redirected native stderr
-// line is an ErrorRecord and sets $? false even at exit 0. Output checks are
-// Contains: a host version may decorate an ErrorRecord's text.
+// the same bodies on Windows PowerShell 5.1, the host whose error handling
+// differs most (stderr turned into ErrorRecords under redirection, verbose
+// error formatting). Output checks are Contains: hosts decorate error text.
 
 func TestPersistentPS_NativeStderrInOutputOnFailure(t *testing.T) {
 	checkNativeStderrInOutputOnFailure(t, newTestPersistentPS(t))
@@ -152,7 +152,38 @@ func TestPersistentPS_LeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T) 
 	checkLeakedStopPreferenceDoesNotFailNativeStderr(t, newTestPersistentPS(t))
 }
 
-// A native program's failure text goes to stderr; before the merge the step
+func TestPersistentPS_OwnStopPreferenceRunsToCompletion(t *testing.T) {
+	checkOwnStopPreferenceRunsToCompletion(t, newTestPersistentPS(t))
+}
+
+// A command (or a .ps1 it runs) that sets Stop itself and then runs a native
+// program writing to stderr must run to completion with its own exit code. A
+// `2>&1` inside PowerShell made that stderr line terminating in 5.1: the rest
+// of the command was skipped and reported as success (or exit -1).
+func checkOwnStopPreferenceRunsToCompletion(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	const prefix = `$ErrorActionPreference = 'Stop'; `
+	out, err := execPS(t, ps, prefix+`cmd /c "echo progress 1>&2 & exit 0"; Write-Output afterStop`)
+	if err != nil {
+		t.Fatalf("expected success, got %v (output %q)", err, out)
+	}
+	for _, want := range []string{"afterStop", "progress"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in the output, got %q", want, out)
+		}
+	}
+	_, err = execPS(t, ps, prefix+`cmd /c "echo boom 1>&2 & exit 3"; Write-Output afterStop`)
+	requireExitCode(t, err, 3)
+	var exitErr *ExitCodeError
+	errors.As(err, &exitErr)
+	for _, want := range []string{"afterStop", "boom"} {
+		if !strings.Contains(exitErr.Output, want) {
+			t.Errorf("expected %q in the output, got %q", want, exitErr.Output)
+		}
+	}
+}
+
+// A native program's failure text goes to stderr; before drainStderr the step
 // reported a bare "exit code 3".
 func checkNativeStderrInOutputOnFailure(t *testing.T, ps *PersistentPowerShell) {
 	t.Helper()
@@ -210,7 +241,7 @@ func checkGitCloneIntoNonEmptyDirKeepsExitCode(t *testing.T, ps *PersistentPower
 	}
 }
 
-// The promoted error reaches the output once, through 2>&1: the old Write-Host
+// The promoted error reaches the output once, through stderr: the old Write-Host
 // echo of $Error[0] must not print it a second time.
 func checkMissingProgramErrorOnce(t *testing.T, ps *PersistentPowerShell) {
 	t.Helper()
@@ -219,10 +250,15 @@ func checkMissingProgramErrorOnce(t *testing.T, ps *PersistentPowerShell) {
 	if n := strings.Count(out, "not recognized"); n != 1 {
 		t.Errorf("expected \"not recognized\" exactly once, got %d in %q", n, out)
 	}
+	// pwsh 7.2+ colours error text even into a pipe unless the host renders
+	// PlainText (psPlainTextRenderingScript).
+	if strings.Contains(out, "\x1b[") {
+		t.Errorf("expected plain text, got ANSI escapes in %q", out)
+	}
 }
 
-// A Stop preference left in the host by an earlier command must not turn a
-// redirected native stderr line into a terminating error.
+// A Stop preference left in the host by an earlier command must not change
+// how the next command runs, and its stderr must still reach the output.
 func checkLeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T, ps *PersistentPowerShell) {
 	t.Helper()
 	if out, err := execPS(t, ps, "$global:ErrorActionPreference = 'Stop'"); err != nil {
@@ -283,7 +319,6 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 		psWrapUserCommand("& '"+blocked+"'") + "\n" +
 		psExitCaptureScript + "\n" +
 		"$__e = if ($Error.Count -gt 0) { $Error[0] } else { $null }\n" +
-		"Write-Output ('AIX_PS_EVIDENCE promoted=' + $__aix_promoted)\n" +
 		"Write-Output ('AIX_PS_EVIDENCE id=' + $(if ($__e) { $__e.FullyQualifiedErrorId }))\n" +
 		"Write-Output ('AIX_PS_EVIDENCE category=' + $(if ($__e) { $__e.CategoryInfo.Category }))\n" +
 		"Write-Output ('AIX_PS_EVIDENCE type=' + $(if ($__e) { $__e.Exception.GetType().FullName }))\n" +
@@ -317,7 +352,6 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 		t.Fatalf("blocked .ps1 must not run under %s\nstdout: %s\nstderr: %s", redact(policy), redact(stdout), redact(stderr))
 	}
 	for _, want := range []struct{ key, value string }{
-		{"promoted", "True"},
 		{"id", "UnauthorizedAccess"},
 	} {
 		if got := ev[want.key]; got != want.value {
@@ -332,7 +366,7 @@ const psEvidenceMarker = "AIX_PS_EVIDENCE "
 
 // blockedScriptEvidence parses stdout's `AIX_PS_EVIDENCE <key>=<value>` lines.
 // The marker must start a line so an error record's echo of the script source
-// cannot supply evidence. policy, promoted and id are required (blank values
+// cannot supply evidence. policy and id are required (blank values
 // are allowed); a repeated key is an error.
 func blockedScriptEvidence(out string) (map[string]string, error) {
 	ev := map[string]string{}
@@ -352,7 +386,7 @@ func blockedScriptEvidence(out string) (map[string]string, error) {
 		}
 		ev[key] = strings.TrimSpace(value)
 	}
-	for _, key := range []string{"policy", "promoted", "id"} {
+	for _, key := range []string{"policy", "id"} {
 		if _, ok := ev[key]; !ok {
 			return nil, fmt.Errorf("evidence key %q missing", key)
 		}
@@ -607,7 +641,7 @@ func TestBlockedScriptPolicyAction(t *testing.T) {
 
 func TestBlockedScriptEvidence(t *testing.T) {
 	t.Run("own lines with CRLF", func(t *testing.T) {
-		out := "AIX_PS_EVIDENCE policy=Restricted\r\nnoise\r\nAIX_PS_EVIDENCE promoted=True\r\n" +
+		out := "AIX_PS_EVIDENCE policy=Restricted\r\nnoise\r\n" +
 			"AIX_PS_EVIDENCE id=UnauthorizedAccess\r\nAIX_PS_EVIDENCE category=SecurityError\r\n" +
 			"AIX_PS_EVIDENCE type=System.Management.Automation.PSSecurityException\r\n"
 		ev, err := blockedScriptEvidence(out)
@@ -615,7 +649,7 @@ func TestBlockedScriptEvidence(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := map[string]string{
-			"policy": "Restricted", "promoted": "True", "id": "UnauthorizedAccess",
+			"policy": "Restricted", "id": "UnauthorizedAccess",
 			"category": "SecurityError", "type": "System.Management.Automation.PSSecurityException",
 		}
 		for k, v := range want {
@@ -627,17 +661,17 @@ func TestBlockedScriptEvidence(t *testing.T) {
 	t.Run("marker inside other text is not evidence", func(t *testing.T) {
 		out := "#< CLIXML\n<Objs Version=\"1.1.0.1\"></Objs>AIX_PS_EVIDENCE policy=Bypass\n" +
 			"AIX_PS_EVIDENCE policy=AllSigned\n" +
-			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n"
+			"AIX_PS_EVIDENCE id=UnauthorizedAccess\n"
 		ev, err := blockedScriptEvidence(out)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ev["policy"] != "AllSigned" || ev["promoted"] != "True" || ev["id"] != "UnauthorizedAccess" {
+		if ev["policy"] != "AllSigned" || ev["id"] != "UnauthorizedAccess" {
 			t.Errorf("got %v", ev)
 		}
 	})
 	t.Run("CI regression: autoload failure echo", func(t *testing.T) {
-		out := "AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n" +
+		out := "AIX_PS_EVIDENCE id=UnauthorizedAccess\n" +
 			"AIX_PS_EVIDENCE category=SecurityError\n" +
 			"AIX_PS_EVIDENCE type=System.Management.Automation.PSSecurityException\n" +
 			`<S S="Error">+ Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))_x000D__x000A_</S>`
@@ -651,7 +685,7 @@ func TestBlockedScriptEvidence(t *testing.T) {
 	})
 	t.Run("BOM before first marker", func(t *testing.T) {
 		ev, err := blockedScriptEvidence("\ufeffAIX_PS_EVIDENCE policy=Restricted\n" +
-			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n")
+			"AIX_PS_EVIDENCE id=UnauthorizedAccess\n")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -660,7 +694,7 @@ func TestBlockedScriptEvidence(t *testing.T) {
 		}
 	})
 	t.Run("blank values", func(t *testing.T) {
-		ev, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE promoted=False\n" +
+		ev, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\n" +
 			"AIX_PS_EVIDENCE id=\nAIX_PS_EVIDENCE type=\n")
 		if err != nil {
 			t.Fatal(err)
@@ -670,13 +704,13 @@ func TestBlockedScriptEvidence(t *testing.T) {
 		}
 	})
 	t.Run("missing id", func(t *testing.T) {
-		if _, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE promoted=True\n"); err == nil {
+		if _, err := blockedScriptEvidence("AIX_PS_EVIDENCE policy=Restricted\n"); err == nil {
 			t.Error("expected an error for a missing id")
 		}
 	})
 	t.Run("duplicated key", func(t *testing.T) {
 		out := "AIX_PS_EVIDENCE policy=Restricted\nAIX_PS_EVIDENCE policy=Bypass\n" +
-			"AIX_PS_EVIDENCE promoted=True\nAIX_PS_EVIDENCE id=UnauthorizedAccess\n"
+			"AIX_PS_EVIDENCE id=UnauthorizedAccess\n"
 		if _, err := blockedScriptEvidence(out); err == nil {
 			t.Error("expected an error for a repeated key")
 		}

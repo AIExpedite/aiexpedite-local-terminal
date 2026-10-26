@@ -121,43 +121,36 @@ const psStatusCaptureStatement = "$global:__aix_ok = $?"
 // PowerShell.Commands.GetCommandCommand` for a `Get-Command -ErrorAction
 // SilentlyContinue` probe) and does not match; a real non-zero native code is
 // never overridden. The error itself reaches the output through the caller's
-// stderr merge (psWrapUserCommand, or the fallback's combined pipes);
-// $__aix_promoted only records that this branch fired, which
-// TestExitCapture_BlockedScriptExitsOne reads as evidence.
+// stderr (drainStderr, or the fallback's combined pipes).
 //
 // One line on purpose: the persistent host reads `-Command -` from stdin, where
 // a statement split across lines (`if (...) {` newline ...) is not run until a
 // blank line follows — the host would hang waiting for it.
-const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; $__aix_promoted = $false; " +
+const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; " +
 	"if (-not $__aix_ok -and ($null -eq $__aix_exit -or $__aix_exit -eq 0) -and $Error.Count -gt 0 -and " +
 	"@('CommandNotFoundException', 'UnauthorizedAccess') -contains $Error[0].FullyQualifiedErrorId) " +
-	"{ $__aix_exit = 1; $__aix_promoted = $true }"
+	"{ $__aix_exit = 1 }"
 
-// psWrapUserCommand wraps one user command for the persistent host so its
-// error stream is part of the captured output. That host reads only stdout, so
-// a native program's own failure text (git's `fatal: ...`) used to be lost and
-// the step failed as a bare `exit code 128`.
+// psWrapUserCommand wraps one user command for the persistent host.
 //
-//   - `2>&1` merges stream 2 only, never `*>&1`: Write-Host / warning / verbose
-//     keep going to stdout as plain text instead of becoming records.
-//   - Each ErrorRecord is stringified to its message; other objects pass
-//     through and are formatted as before. A `process {}` block, not
-//     ForEach-Object: every output line passes through it, and ForEach-Object
-//     costs ~3-4x more per item (200k lines: ~850 ms vs ~200-325 ms).
-//   - psStatusCaptureStatement sits INSIDE the redirected block, right after
-//     the command: after the pipe $? would describe the stringifying block,
-//     which always succeeds, and a missing program would report exit 0 again.
-//   - $ErrorActionPreference is scoped to Continue: in Windows PowerShell 5.1 a
-//     redirected native stderr line is an ErrorRecord, which a preference of
-//     Stop leaked by an earlier command would make terminating. A command that
-//     sets Stop itself still gets it (its assignment runs in the inner scope).
+//   - The script block keeps && / || inside the command from consuming the
+//     protocol lines that follow it.
+//   - psStatusCaptureStatement sits INSIDE the block, right after the command:
+//     $? after `& { }` itself is always true, so reading it outside would never
+//     see the command fail.
+//   - $ErrorActionPreference is scoped to Continue, so a Stop leaked into the
+//     host by an earlier command does not change how this one behaves (the
+//     one-shot fallback starts every command at Continue). A command that sets
+//     Stop itself still gets it: its assignment runs later in the same scope.
 //
-// Success stays on the native exit code: psExitCaptureScript promotes only the
-// two "never started" error ids, so 5.1's $? = false after a native program
-// that wrote to stderr and exited 0 (git clone progress) is still success.
+// The command's stderr is deliberately NOT redirected here (`2>&1`): in
+// Windows PowerShell 5.1 that turns every native stderr line into an
+// ErrorRecord, and under a Stop the command (or a .ps1 it runs) sets itself the
+// first one — git clone progress — becomes terminating, so the rest of the
+// command is silently skipped and reported as success. The host's stderr pipe
+// is drained in Go instead (powershell_windows.go drainStderr).
 //
 // One line on purpose, for the same reason as psExitCaptureScript.
 func psWrapUserCommand(command string) string {
-	return "& { $ErrorActionPreference = 'Continue'; & { " + command + "; " + psStatusCaptureStatement +
-		" } 2>&1 | & { process { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } } }"
+	return "& { $ErrorActionPreference = 'Continue'; " + command + "; " + psStatusCaptureStatement + " }"
 }

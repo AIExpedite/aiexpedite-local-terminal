@@ -211,22 +211,17 @@ func TestPsWrapUserCommand_Contract(t *testing.T) {
 	if strings.ContainsAny(w, "\r\n") {
 		t.Errorf("wrapper must be one line (the persistent host reads -Command - from stdin); got %q", w)
 	}
-	if !strings.Contains(w, "$ErrorActionPreference = 'Continue'") {
-		t.Errorf("wrapper must scope $ErrorActionPreference to Continue; got %q", w)
+	// Continue first, then the command, then the status capture as the very
+	// next statement, all inside the block: $? after `& { }` is always true.
+	want := "& { $ErrorActionPreference = 'Continue'; " + cmd + "; " + psStatusCaptureStatement + " }"
+	if w != want {
+		t.Errorf("wrapper changed:\n got %q\nwant %q", w, want)
 	}
-	// The status capture must follow the command INSIDE the redirected block:
-	// after the pipe, $? would describe ForEach-Object and always be true.
-	inner := "& { " + cmd + "; " + psStatusCaptureStatement + " } 2>&1 |"
-	if !strings.Contains(w, inner) {
-		t.Errorf("wrapper must capture status right after the command, inside the block, before 2>&1; want %q in %q", inner, w)
-	}
-	if strings.Count(w, psStatusCaptureStatement) != 1 {
-		t.Errorf("wrapper must capture status exactly once; got %q", w)
-	}
-	if strings.Contains(w, "*>&1") {
-		t.Errorf("wrapper must merge stream 2 only, never *>&1; got %q", w)
-	}
-	if !strings.Contains(w, "$_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() }") {
-		t.Errorf("wrapper must stringify ErrorRecords to their message; got %q", w)
+	// Never redirect the command's error stream inside PowerShell: in 5.1 a
+	// redirected native stderr line under the command's own Stop is
+	// terminating and silently skips the rest of the command. drainStderr
+	// reads the host's stderr instead.
+	if strings.Contains(w, ">&1") {
+		t.Errorf("wrapper must not redirect the error stream; got %q", w)
 	}
 }

@@ -43,6 +43,16 @@ const (
 	psCwdMarker = "<<<AIEXPEDITE_CWD_7f3d2a1b>>>"
 	// Unique marker to separate exit code from command output
 	psExitCodeMarker = "<<<AIEXPEDITE_EXIT_7f3d2a1b>>>"
+	// Unique marker written to the host's STDERR after each command, so the
+	// stderr drainer knows where one command's stderr ends.
+	psStderrMarker = "<<<AIEXPEDITE_STDERR_DONE_7f3d2a1b>>>"
+	// Cap on each stream's captured output. Beyond it the result cannot be
+	// published to Pub/Sub anyway (64 KB message cap), and an unbounded builder
+	// would exhaust RAM on a command with very large output (`type
+	// largefile.bin`). Reading continues so the markers are still processed.
+	psMaxOutputBytes = 10 * 1024 * 1024 // 10 MB
+	// Sent once at host start; see newPersistentPowerShellWithExe.
+	psPlainTextRenderingScript = "if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }"
 	// Timeout for health check commands
 	psHealthTimeout = 5 * time.Second
 	// Maximum time to wait for the mutex before giving up and falling back.
@@ -58,11 +68,16 @@ type PersistentPowerShell struct {
 	stdoutPipe io.ReadCloser // raw pipe — stored for explicit Close in forceKill
 	stdout     *bufio.Reader
 	stderr     io.ReadCloser
-	mutex      sync.Mutex
-	healthy    atomic.Bool // lock-free health flag — checked without acquiring mutex
-	lastUsed   time.Time
-	isPwsh     bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
-	lastCwd    string // last known working directory of this PS process
+	// stderrBlocks receives one block per command from drainStderr: everything
+	// the host wrote to stderr up to that command's psStderrMarker. Buffered 1:
+	// at most one command is in flight, and a host whose command was abandoned
+	// is killed and never reused. Closed when the stderr pipe ends.
+	stderrBlocks chan string
+	mutex        sync.Mutex
+	healthy      atomic.Bool // lock-free health flag — checked without acquiring mutex
+	lastUsed     time.Time
+	isPwsh       bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
+	lastCwd      string // last known working directory of this PS process
 	// lastPath is the PATH this PS process was last given: the agent's PATH at
 	// spawn, then whatever Execute re-synced. refreshCommandPath (path_refresh.go)
 	// rewrites the AGENT's PATH after an install, but this long-lived child fixed
@@ -149,16 +164,27 @@ func newPersistentPowerShellWithExe(psExe string) (*PersistentPowerShell, error)
 	}
 
 	ps := &PersistentPowerShell{
-		cmd:        cmd,
-		stdin:      stdin,
-		stdoutPipe: stdout,
-		stdout:     bufio.NewReader(stdout),
-		stderr:     stderr,
-		lastUsed:   time.Now(),
-		isPwsh:     psExe == "pwsh.exe",
-		lastPath:   os.Getenv("PATH"),
+		cmd:          cmd,
+		stdin:        stdin,
+		stdoutPipe:   stdout,
+		stdout:       bufio.NewReader(stdout),
+		stderr:       stderr,
+		stderrBlocks: make(chan string, 1),
+		lastUsed:     time.Now(),
+		isPwsh:       psExe == "pwsh.exe",
+		lastPath:     os.Getenv("PATH"),
 	}
 	ps.healthy.Store(true)
+	go ps.drainStderr()
+
+	// pwsh 7.2+ colours its error text with ANSI escapes even into a pipe, and
+	// that text is now part of the output (drainStderr). PlainText changes only
+	// PowerShell's own rendering, unlike NO_COLOR, which every child program
+	// would inherit. Windows PowerShell 5.1 has no $PSStyle.
+	if _, err := fmt.Fprintln(ps.stdin, psPlainTextRenderingScript); err != nil {
+		ps.forceKill()
+		return nil, fmt.Errorf("failed to configure PowerShell: %w", err)
+	}
 
 	// Verify process is responsive with a health check
 	if err := ps.healthCheck(); err != nil {
@@ -250,13 +276,8 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Wrap user command in a script block so && / || operators inside the command
 	// don't consume the delimiter. Without this, PowerShell's operator precedence
 	// causes `cmd1 && cmd2; Write-Host DELIMITER` to skip the delimiter when cmd1 fails.
-	// psWrapUserCommand also merges the command's error stream into stdout and
-	// keeps the status capture inside the block. This host's stderr is never
-	// read, so without the merge a native program's `fatal: ...` was lost and the
-	// step failed as a bare `exit code N`. Only the host's own errors, such as a
-	// parse error in the whole line, still go to that unread pipe. Side benefit:
-	// a native program writing more than the pipe buffer (~64 KB) to stderr can
-	// no longer block on it until the command times out.
+	// psWrapUserCommand also scopes $ErrorActionPreference and keeps the status
+	// capture inside the block. The command's stderr is read by drainStderr.
 	fullCmd.WriteString(psWrapUserCommand(command))
 
 	// Use newlines (not ;) to separate delimiter lines — newlines are unconditional
@@ -264,6 +285,9 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Capture the exit code immediately after the script block (before any other
 	// statements that could reset $LASTEXITCODE), then emit the protocol markers.
 	fullCmd.WriteString("\n" + psExitCaptureScript)
+	// End of this command's stderr. Native programs have exited and PowerShell
+	// has written its own errors by now, and both reach the pipe in order.
+	fullCmd.WriteString(fmt.Sprintf("\n[Console]::Error.WriteLine('%s')", psStderrMarker))
 	fullCmd.WriteString(fmt.Sprintf(
 		"\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
 		psExitCodeMarker, psDelimiter))
@@ -295,13 +319,6 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		exitCodeCaptured := false
 		outputTruncated := false
 
-		// Cap output at 10 MB.  Beyond this limit the result cannot be published
-		// to Pub/Sub anyway (64 KB message cap), and an unbounded builder would
-		// exhaust RAM on commands that produce very large output (e.g. `type
-		// largefile.bin`).  We stop appending but continue draining stdout so the
-		// protocol markers (exit code, cwd, delimiter) are still processed.
-		const maxOutputBytes = 10 * 1024 * 1024 // 10 MB
-
 		for {
 			line, err := ps.stdout.ReadString('\n')
 			if err != nil {
@@ -312,7 +329,14 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			line = strings.TrimRight(line, "\r\n")
 
 			if line == psDelimiter {
-				resultChan <- execResult{output: output.String(), newCwd: newCwd, exitCode: exitCode}
+				// Stdout is done; this command's stderr follows on the other
+				// pipe. If the host dies first the channel closes (pipe EOF).
+				errText, ok := <-ps.stderrBlocks
+				if !ok {
+					errChan <- fmt.Errorf("stderr pipe closed")
+					return
+				}
+				resultChan <- execResult{output: joinOutput(output.String(), errText), newCwd: newCwd, exitCode: exitCode}
 				return
 			}
 
@@ -336,7 +360,7 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			}
 
 			if !outputTruncated {
-				if output.Len()+len(line)+2 > maxOutputBytes {
+				if output.Len()+len(line)+2 > psMaxOutputBytes {
 					output.WriteString("\r\n[output truncated: exceeded 10 MB limit]")
 					outputTruncated = true
 					// Keep draining stdout so markers/delimiter are still received
@@ -377,6 +401,58 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			return "", "", fmt.Errorf("command timed out")
 		}
 		return "", "", fmt.Errorf("command cancelled")
+	}
+}
+
+// drainStderr reads the host's stderr for the life of the process and hands
+// Execute one block per command (see stderrBlocks). Native programs write their
+// failure text there (git's `fatal: ...`), as does PowerShell for its own
+// errors; without a reader that text was lost (a failed clone reported a bare
+// `exit code 128`) and a program writing more than the pipe buffer (~64 KB)
+// could block until the command timed out. Reading it here, rather than with
+// `2>&1` inside PowerShell, leaves the command's own behaviour untouched (see
+// psWrapUserCommand). Stderr follows stdout in the output; the two are not
+// interleaved.
+func (ps *PersistentPowerShell) drainStderr() {
+	defer close(ps.stderrBlocks)
+	r := bufio.NewReader(ps.stderr)
+	var block strings.Builder
+	truncated := false
+	for {
+		line, err := r.ReadString('\n')
+		if line != "" {
+			line = strings.TrimRight(line, "\r\n")
+			switch {
+			case line == psStderrMarker:
+				ps.stderrBlocks <- strings.TrimRight(block.String(), "\r\n ")
+				block.Reset()
+				truncated = false
+			case truncated:
+			case block.Len()+len(line)+2 > psMaxOutputBytes:
+				block.WriteString("\r\n[stderr truncated: exceeded 10 MB limit]")
+				truncated = true
+			default:
+				if block.Len() > 0 {
+					block.WriteString("\r\n")
+				}
+				block.WriteString(line)
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// joinOutput appends a command's stderr to its stdout.
+func joinOutput(stdout, stderr string) string {
+	switch {
+	case stderr == "":
+		return stdout
+	case stdout == "":
+		return stderr
+	default:
+		return strings.TrimRight(stdout, "\r\n") + "\r\n" + stderr
 	}
 }
 
