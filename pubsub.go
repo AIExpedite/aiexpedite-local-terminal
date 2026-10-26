@@ -66,6 +66,13 @@ var (
 	// Compiled regex patterns for sensitive data detection
 	sensitivePatterns     []*regexp.Regexp
 	sensitivePatternsOnce sync.Once
+
+	// urlCredentialPattern matches the userinfo of any `scheme://user:secret@`
+	// URL (a database connection string, or a git remote echoed in a native
+	// program's stderr such as `fatal: unable to access 'https://x:tok@...'`).
+	// The character classes stop at whitespace and `/`, so a match cannot run
+	// across lines or swallow a URL without credentials.
+	urlCredentialPattern = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.\-]*)://[^\s/:@]+:[^\s/@]+@`)
 )
 
 // initSensitivePatterns compiles regex patterns once
@@ -82,8 +89,6 @@ func initSensitivePatterns() {
 			// AWS credentials
 			`(?i)(aws_access_key_id|aws_secret_access_key|aws_session_token)\s*[=:]\s*\S+`,
 			`AKIA[0-9A-Z]{16}`, // AWS Access Key ID pattern
-			// Connection strings with credentials
-			`(?i)(mongodb|postgres|mysql|redis|amqp)://[^:]+:[^@]+@`,
 			// Private keys
 			`(?i)-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----`,
 			// GitHub tokens
@@ -105,7 +110,9 @@ func initSensitivePatterns() {
 func redactSensitiveData(s string) string {
 	initSensitivePatterns()
 
-	result := s
+	// Applied on its own, before the generic replacer below, which would cut a
+	// match at its first `:` and lose the scheme.
+	result := urlCredentialPattern.ReplaceAllString(s, "${1}://[REDACTED]@")
 	for _, re := range sensitivePatterns {
 		result = re.ReplaceAllStringFunc(result, func(match string) string {
 			// For patterns like "password=xxx", keep the key visible
@@ -115,13 +122,6 @@ func redactSensitiveData(s string) string {
 			// For patterns like "Bearer xxx", keep the prefix
 			if strings.HasPrefix(strings.ToLower(match), "bearer ") {
 				return "Bearer [REDACTED]"
-			}
-			// For connection strings, redact credentials but keep protocol
-			if strings.Contains(match, "://") {
-				parts := strings.SplitN(match, "://", 2)
-				if len(parts) == 2 {
-					return parts[0] + "://[REDACTED]@"
-				}
 			}
 			return "[REDACTED]"
 		})

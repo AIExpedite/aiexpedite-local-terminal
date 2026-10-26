@@ -108,7 +108,12 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		psExe = "pwsh.exe"
 		fmt.Println("[powershell] Using PowerShell 7+ (pwsh.exe)")
 	}
+	return newPersistentPowerShellWithExe(psExe)
+}
 
+// newPersistentPowerShellWithExe starts a persistent host on the given
+// executable. Split out so tests can pin Windows PowerShell 5.1.
+func newPersistentPowerShellWithExe(psExe string) (*PersistentPowerShell, error) {
 	// psHostArgs: no CLIXML on stderr, and a process-scoped execution-policy
 	// bypass so the .ps1 files commands call (npm.ps1) load — see
 	// powershell_launch.go. `-Command -` reads commands from stdin.
@@ -245,21 +250,20 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Wrap user command in a script block so && / || operators inside the command
 	// don't consume the delimiter. Without this, PowerShell's operator precedence
 	// causes `cmd1 && cmd2; Write-Host DELIMITER` to skip the delimiter when cmd1 fails.
-	// The status capture sits INSIDE the block: $? after `& { }` is always true,
-	// so reading it outside would never see the user command fail. It is joined
-	// with `;`, not a newline — this host reads `-Command -` from stdin, where a
-	// block split across lines waits for a blank line before it runs.
-	fullCmd.WriteString(fmt.Sprintf("& { %s; %s }", command, psStatusCaptureStatement))
+	// psWrapUserCommand also merges the command's error stream into stdout and
+	// keeps the status capture inside the block. This host's stderr is never
+	// read, so without the merge a native program's `fatal: ...` was lost and the
+	// step failed as a bare `exit code N`. Only the host's own errors, such as a
+	// parse error in the whole line, still go to that unread pipe. Side benefit:
+	// a native program writing more than the pipe buffer (~64 KB) to stderr can
+	// no longer block on it until the command times out.
+	fullCmd.WriteString(psWrapUserCommand(command))
 
 	// Use newlines (not ;) to separate delimiter lines — newlines are unconditional
 	// statement separators that cannot be captured by && or || operators.
 	// Capture the exit code immediately after the script block (before any other
 	// statements that could reset $LASTEXITCODE), then emit the protocol markers.
-	// This host's stderr is never read, so when a program never started (npm.ps1
-	// blocked, npm not installed) the PowerShell error is echoed to stdout —
-	// otherwise the step would fail with no explanation.
 	fullCmd.WriteString("\n" + psExitCaptureScript)
-	fullCmd.WriteString("\nif ($__aix_promoted) { Write-Host (($Error[0] | Out-String).TrimEnd()) }")
 	fullCmd.WriteString(fmt.Sprintf(
 		"\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
 		psExitCodeMarker, psDelimiter))

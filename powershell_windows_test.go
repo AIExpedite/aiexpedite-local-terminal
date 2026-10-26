@@ -72,10 +72,13 @@ func TestPersistentPS_ProcessScopeBypass(t *testing.T) {
 }
 
 // Before the fix a missing program reported success: $LASTEXITCODE stayed at
-// the reset value 0. Its error is echoed to stdout because this host's stderr
-// is not part of the output.
+// the reset value 0. Its error reaches the output through the wrapper's 2>&1.
 func TestPersistentPS_MissingProgramExitsOne(t *testing.T) {
-	ps := newTestPersistentPS(t)
+	checkMissingProgramExitsOne(t, newTestPersistentPS(t))
+}
+
+func checkMissingProgramExitsOne(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
 	out, err := execPS(t, ps, "aix-definitely-missing-cmd --version")
 	requireExitCode(t, err, 1)
 	if !strings.Contains(out, "not recognized") {
@@ -124,6 +127,127 @@ func TestPersistentPS_HandledErrorsNotPromoted(t *testing.T) {
 	}
 }
 
+// The stderr cases below are helpers so powershell_ps51_windows_test.go runs
+// the same bodies on Windows PowerShell 5.1, where a redirected native stderr
+// line is an ErrorRecord and sets $? false even at exit 0. Output checks are
+// Contains: a host version may decorate an ErrorRecord's text.
+
+func TestPersistentPS_NativeStderrInOutputOnFailure(t *testing.T) {
+	checkNativeStderrInOutputOnFailure(t, newTestPersistentPS(t))
+}
+
+func TestPersistentPS_NativeStderrOnSuccessIsNotFailure(t *testing.T) {
+	checkNativeStderrOnSuccessIsNotFailure(t, newTestPersistentPS(t))
+}
+
+func TestPersistentPS_GitCloneIntoNonEmptyDirKeepsExitCode(t *testing.T) {
+	checkGitCloneIntoNonEmptyDirKeepsExitCode(t, newTestPersistentPS(t))
+}
+
+func TestPersistentPS_MissingProgramErrorOnce(t *testing.T) {
+	checkMissingProgramErrorOnce(t, newTestPersistentPS(t))
+}
+
+func TestPersistentPS_LeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T) {
+	checkLeakedStopPreferenceDoesNotFailNativeStderr(t, newTestPersistentPS(t))
+}
+
+// A native program's failure text goes to stderr; before the merge the step
+// reported a bare "exit code 3".
+func checkNativeStderrInOutputOnFailure(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	_, err := execPS(t, ps, `cmd /c "echo boom 1>&2 & exit 3"`)
+	requireExitCode(t, err, 3)
+	var exitErr *ExitCodeError
+	errors.As(err, &exitErr)
+	if !strings.Contains(exitErr.Output, "boom") {
+		t.Errorf("expected the program's stderr in the output, got %q", exitErr.Output)
+	}
+}
+
+// Success stays on the native exit code: stderr text (git clone progress) at
+// exit 0 is not a failure, even where it turns $? false.
+func checkNativeStderrOnSuccessIsNotFailure(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	out, err := execPS(t, ps, `git --version; cmd /c "echo progress 1>&2"`)
+	if err != nil {
+		t.Fatalf("expected success, got %v (output %q)", err, out)
+	}
+	if !strings.Contains(out, "progress") {
+		t.Errorf("expected stderr text in the output, got %q", out)
+	}
+}
+
+// The env-setup clone skeleton into an existing, non-empty directory: git
+// checks the destination before any transport, so no network is needed.
+func checkGitCloneIntoNonEmptyDirKeepsExitCode(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dest := filepath.Join(dir, "dest")
+	if out, err := exec.Command("git", "init", "-q", src).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "keep.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := fmt.Sprintf("git -c protocol.ext.allow=never -c protocol.file.allow=user clone -- '%s' '%s'", src, dest)
+	_, err := execPS(t, ps, cmd)
+	requireExitCode(t, err, 128)
+	var exitErr *ExitCodeError
+	errors.As(err, &exitErr)
+	if !strings.Contains(exitErr.Output, "already exists") {
+		t.Errorf("expected git's fatal: ... already exists in the output, got %q", exitErr.Output)
+	}
+}
+
+// The promoted error reaches the output once, through 2>&1: the old Write-Host
+// echo of $Error[0] must not print it a second time.
+func checkMissingProgramErrorOnce(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	out, err := execPS(t, ps, "aix-definitely-missing-cmd")
+	requireExitCode(t, err, 1)
+	if n := strings.Count(out, "not recognized"); n != 1 {
+		t.Errorf("expected \"not recognized\" exactly once, got %d in %q", n, out)
+	}
+}
+
+// A Stop preference left in the host by an earlier command must not turn a
+// redirected native stderr line into a terminating error.
+func checkLeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	if out, err := execPS(t, ps, "$global:ErrorActionPreference = 'Stop'"); err != nil {
+		t.Fatalf("set Stop: %v (output %q)", err, out)
+	}
+	// Under a terminating error the rest of the wrapper line is skipped, the
+	// text goes to the unread stderr and the reset status reads as success, so
+	// the output and the failing exit code are what tell the two apart.
+	out, err := execPS(t, ps, `cmd /c "echo progress 1>&2 & exit 0"`)
+	if err != nil {
+		t.Fatalf("expected success under a leaked Stop preference, got %v (output %q)", err, out)
+	}
+	if !strings.Contains(out, "progress") {
+		t.Errorf("expected stderr text in the output under a leaked Stop preference, got %q", out)
+	}
+	_, err = execPS(t, ps, `cmd /c "echo boom 1>&2 & exit 4"`)
+	requireExitCode(t, err, 4)
+	if !ps.IsHealthy() {
+		t.Fatal("host became unhealthy")
+	}
+	if out, err := execPS(t, ps, "Write-Output ok"); err != nil || strings.TrimSpace(out) != "ok" {
+		t.Fatalf("expected ok/exit 0, got %q, %v", out, err)
+	}
+}
+
 // A script blocked by execution policy never starts. CI's default policy is
 // permissive and a Group-Policy pin cannot be simulated, so a test-only
 // `powershell.exe -ExecutionPolicy Restricted` host runs the same reset / status
@@ -156,7 +280,7 @@ func TestExitCapture_BlockedScriptExitsOne(t *testing.T) {
 	script := psSecurityModuleImport + "\n" +
 		"Write-Output ('AIX_PS_EVIDENCE policy=' + (Get-ExecutionPolicy))\n" +
 		psResetScript +
-		"& { & '" + blocked + "'; " + psStatusCaptureStatement + " }\n" +
+		psWrapUserCommand("& '"+blocked+"'") + "\n" +
 		psExitCaptureScript + "\n" +
 		"$__e = if ($Error.Count -gt 0) { $Error[0] } else { $null }\n" +
 		"Write-Output ('AIX_PS_EVIDENCE promoted=' + $__aix_promoted)\n" +

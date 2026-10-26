@@ -120,8 +120,8 @@ const psStatusCaptureStatement = "$global:__aix_ok = $?"
 // cmdlet's own error carries a suffix (`CommandNotFoundException,Microsoft.
 // PowerShell.Commands.GetCommandCommand` for a `Get-Command -ErrorAction
 // SilentlyContinue` probe) and does not match; a real non-zero native code is
-// never overridden. $__aix_promoted lets a caller echo the error when the host's
-// stderr is not part of the output.
+// never overridden. The error itself reaches the output through the caller's
+// stderr merge (psWrapUserCommand, or the fallback's combined pipes).
 //
 // One line on purpose: the persistent host reads `-Command -` from stdin, where
 // a statement split across lines (`if (...) {` newline ...) is not run until a
@@ -130,3 +130,30 @@ const psExitCaptureScript = "$__aix_exit = $LASTEXITCODE; $__aix_promoted = $fal
 	"if (-not $__aix_ok -and ($null -eq $__aix_exit -or $__aix_exit -eq 0) -and $Error.Count -gt 0 -and " +
 	"@('CommandNotFoundException', 'UnauthorizedAccess') -contains $Error[0].FullyQualifiedErrorId) " +
 	"{ $__aix_exit = 1; $__aix_promoted = $true }"
+
+// psWrapUserCommand wraps one user command for the persistent host so its
+// error stream is part of the captured output. That host reads only stdout, so
+// a native program's own failure text (git's `fatal: ...`) used to be lost and
+// the step failed as a bare `exit code 128`.
+//
+//   - `2>&1` merges stream 2 only, never `*>&1`: Write-Host / warning / verbose
+//     keep going to stdout as plain text instead of becoming records.
+//   - Each ErrorRecord is stringified to its message; other objects pass
+//     through and are formatted as before.
+//   - psStatusCaptureStatement sits INSIDE the redirected block, right after
+//     the command: after the pipe $? would describe ForEach-Object, which always
+//     succeeds, and a missing program would report exit 0 again.
+//   - $ErrorActionPreference is scoped to Continue: in Windows PowerShell 5.1 a
+//     redirected native stderr line is an ErrorRecord, which a preference of
+//     Stop leaked by an earlier command would make terminating. A command that
+//     sets Stop itself still gets it (its assignment runs in the inner scope).
+//
+// Success stays on the native exit code: psExitCaptureScript promotes only the
+// two "never started" error ids, so 5.1's $? = false after a native program
+// that wrote to stderr and exited 0 (git clone progress) is still success.
+//
+// One line on purpose, for the same reason as psExitCaptureScript.
+func psWrapUserCommand(command string) string {
+	return "& { $ErrorActionPreference = 'Continue'; & { " + command + "; " + psStatusCaptureStatement +
+		" } 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ } } }"
+}
