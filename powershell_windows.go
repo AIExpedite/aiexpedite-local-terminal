@@ -286,8 +286,11 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// statements that could reset $LASTEXITCODE), then emit the protocol markers.
 	fullCmd.WriteString("\n" + psExitCaptureScript)
 	// End of this command's stderr. Native programs have exited and PowerShell
-	// has written its own errors by now, and both reach the pipe in order.
-	fullCmd.WriteString(fmt.Sprintf("\n[Console]::Error.WriteLine('%s')", psStderrMarker))
+	// has written its own errors by now, and both reach the pipe in order. The
+	// leading empty line keeps the marker on its own line after stderr text with
+	// no trailing newline, as Write-Host '' does for stdout; drainStderr matches
+	// whole lines only and trims the blank line from the block.
+	fullCmd.WriteString(fmt.Sprintf("\n[Console]::Error.WriteLine(); [Console]::Error.WriteLine('%s')", psStderrMarker))
 	fullCmd.WriteString(fmt.Sprintf(
 		"\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
 		psExitCodeMarker, psDelimiter))

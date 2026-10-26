@@ -152,6 +152,27 @@ func TestPersistentPS_LeakedStopPreferenceDoesNotFailNativeStderr(t *testing.T) 
 	checkLeakedStopPreferenceDoesNotFailNativeStderr(t, newTestPersistentPS(t))
 }
 
+func TestPersistentPS_UnterminatedStderrDoesNotHang(t *testing.T) {
+	checkUnterminatedStderrDoesNotHang(t, newTestPersistentPS(t))
+}
+
+// Stderr text with no trailing newline must not swallow the stderr marker:
+// drainStderr matches it as a whole line, so a marker appended to `boom` was
+// never seen and Execute waited until the command timed out.
+func checkUnterminatedStderrDoesNotHang(t *testing.T, ps *PersistentPowerShell) {
+	t.Helper()
+	out, err := execPS(t, ps, "[Console]::Error.Write('boom')")
+	if err != nil {
+		t.Fatalf("expected success, got %v (output %q)", err, out)
+	}
+	if !strings.Contains(out, "boom") || strings.Contains(out, psStderrMarker) {
+		t.Errorf("expected the stderr text without the marker, got %q", out)
+	}
+	if out, err := execPS(t, ps, "Write-Output ok"); err != nil || strings.TrimSpace(out) != "ok" {
+		t.Fatalf("expected ok/exit 0 on the next command, got %q, %v", out, err)
+	}
+}
+
 func TestPersistentPS_OwnStopPreferenceRunsToCompletion(t *testing.T) {
 	checkOwnStopPreferenceRunsToCompletion(t, newTestPersistentPS(t))
 }

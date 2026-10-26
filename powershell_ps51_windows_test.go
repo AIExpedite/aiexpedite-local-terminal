@@ -48,6 +48,10 @@ func TestPersistentPS51_MissingProgramErrorOnce(t *testing.T) {
 	checkMissingProgramErrorOnce(t, newTestPersistentPS51(t))
 }
 
+func TestPersistentPS51_UnterminatedStderrDoesNotHang(t *testing.T) {
+	checkUnterminatedStderrDoesNotHang(t, newTestPersistentPS51(t))
+}
+
 func TestPersistentPS51_OwnStopPreferenceRunsToCompletion(t *testing.T) {
 	checkOwnStopPreferenceRunsToCompletion(t, newTestPersistentPS51(t))
 }
