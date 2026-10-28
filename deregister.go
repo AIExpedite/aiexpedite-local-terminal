@@ -39,13 +39,71 @@ var notifyConnectivityMutex sync.Mutex
 // mutex is acquired — see notifyConnectivity for the rationale. It must be
 // at least (notifyConnectivityMaxAttempts × notifyConnectivityPerAttemptHTTP)
 // + (notifyConnectivityMaxAttempts-1) × notifyConnectivityRetryBackoff for
-// the retry wrapper to actually finish all attempts.
+// the retry wrapper to actually finish all attempts. The same holds for
+// notifyOnlineHTTPBudget and notifyOnlinePerAttemptHTTP.
+//
+// /offline, /drain and /drain/exit keep the short 2 s / 5 s: shutdown waits on
+// /offline, and the Windows console handler gives the whole shutdown 2 to 4 s.
+//
+// /online gets its own, longer limits. It carries the boot report and learns
+// the fenced sessions, and terminal-service answers it inside a Firestore
+// transaction that reads every reported session, so a large report, a write
+// throttle or a cold start can take several seconds. A 200 that arrives after
+// the client gave up is lost work: the reaped sessions are not acked (so the
+// next /online is just as large) and the fence gate stays shut, so every
+// session command on this computer is held, Nacked and finally rejected as
+// "too old" (fenced_sessions.go holdForFenceReport). On 2026-10-27 one
+// computer's /online took 4.5 to 9.7 s against the 2 s limit, and none of its
+// 178 session starts that day ran. A slow /online never delays a shutdown or a
+// Disconnect: it is cancelled the moment the agent goes offline or starts
+// shutting down (cancelOnlineOnDisconnect), so the /offline queued behind it
+// on notifyConnectivityMutex goes out at once.
 const (
 	notifyConnectivityMaxAttempts    = 2
 	notifyConnectivityRetryBackoff   = 250 * time.Millisecond
 	notifyConnectivityPerAttemptHTTP = 2 * time.Second
 	notifyConnectivityHTTPBudget     = 5 * time.Second
+
+	notifyOnlinePerAttemptHTTP = 15 * time.Second
+	notifyOnlineHTTPBudget     = notifyConnectivityMaxAttempts*notifyOnlinePerAttemptHTTP +
+		(notifyConnectivityMaxAttempts-1)*notifyConnectivityRetryBackoff + 500*time.Millisecond
 )
+
+// connectivityTimeouts returns the per-attempt HTTP timeout and the post-lock
+// budget for a connectivity path: the longer /online limits for "online", the
+// short ones for everything else.
+func connectivityTimeouts(path string) (perAttempt, budget time.Duration) {
+	if path == "online" {
+		return notifyOnlinePerAttemptHTTP, notifyOnlineHTTPBudget
+	}
+	return notifyConnectivityPerAttemptHTTP, notifyConnectivityHTTPBudget
+}
+
+// onlinePreemptPoll is how often an in-flight /online checks whether the agent
+// went offline or started shutting down.
+const onlinePreemptPoll = 25 * time.Millisecond
+
+// cancelOnlineOnDisconnect cancels an in-flight /online as soon as the agent
+// goes offline (tray Disconnect) or starts shutting down, so the /offline
+// queued behind it on notifyConnectivityMutex is never held for the /online's
+// longer budget. Both paths set the flag before they call notifyOffline. The
+// /online's answer no longer matters then: the next connection sends a fresh
+// one (SetOffline resets the fence report). Returns when ctx is done.
+func cancelOnlineOnDisconnect(ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(onlinePreemptPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if IsOffline() || IsShutdownInProgress() {
+				cancel()
+				return
+			}
+		}
+	}
+}
 
 // notifyOffline sends a POST /device/{agentId}/offline request to the
 // terminal-service so it stops routing commands to this agent immediately.
@@ -192,7 +250,8 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 	// is ignored so callers whose timeout expires while waiting on the
 	// mutex still get a full fresh budget for their HTTP work.
 	parentCtx := ctx
-	ctx, cancel := context.WithTimeout(context.Background(), notifyConnectivityHTTPBudget)
+	_, budget := connectivityTimeouts(path)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	if parentCtx != nil {
 		stop := context.AfterFunc(parentCtx, func() {
 			// Forward only explicit cancellation (shutdown), not deadline
@@ -221,11 +280,16 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 	if path != "offline" && IsOffline() {
 		return context.Canceled
 	}
+	// /online's budget is long (see the constants above); a Disconnect or a
+	// shutdown landing while it is in flight cancels it rather than waiting.
+	if path == "online" {
+		go cancelOnlineOnDisconnect(ctx, cancel)
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= notifyConnectivityMaxAttempts; attempt++ {
 		// Honor the post-lock budget between attempts so we don't loop
-		// past the 5s window on a fully-broken network.
+		// past the budget window on a fully-broken network.
 		select {
 		case <-ctx.Done():
 			if lastErr != nil {
@@ -255,6 +319,12 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 			return nil
 		}
 		lastErr = err
+		// A cancelled or spent budget (Disconnect / shutdown preempting an
+		// /online, or a fully-broken network) ends the loop here rather than
+		// logging a retry that cannot run.
+		if ctx.Err() != nil {
+			return fmt.Errorf("notify%s aborted (%w) after %v", capitalize(path), ctx.Err(), lastErr)
+		}
 
 		if attempt < notifyConnectivityMaxAttempts {
 			fmt.Printf("%s[%s] Notify attempt %d/%d failed: %v — retrying%s\n",
@@ -443,7 +513,8 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, path 
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: notifyConnectivityPerAttemptHTTP}
+	perAttempt, _ := connectivityTimeouts(path)
+	client := &http.Client{Timeout: perAttempt}
 	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
