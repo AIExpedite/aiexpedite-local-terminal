@@ -1073,3 +1073,95 @@ func TestRemoveDetachedCompanionRescuesItsOwnCommits(t *testing.T) {
 		t.Fatalf("rescue ref is at %s, want the companion's own commit %s", rescued, sha)
 	}
 }
+
+// ─── __worktree_remove__ with discardChanges (a confirmed feature delete) ────
+
+func TestRemoveWorktreeDiscardChangesRemovesAnUncommittedTree(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	created, err := ensureWorktree(ctx, fx.ensureReq("feature/discard-dirty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtWrite(t, filepath.Join(created.Path, "not-committed.txt"), "the person was told\n")
+
+	req := fx.removeReq(fx.wtPath("demo"))
+	req.DiscardChanges = true
+	res, err := removeWorktree(ctx, req)
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.Removed || res.Kept || !res.AdminDirRemoved || !res.ChangesDiscarded {
+		t.Fatalf("res = %+v, want removed with changes discarded", res)
+	}
+	if res.RescuePushed {
+		t.Fatal("discardChanges must not push a rescue branch")
+	}
+	if _, serr := os.Lstat(created.Path); !os.IsNotExist(serr) {
+		t.Fatalf("the worktree directory survived: %v", serr)
+	}
+}
+
+func TestRemoveWorktreeDiscardChangesRemovesUnpushedWorkWithoutRescue(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	created, err := ensureWorktree(ctx, fx.ensureReq("feature/discard-unpushed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtWrite(t, filepath.Join(created.Path, "work.txt"), "committed, never pushed\n")
+	wtMustGit(t, created.Path, "add", "-A")
+	wtMustGit(t, created.Path, "commit", "-m", "unpushed")
+
+	req := fx.removeReq(fx.wtPath("demo"))
+	req.DiscardChanges = true
+	res, err := removeWorktree(ctx, req)
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.Removed || res.RescuePushed || !res.ChangesDiscarded {
+		t.Fatalf("res = %+v, want removed, no rescue push, changes discarded", res)
+	}
+}
+
+func TestRemoveWorktreeDiscardChangesStillRefusesALinkedPath(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	sibling := filepath.Join(fx.Base, "sibling-checkout")
+	if err := os.MkdirAll(filepath.Join(sibling, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtWrite(t, filepath.Join(sibling, "precious.txt"), "do not delete\n")
+	if err := os.MkdirAll(filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makeAbsDirLink(t, filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder, "demo"+wtTestRepoDiscriminator), sibling)
+
+	req := fx.removeReq(fx.wtPath("demo"))
+	req.DiscardChanges = true
+	if _, err := removeWorktree(context.Background(), req); err == nil {
+		t.Fatal("discardChanges admitted a worktree path that is a link into a sibling checkout")
+	}
+	if _, serr := os.Stat(filepath.Join(sibling, "precious.txt")); serr != nil {
+		t.Fatalf("the sibling checkout was touched: %v", serr)
+	}
+}
+
+func TestRemoveWorktreeDiscardChangesStillKeepsOnABranchMismatch(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	created, err := ensureWorktree(ctx, fx.ensureReq("feature/discard-actual"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtWrite(t, filepath.Join(created.Path, "dirty.txt"), "x\n")
+	req := fx.removeReq(fx.wtPath("demo"))
+	req.DiscardChanges = true
+	req.Branch = "feature/what-the-server-thinks"
+	res, err := removeWorktree(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed || res.KeptReason != keptReasonBranchMismatch {
+		t.Fatalf("res = %+v, want kept with %q", res, keptReasonBranchMismatch)
+	}
+}

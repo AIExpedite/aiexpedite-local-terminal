@@ -26,6 +26,14 @@
 // unpushed. Uncommitted work is never deleted: the worktree is KEPT and
 // reported. If work exists only here it is pushed to aix/rescue/… first, and
 // only if that push fails is the worktree kept.
+//
+// The ONE exception is `discardChanges`, sent only by a confirmed feature
+// delete (VOICE_DELETE_GATE.md §5): the person was told, before confirming,
+// that the feature's code on this computer goes "including uncommitted
+// changes". It skips exactly the two work proofs (uncommitted, unpushed — and
+// with them the rescue push). The path policy, the registration check, the
+// branch / head checks and the link-safe walk all still run, so it can never
+// remove a path outside the registered worktree.
 // -----------------------------------------------------------------------------
 
 package main
@@ -68,6 +76,9 @@ type worktreeRemoveRequest struct {
 	RescueBranch string `json:"rescueBranch"`
 	// AllowRescuePush defaults to true.
 	AllowRescuePush *bool `json:"allowRescuePush"`
+	// DiscardChanges skips the uncommitted / unpushed proofs (a confirmed
+	// feature delete). Absent = false, so an older server never sends it.
+	DiscardChanges bool `json:"discardChanges"`
 }
 
 type worktreeRemoveResult struct {
@@ -86,6 +97,9 @@ type worktreeRemoveResult struct {
 	// removal is reported rather than merely claimed.
 	ChecksPassed []string `json:"checksPassed,omitempty"`
 	DirtyPaths   []string `json:"dirtyPaths,omitempty"`
+	// ChangesDiscarded is true when DiscardChanges removed a tree that held
+	// uncommitted or unpushed work.
+	ChangesDiscarded bool `json:"changesDiscarded,omitempty"`
 }
 
 func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRemoveResult, error) {
@@ -163,44 +177,57 @@ func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRem
 	}
 	res.ChecksPassed = append(res.ChecksPassed, "head_and_branch_match")
 
-	if state.Dirty {
-		// Uncommitted work is NEVER deleted — and "dirty" includes untracked
-		// files, which are precisely what git cannot recover.
-		res.Kept, res.KeptReason = true, keptReasonUncommittedWork
-		res.DirtyPaths = state.DirtyPaths
-		res.Detail = fmt.Sprintf("%d uncommitted or untracked path(s)", len(state.DirtyPaths))
-		return res, nil
-	}
-	res.ChecksPassed = append(res.ChecksPassed, "nothing_uncommitted")
+	if req.DiscardChanges {
+		// A confirmed feature delete: the work proofs are skipped, nothing is
+		// pushed, and what was here is reported rather than kept.
+		if state.Dirty {
+			res.DirtyPaths = state.DirtyPaths
+			res.ChangesDiscarded = true
+		}
+		if unpushed, _, uerr := wtUnpushedCommits(ctx, wt.Abs, remoteOrDefault(req.Remote), req.DefaultBranch); uerr != nil || unpushed {
+			res.ChangesDiscarded = true
+		}
+		res.ChecksPassed = append(res.ChecksPassed, "changes_discarded_on_request")
+	} else {
+		if state.Dirty {
+			// Uncommitted work is NEVER deleted — and "dirty" includes untracked
+			// files, which are precisely what git cannot recover.
+			res.Kept, res.KeptReason = true, keptReasonUncommittedWork
+			res.DirtyPaths = state.DirtyPaths
+			res.Detail = fmt.Sprintf("%d uncommitted or untracked path(s)", len(state.DirtyPaths))
+			return res, nil
+		}
+		res.ChecksPassed = append(res.ChecksPassed, "nothing_uncommitted")
 
-	// The unpushed check runs for a DETACHED worktree too, not only a branch.
-	// A companion is detached, and a detached HEAD can hold commits an earlier
-	// run made while the working tree looks pristine (that is exactly the
-	// "diverged companion" ensure reports and leaves alone) — so skipping this
-	// for a detached HEAD would delete the only copy of those commits.
-	// wtUnpushedCommits answers both shapes: `@{u}..HEAD` where there is an
-	// upstream, reachability from <remote>/<default> where there is not.
-	unpushed, sample, uerr := wtUnpushedCommits(ctx, wt.Abs, remoteOrDefault(req.Remote), req.DefaultBranch)
-	if uerr != nil {
-		// Could not PROVE it is pushed. Keep it.
-		res.Kept, res.KeptReason, res.Detail = true, keptReasonUnpushedWork, uerr.Error()
-		return res, nil
-	}
-	if unpushed {
-		if req.AllowRescuePush != nil && !*req.AllowRescuePush {
-			res.Kept, res.KeptReason = true, keptReasonUnpushedWork
-			res.Detail = fmt.Sprintf("%d unpushed commit(s) and rescue pushing is off", len(sample))
+		// The unpushed check runs for a DETACHED worktree too, not only a branch.
+		// A companion is detached, and a detached HEAD can hold commits an earlier
+		// run made while the working tree looks pristine (that is exactly the
+		// "diverged companion" ensure reports and leaves alone) — so skipping this
+		// for a detached HEAD would delete the only copy of those commits.
+		// wtUnpushedCommits answers both shapes: `@{u}..HEAD` where there is an
+		// upstream, reachability from <remote>/<default> where there is not.
+		unpushed, sample, uerr := wtUnpushedCommits(ctx, wt.Abs, remoteOrDefault(req.Remote), req.DefaultBranch)
+		if uerr != nil {
+			// Could not PROVE it is pushed. Keep it.
+			res.Kept, res.KeptReason, res.Detail = true, keptReasonUnpushedWork, uerr.Error()
 			return res, nil
 		}
-		if _, perr := wtGitNetwork(ctx, wt.Abs, "push", remoteOrDefault(req.Remote),
-			"HEAD:refs/heads/"+rescueRef); perr != nil {
-			res.Kept, res.KeptReason, res.Detail = true, keptReasonRescuePushFailed, perr.Error()
-			return res, nil
+		if unpushed {
+			if req.AllowRescuePush != nil && !*req.AllowRescuePush {
+				res.Kept, res.KeptReason = true, keptReasonUnpushedWork
+				res.Detail = fmt.Sprintf("%d unpushed commit(s) and rescue pushing is off", len(sample))
+				return res, nil
+			}
+			if _, perr := wtGitNetwork(ctx, wt.Abs, "push", remoteOrDefault(req.Remote),
+				"HEAD:refs/heads/"+rescueRef); perr != nil {
+				res.Kept, res.KeptReason, res.Detail = true, keptReasonRescuePushFailed, perr.Error()
+				return res, nil
+			}
+			res.RescuePushed = true
+			res.ChecksPassed = append(res.ChecksPassed, "rescue_pushed")
 		}
-		res.RescuePushed = true
-		res.ChecksPassed = append(res.ChecksPassed, "rescue_pushed")
+		res.ChecksPassed = append(res.ChecksPassed, "nothing_unpushed")
 	}
-	res.ChecksPassed = append(res.ChecksPassed, "nothing_unpushed")
 
 	// Step 1: the link-safe delete. NOT `git worktree remove`.
 	stats, derr := linkSafeRemoveAll(wt.Abs)
