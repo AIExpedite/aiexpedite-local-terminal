@@ -1445,6 +1445,19 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 	// /drain/exit after the user has flipped connectivity — those RPCs wait
 	// on notifyConnectivityMutex and would otherwise overwrite the later
 	// offline signal.
+	//
+	// The 5 s timeout bounds only the wait for notifyConnectivityMutex; once
+	// a request holds it, it runs on its own budget (notifyConnectivity
+	// forwards cancellation, not deadlines). /online's budget is the longer
+	// notifyOnlineHTTPBudget (~31 s), so against a slow terminal-service this
+	// call can hold StartAgent — and with it the Pub/Sub loop, the orphan
+	// scanner and the Grok keeper — for up to ~31 s (applied branch) or ~36 s
+	// (drain/exit's 5 s, then /online). That is deliberate: a fast give-up
+	// leaves the fence report unapplied, and until it lands every session
+	// command is held and Nacked anyway (holdForFenceReport), so starting
+	// Pub/Sub sooner would not run one more session — it would only lose the
+	// answer and wait for retryInterruptedAttemptReconciliation's backoff.
+	// Disconnect and Quit still cancel it at once.
 	ctx, cancel := attemptReconciliationContext(cfg, 5*time.Second)
 	defer cancel()
 	if applied && Version == target {

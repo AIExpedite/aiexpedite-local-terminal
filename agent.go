@@ -502,7 +502,10 @@ func StartAgent(cfg *Config) {
 		//
 		// Best-effort, non-blocking: a transient backend failure must not
 		// delay agent startup. The HTTP retry wrapper inside notifyOnline
-		// gives us 2 attempts × 2s within a 5s budget.
+		// gives us 2 attempts × 15s within its own budget (deregister.go
+		// notifyOnlinePerAttemptHTTP), off the boot path in this goroutine.
+		// (The update-reconciliation /online in step 3d is the exception: it
+		// runs synchronously on the boot path, see resolveInterruptedAttempt.)
 		if !updateReconciliationPending {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

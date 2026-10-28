@@ -729,3 +729,249 @@ func TestFencedTeardownNeverRunsTwiceAtOnce(t *testing.T) {
 	}
 	endFencedTeardown("s-slow")
 }
+
+// TestSlowOnlineAnswerStillCounts: an /online the server answers after 3 s —
+// past the 2 s that /offline and the drain calls allow — is still accepted.
+// The reaped sessions it carried are acked, the sessions it names are fenced,
+// and the fence report is applied. On 2026-10-27 a computer whose /online took
+// 4.5 to 9.7 s gave up on every answer, kept re-sending 198 reaped ids and
+// turned every session start into a "too old (61 s)" rejection.
+func TestSlowOnlineAnswerStillCounts(t *testing.T) {
+	resetConnectivityState(t)
+	resetFencedSessions(t)
+	resetFenceReportForTest(t)
+	dir := t.TempDir()
+	writeLedgerFixture(t, dir, ledgerFileData{BootID: "boot-s", Entries: []*ledgerEntry{
+		{SessionID: "s-reaped", BootID: "boot-s", State: ledgerStateReaped, PIDs: []ledgerProcess{}},
+	}})
+	l := newTestLedger(t, dir, "boot-t")
+	l.RunBootReap()
+	prevReport, prevAccepted, prevEnd := bootReportForOnline, onOnlineAccepted, endFencedSession
+	bootReportForOnline = func(ctx context.Context) bootReport { return l.Report(ctx) }
+	onOnlineAccepted = func(resp *onlineResponse) { applyOnlineAccepted(l, resp) }
+	// The fenced session's teardown runs in a goroutine that reads
+	// endFencedSession; the test waits for it before the Cleanup restores the
+	// seam, or the race detector flags the write.
+	ended := make(chan string, 1)
+	endFencedSession = func(id string) { ended <- id }
+	t.Cleanup(func() { bootReportForOnline, onOnlineAccepted, endFencedSession = prevReport, prevAccepted, prevEnd })
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		time.Sleep(3 * time.Second)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"fencedSessionIds":["s-moved"]}`))
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	if err := notifyOnline(context.Background(), &Config{AgentID: "agent-s", CommandSecret: "secret-s"}); err != nil {
+		t.Fatalf("a slow 200 must count: %v", err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("a slow 200 was retried: %d requests", n)
+	}
+	if got := l.Report(context.Background()).SessionsReaped; len(got) != 0 {
+		t.Fatalf("a slow accepted /online did not ack the reaped sessions: %v", got)
+	}
+	if !isSessionFenced("s-moved") {
+		t.Fatalf("a slow accepted /online did not fence the sessions it named")
+	}
+	if !fenceReportApplied() {
+		t.Fatalf("a slow accepted /online did not apply the fence report")
+	}
+	select {
+	case id := <-ended:
+		if id != "s-moved" {
+			t.Fatalf("ended %q, want s-moved", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("a slow accepted /online never ended the session it fenced")
+	}
+	waitForFencedTeardownsIdle(t)
+}
+
+// TestOfflineKeepsItsShortTimeout: the longer /online limits do not reach
+// /offline, which shutdown waits on. Against a server that sleeps 3 s on every
+// request, /offline gives up within its 5 s budget (2 attempts × 2 s).
+func TestOfflineKeepsItsShortTimeout(t *testing.T) {
+	resetConnectivityState(t)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(3 * time.Second):
+		case <-release:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	defer close(release)
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	start := time.Now()
+	err := notifyOffline(context.Background(), &Config{AgentID: "agent-o", CommandSecret: "secret-o"})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("/offline must time out against a 3 s server")
+	}
+	if elapsed > notifyConnectivityHTTPBudget+500*time.Millisecond {
+		t.Fatalf("/offline took %v, past its %v budget", elapsed, notifyConnectivityHTTPBudget)
+	}
+}
+
+// TestDisconnectCancelsASlowOnline: a Disconnect or a shutdown landing while a
+// slow /online is in flight cancels it, so the /offline queued behind it on
+// notifyConnectivityMutex goes out at once instead of waiting out the
+// /online's longer budget (the Windows console handler gives a shutdown 2 s).
+func TestDisconnectCancelsASlowOnline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func()
+	}{
+		{"disconnect", func() {
+			offlineMutex.Lock()
+			isOffline = true
+			offlineMutex.Unlock()
+		}},
+		{"shutdown", func() { shutdownInProgress.Store(true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetConnectivityState(t)
+			resetFenceReportForTest(t)
+			t.Cleanup(func() { resetConnectivityState(t) })
+			withBootReport(t, bootReport{BootID: "boot-d", SessionsReaped: []string{}, SessionsSurviving: []string{}})
+			withOnlineAccepted(t)
+
+			release := make(chan struct{})
+			onlineArrived := make(chan struct{}, 1)
+			var offlineAt atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/offline") {
+					offlineAt.Store(time.Now().UnixNano())
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				select {
+				case onlineArrived <- struct{}{}:
+				default:
+				}
+				select {
+				case <-time.After(10 * time.Second):
+				case <-release:
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			defer srv.Close()
+			defer close(release)
+			t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+			cfg := &Config{AgentID: "agent-d", CommandSecret: "secret-d"}
+
+			onlineErr := make(chan error, 1)
+			go func() { onlineErr <- notifyOnline(context.Background(), cfg) }()
+			select {
+			case <-onlineArrived:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("/online never reached the server")
+			}
+
+			start := time.Now()
+			tc.stop()
+			if err := notifyOffline(context.Background(), cfg); err != nil {
+				t.Fatalf("/offline after a cancelled /online: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("/offline waited %v behind the in-flight /online", elapsed)
+			}
+			if offlineAt.Load() == 0 {
+				t.Fatalf("/offline never reached the server")
+			}
+			select {
+			case err := <-onlineErr:
+				if err == nil {
+					t.Fatalf("the cancelled /online reported success")
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("the cancelled /online never returned")
+			}
+			if fenceReportApplied() {
+				t.Fatalf("a cancelled /online applied the fence report")
+			}
+		})
+	}
+}
+
+// waitForFencedTeardownsIdle waits until no fenced-session teardown is still
+// marked running, so a later test fencing the same id is not refused by
+// beginFencedTeardown.
+func waitForFencedTeardownsIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fencedTeardowns.Lock()
+		n := len(fencedTeardowns.running)
+		fencedTeardowns.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d fenced teardown(s) still running", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestFenceWorkerSkipsOnlineQueuedBehindAnAcceptedOne: the fence worker's
+// /online queued behind a slow boot / Reconnect /online is dropped once that
+// one is accepted, so a slow /online is not followed by a second one.
+func TestFenceWorkerSkipsOnlineQueuedBehindAnAcceptedOne(t *testing.T) {
+	resetConnectivityState(t)
+	resetFenceReportForTest(t)
+	withBootReport(t, bootReport{BootID: "boot-w", SessionsReaped: []string{}, SessionsSurviving: []string{}})
+	prevAccepted := onOnlineAccepted
+	onOnlineAccepted = func(resp *onlineResponse) { markFenceReportAppliedFor(resp.fenceGen) }
+	prevDelays, prevSend := fenceReportRetryDelays, sendOnlineForFenceReport
+	fenceReportRetryDelays = []time.Duration{50 * time.Millisecond, 20 * time.Millisecond}
+	sendOnlineForFenceReport = notifyOnlineForFenceReport
+	t.Cleanup(func() {
+		onOnlineAccepted = prevAccepted
+		fenceReportRetryDelays, sendOnlineForFenceReport = prevDelays, prevSend
+	})
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+	cfg := &Config{AgentID: "agent-w", CommandSecret: "secret-w"}
+
+	onlineErr := make(chan error, 1)
+	go func() { onlineErr <- notifyOnline(context.Background(), cfg) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ensureFenceReport(cfg) // its first send queues behind the in-flight /online
+
+	if err := <-onlineErr; err != nil {
+		t.Fatalf("boot /online: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for fenceWorkerRunning() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fenceWorkerRunning() {
+		t.Fatalf("fence worker did not stop once the report was applied")
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("server saw %d /online requests, want 1 (the worker's queued one must be dropped)", n)
+	}
+}
