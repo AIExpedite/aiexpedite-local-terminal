@@ -749,7 +749,11 @@ func TestSlowOnlineAnswerStillCounts(t *testing.T) {
 	prevReport, prevAccepted, prevEnd := bootReportForOnline, onOnlineAccepted, endFencedSession
 	bootReportForOnline = func(ctx context.Context) bootReport { return l.Report(ctx) }
 	onOnlineAccepted = func(resp *onlineResponse) { applyOnlineAccepted(l, resp) }
-	endFencedSession = func(string) {}
+	// The fenced session's teardown runs in a goroutine that reads
+	// endFencedSession; the test waits for it before the Cleanup restores the
+	// seam, or the race detector flags the write.
+	ended := make(chan string, 1)
+	endFencedSession = func(id string) { ended <- id }
 	t.Cleanup(func() { bootReportForOnline, onOnlineAccepted, endFencedSession = prevReport, prevAccepted, prevEnd })
 
 	var hits atomic.Int32
@@ -778,6 +782,15 @@ func TestSlowOnlineAnswerStillCounts(t *testing.T) {
 	if !fenceReportApplied() {
 		t.Fatalf("a slow accepted /online did not apply the fence report")
 	}
+	select {
+	case id := <-ended:
+		if id != "s-moved" {
+			t.Fatalf("ended %q, want s-moved", id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("a slow accepted /online never ended the session it fenced")
+	}
+	waitForFencedTeardownsIdle(t)
 }
 
 // TestOfflineKeepsItsShortTimeout: the longer /online limits do not reach
@@ -888,5 +901,77 @@ func TestDisconnectCancelsASlowOnline(t *testing.T) {
 				t.Fatalf("a cancelled /online applied the fence report")
 			}
 		})
+	}
+}
+
+// waitForFencedTeardownsIdle waits until no fenced-session teardown is still
+// marked running, so a later test fencing the same id is not refused by
+// beginFencedTeardown.
+func waitForFencedTeardownsIdle(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		fencedTeardowns.Lock()
+		n := len(fencedTeardowns.running)
+		fencedTeardowns.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d fenced teardown(s) still running", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestFenceWorkerSkipsOnlineQueuedBehindAnAcceptedOne: the fence worker's
+// /online queued behind a slow boot / Reconnect /online is dropped once that
+// one is accepted, so a slow /online is not followed by a second one.
+func TestFenceWorkerSkipsOnlineQueuedBehindAnAcceptedOne(t *testing.T) {
+	resetConnectivityState(t)
+	resetFenceReportForTest(t)
+	withBootReport(t, bootReport{BootID: "boot-w", SessionsReaped: []string{}, SessionsSurviving: []string{}})
+	prevAccepted := onOnlineAccepted
+	onOnlineAccepted = func(resp *onlineResponse) { markFenceReportAppliedFor(resp.fenceGen) }
+	prevDelays, prevSend := fenceReportRetryDelays, sendOnlineForFenceReport
+	fenceReportRetryDelays = []time.Duration{50 * time.Millisecond, 20 * time.Millisecond}
+	sendOnlineForFenceReport = notifyOnlineForFenceReport
+	t.Cleanup(func() {
+		onOnlineAccepted = prevAccepted
+		fenceReportRetryDelays, sendOnlineForFenceReport = prevDelays, prevSend
+	})
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+	cfg := &Config{AgentID: "agent-w", CommandSecret: "secret-w"}
+
+	onlineErr := make(chan error, 1)
+	go func() { onlineErr <- notifyOnline(context.Background(), cfg) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	ensureFenceReport(cfg) // its first send queues behind the in-flight /online
+
+	if err := <-onlineErr; err != nil {
+		t.Fatalf("boot /online: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for fenceWorkerRunning() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fenceWorkerRunning() {
+		t.Fatalf("fence worker did not stop once the report was applied")
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("server saw %d /online requests, want 1 (the worker's queued one must be dropped)", n)
 	}
 }

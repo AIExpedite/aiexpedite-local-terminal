@@ -203,6 +203,15 @@ func notifyOnline(ctx context.Context, cfg *Config) error {
 // answer drops the reaped sessions it carried from the ledger and fences the
 // sessions it names in fencedSessionIds (onOnlineAccepted).
 func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map[string]any) error {
+	return notifyConnectivityUnless(ctx, cfg, path, extra, nil)
+}
+
+// notifyConnectivityUnless is notifyConnectivity with a check that runs once
+// the request holds notifyConnectivityMutex: when skip reports true, nothing
+// is sent and the call returns nil. A caller that queued behind another
+// request uses it to drop work that request already did (see
+// notifyOnlineForFenceReport). skip may be nil.
+func notifyConnectivityUnless(ctx context.Context, cfg *Config, path string, extra map[string]any, skip func() bool) error {
 	if cfg == nil || cfg.AgentID == "" || cfg.CommandSecret == "" {
 		return fmt.Errorf("notify%s: missing agent credentials", capitalize(path))
 	}
@@ -279,6 +288,9 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 	// /online and drain RPCs must not overwrite that newer user intent.
 	if path != "offline" && IsOffline() {
 		return context.Canceled
+	}
+	if skip != nil && skip() {
+		return nil
 	}
 	// /online's budget is long (see the constants above); a Disconnect or a
 	// shutdown landing while it is in flight cancels it rather than waiting.

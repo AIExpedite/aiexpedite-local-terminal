@@ -504,6 +504,8 @@ func StartAgent(cfg *Config) {
 		// delay agent startup. The HTTP retry wrapper inside notifyOnline
 		// gives us 2 attempts × 15s within its own budget (deregister.go
 		// notifyOnlinePerAttemptHTTP), off the boot path in this goroutine.
+		// (The update-reconciliation /online in step 3d is the exception: it
+		// runs synchronously on the boot path, see resolveInterruptedAttempt.)
 		if !updateReconciliationPending {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

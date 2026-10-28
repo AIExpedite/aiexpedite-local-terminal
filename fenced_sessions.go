@@ -316,7 +316,18 @@ func fenceWorkerRunning() bool {
 }
 
 // sendOnlineForFenceReport is the /online behind a seam for tests.
-var sendOnlineForFenceReport = func(ctx context.Context, cfg *Config) error { return notifyOnline(ctx, cfg) }
+var sendOnlineForFenceReport = func(ctx context.Context, cfg *Config) error { return notifyOnlineForFenceReport(ctx, cfg) }
+
+// notifyOnlineForFenceReport is the fence worker's /online. A boot or
+// Reconnect /online can still be in flight when the worker's first delay
+// ends (an /online may take up to notifyOnlineHTTPBudget), so the worker's
+// request queues behind it on notifyConnectivityMutex. When that /online is
+// accepted while the worker waits, the report is applied and the worker's
+// request is dropped rather than sent as a second, redundant /online to a
+// terminal-service that is already slow.
+func notifyOnlineForFenceReport(ctx context.Context, cfg *Config) error {
+	return notifyConnectivityUnless(ctx, cfg, "online", nil, fenceReportApplied)
+}
 
 // fenceReportRetryDelays is the backoff of ensureFenceReport. The first
 // delay leaves the caller's own /online (boot, Reconnect) time to land.
