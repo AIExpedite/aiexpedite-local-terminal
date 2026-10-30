@@ -7,6 +7,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ type fakeKeepAwake struct {
 	acquired  int
 	released  int
 	failWith  error
+	onLost    func(error) // the latest acquisition's
 	logs      []string
 	timers    map[int]*fakeKeepAwakeTimer
 	nextTimer int
@@ -63,13 +66,14 @@ func newFakeKeepAwakeManager(f *fakeKeepAwake) *keepAwakeManager {
 	m := newKeepAwakeManager()
 	f.timers = map[int]*fakeKeepAwakeTimer{}
 	m.disabled = func() bool { return false }
-	m.acquire = func() (func(), error) {
+	m.acquire = func(onLost func(error)) (func(), error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if f.failWith != nil {
 			return nil, f.failWith
 		}
 		f.acquired++
+		f.onLost = onLost
 		return func() {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -294,4 +298,54 @@ func TestKeepAwakeFollowsTheSpawnLedgerHelpers(t *testing.T) {
 	if f.holding() {
 		t.Fatal("the logical session's release kept the computer awake")
 	}
+}
+
+// An inhibitor child that exits on its own (systemd-inhibit with no system
+// bus) is forgotten, so a later Hold takes the lock again.
+func TestKeepAwakeLostLockIsRetakenByTheNextHold(t *testing.T) {
+	f := &fakeKeepAwake{}
+	m := newFakeKeepAwakeManager(f)
+	m.Hold("a")
+	lostFirst := f.onLost
+	lostFirst(errors.New("systemd-inhibit exited: Failed to connect to bus"))
+	warned := false
+	for _, line := range f.logs {
+		warned = warned || strings.Contains(line, "Failed to connect to bus")
+	}
+	if !warned {
+		t.Fatalf("the lost lock was not logged: %q", f.logs)
+	}
+
+	m.Hold("b")
+	if acquired, _ := f.counts(); acquired != 2 {
+		t.Fatalf("acquired %d times, want a retry after the lock was lost", acquired)
+	}
+	// The first lock's late report never drops the new one.
+	lostFirst(errors.New("late"))
+	m.Release("a")
+	if !f.holding() {
+		t.Fatal("a stale lost report dropped the retaken lock")
+	}
+	m.Release("b")
+	if acquired, released := f.counts(); acquired != 2 || released != 1 {
+		t.Fatalf("acquired %d / released %d, want 2 / 1 (the dead lock is never released)", acquired, released)
+	}
+}
+
+func TestHoldWhileChildRunsReportsAChildThatExitsOnItsOwn(t *testing.T) {
+	lost := make(chan error, 1)
+	release, err := holdWhileChildRuns(exec.Command(os.Args[0], "-test.unknown-flag-for-exit-error"),
+		func(err error) { lost <- err })
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	select {
+	case err := <-lost:
+		if !strings.Contains(err.Error(), "unknown-flag-for-exit-error") {
+			t.Fatalf("lost error %q does not carry the child's stderr", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("a child that exited was never reported lost")
+	}
+	release() // after the exit: returns, no panic
 }

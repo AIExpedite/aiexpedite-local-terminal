@@ -24,6 +24,6 @@ var caffeinateCommand = func(agentPID int) *exec.Cmd {
 	return exec.Command("caffeinate", "-i", "-w", strconv.Itoa(agentPID))
 }
 
-func acquirePlatformKeepAwake() (func(), error) {
-	return holdWhileChildRuns(caffeinateCommand(os.Getpid()))
+func acquirePlatformKeepAwake(onLost func(error)) (func(), error) {
+	return holdWhileChildRuns(caffeinateCommand(os.Getpid()), onLost)
 }

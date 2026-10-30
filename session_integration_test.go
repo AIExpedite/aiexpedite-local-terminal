@@ -172,7 +172,7 @@ func TestMain(m *testing.M) {
 	// …and every spawned session would hold the developer's computer awake
 	// (keep_awake.go): the suite never takes the real OS lock. The cases that
 	// exercise keep-awake install their own fake (helperFakeKeepAwake).
-	globalKeepAwake.acquire = func() (func(), error) { return func() {}, nil }
+	globalKeepAwake.acquire = func(func(error)) (func(), error) { return func() {}, nil }
 	globalKeepAwake.logf = func(string, ...any) {}
 
 	// Confine every config/data write in this package to a throwaway directory

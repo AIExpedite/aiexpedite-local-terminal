@@ -44,7 +44,8 @@ type reasonContext struct {
 	_                  [2 * unsafe.Sizeof(uintptr(0))]byte
 }
 
-func acquirePlatformKeepAwake() (func(), error) {
+// A power request never ends on its own, so onLost is never called.
+func acquirePlatformKeepAwake(func(error)) (func(), error) {
 	for _, proc := range []*windows.LazyProc{procPowerCreateRequest, procPowerSetRequest, procPowerClearRequest} {
 		if err := proc.Find(); err != nil {
 			return nil, err

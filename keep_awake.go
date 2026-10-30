@@ -38,6 +38,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -62,9 +63,11 @@ type keepAwakeManager struct {
 	held    map[string]keepAwakeHoldEntry
 	gen     uint64
 	release func() // non-nil while the OS lock is held
+	lockGen uint64 // bumped per acquisition, so a stale onLost is ignored
 
-	// Seams for tests.
-	acquire    func() (release func(), err error)
+	// Seams for tests. acquire's onLost is called (from another goroutine)
+	// when the OS lock ends without a release: the inhibitor child exited.
+	acquire    func(onLost func(error)) (release func(), err error)
 	afterFunc  func(d time.Duration, f func()) (stop func() bool)
 	disabled   func() bool
 	sessionCap time.Duration
@@ -117,18 +120,37 @@ func (m *keepAwakeManager) Hold(sessionID string) {
 	}
 	// Taken on the first hold; retried on a later one if it failed.
 	if m.release == nil {
-		release, err := m.acquire()
+		m.lockGen++
+		lockGen := m.lockGen
+		release, err := m.acquire(func(err error) { m.lost(lockGen, err) })
 		if err != nil {
-			if !m.warnedAcquire {
-				m.warnedAcquire = true
-				m.logf("%s[keep-awake] Could not keep the computer awake (%v); sessions run without it%s\n",
-					colorYellow, err, colorReset)
-			}
+			m.warnAcquireLocked(err)
 			return
 		}
 		m.release = release
 		m.logf("[keep-awake] Keeping the computer awake while sessions run\n")
 	}
+}
+
+// lost forgets an OS lock that ended on its own (the inhibitor child exited),
+// so the next Hold takes it again instead of trusting a dead one.
+func (m *keepAwakeManager) lost(lockGen uint64, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.release == nil || m.lockGen != lockGen {
+		return // already released, or a newer lock
+	}
+	m.release = nil
+	m.warnAcquireLocked(err)
+}
+
+func (m *keepAwakeManager) warnAcquireLocked(err error) {
+	if m.warnedAcquire {
+		return
+	}
+	m.warnedAcquire = true
+	m.logf("%s[keep-awake] Could not keep the computer awake (%v); sessions run without it%s\n",
+		colorYellow, err, colorReset)
 }
 
 // Release ends sessionID's hold. Unknown or repeated ids are no-ops.
@@ -191,18 +213,57 @@ func (m *keepAwakeManager) heldCount() int {
 
 // holdWhileChildRuns starts a child process that holds the OS lock for as
 // long as it lives (macOS caffeinate, Linux systemd-inhibit). Releasing kills
-// it and waits until it has been reaped.
-func holdWhileChildRuns(cmd *exec.Cmd) (func(), error) {
+// it and waits until it has been reaped. A child that exits on its own (e.g.
+// systemd-inhibit's "Failed to connect to bus") is reported to onLost with
+// the start of its stderr.
+func holdWhileChildRuns(cmd *exec.Cmd, onLost func(error)) (func(), error) {
+	stderr := &cappedBuffer{max: 512}
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	var released atomic.Bool
 	done := make(chan struct{})
 	go func() {
-		_ = cmd.Wait()
+		err := cmd.Wait()
+		// Closed before onLost: a release racing this exit waits on done
+		// while holding the manager's lock, which onLost takes.
 		close(done)
+		if released.Load() {
+			return
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			err = fmt.Errorf("%s exited (%v): %s", cmd.Path, err, msg)
+		} else {
+			err = fmt.Errorf("%s exited (%v)", cmd.Path, err)
+		}
+		onLost(err)
 	}()
 	return func() {
+		released.Store(true)
 		_ = cmd.Process.Kill()
 		<-done
 	}, nil
+}
+
+// cappedBuffer keeps the first max bytes written to it.
+type cappedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := b.max - len(b.buf); room > 0 {
+		b.buf = append(b.buf, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
 }

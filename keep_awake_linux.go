@@ -29,6 +29,6 @@ var systemdInhibitCommand = func() *exec.Cmd {
 	return cmd
 }
 
-func acquirePlatformKeepAwake() (func(), error) {
-	return holdWhileChildRuns(systemdInhibitCommand())
+func acquirePlatformKeepAwake(onLost func(error)) (func(), error) {
+	return holdWhileChildRuns(systemdInhibitCommand(), onLost)
 }

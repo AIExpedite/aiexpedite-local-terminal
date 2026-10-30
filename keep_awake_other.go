@@ -11,6 +11,6 @@ package main
 
 import "errors"
 
-func acquirePlatformKeepAwake() (func(), error) {
+func acquirePlatformKeepAwake(func(error)) (func(), error) {
 	return nil, errors.New("keep-awake is not supported on this platform")
 }

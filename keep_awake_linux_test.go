@@ -34,7 +34,7 @@ func TestLinuxKeepAwakeReleaseKillsAndReapsTheChild(t *testing.T) {
 		return started
 	}
 
-	release, err := acquirePlatformKeepAwake()
+	release, err := acquirePlatformKeepAwake(func(err error) { t.Errorf("a released child was reported lost: %v", err) })
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
