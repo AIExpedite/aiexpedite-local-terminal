@@ -178,6 +178,8 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// deadline. Errors here are best-effort — the app is exiting anyway and the
 	// OS will reap anything we miss.
 	tearDownSubprocesses(shutdownCtx)
+	// No session runs past this point: the computer may sleep again.
+	keepAwakeReleaseAll()
 
 	fmt.Println("[shutdown] Graceful shutdown sequence complete")
 }

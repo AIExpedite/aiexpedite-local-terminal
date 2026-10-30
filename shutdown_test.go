@@ -70,6 +70,25 @@ func TestGracefulShutdownStopsTheAntigravityRefreshSchedule(t *testing.T) {
 	}
 }
 
+// A session still held at shutdown must not keep the computer awake after
+// the agent is gone.
+func TestGracefulShutdownReleasesKeepAwake(t *testing.T) {
+	resetShutdownState(t)
+	f := helperFakeKeepAwake(t)
+	globalKeepAwake.Hold("left-running")
+	if !f.holding() {
+		t.Fatal("precondition: the fake lock should be held")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	gracefulShutdown(ctx, &Config{})
+
+	if f.holding() {
+		t.Error("gracefulShutdown left the computer held awake")
+	}
+}
+
 func TestGracefulShutdownIsIdempotent(t *testing.T) {
 	resetShutdownState(t)
 
