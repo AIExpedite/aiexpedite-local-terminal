@@ -25,17 +25,5 @@ var caffeinateCommand = func(agentPID int) *exec.Cmd {
 }
 
 func acquirePlatformKeepAwake() (func(), error) {
-	cmd := caffeinateCommand(os.Getpid())
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
-	return func() {
-		_ = cmd.Process.Kill()
-		<-done
-	}, nil
+	return holdWhileChildRuns(caffeinateCommand(os.Getpid()))
 }

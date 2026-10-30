@@ -35,6 +35,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -186,4 +187,22 @@ func (m *keepAwakeManager) heldCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.held)
+}
+
+// holdWhileChildRuns starts a child process that holds the OS lock for as
+// long as it lives (macOS caffeinate, Linux systemd-inhibit). Releasing kills
+// it and waits until it has been reaped.
+func holdWhileChildRuns(cmd *exec.Cmd) (func(), error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	return func() {
+		_ = cmd.Process.Kill()
+		<-done
+	}, nil
 }
