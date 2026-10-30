@@ -526,6 +526,19 @@ func (l *spawnLedger) AbortSpawn(sessionID string) {
 	l.persistLocked()
 }
 
+// HasLiveSession reports whether this boot's entry for sessionID still
+// describes a running session: present and not released.
+func (l *spawnLedger) HasLiveSession(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.loadLocked()
+	_, e := l.findLocked(sessionID, l.bootID)
+	return e != nil && !e.Released
+}
+
 // TrackProcess records a started process for sessionID (after BeginSpawn)
 // and, on Windows, puts it in its kill-on-close Job Object. suspended says the
 // process was created suspended (beginSessionSpawn): it is then assigned to
@@ -1018,6 +1031,10 @@ func (l *spawnLedger) AckReaped(sessionIDs []string) {
 //	trackSessionProcess(id, cmd)   // IMMEDIATELY after Start succeeded
 //
 // and releaseLedgerSession(id) where the manager removes the session.
+// The same points hold the computer awake while the session runs
+// (keep_awake.go): beginSessionSpawn / openLedgerLogicalSession hold,
+// releaseLedgerSession releases, and an aborted spawn of a session that never
+// started releases too.
 // beginSessionSpawn prepares cmd for ownership (prepareOwnedStart): on Unix
 // its own process group (Setpgid, unless Setsid already makes it a leader);
 // on Windows it is created SUSPENDED, so trackSessionProcess can put it in its
@@ -1029,9 +1046,18 @@ func beginSessionSpawn(sessionID string, cmd *exec.Cmd) {
 		prepareOwnedStart(cmd)
 	}
 	globalSpawnLedger.BeginSpawn(sessionID)
+	keepAwakeHold(sessionID)
 }
 
-func abortSessionSpawn(sessionID string) { globalSpawnLedger.AbortSpawn(sessionID) }
+// abortSessionSpawn undoes a failed start. The keep-awake hold goes only when
+// the session is not running otherwise (a logical session, an earlier
+// process of the same id).
+func abortSessionSpawn(sessionID string) {
+	globalSpawnLedger.AbortSpawn(sessionID)
+	if !globalSpawnLedger.HasLiveSession(sessionID) {
+		keepAwakeRelease(sessionID)
+	}
+}
 
 func trackSessionProcess(sessionID string, cmd *exec.Cmd) {
 	if cmd == nil {
@@ -1046,6 +1072,7 @@ func untrackSessionProcess(sessionID string, pid int) {
 
 func openLedgerLogicalSession(sessionID string) {
 	globalSpawnLedger.OpenLogicalSession(sessionID)
+	keepAwakeHold(sessionID)
 }
 
 // releaseLedgerSession is the one point every manager passes when it removes
@@ -1054,6 +1081,7 @@ func openLedgerLogicalSession(sessionID string) {
 func releaseLedgerSession(sessionID string) {
 	globalSpawnLedger.ReleaseSession(sessionID)
 	releaseRelayTurnInboxSession(sessionID)
+	keepAwakeRelease(sessionID)
 }
 
 // releaseRelayTurnInboxSession is a seam so tests can observe teardown.

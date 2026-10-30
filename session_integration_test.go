@@ -169,6 +169,11 @@ func TestMain(m *testing.M) {
 		t.Stop()
 		return t
 	}
+	// …and every spawned session would hold the developer's computer awake
+	// (keep_awake.go): the suite never takes the real OS lock. The cases that
+	// exercise keep-awake install their own fake (helperFakeKeepAwake).
+	globalKeepAwake.acquire = func() (func(), error) { return func() {}, nil }
+	globalKeepAwake.logf = func(string, ...any) {}
 
 	// Confine every config/data write in this package to a throwaway directory
 	// BEFORE any test runs. Without this, anything that persists through
