@@ -1753,6 +1753,35 @@ func TestAntigravityListLogNames_RepeatedHourSortsByInstant(t *testing.T) {
 	}
 }
 
+// The listing's extra I/O is bounded: only ambiguous names among the newest
+// antigravityStartupScanCap are stat'ed. One past the cap is never stat'ed, so
+// even with an mtime proving the first occurrence it takes its later instant.
+func TestAntigravityListLogNames_RepeatedHourStatsOnlyTheNewestCap(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	start := helperNYRepeated(false, 0, 0)
+	total := antigravityStartupScanCap + 4
+	for i := 0; i < total; i++ {
+		at := start.Add(time.Duration(i) * time.Second)
+		h.write(t, helperLogName(at), "", at, false)
+	}
+	names, ok := antigravityListLogNames(h.base)
+	if !ok || len(names) != total {
+		t.Fatalf("listed %d names ok=%v, want %d", len(names), ok, total)
+	}
+	for i, n := range names {
+		_, latest, _ := antigravityLogNameCandidates(n.name)
+		earliest := latest.Add(-time.Hour)
+		want := earliest // stat'ed: its mtime proves the first occurrence
+		if i >= antigravityStartupScanCap {
+			want = latest
+		}
+		if !n.at.Equal(want) {
+			t.Errorf("names[%d]=%s at %s, want %s", i, n.name, n.at.UTC(), want.UTC())
+		}
+	}
+}
+
 // The reported regression, managed path: a run whose floor is in the second
 // occurrence of the hour has more than the read cap of newer logs behind it.
 // Read an hour early, its log fell into the DST slack, read only after every
