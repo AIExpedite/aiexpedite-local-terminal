@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -114,6 +116,109 @@ func TestWhatsAppIdentityUsesTheHistoryChunksOwnMappings(t *testing.T) {
 	hist, _ = normalizeWhatsAppHistory(chunk, parseLikeWhatsmeow, nc)
 	if len(hist) != 2 || hist[0].ChatJid != otherPN.String() || hist[1].ChatJid != otherPN.String() {
 		t.Fatalf("conversation pn/lid fields ignored: %+v", hist)
+	}
+
+	// The usual shape: a LID-keyed conversation carries only pnJID (its id is
+	// the LID), and a phone-keyed one only lidJID.
+	third := types.NewJID("777666555", types.HiddenUserServer)
+	thirdPN := types.NewJID("15550000007", types.DefaultUserServer)
+	chunk = historyChunk(third, "M7")
+	chunk.Conversations[0].PnJID = proto.String(thirdPN.String())
+	hist, _ = normalizeWhatsAppHistory(chunk, parseLikeWhatsmeow, nc)
+	if len(hist) != 2 || hist[0].ChatJid != thirdPN.String() || hist[1].ChatJid != thirdPN.String() {
+		t.Fatalf("a LID-keyed conversation's pnJID alone was ignored: %+v", hist)
+	}
+	fourthPN := types.NewJID("15550000006", types.DefaultUserServer)
+	fourth := types.NewJID("333222111", types.HiddenUserServer)
+	chunk = historyChunk(fourthPN, "M6")
+	chunk.Conversations[0].LidJID = proto.String(fourth.String())
+	normalizeWhatsAppHistory(chunk, parseLikeWhatsmeow, nc)
+	if got := nc.Identity.Canonical(fourth, types.EmptyJID); got != fourthPN {
+		t.Fatalf("a phone-keyed conversation's lidJID alone was not learned: %s", got)
+	}
+}
+
+// A join known only to temporary sources (a chunk's mappings, whatsmeow's
+// store) is written to the table while it is known, even when the form the
+// event carries is already recorded: a re-link wipes the session store, and
+// a later message addressed by the other form alone must still land in the
+// same chat.
+func TestWhatsAppIdentityPersistsAJoinWhileItIsKnown(t *testing.T) {
+	store := newMemoryWhatsAppIdentityStore()
+	alt := &learningAlternates{}
+	ir := newWhatsAppIdentityResolver(store, alt.lookup, nil)
+	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
+		t.Fatal(got)
+	}
+	alt.learn(waPeer, waPeerLID) // whatsmeow learns the mapping later
+	ir.missedAt = map[types.JID]time.Time{}
+	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
+		t.Fatalf("the recorded identity moved: %s", got)
+	}
+
+	// "Link again": a new session, a new resolver over the SAME table, and a
+	// session store that does not know the mapping (yet).
+	relinked := newWhatsAppIdentityResolver(store, (&learningAlternates{}).lookup, nil)
+	if got := relinked.Canonical(waPeer, types.EmptyJID); got != waPeerLID {
+		t.Fatalf("after a re-link the phone form chose %s, not the recorded %s", got, waPeerLID)
+	}
+}
+
+// A store miss is trusted for a while, so a large history sync does not ask
+// the store again for every message; it is asked again once the TTL passes.
+func TestWhatsAppIdentityStoreMissesAreTrustedBriefly(t *testing.T) {
+	var asked int
+	ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(types.JID) types.JID { asked++; return types.EmptyJID }, nil)
+	now := time.Unix(1_800_000_000, 0)
+	ir.now = func() time.Time { return now }
+	for i := 0; i < 50; i++ {
+		ir.Canonical(waPeerLID, types.EmptyJID)
+	}
+	if asked != 1 {
+		t.Fatalf("store asked %d times within the miss TTL", asked)
+	}
+	now = now.Add(whatsAppAlternateMissTTL + time.Second)
+	ir.Canonical(waPeerLID, types.EmptyJID)
+	if asked != 2 {
+		t.Fatalf("store not asked again after the miss TTL (asked %d)", asked)
+	}
+}
+
+// Close waits for a write in flight and refuses later ones: a re-link opens
+// the same file right after the old session's stores close, and a commit
+// landing on the old handle after the new one read `next` would hand out the
+// same sequences twice.
+func TestWhatsAppOutboxCloseWaitsForTheWriteInFlight(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, _ := openTestOutbox(t, "lnk_close")
+	ob.mu.Lock() // a write in flight holds mu for its whole transaction
+	closed := make(chan struct{})
+	go func() { ob.Close(); close(closed) }()
+	select {
+	case <-closed:
+		ob.mu.Unlock()
+		t.Fatal("Close returned while a write held the outbox")
+	case <-time.After(100 * time.Millisecond):
+	}
+	ob.mu.Unlock()
+	<-closed
+	if err := ob.Append([]whatsAppRecord{textRecord(waPeer.String(), "A", "x")}, false); !errors.Is(err, errWhatsAppOutboxClosed) {
+		t.Fatalf("an append after Close = %v", err)
+	}
+	if err := ob.EnsureNextAbove(10); !errors.Is(err, errWhatsAppOutboxClosed) {
+		t.Fatalf("EnsureNextAbove after Close = %v", err)
+	}
+}
+
+// Every commit is durable before it returns (synchronous FULL): the cloud
+// acts on what the outbox reports, so a power loss must not roll it back.
+func TestWhatsAppOutboxCommitsAreDurable(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, _ := openTestOutbox(t, "lnk_sync")
+	defer ob.Close()
+	var level int
+	if err := ob.db.QueryRow(`PRAGMA synchronous`).Scan(&level); err != nil || level != 2 {
+		t.Fatalf("synchronous = %d (%v), want 2 (FULL)", level, err)
 	}
 }
 

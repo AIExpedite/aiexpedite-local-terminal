@@ -51,6 +51,9 @@ const (
 
 var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
 
+// errWhatsAppOutboxClosed answers a write after Close.
+var errWhatsAppOutboxClosed = errors.New("whatsapp outbox is closed")
+
 // errWhatsAppOutboxChunkTooLarge is the refusal of a history chunk the EMPTY
 // queue cannot take: the chunk alone passes a cap, so no drain will ever
 // admit it whole. It wraps errWhatsAppOutboxFull. Append decides it under
@@ -74,6 +77,8 @@ type whatsAppOutbox struct {
 	// identity JID).
 	idxKey     []byte
 	identities map[string]string
+	// closed: Close ran (under mu, so it waited for any write in flight).
+	closed bool
 }
 
 // whatsAppOutboxBatch is a contiguous range ready to upload.
@@ -90,7 +95,13 @@ type whatsAppOutboxBatch struct {
 // replay watermark does too.
 func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool, err error) {
 	path := filepath.Join(dir, whatsAppOutboxDBName)
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
+	// synchronous(FULL): a commit is on disk before Append, Ack or an
+	// identity write returns. Under NORMAL an OS crash or power loss can roll
+	// back the last commits, and with them `next` and identities the cloud
+	// has already acted on: records re-numbered at or below its replay
+	// watermark are acked without being written, and a person could be
+	// written under a second identity.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)")
 	if err != nil {
 		return nil, false, err
 	}
@@ -166,6 +177,9 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
 	if acked < ob.next {
 		return nil
 	}
@@ -220,6 +234,9 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -279,6 +296,9 @@ func (ob *whatsAppOutbox) NextUpTo(maxRecords int) (*whatsAppOutboxBatch, error)
 	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return nil, errWhatsAppOutboxClosed
+	}
 	rows, err := ob.db.Query(`SELECT seq, nonce, payload FROM outbox ORDER BY seq LIMIT ?`, maxRecords)
 	if err != nil {
 		return nil, err
@@ -313,6 +333,9 @@ func (ob *whatsAppOutbox) NextUpTo(maxRecords int) (*whatsAppOutboxBatch, error)
 func (ob *whatsAppOutbox) Ack(seq int64) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
 	if _, err := ob.db.Exec(`DELETE FROM outbox WHERE seq <= ?`, seq); err != nil {
 		return err
 	}
@@ -338,10 +361,21 @@ func (ob *whatsAppOutbox) HasRoomForHistory() bool {
 	return ob.count < whatsAppOutboxMaxRecords && ob.bytes < whatsAppOutboxMaxBytes
 }
 
+// Close waits for a write in flight (every write holds mu for its whole
+// transaction) and refuses later ones. A re-link opens the same file under a
+// new handle right after the old session's stores close: an Append still
+// committing on the old handle would otherwise land after the new handle read
+// `next`, and the two would hand out the same sequences.
 func (ob *whatsAppOutbox) Close() error {
 	if ob == nil || ob.db == nil {
 		return nil
 	}
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return nil
+	}
+	ob.closed = true
 	return ob.db.Close()
 }
 

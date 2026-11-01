@@ -15,14 +15,18 @@
 //
 // So the FIRST identity written for a person stays theirs. Each resolution:
 //
-//  1. looks up the forms the event itself carries; a recorded identity wins,
-//     and a form not yet recorded is recorded against it;
-//  2. for a form never seen, completes the (PN, LID) pair from the history
-//     chunk's own mappings (Learn), then from whatsmeow's LID store, both
-//     directions, and looks that form up too;
+//  1. completes the (PN, LID) pair from what the event carries, then the
+//     history chunk's own mappings (Learn), then whatsmeow's LID store, both
+//     directions. It does so even when the form the event carries is already
+//     recorded: the chunk's mappings die with this runner and whatsmeow's
+//     store with the session (a re-link wipes session.db), so a join only
+//     they know has to reach the table while it is known, or a later message
+//     addressed by the other form alone would choose a second identity;
+//  2. returns the identity recorded for either form, recording every form it
+//     has against it;
 //  3. only for a person never seen at all, chooses: the phone number when it
 //     is known (an unnamed chat shows the number part of its JID), else the
-//     LID, and records every form it has.
+//     LID.
 //
 // A person first seen ONLY by LID and, separately, ONLY by phone number before
 // anything joined the two still splits: nothing on this computer can know
@@ -45,6 +49,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
 )
@@ -59,6 +64,12 @@ type whatsAppIdentityStore interface {
 	recordIdentities(map[string]string) error
 }
 
+// whatsAppAlternateMissTTL is how long a store lookup that found nothing is
+// trusted. whatsmeow keeps learning mappings (every LID-addressed live
+// message carries one), so a miss only holds for now; the TTL keeps a large
+// history sync from asking the store again for every message.
+var whatsAppAlternateMissTTL = time.Minute
+
 // whatsAppIdentityResolver implements whatsAppIdentity (whatsapp_normalize.go).
 type whatsAppIdentityResolver struct {
 	// mu makes "look up, choose, record" one step: live messages and history
@@ -69,15 +80,22 @@ type whatsAppIdentityResolver struct {
 	// alternate is whatsmeow's LID store: the PN for a LID or the LID for a
 	// PN, the empty JID when unknown. Nil: no store.
 	alternate func(types.JID) types.JID
-	// hints are history-chunk mappings (both directions), consulted before
-	// the store, which may not have them yet.
-	hints map[types.JID]types.JID
+	// known holds every mapping this resolver has seen, both directions:
+	// history-chunk mappings (Learn), pairs an event carried, and store hits.
+	// Consulted before the store, which may not have a chunk's mappings yet.
+	known map[types.JID]types.JID
+	// missedAt is when a store lookup last found nothing.
+	missedAt map[types.JID]time.Time
+	now      func() time.Time
 	// onWriteError is told (without the JIDs) when a choice was not stored.
 	onWriteError func(error)
 }
 
 func newWhatsAppIdentityResolver(store whatsAppIdentityStore, alternate func(types.JID) types.JID, onWriteError func(error)) *whatsAppIdentityResolver {
-	return &whatsAppIdentityResolver{store: store, alternate: alternate, hints: map[types.JID]types.JID{}, onWriteError: onWriteError}
+	return &whatsAppIdentityResolver{
+		store: store, alternate: alternate, onWriteError: onWriteError,
+		known: map[types.JID]types.JID{}, missedAt: map[types.JID]time.Time{}, now: time.Now,
+	}
 }
 
 // whatsAppPersonForm puts a person's address in canonical form: device part
@@ -104,24 +122,42 @@ func (ir *whatsAppIdentityResolver) Learn(pn, lid types.JID) {
 		return
 	}
 	ir.mu.Lock()
-	ir.hints[pn], ir.hints[lid] = lid, pn
+	ir.rememberLocked(pn, lid)
 	ir.mu.Unlock()
 }
 
-// otherForm completes a pair: hints first, then the store. Caller holds mu.
+// rememberLocked keeps a mapping, both directions. Caller holds mu.
+func (ir *whatsAppIdentityResolver) rememberLocked(pn, lid types.JID) {
+	ir.known[pn], ir.known[lid] = lid, pn
+	delete(ir.missedAt, pn)
+	delete(ir.missedAt, lid)
+}
+
+// otherForm completes a pair: known mappings first, then the store (a miss
+// is trusted for whatsAppAlternateMissTTL). Caller holds mu.
 func (ir *whatsAppIdentityResolver) otherForm(j types.JID) types.JID {
 	want := types.HiddenUserServer
 	if j.Server == types.HiddenUserServer {
 		want = types.DefaultUserServer
 	}
-	if o, ok := ir.hints[j]; ok {
+	if o, ok := ir.known[j]; ok {
 		return o
 	}
-	if ir.alternate != nil {
-		if o, ok := whatsAppPersonForm(ir.alternate(j)); ok && o.Server == want {
-			return o
-		}
+	if ir.alternate == nil {
+		return types.EmptyJID
 	}
+	if at, ok := ir.missedAt[j]; ok && ir.now().Sub(at) < whatsAppAlternateMissTTL {
+		return types.EmptyJID
+	}
+	if o, ok := whatsAppPersonForm(ir.alternate(j)); ok && o.Server == want {
+		if want == types.DefaultUserServer {
+			ir.rememberLocked(o, j)
+		} else {
+			ir.rememberLocked(j, o)
+		}
+		return o
+	}
+	ir.missedAt[j] = ir.now()
 	return types.EmptyJID
 }
 
@@ -148,6 +184,14 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 
 	ir.mu.Lock()
 	defer ir.mu.Unlock()
+	switch {
+	case !pn.IsEmpty() && !lid.IsEmpty():
+		ir.rememberLocked(pn, lid) // the event's own pair is authoritative
+	case pn.IsEmpty():
+		pn = ir.otherForm(lid)
+	default:
+		lid = ir.otherForm(pn)
+	}
 	lookup := func(j types.JID) (string, bool) {
 		if j.IsEmpty() {
 			return "", false
@@ -156,18 +200,6 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 	}
 	pnID, pnOK := lookup(pn)
 	lidID, lidOK := lookup(lid)
-	// Only a form never recorded sends us to the hints and the store: a
-	// recorded one already answers, and its other form is recorded when an
-	// event that carries it (or a lookup from it) arrives.
-	if !pnOK && !lidOK {
-		if pn.IsEmpty() {
-			pn = ir.otherForm(lid)
-			pnID, pnOK = lookup(pn)
-		} else if lid.IsEmpty() {
-			lid = ir.otherForm(pn)
-			lidID, lidOK = lookup(lid)
-		}
-	}
 	var id string
 	switch {
 	case pnOK:
@@ -259,6 +291,9 @@ func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
 	defer ob.mu.Unlock()
 	for jid, id := range entries {
 		ob.identities[hex.EncodeToString(ob.identityIndex(jid))] = id
+	}
+	if ob.closed {
+		return errWhatsAppOutboxClosed
 	}
 	tx, err := ob.db.Begin()
 	if err != nil {

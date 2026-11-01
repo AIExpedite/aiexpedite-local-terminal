@@ -406,9 +406,7 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 		}
 	}
 	for _, conv := range data.GetConversations() {
-		pn, errPN := types.ParseJID(conv.GetPnJID())
-		lid, errLID := types.ParseJID(conv.GetLidJID())
-		if conv.GetPnJID() != "" && conv.GetLidJID() != "" && errPN == nil && errLID == nil {
+		if pn, lid := whatsAppConversationPair(conv); !pn.IsEmpty() && !lid.IsEmpty() {
 			nc.learn(pn, lid)
 		}
 	}
@@ -461,6 +459,36 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 		}
 	}
 	return records, skipped
+}
+
+// whatsAppConversationPair is the (phone number, LID) pair a history
+// conversation names, empty where it names none. The conversation's own id
+// is one of the two forms, and usually only the OTHER form's field is set
+// (a LID-keyed chat carries pnJID, a phone-keyed one lidJID), so the id
+// stands in for whichever field is empty.
+func whatsAppConversationPair(conv *waHistorySync.Conversation) (pn, lid types.JID) {
+	parse := func(s string) types.JID {
+		if s == "" {
+			return types.EmptyJID
+		}
+		j, err := types.ParseJID(s)
+		if err != nil {
+			return types.EmptyJID
+		}
+		return j.ToNonAD()
+	}
+	pn, lid = parse(conv.GetPnJID()), parse(conv.GetLidJID())
+	switch id := parse(conv.GetID()); id.Server {
+	case types.HiddenUserServer:
+		if lid.IsEmpty() {
+			lid = id
+		}
+	case types.DefaultUserServer, types.LegacyUserServer:
+		if pn.IsEmpty() {
+			pn = id
+		}
+	}
+	return pn, lid
 }
 
 // whatsAppConversationRecord announces a chat seen live for the first time,

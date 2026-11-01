@@ -116,6 +116,8 @@ var (
 	// resume (a locked credential store, a held file).
 	whatsAppResumeRetryMin = 30 * time.Second
 	whatsAppResumeRetryMax = 10 * time.Minute
+	// How often the cloud is asked about dormant links (dormantRecheckLoop).
+	whatsAppDormantRecheck = time.Hour
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -201,6 +203,7 @@ func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool)
 		logWhatsApp("-", "links.json unreadable: "+err.Error())
 	}
 	local, hadPending := s.retryPendingWipes(local)
+	go s.dormantRecheckLoop() // skips its ticks while paused
 	if paused {
 		s.mu.Lock()
 		s.paused, s.pausedLinks = true, local
@@ -375,6 +378,40 @@ func (s *whatsAppSupervisor) persist() {
 	if err := saveWhatsAppLocalLinks(out); err != nil {
 		logWhatsApp("-", "links.json not saved: "+err.Error())
 	}
+}
+
+// dormantRecheckLoop asks the cloud about dormant links every
+// whatsAppDormantRecheck while this computer holds one. A dormant link sends
+// nothing, so it never draws the 409 that kicks a reconcile: without this,
+// whatever the cloud does to it - an erase, the access sweep disconnecting a
+// removed member's link, a re-link that moved to another computer - would
+// reach this computer only at the next agent start, and the link's outbox,
+// identity table and key would stay on disk until then. One signed GET per
+// tick, and none at all while no link is dormant.
+func (s *whatsAppSupervisor) dormantRecheckLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(whatsAppDormantRecheck):
+		}
+		if s.isPaused() || !s.holdsDormantLink() {
+			continue
+		}
+		s.reconcileOnce()
+	}
+}
+
+// holdsDormantLink reports whether any link here is dormant.
+func (s *whatsAppSupervisor) holdsDormantLink() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.links {
+		if r.isDormant() {
+			return true
+		}
+	}
+	return false
 }
 
 // reconcileLoop asks the cloud which link this computer should hold and

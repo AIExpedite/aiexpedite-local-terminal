@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -237,5 +238,60 @@ func TestWhatsAppSupervisorLinkStartForAnotherLinkWipesADormantOne(t *testing.T)
 	}
 	if h.sup.runner("lnk_1") != nil || h.sup.runner("lnk_2") == nil {
 		t.Fatal("wrong links held")
+	}
+}
+
+// fastDormantRecheck shortens the dormant re-check for one test. The restore
+// is registered BEFORE the harness, so it runs after the harness has shut the
+// supervisor (and its loop) down: cleanups run last-in, first-out.
+func fastDormantRecheck(t *testing.T) {
+	prev := whatsAppDormantRecheck
+	whatsAppDormantRecheck = 20 * time.Millisecond
+	t.Cleanup(func() { whatsAppDormantRecheck = prev })
+}
+
+// A dormant link sends nothing, so the cloud ending it (an erase, the access
+// sweep for a removed member) reaches this computer through the periodic
+// re-check, not only at the next agent start.
+func TestWhatsAppSupervisorDormantRecheckWipesALinkTheCloudEnded(t *testing.T) {
+	fastDormantRecheck(t)
+	h, c := pairedHarness(t)
+	c.emit(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	waitFor(t, "dormant", func() bool { return dormantRunner(h) })
+	h.transport.mu.Lock()
+	h.transport.bound = nil // erased: the binding is gone
+	h.transport.mu.Unlock()
+	dir, _ := whatsAppLinkDir("lnk_1")
+	waitFor(t, "wiped by the re-check", func() bool {
+		_, err := os.Stat(dir)
+		return os.IsNotExist(err) && h.sup.runner("lnk_1") == nil
+	})
+	if _, err := h.ks.Get("lnk_1"); err == nil {
+		t.Fatal("the outbox key outlived the link")
+	}
+}
+
+// Still bound here (a re-link not yet started, an expired link nobody acted
+// on): the re-check keeps it, and asks again later.
+func TestWhatsAppSupervisorDormantRecheckKeepsALinkStillBoundHere(t *testing.T) {
+	fastDormantRecheck(t)
+	h, c := pairedHarness(t)
+	c.emit(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	waitFor(t, "dormant", func() bool { return dormantRunner(h) })
+	h.transport.mu.Lock()
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 2, State: waStateAuthExpired}}
+	before := h.transport.boundCalls
+	h.transport.mu.Unlock()
+	waitFor(t, "two more re-checks", func() bool {
+		h.transport.mu.Lock()
+		defer h.transport.mu.Unlock()
+		return h.transport.boundCalls >= before+2
+	})
+	if !dormantRunner(h) {
+		t.Fatal("a link still bound here was not kept")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	if _, err := os.Stat(filepath.Join(dir, whatsAppOutboxDBName)); err != nil {
+		t.Fatalf("the kept link lost its outbox: %v", err)
 	}
 }
