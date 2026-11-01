@@ -1220,8 +1220,6 @@ type whatsAppLinkRunner struct {
 	// identity is the link's identity resolver over the outbox's table
 	// (whatsapp_identity.go); nil while the stores are closed.
 	identity *whatsAppIdentityResolver
-	// identityWriteLogged: a failed identity-table write is logged once.
-	identityWriteLogged bool
 	// dormant: the session ended and the stores are closed; the link's
 	// outbox, identity table and key wait for a re-link (top of this file).
 	dormant         bool
@@ -1311,15 +1309,7 @@ func (r *whatsAppLinkRunner) open(fresh bool) error {
 		ob.Close()
 		return errors.New("stale session found in a fresh link directory")
 	}
-	identity := newWhatsAppIdentityResolver(ob, client.AlternateJID, func(error) {
-		r.mu.Lock()
-		first := !r.identityWriteLogged
-		r.identityWriteLogged = true
-		r.mu.Unlock()
-		if first {
-			r.log("identity table not written; this session keeps its choices in memory")
-		}
-	})
+	identity := newWhatsAppIdentityResolver(ob, client.AlternateJID)
 	client.AddEventHandler(r.handleEvent)
 	r.mu.Lock()
 	r.client, r.outbox, r.identity = client, ob, identity

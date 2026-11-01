@@ -63,7 +63,7 @@ func parseLikeWhatsmeow(chat types.JID, w *waWeb.WebMessageInfo) (*events.Messag
 // two documents.
 func TestWhatsAppIdentityHistoryBeforeTheMappingDoesNotSplitTheChat(t *testing.T) {
 	alt := &learningAlternates{}
-	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), alt.lookup, nil)}
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), alt.lookup)}
 
 	hist, _ := normalizeWhatsAppHistory(historyChunk(waPeerLID, "M1"), parseLikeWhatsmeow, nc)
 	if len(hist) != 2 {
@@ -99,7 +99,7 @@ func TestWhatsAppIdentityHistoryBeforeTheMappingDoesNotSplitTheChat(t *testing.T
 // messages already resolve to the phone number — the same identity the live
 // copies carry.
 func TestWhatsAppIdentityUsesTheHistoryChunksOwnMappings(t *testing.T) {
-	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), nil, nil)}
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), nil)}
 	chunk := historyChunk(waPeerLID, "M1")
 	chunk.PhoneNumberToLidMappings = []*waHistorySync.PhoneNumberToLIDMapping{{PnJID: proto.String(waPeer.String()), LidJID: proto.String(waPeerLID.String())}}
 	hist, _ := normalizeWhatsAppHistory(chunk, parseLikeWhatsmeow, nc)
@@ -146,7 +146,7 @@ func TestWhatsAppIdentityUsesTheHistoryChunksOwnMappings(t *testing.T) {
 func TestWhatsAppIdentityPersistsAJoinWhileItIsKnown(t *testing.T) {
 	store := newMemoryWhatsAppIdentityStore()
 	alt := &learningAlternates{}
-	ir := newWhatsAppIdentityResolver(store, alt.lookup, nil)
+	ir := newWhatsAppIdentityResolver(store, alt.lookup)
 	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
 		t.Fatal(got)
 	}
@@ -158,7 +158,7 @@ func TestWhatsAppIdentityPersistsAJoinWhileItIsKnown(t *testing.T) {
 
 	// "Link again": a new session, a new resolver over the SAME table, and a
 	// session store that does not know the mapping (yet).
-	relinked := newWhatsAppIdentityResolver(store, (&learningAlternates{}).lookup, nil)
+	relinked := newWhatsAppIdentityResolver(store, (&learningAlternates{}).lookup)
 	if got := relinked.Canonical(waPeer, types.EmptyJID); got != waPeerLID {
 		t.Fatalf("after a re-link the phone form chose %s, not the recorded %s", got, waPeerLID)
 	}
@@ -168,7 +168,7 @@ func TestWhatsAppIdentityPersistsAJoinWhileItIsKnown(t *testing.T) {
 // the store again for every message; it is asked again once the TTL passes.
 func TestWhatsAppIdentityStoreMissesAreTrustedBriefly(t *testing.T) {
 	var asked int
-	ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(types.JID) types.JID { asked++; return types.EmptyJID }, nil)
+	ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(types.JID) types.JID { asked++; return types.EmptyJID })
 	now := time.Unix(1_800_000_000, 0)
 	ir.now = func() time.Time { return now }
 	for i := 0; i < 50; i++ {
@@ -226,7 +226,7 @@ func TestWhatsAppOutboxCommitsAreDurable(t *testing.T) {
 // phone-only person are one, the phone-number side wins from then on.
 func TestWhatsAppIdentityStickyAndJoinedForms(t *testing.T) {
 	store := newMemoryWhatsAppIdentityStore()
-	ir := newWhatsAppIdentityResolver(store, nil, nil)
+	ir := newWhatsAppIdentityResolver(store, nil)
 	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
 		t.Fatalf("an unknown LID is its own identity, got %s", got)
 	}
@@ -266,7 +266,7 @@ func TestWhatsAppIdentityConcurrentFirstSightingsAgree(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		alt := &learningAlternates{}
 		alt.learn(waPeer, waPeerLID)
-		ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), alt.lookup, nil)
+		ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), alt.lookup)
 		var wg sync.WaitGroup
 		got := make([]types.JID, 2)
 		wg.Add(2)
@@ -284,7 +284,7 @@ func TestWhatsAppIdentityConcurrentFirstSightingsAgree(t *testing.T) {
 func TestWhatsAppIdentityTableIsSealedAndSurvivesReopen(t *testing.T) {
 	ks, _ := withWhatsAppTestEnv(t)
 	ob, dir := openTestOutbox(t, "lnk_id")
-	ir := newWhatsAppIdentityResolver(ob, nil, nil)
+	ir := newWhatsAppIdentityResolver(ob, nil)
 	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
 		t.Fatal(got)
 	}
@@ -306,7 +306,7 @@ func TestWhatsAppIdentityTableIsSealedAndSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ir = newWhatsAppIdentityResolver(ob, nil, nil)
+	ir = newWhatsAppIdentityResolver(ob, nil)
 	if got := ir.Canonical(waPeer, types.EmptyJID); got != waPeerLID {
 		t.Fatalf("after reopen the phone form resolves to %s, want %s", got, waPeerLID)
 	}
@@ -336,7 +336,7 @@ func TestWhatsAppIdentityTableIsSealedAndSurvivesReopen(t *testing.T) {
 	if err := ob.Append([]whatsAppRecord{textRecord(waPeer.String(), "A", "x")}, false); err != nil {
 		t.Fatal(err)
 	}
-	ob.recordIdentities(map[string]string{waPeer.String(): waPeer.String()})
+	ob.stageIdentities(map[string]string{waPeer.String(): waPeer.String()})
 	next := ob.next
 	ob.Close()
 	_ = ks.Delete("lnk_id")
@@ -391,7 +391,7 @@ func TestWhatsAppIdentityFailedWritesAreRetried(t *testing.T) {
 	if _, err := ob.db.Exec(`ALTER TABLE identity RENAME TO identity_away`); err != nil {
 		t.Fatal(err)
 	}
-	ir := newWhatsAppIdentityResolver(ob, nil, nil)
+	ir := newWhatsAppIdentityResolver(ob, nil)
 	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
 		t.Fatal(got)
 	}
@@ -419,7 +419,7 @@ func TestWhatsAppIdentityFailedWritesAreRetried(t *testing.T) {
 	defer ob.Close()
 	alt := &learningAlternates{}
 	alt.learn(waPeer, waPeerLID)
-	if got := newWhatsAppIdentityResolver(ob, alt.lookup, nil).Canonical(waPeer, types.EmptyJID); got != waPeerLID {
+	if got := newWhatsAppIdentityResolver(ob, alt.lookup).Canonical(waPeer, types.EmptyJID); got != waPeerLID {
 		t.Fatalf("after a reopen the phone form chose %s, not the recorded %s", got, waPeerLID)
 	}
 }
@@ -433,7 +433,7 @@ func TestWhatsAppIdentityRefusalNeverCostsTheRecords(t *testing.T) {
 	if _, err := ob.db.Exec(`ALTER TABLE identity RENAME TO identity_away`); err != nil {
 		t.Fatal(err)
 	}
-	newWhatsAppIdentityResolver(ob, nil, nil).Canonical(waPeerLID, types.EmptyJID)
+	newWhatsAppIdentityResolver(ob, nil).Canonical(waPeerLID, types.EmptyJID)
 	if err := ob.Append([]whatsAppRecord{textRecord(waPeerLID.String(), "A", "x")}, false); err != nil {
 		t.Fatalf("an identity refusal cost the record: %v", err)
 	}

@@ -40,6 +40,12 @@
 // conversations and a re-link's history sync must land in the same ones. Rows
 // are indexed by an HMAC of the JID and sealed under the outbox key, so the
 // file holds no phone number in the clear. Nothing here is ever logged.
+//
+// Choices are STAGED, never written on their own: the in-memory cache answers
+// at once, and the staged entries commit inside the transaction of the next
+// Append - the one that writes the records using them - so a record is never
+// durable without the identity it was written under, and a large history sync
+// costs no fsync per new contact. Close flushes what is still staged.
 package main
 
 import (
@@ -58,10 +64,9 @@ import (
 // or a map in tests. Keys and values are JID strings (non-AD).
 type whatsAppIdentityStore interface {
 	lookupIdentity(jid string) (string, bool)
-	// recordIdentities records jid → identity for each entry. The entries
-	// must stay readable through lookupIdentity even when the write fails,
-	// so this session keeps writing what it already chose.
-	recordIdentities(map[string]string) error
+	// stageIdentities records jid → identity for each entry: readable through
+	// lookupIdentity at once, durable with the next records appended.
+	stageIdentities(map[string]string)
 }
 
 // whatsAppAlternateMissTTL is how long a store lookup that found nothing is
@@ -87,13 +92,11 @@ type whatsAppIdentityResolver struct {
 	// missedAt is when a store lookup last found nothing.
 	missedAt map[types.JID]time.Time
 	now      func() time.Time
-	// onWriteError is told (without the JIDs) when a choice was not stored.
-	onWriteError func(error)
 }
 
-func newWhatsAppIdentityResolver(store whatsAppIdentityStore, alternate func(types.JID) types.JID, onWriteError func(error)) *whatsAppIdentityResolver {
+func newWhatsAppIdentityResolver(store whatsAppIdentityStore, alternate func(types.JID) types.JID) *whatsAppIdentityResolver {
 	return &whatsAppIdentityResolver{
-		store: store, alternate: alternate, onWriteError: onWriteError,
+		store: store, alternate: alternate,
 		known: map[types.JID]types.JID{}, missedAt: map[types.JID]time.Time{}, now: time.Now,
 	}
 }
@@ -114,7 +117,14 @@ func whatsAppPersonForm(j types.JID) (types.JID, bool) {
 	return j, false
 }
 
-// Learn records that pn and lid are one person, for this resolver's lifetime.
+// Learn records that pn and lid are one person. The pair is remembered for
+// the resolver's lifetime, and when either form already has an identity the
+// other form is recorded against it NOW (the join rule applies when both do):
+// the chunk that carried the pair may hold nothing else about the person, and
+// a re-link before they appear again would wipe whatsmeow's store and this
+// memory, leaving a later message addressed by the other form to choose anew.
+// A pair for a person never written needs nothing recorded: whatever their
+// first record chooses is their first identity.
 func (ir *whatsAppIdentityResolver) Learn(pn, lid types.JID) {
 	pn, okPN := whatsAppPersonForm(pn)
 	lid, okLID := whatsAppPersonForm(lid)
@@ -122,8 +132,16 @@ func (ir *whatsAppIdentityResolver) Learn(pn, lid types.JID) {
 		return
 	}
 	ir.mu.Lock()
+	defer ir.mu.Unlock()
 	ir.rememberLocked(pn, lid)
-	ir.mu.Unlock()
+	pnID, pnOK := ir.store.lookupIdentity(pn.String())
+	lidID, lidOK := ir.store.lookupIdentity(lid.String())
+	switch {
+	case pnOK && (!lidOK || lidID != pnID):
+		ir.store.stageIdentities(map[string]string{lid.String(): pnID})
+	case lidOK && !pnOK:
+		ir.store.stageIdentities(map[string]string{pn.String(): lidID})
+	}
 }
 
 // rememberLocked keeps a mapping, both directions. Caller holds mu.
@@ -219,9 +237,7 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 		updates[lid.String()] = id
 	}
 	if len(updates) > 0 {
-		if err := ir.store.recordIdentities(updates); err != nil && ir.onWriteError != nil {
-			ir.onWriteError(err)
-		}
+		ir.store.stageIdentities(updates)
 	}
 	out, err := types.ParseJID(id)
 	if err != nil {
@@ -286,13 +302,10 @@ func (ob *whatsAppOutbox) lookupIdentity(jid string) (string, bool) {
 	return id, ok
 }
 
-// recordIdentities records jid → identity. The cache answers at once, so this
-// session keeps writing what it chose even while the disk refuses; an entry
-// whose write failed stays PENDING and is retried by the next identity write,
-// and written inside the next Append's transaction at the latest, so no record
-// is ever committed under an identity the table does not hold (a restart or a
-// re-link would otherwise re-choose it).
-func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
+// stageIdentities records jid → identity in the cache at once and stages the
+// write: the next Append commits it with its records (whatsapp_outbox.go), and
+// Close flushes what is left.
+func (ob *whatsAppOutbox) stageIdentities(entries map[string]string) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	if ob.pendingIdentities == nil {
@@ -303,22 +316,6 @@ func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
 		ob.identities[k] = id
 		ob.pendingIdentities[k] = id
 	}
-	if ob.closed {
-		return errWhatsAppOutboxClosed
-	}
-	tx, err := ob.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := ob.writePendingIdentitiesLocked(tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	clear(ob.pendingIdentities)
-	return nil
 }
 
 // writePendingIdentitiesLocked seals every pending identity into tx. The
@@ -366,11 +363,10 @@ func (s *memoryWhatsAppIdentityStore) lookupIdentity(jid string) (string, bool) 
 	return id, ok
 }
 
-func (s *memoryWhatsAppIdentityStore) recordIdentities(entries map[string]string) error {
+func (s *memoryWhatsAppIdentityStore) stageIdentities(entries map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, v := range entries {
 		s.m[k] = v
 	}
-	return nil
 }

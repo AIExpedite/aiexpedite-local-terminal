@@ -154,7 +154,7 @@ func TestNormalizeCanonicalIdentity(t *testing.T) {
 // testWhatsAppIdentity is a resolver over a memory table, with alternates as
 // whatsmeow's LID store (both directions are listed explicitly).
 func testWhatsAppIdentity(alternates map[types.JID]types.JID) *whatsAppIdentityResolver {
-	return newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(j types.JID) types.JID { return alternates[j] }, nil)
+	return newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(j types.JID) types.JID { return alternates[j] })
 }
 
 // Operation targets and history conversation ids carry no alternate address:

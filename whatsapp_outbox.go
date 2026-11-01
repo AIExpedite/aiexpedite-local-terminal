@@ -77,8 +77,8 @@ type whatsAppOutbox struct {
 	// identity JID).
 	idxKey     []byte
 	identities map[string]string
-	// pendingIdentities are identities whose table write has not committed
-	// yet (index hex → identity); see recordIdentities.
+	// pendingIdentities are staged identities not yet committed (index hex →
+	// identity); see stageIdentities.
 	pendingIdentities map[string]string
 	// closed: Close ran (under mu, so it waited for any write in flight).
 	closed bool
@@ -276,9 +276,9 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		strconv.FormatInt(seq, 10)); err != nil {
 		return err
 	}
-	// Identities whose own write failed commit with the first records that
-	// may use them (recordIdentities). Inside a savepoint: if the identity
-	// table still refuses, only that part rolls back and stays pending - the
+	// Staged identities commit with the records that use them
+	// (stageIdentities). Inside a savepoint: if the identity table refuses,
+	// only that part rolls back and stays staged for the next Append - the
 	// records themselves must never be lost to it.
 	wroteIdentities := false
 	if len(ob.pendingIdentities) > 0 {
@@ -400,6 +400,17 @@ func (ob *whatsAppOutbox) Close() error {
 		return nil
 	}
 	ob.closed = true
+	// Best effort: identities staged since the last Append (a history chunk's
+	// learned aliases, say) must not die with this handle.
+	if len(ob.pendingIdentities) > 0 {
+		if tx, err := ob.db.Begin(); err == nil {
+			if ob.writePendingIdentitiesLocked(tx) == nil && tx.Commit() == nil {
+				clear(ob.pendingIdentities)
+			} else {
+				_ = tx.Rollback()
+			}
+		}
+	}
 	return ob.db.Close()
 }
 
