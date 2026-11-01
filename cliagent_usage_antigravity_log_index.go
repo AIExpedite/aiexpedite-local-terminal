@@ -329,14 +329,14 @@ func antigravityGoroutineID() int64 {
 /* ─────────────────────────── log reading ─────────────────────────── */
 
 // antigravityLogName is one listed run-log name. at is the instant its stamp
-// records (resolved by mtime inside a repeated hour) and latest the later of
-// the instants its stamp can mean. latest never decreases in name order, so
-// no name listed after another resolves later than that one's latest. Both
-// are zero for an unstamped (legacy) name.
+// records (resolved by mtime inside a repeated hour); earliest and latest are
+// the earlier and later instants its stamp can mean. latest never decreases in
+// name order, so no name listed after another resolves later than that one's
+// latest. All three are zero for an unstamped (legacy) name.
 type antigravityLogName struct {
-	name       string
-	at, latest time.Time
-	stamped    bool
+	name                 string
+	at, earliest, latest time.Time
+	stamped              bool
 }
 
 // antigravityLogNameCandidates is the earliest and latest instant a run-log
@@ -434,8 +434,9 @@ func antigravityListLogNames(base string) ([]antigravityLogName, bool) {
 			continue
 		}
 		n := antigravityLogName{name: entry.Name()}
+		n.earliest, n.latest, n.stamped = antigravityLogNameCandidates(n.name)
 		// at holds the earliest candidate until it is resolved below.
-		n.at, n.latest, n.stamped = antigravityLogNameCandidates(n.name)
+		n.at = n.earliest
 		names = append(names, n)
 	}
 	// Second-stamped names sort chronologically but for a repeated hour; newest
@@ -565,7 +566,8 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	// Read once per run, so the legacy mtimes are stat'ed fresh: a run that
 	// appended to an older legacy log inside the memo's TTL is still found.
 	legacy := antigravityLegacyLogsSince(dir, legacyNames, since, true)
-	var afterFloor, slack []string
+	var afterFloor []antigravityLogName
+	var slack []string
 	for _, n := range stampedNames {
 		// No name listed after this one resolves later than its latest, so
 		// latest may end the walk. The resolved instant may not: past the
@@ -573,18 +575,31 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 		if n.latest.Before(since) {
 			break
 		}
+		// An mtime proves only the earlier start (a log is not written before
+		// it exists); a late mtime cannot rule that start out, since a run may
+		// keep writing past the fall-back. So a repeated-hour name ranks at the
+		// earliest start it may have had that is not before the floor: a
+		// first-occurrence run written into the second occurrence still leads
+		// the logs started after it.
+		at := n.at
+		if n.earliest.Before(at) && !n.earliest.Before(floorSecond) {
+			at = n.earliest
+		}
 		switch {
-		case n.at.Before(since):
-		case n.at.Before(floorSecond):
+		case at.Before(since):
+		case at.Before(floorSecond):
 			slack = append(slack, n.name)
 		default:
-			afterFloor = append(afterFloor, n.name)
+			afterFloor = append(afterFloor, antigravityLogName{name: n.name, at: at})
 		}
 	}
-	for i, j := 0, len(afterFloor)-1; i < j; i, j = i+1, j-1 {
-		afterFloor[i], afterFloor[j] = afterFloor[j], afterFloor[i]
+	slices.Reverse(afterFloor)
+	sort.SliceStable(afterFloor, func(i, j int) bool { return afterFloor[i].at.Before(afterFloor[j].at) })
+	stamped := make([]string, 0, len(afterFloor)+len(slack))
+	for _, n := range afterFloor {
+		stamped = append(stamped, n.name)
 	}
-	stamped := append(afterFloor, slack...)
+	stamped = append(stamped, slack...)
 	if limit := antigravityWatchedNewest - min(len(legacy), antigravityLegacyReadReserve); len(stamped) > limit {
 		stamped = stamped[:limit]
 	}

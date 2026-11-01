@@ -1826,6 +1826,26 @@ func TestAntigravityPIDBlock_RepeatedHourWalkDoesNotStopEarly(t *testing.T) {
 	}
 }
 
+// A run started at 01:05 EDT that kept writing until 01:10 EST has an mtime
+// that cannot prove which occurrence it started in, so its name resolves an
+// hour late. Its block is still read ahead of a full read cap of logs started
+// after it in the first occurrence.
+func TestAntigravityPIDBlock_RepeatedHourRunWrittenPastTheFallBack(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	floor := helperNYRepeated(false, 5, 0)
+	h.write(t, helperLogName(floor), helperPIDBlock(54001)+"authenticated successfully as ada@example.com\n",
+		helperNYRepeated(true, 10, 0), false)
+	for i := 1; i <= antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(54100+i), at, false)
+	}
+	block, ok := antigravityPIDBlock(h.base, 54001, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the run's own block ahead of the logs started after it", block, ok)
+	}
+}
+
 // Direct-run path: an own child with PID P exits at 01:20 EST; a user's agy
 // reuses P at 01:25 EST and is gone before the pass, so only time can tell the
 // two apart. Read an hour early, the log looked older than our child's exit
