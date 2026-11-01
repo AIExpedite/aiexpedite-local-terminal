@@ -108,7 +108,12 @@ func helperPinLogZone(t *testing.T, name string) *time.Location {
 	}
 	prev := antigravityLogLocation
 	antigravityLogLocation = zone
-	t.Cleanup(func() { antigravityLogLocation = prev })
+	t.Cleanup(func() {
+		// Cleanups run last-registered first: let in-flight refresh work end
+		// before the zone it may read is swapped back.
+		antigravityUsageRefreshWaitIdle()
+		antigravityLogLocation = prev
+	})
 	return zone
 }
 
