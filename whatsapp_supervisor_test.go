@@ -1264,8 +1264,16 @@ func TestWhatsAppSupervisorAuthExpiredFlushTimeoutRetainsOutbox(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); !os.IsNotExist(err) {
 		t.Fatal("the drained session was not wiped")
 	}
-	if len(h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch && p["generation"].(float64) == 2 })) == 0 {
-		t.Fatal("the queued row never uploaded")
+	// Dormant only once EMPTY: a drain that stopped early would leave the row
+	// queued here. (A refused post is recorded too, so "a batch was posted"
+	// proves nothing.)
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	if ob.Depth() != 0 {
+		t.Fatalf("the link went dormant with %d rows still queued", ob.Depth())
 	}
 }
 
@@ -1831,7 +1839,12 @@ func TestWhatsAppSupervisorShutdownHonoursTheCallerDeadline(t *testing.T) {
 	c.mu.Lock()
 	c.session = true
 	c.mu.Unlock()
-	c.emit(&events.Connected{}) // syncingHistory; the heartbeat loop completes it after the quiet
+	// On its own goroutine: the heartbeat loop can complete history between
+	// the Connected handler's setState and its reportState, and that report
+	// then blocks on the supervisor context like the heartbeat's own - which
+	// only the ShutdownAll below cancels. Emitted inline, the test goroutine
+	// would sit in that report and never reach it.
+	go c.emit(&events.Connected{}) // syncingHistory; the heartbeat loop completes it after the quiet
 	select {
 	case <-tr.blocked:
 	case <-time.After(5 * time.Second):

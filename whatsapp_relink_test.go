@@ -147,6 +147,8 @@ func TestWhatsAppSupervisorFencedDrainHandsTheQueueToTheRelink(t *testing.T) {
 // acks them as replays without writing them.
 func TestWhatsAppSupervisorLinkStartStartsAboveTheCloudWatermark(t *testing.T) {
 	h := newSupervisorHarness(t)
+	// Bound here, so the startup reconcile cannot wipe the link mid-test.
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 4, State: waStatePairing}}
 	h.sup.start(h.transport)
 	_, pub := newBrowserKey(t)
 	h.sup.linkStart(whatsAppLinkStartParams{LinkID: "lnk_1", Generation: 4, WorkspaceID: "ws", Method: waPairQR, BrowserPub: pub, LastAckedSeq: 700})
@@ -241,9 +243,9 @@ func TestWhatsAppSupervisorLinkStartForAnotherLinkWipesADormantOne(t *testing.T)
 	}
 }
 
-// fastDormantRecheck shortens the dormant re-check for one test. The restore
-// is registered BEFORE the harness, so it runs after the harness has shut the
-// supervisor (and its loop) down: cleanups run last-in, first-out.
+// fastDormantRecheck shortens the dormant re-check for one test. The
+// supervisor reads it once at start, on the test goroutine, so the restore
+// never races the loop.
 func fastDormantRecheck(t *testing.T) {
 	prev := whatsAppDormantRecheck
 	whatsAppDormantRecheck = 20 * time.Millisecond
@@ -293,5 +295,40 @@ func TestWhatsAppSupervisorDormantRecheckKeepsALinkStillBoundHere(t *testing.T) 
 	dir, _ := whatsAppLinkDir("lnk_1")
 	if _, err := os.Stat(filepath.Join(dir, whatsAppOutboxDBName)); err != nil {
 		t.Fatalf("the kept link lost its outbox: %v", err)
+	}
+}
+
+// 3. A reconcile that finds a LIVE runner superseded by a newer generation of
+// the same link (a re-pair the link start has not reached yet) ends the
+// session and keeps the outbox for that link start.
+func TestWhatsAppSupervisorReconcileRetiresALiveSupersededRunner(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] == waSyncKindBatch {
+			return whatsAppSyncResult{Status: 503} // keep the row queued
+		}
+		return whatsAppSyncResult{Status: 200}
+	}
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 3, State: waStatePairing}}
+	h.transport.mu.Unlock()
+	queueOne(t, h, c, "S1")
+	if !h.sup.reconcileOnce() {
+		t.Fatal("reconcile did not settle")
+	}
+	if !dormantRunner(h) {
+		t.Fatal("a superseded live runner was not retired")
+	}
+	if _, logouts := c.count(); logouts != 1 {
+		t.Fatal("the superseded session was not logged out")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	if ob.Depth() == 0 {
+		t.Fatal("the superseded generation's queued row was dropped")
 	}
 }

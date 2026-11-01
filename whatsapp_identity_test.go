@@ -262,20 +262,51 @@ func TestWhatsAppIdentityStickyAndJoinedForms(t *testing.T) {
 }
 
 // Concurrent first sightings (live and history goroutines) choose once.
-func TestWhatsAppIdentityConcurrentFirstSightingsAgree(t *testing.T) {
-	for i := 0; i < 50; i++ {
-		alt := &learningAlternates{}
-		alt.learn(waPeer, waPeerLID)
-		ir := newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), alt.lookup)
-		var wg sync.WaitGroup
-		got := make([]types.JID, 2)
-		wg.Add(2)
-		go func() { defer wg.Done(); got[0] = ir.Canonical(waPeerLID, types.EmptyJID) }()
-		go func() { defer wg.Done(); got[1] = ir.Canonical(waPeer, types.EmptyJID) }()
-		wg.Wait()
-		if got[0] != got[1] {
-			t.Fatalf("one person, two identities: %s / %s", got[0], got[1])
+// slowChoiceStore holds back the LID-only call's choice (it records the LID
+// as its own identity) until the other call has finished, or 150 ms pass:
+// the window between a call's lookup and its record, where an unserialized
+// resolver lets the other call choose too.
+type slowChoiceStore struct {
+	*memoryWhatsAppIdentityStore
+	otherDone chan struct{}
+}
+
+func (s *slowChoiceStore) stageIdentities(entries map[string]string) {
+	if entries[waPeerLID.String()] == waPeerLID.String() {
+		select {
+		case <-s.otherDone:
+		case <-time.After(150 * time.Millisecond):
 		}
+	}
+	s.memoryWhatsAppIdentityStore.stageIdentities(entries)
+}
+
+// Concurrent first sightings (the live and history goroutines) choose ONE
+// identity: "look up, choose, record" is one step. A LID-only event that
+// cannot complete its pair chooses the LID; an event carrying both forms
+// would choose the phone number if it could look up while the first call's
+// choice was still unrecorded - and the person would have two identities.
+func TestWhatsAppIdentityConcurrentFirstSightingsAgree(t *testing.T) {
+	store := &slowChoiceStore{memoryWhatsAppIdentityStore: newMemoryWhatsAppIdentityStore(), otherDone: make(chan struct{})}
+	ir := newWhatsAppIdentityResolver(store, nil)
+	var wg sync.WaitGroup
+	got := make([]types.JID, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); got[0] = ir.Canonical(waPeerLID, types.EmptyJID) }()
+	time.Sleep(20 * time.Millisecond) // the LID call is between its lookup and its record
+	go func() {
+		defer wg.Done()
+		got[1] = ir.Canonical(waPeerLID, waPeer) // a live event carrying both forms
+		close(store.otherDone)
+	}()
+	wg.Wait()
+	if got[0] != got[1] {
+		t.Fatalf("one person, two identities: %s / %s", got[0], got[1])
+	}
+	pnID, _ := store.lookupIdentity(waPeer.String())
+	lidID, _ := store.lookupIdentity(waPeerLID.String())
+	if pnID != lidID {
+		t.Fatalf("the table split the person: pn->%s lid->%s", pnID, lidID)
 	}
 }
 
@@ -362,6 +393,15 @@ func TestWhatsAppOutboxEnsureNextAbove(t *testing.T) {
 	if err := ob.EnsureNextAbove(500); err != nil {
 		t.Fatal(err)
 	}
+	// Persisted by EnsureNextAbove itself, before anything is appended.
+	ob.Close()
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_seq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ob.next != 501 {
+		t.Fatalf("EnsureNextAbove did not persist the raised sequence: %d", ob.next)
+	}
 	recs := []whatsAppRecord{textRecord(waPeer.String(), "A", "x")}
 	if err := ob.Append(recs, false); err != nil || recs[0].DeviceSeq != 501 {
 		t.Fatalf("seq = %d, %v", recs[0].DeviceSeq, err)
@@ -370,7 +410,7 @@ func TestWhatsAppOutboxEnsureNextAbove(t *testing.T) {
 		t.Fatalf("a lower watermark moved the sequence to %d (%v)", ob.next, err)
 	}
 	ob.Close()
-	ob, _, err := openWhatsAppOutbox(dir, "lnk_seq")
+	ob, _, err = openWhatsAppOutbox(dir, "lnk_seq")
 	if err != nil {
 		t.Fatal(err)
 	}

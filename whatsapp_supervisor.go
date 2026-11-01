@@ -203,7 +203,9 @@ func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool)
 		logWhatsApp("-", "links.json unreadable: "+err.Error())
 	}
 	local, hadPending := s.retryPendingWipes(local)
-	go s.dormantRecheckLoop() // skips its ticks while paused
+	// The interval is read here, on the starting goroutine: the loop never
+	// reads the package var (tests change it), so nothing races its restore.
+	go s.dormantRecheckLoop(whatsAppDormantRecheck) // skips its ticks while paused
 	if paused {
 		s.mu.Lock()
 		s.paused, s.pausedLinks = true, local
@@ -388,12 +390,12 @@ func (s *whatsAppSupervisor) persist() {
 // reach this computer only at the next agent start, and the link's outbox,
 // identity table and key would stay on disk until then. One signed GET per
 // tick, and none at all while no link is dormant.
-func (s *whatsAppSupervisor) dormantRecheckLoop() {
+func (s *whatsAppSupervisor) dormantRecheckLoop(every time.Duration) {
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-time.After(whatsAppDormantRecheck):
+		case <-time.After(every):
 		}
 		if s.isPaused() || !s.holdsDormantLink() {
 			continue
