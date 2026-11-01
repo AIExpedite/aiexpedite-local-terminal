@@ -11,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	// The repeated-hour cases load named zones; embedding tzdata keeps them
+	// running on a Windows runner with no zoneinfo (test binary only).
+	_ "time/tzdata"
 )
 
 // The log index: which `agy` logs are runs that owe a utilization reading.
@@ -93,7 +96,25 @@ func (h *helperLogIndex) setLive(pid int, live bool) {
 
 // logName is the second-stamped name a run started at `at` gets.
 func helperLogName(at time.Time) string {
-	return "cli-" + at.In(time.Local).Format("20060102_150405") + ".log"
+	return "cli-" + at.In(antigravityLogZone()).Format("20060102_150405") + ".log"
+}
+
+// helperPinLogZone stamps and parses log names in the named zone for the test.
+func helperPinLogZone(t *testing.T, name string) *time.Location {
+	t.Helper()
+	zone, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatalf("load %s: %v", name, err)
+	}
+	prev := antigravityLogLocation
+	antigravityLogLocation = zone
+	t.Cleanup(func() {
+		// Cleanups run last-registered first: let in-flight refresh work end
+		// before the zone it may read is swapped back.
+		antigravityUsageRefreshWaitIdle()
+		antigravityLogLocation = prev
+	})
+	return zone
 }
 
 // helperPIDBlock is one run's block as agy writes it.
@@ -986,8 +1007,13 @@ func TestAntigravityLogNames_StampedLeadLegacy(t *testing.T) {
 	current := h.write(t, helperLogName(now), helperPIDBlock(50011), now, false)
 
 	names, ok := antigravityListLogNames(h.base)
-	if !ok || len(names) == 0 || names[0] != filepath.Base(current) {
+	if !ok || len(names) == 0 || names[0].name != filepath.Base(current) || !names[0].stamped {
 		t.Fatalf("names[0]=%v, want the stamped run %q first", names, filepath.Base(current))
+	}
+	for _, n := range names[1:] {
+		if n.stamped {
+			t.Errorf("%q is listed as stamped, want only the cli- run stamped", n.name)
+		}
 	}
 	found := false
 	for _, file := range antigravityRunLogs(h.base) {
@@ -1592,5 +1618,350 @@ func TestAntigravityExitWatch_StartsAndStopsWithTheTick(t *testing.T) {
 	stopAntigravityDiscovery()
 	if antigravityExitWatchActive.Load() {
 		t.Error("the watch outlived the tick")
+	}
+}
+
+/* ─────────────────────────── repeated hour (DST fall-back) ─────────────────────────── */
+
+// helperNYRepeated is 01:mm:ss on 2025-11-02 in New York, in the first (EDT)
+// or the second (EST) occurrence of the repeated hour.
+func helperNYRepeated(second bool, minute, sec int) time.Time {
+	hour := 5
+	if second {
+		hour = 6
+	}
+	return time.Date(2025, 11, 2, hour, minute, sec, 0, time.UTC)
+}
+
+// A repeated-hour name resolves to the occurrence its mtime proves, whichever
+// offset Go picks for the wall clock in that zone; with no mtime it takes the
+// later one, and an mtime a second early (within the skew) still proves the
+// later one.
+func TestAntigravityLogNameTime_RepeatedHourResolvesByMtime(t *testing.T) {
+	cases := []struct {
+		zone          string
+		first, second time.Time
+	}{
+		{"America/New_York", helperNYRepeated(false, 30, 0), helperNYRepeated(true, 30, 0)},
+		{"Europe/Berlin", time.Date(2025, 10, 26, 0, 30, 0, 0, time.UTC), time.Date(2025, 10, 26, 1, 30, 0, 0, time.UTC)},
+		{"Australia/Sydney", time.Date(2025, 4, 5, 15, 30, 0, 0, time.UTC), time.Date(2025, 4, 5, 16, 30, 0, 0, time.UTC)},
+		// A 30-minute shift.
+		{"Australia/Lord_Howe", time.Date(2025, 4, 5, 14, 45, 0, 0, time.UTC), time.Date(2025, 4, 5, 15, 15, 0, 0, time.UTC)},
+	}
+	for _, c := range cases {
+		t.Run(c.zone, func(t *testing.T) {
+			helperPinLogZone(t, c.zone)
+			name := helperLogName(c.first)
+			if name != helperLogName(c.second) {
+				t.Fatalf("fixture: %q and %q are not one wall clock", name, helperLogName(c.second))
+			}
+			for _, tc := range []struct {
+				what  string
+				mtime time.Time
+				want  time.Time
+			}{
+				{"mtime in the first occurrence", c.first.Add(10 * time.Second), c.first},
+				{"mtime in the second occurrence", c.second.Add(10 * time.Second), c.second},
+				{"no mtime", time.Time{}, c.second},
+				{"mtime a second before the name", c.second.Add(-time.Second), c.second},
+			} {
+				if at, stamped := antigravityLogNameTime(name, tc.mtime); !stamped || !at.Equal(tc.want) {
+					t.Errorf("%s: at=%s stamped=%v, want %s", tc.what, at.UTC(), stamped, tc.want)
+				}
+			}
+		})
+	}
+
+	t.Run("unambiguous", func(t *testing.T) {
+		helperPinLogZone(t, "America/New_York")
+		at := time.Date(2025, 11, 2, 8, 30, 0, 0, time.UTC) // 03:30 EST
+		for _, mtime := range []time.Time{{}, at.Add(time.Hour), at.Add(-time.Hour)} {
+			if got, _ := antigravityLogNameTime(helperLogName(at), mtime); !got.Equal(at) {
+				t.Errorf("mtime=%s: at=%s, want the single instant %s", mtime, got.UTC(), at)
+			}
+		}
+		helperPinLogZone(t, "UTC")
+		if got, _ := antigravityLogNameTime(helperLogName(at), time.Time{}); !got.Equal(at) {
+			t.Errorf("UTC: at=%s, want %s", got.UTC(), at)
+		}
+	})
+}
+
+// The candidates are an hour apart in a zone where Go reads the ambiguous wall
+// clock as the earlier instant (New York) and one where it reads the later one
+// (Berlin): the bug's two directions.
+func TestAntigravityLogNameCandidates_IndependentOfGoOffsetChoice(t *testing.T) {
+	for _, c := range []struct {
+		zone          string
+		wall          [3]int // day, hour, minute in October/November 2025
+		month         time.Month
+		first, second time.Time
+	}{
+		{"America/New_York", [3]int{2, 1, 30}, time.November, helperNYRepeated(false, 30, 0), helperNYRepeated(true, 30, 0)},
+		{"Europe/Berlin", [3]int{26, 2, 30}, time.October, time.Date(2025, 10, 26, 0, 30, 0, 0, time.UTC), time.Date(2025, 10, 26, 1, 30, 0, 0, time.UTC)},
+	} {
+		t.Run(c.zone, func(t *testing.T) {
+			zone := helperPinLogZone(t, c.zone)
+			goPick := time.Date(2025, c.month, c.wall[0], c.wall[1], c.wall[2], 0, 0, zone)
+			earliest, latest, stamped := antigravityLogNameCandidates(helperLogName(c.first))
+			if !stamped || !earliest.Equal(c.first) || !latest.Equal(c.second) || latest.Sub(earliest) != time.Hour {
+				t.Errorf("earliest=%s latest=%s stamped=%v, want %s and %s (Go picks %s)",
+					earliest.UTC(), latest.UTC(), stamped, c.first, c.second, goPick.UTC())
+			}
+		})
+	}
+}
+
+// An ambiguous name whose mtime is earlier than both candidates (beyond the
+// skew: a clock set back) resolves to the earlier one, never to a zero time.
+func TestAntigravityLogNameTime_ClockSkewBeforeEarliest(t *testing.T) {
+	helperPinLogZone(t, "America/New_York")
+	first := helperNYRepeated(false, 30, 0)
+	at, stamped := antigravityLogNameTime(helperLogName(first), first.Add(-time.Hour))
+	if !stamped || at.IsZero() || !at.Equal(first) {
+		t.Errorf("at=%s stamped=%v, want the earliest candidate %s", at.UTC(), stamped, first)
+	}
+}
+
+// Inside a repeated hour name order is not chronological: a second-occurrence
+// 01:05 sorts below a first-occurrence 01:50. The listing ranks by instant,
+// and no name resolves later than the latest of any name listed before it —
+// what lets a newest-first walk stop on latest.
+func TestAntigravityListLogNames_RepeatedHourSortsByInstant(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	runs := []time.Time{
+		time.Date(2025, 11, 2, 4, 30, 0, 0, time.UTC), // 00:30 EDT
+		helperNYRepeated(false, 40, 0),
+		helperNYRepeated(false, 50, 0),
+		helperNYRepeated(true, 5, 0),
+		time.Date(2025, 11, 2, 7, 10, 0, 0, time.UTC), // 02:10 EST
+	}
+	for _, at := range runs {
+		h.write(t, helperLogName(at), "I0929 starting\n", at.Add(5*time.Second), false)
+	}
+	names, ok := antigravityListLogNames(h.base)
+	if !ok || len(names) != len(runs) {
+		t.Fatalf("names=%v ok=%v, want %d", names, ok, len(runs))
+	}
+	for i, n := range names {
+		want := runs[len(runs)-1-i]
+		if n.name != helperLogName(want) || !n.at.Equal(want) {
+			t.Errorf("names[%d]=%s at %s, want %s at %s", i, n.name, n.at.UTC(), helperLogName(want), want)
+		}
+		for _, prev := range names[:i] {
+			if n.at.After(prev.latest) {
+				t.Errorf("%s resolves to %s, after the latest %s of %s listed before it",
+					n.name, n.at.UTC(), prev.latest.UTC(), prev.name)
+			}
+		}
+	}
+}
+
+// The listing's extra I/O is bounded: only ambiguous names among the newest
+// antigravityStartupScanCap are stat'ed. One past the cap is never stat'ed, so
+// even with an mtime proving the first occurrence it takes its later instant.
+func TestAntigravityListLogNames_RepeatedHourStatsOnlyTheNewestCap(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	start := helperNYRepeated(false, 0, 0)
+	total := antigravityStartupScanCap + 4
+	for i := 0; i < total; i++ {
+		at := start.Add(time.Duration(i) * time.Second)
+		h.write(t, helperLogName(at), "", at, false)
+	}
+	names, ok := antigravityListLogNames(h.base)
+	if !ok || len(names) != total {
+		t.Fatalf("listed %d names ok=%v, want %d", len(names), ok, total)
+	}
+	for i, n := range names {
+		_, latest, _ := antigravityLogNameCandidates(n.name)
+		earliest := latest.Add(-time.Hour)
+		want := earliest // stat'ed: its mtime proves the first occurrence
+		if i >= antigravityStartupScanCap {
+			want = latest
+		}
+		if !n.at.Equal(want) {
+			t.Errorf("names[%d]=%s at %s, want %s", i, n.name, n.at.UTC(), want.UTC())
+		}
+	}
+}
+
+// The reported regression, managed path: a run whose floor is in the second
+// occurrence of the hour has more than the read cap of newer logs behind it.
+// Read an hour early, its log fell into the DST slack, read only after every
+// name at or after the floor, and its block was never reached.
+func TestAntigravityPIDBlock_RepeatedHourRunBehindTheReadCap(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	floor := helperNYRepeated(true, 5, 0)
+	h.write(t, helperLogName(floor), helperPIDBlock(51001)+"authenticated successfully as ada@example.com\n",
+		floor.Add(30*time.Second), false)
+	for i := 1; i <= antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(51100+i), at, false)
+	}
+	block, ok := antigravityPIDBlock(h.base, 51001, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the run's own block behind the newer logs", block, ok)
+	}
+}
+
+// A floor in the first occurrence: a second-occurrence log named lexically
+// below a full read cap of first-occurrence names is still read first.
+func TestAntigravityPIDBlock_RepeatedHourWalkDoesNotStopEarly(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	floor := helperNYRepeated(false, 50, 0)
+	for i := 0; i < antigravityWatchedNewest+8; i++ {
+		at := helperNYRepeated(false, 10+i, 0)
+		h.write(t, helperLogName(at), helperPIDBlock(52100+i), at, false)
+	}
+	run := helperNYRepeated(true, 5, 0)
+	h.write(t, helperLogName(run), helperPIDBlock(52001)+"authenticated successfully as ada@example.com\n",
+		run.Add(30*time.Second), false)
+	block, ok := antigravityPIDBlock(h.base, 52001, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the second-occurrence run's block", block, ok)
+	}
+}
+
+// A run started at 01:05 EDT that kept writing until 01:10 EST has an mtime
+// that cannot prove which occurrence it started in, so its name resolves an
+// hour late. Its block is still read ahead of a full read cap of logs started
+// after it in the first occurrence.
+func TestAntigravityPIDBlock_RepeatedHourRunWrittenPastTheFallBack(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	floor := helperNYRepeated(false, 5, 0)
+	h.write(t, helperLogName(floor), helperPIDBlock(54001)+"authenticated successfully as ada@example.com\n",
+		helperNYRepeated(true, 10, 0), false)
+	for i := 1; i <= antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(54100+i), at, false)
+	}
+	block, ok := antigravityPIDBlock(h.base, 54001, floor)
+	if !ok || !strings.Contains(string(block), "ada@example.com") {
+		t.Errorf("block=%q ok=%v, want the run's own block ahead of the logs started after it", block, ok)
+	}
+}
+
+// Direct-run path: an own child with PID P exits at 01:20 EST; a user's agy
+// reuses P at 01:25 EST and is gone before the pass, so only time can tell the
+// two apart. Read an hour early, the log looked older than our child's exit
+// and the user's run was swallowed as ours.
+func TestAntigravityCandidate_RepeatedHourReusedPIDIsADirectRun(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	const pid = 7601
+	lockAntigravityLogIndex()
+	antigravityLogIndex.ownPIDs = antigravityPushPID(antigravityLogIndex.ownPIDs, antigravityTrackedPID{
+		pid: pid, token: fmt.Sprintf("tok-%d", pid), exitedAt: helperNYRepeated(true, 20, 0),
+	})
+	unlockAntigravityLogIndex()
+
+	ran := helperNYRepeated(true, 25, 0)
+	reused := h.write(t, helperLogName(ran), helperPIDBlock(pid), ran.Add(5*time.Second), false)
+	h.pass(ran.Add(time.Minute), 0)
+	if class, _ := helperEntryClass(reused); class != antigravityLogCandidate {
+		t.Fatalf("class=%v, want the reused PID's log to be a direct-run candidate", class)
+	}
+	if res := h.pass(ran.Add(5*time.Minute), 0); res.owed.IsZero() {
+		t.Error("the user's run on a reused PID was never owed after it exited")
+	}
+}
+
+// An owned burst named in the second occurrence stays in the collision grace
+// for antigravityCollisionGrace after its real name-second, so a same-second
+// direct run appended to an evicted file is still found.
+func TestAntigravityDiscovery_RepeatedHourGraceNotExpiredEarly(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	start := helperNYRepeated(true, 10, 0)
+	var paths []string
+	for i := 0; i < antigravityOwnedCap+8; i++ {
+		at := start.Add(time.Duration(i) * time.Second)
+		child := beginAntigravityOwnChild(h.home)
+		child.setPID(53000 + i)
+		paths = append(paths, h.write(t, helperLogName(at), helperPIDBlock(53000+i), at, false))
+		child.done()
+	}
+	now := start.Add(time.Duration(antigravityOwnedCap+9) * time.Second)
+	h.pass(now, 0)
+	if owned, _, _, grace, _, _ := helperIndexCounts(); owned != antigravityOwnedCap || grace != 8 {
+		t.Fatalf("owned=%d grace=%d, want %d owned and 8 still in grace", owned, grace, antigravityOwnedCap)
+	}
+
+	oldest := paths[0]
+	h.setLive(53999, true)
+	h.write(t, filepath.Base(oldest), helperPIDBlock(53999), start.Add(time.Second), true)
+	h.pass(now.Add(10*time.Second), 0)
+	if class, _ := helperEntryClass(oldest); class != antigravityLogCandidate {
+		t.Fatalf("class=%v, want the evicted file reclassified inside its grace", class)
+	}
+	h.setLive(53999, false)
+	h.pass(now.Add(20*time.Second), 0)
+	if res := h.pass(now.Add(20*time.Second+antigravityCandidateSettle), 0); res.owed.IsZero() {
+		t.Error("the collided direct run was never owed")
+	}
+}
+
+// Post-update survival: the cached reading was taken at 01:30 EDT and the
+// agent restarts. A direct run named 01:10 EST (second occurrence, written to
+// 01:12 EST) ended while it was down; the first pass classifies it and owes it.
+func TestAntigravityStartupScan_RepeatedHourPostUpdate(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	observed := helperNYRepeated(false, 30, 0)
+	ran := helperNYRepeated(true, 10, 0)
+	path := h.write(t, helperLogName(ran), helperPIDBlock(54001), helperNYRepeated(true, 12, 0), false)
+	resetAntigravityLogIndex() // the restart
+
+	now := helperNYRepeated(true, 20, 0)
+	res := h.pass(now, observed.UnixMilli())
+	lockAntigravityLogIndex()
+	entry := antigravityLogIndex.entries[path]
+	var nameAt time.Time
+	if entry != nil {
+		nameAt = entry.nameAt
+	}
+	unlockAntigravityLogIndex()
+	if !nameAt.Equal(ran) {
+		t.Errorf("nameAt=%s, want the second occurrence %s", nameAt.UTC(), ran)
+	}
+	if !res.owed.Equal(now) {
+		t.Errorf("owed=%s, want the run owed at its exit seen (%s)", res.owed.UTC(), now)
+	}
+}
+
+// Bounded refresh propagation: two direct runs, one in each occurrence of the
+// hour, have exited. One pass and a watch pass publish exactly one owed floor,
+// max(log mtime, exit seen) of the newer run; a reading at that floor pays it,
+// and each run's block is still within the read cap.
+func TestAntigravityDiscovery_RepeatedHourOwedOncePerRun(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	observed := time.Date(2025, 11, 2, 5, 0, 0, 0, time.UTC)
+	firstRun, secondRun := helperNYRepeated(false, 40, 0), helperNYRepeated(true, 10, 0)
+	h.write(t, helperLogName(firstRun), helperPIDBlock(55001), firstRun.Add(time.Minute), false)
+	h.write(t, helperLogName(secondRun), helperPIDBlock(55002), secondRun.Add(2*time.Minute), false)
+
+	now := helperNYRepeated(true, 20, 0)
+	res := h.pass(now, observed.UnixMilli())
+	if !res.owed.Equal(now) {
+		t.Fatalf("owed=%s, want one floor at the newer run's exit seen (%s)", res.owed.UTC(), now)
+	}
+	watch, newlyOwed := antigravityExitWatchPass(now.Add(5*time.Second), observed.UnixMilli())
+	antigravityApplyDiscovery(watch, now.Add(5*time.Second))
+	if newlyOwed || !watch.owed.Equal(now) {
+		t.Errorf("watch owed=%s newly=%v, want the same single floor", watch.owed.UTC(), newlyOwed)
+	}
+	if res := h.pass(now.Add(10*time.Second), now.UnixMilli()); !res.owed.IsZero() {
+		t.Errorf("owed=%s after a reading at the floor, want nothing", res.owed.UTC())
+	}
+	for pid, floor := range map[int]time.Time{55001: firstRun, 55002: secondRun} {
+		if _, ok := antigravityPIDBlock(h.base, pid, floor); !ok {
+			t.Errorf("pid %d's block was not found from its floor", pid)
+		}
 	}
 }

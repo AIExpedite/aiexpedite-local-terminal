@@ -259,22 +259,24 @@ func antigravityRunLogs(base string) []antigravityRunLog {
 		return nil
 	}
 	dir := antigravityLogDir(base)
-	stampedEnd := len(names)
-	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
-		stampedEnd--
-	}
-	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], time.Time{}, false)
+	stamped, legacyNames := antigravitySplitLegacyNames(names)
+	legacy := antigravityLegacyLogsSince(dir, legacyNames, time.Time{}, false)
 	if len(legacy) > antigravityLegacyReadReserve {
 		legacy = legacy[len(legacy)-antigravityLegacyReadReserve:]
 	}
-	stamped := names[:stampedEnd]
+	// The listing ranks stamped names by instant, so the newest run survives
+	// the cut even inside a repeated hour.
 	if limit := antigravityWatchedNewest - len(legacy); len(stamped) > limit {
 		stamped = stamped[:limit]
 	}
-	names = append(append([]string(nil), stamped...), legacy...)
-	paths := make([]string, 0, len(names)+antigravityCandidateCap)
+	paths := make([]string, 0, len(stamped)+len(legacy)+antigravityCandidateCap)
 	seen := map[string]bool{}
-	for _, name := range names {
+	for _, n := range stamped {
+		path := filepath.Join(dir, n.name)
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	for _, name := range legacy {
 		path := filepath.Join(dir, name)
 		seen[path] = true
 		paths = append(paths, path)

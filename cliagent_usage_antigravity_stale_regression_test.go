@@ -532,6 +532,46 @@ func TestAntigravityEvidence_OnlyTheRunsOwnBlockCounts(t *testing.T) {
 	}
 }
 
+// A managed run whose floor is in the second occurrence of a repeated hour has
+// more than the read cap of newer logs behind it. Its own block is still read:
+// the run's account comes back and its exhaustion is recorded, and nothing the
+// read prints carries the log path, the PID, the account or the reset.
+func TestAntigravityEvidence_ManagedRunInRepeatedHourBehindManyLogs(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	const pid = 57001
+	floor := helperNYRepeated(true, 5, 0)
+	path := h.write(t, helperLogName(floor),
+		helperPIDBlock(pid)+"authenticated successfully as ada@example.com\n"+
+			"RESOURCE_EXHAUSTED (code 429): exhausted. Resets in 1h39m21s.\n",
+		floor.Add(30*time.Second), false)
+	for i := 1; i <= antigravityWatchedNewest+8; i++ {
+		at := floor.Add(time.Duration(i) * time.Minute)
+		h.write(t, helperLogName(at), helperPIDBlock(57100+i), at, false)
+	}
+
+	now := floor.Add(time.Duration(antigravityWatchedNewest+9) * time.Minute)
+	fp := fingerprintAccount("antigravity", "ada@example.com")
+	var got string
+	logged := captureStdout(t, func() { got = recordAntigravityRunEvidence(floor, pid, now) })
+	if got != fp {
+		t.Fatalf("fingerprint=%q, want ada's", got)
+	}
+	events := antigravityExhaustionEvidence(now, fp)
+	if len(events) != 1 {
+		t.Fatalf("evidence=%v, want the run's exhaustion recorded", events)
+	}
+	reset := now.Add(time.Hour + 39*time.Minute + 21*time.Second)
+	for _, secret := range []string{
+		path, filepath.Base(path), fmt.Sprint(pid), "ada@example.com", "1h39m21s",
+		fmt.Sprint(reset.UnixMilli()), reset.Format(time.RFC3339),
+	} {
+		if strings.Contains(logged, secret) || strings.Contains(got, secret) {
+			t.Errorf("the evidence read leaked %q: logged=%q fingerprint=%q", secret, logged, got)
+		}
+	}
+}
+
 // MaintenanceSmokeSurvivesUpdate: the Antigravity maintenance smoke arrives
 // as a Windows encoded-PowerShell execute. The agent is told to shut down the
 // moment the command returns; its payment is stuck, so the bounded drain gives

@@ -1245,3 +1245,26 @@ func TestFetchAntigravityQuotaOnPort_EvidenceNeedsTheServersIdentity(t *testing.
 		t.Errorf("evidence consulted without an identity: %v", askedFor)
 	}
 }
+
+// A run in the second occurrence of a repeated hour (01:05 EST) names its log
+// below a full newest-N window of first-occurrence names (01:28–01:59 EDT).
+// The run that is really the newest — still being written — must survive the
+// cut, or port discovery never sees it.
+func TestAntigravityRunLogs_RepeatedHourNewestRunSurvivesTheCut(t *testing.T) {
+	h := helperIsolateLogIndex(t)
+	helperPinLogZone(t, "America/New_York")
+	for i := 0; i < antigravityWatchedNewest; i++ {
+		at := helperNYRepeated(false, 28+i, 0)
+		h.write(t, helperLogName(at), helperPIDBlock(56100+i), at.Add(30*time.Second), false)
+	}
+	run := helperNYRepeated(true, 5, 0)
+	live := h.write(t, helperLogName(run), helperPIDBlock(56001), run.Add(5*time.Minute), false)
+
+	files := antigravityRunLogs(h.base)
+	if len(files) > antigravityWatchedNewest {
+		t.Errorf("listed %d logs, want at most %d", len(files), antigravityWatchedNewest)
+	}
+	if len(files) == 0 || files[0].path != live {
+		t.Errorf("files=%v, want the second-occurrence run listed first", files)
+	}
+}

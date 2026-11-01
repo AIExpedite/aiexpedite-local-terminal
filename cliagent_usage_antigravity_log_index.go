@@ -4,7 +4,14 @@
 // Every `agy` process writes a second-stamped log under
 // ~/.gemini/antigravity-cli/log (cli-YYYYMMDD_HHMMSS.log, local time; two runs
 // started in the same second share one file, each block opening with
-// "Starting language server process with pid N"). The gather used to treat the
+// "Starting language server process with pid N"). When the clocks fall back,
+// one wall-clock hour happens twice, so a name stamped in it can mean two
+// instants an hour apart; the listing resolves it by the file's mtime (a log
+// is created in its name-second and only written after it) and, without that
+// evidence, picks the later instant. Late is the safe direction for every
+// consumer below: at worst one refresh nobody owed, never a dropped run.
+//
+// The gather used to treat the
 // newest of those logs as a finished run. That made three mistakes:
 //
 //   - The agent's OWN children (`agy models` for model discovery, the Refresh
@@ -30,7 +37,8 @@
 //     never candidates: their own paths settle them.
 //
 // Nothing here is persisted and nothing is logged beyond integer counters: no
-// path, file name, PID, account or log text.
+// path, file name, PID, account or log text. Resolving a repeated-hour name
+// logs nothing either.
 //
 // Lock order: the index lock is a leaf with respect to the freshness and
 // live-runs locks — nothing holds it while taking either. Floors are armed and
@@ -86,6 +94,10 @@ const (
 	// and antigravityStartupDSTSlack widens its window: names are local time.
 	antigravityStartupScanCap  = 256
 	antigravityStartupDSTSlack = time.Hour
+	// antigravityNameMtimeSkew is how far a log's mtime may sit before its
+	// name-second (filesystem timestamp granularity, clock jitter) and still
+	// prove the later of a repeated-hour name's two instants.
+	antigravityNameMtimeSkew = 2 * time.Second
 	// antigravityCandidateSettle is how long an exited candidate whose exit is
 	// not proven (antigravityExitProvenLocked), a noPID log, or a process-only
 	// PID with no start token must stay quiet before its run is owed.
@@ -131,7 +143,18 @@ var (
 	// the CLI's image names; ok=false means the list could not be read (never
 	// "none running").
 	antigravityProcessScan = ScanAntigravityProcessesChecked
+	// antigravityLogLocation is the zone log names and glog lines are stamped
+	// in; nil means time.Local. A test seam.
+	antigravityLogLocation *time.Location
 )
+
+// antigravityLogZone is the zone `agy` stamps its log names and lines in.
+func antigravityLogZone() *time.Location {
+	if antigravityLogLocation != nil {
+		return antigravityLogLocation
+	}
+	return time.Local
+}
 
 // antigravityLogNamePattern is the second-stamped run-log name.
 var antigravityLogNamePattern = regexp.MustCompile(`^cli-(\d{8})_(\d{6})`)
@@ -305,18 +328,83 @@ func antigravityGoroutineID() int64 {
 
 /* ─────────────────────────── log reading ─────────────────────────── */
 
-// antigravityLogNameTime is the second a run-log name records, in local time.
-// Names without the stamp (a legacy spelling) fall back to the file's mtime.
-func antigravityLogNameTime(name string, mtime time.Time) (time.Time, bool) {
+// antigravityLogName is one listed run-log name. at is the instant its stamp
+// records (resolved by mtime inside a repeated hour); earliest and latest are
+// the earlier and later instants its stamp can mean. latest never decreases in
+// name order, so no name listed after another resolves later than that one's
+// latest. All three are zero for an unstamped (legacy) name.
+type antigravityLogName struct {
+	name                 string
+	at, earliest, latest time.Time
+	stamped              bool
+}
+
+// antigravityLogNameCandidates is the earliest and latest instant a run-log
+// name's wall clock can mean in antigravityLogZone: equal unless the clocks
+// fell back over it. A candidate counts when it reads back as the same wall
+// clock, so the answer does not depend on which offset Go picks for an
+// ambiguous time (that varies by zone). A wall clock that never existed (a
+// spring-forward gap, which a correctly clocked agy cannot write) keeps Go's
+// normalisation.
+func antigravityLogNameCandidates(name string) (earliest, latest time.Time, stamped bool) {
 	m := antigravityLogNamePattern.FindStringSubmatch(name)
 	if m == nil {
-		return mtime.Truncate(time.Second), false
+		return time.Time{}, time.Time{}, false
 	}
-	at, err := time.ParseInLocation("20060102150405", m[1]+m[2], time.Local)
+	stamp := m[1] + m[2]
+	wall, err := time.Parse("20060102150405", stamp)
 	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	zone := antigravityLogZone()
+	t := time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), wall.Second(), 0, zone)
+	earliest, latest = t, t
+	_, before := t.Add(-12 * time.Hour).Zone()
+	_, after := t.Add(12 * time.Hour).Zone()
+	d := time.Duration(before-after) * time.Second
+	if d < 0 {
+		d = -d
+	}
+	if d == 0 {
+		return earliest, latest, true
+	}
+	for _, c := range []time.Time{t.Add(-d), t.Add(d)} {
+		if c.In(zone).Format("20060102150405") != stamp {
+			continue
+		}
+		if c.Before(earliest) {
+			earliest = c
+		}
+		if c.After(latest) {
+			latest = c
+		}
+	}
+	return earliest, latest, true
+}
+
+// antigravityResolveLogNameTime picks a name's instant from its candidates: the
+// later one unless the log's mtime (plus antigravityNameMtimeSkew) is before
+// it, and the later one when there is no mtime. A log is created in its
+// name-second and only written after it.
+func antigravityResolveLogNameTime(earliest, latest, mtime time.Time) time.Time {
+	switch {
+	case !latest.After(earliest):
+		return earliest
+	case mtime.IsZero(), !latest.After(mtime.Add(antigravityNameMtimeSkew)):
+		return latest
+	}
+	return earliest
+}
+
+// antigravityLogNameTime is the instant a run-log name records, in
+// antigravityLogZone, with mtime breaking a repeated-hour tie. Names without
+// the stamp (a legacy spelling) fall back to the file's mtime.
+func antigravityLogNameTime(name string, mtime time.Time) (time.Time, bool) {
+	earliest, latest, stamped := antigravityLogNameCandidates(name)
+	if !stamped {
 		return mtime.Truncate(time.Second), false
 	}
-	return at, true
+	return antigravityResolveLogNameTime(earliest, latest, mtime), true
 }
 
 // antigravityIndexableLog reports whether a directory entry is a run log the
@@ -326,8 +414,12 @@ func antigravityIndexableLog(name string) bool {
 	return strings.HasSuffix(name, ".log") && !strings.EqualFold(name, "cli.log")
 }
 
-// antigravityListLogNames lists base's run-log names (names only; no stat).
-func antigravityListLogNames(base string) ([]string, bool) {
+// antigravityListLogNames lists base's run-log names: stamped names newest
+// instant first, then the unstamped (legacy) ones. Names only, except that the
+// ambiguous (repeated-hour) names among the newest antigravityStartupScanCap
+// are stat'ed to resolve them by mtime; one past that cap, or whose stat
+// fails, takes its later instant.
+func antigravityListLogNames(base string) ([]antigravityLogName, bool) {
 	dir := antigravityLogDir(base)
 	if dir == "" {
 		return nil, false
@@ -336,23 +428,59 @@ func antigravityListLogNames(base string) ([]string, bool) {
 	if err != nil {
 		return nil, false
 	}
-	names := make([]string, 0, len(entries))
+	names := make([]antigravityLogName, 0, len(entries))
 	for _, entry := range entries {
-		if !entry.IsDir() && antigravityIndexableLog(entry.Name()) {
-			names = append(names, entry.Name())
+		if entry.IsDir() || !antigravityIndexableLog(entry.Name()) {
+			continue
 		}
+		n := antigravityLogName{name: entry.Name()}
+		n.earliest, n.latest, n.stamped = antigravityLogNameCandidates(n.name)
+		// at holds the earliest candidate until it is resolved below.
+		n.at = n.earliest
+		names = append(names, n)
 	}
-	// Second-stamped names sort chronologically; newest first. They lead every
-	// unstamped (legacy) name, which would otherwise sort after `cli-…` and
-	// crowd the current run out of any newest-N cap.
+	// Second-stamped names sort chronologically but for a repeated hour; newest
+	// first. They lead every unstamped (legacy) name, which would otherwise
+	// sort after `cli-…` and crowd the current run out of any newest-N cap.
 	sort.Slice(names, func(i, j int) bool {
-		iStamped := antigravityLogNamePattern.MatchString(names[i])
-		if iStamped != antigravityLogNamePattern.MatchString(names[j]) {
-			return iStamped
+		if names[i].stamped != names[j].stamped {
+			return names[i].stamped
 		}
-		return names[i] > names[j]
+		return names[i].name > names[j].name
 	})
+	ambiguous := false
+	for i := range names {
+		n := &names[i]
+		if !n.stamped || !n.at.Before(n.latest) {
+			continue
+		}
+		if i >= antigravityStartupScanCap {
+			n.at = n.latest
+			continue
+		}
+		ambiguous = true
+		stat, _ := antigravityStatLog(filepath.Join(dir, n.name))
+		n.at = antigravityResolveLogNameTime(n.at, n.latest, stat.mtime)
+	}
+	if ambiguous {
+		stamped, _ := antigravitySplitLegacyNames(names[:min(len(names), antigravityStartupScanCap)])
+		sort.SliceStable(stamped, func(i, j int) bool { return stamped[i].at.After(stamped[j].at) })
+	}
 	return names, true
+}
+
+// antigravitySplitLegacyNames splits a listing into its stamped names and the
+// unstamped (legacy) names that sort after them.
+func antigravitySplitLegacyNames(names []antigravityLogName) ([]antigravityLogName, []string) {
+	stampedEnd := len(names)
+	for stampedEnd > 0 && !names[stampedEnd-1].stamped {
+		stampedEnd--
+	}
+	legacy := make([]string, 0, len(names)-stampedEnd)
+	for _, n := range names[stampedEnd:] {
+		legacy = append(legacy, n.name)
+	}
+	return names[:stampedEnd], legacy
 }
 
 func antigravityStatLog(path string) (antigravityLogStat, bool) {
@@ -434,29 +562,44 @@ func antigravityPIDBlock(base string, pid int, sinceFloor time.Time) ([]byte, bo
 	// Unstamped (legacy) names sort after every stamped one. Split them off
 	// first: the stamped-time cutoff below must not end the walk before it
 	// reaches them.
-	stampedEnd := len(names)
-	for stampedEnd > 0 && !antigravityLogNamePattern.MatchString(names[stampedEnd-1]) {
-		stampedEnd--
-	}
+	stampedNames, legacyNames := antigravitySplitLegacyNames(names)
 	// Read once per run, so the legacy mtimes are stat'ed fresh: a run that
 	// appended to an older legacy log inside the memo's TTL is still found.
-	legacy := antigravityLegacyLogsSince(dir, names[stampedEnd:], since, true)
-	var afterFloor, slack []string
-	for _, name := range names[:stampedEnd] {
-		at, _ := antigravityLogNameTime(name, time.Time{})
-		if at.Before(since) {
+	legacy := antigravityLegacyLogsSince(dir, legacyNames, since, true)
+	var afterFloor []antigravityLogName
+	var slack []string
+	for _, n := range stampedNames {
+		// No name listed after this one resolves later than its latest, so
+		// latest may end the walk. The resolved instant may not: past the
+		// stat'ed prefix the order is by name, which a repeated hour breaks.
+		if n.latest.Before(since) {
 			break
 		}
-		if at.Before(floorSecond) {
-			slack = append(slack, name)
-		} else {
-			afterFloor = append(afterFloor, name)
+		// An mtime proves only the earlier start (a log is not written before
+		// it exists); a late mtime cannot rule that start out, since a run may
+		// keep writing past the fall-back. So a repeated-hour name ranks at the
+		// earliest start it may have had that is not before the floor: a
+		// first-occurrence run written into the second occurrence still leads
+		// the logs started after it.
+		at := n.at
+		if n.earliest.Before(at) && !n.earliest.Before(floorSecond) {
+			at = n.earliest
+		}
+		switch {
+		case at.Before(since):
+		case at.Before(floorSecond):
+			slack = append(slack, n.name)
+		default:
+			afterFloor = append(afterFloor, antigravityLogName{name: n.name, at: at})
 		}
 	}
-	for i, j := 0, len(afterFloor)-1; i < j; i, j = i+1, j-1 {
-		afterFloor[i], afterFloor[j] = afterFloor[j], afterFloor[i]
+	slices.Reverse(afterFloor)
+	sort.SliceStable(afterFloor, func(i, j int) bool { return afterFloor[i].at.Before(afterFloor[j].at) })
+	stamped := make([]string, 0, len(afterFloor)+len(slack))
+	for _, n := range afterFloor {
+		stamped = append(stamped, n.name)
 	}
-	stamped := append(afterFloor, slack...)
+	stamped = append(stamped, slack...)
 	if limit := antigravityWatchedNewest - min(len(legacy), antigravityLegacyReadReserve); len(stamped) > limit {
 		stamped = stamped[:limit]
 	}
@@ -585,11 +728,10 @@ func beginAntigravityOwnChild(home string) *antigravityOwnChild {
 	second := time.Now().Truncate(time.Second)
 	for _, base := range child.bases {
 		names, _ := antigravityListLogNames(base)
-		for _, name := range names {
-			path := filepath.Join(antigravityLogDir(base), name)
+		for _, n := range names {
+			path := filepath.Join(antigravityLogDir(base), n.name)
 			child.before[path] = struct{}{}
-			if at, stamped := antigravityLogNameTime(name, time.Time{}); stamped && !at.Before(second) &&
-				len(child.appendable) < antigravityOwnChildMaxFiles {
+			if n.stamped && !n.at.Before(second) && len(child.appendable) < antigravityOwnChildMaxFiles {
 				if stat, ok := antigravityStatLog(path); ok {
 					child.appendable[path] = stat.size
 				}
@@ -635,8 +777,8 @@ func (c *antigravityOwnChild) done() {
 			examined := 0
 			for _, base := range c.bases {
 				names, _ := antigravityListLogNames(base)
-				for _, name := range names {
-					path := filepath.Join(antigravityLogDir(base), name)
+				for _, n := range names {
+					path := filepath.Join(antigravityLogDir(base), n.name)
 					if _, existed := c.before[path]; existed {
 						continue
 					}
@@ -1002,7 +1144,7 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 
 	// Listing and stat'ing happen before the lock: names only, then the few
 	// files the pass needs.
-	listings := map[string][]string{}
+	listings := map[string][]antigravityLogName{}
 	for _, base := range bases {
 		if names, ok := antigravityListLogNames(base); ok {
 			listings[base] = names
@@ -1032,13 +1174,14 @@ func antigravityDiscoveryPass(bases []string, now time.Time, observedMs int64) a
 		prev := idx.known[base]
 		current := make(map[string]struct{}, len(names))
 		startupTaken := 0
-		for _, name := range names {
+		for _, n := range names {
+			name := n.name
 			current[name] = struct{}{}
 			path := filepath.Join(dir, name)
-			nameAt, stamped := antigravityLogNameTime(name, now)
-			orderAt := nameAt
-			if !stamped {
-				orderAt = time.Time{}
+			// The listing resolved the stamp; an unstamped name is dated now.
+			nameAt, orderAt := n.at, n.at
+			if !n.stamped {
+				nameAt, orderAt = now.Truncate(time.Second), time.Time{}
 			}
 			newest = append(newest, newestName{path: path, base: base, nameAt: nameAt, orderAt: orderAt})
 			isNew := false
@@ -1171,6 +1314,11 @@ func antigravityClassifyLogLocked(entry *antigravityLogEntry, stat antigravityLo
 	idx := &antigravityLogIndex
 	wasOwned := entry.class == antigravityLogOwned
 	entry.size, entry.mtime = stat.size, stat.mtime
+	// Re-resolve a repeated-hour name with the mtime just stat'ed, so a first
+	// sighting with a stale mtime never pins its earlier instant for good.
+	if at, stamped := antigravityLogNameTime(filepath.Base(entry.path), stat.mtime); stamped {
+		entry.nameAt = at
+	}
 	body, ok := antigravityReadLog(entry.path)
 	if !ok {
 		return
@@ -2165,7 +2313,9 @@ func antigravityBlockEvidence(block []byte, at time.Time) (email string, resets 
 	return email, resets
 }
 
-// antigravityLineTime is a glog line's local time, or at when it has none.
+// antigravityLineTime is a glog line's local time, or at when it has none. A
+// repeated-hour line keeps Go's offset choice: unlike a log name, a line has
+// no mtime to break the tie.
 func antigravityLineTime(line []byte, at time.Time) time.Time {
 	m := antigravityGlogPrefix.FindSubmatch(bytes.TrimSpace(line))
 	if m == nil {
@@ -2175,8 +2325,9 @@ func antigravityLineTime(line []byte, at time.Time) time.Time {
 	for i := range parts {
 		parts[i], _ = strconv.Atoi(string(m[i+1]))
 	}
-	local := at.In(time.Local)
-	t := time.Date(local.Year(), time.Month(parts[0]), parts[1], parts[2], parts[3], parts[4], 0, time.Local)
+	zone := antigravityLogZone()
+	local := at.In(zone)
+	t := time.Date(local.Year(), time.Month(parts[0]), parts[1], parts[2], parts[3], parts[4], 0, zone)
 	if t.After(at.Add(24 * time.Hour)) {
 		// A December line read in January.
 		t = t.AddDate(-1, 0, 0)
@@ -2185,9 +2336,11 @@ func antigravityLineTime(line []byte, at time.Time) time.Time {
 }
 
 // antigravityLogStartedBy is when every run in the log had started by: its
-// name-second, which a same-second second run shares. Zero for an unstamped
-// name, whose runs' start is unknown.
+// name-second as resolved by the file's mtime, which a same-second second run
+// shares. Zero for an unstamped name, whose runs' start is unknown.
 func antigravityLogStartedBy(entry *antigravityLogEntry) time.Time {
-	at, _ := antigravityLogNameTime(filepath.Base(entry.path), time.Time{})
-	return at
+	if !antigravityLogNamePattern.MatchString(filepath.Base(entry.path)) {
+		return time.Time{}
+	}
+	return entry.nameAt
 }
