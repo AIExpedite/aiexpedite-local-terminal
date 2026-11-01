@@ -7,22 +7,35 @@
 // moved on: the session is logged out and wiped, never retried. That is what
 // keeps an old agent process from resurrecting a disconnected link.
 //
+// The outbox belongs to the LINK, not to a generation. A session that ends —
+// WhatsApp removed the companion (once its queue drained), the cloud fenced
+// the generation, a newer one superseded it, a pairing failed or was
+// cancelled — wipes only its session store and leaves the link DORMANT: the
+// outbox (rows still queued), its identity table (whatsapp_identity.go) and
+// its key stay, so "Link again" uploads what was queued, under the new
+// generation, and writes every person under the identity they already had
+// (the cloud keeps the link's earlier messages). Only evidence that the link
+// is over on this computer deletes them: an unlink, a reconcile that finds it
+// unbound or disconnecting, a link start for a different link, or
+// deregistration. A fence asks the cloud which it is (reconcileLoop).
+//
 // State mapping (local/documents/features/whatsapp/WHATSAPP_INTEGRATION.md "Link states"):
 //
 //	link start accepted             → pairing
 //	PairSuccess                     → connecting
 //	Connected                       → syncingHistory (history pending) / connected
 //	initial history done / 10 min   → connected
-//	LoggedOut                       → authExpired  (session wiped, no retry)
+//	LoggedOut                       → authExpired  (queue drained, then dormant; no retry)
 //	StreamReplaced                  → error WHATSAPP_CONNECT_FAILING (session kept, no retry until restart)
 //	TemporaryBan / banned logout    → error WHATSAPP_ACCOUNT_RESTRICTED (no retry)
 //	ClientOutdated / 405            → error WHATSAPP_CLIENT_OUTDATED (no retry)
 //	30 min failing to connect       → error WHATSAPP_CONNECT_FAILING (keeps retrying)
 //
 // Restart: links.json is loaded at boot, so a restart resumes every link
-// without a cloud command; GET /device/:agentId/whatsapp/links then reconciles
-// (wipes a link the cloud no longer binds to this computer, finishes an unlink
-// that was queued while the agent was down).
+// without a cloud command (a dormant one stays dormant); GET
+// /device/:agentId/whatsapp/links then reconciles (wipes a link the cloud no
+// longer binds to this computer, finishes an unlink that was queued while the
+// agent was down).
 //
 // Disconnect from cloud: while the user has the agent disconnected from the
 // cloud (cfg.OfflineMode, the tray toggle) the supervisor is paused — no
@@ -44,7 +57,6 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
-	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -104,6 +116,8 @@ var (
 	// resume (a locked credential store, a held file).
 	whatsAppResumeRetryMin = 30 * time.Second
 	whatsAppResumeRetryMax = 10 * time.Minute
+	// How often the cloud is asked about dormant links (dormantRecheckLoop).
+	whatsAppDormantRecheck = time.Hour
 )
 
 // backoffWithJitter doubles from min to max and adds up to 50% jitter.
@@ -189,6 +203,9 @@ func (s *whatsAppSupervisor) startWith(transport whatsAppTransport, paused bool)
 		logWhatsApp("-", "links.json unreadable: "+err.Error())
 	}
 	local, hadPending := s.retryPendingWipes(local)
+	// The interval is read here, on the starting goroutine: the loop never
+	// reads the package var (tests change it), so nothing races its restore.
+	go s.dormantRecheckLoop(whatsAppDormantRecheck) // skips its ticks while paused
 	if paused {
 		s.mu.Lock()
 		s.paused, s.pausedLinks = true, local
@@ -365,6 +382,40 @@ func (s *whatsAppSupervisor) persist() {
 	}
 }
 
+// dormantRecheckLoop asks the cloud about dormant links every
+// whatsAppDormantRecheck while this computer holds one. A dormant link sends
+// nothing, so it never draws the 409 that kicks a reconcile: without this,
+// whatever the cloud does to it - an erase, the access sweep disconnecting a
+// removed member's link, a re-link that moved to another computer - would
+// reach this computer only at the next agent start, and the link's outbox,
+// identity table and key would stay on disk until then. One signed GET per
+// tick, and none at all while no link is dormant.
+func (s *whatsAppSupervisor) dormantRecheckLoop(every time.Duration) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(every):
+		}
+		if s.isPaused() || !s.holdsDormantLink() {
+			continue
+		}
+		s.reconcileOnce()
+	}
+}
+
+// holdsDormantLink reports whether any link here is dormant.
+func (s *whatsAppSupervisor) holdsDormantLink() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.links {
+		if r.isDormant() {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileLoop asks the cloud which link this computer should hold and
 // retries until it has an answer.
 func (s *whatsAppSupervisor) reconcileLoop() {
@@ -442,8 +493,12 @@ func (s *whatsAppSupervisor) reconcileOnce() bool {
 		case b.State == waStateDisconnecting:
 			s.unlinkLocked(r.linkID, b.Generation)
 		case b.Generation > r.generationNow():
-			r.log("superseded by a newer generation; wiping")
-			s.discard(r, true)
+			// A re-pair of this same link: its session is over, its queue
+			// and identities are the next generation's.
+			if !r.isDormant() {
+				r.log("superseded by a newer generation; keeping its outbox for the link start")
+				s.retire(r, true)
+			}
 		}
 		delete(byID, r.linkID)
 	}
@@ -477,6 +532,16 @@ func (s *whatsAppSupervisor) resume(l whatsAppLocalLink) {
 	r := s.newRunner(l.LinkID, l.WorkspaceID, l.Generation)
 	r.state = l.State
 	r.historyComplete = l.HistoryComplete
+	if l.Dormant {
+		// Nothing to open or connect: held, so a link start, unlink,
+		// reconcile or deregistration still reaches its files.
+		r.stopped, r.dormant = true, true
+		r.cancel()
+		s.mu.Lock()
+		s.links[r.linkID] = r
+		s.mu.Unlock()
+		return
+	}
 	if err := r.open(false); err != nil {
 		r.log("resume failed; keeping the link and retrying: " + err.Error())
 		s.mu.Lock()
@@ -537,18 +602,19 @@ func (s *whatsAppSupervisor) finishResume(r *whatsAppLinkRunner, l whatsAppLocal
 		if l.State == waStatePairing || l.State == waStatePairingRequired {
 			next = waStatePairingRequired
 		}
-		if depth, _ := r.outboxDepth(); next == waStateAuthExpired && depth > 0 {
-			// An auth-expiry drain a pause or shutdown cut short: the
-			// captured rows still upload before the wipe.
-			s.mu.Lock()
-			s.links[r.linkID] = r
-			s.mu.Unlock()
-			r.authExpired()
+		s.mu.Lock()
+		s.links[r.linkID] = r
+		s.mu.Unlock()
+		if depth, _ := r.outboxDepth(); depth > 0 {
+			// A drain a pause or shutdown cut short, or rows a re-link
+			// carried over before its pairing finished: they still upload
+			// under this generation before the link goes dormant.
+			r.endSession(next)
 			return
 		}
 		r.setState(next, "")
 		r.reportState(nil)
-		s.discard(r, false)
+		s.retire(r, false)
 		return
 	}
 	s.mu.Lock()
@@ -569,29 +635,77 @@ func (s *whatsAppSupervisor) newRunner(linkID, workspaceID string, generation in
 	}
 }
 
-// discard stops a runner and deletes everything it had on this computer.
-// logout=true first removes the companion from the phone's Linked devices.
-// The caller holds lifecycleMu. It reports whether the local session
-// material (outbox key, session directory) is actually gone: callers that
-// confirm to the cloud must withhold their ack until it is.
+// discard stops a runner and deletes everything it had on this computer:
+// the link is over here. logout=true first removes the companion from the
+// phone's Linked devices. The caller holds lifecycleMu. It reports whether
+// the local session material (outbox key, session directory) is actually
+// gone: callers that confirm to the cloud must withhold their ack until it is.
 func (s *whatsAppSupervisor) discard(r *whatsAppLinkRunner, logout bool) error {
 	s.trackDiscard(1)
 	defer s.trackDiscard(-1)
 	return s.discardNow(r, logout)
 }
 
-// discardAsync is discard on its own goroutine. The in-flight count is taken
-// BEFORE the goroutine starts, so a shutdown that is already waiting cannot
-// miss it. The goroutine takes lifecycleMu: a wipe queued here (fence,
-// pairing failure) must not run while a link start pairs the next
-// generation, and discardNow's ownership check then spares it.
-func (s *whatsAppSupervisor) discardAsync(r *whatsAppLinkRunner, logout bool) {
+// retire ends a runner's SESSION and leaves its link dormant: the session
+// store is wiped, the outbox, identity table and key stay for the next
+// generation (see the top of this file). logout=true first removes the
+// companion from the phone's Linked devices. The caller holds lifecycleMu.
+// A runner that is no longer the link's (a re-link replaced it, or a discard
+// removed it, while this was queued) is left alone: its link's files belong
+// to the newer runner, or are gone. Reports whether it retired the runner.
+func (s *whatsAppSupervisor) retire(r *whatsAppLinkRunner, logout bool) bool {
+	s.mu.Lock()
+	owned := s.links[r.linkID] == r
+	s.mu.Unlock()
+	if !owned {
+		r.stop(logout)
+		_ = r.closeStores()
+		r.log("retire skipped: the link moved on while this was queued")
+		return false
+	}
+	s.makeDormant(r, logout)
+	return true
+}
+
+// makeDormant is retire without the ownership check, for a runner the caller
+// is placing as the link's: a link start whose stores did not open. The
+// caller holds lifecycleMu.
+func (s *whatsAppSupervisor) makeDormant(r *whatsAppLinkRunner, logout bool) {
+	r.stop(logout)
+	_ = r.closeStores()
+	if err := wipeWhatsAppSessionFiles(r.linkID); err != nil {
+		// Harmless to leave: the next link start wipes it again before it
+		// pairs, and refuses to pair over a session it finds.
+		r.log("session store not deleted: " + err.Error())
+	}
+	r.mu.Lock()
+	r.dormant = true
+	r.mu.Unlock()
+	s.mu.Lock()
+	s.links[r.linkID] = r
+	s.mu.Unlock()
+	s.persist()
+	r.log("session ended; the link's outbox is kept for a re-link")
+}
+
+// retireAsync is retire on its own goroutine, for the runner's own loops (a
+// fence, a pairing failure). The in-flight count is taken BEFORE the
+// goroutine starts, so a shutdown that is already waiting cannot miss it.
+// The goroutine takes lifecycleMu: it must not run while a link start pairs
+// the next generation, and retire's ownership check then spares the new
+// runner. reconcile=true then asks the cloud whether the link still exists
+// here: a fence says this generation is over, not why — a re-link keeps the
+// outbox, a disconnect, an erasure or a move to another computer wipes it.
+func (s *whatsAppSupervisor) retireAsync(r *whatsAppLinkRunner, logout, reconcile bool) {
 	s.trackDiscard(1)
 	go func() {
 		defer s.trackDiscard(-1)
 		s.lifecycleMu.Lock()
-		defer s.lifecycleMu.Unlock()
-		s.discardNow(r, logout)
+		retired := s.retire(r, logout)
+		s.lifecycleMu.Unlock()
+		if retired && reconcile && !s.stopping() && !s.isPaused() {
+			go s.reconcileLoop()
+		}
 	}()
 }
 
@@ -693,11 +807,20 @@ type whatsAppLinkStartParams struct {
 	Method      string `json:"method"`
 	BrowserPub  string `json:"browserPub"`
 	PhoneNumber string `json:"phoneNumber,omitempty"`
+	// LastAckedSeq is the cloud's replay watermark for the link when this
+	// generation began (absent from an older whatsapp-service: 0). The new
+	// generation's sequence starts above it.
+	LastAckedSeq int64 `json:"lastAckedSeq,omitempty"`
 }
 
 // linkStart begins pairing a (new or re-linked) generation. Any older
-// session of the same link is logged out and wiped first: a re-link always
-// pairs fresh. Serialized with every other lifecycle step (lifecycleMu).
+// session of the same link is logged out and its session store wiped first:
+// a re-link always pairs fresh. Its outbox, identity table and key are
+// CARRIED OVER: rows an expired session never delivered upload under the new
+// generation (records are keyed without the generation, so a row the cloud
+// already has collapses), and every person keeps the identity the cloud
+// already stores them under. Serialized with every other lifecycle step
+// (lifecycleMu).
 //
 // retry is true only when the supervisor is paused. On reconnect the Pub/Sub
 // loop can deliver a queued start before the resume clears the pause; acking
@@ -720,7 +843,7 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) (retry bool) {
 			existing.log("duplicate link start ignored")
 			return false
 		}
-		s.discard(existing, true)
+		s.retire(existing, true)
 	}
 	// Another link held by this computer is superseded too: the cloud allows
 	// one active link per computer, so a start for a different link means the
@@ -744,18 +867,37 @@ func (s *whatsAppSupervisor) linkStart(p whatsAppLinkStartParams) (retry bool) {
 		r.reportState(nil)
 		return false
 	}
-	_ = wipeWhatsAppLinkDir(p.LinkID)
-	_ = deleteWhatsAppOutboxKey(p.LinkID)
-	// A pending wipe of this id would delete the session paired below.
 	s.mu.Lock()
+	pendingWipe := false
+	for _, l := range s.pendingWipes {
+		pendingWipe = pendingWipe || l.LinkID == p.LinkID
+	}
+	// A pending wipe of this id would delete the session paired below.
 	s.forgetPendingWipeLocked(p.LinkID)
 	s.mu.Unlock()
-	if err := r.open(true); err != nil {
+	if pendingWipe {
+		// A deregistration's cleanup that never finished: nothing the old
+		// registration held may outlive it, so nothing is carried over.
+		_ = deleteWhatsAppLinkSecrets(p.LinkID)
+	} else if err := wipeWhatsAppSessionFiles(p.LinkID); err != nil {
+		r.log("previous session store not deleted: " + err.Error())
+	}
+	err := r.open(true)
+	if err == nil {
+		err = r.outbox.EnsureNextAbove(p.LastAckedSeq)
+	}
+	if err != nil {
+		// The link's files are kept (they may hold carried-over rows): the
+		// link is held dormant under this generation, so the next "Link
+		// again", an unlink or a reconcile still reaches them.
 		r.log("pairing could not start: " + err.Error())
 		r.setState(waStatePairingRequired, "")
 		r.reportState(nil)
-		s.discard(r, false)
+		s.makeDormant(r, false)
 		return false
+	}
+	if depth, _ := r.outboxDepth(); depth > 0 {
+		r.log("carrying queued rows over to the new generation")
 	}
 	// Admission is checked under the same lock ShutdownAll snapshots the
 	// runners with: a shutdown that began while the credential-store probe or
@@ -792,7 +934,7 @@ func (s *whatsAppSupervisor) linkCancel(linkID string, generation int64) {
 		return
 	}
 	r.log("pairing cancelled")
-	s.discard(r, false)
+	s.retire(r, false)
 }
 
 // unlink logs the companion out on WhatsApp's side, wipes everything local
@@ -1028,14 +1170,30 @@ func (s *whatsAppSupervisor) WipeAll() {
 	s.persist()
 }
 
+// whatsAppAgentProtocol is the WhatsApp behaviour this build implements,
+// reported as capabilities.whatsapp.protocol. terminal-service refuses to
+// pair a computer below its minimum (WHATSAPP_MIN_AGENT_PROTOCOL there), so a
+// build whose identities or sequences the cloud cannot rely on never links.
+//
+//	1 (absent)  the first release: identity chosen per event (a chat could
+//	            split between its history and live copies), and a re-link
+//	            restarted the sequence and wiped the queue
+//	2           one identity per person for the life of the link, the queue
+//	            and identities carried over a re-link, the sequence kept
+//	            above the cloud's watermark
+//
+// Pinned by whatsapp_contract_test.go.
+const whatsAppAgentProtocol = 2
+
 // whatsAppCapability is what systemInfo.go reports.
 type whatsAppCapability struct {
 	Supported     bool `json:"supported"`
 	SecureStorage bool `json:"secureStorage"`
+	Protocol      int  `json:"protocol"`
 }
 
 func currentWhatsAppCapability() *whatsAppCapability {
-	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable()}
+	return &whatsAppCapability{Supported: true, SecureStorage: whatsAppSecureStorageAvailable(), Protocol: whatsAppAgentProtocol}
 }
 
 /* --------------------------------------------------------------------------
@@ -1061,6 +1219,12 @@ type whatsAppLinkRunner struct {
 	accountName     string
 	client          whatsAppClient
 	outbox          *whatsAppOutbox
+	// identity is the link's identity resolver over the outbox's table
+	// (whatsapp_identity.go); nil while the stores are closed.
+	identity *whatsAppIdentityResolver
+	// dormant: the session ended and the stores are closed; the link's
+	// outbox, identity table and key wait for a re-link (top of this file).
+	dormant         bool
 	pairSeq         int64
 	connectedAt     time.Time
 	lastHistoryAt   time.Time
@@ -1105,7 +1269,13 @@ func (r *whatsAppLinkRunner) currentState() string {
 func (r *whatsAppLinkRunner) localLink() whatsAppLocalLink {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return whatsAppLocalLink{LinkID: r.linkID, WorkspaceID: r.workspaceID, Generation: r.generation, State: r.state, HistoryComplete: r.historyComplete}
+	return whatsAppLocalLink{LinkID: r.linkID, WorkspaceID: r.workspaceID, Generation: r.generation, State: r.state, HistoryComplete: r.historyComplete, Dormant: r.dormant}
+}
+
+func (r *whatsAppLinkRunner) isDormant() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dormant
 }
 
 func (r *whatsAppLinkRunner) setState(state, code string) {
@@ -1141,9 +1311,10 @@ func (r *whatsAppLinkRunner) open(fresh bool) error {
 		ob.Close()
 		return errors.New("stale session found in a fresh link directory")
 	}
+	identity := newWhatsAppIdentityResolver(ob, client.AlternateJID)
 	client.AddEventHandler(r.handleEvent)
 	r.mu.Lock()
-	r.client, r.outbox = client, ob
+	r.client, r.outbox, r.identity = client, ob, identity
 	r.mu.Unlock()
 	return nil
 }
@@ -1213,7 +1384,7 @@ func (r *whatsAppLinkRunner) stopClientOnly() {
 func (r *whatsAppLinkRunner) closeStores() error {
 	r.mu.Lock()
 	client, ob := r.client, r.outbox
-	r.client, r.outbox = nil, nil
+	r.client, r.outbox, r.identity = nil, nil, nil
 	r.mu.Unlock()
 	var errs []error
 	if ob != nil {
@@ -1226,10 +1397,13 @@ func (r *whatsAppLinkRunner) closeStores() error {
 }
 
 // fence handles 409 WHATSAPP_LINK_FENCED: the cloud no longer accepts this
-// generation. Terminal — logged out, wiped, never retried.
+// generation. Terminal for the session — logged out, wiped, never retried.
+// The link's outbox stays until a reconcile says whether the link itself is
+// over here: a "Link again" fences the old generation too, and its queued
+// rows are the new one's to upload.
 func (r *whatsAppLinkRunner) fence() {
-	r.log("fenced by the cloud; wiping this session")
-	r.sup.discardAsync(r, true)
+	r.log("fenced by the cloud; ending this session")
+	r.sup.retireAsync(r, true, true)
 }
 
 /* -------------------------------- pairing -------------------------------- */
@@ -1293,7 +1467,7 @@ func (r *whatsAppLinkRunner) pair(method, browserPub, phone string) {
 func (r *whatsAppLinkRunner) pairingFailed() {
 	r.setState(waStatePairingRequired, "")
 	r.reportState(nil)
-	r.sup.discardAsync(r, false)
+	r.sup.retireAsync(r, false, false)
 }
 
 func (r *whatsAppLinkRunner) postPairing(browserPub, method, code string, ttl time.Duration) {
@@ -1418,17 +1592,26 @@ func (r *whatsAppLinkRunner) terminal(state, code string) {
 }
 
 // authExpired: WhatsApp removed this companion. The session is useless; what
-// is already in the outbox still uploads (same generation), then the link is
-// wiped. Only "Link again" (a new generation) recovers.
+// is already in the outbox still uploads (same generation), then the link
+// goes dormant. Only "Link again" (a new generation) recovers.
 func (r *whatsAppLinkRunner) authExpired() {
+	r.log("authentication expired")
+	r.endSession(waStateAuthExpired)
+}
+
+// endSession ends a session that cannot continue — expired, or a resumed
+// link with no paired identity — reporting state. Rows already queued keep
+// uploading under this generation until the outbox is empty; then the session
+// store is wiped and the link goes dormant, its (empty) outbox and identity
+// table kept for a re-link.
+func (r *whatsAppLinkRunner) endSession(state string) {
 	r.mu.Lock()
-	r.terminalError = waStateAuthExpired
+	r.terminalError = state
 	client := r.client
 	r.mu.Unlock()
-	r.setState(waStateAuthExpired, "")
+	r.setState(state, "")
 	r.sup.persist()
 	r.reportState(nil)
-	r.log("authentication expired")
 	// Counted as a wipe in flight from now: shutdown cancels the supervisor
 	// context (ending the flush below) and then waits for the wipe.
 	r.sup.trackDiscard(1)
@@ -1445,8 +1628,9 @@ func (r *whatsAppLinkRunner) authExpired() {
 		cancel()
 		// The session is dead but the outbox is device-authenticated, so
 		// rows the bounded flush could not deliver stay queued: keep
-		// draining instead of wiping captured messages with their key.
-		// Only an empty outbox is wiped below. A closed one is not empty:
+		// draining. Only an empty outbox goes dormant below (a fence ends
+		// the drain first and keeps the rows for the re-link that caused
+		// it). A closed one is not empty:
 		// a cloud pause or shutdown closed the stores under this drain, the
 		// rows are still on disk, and the next resume drains them.
 		for attempt := 0; ; attempt++ {
@@ -1474,11 +1658,11 @@ func (r *whatsAppLinkRunner) authExpired() {
 			r.flush(ctx)
 			cancel()
 		}
-		// Serialized like discardAsync: "Link again" may have paired the
-		// next generation while the flush ran, and discardNow must spare it.
+		// Serialized like retireAsync: "Link again" may have paired the
+		// next generation while the flush ran, and retire must spare it.
 		r.sup.lifecycleMu.Lock()
 		defer r.sup.lifecycleMu.Unlock()
-		r.sup.discardNow(r, false)
+		r.sup.retire(r, false)
 	}()
 }
 
@@ -1526,17 +1710,9 @@ func (r *whatsAppLinkRunner) normalizeContext() whatsAppNormalizeContext {
 	nc := whatsAppNormalizeContext{ReconnectedAt: r.reconnectedAt}
 	if client := r.client; client != nil {
 		nc.OwnJID = client.OwnJID()
-		// Memoized per event / history chunk: a chunk names the same few
-		// LIDs many times, and each miss is a session-store query.
-		seen := map[types.JID]types.JID{}
-		nc.PNForLID = func(lid types.JID) types.JID {
-			if pn, ok := seen[lid]; ok {
-				return pn
-			}
-			pn := client.PNForLID(lid)
-			seen[lid] = pn
-			return pn
-		}
+	}
+	if r.identity != nil {
+		nc.Identity = r.identity
 	}
 	return nc
 }
@@ -1675,8 +1851,7 @@ func (r *whatsAppLinkRunner) onLiveMessage(evt *events.Message) {
 		if !evt.Info.IsGroup && !evt.Info.IsFromMe {
 			name = evt.Info.PushName
 		}
-		conv := whatsAppConversationRecord(evt.Info.MessageSource, name)
-		conv.ChatJid = chat // as normalized, store LID lookup included
+		conv := whatsAppConversationRecord(chat, evt.Info.IsGroup, name)
 		records = append([]whatsAppRecord{conv}, records...)
 	}
 	r.appendLive(records)

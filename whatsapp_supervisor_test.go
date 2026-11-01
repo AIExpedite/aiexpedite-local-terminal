@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ type fakeWAClient struct {
 	logouts   int
 	closed    bool
 	qr        chan whatsmeow.QRChannelItem
+	// alternates is whatsmeow's LID store (both directions).
+	alternates map[types.JID]types.JID
 }
 
 func (c *fakeWAClient) AddEventHandler(h func(any)) {
@@ -67,10 +70,14 @@ func (c *fakeWAClient) Logout(context.Context) error {
 	c.session = false
 	return nil
 }
-func (c *fakeWAClient) IsConnected() bool            { c.mu.Lock(); defer c.mu.Unlock(); return c.connected }
-func (c *fakeWAClient) HasSession() bool             { c.mu.Lock(); defer c.mu.Unlock(); return c.session }
-func (c *fakeWAClient) OwnJID() types.JID            { return waMe }
-func (c *fakeWAClient) PNForLID(types.JID) types.JID { return types.EmptyJID }
+func (c *fakeWAClient) IsConnected() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.connected }
+func (c *fakeWAClient) HasSession() bool  { c.mu.Lock(); defer c.mu.Unlock(); return c.session }
+func (c *fakeWAClient) OwnJID() types.JID { return waMe }
+func (c *fakeWAClient) AlternateJID(j types.JID) types.JID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.alternates[j]
+}
 func (c *fakeWAClient) GetQRChannel(context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return c.qr, nil
 }
@@ -86,12 +93,13 @@ func (c *fakeWAClient) count() (connects, logouts int) {
 }
 
 type fakeWATransport struct {
-	mu      sync.Mutex
-	posts   []map[string]any
-	raw     []string
-	respond func(payload map[string]any) whatsAppSyncResult
-	bound   []whatsAppBoundLink
-	onBound func()
+	mu         sync.Mutex
+	posts      []map[string]any
+	raw        []string
+	respond    func(payload map[string]any) whatsAppSyncResult
+	bound      []whatsAppBoundLink
+	onBound    func()
+	boundCalls int
 }
 
 func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResult {
@@ -117,6 +125,7 @@ func (f *fakeWATransport) Post(_ context.Context, payload any) whatsAppSyncResul
 func (f *fakeWATransport) BoundLinks(context.Context) ([]whatsAppBoundLink, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.boundCalls++
 	if f.onBound != nil {
 		f.onBound()
 	}
@@ -177,6 +186,8 @@ type supervisorHarness struct {
 	mu        sync.Mutex
 	clients   []*fakeWAClient
 	session   bool // HasSession of the next client created
+	// alternates seeds the LID store of the next client created.
+	alternates map[types.JID]types.JID
 }
 
 func newSupervisorHarness(t *testing.T) *supervisorHarness {
@@ -184,10 +195,15 @@ func newSupervisorHarness(t *testing.T) *supervisorHarness {
 	ks, _ := withWhatsAppTestEnv(t)
 	h := &supervisorHarness{sup: &whatsAppSupervisor{}, transport: &fakeWATransport{}, ks: ks}
 	prevFactory := newWhatsAppClient
-	newWhatsAppClient = func(string) (whatsAppClient, error) {
+	newWhatsAppClient = func(dir string) (whatsAppClient, error) {
+		// Like whatsmeow's sqlstore, opening the client creates the session
+		// store, so tests can see which wipes reach it.
+		if f, err := os.OpenFile(filepath.Join(dir, whatsAppSessionDBName), os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			f.Close()
+		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		c := &fakeWAClient{qr: make(chan whatsmeow.QRChannelItem, 4), session: h.session}
+		c := &fakeWAClient{qr: make(chan whatsmeow.QRChannelItem, 4), session: h.session, alternates: h.alternates}
 		h.clients = append(h.clients, c)
 		return c, nil
 	}
@@ -343,18 +359,28 @@ func TestWhatsAppSupervisorDisconnectedDoesNotFlapState(t *testing.T) {
 	}
 }
 
-func TestWhatsAppSupervisorLoggedOutWipesAndNeverRetries(t *testing.T) {
+// An expired session is wiped and never reconnected, but the link goes
+// dormant rather than away: its outbox, identity table and key wait for
+// "Link again", which must keep writing the same identities.
+func TestWhatsAppSupervisorLoggedOutEndsTheSessionAndNeverRetries(t *testing.T) {
 	h, c := pairedHarness(t)
 	connects, _ := c.count()
 	c.emit(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
 	waitFor(t, "authExpired", func() bool { return lastState(h.transport) == waStateAuthExpired })
-	waitFor(t, "wiped", func() bool { return h.sup.runner("lnk_1") == nil })
+	waitFor(t, "dormant", func() bool { r := h.sup.runner("lnk_1"); return r != nil && r.isDormant() })
 	dir, _ := whatsAppLinkDir("lnk_1")
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatal("session directory survived authExpired")
+	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); !os.IsNotExist(err) {
+		t.Fatal("session store survived authExpired")
 	}
-	if _, err := h.ks.Get("lnk_1"); err == nil {
-		t.Fatal("outbox key survived authExpired")
+	if _, err := os.Stat(filepath.Join(dir, whatsAppOutboxDBName)); err != nil {
+		t.Fatalf("the link's outbox was deleted with the session: %v", err)
+	}
+	if _, err := h.ks.Get("lnk_1"); err != nil {
+		t.Fatalf("the link's outbox key was deleted with the session: %v", err)
+	}
+	links, _ := loadWhatsAppLocalLinks()
+	if len(links) != 1 || !links[0].Dormant || links[0].State != waStateAuthExpired {
+		t.Fatalf("links.json = %+v, want the link held dormant", links)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if after, _ := c.count(); after != connects {
@@ -402,8 +428,8 @@ func TestWhatsAppSupervisorStreamReplacedKeepsTheSession(t *testing.T) {
 	}
 }
 
-func TestWhatsAppSupervisorFencedBatchWipesTheSession(t *testing.T) {
-	h, c := pairedHarness(t)
+// fenceBatches makes the cloud answer every batch 409 WHATSAPP_LINK_FENCED.
+func fenceBatches(h *supervisorHarness) {
 	h.transport.mu.Lock()
 	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
 		if p["kind"] == waSyncKindBatch {
@@ -412,10 +438,61 @@ func TestWhatsAppSupervisorFencedBatchWipesTheSession(t *testing.T) {
 		return whatsAppSyncResult{Status: 200}
 	}
 	h.transport.mu.Unlock()
+}
+
+// A fence ends the session (logged out, session store wiped) and asks the
+// cloud why. Bound to this computer under a newer generation is a re-link in
+// progress: the queued row stays for it.
+func TestWhatsAppSupervisorFencedBatchKeepsTheOutboxForARelink(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.transport.mu.Lock()
+	h.transport.bound = []whatsAppBoundLink{{LinkID: "lnk_1", WorkspaceID: "ws", Generation: 3, State: waStatePairing}}
+	h.transport.mu.Unlock()
+	fenceBatches(h)
 	c.emit(liveMsg(waPeer, waPeer, false, "F1", &waE2E.Message{Conversation: proto.String("x")}))
-	waitFor(t, "fenced", func() bool { return h.sup.runner("lnk_1") == nil })
+	waitFor(t, "fenced", func() bool { r := h.sup.runner("lnk_1"); return r != nil && r.isDormant() })
 	if _, logouts := c.count(); logouts != 1 {
 		t.Fatal("a fenced session is logged out")
+	}
+	waitFor(t, "the reconcile the fence asked for", func() bool {
+		h.transport.mu.Lock()
+		defer h.transport.mu.Unlock()
+		return h.transport.boundCalls >= 2
+	})
+	h.sup.lifecycleMu.Lock() // the reconcile's mutations are done once it is free
+	h.sup.lifecycleMu.Unlock()
+	if r := h.sup.runner("lnk_1"); r == nil || !r.isDormant() {
+		t.Fatal("a re-link in progress must keep the dormant link")
+	}
+	dir, _ := whatsAppLinkDir("lnk_1")
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	if ob.Depth() == 0 {
+		t.Fatal("the fenced generation's queued rows were dropped")
+	}
+	links, _ := loadWhatsAppLocalLinks()
+	if len(links) != 1 || !links[0].Dormant {
+		t.Fatalf("links.json = %+v", links)
+	}
+}
+
+// Not bound to this computer any more (disconnected, erased, moved): the
+// fence's reconcile deletes everything.
+func TestWhatsAppSupervisorFencedUnboundLinkIsWiped(t *testing.T) {
+	h, c := pairedHarness(t)
+	h.transport.mu.Lock()
+	h.transport.bound = nil
+	h.transport.mu.Unlock()
+	fenceBatches(h)
+	c.emit(liveMsg(waPeer, waPeer, false, "F1", &waE2E.Message{Conversation: proto.String("x")}))
+	waitFor(t, "wiped", func() bool { return h.sup.runner("lnk_1") == nil })
+	dir, _ := whatsAppLinkDir("lnk_1")
+	waitFor(t, "directory gone", func() bool { _, err := os.Stat(dir); return os.IsNotExist(err) })
+	if _, err := h.ks.Get("lnk_1"); err == nil {
+		t.Fatal("outbox key survived an unbound link")
 	}
 	links, _ := loadWhatsAppLocalLinks()
 	if len(links) != 0 {
@@ -691,7 +768,7 @@ func TestWhatsAppSupervisorLogsCarryNoContent(t *testing.T) {
 	c.emit(liveMsg(waPeer, waPeer, false, "LOG1", &waE2E.Message{Conversation: proto.String("TOP SECRET BODY")}))
 	waitFor(t, "uploaded", func() bool { r := h.sup.runner("lnk_1"); return r != nil && r.outbox.Depth() == 0 })
 	c.emit(&events.LoggedOut{})
-	waitFor(t, "wiped", func() bool { return h.sup.runner("lnk_1") == nil })
+	waitFor(t, "dormant", func() bool { r := h.sup.runner("lnk_1"); return r != nil && r.isDormant() })
 
 	mu.Lock()
 	out := captured.String()
@@ -748,9 +825,9 @@ func TestWhatsAppSupervisorShutdownFlushesThePendingOutbox(t *testing.T) {
 	}
 }
 
-// A flush fenced (409) during shutdown starts a discard while shutdown is
+// A flush fenced (409) during shutdown ends the session while shutdown is
 // already waiting; shutdown must wait for it rather than race it.
-func TestWhatsAppSupervisorShutdownWaitsForAFencedFlushWipe(t *testing.T) {
+func TestWhatsAppSupervisorShutdownWaitsForAFencedFlushRetire(t *testing.T) {
 	h, c := pairedHarness(t)
 	var mu sync.Mutex
 	fenced := false
@@ -778,8 +855,11 @@ func TestWhatsAppSupervisorShutdownWaitsForAFencedFlushWipe(t *testing.T) {
 	defer cancel()
 	h.sup.ShutdownAll(ctx)
 	dir, _ := whatsAppLinkDir("lnk_1")
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); !os.IsNotExist(err) {
 		t.Fatal("shutdown returned before the fenced session was wiped")
+	}
+	if _, err := os.Stat(filepath.Join(dir, whatsAppOutboxDBName)); err != nil {
+		t.Fatalf("the fenced link's outbox went with its session: %v", err)
 	}
 }
 
@@ -802,32 +882,29 @@ func TestWhatsAppSupervisorWaitDiscardsHonoursTheDeadline(t *testing.T) {
 	}
 }
 
-// A wipe queued before a re-link (fenced generation, failed pairing) runs
-// either fully before the link start or fully after it — never through it.
-// In the "after" case the queued wipe must spare the new generation's
-// session entirely.
-func TestWhatsAppSupervisorStaleAsyncWipeSparesTheRelink(t *testing.T) {
+// A session end queued before a re-link (fenced generation, failed pairing)
+// runs either fully before the link start or fully after it — never through
+// it. In the "after" case it must spare the new generation's session
+// entirely.
+func TestWhatsAppSupervisorStaleAsyncRetireSparesTheRelink(t *testing.T) {
 	h, _ := pairedHarness(t) // generation 2
 	old := h.sup.runner("lnk_1")
 	if old == nil {
-		t.Fatal("no runner to wipe")
+		t.Fatal("no runner to retire")
 	}
-	// The queued wipe serializes behind the lifecycle lock: while the test
-	// holds it, the wipe must not touch the runner.
+	// The queued retire serializes behind the lifecycle lock: while the test
+	// holds it, it must not touch the runner.
 	h.sup.lifecycleMu.Lock()
-	h.sup.discardAsync(old, true) // the generation-2 wipe, queued
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for h.sup.runner("lnk_1") == old && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if h.sup.runner("lnk_1") != old {
+	h.sup.retireAsync(old, true, false) // the generation-2 session end, queued
+	time.Sleep(200 * time.Millisecond)
+	if old.isDormant() {
 		h.sup.lifecycleMu.Unlock()
-		t.Fatal("an async wipe ran through the held lifecycle lock")
+		t.Fatal("an async retire ran through the held lifecycle lock")
 	}
 	dir, _ := whatsAppLinkDir("lnk_1")
-	if _, err := os.Stat(dir); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); err != nil {
 		h.sup.lifecycleMu.Unlock()
-		t.Fatal("an async wipe deleted the session while blocked on the lifecycle lock")
+		t.Fatal("an async retire deleted the session while blocked on the lifecycle lock")
 	}
 	h.sup.lifecycleMu.Unlock()
 	// Re-link: whatever order the queued wipe and the link start settle in,
@@ -843,14 +920,14 @@ func TestWhatsAppSupervisorStaleAsyncWipeSparesTheRelink(t *testing.T) {
 		defer h.sup.mu.Unlock()
 		return h.sup.discardsInFlight == 0
 	})
-	if h.sup.runner("lnk_1") != next {
-		t.Fatal("a stale queued wipe removed the relinked runner")
+	if h.sup.runner("lnk_1") != next || next.isDormant() {
+		t.Fatal("a stale queued retire replaced or retired the relinked runner")
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatal("a stale queued wipe deleted the relinked session directory")
+	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); err != nil {
+		t.Fatal("a stale queued retire deleted the relinked session store")
 	}
 	if _, err := h.ks.Get("lnk_1"); err != nil {
-		t.Fatal("a stale queued wipe deleted the relinked outbox key")
+		t.Fatal("a stale queued retire deleted the relinked outbox key")
 	}
 }
 
@@ -1139,7 +1216,7 @@ func TestWhatsAppSupervisorReconcileSkipsLinksCreatedDuringFetch(t *testing.T) {
 
 // An auth expiry during an upload outage must not wipe captured messages:
 // the outbox survives the bounded flush and drains once the cloud is back,
-// and only then is the session wiped.
+// and only then is the session wiped and the link left dormant.
 func TestWhatsAppSupervisorAuthExpiredFlushTimeoutRetainsOutbox(t *testing.T) {
 	h, c := pairedHarness(t)
 	prevFlush := whatsAppAuthFlushTimeout
@@ -1182,10 +1259,21 @@ func TestWhatsAppSupervisorAuthExpiredFlushTimeoutRetainsOutbox(t *testing.T) {
 	mu.Lock()
 	healthy = true
 	mu.Unlock()
-	waitFor(t, "drained wipe", func() bool { return h.sup.runner("lnk_1") == nil })
+	waitFor(t, "drained, then dormant", func() bool { r := h.sup.runner("lnk_1"); return r != nil && r.isDormant() })
 	dir, _ := whatsAppLinkDir("lnk_1")
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, whatsAppSessionDBName)); !os.IsNotExist(err) {
 		t.Fatal("the drained session was not wiped")
+	}
+	// Dormant only once EMPTY: a drain that stopped early would leave the row
+	// queued here. (A refused post is recorded too, so "a batch was posted"
+	// proves nothing.)
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	if ob.Depth() != 0 {
+		t.Fatalf("the link went dormant with %d rows still queued", ob.Depth())
 	}
 }
 
@@ -1266,7 +1354,7 @@ func TestWhatsAppSupervisorOversizedHistoryChunkSplits(t *testing.T) {
 
 // A cloud pause that closes the stores under an auth-expiry drain must not
 // read as "drained": the outbox and its key survive, and the resume after
-// reconnect drains them before the wipe.
+// reconnect drains them before the link goes dormant.
 func TestWhatsAppSupervisorAuthExpiredDrainSurvivesCloudPause(t *testing.T) {
 	h, c := pairedHarness(t)
 	prevFlush := whatsAppAuthFlushTimeout
@@ -1311,9 +1399,9 @@ func TestWhatsAppSupervisorAuthExpiredDrainSurvivesCloudPause(t *testing.T) {
 	healthy = true
 	mu.Unlock()
 	h.sup.setCloudConnected(true) // the next client has no session: still expired
-	waitFor(t, "drained after resume", func() bool {
-		_, err := h.ks.Get("lnk_1")
-		return err != nil && h.sup.runner("lnk_1") == nil
+	waitFor(t, "drained after resume, then dormant", func() bool {
+		r := h.sup.runner("lnk_1")
+		return r != nil && r.isDormant()
 	})
 	var delivered bool
 	for _, p := range h.transport.find(func(p map[string]any) bool { return p["kind"] == waSyncKindBatch }) {
@@ -1383,19 +1471,16 @@ func TestWhatsAppLinkStartCommandIsAcceptedBeforeReturning(t *testing.T) {
 	}
 }
 
-// A fenced session wiped on its own goroutine whose cleanup fails has no
-// caller to retry it: links.json must keep it marked PendingWipe, and the
-// next start finishes the wipe.
+// A fenced link the cloud no longer binds here is wiped by the fence's
+// reconcile, on its own goroutine. When that cleanup fails nothing else would
+// retry it: links.json must keep it marked PendingWipe, and the next start
+// finishes the wipe.
 func TestWhatsAppSupervisorFailedAsyncWipeIsRetriedOnNextStart(t *testing.T) {
 	h, c := pairedHarness(t)
 	h.transport.mu.Lock()
-	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
-		if p["kind"] == waSyncKindBatch {
-			return whatsAppSyncResult{Status: 409, Body: whatsAppSyncResponse{Code: waErrLinkFenced}}
-		}
-		return whatsAppSyncResult{Status: 200}
-	}
+	h.transport.bound = nil
 	h.transport.mu.Unlock()
+	fenceBatches(h)
 	h.ks.unavailable = true
 	c.emit(liveMsg(waPeer, waPeer, false, "F1", &waE2E.Message{Conversation: proto.String("x")}))
 	waitFor(t, "fenced", func() bool { return h.sup.runner("lnk_1") == nil })
@@ -1754,7 +1839,12 @@ func TestWhatsAppSupervisorShutdownHonoursTheCallerDeadline(t *testing.T) {
 	c.mu.Lock()
 	c.session = true
 	c.mu.Unlock()
-	c.emit(&events.Connected{}) // syncingHistory; the heartbeat loop completes it after the quiet
+	// On its own goroutine: the heartbeat loop can complete history between
+	// the Connected handler's setState and its reportState, and that report
+	// then blocks on the supervisor context like the heartbeat's own - which
+	// only the ShutdownAll below cancels. Emitted inline, the test goroutine
+	// would sit in that report and never reach it.
+	go c.emit(&events.Connected{}) // syncingHistory; the heartbeat loop completes it after the quiet
 	select {
 	case <-tr.blocked:
 	case <-time.After(5 * time.Second):

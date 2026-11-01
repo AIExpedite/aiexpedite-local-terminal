@@ -38,9 +38,10 @@ type whatsAppClient interface {
 	// HasSession reports a paired device identity in the store.
 	HasSession() bool
 	OwnJID() types.JID
-	// PNForLID is the phone-number JID the session store maps a LID to, or
-	// the empty JID when none is known.
-	PNForLID(lid types.JID) types.JID
+	// AlternateJID is the other address the session store maps a person to:
+	// the phone-number JID for a LID, the LID for a phone-number JID, or the
+	// empty JID when none is known.
+	AlternateJID(j types.JID) types.JID
 	GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error)
 	PairPhone(ctx context.Context, phone string) (string, error)
 	ParseWebMessage(chat types.JID, msg *waWeb.WebMessageInfo) (*events.Message, error)
@@ -48,7 +49,7 @@ type whatsAppClient interface {
 	Close() error
 }
 
-// whatsAppLIDLookupTimeout bounds one LID → phone-number lookup in the local
+// whatsAppLIDLookupTimeout bounds one LID ↔ phone-number lookup in the local
 // session store.
 const whatsAppLIDLookupTimeout = 2 * time.Second
 
@@ -111,17 +112,26 @@ func (c *whatsmeowClient) OwnJID() types.JID {
 	}
 	return c.cli.Store.ID.ToNonAD()
 }
-func (c *whatsmeowClient) PNForLID(lid types.JID) types.JID {
+func (c *whatsmeowClient) AlternateJID(j types.JID) types.JID {
 	if c.cli.Store == nil || c.cli.Store.LIDs == nil {
 		return types.EmptyJID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), whatsAppLIDLookupTimeout)
 	defer cancel()
-	pn, err := c.cli.Store.LIDs.GetPNForLID(ctx, lid.ToNonAD())
+	var alt types.JID
+	var err error
+	switch j = j.ToNonAD(); j.Server {
+	case types.HiddenUserServer:
+		alt, err = c.cli.Store.LIDs.GetPNForLID(ctx, j)
+	case types.DefaultUserServer:
+		alt, err = c.cli.Store.LIDs.GetLIDForPN(ctx, j)
+	default:
+		return types.EmptyJID
+	}
 	if err != nil {
 		return types.EmptyJID
 	}
-	return pn
+	return alt
 }
 func (c *whatsmeowClient) GetQRChannel(ctx context.Context) (<-chan whatsmeow.QRChannelItem, error) {
 	return c.cli.GetQRChannel(ctx)

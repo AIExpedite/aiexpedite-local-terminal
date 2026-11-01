@@ -151,17 +151,18 @@ func TestNormalizeCanonicalIdentity(t *testing.T) {
 	}
 }
 
+// testWhatsAppIdentity is a resolver over a memory table, with alternates as
+// whatsmeow's LID store (both directions are listed explicitly).
+func testWhatsAppIdentity(alternates map[types.JID]types.JID) *whatsAppIdentityResolver {
+	return newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), func(j types.JID) types.JID { return alternates[j] })
+}
+
 // Operation targets and history conversation ids carry no alternate address:
 // the session store's LID mapping resolves them to the same phone-number
 // identity the original messages normalized to.
 func TestNormalizeResolvesLIDTargetsThroughTheStore(t *testing.T) {
 	lid := types.NewJID("999888777", types.HiddenUserServer)
-	nc := whatsAppNormalizeContext{OwnJID: waMe, PNForLID: func(j types.JID) types.JID {
-		if j == lid {
-			return waPeer
-		}
-		return types.EmptyJID
-	}}
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: testWhatsAppIdentity(map[types.JID]types.JID{lid: waPeer, waPeer: lid})}
 
 	revoke := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{Type: waE2E.ProtocolMessage_REVOKE.Enum(), Key: &waCommon.MessageKey{ID: proto.String("GONE"), Participant: proto.String("999888777:2@lid")}}}
 	if r := one(t, normalizeWhatsAppMessage(liveMsg(waGroup, waMe, true, "X", revoke), waSourceLive, nc)); r.SenderJid != waPeer.String() {
@@ -259,12 +260,7 @@ func TestNormalizeGroupInfoJoinLeave(t *testing.T) {
 // the same identity the member's messages and history notices normalize to.
 func TestNormalizeGroupInfoResolvesLIDParticipants(t *testing.T) {
 	lid := types.NewJID("999888777", types.HiddenUserServer)
-	nc := whatsAppNormalizeContext{PNForLID: func(j types.JID) types.JID {
-		if j == lid {
-			return waPeer
-		}
-		return types.EmptyJID
-	}}
+	nc := whatsAppNormalizeContext{Identity: testWhatsAppIdentity(map[types.JID]types.JID{lid: waPeer, waPeer: lid})}
 	joiner := types.JID{User: "999888777", Device: 3, Server: types.HiddenUserServer}
 	recs := normalizeWhatsAppGroupInfo(&events.GroupInfo{JID: waGroup, Timestamp: waTS, Join: []types.JID{joiner}}, nc)
 	if len(recs) != 1 || recs[0].SenderJid != waPeer.String() {

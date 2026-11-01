@@ -11,9 +11,11 @@
 //
 // Rows are AES-256-GCM sealed under the link's key from the OS credential store
 // (whatsapp_keystore.go); the AAD binds each row to its link and sequence, so a
-// row copied between links or reordered fails to open. The database file
-// therefore holds only ciphertext — message text never sits on disk in the
-// clear outside whatsmeow's own store.
+// row copied between links or reordered fails to open. The same file holds the
+// link's identity table (whatsapp_identity.go), indexed by HMAC and sealed
+// under the same key. The database file therefore holds only ciphertext —
+// message text and phone numbers never sit on disk in the clear outside
+// whatsmeow's own store.
 //
 // Caps (WHATSAPP_INGEST_LIMITS OUTBOX_MAX_RECORDS / OUTBOX_MAX_BYTES): past
 // them a HISTORY append is refused with errWhatsAppOutboxFull — the supervisor
@@ -49,6 +51,9 @@ const (
 
 var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
 
+// errWhatsAppOutboxClosed answers a write after Close.
+var errWhatsAppOutboxClosed = errors.New("whatsapp outbox is closed")
+
 // errWhatsAppOutboxChunkTooLarge is the refusal of a history chunk the EMPTY
 // queue cannot take: the chunk alone passes a cap, so no drain will ever
 // admit it whole. It wraps errWhatsAppOutboxFull. Append decides it under
@@ -56,7 +61,9 @@ var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
 // cap read as this one.
 var errWhatsAppOutboxChunkTooLarge = fmt.Errorf("%w: the chunk alone passes the caps", errWhatsAppOutboxFull)
 
-// whatsAppOutbox is one link's queue.
+// whatsAppOutbox is one link's queue, and its identity table
+// (whatsapp_identity.go). Both belong to the LINK, not to a generation: a
+// re-link keeps them (whatsapp_supervisor.go, linkStart).
 type whatsAppOutbox struct {
 	mu     sync.Mutex
 	db     *sql.DB
@@ -66,6 +73,15 @@ type whatsAppOutbox struct {
 	count int64
 	bytes int64
 	next  int64
+	// idxKey indexes the identity table; identities caches it (index hex →
+	// identity JID).
+	idxKey     []byte
+	identities map[string]string
+	// pendingIdentities are staged identities not yet committed (index hex →
+	// identity); see stageIdentities.
+	pendingIdentities map[string]string
+	// closed: Close ran (under mu, so it waited for any write in flight).
+	closed bool
 }
 
 // whatsAppOutboxBatch is a contiguous range ready to upload.
@@ -75,13 +91,20 @@ type whatsAppOutboxBatch struct {
 	Records []json.RawMessage
 }
 
-// openWhatsAppOutbox opens (creating) dir/outbox.db with the link's key.
-// create=false refuses to mint a key: an outbox whose key is gone cannot be
-// read, so its rows are discarded and a fresh key is minted — reported by
-// discarded=true so the caller can log it.
+// openWhatsAppOutbox opens (creating) dir/outbox.db with the link's key. An
+// outbox or identity table whose key is gone cannot be read, so its rows are
+// discarded and a fresh key is minted — reported by discarded=true so the
+// caller can log it. The sequence (`next`) survives that discard: the cloud's
+// replay watermark does too.
 func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool, err error) {
 	path := filepath.Join(dir, whatsAppOutboxDBName)
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
+	// synchronous(FULL): a commit is on disk before Append, Ack or an
+	// identity write returns. Under NORMAL an OS crash or power loss can roll
+	// back the last commits, and with them `next` and identities the cloud
+	// has already acted on: records re-numbered at or below its replay
+	// watermark are acked without being written, and a person could be
+	// written under a second identity.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)")
 	if err != nil {
 		return nil, false, err
 	}
@@ -99,18 +122,32 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 		db.Close()
 		return nil, false, err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS identity (
+		k BLOB PRIMARY KEY,
+		nonce BLOB NOT NULL,
+		payload BLOB NOT NULL)`); err != nil {
+		db.Close()
+		return nil, false, err
+	}
 	ob = &whatsAppOutbox{db: db, linkID: linkID}
 	if err := ob.loadCounters(); err != nil {
 		db.Close()
 		return nil, false, err
 	}
+	identityRows, err := countWhatsAppIdentityRows(db)
+	if err != nil {
+		db.Close()
+		return nil, false, err
+	}
 
-	key, keyErr := loadOrCreateWhatsAppOutboxKey(linkID, ob.count == 0)
+	key, keyErr := loadOrCreateWhatsAppOutboxKey(linkID, ob.count == 0 && identityRows == 0)
 	if errors.Is(keyErr, errWhatsAppKeyNotFound) {
 		// Rows exist but their key is gone: unreadable by construction.
-		if _, err := db.Exec(`DELETE FROM outbox`); err != nil {
-			db.Close()
-			return nil, false, err
+		for _, stmt := range []string{`DELETE FROM outbox`, `DELETE FROM identity`} {
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, false, err
+			}
 		}
 		discarded = true
 		ob.count, ob.bytes = 0, 0
@@ -121,12 +158,41 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 		return nil, false, keyErr
 	}
 	ob.aead, err = newWhatsAppGCM(key)
+	ob.idxKey = deriveWhatsAppIdentityIndexKey(key)
 	clear(key)
 	if err != nil {
 		db.Close()
 		return nil, false, err
 	}
+	if err := ob.loadIdentities(); err != nil {
+		db.Close()
+		return nil, false, err
+	}
 	return ob, discarded, nil
+}
+
+// EnsureNextAbove makes every sequence handed out from now on greater than
+// acked, the cloud's replay watermark for this link (`lastAckedSeq`, which a
+// re-link never resets). The cloud acks a batch at or below that watermark as
+// a replay WITHOUT writing it, so a sequence restarted below it would lose
+// every record up to it — which is exactly what an outbox lost with its
+// directory (an earlier build, a key that vanished with its rows) would do.
+func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
+	if acked < ob.next {
+		return nil
+	}
+	next := acked + 1
+	if _, err := ob.db.Exec(`INSERT INTO meta (k, v) VALUES ('next', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+		strconv.FormatInt(next, 10)); err != nil {
+		return err
+	}
+	ob.next = next
+	return nil
 }
 
 func (ob *whatsAppOutbox) loadCounters() error {
@@ -171,6 +237,9 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -207,8 +276,29 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		strconv.FormatInt(seq, 10)); err != nil {
 		return err
 	}
+	// Staged identities commit with the records that use them
+	// (stageIdentities). Inside a savepoint: if the identity table refuses,
+	// only that part rolls back and stays staged for the next Append - the
+	// records themselves must never be lost to it.
+	wroteIdentities := false
+	if len(ob.pendingIdentities) > 0 {
+		if _, err := tx.Exec(`SAVEPOINT identities`); err == nil {
+			if ob.writePendingIdentitiesLocked(tx) == nil {
+				_, err = tx.Exec(`RELEASE identities`)
+				wroteIdentities = err == nil
+			}
+			if !wroteIdentities {
+				if _, err := tx.Exec(`ROLLBACK TO identities`); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if wroteIdentities {
+		clear(ob.pendingIdentities)
 	}
 	ob.next = seq
 	ob.count += int64(len(records))
@@ -230,6 +320,9 @@ func (ob *whatsAppOutbox) NextUpTo(maxRecords int) (*whatsAppOutboxBatch, error)
 	}
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return nil, errWhatsAppOutboxClosed
+	}
 	rows, err := ob.db.Query(`SELECT seq, nonce, payload FROM outbox ORDER BY seq LIMIT ?`, maxRecords)
 	if err != nil {
 		return nil, err
@@ -264,6 +357,9 @@ func (ob *whatsAppOutbox) NextUpTo(maxRecords int) (*whatsAppOutboxBatch, error)
 func (ob *whatsAppOutbox) Ack(seq int64) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.closed {
+		return errWhatsAppOutboxClosed
+	}
 	if _, err := ob.db.Exec(`DELETE FROM outbox WHERE seq <= ?`, seq); err != nil {
 		return err
 	}
@@ -289,9 +385,31 @@ func (ob *whatsAppOutbox) HasRoomForHistory() bool {
 	return ob.count < whatsAppOutboxMaxRecords && ob.bytes < whatsAppOutboxMaxBytes
 }
 
+// Close waits for a write in flight (every write holds mu for its whole
+// transaction) and refuses later ones. A re-link opens the same file under a
+// new handle right after the old session's stores close: an Append still
+// committing on the old handle would otherwise land after the new handle read
+// `next`, and the two would hand out the same sequences.
 func (ob *whatsAppOutbox) Close() error {
 	if ob == nil || ob.db == nil {
 		return nil
+	}
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return nil
+	}
+	ob.closed = true
+	// Best effort: identities staged since the last Append (a history chunk's
+	// learned aliases, say) must not die with this handle.
+	if len(ob.pendingIdentities) > 0 {
+		if tx, err := ob.db.Begin(); err == nil {
+			if ob.writePendingIdentitiesLocked(tx) == nil && tx.Commit() == nil {
+				clear(ob.pendingIdentities)
+			} else {
+				_ = tx.Rollback()
+			}
+		}
 	}
 	return ob.db.Close()
 }

@@ -67,13 +67,14 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			if caps.WhatsApp == nil || !caps.WhatsApp.Supported {
 				t.Fatalf("caps = %+v, want the WhatsApp capability reported", *caps)
 			}
-			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage})
+			waRaw, _ := json.Marshal(&whatsAppCapability{Supported: true, SecureStorage: caps.WhatsApp.SecureStorage, Protocol: 2})
 			raw, _ := json.Marshal(caps)
 			// The literal IS the assertion: this pins the exact wire shape, so
 			// adding a capability has to be a deliberate edit here rather than
 			// something that rides along silently. `signedExecutionId` joined it
 			// with the signed-executionId device half, `whatsapp` with the
-			// WhatsApp bridge.
+			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
+			// the re-link carry-over.
 			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}

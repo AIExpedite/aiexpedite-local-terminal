@@ -14,9 +14,11 @@
 //
 // Identity. The cloud hashes (linkId, chatJid, senderJid, waMessageId) into
 // the message document id, so the same message must normalize to the same
-// JIDs whether it arrives through history sync or live. WhatsApp addresses a
-// person either by phone number or by LID; canonicalWhatsAppUser prefers the
-// phone-number form whenever whatsmeow knows it, and drops the device part.
+// JIDs whether it arrives through history sync or live, today or after a
+// re-link. Every person (a direct chat, a sender, an operation's target)
+// therefore goes through the link's identity resolver
+// (whatsapp_identity.go), which hands back the identity first written for
+// them; groups pass through unchanged.
 package main
 
 import (
@@ -100,6 +102,16 @@ type whatsAppRecord struct {
 	Reaction *string `json:"reaction,omitempty"`
 }
 
+// whatsAppIdentity is the link's identity resolver (whatsapp_identity.go).
+type whatsAppIdentity interface {
+	// Canonical is the identity the person addressed by primary (with its
+	// alternate address alt, empty when the event carries none) is written
+	// under. Anything that is not a person comes back as it is.
+	Canonical(primary, alt types.JID) types.JID
+	// Learn records that pn and lid are one person.
+	Learn(pn, lid types.JID)
+}
+
 // whatsAppNormalizeContext is what normalization needs beyond the event.
 type whatsAppNormalizeContext struct {
 	// OwnJID is the linked account (non-AD), to resolve "my message" targets.
@@ -107,34 +119,28 @@ type whatsAppNormalizeContext struct {
 	// ReconnectedAt marks live messages older than the last reconnect as
 	// catch-up (queued by WhatsApp while this companion was offline).
 	ReconnectedAt time.Time
-	// PNForLID maps a LID to its phone-number JID from the session store
-	// (empty when unknown). Used where the event carries no alternate
-	// address — operation targets, history conversation ids — so they hash
-	// to the same identity as the messages they belong to. Nil: no lookup.
-	PNForLID func(lid types.JID) types.JID
+	// Identity resolves every person. Nil (pure mapping tests only): the
+	// event's own addresses decide, phone number first.
+	Identity whatsAppIdentity
 }
 
-// resolveLID returns the phone-number form of a LID when the store knows it,
-// else the JID unchanged (device part dropped).
-func (nc whatsAppNormalizeContext) resolveLID(j types.JID) types.JID {
-	j = j.ToNonAD()
-	if j.Server != types.HiddenUserServer || nc.PNForLID == nil {
-		return j
-	}
-	if pn := nc.PNForLID(j); pn.Server == types.DefaultUserServer {
-		return pn.ToNonAD()
-	}
-	return j
-}
-
-// canonicalUser is canonicalWhatsAppUser with the store lookup as the
-// fallback when the event carries no phone-number alternate.
+// canonicalUser is the identity a person is written under.
 func (nc whatsAppNormalizeContext) canonicalUser(primary, alt types.JID) types.JID {
-	return nc.resolveLID(canonicalWhatsAppUser(primary, alt))
+	if nc.Identity != nil {
+		return nc.Identity.Canonical(primary, alt)
+	}
+	return canonicalWhatsAppUser(primary, alt)
 }
 
-// canonicalWhatsAppUser drops the device part and prefers the phone-number
-// address over a LID when the alternative is known.
+// learn passes a history chunk's mapping to the resolver.
+func (nc whatsAppNormalizeContext) learn(pn, lid types.JID) {
+	if nc.Identity != nil {
+		nc.Identity.Learn(pn, lid)
+	}
+}
+
+// canonicalWhatsAppUser is the resolver-less fallback: device part dropped,
+// the phone-number address preferred over a LID when the event carries both.
 func canonicalWhatsAppUser(primary, alt types.JID) types.JID {
 	j := primary.ToNonAD()
 	if j.Server == types.HiddenUserServer && !alt.IsEmpty() && alt.Server == types.DefaultUserServer {
@@ -143,20 +149,18 @@ func canonicalWhatsAppUser(primary, alt types.JID) types.JID {
 	return j
 }
 
-// canonicalWhatsAppChat is the chat's stable address: groups as they are, a
-// one-to-one chat by the peer's phone number when whatsmeow knows it.
-func canonicalWhatsAppChat(src types.MessageSource) types.JID {
-	chat := src.Chat.ToNonAD()
-	if src.IsGroup || chat.Server != types.HiddenUserServer {
-		return chat
+// whatsAppChatAddress is how an event addresses its chat: the chat JID and,
+// for a one-to-one chat, the peer's alternate address when the event carries
+// it (SenderAlt for the peer's message, RecipientAlt for mine).
+func whatsAppChatAddress(src types.MessageSource) (chat, alt types.JID) {
+	chat = src.Chat.ToNonAD()
+	if src.IsGroup || chat.Server == types.GroupServer {
+		return chat, types.EmptyJID
 	}
-	if !src.IsFromMe && src.SenderAlt.Server == types.DefaultUserServer {
-		return src.SenderAlt.ToNonAD()
+	if src.IsFromMe {
+		return chat, src.RecipientAlt
 	}
-	if src.IsFromMe && src.RecipientAlt.Server == types.DefaultUserServer {
-		return src.RecipientAlt.ToNonAD()
-	}
-	return chat
+	return chat, src.SenderAlt
 }
 
 func whatsAppChatType(chat types.JID) string {
@@ -196,11 +200,11 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 	if evt == nil {
 		return nil
 	}
-	chat := canonicalWhatsAppChat(evt.Info.MessageSource)
-	if chat.IsEmpty() || whatsAppSkippableChat(chat) {
+	rawChat, chatAlt := whatsAppChatAddress(evt.Info.MessageSource)
+	if rawChat.IsEmpty() || whatsAppSkippableChat(rawChat) {
 		return nil
 	}
-	chat = nc.resolveLID(chat)
+	chat := nc.canonicalUser(rawChat, chatAlt)
 	sender := nc.canonicalUser(evt.Info.Sender, evt.Info.SenderAlt)
 	base := whatsAppRecord{
 		Kind:        waRecordMessage,
@@ -291,7 +295,7 @@ func whatsAppReactionTargetSender(participant string, keyFromMe bool, info types
 		return chat // I reacted to the peer's message in a 1:1 chat
 	}
 	if !nc.OwnJID.IsEmpty() {
-		return nc.OwnJID.ToNonAD() // the peer reacted to my message
+		return nc.canonicalUser(nc.OwnJID, types.EmptyJID) // the peer reacted to my message
 	}
 	return chat
 }
@@ -391,17 +395,31 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 	if data == nil {
 		return nil, 0
 	}
+	// The chunk's own mappings are learned before anything in it is resolved:
+	// whatsmeow stores them on a goroutine of its own, which this chunk's
+	// dispatch races, and history messages carry no alternate address.
+	for _, m := range data.GetPhoneNumberToLidMappings() {
+		pn, errPN := types.ParseJID(m.GetPnJID())
+		lid, errLID := types.ParseJID(m.GetLidJID())
+		if errPN == nil && errLID == nil {
+			nc.learn(pn, lid)
+		}
+	}
+	for _, conv := range data.GetConversations() {
+		if pn, lid := whatsAppConversationPair(conv); !pn.IsEmpty() && !lid.IsEmpty() {
+			nc.learn(pn, lid)
+		}
+	}
 	for _, conv := range data.GetConversations() {
 		chat, err := types.ParseJID(conv.GetID())
 		if err != nil || whatsAppSkippableChat(chat) {
 			skipped++
 			continue
 		}
-		// A direct chat keyed by LID is announced under the same phone-number
-		// identity its messages normalize to, or the two would land in
-		// different conversations.
+		// A direct chat is announced under the same identity its messages
+		// normalize to, or the two would land in different conversations.
 		rawChat := chat.ToNonAD()
-		chat = nc.resolveLID(chat)
+		chat = nc.canonicalUser(rawChat, types.EmptyJID)
 		name := conv.GetName()
 		if name == "" {
 			name = conv.GetDisplayName()
@@ -443,8 +461,42 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 	return records, skipped
 }
 
-// whatsAppConversationRecord announces a chat seen live for the first time.
-func whatsAppConversationRecord(src types.MessageSource, name string) whatsAppRecord {
-	chat := canonicalWhatsAppChat(src)
-	return whatsAppRecord{Kind: waRecordConversation, ChatJid: chat.String(), ChatType: whatsAppChatType(chat), Name: strings.TrimSpace(name)}
+// whatsAppConversationPair is the (phone number, LID) pair a history
+// conversation names, empty where it names none. The conversation's own id
+// is one of the two forms, and usually only the OTHER form's field is set
+// (a LID-keyed chat carries pnJID, a phone-keyed one lidJID), so the id
+// stands in for whichever field is empty.
+func whatsAppConversationPair(conv *waHistorySync.Conversation) (pn, lid types.JID) {
+	parse := func(s string) types.JID {
+		if s == "" {
+			return types.EmptyJID
+		}
+		j, err := types.ParseJID(s)
+		if err != nil {
+			return types.EmptyJID
+		}
+		return j.ToNonAD()
+	}
+	pn, lid = parse(conv.GetPnJID()), parse(conv.GetLidJID())
+	switch id := parse(conv.GetID()); id.Server {
+	case types.HiddenUserServer:
+		if lid.IsEmpty() {
+			lid = id
+		}
+	case types.DefaultUserServer, types.LegacyUserServer:
+		if pn.IsEmpty() {
+			pn = id
+		}
+	}
+	return pn, lid
+}
+
+// whatsAppConversationRecord announces a chat seen live for the first time,
+// under the chat identity its first message was normalized to.
+func whatsAppConversationRecord(chatJid string, isGroup bool, name string) whatsAppRecord {
+	chatType := waChatDirect
+	if isGroup {
+		chatType = waChatGroup
+	}
+	return whatsAppRecord{Kind: waRecordConversation, ChatJid: chatJid, ChatType: chatType, Name: strings.TrimSpace(name)}
 }
