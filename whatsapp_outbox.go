@@ -11,9 +11,11 @@
 //
 // Rows are AES-256-GCM sealed under the link's key from the OS credential store
 // (whatsapp_keystore.go); the AAD binds each row to its link and sequence, so a
-// row copied between links or reordered fails to open. The database file
-// therefore holds only ciphertext — message text never sits on disk in the
-// clear outside whatsmeow's own store.
+// row copied between links or reordered fails to open. The same file holds the
+// link's identity table (whatsapp_identity.go), indexed by HMAC and sealed
+// under the same key. The database file therefore holds only ciphertext —
+// message text and phone numbers never sit on disk in the clear outside
+// whatsmeow's own store.
 //
 // Caps (WHATSAPP_INGEST_LIMITS OUTBOX_MAX_RECORDS / OUTBOX_MAX_BYTES): past
 // them a HISTORY append is refused with errWhatsAppOutboxFull — the supervisor
@@ -56,7 +58,9 @@ var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
 // cap read as this one.
 var errWhatsAppOutboxChunkTooLarge = fmt.Errorf("%w: the chunk alone passes the caps", errWhatsAppOutboxFull)
 
-// whatsAppOutbox is one link's queue.
+// whatsAppOutbox is one link's queue, and its identity table
+// (whatsapp_identity.go). Both belong to the LINK, not to a generation: a
+// re-link keeps them (whatsapp_supervisor.go, linkStart).
 type whatsAppOutbox struct {
 	mu     sync.Mutex
 	db     *sql.DB
@@ -66,6 +70,10 @@ type whatsAppOutbox struct {
 	count int64
 	bytes int64
 	next  int64
+	// idxKey indexes the identity table; identities caches it (index hex →
+	// identity JID).
+	idxKey     []byte
+	identities map[string]string
 }
 
 // whatsAppOutboxBatch is a contiguous range ready to upload.
@@ -75,10 +83,11 @@ type whatsAppOutboxBatch struct {
 	Records []json.RawMessage
 }
 
-// openWhatsAppOutbox opens (creating) dir/outbox.db with the link's key.
-// create=false refuses to mint a key: an outbox whose key is gone cannot be
-// read, so its rows are discarded and a fresh key is minted — reported by
-// discarded=true so the caller can log it.
+// openWhatsAppOutbox opens (creating) dir/outbox.db with the link's key. An
+// outbox or identity table whose key is gone cannot be read, so its rows are
+// discarded and a fresh key is minted — reported by discarded=true so the
+// caller can log it. The sequence (`next`) survives that discard: the cloud's
+// replay watermark does too.
 func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool, err error) {
 	path := filepath.Join(dir, whatsAppOutboxDBName)
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
@@ -99,18 +108,32 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 		db.Close()
 		return nil, false, err
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS identity (
+		k BLOB PRIMARY KEY,
+		nonce BLOB NOT NULL,
+		payload BLOB NOT NULL)`); err != nil {
+		db.Close()
+		return nil, false, err
+	}
 	ob = &whatsAppOutbox{db: db, linkID: linkID}
 	if err := ob.loadCounters(); err != nil {
 		db.Close()
 		return nil, false, err
 	}
+	identityRows, err := countWhatsAppIdentityRows(db)
+	if err != nil {
+		db.Close()
+		return nil, false, err
+	}
 
-	key, keyErr := loadOrCreateWhatsAppOutboxKey(linkID, ob.count == 0)
+	key, keyErr := loadOrCreateWhatsAppOutboxKey(linkID, ob.count == 0 && identityRows == 0)
 	if errors.Is(keyErr, errWhatsAppKeyNotFound) {
 		// Rows exist but their key is gone: unreadable by construction.
-		if _, err := db.Exec(`DELETE FROM outbox`); err != nil {
-			db.Close()
-			return nil, false, err
+		for _, stmt := range []string{`DELETE FROM outbox`, `DELETE FROM identity`} {
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, false, err
+			}
 		}
 		discarded = true
 		ob.count, ob.bytes = 0, 0
@@ -121,12 +144,38 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 		return nil, false, keyErr
 	}
 	ob.aead, err = newWhatsAppGCM(key)
+	ob.idxKey = deriveWhatsAppIdentityIndexKey(key)
 	clear(key)
 	if err != nil {
 		db.Close()
 		return nil, false, err
 	}
+	if err := ob.loadIdentities(); err != nil {
+		db.Close()
+		return nil, false, err
+	}
 	return ob, discarded, nil
+}
+
+// EnsureNextAbove makes every sequence handed out from now on greater than
+// acked, the cloud's replay watermark for this link (`lastAckedSeq`, which a
+// re-link never resets). The cloud acks a batch at or below that watermark as
+// a replay WITHOUT writing it, so a sequence restarted below it would lose
+// every record up to it — which is exactly what an outbox lost with its
+// directory (an earlier build, a key that vanished with its rows) would do.
+func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if acked < ob.next {
+		return nil
+	}
+	next := acked + 1
+	if _, err := ob.db.Exec(`INSERT INTO meta (k, v) VALUES ('next', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+		strconv.FormatInt(next, 10)); err != nil {
+		return err
+	}
+	ob.next = next
+	return nil
 }
 
 func (ob *whatsAppOutbox) loadCounters() error {

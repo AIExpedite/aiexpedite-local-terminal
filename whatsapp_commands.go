@@ -1,6 +1,6 @@
 // whatsapp_commands.go — the four signed WhatsApp demand commands.
 //
-//	__whatsapp_link_start__   {linkId, generation, workspaceID, method, browserPub, phoneNumber?}
+//	__whatsapp_link_start__   {linkId, generation, workspaceID, method, browserPub, phoneNumber?, lastAckedSeq?}
 //	__whatsapp_link_cancel__  {linkId, generation}
 //	__whatsapp_unlink__       {linkId, generation, workspaceID}
 //	__whatsapp_resync_state__ {linkId, generation}

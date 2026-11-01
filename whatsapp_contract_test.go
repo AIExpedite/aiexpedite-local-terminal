@@ -72,6 +72,13 @@ func TestWhatsAppContractPins(t *testing.T) {
 	if whatsAppBatchMaxRecords != 200 || whatsAppBatchMaxBodyBytes != 512*1024 {
 		t.Error("batch bounds drifted from WHATSAPP_INGEST_LIMITS")
 	}
+	// terminal-service's WHATSAPP_MIN_AGENT_PROTOCOL refuses to pair below
+	// this; raising it there before a release reports it locks every
+	// computer out of linking.
+	capability, _ := json.Marshal(whatsAppCapability{Supported: true, SecureStorage: true, Protocol: whatsAppAgentProtocol})
+	if whatsAppAgentProtocol != 2 || string(capability) != `{"supported":true,"secureStorage":true,"protocol":2}` {
+		t.Errorf("capabilities.whatsapp drifted: %s", capability)
+	}
 }
 
 // The sync signature canonical, asserted against the vectors terminal-service
@@ -120,8 +127,13 @@ func TestWhatsAppCommandsAreOperationalDemand(t *testing.T) {
 
 func TestParseWhatsAppCommandParams(t *testing.T) {
 	ok := commandMsg{Args: []string{`{"linkId":"lnk_1","generation":2,"method":"qr","browserPub":"x"}`}}
-	if p, err := parseWhatsAppCommandParams(ok); err != nil || p.LinkID != "lnk_1" || p.Generation != 2 {
+	if p, err := parseWhatsAppCommandParams(ok); err != nil || p.LinkID != "lnk_1" || p.Generation != 2 || p.LastAckedSeq != 0 {
 		t.Fatalf("parse: %+v %v", p, err)
+	}
+	// whatsapp-service sends the link's replay watermark with a link start.
+	withSeq := commandMsg{Args: []string{`{"linkId":"lnk_1","generation":3,"method":"qr","browserPub":"x","lastAckedSeq":4812}`}}
+	if p, err := parseWhatsAppCommandParams(withSeq); err != nil || p.LastAckedSeq != 4812 {
+		t.Fatalf("parse lastAckedSeq: %+v %v", p, err)
 	}
 	for _, bad := range [][]string{nil, {"not json"}, {`{"linkId":"../x","generation":1}`}, {`{"linkId":"lnk","generation":0}`}, {"{}", "{}"}} {
 		if _, err := parseWhatsAppCommandParams(commandMsg{Args: bad}); err == nil {

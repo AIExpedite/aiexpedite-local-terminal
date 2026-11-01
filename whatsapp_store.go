@@ -3,7 +3,13 @@
 //
 //	<ConfigDir>/whatsapp/links.json           which links are loaded (no secrets)
 //	<ConfigDir>/whatsapp/<linkId>/session.db  whatsmeow sqlstore (Signal keys)
-//	<ConfigDir>/whatsapp/<linkId>/outbox.db   not-yet-uploaded records, AES-GCM
+//	<ConfigDir>/whatsapp/<linkId>/outbox.db   not-yet-uploaded records and the
+//	                                          link's identity table, AES-GCM
+//
+// session.db belongs to one generation (one pairing) and is wiped when that
+// session ends (wipeWhatsAppSessionFiles); outbox.db and its key belong to
+// the link and are wiped only when the link is over on this computer
+// (wipeWhatsAppLinkDir, whatsapp_supervisor.go "dormant").
 //
 // Every link directory is created owner-only (0700; on Windows a protected
 // DACL granting only the current user — whatsapp_acl_windows.go), so the
@@ -151,6 +157,57 @@ func wipeWhatsAppLinkDir(linkID string) error {
 	}
 }
 
+// whatsAppSessionFileNames are whatsmeow's session store and its SQLite
+// side files: everything in a link directory that belongs to one session.
+var whatsAppSessionFileNames = []string{
+	whatsAppSessionDBName,
+	whatsAppSessionDBName + "-wal",
+	whatsAppSessionDBName + "-shm",
+	whatsAppSessionDBName + "-journal",
+}
+
+// wipeWhatsAppSessionFiles deletes a link's session store and nothing else:
+// the outbox, its identity table and its key stay for the next generation.
+// Same link discipline as wipeWhatsAppLinkDir: a root or link directory that
+// is itself a link is refused, and an entry planted where a session file
+// should be is unlinked, never followed. An absent directory is success.
+func wipeWhatsAppSessionFiles(linkID string) error {
+	dir, err := whatsAppLinkDir(linkID)
+	if err != nil {
+		return err
+	}
+	if _, exists, err := checkWhatsAppRootPlain(); err != nil || !exists {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if isWorktreeLink(info, dir) || !info.IsDir() {
+		return fmt.Errorf("WhatsApp link directory is not a plain directory")
+	}
+	var errs []error
+	for _, name := range whatsAppSessionFileNames {
+		path := filepath.Join(dir, name)
+		// A just-closed SQLite handle can keep the file locked for a moment
+		// on Windows (wipeWhatsAppLinkDir).
+		for attempt := 0; ; attempt++ {
+			_, err = linkSafeRemoveAll(path)
+			if err == nil || attempt == 4 {
+				break
+			}
+			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // listWhatsAppLinkDirs recovers the links held on this computer from their
 // session directories, for when links.json cannot be read. Only plain
 // directories named with a valid link id count; an absent root is no links.
@@ -190,6 +247,11 @@ type whatsAppLocalLink struct {
 	// locked credential store, a held file). It is never resumed; the next
 	// start retries the cleanup until it succeeds.
 	PendingWipe bool `json:"pendingWipe,omitempty"`
+	// Dormant marks a link whose session ended but whose outbox, identity
+	// table and key are kept for a re-link (whatsapp_supervisor.go). It has
+	// no session store and is never connected; only a link start for it, or
+	// evidence the link is over here, changes it.
+	Dormant bool `json:"dormant,omitempty"`
 }
 
 var whatsAppLinksFileMu sync.Mutex
