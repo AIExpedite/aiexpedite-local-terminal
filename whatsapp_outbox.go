@@ -77,6 +77,9 @@ type whatsAppOutbox struct {
 	// identity JID).
 	idxKey     []byte
 	identities map[string]string
+	// pendingIdentities are identities whose table write has not committed
+	// yet (index hex → identity); see recordIdentities.
+	pendingIdentities map[string]string
 	// closed: Close ran (under mu, so it waited for any write in flight).
 	closed bool
 }
@@ -273,8 +276,29 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 		strconv.FormatInt(seq, 10)); err != nil {
 		return err
 	}
+	// Identities whose own write failed commit with the first records that
+	// may use them (recordIdentities). Inside a savepoint: if the identity
+	// table still refuses, only that part rolls back and stays pending - the
+	// records themselves must never be lost to it.
+	wroteIdentities := false
+	if len(ob.pendingIdentities) > 0 {
+		if _, err := tx.Exec(`SAVEPOINT identities`); err == nil {
+			if ob.writePendingIdentitiesLocked(tx) == nil {
+				_, err = tx.Exec(`RELEASE identities`)
+				wroteIdentities = err == nil
+			}
+			if !wroteIdentities {
+				if _, err := tx.Exec(`ROLLBACK TO identities`); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if wroteIdentities {
+		clear(ob.pendingIdentities)
 	}
 	ob.next = seq
 	ob.count += int64(len(records))

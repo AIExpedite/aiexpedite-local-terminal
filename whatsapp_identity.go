@@ -286,11 +286,22 @@ func (ob *whatsAppOutbox) lookupIdentity(jid string) (string, bool) {
 	return id, ok
 }
 
+// recordIdentities records jid → identity. The cache answers at once, so this
+// session keeps writing what it chose even while the disk refuses; an entry
+// whose write failed stays PENDING and is retried by the next identity write,
+// and written inside the next Append's transaction at the latest, so no record
+// is ever committed under an identity the table does not hold (a restart or a
+// re-link would otherwise re-choose it).
 func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
+	if ob.pendingIdentities == nil {
+		ob.pendingIdentities = map[string]string{}
+	}
 	for jid, id := range entries {
-		ob.identities[hex.EncodeToString(ob.identityIndex(jid))] = id
+		k := hex.EncodeToString(ob.identityIndex(jid))
+		ob.identities[k] = id
+		ob.pendingIdentities[k] = id
 	}
 	if ob.closed {
 		return errWhatsAppOutboxClosed
@@ -300,8 +311,24 @@ func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for jid, id := range entries {
-		k := ob.identityIndex(jid)
+	if err := ob.writePendingIdentitiesLocked(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	clear(ob.pendingIdentities)
+	return nil
+}
+
+// writePendingIdentitiesLocked seals every pending identity into tx. The
+// caller holds mu, commits, and clears the pending set only on a commit.
+func (ob *whatsAppOutbox) writePendingIdentitiesLocked(tx *sql.Tx) error {
+	for kHex, id := range ob.pendingIdentities {
+		k, err := hex.DecodeString(kHex)
+		if err != nil {
+			return err
+		}
 		nonce := make([]byte, ob.aead.NonceSize())
 		if _, err := rand.Read(nonce); err != nil {
 			return err
@@ -312,7 +339,7 @@ func (ob *whatsAppOutbox) recordIdentities(entries map[string]string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // countIdentityRows is used at open, before the key is known.

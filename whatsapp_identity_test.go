@@ -379,3 +379,65 @@ func TestWhatsAppOutboxEnsureNextAbove(t *testing.T) {
 		t.Fatalf("the raised sequence did not persist: %d", ob.next)
 	}
 }
+
+// An identity whose table write failed is not treated as recorded: it stays
+// pending, and commits with the next identity write or, at the latest, with
+// the next records appended - so a restart or re-link never re-chooses an
+// identity records were already written under.
+func TestWhatsAppIdentityFailedWritesAreRetried(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, dir := openTestOutbox(t, "lnk_retry")
+	// The disk refuses identity writes for a while.
+	if _, err := ob.db.Exec(`ALTER TABLE identity RENAME TO identity_away`); err != nil {
+		t.Fatal(err)
+	}
+	ir := newWhatsAppIdentityResolver(ob, nil, nil)
+	if got := ir.Canonical(waPeerLID, types.EmptyJID); got != waPeerLID {
+		t.Fatal(got)
+	}
+	if len(ob.pendingIdentities) == 0 {
+		t.Fatal("a failed identity write was not kept pending")
+	}
+	if _, err := ob.db.Exec(`ALTER TABLE identity_away RENAME TO identity`); err != nil {
+		t.Fatal(err)
+	}
+	// The record that uses the identity carries it into the table.
+	if err := ob.Append([]whatsAppRecord{textRecord(waPeerLID.String(), "A", "x")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(ob.pendingIdentities) != 0 {
+		t.Fatal("pending identities survived a committed append")
+	}
+	ob.Close()
+
+	// After a restart / re-link, the phone form (now known) must not
+	// re-choose: the LID identity is in the table.
+	ob, _, err := openWhatsAppOutbox(dir, "lnk_retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ob.Close()
+	alt := &learningAlternates{}
+	alt.learn(waPeer, waPeerLID)
+	if got := newWhatsAppIdentityResolver(ob, alt.lookup, nil).Canonical(waPeer, types.EmptyJID); got != waPeerLID {
+		t.Fatalf("after a reopen the phone form chose %s, not the recorded %s", got, waPeerLID)
+	}
+}
+
+// A table that keeps refusing never costs the records: the append commits
+// them and the identities stay pending for a later write.
+func TestWhatsAppIdentityRefusalNeverCostsTheRecords(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, _ := openTestOutbox(t, "lnk_refuse")
+	defer ob.Close()
+	if _, err := ob.db.Exec(`ALTER TABLE identity RENAME TO identity_away`); err != nil {
+		t.Fatal(err)
+	}
+	newWhatsAppIdentityResolver(ob, nil, nil).Canonical(waPeerLID, types.EmptyJID)
+	if err := ob.Append([]whatsAppRecord{textRecord(waPeerLID.String(), "A", "x")}, false); err != nil {
+		t.Fatalf("an identity refusal cost the record: %v", err)
+	}
+	if ob.Depth() != 1 || len(ob.pendingIdentities) == 0 {
+		t.Fatalf("depth=%d pending=%d, want the record stored and the identity still pending", ob.Depth(), len(ob.pendingIdentities))
+	}
+}
