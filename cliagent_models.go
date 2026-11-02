@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -57,11 +58,13 @@ import (
 // `Pool` is the quota pool this model spends when the device can SAY so (Ship
 // B6): today that is a model the provider meters under its own window — the
 // usage snapshot carries a metric naming the model (Claude Code's weekly Fable
-// window, Codex's per-model pools), and the pool is that window's key. Absent
-// means the device does not know; the backend falls through to the catalog's
-// `cliAgents/<id>.modelPools` rule (Antigravity's Gemini / "Claude and GPT"
-// groups live there — its quota payload meters groups but never says which
-// model belongs to which, so the device does not guess).
+// window, Codex's per-model pools, an Antigravity group named for one model —
+// "Gemini 4 Argon", keyed `gemini-4-argon` like that family's id), and the pool
+// is that window's key. Absent means the device does not know; the backend
+// falls through to the catalog's `cliAgents/<id>.modelPools` rule
+// (Antigravity's Gemini / "Claude and GPT" family groups live there — its quota
+// payload never says which models a family group holds, so the device does not
+// guess).
 type cliAgentModelDetail struct {
 	ID            string   `json:"id"`
 	Label         string   `json:"label,omitempty"`
@@ -318,6 +321,13 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 			ids = append(ids, model.ID)
 		}
 		usage.Models = ids
+	}
+	if usage.Model == "" && strings.EqualFold(agentID, "antigravity") {
+		// `agy models` marks no default; the one agy runs is the /model
+		// choice it saved, resolved against the published families only.
+		if saved := antigravitySavedDefaultModel(home, details); saved != "" && bounded(saved, cliUsageMaxModelDetailIDLength) {
+			usage.Model = saved
+		}
 	}
 	// The receipt bounds `model` at 256 bytes like a detail id; a configured
 	// or reported default past that is left unset rather than copied into a
@@ -782,6 +792,67 @@ func parseAntigravityModelList(output string) (cliAgentModelDiscovery, bool) {
 		out.Models = append(out.Models, boundedModelDetail(detail))
 	}
 	return out, true
+}
+
+// antigravitySettingsMaxBytes bounds the read of agy's settings file for its
+// saved model (about 200 bytes in practice).
+const antigravitySettingsMaxBytes = 256 * 1024
+
+// antigravitySavedDefaultModel is the family a bare `agy` run spends: the
+// `model` its /model command saves in settings.json (a label such as "Gemini 4
+// Argon (Medium)", or a slug or family id — agy accepts all three), resolved to
+// one of the families this probe discovered. agy applies that choice on every
+// run without --model, so it, not the catalog's default, is what such a run
+// spends. Never guessed: a value that is not exactly a family id, a slug of
+// one, or the label of exactly one family reports nothing, because a pinned
+// model agy cannot resolve fails a print-mode run outright.
+//
+// Only the `model` key is decoded. The legacy ~/.agy/config.json is read only
+// when the modern settings file does not exist, the tree Parse falls back to.
+func antigravitySavedDefaultModel(home string, families []cliAgentModelDetail) string {
+	path := expandHome(home, filepath.Join(".gemini", "antigravity-cli", "settings.json"))
+	if path == "" {
+		return ""
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		path = expandHome(home, filepath.Join(".agy", "config.json"))
+	}
+	var settings struct {
+		Model string `json:"model"`
+	}
+	if !readJSONFileWithin(path, antigravitySettingsMaxBytes, &settings) {
+		return ""
+	}
+	saved := strings.TrimSpace(settings.Model)
+	if saved == "" {
+		return ""
+	}
+	family, _ := splitEffortSuffix(strings.ToLower(saved))
+	for _, candidate := range []string{saved, family} {
+		for _, detail := range families {
+			if strings.EqualFold(detail.ID, candidate) {
+				return detail.ID
+			}
+		}
+	}
+	label := antigravityComparableLabel(antigravityLabelSuffix.ReplaceAllString(saved, ""))
+	match := ""
+	for _, detail := range families {
+		if label == "" || antigravityComparableLabel(detail.Label) != label {
+			continue
+		}
+		if match != "" {
+			return ""
+		}
+		match = detail.ID
+	}
+	return match
+}
+
+// antigravityComparableLabel is a display label compared without case or
+// spacing differences.
+func antigravityComparableLabel(label string) string {
+	return strings.ToLower(strings.Join(strings.Fields(label), " "))
 }
 
 // splitEffortSuffix returns (family, effort) for `<family>-<effort>` when the

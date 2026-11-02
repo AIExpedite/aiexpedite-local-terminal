@@ -301,6 +301,8 @@ func TestAntigravityQuotaMetrics_RolledOverWindowIsUnobservable(t *testing.T) {
 	}
 }
 
+// A word is still skipped; a window spelled as a length is not a guess and
+// gets a kind of its own (TestAntigravityQuotaMetrics_OpenLengthIsPlottedUnderItsOwnKind).
 func TestAntigravityQuotaMetrics_SkipsUnknownWindow(t *testing.T) {
 	now := time.Now()
 	snap := antigravityQuotaSnapshot{
@@ -591,6 +593,11 @@ func TestFetchAntigravityQuota_KeepsValidBucketsBesideMalformedOnes(t *testing.T
 	if len(snap.Buckets) != 1 || snap.Buckets[0].Window != "5h" {
 		t.Errorf("buckets=%+v, want only the 5h row", snap.Buckets)
 	}
+	// The omitted weekly is no reading, but its window and reset are kept.
+	if len(snap.UnobservedBuckets) != 1 || snap.UnobservedBuckets[0].Window != "weekly" ||
+		snap.UnobservedBuckets[0].ResetTime != "2126-08-14T00:00:00Z" {
+		t.Errorf("unobserved=%+v, want the weekly bucket with its reset", snap.UnobservedBuckets)
+	}
 }
 
 // Concurrent savers must never expose a partial cache: a shared temp name lets
@@ -863,6 +870,8 @@ func TestSanitizeAntigravityQuotaSnapshot_DropsUnplottableRowsAndClampsStrings(t
 		Buckets: []antigravityQuotaBucket{
 			{Group: "Gemini Models", Window: "fortnightly", RemainingFraction: 0.5},
 			{Group: strings.Repeat("G", 500), Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+			// A length is a window of its own, never a guess, so it is kept.
+			{Group: "Gemini Models", Window: "14d", RemainingFraction: 0.5, ResetTime: "2126-08-14T00:00:00Z"},
 		},
 	}
 	for i := 0; i < cliUsageMaxMetricsPerProvider+5; i++ {
@@ -886,6 +895,9 @@ func TestSanitizeAntigravityQuotaSnapshot_DropsUnplottableRowsAndClampsStrings(t
 	}
 	if len(out.Buckets) != cliUsageMaxMetricsPerProvider {
 		t.Fatalf("buckets=%d, want the cap %d", len(out.Buckets), cliUsageMaxMetricsPerProvider)
+	}
+	if out.Buckets[1].Window != "14d" {
+		t.Errorf("buckets[1]=%+v, want the 14-day window persisted", out.Buckets[1])
 	}
 	for _, bucket := range out.Buckets {
 		if bucket.Window == "fortnightly" {
@@ -1165,14 +1177,15 @@ func TestAntigravitySnapshotFromGroups_OmittedIsUnknownWithoutEvidence(t *testin
 	if ok {
 		t.Fatal("an all-omitted reply with no evidence counted as a reading")
 	}
-	if shape.FractionOmitted != 2 || shape.OmittedCharted != 0 || shape.Buckets != 2 {
-		t.Errorf("shape=%+v, want two omitted, none charted", shape)
+	if shape.FractionOmitted != 2 || shape.OmittedCharted != 0 || shape.OmittedUnobserved != 2 || shape.Buckets != 2 {
+		t.Errorf("shape=%+v, want two omitted, none charted, both unobserved", shape)
 	}
 }
 
 // Evidence names a bucket when its reset is within two minutes of the bucket's
 // and it was recorded for the same account; 3 min off, or another account's
-// fingerprint (the caller filters by fingerprint), charts nothing.
+// fingerprint (the caller filters by fingerprint), charts nothing. The bucket
+// no evidence names rides along as an Unknown row with its reset.
 func TestAntigravitySnapshotFromGroups_EvidenceChartsTheMatchingBucket(t *testing.T) {
 	reset, _ := time.Parse(time.RFC3339, "2126-08-12T04:37:41Z")
 	near := []antigravityExhaustionEvent{{resetAtMs: reset.Add(90 * time.Second).UnixMilli(), fingerprint: "fp-a"}}
@@ -1180,12 +1193,14 @@ func TestAntigravitySnapshotFromGroups_EvidenceChartsTheMatchingBucket(t *testin
 	if !ok || len(snap.Buckets) != 1 || snap.Buckets[0].BucketID != "gemini-5h" || snap.Buckets[0].RemainingFraction != 0 {
 		t.Fatalf("snap=%+v ok=%v, want only the 5h bucket charted fully consumed", snap, ok)
 	}
-	if shape.OmittedCharted != 1 {
-		t.Errorf("omittedCharted=%d, want 1", shape.OmittedCharted)
+	if shape.OmittedCharted != 1 || len(snap.UnobservedBuckets) != 1 || snap.UnobservedBuckets[0].BucketID != "gemini-weekly" {
+		t.Errorf("omittedCharted=%d unobserved=%+v, want the 5h charted and the weekly unobserved", shape.OmittedCharted, snap.UnobservedBuckets)
 	}
 	metrics := antigravityQuotaMetrics(snap, time.Now())
-	if len(metrics) != 1 || metrics[0].Consumed == nil || *metrics[0].Consumed != 100 {
-		t.Errorf("metrics=%+v, want the bucket at 100%% consumed", metrics)
+	if len(metrics) != 2 || metrics[0].Consumed == nil || *metrics[0].Consumed != 100 {
+		t.Errorf("metrics=%+v, want the 5h bucket at 100%% consumed", metrics)
+	} else if !metrics[1].Unknown || metrics[1].Consumed != nil || metrics[1].ResetAt != "2126-08-14T14:17:13Z" {
+		t.Errorf("weekly row = %+v, want Unknown with its reset, never charted", metrics[1])
 	}
 
 	far := []antigravityExhaustionEvent{{resetAtMs: reset.Add(3 * time.Minute).UnixMilli(), fingerprint: "fp-a"}}

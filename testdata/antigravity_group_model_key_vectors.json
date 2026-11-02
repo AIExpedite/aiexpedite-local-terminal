@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "description": "Model key of a model-scoped quota group: runs of characters outside [A-Za-z0-9.] become one \"-\", trimmed of \"-\", lower-cased (ASCII only, after filtering), cut to 64 characters and trimmed of trailing \"-\"; empty when no ASCII letter or digit remains. shared-constants codingAgentGroupModelKey and aiexpedite-local-terminal antigravityGroupModelKey must both pass every vector; keep this file byte-identical in both repos.",
+  "vectors": [
+    {
+      "name": "Gemini 4 Argon",
+      "key": "gemini-4-argon"
+    },
+    {
+      "name": "Gemini 4 Carbon",
+      "key": "gemini-4-carbon"
+    },
+    {
+      "name": "Gemini 3.8 Flash",
+      "key": "gemini-3.8-flash"
+    },
+    {
+      "name": "Gemini 3.5 Pro",
+      "key": "gemini-3.5-pro"
+    },
+    {
+      "name": "GPT-OSS 120B",
+      "key": "gpt-oss-120b"
+    },
+    {
+      "name": "GPT-5.3-Codex-Spark",
+      "key": "gpt-5.3-codex-spark"
+    },
+    {
+      "name": "Claude Opus 4.6 (Thinking)",
+      "key": "claude-opus-4.6-thinking"
+    },
+    {
+      "name": "Claude Opus 5.5",
+      "key": "claude-opus-5.5"
+    },
+    {
+      "name": "  Gemini   4  Argon  ",
+      "key": "gemini-4-argon"
+    },
+    {
+      "name": "-Gemini-",
+      "key": "gemini"
+    },
+    {
+      "name": "Gemini_4/Argon",
+      "key": "gemini-4-argon"
+    },
+    {
+      "name": "Gemini\t4\nArgon",
+      "key": "gemini-4-argon"
+    },
+    {
+      "name": "日本語",
+      "key": ""
+    },
+    {
+      "name": "Gemini 日本 Argon",
+      "key": "gemini-argon"
+    },
+    {
+      "name": "İnstant Model",
+      "key": "nstant-model"
+    },
+    {
+      "name": "Kelvin K",
+      "key": "kelvin"
+    },
+    {
+      "name": "...",
+      "key": ""
+    },
+    {
+      "name": "",
+      "key": ""
+    },
+    {
+      "name": "v1.0",
+      "key": "v1.0"
+    },
+    {
+      "name": "Gemini 4 Argon — Weekly",
+      "key": "gemini-4-argon-weekly"
+    },
+    {
+      "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-",
+      "key": "a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a"
+    },
+    {
+      "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx y",
+      "key": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  ]
+}
