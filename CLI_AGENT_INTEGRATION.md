@@ -1786,8 +1786,9 @@ can.
   `GetUserStatus`, after the CSRF-gated quota check). An OMITTED fraction
   (`antigravityWireFraction` keeps omitted, null, valid and invalid apart) is
   charted as fully consumed only against an event with the same fingerprint
-  whose reset is within 2 min of the bucket's (otherwise it is an Unknown row,
-  see "Rows" below); null and invalid are skipped; a
+  whose reset is within 2 min of the bucket's (otherwise it is kept for
+  diagnosis and never published, see "Rows" below); null and invalid are
+  skipped; a
   failed identity lookup applies no evidence. Direct runs never contribute (a
   login switch between two direct runs could attribute one account's
   exhaustion to another).
@@ -1880,13 +1881,16 @@ can.
 - **One row per identity.** Rows sharing (kind, label, model), such as `weekly`
   and `7d` in one group, are published once, as the more constrained (a figure
   beats Unknown, less left wins): both receipt verifiers reject a whole refresh
-  over a duplicate. Past the 32-row cap, rows from `buckets` are kept before
-  unobserved ones.
+  over a duplicate. Past the 32-row cap, the first rows in display order are
+  kept.
 - **Unobserved buckets.** An omitted fraction that no evidence names, with a
   recognised window and a reset, is cached in `unobservedBuckets` (never in
-  `buckets`, which an older agent charts by fraction) and rendered as an
-  Unknown row with its reset and model. It never counts toward an observation:
-  Google omits a disabled bucket's fraction too. Shape counters
+  `buckets`, which an older agent charts by fraction) for diagnosis only. It is
+  never published as a row and never counts toward an observation. Google omits
+  a SPENT bucket's fraction (proto3 drops a zero), and also a disabled one's. An
+  Unknown row would read server-side as an open, fail-open pool: a fully spent
+  account would read Partial, and as the newest sample it would displace
+  another computer's evidence that the bucket is spent. Shape counters
   `windowsGeneric` and `omittedUnobserved` count both new cases.
 - **Saved default model.** `agy` runs its saved `/model` choice whenever no
   `--model` is passed. The agent reads only the `model` key of

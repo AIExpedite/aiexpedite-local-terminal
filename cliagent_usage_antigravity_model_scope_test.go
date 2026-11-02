@@ -184,8 +184,8 @@ func TestAntigravityQuotaMetrics_NeverEmitsADuplicateIdentity(t *testing.T) {
 		}
 		seen[identity] = true
 	}
-	if len(metrics) != 3 {
-		t.Fatalf("rows=%+v, want three identities", metrics)
+	if len(metrics) != 2 {
+		t.Fatalf("rows=%+v, want two identities", metrics)
 	}
 	if argon := helperMetricLabeled(t, metrics, "Gemini 4 Argon — Weekly quota"); argon.Unknown || argon.Remaining == nil || *argon.Remaining != 10 {
 		t.Errorf("Argon row = %+v, want the lower of the two figures (10)", argon)
@@ -193,8 +193,10 @@ func TestAntigravityQuotaMetrics_NeverEmitsADuplicateIdentity(t *testing.T) {
 	if session := helperMetricLabeled(t, metrics, "Gemini — 5-hour session window"); session.Unknown || session.Remaining == nil || *session.Remaining != 70 {
 		t.Errorf("session row = %+v, want the figure over the rolled-over row", session)
 	}
-	if weekly := helperMetricLabeled(t, metrics, "Gemini — Weekly quota"); !weekly.Unknown || weekly.ResetAt != "2026-11-09T00:00:00Z" {
-		t.Errorf("weekly row = %+v, want the unobserved bucket", weekly)
+	for _, metric := range metrics {
+		if metric.Label == "Gemini — Weekly quota" {
+			t.Errorf("an unobserved bucket was published: %+v", metric)
+		}
 	}
 	helperSignsAntigravityMetrics(t, metrics)
 }
@@ -222,8 +224,8 @@ func TestAntigravityQuotaMetrics_FreshAndReplayedRowsMatchForALongGroup(t *testi
 		}
 		live := antigravityQuotaMetrics(fresh, now)
 		replayed := antigravityQuotaMetrics(sanitizeAntigravityQuotaSnapshot(fresh), now)
-		if len(live) != 2 || !reflect.DeepEqual(live, replayed) {
-			t.Fatalf("%q: live=%+v\nreplayed=%+v, want the same two rows", tc.group, live, replayed)
+		if len(live) != 1 || !reflect.DeepEqual(live, replayed) {
+			t.Fatalf("%q: live=%+v\nreplayed=%+v, want the same one row", tc.group, live, replayed)
 		}
 		for _, metric := range live {
 			if len(metric.Label) > 256 || (metric.Model != "") != tc.wantModel || len(metric.Model) > cliUsageMaxModelPoolLength {
@@ -359,9 +361,8 @@ func TestAntigravityQuotaMetrics_OpenLengthIsPlottedUnderItsOwnKind(t *testing.T
 }
 
 // An omitted fraction beside a reading: the reply is an observation, and the
-// omitted bucket rides along as an Unknown row with its reset (and its model),
-// never charted. Without a reset, or under an unrecognised window, there is
-// nothing to show and it is dropped as before.
+// omitted bucket is kept in the snapshot for diagnosis, never published.
+// Without a reset, or under an unrecognised window, it is dropped as before.
 func TestAntigravitySnapshotFromGroups_OmittedBesideAReadingIsKeptUnobserved(t *testing.T) {
 	raw := `{"response":{"groups":[
 	  {"displayName":"Gemini Models","buckets":[
@@ -384,15 +385,8 @@ func TestAntigravitySnapshotFromGroups_OmittedBesideAReadingIsKeptUnobserved(t *
 	}
 
 	metrics := antigravityQuotaMetrics(snap, helperArgonObservedAt)
-	argon := helperMetricLabeled(t, metrics, "Gemini 4 Argon — Weekly quota")
-	if !argon.Unknown || argon.Remaining != nil || argon.Consumed != nil || argon.Total != nil ||
-		argon.ResetAt != "2026-11-03T08:06:36Z" || argon.Model != "gemini-4-argon" {
-		t.Errorf("Argon row = %+v, want Unknown with its reset and model", argon)
-	}
-	// Past its reset nothing is known about it at all.
-	after := antigravityQuotaMetrics(snap, time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC))
-	if rolled := helperMetricLabeled(t, after, "Gemini 4 Argon — Weekly quota"); !rolled.Unknown || rolled.ResetAt != "" {
-		t.Errorf("rolled-over Argon row = %+v, want Unknown with no reset", rolled)
+	if len(metrics) != 1 || metrics[0].Label != "Gemini — Weekly quota" {
+		t.Errorf("rows=%+v, want only the Gemini reading: the omitted Argon bucket is never a row", metrics)
 	}
 	helperSignsAntigravityMetrics(t, metrics)
 }
@@ -419,10 +413,9 @@ func TestSanitizeAntigravityQuotaSnapshot_UnobservedBucketsShareTheCap(t *testin
 	}
 }
 
-// Past the signed refresh's cap a reading is never pushed out by an Unknown
-// row: every figure is kept, then unobserved rows fill what is left, all in
-// display order.
-func TestAntigravityQuotaMetrics_CapKeepsReadingsBeforeUnobservedRows(t *testing.T) {
+// Unobserved buckets never take a row, so they can never push a reading out
+// of the signed refresh's cap.
+func TestAntigravityQuotaMetrics_UnobservedBucketsNeverTakeARow(t *testing.T) {
 	now := helperArgonObservedAt
 	snap := antigravityQuotaSnapshot{ObservedAt: now.Format(time.RFC3339)}
 	const groups = 20
@@ -432,20 +425,12 @@ func TestAntigravityQuotaMetrics_CapKeepsReadingsBeforeUnobservedRows(t *testing
 		snap.UnobservedBuckets = append(snap.UnobservedBuckets, antigravityUnobservedBucket{Group: group, Window: "weekly", ResetTime: "2026-11-09T00:00:00Z"})
 	}
 	metrics := antigravityQuotaMetrics(snap, now)
-	if len(metrics) != cliUsageMaxMetricsPerProvider {
-		t.Fatalf("rows=%d, want the cap %d", len(metrics), cliUsageMaxMetricsPerProvider)
-	}
-	unknown := cliUsageMaxMetricsPerProvider - groups
-	var labels []string
-	for i := 0; i < groups; i++ {
-		labels = append(labels, fmt.Sprintf("Group %02d — 5-hour session window", i))
-		if i < unknown {
-			labels = append(labels, fmt.Sprintf("Group %02d — Weekly quota", i))
-		}
+	if len(metrics) != groups {
+		t.Fatalf("rows=%d, want the %d readings only", len(metrics), groups)
 	}
 	for i, metric := range metrics {
-		if metric.Label != labels[i] || metric.Unknown != strings.HasSuffix(labels[i], "Weekly quota") {
-			t.Errorf("row %d = %q unknown=%v, want %q", i, metric.Label, metric.Unknown, labels[i])
+		if want := fmt.Sprintf("Group %02d — 5-hour session window", i); metric.Label != want || metric.Unknown {
+			t.Errorf("row %d = %q unknown=%v, want the reading %q", i, metric.Label, metric.Unknown, want)
 		}
 	}
 	helperSignsAntigravityMetrics(t, metrics)
@@ -488,8 +473,9 @@ func TestAntigravityQuotaCache_OlderAgentNeverChartsAnUnobservedBucket(t *testin
 	if !ok || len(replayed.UnobservedBuckets) != 1 {
 		t.Fatalf("replayed=%+v ok=%v, want the unobserved bucket kept", replayed, ok)
 	}
-	argon := helperMetricLabeled(t, antigravityQuotaMetrics(replayed, helperArgonObservedAt), "Gemini 4 Argon — Weekly quota")
-	if !argon.Unknown || argon.ResetAt != "2026-11-03T08:06:36Z" || argon.Model != "gemini-4-argon" {
-		t.Errorf("replayed Argon row = %+v, want Unknown with its reset and model", argon)
+	for _, metric := range antigravityQuotaMetrics(replayed, helperArgonObservedAt) {
+		if metric.Label == "Gemini 4 Argon — Weekly quota" {
+			t.Errorf("the replayed unobserved Argon bucket was published: %+v", metric)
+		}
 	}
 }

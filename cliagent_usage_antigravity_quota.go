@@ -147,10 +147,11 @@ type antigravityQuotaSnapshot struct {
 	Account            string                   `json:"account"`
 	Plan               string                   `json:"plan"`
 	Buckets            []antigravityQuotaBucket `json:"buckets"`
-	// UnobservedBuckets render as Unknown rows with their reset and never make
-	// a reply an observation. They are kept out of Buckets on purpose: an older
-	// agent charts every Buckets entry by its fraction, so after a rollback a
-	// bucket stored there would read 100% consumed, while it ignores this field.
+	// UnobservedBuckets are kept for diagnosis only: never published as rows
+	// (antigravityQuotaMetrics) and never an observation. They are kept out of
+	// Buckets on purpose: an older agent charts every Buckets entry by its
+	// fraction, so after a rollback a bucket stored there would read 100%
+	// consumed, while it ignores this field.
 	UnobservedBuckets []antigravityUnobservedBucket `json:"unobservedBuckets,omitempty"`
 	// StoredLoginRead marks a reading taken through Code Assist with the stored
 	// keyring login itself — the login `agy` runs as. It is the persisted half
@@ -668,8 +669,8 @@ func (s antigravityQuotaShape) String() string {
 // run of the same account hit RESOURCE_EXHAUSTED with a reset within
 // antigravityExhaustionMatch of the bucket's own reset. Only then is it
 // charted as fully consumed. Without evidence a bucket with a recognised
-// window and a reset is kept in UnobservedBuckets (an Unknown row with that
-// reset) and never counts as plottable: Google also omits the fraction of a
+// window and a reset is kept in UnobservedBuckets (for diagnosis, never
+// published) and never counts as plottable: Google also omits the fraction of a
 // DISABLED bucket, so an omitted one is no proof that it is spent. Null and
 // invalid fractions are always skipped.
 func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time, evidence []antigravityExhaustionEvent) (antigravityQuotaSnapshot, antigravityQuotaShape, bool) {
@@ -1263,8 +1264,13 @@ func antigravityGroupModelKey(name string) string {
 // antigravityQuotaMetrics renders the cached/fresh snapshot as capacity rows.
 // Buckets are ordered session-window first within each group, matching how the
 // Claude and Codex cards read. A model-scoped group's rows name its model
-// (antigravityGroupModelScope), and an unobserved bucket is an Unknown row with
-// its reset.
+// (antigravityGroupModelScope).
+//
+// An unobserved bucket (UnobservedBuckets: Google omitted its fraction and no
+// evidence names it) is never published. Google omits the fraction of a spent
+// bucket, so an Unknown row would read server-side as an open, fail-open pool:
+// it would make a fully spent account read Partial, and as the newest sample it
+// would displace another computer's evidence that the bucket is spent.
 //
 // The group is clamped exactly as the cache stores it, so a fresh reading and
 // its replay render the same labels and models. Rows sharing an identity
@@ -1273,25 +1279,23 @@ func antigravityGroupModelKey(name string) string {
 // verifiers reject a whole refresh over a duplicate identity.
 func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cliAgentUsageMetric {
 	type row struct {
-		metric     cliAgentUsageMetric
-		group      int
-		window     int
-		unobserved bool
+		metric cliAgentUsageMetric
+		group  int
+		window int
 	}
 	groupOrder := map[string]int{}
-	rows := make([]row, 0, len(snap.Buckets)+len(snap.UnobservedBuckets))
+	rows := make([]row, 0, len(snap.Buckets))
 	rowOf := map[string]int{}
 
-	// remainingFraction is nil for an unobserved bucket.
-	add := func(group, window, resetTime string, remainingFraction *float64) {
-		kind, windowLabel, ok := antigravityWindowKind(window)
+	for _, bucket := range snap.Buckets {
+		kind, windowLabel, ok := antigravityWindowKind(bucket.Window)
 		if !ok {
-			return
+			continue
 		}
 		// Trimmed after the cut too, which can end on a space: a replayed
 		// reading was already clamped by the cache and is clamped again here,
 		// and a live one must land on the same name.
-		group = strings.TrimSpace(clampAntigravityQuotaField(group, antigravityQuotaMaxBucketFieldBytes))
+		group := strings.TrimSpace(clampAntigravityQuotaField(bucket.Group, antigravityQuotaMaxBucketFieldBytes))
 		groupIdx, seen := groupOrder[group]
 		if !seen {
 			groupIdx = len(groupOrder)
@@ -1308,20 +1312,14 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 			ObservedAt: snap.ObservedAt,
 			Model:      antigravityGroupModelScope(group),
 		}
-		reset, resetErr := time.Parse(time.RFC3339, resetTime)
+		reset, resetErr := time.Parse(time.RFC3339, bucket.ResetTime)
 		switch {
 		case resetErr == nil && !now.Before(reset):
 			// The window rolled over after the observation — the pool has
 			// refilled by an unknown amount, so plot nothing.
 			metric.Unknown = true
-		case remainingFraction == nil:
-			// The window exists and resets then; how much is left is unknown.
-			metric.Unknown = true
-			if resetErr == nil {
-				metric.ResetAt = reset.UTC().Format(time.RFC3339)
-			}
 		default:
-			used := clampPercent((1 - *remainingFraction) * 100)
+			used := clampPercent((1 - bucket.RemainingFraction) * 100)
 			metric.Total = floatPtr(100)
 			metric.Consumed = floatPtr(used)
 			metric.Remaining = floatPtr(100 - used)
@@ -1332,38 +1330,26 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 		identity := metric.Kind + "\x00" + metric.Label + "\x00" + metric.Model
 		if at, dup := rowOf[identity]; dup {
 			if antigravityMoreConstrained(metric, rows[at].metric) {
-				rows[at].metric, rows[at].unobserved = metric, remainingFraction == nil
+				rows[at].metric = metric
 			}
-			return
+			continue
 		}
 		windowRank := 1
 		if kind == limitKindSession {
 			windowRank = 0
 		}
 		rowOf[identity] = len(rows)
-		rows = append(rows, row{metric: metric, group: groupIdx, window: windowRank, unobserved: remainingFraction == nil})
-	}
-	for _, bucket := range snap.Buckets {
-		fraction := bucket.RemainingFraction
-		add(bucket.Group, bucket.Window, bucket.ResetTime, &fraction)
-	}
-	for _, bucket := range snap.UnobservedBuckets {
-		add(bucket.Group, bucket.Window, bucket.ResetTime, nil)
+		rows = append(rows, row{metric: metric, group: groupIdx, window: windowRank})
 	}
 
-	displayOrder := func(i, j int) bool {
+	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].group != rows[j].group {
 			return rows[i].group < rows[j].group
 		}
 		return rows[i].window < rows[j].window
-	}
-	sort.SliceStable(rows, displayOrder)
+	})
 	if len(rows) > cliUsageMaxMetricsPerProvider {
-		// The cap keeps readings before unobserved rows, each in display
-		// order: an Unknown row never pushes a figure out of the refresh.
-		sort.SliceStable(rows, func(i, j int) bool { return !rows[i].unobserved && rows[j].unobserved })
 		rows = rows[:cliUsageMaxMetricsPerProvider]
-		sort.SliceStable(rows, displayOrder)
 	}
 	metrics := make([]cliAgentUsageMetric, 0, len(rows))
 	for _, r := range rows {

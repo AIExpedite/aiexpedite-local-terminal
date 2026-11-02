@@ -446,7 +446,7 @@ func helperUserinfoBob(string) (int, string) {
 
 // AllExhaustedReply: a MANAGED turn whose own log block holds account B's 429
 // makes B's all-omitted reply chartable (the 5h bucket at 100% consumed); the
-// weekly bucket no evidence names stays an Unknown row with its reset. The
+// weekly bucket no evidence names is kept for diagnosis, never published. The
 // same reply after a restart (evidence is in memory only) stays unknown, the
 // recorded limitation.
 func TestAntigravityStaleRegression_AllExhaustedReply(t *testing.T) {
@@ -468,10 +468,8 @@ func TestAntigravityStaleRegression_AllExhaustedReply(t *testing.T) {
 		t.Errorf("unobserved=%+v, want the weekly bucket kept without a figure", snap.UnobservedBuckets)
 	}
 	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
-	if len(usage.Metrics) != 2 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 100 {
-		t.Errorf("metrics=%+v, want the exhausted bucket numeric at 100%%", usage.Metrics)
-	} else if weekly := usage.Metrics[1]; !weekly.Unknown || weekly.Consumed != nil || weekly.ResetAt == "" {
-		t.Errorf("weekly row = %+v, want Unknown with its reset", weekly)
+	if len(usage.Metrics) != 1 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 100 {
+		t.Errorf("metrics=%+v, want only the exhausted bucket, numeric at 100%%", usage.Metrics)
 	}
 
 	// After a self-update the evidence is gone: the same reply is unplottable.

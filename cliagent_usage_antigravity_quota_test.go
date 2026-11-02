@@ -301,6 +301,30 @@ func TestAntigravityQuotaMetrics_RolledOverWindowIsUnobservable(t *testing.T) {
 	}
 }
 
+// A bucket Google omitted the fraction of is never a row: Google omits a
+// SPENT bucket's fraction, and an Unknown row would read server-side as an
+// open pool, making a spent account Partial and outranking another computer's
+// evidence that the bucket is spent.
+func TestAntigravityQuotaMetrics_NeverPublishesAnUnobservedBucket(t *testing.T) {
+	now := time.Now()
+	reset := now.Add(48 * time.Hour).UTC().Format(time.RFC3339)
+	snap := antigravityQuotaSnapshot{
+		ObservedAt: now.UTC().Format(time.RFC3339),
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "5h", RemainingFraction: 0, ResetTime: reset},
+		},
+		UnobservedBuckets: []antigravityUnobservedBucket{
+			{Group: "Gemini Models", Window: "weekly", ResetTime: reset},
+			{Group: "Claude and GPT Models", Window: "weekly", ResetTime: reset},
+			{Group: "Gemini 4 Argon", Window: "weekly", ResetTime: reset},
+		},
+	}
+	metrics := antigravityQuotaMetrics(snap, now)
+	if len(metrics) != 1 || metrics[0].Kind != limitKindSession || metrics[0].Unknown {
+		t.Fatalf("metrics=%+v, want only the charted 5h bucket", metrics)
+	}
+}
+
 // A word is still skipped; a window spelled as a length is not a guess and
 // gets a kind of its own (TestAntigravityQuotaMetrics_OpenLengthIsPlottedUnderItsOwnKind).
 func TestAntigravityQuotaMetrics_SkipsUnknownWindow(t *testing.T) {
@@ -1185,7 +1209,7 @@ func TestAntigravitySnapshotFromGroups_OmittedIsUnknownWithoutEvidence(t *testin
 // Evidence names a bucket when its reset is within two minutes of the bucket's
 // and it was recorded for the same account; 3 min off, or another account's
 // fingerprint (the caller filters by fingerprint), charts nothing. The bucket
-// no evidence names rides along as an Unknown row with its reset.
+// no evidence names is kept for diagnosis and never published.
 func TestAntigravitySnapshotFromGroups_EvidenceChartsTheMatchingBucket(t *testing.T) {
 	reset, _ := time.Parse(time.RFC3339, "2126-08-12T04:37:41Z")
 	near := []antigravityExhaustionEvent{{resetAtMs: reset.Add(90 * time.Second).UnixMilli(), fingerprint: "fp-a"}}
@@ -1197,10 +1221,8 @@ func TestAntigravitySnapshotFromGroups_EvidenceChartsTheMatchingBucket(t *testin
 		t.Errorf("omittedCharted=%d unobserved=%+v, want the 5h charted and the weekly unobserved", shape.OmittedCharted, snap.UnobservedBuckets)
 	}
 	metrics := antigravityQuotaMetrics(snap, time.Now())
-	if len(metrics) != 2 || metrics[0].Consumed == nil || *metrics[0].Consumed != 100 {
-		t.Errorf("metrics=%+v, want the 5h bucket at 100%% consumed", metrics)
-	} else if !metrics[1].Unknown || metrics[1].Consumed != nil || metrics[1].ResetAt != "2126-08-14T14:17:13Z" {
-		t.Errorf("weekly row = %+v, want Unknown with its reset, never charted", metrics[1])
+	if len(metrics) != 1 || metrics[0].Consumed == nil || *metrics[0].Consumed != 100 {
+		t.Errorf("metrics=%+v, want only the 5h bucket, at 100%% consumed", metrics)
 	}
 
 	far := []antigravityExhaustionEvent{{resetAtMs: reset.Add(3 * time.Minute).UnixMilli(), fingerprint: "fp-a"}}
