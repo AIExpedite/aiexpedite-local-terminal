@@ -587,12 +587,27 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 			if verb := whatsAppHistoryStubVerb(web.GetMessageStubType()); verb != "" {
 				ts := int64(web.GetMessageTimestamp()) * 1000
 				stubID := web.GetKey().GetID()
+				if stubID == "" {
+					// No id to tell it by: its content stands in, so the
+					// same id-less stub listed twice stays one message while
+					// differing ones are still numbered. Never emitted, only
+					// compared.
+					stubID = "\x00" + web.GetMessageStubType().String() + "|" +
+						strings.Join(web.GetMessageStubParameters(), ",")
+				}
+				// One stub naming one person twice (two forms of them) is one
+				// notice for them.
+				named := map[string]bool{}
 				for _, p := range web.GetMessageStubParameters() {
 					who, err := types.ParseJID(p)
 					if err != nil {
 						continue
 					}
 					sender := nc.canonicalUser(who, types.EmptyJID).String()
+					if named[sender] {
+						continue
+					}
+					named[sender] = true
 					// Keyed exactly like the live notice of the same event
 					// (normalizeWhatsAppGroupInfo; both timestamps are whole
 					// seconds): a notice seen live and then again in a
@@ -602,13 +617,11 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 					// distinct stubs share that key (X is invited, removed and
 					// invited again within one second). They are numbered:
 					// the first keeps the live key, the n-th becomes
-					// "<key>-n". The stub's own id decides what is distinct,
-					// so one stub listed twice stays one message.
+					// "<key>-n". The stub's own id (its content, without one)
+					// decides what is distinct, so one stub listed twice stays
+					// one message.
 					k := chat.String() + "|" + sender + "|" + id
-					n := -1
-					if stubID != "" {
-						n = slices.Index(stubIDs[k], stubID)
-					}
+					n := slices.Index(stubIDs[k], stubID)
 					if n < 0 {
 						stubIDs[k] = append(stubIDs[k], stubID)
 						n = len(stubIDs[k]) - 1

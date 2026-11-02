@@ -180,6 +180,10 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	tearDownSubprocesses(shutdownCtx)
 	// No session runs past this point: the computer may sleep again.
 	keepAwakeReleaseAll()
+	// Last, past everything else: a WhatsApp outbox write still committing -
+	// a history chunk WhatsApp will not send again - gets a short grace
+	// before the process exits.
+	waitWhatsAppWritesAtExit(whatsAppShutdownWriteGrace)
 
 	fmt.Println("[shutdown] Graceful shutdown sequence complete")
 }

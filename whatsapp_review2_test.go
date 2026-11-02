@@ -86,6 +86,56 @@ func distinctKeys(keys []string) map[string]bool {
 // keeps the key of the live notice of the same event, so the two still
 // collapse - per verb and per person - and the chunk's order does not change
 // which keys there are.
+// A stub naming one person twice (a plain and a device-suffixed form, say)
+// is one notice for them, with an id or without one. An id-less stub listed
+// twice stays one notice too - its content stands in for the id - while two
+// different id-less stubs sharing a key are still numbered.
+func TestNormalizeHistoryNamesEachPersonOncePerStub(t *testing.T) {
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: newWhatsAppIdentityResolver(newMemoryWhatsAppIdentityStore(), nil)}
+	at := time.Unix(1_800_000_123, 0)
+	device := types.JID{User: waPeer.User, Device: 3, Server: waPeer.Server}
+	stub := func(id string, typ waWeb.WebMessageInfo_StubType, who ...types.JID) *waHistorySync.HistorySyncMsg {
+		var params []string
+		for _, j := range who {
+			params = append(params, j.String())
+		}
+		key := &waCommon.MessageKey{RemoteJID: proto.String(waGroup.String())}
+		if id != "" {
+			key.ID = proto.String(id)
+		}
+		return &waHistorySync.HistorySyncMsg{Message: &waWeb.WebMessageInfo{
+			Key: key, MessageTimestamp: proto.Uint64(uint64(at.Unix())),
+			MessageStubType: typ.Enum(), MessageStubParameters: params,
+		}}
+	}
+	keys := func(msgs ...*waHistorySync.HistorySyncMsg) map[string]bool {
+		data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(waGroup.String()), Messages: msgs}}}
+		recs, _ := normalizeWhatsAppHistory(data, parseLikeWhatsmeow, nc)
+		return distinctKeys(noticeKeys(recs))
+	}
+	add := waWeb.WebMessageInfo_GROUP_PARTICIPANT_ADD
+	invite := waWeb.WebMessageInfo_GROUP_PARTICIPANT_INVITE
+	// One record, not two with one key: the outbox would carry the second
+	// for nothing.
+	records := func(msgs ...*waHistorySync.HistorySyncMsg) []string {
+		data := &waHistorySync.HistorySync{Conversations: []*waHistorySync.Conversation{{ID: proto.String(waGroup.String()), Messages: msgs}}}
+		recs, _ := normalizeWhatsAppHistory(data, parseLikeWhatsmeow, nc)
+		return noticeKeys(recs)
+	}
+	if got := records(stub("S1", add, waPeer, device)); len(got) != 1 {
+		t.Fatalf("one stub naming one person twice gave %d notice records: %v", len(got), got)
+	}
+	if got := records(stub("", add, waPeer, device)); len(got) != 1 {
+		t.Fatalf("one id-less stub naming one person twice gave %d notice records: %v", len(got), got)
+	}
+	if got := keys(stub("", add, waPeer), stub("", add, waPeer)); len(got) != 1 {
+		t.Fatalf("one id-less stub listed twice gave %d notices: %v", len(got), got)
+	}
+	if got := keys(stub("", add, waPeer), stub("", invite, waPeer)); len(got) != 2 {
+		t.Fatalf("two different id-less stubs sharing a key gave %d notices: %v", len(got), got)
+	}
+}
+
 func TestNormalizeHistoryNumbersDistinctNoticesSharingAKey(t *testing.T) {
 	nc := whatsAppNormalizeContext{OwnJID: waMe}
 	at := time.Unix(1_800_000_123, 0)
@@ -158,8 +208,8 @@ func TestWhatsAppOutboxAsksForFullFsync(t *testing.T) {
 }
 
 // Shutdown's store close is bounded by the caller's deadline: closing an
-// outbox waits for whatever holds its lock. Held by anything but a committing
-// write (no Append or Rebase reports one in flight here), it gets no grace.
+// outbox waits for whatever holds its lock, and shutdown does not wait past
+// its deadline for it.
 func TestWhatsAppShutdownCloseHonoursTheDeadline(t *testing.T) {
 	withWhatsAppTestEnv(t)
 	ob, _ := openTestOutbox(t, "lnk_close_deadline")
@@ -183,7 +233,8 @@ func TestWhatsAppShutdownCloseHonoursTheDeadline(t *testing.T) {
 }
 
 // WriteInFlight is set while an Append or a Rebase is inside its transaction,
-// and cleared by the time it returns.
+// and cleared by the time it returns; the count across every outbox
+// (whatsAppWritesInFlight) moves with it.
 func TestWhatsAppOutboxReportsAWriteInFlight(t *testing.T) {
 	withWhatsAppTestEnv(t)
 	ob, _ := openTestOutbox(t, "lnk_in_flight")
@@ -195,25 +246,27 @@ func TestWhatsAppOutboxReportsAWriteInFlight(t *testing.T) {
 	for i := range records {
 		records[i] = textRecord("chat@s.whatsapp.net", "W"+strconv.Itoa(i), "x")
 	}
+	base := whatsAppWritesInFlight.Load()
 	watch := func(name string, write func() error) {
 		done := make(chan error, 1)
 		go func() { done <- write() }()
-		saw := false
+		saw, counted := false, false
 		for {
 			select {
 			case err := <-done:
 				if err != nil {
 					t.Fatalf("%s: %v", name, err)
 				}
-				if !saw {
-					t.Fatalf("%s never reported a write in flight", name)
+				if !saw || !counted {
+					t.Fatalf("%s never reported a write in flight (flag %v, count %v)", name, saw, counted)
 				}
-				if ob.WriteInFlight() {
+				if ob.WriteInFlight() || whatsAppWritesInFlight.Load() != base {
 					t.Fatalf("a write still in flight after %s returned", name)
 				}
 				return
 			default:
 				saw = saw || ob.WriteInFlight()
+				counted = counted || whatsAppWritesInFlight.Load() > base
 				runtime.Gosched()
 			}
 		}
@@ -295,12 +348,13 @@ func committedOutboxRows(t *testing.T, dir string) int64 {
 	return n
 }
 
-// A history chunk still committing when shutdown's deadline passes is waited
-// for: the process exits right after ShutdownAll returns, and WhatsApp does
-// not send the chunk again. The wait lasts as long as the write and no
-// longer: the session store's close is held here too, so ShutdownAll returns
-// before the grace ends only if it notices that the write committed.
-func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
+// A history chunk still committing when shutdown's deadline passes: shutdown
+// itself keeps its deadline, and the chunk is waited for at the very end
+// (waitWhatsAppWritesAtExit) - the process exits right after, and WhatsApp
+// does not send the chunk again. The wait lasts as long as the write and no
+// longer. Uploads are paused here, so shutdown reaches its store close (the
+// session store's close is held too).
+func TestWhatsAppShutdownKeepsItsDeadlineAndExitWaitsForTheChunk(t *testing.T) {
 	h, c := pairedHarness(t)
 	r := h.sup.runner("lnk_1")
 	dir, _ := whatsAppLinkDir("lnk_1")
@@ -356,21 +410,30 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
 	finished := writeFinish(ob)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
+	start := time.Now()
 	h.sup.ShutdownAll(ctx)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("ShutdownAll took %v past a 5ms deadline: it must leave the write to the exit", took)
+	}
+	if !waitWhatsAppWritesAtExit(whatsAppShutdownWriteGrace) {
+		t.Fatal("the exit gave up on the write")
+	}
 	returned := time.Now()
 	atExit := committedOutboxRows(t, dir)
 	<-histDone
 	if atExit < before+chunk {
-		t.Fatalf("ShutdownAll returned (the process exits) with %d of the chunk's %d records committed", atExit-before, chunk)
+		t.Fatalf("the process exits with %d of the chunk's %d records committed", atExit-before, chunk)
 	}
 	returnedPromptlyAfter(t, returned, finished)
 }
 
-// The same on the usual path, with uploads healthy: shutdown's flush waits for
+// The same on the usual path, with uploads healthy: the upload loop waits for
 // the outbox behind the chunk's Append, so the deadline passes while the link
-// is still stopping - before the store close is ever reached. The write is
-// waited for there too, and only as long as it lasts.
-func TestWhatsAppShutdownWaitsForAHistoryChunkWhileLinksAreStopping(t *testing.T) {
+// is still stopping - before its runner disconnected the client. Shutdown
+// disconnects every client at that deadline (WhatsApp must deliver, and
+// whatsmeow acknowledge, nothing more the exiting process would drop), keeps
+// its deadline, and the chunk is waited for at the exit.
+func TestWhatsAppShutdownDisconnectsAtItsDeadlineAndExitWaitsForTheChunk(t *testing.T) {
 	h, c := pairedHarness(t)
 	r := h.sup.runner("lnk_1")
 	dir, _ := whatsAppLinkDir("lnk_1")
@@ -424,20 +487,79 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkWhileLinksAreStopping(t *testing.T
 		runtime.Gosched()
 	}
 	finished := writeFinish(ob)
+	// Two idle polls: the upload loop is now waiting for the outbox behind
+	// the Append, so its runner has not reached its own disconnect.
+	time.Sleep(3 * whatsAppUploadIdlePoll)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
+	start := time.Now()
 	h.sup.ShutdownAll(ctx)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("ShutdownAll took %v past a 5ms deadline: it must leave the write to the exit", took)
+	}
+	c.mu.Lock()
+	connected := c.connected
+	c.mu.Unlock()
+	if connected {
+		t.Fatal("the client was still connected when shutdown returned: WhatsApp could deliver history the exit drops")
+	}
+	if !waitWhatsAppWritesAtExit(whatsAppShutdownWriteGrace) {
+		t.Fatal("the exit gave up on the write")
+	}
 	returned := time.Now()
 	if atExit := committedOutboxRows(t, dir); atExit < chunk {
-		t.Fatalf("ShutdownAll returned (the process exits) with %d of the chunk's %d records committed", atExit, chunk)
+		t.Fatalf("the process exits with %d of the chunk's %d records committed", atExit, chunk)
 	}
 	returnedPromptlyAfter(t, returned, finished)
 }
 
-// ShutdownAll's own store close honours the caller's deadline. The test holds
-// the outbox lock itself, as no Append or Rebase does, so nothing is
-// committing and no grace applies: shutdown returns at its deadline, and the
-// link is still recorded.
+// The exit's wait covers every outbox, including one no link holds any more
+// (a pause or a retire took it off its runner while it was writing), and it
+// gives up after its grace.
+func TestWhatsAppExitWaitCoversEveryOutboxAndGivesUpAfterItsGrace(t *testing.T) {
+	withWhatsAppTestEnv(t)
+	ob, _ := openTestOutbox(t, "lnk_exit_wait")
+	defer ob.Close()
+	records := make([]whatsAppRecord, whatsAppInFlightRecords(20000))
+	for i := range records {
+		records[i] = textRecord("chat@s.whatsapp.net", "X"+strconv.Itoa(i), "x")
+	}
+	done := make(chan error, 1)
+	go func() { done <- ob.Append(records, true) }()
+	appendBy := time.Now().Add(10 * time.Second)
+	for !ob.WriteInFlight() {
+		if time.Now().After(appendBy) {
+			t.Fatal("the Append never started")
+		}
+		runtime.Gosched()
+	}
+	finished := writeFinish(ob)
+	if !waitWhatsAppWritesAtExit(time.Minute) {
+		t.Fatal("the exit gave up on the write")
+	}
+	returned := time.Now()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if d := ob.Depth(); d != int64(len(records)) {
+		t.Fatalf("the exit returned with %d of %d records queued", d, len(records))
+	}
+	returnedPromptlyAfter(t, returned, finished)
+
+	whatsAppWritesInFlight.Add(1) // a write that never ends
+	defer whatsAppWritesInFlight.Add(-1)
+	start := time.Now()
+	if waitWhatsAppWritesAtExit(50 * time.Millisecond) {
+		t.Fatal("the exit reported no write in flight")
+	}
+	if took := time.Since(start); took < 50*time.Millisecond || took > time.Second {
+		t.Fatalf("the exit waited %v on a 50ms grace", took)
+	}
+}
+
+// ShutdownAll's own store close honours the caller's deadline: with the
+// outbox lock held, shutdown returns at its deadline, and the link is still
+// recorded.
 func TestWhatsAppShutdownAllCloseHonoursTheDeadline(t *testing.T) {
 	withWhatsAppTestEnv(t)
 	s := &whatsAppSupervisor{links: map[string]*whatsAppLinkRunner{}}
