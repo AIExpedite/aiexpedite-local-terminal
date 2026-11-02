@@ -7,9 +7,9 @@
 //	                       resumed, its title now, who else holds it (running
 //	                       registry entries other than this agent's own
 //	                       children), whether an editor tab has it open, when
-//	                       its transcript was last written, and — only on the
-//	                       final pre-start probe — up to 5 recent turns,
-//	                       masked and capped.
+//	                       its transcript was last written, and — only when
+//	                       includeHistory is "1" (the adopt flow's one probe) —
+//	                       up to 5 recent turns, masked and capped.
 //	watcher                for every claude_native session started with a
 //	                       `--resume=<id>`, poll the running registry every 5 s
 //	                       and publish claude_native_outside_writer only when
