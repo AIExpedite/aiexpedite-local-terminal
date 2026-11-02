@@ -10,7 +10,7 @@
 // reading the cache a second time.
 //
 // Which rows exist is the account's reported window set when one is known
-// (cliagent_usage_claudecode_windows.go — claudeCodeMetricsFromView); the fixed
+// (cliagent_usage_claudecode_windowset.go — claudeCodeMetricsFromView); the fixed
 // three-row layout below is what an account with no known set still gets.
 //
 // The writers that fill this cache live in cliagent_ratelimit.go (stream

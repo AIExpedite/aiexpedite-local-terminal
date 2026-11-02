@@ -49,7 +49,7 @@ import (
 //
 // These are the windows the agent MODELS. A window the usage endpoint reports
 // beyond them is cached under a generic `limit:<kind>…` id and renders as a row
-// of its own (cliagent_usage_claudecode_windows.go); which windows are shown at
+// of its own (cliagent_usage_claudecode_windowset.go); which windows are shown at
 // all follows the window set the provider reports.
 const (
 	claudeWindowFiveHour       = "five_hour"
@@ -159,7 +159,7 @@ type claudeRateLimitSnapshot struct {
 
 	// ReportedWindows / ReportedWindowsAtMs are the window set the last
 	// AUTHORITATIVE probe reply reported for this account
-	// (cliagent_usage_claudecode_windows.go), and the instant it was observed.
+	// (cliagent_usage_claudecode_windowset.go), and the instant it was observed.
 	// The rows are built from it: a window it does not name is hidden — the
 	// verified Ultra account's five-hour window, say — unless a reading newer
 	// than the set shows it again. A generic window (one this agent never

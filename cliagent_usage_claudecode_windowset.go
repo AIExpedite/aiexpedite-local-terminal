@@ -1,4 +1,4 @@
-// cliagent_usage_claudecode_windows.go — the set of quota windows Claude
+// cliagent_usage_claudecode_windowset.go — the set of quota windows Claude
 // REPORTS for the signed-in account, and the rows that set renders as.
 //
 // Why this exists:

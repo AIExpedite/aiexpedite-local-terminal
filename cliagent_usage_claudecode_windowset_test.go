@@ -1,6 +1,6 @@
 package main
 
-// Tests for the window set Claude reports (cliagent_usage_claudecode_windows.go),
+// Tests for the window set Claude reports (cliagent_usage_claudecode_windowset.go),
 // the rows built from it, the plan display name, and the two smaller fixes that
 // ship with them (the same-window reset tolerance and the status line's null
 // window).

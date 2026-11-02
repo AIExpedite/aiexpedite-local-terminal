@@ -51,7 +51,7 @@
 //     The one vendor text that does travel is what names a window this agent
 //     never modelled — a limits[] entry's kind, group and scope display name —
 //     and only as the row it renders as: printable, bounded, and derived by
-//     claudeGenericWindow (cliagent_usage_claudecode_windows.go).
+//     claudeGenericWindow (cliagent_usage_claudecode_windowset.go).
 //   - Skipped entirely when the process never armed it (SetClaudeUsageProbeDisabled
 //     is called only by StartAgent), when the user opted out
 //     (disable_claude_usage_probe), when the agent is offline, or when no stored
