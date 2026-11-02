@@ -1950,7 +1950,9 @@ capacity as unknown. The plan chip said "Max", because the credential's
   shows (and constrains routing) with or without a set, until an
   authoritative reply that omits it hides it again.
 - **Rows** (`claudeCodeMetricsFromView`). No set known — never probed, or a
-  cache from an older agent — gives exactly the old three rows. With a set:
+  cache from an older agent — gives the old three rows, then any reading of a
+  window the agent never modelled that this login took (a partial reply's new
+  meter; an older agent's cache holds none). With a set:
   the session row only if `five_hour` is shown, "Weekly quota" only if a weekly
   window is, "Weekly Fable" (model `fable`) only if a Fable window is, then the
   windows the agent never modelled in the server's order. A window is shown when
@@ -1997,7 +1999,7 @@ capacity as unknown. The plan chip said "Max", because the credential's
   of `oauthAccount.accountUuid` and `organizationUuid`, sampled before the
   credential read (`reportedAccount` / `reportedOrg`). Each part is compared
   only when both sides know it. When the current login differs, the set is
-  ignored: the old three rows return until a probe or Claude Code's reply
+  ignored and the no-set rows return until a probe or Claude Code's reply
   describes the new login. Each generic reading carries the same digests on its
   row (`row.account` / `row.org`), and a reading another login took is left
   out of the rows. Nothing the new login reports would ever overwrite it, and

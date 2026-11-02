@@ -330,10 +330,11 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 //
 // With a window set known (claudeEffectiveWindowSet), the rows are the set's
 // (claudeCodeMetricsFromWindowSet). With none — never probed successfully, a
-// cache from an older agent, or a set bound to another account — they are
-// exactly today's three. Every freshness decision walks these same rows
-// (claudeRowObservationsMs), so a hidden window neither triggers a probe nor
-// counts as fresh evidence.
+// cache from an older agent, or a set bound to another login — they are
+// today's three, then any reading of a window this agent never modelled that
+// this login took (a partial reply's new meter). Every freshness decision walks
+// these same rows (claudeRowObservationsMs), so a hidden window neither
+// triggers a probe nor counts as fresh evidence.
 //
 // A reading of a window this agent never modelled that was taken under another
 // login (claudeBucketsForLogin) is left out of both: after a `/login` to another

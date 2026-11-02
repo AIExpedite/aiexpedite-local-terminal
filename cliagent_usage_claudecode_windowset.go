@@ -949,8 +949,9 @@ func logClaudeGenericWindowsOnce(ids []string) {
 
 // claudeEffectiveWindowSet is the window set rows are built from, or nil when
 // none is known — never probed successfully, a cache from an older agent, or
-// both sources ruled out below — in which case the rows are exactly today's
-// three (claudeCodeMetricsFromBuckets).
+// both sources ruled out below — in which case the rows are today's three,
+// then any reading of a window this agent never modelled that this login took
+// (claudeCodeMetricsFromBuckets).
 //
 // The NEWER of the two sources wins: the probe's persisted set, and Claude
 // Code's own cached reply. Either is a full statement of the account's windows
