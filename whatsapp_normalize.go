@@ -22,6 +22,7 @@
 package main
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -350,6 +351,12 @@ func whatsAppContent(msg *waE2E.Message) (string, string, *whatsAppMedia, string
 // The participants are not written into the text — the thread says "joined" /
 // "left" against the participant as sender, resolved through the store's LID
 // mapping so it matches the identity that member's messages normalize to.
+//
+// A notice is keyed by its verb and its whole-second timestamp, so live
+// notices of one verb for one person within one second still merge into one
+// message: each event arrives alone, with nothing to number it against
+// (normalizeWhatsAppHistory numbers such repeats within a chunk, but not
+// repeats a sync splits across chunks).
 func normalizeWhatsAppGroupInfo(evt *events.GroupInfo, nc whatsAppNormalizeContext) []whatsAppRecord {
 	if evt == nil || evt.JID.IsEmpty() {
 		return nil
@@ -410,6 +417,9 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 			nc.learn(pn, lid)
 		}
 	}
+	// stubIDs lists, per notice key (chat, participant, id), the distinct
+	// stubs given that key so far in this chunk.
+	stubIDs := map[string][]string{}
 	for _, conv := range data.GetConversations() {
 		chat, err := types.ParseJID(conv.GetID())
 		if err != nil || whatsAppSkippableChat(chat) {
@@ -435,15 +445,39 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 			}
 			if verb := whatsAppHistoryStubVerb(web.GetMessageStubType()); verb != "" {
 				ts := int64(web.GetMessageTimestamp()) * 1000
+				stubID := web.GetKey().GetID()
 				for _, p := range web.GetMessageStubParameters() {
 					who, err := types.ParseJID(p)
 					if err != nil {
 						continue
 					}
+					sender := nc.canonicalUser(who, types.EmptyJID).String()
+					// Keyed exactly like the live notice of the same event
+					// (normalizeWhatsAppGroupInfo; both timestamps are whole
+					// seconds): a notice seen live and then again in a
+					// history sync - a re-link's, say - collapses into one.
+					id := "sys-" + verb + "-" + strconv.FormatInt(ts, 10)
+					// Whole seconds, and two verbs for four stub types, let
+					// distinct stubs share that key (X is invited, removed and
+					// invited again within one second). They are numbered:
+					// the first keeps the live key, the n-th becomes
+					// "<key>-n". The stub's own id decides what is distinct,
+					// so one stub listed twice stays one message.
+					k := chat.String() + "|" + sender + "|" + id
+					n := -1
+					if stubID != "" {
+						n = slices.Index(stubIDs[k], stubID)
+					}
+					if n < 0 {
+						stubIDs[k] = append(stubIDs[k], stubID)
+						n = len(stubIDs[k]) - 1
+					}
+					if n > 0 {
+						id += "-" + strconv.Itoa(n+1)
+					}
 					records = append(records, whatsAppRecord{
 						Kind: waRecordMessage, Op: waOpNew, ChatJid: chat.String(),
-						SenderJid:   nc.canonicalUser(who, types.EmptyJID).String(),
-						WaMessageID: clipWhatsAppID(web.GetKey().GetID()),
+						SenderJid: sender, WaMessageID: id,
 						WaTimestamp: ts, Source: waSourceHistory, Type: waTypeSystem, Text: verb,
 					})
 				}

@@ -98,12 +98,14 @@ jobs:
       #   - Race issues are platform-independent in this codebase.
       #
       # -timeout bounds the whole package binary, not one test. The root
-      # package's serial suite already runs ~290s under -race on
-      # ubuntu-latest, so a 5m budget failed on suite growth alone (the test
-      # "running" at the deadline had been going for 0s), not on a hang.
+      # package's serial suite runs ~530-560s under -race on ubuntu-latest
+      # (main's own run on 2026-11-01 took 532s; it was ~290s when 5m was
+      # raised to 10m), so 10m failed on suite growth alone, as 5m did before
+      # it: the test "running" at the deadline had been going for 0s, not
+      # hung. 20m, as the non-race job below.
       - name: go test
         if: runner.os == 'Linux'
-        run: go test -race -timeout 10m ./...
+        run: go test -race -timeout 20m ./...
 
       # windows-latest runs the root package's serial suite in ~560-600s
       # (main's own run took 593s), so a 10m budget times out on suite growth

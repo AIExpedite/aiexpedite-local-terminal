@@ -36,6 +36,9 @@ type fakeWAClient struct {
 	qr        chan whatsmeow.QRChannelItem
 	// alternates is whatsmeow's LID store (both directions).
 	alternates map[types.JID]types.JID
+	// closeGate, when set, holds Close until it is closed (a session store
+	// close that does not finish).
+	closeGate chan struct{}
 }
 
 func (c *fakeWAClient) AddEventHandler(h func(any)) {
@@ -85,7 +88,18 @@ func (c *fakeWAClient) PairPhone(context.Context, string) (string, error) { retu
 func (c *fakeWAClient) ParseWebMessage(chat types.JID, web *waWeb.WebMessageInfo) (*events.Message, error) {
 	return liveMsg(chat, waPeer, false, web.GetKey().GetID(), web.GetMessage()), nil
 }
-func (c *fakeWAClient) Close() error { c.mu.Lock(); c.closed = true; c.mu.Unlock(); return nil }
+func (c *fakeWAClient) Close() error {
+	c.mu.Lock()
+	gate := c.closeGate
+	c.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
 func (c *fakeWAClient) count() (connects, logouts int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

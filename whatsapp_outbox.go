@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 )
@@ -50,6 +51,14 @@ const (
 )
 
 var errWhatsAppOutboxFull = errors.New("whatsapp outbox is full")
+
+// whatsAppMaxSeq is the largest sequence the cloud can hold: whatsapp-service
+// keeps `lastAckedSeq` as a JavaScript number.
+const whatsAppMaxSeq int64 = 1<<53 - 1
+
+// errWhatsAppRebaseOutOfRange refuses a Rebase that would number a row past
+// whatsAppMaxSeq.
+var errWhatsAppRebaseOutOfRange = errors.New("whatsapp outbox rebase passes the largest sequence")
 
 // errWhatsAppOutboxClosed answers a write after Close.
 var errWhatsAppOutboxClosed = errors.New("whatsapp outbox is closed")
@@ -82,6 +91,11 @@ type whatsAppOutbox struct {
 	pendingIdentities map[string]string
 	// closed: Close ran (under mu, so it waited for any write in flight).
 	closed bool
+	// writing is set while an Append or a Rebase holds mu. Read without mu
+	// (WriteInFlight): a shutdown past its deadline gives such a write a
+	// short grace to commit (closeStoresWithin), because WhatsApp does not
+	// send a history chunk again.
+	writing atomic.Bool
 }
 
 // whatsAppOutboxBatch is a contiguous range ready to upload.
@@ -104,7 +118,16 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 	// has already acted on: records re-numbered at or below its replay
 	// watermark are acked without being written, and a person could be
 	// written under a second identity.
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)")
+	// fullfsync: on macOS fsync() does not flush the drive's cache, so FULL
+	// alone is not durable there; with this SQLite uses F_FULLFSYNC for every
+	// sync, checkpoints included (other platforms ignore it). On macOS every
+	// commit therefore waits for the drive's cache flush, and live messages
+	// are one commit each, so catching up after sleep is bounded by the
+	// drive's flush rate. That is deliberate: durability first.
+	// journal_size_limit: the WAL grows to hold a large transaction (a Rebase,
+	// a history chunk at the caps) and by default keeps that size once
+	// checkpointed; this truncates it back to 64 MiB when it resets.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=fullfsync(1)&_pragma=journal_size_limit(67108864)")
 	if err != nil {
 		return nil, false, err
 	}
@@ -195,6 +218,132 @@ func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
 	return nil
 }
 
+// Rebase renumbers the queued rows above `above`, the cloud's replay
+// watermark, when the outbox still holds rows at or below it, and reports how
+// many rows moved.
+//
+// The cloud acks a batch at or below its watermark as a replay WITHOUT
+// writing it. An ack past the batch's own end therefore says the cloud holds
+// sequences this batch never reached. Usually they are an earlier numbering
+// of this outbox: outbox.db was rolled back or restored from a backup where
+// linkStart's EnsureNextAbove could not see it, and deleting the batch on
+// that ack would lose every record in it. Rarely, two uploaders overlapped on
+// one link and the other one sent these rows first; the re-send is then
+// idempotent. (A batch whose 2xx was lost is not this: the uploader retries
+// it as exactly the same range, so it comes back as an exact replay.)
+//
+// Rebase moves every queued row up by the same amount - order kept, the
+// oldest landing just above the watermark - and raises `next` past them, in
+// one transaction. Each row is re-sealed under its new sequence (the AAD
+// binds it), with its payload's deviceSeq rewritten to match.
+func (ob *whatsAppOutbox) Rebase(above int64) (int64, error) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	if ob.closed {
+		return 0, errWhatsAppOutboxClosed
+	}
+	ob.writing.Store(true)
+	defer ob.writing.Store(false)
+	var minSeq, maxSeq sql.NullInt64
+	if err := ob.db.QueryRow(`SELECT MIN(seq), MAX(seq) FROM outbox`).Scan(&minSeq, &maxSeq); err != nil {
+		return 0, err
+	}
+	if !minSeq.Valid || minSeq.Int64 > above {
+		return 0, nil
+	}
+	if above >= whatsAppMaxSeq {
+		return 0, errWhatsAppRebaseOutOfRange
+	}
+	// `next` is past every queued row (loadCounters), so it moves by the
+	// same amount and stays past them.
+	shift := above + 1 - minSeq.Int64
+	next := ob.next + shift
+	if next > whatsAppMaxSeq {
+		return 0, errWhatsAppRebaseOutOfRange
+	}
+	tx, err := ob.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	type sealedRow struct {
+		seq            int64
+		nonce, payload []byte
+	}
+	var moved int64
+	// Highest first, so a row's new sequence is never one a row not yet
+	// moved still holds; a page at a time, so a full outbox is never in
+	// memory at once.
+	cursor := maxSeq.Int64
+	for {
+		rows, err := tx.Query(`SELECT seq, nonce, payload FROM outbox WHERE seq <= ? ORDER BY seq DESC LIMIT ?`,
+			cursor, whatsAppBatchMaxRecords)
+		if err != nil {
+			return 0, err
+		}
+		var page []sealedRow
+		for rows.Next() {
+			var row sealedRow
+			if err := rows.Scan(&row.seq, &row.nonce, &row.payload); err != nil {
+				rows.Close()
+				return 0, err
+			}
+			page = append(page, row)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, row := range page {
+			opened, err := ob.aead.Open(nil, row.nonce, row.payload, ob.aad(row.seq))
+			if err != nil {
+				return 0, fmt.Errorf("outbox row %d does not open: %w", row.seq, err)
+			}
+			seq := row.seq + shift
+			plain, err := withWhatsAppDeviceSeq(opened, seq)
+			clear(opened)
+			if err != nil {
+				return 0, fmt.Errorf("outbox row %d: %w", row.seq, err)
+			}
+			nonce := make([]byte, ob.aead.NonceSize())
+			if _, err := rand.Read(nonce); err != nil {
+				return 0, err
+			}
+			sealed := ob.aead.Seal(nil, nonce, plain, ob.aad(seq))
+			clear(plain)
+			if _, err := tx.Exec(`UPDATE outbox SET seq = ?, size = ?, nonce = ?, payload = ? WHERE seq = ?`,
+				seq, len(sealed), nonce, sealed, row.seq); err != nil {
+				return 0, err
+			}
+			moved++
+		}
+		cursor = page[len(page)-1].seq - 1
+	}
+	if _, err := tx.Exec(`INSERT INTO meta (k, v) VALUES ('next', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+		strconv.FormatInt(next, 10)); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	ob.next = next
+	return moved, ob.loadCountersLocked()
+}
+
+// withWhatsAppDeviceSeq rewrites a record's deviceSeq and keeps every other
+// field as it was stored.
+func withWhatsAppDeviceSeq(plain []byte, seq int64) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(plain, &fields); err != nil {
+		return nil, err
+	}
+	fields["deviceSeq"] = json.RawMessage(strconv.FormatInt(seq, 10))
+	return json.Marshal(fields)
+}
+
 func (ob *whatsAppOutbox) loadCounters() error {
 	row := ob.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(MAX(seq), 0) FROM outbox`)
 	var maxSeq int64
@@ -240,6 +389,8 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	if ob.closed {
 		return errWhatsAppOutboxClosed
 	}
+	ob.writing.Store(true)
+	defer ob.writing.Store(false)
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -376,6 +527,13 @@ func (ob *whatsAppOutbox) Depth() int64 {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	return ob.count
+}
+
+// WriteInFlight reports whether an Append or a Rebase is inside its
+// transaction right now. It never waits for one, unlike every call that
+// takes mu.
+func (ob *whatsAppOutbox) WriteInFlight() bool {
+	return ob.writing.Load()
 }
 
 // HasRoomForHistory reports whether a history append would be accepted.
