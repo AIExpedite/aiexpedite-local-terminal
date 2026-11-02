@@ -110,6 +110,9 @@ type whatsAppIdentity interface {
 	Canonical(primary, alt types.JID) types.JID
 	// Learn records that pn and lid are one person.
 	Learn(pn, lid types.JID)
+	// Formers is every identity that person was written under before a join
+	// re-pointed one of their forms, newest first; never their identity now.
+	Formers(primary, alt types.JID) []types.JID
 }
 
 // whatsAppNormalizeContext is what normalization needs beyond the event.
@@ -130,6 +133,14 @@ func (nc whatsAppNormalizeContext) canonicalUser(primary, alt types.JID) types.J
 		return nc.Identity.Canonical(primary, alt)
 	}
 	return canonicalWhatsAppUser(primary, alt)
+}
+
+// formerUsers is what the resolver's Formers says; nothing without one.
+func (nc whatsAppNormalizeContext) formerUsers(primary, alt types.JID) []types.JID {
+	if nc.Identity != nil {
+		return nc.Identity.Formers(primary, alt)
+	}
+	return nil
 }
 
 // learn passes a history chunk's mapping to the resolver.
@@ -232,17 +243,21 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 			}
 			text, _, _, _ := whatsAppContent(pm.GetEditedMessage())
 			rec.Text = clipWhatsAppText(text)
-			return []whatsAppRecord{rec}
+			// Only the author edits: the target's author is this sender.
+			return whatsAppTargetCopies(rec,
+				nc.formerUsers(rawChat, chatAlt), nc.formerUsers(evt.Info.Sender, evt.Info.SenderAlt))
 		case waE2E.ProtocolMessage_REVOKE:
 			rec := base
 			rec.Op = waOpRevoke
 			rec.WaMessageID = clipWhatsAppID(target.GetID())
+			author, authorAlt := evt.Info.Sender, evt.Info.SenderAlt
 			if p := target.GetParticipant(); p != "" {
 				if j, err := types.ParseJID(p); err == nil {
+					author, authorAlt = j, types.EmptyJID
 					rec.SenderJid = nc.canonicalUser(j, types.EmptyJID).String()
 				}
 			}
-			return []whatsAppRecord{rec}
+			return whatsAppTargetCopies(rec, nc.formerUsers(rawChat, chatAlt), nc.formerUsers(author, authorAlt))
 		default:
 			// Key shares, history notifications, ephemeral settings: not content.
 			return nil
@@ -255,10 +270,24 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 		key := rm.GetKey()
 		rec.WaMessageID = clipWhatsAppID(key.GetID())
 		rec.ReactorJid = sender.String()
-		rec.SenderJid = whatsAppReactionTargetSender(key.GetParticipant(), key.GetFromMe(), evt.Info, chat, sender, nc).String()
+		author, authorAlt := whatsAppReactionTarget(key.GetParticipant(), key.GetFromMe(), evt.Info, rawChat, chatAlt, nc)
+		rec.SenderJid = nc.canonicalUser(author, authorAlt).String()
 		reaction := rm.GetText()
 		rec.Reaction = &reaction
-		return []whatsAppRecord{rec}
+		targets := whatsAppTargetCopies(rec, nc.formerUsers(rawChat, chatAlt), nc.formerUsers(author, authorAlt))
+		out := append([]whatsAppRecord(nil), targets...)
+		// A reactor holds one reaction per message, keyed by their identity.
+		// One left under a former identity is taken off, or it would show
+		// beside every change made since the join.
+		removed := ""
+		for _, former := range nc.formerUsers(evt.Info.Sender, evt.Info.SenderAlt) {
+			for _, t := range targets {
+				t.ReactorJid = former.String()
+				t.Reaction = &removed
+				out = append(out, t)
+			}
+		}
+		return out
 	}
 
 	rec := base
@@ -280,24 +309,70 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 	return []whatsAppRecord{rec}
 }
 
-// whatsAppReactionTargetSender resolves who wrote the message a reaction
-// points at. The key's FromMe is from the REACTOR's point of view.
-func whatsAppReactionTargetSender(participant string, keyFromMe bool, info types.MessageInfo, chat, reactor types.JID, nc whatsAppNormalizeContext) types.JID {
+// whatsAppReactionTarget is the address (primary, alt, as canonicalUser
+// takes them) of whoever wrote the message a reaction points at. The key's
+// FromMe is from the REACTOR's point of view.
+func whatsAppReactionTarget(participant string, keyFromMe bool, info types.MessageInfo, rawChat, chatAlt types.JID, nc whatsAppNormalizeContext) (types.JID, types.JID) {
 	if participant != "" {
 		if j, err := types.ParseJID(participant); err == nil {
-			return nc.canonicalUser(j, types.EmptyJID)
+			return j, types.EmptyJID
 		}
 	}
 	if keyFromMe {
-		return reactor // the reactor reacted to their own message
+		return info.Sender, info.SenderAlt // the reactor reacted to their own message
 	}
 	if info.IsFromMe {
-		return chat // I reacted to the peer's message in a 1:1 chat
+		return rawChat, chatAlt // I reacted to the peer's message in a 1:1 chat
 	}
 	if !nc.OwnJID.IsEmpty() {
-		return nc.canonicalUser(nc.OwnJID, types.EmptyJID) // the peer reacted to my message
+		return nc.OwnJID, types.EmptyJID // the peer reacted to my message
 	}
-	return chat
+	return rawChat, chatAlt
+}
+
+// whatsAppTargetCopies returns rec, an edit, revoke or reaction, then a copy
+// aimed at each place an earlier copy of its target may be stored: under a
+// former identity (whatsapp_identity.go, Formers) of the chat - a person's
+// 1:1 chat - or of the target's author. The cloud parks a copy whose target
+// does not exist, and drops it when the park expires.
+func whatsAppTargetCopies(rec whatsAppRecord, chatFormers, authorFormers []types.JID) []whatsAppRecord {
+	out := []whatsAppRecord{rec}
+	if len(chatFormers) == 0 && len(authorFormers) == 0 {
+		return out
+	}
+	if rec.ChatJid == rec.SenderJid {
+		// The peer's own message in their 1:1 chat: the chat and the author
+		// are one person, re-pointed together.
+		seen := map[string]bool{rec.ChatJid: true}
+		for _, f := range append(append([]types.JID(nil), chatFormers...), authorFormers...) {
+			if s := f.String(); !seen[s] {
+				seen[s] = true
+				cp := rec
+				cp.ChatJid, cp.SenderJid = s, s
+				out = append(out, cp)
+			}
+		}
+		return out
+	}
+	chats := []string{rec.ChatJid}
+	for _, f := range chatFormers {
+		chats = append(chats, f.String())
+	}
+	authors := []string{rec.SenderJid}
+	for _, f := range authorFormers {
+		authors = append(authors, f.String())
+	}
+	for i, c := range chats {
+		for j, a := range authors {
+			if i == 0 && j == 0 {
+				continue
+			}
+			cp := rec
+			cp.ChatJid, cp.SenderJid = c, a
+			out = append(out, cp)
+		}
+	}
+	return out
 }
 
 // whatsAppContent extracts (text/caption, type, media metadata, quoted id).

@@ -32,7 +32,12 @@
 // anything joined the two still splits: nothing on this computer can know
 // they are one person. When a later event joins them, the phone-number form's
 // identity wins from then on (the LID form is re-pointed to it), so the split
-// stops growing.
+// stops growing. The identity the re-pointed form had is kept as one of its
+// FORMER identities (Formers): an edit, revoke or reaction aimed at a message
+// written under it goes under each former identity as well
+// (whatsapp_normalize.go, whatsAppTargetCopies). A delete-for-everyone of a
+// message from before the join therefore still finds it, rather than parking
+// in the cloud until the park expires with the text still stored.
 //
 // The table lives in outbox.db (whatsapp_outbox.go), so it is kept exactly as
 // long as the link's outbox: across a re-link ("Link again" keeps the outbox,
@@ -54,6 +59,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +80,16 @@ type whatsAppIdentityStore interface {
 // message carries one), so a miss only holds for now; the TTL keeps a large
 // history sync from asking the store again for every message.
 var whatsAppAlternateMissTTL = time.Minute
+
+// A form's former identities are recorded in the same table under a key no
+// JID can take (a JID holds no "|"), space-separated, newest first, at most
+// whatsAppMaxFormers of them.
+const (
+	whatsAppFormerKeyPrefix = "former|"
+	whatsAppMaxFormers      = 4
+)
+
+func whatsAppFormerKey(form string) string { return whatsAppFormerKeyPrefix + form }
 
 // whatsAppIdentityResolver implements whatsAppIdentity (whatsapp_normalize.go).
 type whatsAppIdentityResolver struct {
@@ -138,7 +154,11 @@ func (ir *whatsAppIdentityResolver) Learn(pn, lid types.JID) {
 	lidID, lidOK := ir.store.lookupIdentity(lid.String())
 	switch {
 	case pnOK && (!lidOK || lidID != pnID):
-		ir.store.stageIdentities(map[string]string{lid.String(): pnID})
+		updates := map[string]string{lid.String(): pnID}
+		if lidOK {
+			ir.keepFormerLocked(lid.String(), lidID, pnID, updates)
+		}
+		ir.store.stageIdentities(updates)
 	case lidOK && !pnOK:
 		ir.store.stageIdentities(map[string]string{pn.String(): lidID})
 	}
@@ -149,6 +169,55 @@ func (ir *whatsAppIdentityResolver) rememberLocked(pn, lid types.JID) {
 	ir.known[pn], ir.known[lid] = lid, pn
 	delete(ir.missedAt, pn)
 	delete(ir.missedAt, lid)
+}
+
+// keepFormerLocked adds `was`, the identity form is re-pointed away from, to
+// the form's former identities in updates: newest first, never `now` (the
+// identity it is re-pointed to), at most whatsAppMaxFormers. Caller holds mu.
+func (ir *whatsAppIdentityResolver) keepFormerLocked(form, was, now string, updates map[string]string) {
+	formers := []string{was}
+	if prev, ok := ir.store.lookupIdentity(whatsAppFormerKey(form)); ok {
+		for _, f := range strings.Fields(prev) {
+			if len(formers) == whatsAppMaxFormers {
+				break
+			}
+			if f != was && f != now {
+				formers = append(formers, f)
+			}
+		}
+	}
+	updates[whatsAppFormerKey(form)] = strings.Join(formers, " ")
+}
+
+// whatsAppPairOf sorts an event's address (already a person's form) and its
+// alternate into the phone-number and LID forms; either may stay empty.
+func whatsAppPairOf(first, alt types.JID) (pn, lid types.JID) {
+	place := func(j types.JID) {
+		if j, ok := whatsAppPersonForm(j); ok {
+			if j.Server == types.DefaultUserServer && pn.IsEmpty() {
+				pn = j
+			} else if j.Server == types.HiddenUserServer && lid.IsEmpty() {
+				lid = j
+			}
+		}
+	}
+	place(first)
+	place(alt)
+	return pn, lid
+}
+
+// completePairLocked fills the form the event did not carry (otherForm); a
+// pair the event carried whole is remembered. Caller holds mu.
+func (ir *whatsAppIdentityResolver) completePairLocked(pn, lid types.JID) (types.JID, types.JID) {
+	switch {
+	case !pn.IsEmpty() && !lid.IsEmpty():
+		ir.rememberLocked(pn, lid) // the event's own pair is authoritative
+	case pn.IsEmpty():
+		pn = ir.otherForm(lid)
+	default:
+		lid = ir.otherForm(pn)
+	}
+	return pn, lid
 }
 
 // otherForm completes a pair: known mappings first, then the store (a miss
@@ -187,29 +256,11 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 	if !ok {
 		return first
 	}
-	var pn, lid types.JID
-	place := func(j types.JID) {
-		if j, ok := whatsAppPersonForm(j); ok {
-			if j.Server == types.DefaultUserServer && pn.IsEmpty() {
-				pn = j
-			} else if j.Server == types.HiddenUserServer && lid.IsEmpty() {
-				lid = j
-			}
-		}
-	}
-	place(first)
-	place(alt)
+	pn, lid := whatsAppPairOf(first, alt)
 
 	ir.mu.Lock()
 	defer ir.mu.Unlock()
-	switch {
-	case !pn.IsEmpty() && !lid.IsEmpty():
-		ir.rememberLocked(pn, lid) // the event's own pair is authoritative
-	case pn.IsEmpty():
-		pn = ir.otherForm(lid)
-	default:
-		lid = ir.otherForm(pn)
-	}
+	pn, lid = ir.completePairLocked(pn, lid)
 	lookup := func(j types.JID) (string, bool) {
 		if j.IsEmpty() {
 			return "", false
@@ -232,9 +283,15 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 	updates := map[string]string{}
 	if !pn.IsEmpty() && (!pnOK || pnID != id) {
 		updates[pn.String()] = id
+		if pnOK {
+			ir.keepFormerLocked(pn.String(), pnID, id, updates)
+		}
 	}
 	if !lid.IsEmpty() && (!lidOK || lidID != id) {
 		updates[lid.String()] = id
+		if lidOK {
+			ir.keepFormerLocked(lid.String(), lidID, id, updates)
+		}
 	}
 	if len(updates) > 0 {
 		ir.store.stageIdentities(updates)
@@ -242,6 +299,50 @@ func (ir *whatsAppIdentityResolver) Canonical(primary, alt types.JID) types.JID 
 	out, err := types.ParseJID(id)
 	if err != nil {
 		return first
+	}
+	return out
+}
+
+// Formers returns the identities the person addressed by primary (with alt)
+// was written under before a join re-pointed one of their forms, newest
+// first, never the identity Canonical gives them now. Nothing for a person no
+// join ever re-pointed, or for anything that is not a person.
+func (ir *whatsAppIdentityResolver) Formers(primary, alt types.JID) []types.JID {
+	first, ok := whatsAppPersonForm(primary)
+	if !ok {
+		return nil
+	}
+	pn, lid := whatsAppPairOf(first, alt)
+	ir.mu.Lock()
+	defer ir.mu.Unlock()
+	pn, lid = ir.completePairLocked(pn, lid)
+	seen := map[string]bool{}
+	for _, form := range []types.JID{pn, lid} { // Canonical's order
+		if !form.IsEmpty() {
+			if id, ok := ir.store.lookupIdentity(form.String()); ok {
+				seen[id] = true
+				break
+			}
+		}
+	}
+	var out []types.JID
+	for _, form := range []types.JID{lid, pn} {
+		if form.IsEmpty() {
+			continue
+		}
+		prev, ok := ir.store.lookupIdentity(whatsAppFormerKey(form.String()))
+		if !ok {
+			continue
+		}
+		for _, f := range strings.Fields(prev) {
+			if seen[f] {
+				continue
+			}
+			seen[f] = true
+			if j, err := types.ParseJID(f); err == nil {
+				out = append(out, j)
+			}
+		}
 	}
 	return out
 }
