@@ -1979,8 +1979,10 @@ capacity as unknown. The plan chip said "Max", because the credential's
   constraint. At most 32 rows, labels bounded to 64 runes / 256 bytes, the pool
   key to 64 bytes, kind + label + model unique: the signed receipt rejects any
   violation for the whole refresh, and no new receipt field is used. When two
-  windows share an identity, the better evidence is kept at the first one's
-  position: a reading over Unknown, else the later observation. A new
+  windows share an identity (two kinds of one group scoped to one model), one
+  row is published at the first one's position: a reading over Unknown, else
+  the more constraining reading, and the later observation only on a tie.
+  Over-block, never over-admit. A new
   window id is logged once per process (`[claude-usage] provider reported
   windows …`), ids only.
 - **Second source: Claude Code's own cached reply.** `~/.claude.json`

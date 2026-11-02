@@ -610,13 +610,18 @@ func TestClaudeGenericWindows_CappedAndDeduplicated(t *testing.T) {
 		t.Errorf("the modelled rows lost their places to the cap: %v", metricSummary(rows[:2]))
 	}
 
-	// Two different kinds that derive the same row identity: the later is dropped.
-	twins := []string{`{"kind":"weekly_twin","group":"weekly","percent":1}`, `{"kind":"twin","group":"weekly","percent":2}`}
-	if err := json.Unmarshal([]byte(`{"limits":[`+strings.Join(twins, ",")+`]}`), &decoded); err != nil {
-		t.Fatal(err)
+	// Two different kinds that derive the same row identity publish one row —
+	// the more constraining of the two, whichever the server listed first.
+	for _, twins := range [][]string{
+		{`{"kind":"weekly_twin","group":"weekly","percent":1}`, `{"kind":"twin","group":"weekly","percent":2}`},
+		{`{"kind":"weekly_twin","group":"weekly","percent":2}`, `{"kind":"twin","group":"weekly","percent":1}`},
+	} {
+		if err := json.Unmarshal([]byte(`{"limits":[`+strings.Join(twins, ",")+`]}`), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		buckets, set = claudeUsageReplyWindows(decoded, now.UnixMilli())
+		assertMetricSummary(t, claudeCodeMetricsFromWindowSet(buckets, set, now), "Weekly twin|weekly||2")
 	}
-	buckets, set = claudeUsageReplyWindows(decoded, now.UnixMilli())
-	assertMetricSummary(t, claudeCodeMetricsFromWindowSet(buckets, set, now), "Weekly twin|weekly||1")
 }
 
 // A new window is diagnosable from agent.log: its id is logged once per
@@ -1372,11 +1377,13 @@ func TestClaudeGenericWindow_TheModelIDFillingInKeepsTheWindow(t *testing.T) {
 	assertMetricSummary(t, claudeCodeMetricsFromCache(t1, ""), "Weekly quota|weekly||41", "Daily Haiku 5|daily|haiku|100")
 }
 
-// Two windows can still share a row identity (kind + label + model), and the
-// receipt takes one row per identity. The one kept is the better evidence — a
-// reading over an Unknown placeholder, else the later observation — at the
-// earlier row's position; never simply whichever was added first, nor the id
-// that happens to sort first.
+// Two windows can still share a row identity (kind + label + model) — two
+// kinds of one group scoped to the same model, say — and the receipt takes one
+// row per identity. The one kept is the better evidence, at the earlier row's
+// position: a reading over an Unknown placeholder, else the more CONSTRAINING
+// reading, the later observation only on a tie. Never simply whichever was
+// added first, nor whichever was read last, nor the id that happens to sort
+// first: a fresher 30 % must not hide a spent window beside it (over-admit).
 func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	reading := func(label string, used float64, at time.Time) cliAgentUsageMetric {
@@ -1390,16 +1397,19 @@ func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 		ObservedAt: now.UTC().Format(time.RFC3339)}
 	other := reading("Daily quota", 5, now)
 
+	earlier := now.Add(-time.Hour)
 	for _, tc := range []struct {
-		name  string
-		adds  []cliAgentUsageMetric
-		wantN float64
+		name   string
+		adds   []cliAgentUsageMetric
+		wantN  float64
+		wantAt time.Time
 	}{
-		{"a reading replaces an Unknown placeholder", []cliAgentUsageMetric{unknown, other, reading("Daily Haiku 5", 100, now)}, 100},
-		{"a reading replaces a rolled-over window observed later", []cliAgentUsageMetric{rolledOver, other, reading("Daily Haiku 5", 70, now.Add(-time.Hour))}, 70},
-		{"an Unknown placeholder never replaces a reading", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now), other, unknown}, 30},
-		{"the later observation wins", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now.Add(-time.Hour)), other, reading("Daily Haiku 5", 100, now)}, 100},
-		{"an older observation does not", []cliAgentUsageMetric{reading("Daily Haiku 5", 100, now), other, reading("Daily Haiku 5", 30, now.Add(-time.Hour))}, 100},
+		{"a reading replaces an Unknown placeholder", []cliAgentUsageMetric{unknown, other, reading("Daily Haiku 5", 100, now)}, 100, now},
+		{"a reading replaces a rolled-over window observed later", []cliAgentUsageMetric{rolledOver, other, reading("Daily Haiku 5", 70, earlier)}, 70, earlier},
+		{"an Unknown placeholder never replaces a reading", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now), other, unknown}, 30, now},
+		{"the more constraining reading wins", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, earlier), other, reading("Daily Haiku 5", 100, now)}, 100, now},
+		{"a spent window is not hidden by a fresher, healthier one", []cliAgentUsageMetric{reading("Daily Haiku 5", 100, earlier), other, reading("Daily Haiku 5", 30, now)}, 100, earlier},
+		{"a tie takes the later observation", []cliAgentUsageMetric{reading("Daily Haiku 5", 50, earlier), other, reading("Daily Haiku 5", 50, now)}, 50, now},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows := claudeMetricRows{}
@@ -1409,28 +1419,30 @@ func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 			if len(rows.metrics) != 2 || rows.metrics[0].Label != "Daily Haiku 5" || rows.metrics[1].Label != "Daily quota" {
 				t.Fatalf("rows=%v, want the shared identity once, at its first position", metricSummary(rows.metrics))
 			}
-			if got := rows.metrics[0]; got.Unknown || *got.Consumed != tc.wantN {
-				t.Errorf("kept %v, want %g", metricSummary(rows.metrics[:1]), tc.wantN)
+			got := rows.metrics[0]
+			if got.Unknown || *got.Consumed != tc.wantN || got.ObservedAt != tc.wantAt.UTC().Format(time.RFC3339) {
+				t.Errorf("kept %v observed %s, want %g observed %s", metricSummary(rows.metrics[:1]), got.ObservedAt,
+					tc.wantN, tc.wantAt.UTC().Format(time.RFC3339))
 			}
 		})
 	}
 
-	// Through the row builder: two cache ids with one identity — which one is
-	// fresher, not which id sorts first, decides.
-	for _, fresherID := range []string{"limit:daily_scoped:model:aaa", "limit:daily_scoped:model:zzz"} {
+	// Through the row builder: two cache ids with one identity. The spent one
+	// is published whichever id sorts first and whichever was read last.
+	for _, spentID := range []string{"limit:daily_scoped:model:aaa", "limit:daily_scoped:model:zzz"} {
 		buckets := map[string]claudeRateLimitBucket{}
 		for _, id := range []string{"limit:daily_scoped:model:aaa", "limit:daily_scoped:model:zzz"} {
-			used, at := 30.0, now.Add(-time.Hour)
-			if id == fresherID {
-				used, at = 100, now
+			used, at := 30.0, now // the healthier window, read last
+			if id == spentID {
+				used, at = 100, earlier
 			}
 			buckets[id] = claudeRateLimitBucket{UsedPercentage: used, ResetsAtMs: now.Add(10 * time.Hour).UnixMilli(),
 				ObservedAtMs: at.UnixMilli(), UsageObserved: usageObservedPtr(true),
 				Row: &claudeReportedWindow{Kind: "daily", Label: "Daily Haiku 5", Model: "haiku"}}
 		}
 		got := metricSummary(claudeCodeMetricsFromBuckets(buckets, now))
-		if want := "Daily Haiku 5|daily|haiku|100"; got[len(got)-1] != want || len(got) != 4 {
-			t.Errorf("fresher=%s: rows %v, want the three rows then %s", fresherID, got, want)
+		if want := "Daily Haiku 5|daily|haiku|100"; len(got) != 4 || got[len(got)-1] != want {
+			t.Errorf("spent=%s: rows %v, want the three rows then %s", spentID, got, want)
 		}
 	}
 }

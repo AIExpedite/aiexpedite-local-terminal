@@ -1127,14 +1127,14 @@ type claudeMetricRows struct {
 }
 
 // add appends m — or, when a row with the same identity is already in, keeps
-// whichever of the two is the better evidence, at the earlier row's position:
-// a reading over an Unknown placeholder, else the later observation; a tie
-// keeps the row already in. Two windows can share an identity — one model's
-// window under a cache id the provider has since re-spelled, say, beside the
-// reading under the old one — and whichever was added first must not win just
-// for being first, or a stale 30 % hides the 100 % read after it. The three
-// modelled rows never collide (claudeIsFrozenLabel keeps every derived label
-// off theirs).
+// whichever of the two is the better evidence (claudeRowIsBetterEvidence), at
+// the earlier row's position. The receipt takes one row per identity, so two
+// windows that derive one identity — two kinds of one group scoped to the same
+// model, which the label does not tell apart — publish ONE row, and it must be
+// the one that constrains: whichever was added first must not win just for
+// being first, nor whichever was read last, or a 30 % window hides a spent one
+// beside it and routing admits a model that cannot run. The three modelled rows
+// never collide (claudeIsFrozenLabel keeps every derived label off theirs).
 func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
 	identity := m.Kind + "\x00" + m.Label + "\x00" + m.Model
 	if r.index == nil {
@@ -1153,9 +1153,14 @@ func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
 	r.metrics = append(r.metrics, m)
 }
 
-// claudeRowIsBetterEvidence reports whether `candidate` says more about its
-// window than `held`: a reading beats an Unknown placeholder, and between two
-// readings the later observation wins.
+// claudeRowIsBetterEvidence reports whether `candidate` should replace `held`
+// as the one row of their shared identity: a reading beats an Unknown
+// placeholder, and between two readings the more CONSTRAINING one wins (the
+// higher share consumed), the later observation only on a tie — the way the
+// weekly row keeps the worst of its windows (aggregateWeeklyMetric). Over-block,
+// never over-admit. That is also right for one window read under two cache ids:
+// usage within a window only grows, and a reading whose window has rolled over
+// is already Unknown.
 func claudeRowIsBetterEvidence(candidate, held cliAgentUsageMetric) bool {
 	if candidate.Unknown {
 		return false
@@ -1163,7 +1168,18 @@ func claudeRowIsBetterEvidence(candidate, held cliAgentUsageMetric) bool {
 	if held.Unknown {
 		return true
 	}
+	if c, h := claudeRowConsumed(candidate), claudeRowConsumed(held); c != h {
+		return c > h
+	}
 	return observedAtMsFromRFC3339(candidate.ObservedAt) > observedAtMsFromRFC3339(held.ObservedAt)
+}
+
+// claudeRowConsumed is a reading's share consumed, 0 when it carries none.
+func claudeRowConsumed(m cliAgentUsageMetric) float64 {
+	if m.Consumed == nil {
+		return 0
+	}
+	return *m.Consumed
 }
 
 // addGenericReadings adds a row for every reading of a window this agent never
