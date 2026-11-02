@@ -9,6 +9,10 @@
 // (cliagent_usage_claudecode_probe.go), so the probe decides staleness without
 // reading the cache a second time.
 //
+// Which rows exist is the account's reported window set when one is known
+// (cliagent_usage_claudecode_windowset.go — claudeCodeMetricsFromView); the fixed
+// three-row layout below is what an account with no known set still gets.
+//
 // The writers that fill this cache live in cliagent_ratelimit.go (stream
 // capture), statusline_hook.go (interactive renders) and the probe.
 package main
@@ -18,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -103,6 +106,29 @@ type claudeRateLimitView struct {
 	// that landed after it — because the own generation does not version that
 	// row and a receipt must never sign it under one.
 	generation *cliUsageGeneration
+	// reported is the NEWEST authoritative window set the probe persisted among
+	// the snapshots merged here (claudeRateLimitSnapshot.ReportedWindows), or nil
+	// when none carries one. Newest by its own instant, not by which file it came
+	// from: the two channels' probes answer the same account-scoped question,
+	// and the later answer is the better-informed one.
+	reported *claudeWindowSet
+	// dot is what Claude Code's own config says right now: the signed-in
+	// account (the window sets are bound to it) and its own cached copy of the
+	// usage reply, the second source of the window set. Display evidence only —
+	// never a fingerprint or a cache scope. See claudeEffectiveWindowSet.
+	dot claudeDotJSONFacts
+}
+
+// claudeRateLimitViewOf is the view of ONE snapshot, for a caller that already
+// holds it — the seed's locked read, which must measure the snapshot by the
+// same rows the merged view would show.
+func claudeRateLimitViewOf(snap claudeRateLimitSnapshot, dot claudeDotJSONFacts) claudeRateLimitView {
+	return claudeRateLimitView{
+		buckets:    snap.Buckets,
+		probedAtMs: snap.LastProbeObservedAtMs,
+		reported:   claudeSnapshotWindowSet(snap),
+		dot:        dot,
+	}
 }
 
 // probeObservedAtMs is the newest instant a PROBE reading is on record for this
@@ -118,8 +144,9 @@ func (v claudeRateLimitView) probeObservedAtMs() int64 {
 }
 
 // loadMergedClaudeRateLimitView is loadMergedClaudeRateLimitBuckets plus the
-// snapshot-level probe evidence, read in the SAME pass so the two cannot
-// describe different reads of the cache.
+// snapshot-level probe evidence and window set, read in the SAME pass so they
+// cannot describe different reads of the cache, plus Claude Code's own config
+// (claudeDotJSONFactsFor, one stat when it has not changed).
 func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitView {
 	home, _ := os.UserHomeDir()
 	paths := []string{claudeRateLimitCachePath()}
@@ -127,7 +154,7 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 		paths = append(paths, pinned)
 	}
 
-	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}
+	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}, dot: claudeDotJSONFactsFor(home)}
 	selectsUnimportedPinned := false
 	for i, path := range paths {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
@@ -139,6 +166,9 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 		}
 		if snap.LastProbeObservedAtMs > view.probedAtMs {
 			view.probedAtMs = snap.LastProbeObservedAtMs
+		}
+		if set := claudeSnapshotWindowSet(snap); set != nil && (view.reported == nil || set.AtMs > view.reported.AtMs) {
+			view.reported = set
 		}
 		for window, bucket := range snap.Buckets {
 			prev, seen := view.buckets[window]
@@ -179,6 +209,12 @@ func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitVie
 // imported probe evidence still counts as probe evidence. A single-channel
 // machine, where the hook pins the own cache, reads nothing beyond the hook's
 // settings.
+//
+// A NEWER authoritative window set on the pinned cache (the other channel's
+// probe answered after ours) is carried across too, with the account it is
+// bound to, so this agent hides the windows that answer omits even once the
+// pinned file is gone. It moves no generation by itself: the generation
+// versions numeric readings, and only those committed here return one.
 func importPinnedClaudeObservations(fingerprint string) *cliUsageGeneration {
 	return importPinnedClaudeObservationsAs(&fingerprint)
 }
@@ -224,7 +260,11 @@ func importPinnedClaudeObservationsAs(fingerprint *string) *cliUsageGeneration {
 		}
 		bySource[bucket.Source][window] = bucket
 	}
-	if len(bySource) == 0 {
+	var newerSet *claudeWindowSet
+	if set := claudeSnapshotWindowSet(pinnedSnap); set != nil && set.AtMs > ownSnap.ReportedWindowsAtMs {
+		newerSet = set
+	}
+	if len(bySource) == 0 && newerSet == nil {
 		return nil
 	}
 	// Writing a cache this read found absent: "" joins the allowed scopes so a
@@ -239,7 +279,7 @@ func importPinnedClaudeObservationsAs(fingerprint *string) *cliUsageGeneration {
 	_, _ = withClaudeRateLimitCacheLocked(own, time.Time{}, func() (time.Time, error) {
 		now := time.Now()
 		for source, updates := range bySource {
-			_, advanced, err := mergeClaudeRateLimitCacheLocked(own, updates, now, scope, source, allowed, claudeCredStamp{})
+			_, advanced, err := mergeClaudeRateLimitCacheLocked(own, updates, nil, now, scope, source, allowed, claudeCredStamp{})
 			if err != nil {
 				return time.Time{}, err
 			}
@@ -247,15 +287,25 @@ func importPinnedClaudeObservationsAs(fingerprint *string) *cliUsageGeneration {
 				committed = advanced
 			}
 		}
+		// The set as its own write, with no provenance: it is not this channel's
+		// probe sampling anything, so it advances no probe evidence, settles no
+		// debt and clears no credential wait (all of which are keyed to the probe
+		// source in the merge). The merge's newer-wins rule re-checks it against
+		// whatever set the own cache holds under this lock.
+		if newerSet != nil {
+			if _, _, err := mergeClaudeRateLimitCacheLocked(own, nil, newerSet, now, scope, "", allowed, claudeCredStamp{}); err != nil {
+				return time.Time{}, err
+			}
+		}
 		return time.Time{}, nil
 	})
 	return committed
 }
 
-// claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
-// falling back to the Unknown placeholders when a window hasn't been observed.
-// Three rows are always shown so the card layout is stable: the 5-hour session
-// window, the weekly window, and the weekly Fable window.
+// claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache —
+// the rows of the account's reported window set when one is known
+// (claudeCodeMetricsFromView), today's three otherwise — falling back to the
+// Unknown placeholders when a window hasn't been observed.
 //
 // The cache is trusted only when its `accountFingerprint` exactly matches the
 // caller-supplied one. Two empty fingerprints match (no creds + unscoped
@@ -265,21 +315,59 @@ func importPinnedClaudeObservationsAs(fingerprint *string) *cliUsageGeneration {
 // fallback entry after the local credentials were removed.
 //
 // This is the load-then-shape convenience form. The parser itself takes the
-// split path (claudeCodeMetricsFromBuckets) because it has already read the
-// cache to decide whether to spend a utilization probe.
+// split path (claudeCodeMetricsFromView) because it has already read the cache
+// to decide whether to spend a utilization probe.
 func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	return claudeCodeMetricsFromBuckets(loadMergedClaudeRateLimitBuckets(currentFingerprint), now)
+	return claudeCodeMetricsFromView(loadMergedClaudeRateLimitView(currentFingerprint), now)
 }
 
-// claudeCodeMetricsFromBuckets shapes already-loaded buckets into the metric
-// rows. Split from the loading half so a caller that has just read the cache for
-// another reason — the parser's staleness check, which must know the freshest
-// observation before deciding whether to probe — does not read it a second time.
-// Each load also re-parses Claude's settings.json to locate the pinned hook
-// cache, so the duplicate was not free.
+// claudeCodeMetricsFromView shapes an already-loaded view into the metric rows
+// the card shows and the receipt signs. Split from the loading half so a caller
+// that has just read the cache for another reason — the parser's staleness
+// check, which must know the freshest observation before deciding whether to
+// probe — does not read it a second time. Each load also re-parses Claude's
+// settings.json to locate the pinned hook cache, so the duplicate was not free.
+//
+// With a window set known (claudeEffectiveWindowSet), the rows are the set's
+// (claudeCodeMetricsFromWindowSet). With none — never probed successfully, a
+// cache from an older agent, or a set bound to another login — they are
+// today's three, then any reading of a window this agent never modelled that
+// this login took (a partial reply's new meter). Every freshness decision walks
+// these same rows (claudeRowObservationsMs), so a hidden window neither
+// triggers a probe nor counts as fresh evidence.
+//
+// A reading of a window this agent never modelled that was taken under another
+// login (claudeBucketsForLogin) is left out of both: after a `/login` to another
+// account or organization — invisible to a claude.ai credential's cache scope —
+// the previous login's new meters must not become the new login's rows, and
+// nothing the new login reports would ever overwrite them.
+func claudeCodeMetricsFromView(view claudeRateLimitView, now time.Time) []cliAgentUsageMetric {
+	buckets := claudeBucketsForLogin(view.buckets, view.dot.binding())
+	if set := claudeEffectiveWindowSet(view, now); set != nil {
+		return claudeCodeMetricsFromWindowSet(buckets, set, now)
+	}
+	return claudeCodeMetricsFromBuckets(buckets, now)
+}
+
+// claudeCodeMetricsFromBuckets is the row layout for an account whose window
+// set is NOT known, and the buckets-only entry point for a caller that has no
+// set: three rows, always — the 5-hour session window, the weekly window and
+// the weekly Fable window — so the card layout stays stable whether or not the
+// windows have been observed. Unchanged from before window sets existed, which
+// is what keeps an older cache (and every test written against one) reading
+// exactly as it did.
+//
+// After them, a row for every reading of a window this agent never modelled
+// (claudeMetricRows.addGenericReadings) that the caller passes in: a reading
+// from a reply that was not authoritative, which records no set, or one whose
+// set is ignored because it was read under another login. A new meter such a
+// reply could read is still a constraint the card and routing must see. The
+// caller drops the readings another login took (claudeCodeMetricsFromView,
+// claudeBucketsForLogin), and a cache an older agent wrote holds none, so
+// either still reads as exactly the three rows.
 func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now time.Time) []cliAgentUsageMetric {
 	session := observedMetricOrUnknown(
-		buckets, []string{claudeWindowFiveHour}, limitKindSession, "5-hour session window", now)
+		buckets, []string{claudeWindowFiveHour}, limitKindSession, claudeSessionLabel, now)
 	// Weekly is reported under seven_day; some plans split it per-model. When
 	// both per-model buckets are present we aggregate CONSERVATIVELY so an
 	// exhausted Opus quota isn't hidden behind a healthier Sonnet number.
@@ -291,7 +379,7 @@ func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now 
 	// card renders as the dashed "Usage unobservable" bar rather than a 0% bar
 	// that would read as "plenty of Fable quota left".
 	fable := observedMetricOrUnknown(
-		buckets, claudeFableWindowIDs(buckets), limitKindWeekly, "Weekly Fable", now)
+		buckets, claudeFableWindowIDs(buckets), limitKindWeekly, claudeFableLabel, now)
 	// Naming the model makes this row a NESTED sub-limit rather than another
 	// window of the shared weekly budget (shared-constants
 	// `codingAgentPoolFor`): spending it blocks Fable and leaves the account
@@ -300,7 +388,12 @@ func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now 
 	// per-model pools this way.
 	fable.Model = claudeModelFable
 
-	return []cliAgentUsageMetric{session, weekly, fable}
+	rows := claudeMetricRows{}
+	rows.add(session)
+	rows.add(weekly)
+	rows.add(fable)
+	rows.addGenericReadings(buckets, nil, now)
+	return rows.metrics
 }
 
 // claudeFableWindowIDs returns the cache keys that may hold the weekly Fable
@@ -335,14 +428,15 @@ func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now 
 // five_hour* keys are excluded: Claude already splits the weekly window
 // per-model, so a symmetric `five_hour_fable` is plausible, and surfacing a
 // session-window bucket under a row labelled "Weekly Fable" would misreport it.
+// Generic window ids (claudeGenericWindowPrefix) are excluded for the same
+// reason: `limit:daily_scoped:model:fable` is a daily window with a row of its
+// own, not a spelling of the weekly one. claudeIsFableWindowID is the rule.
 func claudeFableWindowIDs(buckets map[string]claudeRateLimitBucket) []string {
 	variants := make([]string, 0, len(buckets))
 	for id := range buckets {
-		lower := strings.ToLower(id)
 		if id == claudeWindowSevenDayFable ||
 			id == claudeWindowSevenDayOverageIncluded ||
-			!strings.Contains(lower, "fable") ||
-			strings.HasPrefix(lower, claudeWindowFiveHour) {
+			!claudeIsFableWindowID(id) {
 			continue
 		}
 		variants = append(variants, id)
@@ -439,7 +533,7 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		observed = true
 	}
 	if !observed {
-		metric := cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
+		metric := cliAgentUsageMetric{Kind: limitKindWeekly, Label: claudeWeeklyLabel, Unit: "%", Unknown: true}
 		if liveUnobservedReset > 0 {
 			metric.ResetAt = time.UnixMilli(liveUnobservedReset).UTC().Format(time.RFC3339)
 		}
@@ -448,7 +542,7 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 	observedAt := observedAtRFC3339(worstObserved)
 	if !worstCurrent {
 		return cliAgentUsageMetric{
-			Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+			Kind: limitKindWeekly, Label: claudeWeeklyLabel, Unit: "%",
 			ObservedAt: observedAt, Unknown: true,
 		}
 	}
@@ -457,7 +551,7 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		resetAt = time.UnixMilli(worstReset).UTC().Format(time.RFC3339)
 	}
 	return cliAgentUsageMetric{
-		Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+		Kind: limitKindWeekly, Label: claudeWeeklyLabel, Unit: "%",
 		Total: floatPtr(100), Consumed: floatPtr(worstUsed), Remaining: floatPtr(100 - worstUsed),
 		ResetAt: resetAt, ObservedAt: observedAt,
 	}
@@ -589,10 +683,12 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 }
 
 // stalestClaudeRowObservation returns the age of the snapshot as the DISPLAYED
-// CARD sees it: the oldest of the observations the three rows
-// claudeCodeMetricsFromBuckets emits actually SHOW, rather than the newest
-// reading anywhere in the cache. Per row it asks claudeRowObservationsMs, which
-// reads the emitted metric rather than re-deriving which bucket the row picked.
+// CARD sees it: the oldest of the observations the rows claudeCodeMetricsFromView
+// emits actually SHOW, rather than the newest reading anywhere in the cache.
+// Per row it asks claudeRowObservationsMs, which reads the emitted metric rather
+// than re-deriving which bucket the row picked — and, through the view, sees
+// only the rows of the account's window set, so a window the provider no
+// longer reports can neither pin the snapshot stale nor pass for fresh.
 //
 // Why not latestClaudeObservation: the writers cover different windows. Claude's
 // status-line payload carries only `five_hour` and `seven_day` (see
@@ -624,10 +720,28 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 //
 // A zero return means "nothing observed" — the same "probe if you can" answer
 // latestClaudeObservation gives for an empty cache.
+//
+// One case is not "nothing observed", and must not read as it: an account whose
+// window set the probe itself reported, where no row carries a reading the
+// probe could have supplied — no meters at all (`limits: []`), or only windows
+// the endpoint names without a value. The probe's answer IS the snapshot then,
+// as fresh as the probe that gave it, so its instant is returned: zero would ask
+// the endpoint again on every gather for an answer it has just given.
+//
+// Decided on the probe's OWN set (claudeBoundProbeWindowSet), never on the
+// effective one the rows are built from. Claude Code refreshes its cached copy
+// of the reply whenever it shows usage, and a newer copy of the same "no
+// meters" answer says nothing about how fresh our values are; judged by the
+// effective set, every such refresh read as "probe now", and a meter-less
+// account was re-probed inside the TTL after each one. A window that copy names
+// and the probe's set does not waits for the TTL like any other reading. With
+// no probe set of our own (only Claude Code's, or one read under another
+// account), "probe if you can" stands; so it does when the probe's evidence is
+// older than its set (a set carried across from the other channel's cache).
 func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.Time {
 	probedAt := view.probeObservedAtMs()
 	stalest := int64(0)
-	for _, displayed := range claudeRowObservationsMs(view.buckets, now) {
+	for _, displayed := range claudeRowObservationsMs(view, now) {
 		if displayed <= 0 {
 			continue // never observed — see the doc comment
 		}
@@ -639,6 +753,9 @@ func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.T
 		}
 	}
 	if stalest <= 0 {
+		if set := claudeBoundProbeWindowSet(view); set != nil && probedAt > 0 && set.AtMs <= probedAt {
+			return time.UnixMilli(probedAt).UTC()
+		}
 		return time.Time{}
 	}
 	return time.UnixMilli(stalest).UTC()
@@ -657,9 +774,10 @@ func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.T
 // newest-across-candidates freshness check called that row fresh on every
 // gather, suppressed the probe for the full staleness TTL, and left the visible
 // value hours old indefinitely. Freshness has to follow the bucket that actually
-// determines the row.
-func claudeRowObservationsMs(buckets map[string]claudeRateLimitBucket, now time.Time) []int64 {
-	metrics := claudeCodeMetricsFromBuckets(buckets, now)
+// determines the row — and the rows that are actually shown, which is why it
+// takes the view (and with it the window set) rather than the bare buckets.
+func claudeRowObservationsMs(view claudeRateLimitView, now time.Time) []int64 {
+	metrics := claudeCodeMetricsFromView(view, now)
 	out := make([]int64, 0, len(metrics))
 	for _, m := range metrics {
 		out = append(out, observedAtMsFromRFC3339(m.ObservedAt))

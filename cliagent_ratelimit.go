@@ -46,6 +46,11 @@ import (
 // window does not: Claude Code's own /usage panel reports it as a separate
 // "Weekly Fable" meter, so cliagent_usage_claudecode.go reads it as its own row
 // rather than folding it into that aggregate.
+//
+// These are the windows the agent MODELS. A window the usage endpoint reports
+// beyond them is cached under a generic `limit:<kind>…` id and renders as a row
+// of its own (cliagent_usage_claudecode_windowset.go); which windows are shown at
+// all follows the window set the provider reports.
 const (
 	claudeWindowFiveHour       = "five_hour"
 	claudeWindowSevenDay       = "seven_day"
@@ -113,6 +118,18 @@ type claudeRateLimitBucket struct {
 	// claudeRateLimitSource* constants). Omitted when empty so a cache written
 	// before this field existed round-trips byte-identically.
 	Source string `json:"source,omitempty"`
+	// Row is the row a GENERIC window (claudeGenericWindowPrefix) renders as —
+	// metric kind, label and nested-pool model, derived from the limits[] entry
+	// that produced this reading (claudeGenericWindow). It rides ON the reading
+	// so the two cannot be separated: the merge, the import from the other
+	// channel's cache and the merged view all move whole buckets. That is what
+	// lets a reading from a reply that is not authoritative — a malformed entry
+	// beside it — still render: the window set says which windows exist, this
+	// says what one is called, and a partial read may add a constraint even
+	// though it may never remove one. Written only by the probe, only on generic
+	// ids: nil on every modelled window, which stays numbers only, and a cache
+	// written before this field round-trips byte-identically.
+	Row *claudeReportedWindow `json:"row,omitempty"`
 }
 
 // hasObservedUsage reports whether UsedPercentage came from an actual reading.
@@ -151,6 +168,47 @@ type claudeRateLimitSnapshot struct {
 	// Omitted when zero so a cache written before this field existed round-trips
 	// byte-identically; readers fall back to the per-bucket provenance for those.
 	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
+
+	// ReportedWindows / ReportedWindowsAtMs are the window set the last
+	// AUTHORITATIVE probe reply reported for this account
+	// (cliagent_usage_claudecode_windowset.go), and the instant it was observed.
+	// The rows are built from it: a window it does not name is hidden — the
+	// verified Ultra account's five-hour window, say — unless a reading newer
+	// than the set shows it again. A generic window (one this agent never
+	// modelled) carries the row it renders as.
+	//
+	// Snapshot-level for the reason LastProbeObservedAtMs is: "the provider said
+	// these are all the windows at T" is a fact about the account, not about any
+	// one window, and a bucket another writer overwrote must not be able to erase
+	// it. Written ONLY by the probe, in the same locked merge as its readings
+	// (and carried across channels by importPinnedClaudeObservations); replaced
+	// only by a NEWER set; cleared with the rest of the account's state on a
+	// fingerprint transition (resetClaudeProbeAccountState). The status-line,
+	// stream and SessionEnd writers never touch it.
+	//
+	// Keyed by window id, like Buckets, so a known window persists as numbers
+	// only ({"five_hour":{"order":0}}); the value's order is the server's.
+	//
+	// Presence is ReportedWindowsAtMs > 0, because an EMPTY set (`limits: []`, an
+	// account with no meters) is a real answer and its map is omitted. Both are
+	// omitted when unset, so a cache written before they existed round-trips
+	// byte-identically — and an older agent binary that re-marshals the cache
+	// drops them, which degrades to today's three rows, never to an error.
+	ReportedWindows     map[string]claudeReportedWindow `json:"reportedWindows,omitempty"`
+	ReportedWindowsAtMs int64                           `json:"reportedWindowsAtMs,omitempty"`
+	// ReportedAccount is the one-way digest (claudeAccountRef) of the Claude
+	// account ~/.claude.json named when the set was read: display-only identity,
+	// never a fingerprint or a cache scope. A claude.ai credential carries no
+	// account, so this is the only thing that can tell a set read before a
+	// `/login` to another account from one that describes it
+	// (claudeEffectiveWindowSet). The digest, not the id, because this file can
+	// reach a diagnostics upload.
+	ReportedAccount string `json:"reportedAccount,omitempty"`
+	// ReportedOrg is the same for oauthAccount.organizationUuid (claudeOrgRef):
+	// quotas belong to the organization, and one Claude user can sign in to
+	// several, so a set read under another organization of the same account
+	// describes someone else's windows too (claudeAccountBinding).
+	ReportedOrg string `json:"reportedOrg,omitempty"`
 
 	// RefreshOwedAtMs is the newest run (or `__cli_smoke__` turn) completion for
 	// which no observation has landed yet — the DURABLE half of
@@ -299,6 +357,8 @@ const claudeUsageProvider = "claudeCode"
 func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
 	snap.Buckets = map[string]claudeRateLimitBucket{}
 	snap.LastProbeObservedAtMs = 0
+	// The window set describes ONE account's quota, exactly like its buckets.
+	snap.ReportedWindows, snap.ReportedWindowsAtMs, snap.ReportedAccount, snap.ReportedOrg = nil, 0, "", ""
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
 	snap.AttemptClaimedUntilMs = 0
@@ -475,6 +535,31 @@ func clampPercent(v float64) float64 {
 	return v
 }
 
+// claudeResetJitter is how far apart two reset stamps of one window may be and
+// still name the SAME window.
+//
+// The writers spell one reset differently. The usage endpoint stamps it with
+// sub-second jitter (`resets_at: 2026-11-02T20:59:59.539538+00:00`) while
+// stream events and the status line carry whole seconds (`21:00:00`), so an
+// exact comparison read every usage-less heartbeat for the window the probe had
+// just measured as a NEW window and wiped the reading to Unknown until the next
+// probe: the weekly row flipped to UNKNOWN after every run. A real rollover
+// moves a window's reset by its whole length — five hours at the least between
+// two consecutive windows of one id — so a minute of tolerance separates the
+// two by orders of magnitude, the same bound Codex uses (codexResetJitterMs).
+const claudeResetJitter = time.Minute
+
+// claudeSameResetWindow reports whether two known reset stamps (epoch ms)
+// describe the same window, within claudeResetJitter. The ONE place a Claude
+// reset is compared for window identity.
+func claudeSameResetWindow(a, b int64) bool {
+	delta := a - b
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= claudeResetJitter.Milliseconds()
+}
+
 // extractClaudeRateLimitBuckets pulls every window it can find from a decoded
 // Claude stream-json event. Handles three shapes:
 //   - rate_limit_event with a nested `rate_limit_info` (per-window)
@@ -619,7 +704,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false, nil, claudeCredStamp{})
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, nil, now, fingerprint, source, false, nil, claudeCredStamp{})
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -663,7 +748,7 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // it — and that treats an unserialized write as a failure. See
 // mergeClaudeRateLimitCacheInto.
 func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, nil, claudeCredStamp{})
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, nil, now, fingerprint, source, true, nil, claudeCredStamp{})
 }
 
 // errClaudeRateLimitCacheRescoped is returned when the snapshot found UNDER THE
@@ -695,7 +780,7 @@ var errClaudeRateLimitCacheRescoped = errors.New("claude rate-limit cache: re-sc
 // added to protect. An empty `allowedScopes` disables the guard, which is what
 // every writer that resolves its identity immediately before writing wants.
 func mergeClaudeRateLimitCacheCheckedScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true, allowedScopes, claudeCredStamp{})
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, nil, now, fingerprint, source, true, allowedScopes, claudeCredStamp{})
 }
 
 // mergeClaudeRateLimitCacheProbeScoped is mergeClaudeRateLimitCacheCheckedScoped
@@ -704,7 +789,17 @@ func mergeClaudeRateLimitCacheCheckedScoped(ctx context.Context, path string, up
 // clears a persisted credential wait only when it is still for that stamp — see
 // mergeClaudeRateLimitCacheLocked.
 func mergeClaudeRateLimitCacheProbeScoped(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, claudeRateLimitSourceProbe, true, allowedScopes, probedCred)
+	return mergeClaudeRateLimitCacheProbeReading(ctx, path, updates, nil, now, fingerprint, allowedScopes, probedCred)
+}
+
+// mergeClaudeRateLimitCacheProbeReading is mergeClaudeRateLimitCacheProbeScoped
+// carrying, beside the readings, the window set an AUTHORITATIVE reply reported
+// (nil for a reply that was not one). The set lands in the same locked write as
+// the readings it came with, so no reader can see one without the other — and
+// it is the one write allowed to carry no reading at all: `limits: []` is an
+// answer ("this account has no meters"), not an empty update to refuse.
+func mergeClaudeRateLimitCacheProbeReading(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, reported *claudeWindowSet, now time.Time, fingerprint string, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, reported, now, fingerprint, claudeRateLimitSourceProbe, true, allowedScopes, probedCred)
 }
 
 // claudeCacheScopeRejects reports whether a snapshot found on disk under
@@ -761,12 +856,12 @@ func claudeCacheScopeRejects(onDisk, fingerprint string, allowed []string) bool 
 // in both modes: there is no evidence of a competing holder, only of a
 // filesystem that will not give us the lock file (a read-only data dir fails the
 // write below anyway, which the verified caller does see).
-func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
-	if path == "" || len(updates) == 0 {
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, reported *claudeWindowSet, now time.Time, fingerprint, source string, verified bool, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
+	if path == "" || (len(updates) == 0 && reported == nil) {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	if !verified {
-		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{}, allowedScopes, probedCred)
+		return mergeClaudeRateLimitCacheSerialized(path, updates, reported, now, fingerprint, source, time.Time{}, allowedScopes, probedCred)
 	}
 	// A verified merge is bounded END TO END, not merely across its two lock
 	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
@@ -803,7 +898,7 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 	}
 	done := make(chan persistResult, 1)
 	go func() {
-		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline, allowedScopes, probedCred)
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, reported, now, fingerprint, source, deadline, allowedScopes, probedCred)
 		done <- persistResult{observed: observed, err: err}
 	}()
 	timer := time.NewTimer(time.Until(deadline))
@@ -840,12 +935,12 @@ func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map
 // The status-line hook runs in a process whose propagator never starts: the
 // note only records there, and the resident agent discovers that commit on its
 // next cache read instead.
-func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, reported *claudeWindowSet, now time.Time, fingerprint, source string, budgetDeadline time.Time, allowedScopes []string, probedCred claudeCredStamp) (time.Time, error) {
 	var advanced *cliUsageGeneration
 	observed, err := withClaudeRateLimitCacheLocked(path, budgetDeadline, func() (time.Time, error) {
 		var observed time.Time
 		var err error
-		observed, advanced, err = mergeClaudeRateLimitCacheLocked(path, updates, now, fingerprint, source, allowedScopes, probedCred)
+		observed, advanced, err = mergeClaudeRateLimitCacheLocked(path, updates, reported, now, fingerprint, source, allowedScopes, probedCred)
 		return observed, err
 	})
 	if err == nil && advanced != nil {
@@ -922,7 +1017,15 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 // already hold the ladder withClaudeRateLimitCacheLocked takes. advanced is the
 // capture generation this write committed when at least one numeric row won the
 // merge (claudeBumpGeneration), and nil otherwise.
-func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (observed time.Time, advanced *cliUsageGeneration, err error) {
+//
+// `reported` is the window set an authoritative probe reply reported (nil for
+// every other write — see claudeRateLimitSnapshot.ReportedWindows). It replaces
+// the persisted set only when it is NEWER, so two channels' probes landing out
+// of order cannot walk the set backwards, and it never moves the generation by
+// itself: Claude's generation versions numeric readings, and a window the set
+// hides is published by the next refresh like any other change that commits
+// no reading.
+func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, reported *claudeWindowSet, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (observed time.Time, advanced *cliUsageGeneration, err error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
@@ -972,12 +1075,18 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 			// window (0% / Unknown) instead of replaying a high-water mark
 			// under the new reset. Skipping also covers the no-prior case: a
 			// first-ever heartbeat without usage must not seed a fake 0% row.
+			//
+			// "Repeats that reset" is judged with claudeSameResetWindow's
+			// tolerance, not exact equality — see there for the reading a
+			// sub-second probe stamp used to lose to every heartbeat.
 			sameLiveWindow := ok && prev.ResetsAtMs > nowMs &&
-				(bucket.ResetsAtMs == 0 || bucket.ResetsAtMs == prev.ResetsAtMs)
+				(bucket.ResetsAtMs == 0 || claudeSameResetWindow(bucket.ResetsAtMs, prev.ResetsAtMs))
 			if sameLiveWindow {
-				if bucket.ResetsAtMs == 0 {
-					bucket.ResetsAtMs = prev.ResetsAtMs
-				}
+				// The carried reading keeps the reset it was observed with, as it
+				// keeps its observation time: a heartbeat's whole-second spelling
+				// of the same instant must not flip the published resetAt — and
+				// with it terminal-service's payload hash — between the two.
+				bucket.ResetsAtMs = prev.ResetsAtMs
 				bucket.UsedPercentage = prev.UsedPercentage
 				// The heartbeat observed the reset/status, not utilization. Keep
 				// the carried percentage paired with its original observation so
@@ -1045,11 +1154,28 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	if numericWon {
 		claudeBumpGeneration(&snap)
 	}
+	// The authoritative window set travels with the readings it came with, and
+	// only ever forward: an older set landing after a newer one (two channels'
+	// probes finishing out of order) is the past, and is dropped like an older
+	// reading. Applied after the account-boundary reset above, so a transition
+	// clears the previous account's set before this one's is written.
+	if reported != nil && reported.AtMs > snap.ReportedWindowsAtMs {
+		snap.ReportedWindows = reported.persisted()
+		snap.ReportedWindowsAtMs = reported.AtMs
+		snap.ReportedAccount = reported.Account
+		snap.ReportedOrg = reported.Org
+	}
 	// Record that the probe sampled this account, independently of which writer
 	// ends up owning each window (see LastProbeObservedAtMs). Only readings
 	// count: a probe response we could not plot is not an observation. Monotonic
 	// — a probe stamping an older instant than one already on record cannot walk
 	// the evidence backwards.
+	//
+	// An authoritative window set counts too, even with no reading beside it: it
+	// is the probe's answer about every window the account has, and `limits: []`
+	// (no meters at all) is exactly such an answer. Without it the evidence would
+	// never advance for that account, and the freshness check would ask the
+	// endpoint again on every gather (stalestClaudeRowObservation).
 	//
 	// A probe reading also proves the stored token works, so it ends any
 	// credential wait an expired token or a 401 recorded, in this same locked
@@ -1066,16 +1192,24 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 	// carries no stamp (a writer outside the probe path, or a Keychain login)
 	// proves nothing about a stamped wait and leaves it alone.
 	if source == claudeRateLimitSourceProbe {
+		proven := false
 		for _, bucket := range updates {
 			if !bucket.usageKnown {
 				continue
 			}
+			proven = true
 			if bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
 				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
 			}
-			if snap.AuthWaitCredStampNs == probedCred.modNs && snap.AuthWaitCredSize == probedCred.size {
-				snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
+		}
+		if reported != nil {
+			proven = true
+			if reported.AtMs > snap.LastProbeObservedAtMs {
+				snap.LastProbeObservedAtMs = reported.AtMs
 			}
+		}
+		if proven && snap.AuthWaitCredStampNs == probedCred.modNs && snap.AuthWaitCredSize == probedCred.size {
+			snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0
 		}
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
@@ -1102,6 +1236,14 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		if observed.IsZero() || b.ObservedAtMs < observed.UnixMilli() {
 			observed = time.UnixMilli(b.ObservedAtMs)
 		}
+	}
+	// A write carrying a window set and no reading at all — an authoritative
+	// reply whose windows have no readable value, or none exist (`limits: []`) —
+	// observed the account at the set's instant: there is no row whose value the
+	// endpoint could have supplied and did not, which is the same answer
+	// stalestClaudeRowObservation gives for it.
+	if len(updates) == 0 && reported != nil {
+		observed = time.UnixMilli(reported.AtMs)
 	}
 
 	// Settle a standing post-run debt in the SAME locked write that carries the

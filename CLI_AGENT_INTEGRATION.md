@@ -408,7 +408,8 @@ terminal-service), so **terminal-service must deploy first**.
 **Quota pool per model (Ship B6, v1.0.21).** A detail row also carries `pool`
 when the device can SAY which quota pool the model spends: a model the
 provider meters under its own window — the usage snapshot has a metric naming
-that model (Claude Code's weekly Fable window, a Codex per-model pool such as
+that model (Claude Code's weekly Fable window or any other model-scoped window
+Claude reports, a Codex per-model pool such as
 `GPT-5.3-Codex-Spark`) — reports the window's key, the model id lower-cased,
 which is exactly how shared-constants keys a nested sub-limit
 (`nestedPoolNameFor`). The annotation is re-derived on every gather from THAT
@@ -1917,6 +1918,130 @@ and carrying the model id, instead of being folded into the main rows where
 its 0 % session window stood in for a main pool that had none. Routing still
 sees those rows in Codex's shared pool (no `metric.pool` on the wire yet —
 the B6 device half), exactly as the folded rows were before.
+
+## Claude rows follow what Claude reports
+
+Anthropic renamed its plans on 2026-10-30 (Max 20x → **Ultra**, Max 5x →
+**Max**), and a verified Ultra account has **no five-hour window** — only a
+weekly all-models limit and a separate weekly Fable limit. The card kept a
+"5-hour session window" row anyway: the rows were a fixed layout of three, and
+nothing told the cache a window was gone (a Max-era `five_hour` reading taken
+with no reset never rolls over, and a claude.ai login's empty fingerprint never
+prunes). That phantom 0 % row also made every consumer read the account's
+capacity as unknown. The plan chip said "Max", because the credential's
+`subscriptionType` is still `max` for Ultra.
+
+- **The window set is the provider's.** The usage endpoint's `limits[]` is, in
+  Claude Code's own schema, "the server's usage rows … as sent … a new meter
+  needs no client release". A reply is **authoritative** when `limits` is an
+  array and it is non-empty or no legacy window produced a reading
+  (`claudeUsageReplyWindows`). The probe then persists the set it reports —
+  every window a `limits[]` entry names, with or without a readable value, plus
+  every legacy window that produced a reading — as
+  `reportedWindows` / `reportedWindowsAtMs` / `reportedAccount` in
+  `claude_rate_limits.json`, in the same locked merge as its readings, replaced
+  only by a newer set and cleared on a fingerprint change. `limits: []` is an
+  answer (no meters): a success, no backoff, no rows. `limits: null` / absent,
+  `limits: []` beside readable legacy windows, a malformed entry (no kind, an
+  unreadable scope) and a list longer than the schema's 64 rows are **not**
+  authoritative: a partial read never removes a row. It can still ADD one: a
+  reading of a window the agent never modelled carries the row it renders as
+  (`buckets.<limit:…>.row`), so a new meter read beside a malformed entry
+  shows (and constrains routing) with or without a set, until an
+  authoritative reply that omits it hides it again.
+- **Rows** (`claudeCodeMetricsFromView`). No set known — never probed, or a
+  cache from an older agent — gives the old three rows, then any reading of a
+  window the agent never modelled that this login took (a partial reply's new
+  meter; an older agent's cache holds none). With a set:
+  the session row only if `five_hour` is shown, "Weekly quota" only if a weekly
+  window is, "Weekly Fable" (model `fable`) only if a Fable window is, then the
+  windows the agent never modelled in the server's order. A window is shown when
+  the set names it, or when a reading of it was observed **after** the set (a
+  stream event or status-line render — an unverified account's temporary
+  session limit shows at once). Hidden buckets are never pruned: another
+  channel's cache or an import would resurrect them.
+- **Identities are frozen** for the three modelled windows (kind + label + model
+  is the metric identity downstream, and mixed agent versions on one account
+  must keep merging). Any other entry becomes `limit:<kind>[:model:<name>|:surface:<name>]`
+  with a derived row (the id slugs the scope's display name, as the label does,
+  so a provider starting to fill `scope.model.id` does not move the window):
+  kind from the entry's `group` (a group beginning with a
+  period word is that period; with no group, the kind's own prefix; a group
+  naming no period is its own kind, so the kind and the label's first word
+  always agree), never `hint`; label `"<Group> <Model>"` ("Weekly Haiku 5"), `"<Group> <Surface>"`,
+  `"<Group> quota"` for an unscoped `<group>_all` ("Daily quota" — read as all
+  models by the Coding capacity dialog, which parses label words), or
+  `"<Group> <rest of the kind>"`; never one of the three frozen labels (" limit"
+  is appended); a model only for a model scope (the `--model` alias its id or
+  display name names — `claude-sonnet-5-1` and "Sonnet 5.1" are both `sonnet`,
+  the only spelling the device discovers and pools — else its id, else its
+  first word) — a surface or unknown scope is a shared
+  constraint. At most 32 rows, labels bounded to 64 runes / 256 bytes, the pool
+  key to 64 bytes, kind + label + model unique: the signed receipt rejects any
+  violation for the whole refresh, and no new receipt field is used. When two
+  windows share an identity (two kinds of one group scoped to one model), one
+  row is published at the first one's position, the way the weekly row
+  combines its windows: a reading over Unknown, else the more constraining
+  reading. Two equally constraining readings publish the later reset (none
+  when either is unknown) and the staler observation. Over-block, never
+  over-admit. A new
+  window id is logged once per process (`[claude-usage] provider reported
+  windows …`), ids only.
+- **Second source: Claude Code's own cached reply.** `~/.claude.json`
+  (`$CLAUDE_CONFIG_DIR/.claude.json` when set) carries
+  `cachedUsageUtilization {fetchedAtMs, accountUuid, utilization}`, the same
+  reply. When its `accountUuid` is the signed-in `oauthAccount.accountUuid`, its
+  set (derived by the same code) is used too — so an agent that cannot probe
+  (offline, `disable_claude_usage_probe`, an expired token) still hides the
+  windows the account lacks. Window set only, never values; re-read each gather
+  (the file is parsed once per stamp), never persisted. The newer of the two
+  sets wins.
+- **Login binding.** A claude.ai credential carries no account, so the cache
+  cannot see a `/login` to another account, or the same user's switch to
+  another organization (quotas belong to the organization; Claude Code treats
+  either change as an account switch). The probe's set records one-way digests
+  of `oauthAccount.accountUuid` and `organizationUuid`, sampled before the
+  credential read (`reportedAccount` / `reportedOrg`). Each part is compared
+  only when both sides know it. When the current login differs, the set is
+  ignored and the no-set rows return until a probe or Claude Code's reply
+  describes the new login. Each generic reading carries the same digests on its
+  row (`row.account` / `row.org`), and a reading another login took is left
+  out of the rows. Nothing the new login reports would ever overwrite it, and
+  signing back in shows it again. These ids are display-only — never a
+  fingerprint or a cache scope.
+- **Freshness walks the shown rows**, so a hidden window neither triggers a
+  probe nor counts as fresh evidence; an account whose probe-reported windows
+  carry no readable value (or none exist) is as fresh as that probe. That last
+  rule is decided on the probe's own (account-bound) set, never on Claude
+  Code's newer copy of the same answer, which would otherwise re-probe a
+  meter-less account after every refresh Claude Code makes.
+- **Plan chip.** `plan` is `oauthAccount.planDisplayName` from the same config
+  file ("Ultra"), validated with Claude Code's own rule
+  (`^[\p{L}\p{N}](?:[\p{L}\p{N} .+-]{0,38}[\p{L}\p{N}+])?$`), else the
+  credential's `subscriptionType` verbatim and lowercase as before; empty for a
+  credential with no subscription login. No plan-name table: consumers tell a
+  display name (capitals) from a legacy code (lowercase).
+- **Same window, two spellings.** The endpoint stamps a reset with sub-second
+  jitter (`20:59:59.539538`) where stream events carry whole seconds; resets
+  within ±60 s are the same window (`claudeSameResetWindow`), so a usage-less
+  heartbeat no longer wipes the weekly reading to Unknown after every run.
+- **Status line.** `statusline-hook`'s own line shows a window only when the
+  payload carries a reading for it — a `"five_hour": null` no longer prints
+  "5h 0%".
+- **Not covered here:** other computers on the account still running an older
+  agent keep publishing the old rows, and the merged views (shared-constants,
+  the frontend) union rows across computers until they update. On one
+  computer, an older binary that reads this agent's cache (a dual-channel
+  hook pinning the newer channel's cache, or a rollback) counts a Fable-named
+  generic id as a "Weekly Fable" candidate; it shows that meter only when the
+  newest reply carried no readable weekly Fable window (canonical first on a
+  tie), and no window reported today has that shape.
+- **The cache's one piece of vendor text** is a generic window's derived row
+  (`reportedWindows.<limit:…>.{kind,label,model}`, and the same on its reading,
+  `buckets.<limit:…>.row`): limits[] carries no label, so the row is persisted
+  as it is published. Everything else stays numbers,
+  timestamps, fingerprints and closed vocabulary
+  (`cliagent_usage_claudecode_redaction_test.go`).
 
 ---
 

@@ -170,6 +170,14 @@ func shellCommand(command string) *exec.Cmd {
 // defaultStatusLine builds a minimal, useful one-liner from the status-line
 // payload: model, current dir, and the rate-limit summary we just captured.
 // Every field is optional — a missing one is simply omitted.
+//
+// A window is shown only when the payload carries a reading for it. Claude
+// Code adds `five_hour` / `seven_day` only for an account that has them (a
+// verified Ultra account has no five-hour window), and a window sent as `null`,
+// or without a `used_percentage`, is a window with nothing to report: decoded
+// into a plain value it printed "5h 0%" — a full session quota the account does
+// not have. Each window is decoded on its own, so one of an unexpected shape
+// costs only itself.
 func defaultStatusLine(raw []byte) string {
 	var p struct {
 		Model struct {
@@ -178,10 +186,8 @@ func defaultStatusLine(raw []byte) string {
 		Workspace struct {
 			CurrentDir string `json:"current_dir"`
 		} `json:"workspace"`
-		Cwd        string `json:"cwd"`
-		RateLimits map[string]struct {
-			UsedPercentage float64 `json:"used_percentage"`
-		} `json:"rate_limits"`
+		Cwd        string                     `json:"cwd"`
+		RateLimits map[string]json.RawMessage `json:"rate_limits"`
 	}
 	_ = json.Unmarshal(raw, &p)
 
@@ -192,13 +198,17 @@ func defaultStatusLine(raw []byte) string {
 	if dir := firstNonEmpty(p.Workspace.CurrentDir, p.Cwd); dir != "" {
 		parts = append(parts, baseName(dir))
 	}
-	if rl := p.RateLimits; rl != nil {
-		if b, ok := rl["five_hour"]; ok {
-			parts = append(parts, fmt.Sprintf("5h %d%%", int(b.UsedPercentage+0.5)))
+	for _, window := range []struct{ key, label string }{
+		{claudeWindowFiveHour, "5h"},
+		{claudeWindowSevenDay, "7d"},
+	} {
+		var w *struct {
+			UsedPercentage *float64 `json:"used_percentage"`
 		}
-		if b, ok := rl["seven_day"]; ok {
-			parts = append(parts, fmt.Sprintf("7d %d%%", int(b.UsedPercentage+0.5)))
+		if json.Unmarshal(p.RateLimits[window.key], &w) != nil || w == nil || w.UsedPercentage == nil {
+			continue
 		}
+		parts = append(parts, fmt.Sprintf("%s %d%%", window.label, int(*w.UsedPercentage+0.5)))
 	}
 	return strings.Join(parts, " · ")
 }
