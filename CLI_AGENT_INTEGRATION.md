@@ -1944,7 +1944,11 @@ capacity as unknown. The plan chip said "Max", because the credential's
   answer (no meters): a success, no backoff, no rows. `limits: null` / absent,
   `limits: []` beside readable legacy windows, a malformed entry (no kind, an
   unreadable scope) and a list longer than the schema's 64 rows are **not**
-  authoritative: a partial read never removes a row.
+  authoritative: a partial read never removes a row. It can still ADD one: a
+  reading of a window the agent never modelled carries the row it renders as
+  (`buckets.<limit:…>.row`), so a new meter read beside a malformed entry
+  shows (and constrains routing) with or without a set, until an
+  authoritative reply that omits it hides it again.
 - **Rows** (`claudeCodeMetricsFromView`). No set known — never probed, or a
   cache from an older agent — gives exactly the old three rows. With a set:
   the session row only if `five_hour` is shown, "Weekly quota" only if a weekly
@@ -2016,8 +2020,9 @@ capacity as unknown. The plan chip said "Max", because the credential's
   newest reply carried no readable weekly Fable window (canonical first on a
   tie), and no window reported today has that shape.
 - **The cache's one piece of vendor text** is a generic window's derived row
-  (`reportedWindows.<limit:…>.{kind,label,model}`): limits[] carries no label,
-  so the row is persisted as it is published. Everything else stays numbers,
+  (`reportedWindows.<limit:…>.{kind,label,model}`, and the same on its reading,
+  `buckets.<limit:…>.row`): limits[] carries no label, so the row is persisted
+  as it is published. Everything else stays numbers,
   timestamps, fingerprints and closed vocabulary
   (`cliagent_usage_claudecode_redaction_test.go`).
 

@@ -118,6 +118,18 @@ type claudeRateLimitBucket struct {
 	// claudeRateLimitSource* constants). Omitted when empty so a cache written
 	// before this field existed round-trips byte-identically.
 	Source string `json:"source,omitempty"`
+	// Row is the row a GENERIC window (claudeGenericWindowPrefix) renders as —
+	// metric kind, label and nested-pool model, derived from the limits[] entry
+	// that produced this reading (claudeGenericWindow). It rides ON the reading
+	// so the two cannot be separated: the merge, the import from the other
+	// channel's cache and the merged view all move whole buckets. That is what
+	// lets a reading from a reply that is not authoritative — a malformed entry
+	// beside it — still render: the window set says which windows exist, this
+	// says what one is called, and a partial read may add a constraint even
+	// though it may never remove one. Written only by the probe, only on generic
+	// ids: nil on every modelled window, which stays numbers only, and a cache
+	// written before this field round-trips byte-identically.
+	Row *claudeReportedWindow `json:"row,omitempty"`
 }
 
 // hasObservedUsage reports whether UsedPercentage came from an actual reading.

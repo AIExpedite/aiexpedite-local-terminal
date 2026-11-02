@@ -7,7 +7,8 @@ package main
 // the published usage, or the signed refresh receipt.
 //
 // One exception, and only one: a window this agent never modelled persists
-// the row it renders as — reportedWindows.<limit:…>.{kind,label,model} —
+// the row it renders as — reportedWindows.<limit:…>.{kind,label,model} in the
+// window set, and buckets.<limit:…>.row.{kind,label,model} on its reading —
 // because limits[] carries no label and a later read has nothing but the cache
 // to build that row from. claudeGenericWindow derives those three strings from
 // the entry's kind, group and scope display names alone, printable and
@@ -123,7 +124,7 @@ var (
 	claudeRedactedEnum = regexp.MustCompile(`^(allowed|rejected|warning|stream|statusline|probe)$`)
 	// The one place free text may sit (see the file header): a generic window's
 	// row. Window ids are slugs, so the path splits unambiguously on ".".
-	claudeRedactedGenericRow = regexp.MustCompile(`^\.reportedWindows\.limit:[a-z0-9_:]+\.(kind|label|model)$`)
+	claudeRedactedGenericRow = regexp.MustCompile(`^\.(reportedWindows\.limit:[a-z0-9_:]+|buckets\.limit:[a-z0-9_:]+\.row)\.(kind|label|model)$`)
 )
 
 // assertClaudeSnapshotStringsRedacted walks the decoded snapshot: numbers and
@@ -211,6 +212,16 @@ func TestClaudeGenericWindow_PersistsOnlyTheRowItRendersAs(t *testing.T) {
 		}
 		if got.Kind != want.kind || got.Label != want.label || got.Model != want.model {
 			t.Errorf("%s persisted {%q %q %q}, want {%q %q %q}", id, got.Kind, got.Label, got.Model, want.kind, want.label, want.model)
+		}
+		// The reading carries the same row, so it renders even without a set.
+		row := snap.Buckets[id].Row
+		if row == nil || row.Kind != want.kind || row.Label != want.label || row.Model != want.model {
+			t.Errorf("%s reading carries row %+v, want {%q %q %q}", id, row, want.kind, want.label, want.model)
+		}
+	}
+	for id, b := range snap.Buckets {
+		if !strings.HasPrefix(id, claudeGenericWindowPrefix) && b.Row != nil {
+			t.Errorf("the modelled window %s carries a row %+v; it stays numbers only", id, b.Row)
 		}
 	}
 	if got := snap.ReportedWindows[claudeWindowFiveHour]; got.Kind != "" || got.Label != "" || got.Model != "" {

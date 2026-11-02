@@ -728,6 +728,12 @@ func claudeClampBytes(s string, max int) string {
 // which is dropped and so cannot be placed in the set — leaving it out would
 // hide whichever window it was; and a list longer than the schema's cap
 // (claudeUsageProbeMaxLimits), read only up to the cap.
+//
+// A partial reply still ADDS what it could read. A reading of a window this
+// agent never modelled carries the row it renders as (claudeRateLimitBucket.Row),
+// so it is shown whether or not any set names it: a new meter at 100 % beside a
+// malformed entry must reach the card and routing, not sit in the cache with
+// nothing to call it until a fully readable reply arrives.
 func claudeUsageReplyWindows(decoded claudeUsageProbeResponse, nowMs int64) (map[string]claudeRateLimitBucket, *claudeWindowSet) {
 	buckets := map[string]claudeRateLimitBucket{}
 	reported := []claudeReportedWindow{}
@@ -749,10 +755,15 @@ func claudeUsageReplyWindows(decoded claudeUsageProbeResponse, nowMs int64) (map
 		seen[w.ID] = true
 		w.Order = len(reported)
 		reported = append(reported, w)
-		if strings.HasPrefix(w.ID, claudeGenericWindowPrefix) {
+		isGeneric := strings.HasPrefix(w.ID, claudeGenericWindowPrefix)
+		if isGeneric {
 			generic = append(generic, w.ID)
 		}
 		if bucket, ok := claudeUsageProbeBucket(limit.window(), nowMs); ok {
+			if isGeneric {
+				row := w
+				bucket.Row = &row
+			}
 			buckets[w.ID] = bucket
 		}
 	}
@@ -906,10 +917,14 @@ func claudeIsFableWindowID(id string) bool {
 //  2. "Weekly quota", when any of seven_day / seven_day_sonnet / seven_day_opus
 //     is shown, aggregated over the shown ones only;
 //  3. "Weekly Fable" (model fable), when a Fable window is shown;
-//  4. the generic windows, in the server's order (ties by id), from the row the
-//     set recorded and the value of their bucket — Unknown when it is missing,
-//     rolled over or never observed. An id with no recorded row — an orphan
-//     stream id such as `overage` — stays unrendered, as it always was.
+//  4. the generic windows, in the server's order (ties by id), from the row
+//     their reading carries — else the row the set recorded, for a window the
+//     set names without a readable value — and the value of their bucket:
+//     Unknown when it is missing, rolled over or never observed;
+//  5. any other generic window SHOWN — a reading newer than the set, from a
+//     reply that was not authoritative — from the row its reading carries
+//     (claudeMetricRows.addGenericReadings). An id with no row at all — an orphan stream
+//     id such as `overage` — stays unrendered, as it always was.
 //
 // At most cliUsageMaxMetricsPerProvider rows, with kind+label+model unique
 // (the later duplicate dropped): either violation would fail the whole signed
@@ -932,16 +947,8 @@ func claudeCodeMetricsFromWindowSet(buckets map[string]claudeRateLimitBucket, se
 		}
 	}
 
-	metrics := make([]cliAgentUsageMetric, 0, len(set.Windows)+3)
-	identities := map[string]bool{}
-	add := func(m cliAgentUsageMetric) {
-		identity := m.Kind + "\x00" + m.Label + "\x00" + m.Model
-		if identities[identity] || len(metrics) >= cliUsageMaxMetricsPerProvider {
-			return
-		}
-		identities[identity] = true
-		metrics = append(metrics, m)
-	}
+	rows := claudeMetricRows{}
+	add := rows.add
 
 	if shown[claudeWindowFiveHour] {
 		add(observedMetricOrUnknown(visible, []string{claudeWindowFiveHour}, limitKindSession, claudeSessionLabel, now))
@@ -977,32 +984,108 @@ func claudeCodeMetricsFromWindowSet(buckets map[string]claudeRateLimitBucket, se
 	}
 
 	generic := make([]claudeReportedWindow, 0, len(set.Windows))
+	named := map[string]bool{}
 	for _, w := range set.Windows {
 		if strings.HasPrefix(w.ID, claudeGenericWindowPrefix) {
+			named[w.ID] = true
+			// The reading's own row first: it was derived from the same reply as
+			// the value beside it, so a label and its number always come from
+			// one answer. The set's row stands in for a window it names without
+			// a readable value (no bucket, so no row to carry).
+			if b, ok := visible[w.ID]; ok && b.Row != nil {
+				w = b.Row.withID(w.ID, w.Order)
+			}
 			generic = append(generic, w)
 		}
 	}
-	sort.SliceStable(generic, func(i, j int) bool {
-		if generic[i].Order != generic[j].Order {
-			return generic[i].Order < generic[j].Order
-		}
-		return generic[i].ID < generic[j].ID
-	})
+	sortClaudeWindows(generic)
 	for _, w := range generic {
-		kind := claudeClampBytes(w.Kind, claudeWindowMetricKindMaxLen)
-		label := claudeClampLabel(w.Label)
-		if kind == "" || label == "" {
+		if m, ok := claudeGenericMetric(w, visible, now); ok {
+			add(m)
+		}
+	}
+	rows.addGenericReadings(visible, named, now)
+	return rows.metrics
+}
+
+// claudeMetricRows collects one provider's rows under the signed receipt's two
+// rules: at most cliUsageMaxMetricsPerProvider rows, and kind+label+model unique
+// (the later duplicate dropped). Either violation would fail the WHOLE refresh,
+// for every provider, so both row builders add through this.
+type claudeMetricRows struct {
+	metrics    []cliAgentUsageMetric
+	identities map[string]bool
+}
+
+func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
+	identity := m.Kind + "\x00" + m.Label + "\x00" + m.Model
+	if r.identities == nil {
+		r.identities = map[string]bool{}
+	}
+	if r.identities[identity] || len(r.metrics) >= cliUsageMaxMetricsPerProvider {
+		return
+	}
+	r.identities[identity] = true
+	r.metrics = append(r.metrics, m)
+}
+
+// addGenericReadings adds a row for every reading of a window this agent never
+// modelled that has not been rendered yet (`skip`), from the row the reading
+// carries (claudeRateLimitBucket.Row) — a reply that was not authoritative
+// names no set, but what it could read is still a constraint. A reading with no
+// row (an orphan id) adds nothing. In the order the readings' replies listed
+// them, ties by id, so the same cache always gives the same rows.
+func (r *claudeMetricRows) addGenericReadings(buckets map[string]claudeRateLimitBucket, skip map[string]bool, now time.Time) {
+	extra := make([]claudeReportedWindow, 0)
+	for id, b := range buckets {
+		if b.Row == nil || skip[id] || !strings.HasPrefix(id, claudeGenericWindowPrefix) {
 			continue
 		}
-		if kind == "hint" {
-			kind = "provider_hint"
-		}
-		if claudeIsFrozenLabel(label) {
-			label = claudeClampLabel(label + " limit")
-		}
-		row := observedMetricOrUnknown(visible, []string{w.ID}, kind, label, now)
-		row.Model = claudeClampBytes(strings.ToLower(w.Model), cliUsageMaxModelPoolLength)
-		add(row)
+		extra = append(extra, b.Row.withID(id, b.Row.Order))
 	}
-	return metrics
+	sortClaudeWindows(extra)
+	for _, w := range extra {
+		if m, ok := claudeGenericMetric(w, buckets, now); ok {
+			r.add(m)
+		}
+	}
+}
+
+// withID is the row under the id it is stored at — a bucket's row is keyed by
+// its bucket, not by a field of its own — at the given position.
+func (w claudeReportedWindow) withID(id string, order int) claudeReportedWindow {
+	w.ID, w.Order = id, order
+	return w
+}
+
+// sortClaudeWindows orders generic windows the way the server listed them, ties
+// by id: deterministic whatever map they were gathered from.
+func sortClaudeWindows(windows []claudeReportedWindow) {
+	sort.SliceStable(windows, func(i, j int) bool {
+		if windows[i].Order != windows[j].Order {
+			return windows[i].Order < windows[j].Order
+		}
+		return windows[i].ID < windows[j].ID
+	})
+}
+
+// claudeGenericMetric is the row of one generic window: its recorded kind,
+// label and model, re-bounded — the cache is a file another binary may have
+// written — and the value of its bucket, Unknown when missing, rolled over or
+// never observed. ok is false for a row with no kind or label to show.
+func claudeGenericMetric(w claudeReportedWindow, buckets map[string]claudeRateLimitBucket, now time.Time) (cliAgentUsageMetric, bool) {
+	kind := claudeClampBytes(w.Kind, claudeWindowMetricKindMaxLen)
+	label := claudeClampLabel(w.Label)
+	if kind == "" || label == "" {
+		return cliAgentUsageMetric{}, false
+	}
+	if kind == "hint" {
+		kind = "provider_hint"
+	}
+	if claudeIsFrozenLabel(label) {
+		label = claudeClampLabel(label + " limit")
+	}
+	row := observedMetricOrUnknown(buckets, []string{w.ID}, kind, label, now)
+	row.Model = claudeClampBytes(strings.ToLower(w.Model), cliUsageMaxModelPoolLength)
+	return row, true
 }

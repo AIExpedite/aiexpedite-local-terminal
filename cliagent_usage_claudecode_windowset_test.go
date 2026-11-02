@@ -878,6 +878,83 @@ func TestClaudeUsageReplyWindows_PartialRepliesAreNotAuthoritative(t *testing.T)
 	}
 }
 
+// A reply that is not authoritative still ADDS what it could read. A meter
+// this agent never modelled, readable beside a malformed entry, is a real
+// constraint — at 100 % it is the account's binding limit — so it must reach
+// the card and routing whether or not a set is known, instead of sitting in the
+// cache with nothing to call it until a fully readable reply arrives. Its
+// reading carries the row it renders as; the partial reply still removes
+// nothing, and records no set.
+func TestClaudePartialReply_AddsTheMeterItCouldReadWithNoSetKnown(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"limits":[
+			{"kind":"weekly_all","group":"weekly","percent":44,"resets_at":%d},
+			{"kind":"daily_all","group":"daily","percent":100,"resets_at":%d},
+			{"kind":"weekly_burst","group":"weekly","percent":7,"resets_at":%d},
+			{"percent":3}]}`, now.Add(72*time.Hour).Unix(), now.Add(10*time.Hour).Unix(), now.Add(72*time.Hour).Unix())
+	})
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
+		t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	if snap := claudeCacheSnapshot(t, cache); snap.ReportedWindowsAtMs != 0 || snap.ReportedWindows != nil {
+		t.Fatalf("set=%+v at %d: a reply with a malformed entry is not authoritative", snap.ReportedWindows, snap.ReportedWindowsAtMs)
+	}
+	// Today's three rows, untouched, then the new meters in the server's order.
+	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""),
+		"5-hour session window|session||?", "Weekly quota|weekly||44", "Weekly Fable|weekly|fable|?",
+		"Daily quota|daily||100", "Weekly burst|weekly||7")
+	usage, ok := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, now)
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	requireCanonicalClaudeReceipt(t, *usage)
+}
+
+// The same beside a set already known: the partial reply cannot replace the
+// set, but the meter it read is newer than the set and carries its row, so it
+// shows. The next AUTHORITATIVE reply that omits the meter hides it again —
+// the set decides absence, and only it.
+func TestClaudePartialReply_AddsTheMeterItCouldReadBesideAKnownSet(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	week, day := t0.Add(72*time.Hour).Unix(), t0.Add(10*time.Hour).Unix()
+	var reply atomic.Value
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, reply.Load().(string))
+	})
+	probe := func(at time.Time, body string) {
+		t.Helper()
+		reply.Store(body)
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), at, false); !refreshed || probeErr != nil {
+			t.Fatalf("probe at %s: refreshed=%v err=%+v", at.Format(time.TimeOnly), refreshed, probeErr)
+		}
+	}
+	authoritative := func(weekly int) string {
+		return fmt.Sprintf(`{"limits":[
+			{"kind":"weekly_all","group":"weekly","percent":%d,"resets_at":%d},
+			{"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":%d,"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}]}`,
+			weekly, week, week)
+	}
+
+	probe(t0, authoritative(44))
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t0, ""), "Weekly quota|weekly||44", "Weekly Fable|weekly|fable|0")
+
+	t1 := t0.Add(time.Minute)
+	probe(t1, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":45,"resets_at":%d},
+		{"kind":"daily_all","group":"daily","percent":100,"resets_at":%d},
+		{"kind":"weekly_scoped","percent":5,"scope":["not","an","object"]}]}`, week, day))
+	if got := claudeCacheSnapshot(t, cache).ReportedWindowsAtMs; got != t0.UnixMilli() {
+		t.Fatalf("set instant moved to %d; a partial reply must not replace the set", got)
+	}
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t1, ""),
+		"Weekly quota|weekly||45", "Weekly Fable|weekly|fable|0", "Daily quota|daily||100")
+
+	t2 := t1.Add(time.Minute)
+	probe(t2, authoritative(46))
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t2, ""), "Weekly quota|weekly||46", "Weekly Fable|weekly|fable|0")
+}
+
 // Absence is believed only when BOTH representations omit a window: a reply
 // whose limits[] has no session entry while its legacy five_hour still carries
 // a reading — the shape an unverified Ultra account's temporary five-hour limit
@@ -1060,6 +1137,28 @@ func TestClaudeWindowSet_DualChannelNewestSetWins(t *testing.T) {
 		if got := claudeCacheSnapshot(t, ownCache); got.ReportedWindowsAtMs != t1.UnixMilli() {
 			t.Errorf("own set moved to %d; an older pinned set must never replace it", got.ReportedWindowsAtMs)
 		}
+	})
+
+	// The other channel read a new meter from a reply that was not
+	// authoritative: no set came with it, only the reading — and its row, which
+	// travels with it, so both the merged view and the own cache after the
+	// import can say what the meter is.
+	t.Run("a generic reading arrives with its row", func(t *testing.T) {
+		writeSnap(ownCache, own)
+		daily := bucket(100, t2)
+		daily.Row = &claudeReportedWindow{Kind: limitKindDaily, Label: "Daily quota", Order: 1}
+		writeSnap(pinnedCache, claudeRateLimitSnapshot{
+			Buckets: map[string]claudeRateLimitBucket{"limit:daily_all": daily},
+		})
+		want := []string{"Weekly quota|weekly||40", "Daily quota|daily||100"}
+		assertMetricSummary(t, claudeCodeMetricsFromCache(t2, ""), want...)
+
+		importPinnedClaudeObservations("")
+		if got := claudeCacheSnapshot(t, ownCache).Buckets["limit:daily_all"].Row; got == nil || got.Label != "Daily quota" {
+			t.Fatalf("imported row=%+v, want the reading's row carried across", got)
+		}
+		_ = os.Remove(pinnedCache)
+		assertMetricSummary(t, claudeCodeMetricsFromCache(t2, ""), want...)
 	})
 }
 

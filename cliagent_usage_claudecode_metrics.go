@@ -348,6 +348,13 @@ func claudeCodeMetricsFromView(view claudeRateLimitView, now time.Time) []cliAge
 // windows have been observed. Unchanged from before window sets existed, which
 // is what keeps an older cache (and every test written against one) reading
 // exactly as it did.
+//
+// After them, a row for every reading of a window this agent never modelled
+// (claudeMetricRows.addGenericReadings). Only a probe reply that was NOT authoritative
+// leaves such a reading without a set — an authoritative one records the set
+// beside it — and a new meter it could read is still a constraint the card and
+// routing must see. A cache an older agent wrote holds none, so it still reads
+// as exactly the three rows.
 func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now time.Time) []cliAgentUsageMetric {
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, claudeSessionLabel, now)
@@ -371,7 +378,12 @@ func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now 
 	// per-model pools this way.
 	fable.Model = claudeModelFable
 
-	return []cliAgentUsageMetric{session, weekly, fable}
+	rows := claudeMetricRows{}
+	rows.add(session)
+	rows.add(weekly)
+	rows.add(fable)
+	rows.addGenericReadings(buckets, nil, now)
+	return rows.metrics
 }
 
 // claudeFableWindowIDs returns the cache keys that may hold the weekly Fable
