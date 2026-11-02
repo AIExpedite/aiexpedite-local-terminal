@@ -1086,10 +1086,11 @@ var antigravityWindowBands = []struct {
 // proto Duration "18000s", "1mo" — "m" alone is minutes), or a one-component
 // ISO 8601 duration ("p7d", "pt5h", where "m" is months before the "t" and
 // minutes after it). Matched lower-cased; a compound or a bare number is not
-// a window.
+// a window. Eight digits reach a year in seconds (31622400s);
+// antigravityWindowMaxMinutes bounds the converted length.
 var (
-	antigravityWindowLengthPattern = regexp.MustCompile(`^(\d{1,6}(?:\.\d{1,9})?)\s*[-_]?\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mo)$`)
-	antigravityWindowISOPattern    = regexp.MustCompile(`^p(?:(\d{1,6})(w|d|m)|t(\d{1,6}(?:\.\d{1,9})?)(h|m|s))$`)
+	antigravityWindowLengthPattern = regexp.MustCompile(`^(\d{1,8}(?:\.\d{1,9})?)\s*[-_]?\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mo)$`)
+	antigravityWindowISOPattern    = regexp.MustCompile(`^p(?:(\d{1,8})(w|d|m)|t(\d{1,8}(?:\.\d{1,9})?)(h|m|s))$`)
 )
 
 // antigravityWindowMaxMinutes bounds a window's length: nothing Google meters

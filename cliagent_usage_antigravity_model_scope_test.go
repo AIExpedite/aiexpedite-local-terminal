@@ -268,6 +268,10 @@ func TestAntigravityWindowKind_GenericSpellings(t *testing.T) {
 		{"30d", limitKindMonthly, monthly},
 		{"1mo", limitKindMonthly, monthly},
 		{"P1M", limitKindMonthly, monthly},
+		// Seconds need up to eight digits for a month or a year.
+		{"2592000s", limitKindMonthly, monthly},
+		{"PT2592000S", limitKindMonthly, monthly},
+		{"31622400s", "window_366d", "366-day window"},
 		{"28 days", limitKindMonthly, monthly},
 		// Band edges: only a length inside a band is canonical.
 		{"294m", "window_294m", "294-minute window"},
@@ -308,7 +312,7 @@ func TestAntigravityWindowKind_GenericSpellings(t *testing.T) {
 	}
 	// A word, a bare number, a compound, a year or less than a minute is not
 	// one length: skipped exactly as an unknown window always was.
-	for _, window := range []string{"", "fortnightly", "hint", "hourly", "7", "0d", "30s", "367d", "1y", "p1y",
+	for _, window := range []string{"", "fortnightly", "hint", "hourly", "7", "0d", "30s", "367d", "31622460s", "999999999s", "1y", "p1y",
 		"p1dt12h", "p", "pt", "7 dayz", "window_4h", "1000000d"} {
 		if kind, label, ok := antigravityWindowKind(window); ok {
 			t.Errorf("antigravityWindowKind(%q) = %q, %q; want it skipped", window, kind, label)
