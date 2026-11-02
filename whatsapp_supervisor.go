@@ -52,6 +52,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -1021,9 +1022,11 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 }
 
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
-// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It never
-// outlasts ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
-// teardown steps after this one still have to run).
+// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It does
+// not outlast ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
+// teardown steps after this one still have to run), with one exception: an
+// outbox write still committing when the deadline passes gets up to
+// whatsAppShutdownWriteGrace more (closeStoresWithin).
 func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.mu.Lock()
 	if s.stopped {
@@ -1085,17 +1088,40 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		return
 	}
 	if !closeStoresWithin(runners, deadline) {
-		logWhatsApp("-", "shutdown deadline reached while an outbox was still writing; SQLite keeps it consistent for the next start")
+		logWhatsApp("-", "shutdown deadline reached while a store was still closing; its files stay for the next start")
 	}
 	s.persist()
 }
+
+// whatsAppShutdownWriteGrace is how long past its deadline shutdown still
+// waits for an outbox write that is committing (a var so tests can shorten
+// it): see closeStoresWithin.
+var whatsAppShutdownWriteGrace = 2 * time.Second
 
 // closeStoresWithin closes the runners' stores, giving up at deadline (nil:
 // none) and reporting whether they all closed. Closing an outbox waits for a
 // write in flight (whatsAppOutbox.Close is a barrier), and a large history
 // chunk can still be appending on whatsmeow's goroutine: shutdown must not
 // outlast its deadline for it (Windows gives the whole shutdown 2–4 s).
+//
+// The one exception is a write still committing when the deadline passes.
+// The process exits right after shutdown returns, and an Append cut short
+// rolls back a history chunk that WhatsApp has already delivered and will not
+// send again. So while an outbox reports a write in flight, the closes get up
+// to whatsAppShutdownWriteGrace more - only that long, and only while the
+// write lasts.
 func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) bool {
+	// Taken before the closes start: closeStores takes each outbox off its
+	// runner.
+	outboxes := make([]*whatsAppOutbox, 0, len(runners))
+	for _, r := range runners {
+		r.mu.Lock()
+		if r.outbox != nil {
+			outboxes = append(outboxes, r.outbox)
+		}
+		r.mu.Unlock()
+	}
+	writing := func() bool { return slices.ContainsFunc(outboxes, (*whatsAppOutbox).WriteInFlight) }
 	closed := make(chan struct{})
 	go func() {
 		for _, r := range runners {
@@ -1107,6 +1133,34 @@ func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) 
 	case <-closed:
 		return true
 	case <-deadline:
+	}
+	if !writing() {
+		return false
+	}
+	start := time.Now()
+	giveUp := time.NewTimer(whatsAppShutdownWriteGrace)
+	defer giveUp.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+wait:
+	for writing() {
+		select {
+		case <-closed:
+			break wait
+		case <-giveUp.C:
+			logWhatsApp("-", "an outbox write was still committing "+whatsAppShutdownWriteGrace.String()+
+				" past the shutdown deadline; gave up on it - a history chunk being written may be lost until a re-link")
+			return false
+		case <-tick.C:
+		}
+	}
+	logWhatsApp("-", "waited "+time.Since(start).Round(time.Millisecond).String()+
+		" past the shutdown deadline for an outbox write to finish")
+	select {
+	case <-closed:
+		return true
+	default:
+		// The write has finished; whatever still holds a close is not one.
 		return false
 	}
 }
@@ -1263,8 +1317,17 @@ type whatsAppLinkRunner struct {
 	// some record up to narrowTo is invalid, but not which. Batches are capped
 	// at narrowLimit records, halved on every refusal, until one record alone
 	// is refused; only that one is dropped. 0 = full batches.
-	narrowLimit  int
-	narrowTo     int64
+	narrowLimit int
+	narrowTo    int64
+	// unsettledTo is the end of a batch whose outcome is unknown: a transport
+	// error, a 5xx or a 429 may have come after the cloud applied it. The
+	// next batch is capped at it, so a 2xx the device lost comes back as an
+	// exact replay, acked at the batch's own end. Grown by rows queued since,
+	// the retry could instead be refused (400) for one of them and narrowed
+	// down to a batch ending below what the lost batch acked, whose replay
+	// ack passes its end and renumbers rows the cloud already wrote
+	// (rebaseBehindCloud). 0 = no unsettled batch.
+	unsettledTo  int64
 	seenChats    map[string]bool
 	stopped      bool
 	loopsStarted bool
@@ -1967,11 +2030,13 @@ const (
 // halves until a single record is refused, and drops only that one (a bad
 // record must neither wedge the queue nor take the valid records around it
 // with it); 401/403 pauses uploads; 409 fences; 429, 5xx and transport errors
-// are retried with backoff.
+// are retried with backoff, as exactly the same range (unsettledTo): the
+// cloud may have applied it, and a lost 2xx then comes back as an exact
+// replay, acked at the batch's own end.
 func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult, whatsAppUploadOutcome) {
 	r.mu.Lock()
 	ob, gen, paused := r.outbox, r.generation, time.Now().Before(r.uploadPausedTil)
-	limit := r.narrowLimit
+	limit, unsettledTo := r.narrowLimit, r.unsettledTo
 	r.mu.Unlock()
 	if ob == nil {
 		return whatsAppSyncResult{}, whatsAppUploadStop
@@ -1987,10 +2052,35 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	if batch == nil {
 		return whatsAppSyncResult{}, whatsAppUploadIdle
 	}
+	if unsettledTo > 0 {
+		if batch.SeqFrom > unsettledTo {
+			// The unsettled range is gone from the queue: nothing to repeat.
+			r.mu.Lock()
+			r.unsettledTo = 0
+			r.mu.Unlock()
+		} else if batch.SeqTo > unsettledTo {
+			// A batch is a contiguous range: record i holds SeqFrom+i.
+			batch.Records = batch.Records[:unsettledTo-batch.SeqFrom+1]
+			batch.SeqTo = unsettledTo
+		}
+	}
 	res := r.sup.transport.Post(ctx, map[string]any{
 		"v": 1, "linkId": r.linkID, "generation": gen, "kind": waSyncKindBatch,
 		"seqFrom": batch.SeqFrom, "seqTo": batch.SeqTo, "records": batch.Records,
 	})
+	// Only a 2xx, a 400 or a 409 says what the cloud did with the range. A
+	// 401/403 is refused before ingest and settles nothing (an earlier
+	// unknown outcome stays unknown); any other answer, or none, leaves this
+	// range's outcome unknown until the same range is sent again.
+	r.mu.Lock()
+	switch {
+	case res.Status/100 == 2 || res.Status == 400 || res.Status == 409:
+		r.unsettledTo = 0
+	case res.Status == 401 || res.Status == 403:
+	default:
+		r.unsettledTo = max(r.unsettledTo, batch.SeqTo)
+	}
+	r.mu.Unlock()
 	switch {
 	case res.Status/100 == 2:
 		acked := batch.SeqTo
@@ -2046,20 +2136,25 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	}
 }
 
-// rebaseBehindCloud answers an ack past the batch's own end. With one
-// uploader per link, the cloud can only hold sequences past this batch if it
-// got them from an earlier numbering of this outbox (Rebase): it acked the
-// batch as a replay and wrote none of it. The queued rows move above its
-// watermark and go again, rather than being deleted.
+// rebaseBehindCloud answers an ack past the batch's own end: the cloud acked
+// the batch as a replay and wrote none of it, because it holds sequences this
+// batch never reached. Usually they are an earlier numbering of this outbox
+// (outbox.db rolled back or restored; see Rebase); rarely, a second uploader
+// overlapped this one on the link and sent these rows first, and the re-send
+// is idempotent. A batch whose 2xx was lost does not end up here: it is
+// retried as the same range (unsettledTo) and comes back acked at its own
+// end. The queued rows move above the watermark and go again, rather than
+// being deleted.
 func (r *whatsAppLinkRunner) rebaseBehindCloud(ob *whatsAppOutbox, batch *whatsAppOutboxBatch, watermark int64) whatsAppUploadOutcome {
 	moved, err := ob.Rebase(watermark)
 	if err != nil {
 		r.log("outbox renumbering failed: " + err.Error())
 		return whatsAppUploadRetry
 	}
-	r.log("the cloud already holds sequences up to " + strconv.FormatInt(watermark, 10) +
-		" but this outbox was numbering from " + strconv.FormatInt(batch.SeqFrom, 10) +
-		"; renumbered " + strconv.FormatInt(moved, 10) + " queued records above it")
+	r.log("the cloud acked through " + strconv.FormatInt(watermark, 10) +
+		", past this batch (" + strconv.FormatInt(batch.SeqFrom, 10) + ".." + strconv.FormatInt(batch.SeqTo, 10) +
+		"): it holds sequences the batch never reached (an earlier numbering of this outbox, or a second uploader); renumbered " +
+		strconv.FormatInt(moved, 10) + " queued records above it")
 	r.mu.Lock()
 	r.lastAckedSeq = max(r.lastAckedSeq, watermark)
 	// The narrowing (a 400's) named sequences that no longer exist.
@@ -2094,7 +2189,6 @@ func (r *whatsAppLinkRunner) flush(ctx context.Context) {
 
 func (r *whatsAppLinkRunner) diagnostics() map[string]any {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	cutoff := time.Now().Add(-24 * time.Hour)
 	kept := r.reconnects[:0]
 	for _, t := range r.reconnects {
@@ -2111,15 +2205,20 @@ func (r *whatsAppLinkRunner) diagnostics() map[string]any {
 		"liveMessagesSynced":    r.liveSynced,
 		"lastAckedSeq":          r.lastAckedSeq,
 	}
-	if r.outbox != nil {
-		d["outboxDepth"] = r.outbox.Depth()
-	}
 	if !r.lastEventAt.IsZero() {
 		d["lastEventAt"] = r.lastEventAt.UnixMilli()
 	}
 	if r.errorCode != "" {
 		d["lastErrorCode"] = r.errorCode
 		d["lastErrorAt"] = r.lastErrorAt.UnixMilli()
+	}
+	ob := r.outbox
+	r.mu.Unlock()
+	// Depth waits for the outbox lock, which a long Append or Rebase holds:
+	// asked under r.mu, a heartbeat would hold every event (handleEvent takes
+	// r.mu first) behind that write.
+	if ob != nil {
+		d["outboxDepth"] = ob.Depth()
 	}
 	return d
 }

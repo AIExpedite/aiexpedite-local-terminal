@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 )
@@ -90,6 +91,11 @@ type whatsAppOutbox struct {
 	pendingIdentities map[string]string
 	// closed: Close ran (under mu, so it waited for any write in flight).
 	closed bool
+	// writing is set while an Append or a Rebase holds mu. Read without mu
+	// (WriteInFlight): a shutdown past its deadline gives such a write a
+	// short grace to commit (closeStoresWithin), because WhatsApp does not
+	// send a history chunk again.
+	writing atomic.Bool
 }
 
 // whatsAppOutboxBatch is a contiguous range ready to upload.
@@ -112,10 +118,16 @@ func openWhatsAppOutbox(dir, linkID string) (ob *whatsAppOutbox, discarded bool,
 	// has already acted on: records re-numbered at or below its replay
 	// watermark are acked without being written, and a person could be
 	// written under a second identity.
-	// fullfsync / checkpoint_fullfsync: on macOS fsync() does not flush the
-	// drive's cache, so FULL alone is not durable there; SQLite then uses
-	// F_FULLFSYNC. Other platforms ignore both.
-	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=fullfsync(1)&_pragma=checkpoint_fullfsync(1)")
+	// fullfsync: on macOS fsync() does not flush the drive's cache, so FULL
+	// alone is not durable there; with this SQLite uses F_FULLFSYNC for every
+	// sync, checkpoints included (other platforms ignore it). On macOS every
+	// commit therefore waits for the drive's cache flush, and live messages
+	// are one commit each, so catching up after sleep is bounded by the
+	// drive's flush rate. That is deliberate: durability first.
+	// journal_size_limit: the WAL grows to hold a large transaction (a Rebase,
+	// a history chunk at the caps) and by default keeps that size once
+	// checkpointed; this truncates it back to 64 MiB when it resets.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(FULL)&_pragma=fullfsync(1)&_pragma=journal_size_limit(67108864)")
 	if err != nil {
 		return nil, false, err
 	}
@@ -212,20 +224,26 @@ func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
 //
 // The cloud acks a batch at or below its watermark as a replay WITHOUT
 // writing it. An ack past the batch's own end therefore says the cloud holds
-// sequences this outbox never sent it: the numbering restarted below the
-// watermark (an outbox.db lost or restored from a backup) where linkStart's
-// EnsureNextAbove could not see it, and deleting the batch on that ack would
-// lose every record in it. Rebase moves every queued row up by the same
-// amount instead - order kept, the oldest landing just above the watermark -
-// and raises `next` past them, in one transaction. Each row is re-sealed
-// under its new sequence (the AAD binds it), with its payload's deviceSeq
-// rewritten to match.
+// sequences this batch never reached. Usually they are an earlier numbering
+// of this outbox: outbox.db was rolled back or restored from a backup where
+// linkStart's EnsureNextAbove could not see it, and deleting the batch on
+// that ack would lose every record in it. Rarely, two uploaders overlapped on
+// one link and the other one sent these rows first; the re-send is then
+// idempotent. (A batch whose 2xx was lost is not this: the uploader retries
+// it as exactly the same range, so it comes back as an exact replay.)
+//
+// Rebase moves every queued row up by the same amount - order kept, the
+// oldest landing just above the watermark - and raises `next` past them, in
+// one transaction. Each row is re-sealed under its new sequence (the AAD
+// binds it), with its payload's deviceSeq rewritten to match.
 func (ob *whatsAppOutbox) Rebase(above int64) (int64, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	if ob.closed {
 		return 0, errWhatsAppOutboxClosed
 	}
+	ob.writing.Store(true)
+	defer ob.writing.Store(false)
 	var minSeq, maxSeq sql.NullInt64
 	if err := ob.db.QueryRow(`SELECT MIN(seq), MAX(seq) FROM outbox`).Scan(&minSeq, &maxSeq); err != nil {
 		return 0, err
@@ -371,6 +389,8 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	if ob.closed {
 		return errWhatsAppOutboxClosed
 	}
+	ob.writing.Store(true)
+	defer ob.writing.Store(false)
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -507,6 +527,13 @@ func (ob *whatsAppOutbox) Depth() int64 {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	return ob.count
+}
+
+// WriteInFlight reports whether an Append or a Rebase is inside its
+// transaction right now. It never waits for one, unlike every call that
+// takes mu.
+func (ob *whatsAppOutbox) WriteInFlight() bool {
+	return ob.writing.Load()
 }
 
 // HasRoomForHistory reports whether a history append would be accepted.
