@@ -330,6 +330,63 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
 	}
 }
 
+// The same on the usual path, with uploads healthy: shutdown's flush waits for
+// the outbox behind the chunk's Append, so the deadline passes while the link
+// is still stopping - before the store close is ever reached. The write is
+// waited for there too, and only as long as it lasts.
+func TestWhatsAppShutdownWaitsForAHistoryChunkWhileLinksAreStopping(t *testing.T) {
+	h, c := pairedHarness(t)
+	r := h.sup.runner("lnk_1")
+	dir, _ := whatsAppLinkDir("lnk_1")
+	waitFor(t, "the outbox drained", func() bool { depth, _ := r.outboxDepth(); return depth == 0 })
+	// Every batch from here on is answered 503, so no ack deletes the rows
+	// this test counts, and uploads are not paused (a 401 would let the
+	// flush skip the outbox, which is the other test's path).
+	h.transport.mu.Lock()
+	h.transport.respond = func(p map[string]any) whatsAppSyncResult {
+		if p["kind"] != waSyncKindBatch {
+			return whatsAppSyncResult{Status: 200}
+		}
+		return whatsAppSyncResult{Status: 503}
+	}
+	h.transport.mu.Unlock()
+	prevGrace := whatsAppShutdownWriteGrace
+	whatsAppShutdownWriteGrace = 10 * time.Second
+	t.Cleanup(func() { whatsAppShutdownWriteGrace = prevGrace })
+	r.mu.Lock()
+	ob := r.outbox
+	r.mu.Unlock()
+
+	const chunk = 30000
+	histDone := make(chan struct{})
+	go func() { // whatsmeow's event goroutine
+		defer close(histDone)
+		c.emit(&events.HistorySync{Data: bigHistoryChunk(chunk)})
+	}()
+	t.Cleanup(func() {
+		<-histDone
+		_ = r.closeStores() // shutdown left them to the process exit
+	})
+	appendBy := time.Now().Add(10 * time.Second)
+	for !ob.WriteInFlight() {
+		if time.Now().After(appendBy) {
+			t.Fatal("the history chunk's Append never started")
+		}
+		runtime.Gosched()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	h.sup.ShutdownAll(ctx)
+	took := time.Since(start)
+	if atExit := committedOutboxRows(t, dir); atExit < chunk {
+		t.Fatalf("ShutdownAll returned (the process exits) with %d of the chunk's %d records committed", atExit, chunk)
+	}
+	if took >= whatsAppShutdownWriteGrace/2 {
+		t.Fatalf("ShutdownAll took %v: it waited out the grace, not the write", took)
+	}
+}
+
 // ShutdownAll's own store close honours the caller's deadline. The test holds
 // the outbox lock itself, as no Append or Rebase does, so nothing is
 // committing and no grace applies: shutdown returns at its deadline, and the

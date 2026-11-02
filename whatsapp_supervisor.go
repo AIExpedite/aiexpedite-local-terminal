@@ -1026,7 +1026,8 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 // not outlast ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
 // teardown steps after this one still have to run), with one exception: an
 // outbox write still committing when the deadline passes gets up to
-// whatsAppShutdownWriteGrace more (closeStoresWithin).
+// whatsAppShutdownWriteGrace more (waitOutWrites), whichever step the
+// deadline finds shutdown in.
 func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.mu.Lock()
 	if s.stopped {
@@ -1050,6 +1051,8 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	if len(runners) == 0 {
 		return
 	}
+	// Listed now, while nothing holds a runner's lock waiting on its outbox.
+	outboxes := outboxesOf(runners)
 	flushCtx, cancel := context.WithTimeout(context.Background(), whatsAppUpdateDrainFlush)
 	defer cancel()
 	if ctx != nil {
@@ -1082,7 +1085,12 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	case <-stoppedAll:
 	case <-deadline:
 		// Out of time with a runner still stopping: leave its stores to the
-		// process exit (SQLite is crash-safe) and record the links.
+		// process exit (SQLite keeps what it committed) and record the links.
+		// This is the usual way a large history Append meets shutdown: the
+		// flush waits for the outbox behind it. The write still gets its
+		// grace; the runners finishing does not end it (it runs on
+		// whatsmeow's history goroutine), so only the write is waited for.
+		waitOutWrites(outboxes, nil)
 		logWhatsApp("-", "shutdown deadline reached while links were still stopping; their files stay for the next start")
 		s.persist()
 		return
@@ -1095,24 +1103,11 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 
 // whatsAppShutdownWriteGrace is how long past its deadline shutdown still
 // waits for an outbox write that is committing (a var so tests can shorten
-// it): see closeStoresWithin.
+// it): see waitOutWrites.
 var whatsAppShutdownWriteGrace = 2 * time.Second
 
-// closeStoresWithin closes the runners' stores, giving up at deadline (nil:
-// none) and reporting whether they all closed. Closing an outbox waits for a
-// write in flight (whatsAppOutbox.Close is a barrier), and a large history
-// chunk can still be appending on whatsmeow's goroutine: shutdown must not
-// outlast its deadline for it (Windows gives the whole shutdown 2–4 s).
-//
-// The one exception is a write still committing when the deadline passes.
-// The process exits right after shutdown returns, and an Append cut short
-// rolls back a history chunk that WhatsApp has already delivered and will not
-// send again. So while an outbox reports a write in flight, the closes get up
-// to whatsAppShutdownWriteGrace more - only that long, and only while the
-// write lasts.
-func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) bool {
-	// Taken before the closes start: closeStores takes each outbox off its
-	// runner.
+// outboxesOf lists the runners' open outboxes.
+func outboxesOf(runners []*whatsAppLinkRunner) []*whatsAppOutbox {
 	outboxes := make([]*whatsAppOutbox, 0, len(runners))
 	for _, r := range runners {
 		r.mu.Lock()
@@ -1121,7 +1116,56 @@ func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) 
 		}
 		r.mu.Unlock()
 	}
+	return outboxes
+}
+
+// waitOutWrites is shutdown's one exception to its deadline. The process
+// exits right after shutdown returns, and an Append cut short rolls back a
+// history chunk that WhatsApp has already delivered and will not send again.
+// So while one of the outboxes reports a write in flight (WriteInFlight), it
+// waits - at most whatsAppShutdownWriteGrace, only while the write lasts, and
+// no longer than until done closes (nil: never) - and reports whether no
+// write is left in flight. A committed write needs nothing more: SQLite
+// keeps it however the process ends.
+func waitOutWrites(outboxes []*whatsAppOutbox, done <-chan struct{}) bool {
 	writing := func() bool { return slices.ContainsFunc(outboxes, (*whatsAppOutbox).WriteInFlight) }
+	if !writing() {
+		return true
+	}
+	start := time.Now()
+	giveUp := time.NewTimer(whatsAppShutdownWriteGrace)
+	defer giveUp.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for writing() {
+		select {
+		case <-done:
+			return true
+		case <-giveUp.C:
+			logWhatsApp("-", "an outbox write was still committing "+whatsAppShutdownWriteGrace.String()+
+				" past the shutdown deadline; gave up on it - a history chunk being written may be lost until a re-link")
+			return false
+		case <-tick.C:
+		}
+	}
+	logWhatsApp("-", "waited "+time.Since(start).Round(time.Millisecond).String()+
+		" past the shutdown deadline for an outbox write to finish")
+	return true
+}
+
+// closeStoresWithin closes the runners' stores, giving up at deadline (nil:
+// none) and reporting whether they all closed. Closing an outbox waits for a
+// write in flight (whatsAppOutbox.Close is a barrier), and a large history
+// chunk can still be appending on whatsmeow's goroutine: shutdown must not
+// outlast its deadline for it (Windows gives the whole shutdown 2–4 s).
+//
+// The one exception is a write still committing when the deadline passes:
+// it gets its grace (waitOutWrites). The closes finishing ends the wait too,
+// since a close waits for any write in flight.
+func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) bool {
+	// Taken before the closes start: closeStores takes each outbox off its
+	// runner.
+	outboxes := outboxesOf(runners)
 	closed := make(chan struct{})
 	go func() {
 		for _, r := range runners {
@@ -1134,28 +1178,9 @@ func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) 
 		return true
 	case <-deadline:
 	}
-	if !writing() {
+	if !waitOutWrites(outboxes, closed) {
 		return false
 	}
-	start := time.Now()
-	giveUp := time.NewTimer(whatsAppShutdownWriteGrace)
-	defer giveUp.Stop()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-wait:
-	for writing() {
-		select {
-		case <-closed:
-			break wait
-		case <-giveUp.C:
-			logWhatsApp("-", "an outbox write was still committing "+whatsAppShutdownWriteGrace.String()+
-				" past the shutdown deadline; gave up on it - a history chunk being written may be lost until a re-link")
-			return false
-		case <-tick.C:
-		}
-	}
-	logWhatsApp("-", "waited "+time.Since(start).Round(time.Millisecond).String()+
-		" past the shutdown deadline for an outbox write to finish")
 	select {
 	case <-closed:
 		return true
