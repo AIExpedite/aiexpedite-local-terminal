@@ -149,12 +149,25 @@ const (
 // is then stored as numbers only, and the cache keeps its rule that what it
 // holds is metrics, timestamps, fingerprints and closed vocabulary — free text
 // appears only in a generic window's row, which the card publishes anyway.
+//
+// ReadAccount / ReadOrg are set only on a READING's row
+// (claudeRateLimitBucket.Row): the login the reading was taken under
+// (claudeAccountBinding), so a reading from another login is never shown as
+// this one's. A set records its login once, for all its windows, and leaves
+// them empty.
 type claudeReportedWindow struct {
-	ID    string `json:"-"`
-	Kind  string `json:"kind,omitempty"`
-	Label string `json:"label,omitempty"`
-	Model string `json:"model,omitempty"`
-	Order int    `json:"order"`
+	ID          string `json:"-"`
+	Kind        string `json:"kind,omitempty"`
+	Label       string `json:"label,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Order       int    `json:"order"`
+	ReadAccount string `json:"account,omitempty"`
+	ReadOrg     string `json:"org,omitempty"`
+}
+
+// readBinding is the login a reading's row was taken under.
+func (w claudeReportedWindow) readBinding() claudeAccountBinding {
+	return claudeAccountBinding{account: w.ReadAccount, org: w.ReadOrg}
 }
 
 // claudeWindowSet is one authoritative statement of which windows the account
@@ -166,10 +179,16 @@ type claudeReportedWindow struct {
 type claudeWindowSet struct {
 	AtMs    int64
 	Windows []claudeReportedWindow
-	// Account is the one-way digest (claudeAccountRef) of the Claude account the
-	// set was read under, "" when that was not known. See
-	// claudeEffectiveWindowSet for the binding it enforces.
+	// Account / Org are the one-way digests (claudeAccountRef, claudeOrgRef) of
+	// the Claude account and organization the set was read under, "" when not
+	// known. See claudeEffectiveWindowSet for the binding they enforce.
 	Account string
+	Org     string
+}
+
+// binding is the login the set was read under.
+func (s *claudeWindowSet) binding() claudeAccountBinding {
+	return claudeAccountBinding{account: s.Account, org: s.Org}
 }
 
 // claudeSnapshotWindowSet is the probe's persisted set, or nil when the
@@ -194,7 +213,8 @@ func claudeSnapshotWindowSet(snap claudeRateLimitSnapshot) *claudeWindowSet {
 		}
 		return windows[i].ID < windows[j].ID
 	})
-	return &claudeWindowSet{AtMs: snap.ReportedWindowsAtMs, Windows: windows, Account: snap.ReportedAccount}
+	return &claudeWindowSet{AtMs: snap.ReportedWindowsAtMs, Windows: windows,
+		Account: snap.ReportedAccount, Org: snap.ReportedOrg}
 }
 
 // persisted is the set's windows as the snapshot stores them, keyed by id (nil
@@ -219,6 +239,86 @@ func claudeAccountRef(accountUUID string) string {
 		return ""
 	}
 	return fingerprintAccount(claudeUsageProvider+":accountUuid", accountUUID)
+}
+
+// claudeOrgRef is claudeAccountRef for oauthAccount.organizationUuid.
+func claudeOrgRef(orgUUID string) string {
+	orgUUID = strings.TrimSpace(orgUUID)
+	if orgUUID == "" {
+		return ""
+	}
+	return fingerprintAccount(claudeUsageProvider+":organizationUuid", orgUUID)
+}
+
+// claudeAccountBinding is the login a window set, or a reading of a window this
+// agent never modelled, describes: the digests of ~/.claude.json's
+// oauthAccount.accountUuid and organizationUuid as they were when it was read,
+// "" for a part that was not known.
+//
+// A claude.ai credential carries no account, so the cache fingerprint cannot
+// see a `/login`: the previous login's set and readings stay in the cache, and
+// these digests are the only evidence they belong to someone else. Both parts,
+// because quotas belong to the ORGANIZATION — one Claude user can sign in to
+// several (a personal Ultra org, a company Team org) — and Claude Code itself
+// treats a change of either as an account switch: it clears its own cached
+// usage reply on every login. Each part is compared only when both sides know
+// it, so a field one side lacks never reads as a switch.
+type claudeAccountBinding struct {
+	account string
+	org     string
+}
+
+// conflicts reports whether two logins are known to differ.
+func (b claudeAccountBinding) conflicts(other claudeAccountBinding) bool {
+	differ := func(x, y string) bool { return x != "" && y != "" && x != y }
+	return differ(b.account, other.account) || differ(b.org, other.org)
+}
+
+// binding is the login ~/.claude.json names.
+func (f claudeDotJSONFacts) binding() claudeAccountBinding {
+	return claudeAccountBinding{account: claudeAccountRef(f.accountUUID), org: claudeOrgRef(f.orgUUID)}
+}
+
+// claudeBindGenericReadings stamps every generic reading in `updates` with the
+// login it was read under — the reading's own copy of its row, so the reply's
+// window set (which records its login once, for the whole set) is untouched.
+func claudeBindGenericReadings(updates map[string]claudeRateLimitBucket, login claudeAccountBinding) {
+	for id, b := range updates {
+		if b.Row == nil {
+			continue
+		}
+		row := *b.Row
+		row.ReadAccount, row.ReadOrg = login.account, login.org
+		b.Row = &row
+		updates[id] = b
+	}
+}
+
+// claudeBucketsForLogin is the cache's readings minus every reading of a
+// window this agent never modelled that was taken under ANOTHER login than
+// `current` (claudeAccountBinding). The modelled windows are left alone: the
+// next reading of the same window overwrites the previous login's, which a
+// generic window's reading — under an id the new login may never report — never
+// is. Hidden, not deleted: signing back in to that login shows them again. The
+// map is copied only when something is dropped.
+func claudeBucketsForLogin(buckets map[string]claudeRateLimitBucket, current claudeAccountBinding) map[string]claudeRateLimitBucket {
+	var out map[string]claudeRateLimitBucket
+	for id, b := range buckets {
+		if b.Row == nil || !b.Row.readBinding().conflicts(current) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]claudeRateLimitBucket, len(buckets))
+			for k, v := range buckets {
+				out[k] = v
+			}
+		}
+		delete(out, id)
+	}
+	if out == nil {
+		return buckets
+	}
+	return out
 }
 
 /* ─────────────────────────── decoding helpers ─────────────────────────── */
@@ -398,7 +498,13 @@ func claudeGenericWindow(kind, group, modelID, modelName, surfaceName string) cl
 	w := claudeReportedWindow{ID: claudeGenericWindowPrefix + kindSlug, Kind: metricKind}
 	switch {
 	case modelID != "" || modelName != "":
-		w.ID += ":model:" + claudeWindowSlug(firstNonEmpty(modelID, modelName))
+		// The id follows the display name, as the label and the model key do —
+		// the id only when there is no name. Every reply seen so far sends
+		// `id: null`; slugging the id first would move the window to a new cache
+		// id the day the provider fills it in, while its row's kind + label +
+		// model stayed the same, and the reading under the old id could then
+		// stand in for the new one (claudeMetricRows.add).
+		w.ID += ":model:" + claudeWindowSlug(firstNonEmpty(modelName, modelID))
 		w.Model = claudeWindowModelKey(modelID, modelName)
 		w.Label = claudeScopedWindowLabel(periodWord, kindSlug, firstNonEmpty(modelName, modelID))
 	case surfaceName != "":
@@ -850,13 +956,14 @@ func logClaudeGenericWindowsOnce(ids []string) {
 // Code's own cached reply. Either is a full statement of the account's windows
 // at its instant, so the later one is simply the better-informed.
 //
-// The probe's set is bound to the Claude account it was read under. A claude.ai
-// credential carries no account at all, so the cache fingerprint cannot see a
-// `/login` to another account, and the previous account's set would go on
-// hiding the new account's windows. When both the recorded and the current
-// account are known and differ, the set is ignored — falling back to today's
-// rows, the fail-safe direction — until a probe or Claude Code's own reply
-// describes the account signed in now. Claude Code's reply is bound by
+// The probe's set is bound to the login it was read under — account AND
+// organization (claudeAccountBinding). A claude.ai credential carries no
+// account at all, so the cache fingerprint cannot see a `/login` to another
+// account, or the same user's switch to another organization, and the previous
+// login's set would go on hiding the new one's windows. When the recorded and
+// the current login are known to differ, the set is ignored — falling back to
+// today's rows, the fail-safe direction — until a probe or Claude Code's own
+// reply describes the login signed in now. Claude Code's reply is bound by
 // construction (claudeDotJSONFacts takes it only when its accountUuid is the
 // signed-in one) and is ignored when it claims a fetch implausibly far in the
 // future (claudeWindowSetSkew).
@@ -882,7 +989,7 @@ func claudeBoundProbeWindowSet(view claudeRateLimitView) *claudeWindowSet {
 	if probe == nil || probe.AtMs <= 0 {
 		return nil
 	}
-	if current := claudeAccountRef(view.dot.accountUUID); probe.Account != "" && current != "" && probe.Account != current {
+	if probe.binding().conflicts(view.dot.binding()) {
 		return nil
 	}
 	return probe
@@ -1009,24 +1116,53 @@ func claudeCodeMetricsFromWindowSet(buckets map[string]claudeRateLimitBucket, se
 }
 
 // claudeMetricRows collects one provider's rows under the signed receipt's two
-// rules: at most cliUsageMaxMetricsPerProvider rows, and kind+label+model unique
-// (the later duplicate dropped). Either violation would fail the WHOLE refresh,
-// for every provider, so both row builders add through this.
+// rules: at most cliUsageMaxMetricsPerProvider rows, and kind+label+model unique.
+// Either violation would fail the WHOLE refresh, for every provider, so both
+// row builders add through this.
 type claudeMetricRows struct {
-	metrics    []cliAgentUsageMetric
-	identities map[string]bool
+	metrics []cliAgentUsageMetric
+	// index is each identity's position in metrics.
+	index map[string]int
 }
 
+// add appends m — or, when a row with the same identity is already in, keeps
+// whichever of the two is the better evidence, at the earlier row's position:
+// a reading over an Unknown placeholder, else the later observation; a tie
+// keeps the row already in. Two windows can share an identity — one model's
+// window under a cache id the provider has since re-spelled, say, beside the
+// reading under the old one — and whichever was added first must not win just
+// for being first, or a stale 30 % hides the 100 % read after it. The three
+// modelled rows never collide (claudeIsFrozenLabel keeps every derived label
+// off theirs).
 func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
 	identity := m.Kind + "\x00" + m.Label + "\x00" + m.Model
-	if r.identities == nil {
-		r.identities = map[string]bool{}
+	if r.index == nil {
+		r.index = map[string]int{}
 	}
-	if r.identities[identity] || len(r.metrics) >= cliUsageMaxMetricsPerProvider {
+	if i, ok := r.index[identity]; ok {
+		if claudeRowIsBetterEvidence(m, r.metrics[i]) {
+			r.metrics[i] = m
+		}
 		return
 	}
-	r.identities[identity] = true
+	if len(r.metrics) >= cliUsageMaxMetricsPerProvider {
+		return
+	}
+	r.index[identity] = len(r.metrics)
 	r.metrics = append(r.metrics, m)
+}
+
+// claudeRowIsBetterEvidence reports whether `candidate` says more about its
+// window than `held`: a reading beats an Unknown placeholder, and between two
+// readings the later observation wins.
+func claudeRowIsBetterEvidence(candidate, held cliAgentUsageMetric) bool {
+	if candidate.Unknown {
+		return false
+	}
+	if held.Unknown {
+		return true
+	}
+	return observedAtMsFromRFC3339(candidate.ObservedAt) > observedAtMsFromRFC3339(held.ObservedAt)
 }
 
 // addGenericReadings adds a row for every reading of a window this agent never

@@ -1961,7 +1961,9 @@ capacity as unknown. The plan chip said "Max", because the credential's
 - **Identities are frozen** for the three modelled windows (kind + label + model
   is the metric identity downstream, and mixed agent versions on one account
   must keep merging). Any other entry becomes `limit:<kind>[:model:<name>|:surface:<name>]`
-  with a derived row: kind from the entry's `group` (a group beginning with a
+  with a derived row (the id slugs the scope's display name, as the label does,
+  so a provider starting to fill `scope.model.id` does not move the window):
+  kind from the entry's `group` (a group beginning with a
   period word is that period; with no group, the kind's own prefix; a group
   naming no period is its own kind, so the kind and the label's first word
   always agree), never `hint`; label `"<Group> <Model>"` ("Weekly Haiku 5"), `"<Group> <Surface>"`,
@@ -1974,7 +1976,9 @@ capacity as unknown. The plan chip said "Max", because the credential's
   first word) — a surface or unknown scope is a shared
   constraint. At most 32 rows, labels bounded to 64 runes / 256 bytes, the pool
   key to 64 bytes, kind + label + model unique: the signed receipt rejects any
-  violation for the whole refresh, and no new receipt field is used. A new
+  violation for the whole refresh, and no new receipt field is used. When two
+  windows share an identity, the better evidence is kept at the first one's
+  position: a reading over Unknown, else the later observation. A new
   window id is logged once per process (`[claude-usage] provider reported
   windows …`), ids only.
 - **Second source: Claude Code's own cached reply.** `~/.claude.json`
@@ -1986,12 +1990,19 @@ capacity as unknown. The plan chip said "Max", because the credential's
   windows the account lacks. Window set only, never values; re-read each gather
   (the file is parsed once per stamp), never persisted. The newer of the two
   sets wins.
-- **Account binding.** A claude.ai credential carries no account, so the cache
-  cannot see a `/login` to another account. The probe's set records a one-way
-  digest of the `accountUuid` sampled before the credential read; when the
-  current account is known and differs, the set is ignored (the old three
-  rows) until a probe or Claude Code's reply describes the new one. The account
-  id is display-only — never a fingerprint or a cache scope.
+- **Login binding.** A claude.ai credential carries no account, so the cache
+  cannot see a `/login` to another account, or the same user's switch to
+  another organization (quotas belong to the organization; Claude Code treats
+  either change as an account switch). The probe's set records one-way digests
+  of `oauthAccount.accountUuid` and `organizationUuid`, sampled before the
+  credential read (`reportedAccount` / `reportedOrg`). Each part is compared
+  only when both sides know it. When the current login differs, the set is
+  ignored: the old three rows return until a probe or Claude Code's reply
+  describes the new login. Each generic reading carries the same digests on its
+  row (`row.account` / `row.org`), and a reading another login took is left
+  out of the rows. Nothing the new login reports would ever overwrite it, and
+  signing back in shows it again. These ids are display-only — never a
+  fingerprint or a cache scope.
 - **Freshness walks the shown rows**, so a hidden window neither triggers a
   probe nor counts as fresh evidence; an account whose probe-reported windows
   carry no readable value (or none exist) is as fresh as that probe. That last

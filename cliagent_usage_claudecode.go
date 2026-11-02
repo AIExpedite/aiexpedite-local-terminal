@@ -149,6 +149,11 @@ type claudeDotJSON struct {
 		// describes (claudeEffectiveWindowSet) and is never a fingerprint or a
 		// cache scope, for the reasons claudeDotJSONFacts gives.
 		AccountUUID claudeLooseString `json:"accountUuid"`
+		// OrganizationUUID is the organization the login is signed in to. Quotas
+		// belong to it, and one account can sign in to several, so it binds a
+		// window set exactly as AccountUUID does (claudeAccountBinding).
+		// DISPLAY-ONLY identity like AccountUUID.
+		OrganizationUUID claudeLooseString `json:"organizationUuid"`
 	} `json:"oauthAccount"`
 	// CachedUsageUtilization is Claude Code's own copy of the usage endpoint's
 	// last reply — `{fetchedAtMs, accountUuid, utilization: <the reply body>}` —
@@ -622,6 +627,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 		scope:       cacheScopeAtCredentialRead,
 		scopePinned: true,
 		accountUUID: dot.accountUUID,
+		orgUUID:     dot.orgUUID,
 		expiresAtMs: oauthExpiresAtMs,
 		credStamp:   credStamp,
 	}) {
@@ -728,6 +734,7 @@ type claudeDotJSONFacts struct {
 	// claudePlanDisplayNamePattern.
 	planDisplayName string
 	accountUUID     string
+	orgUUID         string
 	// usageWindows is the window set Claude Code's own cached usage reply
 	// reports (claudeDotJSONUsageWindows), or nil.
 	usageWindows *claudeWindowSet
@@ -831,11 +838,13 @@ func readClaudeDotJSONFacts(path string) (claudeDotJSONFacts, claudeCredStamp, b
 		return claudeDotJSONFacts{}, claudeCredStamp{}, false
 	}
 	account := strings.TrimSpace(string(cfg.OAuthAccount.AccountUUID))
+	org := strings.TrimSpace(string(cfg.OAuthAccount.OrganizationUUID))
 	facts := claudeDotJSONFacts{
 		email:        cfg.OAuthAccount.EmailAddress,
 		displayName:  cfg.OAuthAccount.DisplayName,
 		accountUUID:  account,
-		usageWindows: claudeDotJSONUsageWindows(cfg.CachedUsageUtilization, account),
+		orgUUID:      org,
+		usageWindows: claudeDotJSONUsageWindows(cfg.CachedUsageUtilization, account, org),
 	}
 	if name := string(cfg.OAuthAccount.PlanDisplayName); claudePlanDisplayNamePattern.MatchString(name) {
 		facts.planDisplayName = name
@@ -864,7 +873,7 @@ func readClaudeDotJSONFacts(path string) (claudeDotJSONFacts, claudeCredStamp, b
 // and never a reason the receipt could fail. Re-read every gather (through the
 // stamp cache), never persisted: a probe set persisted later with a newer
 // instant supersedes it (claudeEffectiveWindowSet).
-func claudeDotJSONUsageWindows(raw json.RawMessage, accountUUID string) *claudeWindowSet {
+func claudeDotJSONUsageWindows(raw json.RawMessage, accountUUID, orgUUID string) *claudeWindowSet {
 	if len(raw) == 0 || accountUUID == "" {
 		return nil
 	}
@@ -888,7 +897,10 @@ func claudeDotJSONUsageWindows(raw json.RawMessage, accountUUID string) *claudeW
 	}
 	_, set := claudeUsageReplyWindows(decoded, int64(fetchedAt))
 	if set != nil {
-		set.Account = claudeAccountRef(accountUUID)
+		// The copy carries no organization of its own, but Claude Code clears it
+		// on every login (an organization switch included), so the one present
+		// was fetched for the login the config names now.
+		set.Account, set.Org = claudeAccountRef(accountUUID), claudeOrgRef(orgUUID)
 	}
 	return set
 }

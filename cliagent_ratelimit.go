@@ -204,6 +204,11 @@ type claudeRateLimitSnapshot struct {
 	// (claudeEffectiveWindowSet). The digest, not the id, because this file can
 	// reach a diagnostics upload.
 	ReportedAccount string `json:"reportedAccount,omitempty"`
+	// ReportedOrg is the same for oauthAccount.organizationUuid (claudeOrgRef):
+	// quotas belong to the organization, and one Claude user can sign in to
+	// several, so a set read under another organization of the same account
+	// describes someone else's windows too (claudeAccountBinding).
+	ReportedOrg string `json:"reportedOrg,omitempty"`
 
 	// RefreshOwedAtMs is the newest run (or `__cli_smoke__` turn) completion for
 	// which no observation has landed yet — the DURABLE half of
@@ -353,7 +358,7 @@ func resetClaudeProbeAccountState(snap *claudeRateLimitSnapshot) {
 	snap.Buckets = map[string]claudeRateLimitBucket{}
 	snap.LastProbeObservedAtMs = 0
 	// The window set describes ONE account's quota, exactly like its buckets.
-	snap.ReportedWindows, snap.ReportedWindowsAtMs, snap.ReportedAccount = nil, 0, ""
+	snap.ReportedWindows, snap.ReportedWindowsAtMs, snap.ReportedAccount, snap.ReportedOrg = nil, 0, "", ""
 	snap.RefreshOwedAtMs, snap.RefreshOwedAttempts, snap.HeldUntilMs = 0, 0, 0
 	snap.NextAttemptAtMs, snap.AuthWaitCredStampNs, snap.AuthWaitCredSize = 0, 0, 0
 	snap.AttemptClaimedUntilMs = 0
@@ -1158,6 +1163,7 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		snap.ReportedWindows = reported.persisted()
 		snap.ReportedWindowsAtMs = reported.AtMs
 		snap.ReportedAccount = reported.Account
+		snap.ReportedOrg = reported.Org
 	}
 	// Record that the probe sampled this account, independently of which writer
 	// ends up owning each window (see LastProbeObservedAtMs). Only readings

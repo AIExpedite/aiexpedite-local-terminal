@@ -1834,6 +1834,10 @@ type claudeUsageProbeIdentity struct {
 	// ignores, never like the new account's, which it would trust. "" when the
 	// file names none. Display-only identity: never a fingerprint or a scope.
 	accountUUID string
+	// orgUUID is oauthAccount.organizationUuid, sampled with accountUUID for
+	// the same reason: the set — and every generic reading — is bound to both
+	// (claudeAccountBinding). "" when the file names none.
+	orgUUID string
 
 	// expiresAtMs is the stored access token's claudeAiOauth.expiresAt (zero when
 	// absent), and credStamp the credential file's stamp (zero on a Keychain
@@ -1875,7 +1879,7 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	// Keychain round-trip on a default macOS config, not an instant, so a
 	// `/login` landing inside it is exactly the case this ordering refuses.
 	scope := claudeRateLimitCacheScope()
-	account := claudeDotJSONFactsFor(home).accountUUID
+	dot := claudeDotJSONFactsFor(home)
 	raw, stamp, ok := readClaudeCredentialsRawStamped(context.Background(), base)
 	if !ok {
 		return claudeUsageProbeIdentity{}
@@ -1889,7 +1893,8 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 		fingerprint: fingerprintAccount(claudeCodeUsageParser{}.Provider(), creds.claudeCredentialAccount()),
 		scope:       scope,
 		scopePinned: true,
-		accountUUID: account,
+		accountUUID: dot.accountUUID,
+		orgUUID:     dot.orgUUID,
 		expiresAtMs: creds.ClaudeAiOauth.ExpiresAt,
 		credStamp:   stamp,
 	}
@@ -2032,7 +2037,8 @@ func probeClaudeUsageResult(
 	// in the same place and for the same reason (claudeUsageProbeIdentity.accountUUID).
 	// Display-only: it decides which set the row builder trusts, never what this
 	// request may write.
-	accountBefore := claudeCurrentDotJSONFacts().accountUUID
+	dotBefore := claudeCurrentDotJSONFacts()
+	accountBefore, orgBefore := dotBefore.accountUUID, dotBefore.orgUUID
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
@@ -2047,7 +2053,7 @@ func probeClaudeUsageResult(
 	// only ever narrow the write targets the locked guards below admit.
 	if identity.scopePinned {
 		scopeBefore = identity.scope
-		accountBefore = identity.accountUUID
+		accountBefore, orgBefore = identity.accountUUID, identity.orgUUID
 	}
 	persistedFor = identity.fingerprint
 	result.credStamped = !identity.credStamp.isZero()
@@ -2241,14 +2247,19 @@ func probeClaudeUsageResult(
 		result.code = claudeProbeNoWindows
 		return result, false, time.Time{}
 	}
+	// Bound to the login — account and organization — Claude Code's config named
+	// as this request went out, sampled with the scope, before the credential
+	// (accountBefore / orgBefore), so a `/login` racing the request can only
+	// make the answer look like the PREVIOUS login's, which the row builders
+	// then ignore (today's rows), never like the new one's. The set records its
+	// login once; each reading of a window this agent never modelled carries its
+	// own, because nothing a later login reports overwrites it
+	// (claudeBucketsForLogin).
+	login := claudeAccountBinding{account: claudeAccountRef(accountBefore), org: claudeOrgRef(orgBefore)}
 	if reported != nil {
-		// Bound to the account Claude Code's config named as this request went
-		// out — sampled with the scope, before the credential (accountBefore),
-		// so a `/login` racing the request can only make the set look like the
-		// PREVIOUS account's, which claudeEffectiveWindowSet then ignores (today's
-		// rows), never like the new one's.
-		reported.Account = claudeAccountRef(accountBefore)
+		reported.Account, reported.Org = login.account, login.org
 	}
+	claudeBindGenericReadings(updates, login)
 	// Report success only if the snapshot actually reached disk. The
 	// fire-and-forget merge swallows an unwritable data dir, a Windows sharing
 	// violation, and a failed rename alike — returning true on any of those would

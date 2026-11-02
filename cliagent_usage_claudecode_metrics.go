@@ -334,11 +334,18 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 // exactly today's three. Every freshness decision walks these same rows
 // (claudeRowObservationsMs), so a hidden window neither triggers a probe nor
 // counts as fresh evidence.
+//
+// A reading of a window this agent never modelled that was taken under another
+// login (claudeBucketsForLogin) is left out of both: after a `/login` to another
+// account or organization — invisible to a claude.ai credential's cache scope —
+// the previous login's new meters must not become the new login's rows, and
+// nothing the new login reports would ever overwrite them.
 func claudeCodeMetricsFromView(view claudeRateLimitView, now time.Time) []cliAgentUsageMetric {
+	buckets := claudeBucketsForLogin(view.buckets, view.dot.binding())
 	if set := claudeEffectiveWindowSet(view, now); set != nil {
-		return claudeCodeMetricsFromWindowSet(view.buckets, set, now)
+		return claudeCodeMetricsFromWindowSet(buckets, set, now)
 	}
-	return claudeCodeMetricsFromBuckets(view.buckets, now)
+	return claudeCodeMetricsFromBuckets(buckets, now)
 }
 
 // claudeCodeMetricsFromBuckets is the row layout for an account whose window
@@ -350,11 +357,13 @@ func claudeCodeMetricsFromView(view claudeRateLimitView, now time.Time) []cliAge
 // exactly as it did.
 //
 // After them, a row for every reading of a window this agent never modelled
-// (claudeMetricRows.addGenericReadings). Only a probe reply that was NOT authoritative
-// leaves such a reading without a set — an authoritative one records the set
-// beside it — and a new meter it could read is still a constraint the card and
-// routing must see. A cache an older agent wrote holds none, so it still reads
-// as exactly the three rows.
+// (claudeMetricRows.addGenericReadings) that the caller passes in: a reading
+// from a reply that was not authoritative, which records no set, or one whose
+// set is ignored because it was read under another login. A new meter such a
+// reply could read is still a constraint the card and routing must see. The
+// caller drops the readings another login took (claudeCodeMetricsFromView,
+// claudeBucketsForLogin), and a cache an older agent wrote holds none, so
+// either still reads as exactly the three rows.
 func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now time.Time) []cliAgentUsageMetric {
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, claudeSessionLabel, now)

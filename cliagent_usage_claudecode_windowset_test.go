@@ -28,6 +28,9 @@ const (
 	// Synthetic account ids for the account-binding cases.
 	claudeTestAccountA = "00000000-0000-4000-8000-0000000000a1"
 	claudeTestAccountB = "00000000-0000-4000-8000-0000000000b2"
+	// Synthetic organization ids: one Claude user can sign in to several.
+	claudeTestOrgX = "00000000-0000-4000-8000-0000000000c3"
+	claudeTestOrgY = "00000000-0000-4000-8000-0000000000d4"
 
 	// The verified-Ultra reply's resets, as the endpoint spells them: the weekly
 	// all-models reset with sub-second jitter, Fable's on the whole second.
@@ -426,7 +429,7 @@ func TestClaudeGenericWindows_KindsScopesLabelsAndModels(t *testing.T) {
 	wantIDs := []string{
 		"limit:daily_all", "limit:weekly_scoped:model:haiku_5", "limit:weekly_scoped:surface:claude_code",
 		"limit:weekly_burst", "limit:something_new", "limit:monthly_spend",
-		"limit:daily_scoped:model:claude_sonnet_5_1", "limit:daily_scoped:model:claude_opus_5",
+		"limit:daily_scoped:model:sonnet_5_1", "limit:daily_scoped:model:claude_opus_5",
 		"limit:hint", "limit:weekly", "limit:weekly_scoped_v2:model:fable", "limit:five_hour_extra",
 		claudeWindowSevenDay,
 	}
@@ -1213,6 +1216,223 @@ func TestClaudeWindowSet_BoundToTheAccountItWasReadUnder(t *testing.T) {
 	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""), setRows...)
 	writeClaudeDotJSON(t, configDir, map[string]any{"oauthAccount": map[string]any{"accountUuid": claudeTestAccountA}})
 	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""), setRows...)
+}
+
+// A reading of a window this agent never modelled stays with the login it was
+// read under. A claude.ai credential's cache scope cannot see a /login, so the
+// previous account's generic readings stay in the cache — and unlike a
+// modelled window's, nothing the new account reports ever overwrites them:
+// shown as the new account's rows, a spent "Daily quota" from account A would
+// make account B unroutable until a set for B arrived. Each reading carries its
+// login, and the rows leave out every one another login took — whether its
+// set is ignored (the fallback rows) or in force — and show them again when
+// that login is back.
+func TestClaudeGenericReadings_StayWithTheLoginTheyWereReadUnder(t *testing.T) {
+	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	week, day, month := t0.Add(72*time.Hour).Unix(), t0.Add(10*time.Hour).Unix(), t0.Add(20*24*time.Hour).Unix()
+	var reply atomic.Value
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, reply.Load().(string))
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	login := func(account string) {
+		t.Helper()
+		writeClaudeDotJSON(t, configDir, map[string]any{"oauthAccount": map[string]any{
+			"accountUuid": account, "organizationUuid": claudeTestOrgX}})
+	}
+	probe := func(at time.Time, body string) {
+		t.Helper()
+		reply.Store(body)
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), at, false); !refreshed || probeErr != nil {
+			t.Fatalf("probe at %s: refreshed=%v err=%+v", at.Format(time.TimeOnly), refreshed, probeErr)
+		}
+	}
+
+	login(claudeTestAccountA)
+	probe(t0, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":40,"resets_at":%d},
+		{"kind":"daily_all","group":"daily","percent":100,"resets_at":%d}]}`, week, day))
+	row := claudeCacheSnapshot(t, cache).Buckets["limit:daily_all"].Row
+	if row == nil || row.ReadAccount != claudeAccountRef(claudeTestAccountA) || row.ReadOrg != claudeOrgRef(claudeTestOrgX) {
+		t.Fatalf("daily reading's row=%+v, want it bound to A in org X", row)
+	}
+	// A partial reply under A adds a meter after the set: A's as well.
+	t1 := t0.Add(time.Minute)
+	probe(t1, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":41,"resets_at":%d},
+		{"kind":"monthly_all","group":"monthly","percent":100,"resets_at":%d},
+		{"percent":3}]}`, week, month))
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t1, ""),
+		"Weekly quota|weekly||41", "Daily quota|daily||100", "Monthly quota|monthly||100")
+
+	// /login to B: A's set is ignored and neither of A's meters is B's. What
+	// is left is exactly today's three rows (the weekly figure is still A's —
+	// the modelled windows' known skew, healed by B's first reading of them).
+	login(claudeTestAccountB)
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t1, ""),
+		"5-hour session window|session||?", "Weekly quota|weekly||41", "Weekly Fable|weekly|fable|?")
+
+	// B's own partial reply: B's daily reading shows (it is B's now), A's
+	// monthly one still does not.
+	t2 := t1.Add(time.Minute)
+	probe(t2, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":12,"resets_at":%d},
+		{"kind":"daily_all","group":"daily","percent":20,"resets_at":%d},
+		{"percent":3}]}`, week, day))
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t2, ""),
+		"5-hour session window|session||?", "Weekly quota|weekly||12", "Weekly Fable|weekly|fable|?", "Daily quota|daily||20")
+
+	// Back to A: A's set is in force again. The daily window it names now holds
+	// B's reading, which is not A's (Unknown); A's own monthly meter is back.
+	login(claudeTestAccountA)
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t2, ""),
+		"Weekly quota|weekly||12", "Daily quota|daily||?", "Monthly quota|monthly||100")
+}
+
+// Quotas belong to the ORGANIZATION, and one Claude user can sign in to
+// several — a personal Ultra org and a company Team org — under the same
+// accountUuid. Claude Code treats a change of either as an account switch (it
+// clears its own cached usage reply on every login), so the probe's set is
+// bound to both: read under org X, it is ignored once org Y is signed in,
+// rather than hiding Y's session window behind X's answer. An organization one
+// side does not know is not a switch.
+func TestClaudeWindowSet_BoundToTheOrganizationToo(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	week := now.Add(48 * time.Hour)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"weekly_all","group":"weekly","percent":44,"resets_at":%d}]}`, week.Unix())
+	})
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	signIn := func(org string) {
+		t.Helper()
+		account := map[string]any{"accountUuid": claudeTestAccountA}
+		if org != "" {
+			account["organizationUuid"] = org
+		}
+		writeClaudeDotJSON(t, configDir, map[string]any{"oauthAccount": account})
+	}
+	signIn(claudeTestOrgX)
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
+		t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.ReportedAccount != claudeAccountRef(claudeTestAccountA) || snap.ReportedOrg != claudeOrgRef(claudeTestOrgX) {
+		t.Fatalf("set bound to %q / %q, want A in org X", snap.ReportedAccount, snap.ReportedOrg)
+	}
+	setRows := []string{"Weekly quota|weekly||44"}
+	today := []string{"5-hour session window|session||?", "Weekly quota|weekly||44", "Weekly Fable|weekly|fable|?"}
+	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""), setRows...)
+
+	signIn(claudeTestOrgY)
+	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""), today...)
+	signIn("")
+	assertMetricSummary(t, claudeCodeMetricsFromCache(now, ""), setRows...)
+
+	// A set recorded with no organization stays in force whatever org is signed in.
+	snap.ReportedOrg = ""
+	view := claudeRateLimitViewOf(snap, claudeDotJSONFacts{accountUUID: claudeTestAccountA, orgUUID: claudeTestOrgY})
+	assertMetricSummary(t, claudeCodeMetricsFromView(view, now), setRows...)
+}
+
+// The day the provider starts filling scope.model.id, a model's window keeps
+// its cache id: the id follows the display name, as the label and the model key
+// do. Slugged from the id first, the window moved to a new id while its row's
+// kind + label + model stayed the same — and with the set still naming the old
+// id (the reply carrying the change was partial), the stale reading under it
+// stood in for the fresh one.
+func TestClaudeGenericWindow_TheModelIDFillingInKeepsTheWindow(t *testing.T) {
+	before := claudeGenericWindow("daily_scoped", "daily", "", "Haiku 5", "")
+	after := claudeGenericWindow("daily_scoped", "daily", "claude-haiku-5", "Haiku 5", "")
+	if before.ID != "limit:daily_scoped:model:haiku_5" || after != before {
+		t.Fatalf("before=%+v after=%+v, want one window under limit:daily_scoped:model:haiku_5", before, after)
+	}
+	if only := claudeGenericWindow("daily_scoped", "daily", "claude-haiku-5", "", ""); only.ID != "limit:daily_scoped:model:claude_haiku_5" {
+		t.Errorf("id-only window id=%q, want the id's slug", only.ID)
+	}
+
+	t0 := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	week, day := t0.Add(72*time.Hour).Unix(), t0.Add(10*time.Hour).Unix()
+	var reply atomic.Value
+	armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, reply.Load().(string)) })
+	probe := func(at time.Time, body string) {
+		t.Helper()
+		reply.Store(body)
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), at, false); !refreshed || probeErr != nil {
+			t.Fatalf("probe at %s: refreshed=%v err=%+v", at.Format(time.TimeOnly), refreshed, probeErr)
+		}
+	}
+	probe(t0, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":40,"resets_at":%d},
+		{"kind":"daily_scoped","group":"daily","percent":30,"resets_at":%d,"scope":{"model":{"id":null,"display_name":"Haiku 5"}}}]}`, week, day))
+	t1 := t0.Add(time.Minute)
+	probe(t1, fmt.Sprintf(`{"limits":[
+		{"kind":"weekly_all","group":"weekly","percent":41,"resets_at":%d},
+		{"kind":"daily_scoped","group":"daily","percent":100,"resets_at":%d,"scope":{"model":{"id":"claude-haiku-5","display_name":"Haiku 5"}}},
+		{"kind":"weekly_scoped","scope":["not","an","object"]}]}`, week, day))
+	assertMetricSummary(t, claudeCodeMetricsFromCache(t1, ""), "Weekly quota|weekly||41", "Daily Haiku 5|daily|haiku|100")
+}
+
+// Two windows can still share a row identity (kind + label + model), and the
+// receipt takes one row per identity. The one kept is the better evidence — a
+// reading over an Unknown placeholder, else the later observation — at the
+// earlier row's position; never simply whichever was added first, nor the id
+// that happens to sort first.
+func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	reading := func(label string, used float64, at time.Time) cliAgentUsageMetric {
+		return cliAgentUsageMetric{Kind: "daily", Label: label, Unit: "%", Total: floatPtr(100),
+			Consumed: floatPtr(used), Remaining: floatPtr(100 - used), ObservedAt: at.UTC().Format(time.RFC3339)}
+	}
+	unknown := cliAgentUsageMetric{Kind: "daily", Label: "Daily Haiku 5", Unit: "%", Unknown: true}
+	// A window that rolled over reads Unknown but keeps the instant it was last
+	// read — here LATER than the live reading beside it, which still wins.
+	rolledOver := cliAgentUsageMetric{Kind: "daily", Label: "Daily Haiku 5", Unit: "%", Unknown: true,
+		ObservedAt: now.UTC().Format(time.RFC3339)}
+	other := reading("Daily quota", 5, now)
+
+	for _, tc := range []struct {
+		name  string
+		adds  []cliAgentUsageMetric
+		wantN float64
+	}{
+		{"a reading replaces an Unknown placeholder", []cliAgentUsageMetric{unknown, other, reading("Daily Haiku 5", 100, now)}, 100},
+		{"a reading replaces a rolled-over window observed later", []cliAgentUsageMetric{rolledOver, other, reading("Daily Haiku 5", 70, now.Add(-time.Hour))}, 70},
+		{"an Unknown placeholder never replaces a reading", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now), other, unknown}, 30},
+		{"the later observation wins", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now.Add(-time.Hour)), other, reading("Daily Haiku 5", 100, now)}, 100},
+		{"an older observation does not", []cliAgentUsageMetric{reading("Daily Haiku 5", 100, now), other, reading("Daily Haiku 5", 30, now.Add(-time.Hour))}, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := claudeMetricRows{}
+			for _, m := range tc.adds {
+				rows.add(m)
+			}
+			if len(rows.metrics) != 2 || rows.metrics[0].Label != "Daily Haiku 5" || rows.metrics[1].Label != "Daily quota" {
+				t.Fatalf("rows=%v, want the shared identity once, at its first position", metricSummary(rows.metrics))
+			}
+			if got := rows.metrics[0]; got.Unknown || *got.Consumed != tc.wantN {
+				t.Errorf("kept %v, want %g", metricSummary(rows.metrics[:1]), tc.wantN)
+			}
+		})
+	}
+
+	// Through the row builder: two cache ids with one identity — which one is
+	// fresher, not which id sorts first, decides.
+	for _, fresherID := range []string{"limit:daily_scoped:model:aaa", "limit:daily_scoped:model:zzz"} {
+		buckets := map[string]claudeRateLimitBucket{}
+		for _, id := range []string{"limit:daily_scoped:model:aaa", "limit:daily_scoped:model:zzz"} {
+			used, at := 30.0, now.Add(-time.Hour)
+			if id == fresherID {
+				used, at = 100, now
+			}
+			buckets[id] = claudeRateLimitBucket{UsedPercentage: used, ResetsAtMs: now.Add(10 * time.Hour).UnixMilli(),
+				ObservedAtMs: at.UnixMilli(), UsageObserved: usageObservedPtr(true),
+				Row: &claudeReportedWindow{Kind: "daily", Label: "Daily Haiku 5", Model: "haiku"}}
+		}
+		got := metricSummary(claudeCodeMetricsFromBuckets(buckets, now))
+		if want := "Daily Haiku 5|daily|haiku|100"; got[len(got)-1] != want || len(got) != 4 {
+			t.Errorf("fresher=%s: rows %v, want the three rows then %s", fresherID, got, want)
+		}
+	}
 }
 
 // The two sources of the window set — the probe's persisted set and Claude
