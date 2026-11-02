@@ -71,8 +71,9 @@ const (
 
 // whatsAppEditFormerWindow is how long after a re-point an edit can still
 // target a message stored under the identity it retired: WhatsApp's edit
-// window, plus an hour for the skew between this computer's clock (a
-// former's RetiredAt) and WhatsApp's (the edit's version).
+// window, plus an hour of skew between this computer's clock (a former's
+// RetiredAt) and the edit's time - read as the earliest of its stamps
+// (whatsAppEditTime), so a clock running ahead only keeps more formers.
 const whatsAppEditFormerWindow = whatsmeow.EditWindow + time.Hour
 
 // whatsAppMedia is media METADATA. Bytes are never downloaded.
@@ -135,6 +136,16 @@ type whatsAppNormalizeContext struct {
 	// Identity resolves every person. Nil (pure mapping tests only): the
 	// event's own addresses decide, phone number first.
 	Identity whatsAppIdentity
+	// Now is this computer's clock, the one a former's RetiredAt is on
+	// (whatsAppEditTime). Nil: time.Now.
+	Now func() time.Time
+}
+
+func (nc whatsAppNormalizeContext) now() time.Time {
+	if nc.Now != nil {
+		return nc.Now()
+	}
+	return time.Now()
 }
 
 // canonicalUser is the identity a person is written under.
@@ -166,20 +177,41 @@ func whatsAppFormerJIDs(formers []whatsAppFormer) []types.JID {
 }
 
 // whatsAppEditableFormers is the formers that can still hold the target of
-// an edit at editVersion. A message stored under a former identity was
-// received before the re-point retired it, and WhatsApp accepts an edit only
-// within whatsmeow.EditWindow of sending, so an edit later than that after
-// the re-point targets a message under the current identity: a copy under
-// the former would only park in the cloud, its text with it, where a later
-// revoke does not reach.
-func whatsAppEditableFormers(formers []whatsAppFormer, editVersion int64) []types.JID {
+// an edit made at editAt (whatsAppEditTime). A message stored under a former
+// identity was received before the re-point retired it, and WhatsApp accepts
+// an edit only within whatsmeow.EditWindow of sending, so an edit later than
+// that after the re-point targets a message under the current identity: a
+// copy under the former would only park in the cloud, its text with it.
+func whatsAppEditableFormers(formers []whatsAppFormer, editAt int64) []types.JID {
 	var out []types.JID
 	for _, f := range formers {
-		if f.RetiredAt.UnixMilli() > editVersion-whatsAppEditFormerWindow.Milliseconds() {
+		if f.RetiredAt.UnixMilli() > editAt-whatsAppEditFormerWindow.Milliseconds() {
 			out = append(out, f.JID)
 		}
 	}
 	return out
+}
+
+// whatsAppEditTime is when an edit was made, for comparing with a former's
+// RetiredAt: the earliest of its stamps. Its version is the EDITING device's
+// clock, which can run ahead; the stanza's timestamp is WhatsApp's server;
+// and this computer's clock at receipt is the one RetiredAt is on, so a live
+// edit is measured on it whatever this clock's own error. The earliest only
+// ever keeps more formers.
+func whatsAppEditTime(rec whatsAppRecord, nc whatsAppNormalizeContext) int64 {
+	at := min(rec.EditVersion, nc.now().UnixMilli())
+	if rec.WaTimestamp > 0 {
+		at = min(at, rec.WaTimestamp)
+	}
+	return at
+}
+
+// whatsAppSamePerson: a and b are the same address of a person, device part
+// aside.
+func whatsAppSamePerson(a, b types.JID) bool {
+	fa, okA := whatsAppPersonForm(a)
+	fb, okB := whatsAppPersonForm(b)
+	return okA && okB && fa == fb
 }
 
 // learn passes a history chunk's mapping to the resolver.
@@ -261,8 +293,16 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 	// (Shared) matters only to a reaction: it is the one op that takes
 	// something off under them.
 	isReaction := msg.GetProtocolMessage() == nil && msg.GetReactionMessage() != nil
-	chat, chatFormers := nc.resolveUser(rawChat, chatAlt, false)
-	sender, senderFormers := nc.resolveUser(evt.Info.Sender, evt.Info.SenderAlt, isReaction)
+	// The peer's own message in their 1:1 chat names one person twice
+	// (whatsmeow: Chat = from.ToNonAD(), Sender = from, one alternate), and
+	// they are resolved once: two resolutions could straddle a join and store
+	// the message at (former, identity), a pair no later op targets.
+	peerChat := !evt.Info.IsFromMe && whatsAppSamePerson(rawChat, evt.Info.Sender)
+	chat, chatFormers := nc.resolveUser(rawChat, chatAlt, isReaction && peerChat)
+	sender, senderFormers := chat, chatFormers
+	if !peerChat {
+		sender, senderFormers = nc.resolveUser(evt.Info.Sender, evt.Info.SenderAlt, isReaction)
+	}
 	base := whatsAppRecord{
 		Kind:        waRecordMessage,
 		ChatJid:     chat.String(),
@@ -291,8 +331,9 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 			// Only the author edits: the target's author is this sender. The
 			// copies carry the new text, so they go only under formers that
 			// can still hold an editable target.
+			at := whatsAppEditTime(rec, nc)
 			return whatsAppTargetCopies(rec,
-				whatsAppEditableFormers(chatFormers, rec.EditVersion), whatsAppEditableFormers(senderFormers, rec.EditVersion))
+				whatsAppEditableFormers(chatFormers, at), whatsAppEditableFormers(senderFormers, at))
 		case waE2E.ProtocolMessage_REVOKE:
 			rec := base
 			rec.Op = waOpRevoke
@@ -322,7 +363,19 @@ func normalizeWhatsAppMessage(evt *events.Message, source string, nc whatsAppNor
 		rec.WaMessageID = clipWhatsAppID(key.GetID())
 		rec.ReactorJid = sender.String()
 		author, authorAlt := whatsAppReactionTarget(key.GetParticipant(), key.GetFromMe(), evt.Info, rawChat, chatAlt, nc)
-		authorID, authorFormers := nc.resolveUser(author, authorAlt, false)
+		// One resolution per person per event: a reaction to the reactor's
+		// own message, or to the peer's in a 1:1 chat, reuses the one above
+		// rather than resolving them again across a possible join.
+		var authorID types.JID
+		var authorFormers []whatsAppFormer
+		switch {
+		case author == evt.Info.Sender && authorAlt == evt.Info.SenderAlt:
+			authorID, authorFormers = sender, senderFormers
+		case author == rawChat && authorAlt == chatAlt:
+			authorID, authorFormers = chat, chatFormers
+		default:
+			authorID, authorFormers = nc.resolveUser(author, authorAlt, false)
+		}
 		rec.SenderJid = authorID.String()
 		reaction := rm.GetText()
 		rec.Reaction = &reaction
