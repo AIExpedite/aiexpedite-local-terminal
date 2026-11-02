@@ -416,10 +416,13 @@ which is exactly how shared-constants keys a nested sub-limit
 gather's snapshot (`annotateModelPoolsFromUsage`), so the 30-minute probe cache
 holds the raw discovery only. Every other model is reported WITHOUT a pool and
 the backend falls through to the catalog rule (`cliAgents/<id>.modelPools`):
-Antigravity in particular stays there — `agy models` prints no group, and the
+Antigravity's family groups stay there — `agy models` prints no group, and the
 quota RPC meters groups ("Gemini Models", "Claude and GPT models") without
 saying which model belongs to which, so the device does not guess a mapping
-that would outrank the authored rule. Bounded to 64 bytes
+that would outrank the authored rule. A group named for ONE model (Gemini 4
+Argon) is keyed by that model's id, so that one family reports its pool (see
+"Rows: one-model groups" below). Antigravity's `model` is the saved `/model`
+choice, resolved to a discovered family or not reported. Bounded to 64 bytes
 (`cliUsageMaxModelPoolLength` = shared `MODEL_POOL_NAME_MAX`); an over-long
 name is dropped rather than truncated, since a name truncated on one side only
 matches no verdict and routes the model fail-open. Vector 5 of the shared
@@ -1262,7 +1265,8 @@ closes that gap by reading the server **while it exists**:
   slower in-flight probe age the card backwards for the same account; an account
   switch always wins regardless of timestamps.
 - **Redaction allowlist.** Only `observedAt`, `accountFingerprint`, `account`,
-  `plan` and the numeric buckets are persisted
+  `plan`, the numeric buckets and the unobserved ones (no fraction; see "Rows"
+  below) are persisted
   (`sanitizeAntigravityQuotaSnapshot`, which also drops unplottable windows and
   length-clamps every string). Discovered ports, log text, argv, prompts and
   `settings.json` contents are never written to the cache and never logged. A
@@ -1782,7 +1786,9 @@ can.
   `GetUserStatus`, after the CSRF-gated quota check). An OMITTED fraction
   (`antigravityWireFraction` keeps omitted, null, valid and invalid apart) is
   charted as fully consumed only against an event with the same fingerprint
-  whose reset is within 2 min of the bucket's; null and invalid are skipped; a
+  whose reset is within 2 min of the bucket's (otherwise it is kept for
+  diagnosis and never published, see "Rows" below); null and invalid are
+  skipped; a
   failed identity lookup applies no evidence. Direct runs never contribute (a
   login switch between two direct runs could attribute one account's
   exhaustion to another).
@@ -1840,6 +1846,59 @@ can.
   the live-runs or freshness lock while holding the index lock panic. The mock
   CLI mode `antigravity-pid-block` writes a real second-stamped log with its own
   PID block (and, with `TEST_MOCK_AGY_EXHAUSTED_AS`, a login and a 429).
+
+### Rows: one-model groups, window spellings and unobserved buckets
+
+`antigravityQuotaMetrics` renders one row per bucket, labelled
+`<group without " Models"> — <window label>` exactly as before.
+
+- **One-model groups (2026-11-02).** Paid Google AI Pro meters Gemini 4 Argon
+  in a weekly group of its own. Sent without a model, shared-constants read
+  that row as the account's own window, so one spent Argon week read "Limit
+  reached" and routing skipped every Antigravity model. Every row of a group
+  named for ONE model now carries `model` =
+  `antigravityGroupModelKey(group)` ("Gemini 4 Argon" is `gemini-4-argon`,
+  agy's own family id, so `annotateModelPoolsFromUsage` pools that family).
+  No model for "Gemini" / "Claude and GPT" (`CODING_AGENT_INDEPENDENT_POOLS`),
+  a plural "… Models" family group, a period or whole-account name
+  (`NON_MODEL_GROUP_RE`, copied verbatim), a name with an em dash, or one with
+  no ASCII letter or digit. Apart from the plural check, which only the device
+  can make (the label drops the suffix), that is shared-constants'
+  `codingAgentWindowModelScope` rule for a label-only row, so an older agent's
+  row and this one are one window. The key function is pinned to
+  [`testdata/antigravity_group_model_key_vectors.json`](testdata/antigravity_group_model_key_vectors.json),
+  a byte-identical copy of shared-constants
+  `tests/fixtures/antigravityGroupModelKeyVectors.json`: change both together.
+  The group is clamped to 96 bytes before rendering, so a live reading and its
+  replay give the same label and model.
+- **Window spellings.** `5h`, `daily`, `weekly` and `monthly` are unchanged. A
+  window spelled as one length (`7d`, `604800s`, `pt5h`, `1mo`) takes the
+  canonical kind and label only inside a tight band (session 295–305 min,
+  daily 1435–1445, weekly 10020–10140, monthly 28–31 days). Any other length
+  gets an open kind, `window_<n><m|h|d>` ("4-hour window", "14-day window"),
+  which the card cannot age by length yet. A word (`fortnightly`) is still
+  skipped, so a reply of only such windows is still no observation.
+- **One row per identity.** Rows sharing (kind, label, model), such as `weekly`
+  and `7d` in one group, are published once, as the more constrained (a figure
+  beats Unknown, less left wins): both receipt verifiers reject a whole refresh
+  over a duplicate. Past the 32-row cap, the first rows in display order are
+  kept.
+- **Unobserved buckets.** An omitted fraction that no evidence names, with a
+  recognised window and a reset, is cached in `unobservedBuckets` (never in
+  `buckets`, which an older agent charts by fraction) for diagnosis only. It is
+  never published as a row and never counts toward an observation. Google omits
+  a SPENT bucket's fraction (proto3 drops a zero), and also a disabled one's. An
+  Unknown row would read server-side as an open, fail-open pool: a fully spent
+  account would read Partial, and as the newest sample it would displace
+  another computer's evidence that the bucket is spent. Shape counters
+  `windowsGeneric` and `omittedUnobserved` count both new cases.
+- **Saved default model.** `agy` runs its saved `/model` choice whenever no
+  `--model` is passed. The agent reads only the `model` key of
+  `~/.gemini/antigravity-cli/settings.json`, or of `~/.agy/config.json` when the
+  modern file does not exist. It reports the result as `model` only when it
+  resolves to a discovered family: an exact id, a slug (`gemini-4-argon-medium`)
+  or a label matching exactly one family ("Gemini 4 Argon (Medium)"). Anything
+  else reports nothing.
 
 # Live usage probe — the Refresh click on the CLI Agents card
 

@@ -39,9 +39,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -112,10 +114,23 @@ type antigravityQuotaBucket struct {
 	ResetTime         string  `json:"resetTime"`
 }
 
+// antigravityUnobservedBucket is a bucket the reply named WITHOUT a
+// remainingFraction, with no evidence that it is spent
+// (antigravitySnapshotFromGroups). The window exists and resets at ResetTime,
+// but nothing says how much is left, so it has no fraction field at all.
+type antigravityUnobservedBucket struct {
+	BucketID    string `json:"bucketId"`
+	Group       string `json:"group"`
+	DisplayName string `json:"displayName"`
+	Window      string `json:"window"`
+	ResetTime   string `json:"resetTime"`
+}
+
 // antigravityQuotaSnapshot is what we cache between `agy` runs. The persisted
 // shape is an allowlist, not a dump: observation time, the account it belongs
-// to, the plan name, and the numeric buckets. Discovered ports, log excerpts,
-// argv, prompts and settings.json contents are deliberately absent.
+// to, the plan name, the numeric buckets and the buckets named without a
+// figure. Discovered ports, log excerpts, argv, prompts and settings.json
+// contents are deliberately absent.
 type antigravityQuotaSnapshot struct {
 	// SchemaVersion is written but never enforced on read — see
 	// antigravityQuotaSchemaVersion.
@@ -132,6 +147,12 @@ type antigravityQuotaSnapshot struct {
 	Account            string                   `json:"account"`
 	Plan               string                   `json:"plan"`
 	Buckets            []antigravityQuotaBucket `json:"buckets"`
+	// UnobservedBuckets are kept for diagnosis only: never published as rows
+	// (antigravityQuotaMetrics) and never an observation. They are kept out of
+	// Buckets on purpose: an older agent charts every Buckets entry by its
+	// fraction, so after a rollback a bucket stored there would read 100%
+	// consumed, while it ignores this field.
+	UnobservedBuckets []antigravityUnobservedBucket `json:"unobservedBuckets,omitempty"`
 	// StoredLoginRead marks a reading taken through Code Assist with the stored
 	// keyring login itself — the login `agy` runs as. It is the persisted half
 	// of the producer attestation (cliagent_usage_live_probe.go): the in-memory
@@ -628,12 +649,14 @@ type antigravityQuotaShape struct {
 	FractionInvalid     int
 	ResetMissing        int
 	OmittedCharted      int
+	OmittedUnobserved   int
+	WindowsGeneric      int // recognised windows given an open kind (antigravityOpenWindow)
 }
 
 func (s antigravityQuotaShape) String() string {
-	return fmt.Sprintf("groups=%d buckets=%d windowsRecognised=%d windowsUnrecognised=%d fractionValid=%d fractionOmitted=%d fractionNull=%d fractionInvalid=%d resetMissing=%d omittedCharted=%d",
-		s.Groups, s.Buckets, s.WindowsRecognised, s.WindowsUnrecognised, s.FractionValid,
-		s.FractionOmitted, s.FractionNull, s.FractionInvalid, s.ResetMissing, s.OmittedCharted)
+	return fmt.Sprintf("groups=%d buckets=%d windowsRecognised=%d windowsUnrecognised=%d windowsGeneric=%d fractionValid=%d fractionOmitted=%d fractionNull=%d fractionInvalid=%d resetMissing=%d omittedCharted=%d omittedUnobserved=%d",
+		s.Groups, s.Buckets, s.WindowsRecognised, s.WindowsUnrecognised, s.WindowsGeneric, s.FractionValid,
+		s.FractionOmitted, s.FractionNull, s.FractionInvalid, s.ResetMissing, s.OmittedCharted, s.OmittedUnobserved)
 }
 
 // antigravitySnapshotFromGroups turns a QuotaSummary into the persisted
@@ -645,7 +668,11 @@ func (s antigravityQuotaShape) String() string {
 // An OMITTED fraction is unknown unless evidence names that bucket: a managed
 // run of the same account hit RESOURCE_EXHAUSTED with a reset within
 // antigravityExhaustionMatch of the bucket's own reset. Only then is it
-// charted as fully consumed. Null and invalid fractions are always skipped.
+// charted as fully consumed. Without evidence a bucket with a recognised
+// window and a reset is kept in UnobservedBuckets (for diagnosis, never
+// published) and never counts as plottable: Google also omits the fraction of a
+// DISABLED bucket, so an omitted one is no proof that it is spent. Null and
+// invalid fractions are always skipped.
 func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.Time, evidence []antigravityExhaustionEvent) (antigravityQuotaSnapshot, antigravityQuotaShape, bool) {
 	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339), ObservedAtMs: now.UnixMilli()}
 	shape := antigravityQuotaShape{Groups: len(groups)}
@@ -653,9 +680,12 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 	for _, group := range groups {
 		for _, bucket := range group.Buckets {
 			shape.Buckets++
-			_, _, recognised := antigravityWindowKind(bucket.Window)
+			kind, _, recognised := antigravityWindowKind(bucket.Window)
 			if recognised {
 				shape.WindowsRecognised++
+				if strings.HasPrefix(kind, antigravityOpenWindowKindPrefix) {
+					shape.WindowsGeneric++
+				}
 			} else {
 				shape.WindowsUnrecognised++
 			}
@@ -670,7 +700,20 @@ func antigravitySnapshotFromGroups(groups []antigravityQuotaGroupWire, now time.
 				fraction = bucket.RemainingFraction.Value
 			case antigravityFractionOmitted:
 				shape.FractionOmitted++
-				if resetErr != nil || !antigravityEvidenceNamesReset(evidence, reset) {
+				if resetErr != nil {
+					continue
+				}
+				if !antigravityEvidenceNamesReset(evidence, reset) {
+					if recognised {
+						shape.OmittedUnobserved++
+						snap.UnobservedBuckets = append(snap.UnobservedBuckets, antigravityUnobservedBucket{
+							BucketID:    bucket.BucketID,
+							Group:       group.DisplayName,
+							DisplayName: bucket.DisplayName,
+							Window:      bucket.Window,
+							ResetTime:   bucket.ResetTime,
+						})
+					}
 					continue
 				}
 				shape.OmittedCharted++
@@ -924,10 +967,11 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 }
 
 // sanitizeAntigravityQuotaSnapshot reduces a reading to exactly what may be
-// persisted: observation time, the account it belongs to, the plan name, and the
-// plottable numeric buckets. Unrecognized windows are dropped (they can never
-// render, and keeping them would let a renamed window bloat the cache), bucket
-// count is capped at the signed-refresh metric cap, and every string is
+// persisted: observation time, the account it belongs to, the plan name, the
+// plottable numeric buckets and the unobserved ones. Unrecognized windows are
+// dropped (they can never render, and keeping them would let a renamed window
+// bloat the cache), the two bucket lists together are capped at the
+// signed-refresh metric cap (numeric buckets first), and every string is
 // length-clamped so a hostile or malformed server payload cannot grow the file
 // or overflow the receipt's per-field bounds.
 func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravityQuotaSnapshot {
@@ -956,6 +1000,21 @@ func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravity
 			break
 		}
 	}
+	for _, bucket := range snap.UnobservedBuckets {
+		if len(out.Buckets)+len(out.UnobservedBuckets) >= cliUsageMaxMetricsPerProvider {
+			break
+		}
+		if _, _, ok := antigravityWindowKind(bucket.Window); !ok {
+			continue
+		}
+		out.UnobservedBuckets = append(out.UnobservedBuckets, antigravityUnobservedBucket{
+			BucketID:    clampAntigravityQuotaField(bucket.BucketID, antigravityQuotaMaxBucketFieldBytes),
+			Group:       clampAntigravityQuotaField(bucket.Group, antigravityQuotaMaxBucketFieldBytes),
+			DisplayName: clampAntigravityQuotaField(bucket.DisplayName, antigravityQuotaMaxBucketFieldBytes),
+			Window:      clampAntigravityQuotaField(bucket.Window, antigravityQuotaMaxBucketFieldBytes),
+			ResetTime:   clampAntigravityQuotaField(bucket.ResetTime, antigravityQuotaMaxBucketFieldBytes),
+		})
+	}
 	return out
 }
 
@@ -972,12 +1031,19 @@ func clampAntigravityQuotaField(s string, max int) string {
 	return s[:max]
 }
 
-// antigravityWindowKind maps the provider's window onto our limit kinds. An
-// unrecognized window is skipped rather than guessed — the card derives a
-// metric's window length from the kind, so a wrong mapping would keep a stale
-// reading on screen past its real expiry.
+// antigravityWindowKind maps the provider's window onto our limit kinds and the
+// row's window label. The four spellings Google has used keep their kinds and
+// labels. A window spelled as a LENGTH ("7d", "604800s", "pt5h") takes the
+// canonical kind its length falls in (antigravityWindowBands), label and all,
+// so a respelled window keeps its identity; any other length gets an open kind
+// of its own (antigravityOpenWindow) and is never read as a canonical one — the
+// card derives a metric's window length from the kind, so a wrong mapping
+// would keep a stale reading on screen past its real expiry. Anything else (a
+// word such as "fortnightly") is skipped rather than guessed: it is not
+// plottable, and a reply holding only such windows is not an observation.
 func antigravityWindowKind(window string) (string, string, bool) {
-	switch strings.ToLower(strings.TrimSpace(window)) {
+	spelled := strings.ToLower(strings.TrimSpace(window))
+	switch spelled {
 	case "5h":
 		return limitKindSession, "5-hour session window", true
 	case "daily":
@@ -987,7 +1053,110 @@ func antigravityWindowKind(window string) (string, string, bool) {
 	case "monthly":
 		return limitKindMonthly, "Monthly quota", true
 	}
-	return "", "", false
+	minutes, ok := antigravityWindowMinutes(spelled)
+	if !ok {
+		return "", "", false
+	}
+	for _, band := range antigravityWindowBands {
+		if minutes >= band.minMinutes && minutes <= band.maxMinutes {
+			return band.kind, band.label, true
+		}
+	}
+	kind, label := antigravityOpenWindow(minutes)
+	return kind, label, true
+}
+
+// antigravityWindowBands are the lengths, in whole minutes, that ARE a
+// canonical window. Tight on purpose: a 4-hour or a 6-day window read as a
+// session or a weekly one would be aged by the wrong length. Session and
+// weekly are Codex's bands (codexMinutesInSessionBand,
+// codexMinutesInWeeklyBand); daily is five minutes either side and monthly 28
+// to 31 days.
+var antigravityWindowBands = []struct {
+	minMinutes, maxMinutes int
+	kind, label            string
+}{
+	{295, 305, limitKindSession, "5-hour session window"},
+	{1435, 1445, limitKindDaily, "Daily quota"},
+	{10020, 10140, limitKindWeekly, "Weekly quota"},
+	{40320, 44640, limitKindMonthly, "Monthly quota"},
+}
+
+// A window spelled as one length: a number and a unit ("300m", "5 hours", the
+// proto Duration "18000s", "1mo" — "m" alone is minutes), or a one-component
+// ISO 8601 duration ("p7d", "pt5h", where "m" is months before the "t" and
+// minutes after it). Matched lower-cased; a compound or a bare number is not
+// a window. Eight digits reach a year in seconds (31622400s);
+// antigravityWindowMaxMinutes bounds the converted length.
+var (
+	antigravityWindowLengthPattern = regexp.MustCompile(`^(\d{1,8}(?:\.\d{1,9})?)\s*[-_]?\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w|months?|mo)$`)
+	antigravityWindowISOPattern    = regexp.MustCompile(`^p(?:(\d{1,8})(w|d|m)|t(\d{1,8}(?:\.\d{1,9})?)(h|m|s))$`)
+)
+
+// antigravityWindowMaxMinutes bounds a window's length: nothing Google meters
+// runs past a year, so a longer "length" is a misreading, not a window.
+const antigravityWindowMaxMinutes = 366 * 24 * 60
+
+// antigravityWindowMinutes is a lower-cased window's length in whole minutes
+// (a month is 30 days), or false when it is not one length between a minute
+// and a year.
+func antigravityWindowMinutes(spelled string) (int, bool) {
+	var number string
+	var perUnit float64
+	if m := antigravityWindowLengthPattern.FindStringSubmatch(spelled); m != nil {
+		number = m[1]
+		switch unit := m[2]; {
+		case strings.HasPrefix(unit, "s"):
+			perUnit = 1.0 / 60
+		case strings.HasPrefix(unit, "mo"):
+			perUnit = 30 * 24 * 60
+		case strings.HasPrefix(unit, "m"):
+			perUnit = 1
+		case strings.HasPrefix(unit, "h"):
+			perUnit = 60
+		case strings.HasPrefix(unit, "d"):
+			perUnit = 24 * 60
+		default: // w, wk(s), week(s)
+			perUnit = 7 * 24 * 60
+		}
+	} else if m := antigravityWindowISOPattern.FindStringSubmatch(spelled); m != nil {
+		if m[1] != "" {
+			number, perUnit = m[1], map[string]float64{"w": 7 * 24 * 60, "d": 24 * 60, "m": 30 * 24 * 60}[m[2]]
+		} else {
+			number, perUnit = m[3], map[string]float64{"h": 60, "m": 1, "s": 1.0 / 60}[m[4]]
+		}
+	} else {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(number, 64)
+	if err != nil {
+		return 0, false
+	}
+	length := value * perUnit
+	if length < 1 || length > antigravityWindowMaxMinutes {
+		return 0, false
+	}
+	return int(math.Round(length)), true
+}
+
+// antigravityOpenWindowKindPrefix starts every open kind. The receipt and
+// shared-constants accept any kind except "hint", which routing reserves for
+// its own windows; the prefix keeps an open kind from ever being one.
+const antigravityOpenWindowKindPrefix = "window_"
+
+// antigravityOpenWindow names a length no canonical kind covers, in its largest
+// whole unit: 240 minutes is "window_4h" / "4-hour window", 20160 is
+// "window_14d" / "14-day window". One length is one identity however Google
+// spells it ("2w", "14d", "p14d"), and the kind is at most 14 bytes.
+func antigravityOpenWindow(minutes int) (string, string) {
+	n, unit, word := minutes, "m", "minute"
+	switch {
+	case minutes%(24*60) == 0:
+		n, unit, word = minutes/(24*60), "d", "day"
+	case minutes%60 == 0:
+		n, unit, word = minutes/60, "h", "hour"
+	}
+	return fmt.Sprintf("%s%d%s", antigravityOpenWindowKindPrefix, n, unit), fmt.Sprintf("%d-%s window", n, word)
 }
 
 // antigravityGroupLabel shortens a group's display name for the row label
@@ -1002,9 +1171,113 @@ func antigravityGroupLabel(group string) string {
 	return trimmed
 }
 
+// antigravityIndependentGroups mirrors shared-constants
+// CODING_AGENT_INDEPENDENT_POOLS, lower-cased: the family groups every request
+// goes through. Each is a pool of its own, never one model's sub-limit.
+var antigravityIndependentGroups = map[string]bool{"gemini": true, "claude and gpt": true}
+
+// antigravityNonModelGroupPattern is shared-constants NON_MODEL_GROUP_RE,
+// verbatim: a group named for a period or the whole account ("Weekly",
+// "5-hour", "Overall", "All models") limits every model, not one.
+var antigravityNonModelGroupPattern = regexp.MustCompile(`^(?:\d+(?:[.,]\d+)?\s*-?\s*(?:s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?|mo|mos|months?|y|yrs?|years?)|hourly|daily|weekly|monthly|yearly|annual|session|rolling|overall|total|account|all|all models|any model|usage|quota|limit|limits)$`)
+
+// antigravityGroupModelScope is the model a quota GROUP limits, as the key it
+// is metered under (antigravityGroupModelKey), or "" for a group that is not
+// one model's. Paid Google AI Pro meters Gemini 4 Argon in a weekly group of
+// its own beside "Gemini Models" and "Claude and GPT models"; read as the
+// account's own window, one spent Argon week made the card say "Limit reached"
+// and routing skip every Antigravity model (2026-11-02).
+//
+// It decides exactly as shared-constants codingAgentWindowModelScope does from
+// this row's label, so an older agent's label-only row and this one are ONE
+// window there: no scope for a group the label cannot carry whole (an em dash
+// in the name ends the label's group early), a known family pool, a period or
+// whole-account phrase, or a name with no ASCII letter or digit. Only this
+// side can also refuse a plural " Models" family group: the label drops that
+// suffix.
+func antigravityGroupModelScope(group string) string {
+	if strings.HasSuffix(group, " Models") || strings.HasSuffix(group, " models") {
+		return ""
+	}
+	name := antigravityGroupLabel(group)
+	if name == "" || strings.Contains(name, "—") {
+		return ""
+	}
+	// Folded the way JavaScript folds it: its whitespace set, and its
+	// lower-casing, which turns U+0130 (a dotted capital I) into "i" plus a
+	// combining dot where Go's gives a bare "i". A name must not be a pool on
+	// one side only.
+	folded := strings.ToLower(strings.Join(strings.FieldsFunc(strings.ReplaceAll(name, "\u0130", "i\u0307"), antigravityJSSpace), " "))
+	if antigravityIndependentGroups[folded] || antigravityNonModelGroupPattern.MatchString(folded) {
+		return ""
+	}
+	return antigravityGroupModelKey(name)
+}
+
+// antigravityJSSpace is JavaScript's \s: Go's unicode.IsSpace without U+0085,
+// plus U+FEFF.
+func antigravityJSSpace(r rune) bool {
+	return r == '\uFEFF' || (r != '\u0085' && unicode.IsSpace(r))
+}
+
+// antigravityGroupModelKey is the model key a model-scoped group is metered
+// under: every run of characters outside [A-Za-z0-9.] becomes one "-", trimmed
+// of "-", ASCII lower-cased, cut to cliUsageMaxModelPoolLength bytes and
+// trimmed of a trailing "-"; "" when no ASCII letter or digit remains.
+// "Gemini 4 Argon" is "gemini-4-argon", the id `agy models` reports for that
+// family, so annotateModelPoolsFromUsage pools it with no table.
+//
+// It must equal shared-constants codingAgentGroupModelKey byte for byte: one
+// differing character makes an updated and an older computer on one account
+// report one bucket as two pools. Both are pinned to
+// testdata/antigravity_group_model_key_vectors.json, a verbatim copy of the
+// shared-constants fixture. Non-ASCII is a separator, never folded, so no
+// Unicode case mapping can become an ASCII letter on one side only.
+func antigravityGroupModelKey(name string) string {
+	var b strings.Builder
+	gap := false
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+			c += 'a' - 'A'
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.':
+		default:
+			gap = true
+			continue
+		}
+		if gap && b.Len() > 0 {
+			b.WriteByte('-')
+		}
+		gap = false
+		b.WriteByte(c)
+	}
+	key := b.String()
+	if len(key) > cliUsageMaxModelPoolLength {
+		key = strings.TrimRight(key[:cliUsageMaxModelPoolLength], "-")
+	}
+	if !strings.ContainsAny(key, "abcdefghijklmnopqrstuvwxyz0123456789") {
+		return ""
+	}
+	return key
+}
+
 // antigravityQuotaMetrics renders the cached/fresh snapshot as capacity rows.
 // Buckets are ordered session-window first within each group, matching how the
-// Claude and Codex cards read.
+// Claude and Codex cards read. A model-scoped group's rows name its model
+// (antigravityGroupModelScope).
+//
+// An unobserved bucket (UnobservedBuckets: Google omitted its fraction and no
+// evidence names it) is never published. Google omits the fraction of a spent
+// bucket, so an Unknown row would read server-side as an open, fail-open pool:
+// it would make a fully spent account read Partial, and as the newest sample it
+// would displace another computer's evidence that the bucket is spent.
+//
+// The group is clamped exactly as the cache stores it, so a fresh reading and
+// its replay render the same labels and models. Rows sharing an identity
+// (kind, label, model) — two buckets of one group spelling one window, "weekly"
+// and "7d" — are published once, as the more constrained: both receipt
+// verifiers reject a whole refresh over a duplicate identity.
 func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cliAgentUsageMetric {
 	type row struct {
 		metric cliAgentUsageMetric
@@ -1013,27 +1286,32 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 	}
 	groupOrder := map[string]int{}
 	rows := make([]row, 0, len(snap.Buckets))
+	rowOf := map[string]int{}
 
 	for _, bucket := range snap.Buckets {
 		kind, windowLabel, ok := antigravityWindowKind(bucket.Window)
 		if !ok {
 			continue
 		}
-		groupIdx, seen := groupOrder[bucket.Group]
+		// Trimmed after the cut too, which can end on a space: a replayed
+		// reading was already clamped by the cache and is clamped again here,
+		// and a live one must land on the same name.
+		group := strings.TrimSpace(clampAntigravityQuotaField(bucket.Group, antigravityQuotaMaxBucketFieldBytes))
+		groupIdx, seen := groupOrder[group]
 		if !seen {
 			groupIdx = len(groupOrder)
-			groupOrder[bucket.Group] = groupIdx
+			groupOrder[group] = groupIdx
 		}
 		label := windowLabel
-		if group := antigravityGroupLabel(bucket.Group); group != "" {
-			label = fmt.Sprintf("%s — %s", group, windowLabel)
+		if name := antigravityGroupLabel(group); name != "" {
+			label = fmt.Sprintf("%s — %s", name, windowLabel)
 		}
-		used := clampPercent((1 - bucket.RemainingFraction) * 100)
 		metric := cliAgentUsageMetric{
 			Kind:       kind,
 			Label:      label,
 			Unit:       "%",
 			ObservedAt: snap.ObservedAt,
+			Model:      antigravityGroupModelScope(group),
 		}
 		reset, resetErr := time.Parse(time.RFC3339, bucket.ResetTime)
 		switch {
@@ -1042,6 +1320,7 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 			// refilled by an unknown amount, so plot nothing.
 			metric.Unknown = true
 		default:
+			used := clampPercent((1 - bucket.RemainingFraction) * 100)
 			metric.Total = floatPtr(100)
 			metric.Consumed = floatPtr(used)
 			metric.Remaining = floatPtr(100 - used)
@@ -1049,10 +1328,18 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 				metric.ResetAt = reset.UTC().Format(time.RFC3339)
 			}
 		}
+		identity := metric.Kind + "\x00" + metric.Label + "\x00" + metric.Model
+		if at, dup := rowOf[identity]; dup {
+			if antigravityMoreConstrained(metric, rows[at].metric) {
+				rows[at].metric = metric
+			}
+			continue
+		}
 		windowRank := 1
 		if kind == limitKindSession {
 			windowRank = 0
 		}
+		rowOf[identity] = len(rows)
 		rows = append(rows, row{metric: metric, group: groupIdx, window: windowRank})
 	}
 
@@ -1070,4 +1357,15 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 		metrics = append(metrics, r.metric)
 	}
 	return metrics
+}
+
+// antigravityMoreConstrained reports whether row a should replace row b as the
+// one published for the identity they share: a figure beats an Unknown row,
+// and of two figures the one with less left wins — the reading routing must
+// not overrun.
+func antigravityMoreConstrained(a, b cliAgentUsageMetric) bool {
+	if a.Unknown || a.Remaining == nil {
+		return false
+	}
+	return b.Unknown || b.Remaining == nil || *a.Remaining < *b.Remaining
 }

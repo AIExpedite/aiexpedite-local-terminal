@@ -445,7 +445,8 @@ func helperUserinfoBob(string) (int, string) {
 }
 
 // AllExhaustedReply: a MANAGED turn whose own log block holds account B's 429
-// makes B's all-omitted reply chartable (the 5h bucket at 100% consumed). The
+// makes B's all-omitted reply chartable (the 5h bucket at 100% consumed); the
+// weekly bucket no evidence names is kept for diagnosis, never published. The
 // same reply after a restart (evidence is in memory only) stays unknown, the
 // recorded limitation.
 func TestAntigravityStaleRegression_AllExhaustedReply(t *testing.T) {
@@ -463,9 +464,12 @@ func TestAntigravityStaleRegression_AllExhaustedReply(t *testing.T) {
 	if snap.Account != "bob@example.com" || len(snap.Buckets) != 1 || snap.Buckets[0].RemainingFraction != 0 {
 		t.Fatalf("snap=%+v, want bob's 5h bucket charted as fully consumed", snap)
 	}
+	if len(snap.UnobservedBuckets) != 1 || snap.UnobservedBuckets[0].BucketID != "gemini-weekly" {
+		t.Errorf("unobserved=%+v, want the weekly bucket kept without a figure", snap.UnobservedBuckets)
+	}
 	usage, _ := helperParsedObservedAt(t, f.home, time.Now())
 	if len(usage.Metrics) != 1 || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 100 {
-		t.Errorf("metrics=%+v, want the exhausted bucket numeric at 100%%", usage.Metrics)
+		t.Errorf("metrics=%+v, want only the exhausted bucket, numeric at 100%%", usage.Metrics)
 	}
 
 	// After a self-update the evidence is gone: the same reply is unplottable.

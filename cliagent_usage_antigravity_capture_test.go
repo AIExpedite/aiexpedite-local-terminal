@@ -484,11 +484,15 @@ func TestAntigravityQuotaCapture_KeepsPollingMemoizedPortAfterDiscoveryCap(t *te
 }
 
 // Everything persisted must stay inside the allowlist: no discovered port, no
-// log text, no settings/config fields.
+// log text, no settings/config fields. The reply carries a bucket with no
+// fraction, so the unobserved list is written and checked too.
 func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) {
 	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 	base := filepath.Join(home, ".gemini", "antigravity-cli")
-	server := helperStartCaptureServer(t, base, helperQuotaJSON, helperStatusJSON)
+	reply := strings.TrimSuffix(helperQuotaJSON, "]}}") + `,
+	  {"displayName":"Gemini 4 Argon","buckets":[
+	    {"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","resetTime":"2126-08-19T01:11:09Z"}]}]}}`
+	server := helperStartCaptureServer(t, base, reply, helperStatusJSON)
 	// A settings file whose contents must never reach the cache.
 	helperWriteJSON(t, filepath.Join(base, "settings.json"), map[string]any{
 		"email":       "previous-login@example.com",
@@ -518,25 +522,31 @@ func TestAntigravityQuotaCapture_PersistsOnlyTheAllowlistedFields(t *testing.T) 
 	}
 	allowedTop := map[string]bool{
 		"schemaVersion": true, "observedAt": true, "observedAtMs": true, "accountFingerprint": true,
-		"account": true, "plan": true, "buckets": true,
+		"account": true, "plan": true, "buckets": true, "unobservedBuckets": true,
 	}
 	for key := range decoded {
 		if !allowedTop[key] {
 			t.Errorf("unexpected persisted field %q", key)
 		}
 	}
-	var buckets []map[string]json.RawMessage
-	if err := json.Unmarshal(decoded["buckets"], &buckets); err != nil {
-		t.Fatalf("buckets are not objects: %v", err)
-	}
 	allowedBucket := map[string]bool{
 		"bucketId": true, "group": true, "displayName": true,
 		"window": true, "remainingFraction": true, "resetTime": true,
 	}
-	for _, bucket := range buckets {
-		for key := range bucket {
-			if !allowedBucket[key] {
-				t.Errorf("unexpected persisted bucket field %q", key)
+	for _, list := range []string{"buckets", "unobservedBuckets"} {
+		var buckets []map[string]json.RawMessage
+		if err := json.Unmarshal(decoded[list], &buckets); err != nil || len(buckets) == 0 {
+			t.Fatalf("%s are not a non-empty list of objects: %v", list, err)
+		}
+		for _, bucket := range buckets {
+			for key := range bucket {
+				if !allowedBucket[key] {
+					t.Errorf("unexpected persisted %s field %q", list, key)
+				}
+			}
+			// A bucket the reply named without a fraction never carries one.
+			if _, charted := bucket["remainingFraction"]; list == "unobservedBuckets" && charted {
+				t.Errorf("an unobserved bucket persisted a fraction: %v", bucket)
 			}
 		}
 	}
