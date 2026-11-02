@@ -144,6 +144,11 @@ type capabilitiesInfo struct {
 	// sends `readOnly` only when this is true — an older agent would reject
 	// the unknown signed field as a bad signature.
 	ReadOnlySessions bool `json:"readOnlySessions"`
+	// CliSessionDiscovery (shared-constants CLI_SESSION_DISCOVERY_CAPABILITY):
+	// this build answers __cli_sessions_discover__ / __cli_session_probe__ for
+	// the listed engines (claude_session_*.go). Absent on an older agent, which
+	// terminal-service refuses with DISCOVERY_AGENT_TOO_OLD before publishing.
+	CliSessionDiscovery *cliSessionDiscoveryCapability `json:"cliSessionDiscovery,omitempty"`
 	// WorktreeBuiltIns (shared-constants DEVICE_WORKTREE_CAPABILITIES.BUILT_INS):
 	// this build intercepts the worktree built-ins before exec, enforces the
 	// path policy and deletes only through the link-safe walk
@@ -327,9 +332,13 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
 		ReadOnlySessions:       true,
-		WorktreeBuiltIns:       true,
-		SignedExecutionID:      true,
-		WhatsApp:               currentWhatsAppCapability(),
+		CliSessionDiscovery: &cliSessionDiscoveryCapability{
+			Engines:  []string{cliSessionEngineClaudeCode},
+			Protocol: cliSessionDiscoveryProtocol,
+		},
+		WorktreeBuiltIns:  true,
+		SignedExecutionID: true,
+		WhatsApp:          currentWhatsAppCapability(),
 	}
 }
 

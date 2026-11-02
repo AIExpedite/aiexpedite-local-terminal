@@ -335,6 +335,17 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
 
+	// Discovery flags sessions this agent drives, and never counts its own
+	// child as another writer; a resumed session is watched for one
+	// (claude_session_probe.go).
+	if proc.Process != nil {
+		recordClaudeOwnPID(proc.Process.Pid, true)
+	}
+	if resumeID := claudeResumeIDFromArgs(extraArgs); resumeID != "" {
+		recordClaudeOwnSessionID(resumeID)
+		startClaudeOutsideWriterWatcher(session, resumeID, publishFn)
+	}
+
 	// Deliver the first user turn (if any) after the readers are wired so we
 	// never miss Claude's response frames. A failure here means the session
 	// never actually got the user's first message — publish a typed error
@@ -839,6 +850,9 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 		for scanner.Scan() {
 			lineCount++
 			trimmed := strings.TrimSpace(scanner.Text())
+			if id := claudeInitSessionID(trimmed); id != "" {
+				recordClaudeOwnSessionID(id)
+			}
 			if trimmed == "" {
 				continue
 			}
@@ -983,6 +997,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// the Grok ACP manager.
 	state, _ := session.Process.Process.Wait()
 	closeProcessExited(session.processExited)
+	recordClaudeOwnPID(session.Process.Process.Pid, false)
 
 	// Drain the scanner goroutines BEFORE closing pipes so they see EOF
 	// naturally on the OS pipe buffer, including the final frame. The child's
