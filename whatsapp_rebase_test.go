@@ -417,6 +417,63 @@ func TestWhatsAppUploadRetriesAnUnsettledBatchAsTheSameRange(t *testing.T) {
 	}
 }
 
+// A 2xx whose local Ack fails leaves the applied rows queued, exactly as a lost
+// 2xx does: the same range goes again (unsettledTo) and comes back as a
+// replay acked at its own end - not grown by rows queued since, refused for
+// one of them, narrowed below the acked end and renumbered. And the failing
+// Ack backs off instead of posting again at once.
+func TestWhatsAppUploadRetriesARangeWhoseAckFailed(t *testing.T) {
+	cloud := newApplyBatchCloud(0)
+	r, ob, _ := newRefusalHarness(t, "lnk_ack_failed", cloud.respond)
+	var first []whatsAppRecord
+	for i := 1; i <= 80; i++ {
+		first = append(first, textRecord("chat@s.whatsapp.net", "A"+strconv.Itoa(i), "x"))
+	}
+	if err := ob.Append(first, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ob.db.Exec(`CREATE TRIGGER fail_ack BEFORE DELETE ON outbox BEGIN SELECT RAISE(ABORT, 'disk said no'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, outcome := r.uploadOnce(context.Background()); outcome != whatsAppUploadRetry || ob.Depth() != 80 {
+		t.Fatalf("[1..80] applied, its Ack failed: outcome %d, depth %d (want a backed-off retry, all 80 queued)", outcome, ob.Depth())
+	}
+	if _, err := ob.db.Exec(`DROP TRIGGER fail_ack`); err != nil {
+		t.Fatal(err)
+	}
+	var second []whatsAppRecord
+	for i := 1; i <= 120; i++ {
+		rec := textRecord("chat@s.whatsapp.net", "B"+strconv.Itoa(i), "y")
+		if i == 10 {
+			rec.WaTimestamp = 0 // refused by the cloud's validation
+		}
+		second = append(second, rec)
+	}
+	if err := ob.Append(second, false); err != nil {
+		t.Fatal(err)
+	}
+	drainOutbox(t, r, ob)
+	for _, rec := range append(first, second...) {
+		got := cloud.written(rec.WaMessageID)
+		if rec.WaMessageID == "B10" {
+			if len(got) != 0 {
+				t.Fatalf("the refused record was written at %v", got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != rec.DeviceSeq {
+			t.Fatalf("%s queued at %d was written at %v: want it once, never renumbered", rec.WaMessageID, rec.DeviceSeq, got)
+		}
+	}
+	more := []whatsAppRecord{textRecord("chat@s.whatsapp.net", "C1", "z")}
+	if err := ob.Append(more, false); err != nil {
+		t.Fatal(err)
+	}
+	if more[0].DeviceSeq != 201 {
+		t.Fatalf("the next record was numbered %d, want 201: the outbox was renumbered", more[0].DeviceSeq)
+	}
+}
+
 // An outbox restored below the cloud's watermark (rows numbered from 1, the
 // cloud at 150) whose first batch fails before the cloud applies it (a 502),
 // and is then refused and narrowed down: the retry as the same range must not

@@ -63,6 +63,12 @@ var errWhatsAppRebaseOutOfRange = errors.New("whatsapp outbox rebase passes the 
 // errWhatsAppOutboxClosed answers a write after Close.
 var errWhatsAppOutboxClosed = errors.New("whatsapp outbox is closed")
 
+// whatsAppWritesInFlight counts the outbox writes (Append, Rebase) inside
+// their transaction right now, on every outbox: a link's, or one a pause or a
+// retire has already taken off its runner. Shutdown's last step waits for it
+// to reach zero (waitWhatsAppWritesAtExit).
+var whatsAppWritesInFlight atomic.Int64
+
 // errWhatsAppOutboxChunkTooLarge is the refusal of a history chunk the EMPTY
 // queue cannot take: the chunk alone passes a cap, so no drain will ever
 // admit it whole. It wraps errWhatsAppOutboxFull. Append decides it under
@@ -91,10 +97,8 @@ type whatsAppOutbox struct {
 	pendingIdentities map[string]string
 	// closed: Close ran (under mu, so it waited for any write in flight).
 	closed bool
-	// writing is set while an Append or a Rebase holds mu. Read without mu
-	// (WriteInFlight): a shutdown past its deadline gives such a write a
-	// short grace to commit (closeStoresWithin), because WhatsApp does not
-	// send a history chunk again.
+	// writing is set while an Append or a Rebase holds mu (beginWrite), and
+	// read without it (WriteInFlight).
 	writing atomic.Bool
 }
 
@@ -229,8 +233,9 @@ func (ob *whatsAppOutbox) EnsureNextAbove(acked int64) error {
 // linkStart's EnsureNextAbove could not see it, and deleting the batch on
 // that ack would lose every record in it. Rarely, two uploaders overlapped on
 // one link and the other one sent these rows first; the re-send is then
-// idempotent. (A batch whose 2xx was lost is not this: the uploader retries
-// it as exactly the same range, so it comes back as an exact replay.)
+// idempotent. (A batch whose 2xx was lost, or whose local Ack failed, is not
+// this: the uploader retries it as exactly the same range, so it comes back
+// as an exact replay.)
 //
 // Rebase moves every queued row up by the same amount - order kept, the
 // oldest landing just above the watermark - and raises `next` past them, in
@@ -242,8 +247,7 @@ func (ob *whatsAppOutbox) Rebase(above int64) (int64, error) {
 	if ob.closed {
 		return 0, errWhatsAppOutboxClosed
 	}
-	ob.writing.Store(true)
-	defer ob.writing.Store(false)
+	defer ob.beginWrite()()
 	var minSeq, maxSeq sql.NullInt64
 	if err := ob.db.QueryRow(`SELECT MIN(seq), MAX(seq) FROM outbox`).Scan(&minSeq, &maxSeq); err != nil {
 		return 0, err
@@ -389,8 +393,7 @@ func (ob *whatsAppOutbox) Append(records []whatsAppRecord, history bool) error {
 	if ob.closed {
 		return errWhatsAppOutboxClosed
 	}
-	ob.writing.Store(true)
-	defer ob.writing.Store(false)
+	defer ob.beginWrite()()
 	tx, err := ob.db.Begin()
 	if err != nil {
 		return err
@@ -527,6 +530,17 @@ func (ob *whatsAppOutbox) Depth() int64 {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 	return ob.count
+}
+
+// beginWrite marks a write in flight, on this outbox and across every outbox
+// (whatsAppWritesInFlight), and returns what ends it. Caller holds mu.
+func (ob *whatsAppOutbox) beginWrite() (end func()) {
+	ob.writing.Store(true)
+	whatsAppWritesInFlight.Add(1)
+	return func() {
+		whatsAppWritesInFlight.Add(-1)
+		ob.writing.Store(false)
+	}
 }
 
 // WriteInFlight reports whether an Append or a Rebase is inside its
