@@ -121,10 +121,13 @@ func claudeOtherWriters(entries []claudeRegistryEntry, sessionID string, isOwnPI
 // claudeRecentTurns reads the transcript tail's last n user/assistant text
 // turns, masked and capped. Tool results and other content are skipped.
 func claudeRecentTurns(path string, n int) []cliSessionTurn {
-	_, tail, _, err := claudeTranscriptChunks(path, cliSessionProbeTailBytes)
+	head, tail, _, err := claudeTranscriptChunks(path, cliSessionProbeTailBytes)
 	if err != nil {
 		return nil
 	}
+	// A small transcript is all head (no tail is read); a large one keeps
+	// its newest lines in the tail.
+	tail = append(head, tail...)
 	turns := []cliSessionTurn{}
 	for i := len(tail) - 1; i >= 0 && len(turns) < n; i-- {
 		var rec claudeTranscriptRecord

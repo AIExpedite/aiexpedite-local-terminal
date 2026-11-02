@@ -74,8 +74,9 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// something that rides along silently. `signedExecutionId` joined it
 			// with the signed-executionId device half, `whatsapp` with the
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
-			// the re-link carry-over.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
+			// the re-link carry-over; `cliSessionDiscovery` with finding and
+			// adopting coding-agent sessions AI Expedite did not start.
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
