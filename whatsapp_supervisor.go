@@ -52,7 +52,6 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -1027,12 +1026,11 @@ func (s *whatsAppSupervisor) resyncState(linkID string, generation int64) {
 }
 
 // ShutdownAll disconnects every client and flushes the outboxes within ctx's
-// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It does
-// not outlast ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
-// teardown steps after this one still have to run), with one exception: an
-// outbox write still committing when the deadline passes gets up to
-// whatsAppShutdownWriteGrace more (waitOutWrites), whichever step the
-// deadline finds shutdown in.
+// deadline (capped at whatsAppUpdateDrainFlush). Files stay on disk. It never
+// outlasts ctx's deadline (Windows gives the whole shutdown 2–4 s, and the
+// teardown steps after this one still have to run). An outbox write still
+// committing then is waited for at the very end of shutdown instead
+// (waitWhatsAppWritesAtExit).
 func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.mu.Lock()
 	if s.stopped {
@@ -1056,8 +1054,6 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	if len(runners) == 0 {
 		return
 	}
-	// Listed now, while nothing holds a runner's lock waiting on its outbox.
-	outboxes := outboxesOf(runners)
 	flushCtx, cancel := context.WithTimeout(context.Background(), whatsAppUpdateDrainFlush)
 	defer cancel()
 	if ctx != nil {
@@ -1092,13 +1088,17 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	select {
 	case <-stoppedAll:
 	case <-deadline:
-		// Out of time with a runner still stopping: leave its stores to the
-		// process exit (SQLite keeps what it committed) and record the links.
-		// This is the usual way a large history Append meets shutdown: the
-		// flush waits for the outbox behind it. The write still gets its
-		// grace; the runners finishing does not end it (it runs on
-		// whatsmeow's history goroutine), so only the write is waited for.
-		waitOutWrites(outboxes, nil)
+		// Out of time with a runner still stopping - the usual way a large
+		// history Append meets shutdown: the upload loop or the flush waits
+		// for the outbox behind it, possibly before the runner's own
+		// disconnect. Disconnect every client now, so WhatsApp delivers (and
+		// whatsmeow acknowledges) no more history this process would drop,
+		// then leave the stores to the process exit (SQLite keeps what it
+		// committed) and record the links. A write still committing is waited
+		// for at the very end of shutdown (waitWhatsAppWritesAtExit).
+		for _, r := range runners {
+			r.stopClientOnly()
+		}
 		logWhatsApp("-", "shutdown deadline reached while links were still stopping; their files stay for the next start")
 		s.persist()
 		return
@@ -1109,55 +1109,39 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 	s.persist()
 }
 
-// whatsAppShutdownWriteGrace is how long past its deadline shutdown still
-// waits for an outbox write that is committing (a var so tests can shorten
-// it): see waitOutWrites.
+// whatsAppShutdownWriteGrace is how long past every other step of shutdown
+// the process still waits for an outbox write that is committing (a var so
+// tests can shorten it): see waitWhatsAppWritesAtExit.
 var whatsAppShutdownWriteGrace = 2 * time.Second
 
-// outboxesOf lists the runners' open outboxes.
-func outboxesOf(runners []*whatsAppLinkRunner) []*whatsAppOutbox {
-	outboxes := make([]*whatsAppOutbox, 0, len(runners))
-	for _, r := range runners {
-		r.mu.Lock()
-		if r.outbox != nil {
-			outboxes = append(outboxes, r.outbox)
-		}
-		r.mu.Unlock()
-	}
-	return outboxes
-}
-
-// waitOutWrites is shutdown's one exception to its deadline. The process
-// exits right after shutdown returns, and an Append cut short rolls back a
-// history chunk that WhatsApp has already delivered and will not send again.
-// So while one of the outboxes reports a write in flight (WriteInFlight), it
-// waits - at most whatsAppShutdownWriteGrace, only while the write lasts, and
-// no longer than until done closes (nil: never) - and reports whether no
-// write is left in flight. A committed write needs nothing more: SQLite
-// keeps it however the process ends.
-func waitOutWrites(outboxes []*whatsAppOutbox, done <-chan struct{}) bool {
-	writing := func() bool { return slices.ContainsFunc(outboxes, (*whatsAppOutbox).WriteInFlight) }
-	if !writing() {
+// waitWhatsAppWritesAtExit is the last step of shutdown (gracefulShutdown),
+// once every other step has run within its deadline. The process exits next,
+// and an outbox write cut short rolls back a history chunk that WhatsApp has
+// already delivered and will not send again. So while any outbox - a link's,
+// or one a pause or a retire took off its runner - has a write in flight
+// (whatsAppWritesInFlight), it waits: at most grace, and only while a write
+// lasts. It reports whether none is left; a committed write needs nothing
+// more, since SQLite keeps it however the process ends.
+func waitWhatsAppWritesAtExit(grace time.Duration) bool {
+	if whatsAppWritesInFlight.Load() == 0 {
 		return true
 	}
 	start := time.Now()
-	giveUp := time.NewTimer(whatsAppShutdownWriteGrace)
+	giveUp := time.NewTimer(grace)
 	defer giveUp.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
-	for writing() {
+	for whatsAppWritesInFlight.Load() > 0 {
 		select {
-		case <-done:
-			return true
 		case <-giveUp.C:
-			logWhatsApp("-", "an outbox write was still committing "+whatsAppShutdownWriteGrace.String()+
-				" past the shutdown deadline; gave up on it - a history chunk being written may be lost until a re-link")
+			logWhatsApp("-", "an outbox write was still committing "+grace.String()+
+				" into the exit; gave up on it - a history chunk being written may be lost until a re-link")
 			return false
 		case <-tick.C:
 		}
 	}
 	logWhatsApp("-", "waited "+time.Since(start).Round(time.Millisecond).String()+
-		" past the shutdown deadline for an outbox write to finish")
+		" at exit for an outbox write to finish")
 	return true
 }
 
@@ -1165,15 +1149,9 @@ func waitOutWrites(outboxes []*whatsAppOutbox, done <-chan struct{}) bool {
 // none) and reporting whether they all closed. Closing an outbox waits for a
 // write in flight (whatsAppOutbox.Close is a barrier), and a large history
 // chunk can still be appending on whatsmeow's goroutine: shutdown must not
-// outlast its deadline for it (Windows gives the whole shutdown 2–4 s).
-//
-// The one exception is a write still committing when the deadline passes:
-// it gets its grace (waitOutWrites). The closes finishing ends the wait too,
-// since a close waits for any write in flight.
+// outlast its deadline for it (Windows gives the whole shutdown 2–4 s). The
+// write is waited for at the very end instead (waitWhatsAppWritesAtExit).
 func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) bool {
-	// Taken before the closes start: closeStores takes each outbox off its
-	// runner.
-	outboxes := outboxesOf(runners)
 	closed := make(chan struct{})
 	go func() {
 		for _, r := range runners {
@@ -1185,15 +1163,6 @@ func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) 
 	case <-closed:
 		return true
 	case <-deadline:
-	}
-	if !waitOutWrites(outboxes, closed) {
-		return false
-	}
-	select {
-	case <-closed:
-		return true
-	default:
-		// The write has finished; whatever still holds a close is not one.
 		return false
 	}
 }
@@ -1352,10 +1321,10 @@ type whatsAppLinkRunner struct {
 	// is refused; only that one is dropped. 0 = full batches.
 	narrowLimit int
 	narrowTo    int64
-	// unsettledTo is the end of a batch whose outcome is unknown: a transport
-	// error, a 5xx or a 429 may have come after the cloud applied it. The
-	// next batch is capped at it, so a 2xx the device lost comes back as an
-	// exact replay, acked at the batch's own end. Grown by rows queued since,
+	// unsettledTo is the end of a batch whose outcome is unknown - a transport
+	// error, a 5xx or a 429 may have come after the cloud applied it - or
+	// whose 2xx came but whose local Ack failed. The next batch is capped at
+	// it, so the range comes back as an exact replay, acked at its own end. Grown by rows queued since,
 	// the retry could instead be refused (400) for one of them and narrowed
 	// down to a batch ending below what the lost batch acked, whose replay
 	// ack passes its end and renumbers rows the cloud already wrote
@@ -2123,10 +2092,19 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 			}
 			acked = *res.Body.AckedSeq
 		}
-		if err := ob.Ack(acked); err != nil {
-			r.log("outbox ack failed: " + err.Error())
+		ackErr := ob.Ack(acked)
+		if ackErr != nil {
+			r.log("outbox ack failed: " + ackErr.Error())
 		}
 		r.mu.Lock()
+		if ackErr != nil {
+			// The cloud holds the range but the rows are still queued, as if
+			// its 2xx had been lost: send exactly it again (unsettledTo), so
+			// it comes back as a replay acked at its own end and the Ack is
+			// retried - rather than grown by rows queued since, refused for
+			// one of them, narrowed below that end and renumbered.
+			r.unsettledTo = max(r.unsettledTo, acked)
+		}
 		r.lastAckedSeq = max(r.lastAckedSeq, acked)
 		if r.narrowLimit > 0 && acked >= r.narrowTo {
 			// The whole refused range went through: the refusal did not
@@ -2134,7 +2112,9 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 			r.narrowLimit, r.narrowTo = 0, 0
 		}
 		r.mu.Unlock()
-		if acked < batch.SeqFrom {
+		// A failing Ack (a full disk, say) backs off rather than posting the
+		// same range again at once.
+		if acked < batch.SeqFrom || ackErr != nil {
 			return res, whatsAppUploadRetry
 		}
 		return res, whatsAppUploadSent
@@ -2174,9 +2154,9 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 // batch never reached. Usually they are an earlier numbering of this outbox
 // (outbox.db rolled back or restored; see Rebase); rarely, a second uploader
 // overlapped this one on the link and sent these rows first, and the re-send
-// is idempotent. A batch whose 2xx was lost does not end up here: it is
-// retried as the same range (unsettledTo) and comes back acked at its own
-// end. The queued rows move above the watermark and go again, rather than
+// is idempotent. A batch whose 2xx was lost, or whose local Ack failed, does
+// not end up here: it is retried as the same range (unsettledTo) and comes
+// back acked at its own end. The queued rows move above the watermark and go again, rather than
 // being deleted.
 func (r *whatsAppLinkRunner) rebaseBehindCloud(ob *whatsAppOutbox, batch *whatsAppOutboxBatch, watermark int64) whatsAppUploadOutcome {
 	moved, err := ob.Rebase(watermark)
