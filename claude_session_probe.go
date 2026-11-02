@@ -154,7 +154,7 @@ func claudeRecentTurns(path string, n int) []cliSessionTurn {
 }
 
 // probeClaudeSession answers the probe from env's sources.
-func probeClaudeSession(env claudeDiscoveryEnv, sessionID string, includeHistory bool) cliSessionProbeResult {
+func probeClaudeSession(ctx context.Context, env claudeDiscoveryEnv, sessionID string, includeHistory bool) cliSessionProbeResult {
 	res := cliSessionProbeResult{SessionID: sessionID, Writers: []cliSessionWriter{}, OpenInEditors: []string{}}
 	if !isClaudeSessionID(sessionID) {
 		res.Error = cliSessionErrBadRequest
@@ -165,7 +165,7 @@ func probeClaudeSession(env claudeDiscoveryEnv, sessionID string, includeHistory
 
 	var tabs []claudeEditorTab
 	for source, root := range env.editorRoots {
-		out := readEditorClaudeTabs(source, root)
+		out := readEditorClaudeTabs(ctx, source, root, env.now.Add(-env.lookBack))
 		for _, t := range out.tabs {
 			if t.SessionID == sessionID {
 				tabs = append(tabs, t)
@@ -252,7 +252,9 @@ func handleCliSessionProbeCommand(ctx context.Context, topic *pubsub.Publisher, 
 			Error: cliSessionErrEngineNotSupported,
 		}, "error")
 	}
-	res := probeClaudeSession(defaultClaudeDiscoveryEnv(0, 0), sessionID, includeHistory)
+	probeCtx, cancel := context.WithTimeout(ctx, cliSessionDiscoverBudget)
+	defer cancel()
+	res := probeClaudeSession(probeCtx, defaultClaudeDiscoveryEnv(0, 0), sessionID, includeHistory)
 	status := "success"
 	if res.Error != "" {
 		status = "error"

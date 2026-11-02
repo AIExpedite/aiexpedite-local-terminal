@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -174,8 +175,12 @@ func editorWindowFolder(dir string) string {
 	return filepath.FromSlash(p)
 }
 
-// readEditorClaudeTabs reads every window of one editor.
-func readEditorClaudeTabs(source, root string) claudeSourceOutcome {
+// readEditorClaudeTabs reads every window of one editor whose state database
+// was written since `since` (a window untouched for longer holds no tab inside
+// the look-back window, and skipping it keeps a machine with thousands of old
+// workspaces inside the budget). It stops when ctx ends; a partial read is
+// still reported, with the source marked as timed out.
+func readEditorClaudeTabs(ctx context.Context, source, root string, since time.Time) claudeSourceOutcome {
 	out := claudeSourceOutcome{source: source}
 	storage := filepath.Join(root, "User", "workspaceStorage")
 	if root == "" {
@@ -192,15 +197,23 @@ func readEditorClaudeTabs(source, root string) claudeSourceOutcome {
 		return out
 	}
 	read, unreadable, unrecognised := 0, 0, 0
+	timedOut := false
 	for i, e := range entries {
 		if i >= claudeEditorMaxWorkspace || !e.IsDir() {
 			continue
+		}
+		if ctx.Err() != nil {
+			timedOut = true
+			break
 		}
 		dir := filepath.Join(storage, e.Name())
 		dbPath := filepath.Join(dir, "state.vscdb")
 		info, err := os.Stat(dbPath)
 		if err != nil {
 			continue // a window with no state database yet
+		}
+		if info.ModTime().Before(since) {
+			continue
 		}
 		raw, err := readEditorStateValue(dbPath)
 		if err != nil {
@@ -240,6 +253,8 @@ func readEditorClaudeTabs(source, root string) claudeSourceOutcome {
 	}
 	out.checked = read > 0 || (unreadable == 0 && unrecognised == 0)
 	switch {
+	case timedOut:
+		out.skip = cliSessionSkipTimeout
 	case unrecognised > 0:
 		out.skip = cliSessionSkipUnrecognised
 	case unreadable > 0:

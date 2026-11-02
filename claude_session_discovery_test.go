@@ -198,11 +198,11 @@ func TestDiscoverDefaultEditorTitleDefersToSavedTitle(t *testing.T) {
 func TestEditorSourceMissingKeyAndMalformedValue(t *testing.T) {
 	root := t.TempDir()
 	writeEditorState(t, root, "nokey", "")
-	if out := readEditorClaudeTabs(cliSessionSourceVSCode, root); out.skip != "" || len(out.tabs) != 0 || !out.checked {
+	if out := readEditorClaudeTabs(context.Background(), cliSessionSourceVSCode, root, time.Time{}); out.skip != "" || len(out.tabs) != 0 || !out.checked {
 		t.Fatalf("missing key: %+v, want checked with no tabs", out)
 	}
 	writeEditorState(t, root, "bad", "{not json")
-	if out := readEditorClaudeTabs(cliSessionSourceVSCode, root); out.skip != cliSessionSkipUnrecognised {
+	if out := readEditorClaudeTabs(context.Background(), cliSessionSourceVSCode, root, time.Time{}); out.skip != cliSessionSkipUnrecognised {
 		t.Fatalf("malformed value: skip = %q, want unrecognised", out.skip)
 	}
 }
@@ -276,5 +276,24 @@ func TestForkSessionPassesThroughInteractiveArgs(t *testing.T) {
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--resume="+sidA) || !strings.Contains(joined, "--fork-session") {
 		t.Fatalf("server-signed resume / fork-session were not passed through: %v", args)
+	}
+}
+
+func TestEditorSourceSkipsWindowsOlderThanTheLookBack(t *testing.T) {
+	root := t.TempDir()
+	tabs, _ := json.Marshal(map[string]any{"panelTabSessions": []map[string]any{{"sessionId": sidA, "title": "Old"}}})
+	writeEditorState(t, root, "old", string(tabs))
+	old := time.Now().Add(-60 * 24 * time.Hour)
+	dbPath := filepath.Join(root, "User", "workspaceStorage", "old", "state.vscdb")
+	if err := os.Chtimes(dbPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if out := readEditorClaudeTabs(context.Background(), cliSessionSourceVSCode, root, time.Now().Add(-30*24*time.Hour)); len(out.tabs) != 0 {
+		t.Fatalf("a window untouched for 60 days was read: %+v", out.tabs)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if out := readEditorClaudeTabs(ctx, cliSessionSourceVSCode, root, time.Time{}); out.skip != cliSessionSkipTimeout {
+		t.Fatalf("an ended context should report timeout, got %q", out.skip)
 	}
 }

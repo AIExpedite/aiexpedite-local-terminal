@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ func TestProbeReportsWritersEditorsHistoryAndOwnPids(t *testing.T) {
 	env := testDiscoveryEnv(configDir, map[string]string{cliSessionSourceVSCode: vscode})
 	env.isOwnPID = func(pid int) bool { return pid == 11 }
 
-	res := probeClaudeSession(env, sidA, false)
+	res := probeClaudeSession(context.Background(), env, sidA, false)
 	if !res.Exists || !res.Resumable {
 		t.Fatalf("exists/resumable = %v/%v", res.Exists, res.Resumable)
 	}
@@ -41,7 +42,7 @@ func TestProbeReportsWritersEditorsHistoryAndOwnPids(t *testing.T) {
 		t.Fatal("recent turns returned without includeHistory")
 	}
 
-	hist := probeClaudeSession(env, sidA, true)
+	hist := probeClaudeSession(context.Background(), env, sidA, true)
 	if len(hist.RecentTurns) != 2 || hist.RecentTurns[0].Role != "user" || hist.RecentTurns[0].Text != "first question" {
 		t.Fatalf("recent turns = %+v", hist.RecentTurns)
 	}
@@ -52,10 +53,10 @@ func TestProbeReportsWritersEditorsHistoryAndOwnPids(t *testing.T) {
 
 func TestProbeMissingAndMalformedSession(t *testing.T) {
 	env := testDiscoveryEnv(t.TempDir(), nil)
-	if res := probeClaudeSession(env, sidB, true); res.Exists || res.Resumable || res.Error != "" {
+	if res := probeClaudeSession(context.Background(), env, sidB, true); res.Exists || res.Resumable || res.Error != "" {
 		t.Fatalf("missing session = %+v, want exists=false without an error", res)
 	}
-	if res := probeClaudeSession(env, "../../etc/passwd", false); res.Error != cliSessionErrBadRequest {
+	if res := probeClaudeSession(context.Background(), env, "../../etc/passwd", false); res.Error != cliSessionErrBadRequest {
 		t.Fatalf("malformed id = %+v, want badRequest", res)
 	}
 }

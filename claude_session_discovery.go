@@ -335,7 +335,9 @@ func discoverClaudeSessions(ctx context.Context, env claudeDiscoveryEnv) cliSess
 	for _, src := range []string{cliSessionSourceVSCode, cliSessionSourceVSCodeInsiders, cliSessionSourceCursor} {
 		src := src
 		root := env.editorRoots[src]
-		jobs = append(jobs, job{src, func() claudeSourceOutcome { return readEditorClaudeTabs(src, root) }})
+		jobs = append(jobs, job{src, func() claudeSourceOutcome {
+			return readEditorClaudeTabs(ctx, src, root, env.now.Add(-env.lookBack))
+		}})
 	}
 	jobs = append(jobs,
 		job{cliSessionSourceClaudeRegistry, func() claudeSourceOutcome { return readClaudeRegistry(env.configDir) }},
