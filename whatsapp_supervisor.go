@@ -52,6 +52,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"strconv"
 	"sync"
 	"time"
 
@@ -1083,10 +1084,31 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		s.persist()
 		return
 	}
-	for _, r := range runners {
-		_ = r.closeStores()
+	if !closeStoresWithin(runners, deadline) {
+		logWhatsApp("-", "shutdown deadline reached while an outbox was still writing; SQLite keeps it consistent for the next start")
 	}
 	s.persist()
+}
+
+// closeStoresWithin closes the runners' stores, giving up at deadline (nil:
+// none) and reporting whether they all closed. Closing an outbox waits for a
+// write in flight (whatsAppOutbox.Close is a barrier), and a large history
+// chunk can still be appending on whatsmeow's goroutine: shutdown must not
+// outlast its deadline for it (Windows gives the whole shutdown 2–4 s).
+func closeStoresWithin(runners []*whatsAppLinkRunner, deadline <-chan struct{}) bool {
+	closed := make(chan struct{})
+	go func() {
+		for _, r := range runners {
+			_ = r.closeStores()
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		return true
+	case <-deadline:
+		return false
+	}
 }
 
 // waitDiscards waits for wipes already in flight, at most 5 s and never past
@@ -1940,11 +1962,12 @@ const (
 	whatsAppUploadStop
 )
 
-// uploadOnce sends the oldest batch. 2xx acks; 400 narrows the refused range
-// down by halves until a single record is refused, and drops only that one
-// (a bad record must neither wedge the queue nor take the valid records
-// around it with it); 401/403 pauses uploads; 409 fences; 429, 5xx and
-// transport errors are retried with backoff.
+// uploadOnce sends the oldest batch. 2xx acks, unless the ack passes the
+// batch's own end (rebaseBehindCloud); 400 narrows the refused range down by
+// halves until a single record is refused, and drops only that one (a bad
+// record must neither wedge the queue nor take the valid records around it
+// with it); 401/403 pauses uploads; 409 fences; 429, 5xx and transport errors
+// are retried with backoff.
 func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult, whatsAppUploadOutcome) {
 	r.mu.Lock()
 	ob, gen, paused := r.outbox, r.generation, time.Now().Before(r.uploadPausedTil)
@@ -1972,7 +1995,10 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	case res.Status/100 == 2:
 		acked := batch.SeqTo
 		if res.Body.AckedSeq != nil {
-			acked = min(*res.Body.AckedSeq, batch.SeqTo)
+			if *res.Body.AckedSeq > batch.SeqTo {
+				return res, r.rebaseBehindCloud(ob, batch, *res.Body.AckedSeq)
+			}
+			acked = *res.Body.AckedSeq
 		}
 		if err := ob.Ack(acked); err != nil {
 			r.log("outbox ack failed: " + err.Error())
@@ -2018,6 +2044,31 @@ func (r *whatsAppLinkRunner) uploadOnce(ctx context.Context) (whatsAppSyncResult
 	default:
 		return res, whatsAppUploadRetry
 	}
+}
+
+// rebaseBehindCloud answers an ack past the batch's own end. With one
+// uploader per link, the cloud can only hold sequences past this batch if it
+// got them from an earlier numbering of this outbox (Rebase): it acked the
+// batch as a replay and wrote none of it. The queued rows move above its
+// watermark and go again, rather than being deleted.
+func (r *whatsAppLinkRunner) rebaseBehindCloud(ob *whatsAppOutbox, batch *whatsAppOutboxBatch, watermark int64) whatsAppUploadOutcome {
+	moved, err := ob.Rebase(watermark)
+	if err != nil {
+		r.log("outbox renumbering failed: " + err.Error())
+		return whatsAppUploadRetry
+	}
+	r.log("the cloud already holds sequences up to " + strconv.FormatInt(watermark, 10) +
+		" but this outbox was numbering from " + strconv.FormatInt(batch.SeqFrom, 10) +
+		"; renumbered " + strconv.FormatInt(moved, 10) + " queued records above it")
+	r.mu.Lock()
+	r.lastAckedSeq = max(r.lastAckedSeq, watermark)
+	// The narrowing (a 400's) named sequences that no longer exist.
+	r.narrowLimit, r.narrowTo = 0, 0
+	r.mu.Unlock()
+	if moved == 0 {
+		return whatsAppUploadRetry
+	}
+	return whatsAppUploadSent
 }
 
 // flush uploads until the outbox is empty or ctx ends.

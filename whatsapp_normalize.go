@@ -442,8 +442,12 @@ func normalizeWhatsAppHistory(data *waHistorySync.HistorySync, parse whatsAppWeb
 					}
 					records = append(records, whatsAppRecord{
 						Kind: waRecordMessage, Op: waOpNew, ChatJid: chat.String(),
-						SenderJid:   nc.canonicalUser(who, types.EmptyJID).String(),
-						WaMessageID: clipWhatsAppID(web.GetKey().GetID()),
+						SenderJid: nc.canonicalUser(who, types.EmptyJID).String(),
+						// Keyed exactly like the live notice of the same event
+						// (normalizeWhatsAppGroupInfo; both timestamps are whole
+						// seconds): a notice seen live and then again in a
+						// history sync - a re-link's, say - collapses into one.
+						WaMessageID: "sys-" + verb + "-" + strconv.FormatInt(ts, 10),
 						WaTimestamp: ts, Source: waSourceHistory, Type: waTypeSystem, Text: verb,
 					})
 				}
