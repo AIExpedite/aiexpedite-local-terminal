@@ -138,6 +138,38 @@ func TestNormalizeEditRevokeReaction(t *testing.T) {
 	}
 }
 
+// whatsAppReactionTarget: with no participant, a reaction key's FromMe is from
+// the REACTOR's point of view. A key FromMe aims at the reactor's own message;
+// my event with a key that is not mine, at the peer's message in our 1:1 chat;
+// the peer's, at mine - or, with no linked account to name, at the chat.
+func TestNormalizeReactionTargetBranches(t *testing.T) {
+	nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: testWhatsAppIdentity(nil)}
+	blind := whatsAppNormalizeContext{Identity: testWhatsAppIdentity(nil)}
+	for _, c := range []struct {
+		name              string
+		nc                whatsAppNormalizeContext
+		chat, sender      types.JID
+		fromMe, keyFromMe bool
+		author, reactor   types.JID
+	}{
+		{"my reaction to my own message", nc, waPeer, waMe, true, true, waMe, waMe},
+		{"a member's reaction to their own group message", nc, waGroup, waPeer, false, true, waPeer, waPeer},
+		{"my reaction to the peer's message", nc, waPeer, waMe, true, false, waPeer, waMe},
+		{"the peer's reaction to my message", nc, waPeer, waPeer, false, false, waMe, waPeer},
+		{"no linked account: the chat stands in", blind, waPeer, waPeer, false, false, waPeer, waPeer},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			react := &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+				Key: &waCommon.MessageKey{ID: proto.String("T"), FromMe: proto.Bool(c.keyFromMe)}, Text: proto.String("👍"),
+			}}
+			r := one(t, normalizeWhatsAppMessage(liveMsg(c.chat, c.sender, c.fromMe, "RX", react), waSourceLive, c.nc))
+			if r.ChatJid != c.chat.String() || r.SenderJid != c.author.String() || r.ReactorJid != c.reactor.String() {
+				t.Fatalf("chat=%s author=%s reactor=%s, want %s %s %s", r.ChatJid, r.SenderJid, r.ReactorJid, c.chat, c.author, c.reactor)
+			}
+		})
+	}
+}
+
 // The same message must hash the same through history and live: a LID sender
 // with a known phone number normalizes to the phone-number JID, and the device
 // part is dropped.
