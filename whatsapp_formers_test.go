@@ -428,10 +428,19 @@ func TestNormalizeAnEditLongAfterTheJoinGoesOnlyToTheCurrentIdentity(t *testing.
 	one(t, normalizeWhatsAppMessage(joined, waSourceLive, nc))
 	group, me := waGroup.String(), waMe.String()
 
+	// at moves every stamp of an edit made `after` the join: the device's,
+	// the stanza's and this computer's clock at receipt.
+	at := func(m *events.Message, after time.Duration) whatsAppNormalizeContext {
+		m.Info.Timestamp = waTS.Add(after)
+		n := nc
+		n.Now = func() time.Time { return waTS.Add(after) }
+		return n
+	}
 	// Bob edits X1, a message of his from after the join: the author's former.
 	byBob := func(after time.Duration) []whatsAppRecord {
-		return normalizeWhatsAppMessage(liveMsg(waGroup, bobLID, false, "E1",
-			editMessage(&waCommon.MessageKey{ID: proto.String("X1")}, "edited", waTS.Add(after))), waSourceLive, nc)
+		m := liveMsg(waGroup, bobLID, false, "E1",
+			editMessage(&waCommon.MessageKey{ID: proto.String("X1")}, "edited", waTS.Add(after)))
+		return normalizeWhatsAppMessage(m, waSourceLive, at(m, after))
 	}
 	wantTargets(t, byBob(whatsAppEditFormerWindow-time.Millisecond), waOpEdit, "X1", [2]string{group, bobPN.String()}, [2]string{group, bobLID.String()})
 	wantTargets(t, byBob(whatsAppEditFormerWindow), waOpEdit, "X1", [2]string{group, bobPN.String()})
@@ -443,10 +452,44 @@ func TestNormalizeAnEditLongAfterTheJoinGoesOnlyToTheCurrentIdentity(t *testing.
 		m := liveMsg(bobLID, waMe, true, "E2",
 			editMessage(&waCommon.MessageKey{ID: proto.String("MINE1"), FromMe: proto.Bool(true)}, "fixed", waTS.Add(after)))
 		m.Info.RecipientAlt = bobPN
-		return normalizeWhatsAppMessage(m, waSourceLive, nc)
+		return normalizeWhatsAppMessage(m, waSourceLive, at(m, after))
 	}
 	wantTargets(t, mine(5*time.Minute), waOpEdit, "MINE1", [2]string{bobPN.String(), me}, [2]string{bobLID.String(), me})
 	wantTargets(t, mine(whatsAppEditFormerWindow+time.Hour), waOpEdit, "MINE1", [2]string{bobPN.String(), me})
+}
+
+// An edit's window is read on the earliest of its stamps. The editing
+// device's clock can run hours ahead, this computer's own clock - the one the
+// re-point's time is on - hours behind, and an edit can arrive late: none of
+// it may drop the copy that reaches a message stored under the former.
+func TestNormalizeAnEditCopyHoldsUnderClockSkew(t *testing.T) {
+	for _, c := range []struct {
+		name                 string
+		device, local, delay time.Duration
+	}{
+		{"the editing device two hours ahead", 2 * time.Hour, 0, 0},
+		{"this computer two hours behind", 0, -2 * time.Hour, 0},
+		{"three hours late from a device two hours ahead", 2 * time.Hour, 0, 3 * time.Hour},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ir := testWhatsAppIdentity(nil)
+			ir.now = func() time.Time { return waTS.Add(c.local) } // Bob's join, on this computer's clock
+			nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: ir}
+			splitInGroup(t, nc)
+			joined := liveMsg(waGroup, bobLID, false, "J1", textMsg("joined"))
+			joined.Info.SenderAlt = bobPN
+			one(t, normalizeWhatsAppMessage(joined, waSourceLive, nc))
+
+			made := waTS.Add(9 * time.Minute) // when Bob edited G1, in true time
+			nc.Now = func() time.Time { return made.Add(c.delay + c.local) }
+			edit := liveMsg(waGroup, bobLID, false, "E1",
+				editMessage(&waCommon.MessageKey{ID: proto.String("G1")}, "edited", made.Add(c.device)))
+			edit.Info.Timestamp = made
+			group := waGroup.String()
+			wantTargets(t, normalizeWhatsAppMessage(edit, waSourceLive, nc), waOpEdit, "G1",
+				[2]string{group, bobPN.String()}, [2]string{group, bobLID.String()})
+		})
+	}
 }
 
 // My own message from before the join is stored at (bobLID, me), in the
@@ -742,6 +785,51 @@ func (j *joinAtCall) Resolve(primary, alt types.JID, shared bool) (types.JID, []
 		return id, formers
 	}
 	return j.whatsAppIdentityResolver.Resolve(primary, alt, shared)
+}
+
+// The peer's own message in their 1:1 chat names one person twice and is
+// resolved once: a join between two resolutions would store it at (former,
+// identity), a pair no later op of theirs targets. Likewise a reaction to the
+// reactor's own message reuses the reactor's resolution.
+func TestNormalizeOnePersonIsResolvedOncePerEvent(t *testing.T) {
+	for k := 1; k <= 3; k++ {
+		t.Run("join before call "+strconv.Itoa(k), func(t *testing.T) {
+			ir := testWhatsAppIdentity(nil)
+			nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: ir}
+			one(t, normalizeWhatsAppMessage(liveMsg(bobLID, bobLID, false, "M1", textMsg("old")), waSourceHistory, nc))
+			one(t, normalizeWhatsAppMessage(liveMsg(bobPN, bobPN, false, "M2", textMsg("hi")), waSourceHistory, nc))
+			racing := nc
+			racing.Identity = &joinAtCall{whatsAppIdentityResolver: ir, k: k, join: func() { ir.Learn(bobPN, bobLID) }}
+			ms := one(t, normalizeWhatsAppMessage(liveMsg(bobLID, bobLID, false, "MS", textMsg("secret")), waSourceLive, racing))
+			if ms.ChatJid != ms.SenderJid {
+				t.Fatalf("Bob's own 1:1 message stored at (%s, %s)", ms.ChatJid, ms.SenderJid)
+			}
+			ir.Learn(bobPN, bobLID) // joined by now, whichever call it raced
+			revoke := liveMsg(bobLID, bobLID, false, "R1", revokeMessage(&waCommon.MessageKey{ID: proto.String("MS")}))
+			reached := false
+			for _, r := range normalizeWhatsAppMessage(revoke, waSourceLive, nc) {
+				reached = reached || (r.ChatJid == ms.ChatJid && r.SenderJid == ms.SenderJid)
+			}
+			if !reached {
+				t.Fatalf("Bob's delete-for-everyone misses MS at (%s, %s)", ms.ChatJid, ms.SenderJid)
+			}
+		})
+		t.Run("reaction to own message, join before call "+strconv.Itoa(k), func(t *testing.T) {
+			ir := testWhatsAppIdentity(nil)
+			nc := whatsAppNormalizeContext{OwnJID: waMe, Identity: ir}
+			splitInGroup(t, nc)
+			racing := nc
+			racing.Identity = &joinAtCall{whatsAppIdentityResolver: ir, k: k, join: func() { ir.Learn(bobPN, bobLID) }}
+			own := liveMsg(waGroup, bobLID, false, "X5", &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{
+				Key:  &waCommon.MessageKey{ID: proto.String("G1"), FromMe: proto.Bool(true)},
+				Text: proto.String("👍"),
+			}})
+			recs := normalizeWhatsAppMessage(own, waSourceLive, racing)
+			if len(recs) == 0 || recs[0].SenderJid != recs[0].ReactorJid {
+				t.Fatalf("a reaction to Bob's own message names two Bobs: %+v", recs)
+			}
+		})
+	}
 }
 
 // historyMapping is a history chunk carrying one person's PN-LID mapping and
