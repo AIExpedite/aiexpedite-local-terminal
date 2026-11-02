@@ -6,6 +6,16 @@ package main
 // identity and private paths; none of it may reach claude_rate_limits.json,
 // the published usage, or the signed refresh receipt.
 //
+// One exception, and only one: a window this agent never modelled persists
+// the row it renders as — reportedWindows.<limit:…>.{kind,label,model} —
+// because limits[] carries no label and a later read has nothing but the cache
+// to build that row from. claudeGenericWindow derives those three strings from
+// the entry's kind, group and scope display names alone, printable and
+// bounded, and they are the very row the card publishes (new windows travel as
+// free-text kind / label / model: the receipt has no other field for them).
+// assertClaudeSnapshotStringsRedacted admits them there and nowhere else, and
+// TestClaudeGenericWindow_PersistsOnlyTheRowItRendersAs pins their values.
+//
 // Mirrors cliagent_usage_codex_redaction_test.go.
 
 import (
@@ -21,6 +31,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestClaudeRunFreshness_PersistsAndPublishesNumericOnly(t *testing.T) {
@@ -110,11 +121,15 @@ var (
 	// The closed vocabulary the snapshot's own string fields may hold: window
 	// statuses and the writer provenance labels.
 	claudeRedactedEnum = regexp.MustCompile(`^(allowed|rejected|warning|stream|statusline|probe)$`)
+	// The one place free text may sit (see the file header): a generic window's
+	// row. Window ids are slugs, so the path splits unambiguously on ".".
+	claudeRedactedGenericRow = regexp.MustCompile(`^\.reportedWindows\.limit:[a-z0-9_:]+\.(kind|label|model)$`)
 )
 
 // assertClaudeSnapshotStringsRedacted walks the decoded snapshot: numbers and
 // booleans are metrics / flags; every string must be an account fingerprint
-// (hex), an RFC3339 timestamp, or a value from the closed enums above. Map keys
+// (hex), an RFC3339 timestamp, or a value from the closed enums above — except
+// a generic window's derived row, which must be bounded and printable. Map keys
 // are window ids.
 func assertClaudeSnapshotStringsRedacted(t *testing.T, path string, v any) {
 	t.Helper()
@@ -128,9 +143,93 @@ func assertClaudeSnapshotStringsRedacted(t *testing.T, path string, v any) {
 			assertClaudeSnapshotStringsRedacted(t, path+"[]", child)
 		}
 	case string:
+		if claudeRedactedGenericRow.MatchString(path) {
+			if len(val) > claudeWindowLabelMaxBytes || utf8.RuneCountInString(val) > claudeWindowLabelMaxRunes ||
+				claudeWindowDisplayText(val) != val {
+				t.Errorf("snapshot field %s holds %q, which is not a bounded, printable row string", path, val)
+			}
+			return
+		}
 		if !claudeRedactedHex.MatchString(val) && !claudeRedactedTimestamp.MatchString(val) &&
 			!claudeRedactedEnum.MatchString(val) {
 			t.Errorf("snapshot field %s holds free text %q", path, val)
+		}
+	}
+}
+
+// A window this agent never modelled is the one place vendor text reaches the
+// cache (see the file header): the row it renders as, and nothing else from the
+// reply — not the entry's other fields, not its scope's, not the body around
+// them. What the cache holds is exactly claudeGenericWindow's derivation, and
+// the card publishes the same strings.
+func TestClaudeGenericWindow_PersistsOnlyTheRowItRendersAs(t *testing.T) {
+	const (
+		email       = "person.secret@example.com"
+		tokenMarker = "sk-ant-oat-LEAK-do-not-persist-7c1f"
+		proseMarker = "PROSE_MARKER_do_not_persist_51d0"
+	)
+	now := time.Now()
+	reset := now.Add(time.Hour).Unix()
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `{"account":{"email":%q,"token":%q},"note":%q,"limits":[
+			{"kind":"session","percent":52,"resets_at":%d},
+			{"kind":"weekly_scoped","group":"weekly","percent":5,"resets_at":%d,"severity":%q,"owner":%q,
+				"scope":{"model":{"id":null,"display_name":"Haiku 5","granted_by":%q},"surface":null,"note":%q}},
+			{"kind":"daily_all","group":"daily","percent":7,"resets_at":%d,"description":%q,
+				"scope":{"model":null,"surface":{"display_name":"Claude Code","admin":%q}}}
+		]}`, email, tokenMarker, proseMarker, reset, reset, proseMarker, email, email, tokenMarker, reset, proseMarker, email)
+	})
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
+		t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
+	}
+
+	forbidden := []string{email, "person.secret", tokenMarker, "sk-ant-oat-LEAK", proseMarker, "PROSE_MARKER"}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range forbidden {
+		if strings.Contains(string(raw), s) {
+			t.Errorf("persisted snapshot leaks %q", s)
+		}
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	assertClaudeSnapshotStringsRedacted(t, "", decoded)
+
+	snap := claudeCacheSnapshot(t, cache)
+	for id, want := range map[string]struct{ kind, label, model string }{
+		"limit:weekly_scoped:model:haiku_5":   {"weekly", "Weekly Haiku 5", "haiku"},
+		"limit:daily_all:surface:claude_code": {"daily", "Daily Claude Code", ""},
+	} {
+		got, ok := snap.ReportedWindows[id]
+		if !ok {
+			t.Errorf("the set lacks %s: %+v", id, snap.ReportedWindows)
+			continue
+		}
+		if got.Kind != want.kind || got.Label != want.label || got.Model != want.model {
+			t.Errorf("%s persisted {%q %q %q}, want {%q %q %q}", id, got.Kind, got.Label, got.Model, want.kind, want.label, want.model)
+		}
+	}
+	if got := snap.ReportedWindows[claudeWindowFiveHour]; got.Kind != "" || got.Label != "" || got.Model != "" {
+		t.Errorf("the modelled session window persisted a row %+v; it keeps its id only", got)
+	}
+
+	usage, ok := claudeCodeUsageParser{}.ParseContext(context.Background(), "", detectedCLIAgent{}, now)
+	if !ok {
+		t.Fatal("parse failed")
+	}
+	assertMetricSummary(t, usage.Metrics,
+		"5-hour session window|session||52", "Weekly Haiku 5|weekly|haiku|5", "Daily Claude Code|daily||7")
+	metrics, err := json.Marshal(usage.Metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range forbidden {
+		if strings.Contains(string(metrics), s) {
+			t.Errorf("published usage metrics leak %q", s)
 		}
 	}
 }

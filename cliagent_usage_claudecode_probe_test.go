@@ -1661,17 +1661,34 @@ func TestClaudeUsageProbe_DecodesLimitsArray(t *testing.T) {
 			t.Errorf("%s lost its reset stamp", tc.window)
 		}
 	}
-	// Unmodelled entries are dropped, not guessed into a row.
-	if len(snap.Buckets) != 5 {
-		t.Errorf("cache holds %d windows, want 5 — unrecognized limits[] entries must be dropped: %+v",
-			len(snap.Buckets), snap.Buckets)
+	// Unmodelled entries used to be dropped here. limits[] is the provider's
+	// authoritative list ("a new meter needs no client release"), so they now
+	// become windows of their own under a generic id — never guessed onto one of
+	// the modelled windows, which is the guarantee this test always pinned.
+	if len(snap.Buckets) != 7 {
+		t.Errorf("cache holds %d windows, want the 5 modelled + 2 generic: %+v", len(snap.Buckets), snap.Buckets)
+	}
+	for id, want := range map[string]float64{
+		"limit:some_future_meter":                       99,
+		"limit:weekly_scoped:model:an_unmodelled_model": 50,
+	} {
+		if got, present := snap.Buckets[id]; !present || got.UsedPercentage != want {
+			t.Errorf("generic window %s=%+v (present=%v), want %v", id, got, present, want)
+		}
 	}
 
 	// The Fable row is reachable ONLY through weekly_scoped on this shape, which
 	// is the specific row a legacy-only decoder would leave permanently blank.
-	fable := claudeCodeMetricsFromCache(now, "")[2]
+	// The modelled rows keep their places; the generic ones follow in the
+	// server's order.
+	rows := claudeCodeMetricsFromCache(now, "")
+	fable := rows[2]
 	if fable.Unknown || fable.Consumed == nil || *fable.Consumed != 7 {
 		t.Errorf("weekly Fable row=%+v, want an observed 7%%", fable)
+	}
+	if len(rows) != 5 || rows[3].Label != "Some future meter" || rows[4].Label != "Weekly an-unmodelled-model" ||
+		rows[4].Model != "an-unmodelled-model" {
+		t.Errorf("rows=%+v, want the three modelled rows then the two generic ones in server order", rows)
 	}
 }
 
@@ -2096,9 +2113,14 @@ func TestClaudeUsageProbe_DecodesLiveLimitsShape(t *testing.T) {
 			t.Errorf("%s=%v, want %v", tc.window, got.UsedPercentage, tc.want)
 		}
 	}
-	if len(snap.Buckets) != 5 {
-		t.Errorf("cache holds %d windows, want 5 — unmodelled entries must drop: %+v",
-			len(snap.Buckets), snap.Buckets)
+	// The two unmodelled entries are windows of their own now (see
+	// TestClaudeUsageProbe_DecodesLimitsArray), not dropped — and still never
+	// folded into a modelled window.
+	if len(snap.Buckets) != 7 {
+		t.Errorf("cache holds %d windows, want the 5 modelled + 2 generic: %+v", len(snap.Buckets), snap.Buckets)
+	}
+	if _, present := snap.Buckets["limit:weekly_scoped:model:some_future_model"]; !present {
+		t.Errorf("the unmodelled scoped model has no window of its own: %+v", snap.Buckets)
 	}
 	// Fable is reachable only through weekly_scoped on this shape.
 	if fable := claudeCodeMetricsFromCache(now, "")[2]; fable.Unknown || fable.Consumed == nil || *fable.Consumed != 7 {

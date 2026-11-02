@@ -30,8 +30,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -125,11 +127,33 @@ var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []st
 // that an unhydrated block (Windows Desktop / SSO Team-plan — anthropics/
 // claude-code#57026) leaves emailAddress empty, in which case we degrade to no
 // account line, exactly as before this fallback existed.
+//
+// The fields added for the plan chip and the window set (planDisplayName,
+// accountUuid, cachedUsageUtilization) are decoded so that a vendor changing
+// their TYPE costs only themselves: claudeLooseString reads a non-string as "",
+// and the cached reply stays raw until claudeDotJSONUsageWindows decodes it on
+// its own. A plain field facing a type change would fail this whole decode and
+// take the account label (and claudeApiKeyApproved's answer) down with it.
 type claudeDotJSON struct {
 	OAuthAccount struct {
 		EmailAddress string `json:"emailAddress"`
 		DisplayName  string `json:"displayName"`
+		// PlanDisplayName is the provider's own name for the plan ("Ultra",
+		// "Max", "Team Premium"), which Claude Code fetches from
+		// /api/oauth/profile (organization.plan_display_name) and validates
+		// before storing — see claudePlanName for why the chip reads it rather
+		// than the credential's subscriptionType.
+		PlanDisplayName claudeLooseString `json:"planDisplayName"`
+		// AccountUUID identifies the signed-in Claude account. DISPLAY-ONLY like
+		// the rest of this block: it binds a window set to the account it
+		// describes (claudeEffectiveWindowSet) and is never a fingerprint or a
+		// cache scope, for the reasons claudeDotJSONFacts gives.
+		AccountUUID claudeLooseString `json:"accountUuid"`
 	} `json:"oauthAccount"`
+	// CachedUsageUtilization is Claude Code's own copy of the usage endpoint's
+	// last reply — `{fetchedAtMs, accountUuid, utilization: <the reply body>}` —
+	// and the second source of the account's window set (claudeDotJSONFacts).
+	CachedUsageUtilization json.RawMessage `json:"cachedUsageUtilization"`
 	// customApiKeyResponses records the user's one-time approve/decline decision
 	// for an ANTHROPIC_API_KEY seen in the environment. Each entry is the LAST 20
 	// CHARACTERS of the key (Claude Code never stores the full secret). A key that
@@ -163,10 +187,14 @@ type claudeDotJSON struct {
 // here, and can it renew itself". RefreshTokenExpiresAt is therefore parsed
 // (documenting the field we deliberately ignore) but never consulted.
 //
-// SubscriptionType is the plan Claude Code itself reports in /usage → ACCOUNT
-// ("max", "pro", …) and is the ONLY place the plan is written: there is no
-// top-level `plan`/`subscription` key, so the card's plan chip is driven from
-// here. Published verbatim (lowercase) — the card capitalizes it for display.
+// SubscriptionType is the plan CODE Claude Code stores with the login ("max",
+// "pro", …). It is the plan chip's FALLBACK, not its source: the code is
+// internal and lags the provider's naming — an Ultra account (renamed from Max
+// 20x on 2026-10-30) still carries "max", and Max 5x and Ultra are
+// indistinguishable by it. The provider's own display name lives in
+// ~/.claude.json (claudeDotJSON.OAuthAccount.PlanDisplayName), and
+// claudePlanName prefers it; this value, verbatim and lowercase as before, is
+// what the chip shows when that is absent or invalid.
 type claudeOAuthCredentials struct {
 	Account       string `json:"account"`
 	Email         string `json:"email"`
@@ -185,6 +213,40 @@ type claudeOAuthCredentials struct {
 // credential carries only the OAuth token object.
 func (c claudeOAuthCredentials) claudeCredentialAccount() string {
 	return firstNonEmpty(c.Email, c.Account, c.Organization)
+}
+
+// hasSubscriptionLogin reports whether the credential carries a claude.ai
+// subscription login at all — the only kind of login a plan belongs to. An
+// API-key install has no claudeAiOauth block, and a plan name left in
+// ~/.claude.json by an earlier subscription login must not be shown for it.
+func (c claudeOAuthCredentials) hasSubscriptionLogin() bool {
+	oauth := c.ClaudeAiOauth
+	return oauth.AccessToken != "" || oauth.RefreshToken != "" || oauth.SubscriptionType != ""
+}
+
+// claudePlanDisplayNamePattern is the rule Claude Code itself applies before it
+// stores organization.plan_display_name as oauthAccount.planDisplayName (it logs
+// `plan_display_name_rejected` and stores null otherwise): 1–40 characters,
+// letters and digits with inner spaces, dots, pluses and hyphens. Applied again
+// here because the file is shared and any program can write it, and the value
+// is published verbatim — in the signed receipt among them.
+var claudePlanDisplayNamePattern = regexp.MustCompile(`^[\p{L}\p{N}](?:[\p{L}\p{N} .+-]{0,38}[\p{L}\p{N}+])?$`)
+
+// claudePlanName is the plan chip: the provider's display name verbatim
+// ("Ultra", "Max", "Team Premium") when it is present and passes Claude Code's
+// own validation, otherwise the credential's subscriptionType exactly as before
+// (lowercase, e.g. "max"), and "" when neither is known.
+//
+// No plan-name table, on purpose: the provider renamed its plans on 2026-10-30
+// without changing the internal code, and a table here would have to be
+// re-released for every rename. The consumers tell the two forms apart by case
+// (a display name has capitals; a legacy code is all lowercase), so a computer
+// still on an older agent keeps reading sensibly during a mixed rollout.
+func claudePlanName(displayName, subscriptionType string) string {
+	if claudePlanDisplayNamePattern.MatchString(displayName) {
+		return displayName
+	}
+	return subscriptionType
 }
 
 // claudeKeychainReader returns the raw Claude credential JSON from the platform
@@ -411,8 +473,10 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	}
 
 	// Read AND decode the credential ONCE (file, or macOS Keychain), then use the
-	// decoded value for the account fingerprint, the plan chip, and the
-	// auth-expiry notice — one shape, so those three can never disagree.
+	// decoded value for the account fingerprint, the plan chip (whether there is
+	// a subscription plan at all, and its code when the provider's display name
+	// is unavailable — see claudePlanName), and the auth-expiry notice — one
+	// shape, so those three can never disagree.
 	credentialFound := false
 	credentialUsable := false
 	// Whether the notice on the card was authored from the credential's own
@@ -437,6 +501,17 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// claudeUsageProbeIdentity.scope. One small local JSON read, of the same file
 	// this parser loads a few lines further down.
 	cacheScopeAtCredentialRead := claudeRateLimitCacheScope()
+	// Claude Code's own config (~/.claude.json, or $CLAUDE_CONFIG_DIR's), read
+	// ONCE for the whole gather (claudeDotJSONFactsFor caches it by stamp): the
+	// plan chip's display name, the account label, the signed-in account a
+	// window set is bound to, and Claude Code's own cached usage reply. Display
+	// evidence only — never a fingerprint or a cache scope.
+	//
+	// Sampled HERE, before the credential read, for the scope's reason: the
+	// account it names is carried to the probe as the account the reply's
+	// window set describes, so it must never be able to name a login NEWER than
+	// the token the request carries (claudeUsageProbeIdentity.accountUUID).
+	dot := claudeDotJSONFactsFor(home)
 	// The token's expiry and the credential file's stamp travel to the probe
 	// with the token, so it can refuse to send one it can see has expired and
 	// notice when Claude Code has rewritten it — from this same read.
@@ -449,7 +524,11 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 		if json.Unmarshal(raw, &creds) == nil {
 			credentialUsable = applyClaudeAuthState(usage, creds, now)
 			usage.Account = creds.claudeCredentialAccount()
-			usage.Plan = creds.ClaudeAiOauth.SubscriptionType
+			// The plan belongs to a subscription login, so a credential without
+			// one reports none — however the shared dotfile names a plan.
+			if creds.hasSubscriptionLogin() {
+				usage.Plan = claudePlanName(dot.planDisplayName, creds.ClaudeAiOauth.SubscriptionType)
+			}
 			oauthAccessToken = creds.ClaudeAiOauth.AccessToken
 			oauthExpiresAtMs = creds.ClaudeAiOauth.ExpiresAt
 
@@ -495,8 +574,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// self-healing display skew, not a cross-account data leak (the metrics are
 	// this device's own usage regardless of which email is shown).
 	if usage.Account == "" {
-		email, displayName := claudeDotJSONAccount(home)
-		usage.Account = firstNonEmpty(email, displayName) // label only
+		usage.Account = firstNonEmpty(dot.email, dot.displayName) // label only
 	}
 
 	// One identity for publish + dedup + cache scope: the credential account.
@@ -529,7 +607,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// generation published below versions the rows this view selects; the
 	// commit is discovered by observeCLIUsageGeneration like any other.
 	importPinnedClaudeObservations(usage.AccountFingerprint)
+	// The view reads Claude Code's config through os.UserHomeDir(); the rows
+	// published below must describe the SAME account the plan and label above
+	// were read for, so this gather's read replaces it. One file in production,
+	// where `home` is that directory.
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
+	view.dot = dot
 	// A credential rewrite the run-debt schedule is waiting on (an expired token
 	// or a 401) makes its pending rung due now rather than at the age backoff.
 	nudgeClaudeCredentialChanged(credStamp)
@@ -538,10 +621,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 		fingerprint: usage.AccountFingerprint,
 		scope:       cacheScopeAtCredentialRead,
 		scopePinned: true,
+		accountUUID: dot.accountUUID,
 		expiresAtMs: oauthExpiresAtMs,
 		credStamp:   credStamp,
 	}) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
+		view.dot = dot
 	}
 	// Again once the gather's seed may have restored a persisted wait and
 	// re-armed its rung: in a fresh process the call above finds no wait to
@@ -549,7 +634,11 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// otherwise leave that rung standing until its time. A no-op when the call
 	// above already claimed this stamp's nudge.
 	nudgeClaudeCredentialChanged(credStamp)
-	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
+	// The rows of the account's reported window set when one is known, today's
+	// three otherwise (claudeCodeMetricsFromView). The receipt and /auth/token
+	// carry whatever this returns: no new field, only rows within the receipt's
+	// existing bounds.
+	usage.Metrics = claudeCodeMetricsFromView(view, now)
 	// The generation these rows were read from, signed in the receipt so the
 	// backend records which Claude commit it applied. A generation this read is
 	// the first to see — a status-line hook commit from another process — is
@@ -624,23 +713,184 @@ func claudeDotJSONPath(home string) string {
 	return expandHome(home, ".claude.json")
 }
 
-// claudeDotJSONAccount returns (email, displayName) from ~/.claude.json's
-// oauthAccount block, or ("","") when the file is absent/unparseable or the
-// block is unhydrated. Used ONLY to pick a human-facing DISPLAY label for the
-// card (email preferred, display name as a fallback) — never as a fingerprint.
-// ~/.claude.json is shared and mutable (any session's `/login` rewrites it), so
-// it must not scope the cache or drive cross-device dedup; Parse fingerprints by
-// the stable credential account instead.
-func claudeDotJSONAccount(home string) (email, displayName string) {
+// claudeDotJSONFacts is what one read of ~/.claude.json says about the login it
+// currently holds, or the zero value when the file is absent, unparseable or
+// unhydrated. Used ONLY for DISPLAY — the card's account label (email
+// preferred, display name as a fallback), the plan chip — and as EVIDENCE about
+// the account's window set: never as a fingerprint. ~/.claude.json is shared
+// and mutable (any session's `/login` rewrites it), so it must not scope the
+// cache or drive cross-device dedup; Parse fingerprints by the stable credential
+// account instead.
+type claudeDotJSONFacts struct {
+	email       string
+	displayName string
+	// planDisplayName is oauthAccount.planDisplayName, "" unless it passes
+	// claudePlanDisplayNamePattern.
+	planDisplayName string
+	accountUUID     string
+	// usageWindows is the window set Claude Code's own cached usage reply
+	// reports (claudeDotJSONUsageWindows), or nil.
+	usageWindows *claudeWindowSet
+}
+
+// claudeDotJSONMaxBytes bounds the read. The file is ~100 KB on a busy profile
+// (it keeps per-project state); anything near this is not Claude Code's config,
+// and reads as absent rather than being loaded whole every gather.
+const claudeDotJSONMaxBytes = 32 << 20
+
+// claudeDotJSONCache keeps the last parse, keyed by path and the file's stamp.
+// The parser, the probe's account sample and every freshness check read this
+// file, and it is large; with the stamp unchanged they share one parse, so a
+// gather reads it at most once. A rewrite changes the stamp — Claude Code
+// rewrites the file whenever it changes it — and the next read parses afresh.
+var claudeDotJSONCache struct {
+	mu    sync.Mutex
+	path  string
+	stamp claudeCredStamp
+	facts claudeDotJSONFacts
+}
+
+// resetClaudeDotJSONCache forgets the cached parse — for a test that rewrites
+// the file faster than its stamp can move.
+func resetClaudeDotJSONCache() {
+	claudeDotJSONCache.mu.Lock()
+	claudeDotJSONCache.path, claudeDotJSONCache.stamp, claudeDotJSONCache.facts = "", claudeCredStamp{}, claudeDotJSONFacts{}
+	claudeDotJSONCache.mu.Unlock()
+}
+
+// claudeCurrentDotJSONFacts is claudeDotJSONFactsFor the user's home, for the
+// callers that do not carry one (the probe, the freshness checks).
+func claudeCurrentDotJSONFacts() claudeDotJSONFacts {
+	home, _ := os.UserHomeDir()
+	return claudeDotJSONFactsFor(home)
+}
+
+// claudeDotJSONFactsFor reads the facts from the config file claudeDotJSONPath
+// resolves for `home` — $CLAUDE_CONFIG_DIR/.claude.json when that override is
+// set — through the stamp cache above. Never an error: an absent file, or one
+// this process has never managed to read, is the zero value.
+//
+// A file that EXISTS but cannot be read or parsed right now keeps the last
+// good parse of the same path. Claude Code rewrites this file all the time, and
+// a read landing mid-write (or meeting a Windows sharing violation) is a
+// transient fact about the read, not about the account: dropping to the zero
+// value would flip the plan chip to the credential's code — and the window set
+// to none — for that one gather, churning the published snapshot twice. The
+// stale stamp stays recorded, so the next read retries the parse.
+func claudeDotJSONFactsFor(home string) claudeDotJSONFacts {
 	path := claudeDotJSONPath(home)
 	if path == "" {
-		return "", ""
+		return claudeDotJSONFacts{}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return claudeDotJSONFacts{}
+	}
+	stamp := claudeCredStamp{modNs: info.ModTime().UnixNano(), size: info.Size()}
+	claudeDotJSONCache.mu.Lock()
+	cachedPath, cached := claudeDotJSONCache.path, claudeDotJSONCache.facts
+	if cachedPath == path && claudeDotJSONCache.stamp == stamp {
+		claudeDotJSONCache.mu.Unlock()
+		return cached
+	}
+	claudeDotJSONCache.mu.Unlock()
+
+	facts, readStamp, ok := readClaudeDotJSONFacts(path)
+	if !ok {
+		if cachedPath == path {
+			return cached
+		}
+		return claudeDotJSONFacts{}
+	}
+	claudeDotJSONCache.mu.Lock()
+	claudeDotJSONCache.path, claudeDotJSONCache.stamp, claudeDotJSONCache.facts = path, readStamp, facts
+	claudeDotJSONCache.mu.Unlock()
+	return facts
+}
+
+// readClaudeDotJSONFacts parses the file, reporting the stamp of the handle the
+// bytes came from so the cache keys the parse to exactly what was read. The
+// handle is closed before this returns: Claude Code replaces the file while it
+// runs, and on Windows an open handle can make that replace fail.
+func readClaudeDotJSONFacts(path string) (claudeDotJSONFacts, claudeCredStamp, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return claudeDotJSONFacts{}, claudeCredStamp{}, false
+	}
+	stamp := claudeCredStamp{}
+	if info, err := f.Stat(); err == nil {
+		stamp = claudeCredStamp{modNs: info.ModTime().UnixNano(), size: info.Size()}
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, claudeDotJSONMaxBytes+1))
+	_ = f.Close()
+	if err != nil || len(raw) > claudeDotJSONMaxBytes {
+		return claudeDotJSONFacts{}, claudeCredStamp{}, false
 	}
 	cfg := claudeDotJSON{}
-	if !readJSONFile(path, &cfg) {
-		return "", ""
+	if json.Unmarshal(raw, &cfg) != nil {
+		return claudeDotJSONFacts{}, claudeCredStamp{}, false
 	}
-	return cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName
+	account := strings.TrimSpace(string(cfg.OAuthAccount.AccountUUID))
+	facts := claudeDotJSONFacts{
+		email:        cfg.OAuthAccount.EmailAddress,
+		displayName:  cfg.OAuthAccount.DisplayName,
+		accountUUID:  account,
+		usageWindows: claudeDotJSONUsageWindows(cfg.CachedUsageUtilization, account),
+	}
+	if name := string(cfg.OAuthAccount.PlanDisplayName); claudePlanDisplayNamePattern.MatchString(name) {
+		facts.planDisplayName = name
+	}
+	return facts, stamp, true
+}
+
+// claudeDotJSONUsageWindows is the window set in Claude Code's own cached copy
+// of the usage reply (`cachedUsageUtilization`), or nil.
+//
+// Why it is read at all: an agent that cannot probe — offline mode, the
+// `disable_claude_usage_probe` opt-out, an expired credential, or simply not
+// probed since its upgrade — would otherwise never learn the account's window
+// set and keep publishing the previous plan's rows (an Ultra account's
+// five-hour window). Claude Code refreshes this copy whenever it shows usage,
+// so it costs no request and works offline.
+//
+// For the WINDOW SET only. Its values never become readings: they keep the
+// provenance, freshness and generation rules of the writers that own them, and
+// a second, unversioned source of numbers would undo all three. The set is
+// derived exactly as the probe derives its own (claudeUsageReplyWindows — the
+// same ids, the same rows), stamped at `fetchedAtMs`, and only when the copy
+// belongs to the account signed in now: its `accountUuid` must equal the
+// config's oauthAccount.accountUuid, both present. Absent, malformed, another
+// account's, or a field whose type changed: ignored silently — never an error,
+// and never a reason the receipt could fail. Re-read every gather (through the
+// stamp cache), never persisted: a probe set persisted later with a newer
+// instant supersedes it (claudeEffectiveWindowSet).
+func claudeDotJSONUsageWindows(raw json.RawMessage, accountUUID string) *claudeWindowSet {
+	if len(raw) == 0 || accountUUID == "" {
+		return nil
+	}
+	var cached struct {
+		FetchedAtMs json.RawMessage   `json:"fetchedAtMs"`
+		AccountUUID claudeLooseString `json:"accountUuid"`
+		Utilization json.RawMessage   `json:"utilization"`
+	}
+	if json.Unmarshal(raw, &cached) != nil ||
+		strings.TrimSpace(string(cached.AccountUUID)) != accountUUID ||
+		len(cached.Utilization) == 0 || len(cached.Utilization) > claudeUsageProbeMaxBody {
+		return nil
+	}
+	var fetchedAt float64
+	if json.Unmarshal(cached.FetchedAtMs, &fetchedAt) != nil || fetchedAt <= 0 {
+		return nil
+	}
+	var decoded claudeUsageProbeResponse
+	if json.Unmarshal(cached.Utilization, &decoded) != nil {
+		return nil
+	}
+	_, set := claudeUsageReplyWindows(decoded, int64(fetchedAt))
+	if set != nil {
+		set.Account = claudeAccountRef(accountUUID)
+	}
+	return set
 }
 
 // claudeEnvAuthActive reports whether the ACTIVE credential for this Claude

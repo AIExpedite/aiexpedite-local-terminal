@@ -48,6 +48,10 @@
 //   - Decoded into a typed, allow-listed struct — never map[string]interface{} —
 //     so unknown vendor fields (tokens, raw config, prose) are discarded by
 //     encoding/json rather than carried into the cache or the signed receipt.
+//     The one vendor text that does travel is what names a window this agent
+//     never modelled — a limits[] entry's kind, group and scope display name —
+//     and only as the row it renders as: printable, bounded, and derived by
+//     claudeGenericWindow (cliagent_usage_claudecode_windows.go).
 //   - Skipped entirely when the process never armed it (SetClaudeUsageProbeDisabled
 //     is called only by StartAgent), when the user opted out
 //     (disable_claude_usage_probe), when the agent is offline, or when no stored
@@ -153,18 +157,24 @@ type claudeUsageProbeWindow struct {
 // claudeUsageProbeResponse accepts BOTH shapes this endpoint is known to use,
 // because reading only one of them is how this probe silently becomes a no-op.
 //
-//  1. `limits[]` — the current representation: a list of entries typed
-//     `session`, `weekly_all` or `weekly_scoped`, the last carrying the model
-//     the scope applies to. On this shape the Fable meter may exist ONLY as a
+//  1. `limits[]` — the current representation, and the AUTHORITATIVE one: the
+//     list of every meter the account has. Kinds seen so far are `session`,
+//     `weekly_all` and `weekly_scoped` (the last carrying the model the scope
+//     applies to); on this shape the Fable meter may exist ONLY as a
 //     weekly_scoped entry, so a decoder ignoring the list would leave that row
-//     permanently unobservable.
+//     permanently unobservable. Any other entry is a window this agent never
+//     modelled, and becomes a row of its own (claudeGenericWindow) rather than
+//     being dropped — "a new meter needs no client release", as Claude Code's
+//     own schema puts it.
 //  2. Legacy top-level window objects, kept as a fallback so a rollback (or an
-//     account still served the previous shape) keeps working.
+//     account still served the previous shape) keeps working. A fixed
+//     allow-list: the code-named top-level keys the reply also carries
+//     (`iguana_necktie`, `tangelo`, …) are not plan windows and are never read.
 //
-// Both are allow-lists: an entry we do not model is dropped rather than landing
-// on the card as an unlabelled row. When both are present the list wins, since
-// it is the shape the service actively maintains; the legacy fields fill only
-// windows the list did not supply.
+// When both are present the list wins, since it is the shape the service
+// actively maintains; the legacy fields fill only windows the list did not
+// supply. claudeUsageReplyWindows maps a decoded reply onto readings and,
+// when the reply is authoritative, the window set it reports.
 type claudeUsageProbeResponse struct {
 	Limits []claudeUsageProbeLimit `json:"limits"`
 
@@ -186,17 +196,26 @@ type claudeUsageProbeResponse struct {
 //
 // `kind` is the discriminator the service actually sends; `type` is kept as an
 // alias so an older or rolled-back revision still decodes. The scope is an
-// OBJECT (`{"scope":{"model":{"display_name":"Fable"}}}`), which is why it uses
-// the tolerant claudeUsageProbeLabel below rather than a plain string: a string
-// field facing an object makes encoding/json reject the WHOLE response, so one
-// mis-modelled field would take every window down with it — the probe would
-// report parse_failed forever and the card would stay exactly as stale as the
-// defect this file exists to fix.
+// OBJECT (`{"scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}`),
+// which is why it uses the tolerant claudeUsageProbeScope rather than a plain
+// string: a string field facing an object makes encoding/json reject the WHOLE
+// response, so one mis-modelled field would take every window down with it —
+// the probe would report parse_failed forever and the card would stay exactly
+// as stale as the defect this file exists to fix. `group` (the server's period
+// for the row, "weekly") is read the same never-failing way, for the same
+// reason: it is new to this decoder, and adding a field must not add a way for
+// a reply that decodes today to stop decoding.
+//
+// Not read: `severity` (the server's colour grade for a meter) and `is_active`
+// (its HEADLINE pick — the one row a single-value indicator shows; it does not
+// mean "applies", and Ultra's Fable window is binding while is_active is
+// false), neither of which the receipt has a field for.
 type claudeUsageProbeLimit struct {
 	Kind           string                `json:"kind"`
 	Type           string                `json:"type"`
+	Group          claudeLooseString     `json:"group"`
 	Model          claudeUsageProbeLabel `json:"model"`
-	Scope          claudeUsageProbeLabel `json:"scope"`
+	Scope          claudeUsageProbeScope `json:"scope"`
 	Percent        *float64              `json:"percent"`
 	Utilization    *float64              `json:"utilization"`
 	UsedPercentage *float64              `json:"used_percentage"`
@@ -207,7 +226,9 @@ type claudeUsageProbeLimit struct {
 // claudeUsageProbeLabel flattens a field that names a model to a single string,
 // accepting every shape this payload has used: a bare string, an object with a
 // display name, or an object nesting the model
-// (`{"model":{"display_name":"Fable"}}`).
+// (`{"model":{"display_name":"Fable"}}`). It decodes the top-level `model` an
+// older revision carried; `scope` is decoded into its parts by
+// claudeUsageProbeScope, which keeps these same readings.
 //
 // It NEVER returns an error. A field we cannot interpret must degrade to "no
 // label" — dropping one entry — instead of failing the enclosing Unmarshal and
@@ -260,36 +281,6 @@ func (l claudeUsageProbeLimit) window() claudeUsageProbeWindow {
 		ResetsAt:       l.ResetsAt,
 		Status:         l.Status,
 	}
-}
-
-// cacheWindow maps a limits[] entry onto a cache window id, or "" when the entry
-// is not one we model.
-//
-//	session       -> five_hour
-//	weekly_all    -> seven_day
-//	weekly_scoped -> seven_day_<model>, for the models the card has rows for
-//
-// An unrecognized type, or a weekly_scoped entry naming a model we have no row
-// for, is dropped: surfacing it would either invent a row or file one model
-// usage under a different model meter.
-func (l claudeUsageProbeLimit) cacheWindow() string {
-	switch strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Kind, l.Type))) {
-	case "session":
-		return claudeWindowFiveHour
-	case "weekly_all":
-		return claudeWindowSevenDay
-	case "weekly_scoped":
-		scope := strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Scope.Label, l.Model.Label)))
-		switch {
-		case strings.Contains(scope, "opus"):
-			return claudeWindowSevenDayOpus
-		case strings.Contains(scope, "sonnet"):
-			return claudeWindowSevenDaySonnet
-		case strings.Contains(scope, "fable"):
-			return claudeWindowSevenDayFable
-		}
-	}
-	return ""
 }
 
 // firstNonNilFloat returns the first non-nil pointer, or nil.
@@ -1388,6 +1379,11 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 		charge := adjustClaudeRefreshAttemptsAt(persisted, +1)
 		lockedHeldMs := int64(0)
 		lockedObserved := time.Time{}
+		// The locked read below measures the snapshot the way every other
+		// freshness check does — by the rows the card SHOWS, which depend on the
+		// account Claude Code's config names now. Read before the cache lock is
+		// taken, so the critical section touches no file but the cache itself.
+		dot := claudeCurrentDotJSONFacts()
 		lockedHeld := false
 		lockedInFlight := false
 		// Both values are sampled on EVERY path, under the SAME lock the charge
@@ -1405,10 +1401,7 @@ func (g *claudeUsageProbeGate) seedOwedFromCacheLeased(ctx context.Context, fing
 		charged, wroteMod, wroteSize := mutateClaudeRateLimitSnapshotStamped(claudeRateLimitCachePath(), fingerprint,
 			func(snap *claudeRateLimitSnapshot) bool {
 				lockedHeldMs = snap.HeldUntilMs
-				lockedObserved = claudeSnapshotFreshness(claudeRateLimitView{
-					buckets:    snap.Buckets,
-					probedAtMs: snap.LastProbeObservedAtMs,
-				}, now)
+				lockedObserved = claudeSnapshotFreshness(claudeRateLimitViewOf(*snap, dot), now)
 				// The hold the unlocked blockedFromIssuing pre-check could not see.
 				// Another channel may have recorded a 429 for this account between
 				// that check and this lock, and a charge on top of it buys a request
@@ -1832,6 +1825,15 @@ type claudeUsageProbeIdentity struct {
 	// than the token it belongs to, which is the whole guard.
 	scope       string
 	scopePinned bool
+	// accountUUID is the account ~/.claude.json's oauthAccount named when this
+	// identity's credential was read — sampled BEFORE that read, beside `scope`
+	// and under the same scopePinned flag, for the same ordering reason. It is
+	// what an authoritative reply's window set is bound to (claudeWindowSet.Account):
+	// a `/login` landing between the sample and the credential read can then
+	// only make the set look like the previous account's, which the row builder
+	// ignores, never like the new account's, which it would trust. "" when the
+	// file names none. Display-only identity: never a fingerprint or a scope.
+	accountUUID string
 
 	// expiresAtMs is the stored access token's claudeAiOauth.expiresAt (zero when
 	// absent), and credStamp the credential file's stamp (zero on a Keychain
@@ -1873,6 +1875,7 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	// Keychain round-trip on a default macOS config, not an instant, so a
 	// `/login` landing inside it is exactly the case this ordering refuses.
 	scope := claudeRateLimitCacheScope()
+	account := claudeDotJSONFactsFor(home).accountUUID
 	raw, stamp, ok := readClaudeCredentialsRawStamped(context.Background(), base)
 	if !ok {
 		return claudeUsageProbeIdentity{}
@@ -1886,6 +1889,7 @@ func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 		fingerprint: fingerprintAccount(claudeCodeUsageParser{}.Provider(), creds.claudeCredentialAccount()),
 		scope:       scope,
 		scopePinned: true,
+		accountUUID: account,
 		expiresAtMs: creds.ClaudeAiOauth.ExpiresAt,
 		credStamp:   stamp,
 	}
@@ -2024,6 +2028,11 @@ func probeClaudeUsageResult(
 	// scope a later login installs is refused because it matches neither this
 	// sample nor this reading's own fingerprint.
 	scopeBefore := claudeRateLimitCacheScope()
+	// The account an authoritative reply's window set will be bound to, sampled
+	// in the same place and for the same reason (claudeUsageProbeIdentity.accountUUID).
+	// Display-only: it decides which set the row builder trusts, never what this
+	// request may write.
+	accountBefore := claudeCurrentDotJSONFacts().accountUUID
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
@@ -2038,6 +2047,7 @@ func probeClaudeUsageResult(
 	// only ever narrow the write targets the locked guards below admit.
 	if identity.scopePinned {
 		scopeBefore = identity.scope
+		accountBefore = identity.accountUUID
 	}
 	persistedFor = identity.fingerprint
 	result.credStamped = !identity.credStamp.isZero()
@@ -2215,13 +2225,29 @@ func probeClaudeUsageResult(
 		return result, false, time.Time{}
 	}
 
-	updates := claudeUsageProbeBuckets(decoded, now)
-	if len(updates) == 0 {
+	updates, reported := claudeUsageReplyWindows(decoded, now.UnixMilli())
+	if len(updates) == 0 && reported == nil {
 		// A response we cannot plot is not an observation. Returning here leaves
 		// the cache byte-identical rather than stamping a fresh ObservedAt on
 		// nothing.
+		//
+		// An AUTHORITATIVE reply with nothing to plot is different, and is not
+		// this branch: `limits: []` is the server saying the account has no
+		// meters ("Empty when the server reported no meters"), and an entry
+		// without a readable percentage still names a window that exists. Both
+		// are answers — a success that persists the set — where treating them as
+		// a broken endpoint would back off, log, and leave the previous plan's
+		// rows on the card indefinitely.
 		result.code = claudeProbeNoWindows
 		return result, false, time.Time{}
+	}
+	if reported != nil {
+		// Bound to the account Claude Code's config named as this request went
+		// out — sampled with the scope, before the credential (accountBefore),
+		// so a `/login` racing the request can only make the set look like the
+		// PREVIOUS account's, which claudeEffectiveWindowSet then ignores (today's
+		// rows), never like the new one's.
+		reported.Account = claudeAccountRef(accountBefore)
 	}
 	// Report success only if the snapshot actually reached disk. The
 	// fire-and-forget merge swallows an unwritable data dir, a Windows sharing
@@ -2255,7 +2281,7 @@ func probeClaudeUsageResult(
 	// under, and the new login's own gather will probe for itself. probeErr stays
 	// nil for the same reason — the endpoint did nothing wrong, so this must not
 	// extend the failure backoff for the account that just signed in.
-	persisted, err := mergeClaudeRateLimitCacheProbeScoped(ctx, claudeRateLimitCachePath(), updates, now,
+	persisted, err := mergeClaudeRateLimitCacheProbeReading(ctx, claudeRateLimitCachePath(), updates, reported, now,
 		identity.fingerprint, []string{scopeBefore}, identity.credStamp)
 	if err != nil {
 		if errors.Is(err, errClaudeRateLimitCacheRescoped) {
@@ -2277,42 +2303,14 @@ func probeClaudeUsageResult(
 	return result, true, persisted
 }
 
-// claudeUsageProbeBuckets converts the allow-listed response into cache buckets.
-// A window with no readable percentage is DROPPED, not persisted as 0% — the
-// same rule bucketFromInfo applies to a stream event that carries no usage.
+// claudeUsageProbeBuckets converts the allow-listed response into cache buckets
+// — the readings half of claudeUsageReplyWindows, for a caller that has no use
+// for the window set. A window with no readable percentage is DROPPED, not
+// persisted as 0% — the same rule bucketFromInfo applies to a stream event that
+// carries no usage.
 func claudeUsageProbeBuckets(decoded claudeUsageProbeResponse, now time.Time) map[string]claudeRateLimitBucket {
-	nowMs := now.UnixMilli()
-	out := map[string]claudeRateLimitBucket{}
-	add := func(window string, w claudeUsageProbeWindow) {
-		bucket, ok := claudeUsageProbeBucket(w, nowMs)
-		if !ok {
-			return
-		}
-		out[window] = bucket
-	}
-	// limits[] first — it is the representation the service actively maintains,
-	// so where both shapes describe a window the list is the one to trust.
-	for _, limit := range decoded.Limits {
-		window := limit.cacheWindow()
-		if window == "" {
-			continue
-		}
-		add(window, limit.window())
-	}
-	// Legacy top-level windows fill only what the list did not supply.
-	addLegacy := func(window string, w *claudeUsageProbeWindow) {
-		if _, taken := out[window]; taken || w == nil {
-			return
-		}
-		add(window, *w)
-	}
-	addLegacy(claudeWindowFiveHour, decoded.FiveHour)
-	addLegacy(claudeWindowSevenDay, decoded.SevenDay)
-	addLegacy(claudeWindowSevenDaySonnet, decoded.SevenDaySonnet)
-	addLegacy(claudeWindowSevenDayOpus, decoded.SevenDayOpus)
-	addLegacy(claudeWindowSevenDayFable, decoded.SevenDayFable)
-	addLegacy(claudeWindowSevenDayOverageIncluded, decoded.SevenDayOverageIncluded)
-	return out
+	buckets, _ := claudeUsageReplyWindows(decoded, now.UnixMilli())
+	return buckets
 }
 
 // claudeUsageProbeBucket normalizes one window. Percentage precedence and the
