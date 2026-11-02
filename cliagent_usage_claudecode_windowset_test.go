@@ -1379,16 +1379,29 @@ func TestClaudeGenericWindow_TheModelIDFillingInKeepsTheWindow(t *testing.T) {
 
 // Two windows can still share a row identity (kind + label + model) — two
 // kinds of one group scoped to the same model, say — and the receipt takes one
-// row per identity. The one kept is the better evidence, at the earlier row's
-// position: a reading over an Unknown placeholder, else the more CONSTRAINING
-// reading, the later observation only on a tie. Never simply whichever was
-// added first, nor whichever was read last, nor the id that happens to sort
-// first: a fresher 30 % must not hide a spent window beside it (over-admit).
+// row per identity, at the earlier row's position, built as the weekly row
+// builds its own: a reading over an Unknown placeholder, else the more
+// CONSTRAINING reading, and two equally constraining readings as one constraint
+// that clears at the later reset (none when either is unknown) and is as fresh
+// as the staler reading. Never simply whichever was added first, nor whichever
+// was read last, nor the id that happens to sort first: a fresher 30 % must not
+// hide a spent window beside it, nor a spent window's early reset another's
+// later one (over-admit).
 func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
-	reading := func(label string, used float64, at time.Time) cliAgentUsageMetric {
+	stamp := func(at time.Time) string {
+		if at.IsZero() {
+			return ""
+		}
+		return at.UTC().Format(time.RFC3339)
+	}
+	resetting := func(label string, used float64, at, reset time.Time) cliAgentUsageMetric {
 		return cliAgentUsageMetric{Kind: "daily", Label: label, Unit: "%", Total: floatPtr(100),
-			Consumed: floatPtr(used), Remaining: floatPtr(100 - used), ObservedAt: at.UTC().Format(time.RFC3339)}
+			Consumed: floatPtr(used), Remaining: floatPtr(100 - used), ObservedAt: stamp(at), ResetAt: stamp(reset)}
+	}
+	soon, tomorrow := now.Add(time.Hour), now.Add(24*time.Hour)
+	reading := func(label string, used float64, at time.Time) cliAgentUsageMetric {
+		return resetting(label, used, at, soon)
 	}
 	unknown := cliAgentUsageMetric{Kind: "daily", Label: "Daily Haiku 5", Unit: "%", Unknown: true}
 	// A window that rolled over reads Unknown but keeps the instant it was last
@@ -1399,17 +1412,27 @@ func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 
 	earlier := now.Add(-time.Hour)
 	for _, tc := range []struct {
-		name   string
-		adds   []cliAgentUsageMetric
-		wantN  float64
-		wantAt time.Time
+		name      string
+		adds      []cliAgentUsageMetric
+		wantN     float64
+		wantAt    time.Time
+		wantReset time.Time
 	}{
-		{"a reading replaces an Unknown placeholder", []cliAgentUsageMetric{unknown, other, reading("Daily Haiku 5", 100, now)}, 100, now},
-		{"a reading replaces a rolled-over window observed later", []cliAgentUsageMetric{rolledOver, other, reading("Daily Haiku 5", 70, earlier)}, 70, earlier},
-		{"an Unknown placeholder never replaces a reading", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now), other, unknown}, 30, now},
-		{"the more constraining reading wins", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, earlier), other, reading("Daily Haiku 5", 100, now)}, 100, now},
-		{"a spent window is not hidden by a fresher, healthier one", []cliAgentUsageMetric{reading("Daily Haiku 5", 100, earlier), other, reading("Daily Haiku 5", 30, now)}, 100, earlier},
-		{"a tie takes the later observation", []cliAgentUsageMetric{reading("Daily Haiku 5", 50, earlier), other, reading("Daily Haiku 5", 50, now)}, 50, now},
+		{"a reading replaces an Unknown placeholder", []cliAgentUsageMetric{unknown, other, reading("Daily Haiku 5", 100, now)}, 100, now, soon},
+		{"a reading replaces a rolled-over window observed later", []cliAgentUsageMetric{rolledOver, other, reading("Daily Haiku 5", 70, earlier)}, 70, earlier, soon},
+		{"an Unknown placeholder never replaces a reading", []cliAgentUsageMetric{reading("Daily Haiku 5", 30, now), other, unknown}, 30, now, soon},
+		{"the more constraining reading wins, with its own reset",
+			[]cliAgentUsageMetric{reading("Daily Haiku 5", 30, earlier), other, resetting("Daily Haiku 5", 100, now, tomorrow)}, 100, now, tomorrow},
+		{"a spent window is not hidden by a fresher, healthier one",
+			[]cliAgentUsageMetric{reading("Daily Haiku 5", 100, earlier), other, resetting("Daily Haiku 5", 30, now, tomorrow)}, 100, earlier, soon},
+		// Two spent windows: the limit clears only when both have reset, and the
+		// row is as fresh as the staler reading — in either order.
+		{"a tie clears at the later reset and is as fresh as the staler reading",
+			[]cliAgentUsageMetric{reading("Daily Haiku 5", 100, now), other, resetting("Daily Haiku 5", 100, earlier, tomorrow)}, 100, earlier, tomorrow},
+		{"the same tie added the other way round",
+			[]cliAgentUsageMetric{resetting("Daily Haiku 5", 100, earlier, tomorrow), other, reading("Daily Haiku 5", 100, now)}, 100, earlier, tomorrow},
+		{"a tie with an unknown reset has none",
+			[]cliAgentUsageMetric{reading("Daily Haiku 5", 100, now), other, resetting("Daily Haiku 5", 100, now, time.Time{})}, 100, now, time.Time{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rows := claudeMetricRows{}
@@ -1420,9 +1443,9 @@ func TestClaudeMetricRows_KeepTheBetterEvidenceOnACollision(t *testing.T) {
 				t.Fatalf("rows=%v, want the shared identity once, at its first position", metricSummary(rows.metrics))
 			}
 			got := rows.metrics[0]
-			if got.Unknown || *got.Consumed != tc.wantN || got.ObservedAt != tc.wantAt.UTC().Format(time.RFC3339) {
-				t.Errorf("kept %v observed %s, want %g observed %s", metricSummary(rows.metrics[:1]), got.ObservedAt,
-					tc.wantN, tc.wantAt.UTC().Format(time.RFC3339))
+			if got.Unknown || *got.Consumed != tc.wantN || got.ObservedAt != stamp(tc.wantAt) || got.ResetAt != stamp(tc.wantReset) {
+				t.Errorf("kept %v observed %q reset %q, want %g observed %q reset %q", metricSummary(rows.metrics[:1]),
+					got.ObservedAt, got.ResetAt, tc.wantN, stamp(tc.wantAt), stamp(tc.wantReset))
 			}
 		})
 	}

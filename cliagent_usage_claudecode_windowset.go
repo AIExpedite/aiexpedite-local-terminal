@@ -1126,9 +1126,9 @@ type claudeMetricRows struct {
 	index map[string]int
 }
 
-// add appends m — or, when a row with the same identity is already in, keeps
-// whichever of the two is the better evidence (claudeRowIsBetterEvidence), at
-// the earlier row's position. The receipt takes one row per identity, so two
+// add appends m — or, when a row with the same identity is already in, replaces
+// it with the one row the two publish together (claudeCollidedRow), at the
+// earlier row's position. The receipt takes one row per identity, so two
 // windows that derive one identity — two kinds of one group scoped to the same
 // model, which the label does not tell apart — publish ONE row, and it must be
 // the one that constrains: whichever was added first must not win just for
@@ -1141,9 +1141,7 @@ func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
 		r.index = map[string]int{}
 	}
 	if i, ok := r.index[identity]; ok {
-		if claudeRowIsBetterEvidence(m, r.metrics[i]) {
-			r.metrics[i] = m
-		}
+		r.metrics[i] = claudeCollidedRow(r.metrics[i], m)
 		return
 	}
 	if len(r.metrics) >= cliUsageMaxMetricsPerProvider {
@@ -1153,25 +1151,44 @@ func (r *claudeMetricRows) add(m cliAgentUsageMetric) {
 	r.metrics = append(r.metrics, m)
 }
 
-// claudeRowIsBetterEvidence reports whether `candidate` should replace `held`
-// as the one row of their shared identity: a reading beats an Unknown
-// placeholder, and between two readings the more CONSTRAINING one wins (the
-// higher share consumed), the later observation only on a tie — the way the
-// weekly row keeps the worst of its windows (aggregateWeeklyMetric). Over-block,
-// never over-admit. That is also right for one window read under two cache ids:
-// usage within a window only grows, and a reading whose window has rolled over
-// is already Unknown.
-func claudeRowIsBetterEvidence(candidate, held cliAgentUsageMetric) bool {
-	if candidate.Unknown {
-		return false
-	}
-	if held.Unknown {
-		return true
+// claudeCollidedRow is the one row two windows sharing an identity publish, by
+// the rules the weekly row applies to its windows (aggregateWeeklyMetric):
+//
+//   - a reading beats an Unknown placeholder;
+//   - between two readings the more CONSTRAINING one (the higher share
+//     consumed) is the row, with its own reset and observation;
+//   - two EQUALLY constraining readings are one constraint that clears only
+//     when both windows have reset — the later reset, or none at all when
+//     either reset is unknown — and the row is only as fresh as the staler of
+//     the two, so a stale constraint still earns its probe.
+//
+// Over-block, never over-admit. That is also right for one window read under
+// two cache ids: usage within a window only grows, and a reading whose window
+// has rolled over is already Unknown.
+func claudeCollidedRow(held, candidate cliAgentUsageMetric) cliAgentUsageMetric {
+	switch {
+	case candidate.Unknown:
+		return held
+	case held.Unknown:
+		return candidate
 	}
 	if c, h := claudeRowConsumed(candidate), claudeRowConsumed(held); c != h {
-		return c > h
+		if c > h {
+			return candidate
+		}
+		return held
 	}
-	return observedAtMsFromRFC3339(candidate.ObservedAt) > observedAtMsFromRFC3339(held.ObservedAt)
+	merged := held
+	if held.ResetAt == "" || candidate.ResetAt == "" {
+		merged.ResetAt = ""
+	} else if observedAtMsFromRFC3339(candidate.ResetAt) > observedAtMsFromRFC3339(held.ResetAt) {
+		merged.ResetAt = candidate.ResetAt
+	}
+	if at := observedAtMsFromRFC3339(candidate.ObservedAt); at > 0 &&
+		(merged.ObservedAt == "" || at < observedAtMsFromRFC3339(merged.ObservedAt)) {
+		merged.ObservedAt = candidate.ObservedAt
+	}
+	return merged
 }
 
 // claudeRowConsumed is a reading's share consumed, 0 when it carries none.

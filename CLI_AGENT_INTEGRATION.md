@@ -1980,9 +1980,11 @@ capacity as unknown. The plan chip said "Max", because the credential's
   key to 64 bytes, kind + label + model unique: the signed receipt rejects any
   violation for the whole refresh, and no new receipt field is used. When two
   windows share an identity (two kinds of one group scoped to one model), one
-  row is published at the first one's position: a reading over Unknown, else
-  the more constraining reading, and the later observation only on a tie.
-  Over-block, never over-admit. A new
+  row is published at the first one's position, the way the weekly row
+  combines its windows: a reading over Unknown, else the more constraining
+  reading. Two equally constraining readings publish the later reset (none
+  when either is unknown) and the staler observation. Over-block, never
+  over-admit. A new
   window id is logged once per process (`[claude-usage] provider reported
   windows …`), ids only.
 - **Second source: Claude Code's own cached reply.** `~/.claude.json`
