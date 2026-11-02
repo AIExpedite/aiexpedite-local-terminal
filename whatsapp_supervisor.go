@@ -168,6 +168,11 @@ type whatsAppSupervisor struct {
 	// there). A counter, not a WaitGroup: a fenced flush can start a discard
 	// while shutdown is already waiting, and WaitGroup forbids Add then.
 	discardsInFlight int
+	// runnersStopped closes once every runner the last ShutdownAll stopped
+	// has finished stopping. On its deadline paths shutdown returns with them
+	// still going (the process exits next); a test waits on it before
+	// tearing anything down under them.
+	runnersStopped chan struct{}
 }
 
 var globalWhatsAppSupervisor = &whatsAppSupervisor{}
@@ -1076,6 +1081,9 @@ func (s *whatsAppSupervisor) ShutdownAll(ctx context.Context) {
 		}(r)
 	}
 	stoppedAll := make(chan struct{})
+	s.mu.Lock()
+	s.runnersStopped = stoppedAll
+	s.mu.Unlock()
 	go func() { wg.Wait(); close(stoppedAll) }()
 	var deadline <-chan struct{}
 	if ctx != nil {

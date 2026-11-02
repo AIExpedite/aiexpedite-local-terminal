@@ -191,7 +191,7 @@ func TestWhatsAppOutboxReportsAWriteInFlight(t *testing.T) {
 	if ob.WriteInFlight() {
 		t.Fatal("an idle outbox reported a write in flight")
 	}
-	records := make([]whatsAppRecord, 20000)
+	records := make([]whatsAppRecord, whatsAppInFlightRecords(20000))
 	for i := range records {
 		records[i] = textRecord("chat@s.whatsapp.net", "W"+strconv.Itoa(i), "x")
 	}
@@ -220,6 +220,44 @@ func TestWhatsAppOutboxReportsAWriteInFlight(t *testing.T) {
 	}
 	watch("Append", func() error { return ob.Append(records, true) })
 	watch("Rebase", func() error { _, err := ob.Rebase(100000); return err })
+}
+
+// whatsAppInFlightRecords sizes a write a test needs still in flight while
+// it acts: n records normally, a tenth of them under the race detector, which
+// slows the write by far more than that (a 30k-record Append takes ~0.2 s
+// here and ~8 s under -race on a CI runner).
+func whatsAppInFlightRecords(n int) int {
+	if whatsAppRaceDetector {
+		return n / 10
+	}
+	return n
+}
+
+// writeFinish reports when ob's write in flight finishes.
+func writeFinish(ob *whatsAppOutbox) <-chan time.Time {
+	done := make(chan time.Time, 1)
+	go func() {
+		for ob.WriteInFlight() {
+			time.Sleep(time.Millisecond)
+		}
+		done <- time.Now()
+	}()
+	return done
+}
+
+// returnedPromptlyAfter fails t unless shutdown returned within a moment of
+// the write finishing: it waited for the write, not out the grace. (Returning
+// before the write finished is what the committed-rows check catches.)
+func returnedPromptlyAfter(t *testing.T, returned time.Time, finished <-chan time.Time) {
+	t.Helper()
+	select {
+	case wrote := <-finished:
+		if late := returned.Sub(wrote); late > 2*time.Second {
+			t.Fatalf("ShutdownAll returned %v after the write finished: it waited out the grace, not the write", late)
+		}
+	case <-time.After(time.Minute):
+		t.Fatal("the write never finished")
+	}
 }
 
 // bigHistoryChunk is one RECENT history chunk (not the final one) of n
@@ -284,7 +322,7 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
 		return time.Now().Before(r.uploadPausedTil)
 	})
 	prevGrace := whatsAppShutdownWriteGrace
-	whatsAppShutdownWriteGrace = 10 * time.Second
+	whatsAppShutdownWriteGrace = time.Minute // never the thing that ends the wait here
 	t.Cleanup(func() { whatsAppShutdownWriteGrace = prevGrace })
 	gate := make(chan struct{})
 	c.mu.Lock()
@@ -302,11 +340,11 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
 	ob := r.outbox
 	r.mu.Unlock()
 
-	const chunk = 30000
+	chunk := int64(whatsAppInFlightRecords(30000))
 	histDone := make(chan struct{})
 	go func() { // whatsmeow's event goroutine
 		defer close(histDone)
-		c.emit(&events.HistorySync{Data: bigHistoryChunk(chunk)})
+		c.emit(&events.HistorySync{Data: bigHistoryChunk(int(chunk))})
 	}()
 	appendBy := time.Now().Add(10 * time.Second)
 	for !ob.WriteInFlight() {
@@ -315,19 +353,17 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkStillCommitting(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	finished := writeFinish(ob)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
-	start := time.Now()
 	h.sup.ShutdownAll(ctx)
-	took := time.Since(start)
+	returned := time.Now()
 	atExit := committedOutboxRows(t, dir)
 	<-histDone
 	if atExit < before+chunk {
 		t.Fatalf("ShutdownAll returned (the process exits) with %d of the chunk's %d records committed", atExit-before, chunk)
 	}
-	if took >= whatsAppShutdownWriteGrace/2 {
-		t.Fatalf("ShutdownAll took %v: it waited out the grace, not the write", took)
-	}
+	returnedPromptlyAfter(t, returned, finished)
 }
 
 // The same on the usual path, with uploads healthy: shutdown's flush waits for
@@ -351,20 +387,33 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkWhileLinksAreStopping(t *testing.T
 	}
 	h.transport.mu.Unlock()
 	prevGrace := whatsAppShutdownWriteGrace
-	whatsAppShutdownWriteGrace = 10 * time.Second
+	whatsAppShutdownWriteGrace = time.Minute // never the thing that ends the wait here
 	t.Cleanup(func() { whatsAppShutdownWriteGrace = prevGrace })
 	r.mu.Lock()
 	ob := r.outbox
 	r.mu.Unlock()
 
-	const chunk = 30000
+	chunk := int64(whatsAppInFlightRecords(30000))
 	histDone := make(chan struct{})
 	go func() { // whatsmeow's event goroutine
 		defer close(histDone)
-		c.emit(&events.HistorySync{Data: bigHistoryChunk(chunk)})
+		c.emit(&events.HistorySync{Data: bigHistoryChunk(int(chunk))})
 	}()
 	t.Cleanup(func() {
 		<-histDone
+		// Shutdown returned with the link still stopping; let it finish
+		// before the stores close and the harness puts its timings back
+		// under its flush.
+		h.sup.mu.Lock()
+		stopping := h.sup.runnersStopped
+		h.sup.mu.Unlock()
+		if stopping != nil {
+			select {
+			case <-stopping:
+			case <-time.After(time.Minute):
+				t.Error("the link never finished stopping")
+			}
+		}
 		_ = r.closeStores() // shutdown left them to the process exit
 	})
 	appendBy := time.Now().Add(10 * time.Second)
@@ -374,17 +423,15 @@ func TestWhatsAppShutdownWaitsForAHistoryChunkWhileLinksAreStopping(t *testing.T
 		}
 		runtime.Gosched()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	finished := writeFinish(ob)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
-	start := time.Now()
 	h.sup.ShutdownAll(ctx)
-	took := time.Since(start)
+	returned := time.Now()
 	if atExit := committedOutboxRows(t, dir); atExit < chunk {
 		t.Fatalf("ShutdownAll returned (the process exits) with %d of the chunk's %d records committed", atExit, chunk)
 	}
-	if took >= whatsAppShutdownWriteGrace/2 {
-		t.Fatalf("ShutdownAll took %v: it waited out the grace, not the write", took)
-	}
+	returnedPromptlyAfter(t, returned, finished)
 }
 
 // ShutdownAll's own store close honours the caller's deadline. The test holds
