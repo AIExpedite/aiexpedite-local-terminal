@@ -297,3 +297,33 @@ func TestEditorSourceSkipsWindowsOlderThanTheLookBack(t *testing.T) {
 		t.Fatalf("an ended context should report timeout, got %q", out.skip)
 	}
 }
+
+func TestDiscoverFindsAnOpenTabsOldTranscriptThroughTheStoreIndex(t *testing.T) {
+	configDir, vscode := t.TempDir(), t.TempDir()
+	// Outside the 30-day window, so the windowed scan does not parse it, but
+	// an open tab names it.
+	writeTranscript(t, configDir, "-w-old", sidB, time.Now().Add(-90*24*time.Hour),
+		userRecord("/w/old", "old work"), map[string]any{"type": "custom-title", "customTitle": "Old but open"})
+	tabs, _ := json.Marshal(map[string]any{"panelTabSessions": []map[string]any{{"sessionId": sidB, "title": "Old but open"}}})
+	writeEditorState(t, vscode, "w1", string(tabs))
+
+	store := readClaudeStore(context.Background(), configDir, time.Now().Add(-30*24*time.Hour), 500)
+	if !store.pathsComplete || store.paths[sidB] == "" || len(store.store) != 0 {
+		t.Fatalf("index = %v complete=%v parsed=%d", store.paths, store.pathsComplete, len(store.store))
+	}
+	if info := lookupClaudeTranscript(configDir, store, sidB); info == nil || info.SavedTitle != "Old but open" {
+		t.Fatalf("lookup through the index = %+v", info)
+	}
+	if lookupClaudeTranscript(configDir, store, sidC) != nil {
+		t.Fatal("an id the complete index does not hold has no transcript")
+	}
+	res := discoverClaudeSessions(context.Background(), testDiscoveryEnv(configDir, map[string]string{cliSessionSourceVSCode: vscode}))
+	if r := rowByID(res.Rows, sidB); r == nil || !r.Resumable {
+		t.Fatalf("the open tab's old session was not offered: %+v", res.Rows)
+	}
+	// An incomplete listing falls back to searching the project folders.
+	partial := claudeSourceOutcome{checked: true, paths: map[string]string{}}
+	if info := lookupClaudeTranscript(configDir, partial, sidB); info == nil {
+		t.Fatal("an incomplete index must fall back to the folder search")
+	}
+}

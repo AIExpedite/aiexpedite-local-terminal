@@ -476,7 +476,12 @@ type claudeTranscriptFile struct {
 // readClaudeStore lists transcripts modified since `since`, newest first, and
 // parses at most maxRows of them.
 func readClaudeStore(ctx context.Context, configDir string, since time.Time, maxRows int) claudeSourceOutcome {
-	out := claudeSourceOutcome{source: cliSessionSourceClaudeStore, store: map[string]*claudeTranscriptInfo{}}
+	out := claudeSourceOutcome{
+		source: cliSessionSourceClaudeStore,
+		store:  map[string]*claudeTranscriptInfo{},
+		paths:  map[string]string{},
+	}
+	newest := map[string]time.Time{}
 	if configDir == "" {
 		out.skip = cliSessionSkipNotFound
 		return out
@@ -510,12 +515,21 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 				continue
 			}
 			fi, err := e.Info()
-			if err != nil || fi.ModTime().Before(since) {
+			if err != nil {
 				continue
 			}
-			files = append(files, claudeTranscriptFile{id, filepath.Join(root, p.Name(), name), fi.ModTime()})
+			path := filepath.Join(root, p.Name(), name)
+			if at, seen := newest[id]; !seen || fi.ModTime().After(at) {
+				newest[id] = fi.ModTime()
+				out.paths[id] = path
+			}
+			if fi.ModTime().Before(since) {
+				continue
+			}
+			files = append(files, claudeTranscriptFile{id, path, fi.ModTime()})
 		}
 	}
+	out.pathsComplete = ctx.Err() == nil
 	sort.Slice(files, func(i, j int) bool { return files[i].modified.After(files[j].modified) })
 	if len(files) > maxRows {
 		files = files[:maxRows]

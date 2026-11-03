@@ -321,7 +321,14 @@ type claudeSourceOutcome struct {
 	tabs    []claudeEditorTab
 	running []claudeRegistryEntry
 	store   map[string]*claudeTranscriptInfo
-	trunc   bool
+	// Every transcript the store scan listed (any age): session id -> newest
+	// path. Lets a session an editor or process names be found without
+	// another walk of every project folder.
+	paths map[string]string
+	// pathsComplete: the listing finished, so an id missing from paths has no
+	// transcript at all.
+	pathsComplete bool
+	trunc         bool
 }
 
 // discoverClaudeSessions runs every source under ctx, merges by session id and
@@ -424,7 +431,7 @@ collect:
 				continue
 			}
 			lookups++
-			if info := findClaudeTranscript(env.configDir, id); info != nil {
+			if info := lookupClaudeTranscript(env.configDir, outcomes[cliSessionSourceClaudeStore], id); info != nil {
 				store[id] = info
 			}
 		}
@@ -447,6 +454,24 @@ collect:
 		res.Truncated = true
 	}
 	return res
+}
+
+// lookupClaudeTranscript parses one session's transcript: from the store
+// scan's path index when the scan ran (no further directory walk), else by
+// searching every project folder (the scan timed out or failed).
+func lookupClaudeTranscript(configDir string, store claudeSourceOutcome, id string) *claudeTranscriptInfo {
+	if store.pathsComplete {
+		path, ok := store.paths[id]
+		if !ok {
+			return nil
+		}
+		info, err := parseClaudeTranscript(id, path)
+		if err != nil {
+			return nil
+		}
+		return info
+	}
+	return findClaudeTranscript(configDir, id)
 }
 
 func keysOf[V any](m map[string]V) map[string]bool {
