@@ -1046,7 +1046,8 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 // run so the correlated result clears the backend's in-flight / pending marker.
 func isInternalDemandCommand(command string) bool {
 	return command == "__cli_usage_refresh__" || command == "__env_inspect__" ||
-		command == cliSmokeCommand || isWhatsAppCommand(command)
+		command == cliSmokeCommand || isWhatsAppCommand(command) ||
+		command == cliSessionsDiscoverCommand || command == cliSessionProbeCommand
 }
 
 func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
@@ -1243,6 +1244,14 @@ type resultMsg struct {
 	// Environment Setup capability. Echoes RefreshID so terminal-service can
 	// correlate the response with its pending inspection request.
 	Readiness *ReadinessReport `json:"readiness,omitempty"`
+
+	// Coding-session discovery (claude_session_discovery.go /
+	// claude_session_probe.go, shared-constants cliSessionDiscovery.js):
+	// populated only on __cli_sessions_discover_result__,
+	// __cli_session_probe_result__ and claude_native_outside_writer.
+	CliSessions   *cliSessionsDiscoverResult `json:"cliSessions,omitempty"`
+	Probe         *cliSessionProbeResult     `json:"probe,omitempty"`
+	OutsideWriter *cliSessionOutsideWriter   `json:"outsideWriter,omitempty"`
 
 	// __cli_smoke_result__ payload — populated only when
 	// Type == cliSmokeResultType. Metric-only BY CONSTRUCTION: status, a
@@ -2439,6 +2448,22 @@ func runPubSubConnection(cfg *Config) error {
 			// backend's pending marker never sticks; nack on publish failure
 			// so Pub/Sub redelivers.
 			if err := handleEnvInspectCommand(ctx, topic, cmd, cfg); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+
+		if cmd.Command == cliSessionsDiscoverCommand || cmd.Command == cliSessionProbeCommand {
+			// Read-only coding-session discovery / probe (claude_session_*.go).
+			// Always publishes one correlated result; nack on a publish
+			// failure so Pub/Sub redelivers.
+			handler := handleCliSessionsDiscoverCommand
+			if cmd.Command == cliSessionProbeCommand {
+				handler = handleCliSessionProbeCommand
+			}
+			if err := handler(ctx, topic, cmd, cfg); err != nil {
 				m.Nack()
 			} else {
 				m.Ack()
