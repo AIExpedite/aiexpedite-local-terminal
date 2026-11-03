@@ -317,8 +317,10 @@ func isClaudeSyntheticPrompt(text string) bool {
 		strings.HasPrefix(t, "Caveat:") || strings.HasPrefix(t, "[Request interrupted")
 }
 
-// claudeTranscriptChunks reads the head and tail of a transcript (≤64 KB
-// each) as complete lines: a cut line at a chunk edge is dropped.
+// claudeTranscriptChunks reads the head and tail of a transcript (≤chunk
+// each) as complete lines: a cut line at a chunk edge is dropped. A transcript
+// of at most two chunks is read whole as the head, so no record is ever split
+// across the head / tail boundary.
 func claudeTranscriptChunks(path string, chunk int64) (head, tail []string, size int64, err error) {
 	fh, err := os.Open(path)
 	if err != nil {
@@ -330,22 +332,24 @@ func claudeTranscriptChunks(path string, chunk int64) (head, tail []string, size
 		return nil, nil, 0, err
 	}
 	size = info.Size()
-	buf := make([]byte, minInt64(size, chunk))
+	whole := size <= 2*chunk
+	headLen := chunk
+	if whole {
+		headLen = size
+	}
+	buf := make([]byte, headLen)
 	n, err := io.ReadFull(fh, buf)
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, nil, size, err
 	}
-	head = splitLines(buf[:n], false, size > chunk)
-	if size > chunk {
-		start := size - chunk
-		if start < chunk {
-			start = chunk // never re-read the head
-		}
-		tbuf := make([]byte, size-start)
+	head = splitLines(buf[:n], false, !whole)
+	if !whole {
+		start := size - chunk // > chunk: the tail never overlaps the head
+		tbuf := make([]byte, chunk)
 		if _, err := fh.ReadAt(tbuf, start); err != nil && !errors.Is(err, io.EOF) {
 			return head, nil, size, err
 		}
-		tail = splitLines(tbuf, start > chunk, false)
+		tail = splitLines(tbuf, true, false)
 	}
 	return head, tail, size, nil
 }
@@ -375,7 +379,13 @@ func minInt64(a, b int64) int64 {
 	return b
 }
 
-// parseClaudeTranscript reads one transcript's allowlisted records.
+// errClaudeTranscriptUnrecognised is returned for a readable transcript with
+// no record of a known type (empty, corrupt or an unsupported format): there
+// is no conversation behind it to resume.
+var errClaudeTranscriptUnrecognised = errors.New("unrecognised claude transcript")
+
+// parseClaudeTranscript reads one transcript's allowlisted records. A
+// transcript without a single recognised record is errClaudeTranscriptUnrecognised.
 func parseClaudeTranscript(sessionID, path string) (*claudeTranscriptInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -427,6 +437,9 @@ func parseClaudeTranscript(sessionID, path string) (*claudeTranscriptInfo, error
 				}
 			}
 		}
+	}
+	if !out.Recognised {
+		return nil, errClaudeTranscriptUnrecognised
 	}
 	for _, t := range []string{custom, ai, summary} {
 		if strings.TrimSpace(t) != "" {
@@ -535,7 +548,7 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 		files = files[:maxRows]
 		out.trunc = true
 	}
-	parsed, failed := 0, 0
+	parsed, failed, unrecognised := 0, 0, 0
 	for _, f := range files {
 		if ctx.Err() != nil {
 			out.trunc = true
@@ -545,6 +558,10 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 			continue
 		}
 		info, err := parseClaudeTranscript(f.sessionID, f.path)
+		if errors.Is(err, errClaudeTranscriptUnrecognised) {
+			unrecognised++
+			continue
+		}
 		if err != nil {
 			failed++
 			continue
@@ -553,7 +570,11 @@ func readClaudeStore(ctx context.Context, configDir string, since time.Time, max
 		out.store[f.sessionID] = info
 	}
 	out.checked = true
-	if failed > 0 && parsed == 0 {
+	switch {
+	case parsed > 0:
+	case unrecognised > 0:
+		out.skip = cliSessionSkipUnrecognised
+	case failed > 0:
 		out.skip = cliSessionSkipUnreadable
 	}
 	return out

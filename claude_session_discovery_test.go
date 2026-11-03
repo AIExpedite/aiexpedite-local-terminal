@@ -327,3 +327,60 @@ func TestDiscoverFindsAnOpenTabsOldTranscriptThroughTheStoreIndex(t *testing.T) 
 		t.Fatal("an incomplete index must fall back to the folder search")
 	}
 }
+
+func TestDiscoverDropsOrphanTabOverAnUnrecognisedTranscript(t *testing.T) {
+	configDir, vscode := t.TempDir(), t.TempDir()
+	writeTranscript(t, configDir, "-w", sidA, time.Now()) // empty file
+	writeTranscript(t, configDir, "-w", sidB, time.Now(), map[string]any{"type": "some-future-record"})
+	tabs, _ := json.Marshal(map[string]any{"panelTabSessions": []map[string]any{
+		{"sessionId": sidA, "title": "Empty"}, {"sessionId": sidB, "title": "Unknown"},
+	}})
+	writeEditorState(t, vscode, "w1", string(tabs))
+
+	res := discoverClaudeSessions(context.Background(), testDiscoveryEnv(configDir, map[string]string{cliSessionSourceVSCode: vscode}))
+	if len(res.Rows) != 0 {
+		t.Fatalf("rows = %+v, want orphan tabs over unrecognised transcripts dropped", res.Rows)
+	}
+	skipped := false
+	for _, s := range res.SourcesSkipped {
+		if s.Source == cliSessionSourceClaudeStore && s.Reason == cliSessionSkipUnrecognised {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Fatalf("sourcesSkipped = %+v, want claudeStore unrecognised", res.SourcesSkipped)
+	}
+}
+
+func TestTranscriptChunksKeepRecordsCrossingTheChunkBoundary(t *testing.T) {
+	const chunk = 64
+	dir := t.TempDir()
+	for _, size := range []int{chunk + 10, 2*chunk - 1, 2 * chunk, 2*chunk + 30, 5 * chunk} {
+		var b strings.Builder
+		i := 0
+		for b.Len() < size {
+			fmt.Fprintf(&b, "{\"n\":%d}\n", i)
+			i++
+		}
+		path := filepath.Join(dir, fmt.Sprintf("t%d.jsonl", size))
+		if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		head, tail, _, err := claudeTranscriptChunks(path, chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := append(head, tail...)
+		for _, l := range lines {
+			if json.Unmarshal([]byte(l), &map[string]any{}) != nil {
+				t.Fatalf("size %d: fragment %q returned as a line", b.Len(), l)
+			}
+		}
+		if b.Len() <= 2*chunk && (len(head) != i || len(tail) != 0) {
+			t.Fatalf("size %d: head/tail = %d/%d lines, want all %d in the head", b.Len(), len(head), len(tail), i)
+		}
+		if last := fmt.Sprintf("{\"n\":%d}", i-1); lines[len(lines)-1] != last {
+			t.Fatalf("size %d: last line %q, want %q", b.Len(), lines[len(lines)-1], last)
+		}
+	}
+}

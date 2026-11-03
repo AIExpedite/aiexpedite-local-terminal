@@ -23,6 +23,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -176,13 +177,18 @@ func probeClaudeSession(ctx context.Context, env claudeDiscoveryEnv, sessionID s
 
 	path := claudeTranscriptPath(env.configDir, sessionID)
 	var info *claudeTranscriptInfo
+	unrecognised := false
 	if path != "" {
 		if fi, err := os.Stat(path); err == nil {
 			res.TranscriptWrittenAt = fi.ModTime().UnixMilli()
 		}
-		info, _ = parseClaudeTranscript(sessionID, path)
+		var err error
+		info, err = parseClaudeTranscript(sessionID, path)
+		unrecognised = errors.Is(err, errClaudeTranscriptUnrecognised)
 	}
-	res.Exists = info != nil || len(res.Writers) > 0
+	// An unrecognised transcript still exists but is not resumable, so the
+	// adopt flow answers NOT_RESUMABLE rather than CANDIDATE_GONE.
+	res.Exists = info != nil || unrecognised || len(res.Writers) > 0
 	res.Resumable = info != nil && filepath.IsAbs(path)
 	var running []claudeRegistryEntry
 	for _, e := range entries {

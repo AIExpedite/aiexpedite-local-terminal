@@ -103,3 +103,12 @@ func TestOutsideWriterStateAndWatcherEmitsOnlyChanges(t *testing.T) {
 		t.Fatalf("emitted %v, want %v", got, want)
 	}
 }
+
+func TestProbeUnrecognisedTranscriptExistsButIsNotResumable(t *testing.T) {
+	configDir := t.TempDir()
+	writeTranscript(t, configDir, "-w", sidB, time.Now(), map[string]any{"type": "some-future-record"})
+	res := probeClaudeSession(context.Background(), testDiscoveryEnv(configDir, nil), sidB, true)
+	if !res.Exists || res.Resumable || len(res.RecentTurns) != 0 {
+		t.Fatalf("unrecognised transcript = %+v, want exists without resumable", res)
+	}
+}
