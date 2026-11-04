@@ -13,14 +13,17 @@ import (
 // seams are restored.
 func withInspectionSeams(t *testing.T, gather func() *MachineInfo, pass func(context.Context) map[string]string) {
 	t.Helper()
-	savedGather, savedPass := inspectionGather, inspectionSetupToolPass
+	savedGather, savedPass, savedGhAuth := inspectionGather, inspectionSetupToolPass, inspectionGhAuthStatus
 	inspectionGather = gather
 	inspectionSetupToolPass = pass
+	// Never spawn the real gh from a test: the machine running it may or may
+	// not be signed in, and the check calls GitHub's API.
+	inspectionGhAuthStatus = nil
 	t.Cleanup(func() {
 		if !drainMachineInfoGathers(5 * time.Second) {
 			t.Errorf("an inspection gather started by this test is still running")
 		}
-		inspectionGather, inspectionSetupToolPass = savedGather, savedPass
+		inspectionGather, inspectionSetupToolPass, inspectionGhAuthStatus = savedGather, savedPass, savedGhAuth
 	})
 }
 

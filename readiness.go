@@ -344,6 +344,9 @@ var (
 		return gatherMachineInfoBounded(inspectionCLIUsageBudget)
 	}
 	inspectionSetupToolPass = runSetupToolProbePass
+	// inspectionGhAuthStatus is the inspection's GitHub sign-in check
+	// (gh_auth_probe.go); nil skips it.
+	inspectionGhAuthStatus ghAuthStatusRunner = runGhAuthStatus
 )
 
 // envInspectLogf writes one [env-inspect] line in the agent's log style.
@@ -439,7 +442,7 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	// outlive this call (a timed-out inspection returns without waiting for
 	// them), so reading the package vars from inside them would race a test
 	// restoring the seams after the call returned.
-	gather, setupToolPass := inspectionGather, inspectionSetupToolPass
+	gather, setupToolPass, ghAuthStatus := inspectionGather, inspectionSetupToolPass, inspectionGhAuthStatus
 	done := make(chan *MachineInfo, 1)
 	release := trackMachineInfoGather()
 	go func() {
@@ -470,6 +473,14 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 	go func() {
 		toolsDone <- setupToolPass(ctx)
 	}()
+	// The GitHub sign-in check runs beside both: work readiness needs GitHub
+	// signed in, and only a fresh inspection can say so (gh_auth_probe.go).
+	// Bounded by ghAuthProbeTimeout and ctx, so it never extends the
+	// inspection past its deadline.
+	ghAuthDone := make(chan *toolAuthInfo, 1)
+	go func() {
+		ghAuthDone <- probeGhAuth(ctx, ghAuthStatus)
+	}()
 
 	var info *MachineInfo
 	select {
@@ -496,6 +507,12 @@ func GatherReadinessOnly(ctx context.Context) ReadinessReport {
 		withSetupToolResults(info, activeSetupToolCatalog(), results)
 	case <-ctx.Done():
 		// Keep the gather's merge of the previous pass.
+	}
+	select {
+	case state := <-ghAuthDone:
+		withToolAuth(info, toolAuthGitHubCLI, state)
+	case <-ctx.Done():
+		// No verdict in time: report nothing, which the server reads as unknown.
 	}
 	// Keep the shared cache fresh so the next /auth/token POST reflects
 	// what the user just saw in the readiness card.
