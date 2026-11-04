@@ -421,9 +421,13 @@ type MachineInfo struct {
 	// tab — one entry per provider with account/plan/capacity metrics. The
 	// older DetectedCliAgents map stays for backward compatibility with the
 	// About-tab chip strip (legacy clients render it directly).
-	CliAgents    []cliAgentUsage   `json:"cliAgents,omitempty"`
-	Capabilities *capabilitiesInfo `json:"capabilities,omitempty"`
-	CollectedAt  string            `json:"collectedAt,omitempty"`
+	CliAgents []cliAgentUsage `json:"cliAgents,omitempty"`
+	// ToolAuth is the sign-in state of tools that are not coding agents,
+	// keyed by setup catalog tool id. Inspection only (gh_auth_probe.go): the
+	// periodic gather never sets it, and an absent key means "unknown".
+	ToolAuth     map[string]*toolAuthInfo `json:"toolAuth,omitempty"`
+	Capabilities *capabilitiesInfo        `json:"capabilities,omitempty"`
+	CollectedAt  string                   `json:"collectedAt,omitempty"`
 	// Virtualization is Windows-only (nil elsewhere, and when neither signal
 	// could be read): whether hardware virtualization is usable and whether
 	// WSL2 is set up — Docker Desktop needs both (systemInfo_setup.go).

@@ -152,6 +152,10 @@ func TestMain(m *testing.M) {
 	// Default to an export that could not be read; the tests that exercise
 	// the fallback stub it explicitly.
 	runOpenCodeExport = func(context.Context, string, string, string) ([]byte, bool) { return nil, false }
+	// Same rule for the GitHub CLI: an inspection asks `gh auth status`, which
+	// calls GitHub's API with the developer's real token. Default to "no
+	// check"; the tests that exercise it stub it (gh_auth_probe_test.go).
+	inspectionGhAuthStatus = nil
 	// …and the direct-run reader never reads the developer's own OpenCode store
 	// or writes its machine ledger: the cases that exercise it enable it against
 	// a temporary store (openCodeDirectFixture).
@@ -914,6 +918,10 @@ func runMockCLI(mode string) {
 		// child environment a read-only session spawned it with
 		// (readonly_session_test.go).
 		runReadOnlyRecordMock()
+
+	case ghAuthMockSignedIn, ghAuthMockSignedOut, ghAuthMockInvalidToken, ghAuthMockHang:
+		// A `gh` answering `auth status` (gh_auth_probe_test.go).
+		runGhAuthStatusMock(mode)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
