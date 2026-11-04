@@ -44,11 +44,17 @@ const (
 	ghUnknownFlag = "unknown flag: --active\n\nUsage:  gh auth status [flags]\n"
 )
 
+// ghAuthStatusArgv is the command this probe is specified to run, written out
+// rather than read from ghAuthStatusArgs: the mock pins it, so dropping
+// --active (every stored account checked, one stale account fails a working
+// computer) or --hostname fails the cases below instead of passing silently.
+const ghAuthStatusArgv = "auth status --active --hostname github.com"
+
 // runGhAuthStatusMock is the mock `gh`. It answers only the exact argv and
 // environment the probe sends: anything else exits 3, which classifies as
 // unknown, so a drift in either fails the signed-in / signed-out cases below.
 func runGhAuthStatusMock(mode string) {
-	if got := strings.Join(os.Args[1:], " "); got != strings.Join(ghAuthStatusArgs, " ") {
+	if got := strings.Join(os.Args[1:], " "); got != ghAuthStatusArgv {
 		fmt.Fprintf(os.Stderr, "unexpected gh argv: %q\n", got)
 		os.Exit(3)
 	}
