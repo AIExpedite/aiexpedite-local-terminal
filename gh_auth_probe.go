@@ -94,8 +94,19 @@ type ghAuthStatusRunner func(ctx context.Context) ghAuthStatusResult
 // ghAuthLookPath resolves gh. Seam for tests.
 var ghAuthLookPath = exec.LookPath
 
+// ghAuthRefreshPath brings this process's PATH up to date before gh is
+// resolved (path_refresh.go). Seam for tests.
+var ghAuthRefreshPath = refreshCommandPath
+
 // runGhAuthStatus is the production ghAuthStatusRunner.
 func runGhAuthStatus(ctx context.Context) ghAuthStatusResult {
+	// A gh installed (and signed in) since the agent started may be on the
+	// persisted PATH only, as after a Windows install. The gather and the
+	// setup-tool pass refresh PATH too, but on their own goroutines: resolving
+	// gh before they get there would report it installed with no sign-in,
+	// leaving a computer with no stored evidence blocked until the next
+	// inspection.
+	ghAuthRefreshPath()
 	path, err := ghAuthLookPath("gh")
 	if err != nil {
 		return ghAuthStatusResult{}

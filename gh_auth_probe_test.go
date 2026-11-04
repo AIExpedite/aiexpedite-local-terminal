@@ -77,12 +77,20 @@ func runGhAuthStatusMock(mode string) {
 	}
 }
 
+// withGhResolver stubs how the probe finds gh: no real PATH refresh, and
+// lookPath decides where (or whether) gh is.
+func withGhResolver(t *testing.T, lookPath func(string) (string, error)) {
+	t.Helper()
+	savedLook, savedRefresh := ghAuthLookPath, ghAuthRefreshPath
+	ghAuthLookPath = lookPath
+	ghAuthRefreshPath = func() {}
+	t.Cleanup(func() { ghAuthLookPath, ghAuthRefreshPath = savedLook, savedRefresh })
+}
+
 // withMockGh points the probe at this test binary running as `gh` in mode.
 func withMockGh(t *testing.T, mode string) {
 	t.Helper()
-	saved := ghAuthLookPath
-	ghAuthLookPath = func(string) (string, error) { return os.Args[0], nil }
-	t.Cleanup(func() { ghAuthLookPath = saved })
+	withGhResolver(t, func(string) (string, error) { return os.Args[0], nil })
 	t.Setenv(mockCLIEnvVar, mode)
 }
 
@@ -159,11 +167,24 @@ func TestRunGhAuthStatus_HungGhIsUnknownAndBounded(t *testing.T) {
 }
 
 func TestRunGhAuthStatus_NoGhOnPathIsUnknown(t *testing.T) {
-	saved := ghAuthLookPath
-	ghAuthLookPath = func(string) (string, error) { return "", errors.New("not found") }
-	t.Cleanup(func() { ghAuthLookPath = saved })
+	withGhResolver(t, func(string) (string, error) { return "", errors.New("not found") })
 	if got := runGhAuthStatus(context.Background()); got.Completed {
 		t.Fatalf("no gh on PATH must not produce a verdict: %+v", got)
+	}
+}
+
+// A gh installed since the agent started is on the persisted PATH only; the
+// probe must refresh PATH itself rather than race the gather's refresh.
+func TestRunGhAuthStatus_RefreshesPathBeforeResolvingGh(t *testing.T) {
+	refreshed, resolvedAfterRefresh := false, false
+	withGhResolver(t, func(string) (string, error) {
+		resolvedAfterRefresh = refreshed
+		return "", errors.New("not found")
+	})
+	ghAuthRefreshPath = func() { refreshed = true } // restored by withGhResolver
+	runGhAuthStatus(context.Background())
+	if !resolvedAfterRefresh {
+		t.Fatal("gh was resolved before PATH was refreshed")
 	}
 }
 
