@@ -245,12 +245,17 @@ func TestGatherReadinessOnly_UnknownGitHubSendsNothing(t *testing.T) {
 func TestGatherReadinessOnly_GitHubCheckNeverHoldsTheInspection(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
+	// Long enough that the instant gather always lands first, even on a
+	// loaded runner (a gather that missed it would report inspection_failed
+	// and fail this test for the wrong reason); the hung check is what has to
+	// end at the deadline.
+	const deadline = 2 * time.Second
 	started := time.Now()
 	report, wire := inspectWithGhAuth(t, func(context.Context) ghAuthStatusResult {
 		<-release // answers only after the inspection is over
 		return ghAuthStatusResult{Output: ghStatusSignedIn, ExitedZero: true, Completed: true}
-	}, 300*time.Millisecond)
-	if elapsed := time.Since(started); elapsed > 5*time.Second {
+	}, deadline)
+	if elapsed := time.Since(started); elapsed > deadline+5*time.Second {
 		t.Fatalf("a hung GitHub check held the inspection for %s", elapsed)
 	}
 	if report.State != ReadinessReady {
