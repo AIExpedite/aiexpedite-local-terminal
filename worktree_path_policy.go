@@ -86,6 +86,9 @@ const (
 	rulePathPathspecMagic     = "pathspec_magic"
 	rulePathEscapesRootByLink = "escapes_root_by_link"
 	rulePathRootUnreadable    = "root_unreadable"
+	// A root INSIDE a git checkout. Refused on creation, reported on a worktree
+	// that already exists — see assertWorktreeParentOutsideRepository.
+	ruleParentInsideRepository = "parent_inside_repository"
 )
 
 // worktreePolicyError is a refusal naming the rule that failed. Every
@@ -338,6 +341,76 @@ func checkWorktreePathLinkFree(root string, segments []string) error {
 			fmt.Sprintf("%q resolves to %q, outside root %q", cur, deepest, realRoot))
 	}
 	return nil
+}
+
+// worktreeParentWalkMaxDepth bounds the walk up from a root. A FIXED bound: a
+// directory nested deeper than this is pathological, and a platform whose
+// filepath.Dir failed to converge would otherwise spin for ever.
+const worktreeParentWalkMaxDepth = 64
+
+// enclosingRepositoryOf returns the deepest directory AT OR ABOVE dir that
+// holds a `.git` entry, or "" when none does.
+//
+// `.git` as a FILE counts, because that is how git marks a LINKED worktree: a
+// root inside somebody else's worktree is inside a repository just as surely as
+// one inside its main checkout. Nothing is followed — a `.git` that is itself a
+// symlink or a junction is still a repository marker, and lstat reads it
+// without walking through it.
+//
+// A BARE repository has no `.git` and is deliberately not detected. It has no
+// working tree, so nobody sets a working directory inside one, and a second
+// heuristic (HEAD + objects + refs) would start refusing directories that
+// merely resemble one.
+func enclosingRepositoryOf(dir string) string {
+	cur := strings.TrimSpace(dir)
+	if cur == "" {
+		return ""
+	}
+	cur = filepath.Clean(cur)
+	for i := 0; i < worktreeParentWalkMaxDepth; i++ {
+		if _, err := os.Lstat(filepath.Join(cur, ".git")); err == nil {
+			return cur
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		cur = parent
+	}
+	return ""
+}
+
+// assertWorktreeParentOutsideRepository refuses a root that sits inside a git
+// checkout (WORKTREE_CONFIG_AND_PORTABILITY.md §7 invariant 2).
+//
+// WHY THIS IS A RULE AND NOT A PREFERENCE. Worktrees live at
+// `<root>/aixwt/<feature>/<repo>`, so a root inside a repository puts every
+// worktree we make inside that repository's WORKING TREE. Three things then go
+// wrong at once, and all three happen to somebody else's data:
+//
+//  1. `git clean -fdx` in the enclosing checkout deletes every worktree we
+//     made — and that command is in a great many repositories' own scripts;
+//  2. the enclosing repository's `git status` fills with our directories, so
+//     the owner's tooling reads our scaffolding as their uncommitted work;
+//  3. a worktree of the same repository nested inside its own checkout is a
+//     shape git itself does not expect, and the link-safe delete walk would be
+//     recursing through a tree that holds a live `.git`.
+//
+// Our own layout never meets this case: the Default working directory sits
+// ABOVE the root checkouts. A developer with ONE repository meets it
+// immediately, by pointing the Default working directory at that repository —
+// which is the obvious thing to do and is exactly who this rule is for.
+//
+// The remedy is in the message, because the owner is the only one who can
+// apply it: the setting is theirs.
+func assertWorktreeParentOutsideRepository(root string) error {
+	repo := enclosingRepositoryOf(root)
+	if repo == "" {
+		return nil
+	}
+	return policyRefusal(ruleParentInsideRepository, fmt.Sprintf(
+		"the worktree root %q is inside the git checkout at %q, so worktrees would be created inside that repository's working tree — where `git clean -fdx` deletes them and `git status` reports them as its own. Point the Default working directory at a folder ABOVE your checkouts.",
+		root, repo))
 }
 
 // isWorktreeLink reports whether an lstat'd path is a symlink or, on Windows, a
