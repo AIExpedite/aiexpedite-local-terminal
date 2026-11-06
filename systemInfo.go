@@ -137,6 +137,13 @@ type capabilitiesInfo struct {
 	// relay must not start Claude at all: an older agent would add the
 	// auto-approve flag regardless.
 	RelayPermissionPrompts bool `json:"relayPermissionPrompts"`
+	// RelayCwdFence (shared-constants DEVICE_RELAY_CAPABILITIES.CWD_FENCE):
+	// the agent enforces a SIGNED `cwdFence` on a session_start admitted through
+	// an ancestor grant, refusing with CWD_OUTSIDE_GRANT_FOLDER if the resolved
+	// directory escapes that fence (relay_cwd_fence.go). terminal-service sends
+	// a start admitted through an ancestor only when this is true; older agents
+	// refuse with DEVICE_UPDATE_REQUIRED.
+	RelayCwdFence bool `json:"relayCwdFence"`
 	// ReadOnlySessions (shared-constants DEVICE_SESSION_CAPABILITIES.READ_ONLY):
 	// the agent verifies a SIGNED `readOnly` on a session_start and starts the
 	// bare `claude` / `codex` in its enforced read-only mode, or refuses with
@@ -331,6 +338,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayFollowUps:         newRelayFollowUpsCapability(),
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
+		RelayCwdFence:          true,
 		ReadOnlySessions:       true,
 		CliSessionDiscovery: &cliSessionDiscoveryCapability{
 			Engines:  []string{cliSessionEngineClaudeCode},
