@@ -70,7 +70,7 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	full := append([]string{"-C", dir}, args...)
+	full := append(append([]string{"-C", dir}, wtNoHooksArgs()...), args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
 	hideWindow(cmd)
 	// The headless overlay is appended last so it always wins: git must never
@@ -83,6 +83,48 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 		return strings.TrimSpace(stdout.String()), &wtGitError{Args: full, Stderr: stderr.String(), Err: err}
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// wtNoHooksArgs points git at an EMPTY hooks directory for the duration of one
+// invocation, so none of the worktree built-ins can trigger a hook the
+// repository checked in.
+//
+// THIS IS NOT HYGIENE, IT IS A BOUNDARY. `git worktree add` fires
+// `post-checkout`, and `core.hooksPath` is routinely set to a TRACKED directory
+// — husky sets `core.hooksPath=.husky`, which is a large share of Node
+// repositories. So preparing a worktree executed repository-authored code on
+// the owner's computer, unattended, before any coding agent existed and before
+// any install step. Verified both ways on a fixture: with the repo's
+// `core.hooksPath` the `post-checkout` hook ran; with this flag it did not, and
+// the worktree was still created normally.
+//
+// Applied to EVERY worktree git call rather than to `worktree add` alone,
+// because the same reasoning covers the rest: a rescue `push` must not run a
+// repository's `pre-push` suite from an hourly timer, and nothing else the
+// built-ins run wants a hook either. The coding agent's own git commands take a
+// different path and DO run hooks — that is the developer's intent, and a run a
+// person asked for is in the loop.
+//
+// The directory is created once, next to the agent's other state, and is made
+// ABSOLUTE before it is handed over. That is not decoration: git resolves a
+// relative `core.hooksPath` against the directory the hooks run in, i.e. the
+// repository — and `resolveBaseDir` returns `"./"` when neither HOME nor
+// XDG_CONFIG_HOME is set, which a service manager can easily produce. The
+// override would then read `nohooks`, and a repository carrying a tracked
+// `nohooks/post-checkout` would have its hook executed by the very flag meant
+// to prevent it. (Codex P2, PR #262, reproduced.)
+//
+// On any failure the args are EMPTY rather than wrong: no suppression is
+// visible and fixable, a relative override is neither.
+func wtNoHooksArgs() []string {
+	dir, err := filepath.Abs(filepath.Join(GetConfigDir(), "nohooks"))
+	if err != nil {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil
+	}
+	return []string{"-c", "core.hooksPath=" + dir}
 }
 
 // wtGit is wtRunGitIn with the ordinary local timeout.
