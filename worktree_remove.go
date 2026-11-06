@@ -100,6 +100,9 @@ type worktreeRemoveResult struct {
 	// ChangesDiscarded is true when DiscardChanges removed a tree that held
 	// uncommitted or unpushed work.
 	ChangesDiscarded bool `json:"changesDiscarded,omitempty"`
+	// FeatureDirRemoved is whether the FEATURE directory above this worktree
+	// was empty afterwards and went too. Additive: no caller has to read it.
+	FeatureDirRemoved bool `json:"featureDirRemoved,omitempty"`
 }
 
 func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRemoveResult, error) {
@@ -246,7 +249,45 @@ func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRem
 	res.ChecksPassed = append(res.ChecksPassed, "one_admin_record_removed")
 	// Drop the dependency markers whose directories have just gone.
 	_ = removeMarkersUnder(wt.Abs)
+	// Step 3: the FEATURE directory, if this was the last thing in it.
+	//
+	// Nothing used to remove it. The delete above takes
+	// `<root>/aixwt/<feature>/<repo>` and left `<feature>` standing, so even a
+	// PERFECT retirement grew `aixwt/` by one dead directory — per retired
+	// feature, per computer, for ever.
+	//
+	// The emptiness proof is the removal itself: `removeOne` maps to
+	// RemoveDirectory, which refuses a directory that still has entries, so a
+	// sibling repository's worktree in the same feature folder — or anything a
+	// person left there — keeps it. The directory is read first so the common
+	// "not empty" case is a quiet false rather than an error.
+	res.FeatureDirRemoved = pruneEmptyFeatureDir(wt)
+	if res.FeatureDirRemoved {
+		res.ChecksPassed = append(res.ChecksPassed, "feature_dir_removed")
+	}
 	return res, nil
+}
+
+// pruneEmptyFeatureDir removes `<root>/aixwt/<featureFolder>` when this
+// worktree was the last thing inside it. Best effort, and deliberately narrow:
+//
+//   - only that exact path, recomputed from the RESOLVED worktree rather than
+//     taken from `filepath.Dir`, so nothing above it can ever be named. The
+//     `aixwt` root itself is shared and is never touched;
+//   - only when it is already empty. `removeOne` is non-recursive, so there is
+//     no walk here that could follow anything;
+//   - the whole path chain was proved link-free by the policy
+//     (`checkWorktreePathLinkFree`) before the removal ran.
+func pruneEmptyFeatureDir(wt resolvedWorktreePath) bool {
+	dir := filepath.Join(wt.Root, worktreeRootSegment, wt.FeatureFolder)
+	if dir != filepath.Dir(wt.Abs) {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) > 0 {
+		return false
+	}
+	return removeOne(dir) == nil
 }
 
 // findAdminDirForPath locates the one admin directory under
