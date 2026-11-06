@@ -36,8 +36,11 @@ func refuseCwdOutsideFence(ctx context.Context, topic *pubsub.Publisher, m *pubs
 		agentID = cfg.AgentID
 	}
 
-	if cmd.Cwd == "" {
-		msg := fmt.Sprintf("working directory is empty; must be inside granted folder %q", cmd.CwdFence)
+	if cmd.Cwd == "" || !filepath.IsAbs(cmd.Cwd) || !filepath.IsAbs(cmd.CwdFence) {
+		msg := fmt.Sprintf("working directory and fence must be absolute paths; got cwd %q, fence %q", cmd.Cwd, cmd.CwdFence)
+		if cmd.Cwd == "" {
+			msg = fmt.Sprintf("working directory is empty; must be inside granted folder %q", cmd.CwdFence)
+		}
 		fmt.Printf("%s[fence] Refused %s: %s%s\n", colorYellow, cmd.Type, msg, colorReset)
 		res := makeRejectionResult(cmd, agentID, "denied", cwdOutsideGrantFolderRejectionCode, msg)
 		err := publishMsg(ctx, topic, res)

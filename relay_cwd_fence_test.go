@@ -258,7 +258,22 @@ func TestRefuseCwdOutsideFence(t *testing.T) {
 		t.Errorf("unexpected denial payload: %+v", msgs[4])
 	}
 
-	// 10. Symlinks (if supported on this environment)
+	// 10. Relative cwd denied
+	cmd = cmdBase
+	cmd.CwdFence = fenceDir
+	cmd.Cwd = "relative/sub"
+	if !refuseCwdOutsideFence(context.Background(), nil, nil, cmd, cfg) {
+		t.Errorf("relative cwd should be refused")
+	}
+	msgs = publishes()
+	if len(msgs) != 6 {
+		t.Fatalf("expected 6 publishes total, got %d", len(msgs))
+	}
+	if msgs[5].Status != "denied" || msgs[5].RejectionReason != cwdOutsideGrantFolderRejectionCode {
+		t.Errorf("unexpected denial payload: %+v", msgs[5])
+	}
+
+	// 11. Symlinks (if supported on this environment)
 	linkInside := filepath.Join(fenceDir, "linkInside")
 	if err := os.Symlink(subDir, linkInside); err == nil {
 		cmd = cmdBase
