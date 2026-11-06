@@ -897,6 +897,12 @@ type signaturePayload struct {
 	// older agent would compute a canonical without it and reject the command.
 	AckedTurnIds    []string        `json:"ackedTurnIds,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
+	// CwdFence is the signed folder boundary for a start admitted through an
+	// ancestor grant (relay_cwd_fence.go). If the command's real directory
+	// escapes that boundary (e.g. symlink escape), the agent refuses the command
+	// with CWD_OUTSIDE_GRANT_FOLDER. Node's signCommand appends `canonical.cwdFence`
+	// immediately before `readOnly`.
+	CwdFence string `json:"cwdFence,omitempty"`
 	// readOnly asks for an ENFORCED read-only session (readonly_session.go).
 	// Signed so it can be neither stripped (a read-only review would run
 	// writable) nor injected. Node's signCommand appends `canonical.readOnly =
@@ -954,6 +960,7 @@ func signatureCanonical(cmd commandMsg) ([]byte, error) {
 		ConversationID:  cmd.ConversationID,
 		AckedTurnIds:    cmd.AckedTurnIds,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
+		CwdFence:        cmd.CwdFence,
 		ReadOnly:        cmd.ReadOnly,
 	}
 
@@ -1151,6 +1158,12 @@ type commandMsg struct {
 	// onto pipes regardless, and Windows rejects tty outright. See
 	// EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
 	Tty bool `json:"tty,omitempty"`
+
+	// CwdFence is the signed folder boundary for a start admitted through an
+	// ancestor grant (relay_cwd_fence.go). If the command's real directory
+	// escapes that boundary (e.g. symlink escape), the agent refuses the command
+	// with CWD_OUTSIDE_GRANT_FOLDER. SIGNED (see signaturePayload.CwdFence).
+	CwdFence string `json:"cwdFence,omitempty"`
 
 	// ReadOnly asks for an ENFORCED read-only coding-agent session
 	// (readonly_session.go): only a generic session_start of the bare `claude`
@@ -2490,6 +2503,9 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			if refuseFencedSessionCommand(ctx, topic, m, cmd, cfg) {
+				return
+			}
+			if refuseCwdOutsideFence(ctx, topic, m, cmd, cfg) {
 				return
 			}
 			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
