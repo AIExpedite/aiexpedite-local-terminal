@@ -70,7 +70,7 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	full := append([]string{"-C", dir}, args...)
+	full := append(append([]string{"-C", dir}, wtNoHooksArgs()...), args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
 	hideWindow(cmd)
 	// The headless overlay is appended last so it always wins: git must never
@@ -83,6 +83,39 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 		return strings.TrimSpace(stdout.String()), &wtGitError{Args: full, Stderr: stderr.String(), Err: err}
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// wtNoHooksArgs points git at an EMPTY hooks directory for the duration of one
+// invocation, so none of the worktree built-ins can trigger a hook the
+// repository checked in.
+//
+// THIS IS NOT HYGIENE, IT IS A BOUNDARY. `git worktree add` fires
+// `post-checkout`, and `core.hooksPath` is routinely set to a TRACKED directory
+// — husky sets `core.hooksPath=.husky`, which is a large share of Node
+// repositories. So preparing a worktree executed repository-authored code on
+// the owner's computer, unattended, before any coding agent existed and before
+// any install step. Verified both ways on a fixture: with the repo's
+// `core.hooksPath` the `post-checkout` hook ran; with this flag it did not, and
+// the worktree was still created normally.
+//
+// Applied to EVERY worktree git call rather than to `worktree add` alone,
+// because the same reasoning covers the rest: a rescue `push` must not run a
+// repository's `pre-push` suite from an hourly timer, and nothing else the
+// built-ins run wants a hook either. The coding agent's own git commands take a
+// different path and DO run hooks — that is the developer's intent, and a run a
+// person asked for is in the loop.
+//
+// The directory is created once, next to the agent's other state, and is
+// absolute: a relative `core.hooksPath` resolves against the repository. On a
+// failure to create it the args are empty rather than wrong, and the caller
+// still gets a working git — a missing hooks path would also find no hooks, but
+// pointing at a directory we know exists keeps the behaviour explicit.
+func wtNoHooksArgs() []string {
+	dir := filepath.Join(GetConfigDir(), "nohooks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil
+	}
+	return []string{"-c", "core.hooksPath=" + dir}
 }
 
 // wtGit is wtRunGitIn with the ordinary local timeout.
