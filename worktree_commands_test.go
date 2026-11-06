@@ -743,6 +743,67 @@ func TestRemoveWorktreeDeletesLinkSafely(t *testing.T) {
 	}
 }
 
+// NOTHING USED TO REMOVE THE FEATURE DIRECTORY. The delete takes
+// `<root>/aixwt/<feature>/<repo>` and left `<feature>` standing, so even a
+// perfect retirement grew `aixwt/` by one dead directory per retired feature
+// per computer, for ever.
+func TestRemoveWorktreeRemovesTheEmptiedFeatureDirectory(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	if _, err := ensureWorktree(ctx, fx.ensureReq("feature/prune-me")); err != nil {
+		t.Fatal(err)
+	}
+	featureDir := filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder)
+	if _, err := os.Stat(featureDir); err != nil {
+		t.Fatalf("the fixture never made the feature directory: %v", err)
+	}
+
+	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("demo")))
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.Removed || !res.FeatureDirRemoved {
+		t.Fatalf("res = %+v", res)
+	}
+	if _, serr := os.Stat(featureDir); !os.IsNotExist(serr) {
+		t.Fatalf("the emptied feature directory survived: %v", serr)
+	}
+	// The aixwt root is SHARED and is never the thing being pruned.
+	if _, serr := os.Stat(filepath.Join(fx.Root, "aixwt")); serr != nil {
+		t.Fatalf("the shared aixwt root was removed: %v", serr)
+	}
+}
+
+// The emptiness proof is the removal itself, so a sibling repository's
+// worktree — or anything a person left in the feature folder — keeps it.
+func TestRemoveWorktreeKeepsAFeatureDirectoryThatStillHasSomething(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	if _, err := ensureWorktree(ctx, fx.ensureReq("feature/keep-the-folder")); err != nil {
+		t.Fatal(err)
+	}
+	featureDir := filepath.Join(fx.Root, "aixwt", wtTestFeatureFolder)
+	sibling := filepath.Join(featureDir, "other-repo-0a1b2c")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtWrite(t, filepath.Join(sibling, "README.md"), "a sibling worktree\n")
+
+	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("demo")))
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.Removed {
+		t.Fatalf("res = %+v", res)
+	}
+	if res.FeatureDirRemoved {
+		t.Fatal("reported removing a feature directory that still had a sibling in it")
+	}
+	if _, serr := os.Stat(filepath.Join(sibling, "README.md")); serr != nil {
+		t.Fatalf("the sibling worktree was removed with the feature directory: %v", serr)
+	}
+}
+
 // ─── __worktree_evict_deps__ ────────────────────────────────────────────────
 
 func (fx wtFixture) evictReq(dirs ...string) worktreeEvictDepsRequest {
