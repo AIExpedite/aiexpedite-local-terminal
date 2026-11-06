@@ -515,6 +515,49 @@ func TestEnsureWorktreeDoesNotRunRepositoryHooks(t *testing.T) {
 	}
 }
 
+// A RELATIVE config directory must not turn the suppression into the hook.
+//
+// `resolveBaseDir` returns "./" when neither HOME nor XDG_CONFIG_HOME is set,
+// which a service manager can produce. git resolves a relative
+// `core.hooksPath` against the directory the hooks run in — the repository —
+// so the override would have read `nohooks`, and a repository carrying a
+// tracked `nohooks/post-checkout` would have had that hook executed BY the
+// flag meant to prevent it. (Codex P2, PR #262.)
+func TestEnsureWorktreeHooksPathIsAbsoluteEvenWithARelativeConfigDir(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	sentinel := filepath.Join(fx.Base, "RELATIVE_HOOK_RAN.txt")
+
+	// The repository carries a hooks directory with the SAME NAME the
+	// suppression uses, and points at it.
+	hooks := filepath.Join(fx.MainRepo, "nohooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh" + "\n" + "echo ran > " + strconvQuote(filepath.ToSlash(sentinel)) + "\n"
+	if err := os.WriteFile(filepath.Join(hooks, "post-checkout"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtMustGit(t, fx.MainRepo, "add", "-A")
+	wtMustGit(t, fx.MainRepo, "commit", "-m", "add a nohooks directory of its own")
+	wtMustGit(t, fx.MainRepo, "config", "core.hooksPath", "nohooks")
+
+	// The fallback: a RELATIVE config directory.
+	prev := baseDir
+	baseDir = "./"
+	t.Cleanup(func() { baseDir = prev })
+
+	res, err := ensureWorktree(context.Background(), fx.ensureReq("feature/relative-config-dir"))
+	if err != nil {
+		t.Fatalf("ensureWorktree: %v", err)
+	}
+	if !res.Created {
+		t.Fatalf("res = %+v, want a created worktree", res)
+	}
+	if _, serr := os.Stat(sentinel); serr == nil {
+		t.Fatal("a relative core.hooksPath resolved into the repository and ran its hook")
+	}
+}
+
 // strconvQuote is strconv.Quote without widening this file's imports for one
 // call; the sentinel path can contain spaces on Windows.
 func strconvQuote(s string) string { return "\"" + s + "\"" }

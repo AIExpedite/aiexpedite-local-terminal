@@ -105,13 +105,22 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 // different path and DO run hooks — that is the developer's intent, and a run a
 // person asked for is in the loop.
 //
-// The directory is created once, next to the agent's other state, and is
-// absolute: a relative `core.hooksPath` resolves against the repository. On a
-// failure to create it the args are empty rather than wrong, and the caller
-// still gets a working git — a missing hooks path would also find no hooks, but
-// pointing at a directory we know exists keeps the behaviour explicit.
+// The directory is created once, next to the agent's other state, and is made
+// ABSOLUTE before it is handed over. That is not decoration: git resolves a
+// relative `core.hooksPath` against the directory the hooks run in, i.e. the
+// repository — and `resolveBaseDir` returns `"./"` when neither HOME nor
+// XDG_CONFIG_HOME is set, which a service manager can easily produce. The
+// override would then read `nohooks`, and a repository carrying a tracked
+// `nohooks/post-checkout` would have its hook executed by the very flag meant
+// to prevent it. (Codex P2, PR #262, reproduced.)
+//
+// On any failure the args are EMPTY rather than wrong: no suppression is
+// visible and fixable, a relative override is neither.
 func wtNoHooksArgs() []string {
-	dir := filepath.Join(GetConfigDir(), "nohooks")
+	dir, err := filepath.Abs(filepath.Join(GetConfigDir(), "nohooks"))
+	if err != nil {
+		return nil
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil
 	}
