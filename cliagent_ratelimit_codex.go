@@ -422,6 +422,52 @@ func codexClearRunFreshnessDebt(snap *codexRateLimitSnapshot) {
 // hook running in a different process, same as Claude's).
 var codexRateLimitMu sync.Mutex
 
+// codexRateLimitFileMu guards the cache file itself: readers share it, and a
+// writer holds it only across one rename, never while waiting on another
+// process or across the rename backoff. It is not optional on Windows: Go
+// opens files without FILE_SHARE_DELETE, so a rename over a cache another
+// goroutine has open for reading fails — an unguarded card read would refuse
+// this process's own commit.
+//
+// Lock order is codexRateLimitMu, then the cross-process advisory lock, then
+// this file lock. Readers take only the file lock, so the order cannot cycle.
+// A reader waits only for the rename in progress, never for the backoff.
+var codexRateLimitFileMu sync.RWMutex
+
+// codexRateLimitRename is os.Rename. A test refuses it to exercise the retry
+// and the commit-refused log; replacing codexCommitRateLimitSnapshot skips both.
+var codexRateLimitRename = os.Rename
+
+// codexRateLimitCommitAttempts bounds the rename retries of one commit. A
+// rename can still collide with ANOTHER process reading the cache (Windows;
+// see codexRateLimitFileMu). A read lasts microseconds, so a few short retries
+// clear it. The file lock is released during the backoff, so readers never
+// wait on it.
+const (
+	codexRateLimitCommitAttempts = 3
+	codexRateLimitCommitBackoff  = 15 * time.Millisecond
+)
+
+// codexRateLimitCommitSleep is time.Sleep by default, injectable by tests.
+var codexRateLimitCommitSleep = time.Sleep
+
+var (
+	codexCommitRefusedMu       sync.Mutex
+	codexCommitRefusedLastLog  time.Time
+	codexCommitRefusedInterval = 5 * time.Second
+)
+
+func codexLogCommitRefused() {
+	codexCommitRefusedMu.Lock()
+	defer codexCommitRefusedMu.Unlock()
+	now := time.Now()
+	if !codexCommitRefusedLastLog.IsZero() && now.Sub(codexCommitRefusedLastLog) < codexCommitRefusedInterval {
+		return
+	}
+	codexCommitRefusedLastLog = now
+	fmt.Printf("%s[cli-usage] codex cache commit refused%s\n", colorYellow, colorReset)
+}
+
 // codexRateLimitCacheLockWait bounds how long a WAITING Codex cache writer
 // blocks on each of the two locks the transaction takes — the in-process gate
 // and the cross-process advisory file lock — and codexRateLimitCacheLockPoll is
@@ -1930,6 +1976,9 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 		Buckets:      map[string]codexRateLimitBucket{},
 		Contributors: map[string]map[string]codexRateLimitBucket{},
 	}
+	// No file lock: only the holder of codexRateLimitMu renames this file, and
+	// this transaction already holds that mutex. Readers take the file lock
+	// themselves so they cannot sit across the rename.
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
 		if snap.Buckets == nil {
@@ -1964,17 +2013,30 @@ func codexRateLimitCacheTransaction(ctx context.Context, path string, now time.T
 }
 
 // codexCommitRateLimitSnapshot writes the serialized snapshot atomically: a
-// temp file beside the cache, then a rename over it.
+// temp file beside the cache, then a rename over it. The rename is retried a
+// bounded number of times because another process can still hold the file
+// open during an update hand-off. The error text is never logged: on Windows
+// it contains the full cache path, which includes the OS user name.
 var codexCommitRateLimitSnapshot = func(path string, out []byte, now time.Time) bool {
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return false
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
+	for attempt := 1; attempt <= codexRateLimitCommitAttempts; attempt++ {
+		codexRateLimitFileMu.Lock()
+		err := codexRateLimitRename(tmp, path)
+		codexRateLimitFileMu.Unlock()
+		if err == nil {
+			return true
+		}
+		if attempt == codexRateLimitCommitAttempts {
+			break
+		}
+		codexRateLimitCommitSleep(codexRateLimitCommitBackoff)
 	}
-	return true
+	_ = os.Remove(tmp)
+	codexLogCommitRefused()
+	return false
 }
 
 // codexScopeSnapshotToAccount discards everything a snapshot holds for another
@@ -2264,8 +2326,13 @@ func reflagPersistedCodexBucket(b codexRateLimitBucket) codexRateLimitBucket {
 
 // loadCodexRateLimitSnapshot reads the cache. Returns (zero, false) when the
 // file is absent or unreadable — the normal "no telemetry observed yet" state.
+// The read lock is held only across the read, and this never takes
+// codexRateLimitMu: a writer can hold that mutex while it waits on another
+// process, and a card read must not queue behind that wait.
 func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
+	codexRateLimitFileMu.RLock()
 	b, err := os.ReadFile(path)
+	codexRateLimitFileMu.RUnlock()
 	if err != nil {
 		return codexRateLimitSnapshot{}, false
 	}

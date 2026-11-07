@@ -640,6 +640,27 @@ func (g *codexUsageRefreshGate) armedLocally(floorMs int64) bool {
 	return len(g.armed[floorMs]) > 0
 }
 
+// armedOnlyByOthers reports whether floorMs is bound and every binding belongs
+// to an account other than fp. A floor with no binding is not "only others":
+// it may predate this process or have been evicted, and a rollback keeps it.
+func (g *codexUsageRefreshGate) armedOnlyByOthers(floorMs int64, fp string) bool {
+	if floorMs <= 0 {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	fps := g.armed[floorMs]
+	if len(fps) == 0 {
+		return false
+	}
+	for _, bound := range fps {
+		if bound == fp {
+			return false
+		}
+	}
+	return true
+}
+
 func (g *codexUsageRefreshGate) takeArmedAccount(floorMs int64) (string, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -669,6 +690,38 @@ func (g *codexUsageRefreshGate) markDisarmed(fp string, floorMs int64) {
 		g.disarmed[fp] = floors
 	}
 	floors[floorMs]++
+	for total := g.disarmedCountLocked(); total > codexArmedAccountCap; total-- {
+		oldestMs := int64(0)
+		oldestFp := ""
+		for acc, fls := range g.disarmed {
+			for ms := range fls {
+				if oldestMs == 0 || ms < oldestMs {
+					oldestMs = ms
+					oldestFp = acc
+				}
+			}
+		}
+		if oldestFp != "" && oldestMs != 0 {
+			fls := g.disarmed[oldestFp]
+			fls[oldestMs]--
+			if fls[oldestMs] <= 0 {
+				delete(fls, oldestMs)
+			}
+			if len(fls) == 0 {
+				delete(g.disarmed, oldestFp)
+			}
+		}
+	}
+}
+
+func (g *codexUsageRefreshGate) disarmedCountLocked() int {
+	total := 0
+	for _, floors := range g.disarmed {
+		for _, count := range floors {
+			total += count
+		}
+	}
+	return total
 }
 
 // takeDisarmed consumes ONE withdrawal recorded at (fp, floorMs); it reports
@@ -1457,6 +1510,28 @@ func codexOweFallbackWhileWorkerRuns(snap *codexRateLimitSnapshot, fp string) {
 
 /* ─────────────────────────── lifecycle hooks ─────────────────────────── */
 
+// codexRunFloorWriteConservingWithdrawal executes a floor write where a
+// withdrawal mark may be consumed by `mutate`. If the transaction mutation
+// consumes the withdrawal mark but the commit does not finish, the mark is
+// restored so the retry still sees it.
+func codexRunFloorWriteConservingWithdrawal(fp string, floorMs int64, now time.Time, mutate func(snap *codexRateLimitSnapshot, take func() bool)) bool {
+	var consumed bool
+	finished := codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+		take := func() bool {
+			if codexUsageRefresh.takeDisarmed(fp, floorMs) {
+				consumed = true
+				return true
+			}
+			return false
+		}
+		mutate(snap, take)
+	})
+	if consumed && !finished {
+		codexUsageRefresh.markDisarmed(fp, floorMs)
+	}
+	return finished
+}
+
 // armCodexUsageRunFloor records that a Codex run started at startedAt. The
 // write takes the cache's blocking cross-process lock, so it runs off the
 // caller's goroutine — both managers call this while holding their own mutex.
@@ -1480,10 +1555,10 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 		// run that has already settled.
 		codexRetryBoundedWrite(func() bool {
 			now := codexUsageFreshnessNow()
-			return codexRecordRunFloorWrite(fp, now, func(snap *codexRateLimitSnapshot) {
+			return codexRunFloorWriteConservingWithdrawal(fp, startedAt.UnixMilli(), now, func(snap *codexRateLimitSnapshot, take func() bool) {
 				// Withdrawn (codexUsageRunDisarmed) before this write landed: the
 				// run never happened, so its floor must not reach disk at all.
-				if codexUsageRefresh.takeDisarmed(fp, startedAt.UnixMilli()) {
+				if take() {
 					return
 				}
 				// A run start is the one moment that proves the clock a floor
@@ -1503,6 +1578,15 @@ func armCodexUsageRunFloor(startedAt time.Time) {
 // pay, which ages into a false stale-utilization warning. The withdrawal is
 // marked in the gate BEFORE the rollback so a late arm write is dropped, and
 // a rollback the bounded cache locks refuse is retried like the arm itself.
+//
+// A write counts as finished only when it committed or was abandoned. A commit
+// that fails after the mutation ran is not finished: the mark that attempt
+// consumed is put back, and the retry sees it. "" is the unscoped account, not
+// an unknown one — the live account is used only when this process never armed
+// the floor, the same rule codexRefreshAfterRun follows with armedKnown. A
+// fallback bound only to another account is dropped, so the rollback cannot
+// adopt a run it did not make; a floor with no binding is kept, because it may
+// predate this process or have been evicted.
 func disarmCodexUsageRunFloor(floor, fallback time.Time) {
 	if !codexUsageRefresh.isEnabled() || floor.IsZero() {
 		return
@@ -1512,24 +1596,22 @@ func disarmCodexUsageRunFloor(floor, fallback time.Time) {
 	if !fallback.IsZero() {
 		fallbackMs = fallback.UnixMilli()
 	}
-	fp, _ := codexUsageRefresh.takeArmedAccount(floorMs)
-	if fp == "" {
+	fp, known := codexUsageRefresh.takeArmedAccount(floorMs)
+	if !known {
 		fp = codexAccountFingerprintAtBase(codexHomeBase())
+	}
+	if codexUsageRefresh.armedOnlyByOthers(fallbackMs, fp) {
+		fallbackMs = 0
 	}
 	codexUsageRefresh.spawn(func() {
 		codexUsageRefresh.markDisarmed(fp, floorMs)
 		codexRetryBoundedWrite(func() bool {
-			// `reached` finishes the work even when the write was abandoned rather
-			// than committed: the mutation ran, so there is nothing left to retry.
-			var reached bool
-			committed := codexRecordRunFloorWrite(fp, codexUsageFreshnessNow(), func(snap *codexRateLimitSnapshot) {
-				reached = true
+			now := codexUsageFreshnessNow()
+			return codexRunFloorWriteConservingWithdrawal(fp, floorMs, now, func(snap *codexRateLimitSnapshot, take func() bool) {
 				if codexDisarmRunFloor(snap, floorMs, fallbackMs) {
-					// The arm had landed; the mark has nothing left to stop.
-					codexUsageRefresh.takeDisarmed(fp, floorMs)
+					take()
 				}
 			})
-			return committed || reached
 		})
 	})
 }
