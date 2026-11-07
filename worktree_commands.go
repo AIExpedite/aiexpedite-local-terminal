@@ -316,6 +316,11 @@ type worktreeEnsureRequest struct {
 	Deps       []worktreeDepsSpec      `json:"deps"`
 	MarkDeps   bool                    `json:"markDeps"`
 	Companions []worktreeCompanionSpec `json:"companions"`
+	// Submodules is nil for "detect": a NEW worktree whose checkout declares
+	// `.gitmodules` gets `git submodule update --init --recursive`. An explicit
+	// false skips it, so a repository whose submodules are optional (or whose
+	// owner says so in `.aix/worktree.yml`) is not made to clone them.
+	Submodules *bool `json:"submodules"`
 }
 
 type worktreeSeedReport struct {
@@ -362,6 +367,22 @@ type worktreeCompanionResult struct {
 	FetchSkipped bool `json:"fetchSkipped,omitempty"`
 }
 
+// worktreeSubmoduleResult is what a NEW worktree's submodules did. Absent
+// entirely when the checkout declares none, so a repository without them says
+// nothing rather than reporting a zero.
+type worktreeSubmoduleResult struct {
+	// Present is whether `.gitmodules` exists in the worktree.
+	Present bool `json:"present"`
+	// Initialised is whether every declared submodule is now checked out.
+	Initialised bool `json:"initialised,omitempty"`
+	// Count is how many submodule paths git reports as populated.
+	Count int `json:"count,omitempty"`
+	// Reason names WHY this is not initialised, in the vocabulary the server
+	// records: `disabled`, `gitmodules_not_a_file`, `timed_out`, `failed`.
+	Reason string `json:"reason,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
 type worktreeEnsureResult struct {
 	Path        string   `json:"path"`
 	Rel         string   `json:"rel"`
@@ -379,6 +400,7 @@ type worktreeEnsureResult struct {
 	DepsReady   bool     `json:"depsReady"`
 
 	Deps        []worktreeDepsReport      `json:"deps,omitempty"`
+	Submodules  *worktreeSubmoduleResult  `json:"submodules,omitempty"`
 	SeededNow   []string                  `json:"seededNow,omitempty"`
 	SeedReports []worktreeSeedReport      `json:"seedReports,omitempty"`
 	Companions  []worktreeCompanionResult `json:"companions,omitempty"`
@@ -424,12 +446,27 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 	_, registered := wtFindWorktree(entries, wt.Abs)
 	res.Registered = registered
 
+	// A root inside a git checkout (WORKTREE_CONFIG_AND_PORTABILITY.md §7
+	// invariant 2). Computed ONCE and used two different ways on purpose:
+	// creation is REFUSED, while a worktree that already exists is only
+	// REPORTED.
+	//
+	// Retro-refusing an existing worktree would strand it rather than fix
+	// anything — the run would fall back to the root checkout, which is the very
+	// sharing worktrees exist to stop, and `__worktree_remove__` has to keep
+	// working so the sweep can still clean the directory up. So the rule stops
+	// the hole growing and the note tells the owner where it already is.
+	parentErr := assertWorktreeParentOutsideRepository(wt.Root)
+
 	switch {
 	case wt.Exists && !registered:
 		// Never clobber a directory git does not know about: it may be a
 		// person's folder that happens to sit at this path.
 		return res, fmt.Errorf("%s exists but git has no worktree registered there; refusing to touch it", wt.Abs)
 	case !wt.Exists:
+		if parentErr != nil {
+			return res, parentErr
+		}
 		if registered {
 			res.Notes = append(res.Notes,
 				"git had a registered worktree at this path with no directory on disk; recreating")
@@ -459,9 +496,14 @@ func ensureWorktree(ctx context.Context, req worktreeEnsureRequest) (worktreeEns
 			fmt.Sprintf("worktree is on %q, not the expected %q", state.Branch, req.Branch))
 	}
 
+	if parentErr != nil {
+		res.Notes = append(res.Notes, parentErr.Error())
+	}
+
 	// Step 4: seeding — ONCE, at creation only.
 	if res.Created {
 		res.SeededNow, res.Notes = seedAllowlistedFiles(mainRepo, wt, req.CopyUntracked, res.Notes)
+		res.Submodules = initSubmodules(ctx, wt, req.Submodules)
 	}
 	res.SeedReports = reportSeededFiles(mainRepo, wt, req.Seeded)
 
