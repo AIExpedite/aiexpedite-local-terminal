@@ -114,6 +114,89 @@ func TestCodexPostUpdate_OfflineAtSettleStillPaysByLiveReadLater(t *testing.T) {
 	}
 }
 
+// A failed turn whose rollback commit is refused once, after the credentials
+// moved, must not come back as an interrupted run when the agent is replaced.
+// The reading that was already on disk survives.
+func TestCodexPostUpdate_RefusedRollbackDoesNotSurviveRestart(t *testing.T) {
+	for _, source := range []struct {
+		name   string
+		disarm func(floor time.Time, armed string)
+	}{
+		{"direct app-server turn", func(floor time.Time, _ string) { codexUsageRunDisarmed(floor, time.Time{}) }},
+		{"smoke", func(floor time.Time, armed string) {
+			settleOrDisarmCodexSmokeRun(floor, armed, codexSmokeEvidence{})
+		}},
+	} {
+		t.Run(source.name, func(t *testing.T) {
+			now := time.Now()
+			runStart := now.Add(-time.Minute).Truncate(time.Millisecond)
+			f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+			f.seedPreRunReading(t, now.Add(-time.Hour), now)
+			reading := f.snapshot(t)
+
+			codexUsageRunStarted(runStart)
+			drainCodexRunDebtLadder(t)
+			helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+			failCommitsMatching(t, 1, func(string) bool { return true })
+			source.disarm(runStart, f.fp)
+			drainCodexRunDebtLadder(t)
+
+			simulateCodexAgentRestart(t)
+			payOwedCodexUsageRefresh()
+			drainCodexRunDebtLadder(t)
+
+			snap := f.snapshot(t)
+			if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 || snap.RefreshOwedAtMs != 0 {
+				t.Fatal("a withdrawn run left a floor or a debt across the restart")
+			}
+			primary := snap.Buckets[codexWindowPrimary]
+			before := reading.Buckets[codexWindowPrimary]
+			if snap.AccountFingerprint != reading.AccountFingerprint ||
+				primary.UsedPercentage != before.UsedPercentage || primary.ObservedAtMs != before.ObservedAtMs {
+				t.Fatal("the reading did not survive the rollback")
+			}
+			for _, fp := range []string{f.fp, currentCodexAccountFingerprint()} {
+				state := codexRunFreshnessForAccount(fp, time.Now())
+				if state.owed || state.interrupted || codexStaleRunNotice(state) != "" {
+					t.Fatal("a withdrawn run is owed, interrupted, or showing a stale notice")
+				}
+			}
+		})
+	}
+}
+
+// A terminal codex run arms only after the prompt reached the child, so it
+// settles instead of withdrawing. That settlement still advances observedAt
+// when the agent is replaced before the debt is paid.
+func TestCodexPostUpdate_ASettledTerminalRunAdvancesObservedAtAcrossRestart(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-3 * time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	f.advanceCursorPast(t, now.Add(-10*time.Second), now)
+	stubCodexFallbackRead(t, noReadingFallback)
+
+	codexUsageRunStarted(runStart)
+	codexUsageRunSettled(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RefreshOwedAtMs == 0 {
+		t.Fatal("precondition: the settled run left no debt to carry across the restart")
+	}
+	if got := codexObservedAt(t, f); !got.Before(runStart) {
+		t.Fatal("precondition: observedAt already covers the run")
+	}
+
+	writeCodexRunRollout(t, f.home, "terminal", runStart, runStart.Add(time.Minute), runStart.Add(70*time.Second), true,
+		[]map[string]any{codexRateLimitFrame(47, 52, now)})
+	simulateCodexAgentRestart(t)
+	payOwedCodexUsageRefresh()
+	drainCodexRunDebtLadder(t)
+
+	if got := codexObservedAt(t, f); got.UnixMilli() < runStart.UnixMilli() {
+		t.Fatal("observedAt did not advance to the settled terminal run")
+	}
+}
+
 // The reported case, end to end: a marker-matched GREEN smoke whose telemetry is
 // silent, then an immediate simulated self-update — no wait for the workers at
 // all — and then the rollout evidence lands. observedAt advances past the smoke's

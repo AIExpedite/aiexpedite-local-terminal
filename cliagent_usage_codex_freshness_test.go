@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -151,9 +152,18 @@ func writeCodexRunRollout(t *testing.T, base, name string, sessionStart, frameAt
 // the newest observation have all stopped moving it cancels the pending rung, so
 // no stray callback writes into the test's cache afterwards. The booked
 // NextAttemptAtMs stays on disk for a test to assert.
+//
+// Cancelling once is not enough. A worker can sit between the fallback's
+// deferred and outstanding writes when the last idle check returns, and the
+// rung it then books would fire into the next assertion. The cleanup cancels,
+// waits that worker out, and cancels again.
 func drainCodexRunDebtLadder(t *testing.T) {
 	t.Helper()
-	defer stopCodexRunDebtRetry()
+	defer func() {
+		stopCodexRunDebtRetry()
+		waitCodexUsageRefreshIdle(t)
+		stopCodexRunDebtRetry()
+	}()
 	type progress struct {
 		owedAtMs, floorMs, paidMs int64
 		attempts, reads           int
@@ -1598,7 +1608,270 @@ func TestDisarmCodexUsageRunFloor_RollsBackTheArmingAccount(t *testing.T) {
 		t.Fatalf("rollback rescoped the cache to %q, want the arming account", snap.AccountFingerprint)
 	}
 	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
-		t.Fatalf("floor %d/%d survived the rollback, want it withdrawn", snap.RunFloorMs, snap.ActiveRunFloorMs)
+		t.Fatalf("floor survived=%t active=%t, want both withdrawn", snap.RunFloorMs != 0, snap.ActiveRunFloorMs != 0)
+	}
+}
+
+func codexDisarmedCount(fp string, floorMs int64) int {
+	codexUsageRefresh.mu.Lock()
+	defer codexUsageRefresh.mu.Unlock()
+	return codexUsageRefresh.disarmed[fp][floorMs]
+}
+
+// The reported failure, made deterministic: the rollback's first commit is
+// refused after the credentials have moved, and the retry still withdraws the
+// arming account's floor.
+func TestDisarmCodexUsageRunFloor_RefusedCommitAfterAccountSwitchIsRetried(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexUsageRunStarted(runStart)
+	drainCodexRunDebtLadder(t)
+	reading := f.snapshot(t)
+
+	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	codexUsageRunDisarmed(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != reading.AccountFingerprint {
+		t.Fatal("rollback rescoped the cache off the arming account")
+	}
+	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatal("a refused rollback commit left the floor on disk")
+	}
+	if snap.Buckets[codexWindowPrimary].UsedPercentage != reading.Buckets[codexWindowPrimary].UsedPercentage ||
+		snap.Buckets[codexWindowPrimary].ObservedAtMs != reading.Buckets[codexWindowPrimary].ObservedAtMs {
+		t.Fatal("the arming account's reading did not survive the rollback")
+	}
+}
+
+// A refused commit on a dropped arm must keep the withdrawal, or the retry
+// persists a floor for a run that never happened.
+func TestArmCodexUsageRunFloor_RefusedCommitKeepsTheWithdrawal(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 1 {
+		t.Fatalf("withdrawal marks=%d, want 1", got)
+	}
+
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	armCodexUsageRunFloor(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatal("a withdrawn arm reached disk after a refused commit")
+	}
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 0 {
+		t.Fatalf("withdrawal marks=%d, want the retry to consume the one it kept", got)
+	}
+}
+
+// A refused commit on a normal arm adds no mark, so the retry lands the floor.
+func TestArmCodexUsageRunFloor_RefusedCommitAddsNoWithdrawal(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	armCodexUsageRunFloor(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatal("a refused commit on a normal arm did not land on retry")
+	}
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 0 {
+		t.Fatalf("withdrawal marks=%d, want none", got)
+	}
+}
+
+// A rollback that found no floor must not spend or add a mark when its commit
+// is refused: the late arm still has to be dropped.
+func TestDisarmCodexUsageRunFloor_RefusedCommitOnAMissingFloorKeepsTheMark(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 1 {
+		t.Fatalf("withdrawal marks=%d, want the one placed before the write", got)
+	}
+}
+
+// Two withdrawals at one millisecond-truncated floor stay exact when one of
+// the arm commits is refused. A spent mark would let one arm reach disk.
+func TestDisarmCodexUsageRunFloor_SharedFloorStaysExactWhenACommitIsRefused(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	disarmCodexUsageRunFloor(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 2 {
+		t.Fatalf("withdrawal marks=%d, want 2", got)
+	}
+
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	armCodexUsageRunFloor(runStart)
+	armCodexUsageRunFloor(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatal("a withdrawn arm reached disk")
+	}
+	if got := codexDisarmedCount(f.fp, runStart.UnixMilli()); got != 0 {
+		t.Fatalf("withdrawal marks=%d, want 0", got)
+	}
+
+	armCodexUsageRunFloor(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != runStart.UnixMilli() {
+		t.Fatal("an arm with no withdrawal left did not land")
+	}
+}
+
+// "" is the unscoped account. A rollback armed under it must not rescope the
+// snapshot onto whoever is signed in when the turn write fails.
+func TestDisarmCodexUsageRunFloor_UnscopedAccountDoesNotRescope(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	if err := os.Remove(filepath.Join(f.home, "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	if currentCodexAccountFingerprint() != "" {
+		t.Fatal("precondition: removing auth left a scoped account")
+	}
+
+	codexUsageRunStarted(runStart)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.AccountFingerprint != "" || snap.RunFloorMs == 0 {
+		t.Fatal("the unscoped arm did not land on an unscoped snapshot")
+	}
+
+	helperCodexAuthAt(t, f.home, "later@example.com", now)
+	if currentCodexAccountFingerprint() == "" {
+		t.Fatal("precondition: sign-in did not scope the account")
+	}
+	codexUsageRunDisarmed(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != "" {
+		t.Fatal("rollback rescoped the unscoped snapshot to the live account")
+	}
+	if snap.RunFloorMs != 0 || snap.ActiveRunFloorMs != 0 {
+		t.Fatal("the unscoped floor survived the rollback")
+	}
+}
+
+// A fallback bound only to another account is that account's open run. The
+// rollback drops it. A fallback bound to the arming account, or to nobody, is
+// kept.
+func TestDisarmCodexUsageRunFloor_DoesNotAdoptAnotherAccountsOpenRun(t *testing.T) {
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	run := now.Add(-time.Minute).Truncate(time.Millisecond)
+	other := run.Add(-30 * time.Second)
+	own := run.Add(-20 * time.Second)
+	unbound := run.Add(-10 * time.Second)
+
+	codexUsageRunStarted(run)
+	drainCodexRunDebtLadder(t)
+	codexUsageRefresh.rememberArmedAccount(other.UnixMilli(), "other-account")
+	codexUsageRunDisarmed(run, other)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 {
+		t.Fatal("rollback adopted a floor bound only to another account")
+	}
+
+	codexUsageRunStarted(run)
+	drainCodexRunDebtLadder(t)
+	codexUsageRefresh.rememberArmedAccount(own.UnixMilli(), f.fp)
+	codexUsageRunDisarmed(run, own)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != own.UnixMilli() {
+		t.Fatal("rollback dropped a fallback bound to the arming account")
+	}
+
+	newer := now.Add(-5 * time.Second).Truncate(time.Millisecond)
+	codexUsageRunStarted(newer)
+	drainCodexRunDebtLadder(t)
+	codexUsageRunDisarmed(newer, unbound)
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != unbound.UnixMilli() {
+		t.Fatal("rollback dropped a fallback with no binding")
+	}
+}
+
+// An abandoned rollback — the cache already belongs to the account that is
+// signed in now — is not retried, and that account's reading stays.
+func TestDisarmCodexUsageRunFloor_AbandonedRollbackIsNotRetried(t *testing.T) {
+	now := time.Now()
+	runStart := now.Add(-time.Minute)
+	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Hour), now)
+	codexUsageRunStarted(runStart)
+	drainCodexRunDebtLadder(t)
+
+	helperCodexAuthAt(t, f.home, "other@example.com", now.Add(-time.Minute))
+	next := currentCodexAccountFingerprint()
+	if next == f.fp {
+		t.Fatal("precondition: the credentials did not change")
+	}
+	mergeCodexRateLimitCache(f.cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(), ObservedAtMs: now.Add(-30 * time.Second).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, next)
+	reading := f.snapshot(t)
+	if reading.AccountFingerprint != next {
+		t.Fatal("precondition: the live account did not take the cache")
+	}
+
+	prevDelay, prevAttempts := codexRunFloorWriteRetryDelay, codexRunFloorWriteAttempts
+	codexRunFloorWriteRetryDelay = 5 * time.Second
+	codexRunFloorWriteAttempts = 4
+	t.Cleanup(func() {
+		codexRunFloorWriteRetryDelay = prevDelay
+		codexRunFloorWriteAttempts = prevAttempts
+	})
+	prev := codexCommitRateLimitSnapshot
+	var commits atomic.Int32
+	codexCommitRateLimitSnapshot = func(path string, out []byte, at time.Time) bool {
+		commits.Add(1)
+		return prev(path, out, at)
+	}
+	t.Cleanup(func() { codexCommitRateLimitSnapshot = prev })
+
+	started := time.Now()
+	codexUsageRunDisarmed(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+	if commits.Load() != 0 {
+		t.Fatalf("abandoned rollback committed %d times", commits.Load())
+	}
+	if time.Since(started) >= 3*time.Second {
+		t.Fatal("abandoned rollback was retried")
+	}
+	snap := f.snapshot(t)
+	if snap.AccountFingerprint != reading.AccountFingerprint {
+		t.Fatal("abandoned rollback rescoped the live account")
+	}
+	if snap.Buckets[codexWindowPrimary].UsedPercentage != reading.Buckets[codexWindowPrimary].UsedPercentage ||
+		snap.Buckets[codexWindowPrimary].ObservedAtMs != reading.Buckets[codexWindowPrimary].ObservedAtMs {
+		t.Fatal("abandoned rollback changed the live account's reading")
 	}
 }
 

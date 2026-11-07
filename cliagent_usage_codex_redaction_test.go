@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -213,6 +214,52 @@ func TestCodexCaptureDriftNotice_CarriesNoPathAccountOrVendorText(t *testing.T) 
 	shape := regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC`).ReplaceAllString(usage.Notice, "<ts>")
 	if want := `Codex utilization was last observed <ts> by Codex build "codex-cli 0.149.0"; the installed build "codex-cli 0.150.0" has not reported utilization since the most recent Codex run started (<ts>). It will update once that build's telemetry is captured.`; shape != want {
 		t.Fatalf("drift notice must be versions and timestamps over fixed copy only:\n got %q\nwant %q", usage.Notice, want)
+	}
+}
+
+// A commit that exhausts its rename attempts logs one fixed line. The error
+// carries the cache path — and so the OS user name — and must not be logged,
+// nor a fingerprint or a quota value from the payload.
+func TestCodexCommit_RefusedRenameLogsNoPathOrQuota(t *testing.T) {
+	const (
+		userMarker  = "secret-user"
+		quotaMarker = "77.25"
+	)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	f.seedPreRunReading(t, now.Add(-time.Minute), now)
+	markerPath := filepath.Join(f.home, userMarker, "codex_rate_limits.json")
+
+	prev := codexRateLimitRename
+	codexRateLimitRename = func(string, string) error {
+		return fmt.Errorf("rename %s: Access is denied", markerPath)
+	}
+	t.Cleanup(func() { codexRateLimitRename = prev })
+
+	logged := captureStdout(t, func() {
+		if codexCommitRateLimitSnapshot(f.cache, []byte(`{"usedPercentage":`+quotaMarker+`}`), now) {
+			t.Fatal("every rename was refused, so the commit must fail")
+		}
+	})
+	plain := regexp.MustCompile("\x1b\\[[0-9;]*m").ReplaceAllString(logged, "")
+	count := 0
+	for _, line := range strings.Split(plain, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.TrimSpace(line) != "[cli-usage] codex cache commit refused" {
+			t.Fatalf("commit log line is not the fixed line")
+		}
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("commit refused line appeared %d times", count)
+	}
+	for _, s := range []string{markerPath, userMarker, f.home, filepath.ToSlash(f.home), f.fp, quotaMarker, "Access is denied"} {
+		if strings.Contains(logged, s) || strings.Contains(plain, s) {
+			t.Error("commit log leaks a path, identity, or quota value")
+		}
 	}
 }
 

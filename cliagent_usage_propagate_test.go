@@ -462,6 +462,79 @@ func TestCLIUsageHint_ARotationCompletedByAMergeCancelsTheRetry(t *testing.T) {
 	}
 }
 
+// A same-account rollback writes no contributor state, so it sends no hint and
+// moves no generation.
+func TestCLIUsageHint_SameAccountRollbackSendsNothing(t *testing.T) {
+	withCodexGenerationEpoch(t, 7201)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	codexLiveReadAt(t, f, 10, 20, now)
+	before := f.snapshot(t)
+	waitHintFor(t, rec, gen(before.GenerationEpoch, before.Generation))
+
+	runStart := now.Add(-time.Minute)
+	codexUsageRunStarted(runStart)
+	drainCodexRunDebtLadder(t)
+	codexUsageRunDisarmed(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+
+	after := f.snapshot(t)
+	if after.GenerationEpoch != before.GenerationEpoch || after.Generation != before.Generation {
+		t.Fatal("a same-account rollback moved the generation")
+	}
+	time.Sleep(2 * cliUsageHintSpacing)
+	for _, h := range rec.all() {
+		if h.hint.Provider == codexUsageProvider && (h.hint.GenerationEpoch != before.GenerationEpoch || h.hint.Generation != before.Generation) {
+			t.Fatal("a same-account rollback sent a hint")
+		}
+	}
+}
+
+// The reading that follows a rollback whose commit was refused once still
+// produces one hint, and the signed receipt carries that generation.
+func TestCLIUsageHint_ReadingAfterARefusedRollbackCommitIsHintedOnce(t *testing.T) {
+	withCodexGenerationEpoch(t, 7202)
+	now := time.Now()
+	f := newCodexFreshnessFixture(t, now.Add(-time.Hour))
+	rec, cfg := propagatorFixture(t)
+	startCLIUsagePropagator(cfg)
+	codexLiveReadAt(t, f, 10, 20, now)
+	seeded := f.snapshot(t)
+	waitHintFor(t, rec, gen(seeded.GenerationEpoch, seeded.Generation))
+
+	runStart := now.Add(-time.Minute)
+	codexUsageRunStarted(runStart)
+	drainCodexRunDebtLadder(t)
+	failCommitsMatching(t, 1, func(string) bool { return true })
+	codexUsageRunDisarmed(runStart, time.Time{})
+	drainCodexRunDebtLadder(t)
+	if snap := f.snapshot(t); snap.RunFloorMs != 0 || snap.GenerationEpoch != seeded.GenerationEpoch || snap.Generation != seeded.Generation {
+		t.Fatal("the refused rollback did not withdraw without moving the generation")
+	}
+
+	codexLiveReadAt(t, f, 12, 22, now.Add(time.Second))
+	snap := f.snapshot(t)
+	if snap.GenerationEpoch == seeded.GenerationEpoch && snap.Generation == seeded.Generation {
+		t.Fatal("the reading after the rollback did not advance the generation")
+	}
+	hint := waitHintFor(t, rec, gen(snap.GenerationEpoch, snap.Generation)).hint
+	n := 0
+	for _, h := range rec.all() {
+		if h.hint.GenerationEpoch == snap.GenerationEpoch && h.hint.Generation == snap.Generation {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("the reading produced %d hints, want 1", n)
+	}
+	agent := codexRefreshReceiptAgent(t, f)
+	if agent.UsageGeneration == nil || agent.UsageGeneration.Epoch != hint.GenerationEpoch || agent.UsageGeneration.Counter != hint.Generation {
+		t.Fatal("receipt generation does not match the hint")
+	}
+}
+
 // Hint bodies are integers and fixed strings only.
 func TestCLIUsageHint_BodyCarriesNoMetricValues(t *testing.T) {
 	body, err := json.Marshal(cliUsageObservedHint{Timestamp: 1, Signature: "ab", Provider: "codex", GenerationEpoch: 2, Generation: 3})

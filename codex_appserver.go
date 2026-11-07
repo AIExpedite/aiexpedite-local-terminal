@@ -268,9 +268,9 @@ func (s *CodexAppServerSession) armUsageRun(at time.Time) int64 {
 // waitForExit must not settle it into a debt no telemetry can pay — one that
 // would age into a false stale-utilization warning. Only the newest open turn
 // is a candidate: Send holds stdinMu from arm to write, so nothing armed after
-// it. The floor persisted by codexUsageRunStarted is left alone — without a
-// debt it is only ever read as an interrupted run at the NEXT process start,
-// where one bounded reconcile retires it.
+// it. The floor persisted by codexUsageRunStarted is rolled back with this
+// turn. Left on disk it would be read as an interrupted run at the NEXT
+// process start and converted into a debt no telemetry can pay.
 //
 // The persisted floor is ACCOUNT-WIDE while this manager runs many concurrent
 // sessions, so the rollback target is the newest turn still open anywhere, not
