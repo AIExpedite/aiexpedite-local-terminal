@@ -536,7 +536,20 @@ func TestRemoveWorktreeKeepsAnUncommittedTree(t *testing.T) {
 	}
 }
 
-func TestRemoveWorktreeKeepsUnpushedWorkWhenRescuePushingIsOff(t *testing.T) {
+// Unpushed commits ON A BRANCH do not need rescuing, and the worktree is
+// retired anyway.
+//
+// MEASURED, and it is why this test replaced one that asserted the opposite: a
+// worktree checked out on a branch loses nothing when its directory and admin
+// record go. `refs/heads/<x>` lives in the shared common directory, survives
+// both deletions and survives `reflog expire --expire-unreachable=now --all &&
+// gc --prune=now`. The commits are already named.
+//
+// The old behaviour kept such a worktree as `unpushed_work` for ever whenever
+// pushing was off, so nothing was ever cleaned up and a person had to look at a
+// directory holding work that was never at risk. Now the retirement completes
+// and the report names the branch that holds it.
+func TestRemoveWorktreeRetiresUnpushedWorkOntoItsOwnBranch(t *testing.T) {
 	fx := newWorktreeFixture(t)
 	ctx := context.Background()
 	created, err := ensureWorktree(ctx, fx.ensureReq("feature/unpushed"))
@@ -546,19 +559,33 @@ func TestRemoveWorktreeKeepsUnpushedWorkWhenRescuePushingIsOff(t *testing.T) {
 	wtWrite(t, filepath.Join(created.Path, "work.txt"), "committed but unpushed\n")
 	wtMustGit(t, created.Path, "add", "-A")
 	wtMustGit(t, created.Path, "commit", "-m", "unpushed")
+	sha := wtMustGit(t, created.Path, "rev-parse", "HEAD")
 
-	req := fx.removeReq(fx.wtPath("demo"))
-	off := false
-	req.AllowRescuePush = &off
-	res, err := removeWorktree(ctx, req)
+	// No AllowRescuePush at all: the live sweep sends none, and absent now
+	// means "save it locally", not "push it".
+	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("demo")))
 	if err != nil {
 		t.Fatalf("removeWorktree: %v", err)
 	}
-	if res.Removed || res.KeptReason != keptReasonUnpushedWork {
-		t.Fatalf("res = %+v, want kept with %q", res, keptReasonUnpushedWork)
+	if !res.Removed || res.Kept {
+		t.Fatalf("res = %+v, want removed", res)
 	}
-	if _, serr := os.Stat(created.Path); serr != nil {
-		t.Fatalf("the worktree was deleted: %v", serr)
+	if res.RescueOutcome != rescueOutcomeBranchRetained || res.RescueBranch != "feature/unpushed" {
+		t.Fatalf("res = %+v, want %q on feature/unpushed", res, rescueOutcomeBranchRetained)
+	}
+	if res.RescueCommits != 1 {
+		t.Fatalf("res.RescueCommits = %d, want 1", res.RescueCommits)
+	}
+	if res.RescuePushed {
+		t.Fatalf("res = %+v, pushed without being asked", res)
+	}
+	// The work is still named, in the main repository.
+	if held := wtMustGit(t, fx.MainRepo, "rev-parse", "refs/heads/feature/unpushed"); held != sha {
+		t.Fatalf("feature/unpushed is at %s, want %s", held, sha)
+	}
+	// NOTHING OF OURS REACHED THE REMOTE.
+	if out, rerr := wtGit(ctx, fx.Remote, "for-each-ref", "--format=%(refname)", "refs/heads/aix"); rerr == nil && out != "" {
+		t.Fatalf("the remote gained %q without consent", out)
 	}
 }
 
@@ -579,7 +606,11 @@ func TestRemoveWorktreeKeepsOnABranchMismatch(t *testing.T) {
 	}
 }
 
-func TestRemoveWorktreeRescuePushesThenRemoves(t *testing.T) {
+// Pushing is OPT-IN. It used to be the default, through an AllowRescuePush
+// whose nil meant push — and the hourly sweep sends no such field, so an
+// unattended timer was creating a vendor-named branch in the owner's GitHub,
+// visible to their whole organisation, for work they never asked us to publish.
+func TestRemoveWorktreeRescuePushesOnlyWhenAsked(t *testing.T) {
 	fx := newWorktreeFixture(t)
 	ctx := context.Background()
 	created, err := ensureWorktree(ctx, fx.ensureReq("feature/rescued"))
@@ -591,12 +622,18 @@ func TestRemoveWorktreeRescuePushesThenRemoves(t *testing.T) {
 	wtMustGit(t, created.Path, "commit", "-m", "only copy")
 	sha := wtMustGit(t, created.Path, "rev-parse", "HEAD")
 
-	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("demo")))
+	on := true
+	req := fx.removeReq(fx.wtPath("demo"))
+	req.AllowRescuePush = &on
+	res, err := removeWorktree(ctx, req)
 	if err != nil {
 		t.Fatalf("removeWorktree: %v", err)
 	}
 	if !res.RescuePushed || !res.Removed || !res.AdminDirRemoved {
 		t.Fatalf("res = %+v, want rescue pushed then removed", res)
+	}
+	if res.RescueOutcome != rescueOutcomePushed {
+		t.Fatalf("res.RescueOutcome = %q, want %q", res.RescueOutcome, rescueOutcomePushed)
 	}
 	if _, serr := os.Lstat(created.Path); !os.IsNotExist(serr) {
 		t.Fatalf("the worktree directory survived: %v", serr)
@@ -1085,11 +1122,175 @@ func TestEvictDepsRefusesALinkedDependencyDirectory(t *testing.T) {
 // companion" ensure reports and leaves alone. A removal that only checked
 // `@{u}..HEAD` would find no upstream, conclude nothing, and delete the only
 // copy of those commits.
-func TestRemoveDetachedCompanionRescuesItsOwnCommits(t *testing.T) {
+// THE CASE THAT ACTUALLY NEEDS RESCUING: a DETACHED companion.
+//
+// Measured, and it is the only real loss case. A branch worktree's commits
+// survive removal on their own ref; a detached worktree's HEAD and reflog live
+// in the admin directory that step 2 deletes, and the object was measurably
+// pruned afterwards. So this is where a ref has to be created - and it is
+// created LOCALLY, in the main repository, never pushed.
+func TestRemoveDetachedCompanionSavesItsCommitsLocally(t *testing.T) {
 	fx := newWorktreeFixture(t)
 	ctx := context.Background()
+	companion, sha := fx.detachedCompanionWithACommit(t, "feature/companion-removal", "left-behind.txt")
+
+	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.Removed || res.Kept {
+		t.Fatalf("res = %+v, want removed", res)
+	}
+	if res.RescueOutcome != rescueOutcomeBranchCreated || res.RescuePushed {
+		t.Fatalf("res = %+v, want %q and no push", res, rescueOutcomeBranchCreated)
+	}
+	if !strings.HasPrefix(res.RescueBranch, "aix/rescue/") {
+		t.Fatalf("res.RescueBranch = %q, want an aix/rescue/ ref", res.RescueBranch)
+	}
+	// The ref is in the MAIN repository and holds the companion's own commit.
+	if held := wtMustGit(t, fx.MainRepo, "rev-parse", "refs/heads/"+res.RescueBranch); held != sha {
+		t.Fatalf("%s is at %s, want %s", res.RescueBranch, held, sha)
+	}
+	if _, serr := os.Lstat(companion); !os.IsNotExist(serr) {
+		t.Fatalf("the companion directory survived: %v", serr)
+	}
+	// NOTHING OF OURS REACHED THE REMOTE.
+	assertNoRescueRefOnTheRemote(t, fx)
+}
+
+// A ref already taken BY ANOTHER COMMIT gets a name of its own, and the first
+// ref is never moved.
+//
+// `git branch <name> <sha>` creates and never resets, which is the same rule
+// createWorktree applies to `worktree add -B`: moving a ref can discard the
+// only name a commit had. So a second retirement of the same (feature,
+// repository) has to disambiguate instead.
+func TestRemoveDetachedCompanionDisambiguatesATakenRescueRef(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	_, firstSha := fx.detachedCompanionWithACommit(t, "feature/twice", "first.txt")
+
+	first, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
+	if err != nil {
+		t.Fatalf("first removeWorktree: %v", err)
+	}
+	if first.RescueOutcome != rescueOutcomeBranchCreated {
+		t.Fatalf("first = %+v, want %q", first, rescueOutcomeBranchCreated)
+	}
+
+	// The same feature folder and repository again, at a DIFFERENT commit.
+	_, secondSha := fx.detachedCompanionWithACommit(t, "feature/twice", "second.txt")
+	if secondSha == firstSha {
+		t.Fatal("premise wrong: the second companion must hold a different commit")
+	}
+	second, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
+	if err != nil {
+		t.Fatalf("second removeWorktree: %v", err)
+	}
+	if !second.Removed || second.RescueOutcome != rescueOutcomeBranchCreated {
+		t.Fatalf("second = %+v, want removed and %q", second, rescueOutcomeBranchCreated)
+	}
+	if second.RescueBranch == first.RescueBranch {
+		t.Fatalf("both retirements used %q; the second must take a name of its own", first.RescueBranch)
+	}
+	// Each ref holds its own commit, and the first was not moved.
+	if held := wtMustGit(t, fx.MainRepo, "rev-parse", "refs/heads/"+first.RescueBranch); held != firstSha {
+		t.Fatalf("%s moved to %s, want %s", first.RescueBranch, held, firstSha)
+	}
+	if held := wtMustGit(t, fx.MainRepo, "rev-parse", "refs/heads/"+second.RescueBranch); held != secondSha {
+		t.Fatalf("%s is at %s, want %s", second.RescueBranch, held, secondSha)
+	}
+}
+
+// A SECOND retirement at the SAME commit is idempotent: `git branch` refuses a
+// name that exists even when it already points at the commit asked for, so an
+// "already exists" has to read as success or every repeat retirement would be
+// kept for ever.
+func TestRemoveDetachedCompanionIsIdempotentAtTheSameCommit(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	_, sha := fx.detachedCompanionWithACommit(t, "feature/again", "once.txt")
+
+	first, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
+	if err != nil {
+		t.Fatalf("first removeWorktree: %v", err)
+	}
+	// Re-made and detached at exactly the same commit, so the ref this
+	// retirement wants already exists and already holds it.
+	fx.detachedCompanionAt(t, "feature/again", sha)
+	second, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
+	if err != nil {
+		t.Fatalf("second removeWorktree: %v", err)
+	}
+	if !second.Removed || second.Kept {
+		t.Fatalf("second = %+v, want removed", second)
+	}
+	if second.RescueBranch != first.RescueBranch {
+		t.Fatalf("second took %q, want the existing %q", second.RescueBranch, first.RescueBranch)
+	}
+}
+
+// Pushing a detached companion's commits still works, on request.
+func TestRemoveDetachedCompanionPushesWhenAsked(t *testing.T) {
+	fx := newWorktreeFixture(t)
+	ctx := context.Background()
+	_, sha := fx.detachedCompanionWithACommit(t, "feature/companion-push", "pushed.txt")
+
+	on := true
+	req := fx.removeReq(fx.wtPath("lib"))
+	req.AllowRescuePush = &on
+	res, err := removeWorktree(ctx, req)
+	if err != nil {
+		t.Fatalf("removeWorktree: %v", err)
+	}
+	if !res.RescuePushed || !res.Removed {
+		t.Fatalf("res = %+v, want rescue pushed then removed", res)
+	}
+	if rescued := wtMustGit(t, fx.Remote, "rev-parse", "refs/heads/"+res.RescueBranch); rescued != sha {
+		t.Fatalf("rescue ref is at %s, want the companion's own commit %s", rescued, sha)
+	}
+}
+
+// assertNoRescueRefOnTheRemote is the half of invariant 4 that is easy to
+// forget: it is not enough that we did not MEAN to push, the remote has to be
+// empty of our refs.
+func assertNoRescueRefOnTheRemote(t *testing.T, fx wtFixture) {
+	t.Helper()
+	out, err := wtGit(context.Background(), fx.Remote, "for-each-ref", "--format=%(refname)", "refs/heads/aix")
+	if err != nil {
+		t.Fatalf("reading the remote's refs: %v", err)
+	}
+	if out != "" {
+		t.Fatalf("the remote gained %q without consent", out)
+	}
+}
+
+// detachedCompanionWithACommit builds the companion these tests need: detached
+// at <remote>/<default>, holding one commit that exists nowhere else. Returns
+// its path and that commit's sha.
+func (fx wtFixture) detachedCompanionWithACommit(t *testing.T, branch, file string) (string, string) {
+	t.Helper()
+	companion := fx.ensureDetachedCompanion(t, branch)
+	wtWrite(t, filepath.Join(companion, file), "the only copy\n")
+	wtMustGit(t, companion, "add", "-A")
+	wtMustGit(t, companion, "commit", "-m", "work nobody pushed")
+	return companion, wtMustGit(t, companion, "rev-parse", "HEAD")
+}
+
+// detachedCompanionAt re-makes the companion and leaves it detached at sha,
+// with no commit of its own.
+func (fx wtFixture) detachedCompanionAt(t *testing.T, branch, sha string) string {
+	t.Helper()
+	companion := fx.ensureDetachedCompanion(t, branch)
+	wtMustGit(t, companion, "checkout", "--detach", sha)
+	return companion
+}
+
+func (fx wtFixture) ensureDetachedCompanion(t *testing.T, branch string) string {
+	t.Helper()
+	ctx := context.Background()
 	yes := true
-	req := fx.ensureReq("feature/companion-removal")
+	req := fx.ensureReq(branch)
 	req.Fetch = &yes
 	req.Companions = []worktreeCompanionSpec{{
 		MainRepo: fx.MainRepo, Path: fx.wtPath("lib"), DefaultBranch: fx.Default, Remote: "origin",
@@ -1102,37 +1303,7 @@ func TestRemoveDetachedCompanionRescuesItsOwnCommits(t *testing.T) {
 	if state, serr := wtReadState(ctx, companion); serr != nil || !state.Detached {
 		t.Fatalf("premise wrong: the companion should be detached (%+v, %v)", state, serr)
 	}
-	wtWrite(t, filepath.Join(companion, "left-behind.txt"), "the only copy\n")
-	wtMustGit(t, companion, "add", "-A")
-	wtMustGit(t, companion, "commit", "-m", "work nobody pushed")
-	sha := wtMustGit(t, companion, "rev-parse", "HEAD")
-
-	// With rescue pushing off, the worktree is kept rather than deleted.
-	off := false
-	keepReq := fx.removeReq(fx.wtPath("lib"))
-	keepReq.AllowRescuePush = &off
-	kept, err := removeWorktree(ctx, keepReq)
-	if err != nil {
-		t.Fatalf("removeWorktree: %v", err)
-	}
-	if kept.Removed || kept.KeptReason != keptReasonUnpushedWork {
-		t.Fatalf("res = %+v, want kept with %q", kept, keptReasonUnpushedWork)
-	}
-	if _, serr := os.Stat(filepath.Join(companion, "left-behind.txt")); serr != nil {
-		t.Fatalf("the detached commit's content was deleted: %v", serr)
-	}
-
-	// With it on, the commit reaches the remote first.
-	res, err := removeWorktree(ctx, fx.removeReq(fx.wtPath("lib")))
-	if err != nil {
-		t.Fatalf("removeWorktree: %v", err)
-	}
-	if !res.RescuePushed || !res.Removed {
-		t.Fatalf("res = %+v, want rescue pushed then removed", res)
-	}
-	if rescued := wtMustGit(t, fx.Remote, "rev-parse", "refs/heads/"+res.RescueBranch); rescued != sha {
-		t.Fatalf("rescue ref is at %s, want the companion's own commit %s", rescued, sha)
-	}
+	return companion
 }
 
 // ─── __worktree_remove__ with discardChanges (a confirmed feature delete) ────
