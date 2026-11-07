@@ -380,6 +380,51 @@ func enclosingRepositoryOf(dir string) string {
 	return ""
 }
 
+// resolveWorktreeRootLinks resolves a root to where it PHYSICALLY is, component
+// by component, following symlinks and Windows junctions alike.
+//
+// NOT filepath.EvalSymlinks, and this is measured rather than assumed: on
+// Windows, EvalSymlinks returns a JUNCTION's own path unchanged — a junction is
+// not reported as ModeSymlink since Go 1.23, which is the same fact
+// `isWorktreeLink` exists for. So an EvalSymlinks-based check would have missed
+// the aliasing shape that matters most here: a junction is what the 2026-09-17
+// data loss was made of, and `mklink /J` needs no privilege, so it is the one a
+// Windows developer actually creates.
+//
+// os.Readlink reads both. The walk starts at the volume root so a link in the
+// MIDDLE of the path counts too, and each component is followed a bounded
+// number of times so a link cycle cannot spin.
+func resolveWorktreeRootLinks(root string) string {
+	cleaned := filepath.Clean(root)
+	if !filepath.IsAbs(cleaned) {
+		return cleaned
+	}
+	vol := filepath.VolumeName(cleaned)
+	parts := strings.FieldsFunc(
+		filepath.ToSlash(strings.TrimPrefix(cleaned, vol)),
+		func(r rune) bool { return r == '/' },
+	)
+	cur := vol + string(filepath.Separator)
+	for _, part := range parts {
+		cur = filepath.Join(cur, part)
+		for i := 0; i < worktreeLinkHops; i++ {
+			target, err := os.Readlink(cur)
+			if err != nil || target == "" {
+				break
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(cur), target)
+			}
+			cur = filepath.Clean(target)
+		}
+	}
+	return cur
+}
+
+// worktreeLinkHops bounds how many links one component may chain through. A
+// FIXED bound: a cycle would otherwise never return.
+const worktreeLinkHops = 8
+
 // assertWorktreeParentOutsideRepository refuses a root that sits inside a git
 // checkout (WORKTREE_CONFIG_AND_PORTABILITY.md §7 invariant 2).
 //
@@ -404,7 +449,24 @@ func enclosingRepositoryOf(dir string) string {
 // The remedy is in the message, because the owner is the only one who can
 // apply it: the setting is theirs.
 func assertWorktreeParentOutsideRepository(root string) error {
+	// BOTH SPELLINGS OF THE ROOT ARE CHECKED, because they fail in two different
+	// ways and the policy deliberately ALLOWS an aliased root (see
+	// checkWorktreePathLinkFree, which resolves it rather than refusing it).
+	//
+	//   - the path as recorded: a `.git` above it means `git clean -fdx` in that
+	//     repository deletes the alias, and every worktree we made becomes
+	//     unreachable at the path the registry holds, even though the files are
+	//     still somewhere;
+	//   - the path RESOLVED: `/work/alias -> /repos/project/scratch` has no
+	//     `.git` above `/work/alias`, yet the directories physically land inside
+	//     `/repos/project`, where that same `git clean` deletes the files
+	//     themselves. A lexical walk alone misses this entirely. (Codex P2, #263.)
 	repo := enclosingRepositoryOf(root)
+	if repo == "" {
+		if resolved := resolveWorktreeRootLinks(root); resolved != filepath.Clean(root) {
+			repo = enclosingRepositoryOf(resolved)
+		}
+	}
 	if repo == "" {
 		return nil
 	}

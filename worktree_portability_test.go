@@ -311,15 +311,23 @@ func TestEnsureReportsNoSubmodulesWhenTheRepositoryDeclaresNone(t *testing.T) {
 	}
 }
 
-// `submodule.<name>.update = !<command>` in a TRACKED `.gitmodules` is the
-// other way a submodule declaration reaches for code execution.
+// A NEW WORKTREE IS ALWAYS A CHECKOUT, never whatever update mode the
+// repository is configured for.
 //
-// git itself refuses the `!` form from `.gitmodules` — but measured, it refuses
-// it by failing the WHOLE update with `fatal: invalid value for
-// 'submodule.sub.update'`, so a repository could stop every worktree of itself
-// from initialising any submodule at all. Pinning the mode with `--checkout`
-// means the value is never consulted: the submodule is checked out normally.
-func TestEnsureIgnoresASubmoduleUpdateCommand(t *testing.T) {
+// AND THE SECURITY CLAIM THIS TEST FIRST CARRIED WAS WRONG. It said `--checkout`
+// stops a tracked `.gitmodules` running `submodule.<name>.update = !<command>`.
+// Measured: git refuses that form from `.gitmodules` outright and will not even
+// COMMIT it, on 2.49 and 2.56 alike, so a pull request can never deliver it and
+// the flag protects against nothing there. What the flag actually does is make
+// the mode independent of CONFIGURATION — measured in the control below, where
+// git without it prints `Submodule path 'sub': 'touch ...'`, having invoked the
+// configured command, and with it prints `checked out`.
+//
+// That is still worth pinning, for the ordinary reason rather than the dramatic
+// one: a freshly created worktree has nothing to rebase or merge onto, so
+// `checkout` is the only mode that makes sense, and prepare should not inherit
+// a preference meant for a person's own `git submodule update`.
+func TestEnsureSubmodulesAreCheckedOutWhateverTheUpdateModeSays(t *testing.T) {
 	fx := newWorktreeFixture(t)
 
 	subRemote := filepath.Join(fx.Base, "sub.git")
@@ -333,33 +341,81 @@ func TestEnsureIgnoresASubmoduleUpdateCommand(t *testing.T) {
 	wtMustGit(t, subSeed, "push", subRemote, "main:main")
 	subHead := wtMustGit(t, subSeed, "rev-parse", "HEAD")
 
-	// `.gitmodules` with BOTH a url and a hostile update mode.
-	seed := filepath.Join(fx.Base, "seed")
-	body := "[submodule \"sub\"]\n\tpath = sub\n\turl = " + filepath.ToSlash(subRemote) +
-		"\n\tupdate = !touch " + filepath.ToSlash(filepath.Join(fx.Base, "UPDATE_RAN.txt")) + "\n"
-	wtWrite(t, filepath.Join(seed, ".gitmodules"), body)
-	wtMustGit(t, seed, "add", ".gitmodules")
-	wtMustGit(t, seed, "update-index", "--add", "--cacheinfo", "160000,"+subHead+",sub")
-	wtMustGit(t, seed, "commit", "-m", "add submodule with an update command")
-	wtMustGit(t, seed, "push", "origin", "main")
-	wtMustGit(t, fx.MainRepo, "fetch", "origin", "main")
-	wtMustGit(t, fx.MainRepo, "reset", "--hard", "origin/main")
+	addSubmodule(t, fx, filepath.ToSlash(subRemote), subHead)
 	wtMustGit(t, fx.Base, "config", "--global", "protocol.file.allow", "always")
 	t.Cleanup(func() {
 		_, _ = wtGit(context.Background(), fx.Base, "config", "--global", "--unset", "protocol.file.allow")
 	})
+	// The owner's own update mode, in local config — the only place git honours
+	// the `!` form.
+	marker := filepath.ToSlash(filepath.Join(fx.Base, "UPDATE_MODE_USED"))
+	wtMustGit(t, fx.MainRepo, "config", "submodule.sub.update", "!touch "+marker)
 
-	res, err := ensureWorktree(context.Background(), fx.ensureReq("feature/update-command"))
+	// THE CONTROL: the same repository, raw git, no --checkout. git must say it
+	// used the configured command; if it does not, the flag below is being
+	// credited with something git was never going to do.
+	controlPath := filepath.Join(fx.Base, "control")
+	wtMustGit(t, fx.MainRepo, "worktree", "add", "--detach", controlPath, "HEAD")
+	control := exec.Command("git", "-C", controlPath, "submodule", "update", "--init")
+	control.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	controlOut, _ := control.CombinedOutput()
+	if !strings.Contains(string(controlOut), "touch "+marker) {
+		t.Fatalf("the control did not use the configured update command, so this test proves nothing: %s", controlOut)
+	}
+
+	res, err := ensureWorktree(context.Background(), fx.ensureReq("feature/update-mode"))
 	if err != nil {
 		t.Fatalf("ensureWorktree: %v", err)
 	}
-	if _, serr := os.Stat(filepath.Join(fx.Base, "UPDATE_RAN.txt")); serr == nil {
-		t.Fatal("submodule.<name>.update ran a command during prepare")
-	}
 	if res.Submodules == nil || !res.Submodules.Initialised {
-		t.Fatalf("res.Submodules = %+v, want initialised despite the update mode", res.Submodules)
+		t.Fatalf("res.Submodules = %+v, want initialised", res.Submodules)
 	}
 	if _, serr := os.Stat(filepath.Join(res.Path, "sub", "MODULE.txt")); serr != nil {
 		t.Fatalf("the submodule is not populated: %v", serr)
+	}
+}
+
+// AN ALIASED ROOT IS CHECKED AT BOTH SPELLINGS.
+//
+// The policy deliberately ALLOWS a root reached through a link —
+// `checkWorktreePathLinkFree` resolves the root rather than refusing it — so a
+// lexical walk over `<base>/alias` finds no `.git` even when the directories
+// physically land inside the repository, where that repository's
+// `git clean -fdx` deletes the files themselves. (Codex P2, #263.)
+func TestEnsureRefusesARootAliasedIntoARepository(t *testing.T) {
+	fx := newWorktreeFixture(t)
+
+	target := filepath.Join(fx.MainRepo, "scratch")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(fx.Base, "alias")
+	// The shared helper (env_verify_deps_test.go): a symlink where the OS allows
+	// one, else a Windows JUNCTION — which needs no privilege and is therefore
+	// the alias a Windows developer actually creates. It takes a target RELATIVE
+	// to the link's own directory, and unlinks non-recursively on cleanup.
+	rel, rerr := filepath.Rel(filepath.Dir(alias), target)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	makeDirLink(t, rel, alias)
+
+	// The precondition this test exists for: the LEXICAL walk sees nothing.
+	if got := enclosingRepositoryOf(alias); got != "" {
+		t.Fatalf("enclosingRepositoryOf(%q) = %q; the alias was expected to look clean lexically", alias, got)
+	}
+
+	req := fx.ensureReq("feature/aliased-root")
+	req.Root = alias
+
+	_, err := ensureWorktree(context.Background(), req)
+	if err == nil {
+		t.Fatal("ensureWorktree accepted a root aliased into a git checkout")
+	}
+	if rule := worktreePolicyRuleOf(err); rule != ruleParentInsideRepository {
+		t.Fatalf("rule = %q, want %q (err: %v)", rule, ruleParentInsideRepository, err)
+	}
+	if _, serr := os.Stat(filepath.Join(target, worktreeRootSegment)); serr == nil {
+		t.Fatalf("%s was created inside the repository through the alias", worktreeRootSegment)
 	}
 }

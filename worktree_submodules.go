@@ -20,10 +20,14 @@
 //     remote code execution with a URL as the payload, and a tracked
 //     `.gitmodules` is the delivery mechanism. Denied on the command line,
 //     which outranks every config file, so a repository cannot re-enable it.
-//   - `submodule.<name>.update = !<command>` is the same hazard by another
-//     route, so the mode is pinned with `--checkout` rather than read from the
-//     repository. git already refuses the `!` form when it comes from
-//     `.gitmodules`; pinning it does not depend on that.
+//
+// `submodule.<name>.update = !<command>` looks like the same hazard by another
+// route, AND IT IS NOT: measured on git 2.49 and 2.56, git refuses that form
+// from `.gitmodules` outright and will not even COMMIT it, so a pull request
+// cannot deliver it. The mode is still pinned with `--checkout`, for the
+// ordinary reason — a freshly created worktree has nothing to rebase or merge
+// onto, so `checkout` is the only mode that makes sense, and prepare should not
+// inherit a preference meant for a person's own `git submodule update`.
 //
 // WHAT IS DELIBERATELY *NOT* DENIED is the `file` transport, and not because it
 // is harmless: because git already refuses it here and refuses it BETTER than
@@ -99,8 +103,9 @@ func initSubmodules(ctx context.Context, wt resolvedWorktreePath, enabled *bool)
 	}
 
 	out := &worktreeSubmoduleResult{Present: true}
-	// `--checkout` pins the update MODE instead of taking it from the
-	// repository, so `submodule.<name>.update` cannot choose it.
+	// `--checkout` pins the update MODE instead of taking it from configuration:
+	// a new worktree has nothing to rebase or merge onto. See the file header for
+	// why this is NOT the security control it first looked like.
 	args := append(wtSubmoduleSafeTransport(), "submodule", "update", "--init", "--recursive", "--checkout")
 	if _, uerr := wtRunGitIn(ctx, wt.Abs, wtSubmoduleTimeout, args...); uerr != nil {
 		out.Reason = "failed"

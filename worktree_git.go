@@ -42,6 +42,11 @@ import (
 const (
 	wtGitTimeout        = 60 * time.Second
 	wtGitNetworkTimeout = 5 * time.Minute
+	// wtGitWaitDelay bounds how long Run may stay blocked on the captured
+	// stdout/stderr handles after the deadline has fired and the tree has been
+	// killed. Short, because by then everything is already force-killed; this
+	// covers only the reap race. Same shape as openCodeSmokeWaitDelay.
+	wtGitWaitDelay = 2 * time.Second
 )
 
 // wtGitError carries git's own stderr, which is the only useful part of a
@@ -72,6 +77,27 @@ func wtRunGitIn(ctx context.Context, dir string, timeout time.Duration, args ...
 	defer cancel()
 	full := append(append([]string{"-C", dir}, wtNoHooksArgs()...), args...)
 	cmd := exec.CommandContext(cctx, "git", full...)
+	// THE TIMEOUT HAS TO BOUND THE CALL, NOT JUST THE DIRECT CHILD.
+	//
+	// exec.CommandContext kills only the process it started, and stdout/stderr
+	// here are buffers, so Wait blocks until those pipes reach EOF — which needs
+	// every DESCENDANT gone too. `git submodule update` and `git fetch` both
+	// spawn helpers that inherit the handles, so a stalled clone kept Run blocked
+	// well past the deadline: measured at 2.1 s against a 100 ms context, and
+	// unbounded against a remote that never answers. The ensure path has an
+	// orchestrator waiting on it, so an unbounded call is a run that never hears
+	// anything rather than one that hears "not finished". (Codex P2, #263.)
+	//
+	// killProcessTreePinned is the same tree kill the CLI smoke probes use, and
+	// it pins the process handle so a reaped PID cannot be reused underneath it.
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		treeErr, _ := killProcessTreePinned(cmd.Process)
+		return treeErr
+	}
+	cmd.WaitDelay = wtGitWaitDelay
 	hideWindow(cmd)
 	// The headless overlay is appended last so it always wins: git must never
 	// reach for a terminal prompt or an editor on this path.
