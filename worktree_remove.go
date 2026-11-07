@@ -24,8 +24,11 @@
 // matches the pattern and sits under its recorded root, that HEAD and branch
 // are what the server expects, that nothing is uncommitted, and that nothing is
 // unpushed. Uncommitted work is never deleted: the worktree is KEPT and
-// reported. If work exists only here it is pushed to aix/rescue/… first, and
-// only if that push fails is the worktree kept.
+// reported. Commits that exist only here are given a name that outlives the
+// directory — usually the worktree's own branch, which already holds them;
+// otherwise a LOCAL aix/rescue/… ref in the main repository
+// (worktree_rescue.go). Nothing is pushed to anybody's remote unless the
+// caller asked for it, and only if the rescue fails is the worktree kept.
 //
 // The ONE exception is `discardChanges`, sent only by a confirmed feature
 // delete (VOICE_DELETE_GATE.md §5): the person was told, before confirming,
@@ -57,8 +60,13 @@ const (
 	keptReasonUncommittedWork  = "uncommitted_work"
 	keptReasonUnpushedWork     = "unpushed_work"
 	keptReasonRescuePushFailed = "rescue_push_failed"
-	keptReasonNotRegistered    = "not_registered"
-	keptReasonStateUnreadable  = "state_unreadable"
+	// The commits could not be given a name that outlives the worktree: the
+	// local ref could not be created, or HEAD could not be read. Distinct from
+	// rescue_push_failed because the remedies differ — one is a network or
+	// permission problem on somebody's remote, this one is local.
+	keptReasonRescueFailed    = "rescue_failed"
+	keptReasonNotRegistered   = "not_registered"
+	keptReasonStateUnreadable = "state_unreadable"
 )
 
 type worktreeRemoveRequest struct {
@@ -74,7 +82,11 @@ type worktreeRemoveRequest struct {
 	DefaultBranch string `json:"defaultBranch"`
 	// RescueBranch defaults to aix/rescue/<featureFolder>/<repoFolder>.
 	RescueBranch string `json:"rescueBranch"`
-	// AllowRescuePush defaults to true.
+	// AllowRescuePush is OPT-IN: absent or false means the commits are saved
+	// LOCALLY (worktree_rescue.go), never pushed. It used to default to TRUE,
+	// and the hourly sweep never sends it — so an unattended timer was creating
+	// a vendor-named branch in the owner's GitHub, visible to their whole
+	// organisation, for work they never asked us to publish.
 	AllowRescuePush *bool `json:"allowRescuePush"`
 	// DiscardChanges skips the uncommitted / unpushed proofs (a confirmed
 	// feature delete). Absent = false, so an older server never sends it.
@@ -82,17 +94,28 @@ type worktreeRemoveRequest struct {
 }
 
 type worktreeRemoveResult struct {
-	Path            string              `json:"path"`
-	Rel             string              `json:"rel"`
-	Removed         bool                `json:"removed"`
-	Kept            bool                `json:"kept"`
-	KeptReason      string              `json:"keptReason,omitempty"`
-	Detail          string              `json:"detail,omitempty"`
-	AdminDir        string              `json:"adminDir,omitempty"`
-	AdminDirRemoved bool                `json:"adminDirRemoved"`
-	RescuePushed    bool                `json:"rescuePushed,omitempty"`
-	RescueBranch    string              `json:"rescueBranch,omitempty"`
-	Deleted         linkSafeDeleteStats `json:"deleted"`
+	Path            string `json:"path"`
+	Rel             string `json:"rel"`
+	Removed         bool   `json:"removed"`
+	Kept            bool   `json:"kept"`
+	KeptReason      string `json:"keptReason,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+	AdminDir        string `json:"adminDir,omitempty"`
+	AdminDirRemoved bool   `json:"adminDirRemoved"`
+	RescuePushed    bool   `json:"rescuePushed,omitempty"`
+	// RescueBranch is the ref that now holds the commits — the worktree's OWN
+	// branch when that already named them, otherwise the aix/rescue/... ref this
+	// removal created, otherwise the ref it pushed.
+	RescueBranch string `json:"rescueBranch,omitempty"`
+	// RescueOutcome is which of those happened: branch_retained, branch_created
+	// or pushed. Empty when there was nothing unpushed to save.
+	RescueOutcome string `json:"rescueOutcome,omitempty"`
+	// RescueCommits is how many unpushed commits the rescue covered, as counted
+	// by the unpushed proof (which samples up to its own bound, so it is a
+	// floor). Reported so a retirement says how much work it preserved rather
+	// than only that it preserved some.
+	RescueCommits int                 `json:"rescueCommits,omitempty"`
+	Deleted       linkSafeDeleteStats `json:"deleted"`
 	// ChecksPassed names the device-side proofs that held, in order, so a
 	// removal is reported rather than merely claimed.
 	ChecksPassed []string `json:"checksPassed,omitempty"`
@@ -216,20 +239,29 @@ func removeWorktree(ctx context.Context, req worktreeRemoveRequest) (worktreeRem
 			return res, nil
 		}
 		if unpushed {
-			if req.AllowRescuePush != nil && !*req.AllowRescuePush {
-				res.Kept, res.KeptReason = true, keptReasonUnpushedWork
-				res.Detail = fmt.Sprintf("%d unpushed commit(s) and rescue pushing is off", len(sample))
+			// Nothing of ours reaches their remote without consent
+			// (WORKTREE_CONFIG_AND_PORTABILITY.md §7 invariant 4). The commits get
+			// a LOCAL name that outlives the worktree; a push happens only when the
+			// caller explicitly asked for one.
+			res.RescueCommits = len(sample)
+			if rerr := rescueUnpushedCommits(ctx, mainRepo, wt, state, req, rescueRef, &res); rerr != nil {
+				res.Kept, res.Detail = true, rerr.Error()
+				var pushErr *rescuePushError
+				if errors.As(rerr, &pushErr) {
+					res.KeptReason = keptReasonRescuePushFailed
+				} else {
+					res.KeptReason = keptReasonRescueFailed
+				}
 				return res, nil
 			}
-			if _, perr := wtGitNetwork(ctx, wt.Abs, "push", remoteOrDefault(req.Remote),
-				"HEAD:refs/heads/"+rescueRef); perr != nil {
-				res.Kept, res.KeptReason, res.Detail = true, keptReasonRescuePushFailed, perr.Error()
-				return res, nil
-			}
-			res.RescuePushed = true
-			res.ChecksPassed = append(res.ChecksPassed, "rescue_pushed")
+		} else {
+			// ONLY when there was nothing to save. This token used to be appended
+			// unconditionally, so a retirement that had just rescued commits
+			// reported "nothing_unpushed" beside "rescue_pushed" — two claims that
+			// contradict each other, in the field a person reads to find out what
+			// happened (invariant 8: report, do not claim).
+			res.ChecksPassed = append(res.ChecksPassed, "nothing_unpushed")
 		}
-		res.ChecksPassed = append(res.ChecksPassed, "nothing_unpushed")
 	}
 
 	// Step 1: the link-safe delete. NOT `git worktree remove`.
