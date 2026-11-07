@@ -165,10 +165,10 @@ func TestCodexPostUpdate_RefusedRollbackDoesNotSurviveRestart(t *testing.T) {
 	}
 }
 
-// A terminal codex run arms only after the prompt reached the child, so it
-// settles instead of withdrawing. That settlement still advances observedAt
-// when the agent is replaced before the debt is paid.
-func TestCodexPostUpdate_ASettledTerminalRunAdvancesObservedAtAcrossRestart(t *testing.T) {
+// A run settled by codexUsageRunSettled (the hook terminal codex sessions arm
+// after the prompt reaches the child) still advances observedAt when the agent
+// is replaced before the debt is paid.
+func TestCodexPostUpdate_ASettledRunAdvancesObservedAtAcrossRestart(t *testing.T) {
 	now := time.Now()
 	runStart := now.Add(-3 * time.Minute)
 	f := newCodexFreshnessFixture(t, now.Add(-3*time.Hour))

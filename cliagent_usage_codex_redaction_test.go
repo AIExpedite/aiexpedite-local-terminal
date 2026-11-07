@@ -236,6 +236,14 @@ func TestCodexCommit_RefusedRenameLogsNoPathOrQuota(t *testing.T) {
 	}
 	t.Cleanup(func() { codexRateLimitRename = prev })
 
+	prevSleep := codexRateLimitCommitSleep
+	codexRateLimitCommitSleep = func(time.Duration) {}
+	t.Cleanup(func() { codexRateLimitCommitSleep = prevSleep })
+
+	codexCommitRefusedMu.Lock()
+	codexCommitRefusedLastLog = time.Time{}
+	codexCommitRefusedMu.Unlock()
+
 	logged := captureStdout(t, func() {
 		if codexCommitRateLimitSnapshot(f.cache, []byte(`{"usedPercentage":`+quotaMarker+`}`), now) {
 			t.Fatal("every rename was refused, so the commit must fail")

@@ -484,8 +484,8 @@ func TestCLIUsageHint_SameAccountRollbackSendsNothing(t *testing.T) {
 	if after.GenerationEpoch != before.GenerationEpoch || after.Generation != before.Generation {
 		t.Fatal("a same-account rollback moved the generation")
 	}
-	time.Sleep(2 * cliUsageHintSpacing)
-	for _, h := range rec.all() {
+	hints := waitHints(t, rec, 2, 2*cliUsageHintSpacing)
+	for _, h := range hints {
 		if h.hint.Provider == codexUsageProvider && (h.hint.GenerationEpoch != before.GenerationEpoch || h.hint.Generation != before.Generation) {
 			t.Fatal("a same-account rollback sent a hint")
 		}

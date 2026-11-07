@@ -448,6 +448,26 @@ const (
 	codexRateLimitCommitBackoff  = 15 * time.Millisecond
 )
 
+// codexRateLimitCommitSleep is time.Sleep by default, injectable by tests.
+var codexRateLimitCommitSleep = time.Sleep
+
+var (
+	codexCommitRefusedMu       sync.Mutex
+	codexCommitRefusedLastLog  time.Time
+	codexCommitRefusedInterval = 5 * time.Second
+)
+
+func codexLogCommitRefused() {
+	codexCommitRefusedMu.Lock()
+	defer codexCommitRefusedMu.Unlock()
+	now := time.Now()
+	if !codexCommitRefusedLastLog.IsZero() && now.Sub(codexCommitRefusedLastLog) < codexCommitRefusedInterval {
+		return
+	}
+	codexCommitRefusedLastLog = now
+	fmt.Printf("%s[cli-usage] codex cache commit refused%s\n", colorYellow, colorReset)
+}
+
 // codexRateLimitCacheLockWait bounds how long a WAITING Codex cache writer
 // blocks on each of the two locks the transaction takes — the in-process gate
 // and the cross-process advisory file lock — and codexRateLimitCacheLockPoll is
@@ -2012,10 +2032,10 @@ var codexCommitRateLimitSnapshot = func(path string, out []byte, now time.Time) 
 		if attempt == codexRateLimitCommitAttempts {
 			break
 		}
-		time.Sleep(codexRateLimitCommitBackoff)
+		codexRateLimitCommitSleep(codexRateLimitCommitBackoff)
 	}
 	_ = os.Remove(tmp)
-	fmt.Printf("%s[cli-usage] codex cache commit refused%s\n", colorYellow, colorReset)
+	codexLogCommitRefused()
 	return false
 }
 
