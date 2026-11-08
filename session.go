@@ -2591,6 +2591,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// (musecode_auth_signal.go).
 			if isMuseCodeCommand(session.Command) {
 				observeMuseCodeAuthOutput(line.text, time.Now())
+				// A `muse exec --json` run's allowance record keeps the CLI
+				// Agents card current (cliagent_usage_musecode_run.go).
+				captureMuseCodeRunUsageLine(line.text, time.Now())
 			}
 
 			if isClaudeCommand(session.Command) {

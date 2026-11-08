@@ -138,7 +138,12 @@ func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
 	if path == "" || entry.AccountKey == "" {
 		return false
 	}
-	file := readMuseCodeUsageLiveFileLocked()
+	return writeMuseCodeUsageLiveLocked(readMuseCodeUsageLiveFileLocked(), entry)
+}
+
+// writeMuseCodeUsageLiveLocked writes `file` with `entry` replacing its
+// account's reading, newest first, capped. Caller holds museCodeUsageLiveCacheMu.
+func writeMuseCodeUsageLiveLocked(file museCodeUsageLiveFile, entry museCodeUsageLiveCache) bool {
 	kept := []museCodeUsageLiveCache{entry}
 	for _, r := range file.Readings {
 		if r.AccountKey != entry.AccountKey && r.AccountKey != "" {
@@ -150,7 +155,7 @@ func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
 		kept = kept[:museCodeUsageLiveMaxAccounts]
 	}
 	file.Readings = kept
-	return writeJSONFileAtomic(path, file)
+	return writeJSONFileAtomic(museCodeUsageLiveCachePath(), file)
 }
 
 // loadMuseCodeUsageLive returns the cached reading for that account, if any.
