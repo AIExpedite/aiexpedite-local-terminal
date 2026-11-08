@@ -209,7 +209,7 @@ func TestOneShotNative_HeldReplyTailIsPublishedBeforeTheTerminalRecord(t *testin
 			}
 
 			frames := sink.all()
-			order := museFrameOrder(frames)
+			order := collapseDeltaRuns(museFrameOrder(frames))
 			if got := strings.Join(order, "|"); got != tc.wantOrder {
 				t.Fatalf("frame order %q, want %q (a delta after the terminal record opens a second bubble):\n%s",
 					got, tc.wantOrder, museFramesDump(frames))
@@ -221,9 +221,25 @@ func TestOneShotNative_HeldReplyTailIsPublishedBeforeTheTerminalRecord(t *testin
 	}
 }
 
+// collapseDeltaRuns folds consecutive delta frames into one "delta": how many
+// frames the text took is the coalescer's business (the run's end publishes the
+// safe text and a held tail apart); that no delta follows the terminal record
+// is the contract.
+func collapseDeltaRuns(order []string) []string {
+	var out []string
+	for _, kind := range order {
+		if kind == "delta" && len(out) > 0 && out[len(out)-1] == "delta" {
+			continue
+		}
+		out = append(out, kind)
+	}
+	return out
+}
+
 // A credential that ends the reply is still masked when the run's end releases
-// it: the release is a FINAL flush, so the label and its value go out in one
-// frame, redacted, ahead of the terminal record.
+// it: the release is a FINAL flush, so the label and its value go out together
+// in one frame, redacted (apart from the safe text before them), ahead of the
+// terminal record.
 func TestOneShotNative_RunEndReleasesACredentialTailMasked(t *testing.T) {
 	m := installMuseCodeStub(t)
 	isolateMuseTurn(t)
@@ -245,11 +261,16 @@ func TestOneShotNative_RunEndReleasesACredentialTailMasked(t *testing.T) {
 			t.Fatalf("the credential reached a published frame:\n%s", museFramesDump(frames))
 		}
 	}
-	if got := strings.Join(museFrameOrder(frames), "|"); got != "delta|terminal|complete" {
+	if got := strings.Join(collapseDeltaRuns(museFrameOrder(frames)), "|"); got != "delta|terminal|complete" {
 		t.Fatalf("frame order %q, want delta|terminal|complete:\n%s", got, museFramesDump(frames))
 	}
-	if delta := frames[0].Output; !strings.Contains(delta, "running tool: ") || !strings.Contains(delta, "[REDACTED]") {
-		t.Fatalf("the safe prefix must stream and the pair must be masked in one frame: %s", delta)
+	prefix, masked := false, false
+	for _, f := range frames {
+		prefix = prefix || strings.Contains(f.Output, "running tool: ")
+		masked = masked || strings.Contains(f.Output, "API_KEY=[REDACTED]")
+	}
+	if !prefix || !masked {
+		t.Fatalf("the safe prefix must stream and the pair must go out masked:\n%s", museFramesDump(frames))
 	}
 }
 

@@ -1030,6 +1030,11 @@ func (c *deltaCoalescer) publish(line string) {
 func (c *deltaCoalescer) publishFinal(line string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The safe text first, in a frame of its own; then the held carry alone.
+	// Joined, the line-level redaction of a carried `api_key=` / bearer pair
+	// (whose `\S+` runs to the end of the line) would also swallow the frame's
+	// closing JSON, every reader would drop the frame, and the safe text with it.
+	c.flushLocked(false)
 	c.flushLocked(true)
 	c.emit(line)
 }

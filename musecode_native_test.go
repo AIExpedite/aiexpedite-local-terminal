@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -297,6 +298,38 @@ func TestDeltaCoalescer_CredentialSplitAcrossFlushesIsNotPublishedRaw(t *testing
 	}
 }
 
+// The run's end releases a held credential-shaped tail, but never in the same
+// frame as the text before it: redacting the tail's `api_key=` pair runs to the
+// end of the line, and a frame whose closing JSON was swallowed is dropped by
+// every reader, with the safe text in it.
+func TestDeltaCoalescer_RunEndKeepsTheSafeTextInAParseableFrame(t *testing.T) {
+	var out []string
+	c := newDeltaCoalescer(museCodeDeltaFrame, func(line string) { out = append(out, redactAgentSecrets(line)) })
+	c.add("Done. Set api_key=")
+	c.publishFinal(`{"payload_type":"run.terminal.completed","payload":{"text":"Done."}}`)
+	c.close()
+
+	safe := false
+	for _, line := range out {
+		var frame struct {
+			PayloadType string `json:"payload_type"`
+			Payload     struct {
+				Text string `json:"text"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal([]byte(line), &frame) == nil && frame.PayloadType == "run.output.delta" &&
+			strings.Contains(frame.Payload.Text, "Done. Set") {
+			safe = true
+		}
+	}
+	if !safe {
+		t.Fatalf("the safe text did not reach a parseable delta frame: %q", out)
+	}
+	if last := out[len(out)-1]; !strings.Contains(last, "run.terminal.completed") {
+		t.Fatalf("the terminal record must come last: %q", out)
+	}
+}
+
 func TestMaskOpaqueContinuation(t *testing.T) {
 	prefix, rest := strings.Repeat("a", 10), strings.Repeat("b", 75)
 	cases := []struct {
@@ -509,8 +542,19 @@ func TestDeltaCoalescer_RunEndReleasesTheCarryAheadOfItsRecord(t *testing.T) {
 		c.add("The summary is in the build output")
 		c.publishFinal(terminal)
 		c.close()
-		if got := strings.Join(snapshot(), "|"); got != "text:The summary is in the build output|"+terminal {
-			t.Fatalf("got %q", got)
+		// The safe text and the held tail ("t" may begin "token") go out as
+		// separate deltas; a reader joins deltas as written, so the text is whole,
+		// and every delta precedes the terminal record.
+		frames := snapshot()
+		if len(frames) < 2 || frames[len(frames)-1] != terminal {
+			t.Fatalf("the terminal record must come last: %q", frames)
+		}
+		var text strings.Builder
+		for _, f := range frames[:len(frames)-1] {
+			text.WriteString(strings.TrimPrefix(f, "text:"))
+		}
+		if text.String() != "The summary is in the build output" {
+			t.Fatalf("the deltas must carry the whole text, got %q from %q", text.String(), frames)
 		}
 	})
 
