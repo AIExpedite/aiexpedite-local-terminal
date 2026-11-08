@@ -23,6 +23,21 @@
 //	chat, voice or Ship turn, and the Refresh probe's cooldown then keeps it
 //	instead of spending a turn of its own.
 //
+// How a run is read (museCodeRunUsageCapture), on both launch paths — the
+// Chat manager (musecode_native.go, ObserveRun) and a session_start run
+// (session.go, readOutputStream):
+//
+//   - Line by line, as the run streams. The record sums up the run's calls,
+//     so it is printed late: after a tool-heavy turn's output, far more than
+//     the bounded diagnostic prefix the Chat manager keeps
+//     (oneShotNativeMaxRawStdout).
+//   - Under the account the run was LAUNCHED with, pinned before its child is
+//     spawned, and saved only while that account is still the one signed in
+//     (museCodeAccountUnchanged, the Refresh probe's own rule). After a login
+//     switch mid-run the reading cannot be attributed: filed under the new
+//     account it would show the old account's quota on the new account's card
+//     and hold its Refresh off for five minutes, so it is dropped instead.
+//
 // What it never does: overwrite a newer reading (a Refresh probe or a later
 // run), make a model call, or read anything but the allowance numbers.
 package main
@@ -101,27 +116,38 @@ func parseMuseCodeRunUsageLine(line string, now time.Time) (museCodeUsageLiveCac
 	return out, true
 }
 
-// captureMuseCodeRunUsageLine records the allowance one `muse exec --json`
-// line carries, for whoever Muse runs as now. Reports whether it was kept.
-func captureMuseCodeRunUsageLine(line string, now time.Time) bool {
+// museCodeRunUsageCapture reads the allowance records of ONE `muse exec
+// --json` run (see the file comment). A nil capture records nothing, so a
+// session of any other command carries one with no condition of its own.
+type museCodeRunUsageCapture struct {
+	// accountKey is whoever Muse ran as when the run was launched.
+	accountKey string
+}
+
+// newMuseCodeRunUsageCapture pins the account Muse runs as now. Call it
+// before the run's child is spawned: the child bills the credentials it
+// starts with.
+func newMuseCodeRunUsageCapture() *museCodeRunUsageCapture {
+	return &museCodeRunUsageCapture{accountKey: museCodeUsageAccountKey(currentMuseCodeAccountFingerprint())}
+}
+
+// Line records the allowance one stdout line of the run carries, under the
+// account the run was launched with. Reports whether it was kept.
+func (c *museCodeRunUsageCapture) Line(line string, now time.Time) bool {
+	if c == nil {
+		return false
+	}
 	reading, ok := parseMuseCodeRunUsageLine(line, now)
 	if !ok {
 		return false
 	}
-	reading.AccountKey = museCodeUsageAccountKey(currentMuseCodeAccountFingerprint())
+	// Checked as the reading is saved, not only at launch: after a login
+	// switch there is no account it can be filed under.
+	if !museCodeAccountUnchanged(c.accountKey) {
+		return false
+	}
+	reading.AccountKey = c.accountKey
 	return saveMuseCodeUsageLiveIfNewer(reading)
-}
-
-// observeMuseCodeRunUsage scans a finished turn's whole stdout (the one-shot
-// native manager's ObserveTurn). Every record is offered; only the newest
-// survives the save rule.
-func observeMuseCodeRunUsage(stdout string, now time.Time) {
-	if !strings.Contains(stdout, museCodeRunUsagePayloadType) {
-		return
-	}
-	for _, line := range strings.Split(stdout, "\n") {
-		captureMuseCodeRunUsageLine(line, now)
-	}
 }
 
 // saveMuseCodeUsageLiveIfNewer saves that account's reading unless the cache

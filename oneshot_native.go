@@ -170,9 +170,17 @@ type oneShotNativeSpec struct {
 	ValidSeed func(id string) bool
 	// LooksLikeMissingSession recognizes a stale-resume failure.
 	LooksLikeMissingSession func(stdout, stderr string) bool
-	// ObserveTurn, when set, sees every finished turn's raw stdout and stderr
-	// (Muse Code reads its own sign-in refusal from them).
+	// ObserveTurn, when set, sees every finished turn's raw stdout — the
+	// bounded diagnostic prefix (oneShotNativeMaxRawStdout), not all of it —
+	// and its stderr (Muse Code reads its own sign-in refusal from them).
 	ObserveTurn func(stdout, stderr string)
+	// ObserveRun, when set, is called once per CLI run, just before the
+	// run's child is spawned, and returns the function that then sees each
+	// stdout line of that run as it is scanned: every line, however much the
+	// run prints, where ObserveTurn gets only the prefix. Whatever it pins at
+	// the spawn belongs to that run alone (Muse Code: the account the child
+	// is launched with, which its allowance record is filed under).
+	ObserveRun func() func(line string)
 	// StripEnvPrefixes are upper-cased env prefixes removed from the child.
 	StripEnvPrefixes []string
 	// ReplayPreamble opens a transcript-replay prompt.
@@ -932,6 +940,12 @@ func (m *oneShotNativeManager) runOneShot(
 	if session.Status() == "ended" {
 		return oneShotRunResult{err: fmt.Errorf("session ended during turn")}
 	}
+	// Pinned before the spawn, so the run's lines are read against what was
+	// true when its child was launched (spec.ObserveRun).
+	var observeLine func(line string)
+	if m.spec.ObserveRun != nil {
+		observeLine = m.spec.ObserveRun()
+	}
 	// Recorded in the spawn ledger for this turn only, so the next boot can
 	// reap a surviving child (and its tools) instead of leaving an orphan
 	// holding the cloud reservation (session_ledger.go).
@@ -975,7 +989,7 @@ func (m *oneShotNativeManager) runOneShot(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stream = m.streamEvents(session, stdout, publishFn)
+		stream = m.streamEvents(session, stdout, publishFn, observeLine)
 	}()
 	go func() {
 		defer wg.Done()
@@ -1029,11 +1043,13 @@ type oneShotStreamState struct {
 // streamEvents publishes each stdout line as its own MESSAGE frame and folds
 // the parsed events into the turn result. Only assistant text accumulates —
 // tool payloads folded into the transcript would be replayed to the model as
-// if the assistant had said them.
+// if the assistant had said them. observeLine (spec.ObserveRun's, or nil)
+// sees every line the turn reads.
 func (m *oneShotNativeManager) streamEvents(
 	session *oneShotNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
+	observeLine func(line string),
 ) oneShotStreamState {
 	var state oneShotStreamState
 	scanner := bufio.NewScanner(r)
@@ -1052,6 +1068,11 @@ func (m *oneShotNativeManager) streamEvents(
 		if state.bytes > oneShotNativeMaxStdout {
 			state.overflow = true
 			break
+		}
+		// Every line, not only the bounded prefix kept below: a record at the
+		// end of a long run (Muse Code's run.usage allowance) is still read.
+		if observeLine != nil {
+			observeLine(line)
 		}
 		if state.raw.Len() < oneShotNativeMaxRawStdout {
 			state.raw.WriteString(line)

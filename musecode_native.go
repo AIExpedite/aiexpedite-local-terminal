@@ -87,11 +87,15 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 		return looksLikeMissingMuseCodeSession(stdout, stderr)
 	},
 	ObserveTurn: func(stdout, stderr string) {
-		now := time.Now()
-		observeMuseCodeAuthOutput(stdout+"\n"+stderr, now)
-		// The run's own allowance record keeps the CLI Agents card current
-		// (cliagent_usage_musecode_run.go).
-		observeMuseCodeRunUsage(stdout, now)
+		observeMuseCodeAuthOutput(stdout+"\n"+stderr, time.Now())
+	},
+	// The run's own allowance record keeps the CLI Agents card current. It is
+	// read as each line streams, not from the bounded prefix ObserveTurn is
+	// handed, and filed under the account the run was launched with
+	// (cliagent_usage_musecode_run.go).
+	ObserveRun: func() func(line string) {
+		capture := newMuseCodeRunUsageCapture()
+		return func(line string) { capture.Line(line, time.Now()) }
 	},
 	StripEnvPrefixes: museCodeUnrelatedStripped,
 	ReplayPreamble: "You are continuing an AIExpedite Muse Code Chat conversation after native session resume was unavailable. " +

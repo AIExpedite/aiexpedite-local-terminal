@@ -89,7 +89,7 @@ func TestCaptureMuseCodeRunUsage_TheCardShowsTheRunsAllowance(t *testing.T) {
 	home := isolateMuseCodeHome(t)
 	writeMuseConfig(t, home, "auth.json", museAuthFixture)
 	now := museRunUsageAsOf.Add(2 * time.Second)
-	if !captureMuseCodeRunUsageLine(museRunUsageRecord, now) {
+	if !newMuseCodeRunUsageCapture().Line(museRunUsageRecord, now) {
 		t.Fatal("capture must keep the run's reading")
 	}
 	usage, _ := museCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
@@ -117,7 +117,7 @@ func TestCaptureMuseCodeRunUsage_TheCardShowsTheRunsAllowance(t *testing.T) {
 func TestCaptureMuseCodeRunUsage_IsKeyedToTheAccountMuseRunsAs(t *testing.T) {
 	home := isolateMuseCodeHome(t)
 	now := museRunUsageAsOf.Add(time.Second)
-	if !captureMuseCodeRunUsageLine(museRunUsageRecord, now) {
+	if !newMuseCodeRunUsageCapture().Line(museRunUsageRecord, now) {
 		t.Fatal("capture")
 	}
 	if _, ok := loadMuseCodeUsageLive(museCodeUnknownAccountKey); !ok {
@@ -148,7 +148,7 @@ func TestCaptureMuseCodeRunUsage_NeverReplacesANewerReading(t *testing.T) {
 	}
 
 	// The older run's record arrives late: kept out.
-	if captureMuseCodeRunUsageLine(museRunUsageRecord, base.Add(11*time.Minute)) {
+	if newMuseCodeRunUsageCapture().Line(museRunUsageRecord, base.Add(11*time.Minute)) {
 		t.Fatal("an older run reading replaced a newer probe reading")
 	}
 	got, _ := loadMuseCodeUsageLive(key)
@@ -156,12 +156,12 @@ func TestCaptureMuseCodeRunUsage_NeverReplacesANewerReading(t *testing.T) {
 		t.Fatalf("kept=%#v", got)
 	}
 	// The same instant is not newer either.
-	if captureMuseCodeRunUsageLine(museRunUsageWith(5, 50, base.Add(10*time.Minute)), base.Add(11*time.Minute)) {
+	if newMuseCodeRunUsageCapture().Line(museRunUsageWith(5, 50, base.Add(10*time.Minute)), base.Add(11*time.Minute)) {
 		t.Fatal("a reading observed at the same instant replaced the stored one")
 	}
 
 	// A later run replaces it, and keeps the window length the probe learned.
-	if !captureMuseCodeRunUsageLine(museRunUsageWith(7, 100, base.Add(20*time.Minute)), base.Add(21*time.Minute)) {
+	if !newMuseCodeRunUsageCapture().Line(museRunUsageWith(7, 100, base.Add(20*time.Minute)), base.Add(21*time.Minute)) {
 		t.Fatal("a newer run reading must replace the probe's")
 	}
 	got, _ = loadMuseCodeUsageLive(key)
@@ -172,7 +172,7 @@ func TestCaptureMuseCodeRunUsage_NeverReplacesANewerReading(t *testing.T) {
 
 func TestCaptureMuseCodeRunUsage_UnknownWindowLengthDefaultsToFiveHours(t *testing.T) {
 	isolateMuseCodeHome(t)
-	if !captureMuseCodeRunUsageLine(museRunUsageRecord, museRunUsageAsOf.Add(time.Second)) {
+	if !newMuseCodeRunUsageCapture().Line(museRunUsageRecord, museRunUsageAsOf.Add(time.Second)) {
 		t.Fatal("capture")
 	}
 	got, _ := loadMuseCodeUsageLive(museCodeUnknownAccountKey)
@@ -185,21 +185,66 @@ func TestCaptureMuseCodeRunUsage_UnknownWindowLengthDefaultsToFiveHours(t *testi
 	}
 }
 
-// The chat manager hands every finished turn to ObserveTurn: a turn's stdout
+// The chat manager hands every line of every run to ObserveRun: a run's stdout
 // holds dozens of records, and the allowance among them lands on the card.
-func TestMuseCodeNativeObserveTurn_KeepsTheRunsAllowance(t *testing.T) {
+// ObserveTurn, handed only the finished turn's bounded prefix and nothing of
+// the account the run was launched with, records none.
+func TestMuseCodeNativeObserveRun_KeepsTheRunsAllowance(t *testing.T) {
 	isolateMuseCodeHome(t)
-	stdout := strings.Join([]string{
+	lines := []string{
 		`{"payload_type":"runtime.command.accepted","payload":{}}`,
 		`{"payload_type":"task.lifecycle.failed","payload":{"event":{"reason":"API error 429: Subscription quota exhausted."}}}`,
 		museRunUsageRecord,
 		`{"payload_type":"run.terminal.failed","payload":{"terminal":"failed","reason":"API error 429"}}`,
-		"",
-	}, "\n")
-	museCodeNativeSpec.ObserveTurn(stdout, "run ended with Failed: API error 429")
+	}
+	museCodeNativeSpec.ObserveTurn(strings.Join(lines, "\n"), "run ended with Failed: API error 429")
+	if r, ok := loadMuseCodeUsageLive(museCodeUnknownAccountKey); ok {
+		t.Fatalf("ObserveTurn filed a reading: %#v", r)
+	}
+	observe := museCodeNativeSpec.ObserveRun()
+	for _, line := range lines {
+		observe(line)
+	}
 	got, ok := loadMuseCodeUsageLive(museCodeUnknownAccountKey)
 	if !ok || got.Weekly.UsedPercent != 99 || got.ObservedAtMs != museRunUsageAsOf.UnixMilli() {
 		t.Fatalf("ok=%v reading=%#v", ok, got)
+	}
+}
+
+// A run's reading is filed under the account it was launched with, and only
+// while that account is still signed in: after a switch it is saved for
+// neither account (the old one is no longer whoever Muse runs as, the new one
+// never made the request).
+func TestMuseCodeRunUsageCapture_IsPinnedToTheLaunchAccount(t *testing.T) {
+	home := isolateMuseCodeHome(t)
+	writeMuseConfig(t, home, "auth.json", museAuthFixture)
+	launched := newMuseCodeRunUsageCapture()
+	writeMuseConfig(t, home, "auth.json", museOtherAuthFixture)
+	if launched.Line(museRunUsageRecord, museRunUsageAsOf.Add(time.Second)) {
+		t.Fatal("a run launched before a login switch saved its reading")
+	}
+	if readings := museRunReadings(); len(readings) != 0 {
+		t.Fatalf("saved %#v", readings)
+	}
+	// The same capture saves again once its account is back.
+	writeMuseConfig(t, home, "auth.json", museAuthFixture)
+	if !launched.Line(museRunUsageRecord, museRunUsageAsOf.Add(time.Second)) {
+		t.Fatal("the launch account's reading must be kept while it is signed in")
+	}
+	if _, ok := loadMuseCodeUsageLive(museDevAccountKey()); !ok {
+		t.Fatal("the reading must be filed under the launch account")
+	}
+}
+
+// Every session that is not a Muse run carries a nil capture.
+func TestMuseCodeRunUsageCapture_NilRecordsNothing(t *testing.T) {
+	isolateMuseCodeHome(t)
+	var none *museCodeRunUsageCapture
+	if none.Line(museRunUsageRecord, museRunUsageAsOf.Add(time.Second)) {
+		t.Fatal("a nil capture reported a save")
+	}
+	if readings := museRunReadings(); len(readings) != 0 {
+		t.Fatalf("a nil capture saved %#v", readings)
 	}
 }
 
@@ -208,7 +253,7 @@ func TestMuseCodeNativeObserveTurn_KeepsTheRunsAllowance(t *testing.T) {
 func TestCaptureMuseCodeRunUsage_ARefreshRightAfterARunSpendsNothing(t *testing.T) {
 	isolateMuseCodeHome(t)
 	now := time.Now()
-	if !captureMuseCodeRunUsageLine(museRunUsageWith(3, 40, now), now) {
+	if !newMuseCodeRunUsageCapture().Line(museRunUsageWith(3, 40, now), now) {
 		t.Fatal("capture")
 	}
 	started := false

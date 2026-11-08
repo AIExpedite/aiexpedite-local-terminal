@@ -27,6 +27,14 @@ import (
 //
 //	OPENCODE_STUB_VERSION    version string printed for `--version`
 //	OPENCODE_STUB_STDOUT     literal stdout, "\n"-escaped as \n
+//	OPENCODE_STUB_STDOUT_FILE when readable, its contents (verbatim) are the
+//	                         run's stdout instead of OPENCODE_STUB_STDOUT —
+//	                         for more output than one environment variable
+//	                         holds (32 KiB on Windows)
+//	OPENCODE_STUB_WAIT_FILE  when set, the run waits (up to 60 s) for this file
+//	                         to exist before it prints its stdout, so a test
+//	                         can change something between the spawn and the
+//	                         output without racing a timer
 //	OPENCODE_STUB_STDERR     literal stderr
 //	OPENCODE_STUB_EXIT       exit code (default 0)
 //	OPENCODE_STUB_ARGV_LOG   append the received argv to this file
@@ -138,6 +146,15 @@ func main() {
 		}
 	}
 
+	if p := os.Getenv("OPENCODE_STUB_WAIT_FILE"); p != "" {
+		for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); {
+			if _, err := os.Stat(p); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
 	// Survived the sleep: record it. A deadline test asserts this file does NOT
 	// exist, which is the only cross-platform proof that the kill reached the
 	// child rather than the parent merely giving up on it.
@@ -157,6 +174,11 @@ func main() {
 	}
 
 	stdout := unescape(os.Getenv("OPENCODE_STUB_STDOUT"))
+	if p := os.Getenv("OPENCODE_STUB_STDOUT_FILE"); p != "" {
+		if data, err := os.ReadFile(p); err == nil {
+			stdout = string(data)
+		}
+	}
 	exitCode, _ := strconv.Atoi(env("OPENCODE_STUB_EXIT", "0"))
 	if os.Getenv("OPENCODE_STUB_FAIL_FIRST") != "" && runs == 1 {
 		stdout = unescape(os.Getenv("OPENCODE_STUB_FIRST_STDOUT"))

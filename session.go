@@ -220,6 +220,12 @@ type CLISession struct {
 	// the session can still be exported. "" for a fresh turn.
 	openCodeResumeSessionID string
 
+	// museCodeRunUsage files a `muse exec --json` run's allowance record under
+	// the account its child was spawned with (cliagent_usage_musecode_run.go),
+	// pinned before the spawn. Nil for every other command, whose Line is a
+	// no-op, so the stream reader holds no per-command condition for it.
+	museCodeRunUsage *museCodeRunUsageCapture
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -1044,6 +1050,14 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		}
 	}
 
+	// A Muse run's allowance record belongs to the account its child is
+	// spawned with, so that account is pinned here, before the spawn, and not
+	// read again when the record arrives (cliagent_usage_musecode_run.go).
+	var museRunUsage *museCodeRunUsageCapture
+	if isMuseCodeCommand(command) {
+		museRunUsage = newMuseCodeRunUsageCapture()
+	}
+
 	// Start the process. It is owned (its own process group on Unix, a
 	// kill-on-close Job Object on Windows) and recorded in the spawn ledger so
 	// a later boot can prove it gone (session_ledger.go).
@@ -1104,6 +1118,7 @@ func (sm *SessionManager) startSession(id, command string, args []string, cwd, w
 		quotaCapture:                 quotaCapture,
 		openCodeUsageRun:             openCodeUsage,
 		openCodeResumeSessionID:      openCodeResumeSessionID,
+		museCodeRunUsage:             museRunUsage,
 		finishGrokBillingAttribution: finishGrokAttribution,
 		// The child is running now, so the pin can be confirmed against the
 		// binary still on disk: a replacement that landed in the pin→Start
@@ -2591,9 +2606,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// (musecode_auth_signal.go).
 			if isMuseCodeCommand(session.Command) {
 				observeMuseCodeAuthOutput(line.text, time.Now())
-				// A `muse exec --json` run's allowance record keeps the CLI
-				// Agents card current (cliagent_usage_musecode_run.go).
-				captureMuseCodeRunUsageLine(line.text, time.Now())
+			}
+			// A `muse exec --json` run's allowance record keeps the CLI Agents
+			// card current, under the account the child was spawned with
+			// (cliagent_usage_musecode_run.go). Stdout only, as on the Chat
+			// path; a no-op for every other command.
+			if line.source == "stdout" {
+				session.museCodeRunUsage.Line(line.text, time.Now())
 			}
 
 			if isClaudeCommand(session.Command) {
