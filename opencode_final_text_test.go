@@ -165,6 +165,10 @@ func TestIsOpenCodeToolBoundary(t *testing.T) {
 
 // End to end: the completion frame of a real (stub) multi-step turn.
 func TestOpenCodeNativeSend_CompletionCarriesTheFinalAnswer(t *testing.T) {
+	// The step_finish frames carry tokens, so the turn commits real OpenCode
+	// usage: into this test's own usage cache, never the process-wide one a
+	// later propagator start would read back and announce.
+	openCodeUsageFixture(t, 1601)
 	installOpenCodeStub(t)
 	frames := []string{
 		ocStepStart, ocText("I'll check the file."), ocToolRead, ocStepFinishTools,
@@ -184,6 +188,7 @@ func TestOpenCodeNativeSend_CompletionCarriesTheFinalAnswer(t *testing.T) {
 	}, time.Minute); err != nil {
 		t.Fatalf("send: %v", err)
 	}
+	openCodeUsageInFlight.Wait()
 	var payload struct {
 		Type      string  `json:"type"`
 		Text      string  `json:"text"`

@@ -309,11 +309,15 @@ func TestAntigravityNativeStartCommand_KeepsTheStartModelAndEffort(t *testing.T)
    Every turn carries them (real child processes)
    -------------------------------------------------------------------------- */
 
+// Each subtest runs real stub turns, which arm OpenCode usage runs: the usage
+// fixture keeps their ledger and cache in the subtest's own directory, never
+// the process-wide one a later test's usage propagator would read back.
 func TestOpenCodeNativeTurns_CarryTheStartModelAndVariant(t *testing.T) {
 	start := []string{"-m", "opencode/big-pickle", "--variant", "high",
 		"--port", "4096", "--session", "ses_injected", "--format", "text", "--continue"}
 
 	t.Run("first and resumed turns", func(t *testing.T) {
+		openCodeUsageFixture(t, 1602)
 		installOpenCodeStub(t)
 		argvLog := filepath.Join(t.TempDir(), "argv.log")
 		t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
@@ -338,6 +342,7 @@ func TestOpenCodeNativeTurns_CarryTheStartModelAndVariant(t *testing.T) {
 	})
 
 	t.Run("the replay recovery", func(t *testing.T) {
+		openCodeUsageFixture(t, 1603)
 		installOpenCodeStub(t)
 		argvLog := filepath.Join(t.TempDir(), "argv.log")
 		t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
@@ -365,6 +370,7 @@ func TestOpenCodeNativeTurns_CarryTheStartModelAndVariant(t *testing.T) {
 	})
 
 	t.Run("a start without them builds the old argv", func(t *testing.T) {
+		openCodeUsageFixture(t, 1604)
 		installOpenCodeStub(t)
 		argvLog := filepath.Join(t.TempDir(), "argv.log")
 		t.Setenv("OPENCODE_STUB_ARGV_LOG", argvLog)
@@ -473,8 +479,11 @@ func TestMuseCodeNativeTurns_CarryTheStartModelAndEffort(t *testing.T) {
 			t.Fatalf("want 1 turn, got %q", lines)
 		}
 		// Nothing after the prompt file: buildMuseCodeNativeArgs's argv exactly.
+		// (The file's path may hold a space, a Windows profile name's; it
+		// never holds " --".)
 		prefix := "exec --json --disable-approval --session-id " + m.Get("s").NativeSessionID + " --prompt-file "
-		if !strings.HasPrefix(lines[0], prefix) || strings.Contains(strings.TrimPrefix(lines[0], prefix), " ") {
+		promptFile := strings.TrimPrefix(lines[0], prefix)
+		if !strings.HasPrefix(lines[0], prefix) || promptFile == "" || strings.Contains(promptFile, " --") {
 			t.Fatalf("turn argv %q, want %q<prompt file> and nothing after it", lines[0], prefix)
 		}
 	})
