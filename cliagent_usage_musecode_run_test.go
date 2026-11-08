@@ -223,3 +223,21 @@ func TestCaptureMuseCodeRunUsage_ARefreshRightAfterARunSpendsNothing(t *testing.
 		t.Fatal("the probe started a host (and would spend a turn) right after a run reported the quota")
 	}
 }
+
+// End to end through the stub `muse` and the real chat manager: a turn Meta
+// refused (429, exit 1) still leaves its allowance on the card.
+func TestMuseCodeChatTurn_ARefusedTurnStillUpdatesTheCard(t *testing.T) {
+	home := isolateMuseCodeHome(t)
+	m := installMuseCodeStub(t)
+	startMuse(t, m, "s", "")
+	refused := `{"payload_type":"run.terminal.failed","payload":{"kind":"run_terminal","terminal":"failed","text":"","reason":"API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-09T00:00:00Z. (rate_limit_error)"}}`
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museRunUsageRecord, refused))
+	t.Setenv("OPENCODE_STUB_EXIT", "1")
+	_ = m.Send("s", "reply with hello", (&frameSink{}).publish, time.Minute)
+
+	usage, _ := museCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, museRunUsageAsOf.Add(time.Minute))
+	weekly := usage.Metrics[1]
+	if weekly.Unknown || *weekly.Consumed != 99 || weekly.ResetAt != "2026-11-09T00:00:00Z" {
+		t.Fatalf("the refused turn's allowance did not reach the card: %#v", usage.Metrics)
+	}
+}
