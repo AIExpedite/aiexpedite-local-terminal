@@ -1028,6 +1028,8 @@ Summary:
 - **Process model:** one-shot `agy` stream-json process per native turn; prompt
   is sent as an NDJSON user event on stdin and stdin is then closed.
 - **Resume:** exact `--conversation <uuid>` only — never `--continue`.
+- **Model and effort:** the START's `--model` / `--effort` ride on every turn
+  (`antigravityNativeLaunchArgs`); every other START arg is dropped.
 - **Native ID capture:** after first turn, from
   `~/.gemini/antigravity-cli/cache/last_conversations.json` (cwd key) with a
   conversations-dir snapshot fallback.
@@ -2118,6 +2120,7 @@ the `__cli_smoke__` provider
 
 ```
 run --format json [--session <id>]        # forced; prompt NEVER on argv
+run --format json [--session <id>] [--model <provider/model>] [--variant <level>]   # a direct-chat turn
 ```
 
 ## Why this exists
@@ -2148,6 +2151,16 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
 - **`--session <id>`** is added only on the direct path, only above
   `openCodeNativeMinVersion`, and is the **one droppable token** in the ladder
   (`openCodeRunShapeResume` → `openCodeRunShapeNoSession`).
+- **The START's model and effort** (`-m` / `--model`, `--variant`, from its
+  signed args) are kept by the direct-chat session and appended to EVERY turn
+  (`buildOpenCodeNativeTurnArgs`), the resumed turns and the replay recovery
+  included; nothing else from a START reaches a turn. Before this the direct
+  path ignored the START's args, and with no model OpenCode runs its own
+  configured default — on a computer whose default provider has no key, every
+  turn failed with `ProviderAuthError`. The agent reports
+  `capabilities.nativeLaunchArgs`, so terminal-service claims a model or effort
+  as applied only on a device that applies it. A value must be one bounded token
+  (shared-constants `CLI_MODEL_ID_PATTERN`); anything else drops the flag.
 - **Stripped, always:** `--format` / `-f`, `--session` / `-s`, `--continue` /
   `-c`, `--fork`, `--print-logs` and their values (`openCodeStrippedFlags`,
   unchanged), decided in ONE place — `openCodeStrippedCallerFlagAt`, the single

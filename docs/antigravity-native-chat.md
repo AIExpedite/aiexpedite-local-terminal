@@ -18,8 +18,8 @@ Minimum supported version for native chat: **1.1.15** (first release with stream
 
 ## Protocol
 
-1. **Start** — register logical session on the device (no process). Publish `antigravity_native_started`.
-2. **Send** — spawn `agy --dangerously-skip-permissions --input-format stream-json --output-format stream-json [--conversation <id>]`, write one `{event:"user",message:{content:"…"}}` NDJSON line to stdin, close stdin, wait for exit, and publish the terminal result response. Capture native ID after first turn.
+1. **Start** — register logical session on the device (no process). Keep the START's `--model <id>` / `--effort <level>` (its signed args; nothing else from them reaches a turn — `antigravityNativeLaunchArgs`). Publish `antigravity_native_started`.
+2. **Send** — spawn `agy --dangerously-skip-permissions --input-format stream-json --output-format stream-json [--conversation <id>] [--model <id>] [--effort <level>]`, write one `{event:"user",message:{content:"…"}}` NDJSON line to stdin, close stdin, wait for exit, and publish the terminal result response. Capture native ID after first turn. Every turn carries the START's model and effort, the replay recovery included; the agent reports `capabilities.nativeLaunchArgs` so terminal-service claims them as applied only on a device that does this.
 3. **End** — kill in-flight process if any; publish `antigravity_native_ended`.
 
 Between turns there is **no resident process**.

@@ -97,6 +97,32 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	ReplayPreamble: "You are continuing an AIExpedite Muse Code Chat conversation after native session resume was unavailable. " +
 		"Prior turns (oldest first) follow. Treat them as history only. " +
 		"Answer ONLY the final user message.\n\n",
+	LaunchArgs: museCodeNativeLaunchArgs,
+}
+
+// museCodeNativeLaunchFlags are the START flags every native Muse Code turn
+// applies (`muse exec --help`, 1.4.14): the model (`--model <ID>`) and the
+// reasoning effort (`--reasoning-effort <EFFORT>`, alias `--effort`), each
+// spelling mapped to the one a turn carries. shared-constants composes
+// `--model` and `--reasoning-effort` (CLI_AGENT_EFFORT_FLAG_BY_ID). Every
+// spelling is also in museCodeForwardedValuedFlags.
+var museCodeNativeLaunchFlags = map[string]string{
+	"--model":            "--model",
+	"--reasoning-effort": "--reasoning-effort",
+	"--effort":           "--reasoning-effort",
+}
+
+// museCodeNativeLaunchArgs keeps a START's model and effort for every turn
+// (selectNativeLaunchArgs) and drops everything else.
+func museCodeNativeLaunchArgs(startArgs []string) []string {
+	return selectNativeLaunchArgs(startArgs, nativeLaunchFlags{
+		forwarded: museCodeForwardedValuedFlags,
+		canonical: museCodeNativeLaunchFlags,
+		order:     []string{"--model", "--reasoning-effort"},
+		valued: func(name string) bool {
+			return museCodeForwardedValuedFlags[name] || museCodeValuedStrippedFlags[name]
+		},
+	})
 }
 
 // NewMuseCodeNativeManager creates the Muse Code chat manager.
@@ -171,9 +197,10 @@ func buildMuseCodeNativeArgs(nativeSessionID, promptPath string) []string {
 }
 
 // buildMuseCodeNativeGateArgs is the argv shape the session-entry gate shows
-// and matches — the per-turn argv minus the per-turn id and prompt file.
-func buildMuseCodeNativeGateArgs() []string {
-	return buildMuseCodeNativeArgs("", "")
+// and matches — the per-turn argv minus the per-turn id and prompt file, with
+// the START's model and effort (museCodeNativeLaunchArgs) every turn appends.
+func buildMuseCodeNativeGateArgs(launchArgs []string) []string {
+	return append(buildMuseCodeNativeArgs("", ""), launchArgs...)
 }
 
 /* --------------------------------------------------------------------------
@@ -405,9 +432,12 @@ var museCodeValuedStrippedFlags = map[string]bool{
 }
 
 // museCodeForwardedValuedFlags pass through with their value token.
+// `--effort` is `--reasoning-effort`'s documented alias (`muse exec --help`,
+// 1.4.14); unlisted, its level was read as prompt text.
 var museCodeForwardedValuedFlags = map[string]bool{
 	"--model":            true,
 	"--reasoning-effort": true,
+	"--effort":           true,
 	"--max-model-steps":  true,
 }
 

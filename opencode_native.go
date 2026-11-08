@@ -118,6 +118,11 @@ type OpenCodeNativeSession struct {
 	StartedAt     time.Time
 	// Bounded transcript for replay recovery (user/assistant pairs).
 	Transcript []openCodeTurn
+	// LaunchArgs are the START's `--model` / `--variant`
+	// (openCodeNativeLaunchArgs), appended to every turn's argv: the first,
+	// each resumed one and the replay recovery alike. Set before the session
+	// is registered and never changed, so a turn reads it without a lock.
+	LaunchArgs []string
 
 	mu            sync.Mutex
 	status        string // "idle" | "running" | "ended"
@@ -225,7 +230,18 @@ func NewOpenCodeNativeManager() *OpenCodeNativeManager {
 // Not validated against the local store: a stale id is recoverable at turn
 // time (Send's looksLikeMissingSession → bounded transcript replay), which is a
 // better answer than refusing the start. Same contract as Antigravity's seed.
+//
+// Start carries no START args, so every turn runs OpenCode's own default
+// model; the Pub/Sub start goes through StartWithArgs.
 func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID, nil, publishFn, onStarted)
+}
+
+// StartWithArgs is Start for a START command: startArgs are its signed args,
+// of which the session keeps only `--model` / `--variant`
+// (openCodeNativeLaunchArgs) and applies them to every turn. A redelivered
+// start keeps the flags the session registered with.
+func (m *OpenCodeNativeManager) StartWithArgs(id, cwd string, workspaceID, uid, resumeSessionID string, startArgs []string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -284,14 +300,15 @@ func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSe
 		// of Start cannot observe a startable session not yet told which
 		// conversation it continues (that window silently starts fresh).
 		NativeSessionID: resumeSessionID,
+		LaunchArgs:      openCodeNativeLaunchArgs(startArgs),
 	}
 	m.sessions[id] = session
 	// The session lives here between its per-turn processes; the ledger keeps
 	// it so a restart can report it gone (session_ledger.go).
 	openLedgerLogicalSession(id)
 
-	fmt.Printf("%s[opencode-native] Session %s registered (cwd=%s)%s\n",
-		colorCyan, id, cwd, colorReset)
+	fmt.Printf("%s[opencode-native] Session %s registered (cwd=%s launch=%v)%s\n",
+		colorCyan, id, cwd, session.LaunchArgs, colorReset)
 
 	if onStarted != nil {
 		onStarted()
@@ -656,9 +673,9 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// One launcher for every OpenCode spawn (opencode_argv.go): a native binary
 	// directly, a Windows `.cmd` / `.bat` npm shim through cmd.exe. A direct
 	// spawn of a shim fails in CreateProcess, which is why an npm-installed
-	// OpenCode could not start a turn at all on Windows.
-	shape := openCodeShapeForResume(nativeID)
-	args := buildOpenCodeRunArgs(shape, nativeID)
+	// OpenCode could not start a turn at all on Windows. The START's model and
+	// effort ride on every turn, whichever conversation it runs in.
+	args := buildOpenCodeNativeTurnArgs(nativeID, session.LaunchArgs)
 	cmd, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
 		Path:       executable,
 		Args:       args,

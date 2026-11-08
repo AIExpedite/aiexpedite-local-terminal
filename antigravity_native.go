@@ -103,6 +103,11 @@ type AntigravityNativeSession struct {
 	StartedAt     time.Time
 	// Bounded transcript for replay recovery (user/assistant pairs).
 	Transcript []antigravityTurn
+	// LaunchArgs are the START's `--model` / `--effort`
+	// (antigravityNativeLaunchArgs), appended to every turn's argv: the first,
+	// each resumed one and the replay recovery alike. Set before the session
+	// is registered and never changed, so a turn reads it without a lock.
+	LaunchArgs []string
 
 	mu            sync.Mutex
 	status        string // "idle" | "running" | "ended"
@@ -248,7 +253,18 @@ func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
 // bounded transcript replay, which is a strictly better answer than refusing the
 // start — the cloud cannot know whether the device still holds the conversation,
 // and a refusal here would strand the run rather than degrade it.
+//
+// Start carries no START args, so every turn runs agy's own model and effort;
+// the Pub/Sub start goes through StartWithArgs.
 func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resumeConversationID string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartWithArgs(id, cwd, workspaceID, uid, resumeConversationID, nil, publishFn, onStarted)
+}
+
+// StartWithArgs is Start for a START command: startArgs are its signed args,
+// of which the session keeps only `--model` / `--effort`
+// (antigravityNativeLaunchArgs) and applies them to every turn. A redelivered
+// start keeps the flags the session registered with.
+func (m *AntigravityNativeManager) StartWithArgs(id, cwd string, workspaceID, uid, resumeConversationID string, startArgs []string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -322,14 +338,15 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 		// been published as startable but not yet told which conversation it
 		// continues — that window would silently start a fresh conversation.
 		NativeConversationID: resumeConversationID,
+		LaunchArgs:           antigravityNativeLaunchArgs(startArgs),
 	}
 	m.sessions[id] = session
 	// The session lives here between its per-turn processes; the ledger keeps
 	// it so a restart can report it gone (session_ledger.go).
 	openLedgerLogicalSession(id)
 
-	fmt.Printf("%s[antigravity-native] Session %s registered (cwd=%s)%s\n",
-		colorCyan, id, cwd, colorReset)
+	fmt.Printf("%s[antigravity-native] Session %s registered (cwd=%s launch=%v)%s\n",
+		colorCyan, id, cwd, session.LaunchArgs, colorReset)
 
 	if onStarted != nil {
 		onStarted()
@@ -727,8 +744,9 @@ func (m *AntigravityNativeManager) runOneShot(
 ) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, err error) {
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment. Same prefix the approval gate displays
-	// (buildAntigravityNativeGateArgs) so the two never drift.
-	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(nativeID)...)
+	// (buildAntigravityNativeGateArgs) so the two never drift. The START's
+	// model and effort ride on every turn, whichever conversation it runs in.
+	args := buildAntigravityNativeTurnArgs(nativeID, session.LaunchArgs)
 
 	cmd := exec.Command(executable, args...)
 	stdinLine := antigravityStreamUserMessage(prompt)
@@ -1209,13 +1227,55 @@ func buildAntigravityNativeArgs(nativeConversationID string) []string {
 	return args
 }
 
+// buildAntigravityNativeTurnArgs is the whole argv runOneShot spawns for one
+// turn: the permission-skipping prefix, the stream-json shape (with
+// `--conversation <id>` on a resumed turn), then the START's model and effort
+// (antigravityNativeLaunchArgs), which every turn of the session carries — a
+// resumed turn and the replay recovery included. Without launch flags it is
+// exactly the prefix plus buildAntigravityNativeArgs.
+func buildAntigravityNativeTurnArgs(nativeConversationID string, launchArgs []string) []string {
+	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(nativeConversationID)...)
+	return append(args, launchArgs...)
+}
+
 // buildAntigravityNativeGateArgs returns the argv shape the approval dialog and
 // allowlist gate should match: exactly what runOneShot spawns for a first turn
-// (--dangerously-skip-permissions prepended; prompt is on stdin). Kept here so
-// the gate and the real launch never drift — a narrowed allowlist must approve
-// the permission-skipping flag it will actually run with.
-func buildAntigravityNativeGateArgs() []string {
-	return append(antigravityDangerousFlags(), buildAntigravityNativeArgs("")...)
+// (--dangerously-skip-permissions prepended; prompt is on stdin; the START's
+// launch flags appended). Kept here so the gate and the real launch never
+// drift — a narrowed allowlist must approve the permission-skipping flag it
+// will actually run with.
+func buildAntigravityNativeGateArgs(launchArgs []string) []string {
+	return buildAntigravityNativeTurnArgs("", launchArgs)
+}
+
+// antigravityNativeForwardedValuedFlags are the caller flags a native agy start
+// forwards — the native path's equivalent of openCodeForwardedValuedFlags and
+// museCodeForwardedValuedFlags. `agy --help` (1.5.3): `--model` "Model for the
+// current CLI session", `--effort` "Reasoning effort for the current CLI
+// session (low|medium|high|xhigh|max)"; shared-constants composes both
+// spellings (CLI_AGENT_EFFORT_FLAG_BY_ID). Nothing else in a START reaches a
+// native turn: `--conversation` is the manager's (resume arrives only as the
+// signed conversationId seed), and every other flag could change what an
+// unattended, permission-skipping turn may do.
+var antigravityNativeForwardedValuedFlags = map[string]bool{
+	"--model":  true,
+	"--effort": true,
+}
+
+// antigravityNativeLaunchArgs keeps a START's model and effort for every turn
+// (selectNativeLaunchArgs) and drops everything else. agy parses with Go's
+// flag package, so the single-dash spellings (`-model`, `-effort`) are the
+// same flags (canonicalAntigravityFlag).
+func antigravityNativeLaunchArgs(startArgs []string) []string {
+	return selectNativeLaunchArgs(startArgs, nativeLaunchFlags{
+		forwarded: antigravityNativeForwardedValuedFlags,
+		canonical: map[string]string{"--model": "--model", "--effort": "--effort"},
+		order:     []string{"--model", "--effort"},
+		valued: func(name string) bool {
+			return antigravityValuedFlags[name] || isAntigravityPrintFlag(name)
+		},
+		normalize: canonicalAntigravityFlag,
+	})
 }
 
 // antigravityStreamUserMessage returns one protocol-compliant NDJSON input

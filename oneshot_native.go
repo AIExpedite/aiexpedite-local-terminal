@@ -28,6 +28,8 @@ package main
 //     non-zero exit, at most once per turn.
 //   - The native id is published only on the completion frame of a turn that
 //     succeeded and whose completion is publishable.
+//   - A START's model and effort flags (spec.LaunchArgs) are the only START
+//     args a turn applies, and every turn applies them.
 
 import (
 	"bufio"
@@ -39,6 +41,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,6 +177,103 @@ type oneShotNativeSpec struct {
 	StripEnvPrefixes []string
 	// ReplayPreamble opens a transcript-replay prompt.
 	ReplayPreamble string
+	// LaunchArgs, when set, picks out of a START's signed args the flags this
+	// CLI applies to every turn of the session: its model and effort, in the
+	// spelling a turn carries (selectNativeLaunchArgs). Every other START arg
+	// is dropped, as it always was.
+	LaunchArgs func(startArgs []string) []string
+}
+
+/* --------------------------------------------------------------------------
+   Launch flags (a START's model and effort)
+   -------------------------------------------------------------------------- */
+
+// nativeLaunchValuePattern is the one shape a kept model or effort value may
+// have: a single token of at most 200 characters that starts with a letter,
+// digit or `_` and holds nothing but letters, digits and `_ . @ + : / -`.
+// It mirrors shared-constants CLI_MODEL_ID_PATTERN, the contract
+// terminal-service validates a model against before it composes the flag;
+// an effort word (CLI_EFFORT_LEVEL_REGEX, `^[a-z]{1,16}$`) is a subset. So
+// the device keeps everything the server composes, and nothing that could be
+// read as a flag (no leading `-`), split into two tokens, or re-read by a
+// Windows `.cmd` shim's cmd.exe pass (no space, quote, `%`, `&`, `|`, `^`).
+var nativeLaunchValuePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.@+:/-]{0,199}$`)
+
+// nativeLaunchFlags is one one-shot kind's answer to "which START flags does
+// every turn apply?" (selectNativeLaunchArgs).
+type nativeLaunchFlags struct {
+	// forwarded is the CLI's caller-flag forwarding allowlist (the legacy
+	// session path's): a spelling is kept only when it is listed there too,
+	// so the native path never applies a flag the legacy path would not pass.
+	forwarded map[string]bool
+	// canonical maps each accepted spelling of the model and effort flags to
+	// the one spelling a turn carries.
+	canonical map[string]string
+	// order is the canonical flags in the order a turn appends them.
+	order []string
+	// valued reports a flag that takes the NEXT token as its value, kept or
+	// not, so the walk never reads a value as a flag.
+	valued func(name string) bool
+	// normalize, when set, maps a spelling onto the name the tables use
+	// (agy's single-dash Go flags: `-model` is `--model`).
+	normalize func(name string) string
+}
+
+// selectNativeLaunchArgs returns the model and effort flags a START's args
+// carry — canonical spelling, one value each, in flags.order — and nothing
+// else. A one-shot kind has no process between turns, so these are the only
+// part of a START that can reach a turn: the session stores them and every
+// turn appends them (resumed turns and the replay recovery included).
+//
+//   - A flag takes its value inline (`--model=x`) or as the next token.
+//   - The value must match nativeLaunchValuePattern. A flag whose value does
+//     not is dropped, and clears an earlier value of the same flag: the start
+//     overrode that one, so the CLI runs its own default rather than it.
+//   - A later occurrence wins, as on the CLI's own command line.
+//   - `--` ends the walk: what follows it is operands, never flags.
+//   - Everything else is dropped, a valued flag's value with it.
+//
+// The read-only start's partitionReadOnlyCallerArgs answers a similar
+// question for Claude and Codex; this one keeps one canonical value per flag
+// because the flags are re-applied on every turn, and validates against the
+// model-id contract the server composes from.
+func selectNativeLaunchArgs(startArgs []string, flags nativeLaunchFlags) []string {
+	values := make(map[string]string, len(flags.order))
+	for i := 0; i < len(startArgs); i++ {
+		token := startArgs[i]
+		if token == "--" {
+			break
+		}
+		name, value, inline := strings.Cut(token, "=")
+		if flags.normalize != nil {
+			name = flags.normalize(name)
+		}
+		if !inline && flags.valued(name) {
+			value = ""
+			if i+1 < len(startArgs) {
+				i++
+				value = startArgs[i]
+			}
+		} else if !inline {
+			continue
+		}
+		canonical := flags.canonical[name]
+		if canonical == "" || !flags.forwarded[name] {
+			continue
+		}
+		if !nativeLaunchValuePattern.MatchString(value) {
+			delete(values, canonical)
+			continue
+		}
+		values[canonical] = value
+	}
+	var out []string
+	for _, flag := range flags.order {
+		if value, ok := values[flag]; ok {
+			out = append(out, flag, value)
+		}
+	}
+	return out
 }
 
 /* --------------------------------------------------------------------------
@@ -203,6 +303,11 @@ type oneShotNativeSession struct {
 	UID           string
 	StartedAt     time.Time
 	Transcript    []oneShotTurn
+	// LaunchArgs are the START's model and effort flags (spec.LaunchArgs),
+	// appended to every turn's argv: the first, each resumed one and the
+	// replay recovery alike. Set before the session is registered and never
+	// changed, so a turn reads it without a lock.
+	LaunchArgs []string
 
 	mu            sync.Mutex
 	status        string // "idle" | "running" | "ended"
@@ -297,8 +402,17 @@ func (m *oneShotNativeManager) logf(color, format string, args ...any) {
 
 // Start registers a logical session; no CLI process launches until Send.
 // resumeSessionID seeds the conversation to continue (conversation-scoped
-// resume after the previous terminal session was reclaimed).
+// resume after the previous terminal session was reclaimed). It carries no
+// START args, so every turn runs the CLI's own model and effort.
 func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID, nil, publishFn, onStarted)
+}
+
+// StartWithArgs is Start for a START command: startArgs are its signed args,
+// of which the session keeps only the model and effort flags
+// (spec.LaunchArgs) and applies them to every turn. A redelivered start keeps
+// the flags the session registered with.
+func (m *oneShotNativeManager) StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID string, startArgs []string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -362,6 +476,10 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 	if nativeID == "" && m.spec.MintNativeID != nil {
 		nativeID = m.spec.MintNativeID()
 	}
+	var launchArgs []string
+	if m.spec.LaunchArgs != nil {
+		launchArgs = m.spec.LaunchArgs(startArgs)
+	}
 	session := &oneShotNativeSession{
 		ID:            id,
 		Cwd:           cwd,
@@ -375,12 +493,13 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 		// session (that window would silently start a fresh conversation).
 		NativeSessionID: nativeID,
 		nativeConfirmed: confirmed,
+		LaunchArgs:      launchArgs,
 	}
 	m.sessions[id] = session
 	// The session lives here between its per-turn processes, so the ledger
 	// keeps it: a restart must be able to certify it ended (session_ledger.go).
 	openLedgerLogicalSession(id)
-	m.logf(colorCyan, "Session %s registered (cwd=%s resume=%v)", id, cwd, confirmed)
+	m.logf(colorCyan, "Session %s registered (cwd=%s resume=%v launch=%v)", id, cwd, confirmed, launchArgs)
 
 	if onStarted != nil {
 		onStarted()
@@ -780,7 +899,10 @@ func (m *oneShotNativeManager) runOneShot(
 		_ = os.Remove(promptPath)
 	}()
 
-	cmd := newOneShotCommand(context.Background(), executable, m.spec.BuildArgs(nativeID, promptPath),
+	// The START's model and effort ride on every turn, whichever conversation
+	// it runs in (a resumed one, or the replay recovery's fresh one).
+	args := append(m.spec.BuildArgs(nativeID, promptPath), session.LaunchArgs...)
+	cmd := newOneShotCommand(context.Background(), executable, args,
 		stripEnvPrefixes(os.Environ(), m.spec.StripEnvPrefixes), runDir)
 	// Own process group so cancel/timeout can reap tools that inherited pipes.
 	detachControllingTTY(cmd)
