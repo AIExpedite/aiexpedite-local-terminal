@@ -176,10 +176,12 @@ type oneShotNativeSpec struct {
 	ObserveTurn func(stdout, stderr string)
 	// ObserveRun, when set, is called once per CLI run, just before the
 	// run's child is spawned, and returns the function that then sees each
-	// stdout line of that run as it is scanned: every line, however much the
-	// run prints, where ObserveTurn gets only the prefix. Whatever it pins at
-	// the spawn belongs to that run alone (Muse Code: the account the child
-	// is launched with, which its allowance record is filed under).
+	// stdout line of that run as it is scanned: every line the turn reads,
+	// where ObserveTurn gets only the prefix (a run past
+	// oneShotNativeMaxStdout fails, and the rest of its output is drained
+	// unread). Whatever it pins at the spawn belongs to that run alone (Muse
+	// Code: the account the child is launched with, which its allowance
+	// record is filed under).
 	ObserveRun func() func(line string)
 	// StripEnvPrefixes are upper-cased env prefixes removed from the child.
 	StripEnvPrefixes []string
