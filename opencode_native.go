@@ -118,6 +118,11 @@ type OpenCodeNativeSession struct {
 	StartedAt     time.Time
 	// Bounded transcript for replay recovery (user/assistant pairs).
 	Transcript []openCodeTurn
+	// LaunchArgs are the START's `--model` / `--variant`
+	// (openCodeNativeLaunchArgs), appended to every turn's argv: the first,
+	// each resumed one and the replay recovery alike. Set before the session
+	// is registered and never changed, so a turn reads it without a lock.
+	LaunchArgs []string
 
 	mu            sync.Mutex
 	status        string // "idle" | "running" | "ended"
@@ -225,7 +230,18 @@ func NewOpenCodeNativeManager() *OpenCodeNativeManager {
 // Not validated against the local store: a stale id is recoverable at turn
 // time (Send's looksLikeMissingSession → bounded transcript replay), which is a
 // better answer than refusing the start. Same contract as Antigravity's seed.
+//
+// Start carries no START args, so every turn runs OpenCode's own default
+// model; the Pub/Sub start goes through StartWithArgs.
 func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID, nil, publishFn, onStarted)
+}
+
+// StartWithArgs is Start for a START command: startArgs are its signed args,
+// of which the session keeps only `--model` / `--variant`
+// (openCodeNativeLaunchArgs) and applies them to every turn. A redelivered
+// start keeps the flags the session registered with.
+func (m *OpenCodeNativeManager) StartWithArgs(id, cwd string, workspaceID, uid, resumeSessionID string, startArgs []string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -284,14 +300,15 @@ func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSe
 		// of Start cannot observe a startable session not yet told which
 		// conversation it continues (that window silently starts fresh).
 		NativeSessionID: resumeSessionID,
+		LaunchArgs:      openCodeNativeLaunchArgs(startArgs),
 	}
 	m.sessions[id] = session
 	// The session lives here between its per-turn processes; the ledger keeps
 	// it so a restart can report it gone (session_ledger.go).
 	openLedgerLogicalSession(id)
 
-	fmt.Printf("%s[opencode-native] Session %s registered (cwd=%s)%s\n",
-		colorCyan, id, cwd, colorReset)
+	fmt.Printf("%s[opencode-native] Session %s registered (cwd=%s launch=%v)%s\n",
+		colorCyan, id, cwd, session.LaunchArgs, colorReset)
 
 	if onStarted != nil {
 		onStarted()
@@ -547,13 +564,13 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 	// Terminal completion frame. Individual deltas were already streamed as
 	// their own opencode_native_message frames during runOneShot; this frame
 	// carries the coalesced assistant text so a client that missed a delta (or
-	// reconnected mid-turn) still renders a complete turn.
+	// reconnected mid-turn) still renders a complete turn, and the final answer
+	// within it (openCodeFinalAnswer). Output is set by withOpenCodeCompletion.
 	seq := int(atomic.AddInt64(&session.seq, 1))
 	msg := resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      openCodeCompletionFrame(result.text, usedReplay),
 		Status:      "success",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
@@ -572,7 +589,8 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 	// Preflight marshaled size: JSON escaping can push an under-cap payload over
 	// Pub/Sub's 10 MB limit, and newSessionPublishFn only LOGS publish failures.
 	// Treat oversize as an explicit turn error before claiming success.
-	if err := openCodeNativeEnvelopePublishable(msg); err != nil {
+	msg, err := withOpenCodeCompletion(msg, result.text, result.finalText, usedReplay)
+	if err != nil {
 		return m.publishTurnError(session, publishFn, err.Error())
 	}
 
@@ -582,16 +600,58 @@ func (m *OpenCodeNativeManager) SendTurn(id, text string, publishFn PublishFunc,
 
 	publishFn(msg)
 
-	fmt.Printf("%s[opencode-native] Turn complete on %s (chars=%d replay=%v)%s\n",
-		colorGreen, id, len(result.text), usedReplay, colorReset)
+	fmt.Printf("%s[opencode-native] Turn complete on %s (chars=%d final=%d replay=%v)%s\n",
+		colorGreen, id, len(result.text), len(result.finalText), usedReplay, colorReset)
 	return nil
 }
 
 // openCodeCompletionFrame wraps the coalesced assistant text in the terminal
-// completion envelope the frontend normalizer recognizes. The replay marker is
-// a structured token stripped before rendering (same contract as Antigravity's).
-func openCodeCompletionFrame(text string, usedReplay bool) string {
-	return oneShotCompletionFrame(text, usedReplay)
+// completion envelope the frontend normalizer recognizes, with the turn's final
+// answer as `finalText` (turnCompletionFrame). The replay marker is a
+// structured token stripped before rendering (same contract as Antigravity's).
+func openCodeCompletionFrame(text, finalText string, usedReplay bool) string {
+	return turnCompletionFrame(text, finalText, usedReplay)
+}
+
+// openCodeStoredChunkMaxBytes mirrors terminal-service's MAX_CHUNK_OUTPUT_BYTES
+// (500 KB, terminal.service.js): a stored chunk's output is cut there, and a
+// completion frame cut there is no longer JSON.
+const openCodeStoredChunkMaxBytes = 500 * 1024
+
+// withOpenCodeCompletion sets msg's Output to the turn's completion frame and
+// checks the envelope fits one Pub/Sub publish.
+//
+// `finalText` repeats the tail of `text`, so on a reply near the publish
+// ceiling it can be the part that tips the envelope over. Such a reply goes
+// out without it — a reader then takes `text`, exactly as from a device that
+// never sent one — rather than failing a turn that fits on its own. Only a
+// frame too big even without it is an error.
+func withOpenCodeCompletion(msg resultMsg, text, finalText string, usedReplay bool) (resultMsg, error) {
+	// A reply with no tool call IS its final answer: repeating it would only
+	// double the frame (readers take text when finalText is absent).
+	if finalText == text {
+		finalText = ""
+	}
+	msg.Output = openCodeCompletionFrame(text, finalText, usedReplay)
+	// The first ceiling a reader meets is terminal-service's stored-chunk cut
+	// (openCodeStoredChunkMaxBytes), not the publish limit: a frame cut there
+	// is no longer JSON, and the turn would never complete for its readers. A
+	// finalText that pushes the frame past it is dropped, as is one past the
+	// publish limit.
+	if len(msg.Output) <= openCodeStoredChunkMaxBytes && openCodeNativeEnvelopePublishable(msg) == nil {
+		return msg, nil
+	}
+	if finalText == "" {
+		if err := openCodeNativeEnvelopePublishable(msg); err != nil {
+			return resultMsg{}, err
+		}
+		return msg, nil
+	}
+	msg.Output = openCodeCompletionFrame(text, "", usedReplay)
+	if err := openCodeNativeEnvelopePublishable(msg); err != nil {
+		return resultMsg{}, err
+	}
+	return msg, nil
 }
 
 /* --------------------------------------------------------------------------
@@ -599,10 +659,12 @@ func openCodeCompletionFrame(text string, usedReplay bool) string {
    -------------------------------------------------------------------------- */
 
 // openCodeRunResult is one `opencode run` invocation's outcome. `text` is the
-// assistant content coalesced from the streamed JSON events; `sessionID` is the
-// native id if any event carried one.
+// assistant content coalesced from the streamed JSON events; `finalText` is
+// the final answer within it (openCodeFinalAnswer); `sessionID` is the native
+// id if any event carried one.
 type openCodeRunResult struct {
 	text          string
+	finalText     string
 	rawStdout     string
 	stderr        string
 	sessionID     string
@@ -656,9 +718,9 @@ func (m *OpenCodeNativeManager) runOneShot(
 	// One launcher for every OpenCode spawn (opencode_argv.go): a native binary
 	// directly, a Windows `.cmd` / `.bat` npm shim through cmd.exe. A direct
 	// spawn of a shim fails in CreateProcess, which is why an npm-installed
-	// OpenCode could not start a turn at all on Windows.
-	shape := openCodeShapeForResume(nativeID)
-	args := buildOpenCodeRunArgs(shape, nativeID)
+	// OpenCode could not start a turn at all on Windows. The START's model and
+	// effort ride on every turn, whichever conversation it runs in.
+	args := buildOpenCodeNativeTurnArgs(nativeID, session.LaunchArgs)
 	cmd, launchErr := newOpenCodeCmd(context.Background(), openCodeLaunch{
 		Path:       executable,
 		Args:       args,
@@ -778,6 +840,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 	}
 	return openCodeRunResult{
 		text:          strings.TrimSpace(stream.text.String()),
+		finalText:     strings.TrimSpace(stream.answer.text()),
 		rawStdout:     strings.TrimSpace(stream.raw.String()),
 		stderr:        errOut,
 		sessionID:     stream.sessionID,
@@ -790,6 +853,9 @@ func (m *OpenCodeNativeManager) runOneShot(
 // openCodeStreamState accumulates what the stdout scan learned about a turn.
 type openCodeStreamState struct {
 	text strings.Builder
+	// answer splits the same text at the run's tool calls, to tell the final
+	// answer from the narration before each tool call.
+	answer openCodeFinalAnswer
 	// raw is a bounded verbatim copy of stdout. `opencode` reports a stale
 	// `--session` id as a PLAIN line ("Error: Session not found"), not as a
 	// JSON event, so the parsed text is empty on exactly the run that needs
@@ -847,10 +913,14 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		if text, sid, ok := parseOpenCodeEventLine(line); ok {
 			if text != "" {
 				state.text.WriteString(text)
+				state.answer.addText(text)
 			}
 			if sid != "" && state.sessionID == "" {
 				state.sessionID = sid
 			}
+		}
+		if isOpenCodeToolBoundary(line) {
+			state.answer.toolCall()
 		}
 		// Memory only: the run commits once the child is reaped.
 		captureOpenCodeUsageLine(usage, line)
@@ -1018,6 +1088,78 @@ func isOpenCodeTextEventType(t string) bool {
 		strings.HasSuffix(t, "text") ||
 		strings.Contains(t, "text-delta") ||
 		strings.Contains(t, "text_delta")
+}
+
+// isOpenCodeToolBoundary reports whether one `--format json` event marks a
+// tool call in the turn:
+//
+//   - a tool event: `tool_use` (the run formatter's spelling, emitted when a
+//     tool part finishes), or any event type naming a tool, or a part whose
+//     type is `tool`;
+//   - a step that finished in tool calls: a `*finish` event (`step_finish`,
+//     `step-finish`) whose finish reason names them (`tool-calls`), read the
+//     way isOpenCodeTerminalEventType reads it. This also covers a tool part
+//     that never reported finishing (an errored one).
+//
+// Decoded leniently (openCodeSmokeFrame): a field typed differently in some
+// release must not hide a boundary.
+func isOpenCodeToolBoundary(line string) bool {
+	if !strings.HasPrefix(line, "{") {
+		return false
+	}
+	frame, ok := parseOpenCodeSmokeFrame(line)
+	if !ok {
+		return false
+	}
+	eventType := strings.ToLower(strings.TrimSpace(frame.Type))
+	if strings.Contains(eventType, "tool") {
+		return true
+	}
+	var part struct {
+		Type string `json:"type"`
+	}
+	if len(frame.Part) > 0 && json.Unmarshal(frame.Part, &part) == nil && strings.EqualFold(part.Type, "tool") {
+		return true
+	}
+	return strings.HasSuffix(eventType, "finish") && strings.Contains(strings.ToLower(frame.finishReason()), "tool")
+}
+
+// openCodeFinalAnswer finds the turn's final answer in its assistant text.
+//
+// A multi-step `opencode run` narrates before each tool call ("I'll check the
+// file.", "Let me run the tests…") and answers after the last one. The
+// completion's `text` joins every text part of every step — the web view and
+// the transcript keep that — but a reader that wants the reply (voice speaks
+// only its head) gets narration first. The final answer is the text after the
+// run's LAST tool call; for a run with no tool call, all of it. A run that
+// ended on a tool call has no text after it, and its answer is then the
+// newest stretch between tool calls that had any — so it is never empty
+// while the turn's text is not.
+type openCodeFinalAnswer struct {
+	// segment is the text since the last tool call.
+	segment strings.Builder
+	// last is the newest stretch between tool calls that had any text.
+	last string
+}
+
+func (a *openCodeFinalAnswer) addText(text string) {
+	a.segment.WriteString(text)
+}
+
+// toolCall closes the current stretch at a tool boundary.
+func (a *openCodeFinalAnswer) toolCall() {
+	if segment := a.segment.String(); strings.TrimSpace(segment) != "" {
+		a.last = segment
+	}
+	a.segment.Reset()
+}
+
+// text is the final answer as the turn stands.
+func (a *openCodeFinalAnswer) text() string {
+	if segment := a.segment.String(); strings.TrimSpace(segment) != "" {
+		return segment
+	}
+	return a.last
 }
 
 // firstNonEmptyRaw is firstNonEmpty without the TrimSpace: a text DELTA may be

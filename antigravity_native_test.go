@@ -210,7 +210,7 @@ func TestBuildAntigravityReplayPrompt_NeverTruncatesCurrentTurn(t *testing.T) {
 // including the leading --dangerously-skip-permissions, so a narrowed allowlist
 // cannot approve a command that silently runs with auto-approved permissions.
 func TestAntigravityNativeGateArgs_MatchExecutedShape(t *testing.T) {
-	gate := buildAntigravityNativeGateArgs()
+	gate := buildAntigravityNativeGateArgs(nil)
 	if len(gate) == 0 || gate[0] != "--dangerously-skip-permissions" {
 		t.Fatalf("gate argv must lead with --dangerously-skip-permissions, got %#v", gate)
 	}

@@ -144,6 +144,15 @@ type capabilitiesInfo struct {
 	// a start admitted through an ancestor only when this is true; older agents
 	// refuse with DEVICE_UPDATE_REQUIRED.
 	RelayCwdFence bool `json:"relayCwdFence"`
+	// NativeLaunchArgs (shared-constants
+	// DEVICE_RELAY_CAPABILITIES.NATIVE_LAUNCH_ARGS): the one-shot native
+	// managers (Antigravity, OpenCode, Muse Code) keep a START's model and
+	// effort flags and apply them to every turn they run
+	// (selectNativeLaunchArgs). An older agent ignores a one-shot START's
+	// args, so terminal-service reports a model or effort for those kinds as
+	// applied only when this is true. Never omitempty: a future build
+	// reporting `false` must not read as "field absent".
+	NativeLaunchArgs bool `json:"nativeLaunchArgs"`
 	// ReadOnlySessions (shared-constants DEVICE_SESSION_CAPABILITIES.READ_ONLY):
 	// the agent verifies a SIGNED `readOnly` on a session_start and starts the
 	// bare `claude` / `codex` in its enforced read-only mode, or refuses with
@@ -339,6 +348,7 @@ func newMachineCapabilities() *capabilitiesInfo {
 		RelayAckWatermark:      true,
 		RelayPermissionPrompts: true,
 		RelayCwdFence:          true,
+		NativeLaunchArgs:       true,
 		ReadOnlySessions:       true,
 		CliSessionDiscovery: &cliSessionDiscoveryCapability{
 			Engines:  []string{cliSessionEngineClaudeCode},

@@ -20,9 +20,11 @@ type fakeOneShotTarget struct {
 	sendCalls  int
 	sendTO     time.Duration
 	started    bool
+	startArgs  []string
 }
 
-func (f *fakeOneShotTarget) Start(_, _, _, _, _ string, _ PublishFunc, onStarted func()) error {
+func (f *fakeOneShotTarget) StartWithArgs(_, _, _, _, _ string, startArgs []string, _ PublishFunc, onStarted func()) error {
+	f.startArgs = startArgs
 	if f.startErr != nil {
 		return f.startErr
 	}

@@ -28,6 +28,8 @@ package main
 //     non-zero exit, at most once per turn.
 //   - The native id is published only on the completion frame of a turn that
 //     succeeded and whose completion is publishable.
+//   - A START's model and effort flags (spec.LaunchArgs) are the only START
+//     args a turn applies, and every turn applies them.
 
 import (
 	"bufio"
@@ -39,6 +41,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,6 +110,11 @@ type oneShotEvent struct {
 	// Coalesce marks a pure text-delta line that may be merged with its
 	// neighbours into one published frame (spec.DeltaFrame).
 	Coalesce bool
+	// EndsRun marks the CLI's own end-of-run record (Muse Code's
+	// `run.terminal.*`). No assistant text follows it, so the delta coalescer
+	// releases everything it holds, the redaction carry included, in a final
+	// flush BEFORE the record is published (deltaCoalescer.publishFinal).
+	EndsRun bool
 }
 
 // nativeFrameKind names a native chat kind on the wire: the part the Pub/Sub
@@ -162,13 +170,120 @@ type oneShotNativeSpec struct {
 	ValidSeed func(id string) bool
 	// LooksLikeMissingSession recognizes a stale-resume failure.
 	LooksLikeMissingSession func(stdout, stderr string) bool
-	// ObserveTurn, when set, sees every finished turn's raw stdout and stderr
-	// (Muse Code reads its own sign-in refusal from them).
+	// ObserveTurn, when set, sees every finished turn's raw stdout — the
+	// bounded diagnostic prefix (oneShotNativeMaxRawStdout), not all of it —
+	// and its stderr (Muse Code reads its own sign-in refusal from them).
 	ObserveTurn func(stdout, stderr string)
+	// ObserveRun, when set, is called once per CLI run, just before the
+	// run's child is spawned, and returns the function that then sees each
+	// stdout line of that run as it is scanned: every line the turn reads,
+	// where ObserveTurn gets only the prefix (a run past
+	// oneShotNativeMaxStdout fails, and the rest of its output is drained
+	// unread). Whatever it pins at the spawn belongs to that run alone (Muse
+	// Code: the account the child is launched with, which its allowance
+	// record is filed under).
+	ObserveRun func() func(line string)
 	// StripEnvPrefixes are upper-cased env prefixes removed from the child.
 	StripEnvPrefixes []string
 	// ReplayPreamble opens a transcript-replay prompt.
 	ReplayPreamble string
+	// LaunchArgs, when set, picks out of a START's signed args the flags this
+	// CLI applies to every turn of the session: its model and effort, in the
+	// spelling a turn carries (selectNativeLaunchArgs). Every other START arg
+	// is dropped, as it always was.
+	LaunchArgs func(startArgs []string) []string
+}
+
+/* --------------------------------------------------------------------------
+   Launch flags (a START's model and effort)
+   -------------------------------------------------------------------------- */
+
+// nativeLaunchValuePattern is the one shape a kept model or effort value may
+// have: a single token of at most 200 characters that starts with a letter,
+// digit or `_` and holds nothing but letters, digits and `_ . @ + : / -`.
+// It mirrors shared-constants CLI_MODEL_ID_PATTERN, the contract
+// terminal-service validates a model against before it composes the flag;
+// an effort word (CLI_EFFORT_LEVEL_REGEX, `^[a-z]{1,16}$`) is a subset. So
+// the device keeps everything the server composes, and nothing that could be
+// read as a flag (no leading `-`), split into two tokens, or re-read by a
+// Windows `.cmd` shim's cmd.exe pass (no space, quote, `%`, `&`, `|`, `^`).
+var nativeLaunchValuePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.@+:/-]{0,199}$`)
+
+// nativeLaunchFlags is one one-shot kind's answer to "which START flags does
+// every turn apply?" (selectNativeLaunchArgs).
+type nativeLaunchFlags struct {
+	// forwarded is the CLI's caller-flag forwarding allowlist (the legacy
+	// session path's): a spelling is kept only when it is listed there too,
+	// so the native path never applies a flag the legacy path would not pass.
+	forwarded map[string]bool
+	// canonical maps each accepted spelling of the model and effort flags to
+	// the one spelling a turn carries.
+	canonical map[string]string
+	// order is the canonical flags in the order a turn appends them.
+	order []string
+	// valued reports a flag that takes the NEXT token as its value, kept or
+	// not, so the walk never reads a value as a flag.
+	valued func(name string) bool
+	// normalize, when set, maps a spelling onto the name the tables use
+	// (agy's single-dash Go flags: `-model` is `--model`).
+	normalize func(name string) string
+}
+
+// selectNativeLaunchArgs returns the model and effort flags a START's args
+// carry — canonical spelling, one value each, in flags.order — and nothing
+// else. A one-shot kind has no process between turns, so these are the only
+// part of a START that can reach a turn: the session stores them and every
+// turn appends them (resumed turns and the replay recovery included).
+//
+//   - A flag takes its value inline (`--model=x`) or as the next token.
+//   - The value must match nativeLaunchValuePattern. A flag whose value does
+//     not is dropped, and clears an earlier value of the same flag: the start
+//     overrode that one, so the CLI runs its own default rather than it.
+//   - A later occurrence wins, as on the CLI's own command line.
+//   - `--` ends the walk: what follows it is operands, never flags.
+//   - Everything else is dropped, a valued flag's value with it.
+//
+// The read-only start's partitionReadOnlyCallerArgs answers a similar
+// question for Claude and Codex; this one keeps one canonical value per flag
+// because the flags are re-applied on every turn, and validates against the
+// model-id contract the server composes from.
+func selectNativeLaunchArgs(startArgs []string, flags nativeLaunchFlags) []string {
+	values := make(map[string]string, len(flags.order))
+	for i := 0; i < len(startArgs); i++ {
+		token := startArgs[i]
+		if token == "--" {
+			break
+		}
+		name, value, inline := strings.Cut(token, "=")
+		if flags.normalize != nil {
+			name = flags.normalize(name)
+		}
+		if !inline && flags.valued(name) {
+			value = ""
+			if i+1 < len(startArgs) {
+				i++
+				value = startArgs[i]
+			}
+		} else if !inline {
+			continue
+		}
+		canonical := flags.canonical[name]
+		if canonical == "" || !flags.forwarded[name] {
+			continue
+		}
+		if !nativeLaunchValuePattern.MatchString(value) {
+			delete(values, canonical)
+			continue
+		}
+		values[canonical] = value
+	}
+	var out []string
+	for _, flag := range flags.order {
+		if value, ok := values[flag]; ok {
+			out = append(out, flag, value)
+		}
+	}
+	return out
 }
 
 /* --------------------------------------------------------------------------
@@ -198,6 +313,11 @@ type oneShotNativeSession struct {
 	UID           string
 	StartedAt     time.Time
 	Transcript    []oneShotTurn
+	// LaunchArgs are the START's model and effort flags (spec.LaunchArgs),
+	// appended to every turn's argv: the first, each resumed one and the
+	// replay recovery alike. Set before the session is registered and never
+	// changed, so a turn reads it without a lock.
+	LaunchArgs []string
 
 	mu            sync.Mutex
 	status        string // "idle" | "running" | "ended"
@@ -292,8 +412,17 @@ func (m *oneShotNativeManager) logf(color, format string, args ...any) {
 
 // Start registers a logical session; no CLI process launches until Send.
 // resumeSessionID seeds the conversation to continue (conversation-scoped
-// resume after the previous terminal session was reclaimed).
+// resume after the previous terminal session was reclaimed). It carries no
+// START args, so every turn runs the CLI's own model and effort.
 func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error {
+	return m.StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID, nil, publishFn, onStarted)
+}
+
+// StartWithArgs is Start for a START command: startArgs are its signed args,
+// of which the session keeps only the model and effort flags
+// (spec.LaunchArgs) and applies them to every turn. A redelivered start keeps
+// the flags the session registered with.
+func (m *oneShotNativeManager) StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID string, startArgs []string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -357,6 +486,10 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 	if nativeID == "" && m.spec.MintNativeID != nil {
 		nativeID = m.spec.MintNativeID()
 	}
+	var launchArgs []string
+	if m.spec.LaunchArgs != nil {
+		launchArgs = m.spec.LaunchArgs(startArgs)
+	}
 	session := &oneShotNativeSession{
 		ID:            id,
 		Cwd:           cwd,
@@ -370,12 +503,13 @@ func (m *oneShotNativeManager) Start(id, cwd, workspaceID, uid, resumeSessionID 
 		// session (that window would silently start a fresh conversation).
 		NativeSessionID: nativeID,
 		nativeConfirmed: confirmed,
+		LaunchArgs:      launchArgs,
 	}
 	m.sessions[id] = session
 	// The session lives here between its per-turn processes, so the ledger
 	// keeps it: a restart must be able to certify it ended (session_ledger.go).
 	openLedgerLogicalSession(id)
-	m.logf(colorCyan, "Session %s registered (cwd=%s resume=%v)", id, cwd, confirmed)
+	m.logf(colorCyan, "Session %s registered (cwd=%s resume=%v launch=%v)", id, cwd, confirmed, launchArgs)
 
 	if onStarted != nil {
 		onStarted()
@@ -649,10 +783,23 @@ func (m *oneShotNativeManager) rotateUnconfirmedID(session *oneShotNativeSession
 // credential would otherwise republish it verbatim. Redaction is idempotent, so
 // a delta already masked upstream is unaffected.
 func oneShotCompletionFrame(text string, usedReplay bool) string {
+	return turnCompletionFrame(text, "", usedReplay)
+}
+
+// turnCompletionFrame is oneShotCompletionFrame with the turn's final answer:
+// a non-empty finalText rides as `finalText`, redacted exactly like `text`.
+// `text` stays everything the turn said (the web view and the transcript read
+// it); `finalText` is what a reader that wants only the reply takes instead
+// (OpenCode: the text after the run's last tool call, see openCodeFinalAnswer).
+// A reader that finds no `finalText` takes `text`, as from an older device.
+func turnCompletionFrame(text, finalText string, usedReplay bool) string {
 	payload := map[string]any{
 		"type":  "aiexpedite.turn_complete",
 		"text":  redactAgentSecrets(text),
 		"final": true,
+	}
+	if finalText != "" {
+		payload["finalText"] = redactAgentSecrets(finalText)
 	}
 	if usedReplay {
 		payload["replayRecovery"] = true
@@ -775,7 +922,10 @@ func (m *oneShotNativeManager) runOneShot(
 		_ = os.Remove(promptPath)
 	}()
 
-	cmd := newOneShotCommand(context.Background(), executable, m.spec.BuildArgs(nativeID, promptPath),
+	// The START's model and effort ride on every turn, whichever conversation
+	// it runs in (a resumed one, or the replay recovery's fresh one).
+	args := append(m.spec.BuildArgs(nativeID, promptPath), session.LaunchArgs...)
+	cmd := newOneShotCommand(context.Background(), executable, args,
 		stripEnvPrefixes(os.Environ(), m.spec.StripEnvPrefixes), runDir)
 	// Own process group so cancel/timeout can reap tools that inherited pipes.
 	detachControllingTTY(cmd)
@@ -791,6 +941,12 @@ func (m *oneShotNativeManager) runOneShot(
 	}
 	if session.Status() == "ended" {
 		return oneShotRunResult{err: fmt.Errorf("session ended during turn")}
+	}
+	// Pinned before the spawn, so the run's lines are read against what was
+	// true when its child was launched (spec.ObserveRun).
+	var observeLine func(line string)
+	if m.spec.ObserveRun != nil {
+		observeLine = m.spec.ObserveRun()
 	}
 	// Recorded in the spawn ledger for this turn only, so the next boot can
 	// reap a surviving child (and its tools) instead of leaving an orphan
@@ -835,7 +991,7 @@ func (m *oneShotNativeManager) runOneShot(
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		stream = m.streamEvents(session, stdout, publishFn)
+		stream = m.streamEvents(session, stdout, publishFn, observeLine)
 	}()
 	go func() {
 		defer wg.Done()
@@ -889,11 +1045,13 @@ type oneShotStreamState struct {
 // streamEvents publishes each stdout line as its own MESSAGE frame and folds
 // the parsed events into the turn result. Only assistant text accumulates —
 // tool payloads folded into the transcript would be replayed to the model as
-// if the assistant had said them.
+// if the assistant had said them. observeLine (spec.ObserveRun's, or nil)
+// sees every line the turn reads.
 func (m *oneShotNativeManager) streamEvents(
 	session *oneShotNativeSession,
 	r interface{ Read([]byte) (int, error) },
 	publishFn PublishFunc,
+	observeLine func(line string),
 ) oneShotStreamState {
 	var state oneShotStreamState
 	scanner := bufio.NewScanner(r)
@@ -912,6 +1070,11 @@ func (m *oneShotNativeManager) streamEvents(
 		if state.bytes > oneShotNativeMaxStdout {
 			state.overflow = true
 			break
+		}
+		// Every line, not only the bounded prefix kept below: a record at the
+		// end of a long run (Muse Code's run.usage allowance) is still read.
+		if observeLine != nil {
+			observeLine(line)
 		}
 		if state.raw.Len() < oneShotNativeMaxRawStdout {
 			state.raw.WriteString(line)
@@ -932,6 +1095,10 @@ func (m *oneShotNativeManager) streamEvents(
 				continue
 			}
 			if ev.Coalesce && deltas.add(ev.TextDelta) {
+				continue
+			}
+			if ev.EndsRun {
+				deltas.publishFinal(line)
 				continue
 			}
 		}
@@ -1000,11 +1167,33 @@ func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoal
 // opaque-token pattern, and a masked completion frame cannot retract a stream
 // frame already published. Lifecycle and tool frames still go out in their own
 // order; only the held tail — bounded by agentSecretCarryMaxBytes — is
-// deferred to the next flush, and close() always releases it.
+// deferred to the next flush, and the run's end (publishFinal) or close()
+// always releases it.
 func (c *deltaCoalescer) publish(line string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.flushLocked(false)
+	c.emit(line)
+}
+
+// publishFinal emits the record that ends the run after a FINAL flush: the
+// held redaction carry goes out with the rest of the buffered text, still
+// joined to it, so the per-frame redaction in publishEventFrame and
+// maskOpaqueContinuation see it whole. No assistant text follows the run's
+// end, so nothing is left for the carry to wait for. Held to close() instead
+// (stdout EOF), the tail was published as a run.output.delta AFTER the run's
+// terminal record; the web view reads a record after a terminal one as the
+// next run's, opened a second bubble for it, and the turn_complete envelope
+// then filled that bubble with the whole reply, so the reply was drawn twice.
+func (c *deltaCoalescer) publishFinal(line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// The safe text first, in a frame of its own; then the held carry alone.
+	// Joined, the line-level redaction of a carried `api_key=` / bearer pair
+	// (whose `\S+` runs to the end of the line) would also swallow the frame's
+	// closing JSON, every reader would drop the frame, and the safe text with it.
+	c.flushLocked(false)
+	c.flushLocked(true)
 	c.emit(line)
 }
 
@@ -1033,8 +1222,9 @@ func (c *deltaCoalescer) add(text string) bool {
 // tail stays buffered (splitRedactionCarry) so the per-frame redaction in
 // publishEventFrame sees `api_key=<value>` whole even when the pair straddles
 // two flushes — the later masked completion frame cannot retract a leaked
-// stream frame. The carry is released by the next delta or by close() — never
-// by an intervening non-delta frame.
+// stream frame. The carry is released by the next delta, by the record that
+// ends the run (publishFinal) or by close() — never by an intervening
+// non-delta frame.
 func (c *deltaCoalescer) flushLocked(final bool) {
 	if c.timer != nil {
 		c.timer.Stop()

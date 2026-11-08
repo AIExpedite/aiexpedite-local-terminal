@@ -6987,9 +6987,10 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// the SAME argv shape runOneShot will execute — including the leading
 		// --dangerously-skip-permissions — so a narrowed allowlist (e.g.
 		// `agy --print *`) cannot approve a command that then silently runs with
-		// auto-approved tool permissions the operator never saw.
+		// auto-approved tool permissions the operator never saw. The START's
+		// model and effort are part of that shape: every turn carries them.
 		allowCommand = "agy"
-		allowArgs = buildAntigravityNativeGateArgs()
+		allowArgs = buildAntigravityNativeGateArgs(antigravityNativeLaunchArgs(cmd.Args))
 		dialogArgs = allowArgs
 		denyOutput = "antigravity native session denied by user: not in allow list"
 	case "opencode_native_start":
@@ -6997,7 +6998,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "opencode"
-		allowArgs = buildOpenCodeRunArgs(openCodeRunShapeNoSession, "")
+		allowArgs = buildOpenCodeNativeTurnArgs("", openCodeNativeLaunchArgs(cmd.Args))
 		dialogArgs = allowArgs
 		denyOutput = "opencode native session denied by user: not in allow list"
 	case "musecode_native_start":
@@ -7010,7 +7011,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "muse"
-		allowArgs = buildMuseCodeNativeGateArgs()
+		allowArgs = buildMuseCodeNativeGateArgs(museCodeNativeLaunchArgs(cmd.Args))
 		dialogArgs = allowArgs
 		denyOutput = "muse code native session denied by user: not in allow list"
 		persistOnAlways = false
@@ -7755,6 +7756,11 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
    Antigravity native (stream-json + --conversation resume) routing
    -------------------------------------------------------------------------- */
 
+// antigravityNativePublisher builds the publisher handleAntigravityNativeCommand
+// streams a session's frames through. A var so a test can drive the handler
+// without a Pub/Sub topic — the seam publishMsg is for one-off results.
+var antigravityNativePublisher = newSessionPublishFn
+
 // handleAntigravityNativeCommand dispatches antigravity_native_* commands to
 // the AntigravityNativeManager. Start registers a logical session (no process);
 // Send runs one-shot agy stream-json with exact --conversation resume; End cancels
@@ -7765,7 +7771,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		// Start commands leave a cloud-side `starting` session + reservation;
 		// emit ended so the orchestrator can tear them down.
 		if cmd.Type == "antigravity_native_start" && cmd.SessionID != "" {
-			publishFn := newSessionPublishFn(topic, "[antigravity-native]")
+			publishFn := antigravityNativePublisher(topic, "[antigravity-native]")
 			publishTerminalResult(publishFn, resultMsg{
 				ID:          cmd.ID,
 				WorkspaceID: cmd.WorkspaceID,
@@ -7782,7 +7788,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		return
 	}
 
-	publishFn := newSessionPublishFn(topic, "[antigravity-native]")
+	publishFn := antigravityNativePublisher(topic, "[antigravity-native]")
 
 	switch cmd.Type {
 	case "antigravity_native_start":
@@ -7808,12 +7814,15 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			})
 		}
 
-		err := globalAntigravityNativeManager.Start(
+		// cmd.Args are signed (signaturePayload.Args); the manager keeps only
+		// their model and effort and applies them to every turn.
+		err := globalAntigravityNativeManager.StartWithArgs(
 			cmd.SessionID,
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
 			cmd.ConversationID,
+			cmd.Args,
 			publishFn,
 			onStarted,
 		)
@@ -8131,8 +8140,14 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 
 // oneShotNativeCommandTarget is what handleOneShotNativeCommand drives:
 // OpenCodeNativeManager and every oneShotNativeManager.
+//
+// StartWithArgs is handed the START's args: they are part of the command's
+// HMAC canonical (signaturePayload.Args, signed for every command type), and
+// the manager keeps only their model and effort flags for every turn
+// (selectNativeLaunchArgs). That is the device half of the
+// `nativeLaunchArgs` capability (capabilitiesInfo.NativeLaunchArgs).
 type oneShotNativeCommandTarget interface {
-	Start(id, cwd, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error
+	StartWithArgs(id, cwd, workspaceID, uid, resumeSessionID string, startArgs []string, publishFn PublishFunc, onStarted func()) error
 	Send(id, text string, publishFn PublishFunc, turnTimeout time.Duration) error
 	End(id string) error
 	HasSession(id string) bool
@@ -8226,7 +8241,7 @@ func dispatchOneShotNativeCommandAccepting(cmd commandMsg, mgr oneShotNativeComm
 				SessionID:   cmd.SessionID,
 			})
 		}
-		err := mgr.Start(cmd.SessionID, cmd.Cwd, cmd.WorkspaceID, cmd.UID, cmd.ConversationID, publishFn, onStarted)
+		err := mgr.StartWithArgs(cmd.SessionID, cmd.Cwd, cmd.WorkspaceID, cmd.UID, cmd.ConversationID, cmd.Args, publishFn, onStarted)
 		if err != nil {
 			publishErr(fmt.Sprintf("failed to start %s: %v", kind, err))
 			if !mgr.HasSession(cmd.SessionID) {

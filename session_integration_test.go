@@ -337,6 +337,9 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"event":"result","result":{"status":"SUCCESS","response":%s}}`+"\n", encodedMarker)
 		os.Exit(0)
 
+	case mockAgyArgvMode:
+		runMockAgyArgv()
+
 	case "antigravity-stream-stdin-slow":
 		// Same contract as antigravity-stream-stdin, but the turn lasts long
 		// enough for the run-scoped quota capture to complete at least one poll

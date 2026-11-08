@@ -532,11 +532,11 @@ func TestOpenCodeStorageDir_HonoursOverrides(t *testing.T) {
    -------------------------------------------------------------------------- */
 
 func TestOpenCodeCompletionFrame_MarksReplayRecovery(t *testing.T) {
-	plain := openCodeCompletionFrame("hi", false)
+	plain := openCodeCompletionFrame("hi", "hi", false)
 	if strings.Contains(plain, "replayRecovery") {
 		t.Fatalf("a non-replay turn must not carry the marker: %s", plain)
 	}
-	replayed := openCodeCompletionFrame("hi", true)
+	replayed := openCodeCompletionFrame("hi", "hi", true)
 	if !strings.Contains(replayed, `"replayRecovery":true`) {
 		t.Fatalf("replay marker missing: %s", replayed)
 	}

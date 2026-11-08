@@ -75,8 +75,10 @@ func TestCapabilities_FailedHardwareProbeKeepsRelayFlags(t *testing.T) {
 			// with the signed-executionId device half, `whatsapp` with the
 			// WhatsApp bridge, and its `protocol` (2) with sticky identities and
 			// the re-link carry-over; `cliSessionDiscovery` with finding and
-			// adopting coding-agent sessions AI Expedite did not start.
-			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
+			// adopting coding-agent sessions AI Expedite did not start;
+			// `nativeLaunchArgs` with the one-shot managers applying a START's
+			// model and effort to every turn.
+			if string(raw) != `{"relayTurnInbox":true,"loadReport":true,"relayAckWatermark":true,"relayPermissionPrompts":true,"relayCwdFence":true,"nativeLaunchArgs":true,"readOnlySessions":true,"cliSessionDiscovery":{"engines":["claudeCode"],"protocol":1},"worktreeBuiltIns":true,"signedExecutionId":true,"whatsapp":`+string(waRaw)+`}` {
 				t.Fatalf("capabilities JSON = %s", raw)
 			}
 		})
@@ -108,5 +110,12 @@ func TestCapabilities_RegistrationCarriesRelayFlags(t *testing.T) {
 	}
 	if caps["relayTurnInbox"] != true || caps["relayAckWatermark"] != true {
 		t.Fatalf("registration capabilities = %v, want both relay flags true", caps)
+	}
+	// terminal-service claims a model or effort as applied for Antigravity,
+	// OpenCode and Muse Code only on a device reporting this (shared-constants
+	// DEVICE_RELAY_CAPABILITIES.NATIVE_LAUNCH_ARGS). It must reach the agent
+	// doc through the same registration payload as the relay flags.
+	if caps["nativeLaunchArgs"] != true {
+		t.Fatalf("registration capabilities = %v, want nativeLaunchArgs true", caps)
 	}
 }

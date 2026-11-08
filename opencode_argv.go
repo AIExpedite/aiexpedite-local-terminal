@@ -17,6 +17,8 @@
 //   - `run` and `--format json` are FORCED on every non-diagnostic invocation.
 //   - `--session <id>` is added only on the direct path, only above
 //     openCodeNativeMinVersion, and is the one droppable token in the ladder.
+//   - The direct path appends its START's `--model` / `--variant` to every
+//     turn (buildOpenCodeNativeTurnArgs); nothing else from a START reaches it.
 //   - Manager-owned flags a caller sent (openCodeStrippedFlags) are removed
 //     with their values; every other TOKEN a caller sent is forwarded AS-IS,
 //     because nothing tells us whether an unlearned option is boolean or
@@ -98,6 +100,15 @@ func openCodeShapeForResume(nativeSessionID string) openCodeRunShape {
 	return openCodeRunShapeNoSession
 }
 
+// buildOpenCodeNativeTurnArgs is one direct-chat turn's argv: the ladder rung
+// for nativeSessionID, then the START's model and effort
+// (openCodeNativeLaunchArgs), which every turn of the session carries — a
+// resumed turn and the replay recovery included. Without launch flags it is
+// exactly the ladder's argv.
+func buildOpenCodeNativeTurnArgs(nativeSessionID string, launchArgs []string) []string {
+	return append(buildOpenCodeRunArgs(openCodeShapeForResume(nativeSessionID), nativeSessionID), launchArgs...)
+}
+
 /* --------------------------------------------------------------------------
    Caller argv policy
    -------------------------------------------------------------------------- */
@@ -161,6 +172,36 @@ var openCodeForwardedValuedFlags = map[string]bool{
 	"--agent":   true,
 	"--port":    true,
 	"--host":    true,
+}
+
+// openCodeNativeLaunchFlags are the START flags every direct-chat turn
+// applies (`opencode run --help`): the model (`-m` / `--model
+// provider/model`) and its provider-specific reasoning effort (`--variant
+// <level>`), each spelling mapped to the one a turn carries. shared-constants
+// composes `--model` and `--variant` (CLI_AGENT_EFFORT_FLAG_BY_ID). Every
+// spelling is also in openCodeForwardedValuedFlags.
+//
+// The native path never applied a START's args before this, and with no
+// model OpenCode falls back to its own configured default — which on a
+// computer whose default provider has no key fails EVERY turn
+// (ProviderAuthError) whatever the person picked.
+var openCodeNativeLaunchFlags = map[string]string{
+	"--model":   "--model",
+	"-m":        "--model",
+	"--variant": "--variant",
+}
+
+// openCodeNativeLaunchArgs keeps a START's model and effort for every turn
+// (selectNativeLaunchArgs) and drops everything else.
+func openCodeNativeLaunchArgs(startArgs []string) []string {
+	return selectNativeLaunchArgs(startArgs, nativeLaunchFlags{
+		forwarded: openCodeForwardedValuedFlags,
+		canonical: openCodeNativeLaunchFlags,
+		order:     []string{"--model", "--variant"},
+		valued: func(name string) bool {
+			return openCodeForwardedValuedFlags[name] || openCodeValuedStrippedFlags[name]
+		},
+	})
 }
 
 // openCodeFlagNameAt splits a caller token into its flag NAME and whether it

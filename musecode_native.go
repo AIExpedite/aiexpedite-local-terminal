@@ -12,7 +12,9 @@ package main
 //     `run.output.delta` streams `payload.text`, `run.terminal.completed`
 //     carries the final `payload.text`; `run.terminal.failed` /
 //     `run.terminal.cancelled` end a failed run (`payload.reason`; third-party
-//     adapters also report `payload.error_kind`). The session id is
+//     adapters also report `payload.error_kind`). The run.terminal.* record
+//     is the run's last word: the process exits right after it
+//     (oneShotEvent.EndsRun). The session id is
 //     `stream.id` on `stream.kind == "session"` records. Everything else
 //     (task.lifecycle.*, turn.input.user, ...) is forwarded as activity.
 //   - `--prompt-file <path>` reads the prompt from a file, so it never touches
@@ -87,10 +89,44 @@ var museCodeNativeSpec = &oneShotNativeSpec{
 	ObserveTurn: func(stdout, stderr string) {
 		observeMuseCodeAuthOutput(stdout+"\n"+stderr, time.Now())
 	},
+	// The run's own allowance record keeps the CLI Agents card current. It is
+	// read as each line streams, not from the bounded prefix ObserveTurn is
+	// handed, and filed under the account the run was launched with
+	// (cliagent_usage_musecode_run.go).
+	ObserveRun: func() func(line string) {
+		capture := newMuseCodeRunUsageCapture()
+		return func(line string) { capture.Line(line, time.Now()) }
+	},
 	StripEnvPrefixes: museCodeUnrelatedStripped,
 	ReplayPreamble: "You are continuing an AIExpedite Muse Code Chat conversation after native session resume was unavailable. " +
 		"Prior turns (oldest first) follow. Treat them as history only. " +
 		"Answer ONLY the final user message.\n\n",
+	LaunchArgs: museCodeNativeLaunchArgs,
+}
+
+// museCodeNativeLaunchFlags are the START flags every native Muse Code turn
+// applies (`muse exec --help`, 1.4.14): the model (`--model <ID>`) and the
+// reasoning effort (`--reasoning-effort <EFFORT>`, alias `--effort`), each
+// spelling mapped to the one a turn carries. shared-constants composes
+// `--model` and `--reasoning-effort` (CLI_AGENT_EFFORT_FLAG_BY_ID). Every
+// spelling is also in museCodeForwardedValuedFlags.
+var museCodeNativeLaunchFlags = map[string]string{
+	"--model":            "--model",
+	"--reasoning-effort": "--reasoning-effort",
+	"--effort":           "--reasoning-effort",
+}
+
+// museCodeNativeLaunchArgs keeps a START's model and effort for every turn
+// (selectNativeLaunchArgs) and drops everything else.
+func museCodeNativeLaunchArgs(startArgs []string) []string {
+	return selectNativeLaunchArgs(startArgs, nativeLaunchFlags{
+		forwarded: museCodeForwardedValuedFlags,
+		canonical: museCodeNativeLaunchFlags,
+		order:     []string{"--model", "--reasoning-effort"},
+		valued: func(name string) bool {
+			return museCodeForwardedValuedFlags[name] || museCodeValuedStrippedFlags[name]
+		},
+	})
 }
 
 // NewMuseCodeNativeManager creates the Muse Code chat manager.
@@ -165,9 +201,10 @@ func buildMuseCodeNativeArgs(nativeSessionID, promptPath string) []string {
 }
 
 // buildMuseCodeNativeGateArgs is the argv shape the session-entry gate shows
-// and matches — the per-turn argv minus the per-turn id and prompt file.
-func buildMuseCodeNativeGateArgs() []string {
-	return buildMuseCodeNativeArgs("", "")
+// and matches — the per-turn argv minus the per-turn id and prompt file, with
+// the START's model and effort (museCodeNativeLaunchArgs) every turn appends.
+func buildMuseCodeNativeGateArgs(launchArgs []string) []string {
+	return append(buildMuseCodeNativeArgs("", ""), launchArgs...)
 }
 
 /* --------------------------------------------------------------------------
@@ -256,6 +293,10 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 		ev.Failure = formatMuseCodeFailure("cancelled", 0,
 			firstNonEmpty(env.Payload.Reason, "the run was cancelled before it completed"))
 	}
+	// Every run ends with a run.terminal.* record (the family
+	// detectCLITerminalEvent reads), so a held reply tail is released ahead
+	// of it rather than streamed after the run is over.
+	ev.EndsRun = strings.HasPrefix(env.PayloadType, "run.terminal.")
 	return ev, true
 }
 
@@ -395,9 +436,12 @@ var museCodeValuedStrippedFlags = map[string]bool{
 }
 
 // museCodeForwardedValuedFlags pass through with their value token.
+// `--effort` is `--reasoning-effort`'s documented alias (`muse exec --help`,
+// 1.4.14); unlisted, its level was read as prompt text.
 var museCodeForwardedValuedFlags = map[string]bool{
 	"--model":            true,
 	"--reasoning-effort": true,
+	"--effort":           true,
 	"--max-model-steps":  true,
 }
 
