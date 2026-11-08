@@ -613,6 +613,11 @@ func openCodeCompletionFrame(text, finalText string, usedReplay bool) string {
 	return turnCompletionFrame(text, finalText, usedReplay)
 }
 
+// openCodeStoredChunkMaxBytes mirrors terminal-service's MAX_CHUNK_OUTPUT_BYTES
+// (500 KB, terminal.service.js): a stored chunk's output is cut there, and a
+// completion frame cut there is no longer JSON.
+const openCodeStoredChunkMaxBytes = 500 * 1024
+
 // withOpenCodeCompletion sets msg's Output to the turn's completion frame and
 // checks the envelope fits one Pub/Sub publish.
 //
@@ -622,8 +627,24 @@ func openCodeCompletionFrame(text, finalText string, usedReplay bool) string {
 // never sent one — rather than failing a turn that fits on its own. Only a
 // frame too big even without it is an error.
 func withOpenCodeCompletion(msg resultMsg, text, finalText string, usedReplay bool) (resultMsg, error) {
+	// A reply with no tool call IS its final answer: repeating it would only
+	// double the frame (readers take text when finalText is absent).
+	if finalText == text {
+		finalText = ""
+	}
 	msg.Output = openCodeCompletionFrame(text, finalText, usedReplay)
-	if openCodeNativeEnvelopePublishable(msg) == nil {
+	// The first ceiling a reader meets is terminal-service's stored-chunk cut
+	// (openCodeStoredChunkMaxBytes), not the publish limit: a frame cut there
+	// is no longer JSON, and the turn would never complete for its readers. A
+	// finalText that pushes the frame past it is dropped, as is one past the
+	// publish limit.
+	if len(msg.Output) <= openCodeStoredChunkMaxBytes && openCodeNativeEnvelopePublishable(msg) == nil {
+		return msg, nil
+	}
+	if finalText == "" {
+		if err := openCodeNativeEnvelopePublishable(msg); err != nil {
+			return resultMsg{}, err
+		}
 		return msg, nil
 	}
 	msg.Output = openCodeCompletionFrame(text, "", usedReplay)

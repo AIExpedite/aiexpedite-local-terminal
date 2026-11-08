@@ -270,3 +270,32 @@ func TestWithOpenCodeCompletion_DropsTheFinalAnswerBeforeFailingATurn(t *testing
 		t.Fatal("a completion too big even without finalText is still a turn error")
 	}
 }
+
+// A reply with no tool call IS its final answer, so finalText is not repeated:
+// the frame would double, and a reply between half the stored-chunk cut and
+// the cut would be cut into broken JSON and never complete. A finalText that
+// would push the frame past that cut is dropped too.
+func TestWithOpenCodeCompletion_NeverRepeatsTheReplyOrCrossesTheStoredChunkCut(t *testing.T) {
+	base := resultMsg{ID: "s", Type: "opencode_native_message", Status: "success"}
+	msg, err := withOpenCodeCompletion(base, "hello", "hello", false)
+	if err != nil || strings.Contains(msg.Output, "finalText") {
+		t.Fatalf("a no-tool reply must not repeat itself as finalText: %v %s", err, msg.Output)
+	}
+
+	const sentence = "all good. "
+	// About 60% of the cut: fits alone, and would cross it with finalText repeating it.
+	reply := strings.Repeat(sentence, openCodeStoredChunkMaxBytes*6/10/len(sentence))
+	msg, err = withOpenCodeCompletion(base, reply, reply, false)
+	if err != nil || len(msg.Output) > openCodeStoredChunkMaxBytes || strings.Contains(msg.Output, "finalText") {
+		t.Fatalf("a reply that fits the stored-chunk cut must stay under it: err=%v len=%d", err, len(msg.Output))
+	}
+	// A distinct final answer that would push the frame past the cut is dropped.
+	answer := strings.Repeat("final word. ", openCodeStoredChunkMaxBytes*5/10/len("final word. "))
+	msg, err = withOpenCodeCompletion(base, reply+answer, answer, false)
+	if err != nil || len(msg.Output) > openCodeStoredChunkMaxBytes && strings.Contains(msg.Output, "finalText") {
+		t.Fatalf("finalText must not push the frame past the cut: err=%v len=%d", err, len(msg.Output))
+	}
+	if strings.Contains(msg.Output, "finalText") {
+		t.Fatal("the oversize finalText must be dropped")
+	}
+}
