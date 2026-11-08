@@ -19,7 +19,7 @@ import (
 // Two minutes is generous for legitimate video uploads while still
 // guaranteeing the ended frame is published the same order of magnitude as
 // the server's 5-minute reaper cadence. Declared as a var so tests can shorten
-// it.
+// it. The one-shot `execute` scan (scanCommandArtifacts) is bounded by it too.
 var sessionArtifactCollectTimeout = 2 * time.Minute
 
 // Give context-aware collectors a short, bounded window to report uploads
@@ -183,7 +183,14 @@ func collectSessionArtifactsWithProgress(
 		return nil, nil
 	}
 
-	files := detectOutputFilesSinceCtx(ctx, effectiveDir, startedAt)
+	files, refusal := scanOutputFilesSince(ctx, effectiveDir, startedAt)
+	if refusal != "" {
+		// Said instead of the "scanned" line below, which would report a scan
+		// that never ran as one that found nothing.
+		fmt.Printf("[session-file-upload] Session %s: skipping media scan of %s: it is %s; artifacts are collected only from a project folder\n",
+			sessionID, effectiveDir, refusal)
+		return nil, nil
+	}
 	// Always log the scan outcome (root + count), even on zero hits. A silent
 	// zero-file result is otherwise indistinguishable from "upload disabled" —
 	// this line is what turns a future `hasFiles:false` report into a one-grep
