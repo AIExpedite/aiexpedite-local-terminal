@@ -107,6 +107,11 @@ type oneShotEvent struct {
 	// Coalesce marks a pure text-delta line that may be merged with its
 	// neighbours into one published frame (spec.DeltaFrame).
 	Coalesce bool
+	// EndsRun marks the CLI's own end-of-run record (Muse Code's
+	// `run.terminal.*`). No assistant text follows it, so the delta coalescer
+	// releases everything it holds, the redaction carry included, in a final
+	// flush BEFORE the record is published (deltaCoalescer.publishFinal).
+	EndsRun bool
 }
 
 // nativeFrameKind names a native chat kind on the wire: the part the Pub/Sub
@@ -934,6 +939,10 @@ func (m *oneShotNativeManager) streamEvents(
 			if ev.Coalesce && deltas.add(ev.TextDelta) {
 				continue
 			}
+			if ev.EndsRun {
+				deltas.publishFinal(line)
+				continue
+			}
 		}
 		deltas.publish(line)
 	}
@@ -1000,11 +1009,28 @@ func newDeltaCoalescer(render func(string) string, emit func(string)) *deltaCoal
 // opaque-token pattern, and a masked completion frame cannot retract a stream
 // frame already published. Lifecycle and tool frames still go out in their own
 // order; only the held tail — bounded by agentSecretCarryMaxBytes — is
-// deferred to the next flush, and close() always releases it.
+// deferred to the next flush, and the run's end (publishFinal) or close()
+// always releases it.
 func (c *deltaCoalescer) publish(line string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.flushLocked(false)
+	c.emit(line)
+}
+
+// publishFinal emits the record that ends the run after a FINAL flush: the
+// held redaction carry goes out with the rest of the buffered text, still
+// joined to it, so the per-frame redaction in publishEventFrame and
+// maskOpaqueContinuation see it whole. No assistant text follows the run's
+// end, so nothing is left for the carry to wait for. Held to close() instead
+// (stdout EOF), the tail was published as a run.output.delta AFTER the run's
+// terminal record; the web view reads a record after a terminal one as the
+// next run's, opened a second bubble for it, and the turn_complete envelope
+// then filled that bubble with the whole reply, so the reply was drawn twice.
+func (c *deltaCoalescer) publishFinal(line string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked(true)
 	c.emit(line)
 }
 
@@ -1033,8 +1059,9 @@ func (c *deltaCoalescer) add(text string) bool {
 // tail stays buffered (splitRedactionCarry) so the per-frame redaction in
 // publishEventFrame sees `api_key=<value>` whole even when the pair straddles
 // two flushes — the later masked completion frame cannot retract a leaked
-// stream frame. The carry is released by the next delta or by close() — never
-// by an intervening non-delta frame.
+// stream frame. The carry is released by the next delta, by the record that
+// ends the run (publishFinal) or by close() — never by an intervening
+// non-delta frame.
 func (c *deltaCoalescer) flushLocked(final bool) {
 	if c.timer != nil {
 		c.timer.Stop()

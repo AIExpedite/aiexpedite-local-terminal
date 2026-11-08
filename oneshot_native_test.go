@@ -142,6 +142,117 @@ func TestOneShotNative_SendStreamsFramesAndPublishesIDAfterSuccess(t *testing.T)
 	}
 }
 
+// isolateMuseTurn keeps a stub-driven Muse turn off every shared path: the
+// Muse files this package reads or writes (isolateMuseCode, among them the
+// sign-in evidence ObserveTurn records for a run.terminal.* record) and the
+// home the prompt scratch dir resolves under.
+func isolateMuseTurn(t *testing.T) {
+	t.Helper()
+	isolateTestUserHome(t, isolateMuseCode(t))
+}
+
+// The delta coalescer holds a credential-shaped tail of the streamed text out
+// of every non-final flush (splitRedactionCarry): a long identifier, or a
+// trailing `t` / `a` that could start a `token=` / `api_key=` label. Held to
+// stdout EOF, that tail went out as a run.output.delta AFTER the run's own
+// run.terminal.* record and before the device's verdict. The web view reads a
+// record after a terminal one as the NEXT run's, so it opened a second bubble,
+// and the turn_complete envelope then filled that bubble with the whole reply:
+// the reply was drawn twice. The run is over at its terminal record, so every
+// delta must precede it — and the stream must still carry all of the text.
+func TestOneShotNative_HeldReplyTailIsPublishedBeforeTheTerminalRecord(t *testing.T) {
+	cases := []struct {
+		name       string
+		deltas     []string
+		terminal   string
+		exit       string
+		wantOrder  string
+		wantStream string
+	}{
+		{
+			// An opaque run long enough to grow into a credential blob.
+			name:       "a completed reply ending in a long identifier",
+			deltas:     []string{"The build is ready in ", "build_artifact_20261108"},
+			terminal:   museCompletedRecord("The build is ready in build_artifact_20261108"),
+			exit:       "0",
+			wantOrder:  "delta|terminal|complete",
+			wantStream: "The build is ready in build_artifact_20261108",
+		},
+		{
+			// A trailing `t` could be the first letter of a `token=` label.
+			name:   "a failed run whose text ends in a label's first letter",
+			deltas: []string{"Checking the deploy ", "target"},
+			terminal: museRecord("run.terminal.failed",
+				`{"kind":"run_terminal","terminal":"failed","error_kind":"server_error","status":503,"reason":"upstream unavailable"}`),
+			exit:       "1",
+			wantOrder:  "delta|terminal|error",
+			wantStream: "Checking the deploy target",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := installMuseCodeStub(t)
+			isolateMuseTurn(t)
+			records := []string{museFrameUserInput}
+			for _, d := range tc.deltas {
+				records = append(records, museDeltaRecord(d))
+			}
+			records = append(records, tc.terminal)
+			t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(records...))
+			t.Setenv("OPENCODE_STUB_EXIT", tc.exit)
+			startMuse(t, m, "s", "")
+
+			sink := &frameSink{}
+			err := m.Send("s", "is it ready?", sink.publish, time.Minute)
+			if (err != nil) != (tc.exit != "0") {
+				t.Fatalf("send error = %v for exit %s", err, tc.exit)
+			}
+
+			frames := sink.all()
+			order := museFrameOrder(frames)
+			if got := strings.Join(order, "|"); got != tc.wantOrder {
+				t.Fatalf("frame order %q, want %q (a delta after the terminal record opens a second bubble):\n%s",
+					got, tc.wantOrder, museFramesDump(frames))
+			}
+			if got := museStreamedDeltaText(t, frames); got != tc.wantStream {
+				t.Fatalf("the stream must carry the whole reply ahead of the terminal record: got %q, want %q", got, tc.wantStream)
+			}
+		})
+	}
+}
+
+// A credential that ends the reply is still masked when the run's end releases
+// it: the release is a FINAL flush, so the label and its value go out in one
+// frame, redacted, ahead of the terminal record.
+func TestOneShotNative_RunEndReleasesACredentialTailMasked(t *testing.T) {
+	m := installMuseCodeStub(t)
+	isolateMuseTurn(t)
+	const secret = "mk-live-0123456789abcdef"
+	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(
+		museDeltaRecord("running tool: META_API_KEY="),
+		museDeltaRecord(secret),
+		museCompletedRecord("running tool: META_API_KEY="+secret),
+	))
+	startMuse(t, m, "s", "")
+
+	sink := &frameSink{}
+	if err := m.Send("s", "run the tool", sink.publish, time.Minute); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	frames := sink.all()
+	for _, f := range frames {
+		if strings.Contains(f.Output, "0123456789abcdef") {
+			t.Fatalf("the credential reached a published frame:\n%s", museFramesDump(frames))
+		}
+	}
+	if got := strings.Join(museFrameOrder(frames), "|"); got != "delta|terminal|complete" {
+		t.Fatalf("frame order %q, want delta|terminal|complete:\n%s", got, museFramesDump(frames))
+	}
+	if delta := frames[0].Output; !strings.Contains(delta, "running tool: ") || !strings.Contains(delta, "[REDACTED]") {
+		t.Fatalf("the safe prefix must stream and the pair must be masked in one frame: %s", delta)
+	}
+}
+
 func TestOneShotNative_FailedTurnIsAnErrorAndRotatesUnconfirmedID(t *testing.T) {
 	m := installMuseCodeStub(t)
 	t.Setenv("OPENCODE_STUB_STDOUT", museStubStdout(museFrameFailed402))

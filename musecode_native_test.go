@@ -22,13 +22,16 @@ func TestParseMuseCodeEventLine(t *testing.T) {
 		{"delta field variant", `{"payload_type":"run.output.delta","payload":{"delta":"Hi"}}`, true, oneShotEvent{Coalesce: true, TextDelta: "Hi"}},
 		{"delta keeps a lone space", `{"payload_type":"run.output.delta","payload":{"delta":" "}}`, true, oneShotEvent{Coalesce: true, TextDelta: " "}},
 		{"delta text fallback", `{"payload_type":"run.output.delta","payload":{"text":"hi"}}`, true, oneShotEvent{Coalesce: true, TextDelta: "hi"}},
-		{"completed", museFrameCompleted, true, oneShotEvent{FinalText: "Hello world", SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
+		{"completed", museFrameCompleted, true, oneShotEvent{FinalText: "Hello world", SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", EndsRun: true}},
 		{"failed with status", museFrameFailed402, true, oneShotEvent{
-			Failure: "[Muse Code turn failed: billing_not_configured (status 402): Billing is not configured for this account.]"}},
+			Failure: "[Muse Code turn failed: billing_not_configured (status 402): Billing is not configured for this account.]", EndsRun: true}},
 		{"failed without status", `{"payload_type":"run.terminal.failed","payload":{"error_kind":"max_model_steps","reason":"step budget exhausted"}}`, true,
-			oneShotEvent{Failure: "[Muse Code turn failed: max_model_steps: step budget exhausted]"}},
+			oneShotEvent{Failure: "[Muse Code turn failed: max_model_steps: step budget exhausted]", EndsRun: true}},
 		{"cancelled", `{"payload_type":"run.terminal.cancelled","payload":{}}`, true,
-			oneShotEvent{Failure: "[Muse Code turn failed: cancelled: the run was cancelled before it completed]"}},
+			oneShotEvent{Failure: "[Muse Code turn failed: cancelled: the run was cancelled before it completed]", EndsRun: true}},
+		// A terminal kind this build does not know still ends the run.
+		{"an unknown terminal kind ends the run", `{"payload_type":"run.terminal.expired","payload":{}}`, true, oneShotEvent{EndsRun: true}},
+		{"a run-scoped record that is not terminal does not end it", `{"payload_type":"run.lifecycle.completed","payload":{}}`, true, oneShotEvent{}},
 		{"task activity contributes no text", museFrameTool, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"}},
 		{"a tool result names its tool", museFrameToolResult, true, oneShotEvent{SessionID: "0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11", ToolName: "powershell"}},
 		{"a tool result without a name still reports progress", `{"payload_type":"tool.result","payload":{"call_id":"c1"}}`, true, oneShotEvent{ToolName: "tool"}},
@@ -474,6 +477,73 @@ func TestDeltaCoalescer_CarrySurvivesAnInterveningNonDeltaFrame(t *testing.T) {
 	if !strings.Contains(joined, "running tool: ") {
 		t.Fatalf("the safe prefix must still stream: %q", frames)
 	}
+}
+
+// The record that ends the run releases the held tail AHEAD of itself: the
+// stream is over, so nothing is left for the carry to wait for, and a tail
+// published after the terminal record is read by the web view as the next
+// run's. The release is a final flush of the joined buffer, so a credential
+// pair split across an earlier timer flush is still masked whole.
+func TestDeltaCoalescer_RunEndReleasesTheCarryAheadOfItsRecord(t *testing.T) {
+	const terminal = `{"payload_type":"run.terminal.completed"}`
+	newSink := func() (*deltaCoalescer, func() []string) {
+		var (
+			mu  sync.Mutex
+			out []string
+		)
+		c := newDeltaCoalescer(
+			func(text string) string { return "text:" + text },
+			func(line string) { mu.Lock(); out = append(out, redactAgentSecrets(line)); mu.Unlock() },
+		)
+		return c, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), out...) }
+	}
+	waitForFrames := func(snapshot func() []string, n int) {
+		deadline := time.Now().Add(5 * time.Second)
+		for len(snapshot()) < n && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	t.Run("a held prose tail goes out before the terminal record", func(t *testing.T) {
+		c, snapshot := newSink()
+		c.add("The summary is in the build output")
+		c.publishFinal(terminal)
+		c.close()
+		if got := strings.Join(snapshot(), "|"); got != "text:The summary is in the build output|"+terminal {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("a credential split across a timer flush is masked whole, before the record", func(t *testing.T) {
+		c, snapshot := newSink()
+		c.add("running tool: META_API_KEY=")
+		// The 250ms timer flushes the safe prefix and holds the label.
+		waitForFrames(snapshot, 1)
+		if got := snapshot(); len(got) != 1 || got[0] != "text:running tool: META_" {
+			t.Fatalf("the timer must publish only the safe prefix, got %q", got)
+		}
+		c.add("mk-live-0123456789abcdef")
+		c.publishFinal(terminal)
+		c.close()
+
+		frames := snapshot()
+		joined := strings.Join(frames, "|")
+		if strings.Contains(joined, "0123456789abcdef") {
+			t.Fatalf("the split credential value leaked: %q", frames)
+		}
+		if len(frames) != 3 || !strings.Contains(frames[1], "API_KEY=[REDACTED]") || frames[2] != terminal {
+			t.Fatalf("want prefix, masked pair, terminal record; got %q", frames)
+		}
+	})
+
+	t.Run("with nothing buffered the record goes out alone", func(t *testing.T) {
+		c, snapshot := newSink()
+		c.publishFinal(terminal)
+		c.close()
+		if got := strings.Join(snapshot(), "|"); got != terminal {
+			t.Fatalf("got %q", got)
+		}
+	})
 }
 
 func TestMuseCodeProbeVersion_PrefersTheLauncherVersionFile(t *testing.T) {

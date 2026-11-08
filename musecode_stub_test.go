@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,6 +69,94 @@ const (
 	museFrameFailed402  = `{"schema_version":1,"sequence":9,"record_type":"event","payload_type":"run.terminal.failed","payload":{"kind":"run_terminal","terminal":"failed","error_kind":"billing_not_configured","status":402,"reason":"Billing is not configured for this account."}}`
 )
 
+// museRecord renders one `muse exec --json` record in the CLI's own field
+// order (payload_type ahead of payload, as in the captured frames above), so a
+// redaction that masks a credential inside the payload text never takes the
+// payload_type with it. payload is the raw JSON object of the payload.
+func museRecord(payloadType, payload string) string {
+	return `{"schema_version":1,"stream":{"kind":"session","id":"0b0e7c4e-6a53-4f0e-9d0a-2f6c1f7c9a11"},"record_type":"event","payload_type":"` +
+		payloadType + `","payload":` + payload + `}`
+}
+
+// museDeltaRecord is a `run.output.delta` record streaming text. The text
+// must hold no line break: the stub unescapes `\n` inside its stdout.
+func museDeltaRecord(text string) string {
+	return museRecord("run.output.delta", `{"kind":"run_output_delta","text":`+museJSONString(text)+`}`)
+}
+
+// museCompletedRecord is the `run.terminal.completed` record carrying the
+// run's full final text.
+func museCompletedRecord(text string) string {
+	return museRecord("run.terminal.completed", `{"kind":"run_terminal","terminal":"completed","text":`+museJSONString(text)+`,"reason":null}`)
+}
+
+func museJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// museFrameOrder names each published frame in order. A message frame is
+// "delta" (the device's merged run.output.delta, recognised by its leading
+// kind, which precedes the text and so survives a mask that eats the rest of
+// the line), "terminal" (a run.terminal.* record), "complete" (the
+// aiexpedite.turn_complete envelope) or "other"; an error frame is "error"
+// and a stderr frame "stderr".
+func museFrameOrder(frames []resultMsg) []string {
+	order := make([]string, 0, len(frames))
+	for _, f := range frames {
+		switch {
+		case f.Type == "musecode_native_error":
+			order = append(order, "error")
+		case f.Type == "musecode_native_stderr":
+			order = append(order, "stderr")
+		case f.Type != "musecode_native_message":
+			order = append(order, f.Type)
+		case strings.Contains(f.Output, `"type":"aiexpedite.turn_complete"`):
+			order = append(order, "complete")
+		case strings.Contains(f.Output, `"payload_type":"run.terminal.`):
+			order = append(order, "terminal")
+		case strings.HasPrefix(f.Output, `{"payload":{"kind":"run_output_delta"`):
+			order = append(order, "delta")
+		default:
+			order = append(order, "other")
+		}
+	}
+	return order
+}
+
+// museFramesDump lists published frames for a failure message.
+func museFramesDump(frames []resultMsg) string {
+	var b strings.Builder
+	for i, f := range frames {
+		fmt.Fprintf(&b, "  #%d %s: %s\n", i, f.Type, f.Output)
+	}
+	return b.String()
+}
+
+// museStreamedDeltaText joins the text of every merged delta frame, in order.
+func museStreamedDeltaText(t *testing.T, frames []resultMsg) string {
+	t.Helper()
+	var b strings.Builder
+	for _, f := range frames {
+		if !strings.HasPrefix(f.Output, `{"payload":{"kind":"run_output_delta"`) {
+			continue
+		}
+		var rec struct {
+			Payload struct {
+				Text string `json:"text"`
+			} `json:"payload"`
+		}
+		if err := json.Unmarshal([]byte(f.Output), &rec); err != nil {
+			t.Fatalf("a delta frame is not a JSON record: %v: %s", err, f.Output)
+		}
+		b.WriteString(rec.Payload.Text)
+	}
+	return b.String()
+}
+
 // frameSink records published frames for assertions.
 type frameSink struct {
 	mu     sync.Mutex
@@ -77,6 +167,13 @@ func (s *frameSink) publish(msg resultMsg) {
 	s.mu.Lock()
 	s.frames = append(s.frames, msg)
 	s.mu.Unlock()
+}
+
+// all returns every published frame, in publish order.
+func (s *frameSink) all() []resultMsg {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]resultMsg(nil), s.frames...)
 }
 
 func (s *frameSink) ofType(t string) []resultMsg {

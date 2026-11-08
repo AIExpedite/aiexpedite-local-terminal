@@ -12,7 +12,9 @@ package main
 //     `run.output.delta` streams `payload.text`, `run.terminal.completed`
 //     carries the final `payload.text`; `run.terminal.failed` /
 //     `run.terminal.cancelled` end a failed run (`payload.reason`; third-party
-//     adapters also report `payload.error_kind`). The session id is
+//     adapters also report `payload.error_kind`). The run.terminal.* record
+//     is the run's last word: the process exits right after it
+//     (oneShotEvent.EndsRun). The session id is
 //     `stream.id` on `stream.kind == "session"` records. Everything else
 //     (task.lifecycle.*, turn.input.user, ...) is forwarded as activity.
 //   - `--prompt-file <path>` reads the prompt from a file, so it never touches
@@ -260,6 +262,10 @@ func parseMuseCodeEventLine(line string) (oneShotEvent, bool) {
 		ev.Failure = formatMuseCodeFailure("cancelled", 0,
 			firstNonEmpty(env.Payload.Reason, "the run was cancelled before it completed"))
 	}
+	// Every run ends with a run.terminal.* record (the family
+	// detectCLITerminalEvent reads), so a held reply tail is released ahead
+	// of it rather than streamed after the run is over.
+	ev.EndsRun = strings.HasPrefix(env.PayloadType, "run.terminal.")
 	return ev, true
 }
 
