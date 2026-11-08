@@ -1262,6 +1262,15 @@ var antigravityNativeForwardedValuedFlags = map[string]bool{
 	"--effort": true,
 }
 
+// antigravityNativeLaunchFlags maps each spelling of agy's model and effort
+// flags to the one a turn carries (single-dash spellings are folded in first
+// by canonicalAntigravityFlag). Every spelling is also in
+// antigravityNativeForwardedValuedFlags.
+var antigravityNativeLaunchFlags = map[string]string{
+	"--model":  "--model",
+	"--effort": "--effort",
+}
+
 // antigravityNativeLaunchArgs keeps a START's model and effort for every turn
 // (selectNativeLaunchArgs) and drops everything else. agy parses with Go's
 // flag package, so the single-dash spellings (`-model`, `-effort`) are the
@@ -1269,7 +1278,7 @@ var antigravityNativeForwardedValuedFlags = map[string]bool{
 func antigravityNativeLaunchArgs(startArgs []string) []string {
 	return selectNativeLaunchArgs(startArgs, nativeLaunchFlags{
 		forwarded: antigravityNativeForwardedValuedFlags,
-		canonical: map[string]string{"--model": "--model", "--effort": "--effort"},
+		canonical: antigravityNativeLaunchFlags,
 		order:     []string{"--model", "--effort"},
 		valued: func(name string) bool {
 			return antigravityValuedFlags[name] || isAntigravityPrintFlag(name)

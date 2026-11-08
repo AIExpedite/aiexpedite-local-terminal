@@ -152,6 +152,38 @@ func TestNativeLaunchArgs_KeepOnlyTheModelAndEffort(t *testing.T) {
 	}
 }
 
+// A spelling is kept only when the CLI's forwarding allowlist (the legacy
+// session path's) lists it too, so the native path never applies a flag the
+// legacy path would not pass — and every production spelling is listed.
+func TestSelectNativeLaunchArgs_KeepsOnlySpellingsTheCLIForwards(t *testing.T) {
+	flags := nativeLaunchFlags{
+		forwarded: map[string]bool{"--model": true},
+		canonical: map[string]string{"--model": "--model", "--effort": "--effort"},
+		order:     []string{"--model", "--effort"},
+		valued:    func(name string) bool { return name == "--model" || name == "--effort" },
+	}
+	got := selectNativeLaunchArgs([]string{"--model", "m", "--effort", "high", "--effort=max"}, flags)
+	if want := []string{"--model", "m"}; !slices.Equal(got, want) {
+		t.Fatalf("a spelling the CLI does not forward was kept: got %q, want %q", got, want)
+	}
+
+	for _, kind := range []struct {
+		name      string
+		canonical map[string]string
+		forwarded map[string]bool
+	}{
+		{"opencode", openCodeNativeLaunchFlags, openCodeForwardedValuedFlags},
+		{"musecode", museCodeNativeLaunchFlags, museCodeForwardedValuedFlags},
+		{"antigravity", antigravityNativeLaunchFlags, antigravityNativeForwardedValuedFlags},
+	} {
+		for spelling := range kind.canonical {
+			if !kind.forwarded[spelling] {
+				t.Errorf("%s: launch spelling %q is missing from the CLI's forwarding allowlist, so it is never kept", kind.name, spelling)
+			}
+		}
+	}
+}
+
 // The value contract mirrors shared-constants CLI_MODEL_ID_PATTERN (what the
 // server validates a model against before composing it), so the device keeps
 // every value the server composes and nothing that could be read as a flag,
