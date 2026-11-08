@@ -2161,6 +2161,15 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   `capabilities.nativeLaunchArgs`, so terminal-service claims a model or effort
   as applied only on a device that applies it. A value must be one bounded token
   (shared-constants `CLI_MODEL_ID_PATTERN`); anything else drops the flag.
+- **The completion envelope** (`aiexpedite.turn_complete`) carries `text` —
+  every text part of every step joined, which the web view and the transcript
+  read — and `finalText`, the answer after the run's LAST tool call (a
+  `tool_use` frame, or a `step_finish` whose reason is `tool-calls`); for a run
+  with no tool call, all of it, and never empty while `text` is not. Voice reads
+  `finalText`, so a multi-step turn is no longer spoken from its narration
+  ("I'll check the file.Let me run the tests…"). Both are redacted. A reply that
+  fits one publish only without `finalText` goes out without it (a reader then
+  takes `text`, as from an older device).
 - **Stripped, always:** `--format` / `-f`, `--session` / `-s`, `--continue` /
   `-c`, `--fork`, `--print-logs` and their values (`openCodeStrippedFlags`,
   unchanged), decided in ONE place — `openCodeStrippedCallerFlagAt`, the single

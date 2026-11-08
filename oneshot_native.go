@@ -773,10 +773,23 @@ func (m *oneShotNativeManager) rotateUnconfirmedID(session *oneShotNativeSession
 // credential would otherwise republish it verbatim. Redaction is idempotent, so
 // a delta already masked upstream is unaffected.
 func oneShotCompletionFrame(text string, usedReplay bool) string {
+	return turnCompletionFrame(text, "", usedReplay)
+}
+
+// turnCompletionFrame is oneShotCompletionFrame with the turn's final answer:
+// a non-empty finalText rides as `finalText`, redacted exactly like `text`.
+// `text` stays everything the turn said (the web view and the transcript read
+// it); `finalText` is what a reader that wants only the reply takes instead
+// (OpenCode: the text after the run's last tool call, see openCodeFinalAnswer).
+// A reader that finds no `finalText` takes `text`, as from an older device.
+func turnCompletionFrame(text, finalText string, usedReplay bool) string {
 	payload := map[string]any{
 		"type":  "aiexpedite.turn_complete",
 		"text":  redactAgentSecrets(text),
 		"final": true,
+	}
+	if finalText != "" {
+		payload["finalText"] = redactAgentSecrets(finalText)
 	}
 	if usedReplay {
 		payload["replayRecovery"] = true
