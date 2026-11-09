@@ -155,6 +155,10 @@ func (c grokBillingLiveCache) sameOnDemand(other grokBillingLiveCache) bool {
 
 var (
 	grokBillingLiveCacheMu sync.Mutex
+	// grokBillingLiveFile guards the cache file itself (cacheFileGuard): the
+	// transactions below rename it, and loadGrokBillingLive reads it without
+	// grokBillingLiveCacheMu.
+	grokBillingLiveFile cacheFileGuard
 	// grokGenerationRotated reports a committed live-cache write carrying this
 	// process's epoch. Until then the cache may hold a generation an earlier
 	// process published, so the parser omits UsageGeneration and the
@@ -718,7 +722,7 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 	}
 	defer release()
 	var prev grokBillingLiveCache
-	hasPrev := readJSONFile(path, &prev)
+	hasPrev := grokBillingLiveFile.readJSON(path, &prev)
 	sameAccount := hasPrev && prev.AccountFingerprint == entry.AccountFingerprint
 	entryAt, entryErr := time.Parse(time.RFC3339Nano, entry.ObservedAt)
 	prevFuture := false
@@ -802,7 +806,7 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			entry.Generation.Counter++
 		}
 	}
-	if !writeJSONFileAtomic(path, entry) {
+	if !grokBillingLiveFile.writeJSON(path, entry) {
 		return false, false, cliUsageGeneration{}
 	}
 	if entry.Generation != nil && entry.Generation.Epoch == epoch {
@@ -831,13 +835,13 @@ func rotateGrokBillingLiveGeneration(fingerprint string) (generation *cliUsageGe
 		return nil, true
 	}
 	defer release()
-	if !readJSONFile(path, &entry) || entry.AccountFingerprint != fingerprint {
+	if !grokBillingLiveFile.readJSON(path, &entry) || entry.AccountFingerprint != fingerprint {
 		return nil, false
 	}
 	epoch := codexProcessGenerationEpoch.Load()
 	if entry.Generation == nil || entry.Generation.Epoch != epoch {
 		entry.Generation = &cliUsageGeneration{Epoch: epoch, Counter: 1}
-		if !writeJSONFileAtomic(path, entry) {
+		if !grokBillingLiveFile.writeJSON(path, entry) {
 			return nil, true
 		}
 	}
@@ -1039,7 +1043,7 @@ func loadGrokBillingLive(fingerprint string, now time.Time) (grokBillingLiveView
 		return grokBillingLiveView{}, false
 	}
 	var entry grokBillingLiveCache
-	if !readJSONFile(grokBillingLiveCachePath(), &entry) || entry.AccountFingerprint != fingerprint {
+	if !grokBillingLiveFile.readJSON(grokBillingLiveCachePath(), &entry) || entry.AccountFingerprint != fingerprint {
 		return grokBillingLiveView{}, false
 	}
 	observed, err := time.Parse(time.RFC3339Nano, entry.ObservedAt)

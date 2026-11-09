@@ -3419,6 +3419,54 @@ func TestClaudeRunDebt_SharedBudgetAcrossEveryAutomaticPath(t *testing.T) {
 	}
 }
 
+// A scheduled attempt books its next rung and only then releases its claim
+// lease. On Windows, a reader that had the cache open at that moment refused the
+// release's rename, and the best-effort write dropped it. The lease then stayed
+// live for the whole probe timeout (claudeRunDebtClaimLease, about ten seconds),
+// and every automatic path refused the debt until it ran out. That is how
+// TestClaudeRunDebt_SharedBudgetAcrossEveryAutomaticPath spent only 1 to 3 of
+// its 4 requests on a loaded Windows runner. A refused release must still land.
+// The refusal is simulated, so this fails the same way on every platform.
+func TestClaudeRunDebt_ARefusedReleaseStillEndsTheLease(t *testing.T) {
+	cache, calls := armClaudeUsageProbe(t, unreachableProbeHandler)
+	// The rung is far enough out that no timer attempt runs during the test.
+	pinClaudeRunDebtLadder(t, []time.Duration{time.Hour}, time.Hour, time.Millisecond)
+	stubCacheFileBackoff(t, nil)
+	now := time.Now()
+	seedClaudeProbeReading(t, cache, now.Add(-time.Hour))
+	claudeOweRunRefresh(now.Add(-time.Minute))
+	// Refuse, once, the write that ends a live lease: the release.
+	refused := refuseCacheFileRename(t, cache, 1, func(current, next []byte) bool {
+		var before, after claudeRateLimitSnapshot
+		_ = json.Unmarshal(current, &before)
+		_ = json.Unmarshal(next, &after)
+		_, live := claudeRunDebtLeaseLive(&before, time.Now())
+		return live && after.AttemptClaimedUntilMs != before.AttemptClaimedUntilMs
+	})
+
+	claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerRun)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want the attempt's one request", got)
+	}
+	if refused.Load() != 1 {
+		t.Fatal("precondition: the release was never refused")
+	}
+	snap := claudeCacheSnapshot(t, cache)
+	if snap.RefreshOwedAttempts != 1 || snap.NextAttemptAtMs == 0 {
+		t.Fatalf("attempts=%d rung=%d, want the request charged and the next rung booked",
+			snap.RefreshOwedAttempts, snap.NextAttemptAtMs)
+	}
+	if snap.AttemptClaimedUntilMs != 0 {
+		t.Fatalf("AttemptClaimedUntilMs=%d, want the refused release to land and end the lease", snap.AttemptClaimedUntilMs)
+	}
+
+	// The debt's next attempt is not locked out.
+	claudeRunDebtAttemptAt(time.Now(), claudeDebtTriggerRun)
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Fatalf("request count=%d, want the next attempt to send its request", got)
+	}
+}
+
 // A restart between a reserved slot and the response leaves the slot spent:
 // the total across restarts stays within the budget.
 func TestClaudeRunDebt_ReservedSlotSurvivesACrash(t *testing.T) {

@@ -175,7 +175,7 @@ func mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint string,
 	var modUnixNano, size int64
 	_, _ = withClaudeRateLimitCacheLocked(path, time.Time{}, func() (time.Time, error) {
 		snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
-		if b, err := os.ReadFile(path); err == nil {
+		if b, err := claudeRateLimitFile.read(path); err == nil {
 			_ = json.Unmarshal(b, &snap)
 			if snap.Buckets == nil {
 				snap.Buckets = map[string]claudeRateLimitBucket{}
@@ -217,13 +217,14 @@ func mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint string,
 		}
 		// Write-then-rename, with the same pid+nanosecond suffix the merge uses,
 		// so a concurrent reader never observes a half-written file and two
-		// writers cannot collide on the intermediate one.
+		// writers cannot collide on the intermediate one. The rename goes
+		// through claudeRateLimitFile, as the merge's does, so a reader cannot
+		// refuse it (Windows).
 		tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
 		if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
 			return time.Time{}, err
 		}
-		if err := os.Rename(tmp, path); err != nil {
-			_ = os.Remove(tmp)
+		if err := claudeRateLimitFile.replace(tmp, path); err != nil {
 			return time.Time{}, err
 		}
 		wrote = true
