@@ -181,6 +181,10 @@ func (state grokUsageFreshness) debtID() grokDebtID {
 
 var (
 	grokFreshnessMu sync.Mutex
+	// grokFreshnessFile guards the state file itself (cacheFileGuard): the
+	// transaction renames and removes it, and loadGrokUsageFreshness reads it
+	// without grokFreshnessMu.
+	grokFreshnessFile cacheFileGuard
 	// grokUsageRefreshEnabled is set only by StartAgent: tests that settle a
 	// Grok run without opting in must never reach xAI.
 	grokUsageRefreshEnabled atomic.Bool
@@ -261,10 +265,27 @@ func updateGrokUsageFreshness(mutate func(*grokUsageFreshness)) grokUsageFreshne
 	return state
 }
 
-// grokUsageFreshnessTxn is updateGrokUsageFreshness reporting whether mutate
-// ran: false only when another process held the lock past the wait.
+// grokUsageFreshnessTxn is updateGrokUsageFreshness reporting whether its
+// result reached disk. It is false in two cases. When another process held the
+// lock past the wait, mutate did not run and the state returned is the one on
+// disk. When the write or delete failed even after the guard's retries, mutate
+// ran and the state returned is its unsaved result. Either way a caller whose
+// mutation must land retries it with grokRetryRefusedFreshness, rather than
+// acting on a state the next transaction would not find.
 func grokUsageFreshnessTxn(mutate func(*grokUsageFreshness)) (grokUsageFreshness, bool) {
 	return grokUsageFreshnessTxnWait(grokUsageFreshnessLockWait, mutate)
+}
+
+// loadGrokUsageFreshness reads the persisted state for a caller outside a
+// transaction. It goes through grokFreshnessFile and never takes
+// grokFreshnessMu, which a transaction holds across another process's lock
+// wait. A missing or corrupt file reads as nothing owed.
+func loadGrokUsageFreshness() grokUsageFreshness {
+	var state grokUsageFreshness
+	if !grokFreshnessFile.readJSON(grokUsageFreshnessPath(), &state) {
+		return grokUsageFreshness{}
+	}
+	return state
 }
 
 // grokUsageFreshnessTxnWait is grokUsageFreshnessTxn with the sibling-lock
@@ -278,7 +299,7 @@ func grokUsageFreshnessTxnWait(wait time.Duration, mutate func(*grokUsageFreshne
 	if path != "" && os.MkdirAll(filepath.Dir(path), 0o755) == nil {
 		lock, outcome := acquireCrossProcessCacheLockUntil(path, time.Now().Add(wait))
 		if outcome == crossProcessLockContended {
-			if !readJSONFile(path, &state) {
+			if !grokFreshnessFile.readJSON(path, &state) {
 				state = grokUsageFreshness{}
 			}
 			return state, false
@@ -290,7 +311,7 @@ func grokUsageFreshnessTxnWait(wait time.Duration, mutate func(*grokUsageFreshne
 			}()
 		}
 	}
-	if !readJSONFile(path, &state) {
+	if !grokFreshnessFile.readJSON(path, &state) {
 		state = grokUsageFreshness{}
 	}
 	before := state
@@ -298,14 +319,15 @@ func grokUsageFreshnessTxnWait(wait time.Duration, mutate func(*grokUsageFreshne
 	if state == before || path == "" {
 		return state, true
 	}
+	// A write or delete that never reached disk is not committed (see
+	// grokUsageFreshnessTxn): the next transaction would read the old state,
+	// so a charge, a claim or a booked rung reported as landed would be lost.
+	// A read-only data dir still costs only a refresh, never a run.
 	if state.RunFloorMs == 0 && !state.owed() && state.LastAttemptAtMs == 0 && state.DirectForgets == 0 {
-		_ = os.Remove(path)
-		return state, true
+		return state, grokFreshnessFile.remove(path) == nil
 	}
 	state.SchemaVersion = grokUsageFreshnessSchema
-	// Best-effort: a read-only data dir costs a refresh, never a run.
-	_ = writeJSONFileAtomic(path, state)
-	return state, true
+	return state, grokFreshnessFile.writeJSON(path, state)
 }
 
 // grokFreshnessRefusedRetryDelay spaces the retries of a required mutation the
@@ -323,12 +345,12 @@ var (
 )
 
 // grokRetryRefusedFreshness re-runs a required mutation another process's lock
-// refused, off the caller's goroutine, until it lands (committed then runs with
-// the result), the bounded retries are spent, or shutdown spends its last
-// attempt. Without it a settled run whose floor is already released, or a
-// failed read whose rung was never booked, would leave neither a persisted
-// debt nor an armed retry. mutate must be safe to run late: it is applied to
-// the state as it is then.
+// refused, or whose write failed, off the caller's goroutine, until it lands
+// (committed then runs with the result), the bounded retries are spent, or
+// shutdown spends its last attempt. Without it a settled run whose floor is
+// already released, or a failed read whose rung was never booked, would leave
+// neither a persisted debt nor an armed retry. mutate must be safe to run
+// late: it is applied to the state as it is then.
 func grokRetryRefusedFreshness(mutate func(*grokUsageFreshness), committed func(grokUsageFreshness)) {
 	grokFreshnessInFlight.Add(1)
 	go func() {

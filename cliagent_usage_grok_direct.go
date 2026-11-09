@@ -245,11 +245,7 @@ func grokDirectScan(requireDetected bool) {
 // count (grokUsageFreshness.DirectForgets); a missing file reads 0. Read only
 // while a marker is pending, i.e. not yet covered: one small file per poll.
 func grokDirectPersistedForgets() uint64 {
-	var state grokUsageFreshness
-	if !readJSONFile(grokUsageFreshnessPath(), &state) {
-		return 0
-	}
-	return state.DirectForgets
+	return loadGrokUsageFreshness().DirectForgets
 }
 
 // grokDirectAdvanceLocked reads what was appended to path since the cursor

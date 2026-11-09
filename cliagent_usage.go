@@ -305,7 +305,23 @@ func readJSONFileWithin(path string, maxBytes int64, into any) bool {
 // after a crash or self-update — never sees a truncated file. The pid +
 // nanosecond suffix keeps concurrent writers off one temp file. Owner-only
 // (0600); false on any error.
+//
+// A file this process also reads without the writer's locks needs a
+// cacheFileGuard's writeJSON instead: on Windows such a read can refuse the
+// rename.
 func writeJSONFileAtomic(path string, value any) bool {
+	return writeJSONFileVia(path, value, func(tmp, path string) error {
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		return nil
+	})
+}
+
+// writeJSONFileVia is writeJSONFileAtomic with the final rename supplied by the
+// caller, which removes the temp file when that rename fails.
+func writeJSONFileVia(path string, value any, replace func(tmp, path string) error) bool {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false
 	}
@@ -317,11 +333,7 @@ func writeJSONFileAtomic(path string, value any) bool {
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return false
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return false
-	}
-	return true
+	return replace(tmp, path) == nil
 }
 
 // expandHome joins a home dir with a relative path, returning "" if either

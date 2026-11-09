@@ -1027,7 +1027,7 @@ func withClaudeRateLimitCacheLocked(path string, budgetDeadline time.Time, fn fu
 // no reading.
 func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateLimitBucket, reported *claudeWindowSet, now time.Time, fingerprint, source string, allowedScopes []string, probedCred claudeCredStamp) (observed time.Time, advanced *cliUsageGeneration, err error) {
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
-	if b, err := os.ReadFile(path); err == nil {
+	if b, err := claudeRateLimitFile.read(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
 		if snap.Buckets == nil {
 			snap.Buckets = map[string]claudeRateLimitBucket{}
@@ -1277,15 +1277,15 @@ func mergeClaudeRateLimitCacheLocked(path string, updates map[string]claudeRateL
 		return time.Time{}, nil, err
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
-	// observes a half-written file. The PID + nanosecond suffix keeps two
-	// concurrent writers (or a stale tmp from a crashed prior run) from
+	// observes a half-written file, and through claudeRateLimitFile so that
+	// reader cannot refuse the rename (Windows). The PID + nanosecond suffix
+	// keeps two concurrent writers (or a stale tmp from a crashed prior run) from
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
 		return time.Time{}, nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := claudeRateLimitFile.replace(tmp, path); err != nil {
 		return time.Time{}, nil, err
 	}
 	if numericWon {
@@ -1437,10 +1437,16 @@ func tryAcquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
 	return f, true
 }
 
+// claudeRateLimitFile guards the cache files themselves, this agent's and the
+// one the status-line hook is pinned to (see cacheFileGuard). Every read and
+// rename of them goes through it. Without it, a reader in this process refused
+// the writers' renames on Windows, and the best-effort ones dropped the write.
+var claudeRateLimitFile cacheFileGuard
+
 // loadClaudeRateLimitSnapshot reads the cache. Returns (zero, false) when the
 // file is absent or unreadable — the normal "no telemetry observed yet" state.
 func loadClaudeRateLimitSnapshot(path string) (claudeRateLimitSnapshot, bool) {
-	b, err := os.ReadFile(path)
+	b, err := claudeRateLimitFile.read(path)
 	if err != nil {
 		return claudeRateLimitSnapshot{}, false
 	}

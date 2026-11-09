@@ -244,6 +244,10 @@ func (state *antigravityUsageFreshness) resetDebtProgress() {
 
 var (
 	antigravityFreshnessMu sync.Mutex
+	// antigravityFreshnessFile guards the state file itself (cacheFileGuard).
+	// antigravityFreshnessMu already keeps this process's reads off its writes.
+	// The guard adds the retry for another process holding the file.
+	antigravityFreshnessFile cacheFileGuard
 	// antigravityRefreshWorkerMu guards the process-wide single flight: one
 	// debt worker at a time, however many runs settle at once.
 	antigravityRefreshWorkerMu sync.Mutex
@@ -291,7 +295,7 @@ func antigravityFreshnessPath() string {
 // next run rewrites it.
 func readAntigravityUsageFreshnessLocked() antigravityUsageFreshness {
 	var state antigravityUsageFreshness
-	if !readJSONFile(antigravityFreshnessPath(), &state) {
+	if !antigravityFreshnessFile.readJSON(antigravityFreshnessPath(), &state) {
 		return antigravityUsageFreshness{}
 	}
 	return state
@@ -315,7 +319,7 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 		return
 	}
 	if state.RunFloorMs == 0 && state.RefreshOwedAtMs == 0 && state.LastPaidAtMs == 0 {
-		_ = os.Remove(path)
+		_ = antigravityFreshnessFile.remove(path)
 		return
 	}
 	state.SchemaVersion = antigravityFreshnessSchema
@@ -328,9 +332,7 @@ func writeAntigravityUsageFreshnessLocked(state antigravityUsageFreshness) {
 	if err := os.WriteFile(tmp, body, 0o600); err != nil {
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-	}
+	_ = antigravityFreshnessFile.replace(tmp, path)
 }
 
 // readAntigravityUsageFreshness reads the persisted state under the freshness

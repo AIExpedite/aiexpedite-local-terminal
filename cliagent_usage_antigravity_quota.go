@@ -167,6 +167,11 @@ type antigravityQuotaSnapshot struct {
 // saveAntigravityQuotaSnapshot.
 var antigravityQuotaCacheMu sync.Mutex
 
+// antigravityQuotaFile guards the cache file itself (cacheFileGuard):
+// readAntigravityQuotaCache reads it through the guard, and the writer renames
+// it through the guard.
+var antigravityQuotaFile cacheFileGuard
+
 // antigravityQuotaCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_AGY_QUOTA_CACHE overrides it (tests isolate from the real machine
 // cache; ops can relocate it if the data dir is read-only).
@@ -846,7 +851,7 @@ func cachedAntigravityQuotaSnapshot() (antigravityQuotaSnapshot, bool) {
 
 func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	var snap antigravityQuotaSnapshot
-	if !readJSONFile(antigravityQuotaCachePath(), &snap) {
+	if !antigravityQuotaFile.readJSON(antigravityQuotaCachePath(), &snap) {
 		return antigravityQuotaSnapshot{}, false
 	}
 	if len(snap.Buckets) == 0 {
@@ -953,8 +958,7 @@ func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return false
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if antigravityQuotaFile.replace(tmp, path) != nil {
 		return false
 	}
 	// Every route that lands a reading is a settler: the in-run poller, the

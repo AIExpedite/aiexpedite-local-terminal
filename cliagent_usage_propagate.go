@@ -104,7 +104,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 )
@@ -774,7 +773,7 @@ func claudeUsageFallbackGeneration() *cliUsageGeneration {
 		return nil
 	}
 	path := claudeRateLimitCachePath()
-	if _, err := os.Stat(path); err != nil {
+	if _, err := claudeRateLimitFile.stat(path); err != nil {
 		// No own cache: on a dual-channel install the hook pinned to the other
 		// channel is still committing readings there, and importing them is
 		// what creates this agent's cache and first generation. Skipping here

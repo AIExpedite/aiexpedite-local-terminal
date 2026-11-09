@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -123,10 +124,11 @@ func (h *grokDebtHarness) idle() {
 	}
 }
 
+// state reads the persisted state the way production reads it outside a
+// transaction. A bare read would race the worker's renames: on Windows it can
+// refuse one, or fail and read as nothing owed.
 func (h *grokDebtHarness) state() grokUsageFreshness {
-	var state grokUsageFreshness
-	readJSONFile(grokUsageFreshnessPath(), &state)
-	return state
+	return loadGrokUsageFreshness()
 }
 
 func (h *grokDebtHarness) write(state grokUsageFreshness) {
@@ -689,6 +691,71 @@ func TestGrokRunDebt_CallerTimeoutSpendsNothingAndTheFlightStillPays(t *testing.
 	if h.reads.Load() != 1 || h.state().owed() {
 		t.Fatalf("reads=%d state=%+v, want the late ok from the same flight to retire the debt", h.reads.Load(), h.state())
 	}
+}
+
+// refuseGrokChargeWrite refuses, up to `times` attempts, the rename that
+// records a read's charge (the write that first sets LastOutcome to outcome),
+// the way Windows refuses a rename over a file a reader has open. It returns the
+// count of refusals.
+func refuseGrokChargeWrite(t *testing.T, outcome string, times int) *atomic.Int64 {
+	t.Helper()
+	stubCacheFileBackoff(t, nil)
+	return refuseCacheFileRename(t, grokUsageFreshnessPath(), times, func(current, next []byte) bool {
+		var before, after grokUsageFreshness
+		_ = json.Unmarshal(current, &before)
+		_ = json.Unmarshal(next, &after)
+		return before.LastOutcome == "" && after.LastOutcome == outcome
+	})
+}
+
+// wantGrokChargeLanded asserts the first failed read was charged: one read,
+// one attempt counted, its outcome and time recorded, and the next rung booked.
+func wantGrokChargeLanded(t *testing.T, h *grokDebtHarness) {
+	t.Helper()
+	state := h.state()
+	if h.reads.Load() != 1 || state.Attempts != 1 || state.LastOutcome != grokLiveOutcomeHTTPError ||
+		state.LastAttemptAtMs != h.clock().UnixMilli() {
+		t.Fatalf("reads=%d state=%+v, want the read charged: one attempt, its outcome and its time",
+			h.reads.Load(), state)
+	}
+	if got := time.UnixMilli(state.NextAttemptAtMs).Sub(h.clock()); got != grokRunDebtRetryLadder[0] {
+		t.Fatalf("rung in %s, want the ladder's first rung %s", got, grokRunDebtRetryLadder[0])
+	}
+}
+
+// A charge whose rename a reader refuses still reaches disk: the guard retries
+// the rename until the reader lets go. A lost charge leaves the read uncounted,
+// so the read cap and the spacing no longer hold.
+func TestGrokRunDebt_ARefusedChargeStillLands(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	refused := refuseGrokChargeWrite(t, grokLiveOutcomeHTTPError, 1)
+
+	h.runAndSettle(time.Second)
+	if refused.Load() != 1 {
+		t.Fatal("precondition: the charge was never refused")
+	}
+	wantGrokChargeLanded(t, h)
+}
+
+// A charge that cannot reach disk at all is not reported as committed. The
+// transaction says so, and the post-read decision is retried until it lands.
+// Before, the failed write was reported as committed and lost: the rung was
+// booked off a state missing this read.
+func TestGrokRunDebt_AChargeThatNeverLandedIsRetried(t *testing.T) {
+	h := newGrokDebtHarness(t)
+	h.outcome.Store(grokLiveOutcomeHTTPError)
+	prevDelay := grokFreshnessRefusedRetryDelay
+	grokFreshnessRefusedRetryDelay = time.Millisecond
+	t.Cleanup(func() { grokFreshnessRefusedRetryDelay = prevDelay })
+	// Every attempt of the first charge transaction; its retry goes through.
+	refused := refuseGrokChargeWrite(t, grokLiveOutcomeHTTPError, cacheFileAttempts)
+
+	h.runAndSettle(time.Second)
+	if got := refused.Load(); got != int64(cacheFileAttempts) {
+		t.Fatalf("refusals = %d, want every attempt of the first charge refused", got)
+	}
+	wantGrokChargeLanded(t, h)
 }
 
 func TestGrokBillingReadOnce_CallerTimeoutReportsTimeout(t *testing.T) {
