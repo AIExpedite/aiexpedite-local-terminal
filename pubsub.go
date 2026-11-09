@@ -3336,21 +3336,28 @@ func commandUploadScanRoot(cfg *Config, scope cwdScope, resolved string) string 
 	return ""
 }
 
+// scanOutputFilesSinceFn is the walk scanCommandArtifacts runs. It is a
+// variable so a test can stand in a walk that finds files and is then cut
+// short by the bound, which a real directory cannot be made to do on cue.
+var scanOutputFilesSinceFn = scanOutputFilesSince
+
 // scanCommandArtifacts returns the media a finished one-shot command wrote
 // under dir (commandUploadScanRoot) for the caller to upload, and logs what
 // the scan did.
 //
-// The scan is bounded by timeout, as a session's is (the caller passes
-// sessionArtifactCollectTimeout). It runs before the command's result is
-// published, and it used to run on a Background context with no limit at all,
-// so a command sent without a cwd walked the whole home folder for as long as
-// that took. A scan the bound cut short returns nothing, so nothing is
-// uploaded from it.
+// The scan is bounded by timeout (the caller passes
+// sessionArtifactCollectTimeout, the session scans' bound). It runs before the
+// command's result is published, and it used to run on a Background context
+// with no limit at all, so a command sent without a cwd walked the whole home
+// folder for as long as that took. The bound is cooperative: the walk checks
+// it before each entry, so a single system call that hangs still holds the
+// scan. A scan the bound cut short returns nothing, whatever it had found by
+// then, so nothing is uploaded from a partial list.
 func scanCommandArtifacts(cmdID, dir string, startedAt time.Time, timeout time.Duration) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	files, refusal := scanOutputFilesSince(ctx, dir, startedAt)
+	files, refusal := scanOutputFilesSinceFn(ctx, dir, startedAt)
 	if refusal != "" {
 		// Said instead of the "scanned" line below, which would report a scan
 		// that never ran as one that found nothing.
@@ -3358,16 +3365,19 @@ func scanCommandArtifacts(cmdID, dir string, startedAt time.Time, timeout time.D
 			cmdID, dir, refusal)
 		return nil
 	}
+	if ctx.Err() != nil {
+		// Said instead of the "scanned" line below, which would report a walk
+		// the bound stopped as a complete one, and before the zero-file
+		// return, so a scan stopped before its first match says so too.
+		fmt.Printf("[file-upload] Command %s: media scan of %s did not finish within %s (%d file(s) found so far, none uploaded)\n",
+			cmdID, dir, timeout, len(files))
+		return nil
+	}
 	// Always log the scan outcome so a zero-file result is diagnosable rather
 	// than silent (mirrors the session path).
 	fmt.Printf("[file-upload] Command %s: scanned %s since %s → %d media file(s)\n",
 		cmdID, dir, startedAt.Format(time.RFC3339), len(files))
 	if len(files) == 0 {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		fmt.Printf("[file-upload] Command %s: skipping upload of %d file(s) — the scan did not finish within %s (%v)\n",
-			cmdID, len(files), timeout, err)
 		return nil
 	}
 	return files
