@@ -2712,11 +2712,7 @@ func runPubSubConnection(cfg *Config) error {
 			// tree on top of the real exec dir would sweep up unrelated fresh
 			// media and make detection expensive.
 			effectiveDir := commandUploadScanRoot(cfg, cwdScopeFor(cmd), ranIn)
-			files := detectOutputFilesSince(effectiveDir, cmdStartedAt)
-			// Always log the scan outcome so a zero-file result is
-			// diagnosable rather than silent (mirrors the session path).
-			fmt.Printf("[file-upload] Command %s: scanned %s since %s → %d media file(s)\n",
-				cmd.ID, effectiveDir, cmdStartedAt.Format(time.RFC3339), len(files))
+			files := scanCommandArtifacts(cmd.ID, effectiveDir, cmdStartedAt, sessionArtifactCollectTimeout)
 			if len(files) > 0 {
 				// Security: Block file upload if workspaceID is missing
 				workspaceID := extractWorkspaceID(cmd)
@@ -3338,6 +3334,43 @@ func commandUploadScanRoot(cfg *Config, scope cwdScope, resolved string) string 
 		return cfg.WorkingDirectory
 	}
 	return ""
+}
+
+// scanCommandArtifacts returns the media a finished one-shot command wrote
+// under dir (commandUploadScanRoot) for the caller to upload, and logs what
+// the scan did.
+//
+// The scan is bounded by timeout, as a session's is (the caller passes
+// sessionArtifactCollectTimeout). It runs before the command's result is
+// published, and it used to run on a Background context with no limit at all,
+// so a command sent without a cwd walked the whole home folder for as long as
+// that took. A scan the bound cut short returns nothing, so nothing is
+// uploaded from it.
+func scanCommandArtifacts(cmdID, dir string, startedAt time.Time, timeout time.Duration) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	files, refusal := scanOutputFilesSince(ctx, dir, startedAt)
+	if refusal != "" {
+		// Said instead of the "scanned" line below, which would report a scan
+		// that never ran as one that found nothing.
+		fmt.Printf("[file-upload] Command %s: skipping media scan of %s: it is %s; artifacts are collected only from a project folder\n",
+			cmdID, dir, refusal)
+		return nil
+	}
+	// Always log the scan outcome so a zero-file result is diagnosable rather
+	// than silent (mirrors the session path).
+	fmt.Printf("[file-upload] Command %s: scanned %s since %s → %d media file(s)\n",
+		cmdID, dir, startedAt.Format(time.RFC3339), len(files))
+	if len(files) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		fmt.Printf("[file-upload] Command %s: skipping upload of %d file(s) — the scan did not finish within %s (%v)\n",
+			cmdID, len(files), timeout, err)
+		return nil
+	}
+	return files
 }
 
 // reportedCommandCwd is the cwd echoed back on the result for diagnostics: the
@@ -6516,6 +6549,9 @@ var errFileLimitReached = errors.New("file upload limit reached")
 //  4. Path stays within workDir (no symlink escape)
 //  5. Not inside an ignored dependency/cache directory (node_modules, .git, etc.)
 //
+// Nothing is walked when workDir is a filesystem root, the home folder or a
+// folder that contains it (artifactScanRootRefusal).
+//
 // This replaces an older heuristic that scanned a hardcoded list of
 // framework-specific directories (test-results/, test-results-ui/). The
 // mtime-based approach catches screenshots wherever a framework or custom
@@ -6537,17 +6573,39 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 // waiting, so the walk must stop too — otherwise an abandoned goroutine keeps
 // stat-ing a huge or network-mounted tree, and worse, goes on to upload
 // objects nobody will ever reference (Codex P2, round 4).
+//
+// A refused root is logged here. The command and session paths call
+// scanOutputFilesSince instead, so they can report the refusal against their
+// own id rather than print "scanned … → 0" for a scan that never ran.
 func detectOutputFilesSinceCtx(ctx context.Context, workDir string, sessionStart time.Time) []string {
+	files, refusal := scanOutputFilesSince(ctx, workDir, sessionStart)
+	if refusal != "" {
+		fmt.Printf("[file-upload] Skipping media scan of %s: it is %s; artifacts are collected only from a project folder\n", workDir, refusal)
+	}
+	return files
+}
+
+// scanOutputFilesSince is the walk behind detectOutputFilesSinceCtx. When
+// artifactScanRootRefusal refuses the root it walks nothing and returns the
+// reason; otherwise the reason is "".
+func scanOutputFilesSince(ctx context.Context, workDir string, sessionStart time.Time) ([]string, string) {
 	files := []string{}
 
 	if workDir == "" {
-		return files
+		return files, ""
 	}
 
 	absBase, err := filepath.Abs(workDir)
 	if err != nil {
 		fmt.Printf("[file-upload] Cannot resolve workDir %q: %v\n", workDir, err)
-		return files
+		return files, ""
+	}
+
+	// Never walk a filesystem root, the home folder or a folder above it. This
+	// is asked here and again once symlinks are resolved, because either
+	// spelling can be the one that names the home folder.
+	if refusal := artifactScanRootRefusal(absBase); refusal != "" {
+		return files, refusal
 	}
 
 	// Resolve symlinks before walking. filepath.WalkDir does NOT descend into
@@ -6560,6 +6618,11 @@ func detectOutputFilesSinceCtx(ctx context.Context, workDir string, sessionStart
 	// session end), fall through to the original absBase so the walk's own
 	// error handling reports the not-exist condition.
 	if resolved, resolveErr := filepath.EvalSymlinks(absBase); resolveErr == nil {
+		if resolved != absBase {
+			if refusal := artifactScanRootRefusal(resolved); refusal != "" {
+				return files, refusal
+			}
+		}
 		absBase = resolved
 	} else if !errors.Is(resolveErr, fs.ErrNotExist) {
 		fmt.Printf("[file-upload] Cannot resolve symlinks for %q: %v\n", absBase, resolveErr)
@@ -6679,7 +6742,7 @@ func detectOutputFilesSinceCtx(ctx context.Context, workDir string, sessionStart
 		fmt.Printf("[file-upload] Walk error in %s: %v\n", absBase, walkErr)
 	}
 
-	return files
+	return files, ""
 }
 
 // extractWorkspaceID extracts workspaceID from command message
