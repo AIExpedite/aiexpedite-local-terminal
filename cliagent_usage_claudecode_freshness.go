@@ -228,7 +228,7 @@ func mutateClaudeRateLimitSnapshotStampedScopedUnscope(path, fingerprint string,
 			return time.Time{}, err
 		}
 		wrote = true
-		if info, err := os.Stat(path); err == nil {
+		if info, err := claudeRateLimitFile.stat(path); err == nil {
 			modUnixNano, size = info.ModTime().UnixNano(), info.Size()
 		}
 		return time.Time{}, nil
@@ -882,7 +882,7 @@ func claudeRefreshDebtRetired(owed time.Time, attempts int, now time.Time) bool 
 // endpoint already imposed on this device. A stat is cheap enough to do per
 // gather on a path that already reads the same file whole.
 func claudeRateLimitCacheStamp() (modUnixNano, size int64) {
-	info, err := os.Stat(claudeRateLimitCachePath())
+	info, err := claudeRateLimitFile.stat(claudeRateLimitCachePath())
 	if err != nil {
 		return 0, 0
 	}

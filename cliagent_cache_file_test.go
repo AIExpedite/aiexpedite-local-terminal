@@ -242,3 +242,47 @@ func TestCacheFileGuard_AWriterWaitsForAReaderInThisProcess(t *testing.T) {
 		t.Fatalf("cache = %q, want the replacement", got)
 	}
 }
+
+// A stat is a reader too: on Windows it opens the file, so a stat taken outside
+// the guard refuses this process's own rename the way a read does. It waits for
+// a write in progress, and returns once the write is done.
+func TestCacheFileGuard_AStatWaitsForAWriteInProgress(t *testing.T) {
+	var g cacheFileGuard
+	path, _ := cacheFileFixture(t, "cached", "")
+
+	g.mu.Lock() // a rename in progress, as replace holds it
+	done := make(chan error, 1)
+	go func() {
+		_, err := g.stat(path)
+		done <- err
+	}()
+	select {
+	case <-done:
+		g.mu.Unlock()
+		t.Fatal("stat ran while a write held the guard")
+	case <-time.After(50 * time.Millisecond):
+	}
+	g.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("stat after the write: %v", err)
+	}
+}
+
+// The Claude cache's stamp (taken per gather and by the propagator's tick) is a
+// stat of the cache, so it goes through claudeRateLimitFile like every read.
+func TestClaudeRateLimitCacheStamp_TakesTheCacheGuard(t *testing.T) {
+	claudeRateLimitFile.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		claudeRateLimitCacheStamp()
+		close(done)
+	}()
+	select {
+	case <-done:
+		claudeRateLimitFile.mu.Unlock()
+		t.Fatal("claudeRateLimitCacheStamp stat the cache without the guard")
+	case <-time.After(50 * time.Millisecond):
+	}
+	claudeRateLimitFile.mu.Unlock()
+	<-done
+}

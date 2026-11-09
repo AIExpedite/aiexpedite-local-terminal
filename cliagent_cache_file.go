@@ -70,6 +70,21 @@ func (g *cacheFileGuard) read(path string) ([]byte, error) {
 	}
 }
 
+// stat is os.Stat under the guard, retried like read. A stat is a reader too:
+// on Windows it opens the file, without FILE_SHARE_DELETE, so one taken outside
+// the guard refuses this process's own rename exactly as a read does.
+func (g *cacheFileGuard) stat(path string) (os.FileInfo, error) {
+	for attempt := 1; ; attempt++ {
+		g.mu.RLock()
+		info, err := os.Stat(path)
+		g.mu.RUnlock()
+		if err == nil || attempt >= cacheFileAttempts || !cacheFileReplaceInProgress(err) {
+			return info, err
+		}
+		cacheFileSleep(cacheFileRetryDelay(attempt))
+	}
+}
+
 // readJSON is readJSONFile under the guard.
 func (g *cacheFileGuard) readJSON(path string, into any) bool {
 	b, err := g.read(path)
