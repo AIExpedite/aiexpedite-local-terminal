@@ -1275,16 +1275,29 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 }
 
 func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publishFn PublishFunc) {
-	err := session.Process.Wait()
+	// Reap the child via os.Process.Wait, NOT exec.Cmd.Wait. Per the
+	// StdoutPipe docs, "it is incorrect to call Wait before all reads from
+	// the pipe have completed" — exec.Cmd.Wait closes the parent ends of
+	// StdoutPipe/StderrPipe the moment the child exits, which can truncate
+	// or abort unread frames still in the OS pipe buffer on Windows.
+	var state *os.ProcessState
+	if session.Process != nil && session.Process.Process != nil {
+		state, _ = session.Process.Process.Wait()
+	}
 	closeProcessExited(session.processExited)
 
-	// Explicitly close pipes so the scanner goroutines receive EOF; mirrors
-	// session.go's behaviour where Windows pipe handles can otherwise linger
-	// past process exit.
-	session.Stdout.Close()
-	session.Stderr.Close()
+	session.mu.Lock()
+	session.status = "ended"
+	if state != nil {
+		session.exitCode = state.ExitCode()
+	} else {
+		session.exitCode = -1
+	}
+	exit := session.exitCode
+	session.mu.Unlock()
 
-	// Wait for readStream to finish draining + flushing every queued publish.
+	// Drain the stdout/stderr scanner goroutines BEFORE closing pipes so they
+	// see EOF naturally on the OS pipe buffer, including the final frame.
 	// readStream's deferred publishWg.Wait() runs before its deferred
 	// close(streamDone), so by the time we unblock here the in-flight
 	// message frames have already been delivered to publishFn. That preserves
@@ -1293,21 +1306,18 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	select {
 	case <-session.streamDone:
 	case <-time.After(codexAppServerStreamDrainTimeout):
-		fmt.Printf("%s[codex-appserver] Stream drain timed out for %s%s\n",
+		fmt.Printf("%s[codex-appserver] Stream drain timed out for %s — forcing pipe close%s\n",
 			colorYellow, session.ID, colorReset)
+		session.Stdout.Close()
+		session.Stderr.Close()
 	}
 
-	session.mu.Lock()
-	session.status = "ended"
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			session.exitCode = exitErr.ExitCode()
-		} else {
-			session.exitCode = -1
-		}
-	}
-	exit := session.exitCode
-	session.mu.Unlock()
+	// Close the parent ends of every pipe. exec.Cmd.Wait would do this for
+	// us; since we bypassed it above we mop up ourselves. closeStdin is
+	// idempotent (sync.Once).
+	session.closeStdin()
+	session.Stdout.Close()
+	session.Stderr.Close()
 
 	// Scan for and upload whatever media this session wrote before announcing
 	// the end, so the metadata rides along on the ended frame exactly as it
