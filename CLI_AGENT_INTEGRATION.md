@@ -2607,3 +2607,69 @@ seam, and the Windows execution regression is covered by a functional test
 compiled stub — proof that cmd.exe starts a shim, that stdin reaches its child and
 that the marker classifies, without a vendor binary. **The first proof against the
 real CLI is still the post-update smoke on a Windows device.**
+
+# CLI Agent Integration — Meta Muse Code (`muse`) usage
+
+Muse Code keeps the account's quota in memory only: Meta reports the allowance
+with each model response and nothing is written to disk, so a `muse` the user
+runs in their own shell is never read. The card's two rows (the 5-hour session
+window and the weekly quota) come from one per-account cache,
+`musecode_usage_live.json` (`GetConfigDir()`, mode 0600, `schemaVersion: 2`),
+filled by two readers:
+
+- **Every run the agent drives** ([cliagent_usage_musecode_run.go](cliagent_usage_musecode_run.go)) —
+  Muse Code 1.4.14 prints a `run.usage` record with an `allowance` on every
+  `muse exec --json` run, a refused (429) one included. It is read line by line
+  on both launch paths (the Chat manager and a `session_start` run), under the
+  account the run was launched with, and saved only when it is newer than the
+  cached reading and that account is still signed in.
+- **A Refresh click** ([cliagent_usage_musecode_live.go](cliagent_usage_musecode_live.go)) —
+  a private `muse serve` answers `usage/read`, spending one trivial turn when
+  its host has not talked to Meta yet. At most once per five minutes per
+  account: a click inside that window, a run's reading included, keeps the
+  cached reading.
+
+## Propagation to terminal-service
+
+`museCode` is a usage-hint provider (`cliagent_usage_propagate.go`, mirrored by
+terminal-service's `CLI_USAGE_HINT_PROVIDERS`), so a run's reading reaches the
+card when it lands instead of at the next wake:
+
+- The cache gains an additive file-level `generation {epoch, counter}` (schema
+  stays 2; an older build ignores it). Every write that commits a reading
+  advances it on this process's epoch and, once the cache lock is released,
+  sends one `POST /device/:id/cli-usage/observed` hint. A reading kept out (not
+  newer, or read after a mid-run login switch) and a write that did not commit
+  advance nothing and send nothing. There is one generation for the file, not
+  one per account: a reading is only ever written for the account signed in at
+  that moment.
+- The counter counts up from the higher of the file's counter (on this epoch)
+  and the last one this process committed, which is held in memory. A file
+  that reads as empty (missing, unreadable, rewritten by another process) never
+  makes it reissue a generation terminal-service already applied: a hint for
+  that one would be skipped as already applied.
+- `museCodeUsageParser.ParseContext` publishes `usageGeneration` with the
+  signed-in account's reading once a write on this process's epoch has
+  committed (`museCodeGenerationRotated`), and reserves it for the signed
+  refresh receipt (`observeCLIUsageGeneration`). Hints wait for that rotation.
+  The parser reads only local files, so it declares `SerialProbeCount() == 0`
+  and the gather holds nothing back for it.
+- Startup recovery (`recoverMuseCodeUsageGeneration`) moves a cache whose
+  reading for the signed-in account still renders a number onto this epoch in
+  one write and hints it once, so a run that finished just before an update
+  hand-off still reaches the card. It is asked once: a refused write leaves the
+  reading to the next refresh.
+- A hint never spends a Muse turn: the refresh it asks for is a plain gather,
+  and only a Refresh click carries the live-probe argument. An older
+  terminal-service answers a Muse hint `202 {accepted: false}` and does
+  nothing.
+- Unlike Grok's, the cache has no cross-process lock. Epochs differ per
+  process, so two agent processes writing it can drop a reading but never
+  suppress a hint.
+
+Pinned by [cliagent_usage_musecode_generation_test.go](cliagent_usage_musecode_generation_test.go)
+(the commit's hint and every reading that sends none, the counter floor, what
+the parser publishes and reserves, the rotation gate, the receipt
+confirmation, startup recovery) and
+[cliagent_usage_musecode_run_test.go](cliagent_usage_musecode_run_test.go)
+(the run record, account pinning, newer-wins).

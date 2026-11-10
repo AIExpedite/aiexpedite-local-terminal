@@ -120,8 +120,9 @@ type cliAgentUsage struct {
 	// UsageGeneration identifies the device-side capture state these metrics
 	// were read from: Codex's rate-limit cache
 	// (codexMetricsAndGenerationFromCache), Claude's claudeRateLimitView.generation,
-	// OpenCode's usage ledger (cliagent_usage_opencode_capture.go), or Grok's live
-	// billing cache (cliagent_usage_grok_live.go). Signed in
+	// OpenCode's usage ledger (cliagent_usage_opencode_capture.go), Grok's live
+	// billing cache (cliagent_usage_grok_live.go), or Muse Code's live usage
+	// cache (cliagent_usage_musecode_live.go). Signed in
 	// the refresh receipt, so the backend can record, per provider, which
 	// generation it applied and skip a usage hint for one it already has
 	// (cliagent_usage_propagate.go). Integers only.
@@ -471,9 +472,9 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 // bounded I/O during refresh (it implements cliAgentUsageContextParser —
 // Claude's usage request and auth status, Codex's app-server state, OpenCode's
 // readiness probes, Antigravity's loopback quota request), nothing for one that
-// only reads local files. A context parser that reads only local files (Grok,
-// which takes the context for its receipt reservation) declares
-// SerialProbeCount() == 0 and reserves nothing.
+// only reads local files. A context parser that reads only local files (Grok
+// and Muse Code, which take the context for their receipt reservation)
+// declares SerialProbeCount() == 0 and reserves nothing.
 func cliAgentUsageGatherReserve(parser cliAgentUsageParser) time.Duration {
 	if parser == nil {
 		return 0

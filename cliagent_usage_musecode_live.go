@@ -28,16 +28,25 @@
 // The same host answers `model/list` first (a query, no model call), which
 // refreshes the on-disk model list the gather reads; the gather's own model
 // probe spawns `muse serve` only when that list is missing or stale.
+//
+// Every write that commits a reading to the cache — this probe's, or a run's
+// allowance record (cliagent_usage_musecode_run.go) — advances the cache's
+// capture generation on this process's epoch and hints terminal-service
+// (cliagent_usage_propagate.go), so the reading reaches the card when it lands
+// rather than at the next wake. The hint carries no figures; the refresh it
+// asks for is a plain gather, which never spends a Muse turn.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,9 +94,41 @@ type museCodeUsageLiveCache struct {
 type museCodeUsageLiveFile struct {
 	SchemaVersion int                      `json:"schemaVersion"`
 	Readings      []museCodeUsageLiveCache `json:"readings"`
+	// Generation is the capture generation (cliUsageGeneration) of the newest
+	// committed write: every write that commits a reading advances it on this
+	// process's epoch, and the parser publishes it with the signed-in
+	// account's reading. One generation for the file, not one per account: a
+	// reading is only ever written for the account signed in at that moment,
+	// so an advance always describes what that account's card shows.
+	// Additive, so the schema stays 2 and an older build ignores it.
+	Generation *cliUsageGeneration `json:"generation,omitempty"`
 }
 
-var museCodeUsageLiveCacheMu sync.Mutex
+// readingFor returns accountKey's reading, if the file holds one.
+func (f museCodeUsageLiveFile) readingFor(accountKey string) (museCodeUsageLiveCache, bool) {
+	for _, r := range f.Readings {
+		if r.AccountKey == accountKey && r.ObservedAtMs > 0 {
+			return r, true
+		}
+	}
+	return museCodeUsageLiveCache{}, false
+}
+
+var (
+	museCodeUsageLiveCacheMu sync.Mutex
+	// museCodeGenerationRotated reports a committed cache write carrying this
+	// process's epoch. Until then the file may hold a generation an earlier
+	// process published, so the parser omits UsageGeneration and the
+	// propagator holds Muse hints (providerBlockedLocked).
+	museCodeGenerationRotated atomic.Bool
+	// museCodeLastGeneration is the newest generation this process committed
+	// (guarded by museCodeUsageLiveCacheMu), the floor the next write counts up
+	// from. The file alone is not enough: a missing, unreadable or replaced
+	// file reads as empty (readMuseCodeUsageLiveFileLocked), and a counter
+	// restarted from it would reissue a generation terminal-service already
+	// applied, whose hint it then skips as already applied.
+	museCodeLastGeneration cliUsageGeneration
+)
 
 // museCodeUsageLiveCachePath: AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE overrides
 // it (tests isolate from the real machine cache).
@@ -130,20 +171,40 @@ func readMuseCodeUsageLiveFileLocked() museCodeUsageLiveFile {
 	return file
 }
 
-// saveMuseCodeUsageLive replaces that account's reading and keeps the others.
+// saveMuseCodeUsageLive replaces that account's reading, keeps the others, and
+// hints terminal-service about the generation the write committed.
 func saveMuseCodeUsageLive(entry museCodeUsageLiveCache) bool {
+	generation, committed := commitMuseCodeUsageLive(entry)
+	noteMuseCodeUsageCommitted(generation, committed)
+	return committed
+}
+
+// commitMuseCodeUsageLive is saveMuseCodeUsageLive's cache transaction.
+func commitMuseCodeUsageLive(entry museCodeUsageLiveCache) (cliUsageGeneration, bool) {
 	museCodeUsageLiveCacheMu.Lock()
 	defer museCodeUsageLiveCacheMu.Unlock()
 	path := museCodeUsageLiveCachePath()
 	if path == "" || entry.AccountKey == "" {
-		return false
+		return cliUsageGeneration{}, false
 	}
 	return writeMuseCodeUsageLiveLocked(readMuseCodeUsageLiveFileLocked(), entry)
 }
 
+// noteMuseCodeUsageCommitted hints terminal-service about a committed
+// generation. Callers run it after the cache transaction returned, outside
+// museCodeUsageLiveCacheMu: the propagator never holds its own lock across a
+// cache transaction, and this keeps the order one-way (saveGrokBillingLive
+// does the same).
+func noteMuseCodeUsageCommitted(generation cliUsageGeneration, committed bool) {
+	if committed {
+		noteCLIUsageObservationAdvanced(museCodeUsageProvider, generation)
+	}
+}
+
 // writeMuseCodeUsageLiveLocked writes `file` with `entry` replacing its
-// account's reading, newest first, capped. Caller holds museCodeUsageLiveCacheMu.
-func writeMuseCodeUsageLiveLocked(file museCodeUsageLiveFile, entry museCodeUsageLiveCache) bool {
+// account's reading, newest first, capped, under the next generation. Caller
+// holds museCodeUsageLiveCacheMu.
+func writeMuseCodeUsageLiveLocked(file museCodeUsageLiveFile, entry museCodeUsageLiveCache) (cliUsageGeneration, bool) {
 	kept := []museCodeUsageLiveCache{entry}
 	for _, r := range file.Readings {
 		if r.AccountKey != entry.AccountKey && r.AccountKey != "" {
@@ -155,19 +216,137 @@ func writeMuseCodeUsageLiveLocked(file museCodeUsageLiveFile, entry museCodeUsag
 		kept = kept[:museCodeUsageLiveMaxAccounts]
 	}
 	file.Readings = kept
-	return writeJSONFileAtomic(museCodeUsageLiveCachePath(), file)
+	return commitMuseCodeUsageFileLocked(file)
+}
+
+// commitMuseCodeUsageFileLocked writes file under the next generation
+// (museCodeNextGenerationLocked). Only a committed write moves the generation,
+// this process's floor (museCodeLastGeneration) and the rotation flag, so a
+// write that failed can never be hinted or published. Caller holds
+// museCodeUsageLiveCacheMu.
+func commitMuseCodeUsageFileLocked(file museCodeUsageLiveFile) (cliUsageGeneration, bool) {
+	next := museCodeNextGenerationLocked(file)
+	file.Generation = &next
+	if !writeJSONFileAtomic(museCodeUsageLiveCachePath(), file) {
+		return cliUsageGeneration{}, false
+	}
+	museCodeLastGeneration = next
+	museCodeGenerationRotated.Store(true)
+	return next, true
+}
+
+// museCodeNextGenerationLocked is the generation the next committed write
+// carries: this process's epoch, one past the higher of the file's counter
+// (only when the file is on this epoch — counters are never compared across
+// epochs) and the last one this process committed. Caller holds
+// museCodeUsageLiveCacheMu.
+func museCodeNextGenerationLocked(file museCodeUsageLiveFile) cliUsageGeneration {
+	epoch := codexProcessGenerationEpoch.Load()
+	var counter int64
+	if file.Generation != nil && file.Generation.Epoch == epoch {
+		counter = file.Generation.Counter
+	}
+	if museCodeLastGeneration.Epoch == epoch && museCodeLastGeneration.Counter > counter {
+		counter = museCodeLastGeneration.Counter
+	}
+	return cliUsageGeneration{Epoch: epoch, Counter: counter + 1}
+}
+
+// museCodeUsageLiveView is one read of the cache for an account.
+type museCodeUsageLiveView struct {
+	reading museCodeUsageLiveCache
+	// generation is the file's committed generation (nil when none).
+	generation *cliUsageGeneration
 }
 
 // loadMuseCodeUsageLive returns the cached reading for that account, if any.
 func loadMuseCodeUsageLive(accountKey string) (museCodeUsageLiveCache, bool) {
+	view, ok := loadMuseCodeUsageLiveView(accountKey)
+	return view.reading, ok
+}
+
+// loadMuseCodeUsageLiveView is loadMuseCodeUsageLive with the file's
+// generation, read under the same lock as the reading it versions.
+func loadMuseCodeUsageLiveView(accountKey string) (museCodeUsageLiveView, bool) {
 	museCodeUsageLiveCacheMu.Lock()
 	defer museCodeUsageLiveCacheMu.Unlock()
-	for _, r := range readMuseCodeUsageLiveFileLocked().Readings {
-		if r.AccountKey == accountKey && r.ObservedAtMs > 0 {
-			return r, true
+	file := readMuseCodeUsageLiveFileLocked()
+	reading, ok := file.readingFor(accountKey)
+	if !ok {
+		return museCodeUsageLiveView{}, false
+	}
+	view := museCodeUsageLiveView{reading: reading}
+	if file.Generation != nil {
+		g := *file.Generation
+		view.generation = &g
+	}
+	return view, true
+}
+
+// recoverMuseCodeUsageGeneration is Muse Code's startup recovery
+// (startCLIUsagePropagator). A reading committed just before an update
+// hand-off — whose hint died with the previous process inside its debounce —
+// is moved onto this process's epoch in one write and hinted once. Only the
+// signed-in account's reading, while it still renders a number, is
+// recovered; the backend skips a generation it already applied. Startup asks
+// once: a write that does not commit leaves the reading to the next refresh,
+// as before Muse Code sent hints.
+func recoverMuseCodeUsageGeneration() {
+	if g := museCodeRecoveryGeneration(time.Now()); g != nil {
+		noteCLIUsageObservationAdvanced(museCodeUsageProvider, *g)
+	}
+}
+
+// museCodeRecoveryGeneration rotates the cache onto this process's epoch when
+// it holds a reading for the account signed in now that renders a number at
+// now, and returns the generation the cache carries afterwards — nil when
+// there is nothing to recover, the write did not commit, or this process
+// already committed (and hinted) the file's generation itself.
+func museCodeRecoveryGeneration(now time.Time) *cliUsageGeneration {
+	accountKey := museCodeUsageAccountKey(currentMuseCodeAccountFingerprint())
+	museCodeUsageLiveCacheMu.Lock()
+	defer museCodeUsageLiveCacheMu.Unlock()
+	if museCodeUsageLiveCachePath() == "" {
+		return nil
+	}
+	file := readMuseCodeUsageLiveFileLocked()
+	reading, ok := file.readingFor(accountKey)
+	if !ok || !museCodeUsageMetricsNumeric(museCodeUsageMetrics(reading, true, now)) {
+		return nil
+	}
+	if file.Generation != nil && file.Generation.Epoch == codexProcessGenerationEpoch.Load() {
+		return nil
+	}
+	g, committed := commitMuseCodeUsageFileLocked(file)
+	if !committed {
+		logMuseCodeUsage("recovery_write_failed")
+		return nil
+	}
+	return &g
+}
+
+// museCodeUsageMetricsNumeric reports whether any row renders a number.
+func museCodeUsageMetricsNumeric(metrics []cliAgentUsageMetric) bool {
+	for _, m := range metrics {
+		if !m.Unknown && m.Consumed != nil {
+			return true
 		}
 	}
-	return museCodeUsageLiveCache{}, false
+	return false
+}
+
+// logMuseCodeUsage prints a fixed label — never a path, account or figure.
+func logMuseCodeUsage(label string) {
+	fmt.Printf("%s[cli-usage] musecode usage: %s%s\n", colorYellow, label, colorReset)
+}
+
+// resetMuseCodeUsageGeneration forgets this process's generation state, as a
+// new process starts with none (tests, through resetCLIUsagePropagator).
+func resetMuseCodeUsageGeneration() {
+	museCodeUsageLiveCacheMu.Lock()
+	museCodeLastGeneration = cliUsageGeneration{}
+	museCodeUsageLiveCacheMu.Unlock()
+	museCodeGenerationRotated.Store(false)
 }
 
 // probeMuseCodeUsageLive runs one bounded quota read for the signed-in Muse
