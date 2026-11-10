@@ -146,26 +146,23 @@ func (c grokBillingLiveCache) numericObservedAt() (time.Time, bool) {
 	return t, err == nil
 }
 
-// omittedZeroAt is when an entry holding xAI's omitted zero was observed: no
-// percentage, the key absent (UsageOmitted), under a recognized period whose
-// parseable end was still ahead of the answer. grokBillingMetrics renders that
-// as 0% used, so it is a reading in its own right. ok is false otherwise.
-func (c grokBillingLiveCache) omittedZeroAt() (time.Time, bool) {
+// omittedZero reports an entry holding xAI's omitted zero: no percentage, the
+// key absent (UsageOmitted), under a recognized period whose parseable end was
+// still ahead of the answer. grokBillingMetrics renders that as 0% used, so it
+// is a reading in its own right.
+func (c grokBillingLiveCache) omittedZero() bool {
 	if c.UsedPercent != nil || !c.UsageOmitted {
-		return time.Time{}, false
+		return false
 	}
 	if _, _, known := grokBillingPeriodKind(c.PeriodType); !known {
-		return time.Time{}, false
+		return false
 	}
 	end, err := time.Parse(time.RFC3339, c.PeriodEnd)
 	if err != nil {
-		return time.Time{}, false
+		return false
 	}
 	at, err := time.Parse(time.RFC3339Nano, c.ObservedAt)
-	if err != nil || !at.Before(end) {
-		return time.Time{}, false
-	}
-	return at, true
+	return err == nil && at.Before(end)
 }
 
 // hasNumericOnDemand reports whether the entry carries an on-demand pool that
@@ -718,10 +715,10 @@ func saveGrokBillingLive(entry grokBillingLiveCache) bool {
 //     observation, a changed percentage, or a new billing period (another
 //     account is all three). An unmetered read never advances it on the
 //     percentage's behalf, except as a clear (below).
-//   - xAI's omitted zero (omittedZeroAt) is a reading the card renders as 0%,
-//     so when no number is kept over it, it advances by the numeric rule —
-//     the first after any other answer, a newer one, or a new period — and is
-//     never marked Cleared.
+//   - xAI's omitted zero (omittedZero) is a reading the card renders as 0%,
+//     so when no number is kept over it, a change to it advances — the first
+//     one after any other answer, or one for a new period — and it is never
+//     marked Cleared. A newer zero for the same period advances nothing.
 //   - A numeric on-demand pool is versioned on its own terms: a read carrying
 //     one advances the generation when it is newer than the cached pool, its
 //     figures changed, or there was no same-account numeric pool — so fresh
@@ -805,16 +802,19 @@ func commitGrokBillingLive(entry grokBillingLiveCache) (committed, advanced bool
 			*prev.UsedPercent != *entry.UsedPercent ||
 			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
 	}
-	if _, zero := entry.omittedZeroAt(); zero && !advanced {
+	if !advanced && entry.omittedZero() {
 		// xAI's omitted zero renders as 0% (it was not replaced by a kept
-		// number above), so it is versioned by the numeric rule: the first after
-		// any other answer, a newer one, or a new period advances. Otherwise a
-		// second rollover to a zero would reuse the first one's generation and
-		// never be hinted.
-		prevZeroAt, prevZero := prev.omittedZeroAt()
-		prevZero = prevZero && sameAccount
+		// number above), so a CHANGE to it is versioned: the first one after any
+		// other answer, or one for a new period. Otherwise a second rollover to
+		// a zero would reuse the first one's generation and never be hinted.
+		//
+		// A newer zero for the same period is not a change. Unlike a number it
+		// does not pay a run's refresh debt (grokRefreshOutcomeUnmetered), so
+		// the debt keeps reading until the run's usage shows; advancing on each
+		// of those reads would hint terminal-service up to
+		// grokRunDebtMaxAttempts times for the same 0%.
+		prevZero := sameAccount && prev.omittedZero()
 		advanced = !prevZero ||
-			(entryErr == nil && entryAt.After(prevZeroAt)) ||
 			prev.PeriodType != entry.PeriodType || prev.PeriodEnd != entry.PeriodEnd
 	}
 	if !advanced && entry.hasNumericOnDemand() {

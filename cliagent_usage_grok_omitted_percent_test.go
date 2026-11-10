@@ -126,10 +126,11 @@ func TestGrokUsage_ARolloverToAnOmittedPercentPublishesAVersionedZero(t *testing
 	}
 }
 
-// Every omitted zero after the first is a reading too: a newer one in the same
-// period and a second rollover each advance and are hinted, so a new reset
-// never rides the generation terminal-service already applied. A number kept
-// over a later omitted answer in its own period advances nothing.
+// A CHANGE to an omitted zero is versioned and hinted — the first one after a
+// number, and a second rollover to another zero — so a new reset never rides
+// the generation terminal-service already applied. A newer zero for the same
+// period, and an omitted answer under a number kept for its period, advance
+// nothing.
 func TestGrokUsage_ConsecutiveOmittedZerosAcrossPeriodsAdvanceAndHint(t *testing.T) {
 	a := newGrokAcceptance(t, 7330)
 	fingerprint := grokAccountFingerprintFor(a.home)
@@ -169,28 +170,40 @@ func TestGrokUsage_ConsecutiveOmittedZerosAcrossPeriodsAdvanceAndHint(t *testing
 	wantGen(1, "week A's number")
 	save(now.Add(-50*time.Minute), weekB, nil)
 	wantGen(2, "the rollover to week B's zero")
+	// A newer zero for the same week changes nothing the card shows: the run
+	// debt's later reads of an unchanged 0% must not hint again.
+	// (The propagator may re-send a generation it already hinted; what must
+	// not appear is a NEW one.)
 	save(now.Add(-40*time.Minute), weekB, nil)
-	wantGen(3, "a newer zero in week B")
+	if entry := readGrokLiveCacheFile(t); entry.Generation == nil || *entry.Generation != gen(7330, 2) {
+		t.Fatalf("a newer zero in week B: cache = %+v, want {7330,2} kept", entry)
+	}
+	time.Sleep(2 * cliUsageHintSpacing)
+	for _, h := range a.grokHints() {
+		if h.Generation > 2 {
+			t.Fatalf("a newer zero in week B hinted a new generation: %+v", h)
+		}
+	}
 	save(now.Add(-30*time.Minute), weekC, nil)
-	wantGen(4, "a second rollover, to week C's zero")
+	wantGen(3, "a second rollover, to week C's zero")
 
 	usage, ok := grokUsageParser{}.Parse("", detectedCLIAgent{Detected: true}, time.Now())
 	if !ok || len(usage.Metrics) != 1 || !grokZeroUsedRow(usage.Metrics[0], usage.Metrics[0].ObservedAt) ||
 		usage.Metrics[0].ResetAt != weekC.UTC().Format(time.RFC3339) {
 		t.Fatalf("usage = %+v, want week C at 0%%", usage)
 	}
-	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7330, 4) {
-		t.Fatalf("usageGeneration = %+v, want week C's zero published as {7330,4}", usage.UsageGeneration)
+	if usage.UsageGeneration == nil || *usage.UsageGeneration != gen(7330, 3) {
+		t.Fatalf("usageGeneration = %+v, want week C's zero published as {7330,3}", usage.UsageGeneration)
 	}
 
 	// A real number in week C, then an omitted answer in the same period: the
 	// number is kept and the omitted answer advances nothing.
 	save(now.Add(-20*time.Minute), weekC, floatPtr(12))
-	wantGen(5, "week C's number")
+	wantGen(4, "week C's number")
 	save(now.Add(-10*time.Minute), weekC, nil)
 	if entry := readGrokLiveCacheFile(t); entry.UsedPercent == nil || *entry.UsedPercent != 12 ||
-		entry.Generation == nil || *entry.Generation != gen(7330, 5) {
-		t.Fatalf("cache = %+v, want 12%% kept at {7330,5}", entry)
+		entry.Generation == nil || *entry.Generation != gen(7330, 4) {
+		t.Fatalf("cache = %+v, want 12%% kept at {7330,4}", entry)
 	}
 }
 
