@@ -481,6 +481,65 @@ func TestDiscoverIsTruncatedWhenTheStoreNeverAnswers(t *testing.T) {
 	}
 }
 
+// Truncation follows the store's own answer: a scan that timed out, or that
+// stopped at maxRows, may be missing sessions; a complete one is not truncated.
+func TestDiscoverTruncationFollowsTheStoreOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome claudeSourceOutcome
+		want    bool
+	}{
+		{"complete", claudeSourceOutcome{checked: true}, false},
+		{"stopped at maxRows", claudeSourceOutcome{checked: true, trunc: true}, true},
+		{"timed out", claudeSourceOutcome{checked: true, skip: cliSessionSkipTimeout}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testDiscoveryEnv(t.TempDir(), nil)
+			env.readStore = func(context.Context, string, time.Time, int) claudeSourceOutcome {
+				o := tc.outcome
+				o.source, o.pathsComplete = cliSessionSourceClaudeStore, true
+				return o
+			}
+			if res := discoverClaudeSessions(context.Background(), env); res.Truncated != tc.want {
+				t.Fatalf("truncated = %v, want %v", res.Truncated, tc.want)
+			}
+		})
+	}
+}
+
+// A session an editor tab names but the store did not list is looked up on
+// its own, at most cliSessionMaxExtraLookups of them. One left unread may be a
+// missing row, so the answer then says truncated; at the cap nothing is left.
+func TestDiscoverIsTruncatedWhenTabLookupsAreCapped(t *testing.T) {
+	for _, tc := range []struct {
+		tabs int
+		want bool
+	}{
+		{cliSessionMaxExtraLookups, false},
+		{cliSessionMaxExtraLookups + 1, true},
+	} {
+		t.Run(fmt.Sprintf("%d tabs", tc.tabs), func(t *testing.T) {
+			vscode := t.TempDir()
+			tabs := []map[string]any{}
+			for i := 0; i < tc.tabs; i++ {
+				tabs = append(tabs, map[string]any{"sessionId": fmt.Sprintf("5%07x-aaaa-4bbb-8ccc-%012x", i, i), "title": "tab"})
+			}
+			raw, _ := json.Marshal(map[string]any{"panelTabSessions": tabs})
+			writeEditorState(t, vscode, "w1", string(raw))
+			env := testDiscoveryEnv(t.TempDir(), map[string]string{cliSessionSourceVSCode: vscode})
+
+			res := discoverClaudeSessions(context.Background(), env)
+			if res.Truncated != tc.want {
+				t.Fatalf("%d tab sessions to look up with a cap of %d: truncated = %v, want %v",
+					tc.tabs, cliSessionMaxExtraLookups, res.Truncated, tc.want)
+			}
+			if !containsString(res.SourcesChecked, cliSessionSourceVSCode) {
+				t.Fatalf("sourcesChecked = %v, want the editor read", res.SourcesChecked)
+			}
+		})
+	}
+}
+
 func TestClaudeSourceContextEndsBeforeTheBudget(t *testing.T) {
 	for _, tc := range []struct {
 		budget, wantGrace time.Duration
