@@ -27,8 +27,10 @@ type grokAcceptance struct {
 	cfg    *Config
 	reads  *int32
 	status atomic.Int32
-	// unmetered makes a 200 answer carry no percentage.
+	// unmetered makes a 200 answer carry no percentage key: xAI's zero.
 	unmetered atomic.Bool
+	// unusable makes a 200 answer carry the key as null: no figure at all.
+	unusable atomic.Bool
 }
 
 func newGrokAcceptance(t *testing.T, epoch int64) *grokAcceptance {
@@ -43,8 +45,12 @@ func newGrokAcceptance(t *testing.T, epoch int64) *grokAcceptance {
 		if status != http.StatusOK {
 			return status, `{}`
 		}
-		if a.unmetered.Load() {
-			return status, `{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"` +
+		if a.unmetered.Load() || a.unusable.Load() {
+			key := ""
+			if a.unusable.Load() {
+				key = `"creditUsagePercent":null,`
+			}
+			return status, `{"config":{` + key + `"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"` +
 				time.Now().Add(72*time.Hour).UTC().Format(time.RFC3339Nano) + `"}}}`
 		}
 		return status, grokFixtureBody(time.Now().Add(72 * time.Hour))
@@ -206,22 +212,29 @@ func TestGrokUsage_ManagedRunHintsAndOverlapsADirectTurnWithOneRead(t *testing.T
 	a.assertOneGrokGeneration()
 }
 
-// Failure paths keep the debt's 4-read cap and never hint without a number.
+// Reads that pay nothing keep the debt's 4-read cap. Those without a figure
+// never hint; xAI's omitted zero hints once, for the 0% it first shows, and
+// the debt's later reads of the same 0% never hint again.
 func TestGrokUsage_FailedDirectReadsKeepTheCapAndNeverHint(t *testing.T) {
 	cases := []struct {
 		name      string
 		status    int
 		unmetered bool
+		unusable  bool
+		// zeroHints: the reads hint exactly one generation, for the zero.
+		zeroHints bool
 	}{
-		{"http_error", http.StatusInternalServerError, false},
-		{"unmetered", http.StatusOK, true},
-		{"unauthorized", http.StatusUnauthorized, false},
+		{"http_error", http.StatusInternalServerError, false, false, false},
+		{"omitted_zero", http.StatusOK, true, false, true},
+		{"unusable", http.StatusOK, false, true, false},
+		{"unauthorized", http.StatusUnauthorized, false, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			a := newGrokAcceptance(t, 7104)
 			a.status.Store(int32(c.status))
 			a.unmetered.Store(c.unmetered)
+			a.unusable.Store(c.unusable)
 			if c.status == http.StatusUnauthorized {
 				runGrokLoginRenewal = func(context.Context, string, string) {}
 			}
@@ -253,8 +266,20 @@ func TestGrokUsage_FailedDirectReadsKeepTheCapAndNeverHint(t *testing.T) {
 				t.Fatalf("billing reads = %d, want %d (capped)", got, first)
 			}
 			time.Sleep(2 * cliUsageHintSpacing)
-			if hints := a.grokHints(); len(hints) != 0 {
-				t.Fatalf("grok hints = %+v, want none without a numeric commit", hints)
+			hints := a.grokHints()
+			if !c.zeroHints {
+				if len(hints) != 0 {
+					t.Fatalf("grok hints = %+v, want none without a figure", hints)
+				}
+				return
+			}
+			if len(hints) == 0 {
+				t.Fatal("the zero xAI reported was never hinted")
+			}
+			for _, h := range hints {
+				if h.GenerationEpoch != 7104 || h.Generation != 1 {
+					t.Fatalf("grok hints = %+v, want only the zero's {7104,1}", hints)
+				}
 			}
 		})
 	}

@@ -16,7 +16,10 @@
 // why it maps onto ObservedAt rather than CollectedAt: a later gather that finds
 // no new line must not make an old percentage look current.
 //
-// Grok ≥ 1.0.40 TUI records carry no `creditUsagePercent`, and headless runs
+// A record with no `creditUsagePercent` is a period with nothing used yet: xAI
+// omits the field when it is zero (the wrapped `{"val":0}` pools keep theirs),
+// the TUI logs the parsed config with every absent optional field skipped, and
+// the TUI itself draws that answer as 0% (grokBillingMetrics). Headless runs
 // (`grok -p`, ACP, the maintenance smoke) log no billing record at all — their
 // managed merge reports `no-record`. The number therefore comes from the live
 // billing read (cliagent_usage_grok_live.go), which every finished run owes
@@ -159,6 +162,12 @@ func (c grokBillingConfig) creditUsagePercent() grokBillingNumber {
 	return c.CreditUsagePercentSnake
 }
 
+// creditUsagePercentOmitted reports that the config carried no usage key under
+// either spelling: xAI's answer for a period with nothing used yet.
+func (c grokBillingConfig) creditUsagePercentOmitted() bool {
+	return !c.CreditUsagePercent.Seen && !c.CreditUsagePercentSnake.Seen
+}
+
 func (c grokBillingConfig) currentPeriod() grokBillingPeriodFields {
 	period := c.CurrentPeriod
 	if strings.TrimSpace(period.Type) == "" {
@@ -191,6 +200,11 @@ func (c grokBillingConfig) onDemandUsed() grokBillingNumber {
 type grokBillingNumber struct {
 	Value float64
 	Valid bool
+	// Seen reports that the key was present at all — null, the wrong type or
+	// out of range included. A key that is ABSENT is xAI's encoding of zero
+	// (its answer drops zero-valued scalars); one that is present but unusable
+	// says nothing about the value.
+	Seen bool
 }
 
 // grokLogIdentityRecord is the complete allowlist for account evidence in a
@@ -210,6 +224,9 @@ type grokLogIdentityRecord struct {
 func (n *grokBillingNumber) UnmarshalJSON(data []byte) error {
 	n.Value = 0
 	n.Valid = false
+	// encoding/json calls this only for a key that is present, JSON null
+	// included.
+	n.Seen = true
 	value, err := strconv.ParseFloat(string(bytes.TrimSpace(data)), 64)
 	if err != nil || !grokFiniteNumber(value) {
 		return nil
@@ -223,9 +240,14 @@ func (n *grokBillingNumber) UnmarshalJSON(data []byte) error {
 type grokBillingSnapshot struct {
 	UsedPercent float64
 	// HasUsedPercent is false when the record named a billing period but no
-	// usage figure — the shape Grok 1.0 emits. UsedPercent is meaningless then
-	// and must never be plotted; the period itself is still authoritative.
-	HasUsedPercent  bool
+	// usable usage figure. UsedPercent is meaningless then and must never be
+	// plotted; the period itself is still authoritative.
+	HasUsedPercent bool
+	// UsageOmitted, only ever set with HasUsedPercent false, reports that the
+	// usage key was ABSENT rather than present and unusable: xAI omits a zero
+	// creditUsagePercent, so grokBillingMetrics plots it as 0% of an open
+	// period, as Grok's own TUI does.
+	UsageOmitted    bool
 	ObservedAt      time.Time
 	PeriodType      string
 	PeriodEnd       time.Time
@@ -241,6 +263,18 @@ type grokBillingSnapshot struct {
 	// timestamped removal, not a gap an older pool may fill.
 	OnDemandObservedAt time.Time
 	SubscriptionTier   string
+}
+
+// rendersOmittedZero reports a snapshot grokBillingMetrics plots as 0% used
+// although it carries no percentage: xAI omitted the key (UsageOmitted) under a
+// recognized period with a parseable end. Whether that end has passed is the
+// caller's question (an ended period renders Unknown).
+func (s grokBillingSnapshot) rendersOmittedZero() bool {
+	if s.HasUsedPercent || !s.UsageOmitted || !s.HasPeriodEnd {
+		return false
+	}
+	_, _, known := grokBillingPeriodKind(s.PeriodType)
+	return known
 }
 
 // onDemandObservedAt is when the on-demand pool was observed: its own time
@@ -580,8 +614,14 @@ func grokManagedBillingPayload(identity string, snap grokBillingSnapshot) ([]byt
 		period["end"] = snap.PeriodEnd.UTC().Format(time.RFC3339Nano)
 	}
 	config := map[string]any{"currentPeriod": period}
-	if snap.HasUsedPercent {
+	switch {
+	case snap.HasUsedPercent:
 		config["creditUsagePercent"] = snap.UsedPercent
+	case !snap.UsageOmitted:
+		// The source carried the key but nothing usable. Writing null keeps it
+		// "present and unusable" for the reader; omitting it would turn it
+		// into xAI's zero.
+		config["creditUsagePercent"] = nil
 	}
 	if snap.HasOnDemand {
 		config["onDemandCap"] = map[string]any{"val": snap.OnDemandCap}
@@ -1580,9 +1620,9 @@ func grokLogIdentity(line []byte) (identity string, found bool, valid bool) {
 }
 
 // grokBillingSnapshotFromRecord validates and allowlists one record. A missing
-// percentage is valid because Grok 1.0 uses that shape for an unmetered period;
-// an observation time is still mandatory so the result can be distinguished
-// from the parser's inferred placeholder.
+// percentage is valid because xAI omits a zero one (UsageOmitted); an
+// observation time is still mandatory so the result can be distinguished from
+// the parser's inferred placeholder.
 func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, bool) {
 	observed, err := time.Parse(time.RFC3339, rec.TS)
 	if err != nil {
@@ -1595,15 +1635,15 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 		PeriodType:       period.Type,
 		SubscriptionTier: firstNonEmpty(rec.Ctx.SubscriptionTier, rec.Ctx.SubscriptionTierSnake),
 	}
-	// Grok 1.0 stopped emitting creditUsagePercent. Every other field of the
-	// record is unchanged, so the record is still the authoritative statement of
-	// the CURRENT billing period — it simply no longer says how much of it is
-	// used. Treat that as "usable record, unobserved usage" rather than "not a
-	// record": rejecting it made the scanner walk further back and publish a
-	// PRE-UPGRADE reading, under a period that had since ended.
+	// A record with no usable percentage is still the authoritative statement
+	// of the CURRENT billing period: rejecting it made the scanner walk further
+	// back and publish a reading from a period that had since ended. An ABSENT
+	// key is xAI's zero; a present but unusable one says nothing.
 	if pct := config.creditUsagePercent(); pct.Valid && grokFiniteNumber(pct.Value) {
 		snap.UsedPercent = clampPercent(pct.Value)
 		snap.HasUsedPercent = true
+	} else {
+		snap.UsageOmitted = config.creditUsagePercentOmitted()
 	}
 	if end, err := time.Parse(time.RFC3339, period.End); err == nil {
 		snap.PeriodEnd = end
@@ -1670,9 +1710,12 @@ func grokBillingPeriodLength(kind string) time.Duration {
 //
 //   - NUMERIC — total/consumed/remaining populated, ObservedAt = the record ts.
 //   - CONFIRMED UNMETERED — Unknown WITH ObservedAt: proof that xAI's billing
-//     endpoint was checked at that instant and reported a period carrying no
-//     usage figure (the Grok 1.0 shape, and any period enum we do not
-//     recognize). Renders as today's dashed Unknown bar plus "Last observed".
+//     endpoint was checked at that instant, for a figure we cannot plot — an
+//     enum we do not recognize, a usage key present but unusable, or an
+//     omitted one under no parseable end.
+//     Renders as today's dashed Unknown bar plus "Last observed". A recognized
+//     open period that omits its usage figure is NUMERIC 0%: xAI drops a zero
+//     creditUsagePercent from its answer, and Grok's own TUI shows it as 0%.
 //   - INFERRED PLACEHOLDER — Unknown with NO ObservedAt: no usable record
 //     exists, or the observation aged past grokBillingObservationTTL.
 //
@@ -1749,15 +1792,31 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 				// case below removes for a still-live window.
 				credits.ObservedAt = ""
 			}
+		case snap.rendersOmittedZero():
+			// A CURRENT period with no usage figure is a period with NOTHING used
+			// yet. xAI's billing answer omits a zero-valued creditUsagePercent
+			// (only the {"val":…} wrapped pools keep their zeros), and Grok's own
+			// TUI draws exactly this answer as "Weekly limit … 0%". Every live
+			// read carried a percentage until the 2026-11-09 weekly reset and
+			// none did after it. Retention is the numeric reading's own: bounded
+			// by the period end, handled by the case above.
+			//
+			// Only the NEWEST answer reaches here without a percentage: inside an
+			// open period a numeric reading outranks a newer percent-less one
+			// (grokNewestBillingObservation, and the live cache's
+			// NumericObservedAt), so an omitted figure never hides a real one.
+			credits.Total = floatPtr(100)
+			credits.Consumed = floatPtr(0)
+			credits.Remaining = floatPtr(100)
+			credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
 		case !snap.HasUsedPercent:
-			// A CURRENT period the CLI no longer meters (Grok 1.0+). The record
-			// timestamp is proof that the provider freshly confirmed this unmetered
-			// period; retaining it is what distinguishes this from an inferred
-			// placeholder produced when no usable billing response exists. An
-			// unparseable period end costs us only ResetAt — freshness does not
-			// depend on knowing when the window closes, but WITHOUT an end we
-			// cannot see the rollover either, so retention falls back to the
-			// period's own nominal length.
+			// A current period whose usage key was present but unusable, or
+			// omitted under no parseable end (zero is what xAI meant, but without
+			// an end we cannot see the rollover, so a 0% could outlive its
+			// window). The record timestamp still proves billing was freshly
+			// read, which is what distinguishes this CONFIRMED UNMETERED row from
+			// the inferred placeholder. Without an end, retention falls back to
+			// the period's own nominal length.
 			credits.Unknown = true
 			if snap.HasPeriodEnd {
 				credits.ObservedAt = retainedWithin(0)
@@ -1819,7 +1878,9 @@ func grokBillingValueWithheld(snap grokBillingSnapshot, now time.Time) bool {
 // falls inside grokBillingMaxClockSkew and renders. Zero when nothing is
 // withheld.
 func grokBillingWithheldFor(snap grokBillingSnapshot, now time.Time) time.Duration {
-	if !snap.HasUsedPercent && !snap.HasOnDemand {
+	// An omitted zero is a figure too: a future-dated one renders Unknown now
+	// and 0% once trusted, so the generation that versions it must wait with it.
+	if !snap.HasUsedPercent && !snap.rendersOmittedZero() && !snap.HasOnDemand {
 		return 0
 	}
 	newest := snap.ObservedAt

@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,21 +27,93 @@ import (
 // with no identity logged before it is refused outright.
 const grokFreshnessIdentity = `{"ts":"2026-08-17T23:00:00.000Z","msg":"session start","ctx":{"user_id":"acct-1"}}`
 
-// grokUnmeteredLine renders a Grok 1.0 confirmed-unmetered record (no
-// creditUsagePercent) under an arbitrary message spelling.
-func grokUnmeteredLine(ts, msg string) string {
+// grokPercentLessLine renders a record with no creditUsagePercent key — xAI's
+// answer for an open weekly period with nothing used yet — under an arbitrary
+// message spelling.
+func grokPercentLessLine(ts, msg string) string {
 	return fmt.Sprintf(`{"ts":%q,"msg":%q,"ctx":{"config":{`+
 		`"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2126-08-24T22:28:32Z"}},`+
 		`"subscriptionTier":"SuperGrok"}}`, ts, msg)
 }
 
-// A confirmed-unmetered record inside the TTL is Unknown WITH an observation
-// time; the same record past it degrades to the inferred placeholder rather
-// than presenting a stale "confirmed" reading.
+// grokUnusablePercentLine is grokPercentLessLine with the usage key PRESENT
+// but null: a figure we cannot use, never xAI's zero.
+func grokUnusablePercentLine(ts, msg string) string {
+	return fmt.Sprintf(`{"ts":%q,"msg":%q,"ctx":{"config":{"creditUsagePercent":null,`+
+		`"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2126-08-24T22:28:32Z"}},`+
+		`"subscriptionTier":"SuperGrok"}}`, ts, msg)
+}
+
+// grokZeroUsedRow reports a credits row plotting 0% of a fully remaining pool,
+// observed at observedAt: what a percent-less record of an open period reads as.
+func grokZeroUsedRow(m cliAgentUsageMetric, observedAt string) bool {
+	return !m.Unknown && m.Unit == "%" &&
+		m.Total != nil && *m.Total == 100 &&
+		m.Consumed != nil && *m.Consumed == 0 &&
+		m.Remaining != nil && *m.Remaining == 100 &&
+		m.ResetAt != "" && m.ObservedAt == observedAt
+}
+
+// The Grok TUI shows a percent-less answer as "Weekly limit … 0%": xAI drops a
+// zero creditUsagePercent. The card must say the same, for as long as the
+// period is open — the TTL that bounds an Unknown row never clips it.
+func TestGrokOmittedPercentIsZeroUsedUntilThePeriodEnds(t *testing.T) {
+	observed := time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC)
+	base := writeGrokLog(t, grokFreshnessIdentity,
+		grokPercentLessLine("2026-08-17T23:02:12Z", grokBillingLogMessage))
+
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
+	if !ok || snap.HasUsedPercent || !snap.UsageOmitted {
+		t.Fatalf("snap = %+v, want a usable record whose usage key was omitted", snap)
+	}
+	for _, now := range []time.Time{observed.Add(time.Minute), observed.Add(grokBillingObservationTTL + time.Minute)} {
+		metrics := grokBillingMetrics(snap, now)
+		if len(metrics) != 1 || !grokZeroUsedRow(metrics[0], "2026-08-17T23:02:12Z") {
+			t.Fatalf("at %s: want one 0%%-used row, got %+v", now, metrics)
+		}
+	}
+
+	// Past the period end the zero describes a window that is over.
+	snap.PeriodEnd = observed.Add(time.Hour)
+	ended := grokBillingMetrics(snap, observed.Add(2*time.Hour))
+	if len(ended) != 1 || !ended[0].Unknown || ended[0].ObservedAt != "" {
+		t.Fatalf("an ended period must drop to the placeholder, got %+v", ended)
+	}
+}
+
+// A usage key that is PRESENT but unusable says nothing about the value: the
+// record is still a confirmed observation of the period, never a 0%.
+func TestGrokUnusablePercentIsNeverReadAsZero(t *testing.T) {
+	for _, raw := range []string{`null`, `"NaN"`, `1e999`, `{}`, `"12"`} {
+		var config grokBillingConfig
+		if err := json.Unmarshal([]byte(`{"creditUsagePercent":`+raw+
+			`,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2126-08-24T22:28:32Z"}}`), &config); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z"}
+		rec.Ctx.Config = config
+		snap, ok := grokBillingSnapshotFromRecord(rec)
+		if !ok || snap.HasUsedPercent || snap.UsageOmitted {
+			t.Fatalf("%s: snap = %+v, want a usable record with an unusable, NOT omitted, figure", raw, snap)
+		}
+	}
+	// The snake_case spelling counts as present too.
+	var config grokBillingConfig
+	if err := json.Unmarshal([]byte(`{"credit_usage_percent":null}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.creditUsagePercentOmitted() {
+		t.Fatal("a null snake_case key is present, not omitted")
+	}
+}
+
+// A confirmed-unmetered record (a usage key we cannot use) inside the TTL is
+// Unknown WITH an observation time; the same record past it degrades to the
+// inferred placeholder rather than presenting a stale "confirmed" reading.
 func TestGrokConfirmedUnmeteredObservationExpiresAtTheTTL(t *testing.T) {
 	observed := time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC)
 	base := writeGrokLog(t, grokFreshnessIdentity,
-		grokUnmeteredLine("2026-08-17T23:02:12Z", grokBillingLogMessage))
+		grokUnusablePercentLine("2026-08-17T23:02:12Z", grokBillingLogMessage))
 
 	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
 	if !ok {
@@ -95,7 +168,7 @@ func TestGrokBillingDecodesEveryAllowlistedMessageSpelling(t *testing.T) {
 	for _, msg := range grokBillingLogMessages {
 		t.Run(msg, func(t *testing.T) {
 			base := writeGrokLog(t, grokFreshnessIdentity,
-				grokUnmeteredLine("2026-08-17T23:02:12Z", msg))
+				grokPercentLessLine("2026-08-17T23:02:12Z", msg))
 			snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
 			if !ok {
 				t.Fatalf("message %q must be recognized as a credits-config record", msg)

@@ -98,18 +98,15 @@ func TestEnsureGrokBillingAttribution_MakesADirectRunRecordObservable(t *testing
 
 	// The CLI then fetches billing, as it does at session start.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T11:59:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T11:59:00Z", grokBillingLogMessage))
 
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
 	if !ok {
 		t.Fatal("Parse failed")
 	}
-	if len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown {
-		t.Fatalf("want one confirmed-unmetered row, got %+v", usage.Metrics)
-	}
-	if usage.Metrics[0].ObservedAt != "2026-08-19T11:59:00Z" {
-		t.Fatalf("ObservedAt = %q — the direct run's record was not attributable",
-			usage.Metrics[0].ObservedAt)
+	if len(usage.Metrics) != 1 || !grokZeroUsedRow(usage.Metrics[0], "2026-08-19T11:59:00Z") {
+		t.Fatalf("want one 0%%-used row observed by the direct run's record "+
+			"(else it was not attributable), got %+v", usage.Metrics)
 	}
 }
 
@@ -136,7 +133,7 @@ func TestEnsureGrokBillingAttribution_IsIdempotentAndReArmsOnAccountChange(t *te
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:03:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:03:00Z", grokBillingLogMessage))
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	if !ok {
 		t.Fatal("the record produced under acct-2 must be attributable to acct-2")
@@ -171,14 +168,14 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
 	if _, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); !ok {
 		t.Fatal("post-rotation records must be attributable again")
 	}
 }
 
-// The terminal-managed acceptance: a child that logged an unmetered record into
-// its isolated home leaves a confirmed-unmetered metric in the persistent home.
+// The terminal-managed acceptance: a child that logged a percent-less record into
+// its isolated home leaves its percent-less (0% used) metric in the persistent home.
 func TestPersistGrokManagedBillingSnapshot_ManagedRunLeavesAConfirmedUnmeteredMetric(t *testing.T) {
 	persistent := helperGrokHomeWithAccount(t, "acct-1")
 	isolated := helperGrokHomeWithAccount(t, "acct-1")
@@ -189,7 +186,7 @@ func TestPersistGrokManagedBillingSnapshot_ManagedRunLeavesAConfirmedUnmeteredMe
 		t.Fatalf("seed isolated identity: %v", err)
 	}
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
 
 	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
@@ -203,11 +200,8 @@ func TestPersistGrokManagedBillingSnapshot_ManagedRunLeavesAConfirmedUnmeteredMe
 	if !ok {
 		t.Fatal("Parse failed")
 	}
-	if len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown {
-		t.Fatalf("want one confirmed-unmetered row, got %+v", usage.Metrics)
-	}
-	if usage.Metrics[0].ObservedAt != "2026-08-19T11:58:00Z" {
-		t.Fatalf("ObservedAt = %q, want the managed run's observation", usage.Metrics[0].ObservedAt)
+	if len(usage.Metrics) != 1 || !grokZeroUsedRow(usage.Metrics[0], "2026-08-19T11:58:00Z") {
+		t.Fatalf("want one 0%%-used row observed by the managed run, got %+v", usage.Metrics)
 	}
 	if usage.Plan != "SuperGrok" {
 		t.Fatalf("Plan = %q, want the tier carried through the merge", usage.Plan)
@@ -224,7 +218,7 @@ func TestPersistGrokManagedBillingSnapshot_NoRecordLeavesThePriorReadingIntact(t
 		t.Fatalf("seed persistent identity: %v", err)
 	}
 	helperAppendGrokLogLine(t, persistent,
-		grokUnmeteredLine("2026-08-19T11:00:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T11:00:00Z", grokBillingLogMessage))
 	before, err := os.ReadFile(grokBillingLogPath(persistent))
 	if err != nil {
 		t.Fatalf("read persistent log: %v", err)
@@ -267,7 +261,7 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 	// A different account's session logs its own identity and fetches billing.
 	helperAppendGrokLogLine(t, base, `{"ts":"2026-08-19T12:01:00Z","msg":"session start","ctx":{"user_id":"acct-9"}}`)
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T12:02:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:02:00Z", grokBillingLogMessage))
 
 	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
 		t.Fatalf("a foreign record must not inherit our identity line: %+v", snap)
@@ -320,7 +314,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	if !ok {
 		t.Fatal("the direct record written after the re-append must be attributable to acct-1")
@@ -358,7 +352,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 	}
 
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	if !ok {
 		t.Fatal("the record written after the re-append must be attributable to acct-1")
@@ -508,7 +502,7 @@ func TestPersistGrokManagedBillingSnapshot_IsIdempotentForTheSameRecord(t *testi
 		t.Fatalf("seed isolated identity: %v", err)
 	}
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
 
 	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
@@ -655,7 +649,7 @@ func TestEnsureGrokBillingAttribution_WithholdsTheLoginWhenAnAPIKeyOverrideIsAct
 
 	// The key's account — not the cached login's — then fetches billing.
 	helperAppendGrokLogLine(t, base,
-		grokUnmeteredLine("2026-08-19T11:59:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T11:59:00Z", grokBillingLogMessage))
 
 	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
 		t.Fatalf("an API-key run's record must not bind to the cached login: %+v", snap)

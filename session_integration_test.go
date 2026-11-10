@@ -1437,8 +1437,8 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 		t.Fatalf("direct billing parse failed: %+v", usage)
 	}
 	metric := usage.Metrics[0]
-	if !metric.Unknown || metric.ObservedAt == "" || metric.ResetAt == "" {
-		t.Fatalf("direct run must produce a fresh confirmed-unmetered metric: %+v", metric)
+	if metric.ObservedAt == "" || !grokZeroUsedRow(metric, metric.ObservedAt) {
+		t.Fatalf("direct run must produce a fresh 0%%-used metric: %+v", metric)
 	}
 	out, err := json.Marshal(usage)
 	if err != nil {
@@ -1485,8 +1485,8 @@ func TestSessionLifecycle_GrokDirectRunAttributesARecordTheCLIDidNotIdentify(t *
 		t.Fatalf("direct billing parse failed: %+v", usage)
 	}
 	metric := usage.Metrics[0]
-	if !metric.Unknown || metric.ObservedAt == "" {
-		t.Fatalf("a direct run must leave a confirmed-unmetered record: %+v", metric)
+	if metric.ObservedAt == "" || !grokZeroUsedRow(metric, metric.ObservedAt) {
+		t.Fatalf("a direct run must leave a fresh 0%%-used record: %+v", metric)
 	}
 	out, err := json.Marshal(usage)
 	if err != nil {
@@ -1677,12 +1677,13 @@ mcps = false
 			pre.Metrics[0].ObservedAt, preErr, post.Metrics[0].ObservedAt, postErr)
 	}
 
-	// The records above carry no percentage (Grok ≥ 1.0.40), so the row is
-	// Unknown however fresh. With the run-completion refresh armed — as
-	// StartAgent arms it — the same terminal-managed smoke owes one live billing
-	// read, and the signed refresh after it reports that number.
-	if !post.Metrics[0].Unknown {
-		t.Fatalf("fixture drifted: the percent-less smoke record plotted a number: %+v", post.Metrics[0])
+	// The records above carry no percentage — xAI's zero — so the row reads 0%
+	// however fresh. A percent-less record still owes a live read: with the
+	// run-completion refresh armed — as StartAgent arms it — the same
+	// terminal-managed smoke owes one live billing read, and the signed refresh
+	// after it reports that number.
+	if !grokZeroUsedRow(post.Metrics[0], post.Metrics[0].ObservedAt) {
+		t.Fatalf("fixture drifted: the percent-less smoke record did not read as 0%%: %+v", post.Metrics[0])
 	}
 	grokEnableRunRefresh(t)
 	reads := grokBillingServer(t, func(string) (int, string) {

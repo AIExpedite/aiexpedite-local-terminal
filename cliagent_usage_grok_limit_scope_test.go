@@ -213,7 +213,7 @@ func TestPersistGrokManagedBillingSnapshot_ContestedProducerWritesNothing(t *tes
 	// A good existing reading the merge must not disturb.
 	helperAppendGrokLogLine(t, persistent, helperGrokIdentityLine(t, "acct-1"))
 	helperAppendGrokLogLine(t, persistent,
-		grokUnmeteredLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
 	before, err := os.ReadFile(grokBillingLogPath(persistent))
 	if err != nil {
 		t.Fatalf("read persistent log: %v", err)
@@ -222,7 +222,7 @@ func TestPersistGrokManagedBillingSnapshot_ContestedProducerWritesNothing(t *tes
 	isolated := helperGrokHomeWithAccount(t, "acct-1")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-1"))
 	helperAppendGrokLogLine(t, isolated,
-		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+		grokPercentLessLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
 	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, true)
 	if err != nil || outcome != grokManagedBillingContestedProducer {

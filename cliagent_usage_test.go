@@ -3641,8 +3641,8 @@ func TestGatherCLIAgentUsageOnly_GrokMetricSurvivesCLIUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first[0].Metrics[0].ObservedAt == "" || !first[0].Metrics[0].Unknown {
-		t.Fatalf("first refresh did not expose confirmed-unmetered freshness: %+v", first[0].Metrics[0])
+	if m := first[0].Metrics[0]; m.ObservedAt == "" || !grokZeroUsedRow(m, m.ObservedAt) {
+		t.Fatalf("first refresh did not expose a fresh 0%%-used reading: %+v", m)
 	}
 
 	secondDir := install("grok-version-v2")
