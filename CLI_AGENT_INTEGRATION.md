@@ -2161,6 +2161,34 @@ a reply we no longer parse. Four device-side gaps produced that one symptom:
   `capabilities.nativeLaunchArgs`, so terminal-service claims a model or effort
   as applied only on a device that applies it. A value must be one bounded token
   (shared-constants `CLI_MODEL_ID_PATTERN`); anything else drops the flag.
+- **A missing provider key names the provider.** OpenCode refuses a model whose
+  provider has no key with ONE top-level record and exit 1:
+  `{"type":"error",…,"error":{"name":"ProviderAuthError","data":{"providerID":"google","message":"…"}}}`.
+  The stream still forwards it as an ordinary `opencode_native_message`, and
+  `streamOpenCodeEvents` also recognises it, by shared-constants
+  `openCodeAuthRefusal`'s rule ([opencode_auth_refusal.go](opencode_auth_refusal.go)):
+  a line starting `{` that names the error, top-level `type` `"error"`,
+  `error.name` `"ProviderAuthError"`, and a `providerID` kept only as 1–40 word
+  characters, dots or dashes. When that turn exits non-zero its
+  `opencode_native_error` reads `OpenCode could not use its model: no
+  credentials for provider <id> on this computer.`, then a line break, then the
+  record rebuilt from the provider id alone —
+  `{"type":"error","error":{"name":"ProviderAuthError","data":{"providerID":"<id>"}}}`
+  — as the error's LAST line, which is where the cloud's
+  `openCodeAuthRefusalOnResult` reads a failed turn. Without a usable id the
+  sentence says "its provider" and the record has no `data`. `data.message` is
+  never copied: it can name the user's home directory or the key variable. The
+  record ending a turn that completed, or quoted inside a text event, is not
+  evidence. Older agents said only "OpenCode exited with code 1 and produced no
+  response"; this one reports `capabilities.openCodeAuthRefusalFrame`.
+- **The configured default model** the card reports is the global config's
+  `model` (`readOpenCodeConfiguredModel`), read as JSONC
+  ([jsonc.go](jsonc.go): comments and trailing commas outside strings removed,
+  so a provider `baseURL`'s `//` survives) from `opencode.jsonc` and then
+  `opencode.json` in each of `$XDG_CONFIG_HOME/opencode`, `~/.config/opencode`,
+  `~/.opencode` and the home directory — OpenCode merges the `.jsonc` file over
+  the `.json` one. A computer configured only through `opencode.jsonc` used to
+  report no default, so a keyless provider as OpenCode's own pick was invisible.
 - **The completion envelope** (`aiexpedite.turn_complete`) carries `text` —
   every text part of every step joined, which the web view and the transcript
   read — and `finalText`, the answer after the run's LAST tool call (a
@@ -2509,17 +2537,37 @@ counted and holds the cursor. `seenSteps` holds 8,192 keys. Above the caps the
 card under-counts, never over-counts.
 
 **Triggers.** One scan at startup (after `recoverOpenCodeUsageGeneration`);
-the propagator's 60 s fallback tick, only while OpenCode is detected, the agent
-is online and not draining or shutting down, and the store's change marker
-moved (SQLite: size + mtime of `opencode.db` and `-wal`; JSON: newest mtime of
-the session directories under `storage/message`) or the last scan left work;
-and a Refresh click. All three share one single flight. `ParseContext` never
-scans. A committed change advances the generation and the propagator sends at
-most one bounded hint; terminal-service already accepts `provider: "opencode"`.
+the propagator's 10 s fallback poll (`cliUsageClaudeFallbackPoll`), only while
+OpenCode is detected, the agent is online and not draining or shutting down,
+and the store's change marker moved (SQLite: size + mtime of `opencode.db` and
+`-wal`; JSON: newest mtime of the session directories under `storage/message`)
+or the last scan left work; and a Refresh click. All three share one single
+flight. `ParseContext` never scans. A committed change advances the generation
+and the propagator sends at most one bounded hint; terminal-service already
+accepts `provider: "opencode"`.
 
 **Card label.** `directCoverage.lastOkLocalDate == today` → "Tokens today"
 (and `dataSource: "opencode store"`); otherwise "Tokens today (agent runs)".
 "Cost today" appears only above zero.
+
+**Card freshness.** The rows' `observedAt` is the newest step's end time, or —
+later — when the store was last **confirmed**: the start of a scan that read it
+whole (`direct_scanned` / `direct_unchanged` with no work left: no cap, hold,
+incomplete message, revisit or settle window), or of a poll that found its
+marker unchanged after one (`openCodeDirectConfirmedAt`). A truncated scan, a
+failed read, a busy ledger and an unknown layout confirm nothing, and neither do
+the polls after them. The confirmation counts only while today is covered, no
+debt is armed or owed and no run of this process holds the reader
+(`openCodeUsageDay.Settled`), and pending spend was adopted; one from before
+local midnight or from the future is ignored. It lives in memory only and is
+never written into a bucket's `observedAtMs`, which seeds the cursor-less scan
+floor and bucket eviction; a poll that only confirms writes, advances and hints
+nothing. So an idle computer's "Tokens today" no longer reads Stale an hour
+after its last run, while a live debt, a held run or a backlog still lets it
+age. Two computers whose OpenCode providers match share one card account (the
+account is the joined provider list), so the one that refreshed last now wins
+the merge rather than the one that ran last. "Tokens today (agent runs)" keeps
+the step time.
 
 **Surviving updates.** The cursor, coverage and windows are additive
 `omitempty` fields under `schemaVersion: 1` — a bump would make an older build

@@ -66,12 +66,15 @@
 // wrote for a Claude run this agent did not spawn, and re-checks that both
 // hooks are still in Claude's settings.json after a Claude upgrade rewrote it.
 //
-// The same 60 s timer runs the OpenCode direct-run reader's gated scan
-// (openCodeDirectScanIfChanged, cliagent_usage_opencode_direct.go): OpenCode
-// spend from the user's own shell, IDE or PTY TUI lands in its own store, which
-// only a read can discover. The scan runs only while OpenCode is detected, the
-// agent is online and not draining or shutting down, and the store changed; a
-// committed change goes through noteOpenCodeUsageAdvanced like any other.
+// The same 10 s poll (cliUsageClaudeFallbackPoll) runs the OpenCode direct-run
+// reader's gated scan (openCodeDirectScanIfChanged,
+// cliagent_usage_opencode_direct.go): OpenCode spend from the user's own shell,
+// IDE or PTY TUI lands in its own store, which only a read can discover. The
+// scan runs only while OpenCode is detected, the agent is online and not
+// draining or shutting down, and the store changed; a committed change goes
+// through noteOpenCodeUsageAdvanced like any other. A poll that finds the store
+// unchanged since a complete scan only confirms it, in memory: the card's
+// reading stays fresh, and nothing is written, advanced or hinted.
 //
 // The same timer then runs the Grok direct-run scan (grokDirectRunScanIfChanged,
 // cliagent_usage_grok_direct.go): a `grok` turn from the user's own shell, an
@@ -115,8 +118,10 @@ var (
 	cliUsageRotationFirstRetry  = 15 * time.Second
 	cliUsageRotationRetryPeriod = 60 * time.Second
 	cliUsageHintHTTPTimeout     = 2 * time.Second
-	// cliUsageClaudeFallbackPeriod paces the fallback timer, which also runs the
-	// OpenCode direct-run reader's gated scan.
+	// cliUsageClaudeFallbackPoll paces the fallback timer, which also runs the
+	// OpenCode direct-run reader's gated scan and the Grok direct-run scan.
+	// cliUsageClaudeFallbackPeriod is the Claude half's own spacing: while its
+	// cache stat is unchanged, the cache is still re-read once per period.
 	cliUsageClaudeFallbackPeriod  = 60 * time.Second
 	cliUsageClaudeFallbackPoll    = 10 * time.Second
 	cliUsageClaudeFallbackEnabled = true

@@ -153,6 +153,15 @@ type capabilitiesInfo struct {
 	// applied only when this is true. Never omitempty: a future build
 	// reporting `false` must not read as "field absent".
 	NativeLaunchArgs bool `json:"nativeLaunchArgs"`
+	// OpenCodeAuthRefusalFrame: an OpenCode direct-chat turn that fails on
+	// OpenCode's ProviderAuthError record (no key for its model's provider on
+	// this computer) publishes an opencode_native_error whose text names the
+	// provider and whose LAST line is the record rebuilt from the provider id
+	// alone (opencode_auth_refusal.go), never OpenCode's own message. On an
+	// older agent the error says only "OpenCode exited with code 1 …" and the
+	// raw record reaches the cloud only as an ordinary message frame. Never
+	// omitempty: a future build reporting `false` must not read as absent.
+	OpenCodeAuthRefusalFrame bool `json:"openCodeAuthRefusalFrame"`
 	// ReadOnlySessions (shared-constants DEVICE_SESSION_CAPABILITIES.READ_ONLY):
 	// the agent verifies a SIGNED `readOnly` on a session_start and starts the
 	// bare `claude` / `codex` in its enforced read-only mode, or refuses with
@@ -342,14 +351,15 @@ const (
 // reports regardless of hardware probes: the protocol flags.
 func newMachineCapabilities() *capabilitiesInfo {
 	return &capabilitiesInfo{
-		RelayTurnInbox:         true,
-		LoadReport:             true,
-		RelayFollowUps:         newRelayFollowUpsCapability(),
-		RelayAckWatermark:      true,
-		RelayPermissionPrompts: true,
-		RelayCwdFence:          true,
-		NativeLaunchArgs:       true,
-		ReadOnlySessions:       true,
+		RelayTurnInbox:           true,
+		LoadReport:               true,
+		RelayFollowUps:           newRelayFollowUpsCapability(),
+		RelayAckWatermark:        true,
+		RelayPermissionPrompts:   true,
+		RelayCwdFence:            true,
+		NativeLaunchArgs:         true,
+		OpenCodeAuthRefusalFrame: true,
+		ReadOnlySessions:         true,
 		CliSessionDiscovery: &cliSessionDiscoveryCapability{
 			Engines:  []string{cliSessionEngineClaudeCode},
 			Protocol: cliSessionDiscoveryProtocol,

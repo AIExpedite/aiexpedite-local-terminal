@@ -271,7 +271,7 @@ func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
 		CostUsd: 0.4567, ObservedAtMs: observed.UnixMilli(),
 	}
 
-	rows := openCodeUsageMetrics(bucket, true, false, now)
+	rows := openCodeUsageMetrics(bucket, true, false, 0, now)
 	if len(rows) != 2 {
 		t.Fatalf("rows = %+v, want tokens and cost", rows)
 	}
@@ -301,14 +301,14 @@ func TestOpenCodeUsageMetrics_DailyRowsFromTheLedger(t *testing.T) {
 
 func TestOpenCodeUsageMetrics_NoCostRowAtZeroAndNoRowsWithoutABucket(t *testing.T) {
 	now := time.Now()
-	unmetered := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 10, ObservedAtMs: now.UnixMilli()}, true, false, now)
+	unmetered := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 10, ObservedAtMs: now.UnixMilli()}, true, false, 0, now)
 	if len(unmetered) != 1 || unmetered[0].Label != "Tokens today (agent runs)" {
 		t.Fatalf("rows = %+v, want tokens only: $0.00 would read as free, not unmetered", unmetered)
 	}
-	if rows := openCodeUsageMetrics(openCodeUsageBucket{}, false, false, now); rows != nil {
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{}, false, false, 0, now); rows != nil {
 		t.Fatalf("no bucket produced %+v, want no rows (no placeholders)", rows)
 	}
-	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, false, now); rows != nil {
+	if rows := openCodeUsageMetrics(openCodeUsageBucket{ObservedAtMs: now.UnixMilli()}, true, false, 0, now); rows != nil {
 		t.Fatalf("an empty bucket produced %+v", rows)
 	}
 }
@@ -321,7 +321,7 @@ func TestOpenCodeUsageMetrics_ASaturatedCostStaysFinite(t *testing.T) {
 	for _, cost := range []float64{math.MaxFloat64, openCodeUsageMaxInt, 1e300} {
 		rows := openCodeUsageMetrics(openCodeUsageBucket{
 			InputTokens: 10, CostUsd: cost, ObservedAtMs: now.UnixMilli(),
-		}, true, false, now)
+		}, true, false, 0, now)
 		if len(rows) != 2 {
 			t.Fatalf("cost %v produced rows %+v, want tokens and cost", cost, rows)
 		}
@@ -337,7 +337,7 @@ func TestOpenCodeUsageMetrics_ASaturatedCostStaysFinite(t *testing.T) {
 		}
 	}
 	// Ordinary spend still rounds to four decimals.
-	rows := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.123456, ObservedAtMs: now.UnixMilli()}, true, false, now)
+	rows := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.123456, ObservedAtMs: now.UnixMilli()}, true, false, 0, now)
 	if *rows[1].Consumed != 0.1235 {
 		t.Fatalf("cost = %v, want 0.1235", *rows[1].Consumed)
 	}
@@ -366,13 +366,13 @@ func TestOpenCodeUsageMetrics_LabelFollowsDirectCoverage(t *testing.T) {
 				return true, false
 			})
 			day := openCodeUsageDayFor("fp", now)
-			rows := openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, now)
+			rows := openCodeUsageMetrics(day.Bucket, day.OK, day.Direct, 0, now)
 			if len(rows) != 1 || rows[0].Label != c.want {
 				t.Fatalf("rows = %+v, want one %q row and no zero-cost row", rows, c.want)
 			}
 		})
 	}
-	withCost := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.5, ObservedAtMs: now.UnixMilli()}, true, true, now)
+	withCost := openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, CostUsd: 0.5, ObservedAtMs: now.UnixMilli()}, true, true, 0, now)
 	if len(withCost) != 2 || withCost[0].Label != "Tokens today" || withCost[1].Label != "Cost today" {
 		t.Fatalf("rows = %+v", withCost)
 	}

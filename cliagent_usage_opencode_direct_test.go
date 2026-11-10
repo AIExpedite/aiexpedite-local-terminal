@@ -1007,7 +1007,7 @@ func TestOpenCodeDirect_AnUnknownLayoutFailsClosed(t *testing.T) {
 	if ledger := loadOpenCodeUsageLedger(); ledger.DirectCoverage != nil {
 		t.Fatalf("coverage = %+v for an unknown store", ledger.DirectCoverage)
 	}
-	raw, _ := json.Marshal(openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, ObservedAtMs: clock.ms(0)}, true, openCodeUsageDayFor("", clock.now).Direct, clock.now))
+	raw, _ := json.Marshal(openCodeUsageMetrics(openCodeUsageBucket{InputTokens: 1, ObservedAtMs: clock.ms(0)}, true, openCodeUsageDayFor("", clock.now).Direct, 0, clock.now))
 	if !json.Valid(raw) || !strings.Contains(string(raw), "Tokens today (agent runs)") {
 		t.Fatalf("label = %s", raw)
 	}
