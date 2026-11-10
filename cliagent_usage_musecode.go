@@ -7,10 +7,14 @@
 //     (`providers.meta.user_email`), which also keys the cross-device dedup.
 //   - Device default model: `model` in Muse Code's settings.json.
 //   - Quota: the 5-hour window and the weekly block, from the last reading a
-//     live probe captured (cliagent_usage_musecode_live.go). Muse Code keeps
-//     these only in memory and on no disk file, so without a reading both
-//     metrics are reported Unknown — the card draws dashed bars that say the
-//     limit exists but is unobserved, rather than no bars at all.
+//     live probe or a run's allowance record captured
+//     (cliagent_usage_musecode_live.go, cliagent_usage_musecode_run.go). Muse
+//     Code keeps these only in memory and on no disk file, so without a
+//     reading both metrics are reported Unknown — the card draws dashed bars
+//     that say the limit exists but is unobserved, rather than no bars at all.
+//   - Usage generation: the cache's capture generation, once this process has
+//     committed a reading, so the backend can tell a hint it already applied
+//     (cliagent_usage_propagate.go).
 //
 // # WHY AUTH FAILS OPEN
 //
@@ -34,6 +38,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,9 +57,22 @@ const (
 // are well under a kilobyte.
 const museCodeConfigFileMaxBytes = 256 * 1024
 
+// museCodeUsageProvider is Muse Code's provider id on the card and in usage
+// hints (shared-constants CLI_AGENT_IDS.MUSE_CODE).
+const museCodeUsageProvider = "museCode"
+
 type museCodeUsageParser struct{}
 
-func (museCodeUsageParser) Provider() string { return "museCode" }
+// ParseContext lets a signed refresh reserve the cache's generation for its
+// receipt (observeCLIUsageGeneration); the compile-time proof keeps the
+// gather's type assertion from silently falling back to Parse.
+var _ cliAgentUsageContextParser = museCodeUsageParser{}
+
+func (museCodeUsageParser) Provider() string { return museCodeUsageProvider }
+
+// SerialProbeCount is zero: ParseContext reads only local files, so the gather
+// must not hold back a probe window for it (cliAgentUsageGatherReserve).
+func (museCodeUsageParser) SerialProbeCount() int { return 0 }
 
 // museCodeCredentialFileName is the keychain-fallback credential file in the
 // Muse Code config dir. A miss degrades to "unknown", never to Login-required.
@@ -64,8 +82,17 @@ const museCodeCredentialFileName = "auth.json"
 const museCodeSettingsFileName = "settings.json"
 
 func (p museCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	return p.ParseContext(context.Background(), home, detected, now)
+}
+
+// ParseContext is the gather's entry point. ctx carries a signed refresh's
+// receipt reservation, if any.
+func (p museCodeUsageParser) ParseContext(ctx context.Context, home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	usage := &cliAgentUsage{
-		CliAgentID:  "museCode",
+		CliAgentID:  museCodeUsageProvider,
 		Provider:    p.Provider(),
 		Name:        firstNonEmpty(detected.Name, "Muse Code"),
 		Version:     detected.Version,
@@ -97,12 +124,31 @@ func (p museCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 	usage.AccountFingerprint = identity.Fingerprint
 	usage.Model = readMuseCodeDefaultModel(home, os.Getenv)
 
-	reading, ok := loadMuseCodeUsageLive(museCodeUsageAccountKey(usage.AccountFingerprint))
+	view, ok := loadMuseCodeUsageLiveView(museCodeUsageAccountKey(usage.AccountFingerprint))
 	if ok {
 		usage.DataSource = "muse usage/read"
 	}
-	usage.Metrics = museCodeUsageMetrics(reading, ok, now)
+	usage.Metrics = museCodeUsageMetrics(view.reading, ok, now)
+	if g := museCodePublishableGeneration(view, ok); g != nil {
+		usage.UsageGeneration = g
+		observeCLIUsageGeneration(ctx, museCodeUsageProvider, usage.UsageGeneration)
+	}
 	return usage, true
+}
+
+// museCodePublishableGeneration is the generation a parse publishes with the
+// reading it loaded, or nil. Only a generation this process committed is
+// published — the cache has rotated onto its epoch (museCodeGenerationRotated)
+// — never one an earlier process left in the file: a generation is only ever
+// published under an epoch the publishing process wrote, as Codex, OpenCode
+// and Grok publish theirs. Nothing without a reading for the account.
+func museCodePublishableGeneration(view museCodeUsageLiveView, ok bool) *cliUsageGeneration {
+	if !ok || view.generation == nil || !museCodeGenerationRotated.Load() ||
+		view.generation.Epoch != codexProcessGenerationEpoch.Load() || view.generation.Counter <= 0 {
+		return nil
+	}
+	g := *view.generation
+	return &g
 }
 
 // museCodeHasCredential reports positive evidence of a usable credential.
@@ -158,7 +204,7 @@ type museCodeAuthIdentityFile struct {
 // museCodeAccountFingerprint keys the account for cross-device dedup. Emails
 // compare case-insensitively.
 func museCodeAccountFingerprint(email string) string {
-	return fingerprintAccount("museCode", strings.ToLower(strings.TrimSpace(email)))
+	return fingerprintAccount(museCodeUsageProvider, strings.ToLower(strings.TrimSpace(email)))
 }
 
 // museCodeAPIKeyFingerprint keys an API-key account: one-way (sha256,

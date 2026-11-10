@@ -21,7 +21,9 @@
 //	with "Subscription quota exhausted". Reading the record each run already
 //	prints lands the same per-account reading the parser shows, after every
 //	chat, voice or Ship turn, and the Refresh probe's cooldown then keeps it
-//	instead of spending a turn of its own.
+//	instead of spending a turn of its own. Each reading it commits also hints
+//	terminal-service (cliagent_usage_propagate.go), so the card picks it up
+//	when it lands instead of at the next wake.
 //
 // How a run is read (museCodeRunUsageCapture), on both launch paths — the
 // Chat manager (musecode_native.go, ObserveRun) and a session_start run
@@ -154,12 +156,22 @@ func (c *museCodeRunUsageCapture) Line(line string, now time.Time) bool {
 // already holds one observed at the same time or later — read, compare and
 // write under one lock, so a Refresh probe landing between them is never
 // overwritten by an older run. A reading that names no window length keeps
-// the account's earlier one, else the 5-hour default.
+// the account's earlier one, else the 5-hour default. A committed reading
+// advances the cache's generation and hints terminal-service once the lock is
+// released (noteMuseCodeUsageCommitted); a reading kept out sends nothing.
 func saveMuseCodeUsageLiveIfNewer(entry museCodeUsageLiveCache) bool {
+	generation, committed := commitMuseCodeUsageLiveIfNewer(entry)
+	noteMuseCodeUsageCommitted(generation, committed)
+	return committed
+}
+
+// commitMuseCodeUsageLiveIfNewer is saveMuseCodeUsageLiveIfNewer's cache
+// transaction.
+func commitMuseCodeUsageLiveIfNewer(entry museCodeUsageLiveCache) (cliUsageGeneration, bool) {
 	museCodeUsageLiveCacheMu.Lock()
 	defer museCodeUsageLiveCacheMu.Unlock()
 	if entry.AccountKey == "" || museCodeUsageLiveCachePath() == "" {
-		return false
+		return cliUsageGeneration{}, false
 	}
 	file := readMuseCodeUsageLiveFileLocked()
 	for _, r := range file.Readings {
@@ -167,7 +179,7 @@ func saveMuseCodeUsageLiveIfNewer(entry museCodeUsageLiveCache) bool {
 			continue
 		}
 		if r.ObservedAtMs >= entry.ObservedAtMs {
-			return false
+			return cliUsageGeneration{}, false
 		}
 		if entry.Window.WindowDurationMins <= 0 {
 			entry.Window.WindowDurationMins = r.Window.WindowDurationMins

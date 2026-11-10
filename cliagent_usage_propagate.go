@@ -18,7 +18,10 @@
 // (mergeClaudeRateLimitCacheLocked), OpenCode on an advanced observation in its
 // usage ledger (cliagent_usage_opencode_capture.go), Grok on a numeric live
 // billing read committing to its cache (commitGrokBillingLive,
-// cliagent_usage_grok_live.go) — the propagator sends one signed hint,
+// cliagent_usage_grok_live.go), Muse Code on a quota reading committing to its
+// live cache — a run's allowance record or a Refresh probe
+// (commitMuseCodeUsageFileLocked, cliagent_usage_musecode_live.go) — the
+// propagator sends one signed hint,
 // `POST /device/:agentId/cli-usage/observed`, naming the provider and the
 // committed generation. terminal-service answers it with one ordinary refresh —
 // at most one per agent per 4 minutes, none when it already applied that
@@ -29,9 +32,10 @@
 // The providers that send hints mirror terminal-service's
 // CLI_USAGE_HINT_PROVIDERS (src/config/terminal.config.js) by hand — the device
 // cannot import it: codexUsageProvider, claudeUsageProvider,
-// openCodeUsageProvider and grokUsageProvider. A hint from any other provider is
-// accepted and ignored there, so a device that ships a new provider first sends
-// hints that do nothing until terminal-service lists it.
+// openCodeUsageProvider, grokUsageProvider and museCodeUsageProvider. A hint
+// from any other provider is accepted and ignored there, so a device that ships
+// a new provider first sends hints that do nothing until terminal-service
+// lists it.
 //
 // Device-side bounds:
 //   - one pending slot PER PROVIDER, carrying that provider's newest
@@ -51,9 +55,10 @@
 //     cooldown); a failed signing or publish releases it into the normal
 //     initial-plus-follow-up lifecycle;
 //   - nothing is sent while offline, draining, shutting down, unregistered, or
-//     (Codex, OpenCode and Grok) before this process's generation epoch for that
-//     provider is on disk; the generation is kept and re-checked at the next
-//     boundary, and a provider awaiting its rotation never holds another back.
+//     (Codex, OpenCode, Grok and Muse Code) before this process's generation
+//     epoch for that provider is on disk; the generation is kept and re-checked
+//     at the next boundary, and a provider awaiting its rotation never holds
+//     another back.
 //
 // Discovering commits made elsewhere. The Claude status-line hook commits from
 // short-lived processes of its own, so the resident agent learns of those
@@ -94,8 +99,9 @@
 // way. An OpenCode ledger with numbers for today is rotated and scheduled the
 // same way (recoverOpenCodeUsageGeneration), and so is a Grok live cache whose
 // numeric reading for the signed-in account is still in an open period
-// (recoverGrokUsageGeneration). The backend skips a generation it already
-// applied.
+// (recoverGrokUsageGeneration), and a Muse Code live cache whose reading for
+// the signed-in account still renders a number (recoverMuseCodeUsageGeneration,
+// asked once). The backend skips a generation it already applied.
 //
 // Logs are fixed labels only (`[cli-usage] usage hint: <label>`) — never a
 // path, account, fingerprint, id or response body.
@@ -266,6 +272,7 @@ func startCLIUsagePropagator(cfg *Config) {
 		p.rotate(cliUsageRotationFirstRetry)
 		recoverOpenCodeUsageGeneration(1)
 		recoverGrokUsageGeneration(1)
+		recoverMuseCodeUsageGeneration()
 		// Runs made while the agent was down or mid-update.
 		openCodeDirectScanAtStartup()
 		grokDirectScanAtStartup()
@@ -537,7 +544,8 @@ func (p *cliUsagePropagatorState) sendDelayLocked(h *cliUsagePendingHint) time.D
 // providerBlockedLocked: a Codex generation waits for this process's Codex
 // epoch rotation (codexPublishableGeneration publishes nothing before it), and
 // an OpenCode generation for its own ledger rotation (openCodeGenerationRotated),
-// and a Grok generation for its live cache's (grokGenerationRotated) — never
+// a Grok generation for its live cache's (grokGenerationRotated) and a Muse
+// Code generation for its live cache's (museCodeGenerationRotated) — never
 // Codex's: a device that never ran Codex has no Codex rotation to wait on.
 func (p *cliUsagePropagatorState) providerBlockedLocked(provider string) bool {
 	switch provider {
@@ -547,6 +555,8 @@ func (p *cliUsagePropagatorState) providerBlockedLocked(provider string) bool {
 		return !openCodeGenerationRotated.Load()
 	case grokUsageProvider:
 		return !grokGenerationRotated.Load()
+	case museCodeUsageProvider:
+		return !museCodeGenerationRotated.Load()
 	}
 	return false
 }
@@ -917,6 +927,10 @@ func logCLIUsageHint(label string) {
 func resetCLIUsagePropagator() {
 	p := cliUsagePropagator
 	p.rotating.Wait()
+	// Muse Code's generation state sits under its cache lock: reset it before
+	// any propagator lock is taken, so neither is held while waiting on the
+	// other.
+	resetMuseCodeUsageGeneration()
 	// A fallback that passed its stopped check before the stop finishes first.
 	p.fallbackRunning.Lock()
 	defer p.fallbackRunning.Unlock()

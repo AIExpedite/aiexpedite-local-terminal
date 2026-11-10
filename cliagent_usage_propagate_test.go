@@ -53,6 +53,9 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	// …and Grok live-cache commits likewise.
 	delete(p.pending, grokUsageProvider)
 	delete(p.seen, grokUsageProvider)
+	// …and Muse Code live-cache commits too.
+	delete(p.pending, museCodeUsageProvider)
+	delete(p.seen, museCodeUsageProvider)
 	p.mu.Unlock()
 	prev := []time.Duration{cliUsageHintDebounce, cliUsageHintSpacing, cliUsageRotationFirstRetry, cliUsageRotationRetryPeriod, cliUsageClaudeFallbackPeriod, cliUsageClaudeFallbackPoll}
 	prevFallback, prevDetected := cliUsageClaudeFallbackEnabled, claudeUsageFallbackDetected
@@ -84,6 +87,11 @@ func propagatorFixture(t *testing.T) (*cliUsageHintRecorder, *Config) {
 	}
 	if os.Getenv("GROK_HOME") == "" {
 		t.Setenv("GROK_HOME", t.TempDir())
+	}
+	// …and the Muse Code recovery reads and may rotate the Muse cache: never
+	// the sandbox's shared one, which another test's run may have filled.
+	if os.Getenv("AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE") == "" {
+		t.Setenv("AIEXPEDITE_MUSECODE_USAGE_LIVE_CACHE", t.TempDir()+"/musecode_usage_live.json")
 	}
 	prevGrokScan := grokDirectScanEnabled
 	grokDirectScanEnabled = false
