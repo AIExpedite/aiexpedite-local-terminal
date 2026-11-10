@@ -991,8 +991,9 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 }
 
 // claudeSettingsAfterRepairWrite runs after a reconcile's repair writes, at the
-// start of recordClaudeSettingsStampIfReconciled. A no-op in production; a test seam that
-// lets a test land a foreign rewrite inside that window deterministically.
+// start of recordClaudeSettingsStampIfReconciled. A no-op in production; a test
+// seam that lets a test land a foreign rewrite inside that window
+// deterministically.
 var claudeSettingsAfterRepairWrite = func(settingsPath string) {}
 
 // recordClaudeSettingsStamp records settings.json's mtime + size as verified.
